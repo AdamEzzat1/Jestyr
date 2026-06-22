@@ -436,6 +436,12 @@ mod tests {
     }
 
     #[test]
+    fn niche_example_compiles_clean() {
+        // Niche-optimized optional pointers (enum/ADT step 1).
+        pipeline_is_clean("examples/niche.jtr");
+    }
+
+    #[test]
     fn tests_demo_example_builds_a_clean_test_harness() {
         // The `@test`/`@bench` runner (workstream O): emit in test mode and check
         // the harness is generated without diagnostics.

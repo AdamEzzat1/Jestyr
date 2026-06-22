@@ -67,27 +67,36 @@ record Point { x: i32, y: i32
   arm via `record_name`; the `mut self` rejection in `parser::parse_named_struct`.
   Demo [`examples/records.jtr`](../examples/records.jtr).
 
-### 2.2 In-language `Option`/`Result` + **niche optimization**  🔜 NEXT (flagship)
+### 2.2 Niche optimization  ✅ DONE (this session) · 2.2b generic `Option`/`Result`  🔜 NEXT
 
 ```jestyr
-enum Option(T) { none, some(T) }
-enum Result(T, E) { ok(T), err(E) }
+enum Maybe { none, some(p: *mut i32) }   // ← lowers to a bare `int32_t*` (done)
+enum Option(T) { none, some(T) }         // ← generic form (needs generic enums, next)
 ```
 - **Inspiration:** Rust niche optimization; ML/Rust prelude ADTs (not hardcoded like CJC).
-- **The flagship transparency demo:** when an enum is *one nullary variant* + *one
-  single-field variant whose payload type has a **niche*** (an invalid bit-pattern — a
-  pointer's `null`, a `bool`'s `2..=255`, a `&T`/`&[r]T`), represent the whole enum as
-  **just the payload**, using the niche to encode the nullary case. So
-  `Option(&T)` is bit-for-bit a pointer: `size_of(Option(&T)) == size_of(&T)`.
-- **Why it's *the* Jestyr demo:** the provable thing (the type has an unused
-  bit-pattern) and the cheap thing (don't store a separate tag) are the *same thing* —
-  Jestyr's thesis in one feature. Ship it with a `size_of` test that proves the equality.
-- **Impl sketch:** define the two enums in a prelude module over the existing ADT
-  machinery (retire any hardcoding); add a **niche-detection pass** in `cgen` that, for
-  a qualifying enum, emits the bare payload C type and lowers `some(p)`/`none`/match to
-  null-checks instead of a tag. Start with the pointer-niche (`&T`/`*T`/`&[r]T`); extend
-  to `bool`/enum-with-spare-tags later. Falls back to the ordinary tagged union otherwise.
-- **Depends on:** enums (have), generics (have). **No AST-shape change** → low conflict.
+- **The flagship transparency demo:** an enum that is *one nullary variant* + *one
+  single-field variant whose payload is a **thin pointer*** (`*T` or `&[r]T` — both have a
+  `null` niche) is represented as **just the payload**: `some(p)` is `p`, `none` is the
+  null pointer. No tag, no padding — `size_of(Maybe) == size_of(*mut i32) == 8` (a tagged
+  union is 16). The provable fact (a pointer has an unused null bit-pattern) and the cheap
+  fact (no tag needed) are the *same fact* — Jestyr's thesis in one optimization.
+- **A sharper framing than the original note:** Jestyr's `&T` is a *fat* generational ref
+  (`{ptr,gen}`), so it has no single null niche. The niche applies to the **thin tiers**
+  `*T` and `&[r]T`. (A fat `&T`/`[]T` correctly falls back to the tagged union.)
+- **What landed (`cgen`):** `NicheInfo` + `niche_enum_at`/`niche_enum_named` detect a
+  qualifying enum; `c_type`/`c_ty_ast` return the bare payload pointer; `enum_defs` and
+  `forward_types` skip it (no struct/tag); `emit_variant_construct` emits `some(p)`→`p` and
+  `none`→`((T*)0)`; `emit_niche_match` lowers `match` to an `!= NULL` test instead of a tag
+  `switch`. Demo [`examples/niche.jtr`](../examples/niche.jtr) (`8, 42, 0`); the
+  `size_of`/`!switch`/`!Jestyr_Maybe` proof is a cgen test.
+- **2.2b (next):** make it **generic** — `Option(T)`/`Result(T,E)` defined in a prelude
+  over the ADT machinery. This needs **generic enums** (the prerequisite below); once they
+  exist, `Option(*T)`/`Option(&[r]T)` inherit the niche optimization above *for free*.
+- **Generic enums (the 2.2b prerequisite):** mirror the generic-*struct* machinery — an
+  anonymous `enum {…}` value (an `EnumType` expr like `StructType`), recognized by the
+  `comptime fn … -> type { return enum {…} }` path, with a generic-enum `Ty` and a
+  `collect_enum_instances` monomorphization pass. Sizable; it's the real gate for
+  in-language `Option`/`Result`.
 
 ### 2.3 Struct-variant enums + explicit discriminants  ⏳
 
@@ -196,7 +205,8 @@ rebase the rest (HANDOFF §1).
 | # | Step | Why here | AST-shape? | Size | Status |
 |---|---|---|---|---|---|
 | 0 | **`record`** | smallest entry; pure subtraction | no | S | ✅ done |
-| 1 | **In-language `Option`/`Result` + niche opt** | flagship "transparent cost"; no shape change | no | M | 🔜 next |
+| 1a | **Niche optimization** (optional thin pointers) | flagship "transparent cost"; no shape change | no | M | ✅ done |
+| 1b | **Generic enums → in-language `Option`/`Result`** | the real gate for Option/Result; inherits 1a's niche opt | **yes** | M–L | 🔜 next |
 | 2 | **Struct-variant enums + explicit discriminants** | the AST-shape change → land early | **yes** | M | ⏳ |
 | 3 | **Match power + Maranget exhaustiveness** | rests on #2's pattern shapes; largest | **yes** | L | ⏳ |
 | 4 | **Recursive ADTs (`indirect`)** | needs ref tiers (have); novel | small | M | ⏳ |

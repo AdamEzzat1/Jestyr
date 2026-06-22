@@ -1,0 +1,35 @@
+// examples/niche.jtr — niche-optimized optional pointers (step 1 of the
+// structs/enums/ADT plan; the flagship "transparent cost" demo).
+//
+//   jestyrc run examples/niche.jtr   →  8, 42, 0
+//
+// An enum with exactly one nullary variant and one single *thin-pointer* variant
+// is represented as JUST the pointer — `none` is the null pointer, `some(p)` is
+// `p`. No tag, no padding: `size_of(Maybe) == size_of(*mut i32) == 8` (a tagged
+// union would be 16). The *provable* fact (a pointer has an unused null
+// bit-pattern) and the *cheap* fact (no separate tag is needed) are the same
+// fact — Jestyr's whole thesis in one optimization.
+//
+// (Jestyr's `&T` is a fat generational ref, so the niche applies to the thin
+// tiers: `*T` and `&[r]T`. Generic `Option(T)`/`Result(T, E)` — which inherit
+// this optimization automatically — are the next sub-step, once enums take type
+// parameters.)
+
+enum Maybe { none, some(p: *mut i32) }
+
+fn unwrap_or(m: Maybe, dflt: i32) -> i32 {
+    match m {
+        some(p) => unsafe { p.* },   // the payload binding *is* the pointer
+        none    => dflt,             // the null case
+    }
+}
+
+fn main() -> i32 {
+    print_int(size_of(Maybe))         // 8  — identical to a bare pointer
+    var x: *mut i32 = alloc_i32(1)
+    unsafe { x.* = 42 }
+    print_int(unwrap_or(some(x), 0))  // 42  (some → deref the pointer)
+    print_int(unwrap_or(none, 0))     // 0   (none → the default)
+    free_ptr(x)
+    return 0
+}

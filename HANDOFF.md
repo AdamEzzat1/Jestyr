@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 193 tests pass, including `proptest` property
+and run (or are correctly rejected). 196 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -214,6 +214,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `attributes.jtr` | `25`, `7`, `12`, `9`, `8` | **compiler attributes (D)** — `@inline`/`@hot`/`@cold` opt hints, `@must_use`, `@deprecated("…")`, `@no_mangle` export; registry-validated (§5.30) |
 | `tests_demo.jtr` | (via `jestyrc test`) | **`@test`/`@bench` runner (O)** — `jestyrc test` harness: runs `bool`-returning tests + timed benches; exit≠0 on failure (§5.30) |
 | `records.jtr` | `3`, `4`, `25` | **immutable `record` (B)** — struct/record split; field assignment is a static error; lowers to a plain struct (§5.32) |
+| `niche.jtr` | `8`, `42`, `0` | **niche optimization (B)** — `enum {none, some(*T)}` lowers to a bare pointer (`none`=NULL); `size_of`==pointer size; match→null-test (§5.33) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -583,6 +584,21 @@ These are the non-obvious things that will bite if you don't know them.
     `Option`, struct-variant enums, Maranget exhaustiveness, recursive `indirect` ADTs,
     `distinct`, layout reflection): [`docs/structs-enums-design.md`](docs/structs-enums-design.md).
     Demo `examples/records.jtr`.
+
+33. **Niche optimization — a two-variant `{none, some(thin-ptr)}` enum *is* its
+    pointer (CJC §1.3 / Rust niche; the flagship "transparent cost" demo).** When an
+    enum has exactly one nullary variant and one single-field variant whose payload is a
+    **thin pointer** (`*T` or `&[r]T` — both have a `null` niche; a *fat* `&T` genref or
+    `[]T` slice does not), cgen represents the whole enum as just that pointer: `some(p)`
+    → `p`, `none` → `((T*)0)`, and `size_of` == the pointer size. It is a pure
+    *representation* swap — typeck still sees an ordinary 2-variant enum (exhaustiveness,
+    construction, projection unchanged); only cgen branches. Pieces (`cgen.rs`):
+    `NicheInfo` + `niche_enum_at`/`niche_enum_named` (detect, reading the type table);
+    `c_type`/`c_ty_ast` return the payload pointer; `enum_defs` + `forward_types` skip the
+    enum (no `Jestyr_<E>` struct/tag); `emit_variant_construct` handles `some`/`none`;
+    `emit_niche_match` lowers `match` to an `if (p != NULL)` test instead of a tag
+    `switch`. Demo `examples/niche.jtr` (`8, 42, 0`). **Next (design 2.2b):** generic
+    enums → in-language `Option(T)`/`Result(T,E)`, which inherit this opt for free.
 
 ---
 

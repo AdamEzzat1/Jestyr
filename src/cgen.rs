@@ -187,6 +187,27 @@ struct VariantInfo {
     fields: Vec<(String, TypeId)>,
 }
 
+/// A *niche-optimized* enum: exactly two variants — one nullary and one carrying
+/// a single thin-pointer payload — so the whole enum is represented as just that
+/// pointer (the nullary variant is encoded as `NULL`). Zero tag, zero padding:
+/// `size_of(Option(*T)) == size_of(*T)`. (CJC-inspired §1.3; Rust niche opt.)
+#[derive(Clone)]
+struct NicheInfo {
+    /// The nullary variant — encoded as the null pointer.
+    none_variant: String,
+    /// The single-field variant — encoded as the payload pointer itself.
+    some_variant: String,
+    /// The pointer payload type (the enum's whole representation).
+    payload: Ty,
+}
+
+/// Does this type lower to a single pointer with a usable `NULL` niche? Raw
+/// pointers and zero-cost region references do; a generational `&T` (fat:
+/// `{ptr, gen}`) and a slice `[]T` (fat: `{ptr, len}`) do not.
+fn is_niche_pointer(t: &Ty) -> bool {
+    matches!(t, Ty::Ptr { .. } | Ty::RegionRef(_))
+}
+
 /// A `spawn <fn>(args)` site inside a `concurrent` block. Each becomes an
 /// argument struct + a `void*` thread trampoline, keyed by the call's expr id.
 #[derive(Clone)]
@@ -372,6 +393,17 @@ impl<'a> Cgen<'a> {
                     self.raw(format!("typedef struct Jestyr_{0} Jestyr_{0};\n", name.name));
                 }
                 Item::Enum(e) => {
+                    // A niche-optimized enum has no `Jestyr_<E>` struct (it is its
+                    // pointer payload), so it needs no forward typedef either.
+                    if self
+                        .info
+                        .table
+                        .type_index
+                        .get(&e.name.name)
+                        .is_some_and(|&i| self.niche_enum_at(i).is_some())
+                    {
+                        continue;
+                    }
                     self.raw(format!("typedef struct Jestyr_{0} Jestyr_{0};\n", e.name.name));
                 }
                 _ => {}
@@ -380,13 +412,53 @@ impl<'a> Cgen<'a> {
         self.raw("\n");
     }
 
+    /// If the type at table index `i` is a niche-optimizable enum, describe it.
+    /// Qualifies when it has exactly two variants — one nullary, one with a single
+    /// *thin-pointer* field (`*T` or `&[r]T`; a fat `&T`/`[]T` has no null niche).
+    fn niche_enum_at(&self, i: usize) -> Option<NicheInfo> {
+        let decl = self.info.table.types.get(i)?;
+        let TypeKindG::Enum { variants } = &decl.kind else { return None };
+        if variants.len() != 2 {
+            return None;
+        }
+        let mut none_variant = None;
+        let mut some = None;
+        for (vname, fields) in variants {
+            match fields.as_slice() {
+                [] => none_variant = Some(vname.clone()),
+                [t] if is_niche_pointer(t) => some = Some((vname.clone(), t.clone())),
+                _ => return None, // a non-niche-able variant disqualifies the enum
+            }
+        }
+        let none_variant = none_variant?;
+        let (some_variant, payload) = some?;
+        Some(NicheInfo { none_variant, some_variant, payload })
+    }
+
+    /// Niche info for an enum by name (used at construction sites).
+    fn niche_enum_named(&self, name: &str) -> Option<NicheInfo> {
+        let i = *self.info.table.type_index.get(name)?;
+        self.niche_enum_at(i)
+    }
+
     /// Lower each enum to a tagged union: a `tag` enum plus a `union` of the
     /// payload-carrying variants. Nullary variants contribute a tag constant but
-    /// no union member.
+    /// no union member. A niche-optimized enum is skipped (it has no struct).
     fn enum_defs(&mut self) {
         let ast = self.ast;
         for item in &ast.items {
             if let Item::Enum(e) = item {
+                // A niche-optimized enum has no tag/union struct — it *is* its
+                // pointer payload, so emit nothing here (see `c_type`/`c_ty_ast`).
+                if self
+                    .info
+                    .table
+                    .type_index
+                    .get(&e.name.name)
+                    .is_some_and(|&i| self.niche_enum_at(i).is_some())
+                {
+                    continue;
+                }
                 let en = &e.name.name;
                 self.raw(format!("enum Jestyr_{en}_tag {{\n"));
                 for v in &e.variants {
@@ -1257,6 +1329,70 @@ impl<'a> Cgen<'a> {
         }
     }
 
+    /// Lower a `match` on a niche-optimized enum: the scrutinee is a pointer, so
+    /// dispatch on `!= NULL` (the `some` payload) vs `== NULL` (`none`) instead of
+    /// a tag `switch`. The `some` payload binding *is* the scrutinee pointer.
+    fn emit_niche_match(&mut self, e: ExprId, ret: bool, n: &NicheInfo) {
+        let ast = self.ast;
+        let (scrut, arms) = match &ast.expr_at(e).kind {
+            ExprKind::Match { scrut, arms } => (*scrut, arms),
+            _ => return,
+        };
+        let cty = self.c_type(&n.payload);
+        let scrut_c = self.emit_expr(scrut);
+        let tmp = format!("jm_{}", self.tmp);
+        self.tmp += 1;
+        self.line(format!("{cty} {tmp} = {scrut_c};"));
+
+        // Classify the arms (bodies + any binding) into some / none / catch-all.
+        let mut some_arm: Option<(ExprId, Option<String>)> = None;
+        let mut none_arm: Option<ExprId> = None;
+        let mut default_arm: Option<(ExprId, Option<String>)> = None;
+        for arm in arms {
+            match &ast.pat_at(arm.pat).kind {
+                PatKind::Variant { name, subpats } if name.name == n.some_variant => {
+                    let bind = subpats.first().and_then(|sp| match &ast.pat_at(*sp).kind {
+                        PatKind::Ident(b) => Some(b.name.clone()),
+                        _ => None,
+                    });
+                    some_arm = Some((arm.body, bind));
+                }
+                PatKind::Ident(name) if name.name == n.none_variant => none_arm = Some(arm.body),
+                PatKind::Wildcard => default_arm = Some((arm.body, None)),
+                PatKind::Ident(b) => default_arm = Some((arm.body, Some(b.name.clone()))),
+                _ => {}
+            }
+        }
+
+        // `some` branch: tmp != NULL, with the payload bound to the pointer.
+        self.line(format!("if ({tmp} != (({cty})0))"));
+        self.line("{");
+        self.depth += 1;
+        let some = some_arm.or_else(|| default_arm.clone());
+        if let Some((body, bind)) = some {
+            if let Some(b) = bind {
+                self.line(format!("{cty} j_{b} = {tmp};"));
+            }
+            self.emit_arm_body(body, ret);
+        }
+        self.depth -= 1;
+        self.line("}");
+        // `none` branch: tmp == NULL.
+        self.line("else");
+        self.line("{");
+        self.depth += 1;
+        if let Some(body) = none_arm {
+            self.emit_arm_body(body, ret);
+        } else if let Some((body, bind)) = default_arm {
+            if let Some(b) = bind {
+                self.line(format!("{cty} j_{b} = {tmp};"));
+            }
+            self.emit_arm_body(body, ret);
+        }
+        self.depth -= 1;
+        self.line("}");
+    }
+
     /// Lower a `match` on an enum to a `switch` on the tag. The scrutinee is
     /// spilled to a temporary so it is evaluated exactly once.
     fn emit_match(&mut self, e: ExprId, ret: bool) {
@@ -1267,6 +1403,12 @@ impl<'a> Cgen<'a> {
         };
 
         let scrut_ty = self.info.type_of(scrut).clone();
+        // A niche-optimized enum matches on a null test, not a tag `switch`.
+        if let Ty::Named(i) = &scrut_ty {
+            if let Some(n) = self.niche_enum_at(*i) {
+                return self.emit_niche_match(e, ret, &n);
+            }
+        }
         let enum_name = match &scrut_ty {
             Ty::Named(i)
                 if matches!(self.info.table.types[*i].kind, TypeKindG::Enum { .. }) =>
@@ -1385,6 +1527,16 @@ impl<'a> Cgen<'a> {
     }
 
     fn emit_variant_construct(&mut self, vi: &VariantInfo, vname: &str, args: &[ExprId]) -> String {
+        // Niche-optimized enum: the value *is* the pointer payload. The `some`
+        // variant emits its argument directly; the `none` variant is the null
+        // pointer — no tag, no struct literal.
+        if let Some(n) = self.niche_enum_named(&vi.enum_name) {
+            if vname == n.some_variant {
+                return args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".to_string());
+            }
+            let cty = self.c_type(&n.payload);
+            return format!("(({cty})0)");
+        }
         let mut s = format!("(Jestyr_{}){{ .tag = Jestyr_{}_{vname}", vi.enum_name, vi.enum_name);
         if !args.is_empty() {
             let _ = write!(s, ", .u.{vname} = {{ ");
@@ -3053,6 +3205,11 @@ impl<'a> Cgen<'a> {
                     return p.to_string();
                 }
                 match self.info.table.type_index.get(&n.name).copied() {
+                    // A niche-optimized enum lowers to its bare pointer payload.
+                    Some(i) if self.niche_enum_at(i).is_some() => {
+                        let payload = self.niche_enum_at(i).unwrap().payload;
+                        self.c_type(&payload)
+                    }
                     // structs and enums both lower to a `Jestyr_<Name>` typedef.
                     Some(_) => format!("Jestyr_{}", n.name),
                     None => {
@@ -3109,7 +3266,13 @@ impl<'a> Cgen<'a> {
                     _ => format!("{i}*"),
                 }
             }
-            Ty::Named(i) => format!("Jestyr_{}", self.info.table.types[*i].name),
+            Ty::Named(i) => {
+                // A niche-optimized enum *is* its pointer payload.
+                if let Some(n) = self.niche_enum_at(*i) {
+                    return self.c_type(&n.payload);
+                }
+                format!("Jestyr_{}", self.info.table.types[*i].name)
+            }
             // an inferred type parameter (e.g. `T`) under the active substitution
             Ty::Opaque(n) => match self.subst.get(n).cloned() {
                 Some(t) => self.c_type(&t),
@@ -4369,5 +4532,41 @@ mod tests {
         assert!(c.contains("int32_t j_v = "), "{c}"); // payload bound from the union
         assert!(c.contains("case Jestyr_E_b:"), "{c}");
         assert!(c.contains("__builtin_unreachable();"), "exhaustive match guard: {c}");
+    }
+
+    #[test]
+    fn niche_optimizes_an_optional_pointer_to_a_bare_pointer() {
+        // `none`/`some(*T)` collapses to the pointer itself — no tag, no struct.
+        let src = "enum Maybe { none, some(p: *mut i32) } \
+                   fn sz() -> i32 { size_of(Maybe) } \
+                   fn mk(p: *mut i32) -> Maybe { some(p) } \
+                   fn empty() -> Maybe { none } \
+                   fn get(m: Maybe) -> i32 { match m { some(p) => unsafe { p.* }, none => 0 } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        // No tagged-union struct or tag enum is emitted for the niche enum.
+        assert!(!c.contains("Jestyr_Maybe"), "niche enum has no struct/tag: {c}");
+        // It IS a pointer: size_of and the signature both show `int32_t*`.
+        assert!(c.contains("sizeof(int32_t*)"), "size_of is the pointer size: {c}");
+        assert!(c.contains("int32_t jestyr_get(int32_t* j_m"), "param is a bare pointer: {c}");
+        // Construction: `some(p)` is the pointer; `none` is the null pointer.
+        assert!(c.contains("return j_p;"), "some(p) lowers to the pointer: {c}");
+        assert!(c.contains("return ((int32_t*)0);"), "none lowers to NULL: {c}");
+        // Match lowers to a null test, not a tag switch.
+        assert!(c.contains("!= ((int32_t*)0)"), "match dispatches on NULL: {c}");
+        assert!(!c.contains("switch ("), "no tag switch for a niche enum: {c}");
+    }
+
+    #[test]
+    fn a_non_niche_enum_keeps_its_tagged_union() {
+        // Two payload fields ⇒ no single-pointer niche ⇒ ordinary tagged union.
+        let two = gen("enum E { none, some(p: *mut i32, n: i32) }").0;
+        assert!(two.contains("struct Jestyr_E {"), "two fields → tagged union: {two}");
+        // Three variants ⇒ not the 2-variant niche shape.
+        let three = gen("enum E { none, some(p: *mut i32), more(q: *mut i32) }").0;
+        assert!(three.contains("struct Jestyr_E {"), "three variants → tagged union: {three}");
+        // A fat generational ref `&T` has no null niche ⇒ tagged union.
+        let fat = gen("enum E { none, some(p: &i32) }").0;
+        assert!(fat.contains("struct Jestyr_E {"), "fat &T → tagged union: {fat}");
     }
 }
