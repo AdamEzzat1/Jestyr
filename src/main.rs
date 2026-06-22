@@ -18,6 +18,7 @@
 //!   jestyrc doc    <file.jtr>   render the file's API docs as Markdown (--html for HTML)
 
 mod ast;
+mod attrs;
 mod cgen;
 mod diag;
 mod doc;
@@ -48,6 +49,7 @@ enum Mode {
     EmitC,
     Build,
     Run,
+    Test,
     Tokens,
     Doc { html: bool },
 }
@@ -88,7 +90,7 @@ fn main() -> ExitCode {
             }
         }
         Some("tokens") | Some("parse") | Some("check") | Some("emit-c") | Some("build")
-        | Some("run") => {
+        | Some("run") | Some("test") => {
             let candidates = [
                 sub("tokens", Mode::Tokens),
                 sub("parse", Mode::Parse),
@@ -96,6 +98,7 @@ fn main() -> ExitCode {
                 sub("emit-c", Mode::EmitC),
                 sub("build", Mode::Build),
                 sub("run", Mode::Run),
+                sub("test", Mode::Test),
             ];
             match candidates.into_iter().flatten().next() {
                 Some(Ok(pair)) => pair,
@@ -162,7 +165,7 @@ fn main() -> ExitCode {
             }
             report_program(&prog.modules, &diags)
         }
-        Mode::EmitC | Mode::Build | Mode::Run => {
+        Mode::EmitC | Mode::Build | Mode::Run | Mode::Test => {
             // Codegen only ever sees well-formed programs: gate on every check.
             let prog = module::load(&path);
             if !prog.diags.is_empty() {
@@ -175,7 +178,13 @@ fn main() -> ExitCode {
                 return report_program(&prog.modules, &diags);
             }
 
-            let (c_src, cgen_diags) = cgen::emit(&prog.ast, &info);
+            // `test` mode emits a `@test`/`@bench` harness `main`; the rest emit
+            // the ordinary entry-point wrapper.
+            let (c_src, cgen_diags) = if matches!(mode, Mode::Test) {
+                cgen::emit_tests(&prog.ast, &info)
+            } else {
+                cgen::emit(&prog.ast, &info)
+            };
             match mode {
                 Mode::EmitC => {
                     print!("{c_src}");
@@ -189,7 +198,8 @@ fn main() -> ExitCode {
                     if !cgen_diags.is_empty() {
                         return report_program(&prog.modules, &cgen_diags);
                     }
-                    build_and_maybe_run(&path, &c_src, matches!(mode, Mode::Run))
+                    // `run` and `test` both execute the built binary.
+                    build_and_maybe_run(&path, &c_src, matches!(mode, Mode::Run | Mode::Test))
                 }
             }
         }
@@ -299,6 +309,7 @@ fn print_usage() {
     eprintln!("    jestyrc emit-c <file.jtr>   lower to C and print it");
     eprintln!("    jestyrc build  <file.jtr>   lower to C and compile a native binary");
     eprintln!("    jestyrc run    <file.jtr>   build, then execute the binary");
+    eprintln!("    jestyrc test   <file.jtr>   build & run the `@test`/`@bench` harness");
     eprintln!("    jestyrc tokens <file.jtr>   stop after lexing and dump tokens");
     eprintln!("    jestyrc doc    <file.jtr>   render the file's API docs as Markdown");
     eprintln!("                               (add --html for an HTML page)");

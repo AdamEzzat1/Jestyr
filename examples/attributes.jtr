@@ -1,0 +1,55 @@
+// examples/attributes.jtr — compiler attributes (roadmap workstream D).
+//
+//   jestyrc run examples/attributes.jtr
+//   →  25    (square:  @inline + @hot   — pure optimization hints)
+//      7     (slow_path: @cold          — the unlikely branch)
+//      12    (checked_add: @must_use    — its result must be consumed)
+//      9     (parse_v2 — we migrated off the @deprecated `parse`)
+//      8     (entry:   @no_mangle       — exported under its bare C symbol)
+//
+// The governing rule: attributes describe *compilation* (inline/hot/cold),
+// *tooling* (must_use, deprecated), and *ABI* (no_mangle) — they never change
+// *what* a function computes. Contracts (requires/ensures) stay real syntax,
+// not attributes.
+
+// Optimization intent. `@inline` lowers to `static inline
+// __attribute__((always_inline))`; `@hot` marks it for the fast path.
+@inline @hot fn square(x: i32) -> i32 {
+    return x * x
+}
+
+// `@cold` tells the optimizer this path is unlikely (error/slow handling).
+@cold fn slow_path(x: i32) -> i32 {
+    return x + 4
+}
+
+// `@must_use` (→ `warn_unused_result`): silently dropping the return is a
+// compiler warning. Here `main` consumes it, so the call is clean.
+@must_use fn checked_add(a: i32, b: i32) -> i32 {
+    return a + b
+}
+
+// `@deprecated` records a migration message. Any *call site* of `parse` draws a
+// `-Wdeprecated-declarations` warning naming the replacement; `main` below has
+// already migrated to `parse_v2`, so the build stays quiet.
+@deprecated("use parse_v2") fn parse(x: i32) -> i32 {
+    return x
+}
+
+fn parse_v2(x: i32) -> i32 {
+    return x + 1
+}
+
+// `@no_mangle` exports this under the bare C symbol `entry` (no `jestyr_`
+// prefix) — the export counterpart to `extern "c"`. Cannot be generic.
+@no_mangle fn entry(x: i32) -> i32 {
+    return x * 2
+}
+
+fn main() {
+    print_int(square(5))         // 25
+    print_int(slow_path(3))      // 7
+    print_int(checked_add(5, 7)) // 12  (result consumed → @must_use satisfied)
+    print_int(parse_v2(8))       // 9   (the @deprecated `parse` is retired)
+    print_int(entry(4))          // 8   (called by its bare, unmangled name)
+}

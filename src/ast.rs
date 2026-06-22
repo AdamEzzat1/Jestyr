@@ -298,8 +298,14 @@ pub struct FnDecl {
     /// methods (a method's visibility follows its enclosing struct).
     pub is_pub: bool,
     /// `@no_panic fn …` (design §13) — the compiler must *prove* every faulting
-    /// op (today: slice indexing) is fault-free, else it's a compile error.
+    /// op (today: slice indexing) is fault-free, else it's a compile error. A
+    /// cached projection of [`FnDecl::attrs`]; see also [`FnDecl::has_attr`].
     pub no_panic: bool,
+    /// Every leading `@name` / `@name(args)` directive on this function (design
+    /// §7/§16; roadmap workstream D). Validated by [`crate::attrs`]; consumed by
+    /// the backend for optimization/ABI hints (`@inline`, `@cold`, `@no_mangle`,
+    /// `@deprecated`, …). The single source of truth — `no_panic` mirrors it.
+    pub attrs: Vec<Attribute>,
     pub name: Ident,
     pub params: Vec<Param>,
     pub ret_conv: Conv,
@@ -312,6 +318,18 @@ pub struct FnDecl {
     pub ensures: Vec<ExprId>,
     pub body: Block,
     pub span: Span,
+}
+
+impl FnDecl {
+    /// Is the attribute `@<name>` present on this function?
+    pub fn has_attr(&self, name: &str) -> bool {
+        self.attrs.iter().any(|a| a.name == name)
+    }
+
+    /// The attribute `@<name>`, if present (e.g. to read `@deprecated`'s message).
+    pub fn attr(&self, name: &str) -> Option<&Attribute> {
+        self.attrs.iter().find(|a| a.name == name)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -348,7 +366,19 @@ pub struct ConstDecl {
     pub name: Ident,
     pub ty: Option<TypeId>,
     pub value: ExprId,
+    /// `@no_mangle` / `@section(…)` directives (validated by [`crate::attrs`]).
+    pub attrs: Vec<Attribute>,
     pub span: Span,
+}
+
+impl ConstDecl {
+    pub fn has_attr(&self, name: &str) -> bool {
+        self.attrs.iter().any(|a| a.name == name)
+    }
+
+    pub fn attr(&self, name: &str) -> Option<&Attribute> {
+        self.attrs.iter().find(|a| a.name == name)
+    }
 }
 
 /// A foreign function declared via `extern "c" fn name(...) -> T` — a bodyless

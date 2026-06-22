@@ -1,0 +1,34 @@
+// examples/tests_demo.jtr — the @test / @bench harness (roadmap workstream O).
+//
+//   jestyrc test examples/tests_demo.jtr
+//   →  running 2 test(s)
+//      test add_is_commutative ... ok
+//      test doubling_works ... ok
+//      bench sum_to_1000 ... 0.000 ms
+//
+//      result: 2 passed; 0 failed
+//
+// `jestyrc test` ignores any `main` and instead generates a harness that runs
+// every `@test` (a no-argument function returning `bool` — `true` = pass) and
+// times every `@bench`. The process exit code is 0 iff every test passed, so it
+// drops straight into CI. A failing test prints `... FAILED` and flips the exit.
+
+fn add(a: i32, b: i32) -> i32 { return a + b }
+fn double(x: i32) -> i32 { return x * 2 }
+
+// A test returns `true` on success. The harness prints `test <name> ... ok`.
+@test fn add_is_commutative() -> bool {
+    return add(2, 3) == add(3, 2)
+}
+
+@test fn doubling_works() -> bool {
+    return double(21) == 42
+}
+
+// A benchmark takes no arguments; its body is timed with `clock()`. (This is a
+// single timed invocation — a real micro-benchmark would loop and consume the
+// result to defeat the optimizer; that refinement is future work.)
+@bench fn sum_to_1000() {
+    var total: i32 = 0
+    for i in 0..1000 { total = total + i }
+}

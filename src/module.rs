@@ -423,6 +423,28 @@ mod tests {
     }
 
     #[test]
+    fn attributes_example_compiles_clean() {
+        // Compiler attributes (workstream D): @inline/@hot/@cold optimization
+        // hints, @must_use, @deprecated, and a @no_mangle export.
+        pipeline_is_clean("examples/attributes.jtr");
+    }
+
+    #[test]
+    fn tests_demo_example_builds_a_clean_test_harness() {
+        // The `@test`/`@bench` runner (workstream O): emit in test mode and check
+        // the harness is generated without diagnostics.
+        let prog = load("examples/tests_demo.jtr");
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, type_diags) = typeck::check_program(&prog.ast, &prog.modules);
+        let mut sema = type_diags;
+        sema.extend(crate::escape::check(&prog.ast, &info));
+        assert!(sema.is_empty(), "sema diags: {:?}", sema);
+        let (c, cgen_diags) = crate::cgen::emit_tests(&prog.ast, &info);
+        assert!(cgen_diags.is_empty(), "cgen diags: {:?}", cgen_diags);
+        assert!(c.contains("running 2 test(s)"), "harness counts the two tests: {c}");
+    }
+
+    #[test]
     fn qualified_access_resolves_public_items() {
         let dir = fixture(
             "qual",

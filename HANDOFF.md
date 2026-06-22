@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 157 tests pass, including `proptest` property
+and run (or are correctly rejected). 186 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -83,6 +83,7 @@ jestyrc check  <file.jtr>   resolve, type-check, ownership-check
 jestyrc emit-c <file.jtr>   lower to C and print it
 jestyrc build  <file.jtr>   lower to C and compile a native binary (needs cc)
 jestyrc run    <file.jtr>   build, then execute
+jestyrc test   <file.jtr>   build & run the `@test`/`@bench` harness (workstream O)
 jestyrc doc    <file.jtr>   render the file's API docs as Markdown (--html for HTML)
 ```
 (Run via `cargo run -- <args>`.)
@@ -107,7 +108,9 @@ src/
   lexer.rs            Hand-written lexer; new()/new_slice() (slice = one module's region).
                       Collects `///`/`//!`/`/** */` docs as trivia (tokenize_with_docs).
   ast.rs              Arena AST: ExprId/TypeId/PatId handles, all node enums, Ast.
-                      Item::Import, `is_pub` on decls (item K).
+                      Item::Import, `is_pub` on decls (item K); `attrs` on FnDecl/Struct.
+  attrs.rs            Attribute registry + validation (workstream D): the closed set,
+                      legal targets, arg shapes, conflicts, "did you mean". §5.30.
   module.rs           Module loader (item K): import resolution, cycle detection,
                       shared-arena multi-file merge, per-module bookkeeping. Modules.
   parser.rs           Recursive descent + Pratt. parse()/parse_module()/resume().
@@ -208,6 +211,8 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `loops.jtr` | `10`, `15`, `10`, `14`, `2`, `3` | **unified `for`** — range/inclusive/slice-read/`mut`-in-place/infinite+break/`for _`; bounds-check elision + `invariant` |
 | `loops_advanced.jtr` | `32`, `6`, `1`, `102`, `203`, `30`, `131`, `2`, `20`, `0` | loop fast-follows — zip, `@no_panic`, element+index, region scratch, strings, casts, labeled break, step, `variant` |
 | `docs.jtr` | `5`, `7`, `20`, `6` | **doc comments (C)** — `//!`/`///`/`/** */` tiers, sections, examples; also `jestyrc doc examples/docs.jtr` renders its API (signatures + prose + machine-checked **Guarantees**) |
+| `attributes.jtr` | `25`, `7`, `12`, `9`, `8` | **compiler attributes (D)** — `@inline`/`@hot`/`@cold` opt hints, `@must_use`, `@deprecated("…")`, `@no_mangle` export; registry-validated (§5.30) |
+| `tests_demo.jtr` | (via `jestyrc test`) | **`@test`/`@bench` runner (O)** — `jestyrc test` harness: runs `bool`-returning tests + timed benches; exit≠0 on failure (§5.30) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -524,6 +529,45 @@ These are the non-obvious things that will bite if you don't know them.
     for now (doesn't crawl `import`s). User reference: [`docs/comments.md`](docs/comments.md);
     demo `examples/docs.jtr`.
 
+31. **Attributes are registry-validated; `attrs.rs` is the single source of truth.**
+    `parse_attrs` collects raw `@name`/`@name(args)` onto items; `FnDecl` now keeps
+    its **full** `attrs: Vec<Attribute>` (not just the `no_panic` bool — that field is
+    a cached projection; `FnDecl::has_attr`/`attr` read the vector). Every item's
+    attributes are checked against the closed registry in `attrs.rs` *at parse time*
+    (so enum/const/extern attrs are validated before being discarded): a row lists an
+    attribute's legal `Target`s, its `Args` shape, and a `Status` (`Active` vs
+    `Reserved`). **Anything unknown, misplaced, mis-argued, contradictory, or
+    reserved-but-unimplemented is a hard error** (with a Levenshtein "did you mean"
+    for typos) — a deterministic language must never silently ignore a directive. The
+    backend (`cgen::fn_attr_prefix`) lowers function attributes to GNU declaration
+    clauses: `@inline` → `static inline __attribute__((always_inline))` (the `static`
+    dodges C11's inline-linkage pitfall, and is why `@inline` conflicts with
+    `@no_mangle`), `@no_inline`/`@hot`/`@cold` → the matching `__attribute__`,
+    `@must_use` → `warn_unused_result`, `@deprecated("m")` → `deprecated("m")` (the
+    message literal already carries its quotes). `@no_mangle` (`cgen::c_fn_name` +
+    a `no_mangle` set) emits the function under its **bare** C symbol and calls it
+    bare — the export mirror of `extern "c"`; rejected on generics (no single name to
+    mangle) and a no-op on `main` (already exported by the entry wrapper). These are
+    all *hints/ABI*, never behavior — the design's hard rule. Demo `attributes.jtr`.
+    **Also active:** `@section(".name")` (→ `__attribute__((section…))` on fns,
+    methods, *and* consts — bare-metal placement); `@no_mangle` **on consts** (a
+    bare external `const <name>` instead of `static const j_<name>`, referenced
+    bare via `no_mangle_consts` in the `Name` arm — *caveat:* a local shadowing the
+    name mis-resolves, since cgen has no scope map). **Bug-fix watch-outs:** the
+    `@no_mangle` bare-name must be threaded everywhere a callee name is built —
+    `emit_named_call`, the direct `Name`-call arm, the **free-method-call** path
+    (`emit_method_call`, item A), and the **spawn trampoline** (`jestyr_task_*`)
+    all route through `c_fn_name` now; miss one and a `@no_mangle` target link-errors.
+    Validation extras (`attrs.rs`): duplicate attributes, `@align` must be a positive
+    power of two, conflicts include `@inline`+`@no_mangle`. Doc: `docs/attributes.md`.
+    **`@test`/`@bench` runner (workstream O):** `cgen::emit_tests` (vs `emit`) swaps
+    the `main` wrapper for `test_main` — a harness that calls each `@test` (a no-arg
+    `bool` fn; `true`=pass) tallying pass/fail and times each `@bench` with `clock()`
+    (prelude pulls `<time.h>` in `test_mode`); exit≠0 on any failure. Driven by
+    `jestyrc test` (`Mode::Test` in `main.rs`); demo `tests_demo.jtr`.
+    **Reserved (recognized, error-on-use until built):** `@verified` (SMT),
+    `@doc_hidden` (doc gen, workstream C).
+
 ---
 
 ## 6. How to add tests
@@ -549,6 +593,8 @@ lettered — A, B, C (method sugar / closures / generic-struct methods), **D**
 (generational refs), **E** (bounds-check elision), F (contracts), H (`extern "c"`),
 J (structured concurrency), L (diagnostics); plus the `restrict` speed work and these
 **Section-C / design-doc features**: layout attributes (`@packed`/`@align`/`size_of`),
+the **general attribute system** (registry-validated `@inline`/`@no_inline`/`@hot`/
+`@cold`/`@must_use`/`@deprecated`/`@no_mangle`; workstream D — see `attrs.rs` + §5.30),
 slices `[]T` + bounds-checked indexing, match exhaustiveness + payload projection,
 bare-metal `@volatile`/`@address`, and **MVS** (default = `read`).
 **Remaining (lettered):** G (CTFE + reflection), N (self-hosting). **D is fully

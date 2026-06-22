@@ -60,7 +60,8 @@ impl<'a> Printer<'a> {
                 self.line(d, &format!("const {}: {} =", c.name.name, ts));
                 self.expr(d + 1, c.value);
             }
-            Item::Struct { name, body, .. } => {
+            Item::Struct { name, body, attrs, .. } => {
+                self.attrs(d, attrs);
                 self.line(d, &format!("struct {}", name.name));
                 self.struct_body(d + 1, body);
             }
@@ -81,7 +82,20 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// Render an item's leading attributes, one `@name(args…)` per line.
+    fn attrs(&mut self, d: usize, attrs: &[Attribute]) {
+        for a in attrs {
+            let args: Vec<String> = a.args.iter().map(|e| self.expr_inline(*e)).collect();
+            if args.is_empty() {
+                self.line(d, &format!("@{}", a.name));
+            } else {
+                self.line(d, &format!("@{}({})", a.name, args.join(", ")));
+            }
+        }
+    }
+
     fn func(&mut self, d: usize, f: &FnDecl, kw: &str) {
+        self.attrs(d, &f.attrs);
         self.line(d, &format!("{} {}", kw, f.name.name));
         if !f.params.is_empty() {
             self.line(d + 1, "params:");

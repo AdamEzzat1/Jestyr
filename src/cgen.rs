@@ -31,7 +31,20 @@ use crate::diag::Diagnostic;
 use crate::span::Span;
 use crate::types::{prim_ty, MethodRes, Ty, TypeInfo, TypeKindG};
 
+/// Lower a program to C, ending with the ordinary entry-point wrapper around
+/// the user's `main`.
 pub fn emit(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
+    emit_program(ast, info, false)
+}
+
+/// Lower a program to C in *test* mode: instead of the `main` wrapper, emit a
+/// harness `main` that runs every `@test` (reporting pass/fail) and times every
+/// `@bench`. Drives `jestyrc test` (roadmap workstream O).
+pub fn emit_tests(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
+    emit_program(ast, info, true)
+}
+
+fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool) -> (String, Vec<Diagnostic>) {
     // Index every enum variant by name, so the backend can construct and match
     // on them by finding the owning enum and the variant's payload fields.
     let mut variants = HashMap::new();
@@ -111,6 +124,27 @@ pub fn emit(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
         break_label: None,
         variant_trackers: HashMap::new(),
         cur_no_panic: false,
+        no_mangle: ast
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                // `main` is already exported as the C `main` by the entry wrapper,
+                // so `@no_mangle` on it is a redundant no-op rather than a rename.
+                Item::Fn(f) if f.has_attr("no_mangle") && f.name.name != "main" => {
+                    Some(f.name.name.clone())
+                }
+                _ => None,
+            })
+            .collect(),
+        no_mangle_consts: ast
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Const(c) if c.has_attr("no_mangle") => Some(c.name.name.clone()),
+                _ => None,
+            })
+            .collect(),
+        test_mode,
     };
     g.spawn_sites = g.collect_spawns();
     g.slice_instances = g.collect_slices();
@@ -139,7 +173,11 @@ pub fn emit(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
     g.closure_fns();
     g.fn_defs();
     g.method_defs();
-    g.main_wrapper();
+    if g.test_mode {
+        g.test_main();
+    } else {
+        g.main_wrapper();
+    }
     (g.out, g.diags)
 }
 
@@ -258,6 +296,17 @@ struct Cgen<'a> {
     /// is the function being emitted `@no_panic`? If so, a non-elided (faulting)
     /// slice index is a compile error rather than a runtime bounds check.
     cur_no_panic: bool,
+    /// functions marked `@no_mangle` — emitted under their bare Jestyr name (no
+    /// `jestyr_` prefix) so they expose a stable C symbol, the export counterpart
+    /// to `extern "c"` import. Validation forbids this on generic functions.
+    no_mangle: HashSet<String>,
+    /// `const`s marked `@no_mangle` — emitted as an external `<name>` global (not
+    /// `static const j_<name>`); references render bare. (A local shadowing such a
+    /// name would mis-resolve — top-level names are globally unique by design.)
+    no_mangle_consts: HashSet<String>,
+    /// emitting a `jestyrc test` harness (`@test`/`@bench` runner) rather than the
+    /// ordinary `main` wrapper.
+    test_mode: bool,
 }
 
 impl<'a> Cgen<'a> {
@@ -280,6 +329,9 @@ impl<'a> Cgen<'a> {
         self.raw("#include <stdint.h>\n#include <stdbool.h>\n#include <stddef.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <assert.h>\n");
         if !self.spawn_sites.is_empty() {
             self.raw("#include <pthread.h>\n");
+        }
+        if self.test_mode {
+            self.raw("#include <time.h>\n"); // `@bench` timing via clock()
         }
         self.raw("\n");
         self.raw("/* Jestyr runtime prelude — temporary print intrinsics (stand-in for a stdlib). */\n");
@@ -713,7 +765,8 @@ impl<'a> Cgen<'a> {
                     continue;
                 }
                 self.subst.clear();
-                let sig = self.fn_signature(f, &format!("jestyr_{}", f.name.name));
+                let cname = self.c_fn_name(&f.name.name);
+                let sig = self.fn_signature(f, &cname);
                 self.raw(format!("{sig};\n"));
             }
         }
@@ -782,7 +835,21 @@ impl<'a> Cgen<'a> {
                     self.c_type(&t)
                 };
                 let v = self.emit_expr(c.value);
-                self.raw(format!("static const {cty} j_{} = {v};\n", c.name.name));
+                // `@section(".name")` places the global in a named linker section.
+                let section = c
+                    .attr("section")
+                    .and_then(|a| a.args.first())
+                    .and_then(|arg| match &self.ast.expr_at(*arg).kind {
+                        ExprKind::Str(s) => Some(format!(" __attribute__((section({s})))")),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                if self.no_mangle_consts.contains(&c.name.name) {
+                    // Exported as a bare external symbol (no `static`, no `j_` prefix).
+                    self.raw(format!("const {cty} {}{section} = {v};\n", c.name.name));
+                } else {
+                    self.raw(format!("static const {cty} j_{}{section} = {v};\n", c.name.name));
+                }
             }
         }
         self.raw("\n");
@@ -804,7 +871,8 @@ impl<'a> Cgen<'a> {
                     continue;
                 }
                 self.subst.clear();
-                self.emit_fn(f, &format!("jestyr_{}", f.name.name));
+                let cname = self.c_fn_name(&f.name.name);
+                self.emit_fn(f, &cname);
             }
         }
         // monomorphized instances
@@ -898,10 +966,73 @@ impl<'a> Cgen<'a> {
         self.result_c_name(&ok)
     }
 
+    /// The C symbol for a *non-generic* user function: its bare name when
+    /// `@no_mangle`, otherwise the collision-free `jestyr_<name>`. (Generic
+    /// instances are always mangled with their type arguments and never reach
+    /// here — `@no_mangle` on a generic is rejected during validation.)
+    fn c_fn_name(&self, name: &str) -> String {
+        if self.no_mangle.contains(name) {
+            name.to_string()
+        } else {
+            format!("jestyr_{name}")
+        }
+    }
+
+    /// Translate a function's optimization/ABI/tooling attributes into a leading
+    /// declaration clause: a storage prefix (`@inline` → `static inline`, so the
+    /// always-inline definition has internal linkage and dodges C's inline-
+    /// linkage pitfall) plus a GNU `__attribute__((…))` group. These are pure
+    /// hints — they never change *what* the function computes (the design rule).
+    fn fn_attr_prefix(&self, f: &FnDecl) -> String {
+        let mut storage = String::new();
+        let mut gnu: Vec<String> = Vec::new();
+        for a in &f.attrs {
+            match a.name.as_str() {
+                "inline" => {
+                    storage = "static inline ".to_string();
+                    gnu.push("always_inline".to_string());
+                }
+                "no_inline" => gnu.push("noinline".to_string()),
+                "hot" => gnu.push("hot".to_string()),
+                "cold" => gnu.push("cold".to_string()),
+                "section" => {
+                    // The section name literal already carries its quotes, so
+                    // `section(<str>)` is a ready-made C clause.
+                    if let Some(arg) = a.args.first() {
+                        if let ExprKind::Str(s) = &self.ast.expr_at(*arg).kind {
+                            gnu.push(format!("section({s})"));
+                        }
+                    }
+                }
+                "must_use" => gnu.push("warn_unused_result".to_string()),
+                "deprecated" => {
+                    // The message literal already carries its quotes verbatim, so
+                    // `deprecated(<str>)` is a ready-made C string literal.
+                    let clause = match a.args.first() {
+                        Some(arg) => match &self.ast.expr_at(*arg).kind {
+                            ExprKind::Str(s) => format!("deprecated({s})"),
+                            _ => "deprecated".to_string(),
+                        },
+                        None => "deprecated".to_string(),
+                    };
+                    gnu.push(clause);
+                }
+                _ => {} // `no_panic` is handled in the body; layout attrs aren't on fns
+            }
+        }
+        let attr = if gnu.is_empty() {
+            String::new()
+        } else {
+            format!("__attribute__(({})) ", gnu.join(", "))
+        };
+        format!("{storage}{attr}")
+    }
+
     fn fn_signature(&mut self, f: &FnDecl, c_name: &str) -> String {
+        let prefix = self.fn_attr_prefix(f);
         let ret = self.ret_type(f);
         let params = self.params_str(f);
-        format!("{ret} {c_name}({params})")
+        format!("{prefix}{ret} {c_name}({params})")
     }
 
     fn main_wrapper(&mut self) {
@@ -920,6 +1051,53 @@ impl<'a> Cgen<'a> {
             Some(false) => self.raw("int main(void) { jestyr_main(); return 0; }\n"),
             None => {}
         }
+    }
+
+    /// Emit the `jestyrc test` harness `main`: run each `@test` (a no-arg fn
+    /// returning `bool`), tallying pass/fail; then time each `@bench`. Exits
+    /// non-zero if any test fails. (User `main` is ignored in test mode.)
+    fn test_main(&mut self) {
+        let ast = self.ast;
+        let runnable = |f: &FnDecl| !self.is_generic(f) && self.fn_supported(f);
+        let tests: Vec<String> = ast
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Fn(f) if f.has_attr("test") && runnable(f) => Some(f.name.name.clone()),
+                _ => None,
+            })
+            .collect();
+        let benches: Vec<String> = ast
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Fn(f) if f.has_attr("bench") && runnable(f) => Some(f.name.name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        self.raw("int main(void) {\n");
+        self.raw(format!(
+            "    int _passed = 0, _failed = 0;\n    printf(\"running {} test(s)\\n\");\n",
+            tests.len()
+        ));
+        for t in &tests {
+            let call = self.c_fn_name(t);
+            self.raw(format!("    printf(\"test {t} ... \"); fflush(stdout);\n"));
+            self.raw(format!(
+                "    if ({call}()) {{ printf(\"ok\\n\"); _passed++; }} else {{ printf(\"FAILED\\n\"); _failed++; }}\n"
+            ));
+        }
+        for b in &benches {
+            let call = self.c_fn_name(b);
+            self.raw(format!(
+                "    {{ clock_t _s = clock(); {call}(); clock_t _e = clock(); \
+                 printf(\"bench {b} ... %.3f ms\\n\", (double)(_e - _s) * 1000.0 / CLOCKS_PER_SEC); }}\n"
+            ));
+        }
+        self.raw(
+            "    printf(\"\\nresult: %d passed; %d failed\\n\", _passed, _failed);\n    return _failed == 0 ? 0 : 1;\n}\n",
+        );
     }
 
     // --- signatures ---
@@ -1252,6 +1430,9 @@ impl<'a> Cgen<'a> {
                 }
                 if self.ptr_params.contains(&n.name) {
                     format!("(*j_{})", n.name)
+                } else if self.no_mangle_consts.contains(&n.name) {
+                    // A `@no_mangle` const is referenced by its bare exported name.
+                    n.name.clone()
                 } else {
                     format!("j_{}", n.name)
                 }
@@ -1705,7 +1886,7 @@ impl<'a> Cgen<'a> {
                     parts.push(e);
                 }
             }
-            return format!("jestyr_{}({})", n.name, parts.join(", "));
+            return format!("{}({})", self.c_fn_name(&n.name), parts.join(", "));
         }
 
         let c = self.emit_expr(callee);
@@ -1740,7 +1921,8 @@ impl<'a> Cgen<'a> {
         if self.extern_fns.contains(name) {
             format!("{}({})", name, parts.join(", "))
         } else {
-            format!("jestyr_{}({})", name, parts.join(", "))
+            // `@no_mangle` callees are reached by their bare C name too.
+            format!("{}({})", self.c_fn_name(name), parts.join(", "))
         }
     }
 
@@ -1780,8 +1962,11 @@ impl<'a> Cgen<'a> {
                 .find_fn(&mr.fn_name)
                 .map(|f| f.params.iter().filter(|p| !p.comptime).skip(1).map(|p| p.conv).collect())
                 .unwrap_or_default();
+            // A free-function method (item A) may itself be `@no_mangle`, so route
+            // the non-generic name through `c_fn_name`. (A generic free method is
+            // never `@no_mangle` — validation forbids it — so the mangled path stays.)
             let nm = if targs.is_empty() {
-                format!("jestyr_{}", mr.fn_name)
+                self.c_fn_name(&mr.fn_name)
             } else {
                 format!("jestyr_{}", self.mangle(&mr.fn_name, &targs))
             };
@@ -2293,7 +2478,11 @@ impl<'a> Cgen<'a> {
             .collect();
         self.cur_result.clear();
         self.cur_ensures.clear();
+        // `@no_panic`/`@inline`/`@cold`/… are honoured on methods too (they emit as
+        // free C functions), so the attribute machinery must follow them here.
+        self.cur_no_panic = f.no_panic;
 
+        let prefix = self.fn_attr_prefix(f);
         let ret = match f.ret_ty {
             Some(t) => self.c_ty_ast(t),
             None => "void".to_string(),
@@ -2301,17 +2490,18 @@ impl<'a> Cgen<'a> {
         let cname = self.method_c_name(ctor, args, &f.name.name);
         let params = self.method_params_str(f);
         if body {
-            self.raw(format!("{ret} {cname}({params})\n"));
+            self.raw(format!("{prefix}{ret} {cname}({params})\n"));
             self.emit_body(&f.body, ret != "void");
             self.raw("\n");
         } else {
-            self.raw(format!("{ret} {cname}({params});\n"));
+            self.raw(format!("{prefix}{ret} {cname}({params});\n"));
         }
 
         self.ptr_params.clear();
         self.self_cty.clear();
         self.self_is_ptr = false;
         self.subst.clear();
+        self.cur_no_panic = false;
     }
 
     fn method_protos(&mut self) {
@@ -2434,9 +2624,10 @@ impl<'a> Cgen<'a> {
             self.raw("};\n");
 
             let call_args: Vec<String> = (0..runtime.len()).map(|i| format!("_a->a{i}")).collect();
+            let callee = self.c_fn_name(&site.fn_name); // honour `@no_mangle` spawn targets
             self.raw(format!("static void* jestyr_task_{id}(void* _vp) {{ "));
             self.raw(format!("struct _jsp_{id}* _a = (struct _jsp_{id}*)_vp; "));
-            self.raw(format!("jestyr_{}({}); return NULL; }}\n", site.fn_name, call_args.join(", ")));
+            self.raw(format!("{callee}({}); return NULL; }}\n", call_args.join(", ")));
         }
         if !self.spawn_sites.is_empty() {
             self.raw("\n");
@@ -3478,6 +3669,16 @@ mod tests {
         emit(&ast, &info)
     }
 
+    /// Like [`gen`], but lowers in test-harness mode (`jestyrc test`).
+    fn gen_tests(src: &str) -> (String, Vec<Diagnostic>) {
+        let (tokens, ld) = Lexer::new(src).tokenize();
+        assert!(ld.is_empty(), "lex: {:?}", ld);
+        let (ast, pd) = Parser::new(src, tokens).parse();
+        assert!(pd.is_empty(), "parse: {:?}", pd);
+        let (info, _td) = crate::typeck::check(&ast);
+        emit_tests(&ast, &info)
+    }
+
     #[test]
     fn lowers_a_function_with_arithmetic_and_return() {
         let (c, d) = gen("fn add(a: i32, b: i32) -> i32 { a + b }");
@@ -3637,6 +3838,107 @@ mod tests {
         assert!(c.contains("int32_t puts(const char* j_s);"), "extern prototype: {c}");
         assert!(c.contains("puts(\"hi\")"), "called by bare C name: {c}");
         assert!(!c.contains("jestyr_puts"), "extern names are not mangled: {c}");
+    }
+
+    #[test]
+    fn lowers_function_optimization_and_tooling_attributes() {
+        // Each attribute lowers to a GNU declaration clause — a pure hint that
+        // never changes what the function computes.
+        let src = "@inline @hot fn sq(x: i32) -> i32 { return x * x } \
+                   @cold fn slow(x: i32) -> i32 { return x } \
+                   @must_use fn add(a: i32, b: i32) -> i32 { return a + b } \
+                   @deprecated(\"use v2\") fn old(x: i32) -> i32 { return x }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(
+            c.contains("static inline __attribute__((always_inline, hot)) int32_t jestyr_sq"),
+            "inline+hot → static inline always_inline: {c}"
+        );
+        assert!(c.contains("__attribute__((cold)) int32_t jestyr_slow"), "cold: {c}");
+        assert!(
+            c.contains("__attribute__((warn_unused_result)) int32_t jestyr_add"),
+            "must_use → warn_unused_result: {c}"
+        );
+        assert!(
+            c.contains("__attribute__((deprecated(\"use v2\"))) int32_t jestyr_old"),
+            "deprecated carries its message: {c}"
+        );
+    }
+
+    #[test]
+    fn no_mangle_emits_a_bare_symbol_and_calls_it_bare() {
+        // `@no_mangle` exports the function under its bare C name (no `jestyr_`),
+        // and every call site reaches it by that bare name too.
+        let src = "@no_mangle fn entry(x: i32) -> i32 { return x * 2 } \
+                   fn main() -> i32 { return entry(4) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("int32_t entry(int32_t j_x)"), "bare definition: {c}");
+        assert!(c.contains("return entry(4);"), "called by bare name: {c}");
+        assert!(!c.contains("jestyr_entry"), "the export is not mangled: {c}");
+    }
+
+    #[test]
+    fn section_attribute_places_a_function_in_a_named_section() {
+        let (c, d) = gen("@section(\".boot\") fn reset() {}");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(
+            c.contains("__attribute__((section(\".boot\"))) void jestyr_reset"),
+            "section clause on the function: {c}"
+        );
+    }
+
+    #[test]
+    fn no_mangle_and_section_apply_to_a_const() {
+        let (c, d) = gen(
+            "@no_mangle const VERSION: i32 = 7 \
+             @section(\".rodata.cfg\") const CFG: i32 = 3 \
+             fn main() -> i32 { return VERSION + CFG }",
+        );
+        assert!(d.is_empty(), "{:?}", d);
+        // `@no_mangle` → bare external global, referenced bare.
+        assert!(c.contains("const int32_t VERSION = 7;"), "no_mangle const is bare+external: {c}");
+        assert!(!c.contains("j_VERSION"), "no_mangle const reference is unmangled: {c}");
+        // `@section` → the global carries the section attribute (still `j_`-named).
+        assert!(
+            c.contains("static const int32_t j_CFG __attribute__((section(\".rodata.cfg\"))) = 3;"),
+            "section clause on the const: {c}"
+        );
+        assert!(c.contains("return (VERSION + j_CFG);"), "mixed references: {c}");
+    }
+
+    #[test]
+    fn test_harness_runs_tests_and_times_benches() {
+        let src = "@test fn t_ok() -> bool { return true } \
+                   @bench fn b_work() { var s: i32 = 0 for i in 0..10 { s = s + i } }";
+        let (c, d) = gen_tests(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("int main(void) {"), "harness emits its own main: {c}");
+        assert!(c.contains("running 1 test(s)"), "test count: {c}");
+        assert!(
+            c.contains("if (jestyr_t_ok()) { printf(\"ok\\n\"); _passed++; }"),
+            "runs the test and tallies: {c}"
+        );
+        assert!(c.contains("clock_t _s = clock(); jestyr_b_work();"), "times the bench: {c}");
+        assert!(c.contains("return _failed == 0 ? 0 : 1;"), "exit reflects failures: {c}");
+    }
+
+    #[test]
+    fn attributes_apply_to_a_generic_struct_method() {
+        // Methods emit as free C functions through a separate path, so the
+        // attribute prefix must follow them there too.
+        let src = "fn List(comptime T: type) -> type { return struct { \
+                       v: T, \
+                       @inline fn val(read self) -> T { return self.v } \
+                   } } \
+                   fn mk(comptime T: type, x: T) -> List(T) { return List(T){ v: x } } \
+                   fn main() -> i32 { var xs = mk(i32, 7) return xs.val() }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(
+            c.contains("static inline __attribute__((always_inline)) int32_t jestyr_List__i32_val"),
+            "an `@inline` method gets the same prefix as a free function: {c}"
+        );
     }
 
     #[test]

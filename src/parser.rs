@@ -15,6 +15,7 @@
 
 use crate::ast::*;
 use crate::ast::Ident; // explicit: shadows the glob clash with `TokenKind::Ident`
+use crate::attrs;
 use crate::diag::Diagnostic;
 use crate::span::Span;
 use crate::token::TokenKind::*;
@@ -144,32 +145,46 @@ impl<'src> Parser<'src> {
     // --- items ---
 
     fn parse_item(&mut self) -> Option<Item> {
-        let attrs = self.parse_attrs(); // `@packed`, `@align(n)`, `@layout(c)`, …
+        let attrs = self.parse_attrs(); // `@packed`, `@inline`, `@deprecated(…)`, …
         let is_pub = self.eat(Pub); // module-public vs module-private (design §9)
         match self.cur().kind {
             Fn => {
-                let mut f = self.parse_fn();
+                let mut f = self.parse_fn(attrs);
                 f.is_pub = is_pub;
-                f.no_panic = attrs.iter().any(|a| a.name == "no_panic");
+                // Validation needs the parsed signature (for `@must_use`/`@no_mangle`),
+                // so it runs *after* `parse_fn` rather than over the raw attrs.
+                self.check_fn_attrs(&f, false);
                 Some(Item::Fn(f))
             }
             Enum => {
+                self.check_attrs(&attrs, attrs::Target::Enum);
                 let mut e = self.parse_enum();
                 e.is_pub = is_pub;
                 Some(Item::Enum(e))
             }
             Const => {
+                self.check_attrs(&attrs, attrs::Target::Const);
                 let mut c = self.parse_const();
                 c.is_pub = is_pub;
+                c.attrs = attrs;
                 Some(Item::Const(c))
             }
-            Struct => Some(self.parse_named_struct(attrs, is_pub)),
+            Struct => {
+                self.check_attrs(&attrs, attrs::Target::Struct);
+                Some(self.parse_named_struct(attrs, is_pub))
+            }
             Extern => {
+                self.check_attrs(&attrs, attrs::Target::Extern);
                 let mut e = self.parse_extern();
                 e.is_pub = is_pub;
                 Some(Item::Extern(e))
             }
-            Import => Some(Item::Import(self.parse_import())),
+            Import => {
+                if let Some(a) = attrs.first() {
+                    self.error(a.span, "attributes are not allowed on `import`");
+                }
+                Some(Item::Import(self.parse_import()))
+            }
             other => {
                 self.error(
                     self.cur().span,
@@ -198,7 +213,7 @@ impl<'src> Parser<'src> {
         ImportDecl { path, alias, span: start.to(self.prev_span()) }
     }
 
-    fn parse_fn(&mut self) -> FnDecl {
+    fn parse_fn(&mut self, attrs: Vec<Attribute>) -> FnDecl {
         let start = self.cur().span;
         self.expect(Fn, "`fn`");
         let name = self.eat_ident("function name");
@@ -239,7 +254,10 @@ impl<'src> Parser<'src> {
 
         let body = self.parse_block();
         let span = start.to(body.span);
-        FnDecl { is_pub: false, no_panic: false, name, params, ret_conv, ret_ty, errors, requires, ensures, body, span }
+        // `no_panic` is a cached projection of `attrs` (the single source of truth)
+        // so the many `f.no_panic` read sites need not scan the vector each time.
+        let no_panic = attrs.iter().any(|a| a.name == "no_panic");
+        FnDecl { is_pub: false, no_panic, attrs, name, params, ret_conv, ret_ty, errors, requires, ensures, body, span }
     }
 
     /// `extern "c" fn name(params) -> ret` — a bodyless foreign declaration.
@@ -384,7 +402,7 @@ impl<'src> Parser<'src> {
         self.expect(Eq, "`=`");
         let value = self.parse_expr();
         let span = start.to(self.ast.expr_at(value).span);
-        ConstDecl { is_pub: false, name, ty, value, span }
+        ConstDecl { is_pub: false, name, ty, value, attrs: Vec::new(), span }
     }
 
     fn parse_named_struct(&mut self, attrs: Vec<Attribute>, is_pub: bool) -> Item {
@@ -418,19 +436,45 @@ impl<'src> Parser<'src> {
         attrs
     }
 
+    /// Validate item/field attributes against the registry (`crate::attrs`),
+    /// folding any problems into the parser's diagnostic stream. The immutable
+    /// borrow of `self.ast` and the mutable borrow of `self.diagnostics` are
+    /// disjoint struct fields, so the borrow checker accepts both at once.
+    fn check_attrs(&mut self, attrs: &[Attribute], target: attrs::Target) {
+        attrs::validate(&self.ast, attrs, target, &mut self.diagnostics);
+    }
+
+    /// Validate a function's (or method's) attributes — the generic checks plus
+    /// the signature-dependent ones (`@must_use`, `@no_mangle`).
+    fn check_fn_attrs(&mut self, f: &FnDecl, is_method: bool) {
+        attrs::validate_fn(&self.ast, f, is_method, &mut self.diagnostics);
+    }
+
     fn parse_struct_body(&mut self) -> StructBody {
         let start = self.cur().span;
         self.expect(LBrace, "`{`");
         let mut members = Vec::new();
         while !self.at(RBrace) && !self.at(Eof) {
             let before = self.pos;
+            // Leading attributes here belong to a *method* (`@inline fn …`); a
+            // field's attributes (`@volatile`) are written after its `:` instead.
+            let mattrs = self.parse_attrs();
             if self.at(Fn) {
-                members.push(StructMember::Method(self.parse_fn()));
+                let f = self.parse_fn(mattrs);
+                self.check_fn_attrs(&f, true);
+                members.push(StructMember::Method(f));
             } else {
+                if let Some(a) = mattrs.first() {
+                    self.error(
+                        a.span,
+                        "an attribute here applies to a method; a field's attributes (e.g. `@volatile`) go after its `:`",
+                    );
+                }
                 let fstart = self.cur().span;
                 let name = self.eat_ident("field name");
                 self.expect(Colon, "`:`");
                 let fattrs = self.parse_attrs(); // field-level: `@volatile`
+                self.check_attrs(&fattrs, attrs::Target::Field);
                 let volatile = fattrs.iter().any(|a| a.name == "volatile");
                 let ty = self.parse_type();
                 members.push(StructMember::Field {
