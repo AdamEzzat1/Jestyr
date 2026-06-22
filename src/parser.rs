@@ -171,7 +171,12 @@ impl<'src> Parser<'src> {
             }
             Struct => {
                 self.check_attrs(&attrs, attrs::Target::Struct);
-                Some(self.parse_named_struct(attrs, is_pub))
+                Some(self.parse_named_struct(attrs, is_pub, false))
+            }
+            Record => {
+                // An immutable product type — same grammar/attrs as `struct`.
+                self.check_attrs(&attrs, attrs::Target::Struct);
+                Some(self.parse_named_struct(attrs, is_pub, true))
             }
             Extern => {
                 self.check_attrs(&attrs, attrs::Target::Extern);
@@ -188,7 +193,7 @@ impl<'src> Parser<'src> {
             other => {
                 self.error(
                     self.cur().span,
-                    format!("expected an item (`fn`, `enum`, `const`, `struct`, `extern`, `import`), found `{}`", other.describe()),
+                    format!("expected an item (`fn`, `enum`, `const`, `struct`, `record`, `extern`, `import`), found `{}`", other.describe()),
                 );
                 self.bump();
                 None
@@ -405,13 +410,38 @@ impl<'src> Parser<'src> {
         ConstDecl { is_pub: false, name, ty, value, attrs: Vec::new(), span }
     }
 
-    fn parse_named_struct(&mut self, attrs: Vec<Attribute>, is_pub: bool) -> Item {
+    fn parse_named_struct(&mut self, attrs: Vec<Attribute>, is_pub: bool, is_record: bool) -> Item {
         let start = self.cur().span;
-        self.expect(Struct, "`struct`");
-        let name = self.eat_ident("struct name");
+        if is_record {
+            self.expect(Record, "`record`");
+        } else {
+            self.expect(Struct, "`struct`");
+        }
+        let what = if is_record { "record name" } else { "struct name" };
+        let name = self.eat_ident(what);
         let body = self.parse_struct_body();
+        // A record's fields are immutable, so a `mut self` / `out self` method —
+        // which exists to mutate the receiver — is a contradiction. Reject it.
+        if is_record {
+            for m in &body.members {
+                if let StructMember::Method(f) = m {
+                    if let Some(p) =
+                        f.params.iter().find(|p| p.is_self && matches!(p.conv, Conv::Mut | Conv::Out))
+                    {
+                        self.error(
+                            f.name.span,
+                            format!(
+                                "a method of immutable record `{}` cannot take `{} self`",
+                                name.name,
+                                p.conv.label()
+                            ),
+                        );
+                    }
+                }
+            }
+        }
         let span = start.to(body.span);
-        Item::Struct { is_pub, name, body, attrs, span }
+        Item::Struct { is_pub, is_record, name, body, attrs, span }
     }
 
     /// Parse a run of leading `@name` / `@name(args)` item attributes.
@@ -1348,6 +1378,31 @@ mod tests {
             }
             _ => panic!("expected a struct"),
         }
+    }
+
+    #[test]
+    fn parses_a_record_as_an_immutable_struct() {
+        let ast = parse_ok("record Point { x: i32, y: i32 }");
+        match &ast.items[0] {
+            Item::Struct { is_record, name, .. } => {
+                assert!(*is_record, "parsed as a record");
+                assert_eq!(name.name, "Point");
+            }
+            _ => panic!("expected a struct item"),
+        }
+        // …while a plain `struct` is not a record.
+        let s = parse_ok("struct S { x: i32 }");
+        assert!(matches!(&s.items[0], Item::Struct { is_record: false, .. }));
+    }
+
+    #[test]
+    fn record_rejects_a_mut_self_method() {
+        let (_ast, d) = parse("record P { x: i32  fn bump(mut self) { self.x = 1 } }");
+        assert!(
+            d.iter().any(|m| m.message.contains("cannot take `mut self`")),
+            "expected a mut-self rejection: {:?}",
+            d
+        );
     }
 
     #[test]

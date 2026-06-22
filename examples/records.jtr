@@ -1,0 +1,29 @@
+// examples/records.jtr — immutable `record` product types.
+//
+//   jestyrc run examples/records.jtr   →  3, 4, 25
+//
+// A `record` is a struct whose fields are *immutable*: `p.x = …` is a compile
+// error (try it — see the note below). It is a pure static guarantee — a record
+// lowers to the exact same C struct as a `struct`, so immutability costs nothing
+// at runtime. (CJC-inspired struct/record split; the immutability is enforced
+// statically by Jestyr's checker rather than at runtime like CJC's E0160.)
+
+record Point {
+    x: i32,
+    y: i32,
+
+    // Record methods read the receiver; `mut self` would be a compile error.
+    fn norm_sq(read self) -> i32 {
+        return self.x * self.x + self.y * self.y
+    }
+}
+
+fn main() -> i32 {
+    let p = Point { x: 3, y: 4 }
+    print_int(p.x)          // 3
+    print_int(p.y)          // 4
+    print_int(p.norm_sq())  // 25
+    // p.x = 5              // <- would be: error: cannot assign to a field of
+    //                            immutable record `Point`
+    return 0
+}

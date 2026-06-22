@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 186 tests pass, including `proptest` property
+and run (or are correctly rejected). 193 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -213,6 +213,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `docs.jtr` | `5`, `7`, `20`, `6` | **doc comments (C)** — `//!`/`///`/`/** */` tiers, sections, examples; also `jestyrc doc examples/docs.jtr` renders its API (signatures + prose + machine-checked **Guarantees**) |
 | `attributes.jtr` | `25`, `7`, `12`, `9`, `8` | **compiler attributes (D)** — `@inline`/`@hot`/`@cold` opt hints, `@must_use`, `@deprecated("…")`, `@no_mangle` export; registry-validated (§5.30) |
 | `tests_demo.jtr` | (via `jestyrc test`) | **`@test`/`@bench` runner (O)** — `jestyrc test` harness: runs `bool`-returning tests + timed benches; exit≠0 on failure (§5.30) |
+| `records.jtr` | `3`, `4`, `25` | **immutable `record` (B)** — struct/record split; field assignment is a static error; lowers to a plain struct (§5.32) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -568,6 +569,21 @@ These are the non-obvious things that will bite if you don't know them.
     **Reserved (recognized, error-on-use until built):** `@verified` (SMT),
     `@doc_hidden` (doc gen, workstream C).
 
+32. **`record` is an immutable `struct` — a static guarantee with zero representation
+    cost (CJC-inspired struct/record split).** A `record` is parsed exactly like a
+    `struct` (new `Record` keyword → `parser::parse_named_struct(.., is_record=true)`),
+    carries `is_record` on `Item::Struct` (`ast.rs`) and `TypeDecl` (`types.rs`), and
+    lowers to the **identical** C struct — cgen never branches on it. The immutability is
+    enforced purely in the checker: `typeck`'s `Assign` arm calls `record_name(base_ty)`
+    (which looks through one level of `*`/`&`/`&[r]`) and rejects `r.field = …` with
+    *"cannot assign to a field of immutable record"*; and `parse_named_struct` rejects a
+    `mut self`/`out self` method on a record. The whole *binding* may still be rebound
+    (`var p = …; p = Rec{…}`), like a `let` value — only **field** assignment is barred.
+    Design + the sequenced plan for the rest of the struct/enum/ADT work (niche-optimized
+    `Option`, struct-variant enums, Maranget exhaustiveness, recursive `indirect` ADTs,
+    `distinct`, layout reflection): [`docs/structs-enums-design.md`](docs/structs-enums-design.md).
+    Demo `examples/records.jtr`.
+
 ---
 
 ## 6. How to add tests
@@ -596,7 +612,9 @@ J (structured concurrency), L (diagnostics); plus the `restrict` speed work and 
 the **general attribute system** (registry-validated `@inline`/`@no_inline`/`@hot`/
 `@cold`/`@must_use`/`@deprecated`/`@no_mangle`; workstream D — see `attrs.rs` + §5.30),
 slices `[]T` + bounds-checked indexing, match exhaustiveness + payload projection,
-bare-metal `@volatile`/`@address`, and **MVS** (default = `read`).
+bare-metal `@volatile`/`@address`, the **immutable `record`** (struct/record split —
+§5.32; full struct/enum/ADT plan in `docs/structs-enums-design.md`), and **MVS**
+(default = `read`).
 **Remaining (lettered):** G (CTFE + reflection), N (self-hosting). **D is fully
 done** (both reference tiers); **K (modules) and I (stdlib + allocator) are now
 done** (this session — see their entries below). **Remaining (Section C):**

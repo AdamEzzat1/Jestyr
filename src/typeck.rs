@@ -122,8 +122,9 @@ impl<'a> TypeChecker<'a> {
         // to in any order.
         for item in &ast.items {
             match item {
-                Item::Struct { name, .. } => {
-                    self.register_type(name, false);
+                Item::Struct { name, is_record, .. } => {
+                    let i = self.register_type(name, false);
+                    self.table.types[i].is_record = *is_record;
                 }
                 Item::Enum(e) => {
                     let idx = self.register_type(&e.name, true);
@@ -229,9 +230,31 @@ impl<'a> TypeChecker<'a> {
         } else {
             TypeKindG::Struct { fields: Vec::new() }
         };
-        self.table.types.push(TypeDecl { name: name.name.clone(), kind, is_copy: false });
+        self.table.types.push(TypeDecl {
+            name: name.name.clone(),
+            kind,
+            is_copy: false,
+            is_record: false,
+        });
         self.table.type_index.insert(name.name.clone(), idx);
         idx
+    }
+
+    /// If `t` (or what it points/refers to) is an immutable `record`, its name —
+    /// used to reject `r.field = …`. Looks through one level of `*T`/`&T`/`&[r]T`
+    /// so a record is immutable however it's reached.
+    fn record_name(&self, t: &Ty) -> Option<String> {
+        let inner = match t {
+            Ty::Ptr { inner, .. } | Ty::GenRef(inner) | Ty::RegionRef(inner) => inner.as_ref(),
+            other => other,
+        };
+        if let Ty::Named(i) = inner {
+            let d = self.table.types.get(*i)?;
+            if d.is_record {
+                return Some(d.name.clone());
+            }
+        }
+        None
     }
 
     /// The set of generic type-parameter names a function introduces — its
@@ -727,6 +750,18 @@ impl<'a> TypeChecker<'a> {
             ExprKind::Assign { target, value, .. } => {
                 self.infer(scope, typ, self_ty, *target);
                 self.infer(scope, typ, self_ty, *value);
+                // A `record`'s fields are immutable: assigning one is a static
+                // error (the whole binding may still be rebound, like `let`).
+                if let ExprKind::Field { base, .. } = &ast.expr_at(*target).kind {
+                    let bt = self.expr_types[base.0 as usize].clone();
+                    if let Some(rname) = self.record_name(&bt) {
+                        let sp = ast.expr_at(*target).span;
+                        self.error(
+                            sp,
+                            format!("cannot assign to a field of immutable record `{rname}`"),
+                        );
+                    }
+                }
                 Ty::Unit
             }
             ExprKind::Range { lo, hi, .. } => {
@@ -1230,6 +1265,34 @@ mod tests {
         let (_i, d) = analyze("fn dup() {} fn dup() {}");
         assert_eq!(d.len(), 1, "{:?}", d);
         assert!(d[0].message.contains("duplicate definition of `dup`"));
+    }
+
+    #[test]
+    fn record_field_mutation_is_a_static_error() {
+        let (_i, d) =
+            analyze("record P { x: i32 } fn f(mut p: P) { p.x = 9 }");
+        assert_eq!(d.len(), 1, "{:?}", d);
+        assert!(
+            d[0].message.contains("cannot assign to a field of immutable record `P`"),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn record_reads_and_construction_are_fine() {
+        // Constructing and reading a record is allowed; only field assignment isn't.
+        let (_i, d) = analyze(
+            "record P { x: i32, y: i32 } fn f() -> i32 { let p = P { x: 1, y: 2 } p.x }",
+        );
+        assert!(d.is_empty(), "unexpected errors: {:?}", d);
+    }
+
+    #[test]
+    fn a_plain_struct_field_is_still_mutable() {
+        // The record rule must not leak onto ordinary structs.
+        let (_i, d) = analyze("struct S { x: i32 } fn f(mut s: S) { s.x = 9 }");
+        assert!(d.is_empty(), "struct mutation should be allowed: {:?}", d);
     }
 
     #[test]

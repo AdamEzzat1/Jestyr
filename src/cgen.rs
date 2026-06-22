@@ -3697,6 +3697,17 @@ mod tests {
     }
 
     #[test]
+    fn record_lowers_to_an_ordinary_struct() {
+        // A `record` is immutable at the Jestyr level but representationally a
+        // plain struct — zero runtime cost for the static guarantee.
+        let (c, d) =
+            gen("record Point { x: i32, y: i32 } fn mk() -> Point { Point{ x: 1, y: 2 } }");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("typedef struct Jestyr_Point Jestyr_Point;"), "{c}");
+        assert!(c.contains("(Jestyr_Point){ .j_x = 1, .j_y = 2 }"), "{c}");
+    }
+
+    #[test]
     fn lowers_if_in_return_position() {
         let (c, d) = gen("fn m(n: i32) -> i32 { if n <= 1 { return 1 } return n }");
         assert!(d.is_empty(), "{:?}", d);

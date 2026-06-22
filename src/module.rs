@@ -430,6 +430,12 @@ mod tests {
     }
 
     #[test]
+    fn records_example_compiles_clean() {
+        // Immutable `record` product types (struct/record split).
+        pipeline_is_clean("examples/records.jtr");
+    }
+
+    #[test]
     fn tests_demo_example_builds_a_clean_test_harness() {
         // The `@test`/`@bench` runner (workstream O): emit in test mode and check
         // the harness is generated without diagnostics.

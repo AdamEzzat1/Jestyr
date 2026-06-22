@@ -139,6 +139,9 @@ pub struct TypeDecl {
     pub kind: TypeKindG,
     /// User aggregates are non-`Copy` by default (an explicit opt-in lands later).
     pub is_copy: bool,
+    /// Declared with `record` rather than `struct` — its fields are immutable
+    /// (assigning one is a compile error). Layout/representation is identical.
+    pub is_record: bool,
 }
 
 #[derive(Debug)]

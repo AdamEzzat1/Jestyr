@@ -418,7 +418,18 @@ pub enum Item {
     Fn(FnDecl),
     Enum(EnumDecl),
     Const(ConstDecl),
-    Struct { is_pub: bool, name: Ident, body: StructBody, attrs: Vec<Attribute>, span: Span },
+    /// A product type. `is_record` distinguishes an **immutable** `record` (whose
+    /// fields cannot be assigned — a static guarantee) from a mutable `struct`.
+    /// Both share one field grammar, layout, and C lowering; only the mutation
+    /// rule differs (design: struct/record/class split, CJC-inspired §1.2).
+    Struct {
+        is_pub: bool,
+        is_record: bool,
+        name: Ident,
+        body: StructBody,
+        attrs: Vec<Attribute>,
+        span: Span,
+    },
     Extern(ExternFn),
     Import(ImportDecl),
 }

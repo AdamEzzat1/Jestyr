@@ -60,9 +60,10 @@ impl<'a> Printer<'a> {
                 self.line(d, &format!("const {}: {} =", c.name.name, ts));
                 self.expr(d + 1, c.value);
             }
-            Item::Struct { name, body, attrs, .. } => {
+            Item::Struct { name, body, attrs, is_record, .. } => {
                 self.attrs(d, attrs);
-                self.line(d, &format!("struct {}", name.name));
+                let kw = if *is_record { "record" } else { "struct" };
+                self.line(d, &format!("{kw} {}", name.name));
                 self.struct_body(d + 1, body);
             }
             Item::Extern(e) => {
