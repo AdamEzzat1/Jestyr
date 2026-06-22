@@ -1,0 +1,93 @@
+//! Documentation comments — a demo of Jestyr's three comment tiers and the
+//! `jestyrc doc` generator (roadmap workstream C).
+//!
+//! Jestyr has three kinds of comment:
+//!   - `//`  a plain comment, ignored by everything;
+//!   - `///` an *outer* doc comment, documenting the item below it;
+//!   - `//!` an *inner* doc comment (this one) documenting the whole module.
+//!
+//! The rule that keeps comments honest: **comments document; contracts prove.**
+//! The prose you write in `///` is never checked, but the `requires`/`ensures`
+//! clauses, error sets, `@no_panic`, and refinements *are* — and `jestyrc doc`
+//! shows them in a separate **Guarantees** block so the two never blur together.
+//!
+//! Run the program:    jestyrc run examples/docs.jtr   ->  5, 7, 20, 6
+//! Generate its docs:   jestyrc doc examples/docs.jtr   ->  Markdown to stdout
+//!                      jestyrc doc examples/docs.jtr --html  ->  an HTML page
+
+/// The absolute value of `x`.
+///
+/// # Example
+/// ```jestyr
+/// let a = abs(0 - 5)   // a == 5
+/// ```
+///
+/// # Notes
+/// The prose above is *documentation*. The `ensures` clause below is a
+/// *guarantee* the compiler checks at every return — this is the distinction
+/// the doc generator makes visible.
+fn abs(x: i32) -> i32
+    ensures result >= 0
+{
+    if x < 0 {
+        return 0 - x
+    }
+    return x
+}
+
+/// Add two integers with no possibility of a runtime fault.
+///
+/// `@no_panic` is *proven*, not promised: the compiler rejects the function if
+/// any operation in it could fault.
+@no_panic fn add(a: i32, b: i32) -> i32 {
+    return a + b
+}
+
+/// Read element `i` of `xs`.
+///
+/// The index is refined `in 0..xs.len`, so the bounds check is **elided** — the
+/// access is as fast as unchecked C, and the refinement records why that is safe.
+fn at(xs: []i32, i: usize in 0..xs.len) -> i32 {
+    return xs[i]
+}
+
+/// A monotonic counter.
+///
+/// # Example
+/// ```jestyr
+/// var c: Counter = Counter{ n: 0 }
+/// let one = c.bump()   // one == 1
+/// ```
+struct Counter {
+    n: i32
+
+    /// Increase the count by one and return the new value.
+    fn bump(mut self) -> i32 {
+        self.n = self.n + 1
+        return self.n
+    }
+}
+
+/// The answer to life, the universe, and everything.
+const ANSWER: i32 = 42
+
+fn set(p: *mut i32, i: i32, v: i32) {
+    unsafe { (p + i).* = v }
+}
+
+fn main() -> i32 {
+    print_int(abs(0 - 5))    // 5
+    print_int(add(3, 4))     // 7
+
+    var p: *mut i32 = alloc_i32(3)
+    set(p, 0, 10)
+    set(p, 1, 20)
+    set(p, 2, 30)
+    var s: []i32 = slice(i32, p, 3)
+    print_int(at(s, 1))      // 20
+    free_ptr(p)
+
+    var c: Counter = Counter{ n: 5 }
+    print_int(c.bump())      // 6
+    return 0
+}

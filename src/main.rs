@@ -15,10 +15,12 @@
 //!   jestyrc build  <file.jtr>   lower to C and compile a native binary
 //!   jestyrc run    <file.jtr>   build, then execute the binary
 //!   jestyrc tokens <file.jtr>   stop after lexing and dump the token stream
+//!   jestyrc doc    <file.jtr>   render the file's API docs as Markdown (--html for HTML)
 
 mod ast;
 mod cgen;
 mod diag;
+mod doc;
 mod escape;
 mod lexer;
 mod module;
@@ -47,6 +49,7 @@ enum Mode {
     Build,
     Run,
     Tokens,
+    Doc { html: bool },
 }
 
 fn main() -> ExitCode {
@@ -71,6 +74,18 @@ fn main() -> ExitCode {
         None | Some("-h") | Some("--help") => {
             print_usage();
             return if args.len() < 2 { ExitCode::FAILURE } else { ExitCode::SUCCESS };
+        }
+        Some("doc") => {
+            // `doc` takes an optional `--html` flag anywhere after it; the file is
+            // the first remaining non-flag argument.
+            let html = args[2..].iter().any(|a| a == "--html");
+            match args[2..].iter().find(|a| !a.starts_with("--")) {
+                Some(p) => (Mode::Doc { html }, p.clone()),
+                None => {
+                    eprintln!("error: `doc` needs a file argument");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
         Some("tokens") | Some("parse") | Some("check") | Some("emit-c") | Some("build")
         | Some("run") => {
@@ -112,6 +127,23 @@ fn main() -> ExitCode {
             let mut diags = lex_diags;
             diags.extend(parse_diags);
             report(&src, &path, &diags)
+        }
+        Mode::Doc { html } => {
+            // The doc generator re-lexes (it needs the doc-comment side table),
+            // so the pre-lexed `tokens` above go unused here.
+            let title = Path::new(&path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&path)
+                .to_string();
+            let (rendered, notices) = doc::generate(&src, &title, html);
+            print!("{rendered}");
+            // Dangling-doc + parse notices are advisory: print them to stderr and
+            // still succeed, so docs are emitted even for an imperfect file.
+            for d in &notices {
+                eprintln!("{}", d.render(&src, &path, diag::Severity::Warning));
+            }
+            ExitCode::SUCCESS
         }
         Mode::Check => {
             // The loader follows `import`s, so the check covers the whole program.
@@ -268,6 +300,8 @@ fn print_usage() {
     eprintln!("    jestyrc build  <file.jtr>   lower to C and compile a native binary");
     eprintln!("    jestyrc run    <file.jtr>   build, then execute the binary");
     eprintln!("    jestyrc tokens <file.jtr>   stop after lexing and dump tokens");
+    eprintln!("    jestyrc doc    <file.jtr>   render the file's API docs as Markdown");
+    eprintln!("                               (add --html for an HTML page)");
 }
 
 fn dump_tokens(src: &str, path: &str, tokens: &[token::Token]) {

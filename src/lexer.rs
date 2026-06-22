@@ -12,6 +12,7 @@
 //! multi-character operator in the grammar (`->`, `..=`, `.*`, `<<`, `>=`, ...).
 
 use crate::diag::Diagnostic;
+use crate::doc::{DocKind, RawDoc};
 use crate::span::Span;
 use crate::token::{Token, TokenKind};
 
@@ -24,23 +25,38 @@ pub struct Lexer<'src> {
     /// across files) while the buffer itself slices correctly.
     end: usize,
     pub diagnostics: Vec<Diagnostic>,
+    /// Doc comments (`///`, `//!`, `/** */`, `/*! */`) collected as we go. They
+    /// stay *trivia* in the token stream — the parser never sees them — so a
+    /// comment can never alter how code is parsed (design rule: "comments
+    /// document; contracts prove"). The doc generator reads them back out of
+    /// this side table and attaches them to items by source position. See
+    /// [`crate::doc`].
+    pub docs: Vec<RawDoc>,
 }
 
 impl<'src> Lexer<'src> {
     pub fn new(src: &'src str) -> Lexer<'src> {
         let end = src.len();
-        Lexer { src, pos: 0, end, diagnostics: Vec::new() }
+        Lexer { src, pos: 0, end, diagnostics: Vec::new(), docs: Vec::new() }
     }
 
     /// Lex the byte region `[start, end)` of `src`, emitting spans relative to
     /// `src` (i.e. *global* offsets). Used by the module loader so a single
     /// concatenated source buffer backs every module's tokens and diagnostics.
     pub fn new_slice(src: &'src str, start: usize, end: usize) -> Lexer<'src> {
-        Lexer { src, pos: start, end, diagnostics: Vec::new() }
+        Lexer { src, pos: start, end, diagnostics: Vec::new(), docs: Vec::new() }
     }
 
     /// Lex the entire input. The returned token vector always ends with `Eof`.
-    pub fn tokenize(mut self) -> (Vec<Token>, Vec<Diagnostic>) {
+    pub fn tokenize(self) -> (Vec<Token>, Vec<Diagnostic>) {
+        let (tokens, diags, _docs) = self.tokenize_with_docs();
+        (tokens, diags)
+    }
+
+    /// Like [`tokenize`](Self::tokenize) but also returns the doc comments
+    /// collected along the way (in source order). Used by the doc generator;
+    /// the compiler proper ignores docs and calls `tokenize`.
+    pub fn tokenize_with_docs(mut self) -> (Vec<Token>, Vec<Diagnostic>, Vec<RawDoc>) {
         let mut tokens = Vec::new();
         loop {
             let tok = self.next_token();
@@ -50,7 +66,7 @@ impl<'src> Lexer<'src> {
                 break;
             }
         }
-        (tokens, self.diagnostics)
+        (tokens, self.diagnostics, self.docs)
     }
 
     // --- character cursor helpers ---
@@ -292,41 +308,90 @@ impl<'src> Lexer<'src> {
         Token::new(TokenKind::Char, Span::new(start, self.pos))
     }
 
-    /// Skip whitespace, `// line comments`, and `/* nested block comments */`.
+    /// Skip whitespace and comments. Plain comments (`//`, `/* … */`) are
+    /// discarded; **doc comments** (`///`, `//!`, `/** … */`, `/*! … */`) are
+    /// recorded in `self.docs` *and then skipped* — they never become tokens, so
+    /// the grammar is identical with or without them. Classification follows Rust:
+    /// `///`/`/**` are *outer* docs (document the following item), `//!`/`/*!`
+    /// are *inner* docs (document the enclosing module), and an extra marker
+    /// char (`////`, `/***`) demotes them back to a plain comment.
     fn skip_trivia(&mut self) {
         loop {
             match self.peek() {
                 Some(c) if c.is_whitespace() => {
                     self.pos += c.len_utf8();
                 }
-                Some('/') if self.peek2() == Some('/') => {
-                    self.pos += 2;
-                    self.eat_while(|c| c != '\n');
-                }
-                Some('/') if self.peek2() == Some('*') => {
-                    let start = self.pos;
-                    self.pos += 2;
-                    let mut depth = 1;
-                    while depth > 0 {
-                        match self.bump() {
-                            None => {
-                                self.error(start, "unterminated block comment");
-                                break;
-                            }
-                            Some('/') if self.at('*') => {
-                                self.bump();
-                                depth += 1;
-                            }
-                            Some('*') if self.at('/') => {
-                                self.bump();
-                                depth -= 1;
-                            }
-                            Some(_) => {}
-                        }
-                    }
-                }
+                Some('/') if self.peek2() == Some('/') => self.line_comment(),
+                Some('/') if self.peek2() == Some('*') => self.block_comment(),
                 _ => break,
             }
+        }
+    }
+
+    /// A `//`-style comment (already known to start with `//`). Records the line
+    /// as a doc comment if it is `///` (outer) or `//!` (inner), but not `////`.
+    fn line_comment(&mut self) {
+        let line_start = self.pos;
+        let rest = &self.src[self.pos..self.end];
+        let kind = if rest.starts_with("//!") {
+            Some(DocKind::Inner)
+        } else if rest.starts_with("///") && !rest.starts_with("////") {
+            Some(DocKind::Outer)
+        } else {
+            None
+        };
+        let prefix = if kind.is_some() { 3 } else { 2 };
+        self.pos += prefix;
+        let content_start = self.pos;
+        self.eat_while(|c| c != '\n');
+        if let Some(kind) = kind {
+            let text = self.src[content_start..self.pos].to_string();
+            self.docs.push(RawDoc { kind, block: false, span: Span::new(line_start, self.pos), text });
+        }
+    }
+
+    /// A `/* … */` block comment (already known to start with `/*`), honouring
+    /// nesting. Records the contents as a doc comment if it opens with `/**`
+    /// (outer) or `/*!` (inner) — but not the empty `/**/` nor `/***`.
+    fn block_comment(&mut self) {
+        let start = self.pos;
+        let rest = &self.src[self.pos..self.end];
+        let kind = if rest.starts_with("/*!") {
+            Some(DocKind::Inner)
+        } else if rest.starts_with("/**") && !rest.starts_with("/**/") && !rest.starts_with("/***") {
+            Some(DocKind::Outer)
+        } else {
+            None
+        };
+        self.pos += 2;
+        let mut depth = 1;
+        let mut terminated = false;
+        while depth > 0 {
+            match self.bump() {
+                None => {
+                    self.error(start, "unterminated block comment");
+                    break;
+                }
+                Some('/') if self.at('*') => {
+                    self.bump();
+                    depth += 1;
+                }
+                Some('*') if self.at('/') => {
+                    self.bump();
+                    depth -= 1;
+                    if depth == 0 {
+                        terminated = true;
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some(kind) = kind {
+            // Inner text lies between the 3-char marker and the closing `*/`.
+            let inner_start = (start + 3).min(self.pos);
+            let inner_end = if terminated { self.pos.saturating_sub(2) } else { self.pos };
+            let text = self.src[inner_start..inner_end.max(inner_start)].to_string();
+            self.docs.push(RawDoc { kind, block: true, span: Span::new(start, self.pos), text });
         }
     }
 }
@@ -420,6 +485,44 @@ mod tests {
             kinds("a // line comment\n b /* block /* nested */ still */ c"),
             vec![Ident, Ident, Ident]
         );
+    }
+
+    #[test]
+    fn doc_comments_are_collected_but_still_trivia() {
+        // `///`/`//!` are recorded as docs yet produce no tokens — the grammar is
+        // unchanged. A plain `//` (and `////`) is *not* a doc comment.
+        let src = "//! module doc\n/// outer doc\n// plain\n//// not a doc\nfn f() {}";
+        let (toks, diags, docs) = Lexer::new(src).tokenize_with_docs();
+        assert!(diags.is_empty(), "diags: {:?}", diags);
+        let ks: Vec<_> = toks.into_iter().map(|t| t.kind).filter(|k| *k != Eof).collect();
+        assert_eq!(ks, vec![Fn, Ident, LParen, RParen, LBrace, RBrace]);
+        assert_eq!(docs.len(), 2, "exactly the `//!` and `///` lines: {:?}", docs);
+        assert_eq!(docs[0].kind, DocKind::Inner);
+        assert_eq!(docs[0].text, " module doc");
+        assert_eq!(docs[1].kind, DocKind::Outer);
+        assert_eq!(docs[1].text, " outer doc");
+    }
+
+    #[test]
+    fn block_doc_comments_are_collected() {
+        let src = "/** outer block */ /*! inner block */ /* plain */ /**/ x";
+        let (_toks, diags, docs) = Lexer::new(src).tokenize_with_docs();
+        assert!(diags.is_empty(), "diags: {:?}", diags);
+        assert_eq!(docs.len(), 2, "only the `/**` and `/*!` blocks: {:?}", docs);
+        assert_eq!(docs[0].kind, DocKind::Outer);
+        assert_eq!(docs[0].text, " outer block ");
+        assert_eq!(docs[1].kind, DocKind::Inner);
+        assert_eq!(docs[1].text, " inner block ");
+    }
+
+    #[test]
+    fn doc_spans_cover_the_whole_comment() {
+        // The span runs from the first marker char to end-of-line, so the doc
+        // generator can tell what an outer doc sits immediately above.
+        let src = "/// hi\nfn f() {}";
+        let (_t, _d, docs) = Lexer::new(src).tokenize_with_docs();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(&src[docs[0].span.range()], "/// hi");
     }
 
     #[test]
