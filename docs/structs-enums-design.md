@@ -89,14 +89,43 @@ enum Option(T) { none, some(T) }         // ← generic form (needs generic enum
   `none`→`((T*)0)`; `emit_niche_match` lowers `match` to an `!= NULL` test instead of a tag
   `switch`. Demo [`examples/niche.jtr`](../examples/niche.jtr) (`8, 42, 0`); the
   `size_of`/`!switch`/`!Jestyr_Maybe` proof is a cgen test.
-- **2.2b (next):** make it **generic** — `Option(T)`/`Result(T,E)` defined in a prelude
-  over the ADT machinery. This needs **generic enums** (the prerequisite below); once they
-  exist, `Option(*T)`/`Option(&[r]T)` inherit the niche optimization above *for free*.
-- **Generic enums (the 2.2b prerequisite):** mirror the generic-*struct* machinery — an
-  anonymous `enum {…}` value (an `EnumType` expr like `StructType`), recognized by the
-  `comptime fn … -> type { return enum {…} }` path, with a generic-enum `Ty` and a
-  `collect_enum_instances` monomorphization pass. Sizable; it's the real gate for
-  in-language `Option`/`Result`.
+#### 2.2b Generic enums — SHAPE + FRONTEND ✅ (this session); codegen 🔜 NEXT
+
+Decision: **direct `enum Name(T) { … }` syntax** (not the comptime-`fn … -> type`
+pattern generic structs use) — it keeps the enum a registered `TypeDecl`, so variant
+registration, `match`, exhaustiveness, and the niche detector all reuse the existing
+non-generic-enum machinery. (Generic *structs* can migrate to this form later.)
+
+**Landed now:** `EnumDecl.type_params` (`ast`), the parser (`enum Option(T, E) { … }`),
+typeck lowers variant field types with the enum's type params in scope (`some(x: T)` →
+`T` is a real type parameter), and cgen treats a generic enum as a **template** — skipped
+in `enum_defs`/`forward_types`; *using* one (construction/match) emits a clear
+"cannot lower generic enum … yet" diagnostic instead of broken C. Declared-but-unused
+generic enums compile clean. Tests: parser (type params), cgen (template not emitted +
+use diagnoses).
+
+**The codegen completion (next, ~one focused turn):**
+1. **A generic-enum instance type.** Add `Ty::GenEnum { ctor, args }` (parallel to
+   `GenStruct`; reusing `GenStruct` would force a struct-vs-enum branch at every site).
+   `lower_type` of `App{ctor, args}` chooses `GenEnum` when `ctor` is a generic enum.
+2. **Instantiation inference** — the genuine hard part. typeck has **no** expected-type
+   propagation, so a payload variant `some(5)` can infer `Option(i32)` by unifying the
+   arg against the variant's generic field types, but a **nullary `none` cannot**. Two
+   options: (a) thread an `expected: Option<&Ty>` through `infer` for `let`-annotations
+   and `return` (the principled fix — a small bidirectional pass); or (b) interim:
+   require an ascription `none as Option(i32)`. Recommend (a) — it also helps struct
+   literals and future inference.
+3. **Monomorphization** — `collect_enum_instances` mirroring `collect_struct_instances`;
+   emit one `Jestyr_Option__i32` tagged union per instantiation with the type params
+   substituted; mangle via the existing `gen_struct_c_name` scheme.
+4. **Construction + match on instances** — extend `emit_variant_construct` and
+   `emit_match` to take the instance's substitution (the variant union/field types come
+   from the template under `subst`).
+5. **Niche-opt inheritance (free win).** Generalize `niche_enum_at` to run on an
+   instance under its substitution, so `Option(*T)`/`Option(&[r]T)` collapse to a bare
+   pointer automatically — the §2.2 optimization, now generic.
+6. **Prelude `Option`/`Result`.** Define `enum Option(T) { none, some(v: T) }` and
+   `enum Result(T, E) { ok(v: T), err(e: E) }` in a prelude module; retire any hardcoding.
 
 ### 2.3 Struct-variant enums + explicit discriminants  ⏳
 
@@ -206,7 +235,8 @@ rebase the rest (HANDOFF §1).
 |---|---|---|---|---|---|
 | 0 | **`record`** | smallest entry; pure subtraction | no | S | ✅ done |
 | 1a | **Niche optimization** (optional thin pointers) | flagship "transparent cost"; no shape change | no | M | ✅ done |
-| 1b | **Generic enums → in-language `Option`/`Result`** | the real gate for Option/Result; inherits 1a's niche opt | **yes** | M–L | 🔜 next |
+| 1b-shape | **Generic enum AST + parser + frontend** | the high-conflict shape, landed early; templates skipped, use diagnoses | **yes** | M | ✅ done |
+| 1b-codegen | **Generic-enum monomorphization + inference + prelude `Option`/`Result`** | the codegen completion; inherits 1a's niche opt | no | M–L | 🔜 next |
 | 2 | **Struct-variant enums + explicit discriminants** | the AST-shape change → land early | **yes** | M | ⏳ |
 | 3 | **Match power + Maranget exhaustiveness** | rests on #2's pattern shapes; largest | **yes** | L | ⏳ |
 | 4 | **Recursive ADTs (`indirect`)** | needs ref tiers (have); novel | small | M | ⏳ |

@@ -393,8 +393,11 @@ impl<'a> Cgen<'a> {
                     self.raw(format!("typedef struct Jestyr_{0} Jestyr_{0};\n", name.name));
                 }
                 Item::Enum(e) => {
-                    // A niche-optimized enum has no `Jestyr_<E>` struct (it is its
-                    // pointer payload), so it needs no forward typedef either.
+                    // Generic-enum templates and niche-optimized enums have no
+                    // `Jestyr_<E>` struct, so they need no forward typedef.
+                    if e.is_generic() {
+                        continue;
+                    }
                     if self
                         .info
                         .table
@@ -448,6 +451,12 @@ impl<'a> Cgen<'a> {
         let ast = self.ast;
         for item in &ast.items {
             if let Item::Enum(e) = item {
+                // A generic enum is a *template* (monomorphized per instantiation,
+                // like a generic struct/fn) — never emitted directly. (Codegen of
+                // the instances is the next sub-step; see design §2.2b.)
+                if e.is_generic() {
+                    continue;
+                }
                 // A niche-optimized enum has no tag/union struct — it *is* its
                 // pointer payload, so emit nothing here (see `c_type`/`c_ty_ast`).
                 if self
@@ -1526,7 +1535,31 @@ impl<'a> Cgen<'a> {
         }
     }
 
+    /// Is `name` a generic enum (a monomorphizable template)?
+    fn enum_is_generic(&self, name: &str) -> bool {
+        self.ast
+            .items
+            .iter()
+            .any(|it| matches!(it, Item::Enum(e) if e.name.name == name && e.is_generic()))
+    }
+
     fn emit_variant_construct(&mut self, vi: &VariantInfo, vname: &str, args: &[ExprId]) -> String {
+        // Generic-enum instances aren't lowered yet (design §2.2b) — diagnose
+        // rather than emit a reference to a never-defined template struct.
+        if self.enum_is_generic(&vi.enum_name) {
+            let span = args
+                .first()
+                .map(|a| self.ast.expr_at(*a).span)
+                .unwrap_or_else(|| Span::new(0, 0));
+            self.diag(
+                span,
+                format!(
+                    "the C backend cannot lower generic enum `{}` yet (monomorphization is the next step)",
+                    vi.enum_name
+                ),
+            );
+            return "0".to_string();
+        }
         // Niche-optimized enum: the value *is* the pointer payload. The `some`
         // variant emits its argument directly; the `none` variant is the null
         // pointer — no tag, no struct literal.
@@ -4555,6 +4588,24 @@ mod tests {
         // Match lowers to a null test, not a tag switch.
         assert!(c.contains("!= ((int32_t*)0)"), "match dispatches on NULL: {c}");
         assert!(!c.contains("switch ("), "no tag switch for a niche enum: {c}");
+    }
+
+    #[test]
+    fn generic_enum_template_is_not_emitted_and_use_diagnoses() {
+        // A generic enum is a template — declaring one (unused) emits nothing and
+        // compiles clean; the per-instantiation codegen is the next sub-step.
+        let (c, d) =
+            gen("enum Option(T) { none, some(x: T) } fn main() -> i32 { return 0 }");
+        assert!(d.is_empty(), "declared-but-unused generic enum is clean: {:?}", d);
+        assert!(!c.contains("Jestyr_Option"), "no template struct emitted: {c}");
+        // Using one is a clear diagnostic, never broken C.
+        let (_c2, d2) =
+            gen("enum Option(T) { none, some(x: T) } fn f() -> i32 { var m = some(5) return 0 }");
+        assert!(
+            d2.iter().any(|m| m.message.contains("cannot lower generic enum `Option`")),
+            "using a generic enum diagnoses pending codegen: {:?}",
+            d2
+        );
     }
 
     #[test]

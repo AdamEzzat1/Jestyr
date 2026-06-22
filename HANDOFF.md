@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 196 tests pass, including `proptest` property
+and run (or are correctly rejected). 198 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -599,6 +599,21 @@ These are the non-obvious things that will bite if you don't know them.
     `emit_niche_match` lowers `match` to an `if (p != NULL)` test instead of a tag
     `switch`. Demo `examples/niche.jtr` (`8, 42, 0`). **Next (design 2.2b):** generic
     enums → in-language `Option(T)`/`Result(T,E)`, which inherit this opt for free.
+
+34. **Generic enums — *shape + frontend* landed; codegen is the next step (design
+    §2.2b).** `enum Option(T) { none, some(x: T) }` now parses (`EnumDecl.type_params`,
+    via direct `enum Name(T)` syntax — *not* the comptime-`fn -> type` pattern generic
+    structs use, so the enum stays a registered `TypeDecl` and reuses variant/match/
+    niche machinery). typeck lowers variant field types with the enum's type params in
+    scope. cgen treats a generic enum as a **template**: `enum_defs`/`forward_types`
+    skip it, so a declared-but-unused generic enum compiles clean; *using* one
+    (`emit_variant_construct` via `enum_is_generic`) emits a clear "cannot lower generic
+    enum … yet" diagnostic rather than referencing a never-defined `Jestyr_<E>` struct.
+    **Remaining (next turn):** a `Ty::GenEnum` instance type; **instantiation
+    inference** (typeck has no expected-type propagation, so nullary `none` needs a small
+    bidirectional pass or an `as` ascription — the genuine hard part); `collect_enum_
+    instances` monomorphization; instance construction/match; generalizing `niche_enum_at`
+    to instances (so `Option(*T)` inherits §5.33 niche-opt); and prelude `Option`/`Result`.
 
 ---
 

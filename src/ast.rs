@@ -356,8 +356,18 @@ pub struct EnumVariant {
 pub struct EnumDecl {
     pub is_pub: bool,
     pub name: Ident,
+    /// Generic type parameters, e.g. `enum Option(T) { … }` (empty for a plain
+    /// enum). A generic enum is a *template* — monomorphized per instantiation,
+    /// like a generic struct. (See `docs/structs-enums-design.md` §2.2b.)
+    pub type_params: Vec<Ident>,
     pub variants: Vec<EnumVariant>,
     pub span: Span,
+}
+
+impl EnumDecl {
+    pub fn is_generic(&self) -> bool {
+        !self.type_params.is_empty()
+    }
 }
 
 #[derive(Clone, Debug)]

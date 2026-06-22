@@ -367,6 +367,17 @@ impl<'src> Parser<'src> {
         let start = self.cur().span;
         self.expect(Enum, "`enum`");
         let name = self.eat_ident("enum name");
+        // Optional generic parameters: `enum Option(T, E) { … }`.
+        let mut type_params = Vec::new();
+        if self.eat(LParen) {
+            while !self.at(RParen) && !self.at(Eof) {
+                type_params.push(self.eat_ident("type parameter"));
+                if !self.eat(Comma) {
+                    break;
+                }
+            }
+            self.expect(RParen, "`)`");
+        }
         self.expect(LBrace, "`{`");
         let mut variants = Vec::new();
         while !self.at(RBrace) && !self.at(Eof) {
@@ -396,7 +407,7 @@ impl<'src> Parser<'src> {
         }
         let end = self.cur().span;
         self.expect(RBrace, "`}`");
-        EnumDecl { is_pub: false, name, variants, span: start.to(end) }
+        EnumDecl { is_pub: false, name, type_params, variants, span: start.to(end) }
     }
 
     fn parse_const(&mut self) -> ConstDecl {
@@ -1393,6 +1404,23 @@ mod tests {
         // …while a plain `struct` is not a record.
         let s = parse_ok("struct S { x: i32 }");
         assert!(matches!(&s.items[0], Item::Struct { is_record: false, .. }));
+    }
+
+    #[test]
+    fn parses_a_generic_enum_with_type_params() {
+        let ast = parse_ok("enum Option(T) { none, some(x: T) }");
+        match &ast.items[0] {
+            Item::Enum(e) => {
+                assert!(e.is_generic());
+                assert_eq!(e.type_params.len(), 1);
+                assert_eq!(e.type_params[0].name, "T");
+                assert_eq!(e.variants.len(), 2);
+            }
+            _ => panic!("expected an enum item"),
+        }
+        // A plain enum has no type parameters.
+        let p = parse_ok("enum Color { red, green }");
+        assert!(matches!(&p.items[0], Item::Enum(e) if !e.is_generic()));
     }
 
     #[test]

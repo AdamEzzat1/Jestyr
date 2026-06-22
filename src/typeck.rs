@@ -155,10 +155,14 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
                 Item::Enum(e) => {
+                    // A generic enum's variant field types may mention its type
+                    // parameters (`some(x: T)`), so lower them with those in scope.
+                    let tp: HashSet<String> =
+                        e.type_params.iter().map(|p| p.name.clone()).collect();
                     let mut variants = Vec::new();
                     for v in &e.variants {
                         let ftys: Vec<Ty> =
-                            v.fields.iter().map(|(_, t)| self.lower_type(&empty, *t)).collect();
+                            v.fields.iter().map(|(_, t)| self.lower_type(&tp, *t)).collect();
                         variants.push((v.name.name.clone(), ftys));
                     }
                     if let Some(&i) = self.table.type_index.get(&e.name.name) {
