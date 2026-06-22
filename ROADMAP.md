@@ -14,14 +14,14 @@
 
 ## 0. Current state (snapshot)
 
-Working bootstrap compiler in Rust (~10K LOC, 141 tests, warning-clean) taking
+Working bootstrap compiler in Rust (~10K LOC, 157 tests, warning-clean) taking
 `.jtr` → C → native binary. Pipeline: **load (multi-file) → lex → parse →
 resolve+typecheck → ownership/escape → C codegen → cc**. Done: the tiered reference
 model (`&T`/`&[r]T`), generics + monomorphization, methods, closures, error sets +
 `?`, contracts, slices + bounds-elision, structured concurrency, `extern "c"`,
 layout attributes, **modules** (item K), **stdlib + allocator-as-value** (item I),
-the full **loop** system (unified `for` + fast-follows), **casts**, and **byte-level
-string iteration**.
+the full **loop** system (unified `for` + fast-follows), **casts**, **byte-level
+string iteration**, and **doc comments + a doc generator** (item C, `jestyrc doc`).
 
 ---
 
@@ -82,7 +82,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 |---|---|---|---|---|---|---|
 | A | Loops | ~90% | HIGH | S–M | ✓ | — |
 | B | Structs & enums | ~75% | HIGH | M | ✓✓ | — |
-| C | Comments & doc-comments | ~60% | LOW | S | ✓ | — |
+| C | Comments & doc-comments | ✅ DONE | LOW | S | ✓ | — |
 | D | Attributes | ~50% | MED | S | ✓ | ✓ (provenance hooks) |
 | E | Real strings / text | ~25% | HIGH | L | ✓✓ | ✓✓ (self-host) |
 | F | Traits / `dyn` | 0% | HIGH | L | ✓✓ | ✓✓ (pass interfaces) |
@@ -128,12 +128,21 @@ projection).
 **Why:** the single biggest "make the language feel finished" stream; `Self{}` +
 fallible methods finally make `vec.jtr` run end-to-end.
 
-### C. Comments & doc-comments — ~60% (LOW conflict; files: lexer + new doc-gen)
-**Done:** `//` line comments and nested `/* */` block comments (lexer trivia).
-**Left:** **doc comments** (`///` / `/** */`) captured by the lexer and attached to
-the following item; a **doc generator** (a new binary/subcommand emitting Markdown
-or HTML from doc comments + signatures — design §15). Mostly isolated: lexer change
-+ an `Ast` annotation + a new pass. **Great parallel candidate.**
+### C. Comments & doc-comments — ✅ DONE (LOW conflict; files: lexer + new `doc.rs`)
+**Done:** `//` line + nested `/* */` block comments (trivia); the **three doc-comment
+tiers** — `///`/`/** */` (outer, document the next item), `//!`/`/*! */` (inner,
+document the module) — collected by the lexer as **trivia** (`tokenize_with_docs`),
+so docs never reach the parser and can never change parsing (the structural form of
+"comments document; contracts prove"). A **doc generator** (`jestyrc doc <file>`,
+`--html`) re-lexes, attaches each outer-doc block to the item/method below it
+(dangling docs → warnings), takes `//!` as the module doc, splits prose into a
+summary + `#`-headed sections + fenced examples, and reconstructs a **Guarantees**
+block from the AST (`requires`/`ensures`, error set, `@no_panic`, refined params) —
+the Jestyr-specific value-add that keeps machine-checked facts distinct from prose.
+Emits Markdown or HTML. Demo `examples/docs.jtr`; reference `docs/comments.md`;
+gotcha HANDOFF §5.30. **Left (deferred):** crawl `import`s into one doc site
+(today single-file); *run* extracted examples as doctests; richer inline-markdown in
+the HTML renderer.
 
 ### D. Attributes — ~50% (MED conflict; files: parser `parse_attrs`, ast, cgen)
 **Done:** `@packed`, `@align(n)`, `@volatile`, `@address`, `@no_panic`, `@layout(c)`

@@ -409,6 +409,13 @@ mod tests {
     }
 
     #[test]
+    fn docs_example_compiles_clean() {
+        // The doc-comment demo is decorated with `//!`/`///` (pure trivia) yet
+        // must still compile and run like any other program.
+        pipeline_is_clean("examples/docs.jtr");
+    }
+
+    #[test]
     fn advanced_loops_example_compiles_clean() {
         // Fast-follows: zip, @no_panic, element+index, region scratch, string
         // iteration, casts.

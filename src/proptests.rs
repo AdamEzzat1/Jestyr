@@ -67,6 +67,14 @@ mod prop {
             run_pipeline(&s);
         }
 
+        /// The doc generator (lex-with-docs → parse → attach → render) never
+        /// panics on arbitrary text, in either output format.
+        #[test]
+        fn doc_generator_is_total(s in ".{0,400}") {
+            let _ = crate::doc::generate(&s, "t", false);
+            let _ = crate::doc::generate(&s, "t", true);
+        }
+
         /// The pipeline is total even on raw ASCII soup (lots of operators/braces).
         #[test]
         fn pipeline_is_total_on_ascii_soup(s in "[\\[\\](){}<>!?@.,;:|&^~*/+=%a-zA-Z0-9 \n]{0,400}") {

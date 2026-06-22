@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 141 tests pass, including `proptest` property
+and run (or are correctly rejected). 157 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -83,6 +83,7 @@ jestyrc check  <file.jtr>   resolve, type-check, ownership-check
 jestyrc emit-c <file.jtr>   lower to C and print it
 jestyrc build  <file.jtr>   lower to C and compile a native binary (needs cc)
 jestyrc run    <file.jtr>   build, then execute
+jestyrc doc    <file.jtr>   render the file's API docs as Markdown (--html for HTML)
 ```
 (Run via `cargo run -- <args>`.)
 
@@ -101,7 +102,10 @@ src/
   span.rs             Span {start,end:u32}, LineCol, line_col().
   token.rs            Token, TokenKind (big enum), keyword(), describe().
   diag.rs             Diagnostic { message, span, code, help }; render().
+  doc.rs              Doc comments (DocKind/RawDoc) + the `doc` generator (C):
+                      attach docs to items, extract AST guarantees, Markdown/HTML.
   lexer.rs            Hand-written lexer; new()/new_slice() (slice = one module's region).
+                      Collects `///`/`//!`/`/** */` docs as trivia (tokenize_with_docs).
   ast.rs              Arena AST: ExprId/TypeId/PatId handles, all node enums, Ast.
                       Item::Import, `is_pub` on decls (item K).
   module.rs           Module loader (item K): import resolution, cycle detection,
@@ -203,6 +207,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `std/demo.jtr` | `5`, `10`, `50`, `40` | **stdlib (I)** — `mem`+`list`+`core`+`io`: a generic growable `List(T)` over an allocator value |
 | `loops.jtr` | `10`, `15`, `10`, `14`, `2`, `3` | **unified `for`** — range/inclusive/slice-read/`mut`-in-place/infinite+break/`for _`; bounds-check elision + `invariant` |
 | `loops_advanced.jtr` | `32`, `6`, `1`, `102`, `203`, `30`, `131`, `2`, `20`, `0` | loop fast-follows — zip, `@no_panic`, element+index, region scratch, strings, casts, labeled break, step, `variant` |
+| `docs.jtr` | `5`, `7`, `20`, `6` | **doc comments (C)** — `//!`/`///`/`/** */` tiers, sections, examples; also `jestyrc doc examples/docs.jtr` renders its API (signatures + prose + machine-checked **Guarantees**) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -218,7 +223,8 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `vec.jtr` | backend-unsupported notes | the design flagship (does NOT fully run — see §7) |
 
 **Feature coverage by stage:**
-- **Lexer:** full token set, nested block comments, all literals (incl `0xFF`,
+- **Lexer:** full token set, nested block comments, **doc comments** (`///`/`//!`/
+  `/** */`/`/*! */`, collected as trivia — item C), all literals (incl `0xFF`,
   `0b1010`, `1_000`, floats w/ exponent), error recovery, total on any input.
 - **Parser:** structs/enums/fns/consts; if/match/blocks/unsafe; Pratt expressions;
   closures `|x| e`; type application `List(i32)`; generic struct literals
@@ -499,6 +505,24 @@ These are the non-obvious things that will bite if you don't know them.
     `strlen` + `(uint8_t)s[k]`), `text[i]` → a byte. **Byte iteration, not
     Unicode** — and `str` carries no length *statically* (it's `strlen` at runtime),
     so a length-carrying string type is still future work.
+
+30. **Doc comments are *trivia* with a side table — they never reach the parser
+    (item C).** The lexer classifies `///`/`/** */` as *outer* docs and `//!`/`/*! */`
+    as *inner* docs (an extra marker char — `////`, `/***` — demotes them to plain
+    comments, like Rust), records each as a `RawDoc { kind, block, span, text }` in
+    `Lexer::docs`, and **still skips it**. So the token stream is identical with or
+    without docs and *a comment can never change how code parses* — the structural
+    enforcement of "comments document; contracts prove". `tokenize_with_docs` exposes
+    the side table; the compiler proper calls plain `tokenize` and ignores docs.
+    The generator (`doc.rs`, `jestyrc doc`) re-lexes, **attaches** each outer-doc
+    block to the nearest item/method below it (a dangling doc is a *warning*),
+    treats all `//!` blocks as the module doc, splits prose into a summary +
+    `#`-headed sections + fenced examples, and — the Jestyr-specific part —
+    reconstructs a **Guarantees** block straight from the AST (`requires`/`ensures`,
+    error set, `@no_panic`, refined params), so machine-checked facts are never
+    confused with prose. Renders Markdown (default) or HTML (`--html`); single-file
+    for now (doesn't crawl `import`s). User reference: [`docs/comments.md`](docs/comments.md);
+    demo `examples/docs.jtr`.
 
 ---
 
