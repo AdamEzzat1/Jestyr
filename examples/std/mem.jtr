@@ -1,0 +1,48 @@
+// std/mem.jtr — allocator-as-value (design §14).
+//
+// Every allocating API takes an `Allocator` *value*. The value carries both the
+// strategy (the enum tag) and its context (the payload), and `allocate` dispatches
+// on it. This is the bootstrap encoding of "allocators are first-class": a real
+// fn-pointer vtable is the next step once function-pointer types / traits land.
+//
+//   • system  — malloc/free, frees per-allocation
+//   • arena   — bump allocation from one buffer, freed in bulk by `destroy`
+
+pub enum Allocator {
+    system,
+    arena(h: *mut u8),
+}
+
+// Construct the malloc-backed general-purpose allocator.
+pub fn system_allocator() -> Allocator {
+    return system
+}
+
+// Construct a bump-arena allocator with a `cap`-byte backing buffer.
+pub fn arena_allocator(cap: usize) -> Allocator {
+    return arena(arena_open(cap))
+}
+
+// Allocate `n` contiguous `T` from `a`. The strategy is whatever `a` carries.
+pub fn allocate(comptime T: type, a: Allocator, n: usize) -> *mut T {
+    match a {
+        system => alloc(T, n),
+        arena(h) => arena_alloc(h, T, n),
+    }
+}
+
+// Release one allocation. A no-op for the arena (it frees in bulk at `destroy`).
+pub fn release(comptime T: type, a: Allocator, p: *mut T) {
+    match a {
+        system => free_ptr(p),
+        arena(h) => {},
+    }
+}
+
+// Tear down an allocator, releasing any bulk-owned memory (the arena buffer).
+pub fn destroy(a: Allocator) {
+    match a {
+        system => {},
+        arena(h) => arena_close(h),
+    }
+}

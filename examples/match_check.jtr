@@ -1,0 +1,20 @@
+// examples/match_check.jtr — match exhaustiveness checking (design §7).
+//
+// `paint` forgets the `blue` case, so the type checker rejects the match.
+// (Payload projection — binding `circle(r)` as `r: f64` — is exercised at
+// runtime by shapes.jtr; here we show the *exhaustiveness* half.)
+//
+// Run:  jestyrc check examples/match_check.jtr   →  1 error: missing `blue`
+
+enum Color {
+    red,
+    green,
+    blue,
+}
+
+fn paint(read c: Color) -> i32 {
+    match c {
+        red   => 0,
+        green => 1,
+    }
+}

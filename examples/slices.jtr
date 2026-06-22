@@ -1,0 +1,27 @@
+// examples/slices.jtr — slices []T + safe bounds-checked indexing (design §7).
+//
+// A slice is a fat pointer { ptr, len }. `slice(T, ptr, len)` builds one; `s[i]`
+// is *bounds-checked* (asserts i < len, aborting on out-of-range); `s.len` and
+// `s.ptr` are accessors. This is the safe-indexing foundation that refinement
+// types (item E) will use to *elide* the check when the index is provably in range.
+//
+// Run:  jestyrc run examples/slices.jtr   →  10, 30, 3
+
+fn set(p: *mut i32, i: i32, v: i32) {
+    unsafe { (p + i).* = v }
+}
+
+fn main() -> i32 {
+    var buf: *mut i32 = alloc_i32(3)
+    set(buf, 0, 10)
+    set(buf, 1, 20)
+    set(buf, 2, 30)
+
+    var s: []i32 = slice(i32, buf, 3)
+    print_int(s[0])     // 10  (bounds-checked)
+    print_int(s[2])     // 30  (bounds-checked)
+    print_int(s.len)    // 3
+
+    free_ptr(buf)
+    return 0
+}

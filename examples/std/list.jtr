@@ -1,0 +1,57 @@
+// std/list.jtr — a generic growable list, allocator-aware (design §16.1).
+//
+// `List(T)` owns a heap buffer obtained from an `Allocator` value. Every API that
+// can allocate takes the allocator explicitly — the design's first rule for
+// collections. Growth doubles the capacity and copies; since the bootstrap has no
+// loops yet, the copy is a tail-recursive helper.
+
+import "mem"
+
+pub fn List(comptime T: type) -> type {
+    return struct {
+        ptr: *mut T,
+        len: usize,
+        cap: usize,
+    }
+}
+
+// An empty list. It owns no memory until the first `push` grows it.
+pub fn make(comptime T: type) -> List(T) {
+    return List(T){ ptr: null, len: 0, cap: 0 }
+}
+
+// Append `x`, growing (doubling) the backing buffer from `a` when full.
+pub fn push(comptime T: type, mut l: List(T), a: Allocator, x: T) {
+    if l.len == l.cap {
+        var newcap: usize = 4
+        if l.cap != 0 { newcap = l.cap * 2 }
+        var np: *mut T = mem.allocate(T, a, newcap)
+        // Copy the live elements into the new buffer (was a recursive helper
+        // before the bootstrap had loops).
+        for i in 0..l.len {
+            unsafe { (np + i).* = (l.ptr + i).* }
+        }
+        if l.cap != 0 { mem.release(T, a, l.ptr) }
+        l.ptr = np
+        l.cap = newcap
+    }
+    unsafe { (l.ptr + l.len).* = x }
+    l.len = l.len + 1
+}
+
+// The element at `i` (caller-checked; a refined/bounds-checked variant is future work).
+pub fn get(comptime T: type, l: List(T), i: usize) -> T {
+    unsafe { (l.ptr + i).* }
+}
+
+pub fn len(comptime T: type, l: List(T)) -> usize {
+    return l.len
+}
+
+// Release the backing buffer (a no-op for an arena allocator, which frees in bulk).
+pub fn free(comptime T: type, mut l: List(T), a: Allocator) {
+    if l.cap != 0 { mem.release(T, a, l.ptr) }
+    l.ptr = null
+    l.len = 0
+    l.cap = 0
+}

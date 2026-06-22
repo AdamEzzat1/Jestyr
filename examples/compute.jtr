@@ -1,0 +1,29 @@
+// examples/compute.jtr — structs, value-returning functions, recursion, and
+// control flow, all lowered to C and run natively.
+// Run:  jestyrc run examples/compute.jtr   →  prints 16 then 120
+
+struct Vec2 { x: i32, y: i32 }
+
+fn add(a: Vec2, b: Vec2) -> Vec2 {
+    Vec2{ x: a.x + b.x, y: a.y + b.y }
+}
+
+fn dot(a: Vec2, b: Vec2) -> i32 {
+    a.x * b.x + a.y * b.y
+}
+
+fn factorial(n: i32) -> i32 {
+    if n <= 1 {
+        return 1
+    }
+    return n * factorial(n - 1)
+}
+
+fn main() -> i32 {
+    let p = Vec2{ x: 3, y: 4 }
+    let q = Vec2{ x: 1, y: 2 }
+    let s = add(p, q)            // (4, 6)
+    print_int(dot(s, q))         // 4*1 + 6*2 = 16
+    print_int(factorial(5))      // 120
+    return 0
+}

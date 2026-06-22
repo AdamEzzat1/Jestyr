@@ -1,0 +1,71 @@
+// examples/loops.jtr — the unified `for` loop (see docs/loops-spec.md).
+//
+//   jestyrc run examples/loops.jtr
+//   →  10   (range:        0+1+2+3+4)
+//      15   (inclusive:    0+1+2+3+4+5)
+//      10   (slice read:   1+2+3+4, bounds-check elided)
+//      14   (slice mut:    each +1 in place, then summed)
+//       2   (infinite+break/continue: first even element)
+//       3   (wildcard `for _`: repeat 3 times)
+
+// Range form — `i` is i32 (from the bound `n`); index sums to n*(n-1)/2.
+fn sum_to(n: i32) -> i32 {
+    var total: i32 = 0
+    for i in 0..n { total = total + i }
+    return total
+}
+
+// Inclusive range — `0..=n` includes n.
+fn sum_to_incl(n: i32) -> i32 {
+    var total: i32 = 0
+    for i in 0..=n { total = total + i }
+    return total
+}
+
+// Slice read iteration, with a loop invariant. `xs[i]` here is a *raw* access:
+// the index is provably `< xs.len`, so the bounds check is elided.
+fn sum_slice(xs: []i32) -> i32 {
+    var total: i32 = 0
+    for i in 0..xs.len {
+        invariant total >= 0
+        total = total + xs[i]
+    }
+    return total
+}
+
+// Mutable element iteration — `mut x` writes back through the slice in place.
+fn add_one(mut xs: []i32) {
+    for mut x in xs { x = x + 1 }
+}
+
+// Infinite loop with `break`/`continue`, and `return` out of a loop.
+fn first_even(xs: []i32) -> i32 {
+    var i: usize = 0
+    for {
+        if i >= xs.len { break }
+        if xs[i] % 2 != 0 { i = i + 1; continue }
+        return xs[i]
+    }
+    return 0 - 1
+}
+
+fn main() -> i32 {
+    print_int(sum_to(5))         // 10
+    print_int(sum_to_incl(5))    // 15
+
+    var p: *mut i32 = alloc_i32(4)
+    var xs: []i32 = slice(i32, p, 4)
+    unsafe { (p + 0).* = 1; (p + 1).* = 2; (p + 2).* = 3; (p + 3).* = 4 }
+
+    print_int(sum_slice(xs))     // 10
+    add_one(xs)                  // xs = [2, 3, 4, 5]
+    print_int(sum_slice(xs))     // 14
+    print_int(first_even(xs))    // 2
+
+    var count: i32 = 0
+    for _ in 0..3 { count = count + 1 }
+    print_int(count)             // 3
+
+    free_ptr(p)
+    return 0
+}

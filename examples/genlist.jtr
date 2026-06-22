@@ -1,0 +1,46 @@
+// examples/genlist.jtr — a GENERIC, heap-backed, growable container.
+// `List(T)` is a comptime function returning a struct type; each `List(i32)`,
+// `List(f64)`, ... is monomorphized to its own concrete C struct + functions.
+// Run:  jestyrc run examples/genlist.jtr   →  10, 30, 3, then 2.5
+
+fn List(comptime T: type) -> type {
+    return struct {
+        ptr: *mut T,
+        len: i32,
+        cap: i32,
+    }
+}
+
+fn list_new(comptime T: type) -> List(T) {
+    return List(T){ ptr: alloc(T, 4), len: 0, cap: 4 }
+}
+
+fn list_push(comptime T: type, mut l: List(T), x: T) {
+    if l.len == l.cap {
+        l.cap = l.cap * 2
+        l.ptr = realloc(T, l.ptr, l.cap)
+    }
+    unsafe { (l.ptr + l.len).* = x }
+    l.len = l.len + 1
+}
+
+fn list_get(comptime T: type, l: List(T), i: i32) -> T {
+    unsafe { (l.ptr + i).* }
+}
+
+fn main() -> i32 {
+    var xs = list_new(i32)            // List(i32)
+    list_push(i32, xs, 10)
+    list_push(i32, xs, 20)
+    list_push(i32, xs, 30)
+    print_int(list_get(i32, xs, 0))   // 10
+    print_int(list_get(i32, xs, 2))   // 30
+    print_int(xs.len)                 // 3
+    free_ptr(xs.ptr)
+
+    var ys = list_new(f64)            // a second instantiation: List(f64)
+    list_push(f64, ys, 2.5)
+    print_float(list_get(f64, ys, 0)) // 2.5
+    free_ptr(ys.ptr)
+    return 0
+}

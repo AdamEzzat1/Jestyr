@@ -1,0 +1,24 @@
+// examples/genref.jtr — generational references &T (design §4.4).
+//
+// A generational reference is { ptr, gen }: a copyable, storable handle to a heap
+// object that needs no borrow checker and no GC. Each allocation carries a
+// generation; the reference snapshots it. Dereferencing checks the snapshot
+// against the live generation — so a use-after-free *faults at runtime* instead
+// of silently reading freed memory. This is how Jestyr expresses graphs/caches
+// safely: the runtime-checked tier (region refs `&[r]T` are the zero-cost tier,
+// still to come).
+//
+// Run:  jestyrc run examples/genref.jtr   →  42, 99
+
+fn main() -> i32 {
+    var r: &i32 = gen_new(i32, 42)
+    print_int(r.*)        // 42  (generation matches → safe deref)
+
+    var s: &i32 = gen_new(i32, 99)
+    print_int(s.*)        // 99
+
+    gen_free(r)           // invalidate r (bump its generation)
+    gen_free(s)
+    // print_int(r.*)     // would fault: use-after-free caught at runtime
+    return 0
+}

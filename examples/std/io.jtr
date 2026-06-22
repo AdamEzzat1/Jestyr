@@ -1,0 +1,20 @@
+// std/io.jtr — the `std` I/O tier: thin, named wrappers over the runtime's print
+// intrinsics, so user code says `io.print_i32(x)` instead of reaching for a bare
+// compiler builtin. (When `extern "c"` retires the print intrinsics, only this
+// module changes — design §14.)
+
+pub fn print_i32(x: i32) {
+    print_int(x)
+}
+
+pub fn print_f64(x: f64) {
+    print_float(x)
+}
+
+pub fn print_line(s: str) {
+    print_str(s)
+}
+
+pub fn print_flag(b: bool) {
+    print_bool(b)
+}

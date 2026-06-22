@@ -1,0 +1,23 @@
+// examples/shapes.jtr — sum types + pattern matching, compiled to a native binary.
+// Run:  jestyrc run examples/shapes.jtr   →  prints 12.5664, 12, 0
+
+enum Shape {
+    circle(r: f64),
+    rect(w: f64, h: f64),
+    none,
+}
+
+fn area(read s: Shape) -> f64 {
+    match s {
+        circle(r)  => 3.14159 * r * r,
+        rect(w, h) => w * h,
+        none       => 0.0,
+    }
+}
+
+fn main() -> i32 {
+    print_float(area(circle(2.0)))     // π·2² ≈ 12.5664
+    print_float(area(rect(3.0, 4.0)))  // 12
+    print_float(area(none))            // 0
+    return 0
+}

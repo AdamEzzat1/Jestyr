@@ -1,0 +1,13 @@
+// A compute-bound microbenchmark: naive recursive Fibonacci.
+// Purpose: measure the abstraction overhead of Jestyr's C backend vs hand C.
+fn fib(n: i32) -> i32 {
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn main() -> i32 {
+    print_int(fib(40))
+    return 0
+}

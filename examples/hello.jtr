@@ -1,0 +1,7 @@
+// examples/hello.jtr — the smallest runnable Jestyr program.
+// Run:  jestyrc run examples/hello.jtr
+
+fn main() -> i32 {
+    print_str("Hello from Jestyr — compiled through C to a native binary!")
+    return 0
+}

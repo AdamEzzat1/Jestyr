@@ -1,0 +1,33 @@
+// examples/mmio.jtr — bare-metal: volatile registers + fixed addresses (§16).
+//
+// `@volatile` fields compile to C `volatile`, so the compiler won't elide,
+// cache, or reorder the access — essential for memory-mapped I/O. `@address(0x…)`
+// places a pointer at a fixed address (here just declared, not dereferenced, so
+// the demo still runs on a hosted OS). The register block lives in normal memory
+// and is read/written through its volatile fields.
+//
+// Run:  jestyrc run examples/mmio.jtr   →  7, 1
+
+struct Reg {
+    value: @volatile u32,
+    flag:  @volatile u32,
+}
+
+// A fixed-address pointer (the classic MMIO base address); declared, not used.
+const MMIO_BASE: *mut u32 = @address(0x4000_C000)
+
+fn write_value(mut r: Reg, v: u32) {
+    r.value = v
+}
+
+fn read_value(read r: Reg) -> u32 {
+    r.value
+}
+
+fn main() -> i32 {
+    var r = Reg{ value: 0, flag: 1 }
+    write_value(r, 7)
+    print_int(read_value(r))   // 7  (written/read through volatile fields)
+    print_int(r.flag)          // 1
+    return 0
+}

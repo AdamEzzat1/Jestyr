@@ -1,0 +1,38 @@
+// examples/refine.jtr — refinement types elide bounds checks (design §7.2).
+//
+// `at`'s index is refined `in 0..s.len`, so `s[i]` needs NO runtime bounds check
+// — the type proves it in range, and codegen emits the raw access. `at_checked`'s
+// index is unconstrained, so its `s[i]` keeps the check. This is exactly where
+// Jestyr can be *both* safe and as fast as unchecked C — and faster than
+// always-checked safe Rust.
+//
+// (The refinement is a promise the caller must keep; enforcing it at call sites
+// — so the elision is fully sound — is the companion piece, not yet built.)
+//
+// Run:  jestyrc run examples/refine.jtr   →  10, 30
+
+fn set(p: *mut i32, i: i32, v: i32) {
+    unsafe { (p + i).* = v }
+}
+
+fn at(s: []i32, i: usize in 0..s.len) -> i32 {
+    s[i]              // elided: the refinement proves `i < s.len`
+}
+
+fn at_checked(s: []i32, i: usize) -> i32 {
+    s[i]              // bounds-checked: `i` is unconstrained
+}
+
+fn main() -> i32 {
+    var p: *mut i32 = alloc_i32(3)
+    set(p, 0, 10)
+    set(p, 1, 20)
+    set(p, 2, 30)
+
+    var s: []i32 = slice(i32, p, 3)
+    print_int(at(s, 0))          // 10  (no bounds check emitted)
+    print_int(at_checked(s, 2))  // 30  (bounds-checked)
+
+    free_ptr(p)
+    return 0
+}

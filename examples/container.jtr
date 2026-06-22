@@ -1,0 +1,44 @@
+// examples/container.jtr — a real, heap-backed, *growable* container compiled to
+// native code: raw pointers, manual allocation, and in-place mutation through a
+// `mut` borrow. Run:  jestyrc run examples/container.jtr   →  prints 10, 50, 5
+//
+// (This is a concrete `i32` list. Making it `List(T)` for any T is the remaining
+// generic-struct-types grammar layer; the value/pointer machinery is all here.)
+
+struct IntList {
+    ptr: *mut i32,
+    len: i32,
+    cap: i32,
+}
+
+fn list_new() -> IntList {
+    return IntList{ ptr: alloc_i32(4), len: 0, cap: 4 }
+}
+
+// `mut l` is a mutable borrow → lowered to `IntList*`, mutated in place.
+fn list_push(mut l: IntList, x: i32) {
+    if l.len == l.cap {
+        l.cap = l.cap * 2
+        l.ptr = realloc_i32(l.ptr, l.cap)   // grow
+    }
+    unsafe { (l.ptr + l.len).* = x }         // raw store at ptr[len]
+    l.len = l.len + 1
+}
+
+fn list_get(l: IntList, i: i32) -> i32 {
+    unsafe { (l.ptr + i).* }                 // raw load ptr[i]
+}
+
+fn main() -> i32 {
+    var xs = list_new()
+    list_push(xs, 10)
+    list_push(xs, 20)
+    list_push(xs, 30)
+    list_push(xs, 40)
+    list_push(xs, 50)                // 5th push grows capacity 4 → 8
+    print_int(list_get(xs, 0))       // 10
+    print_int(list_get(xs, 4))       // 50
+    print_int(xs.len)                // 5
+    free_ptr(xs.ptr)
+    return 0
+}

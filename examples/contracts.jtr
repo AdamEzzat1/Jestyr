@@ -1,0 +1,30 @@
+// examples/contracts.jtr — design-by-contract (backlog item F).
+//
+// `requires` (preconditions) are asserted on entry; `ensures` (postconditions)
+// are asserted before every return, with `result` bound to the returned value.
+// They lower to C `assert(...)` — active in debug, elided under `-DNDEBUG`
+// (the design's debug-check → release-elide ladder, §6.4). `ensures` is checked
+// at *every* return point, including the early one in `abs`.
+//
+// Run:  jestyrc run examples/contracts.jtr   →  5, then 5
+
+fn abs(x: i32) -> i32
+    ensures result >= 0
+{
+    if x < 0 {
+        return 0 - x
+    }
+    return x
+}
+
+fn safe_div(a: i32, b: i32) -> i32
+    requires b != 0
+{
+    return a / b
+}
+
+fn main() -> i32 {
+    print_int(abs(0 - 5))       // 5  (postcondition result >= 0 holds)
+    print_int(safe_div(10, 2))  // 5  (precondition b != 0 holds)
+    return 0
+}

@@ -1,0 +1,51 @@
+// examples/genmethods.jtr — generic-struct *methods* (backlog item C).
+//
+// Unlike methods.jtr (where `push`/`get` are free functions), here the methods
+// live *inside* the struct that `List(T)` returns — the design's intended shape
+// (`fn push(mut self, …)`). Each `List(i32)` monomorphizes its own
+// `jestyr_List__i32_push` / `_get`, with `self` passed by pointer for `mut self`
+// and by value for `read self`. Calls go through the same `xs.push(x)` sugar.
+//
+// Run:  jestyrc run examples/genmethods.jtr   →  10, 30, 3, then 2.5
+
+fn List(comptime T: type) -> type {
+    return struct {
+        ptr: *mut T,
+        len: i32,
+        cap: i32,
+
+        fn push(mut self, x: T) {
+            if self.len == self.cap {
+                self.cap = self.cap * 2
+                self.ptr = realloc(T, self.ptr, self.cap)
+            }
+            unsafe { (self.ptr + self.len).* = x }
+            self.len = self.len + 1
+        }
+
+        fn get(read self, i: i32) -> T {
+            unsafe { (self.ptr + i).* }
+        }
+    }
+}
+
+fn new(comptime T: type) -> List(T) {
+    return List(T){ ptr: alloc(T, 4), len: 0, cap: 4 }
+}
+
+fn main() -> i32 {
+    var xs = new(i32)
+    xs.push(10)
+    xs.push(20)
+    xs.push(30)
+    print_int(xs.get(0))    // 10
+    print_int(xs.get(2))    // 30
+    print_int(xs.len)       // 3
+    free_ptr(xs.ptr)
+
+    var ys = new(f64)
+    ys.push(2.5)
+    print_float(ys.get(0))  // 2.5
+    free_ptr(ys.ptr)
+    return 0
+}

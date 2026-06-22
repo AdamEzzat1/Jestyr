@@ -1,0 +1,22 @@
+// examples/closure_run.jtr — closures that actually execute (backlog item B).
+//
+// Each closure is lambda-lifted to (1) an environment struct holding its
+// captured values, (2) a top-level function taking that env by pointer, and
+// (3) a closure value pairing a function pointer with its env. Invoking `f(x)`
+// lowers to `f.call(&f.env, x)`.
+//
+// Run:  jestyrc run examples/closure_run.jtr   →  105, 42, 102
+
+fn main() -> i32 {
+    let base = 100
+
+    // captures `base` from the enclosing frame
+    let add = |x: i32| x + base
+    // captures nothing
+    let twice = |y: i32| y + y
+
+    print_int(add(5))            // 100 + 5      = 105
+    print_int(twice(21))         // 21 + 21      = 42
+    print_int(add(twice(1)))     // 100 + (1+1)  = 102
+    return 0
+}

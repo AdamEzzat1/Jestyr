@@ -1,0 +1,24 @@
+[package]
+name = "jestyrc"
+version = "0.1.0"
+edition = "2021"
+description = "The Jestyr language compiler (bootstrap, written in Rust)"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "jestyrc"
+path = "src/main.rs"
+
+# Fast iteration is a Jestyr value; keep the bootstrap compiler's own build snappy too.
+# The compiler itself has zero runtime dependencies (the lexer/parser are hand-written).
+# Test-only dependencies provide property-based and fuzz testing.
+[dev-dependencies]
+proptest = "1"
+bolero = "0.11"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = "thin"

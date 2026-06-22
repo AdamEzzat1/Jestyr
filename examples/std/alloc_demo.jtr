@@ -1,0 +1,39 @@
+// examples/std/alloc_demo.jtr — allocator-as-value end to end (items K + I).
+//
+// The *same* code path (`fill_and_sum`) works against two different allocator
+// strategies, chosen by the value passed in. This is the whole point of
+// allocator-as-value: the strategy travels with the value, nothing is hidden.
+//
+// Note: functions/consts are import-gated (qualified `mem.allocate`), but *types*
+// resolve by bare name in the v1 flat namespace — so the `Allocator` type is
+// written bare even though it is defined in `mem`.
+//
+//   jestyrc run examples/std/alloc_demo.jtr   →   60, 60
+
+import "mem"
+
+// Allocate 3 ints from `a`, fill them, sum them, then release. Allocator-agnostic.
+fn fill_and_sum(a: Allocator) -> i32 {
+    var p: *mut i32 = mem.allocate(i32, a, 3)
+    unsafe { (p + 0).* = 10; (p + 1).* = 20; (p + 2).* = 30 }
+    var total: i32 = 0
+    unsafe { total = (p + 0).* + (p + 1).* + (p + 2).* }
+    mem.release(i32, a, p)
+    return total
+}
+
+fn main() -> i32 {
+    // 1) general-purpose (malloc) allocator
+    var gpa: Allocator = mem.system_allocator()
+    print_int(fill_and_sum(gpa))   // 60
+
+    // 2) bump-arena allocator — same fill_and_sum, different strategy.
+    // (The local is named `bump`, not `arena`: a variable sharing a nullary
+    // variant's name is shadowed by the variant in the C backend — a known
+    // bootstrap gotcha.)
+    var bump: Allocator = mem.arena_allocator(1024)
+    print_int(fill_and_sum(bump))  // 60
+    mem.destroy(bump)
+
+    return 0
+}

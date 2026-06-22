@@ -1,0 +1,95 @@
+// examples/loops_advanced.jtr — the loop fast-follows + casts + string iteration.
+//
+//   jestyrc run examples/loops_advanced.jtr
+//   →  32    (lockstep zip: dot product of [1,2,3]·[4,5,6])
+//      6     (@no_panic sum with a provably in-range index)
+//      1     (element+index: i*100 + x for i=0,x=1)
+//      102   (                                i=1,x=2)
+//      203   (                                i=2,x=3)
+//      30    (region-scoped scratch: per-iteration arena, 0+10+20)
+//      131   (string iteration: byte sum of "AB" = 65+66)
+//      2     (labeled break: first i,j with xs[i]+xs[j]==4 → i=0,j=2)
+//      20    (step range: sum of evens 0,2,4,6,8)
+//      0     (variant termination measure: countdown to 0)
+
+// Lockstep zip — the two slices must have equal length (checked).
+fn dot(xs: []i32, ys: []i32) -> i32 {
+    var d: i32 = 0
+    for a, b in xs, ys { d = d + a * b }
+    return d
+}
+
+// @no_panic: every index must be provably in range, or it's a compile error.
+@no_panic fn sum(xs: []i32) -> i32 {
+    var t: i32 = 0
+    for i in 0..xs.len { t = t + xs[i] }
+    return t
+}
+
+// String iteration yields bytes (`u8`); `as i32` widens for arithmetic.
+fn byte_sum(s: str) -> i32 {
+    var t: i32 = 0
+    for c in s { t = t + (c as i32) }
+    return t
+}
+
+// Labeled break out of nested loops: first (i, j) with xs[i] + xs[j] == target,
+// encoded as i*10 + j (or -1).
+fn first_pair(xs: []i32, target: i32) -> i32 {
+    var found: i32 = 0 - 1
+    for outer: i in 0..xs.len {
+        for j in 0..xs.len {
+            if xs[i] + xs[j] == target {
+                found = i * 10 + j
+                break outer
+            }
+        }
+    }
+    return found
+}
+
+fn main() -> i32 {
+    var p: *mut i32 = alloc_i32(3)
+    var xs: []i32 = slice(i32, p, 3)
+    unsafe { (p + 0).* = 1; (p + 1).* = 2; (p + 2).* = 3 }
+    var q: *mut i32 = alloc_i32(3)
+    var ys: []i32 = slice(i32, q, 3)
+    unsafe { (q + 0).* = 4; (q + 1).* = 5; (q + 2).* = 6 }
+
+    print_int(dot(xs, ys))   // 32
+    print_int(sum(xs))       // 6
+
+    // element + index
+    for x, i in xs { print_int(i * 100 + x) }   // 1, 102, 203
+
+    // region-scoped scratch arena: fresh per iteration, freed once
+    var rs: i32 = 0
+    for k in 0..3 region scratch {
+        var c: &[scratch]i32 = region_alloc(scratch, i32, 1)
+        unsafe { c.* = k * 10 }
+        unsafe { rs = rs + c.* }
+    }
+    print_int(rs)            // 30
+
+    print_int(byte_sum("AB"))  // 131
+
+    // labeled break — xs is [1,2,3]; 1 + 3 == 4 at i=0, j=2 → 0*10 + 2
+    print_int(first_pair(xs, 4))   // 2
+
+    // step range — sum of evens in 0..10
+    var ev: i32 = 0
+    for i in 0..10 step 2 { ev = ev + i }
+    print_int(ev)              // 20
+
+    // variant — a termination measure: `n` must be >= 0 and strictly decrease
+    var n: i32 = 4
+    for n > 0 {
+        variant n
+        n = n - 1
+    }
+    print_int(n)               // 0
+
+    free_ptr(p)
+    free_ptr(q)
+    return 0
+}

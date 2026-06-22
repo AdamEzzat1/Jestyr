@@ -1,0 +1,17 @@
+// std/core.jtr — the `core` tier: allocation-free, OS-free helpers (design §3/§14).
+// Nothing here allocates; `core` is what a freestanding/bare-metal target links.
+
+pub fn imax(a: i32, b: i32) -> i32 {
+    if a > b { return a }
+    return b
+}
+
+pub fn imin(a: i32, b: i32) -> i32 {
+    if a < b { return a }
+    return b
+}
+
+pub fn abs_i32(x: i32) -> i32 {
+    if x < 0 { return 0 - x }
+    return x
+}

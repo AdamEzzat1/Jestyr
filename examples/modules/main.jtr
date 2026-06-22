@@ -1,0 +1,17 @@
+// examples/modules/main.jtr — a multi-file program (item K, design §9).
+//
+// `import "mathx"` loads mathx.jtr (resolved relative to this file) and binds it
+// as `mathx`. Qualified access `mathx.square` reaches its public items; the
+// private `mathx.scale` would be a visibility error.
+//
+//   jestyrc run examples/modules/main.jtr   →   49, 27, 14, 2
+
+import "mathx"
+
+fn main() -> i32 {
+    print_int(mathx.square(7))   // 49
+    print_int(mathx.cube(3))     // 27
+    print_int(mathx.doubled(7))  // 14  (doubled is pub; it calls private scale)
+    print_int(mathx.TWO)         // 2   (qualified const access)
+    return 0
+}

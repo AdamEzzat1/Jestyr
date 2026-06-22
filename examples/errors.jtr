@@ -1,0 +1,22 @@
+// examples/errors.jtr — error sets and the `?` operator, compiled to native code.
+// `T !{E}` lowers to a tagged result struct; `?` propagates errors with an early
+// return. Run:  jestyrc run examples/errors.jtr   →  prints 6, then true
+
+fn safe_div(a: i32, b: i32) -> i32 !{ DivByZero } {
+    if b == 0 {
+        return err(DivByZero)
+    }
+    return ok(a / b)
+}
+
+// `?` propagates `DivByZero` from safe_div without any explicit error handling.
+fn add_one(a: i32, b: i32) -> i32 !{ DivByZero } {
+    let q = safe_div(a, b)?
+    return ok(q + 1)
+}
+
+fn main() -> i32 {
+    print_int(unwrap(add_one(10, 2)))    // 10/2 = 5, +1 = 6
+    print_bool(is_err(add_one(10, 0)))   // division by zero propagates → true
+    return 0
+}

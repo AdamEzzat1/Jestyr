@@ -1,0 +1,27 @@
+// examples/generic.jtr — generics by monomorphization. The `comptime T: type`
+// parameter is a *type passed as a value*, erased at compile time; each distinct
+// type argument stamps out its own concrete function.
+//
+// The value params are `take`: because these functions *return* one of their
+// arguments, they must own it (a default = `read` borrow could not escape — see
+// mvs.jtr). For a generic `T` the checker must assume non-`Copy`, so `take` is
+// required even though the demo instantiates at `Copy` scalars.
+// Run:  jestyrc run examples/generic.jtr   →  prints 7, 3, 2.5
+
+fn max(comptime T: type, take a: T, take b: T) -> T {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn min(comptime T: type, take a: T, take b: T) -> T {
+    if a < b { a } else { b }
+}
+
+fn main() -> i32 {
+    print_int(max(i32, 3, 7))        // 7   → instantiates max__i32
+    print_int(min(i32, 3, 7))        // 3   → instantiates min__i32
+    print_float(max(f64, 2.5, 1.5))  // 2.5 → instantiates max__f64
+    return 0
+}

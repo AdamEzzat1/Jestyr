@@ -1,0 +1,25 @@
+// examples/mvs.jtr — move-by-default value semantics (design §4.3).
+//
+// The default parameter convention is now `read` (an immutable borrow): you may
+// read it and pass it further down, but it may not escape the call. `keep` tries
+// to return its borrowed parameter by value — rejected. To hand ownership back,
+// declare the parameter `take`.
+//
+// Run:  jestyrc check examples/mvs.jtr   →  1 error: cannot return borrow `n`
+
+struct Node { v: i32 }
+
+// ✗ ESCAPE: `n` is a default (= read) borrow; returning it moves out of the borrow.
+fn keep(n: Node) -> Node {
+    n
+}
+
+// ✓ OK: `take` consumes ownership, so the value can be returned.
+fn consume(take n: Node) -> Node {
+    n
+}
+
+// ✓ OK: a Copy scalar default is duplicated, not referenced — fine to return.
+fn echo(x: i32) -> i32 {
+    x
+}

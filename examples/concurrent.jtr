@@ -1,0 +1,32 @@
+// examples/concurrent.jtr — structured concurrency (backlog item J).
+//
+// A `concurrent { … }` nursery launches each `spawn`ed task on its own OS thread
+// (pthreads) and *joins them all at the closing brace* — Swift/Trio-style
+// structured concurrency (design §10.2): no task can outlive its scope, so a
+// value borrowed into a task can't escape its frame. Each task writes a distinct
+// slot of `buf` (no data race); the results are visible once the scope joins.
+//
+// Run:  jestyrc run examples/concurrent.jtr   →  0, 4, 9
+
+fn set(p: *mut i32, i: i32) {
+    unsafe { (p + i).* = i * i }
+}
+
+fn get(p: *mut i32, i: i32) -> i32 {
+    unsafe { (p + i).* }
+}
+
+fn main() -> i32 {
+    var buf: *mut i32 = alloc_i32(4)
+    concurrent {
+        spawn set(buf, 0)
+        spawn set(buf, 1)
+        spawn set(buf, 2)
+        spawn set(buf, 3)
+    }
+    print_int(get(buf, 0))   // 0
+    print_int(get(buf, 2))   // 4
+    print_int(get(buf, 3))   // 9
+    free_ptr(buf)
+    return 0
+}

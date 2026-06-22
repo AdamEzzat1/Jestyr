@@ -1,0 +1,19 @@
+// examples/typeerr.jtr — exercises the type checker (stages ③–④).
+// Run:  jestyrc check examples/typeerr.jtr   → expect THREE errors.
+
+struct Point { x: i32, y: i32 }
+
+// ✗ no field `z` on a known struct
+fn bad_field(read p: Point) -> i32 {
+    p.z
+}
+
+// ✗ wrong number of arguments to a known function
+fn caller() {
+    bad_field()
+}
+
+// ✗ duplicate top-level definition
+fn caller() {
+    bad_field(Point{ x: 0, y: 0 })
+}

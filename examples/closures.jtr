@@ -1,0 +1,25 @@
+// examples/closures.jtr — completes the escape-checker thesis: a closure that
+// captures a second-class borrow is itself borrow-tainted, so the existing
+// escape routes catch it leaving the frame.
+// Run:  jestyrc check examples/closures.jtr   →  expect exactly ONE escape error.
+
+struct Conn { fd: i32 }
+
+fn use_conn(read c: Conn) {}
+
+// ✗ ESCAPE: the returned closure captures the borrow `c`, so `c` would be used
+//   after this call returns.
+fn make_leaky(read c: Conn) -> Handler {
+    || use_conn(c)
+}
+
+// ✓ OK: this closure captures `n`, which is owned (not a borrow) — fine to return.
+fn make_ok(n: i32) -> Handler {
+    || takes_int(n)
+}
+
+// ✓ OK: a borrow-capturing closure that stays in the frame never escapes.
+fn run_local(read c: Conn) {
+    let f = || use_conn(c)
+    invoke(f)
+}

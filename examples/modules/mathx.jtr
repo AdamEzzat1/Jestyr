@@ -1,0 +1,23 @@
+// examples/modules/mathx.jtr — an imported module (item K).
+// `pub` items are visible to importers; unmarked items are module-private.
+
+pub const TWO: i32 = 2
+
+pub fn square(x: i32) -> i32 {
+    return x * x
+}
+
+// An intra-module call: `cube` calls `square` by its bare name (same module,
+// order-independent — no forward declaration needed, design §9).
+pub fn cube(x: i32) -> i32 {
+    return square(x) * x
+}
+
+// Module-private: importers may not name `mathx.scale` (a visibility error).
+fn scale(x: i32) -> i32 {
+    return x * TWO
+}
+
+pub fn doubled(x: i32) -> i32 {
+    return scale(x)
+}

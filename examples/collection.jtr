@@ -1,0 +1,25 @@
+// examples/collection.jtr — the "store a borrow into a collection" escape,
+// in its idiomatic Jestyr form: a borrow cannot be handed to a `take` parameter.
+// Run:  jestyrc check examples/collection.jtr   → expect ONE escape error.
+
+struct Item { id: i32 }
+struct List { len: i32 }
+
+// `take item` consumes ownership — the collection now owns what it's given.
+fn append(mut self_list: List, take item: Item) {
+    // (a real impl stores `item` into `self_list`)
+}
+
+// Just looks at its argument; a borrow is plenty.
+fn inspect(read item: Item) {}
+
+// ✗ ESCAPE: `p` is only borrowed, so it cannot be GIVEN to `append` (which
+//   would store it past the borrow's lifetime).
+fn bad_insert(mut list: List, read p: Item) {
+    append(list, p)
+}
+
+// ✓ OK: passing the borrow to a function that only reads it is fine.
+fn ok_inspect(read p: Item) {
+    inspect(p)
+}

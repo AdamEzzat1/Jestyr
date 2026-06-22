@@ -1,0 +1,23 @@
+// examples/region.jtr — region references &[r]T (design §4.4): the ZERO-COST tier.
+//
+// A `region r { … }` block owns a bump arena. `region_alloc(r, T, v)` allocates
+// into it and returns a `&[r]T` — a *plain pointer*, with NO per-deref check
+// (unlike the runtime-checked generational `&T` in genref.jtr). Safety is
+// structural/lexical: a `&[r]T` is confined to the region's scope, and the whole
+// arena is freed in O(1) at the block's closing brace. This is how Jestyr does
+// fast, deterministic, arena-allocated data (graphs, ASTs) with zero reference
+// overhead — the compile-time-proven half of the tiered-safety model.
+//
+// Run:  jestyrc run examples/region.jtr   →  10, 20, 30
+
+fn main() -> i32 {
+    region r {
+        var a: &[r]i32 = region_alloc(r, i32, 10)
+        var b: &[r]i32 = region_alloc(r, i32, 20)
+        var c: &[r]i32 = region_alloc(r, i32, 30)
+        print_int(a.*)    // 10  (raw deref — zero runtime cost)
+        print_int(b.*)    // 20
+        print_int(c.*)    // 30
+    }                     // the whole arena is freed here, at once
+    return 0
+}

@@ -1,0 +1,33 @@
+// examples/layout.jtr — layout-control attributes (design §7/§16; memory efficiency).
+//
+// `@packed` removes inter-field padding; `@align(n)` forces an alignment. They
+// lower to GNU `__attribute__((packed))` / `((aligned(n)))`. `size_of(T)` (a new
+// intrinsic → C `sizeof`) makes the memory difference observable.
+//
+// `Wasteful` has a u8, an i32, and a u8 — natural alignment pads it to 12 bytes.
+// `Tight` is the same fields `@packed` → 6 bytes. `Over` forces 16-byte alignment.
+//
+// Run:  jestyrc run examples/layout.jtr   →  12, 6, 16
+
+struct Wasteful {
+    a: u8,
+    b: i32,
+    c: u8,
+}
+
+@packed struct Tight {
+    a: u8,
+    b: i32,
+    c: u8,
+}
+
+@align(16) struct Over {
+    x: i32,
+}
+
+fn main() -> i32 {
+    print_int(size_of(Wasteful))   // 12 — padded for alignment
+    print_int(size_of(Tight))      // 6  — no padding
+    print_int(size_of(Over))       // 16 — forced alignment
+    return 0
+}
