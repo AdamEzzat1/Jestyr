@@ -343,6 +343,47 @@ value each iteration); like `invariant`, it becomes a static proof obligation on
 
 ---
 
+## 17. Loop `else` — search-or-default
+
+Attach an `else` block to any *finite* loop. It runs **exactly once, iff the loop
+finishes without a `break`** (Python's loop-`else`) — the "search, else default"
+idiom with no sentinel value and no found-flag:
+
+```jestyr
+fn first_even(xs: []i32) -> i32 {
+    var ans: i32 = 0
+    for x in xs {
+        if x % 2 == 0 { ans = x; break }   // hit → break skips the `else`
+    } else {
+        ans = 0 - 1                         // ran off the end → not found
+    }
+    return ans
+}
+```
+
+- A `break` (plain *or* labeled) skips the `else`; running off the end of a
+  range/slice — or a `for <cond>` going false — runs it.
+- The `else` runs in the **enclosing scope**: the loop bindings are already out of
+  scope, and the iterated collection is no longer frozen.
+- `return` inside the body leaves the *function*, so it bypasses the `else` too.
+- It composes with everything else — labels, `region`, zip, `step`. With a
+  `region`, the `else` runs after the loop body but before the arena is freed (so
+  it must not touch `scratch` allocations — they are iteration-local).
+
+**An infinite `for { … }` may not have an `else`** — its only exit is `break`, so
+the `else` could never run. It is a compile error:
+
+```jestyr
+for { if done() { break } } else { cleanup() }
+// error: an infinite `for { … }` only exits via `break`, so its `else` can
+//        never run — remove the `else`, or give the loop a condition or range
+```
+
+(Lowered to C with the `else` block emitted after the loop; a `break` becomes a
+`goto` whose target sits *after* the `else`, so it jumps past it.)
+
+---
+
 ## Related: casts — `expr as T`
 
 Loops over typed data lean on explicit conversions. `as` performs numeric and
@@ -362,9 +403,11 @@ print_int((c as u8) as i32)
 ```sh
 jestyrc run examples/loops.jtr           # → 10, 15, 10, 14, 2, 3   (the MVP forms)
 jestyrc run examples/loops_advanced.jtr  # → 32, 6, 1, 102, 203, 30, 131, 2, 20, 0
+jestyrc run examples/loops_else.jtr      # → 4, -1, 7               (loop-`else`)
 ```
 [`examples/loops.jtr`](../examples/loops.jtr) ·
-[`examples/loops_advanced.jtr`](../examples/loops_advanced.jtr)
+[`examples/loops_advanced.jtr`](../examples/loops_advanced.jtr) ·
+[`examples/loops_else.jtr`](../examples/loops_else.jtr)
 
 ---
 
@@ -372,7 +415,6 @@ jestyrc run examples/loops_advanced.jtr  # → 32, 6, 1, 102, 203, 30, 131, 2, 2
 
 - `take`-iteration (`for take x in xs`) — needs an owned-iterable protocol.
 - Value-yielding loops (`let x = for { break v }`).
-- Loop `else`.
 - Custom iterators (`for x in map.keys()`).
 - Unicode-aware string iteration (`for cp in text.codepoints()`).
 - `par` parallel loops.

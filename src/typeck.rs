@@ -930,11 +930,14 @@ impl<'a> TypeChecker<'a> {
                 self.infer_block(scope, typ, self_ty, body);
                 Ty::Unit
             }
-            ExprKind::For { head, body, .. } => {
+            ExprKind::For { head, body, els, .. } => {
                 match head {
-                    ForHead::Infinite => {}
+                    ForHead::Infinite => {
+                        self.infer_block(scope, typ, self_ty, body);
+                    }
                     ForHead::While(cond) => {
                         self.infer(scope, typ, self_ty, *cond);
+                        self.infer_block(scope, typ, self_ty, body);
                     }
                     ForHead::Iter { binds, sources, .. } => {
                         let binds: Vec<(String, Conv)> =
@@ -971,10 +974,13 @@ impl<'a> TypeChecker<'a> {
                         }
                         self.infer_block(scope, typ, self_ty, body);
                         scope.pop();
-                        return self.set(id, Ty::Unit);
                     }
                 }
-                self.infer_block(scope, typ, self_ty, body);
+                // The `else` block runs after the loop, in the *enclosing* scope —
+                // the loop bindings are out of scope here.
+                if let Some(els) = els {
+                    self.infer_block(scope, typ, self_ty, els);
+                }
                 Ty::Unit
             }
             ExprKind::Break(_) | ExprKind::Continue(_) => Ty::Unit,

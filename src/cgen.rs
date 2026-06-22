@@ -108,6 +108,7 @@ pub fn emit(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
         cur_refines: HashMap::new(),
         scratch_reset: None,
         cont_label: None,
+        break_label: None,
         variant_trackers: HashMap::new(),
         cur_no_panic: false,
     };
@@ -246,6 +247,12 @@ struct Cgen<'a> {
     /// emitted at the bottom of the body (armed by `emit_for`, consumed by the
     /// body emitter).
     cont_label: Option<String>,
+    /// for the *innermost* loop that has an `else`, the label a plain (unlabeled)
+    /// `break` must `goto` so it skips the `else` block (whose `<label>__break:`
+    /// target sits *after* the `else`). `None` when the innermost loop has no
+    /// `else`, so a plain `break` lowers to C `break`. Saved/restored per loop so
+    /// it always names the nearest loop.
+    break_label: Option<String>,
     /// `variant <expr>` node id → its hoisted tracker index (pre-scanned per loop).
     variant_trackers: HashMap<ExprId, usize>,
     /// is the function being emitted `@no_panic`? If so, a non-elided (faulting)
@@ -575,7 +582,7 @@ impl<'a> Cgen<'a> {
             }
             ExprKind::Block(b) | ExprKind::Unsafe(b) => self.collect_structs_in_block(b, subst, seen, order),
             ExprKind::Closure { body, .. } => self.collect_structs_in_expr(*body, subst, seen, order),
-            ExprKind::For { head, body, .. } => {
+            ExprKind::For { head, body, els, .. } => {
                 match head {
                     ForHead::While(c) => self.collect_structs_in_expr(*c, subst, seen, order),
                     ForHead::Iter { sources, .. } => {
@@ -586,6 +593,9 @@ impl<'a> Cgen<'a> {
                     ForHead::Infinite => {}
                 }
                 self.collect_structs_in_block(body, subst, seen, order);
+                if let Some(els) = els {
+                    self.collect_structs_in_block(els, subst, seen, order);
+                }
             }
             ExprKind::Invariant(e) | ExprKind::Variant(e) => self.collect_structs_in_expr(*e, subst, seen, order),
             _ => {}
@@ -1003,7 +1013,9 @@ impl<'a> Cgen<'a> {
                     ExprKind::Unsafe(b) => self.emit_body(b, false),
                     ExprKind::Concurrent(b) => self.emit_concurrent(b),
                     ExprKind::Region { name, body } => self.emit_region(&name.name, body),
-                    ExprKind::For { label, head, region, body } => self.emit_for(label.as_ref(), head, region.as_ref(), body),
+                    ExprKind::For { label, head, region, body, els } => {
+                        self.emit_for(label.as_ref(), head, region.as_ref(), body, els.as_ref())
+                    }
                     _ => {
                         let v = self.emit_expr(*e);
                         self.line(format!("{v};"));
@@ -1026,7 +1038,9 @@ impl<'a> Cgen<'a> {
             ExprKind::Unsafe(b) => self.emit_body(b, true),
             // A loop has no value; emit it as a statement (a non-void function
             // still needs an explicit `return` after it).
-            ExprKind::For { label, head, region, body } => self.emit_for(label.as_ref(), head, region.as_ref(), body),
+            ExprKind::For { label, head, region, body, els } => {
+                self.emit_for(label.as_ref(), head, region.as_ref(), body, els.as_ref())
+            }
             _ => {
                 let v = self.emit_expr(e);
                 self.emit_value_return(v);
@@ -1417,7 +1431,13 @@ impl<'a> Cgen<'a> {
             }
             ExprKind::Break(l) => match l {
                 Some(lbl) => format!("goto {}__break", lbl.name),
-                None => "break".to_string(),
+                // A plain `break` in a loop that has an `else` must `goto` past the
+                // `else` block (its target sits after the `else`); otherwise a plain
+                // C `break` is exactly right.
+                None => match &self.break_label {
+                    Some(name) => format!("goto {name}__break"),
+                    None => "break".to_string(),
+                },
             },
             ExprKind::Continue(l) => match l {
                 Some(lbl) => format!("goto {}__continue", lbl.name),
@@ -1876,7 +1896,7 @@ impl<'a> Cgen<'a> {
                 }
             }
             ExprKind::Block(b) | ExprKind::Unsafe(b) => self.find_closures_block(b, found, seen),
-            ExprKind::For { head, body, .. } => {
+            ExprKind::For { head, body, els, .. } => {
                 match head {
                     ForHead::While(c) => self.find_closures_expr(*c, found, seen),
                     ForHead::Iter { sources, .. } => {
@@ -1887,6 +1907,9 @@ impl<'a> Cgen<'a> {
                     ForHead::Infinite => {}
                 }
                 self.find_closures_block(body, found, seen);
+                if let Some(els) = els {
+                    self.find_closures_block(els, found, seen);
+                }
             }
             ExprKind::Invariant(e) | ExprKind::Variant(e) => self.find_closures_expr(*e, found, seen),
             _ => {}
@@ -1980,7 +2003,7 @@ impl<'a> Cgen<'a> {
             }
             ExprKind::Block(b) | ExprKind::Unsafe(b) => self.collect_refs_block(b, out),
             ExprKind::Closure { body, .. } => self.collect_refs(*body, out),
-            ExprKind::For { head, body, .. } => {
+            ExprKind::For { head, body, els, .. } => {
                 match head {
                     ForHead::While(c) => self.collect_refs(*c, out),
                     ForHead::Iter { sources, .. } => {
@@ -1991,6 +2014,9 @@ impl<'a> Cgen<'a> {
                     ForHead::Infinite => {}
                 }
                 self.collect_refs_block(body, out);
+                if let Some(els) = els {
+                    self.collect_refs_block(els, out);
+                }
             }
             ExprKind::Invariant(e) | ExprKind::Variant(e) => self.collect_refs(*e, out),
             _ => {}
@@ -2359,7 +2385,12 @@ impl<'a> Cgen<'a> {
                     self.find_spawns_expr(a.body, out);
                 }
             }
-            ExprKind::For { body, .. } => self.find_spawns_block(body, out),
+            ExprKind::For { body, els, .. } => {
+                self.find_spawns_block(body, out);
+                if let Some(els) = els {
+                    self.find_spawns_block(els, out);
+                }
+            }
             _ => {}
         }
     }
@@ -2451,7 +2482,14 @@ impl<'a> Cgen<'a> {
     /// a range loop also wires its index into the refinement proof so `xs[i]` in
     /// the body elides its bounds check. An optional `region` wraps the loop in a
     /// scratch arena that is reset (O(1)) each iteration and freed once at the end.
-    fn emit_for(&mut self, label: Option<&Ident>, head: &ForHead, region: Option<&Ident>, body: &Block) {
+    fn emit_for(
+        &mut self,
+        label: Option<&Ident>,
+        head: &ForHead,
+        region: Option<&Ident>,
+        body: &Block,
+        els: Option<&Block>,
+    ) {
         // Region-scoped loop: open the arena once, arm the per-iteration reset
         // (consumed by `emit_loop_body`), and free the arena after the loop.
         if let Some(r) = region {
@@ -2467,9 +2505,40 @@ impl<'a> Cgen<'a> {
         if let Some(l) = label {
             self.cont_label = Some(l.name.clone());
         }
+        // A loop with an `else` needs its break target placed *after* the `else`,
+        // so a `break` skips it. Reuse the user's label if present, else synthesize
+        // a fresh one. (A label-only loop keeps its target right after the body —
+        // there is no `else` in between.)
+        let eff_label: Option<String> = match (label, els) {
+            (Some(l), _) => Some(l.name.clone()),
+            (None, Some(_)) => {
+                let n = self.tmp;
+                self.tmp += 1;
+                Some(format!("_fe{n}"))
+            }
+            (None, None) => None,
+        };
+        // Arm plain-`break` rerouting for the body: only a loop that *has* an
+        // `else` reroutes (to skip it). Setting `None` for an else-less loop
+        // correctly models "the nearest loop" across nested loops.
+        let saved_break = self.break_label.take();
+        self.break_label = if els.is_some() { eff_label.clone() } else { None };
         self.emit_for_inner(head, body);
-        if let Some(l) = label {
-            self.line(format!("{}__break: ;", l.name)); // labeled-break target
+        self.break_label = saved_break;
+        // The `else` runs on normal completion: emitted between the loop and the
+        // break target, so falling out of the loop runs it while a `break` (now a
+        // `goto <label>__break`) jumps past it.
+        if let Some(els_blk) = els {
+            self.line("{");
+            self.depth += 1;
+            for stmt in &els_blk.stmts {
+                self.emit_stmt(stmt);
+            }
+            self.depth -= 1;
+            self.line("}");
+        }
+        if let Some(name) = &eff_label {
+            self.line(format!("{name}__break: ;")); // labeled- and/or else-break target
         }
         self.variant_trackers = saved_trackers;
         if let Some(r) = region {
@@ -3248,7 +3317,7 @@ impl<'a> Cgen<'a> {
             ExprKind::Region { body, .. } => self.find_calls_block(body, subst, work),
             ExprKind::Closure { body, .. } => self.find_calls_expr(*body, subst, work),
             ExprKind::Spawn(inner) => self.find_calls_expr(*inner, subst, work),
-            ExprKind::For { head, body, .. } => {
+            ExprKind::For { head, body, els, .. } => {
                 match head {
                     ForHead::While(c) => self.find_calls_expr(*c, subst, work),
                     ForHead::Iter { sources, .. } => {
@@ -3259,6 +3328,9 @@ impl<'a> Cgen<'a> {
                     ForHead::Infinite => {}
                 }
                 self.find_calls_block(body, subst, work);
+                if let Some(els) = els {
+                    self.find_calls_block(els, subst, work);
+                }
             }
             ExprKind::Invariant(e) | ExprKind::Variant(e) => self.find_calls_expr(*e, subst, work),
             _ => {}
@@ -3720,6 +3792,46 @@ mod tests {
         assert!(c.contains("outer__break: ;"), "break target after the loop: {c}");
         assert!(c.contains("goto outer__continue;"), "labeled continue → goto: {c}");
         assert!(c.contains("outer__continue: ;"), "continue target at body end: {c}");
+    }
+
+    #[test]
+    fn lowers_loop_else_with_break_skipping_it() {
+        // The `else` is emitted *after* the loop; a plain `break` becomes a
+        // `goto …__break` whose target sits *after* the `else`, so it skips it.
+        // Falling off the end of the slice runs the `else`.
+        let src = "fn f(xs: []i32) -> i32 { var a: i32 = 0 \
+                   for x in xs { if x == 0 { a = 1 break } } else { a = 0 - 1 } return a }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        // Plain break is rerouted to skip the else…
+        assert!(c.contains("goto _fe0__break;"), "plain break skips the else via goto: {c}");
+        // …and the else body precedes the break target.
+        let els_at = c.find("j_a = (0 - 1)").expect("else body emitted");
+        let tgt_at = c.find("_fe0__break: ;").expect("break target emitted");
+        assert!(els_at < tgt_at, "else body comes before the break target: {c}");
+    }
+
+    #[test]
+    fn lowers_labeled_loop_else_target_after_else() {
+        // A *labeled* else-loop reuses the user's label for the skip target, and
+        // that target still lands after the `else`.
+        let src = "fn f(xs: []i32) -> i32 { var a: i32 = 0 \
+                   for outer: x in xs { if x == 0 { break outer } } else { a = 9 } return a }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("goto outer__break;"), "labeled break → goto: {c}");
+        let els_at = c.find("j_a = 9").expect("else body emitted");
+        let tgt_at = c.find("outer__break: ;").expect("break target emitted");
+        assert!(els_at < tgt_at, "labeled break target sits after the else: {c}");
+    }
+
+    #[test]
+    fn loop_else_does_not_perturb_an_else_less_loop() {
+        // No `else` ⇒ no synthetic label, and a plain `break` stays a C `break`.
+        let (c, d) = gen("fn f() { for { break } }");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("break;"), "else-less break is plain C break: {c}");
+        assert!(!c.contains("__break"), "no break label synthesized: {c}");
     }
 
     #[test]

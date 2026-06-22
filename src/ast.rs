@@ -200,8 +200,12 @@ pub enum ExprKind {
     /// `read`/`mut` convention, exactly like a parameter. An optional `region`
     /// gives each iteration a fresh scratch arena (reset in O(1) per iteration,
     /// freed once after the loop). An optional `label` (`for outer: …`) is the
-    /// target of a labeled `break`/`continue`.
-    For { label: Option<Ident>, head: ForHead, region: Option<Ident>, body: Block },
+    /// target of a labeled `break`/`continue`. An optional `els` block (`for … {
+    /// … } else { … }`) runs exactly once *if the loop completes without a
+    /// `break`* — the "search-or-default" idiom (Python's loop-`else`). It is
+    /// rejected on an infinite loop, whose only exit is `break` (the `else` would
+    /// be dead code).
+    For { label: Option<Ident>, head: ForHead, region: Option<Ident>, body: Block, els: Option<Block> },
     /// `break` / `break <label>` — exit the nearest enclosing loop, or the loop
     /// named by the label.
     Break(Option<Ident>),

@@ -275,25 +275,28 @@ impl<'a> Printer<'a> {
             ExprKind::Concurrent(_) => "concurrent { ... }".to_string(),
             ExprKind::Spawn(e) => format!("spawn {}", self.expr_inline(*e)),
             ExprKind::Region { name, .. } => format!("region {} {{ ... }}", name.name),
-            ExprKind::For { head, .. } => match head {
-                ForHead::Infinite => "for { ... }".to_string(),
-                ForHead::While(c) => format!("for {} {{ ... }}", self.expr_inline(*c)),
-                ForHead::Iter { binds, sources, .. } => {
-                    let bs: Vec<String> = binds
-                        .iter()
-                        .map(|b| {
-                            let c = if b.conv != Conv::Default && b.conv != Conv::Read {
-                                format!("{} ", b.conv.label())
-                            } else {
-                                String::new()
-                            };
-                            format!("{}{}", c, b.name.name)
-                        })
-                        .collect();
-                    let ss: Vec<String> = sources.iter().map(|s| self.expr_inline(*s)).collect();
-                    format!("for {} in {} {{ ... }}", bs.join(", "), ss.join(", "))
+            ExprKind::For { head, els, .. } => {
+                let tail = if els.is_some() { " else { ... }" } else { "" };
+                match head {
+                    ForHead::Infinite => format!("for {{ ... }}{tail}"),
+                    ForHead::While(c) => format!("for {} {{ ... }}{tail}", self.expr_inline(*c)),
+                    ForHead::Iter { binds, sources, .. } => {
+                        let bs: Vec<String> = binds
+                            .iter()
+                            .map(|b| {
+                                let c = if b.conv != Conv::Default && b.conv != Conv::Read {
+                                    format!("{} ", b.conv.label())
+                                } else {
+                                    String::new()
+                                };
+                                format!("{}{}", c, b.name.name)
+                            })
+                            .collect();
+                        let ss: Vec<String> = sources.iter().map(|s| self.expr_inline(*s)).collect();
+                        format!("for {} in {} {{ ... }}{tail}", bs.join(", "), ss.join(", "))
+                    }
                 }
-            },
+            }
             ExprKind::Break(l) => match l {
                 Some(n) => format!("break {}", n.name),
                 None => "break".to_string(),

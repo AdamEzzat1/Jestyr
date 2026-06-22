@@ -318,7 +318,7 @@ impl<'a> Checker<'a> {
                 self.check_block(ctx, body, false);
                 return;
             }
-            ExprKind::For { head, body, .. } => {
+            ExprKind::For { head, body, els, .. } => {
                 ctx.push();
                 let mut froze = 0usize;
                 match head {
@@ -376,6 +376,12 @@ impl<'a> Checker<'a> {
                     self.frozen.pop();
                 }
                 ctx.pop();
+                // The `else` block runs after the loop, in the enclosing scope:
+                // the loop bindings are gone and the iterated collections are no
+                // longer frozen.
+                if let Some(els) = els {
+                    self.check_block(ctx, els, false);
+                }
                 return;
             }
             ExprKind::Invariant(e) | ExprKind::Variant(e) => {

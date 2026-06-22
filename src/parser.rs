@@ -965,8 +965,25 @@ impl<'src> Parser<'src> {
         // Optional `region <name>` — a per-iteration scratch arena.
         let region = if self.eat(Region) { Some(self.eat_ident("region name")) } else { None };
         let body = self.parse_block();
-        let span = start.to(body.span);
-        self.ast.expr(ExprKind::For { label, head, region, body }, span)
+        // Optional `else { … }` — runs once if the loop completes without `break`
+        // (Python's loop-`else`; the search-or-default idiom). An infinite loop
+        // only ever exits via `break`, so its `else` is dead code — reject it.
+        let els = if self.eat(Else) {
+            let els_start = self.prev_span();
+            let b = self.parse_block();
+            if matches!(head, ForHead::Infinite) {
+                self.error(
+                    els_start.to(b.span),
+                    "an infinite `for { … }` only exits via `break`, so its `else` can never run — remove the `else`, or give the loop a condition or range",
+                );
+            }
+            Some(b)
+        } else {
+            None
+        };
+        let span = els.as_ref().map_or(body.span, |b| b.span);
+        let span = start.to(span);
+        self.ast.expr(ExprKind::For { label, head, region, body, els }, span)
     }
 
     /// Parse a loop header (everything between `for` and the body / `region`).
@@ -1076,13 +1093,13 @@ impl<'src> Parser<'src> {
             self.no_struct = saved;
             let body = self.parse_block();
             let span = start.to(body.span);
-            self.ast.expr(ExprKind::For { label: None, head: ForHead::While(cond), region: None, body }, span)
+            self.ast.expr(ExprKind::For { label: None, head: ForHead::While(cond), region: None, body, els: None }, span)
         } else {
             self.error(start, "Jestyr has one loop keyword — write `for { … }` (not `loop`)");
             self.bump();
             let body = self.parse_block();
             let span = start.to(body.span);
-            self.ast.expr(ExprKind::For { label: None, head: ForHead::Infinite, region: None, body }, span)
+            self.ast.expr(ExprKind::For { label: None, head: ForHead::Infinite, region: None, body, els: None }, span)
         }
     }
 
@@ -1380,6 +1397,30 @@ mod tests {
         assert!(
             kinds().any(|k| matches!(k, ExprKind::Continue(Some(l)) if l.name == "outer")),
             "labeled continue parsed",
+        );
+    }
+
+    #[test]
+    fn parses_loop_else_on_iter_and_conditional() {
+        let ast = parse_ok(
+            "fn f() { for x in xs { break } else { } for c { } else { } }",
+        );
+        let with_else = ast
+            .exprs
+            .iter()
+            .filter(|e| matches!(&e.kind, ExprKind::For { els: Some(_), .. }))
+            .count();
+        assert_eq!(with_else, 2, "both an iter-loop and a conditional loop carry an `else`");
+    }
+
+    #[test]
+    fn rejects_else_on_an_infinite_loop() {
+        let (_a, d) = parse("fn f() { for { break } else { } }");
+        assert_eq!(d.len(), 1, "exactly one error: {:?}", d);
+        assert!(
+            d[0].message.contains("infinite") && d[0].message.contains("`else`"),
+            "points at the dead `else`: {:?}",
+            d,
         );
     }
 

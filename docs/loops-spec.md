@@ -151,12 +151,15 @@ All fast-follows (F1–F4), plus: **labeled `break`/`continue`** (`for outer: �
 `goto`), **`step`/descending ranges** (negative literal step descends; signed index
 avoids underflow; no elision when stepped), **`variant` termination measures**
 (hoisted `INT64_MAX` tracker + per-iteration `>= 0` and strict-decrease asserts),
-plus **casts** (`expr as T`) and **byte-level string iteration** (`for c in text`,
-`text.len` via `strlen`). User-facing reference: [`loops.md`](loops.md).
+**loop-`else`** (`for … { … } else { … }` — runs iff the loop completes without a
+`break`; the `else` is emitted after the loop and a `break` becomes a `goto` past
+it; rejected on an infinite loop, whose `else` would be dead code), plus **casts**
+(`expr as T`) and **byte-level string iteration** (`for c in text`, `text.len` via
+`strlen`). User-facing reference: [`loops.md`](loops.md).
 
 ## Still DEFERRED
 `take`-iteration (slices are borrows — needs an owned-iterable protocol);
-value-yielding `for { break v }` / loop-as-expression; loop-`else`; destructuring
+value-yielding `for { break v }` / loop-as-expression; destructuring
 bindings; custom iterators; **Unicode-aware** string iteration
 (`for cp in text.codepoints()` — byte iteration exists, codepoints are future); a
 length-carrying `String` type; `par` parallel loops (`// future: par — deterministic
