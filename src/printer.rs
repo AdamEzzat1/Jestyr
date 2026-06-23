@@ -367,6 +367,11 @@ impl<'a> Printer<'a> {
                 let s: Vec<String> = subpats.iter().map(|x| self.pat_str(*x)).collect();
                 format!("{}({})", name.name, s.join(", "))
             }
+            PatKind::Lit(e) => self.expr_inline(*e),
+            PatKind::Range { lo, hi, inclusive } => {
+                let dots = if *inclusive { "..=" } else { ".." };
+                format!("{}{}{}", self.expr_inline(*lo), dots, self.expr_inline(*hi))
+            }
             PatKind::Error => "<error-pat>".to_string(),
         }
     }

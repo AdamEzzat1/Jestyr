@@ -220,6 +220,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `recursion.jtr` | `30`, `70` | **recursive ADTs via `indirect` (B)** — `node(left: indirect Tree, …)`; by-value recursion is a compile error (§5.36) |
 | `distinct.jtr` | `1001`, `42`, `7` | **distinct nominal types (B)** — `distinct UserId = i32`; zero-cost typedef; `as` to convert; mixing without `as` errors (§5.37) |
 | `guards.jtr` | `5`, `20`, `37`, `50`, `5`, `3`, `0` | **match arm guards (§2.4)** — `pat if <bool> => …`; two arms share a variant via guard; guarded arms don't count for exhaustiveness; lowers to an if-chain (§5.38) |
+| `ranges.jtr` | `0`, `1`, `2`, `3`, `9`, `-1`, `1` | **literal + range patterns (§2.4)** — `match` on integers; `0`, `1..=9`, `100..1000`; scalar match needs a catch-all; if-chain on the value (§5.39) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -701,6 +702,28 @@ These are the non-obvious things that will bite if you don't know them.
     replacing name-set exhaustiveness with a Maranget usefulness matrix (which also flags
     redundant arms — now that guarded arms are skipped, an unguarded arm shadowed by an
     earlier one is the first redundancy case to catch).
+
+39. **Literal + range patterns → `match` on integers (design §2.4, step 2).** Two new
+    `PatKind`s: `Lit(ExprId)` (`0`, `-3`, `'a'`, `true` — the literal is kept as an expr so
+    cgen re-emits it verbatim) and `Range { lo, hi, inclusive }` (`0..=9` / `0..9`). Parsed
+    in `parse_pattern` (a `parse_pat_lit` helper handles a leading `-`; **floats are
+    excluded** — equality is a footgun). **This is the first time `match` dispatches on a
+    non-enum scrutinee.** cgen: `emit_match` routes a `Ty::Prim` scrutinee whose name passes
+    `typeck::is_scalar_match_ty` (integer/char/bool, *not* float) to **`emit_scalar_match`**
+    — an ordered if-chain on the *value*: `Lit` → `tmp == (lit)`, `Range` → `tmp >= (lo) &&
+    tmp <(=) (hi)`, `Wildcard`/`Ident` → catch-all (on a scalar, *every* `Ident` is a
+    binding — no variant can match an int). Guards compose (same `emit_guarded_arm`).
+    **Exhaustiveness:** `check_exhaustive` gains a scalar branch — the integer domain can't
+    be enumerated, so a scalar `match` **requires an unguarded `_`/binding catch-all** (true
+    interval coverage like `0..=255` over `u8`, and `true|false` over `bool`, arrive with
+    the Maranget pass — §2.4 step 4). The new `PatKind`s also forced no-op/diagnostic arms in
+    every exhaustive `match pat` site (the AST-shape tax): `bind_pattern_types`/`check_exhaustive`
+    (typeck), `bind_pattern` (escape), `pat_str` (printer), and the two enum loops in cgen
+    (`emit_match` switch path + `emit_guarded_match`) where a scalar pattern on an enum
+    scrutinee diagnoses. **Limitation:** *nested* literal patterns inside a variant
+    (`some(0)`) still bind-or-ignore like a wildcard in the enum path — proper nested-pattern
+    dispatch lands with the Maranget decision tree (step 4). Demo
+    [`examples/ranges.jtr`](examples/ranges.jtr) (`0, 1, 2, 3, 9, -1, 1`).
 
 ---
 

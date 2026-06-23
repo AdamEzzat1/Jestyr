@@ -1321,11 +1321,66 @@ impl<'src> Parser<'src> {
                     self.ast.pat(PatKind::Ident(name), span)
                 }
             }
+            Int | Char | True | False | Minus => {
+                let lo = self.parse_pat_lit().expect("literal-starting token");
+                let lo_span = self.ast.expr_at(lo).span;
+                if self.at(DotDot) || self.at(DotDotEq) {
+                    let inclusive = self.at(DotDotEq);
+                    self.bump();
+                    let hi = match self.parse_pat_lit() {
+                        Some(h) => h,
+                        None => {
+                            let sp = self.cur().span;
+                            self.error(sp, "expected the upper bound of a range pattern".to_string());
+                            return self.ast.pat(PatKind::Error, lo_span);
+                        }
+                    };
+                    let s = lo_span.to(self.ast.expr_at(hi).span);
+                    self.ast.pat(PatKind::Range { lo, hi, inclusive }, s)
+                } else {
+                    self.ast.pat(PatKind::Lit(lo), lo_span)
+                }
+            }
             other => {
                 self.error(span, format!("expected a pattern, found `{}`", other.describe()));
                 self.bump();
                 self.ast.pat(PatKind::Error, span)
             }
+        }
+    }
+
+    /// Parse a scalar literal used inside a pattern (`0`, `-3`, `'a'`, `true`),
+    /// returning its expression id — or `None` if the cursor isn't on a literal.
+    /// Float literals are intentionally excluded (float equality is a footgun).
+    fn parse_pat_lit(&mut self) -> Option<ExprId> {
+        let tok = self.cur();
+        let span = tok.span;
+        match tok.kind {
+            Minus => {
+                self.bump();
+                let rhs = self.parse_pat_lit()?;
+                let s = span.to(self.ast.expr_at(rhs).span);
+                Some(self.ast.expr(ExprKind::Unary { op: UnOp::Neg, rhs }, s))
+            }
+            Int => {
+                self.bump();
+                let t = self.text(span);
+                Some(self.ast.expr(ExprKind::Int(t), span))
+            }
+            Char => {
+                self.bump();
+                let t = self.text(span);
+                Some(self.ast.expr(ExprKind::Char(t), span))
+            }
+            True => {
+                self.bump();
+                Some(self.ast.expr(ExprKind::Bool(true), span))
+            }
+            False => {
+                self.bump();
+                Some(self.ast.expr(ExprKind::Bool(false), span))
+            }
+            _ => None,
         }
     }
 
@@ -1436,6 +1491,31 @@ mod tests {
         assert_eq!(arms.len(), 2);
         assert!(arms[0].guard.is_some(), "the guarded arm carries a guard");
         assert!(arms[1].guard.is_none(), "the unguarded arm has no guard");
+    }
+
+    #[test]
+    fn parses_literal_and_range_patterns() {
+        let ast = parse_ok(
+            "fn f(read n: i32) -> i32 { match n { 0 => 0, 1..=9 => 1, 10..20 => 2, _ => 9 } }",
+        );
+        let arms = ast
+            .exprs
+            .iter()
+            .find_map(|e| match &e.kind {
+                ExprKind::Match { arms, .. } => Some(arms.clone()),
+                _ => None,
+            })
+            .expect("a match expression");
+        assert!(matches!(ast.pat_at(arms[0].pat).kind, PatKind::Lit(_)), "first arm is a literal");
+        assert!(
+            matches!(ast.pat_at(arms[1].pat).kind, PatKind::Range { inclusive: true, .. }),
+            "second arm is an inclusive range"
+        );
+        assert!(
+            matches!(ast.pat_at(arms[2].pat).kind, PatKind::Range { inclusive: false, .. }),
+            "third arm is a half-open range"
+        );
+        assert!(matches!(ast.pat_at(arms[3].pat).kind, PatKind::Wildcard));
     }
 
     #[test]

@@ -185,9 +185,16 @@ match shape {
   and an unguarded fallback is still required. cgen flips a match with any guarded arm to
   an ordered if-else-if chain (`switch` can't re-test a tag or fall through on a failed
   guard); no-guard matches keep the existing `switch`/null-test lowering untouched. Demo
-  [`examples/guards.jtr`](../examples/guards.jtr); HANDOFF §5.38. **Remaining steps:**
-  or-patterns, range patterns, `..` rest, `@`-binding, then the Maranget usefulness matrix
-  (real nested-pattern exhaustiveness + redundant-arm warnings + a decision-tree lowering).
+  [`examples/guards.jtr`](../examples/guards.jtr); HANDOFF §5.38.
+- **Step 2 ✅ — literal + range patterns (`match` on integers).** `PatKind::Lit(ExprId)`
+  (`0`, `-3`, `'a'`, `true`) and `PatKind::Range { lo, hi, inclusive }` (`0..=9` / `0..9`).
+  The first non-enum scrutinee: a `Ty::Prim` integer/char/bool routes to a value if-chain
+  (`emit_scalar_match`), guards composing. Exhaustiveness gains a scalar branch — the domain
+  can't be enumerated, so a scalar `match` requires a `_`/binding catch-all. Demo
+  [`examples/ranges.jtr`](../examples/ranges.jtr); HANDOFF §5.39. **Remaining steps:**
+  or-patterns (`a | b`), `..` rest, then the Maranget usefulness matrix (real nested-pattern
+  exhaustiveness — including `0..=255`/`true|false` interval coverage — + redundant-arm
+  warnings + a decision-tree lowering, replacing the name-set/catch-all checks).
 
 ### 2.5 Recursive ADTs via explicit `indirect`  ✅ DONE
 

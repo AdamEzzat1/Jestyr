@@ -1725,6 +1725,13 @@ impl<'a> Cgen<'a> {
             }
             _ => {}
         }
+        // A scalar scrutinee (integer/char/bool) dispatches on the value itself via
+        // an ordered if-chain — there's no tag to `switch` on.
+        if let Ty::Prim(p) = &scrut_ty {
+            if crate::typeck::is_scalar_match_ty(p) {
+                return self.emit_scalar_match(e, ret, &scrut_ty);
+            }
+        }
         // The C tag-enum prefix and the type-arg substitution (empty for a plain
         // enum; type-params → args for a generic instance), so payload bindings
         // get their concrete C type.
@@ -1827,6 +1834,13 @@ impl<'a> Cgen<'a> {
                     self.depth -= 1;
                     self.line("}");
                 }
+                PatKind::Lit(_) | PatKind::Range { .. } => {
+                    // Scalar patterns are invalid on an enum scrutinee (a type error).
+                    self.diag(
+                        ast.pat_at(arm.pat).span,
+                        "literal/range patterns only apply to a scalar `match`",
+                    );
+                }
                 PatKind::Error => {}
             }
         }
@@ -1926,6 +1940,12 @@ impl<'a> Cgen<'a> {
                     self.depth -= 1;
                     self.line("}");
                 }
+                PatKind::Lit(_) | PatKind::Range { .. } => {
+                    self.diag(
+                        ast.pat_at(arm.pat).span,
+                        "literal/range patterns only apply to a scalar `match`",
+                    );
+                }
                 PatKind::Error => {}
             }
         }
@@ -1961,6 +1981,78 @@ impl<'a> Cgen<'a> {
                     self.line(format!("goto {end};"));
                 }
             }
+        }
+    }
+
+    /// Lower a `match` on a scalar (integer/char/bool) scrutinee to an ordered
+    /// if-else-if chain on the *value*: a literal arm tests `==`, a range arm tests
+    /// `>=` / `<`(`=`), and a wildcard or binding is the catch-all. Guards compose
+    /// (the same `emit_guarded_arm`). The frontend requires a catch-all, so control
+    /// never falls off the chain.
+    fn emit_scalar_match(&mut self, e: ExprId, ret: bool, scrut_ty: &Ty) {
+        let ast = self.ast;
+        let (scrut, arms) = match &ast.expr_at(e).kind {
+            ExprKind::Match { scrut, arms } => (*scrut, arms),
+            _ => return,
+        };
+        let scrut_c = self.emit_expr(scrut);
+        let cty = self.c_type(scrut_ty);
+        let tmp = format!("jm_{}", self.tmp);
+        self.tmp += 1;
+        let end = format!("jm_end_{}", self.tmp);
+        self.tmp += 1;
+        self.line(format!("{cty} {tmp} = {scrut_c};"));
+
+        let mut has_uncond_default = false;
+        for arm in arms {
+            let guard = arm.guard;
+            // The C value test (None = unconditional catch-all) plus an optional
+            // whole-value binding.
+            let (cond, bind): (Option<String>, Option<String>) = match &ast.pat_at(arm.pat).kind {
+                PatKind::Lit(le) => {
+                    let lc = self.emit_expr(*le);
+                    (Some(format!("{tmp} == ({lc})")), None)
+                }
+                PatKind::Range { lo, hi, inclusive } => {
+                    let loc = self.emit_expr(*lo);
+                    let hic = self.emit_expr(*hi);
+                    let op = if *inclusive { "<=" } else { "<" };
+                    (Some(format!("{tmp} >= ({loc}) && {tmp} {op} ({hic})")), None)
+                }
+                PatKind::Wildcard => (None, None),
+                // On a scalar scrutinee any identifier is a binding catch-all (no
+                // enum variant can match an integer).
+                PatKind::Ident(b) => (None, Some(b.name.clone())),
+                _ => {
+                    self.diag(
+                        ast.pat_at(arm.pat).span,
+                        "this pattern isn't valid on a scalar `match`",
+                    );
+                    continue;
+                }
+            };
+            if cond.is_none() && guard.is_none() {
+                has_uncond_default = true;
+            }
+            match &cond {
+                Some(c) => {
+                    self.line(format!("if ({c})"));
+                    self.line("{");
+                }
+                None => self.line("{"),
+            }
+            self.depth += 1;
+            if let Some(b) = bind {
+                self.line(format!("{cty} j_{b} = {tmp};"));
+            }
+            self.emit_guarded_arm(arm.body, guard, ret, &end);
+            self.depth -= 1;
+            self.line("}");
+        }
+        if !ret {
+            self.line(format!("{end}: ;"));
+        } else if !has_uncond_default {
+            self.line("__builtin_unreachable();");
         }
     }
 
@@ -5113,6 +5205,36 @@ mod tests {
         assert!(c.contains("!= ((int32_t*)0)"), "`some` tested by non-null: {c}");
         assert!(c.contains("== ((int32_t*)0)"), "`none` tested by null: {c}");
         assert!(c.contains("if ((j_flag > 0))"), "the guard gates the `some` arm: {c}");
+    }
+
+    #[test]
+    fn scalar_match_lowers_to_a_value_if_chain() {
+        let src = "fn f(read n: i32) -> i32 { match n { 0 => 0, 1..=9 => 1, 100..1000 => 2, _ => 9 } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(!c.contains("switch ("), "a scalar match is an if-chain, not a switch: {c}");
+        assert!(c.contains("== (0)"), "literal arm tests equality: {c}");
+        assert!(c.contains(">= (1) && ") && c.contains("<= (9)"), "inclusive range bounds: {c}");
+        assert!(c.contains("< (1000)"), "half-open upper bound is exclusive: {c}");
+    }
+
+    #[test]
+    fn char_range_pattern_lowers_to_a_comparison() {
+        // Char-literal bounds are integer comparisons in C.
+        let src = "fn d(read c: u8) -> i32 { match c { '0'..='9' => 1, _ => 0 } }";
+        let (c, diags) = gen(src);
+        assert!(diags.is_empty(), "{:?}", diags);
+        assert!(c.contains(">= ('0') && ") && c.contains("<= ('9')"), "char-range comparison: {c}");
+    }
+
+    #[test]
+    fn scalar_match_guard_composes_with_a_binding_catch_all() {
+        let src = "fn f(read n: i32) -> i32 { match n { 0 => 0, m if m < 0 => 0 - 1, m => 1 } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("== (0)"), "literal arm: {c}");
+        assert!(c.contains("int32_t j_m = "), "binding catch-all names the value: {c}");
+        assert!(c.contains("if ((j_m < 0))"), "the guard gates the binding arm: {c}");
     }
 
     #[test]

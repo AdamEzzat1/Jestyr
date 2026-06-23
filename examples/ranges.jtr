@@ -1,0 +1,38 @@
+// examples/ranges.jtr — literal & range patterns: `match` on integers (§2.4).
+//
+// A scalar `match` dispatches on the value itself — a literal arm tests equality,
+// a range arm tests an interval (`1..=9` inclusive, `100..1000` half-open). The
+// integer domain can't be enumerated, so a scalar `match` requires a `_`/binding
+// catch-all; the lowering is an ordered if-else-if chain on the value.
+//
+// Run:  jestyrc run examples/ranges.jtr   →  prints 0, 1, 2, 3, 9, -1, 1
+
+fn classify(read n: i32) -> i32 {
+    match n {
+        0         => 0,        // exact literal
+        1..=9     => 1,        // one digit
+        10..=99   => 2,        // two digits
+        100..1000 => 3,        // three digits (half-open upper bound)
+        _         => 9,        // anything else
+    }
+}
+
+// Guards compose with scalar patterns; a binding catch-all names the value.
+fn sign(read n: i32) -> i32 {
+    match n {
+        0          => 0,
+        m if m < 0 => 0 - 1,   // negative
+        m          => 1,       // positive
+    }
+}
+
+fn main() -> i32 {
+    print_int(classify(0))       // 0
+    print_int(classify(7))       // 1
+    print_int(classify(55))      // 2
+    print_int(classify(512))     // 3
+    print_int(classify(9999))    // 9
+    print_int(sign(0 - 8))       // -1
+    print_int(sign(42))          // 1
+    return 0
+}

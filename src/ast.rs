@@ -115,6 +115,11 @@ pub enum PatKind {
     Wildcard,                                  // _
     Ident(Ident),                              // a binding, or a nullary variant like `none`
     Variant { name: Ident, subpats: Vec<PatId> }, // circle(r), rect(w, h)
+    /// A scalar literal pattern: `0`, `-3`, `'a'`, `true`. The `ExprId` is the
+    /// literal expression, so cgen can re-emit it verbatim for the equality test.
+    Lit(ExprId),
+    /// An inclusive/half-open integer range: `0..=9` / `0..9`.
+    Range { lo: ExprId, hi: ExprId, inclusive: bool },
     Error,
 }
 

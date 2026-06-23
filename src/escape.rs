@@ -571,6 +571,7 @@ impl<'a> Checker<'a> {
                     self.bind_pattern(ctx, *sp, is_borrow);
                 }
             }
+            PatKind::Lit(_) | PatKind::Range { .. } => {}
             PatKind::Wildcard | PatKind::Error => {}
         }
     }

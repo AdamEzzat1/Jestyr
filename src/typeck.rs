@@ -1307,6 +1307,8 @@ impl<'a> TypeChecker<'a> {
                     self.bind_pattern_types(scope, &fty, *sp);
                 }
             }
+            // Scalar patterns bind nothing — they only constrain the value.
+            PatKind::Lit(_) | PatKind::Range { .. } => {}
             PatKind::Wildcard | PatKind::Error => {}
         }
     }
@@ -1345,6 +1347,31 @@ impl<'a> TypeChecker<'a> {
     /// Report a non-exhaustive `match` on an enum (one not covering every variant
     /// and lacking a `_`/binding catch-all).
     fn check_exhaustive(&mut self, span: Span, scrut: &Ty, arms: &[MatchArm]) {
+        // A scalar scrutinee (integer/char/bool) has too large/infinite a domain to
+        // enumerate with literal/range arms, so it needs an unguarded `_`/binding
+        // catch-all. (True interval coverage — `0..=255` over `u8`, or `true|false`
+        // over `bool` — arrives with the Maranget usefulness pass.)
+        if let Ty::Prim(p) = scrut {
+            if is_scalar_match_ty(p) {
+                let ast = self.ast;
+                let has_catch_all = arms.iter().any(|a| {
+                    a.guard.is_none()
+                        && match &ast.pat_at(a.pat).kind {
+                            PatKind::Wildcard => true,
+                            PatKind::Ident(n) => !self.table.variants.contains_key(&n.name),
+                            _ => false,
+                        }
+                });
+                if !has_catch_all {
+                    self.error(
+                        span,
+                        "non-exhaustive `match`: a scalar `match` needs a `_` or binding catch-all"
+                            .to_string(),
+                    );
+                }
+                return;
+            }
+        }
         let ei = match scrut {
             Ty::Named(i) => *i,
             Ty::GenEnum { ctor, .. } => match self.table.type_index.get(ctor) {
@@ -1380,6 +1407,9 @@ impl<'a> TypeChecker<'a> {
                 PatKind::Variant { name, .. } => {
                     covered.insert(name.name.clone());
                 }
+                // Scalar patterns can't appear on an enum scrutinee (a type error
+                // elsewhere); they cover no variant here.
+                PatKind::Lit(_) | PatKind::Range { .. } => {}
                 PatKind::Error => {}
             }
         }
@@ -1391,6 +1421,17 @@ impl<'a> TypeChecker<'a> {
             self.error(span, format!("non-exhaustive `match`: missing `{}`", missing.join("`, `")));
         }
     }
+}
+
+/// The scalar types a `match` can dispatch on by value (integer/char/bool) — i.e.
+/// where literal/range patterns are meaningful. Floats are excluded (equality is a
+/// footgun).
+pub(crate) fn is_scalar_match_ty(p: &str) -> bool {
+    matches!(
+        p,
+        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" | "char"
+            | "bool"
+    )
 }
 
 /// Does the parameter type's head constructor match the receiver's? Confirms
@@ -1591,6 +1632,22 @@ mod tests {
         let (_i, d) = analyze(src);
         assert_eq!(d.len(), 1, "a guarded `_` is not a catch-all: {:?}", d);
         assert!(d[0].message.contains("non-exhaustive"), "{:?}", d);
+    }
+
+    #[test]
+    fn scalar_match_without_catch_all_is_non_exhaustive() {
+        // Literal/range arms can't enumerate the integer domain — a catch-all is
+        // required.
+        let (_i, d) = analyze("fn f(read n: i32) -> i32 { match n { 0 => 0, 1..=9 => 1 } }");
+        assert_eq!(d.len(), 1, "{:?}", d);
+        assert!(d[0].message.contains("non-exhaustive"), "{:?}", d);
+        assert!(d[0].message.contains("catch-all"), "{:?}", d);
+    }
+
+    #[test]
+    fn scalar_match_with_catch_all_is_exhaustive() {
+        let (_i, d) = analyze("fn f(read n: i32) -> i32 { match n { 0 => 0, _ => 1 } }");
+        assert!(d.is_empty(), "a `_` covers the rest: {:?}", d);
     }
 
     #[test]
