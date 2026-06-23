@@ -154,10 +154,15 @@ impl<'a> TypeChecker<'a> {
         for item in &ast.items {
             match item {
                 Item::Struct { name, body, .. } => {
+                    let self_idx = self.table.type_index.get(&name.name).copied();
                     let mut fields = Vec::new();
                     for m in &body.members {
                         if let StructMember::Field { name: fname, ty, .. } = m {
-                            fields.push((fname.name.clone(), self.lower_type(&empty, *ty)));
+                            let fty = self.lower_type(&empty, *ty);
+                            if let Some(si) = self_idx {
+                                self.check_no_value_recursion(si, self.ast.type_at(*ty).span, &fty);
+                            }
+                            fields.push((fname.name.clone(), fty));
                         }
                     }
                     if let Some(&i) = self.table.type_index.get(&name.name) {
@@ -171,10 +176,17 @@ impl<'a> TypeChecker<'a> {
                     // parameters (`some(x: T)`), so lower them with those in scope.
                     let tp: HashSet<String> =
                         e.type_params.iter().map(|p| p.name.clone()).collect();
+                    let self_idx = self.table.type_index.get(&e.name.name).copied();
                     let mut variants = Vec::new();
                     for v in &e.variants {
-                        let ftys: Vec<Ty> =
-                            v.fields.iter().map(|(_, t)| self.lower_type(&tp, *t)).collect();
+                        let mut ftys = Vec::new();
+                        for (_, t) in &v.fields {
+                            let fty = self.lower_type(&tp, *t);
+                            if let Some(si) = self_idx {
+                                self.check_no_value_recursion(si, self.ast.type_at(*t).span, &fty);
+                            }
+                            ftys.push(fty);
+                        }
                         variants.push((v.name.name.clone(), ftys));
                     }
                     if let Some(&i) = self.table.type_index.get(&e.name.name) {
@@ -255,6 +267,23 @@ impl<'a> TypeChecker<'a> {
         });
         self.table.type_index.insert(name.name.clone(), idx);
         idx
+    }
+
+    /// Reject a field that stores the enclosing type *by value* (`struct Node {
+    /// next: Node }` / `enum List { cons(tail: List) }`) — it would be infinitely
+    /// sized. The fix is an indirection (`indirect T`, `*T`, `&T`, `&[r]T`), which
+    /// lowers to a pointer and breaks the cycle. (Catches direct self-reference;
+    /// mutual / generic-by-value cycles are left to the C compiler for now.)
+    fn check_no_value_recursion(&mut self, self_idx: usize, span: Span, field_ty: &Ty) {
+        if matches!(field_ty, Ty::Named(i) if *i == self_idx) {
+            let name = self.table.types[self_idx].name.clone();
+            self.error(
+                span,
+                format!(
+                    "recursive field would make `{name}` infinitely sized — store it behind an indirection (`indirect {name}` or `*{name}`)"
+                ),
+            );
+        }
     }
 
     /// Does `name` denote a generic enum (an `enum Name(T) { … }` template)?
@@ -1432,6 +1461,20 @@ mod tests {
         assert_eq!(d.len(), 1, "{:?}", d);
         assert!(d[0].message.contains("non-exhaustive"), "{:?}", d);
         assert!(d[0].message.contains('c'), "names the missing variant: {:?}", d);
+    }
+
+    #[test]
+    fn rejects_by_value_recursive_field_but_allows_indirect() {
+        // By-value self-reference is infinitely sized → error.
+        let (_i, d) = analyze("enum List { nil, cons(tail: List) }");
+        assert!(d.iter().any(|m| m.message.contains("infinitely sized")), "{:?}", d);
+        let (_s, ds) = analyze("struct Node { next: Node }");
+        assert!(ds.iter().any(|m| m.message.contains("infinitely sized")), "{:?}", ds);
+        // Behind an indirection it's fine.
+        let (_i2, d2) = analyze("enum List { nil, cons(tail: indirect List) }");
+        assert!(d2.is_empty(), "indirect breaks the cycle: {:?}", d2);
+        let (_i3, d3) = analyze("struct Node { next: *Node }");
+        assert!(d3.is_empty(), "a pointer breaks the cycle: {:?}", d3);
     }
 
     #[test]

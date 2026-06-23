@@ -455,6 +455,12 @@ mod tests {
     }
 
     #[test]
+    fn recursion_example_compiles_clean() {
+        // Recursive ADTs via `indirect` (enum/ADT step 2.5).
+        pipeline_is_clean("examples/recursion.jtr");
+    }
+
+    #[test]
     fn tests_demo_example_builds_a_clean_test_harness() {
         // The `@test`/`@bench` runner (workstream O): emit in test mode and check
         // the harness is generated without diagnostics.

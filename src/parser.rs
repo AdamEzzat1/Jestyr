@@ -572,6 +572,16 @@ impl<'src> Parser<'src> {
                 let t = self.bump();
                 self.ast.ty(TypeKind::TypeKw, t.span)
             }
+            // `indirect T` — a recursive-indirection field. Currently sugar for a
+            // raw pointer `*T` (it breaks the size cycle and is the readable
+            // spelling for self-referential ADTs; tier-aware `indirect &[r]T` is
+            // future work). See docs/structs-enums-design.md §2.5.
+            Indirect => {
+                self.bump();
+                let inner = self.parse_type();
+                let span = start.to(self.ast.type_at(inner).span);
+                self.ast.ty(TypeKind::Ptr { mutbl: PtrMut::Default, inner }, span)
+            }
             LBracket => {
                 self.bump();
                 self.expect(RBracket, "`]`"); // `[]T` — a slice
@@ -1450,6 +1460,19 @@ mod tests {
         // No `= n` → no discriminant.
         let p = parse_ok("enum E { a, b }");
         assert!(matches!(&p.items[0], Item::Enum(e) if e.variants[0].discriminant.is_none()));
+    }
+
+    #[test]
+    fn indirect_parses_as_a_pointer() {
+        // `indirect T` is sugar for a raw pointer `*T` (the recursion spelling).
+        let ast = parse_ok("fn f(t: indirect i32) -> i32 { return 0 }");
+        match &ast.items[0] {
+            Item::Fn(f) => {
+                let ty = f.params[0].ty.expect("param has a type");
+                assert!(matches!(ast.type_at(ty).kind, TypeKind::Ptr { .. }), "indirect → pointer");
+            }
+            _ => panic!("expected a function"),
+        }
     }
 
     #[test]

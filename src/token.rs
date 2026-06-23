@@ -42,6 +42,7 @@ pub enum TokenKind {
     Trait,
     Type,
     Distinct,
+    Indirect,
     Error, // the `error` keyword that names an error set
     Match,
     If,
@@ -156,6 +157,7 @@ impl TokenKind {
             "trait" => Trait,
             "type" => Type,
             "distinct" => Distinct,
+            "indirect" => Indirect,
             "error" => Error,
             "match" => Match,
             "if" => If,
@@ -223,6 +225,7 @@ impl TokenKind {
             Trait => "trait",
             Type => "type",
             Distinct => "distinct",
+            Indirect => "indirect",
             Error => "error",
             Match => "match",
             If => "if",

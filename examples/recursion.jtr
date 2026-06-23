@@ -1,0 +1,44 @@
+// examples/recursion.jtr — recursive ADTs via `indirect` (enum/ADT step 2.5).
+//
+//   jestyrc run examples/recursion.jtr   →  30, 70
+//
+// A self-referential field must be stored behind an indirection — `indirect T`
+// (currently a raw pointer `*T`) breaks the size cycle. Writing it by value
+// (`node(left: Tree, …)`) is a compile error that suggests `indirect`. Recursion
+// already works through any pointer tier (`*T`, `&T`, `&[r]T`); `indirect` is just
+// the intent-revealing spelling, and the future hook for tier-aware boxing.
+
+enum Tree { leaf(v: i32), node(left: indirect Tree, right: indirect Tree) }
+
+fn sum(t: Tree) -> i32 {
+    match t {
+        leaf(v)    => v,
+        node(l, r) => sum(l.*) + sum(r.*),   // l, r are pointers — deref to recurse
+    }
+}
+
+fn leaf_box(v: i32) -> *mut Tree {
+    var p: *mut Tree = alloc_i32(8) as *mut Tree
+    unsafe { p.* = leaf(v) }
+    return p
+}
+
+fn main() -> i32 {
+    var l: *mut Tree = leaf_box(10)
+    var r: *mut Tree = leaf_box(20)
+    var t: Tree = node(l, r)
+    print_int(sum(t))                         // 30  (10 + 20)
+
+    // A deeper tree: node(t, leaf(40)).
+    var tbox: *mut Tree = alloc_i32(8) as *mut Tree
+    unsafe { tbox.* = t }
+    var leaf3: *mut Tree = leaf_box(40)
+    var t2: Tree = node(tbox, leaf3)
+    print_int(sum(t2))                        // 70  (30 + 40)
+
+    free_ptr(l)
+    free_ptr(r)
+    free_ptr(tbox)
+    free_ptr(leaf3)
+    return 0
+}

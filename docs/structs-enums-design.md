@@ -180,23 +180,33 @@ match shape {
 - **Provability:** exhaustiveness becomes a *soundness proof*, and redundant arms a
   *warning* — table-stakes for a provable language.
 
-### 2.5 Recursive ADTs via explicit `indirect`  ⏳ (the novel angle)
+### 2.5 Recursive ADTs via explicit `indirect`  ✅ DONE
 
 ```jestyr
-enum Tree {
-    leaf(i32),
-    node(indirect &[r]Tree, indirect &[r]Tree),   // arena-tiered recursion
-}
+enum Tree { leaf(v: i32), node(left: indirect Tree, right: indirect Tree) }
 ```
 - **Inspiration:** Swift `indirect` (but Swift/Rust hide the heap; Jestyr won't).
-- **The Jestyr difference:** the indirection *chooses its tier in the type* — `indirect
-  &[r]Node` (arena, zero-cost), `indirect &Node` (generational, checked), `indirect
-  *Node` (raw). A recursive type therefore **carries its allocation strategy**, which no
-  inspiration offers and which is exactly "transparent cost." `indirect` is the marker
-  that (a) breaks the infinite-size cycle and (b) names the tier.
-- **Impl:** an `indirect` payload marker on a variant field; size computation treats it as
-  a pointer; cgen allocates through the named tier. Depends on the reference tiers (have).
-- **Replaces** CJC's GC `class` for the recursion use-case — no GC type needed.
+- **What landed.** Two things, and a key discovery:
+  - **Recursion already worked** through any pointer tier (`*T`, `&T`, `&[r]T`) — they
+    lower to a pointer, so a recursive enum/struct is already finite-sized and compiles.
+  - **`indirect T`** is a new keyword that is currently **sugar for a raw pointer `*T`**
+    (parser-level → `TypeKind::Ptr`), giving a readable, intent-revealing spelling for a
+    self-referential field. Demo [`examples/recursion.jtr`](../examples/recursion.jtr)
+    (`30, 70`) — a binary tree summed recursively.
+  - **A by-value-recursion guard** (`typeck::check_no_value_recursion`): a field whose
+    type is the *enclosing type by value* (`enum List { cons(tail: List) }`,
+    `struct Node { next: Node }`) is a clear error — "infinitely sized … store it behind
+    an indirection (`indirect List` or `*List`)". This is what makes `indirect` *mean*
+    something rather than being pure cosmetics.
+- **The Jestyr difference (future):** the design goal is that the indirection *chooses its
+  tier in the type* — `indirect &[r]Node` (arena, zero-cost), `indirect &Node`
+  (generational), `indirect *Node` (raw) — so a recursive type **carries its allocation
+  strategy**. Today `indirect T` is just the raw-pointer form; tier-aware `indirect` +
+  auto-allocation on construction is the follow-up. Already replaces CJC's GC `class` for
+  recursion — no GC type needed.
+- **Limitations:** the guard catches *direct* by-value self-reference; mutual cycles
+  (A↔B) and generic-by-value self-reference (`Option(Option(T))` by value) are left to the
+  C compiler for now.
 
 ### 2.6 `distinct` types  ⏳
 
@@ -249,6 +259,7 @@ rebase the rest (HANDOFF §1).
 | 1b-codegen | **Generic-enum monomorphization + inference + in-language `Option`/`Result`** | the codegen completion; inherits 1a's niche opt | no | M–L | ✅ done |
 | 2 | **Explicit discriminants** (`= n` + `e as int`) | the AST-shape change, landed early | **yes** | S | ✅ done |
 | 2b | **Struct-variant *syntax*** (`V { … }` named construct/match) | ergonomics; named fields already exist | **yes** | M | ⏳ |
+| 2.5 | **Recursive ADTs via `indirect`** + by-value-recursion guard | recursion already worked via tiers; `indirect` is the spelling | **yes** | S | ✅ done |
 | 3 | **Match power + Maranget exhaustiveness** | rests on #2's pattern shapes; largest | **yes** | L | ⏳ |
 | 4 | **Recursive ADTs (`indirect`)** | needs ref tiers (have); novel | small | M | ⏳ |
 | 5 | **`distinct` types** | isolated; keyword reserved | small | S | ⏳ |

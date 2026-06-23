@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 205 tests pass, including `proptest` property
+and run (or are correctly rejected). 208 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -217,6 +217,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `niche.jtr` | `8`, `42`, `0` | **niche optimization (B)** — `enum {none, some(*T)}` lowers to a bare pointer (`none`=NULL); `size_of`==pointer size; match→null-test (§5.33) |
 | `option.jtr` | `42`, `7`, `5`, `-3`, `8` | **generic enums + in-language `Option`/`Result` (B)** — monomorphized per instantiation; inference from args/expected-type; `Option(*T)` inherits niche-opt (§5.34) |
 | `discriminants.jtr` | `1`, `2`, `4`, `7`, `2` | **explicit enum discriminants (B)** — `red = 1`; `e as i32` reads the tag; `match` still works by name (§5.35) |
+| `recursion.jtr` | `30`, `70` | **recursive ADTs via `indirect` (B)** — `node(left: indirect Tree, …)`; by-value recursion is a compile error (§5.36) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -639,6 +640,20 @@ These are the non-obvious things that will bite if you don't know them.
     `examples/discriminants.jtr` (`1, 2, 4, 7, 2`). **Not yet:** a `: <int>` tag-width
     repr (`enum Color : u8`), and brace struct-variant *syntax* (`V { x }` named
     construct/match — named *fields* already exist via `V(x: T)`).
+
+36. **Recursive ADTs via `indirect` (design §2.5).** Key fact: **recursion already
+    worked** — `*T`/`&T`/`&[r]T` all lower to a pointer, so `enum List { cons(tail: *List) }`
+    has always compiled (a forward typedef `typedef struct Jestyr_List Jestyr_List;` is
+    emitted by `forward_types`). New this step: the **`indirect` keyword** (`token.rs`),
+    parsed in `parse_type` as **sugar for `TypeKind::Ptr{Default}`** (so *zero* new
+    type/cgen machinery — `indirect T` ≡ `*T`), the readable spelling for a self-reference;
+    and a **by-value-recursion guard** (`typeck::check_no_value_recursion`, run in phase 2
+    when lowering struct/enum fields) that rejects a field whose type is the *enclosing
+    type by value* (`cons(tail: List)`, `next: Node`) with "infinitely sized … use
+    `indirect`/`*`". The guard is what gives `indirect` meaning. Demo
+    `examples/recursion.jtr` (`30, 70`). **Future:** tier-aware `indirect &[r]T` +
+    auto-allocation on construction; the guard catches only *direct* self-reference (mutual
+    / generic-by-value cycles fall to the C compiler).
 
 ---
 
