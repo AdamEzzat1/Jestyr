@@ -1875,6 +1875,9 @@ impl<'a> Cgen<'a> {
                         "literal/range patterns only apply to a scalar `match`",
                     );
                 }
+                // A bare `..` is only meaningful as a variant's last field, handled
+                // by the per-variant binding loop above — not as a whole arm.
+                PatKind::Rest => {}
                 PatKind::Error => {}
             }
         }
@@ -2002,6 +2005,7 @@ impl<'a> Cgen<'a> {
                         "literal/range patterns only apply to a scalar `match`",
                     );
                 }
+                PatKind::Rest => {}
                 PatKind::Error => {}
             }
         }
@@ -5298,6 +5302,17 @@ mod tests {
         assert!(c.contains("!= ((int32_t*)0)"), "`some` tested by non-null: {c}");
         assert!(c.contains("== ((int32_t*)0)"), "`none` tested by null: {c}");
         assert!(c.contains("if ((j_flag > 0))"), "the guard gates the `some` arm: {c}");
+    }
+
+    #[test]
+    fn rest_pattern_binds_only_named_fields() {
+        let src = "enum E { c(x: i32, y: i32, z: i32) } \
+                   fn f(read e: E) -> i32 { match e { c(x, ..) => x } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("int32_t j_x = "), "binds the named field: {c}");
+        assert!(!c.contains("j_y ="), "ignores the rest — no binding for y: {c}");
+        assert!(!c.contains("j_z ="), "ignores the rest — no binding for z: {c}");
     }
 
     #[test]

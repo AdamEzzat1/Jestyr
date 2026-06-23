@@ -1307,8 +1307,8 @@ impl<'a> TypeChecker<'a> {
                     self.bind_pattern_types(scope, &fty, *sp);
                 }
             }
-            // Scalar patterns bind nothing — they only constrain the value.
-            PatKind::Lit(_) | PatKind::Range { .. } => {}
+            // Scalar patterns and `..` rest bind nothing.
+            PatKind::Lit(_) | PatKind::Range { .. } | PatKind::Rest => {}
             PatKind::Or(alts) => {
                 // Alternatives should bind the same names; bind each so any binding
                 // is in scope for the body (the bootstrap doesn't check consistency).
@@ -1437,8 +1437,8 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             // Scalar patterns can't appear on an enum scrutinee (a type error
-            // elsewhere); they cover no variant here.
-            PatKind::Lit(_) | PatKind::Range { .. } | PatKind::Error => {}
+            // elsewhere); `..` rest and these cover no variant here.
+            PatKind::Lit(_) | PatKind::Range { .. } | PatKind::Rest | PatKind::Error => {}
         }
     }
 }

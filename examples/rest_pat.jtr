@@ -1,0 +1,28 @@
+// examples/rest_pat.jtr — the `..` rest in variant patterns (§2.4). `..` ignores a
+// variant's remaining fields, binding only the ones you name; it must be the LAST
+// field pattern. Zero cost — the dropped fields simply aren't bound.
+//
+// Run:  jestyrc run examples/rest_pat.jtr   →  prints 1, 2, 7, 0
+
+enum Event {
+    click(x: i32, y: i32, button: i32),
+    scroll(delta: i32),
+    quit,
+}
+
+// We only care about a click's x and a scroll's delta; `..` drops the rest.
+fn summarize(read e: Event) -> i32 {
+    match e {
+        click(x, ..) => x,        // bind x; ignore y and button
+        scroll(d)    => d,
+        quit         => 0,
+    }
+}
+
+fn main() -> i32 {
+    print_int(summarize(click(1, 50, 2)))   // 1   (x; y=50, button=2 ignored)
+    print_int(summarize(click(2, 99, 0)))   // 2
+    print_int(summarize(scroll(7)))         // 7
+    print_int(summarize(quit))              // 0
+    return 0
+}

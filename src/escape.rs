@@ -571,7 +571,7 @@ impl<'a> Checker<'a> {
                     self.bind_pattern(ctx, *sp, is_borrow);
                 }
             }
-            PatKind::Lit(_) | PatKind::Range { .. } => {}
+            PatKind::Lit(_) | PatKind::Range { .. } | PatKind::Rest => {}
             PatKind::Or(alts) => {
                 for sp in alts {
                     self.bind_pattern(ctx, *sp, is_borrow);

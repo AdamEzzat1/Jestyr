@@ -222,6 +222,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `guards.jtr` | `5`, `20`, `37`, `50`, `5`, `3`, `0` | **match arm guards (§2.4)** — `pat if <bool> => …`; two arms share a variant via guard; guarded arms don't count for exhaustiveness; lowers to an if-chain (§5.38) |
 | `ranges.jtr` | `0`, `1`, `2`, `3`, `9`, `-1`, `1` | **literal + range patterns (§2.4)** — `match` on integers; `0`, `1..=9`, `100..1000`; scalar match needs a catch-all; if-chain on the value (§5.39) |
 | `orpat.jtr` | `1`, `1`, `0`, `7`, `7`, `7`, `0` | **or-patterns `a \| b` (§2.4)** — `red \| green \| blue`, `0 \| 1 \| 2`, `10..=19 \| 30..=39`; each alt covers independently; stacked cases / ORed tests (§5.40) |
+| `rest_pat.jtr` | `1`, `2`, `7`, `0` | **`..` rest in variant patterns (§2.4)** — `click(x, ..)` binds `x`, ignores the rest; trailing-only; the binding loop just skips it (§5.41) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -742,6 +743,19 @@ These are the non-obvious things that will bite if you don't know them.
     diagnoses, it doesn't miscompile). Or-patterns on a **niche** enum diagnose
     ("not supported yet") rather than being silently dropped by the niche classifier's
     catch-all. Demo [`examples/orpat.jtr`](examples/orpat.jtr) (`1, 1, 0, 7, 7, 7, 0`).
+
+41. **`..` rest in variant patterns (design §2.4, step 3b).** `PatKind::Rest`, parsed from a
+    bare `..` (the `DotDot` token at the start of a pattern atom — unambiguous since open-
+    ended ranges aren't supported). It's only meaningful as the **last** field of a variant
+    pattern (`rect(w, ..)` binds `w`, ignores the rest); the parser **rejects a non-trailing
+    `..`** ("`..` may only appear as the last field pattern"). Almost free to implement: the
+    variant binding loop in cgen already binds *only* `Ident` subpatterns, so a trailing
+    `Rest` is simply skipped — no field is bound for it. Everywhere else `Rest` is a no-op
+    (`bind_pattern_types`/`cover_pattern`/`bind_pattern` bind/cover nothing; `pat_str` →
+    `".."`; the two cgen enum loops treat a *whole-arm* `..` as a no-op). Demo
+    [`examples/rest_pat.jtr`](examples/rest_pat.jtr) (`1, 2, 7, 0`). **Limitation:**
+    *trailing* `..` only (a middle `..` would need positional remapping of later bindings) —
+    fine until named struct-variant patterns (§2.3b) land.
 
 ---
 

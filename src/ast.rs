@@ -124,6 +124,9 @@ pub enum PatKind {
     /// alternative matches; the alternatives must bind the same names (the
     /// bootstrap supports non-binding alternatives — variants/literals/ranges).
     Or(Vec<PatId>),
+    /// The `..` rest, valid as the *last* field of a variant pattern: `rect(w, ..)`
+    /// binds `w` and ignores the remaining fields.
+    Rest,
     Error,
 }
 

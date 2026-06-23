@@ -1331,6 +1331,15 @@ impl<'src> Parser<'src> {
                     }
                     let end = self.cur().span;
                     self.expect(RParen, "`)`");
+                    // `..` rest may only appear as the final field of a variant.
+                    let n = subpats.len();
+                    for (i, sp) in subpats.iter().enumerate() {
+                        let is_rest = matches!(self.ast.pat_at(*sp).kind, PatKind::Rest);
+                        let sp_span = self.ast.pat_at(*sp).span;
+                        if is_rest && i + 1 != n {
+                            self.error(sp_span, "`..` may only appear as the last field pattern".to_string());
+                        }
+                    }
                     self.ast.pat(PatKind::Variant { name, subpats }, span.to(end))
                 } else {
                     self.ast.pat(PatKind::Ident(name), span)
@@ -1355,6 +1364,12 @@ impl<'src> Parser<'src> {
                 } else {
                     self.ast.pat(PatKind::Lit(lo), lo_span)
                 }
+            }
+            DotDot => {
+                // The `..` rest — only meaningful as a variant's last field, which
+                // the variant branch validates.
+                self.bump();
+                self.ast.pat(PatKind::Rest, span)
             }
             other => {
                 self.error(span, format!("expected a pattern, found `{}`", other.describe()));
@@ -1550,6 +1565,37 @@ mod tests {
             PatKind::Or(alts) => assert_eq!(alts.len(), 3, "three alternatives"),
             other => panic!("expected an or-pattern, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_rest_in_variant_pattern() {
+        let ast = parse_ok(
+            "enum E { c(x: i32, y: i32) } fn f(read e: E) -> i32 { match e { c(x, ..) => x } }",
+        );
+        let arms = ast
+            .exprs
+            .iter()
+            .find_map(|e| match &e.kind {
+                ExprKind::Match { arms, .. } => Some(arms.clone()),
+                _ => None,
+            })
+            .expect("a match expression");
+        match &ast.pat_at(arms[0].pat).kind {
+            PatKind::Variant { subpats, .. } => {
+                assert_eq!(subpats.len(), 2);
+                assert!(matches!(ast.pat_at(subpats[0]).kind, PatKind::Ident(_)));
+                assert!(matches!(ast.pat_at(subpats[1]).kind, PatKind::Rest));
+            }
+            other => panic!("expected a variant pattern, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rest_must_be_the_last_field() {
+        let (_ast, d) = parse(
+            "enum E { c(x: i32, y: i32) } fn f(read e: E) -> i32 { match e { c(.., y) => y } }",
+        );
+        assert!(d.iter().any(|x| x.message.contains("last field")), "{:?}", d);
     }
 
     #[test]

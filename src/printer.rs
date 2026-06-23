@@ -376,6 +376,7 @@ impl<'a> Printer<'a> {
                 let s: Vec<String> = alts.iter().map(|p| self.pat_str(*p)).collect();
                 s.join(" | ")
             }
+            PatKind::Rest => "..".to_string(),
             PatKind::Error => "<error-pat>".to_string(),
         }
     }

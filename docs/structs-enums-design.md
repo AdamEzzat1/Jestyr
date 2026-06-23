@@ -197,10 +197,15 @@ match shape {
   `red | green | blue` needs no catch-all). cgen: scalar ORs the value tests, the enum
   switch stacks `case` labels, the enum if-chain ORs the tag tests. Nullary-variant
   alternatives only (shared payload bindings are future work). Demo
-  [`examples/orpat.jtr`](../examples/orpat.jtr); HANDOFF §5.40. **Remaining steps:**
-  `..` rest, then the Maranget usefulness matrix (real nested-pattern exhaustiveness —
-  including `0..=255`/`true|false` interval coverage — + redundant-arm warnings + a
-  decision-tree lowering, replacing the name-set/catch-all checks).
+  [`examples/orpat.jtr`](../examples/orpat.jtr); HANDOFF §5.40.
+- **Step 3b ✅ — `..` rest in variant patterns.** `PatKind::Rest`, parsed from a bare `..`;
+  valid as a variant's *last* field only (`rect(w, ..)` binds `w`, drops the rest; a non-
+  trailing `..` is a parse error). Nearly free — the cgen binding loop already binds only
+  named subpatterns, so a trailing rest is simply skipped. Demo
+  [`examples/rest_pat.jtr`](../examples/rest_pat.jtr); HANDOFF §5.41. **Remaining step:**
+  the Maranget usefulness matrix — real nested-pattern exhaustiveness (including
+  `0..=255`/`true|false` interval coverage) + redundant-arm warnings + a decision-tree
+  lowering, replacing the name-set/catch-all checks.
 
 ### 2.5 Recursive ADTs via explicit `indirect`  ✅ DONE
 
