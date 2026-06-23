@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 251 tests pass, including `proptest` property
+and run (or are correctly rejected). 253 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -227,6 +227,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `reflect.jtr` | `12`, `4`, `0`, `4`, `8` | **layout reflection (§2.7)** — `align_of(T)`→`_Alignof`, `offset_of(T, f)`→`offsetof`; compile-time intrinsics next to `size_of` (§5.44) |
 | `struct_variant.jtr` | `12.5664`, `12`, `0`, `9` | **struct-variant syntax (§2.3b)** — named construct `circle { r: 2.0 }` + named match `circle { r }`, `rect { w, .. }`; designated init / by-name dispatch (§5.45) |
 | `spread.jtr` | `1`, `2`, `9`, `2`, `1`, `20` | **struct update / spread (§2.8)** — `Point { x: 9, ..p }` functional update; copy-then-override statement-expr (§5.46) |
+| `defaults.jtr` | `3`, `0`, `1`, `5`, `0`, `9` | **field defaults (§2.8)** — `x: i32 = 0`; omitted fields filled from defaults at construction (§5.47) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -860,6 +861,20 @@ These are the non-obvious things that will bite if you don't know them.
     [`examples/spread.jtr`](examples/spread.jtr) (`1, 2, 9, 2, 1, 20`). **Remaining §2.8:** field
     defaults (`x: i32 = 0`), per-field visibility (`pub x`), untagged `union`, bit-fields, opt-in
     `Copy`.
+
+47. **Field defaults `x: i32 = 0` (design §2.8).** `StructMember::Field` gains a `default:
+    Option<ExprId>`, parsed in `parse_struct_body` as an optional `= <expr>` after the field
+    type. cgen fills omitted fields at each construction site: after emitting the literal's
+    explicit fields, it appends `.j_<f> = <default>` for every declared field not present (via
+    `struct_field_defaults`, which scans `ast.items` for the struct's decl). C designated
+    initializers are order-independent, so the appended defaults compose cleanly with the
+    explicit ones. **Applies to non-generic `StructLit` only** (not generic `GenStructLit`, and
+    not the spread path — a `..base` already supplies every field). **Caveat:** a default is
+    emitted at *each* construction site, so it should be a **constant expression** — a default
+    containing a generic call wouldn't be seen by the monomorphization walkers (which scan fn
+    bodies, not struct decls). Demo [`examples/defaults.jtr`](examples/defaults.jtr)
+    (`3, 0, 1, 5, 0, 9`). **Remaining §2.8:** per-field visibility (`pub x`), untagged `union`,
+    bit-fields, opt-in `Copy`.
 
 ---
 

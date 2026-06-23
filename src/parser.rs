@@ -552,10 +552,18 @@ impl<'src> Parser<'src> {
                 self.check_attrs(&fattrs, attrs::Target::Field);
                 let volatile = fattrs.iter().any(|a| a.name == "volatile");
                 let ty = self.parse_type();
+                // An optional field default: `x: i32 = 0`. Used to fill the field
+                // when a struct literal omits it.
+                let default = if self.eat(Eq) {
+                    Some(self.parse_expr())
+                } else {
+                    None
+                };
                 members.push(StructMember::Field {
                     name,
                     ty,
                     volatile,
+                    default,
                     span: fstart.to(self.prev_span()),
                 });
                 self.eat(Comma); // optional separator between fields
@@ -1635,6 +1643,22 @@ mod tests {
             "enum E { c(x: i32, y: i32) } fn f(read e: E) -> i32 { match e { c(.., y) => y } }",
         );
         assert!(d.iter().any(|x| x.message.contains("last field")), "{:?}", d);
+    }
+
+    #[test]
+    fn parses_field_default() {
+        let ast = parse_ok("struct C { x: i32 = 3, y: i32 }");
+        let body = ast
+            .items
+            .iter()
+            .find_map(|it| match it {
+                Item::Struct { body, .. } => Some(body),
+                _ => None,
+            })
+            .expect("a struct");
+        let has_default =
+            body.members.iter().any(|m| matches!(m, StructMember::Field { default: Some(_), .. }));
+        assert!(has_default, "the `= 3` field default was parsed");
     }
 
     #[test]

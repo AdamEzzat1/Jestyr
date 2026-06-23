@@ -356,7 +356,9 @@ impl FnDecl {
 #[derive(Clone, Debug)]
 pub enum StructMember {
     /// `volatile` is set by an `@volatile` field attribute (MMIO; design §16).
-    Field { name: Ident, ty: TypeId, volatile: bool, span: Span },
+    /// `default` is the field's `= <expr>` default value, used to fill the field
+    /// when a struct literal omits it.
+    Field { name: Ident, ty: TypeId, volatile: bool, default: Option<ExprId>, span: Span },
     Method(FnDecl),
 }
 

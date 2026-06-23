@@ -289,8 +289,10 @@ offset_of(Point, y)       // new — offsetof
 
 ### 2.8 Lower-priority / substrate  ⏳
 
-- **Field defaults** (`x: i32 = 0`) + **per-field visibility** (`pub x`) — cheap grammar
-  additions (CJC has both); compose with field attributes.
+- **Field defaults** (`x: i32 = 0`) ✅ DONE — `StructMember::Field.default`; cgen fills omitted
+  fields from defaults at each construction site (non-generic structs). Demo
+  [`examples/defaults.jtr`](../examples/defaults.jtr); HANDOFF §5.47. **Per-field visibility**
+  (`pub x`) — still a cheap grammar addition (CJC has both); composes with field attributes.
 - **Struct update / spread** (`Point { x: 9, ..p }`) ✅ DONE — `StructLit.spread`; a
   copy-then-override GNU statement-expression. Pairs with immutable `record` (functional
   update). Demo [`examples/spread.jtr`](../examples/spread.jtr); HANDOFF §5.46.

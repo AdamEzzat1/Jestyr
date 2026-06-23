@@ -2478,6 +2478,29 @@ impl<'a> Cgen<'a> {
             .any(|it| matches!(it, Item::Enum(e) if e.name.name == name && e.is_generic()))
     }
 
+    /// The fields of a (non-generic) struct that declare a `= <expr>` default,
+    /// by name — used to fill omitted fields in a struct literal. Defaults should
+    /// be constant expressions (they're emitted at each construction site).
+    fn struct_field_defaults(&self, name: &str) -> Vec<(String, ExprId)> {
+        for item in &self.ast.items {
+            if let Item::Struct { name: sname, body, .. } = item {
+                if sname.name == name {
+                    return body
+                        .members
+                        .iter()
+                        .filter_map(|m| match m {
+                            StructMember::Field { name: fname, default: Some(d), .. } => {
+                                Some((fname.name.clone(), *d))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                }
+            }
+        }
+        Vec::new()
+    }
+
     /// Construct an enum variant from a *named*-field literal, `circle { r: 2.0 }`.
     /// Like [`emit_variant_construct`] but the fields are designated by name (so
     /// order doesn't matter and the niche/generic cases are handled the same way).
@@ -2774,12 +2797,26 @@ impl<'a> Cgen<'a> {
                     return s;
                 }
                 let mut s = format!("(Jestyr_{}){{ ", path.name);
-                for (i, fi) in fields.iter().enumerate() {
-                    if i > 0 {
+                let mut first = true;
+                for fi in fields {
+                    if !first {
                         s.push_str(", ");
                     }
+                    first = false;
                     let v = self.emit_expr(fi.value);
                     let _ = write!(s, ".j_{} = {v}", fi.name.name);
+                }
+                // Fill any omitted field that declares a default `= <expr>`.
+                for (fname, dexpr) in self.struct_field_defaults(&path.name) {
+                    if fields.iter().any(|fi| fi.name.name == fname) {
+                        continue;
+                    }
+                    if !first {
+                        s.push_str(", ");
+                    }
+                    first = false;
+                    let v = self.emit_expr(dexpr);
+                    let _ = write!(s, ".j_{fname} = {v}");
                 }
                 s.push_str(" }");
                 s
@@ -5768,6 +5805,15 @@ mod tests {
             c.contains(".u.node.j_r).tag == Jestyr_Tree_leaf"),
             "right child too: {c}"
         );
+    }
+
+    #[test]
+    fn field_default_fills_omitted_fields() {
+        let src = "struct C { x: i32 = 3, y: i32 = 7 } fn mk() -> C { C { y: 9 } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains(".j_y = 9"), "explicit field stays: {c}");
+        assert!(c.contains(".j_x = 3"), "omitted field filled from its default: {c}");
     }
 
     #[test]
