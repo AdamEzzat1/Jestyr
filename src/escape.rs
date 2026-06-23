@@ -182,6 +182,12 @@ impl<'a> Checker<'a> {
                 for arm in arms {
                     ctx.push();
                     self.bind_pattern(ctx, arm.pat, scrut_borrow);
+                    // The guard sees the pattern's bindings; walk it so closures or
+                    // nested expressions inside it are checked. It's a boolean, so
+                    // nothing escapes *through* it (never a tail position).
+                    if let Some(g) = arm.guard {
+                        self.walk_expr(ctx, g, false);
+                    }
                     self.walk_expr(ctx, arm.body, tail);
                     ctx.pop();
                 }
@@ -669,6 +675,9 @@ impl<'a> Checker<'a> {
             ExprKind::Match { scrut, arms } => {
                 self.collect_names(*scrut, out);
                 for a in arms {
+                    if let Some(g) = a.guard {
+                        self.collect_names(g, out);
+                    }
                     self.collect_names(a.body, out);
                 }
             }

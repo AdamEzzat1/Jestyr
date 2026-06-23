@@ -1270,9 +1270,18 @@ impl<'src> Parser<'src> {
         while !self.at(RBrace) && !self.at(Eof) {
             let before = self.pos;
             let pat = self.parse_pattern();
+            // Optional guard: `pat if <bool-expr> => body`. The `if` here is a
+            // contextual marker, not an if-expression — we parse the boolean that
+            // follows it directly. The guard stops before `=>` since `=>` is not an
+            // operator the Pratt parser will consume.
+            let guard = if self.eat(If) {
+                Some(self.parse_expr())
+            } else {
+                None
+            };
             self.expect(FatArrow, "`=>`");
             let body = self.parse_expr();
-            arms.push(MatchArm { pat, body });
+            arms.push(MatchArm { pat, guard, body });
             if self.pos == before {
                 self.bump();
             }
@@ -1408,6 +1417,25 @@ mod tests {
             }
             _ => panic!("expected a function"),
         }
+    }
+
+    #[test]
+    fn parses_match_arm_guard() {
+        let ast = parse_ok(
+            "enum S { circle(r: f64), square } \
+             fn f(read s: S) -> i32 { match s { circle(r) if r > 0.0 => 1, square => 0 } }",
+        );
+        let arms = ast
+            .exprs
+            .iter()
+            .find_map(|e| match &e.kind {
+                ExprKind::Match { arms, .. } => Some(arms.clone()),
+                _ => None,
+            })
+            .expect("a match expression");
+        assert_eq!(arms.len(), 2);
+        assert!(arms[0].guard.is_some(), "the guarded arm carries a guard");
+        assert!(arms[1].guard.is_none(), "the unguarded arm has no guard");
     }
 
     #[test]

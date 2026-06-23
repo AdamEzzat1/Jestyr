@@ -213,7 +213,10 @@ impl<'a> Printer<'a> {
                 let head = format!("match {}", self.expr_inline(*scrut));
                 self.line(d, &head);
                 for a in arms {
-                    let arm_head = format!("arm {} =>", self.pat_str(a.pat));
+                    let arm_head = match a.guard {
+                        Some(g) => format!("arm {} if {} =>", self.pat_str(a.pat), self.expr_inline(g)),
+                        None => format!("arm {} =>", self.pat_str(a.pat)),
+                    };
                     self.line(d + 1, &arm_head);
                     self.expr(d + 2, a.body);
                 }

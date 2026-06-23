@@ -135,6 +135,10 @@ pub struct FieldInit {
 #[derive(Clone, Debug)]
 pub struct MatchArm {
     pub pat: PatId,
+    /// An optional boolean guard: `circle(r) if r > 0.0 => …`. A guarded arm only
+    /// fires when the pattern matches *and* the guard is true — and crucially does
+    /// **not** count toward exhaustiveness (the guard could be false at runtime).
+    pub guard: Option<ExprId>,
     pub body: ExprId,
 }
 

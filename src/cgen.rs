@@ -800,6 +800,9 @@ impl<'a> Cgen<'a> {
             ExprKind::Match { scrut, arms } => {
                 self.collect_structs_in_expr(*scrut, subst, seen, order);
                 for a in arms {
+                    if let Some(g) = a.guard {
+                        self.collect_structs_in_expr(g, subst, seen, order);
+                    }
                     self.collect_structs_in_expr(a.body, subst, seen, order);
                 }
             }
@@ -1573,6 +1576,9 @@ impl<'a> Cgen<'a> {
             ExprKind::Match { scrut, arms } => (*scrut, arms),
             _ => return,
         };
+        if arms.iter().any(|a| a.guard.is_some()) {
+            return self.emit_guarded_niche_match(e, ret, n);
+        }
         let cty = self.c_type(&n.payload);
         let scrut_c = self.emit_expr(scrut);
         let tmp = format!("jm_{}", self.tmp);
@@ -1628,6 +1634,72 @@ impl<'a> Cgen<'a> {
         self.line("}");
     }
 
+    /// The guarded counterpart of [`emit_niche_match`]: a niche enum whose `match`
+    /// has a guard can't use the simple two-way null branch (a later arm may handle
+    /// a value a failed guard skipped), so it becomes an ordered if-chain on the
+    /// null test — `some` is `ptr != NULL`, `none` is `ptr == NULL`, a catch-all is
+    /// unconditional — each AND-ed with its guard.
+    fn emit_guarded_niche_match(&mut self, e: ExprId, ret: bool, n: &NicheInfo) {
+        let ast = self.ast;
+        let (scrut, arms) = match &ast.expr_at(e).kind {
+            ExprKind::Match { scrut, arms } => (*scrut, arms),
+            _ => return,
+        };
+        let cty = self.c_type(&n.payload);
+        let scrut_c = self.emit_expr(scrut);
+        let tmp = format!("jm_{}", self.tmp);
+        self.tmp += 1;
+        let end = format!("jm_end_{}", self.tmp);
+        self.tmp += 1;
+        self.line(format!("{cty} {tmp} = {scrut_c};"));
+        let null = format!("(({cty})0)");
+
+        let mut has_uncond_default = false;
+        for arm in arms {
+            let guard = arm.guard;
+            // The C pattern test (None = unconditional catch-all) and an optional
+            // binding name (the payload pointer for `some`, the whole value for a
+            // binding catch-all).
+            let (cond, bind): (Option<String>, Option<String>) = match &ast.pat_at(arm.pat).kind {
+                PatKind::Variant { name, subpats } if name.name == n.some_variant => {
+                    let b = subpats.first().and_then(|sp| match &ast.pat_at(*sp).kind {
+                        PatKind::Ident(b) => Some(b.name.clone()),
+                        _ => None,
+                    });
+                    (Some(format!("{tmp} != {null}")), b)
+                }
+                PatKind::Ident(name) if name.name == n.none_variant => {
+                    (Some(format!("{tmp} == {null}")), None)
+                }
+                PatKind::Wildcard => (None, None),
+                PatKind::Ident(b) => (None, Some(b.name.clone())),
+                _ => continue,
+            };
+            if cond.is_none() && guard.is_none() {
+                has_uncond_default = true;
+            }
+            match &cond {
+                Some(c) => {
+                    self.line(format!("if ({c})"));
+                    self.line("{");
+                }
+                None => self.line("{"),
+            }
+            self.depth += 1;
+            if let Some(b) = bind {
+                self.line(format!("{cty} j_{b} = {tmp};"));
+            }
+            self.emit_guarded_arm(arm.body, guard, ret, &end);
+            self.depth -= 1;
+            self.line("}");
+        }
+        if !ret {
+            self.line(format!("{end}: ;"));
+        } else if !has_uncond_default {
+            self.line("__builtin_unreachable();");
+        }
+    }
+
     /// Lower a `match` on an enum to a `switch` on the tag. The scrutinee is
     /// spilled to a temporary so it is evaluated exactly once.
     fn emit_match(&mut self, e: ExprId, ret: bool) {
@@ -1670,6 +1742,13 @@ impl<'a> Cgen<'a> {
                 return;
             }
         };
+
+        // Any guarded arm forces the ordered-if-chain lowering: a C `switch` can't
+        // place two `case`s on the same tag (arms differing only by guard) nor fall
+        // through to a later arm when a guard fails.
+        if arms.iter().any(|a| a.guard.is_some()) {
+            return self.emit_guarded_match(e, ret, &tag_prefix, &subst, &scrut_ty);
+        }
 
         let scrut_c = self.emit_expr(scrut);
         let cty = self.c_type(&scrut_ty);
@@ -1758,6 +1837,130 @@ impl<'a> Cgen<'a> {
         // about falling off the end of a non-void function.
         if ret && !has_default {
             self.line("__builtin_unreachable();");
+        }
+    }
+
+    /// Lower a tagged-enum `match` that has at least one guarded arm to an ordered
+    /// if-else-if chain. Each arm is `if (tag matches) { bind payload; if (guard) {
+    /// body } }`; when a guard is false control simply falls through to the next
+    /// arm. In statement position a fired arm `goto`s the shared end label; in
+    /// return position the body's `return` ends the function (no label needed).
+    fn emit_guarded_match(
+        &mut self,
+        e: ExprId,
+        ret: bool,
+        tag_prefix: &str,
+        subst: &HashMap<String, Ty>,
+        scrut_ty: &Ty,
+    ) {
+        let ast = self.ast;
+        let (scrut, arms) = match &ast.expr_at(e).kind {
+            ExprKind::Match { scrut, arms } => (*scrut, arms),
+            _ => return,
+        };
+        let scrut_c = self.emit_expr(scrut);
+        let cty = self.c_type(scrut_ty);
+        let tmp = format!("jm_{}", self.tmp);
+        self.tmp += 1;
+        let end = format!("jm_end_{}", self.tmp);
+        self.tmp += 1;
+        self.line(format!("{cty} {tmp} = {scrut_c};"));
+
+        // Does some *unguarded* arm handle every remaining value (an `_` or a
+        // whole-value binding)? If so, control can't fall off the chain, so no
+        // trailing `__builtin_unreachable` is needed in return position.
+        let mut has_uncond_default = false;
+        for arm in arms {
+            let guard = arm.guard;
+            match &ast.pat_at(arm.pat).kind {
+                PatKind::Variant { name: vname, subpats } => {
+                    self.line(format!("if ({tmp}.tag == {tag_prefix}_{})", vname.name));
+                    self.line("{");
+                    self.depth += 1;
+                    if let Some(vi) = self.variants.get(&vname.name).cloned() {
+                        for (i, sp) in subpats.iter().enumerate() {
+                            if let PatKind::Ident(bind) = &ast.pat_at(*sp).kind {
+                                if let Some((fname, fty)) = vi.fields.get(i) {
+                                    let ft = self.ast_type_to_ty(*fty, subst);
+                                    let fcty = self.c_type(&ft);
+                                    self.line(format!(
+                                        "{fcty} j_{} = {tmp}.u.{}.j_{fname};",
+                                        bind.name, vname.name
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    self.emit_guarded_arm(arm.body, guard, ret, &end);
+                    self.depth -= 1;
+                    self.line("}");
+                }
+                PatKind::Ident(vname) if self.variants.contains_key(&vname.name) => {
+                    // a nullary variant pattern, e.g. `none`
+                    self.line(format!("if ({tmp}.tag == {tag_prefix}_{})", vname.name));
+                    self.line("{");
+                    self.depth += 1;
+                    self.emit_guarded_arm(arm.body, guard, ret, &end);
+                    self.depth -= 1;
+                    self.line("}");
+                }
+                PatKind::Ident(bind) => {
+                    // a binding catch-all (binds the whole scrutinee)
+                    if guard.is_none() {
+                        has_uncond_default = true;
+                    }
+                    self.line("{");
+                    self.depth += 1;
+                    self.line(format!("{cty} j_{} = {tmp};", bind.name));
+                    self.emit_guarded_arm(arm.body, guard, ret, &end);
+                    self.depth -= 1;
+                    self.line("}");
+                }
+                PatKind::Wildcard => {
+                    if guard.is_none() {
+                        has_uncond_default = true;
+                    }
+                    self.line("{");
+                    self.depth += 1;
+                    self.emit_guarded_arm(arm.body, guard, ret, &end);
+                    self.depth -= 1;
+                    self.line("}");
+                }
+                PatKind::Error => {}
+            }
+        }
+        if !ret {
+            self.line(format!("{end}: ;"));
+        } else if !has_uncond_default {
+            // The frontend proved exhaustiveness via unguarded arms covering every
+            // tag, so every value returns before reaching here.
+            self.line("__builtin_unreachable();");
+        }
+    }
+
+    /// Emit one arm of a guarded if-chain: gate the body on the guard if present,
+    /// and once the body runs, leave the chain (a `goto` to `end` in statement
+    /// position; the body's own `return` in return position).
+    fn emit_guarded_arm(&mut self, body: ExprId, guard: Option<ExprId>, ret: bool, end: &str) {
+        match guard {
+            Some(g) => {
+                let gc = self.emit_expr(g);
+                self.line(format!("if ({gc})"));
+                self.line("{");
+                self.depth += 1;
+                self.emit_arm_body(body, ret);
+                if !ret {
+                    self.line(format!("goto {end};"));
+                }
+                self.depth -= 1;
+                self.line("}");
+            }
+            None => {
+                self.emit_arm_body(body, ret);
+                if !ret {
+                    self.line(format!("goto {end};"));
+                }
+            }
         }
     }
 
@@ -2535,6 +2738,9 @@ impl<'a> Cgen<'a> {
             ExprKind::Match { scrut, arms } => {
                 self.find_closures_expr(*scrut, found, seen);
                 for a in arms {
+                    if let Some(g) = a.guard {
+                        self.find_closures_expr(g, found, seen);
+                    }
                     self.find_closures_expr(a.body, found, seen);
                 }
             }
@@ -2641,6 +2847,9 @@ impl<'a> Cgen<'a> {
             ExprKind::Match { scrut, arms } => {
                 self.collect_refs(*scrut, out);
                 for a in arms {
+                    if let Some(g) = a.guard {
+                        self.collect_refs(g, out);
+                    }
                     self.collect_refs(a.body, out);
                 }
             }
@@ -3030,6 +3239,9 @@ impl<'a> Cgen<'a> {
             ExprKind::Match { scrut, arms } => {
                 self.find_spawns_expr(*scrut, out);
                 for a in arms {
+                    if let Some(g) = a.guard {
+                        self.find_spawns_expr(g, out);
+                    }
                     self.find_spawns_expr(a.body, out);
                 }
             }
@@ -3981,6 +4193,9 @@ impl<'a> Cgen<'a> {
             ExprKind::Match { scrut, arms } => {
                 self.find_calls_expr(*scrut, subst, work);
                 for a in arms {
+                    if let Some(g) = a.guard {
+                        self.find_calls_expr(g, subst, work);
+                    }
                     self.find_calls_expr(a.body, subst, work);
                 }
             }
@@ -4851,6 +5066,53 @@ mod tests {
         assert!(c.contains("int32_t j_v = "), "{c}"); // payload bound from the union
         assert!(c.contains("case Jestyr_E_b:"), "{c}");
         assert!(c.contains("__builtin_unreachable();"), "exhaustive match guard: {c}");
+    }
+
+    #[test]
+    fn guarded_match_lowers_to_an_ordered_if_chain() {
+        // Two arms share `a`, differing only by guard — impossible in a C `switch`,
+        // so the match becomes an ordered if-chain on the tag.
+        let src = "enum E { a(x: i32), b } \
+                   fn f(read e: E) -> i32 { match e { a(v) if v > 0 => v, a(v) => 0 - v, b => 0 } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(!c.contains("switch ("), "a guarded match uses an if-chain, not a switch: {c}");
+        assert!(c.contains(".tag == Jestyr_E_a)"), "tag test per arm: {c}");
+        assert!(c.contains("int32_t j_v = jm_0.u.a.j_x;"), "payload bound before the guard: {c}");
+        assert!(c.contains("if ((j_v > 0))"), "the guard gates the arm: {c}");
+        // Exhaustive via the unguarded `a(v)`/`b` arms → unreachable tail.
+        assert!(c.contains("__builtin_unreachable();"), "{c}");
+    }
+
+    #[test]
+    fn guarded_match_in_statement_position_jumps_to_an_end_label() {
+        // In statement position (not the function tail) a fired arm `goto`s a shared
+        // end label rather than returning.
+        let src = "enum E { a(x: i32), b } \
+                   fn f(read e: E) -> i32 { \
+                       match e { a(v) if v > 0 => print_int(v), a(v) => print_int(0), b => print_int(1) } \
+                       return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("goto jm_end_"), "a fired arm jumps to the end label: {c}");
+        assert!(c.contains("jm_end_"), "the end label is emitted: {c}");
+        // No unreachable in statement position — control falls past the label.
+        assert!(!c.contains("__builtin_unreachable();"), "{c}");
+    }
+
+    #[test]
+    fn guarded_niche_match_uses_an_ordered_null_test() {
+        // A guarded niche match keeps the pointer representation but switches from
+        // the simple two-way null branch to an ordered if-chain on the null test.
+        let src = "enum Maybe { none, some(p: *mut i32) } \
+                   fn get(m: Maybe, flag: i32) -> i32 { \
+                       match m { some(p) if flag > 0 => 1, some(p) => 2, none => 0 - 1 } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(!c.contains("switch ("), "niche match has no tag switch: {c}");
+        assert!(c.contains("!= ((int32_t*)0)"), "`some` tested by non-null: {c}");
+        assert!(c.contains("== ((int32_t*)0)"), "`none` tested by null: {c}");
+        assert!(c.contains("if ((j_flag > 0))"), "the guard gates the `some` arm: {c}");
     }
 
     #[test]

@@ -1,0 +1,48 @@
+// examples/guards.jtr — match arm GUARDS (design §2.4): `pat if <bool> => …`.
+//
+// A guarded arm fires only when the pattern matches *and* the guard holds. A
+// guard may reference the pattern's bindings (`temp(c) if c < 0`). Crucially a
+// guarded arm never counts toward exhaustiveness — the guard could be false at
+// runtime — so each variant still needs an unguarded fallback (or a `_`).
+//
+// Two arms may share a variant, differing only by guard — the case a C `switch`
+// can't express, so a guarded match lowers to an ordered if-else-if chain.
+//
+// Run:  jestyrc run examples/guards.jtr   →  prints 5, 20, 37, 50, 5, 3, 0
+
+enum Reading {
+    temp(c: i32),
+    pressure(kpa: i32),
+}
+
+fn level(read r: Reading) -> i32 {
+    match r {
+        temp(c) if c < 0           => 0 - c,    // below freezing: magnitude below 0
+        temp(c) if c > 100         => c - 100,  // above boiling: magnitude above 100
+        temp(c)                    => c,        // in range: the value itself
+        pressure(kpa) if kpa > 100 => kpa - 100,
+        pressure(kpa)              => kpa,
+    }
+}
+
+// Guards compose with generic enums too — `Option(i32)` is a tagged instance.
+enum Option(T) { none, some(v: T) }
+
+fn magnitude(read o: Option(i32)) -> i32 {
+    match o {
+        some(v) if v > 0 => v,
+        some(v)          => 0 - v,   // negate a non-positive payload
+        none             => 0,
+    }
+}
+
+fn main() -> i32 {
+    print_int(level(temp(0 - 5)))      // c<0   → 5
+    print_int(level(temp(120)))        // c>100 → 20
+    print_int(level(temp(37)))         // normal → 37
+    print_int(level(pressure(150)))    // >100  → 50
+    print_int(magnitude(some(5)))      // v>0   → 5
+    print_int(magnitude(some(0 - 3)))  // ≤0    → 3
+    print_int(magnitude(none))         // absent → 0
+    return 0
+}

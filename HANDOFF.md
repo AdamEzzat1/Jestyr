@@ -219,6 +219,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `discriminants.jtr` | `1`, `2`, `4`, `7`, `2` | **explicit enum discriminants (B)** — `red = 1`; `e as i32` reads the tag; `match` still works by name (§5.35) |
 | `recursion.jtr` | `30`, `70` | **recursive ADTs via `indirect` (B)** — `node(left: indirect Tree, …)`; by-value recursion is a compile error (§5.36) |
 | `distinct.jtr` | `1001`, `42`, `7` | **distinct nominal types (B)** — `distinct UserId = i32`; zero-cost typedef; `as` to convert; mixing without `as` errors (§5.37) |
+| `guards.jtr` | `5`, `20`, `37`, `50`, `5`, `3`, `0` | **match arm guards (§2.4)** — `pat if <bool> => …`; two arms share a variant via guard; guarded arms don't count for exhaustiveness; lowers to an if-chain (§5.38) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -671,6 +672,35 @@ These are the non-obvious things that will bite if you don't know them.
     yet (lands with general arg-vs-param checking). **Adding a new `Item` variant** touches
     ~8 exhaustive `match item` sites (typeck phases + build_owner + check_items, escape,
     module `item_is_pub`, printer, doc) — the AST-shape tax, all additive.
+
+38. **Match arm guards (`pat if <bool> => …`, design §2.4, step 1 of "match power").**
+    `MatchArm.guard: Option<ExprId>` (the AST-shape change), parsed in `parse_match` as
+    an optional `if <expr>` between the pattern and `=>` (the `if` is a *contextual
+    marker*, not an if-expression — we just `parse_expr` what follows). **The one
+    soundness-relevant rule:** a guarded arm proves *nothing* about coverage, so
+    `typeck::check_exhaustive` **`continue`s past any guarded arm** — even `_ if c =>`
+    or `circle(r) if c =>` leaves that case potentially unhandled, so an unguarded
+    fallback is still required. typeck infers the guard with the pattern's bindings in
+    scope (it may reference them); escape walks it (a boolean — never a tail/escape
+    route). **cgen:** a C `switch` can't put two `case`s on one tag (arms differing only
+    by guard) nor fall through when a guard fails, so **any guarded arm flips the whole
+    match to an ordered if-else-if chain** (`emit_guarded_match`; the niche path gets
+    `emit_guarded_niche_match`) — `if (tag matches) { bind; if (guard) { body } }`, a
+    failed guard falling to the next arm. A fired arm `goto`s a shared `jm_end_N` label
+    in statement position, or the body `return`s in return position (then a trailing
+    `__builtin_unreachable()` iff no *unguarded* catch-all). **No-guard matches keep the
+    existing `switch`/null-test lowering byte-for-byte** (zero risk to the tests that
+    assert on it) — the chain is only used when `arms.iter().any(|a| a.guard.is_some())`.
+    **Watch-out (the §5.28 lesson again):** the guard is a *new sub-expression*, so every
+    cgen walker that descends into `arm.body` (`find_calls_expr`, `collect_structs_in_expr`,
+    `find_closures_expr`, `find_spawns_expr`, `collect_refs`) **and** escape's
+    `collect_names` now also descend into `arm.guard` — miss one and a generic call /
+    closure / spawn used *only inside a guard* silently vanishes from codegen. Demo
+    [`examples/guards.jtr`](examples/guards.jtr) (`5, 20, 37, 50, 5, 3, 0`). **Next match-power
+    steps (still §2.4):** or-patterns (`a | b`), range patterns (`0..=9`), `..` rest, then
+    replacing name-set exhaustiveness with a Maranget usefulness matrix (which also flags
+    redundant arms — now that guarded arms are skipped, an unguarded arm shadowed by an
+    earlier one is the first redundancy case to catch).
 
 ---
 

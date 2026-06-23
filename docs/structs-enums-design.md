@@ -158,7 +158,7 @@ enum Shape { circle(r: f64), rect(w: f64, h: f64) }  // named fields — already
   is a separate small follow-up — pairs with a `@repr(u8)` attribute slotting next to
   `@layout` in the registry.
 
-### 2.4 Match power + Maranget exhaustiveness  ⏳ (largest)
+### 2.4 Match power + Maranget exhaustiveness  🔜 (largest; guards ✅ done)
 
 ```jestyr
 match shape {
@@ -179,6 +179,15 @@ match shape {
   boolean the arm is gated on.
 - **Provability:** exhaustiveness becomes a *soundness proof*, and redundant arms a
   *warning* — table-stakes for a provable language.
+- **Step 1 ✅ — guards (`pat if <bool> => …`).** `MatchArm.guard: Option<ExprId>`; the
+  guard is a boolean the arm is gated on. The soundness rule: a guarded arm contributes
+  **nothing** to exhaustiveness (the guard may be false), so `check_exhaustive` skips it
+  and an unguarded fallback is still required. cgen flips a match with any guarded arm to
+  an ordered if-else-if chain (`switch` can't re-test a tag or fall through on a failed
+  guard); no-guard matches keep the existing `switch`/null-test lowering untouched. Demo
+  [`examples/guards.jtr`](../examples/guards.jtr); HANDOFF §5.38. **Remaining steps:**
+  or-patterns, range patterns, `..` rest, `@`-binding, then the Maranget usefulness matrix
+  (real nested-pattern exhaustiveness + redundant-arm warnings + a decision-tree lowering).
 
 ### 2.5 Recursive ADTs via explicit `indirect`  ✅ DONE
 
@@ -269,7 +278,7 @@ rebase the rest (HANDOFF §1).
 | 2b | **Struct-variant *syntax*** (`V { … }` named construct/match) | ergonomics; named fields already exist | **yes** | M | ⏳ |
 | 2.5 | **Recursive ADTs via `indirect`** + by-value-recursion guard | recursion already worked via tiers; `indirect` is the spelling | **yes** | S | ✅ done |
 | 2.6 | **`distinct` nominal types** (zero-cost typedef + `as` + let-enforcement) | `distinct` keyword; reuses casts | **yes** | S | ✅ done |
-| 3 | **Match power + Maranget exhaustiveness** | rests on #2's pattern shapes; largest | **yes** | L | ⏳ |
+| 3 | **Match power + Maranget exhaustiveness** | rests on #2's pattern shapes; largest | **yes** | L | 🔜 guards ✅; or/range/rest/Maranget ⏳ |
 | 4 | **Recursive ADTs (`indirect`)** | needs ref tiers (have); novel | small | M | ⏳ |
 | 5 | **`distinct` types** | isolated; keyword reserved | small | S | ⏳ |
 | 6 | **Layout reflection (`offset_of`/`align_of`)** | isolated cgen intrinsics | no | S | ⏳ |

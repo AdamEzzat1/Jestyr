@@ -1115,6 +1115,14 @@ impl<'a> TypeChecker<'a> {
                 for (ai, arm) in arms.iter().enumerate() {
                     scope.push(HashMap::new());
                     self.bind_pattern_types(scope, &st, arm.pat);
+                    // A guard is inferred with the pattern's bindings in scope (it
+                    // may reference them: `circle(r) if r > 0.0`). We infer it for
+                    // its side effects (recording expr types, resolving names);
+                    // it's expected to be `bool` but the lenient checker doesn't
+                    // enforce that.
+                    if let Some(g) = arm.guard {
+                        self.infer(scope, typ, self_ty, g);
+                    }
                     let bt = self.infer(scope, typ, self_ty, arm.body);
                     scope.pop();
                     if ai == 0 {
@@ -1354,6 +1362,12 @@ impl<'a> TypeChecker<'a> {
         let mut covered: HashSet<String> = HashSet::new();
         let mut catch_all = false;
         for arm in arms {
+            // A guarded arm proves nothing about coverage — its guard may be false
+            // at runtime, so even `_ if cond =>` or `circle(r) if cond =>` leaves
+            // that case potentially unhandled.
+            if arm.guard.is_some() {
+                continue;
+            }
             match &ast.pat_at(arm.pat).kind {
                 PatKind::Wildcard => catch_all = true,
                 PatKind::Ident(n) => {
@@ -1555,6 +1569,37 @@ mod tests {
         let (_i, d) =
             analyze("enum E { a, b, c } fn f(read e: E) -> i32 { match e { a => 0, _ => 1 } }");
         assert!(d.is_empty(), "a wildcard covers the rest: {:?}", d);
+    }
+
+    #[test]
+    fn guarded_arm_does_not_satisfy_exhaustiveness() {
+        // `a if cond` may not fire (the guard can be false), so it does NOT cover
+        // `a`: the match is still missing `a`'s unguarded case.
+        let src = "enum E { a(x: i32), b } \
+                   fn f(read e: E) -> i32 { match e { a(v) if v > 0 => 1, b => 0 } }";
+        let (_i, d) = analyze(src);
+        assert_eq!(d.len(), 1, "{:?}", d);
+        assert!(d[0].message.contains("non-exhaustive"), "{:?}", d);
+        assert!(d[0].message.contains('a'), "names the still-uncovered variant: {:?}", d);
+    }
+
+    #[test]
+    fn guarded_wildcard_does_not_make_a_match_exhaustive() {
+        // Even a guarded catch-all doesn't prove coverage.
+        let src = "enum E { a, b, c } \
+                   fn f(read e: E) -> i32 { match e { a => 0, _ if other() => 1 } }";
+        let (_i, d) = analyze(src);
+        assert_eq!(d.len(), 1, "a guarded `_` is not a catch-all: {:?}", d);
+        assert!(d[0].message.contains("non-exhaustive"), "{:?}", d);
+    }
+
+    #[test]
+    fn an_unguarded_fallback_after_guarded_arms_is_exhaustive() {
+        // Guarded arms plus an unguarded fallback covering every variant is fine.
+        let src = "enum E { a(x: i32), b } \
+                   fn f(read e: E) -> i32 { match e { a(v) if v > 0 => 1, a(v) => 0 - v, b => 0 } }";
+        let (_i, d) = analyze(src);
+        assert!(d.is_empty(), "unguarded `a(v)`/`b` cover everything: {:?}", d);
     }
 
     #[test]
