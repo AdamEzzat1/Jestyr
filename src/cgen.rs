@@ -1045,10 +1045,15 @@ impl<'a> Cgen<'a> {
                 let kw = if *is_union { "union" } else { "struct" };
                 self.raw(format!("{kw}{attr} Jestyr_{} {{\n", name.name));
                 for m in &body.members {
-                    if let StructMember::Field { name: fname, ty, volatile, .. } = m {
+                    if let StructMember::Field { name: fname, ty, volatile, bits, .. } = m {
                         let cty = self.c_ty_ast(*ty);
                         let vol = if *volatile { "volatile " } else { "" };
-                        self.raw(format!("    {vol}{cty} j_{};\n", fname.name));
+                        // A bit-field width lowers to C `: N` (e.g. `uint8_t j_flags : 3`).
+                        let bf = match bits {
+                            Some(n) => format!(" : {n}"),
+                            None => String::new(),
+                        };
+                        self.raw(format!("    {vol}{cty} j_{}{bf};\n", fname.name));
                     }
                 }
                 self.raw("};\n\n");
@@ -5807,6 +5812,15 @@ mod tests {
             c.contains(".u.node.j_r).tag == Jestyr_Tree_leaf"),
             "right child too: {c}"
         );
+    }
+
+    #[test]
+    fn bit_field_lowers_to_a_c_bit_field() {
+        let src = "struct F { a: u8 : 1, mode: u8 : 3 } fn get(read f: F) -> i32 { return f.mode }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("uint8_t j_a : 1"), "1-bit field: {c}");
+        assert!(c.contains("uint8_t j_mode : 3"), "3-bit field: {c}");
     }
 
     #[test]

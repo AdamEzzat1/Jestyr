@@ -1,0 +1,22 @@
+// examples/bitfields.jtr — bit-fields (§2.8): a struct field can declare a bit
+// width (`flags: u8 : 3`), lowering to a C bit-field (`uint8_t j_flags : 3`).
+// Several small fields then pack into one storage unit — the last substrate item,
+// and the flags/MMIO companion to `@packed`.
+//
+// Run:  jestyrc run examples/bitfields.jtr   →  prints 4, 1, 1, 5
+
+// Four separate bytes.
+struct Wide { a: u8, b: u8, mode: u8, rest: u8 }
+
+// The same four fields bit-packed into a single byte (1 + 1 + 3 + 3 = 8 bits).
+struct Packed { a: u8 : 1, b: u8 : 1, mode: u8 : 3, rest: u8 : 3 }
+
+fn main() -> i32 {
+    print_int(size_of(Wide))      // 4 — four whole bytes
+    print_int(size_of(Packed))    // 1 — eight bits in one byte
+
+    var p: Packed = Packed { a: 1, b: 0, mode: 5, rest: 2 }
+    print_int(p.a)                // 1
+    print_int(p.mode)             // 5
+    return 0
+}

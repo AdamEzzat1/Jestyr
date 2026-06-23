@@ -573,6 +573,26 @@ impl<'src> Parser<'src> {
                 self.check_attrs(&fattrs, attrs::Target::Field);
                 let volatile = fattrs.iter().any(|a| a.name == "volatile");
                 let ty = self.parse_type();
+                // An optional bit-field width: `flags: u8 : 3` → a 3-bit field.
+                let bits = if self.eat(Colon) {
+                    let t = self.cur();
+                    if t.kind == Int {
+                        self.bump();
+                        match self.text(t.span).replace('_', "").parse::<u32>() {
+                            Ok(n) => Some(n),
+                            Err(_) => {
+                                self.error(t.span, "bit-field width must be a non-negative integer".to_string());
+                                None
+                            }
+                        }
+                    } else {
+                        let sp = t.span;
+                        self.error(sp, "expected a bit-field width (an integer) after `:`".to_string());
+                        None
+                    }
+                } else {
+                    None
+                };
                 // An optional field default: `x: i32 = 0`. Used to fill the field
                 // when a struct literal omits it.
                 let default = if self.eat(Eq) {
@@ -586,6 +606,7 @@ impl<'src> Parser<'src> {
                     volatile,
                     default,
                     is_pub,
+                    bits,
                     span: fstart.to(self.prev_span()),
                 });
                 self.eat(Comma); // optional separator between fields
@@ -1665,6 +1686,28 @@ mod tests {
             "enum E { c(x: i32, y: i32) } fn f(read e: E) -> i32 { match e { c(.., y) => y } }",
         );
         assert!(d.iter().any(|x| x.message.contains("last field")), "{:?}", d);
+    }
+
+    #[test]
+    fn parses_bit_field_width() {
+        let ast = parse_ok("struct F { a: u8 : 1, b: u8 : 3 }");
+        let body = ast
+            .items
+            .iter()
+            .find_map(|it| match it {
+                Item::Struct { body, .. } => Some(body),
+                _ => None,
+            })
+            .expect("a struct");
+        let widths: Vec<Option<u32>> = body
+            .members
+            .iter()
+            .filter_map(|m| match m {
+                StructMember::Field { bits, .. } => Some(*bits),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(widths, vec![Some(1), Some(3)], "bit-field widths parsed");
     }
 
     #[test]

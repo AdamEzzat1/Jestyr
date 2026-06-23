@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 259 tests pass, including `proptest` property
+and run (or are correctly rejected). 261 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -231,6 +231,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `copy_optin.jtr` | `3`, `7`, `20` | **opt-in Copy (§2.8)** — `@copy struct`; a freely-copyable aggregate may be returned by value (escape-checker only) (§5.48) |
 | `visibility/main.jtr` | `3`, `7` | **per-field visibility (§2.8)** — `pub x` exposes a field cross-module; private fields need a pub accessor (§5.49) |
 | `union.jtr` | `1075838976`, `2.5`, `4` | **untagged `union` (§2.8)** — overlapping fields (C `union`); float bit-punning; `size_of` = largest field (§5.50) |
+| `bitfields.jtr` | `4`, `1`, `1`, `5` | **bit-fields (§2.8)** — `flags: u8 : 3` → C `uint8_t j_flags : 3`; four fields pack 4 B → 1 B (§5.51) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -922,6 +923,21 @@ These are the non-obvious things that will bite if you don't know them.
     field defaults on a union are meaningless (overlapping) and simply unused. Demo
     [`examples/union.jtr`](examples/union.jtr) (`1075838976, 2.5, 4`). **Remaining §2.8:**
     bit-fields (the last substrate item).
+
+51. **Bit-fields — `flags: u8 : 3` (design §2.8, the final substrate item).**
+    `StructMember::Field.bits: Option<u32>`, parsed as an optional `: <int>` after the field
+    type (a second colon — the first separates name from type, the second introduces the width;
+    it composes with the `= default` that may follow). cgen `struct_defs` lowers it to a C
+    bit-field `uint8_t j_flags : 3;` (one `let bf = match bits { Some(n) => format!(" : {n}") …}`).
+    Several small fields then pack into one storage unit, so `size_of` shrinks (`1 + 1 + 3 + 3`
+    bits → 1 byte vs. 4). **Composes with `@packed`** (both are just C declaration syntax) and
+    with field defaults / `pub` / `@volatile` (all live on the same `Field`). Construction and
+    field access are unchanged — a bit-field reads/writes like any field (`p.j_a`). **Width is
+    not range-checked** against the type size (the C compiler diagnoses an over-wide field).
+    Demo [`examples/bitfields.jtr`](examples/bitfields.jtr) (`4, 1, 1, 5`). **This completes §2.8
+    and the entire struct/enum/ADT plan** (`docs/structs-enums-design.md`) — all of §2.1–§2.8 are
+    ✅; the only deferred items are cross-feature follow-ups (tier-aware `indirect`, a `: u8`
+    tag-width repr, an optimal shared-test match decision tree).
 
 ---
 

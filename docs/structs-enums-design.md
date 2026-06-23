@@ -287,7 +287,7 @@ offset_of(Point, y)       // new — offsetof
   (`12, 4, 0, 4, 8`); HANDOFF §5.44. Makes layout *inspectable in-language* — the opposite of
   CJC's hidden alphabetical map, and a seed for the CTFE/reflection workstream (G).
 
-### 2.8 Lower-priority / substrate  ⏳
+### 2.8 Lower-priority / substrate  ✅ DONE (bit-fields close it out)
 
 - **Field defaults** (`x: i32 = 0`) ✅ DONE — `StructMember::Field.default`; cgen fills omitted
   fields from defaults at each construction site (non-generic structs). Demo
@@ -301,8 +301,12 @@ offset_of(Point, y)       // new — offsetof
   update). Demo [`examples/spread.jtr`](../examples/spread.jtr); HANDOFF §5.46.
 - **`union`** (untagged) ✅ DONE — `union Name { … }` reuses `Item::Struct` with an `is_union`
   flag; cgen emits a C `union`/`typedef union` (the whole struct frontend is inherited). Demo
-  [`examples/union.jtr`](../examples/union.jtr); HANDOFF §5.50. **Bit-fields** (named bit ranges)
-  — the last substrate item; the Odin/C substrate for MMIO; dovetails with `@volatile`/`@packed`.
+  [`examples/union.jtr`](../examples/union.jtr); HANDOFF §5.50.
+- **Bit-fields** (named bit ranges) ✅ DONE — `flags: u8 : 3` → C `uint8_t j_flags : 3`
+  (`StructMember::Field.bits`); several small fields pack into one storage unit, so `size_of`
+  shrinks. Composes with `@packed`/`@volatile`/defaults/`pub`. Demo
+  [`examples/bitfields.jtr`](../examples/bitfields.jtr); HANDOFF §5.51. **This closes out §2.8
+  and the whole struct/enum/ADT plan** — §2.1–§2.8 are all ✅.
 - **opt-in `Copy`** for small aggregates ✅ DONE — `@copy struct` sets `TypeDecl.is_copy`, so the
   escape checker treats it as freely copyable (returnable by value without `take`). Escape-checker
   only; representation unchanged. Demo [`examples/copy_optin.jtr`](../examples/copy_optin.jtr);
@@ -330,7 +334,7 @@ rebase the rest (HANDOFF §1).
 | 4 | **Recursive ADTs (`indirect`)** | needs ref tiers (have); novel | small | M | ⏳ |
 | 5 | **`distinct` types** | isolated; keyword reserved | small | S | ⏳ |
 | 6 | **Layout reflection (`offset_of`/`align_of`)** | isolated cgen intrinsics | no | S | ✅ done |
-| 7 | **Substrate** (defaults, visibility, spread, `union`, bit-fields, `Copy`) | polish; parallel-safe | mixed | M | ⏳ |
+| 7 | **Substrate** (defaults, visibility, spread, `union`, bit-fields, `Copy`) | polish; parallel-safe | mixed | M | ✅ done |
 
 **Discipline (unchanged):** every step ships a runnable `examples/*.jtr` demo, unit tests
 asserting emitted C / diagnostics, and stays `cargo test`-green + warning-clean. Niche

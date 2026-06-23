@@ -359,12 +359,14 @@ pub enum StructMember {
     /// `default` is the field's `= <expr>` default value, used to fill the field
     /// when a struct literal omits it. `is_pub` (the `pub` keyword) exposes the
     /// field across modules — fields are private to their module by default.
+    /// `bits` is a bit-field width — `flags: u8 : 3` lowers to `uint8_t j_flags : 3`.
     Field {
         name: Ident,
         ty: TypeId,
         volatile: bool,
         default: Option<ExprId>,
         is_pub: bool,
+        bits: Option<u32>,
         span: Span,
     },
     Method(FnDecl),
