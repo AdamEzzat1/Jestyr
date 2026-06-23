@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 212 tests pass, including `proptest` property
+and run (or are correctly rejected). 241 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -227,6 +227,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
 | `match_check.jtr` | 1 error | **match exhaustiveness** (missing `blue`) — payload projection runs in shapes.jtr (§7) |
+| `exhaustive_check.jtr` | 1 error + 1 warning | **Maranget usefulness (§2.4)** — nested non-exhaustiveness (error) + a redundant/unreachable arm (warning) (§5.42) |
 | `mvs.jtr` | 1 error | **MVS default = `read`** — returning a default (borrowed) param escapes; `take` to own (§4.3) |
 
 | Demo | `jestyrc check` | Exercises |
@@ -756,6 +757,34 @@ These are the non-obvious things that will bite if you don't know them.
     [`examples/rest_pat.jtr`](examples/rest_pat.jtr) (`1, 2, 7, 0`). **Limitation:**
     *trailing* `..` only (a middle `..` would need positional remapping of later bindings) —
     fine until named struct-variant patterns (§2.3b) land.
+
+42. **Maranget usefulness — real exhaustiveness + redundant-arm warnings (design §2.4, the
+    capstone).** `typeck::check_exhaustive` is rebuilt on Maranget's usefulness algorithm
+    ("Warnings for pattern matching", 2007). Patterns lower (`lower_pat`) to a structural IR
+    `Pat = Wild | Var(name, args) | Int(i128) | Range(lo,hi) | Or(vec)` (bindings/`_`/`..`/
+    un-evaluable literals → `Wild`; a trailing `..` pads a variant's args with `Wild`s to its
+    arity). **`useful(matrix, q)`** decides whether a pattern vector matches a value no prior
+    row does, via `specialize_var`/`specialize_value`/`default_matrix` + a `col_kind`
+    completeness check. **Exhaustiveness** = the all-`Wild` vector is *not* useful against the
+    arm matrix (this finds **nested** gaps the old name-set check missed — e.g.
+    `node(leaf, leaf)` doesn't cover `node(node(..), ..)`). **Redundancy** = an arm not useful
+    against the rows above it → a **warning** (`unreachable match arm`). **Guarded arms are
+    excluded** from the matrix (a guard may be false → no coverage, never flagged).
+    **Scalars** use a dedicated interval engine (`check_scalar_match`): exhaustiveness via
+    `intervals_cover` over the type's `scalar_bounds` (so `true|false` covers `bool` and
+    `0..=255` covers `u8` *without* a catch-all — a real improvement), plus interval-subsumption
+    redundancy (`5` after `0..=9`); in the *matrix*, scalar columns are treated as never
+    complete (a wildcard sibling is required) — sound, and matches the dedicated check.
+    **Warnings plumbing:** `Diagnostic` gained a `severity` field (+`Diagnostic::warning`,
+    `is_error`); `main.rs` reports warnings but only *errors* block codegen / fail the build
+    (`report_program` counts errors; the Build/Run gate is `diags.iter().any(is_error)`).
+    **Frontend/backend gap (important):** the *checker* now understands nested patterns, but
+    cgen still lowers via the flat switch/if-chain and can't **dispatch** a nested non-wildcard
+    subpattern (`node(leaf, leaf)`, `some(0)`) — so the two cgen variant-binding loops now
+    **diagnose** ("nested patterns aren't supported by the backend yet …") instead of silently
+    miscompiling. The optimal **decision-tree lowering** that closes this gap is the remaining
+    §2.4 work. Check-demo [`examples/exhaustive_check.jtr`](examples/exhaustive_check.jtr)
+    (1 error + 1 warning).
 
 ---
 

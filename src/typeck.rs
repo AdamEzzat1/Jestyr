@@ -119,6 +119,12 @@ impl<'a> TypeChecker<'a> {
         self.diags.push(Diagnostic::new(message, span));
     }
 
+    /// A non-fatal warning (e.g. a redundant match arm) — reported but the build
+    /// still succeeds.
+    fn warn(&mut self, span: Span, message: impl Into<String>) {
+        self.diags.push(Diagnostic::warning(message, span));
+    }
+
     fn set(&mut self, id: ExprId, ty: Ty) -> Ty {
         self.expr_types[id.0 as usize] = ty.clone();
         ty
@@ -1351,26 +1357,17 @@ impl<'a> TypeChecker<'a> {
         base
     }
 
-    /// Report a non-exhaustive `match` on an enum (one not covering every variant
-    /// and lacking a `_`/binding catch-all).
+    /// Check a `match` for exhaustiveness (a hard error) and redundant/unreachable
+    /// arms (a warning), using Maranget's *usefulness* algorithm over enum
+    /// patterns and an interval analysis over scalar ones. Guarded arms are
+    /// excluded — a guard may be false, so a guarded arm neither proves coverage
+    /// nor can be deemed unreachable.
     fn check_exhaustive(&mut self, span: Span, scrut: &Ty, arms: &[MatchArm]) {
-        // A scalar scrutinee (integer/char/bool) has too large/infinite a domain to
-        // enumerate with literal/range arms, so it needs an unguarded `_`/binding
-        // catch-all. (True interval coverage — `0..=255` over `u8`, or `true|false`
-        // over `bool` — arrives with the Maranget usefulness pass.)
         if let Ty::Prim(p) = scrut {
             if is_scalar_match_ty(p) {
-                let has_catch_all =
-                    arms.iter().any(|a| a.guard.is_none() && self.pat_is_irrefutable(a.pat));
-                if !has_catch_all {
-                    self.error(
-                        span,
-                        "non-exhaustive `match`: a scalar `match` needs a `_` or binding catch-all"
-                            .to_string(),
-                    );
-                }
-                return;
+                self.check_scalar_match(span, p, arms);
             }
+            return;
         }
         let ei = match scrut {
             Ty::Named(i) => *i,
@@ -1380,67 +1377,533 @@ impl<'a> TypeChecker<'a> {
             },
             _ => return,
         };
-        let ei = &ei;
-        let all: Vec<String> = match &self.table.types[*ei].kind {
-            TypeKindG::Enum { variants } => variants.iter().map(|(n, _)| n.clone()).collect(),
-            _ => return, // matching a struct, not an enum — no variant set to check
-        };
-        let mut covered: HashSet<String> = HashSet::new();
-        let mut catch_all = false;
+        if !matches!(self.table.types[ei].kind, TypeKindG::Enum { .. }) {
+            return; // matching a struct, not an enum
+        }
+        self.check_enum_match(span, arms);
+    }
+
+    /// Maranget usefulness over enum patterns: nested-pattern exhaustiveness plus
+    /// redundant-arm detection.
+    fn check_enum_match(&mut self, span: Span, arms: &[MatchArm]) {
+        let mut matrix: Vec<Vec<Pat>> = Vec::new();
         for arm in arms {
-            // A guarded arm proves nothing about coverage — its guard may be false
-            // at runtime, so even `_ if cond =>` or `circle(r) if cond =>` leaves
-            // that case potentially unhandled.
             if arm.guard.is_some() {
                 continue;
             }
-            self.cover_pattern(arm.pat, &mut covered, &mut catch_all);
+            let row = vec![self.lower_pat(arm.pat)];
+            // An arm useless against the rows above it is unreachable.
+            if !self.useful(&matrix, &row) {
+                let sp = self.ast.pat_at(arm.pat).span;
+                self.warn(sp, "unreachable match arm: already covered by an earlier arm");
+            }
+            matrix.push(row);
         }
-        if catch_all {
-            return;
-        }
-        let missing: Vec<String> = all.into_iter().filter(|v| !covered.contains(v)).collect();
-        if !missing.is_empty() {
-            self.error(span, format!("non-exhaustive `match`: missing `{}`", missing.join("`, `")));
-        }
-    }
-
-    /// Is this pattern an unconditional catch-all (a `_`/binding, possibly reached
-    /// through an or-pattern alternative)? Used for scalar-match exhaustiveness.
-    fn pat_is_irrefutable(&self, pat: PatId) -> bool {
-        match &self.ast.pat_at(pat).kind {
-            PatKind::Wildcard => true,
-            PatKind::Ident(n) => !self.table.variants.contains_key(&n.name),
-            PatKind::Or(alts) => alts.iter().any(|p| self.pat_is_irrefutable(*p)),
-            _ => false,
+        // Exhaustive iff the all-wildcard vector is *not* useful against the matrix.
+        if self.useful(&matrix, &[Pat::Wild]) {
+            let msg = self.non_exhaustive_message(&matrix);
+            self.error(span, msg);
         }
     }
 
-    /// Accumulate the enum variants an (unguarded) pattern covers, and whether it
-    /// is a catch-all — recursing through or-pattern alternatives.
-    fn cover_pattern(&self, pat: PatId, covered: &mut HashSet<String>, catch_all: &mut bool) {
-        match &self.ast.pat_at(pat).kind {
-            PatKind::Wildcard => *catch_all = true,
-            PatKind::Ident(n) => {
-                if self.table.variants.contains_key(&n.name) {
-                    covered.insert(n.name.clone());
-                } else {
-                    *catch_all = true; // a binding catches everything
+    /// Scalar `match` (integer/char/bool): exhaustiveness via interval coverage of
+    /// the type's domain, and redundancy when an arm's value-set is already covered.
+    fn check_scalar_match(&mut self, span: Span, prim: &str, arms: &[MatchArm]) {
+        let bounds = scalar_bounds(prim);
+        let mut covered: Vec<(i128, i128)> = Vec::new();
+        let mut full = false; // has an unguarded wildcard/binding been seen?
+        for arm in arms {
+            if arm.guard.is_some() {
+                continue;
+            }
+            let mut my: Vec<(i128, i128)> = Vec::new();
+            let mut my_full = false;
+            self.collect_scalar_intervals(arm.pat, &mut my, &mut my_full);
+            let redundant = if my_full {
+                full // a catch-all after a catch-all
+            } else {
+                !my.is_empty() && my.iter().all(|(lo, hi)| full || intervals_cover(*lo, *hi, &covered))
+            };
+            if redundant {
+                let sp = self.ast.pat_at(arm.pat).span;
+                self.warn(sp, "unreachable match arm: already covered by an earlier arm");
+            }
+            if my_full {
+                full = true;
+            }
+            covered.extend(my);
+        }
+        let exhaustive = full
+            || match bounds {
+                Some((lo, hi)) => intervals_cover(lo, hi, &covered),
+                None => false, // platform-width type → require a catch-all
+            };
+        if !exhaustive {
+            self.error(
+                span,
+                "non-exhaustive `match`: a scalar `match` needs a `_`/binding catch-all (or full coverage)"
+                    .to_string(),
+            );
+        }
+    }
+
+    /// Build a helpful non-exhaustive message — naming missing top-level variants
+    /// when possible, else a generic "some cases aren't covered".
+    fn non_exhaustive_message(&self, matrix: &[Vec<Pat>]) -> String {
+        let mut present: HashSet<String> = HashSet::new();
+        for row in matrix {
+            Self::collect_head_variants(&row[0], &mut present);
+        }
+        if let Some(name) = present.iter().next() {
+            if let Some(vs) = self.enum_variants_of(name) {
+                let missing: Vec<String> =
+                    vs.into_iter().map(|(n, _)| n).filter(|v| !present.contains(v)).collect();
+                if !missing.is_empty() {
+                    return format!("non-exhaustive `match`: missing `{}`", missing.join("`, `"));
                 }
             }
-            PatKind::Variant { name, .. } => {
-                covered.insert(name.name.clone());
+        }
+        "non-exhaustive `match`: some cases aren't covered".to_string()
+    }
+
+    // --- Maranget usefulness ---
+
+    /// Is `q` useful w.r.t. the pattern `matrix` — i.e. does it match some value no
+    /// row already matches? (Maranget, "Warnings for pattern matching", 2007.)
+    fn useful(&self, matrix: &[Vec<Pat>], q: &[Pat]) -> bool {
+        let q0 = match q.first() {
+            None => return matrix.is_empty(), // base case: useful iff no rows remain
+            Some(p) => p,
+        };
+        let qrest = &q[1..];
+        match q0 {
+            Pat::Or(alts) => alts.iter().any(|a| {
+                let mut nq = vec![a.clone()];
+                nq.extend_from_slice(qrest);
+                self.useful(matrix, &nq)
+            }),
+            Pat::Var(name, args) => {
+                let spec = self.specialize_var(matrix, name, args.len());
+                let mut nq = args.clone();
+                nq.extend_from_slice(qrest);
+                self.useful(&spec, &nq)
+            }
+            Pat::Int(v) => {
+                let spec = self.specialize_value(matrix, *v);
+                self.useful(&spec, qrest)
+            }
+            Pat::Range(lo, hi) => self.useful_range(matrix, *lo, *hi, qrest),
+            Pat::Wild => match self.col_kind(matrix) {
+                ColKind::Enum(variants) => {
+                    let present = self.head_variants(matrix);
+                    let complete = variants.iter().all(|(n, _)| present.contains(n));
+                    if complete {
+                        // The signature is covered; q is useful iff useful under some
+                        // constructor (a witness picks one and recurses on its fields).
+                        variants.iter().any(|(n, ar)| {
+                            let spec = self.specialize_var(matrix, n, *ar);
+                            let mut nq = vec![Pat::Wild; *ar];
+                            nq.extend_from_slice(qrest);
+                            self.useful(&spec, &nq)
+                        })
+                    } else {
+                        // A missing constructor witnesses usefulness — recurse on the
+                        // default (wildcard) matrix.
+                        let def = self.default_matrix(matrix);
+                        self.useful(&def, qrest)
+                    }
+                }
+                // Scalar columns are treated as never complete (a wildcard sibling is
+                // required); interval coverage of *finite* types is handled by the
+                // dedicated scalar-match check, not the matrix.
+                ColKind::Scalar | ColKind::WildOnly => {
+                    let def = self.default_matrix(matrix);
+                    self.useful(&def, qrest)
+                }
+            },
+        }
+    }
+
+    /// The default matrix `D(P)`: rows whose first pattern matches *any* value,
+    /// with the first column removed (or-patterns split first).
+    fn default_matrix(&self, matrix: &[Vec<Pat>]) -> Vec<Vec<Pat>> {
+        let mut out = Vec::new();
+        for row in matrix {
+            Self::default_row(row, &mut out);
+        }
+        out
+    }
+
+    fn default_row(row: &[Pat], out: &mut Vec<Vec<Pat>>) {
+        let (head, rest) = row.split_first().expect("row has a column");
+        match head {
+            Pat::Wild => out.push(rest.to_vec()),
+            Pat::Or(alts) => {
+                for a in alts {
+                    let mut nr = vec![a.clone()];
+                    nr.extend_from_slice(rest);
+                    Self::default_row(&nr, out);
+                }
+            }
+            _ => {} // a constructor row is dropped
+        }
+    }
+
+    /// The specialized matrix `S(c, P)` for an enum constructor of the given arity.
+    fn specialize_var(&self, matrix: &[Vec<Pat>], ctor: &str, arity: usize) -> Vec<Vec<Pat>> {
+        let mut out = Vec::new();
+        for row in matrix {
+            Self::spec_var_row(row, ctor, arity, &mut out);
+        }
+        out
+    }
+
+    fn spec_var_row(row: &[Pat], ctor: &str, arity: usize, out: &mut Vec<Vec<Pat>>) {
+        let (head, rest) = row.split_first().expect("row has a column");
+        match head {
+            Pat::Wild => {
+                let mut r = vec![Pat::Wild; arity];
+                r.extend_from_slice(rest);
+                out.push(r);
+            }
+            Pat::Var(n, args) if n == ctor => {
+                let mut r = args.clone();
+                r.extend_from_slice(rest);
+                out.push(r);
+            }
+            Pat::Or(alts) => {
+                for a in alts {
+                    let mut nr = vec![a.clone()];
+                    nr.extend_from_slice(rest);
+                    Self::spec_var_row(&nr, ctor, arity, out);
+                }
+            }
+            _ => {} // a different constructor (or a scalar) is dropped
+        }
+    }
+
+    /// Specialize a scalar column by a concrete value: keep rows whose head pattern
+    /// matches `v`, dropping the column.
+    fn specialize_value(&self, matrix: &[Vec<Pat>], v: i128) -> Vec<Vec<Pat>> {
+        let mut out = Vec::new();
+        for row in matrix {
+            Self::spec_val_row(row, v, &mut out);
+        }
+        out
+    }
+
+    fn spec_val_row(row: &[Pat], v: i128, out: &mut Vec<Vec<Pat>>) {
+        let (head, rest) = row.split_first().expect("row has a column");
+        match head {
+            Pat::Wild => out.push(rest.to_vec()),
+            Pat::Int(w) if *w == v => out.push(rest.to_vec()),
+            Pat::Range(lo, hi) if *lo <= v && v <= *hi => out.push(rest.to_vec()),
+            Pat::Or(alts) => {
+                for a in alts {
+                    let mut nr = vec![a.clone()];
+                    nr.extend_from_slice(rest);
+                    Self::spec_val_row(&nr, v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Usefulness of a range pattern — precise for a single scalar column (the
+    /// common case), conservative (assumed useful) for nested positions.
+    fn useful_range(&self, matrix: &[Vec<Pat>], lo: i128, hi: i128, qrest: &[Pat]) -> bool {
+        if !qrest.is_empty() {
+            return true;
+        }
+        let mut covered: Vec<(i128, i128)> = Vec::new();
+        let mut full = false;
+        for row in matrix {
+            Self::collect_pat_intervals(&row[0], &mut covered, &mut full);
+        }
+        if full {
+            return false;
+        }
+        !intervals_cover(lo, hi, &covered)
+    }
+
+    fn collect_pat_intervals(p: &Pat, out: &mut Vec<(i128, i128)>, full: &mut bool) {
+        match p {
+            Pat::Wild => *full = true,
+            Pat::Int(v) => out.push((*v, *v)),
+            Pat::Range(a, b) => out.push((*a, *b)),
+            Pat::Or(alts) => {
+                for a in alts {
+                    Self::collect_pat_intervals(a, out, full);
+                }
+            }
+            Pat::Var(_, _) => {}
+        }
+    }
+
+    /// The kind of a matrix's first column — an enum (with its full variant set),
+    /// a scalar, or wildcards only.
+    fn col_kind(&self, matrix: &[Vec<Pat>]) -> ColKind {
+        let mut variant: Option<String> = None;
+        let mut scalar = false;
+        for row in matrix {
+            Self::scan_head(&row[0], &mut variant, &mut scalar);
+        }
+        if let Some(n) = variant {
+            if let Some(vs) = self.enum_variants_of(&n) {
+                return ColKind::Enum(vs);
+            }
+        }
+        if scalar {
+            ColKind::Scalar
+        } else {
+            ColKind::WildOnly
+        }
+    }
+
+    fn scan_head(p: &Pat, variant: &mut Option<String>, scalar: &mut bool) {
+        match p {
+            Pat::Var(n, _) => {
+                if variant.is_none() {
+                    *variant = Some(n.clone());
+                }
+            }
+            Pat::Int(_) | Pat::Range(_, _) => *scalar = true,
+            Pat::Or(alts) => {
+                for a in alts {
+                    Self::scan_head(a, variant, scalar);
+                }
+            }
+            Pat::Wild => {}
+        }
+    }
+
+    fn head_variants(&self, matrix: &[Vec<Pat>]) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for row in matrix {
+            Self::collect_head_variants(&row[0], &mut out);
+        }
+        out
+    }
+
+    fn collect_head_variants(p: &Pat, out: &mut HashSet<String>) {
+        match p {
+            Pat::Var(n, _) => {
+                out.insert(n.clone());
+            }
+            Pat::Or(alts) => {
+                for a in alts {
+                    Self::collect_head_variants(a, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The full variant set (name + arity) of the enum that owns `vname`.
+    fn enum_variants_of(&self, vname: &str) -> Option<Vec<(String, usize)>> {
+        let &ei = self.table.variants.get(vname)?;
+        if let TypeKindG::Enum { variants } = &self.table.types[ei].kind {
+            Some(variants.iter().map(|(n, ftys)| (n.clone(), ftys.len())).collect())
+        } else {
+            None
+        }
+    }
+
+    // --- pattern lowering (AST → the usefulness IR) ---
+
+    fn lower_pat(&self, pat: PatId) -> Pat {
+        match &self.ast.pat_at(pat).kind {
+            PatKind::Wildcard | PatKind::Rest | PatKind::Error => Pat::Wild,
+            PatKind::Ident(n) => {
+                if self.table.variants.contains_key(&n.name) {
+                    Pat::Var(n.name.clone(), vec![])
+                } else {
+                    Pat::Wild // a binding matches anything
+                }
+            }
+            PatKind::Variant { name, subpats } => {
+                let arity = self.variant_field_types(&name.name).len();
+                let mut args = Vec::new();
+                for sp in subpats {
+                    if matches!(self.ast.pat_at(*sp).kind, PatKind::Rest) {
+                        break; // trailing `..` → the remaining fields are wildcards
+                    }
+                    args.push(self.lower_pat(*sp));
+                }
+                while args.len() < arity {
+                    args.push(Pat::Wild);
+                }
+                Pat::Var(name.name.clone(), args)
+            }
+            PatKind::Lit(e) => match self.eval_pat_int(*e) {
+                Some(v) => Pat::Int(v),
+                None => Pat::Wild, // un-evaluable literal: treat conservatively
+            },
+            PatKind::Range { lo, hi, inclusive } => {
+                match (self.eval_pat_int(*lo), self.eval_pat_int(*hi)) {
+                    (Some(a), Some(b)) => {
+                        let b = if *inclusive { b } else { b - 1 };
+                        Pat::Range(a, b)
+                    }
+                    _ => Pat::Wild,
+                }
+            }
+            PatKind::Or(alts) => Pat::Or(alts.iter().map(|p| self.lower_pat(*p)).collect()),
+        }
+    }
+
+    /// Accumulate the value-intervals an (unguarded) scalar pattern covers, and
+    /// whether it is a catch-all.
+    fn collect_scalar_intervals(&self, pat: PatId, out: &mut Vec<(i128, i128)>, full: &mut bool) {
+        match &self.ast.pat_at(pat).kind {
+            PatKind::Wildcard | PatKind::Rest => *full = true,
+            PatKind::Ident(n) => {
+                if !self.table.variants.contains_key(&n.name) {
+                    *full = true; // a binding catches everything
+                }
+            }
+            PatKind::Lit(e) => {
+                if let Some(v) = self.eval_pat_int(*e) {
+                    out.push((v, v));
+                }
+            }
+            PatKind::Range { lo, hi, inclusive } => {
+                if let (Some(a), Some(b)) = (self.eval_pat_int(*lo), self.eval_pat_int(*hi)) {
+                    let b = if *inclusive { b } else { b - 1 };
+                    if a <= b {
+                        out.push((a, b));
+                    }
+                }
             }
             PatKind::Or(alts) => {
                 for p in alts {
-                    self.cover_pattern(*p, covered, catch_all);
+                    self.collect_scalar_intervals(*p, out, full);
                 }
             }
-            // Scalar patterns can't appear on an enum scrutinee (a type error
-            // elsewhere); `..` rest and these cover no variant here.
-            PatKind::Lit(_) | PatKind::Range { .. } | PatKind::Rest | PatKind::Error => {}
+            PatKind::Variant { .. } | PatKind::Error => {}
         }
     }
+
+    /// Evaluate a literal pattern expression to an integer value (covers integer,
+    /// `char`, and `bool` literals, and a leading unary minus).
+    fn eval_pat_int(&self, e: ExprId) -> Option<i128> {
+        match &self.ast.expr_at(e).kind {
+            ExprKind::Int(t) => parse_int_lit(t),
+            ExprKind::Bool(b) => Some(if *b { 1 } else { 0 }),
+            ExprKind::Char(t) => parse_char_lit(t),
+            ExprKind::Unary { op: UnOp::Neg, rhs } => self.eval_pat_int(*rhs).map(|v| -v),
+            _ => None,
+        }
+    }
+}
+
+/// The usefulness-algorithm IR a match pattern lowers to (a structural view that
+/// drops bindings and source spans — see [`TypeChecker::lower_pat`]).
+#[derive(Clone, Debug)]
+enum Pat {
+    /// `_`, a binding, `..` rest, or an un-evaluable literal — matches anything.
+    Wild,
+    /// An enum variant constructor with its (positionally lowered) field patterns.
+    Var(String, Vec<Pat>),
+    /// A concrete scalar value (integer/char/bool literal).
+    Int(i128),
+    /// An inclusive integer range.
+    Range(i128, i128),
+    /// An or-pattern — matches if any alternative does.
+    Or(Vec<Pat>),
+}
+
+/// What a usefulness matrix's first column ranges over.
+enum ColKind {
+    /// An enum, with its full `(variant, arity)` signature.
+    Enum(Vec<(String, usize)>),
+    /// A scalar (integer/char/bool) — treated as never fully covered by the matrix.
+    Scalar,
+    /// Wildcards only — no constructors to split on.
+    WildOnly,
+}
+
+/// Parse an integer literal's source text to a value (handles `_` separators and
+/// `0x`/`0b`/`0o` radices).
+fn parse_int_lit(text: &str) -> Option<i128> {
+    let t: String = text.chars().filter(|c| *c != '_').collect();
+    let t = t.trim();
+    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        i128::from_str_radix(h, 16).ok()
+    } else if let Some(b) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+        i128::from_str_radix(b, 2).ok()
+    } else if let Some(o) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
+        i128::from_str_radix(o, 8).ok()
+    } else {
+        t.parse::<i128>().ok()
+    }
+}
+
+/// Parse a char literal's source text (`'a'`, `'\n'`, …) to its codepoint value.
+fn parse_char_lit(text: &str) -> Option<i128> {
+    let inner = text.strip_prefix('\'')?.strip_suffix('\'')?;
+    let mut chars = inner.chars();
+    let c = chars.next()?;
+    let value = if c == '\\' {
+        let e = chars.next()?;
+        match e {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            '0' => '\0',
+            '\\' => '\\',
+            '\'' => '\'',
+            '"' => '"',
+            _ => return None,
+        }
+    } else {
+        c
+    };
+    if chars.next().is_some() {
+        return None; // more than one char/escape — not a simple char literal
+    }
+    Some(value as i128)
+}
+
+/// The inclusive `[min, max]` value range of a finite scalar type, or `None` for a
+/// platform-width type (`usize`/`isize`) whose domain can't be enumerated here.
+fn scalar_bounds(p: &str) -> Option<(i128, i128)> {
+    let r = match p {
+        "bool" => (0, 1),
+        "u8" => (0, 255),
+        "i8" => (-128, 127),
+        "u16" => (0, 65_535),
+        "i16" => (-32_768, 32_767),
+        "char" => (0, 0x10_FFFF),
+        "u32" => (0, 4_294_967_295),
+        "i32" => (-2_147_483_648, 2_147_483_647),
+        "u64" => (0, u64::MAX as i128),
+        "i64" => (i64::MIN as i128, i64::MAX as i128),
+        _ => return None,
+    };
+    Some(r)
+}
+
+/// Do the `covered` intervals fully cover the inclusive range `[lo, hi]`?
+fn intervals_cover(lo: i128, hi: i128, covered: &[(i128, i128)]) -> bool {
+    if lo > hi {
+        return true;
+    }
+    let mut iv: Vec<(i128, i128)> = covered.iter().copied().filter(|(a, b)| a <= b).collect();
+    iv.sort_unstable();
+    let mut cur = lo;
+    for (a, b) in iv {
+        if a > cur {
+            return false; // a gap before this interval
+        }
+        if b >= cur {
+            if b >= hi {
+                return true;
+            }
+            cur = b + 1;
+        }
+    }
+    false
 }
 
 /// The scalar types a `match` can dispatch on by value (integer/char/bool) — i.e.
@@ -1671,6 +2134,80 @@ mod tests {
         assert_eq!(d.len(), 1, "{:?}", d);
         assert!(d[0].message.contains("non-exhaustive"), "{:?}", d);
         assert!(d[0].message.contains("blue"), "names the uncovered variant: {:?}", d);
+    }
+
+    #[test]
+    fn nested_pattern_exhaustiveness_via_maranget() {
+        // `node(leaf, leaf)` covers only one shape of `node` — non-exhaustive.
+        let src = "enum Tree { leaf, node(l: indirect Tree, r: indirect Tree) } \
+                   fn f(read t: Tree) -> i32 { match t { leaf => 0, node(leaf, leaf) => 1 } }";
+        let (_i, d) = analyze(src);
+        assert!(
+            d.iter().any(|x| x.is_error() && x.message.contains("non-exhaustive")),
+            "nested gap should be caught: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn nested_wildcard_makes_it_exhaustive() {
+        let src = "enum Tree { leaf, node(l: indirect Tree, r: indirect Tree) } \
+                   fn f(read t: Tree) -> i32 { match t { leaf => 0, node(_, _) => 1 } }";
+        let (_i, d) = analyze(src);
+        assert!(d.iter().all(|x| !x.is_error()), "node(_, _) covers all nodes: {:?}", d);
+    }
+
+    #[test]
+    fn redundant_enum_arm_is_a_warning() {
+        // Exhaustive, but the second `red` is unreachable — a warning, not an error.
+        let src = "enum C { red, green } \
+                   fn f(read c: C) -> i32 { match c { red => 0, green => 1, red => 2 } }";
+        let (_i, d) = analyze(src);
+        assert!(d.iter().all(|x| !x.is_error()), "no error: {:?}", d);
+        assert!(
+            d.iter().any(|x| !x.is_error() && x.message.contains("unreachable")),
+            "the duplicate arm warns: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn arm_after_a_wildcard_is_unreachable() {
+        let src = "enum C { red, green } \
+                   fn f(read c: C) -> i32 { match c { _ => 0, red => 1 } }";
+        let (_i, d) = analyze(src);
+        assert!(
+            d.iter().any(|x| !x.is_error() && x.message.contains("unreachable")),
+            "an arm after `_` warns: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn redundant_scalar_arm_is_a_warning() {
+        // `5` is already covered by the earlier `0..=9`.
+        let src = "fn f(read n: i32) -> i32 { match n { 0..=9 => 0, 5 => 1, _ => 2 } }";
+        let (_i, d) = analyze(src);
+        assert!(
+            d.iter().any(|x| !x.is_error() && x.message.contains("unreachable")),
+            "the subsumed literal warns: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn bool_match_is_exhaustive_without_a_catch_all() {
+        // `true | false` covers `bool` — interval coverage the old name-set check missed.
+        let src = "fn f(read b: bool) -> i32 { match b { true => 1, false => 0 } }";
+        let (_i, d) = analyze(src);
+        assert!(d.iter().all(|x| !x.is_error()), "true/false covers bool: {:?}", d);
+    }
+
+    #[test]
+    fn full_range_makes_a_bounded_scalar_match_exhaustive() {
+        let src = "fn f(read x: u8) -> i32 { match x { 0..=255 => 1 } }";
+        let (_i, d) = analyze(src);
+        assert!(d.iter().all(|x| !x.is_error()), "0..=255 covers u8: {:?}", d);
     }
 
     #[test]

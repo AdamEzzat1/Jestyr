@@ -1786,17 +1786,31 @@ impl<'a> Cgen<'a> {
                     self.depth += 1;
                     if let Some(vi) = self.variants.get(&vname.name).cloned() {
                         for (i, sp) in subpats.iter().enumerate() {
-                            if let PatKind::Ident(bind) = &ast.pat_at(*sp).kind {
-                                if let Some((fname, fty)) = vi.fields.get(i) {
-                                    // Substitute the instance's type args (no-op for
-                                    // a plain enum) so the binding's C type is concrete.
-                                    let ft = self.ast_type_to_ty(*fty, &subst);
-                                    let fcty = self.c_type(&ft);
-                                    self.line(format!(
-                                        "{fcty} j_{} = {tmp}.u.{}.j_{fname};",
-                                        bind.name, vname.name
-                                    ));
+                            match &ast.pat_at(*sp).kind {
+                                // a plain binding → project the field
+                                PatKind::Ident(bind)
+                                    if !self.variants.contains_key(&bind.name) =>
+                                {
+                                    if let Some((fname, fty)) = vi.fields.get(i) {
+                                        // Substitute the instance's type args (no-op for
+                                        // a plain enum) so the binding's C type is concrete.
+                                        let ft = self.ast_type_to_ty(*fty, &subst);
+                                        let fcty = self.c_type(&ft);
+                                        self.line(format!(
+                                            "{fcty} j_{} = {tmp}.u.{}.j_{fname};",
+                                            bind.name, vname.name
+                                        ));
+                                    }
                                 }
+                                // a wildcard or `..` rest ignores the field
+                                PatKind::Wildcard | PatKind::Rest => {}
+                                // The frontend (Maranget) understands nested patterns,
+                                // but the flat switch/if-chain backend can't dispatch on
+                                // them yet — a clear diagnostic beats a silent miscompile.
+                                _ => self.diag(
+                                    ast.pat_at(*sp).span,
+                                    "nested patterns aren't supported by the backend yet — bind the field and `match` it separately",
+                                ),
                             }
                         }
                     }
@@ -1930,15 +1944,24 @@ impl<'a> Cgen<'a> {
                     self.depth += 1;
                     if let Some(vi) = self.variants.get(&vname.name).cloned() {
                         for (i, sp) in subpats.iter().enumerate() {
-                            if let PatKind::Ident(bind) = &ast.pat_at(*sp).kind {
-                                if let Some((fname, fty)) = vi.fields.get(i) {
-                                    let ft = self.ast_type_to_ty(*fty, subst);
-                                    let fcty = self.c_type(&ft);
-                                    self.line(format!(
-                                        "{fcty} j_{} = {tmp}.u.{}.j_{fname};",
-                                        bind.name, vname.name
-                                    ));
+                            match &ast.pat_at(*sp).kind {
+                                PatKind::Ident(bind)
+                                    if !self.variants.contains_key(&bind.name) =>
+                                {
+                                    if let Some((fname, fty)) = vi.fields.get(i) {
+                                        let ft = self.ast_type_to_ty(*fty, subst);
+                                        let fcty = self.c_type(&ft);
+                                        self.line(format!(
+                                            "{fcty} j_{} = {tmp}.u.{}.j_{fname};",
+                                            bind.name, vname.name
+                                        ));
+                                    }
                                 }
+                                PatKind::Wildcard | PatKind::Rest => {}
+                                _ => self.diag(
+                                    ast.pat_at(*sp).span,
+                                    "nested patterns aren't supported by the backend yet — bind the field and `match` it separately",
+                                ),
                             }
                         }
                     }
@@ -5302,6 +5325,20 @@ mod tests {
         assert!(c.contains("!= ((int32_t*)0)"), "`some` tested by non-null: {c}");
         assert!(c.contains("== ((int32_t*)0)"), "`none` tested by null: {c}");
         assert!(c.contains("if ((j_flag > 0))"), "the guard gates the `some` arm: {c}");
+    }
+
+    #[test]
+    fn nested_subpattern_diagnoses_in_codegen() {
+        // The frontend (Maranget) understands `node(leaf, leaf)`, but the flat
+        // backend can't dispatch it — it must diagnose, not miscompile.
+        let src = "enum Tree { leaf, node(l: indirect Tree, r: indirect Tree) } \
+                   fn f(read t: Tree) -> i32 { match t { leaf => 0, node(leaf, leaf) => 1 } }";
+        let (_c, d) = gen(src);
+        assert!(
+            d.iter().any(|x| x.message.contains("nested patterns aren't supported")),
+            "{:?}",
+            d
+        );
     }
 
     #[test]

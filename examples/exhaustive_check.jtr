@@ -1,0 +1,32 @@
+// examples/exhaustive_check.jtr — Maranget usefulness analysis (§2.4): real
+// nested-pattern exhaustiveness + redundant-arm warnings. This file is for
+// `jestyrc check` — it deliberately contains a non-exhaustive match (an error)
+// and an unreachable arm (a warning) to exercise the analysis.
+//
+// Run:  jestyrc check examples/exhaustive_check.jtr
+//   error:   non-exhaustive `match`: some cases aren't covered   (in depth1)
+//   warning: unreachable match arm: already covered by an earlier arm   (in bucket)
+
+enum Tree { leaf, node(l: indirect Tree, r: indirect Tree) }
+
+// NON-EXHAUSTIVE: `node(leaf, leaf)` only matches a node whose children are both
+// leaves — `node(node(..), ..)` is unhandled. The old name-set check (which only
+// looked at top-level variant names) would have wrongly accepted this; Maranget
+// specializes into the node's fields and finds the gap.
+fn depth1(read t: Tree) -> i32 {
+    match t {
+        leaf             => 0,
+        node(leaf, leaf) => 1,
+    }
+}
+
+// REDUNDANT ARM: the `5` arm can never run — `0..=9` already covers it. The
+// usefulness check flags it as unreachable (a non-fatal warning).
+fn bucket(read n: i32) -> i32 {
+    match n {
+        0..=9 => 1,
+        20    => 2,
+        5     => 3,   // unreachable: 5 ∈ 0..=9
+        _     => 0,
+    }
+}

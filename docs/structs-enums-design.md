@@ -158,7 +158,7 @@ enum Shape { circle(r: f64), rect(w: f64, h: f64) }  // named fields — already
   is a separate small follow-up — pairs with a `@repr(u8)` attribute slotting next to
   `@layout` in the registry.
 
-### 2.4 Match power + Maranget exhaustiveness  🔜 (largest; guards ✅ done)
+### 2.4 Match power + Maranget exhaustiveness  ✅ DONE (analysis; decision-tree cgen pending)
 
 ```jestyr
 match shape {
@@ -202,10 +202,18 @@ match shape {
   valid as a variant's *last* field only (`rect(w, ..)` binds `w`, drops the rest; a non-
   trailing `..` is a parse error). Nearly free — the cgen binding loop already binds only
   named subpatterns, so a trailing rest is simply skipped. Demo
-  [`examples/rest_pat.jtr`](../examples/rest_pat.jtr); HANDOFF §5.41. **Remaining step:**
-  the Maranget usefulness matrix — real nested-pattern exhaustiveness (including
-  `0..=255`/`true|false` interval coverage) + redundant-arm warnings + a decision-tree
-  lowering, replacing the name-set/catch-all checks.
+  [`examples/rest_pat.jtr`](../examples/rest_pat.jtr); HANDOFF §5.41.
+- **Step 4 ✅ — Maranget usefulness (the capstone, *analysis*).** `check_exhaustive` is now
+  the usefulness algorithm over a `Pat` IR (`Wild | Var | Int | Range | Or`):
+  exhaustiveness = the all-wildcard vector is not useful against the arm matrix (finds
+  **nested** gaps the old name-set check missed), and a redundant/unreachable arm is a
+  **warning** (`Diagnostic.severity` now distinguishes warnings — they report but don't fail
+  the build). Scalars use an interval engine, so `true|false`/`0..=255` are exhaustive without
+  a catch-all, and a subsumed literal/range warns. Guarded arms are excluded. Check-demo
+  [`examples/exhaustive_check.jtr`](../examples/exhaustive_check.jtr); HANDOFF §5.42.
+  **The one remaining piece** is the *backend*: cgen still lowers via the flat switch/if-chain
+  and **diagnoses** (rather than dispatches) a nested non-wildcard subpattern — the
+  decision-tree lowering that closes this frontend/backend gap is the next match-power task.
 
 ### 2.5 Recursive ADTs via explicit `indirect`  ✅ DONE
 
@@ -296,7 +304,7 @@ rebase the rest (HANDOFF §1).
 | 2b | **Struct-variant *syntax*** (`V { … }` named construct/match) | ergonomics; named fields already exist | **yes** | M | ⏳ |
 | 2.5 | **Recursive ADTs via `indirect`** + by-value-recursion guard | recursion already worked via tiers; `indirect` is the spelling | **yes** | S | ✅ done |
 | 2.6 | **`distinct` nominal types** (zero-cost typedef + `as` + let-enforcement) | `distinct` keyword; reuses casts | **yes** | S | ✅ done |
-| 3 | **Match power + Maranget exhaustiveness** | rests on #2's pattern shapes; largest | **yes** | L | 🔜 guards ✅; or/range/rest/Maranget ⏳ |
+| 3 | **Match power + Maranget exhaustiveness** | rests on #2's pattern shapes; largest | **yes** | L | ✅ guards/or/range/rest/Maranget-analysis; decision-tree cgen ⏳ |
 | 4 | **Recursive ADTs (`indirect`)** | needs ref tiers (have); novel | small | M | ⏳ |
 | 5 | **`distinct` types** | isolated; keyword reserved | small | S | ⏳ |
 | 6 | **Layout reflection (`offset_of`/`align_of`)** | isolated cgen intrinsics | no | S | ⏳ |

@@ -174,8 +174,13 @@ fn main() -> ExitCode {
             let (info, type_diags) = typeck::check_program(&prog.ast, &prog.modules);
             let mut diags = type_diags;
             diags.extend(escape::check(&prog.ast, &info));
-            if !diags.is_empty() {
+            // Errors block codegen; warnings (e.g. redundant match arms) are
+            // reported but the build proceeds.
+            if diags.iter().any(|d| d.is_error()) {
                 return report_program(&prog.modules, &diags);
+            }
+            for d in &diags {
+                eprintln!("{}", prog.modules.render(d, d.severity));
             }
 
             // `test` mode emits a `@test`/`@bench` harness `main`; the rest emit
@@ -214,10 +219,16 @@ fn report_program(modules: &module::Modules, diags: &[diag::Diagnostic]) -> Exit
     }
     eprintln!();
     for d in diags {
-        eprintln!("{}", modules.render(d, diag::Severity::Error));
+        eprintln!("{}", modules.render(d, d.severity));
     }
-    eprintln!("{} error(s)", diags.len());
-    ExitCode::FAILURE
+    let errors = diags.iter().filter(|d| d.is_error()).count();
+    if errors > 0 {
+        eprintln!("{errors} error(s)");
+        ExitCode::FAILURE
+    } else {
+        eprintln!("{} warning(s)", diags.len());
+        ExitCode::SUCCESS
+    }
 }
 
 /// Write the emitted C to a temp file, compile it with a detected C compiler,

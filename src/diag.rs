@@ -33,6 +33,9 @@ impl Severity {
 pub struct Diagnostic {
     pub message: String,
     pub span: Span,
+    /// The severity this diagnostic *is* (independent of how a caller renders it).
+    /// Errors are fatal; warnings are reported but don't fail the build.
+    pub severity: Severity,
     /// An optional stable error code (e.g. `E0042`), shown as `error[E0042]`.
     pub code: Option<&'static str>,
     /// An optional suggestion, rendered on a trailing `= help:` line.
@@ -41,7 +44,17 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     pub fn new(message: impl Into<String>, span: Span) -> Diagnostic {
-        Diagnostic { message: message.into(), span, code: None, help: None }
+        Diagnostic { message: message.into(), span, severity: Severity::Error, code: None, help: None }
+    }
+
+    /// A non-fatal warning (e.g. a redundant match arm).
+    pub fn warning(message: impl Into<String>, span: Span) -> Diagnostic {
+        Diagnostic { message: message.into(), span, severity: Severity::Warning, code: None, help: None }
+    }
+
+    /// Whether this diagnostic is fatal (an error, not a warning/note).
+    pub fn is_error(&self) -> bool {
+        self.severity == Severity::Error
     }
 
     /// Attach a stable error code.
