@@ -1,0 +1,15 @@
+// examples/visibility/main.jtr — per-field visibility (§2.8). Fields are private
+// to their defining module by default; `pub` exposes them. Same-module access is
+// always free; only cross-module access of a non-`pub` field is rejected.
+//
+// Run:  jestyrc run examples/visibility/main.jtr   →  prints 3, 7
+
+import "geo"
+
+fn main() -> i32 {
+    let p = geo.make(3, 7)
+    print_int(p.x)              // 3   — `x` is `pub`, readable here
+    print_int(geo.y_of(p))      // 7   — `y` is private; reach it via the accessor
+    // print_int(p.y)           // ERROR: field `y` is private to module `geo`
+    return 0
+}

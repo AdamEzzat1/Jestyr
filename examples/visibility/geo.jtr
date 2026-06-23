@@ -1,0 +1,13 @@
+// examples/visibility/geo.jtr — a library module. `Point` has a public `x` and a
+// private `y`; struct fields are private to their module unless marked `pub`.
+// A pub accessor exposes the private field in a controlled way.
+
+pub struct Point {
+    pub x: i32,     // public — readable from other modules
+    y: i32,         // private to module `geo`
+}
+
+pub fn make(x: i32, y: i32) -> Point { return Point { x: x, y: y } }
+
+// A public accessor for the private field.
+pub fn y_of(read p: Point) -> i32 { return p.y }

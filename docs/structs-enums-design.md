@@ -291,8 +291,11 @@ offset_of(Point, y)       // new — offsetof
 
 - **Field defaults** (`x: i32 = 0`) ✅ DONE — `StructMember::Field.default`; cgen fills omitted
   fields from defaults at each construction site (non-generic structs). Demo
-  [`examples/defaults.jtr`](../examples/defaults.jtr); HANDOFF §5.47. **Per-field visibility**
-  (`pub x`) — still a cheap grammar addition (CJC has both); composes with field attributes.
+  [`examples/defaults.jtr`](../examples/defaults.jtr); HANDOFF §5.47.
+- **Per-field visibility** (`pub x`) ✅ DONE — `StructMember::Field.is_pub`; fields are private
+  to their module by default, `pub` exposes them. Enforced in `field_type` for cross-module
+  access of a non-`pub` struct field (same-module access is free). Demo (2-file)
+  [`examples/visibility/main.jtr`](../examples/visibility/main.jtr); HANDOFF §5.49.
 - **Struct update / spread** (`Point { x: 9, ..p }`) ✅ DONE — `StructLit.spread`; a
   copy-then-override GNU statement-expression. Pairs with immutable `record` (functional
   update). Demo [`examples/spread.jtr`](../examples/spread.jtr); HANDOFF §5.46.

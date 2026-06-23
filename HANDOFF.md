@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 255 tests pass, including `proptest` property
+and run (or are correctly rejected). 257 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -229,6 +229,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `spread.jtr` | `1`, `2`, `9`, `2`, `1`, `20` | **struct update / spread (§2.8)** — `Point { x: 9, ..p }` functional update; copy-then-override statement-expr (§5.46) |
 | `defaults.jtr` | `3`, `0`, `1`, `5`, `0`, `9` | **field defaults (§2.8)** — `x: i32 = 0`; omitted fields filled from defaults at construction (§5.47) |
 | `copy_optin.jtr` | `3`, `7`, `20` | **opt-in Copy (§2.8)** — `@copy struct`; a freely-copyable aggregate may be returned by value (escape-checker only) (§5.48) |
+| `visibility/main.jtr` | `3`, `7` | **per-field visibility (§2.8)** — `pub x` exposes a field cross-module; private fields need a pub accessor (§5.49) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -889,6 +890,22 @@ These are the non-obvious things that will bite if you don't know them.
     (`3, 7, 20`). **Scoped to structs** (enums could follow the same one-liner at the enum
     registration site). **Remaining §2.8:** per-field visibility (`pub x`), untagged `union`,
     bit-fields.
+
+49. **Per-field visibility — `pub x` (design §2.8).** Struct fields are **private to their
+    defining module by default**; `pub` exposes them. `StructMember::Field.is_pub` (parsed as an
+    optional `pub` before the field name). Enforced in `typeck::field_type`: when accessing
+    `base.f` on a `Ty::Named` **struct** whose owning module (`self.owner[sname]`) differs from
+    `self.cur_mod` and the field isn't `pub` (`field_is_pub`, an AST scan), it's an error —
+    `field \`f\` is private to module \`m\``. **Same-module access is always free** (so all
+    single-file programs and same-module field reads are unaffected — `owner == cur_mod`), and
+    the check only fires for non-generic `Named` structs (a generic `GenStruct` field projects
+    `Unknown`, no check). **Non-breaking:** no existing example does cross-module non-generic
+    struct field access, verified by the green `modules/`+`std/` demos. **Scope/limitations:**
+    enforces field *reads* (not construction with a private field), and reuses the same
+    module-origin machinery as the fn/const visibility check (§5.25). Demo (2-file)
+    [`examples/visibility/main.jtr`](examples/visibility/main.jtr) + `geo.jtr` (`3, 7`);
+    cross-module `p.y` on the private field is the rejected case. **Remaining §2.8:** untagged
+    `union` / bit-fields.
 
 ---
 

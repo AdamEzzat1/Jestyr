@@ -546,6 +546,8 @@ impl<'src> Parser<'src> {
                     );
                 }
                 let fstart = self.cur().span;
+                // `pub x: T` exposes the field across modules (private by default).
+                let is_pub = self.eat(Pub);
                 let name = self.eat_ident("field name");
                 self.expect(Colon, "`:`");
                 let fattrs = self.parse_attrs(); // field-level: `@volatile`
@@ -564,6 +566,7 @@ impl<'src> Parser<'src> {
                     ty,
                     volatile,
                     default,
+                    is_pub,
                     span: fstart.to(self.prev_span()),
                 });
                 self.eat(Comma); // optional separator between fields
@@ -1643,6 +1646,28 @@ mod tests {
             "enum E { c(x: i32, y: i32) } fn f(read e: E) -> i32 { match e { c(.., y) => y } }",
         );
         assert!(d.iter().any(|x| x.message.contains("last field")), "{:?}", d);
+    }
+
+    #[test]
+    fn parses_pub_field() {
+        let ast = parse_ok("struct P { pub x: i32, y: i32 }");
+        let body = ast
+            .items
+            .iter()
+            .find_map(|it| match it {
+                Item::Struct { body, .. } => Some(body),
+                _ => None,
+            })
+            .expect("a struct");
+        let pubs: Vec<bool> = body
+            .members
+            .iter()
+            .filter_map(|m| match m {
+                StructMember::Field { is_pub, .. } => Some(*is_pub),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pubs, vec![true, false], "x is pub, y is private");
     }
 
     #[test]

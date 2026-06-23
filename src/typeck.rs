@@ -1280,8 +1280,9 @@ impl<'a> TypeChecker<'a> {
         }
         if let Ty::Named(i) = base {
             // Read what we need, dropping the table borrow before any diagnostic.
-            let (found, sname) = {
+            let (found, sname, is_struct) = {
                 let decl = &self.table.types[*i];
+                let is_struct = matches!(decl.kind, TypeKindG::Struct { .. });
                 let found = match &decl.kind {
                     TypeKindG::Struct { fields } => {
                         fields.iter().find(|(n, _)| n == fname).map(|(_, t)| t.clone())
@@ -1290,10 +1291,25 @@ impl<'a> TypeChecker<'a> {
                     // fields of its own — neither has a directly-accessible field.
                     TypeKindG::Enum { .. } | TypeKindG::Distinct { .. } => Some(Ty::Unknown),
                 };
-                (found, decl.name.clone())
+                (found, decl.name.clone(), is_struct)
             };
             match found {
-                Some(t) => t,
+                Some(t) => {
+                    // Per-field visibility: a non-`pub` struct field is private to
+                    // its defining module (design §2.8). Same-module access is free.
+                    if is_struct {
+                        if let Some(&(owner, _)) = self.owner.get(&sname) {
+                            if owner != self.cur_mod && !self.field_is_pub(&sname, fname) {
+                                let m = self.modules.names[owner].clone();
+                                self.error(
+                                    span,
+                                    format!("field `{fname}` is private to module `{m}`"),
+                                );
+                            }
+                        }
+                    }
+                    t
+                }
                 None => {
                     self.error(span, format!("no field `{fname}` on struct `{sname}`"));
                     Ty::Error
@@ -1302,6 +1318,26 @@ impl<'a> TypeChecker<'a> {
         } else {
             Ty::Unknown
         }
+    }
+
+    /// Is `field_name` a `pub` field of struct `struct_name`? (Fields are private
+    /// to their module by default; `pub` exposes them.) Unknown struct/field →
+    /// `true` (lenient — don't restrict what we can't resolve).
+    fn field_is_pub(&self, struct_name: &str, field_name: &str) -> bool {
+        for item in &self.ast.items {
+            if let Item::Struct { name, body, .. } = item {
+                if name.name == struct_name {
+                    for m in &body.members {
+                        if let StructMember::Field { name: fname, is_pub, .. } = m {
+                            if fname.name == field_name {
+                                return *is_pub;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Bind a pattern's variables, projecting an enum variant's payload field
@@ -2035,6 +2071,14 @@ mod tests {
         let (_i, d) = analyze("struct Point { x: i32, y: i32 } fn f(read p: Point) -> i32 { p.z }");
         assert_eq!(d.len(), 1, "{:?}", d);
         assert!(d[0].message.contains("no field `z` on struct `Point`"));
+    }
+
+    #[test]
+    fn same_module_private_field_access_is_fine() {
+        // Per-field visibility only restricts *cross-module* access; within a
+        // module a private field is freely readable (no false positive).
+        let (_i, d) = analyze("struct P { y: i32 } fn f(read p: P) -> i32 { return p.y }");
+        assert!(d.is_empty(), "same-module access is free: {:?}", d);
     }
 
     #[test]

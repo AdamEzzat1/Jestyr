@@ -357,8 +357,16 @@ impl FnDecl {
 pub enum StructMember {
     /// `volatile` is set by an `@volatile` field attribute (MMIO; design §16).
     /// `default` is the field's `= <expr>` default value, used to fill the field
-    /// when a struct literal omits it.
-    Field { name: Ident, ty: TypeId, volatile: bool, default: Option<ExprId>, span: Span },
+    /// when a struct literal omits it. `is_pub` (the `pub` keyword) exposes the
+    /// field across modules — fields are private to their module by default.
+    Field {
+        name: Ident,
+        ty: TypeId,
+        volatile: bool,
+        default: Option<ExprId>,
+        is_pub: bool,
+        span: Span,
+    },
     Method(FnDecl),
 }
 
