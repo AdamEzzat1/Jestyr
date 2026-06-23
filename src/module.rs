@@ -252,6 +252,7 @@ fn item_is_pub(item: &Item) -> bool {
         Item::Enum(e) => e.is_pub,
         Item::Const(c) => c.is_pub,
         Item::Struct { is_pub, .. } => *is_pub,
+        Item::Distinct(d) => d.is_pub,
         Item::Extern(e) => e.is_pub,
         Item::Import(_) => false,
     }
@@ -458,6 +459,12 @@ mod tests {
     fn recursion_example_compiles_clean() {
         // Recursive ADTs via `indirect` (enum/ADT step 2.5).
         pipeline_is_clean("examples/recursion.jtr");
+    }
+
+    #[test]
+    fn distinct_example_compiles_clean() {
+        // Distinct nominal types (enum/ADT step 2.6).
+        pipeline_is_clean("examples/distinct.jtr");
     }
 
     #[test]

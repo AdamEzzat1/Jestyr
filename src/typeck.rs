@@ -79,6 +79,7 @@ fn build_owner(ast: &Ast, modules: &Modules) -> HashMap<String, (ModId, bool)> {
             Item::Enum(e) => Some(e.name.name.clone()),
             Item::Const(c) => Some(c.name.name.clone()),
             Item::Struct { name, .. } => Some(name.name.clone()),
+            Item::Distinct(d) => Some(d.name.name.clone()),
             Item::Extern(e) => Some(e.name.name.clone()),
             Item::Import(_) => None,
         };
@@ -144,6 +145,22 @@ impl<'a> TypeChecker<'a> {
                         self.table.variants.insert(v.name.name.clone(), idx);
                     }
                 }
+                Item::Distinct(d) => {
+                    // Register the name now; the base type is lowered in phase 2.
+                    if self.table.type_index.contains_key(&d.name.name) {
+                        self.error(d.name.span, format!("duplicate definition of `{}`", d.name.name));
+                    } else {
+                        let idx = self.table.types.len();
+                        self.table.types.push(TypeDecl {
+                            name: d.name.name.clone(),
+                            kind: TypeKindG::Distinct { base: Ty::Unknown },
+                            is_copy: false,
+                            is_record: false,
+                            type_params: Vec::new(),
+                        });
+                        self.table.type_index.insert(d.name.name.clone(), idx);
+                    }
+                }
                 _ => {}
             }
         }
@@ -192,6 +209,17 @@ impl<'a> TypeChecker<'a> {
                     if let Some(&i) = self.table.type_index.get(&e.name.name) {
                         if let TypeKindG::Enum { variants: slot } = &mut self.table.types[i].kind {
                             *slot = variants;
+                        }
+                    }
+                }
+                Item::Distinct(d) => {
+                    // Lower the base type; a distinct type is `Copy` iff its base is.
+                    let base = self.lower_type(&empty, d.base);
+                    let copy = base.is_copy(&self.table);
+                    if let Some(&i) = self.table.type_index.get(&d.name.name) {
+                        self.table.types[i].is_copy = copy;
+                        if let TypeKindG::Distinct { base: slot } = &mut self.table.types[i].kind {
+                            *slot = base;
                         }
                     }
                 }
@@ -284,6 +312,23 @@ impl<'a> TypeChecker<'a> {
                 ),
             );
         }
+    }
+
+    /// Is `t` a `distinct` nominal type?
+    fn is_distinct(&self, t: &Ty) -> bool {
+        matches!(t, Ty::Named(i) if matches!(self.table.types[*i].kind, TypeKindG::Distinct { .. }))
+    }
+
+    /// Should assigning `got` where `ann` is expected be rejected on `distinct`
+    /// grounds? Only when a distinct type is involved and the two differ — and
+    /// never when either side is loose (`Unknown`/`Opaque`/`Error`), to preserve
+    /// the checker's leniency everywhere a distinct type is *not* involved.
+    fn distinct_mismatch(&self, ann: &Ty, got: &Ty) -> bool {
+        if !(self.is_distinct(ann) || self.is_distinct(got)) {
+            return false;
+        }
+        let loose = |t: &Ty| matches!(t, Ty::Unknown | Ty::Opaque(_) | Ty::Error);
+        !loose(ann) && !loose(got) && ann != got
     }
 
     /// Does `name` denote a generic enum (an `enum Name(T) { … }` template)?
@@ -740,7 +785,7 @@ impl<'a> TypeChecker<'a> {
                     let mut scope: Scope = vec![HashMap::new()];
                     self.infer(&mut scope, &empty, &Ty::Unit, c.value);
                 }
-                Item::Enum(_) | Item::Extern(_) | Item::Import(_) => {}
+                Item::Enum(_) | Item::Distinct(_) | Item::Extern(_) | Item::Import(_) => {}
             }
         }
     }
@@ -780,6 +825,20 @@ impl<'a> TypeChecker<'a> {
                     self.cur_expected = expected.clone();
                     let inferred = init.map(|e| self.infer(scope, typ, self_ty, e));
                     self.cur_expected = prev;
+                    // A `distinct` type is *not* interchangeable with its base (or any
+                    // other type): a mismatched initializer is an error suggesting `as`.
+                    if let (Some(ann), Some(got)) = (&expected, &inferred) {
+                        if self.distinct_mismatch(ann, got) {
+                            self.error(
+                                name.span,
+                                format!(
+                                    "expected `{}`, found `{}` — `distinct` types need an explicit `as`",
+                                    ann.display(&self.table),
+                                    got.display(&self.table)
+                                ),
+                            );
+                        }
+                    }
                     let bind = expected.unwrap_or_else(|| inferred.unwrap_or(Ty::Unknown));
                     scope.last_mut().unwrap().insert(name.name.clone(), bind);
                     result = Ty::Unit;
@@ -1202,7 +1261,9 @@ impl<'a> TypeChecker<'a> {
                     TypeKindG::Struct { fields } => {
                         fields.iter().find(|(n, _)| n == fname).map(|(_, t)| t.clone())
                     }
-                    TypeKindG::Enum { .. } => Some(Ty::Unknown),
+                    // Enums project payloads via `match`; a distinct type has no
+                    // fields of its own — neither has a directly-accessible field.
+                    TypeKindG::Enum { .. } | TypeKindG::Distinct { .. } => Some(Ty::Unknown),
                 };
                 (found, decl.name.clone())
             };
@@ -1475,6 +1536,18 @@ mod tests {
         assert!(d2.is_empty(), "indirect breaks the cycle: {:?}", d2);
         let (_i3, d3) = analyze("struct Node { next: *Node }");
         assert!(d3.is_empty(), "a pointer breaks the cycle: {:?}", d3);
+    }
+
+    #[test]
+    fn distinct_types_are_not_interchangeable_with_their_base() {
+        // Assigning the base type to a distinct binding (no cast) is an error.
+        let (_i, d) =
+            analyze("distinct UserId = i32 fn main() -> i32 { var x: UserId = 5 return 0 }");
+        assert!(d.iter().any(|m| m.message.contains("distinct")), "{:?}", d);
+        // An explicit `as` conversion is accepted.
+        let (_i2, d2) =
+            analyze("distinct UserId = i32 fn main() -> i32 { var x: UserId = 5 as UserId return 0 }");
+        assert!(d2.is_empty(), "explicit `as` is fine: {:?}", d2);
     }
 
     #[test]

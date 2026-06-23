@@ -427,11 +427,23 @@ pub struct Attribute {
     pub span: Span,
 }
 
+/// `distinct UserId = u64` — a zero-cost nominal wrapper over a base type
+/// (Haskell `newtype` / Odin `distinct`; design §2.6). Same representation, not
+/// interchangeable with the base; convert with an explicit `as`.
+#[derive(Clone, Debug)]
+pub struct DistinctDecl {
+    pub is_pub: bool,
+    pub name: Ident,
+    pub base: TypeId,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug)]
 pub enum Item {
     Fn(FnDecl),
     Enum(EnumDecl),
     Const(ConstDecl),
+    Distinct(DistinctDecl),
     /// A product type. `is_record` distinguishes an **immutable** `record` (whose
     /// fields cannot be assigned — a static guarantee) from a mutable `struct`.
     /// Both share one field grammar, layout, and C lowering; only the mutation

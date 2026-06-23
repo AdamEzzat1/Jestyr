@@ -397,6 +397,11 @@ impl<'a> Cgen<'a> {
                 Item::Struct { name, .. } => {
                     self.raw(format!("typedef struct Jestyr_{0} Jestyr_{0};\n", name.name));
                 }
+                // `distinct UserId = u64` → a zero-cost C typedef of the base.
+                Item::Distinct(dd) => {
+                    let base = self.c_ty_ast(dd.base);
+                    self.raw(format!("typedef {base} Jestyr_{};\n", dd.name.name));
+                }
                 Item::Enum(e) => {
                     // Generic-enum templates and niche-optimized enums have no
                     // `Jestyr_<E>` struct, so they need no forward typedef.
@@ -4936,6 +4941,17 @@ mod tests {
         assert!(c.contains("Jestyr_Color_red = 1,"), "explicit discriminant in tag enum: {c}");
         assert!(c.contains("Jestyr_Color_blue = 4,"), "{c}");
         assert!(c.contains(").tag)"), "`c as i32` reads the discriminant (the tag): {c}");
+    }
+
+    #[test]
+    fn distinct_lowers_to_a_zero_cost_typedef() {
+        let src = "distinct UserId = i32 \
+                   fn id(u: UserId) -> i32 { return u as i32 } \
+                   fn main() -> i32 { return id(5 as UserId) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("typedef int32_t Jestyr_UserId;"), "zero-cost typedef: {c}");
+        assert!(c.contains("Jestyr_UserId j_u"), "param uses the distinct type: {c}");
     }
 
     #[test]

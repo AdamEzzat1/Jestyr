@@ -178,6 +178,14 @@ impl<'src> Parser<'src> {
                 self.check_attrs(&attrs, attrs::Target::Struct);
                 Some(self.parse_named_struct(attrs, is_pub, true))
             }
+            Distinct => {
+                if let Some(a) = attrs.first() {
+                    self.error(a.span, "attributes are not allowed on `distinct`");
+                }
+                let mut d = self.parse_distinct();
+                d.is_pub = is_pub;
+                Some(Item::Distinct(d))
+            }
             Extern => {
                 self.check_attrs(&attrs, attrs::Target::Extern);
                 let mut e = self.parse_extern();
@@ -193,12 +201,23 @@ impl<'src> Parser<'src> {
             other => {
                 self.error(
                     self.cur().span,
-                    format!("expected an item (`fn`, `enum`, `const`, `struct`, `record`, `extern`, `import`), found `{}`", other.describe()),
+                    format!("expected an item (`fn`, `enum`, `const`, `struct`, `record`, `distinct`, `extern`, `import`), found `{}`", other.describe()),
                 );
                 self.bump();
                 None
             }
         }
+    }
+
+    /// `distinct Name = BaseType` — a zero-cost nominal wrapper (design §2.6).
+    fn parse_distinct(&mut self) -> DistinctDecl {
+        let start = self.cur().span;
+        self.expect(Distinct, "`distinct`");
+        let name = self.eat_ident("distinct type name");
+        self.expect(Eq, "`=`");
+        let base = self.parse_type();
+        let span = start.to(self.ast.type_at(base).span);
+        DistinctDecl { is_pub: false, name, base, span }
     }
 
     /// `import "rel/path"` or `import "rel/path" as alias`.
@@ -1473,6 +1492,15 @@ mod tests {
             }
             _ => panic!("expected a function"),
         }
+    }
+
+    #[test]
+    fn parses_a_distinct_type() {
+        let ast = parse_ok("distinct UserId = i32");
+        assert!(
+            matches!(&ast.items[0], Item::Distinct(d) if d.name.name == "UserId"),
+            "expected a distinct item"
+        );
     }
 
     #[test]

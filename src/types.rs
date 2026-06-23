@@ -136,6 +136,10 @@ pub fn is_numeric(t: &Ty) -> bool {
 pub enum TypeKindG {
     Struct { fields: Vec<(String, Ty)> },
     Enum { variants: Vec<(String, Vec<Ty>)> },
+    /// `distinct UserId = u64` — a zero-cost nominal wrapper over `base`. Same
+    /// representation, *not* interchangeable with it (Haskell `newtype` / Odin
+    /// `distinct`). Convert with an explicit `as`.
+    Distinct { base: Ty },
 }
 
 #[derive(Debug)]

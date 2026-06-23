@@ -208,19 +208,27 @@ enum Tree { leaf(v: i32), node(left: indirect Tree, right: indirect Tree) }
   (A↔B) and generic-by-value self-reference (`Option(Option(T))` by value) are left to the
   C compiler for now.
 
-### 2.6 `distinct` types  ⏳
+### 2.6 `distinct` types  ✅ DONE
 
 ```jestyr
-distinct UserId = u64        // same bits as u64, but not interchangeable with it
-distinct Meters = f64
+distinct UserId = i32        // same bits as i32, but not interchangeable with it
+distinct AccountId = i32
 ```
-- **Inspiration:** Haskell `newtype`, Odin `distinct`, Ada subtypes. The `distinct`
-  keyword is **already reserved** in the lexer.
-- **Rule:** identical representation, *nominally distinct* — no implicit coercion to/from
-  the base type (an explicit `as` cast or constructor is required). Zero runtime cost.
-- **Impl:** a thin nominal wrapper in the type table; cgen emits the base C type; the
-  checker refuses cross-assignment. Great with refinements (`distinct Percent = u8` +
-  `in 0..=100`).
+- **Inspiration:** Haskell `newtype`, Odin `distinct`, Ada subtypes.
+- **What landed.** `distinct Name = Base` (`Item::Distinct`, `TypeKindG::Distinct{base}`).
+  It lowers to a **zero-cost C typedef** of the base (`typedef int32_t Jestyr_UserId;`,
+  emitted in `forward_types`); `is_copy` follows the base. Construction/extraction is the
+  ordinary `as` cast (`5 as UserId`, `uid as i32`). Enforcement: a `let` whose annotation
+  is a distinct type rejects a non-matching initializer (`typeck::distinct_mismatch`) with
+  "expected `UserId`, found `i32` — `distinct` types need an explicit `as`". The check is
+  scoped to *only fire when a distinct type is involved*, so the lenient checker is
+  unaffected everywhere else. Demo [`examples/distinct.jtr`](../examples/distinct.jtr)
+  (`1001, 42, 7`).
+- **Limitation:** enforcement currently covers `let` annotations (the common case); the
+  lenient checker doesn't yet type-check *call arguments* or *returns*, so passing a
+  distinct where its base is expected at a call isn't rejected yet — it lands when general
+  argument-vs-parameter type-checking does. Pairs well with refinements later
+  (`distinct Percent = u8` + `in 0..=100`).
 
 ### 2.7 Layout reflection  ⏳
 
@@ -260,6 +268,7 @@ rebase the rest (HANDOFF §1).
 | 2 | **Explicit discriminants** (`= n` + `e as int`) | the AST-shape change, landed early | **yes** | S | ✅ done |
 | 2b | **Struct-variant *syntax*** (`V { … }` named construct/match) | ergonomics; named fields already exist | **yes** | M | ⏳ |
 | 2.5 | **Recursive ADTs via `indirect`** + by-value-recursion guard | recursion already worked via tiers; `indirect` is the spelling | **yes** | S | ✅ done |
+| 2.6 | **`distinct` nominal types** (zero-cost typedef + `as` + let-enforcement) | `distinct` keyword; reuses casts | **yes** | S | ✅ done |
 | 3 | **Match power + Maranget exhaustiveness** | rests on #2's pattern shapes; largest | **yes** | L | ⏳ |
 | 4 | **Recursive ADTs (`indirect`)** | needs ref tiers (have); novel | small | M | ⏳ |
 | 5 | **`distinct` types** | isolated; keyword reserved | small | S | ⏳ |

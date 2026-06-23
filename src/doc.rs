@@ -385,6 +385,18 @@ fn collect_targets(ast: &Ast, src: &str) -> Vec<Target> {
                     }
                 }
             }
+            Item::Distinct(dd) => {
+                let vis = if dd.is_pub { "pub " } else { "" };
+                targets.push(Target {
+                    span: dd.span,
+                    kind: "distinct",
+                    name: dd.name.name.clone(),
+                    signature: format!("{vis}distinct {} = {}", dd.name.name, ty_str(ast, dd.base)),
+                    guarantees: Vec::new(),
+                    parent: None,
+                    doc: None,
+                });
+            }
             Item::Import(_) => {}
         }
     }

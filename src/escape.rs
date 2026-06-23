@@ -108,7 +108,7 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            Item::Enum(_) | Item::Const(_) | Item::Extern(_) | Item::Import(_) => {}
+            Item::Enum(_) | Item::Const(_) | Item::Distinct(_) | Item::Extern(_) | Item::Import(_) => {}
         }
     }
 

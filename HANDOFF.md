@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 208 tests pass, including `proptest` property
+and run (or are correctly rejected). 212 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -218,6 +218,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `option.jtr` | `42`, `7`, `5`, `-3`, `8` | **generic enums + in-language `Option`/`Result` (B)** — monomorphized per instantiation; inference from args/expected-type; `Option(*T)` inherits niche-opt (§5.34) |
 | `discriminants.jtr` | `1`, `2`, `4`, `7`, `2` | **explicit enum discriminants (B)** — `red = 1`; `e as i32` reads the tag; `match` still works by name (§5.35) |
 | `recursion.jtr` | `30`, `70` | **recursive ADTs via `indirect` (B)** — `node(left: indirect Tree, …)`; by-value recursion is a compile error (§5.36) |
+| `distinct.jtr` | `1001`, `42`, `7` | **distinct nominal types (B)** — `distinct UserId = i32`; zero-cost typedef; `as` to convert; mixing without `as` errors (§5.37) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -654,6 +655,22 @@ These are the non-obvious things that will bite if you don't know them.
     `examples/recursion.jtr` (`30, 70`). **Future:** tier-aware `indirect &[r]T` +
     auto-allocation on construction; the guard catches only *direct* self-reference (mutual
     / generic-by-value cycles fall to the C compiler).
+
+37. **`distinct` nominal types (design §2.6).** `distinct UserId = i32` →
+    `Item::Distinct(DistinctDecl)` + `TypeKindG::Distinct { base }` (registered in
+    phase 1, base lowered in phase 2; `is_copy` follows the base). It lowers to a
+    **zero-cost typedef** — `typedef int32_t Jestyr_UserId;` emitted in
+    `forward_types`; `c_type`/`c_ty_ast` for a `Named` distinct already return
+    `Jestyr_<Name>` (so no other cgen change), and the struct/enum/etc. passes skip it
+    (they match `Item::Struct`/`Item::Enum` specifically). Construct/extract with `as`
+    (`5 as UserId`, `uid as i32`). Enforcement: `typeck::distinct_mismatch` — a `let`
+    whose annotation is a distinct type rejects a non-matching initializer (suggest `as`);
+    scoped to fire *only when a distinct type is involved*, so the lenient checker is
+    untouched elsewhere. Demo `examples/distinct.jtr` (`1001, 42, 7`). **Limitation:**
+    enforcement covers `let` annotations only — call args / returns aren't type-checked
+    yet (lands with general arg-vs-param checking). **Adding a new `Item` variant** touches
+    ~8 exhaustive `match item` sites (typeck phases + build_owner + check_items, escape,
+    module `item_is_pub`, printer, doc) — the AST-shape tax, all additive.
 
 ---
 

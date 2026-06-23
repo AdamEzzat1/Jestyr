@@ -1,0 +1,23 @@
+// examples/distinct.jtr — distinct nominal types (enum/ADT step 2.6).
+//
+//   jestyrc run examples/distinct.jtr   →  1001, 42, 7
+//
+// `distinct T = Base` is a zero-cost nominal wrapper: identical representation to
+// `Base`, but *not* interchangeable with it (Haskell `newtype` / Odin `distinct`).
+// Conversions are explicit via `as` (and free). Mixing without a cast — e.g.
+// `var u: UserId = 5` or passing an `AccountId` where a `UserId` is expected — is
+// a compile error, so the two id spaces can't be confused.
+
+distinct UserId = i32
+distinct AccountId = i32
+
+fn whoami(u: UserId) -> i32 { u as i32 }
+
+fn main() -> i32 {
+    var u: UserId = 1001 as UserId
+    var acct: AccountId = 42 as AccountId
+    print_int(whoami(u))             // 1001
+    print_int(acct as i32)           // 42
+    print_int(whoami(7 as UserId))   // 7   (explicit, zero-cost conversion)
+    return 0
+}

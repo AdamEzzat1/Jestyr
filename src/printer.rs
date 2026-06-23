@@ -80,6 +80,9 @@ impl<'a> Printer<'a> {
                 let alias = im.alias.as_ref().map(|a| format!(" as {}", a.name)).unwrap_or_default();
                 self.line(d, &format!("import \"{}\"{}", im.path, alias));
             }
+            Item::Distinct(dd) => {
+                self.line(d, &format!("distinct {} = {}", dd.name.name, self.type_str(dd.base)));
+            }
         }
     }
 
