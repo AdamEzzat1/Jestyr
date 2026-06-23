@@ -115,6 +115,10 @@ pub enum PatKind {
     Wildcard,                                  // _
     Ident(Ident),                              // a binding, or a nullary variant like `none`
     Variant { name: Ident, subpats: Vec<PatId> }, // circle(r), rect(w, h)
+    /// A struct-variant pattern: `circle { r }`, `rect { w: 0.0, .. }`. Each field
+    /// names a binding (shorthand `r` ≡ `r: r`); `has_rest` (`..`) lets fields be
+    /// omitted. Matched by *name*, unlike the positional `Variant`.
+    StructVariant { name: Ident, fields: Vec<(Ident, PatId)>, has_rest: bool },
     /// A scalar literal pattern: `0`, `-3`, `'a'`, `true`. The `ExprId` is the
     /// literal expression, so cgen can re-emit it verbatim for the equality test.
     Lit(ExprId),

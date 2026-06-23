@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 244 tests pass, including `proptest` property
+and run (or are correctly rejected). 249 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -225,6 +225,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `rest_pat.jtr` | `1`, `2`, `7`, `0` | **`..` rest in variant patterns (§2.4)** — `click(x, ..)` binds `x`, ignores the rest; trailing-only; the binding loop just skips it (§5.41) |
 | `nested_match.jtr` | `0`, `1`, `2`, `99` | **nested pattern dispatch (§2.4)** — `node(leaf(_), leaf(_))`, `leaf(99)`; recursive `pat_test` if-chain, auto-deref through `indirect` (§5.43) |
 | `reflect.jtr` | `12`, `4`, `0`, `4`, `8` | **layout reflection (§2.7)** — `align_of(T)`→`_Alignof`, `offset_of(T, f)`→`offsetof`; compile-time intrinsics next to `size_of` (§5.44) |
+| `struct_variant.jtr` | `12.5664`, `12`, `0`, `9` | **struct-variant syntax (§2.3b)** — named construct `circle { r: 2.0 }` + named match `circle { r }`, `rect { w, .. }`; designated init / by-name dispatch (§5.45) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -820,6 +821,28 @@ These are the non-obvious things that will bite if you don't know them.
     Both are added to `is_intrinsic` (so a reference isn't mistaken for a closure capture).
     Makes a type's layout inspectable in-language — a seed for CTFE/reflection (workstream G).
     Demo [`examples/reflect.jtr`](examples/reflect.jtr) (`12, 4, 0, 4, 8`).
+
+45. **Struct-variant syntax — named construct + match (design §2.3b).** The brace counterpart
+    of the positional variant forms. **Construction** `circle { r: 2.0 }` reuses the existing
+    `ExprKind::StructLit` (it already parses): typeck's `StructLit` arm now checks `path` against
+    `table.variants` and types it via `variant_ctor_type` (source order taken as field order —
+    exact for non-generic, best-effort for generic); cgen's `StructLit` arm routes a variant
+    path to **`emit_struct_variant_construct`**, which emits a **designated** tagged-union literal
+    (`(Jestyr_Shape){ .tag = …_circle, .u.circle = { .j_r = 2.0 } }`) — handling niche/generic
+    like `emit_variant_construct`. **Patterns** `circle { r }` / `rect { w: 0.0, .. }` are a new
+    `PatKind::StructVariant { name, fields: Vec<(Ident, PatId)>, has_rest }` (shorthand `r` ≡
+    `r: r`, synthesized at parse time; `..` → `has_rest`), parsed from `Ident {` in pattern
+    position. They always **route through `emit_nested_match`** (`pat_needs_nesting` → true), where
+    `pat_test` resolves each field by name via the new `variant_field_by_name`. **Key gotcha:**
+    the typeck table stores enum-variant field *types* but **not names**, so named bindings are
+    typed **`Unknown`** in the checker (lenient — cgen projects the real field type from
+    `VariantInfo`), and exhaustiveness lowers a `StructVariant`'s fields as **wildcards**
+    (`Pat::Var(name, [Wild; arity])`) — coverage is by variant, named-sub-pattern nesting is
+    cgen-only. **AST-shape tax:** the new `PatKind` touched ~10 exhaustive `match pat` sites
+    (parser, typeck `bind_pattern_types`/`cover_pattern`/`lower_pat`/`collect_scalar_intervals`,
+    escape, printer, cgen `pat_test`/`pat_needs_nesting`/`pat_is_constructor` + two dead loop
+    arms). Demo [`examples/struct_variant.jtr`](examples/struct_variant.jtr)
+    (`12.5664, 12, 0, 9`).
 
 ---
 

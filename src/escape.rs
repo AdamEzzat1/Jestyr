@@ -571,6 +571,11 @@ impl<'a> Checker<'a> {
                     self.bind_pattern(ctx, *sp, is_borrow);
                 }
             }
+            PatKind::StructVariant { fields, .. } => {
+                for (_, sp) in fields {
+                    self.bind_pattern(ctx, *sp, is_borrow);
+                }
+            }
             PatKind::Lit(_) | PatKind::Range { .. } | PatKind::Rest => {}
             PatKind::Or(alts) => {
                 for sp in alts {

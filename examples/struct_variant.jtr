@@ -1,0 +1,36 @@
+// examples/struct_variant.jtr — struct-variant syntax (§2.3b): construct and match
+// enum variants by *named* field — `circle { r: 2.0 }` and `circle { r }`, the
+// brace counterpart of the positional `circle(2.0)` / `circle(r)`. Identical
+// representation; pure ergonomics.
+//
+// Run:  jestyrc run examples/struct_variant.jtr   →  prints 12.5664, 12, 0, 9
+
+enum Shape {
+    circle(r: f64),
+    rect(w: f64, h: f64),
+    dot,
+}
+
+fn area(read s: Shape) -> f64 {
+    match s {
+        circle { r }  => 3.14159 * r * r,
+        rect { w, h } => w * h,
+        dot           => 0.0,
+    }
+}
+
+// `..` binds a subset of a variant's fields.
+fn width(read s: Shape) -> f64 {
+    match s {
+        rect { w, .. } => w,    // bind w, ignore h
+        _              => 0.0,
+    }
+}
+
+fn main() -> i32 {
+    print_float(area(circle { r: 2.0 }))        // π·2² ≈ 12.5664
+    print_float(area(rect { w: 3.0, h: 4.0 }))  // 12
+    print_float(area(dot))                      // 0
+    print_float(width(rect { w: 9.0, h: 1.0 })) // 9
+    return 0
+}

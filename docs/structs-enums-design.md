@@ -134,7 +134,7 @@ unapplied substitution) aren't collected for monomorphization; generic-enum *met
 aren't supported; a true auto-imported prelude awaits the module system (today
 `Option`/`Result` are defined per-module or imported).
 
-### 2.3 Explicit discriminants ✅ DONE · struct-variant *syntax* ⏳ (mostly already present)
+### 2.3 Explicit discriminants ✅ DONE · struct-variant *syntax* ✅ DONE
 
 ```jestyr
 enum Color { red = 1, green = 2, blue = 4 }   // explicit discriminants (done)
@@ -148,12 +148,14 @@ enum Shape { circle(r: f64), rect(w: f64, h: f64) }  // named fields — already
   enum has no tag and keeps the pointer cast). Demo
   [`examples/discriminants.jtr`](../examples/discriminants.jtr) (`1, 2, 4, 7, 2`).
   *Note:* variant names can't be language keywords (`red`, not `read`).
-- **Struct variants are *already* here in substance.** Jestyr variants carry **named
-  fields** today via the paren form `circle(r: f64)` (`EnumVariant.fields` is
-  `Vec<(Ident, TypeId)>`). What's *not* yet supported is **named construction/projection**
-  (`circle { r: 2.0 }` / `match { circle { r } => }`) — construction and binding are
-  positional. Adding the brace grammar + named binding is the remaining, optional polish
-  (it adds ergonomics, not capability). Deferred as lower-value than §2.4.
+- **Struct-variant *syntax* — landed (§2.3b).** Named **construction** `circle { r: 2.0 }`
+  (reuses `ExprKind::StructLit`; a designated tagged-union initializer in cgen) and named
+  **patterns** `circle { r }` / `rect { w: 0.0, .. }` (a new `PatKind::StructVariant`, routed
+  through the recursive `pat_test` matcher). Shorthand `{ r }` ≡ `{ r: r }`; `..` omits fields.
+  Identical representation to the positional form — pure ergonomics. Demo
+  [`examples/struct_variant.jtr`](../examples/struct_variant.jtr); HANDOFF §5.45. **Caveat:**
+  the typeck table lacks enum-variant field names, so named bindings are typed leniently
+  (`Unknown`) while cgen projects the real type — a name→type table entry would tighten it.
 - **A `: <int-type>` repr** (choosing the tag's integer width, e.g. `enum Color : u8`)
   is a separate small follow-up — pairs with a `@repr(u8)` attribute slotting next to
   `@layout` in the registry.
@@ -309,7 +311,7 @@ rebase the rest (HANDOFF §1).
 | 1b-shape | **Generic enum AST + parser + frontend** | the high-conflict shape, landed early; templates skipped, use diagnoses | **yes** | M | ✅ done |
 | 1b-codegen | **Generic-enum monomorphization + inference + in-language `Option`/`Result`** | the codegen completion; inherits 1a's niche opt | no | M–L | ✅ done |
 | 2 | **Explicit discriminants** (`= n` + `e as int`) | the AST-shape change, landed early | **yes** | S | ✅ done |
-| 2b | **Struct-variant *syntax*** (`V { … }` named construct/match) | ergonomics; named fields already exist | **yes** | M | ⏳ |
+| 2b | **Struct-variant *syntax*** (`V { … }` named construct/match) | ergonomics; named fields already exist | **yes** | M | ✅ done |
 | 2.5 | **Recursive ADTs via `indirect`** + by-value-recursion guard | recursion already worked via tiers; `indirect` is the spelling | **yes** | S | ✅ done |
 | 2.6 | **`distinct` nominal types** (zero-cost typedef + `as` + let-enforcement) | `distinct` keyword; reuses casts | **yes** | S | ✅ done |
 | 3 | **Match power + Maranget exhaustiveness** | rests on #2's pattern shapes; largest | **yes** | L | ✅ guards/or/range/rest/Maranget-analysis; decision-tree cgen ⏳ |

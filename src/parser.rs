@@ -1320,6 +1320,37 @@ impl<'src> Parser<'src> {
             TokenKind::Ident => {
                 let t = self.bump();
                 let name = self.ident(t);
+                if self.at(LBrace) {
+                    // A struct-variant pattern `circle { r }` / `rect { w: 0.0, .. }`.
+                    self.bump();
+                    let mut fields = Vec::new();
+                    let mut has_rest = false;
+                    while !self.at(RBrace) && !self.at(Eof) {
+                        if self.at(DotDot) {
+                            self.bump();
+                            has_rest = true;
+                            break;
+                        }
+                        let ft = self.bump();
+                        let fname = self.ident(ft);
+                        let subpat = if self.eat(Colon) {
+                            self.parse_pattern()
+                        } else {
+                            // shorthand: `{ r }` binds the field to a variable `r`
+                            self.ast.pat(PatKind::Ident(fname.clone()), fname.span)
+                        };
+                        fields.push((fname, subpat));
+                        if !self.eat(Comma) {
+                            break;
+                        }
+                    }
+                    let end = self.cur().span;
+                    self.expect(RBrace, "`}`");
+                    return self.ast.pat(
+                        PatKind::StructVariant { name, fields, has_rest },
+                        span.to(end),
+                    );
+                }
                 if self.at(LParen) {
                     self.bump();
                     let mut subpats = Vec::new();
@@ -1596,6 +1627,53 @@ mod tests {
             "enum E { c(x: i32, y: i32) } fn f(read e: E) -> i32 { match e { c(.., y) => y } }",
         );
         assert!(d.iter().any(|x| x.message.contains("last field")), "{:?}", d);
+    }
+
+    #[test]
+    fn parses_struct_variant_pattern() {
+        let ast = parse_ok(
+            "enum S { circle(r: f64), dot } \
+             fn f(read s: S) -> f64 { match s { circle { r } => r, dot => 0.0 } }",
+        );
+        let arms = ast
+            .exprs
+            .iter()
+            .find_map(|e| match &e.kind {
+                ExprKind::Match { arms, .. } => Some(arms.clone()),
+                _ => None,
+            })
+            .expect("a match expression");
+        match &ast.pat_at(arms[0].pat).kind {
+            PatKind::StructVariant { name, fields, has_rest } => {
+                assert_eq!(name.name, "circle");
+                assert_eq!(fields.len(), 1);
+                assert!(!has_rest);
+            }
+            other => panic!("expected a struct-variant pattern, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_struct_variant_pattern_with_rest() {
+        let ast = parse_ok(
+            "enum S { rect(w: f64, h: f64) } \
+             fn f(read s: S) -> f64 { match s { rect { w, .. } => w } }",
+        );
+        let arms = ast
+            .exprs
+            .iter()
+            .find_map(|e| match &e.kind {
+                ExprKind::Match { arms, .. } => Some(arms.clone()),
+                _ => None,
+            })
+            .expect("a match expression");
+        match &ast.pat_at(arms[0].pat).kind {
+            PatKind::StructVariant { fields, has_rest, .. } => {
+                assert_eq!(fields.len(), 1, "only `w` is named");
+                assert!(has_rest, "`..` sets has_rest");
+            }
+            other => panic!("expected a struct-variant pattern, got {other:?}"),
+        }
     }
 
     #[test]

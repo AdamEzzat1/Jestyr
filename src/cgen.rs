@@ -1908,7 +1908,9 @@ impl<'a> Cgen<'a> {
                 }
                 // A bare `..` is only meaningful as a variant's last field, handled
                 // by the per-variant binding loop above — not as a whole arm.
-                PatKind::Rest => {}
+                // A struct-variant pattern is intercepted by `emit_nested_match`
+                // upstream — unreachable on the flat paths.
+                PatKind::Rest | PatKind::StructVariant { .. } => {}
                 PatKind::Error => {}
             }
         }
@@ -2045,7 +2047,9 @@ impl<'a> Cgen<'a> {
                         "literal/range patterns only apply to a scalar `match`",
                     );
                 }
-                PatKind::Rest => {}
+                // A struct-variant pattern is intercepted by `emit_nested_match`
+                // upstream — unreachable on the flat paths.
+                PatKind::Rest | PatKind::StructVariant { .. } => {}
                 PatKind::Error => {}
             }
         }
@@ -2201,6 +2205,8 @@ impl<'a> Cgen<'a> {
     fn pat_needs_nesting(&self, pat: PatId) -> bool {
         match &self.ast.pat_at(pat).kind {
             PatKind::Variant { subpats, .. } => subpats.iter().any(|sp| !self.is_flat_subpat(*sp)),
+            // A struct-variant pattern is always matched by name → the recursive path.
+            PatKind::StructVariant { .. } => true,
             PatKind::Or(alts) => alts.iter().any(|a| self.pat_needs_nesting(*a)),
             _ => false,
         }
@@ -2216,7 +2222,10 @@ impl<'a> Cgen<'a> {
 
     fn pat_is_constructor(&self, pat: PatId) -> bool {
         match &self.ast.pat_at(pat).kind {
-            PatKind::Variant { .. } | PatKind::Lit(_) | PatKind::Range { .. } => true,
+            PatKind::Variant { .. }
+            | PatKind::StructVariant { .. }
+            | PatKind::Lit(_)
+            | PatKind::Range { .. } => true,
             PatKind::Ident(n) => self.variants.contains_key(&n.name), // a nullary variant
             PatKind::Or(alts) => alts.iter().any(|a| self.pat_is_constructor(*a)),
             _ => false,
@@ -2280,6 +2289,31 @@ impl<'a> Cgen<'a> {
         Some((format!("{subject}.u.{vname}.j_{fname}"), fty))
     }
 
+    /// [`variant_field`] but selecting the field by *name* (for struct-variant
+    /// patterns `circle { r }`).
+    fn variant_field_by_name(
+        &mut self,
+        subject: &str,
+        subject_ty: &Ty,
+        vname: &str,
+        fieldname: &str,
+    ) -> Option<(String, Ty)> {
+        if let Some(n) = self.niche_of_ty(subject_ty) {
+            if vname == n.some_variant {
+                return Some((subject.to_string(), n.payload.clone()));
+            }
+            return None;
+        }
+        let vi = self.variants.get(vname)?.clone();
+        let (fname, fty_id) = vi.fields.iter().find(|(f, _)| f == fieldname)?;
+        let subst = match subject_ty {
+            Ty::GenEnum { ctor, args } => self.gen_enum_subst(ctor, args),
+            _ => HashMap::new(),
+        };
+        let fty = self.ast_type_to_ty(*fty_id, &subst);
+        Some((format!("{subject}.u.{vname}.j_{fname}"), fty))
+    }
+
     /// Compile a pattern to `(C boolean test, binding statements)` against the
     /// value at C-expression `subject` of type `subject_ty`. `"1"` means the
     /// pattern is irrefutable (a wildcard/binding). Recurses into sub-patterns,
@@ -2305,6 +2339,24 @@ impl<'a> Cgen<'a> {
                         self.variant_field(subject, subject_ty, &name.name, i)
                     {
                         let (t, b) = self.pat_test_auto(&fpath, &fty, *sp);
+                        if t != "1" {
+                            tests.push(t);
+                        }
+                        binds.extend(b);
+                    }
+                }
+                (tests.join(" && "), binds)
+            }
+            PatKind::StructVariant { name, fields, .. } => {
+                // Like `Variant`, but fields are matched by name (omitted fields and
+                // `..` are simply not tested/bound).
+                let mut tests = vec![self.variant_tag_test(subject, subject_ty, &name.name)];
+                let mut binds = vec![];
+                for (fname, subpat) in fields {
+                    if let Some((fpath, fty)) =
+                        self.variant_field_by_name(subject, subject_ty, &name.name, &fname.name)
+                    {
+                        let (t, b) = self.pat_test_auto(&fpath, &fty, *subpat);
                         if t != "1" {
                             tests.push(t);
                         }
@@ -2421,6 +2473,72 @@ impl<'a> Cgen<'a> {
             .items
             .iter()
             .any(|it| matches!(it, Item::Enum(e) if e.name.name == name && e.is_generic()))
+    }
+
+    /// Construct an enum variant from a *named*-field literal, `circle { r: 2.0 }`.
+    /// Like [`emit_variant_construct`] but the fields are designated by name (so
+    /// order doesn't matter and the niche/generic cases are handled the same way).
+    fn emit_struct_variant_construct(
+        &mut self,
+        id: ExprId,
+        vname: &str,
+        fields: &[FieldInit],
+    ) -> String {
+        let vi = match self.variants.get(vname).cloned() {
+            Some(v) => v,
+            None => return "0".to_string(),
+        };
+        // A generic-enum instance: the instantiation comes from the inferred type.
+        if let Ty::GenEnum { ctor, args } = self.info.type_of(id).clone() {
+            if !args.iter().all(Self::is_concrete) {
+                let sp = self.ast.expr_at(id).span;
+                self.diag(sp, format!("cannot infer the type arguments of generic enum `{ctor}` here"));
+                return "0".to_string();
+            }
+            if let Some(n) = self.niche_enum_instance(&ctor, &args) {
+                if vname == n.some_variant {
+                    return fields.first().map(|fi| self.emit_expr(fi.value)).unwrap_or_else(|| "0".to_string());
+                }
+                let pcty = self.c_type(&n.payload);
+                return format!("(({pcty})0)");
+            }
+            let cname = self.gen_struct_c_name(&ctor, &args);
+            return self.struct_variant_literal(&cname, &cname, vname, fields);
+        }
+        // A niche-optimized (non-generic) enum: the value *is* the payload pointer.
+        if let Some(n) = self.niche_enum_named(&vi.enum_name) {
+            if vname == n.some_variant {
+                return fields.first().map(|fi| self.emit_expr(fi.value)).unwrap_or_else(|| "0".to_string());
+            }
+            let cty = self.c_type(&n.payload);
+            return format!("(({cty})0)");
+        }
+        let prefix = format!("Jestyr_{}", vi.enum_name);
+        self.struct_variant_literal(&prefix, &prefix, vname, fields)
+    }
+
+    /// Emit a tagged-union literal with designated field initializers.
+    fn struct_variant_literal(
+        &mut self,
+        cname: &str,
+        prefix: &str,
+        vname: &str,
+        fields: &[FieldInit],
+    ) -> String {
+        let mut s = format!("({cname}){{ .tag = {prefix}_{vname}");
+        if !fields.is_empty() {
+            let _ = write!(s, ", .u.{vname} = {{ ");
+            for (i, fi) in fields.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                let v = self.emit_expr(fi.value);
+                let _ = write!(s, ".j_{} = {v}", fi.name.name);
+            }
+            s.push_str(" }");
+        }
+        s.push_str(" }");
+        s
     }
 
     fn emit_variant_construct(
@@ -2632,6 +2750,11 @@ impl<'a> Cgen<'a> {
                 if path.name == "Self" {
                     self.diag(span, "the C backend does not support `Self { .. }` (methods) yet");
                     return "0".to_string();
+                }
+                // `circle { r: 2.0 }` — a *struct-variant construction*: the path is
+                // an enum variant, not a struct type.
+                if self.variants.contains_key(&path.name) {
+                    return self.emit_struct_variant_construct(id, &path.name, fields);
                 }
                 let mut s = format!("(Jestyr_{}){{ ", path.name);
                 for (i, fi) in fields.iter().enumerate() {
@@ -5604,6 +5727,23 @@ mod tests {
             c.contains(".u.node.j_r).tag == Jestyr_Tree_leaf"),
             "right child too: {c}"
         );
+    }
+
+    #[test]
+    fn struct_variant_construction_and_match() {
+        let src = "enum S { circle(r: f64), dot } \
+                   fn mk() -> S { circle { r: 2.0 } } \
+                   fn area(read s: S) -> f64 { match s { circle { r } => r, dot => 0.0 } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        // Named construction → a designated tagged-union initializer.
+        assert!(
+            c.contains(".tag = Jestyr_S_circle, .u.circle = { .j_r = "),
+            "named construction: {c}"
+        );
+        // Named match → field projection by name.
+        assert!(c.contains("jm_0.tag == Jestyr_S_circle"), "tag test: {c}");
+        assert!(c.contains("double j_r = jm_0.u.circle.j_r;"), "named field binding: {c}");
     }
 
     #[test]

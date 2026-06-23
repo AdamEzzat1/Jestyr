@@ -1079,11 +1079,15 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             ExprKind::StructLit { path, fields } => {
-                for fi in fields {
-                    self.infer(scope, typ, self_ty, fi.value);
-                }
+                let arg_tys: Vec<Ty> =
+                    fields.iter().map(|fi| self.infer(scope, typ, self_ty, fi.value)).collect();
                 if path.name == "Self" {
                     self_ty.clone()
+                } else if let Some(&ei) = self.table.variants.get(&path.name) {
+                    // `circle { r: 2.0 }` — a struct-variant construction (the path is
+                    // an enum variant, not a struct type). Reuse the positional
+                    // inference (source order is taken as field order).
+                    self.variant_ctor_type(ei, &path.name, &arg_tys)
                 } else if let Some(&i) = self.table.type_index.get(&path.name) {
                     Ty::Named(i)
                 } else {
@@ -1311,6 +1315,14 @@ impl<'a> TypeChecker<'a> {
                 for (i, sp) in subpats.iter().enumerate() {
                     let fty = ftys.get(i).cloned().unwrap_or(Ty::Unknown);
                     self.bind_pattern_types(scope, &fty, *sp);
+                }
+            }
+            PatKind::StructVariant { fields, .. } => {
+                // The table doesn't carry enum-variant field *names*, so the named
+                // bindings are typed leniently (`Unknown`) — cgen still projects the
+                // concrete field type from the variant declaration.
+                for (_, sp) in fields {
+                    self.bind_pattern_types(scope, &Ty::Unknown, *sp);
                 }
             }
             // Scalar patterns and `..` rest bind nothing.
@@ -1735,6 +1747,13 @@ impl<'a> TypeChecker<'a> {
                 }
                 Pat::Var(name.name.clone(), args)
             }
+            PatKind::StructVariant { name, .. } => {
+                // For usefulness, a struct-variant covers its variant; the named
+                // field patterns are treated as wildcards (named-field dispatch
+                // lives in cgen; nested constructors-in-named are rare and lenient).
+                let arity = self.variant_field_types(&name.name).len();
+                Pat::Var(name.name.clone(), vec![Pat::Wild; arity])
+            }
             PatKind::Lit(e) => match self.eval_pat_int(*e) {
                 Some(v) => Pat::Int(v),
                 None => Pat::Wild, // un-evaluable literal: treat conservatively
@@ -1780,7 +1799,7 @@ impl<'a> TypeChecker<'a> {
                     self.collect_scalar_intervals(*p, out, full);
                 }
             }
-            PatKind::Variant { .. } | PatKind::Error => {}
+            PatKind::Variant { .. } | PatKind::StructVariant { .. } | PatKind::Error => {}
         }
     }
 
@@ -2208,6 +2227,26 @@ mod tests {
         let src = "fn f(read x: u8) -> i32 { match x { 0..=255 => 1 } }";
         let (_i, d) = analyze(src);
         assert!(d.iter().all(|x| !x.is_error()), "0..=255 covers u8: {:?}", d);
+    }
+
+    #[test]
+    fn struct_variant_match_is_exhaustive_by_variant() {
+        let src = "enum S { a(x: i32), b } \
+                   fn f(read s: S) -> i32 { match s { a { x } => x, b => 0 } }";
+        let (_i, d) = analyze(src);
+        assert!(d.iter().all(|x| !x.is_error()), "named arms cover both variants: {:?}", d);
+    }
+
+    #[test]
+    fn struct_variant_match_missing_variant_is_non_exhaustive() {
+        let src = "enum S { a(x: i32), b } \
+                   fn f(read s: S) -> i32 { match s { a { x } => x } }";
+        let (_i, d) = analyze(src);
+        assert!(
+            d.iter().any(|x| x.is_error() && x.message.contains("non-exhaustive")),
+            "{:?}",
+            d
+        );
     }
 
     #[test]
