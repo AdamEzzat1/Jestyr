@@ -1,0 +1,29 @@
+// examples/discriminants.jtr — explicit enum discriminants (enum/ADT step 2).
+//
+//   jestyrc run examples/discriminants.jtr   →  1, 2, 4, 7, 2
+//
+// A variant may carry an explicit integer tag (`= n`) — for C-ABI enums, bit
+// flags, and stable wire formats (the Rust/Swift "raw value"). `e as i32` reads
+// the discriminant (the tag); `match` still dispatches by variant name, so the
+// two coexist. (Variant names can't be language keywords — so `red`, not `read`.)
+
+enum Color { red = 1, green = 2, blue = 4 }
+
+fn bits(c: Color) -> i32 { c as i32 }
+
+fn name_len(c: Color) -> i32 {
+    match c {
+        red   => 3,
+        green => 5,
+        blue  => 4,
+    }
+}
+
+fn main() -> i32 {
+    print_int(bits(red))                          // 1
+    print_int(bits(green))                        // 2
+    print_int(bits(blue))                         // 4
+    print_int(bits(red) + bits(green) + bits(blue)) // 7  (1 + 2 + 4)
+    print_int(name_len(green) - 3)                // 2  (match still works)
+    return 0
+}

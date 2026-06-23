@@ -486,6 +486,20 @@ impl<'a> Cgen<'a> {
         Some(NicheInfo { none_variant: none_variant?, some_variant, payload })
     }
 
+    /// Does this type lower to a tagged-union enum (has a `.tag` field)? True for a
+    /// plain or generic enum that is *not* niche-optimized (a niche enum is a bare
+    /// pointer with no tag). Used to read an enum's discriminant via `e as int`.
+    fn is_tagged_enum(&self, t: &Ty) -> bool {
+        match t {
+            Ty::Named(i) => {
+                matches!(self.info.table.types[*i].kind, TypeKindG::Enum { .. })
+                    && self.niche_enum_at(*i).is_none()
+            }
+            Ty::GenEnum { ctor, args } => self.niche_enum_instance(ctor, args).is_none(),
+            _ => false,
+        }
+    }
+
     /// The type-param → arg substitution for a generic enum instance `ctor(args)`.
     fn gen_enum_subst(&self, ctor: &str, args: &[Ty]) -> HashMap<String, Ty> {
         self.ast
@@ -528,10 +542,17 @@ impl<'a> Cgen<'a> {
                 {
                     continue;
                 }
-                let en = &e.name.name;
+                let en = e.name.name.clone();
                 self.raw(format!("enum Jestyr_{en}_tag {{\n"));
                 for v in &e.variants {
-                    self.raw(format!("    Jestyr_{en}_{},\n", v.name.name));
+                    // An explicit discriminant sets the tag's integer value.
+                    match v.discriminant {
+                        Some(d) => {
+                            let val = self.emit_expr(d);
+                            self.raw(format!("    Jestyr_{en}_{} = {val},\n", v.name.name));
+                        }
+                        None => self.raw(format!("    Jestyr_{en}_{},\n", v.name.name)),
+                    }
                 }
                 self.raw("};\n");
 
@@ -937,7 +958,13 @@ impl<'a> Cgen<'a> {
         let cname = self.gen_struct_c_name(ctor, args);
         self.raw(format!("enum {cname}_tag {{\n"));
         for v in &e.variants {
-            self.raw(format!("    {cname}_{},\n", v.name.name));
+            match v.discriminant {
+                Some(d) => {
+                    let val = self.emit_expr(d);
+                    self.raw(format!("    {cname}_{} = {val},\n", v.name.name));
+                }
+                None => self.raw(format!("    {cname}_{},\n", v.name.name)),
+            }
         }
         self.raw("};\n");
         self.raw(format!("struct {cname} {{\n"));
@@ -1934,8 +1961,15 @@ impl<'a> Cgen<'a> {
             }
             ExprKind::Cast { expr, ty } => {
                 let cty = self.c_ty_ast(*ty);
+                let src_ty = self.info.type_of(*expr).clone();
                 let e = self.emit_expr(*expr);
-                format!("({cty})({e})")
+                // Casting a tagged enum to an integer reads its discriminant
+                // (the tag), which carries any explicit `= value`.
+                if self.is_tagged_enum(&src_ty) {
+                    format!("({cty})(({e}).tag)")
+                } else {
+                    format!("({cty})({e})")
+                }
             }
             ExprKind::Deref { base } => {
                 let bt = self.info.type_of(*base).clone();
@@ -4890,6 +4924,18 @@ mod tests {
         assert!(c.contains("int32_t jestyr_get(int32_t* j_o)"), "instance is a bare pointer: {c}");
         assert!(c.contains("!= ((int32_t*)0)"), "match is a null test: {c}");
         assert!(!c.contains("Jestyr_Option__pmut"), "no tagged union for the niche instance: {c}");
+    }
+
+    #[test]
+    fn lowers_explicit_discriminants_and_reads_them_via_cast() {
+        let src = "enum Color { red = 1, green = 2, blue = 4 } \
+                   fn v(c: Color) -> i32 { c as i32 } \
+                   fn main() -> i32 { return v(green) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("Jestyr_Color_red = 1,"), "explicit discriminant in tag enum: {c}");
+        assert!(c.contains("Jestyr_Color_blue = 4,"), "{c}");
+        assert!(c.contains(").tag)"), "`c as i32` reads the discriminant (the tag): {c}");
     }
 
     #[test]

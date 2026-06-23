@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 202 tests pass, including `proptest` property
+and run (or are correctly rejected). 205 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -216,6 +216,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `records.jtr` | `3`, `4`, `25` | **immutable `record` (B)** — struct/record split; field assignment is a static error; lowers to a plain struct (§5.32) |
 | `niche.jtr` | `8`, `42`, `0` | **niche optimization (B)** — `enum {none, some(*T)}` lowers to a bare pointer (`none`=NULL); `size_of`==pointer size; match→null-test (§5.33) |
 | `option.jtr` | `42`, `7`, `5`, `-3`, `8` | **generic enums + in-language `Option`/`Result` (B)** — monomorphized per instantiation; inference from args/expected-type; `Option(*T)` inherits niche-opt (§5.34) |
+| `discriminants.jtr` | `1`, `2`, `4`, `7`, `2` | **explicit enum discriminants (B)** — `red = 1`; `e as i32` reads the tag; `match` still works by name (§5.35) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -624,6 +625,20 @@ These are the non-obvious things that will bite if you don't know them.
     call arguments** (`or_else(none, 5)` resolves `none` from the param type). **Limitations
     (follow-ups):** generic enums used only *inside a generic function body* aren't
     collected; generic-enum *methods* and a true auto-prelude are future work.
+
+35. **Explicit enum discriminants (design §2.3).** `EnumVariant.discriminant:
+    Option<ExprId>` (the AST-shape change), parsed as `= <expr>` after a variant
+    (`enum Color { red = 1, green = 2 }`). cgen emits `Jestyr_<E>_<v> = <value>` in the
+    tag enum — for both plain enums (`enum_defs`) and generic instances
+    (`emit_enum_instance`). Reading a discriminant: `e as i32` extracts the tag —
+    `cgen`'s `Cast` arm emits `(int)((e).tag)` when `is_tagged_enum(src)` (a non-niche
+    Named/`GenEnum`); a niche enum has no tag so it keeps the plain pointer cast. The
+    `match` switch is unchanged (it dispatches on the named tag constant, which now just
+    has an explicit value). **Gotcha:** a variant name can't be a language keyword
+    (`read`/`mut`/`in`/… are reserved) — use `red`, not `read`. Demo
+    `examples/discriminants.jtr` (`1, 2, 4, 7, 2`). **Not yet:** a `: <int>` tag-width
+    repr (`enum Color : u8`), and brace struct-variant *syntax* (`V { x }` named
+    construct/match — named *fields* already exist via `V(x: T)`).
 
 ---
 

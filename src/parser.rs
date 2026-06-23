@@ -397,7 +397,22 @@ impl<'src> Parser<'src> {
                 }
                 self.expect(RParen, "`)`");
             }
-            variants.push(EnumVariant { name: vname, fields, span: vstart.to(self.prev_span()) });
+            // Optional explicit discriminant: `red = 1`.
+            let discriminant = if self.eat(Eq) {
+                let saved = self.no_struct;
+                self.no_struct = true; // a trailing `{` is the next item, not a struct literal
+                let d = self.parse_expr();
+                self.no_struct = saved;
+                Some(d)
+            } else {
+                None
+            };
+            variants.push(EnumVariant {
+                name: vname,
+                fields,
+                discriminant,
+                span: vstart.to(self.prev_span()),
+            });
             if self.pos == before {
                 self.bump();
             }
@@ -1421,6 +1436,20 @@ mod tests {
         // A plain enum has no type parameters.
         let p = parse_ok("enum Color { red, green }");
         assert!(matches!(&p.items[0], Item::Enum(e) if !e.is_generic()));
+    }
+
+    #[test]
+    fn parses_explicit_enum_discriminants() {
+        let ast = parse_ok("enum Color { red = 1, green = 2, blue = 4 }");
+        match &ast.items[0] {
+            Item::Enum(e) => {
+                assert!(e.variants.iter().all(|v| v.discriminant.is_some()), "all have `= n`");
+            }
+            _ => panic!("expected an enum item"),
+        }
+        // No `= n` → no discriminant.
+        let p = parse_ok("enum E { a, b }");
+        assert!(matches!(&p.items[0], Item::Enum(e) if e.variants[0].discriminant.is_none()));
     }
 
     #[test]

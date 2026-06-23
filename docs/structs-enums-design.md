@@ -134,26 +134,29 @@ unapplied substitution) aren't collected for monomorphization; generic-enum *met
 aren't supported; a true auto-imported prelude awaits the module system (today
 `Option`/`Result` are defined per-module or imported).
 
-### 2.3 Struct-variant enums + explicit discriminants  ⏳
+### 2.3 Explicit discriminants ✅ DONE · struct-variant *syntax* ⏳ (mostly already present)
 
 ```jestyr
-enum Shape {
-    circle { r: f64 },
-    rect   { w: f64, h: f64 },
-}
-enum Color : u8 { red = 1, green = 2, blue = 4 }   // raw-value discriminants
+enum Color { red = 1, green = 2, blue = 4 }   // explicit discriminants (done)
+enum Shape { circle(r: f64), rect(w: f64, h: f64) }  // named fields — already supported
 ```
 - **Inspiration:** Rust struct variants; Swift/Rust raw values; Ada discriminated records.
-- **Struct variants:** `EnumVariant.fields` is *already* `Vec<(Ident, TypeId)>` in the
-  AST — the names exist; the parser just needs a `{ field: T, … }` variant grammar
-  alongside the positional `(T, …)` form, and `match` needs `circle { r }` patterns
-  (field shorthand). Mostly parser + a match-pattern arm.
-- **Explicit discriminants:** an optional `: <int-type>` on the enum sets the
-  discriminant representation, and `= n` pins a variant's tag (Ada/Rust). Lowers to a C
-  enum/`switch` on the chosen integer type; pairs with a `@repr(u8)`-style attribute
-  (reuse the attribute registry — `@repr` slots next to `@layout`).
-- **Conflict note:** this is the AST-shape change of the batch (variant payload grammar)
-  → **land it early** so other enum work rebases on it (HANDOFF §1 strategy).
+- **Explicit discriminants — landed.** `EnumVariant.discriminant: Option<ExprId>` (the
+  AST-shape change), parsed as `= <expr>` after a variant. cgen emits `Jestyr_E_<v> = n`
+  in the tag enum (both plain and generic-instance tag enums), and `e as i32` reads the
+  discriminant by extracting `.tag` (`cgen::is_tagged_enum` gates the rewrite; a niche
+  enum has no tag and keeps the pointer cast). Demo
+  [`examples/discriminants.jtr`](../examples/discriminants.jtr) (`1, 2, 4, 7, 2`).
+  *Note:* variant names can't be language keywords (`red`, not `read`).
+- **Struct variants are *already* here in substance.** Jestyr variants carry **named
+  fields** today via the paren form `circle(r: f64)` (`EnumVariant.fields` is
+  `Vec<(Ident, TypeId)>`). What's *not* yet supported is **named construction/projection**
+  (`circle { r: 2.0 }` / `match { circle { r } => }`) — construction and binding are
+  positional. Adding the brace grammar + named binding is the remaining, optional polish
+  (it adds ergonomics, not capability). Deferred as lower-value than §2.4.
+- **A `: <int-type>` repr** (choosing the tag's integer width, e.g. `enum Color : u8`)
+  is a separate small follow-up — pairs with a `@repr(u8)` attribute slotting next to
+  `@layout` in the registry.
 
 ### 2.4 Match power + Maranget exhaustiveness  ⏳ (largest)
 
@@ -244,7 +247,8 @@ rebase the rest (HANDOFF §1).
 | 1a | **Niche optimization** (optional thin pointers) | flagship "transparent cost"; no shape change | no | M | ✅ done |
 | 1b-shape | **Generic enum AST + parser + frontend** | the high-conflict shape, landed early; templates skipped, use diagnoses | **yes** | M | ✅ done |
 | 1b-codegen | **Generic-enum monomorphization + inference + in-language `Option`/`Result`** | the codegen completion; inherits 1a's niche opt | no | M–L | ✅ done |
-| 2 | **Struct-variant enums + explicit discriminants** | the AST-shape change → land early | **yes** | M | ⏳ |
+| 2 | **Explicit discriminants** (`= n` + `e as int`) | the AST-shape change, landed early | **yes** | S | ✅ done |
+| 2b | **Struct-variant *syntax*** (`V { … }` named construct/match) | ergonomics; named fields already exist | **yes** | M | ⏳ |
 | 3 | **Match power + Maranget exhaustiveness** | rests on #2's pattern shapes; largest | **yes** | L | ⏳ |
 | 4 | **Recursive ADTs (`indirect`)** | needs ref tiers (have); novel | small | M | ⏳ |
 | 5 | **`distinct` types** | isolated; keyword reserved | small | S | ⏳ |

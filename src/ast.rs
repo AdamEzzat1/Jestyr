@@ -349,6 +349,10 @@ pub struct StructBody {
 pub struct EnumVariant {
     pub name: Ident,
     pub fields: Vec<(Ident, TypeId)>,
+    /// An explicit discriminant, e.g. `red = 1` (design §7; Rust/Swift raw values).
+    /// Sets the variant's integer tag value — for C-ABI enums, bit flags, and
+    /// stable wire formats. `None` lets C assign it sequentially.
+    pub discriminant: Option<ExprId>,
     pub span: Span,
 }
 
