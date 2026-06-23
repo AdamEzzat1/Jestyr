@@ -127,12 +127,12 @@ use diagnoses).
    `enum Result(T, E) { ok(v: T), err(e: E) }` are ordinary source now (no hardcoding).
    Demo [`examples/option.jtr`](../examples/option.jtr) (`42, 7, 5, -3, 8`).
 
-**Documented limitations (follow-ups):** instantiation inference covers `let`/`return`
-but **not call arguments** (`get(none)` can't infer — pass a typed binding, or write
-`some(…)`); generic enums used only *inside a generic function body* (under an unapplied
-substitution) aren't collected for monomorphization; generic-enum *methods* aren't
-supported; a true auto-imported prelude awaits the module system (today `Option`/`Result`
-are defined per-module or imported).
+**Instantiation inference** covers `let` annotations, `return`, **and call arguments**
+(`or_else(none, 5)` types `none` from the parameter's type). **Remaining limitations
+(follow-ups):** generic enums used only *inside a generic function body* (under an
+unapplied substitution) aren't collected for monomorphization; generic-enum *methods*
+aren't supported; a true auto-imported prelude awaits the module system (today
+`Option`/`Result` are defined per-module or imported).
 
 ### 2.3 Struct-variant enums + explicit discriminants  ⏳
 

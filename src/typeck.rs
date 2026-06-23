@@ -892,8 +892,19 @@ impl<'a> TypeChecker<'a> {
                     _ => None,
                 };
                 self.infer(scope, typ, self_ty, *callee);
-                for a in args {
+                // Each argument is inferred with its parameter type as the expected
+                // type, so a nullary generic variant resolves: `get(none)` where
+                // `get(o: Option(i32), …)` types `none` as `Option(i32)`.
+                let param_tys: Vec<Ty> = callee_name
+                    .as_ref()
+                    .and_then(|n| self.table.fns.get(n))
+                    .map(|sig| sig.params.iter().map(|p| p.ty.clone()).collect())
+                    .unwrap_or_default();
+                for (i, a) in args.iter().enumerate() {
+                    let prev = self.cur_expected.take();
+                    self.cur_expected = param_tys.get(i).cloned();
                     self.infer(scope, typ, self_ty, *a);
+                    self.cur_expected = prev;
                 }
                 if let Some(name) = callee_name {
                     self.check_visibility(&name, span);

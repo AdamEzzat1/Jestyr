@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 201 tests pass, including `proptest` property
+and run (or are correctly rejected). 202 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -620,10 +620,10 @@ These are the non-obvious things that will bite if you don't know them.
       `GenEnum` type; `emit_match` carries `(tag_prefix, subst)` so payload bindings get
       their concrete C type. `niche_enum_instance` runs the niche rule on the substituted
       templates, so `Option(*T)`/`Option(&[r]T)` inherit §5.33 niche-opt (a bare pointer).
-    Demo `examples/option.jtr` (`42, 7, 5, -3, 8`). **Limitations (follow-ups):**
-    inference doesn't cover *call arguments* (`get(none)` — pass a typed binding); generic
-    enums used only *inside a generic function body* aren't collected; generic-enum
-    *methods* and a true auto-prelude are future work.
+    Demo `examples/option.jtr` (`42, 7, 5, -3, 8`). Inference covers `let`/`return` **and
+    call arguments** (`or_else(none, 5)` resolves `none` from the param type). **Limitations
+    (follow-ups):** generic enums used only *inside a generic function body* aren't
+    collected; generic-enum *methods* and a true auto-prelude are future work.
 
 ---
 

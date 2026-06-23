@@ -4869,6 +4869,18 @@ mod tests {
     }
 
     #[test]
+    fn infers_a_nullary_generic_variant_from_a_call_argument() {
+        // `none` in argument position resolves to the parameter's instantiation.
+        let src = "enum Option(T) { none, some(v: T) } \
+                   fn or_else(o: Option(i32), d: i32) -> i32 { match o { some(v) => v, none => d } } \
+                   fn main() -> i32 { return or_else(none, 5) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        // `none` constructed the parameter's instance (not an unresolved template).
+        assert!(c.contains("Jestyr_Option__i32_none"), "none → the param instance: {c}");
+    }
+
+    #[test]
     fn generic_enum_instance_inherits_niche_optimization() {
         // Option(*mut i32) is one nullary + one thin-pointer variant → bare pointer.
         let src = "enum Option(T) { none, some(v: T) } \
