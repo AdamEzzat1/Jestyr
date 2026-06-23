@@ -211,7 +211,7 @@ impl<'a> Checker<'a> {
                 }
                 return;
             }
-            ExprKind::StructLit { path, fields } => {
+            ExprKind::StructLit { path, fields, spread } => {
                 for fi in fields {
                     self.walk_expr(ctx, fi.value, false);
                     if self.escapes_as(ctx, fi.value) {
@@ -224,6 +224,9 @@ impl<'a> Checker<'a> {
                             ),
                         );
                     }
+                }
+                if let Some(s) = spread {
+                    self.walk_expr(ctx, *s, false);
                 }
                 return;
             }
@@ -671,7 +674,15 @@ impl<'a> Checker<'a> {
             ExprKind::Deref { base } => self.collect_names(*base, out),
             ExprKind::Try { base } => self.collect_names(*base, out),
             ExprKind::Cast { expr, .. } => self.collect_names(*expr, out),
-            ExprKind::StructLit { fields, .. } | ExprKind::GenStructLit { fields, .. } => {
+            ExprKind::StructLit { fields, spread, .. } => {
+                for f in fields {
+                    self.collect_names(f.value, out);
+                }
+                if let Some(s) = spread {
+                    self.collect_names(*s, out);
+                }
+            }
+            ExprKind::GenStructLit { fields, .. } => {
                 for f in fields {
                     self.collect_names(f.value, out);
                 }

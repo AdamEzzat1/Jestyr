@@ -973,7 +973,15 @@ impl<'src> Parser<'src> {
         let saved = self.no_struct;
         self.no_struct = false;
         let mut fields = Vec::new();
+        let mut spread = None;
         while !self.at(RBrace) && !self.at(Eof) {
+            // `..base` — a functional-update spread; takes the remaining fields from
+            // `base`. It is the final element of the literal.
+            if self.at(DotDot) {
+                self.bump();
+                spread = Some(self.parse_expr());
+                break;
+            }
             let before = self.pos;
             let name = self.eat_ident("field name");
             self.expect(Colon, "`:`");
@@ -989,7 +997,7 @@ impl<'src> Parser<'src> {
         let end = self.cur().span;
         self.expect(RBrace, "`}`");
         self.no_struct = saved;
-        self.ast.expr(ExprKind::StructLit { path, fields }, start.to(end))
+        self.ast.expr(ExprKind::StructLit { path, fields, spread }, start.to(end))
     }
 
     fn parse_gen_struct_lit(&mut self, ctor: Ident, type_args: Vec<ExprId>, start: Span) -> ExprId {
@@ -1627,6 +1635,16 @@ mod tests {
             "enum E { c(x: i32, y: i32) } fn f(read e: E) -> i32 { match e { c(.., y) => y } }",
         );
         assert!(d.iter().any(|x| x.message.contains("last field")), "{:?}", d);
+    }
+
+    #[test]
+    fn parses_struct_spread() {
+        let ast = parse_ok("struct P { x: i32, y: i32 } fn f(read p: P) -> P { P { x: 9, ..p } }");
+        let has_spread = ast
+            .exprs
+            .iter()
+            .any(|e| matches!(&e.kind, ExprKind::StructLit { spread: Some(_), .. }));
+        assert!(has_spread, "the `..p` functional-update spread was parsed");
     }
 
     #[test]

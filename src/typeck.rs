@@ -1078,9 +1078,12 @@ impl<'a> TypeChecker<'a> {
                     _ => Ty::Unknown,
                 }
             }
-            ExprKind::StructLit { path, fields } => {
+            ExprKind::StructLit { path, fields, spread } => {
                 let arg_tys: Vec<Ty> =
                     fields.iter().map(|fi| self.infer(scope, typ, self_ty, fi.value)).collect();
+                if let Some(s) = spread {
+                    self.infer(scope, typ, self_ty, *s);
+                }
                 if path.name == "Self" {
                     self_ty.clone()
                 } else if let Some(&ei) = self.table.variants.get(&path.name) {

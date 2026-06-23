@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 249 tests pass, including `proptest` property
+and run (or are correctly rejected). 251 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -226,6 +226,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `nested_match.jtr` | `0`, `1`, `2`, `99` | **nested pattern dispatch (§2.4)** — `node(leaf(_), leaf(_))`, `leaf(99)`; recursive `pat_test` if-chain, auto-deref through `indirect` (§5.43) |
 | `reflect.jtr` | `12`, `4`, `0`, `4`, `8` | **layout reflection (§2.7)** — `align_of(T)`→`_Alignof`, `offset_of(T, f)`→`offsetof`; compile-time intrinsics next to `size_of` (§5.44) |
 | `struct_variant.jtr` | `12.5664`, `12`, `0`, `9` | **struct-variant syntax (§2.3b)** — named construct `circle { r: 2.0 }` + named match `circle { r }`, `rect { w, .. }`; designated init / by-name dispatch (§5.45) |
+| `spread.jtr` | `1`, `2`, `9`, `2`, `1`, `20` | **struct update / spread (§2.8)** — `Point { x: 9, ..p }` functional update; copy-then-override statement-expr (§5.46) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -843,6 +844,22 @@ These are the non-obvious things that will bite if you don't know them.
     escape, printer, cgen `pat_test`/`pat_needs_nesting`/`pat_is_constructor` + two dead loop
     arms). Demo [`examples/struct_variant.jtr`](examples/struct_variant.jtr)
     (`12.5664, 12, 0, 9`).
+
+46. **Struct update / spread `Point { x: 9, ..p }` (design §2.8, the first substrate win).**
+    `ExprKind::StructLit` gains a `spread: Option<ExprId>` (the `..base` source). Parsed in
+    `parse_struct_lit` (a leading `..` ends the field list). cgen lowers a spread to a GNU
+    **statement-expression** — `({ Jestyr_Point jss_0 = <base>; jss_0.j_x = 9; jss_0; })` —
+    copying the base then assigning the listed fields, so it stays an expression. Pairs with
+    immutable `record`: the synthesized field assignments live only in cgen, so they never trip
+    the typeck record-mutation check (the user wrote a *construction*, not an assignment).
+    **Watch-out (the §5.28 lesson):** `spread` is a new sub-expression, so the StructLit
+    destructures in escape (`walk_expr` + `collect_names`), printer, typeck, and the **four**
+    cgen walkers (`collect_structs_in_expr`, `find_closures_expr`, `collect_refs`,
+    `find_calls_expr`) all had to descend into it — and the combined `StructLit | GenStructLit`
+    walker arms were **split** (only `StructLit` carries `spread`). Demo
+    [`examples/spread.jtr`](examples/spread.jtr) (`1, 2, 9, 2, 1, 20`). **Remaining §2.8:** field
+    defaults (`x: i32 = 0`), per-field visibility (`pub x`), untagged `union`, bit-fields, opt-in
+    `Copy`.
 
 ---
 

@@ -796,9 +796,12 @@ impl<'a> Cgen<'a> {
                 self.collect_structs_in_expr(*expr, subst, seen, order);
             }
             ExprKind::Try { base } => self.collect_structs_in_expr(*base, subst, seen, order),
-            ExprKind::StructLit { fields, .. } => {
+            ExprKind::StructLit { fields, spread, .. } => {
                 for fi in fields {
                     self.collect_structs_in_expr(fi.value, subst, seen, order);
+                }
+                if let Some(s) = spread {
+                    self.collect_structs_in_expr(*s, subst, seen, order);
                 }
             }
             ExprKind::If { cond, then, els } => {
@@ -2746,7 +2749,7 @@ impl<'a> Cgen<'a> {
                     format!("(*{b})")
                 }
             }
-            ExprKind::StructLit { path, fields } => {
+            ExprKind::StructLit { path, fields, spread } => {
                 if path.name == "Self" {
                     self.diag(span, "the C backend does not support `Self { .. }` (methods) yet");
                     return "0".to_string();
@@ -2755,6 +2758,20 @@ impl<'a> Cgen<'a> {
                 // an enum variant, not a struct type.
                 if self.variants.contains_key(&path.name) {
                     return self.emit_struct_variant_construct(id, &path.name, fields);
+                }
+                // `Point { x: 9, ..p }` — functional update: copy `p`, then assign the
+                // listed fields. A GNU statement-expression keeps it an expression.
+                if let Some(sp) = spread {
+                    let base = self.emit_expr(*sp);
+                    let tmp = format!("jss_{}", self.tmp);
+                    self.tmp += 1;
+                    let mut s = format!("({{ Jestyr_{} {tmp} = {base}; ", path.name);
+                    for fi in fields {
+                        let v = self.emit_expr(fi.value);
+                        let _ = write!(s, "{tmp}.j_{} = {v}; ", fi.name.name);
+                    }
+                    let _ = write!(s, "{tmp}; }})");
+                    return s;
                 }
                 let mut s = format!("(Jestyr_{}){{ ", path.name);
                 for (i, fi) in fields.iter().enumerate() {
@@ -3308,7 +3325,15 @@ impl<'a> Cgen<'a> {
             ExprKind::Deref { base } | ExprKind::Try { base } => {
                 self.find_closures_expr(*base, found, seen)
             }
-            ExprKind::StructLit { fields, .. } | ExprKind::GenStructLit { fields, .. } => {
+            ExprKind::StructLit { fields, spread, .. } => {
+                for fi in fields {
+                    self.find_closures_expr(fi.value, found, seen);
+                }
+                if let Some(s) = spread {
+                    self.find_closures_expr(*s, found, seen);
+                }
+            }
+            ExprKind::GenStructLit { fields, .. } => {
                 for fi in fields {
                     self.find_closures_expr(fi.value, found, seen);
                 }
@@ -3417,7 +3442,15 @@ impl<'a> Cgen<'a> {
                 self.collect_refs(*index, out);
             }
             ExprKind::Deref { base } | ExprKind::Try { base } => self.collect_refs(*base, out),
-            ExprKind::StructLit { fields, .. } | ExprKind::GenStructLit { fields, .. } => {
+            ExprKind::StructLit { fields, spread, .. } => {
+                for fi in fields {
+                    self.collect_refs(fi.value, out);
+                }
+                if let Some(s) = spread {
+                    self.collect_refs(*s, out);
+                }
+            }
+            ExprKind::GenStructLit { fields, .. } => {
                 for fi in fields {
                     self.collect_refs(fi.value, out);
                 }
@@ -4763,7 +4796,15 @@ impl<'a> Cgen<'a> {
             ExprKind::Deref { base } => self.find_calls_expr(*base, subst, work),
             ExprKind::Cast { expr, .. } => self.find_calls_expr(*expr, subst, work),
             ExprKind::Try { base } => self.find_calls_expr(*base, subst, work),
-            ExprKind::StructLit { fields, .. } | ExprKind::GenStructLit { fields, .. } => {
+            ExprKind::StructLit { fields, spread, .. } => {
+                for f in fields {
+                    self.find_calls_expr(f.value, subst, work);
+                }
+                if let Some(s) = spread {
+                    self.find_calls_expr(*s, subst, work);
+                }
+            }
+            ExprKind::GenStructLit { fields, .. } => {
                 for f in fields {
                     self.find_calls_expr(f.value, subst, work);
                 }
@@ -5727,6 +5768,15 @@ mod tests {
             c.contains(".u.node.j_r).tag == Jestyr_Tree_leaf"),
             "right child too: {c}"
         );
+    }
+
+    #[test]
+    fn struct_spread_lowers_to_a_copy_and_override() {
+        let src = "struct P { x: i32, y: i32 } fn f(read p: P) -> P { P { x: 9, ..p } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("Jestyr_P jss_"), "copies the base into a temp: {c}");
+        assert!(c.contains(".j_x = 9;"), "overrides the listed field: {c}");
     }
 
     #[test]

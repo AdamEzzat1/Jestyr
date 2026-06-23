@@ -195,7 +195,8 @@ pub enum ExprKind {
     Cast { expr: ExprId, ty: TypeId }, // `expr as T` — an explicit conversion
 
     // composite
-    StructLit { path: Ident, fields: Vec<FieldInit> }, // Self{...}, Foo{...}
+    // Self{...}, Foo{...}; `spread` is the `..base` functional-update source, if any.
+    StructLit { path: Ident, fields: Vec<FieldInit>, spread: Option<ExprId> },
     // List(i32){ ... } — generic struct literal; `type_args` are type-valued exprs.
     GenStructLit { ctor: Ident, type_args: Vec<ExprId>, fields: Vec<FieldInit> },
     StructType(StructBody),                            // `struct { ... }` as a value

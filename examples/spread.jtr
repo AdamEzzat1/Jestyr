@@ -1,0 +1,24 @@
+// examples/spread.jtr — struct update / spread (§2.8): `Point { x: 9, ..p }` copies
+// `p`, then overrides the listed fields. Pairs with immutable `record` — a
+// functional update with no mutation. Lowers to `({ T t = base; t.x = 9; t; })`.
+//
+// Run:  jestyrc run examples/spread.jtr   →  prints 1, 2, 9, 2, 1, 20
+
+record Point { x: i32, y: i32 }
+
+fn main() -> i32 {
+    let p = Point { x: 1, y: 2 }
+    print_int(p.x)                 // 1
+    print_int(p.y)                 // 2
+
+    // Functional update: override x, carry y from p.
+    let q = Point { x: 9, ..p }
+    print_int(q.x)                 // 9
+    print_int(q.y)                 // 2  (from p)
+
+    // Override a different field; x is carried from p.
+    let r = Point { y: 20, ..p }
+    print_int(r.x)                 // 1  (from p)
+    print_int(r.y)                 // 20
+    return 0
+}

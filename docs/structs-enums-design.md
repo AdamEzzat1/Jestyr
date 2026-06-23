@@ -291,7 +291,9 @@ offset_of(Point, y)       // new — offsetof
 
 - **Field defaults** (`x: i32 = 0`) + **per-field visibility** (`pub x`) — cheap grammar
   additions (CJC has both); compose with field attributes.
-- **Struct update / spread** (`Point { x: 9, ..p }`) — ergonomic, pairs with `record`.
+- **Struct update / spread** (`Point { x: 9, ..p }`) ✅ DONE — `StructLit.spread`; a
+  copy-then-override GNU statement-expression. Pairs with immutable `record` (functional
+  update). Demo [`examples/spread.jtr`](../examples/spread.jtr); HANDOFF §5.46.
 - **`union` / `#raw_union`** (untagged) and **bit-fields** (named bit ranges) — the Odin/C
   substrate for MMIO; dovetails with `@volatile`/`@address`/`@packed`.
 - **opt-in `Copy`** for small aggregates (HANDOFF §7-B).

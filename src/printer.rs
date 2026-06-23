@@ -267,11 +267,14 @@ impl<'a> Printer<'a> {
             ExprKind::Index { base, index } => {
                 format!("{}[{}]", self.expr_inline(*base), self.expr_inline(*index))
             }
-            ExprKind::StructLit { path, fields } => {
-                let fs: Vec<String> = fields
+            ExprKind::StructLit { path, fields, spread } => {
+                let mut fs: Vec<String> = fields
                     .iter()
                     .map(|f| format!("{}: {}", f.name.name, self.expr_inline(f.value)))
                     .collect();
+                if let Some(s) = spread {
+                    fs.push(format!("..{}", self.expr_inline(*s)));
+                }
                 format!("{}{{ {} }}", path.name, fs.join(", "))
             }
             ExprKind::GenStructLit { ctor, type_args, fields } => {
