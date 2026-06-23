@@ -221,6 +221,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `distinct.jtr` | `1001`, `42`, `7` | **distinct nominal types (B)** — `distinct UserId = i32`; zero-cost typedef; `as` to convert; mixing without `as` errors (§5.37) |
 | `guards.jtr` | `5`, `20`, `37`, `50`, `5`, `3`, `0` | **match arm guards (§2.4)** — `pat if <bool> => …`; two arms share a variant via guard; guarded arms don't count for exhaustiveness; lowers to an if-chain (§5.38) |
 | `ranges.jtr` | `0`, `1`, `2`, `3`, `9`, `-1`, `1` | **literal + range patterns (§2.4)** — `match` on integers; `0`, `1..=9`, `100..1000`; scalar match needs a catch-all; if-chain on the value (§5.39) |
+| `orpat.jtr` | `1`, `1`, `0`, `7`, `7`, `7`, `0` | **or-patterns `a \| b` (§2.4)** — `red \| green \| blue`, `0 \| 1 \| 2`, `10..=19 \| 30..=39`; each alt covers independently; stacked cases / ORed tests (§5.40) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -724,6 +725,23 @@ These are the non-obvious things that will bite if you don't know them.
     (`some(0)`) still bind-or-ignore like a wildcard in the enum path — proper nested-pattern
     dispatch lands with the Maranget decision tree (step 4). Demo
     [`examples/ranges.jtr`](examples/ranges.jtr) (`0, 1, 2, 3, 9, -1, 1`).
+
+40. **Or-patterns `a | b` (design §2.4, step 3).** `PatKind::Or(Vec<PatId>)`. `parse_pattern`
+    now parses one atom (`parse_pattern_atom`, the old body) then folds `|`-separated atoms
+    into an `Or` — so or-patterns nest inside variant subpatterns too. An arm matches if
+    **any** alternative matches; each alternative counts **independently** for coverage, so
+    `red | green | blue` over the remaining variants is exhaustive with no catch-all.
+    Exhaustiveness recurses through `Or` via two new typeck helpers — `cover_pattern`
+    (variants covered + catch-all, for enums) and `pat_is_irrefutable` (for the scalar
+    catch-all check). **cgen, three paths:** (1) **scalar** — `scalar_pat_cond` recurses and
+    OR-joins the alternatives' value tests (`(n==0) || (n==1) || …`); (2) **enum no-guard
+    switch** — an or-pattern stacks `case` labels (`case red: case green: …` → one body);
+    (3) **enum guarded if-chain** — an OR-ed tag test (`tag==red || tag==green`). Both enum
+    paths use `or_variant_names`, which only accepts **nullary** variant alternatives —
+    payload bindings can't be shared across or-alternatives in the bootstrap (a mismatch
+    diagnoses, it doesn't miscompile). Or-patterns on a **niche** enum diagnose
+    ("not supported yet") rather than being silently dropped by the niche classifier's
+    catch-all. Demo [`examples/orpat.jtr`](examples/orpat.jtr) (`1, 1, 0, 7, 7, 7, 0`).
 
 ---
 

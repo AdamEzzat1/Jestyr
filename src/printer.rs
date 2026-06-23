@@ -372,6 +372,10 @@ impl<'a> Printer<'a> {
                 let dots = if *inclusive { "..=" } else { ".." };
                 format!("{}{}{}", self.expr_inline(*lo), dots, self.expr_inline(*hi))
             }
+            PatKind::Or(alts) => {
+                let s: Vec<String> = alts.iter().map(|p| self.pat_str(*p)).collect();
+                s.join(" | ")
+            }
             PatKind::Error => "<error-pat>".to_string(),
         }
     }

@@ -120,6 +120,10 @@ pub enum PatKind {
     Lit(ExprId),
     /// An inclusive/half-open integer range: `0..=9` / `0..9`.
     Range { lo: ExprId, hi: ExprId, inclusive: bool },
+    /// An or-pattern: `red | green | blue`, `1 | 2 | 3`. Matches if *any*
+    /// alternative matches; the alternatives must bind the same names (the
+    /// bootstrap supports non-binding alternatives — variants/literals/ranges).
+    Or(Vec<PatId>),
     Error,
 }
 

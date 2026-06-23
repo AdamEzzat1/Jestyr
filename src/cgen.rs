@@ -1601,6 +1601,10 @@ impl<'a> Cgen<'a> {
                 PatKind::Ident(name) if name.name == n.none_variant => none_arm = Some(arm.body),
                 PatKind::Wildcard => default_arm = Some((arm.body, None)),
                 PatKind::Ident(b) => default_arm = Some((arm.body, Some(b.name.clone()))),
+                PatKind::Or(_) => self.diag(
+                    ast.pat_at(arm.pat).span,
+                    "or-patterns on a niche-optimized enum aren't supported yet",
+                ),
                 _ => {}
             }
         }
@@ -1673,6 +1677,13 @@ impl<'a> Cgen<'a> {
                 }
                 PatKind::Wildcard => (None, None),
                 PatKind::Ident(b) => (None, Some(b.name.clone())),
+                PatKind::Or(_) => {
+                    self.diag(
+                        ast.pat_at(arm.pat).span,
+                        "or-patterns on a niche-optimized enum aren't supported yet",
+                    );
+                    continue;
+                }
                 _ => continue,
             };
             if cond.is_none() && guard.is_none() {
@@ -1834,6 +1845,29 @@ impl<'a> Cgen<'a> {
                     self.depth -= 1;
                     self.line("}");
                 }
+                PatKind::Or(_) => {
+                    // An or-pattern of nullary variants → stacked `case` labels
+                    // sharing one body (`red | green => …`).
+                    match self.or_variant_names(arm.pat) {
+                        Some(names) => {
+                            for nm in &names {
+                                self.line(format!("case {tag_prefix}_{nm}:"));
+                            }
+                            self.line("{");
+                            self.depth += 1;
+                            self.emit_arm_body(arm.body, ret);
+                            if !ret {
+                                self.line("break;");
+                            }
+                            self.depth -= 1;
+                            self.line("}");
+                        }
+                        None => self.diag(
+                            ast.pat_at(arm.pat).span,
+                            "an or-pattern here must combine nullary variants (payload bindings can't be shared)",
+                        ),
+                    }
+                }
                 PatKind::Lit(_) | PatKind::Range { .. } => {
                     // Scalar patterns are invalid on an enum scrutinee (a type error).
                     self.diag(
@@ -1940,6 +1974,28 @@ impl<'a> Cgen<'a> {
                     self.depth -= 1;
                     self.line("}");
                 }
+                PatKind::Or(_) => {
+                    // An or-pattern of nullary variants → an OR-ed tag test.
+                    match self.or_variant_names(arm.pat) {
+                        Some(names) => {
+                            let test = names
+                                .iter()
+                                .map(|nm| format!("{tmp}.tag == {tag_prefix}_{nm}"))
+                                .collect::<Vec<_>>()
+                                .join(" || ");
+                            self.line(format!("if ({test})"));
+                            self.line("{");
+                            self.depth += 1;
+                            self.emit_guarded_arm(arm.body, guard, ret, &end);
+                            self.depth -= 1;
+                            self.line("}");
+                        }
+                        None => self.diag(
+                            ast.pat_at(arm.pat).span,
+                            "an or-pattern here must combine nullary variants (payload bindings can't be shared)",
+                        ),
+                    }
+                }
                 PatKind::Lit(_) | PatKind::Range { .. } => {
                     self.diag(
                         ast.pat_at(arm.pat).span,
@@ -1984,6 +2040,59 @@ impl<'a> Cgen<'a> {
         }
     }
 
+    /// The C boolean test for a scalar pattern against `tmp` — `None` means the
+    /// pattern always matches (a wildcard or binding). Or-patterns OR their
+    /// alternatives; an invalid pattern diagnoses and yields a never-true test.
+    fn scalar_pat_cond(&mut self, pat: PatId, tmp: &str) -> Option<String> {
+        let ast = self.ast;
+        match &ast.pat_at(pat).kind {
+            PatKind::Lit(le) => {
+                let lc = self.emit_expr(*le);
+                Some(format!("{tmp} == ({lc})"))
+            }
+            PatKind::Range { lo, hi, inclusive } => {
+                let loc = self.emit_expr(*lo);
+                let hic = self.emit_expr(*hi);
+                let op = if *inclusive { "<=" } else { "<" };
+                Some(format!("{tmp} >= ({loc}) && {tmp} {op} ({hic})"))
+            }
+            PatKind::Wildcard | PatKind::Ident(_) => None,
+            PatKind::Or(alts) => {
+                let mut parts = Vec::new();
+                for p in alts {
+                    match self.scalar_pat_cond(*p, tmp) {
+                        None => return None, // an alternative matches everything
+                        Some(c) => parts.push(format!("({c})")),
+                    }
+                }
+                Some(parts.join(" || "))
+            }
+            _ => {
+                self.diag(ast.pat_at(pat).span, "this pattern isn't valid on a scalar `match`");
+                Some("0".to_string())
+            }
+        }
+    }
+
+    /// The enum-variant tag names a (nullary) pattern covers — for stacking `case`
+    /// labels and OR-ing tag tests. `None` if the pattern isn't a nullary variant
+    /// or an or-pattern of them (payload bindings can't be shared across
+    /// alternatives in the bootstrap).
+    fn or_variant_names(&self, pat: PatId) -> Option<Vec<String>> {
+        match &self.ast.pat_at(pat).kind {
+            PatKind::Ident(n) if self.variants.contains_key(&n.name) => Some(vec![n.name.clone()]),
+            PatKind::Variant { name, subpats } if subpats.is_empty() => Some(vec![name.name.clone()]),
+            PatKind::Or(alts) => {
+                let mut out = Vec::new();
+                for p in alts {
+                    out.extend(self.or_variant_names(*p)?);
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
     /// Lower a `match` on a scalar (integer/char/bool) scrutinee to an ordered
     /// if-else-if chain on the *value*: a literal arm tests `==`, a range arm tests
     /// `>=` / `<`(`=`), and a wildcard or binding is the catch-all. Guards compose
@@ -2006,31 +2115,15 @@ impl<'a> Cgen<'a> {
         let mut has_uncond_default = false;
         for arm in arms {
             let guard = arm.guard;
-            // The C value test (None = unconditional catch-all) plus an optional
-            // whole-value binding.
-            let (cond, bind): (Option<String>, Option<String>) = match &ast.pat_at(arm.pat).kind {
-                PatKind::Lit(le) => {
-                    let lc = self.emit_expr(*le);
-                    (Some(format!("{tmp} == ({lc})")), None)
-                }
-                PatKind::Range { lo, hi, inclusive } => {
-                    let loc = self.emit_expr(*lo);
-                    let hic = self.emit_expr(*hi);
-                    let op = if *inclusive { "<=" } else { "<" };
-                    (Some(format!("{tmp} >= ({loc}) && {tmp} {op} ({hic})")), None)
-                }
-                PatKind::Wildcard => (None, None),
-                // On a scalar scrutinee any identifier is a binding catch-all (no
-                // enum variant can match an integer).
-                PatKind::Ident(b) => (None, Some(b.name.clone())),
-                _ => {
-                    self.diag(
-                        ast.pat_at(arm.pat).span,
-                        "this pattern isn't valid on a scalar `match`",
-                    );
-                    continue;
-                }
+            // On a scalar scrutinee a bare identifier is a binding catch-all (no
+            // enum variant can match an integer).
+            let bind = match &ast.pat_at(arm.pat).kind {
+                PatKind::Ident(b) => Some(b.name.clone()),
+                _ => None,
             };
+            // The C value test (None = unconditional catch-all). Or-patterns OR the
+            // alternatives' tests together.
+            let cond = self.scalar_pat_cond(arm.pat, &tmp);
             if cond.is_none() && guard.is_none() {
                 has_uncond_default = true;
             }
@@ -5205,6 +5298,30 @@ mod tests {
         assert!(c.contains("!= ((int32_t*)0)"), "`some` tested by non-null: {c}");
         assert!(c.contains("== ((int32_t*)0)"), "`none` tested by null: {c}");
         assert!(c.contains("if ((j_flag > 0))"), "the guard gates the `some` arm: {c}");
+    }
+
+    #[test]
+    fn enum_or_pattern_stacks_case_labels() {
+        let src = "enum C { red, green, blue, black } \
+                   fn f(read c: C) -> i32 { match c { red | green | blue => 1, black => 0 } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("switch ("), "an unguarded enum or-pattern keeps the switch: {c}");
+        assert!(c.contains("case Jestyr_C_red:"), "{c}");
+        assert!(c.contains("case Jestyr_C_green:"), "{c}");
+        assert!(c.contains("case Jestyr_C_blue:"), "stacked case labels share one body: {c}");
+    }
+
+    #[test]
+    fn scalar_or_pattern_ors_the_value_tests() {
+        let src = "fn f(read n: i32) -> i32 { match n { 0 | 1 | 2 => 7, 10..=19 | 30..=39 => 8, _ => 0 } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("(jm_0 == (0)) || (jm_0 == (1)) || (jm_0 == (2))"), "literal alts ORed: {c}");
+        assert!(
+            c.contains("(jm_0 >= (10) && jm_0 <= (19)) || (jm_0 >= (30) && jm_0 <= (39))"),
+            "range alts ORed: {c}"
+        );
     }
 
     #[test]

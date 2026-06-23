@@ -191,10 +191,16 @@ match shape {
   The first non-enum scrutinee: a `Ty::Prim` integer/char/bool routes to a value if-chain
   (`emit_scalar_match`), guards composing. Exhaustiveness gains a scalar branch — the domain
   can't be enumerated, so a scalar `match` requires a `_`/binding catch-all. Demo
-  [`examples/ranges.jtr`](../examples/ranges.jtr); HANDOFF §5.39. **Remaining steps:**
-  or-patterns (`a | b`), `..` rest, then the Maranget usefulness matrix (real nested-pattern
-  exhaustiveness — including `0..=255`/`true|false` interval coverage — + redundant-arm
-  warnings + a decision-tree lowering, replacing the name-set/catch-all checks).
+  [`examples/ranges.jtr`](../examples/ranges.jtr); HANDOFF §5.39.
+- **Step 3 ✅ — or-patterns (`a | b`).** `PatKind::Or(Vec<PatId>)`; an arm matches if any
+  alternative does, and each alternative counts independently for exhaustiveness (so
+  `red | green | blue` needs no catch-all). cgen: scalar ORs the value tests, the enum
+  switch stacks `case` labels, the enum if-chain ORs the tag tests. Nullary-variant
+  alternatives only (shared payload bindings are future work). Demo
+  [`examples/orpat.jtr`](../examples/orpat.jtr); HANDOFF §5.40. **Remaining steps:**
+  `..` rest, then the Maranget usefulness matrix (real nested-pattern exhaustiveness —
+  including `0..=255`/`true|false` interval coverage — + redundant-arm warnings + a
+  decision-tree lowering, replacing the name-set/catch-all checks).
 
 ### 2.5 Recursive ADTs via explicit `indirect`  ✅ DONE
 

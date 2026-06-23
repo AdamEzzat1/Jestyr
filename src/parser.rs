@@ -1294,7 +1294,22 @@ impl<'src> Parser<'src> {
         self.ast.expr(ExprKind::Match { scrut, arms }, start.to(end))
     }
 
+    /// Parse a pattern, folding `|`-separated alternatives into an or-pattern.
     fn parse_pattern(&mut self) -> PatId {
+        let first = self.parse_pattern_atom();
+        if !self.at(Pipe) {
+            return first;
+        }
+        let start = self.ast.pat_at(first).span;
+        let mut alts = vec![first];
+        while self.eat(Pipe) {
+            alts.push(self.parse_pattern_atom());
+        }
+        let end = self.ast.pat_at(*alts.last().unwrap()).span;
+        self.ast.pat(PatKind::Or(alts), start.to(end))
+    }
+
+    fn parse_pattern_atom(&mut self) -> PatId {
         let tok = self.cur();
         let span = tok.span;
         match tok.kind {
@@ -1516,6 +1531,25 @@ mod tests {
             "third arm is a half-open range"
         );
         assert!(matches!(ast.pat_at(arms[3].pat).kind, PatKind::Wildcard));
+    }
+
+    #[test]
+    fn parses_or_pattern() {
+        let ast = parse_ok(
+            "enum C { red, green, blue } fn f(read c: C) -> i32 { match c { red | green | blue => 1 } }",
+        );
+        let arms = ast
+            .exprs
+            .iter()
+            .find_map(|e| match &e.kind {
+                ExprKind::Match { arms, .. } => Some(arms.clone()),
+                _ => None,
+            })
+            .expect("a match expression");
+        match &ast.pat_at(arms[0].pat).kind {
+            PatKind::Or(alts) => assert_eq!(alts.len(), 3, "three alternatives"),
+            other => panic!("expected an or-pattern, got {other:?}"),
+        }
     }
 
     #[test]

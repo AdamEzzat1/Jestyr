@@ -1,0 +1,37 @@
+// examples/orpat.jtr — or-patterns `a | b` (§2.4). An arm fires if ANY alternative
+// matches. Over enum variants the alternatives stack `case` labels; over scalars
+// they OR the value tests. Each alternative counts independently for
+// exhaustiveness, so `red | green | blue` covering the remaining variants needs no
+// catch-all.
+//
+// Run:  jestyrc run examples/orpat.jtr   →  prints 1, 1, 0, 7, 7, 7, 0
+
+enum Color { red, green, blue, black }
+
+// red/green/blue are "bright"; black is not. One arm covers three variants.
+fn is_bright(read c: Color) -> i32 {
+    match c {
+        red | green | blue => 1,
+        black              => 0,
+    }
+}
+
+// Scalar or-patterns: a set of literals, and a union of ranges.
+fn bucket(read n: i32) -> i32 {
+    match n {
+        0 | 1 | 2         => 7,   // a small set of literals
+        10..=19 | 30..=39 => 7,   // two disjoint ranges
+        _                 => 0,
+    }
+}
+
+fn main() -> i32 {
+    print_int(is_bright(red))      // 1
+    print_int(is_bright(green))    // 1
+    print_int(is_bright(black))    // 0
+    print_int(bucket(1))           // 7  (literal alternative)
+    print_int(bucket(15))          // 7  (first range)
+    print_int(bucket(35))          // 7  (second range)
+    print_int(bucket(99))          // 0
+    return 0
+}

@@ -572,6 +572,11 @@ impl<'a> Checker<'a> {
                 }
             }
             PatKind::Lit(_) | PatKind::Range { .. } => {}
+            PatKind::Or(alts) => {
+                for sp in alts {
+                    self.bind_pattern(ctx, *sp, is_borrow);
+                }
+            }
             PatKind::Wildcard | PatKind::Error => {}
         }
     }

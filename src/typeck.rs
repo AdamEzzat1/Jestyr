@@ -1309,6 +1309,13 @@ impl<'a> TypeChecker<'a> {
             }
             // Scalar patterns bind nothing — they only constrain the value.
             PatKind::Lit(_) | PatKind::Range { .. } => {}
+            PatKind::Or(alts) => {
+                // Alternatives should bind the same names; bind each so any binding
+                // is in scope for the body (the bootstrap doesn't check consistency).
+                for sp in alts {
+                    self.bind_pattern_types(scope, scrut, *sp);
+                }
+            }
             PatKind::Wildcard | PatKind::Error => {}
         }
     }
@@ -1353,15 +1360,8 @@ impl<'a> TypeChecker<'a> {
         // over `bool` — arrives with the Maranget usefulness pass.)
         if let Ty::Prim(p) = scrut {
             if is_scalar_match_ty(p) {
-                let ast = self.ast;
-                let has_catch_all = arms.iter().any(|a| {
-                    a.guard.is_none()
-                        && match &ast.pat_at(a.pat).kind {
-                            PatKind::Wildcard => true,
-                            PatKind::Ident(n) => !self.table.variants.contains_key(&n.name),
-                            _ => false,
-                        }
-                });
+                let has_catch_all =
+                    arms.iter().any(|a| a.guard.is_none() && self.pat_is_irrefutable(a.pat));
                 if !has_catch_all {
                     self.error(
                         span,
@@ -1385,7 +1385,6 @@ impl<'a> TypeChecker<'a> {
             TypeKindG::Enum { variants } => variants.iter().map(|(n, _)| n.clone()).collect(),
             _ => return, // matching a struct, not an enum — no variant set to check
         };
-        let ast = self.ast;
         let mut covered: HashSet<String> = HashSet::new();
         let mut catch_all = false;
         for arm in arms {
@@ -1395,23 +1394,7 @@ impl<'a> TypeChecker<'a> {
             if arm.guard.is_some() {
                 continue;
             }
-            match &ast.pat_at(arm.pat).kind {
-                PatKind::Wildcard => catch_all = true,
-                PatKind::Ident(n) => {
-                    if self.table.variants.contains_key(&n.name) {
-                        covered.insert(n.name.clone());
-                    } else {
-                        catch_all = true; // a binding catches everything
-                    }
-                }
-                PatKind::Variant { name, .. } => {
-                    covered.insert(name.name.clone());
-                }
-                // Scalar patterns can't appear on an enum scrutinee (a type error
-                // elsewhere); they cover no variant here.
-                PatKind::Lit(_) | PatKind::Range { .. } => {}
-                PatKind::Error => {}
-            }
+            self.cover_pattern(arm.pat, &mut covered, &mut catch_all);
         }
         if catch_all {
             return;
@@ -1419,6 +1402,43 @@ impl<'a> TypeChecker<'a> {
         let missing: Vec<String> = all.into_iter().filter(|v| !covered.contains(v)).collect();
         if !missing.is_empty() {
             self.error(span, format!("non-exhaustive `match`: missing `{}`", missing.join("`, `")));
+        }
+    }
+
+    /// Is this pattern an unconditional catch-all (a `_`/binding, possibly reached
+    /// through an or-pattern alternative)? Used for scalar-match exhaustiveness.
+    fn pat_is_irrefutable(&self, pat: PatId) -> bool {
+        match &self.ast.pat_at(pat).kind {
+            PatKind::Wildcard => true,
+            PatKind::Ident(n) => !self.table.variants.contains_key(&n.name),
+            PatKind::Or(alts) => alts.iter().any(|p| self.pat_is_irrefutable(*p)),
+            _ => false,
+        }
+    }
+
+    /// Accumulate the enum variants an (unguarded) pattern covers, and whether it
+    /// is a catch-all — recursing through or-pattern alternatives.
+    fn cover_pattern(&self, pat: PatId, covered: &mut HashSet<String>, catch_all: &mut bool) {
+        match &self.ast.pat_at(pat).kind {
+            PatKind::Wildcard => *catch_all = true,
+            PatKind::Ident(n) => {
+                if self.table.variants.contains_key(&n.name) {
+                    covered.insert(n.name.clone());
+                } else {
+                    *catch_all = true; // a binding catches everything
+                }
+            }
+            PatKind::Variant { name, .. } => {
+                covered.insert(name.name.clone());
+            }
+            PatKind::Or(alts) => {
+                for p in alts {
+                    self.cover_pattern(*p, covered, catch_all);
+                }
+            }
+            // Scalar patterns can't appear on an enum scrutinee (a type error
+            // elsewhere); they cover no variant here.
+            PatKind::Lit(_) | PatKind::Range { .. } | PatKind::Error => {}
         }
     }
 }
@@ -1632,6 +1652,25 @@ mod tests {
         let (_i, d) = analyze(src);
         assert_eq!(d.len(), 1, "a guarded `_` is not a catch-all: {:?}", d);
         assert!(d[0].message.contains("non-exhaustive"), "{:?}", d);
+    }
+
+    #[test]
+    fn or_pattern_covers_each_alternative_for_exhaustiveness() {
+        // `red | green | blue` covers all three variants — exhaustive, no catch-all.
+        let src = "enum C { red, green, blue } \
+                   fn f(read c: C) -> i32 { match c { red | green | blue => 1 } }";
+        let (_i, d) = analyze(src);
+        assert!(d.is_empty(), "an or-pattern of all variants is exhaustive: {:?}", d);
+    }
+
+    #[test]
+    fn or_pattern_missing_an_alternative_is_non_exhaustive() {
+        let src = "enum C { red, green, blue } \
+                   fn f(read c: C) -> i32 { match c { red | green => 1 } }";
+        let (_i, d) = analyze(src);
+        assert_eq!(d.len(), 1, "{:?}", d);
+        assert!(d[0].message.contains("non-exhaustive"), "{:?}", d);
+        assert!(d[0].message.contains("blue"), "names the uncovered variant: {:?}", d);
     }
 
     #[test]
