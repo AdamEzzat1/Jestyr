@@ -755,6 +755,21 @@ mod tests {
     }
 
     #[test]
+    fn non_copy_struct_param_cannot_be_returned() {
+        // By default a user aggregate is non-Copy: returning a `read` param escapes.
+        let d = escapes("struct V { x: i32 } fn id(read v: V) -> V { return v }");
+        assert_eq!(d.len(), 1, "{:?}", d);
+        assert!(d[0].message.contains("cannot return borrow"), "{:?}", d);
+    }
+
+    #[test]
+    fn copy_struct_param_can_be_returned() {
+        // `@copy` opts the aggregate into being freely copyable — no escape.
+        let d = escapes("@copy struct V { x: i32 } fn id(read v: V) -> V { return v }");
+        assert!(d.is_empty(), "a @copy aggregate may be returned by value: {:?}", d);
+    }
+
+    #[test]
     fn allows_returning_a_borrow_when_the_signature_says_so() {
         // NB: `out` is a reserved convention keyword, so the fn is named `reborrow`.
         let d = escapes("fn reborrow(read p: Node) -> read Node { p }");

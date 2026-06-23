@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 253 tests pass, including `proptest` property
+and run (or are correctly rejected). 255 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -228,6 +228,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `struct_variant.jtr` | `12.5664`, `12`, `0`, `9` | **struct-variant syntax (§2.3b)** — named construct `circle { r: 2.0 }` + named match `circle { r }`, `rect { w, .. }`; designated init / by-name dispatch (§5.45) |
 | `spread.jtr` | `1`, `2`, `9`, `2`, `1`, `20` | **struct update / spread (§2.8)** — `Point { x: 9, ..p }` functional update; copy-then-override statement-expr (§5.46) |
 | `defaults.jtr` | `3`, `0`, `1`, `5`, `0`, `9` | **field defaults (§2.8)** — `x: i32 = 0`; omitted fields filled from defaults at construction (§5.47) |
+| `copy_optin.jtr` | `3`, `7`, `20` | **opt-in Copy (§2.8)** — `@copy struct`; a freely-copyable aggregate may be returned by value (escape-checker only) (§5.48) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -875,6 +876,19 @@ These are the non-obvious things that will bite if you don't know them.
     bodies, not struct decls). Demo [`examples/defaults.jtr`](examples/defaults.jtr)
     (`3, 0, 1, 5, 0, 9`). **Remaining §2.8:** per-field visibility (`pub x`), untagged `union`,
     bit-fields, opt-in `Copy`.
+
+48. **Opt-in `Copy` — `@copy struct` (design §2.8).** Marks a small aggregate as freely
+    copyable, so the escape checker never treats it as a move/borrow that could escape (e.g.
+    a `read` struct param can now be **returned by value** without `take`). Almost no new code:
+    `TypeDecl.is_copy` and `Ty::is_copy()` **already existed** (the field's comment literally said
+    "an explicit opt-in lands later"), structs already pass by value in cgen, so this is
+    **escape-checker-only**. Wiring: a `@copy` row in the `attrs.rs` registry (`Target::Struct`),
+    and one line in `build_table` — `self.table.types[i].is_copy = attrs.iter().any(|a| a.name ==
+    "copy")` (the struct's attrs are still on `Item::Struct`, even though §5.31 discards them for
+    cgen). No cgen/representation change. Demo [`examples/copy_optin.jtr`](examples/copy_optin.jtr)
+    (`3, 7, 20`). **Scoped to structs** (enums could follow the same one-liner at the enum
+    registration site). **Remaining §2.8:** per-field visibility (`pub x`), untagged `union`,
+    bit-fields.
 
 ---
 

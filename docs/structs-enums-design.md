@@ -298,7 +298,10 @@ offset_of(Point, y)       // new — offsetof
   update). Demo [`examples/spread.jtr`](../examples/spread.jtr); HANDOFF §5.46.
 - **`union` / `#raw_union`** (untagged) and **bit-fields** (named bit ranges) — the Odin/C
   substrate for MMIO; dovetails with `@volatile`/`@address`/`@packed`.
-- **opt-in `Copy`** for small aggregates (HANDOFF §7-B).
+- **opt-in `Copy`** for small aggregates ✅ DONE — `@copy struct` sets `TypeDecl.is_copy`, so the
+  escape checker treats it as freely copyable (returnable by value without `take`). Escape-checker
+  only; representation unchanged. Demo [`examples/copy_optin.jtr`](../examples/copy_optin.jtr);
+  HANDOFF §5.48.
 
 ---
 

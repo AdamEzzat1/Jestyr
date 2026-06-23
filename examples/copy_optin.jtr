@@ -1,0 +1,26 @@
+// examples/copy_optin.jtr — opt-in Copy (§2.8). By default a user aggregate is
+// non-Copy: a `read` (borrowed) parameter can't be returned — it would outlive its
+// call (you'd need `take` to own it). `@copy` marks a small aggregate as freely
+// copyable, so it can be returned/stored by value with no ownership ceremony.
+// It's an escape-checker concept only — the representation is unchanged.
+//
+// Run:  jestyrc run examples/copy_optin.jtr   →  prints 3, 7, 20
+
+@copy struct Vec2 { x: i32, y: i32 }
+
+// Returning a `read` (borrowed) param by value is legal *because* Vec2 is @copy.
+fn identity(read v: Vec2) -> Vec2 { return v }
+
+fn add(read a: Vec2, read b: Vec2) -> Vec2 {
+    return Vec2 { x: a.x + b.x, y: a.y + b.y }
+}
+
+fn main() -> i32 {
+    let p = Vec2 { x: 3, y: 7 }
+    let q = identity(p)            // copy a borrowed param out — no `take` needed
+    print_int(q.x)                 // 3
+    print_int(q.y)                 // 7
+    let r = add(p, q)              // (3+3, 7+7) = (6, 14)
+    print_int(r.x + r.y)           // 20
+    return 0
+}

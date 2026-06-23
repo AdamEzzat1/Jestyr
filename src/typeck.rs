@@ -139,9 +139,13 @@ impl<'a> TypeChecker<'a> {
         // to in any order.
         for item in &ast.items {
             match item {
-                Item::Struct { name, is_record, .. } => {
+                Item::Struct { name, is_record, attrs, .. } => {
                     let i = self.register_type(name, false);
                     self.table.types[i].is_record = *is_record;
+                    // `@copy` opts a small aggregate into being freely copyable
+                    // (design §2.8) — the escape checker then never treats it as a
+                    // move/borrow that could escape.
+                    self.table.types[i].is_copy = attrs.iter().any(|a| a.name == "copy");
                 }
                 Item::Enum(e) => {
                     let idx = self.register_type(&e.name, true);

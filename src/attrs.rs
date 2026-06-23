@@ -95,6 +95,8 @@ const SPECS: &[Spec] = &[
     Spec { name: "packed", targets: &[Target::Struct], args: Args::None, status: Status::Active },
     Spec { name: "align", targets: &[Target::Struct], args: Args::Pow2, status: Status::Active },
     Spec { name: "layout", targets: &[Target::Struct], args: Args::Word, status: Status::Active },
+    // opt-in `Copy` for a small aggregate (design §2.8): freely copied, never moves.
+    Spec { name: "copy", targets: &[Target::Struct], args: Args::None, status: Status::Active },
     // ── bare-metal field qualifier (design §16) ────────────────────────────
     Spec { name: "volatile", targets: &[Target::Field], args: Args::None, status: Status::Active },
     // ── safety / verification (functions) ──────────────────────────────────
