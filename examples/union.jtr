@@ -1,0 +1,17 @@
+// examples/union.jtr — untagged `union` (§2.8): all fields overlap in storage
+// (a C `union`), so reading a field reinterprets the same bytes. The classic use
+// is type-punning a float's bit pattern — the Odin/C substrate for MMIO and
+// low-level reinterpretation. `size_of` is the *largest* field, not the sum.
+//
+// Run:  jestyrc run examples/union.jtr   →  prints 1075838976, 2.5, 4
+
+union Bits { i: i32, f: f32 }
+
+fn main() -> i32 {
+    var a: Bits = Bits { f: 2.5 }
+    print_int(a.i)              // 1075838976 — the raw bits of 2.5f (0x40200000)
+    var b: Bits = Bits { i: a.i }
+    print_float(b.f)            // 2.5 — round-trips back through the same bits
+    print_int(size_of(Bits))    // 4  — max(field sizes), not their sum
+    return 0
+}

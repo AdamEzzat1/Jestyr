@@ -405,8 +405,9 @@ impl<'a> Cgen<'a> {
         let ast = self.ast;
         for item in &ast.items {
             match item {
-                Item::Struct { name, .. } => {
-                    self.raw(format!("typedef struct Jestyr_{0} Jestyr_{0};\n", name.name));
+                Item::Struct { name, is_union, .. } => {
+                    let kw = if *is_union { "union" } else { "struct" };
+                    self.raw(format!("typedef {kw} Jestyr_{0} Jestyr_{0};\n", name.name));
                 }
                 // `distinct UserId = u64` → a zero-cost C typedef of the base.
                 Item::Distinct(dd) => {
@@ -1039,9 +1040,10 @@ impl<'a> Cgen<'a> {
     fn struct_defs(&mut self) {
         let ast = self.ast;
         for item in &ast.items {
-            if let Item::Struct { name, body, attrs, .. } = item {
+            if let Item::Struct { name, body, attrs, is_union, .. } = item {
                 let attr = self.struct_attr(attrs);
-                self.raw(format!("struct{attr} Jestyr_{} {{\n", name.name));
+                let kw = if *is_union { "union" } else { "struct" };
+                self.raw(format!("{kw}{attr} Jestyr_{} {{\n", name.name));
                 for m in &body.members {
                     if let StructMember::Field { name: fname, ty, volatile, .. } = m {
                         let cty = self.c_ty_ast(*ty);
@@ -5805,6 +5807,16 @@ mod tests {
             c.contains(".u.node.j_r).tag == Jestyr_Tree_leaf"),
             "right child too: {c}"
         );
+    }
+
+    #[test]
+    fn union_emits_a_c_union() {
+        let src = "union U { a: i32, b: f32 } fn first(read u: U) -> i32 { return u.a }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("union Jestyr_U"), "emits a C union: {c}");
+        assert!(c.contains("typedef union Jestyr_U"), "forward-declared as a union: {c}");
+        assert!(!c.contains("struct Jestyr_U"), "a union is not a struct: {c}");
     }
 
     #[test]

@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 257 tests pass, including `proptest` property
+and run (or are correctly rejected). 259 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -230,6 +230,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `defaults.jtr` | `3`, `0`, `1`, `5`, `0`, `9` | **field defaults (§2.8)** — `x: i32 = 0`; omitted fields filled from defaults at construction (§5.47) |
 | `copy_optin.jtr` | `3`, `7`, `20` | **opt-in Copy (§2.8)** — `@copy struct`; a freely-copyable aggregate may be returned by value (escape-checker only) (§5.48) |
 | `visibility/main.jtr` | `3`, `7` | **per-field visibility (§2.8)** — `pub x` exposes a field cross-module; private fields need a pub accessor (§5.49) |
+| `union.jtr` | `1075838976`, `2.5`, `4` | **untagged `union` (§2.8)** — overlapping fields (C `union`); float bit-punning; `size_of` = largest field (§5.50) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -906,6 +907,21 @@ These are the non-obvious things that will bite if you don't know them.
     [`examples/visibility/main.jtr`](examples/visibility/main.jtr) + `geo.jtr` (`3, 7`);
     cross-module `p.y` on the private field is the rejected case. **Remaining §2.8:** untagged
     `union` / bit-fields.
+
+50. **Untagged `union` (design §2.8).** `union Name { a: i32, b: f32 }` — all fields overlap in
+    storage (C `union`); reading a field reinterprets the bytes (type punning, e.g. a float's bit
+    pattern). Implemented by **reusing `Item::Struct`** with a new `is_union: bool` (parallel to
+    `is_record`) — *zero* new `Item`/`TypeKind` variants, so the whole frontend (registration as a
+    `TypeKindG::Struct`, field access, construction, `size_of`, `@copy`, per-field visibility) is
+    inherited unchanged. The **only** backend difference is the C keyword: `struct_defs` and
+    `forward_types` emit `union`/`typedef union` when `is_union` (one `let kw = if is_union {…}`
+    each). The `Union` token was already reserved in the lexer; `parse_named_struct` gained an
+    `is_union` arm next to `is_record`. **Construction** uses a designated initializer for one
+    field (`(Jestyr_Bits){ .j_f = 2.5 }`); `size_of` is the largest field. **Not added:** an
+    `unsafe` requirement on punning reads (the systems-language default trusts the programmer);
+    field defaults on a union are meaningless (overlapping) and simply unused. Demo
+    [`examples/union.jtr`](examples/union.jtr) (`1075838976, 2.5, 4`). **Remaining §2.8:**
+    bit-fields (the last substrate item).
 
 ---
 

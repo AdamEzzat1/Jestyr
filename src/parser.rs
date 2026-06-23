@@ -171,12 +171,17 @@ impl<'src> Parser<'src> {
             }
             Struct => {
                 self.check_attrs(&attrs, attrs::Target::Struct);
-                Some(self.parse_named_struct(attrs, is_pub, false))
+                Some(self.parse_named_struct(attrs, is_pub, false, false))
             }
             Record => {
                 // An immutable product type — same grammar/attrs as `struct`.
                 self.check_attrs(&attrs, attrs::Target::Struct);
-                Some(self.parse_named_struct(attrs, is_pub, true))
+                Some(self.parse_named_struct(attrs, is_pub, true, false))
+            }
+            Union => {
+                // An untagged union — same grammar as `struct`; fields overlap.
+                self.check_attrs(&attrs, attrs::Target::Struct);
+                Some(self.parse_named_struct(attrs, is_pub, false, true))
             }
             Distinct => {
                 if let Some(a) = attrs.first() {
@@ -455,14 +460,28 @@ impl<'src> Parser<'src> {
         ConstDecl { is_pub: false, name, ty, value, attrs: Vec::new(), span }
     }
 
-    fn parse_named_struct(&mut self, attrs: Vec<Attribute>, is_pub: bool, is_record: bool) -> Item {
+    fn parse_named_struct(
+        &mut self,
+        attrs: Vec<Attribute>,
+        is_pub: bool,
+        is_record: bool,
+        is_union: bool,
+    ) -> Item {
         let start = self.cur().span;
         if is_record {
             self.expect(Record, "`record`");
+        } else if is_union {
+            self.expect(Union, "`union`");
         } else {
             self.expect(Struct, "`struct`");
         }
-        let what = if is_record { "record name" } else { "struct name" };
+        let what = if is_record {
+            "record name"
+        } else if is_union {
+            "union name"
+        } else {
+            "struct name"
+        };
         let name = self.eat_ident(what);
         let body = self.parse_struct_body();
         // A record's fields are immutable, so a `mut self` / `out self` method —
@@ -486,7 +505,7 @@ impl<'src> Parser<'src> {
             }
         }
         let span = start.to(body.span);
-        Item::Struct { is_pub, is_record, name, body, attrs, span }
+        Item::Struct { is_pub, is_record, is_union, name, body, attrs, span }
     }
 
     /// Parse a run of leading `@name` / `@name(args)` item attributes.
@@ -1646,6 +1665,13 @@ mod tests {
             "enum E { c(x: i32, y: i32) } fn f(read e: E) -> i32 { match e { c(.., y) => y } }",
         );
         assert!(d.iter().any(|x| x.message.contains("last field")), "{:?}", d);
+    }
+
+    #[test]
+    fn parses_union() {
+        let ast = parse_ok("union U { a: i32, b: f32 }");
+        let is_union = ast.items.iter().any(|it| matches!(it, Item::Struct { is_union: true, .. }));
+        assert!(is_union, "a `union` parses as an Item::Struct with is_union set");
     }
 
     #[test]

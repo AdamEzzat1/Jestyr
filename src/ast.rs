@@ -477,11 +477,14 @@ pub enum Item {
     Distinct(DistinctDecl),
     /// A product type. `is_record` distinguishes an **immutable** `record` (whose
     /// fields cannot be assigned — a static guarantee) from a mutable `struct`.
-    /// Both share one field grammar, layout, and C lowering; only the mutation
-    /// rule differs (design: struct/record/class split, CJC-inspired §1.2).
+    /// `is_union` marks an **untagged `union`** — all fields overlap in storage
+    /// (C `union`); reading a field reinterprets the bytes. Each variant shares one
+    /// field grammar and frontend; only the C keyword (`union` vs `struct`) and the
+    /// mutation rule differ (design: struct/record/class split, CJC-inspired §1.2).
     Struct {
         is_pub: bool,
         is_record: bool,
+        is_union: bool,
         name: Ident,
         body: StructBody,
         attrs: Vec<Attribute>,

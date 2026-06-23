@@ -299,8 +299,10 @@ offset_of(Point, y)       // new — offsetof
 - **Struct update / spread** (`Point { x: 9, ..p }`) ✅ DONE — `StructLit.spread`; a
   copy-then-override GNU statement-expression. Pairs with immutable `record` (functional
   update). Demo [`examples/spread.jtr`](../examples/spread.jtr); HANDOFF §5.46.
-- **`union` / `#raw_union`** (untagged) and **bit-fields** (named bit ranges) — the Odin/C
-  substrate for MMIO; dovetails with `@volatile`/`@address`/`@packed`.
+- **`union`** (untagged) ✅ DONE — `union Name { … }` reuses `Item::Struct` with an `is_union`
+  flag; cgen emits a C `union`/`typedef union` (the whole struct frontend is inherited). Demo
+  [`examples/union.jtr`](../examples/union.jtr); HANDOFF §5.50. **Bit-fields** (named bit ranges)
+  — the last substrate item; the Odin/C substrate for MMIO; dovetails with `@volatile`/`@packed`.
 - **opt-in `Copy`** for small aggregates ✅ DONE — `@copy struct` sets `TypeDecl.is_copy`, so the
   escape checker treats it as freely copyable (returnable by value without `take`). Escape-checker
   only; representation unchanged. Demo [`examples/copy_optin.jtr`](../examples/copy_optin.jtr);
