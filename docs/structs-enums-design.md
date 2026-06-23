@@ -158,7 +158,7 @@ enum Shape { circle(r: f64), rect(w: f64, h: f64) }  // named fields — already
   is a separate small follow-up — pairs with a `@repr(u8)` attribute slotting next to
   `@layout` in the registry.
 
-### 2.4 Match power + Maranget exhaustiveness  ✅ DONE (analysis; decision-tree cgen pending)
+### 2.4 Match power + Maranget exhaustiveness  ✅ DONE (analysis + nested dispatch)
 
 ```jestyr
 match shape {
@@ -211,9 +211,14 @@ match shape {
   the build). Scalars use an interval engine, so `true|false`/`0..=255` are exhaustive without
   a catch-all, and a subsumed literal/range warns. Guarded arms are excluded. Check-demo
   [`examples/exhaustive_check.jtr`](../examples/exhaustive_check.jtr); HANDOFF §5.42.
-  **The one remaining piece** is the *backend*: cgen still lowers via the flat switch/if-chain
-  and **diagnoses** (rather than dispatches) a nested non-wildcard subpattern — the
-  decision-tree lowering that closes this frontend/backend gap is the next match-power task.
+- **Step 5 ✅ — decision-tree backend (nested dispatch).** cgen now *dispatches* nested
+  patterns (`node(leaf(_), leaf(_))`, `some(0)`): a recursive `pat_test` builds a per-arm C
+  boolean test + bindings (auto-dereferencing `indirect`/pointer fields, niche-aware), and
+  `emit_nested_match` lowers to an ordered if-chain. Flat matches keep their optimized
+  switch/scalar/niche paths. Demo [`examples/nested_match.jtr`](../examples/nested_match.jtr);
+  HANDOFF §5.43. **§2.4 is now complete end-to-end** (analysis + dispatch); the only deferred
+  polish is an *optimal* shared-test decision tree (the if-chain re-tests the tag per arm —
+  correct, not minimal) and binding or-pattern alternatives in nested position.
 
 ### 2.5 Recursive ADTs via explicit `indirect`  ✅ DONE
 

@@ -211,6 +211,17 @@ fn is_niche_pointer(t: &Ty) -> bool {
     matches!(t, Ty::Ptr { .. } | Ty::RegionRef(_))
 }
 
+/// The pointee of a *plain* pointer (`*T` / `&[r]T`), for looking through an
+/// `indirect`/raw field when matching a constructor against it. A fat generational
+/// `&T` is excluded — its deref is checked, not a structural `(*p)`.
+fn pointer_pointee(t: &Ty) -> Option<Ty> {
+    match t {
+        Ty::Ptr { inner, .. } => Some((**inner).clone()),
+        Ty::RegionRef(inner) => Some((**inner).clone()),
+        _ => None,
+    }
+}
+
 /// A `spawn <fn>(args)` site inside a `concurrent` block. Each becomes an
 /// argument struct + a `void*` thread trampoline, keyed by the call's expr id.
 #[derive(Clone)]
@@ -1721,6 +1732,12 @@ impl<'a> Cgen<'a> {
         };
 
         let scrut_ty = self.info.type_of(scrut).clone();
+        // A nested sub-pattern (a constructor inside a variant's fields) needs the
+        // recursive decision-tree lowering — the flat switch/if-chain can't dispatch
+        // it. Flat matches (bindings/`_`/`..` fields) keep their optimized paths.
+        if arms.iter().any(|a| self.pat_needs_nesting(a.pat)) {
+            return self.emit_nested_match(e, ret, &scrut_ty);
+        }
         // A niche-optimized enum (plain or a generic instance) matches on a null
         // test, not a tag `switch`.
         match &scrut_ty {
@@ -2166,6 +2183,210 @@ impl<'a> Cgen<'a> {
                 self.line(format!("{cty} j_{b} = {tmp};"));
             }
             self.emit_guarded_arm(arm.body, guard, ret, &end);
+            self.depth -= 1;
+            self.line("}");
+        }
+        if !ret {
+            self.line(format!("{end}: ;"));
+        } else if !has_uncond_default {
+            self.line("__builtin_unreachable();");
+        }
+    }
+
+    // --- nested-pattern dispatch (the decision-tree backend) ---
+
+    /// Does this pattern contain a *nested* sub-pattern the flat switch/if-chain
+    /// paths can't dispatch — a variant/literal/range/nullary-variant inside a
+    /// variant's fields? (A plain binding, `_`, or `..` field is still flat.)
+    fn pat_needs_nesting(&self, pat: PatId) -> bool {
+        match &self.ast.pat_at(pat).kind {
+            PatKind::Variant { subpats, .. } => subpats.iter().any(|sp| !self.is_flat_subpat(*sp)),
+            PatKind::Or(alts) => alts.iter().any(|a| self.pat_needs_nesting(*a)),
+            _ => false,
+        }
+    }
+
+    fn is_flat_subpat(&self, sp: PatId) -> bool {
+        match &self.ast.pat_at(sp).kind {
+            PatKind::Wildcard | PatKind::Rest => true,
+            PatKind::Ident(n) => !self.variants.contains_key(&n.name), // a binding, not a variant
+            _ => false,
+        }
+    }
+
+    fn pat_is_constructor(&self, pat: PatId) -> bool {
+        match &self.ast.pat_at(pat).kind {
+            PatKind::Variant { .. } | PatKind::Lit(_) | PatKind::Range { .. } => true,
+            PatKind::Ident(n) => self.variants.contains_key(&n.name), // a nullary variant
+            PatKind::Or(alts) => alts.iter().any(|a| self.pat_is_constructor(*a)),
+            _ => false,
+        }
+    }
+
+    fn niche_of_ty(&self, t: &Ty) -> Option<NicheInfo> {
+        match t {
+            Ty::Named(i) => self.niche_enum_at(*i),
+            Ty::GenEnum { ctor, args } => self.niche_enum_instance(ctor, args),
+            _ => None,
+        }
+    }
+
+    /// The C tag-enum prefix for a (non-niche) enum type.
+    fn enum_tag_prefix(&self, subject_ty: &Ty) -> String {
+        match subject_ty {
+            Ty::Named(i) => format!("Jestyr_{}", self.info.table.types[*i].name),
+            Ty::GenEnum { ctor, args } => self.gen_struct_c_name(ctor, args),
+            _ => String::new(),
+        }
+    }
+
+    /// The C boolean test that `subject` (of enum type `subject_ty`) is variant
+    /// `vname` — a tag comparison, or a null test for a niche enum.
+    fn variant_tag_test(&mut self, subject: &str, subject_ty: &Ty, vname: &str) -> String {
+        if let Some(n) = self.niche_of_ty(subject_ty) {
+            let cty = self.c_type(&n.payload);
+            return if vname == n.some_variant {
+                format!("{subject} != (({cty})0)")
+            } else {
+                format!("{subject} == (({cty})0)")
+            };
+        }
+        let prefix = self.enum_tag_prefix(subject_ty);
+        format!("{subject}.tag == {prefix}_{vname}")
+    }
+
+    /// The C l-value path and Jestyr type of field `i` of variant `vname` reached
+    /// through `subject`. For a niche enum the lone payload *is* the subject.
+    fn variant_field(
+        &mut self,
+        subject: &str,
+        subject_ty: &Ty,
+        vname: &str,
+        i: usize,
+    ) -> Option<(String, Ty)> {
+        if let Some(n) = self.niche_of_ty(subject_ty) {
+            if vname == n.some_variant && i == 0 {
+                return Some((subject.to_string(), n.payload.clone()));
+            }
+            return None;
+        }
+        let vi = self.variants.get(vname)?.clone();
+        let (fname, fty_id) = vi.fields.get(i)?;
+        let subst = match subject_ty {
+            Ty::GenEnum { ctor, args } => self.gen_enum_subst(ctor, args),
+            _ => HashMap::new(),
+        };
+        let fty = self.ast_type_to_ty(*fty_id, &subst);
+        Some((format!("{subject}.u.{vname}.j_{fname}"), fty))
+    }
+
+    /// Compile a pattern to `(C boolean test, binding statements)` against the
+    /// value at C-expression `subject` of type `subject_ty`. `"1"` means the
+    /// pattern is irrefutable (a wildcard/binding). Recurses into sub-patterns,
+    /// auto-dereferencing pointer fields (so `node(leaf(_), ..)` looks *through*
+    /// an `indirect Tree`).
+    fn pat_test(&mut self, subject: &str, subject_ty: &Ty, pat: PatId) -> (String, Vec<String>) {
+        let ast = self.ast;
+        match &ast.pat_at(pat).kind {
+            PatKind::Wildcard | PatKind::Rest | PatKind::Error => ("1".to_string(), vec![]),
+            PatKind::Ident(n) if !self.variants.contains_key(&n.name) => {
+                let cty = self.c_type(subject_ty);
+                ("1".to_string(), vec![format!("{cty} j_{} = {subject};", n.name)])
+            }
+            PatKind::Ident(n) => (self.variant_tag_test(subject, subject_ty, &n.name), vec![]),
+            PatKind::Variant { name, subpats } => {
+                let mut tests = vec![self.variant_tag_test(subject, subject_ty, &name.name)];
+                let mut binds = vec![];
+                for (i, sp) in subpats.iter().enumerate() {
+                    if matches!(ast.pat_at(*sp).kind, PatKind::Rest) {
+                        break; // trailing `..` ignores the remaining fields
+                    }
+                    if let Some((fpath, fty)) =
+                        self.variant_field(subject, subject_ty, &name.name, i)
+                    {
+                        let (t, b) = self.pat_test_auto(&fpath, &fty, *sp);
+                        if t != "1" {
+                            tests.push(t);
+                        }
+                        binds.extend(b);
+                    }
+                }
+                (tests.join(" && "), binds)
+            }
+            PatKind::Lit(e) => {
+                let lc = self.emit_expr(*e);
+                (format!("{subject} == ({lc})"), vec![])
+            }
+            PatKind::Range { lo, hi, inclusive } => {
+                let loc = self.emit_expr(*lo);
+                let hic = self.emit_expr(*hi);
+                let op = if *inclusive { "<=" } else { "<" };
+                (format!("{subject} >= ({loc}) && {subject} {op} ({hic})"), vec![])
+            }
+            PatKind::Or(alts) => {
+                let mut tests = vec![];
+                for a in alts {
+                    let (t, b) = self.pat_test(subject, subject_ty, *a);
+                    if !b.is_empty() {
+                        self.diag(
+                            ast.pat_at(*a).span,
+                            "or-pattern alternatives can't bind values in a nested `match` yet",
+                        );
+                    }
+                    tests.push(format!("({t})"));
+                }
+                (tests.join(" || "), vec![])
+            }
+        }
+    }
+
+    /// [`pat_test`], auto-dereferencing a pointer field when matching a constructor
+    /// pattern against it (so a recursive `indirect`/`*T` field is looked through).
+    fn pat_test_auto(&mut self, subject: &str, ty: &Ty, pat: PatId) -> (String, Vec<String>) {
+        if self.pat_is_constructor(pat) {
+            if let Some(inner) = pointer_pointee(ty) {
+                let deref = format!("(*{subject})");
+                return self.pat_test(&deref, &inner, pat);
+            }
+        }
+        self.pat_test(subject, ty, pat)
+    }
+
+    /// Lower a `match` containing nested patterns to an ordered if-chain whose arm
+    /// conditions are recursive pattern tests. Guards compose (the same
+    /// `emit_guarded_arm`); a fired arm `goto`s the end label or `return`s.
+    fn emit_nested_match(&mut self, e: ExprId, ret: bool, scrut_ty: &Ty) {
+        let ast = self.ast;
+        let (scrut, arms) = match &ast.expr_at(e).kind {
+            ExprKind::Match { scrut, arms } => (*scrut, arms),
+            _ => return,
+        };
+        let scrut_c = self.emit_expr(scrut);
+        let cty = self.c_type(scrut_ty);
+        let tmp = format!("jm_{}", self.tmp);
+        self.tmp += 1;
+        let end = format!("jm_end_{}", self.tmp);
+        self.tmp += 1;
+        self.line(format!("{cty} {tmp} = {scrut_c};"));
+
+        let mut has_uncond_default = false;
+        for arm in arms {
+            let (test, binds) = self.pat_test(&tmp, scrut_ty, arm.pat);
+            let uncond = test == "1";
+            if uncond && arm.guard.is_none() {
+                has_uncond_default = true;
+            }
+            if uncond {
+                self.line("{");
+            } else {
+                self.line(format!("if ({test})"));
+                self.line("{");
+            }
+            self.depth += 1;
+            for b in binds {
+                self.line(b);
+            }
+            self.emit_guarded_arm(arm.body, arm.guard, ret, &end);
             self.depth -= 1;
             self.line("}");
         }
@@ -5328,17 +5549,40 @@ mod tests {
     }
 
     #[test]
-    fn nested_subpattern_diagnoses_in_codegen() {
-        // The frontend (Maranget) understands `node(leaf, leaf)`, but the flat
-        // backend can't dispatch it — it must diagnose, not miscompile.
+    fn nested_variant_pattern_dispatches_via_deref() {
+        // A nested variant pattern looks *through* the `indirect` (pointer) field.
         let src = "enum Tree { leaf, node(l: indirect Tree, r: indirect Tree) } \
-                   fn f(read t: Tree) -> i32 { match t { leaf => 0, node(leaf, leaf) => 1 } }";
-        let (_c, d) = gen(src);
+                   fn f(read t: Tree) -> i32 { match t { leaf => 0, node(leaf, leaf) => 1, node(_, _) => 2 } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "nested patterns now compile: {:?}", d);
+        assert!(!c.contains("switch ("), "a nested match is an if-chain, not a switch: {c}");
         assert!(
-            d.iter().any(|x| x.message.contains("nested patterns aren't supported")),
-            "{:?}",
-            d
+            c.contains(".u.node.j_l).tag == Jestyr_Tree_leaf"),
+            "left child is deref'd and tag-tested: {c}"
         );
+        assert!(
+            c.contains(".u.node.j_r).tag == Jestyr_Tree_leaf"),
+            "right child too: {c}"
+        );
+    }
+
+    #[test]
+    fn nested_literal_pattern_tests_the_field() {
+        // A non-pointer field needs no deref — the literal tests the value directly.
+        let src = "enum E { v(x: i32), w } fn f(read e: E) -> i32 { match e { v(0) => 1, _ => 0 } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains(".u.v.j_x == (0)"), "nested literal tests the field value: {c}");
+    }
+
+    #[test]
+    fn flat_variant_match_still_uses_a_switch() {
+        // Regression: a flat `node(l, r)` binding match keeps the optimized switch.
+        let src = "enum Tree { leaf(v: i32), node(l: indirect Tree, r: indirect Tree) } \
+                   fn f(read t: Tree) -> i32 { match t { leaf(v) => v, node(l, r) => 0 } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("switch ("), "a flat match keeps its switch lowering: {c}");
     }
 
     #[test]

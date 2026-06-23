@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 241 tests pass, including `proptest` property
+and run (or are correctly rejected). 243 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -223,6 +223,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `ranges.jtr` | `0`, `1`, `2`, `3`, `9`, `-1`, `1` | **literal + range patterns (§2.4)** — `match` on integers; `0`, `1..=9`, `100..1000`; scalar match needs a catch-all; if-chain on the value (§5.39) |
 | `orpat.jtr` | `1`, `1`, `0`, `7`, `7`, `7`, `0` | **or-patterns `a \| b` (§2.4)** — `red \| green \| blue`, `0 \| 1 \| 2`, `10..=19 \| 30..=39`; each alt covers independently; stacked cases / ORed tests (§5.40) |
 | `rest_pat.jtr` | `1`, `2`, `7`, `0` | **`..` rest in variant patterns (§2.4)** — `click(x, ..)` binds `x`, ignores the rest; trailing-only; the binding loop just skips it (§5.41) |
+| `nested_match.jtr` | `0`, `1`, `2`, `99` | **nested pattern dispatch (§2.4)** — `node(leaf(_), leaf(_))`, `leaf(99)`; recursive `pat_test` if-chain, auto-deref through `indirect` (§5.43) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -785,6 +786,28 @@ These are the non-obvious things that will bite if you don't know them.
     miscompiling. The optimal **decision-tree lowering** that closes this gap is the remaining
     §2.4 work. Check-demo [`examples/exhaustive_check.jtr`](examples/exhaustive_check.jtr)
     (1 error + 1 warning).
+
+43. **Decision-tree backend — nested pattern *dispatch* (design §2.4, closing §5.42's gap).**
+    cgen now lowers a `match` with **nested** sub-patterns (`node(leaf(_), leaf(_))`, `some(0)`,
+    `v(0..=9)`). The core is **`pat_test(subject, subject_ty, pat) -> (C bool test, binding
+    stmts)`** — a recursive compiler that ANDs a variant's tag test with its fields' tests and
+    collects bindings along full C paths (`tmp.u.node.j_l`). **`pat_test_auto`** auto-dereferences
+    a *plain* pointer field (`pointer_pointee`: `*T`/`&[r]T`, **not** a fat `&T`) when matching a
+    constructor against it — so a nested pattern looks *through* an `indirect Tree`
+    (`(*tmp.u.node.j_l).tag == …`). It's **niche-aware**: `variant_tag_test`/`variant_field` use a
+    null test and treat the payload pointer as the lone field for a niche enum. **`emit_nested_match`**
+    is an ordered if-chain (`if (<pat_test>) { <binds>; <body> }`), guards composing via
+    `emit_guarded_arm`, with the same `goto`/`return` + `__builtin_unreachable` discipline as the
+    other chains. **Routing:** `emit_match` checks `pat_needs_nesting` (a variant field that isn't
+    a binding/`_`/`..`) and routes there; **flat matches keep their optimized switch/scalar/niche/
+    guarded paths unchanged** (so `recursion.jtr`'s flat `node(l, r)` still emits a `switch` — zero
+    test churn). The two variant-binding loops' "nested patterns aren't supported" diagnostics are
+    now **dead safety nets** (nesting is intercepted upstream). **Limitations:** or-pattern
+    alternatives still can't *bind* in a nested position (diagnosed); a fat `&T` field isn't
+    structurally looked through. Demo [`examples/nested_match.jtr`](examples/nested_match.jtr)
+    (`0, 1, 2, 99`). **This completes §2.4 end-to-end** (analysis *and* dispatch); the only deferred
+    polish is an *optimal* shared-test decision tree (the current if-chain re-tests the tag per arm
+    — correct, not minimal).
 
 ---
 

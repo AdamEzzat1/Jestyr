@@ -1,0 +1,54 @@
+// examples/nested_match.jtr — nested pattern dispatch (§2.4 decision-tree backend).
+// Patterns can now nest: a constructor inside a variant's fields. The backend
+// lowers a nested `match` to an ordered if-chain of recursive tests, auto-
+// dereferencing `indirect` (pointer) fields to look through the recursion.
+//
+// Run:  jestyrc run examples/nested_match.jtr   →  prints 0, 1, 2, 99
+
+enum Tree { leaf(v: i32), node(l: indirect Tree, r: indirect Tree) }
+
+// Classify a tree's shape by matching *nested* structure:
+//   leaf                     -> 0
+//   node of two leaves       -> 1   (looks through both `indirect` children)
+//   any deeper node          -> 2
+fn shape(read t: Tree) -> i32 {
+    match t {
+        leaf(_)                => 0,
+        node(leaf(_), leaf(_)) => 1,
+        node(_, _)             => 2,
+    }
+}
+
+// A nested literal also dispatches: a leaf carrying exactly 99.
+fn is_answer(read t: Tree) -> i32 {
+    match t {
+        leaf(99) => 99,
+        _        => 0,
+    }
+}
+
+fn leaf_box(v: i32) -> *mut Tree {
+    var p: *mut Tree = alloc_i32(8) as *mut Tree
+    unsafe { p.* = leaf(v) }
+    return p
+}
+
+fn main() -> i32 {
+    print_int(shape(leaf(5)))           // 0
+
+    var a: *mut Tree = leaf_box(1)
+    var b: *mut Tree = leaf_box(2)
+    var twig: Tree = node(a, b)
+    print_int(shape(twig))              // 1  (node of two leaves)
+
+    var twigbox: *mut Tree = alloc_i32(8) as *mut Tree
+    unsafe { twigbox.* = twig }
+    var c: *mut Tree = leaf_box(3)
+    var deep: Tree = node(twigbox, c)
+    print_int(shape(deep))              // 2  (left child is a node)
+
+    print_int(is_answer(leaf(99)))      // 99  (nested literal pattern)
+
+    free_ptr(a) free_ptr(b) free_ptr(twigbox) free_ptr(c)
+    return 0
+}
