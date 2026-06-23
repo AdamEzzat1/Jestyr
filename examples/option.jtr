@@ -1,0 +1,48 @@
+// examples/option.jtr — in-language Option(T) / Result(T, E) over generic enums
+// (enum/ADT step 1b-codegen).
+//
+//   jestyrc run examples/option.jtr   →  42, 7, 5, -3, 8
+//
+// Generic enums are monomorphized per instantiation, exactly like generic
+// structs: Option(i32) and Result(i32, i32) each become their own tagged union.
+// And the niche optimization is inherited for free — Option(*mut i32) collapses
+// to a bare pointer (none = NULL), no tag.
+//
+// (Inference note: a payload variant like `some(42)` recovers its instantiation
+// from the argument; a nullary `none` takes it from the expected type — a `let`
+// annotation or `return` type. So `var b: Option(i32) = none` works.)
+
+enum Option(T) { none, some(v: T) }
+enum Result(T, E) { ok(v: T), err(e: E) }
+
+fn or_else(o: Option(i32), d: i32) -> i32 {
+    match o { some(v) => v, none => d }
+}
+
+fn code(r: Result(i32, i32)) -> i32 {
+    match r { ok(v) => v, err(e) => 0 - e }
+}
+
+// Option(*mut i32) niche-optimizes to a bare pointer — same source, zero tag.
+fn deref_or(o: Option(*mut i32), d: i32) -> i32 {
+    match o { some(p) => unsafe { p.* }, none => d }
+}
+
+fn main() -> i32 {
+    var a: Option(i32) = some(42)
+    var b: Option(i32) = none
+    print_int(or_else(a, 0))     // 42
+    print_int(or_else(b, 7))     // 7
+
+    var ok1: Result(i32, i32) = ok(5)
+    var er1: Result(i32, i32) = err(3)
+    print_int(code(ok1))         // 5
+    print_int(code(er1))         // -3
+
+    var x: *mut i32 = alloc_i32(1)
+    unsafe { x.* = 8 }
+    var p: Option(*mut i32) = some(x)
+    print_int(deref_or(p, 0))    // 8  (niche: o is a bare pointer)
+    free_ptr(x)
+    return 0
+}

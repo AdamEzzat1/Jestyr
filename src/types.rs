@@ -33,6 +33,10 @@ pub enum Ty {
     Result(Box<Ty>),
     /// An applied generic struct, e.g. `List(i32)`. Non-`Copy`.
     GenStruct { ctor: String, args: Vec<Ty> },
+    /// An applied generic enum, e.g. `Option(i32)`. Non-`Copy` (unless a niche
+    /// instance, but the escape checker treats it conservatively). The `ctor`
+    /// names a generic `enum` declaration; `args` are its concrete type arguments.
+    GenEnum { ctor: String, args: Vec<Ty> },
     /// A slice `[]T` — a fat pointer `{ptr, len}`. Non-`Copy` (it borrows data).
     Slice(Box<Ty>),
     /// A generational reference `&T` — `{ptr, gen}` (§4.4). `Copy`: it may be
@@ -61,6 +65,7 @@ impl Ty {
             Ty::Opaque(_) => false, // generic/external: assume non-Copy (conservative & correct generically)
             Ty::Result(_) => false,
             Ty::GenStruct { .. } => false,
+            Ty::GenEnum { .. } => false,
             Ty::Slice(_) => false,
             Ty::GenRef(_) => true, // a generational reference is a copyable fat pointer
             Ty::RegionRef(_) => true, // a region reference is a copyable plain pointer
@@ -87,7 +92,7 @@ impl Ty {
             Ty::Named(i) => tbl.types.get(*i).map(|t| t.name.clone()).unwrap_or_else(|| "?".to_string()),
             Ty::Opaque(n) => n.clone(),
             Ty::Result(ok) => format!("{}!", ok.display(tbl)),
-            Ty::GenStruct { ctor, args } => {
+            Ty::GenStruct { ctor, args } | Ty::GenEnum { ctor, args } => {
                 let a: Vec<String> = args.iter().map(|t| t.display(tbl)).collect();
                 format!("{ctor}({})", a.join(", "))
             }
@@ -142,6 +147,9 @@ pub struct TypeDecl {
     /// Declared with `record` rather than `struct` — its fields are immutable
     /// (assigning one is a compile error). Layout/representation is identical.
     pub is_record: bool,
+    /// Generic type-parameter names, for a generic `enum Option(T) { … }`. Empty
+    /// for a plain type. Drives instantiation inference + monomorphization.
+    pub type_params: Vec<String>,
 }
 
 #[derive(Debug)]

@@ -89,7 +89,7 @@ enum Option(T) { none, some(T) }         // ← generic form (needs generic enum
   `none`→`((T*)0)`; `emit_niche_match` lowers `match` to an `!= NULL` test instead of a tag
   `switch`. Demo [`examples/niche.jtr`](../examples/niche.jtr) (`8, 42, 0`); the
   `size_of`/`!switch`/`!Jestyr_Maybe` proof is a cgen test.
-#### 2.2b Generic enums — SHAPE + FRONTEND ✅ (this session); codegen 🔜 NEXT
+#### 2.2b Generic enums + in-language `Option`/`Result` — ✅ DONE
 
 Decision: **direct `enum Name(T) { … }` syntax** (not the comptime-`fn … -> type`
 pattern generic structs use) — it keeps the enum a registered `TypeDecl`, so variant
@@ -104,28 +104,35 @@ in `enum_defs`/`forward_types`; *using* one (construction/match) emits a clear
 generic enums compile clean. Tests: parser (type params), cgen (template not emitted +
 use diagnoses).
 
-**The codegen completion (next, ~one focused turn):**
-1. **A generic-enum instance type.** Add `Ty::GenEnum { ctor, args }` (parallel to
-   `GenStruct`; reusing `GenStruct` would force a struct-vs-enum branch at every site).
-   `lower_type` of `App{ctor, args}` chooses `GenEnum` when `ctor` is a generic enum.
-2. **Instantiation inference** — the genuine hard part. typeck has **no** expected-type
-   propagation, so a payload variant `some(5)` can infer `Option(i32)` by unifying the
-   arg against the variant's generic field types, but a **nullary `none` cannot**. Two
-   options: (a) thread an `expected: Option<&Ty>` through `infer` for `let`-annotations
-   and `return` (the principled fix — a small bidirectional pass); or (b) interim:
-   require an ascription `none as Option(i32)`. Recommend (a) — it also helps struct
-   literals and future inference.
-3. **Monomorphization** — `collect_enum_instances` mirroring `collect_struct_instances`;
-   emit one `Jestyr_Option__i32` tagged union per instantiation with the type params
-   substituted; mangle via the existing `gen_struct_c_name` scheme.
-4. **Construction + match on instances** — extend `emit_variant_construct` and
-   `emit_match` to take the instance's substitution (the variant union/field types come
-   from the template under `subst`).
-5. **Niche-opt inheritance (free win).** Generalize `niche_enum_at` to run on an
-   instance under its substitution, so `Option(*T)`/`Option(&[r]T)` collapse to a bare
-   pointer automatically — the §2.2 optimization, now generic.
-6. **Prelude `Option`/`Result`.** Define `enum Option(T) { none, some(v: T) }` and
-   `enum Result(T, E) { ok(v: T), err(e: E) }` in a prelude module; retire any hardcoding.
+**The codegen completion — all landed:**
+1. **`Ty::GenEnum { ctor, args }`** instance type (a distinct variant, not reusing
+   `GenStruct`); `lower_type`/`ast_type_to_ty` of `App{ctor,args}` produce it when
+   `ctor` is a generic enum.
+2. **Instantiation inference** via `variant_ctor_type` — a payload variant `some(5)`
+   recovers `Option(i32)` by `unify_tp` against the variant's template field types; a
+   nullary `none` takes its instantiation from a new, *targeted* expected-type
+   (`cur_expected`/`cur_ret`, set around `let`-annotations and `return`). So
+   `var b: Option(i32) = none` and `return none` work.
+3. **Monomorphization** — `collect_enum_instances` scans every expression's type +
+   function signatures for concrete `GenEnum`s; `gen_enum_defs`/`emit_enum_instance`
+   emit one `Jestyr_Option__i32` tagged union per instantiation (type params
+   substituted), mangled via `gen_struct_c_name`.
+4. **Construction + match on instances** — `emit_variant_construct` reads the
+   construction expr's inferred `GenEnum` type; `emit_match` carries a `(tag_prefix,
+   subst)` pair so payload bindings get their concrete C type.
+5. **Niche-opt inheritance (free win)** — `niche_enum_instance` runs the niche rule on
+   the substituted variant templates, so `Option(*T)`/`Option(&[r]T)` collapse to a
+   bare pointer automatically. The §2.2 optimization, now generic.
+6. **In-language `Option`/`Result`** — `enum Option(T) { none, some(v: T) }` and
+   `enum Result(T, E) { ok(v: T), err(e: E) }` are ordinary source now (no hardcoding).
+   Demo [`examples/option.jtr`](../examples/option.jtr) (`42, 7, 5, -3, 8`).
+
+**Documented limitations (follow-ups):** instantiation inference covers `let`/`return`
+but **not call arguments** (`get(none)` can't infer — pass a typed binding, or write
+`some(…)`); generic enums used only *inside a generic function body* (under an unapplied
+substitution) aren't collected for monomorphization; generic-enum *methods* aren't
+supported; a true auto-imported prelude awaits the module system (today `Option`/`Result`
+are defined per-module or imported).
 
 ### 2.3 Struct-variant enums + explicit discriminants  ⏳
 
@@ -236,7 +243,7 @@ rebase the rest (HANDOFF §1).
 | 0 | **`record`** | smallest entry; pure subtraction | no | S | ✅ done |
 | 1a | **Niche optimization** (optional thin pointers) | flagship "transparent cost"; no shape change | no | M | ✅ done |
 | 1b-shape | **Generic enum AST + parser + frontend** | the high-conflict shape, landed early; templates skipped, use diagnoses | **yes** | M | ✅ done |
-| 1b-codegen | **Generic-enum monomorphization + inference + prelude `Option`/`Result`** | the codegen completion; inherits 1a's niche opt | no | M–L | 🔜 next |
+| 1b-codegen | **Generic-enum monomorphization + inference + in-language `Option`/`Result`** | the codegen completion; inherits 1a's niche opt | no | M–L | ✅ done |
 | 2 | **Struct-variant enums + explicit discriminants** | the AST-shape change → land early | **yes** | M | ⏳ |
 | 3 | **Match power + Maranget exhaustiveness** | rests on #2's pattern shapes; largest | **yes** | L | ⏳ |
 | 4 | **Recursive ADTs (`indirect`)** | needs ref tiers (have); novel | small | M | ⏳ |

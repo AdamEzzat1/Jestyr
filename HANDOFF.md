@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 198 tests pass, including `proptest` property
+and run (or are correctly rejected). 201 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -215,6 +215,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `tests_demo.jtr` | (via `jestyrc test`) | **`@test`/`@bench` runner (O)** — `jestyrc test` harness: runs `bool`-returning tests + timed benches; exit≠0 on failure (§5.30) |
 | `records.jtr` | `3`, `4`, `25` | **immutable `record` (B)** — struct/record split; field assignment is a static error; lowers to a plain struct (§5.32) |
 | `niche.jtr` | `8`, `42`, `0` | **niche optimization (B)** — `enum {none, some(*T)}` lowers to a bare pointer (`none`=NULL); `size_of`==pointer size; match→null-test (§5.33) |
+| `option.jtr` | `42`, `7`, `5`, `-3`, `8` | **generic enums + in-language `Option`/`Result` (B)** — monomorphized per instantiation; inference from args/expected-type; `Option(*T)` inherits niche-opt (§5.34) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -597,23 +598,32 @@ These are the non-obvious things that will bite if you don't know them.
     `c_type`/`c_ty_ast` return the payload pointer; `enum_defs` + `forward_types` skip the
     enum (no `Jestyr_<E>` struct/tag); `emit_variant_construct` handles `some`/`none`;
     `emit_niche_match` lowers `match` to an `if (p != NULL)` test instead of a tag
-    `switch`. Demo `examples/niche.jtr` (`8, 42, 0`). **Next (design 2.2b):** generic
-    enums → in-language `Option(T)`/`Result(T,E)`, which inherit this opt for free.
+    `switch`. Demo `examples/niche.jtr` (`8, 42, 0`). Generic instances inherit this
+    via `niche_enum_instance` (§5.34), so `Option(*T)` is a bare pointer too.
 
-34. **Generic enums — *shape + frontend* landed; codegen is the next step (design
-    §2.2b).** `enum Option(T) { none, some(x: T) }` now parses (`EnumDecl.type_params`,
-    via direct `enum Name(T)` syntax — *not* the comptime-`fn -> type` pattern generic
-    structs use, so the enum stays a registered `TypeDecl` and reuses variant/match/
-    niche machinery). typeck lowers variant field types with the enum's type params in
-    scope. cgen treats a generic enum as a **template**: `enum_defs`/`forward_types`
-    skip it, so a declared-but-unused generic enum compiles clean; *using* one
-    (`emit_variant_construct` via `enum_is_generic`) emits a clear "cannot lower generic
-    enum … yet" diagnostic rather than referencing a never-defined `Jestyr_<E>` struct.
-    **Remaining (next turn):** a `Ty::GenEnum` instance type; **instantiation
-    inference** (typeck has no expected-type propagation, so nullary `none` needs a small
-    bidirectional pass or an `as` ascription — the genuine hard part); `collect_enum_
-    instances` monomorphization; instance construction/match; generalizing `niche_enum_at`
-    to instances (so `Option(*T)` inherits §5.33 niche-opt); and prelude `Option`/`Result`.
+34. **Generic enums + in-language `Option`/`Result` — fully lowered (design §2.2b).**
+    `enum Option(T) { none, some(v: T) }` uses **direct `enum Name(T)` syntax** (not the
+    comptime-`fn -> type` pattern generic structs use), so the enum stays a registered
+    `TypeDecl` and reuses variant/match/exhaustiveness/niche machinery; it's
+    monomorphized per instantiation like a generic struct. Pieces:
+    - **Type:** `Ty::GenEnum { ctor, args }` (distinct from `GenStruct`). `lower_type`/
+      `ast_type_to_ty` of `App` produce it when the ctor is a generic enum.
+    - **Inference (`typeck::variant_ctor_type`):** a payload variant `some(5)` recovers
+      `Option(i32)` via `unify_tp` against the variant's template fields; a nullary
+      `none` takes its instance from a *targeted* expected type — `cur_expected`/`cur_ret`,
+      set only around `let`-annotations and `return` (not a general bidirectional pass).
+    - **Monomorphization (`cgen`):** `collect_enum_instances` scans every expr type +
+      fn signatures for concrete `GenEnum`s; `gen_enum_defs`/`emit_enum_instance` emit one
+      `Jestyr_Option__i32` tagged union per instance (type-params substituted, mangled by
+      `gen_struct_c_name`). `enum_defs`/`forward_types` still skip the *template*.
+    - **Construct/match:** `emit_variant_construct` reads the construction expr's inferred
+      `GenEnum` type; `emit_match` carries `(tag_prefix, subst)` so payload bindings get
+      their concrete C type. `niche_enum_instance` runs the niche rule on the substituted
+      templates, so `Option(*T)`/`Option(&[r]T)` inherit §5.33 niche-opt (a bare pointer).
+    Demo `examples/option.jtr` (`42, 7, 5, -3, 8`). **Limitations (follow-ups):**
+    inference doesn't cover *call arguments* (`get(none)` — pass a typed binding); generic
+    enums used only *inside a generic function body* aren't collected; generic-enum
+    *methods* and a true auto-prelude are future work.
 
 ---
 

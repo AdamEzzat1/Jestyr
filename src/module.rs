@@ -442,6 +442,13 @@ mod tests {
     }
 
     #[test]
+    fn option_example_compiles_clean() {
+        // In-language generic Option(T)/Result(T,E) (enum/ADT step 1b-codegen):
+        // monomorphization + inference + niche inheritance.
+        pipeline_is_clean("examples/option.jtr");
+    }
+
+    #[test]
     fn tests_demo_example_builds_a_clean_test_harness() {
         // The `@test`/`@bench` runner (workstream O): emit in test mode and check
         // the harness is generated without diagnostics.

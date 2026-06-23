@@ -50,6 +50,8 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
         expr_types: vec![Ty::Unknown; ast.exprs.len()],
         method_calls: HashMap::new(),
         qualified: HashMap::new(),
+        cur_expected: None,
+        cur_ret: None,
         diags: Vec::new(),
     };
     tc.build_table();
@@ -100,6 +102,14 @@ struct TypeChecker<'a> {
     method_calls: HashMap<ExprId, MethodRes>,
     /// Qualified access (`mem.allocate` / `mem.PAGE`) → the resolved bare name.
     qualified: HashMap<ExprId, String>,
+    /// The type a sub-expression is *expected* to have (from a `let` annotation
+    /// or a `return`), used to resolve an otherwise-ambiguous nullary generic
+    /// variant like `none` to its instantiation (`Option(i32)`). A minimal,
+    /// targeted bit of bidirectional inference — not a general expected-type pass.
+    cur_expected: Option<Ty>,
+    /// The return type of the function currently being checked — the expected type
+    /// for a `return <expr>`.
+    cur_ret: Option<Ty>,
     diags: Vec<Diagnostic>,
 }
 
@@ -128,6 +138,8 @@ impl<'a> TypeChecker<'a> {
                 }
                 Item::Enum(e) => {
                     let idx = self.register_type(&e.name, true);
+                    self.table.types[idx].type_params =
+                        e.type_params.iter().map(|p| p.name.clone()).collect();
                     for v in &e.variants {
                         self.table.variants.insert(v.name.name.clone(), idx);
                     }
@@ -239,9 +251,58 @@ impl<'a> TypeChecker<'a> {
             kind,
             is_copy: false,
             is_record: false,
+            type_params: Vec::new(),
         });
         self.table.type_index.insert(name.name.clone(), idx);
         idx
+    }
+
+    /// Does `name` denote a generic enum (an `enum Name(T) { … }` template)?
+    fn is_generic_enum(&self, name: &str) -> bool {
+        self.table.type_index.get(name).is_some_and(|&i| {
+            !self.table.types[i].type_params.is_empty()
+                && matches!(self.table.types[i].kind, TypeKindG::Enum { .. })
+        })
+    }
+
+    /// Type a variant construction `vname(args)` / bare `vname` whose owning enum
+    /// is `ei`. For a plain enum this is `Named(ei)`; for a *generic* enum, recover
+    /// the type arguments by unifying the actual arg types against the variant's
+    /// template field types, falling back to the expected type for a nullary variant.
+    fn variant_ctor_type(&self, ei: usize, vname: &str, arg_tys: &[Ty]) -> Ty {
+        let decl = &self.table.types[ei];
+        if decl.type_params.is_empty() {
+            return Ty::Named(ei);
+        }
+        let tps: HashSet<String> = decl.type_params.iter().cloned().collect();
+        let fields: Vec<Ty> = match &decl.kind {
+            TypeKindG::Enum { variants } => variants
+                .iter()
+                .find(|(n, _)| n == vname)
+                .map(|(_, f)| f.clone())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let mut subst: HashMap<String, Ty> = HashMap::new();
+        for (tmpl, actual) in fields.iter().zip(arg_tys) {
+            unify_tp(tmpl, actual, &tps, &mut subst);
+        }
+        let inferred: Vec<Ty> = decl
+            .type_params
+            .iter()
+            .map(|p| subst.get(p).cloned().unwrap_or(Ty::Unknown))
+            .collect();
+        // Args fully recovered from the call → use them.
+        if inferred.iter().all(|t| *t != Ty::Unknown) {
+            return Ty::GenEnum { ctor: decl.name.clone(), args: inferred };
+        }
+        // Otherwise (a nullary variant) adopt the expected instantiation if it matches.
+        if let Some(Ty::GenEnum { ctor, args }) = &self.cur_expected {
+            if *ctor == decl.name {
+                return Ty::GenEnum { ctor: decl.name.clone(), args: args.clone() };
+            }
+        }
+        Ty::GenEnum { ctor: decl.name.clone(), args: inferred }
     }
 
     /// If `t` (or what it points/refers to) is an immutable `record`, its name —
@@ -300,7 +361,13 @@ impl<'a> TypeChecker<'a> {
             }
             TypeKind::App { ctor, args } => {
                 let aty: Vec<Ty> = args.iter().map(|a| self.lower_type(ty_params, *a)).collect();
-                Ty::GenStruct { ctor: ctor.name.clone(), args: aty }
+                // `Ctor(args)` is a generic *enum* instance if `Ctor` names a
+                // generic enum; otherwise a generic struct (the comptime-fn form).
+                if self.is_generic_enum(&ctor.name) {
+                    Ty::GenEnum { ctor: ctor.name.clone(), args: aty }
+                } else {
+                    Ty::GenStruct { ctor: ctor.name.clone(), args: aty }
+                }
             }
             TypeKind::Error => Ty::Error,
         }
@@ -663,7 +730,11 @@ impl<'a> TypeChecker<'a> {
             let name = if p.is_self { "self".to_string() } else { p.name.name.clone() };
             scope[0].insert(name, pty);
         }
+        // The (ok) return type is the expected type for `return <expr>`.
+        let prev_ret = self.cur_ret.take();
+        self.cur_ret = f.ret_ty.map(|t| self.lower_type(&typ, t));
         self.infer_block(&mut scope, &typ, self_ty, &f.body);
+        self.cur_ret = prev_ret;
     }
 
     fn infer_block(&mut self, scope: &mut Scope, typ: &HashSet<String>, self_ty: &Ty, block: &Block) -> Ty {
@@ -673,18 +744,23 @@ impl<'a> TypeChecker<'a> {
         for (i, stmt) in block.stmts.iter().enumerate() {
             match stmt {
                 Stmt::Let { name, ty, init, .. } => {
+                    // A type annotation is the expected type for the initializer
+                    // (so `var m: Option(i32) = none` resolves `none`'s instantiation).
+                    let expected = ty.map(|t| self.lower_type(typ, t));
+                    let prev = self.cur_expected.take();
+                    self.cur_expected = expected.clone();
                     let inferred = init.map(|e| self.infer(scope, typ, self_ty, e));
-                    let bind = if let Some(t) = ty {
-                        self.lower_type(typ, *t)
-                    } else {
-                        inferred.unwrap_or(Ty::Unknown)
-                    };
+                    self.cur_expected = prev;
+                    let bind = expected.unwrap_or_else(|| inferred.unwrap_or(Ty::Unknown));
                     scope.last_mut().unwrap().insert(name.name.clone(), bind);
                     result = Ty::Unit;
                 }
                 Stmt::Return { value, .. } => {
                     if let Some(v) = value {
+                        let prev = self.cur_expected.take();
+                        self.cur_expected = self.cur_ret.clone();
                         self.infer(scope, typ, self_ty, *v);
+                        self.cur_expected = prev;
                     }
                     result = Ty::Unit;
                 }
@@ -718,7 +794,9 @@ impl<'a> TypeChecker<'a> {
                 } else if let Some(t) = self.table.consts.get(&n.name) {
                     t.clone()
                 } else if let Some(&i) = self.table.variants.get(&n.name) {
-                    Ty::Named(i)
+                    // A bare nullary variant, e.g. `none` — for a generic enum its
+                    // instantiation comes from the expected type (`variant_ctor_type`).
+                    self.variant_ctor_type(i, &n.name, &[])
                 } else {
                     Ty::Unknown // a function name or external symbol: stay quiet
                 }
@@ -838,8 +916,11 @@ impl<'a> TypeChecker<'a> {
                             ret
                         }
                     } else if let Some(&ei) = self.table.variants.get(&name) {
-                        // an enum-variant constructor, e.g. `circle(2.0)`
-                        Ty::Named(ei)
+                        // An enum-variant constructor, e.g. `circle(2.0)`. For a
+                        // generic enum, recover its type arguments from the args.
+                        let arg_tys: Vec<Ty> =
+                            args.iter().map(|a| self.expr_types[a.0 as usize].clone()).collect();
+                        self.variant_ctor_type(ei, &name, &arg_tys)
                     } else {
                         Ty::Unknown
                     }
@@ -1111,7 +1192,7 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             PatKind::Variant { name, subpats } => {
-                let ftys = self.variant_field_types(&name.name);
+                let ftys = self.variant_field_types_in(scrut, &name.name);
                 for (i, sp) in subpats.iter().enumerate() {
                     let fty = ftys.get(i).cloned().unwrap_or(Ty::Unknown);
                     self.bind_pattern_types(scope, &fty, *sp);
@@ -1133,10 +1214,37 @@ impl<'a> TypeChecker<'a> {
         Vec::new()
     }
 
+    /// Variant field types projected onto a *specific* scrutinee — for a generic
+    /// enum instance `Option(i32)`, the template's `T` becomes `i32` so a pattern
+    /// `some(p)` binds `p` to the concrete payload type.
+    fn variant_field_types_in(&self, scrut: &Ty, vname: &str) -> Vec<Ty> {
+        let base = self.variant_field_types(vname);
+        if let Ty::GenEnum { ctor, args } = scrut {
+            if let Some(&ei) = self.table.type_index.get(ctor) {
+                let subst: HashMap<String, Ty> = self.table.types[ei]
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .zip(args.iter().cloned())
+                    .collect();
+                return base.iter().map(|t| subst_ty(t, &subst)).collect();
+            }
+        }
+        base
+    }
+
     /// Report a non-exhaustive `match` on an enum (one not covering every variant
     /// and lacking a `_`/binding catch-all).
     fn check_exhaustive(&mut self, span: Span, scrut: &Ty, arms: &[MatchArm]) {
-        let Ty::Named(ei) = scrut else { return };
+        let ei = match scrut {
+            Ty::Named(i) => *i,
+            Ty::GenEnum { ctor, .. } => match self.table.type_index.get(ctor) {
+                Some(&i) => i,
+                None => return,
+            },
+            _ => return,
+        };
+        let ei = &ei;
         let all: Vec<String> = match &self.table.types[*ei].kind {
             TypeKindG::Enum { variants } => variants.iter().map(|(n, _)| n.clone()).collect(),
             _ => return, // matching a struct, not an enum — no variant set to check
@@ -1189,7 +1297,10 @@ fn unify_tp(param: &Ty, actual: &Ty, tps: &HashSet<String>, subst: &mut HashMap<
         (Ty::Opaque(n), a) if tps.contains(n) => {
             subst.entry(n.clone()).or_insert_with(|| a.clone());
         }
-        (Ty::GenStruct { ctor: c1, args: a1 }, Ty::GenStruct { ctor: c2, args: a2 }) if c1 == c2 => {
+        (Ty::GenStruct { ctor: c1, args: a1 }, Ty::GenStruct { ctor: c2, args: a2 })
+        | (Ty::GenEnum { ctor: c1, args: a1 }, Ty::GenEnum { ctor: c2, args: a2 })
+            if c1 == c2 =>
+        {
             for (p, x) in a1.iter().zip(a2) {
                 unify_tp(p, x, tps, subst);
             }
@@ -1210,6 +1321,10 @@ fn subst_ty(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
         Ty::Ptr { mutbl, inner } => Ty::Ptr { mutbl: *mutbl, inner: Box::new(subst_ty(inner, subst)) },
         Ty::Result(ok) => Ty::Result(Box::new(subst_ty(ok, subst))),
         Ty::GenStruct { ctor, args } => Ty::GenStruct {
+            ctor: ctor.clone(),
+            args: args.iter().map(|a| subst_ty(a, subst)).collect(),
+        },
+        Ty::GenEnum { ctor, args } => Ty::GenEnum {
             ctor: ctor.clone(),
             args: args.iter().map(|a| subst_ty(a, subst)).collect(),
         },

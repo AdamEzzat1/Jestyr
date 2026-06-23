@@ -97,6 +97,7 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool) -> (String, Vec<Dia
         subst: HashMap::new(),
         instances: Vec::new(),
         struct_instances: Vec::new(),
+        enum_instances: Vec::new(),
         error_tags,
         cur_result: String::new(),
         cur_ensures: Vec::new(),
@@ -153,6 +154,7 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool) -> (String, Vec<Dia
     g.instances = instances;
     g.method_instances = method_instances;
     g.struct_instances = g.collect_struct_instances();
+    g.enum_instances = g.collect_enum_instances();
     let (closures, closure_index) = g.collect_closures();
     g.closures = closures;
     g.closure_index = closure_index;
@@ -161,6 +163,7 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool) -> (String, Vec<Dia
     g.struct_defs();
     g.enum_defs();
     g.gen_struct_defs();
+    g.gen_enum_defs();
     g.slice_struct_defs();
     g.genref_struct_defs();
     g.result_defs();
@@ -265,6 +268,8 @@ struct Cgen<'a> {
     instances: Vec<(String, Vec<Ty>)>,
     /// every monomorphized generic-struct instance: (ctor name, concrete type args).
     struct_instances: Vec<(String, Vec<Ty>)>,
+    /// every monomorphized generic-enum instance: (ctor name, concrete type args).
+    enum_instances: Vec<(String, Vec<Ty>)>,
     /// error name → its integer tag.
     error_tags: HashMap<String, i64>,
     /// the C result-struct type of the function currently being emitted (empty if
@@ -444,6 +449,61 @@ impl<'a> Cgen<'a> {
         self.niche_enum_at(i)
     }
 
+    /// Niche info for a *generic enum instance* `ctor(args)`: substitute the type
+    /// arguments into the variant templates, then apply the same niche rule. So
+    /// `Option(*T)`/`Option(&[r]T)` inherit the niche optimization automatically.
+    fn niche_enum_instance(&self, ctor: &str, args: &[Ty]) -> Option<NicheInfo> {
+        let e = self.ast.items.iter().find_map(|it| match it {
+            Item::Enum(e) if e.name.name == ctor && e.is_generic() => Some(e),
+            _ => None,
+        })?;
+        if e.variants.len() != 2 {
+            return None;
+        }
+        let subst: HashMap<String, Ty> = e
+            .type_params
+            .iter()
+            .map(|p| p.name.clone())
+            .zip(args.iter().cloned())
+            .collect();
+        let mut none_variant = None;
+        let mut some = None;
+        for v in &e.variants {
+            match v.fields.as_slice() {
+                [] => none_variant = Some(v.name.name.clone()),
+                [(_, tid)] => {
+                    let ty = self.ast_type_to_ty(*tid, &subst);
+                    if is_niche_pointer(&ty) {
+                        some = Some((v.name.name.clone(), ty));
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        let (some_variant, payload) = some?;
+        Some(NicheInfo { none_variant: none_variant?, some_variant, payload })
+    }
+
+    /// The type-param → arg substitution for a generic enum instance `ctor(args)`.
+    fn gen_enum_subst(&self, ctor: &str, args: &[Ty]) -> HashMap<String, Ty> {
+        self.ast
+            .items
+            .iter()
+            .find_map(|it| match it {
+                Item::Enum(e) if e.name.name == ctor && e.is_generic() => Some(
+                    e.type_params
+                        .iter()
+                        .map(|p| p.name.clone())
+                        .zip(args.iter().cloned())
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
     /// Lower each enum to a tagged union: a `tag` enum plus a `union` of the
     /// payload-carrying variants. Nullary variants contribute a tag constant but
     /// no union member. A niche-optimized enum is skipped (it has no struct).
@@ -526,10 +586,14 @@ impl<'a> Cgen<'a> {
             TypeKind::Ptr { mutbl, inner } => {
                 Ty::Ptr { mutbl: *mutbl, inner: Box::new(self.ast_type_to_ty(*inner, subst)) }
             }
-            TypeKind::App { ctor, args } => Ty::GenStruct {
-                ctor: ctor.name.clone(),
-                args: args.iter().map(|a| self.ast_type_to_ty(*a, subst)).collect(),
-            },
+            TypeKind::App { ctor, args } => {
+                let aty: Vec<Ty> = args.iter().map(|a| self.ast_type_to_ty(*a, subst)).collect();
+                if self.enum_is_generic(&ctor.name) {
+                    Ty::GenEnum { ctor: ctor.name.clone(), args: aty }
+                } else {
+                    Ty::GenStruct { ctor: ctor.name.clone(), args: aty }
+                }
+            }
             TypeKind::Slice(inner) => Ty::Slice(Box::new(self.ast_type_to_ty(*inner, subst))),
             TypeKind::GenRef(inner) => Ty::GenRef(Box::new(self.ast_type_to_ty(*inner, subst))),
             TypeKind::RegionRef { inner, .. } => {
@@ -763,6 +827,136 @@ impl<'a> Cgen<'a> {
                 let fc = self.c_type(&fty);
                 self.raw(format!("    {fc} j_{};\n", name.name));
             }
+        }
+        self.raw("};\n\n");
+    }
+
+    // --- generic enums (monomorphization) ---
+
+    /// Is this type fully concrete (no unresolved type parameter / inference gap)?
+    /// Only concrete instances can be monomorphized into C.
+    fn is_concrete(t: &Ty) -> bool {
+        match t {
+            Ty::Opaque(_) | Ty::Unknown | Ty::Error => false,
+            Ty::Ptr { inner, .. }
+            | Ty::Slice(inner)
+            | Ty::GenRef(inner)
+            | Ty::RegionRef(inner)
+            | Ty::Result(inner) => Self::is_concrete(inner),
+            Ty::GenStruct { args, .. } | Ty::GenEnum { args, .. } => {
+                args.iter().all(Self::is_concrete)
+            }
+            _ => true,
+        }
+    }
+
+    /// Every generic-enum instance the program uses — found by scanning every
+    /// expression's inferred type plus all function signatures for `GenEnum`.
+    /// (Instances arising only *inside* a generic function body, under a yet-
+    /// unapplied substitution, aren't collected here — a documented limitation.)
+    fn collect_enum_instances(&self) -> Vec<(String, Vec<Ty>)> {
+        let mut seen = HashSet::new();
+        let mut order = Vec::new();
+        for t in &self.info.expr_types {
+            self.collect_gen_enum(t, &mut seen, &mut order);
+        }
+        for sig in self.info.table.fns.values() {
+            for p in &sig.params {
+                self.collect_gen_enum(&p.ty, &mut seen, &mut order);
+            }
+            self.collect_gen_enum(&sig.ret, &mut seen, &mut order);
+        }
+        order
+    }
+
+    fn collect_gen_enum(
+        &self,
+        t: &Ty,
+        seen: &mut HashSet<String>,
+        order: &mut Vec<(String, Vec<Ty>)>,
+    ) {
+        match t {
+            Ty::GenEnum { ctor, args } => {
+                for a in args {
+                    self.collect_gen_enum(a, seen, order);
+                }
+                if args.iter().all(Self::is_concrete) {
+                    let cname = self.gen_struct_c_name(ctor, args);
+                    if seen.insert(cname) {
+                        order.push((ctor.clone(), args.clone()));
+                    }
+                }
+            }
+            Ty::GenStruct { args, .. } => {
+                for a in args {
+                    self.collect_gen_enum(a, seen, order);
+                }
+            }
+            Ty::Ptr { inner, .. }
+            | Ty::Slice(inner)
+            | Ty::GenRef(inner)
+            | Ty::RegionRef(inner)
+            | Ty::Result(inner) => self.collect_gen_enum(inner, seen, order),
+            _ => {}
+        }
+    }
+
+    fn gen_enum_defs(&mut self) {
+        // Forward typedefs for non-niche instances (a niche instance is a pointer).
+        for (ctor, args) in self.enum_instances.clone() {
+            if self.niche_enum_instance(&ctor, &args).is_some() {
+                continue;
+            }
+            let cname = self.gen_struct_c_name(&ctor, &args);
+            self.raw(format!("typedef struct {cname} {cname};\n"));
+        }
+        self.raw("\n");
+        for (ctor, args) in self.enum_instances.clone() {
+            self.emit_enum_instance(&ctor, &args);
+        }
+    }
+
+    /// Emit one monomorphized generic-enum instance as a tagged union (a niche
+    /// instance is skipped — it lowers to its bare pointer payload).
+    fn emit_enum_instance(&mut self, ctor: &str, args: &[Ty]) {
+        if self.niche_enum_instance(ctor, args).is_some() {
+            return;
+        }
+        let Some(e) = self.ast.items.iter().find_map(|it| match it {
+            Item::Enum(e) if e.name.name == ctor && e.is_generic() => Some(e.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let subst: HashMap<String, Ty> = e
+            .type_params
+            .iter()
+            .map(|p| p.name.clone())
+            .zip(args.iter().cloned())
+            .collect();
+        let cname = self.gen_struct_c_name(ctor, args);
+        self.raw(format!("enum {cname}_tag {{\n"));
+        for v in &e.variants {
+            self.raw(format!("    {cname}_{},\n", v.name.name));
+        }
+        self.raw("};\n");
+        self.raw(format!("struct {cname} {{\n"));
+        self.raw(format!("    enum {cname}_tag tag;\n"));
+        if e.variants.iter().any(|v| !v.fields.is_empty()) {
+            self.raw("    union {\n");
+            for v in &e.variants {
+                if v.fields.is_empty() {
+                    continue;
+                }
+                self.raw("        struct { ");
+                for (fname, tid) in &v.fields {
+                    let fty = self.ast_type_to_ty(*tid, &subst);
+                    let fcty = self.c_type(&fty);
+                    self.raw(format!("{fcty} j_{}; ", fname.name));
+                }
+                self.raw(format!("}} {};\n", v.name.name));
+            }
+            self.raw("    } u;\n");
         }
         self.raw("};\n\n");
     }
@@ -1412,17 +1606,32 @@ impl<'a> Cgen<'a> {
         };
 
         let scrut_ty = self.info.type_of(scrut).clone();
-        // A niche-optimized enum matches on a null test, not a tag `switch`.
-        if let Ty::Named(i) = &scrut_ty {
-            if let Some(n) = self.niche_enum_at(*i) {
-                return self.emit_niche_match(e, ret, &n);
+        // A niche-optimized enum (plain or a generic instance) matches on a null
+        // test, not a tag `switch`.
+        match &scrut_ty {
+            Ty::Named(i) => {
+                if let Some(n) = self.niche_enum_at(*i) {
+                    return self.emit_niche_match(e, ret, &n);
+                }
             }
+            Ty::GenEnum { ctor, args } => {
+                if let Some(n) = self.niche_enum_instance(ctor, args) {
+                    return self.emit_niche_match(e, ret, &n);
+                }
+            }
+            _ => {}
         }
-        let enum_name = match &scrut_ty {
+        // The C tag-enum prefix and the type-arg substitution (empty for a plain
+        // enum; type-params → args for a generic instance), so payload bindings
+        // get their concrete C type.
+        let (tag_prefix, subst): (String, HashMap<String, Ty>) = match &scrut_ty {
             Ty::Named(i)
                 if matches!(self.info.table.types[*i].kind, TypeKindG::Enum { .. }) =>
             {
-                self.info.table.types[*i].name.clone()
+                (format!("Jestyr_{}", self.info.table.types[*i].name), HashMap::new())
+            }
+            Ty::GenEnum { ctor, args } => {
+                (self.gen_struct_c_name(ctor, args), self.gen_enum_subst(ctor, args))
             }
             _ => {
                 self.diag(ast.expr_at(e).span, "the C backend only supports `match` on enum values");
@@ -1443,14 +1652,17 @@ impl<'a> Cgen<'a> {
         for arm in arms {
             match &ast.pat_at(arm.pat).kind {
                 PatKind::Variant { name: vname, subpats } => {
-                    self.line(format!("case Jestyr_{enum_name}_{}:", vname.name));
+                    self.line(format!("case {tag_prefix}_{}:", vname.name));
                     self.line("{");
                     self.depth += 1;
                     if let Some(vi) = self.variants.get(&vname.name).cloned() {
                         for (i, sp) in subpats.iter().enumerate() {
                             if let PatKind::Ident(bind) = &ast.pat_at(*sp).kind {
                                 if let Some((fname, fty)) = vi.fields.get(i) {
-                                    let fcty = self.c_ty_ast(*fty);
+                                    // Substitute the instance's type args (no-op for
+                                    // a plain enum) so the binding's C type is concrete.
+                                    let ft = self.ast_type_to_ty(*fty, &subst);
+                                    let fcty = self.c_type(&ft);
                                     self.line(format!(
                                         "{fcty} j_{} = {tmp}.u.{}.j_{fname};",
                                         bind.name, vname.name
@@ -1468,7 +1680,7 @@ impl<'a> Cgen<'a> {
                 }
                 PatKind::Ident(vname) if self.variants.contains_key(&vname.name) => {
                     // a nullary variant pattern, e.g. `none`
-                    self.line(format!("case Jestyr_{enum_name}_{}:", vname.name));
+                    self.line(format!("case {tag_prefix}_{}:", vname.name));
                     self.line("{");
                     self.depth += 1;
                     self.emit_arm_body(arm.body, ret);
@@ -1543,26 +1755,48 @@ impl<'a> Cgen<'a> {
             .any(|it| matches!(it, Item::Enum(e) if e.name.name == name && e.is_generic()))
     }
 
-    fn emit_variant_construct(&mut self, vi: &VariantInfo, vname: &str, args: &[ExprId]) -> String {
-        // Generic-enum instances aren't lowered yet (design §2.2b) — diagnose
-        // rather than emit a reference to a never-defined template struct.
-        if self.enum_is_generic(&vi.enum_name) {
-            let span = args
-                .first()
-                .map(|a| self.ast.expr_at(*a).span)
-                .unwrap_or_else(|| Span::new(0, 0));
-            self.diag(
-                span,
-                format!(
-                    "the C backend cannot lower generic enum `{}` yet (monomorphization is the next step)",
-                    vi.enum_name
-                ),
-            );
-            return "0".to_string();
+    fn emit_variant_construct(
+        &mut self,
+        construct_id: ExprId,
+        vi: &VariantInfo,
+        vname: &str,
+        args: &[ExprId],
+    ) -> String {
+        // A generic-enum instance: the instantiation comes from this expression's
+        // inferred type (`Option(i32)`), so the right monomorphized struct is used.
+        if let Ty::GenEnum { ctor, args: targs } = self.info.type_of(construct_id).clone() {
+            if !targs.iter().all(Self::is_concrete) {
+                self.diag(
+                    self.ast.expr_at(construct_id).span,
+                    format!("cannot infer the type arguments of generic enum `{ctor}` here"),
+                );
+                return "0".to_string();
+            }
+            // Niche instance → bare pointer (`some` is the value, `none` is NULL).
+            if let Some(n) = self.niche_enum_instance(&ctor, &targs) {
+                if vname == n.some_variant {
+                    return args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".into());
+                }
+                let pcty = self.c_type(&n.payload);
+                return format!("(({pcty})0)");
+            }
+            let cname = self.gen_struct_c_name(&ctor, &targs);
+            let mut s = format!("({cname}){{ .tag = {cname}_{vname}");
+            if !args.is_empty() {
+                let _ = write!(s, ", .u.{vname} = {{ ");
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    let e = self.emit_expr(*a);
+                    s.push_str(&e);
+                }
+                s.push_str(" }");
+            }
+            s.push_str(" }");
+            return s;
         }
-        // Niche-optimized enum: the value *is* the pointer payload. The `some`
-        // variant emits its argument directly; the `none` variant is the null
-        // pointer — no tag, no struct literal.
+        // Niche-optimized (non-generic) enum: the value *is* the pointer payload.
         if let Some(n) = self.niche_enum_named(&vi.enum_name) {
             if vname == n.some_variant {
                 return args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".to_string());
@@ -1610,7 +1844,7 @@ impl<'a> Cgen<'a> {
                 if let Some(vi) = self.variants.get(&n.name).cloned() {
                     if vi.fields.is_empty() {
                         let vname = n.name.clone();
-                        return self.emit_variant_construct(&vi, &vname, &[]);
+                        return self.emit_variant_construct(id, &vi, &vname, &[]);
                     }
                 }
                 if self.ptr_params.contains(&n.name) {
@@ -1860,7 +2094,7 @@ impl<'a> Cgen<'a> {
             // enum-variant constructor with a payload, e.g. `circle(2.0)`
             if let Some(vi) = self.variants.get(&n.name).cloned() {
                 let vname = n.name.clone();
-                return self.emit_variant_construct(&vi, &vname, args);
+                return self.emit_variant_construct(call_id, &vi, &vname, args);
             }
 
             // print intrinsics
@@ -3265,6 +3499,12 @@ impl<'a> Cgen<'a> {
             TypeKind::App { ctor, args } => {
                 let subst = self.subst.clone();
                 let aty: Vec<Ty> = args.iter().map(|a| self.ast_type_to_ty(*a, &subst)).collect();
+                // A generic-enum instance may be niche-optimized to a bare pointer.
+                if self.enum_is_generic(&ctor.name) {
+                    if let Some(n) = self.niche_enum_instance(&ctor.name, &aty) {
+                        return self.c_type(&n.payload);
+                    }
+                }
                 self.gen_struct_c_name(&ctor.name, &aty)
             }
             TypeKind::Slice(inner) => {
@@ -3313,6 +3553,13 @@ impl<'a> Cgen<'a> {
             },
             Ty::Result(ok) => self.result_c_name(ok),
             Ty::GenStruct { ctor, args } => self.gen_struct_c_name(ctor, args),
+            Ty::GenEnum { ctor, args } => {
+                // A niche-able instance is its bare pointer; else the tagged union.
+                if let Some(n) = self.niche_enum_instance(ctor, args) {
+                    return self.c_type(&n.payload);
+                }
+                self.gen_struct_c_name(ctor, args)
+            }
             Ty::Slice(elem) => self.slice_c_name(elem),
             Ty::GenRef(elem) => self.genref_c_name(elem),
             Ty::RegionRef(elem) => {
@@ -4591,21 +4838,46 @@ mod tests {
     }
 
     #[test]
-    fn generic_enum_template_is_not_emitted_and_use_diagnoses() {
-        // A generic enum is a template — declaring one (unused) emits nothing and
-        // compiles clean; the per-instantiation codegen is the next sub-step.
+    fn generic_enum_template_is_not_emitted_until_instantiated() {
+        // A generic enum is a template — declaring one (unused) emits no struct.
         let (c, d) =
             gen("enum Option(T) { none, some(x: T) } fn main() -> i32 { return 0 }");
         assert!(d.is_empty(), "declared-but-unused generic enum is clean: {:?}", d);
-        assert!(!c.contains("Jestyr_Option"), "no template struct emitted: {c}");
-        // Using one is a clear diagnostic, never broken C.
-        let (_c2, d2) =
-            gen("enum Option(T) { none, some(x: T) } fn f() -> i32 { var m = some(5) return 0 }");
+        assert!(!c.contains("Jestyr_Option"), "no template struct emitted when unused: {c}");
+    }
+
+    #[test]
+    fn monomorphizes_a_generic_enum_instance_with_construction_and_match() {
+        let src = "enum Option(T) { none, some(v: T) } \
+                   fn get(o: Option(i32), d: i32) -> i32 { match o { some(v) => v, none => d } } \
+                   fn main() -> i32 { var a: Option(i32) = some(7) var b: Option(i32) = none \
+                                      return get(a, 0) + get(b, 1) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        // The i32 instance is a tagged union with a mangled name.
+        assert!(c.contains("struct Jestyr_Option__i32 {"), "instance struct: {c}");
+        assert!(c.contains("Jestyr_Option__i32 j_o"), "param uses the instance: {c}");
+        // Construction names the instance's tag/union.
         assert!(
-            d2.iter().any(|m| m.message.contains("cannot lower generic enum `Option`")),
-            "using a generic enum diagnoses pending codegen: {:?}",
-            d2
+            c.contains(".tag = Jestyr_Option__i32_some, .u.some = { 7 }"),
+            "some(7) constructs the instance: {c}"
         );
+        assert!(c.contains(".tag = Jestyr_Option__i32_none"), "none constructs the instance: {c}");
+        // Match switches on the instance's tag and binds the substituted payload.
+        assert!(c.contains("case Jestyr_Option__i32_some:"), "match case: {c}");
+        assert!(c.contains("int32_t j_v = "), "payload bound at concrete type: {c}");
+    }
+
+    #[test]
+    fn generic_enum_instance_inherits_niche_optimization() {
+        // Option(*mut i32) is one nullary + one thin-pointer variant → bare pointer.
+        let src = "enum Option(T) { none, some(v: T) } \
+                   fn get(o: Option(*mut i32)) -> i32 { match o { some(p) => unsafe { p.* }, none => 0 } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("int32_t jestyr_get(int32_t* j_o)"), "instance is a bare pointer: {c}");
+        assert!(c.contains("!= ((int32_t*)0)"), "match is a null test: {c}");
+        assert!(!c.contains("Jestyr_Option__pmut"), "no tagged union for the niche instance: {c}");
     }
 
     #[test]
