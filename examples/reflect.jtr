@@ -1,0 +1,25 @@
+// examples/reflect.jtr — layout reflection (design §2.7). Two new compile-time
+// intrinsics next to `size_of`: `align_of(T)` (→ C `_Alignof`) and
+// `offset_of(T, field)` (→ C `offsetof`). They make a type's memory layout
+// inspectable *in the language* — the opposite of a hidden alphabetical map, and
+// a seed for the CTFE/reflection workstream.
+//
+// `Mixed { a: u8, b: i32, c: u8 }` — natural alignment is 4 (the i32), so `b`
+// sits at offset 4 (after `a` + 3 padding bytes), and `c` at offset 8.
+//
+// Run:  jestyrc run examples/reflect.jtr   →  12, 4, 0, 4, 8
+
+struct Mixed {
+    a: u8,
+    b: i32,
+    c: u8,
+}
+
+fn main() -> i32 {
+    print_int(size_of(Mixed))         // 12 — padded to a 4-byte multiple
+    print_int(align_of(Mixed))        // 4  — the i32 field's alignment
+    print_int(offset_of(Mixed, a))    // 0
+    print_int(offset_of(Mixed, b))    // 4  — after `a` + 3 padding bytes
+    print_int(offset_of(Mixed, c))    // 8
+    return 0
+}

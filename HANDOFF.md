@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 243 tests pass, including `proptest` property
+and run (or are correctly rejected). 244 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -224,6 +224,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `orpat.jtr` | `1`, `1`, `0`, `7`, `7`, `7`, `0` | **or-patterns `a \| b` (§2.4)** — `red \| green \| blue`, `0 \| 1 \| 2`, `10..=19 \| 30..=39`; each alt covers independently; stacked cases / ORed tests (§5.40) |
 | `rest_pat.jtr` | `1`, `2`, `7`, `0` | **`..` rest in variant patterns (§2.4)** — `click(x, ..)` binds `x`, ignores the rest; trailing-only; the binding loop just skips it (§5.41) |
 | `nested_match.jtr` | `0`, `1`, `2`, `99` | **nested pattern dispatch (§2.4)** — `node(leaf(_), leaf(_))`, `leaf(99)`; recursive `pat_test` if-chain, auto-deref through `indirect` (§5.43) |
+| `reflect.jtr` | `12`, `4`, `0`, `4`, `8` | **layout reflection (§2.7)** — `align_of(T)`→`_Alignof`, `offset_of(T, f)`→`offsetof`; compile-time intrinsics next to `size_of` (§5.44) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -808,6 +809,17 @@ These are the non-obvious things that will bite if you don't know them.
     (`0, 1, 2, 99`). **This completes §2.4 end-to-end** (analysis *and* dispatch); the only deferred
     polish is an *optimal* shared-test decision tree (the current if-chain re-tests the tag per arm
     — correct, not minimal).
+
+44. **Layout reflection — `align_of(T)` / `offset_of(T, f)` (design §2.7).** Two new cgen
+    intrinsics alongside `size_of`, in `emit_call`'s name-keyed dispatch: `align_of(T)` →
+    `_Alignof(<c_type T>)` (a C11 keyword — no header), `offset_of(T, f)` →
+    `offsetof(Jestyr_<T>, j_<f>)` (`<stddef.h>`, already in the prelude). The first arg is a
+    **type** (resolved by `eval_type_arg`, like `size_of`); for `offset_of` the **second arg
+    is a bare field name** — an `ExprKind::Name` whose identifier is read directly (never
+    emitted as a value; a non-name diagnoses), and the field's C symbol is `j_<name>` (§5.4).
+    Both are added to `is_intrinsic` (so a reference isn't mistaken for a closure capture).
+    Makes a type's layout inspectable in-language — a seed for CTFE/reflection (workstream G).
+    Demo [`examples/reflect.jtr`](examples/reflect.jtr) (`12, 4, 0, 4, 8`).
 
 ---
 

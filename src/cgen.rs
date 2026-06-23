@@ -2915,6 +2915,35 @@ impl<'a> Cgen<'a> {
                     let cty = self.c_type(&ty);
                     return format!("sizeof({cty})");
                 }
+                // Compile-time alignment of a type, e.g. `align_of(Packed)` → `_Alignof`.
+                "align_of" => {
+                    let subst = self.subst.clone();
+                    let ty = args.first().map(|a| self.eval_type_arg(*a, &subst)).unwrap_or(Ty::Unknown);
+                    let cty = self.c_type(&ty);
+                    return format!("_Alignof({cty})");
+                }
+                // Byte offset of a field within a struct: `offset_of(Point, y)` →
+                // `offsetof(Jestyr_Point, j_y)`. The second argument is a bare field
+                // name (an identifier expression), not a value.
+                "offset_of" => {
+                    let subst = self.subst.clone();
+                    let ty = args.first().map(|a| self.eval_type_arg(*a, &subst)).unwrap_or(Ty::Unknown);
+                    let cty = self.c_type(&ty);
+                    let field = args.get(1).and_then(|a| match &self.ast.expr_at(*a).kind {
+                        ExprKind::Name(fname) => Some(fname.name.clone()),
+                        _ => None,
+                    });
+                    match field {
+                        Some(f) => return format!("offsetof({cty}, j_{f})"),
+                        None => {
+                            self.diag(
+                                ast.expr_at(call_id).span,
+                                "`offset_of(T, field)` needs a bare field name as its second argument",
+                            );
+                            return "0".to_string();
+                        }
+                    }
+                }
                 // Generic allocation: first argument is the element *type*.
                 "alloc" => {
                     let subst = self.subst.clone();
@@ -4682,6 +4711,7 @@ fn is_intrinsic(name: &str) -> bool {
         name,
         "print_int" | "print_float" | "print_str" | "print_bool"
             | "alloc" | "alloc_i32" | "realloc" | "realloc_i32" | "free_ptr" | "size_of" | "slice"
+            | "align_of" | "offset_of"
             | "gen_new" | "gen_free" | "region_alloc" | "ok" | "err" | "is_err" | "unwrap"
             | "arena_open" | "arena_alloc" | "arena_close"
     )
@@ -4956,6 +4986,16 @@ mod tests {
         assert!(c.contains("struct __attribute__((packed)) Jestyr_P"), "packed: {c}");
         assert!(c.contains("struct __attribute__((aligned(16))) Jestyr_O"), "aligned: {c}");
         assert!(c.contains("sizeof(Jestyr_P)"), "size_of → sizeof: {c}");
+    }
+
+    #[test]
+    fn layout_reflection_align_of_and_offset_of() {
+        let src = "struct M { a: u8, b: i32, c: u8 } \
+                   fn main() -> i32 { print_int(align_of(M)) print_int(offset_of(M, b)) return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("_Alignof(Jestyr_M)"), "align_of → _Alignof: {c}");
+        assert!(c.contains("offsetof(Jestyr_M, j_b)"), "offset_of → offsetof with j_ field: {c}");
     }
 
     #[test]

@@ -270,7 +270,7 @@ distinct AccountId = i32
   argument-vs-parameter type-checking does. Pairs well with refinements later
   (`distinct Percent = u8` + `in 0..=100`).
 
-### 2.7 Layout reflection  ⏳
+### 2.7 Layout reflection  ✅ DONE
 
 ```jestyr
 size_of(Point)            // already exists
@@ -278,9 +278,12 @@ align_of(Point)           // new — _Alignof
 offset_of(Point, y)       // new — offsetof
 ```
 - **Inspiration:** Zig `@sizeOf`/`@alignOf`/`@offsetOf`/`@typeInfo`.
-- **Impl:** new cgen intrinsics emitting `_Alignof(T)` / `offsetof(T, f)`. Makes layout
-  *inspectable in-language* — the opposite of CJC's hidden alphabetical map, and a seed
-  for the CTFE/reflection workstream (G).
+- **What landed:** `align_of(T)` → `_Alignof(<c_type T>)` and `offset_of(T, f)` →
+  `offsetof(Jestyr_<T>, j_<f>)`, two cgen intrinsics next to `size_of` (`emit_call` dispatch;
+  `<stddef.h>` already in the prelude). `offset_of`'s second arg is a bare field name read
+  straight off the `ExprKind::Name`. Demo [`examples/reflect.jtr`](../examples/reflect.jtr)
+  (`12, 4, 0, 4, 8`); HANDOFF §5.44. Makes layout *inspectable in-language* — the opposite of
+  CJC's hidden alphabetical map, and a seed for the CTFE/reflection workstream (G).
 
 ### 2.8 Lower-priority / substrate  ⏳
 
@@ -312,7 +315,7 @@ rebase the rest (HANDOFF §1).
 | 3 | **Match power + Maranget exhaustiveness** | rests on #2's pattern shapes; largest | **yes** | L | ✅ guards/or/range/rest/Maranget-analysis; decision-tree cgen ⏳ |
 | 4 | **Recursive ADTs (`indirect`)** | needs ref tiers (have); novel | small | M | ⏳ |
 | 5 | **`distinct` types** | isolated; keyword reserved | small | S | ⏳ |
-| 6 | **Layout reflection (`offset_of`/`align_of`)** | isolated cgen intrinsics | no | S | ⏳ |
+| 6 | **Layout reflection (`offset_of`/`align_of`)** | isolated cgen intrinsics | no | S | ✅ done |
 | 7 | **Substrate** (defaults, visibility, spread, `union`, bit-fields, `Copy`) | polish; parallel-safe | mixed | M | ⏳ |
 
 **Discipline (unchanged):** every step ships a runnable `examples/*.jtr` demo, unit tests
