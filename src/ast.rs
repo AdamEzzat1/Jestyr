@@ -203,6 +203,9 @@ pub enum ExprKind {
     Block(Block),
     If { cond: ExprId, then: Block, els: Option<ExprId> },
     Match { scrut: ExprId, arms: Vec<MatchArm> },
+    /// An f-string `f"a {x} b"` — `parts` are the literal runs and `exprs` the
+    /// interpolations, with `parts.len() == exprs.len() + 1`. Builds an owned `String`.
+    FString { parts: Vec<String>, exprs: Vec<ExprId> },
     Unsafe(Block),
     Closure { params: Vec<ClosureParam>, body: ExprId },
 

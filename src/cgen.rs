@@ -389,7 +389,9 @@ impl<'a> Cgen<'a> {
         self.raw("static JestyrString jestyr_rt_str_from(JestyrStr v) { JestyrString s; s.cap = v.len ? v.len : 1; s.ptr = (char*)malloc(s.cap); memcpy(s.ptr, v.ptr, v.len); s.len = v.len; return s; }\n");
         self.raw("static void jestyr_rt_str_push(JestyrString* s, JestyrStr v) { if (s->len + v.len > s->cap) { size_t nc = s->cap ? s->cap * 2 : 8; while (nc < s->len + v.len) nc *= 2; s->ptr = (char*)realloc(s->ptr, nc); s->cap = nc; } memcpy(s->ptr + s->len, v.ptr, v.len); s->len += v.len; }\n");
         self.raw("static JestyrStr jestyr_rt_str_view(JestyrString* s) { return (JestyrStr){ s->ptr, s->len }; }\n");
-        self.raw("static void jestyr_rt_str_free(JestyrString* s) { free(s->ptr); s->ptr = NULL; s->len = 0; s->cap = 0; }\n\n");
+        self.raw("static void jestyr_rt_str_free(JestyrString* s) { free(s->ptr); s->ptr = NULL; s->len = 0; s->cap = 0; }\n");
+        self.raw("/* Append an integer's decimal digits (for f-string interpolation; copies). */\n");
+        self.raw("static void jestyr_rt_str_push_i64(JestyrString* s, int64_t v) { char b[24]; int n = snprintf(b, sizeof(b), \"%lld\", (long long)v); if (n < 0) n = 0; jestyr_rt_str_push(s, (JestyrStr){ b, (size_t)n }); }\n\n");
         self.raw("/* Jestyr Builder — an iolist: a list of `str` *fragments* collected with no\n");
         self.raw("   copying; `builder_build` sums the lengths, allocates once, and flattens in a\n");
         self.raw("   single pass (Erlang iodata). Fragments must outlive the build. */\n");
@@ -2678,6 +2680,7 @@ impl<'a> Cgen<'a> {
             // A string literal is a length-carrying view; `JSTR` snapshots its
             // compile-time byte length via `sizeof(lit) - 1`.
             ExprKind::Str(l) => format!("JSTR({l})"),
+            ExprKind::FString { parts, exprs } => self.emit_fstring(parts, exprs),
             ExprKind::Char(l) => l.clone(),
             ExprKind::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             ExprKind::Null => "NULL".to_string(),
@@ -4379,6 +4382,42 @@ impl<'a> Cgen<'a> {
     /// `for c in text { B }` → iterate a string's bytes. The length is computed
     /// once with `strlen`; each `c` is the `u8` byte. (Byte iteration, not
     /// Unicode-aware — a real grapheme/codepoint iterator is future work.)
+    /// Lower an f-string to a fresh owned `String`, built by appending each literal
+    /// run and each interpolation (formatted per type). The result is a statement-
+    /// expression so `f"…"` is an ordinary value.
+    fn emit_fstring(&mut self, parts: &[String], exprs: &[ExprId]) -> String {
+        let n = self.tmp;
+        self.tmp += 1;
+        let f = format!("_fs{n}");
+        let mut s = format!("({{ JestyrString {f} = jestyr_rt_str_new(); ");
+        for (i, part) in parts.iter().enumerate() {
+            if !part.is_empty() {
+                let _ = write!(s, "jestyr_rt_str_push(&{f}, JSTR(\"{part}\")); ");
+            }
+            if let Some(&e) = exprs.get(i) {
+                let et = self.info.type_of(e).clone();
+                let ec = self.emit_expr(e);
+                match &et {
+                    Ty::Prim("str") => {
+                        let _ = write!(s, "jestyr_rt_str_push(&{f}, {ec}); ");
+                    }
+                    Ty::Prim("String") => {
+                        let _ = write!(s, "jestyr_rt_str_push(&{f}, jestyr_rt_str_view(&{ec})); ");
+                    }
+                    Ty::Prim("bool") => {
+                        let _ = write!(s, "jestyr_rt_str_push(&{f}, ({ec}) ? JSTR(\"true\") : JSTR(\"false\")); ");
+                    }
+                    // Integers (and, as a fallback, anything else) format as decimal.
+                    _ => {
+                        let _ = write!(s, "jestyr_rt_str_push_i64(&{f}, (int64_t)({ec})); ");
+                    }
+                }
+            }
+        }
+        let _ = write!(s, "{f}; }})");
+        s
+    }
+
     /// If `e` is `codepoints(s)`, the string argument `s` — the marker for a
     /// codepoint-decoding `for` loop (this intrinsic is valid only in for-position).
     fn codepoints_iter_arg(&self, e: ExprId) -> Option<ExprId> {
@@ -5557,6 +5596,15 @@ mod tests {
         let (c, d) = gen("fn f(p: *mut i32) -> *mut u8 { return p as *mut u8 }");
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("(uint8_t*)(j_p)"), "pointer cast: {c}");
+    }
+
+    #[test]
+    fn fstring_builds_a_string_with_typed_interpolation() {
+        let src = "fn f(read who: str) -> i32 { let n: i32 = 3 var m: String = f\"{who}: {n}\" let r: i32 = m.len as i32 string_free(m) return r }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("jestyr_rt_str_new()"), "an f-string builds a fresh String: {c}");
+        assert!(c.contains("jestyr_rt_str_push_i64(&"), "an int interpolation formats as decimal: {c}");
     }
 
     #[test]

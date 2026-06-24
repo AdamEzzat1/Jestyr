@@ -922,6 +922,41 @@ impl<'src> Parser<'src> {
         e
     }
 
+    /// Split an f-string `f"a {x} b"` into literal `parts` and interpolated `exprs`.
+    /// Interpolations are bare identifiers (`{x}`); a `String` is the result.
+    fn parse_fstring(&mut self, span: Span) -> ExprId {
+        let raw = self.text(span);
+        // Drop the `f"` prefix and the closing `"` (both ASCII, so byte-safe).
+        let body: String = if raw.len() >= 3 { raw[2..raw.len() - 1].to_string() } else { String::new() };
+        let mut parts: Vec<String> = Vec::new();
+        let mut exprs: Vec<ExprId> = Vec::new();
+        let mut cur = String::new();
+        let mut chars = body.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '{' {
+                parts.push(std::mem::take(&mut cur));
+                let mut name = String::new();
+                while let Some(&nc) = chars.peek() {
+                    chars.next();
+                    if nc == '}' {
+                        break;
+                    }
+                    name.push(nc);
+                }
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    self.error(span, "empty `{}` interpolation in an f-string".to_string());
+                }
+                let id = self.ast.expr(ExprKind::Name(Ident { name, span }), span);
+                exprs.push(id);
+            } else {
+                cur.push(c);
+            }
+        }
+        parts.push(cur);
+        self.ast.expr(ExprKind::FString { parts, exprs }, span)
+    }
+
     fn parse_primary(&mut self) -> ExprId {
         let tok = self.cur();
         let span = tok.span;
@@ -929,6 +964,7 @@ impl<'src> Parser<'src> {
             Int => { self.bump(); let t = self.text(span); self.ast.expr(ExprKind::Int(t), span) }
             Float => { self.bump(); let t = self.text(span); self.ast.expr(ExprKind::Float(t), span) }
             Str => { self.bump(); let t = self.text(span); self.ast.expr(ExprKind::Str(t), span) }
+            FStr => { self.bump(); self.parse_fstring(span) }
             Char => { self.bump(); let t = self.text(span); self.ast.expr(ExprKind::Char(t), span) }
             True => { self.bump(); self.ast.expr(ExprKind::Bool(true), span) }
             False => { self.bump(); self.ast.expr(ExprKind::Bool(false), span) }

@@ -218,6 +218,11 @@ impl<'src> Lexer<'src> {
 
     fn ident(&mut self, start: usize) -> Token {
         self.eat_while(is_ident_continue);
+        // An f-string prefix: `f"…"` (the `f` is immediately followed by a quote).
+        if &self.src[start..self.pos] == "f" && self.peek() == Some('"') {
+            self.bump(); // consume the opening quote
+            return self.fstring(start);
+        }
         let text = &self.src[start..self.pos];
         let kind = if text == "_" {
             TokenKind::Underscore
@@ -225,6 +230,25 @@ impl<'src> Lexer<'src> {
             TokenKind::keyword(text).unwrap_or(TokenKind::Ident)
         };
         Token::new(kind, Span::new(start, self.pos))
+    }
+
+    /// Scan an f-string body (the opening `f"` is already consumed) to the closing
+    /// quote. The parser splits `{…}` interpolations out of the captured span.
+    fn fstring(&mut self, start: usize) -> Token {
+        loop {
+            match self.bump() {
+                None => {
+                    self.error(start, "unterminated f-string literal");
+                    break;
+                }
+                Some('"') => break,
+                Some('\\') => {
+                    self.bump();
+                }
+                Some(_) => {}
+            }
+        }
+        Token::new(TokenKind::FStr, Span::new(start, self.pos))
     }
 
     fn number(&mut self, start: usize) -> Token {
@@ -454,6 +478,13 @@ mod tests {
             kinds("(p + i).*"),
             vec![LParen, Ident, Plus, Ident, RParen, DotStar]
         );
+    }
+
+    #[test]
+    fn lexes_fstring_as_one_token() {
+        // `f"…"` is a single f-string token; a bare `f` followed by a space is an ident.
+        assert_eq!(kinds(r#"f"a {x} b""#), vec![FStr]);
+        assert_eq!(kinds(r#"f "x""#), vec![Ident, Str]);
     }
 
     #[test]

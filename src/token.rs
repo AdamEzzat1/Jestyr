@@ -27,6 +27,7 @@ pub enum TokenKind {
     Int,
     Float,
     Str,
+    FStr, // an f-string literal `f"… {x} …"`
     Char,
     Underscore, // a lone `_`, used as the pattern wildcard
 
@@ -212,6 +213,7 @@ impl TokenKind {
             Int => "int",
             Float => "float",
             Str => "string",
+            FStr => "f-string",
             Char => "char",
             Underscore => "_",
             Fn => "fn",

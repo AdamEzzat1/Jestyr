@@ -238,6 +238,19 @@ impl<'a> Printer<'a> {
         let e = self.ast.expr_at(id);
         match &e.kind {
             ExprKind::Int(s) | ExprKind::Float(s) | ExprKind::Str(s) | ExprKind::Char(s) => s.clone(),
+            ExprKind::FString { parts, exprs } => {
+                let mut out = String::from("f\"");
+                for (i, p) in parts.iter().enumerate() {
+                    out.push_str(p);
+                    if let Some(e) = exprs.get(i) {
+                        out.push('{');
+                        out.push_str(&self.expr_inline(*e));
+                        out.push('}');
+                    }
+                }
+                out.push('"');
+                out
+            }
             ExprKind::Bool(b) => b.to_string(),
             ExprKind::Null => "null".to_string(),
             ExprKind::Name(n) => n.name.clone(),

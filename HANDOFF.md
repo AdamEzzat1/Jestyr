@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 269 tests pass, including `proptest` property
+and run (or are correctly rejected). 271 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -237,6 +237,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `utf8_validate.jtr` | `1`, `2`, `2`, `0` | **validate-at-boundary (strings E)** — `from_utf8([]u8)→str` (validity as a type-state); `is_utf8` recoverable check (§5.54) |
 | `owned_string.jtr` | `5`, `12`, 2 greetings | **owned `String` (strings E)** — heap-owned growable buffer; `string_view` borrows it (owned/view split) (§5.55) |
 | `builder.jtr` | `9`, `[1, 2, 3]` | **iolist / `Builder` (strings E)** — collect `str` fragments zero-copy, flatten once into a `String` (§5.56) |
+| `fstring.jtr` | message, `25` | **f-strings (strings E)** — `f"{name} x = {x} ({ok})"` typed interpolation → owned `String` (§5.57) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -1008,6 +1009,21 @@ These are the non-obvious things that will bite if you don't know them.
     build** — which is exactly why this composes with region arenas (step 7): the escape checker
     can prove no fragment outlives its region. Demo [`examples/builder.jtr`](examples/builder.jtr)
     (`9,` then `[1, 2, 3]`).
+
+57. **f-strings (strings step 6).** `f"… {x} …"` interpolation. **Lexer:** `ident` detects the
+    `f"` prefix (`&src[start..pos] == "f" && peek() == '"'`) and scans an `FStr` token. **Parser:**
+    `parse_fstring` splits the captured span into literal `parts` and `{ident}` interpolations →
+    `ExprKind::FString { parts, exprs }` (`parts.len() == exprs.len() + 1`); interpolations are
+    **bare identifiers** (`{x}`), each lowered to an `ExprKind::Name` (no sub-expression re-lexing
+    — a documented limit). **typeck** infers each interpolation (so names resolve / types are
+    recorded) and types the whole thing as `String`. **cgen `emit_fstring`** builds a fresh owned
+    `String` via a statement-expr, formatting per type: `str` inlined, `String` via its view,
+    `bool` → `"true"`/`"false"`, integers (and the fallback) via `jestyr_rt_str_push_i64` (decimal,
+    copying). **Watch-out (the §5.28 lesson):** `FString` is a new `ExprKind`, so escape's
+    `walk_expr` and the printer gained arms (the two the compiler flagged) — its interpolations
+    are bare names, so the monomorphization walkers (which have `_` arms) needn't descend. Demo
+    [`examples/fstring.jtr`](examples/fstring.jtr) (`Jestyr says x = 42 (true)`, len `25`).
+    *(Limits: identifiers only, no `{{`/`}}` brace escaping, floats truncate to int.)*
 
 ---
 

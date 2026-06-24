@@ -1,0 +1,20 @@
+// examples/fstring.jtr — f-strings (strings workstream, step 6).
+//
+// `f"… {x} …"` interpolates identifiers into an owned `String`. Each interpolation
+// is formatted by its type: `str`/`String` are inlined, integers print as decimal,
+// `bool` as true/false. The result is a `String` you own and free — interpolation
+// is explicit string-building, not a hidden printf.
+//
+// Run:  jestyrc run examples/fstring.jtr   →  Jestyr says x = 42 (true)  /  25
+
+fn main() -> i32 {
+    let name: str = "Jestyr"
+    let x: i32 = 42
+    let ok: bool = true
+
+    var msg: String = f"{name} says x = {x} ({ok})"
+    print_str(string_view(msg))     // Jestyr says x = 42 (true)
+    print_int(msg.len)              // 25
+    string_free(msg)
+    return 0
+}

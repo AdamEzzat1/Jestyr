@@ -1126,6 +1126,14 @@ impl<'a> TypeChecker<'a> {
                 }
                 t
             }
+            ExprKind::FString { exprs, .. } => {
+                // Infer each interpolation (so names resolve and types are recorded
+                // for cgen's per-type formatting). An f-string builds an owned String.
+                for e in exprs {
+                    self.infer(scope, typ, self_ty, *e);
+                }
+                Ty::Prim("String")
+            }
             ExprKind::Match { scrut, arms } => {
                 let st = self.infer(scope, typ, self_ty, *scrut);
                 let mut result = Ty::Unknown;

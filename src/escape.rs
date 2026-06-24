@@ -211,6 +211,13 @@ impl<'a> Checker<'a> {
                 }
                 return;
             }
+            ExprKind::FString { exprs, .. } => {
+                // Interpolations are read for formatting — never a tail position.
+                for e in exprs {
+                    self.walk_expr(ctx, *e, false);
+                }
+                return;
+            }
             ExprKind::StructLit { path, fields, spread } => {
                 for fi in fields {
                     self.walk_expr(ctx, fi.value, false);
