@@ -1,0 +1,26 @@
+// examples/codepoints.jtr — cost-visible string views (strings workstream, step 2).
+//
+// `.len` is O(1) *bytes*; `count_codepoints` is O(n) — the cost lives in the name,
+// so you can never accidentally pay O(n) for a "length". Codepoint iteration is
+// explicit (`for cp in codepoints(s)`), never an implicit decode (the D lesson).
+//
+// Run:  jestyrc run examples/codepoints.jtr   →  5, 4, 233, 1
+
+fn main() -> i32 {
+    let s: str = "café"
+    print_int(s.len)                   // 5 — UTF-8 *bytes*, O(1)
+    print_int(count_codepoints(s))     // 4 — codepoints, O(n) decode
+
+    // The last codepoint is 'é' = U+00E9 = 233.
+    var last: i32 = 0
+    for cp in codepoints(s) { last = cp as i32 }
+    print_int(last)                    // 233
+
+    // Count the non-ASCII codepoints (>= 0x80).
+    var hi: i32 = 0
+    for cp in codepoints(s) {
+        if cp >= 128 { hi = hi + 1 }
+    }
+    print_int(hi)                      // 1  ('é')
+    return 0
+}

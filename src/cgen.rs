@@ -375,7 +375,13 @@ impl<'a> Cgen<'a> {
         self.raw("   like Zig `[]const u8` / Rust `&str`). `.len` is O(1); no `strlen`. A bare\n");
         self.raw("   `cstr` (null-terminated `const char*`) is the distinct C-interop type. */\n");
         self.raw("typedef struct { const char* ptr; size_t len; } JestyrStr;\n");
-        self.raw("#define JSTR(s) ((JestyrStr){ (s), sizeof(s) - 1 })\n\n");
+        self.raw("#define JSTR(s) ((JestyrStr){ (s), sizeof(s) - 1 })\n");
+        self.raw("/* O(n) codepoint count (vs O(1) `.len`): a UTF-8 leading byte is one whose top two bits aren't 10. */\n");
+        self.raw("static size_t jestyr_rt_count_cp(JestyrStr s) { size_t n = 0; for (size_t k = 0; k < s.len; k++) if (((uint8_t)s.ptr[k] & 0xC0u) != 0x80u) n++; return n; }\n");
+        self.raw("/* Decode the UTF-8 codepoint at *k, advancing *k past it (replacement char on a bad lead byte). */\n");
+        self.raw("static uint32_t jestyr_rt_decode_cp(const char* p, size_t len, size_t* k) { size_t i = *k; uint8_t b = (uint8_t)p[i]; uint32_t cp; size_t n; if (b < 0x80u) { cp = b; n = 1; } else if ((b & 0xE0u) == 0xC0u) { cp = b & 0x1Fu; n = 2; } else if ((b & 0xF0u) == 0xE0u) { cp = b & 0x0Fu; n = 3; } else if ((b & 0xF8u) == 0xF0u) { cp = b & 0x07u; n = 4; } else { *k = i + 1; return 0xFFFDu; } for (size_t j = 1; j < n && i + j < len; j++) cp = (cp << 6) | ((uint8_t)p[i + j] & 0x3Fu); *k = i + n; return cp; }\n");
+        self.raw("/* Validate a byte range as UTF-8 (used at the bytes->str boundary). */\n");
+        self.raw("static bool jestyr_rt_valid_utf8(const char* p, size_t len) { size_t k = 0; while (k < len) { uint8_t b = (uint8_t)p[k]; size_t n; if (b < 0x80u) n = 1; else if ((b & 0xE0u) == 0xC0u) n = 2; else if ((b & 0xF0u) == 0xE0u) n = 3; else if ((b & 0xF8u) == 0xF0u) n = 4; else return false; if (k + n > len) return false; for (size_t j = 1; j < n; j++) if (((uint8_t)p[k + j] & 0xC0u) != 0x80u) return false; k += n; } return true; }\n\n");
         self.raw("/* Jestyr runtime prelude — temporary print intrinsics (stand-in for a stdlib). */\n");
         self.raw("static void jestyr_rt_print_int(int64_t x) { printf(\"%lld\\n\", (long long) x); }\n");
         self.raw("static void jestyr_rt_print_float(double x) { printf(\"%g\\n\", x); }\n");
@@ -3115,6 +3121,11 @@ impl<'a> Cgen<'a> {
                     let cty = self.c_type(&ty);
                     return format!("sizeof({cty})");
                 }
+                // O(n) codepoint count — the cost-visible companion to O(1) `.len`.
+                "count_codepoints" => {
+                    let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    return format!("jestyr_rt_count_cp({s})");
+                }
                 // Compile-time alignment of a type, e.g. `align_of(Packed)` → `_Alignof`.
                 "align_of" => {
                     let subst = self.subst.clone();
@@ -4143,8 +4154,11 @@ impl<'a> Cgen<'a> {
                 if let ExprKind::Range { lo, hi, inclusive } = &self.ast.expr_at(src).kind {
                     let (lo, hi, inclusive) = (*lo, *hi, *inclusive);
                     self.emit_range_for(&b0.name, src, lo, hi, inclusive, step, body);
+                } else if let Some(s_arg) = self.codepoints_iter_arg(src) {
+                    // `for cp in codepoints(s)` — O(n) UTF-8 decode (cost in the name).
+                    self.emit_codepoints_for(&b0.name, s_arg, body);
                 } else if matches!(self.info.type_of(src), Ty::Prim("str")) {
-                    // String iteration — byte by byte (via strlen).
+                    // String iteration — byte by byte through the view.
                     let index = binds.get(1).map(|b| b.name.clone());
                     self.emit_str_for(&b0.name, index.as_ref(), src, body);
                 } else {
@@ -4284,6 +4298,52 @@ impl<'a> Cgen<'a> {
     /// `for c in text { B }` → iterate a string's bytes. The length is computed
     /// once with `strlen`; each `c` is the `u8` byte. (Byte iteration, not
     /// Unicode-aware — a real grapheme/codepoint iterator is future work.)
+    /// If `e` is `codepoints(s)`, the string argument `s` — the marker for a
+    /// codepoint-decoding `for` loop (this intrinsic is valid only in for-position).
+    fn codepoints_iter_arg(&self, e: ExprId) -> Option<ExprId> {
+        if let ExprKind::Call { callee, args } = &self.ast.expr_at(e).kind {
+            if let ExprKind::Name(n) = &self.ast.expr_at(*callee).kind {
+                if n.name == "codepoints" && args.len() == 1 {
+                    return Some(args[0]);
+                }
+            }
+        }
+        None
+    }
+
+    /// `for cp in codepoints(s) { B }` — decode UTF-8 one codepoint at a time. Each
+    /// `cp` is a `u32`; the loop advances by the codepoint's byte width. O(n), and
+    /// the cost is right there in the name — never an implicit decode (the D lesson).
+    fn emit_codepoints_for(&mut self, binding: &Ident, s_expr: ExprId, body: &Block) {
+        let s = self.emit_expr(s_expr);
+        let n = self.tmp;
+        self.tmp += 1;
+        self.line(format!("JestyrStr _str{n} = {s};"));
+        self.line(format!("size_t _k{n} = 0;"));
+        self.line(format!("while (_k{n} < _str{n}.len)"));
+        self.line("{");
+        self.depth += 1;
+        if let Some(name) = self.scratch_reset.take() {
+            self.line(format!("j_{name}.off = 0;"));
+        }
+        if binding.name != "_" {
+            self.line(format!(
+                "uint32_t j_{} = jestyr_rt_decode_cp(_str{n}.ptr, _str{n}.len, &_k{n});",
+                binding.name
+            ));
+        } else {
+            self.line(format!("(void) jestyr_rt_decode_cp(_str{n}.ptr, _str{n}.len, &_k{n});"));
+        }
+        for stmt in &body.stmts {
+            self.emit_stmt(stmt);
+        }
+        if let Some(lbl) = self.cont_label.take() {
+            self.line(format!("{lbl}__continue: ;"));
+        }
+        self.depth -= 1;
+        self.line("}");
+    }
+
     fn emit_str_for(&mut self, binding: &Ident, index: Option<&Ident>, iter: ExprId, body: &Block) {
         let s = self.emit_expr(iter);
         let n = self.tmp;
@@ -4934,7 +4994,7 @@ fn is_intrinsic(name: &str) -> bool {
         name,
         "print_int" | "print_float" | "print_str" | "print_bool"
             | "alloc" | "alloc_i32" | "realloc" | "realloc_i32" | "free_ptr" | "size_of" | "slice"
-            | "align_of" | "offset_of"
+            | "align_of" | "offset_of" | "count_codepoints" | "codepoints" | "from_utf8"
             | "gen_new" | "gen_free" | "region_alloc" | "ok" | "err" | "is_err" | "unwrap"
             | "arena_open" | "arena_alloc" | "arena_close"
     )
@@ -5412,6 +5472,22 @@ mod tests {
         let (c, d) = gen("fn f(p: *mut i32) -> *mut u8 { return p as *mut u8 }");
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("(uint8_t*)(j_p)"), "pointer cast: {c}");
+    }
+
+    #[test]
+    fn count_codepoints_is_an_on_decode() {
+        let (c, d) = gen("fn f(read s: str) -> i32 { return count_codepoints(s) as i32 }");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("jestyr_rt_count_cp("), "count_codepoints → O(n) decode: {c}");
+    }
+
+    #[test]
+    fn codepoints_for_decodes_utf8() {
+        let src = "fn f(read s: str) -> i32 { var n: i32 = 0 for cp in codepoints(s) { n = n + 1 } return n }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("jestyr_rt_decode_cp("), "codepoint iteration decodes UTF-8: {c}");
+        assert!(c.contains("uint32_t j_cp"), "each codepoint binds as a u32: {c}");
     }
 
     #[test]

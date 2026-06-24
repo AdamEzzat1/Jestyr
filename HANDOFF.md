@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 263 tests pass, including `proptest` property
+and run (or are correctly rejected). 265 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -233,6 +233,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `union.jtr` | `1075838976`, `2.5`, `4` | **untagged `union` (§2.8)** — overlapping fields (C `union`); float bit-punning; `size_of` = largest field (§5.50) |
 | `bitfields.jtr` | `4`, `1`, `1`, `5` | **bit-fields (§2.8)** — `flags: u8 : 3` → C `uint8_t j_flags : 3`; four fields pack 4 B → 1 B (§5.51) |
 | `strings.jtr` | `13`, `72`, `3`, `5`, greeting | **length-carrying `str` view + `cstr` (strings E)** — `{ptr,len}`, O(1) `.len`, `"café".len==5`; `.cstr` FFI bridge (§5.52) |
+| `codepoints.jtr` | `5`, `4`, `233`, `1` | **cost-visible views (strings E)** — O(1) `.len` vs O(n) `count_codepoints`; `for cp in codepoints(s)` decodes (§5.53) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -958,6 +959,18 @@ These are the non-obvious things that will bite if you don't know them.
     (`codepoints()`/`count_codepoints` O(n)), `bytes`→`str` validate-at-boundary (UTF-8 validity
     as a type-state), an owned `String` (allocator-as-value), `StringBuilder`/iolists (region-
     friendly, zero-copy), f-strings, and a `Bytes` unvalidated-platform-bytes type.
+
+53. **Cost-visible codepoint views (strings step 2).** The "cost in the name" principle: `.len`
+    is O(1) bytes; **`count_codepoints(s)` is O(n)** (`jestyr_rt_count_cp` counts UTF-8 leading
+    bytes — those whose top two bits aren't `10`). Codepoint *iteration* is explicit:
+    **`for cp in codepoints(s)`** decodes one codepoint at a time (`emit_codepoints_for` + the
+    `jestyr_rt_decode_cp(ptr, len, &k)` runtime helper, each `cp` a `u32`), never an implicit
+    decode (the D-language cautionary tale). `codepoints(s)` is a for-position-only marker
+    (`codepoints_iter_arg` intercepts it in `emit_for_inner` *before* the str/slice dispatch,
+    since its call type is `Unknown`). Three reusable UTF-8 helpers now live in the prelude:
+    `count_cp`, `decode_cp`, and `valid_utf8` (the last seeds step 3). Demo
+    [`examples/codepoints.jtr`](examples/codepoints.jtr) (`5, 4, 233, 1` — `"café"` is 5 bytes
+    but 4 codepoints; the cost gap is the whole point).
 
 ---
 
