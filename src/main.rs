@@ -23,6 +23,8 @@ mod ast;
 mod attrs;
 mod cgen;
 mod diag;
+#[cfg(feature = "dharht-experiment")]
+mod dharht;
 mod doc;
 mod escape;
 mod lexer;
@@ -180,6 +182,92 @@ fn selfbench() {
     println!("  memory: rebuild with `--features bench-alloc` for peak/total heap bytes");
 }
 
+/// Experiment: D-HARHT (Memory profile) vs `HashMap` on the **build-once /
+/// lookup-many** workload a compiler's symbol tables have (build in typeck, read
+/// in cgen). Compares lookup latency + footprint at a compiler-realistic size and
+/// a large size. Honest about D-HARHT's fixed 256-shard overhead.
+#[cfg(feature = "dharht-experiment")]
+fn dharht_bench() {
+    use crate::dharht::{deterministic_permutation_scatter, DHarht, LookupProfile};
+    use std::collections::HashMap;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    println!("D-HARHT (Memory profile) vs HashMap — build-once / lookup-many");
+    for &n in &[2_000usize, 100_000] {
+        let keys: Vec<u64> = (0..n)
+            .map(|i| deterministic_permutation_scatter(i as u64 ^ 0x9e37_79b9_7f4a_7c15))
+            .collect();
+        // A lookup stream of 4n hits in deterministic pseudo-random order.
+        let mut lookups = Vec::with_capacity(n * 4);
+        let mut st = 0x243f_6a88_85a3_08d3_u64;
+        for _ in 0..n * 4 {
+            st = deterministic_permutation_scatter(st);
+            lookups.push(keys[(st as usize) % n]);
+        }
+
+        let mut hm: HashMap<u64, u64> = HashMap::with_capacity(n);
+        let mut dh: DHarht<u64> = DHarht::with_capacity(256, n / 256 + 8);
+        dh.set_lookup_profile(LookupProfile::Memory);
+        for (i, &k) in keys.iter().enumerate() {
+            hm.insert(k, i as u64);
+            dh.insert(k, i as u64);
+        }
+        dh.seal_for_lookup();
+
+        let time = |f: &dyn Fn() -> u64| {
+            let _ = f(); // warm up
+            let runs = 5u32;
+            let t = Instant::now();
+            let mut acc = 0u64;
+            for _ in 0..runs {
+                acc ^= f();
+            }
+            let _ = black_box(acc);
+            t.elapsed().as_secs_f64() / runs as f64
+        };
+        let hm_t = time(&|| {
+            let mut c = 0u64;
+            for &k in &lookups {
+                c ^= *hm.get(black_box(&k)).unwrap_or(&0);
+            }
+            c
+        });
+        let dh_t = time(&|| {
+            let mut c = 0u64;
+            for &k in &lookups {
+                c ^= *dh.get(black_box(k)).unwrap_or(&0);
+            }
+            c
+        });
+        let per = |t: f64| t * 1e9 / lookups.len() as f64;
+
+        // Footprint: D-HARHT self-reports; HashMap<u64,u64> ≈ capacity × ((K,V) + 1
+        // control byte) — a hashbrown-shaped lower bound.
+        let dh_mem = dh.approx_memory_bytes();
+        let hm_mem = hm.capacity() * (std::mem::size_of::<u64>() * 2 + 1);
+
+        println!("\nn = {n}  ({} lookups):", lookups.len());
+        println!(
+            "  lookup   HashMap {:7.2} ns/op    D-HARHT(mem) {:7.2} ns/op    ({:.2}x HashMap)",
+            per(hm_t),
+            per(dh_t),
+            per(dh_t) / per(hm_t)
+        );
+        println!(
+            "  memory   HashMap ~{:>10} B    D-HARHT(mem) {:>10} B    ({:.2}x HashMap)",
+            hm_mem,
+            dh_mem,
+            dh_mem as f64 / hm_mem as f64
+        );
+    }
+    println!(
+        "\nnote: D-HARHT carries a fixed 256-shard overhead (each Shard has 256-entry\n\
+         second_jump/second_leaf arrays), so small tables pay a large constant. Tune the\n\
+         shard count down for compiler-sized tables."
+    );
+}
+
 enum Mode {
     Parse,
     Check,
@@ -218,6 +306,11 @@ fn main() -> ExitCode {
             // No file argument: compile a generated program and report per-stage
             // throughput + footprint (and, with `--features bench-alloc`, heap use).
             selfbench();
+            return ExitCode::SUCCESS;
+        }
+        #[cfg(feature = "dharht-experiment")]
+        Some("dharht-bench") => {
+            dharht_bench();
             return ExitCode::SUCCESS;
         }
         Some("doc") => {

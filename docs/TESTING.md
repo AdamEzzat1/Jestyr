@@ -247,3 +247,59 @@ test a feature can have, far beyond the per-feature golden examples.
   floor or peak memory rises above a ceiling — turning the §3.5 baseline into an enforced budget.
 - **Allocation count:** extend the `bench-alloc` allocator to also count *number* of allocations
   (not just bytes) — a proxy for allocator pressure that the arena-AST design aims to keep low.
+
+---
+
+## 6. Experiment — D-HARHT (Memory profile) vs `HashMap`
+
+Could the compiler's randomized `HashMap` symbol tables be replaced by **D-HARHT**, a
+deterministic hash/radix table whose "seal then look up" model matches a compiler's *build-in-
+typeck / read-in-cgen* access pattern? The Memory-profile code is vendored at
+[`src/dharht.rs`](../src/dharht.rs) behind `--features dharht-experiment`, with a comparison
+benchmark (`jestyrc dharht-bench`), a differential property test
+(`proptests::dharht_experiment::dharht_memory_matches_hashmap` — a sealed D-HARHT must agree with
+`HashMap` on every key), and the vendored unit tests.
+
+```sh
+cargo test --features dharht-experiment dharht                 # correctness (differential + units)
+cargo run --release --features dharht-experiment -- dharht-bench
+```
+
+**Result (release, `u64 → u64`, 4n hits in pseudo-random order):**
+
+| n | HashMap lookup | D-HARHT(mem) lookup | HashMap mem | D-HARHT(mem) mem |
+|---|---|---|---|---|
+| 2,000 (compiler-realistic) | 18.6 ns/op | **9.9 ns/op (0.53×)** | ~61 KB | **1.38 MB (22.7×)** |
+| 100,000 | 51.3 ns/op | 71.1 ns/op (1.39×) | ~1.95 MB | 7.95 MB (4.08×) |
+
+**Reading it honestly:**
+- **Lookup speed** is genuinely good at compiler-realistic sizes — ~**2× faster** than `HashMap`
+  at n=2,000 (the warm `second_leaf` cache + cache-resident data win), crossing over to ~1.4×
+  *slower* at n=100,000 for random `u64` keys.
+- **Memory** is the catch: D-HARHT(mem) is **4–23× heavier** than `HashMap` here. The "Memory
+  profile" is memory-efficient *relative to D-HARHT's own Speed/Balanced profiles*, **not** versus
+  `HashMap`. The cause is a **fixed 256-shard overhead** — each `Shard` carries 256-entry
+  `second_jump`/`second_leaf` arrays (~2 KB/shard ⇒ ~0.5 MB of constant before any data), which
+  dominates small tables.
+
+**Verdict for the bootstrap compiler:** **not a drop-in fit, for two structural reasons.**
+1. **Key type.** Jestyr's tables are `HashMap<String, _>` (and a few `HashMap<ExprId, _>`).
+   D-HARHT is **`u64`-keyed** and does its full-equality check on that `u64`. Replacing a
+   `String`-keyed table means hashing `String → u64`, at which point collisions silently alias
+   (two strings, same `u64`, the `==` check passes) — reintroducing exactly the problem D-HARHT's
+   key-equality model avoids. Only the `HashMap<ExprId, _>` tables (`method_calls`,
+   `closure_index`, `qualified`) are natively `u32`-keyed and could map to `u64` cleanly.
+2. **Table size.** Those tables hold hundreds–thousands of entries, where the ~0.5 MB shard
+   constant makes D-HARHT 20×+ heavier for a sub-millisecond lookup saving the compiler never
+   notices. (Tuning the shard count *down* would shrink the constant — a 16-shard build would be
+   far lighter — but the key-type problem remains for the `String` tables.)
+3. **Determinism** — D-HARHT's headline draw — is **already achieved**: the
+   `compilation_is_deterministic` property (§3.1) shows the compiler emits byte-identical C today,
+   so there's no determinism gap to close here. (If one ever appeared, the cheaper fix is
+   `BTreeMap`/sorted iteration, not a radix table.)
+
+**Where D-HARHT *would* shine:** large, **byte-addressable / prefix-heavy**, build-once/lookup-many
+tables — e.g. a future self-hosted Jestyr's *runtime* string-interner or path index, exactly the
+"byte-first, view-second" workload it was designed for. The experiment, benchmark, and differential
+property test stay in-tree (feature-gated, zero cost to the default build) so that case can be
+re-measured when it arises.

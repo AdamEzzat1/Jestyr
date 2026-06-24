@@ -20,6 +20,9 @@ bolero = "0.11"
 # Opt-in counting global allocator for `jestyrc selfbench` (peak/total heap bytes).
 # Off by default so the production compiler uses the plain System allocator.
 bench-alloc = []
+# Experimental: vendored D-HARHT deterministic table + `jestyrc dharht-bench`
+# (D-HARHT Memory profile vs HashMap). Off by default; see docs/TESTING.md §6.
+dharht-experiment = []
 
 [profile.dev]
 opt-level = 0

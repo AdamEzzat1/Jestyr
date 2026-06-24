@@ -226,6 +226,38 @@ mod prop {
     }
 }
 
+/// Experiment (feature `dharht-experiment`): the strongest "can D-HARHT replace a
+/// `HashMap`?" check — a sealed D-HARHT (Memory profile) must agree with a HashMap
+/// on every key, across random key sets.
+#[cfg(feature = "dharht-experiment")]
+mod dharht_experiment {
+    use crate::dharht::{DHarht, LookupProfile};
+    use proptest::prelude::*;
+    use std::collections::HashMap;
+
+    proptest! {
+        #[test]
+        fn dharht_memory_matches_hashmap(keys in proptest::collection::vec(any::<u64>(), 0..300)) {
+            let mut hm: HashMap<u64, u64> = HashMap::new();
+            let mut dh: DHarht<u64> = DHarht::new(16);
+            dh.set_lookup_profile(LookupProfile::Memory);
+            for (i, &k) in keys.iter().enumerate() {
+                hm.insert(k, i as u64); // last write wins, both
+                dh.insert(k, i as u64);
+            }
+            dh.seal_for_lookup();
+            for &k in &keys {
+                prop_assert_eq!(dh.get(k).copied(), hm.get(&k).copied());
+            }
+            for probe in [u64::MAX, u64::MAX / 2, 0xdead_beef_u64] {
+                if !hm.contains_key(&probe) {
+                    prop_assert_eq!(dh.get(probe), None);
+                }
+            }
+        }
+    }
+}
+
 mod fuzz {
     use super::*;
 
