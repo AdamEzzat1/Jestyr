@@ -93,6 +93,17 @@ throughput** (lex/parse/typeck/escape/cgen, lines & tokens per second) and an **
 footprint** (token count, arena sizes, emitted-C bytes). A feature-gated counting allocator
 (`--features bench-alloc`) reports **peak / total heap bytes** for a full compile — no new deps.
 
+Sample (1501-line generated program, ~25.5k tokens, release build):
+
+```
+    total     14.155 ms    (106040 lines/s, 1802264 tokens/s)
+  memory (one full compile): peak 4054 KiB resident, 9148 KiB total allocated
+```
+
+Per-stage breakdown shows where time goes (typeck + cgen dominate); the numbers are a
+*regression baseline* — a future change that halves throughput or doubles peak memory is
+visible at a glance. (Run `--release` for representative speed; `dev` is `opt-level = 0`.)
+
 ---
 
 ## 4. How to run

@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 285 tests pass, including `proptest` property
+and run (or are correctly rejected). 294 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -85,8 +85,9 @@ jestyrc build  <file.jtr>   lower to C and compile a native binary (needs cc)
 jestyrc run    <file.jtr>   build, then execute
 jestyrc test   <file.jtr>   build & run the `@test`/`@bench` harness (workstream O)
 jestyrc doc    <file.jtr>   render the file's API docs as Markdown (--html for HTML)
+jestyrc selfbench           compiler speed + memory benchmark (see docs/TESTING.md)
 ```
-(Run via `cargo run -- <args>`.)
+(Run via `cargo run -- <args>`.) Testing/QA strategy: [`docs/TESTING.md`](docs/TESTING.md).
 
 ---
 

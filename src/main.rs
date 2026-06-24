@@ -16,6 +16,8 @@
 //!   jestyrc run    <file.jtr>   build, then execute the binary
 //!   jestyrc tokens <file.jtr>   stop after lexing and dump the token stream
 //!   jestyrc doc    <file.jtr>   render the file's API docs as Markdown (--html for HTML)
+//!   jestyrc selfbench           compile a generated program; report per-stage speed +
+//!                               footprint (build `--features bench-alloc` for heap bytes)
 
 mod ast;
 mod attrs;
@@ -42,6 +44,141 @@ use lexer::Lexer;
 use parser::Parser;
 use printer::print_ast;
 use span::line_col;
+
+/// An opt-in counting global allocator (feature `bench-alloc`) tracking current,
+/// peak, and total bytes — for `selfbench`'s memory report. Off by default so the
+/// production compiler uses the plain System allocator.
+#[cfg(feature = "bench-alloc")]
+mod bench_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CURRENT: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+    static TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn reset() {
+        CURRENT.store(0, Ordering::Relaxed);
+        PEAK.store(0, Ordering::Relaxed);
+        TOTAL.store(0, Ordering::Relaxed);
+    }
+    /// (peak resident bytes, total bytes ever allocated).
+    pub fn stats() -> (usize, usize) {
+        (PEAK.load(Ordering::Relaxed), TOTAL.load(Ordering::Relaxed))
+    }
+
+    struct Counting;
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let p = System.alloc(l);
+            if !p.is_null() {
+                let cur = CURRENT.fetch_add(l.size(), Ordering::Relaxed) + l.size();
+                TOTAL.fetch_add(l.size(), Ordering::Relaxed);
+                PEAK.fetch_max(cur, Ordering::Relaxed);
+            }
+            p
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            CURRENT.fetch_sub(l.size(), Ordering::Relaxed);
+            System.dealloc(p, l);
+        }
+    }
+    #[global_allocator]
+    static GLOBAL: Counting = Counting;
+}
+
+/// A representative, always-valid program: `n` triples of (struct, enum, function
+/// with a `match`), plus `main`. Exercises lex/parse/typeck/escape/cgen at scale.
+fn gen_bench_program(n: usize) -> String {
+    let mut s = String::with_capacity(n * 120);
+    for i in 0..n {
+        s.push_str(&format!("struct S{i} {{ a: i32, b: i32, c: i32 }}\n"));
+        s.push_str(&format!("enum E{i} {{ red, green, blue }}\n"));
+        s.push_str(&format!(
+            "fn f{i}(read e: E{i}) -> i32 {{ match e {{ red => {}, green => {}, blue => {} }} }}\n",
+            i,
+            i + 1,
+            i + 2,
+        ));
+    }
+    s.push_str("fn main() -> i32 { return 0 }\n");
+    s
+}
+
+/// Compile a generated program and report per-stage throughput + footprint.
+fn selfbench() {
+    use std::time::Instant;
+    let src = gen_bench_program(500);
+    let lines = src.lines().count();
+    let bytes = src.len();
+
+    // Warm up and capture the footprint once.
+    let (tok0, _) = Lexer::new(&src).tokenize();
+    let ntok = tok0.len();
+    let (ast0, _) = Parser::new(&src, tok0).parse();
+    let (nexpr, ntype, npat) = (ast0.exprs.len(), ast0.types.len(), ast0.pats.len());
+    let (info0, _) = typeck::check(&ast0);
+    let (c0, _) = cgen::emit(&ast0, &info0);
+    let cbytes = c0.len();
+
+    let runs = 30u32;
+    let (mut lex, mut parse, mut tyck, mut esc, mut cg) = (0f64, 0f64, 0f64, 0f64, 0f64);
+    for _ in 0..runs {
+        let a = Instant::now();
+        let (tokens, _) = Lexer::new(&src).tokenize();
+        let b = Instant::now();
+        let (ast, _) = Parser::new(&src, tokens).parse();
+        let c = Instant::now();
+        let (info, _) = typeck::check(&ast);
+        let d = Instant::now();
+        let _ = escape::check(&ast, &info);
+        let e = Instant::now();
+        let _ = cgen::emit(&ast, &info);
+        let f = Instant::now();
+        lex += (b - a).as_secs_f64();
+        parse += (c - b).as_secs_f64();
+        tyck += (d - c).as_secs_f64();
+        esc += (e - d).as_secs_f64();
+        cg += (f - e).as_secs_f64();
+    }
+    let r = runs as f64;
+    let (lex, parse, tyck, esc, cg) = (lex / r, parse / r, tyck / r, esc / r, cg / r);
+    let total = lex + parse + tyck + esc + cg;
+    let ms = |x: f64| x * 1000.0;
+
+    println!("jestyrc selfbench — generated program: {lines} lines, {bytes} bytes, {ntok} tokens");
+    println!("  AST: {nexpr} exprs, {ntype} types, {npat} pats    emitted C: {cbytes} bytes");
+    println!("  stage timings (avg of {runs} runs):");
+    println!("    lex     {:8.3} ms", ms(lex));
+    println!("    parse   {:8.3} ms", ms(parse));
+    println!("    typeck  {:8.3} ms", ms(tyck));
+    println!("    escape  {:8.3} ms", ms(esc));
+    println!("    cgen    {:8.3} ms", ms(cg));
+    println!(
+        "    total   {:8.3} ms    ({:.0} lines/s, {:.0} tokens/s)",
+        ms(total),
+        lines as f64 / total,
+        ntok as f64 / total
+    );
+
+    #[cfg(feature = "bench-alloc")]
+    {
+        bench_alloc::reset();
+        let (tk, _) = Lexer::new(&src).tokenize();
+        let (ast, _) = Parser::new(&src, tk).parse();
+        let (info, _) = typeck::check(&ast);
+        let _ = escape::check(&ast, &info);
+        let _ = cgen::emit(&ast, &info);
+        let (peak, total_alloc) = bench_alloc::stats();
+        println!(
+            "  memory (one full compile): peak {} KiB resident, {} KiB total allocated",
+            peak / 1024,
+            total_alloc / 1024
+        );
+    }
+    #[cfg(not(feature = "bench-alloc"))]
+    println!("  memory: rebuild with `--features bench-alloc` for peak/total heap bytes");
+}
 
 enum Mode {
     Parse,
@@ -76,6 +213,12 @@ fn main() -> ExitCode {
         None | Some("-h") | Some("--help") => {
             print_usage();
             return if args.len() < 2 { ExitCode::FAILURE } else { ExitCode::SUCCESS };
+        }
+        Some("selfbench") => {
+            // No file argument: compile a generated program and report per-stage
+            // throughput + footprint (and, with `--features bench-alloc`, heap use).
+            selfbench();
+            return ExitCode::SUCCESS;
         }
         Some("doc") => {
             // `doc` takes an optional `--html` flag anywhere after it; the file is
