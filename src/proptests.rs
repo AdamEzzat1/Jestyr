@@ -44,6 +44,24 @@ fn run_pipeline(src: &str) {
     let (_c, _cgen_diags) = cgen::emit(&ast, &info);
 }
 
+/// Compile front-to-back, returning the emitted C and the *total* diagnostic count
+/// across all stages. The workhorse for the determinism and metamorphic properties.
+fn compile(src: &str) -> (String, usize) {
+    let (tokens, ld) = Lexer::new(src).tokenize();
+    let (ast, pd) = Parser::new(src, tokens).parse();
+    let (info, td) = typeck::check(&ast);
+    let ed = escape::check(&ast, &info);
+    let (c, cd) = cgen::emit(&ast, &info);
+    (c, ld.len() + pd.len() + td.len() + ed.len() + cd.len())
+}
+
+/// The token-kind sequence (Eof dropped) — the lexer's structural output, used by
+/// the whitespace-insensitivity metamorphic property.
+fn token_kinds(src: &str) -> Vec<TokenKind> {
+    let (tokens, _) = Lexer::new(src).tokenize();
+    tokens.iter().map(|t| t.kind).filter(|k| *k != TokenKind::Eof).collect()
+}
+
 mod prop {
     use super::*;
     use proptest::prelude::*;
@@ -112,6 +130,83 @@ mod prop {
             prop_assert_eq!(tokens.len(), 2);
             prop_assert_eq!(tokens[0].kind, TokenKind::Ident);
         }
+
+        // ── the stricter layer ────────────────────────────────────────────────
+
+        /// **Determinism (the headline).** A deterministic language needs a
+        /// deterministic compiler: the same source must emit byte-identical C and
+        /// the same diagnostic count every run — no `HashMap`/`HashSet` iteration
+        /// order may leak into the output.
+        #[test]
+        fn compilation_is_deterministic(s in ".{0,400}") {
+            prop_assert_eq!(compile(&s), compile(&s));
+        }
+
+        /// Determinism on *structurally rich* valid programs (structs/enums/fns),
+        /// which exercise the monomorphization/struct/enum collectors where ordering
+        /// bugs would hide.
+        #[test]
+        fn valid_programs_compile_deterministically(p in arb_program()) {
+            prop_assert_eq!(compile(&p), compile(&p));
+        }
+
+        /// A generated valid program lowers to *some* C built on the runtime prelude
+        /// (cgen never silently produces nothing for a well-formed program).
+        #[test]
+        fn valid_program_emits_prelude(p in arb_program()) {
+            let (c, _) = compile(&p);
+            prop_assert!(c.contains("#include"), "no prelude in: {}", c);
+        }
+
+        /// **Metamorphic — whitespace insensitivity.** The lexer discards layout, so
+        /// doubling every space leaves the token-kind sequence unchanged.
+        #[test]
+        fn whitespace_does_not_change_tokens(p in arb_program()) {
+            prop_assert_eq!(token_kinds(&p), token_kinds(&p.replace(' ', "   ")));
+        }
+
+        /// **Metamorphic — comment insensitivity.** Comments are trivia (no tokens,
+        /// no AST nodes), so prepending one cannot change the emitted C.
+        #[test]
+        fn comments_do_not_change_codegen(p in arb_program()) {
+            let plain = compile(&p).0;
+            let commented = compile(&format!("// a comment\n{p}")).0;
+            prop_assert_eq!(plain, commented);
+        }
+
+        /// The AST printer is total and **idempotent** (printing twice is stable) on
+        /// any generated program.
+        #[test]
+        fn printer_is_total_and_stable(p in arb_program()) {
+            let (tokens, _) = Lexer::new(&p).tokenize();
+            let (ast, _) = Parser::new(&p, tokens).parse();
+            let a = crate::printer::print_ast(&ast);
+            let b = crate::printer::print_ast(&ast);
+            prop_assert_eq!(a, b);
+        }
+    }
+
+    /// A small but structurally-rich *valid-parsing* program: a struct, an enum, and
+    /// a function whose body is an arbitrary arithmetic expression. Names are
+    /// `x`-prefixed + index-suffixed, so they are unique and never collide with a
+    /// keyword — the program always lexes and parses clean.
+    fn arb_program() -> impl Strategy<Value = String> {
+        (
+            proptest::collection::vec("x[a-z0-9]{0,4}", 1..4),
+            proptest::collection::vec("x[a-z0-9]{0,4}", 1..4),
+            arb_expr(),
+        )
+            .prop_map(|(fields, variants, body)| {
+                let fs: Vec<String> =
+                    fields.iter().enumerate().map(|(i, f)| format!("{f}{i}: i32")).collect();
+                let vs: Vec<String> =
+                    variants.iter().enumerate().map(|(i, v)| format!("{v}{i}")).collect();
+                format!(
+                    "struct S {{ {} }} enum E {{ {} }} fn f() -> i32 {{ {body} }}",
+                    fs.join(", "),
+                    vs.join(", ")
+                )
+            })
     }
 
     /// A recursively-built, always-valid arithmetic expression. Identifiers are
