@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 271 tests pass, including `proptest` property
+and run (or are correctly rejected). 273 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -238,6 +238,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `owned_string.jtr` | `5`, `12`, 2 greetings | **owned `String` (strings E)** — heap-owned growable buffer; `string_view` borrows it (owned/view split) (§5.55) |
 | `builder.jtr` | `9`, `[1, 2, 3]` | **iolist / `Builder` (strings E)** — collect `str` fragments zero-copy, flatten once into a `String` (§5.56) |
 | `fstring.jtr` | message, `25` | **f-strings (strings E)** — `f"{name} x = {x} ({ok})"` typed interpolation → owned `String` (§5.57) |
+| `region_string.jtr` | `Hello, region!`, `14`, `5`, `4` | **region strings + `bytes` (strings E)** — arena-allocated text, freed at scope end; `bytes`↔`from_utf8` round-trip (§5.58) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -1024,6 +1025,24 @@ These are the non-obvious things that will bite if you don't know them.
     are bare names, so the monomorphization walkers (which have `_` arms) needn't descend. Demo
     [`examples/fstring.jtr`](examples/fstring.jtr) (`Jestyr says x = 42 (true)`, len `25`).
     *(Limits: identifiers only, no `{{`/`}}` brace escaping, floats truncate to int.)*
+
+58. **Region-allocated strings + `bytes` (strings step 7 — the finale, and the differentiator).**
+    **Region strings:** `region_str(r, str)` copies a `str` into region arena `r`'s bump buffer
+    and returns a view; `region_concat(r, a, b)` allocates `a.len+b.len` in the arena and copies
+    both. Used inside `region scratch { … }`, **every fragment is arena-allocated and the whole
+    arena frees at the block's end — zero individual frees**, and the region scope makes it
+    *lexically impossible* for a fragment to outlive its arena (§5.23). Provably-scoped,
+    near-zero-overhead text processing — what heap-only string libraries can't do. The arena name
+    is `j_<region>` (same as `region_alloc`). **`bytes(str) -> []u8`** exposes a string's bytes as
+    an *unvalidated* `[]u8` (the platform-bytes / WTF-8 home) — the reverse of `from_utf8`,
+    completing the bytes↔str round-trip. Demo
+    [`examples/region_string.jtr`](examples/region_string.jtr) (`Hello, region!, 14, 5, 4`).
+    **This completes the strings workstream (roadmap E), steps 1–7** (§5.52–§5.58): length-carrying
+    `str` view + `cstr`, cost-visible codepoint views, validate-at-boundary, owned `String`,
+    iolist `Builder`, f-strings, and region strings + `bytes`. *(Deferred refinements: a true
+    grapheme iterator, a recoverable `from_utf8 -> str !Utf8Error`, threading the allocator-value
+    through `String`/`Builder`, and an escape-checker rule that a region `str` can't leave its
+    `region` — today that safety is lexical-by-construction.)*
 
 ---
 

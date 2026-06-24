@@ -3072,6 +3072,51 @@ impl<'a> Cgen<'a> {
                         "({{ {ecty}* _p{n} = ({ecty}*)jestyr_arena_alloc(&{arena}, sizeof({ecty})); *_p{n} = ({v}); _p{n}; }})"
                     );
                 }
+                // Region-allocated strings (the differentiator): copy a `str` into a
+                // region arena, returning a view into it. The whole arena is freed at
+                // the region's end — zero individual frees, lexically scoped.
+                "region_str" => {
+                    let arena = args
+                        .first()
+                        .and_then(|a| match &ast.expr_at(*a).kind {
+                            ExprKind::Name(rn) => Some(format!("j_{}", rn.name)),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "0".to_string());
+                    let v = args.get(1).map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    let n = self.tmp;
+                    self.tmp += 1;
+                    return format!(
+                        "({{ JestyrStr _sv{n} = {v}; char* _p{n} = (char*)jestyr_arena_alloc(&{arena}, _sv{n}.len); memcpy(_p{n}, _sv{n}.ptr, _sv{n}.len); (JestyrStr){{ _p{n}, _sv{n}.len }}; }})"
+                    );
+                }
+                "region_concat" => {
+                    let arena = args
+                        .first()
+                        .and_then(|a| match &ast.expr_at(*a).kind {
+                            ExprKind::Name(rn) => Some(format!("j_{}", rn.name)),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "0".to_string());
+                    let a = args.get(1).map(|x| self.emit_expr(*x)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    let b = args.get(2).map(|x| self.emit_expr(*x)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    let n = self.tmp;
+                    self.tmp += 1;
+                    return format!(
+                        "({{ JestyrStr _a{n} = {a}; JestyrStr _b{n} = {b}; size_t _t{n} = _a{n}.len + _b{n}.len; char* _p{n} = (char*)jestyr_arena_alloc(&{arena}, _t{n}); memcpy(_p{n}, _a{n}.ptr, _a{n}.len); memcpy(_p{n} + _a{n}.len, _b{n}.ptr, _b{n}.len); (JestyrStr){{ _p{n}, _t{n} }}; }})"
+                    );
+                }
+                // Expose a `str`'s bytes as an unvalidated `[]u8` (the platform-bytes
+                // view; re-validate with `from_utf8`). The reverse of the boundary.
+                "bytes" => {
+                    let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    let sn = self.slice_c_name(&Ty::Prim("u8"));
+                    let n = self.tmp;
+                    self.tmp += 1;
+                    return format!(
+                        "({{ JestyrStr _bv{n} = {s}; ({sn}){{ (uint8_t*)_bv{n}.ptr, _bv{n}.len }}; }})"
+                    );
+                }
                 // Value-level bump arena (std arena allocator). `arena_open(cap)`
                 // heap-allocates an arena and returns an opaque `*mut u8` handle;
                 // `arena_alloc(h, T, n)` bump-allocates `n` T's; `arena_close(h)`
@@ -5117,6 +5162,7 @@ fn is_intrinsic(name: &str) -> bool {
             | "align_of" | "offset_of" | "count_codepoints" | "codepoints" | "from_utf8" | "is_utf8"
             | "string_new" | "string_from" | "string_push" | "string_view" | "string_free"
             | "builder_new" | "builder_push" | "builder_build" | "builder_free"
+            | "region_str" | "region_concat" | "bytes"
             | "gen_new" | "gen_free" | "region_alloc" | "ok" | "err" | "is_err" | "unwrap"
             | "arena_open" | "arena_alloc" | "arena_close"
     )
@@ -5596,6 +5642,25 @@ mod tests {
         let (c, d) = gen("fn f(p: *mut i32) -> *mut u8 { return p as *mut u8 }");
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("(uint8_t*)(j_p)"), "pointer cast: {c}");
+    }
+
+    #[test]
+    fn region_string_allocates_in_the_arena() {
+        let src = "fn f() -> i32 { var n: i32 = 0 region scratch { let g: str = region_concat(scratch, \"a\", \"b\") n = g.len as i32 } return n }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(
+            c.contains("jestyr_arena_alloc(&j_scratch"),
+            "region strings bump-allocate in the arena: {c}"
+        );
+    }
+
+    #[test]
+    fn bytes_exposes_a_strs_bytes_as_u8_slice() {
+        let src = "fn f(read s: str) -> i32 { let b: []u8 = bytes(s) return b.len as i32 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("(uint8_t*)"), "bytes views the str's bytes as u8: {c}");
     }
 
     #[test]

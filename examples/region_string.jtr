@@ -1,0 +1,31 @@
+// examples/region_string.jtr — region-allocated strings + bytes (strings workstream,
+// step 7, the finale).
+//
+// The Jestyr differentiator: build text inside a `region` arena. Every fragment is
+// bump-allocated in the arena, and the WHOLE arena is freed at the block's end — zero
+// individual frees, and the region scope makes it lexically impossible for a fragment
+// to outlive its arena. Provably-scoped, near-zero-overhead text processing — what
+// heap-only string libraries can't offer.
+//
+// `bytes(s)` exposes a `str`'s underlying bytes as an *unvalidated* `[]u8` (the
+// platform-bytes view); `from_utf8` re-validates them back into a proven `str`.
+//
+// Run:  jestyrc run examples/region_string.jtr   →  Hello, region!  /  14, 5, 4
+
+fn main() -> i32 {
+    region scratch {
+        let hello: str = region_str(scratch, "Hello")
+        let greeting: str = region_concat(scratch, hello, ", region!")
+        print_str(greeting)            // Hello, region! — arena-allocated
+        print_int(greeting.len)        // 14
+    }
+    // the whole arena is freed here — no per-string `free`
+
+    // Bytes ↔ str round-trip.
+    let s: str = "café"
+    let b: []u8 = bytes(s)             // a str's bytes, as unvalidated platform bytes
+    print_int(b.len)                   // 5  (UTF-8 bytes)
+    let back: str = from_utf8(b)       // re-validate the bytes into a proven str
+    print_int(count_codepoints(back))  // 4
+    return 0
+}
