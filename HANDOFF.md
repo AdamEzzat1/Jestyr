@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 273 tests pass, including `proptest` property
+and run (or are correctly rejected). 275 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -239,6 +239,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `builder.jtr` | `9`, `[1, 2, 3]` | **iolist / `Builder` (strings E)** — collect `str` fragments zero-copy, flatten once into a `String` (§5.56) |
 | `fstring.jtr` | message, `25` | **f-strings (strings E)** — `f"{name} x = {x} ({ok})"` typed interpolation → owned `String` (§5.57) |
 | `region_string.jtr` | `Hello, region!`, `14`, `5`, `4` | **region strings + `bytes` (strings E)** — arena-allocated text, freed at scope end; `bytes`↔`from_utf8` round-trip (§5.58) |
+| `substr.jtr` | `ell`, `Hello`, `lo`, `3` | **substring / slicing (strings E)** — `s[i..j]`/`substr` boundary-checked zero-copy sub-view (§5.59) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -1043,6 +1044,21 @@ These are the non-obvious things that will bite if you don't know them.
     grapheme iterator, a recoverable `from_utf8 -> str !Utf8Error`, threading the allocator-value
     through `String`/`Builder`, and an escape-checker rule that a region `str` can't leave its
     `region` — today that safety is lexical-by-construction.)*
+
+59. **Substring / slicing (strings step 8 — unblocks `split`/`trim`/`find`).** `s[i..j]` and the
+    named `substr(s, i, j)` produce a **boundary-checked, zero-copy sub-view** (Erlang sub-binary
+    sharing + Rust's "no slicing on a non-char-boundary"): both lower to one runtime helper
+    `jestyr_rt_substr` that asserts `start ≤ end ≤ len` *and* that both ends sit on UTF-8 char
+    boundaries (`jestyr_rt_is_boundary`: a byte whose top two bits aren't `10`, or `== len`), then
+    returns `{ ptr+start, end-start }` into the same buffer (no allocation). **cgen** intercepts a
+    *range* index (`ExprKind::Range`) in the `Index` arm **before** the byte-index path (so `s[i]`
+    still reads a `u8`); open ends default (`s[i..]` → `…len`, `s[..j]` → `0`, inclusive `..=` adds
+    1). **typeck:** the `Index` arm types `s[range]` as `str` (vs `u8` for `s[i]`); a new
+    `string_intrinsic_ret` types the bare intrinsics (`substr`/`from_utf8` → `str`,
+    `count_codepoints` → `usize`, `is_utf8` → `bool`) so a `let` **without an annotation** gets the
+    right C type. Demo [`examples/substr.jtr`](examples/substr.jtr) (`ell, Hello, lo, 3`).
+    **Next (operations):** `eq`/`find`/`contains`/`split`/`trim` build on this view; then the
+    region-escape static proof.
 
 ---
 

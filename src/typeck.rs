@@ -1030,6 +1030,10 @@ impl<'a> TypeChecker<'a> {
                         let arg_tys: Vec<Ty> =
                             args.iter().map(|a| self.expr_types[a.0 as usize].clone()).collect();
                         self.variant_ctor_type(ei, &name, &arg_tys)
+                    } else if let Some(t) = string_intrinsic_ret(&name) {
+                        // String intrinsics aren't declared functions; type their
+                        // results so a `let` (without an annotation) gets the right C type.
+                        t
                     } else {
                         Ty::Unknown
                     }
@@ -1054,10 +1058,17 @@ impl<'a> TypeChecker<'a> {
             ExprKind::Index { base, index } => {
                 let bt = self.infer(scope, typ, self_ty, *base);
                 self.infer(scope, typ, self_ty, *index);
-                // Indexing a slice yields its element type; a string yields a byte.
+                // Indexing a slice yields its element type; a string yields a byte,
+                // *except* `s[i..j]` (a range index) which slices a sub-`str`.
                 match bt {
                     Ty::Slice(elem) => *elem,
-                    Ty::Prim("str") => Ty::Prim("u8"),
+                    Ty::Prim("str") => {
+                        if matches!(ast.expr_at(*index).kind, ExprKind::Range { .. }) {
+                            Ty::Prim("str")
+                        } else {
+                            Ty::Prim("u8")
+                        }
+                    }
                     _ => Ty::Unknown,
                 }
             }
@@ -1994,6 +2005,19 @@ pub(crate) fn is_scalar_match_ty(p: &str) -> bool {
         "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" | "char"
             | "bool"
     )
+}
+
+/// The return type of a string-library intrinsic (which isn't a declared
+/// function), so a `let` bound to one gets the right C type without an explicit
+/// annotation. `from_utf8` traps on invalid input today, so it yields `str`
+/// directly (the recoverable `str !Utf8Error` form is a future refinement).
+fn string_intrinsic_ret(name: &str) -> Option<Ty> {
+    Some(match name {
+        "substr" | "from_utf8" => Ty::Prim("str"),
+        "count_codepoints" => Ty::Prim("usize"),
+        "is_utf8" => Ty::Prim("bool"),
+        _ => return None,
+    })
 }
 
 /// Does the parameter type's head constructor match the receiver's? Confirms

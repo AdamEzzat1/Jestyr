@@ -381,7 +381,10 @@ impl<'a> Cgen<'a> {
         self.raw("/* Decode the UTF-8 codepoint at *k, advancing *k past it (replacement char on a bad lead byte). */\n");
         self.raw("static uint32_t jestyr_rt_decode_cp(const char* p, size_t len, size_t* k) { size_t i = *k; uint8_t b = (uint8_t)p[i]; uint32_t cp; size_t n; if (b < 0x80u) { cp = b; n = 1; } else if ((b & 0xE0u) == 0xC0u) { cp = b & 0x1Fu; n = 2; } else if ((b & 0xF0u) == 0xE0u) { cp = b & 0x0Fu; n = 3; } else if ((b & 0xF8u) == 0xF0u) { cp = b & 0x07u; n = 4; } else { *k = i + 1; return 0xFFFDu; } for (size_t j = 1; j < n && i + j < len; j++) cp = (cp << 6) | ((uint8_t)p[i + j] & 0x3Fu); *k = i + n; return cp; }\n");
         self.raw("/* Validate a byte range as UTF-8 (used at the bytes->str boundary). */\n");
-        self.raw("static bool jestyr_rt_valid_utf8(const char* p, size_t len) { size_t k = 0; while (k < len) { uint8_t b = (uint8_t)p[k]; size_t n; if (b < 0x80u) n = 1; else if ((b & 0xE0u) == 0xC0u) n = 2; else if ((b & 0xF0u) == 0xE0u) n = 3; else if ((b & 0xF8u) == 0xF0u) n = 4; else return false; if (k + n > len) return false; for (size_t j = 1; j < n; j++) if (((uint8_t)p[k + j] & 0xC0u) != 0x80u) return false; k += n; } return true; }\n\n");
+        self.raw("static bool jestyr_rt_valid_utf8(const char* p, size_t len) { size_t k = 0; while (k < len) { uint8_t b = (uint8_t)p[k]; size_t n; if (b < 0x80u) n = 1; else if ((b & 0xE0u) == 0xC0u) n = 2; else if ((b & 0xF0u) == 0xE0u) n = 3; else if ((b & 0xF8u) == 0xF0u) n = 4; else return false; if (k + n > len) return false; for (size_t j = 1; j < n; j++) if (((uint8_t)p[k + j] & 0xC0u) != 0x80u) return false; k += n; } return true; }\n");
+        self.raw("/* A boundary-checked sub-view (Rust discipline): start<=end<=len, and both on UTF-8 char boundaries. Zero-copy. */\n");
+        self.raw("static bool jestyr_rt_is_boundary(JestyrStr s, size_t i) { return i == s.len || ((uint8_t)s.ptr[i] & 0xC0u) != 0x80u; }\n");
+        self.raw("static JestyrStr jestyr_rt_substr(JestyrStr s, size_t start, size_t end) { assert(start <= end && end <= s.len); assert(jestyr_rt_is_boundary(s, start) && jestyr_rt_is_boundary(s, end)); return (JestyrStr){ s.ptr + start, end - start }; }\n\n");
         self.raw("/* Jestyr owned String — a heap-owned, growable buffer (the owned half of the\n");
         self.raw("   owned/view split). `string_view` borrows it as a `str` view; no copy. */\n");
         self.raw("typedef struct { char* ptr; size_t len; size_t cap; } JestyrString;\n");
@@ -2766,6 +2769,25 @@ impl<'a> Cgen<'a> {
             }
             ExprKind::Index { base, index } => {
                 let bt = self.info.type_of(*base).clone();
+                // `s[i..j]` on a string → a boundary-checked, zero-copy sub-view.
+                if matches!(bt, Ty::Prim("str")) {
+                    let range = match &self.ast.expr_at(*index).kind {
+                        ExprKind::Range { lo, hi, inclusive } => Some((*lo, *hi, *inclusive)),
+                        _ => None,
+                    };
+                    if let Some((lo, hi, inclusive)) = range {
+                        let b = self.emit_expr(*base);
+                        let lo_c = lo.map(|e| self.emit_expr(e)).unwrap_or_else(|| "0".to_string());
+                        let hi_c = match hi {
+                            Some(e) => {
+                                let h = self.emit_expr(e);
+                                if inclusive { format!("(({h}) + 1)") } else { h }
+                            }
+                            None => format!("({b}).len"),
+                        };
+                        return format!("jestyr_rt_substr({b}, {lo_c}, {hi_c})");
+                    }
+                }
                 let proven = matches!(bt, Ty::Slice(_)) && self.index_in_range(*base, *index);
                 let b = self.emit_expr(*base);
                 let i = self.emit_expr(*index);
@@ -3218,6 +3240,14 @@ impl<'a> Cgen<'a> {
                 "count_codepoints" => {
                     let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
                     return format!("jestyr_rt_count_cp({s})");
+                }
+                // `substr(s, start, end)` — a boundary-checked zero-copy sub-view
+                // (the named form of `s[start..end]`).
+                "substr" => {
+                    let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    let start = args.get(1).map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".to_string());
+                    let end = args.get(2).map(|a| self.emit_expr(*a)).unwrap_or_else(|| format!("({s}).len"));
+                    return format!("jestyr_rt_substr({s}, {start}, {end})");
                 }
                 // Owned, growable `String` (the owned half of the owned/view split).
                 "string_new" => return "jestyr_rt_str_new()".to_string(),
@@ -5160,6 +5190,7 @@ fn is_intrinsic(name: &str) -> bool {
         "print_int" | "print_float" | "print_str" | "print_bool"
             | "alloc" | "alloc_i32" | "realloc" | "realloc_i32" | "free_ptr" | "size_of" | "slice"
             | "align_of" | "offset_of" | "count_codepoints" | "codepoints" | "from_utf8" | "is_utf8"
+            | "substr"
             | "string_new" | "string_from" | "string_push" | "string_view" | "string_free"
             | "builder_new" | "builder_push" | "builder_build" | "builder_free"
             | "region_str" | "region_concat" | "bytes"
@@ -5691,6 +5722,25 @@ mod tests {
         assert!(c.contains("jestyr_rt_str_from("), "string_from copies into an owned buffer: {c}");
         assert!(c.contains("jestyr_rt_str_push(&"), "string_push takes the String by address: {c}");
         assert!(c.contains("j_s.len"), "String.len is an O(1) field: {c}");
+    }
+
+    #[test]
+    fn string_slice_is_a_boundary_checked_view() {
+        // `s[i..j]` (no annotation) types as `str`, so the `let` declares a
+        // JestyrStr, and lowers to the bounds+boundary-checked substr helper.
+        let src = "fn f(read s: str) -> i32 { let t = s[1..4] return t.len as i32 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("JestyrStr j_t"), "a string slice types as str: {c}");
+        assert!(c.contains("jestyr_rt_substr("), "via the boundary-checked helper: {c}");
+    }
+
+    #[test]
+    fn named_substr_types_and_lowers() {
+        let (c, d) = gen("fn f(read s: str) -> i32 { let t = substr(s, 1, 3) return t.len as i32 }");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("JestyrStr j_t"), "substr(...) types as str: {c}");
+        assert!(c.contains("jestyr_rt_substr("), "substr lowers to the helper: {c}");
     }
 
     #[test]

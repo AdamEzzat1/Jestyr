@@ -1,0 +1,16 @@
+// examples/substr.jtr — substring / slicing (strings step 8). A substring is a
+// boundary-checked, *zero-copy view* into the same bytes (Erlang sub-binary
+// sharing + Rust's "no slicing on a non-char-boundary" discipline). `s[i..j]` is
+// sugar for `substr(s, i, j)`; both share one bounds+boundary-checked helper.
+//
+// Run:  jestyrc run examples/substr.jtr   →  prints ell, Hello, lo, 3
+
+fn main() -> i32 {
+    let s: str = "Hello"
+
+    print_str(s[1..4])                // ell    — bytes 1..4 (a view, no copy)
+    print_str(s[0..])                 // Hello  — open end → to s.len
+    print_str(substr(s, 3, 5))        // lo     — the named form
+    print_int(s[1..4].len as i32)     // 3      — the sub-view carries its own O(1) length
+    return 0
+}
