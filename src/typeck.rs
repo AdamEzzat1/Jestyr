@@ -2038,7 +2038,9 @@ fn string_intrinsic_ret(name: &str) -> Option<Ty> {
         "try_from_utf8" => Ty::Result(Box::new(Ty::Prim("str"))),
         "count_codepoints" | "count_graphemes" => Ty::Prim("usize"),
         "find" => Ty::Prim("isize"),
-        "is_utf8" | "str_eq" | "starts_with" | "ends_with" | "contains" => Ty::Prim("bool"),
+        "is_utf8" | "str_eq" | "eq_fold" | "starts_with" | "ends_with" | "contains" => {
+            Ty::Prim("bool")
+        }
         _ => return None,
     })
 }

@@ -395,7 +395,10 @@ impl<'a> Cgen<'a> {
         self.raw("static bool jestyr_rt_ends_with(JestyrStr s, JestyrStr p) { return s.len >= p.len && memcmp(s.ptr + (s.len - p.len), p.ptr, p.len) == 0; }\n");
         self.raw("static int64_t jestyr_rt_find(JestyrStr s, JestyrStr n) { if (n.len == 0) return 0; if (n.len > s.len) return -1; for (size_t i = 0; i + n.len <= s.len; i++) if (memcmp(s.ptr + i, n.ptr, n.len) == 0) return (int64_t)i; return -1; }\n");
         self.raw("static bool jestyr_rt_contains(JestyrStr s, JestyrStr n) { return jestyr_rt_find(s, n) >= 0; }\n");
-        self.raw("static JestyrStr jestyr_rt_trim(JestyrStr s) { size_t a = 0, b = s.len; while (a < b) { char c = s.ptr[a]; if (c==' '||c=='\\t'||c=='\\n'||c=='\\r') a++; else break; } while (b > a) { char c = s.ptr[b-1]; if (c==' '||c=='\\t'||c=='\\n'||c=='\\r') b--; else break; } return (JestyrStr){ s.ptr + a, b - a }; }\n\n");
+        self.raw("static JestyrStr jestyr_rt_trim(JestyrStr s) { size_t a = 0, b = s.len; while (a < b) { char c = s.ptr[a]; if (c==' '||c=='\\t'||c=='\\n'||c=='\\r') a++; else break; } while (b > a) { char c = s.ptr[b-1]; if (c==' '||c=='\\t'||c=='\\n'||c=='\\r') b--; else break; } return (JestyrStr){ s.ptr + a, b - a }; }\n");
+        self.raw("/* ASCII case-insensitive equality — the opt-in normalization-aware compare. Full Unicode case-folding / NFC normalization needs the Unicode tables (deferred). */\n");
+        self.raw("static char jestyr_rt_ascii_lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }\n");
+        self.raw("static bool jestyr_rt_eq_fold(JestyrStr a, JestyrStr b) { if (a.len != b.len) return false; for (size_t i = 0; i < a.len; i++) if (jestyr_rt_ascii_lower(a.ptr[i]) != jestyr_rt_ascii_lower(b.ptr[i])) return false; return true; }\n\n");
         self.raw("/* Jestyr owned String — a heap-owned, growable buffer (the owned half of the\n");
         self.raw("   owned/view split). `string_view` borrows it as a `str` view; no copy. */\n");
         self.raw("typedef struct { char* ptr; size_t len; size_t cap; } JestyrString;\n");
@@ -3295,6 +3298,7 @@ impl<'a> Cgen<'a> {
                 }
                 // Byte-level string operations (all view-based; `find`/`trim` zero-copy).
                 "str_eq" => return self.emit_str_binop("jestyr_rt_str_eq", args),
+                "eq_fold" => return self.emit_str_binop("jestyr_rt_eq_fold", args),
                 "starts_with" => return self.emit_str_binop("jestyr_rt_starts_with", args),
                 "ends_with" => return self.emit_str_binop("jestyr_rt_ends_with", args),
                 "contains" => return self.emit_str_binop("jestyr_rt_contains", args),
@@ -5362,7 +5366,7 @@ fn is_intrinsic(name: &str) -> bool {
             | "alloc" | "alloc_i32" | "realloc" | "realloc_i32" | "free_ptr" | "size_of" | "slice"
             | "align_of" | "offset_of" | "count_codepoints" | "codepoints" | "from_utf8" | "is_utf8"
             | "substr" | "str_eq" | "starts_with" | "ends_with" | "contains" | "find" | "trim"
-            | "count_graphemes" | "graphemes" | "split" | "try_from_utf8"
+            | "count_graphemes" | "graphemes" | "split" | "try_from_utf8" | "eq_fold"
             | "string_new" | "string_from" | "string_push" | "string_view" | "string_free"
             | "builder_new" | "builder_push" | "builder_build" | "builder_free"
             | "region_str" | "region_concat" | "bytes"
@@ -5944,6 +5948,13 @@ mod tests {
         assert!(c.contains("jestyr_rt_trim("), "trim: {c}");
         assert!(c.contains("JestyrStr j_t"), "trim yields a str view: {c}");
         assert!(c.contains("bool j_a"), "str_eq yields a bool: {c}");
+    }
+
+    #[test]
+    fn eq_fold_is_case_insensitive() {
+        let (c, d) = gen("fn f() -> i32 { if eq_fold(\"Hi\", \"hi\") { return 1 } return 0 }");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("jestyr_rt_eq_fold("), "eq_fold lowers to the fold compare: {c}");
     }
 
     #[test]

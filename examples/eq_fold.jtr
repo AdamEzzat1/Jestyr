@@ -1,0 +1,12 @@
+// examples/eq_fold.jtr — case-fold comparison (strings S4): the opt-in
+// normalization-aware compare. `eq_fold` is ASCII case-insensitive; full Unicode
+// case-folding / NFC normalization needs the Unicode tables (deferred).
+//
+// Run:  jestyrc run examples/eq_fold.jtr   →  false, true, true
+
+fn main() -> i32 {
+    print_bool(str_eq("Hello", "hello"))    // false — exact byte equality
+    print_bool(eq_fold("Hello", "hello"))   // true  — case-insensitive
+    print_bool(eq_fold("WORLD", "world"))   // true
+    return 0
+}

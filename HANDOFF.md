@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 280 tests pass, including `proptest` property
+and run (or are correctly rejected). 281 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -1113,6 +1113,12 @@ These are the non-obvious things that will bite if you don't know them.
     — so `unwrap(r).len` projects correctly without an annotation. cgen emits a ternary on
     `jestyr_rt_valid_utf8`: ok → `{ .is_err=false, .ok={…} }`, bad → `{ .is_err=true, .err=1 }`.
     Demo [`examples/try_utf8.jtr`](examples/try_utf8.jtr) (`5, -1` — valid length vs recovered).
+
+64. **Case-fold comparison `eq_fold` (strings S4).** The opt-in normalization-aware compare:
+    `eq_fold(a, b)` is ASCII case-insensitive equality (`jestyr_rt_eq_fold` via `ascii_lower`,
+    typed `bool`). Honest scope: **full Unicode case-folding and NFC normalization** (so composed
+    "é" equals decomposed "é") need the Unicode decomposition tables — deferred. Demo
+    [`examples/eq_fold.jtr`](examples/eq_fold.jtr) (`false, true, true`).
 
 ---
 
