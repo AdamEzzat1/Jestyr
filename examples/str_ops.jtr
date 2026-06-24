@@ -1,0 +1,23 @@
+// examples/str_ops.jtr — basic string operations (strings step 9). Built on the
+// `str` view + `substr`: equality, prefix/suffix, search, trim. `find`/`trim` are
+// zero-copy. With `find` + `substr` you can split by hand until a `split` that
+// returns a collection lands.
+//
+// Run:  jestyrc run examples/str_ops.jtr   →  prints true, true, false, 7, foo, bar
+
+fn main() -> i32 {
+    let s: str = "hello, world"
+
+    print_bool(str_eq(s, "hello, world"))   // true
+    print_bool(starts_with(s, "hello"))     // true
+    print_bool(contains(s, "xyz"))          // false
+    print_int(find(s, "world") as i32)      // 7    — byte offset of the match
+
+    print_str(trim("  foo  "))              // foo  — a zero-copy trimmed sub-view
+
+    // Split on the first comma using find + substr (the building blocks).
+    let csv: str = "bar,baz"
+    let comma: isize = find(csv, ",")
+    print_str(csv[0..(comma as usize)])     // bar
+    return 0
+}

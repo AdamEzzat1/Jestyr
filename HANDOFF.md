@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 275 tests pass, including `proptest` property
+and run (or are correctly rejected). 276 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -240,6 +240,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `fstring.jtr` | message, `25` | **f-strings (strings E)** — `f"{name} x = {x} ({ok})"` typed interpolation → owned `String` (§5.57) |
 | `region_string.jtr` | `Hello, region!`, `14`, `5`, `4` | **region strings + `bytes` (strings E)** — arena-allocated text, freed at scope end; `bytes`↔`from_utf8` round-trip (§5.58) |
 | `substr.jtr` | `ell`, `Hello`, `lo`, `3` | **substring / slicing (strings E)** — `s[i..j]`/`substr` boundary-checked zero-copy sub-view (§5.59) |
+| `str_ops.jtr` | `true`, `true`, `false`, `7`, `foo`, `bar` | **string operations (strings E)** — `str_eq`/`starts_with`/`contains`/`find`/`trim` (view-based) (§5.60) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -1059,6 +1060,15 @@ These are the non-obvious things that will bite if you don't know them.
     right C type. Demo [`examples/substr.jtr`](examples/substr.jtr) (`ell, Hello, lo, 3`).
     **Next (operations):** `eq`/`find`/`contains`/`split`/`trim` build on this view; then the
     region-escape static proof.
+
+60. **Basic string operations (strings step 9).** Byte-level, view-based: `str_eq`,
+    `starts_with`, `ends_with`, `contains`, `find` (`-> isize`, byte offset or `-1`), and `trim`
+    (a **zero-copy** trimmed sub-view). Each is one `memcmp`/scan runtime helper
+    (`jestyr_rt_str_eq` … `jestyr_rt_trim`); the binary ones share `cgen::emit_str_binop`. Typed
+    via `string_intrinsic_ret` (eq/prefix/suffix/contains → `bool`, `find` → `isize`, `trim` →
+    `str`) so no annotations are needed. With `find` + `substr` you can split by hand; a `split`
+    that *returns a collection* needs a string-list/iterator (the next gap). Demo
+    [`examples/str_ops.jtr`](examples/str_ops.jtr) (`true, true, false, 7, foo, bar`).
 
 ---
 

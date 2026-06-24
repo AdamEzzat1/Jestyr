@@ -2013,9 +2013,10 @@ pub(crate) fn is_scalar_match_ty(p: &str) -> bool {
 /// directly (the recoverable `str !Utf8Error` form is a future refinement).
 fn string_intrinsic_ret(name: &str) -> Option<Ty> {
     Some(match name {
-        "substr" | "from_utf8" => Ty::Prim("str"),
+        "substr" | "from_utf8" | "trim" => Ty::Prim("str"),
         "count_codepoints" => Ty::Prim("usize"),
-        "is_utf8" => Ty::Prim("bool"),
+        "find" => Ty::Prim("isize"),
+        "is_utf8" | "str_eq" | "starts_with" | "ends_with" | "contains" => Ty::Prim("bool"),
         _ => return None,
     })
 }

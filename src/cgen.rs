@@ -384,7 +384,14 @@ impl<'a> Cgen<'a> {
         self.raw("static bool jestyr_rt_valid_utf8(const char* p, size_t len) { size_t k = 0; while (k < len) { uint8_t b = (uint8_t)p[k]; size_t n; if (b < 0x80u) n = 1; else if ((b & 0xE0u) == 0xC0u) n = 2; else if ((b & 0xF0u) == 0xE0u) n = 3; else if ((b & 0xF8u) == 0xF0u) n = 4; else return false; if (k + n > len) return false; for (size_t j = 1; j < n; j++) if (((uint8_t)p[k + j] & 0xC0u) != 0x80u) return false; k += n; } return true; }\n");
         self.raw("/* A boundary-checked sub-view (Rust discipline): start<=end<=len, and both on UTF-8 char boundaries. Zero-copy. */\n");
         self.raw("static bool jestyr_rt_is_boundary(JestyrStr s, size_t i) { return i == s.len || ((uint8_t)s.ptr[i] & 0xC0u) != 0x80u; }\n");
-        self.raw("static JestyrStr jestyr_rt_substr(JestyrStr s, size_t start, size_t end) { assert(start <= end && end <= s.len); assert(jestyr_rt_is_boundary(s, start) && jestyr_rt_is_boundary(s, end)); return (JestyrStr){ s.ptr + start, end - start }; }\n\n");
+        self.raw("static JestyrStr jestyr_rt_substr(JestyrStr s, size_t start, size_t end) { assert(start <= end && end <= s.len); assert(jestyr_rt_is_boundary(s, start) && jestyr_rt_is_boundary(s, end)); return (JestyrStr){ s.ptr + start, end - start }; }\n");
+        self.raw("/* Byte-level string operations: equality, prefix/suffix, search, trim. All view-based (find/trim are zero-copy). */\n");
+        self.raw("static bool jestyr_rt_str_eq(JestyrStr a, JestyrStr b) { return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0; }\n");
+        self.raw("static bool jestyr_rt_starts_with(JestyrStr s, JestyrStr p) { return s.len >= p.len && memcmp(s.ptr, p.ptr, p.len) == 0; }\n");
+        self.raw("static bool jestyr_rt_ends_with(JestyrStr s, JestyrStr p) { return s.len >= p.len && memcmp(s.ptr + (s.len - p.len), p.ptr, p.len) == 0; }\n");
+        self.raw("static int64_t jestyr_rt_find(JestyrStr s, JestyrStr n) { if (n.len == 0) return 0; if (n.len > s.len) return -1; for (size_t i = 0; i + n.len <= s.len; i++) if (memcmp(s.ptr + i, n.ptr, n.len) == 0) return (int64_t)i; return -1; }\n");
+        self.raw("static bool jestyr_rt_contains(JestyrStr s, JestyrStr n) { return jestyr_rt_find(s, n) >= 0; }\n");
+        self.raw("static JestyrStr jestyr_rt_trim(JestyrStr s) { size_t a = 0, b = s.len; while (a < b) { char c = s.ptr[a]; if (c==' '||c=='\\t'||c=='\\n'||c=='\\r') a++; else break; } while (b > a) { char c = s.ptr[b-1]; if (c==' '||c=='\\t'||c=='\\n'||c=='\\r') b--; else break; } return (JestyrStr){ s.ptr + a, b - a }; }\n\n");
         self.raw("/* Jestyr owned String — a heap-owned, growable buffer (the owned half of the\n");
         self.raw("   owned/view split). `string_view` borrows it as a `str` view; no copy. */\n");
         self.raw("typedef struct { char* ptr; size_t len; size_t cap; } JestyrString;\n");
@@ -2517,6 +2524,14 @@ impl<'a> Cgen<'a> {
             .any(|it| matches!(it, Item::Enum(e) if e.name.name == name && e.is_generic()))
     }
 
+    /// Emit a two-`str`-argument string operation `helper(a, b)` (equality,
+    /// prefix/suffix, search).
+    fn emit_str_binop(&mut self, helper: &str, args: &[ExprId]) -> String {
+        let a = args.first().map(|x| self.emit_expr(*x)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+        let b = args.get(1).map(|x| self.emit_expr(*x)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+        format!("{helper}({a}, {b})")
+    }
+
     /// The fields of a (non-generic) struct that declare a `= <expr>` default,
     /// by name — used to fill omitted fields in a struct literal. Defaults should
     /// be constant expressions (they're emitted at each construction site).
@@ -3248,6 +3263,16 @@ impl<'a> Cgen<'a> {
                     let start = args.get(1).map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".to_string());
                     let end = args.get(2).map(|a| self.emit_expr(*a)).unwrap_or_else(|| format!("({s}).len"));
                     return format!("jestyr_rt_substr({s}, {start}, {end})");
+                }
+                // Byte-level string operations (all view-based; `find`/`trim` zero-copy).
+                "str_eq" => return self.emit_str_binop("jestyr_rt_str_eq", args),
+                "starts_with" => return self.emit_str_binop("jestyr_rt_starts_with", args),
+                "ends_with" => return self.emit_str_binop("jestyr_rt_ends_with", args),
+                "contains" => return self.emit_str_binop("jestyr_rt_contains", args),
+                "find" => return self.emit_str_binop("jestyr_rt_find", args),
+                "trim" => {
+                    let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    return format!("jestyr_rt_trim({s})");
                 }
                 // Owned, growable `String` (the owned half of the owned/view split).
                 "string_new" => return "jestyr_rt_str_new()".to_string(),
@@ -5190,7 +5215,7 @@ fn is_intrinsic(name: &str) -> bool {
         "print_int" | "print_float" | "print_str" | "print_bool"
             | "alloc" | "alloc_i32" | "realloc" | "realloc_i32" | "free_ptr" | "size_of" | "slice"
             | "align_of" | "offset_of" | "count_codepoints" | "codepoints" | "from_utf8" | "is_utf8"
-            | "substr"
+            | "substr" | "str_eq" | "starts_with" | "ends_with" | "contains" | "find" | "trim"
             | "string_new" | "string_from" | "string_push" | "string_view" | "string_free"
             | "builder_new" | "builder_push" | "builder_build" | "builder_free"
             | "region_str" | "region_concat" | "bytes"
@@ -5741,6 +5766,22 @@ mod tests {
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("JestyrStr j_t"), "substr(...) types as str: {c}");
         assert!(c.contains("jestyr_rt_substr("), "substr lowers to the helper: {c}");
+    }
+
+    #[test]
+    fn string_operations_lower_to_helpers() {
+        // The bare ops type via string_intrinsic_ret (no annotations needed):
+        // eq/starts_with/contains → bool, find → isize, trim → str.
+        let src = "fn f(read s: str) -> i32 { \
+            let a = str_eq(s, \"x\") let b = starts_with(s, \"x\") let c = contains(s, \"x\") \
+            let i = find(s, \"x\") let t = trim(s) return i as i32 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("jestyr_rt_str_eq("), "str_eq: {c}");
+        assert!(c.contains("jestyr_rt_find("), "find: {c}");
+        assert!(c.contains("jestyr_rt_trim("), "trim: {c}");
+        assert!(c.contains("JestyrStr j_t"), "trim yields a str view: {c}");
+        assert!(c.contains("bool j_a"), "str_eq yields a bool: {c}");
     }
 
     #[test]
