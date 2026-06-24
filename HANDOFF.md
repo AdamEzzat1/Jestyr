@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 281 tests pass, including `proptest` property
+and run (or are correctly rejected). 282 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -1119,6 +1119,16 @@ These are the non-obvious things that will bite if you don't know them.
     typed `bool`). Honest scope: **full Unicode case-folding and NFC normalization** (so composed
     "é" equals decomposed "é") need the Unicode decomposition tables — deferred. Demo
     [`examples/eq_fold.jtr`](examples/eq_fold.jtr) (`false, true, true`).
+
+65. **`os_str` / WTF-8 platform bytes (strings S5).** A **distinct primitive** for unvalidated
+    platform text (the Rust `OsStr` / WTF-8 role — relevant on Windows). `prim()` (types.rs) and
+    `c_type` add `os_str` (lowers to `JestyrStr` — structurally a `{ptr,len}` view, but *unproven*).
+    `os_from_bytes([]u8) -> os_str` reinterprets raw bytes without checking; `to_str_lossy(os) ->
+    String` decodes them into a **proven** owned `String`, replacing each ill-formed byte with
+    U+FFFD (`jestyr_rt_to_str_lossy`). So the only doors from unproven bytes to a proven `str`/
+    `String` are validation (`from_utf8`/`try_from_utf8`) or this lossy decode. **Limitation:** like
+    `distinct` (§5.37), the os_str↔str distinction is enforced at `let` annotations, not yet at call
+    args. Demo [`examples/os_str.jtr`](examples/os_str.jtr) (`6` = `caf` + U+FFFD).
 
 ---
 

@@ -1,0 +1,17 @@
+// examples/os_str.jtr — os_str / WTF-8 platform bytes (strings S5). Platform APIs
+// (especially Windows) hand back potentially ill-formed text. `os_str` is a
+// DISTINCT type for "bytes I haven't proven valid" — you can't use it where a
+// proven `str` is expected without going through validation or a lossy decode.
+// `to_str_lossy` produces a proven `String`, replacing bad bytes with U+FFFD.
+//
+// Run:  jestyrc run examples/os_str.jtr   →  6
+
+fn main() -> i32 {
+    // Simulate platform text with an invalid UTF-8 byte (0xFF).
+    let raw: []u8 = bytes("caf\xFF")
+    let os: os_str = os_from_bytes(raw)        // unvalidated platform text
+    var clean: String = to_str_lossy(os)       // → "caf" + U+FFFD (3 bytes)
+    print_int(clean.len as i32)                // 6 = 3 ("caf") + 3 (U+FFFD)
+    string_free(clean)
+    return 0
+}

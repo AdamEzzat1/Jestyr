@@ -408,7 +408,9 @@ impl<'a> Cgen<'a> {
         self.raw("static JestyrStr jestyr_rt_str_view(JestyrString* s) { return (JestyrStr){ s->ptr, s->len }; }\n");
         self.raw("static void jestyr_rt_str_free(JestyrString* s) { free(s->ptr); s->ptr = NULL; s->len = 0; s->cap = 0; }\n");
         self.raw("/* Append an integer's decimal digits (for f-string interpolation; copies). */\n");
-        self.raw("static void jestyr_rt_str_push_i64(JestyrString* s, int64_t v) { char b[24]; int n = snprintf(b, sizeof(b), \"%lld\", (long long)v); if (n < 0) n = 0; jestyr_rt_str_push(s, (JestyrStr){ b, (size_t)n }); }\n\n");
+        self.raw("static void jestyr_rt_str_push_i64(JestyrString* s, int64_t v) { char b[24]; int n = snprintf(b, sizeof(b), \"%lld\", (long long)v); if (n < 0) n = 0; jestyr_rt_str_push(s, (JestyrStr){ b, (size_t)n }); }\n");
+        self.raw("/* Lossily decode unvalidated platform text (os_str) into a proven UTF-8 String, replacing each ill-formed byte with U+FFFD. */\n");
+        self.raw("static JestyrString jestyr_rt_to_str_lossy(JestyrStr os) { JestyrString out = jestyr_rt_str_new(); size_t k = 0; while (k < os.len) { uint8_t b = (uint8_t)os.ptr[k]; size_t n; bool ok = true; if (b < 0x80u) n = 1; else if ((b & 0xE0u) == 0xC0u) n = 2; else if ((b & 0xF0u) == 0xE0u) n = 3; else if ((b & 0xF8u) == 0xF0u) n = 4; else { ok = false; n = 1; } if (ok && k + n <= os.len) { for (size_t j = 1; j < n; j++) if (((uint8_t)os.ptr[k + j] & 0xC0u) != 0x80u) { ok = false; break; } } else if (n > 1) ok = false; if (ok) { jestyr_rt_str_push(&out, (JestyrStr){ os.ptr + k, n }); k += n; } else { jestyr_rt_str_push(&out, (JestyrStr){ \"\\xEF\\xBF\\xBD\", 3 }); k += 1; } } return out; }\n\n");
         self.raw("/* Jestyr Builder — an iolist: a list of `str` *fragments* collected with no\n");
         self.raw("   copying; `builder_build` sums the lengths, allocates once, and flattens in a\n");
         self.raw("   single pass (Erlang iodata). Fragments must outlive the build. */\n");
@@ -3307,6 +3309,17 @@ impl<'a> Cgen<'a> {
                     let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
                     return format!("jestyr_rt_trim({s})");
                 }
+                // `os_str` — unvalidated platform text (the WTF-8 / OsStr role).
+                // `os_from_bytes` reinterprets raw bytes as an os_str view (no check);
+                // `to_str_lossy` decodes it into a proven `String` (U+FFFD for bad bytes).
+                "os_from_bytes" => {
+                    let b = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    return format!("({{ __typeof__({b}) _ob = {b}; (JestyrStr){{ (const char*)_ob.ptr, _ob.len }}; }})");
+                }
+                "to_str_lossy" => {
+                    let os = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    return format!("jestyr_rt_to_str_lossy({os})");
+                }
                 // Owned, growable `String` (the owned half of the owned/view split).
                 "string_new" => return "jestyr_rt_str_new()".to_string(),
                 "string_from" => {
@@ -5367,6 +5380,7 @@ fn is_intrinsic(name: &str) -> bool {
             | "align_of" | "offset_of" | "count_codepoints" | "codepoints" | "from_utf8" | "is_utf8"
             | "substr" | "str_eq" | "starts_with" | "ends_with" | "contains" | "find" | "trim"
             | "count_graphemes" | "graphemes" | "split" | "try_from_utf8" | "eq_fold"
+            | "os_from_bytes" | "to_str_lossy"
             | "string_new" | "string_from" | "string_push" | "string_view" | "string_free"
             | "builder_new" | "builder_push" | "builder_build" | "builder_free"
             | "region_str" | "region_concat" | "bytes"
@@ -5422,6 +5436,7 @@ fn prim_c(name: &str) -> Option<&'static str> {
         "bool" => "bool",
         "char" => "uint32_t",
         "str" => "JestyrStr",
+        "os_str" => "JestyrStr", // structurally a view, but unproven (possibly ill-formed)
         "cstr" => "const char*",
         "String" => "JestyrString",
         "Builder" => "JestyrBuilder",
@@ -5948,6 +5963,15 @@ mod tests {
         assert!(c.contains("jestyr_rt_trim("), "trim: {c}");
         assert!(c.contains("JestyrStr j_t"), "trim yields a str view: {c}");
         assert!(c.contains("bool j_a"), "str_eq yields a bool: {c}");
+    }
+
+    #[test]
+    fn os_str_lossy_decode() {
+        let src = "fn f(raw: []u8) -> i32 { let os: os_str = os_from_bytes(raw) var s: String = to_str_lossy(os) let n = s.len as i32 string_free(s) return n }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("JestyrStr j_os"), "os_str lowers to a view: {c}");
+        assert!(c.contains("jestyr_rt_to_str_lossy("), "lossy decode to a proven String: {c}");
     }
 
     #[test]

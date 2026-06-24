@@ -126,6 +126,7 @@ pub fn prim_ty(name: &str) -> Option<&'static str> {
         "char" => "char",
         "str" => "str",
         "cstr" => "cstr",
+        "os_str" => "os_str",
         "String" => "String",
         "Builder" => "Builder",
         _ => return None,

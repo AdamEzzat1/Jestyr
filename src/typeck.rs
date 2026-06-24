@@ -2034,6 +2034,8 @@ pub(crate) fn is_scalar_match_ty(p: &str) -> bool {
 fn string_intrinsic_ret(name: &str) -> Option<Ty> {
     Some(match name {
         "substr" | "from_utf8" | "trim" => Ty::Prim("str"),
+        "os_from_bytes" => Ty::Prim("os_str"),
+        "to_str_lossy" => Ty::Prim("String"),
         // Recoverable: yields a Result so `is_err`/`unwrap`/`?` compose.
         "try_from_utf8" => Ty::Result(Box::new(Ty::Prim("str"))),
         "count_codepoints" | "count_graphemes" => Ty::Prim("usize"),
