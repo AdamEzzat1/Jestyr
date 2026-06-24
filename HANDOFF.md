@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 279 tests pass, including `proptest` property
+and run (or are correctly rejected). 280 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -1102,6 +1102,17 @@ These are the non-obvious things that will bite if you don't know them.
     `for`-binding by the iterator's callee (`split`/`graphemes` → `str`, `codepoints` → `u32`) so
     `p.len`/`g.len` lower correctly. Decomposed literals via C `\x` escapes (`"e\xCC\x81"` = e +
     U+0301). Demo [`examples/str_iter.jtr`](examples/str_iter.jtr) (`1, 2, 3, 3, 0, 1, 2, 1`).
+
+63. **Recoverable `try_from_utf8 -> str !Utf8Error` (strings S3).** Where `from_utf8` *traps*
+    (asserts) on invalid input, `try_from_utf8([]u8)` returns a **Result** you branch on with
+    `is_err`/`unwrap` (or compose with `?`). Since it's an intrinsic, its result type isn't
+    discovered from a fn signature, so `result_defs` emits `JestyrResult_str` (`{ bool is_err;
+    JestyrStr ok; int err; }`) **up front**, seeding the `seen` set so a user `str !E` fn doesn't
+    duplicate it. **typeck:** `string_intrinsic_ret("try_from_utf8")` → `Ty::Result(str)`, and a
+    new Call-arm case types **`unwrap(r: T !E) -> T`** (the result's ok type) and `is_err -> bool`
+    — so `unwrap(r).len` projects correctly without an annotation. cgen emits a ternary on
+    `jestyr_rt_valid_utf8`: ok → `{ .is_err=false, .ok={…} }`, bad → `{ .is_err=true, .err=1 }`.
+    Demo [`examples/try_utf8.jtr`](examples/try_utf8.jtr) (`5, -1` — valid length vs recovered).
 
 ---
 

@@ -1,0 +1,22 @@
+// examples/try_utf8.jtr — recoverable validate-at-boundary (strings S3). Unlike
+// from_utf8 (which traps on invalid input), try_from_utf8 returns a Result you
+// branch on with is_err/unwrap (or compose with `?`).
+//
+// Run:  jestyrc run examples/try_utf8.jtr   →  5, -1
+
+fn try_len(b: []u8) -> i32 {
+    let r = try_from_utf8(b)
+    if is_err(r) {
+        return -1                    // recovered — no trap
+    }
+    return unwrap(r).len as i32
+}
+
+fn main() -> i32 {
+    let good: []u8 = bytes("hello")
+    print_int(try_len(good))         // 5    — valid UTF-8
+
+    let bad: []u8 = bytes("\xFF\xFE")  // invalid UTF-8 lead bytes
+    print_int(try_len(bad))          // -1   — rejected, recovered
+    return 0
+}

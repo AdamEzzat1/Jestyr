@@ -1030,6 +1030,14 @@ impl<'a> TypeChecker<'a> {
                         let arg_tys: Vec<Ty> =
                             args.iter().map(|a| self.expr_types[a.0 as usize].clone()).collect();
                         self.variant_ctor_type(ei, &name, &arg_tys)
+                    } else if name == "unwrap" {
+                        // `unwrap(r: T !E) -> T` — the ok type of the result argument.
+                        match args.first().map(|a| self.expr_types[a.0 as usize].clone()) {
+                            Some(Ty::Result(ok)) => *ok,
+                            _ => Ty::Unknown,
+                        }
+                    } else if name == "is_err" {
+                        Ty::Prim("bool")
                     } else if let Some(t) = string_intrinsic_ret(&name) {
                         // String intrinsics aren't declared functions; type their
                         // results so a `let` (without an annotation) gets the right C type.
@@ -2026,6 +2034,8 @@ pub(crate) fn is_scalar_match_ty(p: &str) -> bool {
 fn string_intrinsic_ret(name: &str) -> Option<Ty> {
     Some(match name {
         "substr" | "from_utf8" | "trim" => Ty::Prim("str"),
+        // Recoverable: yields a Result so `is_err`/`unwrap`/`?` compose.
+        "try_from_utf8" => Ty::Result(Box::new(Ty::Prim("str"))),
         "count_codepoints" | "count_graphemes" => Ty::Prim("usize"),
         "find" => Ty::Prim("isize"),
         "is_utf8" | "str_eq" | "starts_with" | "ends_with" | "contains" => Ty::Prim("bool"),

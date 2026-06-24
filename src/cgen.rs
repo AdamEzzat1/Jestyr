@@ -1059,6 +1059,11 @@ impl<'a> Cgen<'a> {
     fn result_defs(&mut self) {
         let ast = self.ast;
         let mut seen: HashSet<String> = HashSet::new();
+        // `try_from_utf8(...) -> str !Utf8Error` is an *intrinsic*, so its result
+        // type isn't discovered from a fn signature — emit it up front (and seed
+        // `seen` so a user `str !E` function doesn't duplicate the typedef).
+        self.raw("typedef struct { bool is_err; JestyrStr ok; int err; } JestyrResult_str;\n");
+        seen.insert("JestyrResult_str".to_string());
         for item in &ast.items {
             if let Item::Fn(f) = item {
                 if f.errors.is_none() {
@@ -3242,6 +3247,21 @@ impl<'a> Cgen<'a> {
                     }
                     return "(JestyrStr){0,0}".to_string();
                 }
+                // Recoverable validate-at-boundary: `try_from_utf8([]u8) -> str !Utf8Error`
+                // returns a Result (`is_err`/`unwrap`/`?` compose) instead of trapping.
+                "try_from_utf8" => {
+                    if let Some(a) = args.first().copied() {
+                        let bt = self.info.type_of(a).clone();
+                        let bcty = self.c_type(&bt);
+                        let b = self.emit_expr(a);
+                        return format!(
+                            "({{ {bcty} _u = {b}; jestyr_rt_valid_utf8((const char*)_u.ptr, _u.len) \
+                             ? (JestyrResult_str){{ .is_err = false, .ok = (JestyrStr){{ (const char*)_u.ptr, _u.len }} }} \
+                             : (JestyrResult_str){{ .is_err = true, .err = 1 }}; }})"
+                        );
+                    }
+                    return "(JestyrResult_str){ .is_err = true, .err = 1 }".to_string();
+                }
                 // An explicit, recoverable UTF-8 check (when you want to branch
                 // rather than trap).
                 "is_utf8" => {
@@ -5342,7 +5362,7 @@ fn is_intrinsic(name: &str) -> bool {
             | "alloc" | "alloc_i32" | "realloc" | "realloc_i32" | "free_ptr" | "size_of" | "slice"
             | "align_of" | "offset_of" | "count_codepoints" | "codepoints" | "from_utf8" | "is_utf8"
             | "substr" | "str_eq" | "starts_with" | "ends_with" | "contains" | "find" | "trim"
-            | "count_graphemes" | "graphemes" | "split"
+            | "count_graphemes" | "graphemes" | "split" | "try_from_utf8"
             | "string_new" | "string_from" | "string_push" | "string_view" | "string_free"
             | "builder_new" | "builder_push" | "builder_build" | "builder_free"
             | "region_str" | "region_concat" | "bytes"
@@ -5924,6 +5944,16 @@ mod tests {
         assert!(c.contains("jestyr_rt_trim("), "trim: {c}");
         assert!(c.contains("JestyrStr j_t"), "trim yields a str view: {c}");
         assert!(c.contains("bool j_a"), "str_eq yields a bool: {c}");
+    }
+
+    #[test]
+    fn try_from_utf8_returns_a_recoverable_result() {
+        let src = "fn f(b: []u8) -> i32 { let r = try_from_utf8(b) if is_err(r) { return -1 } return unwrap(r).len as i32 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("JestyrResult_str j_r"), "result-typed binding (no annotation): {c}");
+        assert!(c.contains("(JestyrResult_str){ .is_err = false"), "ok construction: {c}");
+        assert!(c.contains(".ok).len"), "unwrap(r).len projects the str length: {c}");
     }
 
     #[test]
