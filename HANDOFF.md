@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 278 tests pass, including `proptest` property
+and run (or are correctly rejected). 279 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -241,6 +241,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `region_string.jtr` | `Hello, region!`, `14`, `5`, `4` | **region strings + `bytes` (strings E)** — arena-allocated text, freed at scope end; `bytes`↔`from_utf8` round-trip (§5.58) |
 | `substr.jtr` | `ell`, `Hello`, `lo`, `3` | **substring / slicing (strings E)** — `s[i..j]`/`substr` boundary-checked zero-copy sub-view (§5.59) |
 | `str_ops.jtr` | `true`, `true`, `false`, `7`, `foo`, `bar` | **string operations (strings E)** — `str_eq`/`starts_with`/`contains`/`find`/`trim` (view-based) (§5.60) |
+| `str_iter.jtr` | `1`, `2`, `3`, `3`, `0`, `1`, `2`, `1` | **split / grapheme / offset iterators (strings E)** — `split`/`graphemes`/`codepoints` w/ byte offset; `count_graphemes` (§5.62) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -1088,6 +1089,19 @@ These are the non-obvious things that will bite if you don't know them.
     [`examples/region_escape.jtr`](examples/region_escape.jtr) (1 error). This is the one thing on
     the string survey no surveyed language (Swift/Zig/Rust/Erlang) can do: provably
     zero-allocation streaming text.
+
+62. **Split / grapheme / offset iterators (strings S1+S2).** Three zero-copy string iterators,
+    all hooked into the `for`-dispatch like `codepoints` (a `*_iter_arg` recognizer + an
+    `emit_*_for`): **`for part in split(s, sep)`** yields each `str` between separators (scans
+    with `jestyr_rt_find`; last part is the remainder; empty `sep` → whole string once);
+    **`for g in graphemes(s)`** yields each grapheme cluster as a `str` (a base codepoint plus
+    following combining marks — `jestyr_rt_is_combining`; simplified UAX#29, ZWJ emoji not merged);
+    **`for cp, off in codepoints(s)`** now binds the codepoint's **byte offset** (`_k` *before*
+    the decode — Go's range-over-string). **`count_graphemes(s)`** is the O(n) cluster count
+    (cost in the name, beside `count_codepoints`). **typeck:** `iter_elem_type` types the
+    `for`-binding by the iterator's callee (`split`/`graphemes` → `str`, `codepoints` → `u32`) so
+    `p.len`/`g.len` lower correctly. Decomposed literals via C `\x` escapes (`"e\xCC\x81"` = e +
+    U+0301). Demo [`examples/str_iter.jtr`](examples/str_iter.jtr) (`1, 2, 3, 3, 0, 1, 2, 1`).
 
 ---
 

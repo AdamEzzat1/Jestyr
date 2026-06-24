@@ -1,0 +1,27 @@
+// examples/str_iter.jtr — split + (offset, codepoint) + graphemes (strings S1/S2).
+// All are zero-copy iterators over the `str` view, with cost in the name.
+//
+// Run:  jestyrc run examples/str_iter.jtr   →  1, 2, 3, 3, 0, 1, 2, 1
+
+fn main() -> i32 {
+    // split: each part is a zero-copy sub-view.
+    var parts: i32 = 0
+    for p in split("a,bb,ccc", ",") {
+        print_int(p.len as i32)                  // 1, 2, 3
+        parts = parts + 1
+    }
+    print_int(parts)                             // 3
+
+    // (offset, codepoint): Go-style range over a string. '¢' (U+00A2) is 2 bytes,
+    // so it starts at byte offset 1 (right after 'a').
+    for cp, off in codepoints("a¢") {
+        print_int(off as i32)                    // 0, 1
+    }
+
+    // graphemes vs codepoints: "é" written *decomposed* — e (0x65) + combining
+    // acute U+0301 (0xCC 0x81) — is TWO codepoints but ONE grapheme cluster.
+    let acc: str = "e\xCC\x81"
+    print_int(count_codepoints(acc) as i32)      // 2
+    print_int(count_graphemes(acc) as i32)       // 1
+    return 0
+}

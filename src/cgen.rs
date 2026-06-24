@@ -378,8 +378,12 @@ impl<'a> Cgen<'a> {
         self.raw("#define JSTR(s) ((JestyrStr){ (s), sizeof(s) - 1 })\n");
         self.raw("/* O(n) codepoint count (vs O(1) `.len`): a UTF-8 leading byte is one whose top two bits aren't 10. */\n");
         self.raw("static size_t jestyr_rt_count_cp(JestyrStr s) { size_t n = 0; for (size_t k = 0; k < s.len; k++) if (((uint8_t)s.ptr[k] & 0xC0u) != 0x80u) n++; return n; }\n");
+        self.raw("/* Simplified grapheme segmentation: a cluster is a base codepoint plus following combining marks (é = e + U+0301). ZWJ emoji sequences are not merged — full UAX#29 needs Unicode tables. */\n");
+        self.raw("static bool jestyr_rt_is_combining(uint32_t cp) { return (cp >= 0x0300u && cp <= 0x036Fu) || (cp >= 0x1AB0u && cp <= 0x1AFFu) || (cp >= 0x1DC0u && cp <= 0x1DFFu) || (cp >= 0x20D0u && cp <= 0x20FFu) || (cp >= 0xFE20u && cp <= 0xFE2Fu); }\n");
         self.raw("/* Decode the UTF-8 codepoint at *k, advancing *k past it (replacement char on a bad lead byte). */\n");
         self.raw("static uint32_t jestyr_rt_decode_cp(const char* p, size_t len, size_t* k) { size_t i = *k; uint8_t b = (uint8_t)p[i]; uint32_t cp; size_t n; if (b < 0x80u) { cp = b; n = 1; } else if ((b & 0xE0u) == 0xC0u) { cp = b & 0x1Fu; n = 2; } else if ((b & 0xF0u) == 0xE0u) { cp = b & 0x0Fu; n = 3; } else if ((b & 0xF8u) == 0xF0u) { cp = b & 0x07u; n = 4; } else { *k = i + 1; return 0xFFFDu; } for (size_t j = 1; j < n && i + j < len; j++) cp = (cp << 6) | ((uint8_t)p[i + j] & 0x3Fu); *k = i + n; return cp; }\n");
+        self.raw("/* O(n) grapheme-cluster count: base codepoints (combining marks attach to the preceding base). */\n");
+        self.raw("static size_t jestyr_rt_count_graphemes(JestyrStr s) { size_t k = 0, n = 0; while (k < s.len) { uint32_t cp = jestyr_rt_decode_cp(s.ptr, s.len, &k); if (!jestyr_rt_is_combining(cp)) n++; } return n; }\n");
         self.raw("/* Validate a byte range as UTF-8 (used at the bytes->str boundary). */\n");
         self.raw("static bool jestyr_rt_valid_utf8(const char* p, size_t len) { size_t k = 0; while (k < len) { uint8_t b = (uint8_t)p[k]; size_t n; if (b < 0x80u) n = 1; else if ((b & 0xE0u) == 0xC0u) n = 2; else if ((b & 0xF0u) == 0xE0u) n = 3; else if ((b & 0xF8u) == 0xF0u) n = 4; else return false; if (k + n > len) return false; for (size_t j = 1; j < n; j++) if (((uint8_t)p[k + j] & 0xC0u) != 0x80u) return false; k += n; } return true; }\n");
         self.raw("/* A boundary-checked sub-view (Rust discipline): start<=end<=len, and both on UTF-8 char boundaries. Zero-copy. */\n");
@@ -3256,6 +3260,11 @@ impl<'a> Cgen<'a> {
                     let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
                     return format!("jestyr_rt_count_cp({s})");
                 }
+                // O(n) grapheme-cluster count (the correctness ceiling, opt-in).
+                "count_graphemes" => {
+                    let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    return format!("jestyr_rt_count_graphemes({s})");
+                }
                 // `substr(s, start, end)` — a boundary-checked zero-copy sub-view
                 // (the named form of `s[start..end]`).
                 "substr" => {
@@ -4339,8 +4348,16 @@ impl<'a> Cgen<'a> {
                     let (lo, hi, inclusive) = (*lo, *hi, *inclusive);
                     self.emit_range_for(&b0.name, src, lo, hi, inclusive, step, body);
                 } else if let Some(s_arg) = self.codepoints_iter_arg(src) {
-                    // `for cp in codepoints(s)` — O(n) UTF-8 decode (cost in the name).
-                    self.emit_codepoints_for(&b0.name, s_arg, body);
+                    // `for cp in codepoints(s)` — O(n) UTF-8 decode (cost in the name);
+                    // an optional second binding is the codepoint's byte offset (Go-style).
+                    let off = binds.get(1).map(|b| b.name.clone());
+                    self.emit_codepoints_for(&b0.name, off.as_ref(), s_arg, body);
+                } else if let Some(g_arg) = self.graphemes_iter_arg(src) {
+                    // `for g in graphemes(s)` — each `g` is a `str` grapheme cluster.
+                    self.emit_graphemes_for(&b0.name, g_arg, body);
+                } else if let Some((s_arg, sep_arg)) = self.split_iter_arg(src) {
+                    // `for part in split(s, sep)` — each `part` is a `str` view.
+                    self.emit_split_for(&b0.name, s_arg, sep_arg, body);
                 } else if matches!(self.info.type_of(src), Ty::Prim("str")) {
                     // String iteration — byte by byte through the view.
                     let index = binds.get(1).map(|b| b.name.clone());
@@ -4534,7 +4551,13 @@ impl<'a> Cgen<'a> {
     /// `for cp in codepoints(s) { B }` — decode UTF-8 one codepoint at a time. Each
     /// `cp` is a `u32`; the loop advances by the codepoint's byte width. O(n), and
     /// the cost is right there in the name — never an implicit decode (the D lesson).
-    fn emit_codepoints_for(&mut self, binding: &Ident, s_expr: ExprId, body: &Block) {
+    fn emit_codepoints_for(
+        &mut self,
+        binding: &Ident,
+        offset: Option<&Ident>,
+        s_expr: ExprId,
+        body: &Block,
+    ) {
         let s = self.emit_expr(s_expr);
         let n = self.tmp;
         self.tmp += 1;
@@ -4546,6 +4569,12 @@ impl<'a> Cgen<'a> {
         if let Some(name) = self.scratch_reset.take() {
             self.line(format!("j_{name}.off = 0;"));
         }
+        // The byte offset is `_k` *before* the decode advances it (Go's range-over-string).
+        if let Some(off) = offset {
+            if off.name != "_" {
+                self.line(format!("size_t j_{} = _k{n};", off.name));
+            }
+        }
         if binding.name != "_" {
             self.line(format!(
                 "uint32_t j_{} = jestyr_rt_decode_cp(_str{n}.ptr, _str{n}.len, &_k{n});",
@@ -4554,6 +4583,103 @@ impl<'a> Cgen<'a> {
         } else {
             self.line(format!("(void) jestyr_rt_decode_cp(_str{n}.ptr, _str{n}.len, &_k{n});"));
         }
+        for stmt in &body.stmts {
+            self.emit_stmt(stmt);
+        }
+        if let Some(lbl) = self.cont_label.take() {
+            self.line(format!("{lbl}__continue: ;"));
+        }
+        self.depth -= 1;
+        self.line("}");
+    }
+
+    fn graphemes_iter_arg(&self, e: ExprId) -> Option<ExprId> {
+        if let ExprKind::Call { callee, args } = &self.ast.expr_at(e).kind {
+            if let ExprKind::Name(nm) = &self.ast.expr_at(*callee).kind {
+                if nm.name == "graphemes" && args.len() == 1 {
+                    return Some(args[0]);
+                }
+            }
+        }
+        None
+    }
+
+    /// `for g in graphemes(s) { B }` — each `g` is a `str` view over one grapheme
+    /// cluster (a base codepoint plus its following combining marks). Zero-copy.
+    fn emit_graphemes_for(&mut self, binding: &Ident, s_expr: ExprId, body: &Block) {
+        let s = self.emit_expr(s_expr);
+        let n = self.tmp;
+        self.tmp += 1;
+        self.line(format!("JestyrStr _gs{n} = {s};"));
+        self.line(format!("size_t _gk{n} = 0;"));
+        self.line(format!("while (_gk{n} < _gs{n}.len)"));
+        self.line("{");
+        self.depth += 1;
+        if let Some(name) = self.scratch_reset.take() {
+            self.line(format!("j_{name}.off = 0;"));
+        }
+        self.line(format!("size_t _gstart{n} = _gk{n};"));
+        self.line(format!("(void) jestyr_rt_decode_cp(_gs{n}.ptr, _gs{n}.len, &_gk{n});"));
+        // Absorb following combining marks into the same cluster.
+        self.line(format!("while (_gk{n} < _gs{n}.len) {{ size_t _gsave{n} = _gk{n}; uint32_t _gc{n} = jestyr_rt_decode_cp(_gs{n}.ptr, _gs{n}.len, &_gk{n}); if (!jestyr_rt_is_combining(_gc{n})) {{ _gk{n} = _gsave{n}; break; }} }}"));
+        if binding.name != "_" {
+            self.line(format!(
+                "JestyrStr j_{} = (JestyrStr){{ _gs{n}.ptr + _gstart{n}, _gk{n} - _gstart{n} }};",
+                binding.name
+            ));
+        }
+        for stmt in &body.stmts {
+            self.emit_stmt(stmt);
+        }
+        if let Some(lbl) = self.cont_label.take() {
+            self.line(format!("{lbl}__continue: ;"));
+        }
+        self.depth -= 1;
+        self.line("}");
+    }
+
+    fn split_iter_arg(&self, e: ExprId) -> Option<(ExprId, ExprId)> {
+        if let ExprKind::Call { callee, args } = &self.ast.expr_at(e).kind {
+            if let ExprKind::Name(nm) = &self.ast.expr_at(*callee).kind {
+                if nm.name == "split" && args.len() == 2 {
+                    return Some((args[0], args[1]));
+                }
+            }
+        }
+        None
+    }
+
+    /// `for part in split(s, sep) { B }` — yield each `str` view between separators
+    /// (zero-copy; the last part is the remainder). An empty `sep` yields the whole
+    /// string once.
+    fn emit_split_for(&mut self, binding: &Ident, s_expr: ExprId, sep_expr: ExprId, body: &Block) {
+        let s = self.emit_expr(s_expr);
+        let sep = self.emit_expr(sep_expr);
+        let n = self.tmp;
+        self.tmp += 1;
+        self.line(format!("JestyrStr _ss{n} = {s};"));
+        self.line(format!("JestyrStr _sep{n} = {sep};"));
+        self.line(format!("size_t _start{n} = 0;"));
+        self.line(format!("int _go{n} = 1;"));
+        self.line(format!("while (_go{n})"));
+        self.line("{");
+        self.depth += 1;
+        if let Some(name) = self.scratch_reset.take() {
+            self.line(format!("j_{name}.off = 0;"));
+        }
+        self.line(format!(
+            "JestyrStr _rest{n} = (JestyrStr){{ _ss{n}.ptr + _start{n}, _ss{n}.len - _start{n} }};"
+        ));
+        self.line(format!("int64_t _hit{n} = _sep{n}.len ? jestyr_rt_find(_rest{n}, _sep{n}) : -1;"));
+        if binding.name != "_" {
+            self.line(format!(
+                "JestyrStr j_{} = (_hit{n} < 0) ? _rest{n} : (JestyrStr){{ _rest{n}.ptr, (size_t)_hit{n} }};",
+                binding.name
+            ));
+        }
+        self.line(format!(
+            "if (_hit{n} < 0) _go{n} = 0; else _start{n} += (size_t)_hit{n} + _sep{n}.len;"
+        ));
         for stmt in &body.stmts {
             self.emit_stmt(stmt);
         }
@@ -5216,6 +5342,7 @@ fn is_intrinsic(name: &str) -> bool {
             | "alloc" | "alloc_i32" | "realloc" | "realloc_i32" | "free_ptr" | "size_of" | "slice"
             | "align_of" | "offset_of" | "count_codepoints" | "codepoints" | "from_utf8" | "is_utf8"
             | "substr" | "str_eq" | "starts_with" | "ends_with" | "contains" | "find" | "trim"
+            | "count_graphemes" | "graphemes" | "split"
             | "string_new" | "string_from" | "string_push" | "string_view" | "string_free"
             | "builder_new" | "builder_push" | "builder_build" | "builder_free"
             | "region_str" | "region_concat" | "bytes"
@@ -5766,6 +5893,21 @@ mod tests {
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("JestyrStr j_t"), "substr(...) types as str: {c}");
         assert!(c.contains("jestyr_rt_substr("), "substr lowers to the helper: {c}");
+    }
+
+    #[test]
+    fn split_grapheme_offset_iterators() {
+        let src = "fn f(read s: str) -> i32 { var n: i32 = 0 \
+            for p in split(s, \",\") { n = n + p.len as i32 } \
+            for g in graphemes(s) { n = n + g.len as i32 } \
+            for cp, off in codepoints(s) { n = n + off as i32 } \
+            return (n + count_graphemes(s) as i32) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("jestyr_rt_find(_rest"), "split scans with find: {c}");
+        assert!(c.contains("jestyr_rt_is_combining("), "graphemes absorbs combining marks: {c}");
+        assert!(c.contains("jestyr_rt_count_graphemes("), "count_graphemes: {c}");
+        assert!(c.contains("size_t j_off = _k"), "(offset, codepoint) binds the byte offset: {c}");
     }
 
     #[test]

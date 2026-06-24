@@ -1277,7 +1277,19 @@ impl<'a> TypeChecker<'a> {
             self.set(src, Ty::Unknown);
             t
         } else {
-            match self.infer(scope, typ, self_ty, src) {
+            let t = self.infer(scope, typ, self_ty, src);
+            // String iterators (recognized by their callee): `split`/`graphemes`
+            // yield a `str` view per element, `codepoints` yields a codepoint.
+            if let ExprKind::Call { callee, .. } = &self.ast.expr_at(src).kind {
+                if let ExprKind::Name(n) = &self.ast.expr_at(*callee).kind {
+                    match n.name.as_str() {
+                        "split" | "graphemes" => return Ty::Prim("str"),
+                        "codepoints" => return Ty::Prim("u32"),
+                        _ => {}
+                    }
+                }
+            }
+            match t {
                 Ty::Slice(e) => *e,
                 Ty::Prim("str") => Ty::Prim("u8"), // iterating a string yields bytes
                 _ => Ty::Unknown,
@@ -2014,7 +2026,7 @@ pub(crate) fn is_scalar_match_ty(p: &str) -> bool {
 fn string_intrinsic_ret(name: &str) -> Option<Ty> {
     Some(match name {
         "substr" | "from_utf8" | "trim" => Ty::Prim("str"),
-        "count_codepoints" => Ty::Prim("usize"),
+        "count_codepoints" | "count_graphemes" => Ty::Prim("usize"),
         "find" => Ty::Prim("isize"),
         "is_utf8" | "str_eq" | "starts_with" | "ends_with" | "contains" => Ty::Prim("bool"),
         _ => return None,
