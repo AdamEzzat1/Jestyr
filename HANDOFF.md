@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 283 tests pass, including `proptest` property
+and run (or are correctly rejected). 285 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -248,7 +248,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `match_check.jtr` | 1 error | **match exhaustiveness** (missing `blue`) — payload projection runs in shapes.jtr (§7) |
 | `exhaustive_check.jtr` | 1 error + 1 warning | **Maranget usefulness (§2.4)** — nested non-exhaustiveness (error) + a redundant/unreachable arm (warning) (§5.42) |
 | `mvs.jtr` | 1 error | **MVS default = `read`** — returning a default (borrowed) param escapes; `take` to own (§4.3) |
-| `region_escape.jtr` | 1 error | **region-escape proof (strings E)** — returning a region-allocated `str` is statically rejected (§5.61) |
+| `region_escape.jtr` | 2 errors | **region-escape proof (strings E)** — returning *and* assign-to-outer of a region `str` are statically rejected (§5.61, §5.67) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -1141,6 +1141,23 @@ These are the non-obvious things that will bite if you don't know them.
     (the arena), but a *general* `Allocator` value threaded through every `realloc` of the heap
     `String` is a larger refactor (the std `Allocator` is a Jestyr value; the `String` runtime is
     C-level `malloc`) — deferred.
+
+67. **Region assign-to-outer escape (strings S7 — finishing the §5.61 proof).** The region-safety
+    proof now also catches **storing a region value into a binding declared *outside* the `region`
+    block** (not just returning it). The `Checker` keeps `region_depths: Vec<usize>` — the
+    `ctx.scopes.len()` at each active `region`'s entry; the `Region` arm pushes/pops it. In the
+    `Assign` arm, if a region is active and the value `is_region_value`, the target's
+    `scope_depth_of(name)` is compared to the innermost `region_depth`: **shallower → an error**
+    (it outlives the arena); same-or-deeper (a region-local) → fine, and the binding is
+    region-tainted so a later `return` of it is also caught. **Robustness:** both region checks
+    gate on **`carries_arena_ref`** (the value's type is a `str`/`os_str`/pointer/slice/`Unknown` —
+    something that holds an arena pointer), so a scalar projected out of a region value (`g.len`, a
+    fresh `usize`) is *not* a false positive — and a region pointer (Copy, but dangling) *is*
+    caught (which a plain `is_non_copy` gate would have missed). Demo
+    [`examples/region_escape.jtr`](examples/region_escape.jtr) now has **2 errors** (return +
+    assign-to-outer). **This closes the entire string survey** — every item from the Swift/Zig/
+    Rust/Erlang synthesis is now built (minus the deliberately-skipped D auto-decode and the
+    documented allocator-threading refactor).
 
 ---
 

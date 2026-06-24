@@ -44,10 +44,10 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::*;
 use crate::diag::Diagnostic;
 use crate::span::Span;
-use crate::types::TypeInfo;
+use crate::types::{Ty, TypeInfo};
 
 pub fn check(ast: &Ast, info: &TypeInfo) -> Vec<Diagnostic> {
-    let mut ck = Checker { ast, info, diags: Vec::new(), frozen: Vec::new() };
+    let mut ck = Checker { ast, info, diags: Vec::new(), frozen: Vec::new(), region_depths: Vec::new() };
     for item in &ast.items {
         ck.check_item(item);
     }
@@ -63,6 +63,10 @@ struct Checker<'a> {
     /// forbidden (iterator invalidation — the borrow contract of a loop). A stack
     /// because loops nest.
     frozen: Vec<String>,
+    /// The scope depth (`ctx.scopes.len()`) at the entry of each active `region`
+    /// block. A binding at a shallower scope is *outside* the region, so storing a
+    /// region-allocated value into it would let the value outlive its arena.
+    region_depths: Vec<usize>,
 }
 
 /// Per-function analysis state: a stack of lexical scopes mapping each in-scope
@@ -93,6 +97,11 @@ impl FnCtx {
     }
     fn is_region(&self, name: &str) -> bool {
         self.region.iter().any(|s| s.contains(name))
+    }
+    /// The scope index where `name` is bound (innermost wins) — for deciding
+    /// whether an assignment target lives *outside* a region block.
+    fn scope_depth_of(&self, name: &str) -> Option<usize> {
+        self.scopes.iter().enumerate().rev().find(|(_, s)| s.contains_key(name)).map(|(i, _)| i)
     }
     /// Innermost binding wins (handles shadowing).
     fn lookup(&self, name: &str) -> Option<bool> {
@@ -282,6 +291,27 @@ impl<'a> Checker<'a> {
                         ),
                     );
                 }
+                // Region-safety (assign-to-outer): storing a region-allocated value
+                // into a binding declared *outside* the current `region` block lets
+                // it outlive the arena. The taint flows so the outer binding is
+                // region-marked too (a later `return` of it is then also caught).
+                if let Some(&region_depth) = self.region_depths.last() {
+                    if self.is_region_value(ctx, *value) && self.carries_arena_ref(*value) {
+                        if let ExprKind::Name(n) = &self.ast.expr_at(*target).kind {
+                            let n = n.name.clone();
+                            match ctx.scope_depth_of(&n) {
+                                Some(d) if d < region_depth => self.error(
+                                    span,
+                                    format!(
+                                        "cannot store region-allocated value into `{n}`: it is declared outside the \
+                                         `region` block and would outlive the arena (copy it into an owned `String`)"
+                                    ),
+                                ),
+                                _ => ctx.bind_region(&n),
+                            }
+                        }
+                    }
+                }
                 // Mutating a collection currently being iterated (e.g. `xs[i] = v`
                 // or `xs = …` inside `for x in xs`) invalidates the loop's borrow.
                 let root = self.root_name(ctx, *target);
@@ -348,7 +378,11 @@ impl<'a> Checker<'a> {
                 return;
             }
             ExprKind::Region { body, .. } => {
+                // Record the scope depth at entry: anything bound shallower than
+                // this is *outside* the region (a region value stored there escapes).
+                self.region_depths.push(ctx.scopes.len());
                 self.check_block(ctx, body, false);
+                self.region_depths.pop();
                 return;
             }
             ExprKind::For { head, body, els, .. } => {
@@ -441,7 +475,7 @@ impl<'a> Checker<'a> {
         // Region-safety: a region-allocated value is owned by its arena, which is
         // freed at the end of its `region` block — so it can never be returned (it
         // would dangle). This is the static proof behind zero-alloc region text.
-        if tail && self.is_region_value(ctx, id) {
+        if tail && self.is_region_value(ctx, id) && self.carries_arena_ref(id) {
             let name = self.root_name(ctx, id);
             self.error(
                 span,
@@ -466,6 +500,22 @@ impl<'a> Checker<'a> {
             };
             self.error(span, msg);
         }
+    }
+
+    /// Does this expression's type carry a *pointer into* the arena (so letting it
+    /// escape dangles)? A `str`/`os_str` view, a raw/region pointer, or a slice —
+    /// but **not** a scalar projected out of a region value (e.g. `g.len`, which is
+    /// a fresh `usize`). `Unknown` is included (the region intrinsics return it).
+    fn carries_arena_ref(&self, id: ExprId) -> bool {
+        matches!(
+            self.info.type_of(id),
+            Ty::Prim("str")
+                | Ty::Prim("os_str")
+                | Ty::Ptr { .. }
+                | Ty::Slice(_)
+                | Ty::RegionRef(_)
+                | Ty::Unknown
+        )
     }
 
     /// Is this expression a region-allocated value — a `region_str`/`region_alloc`/
@@ -824,6 +874,29 @@ mod tests {
             "fn f() -> str { region r { let g: str = region_concat(r, \"a\", \"b\") return g } return \"\" }",
         );
         assert!(d.iter().any(|m| m.message.contains("region-allocated")), "{:?}", d);
+    }
+
+    #[test]
+    fn region_value_assigned_to_outer_binding_escapes() {
+        // Assign-to-outer: storing a region value into a binding declared outside
+        // the `region` block lets it outlive the arena.
+        let d = escapes(
+            "fn f() -> i32 { var saved: str = \"\" region r { saved = region_concat(r, \"a\", \"b\") } return saved.len as i32 }",
+        );
+        assert!(
+            d.iter().any(|m| m.message.contains("declared outside the `region`")),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn region_value_assigned_to_inner_binding_is_fine() {
+        // Assigning to a region-*local* binding (declared inside the block) is OK.
+        let d = escapes(
+            "fn f() -> i32 { region r { var local: str = \"\" local = region_concat(r, \"a\", \"b\") return local.len as i32 } return 0 }",
+        );
+        assert!(d.is_empty(), "in-region local assign is fine: {:?}", d);
     }
 
     #[test]

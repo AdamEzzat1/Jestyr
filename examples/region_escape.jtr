@@ -5,14 +5,26 @@
 // text *provably* safe, not merely safe-by-construction — something no surveyed
 // string design (Swift/Zig/Rust/Erlang) can do.
 //
-// Run:  jestyrc check examples/region_escape.jtr   →  1 error (the escape below)
+// Run:  jestyrc check examples/region_escape.jtr   →  2 errors (both escapes below)
 
+// Escape route 1 — RETURN: a region value can't outlive its arena.
 fn build_in_region() -> str {
     region r {
         let g: str = region_concat(r, "Hello, ", "region!")
         return g            // ERROR: `g` is region-allocated; it can't outlive `r`
     }
     return ""
+}
+
+// Escape route 2 — ASSIGN-TO-OUTER: storing a region value into a binding declared
+// outside the `region` block would let it dangle after the arena is freed.
+fn leak_via_outer() -> i32 {
+    var saved: str = ""
+    region r {
+        saved = region_concat(r, "a", "b")   // ERROR: `saved` outlives the arena
+    }
+    print_str(saved)        // would be a use-after-free
+    return 0
 }
 
 fn main() -> i32 { return 0 }
