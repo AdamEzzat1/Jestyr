@@ -119,3 +119,131 @@ cargo run -- test examples/tests_demo.jtr       # the in-language @test/@bench r
 
 Discipline (unchanged): every increment stays `cargo test`-green and warning-clean; new
 invariants live in `proptests.rs`, new goldens in the relevant module's `mod tests`.
+
+---
+
+## 5. Expanding the layer — feature by feature
+
+A roadmap for pushing property + `bolero` coverage into *every* shipped feature. Each row is a
+concrete invariant or generator someone can implement; "P" = `proptest` property, "F" = `bolero`
+fuzz target, "G" = a generator to build first. The unifying tactic: **build a generator of *valid*
+programs for a feature, then assert an invariant that must hold for all of them** — the strongest
+test a feature can have, far beyond the per-feature golden examples.
+
+### 5.1 Lexer / parser (deepen what exists)
+- **P — round-trip:** `tokens(src)` reconstruct the source up to trivia; every token's
+  `src[span]` re-lexes to the same single token.
+- **P — parser totality on token soup:** generate random *token* sequences (not char soup) and
+  assert `parse` never panics and recovers (already partially covered; tighten to assert the AST
+  is non-empty when the stream is).
+- **P — `print → parse → print` idempotence:** for a generated valid program, re-parsing the
+  printer's output yields a structurally-identical AST (printer/parser are inverse on the valid
+  subset).
+- **F:** fuzz the parser on `Vec<Token>` directly (skip the lexer) to hammer recovery paths.
+
+### 5.2 Loops (`for`, ranges, slices, zip, labels, `break`/`continue`)
+- **G — `arb_loop`:** range / inclusive / slice / zip / `for _` / infinite+break, with optional
+  `invariant`/`variant`, labels, and a step.
+- **P — bounds-elision soundness:** a generated `for i in 0..xs.len { xs[i] }` emits **no**
+  `assert(` (elided), while `for i in 0..n { xs[i] }` (unproven) keeps the bounds check — a
+  metamorphic pair.
+- **P — iterator-invalidation is rejected:** any generated loop that mutates its iterated
+  collection in the body produces a diagnostic (the borrow contract holds for *all* shapes).
+- **P — determinism:** loop lowering is byte-stable (already covered by the global determinism
+  property, but worth a focused generator).
+
+### 5.3 Strings (the largest new surface)
+- **G — `arb_str_program`:** literals (incl. `\x` escapes), slicing `s[i..j]`, the iterators
+  (`bytes`/`codepoints`/`graphemes`/`split`), operations (`find`/`trim`/`eq`/…), validation,
+  `Builder`, f-strings, `Cow`, `os_str`.
+- **P — UTF-8 invariant:** for any `bytes` input, `from_utf8`/`try_from_utf8` only ever yield a
+  `str` whose bytes are valid UTF-8 (cross-check the emitted runtime against a Rust
+  `std::str::from_utf8`).
+- **P — slice boundary law:** `s[i..j]` either returns a view whose ends are on char boundaries
+  or traps — never a half-codepoint (differential vs Rust slicing).
+- **P — `len ≥ count_codepoints ≥ count_graphemes`** for every generated string (the cost-tiers
+  are monotone).
+- **P — split/concat round-trip:** `join(split(s, sep), sep) == s` for non-empty `sep`.
+- **P — `eq`/`eq_fold` laws:** reflexive, symmetric; `eq ⇒ eq_fold`.
+- **F:** fuzz `from_utf8`/`substr`/`split` lowering on `Vec<u8>` → assert the emitted C compiles
+  (gcc) and the runtime matches a Rust oracle for a sample of inputs.
+
+### 5.4 Attributes (registry-validated)
+- **G — `arb_attr`:** every attribute × every legal/illegal target × arg shapes.
+- **P — registry totality:** an attribute on a *legal* target with a *legal* arg shape never
+  errors; on an illegal target/arg it *always* errors (the registry is a total function).
+- **P — "did you mean":** a one-edit typo of a known attribute always suggests the original.
+- **P:** attributes are ABI/hints only — adding any valid attribute never changes program
+  *behavior* (the emitted C differs only in `__attribute__` clauses, not logic).
+
+### 5.5 Structs / enums / ADTs / records / unions / distinct
+- **G — `arb_type_decl`:** struct/record/union/enum (incl. generic, niche, recursive `indirect`)
+  with field defaults, bit-fields, visibility, `@copy`.
+- **P — `size_of`/`align_of`/`offset_of` agree with C:** emit a program that prints them and
+  compare to a tiny C oracle (or `std::mem` for the mapped Rust types).
+- **P — niche law:** `size_of(Option(*T)) == size_of(*T)` for any thin-pointer `T` (the niche
+  proof generalized).
+- **P — record immutability:** any generated field assignment on a `record` is rejected; the same
+  on a `struct` is accepted.
+- **P — construction round-trip:** `let x = T{…}; x.f` returns the constructed field value
+  (positional *and* named `T{ f: … }`), for generated field sets.
+- **P — exhaustiveness ⇔ Maranget:** a generated `match` is accepted iff a reference usefulness
+  oracle says it's exhaustive; redundant arms always warn.
+
+### 5.6 Match power
+- **G — `arb_pattern`:** wildcard / binding / variant / nested / literal / range / or / `..` rest /
+  struct-variant, over a generated enum.
+- **P — exhaustiveness soundness:** if typeck accepts a guard-free `match`, then for *every* value
+  of the scrutinee type some arm matches (check against an enumerated value space for small enums).
+- **P — redundancy:** an arm that duplicates an earlier one always warns; reordering arms changes
+  *which* arm warns but not *whether* (metamorphic).
+- **P — nested-dispatch correctness:** a generated nested match compiles and, at runtime, routes
+  each constructed value to the arm a reference matcher picks.
+
+### 5.7 Ownership / escape (the language thesis)
+- **G — `arb_borrow_program`:** functions with `read`/`mut`/`out`/`take` params that variously
+  return / store / capture / give-away their borrows.
+- **P — soundness direction:** every program the escape checker *accepts* has no borrow outliving
+  its frame (check against a reference dataflow oracle on the small generated subset).
+- **P — completeness direction:** each of the 4 routes + the 2 region routes, when generated
+  deliberately, is always rejected.
+- **P — `@copy`/Copy refinement:** marking a generated aggregate `@copy` flips exactly the
+  "return a value param" diagnostics off and nothing else.
+- **P — region proof:** a generated `region` value that escapes (return *or* assign-to-outer) is
+  always rejected; one that stays in scope is always accepted.
+
+### 5.8 Generics / monomorphization
+- **G — `arb_generic_use`:** generic fns/structs/enums/methods instantiated at varied type sets.
+- **P — instance completeness:** every concrete instantiation reachable from `main` appears
+  exactly once in the emitted C (no missing instance — the §5.28 walker bug class — and no dup).
+- **P — erasure:** comptime type params never appear in a runtime signature.
+- **P — determinism of mangling:** instance C names are a pure function of `(ctor, type-args)`,
+  order-independent.
+
+### 5.9 Modules / visibility
+- **G — `arb_module_graph`:** N files with imports (incl. diamonds), `pub`/private items.
+- **P — cycle detection:** any generated import cycle is a hard error; any DAG loads once.
+- **P — visibility:** a cross-module reference to a private item/field is always rejected; to a
+  `pub` one always accepted; same-module always accepted.
+- **P — flat-merge determinism:** the merged program (and its emitted C) is independent of import
+  *discovery order* for a fixed graph.
+
+### 5.10 Determinism & the compiler itself (deepen §3.1)
+- **P (have):** `compile(s) == compile(s)`. **Strengthen to:** `compile(s)` is identical across a
+  fresh process / different `RUST_MIN_STACK` / shuffled item order where semantics allow.
+- **P — order-independence:** permuting top-level *independent* items doesn't change the emitted C
+  (modulo the items' own order in the file) — flushes out any hidden iteration-order dependence.
+- **P — stage purity:** `typeck::check` and `escape::check` never mutate the AST (annotate-don't-
+  mutate); assert the AST is bit-identical before/after.
+- **F (have):** `fuzz_determinism`. Add a long `cargo bolero` soak in CI.
+
+### 5.11 Benchmarking — speed & memory (deepen §3.5)
+- **Per-feature micro-benches** in `selfbench`: a generator knob to emit string-heavy /
+  generic-heavy / match-heavy / deeply-nested programs, so each subsystem's throughput is tracked
+  separately (today it's one mixed program).
+- **Memory efficiency:** beyond peak/total heap, report **bytes-per-AST-node** and
+  **emitted-C-bytes-per-source-line** — efficiency ratios that catch bloat a raw peak misses.
+- **CI budget:** wire `selfbench --release` into a canary that fails if throughput drops below a
+  floor or peak memory rises above a ceiling — turning the §3.5 baseline into an enforced budget.
+- **Allocation count:** extend the `bench-alloc` allocator to also count *number* of allocations
+  (not just bytes) — a proxy for allocator pressure that the arena-AST design aims to keep low.
