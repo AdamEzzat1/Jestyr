@@ -410,6 +410,13 @@ impl<'a> Cgen<'a> {
         self.raw("/* Append an integer's decimal digits (for f-string interpolation; copies). */\n");
         self.raw("static void jestyr_rt_str_push_i64(JestyrString* s, int64_t v) { char b[24]; int n = snprintf(b, sizeof(b), \"%lld\", (long long)v); if (n < 0) n = 0; jestyr_rt_str_push(s, (JestyrStr){ b, (size_t)n }); }\n");
         self.raw("/* Lossily decode unvalidated platform text (os_str) into a proven UTF-8 String, replacing each ill-formed byte with U+FFFD. */\n");
+        self.raw("/* Cow<str>: borrowed-or-owned, visible. cap==0 means borrowed (no allocation, free is a no-op); cap>0 means owned. cow_to_mut is the copy-on-write point. */\n");
+        self.raw("typedef struct { char* ptr; size_t len; size_t cap; } JestyrCow;\n");
+        self.raw("static JestyrCow jestyr_rt_cow_borrow(JestyrStr v) { JestyrCow c; c.ptr = (char*)v.ptr; c.len = v.len; c.cap = 0; return c; }\n");
+        self.raw("static bool jestyr_rt_cow_is_owned(JestyrCow c) { return c.cap > 0; }\n");
+        self.raw("static JestyrStr jestyr_rt_cow_view(JestyrCow c) { return (JestyrStr){ c.ptr, c.len }; }\n");
+        self.raw("static JestyrCow jestyr_rt_cow_to_mut(JestyrCow c) { if (c.cap > 0) return c; JestyrCow o; o.cap = c.len ? c.len : 1; o.ptr = (char*)malloc(o.cap); memcpy(o.ptr, c.ptr, c.len); o.len = c.len; return o; }\n");
+        self.raw("static void jestyr_rt_cow_free(JestyrCow* c) { if (c->cap > 0) free(c->ptr); c->ptr = NULL; c->len = 0; c->cap = 0; }\n");
         self.raw("static JestyrString jestyr_rt_to_str_lossy(JestyrStr os) { JestyrString out = jestyr_rt_str_new(); size_t k = 0; while (k < os.len) { uint8_t b = (uint8_t)os.ptr[k]; size_t n; bool ok = true; if (b < 0x80u) n = 1; else if ((b & 0xE0u) == 0xC0u) n = 2; else if ((b & 0xF0u) == 0xE0u) n = 3; else if ((b & 0xF8u) == 0xF0u) n = 4; else { ok = false; n = 1; } if (ok && k + n <= os.len) { for (size_t j = 1; j < n; j++) if (((uint8_t)os.ptr[k + j] & 0xC0u) != 0x80u) { ok = false; break; } } else if (n > 1) ok = false; if (ok) { jestyr_rt_str_push(&out, (JestyrStr){ os.ptr + k, n }); k += n; } else { jestyr_rt_str_push(&out, (JestyrStr){ \"\\xEF\\xBF\\xBD\", 3 }); k += 1; } } return out; }\n\n");
         self.raw("/* Jestyr Builder — an iolist: a list of `str` *fragments* collected with no\n");
         self.raw("   copying; `builder_build` sums the lengths, allocates once, and flattens in a\n");
@@ -3320,6 +3327,27 @@ impl<'a> Cgen<'a> {
                     let os = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
                     return format!("jestyr_rt_to_str_lossy({os})");
                 }
+                // Cow<str> — borrowed-or-owned, with the allocation visible.
+                "cow_borrow" => {
+                    let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    return format!("jestyr_rt_cow_borrow({s})");
+                }
+                "cow_to_mut" => {
+                    let c = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrCow){0}".to_string());
+                    return format!("jestyr_rt_cow_to_mut({c})");
+                }
+                "cow_view" => {
+                    let c = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrCow){0}".to_string());
+                    return format!("jestyr_rt_cow_view({c})");
+                }
+                "cow_is_owned" => {
+                    let c = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrCow){0}".to_string());
+                    return format!("jestyr_rt_cow_is_owned({c})");
+                }
+                "cow_free" => {
+                    let c = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrCow){0}".to_string());
+                    return format!("jestyr_rt_cow_free(&{c})");
+                }
                 // Owned, growable `String` (the owned half of the owned/view split).
                 "string_new" => return "jestyr_rt_str_new()".to_string(),
                 "string_from" => {
@@ -5381,6 +5409,7 @@ fn is_intrinsic(name: &str) -> bool {
             | "substr" | "str_eq" | "starts_with" | "ends_with" | "contains" | "find" | "trim"
             | "count_graphemes" | "graphemes" | "split" | "try_from_utf8" | "eq_fold"
             | "os_from_bytes" | "to_str_lossy"
+            | "cow_borrow" | "cow_to_mut" | "cow_view" | "cow_is_owned" | "cow_free"
             | "string_new" | "string_from" | "string_push" | "string_view" | "string_free"
             | "builder_new" | "builder_push" | "builder_build" | "builder_free"
             | "region_str" | "region_concat" | "bytes"
@@ -5440,6 +5469,7 @@ fn prim_c(name: &str) -> Option<&'static str> {
         "cstr" => "const char*",
         "String" => "JestyrString",
         "Builder" => "JestyrBuilder",
+        "Cow" => "JestyrCow",
         _ => return None,
     })
 }
@@ -5963,6 +5993,17 @@ mod tests {
         assert!(c.contains("jestyr_rt_trim("), "trim: {c}");
         assert!(c.contains("JestyrStr j_t"), "trim yields a str view: {c}");
         assert!(c.contains("bool j_a"), "str_eq yields a bool: {c}");
+    }
+
+    #[test]
+    fn cow_str_borrows_then_clones() {
+        let src = "fn f(read s: str) -> i32 { var c: Cow = cow_borrow(s) let b = cow_is_owned(c) \
+                   var o: Cow = cow_to_mut(c) let n = cow_view(o).len as i32 cow_free(o) return n }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("JestyrCow j_c"), "Cow-typed binding: {c}");
+        assert!(c.contains("jestyr_rt_cow_borrow("), "borrow (no alloc): {c}");
+        assert!(c.contains("jestyr_rt_cow_to_mut("), "copy-on-write point: {c}");
     }
 
     #[test]

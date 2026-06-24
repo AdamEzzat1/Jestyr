@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 282 tests pass, including `proptest` property
+and run (or are correctly rejected). 283 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -1129,6 +1129,18 @@ These are the non-obvious things that will bite if you don't know them.
     `String` are validation (`from_utf8`/`try_from_utf8`) or this lossy decode. **Limitation:** like
     `distinct` (§5.37), the os_str↔str distinction is enforced at `let` annotations, not yet at call
     args. Demo [`examples/os_str.jtr`](examples/os_str.jtr) (`6` = `caf` + U+FFFD).
+
+66. **`Cow<str>` — borrowed-or-owned, visible (strings S6).** A copy-on-write string: a
+    `JestyrCow { char* ptr; size_t len; size_t cap }` where **`cap == 0` means borrowed** (no
+    allocation, `cow_free` is a no-op) and `cap > 0` means owned. `cow_borrow(str)` borrows for
+    free; **`cow_to_mut(c)`** is the copy-on-write point (clones into a fresh buffer iff borrowed);
+    `cow_view -> str`, `cow_is_owned -> bool` (you can *see* whether it allocated), `cow_free`.
+    `Cow` is a prim (→ `JestyrCow`). Demo [`examples/cow.jtr`](examples/cow.jtr)
+    (`false, 5, true, 5`). **Allocator-value threading** through the heap `String`/`Builder` is the
+    one piece still open: region strings (§5.58) already demonstrate allocator-as-value for text
+    (the arena), but a *general* `Allocator` value threaded through every `realloc` of the heap
+    `String` is a larger refactor (the std `Allocator` is a Jestyr value; the `String` runtime is
+    C-level `malloc`) — deferred.
 
 ---
 

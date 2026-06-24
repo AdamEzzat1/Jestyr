@@ -1,0 +1,17 @@
+// examples/cow.jtr — Cow<str> (strings S6): a copy-on-write string that's either
+// a borrowed view OR an owned buffer — and you can SEE when it allocates.
+// Borrowing is free; `cow_to_mut` is the copy-on-write point (clones if borrowed).
+//
+// Run:  jestyrc run examples/cow.jtr   →  false, 5, true, 5
+
+fn main() -> i32 {
+    var c: Cow = cow_borrow("hello")        // borrow — no allocation
+    print_bool(cow_is_owned(c))             // false — still borrowed
+    print_int(cow_view(c).len as i32)       // 5
+
+    var owned: Cow = cow_to_mut(c)          // the CoW point — now it allocates
+    print_bool(cow_is_owned(owned))         // true  — owns its bytes
+    print_int(cow_view(owned).len as i32)   // 5     — same content
+    cow_free(owned)
+    return 0
+}

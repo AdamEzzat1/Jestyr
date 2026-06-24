@@ -2036,6 +2036,9 @@ fn string_intrinsic_ret(name: &str) -> Option<Ty> {
         "substr" | "from_utf8" | "trim" => Ty::Prim("str"),
         "os_from_bytes" => Ty::Prim("os_str"),
         "to_str_lossy" => Ty::Prim("String"),
+        "cow_borrow" | "cow_to_mut" => Ty::Prim("Cow"),
+        "cow_view" => Ty::Prim("str"),
+        "cow_is_owned" => Ty::Prim("bool"),
         // Recoverable: yields a Result so `is_err`/`unwrap`/`?` compose.
         "try_from_utf8" => Ty::Result(Box::new(Ty::Prim("str"))),
         "count_codepoints" | "count_graphemes" => Ty::Prim("usize"),
