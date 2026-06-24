@@ -39,7 +39,7 @@
 //!     supply; this is how "storing a borrow into a collection" (`vec.push(take
 //!     value)`) is caught for free-function calls.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::diag::Diagnostic;
@@ -69,18 +69,30 @@ struct Checker<'a> {
 /// binding to whether it denotes a borrow, plus this function's return mode.
 struct FnCtx {
     scopes: Vec<HashMap<String, bool>>,
+    /// Names bound to a **region-allocated** value (from `region_str`/`region_alloc`/
+    /// `region_concat`). Such a value is owned by its arena and may not escape — the
+    /// region-safety proof (design §4.4).
+    region: Vec<HashSet<String>>,
     ret_is_borrow: bool,
 }
 
 impl FnCtx {
     fn push(&mut self) {
         self.scopes.push(HashMap::new());
+        self.region.push(HashSet::new());
     }
     fn pop(&mut self) {
         self.scopes.pop();
+        self.region.pop();
     }
     fn bind(&mut self, name: &str, is_borrow: bool) {
         self.scopes.last_mut().unwrap().insert(name.to_string(), is_borrow);
+    }
+    fn bind_region(&mut self, name: &str) {
+        self.region.last_mut().unwrap().insert(name.to_string());
+    }
+    fn is_region(&self, name: &str) -> bool {
+        self.region.iter().any(|s| s.contains(name))
     }
     /// Innermost binding wins (handles shadowing).
     fn lookup(&self, name: &str) -> Option<bool> {
@@ -114,7 +126,7 @@ impl<'a> Checker<'a> {
 
     fn check_fn(&mut self, f: &FnDecl) {
         let ret_is_borrow = matches!(f.ret_conv, Conv::Read | Conv::Mut | Conv::Out);
-        let mut ctx = FnCtx { scopes: Vec::new(), ret_is_borrow };
+        let mut ctx = FnCtx { scopes: Vec::new(), region: Vec::new(), ret_is_borrow };
         ctx.push();
         for p in &f.params {
             // MVS (design §4.3): the default convention *is* `read` (an immutable
@@ -137,6 +149,11 @@ impl<'a> Checker<'a> {
                 Stmt::Let { name, init, .. } => {
                     let is_borrow = if let Some(e) = init {
                         self.walk_expr(ctx, *e, false);
+                        // A binding initialized from a region-allocated value is
+                        // itself region-tainted, so the taint flows through `let`s.
+                        if self.is_region_value(ctx, *e) {
+                            ctx.bind_region(&name.name);
+                        }
                         self.is_borrow_place(ctx, *e)
                     } else {
                         false
@@ -421,6 +438,20 @@ impl<'a> Checker<'a> {
             | ExprKind::Error => {}
         }
 
+        // Region-safety: a region-allocated value is owned by its arena, which is
+        // freed at the end of its `region` block — so it can never be returned (it
+        // would dangle). This is the static proof behind zero-alloc region text.
+        if tail && self.is_region_value(ctx, id) {
+            let name = self.root_name(ctx, id);
+            self.error(
+                span,
+                format!(
+                    "cannot return region-allocated value `{name}`: it is owned by its `region` \
+                     arena and does not outlive it (copy it into an owned `String` to return it)"
+                ),
+            );
+        }
+
         // Return-position leaf check: a non-Copy borrow place returned by value
         // escapes. (A Copy value is duplicated out, not referenced — so it's fine.)
         if tail && !ctx.ret_is_borrow && self.escapes_as(ctx, id) {
@@ -434,6 +465,23 @@ impl<'a> Checker<'a> {
                 )
             };
             self.error(span, msg);
+        }
+    }
+
+    /// Is this expression a region-allocated value — a `region_str`/`region_alloc`/
+    /// `region_concat` call, a binding tainted by one, or a projection of either?
+    fn is_region_value(&self, ctx: &FnCtx, id: ExprId) -> bool {
+        match &self.ast.expr_at(id).kind {
+            ExprKind::Call { callee, .. } => matches!(
+                &self.ast.expr_at(*callee).kind,
+                ExprKind::Name(n)
+                    if matches!(n.name.as_str(), "region_str" | "region_alloc" | "region_concat")
+            ),
+            ExprKind::Name(n) => ctx.is_region(&n.name),
+            ExprKind::Field { base, .. }
+            | ExprKind::Index { base, .. }
+            | ExprKind::Deref { base } => self.is_region_value(ctx, *base),
+            _ => false,
         }
     }
 
@@ -767,6 +815,25 @@ mod tests {
         let d = escapes("struct V { x: i32 } fn id(read v: V) -> V { return v }");
         assert_eq!(d.len(), 1, "{:?}", d);
         assert!(d[0].message.contains("cannot return borrow"), "{:?}", d);
+    }
+
+    #[test]
+    fn region_value_cannot_be_returned() {
+        // The marquee region-safety proof: a region-allocated value can't escape.
+        let d = escapes(
+            "fn f() -> str { region r { let g: str = region_concat(r, \"a\", \"b\") return g } return \"\" }",
+        );
+        assert!(d.iter().any(|m| m.message.contains("region-allocated")), "{:?}", d);
+    }
+
+    #[test]
+    fn region_value_used_in_scope_is_fine() {
+        // Using a region value *inside* its region (not returning it) is allowed —
+        // no false positive.
+        let d = escapes(
+            "fn f() -> i32 { var n: i32 = 0 region r { let g: str = region_concat(r, \"a\", \"b\") n = g.len as i32 } return n }",
+        );
+        assert!(d.is_empty(), "in-scope use must stay clean: {:?}", d);
     }
 
     #[test]

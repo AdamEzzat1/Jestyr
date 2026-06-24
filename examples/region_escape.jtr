@@ -1,0 +1,18 @@
+// examples/region_escape.jtr — the region-safety PROOF (strings step 10, the
+// marquee provability win). A region-allocated value is owned by its arena, which
+// is freed at the end of the `region` block — so the escape checker statically
+// REJECTS returning it (it would dangle). This is what makes zero-alloc region
+// text *provably* safe, not merely safe-by-construction — something no surveyed
+// string design (Swift/Zig/Rust/Erlang) can do.
+//
+// Run:  jestyrc check examples/region_escape.jtr   →  1 error (the escape below)
+
+fn build_in_region() -> str {
+    region r {
+        let g: str = region_concat(r, "Hello, ", "region!")
+        return g            // ERROR: `g` is region-allocated; it can't outlive `r`
+    }
+    return ""
+}
+
+fn main() -> i32 { return 0 }

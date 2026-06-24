@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 276 tests pass, including `proptest` property
+and run (or are correctly rejected). 278 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -247,6 +247,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `match_check.jtr` | 1 error | **match exhaustiveness** (missing `blue`) — payload projection runs in shapes.jtr (§7) |
 | `exhaustive_check.jtr` | 1 error + 1 warning | **Maranget usefulness (§2.4)** — nested non-exhaustiveness (error) + a redundant/unreachable arm (warning) (§5.42) |
 | `mvs.jtr` | 1 error | **MVS default = `read`** — returning a default (borrowed) param escapes; `take` to own (§4.3) |
+| `region_escape.jtr` | 1 error | **region-escape proof (strings E)** — returning a region-allocated `str` is statically rejected (§5.61) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -1069,6 +1070,24 @@ These are the non-obvious things that will bite if you don't know them.
     `str`) so no annotations are needed. With `find` + `substr` you can split by hand; a `split`
     that *returns a collection* needs a string-list/iterator (the next gap). Demo
     [`examples/str_ops.jtr`](examples/str_ops.jtr) (`true, true, false, 7, foo, bar`).
+
+61. **Region-escape static proof (strings step 10 — the marquee provability win).** The escape
+    checker now **statically rejects returning a region-allocated value** — turning region
+    safety from "safe by lexical construction" (§5.23/§5.58) into a *proof*. `FnCtx` gains a
+    scoped `region: Vec<HashSet<String>>` of region-tainted bindings; a `let` whose initializer
+    `is_region_value` (a `region_str`/`region_alloc`/`region_concat` call, a tainted binding, or
+    a projection of either) taints its name. In the return-position leaf check (`walk_expr`,
+    alongside the borrow route), `tail && is_region_value(id)` is an error: *"cannot return
+    region-allocated value `g`: it is owned by its `region` arena and does not outlive it"*. The
+    taint flows through `let`s, so `let g = region_concat(r,…); return g` is caught.
+    **Non-breaking:** in-scope use (the common case — `region r { … n = g.len … }`) stays clean
+    (`region_string.jtr` unaffected), since only *returning* the value is rejected.
+    **Scope/limitation:** catches the *return* escape (the clearest, most important); a region
+    value *assigned to a binding declared outside the region block* isn't yet caught (needs
+    block-relative lifetime tracking) — the documented next refinement. Check-demo
+    [`examples/region_escape.jtr`](examples/region_escape.jtr) (1 error). This is the one thing on
+    the string survey no surveyed language (Swift/Zig/Rust/Erlang) can do: provably
+    zero-allocation streaming text.
 
 ---
 
