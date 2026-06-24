@@ -1,0 +1,32 @@
+// examples/utf8_validate.jtr — UTF-8 validate-at-boundary (strings workstream, step 3).
+//
+// `from_utf8([]u8) -> str` is the ONLY way to turn raw bytes into a `str`, and it
+// validates once at the boundary. Past that point, "valid UTF-8" is a *proven*
+// invariant carried by the type — not a runtime tag re-checked on every use. This is
+// the provable-language upgrade to "validate at the edge, trust thereafter".
+// `is_utf8` is the explicit, recoverable check when you'd rather branch than trap.
+//
+// Run:  jestyrc run examples/utf8_validate.jtr   →  1, 2, 2, 0
+
+fn main() -> i32 {
+    // Build the bytes of "Hi" by hand.
+    var buf: *mut u8 = alloc(u8, 2)
+    unsafe {
+        buf[0] = 72     // 'H'
+        buf[1] = 105    // 'i'
+    }
+    let bytes: []u8 = slice(u8, buf, 2)
+    print_int(is_utf8(bytes) as i32)     // 1 — valid
+    let s: str = from_utf8(bytes)        // checked transition: []u8 → proven str
+    print_int(s.len)                     // 2
+    print_int(count_codepoints(s))       // 2
+    free_ptr(buf)
+
+    // A lone continuation byte (0x80) is not valid UTF-8.
+    var bad: *mut u8 = alloc(u8, 1)
+    unsafe { bad[0] = 128 }
+    let bb: []u8 = slice(u8, bad, 1)
+    print_int(is_utf8(bb) as i32)        // 0 — invalid; `from_utf8` would trap here
+    free_ptr(bad)
+    return 0
+}

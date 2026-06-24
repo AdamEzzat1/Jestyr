@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 265 tests pass, including `proptest` property
+and run (or are correctly rejected). 267 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -234,6 +234,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `bitfields.jtr` | `4`, `1`, `1`, `5` | **bit-fields (§2.8)** — `flags: u8 : 3` → C `uint8_t j_flags : 3`; four fields pack 4 B → 1 B (§5.51) |
 | `strings.jtr` | `13`, `72`, `3`, `5`, greeting | **length-carrying `str` view + `cstr` (strings E)** — `{ptr,len}`, O(1) `.len`, `"café".len==5`; `.cstr` FFI bridge (§5.52) |
 | `codepoints.jtr` | `5`, `4`, `233`, `1` | **cost-visible views (strings E)** — O(1) `.len` vs O(n) `count_codepoints`; `for cp in codepoints(s)` decodes (§5.53) |
+| `utf8_validate.jtr` | `1`, `2`, `2`, `0` | **validate-at-boundary (strings E)** — `from_utf8([]u8)→str` (validity as a type-state); `is_utf8` recoverable check (§5.54) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -971,6 +972,17 @@ These are the non-obvious things that will bite if you don't know them.
     `count_cp`, `decode_cp`, and `valid_utf8` (the last seeds step 3). Demo
     [`examples/codepoints.jtr`](examples/codepoints.jtr) (`5, 4, 233, 1` — `"café"` is 5 bytes
     but 4 codepoints; the cost gap is the whole point).
+
+54. **UTF-8 validate-at-boundary (strings step 3).** **`from_utf8([]u8) -> str` is the *only*
+    way to turn raw bytes into a `str`** (besides a compile-time-valid literal), so every `str`
+    is *proven* valid UTF-8 — validity is a **type-state**, not a per-use runtime tag. It lowers
+    to a statement-expr that spills the byte slice once, `assert(jestyr_rt_valid_utf8(ptr,len))`,
+    then builds the view — validated once at the edge, trusted thereafter (the provable-language
+    upgrade to CJC's model). **`is_utf8([]u8) -> bool`** is the explicit, recoverable check (no
+    trap) for when you'd rather branch. Both are `emit_call` intrinsics over a `[]u8` slice's
+    `.ptr`/`.len`. Demo [`examples/utf8_validate.jtr`](examples/utf8_validate.jtr) (`1, 2, 2, 0`).
+    *(A recoverable `-> str !Utf8Error` variant pairs with the error-set machinery later; today
+    the boundary either traps or you pre-check with `is_utf8`.)*
 
 ---
 

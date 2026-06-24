@@ -3121,6 +3121,33 @@ impl<'a> Cgen<'a> {
                     let cty = self.c_type(&ty);
                     return format!("sizeof({cty})");
                 }
+                // Validate-at-boundary: `from_utf8([]u8) -> str` is the *only* way to
+                // turn raw bytes into a `str`, so every `str` is proven valid UTF-8.
+                // It checks once (asserts), then the validity is a trusted invariant.
+                "from_utf8" => {
+                    if let Some(a) = args.first().copied() {
+                        let bt = self.info.type_of(a).clone();
+                        let bcty = self.c_type(&bt);
+                        let b = self.emit_expr(a);
+                        return format!(
+                            "({{ {bcty} _u = {b}; assert(jestyr_rt_valid_utf8((const char*)_u.ptr, _u.len)); (JestyrStr){{ (const char*)_u.ptr, _u.len }}; }})"
+                        );
+                    }
+                    return "(JestyrStr){0,0}".to_string();
+                }
+                // An explicit, recoverable UTF-8 check (when you want to branch
+                // rather than trap).
+                "is_utf8" => {
+                    if let Some(a) = args.first().copied() {
+                        let bt = self.info.type_of(a).clone();
+                        let bcty = self.c_type(&bt);
+                        let b = self.emit_expr(a);
+                        return format!(
+                            "({{ {bcty} _u = {b}; jestyr_rt_valid_utf8((const char*)_u.ptr, _u.len); }})"
+                        );
+                    }
+                    return "false".to_string();
+                }
                 // O(n) codepoint count — the cost-visible companion to O(1) `.len`.
                 "count_codepoints" => {
                     let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
@@ -4994,7 +5021,7 @@ fn is_intrinsic(name: &str) -> bool {
         name,
         "print_int" | "print_float" | "print_str" | "print_bool"
             | "alloc" | "alloc_i32" | "realloc" | "realloc_i32" | "free_ptr" | "size_of" | "slice"
-            | "align_of" | "offset_of" | "count_codepoints" | "codepoints" | "from_utf8"
+            | "align_of" | "offset_of" | "count_codepoints" | "codepoints" | "from_utf8" | "is_utf8"
             | "gen_new" | "gen_free" | "region_alloc" | "ok" | "err" | "is_err" | "unwrap"
             | "arena_open" | "arena_alloc" | "arena_close"
     )
@@ -5472,6 +5499,22 @@ mod tests {
         let (c, d) = gen("fn f(p: *mut i32) -> *mut u8 { return p as *mut u8 }");
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("(uint8_t*)(j_p)"), "pointer cast: {c}");
+    }
+
+    #[test]
+    fn from_utf8_validates_at_the_boundary() {
+        let src = "fn f(b: []u8) -> i32 { let s: str = from_utf8(b) return s.len as i32 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("jestyr_rt_valid_utf8("), "from_utf8 validates: {c}");
+        assert!(c.contains("assert("), "validity is asserted at the boundary: {c}");
+    }
+
+    #[test]
+    fn is_utf8_is_a_recoverable_check() {
+        let (c, d) = gen("fn f(b: []u8) -> i32 { return is_utf8(b) as i32 }");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("jestyr_rt_valid_utf8("), "is_utf8 → validity check: {c}");
     }
 
     #[test]
