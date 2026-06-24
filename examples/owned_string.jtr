@@ -1,0 +1,28 @@
+// examples/owned_string.jtr — owned String (strings workstream, step 4).
+//
+// `String` is heap-owned and growable — the owned half of the owned/view split.
+// `str` borrows; `String` owns. `string_view(s)` hands back a `str` view into the
+// owned buffer with no copy, and `.len` is O(1). Owned values are non-Copy: the
+// buffer has a single owner, responsible for `string_free`.
+//
+// Run:  jestyrc run examples/owned_string.jtr   →  5, 12, then  Hello, world  /  Hello, Jestyr
+
+fn greet(read who: str) -> String {
+    var s: String = string_from("Hello, ")
+    string_push(s, who)
+    return s
+}
+
+fn main() -> i32 {
+    var s: String = string_from("Hello")
+    print_int(s.len)               // 5
+    string_push(s, ", world")      // grows the owned buffer in place
+    print_int(s.len)               // 12
+    print_str(string_view(s))      // Hello, world — borrow the buffer as a view
+    string_free(s)
+
+    var g: String = greet("Jestyr")
+    print_str(string_view(g))      // Hello, Jestyr
+    string_free(g)
+    return 0
+}

@@ -1284,6 +1284,9 @@ impl<'a> TypeChecker<'a> {
                 _ => Ty::Unknown,
             };
         }
+        if matches!(base, Ty::Prim("String")) && fname == "len" {
+            return Ty::Prim("usize"); // an owned String's byte length
+        }
         if let Ty::Named(i) = base {
             // Read what we need, dropping the table borrow before any diagnostic.
             let (found, sname, is_struct) = {

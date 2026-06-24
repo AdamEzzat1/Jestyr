@@ -382,6 +382,14 @@ impl<'a> Cgen<'a> {
         self.raw("static uint32_t jestyr_rt_decode_cp(const char* p, size_t len, size_t* k) { size_t i = *k; uint8_t b = (uint8_t)p[i]; uint32_t cp; size_t n; if (b < 0x80u) { cp = b; n = 1; } else if ((b & 0xE0u) == 0xC0u) { cp = b & 0x1Fu; n = 2; } else if ((b & 0xF0u) == 0xE0u) { cp = b & 0x0Fu; n = 3; } else if ((b & 0xF8u) == 0xF0u) { cp = b & 0x07u; n = 4; } else { *k = i + 1; return 0xFFFDu; } for (size_t j = 1; j < n && i + j < len; j++) cp = (cp << 6) | ((uint8_t)p[i + j] & 0x3Fu); *k = i + n; return cp; }\n");
         self.raw("/* Validate a byte range as UTF-8 (used at the bytes->str boundary). */\n");
         self.raw("static bool jestyr_rt_valid_utf8(const char* p, size_t len) { size_t k = 0; while (k < len) { uint8_t b = (uint8_t)p[k]; size_t n; if (b < 0x80u) n = 1; else if ((b & 0xE0u) == 0xC0u) n = 2; else if ((b & 0xF0u) == 0xE0u) n = 3; else if ((b & 0xF8u) == 0xF0u) n = 4; else return false; if (k + n > len) return false; for (size_t j = 1; j < n; j++) if (((uint8_t)p[k + j] & 0xC0u) != 0x80u) return false; k += n; } return true; }\n\n");
+        self.raw("/* Jestyr owned String — a heap-owned, growable buffer (the owned half of the\n");
+        self.raw("   owned/view split). `string_view` borrows it as a `str` view; no copy. */\n");
+        self.raw("typedef struct { char* ptr; size_t len; size_t cap; } JestyrString;\n");
+        self.raw("static JestyrString jestyr_rt_str_new(void) { JestyrString s; s.ptr = NULL; s.len = 0; s.cap = 0; return s; }\n");
+        self.raw("static JestyrString jestyr_rt_str_from(JestyrStr v) { JestyrString s; s.cap = v.len ? v.len : 1; s.ptr = (char*)malloc(s.cap); memcpy(s.ptr, v.ptr, v.len); s.len = v.len; return s; }\n");
+        self.raw("static void jestyr_rt_str_push(JestyrString* s, JestyrStr v) { if (s->len + v.len > s->cap) { size_t nc = s->cap ? s->cap * 2 : 8; while (nc < s->len + v.len) nc *= 2; s->ptr = (char*)realloc(s->ptr, nc); s->cap = nc; } memcpy(s->ptr + s->len, v.ptr, v.len); s->len += v.len; }\n");
+        self.raw("static JestyrStr jestyr_rt_str_view(JestyrString* s) { return (JestyrStr){ s->ptr, s->len }; }\n");
+        self.raw("static void jestyr_rt_str_free(JestyrString* s) { free(s->ptr); s->ptr = NULL; s->len = 0; s->cap = 0; }\n\n");
         self.raw("/* Jestyr runtime prelude — temporary print intrinsics (stand-in for a stdlib). */\n");
         self.raw("static void jestyr_rt_print_int(int64_t x) { printf(\"%lld\\n\", (long long) x); }\n");
         self.raw("static void jestyr_rt_print_float(double x) { printf(\"%g\\n\", x); }\n");
@@ -2739,6 +2747,8 @@ impl<'a> Cgen<'a> {
                         "ptr" | "cstr" => format!("{b}.ptr"),
                         _ => format!("{b}.j_{}", name.name),
                     }
+                } else if matches!(bt, Ty::Prim("String")) && name.name == "len" {
+                    format!("{b}.len") // an owned String's byte length, O(1)
                 } else {
                     format!("{b}.j_{}", name.name)
                 }
@@ -3152,6 +3162,26 @@ impl<'a> Cgen<'a> {
                 "count_codepoints" => {
                     let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
                     return format!("jestyr_rt_count_cp({s})");
+                }
+                // Owned, growable `String` (the owned half of the owned/view split).
+                "string_new" => return "jestyr_rt_str_new()".to_string(),
+                "string_from" => {
+                    let v = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    return format!("jestyr_rt_str_from({v})");
+                }
+                "string_push" => {
+                    let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_default();
+                    let v = args.get(1).map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    return format!("jestyr_rt_str_push(&{s}, {v})");
+                }
+                // Borrow the owned buffer as a `str` view — no copy (owned → view).
+                "string_view" => {
+                    let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_default();
+                    return format!("jestyr_rt_str_view(&{s})");
+                }
+                "string_free" => {
+                    let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_default();
+                    return format!("jestyr_rt_str_free(&{s})");
                 }
                 // Compile-time alignment of a type, e.g. `align_of(Packed)` → `_Alignof`.
                 "align_of" => {
@@ -5022,6 +5052,7 @@ fn is_intrinsic(name: &str) -> bool {
         "print_int" | "print_float" | "print_str" | "print_bool"
             | "alloc" | "alloc_i32" | "realloc" | "realloc_i32" | "free_ptr" | "size_of" | "slice"
             | "align_of" | "offset_of" | "count_codepoints" | "codepoints" | "from_utf8" | "is_utf8"
+            | "string_new" | "string_from" | "string_push" | "string_view" | "string_free"
             | "gen_new" | "gen_free" | "region_alloc" | "ok" | "err" | "is_err" | "unwrap"
             | "arena_open" | "arena_alloc" | "arena_close"
     )
@@ -5075,6 +5106,7 @@ fn prim_c(name: &str) -> Option<&'static str> {
         "char" => "uint32_t",
         "str" => "JestyrStr",
         "cstr" => "const char*",
+        "String" => "JestyrString",
         _ => return None,
     })
 }
@@ -5499,6 +5531,17 @@ mod tests {
         let (c, d) = gen("fn f(p: *mut i32) -> *mut u8 { return p as *mut u8 }");
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("(uint8_t*)(j_p)"), "pointer cast: {c}");
+    }
+
+    #[test]
+    fn owned_string_grows_and_views() {
+        let src = "fn f() -> i32 { var s: String = string_from(\"hi\") string_push(s, \"!\") return s.len as i32 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("JestyrString j_s"), "String is the owned heap type: {c}");
+        assert!(c.contains("jestyr_rt_str_from("), "string_from copies into an owned buffer: {c}");
+        assert!(c.contains("jestyr_rt_str_push(&"), "string_push takes the String by address: {c}");
+        assert!(c.contains("j_s.len"), "String.len is an O(1) field: {c}");
     }
 
     #[test]

@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 267 tests pass, including `proptest` property
+and run (or are correctly rejected). 268 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -235,6 +235,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `strings.jtr` | `13`, `72`, `3`, `5`, greeting | **length-carrying `str` view + `cstr` (strings E)** — `{ptr,len}`, O(1) `.len`, `"café".len==5`; `.cstr` FFI bridge (§5.52) |
 | `codepoints.jtr` | `5`, `4`, `233`, `1` | **cost-visible views (strings E)** — O(1) `.len` vs O(n) `count_codepoints`; `for cp in codepoints(s)` decodes (§5.53) |
 | `utf8_validate.jtr` | `1`, `2`, `2`, `0` | **validate-at-boundary (strings E)** — `from_utf8([]u8)→str` (validity as a type-state); `is_utf8` recoverable check (§5.54) |
+| `owned_string.jtr` | `5`, `12`, 2 greetings | **owned `String` (strings E)** — heap-owned growable buffer; `string_view` borrows it (owned/view split) (§5.55) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -983,6 +984,18 @@ These are the non-obvious things that will bite if you don't know them.
     `.ptr`/`.len`. Demo [`examples/utf8_validate.jtr`](examples/utf8_validate.jtr) (`1, 2, 2, 0`).
     *(A recoverable `-> str !Utf8Error` variant pairs with the error-set machinery later; today
     the boundary either traps or you pre-check with `is_utf8`.)*
+
+55. **Owned `String` (strings step 4).** The **owned half of the owned/view split**: `String`
+    is a heap-owned, growable `{ char* ptr; size_t len; size_t cap; }` (`JestyrString`,
+    `c_type("String")`), while `str` borrows. Both **non-`Copy`** now (`is_copy` excludes `str`
+    *and* `String`). Runtime + intrinsics: `string_new()`, `string_from(str)` (copies into an
+    owned buffer), `string_push(s, str)` (grows in place — emitted `jestyr_rt_str_push(&s, …)`,
+    so `s` is taken by address), **`string_view(s) -> str`** (borrows the buffer as a view, *no
+    copy* — the owned→view bridge), `string_free(s)`; `String.len` is an O(1) field
+    (cgen + typeck). Demo [`examples/owned_string.jtr`](examples/owned_string.jtr) (`5, 12,` then
+    `Hello, world` / `Hello, Jestyr` — `greet` returns an owned `String`). *(Uses `malloc`/
+    `realloc` directly; threading the stdlib's allocator-value through `String` like `List(T)` is
+    the faithful refinement.)*
 
 ---
 
