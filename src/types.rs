@@ -124,6 +124,7 @@ pub fn prim_ty(name: &str) -> Option<&'static str> {
         "bool" => "bool",
         "char" => "char",
         "str" => "str",
+        "cstr" => "cstr",
         _ => return None,
     })
 }

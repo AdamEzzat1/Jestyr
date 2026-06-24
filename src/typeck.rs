@@ -1275,8 +1275,14 @@ impl<'a> TypeChecker<'a> {
                 _ => Ty::Unknown,
             };
         }
-        if matches!(base, Ty::Prim("str")) && fname == "len" {
-            return Ty::Prim("usize"); // `text.len` — the byte length (via strlen)
+        if matches!(base, Ty::Prim("str")) {
+            // A string view exposes its byte length (O(1)) and the underlying
+            // bytes — `.cstr` is the null-terminated C-interop pointer.
+            return match fname {
+                "len" => Ty::Prim("usize"),
+                "ptr" | "cstr" => Ty::Prim("cstr"),
+                _ => Ty::Unknown,
+            };
         }
         if let Ty::Named(i) = base {
             // Read what we need, dropping the table borrow before any diagnostic.

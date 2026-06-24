@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 261 tests pass, including `proptest` property
+and run (or are correctly rejected). 263 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -232,6 +232,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `visibility/main.jtr` | `3`, `7` | **per-field visibility (§2.8)** — `pub x` exposes a field cross-module; private fields need a pub accessor (§5.49) |
 | `union.jtr` | `1075838976`, `2.5`, `4` | **untagged `union` (§2.8)** — overlapping fields (C `union`); float bit-punning; `size_of` = largest field (§5.50) |
 | `bitfields.jtr` | `4`, `1`, `1`, `5` | **bit-fields (§2.8)** — `flags: u8 : 3` → C `uint8_t j_flags : 3`; four fields pack 4 B → 1 B (§5.51) |
+| `strings.jtr` | `13`, `72`, `3`, `5`, greeting | **length-carrying `str` view + `cstr` (strings E)** — `{ptr,len}`, O(1) `.len`, `"café".len==5`; `.cstr` FFI bridge (§5.52) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -525,11 +526,10 @@ These are the non-obvious things that will bite if you don't know them.
 29. **Casts and string iteration (self-hosting enablers).** `expr as T`
     (`ExprKind::Cast`) parses tighter than binary ops (`parse_cast` between unary and
     postfix), types as its target, lowers to a C cast `(T)(e)` — numeric and pointer.
-    `str` stays a bare `const char*` but now has a length and is iterable: `text.len`
-    → `strlen`, `for c in text` byte-iterates (`emit_str_for`, each `c` a `u8` via
-    `strlen` + `(uint8_t)s[k]`), `text[i]` → a byte. **Byte iteration, not
-    Unicode** — and `str` carries no length *statically* (it's `strlen` at runtime),
-    so a length-carrying string type is still future work.
+    `str` is iterable: `for c in text` byte-iterates (`emit_str_for`, each `c` a
+    `u8`), `text[i]` → a byte. **Byte iteration, not Unicode.** *(Superseded by §5.52:
+    `str` is now a length-carrying `{ptr,len}` view, so `text.len` is O(1) — no more
+    `strlen` — and iteration/indexing go through the view's `ptr`.)*
 
 30. **Doc comments are *trivia* with a side table — they never reach the parser
     (item C).** The lexer classifies `///`/`/** */` as *outer* docs and `//!`/`/*! */`
@@ -938,6 +938,26 @@ These are the non-obvious things that will bite if you don't know them.
     and the entire struct/enum/ADT plan** (`docs/structs-enums-design.md`) — all of §2.1–§2.8 are
     ✅; the only deferred items are cross-feature follow-ups (tier-aware `indirect`, a `: u8`
     tag-width repr, an optimal shared-test match decision tree).
+
+52. **Length-carrying `str` view + `cstr` C-interop type (strings workstream, step 1 — design
+    "E").** The keystone of the real-strings work. **`str` is now a `{ const char* ptr; size_t
+    len }` view** (`JestyrStr` in the prelude) — a borrowed, length-carrying UTF-8 view, like Zig
+    `[]const u8` / Rust `&str` — replacing the old bare-`const char*`-with-`strlen` model (§5.29).
+    Consequences: `c_type("str")` → `JestyrStr`; a **string literal** lowers to `JSTR("…")`
+    (`#define JSTR(s) ((JestyrStr){ (s), sizeof(s) - 1 })` — the byte length is computed by the C
+    compiler, so escapes/UTF-8 are honest); **`.len` is an O(1) field** (no `strlen`); `s[i]` →
+    `((uint8_t)s.ptr[i])`; `for c in s` walks `s.ptr[0..s.len]` (`emit_str_for`); `print_str`
+    takes a `JestyrStr` and prints `%.*s`. A **distinct `cstr`** primitive (`= const char*`, the
+    Zig `[*:0]u8` sentinel role) is the C-interop type — `extern "c"` functions take `cstr`, and
+    `s.cstr`/`s.ptr` (typeck → `Ty::Prim("cstr")`) bridges a view to a bare pointer at the FFI
+    boundary (null-terminated for a literal). `str` stays **non-`Copy`** (a view that borrows its
+    data); `cstr` is `Copy` (a raw pointer). **Migration:** `extern_c.jtr` now declares
+    `puts(s: cstr)` and calls `puts("…".cstr)`. Demo [`examples/strings.jtr`](examples/strings.jtr)
+    (`13, 72, 3, 5,` then the greeting — `"café".len == 5` makes the UTF-8 *byte* cost visible,
+    not 4 codepoints). **Next in the workstream:** cost-visible codepoint/grapheme views
+    (`codepoints()`/`count_codepoints` O(n)), `bytes`→`str` validate-at-boundary (UTF-8 validity
+    as a type-state), an owned `String` (allocator-as-value), `StringBuilder`/iolists (region-
+    friendly, zero-copy), f-strings, and a `Bytes` unvalidated-platform-bytes type.
 
 ---
 

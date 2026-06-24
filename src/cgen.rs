@@ -371,10 +371,15 @@ impl<'a> Cgen<'a> {
             self.raw("#include <time.h>\n"); // `@bench` timing via clock()
         }
         self.raw("\n");
+        self.raw("/* Jestyr string view — a length-carrying `{ptr, len}` (a borrowed UTF-8 view,\n");
+        self.raw("   like Zig `[]const u8` / Rust `&str`). `.len` is O(1); no `strlen`. A bare\n");
+        self.raw("   `cstr` (null-terminated `const char*`) is the distinct C-interop type. */\n");
+        self.raw("typedef struct { const char* ptr; size_t len; } JestyrStr;\n");
+        self.raw("#define JSTR(s) ((JestyrStr){ (s), sizeof(s) - 1 })\n\n");
         self.raw("/* Jestyr runtime prelude — temporary print intrinsics (stand-in for a stdlib). */\n");
         self.raw("static void jestyr_rt_print_int(int64_t x) { printf(\"%lld\\n\", (long long) x); }\n");
         self.raw("static void jestyr_rt_print_float(double x) { printf(\"%g\\n\", x); }\n");
-        self.raw("static void jestyr_rt_print_str(const char* s) { printf(\"%s\\n\", s); }\n");
+        self.raw("static void jestyr_rt_print_str(JestyrStr s) { printf(\"%.*s\\n\", (int) s.len, s.ptr); }\n");
         self.raw("static void jestyr_rt_print_bool(bool b) { printf(\"%s\\n\", b ? \"true\" : \"false\"); }\n\n");
         if self.uses_arena() {
             self.raw("/* Jestyr bump arena — backs region refs (`&[r]T`) and the std arena allocator. */\n");
@@ -2648,7 +2653,9 @@ impl<'a> Cgen<'a> {
         match &data.kind {
             ExprKind::Int(l) => c_int_literal(l),
             ExprKind::Float(l) => l.chars().filter(|c| *c != '_').collect(),
-            ExprKind::Str(l) => l.clone(),
+            // A string literal is a length-carrying view; `JSTR` snapshots its
+            // compile-time byte length via `sizeof(lit) - 1`.
+            ExprKind::Str(l) => format!("JSTR({l})"),
             ExprKind::Char(l) => l.clone(),
             ExprKind::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             ExprKind::Null => "NULL".to_string(),
@@ -2718,8 +2725,14 @@ impl<'a> Cgen<'a> {
                 // A slice's `ptr`/`len` are real C fields (not `j_`-prefixed).
                 if matches!(bt, Ty::Slice(_)) && (name.name == "len" || name.name == "ptr") {
                     format!("{b}.{}", name.name)
-                } else if matches!(bt, Ty::Prim("str")) && name.name == "len" {
-                    format!("strlen({b})") // a string's length is its strlen
+                } else if matches!(bt, Ty::Prim("str")) {
+                    // A string view carries its length (O(1)); `.ptr`/`.cstr` expose
+                    // the underlying bytes (`.cstr` is null-terminated for a literal).
+                    match name.name.as_str() {
+                        "len" => format!("{b}.len"),
+                        "ptr" | "cstr" => format!("{b}.ptr"),
+                        _ => format!("{b}.j_{}", name.name),
+                    }
                 } else {
                     format!("{b}.j_{}", name.name)
                 }
@@ -2729,7 +2742,10 @@ impl<'a> Cgen<'a> {
                 let proven = matches!(bt, Ty::Slice(_)) && self.index_in_range(*base, *index);
                 let b = self.emit_expr(*base);
                 let i = self.emit_expr(*index);
-                if !matches!(bt, Ty::Slice(_)) {
+                if matches!(bt, Ty::Prim("str")) {
+                    // A string view indexes into its byte buffer.
+                    format!("((uint8_t)({b}).ptr[({i})])")
+                } else if !matches!(bt, Ty::Slice(_)) {
                     format!("({b})[{i}]")
                 } else if proven {
                     // Refinement proved `i < s.len` → elide the bounds check.
@@ -4272,9 +4288,8 @@ impl<'a> Cgen<'a> {
         let s = self.emit_expr(iter);
         let n = self.tmp;
         self.tmp += 1;
-        self.line(format!("const char* _str{n} = {s};"));
-        self.line(format!("size_t _len{n} = strlen(_str{n});"));
-        self.line(format!("for (size_t _k{n} = 0; _k{n} < _len{n}; _k{n}++)"));
+        self.line(format!("JestyrStr _str{n} = {s};"));
+        self.line(format!("for (size_t _k{n} = 0; _k{n} < _str{n}.len; _k{n}++)"));
         self.line("{");
         self.depth += 1;
         if let Some(name) = self.scratch_reset.take() {
@@ -4286,7 +4301,7 @@ impl<'a> Cgen<'a> {
             }
         }
         if binding.name != "_" {
-            self.line(format!("uint8_t j_{} = (uint8_t)_str{n}[_k{n}];", binding.name));
+            self.line(format!("uint8_t j_{} = (uint8_t)_str{n}.ptr[_k{n}];", binding.name));
         }
         for stmt in &body.stmts {
             self.emit_stmt(stmt);
@@ -4971,7 +4986,8 @@ fn prim_c(name: &str) -> Option<&'static str> {
         "f64" => "double",
         "bool" => "bool",
         "char" => "uint32_t",
-        "str" => "const char*",
+        "str" => "JestyrStr",
+        "cstr" => "const char*",
         _ => return None,
     })
 }
@@ -5221,11 +5237,11 @@ mod tests {
 
     #[test]
     fn lowers_extern_c_to_bare_prototype_and_call() {
-        let src = "extern \"c\" fn puts(s: str) -> i32 fn main() -> i32 { puts(\"hi\") return 0 }";
+        let src = "extern \"c\" fn puts(s: cstr) -> i32 fn main() -> i32 { puts(\"hi\".cstr) return 0 }";
         let (c, d) = gen(src);
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("int32_t puts(const char* j_s);"), "extern prototype: {c}");
-        assert!(c.contains("puts(\"hi\")"), "called by bare C name: {c}");
+        assert!(c.contains("puts(JSTR(\"hi\").ptr)"), "bare call, str→cstr at the boundary: {c}");
         assert!(!c.contains("jestyr_puts"), "extern names are not mangled: {c}");
     }
 
@@ -5399,19 +5415,40 @@ mod tests {
     }
 
     #[test]
-    fn lowers_string_iteration_via_strlen() {
+    fn string_literal_is_a_length_carrying_view() {
+        let (c, d) = gen("fn f() -> i32 { let s: str = \"hi\" return s.len as i32 }");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(
+            c.contains("typedef struct { const char* ptr; size_t len; } JestyrStr;"),
+            "the view type: {c}"
+        );
+        assert!(c.contains("JSTR(\"hi\")"), "a literal builds a view (length via sizeof): {c}");
+    }
+
+    #[test]
+    fn cstr_is_the_distinct_ffi_type() {
+        let (c, d) = gen("fn f(read s: str) -> cstr { return s.cstr }");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("const char* jestyr_f(JestyrStr j_s)"), "str view in, cstr out: {c}");
+        assert!(c.contains("j_s.ptr"), "`.cstr` bridges to the byte pointer: {c}");
+    }
+
+    #[test]
+    fn lowers_string_iteration_over_the_view() {
         let src = "fn f(s: str) -> i32 { var t: i32 = 0 for c in s { t = t + (c as i32) } return t }";
         let (c, d) = gen(src);
         assert!(d.is_empty(), "{:?}", d);
-        assert!(c.contains("strlen("), "length via strlen: {c}");
+        assert!(c.contains(".len;"), "iterates to the view's length, not strlen: {c}");
+        assert!(!c.contains("strlen("), "length is O(1) — no strlen: {c}");
         assert!(c.contains("uint8_t j_c = (uint8_t)"), "each byte binds as u8: {c}");
     }
 
     #[test]
-    fn lowers_string_len_to_strlen() {
+    fn string_len_is_an_o1_field() {
         let (c, d) = gen("fn f(s: str) -> i32 { return s.len as i32 }");
         assert!(d.is_empty(), "{:?}", d);
-        assert!(c.contains("strlen("), "str.len → strlen: {c}");
+        assert!(c.contains("j_s.len"), "str.len is an O(1) field read: {c}");
+        assert!(!c.contains("strlen("), "no strlen: {c}");
     }
 
     #[test]

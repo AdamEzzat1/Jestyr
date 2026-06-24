@@ -1,0 +1,34 @@
+// examples/strings.jtr — length-carrying string views (strings workstream, step 1).
+//
+// A `str` is now a `{ ptr, len }` view (like Zig `[]const u8` / Rust `&str`), not a
+// bare C pointer: `.len` is O(1) (no `strlen`), iteration and indexing walk the
+// bytes, and the byte length is honest about UTF-8 (5 bytes for "café", not 4
+// codepoints — the cost is visible). A distinct `cstr` (null-terminated
+// `const char*`) is the C-interop type, bridged at the boundary with `.cstr`.
+//
+// Run:  jestyrc run examples/strings.jtr
+//       →  13, 72, 3, 5, then  Hello, Jestyr
+
+extern "c" fn puts(s: cstr) -> i32
+
+// Count the ASCII bytes (value < 0x80). Byte-level — and the cost is right there.
+fn ascii_bytes(read s: str) -> i32 {
+    var n: i32 = 0
+    for b in s {
+        if b < 128 { n = n + 1 }
+    }
+    return n
+}
+
+fn main() -> i32 {
+    let greeting: str = "Hello, Jestyr"
+    print_int(greeting.len)         // 13 — O(1), carried in the view
+    print_int(greeting[0] as i32)   // 72 — 'H', a single byte
+
+    print_int(ascii_bytes("café"))  // 3  — c, a, f are ASCII; é is two non-ASCII bytes
+    let cafe: str = "café"
+    print_int(cafe.len)             // 5  — UTF-8 *bytes*, not 4 codepoints
+
+    puts(greeting.cstr)             // Hello, Jestyr — view bridged to a C string
+    return 0
+}

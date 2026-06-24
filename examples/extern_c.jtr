@@ -4,15 +4,19 @@
 // It is called by its *bare* C name (no `jestyr_` mangling) and resolved by the
 // linker — so these call straight into libc, with no Jestyr intrinsic in between.
 //
+// A C function takes a null-terminated `cstr`, *not* Jestyr's length-carrying
+// `str` view — keeping null-termination quarantined to the FFI boundary. Bridge a
+// string literal across with `.cstr`.
+//
 // Run:  jestyrc run examples/extern_c.jtr
 //       →  Hello from C, called via extern c
 //          42
 
-extern "c" fn puts(s: str) -> i32
+extern "c" fn puts(s: cstr) -> i32
 extern "c" fn abs(x: i32) -> i32
 
 fn main() -> i32 {
-    puts("Hello from C, called via extern c")
+    puts("Hello from C, called via extern c".cstr)
     print_int(abs(0 - 42))   // 42, computed by libc's abs()
     return 0
 }
