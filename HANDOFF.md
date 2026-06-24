@@ -15,7 +15,7 @@ that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
 ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 268 tests pass, including `proptest` property
+and run (or are correctly rejected). 269 tests pass, including `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -236,6 +236,7 @@ All `examples/*.jtr` either run natively or are correctly rejected:
 | `codepoints.jtr` | `5`, `4`, `233`, `1` | **cost-visible views (strings E)** — O(1) `.len` vs O(n) `count_codepoints`; `for cp in codepoints(s)` decodes (§5.53) |
 | `utf8_validate.jtr` | `1`, `2`, `2`, `0` | **validate-at-boundary (strings E)** — `from_utf8([]u8)→str` (validity as a type-state); `is_utf8` recoverable check (§5.54) |
 | `owned_string.jtr` | `5`, `12`, 2 greetings | **owned `String` (strings E)** — heap-owned growable buffer; `string_view` borrows it (owned/view split) (§5.55) |
+| `builder.jtr` | `9`, `[1, 2, 3]` | **iolist / `Builder` (strings E)** — collect `str` fragments zero-copy, flatten once into a `String` (§5.56) |
 
 | Demo | `jestyrc check` | Exercises |
 |---|---|---|
@@ -996,6 +997,17 @@ These are the non-obvious things that will bite if you don't know them.
     `Hello, world` / `Hello, Jestyr` — `greet` returns an owned `String`). *(Uses `malloc`/
     `realloc` directly; threading the stdlib's allocator-value through `String` like `List(T)` is
     the faithful refinement.)*
+
+56. **`Builder` — iolist / StringBuilder (strings step 5).** Erlang-style **iodata**: a `Builder`
+    (`JestyrBuilder { JestyrStr* frags; size_t n; size_t cap; }`) collects `str` fragments as
+    `{ptr,len}` *views* with **no copying** during building; `builder_build` sums the lengths,
+    `malloc`s **once**, and flattens in a **single pass** into an owned `String` — not the
+    repeated reallocation of naive `a + b + c`. Intrinsics `builder_new`/`builder_push(b,str)`/
+    `builder_build(b) -> String`/`builder_free(b)`; `Builder` is a non-`Copy` prim
+    (`c_type → JestyrBuilder`). **Caveat:** fragments are views, so they must **outlive the
+    build** — which is exactly why this composes with region arenas (step 7): the escape checker
+    can prove no fragment outlives its region. Demo [`examples/builder.jtr`](examples/builder.jtr)
+    (`9,` then `[1, 2, 3]`).
 
 ---
 

@@ -59,8 +59,8 @@ impl Ty {
     pub fn is_copy(&self, tbl: &GlobalTable) -> bool {
         match self {
             Ty::Unit => true,
-            // A `str` view borrows; an owned `String` owns heap — neither is Copy.
-            Ty::Prim(n) => !matches!(*n, "str" | "String"),
+            // A `str` view borrows; an owned `String`/`Builder` owns heap — none Copy.
+            Ty::Prim(n) => !matches!(*n, "str" | "String" | "Builder"),
             Ty::Ptr { .. } => true, // raw pointers are Copy
             Ty::Named(i) => tbl.types.get(*i).map(|t| t.is_copy).unwrap_or(false),
             Ty::Opaque(_) => false, // generic/external: assume non-Copy (conservative & correct generically)
@@ -127,6 +127,7 @@ pub fn prim_ty(name: &str) -> Option<&'static str> {
         "str" => "str",
         "cstr" => "cstr",
         "String" => "String",
+        "Builder" => "Builder",
         _ => return None,
     })
 }

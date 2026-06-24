@@ -390,6 +390,14 @@ impl<'a> Cgen<'a> {
         self.raw("static void jestyr_rt_str_push(JestyrString* s, JestyrStr v) { if (s->len + v.len > s->cap) { size_t nc = s->cap ? s->cap * 2 : 8; while (nc < s->len + v.len) nc *= 2; s->ptr = (char*)realloc(s->ptr, nc); s->cap = nc; } memcpy(s->ptr + s->len, v.ptr, v.len); s->len += v.len; }\n");
         self.raw("static JestyrStr jestyr_rt_str_view(JestyrString* s) { return (JestyrStr){ s->ptr, s->len }; }\n");
         self.raw("static void jestyr_rt_str_free(JestyrString* s) { free(s->ptr); s->ptr = NULL; s->len = 0; s->cap = 0; }\n\n");
+        self.raw("/* Jestyr Builder — an iolist: a list of `str` *fragments* collected with no\n");
+        self.raw("   copying; `builder_build` sums the lengths, allocates once, and flattens in a\n");
+        self.raw("   single pass (Erlang iodata). Fragments must outlive the build. */\n");
+        self.raw("typedef struct { JestyrStr* frags; size_t n; size_t cap; } JestyrBuilder;\n");
+        self.raw("static JestyrBuilder jestyr_rt_b_new(void) { JestyrBuilder b; b.frags = NULL; b.n = 0; b.cap = 0; return b; }\n");
+        self.raw("static void jestyr_rt_b_push(JestyrBuilder* b, JestyrStr v) { if (b->n == b->cap) { size_t nc = b->cap ? b->cap * 2 : 8; b->frags = (JestyrStr*)realloc(b->frags, nc * sizeof(JestyrStr)); b->cap = nc; } b->frags[b->n++] = v; }\n");
+        self.raw("static JestyrString jestyr_rt_b_build(JestyrBuilder* b) { size_t total = 0; for (size_t i = 0; i < b->n; i++) total += b->frags[i].len; JestyrString s; s.cap = total ? total : 1; s.ptr = (char*)malloc(s.cap); s.len = total; size_t off = 0; for (size_t i = 0; i < b->n; i++) { memcpy(s.ptr + off, b->frags[i].ptr, b->frags[i].len); off += b->frags[i].len; } return s; }\n");
+        self.raw("static void jestyr_rt_b_free(JestyrBuilder* b) { free(b->frags); b->frags = NULL; b->n = 0; b->cap = 0; }\n\n");
         self.raw("/* Jestyr runtime prelude — temporary print intrinsics (stand-in for a stdlib). */\n");
         self.raw("static void jestyr_rt_print_int(int64_t x) { printf(\"%lld\\n\", (long long) x); }\n");
         self.raw("static void jestyr_rt_print_float(double x) { printf(\"%g\\n\", x); }\n");
@@ -3183,6 +3191,22 @@ impl<'a> Cgen<'a> {
                     let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_default();
                     return format!("jestyr_rt_str_free(&{s})");
                 }
+                // Builder / iolist — collect `str` fragments with no copy, flatten once.
+                "builder_new" => return "jestyr_rt_b_new()".to_string(),
+                "builder_push" => {
+                    let b = args.first().map(|a| self.emit_expr(*a)).unwrap_or_default();
+                    let v = args.get(1).map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    return format!("jestyr_rt_b_push(&{b}, {v})");
+                }
+                // Flatten the fragment list into one owned `String` in a single pass.
+                "builder_build" => {
+                    let b = args.first().map(|a| self.emit_expr(*a)).unwrap_or_default();
+                    return format!("jestyr_rt_b_build(&{b})");
+                }
+                "builder_free" => {
+                    let b = args.first().map(|a| self.emit_expr(*a)).unwrap_or_default();
+                    return format!("jestyr_rt_b_free(&{b})");
+                }
                 // Compile-time alignment of a type, e.g. `align_of(Packed)` → `_Alignof`.
                 "align_of" => {
                     let subst = self.subst.clone();
@@ -5053,6 +5077,7 @@ fn is_intrinsic(name: &str) -> bool {
             | "alloc" | "alloc_i32" | "realloc" | "realloc_i32" | "free_ptr" | "size_of" | "slice"
             | "align_of" | "offset_of" | "count_codepoints" | "codepoints" | "from_utf8" | "is_utf8"
             | "string_new" | "string_from" | "string_push" | "string_view" | "string_free"
+            | "builder_new" | "builder_push" | "builder_build" | "builder_free"
             | "gen_new" | "gen_free" | "region_alloc" | "ok" | "err" | "is_err" | "unwrap"
             | "arena_open" | "arena_alloc" | "arena_close"
     )
@@ -5107,6 +5132,7 @@ fn prim_c(name: &str) -> Option<&'static str> {
         "str" => "JestyrStr",
         "cstr" => "const char*",
         "String" => "JestyrString",
+        "Builder" => "JestyrBuilder",
         _ => return None,
     })
 }
@@ -5531,6 +5557,16 @@ mod tests {
         let (c, d) = gen("fn f(p: *mut i32) -> *mut u8 { return p as *mut u8 }");
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("(uint8_t*)(j_p)"), "pointer cast: {c}");
+    }
+
+    #[test]
+    fn builder_collects_fragments_and_flattens_once() {
+        let src = "fn f() -> i32 { var b: Builder = builder_new() builder_push(b, \"x\") var s: String = builder_build(b) return s.len as i32 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("JestyrBuilder j_b"), "Builder is the iolist type: {c}");
+        assert!(c.contains("jestyr_rt_b_push(&"), "push stores a fragment view: {c}");
+        assert!(c.contains("jestyr_rt_b_build(&"), "build flattens once: {c}");
     }
 
     #[test]

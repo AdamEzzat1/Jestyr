@@ -1,0 +1,25 @@
+// examples/builder.jtr — StringBuilder / iolist (strings workstream, step 5).
+//
+// A `Builder` is an *iolist*: it collects `str` fragments as `{ptr,len}` views with
+// NO copying. `builder_build` then sums the lengths, allocates once, and flattens
+// in a single pass (Erlang iodata). Building an N-fragment string is one allocation
+// plus one copy each — not the repeated reallocation of naive concatenation.
+//
+// Run:  jestyrc run examples/builder.jtr   →  9, then  [1, 2, 3]
+
+fn main() -> i32 {
+    var b: Builder = builder_new()
+    builder_push(b, "[")        // each push stores a view — no bytes copied yet
+    builder_push(b, "1, ")
+    builder_push(b, "2, ")
+    builder_push(b, "3")
+    builder_push(b, "]")
+
+    var s: String = builder_build(b)   // flattened once: one malloc, one pass
+    print_int(s.len)                    // 9
+    print_str(string_view(s))           // [1, 2, 3]
+
+    string_free(s)
+    builder_free(b)
+    return 0
+}
