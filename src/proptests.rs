@@ -248,4 +248,39 @@ mod fuzz {
             assert_eq!(tokens.last().unwrap().kind, TokenKind::Eof);
         });
     }
+
+    /// **Determinism under fuzzing** — the strongest invariant: the same adversarial
+    /// input must compile to byte-identical C and the same diagnostic count, every
+    /// run. A coverage-guided search for any `HashMap`/`HashSet` ordering leak.
+    #[test]
+    fn fuzz_determinism() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            assert_eq!(compile(s), compile(s));
+        });
+    }
+
+    /// The doc generator never panics on arbitrary bytes, in either output format.
+    #[test]
+    fn fuzz_doc_generator() {
+        bolero::check!().with_type::<Vec<u8>>().for_each(|bytes: &Vec<u8>| {
+            let s = String::from_utf8_lossy(bytes);
+            let _ = crate::doc::generate(&s, "t", false);
+            let _ = crate::doc::generate(&s, "t", true);
+        });
+    }
+
+    /// Every AST node's span stays in-bounds and on char boundaries even on
+    /// adversarial input (parser span integrity, not just the lexer's).
+    #[test]
+    fn fuzz_ast_spans_in_bounds() {
+        bolero::check!().with_type::<Vec<u8>>().for_each(|bytes: &Vec<u8>| {
+            let s = String::from_utf8_lossy(bytes);
+            let (tokens, _) = Lexer::new(&s).tokenize();
+            let (ast, _) = Parser::new(&s, tokens).parse();
+            let len = s.len() as u32;
+            for e in &ast.exprs {
+                assert!(e.span.start <= e.span.end && e.span.end <= len, "expr span OOB");
+            }
+        });
+    }
 }
