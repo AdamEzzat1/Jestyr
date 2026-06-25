@@ -5972,6 +5972,24 @@ mod tests {
     }
 
     #[test]
+    fn lowers_a_vtable_built_from_closure_literals() {
+        // The full ergonomic: construct a vtable directly from closure literals in
+        // the struct-literal fields. Each becomes a bare function; the field is
+        // initialized with its address.
+        let src = "struct V { op: fn(i32) -> i32 } \
+                   fn run(read v: V, n: i32) -> i32 { return v.op(n) } \
+                   fn main() -> i32 { let v = V{ op: |x| x + 1 } return run(v, 41) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("static int32_t jestyr_lam_"), "closure field → bare function: {c}");
+        assert!(
+            c.contains(".j_op = (&jestyr_lam_"),
+            "the struct field is initialized with the function's address: {c}"
+        );
+        assert!(!c.contains("JestyrClosure_"), "no fat-closure struct: {c}");
+    }
+
+    #[test]
     fn rejects_a_capturing_closure_coerced_to_a_fn_pointer() {
         // A closure that captures its environment is not a thin pointer — coercing
         // it must be a clear error, not silently-wrong C.

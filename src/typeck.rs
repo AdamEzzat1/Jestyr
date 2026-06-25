@@ -1134,8 +1134,23 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             ExprKind::StructLit { path, fields, spread } => {
-                let arg_tys: Vec<Ty> =
-                    fields.iter().map(|fi| self.infer(scope, typ, self_ty, fi.value)).collect();
+                // For a plain named struct, resolve its index *first*, so each field
+                // value is inferred against its **declared field type** as the
+                // expected type. That is what lets a fn-pointer-typed field accept a
+                // coercing closure literal — `Allocator{ alloc_fn: |n| … }`.
+                let named_idx = if path.name != "Self" && !self.table.variants.contains_key(&path.name) {
+                    self.table.type_index.get(&path.name).copied()
+                } else {
+                    None
+                };
+                for fi in fields {
+                    let expected =
+                        named_idx.and_then(|i| self.struct_field_decl_ty(i, &fi.name.name));
+                    let prev = self.cur_expected.take();
+                    self.cur_expected = expected;
+                    self.infer(scope, typ, self_ty, fi.value);
+                    self.cur_expected = prev;
+                }
                 if let Some(s) = spread {
                     self.infer(scope, typ, self_ty, *s);
                 }
@@ -1145,8 +1160,10 @@ impl<'a> TypeChecker<'a> {
                     // `circle { r: 2.0 }` — a struct-variant construction (the path is
                     // an enum variant, not a struct type). Reuse the positional
                     // inference (source order is taken as field order).
+                    let arg_tys: Vec<Ty> =
+                        fields.iter().map(|fi| self.expr_types[fi.value.0 as usize].clone()).collect();
                     self.variant_ctor_type(ei, &path.name, &arg_tys)
-                } else if let Some(&i) = self.table.type_index.get(&path.name) {
+                } else if let Some(i) = named_idx {
                     Ty::Named(i)
                 } else {
                     Ty::Opaque(path.name.clone())
@@ -1369,6 +1386,15 @@ impl<'a> TypeChecker<'a> {
         let TypeKindG::Struct { fields } = &self.table.types.get(*i)?.kind else { return None };
         let (_, t) = fields.iter().find(|(n, _)| n == fname)?;
         matches!(t, Ty::Fn { .. }).then(|| t.clone())
+    }
+
+    /// The declared type of field `fname` on the struct at table index `i` (the
+    /// *expected* type when inferring that field's value in a struct literal —
+    /// notably letting a fn-pointer field coerce a closure literal). `None` for an
+    /// enum/distinct, or an absent field.
+    fn struct_field_decl_ty(&self, i: usize, fname: &str) -> Option<Ty> {
+        let TypeKindG::Struct { fields } = &self.table.types.get(i)?.kind else { return None };
+        fields.iter().find(|(n, _)| n == fname).map(|(_, t)| t.clone())
     }
 
     fn field_type(&mut self, span: Span, base: &Ty, fname: &str) -> Ty {
@@ -2276,6 +2302,26 @@ mod tests {
         assert!(
             matches!(info.type_of(clo), Ty::Fn { .. }),
             "closure should coerce to a fn-pointer type, got {:?}",
+            info.type_of(clo)
+        );
+    }
+
+    #[test]
+    fn a_closure_in_a_struct_field_coerces_to_the_field_fn_pointer() {
+        // A vtable built directly from closure literals: the field's declared
+        // fn-pointer type flows in as the expected type, so the closure coerces.
+        let (ast, info) = analyze_full(
+            "struct V { op: fn(i32) -> i32 } fn f() { let v = V{ op: |x| x + 1 } }",
+        );
+        let clo = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| matches!(e.kind, ExprKind::Closure { .. }).then_some(ExprId(i as u32)))
+            .expect("the closure");
+        assert!(
+            matches!(info.type_of(clo), Ty::Fn { .. }),
+            "a closure in a fn-pointer field should coerce, got {:?}",
             info.type_of(clo)
         );
     }
