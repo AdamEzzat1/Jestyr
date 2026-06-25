@@ -203,10 +203,21 @@ impl<'src> Parser<'src> {
                 }
                 Some(Item::Import(self.parse_import()))
             }
+            Trait => {
+                let mut t = self.parse_trait();
+                t.is_pub = is_pub;
+                Some(Item::Trait(t))
+            }
+            Impl => {
+                if let Some(a) = attrs.first() {
+                    self.error(a.span, "attributes are not allowed on an `impl` block itself");
+                }
+                Some(Item::Impl(self.parse_impl()))
+            }
             other => {
                 self.error(
                     self.cur().span,
-                    format!("expected an item (`fn`, `enum`, `const`, `struct`, `record`, `distinct`, `extern`, `import`), found `{}`", other.describe()),
+                    format!("expected an item (`fn`, `trait`, `impl`, `enum`, `const`, `struct`, `record`, `distinct`, `extern`, `import`), found `{}`", other.describe()),
                 );
                 self.bump();
                 None
@@ -246,6 +257,7 @@ impl<'src> Parser<'src> {
         let start = self.cur().span;
         self.expect(Fn, "`fn`");
         let name = self.eat_ident("function name");
+        let generics = self.parse_generics(); // optional `[T: Add, U]`
         self.expect(LParen, "`(`");
         let params = self.parse_params();
         self.expect(RParen, "`)`");
@@ -286,7 +298,110 @@ impl<'src> Parser<'src> {
         // `no_panic` is a cached projection of `attrs` (the single source of truth)
         // so the many `f.no_panic` read sites need not scan the vector each time.
         let no_panic = attrs.iter().any(|a| a.name == "no_panic");
-        FnDecl { is_pub: false, no_panic, attrs, name, params, ret_conv, ret_ty, errors, requires, ensures, body, span }
+        FnDecl { is_pub: false, generics, no_panic, attrs, name, params, ret_conv, ret_ty, errors, requires, ensures, body, span }
+    }
+
+    /// Optional bracket-form bounded generics after a function name: `[T: Add, U]`.
+    /// Empty when absent. Each entry is a type-parameter name with an optional
+    /// trait bound (`T: Add`); the bound is checked at the definition site.
+    fn parse_generics(&mut self) -> Vec<GenericParam> {
+        let mut gs = Vec::new();
+        if !self.eat(LBracket) {
+            return gs;
+        }
+        while !self.at(RBracket) && !self.at(Eof) {
+            let before = self.pos;
+            let name = self.eat_ident("type parameter");
+            let bound = if self.eat(Colon) { Some(self.eat_ident("trait bound")) } else { None };
+            gs.push(GenericParam { name, bound });
+            if self.pos == before {
+                self.bump(); // guarantee progress on malformed input
+            }
+            if !self.eat(Comma) {
+                break;
+            }
+        }
+        self.expect(RBracket, "`]`");
+        gs
+    }
+
+    /// `trait Name { fn m(self) -> T  fn n(self) { <default> } }` — a behavior
+    /// description (design §7.3). A method with a `{ … }` body is a *default*
+    /// (optional for an `impl`); a bodyless one is required.
+    fn parse_trait(&mut self) -> TraitDecl {
+        let start = self.cur().span;
+        self.expect(Trait, "`trait`");
+        let name = self.eat_ident("trait name");
+        self.expect(LBrace, "`{`");
+        let mut methods = Vec::new();
+        while !self.at(RBrace) && !self.at(Eof) {
+            let before = self.pos;
+            if self.at(Fn) {
+                methods.push(self.parse_trait_method());
+            } else {
+                self.error(self.cur().span, "expected a method signature (`fn …`) in the trait body");
+            }
+            if self.pos == before {
+                self.bump();
+            }
+        }
+        let end = self.cur().span;
+        self.expect(RBrace, "`}`");
+        TraitDecl { is_pub: false, name, methods, span: start.to(end) }
+    }
+
+    fn parse_trait_method(&mut self) -> TraitMethod {
+        let start = self.cur().span;
+        self.expect(Fn, "`fn`");
+        let name = self.eat_ident("method name");
+        self.expect(LParen, "`(`");
+        let params = self.parse_params();
+        self.expect(RParen, "`)`");
+        let mut ret_conv = Conv::Default;
+        let mut ret_ty = None;
+        if self.eat(Arrow) {
+            ret_conv = self.parse_conv();
+            ret_ty = Some(self.parse_type());
+        }
+        // A `{ … }` body is a default implementation; otherwise the signature is
+        // required, with an optional `;` terminator.
+        let default_body = if self.at(LBrace) {
+            Some(self.parse_block())
+        } else {
+            self.eat(Semi);
+            None
+        };
+        TraitMethod { name, params, ret_conv, ret_ty, default_body, span: start.to(self.prev_span()) }
+    }
+
+    /// `impl Trait for Type { fn m(self) -> T { … } }`.
+    fn parse_impl(&mut self) -> ImplDecl {
+        let start = self.cur().span;
+        self.expect(Impl, "`impl`");
+        let trait_name = self.eat_ident("trait name");
+        self.expect(For, "`for`");
+        let ty = self.parse_type();
+        self.expect(LBrace, "`{`");
+        let mut methods = Vec::new();
+        while !self.at(RBrace) && !self.at(Eof) {
+            let before = self.pos;
+            let mattrs = self.parse_attrs(); // `@inline fn …` on an impl method
+            if self.at(Fn) {
+                let f = self.parse_fn(mattrs);
+                self.check_fn_attrs(&f, true);
+                methods.push(f);
+            } else if let Some(a) = mattrs.first() {
+                self.error(a.span, "an attribute here applies to a method (`fn …`)");
+            } else {
+                self.error(self.cur().span, "expected a method (`fn …`) in the impl body");
+            }
+            if self.pos == before {
+                self.bump();
+            }
+        }
+        let end = self.cur().span;
+        self.expect(RBrace, "`}`");
+        ImplDecl { trait_name, ty, methods, span: start.to(end) }
     }
 
     /// `extern "c" fn name(params) -> ret` — a bodyless foreign declaration.
@@ -698,6 +813,12 @@ impl<'src> Parser<'src> {
                 let t = self.bump();
                 let id = Ident { name: "Self".to_string(), span: t.span };
                 self.ast.ty(TypeKind::Name(id), t.span)
+            }
+            // `dyn Trait` — a type-erased fat pointer dispatching through a vtable.
+            Dyn => {
+                self.bump();
+                let name = self.eat_ident("trait name");
+                self.ast.ty(TypeKind::Dyn(name), start.to(self.prev_span()))
             }
             // `fn(read T1, take T2) -> read R` — a thin function-pointer type.
             // Each parameter may carry a passing convention; the `-> conv R`
@@ -1728,6 +1849,66 @@ mod tests {
         // Garbage between the parens must not spin the parser (progress guard).
         let (_ast, diags) = parse("fn f(g: fn(,,,) -> i32) { }");
         assert!(!diags.is_empty(), "a malformed parameter list reports an error");
+    }
+
+    // --- traits / impl / dyn / bounds (Stage A) ---
+
+    #[test]
+    fn parses_a_trait_with_required_and_default_methods() {
+        let ast = parse_ok(
+            "trait Show { fn show(read self) -> i32  fn label(read self) -> i32 { return 0 } }",
+        );
+        let Item::Trait(t) = &ast.items[0] else { panic!("expected a trait") };
+        assert_eq!(t.name.name, "Show");
+        assert_eq!(t.methods.len(), 2);
+        assert!(t.methods[0].default_body.is_none(), "show is a required signature");
+        assert!(t.methods[1].default_body.is_some(), "label has a default body");
+    }
+
+    #[test]
+    fn parses_an_impl_block() {
+        let ast = parse_ok("impl Show for i32 { fn show(read self) -> i32 { return self } }");
+        let Item::Impl(im) = &ast.items[0] else { panic!("expected an impl") };
+        assert_eq!(im.trait_name.name, "Show");
+        assert!(matches!(ast.type_at(im.ty).kind, TypeKind::Name(_)), "impl target is a type");
+        assert_eq!(im.methods.len(), 1);
+    }
+
+    #[test]
+    fn parses_a_bounded_generic_function() {
+        let ast = parse_ok("fn describe[T: Show, U](read x: T) -> i32 { return 0 }");
+        let Item::Fn(f) = &ast.items[0] else { panic!() };
+        assert_eq!(f.generics.len(), 2);
+        assert_eq!(f.generics[0].name.name, "T");
+        assert_eq!(f.generics[0].bound.as_ref().map(|b| b.name.as_str()), Some("Show"));
+        assert!(f.generics[1].bound.is_none(), "U is an unbounded type parameter");
+    }
+
+    #[test]
+    fn parses_a_dyn_trait_type() {
+        let ast = parse_ok("fn render(read s: dyn Show) -> i32 { return 0 }");
+        let Item::Fn(f) = &ast.items[0] else { panic!() };
+        let ty = f.params[0].ty.unwrap();
+        assert!(matches!(&ast.type_at(ty).kind, TypeKind::Dyn(n) if n.name == "Show"));
+    }
+
+    #[test]
+    fn prints_trait_impl_and_bounds_round_trip() {
+        let ast = parse_ok(
+            "trait Show { fn show(read self) -> i32 } \
+             impl Show for i32 { fn show(read self) -> i32 { return self } } \
+             fn f[T: Show](read x: T) -> i32 { return 0 }",
+        );
+        let out = print_ast(&ast);
+        assert!(out.contains("trait Show"), "{out}");
+        assert!(out.contains("impl Show for i32"), "{out}");
+        assert!(out.contains("fn f[T: Show]"), "{out}");
+    }
+
+    #[test]
+    fn recovers_from_a_malformed_trait_body() {
+        let (_ast, diags) = parse("trait T { @ @ @ }");
+        assert!(!diags.is_empty(), "garbage in a trait body reports an error");
     }
 
     #[test]

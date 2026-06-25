@@ -214,6 +214,58 @@ mod prop {
         fn fn_pointer_programs_compile_deterministically(p in arb_fn_type_program()) {
             prop_assert_eq!(compile(&p), compile(&p));
         }
+
+        // ── traits / interfaces, Stage A (parse + represent) ──────────────────
+
+        /// A generated trait program — a trait (required + default methods), an
+        /// `impl` for it, a bounded generic `[T: Tr]` use, and optionally a `dyn`
+        /// parameter — always lexes and parses with no diagnostics.
+        #[test]
+        fn trait_programs_parse_clean(p in arb_trait_program()) {
+            let (tokens, lex_diags) = Lexer::new(&p).tokenize();
+            prop_assert!(lex_diags.is_empty(), "lex errors on {}", p);
+            let (_ast, parse_diags) = Parser::new(&p, tokens).parse();
+            prop_assert!(parse_diags.is_empty(), "parse errors on {}: {:?}", p, parse_diags);
+        }
+
+        /// The whole pipeline stays **total and deterministic** on trait programs —
+        /// Stage A adds no semantics, so this also guards that the new AST nodes
+        /// don't make any later stage panic or leak iteration order.
+        #[test]
+        fn trait_programs_are_total_and_deterministic(p in arb_trait_program()) {
+            run_pipeline(&p);
+            prop_assert_eq!(compile(&p), compile(&p));
+        }
+
+        /// `print_ast` is total and idempotent on trait/impl/`dyn`/bound nodes.
+        #[test]
+        fn trait_programs_print_stably(p in arb_trait_program()) {
+            let (tokens, _) = Lexer::new(&p).tokenize();
+            let (ast, _) = Parser::new(&p, tokens).parse();
+            let a = crate::printer::print_ast(&ast);
+            let b = crate::printer::print_ast(&ast);
+            prop_assert_eq!(a, b);
+        }
+    }
+
+    /// A small *valid* trait program: a trait `xShow` with `n` required methods, an
+    /// `impl xShow for i32` providing them, a bounded generic `xuse[T: xShow]`, and
+    /// (optionally) a `dyn xShow` parameter. All names are `x`-prefixed so they
+    /// never collide with a keyword — the program always lexes and parses clean.
+    fn arb_trait_program() -> impl Strategy<Value = String> {
+        (1usize..4, any::<bool>()).prop_map(|(n, use_dyn)| {
+            let sigs: Vec<String> =
+                (0..n).map(|i| format!("fn xm{i}(read self) -> i32")).collect();
+            let impls: Vec<String> =
+                (0..n).map(|i| format!("fn xm{i}(read self) -> i32 {{ return {i} }}")).collect();
+            let dyn_fn = if use_dyn { "fn xr(read s: dyn xShow) -> i32 { return 0 }" } else { "" };
+            format!(
+                "trait xShow {{ {} }} impl xShow for i32 {{ {} }} \
+                 fn xuse[T: xShow](read x: T) -> i32 {{ return 0 }} {dyn_fn}",
+                sigs.join("  "),
+                impls.join("  "),
+            )
+        })
     }
 
     /// A base type to appear inside a generated function-pointer signature —
@@ -374,6 +426,22 @@ mod fuzz {
         bolero::check!().with_type::<String>().for_each(|s: &String| {
             let prog = format!(
                 "struct V {{ f: fn({s}) -> i32 }} fn use_v(g: fn({s})) -> i32 {{ return f(0) }}"
+            );
+            run_pipeline(&prog);
+            assert_eq!(compile(&prog), compile(&prog));
+        });
+    }
+
+    /// Coverage-guided fuzzing of the **traits** parse/recovery paths: the
+    /// fuzzer's bytes land inside an `impl` body and a bounded-generic body, so
+    /// the new `trait`/`impl`/`dyn`/`[T: Bound]` grammar and its recovery guards
+    /// are hammered. The pipeline must stay total *and* deterministic.
+    #[test]
+    fn fuzz_traits_pipeline() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let prog = format!(
+                "trait T {{ fn m(read self) -> i32 }} \
+                 impl T for i32 {{ {s} }} fn u[X: T](read x: X) -> i32 {{ {s} }}"
             );
             run_pipeline(&prog);
             assert_eq!(compile(&prog), compile(&prog));

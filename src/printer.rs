@@ -83,6 +83,19 @@ impl<'a> Printer<'a> {
             Item::Distinct(dd) => {
                 self.line(d, &format!("distinct {} = {}", dd.name.name, self.type_str(dd.base)));
             }
+            Item::Trait(t) => {
+                self.line(d, &format!("trait {}", t.name.name));
+                for m in &t.methods {
+                    let kind = if m.default_body.is_some() { "default method" } else { "method" };
+                    self.line(d + 1, &format!("{} {}", kind, m.name.name));
+                }
+            }
+            Item::Impl(im) => {
+                self.line(d, &format!("impl {} for {}", im.trait_name.name, self.type_str(im.ty)));
+                for f in &im.methods {
+                    self.func(d + 1, f, "method fn");
+                }
+            }
         }
     }
 
@@ -100,7 +113,20 @@ impl<'a> Printer<'a> {
 
     fn func(&mut self, d: usize, f: &FnDecl, kw: &str) {
         self.attrs(d, &f.attrs);
-        self.line(d, &format!("{} {}", kw, f.name.name));
+        let gen = if f.generics.is_empty() {
+            String::new()
+        } else {
+            let gs: Vec<String> = f
+                .generics
+                .iter()
+                .map(|g| match &g.bound {
+                    Some(b) => format!("{}: {}", g.name.name, b.name),
+                    None => g.name.name.clone(),
+                })
+                .collect();
+            format!("[{}]", gs.join(", "))
+        };
+        self.line(d, &format!("{} {}{}", kw, f.name.name, gen));
         if !f.params.is_empty() {
             self.line(d + 1, "params:");
             for p in &f.params {
@@ -395,6 +421,7 @@ impl<'a> Printer<'a> {
                 };
                 format!("fn({}){}", ps.join(", "), tail)
             }
+            TypeKind::Dyn(n) => format!("dyn {}", n.name),
             TypeKind::Error => "<error-type>".to_string(),
         }
     }
@@ -501,5 +528,19 @@ mod tests {
         let out = printed("fn f(free_fn: fn(*mut u8)) { }");
         assert!(out.contains("fn(*mut u8)"), "{out}");
         assert!(!out.contains("fn(*mut u8) ->"), "no arrow for a unit-returning pointer: {out}");
+    }
+
+    #[test]
+    fn renders_dyn_type_and_generic_bounds() {
+        let out = printed("fn f[T: Ord](read s: dyn Show) -> i32 { return 0 }");
+        assert!(out.contains("dyn Show"), "renders a dyn type: {out}");
+        assert!(out.contains("[T: Ord]"), "renders a bounded generic: {out}");
+    }
+
+    #[test]
+    fn renders_trait_methods_required_vs_default() {
+        let out = printed("trait Tr { fn req(read self) -> i32  fn def(read self) -> i32 { return 0 } }");
+        assert!(out.contains("method req"), "required method: {out}");
+        assert!(out.contains("default method def"), "default method: {out}");
     }
 }

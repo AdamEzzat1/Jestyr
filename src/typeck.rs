@@ -81,7 +81,8 @@ fn build_owner(ast: &Ast, modules: &Modules) -> HashMap<String, (ModId, bool)> {
             Item::Struct { name, .. } => Some(name.name.clone()),
             Item::Distinct(d) => Some(d.name.name.clone()),
             Item::Extern(e) => Some(e.name.name.clone()),
-            Item::Import(_) => None,
+            Item::Trait(t) => Some(t.name.name.clone()),
+            Item::Impl(_) | Item::Import(_) => None,
         };
         if let Some(n) = name {
             owner.entry(n).or_insert((m, is_pub));
@@ -281,6 +282,8 @@ impl<'a> TypeChecker<'a> {
                     );
                 }
                 Item::Import(_) => {}
+                // Trait/impl signatures are resolved in Stage B, not registered here.
+                Item::Trait(_) | Item::Impl(_) => {}
             }
         }
     }
@@ -454,6 +457,9 @@ impl<'a> TypeChecker<'a> {
                 };
                 Ty::Fn { params: ps, ret: Box::new(r), ret_conv: *ret_conv }
             }
+            // `dyn Trait` is opaque until trait resolution lands (Stage F gives it a
+            // real fat-pointer representation); keep it quiet, not an error.
+            TypeKind::Dyn(n) => Ty::Opaque(format!("dyn {}", n.name)),
             TypeKind::App { ctor, args } => {
                 let aty: Vec<Ty> = args.iter().map(|a| self.lower_type(ty_params, *a)).collect();
                 // `Ctor(args)` is a generic *enum* instance if `Ctor` names a
@@ -807,6 +813,8 @@ impl<'a> TypeChecker<'a> {
                     self.infer(&mut scope, &empty, &Ty::Unit, c.value);
                 }
                 Item::Enum(_) | Item::Distinct(_) | Item::Extern(_) | Item::Import(_) => {}
+                // Trait/impl method bodies are checked in Stage B (against the trait).
+                Item::Trait(_) | Item::Impl(_) => {}
             }
         }
     }

@@ -715,6 +715,7 @@ impl<'a> Cgen<'a> {
                 };
                 Ty::Fn { params: ps, ret: Box::new(r), ret_conv: *ret_conv }
             }
+            TypeKind::Dyn(n) => Ty::Opaque(format!("dyn {}", n.name)),
             TypeKind::TypeKw => Ty::TypeKw,
             TypeKind::Error => Ty::Error,
         }
@@ -5085,6 +5086,10 @@ impl<'a> Cgen<'a> {
                 let subst = self.subst.clone();
                 let ty = self.ast_type_to_ty(id, &subst);
                 self.c_type(&ty)
+            }
+            TypeKind::Dyn(_) => {
+                self.diag(span, "the C backend does not support `dyn` yet (traits Stage F)");
+                "void*".to_string()
             }
             TypeKind::Error => "int".to_string(),
         }

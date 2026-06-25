@@ -254,7 +254,8 @@ fn item_is_pub(item: &Item) -> bool {
         Item::Struct { is_pub, .. } => *is_pub,
         Item::Distinct(d) => d.is_pub,
         Item::Extern(e) => e.is_pub,
-        Item::Import(_) => false,
+        Item::Trait(t) => t.is_pub,
+        Item::Impl(_) | Item::Import(_) => false,
     }
 }
 

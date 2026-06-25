@@ -248,6 +248,26 @@ test a feature can have, far beyond the per-feature golden examples.
 - **Allocation count:** extend the `bench-alloc` allocator to also count *number* of allocations
   (not just bytes) — a proxy for allocator pressure that the arena-AST design aims to keep low.
 
+### 5.12 Traits / interfaces (in progress — the biggest remaining gap)
+
+Built stage-by-stage (parse → resolve+coherence → static dispatch → bounds → operators →
+`dyn`); each increment ships unit + property + bolero coverage and stays green/warning-clean.
+Run: `cargo test trait_programs`, `cargo test parses_a_trait`, `cargo bolero test fuzz_traits_pipeline`.
+
+- ✅ **Stage A — parse + represent.** `trait`/`impl`/`dyn Trait`/`[T: Bound]` parse into the AST
+  (`Item::Trait`, `Item::Impl`, `TypeKind::Dyn`, `FnDecl::generics`); printer/doc stay idempotent;
+  the whole pipeline stays **total** (later stages ignore trait/impl items, `dyn` lowers to an
+  opaque placeholder — *no semantics yet*).
+  - Unit: trait (required vs default methods), impl block, bounded generic, `dyn` type, print
+    round-trip, malformed-body recovery (parser/printer `mod tests`).
+  - Property (`prop`): `trait_programs_parse_clean`, `..._are_total_and_deterministic`,
+    `..._print_stably` over the `arb_trait_program` generator (trait + impl + bounded use + `dyn`).
+  - Fuzz (`fuzz`): `fuzz_traits_pipeline` — fuzz bytes inside an `impl`/bounded-generic body;
+    total + deterministic.
+- ⏳ **Remaining:** B resolve+coherence · C static dispatch (monomorphized, no vtable) ·
+  D definition-site bounds · E operator traits (`Add`/`Mul`/`Eq`/`Ord`) · F `dyn` vtable.
+  Each lands with the same three layers (+ a gcc differential once runtime behaviour matters).
+
 ---
 
 ## 6. Experiment — D-HARHT (Memory profile) vs `HashMap`

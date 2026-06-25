@@ -130,6 +130,9 @@ impl<'a> Checker<'a> {
                 }
             }
             Item::Enum(_) | Item::Const(_) | Item::Distinct(_) | Item::Extern(_) | Item::Import(_) => {}
+            // Trait/impl method bodies are escape-checked once their resolution
+            // lands (Stage B); a bare signature has nothing to check.
+            Item::Trait(_) | Item::Impl(_) => {}
         }
     }
 

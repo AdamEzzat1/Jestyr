@@ -397,6 +397,21 @@ fn collect_targets(ast: &Ast, src: &str) -> Vec<Target> {
                     doc: None,
                 });
             }
+            Item::Trait(t) => {
+                let vis = if t.is_pub { "pub " } else { "" };
+                targets.push(Target {
+                    span: t.span,
+                    kind: "trait",
+                    name: t.name.name.clone(),
+                    signature: format!("{vis}trait {}", t.name.name),
+                    guarantees: Vec::new(),
+                    parent: None,
+                    doc: None,
+                });
+            }
+            // An `impl` block has no name of its own to document (its methods belong
+            // to their trait/type); skip it for now.
+            Item::Impl(_) => {}
             Item::Import(_) => {}
         }
     }
@@ -626,6 +641,7 @@ fn ty_str(ast: &Ast, id: TypeId) -> String {
             };
             format!("fn({}){}", ps.join(", "), tail)
         }
+        TypeKind::Dyn(n) => format!("dyn {}", n.name),
         TypeKind::Error => "<error-type>".to_string(),
     }
 }

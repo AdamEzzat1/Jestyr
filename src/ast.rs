@@ -117,6 +117,11 @@ pub enum TypeKind {
     /// canonical use is a hand-written vtable: a struct of these is exactly the
     /// allocator interface that must exist *before* traits do (design discussion).
     Fn { params: Vec<FnTypeParam>, ret_conv: Conv, ret: Option<TypeId> },
+    /// `dyn Trait` — the explicit, *visible* dynamic-dispatch escape valve (design
+    /// §7.3). A fat pointer `{ data*, vtable* }`; the vtable is a compiler-built
+    /// struct of function pointers, byte-compatible with a hand-written one. You
+    /// never get a vtable you didn't ask for — static dispatch never synthesizes one.
+    Dyn(Ident),
     Error,
 }
 
@@ -334,11 +339,24 @@ pub struct ErrorSet {
     pub span: Span,
 }
 
+/// A bounded generic type parameter in the bracket form `fn f[T: Add, U](…)`
+/// (design §8.2): a name with an optional trait bound. Distinct from a value-level
+/// `comptime T: type` parameter — these are checked at the *definition* site
+/// against their bound (the "Zig fix": blame the generic code, not the caller).
+#[derive(Clone, Debug)]
+pub struct GenericParam {
+    pub name: Ident,
+    pub bound: Option<Ident>,
+}
+
 #[derive(Clone, Debug)]
 pub struct FnDecl {
     /// `pub fn …` — visible outside its module (design §9). Always `false` for
     /// methods (a method's visibility follows its enclosing struct).
     pub is_pub: bool,
+    /// Bracket-form bounded generics: `fn sum[T: Add](…)`. Empty for a plain or
+    /// `comptime`-generic function. Checked at the definition site against the bound.
+    pub generics: Vec<GenericParam>,
     /// `@no_panic fn …` (design §13) — the compiler must *prove* every faulting
     /// op (today: slice indexing) is fault-free, else it's a compile error. A
     /// cached projection of [`FnDecl::attrs`]; see also [`FnDecl::has_attr`].
@@ -492,9 +510,47 @@ pub struct DistinctDecl {
     pub span: Span,
 }
 
+/// One method *signature* in a `trait` body — a name, parameters (including the
+/// `self` receiver with its `read`/`mut`/`take` convention), and a return. A
+/// `default_body` makes the method optional for an `impl` (Swift protocol
+/// extension / Rust default method); `None` makes it required.
+#[derive(Clone, Debug)]
+pub struct TraitMethod {
+    pub name: Ident,
+    pub params: Vec<Param>,
+    pub ret_conv: Conv,
+    pub ret_ty: Option<TypeId>,
+    pub default_body: Option<Block>,
+    pub span: Span,
+}
+
+/// `trait Name { … }` — a description of behavior (design §7.3). Bounds reference
+/// it; an `impl` provides it; `dyn Name` erases to it. Operators desugar to the
+/// methods of built-in traits (`Add`, `Mul`, `Eq`, `Ord`).
+#[derive(Clone, Debug)]
+pub struct TraitDecl {
+    pub is_pub: bool,
+    pub name: Ident,
+    pub methods: Vec<TraitMethod>,
+    pub span: Span,
+}
+
+/// `impl Trait for Type { … }` — provides a trait's behavior for a concrete type.
+/// At most one per `(trait, type)` (coherence); methods are ordinary functions
+/// the monomorphizer specializes (static) or a `dyn` vtable points at (dynamic).
+#[derive(Clone, Debug)]
+pub struct ImplDecl {
+    pub trait_name: Ident,
+    pub ty: TypeId,
+    pub methods: Vec<FnDecl>,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug)]
 pub enum Item {
     Fn(FnDecl),
+    Trait(TraitDecl),
+    Impl(ImplDecl),
     Enum(EnumDecl),
     Const(ConstDecl),
     Distinct(DistinctDecl),
