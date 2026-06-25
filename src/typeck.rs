@@ -1518,16 +1518,30 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// If `base` is a plain struct with a field `fname` of *function-pointer*
-    /// type, return that `Ty::Fn`. Diagnostic-free (unlike [`Self::field_type`]),
-    /// so it can probe a method-call's receiver field without emitting a spurious
-    /// "no field" error when the call is really a method. Generic-struct fn-ptr
-    /// fields are out of scope here (the vtable shape is a plain struct).
+    /// If `base` is a struct with a field `fname` of *function-pointer* type,
+    /// return that `Ty::Fn`. Diagnostic-free (unlike [`Self::field_type`]), so it
+    /// can probe a method-call's receiver field without emitting a spurious "no
+    /// field" error when the call is really a method.
+    ///
+    /// Handles both shapes of vtable receiver:
+    /// - a **plain** struct (`Ty::Named`) — read the field's declared type directly;
+    /// - a **generic** struct (`Ty::GenStruct`) — resolve the field's declared type
+    ///   *under the receiver's type arguments* (mirroring
+    ///   [`Self::gen_struct_field_decl_ty`]), so `gen.op(n)` on `Box(i32)` sees
+    ///   `op: fn(T) -> T` as the concrete `fn(i32) -> i32` and the call is typed by
+    ///   its substituted return rather than falling through to `Unknown`.
     fn fn_ptr_field(&self, base: &Ty, fname: &str) -> Option<Ty> {
-        let Ty::Named(i) = base else { return None };
-        let TypeKindG::Struct { fields } = &self.table.types.get(*i)?.kind else { return None };
-        let (_, t) = fields.iter().find(|(n, _)| n == fname)?;
-        matches!(t, Ty::Fn { .. }).then(|| t.clone())
+        let t = match base {
+            Ty::Named(i) => {
+                let TypeKindG::Struct { fields } = &self.table.types.get(*i)?.kind else {
+                    return None;
+                };
+                fields.iter().find(|(n, _)| n == fname).map(|(_, t)| t.clone())?
+            }
+            Ty::GenStruct { ctor, args } => self.gen_struct_field_decl_ty(ctor, args, fname)?,
+            _ => return None,
+        };
+        matches!(t, Ty::Fn { .. }).then_some(t)
     }
 
     /// The declared type of field `fname` on the struct at table index `i` (the
@@ -2514,6 +2528,40 @@ mod tests {
             }
             other => panic!("expected fn(i32) -> i32, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fn_pointer_field_call_on_a_generic_struct_types_by_the_substituted_return() {
+        // The Main Objective: a fn-pointer-field call *method-style* on a
+        // **generic-struct receiver**. `b: Box(i32)` has `op: fn(T) -> T`, so
+        // `b.op(n)` must infer the *substituted* return `i32` — not `Unknown`
+        // from the generic fallthrough. The teeth: a distinct return type (`i64`)
+        // that can only be right if substitution under T = i64 actually ran.
+        let src = "fn Box(comptime T: type) -> type { return struct { op: fn(T) -> T } } \
+                   fn use_it(n: i64) -> i64 { let b = Box(i64){ op: |x| x + 1 } return b.op(n) }";
+        let (ast, info) = analyze_full(src);
+        let call = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| matches!(e.kind, ExprKind::Call { .. }).then_some(ExprId(i as u32)))
+            .expect("the `b.op(n)` call");
+        assert_eq!(
+            info.type_of(call),
+            &Ty::Prim("i64"),
+            "generic-vtable field call types by the substituted return, not Unknown"
+        );
+    }
+
+    #[test]
+    fn fn_pointer_field_call_on_a_generic_struct_is_not_mistaken_for_a_method() {
+        // Companion to the plain-struct diagnostic test: probing the generic
+        // receiver's fn-pointer field must stay diagnostic-free (no spurious "no
+        // field" / failed method-resolution error).
+        let src = "fn Box(comptime T: type) -> type { return struct { op: fn(T) -> T } } \
+                   fn use_it(n: i32) -> i32 { let b = Box(i32){ op: |x| x + 1 } return b.op(n) }";
+        let (_i, d) = analyze(src);
+        assert!(d.is_empty(), "a generic-struct fn-pointer field call should typecheck cleanly: {:?}", d);
     }
 
     // --- traits: resolve + coherence (Stage B) ---

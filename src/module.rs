@@ -469,6 +469,15 @@ mod tests {
     }
 
     #[test]
+    fn gen_vtable_example_compiles_clean() {
+        // A *generic* vtable: a fn-pointer field on a generic struct, called
+        // method-style on the generic-struct receiver (`b.op(n)`). Exercises the
+        // generic-struct arm of `fn_ptr_field` end-to-end — the call is fully
+        // typed under substitution and lowers to a clean indirect call.
+        pipeline_is_clean("examples/gen_vtable.jtr");
+    }
+
+    #[test]
     fn tests_demo_example_builds_a_clean_test_harness() {
         // The `@test`/`@bench` runner (workstream O): emit in test mode and check
         // the harness is generated without diagnostics.

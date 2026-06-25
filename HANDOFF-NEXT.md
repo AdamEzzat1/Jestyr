@@ -9,41 +9,56 @@
 
 ---
 
-## Main objective — extend `fn_ptr_field` to `Ty::GenStruct`
+## ✅ Done — `fn_ptr_field` extended to `Ty::GenStruct`
 
-**The one genuinely-remaining gap in fn-pointer field ergonomics, and the next
-thing to build.** Calling a fn-pointer field *method-style* on a **generic-struct
-receiver** — `gen.op(n)` where `gen: Box(i32)` and `op: fn(T) -> T` — already
-lowers to correct C (`j_gen.j_op(j_n)`) and runs, but the type checker routes it
-through the generic fallthrough, so the call expression's **result type infers as
-`Unknown`**. On a *plain* struct the same call is fully typed, because
-`typeck::fn_ptr_field` recognizes the fn-pointer field and `resolve`s the call by
-its return type.
+Calling a fn-pointer field *method-style* on a **generic-struct receiver** —
+`gen.op(n)` where `gen: Box(i32)` and `op: fn(T) -> T` — is now **fully typed**:
+the call's result infers under the struct's type-argument substitution instead of
+falling through to `Unknown`.
 
-**Objective:** teach `fn_ptr_field` (and the field-call disambiguation that uses
-it) about `Ty::GenStruct`, so `gen.op(n)` infers its return type under the
-struct's type-argument substitution — exactly as `gen_struct_field_decl_ty`
-already resolves a generic field's *declared* type for closure coercion.
+- **Change:** `typeck::fn_ptr_field` now matches `Ty::GenStruct { ctor, args }` in
+  addition to `Ty::Named`, resolving the field's declared type via
+  `gen_struct_field_decl_ty` (`find_fn_decl → ctor_struct_body →
+  comptime_tp_names → subst_ty`) and returning it when it is a `Ty::Fn`. Its sole
+  call site (the `ExprKind::Call` field-callee disambiguation) needed no edit —
+  it now sets the callee to the resolved `Ty::Fn`, which routes codegen through
+  the real `emit_fn_ptr_invoke` path.
+- **Bonus correctness:** the old generic *tail fallthrough* in `cgen::emit_call`
+  emitted `callee(args)` with no awareness of the field-pointer's per-param
+  conventions, so a `fn(mut T)` field passed its argument **by value** — an ABI
+  mismatch. Routing through `emit_fn_ptr_invoke` reads the `Ty::Fn`'s conv and
+  takes `&arg` for `mut`/`out`. (Test: `generic_vtable_field_call_takes_mut_arg_by_pointer`.)
+- **Tests (teeth-verified by mutation):** typeck unit
+  (`fn_pointer_field_call_on_a_generic_struct_*`), cgen
+  (`lowers_a_field_call_through_a_generic_vtable_pointer`, the `mut` ABI test),
+  a property + determinism prop over `arb_gen_vtable_program`, a
+  `fuzz_generic_vtable_pipeline` target, and an end-to-end gcc round-trip example
+  `examples/gen_vtable.jtr` (runs to `42/141`, covered by
+  `gen_vtable_example_compiles_clean`). Suite now **353 green**, warning-clean.
+- **Known adjacent gap (out of scope, not yet done):** a *bare* fn-pointer-field
+  **read** on a generic struct — `let f = gen.op` without calling — still types as
+  `Unknown` (`typeck::field_type` only resolves fields for `Ty::Named`, returning
+  `Unknown` for `Ty::GenStruct`). The Main Objective was specifically the
+  method-style *call*; generic-struct field *reads* are a broader generic
+  field-access limitation to tackle separately if `dyn` needs it.
 
-- **Where:** `src/typeck.rs` — `fn_ptr_field` is `Ty::Named`-only today; mirror the
-  generic resolution in `gen_struct_field_decl_ty` (`find_fn_decl` →
-  `ctor_struct_body` → `comptime_tp_names` → `subst_ty` with the receiver's type
-  args). The field-call site is the `ExprKind::Call` / `ExprKind::Field` callee
-  branch where `fn_ptr_field` is consulted ahead of method-call sugar.
-- **Codegen already works** (the call lowers correctly); this is a *typeck
-  completeness* fix, so the test that has teeth is the inferred-type assertion:
-  find the `gen.op(n)` `Call` expr and assert `info.type_of(call)` is the
-  substituted return, not `Unknown`. Add the property over `arb_*` generic-vtable
-  programs and a gcc round-trip if you wire one.
-
-**Why it matters — the arc this completes.** A fn-pointer field on a struct *is*
-a hand-written vtable. Making generic-struct vtable calls fully typed is the last
+**Why it mattered — the arc this completes.** A fn-pointer field on a struct *is*
+a hand-written vtable. Generic-struct vtable calls being fully typed was the last
 step before the compiler-synthesized version: **`dyn Trait`** erases the receiver
-type and dispatches through an emitted vtable struct that is byte-compatible with
-this hand-written one (traits **Stage F**). So this small typeck fix is the
-foundation `dyn` / auto-synthesized vtables build on — finish it first, then the
-`dyn` vtable reuses the same field-call machinery instead of inventing a parallel
-one.
+type and dispatches through an emitted vtable struct byte-compatible with this
+hand-written one (traits **Stage F**). The `dyn` vtable can now reuse this same
+field-call machinery instead of inventing a parallel one.
+
+---
+
+## Main objective — traits **Stage C** (static, monomorphized dispatch)
+
+With generic-vtable calls fully typed, the trait epic resumes at **Stage C**:
+consume the `impl_calls` recorded by Stage B's `resolve_impl_method`, emit and
+mangle the impl-method functions, and lower `recv.m(args)` to a **direct** call
+(monomorphized — no vtable yet). See the trait-stage ledger in
+`docs/TESTING.md §5.12` and the remaining-stages list below (D bounds, E operator
+traits, F `dyn` vtable — which builds on the machinery just finished).
 
 ---
 
@@ -90,7 +105,7 @@ C-linker `WinMain` error (`test` mode is exempt; it synthesizes its own `main`).
 
 ## Test posture
 
-Suite is **345 green**, warning-clean, clean across the `dharht-experiment` and
+Suite is **353 green**, warning-clean, clean across the `dharht-experiment` and
 `bench-alloc` feature builds. New coverage adapts to the *real* harness
 (`src/proptests.rs`: `mod prop` + `mod fuzz` + `arb_*_program` generators,
 `typeck_diags` for diagnostic differentials) — the handoff's referenced

@@ -1,0 +1,24 @@
+// A *generic* vtable: a generic struct whose field is a thin function pointer
+// over the struct's own type parameter. Calling that field method-style on the
+// generic-struct receiver (`b.op(n)`) is the Main-Objective case — it must be
+// fully typed (result inferred under the struct's type-argument substitution),
+// and lower to a correct indirect call.
+fn Box(comptime T: type) -> type {
+    return struct { op: fn(T) -> T }
+}
+
+fn inc(x: i32) -> i32 {
+    return x + 1
+}
+
+fn main() -> i32 {
+    // Field initialised from `&fn` …
+    let b = Box(i32){ op: &inc }
+    print_int(b.op(41)) // expect 42
+
+    // … and from a coercing non-capturing closure.
+    let c = Box(i32){ op: |x| x + 100 }
+    print_int(c.op(41)) // expect 141
+
+    return 0
+}

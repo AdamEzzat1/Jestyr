@@ -5988,6 +5988,32 @@ mod tests {
     }
 
     #[test]
+    fn lowers_a_field_call_through_a_generic_vtable_pointer() {
+        // The generic-struct counterpart of the test above: a fn-pointer field on
+        // a *generic* vtable (`Box(i32)`), called method-style. Now that typeck
+        // types the callee as `Ty::Fn`, codegen routes through the real fn-pointer
+        // invoke path (not the generic tail), so the indirect call is emitted.
+        let src = "fn Box(comptime T: type) -> type { return struct { op: fn(T) -> T } } \
+                   fn use_it(n: i32) -> i32 { let b = Box(i32){ op: |x| x + 1 } return b.op(n) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("j_b.j_op(j_n)"), "indirect call through the generic-struct field: {c}");
+    }
+
+    #[test]
+    fn generic_vtable_field_call_takes_mut_arg_by_pointer() {
+        // The strictly-more-correct payoff: a `mut` parameter declared in the
+        // field's *pointer type* must be passed by `&`, matching the callee's ABI.
+        // The old generic tail-fallthrough dropped the conv and passed by value;
+        // routing through `emit_fn_ptr_invoke` reads the `Ty::Fn`'s per-param conv.
+        let src = "fn Box(comptime T: type) -> type { return struct { op: fn(mut T) } } \
+                   fn use_it(n: i32) { let b = Box(i32){ op: |x| { } } b.op(n) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("j_b.j_op(&(j_n))"), "a `mut` field-pointer arg is passed by address: {c}");
+    }
+
+    #[test]
     fn lowers_a_non_capturing_closure_coerced_to_a_fn_pointer() {
         // A non-capturing closure used where a `fn(...)` is expected becomes a
         // *bare* top-level function, and the value is its address — no fat

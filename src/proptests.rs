@@ -64,6 +64,16 @@ fn typeck_diags(src: &str) -> Vec<String> {
     td.iter().map(|d| d.message.clone()).collect()
 }
 
+/// Like [`compile`] but stops after type-checking and hands back the AST plus the
+/// inferred-type table, so a property can locate an expression and assert its
+/// inferred type (the teeth for a typeck-completeness invariant).
+fn typeck_full(src: &str) -> (crate::ast::Ast, crate::types::TypeInfo) {
+    let (tokens, _) = Lexer::new(src).tokenize();
+    let (ast, _) = Parser::new(src, tokens).parse();
+    let (info, _td) = typeck::check(&ast);
+    (ast, info)
+}
+
 /// The token-kind sequence (Eof dropped) — the lexer's structural output, used by
 /// the whitespace-insensitivity metamorphic property.
 fn token_kinds(src: &str) -> Vec<TokenKind> {
@@ -224,6 +234,42 @@ mod prop {
             prop_assert_eq!(compile(&p), compile(&p));
         }
 
+        // ── generic vtables (fn-pointer field on a generic struct) ────────────
+
+        /// **The generic-vtable typing invariant** (the Main Objective): a
+        /// fn-pointer field called method-style on a *generic-struct* receiver
+        /// infers its result by the field's **substituted return type** — never
+        /// `Unknown` from the generic fallthrough. The oracle is the construction
+        /// type `t`, varied across primitives by the generator. Teeth: reverting
+        /// `fn_ptr_field`'s `Ty::GenStruct` arm to `None` makes `b.op(n)` infer
+        /// `Unknown`, and this fails for every `t`.
+        #[test]
+        fn generic_vtable_field_call_types_by_substituted_return(
+            (p, t) in arb_gen_vtable_program(),
+        ) {
+            let (ast, info) = typeck_full(&p);
+            let call = ast
+                .exprs
+                .iter()
+                .enumerate()
+                .find_map(|(i, e)| {
+                    matches!(e.kind, crate::ast::ExprKind::Call { .. })
+                        .then_some(crate::ast::ExprId(i as u32))
+                })
+                .expect("the b.op(n) call");
+            prop_assert_eq!(info.type_of(call), &crate::types::Ty::Prim(t), "program: {}", p);
+        }
+
+        /// Determinism still holds on generic-vtable programs — byte-identical C
+        /// and the same diagnostic count every run (the new generic field-call
+        /// path adds no iteration-order leak).
+        #[test]
+        fn generic_vtable_programs_compile_deterministically(
+            (p, _t) in arb_gen_vtable_program(),
+        ) {
+            prop_assert_eq!(compile(&p), compile(&p));
+        }
+
         // ── traits / interfaces, Stage A (parse + represent) ──────────────────
 
         /// A generated trait program — a trait (required + default methods), an
@@ -366,6 +412,21 @@ mod prop {
         })
     }
 
+    /// A small *valid* program with a **generic** vtable: a generic struct `xBox`
+    /// whose fn-pointer field `op: fn(T) -> T` ranges over the struct's own type
+    /// parameter, built at a concrete type `t` and called *method-style*
+    /// (`b.op(n)`). Paired with `t` — the oracle the call's result type must equal
+    /// under substitution. The identity closure `|x| x` coerces for every `t`.
+    fn arb_gen_vtable_program() -> impl Strategy<Value = (String, &'static str)> {
+        arb_prim_ty().prop_map(|t| {
+            let prog = format!(
+                "fn xBox(comptime T: type) -> type {{ return struct {{ op: fn(T) -> T }} }} \
+                 fn xuse(n: {t}) -> {t} {{ let b = xBox({t}){{ op: |x| x }} return b.op(n) }}"
+            );
+            (prog, t)
+        })
+    }
+
     /// A small but structurally-rich *valid-parsing* program: a struct, an enum, and
     /// a function whose body is an arbitrary arithmetic expression. Names are
     /// `x`-prefixed + index-suffixed, so they are unique and never collide with a
@@ -491,6 +552,23 @@ mod fuzz {
         bolero::check!().with_type::<String>().for_each(|s: &String| {
             let prog = format!(
                 "struct V {{ f: fn({s}) -> i32 }} fn use_v(g: fn({s})) -> i32 {{ return f(0) }}"
+            );
+            run_pipeline(&prog);
+            assert_eq!(compile(&prog), compile(&prog));
+        });
+    }
+
+    /// Coverage-guided fuzzing of the **generic-vtable field-call** path: the
+    /// fuzzer's bytes land in the generic struct's fn-pointer field type and in
+    /// the method-style call's argument slot, so the new `Ty::GenStruct` arm of
+    /// `fn_ptr_field` (and the substitution behind it) is hammered. The pipeline
+    /// must stay total *and* deterministic on whatever lands there.
+    #[test]
+    fn fuzz_generic_vtable_pipeline() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let prog = format!(
+                "fn xBox(comptime T: type) -> type {{ return struct {{ op: fn({s}) -> T }} }} \
+                 fn xuse(n: i32) -> i32 {{ let b = xBox(i32){{ op: |x| x }} return b.op({s}) }}"
             );
             run_pipeline(&prog);
             assert_eq!(compile(&prog), compile(&prog));
