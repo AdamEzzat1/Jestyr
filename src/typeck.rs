@@ -1170,10 +1170,18 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             ExprKind::GenStructLit { ctor, type_args, fields } => {
-                for fi in fields {
-                    self.infer(scope, typ, self_ty, fi.value);
-                }
+                // Evaluate the type arguments first, so each field value is inferred
+                // against its declared type *under the substitution* — letting a
+                // closure literal coerce in a generic vtable's fn-pointer field
+                // (`Container(i32){ op: |x| x + 1 }`).
                 let args: Vec<Ty> = type_args.iter().map(|a| self.eval_type_expr(typ, *a)).collect();
+                for fi in fields {
+                    let expected = self.gen_struct_field_decl_ty(&ctor.name, &args, &fi.name.name);
+                    let prev = self.cur_expected.take();
+                    self.cur_expected = expected;
+                    self.infer(scope, typ, self_ty, fi.value);
+                    self.cur_expected = prev;
+                }
                 Ty::GenStruct { ctor: ctor.name.clone(), args }
             }
             ExprKind::StructType(body) => {
@@ -1395,6 +1403,26 @@ impl<'a> TypeChecker<'a> {
     fn struct_field_decl_ty(&self, i: usize, fname: &str) -> Option<Ty> {
         let TypeKindG::Struct { fields } = &self.table.types.get(i)?.kind else { return None };
         fields.iter().find(|(n, _)| n == fname).map(|(_, t)| t.clone())
+    }
+
+    /// The declared type of field `fname` of generic struct `ctor` *under the
+    /// concrete type arguments* `args` — e.g. `Container(i32)`'s `op: fn(T)->T`
+    /// resolves to `fn(i32)->i32`. This is the expected type that lets a closure
+    /// literal coerce inside a generic-struct literal's fn-pointer field.
+    fn gen_struct_field_decl_ty(&self, ctor: &str, args: &[Ty], fname: &str) -> Option<Ty> {
+        let cf = self.find_fn_decl(ctor)?;
+        let body = self.ctor_struct_body(cf)?;
+        let tp_names = self.comptime_tp_names(cf);
+        let tp_set: HashSet<String> = tp_names.iter().cloned().collect();
+        let subst: HashMap<String, Ty> = tp_names.into_iter().zip(args.iter().cloned()).collect();
+        for m in &body.members {
+            if let StructMember::Field { name, ty, .. } = m {
+                if name.name == fname {
+                    return Some(subst_ty(&self.lower_type(&tp_set, *ty), &subst));
+                }
+            }
+        }
+        None
     }
 
     fn field_type(&mut self, span: Span, base: &Ty, fname: &str) -> Ty {
@@ -2195,6 +2223,11 @@ fn subst_ty(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
         Ty::Slice(elem) => Ty::Slice(Box::new(subst_ty(elem, subst))),
         Ty::GenRef(elem) => Ty::GenRef(Box::new(subst_ty(elem, subst))),
         Ty::RegionRef(elem) => Ty::RegionRef(Box::new(subst_ty(elem, subst))),
+        Ty::Fn { params, ret, ret_conv } => Ty::Fn {
+            params: params.iter().map(|(c, t)| (*c, Box::new(subst_ty(t, subst)))).collect(),
+            ret: Box::new(subst_ty(ret, subst)),
+            ret_conv: *ret_conv,
+        },
         _ => ty.clone(),
     }
 }
@@ -2324,6 +2357,29 @@ mod tests {
             "a closure in a fn-pointer field should coerce, got {:?}",
             info.type_of(clo)
         );
+    }
+
+    #[test]
+    fn a_closure_in_a_generic_struct_field_coerces_under_substitution() {
+        // `Box(i32)`'s field `op: fn(T) -> T` resolves to `fn(i32) -> i32` under
+        // T = i32, so the closure coerces to that concrete pointer type.
+        let src = "fn Box(comptime T: type) -> type { return struct { op: fn(T) -> T } } \
+                   fn f() { let b = Box(i32){ op: |x| x + 1 } }";
+        let (ast, info) = analyze_full(src);
+        let clo = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| matches!(e.kind, ExprKind::Closure { .. }).then_some(ExprId(i as u32)))
+            .expect("the closure");
+        match info.type_of(clo) {
+            Ty::Fn { params, ret, .. } => {
+                assert_eq!(params.len(), 1);
+                assert_eq!(&*params[0].1, &Ty::Prim("i32"), "parameter substituted to i32");
+                assert_eq!(&**ret, &Ty::Prim("i32"), "return substituted to i32");
+            }
+            other => panic!("expected fn(i32) -> i32, got {other:?}"),
+        }
     }
 
     #[test]

@@ -151,12 +151,14 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool) -> (String, Vec<Dia
     g.spawn_sites = g.collect_spawns();
     g.slice_instances = g.collect_slices();
     g.genref_instances = g.collect_genrefs();
-    g.fn_type_instances = g.collect_fn_types();
     let (instances, method_instances) = g.collect_all_instances();
     g.instances = instances;
     g.method_instances = method_instances;
     g.struct_instances = g.collect_struct_instances();
     g.enum_instances = g.collect_enum_instances();
+    // After struct instances: a monomorphized generic-struct's fn-pointer fields
+    // contribute concrete `JestyrFn_…` typedefs, so this must run last.
+    g.fn_type_instances = g.collect_fn_types();
     let (closures, closure_index) = g.collect_closures();
     g.closures = closures;
     g.closure_index = closure_index;
@@ -5232,11 +5234,34 @@ impl<'a> Cgen<'a> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut out = Vec::new();
         let empty = HashMap::new();
+        // Every fn-type written textually (struct field, signature, `let`, …).
+        // Generic placeholders (`fn(T) -> T`, where `T` stays opaque) are skipped —
+        // their *concrete* instances come from the generic-struct walk below.
         for (i, td) in self.ast.types.iter().enumerate() {
             if let TypeKind::Fn { .. } = &td.kind {
                 let ty = self.ast_type_to_ty(TypeId(i as u32), &empty);
-                if seen.insert(self.ty_mangle(&ty)) {
+                if Self::is_concrete(&ty) && seen.insert(self.ty_mangle(&ty)) {
                     out.push(ty);
+                }
+            }
+        }
+        // A monomorphized generic struct contributes the *concrete* fn-pointer type
+        // of each fn-pointer field under its substitution — e.g. `Container(i32)`'s
+        // `op: fn(T) -> T` yields `fn(i32) -> i32`. Without this a generic vtable's
+        // field would reference an un-emitted typedef.
+        for (ctor, args) in &self.struct_instances {
+            let Some(f) = self.find_fn(ctor) else { continue };
+            let Some(body) = self.ctor_struct_body(f) else { continue };
+            let names = self.type_param_names(f);
+            let subst: HashMap<String, Ty> = names.into_iter().zip(args.iter().cloned()).collect();
+            for m in &body.members {
+                if let StructMember::Field { ty, .. } = m {
+                    if matches!(self.ast.type_at(*ty).kind, TypeKind::Fn { .. }) {
+                        let fty = self.ast_type_to_ty(*ty, &subst);
+                        if Self::is_concrete(&fty) && seen.insert(self.ty_mangle(&fty)) {
+                            out.push(fty);
+                        }
+                    }
                 }
             }
         }
@@ -5987,6 +6012,25 @@ mod tests {
             "the struct field is initialized with the function's address: {c}"
         );
         assert!(!c.contains("JestyrClosure_"), "no fat-closure struct: {c}");
+    }
+
+    #[test]
+    fn lowers_a_generic_vtable_field_under_substitution() {
+        // A generic struct whose field's fn-pointer type uses the type parameter:
+        // the monomorphized instance must emit the *substituted* concrete typedef
+        // (and no opaque `…_dT_ret_T` placeholder), and the field closure coerces.
+        let src = "fn Box(comptime T: type) -> type { return struct { op: fn(T) -> T } } \
+                   fn run(comptime T: type, read b: Box(T), x: T) -> T { return b.op(x) } \
+                   fn main() -> i32 { let b = Box(i32){ op: |x| x + 1 } return run(i32, b, 41) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(
+            c.contains("typedef int32_t (*JestyrFn_fn_di32_ret_i32)(int32_t);"),
+            "concrete typedef under substitution: {c}"
+        );
+        assert!(c.contains("JestyrFn_fn_di32_ret_i32 j_op;"), "the monomorphized field uses it: {c}");
+        assert!(c.contains("static int32_t jestyr_lam_"), "the field closure becomes a bare function: {c}");
+        assert!(!c.contains("JestyrFn_fn_dT_ret_T"), "no opaque placeholder typedef: {c}");
     }
 
     #[test]
