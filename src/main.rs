@@ -439,12 +439,30 @@ fn main() -> ExitCode {
                     if !cgen_diags.is_empty() {
                         return report_program(&prog.modules, &cgen_diags);
                     }
+                    // `run`/`build` need an entry point. Without a `main` the emitted
+                    // C has no `main`, so the C linker fails obscurely (`undefined
+                    // reference to WinMain`/`_start`). Catch it here with a clear
+                    // message — a library file is type-checked with `check`, not run.
+                    // (`test` mode is exempt: it synthesizes its own harness `main`.)
+                    if matches!(mode, Mode::Build | Mode::Run) && !program_has_main(&prog.ast) {
+                        eprintln!("error: no `main` function — `run`/`build` need an entry point");
+                        eprintln!(
+                            "note: `{path}` looks like a library; type-check it with `jestyrc check {path}` instead"
+                        );
+                        return ExitCode::FAILURE;
+                    }
                     // `run` and `test` both execute the built binary.
                     build_and_maybe_run(&path, &c_src, matches!(mode, Mode::Run | Mode::Test))
                 }
             }
         }
     }
+}
+
+/// Does the program declare a top-level `fn main`? `run`/`build` need one for an
+/// entry point; a library file (no `main`) is a `check`-only artifact.
+fn program_has_main(ast: &ast::Ast) -> bool {
+    ast.items.iter().any(|it| matches!(it, ast::Item::Fn(f) if f.name.name == "main"))
 }
 
 /// Report diagnostics that may originate from any module, rendering each against

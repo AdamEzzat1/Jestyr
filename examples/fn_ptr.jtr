@@ -13,14 +13,17 @@
 //   3. Calling *through* a pointer          — `f(x)` and `a.alloc_fn(n)`, both
 //      indirect calls disambiguated from a named call purely by the value's type.
 //
-// Obtain a pointer with `&fn` (the address of a top-level function). Conventions
-// live *in* the type: `fn(read i32)` and `fn(mut i32)` are different types.
+// Obtain a pointer two ways: `&fn` (the address of a top-level function), or a
+// *non-capturing closure*, which coerces to the matching `fn(...)` type. (A
+// closure that captures its environment stays a fat closure and cannot coerce.)
+// Conventions live *in* the type: `fn(read i32)` and `fn(mut i32)` differ.
 //
 // Run:  jestyrc run examples/fn_ptr.jtr
 //       →  42        (apply(&dbl, 21))
 //          42        (apply(&inc, 41))
 //          7         (allocator label, called through a struct field)
 //          8         (op(7), a direct indirect-call)
+//          42        (apply(|n| n - 1, 43) — a closure coerced to fn(i32)->i32)
 
 fn dbl(x: i32) -> i32 { return x + x }
 fn inc(x: i32) -> i32 { return x + 1 }
@@ -61,5 +64,8 @@ fn main() -> i32 {
 
     // 3. A direct indirect-call on the pointer value itself.
     print_int(op(7))                    // 8
+
+    // 4. A non-capturing closure coerces to the same thin pointer type — no `&`.
+    print_int(apply(|n| n - 1, 43))     // 42
     return 0
 }

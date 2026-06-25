@@ -1209,17 +1209,39 @@ impl<'a> TypeChecker<'a> {
                 result
             }
             ExprKind::Closure { params, body } => {
-                // We don't model function types yet; check the body in a fresh
-                // scope with the parameters bound, and give the closure an opaque
-                // type. (The escape checker handles capture separately.)
+                // Check the body in a fresh scope with the parameters bound. If a
+                // *function-pointer* type is expected here (a `let`/argument/return
+                // annotated `fn(...) -> R`), this is a **closure → fn-pointer
+                // coercion**: propagate the expected parameter types onto the
+                // closure's (possibly unannotated) parameters, infer the body
+                // against the expected return, and give the closure that `Ty::Fn`.
+                // Otherwise it stays an opaque fat closure. (Whether the coercion
+                // is *legal* — i.e. the closure captures nothing — is enforced by
+                // codegen, which is where capture analysis lives.)
+                let exp_fn = match self.cur_expected.clone() {
+                    Some(Ty::Fn { params, ret, ret_conv }) => Some((params, ret, ret_conv)),
+                    _ => None,
+                };
                 scope.push(HashMap::new());
-                for p in params {
-                    let pty = p.ty.map(|t| self.lower_type(typ, t)).unwrap_or(Ty::Unknown);
+                for (i, p) in params.iter().enumerate() {
+                    let pty = if let Some(t) = p.ty {
+                        self.lower_type(typ, t)
+                    } else if let Some((ep, _, _)) = &exp_fn {
+                        ep.get(i).map(|(_, t)| (**t).clone()).unwrap_or(Ty::Unknown)
+                    } else {
+                        Ty::Unknown
+                    };
                     scope.last_mut().unwrap().insert(p.name.name.clone(), pty);
                 }
+                let prev = self.cur_expected.take();
+                self.cur_expected = exp_fn.as_ref().map(|(_, r, _)| (**r).clone());
                 self.infer(scope, typ, self_ty, *body);
+                self.cur_expected = prev;
                 scope.pop();
-                Ty::Opaque("closure".to_string())
+                match exp_fn {
+                    Some((ep, r, rc)) => Ty::Fn { params: ep, ret: r, ret_conv: rc },
+                    None => Ty::Opaque("closure".to_string()),
+                }
             }
             ExprKind::Concurrent(b) => {
                 self.infer_block(scope, typ, self_ty, b);
@@ -2238,6 +2260,38 @@ mod tests {
             .find_map(|(i, e)| matches!(e.kind, ExprKind::Call { .. }).then_some(ExprId(i as u32)))
             .expect("the `a.op(n)` call");
         assert_eq!(info.type_of(call), &Ty::Prim("i64"));
+    }
+
+    #[test]
+    fn a_non_capturing_closure_coerces_to_a_fn_pointer_type() {
+        // With a `fn(i32) -> i32` expected, an unannotated closure picks up the
+        // parameter type and is itself typed as that function pointer.
+        let (ast, info) = analyze_full("fn f() { let op: fn(i32) -> i32 = |x| x + 1 }");
+        let clo = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| matches!(e.kind, ExprKind::Closure { .. }).then_some(ExprId(i as u32)))
+            .expect("the closure");
+        assert!(
+            matches!(info.type_of(clo), Ty::Fn { .. }),
+            "closure should coerce to a fn-pointer type, got {:?}",
+            info.type_of(clo)
+        );
+    }
+
+    #[test]
+    fn a_closure_without_an_expected_fn_pointer_stays_opaque() {
+        // No coercion pressure ⇒ the closure keeps its fat opaque type (no
+        // accidental change to existing closure behaviour).
+        let (ast, info) = analyze_full("fn f() { let c = |x| x + 1 }");
+        let clo = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| matches!(e.kind, ExprKind::Closure { .. }).then_some(ExprId(i as u32)))
+            .expect("the closure");
+        assert!(matches!(info.type_of(clo), Ty::Opaque(s) if s == "closure"));
     }
 
     #[test]

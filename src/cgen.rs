@@ -3891,6 +3891,11 @@ impl<'a> Cgen<'a> {
     /// each lifted closure.
     fn closure_types(&mut self) {
         for ci in self.closures.clone() {
+            // A closure coerced to a thin fn-pointer needs no environment struct
+            // and no `{call, env}` closure struct — it is just a bare function.
+            if self.closure_is_fn_ptr(&ci) {
+                continue;
+            }
             let n = ci.id.0;
             self.raw("typedef struct { ");
             if ci.captures.is_empty() {
@@ -3930,6 +3935,20 @@ impl<'a> Cgen<'a> {
     fn closure_fns(&mut self) {
         for ci in self.closures.clone() {
             let n = ci.id.0;
+            // A coerced (thin) closure becomes a *bare* function — no env param —
+            // whose C signature matches the fn-pointer typedef exactly.
+            if self.closure_is_fn_ptr(&ci) {
+                if ci.captures.is_empty() {
+                    self.emit_thin_closure_fn(&ci);
+                } else {
+                    self.diag(
+                        self.ast.expr_at(ci.id).span,
+                        "a closure that captures its environment cannot coerce to a thin \
+                         function pointer (only a non-capturing closure can)",
+                    );
+                }
+                continue;
+            }
             let ret = self.c_type(&ci.ret);
             let mut params = format!("JestyrEnv_{n}* j__env");
             for (pname, pty) in &ci.params {
@@ -3950,6 +3969,45 @@ impl<'a> Cgen<'a> {
             self.raw("\n");
             self.capture_set.clear();
         }
+    }
+
+    /// Emit a coerced non-capturing closure as a bare top-level function whose C
+    /// signature is taken from the *expected* fn-pointer type (so it matches the
+    /// `JestyrFn_…` typedef byte-for-byte). A `mut`/`out` parameter arrives by
+    /// pointer, exactly as a real Jestyr function's would.
+    fn emit_thin_closure_fn(&mut self, ci: &ClosureInfo) {
+        let n = ci.id.0;
+        let Ty::Fn { params, ret, .. } = self.info.type_of(ci.id).clone() else { return };
+        let ret_c = self.c_type(&ret);
+        let mut sig = String::new();
+        let mut ptrs: HashSet<String> = HashSet::new();
+        for (i, (conv, pty)) in params.iter().enumerate() {
+            let base = self.c_type(pty);
+            let pname = ci
+                .params
+                .get(i)
+                .map(|(nm, _)| nm.clone())
+                .unwrap_or_else(|| format!("_p{i}"));
+            let cty = if matches!(conv, Conv::Mut | Conv::Out) {
+                ptrs.insert(pname.clone());
+                format!("{base}*")
+            } else {
+                base
+            };
+            let _ = write!(sig, "{}{} j_{}", if i > 0 { ", " } else { "" }, cty, pname);
+        }
+        if params.is_empty() {
+            sig = "void".to_string();
+        }
+        self.subst.clear();
+        self.ptr_params = ptrs;
+        self.cur_result.clear();
+        self.cur_ensures.clear();
+        self.capture_set.clear();
+        self.raw(format!("static {ret_c} jestyr_lam_{n}({sig})\n"));
+        self.emit_closure_body(ci.body, ret_c != "void");
+        self.raw("\n");
+        self.ptr_params.clear();
     }
 
     fn emit_closure_body(&mut self, body: ExprId, returns_value: bool) {
@@ -3985,6 +4043,18 @@ impl<'a> Cgen<'a> {
         };
         let ci = self.closures[idx].clone();
         let n = ci.id.0;
+        // Coerced to a thin fn-pointer: the value *is* the function's address.
+        if self.closure_is_fn_ptr(&ci) {
+            if !ci.captures.is_empty() {
+                self.diag(
+                    self.ast.expr_at(cid).span,
+                    "a closure that captures its environment cannot coerce to a thin \
+                     function pointer (only a non-capturing closure can)",
+                );
+                return "0".to_string();
+            }
+            return format!("(&jestyr_lam_{n})");
+        }
         if ci.captures.is_empty() {
             return format!("(JestyrClosure_{n}){{ .call = jestyr_lam_{n}, .env = {{0}} }}");
         }
@@ -4029,6 +4099,14 @@ impl<'a> Cgen<'a> {
     /// Is `id` a value of closure type (so a call on it is an invocation)?
     fn is_closure_typed(&self, id: ExprId) -> bool {
         matches!(self.info.type_of(id), Ty::Opaque(s) if s == "closure")
+    }
+
+    /// Was this closure **coerced to a thin function pointer**? The type checker
+    /// stamps a closure used where a `fn(...) -> R` is expected with that `Ty::Fn`
+    /// (instead of the opaque fat-closure type). Such a closure lowers to a bare
+    /// top-level function and `&`-of-it — not the `{call, env}` closure struct.
+    fn closure_is_fn_ptr(&self, ci: &ClosureInfo) -> bool {
+        matches!(self.info.type_of(ci.id), Ty::Fn { .. })
     }
 
     /// Emit an indirect call through a thin function-pointer value. The callee
@@ -5877,6 +5955,34 @@ mod tests {
         let (c, d) = gen(src);
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("j_a.j_op(j_n)"), "indirect call through the struct field: {c}");
+    }
+
+    #[test]
+    fn lowers_a_non_capturing_closure_coerced_to_a_fn_pointer() {
+        // A non-capturing closure used where a `fn(...)` is expected becomes a
+        // *bare* top-level function, and the value is its address — no fat
+        // `{call, env}` closure struct.
+        let src = "fn apply(f: fn(i32) -> i32, x: i32) -> i32 { return f(x) } \
+                   fn main() -> i32 { return apply(|x| x + 1, 41) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("static int32_t jestyr_lam_"), "a bare thin function: {c}");
+        assert!(c.contains("(&jestyr_lam_"), "the value is the function's address: {c}");
+        assert!(!c.contains("JestyrClosure_"), "no fat-closure struct for a coerced closure: {c}");
+    }
+
+    #[test]
+    fn rejects_a_capturing_closure_coerced_to_a_fn_pointer() {
+        // A closure that captures its environment is not a thin pointer — coercing
+        // it must be a clear error, not silently-wrong C.
+        let src = "fn main() -> i32 { let k = 10 \
+                   let bad: fn(i32) -> i32 = |x| x + k return bad(1) }";
+        let (_c, d) = gen(src);
+        assert!(
+            d.iter().any(|m| m.message.contains("cannot coerce to a thin function pointer")),
+            "expected a capture-coercion error, got {:?}",
+            d
+        );
     }
 
     #[test]
