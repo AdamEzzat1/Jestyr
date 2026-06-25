@@ -1,0 +1,65 @@
+// examples/fn_ptr.jtr — thin function-pointer types (backlog item: fn-ptr types).
+//
+// A function pointer is a *thin*, capture-free, first-class value: one machine
+// word that names a function to jump to. It is written `fn(T1, T2) -> R`, and —
+// unlike Jestyr's fat capturing closures — it stores no environment, so it can
+// be put in a struct, passed by value, returned, and reassigned at zero cost.
+//
+// Three things this demonstrates:
+//   1. A function pointer in a *signature*  — `apply(f: fn(i32) -> i32, …)`.
+//   2. A hand-written *vtable*              — `Allocator`, a struct of fn-ptrs.
+//      This is the allocator-interface shape that must exist *before* a trait
+//      system does; you bootstrap dynamic dispatch on fn-pointers, not traits.
+//   3. Calling *through* a pointer          — `f(x)` and `a.alloc_fn(n)`, both
+//      indirect calls disambiguated from a named call purely by the value's type.
+//
+// Obtain a pointer with `&fn` (the address of a top-level function). Conventions
+// live *in* the type: `fn(read i32)` and `fn(mut i32)` are different types.
+//
+// Run:  jestyrc run examples/fn_ptr.jtr
+//       →  42        (apply(&dbl, 21))
+//          42        (apply(&inc, 41))
+//          7         (allocator label, called through a struct field)
+//          8         (op(7), a direct indirect-call)
+
+fn dbl(x: i32) -> i32 { return x + x }
+fn inc(x: i32) -> i32 { return x + 1 }
+
+// A function pointer in a parameter position: `apply` is generic over *behavior*
+// without any trait — it just takes the function to run.
+fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+    return f(x)            // indirect call through the parameter
+}
+
+// A hand-written vtable: a struct whose fields are thin function pointers. This
+// is exactly the manual-interface pattern (cf. Zig's `std.mem.Allocator`).
+struct Allocator {
+    alloc_fn: fn(i32) -> *mut u8,
+    label_fn: fn() -> i32,
+}
+
+fn bump_alloc(n: i32) -> *mut u8 { return alloc_i32(n) as *mut u8 }
+fn which() -> i32 { return 7 }
+
+fn use_allocator(read a: Allocator, n: i32) -> i32 {
+    let p = a.alloc_fn(n)  // indirect call through a *struct field* (the vtable)
+    free_ptr(p)
+    return a.label_fn()    // a second field call, no arguments
+}
+
+fn main() -> i32 {
+    // 1. Function pointer through a signature, obtained with `&`.
+    var op: fn(i32) -> i32 = &dbl
+    print_int(apply(op, 21))            // 42
+
+    op = &inc                           // reassign — a fn-pointer is a plain value
+    print_int(apply(op, 41))            // 42
+
+    // 2. Build and use a vtable.
+    let a = Allocator{ alloc_fn: &bump_alloc, label_fn: &which }
+    print_int(use_allocator(a, 16))     // 7
+
+    // 3. A direct indirect-call on the pointer value itself.
+    print_int(op(7))                    // 8
+    return 0
+}

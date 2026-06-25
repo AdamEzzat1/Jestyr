@@ -370,6 +370,31 @@ impl<'a> Printer<'a> {
                 let a: Vec<String> = args.iter().map(|t| self.type_str(*t)).collect();
                 format!("{}({})", ctor.name, a.join(", "))
             }
+            TypeKind::Fn { params, ret_conv, ret } => {
+                let ps: Vec<String> = params
+                    .iter()
+                    .map(|p| {
+                        let c = if p.conv != Conv::Default {
+                            format!("{} ", p.conv.label())
+                        } else {
+                            String::new()
+                        };
+                        format!("{}{}", c, self.type_str(p.ty))
+                    })
+                    .collect();
+                let tail = match ret {
+                    Some(t) => {
+                        let c = if *ret_conv != Conv::Default {
+                            format!("{} ", ret_conv.label())
+                        } else {
+                            String::new()
+                        };
+                        format!(" -> {}{}", c, self.type_str(*t))
+                    }
+                    None => String::new(),
+                };
+                format!("fn({}){}", ps.join(", "), tail)
+            }
             TypeKind::Error => "<error-type>".to_string(),
         }
     }
@@ -449,5 +474,32 @@ fn assign_label(op: AssignOp) -> &'static str {
         AssignOp::BitAnd => "&=",
         AssignOp::BitOr => "|=",
         AssignOp::BitXor => "^=",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::print_ast;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+
+    fn printed(src: &str) -> String {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, diags) = Parser::new(src, tokens).parse();
+        assert!(diags.is_empty(), "parse: {:?}", diags);
+        print_ast(&ast)
+    }
+
+    #[test]
+    fn renders_a_fn_pointer_type_with_conventions() {
+        let out = printed("fn f(g: fn(read i32, take i32) -> i32) { }");
+        assert!(out.contains("fn(read i32, take i32) -> i32"), "{out}");
+    }
+
+    #[test]
+    fn renders_a_unit_returning_fn_pointer_without_an_arrow() {
+        let out = printed("fn f(free_fn: fn(*mut u8)) { }");
+        assert!(out.contains("fn(*mut u8)"), "{out}");
+        assert!(!out.contains("fn(*mut u8) ->"), "no arrow for a unit-returning pointer: {out}");
     }
 }

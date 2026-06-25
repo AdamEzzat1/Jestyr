@@ -184,6 +184,69 @@ mod prop {
             let b = crate::printer::print_ast(&ast);
             prop_assert_eq!(a, b);
         }
+
+        // ── function-pointer types (TESTING.md §5, per-feature property layer) ──
+
+        /// A generated program that *names* function-pointer types — in a vtable
+        /// struct and in a signature, over varied parameter conventions, with and
+        /// without a return — always parses with no diagnostics.
+        #[test]
+        fn fn_pointer_programs_parse_clean(p in arb_fn_type_program()) {
+            let (tokens, lex_diags) = Lexer::new(&p).tokenize();
+            prop_assert!(lex_diags.is_empty(), "lex errors on {}", p);
+            let (_ast, parse_diags) = Parser::new(&p, tokens).parse();
+            prop_assert!(parse_diags.is_empty(), "parse errors on {}: {:?}", p, parse_diags);
+        }
+
+        /// Every such program lowers to C that contains a `JestyrFn_` typedef —
+        /// the lowering actually fires (the type isn't silently dropped) for every
+        /// shape the generator produces.
+        #[test]
+        fn fn_pointer_programs_emit_a_typedef(p in arb_fn_type_program()) {
+            let (c, _) = compile(&p);
+            prop_assert!(c.contains("JestyrFn_"), "no fn-ptr typedef for {}:\n{}", p, c);
+        }
+
+        /// Determinism still holds on fn-pointer-bearing programs: byte-identical C
+        /// and the same diagnostic count every run (no ordering leak via the new
+        /// `fn_type_instances` collection).
+        #[test]
+        fn fn_pointer_programs_compile_deterministically(p in arb_fn_type_program()) {
+            prop_assert_eq!(compile(&p), compile(&p));
+        }
+    }
+
+    /// A base type to appear inside a generated function-pointer signature —
+    /// primitives plus a thin pointer (so the niche/pointer path is exercised).
+    fn arb_base_ty() -> impl Strategy<Value = &'static str> {
+        prop_oneof![
+            Just("i32"), Just("i64"), Just("u8"), Just("usize"), Just("bool"), Just("*mut u8"),
+        ]
+    }
+
+    /// A single function-pointer *type* string, e.g. `fn(read i32, *mut u8) -> u8`
+    /// or `fn(mut i64)` (no return). Conventions vary across `read`/`take`/`mut`
+    /// and the bare default — the convention-in-the-type surface.
+    fn arb_fn_sig() -> impl Strategy<Value = String> {
+        let conv = prop_oneof![Just(""), Just("read "), Just("take "), Just("mut ")];
+        let param = (conv, arb_base_ty()).prop_map(|(c, t)| format!("{c}{t}"));
+        let params = proptest::collection::vec(param, 0..4).prop_map(|ps| ps.join(", "));
+        let ret = prop_oneof![
+            arb_base_ty().prop_map(|t| format!(" -> {t}")),
+            Just(String::new()),
+        ];
+        (params, ret).prop_map(|(p, r)| format!("fn({p}){r}"))
+    }
+
+    /// A small *valid* program that names function-pointer types in the two
+    /// canonical positions — a vtable struct field and a function parameter — with
+    /// a trivial body so it also type-checks and lowers cleanly.
+    fn arb_fn_type_program() -> impl Strategy<Value = String> {
+        (arb_fn_sig(), arb_fn_sig(), arb_fn_sig()).prop_map(|(a, b, c)| {
+            format!(
+                "struct V {{ f0: {a}, f1: {b} }} fn use_v(g: {c}) -> i32 {{ return 0 }}"
+            )
+        })
     }
 
     /// A small but structurally-rich *valid-parsing* program: a struct, an enum, and
@@ -298,6 +361,22 @@ mod fuzz {
             let s = String::from_utf8_lossy(bytes);
             let _ = crate::doc::generate(&s, "t", false);
             let _ = crate::doc::generate(&s, "t", true);
+        });
+    }
+
+    /// Coverage-guided fuzzing of the **function-pointer** parse/typeck/cgen
+    /// paths: the fuzzer's bytes are dropped into a fn-pointer type slot (and a
+    /// call slot), so `parse_type`'s `Fn` arm, its recovery guard, and the
+    /// typedef lowering are all hammered. The pipeline must stay total *and*
+    /// deterministic on whatever soup lands inside the parentheses.
+    #[test]
+    fn fuzz_fn_pointer_pipeline() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let prog = format!(
+                "struct V {{ f: fn({s}) -> i32 }} fn use_v(g: fn({s})) -> i32 {{ return f(0) }}"
+            );
+            run_pipeline(&prog);
+            assert_eq!(compile(&prog), compile(&prog));
         });
     }
 

@@ -119,6 +119,7 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool) -> (String, Vec<Dia
         spawn_sites: Vec::new(),
         slice_instances: Vec::new(),
         genref_instances: Vec::new(),
+        fn_type_instances: Vec::new(),
         cur_refines: HashMap::new(),
         scratch_reset: None,
         cont_label: None,
@@ -150,6 +151,7 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool) -> (String, Vec<Dia
     g.spawn_sites = g.collect_spawns();
     g.slice_instances = g.collect_slices();
     g.genref_instances = g.collect_genrefs();
+    g.fn_type_instances = g.collect_fn_types();
     let (instances, method_instances) = g.collect_all_instances();
     g.instances = instances;
     g.method_instances = method_instances;
@@ -160,6 +162,11 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool) -> (String, Vec<Dia
     g.closure_index = closure_index;
     g.prelude();
     g.forward_types();
+    // Function-pointer typedefs come right after the forward struct/enum
+    // typedefs (so a `JestyrFn_…` over a struct sees its forward name) and
+    // *before* `struct_defs`, so a struct may hold a fn-pointer field — the
+    // hand-written-vtable shape (e.g. an allocator interface).
+    g.fn_type_typedefs();
     g.struct_defs();
     g.enum_defs();
     g.gen_struct_defs();
@@ -312,6 +319,9 @@ struct Cgen<'a> {
     slice_instances: Vec<Ty>,
     /// distinct generational-reference element types (one `JestyrRef_<T>` each).
     genref_instances: Vec<Ty>,
+    /// distinct function-pointer signatures, for emitting one `JestyrFn_<sig>`
+    /// typedef each (so a fn-pointer is a plain named type everywhere it appears).
+    fn_type_instances: Vec<Ty>,
     /// the current function's refined parameters: name → its `in <range>` expr.
     /// Used to *elide* a slice bounds check when the index is provably in range.
     cur_refines: HashMap<String, ExprId>,
@@ -692,6 +702,17 @@ impl<'a> Cgen<'a> {
             TypeKind::RegionRef { inner, .. } => {
                 Ty::RegionRef(Box::new(self.ast_type_to_ty(*inner, subst)))
             }
+            TypeKind::Fn { params, ret_conv, ret } => {
+                let ps: Vec<(Conv, Box<Ty>)> = params
+                    .iter()
+                    .map(|p| (p.conv, Box::new(self.ast_type_to_ty(p.ty, subst))))
+                    .collect();
+                let r = match ret {
+                    Some(t) => self.ast_type_to_ty(*t, subst),
+                    None => Ty::Unit,
+                };
+                Ty::Fn { params: ps, ret: Box::new(r), ret_conv: *ret_conv }
+            }
             TypeKind::TypeKw => Ty::TypeKw,
             TypeKind::Error => Ty::Error,
         }
@@ -945,6 +966,9 @@ impl<'a> Cgen<'a> {
             Ty::GenStruct { args, .. } | Ty::GenEnum { args, .. } => {
                 args.iter().all(Self::is_concrete)
             }
+            Ty::Fn { params, ret, .. } => {
+                params.iter().all(|(_, t)| Self::is_concrete(t)) && Self::is_concrete(ret)
+            }
             _ => true,
         }
     }
@@ -996,6 +1020,12 @@ impl<'a> Cgen<'a> {
             | Ty::GenRef(inner)
             | Ty::RegionRef(inner)
             | Ty::Result(inner) => self.collect_gen_enum(inner, seen, order),
+            Ty::Fn { params, ret, .. } => {
+                for (_, t) in params {
+                    self.collect_gen_enum(t, seen, order);
+                }
+                self.collect_gen_enum(ret, seen, order);
+            }
             _ => {}
         }
     }
@@ -2765,6 +2795,21 @@ impl<'a> Cgen<'a> {
                 "0".to_string()
             }
             ExprKind::Unary { op, rhs } => {
+                // `&<fn>` — taking the address of a *top-level function* yields a
+                // thin function-pointer value (the function's mangled C symbol,
+                // or the bare name for an `extern "c"` callee). This is the
+                // explicit way to obtain a fn-pointer; a function name is not a
+                // `j_`-prefixed local, so the generic `&j_name` path is wrong here.
+                if matches!(op, UnOp::Ref) {
+                    if let ExprKind::Name(n) = &self.ast.expr_at(*rhs).kind {
+                        if self.extern_fns.contains(&n.name) {
+                            return format!("(&{})", n.name);
+                        }
+                        if self.info.table.fns.contains_key(&n.name) {
+                            return format!("(&{})", self.c_fn_name(&n.name));
+                        }
+                    }
+                }
                 let r = self.emit_expr(*rhs);
                 format!("({}{r})", unop_c(*op))
             }
@@ -3042,6 +3087,15 @@ impl<'a> Cgen<'a> {
         // Invoking a closure value (a local bound to one, or an inline closure).
         if self.is_closure_typed(callee) {
             return self.emit_closure_invoke(callee, args);
+        }
+        // Invoking a *thin function-pointer* value — a local/parameter/field whose
+        // type is `fn(...) -> R`. We tell this from a direct call to a named
+        // function purely by the callee's **type** (the "disambiguate by field
+        // type" rule: `a.alloc_fn(x)` is a pointer call because the field's type
+        // says so — no `(a.f)()` ceremony). An indirect call needs no `jestyr_`
+        // name mangling: the value already *is* the address to jump to.
+        if matches!(self.info.type_of(callee), Ty::Fn { .. }) {
+            return self.emit_fn_ptr_invoke(callee, args);
         }
         // `@address(0x…)` — a pointer at a fixed address (MMIO; design §16).
         if let ExprKind::Attr(n) = &ast.expr_at(callee).kind {
@@ -3975,6 +4029,29 @@ impl<'a> Cgen<'a> {
     /// Is `id` a value of closure type (so a call on it is an invocation)?
     fn is_closure_typed(&self, id: ExprId) -> bool {
         matches!(self.info.type_of(id), Ty::Opaque(s) if s == "closure")
+    }
+
+    /// Emit an indirect call through a thin function-pointer value. The callee
+    /// expression (a local `j_f`, a field `j_a.j_alloc_fn`, …) already holds the
+    /// address, so we just `callee(args)`. A `mut`/`out` parameter — declared in
+    /// the *pointer's type* — still takes its argument by `&`, matching the
+    /// callee function's ABI exactly as a direct call would.
+    fn emit_fn_ptr_invoke(&mut self, callee: ExprId, args: &[ExprId]) -> String {
+        let convs: Vec<Conv> = match self.info.type_of(callee) {
+            Ty::Fn { params, .. } => params.iter().map(|(c, _)| *c).collect(),
+            _ => Vec::new(),
+        };
+        let c = self.emit_expr(callee);
+        let mut parts = Vec::new();
+        for (i, a) in args.iter().enumerate() {
+            let e = self.emit_expr(*a);
+            if matches!(convs.get(i), Some(Conv::Mut) | Some(Conv::Out)) {
+                parts.push(format!("&({e})"));
+            } else {
+                parts.push(e);
+            }
+        }
+        format!("{c}({})", parts.join(", "))
     }
 
     // --- generic-struct methods ---
@@ -4921,6 +4998,14 @@ impl<'a> Cgen<'a> {
                 let i = self.c_ty_ast(*inner);
                 format!("{i}*")
             }
+            // a thin function pointer lowers to its `JestyrFn_<sig>` typedef
+            // (emitted by `fn_type_typedefs`), so the *name* sits on the outside
+            // of any declaration — sidestepping C's inside-out declarator syntax.
+            TypeKind::Fn { .. } => {
+                let subst = self.subst.clone();
+                let ty = self.ast_type_to_ty(id, &subst);
+                self.c_type(&ty)
+            }
             TypeKind::Error => "int".to_string(),
         }
     }
@@ -4965,8 +5050,16 @@ impl<'a> Cgen<'a> {
                 let i = self.c_type(elem);
                 format!("{i}*")
             }
+            Ty::Fn { .. } => self.fn_type_c_name(t),
             _ => "int".to_string(),
         }
+    }
+
+    /// The C typedef name for a function-pointer type — a pure function of its
+    /// signature mangle, so equal signatures share one `typedef` (see
+    /// [`Cgen::fn_type_typedefs`]).
+    fn fn_type_c_name(&self, t: &Ty) -> String {
+        format!("JestyrFn_{}", self.ty_mangle(t))
     }
 
     /// The C struct name for a slice with the given element type.
@@ -5051,6 +5144,54 @@ impl<'a> Cgen<'a> {
             }
         }
         out
+    }
+
+    /// Every distinct function-pointer signature the program names — found by
+    /// scanning the type arena for `TypeKind::Fn`. Nested fn-types occupy their
+    /// own arena entries with *smaller* ids (a callee is parsed before the type
+    /// that contains it), so arena order already emits inner typedefs first.
+    fn collect_fn_types(&self) -> Vec<Ty> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out = Vec::new();
+        let empty = HashMap::new();
+        for (i, td) in self.ast.types.iter().enumerate() {
+            if let TypeKind::Fn { .. } = &td.kind {
+                let ty = self.ast_type_to_ty(TypeId(i as u32), &empty);
+                if seen.insert(self.ty_mangle(&ty)) {
+                    out.push(ty);
+                }
+            }
+        }
+        out
+    }
+
+    /// Emit `typedef R (*JestyrFn_<sig>)(T1, T2);` per distinct signature. The
+    /// typedef puts the name on the *outside*, so every later use is a plain
+    /// `JestyrFn_<sig> j_x` — no inside-out C declarator anywhere. A `mut`/`out`
+    /// parameter lowers to `T*`, matching the ABI of a real Jestyr function
+    /// (see `fn_signature`), so a fn-pointer can hold `&some_fn`.
+    fn fn_type_typedefs(&mut self) {
+        for t in self.fn_type_instances.clone() {
+            let Ty::Fn { params, ret, .. } = &t else { continue };
+            let name = self.fn_type_c_name(&t);
+            let rc = self.c_type(ret);
+            let ps: Vec<String> = params
+                .iter()
+                .map(|(c, pt)| {
+                    let base = self.c_type(pt);
+                    if matches!(c, Conv::Mut | Conv::Out) {
+                        format!("{base}*")
+                    } else {
+                        base
+                    }
+                })
+                .collect();
+            let plist = if ps.is_empty() { "void".to_string() } else { ps.join(", ") };
+            self.raw(format!("typedef {rc} (*{name})({plist});\n"));
+        }
+        if !self.fn_type_instances.is_empty() {
+            self.raw("\n");
+        }
     }
 
     /// Emit `typedef struct { T* ptr; uint64_t gen; } JestyrRef_<T>;` per element.
@@ -5151,6 +5292,25 @@ impl<'a> Cgen<'a> {
             Ty::Slice(elem) => format!("slice_{}", self.ty_mangle(elem)),
             Ty::GenRef(elem) => format!("ref_{}", self.ty_mangle(elem)),
             Ty::RegionRef(elem) => format!("rref_{}", self.ty_mangle(elem)),
+            // A fn-pointer mangle must vary with each parameter's *convention*
+            // (a `mut`/`out` param lowers to `T*`, so it is a different C type),
+            // hence the leading conv tag per parameter.
+            Ty::Fn { params, ret, .. } => {
+                let ps: Vec<String> = params
+                    .iter()
+                    .map(|(c, t)| {
+                        let tag = match c {
+                            Conv::Mut => "m",
+                            Conv::Out => "o",
+                            Conv::Take => "t",
+                            Conv::Read => "r",
+                            Conv::Default => "d",
+                        };
+                        format!("{tag}{}", self.ty_mangle(t))
+                    })
+                    .collect();
+                format!("fn_{}_ret_{}", ps.join("_"), self.ty_mangle(ret))
+            }
             _ => "x".to_string(),
         }
     }
@@ -5433,6 +5593,11 @@ fn apply_subst(t: &Ty, subst: &HashMap<String, Ty>) -> Ty {
         Ty::Slice(elem) => Ty::Slice(Box::new(apply_subst(elem, subst))),
         Ty::GenRef(elem) => Ty::GenRef(Box::new(apply_subst(elem, subst))),
         Ty::RegionRef(elem) => Ty::RegionRef(Box::new(apply_subst(elem, subst))),
+        Ty::Fn { params, ret, ret_conv } => Ty::Fn {
+            params: params.iter().map(|(c, t)| (*c, Box::new(apply_subst(t, subst)))).collect(),
+            ret: Box::new(apply_subst(ret, subst)),
+            ret_conv: *ret_conv,
+        },
         _ => t.clone(),
     }
 }
@@ -5644,6 +5809,74 @@ mod tests {
         assert!(c.contains("malloc(8 + sizeof(int32_t))"), "alloc carries a generation header: {c}");
         assert!(c.contains(".ptr)[-1] == "), "deref checks the generation: {c}");
         assert!(c.contains(".ptr)[-1]++"), "gen_free bumps the generation: {c}");
+    }
+
+    // --- function-pointer types ---
+
+    #[test]
+    fn lowers_a_fn_pointer_type_to_a_c_typedef_and_indirect_call() {
+        let (c, d) = gen("fn apply(f: fn(i32) -> i32, x: i32) -> i32 { return f(x) }");
+        assert!(d.is_empty(), "{:?}", d);
+        // The signature becomes a `typedef`, so the name sits on the outside.
+        assert!(
+            c.contains("typedef int32_t (*JestyrFn_fn_di32_ret_i32)(int32_t);"),
+            "fn-pointer typedef: {c}"
+        );
+        assert!(c.contains("JestyrFn_fn_di32_ret_i32 j_f"), "the parameter uses the typedef: {c}");
+        // The call through the pointer is *indirect* — `j_f`, not a mangled
+        // `jestyr_f` (which would be a direct call to a non-existent function).
+        assert!(c.contains("return j_f(j_x);"), "indirect call through the pointer: {c}");
+    }
+
+    #[test]
+    fn lowers_a_vtable_struct_of_fn_pointers() {
+        // The headline use case: a hand-written allocator vtable — a struct whose
+        // fields are thin function pointers, the interface that must exist before
+        // any trait system does.
+        let src = "struct Allocator { alloc_fn: fn(i32) -> *mut u8, free_fn: fn(*mut u8) } \
+                   fn pick(read a: Allocator) -> i32 { return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(
+            c.contains("typedef uint8_t* (*JestyrFn_fn_di32_ret_ptr_u8)(int32_t);"),
+            "alloc_fn typedef: {c}"
+        );
+        assert!(
+            c.contains("typedef void (*JestyrFn_fn_dptr_u8_ret_unit)(uint8_t*);"),
+            "free_fn typedef (unit return → void): {c}"
+        );
+        assert!(c.contains("JestyrFn_fn_di32_ret_ptr_u8 j_alloc_fn;"), "vtable field: {c}");
+    }
+
+    #[test]
+    fn lowers_address_of_a_function_to_its_c_symbol() {
+        let src = "fn dbl(x: i32) -> i32 { return x + x } \
+                   fn main() -> i32 { let op: fn(i32) -> i32 = &dbl return op(21) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("(&jestyr_dbl)"), "address-of-fn is the mangled C symbol: {c}");
+        assert!(c.contains("j_op(21)"), "the call through `op` is indirect: {c}");
+    }
+
+    #[test]
+    fn lowers_a_mut_parameter_in_a_fn_pointer_type_by_pointer() {
+        // A `mut` parameter declared *in the pointer's type* lowers to `T*`,
+        // matching the ABI of a real Jestyr `mut` parameter.
+        let (c, d) = gen("fn f(g: fn(mut i32) -> i32) -> i32 { return 0 }");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(
+            c.contains("typedef int32_t (*JestyrFn_fn_mi32_ret_i32)(int32_t*);"),
+            "a `mut` parameter becomes a pointer in the typedef: {c}"
+        );
+    }
+
+    #[test]
+    fn lowers_a_field_call_through_a_vtable_pointer() {
+        let src = "struct A { op: fn(i32) -> i32 } \
+                   fn use_it(read a: A, n: i32) -> i32 { return a.op(n) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("j_a.j_op(j_n)"), "indirect call through the struct field: {c}");
     }
 
     #[test]

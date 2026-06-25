@@ -90,6 +90,18 @@ pub enum AssignOp {
 
 // --- types ---
 
+/// One parameter of a function-pointer *type* — a passing convention plus a
+/// type, but (unlike a [`Param`]) no name and no refinement: a type needs
+/// neither. Storing the [`Conv`] here is the Jestyr-novel bit — a function
+/// pointer's type records *how* each argument is passed (`read`/`mut`/`take`/
+/// `out`), so `fn(read Node, take Buf)` and `fn(take Node, take Buf)` are
+/// distinct types (and lower to distinct C signatures).
+#[derive(Clone, Debug)]
+pub struct FnTypeParam {
+    pub conv: Conv,
+    pub ty: TypeId,
+}
+
 #[derive(Clone, Debug)]
 pub enum TypeKind {
     Name(Ident),                              // usize, f64, T, Shape, Self
@@ -99,6 +111,12 @@ pub enum TypeKind {
     GenRef(TypeId),                            // &T — a generational reference (§4.4)
     RegionRef { region: Ident, inner: TypeId }, // &[r]T — a zero-cost region reference (§4.4)
     App { ctor: Ident, args: Vec<TypeId> },    // List(i32) — applied generic struct
+    /// A *thin* function-pointer type `fn(T1, T2) -> R` — a capture-free,
+    /// first-class value (one machine pointer), distinct from a fat capturing
+    /// [`ExprKind::Closure`]. `ret` is `None` for a unit-returning pointer. The
+    /// canonical use is a hand-written vtable: a struct of these is exactly the
+    /// allocator interface that must exist *before* traits do (design discussion).
+    Fn { params: Vec<FnTypeParam>, ret_conv: Conv, ret: Option<TypeId> },
     Error,
 }
 

@@ -868,6 +868,16 @@ mod tests {
     }
 
     #[test]
+    fn a_fn_pointer_is_first_class_and_escapes_freely() {
+        // The split the design memo predicted: a borrow-capturing closure stays
+        // second-class, but a *thin* fn-pointer captures nothing — it is Copy and
+        // first-class, so returning one is not an escape (contrast the test above,
+        // where a non-Copy aggregate borrow cannot be returned).
+        let d = escapes("fn pick(f: fn(i32) -> i32) -> fn(i32) -> i32 { return f }");
+        assert!(d.is_empty(), "returning a thin fn-pointer is allowed: {:?}", d);
+    }
+
+    #[test]
     fn region_value_cannot_be_returned() {
         // The marquee region-safety proof: a region-allocated value can't escape.
         let d = escapes(

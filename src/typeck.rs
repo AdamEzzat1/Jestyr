@@ -443,6 +443,17 @@ impl<'a> TypeChecker<'a> {
             TypeKind::RegionRef { inner, .. } => {
                 Ty::RegionRef(Box::new(self.lower_type(ty_params, *inner)))
             }
+            TypeKind::Fn { params, ret_conv, ret } => {
+                let ps: Vec<(Conv, Box<Ty>)> = params
+                    .iter()
+                    .map(|p| (p.conv, Box::new(self.lower_type(ty_params, p.ty))))
+                    .collect();
+                let r = match ret {
+                    Some(t) => self.lower_type(ty_params, *t),
+                    None => Ty::Unit,
+                };
+                Ty::Fn { params: ps, ret: Box::new(r), ret_conv: *ret_conv }
+            }
             TypeKind::App { ctor, args } => {
                 let aty: Vec<Ty> = args.iter().map(|a| self.lower_type(ty_params, *a)).collect();
                 // `Ctor(args)` is a generic *enum* instance if `Ctor` names a
@@ -975,6 +986,17 @@ impl<'a> TypeChecker<'a> {
                     let recv_ty = self.infer(scope, typ, self_ty, base);
                     let arg_tys: Vec<Ty> =
                         args.iter().map(|a| self.infer(scope, typ, self_ty, *a)).collect();
+                    // `a.f(x)` where `f` is a *function-pointer field* — an
+                    // indirect call through the field, typed by its return type.
+                    // Resolved by the field's *type*, ahead of method-call sugar:
+                    // the "disambiguate by field type" rule (design discussion H).
+                    if let Some(fty) = self.fn_ptr_field(&recv_ty, &name) {
+                        if let Ty::Fn { ret, .. } = &fty {
+                            let ret = (**ret).clone();
+                            self.set(*callee, fty.clone()); // route cgen to an indirect call
+                            return self.set(id, ret);
+                        }
+                    }
                     if let Some(ret) =
                         self.resolve_free_method(id, &name, args, &recv_ty, &arg_tys)
                     {
@@ -990,6 +1012,16 @@ impl<'a> TypeChecker<'a> {
                     _ => None,
                 };
                 self.infer(scope, typ, self_ty, *callee);
+                // Indirect call through a fn-pointer *local or parameter* (`op(x)`):
+                // the callee is a value of type `fn(...) -> R`, so the call's type
+                // is `R`. A bare top-level *function name* infers to `Unknown`
+                // (not `Fn`), so this never intercepts an ordinary direct call.
+                if let Ty::Fn { ret, .. } = self.expr_types[callee.0 as usize].clone() {
+                    for a in args {
+                        self.infer(scope, typ, self_ty, *a);
+                    }
+                    return self.set(id, *ret);
+                }
                 // Each argument is inferred with its parameter type as the expected
                 // type, so a nullary generic variant resolves: `get(none)` where
                 // `get(o: Option(i32), …)` types `none` as `Option(i32)`.
@@ -1303,6 +1335,18 @@ impl<'a> TypeChecker<'a> {
                 _ => Ty::Unknown,
             }
         }
+    }
+
+    /// If `base` is a plain struct with a field `fname` of *function-pointer*
+    /// type, return that `Ty::Fn`. Diagnostic-free (unlike [`Self::field_type`]),
+    /// so it can probe a method-call's receiver field without emitting a spurious
+    /// "no field" error when the call is really a method. Generic-struct fn-ptr
+    /// fields are out of scope here (the vtable shape is a plain struct).
+    fn fn_ptr_field(&self, base: &Ty, fname: &str) -> Option<Ty> {
+        let Ty::Named(i) = base else { return None };
+        let TypeKindG::Struct { fields } = &self.table.types.get(*i)?.kind else { return None };
+        let (_, t) = fields.iter().find(|(n, _)| n == fname)?;
+        matches!(t, Ty::Fn { .. }).then(|| t.clone())
     }
 
     fn field_type(&mut self, span: Span, base: &Ty, fname: &str) -> Ty {
@@ -2128,6 +2172,72 @@ mod tests {
         let (ast, pd) = Parser::new(src, tokens).parse();
         assert!(pd.is_empty(), "parse: {:?}", pd);
         check(&ast)
+    }
+
+    /// Like [`analyze`] but keeps the AST too, so a test can locate a specific
+    /// expression and assert its inferred type.
+    fn analyze_full(src: &str) -> (Ast, TypeInfo) {
+        let (tokens, ld) = Lexer::new(src).tokenize();
+        assert!(ld.is_empty(), "lex: {:?}", ld);
+        let (ast, pd) = Parser::new(src, tokens).parse();
+        assert!(pd.is_empty(), "parse: {:?}", pd);
+        let (info, _d) = check(&ast);
+        (ast, info)
+    }
+
+    // --- function-pointer types ---
+
+    #[test]
+    fn a_fn_pointer_type_is_copy_and_first_class() {
+        // The escape checker keys off `is_copy`: a thin fn-pointer captures
+        // nothing, so it is Copy — and therefore escapes freely.
+        let tbl = GlobalTable::default();
+        let fp = Ty::Fn {
+            params: vec![(Conv::Read, Box::new(Ty::Prim("i32")))],
+            ret: Box::new(Ty::Prim("i32")),
+            ret_conv: Conv::Default,
+        };
+        assert!(fp.is_copy(&tbl), "a thin fn-pointer must be Copy / first-class");
+    }
+
+    #[test]
+    fn indirect_call_through_a_parameter_is_typed_by_the_pointer_return() {
+        // `f(x)` where `f: fn(i32) -> i64` types as i64 — distinct enough that a
+        // coincidental i64 elsewhere can't make this pass by accident.
+        let (ast, info) =
+            analyze_full("fn apply(f: fn(i32) -> i64, x: i32) -> i64 { return f(x) }");
+        let call = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| matches!(e.kind, ExprKind::Call { .. }).then_some(ExprId(i as u32)))
+            .expect("the `f(x)` call");
+        assert_eq!(info.type_of(call), &Ty::Prim("i64"), "indirect call types as the pointer return");
+    }
+
+    #[test]
+    fn fn_pointer_field_call_is_not_mistaken_for_a_method() {
+        // `a.alloc_fn(n)` on a fn-pointer *field* must resolve by the field's
+        // type — no spurious "no field" / method-resolution diagnostic.
+        let src = "struct A { alloc_fn: fn(i32) -> i32 } \
+                   fn use_it(read a: A, n: i32) -> i32 { return a.alloc_fn(n) }";
+        let (_i, d) = analyze(src);
+        assert!(d.is_empty(), "a fn-pointer field call should typecheck cleanly: {:?}", d);
+    }
+
+    #[test]
+    fn fn_pointer_field_call_types_by_the_field_return() {
+        let (ast, info) = analyze_full(
+            "struct A { op: fn(i32) -> i64 } \
+             fn use_it(read a: A, n: i32) -> i64 { return a.op(n) }",
+        );
+        let call = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| matches!(e.kind, ExprKind::Call { .. }).then_some(ExprId(i as u32)))
+            .expect("the `a.op(n)` call");
+        assert_eq!(info.type_of(call), &Ty::Prim("i64"));
     }
 
     #[test]

@@ -699,6 +699,36 @@ impl<'src> Parser<'src> {
                 let id = Ident { name: "Self".to_string(), span: t.span };
                 self.ast.ty(TypeKind::Name(id), t.span)
             }
+            // `fn(read T1, take T2) -> read R` — a thin function-pointer type.
+            // Each parameter may carry a passing convention; the `-> conv R`
+            // return is optional (its absence means a unit-returning pointer).
+            // This is a *type*, not a declaration: parameters have no names.
+            Fn => {
+                self.bump(); // `fn`
+                self.expect(LParen, "`(`");
+                let mut params = Vec::new();
+                while !self.at(RParen) && !self.at(Eof) {
+                    let before = self.pos;
+                    let conv = self.parse_conv();
+                    let ty = self.parse_type();
+                    params.push(FnTypeParam { conv, ty });
+                    if self.pos == before {
+                        self.bump(); // guarantee progress on malformed input
+                    }
+                    if !self.eat(Comma) {
+                        break;
+                    }
+                }
+                self.expect(RParen, "`)`");
+                let mut ret_conv = Conv::Default;
+                let mut ret = None;
+                if self.eat(Arrow) {
+                    ret_conv = self.parse_conv();
+                    ret = Some(self.parse_type());
+                }
+                let span = start.to(self.prev_span());
+                self.ast.ty(TypeKind::Fn { params, ret_conv, ret }, span)
+            }
             other => {
                 self.error(start, format!("expected a type, found `{}`", other.describe()));
                 self.bump(); // ensure progress
@@ -1628,6 +1658,76 @@ mod tests {
             }
             _ => panic!("expected a function"),
         }
+    }
+
+    // --- function-pointer types ---
+
+    #[test]
+    fn parses_a_fn_pointer_type_in_a_signature() {
+        let ast = parse_ok("fn apply(f: fn(i32) -> i32, x: i32) -> i32 { f(x) }");
+        let Item::Fn(func) = &ast.items[0] else { panic!("expected a function") };
+        let ty = func.params[0].ty.expect("f has a type");
+        let TypeKind::Fn { params, ret, .. } = &ast.type_at(ty).kind else {
+            panic!("param `f` should be a fn-pointer type, got {:?}", ast.type_at(ty).kind)
+        };
+        assert_eq!(params.len(), 1, "one parameter type");
+        assert!(ret.is_some(), "an explicit `-> i32` return type");
+    }
+
+    #[test]
+    fn parses_conventions_inside_a_fn_pointer_type() {
+        // The Jestyr-novel bit: passing conventions live *inside* the function
+        // type, so `read`/`take`/`mut`/`out` are part of the type, not the name.
+        let ast = parse_ok("fn f(g: fn(read i32, take i32) -> read i32) { }");
+        let Item::Fn(func) = &ast.items[0] else { panic!() };
+        let ty = func.params[0].ty.unwrap();
+        let TypeKind::Fn { params, ret_conv, ret } = &ast.type_at(ty).kind else { panic!() };
+        assert_eq!(params[0].conv, Conv::Read);
+        assert_eq!(params[1].conv, Conv::Take);
+        assert_eq!(*ret_conv, Conv::Read);
+        assert!(ret.is_some());
+    }
+
+    #[test]
+    fn parses_a_unit_returning_fn_pointer_without_an_arrow() {
+        let ast = parse_ok("fn f(free_fn: fn(*mut u8)) { }");
+        let Item::Fn(func) = &ast.items[0] else { panic!() };
+        let ty = func.params[0].ty.unwrap();
+        let TypeKind::Fn { params, ret, ret_conv } = &ast.type_at(ty).kind else { panic!() };
+        assert_eq!(params.len(), 1);
+        assert!(ret.is_none(), "no `->` means a unit-returning pointer");
+        assert_eq!(*ret_conv, Conv::Default);
+    }
+
+    #[test]
+    fn parses_a_struct_of_fn_pointers_the_vtable_shape() {
+        let ast = parse_ok(
+            "struct Allocator { alloc_fn: fn(usize) -> *mut u8, free_fn: fn(*mut u8) }",
+        );
+        let Item::Struct { body, .. } = &ast.items[0] else { panic!() };
+        let fn_fields = body
+            .members
+            .iter()
+            .filter(|m| {
+                matches!(m, StructMember::Field { ty, .. }
+                    if matches!(ast.type_at(*ty).kind, TypeKind::Fn { .. }))
+            })
+            .count();
+        assert_eq!(fn_fields, 2, "both fields are fn-pointer typed");
+    }
+
+    #[test]
+    fn prints_a_fn_pointer_type_round_trip() {
+        let ast = parse_ok("fn f(g: fn(read i32) -> i32) { }");
+        let out = print_ast(&ast);
+        assert!(out.contains("fn(read i32) -> i32"), "printer renders the fn-ptr type: {out}");
+    }
+
+    #[test]
+    fn parser_recovers_from_a_malformed_fn_pointer_type() {
+        // Garbage between the parens must not spin the parser (progress guard).
+        let (_ast, diags) = parse("fn f(g: fn(,,,) -> i32) { }");
+        assert!(!diags.is_empty(), "a malformed parameter list reports an error");
     }
 
     #[test]

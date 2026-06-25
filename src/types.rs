@@ -45,6 +45,12 @@ pub enum Ty {
     /// A region reference `&[r]T` (§4.4) — lowers to a plain pointer (zero-cost,
     /// raw deref). Safety is compile-time/lexical: it can't outlive its region.
     RegionRef(Box<Ty>),
+    /// A thin function-pointer type `fn(T1, T2) -> R`. **`Copy`** — one machine
+    /// pointer, captures nothing, so it may be freely stored/returned/aliased
+    /// and *escapes freely* (the escape checker keeps borrow-capturing closures
+    /// second-class, but a bare fn-pointer is first-class). Each parameter
+    /// carries its passing [`Conv`]; `ret` is the (possibly `Unit`) result type.
+    Fn { params: Vec<(Conv, Box<Ty>)>, ret: Box<Ty>, ret_conv: Conv },
     /// The type of types (a `comptime` value), e.g. the result of `type`.
     TypeKw,
     /// Inference gave up here. Treated as `Copy` so we don't raise false escapes.
@@ -70,6 +76,7 @@ impl Ty {
             Ty::Slice(_) => false,
             Ty::GenRef(_) => true, // a generational reference is a copyable fat pointer
             Ty::RegionRef(_) => true, // a region reference is a copyable plain pointer
+            Ty::Fn { .. } => true, // a thin fn-pointer captures nothing — first-class, escapes freely
             Ty::TypeKw => true,
             Ty::Unknown => true, // lenient: suppress escapes we couldn't type
             Ty::Error => true,   // suppress cascades
@@ -100,6 +107,22 @@ impl Ty {
             Ty::Slice(t) => format!("[]{}", t.display(tbl)),
             Ty::GenRef(t) => format!("&{}", t.display(tbl)),
             Ty::RegionRef(t) => format!("&[r]{}", t.display(tbl)),
+            Ty::Fn { params, ret, ret_conv } => {
+                let ps: Vec<String> = params
+                    .iter()
+                    .map(|(c, t)| {
+                        let label = c.label();
+                        if label.is_empty() {
+                            t.display(tbl)
+                        } else {
+                            format!("{label} {}", t.display(tbl))
+                        }
+                    })
+                    .collect();
+                let rc = ret_conv.label();
+                let rcs = if rc.is_empty() { String::new() } else { format!("{rc} ") };
+                format!("fn({}) -> {rcs}{}", ps.join(", "), ret.display(tbl))
+            }
             Ty::TypeKw => "type".to_string(),
             Ty::Unknown => "?".to_string(),
             Ty::Error => "<error>".to_string(),

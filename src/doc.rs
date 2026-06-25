@@ -601,6 +601,31 @@ fn ty_str(ast: &Ast, id: TypeId) -> String {
             let a: Vec<String> = args.iter().map(|t| ty_str(ast, *t)).collect();
             format!("{}({})", ctor.name, a.join(", "))
         }
+        TypeKind::Fn { params, ret_conv, ret } => {
+            let ps: Vec<String> = params
+                .iter()
+                .map(|p| {
+                    let c = if p.conv != Conv::Default {
+                        format!("{} ", p.conv.label())
+                    } else {
+                        String::new()
+                    };
+                    format!("{}{}", c, ty_str(ast, p.ty))
+                })
+                .collect();
+            let tail = match ret {
+                Some(t) => {
+                    let c = if *ret_conv != Conv::Default {
+                        format!("{} ", ret_conv.label())
+                    } else {
+                        String::new()
+                    };
+                    format!(" -> {}{}", c, ty_str(ast, *t))
+                }
+                None => String::new(),
+            };
+            format!("fn({}){}", ps.join(", "), tail)
+        }
         TypeKind::Error => "<error-type>".to_string(),
     }
 }
