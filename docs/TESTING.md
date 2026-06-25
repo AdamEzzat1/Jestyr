@@ -264,9 +264,18 @@ Run: `cargo test trait_programs`, `cargo test parses_a_trait`, `cargo bolero tes
     `..._print_stably` over the `arb_trait_program` generator (trait + impl + bounded use + `dyn`).
   - Fuzz (`fuzz`): `fuzz_traits_pipeline` — fuzz bytes inside an `impl`/bounded-generic body;
     total + deterministic.
-- ⏳ **Remaining:** B resolve+coherence · C static dispatch (monomorphized, no vtable) ·
-  D definition-site bounds · E operator traits (`Add`/`Mul`/`Eq`/`Ord`) · F `dyn` vtable.
-  Each lands with the same three layers (+ a gcc differential once runtime behaviour matters).
+- ✅ **Stage B — resolve + coherence.** typeck registers each `trait` (method set) and `impl`
+  (`GlobalTable::{traits, impls, impl_index}`), enforcing **coherence**: unknown trait, duplicate
+  `impl` per `(trait, type)`, missing required method, non-member method. A `recv.m(args)` call
+  resolves through `impl Trait for <recv-type>` (`resolve_impl_method`, recorded in `impl_calls`
+  for the backend) and types as the impl method's return.
+  - Unit (typeck): each coherence diagnostic, a defaulted method may be omitted, and a resolved
+    call types by the impl return + is recorded.
+  - Property (`prop`): `duplicate_impl_is_always_a_coherence_error` (soundness),
+    `distinct_type_impls_are_accepted` (completeness), `coherence_verdict_is_order_independent`.
+- ⏳ **Remaining:** C static dispatch (monomorphized, no vtable) · D definition-site bounds ·
+  E operator traits (`Add`/`Mul`/`Eq`/`Ord`) · F `dyn` vtable. Each lands with the same three
+  layers (+ a gcc differential once runtime behaviour matters).
 
 ---
 

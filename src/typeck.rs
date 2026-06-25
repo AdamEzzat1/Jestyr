@@ -50,6 +50,7 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
         expr_types: vec![Ty::Unknown; ast.exprs.len()],
         method_calls: HashMap::new(),
         qualified: HashMap::new(),
+        impl_calls: HashMap::new(),
         cur_expected: None,
         cur_ret: None,
         diags: Vec::new(),
@@ -62,6 +63,7 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
             expr_types: tc.expr_types,
             method_calls: tc.method_calls,
             qualified: tc.qualified,
+            impl_calls: tc.impl_calls,
         },
         tc.diags,
     )
@@ -104,6 +106,8 @@ struct TypeChecker<'a> {
     method_calls: HashMap<ExprId, MethodRes>,
     /// Qualified access (`mem.allocate` / `mem.PAGE`) → the resolved bare name.
     qualified: HashMap<ExprId, String>,
+    /// `Call`-expr id → trait-impl method resolution (traits, Stage B).
+    impl_calls: HashMap<ExprId, ImplCall>,
     /// The type a sub-expression is *expected* to have (from a `let` annotation
     /// or a `return`), used to resolve an otherwise-ambiguous nullary generic
     /// variant like `none` to its instantiation (`Option(i32)`). A minimal,
@@ -282,10 +286,127 @@ impl<'a> TypeChecker<'a> {
                     );
                 }
                 Item::Import(_) => {}
-                // Trait/impl signatures are resolved in Stage B, not registered here.
+                // Traits and impls are registered in their own pass below (impls
+                // need every type lowered first, to key by the target type).
                 Item::Trait(_) | Item::Impl(_) => {}
             }
         }
+
+        // Phase 3: traits, then impls (coherence-checked against the traits).
+        self.register_traits();
+        self.register_impls();
+    }
+
+    /// Register each `trait` (name → its method set, flagged required/defaulted).
+    fn register_traits(&mut self) {
+        let ast = self.ast;
+        for item in &ast.items {
+            if let Item::Trait(t) = item {
+                if self.table.traits.contains_key(&t.name.name) {
+                    self.error(
+                        t.name.span,
+                        format!("duplicate definition of trait `{}`", t.name.name),
+                    );
+                    continue;
+                }
+                let methods = t
+                    .methods
+                    .iter()
+                    .map(|m| (m.name.name.clone(), m.default_body.is_none()))
+                    .collect();
+                self.table.traits.insert(t.name.name.clone(), TraitDef { methods });
+            }
+        }
+    }
+
+    /// Register each `impl Trait for Type`, enforcing **coherence**: the trait must
+    /// exist; at most one impl per `(trait, type)`; every required method present;
+    /// no method that isn't a trait member. Records each provided method's return
+    /// type (with `Self` resolved to the target) for resolution + the backend.
+    fn register_impls(&mut self) {
+        let ast = self.ast;
+        let empty = HashSet::new();
+        for item in &ast.items {
+            let Item::Impl(im) = item else { continue };
+            if !self.table.traits.contains_key(&im.trait_name.name) {
+                self.error(
+                    im.trait_name.span,
+                    format!("unknown trait `{}` in `impl`", im.trait_name.name),
+                );
+                continue;
+            }
+            let target = self.lower_type(&empty, im.ty);
+            let type_key = self.table.ty_key(&target);
+            let pair = (im.trait_name.name.clone(), type_key.clone());
+            if self.table.impl_index.contains_key(&pair) {
+                self.error(
+                    im.span,
+                    format!(
+                        "conflicting implementations of trait `{}` for `{}` (coherence: at most one)",
+                        im.trait_name.name, type_key
+                    ),
+                );
+                continue;
+            }
+            let self_subst: HashMap<String, Ty> =
+                std::iter::once(("Self".to_string(), target.clone())).collect();
+            let mut method_rets = HashMap::new();
+            let mut provided: HashSet<String> = HashSet::new();
+            for m in &im.methods {
+                let tps = self.fn_type_params(m, &empty);
+                let ret = m.ret_ty.map(|t| self.lower_type(&tps, t)).unwrap_or(Ty::Unit);
+                let ret = subst_ty(&ret, &self_subst);
+                let is_member = self.table.traits[&im.trait_name.name].has_method(&m.name.name);
+                if !is_member {
+                    self.error(
+                        m.name.span,
+                        format!(
+                            "method `{}` is not a member of trait `{}`",
+                            m.name.name, im.trait_name.name
+                        ),
+                    );
+                }
+                method_rets.insert(m.name.name.clone(), ret);
+                provided.insert(m.name.name.clone());
+            }
+            let missing: Vec<String> = self.table.traits[&im.trait_name.name]
+                .required()
+                .filter(|r| !provided.contains(*r))
+                .map(|s| s.to_string())
+                .collect();
+            for miss in missing {
+                self.error(
+                    im.span,
+                    format!(
+                        "missing method `{miss}` in `impl` of trait `{}` for `{type_key}`",
+                        im.trait_name.name
+                    ),
+                );
+            }
+            let idx = self.table.impls.len();
+            self.table.impls.push(ImplDef {
+                trait_name: im.trait_name.name.clone(),
+                type_key,
+                method_rets,
+            });
+            self.table.impl_index.insert(pair, idx);
+        }
+    }
+
+    /// Resolve `recv.method(args)` through an `impl Trait for <recv-type>`. Returns
+    /// the method's return type and records the resolution for the backend.
+    fn resolve_impl_method(&mut self, call_id: ExprId, method: &str, recv_ty: &Ty) -> Option<Ty> {
+        let key = self.table.ty_key(recv_ty);
+        let (trait_name, ret) = {
+            let im = self
+                .table
+                .impls
+                .iter()
+                .find(|im| im.type_key == key && im.method_rets.contains_key(method))?;
+            (im.trait_name.clone(), im.method_rets.get(method).cloned().unwrap_or(Ty::Unknown))
+        };
+        self.impl_calls.insert(call_id, ImplCall { trait_name, type_key: key, method: method.to_string() });
+        Some(ret)
     }
 
     fn register_type(&mut self, name: &Ident, is_enum: bool) -> usize {
@@ -1011,6 +1132,11 @@ impl<'a> TypeChecker<'a> {
                         return self.set(id, ret);
                     }
                     if let Some(ret) = self.resolve_struct_method(id, &name, args, &recv_ty) {
+                        return self.set(id, ret);
+                    }
+                    // `recv.m(args)` resolving through an `impl Trait for <recv>`
+                    // (traits, Stage B) — a fallback after free-fn / struct methods.
+                    if let Some(ret) = self.resolve_impl_method(id, &name, &recv_ty) {
                         return self.set(id, ret);
                     }
                     return self.set(id, Ty::Unknown);
@@ -2388,6 +2514,70 @@ mod tests {
             }
             other => panic!("expected fn(i32) -> i32, got {other:?}"),
         }
+    }
+
+    // --- traits: resolve + coherence (Stage B) ---
+
+    #[test]
+    fn resolves_a_trait_method_call_to_the_impl_return() {
+        let (ast, info) = analyze_full(
+            "trait Show { fn show(read self) -> i64 } \
+             impl Show for i32 { fn show(read self) -> i64 { return 1 } } \
+             fn use_it(read x: i32) -> i64 { return x.show() }",
+        );
+        let call = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| matches!(e.kind, ExprKind::Call { .. }).then_some(ExprId(i as u32)))
+            .expect("the x.show() call");
+        assert_eq!(info.type_of(call), &Ty::Prim("i64"), "call types as the impl method's return");
+        assert!(info.impl_calls.contains_key(&call), "the resolution is recorded for the backend");
+    }
+
+    #[test]
+    fn duplicate_impl_is_a_coherence_error() {
+        let (_i, d) = analyze(
+            "trait T { fn m(read self) -> i32 } \
+             impl T for i32 { fn m(read self) -> i32 { return 1 } } \
+             impl T for i32 { fn m(read self) -> i32 { return 2 } }",
+        );
+        assert!(
+            d.iter().any(|m| m.message.contains("conflicting implementations")),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn impl_missing_a_required_method_is_an_error() {
+        let (_i, d) = analyze("trait T { fn need(read self) -> i32 } impl T for i32 { }");
+        assert!(d.iter().any(|m| m.message.contains("missing method `need`")), "{:?}", d);
+    }
+
+    #[test]
+    fn impl_of_an_unknown_trait_is_an_error() {
+        let (_i, d) = analyze("impl Nope for i32 { fn m(read self) -> i32 { return 1 } }");
+        assert!(d.iter().any(|m| m.message.contains("unknown trait `Nope`")), "{:?}", d);
+    }
+
+    #[test]
+    fn impl_method_not_in_the_trait_is_an_error() {
+        let (_i, d) = analyze(
+            "trait T { fn m(read self) -> i32 } \
+             impl T for i32 { fn m(read self) -> i32 { return 1 } \
+                              fn extra(read self) -> i32 { return 2 } }",
+        );
+        assert!(d.iter().any(|m| m.message.contains("not a member of trait `T`")), "{:?}", d);
+    }
+
+    #[test]
+    fn impl_may_omit_a_defaulted_method() {
+        let (_i, d) = analyze(
+            "trait T { fn show(read self) -> i32  fn label(read self) -> i32 { return 0 } } \
+             impl T for i32 { fn show(read self) -> i32 { return 1 } }",
+        );
+        assert!(d.is_empty(), "a defaulted method may be omitted: {:?}", d);
     }
 
     #[test]

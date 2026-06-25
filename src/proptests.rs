@@ -55,6 +55,15 @@ fn compile(src: &str) -> (String, usize) {
     (c, ld.len() + pd.len() + td.len() + ed.len() + cd.len())
 }
 
+/// The type-checker's diagnostic messages for a source — used by the coherence
+/// properties to assert *which* diagnostic fires (not just how many).
+fn typeck_diags(src: &str) -> Vec<String> {
+    let (tokens, _) = Lexer::new(src).tokenize();
+    let (ast, _) = Parser::new(src, tokens).parse();
+    let (_info, td) = typeck::check(&ast);
+    td.iter().map(|d| d.message.clone()).collect()
+}
+
 /// The token-kind sequence (Eof dropped) — the lexer's structural output, used by
 /// the whitespace-insensitivity metamorphic property.
 fn token_kinds(src: &str) -> Vec<TokenKind> {
@@ -246,6 +255,62 @@ mod prop {
             let b = crate::printer::print_ast(&ast);
             prop_assert_eq!(a, b);
         }
+
+        // ── traits, Stage B: coherence (a single-program differential) ────────
+
+        /// **Coherence soundness.** Two `impl`s of the same `(trait, type)` are
+        /// *always* a conflict — for every concrete type the generator picks.
+        #[test]
+        fn duplicate_impl_is_always_a_coherence_error(t in arb_prim_ty()) {
+            let p = format!(
+                "trait xT {{ fn xm(read self) -> i32 }} \
+                 impl xT for {t} {{ fn xm(read self) -> i32 {{ return 1 }} }} \
+                 impl xT for {t} {{ fn xm(read self) -> i32 {{ return 2 }} }}"
+            );
+            let diags = typeck_diags(&p);
+            prop_assert!(
+                diags.iter().any(|d| d.contains("conflicting implementations")),
+                "expected a coherence error: {:?}", diags
+            );
+        }
+
+        /// **Coherence completeness.** `impl`s of a trait for *distinct* types are
+        /// never a conflict (the oracle: the two types differ by construction).
+        #[test]
+        fn distinct_type_impls_are_accepted((a, b) in (arb_prim_ty(), arb_prim_ty())) {
+            prop_assume!(a != b);
+            let p = format!(
+                "trait xT {{ fn xm(read self) -> i32 }} \
+                 impl xT for {a} {{ fn xm(read self) -> i32 {{ return 1 }} }} \
+                 impl xT for {b} {{ fn xm(read self) -> i32 {{ return 2 }} }}"
+            );
+            let diags = typeck_diags(&p);
+            prop_assert!(
+                !diags.iter().any(|d| d.contains("conflicting implementations")),
+                "distinct-type impls must be accepted: {:?}", diags
+            );
+        }
+
+        /// **Order independence.** The coherence verdict for a duplicate pair is the
+        /// same whichever source order the two `impl`s appear in (no iteration-order
+        /// leak in the single-pass `impl_index` check).
+        #[test]
+        fn coherence_verdict_is_order_independent(t in arb_prim_ty()) {
+            let tr = "trait xT { fn xm(read self) -> i32 }";
+            let i1 = format!("impl xT for {t} {{ fn xm(read self) -> i32 {{ return 1 }} }}");
+            let i2 = format!("impl xT for {t} {{ fn xm(read self) -> i32 {{ return 2 }} }}");
+            let n_ab = typeck_diags(&format!("{tr} {i1} {i2}"))
+                .iter().filter(|d| d.contains("conflicting implementations")).count();
+            let n_ba = typeck_diags(&format!("{tr} {i2} {i1}"))
+                .iter().filter(|d| d.contains("conflicting implementations")).count();
+            prop_assert_eq!(n_ab, 1);
+            prop_assert_eq!(n_ab, n_ba);
+        }
+    }
+
+    /// A concrete primitive type to `impl` a trait for.
+    fn arb_prim_ty() -> impl Strategy<Value = &'static str> {
+        prop_oneof![Just("i32"), Just("i64"), Just("u8"), Just("u16"), Just("bool")]
     }
 
     /// A small *valid* trait program: a trait `xShow` with `n` required methods, an

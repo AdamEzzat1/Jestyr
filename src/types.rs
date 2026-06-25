@@ -204,6 +204,44 @@ pub struct FnSig {
     pub fallible: bool,
 }
 
+/// A declared `trait`: the set of its method names, each flagged required (no
+/// default body) or defaulted. Coherence uses this to check an `impl` provides
+/// every required method.
+#[derive(Debug, Default)]
+pub struct TraitDef {
+    /// (method name, is-required).
+    pub methods: Vec<(String, bool)>,
+}
+
+impl TraitDef {
+    pub fn has_method(&self, name: &str) -> bool {
+        self.methods.iter().any(|(m, _)| m == name)
+    }
+    pub fn required(&self) -> impl Iterator<Item = &str> {
+        self.methods.iter().filter(|(_, req)| *req).map(|(m, _)| m.as_str())
+    }
+}
+
+/// A registered `impl Trait for Type`: which trait, a canonical key for the
+/// target type (see [`GlobalTable::ty_key`]), and each provided method's return
+/// type (with `Self` already resolved to the target).
+#[derive(Debug)]
+pub struct ImplDef {
+    pub trait_name: String,
+    pub type_key: String,
+    pub method_rets: HashMap<String, Ty>,
+}
+
+/// How a trait-method call `recv.m(args)` resolved — recorded for the backend
+/// (Stage C lowers it to the mangled impl-method call).
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // fields consumed by cgen once static dispatch lands (Stage C)
+pub struct ImplCall {
+    pub trait_name: String,
+    pub type_key: String,
+    pub method: String,
+}
+
 /// All top-level declarations, indexed by name — the output of name resolution.
 #[derive(Default)]
 pub struct GlobalTable {
@@ -213,6 +251,26 @@ pub struct GlobalTable {
     pub consts: HashMap<String, Ty>,
     /// enum-variant name → its enum's index in `types`.
     pub variants: HashMap<String, usize>,
+    /// trait name → its method set (for coherence + method resolution).
+    pub traits: HashMap<String, TraitDef>,
+    /// every `impl Trait for Type` in the program.
+    pub impls: Vec<ImplDef>,
+    /// `(trait, type-key)` → index into `impls` — the single-pass coherence map
+    /// (at most one impl per pair) and the resolution lookup.
+    pub impl_index: HashMap<(String, String), usize>,
+}
+
+impl GlobalTable {
+    /// A canonical, stable string key for a type, used to index `impl`s and to
+    /// check coherence. Primitives and named types are their name; everything
+    /// else falls back to its display form.
+    pub fn ty_key(&self, t: &Ty) -> String {
+        match t {
+            Ty::Prim(n) => (*n).to_string(),
+            Ty::Named(i) => self.types.get(*i).map(|d| d.name.clone()).unwrap_or_default(),
+            other => other.display(self),
+        }
+    }
 }
 
 /// How a `base.name(args)` method call resolved (filled in by the type checker
@@ -242,6 +300,10 @@ pub struct TypeInfo {
     /// the underlying function/const name. The backend emits a direct reference,
     /// not a field access / method call (design §9, qualified access).
     pub qualified: HashMap<ExprId, String>,
+    /// `Call`-expr id → trait-impl method resolution, for `recv.m(args)` calls
+    /// that resolved through an `impl Trait for <recv-type>` (traits, Stage B).
+    #[allow(dead_code)] // consumed by cgen once static dispatch lands (Stage C)
+    pub impl_calls: HashMap<ExprId, ImplCall>,
 }
 
 impl TypeInfo {
