@@ -316,10 +316,15 @@ Run: `cargo test trait_programs`, `cargo test parses_a_trait`, `cargo bolero tes
     `operator_programs_compile_deterministically`. Fuzz: `fuzz_operator_traits`.
   - gcc differential: `examples/operators.jtr` runs to `13/42/0/1`
     (`operators_example_compiles_clean`).
-- ⏳ **Remaining:** F `dyn` vtable (reuses the fn-pointer-field call machinery). Separate
-  workstreams flagged in `HANDOFF-NEXT.md`: bracket-generic *codegen* (monomorphizing `f[T: Tr]`)
-  and the body-side "blame the generic code" bound check. Each lands with the same three layers
-  (+ a gcc differential once runtime behaviour matters).
+- ✅ **Bracket-generic codegen** (not a trait stage, but unblocks the next): bracket-form `[T:
+  Bound]` generics now monomorphize — each `T` is *inferred* from the call's value arguments
+  (`unify_tp`, shared between typeck and cgen) and a mangled instance `jestyr_<name>__<targs>` is
+  emitted. `monomorphize_ret` infers the return too. Unit (typeck return-inference; cgen instance
+  emit, per-type instances, multi-param mangle), property + determinism over
+  `arb_bracket_generic_program`, gcc round-trip `examples/bracket_generic.jtr` (`42/0`).
+- ⏳ **Remaining:** the **body-side "blame the generic code"** bound check (inside `f[T: Tr]`, only
+  `Tr`'s methods callable on a `T` value — design §8.2) · trait **F** `dyn` vtable (reuses the
+  fn-pointer-field call machinery). Each lands with the same three layers.
 
 ---
 

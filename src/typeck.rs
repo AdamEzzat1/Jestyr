@@ -787,7 +787,12 @@ impl<'a> TypeChecker<'a> {
         })
     }
 
-    /// If `name` is generic, substitute its type arguments into `ret`.
+    /// If `name` is generic, substitute its type arguments into `ret`. Handles
+    /// both generic forms: a **comptime** `T: type` parameter takes its argument
+    /// as an explicit type expression (`pick(i32, …)`), while a **bracket** `[T:
+    /// Tr]` parameter is *inferred* from the value arguments' types (`sum(a, b)`
+    /// with `a: i32` ⇒ `T = i32`) — so `sum(a, b) -> T` types as `i32`, not the
+    /// bare type parameter.
     fn monomorphize_ret(&self, name: &str, args: &[ExprId], typ: &HashSet<String>, ret: Ty) -> Ty {
         let Some(f) = self.find_fn_decl(name) else { return ret };
         let mut subst = HashMap::new();
@@ -797,6 +802,23 @@ impl<'a> TypeChecker<'a> {
             if is_tp {
                 if let Some(a) = args.get(i) {
                     subst.insert(p.name.name.clone(), self.eval_type_expr(typ, *a));
+                }
+            }
+        }
+        // Bracket-form generics: infer each `T` by unifying the declared parameter
+        // types (`Ty::Opaque("T")`) against the actual argument types.
+        if !f.generics.is_empty() {
+            let tps: HashSet<String> = f.generics.iter().map(|g| g.name.name.clone()).collect();
+            let param_tys: Vec<Ty> = self
+                .table
+                .fns
+                .get(name)
+                .map(|s| s.params.iter().map(|p| p.ty.clone()).collect())
+                .unwrap_or_default();
+            for (i, pt) in param_tys.iter().enumerate() {
+                if let Some(a) = args.get(i) {
+                    let at = self.expr_types[a.0 as usize].clone();
+                    unify_tp(pt, &at, &tps, &mut subst);
                 }
             }
         }
@@ -2558,7 +2580,7 @@ fn head_matches(param: &Ty, recv: &Ty) -> bool {
 /// Unify a parameter type against an actual type, binding any type parameters
 /// it mentions (names in `tps`) into `subst`. A one-directional match — enough
 /// to recover `T = i32` from `List(T)` vs `List(i32)`.
-fn unify_tp(param: &Ty, actual: &Ty, tps: &HashSet<String>, subst: &mut HashMap<String, Ty>) {
+pub(crate) fn unify_tp(param: &Ty, actual: &Ty, tps: &HashSet<String>, subst: &mut HashMap<String, Ty>) {
     match (param, actual) {
         (Ty::Opaque(n), a) if tps.contains(n) => {
             subst.entry(n.clone()).or_insert_with(|| a.clone());
@@ -3055,6 +3077,29 @@ mod tests {
             d.iter().any(|m| m.message.contains("duplicate definition of trait `Add`")),
             "{:?}",
             d
+        );
+    }
+
+    // --- bracket-generic monomorphization (typeck side) ---
+
+    #[test]
+    fn a_bracket_generic_call_infers_its_return_type() {
+        // `dup[T](x: T) -> T` called at `5` infers `T = i32` from the value
+        // argument, so the call types as `i32` (not the bare type parameter).
+        let (ast, info) = analyze_full(
+            "fn dup[T](take x: T) -> T { return x } \
+             fn use_it() -> i32 { return dup(5) }",
+        );
+        let call = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| matches!(e.kind, ExprKind::Call { .. }).then_some(ExprId(i as u32)))
+            .expect("the dup(5) call");
+        assert_eq!(
+            info.type_of(call),
+            &Ty::Prim("i32"),
+            "bracket-generic return inferred from the argument type"
         );
     }
 

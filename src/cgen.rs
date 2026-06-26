@@ -29,6 +29,7 @@ use std::fmt::Write;
 use crate::ast::*;
 use crate::diag::Diagnostic;
 use crate::span::Span;
+use crate::typeck::unify_tp;
 use crate::types::{prim_ty, ImplCall, MethodRes, Ty, TypeInfo, TypeKindG};
 
 /// Lower a program to C, ending with the ordinary entry-point wrapper around
@@ -69,9 +70,13 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool) -> (String, Vec<Dia
     let mut error_tags: HashMap<String, i64> = HashMap::new();
     for item in &ast.items {
         if let Item::Fn(f) = item {
-            let is_gen = f.params.iter().any(|p| {
-                p.comptime && p.ty.is_some_and(|t| matches!(ast.type_at(t).kind, TypeKind::TypeKw))
-            });
+            // A function is monomorphized if it has a `comptime T: type` parameter
+            // *or* a bracket-form `[T: Bound]` generic — both are templates emitted
+            // per concrete instantiation, never directly.
+            let is_gen = !f.generics.is_empty()
+                || f.params.iter().any(|p| {
+                    p.comptime && p.ty.is_some_and(|t| matches!(ast.type_at(t).kind, TypeKind::TypeKw))
+                });
             if is_gen {
                 generics.insert(f.name.name.clone());
             }
@@ -5546,9 +5551,43 @@ impl<'a> Cgen<'a> {
         p.comptime && p.ty.is_some_and(|t| matches!(self.ast.type_at(t).kind, TypeKind::TypeKw))
     }
 
-    /// A generic function has at least one `comptime <name>: type` parameter.
+    /// A generic function has a `comptime <name>: type` parameter or a bracket-form
+    /// `[T: Bound]` generic — either makes it a monomorphization template.
     fn is_generic(&self, f: &FnDecl) -> bool {
-        f.params.iter().any(|p| self.is_type_param(p))
+        !f.generics.is_empty() || f.params.iter().any(|p| self.is_type_param(p))
+    }
+
+    /// The bracket-form generic parameter names of `f`, in declaration order.
+    fn bracket_param_names(&self, f: &FnDecl) -> Vec<String> {
+        f.generics.iter().map(|g| g.name.name.clone()).collect()
+    }
+
+    /// Infer a bracket-generic call's type arguments by unifying `f`'s declared
+    /// parameter types against the actual argument types — the inference-based
+    /// counterpart to a `comptime` generic's explicit type arguments. `subst` is
+    /// the enclosing monomorphization substitution (for a call nested in another
+    /// generic). Returns one `Ty` per bracket parameter, in declaration order.
+    fn infer_bracket_args(
+        &self,
+        f: &FnDecl,
+        args: &[ExprId],
+        subst: &HashMap<String, Ty>,
+    ) -> Vec<Ty> {
+        if f.generics.is_empty() {
+            return Vec::new();
+        }
+        let tps: HashSet<String> = f.generics.iter().map(|g| g.name.name.clone()).collect();
+        let mut inferred: HashMap<String, Ty> = HashMap::new();
+        for (i, p) in f.params.iter().enumerate() {
+            let (Some(pt), Some(a)) = (p.ty, args.get(i)) else { continue };
+            let param_ty = self.ast_type_to_ty(pt, subst);
+            let arg_ty = apply_subst(&self.info.type_of(*a).clone(), subst);
+            unify_tp(&param_ty, &arg_ty, &tps, &mut inferred);
+        }
+        f.generics
+            .iter()
+            .map(|g| inferred.get(&g.name.name).cloned().unwrap_or(Ty::Unknown))
+            .collect()
     }
 
     /// The backend can emit a function if it has no `self` (methods) and no
@@ -5579,7 +5618,12 @@ impl<'a> Cgen<'a> {
     }
 
     fn make_subst(&self, f: &FnDecl, args: &[Ty]) -> HashMap<String, Ty> {
-        self.type_param_names(f).into_iter().zip(args.iter().cloned()).collect()
+        // Type parameters in mangle/instance order: `comptime` type params first,
+        // then bracket-form `[T: Bound]` generics — matching how the instance's
+        // `args` vector is assembled at every call site.
+        let mut names = self.type_param_names(f);
+        names.extend(self.bracket_param_names(f));
+        names.into_iter().zip(args.iter().cloned()).collect()
     }
 
     fn mangle(&self, name: &str, args: &[Ty]) -> String {
@@ -5647,8 +5691,11 @@ impl<'a> Cgen<'a> {
         let Some(f) = self.find_fn(name) else { return "0".to_string() };
         let cpos = self.comptime_positions(f);
         let subst = self.subst.clone();
-        let type_args: Vec<Ty> =
+        // Type arguments in instance order: comptime (explicit) then bracket
+        // (inferred from the value args). Must match `make_subst`'s ordering.
+        let mut type_args: Vec<Ty> =
             cpos.iter().filter_map(|&p| args.get(p)).map(|a| self.eval_type_arg(*a, &subst)).collect();
+        type_args.extend(self.infer_bracket_args(f, args, &subst));
         let mangled = self.mangle(name, &type_args);
 
         let mut parts = Vec::new();
@@ -5754,24 +5801,26 @@ impl<'a> Cgen<'a> {
                     // function instantiates it just like a bare generic call.
                     if self.generics.contains(qname) {
                         if let Some(gf) = self.find_fn(qname) {
-                            let type_args: Vec<Ty> = self
+                            let mut type_args: Vec<Ty> = self
                                 .comptime_positions(gf)
                                 .iter()
                                 .filter_map(|&p| args.get(p))
                                 .map(|a| self.eval_type_arg(*a, subst))
                                 .collect();
+                            type_args.extend(self.infer_bracket_args(gf, args, subst));
                             work.push(Work::Fn(qname.clone(), type_args));
                         }
                     }
                 } else if let ExprKind::Name(n) = &ast.expr_at(*callee).kind {
                     if self.generics.contains(&n.name) {
                         if let Some(gf) = self.find_fn(&n.name) {
-                            let type_args: Vec<Ty> = self
+                            let mut type_args: Vec<Ty> = self
                                 .comptime_positions(gf)
                                 .iter()
                                 .filter_map(|&p| args.get(p))
                                 .map(|a| self.eval_type_arg(*a, subst))
                                 .collect();
+                            type_args.extend(self.infer_bracket_args(gf, args, subst));
                             work.push(Work::Fn(n.name.clone(), type_args));
                         }
                     }
@@ -6339,6 +6388,48 @@ mod tests {
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("(j_a + j_b)"), "primitive add is native: {c}");
         assert!(!c.contains("jestyr_impl_Add"), "no operator-trait dispatch for primitives: {c}");
+    }
+
+    // --- bracket-generic monomorphization (codegen side) ---
+
+    #[test]
+    fn monomorphizes_a_bracket_generic_from_the_argument_type() {
+        // `dup[T]` is a template: its `T` is inferred from the call's value
+        // argument and a mangled instance is emitted + called.
+        let src = "fn dup[T](take x: T) -> T { return x } \
+                   fn main() -> i32 { return dup(42) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(
+            c.contains("int32_t jestyr_dup__i32(int32_t j_x)"),
+            "i32 instance with T erased to int32_t: {c}"
+        );
+        assert!(c.contains("jestyr_dup__i32(42)"), "call targets the instance: {c}");
+    }
+
+    #[test]
+    fn a_bracket_generic_instantiates_once_per_concrete_type() {
+        // Two calls at different types produce two distinct mangled instances —
+        // each `T` recovered from that call's argument.
+        let src = "fn dup[T](take x: T) -> T { return x } \
+                   fn main() -> i32 { let a = dup(7) let b = dup(true) return a }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("jestyr_dup__i32("), "an i32 instance: {c}");
+        assert!(c.contains("jestyr_dup__bool("), "a distinct bool instance: {c}");
+    }
+
+    #[test]
+    fn a_multi_param_bracket_generic_mangles_each_type_arg() {
+        // `[A, B]` recovers both parameters from the two arguments, in order.
+        let src = "fn pair[A, B](read a: A, read b: B) -> i32 { return 0 } \
+                   fn main() -> i32 { return pair(1, true) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(
+            c.contains("jestyr_pair__i32_bool(int32_t j_a, bool j_b)"),
+            "both type args mangled, in declaration order: {c}"
+        );
     }
 
     #[test]

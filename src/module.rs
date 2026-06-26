@@ -493,6 +493,13 @@ mod tests {
     }
 
     #[test]
+    fn bracket_generic_example_compiles_clean() {
+        // Bracket-form generics `[T]` monomorphize: each `T` is inferred from the
+        // call's value arguments and a mangled instance is emitted.
+        pipeline_is_clean("examples/bracket_generic.jtr");
+    }
+
+    #[test]
     fn tests_demo_example_builds_a_clean_test_harness() {
         // The `@test`/`@bench` runner (workstream O): emit in test mode and check
         // the harness is generated without diagnostics.

@@ -454,6 +454,28 @@ mod prop {
         fn operator_programs_compile_deterministically((p, _s) in arb_operator_program()) {
             prop_assert_eq!(compile(&p), compile(&p));
         }
+
+        // ── bracket-generic monomorphization ──────────────────────────────────
+
+        /// **Monomorphization.** A bracket generic `dup[T]` called at a concrete
+        /// type emits a mangled instance `jestyr_dup__<t>` — `T` recovered from the
+        /// argument type, for every primitive. Teeth: treating bracket generics as
+        /// non-generic emits a single `jestyr_dup` with an unlowerable `T` instead.
+        #[test]
+        fn a_bracket_generic_is_monomorphized_per_instantiation(
+            (p, sym) in arb_bracket_generic_program(),
+        ) {
+            let (c, _) = compile(&p);
+            prop_assert!(c.contains(&sym), "expected a monomorphized instance `{}`:\n{}", sym, c);
+        }
+
+        /// Determinism holds on bracket-generic programs — byte-identical C every run.
+        #[test]
+        fn bracket_generic_programs_compile_deterministically(
+            (p, _s) in arb_bracket_generic_program(),
+        ) {
+            prop_assert_eq!(compile(&p), compile(&p));
+        }
     }
 
     /// A concrete primitive type to `impl` a trait for.
@@ -513,6 +535,19 @@ mod prop {
                  fn use_it(read a: V, read b: V) -> {ret} {{ return a {op} b }}"
             );
             (prog, format!("jestyr_impl_{tr}__V__{m}(j_a, j_b)"))
+        })
+    }
+
+    /// A *valid* program that calls a bracket generic `dup[T]` at a concrete type
+    /// `t` (inferred from the argument). Paired with the mangled instance prefix
+    /// the emitted C must contain (`jestyr_dup__<t>(`).
+    fn arb_bracket_generic_program() -> impl Strategy<Value = (String, String)> {
+        arb_prim_ty().prop_map(|t| {
+            let prog = format!(
+                "fn dup[T](take x: T) -> T {{ return x }} \
+                 fn use_it(take y: {t}) -> {t} {{ return dup(y) }}"
+            );
+            (prog, format!("jestyr_dup__{t}("))
         })
     }
 

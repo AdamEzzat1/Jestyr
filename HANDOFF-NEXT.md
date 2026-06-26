@@ -159,21 +159,51 @@ into operator syntax by `impl`-ing the matching trait:
 
 ---
 
-## Main objective — **bracket-generic codegen** (monomorphize `f[T: Tr]`)
+## ✅ Done — **bracket-generic codegen** (monomorphize `f[T: Tr]`)
 
-The next step (a prerequisite for the body-side bound check below): make
-bracket-form `[T: Bound]` params **real type parameters that compile and run**.
-Today they lower to `Ty::Opaque("T")` and the backend doesn't monomorphize them — a
-bracket-generic *call* hits cgen's "cannot lower external type `T`". The work:
-infer each `T` from the value arguments at a call (the inference-based counterpart
-to comptime generics' explicit `pick(i32, …)`), thread it through the
-monomorphization engine (`cgen::{is_generic, make_subst, mangle, collect_all_instances}`),
-and emit a mangled instance per concrete instantiation. This gives Stage D a gcc
-round-trip and unblocks the **body-side "blame the generic code" check** (design
-§8.2's "Zig fix": inside `f[T: Tr]`, only `Tr`'s methods are callable on a `T`
-value — needs bracket params as real type params + method resolution through the
-bound). Trait **Stage F** (`dyn` vtable, reusing the fn-pointer-field call
-machinery) is the remaining trait stage after these.
+Bracket-form `[T: Bound]` generics now **compile and run**: a bracket-generic call
+emits a mangled instance per concrete instantiation, with each `T` *inferred* from
+the value arguments (the inference-based counterpart to a `comptime` generic's
+explicit `pick(i32, …)`).
+
+- **Inference seam:** `typeck::unify_tp` is now `pub(crate)` and shared with cgen —
+  the one matcher that recovers `T = i32` from a declared `Opaque("T")` vs a
+  concrete arg type, used by both layers so they never disagree.
+- **typeck:** `monomorphize_ret` also infers bracket `T`s from the argument types,
+  so `dup(5) -> T` types as `i32` (not the bare parameter).
+- **cgen:** `is_generic` and the `generics` set include bracket generics;
+  `infer_bracket_args` unifies declared params against `info.type_of(arg)` (under
+  the enclosing subst) to get the type args; `make_subst` maps `comptime ++
+  bracket` names; instance collection (`find_calls_expr`) and emission
+  (`emit_generic_call`) append the inferred bracket args to the comptime ones. A
+  pure-bracket call passes all value args (no comptime positions to erase).
+- **Tests (teeth-verified by mutation):** typeck unit (return inferred from the
+  arg), cgen unit (i32 instance emitted + called, two types → two instances,
+  multi-param mangles each arg in order), property + determinism over
+  `arb_bracket_generic_program`, and the gcc round-trip `examples/bracket_generic.jtr`
+  (`42/0`). Suite **390 green**, warning-clean.
+- **Scope note:** the body may only use `T` *structurally* (store/return/pass) —
+  calling a trait method on a `T` value needs the body-side resolution below.
+  `comptime` and bracket generics may not yet be **mixed** in one signature in a
+  way that crosses their arg orders (the common pure-bracket / pure-comptime cases
+  are correct; a mixed signature is exotic and untested).
+
+---
+
+## Main objective — **body-side bound enforcement** (the "Zig fix")
+
+The final flagged workstream. Inside a bracket-generic body `f[T: Tr]`, a method
+call on a `T`-typed value (`x.m()` where `x: T`) should resolve **through the
+bound** `Tr` — type-checking iff `m` is a method of `Tr`, typing as `m`'s declared
+return; calling a non-`Tr` method on a `T` value is a **definition-site error**
+(design §8.2's "blame the generic code, not the caller"). The pieces now in place:
+bracket params monomorphize (above), and `unify_tp`/`impl_index`/`TraitDef.methods`
+exist. The work is typeck: recognize a bracket param `T` as a bound type parameter
+in the body (it lowers to `Ty::Opaque("T")` today — thread the param→bound map into
+`infer`), and when a method call's receiver is such a `T`, look the method up in
+`Tr`'s `TraitDef` (and resolve its return from the trait method signature) instead
+of failing. Trait **Stage F** (`dyn` vtable, reusing the fn-pointer-field call
+machinery) is the remaining trait stage after this.
 
 ---
 
@@ -229,7 +259,7 @@ C-linker `WinMain` error (`test` mode is exempt; it synthesizes its own `main`).
 
 ## Test posture
 
-Suite is **383 green**, warning-clean, clean across the `dharht-experiment` and
+Suite is **390 green**, warning-clean, clean across the `dharht-experiment` and
 `bench-alloc` feature builds. New coverage adapts to the *real* harness
 (`src/proptests.rs`: `mod prop` + `mod fuzz` + `arb_*_program` generators,
 `typeck_diags` for diagnostic differentials) — the handoff's referenced

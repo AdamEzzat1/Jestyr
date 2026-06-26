@@ -1,0 +1,16 @@
+// Bracket-form generics `[T: Bound]` now monomorphize and run. The type
+// parameter is *inferred* from the value arguments at each call (the
+// inference-based counterpart to a `comptime T: type` generic's explicit
+// `pick(i32, …)`), and a mangled instance is emitted per concrete type.
+
+// An unbounded bracket generic — `T` flows through structurally.
+fn dup[T](take x: T) -> T { return x }
+
+// Two distinct instantiations from the *argument* types alone.
+fn pair[A, B](read a: A, read b: B) -> i32 { return 0 }
+
+fn main() -> i32 {
+    print_int(dup(42))       // 42  — dup instantiated at i32
+    print_int(pair(1, 2))    // 0   — pair[A=i32, B=i32]
+    return 0
+}
