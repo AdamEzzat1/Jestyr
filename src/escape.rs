@@ -354,6 +354,7 @@ impl<'a> Checker<'a> {
                 self.check_give_away(ctx, id, *callee, args);
                 self.check_loop_mutation(ctx, id, *callee, args);
                 self.check_no_alloc_call(id, *callee, span);
+                self.check_manual_drop(id, span);
                 return;
             }
             ExprKind::Binary { lhs, rhs, .. } => {
@@ -625,6 +626,21 @@ impl<'a> Checker<'a> {
                     let borrow = self.root_name(ctx, arg);
                     self.give_away_error(arg, &borrow, &pname, &name);
                 }
+            }
+        }
+    }
+
+    /// Reject a manual `value.drop()` call. `drop` is run *automatically* by the
+    /// compiler at scope exit (in reverse declaration order); calling it by hand
+    /// would double-free (the auto-drop still fires). The destructor is
+    /// inspectable (`--show-drops`) but not hand-callable — Rust's rule.
+    fn check_manual_drop(&mut self, call_id: ExprId, span: Span) {
+        if let Some(ic) = self.info.impl_calls.get(&call_id) {
+            if ic.trait_name == "Drop" && ic.method == "drop" {
+                self.error(
+                    span,
+                    "cannot call `drop` manually — it runs automatically at scope exit (see `--show-drops`)",
+                );
             }
         }
     }
@@ -942,6 +958,16 @@ mod tests {
         let d = escapes("@no_alloc fn f() -> i32 { region r { let x = region_alloc(r, i32, 1) } return 0 }");
         assert!(!d.is_empty(), "a region block must be rejected: {:?}", d);
         assert!(d.iter().any(|m| m.message.contains("region")), "{:?}", d);
+    }
+
+    #[test]
+    fn cannot_call_drop_manually() {
+        let d = escapes(
+            "trait Drop { fn drop(mut self) } struct R { id: i32 } \
+             impl Drop for R { fn drop(mut self) { print_int(self.id) } } \
+             fn f() { let a = R{ id: 1 } a.drop() }",
+        );
+        assert!(d.iter().any(|m| m.message.contains("cannot call `drop` manually")), "{:?}", d);
     }
 
     #[test]
