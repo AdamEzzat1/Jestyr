@@ -190,20 +190,50 @@ explicit `pick(i32, …)`).
 
 ---
 
-## Main objective — **body-side bound enforcement** (the "Zig fix")
+## ✅ Done — **body-side bound enforcement** (the "Zig fix")
 
-The final flagged workstream. Inside a bracket-generic body `f[T: Tr]`, a method
-call on a `T`-typed value (`x.m()` where `x: T`) should resolve **through the
-bound** `Tr` — type-checking iff `m` is a method of `Tr`, typing as `m`'s declared
-return; calling a non-`Tr` method on a `T` value is a **definition-site error**
-(design §8.2's "blame the generic code, not the caller"). The pieces now in place:
-bracket params monomorphize (above), and `unify_tp`/`impl_index`/`TraitDef.methods`
-exist. The work is typeck: recognize a bracket param `T` as a bound type parameter
-in the body (it lowers to `Ty::Opaque("T")` today — thread the param→bound map into
-`infer`), and when a method call's receiver is such a `T`, look the method up in
-`Tr`'s `TraitDef` (and resolve its return from the trait method signature) instead
-of failing. Trait **Stage F** (`dyn` vtable, reusing the fn-pointer-field call
-machinery) is the remaining trait stage after this.
+Inside a bracket-generic body `f[T: Tr]`, a method call on a `T`-typed value now
+resolves **through the bound** `Tr` — and dispatches to the concrete `impl` at each
+instantiation:
+
+- **Context:** `check_fn` threads the current function's bracket params → bounds
+  into `TypeChecker::cur_type_param_bounds` (restored on exit).
+- **typeck** (`resolve_bound_method`, last in the method-call resolution chain):
+  for `x.m()` where `x: Ty::Opaque(T)` and `T` is a bracket param, `m` must be a
+  method of `T`'s bound `Tr` (`TraitDef::has_method`) — else a **definition-site
+  error** ("blame the generic code"); an *unbounded* `[U]` rejects every method.
+  Types the call by the trait method's declared return (`trait_method_ret`, with
+  `Self` → the parameter). Records `TypeInfo::bound_method_calls[id] =
+  BoundMethodCall { trait, method, type_param }`.
+- **cgen** (in `emit_call`, after the `impl_calls` check): the concrete receiver
+  type is `T`'s binding in the *active monomorphization* (`self.subst[type_param]`),
+  so a synthesized `ImplCall` reuses `emit_impl_call` to dispatch to
+  `jestyr_impl_<Tr>__<concrete>__<m>`. The same `x.m()` ExprId lowers to a
+  *different* impl per instance — the whole reason the resolution is recorded
+  abstractly (trait+method+param) rather than as a concrete `ImplCall`.
+- **Tests (teeth-verified by mutation):** typeck unit (bound method → typed +
+  recorded, non-bound method → definition error, unbounded param → error), cgen
+  unit (per-instance dispatch, asserting the *call* `(j_x)` not the always-emitted
+  impl def), property + determinism over `arb_bound_method_program`,
+  `fuzz_bound_method_calls`, and the gcc round-trip `examples/bound_method.jtr`
+  (`42/70` — one body, two impls). Suite **398 green**, warning-clean.
+
+This composes the three prior layers with almost no new machinery: Stage C emits
+the impl methods, bracket-generic codegen monomorphizes the body + maintains
+`subst`, and the "Zig fix" synthesizes the per-instance `ImplCall`.
+
+---
+
+## Main objective — trait **Stage F** (`dyn` vtable)
+
+The last remaining trait stage. `dyn Trait` erases the receiver type and dispatches
+through a compiler-**synthesized vtable** struct that is byte-compatible with the
+hand-written fn-pointer-field vtable from the first done section — so it reuses the
+existing fn-pointer-field call machinery (the generic-struct field-call path
+finished at the top of this file) rather than inventing a parallel one. Emit a
+vtable struct per trait (one fn-pointer field per method), populate it from each
+`impl`, and lower a `dyn Trait` value to `{data_ptr, vtable_ptr}` with `d.m(args)`
+calling through the vtable slot. See `docs/TESTING.md §5.12`.
 
 ---
 
@@ -251,15 +281,21 @@ C-linker `WinMain` error (`test` mode is exempt; it synthesizes its own `main`).
 - **E — operator traits:** `+`/`*`/`==`/`<` desugar to synthetic `Add`/`Mul`/`Eq`/`Ord`
   traits; a binary op on a user type dispatches through its `impl` (Stage C path).
   Plus the `-ffp-contract=off` f64 determinism seam. See the done-section / §5.12.
-- **Remaining (in order):** **bracket-generic codegen** + the **body-side bound
-  check** (see Main Objective above) · trait **F** `dyn` vtable (reuses the
-  fn-pointer-field call machinery — see the first done section's arc).
+- **Bracket-generic codegen** (not a trait stage): `[T: Bound]` generics
+  monomorphize — each `T` inferred from the value args (`unify_tp`, shared
+  typeck↔cgen), a mangled instance emitted per instantiation.
+- **Body-side bound enforcement (the "Zig fix"):** inside `f[T: Tr]`, `x.m()`
+  resolves through the bound (`resolve_bound_method`), erroring on a non-bound
+  method, and dispatches to the concrete `impl` per instance via
+  `bound_method_calls` + the active `subst`. See the done-section / §5.12.
+- **Remaining:** trait **F** `dyn` vtable (reuses the fn-pointer-field call
+  machinery — see Main Objective + the first done section's arc).
 
 ---
 
 ## Test posture
 
-Suite is **390 green**, warning-clean, clean across the `dharht-experiment` and
+Suite is **398 green**, warning-clean, clean across the `dharht-experiment` and
 `bench-alloc` feature builds. New coverage adapts to the *real* harness
 (`src/proptests.rs`: `mod prop` + `mod fuzz` + `arb_*_program` generators,
 `typeck_diags` for diagnostic differentials) — the handoff's referenced

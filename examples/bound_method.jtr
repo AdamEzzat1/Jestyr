@@ -1,0 +1,30 @@
+// The "blame the generic code" rule (design §8.2): inside a bracket-generic
+// `f[T: Show]`, a method call on a `T` value resolves *through the bound* `Show`.
+// At each instantiation the call dispatches to the concrete `impl` — selected by
+// the monomorphization's binding for `T` — so it both type-checks against the
+// bound and lowers to a real static call.
+
+trait Show {
+    fn show(read self) -> i32
+}
+
+impl Show for i32 {
+    fn show(read self) -> i32 { return self + 1 }
+}
+
+struct P { v: i32 }
+impl Show for P {
+    fn show(read self) -> i32 { return self.v * 10 }
+}
+
+// `x.show()` is checked against the bound `Show` once, here — and lowers to the
+// right impl per instantiation.
+fn describe[T: Show](read x: T) -> i32 {
+    return x.show()
+}
+
+fn main() -> i32 {
+    print_int(describe(41))          // 42  — describe[T=i32] → Show::show for i32
+    print_int(describe(P{ v: 7 }))   // 70  — describe[T=P]   → Show::show for P
+    return 0
+}

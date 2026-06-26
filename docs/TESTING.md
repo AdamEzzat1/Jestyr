@@ -322,9 +322,16 @@ Run: `cargo test trait_programs`, `cargo test parses_a_trait`, `cargo bolero tes
   emitted. `monomorphize_ret` infers the return too. Unit (typeck return-inference; cgen instance
   emit, per-type instances, multi-param mangle), property + determinism over
   `arb_bracket_generic_program`, gcc round-trip `examples/bracket_generic.jtr` (`42/0`).
-- ⏳ **Remaining:** the **body-side "blame the generic code"** bound check (inside `f[T: Tr]`, only
-  `Tr`'s methods callable on a `T` value — design §8.2) · trait **F** `dyn` vtable (reuses the
-  fn-pointer-field call machinery). Each lands with the same three layers.
+- ✅ **Body-side bound enforcement (the "Zig fix", design §8.2):** inside `f[T: Tr]`, a method call
+  on a `T` value resolves through the bound (`resolve_bound_method`) — a non-bound method (or any
+  method on an unbounded `[U]`) is a *definition-site* error; the call types by the trait method's
+  return and is recorded in `bound_method_calls`. cgen selects the concrete `impl` per monomorphized
+  instance via the active `subst`, so one `x.m()` lowers to different impls per instantiation. Unit
+  (typeck: bound method typed, non-bound + unbounded errors; cgen: per-instance dispatch asserting
+  the *call*, not the impl def), property + determinism over `arb_bound_method_program`,
+  `fuzz_bound_method_calls`, gcc round-trip `examples/bound_method.jtr` (`42/70`).
+- ⏳ **Remaining:** trait **F** `dyn` vtable (reuses the fn-pointer-field call machinery). Lands with
+  the same three layers.
 
 ---
 

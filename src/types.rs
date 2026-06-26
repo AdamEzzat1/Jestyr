@@ -241,6 +241,18 @@ pub struct ImplCall {
     pub method: String,
 }
 
+/// A method call on a **bracket type parameter**, resolved through its bound (the
+/// "Zig fix"): inside `f[T: Tr]`, `x.m()` on a `T` value calls `Tr`'s `m`. The
+/// concrete impl isn't known at type-check time (`T` is abstract), so the backend
+/// selects it per monomorphized instance by looking `type_param` up in the active
+/// type substitution and dispatching to `impl <trait_name> for <that type>`.
+#[derive(Clone, Debug)]
+pub struct BoundMethodCall {
+    pub trait_name: String,
+    pub method: String,
+    pub type_param: String,
+}
+
 /// All top-level declarations, indexed by name — the output of name resolution.
 #[derive(Default)]
 pub struct GlobalTable {
@@ -301,8 +313,11 @@ pub struct TypeInfo {
     pub qualified: HashMap<ExprId, String>,
     /// `Call`-expr id → trait-impl method resolution, for `recv.m(args)` calls
     /// that resolved through an `impl Trait for <recv-type>` (traits, Stage B).
-    #[allow(dead_code)] // consumed by cgen once static dispatch lands (Stage C)
     pub impl_calls: HashMap<ExprId, ImplCall>,
+    /// `Call`-expr id → a method call on a bracket type parameter resolved through
+    /// its bound (the "Zig fix"); the backend selects the concrete impl per
+    /// monomorphized instance via the active type substitution.
+    pub bound_method_calls: HashMap<ExprId, BoundMethodCall>,
 }
 
 impl TypeInfo {

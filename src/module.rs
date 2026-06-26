@@ -500,6 +500,13 @@ mod tests {
     }
 
     #[test]
+    fn bound_method_example_compiles_clean() {
+        // The "Zig fix": inside `describe[T: Show]`, `x.show()` resolves through
+        // the bound and dispatches to the concrete impl per instantiation.
+        pipeline_is_clean("examples/bound_method.jtr");
+    }
+
+    #[test]
     fn tests_demo_example_builds_a_clean_test_harness() {
         // The `@test`/`@bench` runner (workstream O): emit in test mode and check
         // the harness is generated without diagnostics.

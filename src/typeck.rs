@@ -51,6 +51,8 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
         method_calls: HashMap::new(),
         qualified: HashMap::new(),
         impl_calls: HashMap::new(),
+        bound_method_calls: HashMap::new(),
+        cur_type_param_bounds: HashMap::new(),
         cur_expected: None,
         cur_ret: None,
         diags: Vec::new(),
@@ -64,6 +66,7 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
             method_calls: tc.method_calls,
             qualified: tc.qualified,
             impl_calls: tc.impl_calls,
+            bound_method_calls: tc.bound_method_calls,
         },
         tc.diags,
     )
@@ -108,6 +111,14 @@ struct TypeChecker<'a> {
     qualified: HashMap<ExprId, String>,
     /// `Call`-expr id → trait-impl method resolution (traits, Stage B).
     impl_calls: HashMap<ExprId, ImplCall>,
+    /// `Call`-expr id → a method call on a *bracket type parameter* resolved
+    /// through its bound (the "Zig fix"). The concrete impl is selected per
+    /// monomorphized instance in the backend, via the active type substitution.
+    bound_method_calls: HashMap<ExprId, BoundMethodCall>,
+    /// The bracket type parameters in scope for the function being checked, each
+    /// mapped to its declared bound (`None` if unbounded). Drives the body-side
+    /// "only the bound's methods are callable on a `T` value" check.
+    cur_type_param_bounds: HashMap<String, Option<String>>,
     /// The type a sub-expression is *expected* to have (from a `let` annotation
     /// or a `return`), used to resolve an otherwise-ambiguous nullary generic
     /// variant like `none` to its instantiation (`Option(i32)`). A minimal,
@@ -428,6 +439,61 @@ impl<'a> TypeChecker<'a> {
         };
         self.impl_calls.insert(call_id, ImplCall { trait_name, type_key: key, method: method.to_string() });
         Some(ret)
+    }
+
+    /// The "Zig fix" (design §8.2): inside a bracket-generic body `f[T: Tr]`, a
+    /// method call `x.m()` on a value of the type parameter `T` resolves *through
+    /// the bound* `Tr`. It type-checks iff `m` is one of `Tr`'s methods (typed by
+    /// `m`'s declared return); a method **not** in the bound — or any method on an
+    /// *unbounded* `[U]` — is a **definition-site** error ("blame the generic code,
+    /// not the caller"). Records the resolution so the backend can dispatch to the
+    /// concrete `impl` per monomorphized instance. `None` ⇒ the receiver isn't a
+    /// bracket type parameter of the enclosing function (try other resolutions).
+    fn resolve_bound_method(&mut self, call_id: ExprId, mname: &str, recv_ty: &Ty) -> Option<Ty> {
+        let Ty::Opaque(tp) = recv_ty else { return None };
+        let bound = self.cur_type_param_bounds.get(tp)?.clone();
+        let span = self.ast.expr_at(call_id).span;
+        let Some(tr) = bound else {
+            self.error(
+                span,
+                format!("no method `{mname}` on unbounded type parameter `{tp}` — add a bound `[{tp}: Trait]`"),
+            );
+            return Some(Ty::Error);
+        };
+        if !self.table.traits.get(&tr).is_some_and(|t| t.has_method(mname)) {
+            self.error(
+                span,
+                format!("no method `{mname}` on type parameter `{tp}`: its bound `{tr}` has no such method"),
+            );
+            return Some(Ty::Error);
+        }
+        self.bound_method_calls.insert(
+            call_id,
+            BoundMethodCall { trait_name: tr.clone(), method: mname.to_string(), type_param: tp.clone() },
+        );
+        Some(self.trait_method_ret(&tr, mname, recv_ty))
+    }
+
+    /// The declared return type of trait `trait_name`'s method `mname`, with `Self`
+    /// resolved to `self_ty` (here the opaque type parameter). `Unknown` for a
+    /// synthetic (operator) trait or an absent method — best-effort typing.
+    fn trait_method_ret(&self, trait_name: &str, mname: &str, self_ty: &Ty) -> Ty {
+        for item in &self.ast.items {
+            if let Item::Trait(t) = item {
+                if t.name.name == trait_name {
+                    for m in &t.methods {
+                        if m.name.name == mname {
+                            let r =
+                                m.ret_ty.map(|ty| self.lower_type(&HashSet::new(), ty)).unwrap_or(Ty::Unit);
+                            let subst: HashMap<String, Ty> =
+                                std::iter::once(("Self".to_string(), self_ty.clone())).collect();
+                            return subst_ty(&r, &subst);
+                        }
+                    }
+                }
+            }
+        }
+        Ty::Unknown
     }
 
     /// Definition-site bounds (traits, Stage D), the declaration half: every
@@ -1131,6 +1197,15 @@ impl<'a> TypeChecker<'a> {
 
     fn check_fn(&mut self, f: &FnDecl, enclosing: &HashSet<String>, self_ty: &Ty) {
         let typ = self.fn_type_params(f, enclosing);
+        // The bracket type parameters in scope for this body (→ their bounds), for
+        // the "Zig fix": only a bound's methods are callable on a `T` value.
+        let prev_bounds = std::mem::replace(
+            &mut self.cur_type_param_bounds,
+            f.generics
+                .iter()
+                .map(|g| (g.name.name.clone(), g.bound.as_ref().map(|b| b.name.clone())))
+                .collect(),
+        );
         let mut scope: Scope = vec![HashMap::new()];
         for p in &f.params {
             let pty = if p.is_self {
@@ -1148,6 +1223,7 @@ impl<'a> TypeChecker<'a> {
         self.cur_ret = f.ret_ty.map(|t| self.lower_type(&typ, t));
         self.infer_block(&mut scope, &typ, self_ty, &f.body);
         self.cur_ret = prev_ret;
+        self.cur_type_param_bounds = prev_bounds;
     }
 
     fn infer_block(&mut self, scope: &mut Scope, typ: &HashSet<String>, self_ty: &Ty, block: &Block) -> Ty {
@@ -1333,6 +1409,13 @@ impl<'a> TypeChecker<'a> {
                     // `recv.m(args)` resolving through an `impl Trait for <recv>`
                     // (traits, Stage B) — a fallback after free-fn / struct methods.
                     if let Some(ret) = self.resolve_impl_method(id, &name, &recv_ty) {
+                        return self.set(id, ret);
+                    }
+                    // `x.m(args)` where `x: T` is a **bracket type parameter** of the
+                    // enclosing generic: resolve `m` *through the bound* `Tr` (the
+                    // "Zig fix" — design §8.2). A method not in `Tr` is a
+                    // definition-site error ("blame the generic code").
+                    if let Some(ret) = self.resolve_bound_method(id, &name, &recv_ty) {
                         return self.set(id, ret);
                     }
                     return self.set(id, Ty::Unknown);
@@ -3100,6 +3183,57 @@ mod tests {
             info.type_of(call),
             &Ty::Prim("i32"),
             "bracket-generic return inferred from the argument type"
+        );
+    }
+
+    // --- body-side bound enforcement: the "Zig fix" ---
+
+    #[test]
+    fn a_bound_method_call_resolves_through_the_bound() {
+        // Inside `describe[T: Show]`, `x.show()` resolves through `Show` and types
+        // as `Show::show`'s return — and is recorded for per-instance dispatch.
+        let (ast, info) = analyze_full(
+            "trait Show { fn show(read self) -> i64 } \
+             impl Show for i32 { fn show(read self) -> i64 { return 1 } } \
+             fn describe[T: Show](read x: T) -> i64 { return x.show() }",
+        );
+        let call = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| {
+                let id = ExprId(i as u32);
+                (matches!(e.kind, ExprKind::Call { .. })
+                    && info.bound_method_calls.contains_key(&id))
+                .then_some(id)
+            })
+            .expect("the x.show() bound-method call");
+        assert_eq!(info.type_of(call), &Ty::Prim("i64"), "typed by the bound method's return");
+    }
+
+    #[test]
+    fn calling_a_non_bound_method_on_a_type_param_is_an_error() {
+        // The headline "blame the generic code" check: a method the bound doesn't
+        // provide is rejected at the generic's *definition*, not at a call site.
+        let (_i, d) = analyze(
+            "trait Show { fn show(read self) -> i32 } \
+             fn describe[T: Show](read x: T) -> i32 { return x.other() }",
+        );
+        assert!(
+            d.iter().any(|m| m.message.contains("its bound `Show` has no such method")),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn calling_a_method_on_an_unbounded_type_param_is_an_error() {
+        // No bound ⇒ no methods are available on the value at all.
+        let (_i, d) = analyze("fn f[U](read x: U) -> i32 { return x.anything() }");
+        assert!(
+            d.iter().any(|m| m.message.contains("unbounded type parameter `U`")),
+            "{:?}",
+            d
         );
     }
 

@@ -476,6 +476,28 @@ mod prop {
         ) {
             prop_assert_eq!(compile(&p), compile(&p));
         }
+
+        // ── body-side bound enforcement (the "Zig fix") ───────────────────────
+
+        /// **Per-instance bound dispatch.** Inside `g[T: xS]`, `x.xm()` lowers to
+        /// the concrete `impl xS for <t>` method at each instantiation — for every
+        /// primitive `t`. Teeth: dropping the bound-method resolution emits an
+        /// unresolved `j_x.j_xm(...)` instead of the mangled impl symbol.
+        #[test]
+        fn a_bound_method_dispatches_to_the_concrete_impl(
+            (p, sym) in arb_bound_method_program(),
+        ) {
+            let (c, _) = compile(&p);
+            prop_assert!(c.contains(&sym), "expected bound-method dispatch `{}`:\n{}", sym, c);
+        }
+
+        /// Determinism holds on bound-method programs — byte-identical C every run.
+        #[test]
+        fn bound_method_programs_compile_deterministically(
+            (p, _s) in arb_bound_method_program(),
+        ) {
+            prop_assert_eq!(compile(&p), compile(&p));
+        }
     }
 
     /// A concrete primitive type to `impl` a trait for.
@@ -548,6 +570,23 @@ mod prop {
                  fn use_it(take y: {t}) -> {t} {{ return dup(y) }}"
             );
             (prog, format!("jestyr_dup__{t}("))
+        })
+    }
+
+    /// A *valid* program where a bound generic `g[T: xS]` calls the bound method
+    /// `x.xm()`, instantiated at a concrete `t` that `impl`s `xS`. Paired with the
+    /// per-instance dispatch symbol the emitted C must contain.
+    fn arb_bound_method_program() -> impl Strategy<Value = (String, String)> {
+        arb_prim_ty().prop_map(|t| {
+            let prog = format!(
+                "trait xS {{ fn xm(read self) -> i32 }} \
+                 impl xS for {t} {{ fn xm(read self) -> i32 {{ return 0 }} }} \
+                 fn g[T: xS](read x: T) -> i32 {{ return x.xm() }} \
+                 fn use_it(read y: {t}) -> i32 {{ return g(y) }}"
+            );
+            // The dispatch *call* (receiver `j_x`), not the impl method definition
+            // (`j_self`) — so the property has teeth for the bound-method lowering.
+            (prog, format!("jestyr_impl_xS__{t}__xm(j_x)"))
         })
     }
 
@@ -807,6 +846,24 @@ mod fuzz {
                  impl B for i32 {{ fn m(read self) -> i32 {{ return 0 }} }} \
                  fn g[T: B](read x: T) -> i32 {{ {s} }} \
                  fn c(read y: i32) -> i32 {{ return g(y) }}"
+            );
+            run_pipeline(&prog);
+            assert_eq!(compile(&prog), compile(&prog));
+        });
+    }
+
+    /// Coverage-guided fuzzing of the **body-side bound check** (the "Zig fix"):
+    /// fuzz bytes fill a bound generic's body while `x.xm()` drives the
+    /// bound-method resolution (typeck) and per-instance dispatch (cgen). Total +
+    /// deterministic on arbitrary body soup.
+    #[test]
+    fn fuzz_bound_method_calls() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let prog = format!(
+                "trait xS {{ fn xm(read self) -> i32 }} \
+                 impl xS for i32 {{ fn xm(read self) -> i32 {{ return 0 }} }} \
+                 fn g[T: xS](read x: T) -> i32 {{ {s} return x.xm() }} \
+                 fn use_it(read y: i32) -> i32 {{ return g(y) }}"
             );
             run_pipeline(&prog);
             assert_eq!(compile(&prog), compile(&prog));

@@ -3113,6 +3113,19 @@ impl<'a> Cgen<'a> {
         if let Some(ic) = self.info.impl_calls.get(&call_id).cloned() {
             return self.emit_impl_call(callee, &ic, args);
         }
+        // `x.m(args)` on a *bracket type parameter* `T`, resolved through its bound
+        // (the "Zig fix"). The concrete receiver type is `T`'s binding in the
+        // *current monomorphization* — so we recover it from `self.subst` and
+        // dispatch to `impl <bound> for <that type>`, reusing the Stage C path.
+        if let Some(bmc) = self.info.bound_method_calls.get(&call_id).cloned() {
+            let concrete = self.subst.get(&bmc.type_param).cloned().unwrap_or(Ty::Unknown);
+            let ic = ImplCall {
+                trait_name: bmc.trait_name,
+                type_key: self.info.table.ty_key(&concrete),
+                method: bmc.method,
+            };
+            return self.emit_impl_call(callee, &ic, args);
+        }
         // Invoking a closure value (a local bound to one, or an inline closure).
         if self.is_closure_typed(callee) {
             return self.emit_closure_invoke(callee, args);
@@ -6429,6 +6442,31 @@ mod tests {
         assert!(
             c.contains("jestyr_pair__i32_bool(int32_t j_a, bool j_b)"),
             "both type args mangled, in declaration order: {c}"
+        );
+    }
+
+    #[test]
+    fn a_bound_method_call_dispatches_per_monomorphized_instance() {
+        // The "Zig fix" payoff: one generic body `x.show()` lowers to a *different*
+        // impl per instantiation — the concrete type recovered from the active
+        // monomorphization substitution.
+        let src = "trait Show { fn show(read self) -> i32 } \
+                   impl Show for i32 { fn show(read self) -> i32 { return self } } \
+                   struct P { v: i32 } \
+                   impl Show for P { fn show(read self) -> i32 { return self.v } } \
+                   fn describe[T: Show](read x: T) -> i32 { return x.show() } \
+                   fn main() -> i32 { return describe(1) + describe(P{ v: 2 }) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        // Assert the *call* (receiver `j_x`), not the always-emitted impl method
+        // definition (which uses `j_self`) — so this has teeth for the dispatch.
+        assert!(
+            c.contains("jestyr_impl_Show__i32__show(j_x)"),
+            "the i32 instance body dispatches to the i32 impl: {c}"
+        );
+        assert!(
+            c.contains("jestyr_impl_Show__P__show(j_x)"),
+            "the P instance body dispatches to the P impl: {c}"
         );
     }
 
