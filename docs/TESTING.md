@@ -404,9 +404,17 @@ so they run under the toolchain-free default `cargo test`.
 - ✅ **Allocator-parameterized `Vec`, freed by RAII (Increment 6).** `IntVec` stores its `Allocator`,
   grows via the vtable, and `Drop` frees the buffer at scope exit *through the stored allocator* — the
   integration forcing function. gcc round-trip `examples/vec_alloc.jtr` (`5/10/50/99`, then auto-free).
-- **Remaining (future work):** `defer`/`errdefer`; generic `Vec(T, A)` (needs generic-struct `Drop`
-  monomorphization) + porting `std/mem.jtr`/`std/list.jtr` off the enum; owned (`take`) parameter drop;
-  a leak-catching debug allocator (the `--features c-oracle` gcc-round-trip exit criterion);
+- ✅ **Generic `Vec(T, A)` + generic-call move precision (Increment 7).** `Vec(T)` monomorphized per
+  element type, RAII-freed via `impl Drop for Vec(i32)` even through generic `vec_push(i32, v, …)`
+  operations. `collect_moved` aligns args to params by call shape (free call skips the leading
+  `comptime` type-arg slot; method/impl call offsets past the receiver), so a generic `mut`-borrow arg
+  is a borrow, not a move. Goldens `generic_struct_instantiation_drops_at_scope_exit` /
+  `generic_call_borrow_arg_does_not_move_droppable`; property `generic_borrow_call_still_drops_once`;
+  gcc round-trip `examples/vec_generic.jtr`. **Teeth:** reverting to "all generic args move" fails the
+  seam tests, then passes on revert.
+- **Remaining (future work):** a *blanket* generic `impl[T] Drop for Vec(T)` + porting
+  `std/mem.jtr`/`std/list.jtr` off the enum; `defer`/`errdefer`; owned (`take`) parameter drop; a
+  leak-catching debug allocator (the `--features c-oracle` gcc-round-trip exit criterion);
   `@deterministic` allocators; linear / must-use types; conditional (per-branch) move precision;
   transitive `@no_alloc`. See `DROP-ALLOC-PHASE3.md`.
 
