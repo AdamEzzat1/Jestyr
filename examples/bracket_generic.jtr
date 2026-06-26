@@ -9,8 +9,13 @@ fn dup[T](take x: T) -> T { return x }
 // Two distinct instantiations from the *argument* types alone.
 fn pair[A, B](read a: A, read b: B) -> i32 { return 0 }
 
+// Both generic forms in one signature: an explicit `comptime T: type` and an
+// inferred bracket `[U]`. They mangle `comptime ++ bracket` into one instance.
+fn tagged[U](comptime T: type, take x: T, take u: U) -> T { return x }
+
 fn main() -> i32 {
-    print_int(dup(42))       // 42  — dup instantiated at i32
-    print_int(pair(1, 2))    // 0   — pair[A=i32, B=i32]
+    print_int(dup(42))                // 42  — dup instantiated at i32
+    print_int(pair(1, 2))             // 0   — pair[A=i32, B=i32]
+    print_int(tagged(i32, 99, true))  // 99  — T=i32 explicit, U=bool inferred
     return 0
 }

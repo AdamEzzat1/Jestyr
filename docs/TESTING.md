@@ -301,27 +301,33 @@ Run: `cargo test trait_programs`, `cargo test parses_a_trait`, `cargo bolero tes
     impl/call types), `satisfied_bound_never_errors_at_the_call` (completeness).
   - Fuzz (`fuzz`): `fuzz_definition_site_bounds` — fuzz bytes in a bracket-generic body, a real call
     drives `check_call_bounds`; total + deterministic.
-- ✅ **Stage E — operator traits.** The built-in operators desugar to synthetic-trait methods —
-  `+`→`Add::add`, `*`→`Mul::mul`, `==`→`Eq::eq`, `<`→`Ord::lt` (`register_operator_traits`). A binary
+- ✅ **Stage E — operator traits.** The built-in operators desugar to synthetic-trait methods. Six
+  *primitive* methods are implemented directly — `+`→`Add::add`, `-`→`Sub::sub`, `*`→`Mul::mul`,
+  `/`→`Div::div`, `==`→`Eq::eq`, `<`→`Ord::lt` (`register_operator_traits`) — and the four remaining
+  comparisons are **derived** at lowering by a swap/negate (`!=`→`!eq`, `>`→swapped `lt`, `<=`→`!`
+  swapped `lt`, `>=`→`!lt`), so a user type gets the full set from those six impls. A binary
   op whose left operand is a *user type* resolves through `impl <OpTrait> for <lhs>`
   (`resolve_operator_trait`, recorded in `impl_calls` keyed by the binary expr) and lowers to a direct
   impl-method call (`emit_operator_call`, reusing the Stage C path). Result type = the impl method's
   return (`Add`/`Mul` → the type, `Eq`/`Ord` → `bool`); a user type used with the operator but lacking
   the `impl` is an error; primitives keep native semantics. The **`f64` no-FMA determinism seam** is
   the gcc flag `-ffp-contract=off` (forbids `a*b+c` → fused multiply-add, for bit-reproducibility).
-  - Unit (typeck): arithmetic op → the type + recorded, comparison op → `bool`, missing-impl error,
-    primitives untouched, a user `trait Add` collides with the reserved built-in.
-  - Unit (cgen): `a + b`/`a == b` lower to `jestyr_impl_<Trait>__V__<m>(j_a, j_b)`; primitives native.
-  - Property (`prop`): `an_operator_on_a_user_type_lowers_to_its_impl_call` over all four operators,
-    `operator_programs_compile_deterministically`. Fuzz: `fuzz_operator_traits`.
-  - gcc differential: `examples/operators.jtr` runs to `13/42/0/1`
+  - Unit (typeck): arithmetic op → the type + recorded, comparison op → `bool`, `-`→`Sub`, the derived
+    `>`/`!=` resolve through `Ord`/`Eq`, missing-impl error, primitives untouched, a user `trait Add`
+    collides with the reserved built-in.
+  - Unit (cgen): base ops lower to `jestyr_impl_<Trait>__V__<m>(j_a, j_b)`; `-`/`/` → `Sub`/`Div`; the
+    derived comparisons lower via swap/negate (`>`→`lt(j_b,j_a)`, `!=`/`<=`/`>=` negated); primitives native.
+  - Property (`prop`): `an_operator_on_a_user_type_lowers_to_its_impl_call` over all **ten** operators
+    (swap-aware expected symbols), `operator_programs_compile_deterministically`. Fuzz: `fuzz_operator_traits`.
+  - gcc differential: `examples/operators.jtr` runs to `13/1/42/6/0/1/1/0/1/0`
     (`operators_example_compiles_clean`).
 - ✅ **Bracket-generic codegen** (not a trait stage, but unblocks the next): bracket-form `[T:
   Bound]` generics now monomorphize — each `T` is *inferred* from the call's value arguments
   (`unify_tp`, shared between typeck and cgen) and a mangled instance `jestyr_<name>__<targs>` is
-  emitted. `monomorphize_ret` infers the return too. Unit (typeck return-inference; cgen instance
-  emit, per-type instances, multi-param mangle), property + determinism over
-  `arb_bracket_generic_program`, gcc round-trip `examples/bracket_generic.jtr` (`42/0`).
+  emitted. `monomorphize_ret` infers the return too. Mixing `comptime T: type` + bracket `[U]` in one
+  signature works (type args assembled `comptime ++ bracket`). Unit (typeck return-inference; cgen
+  instance emit, per-type instances, multi-param mangle, comptime+bracket mix), property + determinism
+  over `arb_bracket_generic_program`, gcc round-trip `examples/bracket_generic.jtr` (`42/0/99`).
 - ✅ **Body-side bound enforcement (the "Zig fix", design §8.2):** inside `f[T: Tr]`, a method call
   on a `T` value resolves through the bound (`resolve_bound_method`) — a non-bound method (or any
   method on an unbounded `[U]`) is a *definition-site* error; the call types by the trait method's

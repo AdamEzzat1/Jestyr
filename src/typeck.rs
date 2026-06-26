@@ -2622,20 +2622,34 @@ fn string_intrinsic_ret(name: &str) -> Option<Ty> {
 /// that `base.name(...)` really is a method on `base`'s type (and not a typo
 /// that happens to share a name with some unrelated function).
 /// The built-in operator traits (traits, Stage E): `(trait name, method name)`.
-/// `+`→`Add::add`, `*`→`Mul::mul`, `==`→`Eq::eq`, `<`→`Ord::lt`. Registered as
-/// synthetic traits so a user type opts into operator syntax by `impl`-ing them.
-const OPERATOR_TRAITS: [(&str, &str); 4] =
-    [("Add", "add"), ("Mul", "mul"), ("Eq", "eq"), ("Ord", "lt")];
+/// Four "primitive" operator methods a user type implements directly —
+/// `+`→`Add::add`, `-`→`Sub::sub`, `*`→`Mul::mul`, `/`→`Div::div`, `==`→`Eq::eq`,
+/// `<`→`Ord::lt`. The remaining comparisons are *derived* from `Eq`/`Ord` (see
+/// [`op_trait_method`]), so a user type opts into the full operator set by
+/// `impl`-ing just these six.
+const OPERATOR_TRAITS: [(&str, &str); 6] = [
+    ("Add", "add"),
+    ("Sub", "sub"),
+    ("Mul", "mul"),
+    ("Div", "div"),
+    ("Eq", "eq"),
+    ("Ord", "lt"),
+];
 
 /// The `(trait, method)` a trait-backed binary operator desugars to, or `None`
-/// for an operator with native-only semantics (`-`, `/`, `&&`, bit-ops, …).
+/// for an operator with native-only semantics (`%`, `&&`, bit-ops, …). The
+/// *derived* comparisons reuse one base method and are completed by a swap/negate
+/// at lowering time ([`crate::cgen`]): `!=`→`Eq::eq` (negated), `>`→`Ord::lt`
+/// (swapped), `<=`→`Ord::lt` (swapped+negated), `>=`→`Ord::lt` (negated).
 fn op_trait_method(op: BinOp) -> Option<(&'static str, &'static str)> {
     use BinOp::*;
     Some(match op {
         Add => ("Add", "add"),
+        Sub => ("Sub", "sub"),
         Mul => ("Mul", "mul"),
-        Eq => ("Eq", "eq"),
-        Lt => ("Ord", "lt"),
+        Div => ("Div", "div"),
+        Eq | Ne => ("Eq", "eq"),
+        Lt | Gt | Le | Ge => ("Ord", "lt"),
         _ => return None,
     })
 }
@@ -2645,9 +2659,15 @@ fn op_symbol(op: BinOp) -> &'static str {
     use BinOp::*;
     match op {
         Add => "+",
+        Sub => "-",
         Mul => "*",
+        Div => "/",
         Eq => "==",
+        Ne => "!=",
         Lt => "<",
+        Gt => ">",
+        Le => "<=",
+        Ge => ">=",
         _ => "?",
     }
 }
@@ -3161,6 +3181,53 @@ mod tests {
             "{:?}",
             d
         );
+    }
+
+    #[test]
+    fn subtraction_on_a_user_type_resolves_through_sub() {
+        // `-` is its own primitive operator trait `Sub` (like `Add`/`Mul`/`Div`).
+        let (ast, info) = analyze_full(
+            "struct V { n: i32 } \
+             impl Sub for V { fn sub(read self, read rhs: V) -> V { return V{ n: self.n - rhs.n } } } \
+             fn use_it(read a: V, read b: V) -> V { return a - b }",
+        );
+        let sub = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| {
+                let id = ExprId(i as u32);
+                (matches!(e.kind, ExprKind::Binary { op: BinOp::Sub, .. })
+                    && info.impl_calls.contains_key(&id))
+                .then_some(id)
+            })
+            .expect("the dispatched `a - b`");
+        assert!(matches!(info.type_of(sub), Ty::Named(_)), "Sub::sub returns the type");
+    }
+
+    #[test]
+    fn derived_comparison_operators_resolve_through_their_base_trait() {
+        // `>` and `!=` need only `Ord`/`Eq`: they reuse `lt`/`eq` (a swap/negate is
+        // applied at lowering), and type as `bool`.
+        let (ast, info) = analyze_full(
+            "struct V { n: i32 } \
+             impl Eq for V { fn eq(read self, read rhs: V) -> bool { return self.n == rhs.n } } \
+             impl Ord for V { fn lt(read self, read rhs: V) -> bool { return self.n < rhs.n } } \
+             fn use_it(read a: V, read b: V) -> bool { let p = a > b return a != b }",
+        );
+        for want in [BinOp::Gt, BinOp::Ne] {
+            let e = ast
+                .exprs
+                .iter()
+                .enumerate()
+                .find_map(|(i, ex)| {
+                    matches!(&ex.kind, ExprKind::Binary { op, .. } if *op == want)
+                        .then_some(ExprId(i as u32))
+                })
+                .expect("the derived comparison");
+            assert_eq!(info.type_of(e), &Ty::Prim("bool"), "{want:?} types as bool");
+            assert!(info.impl_calls.contains_key(&e), "{want:?} resolved through its base trait");
+        }
     }
 
     // --- bracket-generic monomorphization (typeck side) ---

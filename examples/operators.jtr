@@ -1,32 +1,37 @@
-// Traits — Stage E: operator traits. The built-in operators desugar to methods
-// of synthetic traits — `+`→`Add::add`, `*`→`Mul::mul`, `==`→`Eq::eq`,
-// `<`→`Ord::lt` — so a user type opts into operator syntax by `impl`-ing them.
-// Each `a OP b` lowers through the same static-dispatch path as a method call.
+// Traits — Stage E: operator traits. A user type implements six "primitive"
+// operator methods — `+`→`Add::add`, `-`→`Sub::sub`, `*`→`Mul::mul`,
+// `/`→`Div::div`, `==`→`Eq::eq`, `<`→`Ord::lt` — and gets the full operator set:
+// the remaining comparisons are *derived* by a swap/negate at lowering time
+// (`!=` = `!eq`, `>` = swapped `lt`, `<=` = `!`(swapped `lt`), `>=` = `!lt`).
 
 struct V { n: i32 }
 
-impl Add for V {
-    fn add(read self, read rhs: V) -> V { return V{ n: self.n + rhs.n } }
-}
-impl Mul for V {
-    fn mul(read self, read rhs: V) -> V { return V{ n: self.n * rhs.n } }
-}
-impl Eq for V {
-    fn eq(read self, read rhs: V) -> bool { return self.n == rhs.n }
-}
-impl Ord for V {
-    fn lt(read self, read rhs: V) -> bool { return self.n < rhs.n }
-}
+impl Add for V { fn add(read self, read rhs: V) -> V { return V{ n: self.n + rhs.n } } }
+impl Sub for V { fn sub(read self, read rhs: V) -> V { return V{ n: self.n - rhs.n } } }
+impl Mul for V { fn mul(read self, read rhs: V) -> V { return V{ n: self.n * rhs.n } } }
+impl Div for V { fn div(read self, read rhs: V) -> V { return V{ n: self.n / rhs.n } } }
+impl Eq  for V { fn eq(read self, read rhs: V) -> bool { return self.n == rhs.n } }
+impl Ord for V { fn lt(read self, read rhs: V) -> bool { return self.n < rhs.n } }
+
+// bool → int, so each comparison result prints as a clean 0/1.
+fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
 
 fn main() -> i32 {
     let a = V{ n: 6 }
     let b = V{ n: 7 }
+    let c = V{ n: 42 }
 
-    print_int((a + b).n)   // 13 — Add::add
-    print_int((a * b).n)   // 42 — Mul::mul
+    print_int((a + b).n)    // 13 — Add::add
+    print_int((b - a).n)    // 1  — Sub::sub
+    print_int((a * b).n)    // 42 — Mul::mul
+    print_int((c / b).n)    // 6  — Div::div
 
-    if a == b { print_int(1) } else { print_int(0) }  // 0 — Eq::eq
-    if a < b { print_int(1) } else { print_int(0) }   // 1 — Ord::lt
+    print_int(b2i(a == b))  // 0  — Eq::eq
+    print_int(b2i(a != b))  // 1  — !Eq::eq            (derived)
+    print_int(b2i(a < b))   // 1  — Ord::lt
+    print_int(b2i(a > b))   // 0  — Ord::lt swapped     (derived)
+    print_int(b2i(a <= b))  // 1  — !(Ord::lt swapped)  (derived)
+    print_int(b2i(a >= b))  // 0  — !Ord::lt            (derived)
 
     return 0
 }

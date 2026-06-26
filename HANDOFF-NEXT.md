@@ -152,10 +152,12 @@ into operator syntax by `impl`-ing the matching trait:
   properties over all four operators + determinism, `fuzz_operator_traits`, and the
   gcc round-trip `examples/operators.jtr` (`13/42/0/1`). Suite **383 green**,
   warning-clean.
-- **Scope note:** only the four operators `+`/`*`/`==`/`<` are wired. Derived
-  operators (`-`/`/`/`!=`/`>`/`<=`/`>=`) on user types are **not** yet desugared
-  (they'd negate/swap an `Eq`/`Ord`/`Add` call); they currently keep native
-  semantics (invalid C for a struct, but a pre-existing gap, not a regression).
+- **Full operator set:** all of `+`/`-`/`*`/`/`/`==`/`!=`/`<`/`>`/`<=`/`>=` are
+  wired. Six "primitive" methods are implemented directly (`Add`/`Sub`/`Mul`/`Div`
+  + `Eq::eq` + `Ord::lt`); the four remaining comparisons are **derived** by a
+  swap/negate at lowering (`!=`→`!eq`, `>`→swapped `lt`, `<=`→`!`swapped `lt`,
+  `>=`→`!lt`) — so a user type opts into the full set by `impl`-ing just those six.
+  (`%` and the bit/logical operators keep native semantics by design.)
 
 ---
 
@@ -182,11 +184,11 @@ explicit `pick(i32, …)`).
   multi-param mangles each arg in order), property + determinism over
   `arb_bracket_generic_program`, and the gcc round-trip `examples/bracket_generic.jtr`
   (`42/0`). Suite **390 green**, warning-clean.
-- **Scope note:** the body may only use `T` *structurally* (store/return/pass) —
-  calling a trait method on a `T` value needs the body-side resolution below.
-  `comptime` and bracket generics may not yet be **mixed** in one signature in a
-  way that crosses their arg orders (the common pure-bracket / pure-comptime cases
-  are correct; a mixed signature is exotic and untested).
+- **Mixing comptime + bracket** generics in one signature works and is covered:
+  type args are assembled `comptime ++ bracket` everywhere (the comptime arg is an
+  explicit type expression erased from the value params; the bracket arg is
+  inferred from a value arg), and `make_subst` maps names in that same order
+  (`mixes_a_comptime_and_a_bracket_type_parameter`, `examples/bracket_generic.jtr`).
 
 ---
 
@@ -295,7 +297,7 @@ C-linker `WinMain` error (`test` mode is exempt; it synthesizes its own `main`).
 
 ## Test posture
 
-Suite is **398 green**, warning-clean, clean across the `dharht-experiment` and
+Suite is **403 green**, warning-clean, clean across the `dharht-experiment` and
 `bench-alloc` feature builds. New coverage adapts to the *real* harness
 (`src/proptests.rs`: `mod prop` + `mod fuzz` + `arb_*_program` generators,
 `typeck_diags` for diagnostic differentials) — the handoff's referenced

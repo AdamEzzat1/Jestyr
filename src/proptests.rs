@@ -544,19 +544,33 @@ mod prop {
     /// user type `V` with the matching `impl`. Paired with the dispatch symbol the
     /// emitted C must contain (`jestyr_impl_<Trait>__V__<method>(j_a, j_b)`).
     fn arb_operator_program() -> impl Strategy<Value = (String, String)> {
+        // The full operator surface: a `V` that `impl`s all six primitive operator
+        // traits, then a function using one operator. Each case is paired with the
+        // exact dispatch call the C must contain — including the *swapped* operand
+        // order for the derived `>`/`<=`, which has teeth for the derivation.
+        const IMPLS: &str = "struct V { n: i32 } \
+            impl Add for V { fn add(read self, read rhs: V) -> V { return V{ n: self.n + rhs.n } } } \
+            impl Sub for V { fn sub(read self, read rhs: V) -> V { return V{ n: self.n - rhs.n } } } \
+            impl Mul for V { fn mul(read self, read rhs: V) -> V { return V{ n: self.n * rhs.n } } } \
+            impl Div for V { fn div(read self, read rhs: V) -> V { return V{ n: self.n / rhs.n } } } \
+            impl Eq for V { fn eq(read self, read rhs: V) -> bool { return self.n == rhs.n } } \
+            impl Ord for V { fn lt(read self, read rhs: V) -> bool { return self.n < rhs.n } }";
         prop_oneof![
-            Just(("+", "Add", "add", "V", "return V{ n: self.n + rhs.n }")),
-            Just(("*", "Mul", "mul", "V", "return V{ n: self.n * rhs.n }")),
-            Just(("==", "Eq", "eq", "bool", "return self.n == rhs.n")),
-            Just(("<", "Ord", "lt", "bool", "return self.n < rhs.n")),
+            Just(("+", "V", "jestyr_impl_Add__V__add(j_a, j_b)")),
+            Just(("-", "V", "jestyr_impl_Sub__V__sub(j_a, j_b)")),
+            Just(("*", "V", "jestyr_impl_Mul__V__mul(j_a, j_b)")),
+            Just(("/", "V", "jestyr_impl_Div__V__div(j_a, j_b)")),
+            Just(("==", "bool", "jestyr_impl_Eq__V__eq(j_a, j_b)")),
+            Just(("!=", "bool", "jestyr_impl_Eq__V__eq(j_a, j_b)")),
+            Just(("<", "bool", "jestyr_impl_Ord__V__lt(j_a, j_b)")),
+            Just((">", "bool", "jestyr_impl_Ord__V__lt(j_b, j_a)")),
+            Just(("<=", "bool", "jestyr_impl_Ord__V__lt(j_b, j_a)")),
+            Just((">=", "bool", "jestyr_impl_Ord__V__lt(j_a, j_b)")),
         ]
-        .prop_map(|(op, tr, m, ret, body)| {
-            let prog = format!(
-                "struct V {{ n: i32 }} \
-                 impl {tr} for V {{ fn {m}(read self, read rhs: V) -> {ret} {{ {body} }} }} \
-                 fn use_it(read a: V, read b: V) -> {ret} {{ return a {op} b }}"
-            );
-            (prog, format!("jestyr_impl_{tr}__V__{m}(j_a, j_b)"))
+        .prop_map(|(op, ret, sym)| {
+            let prog =
+                format!("{IMPLS} fn use_it(read a: V, read b: V) -> {ret} {{ return a {op} b }}");
+            (prog, sym.to_string())
         })
     }
 

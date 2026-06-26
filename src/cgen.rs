@@ -2835,7 +2835,7 @@ impl<'a> Cgen<'a> {
                 // through `impl <OpTrait> for <lhs>` lowers to a direct call of the
                 // impl method (`lhs` is the receiver, `rhs` the argument).
                 if let Some(ic) = self.info.impl_calls.get(&id).cloned() {
-                    return self.emit_operator_call(&ic, *lhs, *rhs);
+                    return self.emit_operator_call(&ic, *op, *lhs, *rhs);
                 }
                 let l = self.emit_expr(*lhs);
                 let r = self.emit_expr(*rhs);
@@ -4485,11 +4485,19 @@ impl<'a> Cgen<'a> {
         format!("{name}({})", parts.join(", "))
     }
 
-    /// Lower an operator-trait binary op (Stage E) to a direct call of its impl
-    /// method: `a + b` → `jestyr_impl_Add__<T>__add(a, b)`. `lhs` is the receiver,
-    /// `rhs` the single argument; each is taken by `&` for a `mut`/`out` parameter
-    /// (operators are `read self, read rhs` by convention, so usually by value).
-    fn emit_operator_call(&mut self, ic: &ImplCall, lhs: ExprId, rhs: ExprId) -> String {
+    /// Lower an operator-trait binary op (Stage E) to a call of its impl method:
+    /// `a + b` → `jestyr_impl_Add__<T>__add(a, b)`. The four base operators
+    /// (`+`/`-`/`*`/`/`/`==`/`<`) call directly; the **derived** comparisons reuse
+    /// one base method with a swap and/or negate: `!=` → `!eq(a,b)`, `>` →
+    /// `lt(b,a)`, `<=` → `!lt(b,a)`, `>=` → `!lt(a,b)`. The receiver operand is
+    /// taken by `&` for a `mut`/`out` `self` (operators are `read` by convention,
+    /// so usually by value).
+    fn emit_operator_call(&mut self, ic: &ImplCall, op: BinOp, lhs: ExprId, rhs: ExprId) -> String {
+        use BinOp::*;
+        // `>` and `<=` compare via `b < a`, so the receiver is the *right* operand.
+        let swap = matches!(op, Gt | Le);
+        // `!=`/`<=`/`>=` are the logical negation of their base comparison.
+        let negate = matches!(op, Ne | Le | Ge);
         let (self_conv, rhs_conv) = self
             .find_impl_method(&ic.trait_name, &ic.type_key, &ic.method)
             .map(|f| {
@@ -4504,12 +4512,18 @@ impl<'a> Cgen<'a> {
                 (sc, rc)
             })
             .unwrap_or((Conv::Default, Conv::Default));
-        let l = self.emit_expr(lhs);
-        let l = if matches!(self_conv, Conv::Mut | Conv::Out) { format!("&({l})") } else { l };
-        let r = self.emit_expr(rhs);
-        let r = if matches!(rhs_conv, Conv::Mut | Conv::Out) { format!("&({r})") } else { r };
+        let (recv_id, arg_id) = if swap { (rhs, lhs) } else { (lhs, rhs) };
+        let recv = self.emit_expr(recv_id);
+        let recv = if matches!(self_conv, Conv::Mut | Conv::Out) { format!("&({recv})") } else { recv };
+        let arg = self.emit_expr(arg_id);
+        let arg = if matches!(rhs_conv, Conv::Mut | Conv::Out) { format!("&({arg})") } else { arg };
         let name = impl_method_c_name(&ic.trait_name, &ic.type_key, &ic.method);
-        format!("{name}({l}, {r})")
+        let call = format!("{name}({recv}, {arg})");
+        if negate {
+            format!("(!{call})")
+        } else {
+            call
+        }
     }
 
     // --- structured concurrency (`concurrent` / `spawn`) ---
@@ -6403,6 +6417,43 @@ mod tests {
         assert!(!c.contains("jestyr_impl_Add"), "no operator-trait dispatch for primitives: {c}");
     }
 
+    #[test]
+    fn lowers_subtraction_and_division_to_their_impls() {
+        // `-`/`/` are their own primitive operator traits, like `+`/`*`.
+        let src = "struct V { n: i32 } \
+                   impl Sub for V { fn sub(read self, read rhs: V) -> V { return V{ n: self.n - rhs.n } } } \
+                   impl Div for V { fn div(read self, read rhs: V) -> V { return V{ n: self.n / rhs.n } } } \
+                   fn use_it(read a: V, read b: V) -> V { let d = a / b return a - b }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("jestyr_impl_Sub__V__sub(j_a, j_b)"), "`-` → Sub: {c}");
+        assert!(c.contains("jestyr_impl_Div__V__div(j_a, j_b)"), "`/` → Div: {c}");
+    }
+
+    #[test]
+    fn lowers_derived_comparisons_via_swap_and_negate() {
+        // The four derived comparisons reuse `Eq::eq`/`Ord::lt` with a swap and/or
+        // negate — no extra impls needed beyond `Eq` and `Ord`.
+        let src = "struct V { n: i32 } \
+                   impl Eq for V { fn eq(read self, read rhs: V) -> bool { return self.n == rhs.n } } \
+                   impl Ord for V { fn lt(read self, read rhs: V) -> bool { return self.n < rhs.n } } \
+                   fn ne(read a: V, read b: V) -> bool { return a != b } \
+                   fn gt(read a: V, read b: V) -> bool { return a > b } \
+                   fn le(read a: V, read b: V) -> bool { return a <= b } \
+                   fn ge(read a: V, read b: V) -> bool { return a >= b }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("(!jestyr_impl_Eq__V__eq(j_a, j_b))"), "`!=` negates eq: {c}");
+        assert!(c.contains("(!jestyr_impl_Ord__V__lt(j_b, j_a))"), "`<=` swaps + negates: {c}");
+        assert!(c.contains("(!jestyr_impl_Ord__V__lt(j_a, j_b))"), "`>=` negates: {c}");
+        // `>` swaps without negating — the bare (un-negated) swapped call appears
+        // for `gt` (and inside `<=`'s negation, which is fine).
+        assert!(
+            c.contains("return jestyr_impl_Ord__V__lt(j_b, j_a);"),
+            "`>` swaps operands without negating: {c}"
+        );
+    }
+
     // --- bracket-generic monomorphization (codegen side) ---
 
     #[test]
@@ -6443,6 +6494,23 @@ mod tests {
             c.contains("jestyr_pair__i32_bool(int32_t j_a, bool j_b)"),
             "both type args mangled, in declaration order: {c}"
         );
+    }
+
+    #[test]
+    fn mixes_a_comptime_and_a_bracket_type_parameter() {
+        // Both generic forms in one signature: an explicit `comptime T: type` and
+        // a bracket `[U]` inferred from its value argument. The instance mangles
+        // `comptime ++ bracket` (T then U) and erases the comptime type *argument*
+        // from the value params — locking in the cross-cutting ordering invariant.
+        let src = "fn mix[U](comptime T: type, take a: T, take b: U) -> i32 { return 0 } \
+                   fn main() -> i32 { return mix(i32, 5, true) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(
+            c.contains("jestyr_mix__i32_bool(int32_t j_a, bool j_b)"),
+            "T=i32 (comptime, erased from params) + U=bool (inferred), mangled in order: {c}"
+        );
+        assert!(c.contains("jestyr_mix__i32_bool(5, true)"), "the call drops the type argument: {c}");
     }
 
     #[test]
