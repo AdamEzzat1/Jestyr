@@ -5757,12 +5757,11 @@ impl<'a> Cgen<'a> {
         for stmt in &body.stmts {
             self.emit_stmt(stmt);
         }
-        // Per-value drops run before the arena is freed in bulk.
-        if matches!(body.stmts.last(), Some(Stmt::Return { .. })) {
-            self.drop_scope_exit_discard();
-        } else {
-            self.drop_scope_exit_emit();
-        }
+        // Region-integrated bulk drop (design Phase 3): a value owned by the region
+        // emits **no** per-value drop glue — the arena reclaims everything at once
+        // when it is freed. The allocator/region *determines* the drop strategy, so
+        // we discard the region's drop scope rather than emitting individual calls.
+        self.drop_scope_exit_discard();
         self.line(format!("jestyr_arena_free(&j_{name});"));
         self.depth -= 1;
         self.line("}");
@@ -6745,6 +6744,18 @@ mod tests {
         let (info, _) = crate::typeck::check(&ast);
         let (c, _d) = emit_show_drops(&ast, &info);
         assert!(c.contains("/* drop j_a : R */"), "show-drops comment missing:\n{c}");
+    }
+
+    #[test]
+    fn region_owned_value_elides_per_value_drop_glue() {
+        // Metamorphic: the *same* droppable emits one drop outside a region and
+        // *zero* inside one (the arena reclaims it in bulk).
+        let outside = format!("{DROP_PRELUDE} fn f() {{ let a = R{{ id: 1 }} }}");
+        let inside = format!("{DROP_PRELUDE} fn f() {{ region r {{ let a = R{{ id: 1 }} }} }}");
+        let (co, _) = gen(&outside);
+        let (ci, _) = gen(&inside);
+        assert_eq!(co.matches("__drop(&j_a)").count(), 1, "outside a region:\n{co}");
+        assert_eq!(ci.matches("__drop(&j_a)").count(), 0, "region-owned value:\n{ci}");
     }
 
     #[test]

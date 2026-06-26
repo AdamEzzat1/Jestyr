@@ -837,6 +837,24 @@ mod drop_props {
             let (src, _e) = drop_program(n, false);
             prop_assert_eq!(compile(&src), compile(&src));
         }
+
+        /// Region-integrated bulk drop (metamorphic): the same droppable emits one
+        /// drop call in a plain block and *zero* inside a `region` (the arena
+        /// reclaims it in bulk), for any small id.
+        #[test]
+        fn region_owned_value_emits_no_drop_glue(id in 0i32..50) {
+            let outside = format!(
+                "{PRELUDE} fn f() {{ let a = R{{ id: {id} }} }} fn main() -> i32 {{ return 0 }}"
+            );
+            let inside = format!(
+                "{PRELUDE} fn f() {{ region r {{ let a = R{{ id: {id} }} }} }} \
+                 fn main() -> i32 {{ return 0 }}"
+            );
+            let (co, _) = compile(&outside);
+            let (ci, _) = compile(&inside);
+            prop_assert_eq!(co.matches("__drop(&j_a)").count(), 1, "outside:\n{}", co);
+            prop_assert_eq!(ci.matches("__drop(&j_a)").count(), 0, "region:\n{}", ci);
+        }
     }
 }
 
