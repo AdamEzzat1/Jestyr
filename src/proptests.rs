@@ -838,6 +838,23 @@ mod drop_props {
             prop_assert_eq!(compile(&src), compile(&src));
         }
 
+        /// The take-vs-borrow seam (the RAII-Vec enabler): a droppable passed to
+        /// any number of `mut`-borrow calls still drops *exactly once* at scope
+        /// exit — only a `take` argument would move it.
+        #[test]
+        fn borrow_passed_droppable_still_drops_once(k in 0usize..5) {
+            let calls: String = (0..k).map(|_| "bump(x) ").collect();
+            let src = format!(
+                "{PRELUDE} fn bump(mut r: R) {{ r.id = r.id + 1 }} \
+                 fn f() {{ var x = R{{ id: 1 }} {calls} }} fn main() -> i32 {{ return 0 }}"
+            );
+            let (c, _d) = compile(&src);
+            prop_assert_eq!(
+                count(&c, "jestyr_impl_Drop__R__drop(&j_x)"), 1,
+                "a mut-borrowed droppable must drop exactly once:\n{}", c
+            );
+        }
+
         /// Region-integrated bulk drop (metamorphic): the same droppable emits one
         /// drop call in a plain block and *zero* inside a `region` (the arena
         /// reclaims it in bulk), for any small id.

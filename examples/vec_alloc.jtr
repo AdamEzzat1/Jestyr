@@ -1,0 +1,96 @@
+// examples/vec_alloc.jtr — an allocator-parameterized vector, freed by RAII
+// (design Phase 3 — the integration forcing function).
+//
+// `IntVec` owns a heap buffer obtained from an `Allocator` *value* it stores
+// (Rust's `Vec<T, A>`: the collection carries its allocator). It grows on demand
+// through that allocator's vtable, and — the payoff of unifying Drop with the
+// explicit allocator — its `Drop` impl frees the buffer **at scope exit**,
+// through the very allocator it was allocated from. No manual `free`, no leak.
+//
+//   jestyrc run examples/vec_alloc.jtr
+//   →   5         (length after 5 pushes; one growth happened at cap 4 -> 8)
+//       10        (first element)
+//       50        (last element)
+//       99        (the buffer is freed automatically when `v` leaves scope)
+
+trait Drop { fn drop(mut self) }
+
+struct Layout { size: usize, align: usize }
+
+// `@copy`: an allocator is a cheap handle (a context pointer + thin fn-pointers),
+// freely copied by value — so a collection may *store* one without it escaping.
+@copy struct Allocator {
+    ctx: *mut u8,
+    alloc_fn: fn(*mut u8, Layout) -> *mut u8,
+    free_fn: fn(*mut u8, *mut u8),
+}
+
+fn alloc_n(read a: Allocator, n: usize) -> *mut u8 {
+    return a.alloc_fn(a.ctx, Layout{ size: n, align: 8 })
+}
+fn free_n(read a: Allocator, p: *mut u8) { a.free_fn(a.ctx, p) }
+
+fn sys_alloc(ctx: *mut u8, ly: Layout) -> *mut u8 { return alloc(u8, ly.size) }
+fn sys_free(ctx: *mut u8, p: *mut u8) { free_ptr(p) }
+fn system_allocator() -> Allocator {
+    return Allocator{ ctx: null, alloc_fn: &sys_alloc, free_fn: &sys_free }
+}
+
+fn store(p: *mut i32, i: usize, v: i32) { unsafe { (p + i).* = v } }
+fn load(read p: *mut i32, i: usize) -> i32 { unsafe { return (p + i).* } }
+
+// The collection: a growable buffer plus the allocator it was built from.
+struct IntVec {
+    ptr: *mut i32,
+    len: usize,
+    cap: usize,
+    a: Allocator,
+}
+
+// RAII: free the backing buffer through the stored allocator at scope exit.
+impl Drop for IntVec {
+    fn drop(mut self) {
+        if self.cap != 0 { free_n(self.a, self.ptr as *mut u8) }
+    }
+}
+
+// An empty vector that owns no memory until the first `push`.
+fn ivec_new(read a: Allocator) -> IntVec {
+    return IntVec{ ptr: null, len: 0, cap: 0, a: a }
+}
+
+// Append `x`, doubling the buffer (from the stored allocator) when full.
+fn ivec_push(mut v: IntVec, x: i32) {
+    if v.len == v.cap {
+        var newcap: usize = 4
+        if v.cap != 0 { newcap = v.cap * 2 }
+        var np: *mut i32 = alloc_n(v.a, newcap * 4) as *mut i32
+        for i in 0..v.len {
+            store(np, i, load(v.ptr, i))
+        }
+        if v.cap != 0 { free_n(v.a, v.ptr as *mut u8) }
+        v.ptr = np
+        v.cap = newcap
+    }
+    store(v.ptr, v.len, x)
+    v.len = v.len + 1
+}
+
+fn ivec_get(read v: IntVec, i: usize) -> i32 { return load(v.ptr, i) }
+fn ivec_len(read v: IntVec) -> usize { return v.len }
+
+fn main() -> i32 {
+    var a: Allocator = system_allocator()
+    var v: IntVec = ivec_new(a)
+    ivec_push(v, 10)
+    ivec_push(v, 20)
+    ivec_push(v, 30)
+    ivec_push(v, 40)
+    ivec_push(v, 50)               // 5th push grows the buffer from cap 4 -> 8
+
+    print_int(ivec_len(v))         // 5
+    print_int(ivec_get(v, 0))      // 10
+    print_int(ivec_get(v, 4))      // 50
+    print_int(99)                  // marker — `v` is freed right after, at scope exit
+    return 0
+}

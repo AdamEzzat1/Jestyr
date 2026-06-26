@@ -6813,6 +6813,41 @@ mod tests {
     }
 
     #[test]
+    fn mut_borrowed_droppable_still_drops_at_scope_exit() {
+        // The RAII payoff (an allocator-owning Vec mutated via `mut` methods): a
+        // droppable passed to a `mut`-borrow call is NOT moved, so it still drops
+        // exactly once at scope exit. This is the take-vs-borrow seam in collect_moved.
+        let src = "trait Drop { fn drop(mut self) } struct R { n: i32 } \
+            impl Drop for R { fn drop(mut self) { print_int(self.n) } } \
+            fn bump(mut r: R) { r.n = r.n + 1 } \
+            fn f() { var r = R{ n: 1 } bump(r) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert_eq!(
+            c.matches("jestyr_impl_Drop__R__drop(&j_r)").count(),
+            1,
+            "a mut-borrowed droppable must drop exactly once:\n{c}"
+        );
+    }
+
+    #[test]
+    fn taken_droppable_is_not_dropped_by_caller() {
+        // The complement: a `take` argument *consumes* — the callee owns it, so the
+        // caller must NOT also drop it (that would double-free).
+        let src = "trait Drop { fn drop(mut self) } struct R { n: i32 } \
+            impl Drop for R { fn drop(mut self) { print_int(self.n) } } \
+            fn consume(take r: R) {} \
+            fn f() { var r = R{ n: 1 } consume(r) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert_eq!(
+            c.matches("jestyr_impl_Drop__R__drop(&j_r)").count(),
+            0,
+            "a taken droppable must not be dropped by the caller:\n{c}"
+        );
+    }
+
+    #[test]
     fn allocator_value_routes_through_the_vtable_not_bare_malloc() {
         // The explicit-allocator interface (Phase 3): `a.alloc_fn(a.ctx, ly)` is an
         // *indirect* call through a struct fn-pointer field — the Zig vtable shape,
