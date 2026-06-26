@@ -15,9 +15,9 @@ teeth-verifies each new property by mutation, and is auto-committed.
 
 ## Achieved
 
-Two green, warning-clean, auto-committed increments. **456 tests pass** under the
-default `cargo test` (up from 448 → 456: +3 cgen goldens, +1 wiring, +7
-`core_props`; the +3 over the 445 baseline are the codegen enabler's goldens).
+Several green, warning-clean, auto-committed increments. **468 tests pass** under
+the default `cargo test` (from a 445 baseline: the codegen enablers' goldens, the
+combinator/slice `core_props` laws, and the wiring tests).
 
 ### Reframing what `core`'s "trait surface" actually is
 
@@ -100,6 +100,30 @@ a fn-pointer return/param type; the bodies follow in `gen_struct_defs`/
 `fn_pointer_returning_a_generic_enum_is_forward_declared_first` pins the ordering;
 teeth: neutering `gen_forward_types` fails it.
 
+### Slice / iterator algorithms (no-alloc)
+
+The consuming/searching/in-place algorithms over `[]T` (`examples/std/core.jtr`) —
+producers like `map`/`filter` that build a new sequence are the allocating `std`
+(Phase 2); a no-alloc `map_into(src, dst, f)` over a caller buffer can follow.
+
+- `sl_fold` (the reducer `sum`/`count`/... specialize to), `sl_count_where`,
+  `sl_any`, `sl_all`, `sl_find` (→ `Option(usize)`), `sl_binary_search`
+  (→ `Option(usize)`), `sl_swap`, and an in-place **stable, deterministic**
+  insertion `sl_sort`. Indices come back as `Option(usize)` so nothing copies a
+  (possibly non-`Copy`) element out; the in-place swap is raw-pointer-level (in
+  `unsafe`) so it works for a generic `T` without the borrow checker rejecting the
+  temporary.
+- This needed the same substitution discipline one layer down: a `for x in s` /
+  `s[i]` over a generic `[]T` now resolves the slice type through `self.subst`
+  (names `JestyrSlice_i32`, not the opaque `JestyrSlice_T`), and `collect_slices`
+  walks monomorphized function signatures so a `[]T` parameter contributes its
+  concrete typedef even with no local `slice(T, …)` construction (and a generic
+  `[]T` *annotation*, a template, no longer emits a bogus `JestyrSlice_T`). Golden
+  `generic_slice_algorithm_monomorphizes_to_the_concrete_slice_type`; teeth-verified.
+- Iterator laws as oracles (`core_props`): `find` matches `iter().position()`,
+  `any`/`all` match the reference; **sort invariants** — sorted permutation,
+  deterministic, and **stable** (equal keys keep input order).
+
 ### Determinism guarantees realized
 
 - **Combinator lowering is deterministic** — byte-identical C twice, for any
@@ -160,12 +184,12 @@ Honest accounting of what is stubbed, deferred, or only partially covered.
 
 In rough priority order toward a usable `core` and self-hosting:
 
-1. ✅ **Done — typedef reorder → `and_then`/`filter` + the monad laws** (this pass).
-2. **Slice / iterator algorithms** as generic free functions over `[]T`:
-   `map`/`filter`/`fold`/`zip`/`enumerate`/`find`/`all`/`any`/`count`/`sum`;
-   `binary_search`; a **deterministic stable `sort`** (laws: output is a sorted
-   permutation of the input, and identical across runs). Iterator laws as oracles
-   (collect-and-compare against a Rust reference).
+1. ✅ **Done — typedef reorder → `and_then`/`filter` + the monad laws.**
+2. ✅ **Done — slice / iterator algorithms** (consuming/searching/in-place):
+   `fold`/`count_where`/`any`/`all`/`find`/`binary_search`/`sort`, with iterator
+   laws + sort invariants as oracles. (Producers `map`/`filter`/`zip`/`enumerate`
+   that build a new sequence — and `map_into` over a caller buffer — remain, the
+   former gated on the allocating `std`.)
 3. **Math with defined semantics** (ROADMAP J): `wrapping_*`/`saturating_*`/
    `checked_*`, bit-width-aware, with the overflow behavior pinned by property.
 4. **Number parse/format — the determinism deliverable.** Correctly-rounded,

@@ -174,11 +174,15 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool, show_drops: bool) -
         cur_moved: HashSet::new(),
     };
     g.spawn_sites = g.collect_spawns();
-    g.slice_instances = g.collect_slices();
     g.genref_instances = g.collect_genrefs();
     let (instances, method_instances) = g.collect_all_instances();
     g.instances = instances;
     g.method_instances = method_instances;
+    // After `instances`: `collect_slices` also walks monomorphized generic function
+    // signatures, so a `[]T` parameter of a generic combinator contributes its
+    // concrete `JestyrSlice_<T>` typedef even when the caller never writes a
+    // `slice(T, …)` literal locally.
+    g.slice_instances = g.collect_slices();
     g.struct_instances = g.collect_struct_instances();
     g.enum_instances = g.collect_enum_instances();
     // After struct instances: a monomorphized generic-struct's fn-pointer fields
@@ -3347,7 +3351,9 @@ impl<'a> Cgen<'a> {
                 }
             }
             ExprKind::Index { base, index } => {
-                let bt = self.info.type_of(*base).clone();
+                // Resolve through the active monomorphization subst so a generic
+                // `[]T` indexed inside a generic function names `JestyrSlice_i32`.
+                let bt = apply_subst(&self.info.type_of(*base).clone(), &self.subst);
                 // `s[i..j]` on a string → a boundary-checked, zero-copy sub-view.
                 if matches!(bt, Ty::Prim("str")) {
                     let range = match &self.ast.expr_at(*index).kind {
@@ -5646,7 +5652,9 @@ impl<'a> Cgen<'a> {
         iter: ExprId,
         body: &Block,
     ) {
-        let st = self.info.type_of(iter).clone();
+        // Resolve through the active monomorphization subst so iterating a generic
+        // `[]T` inside a generic function names `JestyrSlice_i32` / `int32_t`.
+        let st = apply_subst(&self.info.type_of(iter).clone(), &self.subst);
         let elem = match &st {
             Ty::Slice(e) => (**e).clone(),
             _ => Ty::Unknown,
@@ -6153,7 +6161,11 @@ impl<'a> Cgen<'a> {
         for td in &self.ast.types {
             if let TypeKind::Slice(inner) = &td.kind {
                 let elem = self.ast_type_to_ty(*inner, &empty);
-                if seen.insert(self.ty_mangle(&elem)) {
+                // A generic `[]T` *annotation* is a template, not an instance — its
+                // concrete `JestyrSlice_<T>` comes from the monomorphized-instance
+                // walk below (or a `slice(T, …)` construction), so skip the opaque
+                // form rather than emitting a bogus `JestyrSlice_T`.
+                if Self::is_concrete(&elem) && seen.insert(self.ty_mangle(&elem)) {
                     out.push(elem);
                 }
             }
@@ -6168,6 +6180,22 @@ impl<'a> Cgen<'a> {
                                 out.push(elem);
                             }
                         }
+                    }
+                }
+            }
+        }
+        // Each monomorphized generic function contributes the concrete element type
+        // of any `[]T` parameter/return under its substitution — so a generic slice
+        // algorithm's `JestyrSlice_<T>` is emitted even with no local `slice(T, …)`.
+        for (name, args) in &self.instances {
+            let Some(f) = self.find_fn(name) else { continue };
+            let subst = self.make_subst(f, args);
+            let sig_tys = f.params.iter().filter_map(|p| p.ty).chain(f.ret_ty);
+            for ty in sig_tys {
+                if let TypeKind::Slice(inner) = self.ast.type_at(ty).kind {
+                    let elem = self.ast_type_to_ty(inner, &subst);
+                    if Self::is_concrete(&elem) && seen.insert(self.ty_mangle(&elem)) {
+                        out.push(elem);
                     }
                 }
             }
@@ -8754,6 +8782,21 @@ mod tests {
         let fnp = c.find("(*JestyrFn_fn_di32_ret_Option__i32)")
             .expect(&format!("fn-pointer typedef returning the instance: {c}"));
         assert!(fwd < fnp, "the instance must be forward-declared before the fn-pointer typedef: {c}");
+    }
+
+    #[test]
+    fn generic_slice_algorithm_monomorphizes_to_the_concrete_slice_type() {
+        // A `for x in s` over a generic `[]T` inside a generic function must name the
+        // concrete `JestyrSlice_i32` instance (resolved through the active subst), not
+        // the opaque `JestyrSlice_T`. (Regression: the slice for-loop and index
+        // lowering read the inferred type without applying the substitution.)
+        let src = "fn sl_sum(comptime T: type, read s: []T, take z: T, f: fn(T, T) -> T) -> T { var acc: T = z for x in s { acc = f(acc, x) } return acc } \
+                   fn add(a: i32, b: i32) -> i32 { return a + b } \
+                   fn main() -> i32 { var p: *mut i32 = alloc_i32(1) unsafe { p.* = 5 } var s: []i32 = slice(i32, p, 1) return sl_sum(i32, s, 0, &add) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("JestyrSlice_i32 _s"), "the for-loop names the concrete slice instance: {c}");
+        assert!(!c.contains("JestyrSlice_T"), "no opaque slice type leaks: {c}");
     }
 
     #[test]

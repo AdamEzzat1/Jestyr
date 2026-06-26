@@ -1286,6 +1286,41 @@ mod core_props {
         match o { Some(v) => if pred(&v) { Some(v) } else { None }, None => None }
     }
 
+    // ── Rust mirrors of core's slice algorithms (same structure as core.jtr) ────
+    fn m_sl_find<T>(s: &[T], pred: impl Fn(&T) -> bool) -> Option<usize> {
+        let mut i = 0;
+        for x in s {
+            if pred(x) {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+    /// Insertion sort by `less` — the exact structure of `core.sl_sort`.
+    fn m_sl_sort_by<T: Clone>(s: &mut [T], less: impl Fn(&T, &T) -> bool) {
+        let mut i = 1;
+        while i < s.len() {
+            let mut j = i;
+            while j > 0 && less(&s[j], &s[j - 1]) {
+                s.swap(j, j - 1);
+                j -= 1;
+            }
+            i += 1;
+        }
+    }
+
+    /// A self-contained generic slice-fold program at element type `prim` — the real
+    /// compiler path the slice algorithms ride (subst through the for-loop / index).
+    fn slice_fold_source(prim: &str) -> String {
+        format!(
+            "fn sl_fold(comptime T: type, read s: []T, take z: T, f: fn(T, T) -> T) -> T {{ var acc: T = z for x in s {{ acc = f(acc, x) }} return acc }}\n\
+             fn add(a: {p}, b: {p}) -> {p} {{ return a + b }}\n\
+             fn main() -> i32 {{ var p: *mut {p} = alloc({p}, 1) unsafe {{ p.* = 1 }} var s: []{p} = slice({p}, p, 1) return sl_fold({p}, s, 0, &add) as i32 }}",
+            p = prim
+        )
+    }
+
     proptest! {
         // ── codegen layer (the real Jestyr compiler path) ──────────────────────
 
@@ -1381,6 +1416,58 @@ mod core_props {
             let pred = |v: &i32| *v > 10;
             let expect = if is_some && x > 10 { Some(x) } else { None };
             prop_assert_eq!(m_filter(o, pred), expect);
+        }
+
+        // ── slice / iterator algorithm laws ────────────────────────────────────
+
+        /// A generic slice fold compiles clean (subst through the `for`-loop / index)
+        /// for any integer element type — the real compiler path. (Teeth: dropping the
+        /// slice-`for` subst fix reintroduces an undefined `JestyrSlice_T`.)
+        #[test]
+        fn slice_fold_compiles_clean_for_any_int_type(p in int_prim()) {
+            let (_c, diags) = compile(&slice_fold_source(p));
+            prop_assert_eq!(diags, 0, "slice fold over {} must compile clean", p);
+        }
+
+        /// `find` returns the first matching index — agrees with `iter().position()`.
+        #[test]
+        fn slice_find_matches_position(xs in proptest::collection::vec(any::<i32>(), 0..32)) {
+            prop_assert_eq!(m_sl_find(&xs, |&x| x > 0), xs.iter().position(|&x| x > 0));
+        }
+
+        /// `any`/`all` (expressed via the short-circuiting `find`) agree with the
+        /// reference iterators: `any p == find(p).is_some`, `all p == find(¬p).is_none`.
+        #[test]
+        fn slice_any_all_match_reference(xs in proptest::collection::vec(any::<i32>(), 0..32)) {
+            prop_assert_eq!(m_sl_find(&xs, |&x| x > 0).is_some(), xs.iter().any(|&x| x > 0));
+            prop_assert_eq!(m_sl_find(&xs, |&x| !(x > 0)).is_none(), xs.iter().all(|&x| x > 0));
+        }
+
+        /// `sort` yields a **sorted permutation** of the input, **deterministically**.
+        #[test]
+        fn slice_sort_is_a_sorted_permutation(xs in proptest::collection::vec(any::<i32>(), 0..32)) {
+            let mut a = xs.clone();
+            m_sl_sort_by(&mut a, |x, y| x < y);
+            prop_assert!(a.windows(2).all(|w| w[0] <= w[1]), "sorted (non-decreasing)");
+            let mut b = xs.clone();
+            b.sort();
+            prop_assert_eq!(&a, &b, "a permutation of the input");
+            let mut c = xs.clone();
+            m_sl_sort_by(&mut c, |x, y| x < y);
+            prop_assert_eq!(&a, &c, "deterministic: same input → same output");
+        }
+
+        /// `sort` is **stable**: among equal keys, input order is preserved.
+        #[test]
+        fn slice_sort_is_stable(keys in proptest::collection::vec(0u8..4, 0..24)) {
+            let mut tagged: Vec<(u8, usize)> = keys.iter().cloned().zip(0..).collect();
+            m_sl_sort_by(&mut tagged, |x, y| x.0 < y.0);  // compare keys only
+            prop_assert!(tagged.windows(2).all(|w| w[0].0 <= w[1].0), "sorted by key");
+            for w in tagged.windows(2) {
+                if w[0].0 == w[1].0 {
+                    prop_assert!(w[0].1 < w[1].1, "equal keys keep input order");
+                }
+            }
         }
     }
 }

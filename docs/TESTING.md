@@ -468,18 +468,35 @@ the runtime side pinned by an end-to-end example and `cgen` goldens.
   associativity; `unwrap_or` selection; `filter` keep-iff-predicate; and the
   `res_ok(ok_or(o, e)) == o` bridge round-trip — all against a Rust mirror of the combinators'
   `match` structure.
+- ✅ **Generic-`[]T` codegen.** A `for x in s` / `s[i]` over a generic slice inside a generic
+  function now resolves the slice type through the active subst (names `JestyrSlice_i32`, not the
+  opaque `JestyrSlice_T`), and `collect_slices` walks monomorphized function signatures so a `[]T`
+  parameter contributes its concrete typedef even with no local `slice(T, …)`. Golden
+  `generic_slice_algorithm_monomorphizes_to_the_concrete_slice_type`. **Teeth:** dropping the
+  slice-`for` subst reintroduces an undefined `JestyrSlice_T`.
+- ✅ **Slice / iterator algorithms (no-alloc).** The consuming/searching/in-place algorithms over
+  `[]T`: `sl_fold`, `sl_count_where`, `sl_any`, `sl_all`, `sl_find` (→ `Option(usize)`),
+  `sl_binary_search` (→ `Option(usize)`), `sl_swap`, and an in-place **stable, deterministic**
+  insertion `sl_sort`. (Producers like `map`/`filter` that build a new sequence are the allocating
+  `std`, Phase 2.) Iterator laws as oracles (`core_props`): `find` matches `iter().position()`,
+  `any`/`all` match the reference; **sort invariants** — output is a sorted permutation of the
+  input, deterministic (same input → same output), and **stable** (equal keys keep input order);
+  plus a codegen property that a generic slice fold compiles clean for any integer element type.
 - ✅ **Codegen properties (`proptests::core_props`).** A generic Option combinator compiles with
   **zero diagnostics** and **byte-identically** for every integer element type — the real
   compiler path the combinators ride (`core_option_combinator_compiles_clean_for_any_int_type`,
   `core_option_combinator_is_deterministic`).
-- ✅ **Wiring.** `module::core_combinators_example_compiles_clean` —
-  `examples/std/combinators.jtr` resolves the combinators across the `import "core"` boundary and
-  lowers clean. gcc round-trip: `jestyrc run examples/std/combinators.jtr` →
+- ✅ **Wiring.** `module::core_combinators_example_compiles_clean` +
+  `slice_algos_example_compiles_clean`. gcc round-trips:
+  `jestyrc run examples/std/combinators.jtr` →
   `1, 20, 7, 42, 21, 22, 99, 0, 40, 20, 21, 7, 21, 20, 20, 7, 40` (the `22` is functor
-  composition; the `21`/`20` pair is monad left/right identity, operationally).
-- **Remaining (future work):** slice/iterator algorithms (generic free functions over `[]T`);
-  defined-overflow math; correctly-rounded deterministic number parse/format + the cross-OS canary;
-  the allocating `std` (Phase 2). See `CORE-STD-PHASE3.md`.
+  composition; the `21`/`20` pair is monad left/right identity); and
+  `jestyrc run examples/std/slice_algos.jtr` →
+  `100, 2, 1, 0, 2, 99, [10 20 30 40 50], 3, 99` (reduce/search, then the sorted slice, then
+  binary search).
+- **Remaining (future work):** defined-overflow math (`wrapping_*`/`saturating_*`/`checked_*`);
+  correctly-rounded deterministic number parse/format + the cross-OS canary; the allocating `std`
+  (Phase 2). See `CORE-STD-PHASE3.md`.
 
 ---
 

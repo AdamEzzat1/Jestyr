@@ -1,0 +1,67 @@
+// examples/std/slice_algos.jtr — the `core` slice/iterator algorithms, end to end.
+//
+// The no-alloc algorithms over `[]T`: reduce (`fold`), search (`find`/
+// `binary_search`), quantifiers (`any`/`all`/`count_where`), and an in-place
+// deterministic `sort`. A predicate/order is a thin `fn(read T) -> …` pointer;
+// indices come back as `Option(usize)`. All generic and monomorphized — the
+// element type is a `comptime` argument: `core.sl_fold(i32, i32, s, 0, &add)`.
+//
+//   jestyrc run examples/std/slice_algos.jtr
+//   →  100            (fold: 10+20+30+40)
+//      2              (count_where > 25: {30,40})
+//      1              (any > 25)
+//      0              (all > 25)
+//      2              (find == 30 -> index 2)
+//      99             (find == 999 -> none -> default)
+//      10 20 30 40 50 (the slice after in-place sort)
+//      3              (binary_search 40 -> index 3)
+//      99             (binary_search 35 -> none -> default)
+
+import "core"
+import "io"
+
+fn add(a: i32, x: i32) -> i32 { return a + x }
+fn is_big(read x: i32) -> bool { return x > 25 }
+fn is30(read x: i32) -> bool { return x == 30 }
+fn is999(read x: i32) -> bool { return x == 999 }
+fn lt(read a: i32, read b: i32) -> bool { return a < b }
+fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
+fn seti(p: *mut i32, i: i32, v: i32) { unsafe { (p + i).* = v } }
+
+fn main() -> i32 {
+    var buf: *mut i32 = alloc_i32(5)
+
+    // A clean ascending 4-element view for the reduce/search demos.
+    seti(buf, 0, 10)
+    seti(buf, 1, 20)
+    seti(buf, 2, 30)
+    seti(buf, 3, 40)
+    seti(buf, 4, 50)
+    var s: []i32 = slice(i32, buf, 4)          // {10, 20, 30, 40}
+
+    io.print_i32(core.sl_fold(i32, i32, s, 0, &add))             // 100
+    io.print_i32(core.sl_count_where(i32, s, &is_big) as i32)   // 2  ({30,40})
+    io.print_i32(b2i(core.sl_any(i32, s, &is_big)))             // 1
+    io.print_i32(b2i(core.sl_all(i32, s, &is_big)))             // 0
+    io.print_i32(core.opt_unwrap_or(usize, core.sl_find(i32, s, &is30), 99) as i32)    // 2
+    io.print_i32(core.opt_unwrap_or(usize, core.sl_find(i32, s, &is999), 99) as i32)   // 99
+
+    // In-place deterministic sort of an unsorted 5-element slice, then binary search.
+    seti(buf, 0, 30)
+    seti(buf, 1, 10)
+    seti(buf, 2, 50)
+    seti(buf, 3, 20)
+    seti(buf, 4, 40)
+    var all5: []i32 = slice(i32, buf, 5)
+    core.sl_sort(i32, all5, &lt)
+    io.print_i32(all5[0])   // 10
+    io.print_i32(all5[1])   // 20
+    io.print_i32(all5[2])   // 30
+    io.print_i32(all5[3])   // 40
+    io.print_i32(all5[4])   // 50
+    io.print_i32(core.opt_unwrap_or(usize, core.sl_binary_search(i32, all5, 40, &lt), 99) as i32)  // 3
+    io.print_i32(core.opt_unwrap_or(usize, core.sl_binary_search(i32, all5, 35, &lt), 99) as i32)  // 99
+
+    free_ptr(buf)
+    return 0
+}

@@ -431,6 +431,13 @@ mod tests {
     }
 
     #[test]
+    fn slice_algos_example_compiles_clean() {
+        // The core slice/iterator algorithms (fold/find/any/all/sort/binary_search)
+        // monomorphize over a generic `[]T` and lower clean across `import "core"`.
+        pipeline_is_clean("examples/std/slice_algos.jtr");
+    }
+
+    #[test]
     fn loops_example_compiles_clean() {
         // Every MVP loop form + `invariant` + bounds-check elision.
         pipeline_is_clean("examples/loops.jtr");
