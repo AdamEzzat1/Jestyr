@@ -301,9 +301,25 @@ Run: `cargo test trait_programs`, `cargo test parses_a_trait`, `cargo bolero tes
     impl/call types), `satisfied_bound_never_errors_at_the_call` (completeness).
   - Fuzz (`fuzz`): `fuzz_definition_site_bounds` — fuzz bytes in a bracket-generic body, a real call
     drives `check_call_bounds`; total + deterministic.
-- ⏳ **Remaining:** E operator traits (`Add`/`Mul`/`Eq`/`Ord`, the `f64` impl is the no-FMA
-  determinism seam) · F `dyn` vtable (reuses the fn-pointer-field call machinery). Each
-  lands with the same three layers (+ a gcc differential once runtime behaviour matters).
+- ✅ **Stage E — operator traits.** The built-in operators desugar to synthetic-trait methods —
+  `+`→`Add::add`, `*`→`Mul::mul`, `==`→`Eq::eq`, `<`→`Ord::lt` (`register_operator_traits`). A binary
+  op whose left operand is a *user type* resolves through `impl <OpTrait> for <lhs>`
+  (`resolve_operator_trait`, recorded in `impl_calls` keyed by the binary expr) and lowers to a direct
+  impl-method call (`emit_operator_call`, reusing the Stage C path). Result type = the impl method's
+  return (`Add`/`Mul` → the type, `Eq`/`Ord` → `bool`); a user type used with the operator but lacking
+  the `impl` is an error; primitives keep native semantics. The **`f64` no-FMA determinism seam** is
+  the gcc flag `-ffp-contract=off` (forbids `a*b+c` → fused multiply-add, for bit-reproducibility).
+  - Unit (typeck): arithmetic op → the type + recorded, comparison op → `bool`, missing-impl error,
+    primitives untouched, a user `trait Add` collides with the reserved built-in.
+  - Unit (cgen): `a + b`/`a == b` lower to `jestyr_impl_<Trait>__V__<m>(j_a, j_b)`; primitives native.
+  - Property (`prop`): `an_operator_on_a_user_type_lowers_to_its_impl_call` over all four operators,
+    `operator_programs_compile_deterministically`. Fuzz: `fuzz_operator_traits`.
+  - gcc differential: `examples/operators.jtr` runs to `13/42/0/1`
+    (`operators_example_compiles_clean`).
+- ⏳ **Remaining:** F `dyn` vtable (reuses the fn-pointer-field call machinery). Separate
+  workstreams flagged in `HANDOFF-NEXT.md`: bracket-generic *codegen* (monomorphizing `f[T: Tr]`)
+  and the body-side "blame the generic code" bound check. Each lands with the same three layers
+  (+ a gcc differential once runtime behaviour matters).
 
 ---
 

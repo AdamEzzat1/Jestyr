@@ -436,6 +436,24 @@ mod prop {
                 "a satisfied bound must not error: {:?}", diags
             );
         }
+
+        // ── traits, Stage E: operator traits ──────────────────────────────────
+
+        /// **Operator dispatch.** `a OP b` on a user type with the matching
+        /// operator `impl` lowers to a direct call of the impl method — for every
+        /// trait-backed operator (`+`/`*`/`==`/`<`). Teeth: without operator
+        /// resolution the op stays a native `(j_a OP j_b)` and this symbol is absent.
+        #[test]
+        fn an_operator_on_a_user_type_lowers_to_its_impl_call((p, sym) in arb_operator_program()) {
+            let (c, _) = compile(&p);
+            prop_assert!(c.contains(&sym), "expected operator dispatch `{}`:\n{}", sym, c);
+        }
+
+        /// Determinism holds on operator-trait programs — byte-identical C every run.
+        #[test]
+        fn operator_programs_compile_deterministically((p, _s) in arb_operator_program()) {
+            prop_assert_eq!(compile(&p), compile(&p));
+        }
     }
 
     /// A concrete primitive type to `impl` a trait for.
@@ -475,6 +493,26 @@ mod prop {
                  fn xuse(read s: {t}) -> i32 {{ return s.xm() }}"
             );
             (prog, t)
+        })
+    }
+
+    /// A *valid* program that uses one of the four trait-backed operators on a
+    /// user type `V` with the matching `impl`. Paired with the dispatch symbol the
+    /// emitted C must contain (`jestyr_impl_<Trait>__V__<method>(j_a, j_b)`).
+    fn arb_operator_program() -> impl Strategy<Value = (String, String)> {
+        prop_oneof![
+            Just(("+", "Add", "add", "V", "return V{ n: self.n + rhs.n }")),
+            Just(("*", "Mul", "mul", "V", "return V{ n: self.n * rhs.n }")),
+            Just(("==", "Eq", "eq", "bool", "return self.n == rhs.n")),
+            Just(("<", "Ord", "lt", "bool", "return self.n < rhs.n")),
+        ]
+        .prop_map(|(op, tr, m, ret, body)| {
+            let prog = format!(
+                "struct V {{ n: i32 }} \
+                 impl {tr} for V {{ fn {m}(read self, read rhs: V) -> {ret} {{ {body} }} }} \
+                 fn use_it(read a: V, read b: V) -> {ret} {{ return a {op} b }}"
+            );
+            (prog, format!("jestyr_impl_{tr}__V__{m}(j_a, j_b)"))
         })
     }
 
@@ -734,6 +772,23 @@ mod fuzz {
                  impl B for i32 {{ fn m(read self) -> i32 {{ return 0 }} }} \
                  fn g[T: B](read x: T) -> i32 {{ {s} }} \
                  fn c(read y: i32) -> i32 {{ return g(y) }}"
+            );
+            run_pipeline(&prog);
+            assert_eq!(compile(&prog), compile(&prog));
+        });
+    }
+
+    /// Coverage-guided fuzzing of **operator traits** (Stage E): fuzz bytes fill an
+    /// `Add` impl body while `a + b` drives the operator resolution + dispatch
+    /// lowering (`resolve_operator_trait` / `emit_operator_call`). Total +
+    /// deterministic on arbitrary body soup.
+    #[test]
+    fn fuzz_operator_traits() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let prog = format!(
+                "struct V {{ n: i32 }} \
+                 impl Add for V {{ fn add(read self, read rhs: V) -> V {{ {s} }} }} \
+                 fn use_it(read a: V, read b: V) -> V {{ return a + b }}"
             );
             run_pipeline(&prog);
             assert_eq!(compile(&prog), compile(&prog));

@@ -125,19 +125,55 @@ parameters in `fn_type_params`/`lower_type` and method resolution through the bo
 
 ---
 
-## Main objective — traits **Stage E** (operator traits)
+## ✅ Done — traits **Stage E** (operator traits)
 
-The trait epic resumes at **Stage E**: desugar the built-in operators to trait
-methods — `+`/`*`/`==`/`<` → `Add`/`Mul`/`Eq`/`Ord` — so a user type that `impl`s
-the trait participates in operator syntax, lowering through the Stage C
-static-dispatch path. **The `f64` impl is the no-FMA determinism seam** (see
-`NUMERICS-RESEARCH.md` and the numerics memory): floating `+`/`*` must lower to
-contraction-free C (`-ffp-contract=off` / no fused multiply-add) so results are
-bit-reproducible. Wire the built-in operator traits into `GlobalTable::traits`,
-resolve a binary-op expr whose operands are a user type through
-`impl <OpTrait> for <lhs>`, and emit the impl method call (Stage C machinery).
-See the trait-stage ledger in `docs/TESTING.md §5.12` (F `dyn` vtable — which
-reuses the fn-pointer-field call machinery — follows).
+The built-in operators now desugar to synthetic-trait methods, so a user type opts
+into operator syntax by `impl`-ing the matching trait:
+
+- **Built-in traits** (`typeck::register_operator_traits`, phase 3): `+`→`Add::add`,
+  `*`→`Mul::mul`, `==`→`Eq::eq`, `<`→`Ord::lt`, registered synthetically (no AST
+  `trait` item; reserved — a user `trait Add` collides).
+- **Resolve** (`typeck::resolve_operator_trait`, in the `ExprKind::Binary` arm): a
+  binary op whose **left operand is a user type** resolves through
+  `impl <OpTrait> for <lhs>` and is recorded in `impl_calls` keyed by the binary
+  expr; result type = the impl method's return (`Add`/`Mul` → the type, `Eq`/`Ord`
+  → `bool`). A user type used with the operator but lacking the `impl` is an error;
+  primitives keep native C semantics.
+- **Lower** (`cgen::emit_operator_call`, in the `ExprKind::Binary` arm): `a + b` →
+  `jestyr_impl_Add__<T>__add(a, b)` (lhs receiver, rhs arg), reusing the Stage C
+  mangling + emission. No new backend machinery.
+- **`f64` no-FMA determinism seam:** the gcc invocation now passes
+  `-ffp-contract=off` (`src/main.rs`), forbidding `a*b + c` → fused multiply-add so
+  `f64` `+`/`*` are bit-reproducible across platforms (the numerics workstream's
+  key seam — see `NUMERICS-RESEARCH.md`).
+- **Tests (teeth-verified by mutation):** typeck unit (arith → type + recorded,
+  comparison → `bool`, missing-impl error, primitives untouched, reserved-name
+  collision), cgen unit (operator → impl-call lowering, primitive stays native),
+  properties over all four operators + determinism, `fuzz_operator_traits`, and the
+  gcc round-trip `examples/operators.jtr` (`13/42/0/1`). Suite **383 green**,
+  warning-clean.
+- **Scope note:** only the four operators `+`/`*`/`==`/`<` are wired. Derived
+  operators (`-`/`/`/`!=`/`>`/`<=`/`>=`) on user types are **not** yet desugared
+  (they'd negate/swap an `Eq`/`Ord`/`Add` call); they currently keep native
+  semantics (invalid C for a struct, but a pre-existing gap, not a regression).
+
+---
+
+## Main objective — **bracket-generic codegen** (monomorphize `f[T: Tr]`)
+
+The next step (a prerequisite for the body-side bound check below): make
+bracket-form `[T: Bound]` params **real type parameters that compile and run**.
+Today they lower to `Ty::Opaque("T")` and the backend doesn't monomorphize them — a
+bracket-generic *call* hits cgen's "cannot lower external type `T`". The work:
+infer each `T` from the value arguments at a call (the inference-based counterpart
+to comptime generics' explicit `pick(i32, …)`), thread it through the
+monomorphization engine (`cgen::{is_generic, make_subst, mangle, collect_all_instances}`),
+and emit a mangled instance per concrete instantiation. This gives Stage D a gcc
+round-trip and unblocks the **body-side "blame the generic code" check** (design
+§8.2's "Zig fix": inside `f[T: Tr]`, only `Tr`'s methods are callable on a `T`
+value — needs bracket params as real type params + method resolution through the
+bound). Trait **Stage F** (`dyn` vtable, reusing the fn-pointer-field call
+machinery) is the remaining trait stage after these.
 
 ---
 
@@ -165,7 +201,7 @@ A *capturing* closure coerced to a fn-pointer is a clear error.
 `run`/`build` on a no-`main` library now reports a clear message instead of a raw
 C-linker `WinMain` error (`test` mode is exempt; it synthesizes its own `main`).
 
-### Traits / interfaces — Stages A, B, C & D done (epic in flight)
+### Traits / interfaces — Stages A–E done (epic in flight)
 - **A — parse + represent:** `trait`/`impl`/`dyn Trait`/`[T: Bound]` into the AST
   (`Item::Trait`, `Item::Impl`, `TypeKind::Dyn`, `FnDecl::generics`); pipeline
   stays total with no semantics.
@@ -182,16 +218,18 @@ C-linker `WinMain` error (`test` mode is exempt; it synthesizes its own `main`).
   the bound names a known trait (declaration), and every call instantiates `T` at a
   type that `impl`s `Tr` (call-site obligation, reusing `impl_index`). Typeck-only;
   bracket generics aren't monomorphized yet. See the done-section / §5.12 ledger.
-- **Remaining (in order):** **E** operator traits (`+`/`*`/`==`/`<` →
-  `Add`/`Mul`/`Eq`/`Ord`, the `f64` impl is the no-FMA determinism seam — see Main
-  Objective above) · **F** `dyn` vtable (reuses the fn-pointer-field call
-  machinery — see the first done section's arc).
+- **E — operator traits:** `+`/`*`/`==`/`<` desugar to synthetic `Add`/`Mul`/`Eq`/`Ord`
+  traits; a binary op on a user type dispatches through its `impl` (Stage C path).
+  Plus the `-ffp-contract=off` f64 determinism seam. See the done-section / §5.12.
+- **Remaining (in order):** **bracket-generic codegen** + the **body-side bound
+  check** (see Main Objective above) · trait **F** `dyn` vtable (reuses the
+  fn-pointer-field call machinery — see the first done section's arc).
 
 ---
 
 ## Test posture
 
-Suite is **372 green**, warning-clean, clean across the `dharht-experiment` and
+Suite is **383 green**, warning-clean, clean across the `dharht-experiment` and
 `bench-alloc` feature builds. New coverage adapts to the *real* harness
 (`src/proptests.rs`: `mod prop` + `mod fuzz` + `arb_*_program` generators,
 `typeck_diags` for diagnostic differentials) — the handoff's referenced

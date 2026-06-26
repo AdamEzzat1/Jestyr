@@ -486,6 +486,13 @@ mod tests {
     }
 
     #[test]
+    fn operators_example_compiles_clean() {
+        // Traits Stage E: the four trait-backed operators (`+`/`*`/`==`/`<`) on a
+        // user type, each dispatching through its `Add`/`Mul`/`Eq`/`Ord` impl.
+        pipeline_is_clean("examples/operators.jtr");
+    }
+
+    #[test]
     fn tests_demo_example_builds_a_clean_test_harness() {
         // The `@test`/`@bench` runner (workstream O): emit in test mode and check
         // the harness is generated without diagnostics.

@@ -2826,6 +2826,12 @@ impl<'a> Cgen<'a> {
                 format!("({}{r})", unop_c(*op))
             }
             ExprKind::Binary { op, lhs, rhs } => {
+                // Operator traits (Stage E): a binary op the type checker resolved
+                // through `impl <OpTrait> for <lhs>` lowers to a direct call of the
+                // impl method (`lhs` is the receiver, `rhs` the argument).
+                if let Some(ic) = self.info.impl_calls.get(&id).cloned() {
+                    return self.emit_operator_call(&ic, *lhs, *rhs);
+                }
                 let l = self.emit_expr(*lhs);
                 let r = self.emit_expr(*rhs);
                 format!("({l} {} {r})", binop_c(*op))
@@ -4459,6 +4465,33 @@ impl<'a> Cgen<'a> {
         }
         let name = impl_method_c_name(&ic.trait_name, &ic.type_key, &ic.method);
         format!("{name}({})", parts.join(", "))
+    }
+
+    /// Lower an operator-trait binary op (Stage E) to a direct call of its impl
+    /// method: `a + b` → `jestyr_impl_Add__<T>__add(a, b)`. `lhs` is the receiver,
+    /// `rhs` the single argument; each is taken by `&` for a `mut`/`out` parameter
+    /// (operators are `read self, read rhs` by convention, so usually by value).
+    fn emit_operator_call(&mut self, ic: &ImplCall, lhs: ExprId, rhs: ExprId) -> String {
+        let (self_conv, rhs_conv) = self
+            .find_impl_method(&ic.trait_name, &ic.type_key, &ic.method)
+            .map(|f| {
+                let sc =
+                    f.params.iter().find(|p| p.is_self).map(|p| p.conv).unwrap_or(Conv::Default);
+                let rc = f
+                    .params
+                    .iter()
+                    .find(|p| !p.comptime && !p.is_self)
+                    .map(|p| p.conv)
+                    .unwrap_or(Conv::Default);
+                (sc, rc)
+            })
+            .unwrap_or((Conv::Default, Conv::Default));
+        let l = self.emit_expr(lhs);
+        let l = if matches!(self_conv, Conv::Mut | Conv::Out) { format!("&({l})") } else { l };
+        let r = self.emit_expr(rhs);
+        let r = if matches!(rhs_conv, Conv::Mut | Conv::Out) { format!("&({r})") } else { r };
+        let name = impl_method_c_name(&ic.trait_name, &ic.type_key, &ic.method);
+        format!("{name}({l}, {r})")
     }
 
     // --- structured concurrency (`concurrent` / `spawn`) ---
@@ -6270,6 +6303,42 @@ mod tests {
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("jestyr_impl_G__i32__g(j_n)"), "i32 receiver picks the i32 impl: {c}");
         assert!(c.contains("jestyr_impl_G__P__g(j_p)"), "P receiver picks the P impl: {c}");
+    }
+
+    // --- traits: operator traits (Stage E) ---
+
+    #[test]
+    fn lowers_an_operator_to_its_impl_method_call() {
+        // `a + b` and `a == b` on a user type lower to direct calls of the
+        // `Add`/`Eq` impl methods (lhs receiver, rhs argument) — no native `+`/`==`.
+        let src = "struct V { n: i32 } \
+                   impl Add for V { fn add(read self, read rhs: V) -> V { return V{ n: self.n + rhs.n } } } \
+                   impl Eq for V { fn eq(read self, read rhs: V) -> bool { return self.n == rhs.n } } \
+                   fn use_it(read a: V, read b: V) -> bool { let s = a + b return a == b }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(
+            c.contains("jestyr_impl_Add__V__add(j_a, j_b)"),
+            "`+` lowers to the Add impl call: {c}"
+        );
+        assert!(
+            c.contains("jestyr_impl_Eq__V__eq(j_a, j_b)"),
+            "`==` lowers to the Eq impl call: {c}"
+        );
+        // The impl methods themselves are emitted (Stage C machinery).
+        assert!(
+            c.contains("Jestyr_V jestyr_impl_Add__V__add(Jestyr_V j_self, Jestyr_V j_rhs)"),
+            "Add impl method definition: {c}"
+        );
+    }
+
+    #[test]
+    fn primitive_operator_keeps_native_lowering() {
+        // A primitive `+` stays a native C `+` — no operator-trait dispatch.
+        let (c, d) = gen("fn add(a: i32, b: i32) -> i32 { return a + b }");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("(j_a + j_b)"), "primitive add is native: {c}");
+        assert!(!c.contains("jestyr_impl_Add"), "no operator-trait dispatch for primitives: {c}");
     }
 
     #[test]

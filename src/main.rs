@@ -507,7 +507,12 @@ fn build_and_maybe_run(path: &str, c_src: &str, run: bool) -> ExitCode {
     };
 
     let mut cmd = Command::new(&cc);
-    cmd.args(["-O2", "-std=c11"]);
+    // `-ffp-contract=off` is the floating-point **determinism seam** (traits Stage
+    // E / the numerics workstream): it forbids the compiler from fusing `a*b + c`
+    // into a single FMA, which would silently change the result and break
+    // bit-reproducibility across platforms. A user `f64` `+`/`*` must compute
+    // exactly what the source says — see `NUMERICS-RESEARCH.md`.
+    cmd.args(["-O2", "-std=c11", "-ffp-contract=off"]);
     // Structured-concurrency output uses pthreads; link it only when present.
     if c_src.contains("pthread") {
         cmd.arg("-pthread");

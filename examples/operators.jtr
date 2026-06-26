@@ -1,0 +1,32 @@
+// Traits — Stage E: operator traits. The built-in operators desugar to methods
+// of synthetic traits — `+`→`Add::add`, `*`→`Mul::mul`, `==`→`Eq::eq`,
+// `<`→`Ord::lt` — so a user type opts into operator syntax by `impl`-ing them.
+// Each `a OP b` lowers through the same static-dispatch path as a method call.
+
+struct V { n: i32 }
+
+impl Add for V {
+    fn add(read self, read rhs: V) -> V { return V{ n: self.n + rhs.n } }
+}
+impl Mul for V {
+    fn mul(read self, read rhs: V) -> V { return V{ n: self.n * rhs.n } }
+}
+impl Eq for V {
+    fn eq(read self, read rhs: V) -> bool { return self.n == rhs.n }
+}
+impl Ord for V {
+    fn lt(read self, read rhs: V) -> bool { return self.n < rhs.n }
+}
+
+fn main() -> i32 {
+    let a = V{ n: 6 }
+    let b = V{ n: 7 }
+
+    print_int((a + b).n)   // 13 — Add::add
+    print_int((a * b).n)   // 42 — Mul::mul
+
+    if a == b { print_int(1) } else { print_int(0) }  // 0 — Eq::eq
+    if a < b { print_int(1) } else { print_int(0) }   // 1 — Ord::lt
+
+    return 0
+}

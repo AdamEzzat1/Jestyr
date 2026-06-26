@@ -292,13 +292,30 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
-        // Phase 3: traits, then impls (coherence-checked against the traits).
+        // Phase 3: built-in operator traits, then user traits, then impls
+        // (coherence-checked against both). Operator traits are registered first
+        // so a user `impl Add for T` resolves, and a user `trait Add` collides.
+        self.register_operator_traits();
         self.register_traits();
         self.register_impls();
         // Phase 4: definition-site bounds (traits, Stage D) — every declared
         // bound `[T: Tr]` must name a registered trait (the per-call obligation
         // that a *concrete* type satisfies the bound is checked in `infer`).
         self.check_bound_traits_declared();
+    }
+
+    /// Register the built-in **operator traits** (traits, Stage E): `+`/`*`/`==`/`<`
+    /// desugar to `Add`/`Mul`/`Eq`/`Ord` methods, so a user type opts into operator
+    /// syntax by `impl`-ing the matching trait. These are synthetic (no AST
+    /// `trait` item); a user type's `impl Add for T` then resolves and lowers
+    /// through the Stage C static-dispatch path.
+    fn register_operator_traits(&mut self) {
+        for (name, method) in OPERATOR_TRAITS {
+            self.table
+                .traits
+                .entry(name.to_string())
+                .or_insert_with(|| TraitDef { methods: vec![(method.to_string(), true)] });
+        }
     }
 
     /// Register each `trait` (name → its method set, flagged required/defaulted).
@@ -509,6 +526,53 @@ impl<'a> TypeChecker<'a> {
                     "type `{ty}` does not implement trait `{tr}` required by bound `{param}: {tr}` on `{name}`"
                 ),
             );
+        }
+    }
+
+    /// Operator traits (traits, Stage E): a binary `a OP b` whose **left operand
+    /// is a user type** resolves through `impl <OpTrait> for <lhs>` and is recorded
+    /// for static dispatch (reusing `impl_calls`, keyed by the binary expr). Returns
+    /// the result type — the impl method's return (`Add`/`Mul` → the type itself,
+    /// `Eq`/`Ord` → `bool`). `None` means "not operator-overloaded" (a non-trait
+    /// operator, or a primitive operand using native C ops). A user type used with
+    /// a trait-backed operator but lacking the `impl` is an error.
+    fn resolve_operator_trait(&mut self, id: ExprId, op: BinOp, lt: &Ty, span: Span) -> Option<Ty> {
+        let (trait_name, method) = op_trait_method(op)?;
+        // Only user types overload operators; primitives keep native semantics.
+        if !matches!(lt, Ty::Named(_) | Ty::GenStruct { .. }) {
+            return None;
+        }
+        let key = self.table.ty_key(lt);
+        let resolved: Option<Ty> = self
+            .table
+            .impls
+            .iter()
+            .find(|im| {
+                im.trait_name == trait_name && im.type_key == key && im.method_rets.contains_key(method)
+            })
+            .map(|im| im.method_rets.get(method).cloned().unwrap_or(Ty::Unknown));
+        match resolved {
+            Some(ret) => {
+                self.impl_calls.insert(
+                    id,
+                    ImplCall {
+                        trait_name: trait_name.to_string(),
+                        type_key: key,
+                        method: method.to_string(),
+                    },
+                );
+                Some(ret)
+            }
+            None => {
+                self.error(
+                    span,
+                    format!(
+                        "type `{key}` does not implement `{trait_name}` (the `{}` operator)",
+                        op_symbol(op)
+                    ),
+                );
+                Some(Ty::Error)
+            }
         }
     }
 
@@ -1156,16 +1220,23 @@ impl<'a> TypeChecker<'a> {
             ExprKind::Binary { op, lhs, rhs } => {
                 let lt = self.infer(scope, typ, self_ty, *lhs);
                 let rt = self.infer(scope, typ, self_ty, *rhs);
-                use BinOp::*;
-                match op {
-                    Eq | Ne | Lt | Le | Gt | Ge | And | Or => Ty::Prim("bool"),
-                    _ => {
-                        if is_numeric(&lt) {
-                            lt
-                        } else if is_numeric(&rt) {
-                            rt
-                        } else {
-                            Ty::Unknown
+                // Operator traits (Stage E): `a OP b` on a user type dispatches
+                // through `impl <OpTrait> for <lhs>`; primitives fall through to
+                // native semantics below.
+                if let Some(t) = self.resolve_operator_trait(id, *op, &lt, span) {
+                    t
+                } else {
+                    use BinOp::*;
+                    match op {
+                        Eq | Ne | Lt | Le | Gt | Ge | And | Or => Ty::Prim("bool"),
+                        _ => {
+                            if is_numeric(&lt) {
+                                lt
+                            } else if is_numeric(&rt) {
+                                rt
+                            } else {
+                                Ty::Unknown
+                            }
                         }
                     }
                 }
@@ -2445,6 +2516,37 @@ fn string_intrinsic_ret(name: &str) -> Option<Ty> {
 /// Does the parameter type's head constructor match the receiver's? Confirms
 /// that `base.name(...)` really is a method on `base`'s type (and not a typo
 /// that happens to share a name with some unrelated function).
+/// The built-in operator traits (traits, Stage E): `(trait name, method name)`.
+/// `+`→`Add::add`, `*`→`Mul::mul`, `==`→`Eq::eq`, `<`→`Ord::lt`. Registered as
+/// synthetic traits so a user type opts into operator syntax by `impl`-ing them.
+const OPERATOR_TRAITS: [(&str, &str); 4] =
+    [("Add", "add"), ("Mul", "mul"), ("Eq", "eq"), ("Ord", "lt")];
+
+/// The `(trait, method)` a trait-backed binary operator desugars to, or `None`
+/// for an operator with native-only semantics (`-`, `/`, `&&`, bit-ops, …).
+fn op_trait_method(op: BinOp) -> Option<(&'static str, &'static str)> {
+    use BinOp::*;
+    Some(match op {
+        Add => ("Add", "add"),
+        Mul => ("Mul", "mul"),
+        Eq => ("Eq", "eq"),
+        Lt => ("Ord", "lt"),
+        _ => return None,
+    })
+}
+
+/// The source spelling of a trait-backed operator, for diagnostics.
+fn op_symbol(op: BinOp) -> &'static str {
+    use BinOp::*;
+    match op {
+        Add => "+",
+        Mul => "*",
+        Eq => "==",
+        Lt => "<",
+        _ => "?",
+    }
+}
+
 fn head_matches(param: &Ty, recv: &Ty) -> bool {
     match (param, recv) {
         (Ty::GenStruct { ctor: a, .. }, Ty::GenStruct { ctor: b, .. }) => a == b,
@@ -2860,6 +2962,100 @@ mod tests {
              fn caller(read b: bool) -> i32 { return xid(b) }",
         );
         assert!(d.is_empty(), "an unbounded param accepts any type: {:?}", d);
+    }
+
+    // --- traits: operator traits (Stage E) ---
+
+    #[test]
+    fn an_arithmetic_operator_on_a_user_type_resolves_through_its_impl() {
+        // `a + b` on a type with `impl Add` types as the impl's return (the type
+        // itself) and is recorded for static dispatch.
+        let (ast, info) = analyze_full(
+            "struct V { n: i32 } \
+             impl Add for V { fn add(read self, read rhs: V) -> V { return V{ n: self.n + rhs.n } } } \
+             fn use_it(read a: V, read b: V) -> V { return a + b }",
+        );
+        // Find the operator-*dispatched* `a + b` (the impl body's own `self.n +
+        // rhs.n` is native i32 with no `impl_calls` entry, so filter by that).
+        let add = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| {
+                let id = ExprId(i as u32);
+                (matches!(e.kind, ExprKind::Binary { op: BinOp::Add, .. })
+                    && info.impl_calls.contains_key(&id))
+                .then_some(id)
+            })
+            .expect("the dispatched `a + b` expr");
+        assert!(matches!(info.type_of(add), Ty::Named(_)), "operator result is the user type");
+    }
+
+    #[test]
+    fn a_comparison_operator_on_a_user_type_resolves_to_bool() {
+        // `a == b` on a type with `impl Eq` types as the impl's `bool` return.
+        let (ast, info) = analyze_full(
+            "struct V { n: i32 } \
+             impl Eq for V { fn eq(read self, read rhs: V) -> bool { return self.n == rhs.n } } \
+             fn use_it(read a: V, read b: V) -> bool { return a == b }",
+        );
+        let eq = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| {
+                let id = ExprId(i as u32);
+                (matches!(e.kind, ExprKind::Binary { op: BinOp::Eq, .. })
+                    && info.impl_calls.contains_key(&id))
+                .then_some(id)
+            })
+            .expect("the dispatched `a == b` expr");
+        assert_eq!(info.type_of(eq), &Ty::Prim("bool"), "Eq::eq returns bool");
+    }
+
+    #[test]
+    fn an_operator_on_a_user_type_without_the_impl_is_an_error() {
+        // A user type used with `+` but lacking `impl Add` is rejected — clearer
+        // than silently typing `Unknown` and emitting invalid C.
+        let (_i, d) = analyze(
+            "struct V { n: i32 } \
+             fn use_it(read a: V, read b: V) -> V { return a + b }",
+        );
+        assert!(
+            d.iter().any(|m| m.message.contains("does not implement `Add`")),
+            "expected a missing-operator-impl error: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn primitive_arithmetic_is_not_routed_through_operator_traits() {
+        // Primitives keep native semantics — no operator-trait resolution, no
+        // `impl_calls` entry, just the usual numeric result.
+        let (ast, info) = analyze_full("fn add(a: i32, b: i32) -> i32 { return a + b }");
+        let plus = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| {
+                matches!(e.kind, ExprKind::Binary { op: BinOp::Add, .. })
+                    .then_some(ExprId(i as u32))
+            })
+            .expect("the `a + b` expr");
+        assert_eq!(info.type_of(plus), &Ty::Prim("i32"));
+        assert!(!info.impl_calls.contains_key(&plus), "primitives don't dispatch operators");
+    }
+
+    #[test]
+    fn a_user_trait_named_like_an_operator_trait_collides() {
+        // The built-in operator traits are reserved: a user `trait Add` conflicts
+        // with the pre-registered one.
+        let (_i, d) = analyze("trait Add { fn add(read self) -> i32 }");
+        assert!(
+            d.iter().any(|m| m.message.contains("duplicate definition of trait `Add`")),
+            "{:?}",
+            d
+        );
     }
 
     #[test]
