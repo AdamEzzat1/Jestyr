@@ -109,12 +109,16 @@ visible at a glance. (Run `--release` for representative speed; `dev` is `opt-le
 ## 4. How to run
 
 ```sh
-cargo test                       # unit + property + replayed fuzz corpus (285+ tests)
+cargo test                       # unit + property + replayed fuzz corpus (430+ tests)
 cargo test prop::                # just the property tests
+cargo test drop_props            # Drop/RAII scope-exit drop-glue properties (Phase 3)
+cargo test alloc_props           # @no_alloc soundness/completeness properties (Phase 3)
 cargo bolero test fuzz_pipeline  # real coverage-guided fuzzing of the pipeline
+cargo bolero test fuzz_drop_alloc_pipeline      # fuzz Drop/RAII + allocator lowering
 cargo run -- selfbench           # per-stage speed + footprint on a generated program
 cargo run --features bench-alloc -- selfbench   # + peak/total heap bytes
 cargo run -- test examples/tests_demo.jtr       # the in-language @test/@bench runner
+cargo run -- emit-c examples/drop.jtr --show-drops   # inspect where drop glue is inserted
 ```
 
 Discipline (unchanged): every increment stays `cargo test`-green and warning-clean; new
@@ -349,6 +353,49 @@ Run: `cargo test trait_programs`, `cargo test parses_a_trait`, `cargo bolero tes
   determinism over `arb_dyn_program`, `fuzz_dyn_dispatch`, gcc round-trip `examples/dyn_dispatch.jtr`
   (`42/70/70`).
 - ✅ **The trait epic (A–F) is complete.**
+
+### 5.13 Drop / RAII + allocators (design Phase 3)
+
+Deterministic, drop-flag-free destructors and the enforced allocation-free contract. The oracle for
+every drop property is **known by construction**: a generator builds a program with a known number
+of owned, non-moved droppables, and the property asserts the emitted C holds exactly that many drop
+*call sites* — `0` is a missed drop (leak), `≥2` is a double-free. All pure-Rust (scans emitted C),
+so they run under the toolchain-free default `cargo test`.
+
+- ✅ **Scope-exit drop glue (Increment 1).** A local of a type with an `impl Drop for T` is dropped
+  at scope exit in **reverse declaration order**, with no runtime drop flags — liveness is static
+  because the ownership model makes moves syntactic. cgen keeps a drop-scope stack (one per `{ }`
+  block); a local registers *as its `let` is emitted*, so an early `return` never drops a not-yet-
+  declared local. A `return` spills its value to a temp, runs drops, then returns (no use-after-drop).
+  Unit goldens (`cgen::tests`: call emitted, reverse order, move elision, `--show-drops` comment, no
+  glue without an impl); properties (`drop_props`: drops-each-owned-exactly-once,
+  move-elision, no-double-free, determinism); `fuzz_drop_alloc_pipeline` / `_determinism`. gcc round-
+  trip `examples/drop.jtr` (`100, 2, 1, 200, 300, 7`). **Teeth:** suppressing the emitter fails the
+  count properties + goldens, then passes on revert.
+- ✅ **Move analysis (drop-after-move elision).** `cgen::collect_moved` over-approximates (leak-safe):
+  a local that is returned, passed by value to a call, captured into a struct, rebound, or used as a
+  `take self` receiver is **not** dropped at its origin — the new owner drops it, so no double-free
+  by construction. Property `moved_out_value_is_not_dropped` (the returned local `x0` is never dropped).
+- ✅ **`--show-drops` inspection.** `jestyrc emit-c <f> --show-drops` annotates each inserted drop with
+  a `/* drop j_x : T */` comment — implicit is not hidden. Golden `show_drops_annotates_the_glue`.
+- ✅ **Manual-`drop()` rejection.** A `value.drop()` call (resolving through `impl Drop`'s `drop`) is a
+  compile error — the auto-drop would double-free. Unit `cannot_call_drop_manually`.
+- ✅ **Region-integrated bulk drop (Increment 4, partial).** A value owned by a `region { }` block emits
+  **zero** per-value drop glue — the arena reclaims it in bulk; the region *determines* the drop
+  strategy. Metamorphic golden + property `region_owned_value_emits_no_drop_glue`: the same droppable
+  emits one drop in a plain block and zero inside a `region`.
+- ✅ **`@no_alloc` — the enforced contract (Increment 3).** A `@no_alloc` function must be *proven*
+  allocation-free by the escape checker, or it is a compile error (the `@no_panic` analog). Rejects a
+  call to any allocation intrinsic (`alloc`/`realloc`/`arena_*`/`region_*`/`gen_new`, bare or
+  module-qualified), a `region { }` block, and a region-scoped `for`. Unit (`escape::tests`: rejects
+  heap alloc / region; accepts a clean body; per-function, not inherited); property `alloc_props` —
+  soundness **and** completeness against an independent oracle (rejected *iff* it allocates, no false
+  positives). **Teeth:** neutering `is_alloc_intrinsic` fails the rejection tests, then passes on revert.
+- **Remaining (future work):** `defer`/`errdefer`; the fn-pointer-vtable `Allocator` value (retiring the
+  enum stand-in in `std/mem.jtr`); `Layout { size, align }`; an allocator-parameterized `Vec(T, A)`
+  end-to-end with a leak-catching debug allocator (the `--features c-oracle` gcc-round-trip exit
+  criterion); `@deterministic` allocators; linear / must-use types; conditional (per-branch) move
+  precision; transitive `@no_alloc` (calls-a-function-that-allocates closure). See `DROP-ALLOC-PHASE3.md`.
 
 ---
 
