@@ -47,7 +47,14 @@ use crate::span::Span;
 use crate::types::{Ty, TypeInfo};
 
 pub fn check(ast: &Ast, info: &TypeInfo) -> Vec<Diagnostic> {
-    let mut ck = Checker { ast, info, diags: Vec::new(), frozen: Vec::new(), region_depths: Vec::new() };
+    let mut ck = Checker {
+        ast,
+        info,
+        diags: Vec::new(),
+        frozen: Vec::new(),
+        region_depths: Vec::new(),
+        no_alloc: false,
+    };
     for item in &ast.items {
         ck.check_item(item);
     }
@@ -58,6 +65,11 @@ struct Checker<'a> {
     ast: &'a Ast,
     info: &'a TypeInfo,
     diags: Vec<Diagnostic>,
+    /// Is the function currently being checked `@no_alloc`? If so, any allocation
+    /// (a heap/arena intrinsic, a `region` block, a region-scoped loop) is a
+    /// compile error — the enforced allocation-free contract (the `@no_panic`
+    /// analog). Saved/restored around nested method bodies.
+    no_alloc: bool,
     /// Collections currently being iterated (by simple name). A `for … in xs`
     /// loop holds a borrow of `xs` for its body, so mutating `xs` there is
     /// forbidden (iterator invalidation — the borrow contract of a loop). A stack
@@ -148,8 +160,13 @@ impl<'a> Checker<'a> {
             let name = if p.is_self { "self" } else { p.name.name.as_str() };
             ctx.bind(name, is_borrow);
         }
+        // `@no_alloc` is per-function — save/restore so a nested method body does
+        // not inherit (or clobber) the enclosing function's contract.
+        let saved_no_alloc = self.no_alloc;
+        self.no_alloc = f.has_attr("no_alloc");
         // The body is in return position: its tail expression is the result.
         self.check_block(&mut ctx, &f.body, true);
+        self.no_alloc = saved_no_alloc;
     }
 
     fn check_block(&mut self, ctx: &mut FnCtx, block: &Block, tail: bool) {
@@ -336,6 +353,7 @@ impl<'a> Checker<'a> {
                 }
                 self.check_give_away(ctx, id, *callee, args);
                 self.check_loop_mutation(ctx, id, *callee, args);
+                self.check_no_alloc_call(id, *callee, span);
                 return;
             }
             ExprKind::Binary { lhs, rhs, .. } => {
@@ -381,6 +399,11 @@ impl<'a> Checker<'a> {
                 return;
             }
             ExprKind::Region { body, .. } => {
+                // A `region` block opens an arena (a heap allocation), so it is
+                // forbidden in a `@no_alloc` function.
+                if self.no_alloc {
+                    self.error(span, "a `region` block allocates an arena — forbidden in a `@no_alloc` function");
+                }
                 // Record the scope depth at entry: anything bound shallower than
                 // this is *outside* the region (a region value stored there escapes).
                 self.region_depths.push(ctx.scopes.len());
@@ -388,7 +411,11 @@ impl<'a> Checker<'a> {
                 self.region_depths.pop();
                 return;
             }
-            ExprKind::For { head, body, els, .. } => {
+            ExprKind::For { head, body, els, region, .. } => {
+                // A region-scoped loop allocates a per-iteration scratch arena.
+                if self.no_alloc && region.is_some() {
+                    self.error(span, "a region-scoped loop allocates a scratch arena — forbidden in a `@no_alloc` function");
+                }
                 ctx.push();
                 let mut froze = 0usize;
                 match head {
@@ -599,6 +626,33 @@ impl<'a> Checker<'a> {
                     self.give_away_error(arg, &borrow, &pname, &name);
                 }
             }
+        }
+    }
+
+    /// In a `@no_alloc` function, reject a call to an allocation intrinsic
+    /// (`alloc`/`realloc`/`arena_*`/`region_*`/`gen_new`), whether bare or module-
+    /// qualified (`mem.allocate` resolves to its bare name). This is the direct,
+    /// per-op enforcement that mirrors `@no_panic`'s un-elided-index check; the
+    /// *transitive* "calls a function that allocates" closure is future work.
+    fn check_no_alloc_call(&mut self, call_id: ExprId, callee: ExprId, span: Span) {
+        if !self.no_alloc {
+            return;
+        }
+        // A module-qualified call resolves to the underlying bare function name.
+        let name = if let Some(q) = self.info.qualified.get(&call_id) {
+            q.clone()
+        } else if let ExprKind::Name(n) = &self.ast.expr_at(callee).kind {
+            n.name.clone()
+        } else {
+            return;
+        };
+        if is_alloc_intrinsic(&name) {
+            self.error(
+                span,
+                format!(
+                    "`{name}` allocates — forbidden in a `@no_alloc` function (the proven-allocation-free contract)"
+                ),
+            );
         }
     }
 
@@ -829,6 +883,26 @@ impl<'a> Checker<'a> {
     }
 }
 
+/// Does `name` denote a backend allocation intrinsic — a call that obtains fresh
+/// memory (heap `malloc`/`realloc`, an arena open, or an arena bump)? These are
+/// the operations a `@no_alloc` function may not perform. (`free_ptr`/`arena_close`
+/// release memory and are allowed; they don't allocate.)
+fn is_alloc_intrinsic(name: &str) -> bool {
+    matches!(
+        name,
+        "alloc"
+            | "alloc_i32"
+            | "realloc"
+            | "realloc_i32"
+            | "arena_open"
+            | "arena_alloc"
+            | "region_alloc"
+            | "region_str"
+            | "region_concat"
+            | "gen_new"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,6 +925,39 @@ mod tests {
     fn accepts_the_vec_example() {
         let src = include_str!("../examples/vec.jtr");
         assert!(escapes(src).is_empty(), "false positives: {:?}", escapes(src));
+    }
+
+    // --- @no_alloc: the enforced allocation-free contract (Phase 3) ---
+
+    #[test]
+    fn no_alloc_rejects_a_heap_allocation() {
+        let d = escapes("@no_alloc fn f(n: i32) -> i32 { let p = alloc(i32, 4) free_ptr(p) return n }");
+        assert_eq!(d.len(), 1, "{:?}", d);
+        assert!(d[0].message.contains("@no_alloc"), "{:?}", d);
+        assert!(d[0].message.contains("alloc"), "{:?}", d);
+    }
+
+    #[test]
+    fn no_alloc_rejects_a_region_block() {
+        let d = escapes("@no_alloc fn f() -> i32 { region r { let x = region_alloc(r, i32, 1) } return 0 }");
+        assert!(!d.is_empty(), "a region block must be rejected: {:?}", d);
+        assert!(d.iter().any(|m| m.message.contains("region")), "{:?}", d);
+    }
+
+    #[test]
+    fn no_alloc_accepts_an_allocation_free_body() {
+        let d = escapes("@no_alloc fn f(a: i32, b: i32) -> i32 { let s = a + b return s }");
+        assert!(d.is_empty(), "allocation-free body must pass: {:?}", d);
+    }
+
+    #[test]
+    fn no_alloc_is_per_function_not_inherited() {
+        // The plain `g` may allocate even when a `@no_alloc` `f` exists alongside.
+        let d = escapes(
+            "@no_alloc fn f(n: i32) -> i32 { return n } \
+             fn g() -> i32 { let p = alloc(i32, 4) free_ptr(p) return 0 }",
+        );
+        assert!(d.is_empty(), "only the annotated fn is constrained: {:?}", d);
     }
 
     // --- the thesis in action: allowed uses ---

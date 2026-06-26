@@ -106,6 +106,23 @@ const SPECS: &[Spec] = &[
         args: Args::None,
         status: Status::Active,
     },
+    // `@no_alloc` (design Phase 3) — the escape checker must *prove* the body does
+    // no allocation (heap or arena), else it is a compile error. The enforced
+    // contract for real-time / embedded / kernel paths; the `@no_panic` analog.
+    Spec {
+        name: "no_alloc",
+        targets: &[Target::Fn, Target::Method],
+        args: Args::None,
+        status: Status::Active,
+    },
+    // `@deterministic` (design Phase 3) — recognized; the allocator-determinism
+    // contract ("same alloc sequence ⇒ same slot layout") is not yet enforced.
+    Spec {
+        name: "deterministic",
+        targets: &[Target::Fn, Target::Method],
+        args: Args::None,
+        status: Status::Reserved("allocator-determinism contract (design Phase 3; NUMERICS-RESEARCH.md)"),
+    },
     // ── optimization intent (functions) ────────────────────────────────────
     Spec {
         name: "inline",

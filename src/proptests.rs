@@ -74,6 +74,15 @@ fn typeck_full(src: &str) -> (crate::ast::Ast, crate::types::TypeInfo) {
     (ast, info)
 }
 
+/// The escape checker's diagnostic messages for a source — used by the
+/// `@no_alloc` soundness/completeness property to assert *which* error fires.
+fn escape_diags(src: &str) -> Vec<String> {
+    let (tokens, _) = Lexer::new(src).tokenize();
+    let (ast, _) = Parser::new(src, tokens).parse();
+    let (info, _) = typeck::check(&ast);
+    escape::check(&ast, &info).iter().map(|d| d.message.clone()).collect()
+}
+
 /// The token-kind sequence (Eof dropped) — the lexer's structural output, used by
 /// the whitespace-insensitivity metamorphic property.
 fn token_kinds(src: &str) -> Vec<TokenKind> {
@@ -827,6 +836,67 @@ mod drop_props {
         fn drop_lowering_is_deterministic(n in 1usize..6) {
             let (src, _e) = drop_program(n, false);
             prop_assert_eq!(compile(&src), compile(&src));
+        }
+    }
+}
+
+/// Property tests for the `@no_alloc` enforced contract (design Phase 3).
+///
+/// Soundness **and** completeness against an independent oracle: the generator
+/// knows by construction whether the body it built allocates, so the property
+/// asserts the escape checker rejects a `@no_alloc` body *iff* it allocates — no
+/// false negatives (a missed allocation) and no false positives (a rejected
+/// allocation-free body).
+mod alloc_props {
+    use super::escape_diags;
+    use proptest::prelude::*;
+
+    /// The allocating intrinsics a `@no_alloc` body must not call, with a
+    /// well-typed call form for each.
+    const ALLOC_CALLS: &[&str] = &[
+        "let p = alloc(i32, 4) free_ptr(p)",
+        "let p = realloc(i32, null, 8) free_ptr(p)",
+        "let h = arena_open(64)",
+    ];
+
+    /// Benign, allocation-free statements that must never trip the checker.
+    const BENIGN: &[&str] = &["let s = n + 1", "let t = n * 2", "print_int(n)", ""];
+
+    proptest! {
+        /// A `@no_alloc` body that calls an allocating intrinsic is *always*
+        /// rejected, whichever intrinsic and wherever in the body.
+        #[test]
+        fn allocating_body_is_always_rejected(
+            ai in 0usize..ALLOC_CALLS.len(),
+            bi in 0usize..BENIGN.len(),
+        ) {
+            let src = format!(
+                "@no_alloc fn f(n: i32) -> i32 {{ {} {} return n }}",
+                BENIGN[bi], ALLOC_CALLS[ai]
+            );
+            let diags = escape_diags(&src);
+            prop_assert!(
+                diags.iter().any(|m| m.contains("@no_alloc")),
+                "an allocating @no_alloc body must be rejected: {}\n{:?}", src, diags
+            );
+        }
+
+        /// A `@no_alloc` body built only from benign statements is *always*
+        /// accepted — no false positives.
+        #[test]
+        fn allocation_free_body_is_always_accepted(
+            b0 in 0usize..BENIGN.len(),
+            b1 in 0usize..BENIGN.len(),
+        ) {
+            let src = format!(
+                "@no_alloc fn f(n: i32) -> i32 {{ {} {} return n }}",
+                BENIGN[b0], BENIGN[b1]
+            );
+            let diags = escape_diags(&src);
+            prop_assert!(
+                !diags.iter().any(|m| m.contains("@no_alloc")),
+                "an allocation-free @no_alloc body must be accepted: {}\n{:?}", src, diags
+            );
         }
     }
 }
