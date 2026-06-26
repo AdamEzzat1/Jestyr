@@ -1,48 +1,75 @@
-// std/mem.jtr — allocator-as-value (design §14).
+// std/mem.jtr — the explicit allocator interface (design §14, Phase 3).
 //
-// Every allocating API takes an `Allocator` *value*. The value carries both the
-// strategy (the enum tag) and its context (the payload), and `allocate` dispatches
-// on it. This is the bootstrap encoding of "allocators are first-class": a real
-// fn-pointer vtable is the next step once function-pointer types / traits land.
+// Every allocating API takes an `Allocator` *value*. The value is Zig's
+// `std.mem.Allocator` shape: an opaque context pointer plus a vtable of thin
+// function pointers (`alloc`/`free`/`destroy`). `allocate` dispatches through that
+// vtable — a real first-class allocator, retiring the earlier enum stand-in. The
+// strategy travels with the value; nothing is hidden behind a global.
 //
 //   • system  — malloc/free, frees per-allocation
-//   • arena   — bump allocation from one buffer, freed in bulk by `destroy`
+//   • arena   — bump allocation from one buffer, reclaimed in bulk by `destroy`
 
-pub enum Allocator {
-    system,
-    arena(h: *mut u8),
+// `Drop` lives here so std collections can free their buffers by RAII through the
+// allocator they were built from. (A built-in/prelude `Drop` is future work.)
+trait Drop { fn drop(mut self) }
+
+// The size + alignment of an allocation request (Rust's `Layout`).
+pub struct Layout { size: usize, align: usize }
+
+// `@copy`: an allocator is a cheap handle (a context pointer + thin fn-pointers),
+// freely copied by value — so a collection may *store* one without it escaping.
+@copy pub struct Allocator {
+    ctx: *mut u8,
+    alloc_fn: fn(*mut u8, Layout) -> *mut u8,
+    free_fn: fn(*mut u8, *mut u8),
+    destroy_fn: fn(*mut u8),
 }
 
-// Construct the malloc-backed general-purpose allocator.
-pub fn system_allocator() -> Allocator {
-    return system
+// --- the raw byte API (one path over any allocator) ---
+pub fn alloc_bytes(read a: Allocator, n: usize) -> *mut u8 {
+    return a.alloc_fn(a.ctx, Layout{ size: n, align: 8 })
 }
+pub fn free_bytes(read a: Allocator, p: *mut u8) { a.free_fn(a.ctx, p) }
 
-// Construct a bump-arena allocator with a `cap`-byte backing buffer.
-pub fn arena_allocator(cap: usize) -> Allocator {
-    return arena(arena_open(cap))
-}
+// --- the typed API (what collections + user code call) ---
 
 // Allocate `n` contiguous `T` from `a`. The strategy is whatever `a` carries.
-pub fn allocate(comptime T: type, a: Allocator, n: usize) -> *mut T {
-    match a {
-        system => alloc(T, n),
-        arena(h) => arena_alloc(h, T, n),
-    }
+pub fn allocate(comptime T: type, read a: Allocator, n: usize) -> *mut T {
+    return alloc_bytes(a, n * size_of(T)) as *mut T
 }
 
-// Release one allocation. A no-op for the arena (it frees in bulk at `destroy`).
-pub fn release(comptime T: type, a: Allocator, p: *mut T) {
-    match a {
-        system => free_ptr(p),
-        arena(h) => {},
-    }
+// Release one allocation (a no-op for the arena, which frees in bulk at `destroy`).
+pub fn release(comptime T: type, read a: Allocator, p: *mut T) {
+    free_bytes(a, p as *mut u8)
 }
 
 // Tear down an allocator, releasing any bulk-owned memory (the arena buffer).
-pub fn destroy(a: Allocator) {
-    match a {
-        system => {},
-        arena(h) => arena_close(h),
+pub fn destroy(read a: Allocator) { a.destroy_fn(a.ctx) }
+
+// --- strategy 1: the system (malloc) allocator ---
+fn sys_alloc(ctx: *mut u8, ly: Layout) -> *mut u8 { return alloc(u8, ly.size) }
+fn sys_free(ctx: *mut u8, p: *mut u8) { free_ptr(p) }
+fn sys_destroy(ctx: *mut u8) {}
+
+pub fn system_allocator() -> Allocator {
+    return Allocator{
+        ctx: null,
+        alloc_fn: &sys_alloc,
+        free_fn: &sys_free,
+        destroy_fn: &sys_destroy,
+    }
+}
+
+// --- strategy 2: a bump arena (ctx = the arena handle) ---
+fn ar_alloc(ctx: *mut u8, ly: Layout) -> *mut u8 { return arena_alloc(ctx, u8, ly.size) }
+fn ar_free(ctx: *mut u8, p: *mut u8) {}
+fn ar_destroy(ctx: *mut u8) { arena_close(ctx) }
+
+pub fn arena_allocator(cap: usize) -> Allocator {
+    return Allocator{
+        ctx: arena_open(cap),
+        alloc_fn: &ar_alloc,
+        free_fn: &ar_free,
+        destroy_fn: &ar_destroy,
     }
 }

@@ -1,9 +1,11 @@
-// std/list.jtr — a generic growable list, allocator-aware (design §16.1).
+// std/list.jtr — a generic growable list, allocator-parameterized (design §16.1).
 //
-// `List(T)` owns a heap buffer obtained from an `Allocator` value. Every API that
-// can allocate takes the allocator explicitly — the design's first rule for
-// collections. Growth doubles the capacity and copies; since the bootstrap has no
-// loops yet, the copy is a tail-recursive helper.
+// `List(T)` *stores* the `Allocator` it was built from (Rust's `Vec<T, A>`), owns
+// a heap buffer obtained through that allocator's vtable, and grows it on demand.
+// The concrete `List(i32)` instantiation carries a `Drop` impl, so its buffer is
+// freed **automatically at scope exit** — no manual `free` needed. (`free` is kept
+// for explicit teardown and is idempotent, so calling it *and* relying on Drop is
+// safe — exactly one release.)
 
 import "mem"
 
@@ -12,26 +14,26 @@ pub fn List(comptime T: type) -> type {
         ptr: *mut T,
         len: usize,
         cap: usize,
+        a: Allocator,
     }
 }
 
-// An empty list. It owns no memory until the first `push` grows it.
-pub fn make(comptime T: type) -> List(T) {
-    return List(T){ ptr: null, len: 0, cap: 0 }
+// An empty list bound to allocator `a`. It owns no memory until the first `push`.
+pub fn make(comptime T: type, read a: Allocator) -> List(T) {
+    return List(T){ ptr: null, len: 0, cap: 0, a: a }
 }
 
-// Append `x`, growing (doubling) the backing buffer from `a` when full.
-pub fn push(comptime T: type, mut l: List(T), a: Allocator, x: T) {
+// Append `x`, growing (doubling) the backing buffer from the stored allocator
+// when full.
+pub fn push(comptime T: type, mut l: List(T), x: T) {
     if l.len == l.cap {
         var newcap: usize = 4
         if l.cap != 0 { newcap = l.cap * 2 }
-        var np: *mut T = mem.allocate(T, a, newcap)
-        // Copy the live elements into the new buffer (was a recursive helper
-        // before the bootstrap had loops).
+        var np: *mut T = mem.allocate(T, l.a, newcap)
         for i in 0..l.len {
             unsafe { (np + i).* = (l.ptr + i).* }
         }
-        if l.cap != 0 { mem.release(T, a, l.ptr) }
+        if l.cap != 0 { mem.release(T, l.a, l.ptr) }
         l.ptr = np
         l.cap = newcap
     }
@@ -48,10 +50,27 @@ pub fn len(comptime T: type, l: List(T)) -> usize {
     return l.len
 }
 
-// Release the backing buffer (a no-op for an arena allocator, which frees in bulk).
-pub fn free(comptime T: type, mut l: List(T), a: Allocator) {
-    if l.cap != 0 { mem.release(T, a, l.ptr) }
+// Explicit teardown — idempotent (zeroes `cap`, so a following auto-drop is a
+// no-op). RAII (`Drop`) handles this automatically if you don't call it.
+pub fn free(comptime T: type, mut l: List(T)) {
+    if l.cap != 0 { mem.release(T, l.a, l.ptr) }
     l.ptr = null
     l.len = 0
     l.cap = 0
+}
+
+// Free an i32 buffer through its allocator. A free function (not the `impl`
+// method) so the module-qualified `mem.release` resolves — qualified calls inside
+// an `impl`-method body are not yet resolved (a known bootstrap limitation), so
+// the destructor delegates here by bare name.
+fn release_i32_buf(read a: Allocator, p: *mut i32, n: usize) {
+    if n != 0 { mem.release(i32, a, p) }
+}
+
+// RAII for the i32 instantiation: free the buffer through the stored allocator at
+// scope exit (per-instantiation; a blanket `impl[T] Drop for List(T)` is future work).
+impl Drop for List(i32) {
+    fn drop(mut self) {
+        release_i32_buf(self.a, self.ptr, self.cap)
+    }
 }

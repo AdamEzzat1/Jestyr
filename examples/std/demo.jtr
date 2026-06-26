@@ -1,14 +1,15 @@
-// examples/std/demo.jtr — the standard library, end to end (items K + I).
+// examples/std/demo.jtr — the standard library, end to end (items K + I, Phase 3).
 //
-// Pulls together four std modules — `mem` (allocator-as-value), `list` (a generic
-// growable collection that takes an allocator), `core` (allocation-free helpers),
-// and `io` (output) — into one multi-file program.
+// Pulls together four std modules — `mem` (the fn-pointer-vtable allocator), `list`
+// (a generic growable collection that stores its allocator and frees by RAII),
+// `core` (allocation-free helpers), and `io` (output) — into one multi-file program.
 //
 //   jestyrc run examples/std/demo.jtr
-//   →   5            (length after 5 pushes; one growth happened at cap 4→8)
+//   →   5            (length after 5 pushes; one growth happened at cap 4->8)
 //       10           (first element)
 //       50           (last element)
 //       40           (core.imax of elements 2 and 3)
+//   The list's buffer is freed automatically when `xs` leaves scope (RAII).
 
 import "mem"
 import "list"
@@ -16,22 +17,21 @@ import "core"
 import "io"
 
 fn main() -> i32 {
-    // The allocator is a value. `list` never names a concrete strategy — it just
-    // takes whatever allocator we hand it.
+    // The allocator is a value with a real vtable. `list` never names a concrete
+    // strategy — it just takes whatever allocator we hand it, and stores it.
     var gpa: Allocator = mem.system_allocator()
 
-    var xs = list.make(i32)
-    list.push(i32, xs, gpa, 10)
-    list.push(i32, xs, gpa, 20)
-    list.push(i32, xs, gpa, 30)
-    list.push(i32, xs, gpa, 40)
-    list.push(i32, xs, gpa, 50)   // 5th push grows the buffer from cap 4 → 8
+    var xs = list.make(i32, gpa)
+    list.push(i32, xs, 10)
+    list.push(i32, xs, 20)
+    list.push(i32, xs, 30)
+    list.push(i32, xs, 40)
+    list.push(i32, xs, 50)   // 5th push grows the buffer from cap 4 -> 8
 
     io.print_i32(list.len(i32, xs))          // 5
     io.print_i32(list.get(i32, xs, 0))       // 10
     io.print_i32(list.get(i32, xs, 4))       // 50
     io.print_i32(core.imax(list.get(i32, xs, 2), list.get(i32, xs, 3)))  // 40
 
-    list.free(i32, xs, gpa)
-    return 0
+    return 0   // `xs` drops here — its buffer is freed through the stored allocator
 }

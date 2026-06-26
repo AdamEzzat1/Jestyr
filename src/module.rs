@@ -398,10 +398,28 @@ mod tests {
 
     #[test]
     fn stdlib_demo_compiles_clean() {
-        // The shipped stdlib demo: mem + list + core + io, allocator-as-value,
-        // a generic growable collection — the full item-K + item-I integration.
-        // (Also exercises a `for` loop: `list.push`'s grow-copy.)
+        // The shipped stdlib demo: mem + list + core + io, the fn-pointer-vtable
+        // allocator, a generic growable collection freed by RAII — the full
+        // item-K + item-I + Phase-3 integration. (Also exercises a `for` loop:
+        // `list.push`'s grow-copy.)
         pipeline_is_clean("examples/std/demo.jtr");
+    }
+
+    #[test]
+    fn stdlib_demo_frees_its_list_by_raii() {
+        // Wiring: the ported `std` routes allocation through the allocator vtable
+        // and frees the `List(i32)` automatically at scope exit (no manual free).
+        let prog = load("examples/std/demo.jtr");
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, _td) = typeck::check_program(&prog.ast, &prog.modules);
+        let (c, _cd) = crate::cgen::emit(&prog.ast, &info);
+        assert!(
+            c.contains("jestyr_impl_Drop__List_i32___drop(&j_xs)"),
+            "the list must drop by RAII at scope exit:\n{c}"
+        );
+        // Allocation goes through the vtable's function pointer, not a bare malloc
+        // in user code.
+        assert!(c.contains("j_a.j_alloc_fn("), "allocation must route through the vtable:\n{c}");
     }
 
     #[test]

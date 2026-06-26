@@ -1,8 +1,9 @@
-// examples/std/alloc_demo.jtr — allocator-as-value end to end (items K + I).
+// examples/std/alloc_demo.jtr — the explicit allocator interface, end to end.
 //
 // The *same* code path (`fill_and_sum`) works against two different allocator
-// strategies, chosen by the value passed in. This is the whole point of
-// allocator-as-value: the strategy travels with the value, nothing is hidden.
+// strategies, chosen by the value passed in. This is the whole point of an
+// explicit allocator value: the strategy travels with the value (now a real
+// fn-pointer vtable), nothing is hidden.
 //
 // Note: functions/consts are import-gated (qualified `mem.allocate`), but *types*
 // resolve by bare name in the v1 flat namespace — so the `Allocator` type is
@@ -27,10 +28,9 @@ fn main() -> i32 {
     var gpa: Allocator = mem.system_allocator()
     print_int(fill_and_sum(gpa))   // 60
 
-    // 2) bump-arena allocator — same fill_and_sum, different strategy.
-    // (The local is named `bump`, not `arena`: a variable sharing a nullary
-    // variant's name is shadowed by the variant in the C backend — a known
-    // bootstrap gotcha.)
+    // 2) bump-arena allocator — same fill_and_sum, different strategy. (With the
+    // vtable allocator there is no enum variant to shadow, so the local may even be
+    // named `arena`; `bump` is kept for continuity.)
     var bump: Allocator = mem.arena_allocator(1024)
     print_int(fill_and_sum(bump))  // 60
     mem.destroy(bump)
