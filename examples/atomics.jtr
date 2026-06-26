@@ -1,0 +1,24 @@
+// examples/atomics.jtr — atomic operations (concurrency, workstream N).
+//
+// A shared `int64` cell incremented from several threads with atomic_add is
+// data-race-free, and its final value is DETERMINISTIC regardless of how the
+// threads interleave — the foundation of the numerics-scaling story (a parallel
+// reduction whose result does not depend on scheduling).
+//
+//   jestyrc run examples/atomics.jtr   →   4   (four atomic increments, any order)
+
+fn worker(c: *mut i64) { atomic_add(c, 1) }
+
+fn main() -> i32 {
+    var c: *mut i64 = alloc(i64, 1)
+    atomic_store(c, 0)
+    concurrent {
+        spawn worker(c)
+        spawn worker(c)
+        spawn worker(c)
+        spawn worker(c)
+    }
+    print_int(atomic_load(c) as i32)   // 4 — deterministic
+    free_ptr(c)
+    return 0
+}

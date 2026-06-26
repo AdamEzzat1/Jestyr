@@ -3635,6 +3635,31 @@ impl<'a> Cgen<'a> {
                     let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "NULL".to_string());
                     return format!("free({p})");
                 }
+                // --- Concurrency (workstream N) ---
+                // Atomics: sequentially-consistent ops on an `int64_t` cell, via GCC
+                // `__atomic_*` builtins (no `<stdatomic.h>`, no special type). A
+                // shared counter incremented from many threads is data-race-free and
+                // its final value is deterministic regardless of interleaving — the
+                // foundation of the numerics-scaling story.
+                "atomic_store" => {
+                    let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "NULL".to_string());
+                    let v = args.get(1).map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".to_string());
+                    return format!("__atomic_store_n((int64_t*)({p}), (int64_t)({v}), __ATOMIC_SEQ_CST)");
+                }
+                "atomic_load" => {
+                    let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "NULL".to_string());
+                    return format!("__atomic_load_n((int64_t*)({p}), __ATOMIC_SEQ_CST)");
+                }
+                "atomic_add" => {
+                    let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "NULL".to_string());
+                    let v = args.get(1).map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".to_string());
+                    return format!("__atomic_fetch_add((int64_t*)({p}), (int64_t)({v}), __ATOMIC_SEQ_CST)");
+                }
+                "atomic_sub" => {
+                    let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "NULL".to_string());
+                    let v = args.get(1).map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".to_string());
+                    return format!("__atomic_fetch_sub((int64_t*)({p}), (int64_t)({v}), __ATOMIC_SEQ_CST)");
+                }
                 // Region allocation: `region_alloc(r, T, value)` — bump-allocate
                 // into region `r`'s arena and return a zero-cost `&[r]T` (plain ptr).
                 "region_alloc" => {
@@ -7432,6 +7457,19 @@ mod tests {
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("_Alignof(Jestyr_M)"), "align_of → _Alignof: {c}");
         assert!(c.contains("offsetof(Jestyr_M, j_b)"), "offset_of → offsetof with j_ field: {c}");
+    }
+
+    #[test]
+    fn atomics_lower_to_gcc_atomic_builtins() {
+        // Sequentially-consistent atomics over an `int64_t` cell — data-race-free
+        // shared state, deterministic regardless of thread interleaving.
+        let (c, d) = gen(
+            "fn w(p: *mut i64) { atomic_add(p, 1) } \
+             fn r(p: *mut i64) -> i64 { return atomic_load(p) }",
+        );
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("__atomic_fetch_add((int64_t*)(j_p), (int64_t)(1), __ATOMIC_SEQ_CST)"), "{c}");
+        assert!(c.contains("__atomic_load_n((int64_t*)(j_p), __ATOMIC_SEQ_CST)"), "{c}");
     }
 
     #[test]
