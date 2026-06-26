@@ -1,0 +1,95 @@
+// examples/vec_generic.jtr — a *generic* allocator-parameterized vector, RAII-freed
+// (design Phase 3 — `Vec<T, A>`, the std collection shape).
+//
+// `Vec(T)` is monomorphized per element type, stores its `Allocator` value, and
+// grows through that allocator's vtable. The concrete instantiation `Vec(i32)`
+// carries a `Drop` impl, so the buffer is freed **automatically at scope exit**
+// even though every operation goes through generic, comptime-parameterized
+// functions (`vec_push(i32, v, …)`). This is what the move analysis had to get
+// right: a generic call's `comptime` type argument occupies a slot, but the `mut`
+// receiver after it is a *borrow*, so `v` is not moved and still drops.
+//
+//   jestyrc run examples/vec_generic.jtr
+//   →   5         (length after 5 pushes; one growth at cap 4 -> 8)
+//       10        (first element)
+//       50        (last element)
+//       99        (marker — the buffer frees automatically when `v` leaves scope)
+
+trait Drop { fn drop(mut self) }
+
+struct Layout { size: usize, align: usize }
+
+@copy struct Allocator {
+    ctx: *mut u8,
+    alloc_fn: fn(*mut u8, Layout) -> *mut u8,
+    free_fn: fn(*mut u8, *mut u8),
+}
+
+fn alloc_n(read a: Allocator, n: usize) -> *mut u8 {
+    return a.alloc_fn(a.ctx, Layout{ size: n, align: 8 })
+}
+fn free_n(read a: Allocator, p: *mut u8) { a.free_fn(a.ctx, p) }
+
+fn sys_alloc(ctx: *mut u8, ly: Layout) -> *mut u8 { return alloc(u8, ly.size) }
+fn sys_free(ctx: *mut u8, p: *mut u8) { free_ptr(p) }
+fn system_allocator() -> Allocator {
+    return Allocator{ ctx: null, alloc_fn: &sys_alloc, free_fn: &sys_free }
+}
+
+// The generic collection — monomorphized per element type T.
+fn Vec(comptime T: type) -> type {
+    return struct {
+        ptr: *mut T,
+        len: usize,
+        cap: usize,
+        a: Allocator,
+    }
+}
+
+fn vec_make(comptime T: type, read a: Allocator) -> Vec(T) {
+    return Vec(T){ ptr: null, len: 0, cap: 0, a: a }
+}
+
+fn vec_push(comptime T: type, mut v: Vec(T), x: T) {
+    if v.len == v.cap {
+        var newcap: usize = 4
+        if v.cap != 0 { newcap = v.cap * 2 }
+        var np: *mut T = alloc_n(v.a, newcap * size_of(T)) as *mut T
+        for i in 0..v.len {
+            unsafe { (np + i).* = (v.ptr + i).* }
+        }
+        if v.cap != 0 { free_n(v.a, v.ptr as *mut u8) }
+        v.ptr = np
+        v.cap = newcap
+    }
+    unsafe { (v.ptr + v.len).* = x }
+    v.len = v.len + 1
+}
+
+fn vec_get(comptime T: type, read v: Vec(T), i: usize) -> T {
+    unsafe { return (v.ptr + i).* }
+}
+fn vec_len(comptime T: type, read v: Vec(T)) -> usize { return v.len }
+
+// RAII for the i32 instantiation: free the buffer through the stored allocator.
+impl Drop for Vec(i32) {
+    fn drop(mut self) {
+        if self.cap != 0 { free_n(self.a, self.ptr as *mut u8) }
+    }
+}
+
+fn main() -> i32 {
+    var a: Allocator = system_allocator()
+    var v = vec_make(i32, a)
+    vec_push(i32, v, 10)
+    vec_push(i32, v, 20)
+    vec_push(i32, v, 30)
+    vec_push(i32, v, 40)
+    vec_push(i32, v, 50)               // grows cap 4 -> 8
+
+    print_int(vec_len(i32, v))         // 5
+    print_int(vec_get(i32, v, 0))      // 10
+    print_int(vec_get(i32, v, 4))      // 50
+    print_int(99)                      // `v` drops right after — buffer freed
+    return 0
+}

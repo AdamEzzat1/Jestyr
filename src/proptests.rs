@@ -855,6 +855,23 @@ mod drop_props {
             );
         }
 
+        /// The generic-call seam (the generic-`Vec(T)` enabler): a droppable passed
+        /// to a *generic* `mut`-borrow fn — where a leading `comptime` type argument
+        /// occupies an arg slot — still drops exactly once, for any call count.
+        #[test]
+        fn generic_borrow_call_still_drops_once(k in 0usize..4) {
+            let calls: String = (0..k).map(|_| "bump(R, x) ").collect();
+            let src = format!(
+                "{PRELUDE} fn bump(comptime T: type, mut r: T) {{ }} \
+                 fn f() {{ var x = R{{ id: 1 }} {calls} }} fn main() -> i32 {{ return 0 }}"
+            );
+            let (c, _d) = compile(&src);
+            prop_assert_eq!(
+                count(&c, "jestyr_impl_Drop__R__drop(&j_x)"), 1,
+                "a generic mut-borrow arg must not move the droppable:\n{}", c
+            );
+        }
+
         /// Region-integrated bulk drop (metamorphic): the same droppable emits one
         /// drop call in a plain block and *zero* inside a `region` (the arena
         /// reclaims it in bulk), for any small id.

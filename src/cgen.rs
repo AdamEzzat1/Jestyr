@@ -1614,14 +1614,17 @@ impl<'a> Cgen<'a> {
         None
     }
 
-    /// Mark each bare-name argument that lands at a `take` (consuming) parameter
-    /// of `call_id` as moved. Borrow conventions (`read`/`mut`/`out`) do not move,
-    /// so a droppable handed to a borrowing call still drops at scope exit. A
-    /// callee we can't resolve to a user `FnDecl` (an intrinsic, closure, or `dyn`
-    /// call) never takes ownership of a droppable in the bootstrap, so it moves
-    /// nothing. A *generic* callee's comptime type-arguments occupy argument slots,
-    /// so positions can't be aligned — there we fall back to the conservative
-    /// "every bare-name arg moves" (leak-safe).
+    /// Mark each bare-name argument that lands at a `take` (consuming) parameter of
+    /// `call_id` as moved. Borrow conventions (`read`/`mut`/`out`) do not move, so a
+    /// droppable handed to a borrowing call still drops at scope exit. A callee we
+    /// can't resolve to a user `FnDecl` (an intrinsic, closure, or `dyn` call) never
+    /// takes ownership of a droppable in the bootstrap, so it moves nothing.
+    ///
+    /// Alignment differs by call shape. A **free/qualified** call passes its
+    /// `comptime` type arguments as leading args (`vec_push(i32, v, x)`), so args
+    /// align 1:1 with the callee's non-`self` params and a type-param position is
+    /// skipped. A **method-sugar / impl** call's receiver consumes the first
+    /// runtime param, so the explicit args align after it.
     fn mark_take_args(
         &self,
         call_id: ExprId,
@@ -1629,42 +1632,62 @@ impl<'a> Cgen<'a> {
         args: &[ExprId],
         out: &mut HashSet<String>,
     ) {
-        // A trait-impl method call resolves through `find_impl_method`.
+        // A trait-impl method call: the receiver is `self`, explicit args follow it.
         if let Some(ic) = self.info.impl_calls.get(&call_id) {
             if let Some(f) = self.find_impl_method(&ic.trait_name, &ic.type_key, &ic.method) {
-                self.mark_take_args_against(f, args, out);
+                self.mark_method_arg_takes(f, args, out);
             }
             return;
         }
-        let fdecl = if let Some(mr) = self.info.method_calls.get(&call_id) {
-            self.find_fn(&mr.fn_name)
-        } else if let Some(q) = self.info.qualified.get(&call_id) {
-            self.find_fn(q)
+        // Method sugar `base.m(args)` — a struct method (self) or a free-fn-method
+        // (the receiver is the first regular param), resolved via `method_calls`.
+        if let Some(mr) = self.info.method_calls.get(&call_id) {
+            if let Some(f) = self.find_fn(&mr.fn_name) {
+                self.mark_method_arg_takes(f, args, out);
+            }
+            return;
+        }
+        // A free or module-qualified call: args align 1:1 with the params.
+        let fname = if let Some(q) = self.info.qualified.get(&call_id) {
+            Some(q.clone())
         } else if let ExprKind::Name(n) = &self.ast.expr_at(callee).kind {
-            self.find_fn(&n.name)
+            Some(n.name.clone())
         } else {
             None
         };
-        if let Some(f) = fdecl {
-            self.mark_take_args_against(f, args, out);
+        if let Some(f) = fname.and_then(|n| self.find_fn(&n)) {
+            self.mark_free_arg_takes(f, args, out);
         }
     }
 
-    /// Helper for [`mark_take_args`]: align `args` to `f`'s non-self runtime
-    /// parameters and mark the `take` ones (or all, if `f` is generic).
-    fn mark_take_args_against(&self, f: &FnDecl, args: &[ExprId], out: &mut HashSet<String>) {
-        if f.params.iter().any(|p| p.comptime) {
-            for a in args {
+    /// Free/qualified call: each non-`self` param takes the arg at the same index;
+    /// a `comptime` type-param position carries a *type* argument, so it is skipped.
+    fn mark_free_arg_takes(&self, f: &FnDecl, args: &[ExprId], out: &mut HashSet<String>) {
+        let params: Vec<&Param> = f.params.iter().filter(|p| !p.is_self).collect();
+        for (p, a) in params.iter().zip(args.iter()) {
+            if self.is_type_param(p) {
+                continue;
+            }
+            if p.conv == Conv::Take {
                 if let Some(name) = self.as_name(*a) {
                     out.insert(name);
                 }
             }
-            return;
         }
+    }
+
+    /// Method-sugar / impl call: the receiver consumed the first *runtime* param
+    /// (non-`self`, non-`comptime`) when the method is a free-fn-method, or `self`
+    /// when it is a struct/impl method; the explicit args align to the rest.
+    fn mark_method_arg_takes(&self, f: &FnDecl, args: &[ExprId], out: &mut HashSet<String>) {
         let runtime: Vec<Conv> =
-            f.params.iter().filter(|p| !p.comptime && !p.is_self).map(|p| p.conv).collect();
+            f.params.iter().filter(|p| !p.is_self && !p.comptime).map(|p| p.conv).collect();
+        // A `self`-method's receiver is the (filtered-out) `self` param, so args
+        // start at runtime[0]; a free-fn-method's receiver is runtime[0], so args
+        // start at runtime[1].
+        let offset = if f.params.iter().any(|p| p.is_self) { 0 } else { 1 };
         for (i, a) in args.iter().enumerate() {
-            if matches!(runtime.get(i), Some(Conv::Take)) {
+            if matches!(runtime.get(i + offset), Some(Conv::Take)) {
                 if let Some(name) = self.as_name(*a) {
                     out.insert(name);
                 }
@@ -6869,6 +6892,42 @@ mod tests {
             c.matches("jestyr_impl_Drop__R__drop(&j_r)").count(),
             0,
             "a taken droppable must not be dropped by the caller:\n{c}"
+        );
+    }
+
+    #[test]
+    fn generic_struct_instantiation_drops_at_scope_exit() {
+        // A concrete instantiation of a generic struct (`Box(i32)`) with a `Drop`
+        // impl is dropped at scope exit — the call and the impl definition agree on
+        // the mangled name derived from the GenStruct's type key.
+        let src = "trait Drop { fn drop(mut self) } \
+            fn Box(comptime T: type) -> type { return struct { v: T } } \
+            impl Drop for Box(i32) { fn drop(mut self) { print_int(self.v) } } \
+            fn f() { var b = Box(i32){ v: 7 } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("jestyr_impl_Drop__Box_i32___drop(&j_b)"), "drop call:\n{c}");
+        assert!(
+            c.contains("void jestyr_impl_Drop__Box_i32___drop(Jestyr_Box__i32"),
+            "matching impl definition:\n{c}"
+        );
+    }
+
+    #[test]
+    fn generic_call_borrow_arg_does_not_move_droppable() {
+        // A droppable passed to a *generic* `mut`-borrow fn (a leading `comptime`
+        // type argument occupies a slot) still drops exactly once — the args align
+        // past the type arg, landing the value at a borrow, not a `take`.
+        let src = "trait Drop { fn drop(mut self) } struct R { id: i32 } \
+            impl Drop for R { fn drop(mut self) { print_int(self.id) } } \
+            fn bump(comptime T: type, mut r: T) {} \
+            fn f() { var x = R{ id: 1 } bump(R, x) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert_eq!(
+            c.matches("jestyr_impl_Drop__R__drop(&j_x)").count(),
+            1,
+            "a generic mut-borrow arg must not move the droppable:\n{c}"
         );
     }
 
