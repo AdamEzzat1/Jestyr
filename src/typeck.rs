@@ -52,6 +52,8 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
         qualified: HashMap::new(),
         impl_calls: HashMap::new(),
         bound_method_calls: HashMap::new(),
+        dyn_coercions: HashMap::new(),
+        dyn_calls: HashMap::new(),
         cur_type_param_bounds: HashMap::new(),
         cur_expected: None,
         cur_ret: None,
@@ -67,6 +69,8 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
             qualified: tc.qualified,
             impl_calls: tc.impl_calls,
             bound_method_calls: tc.bound_method_calls,
+            dyn_coercions: tc.dyn_coercions,
+            dyn_calls: tc.dyn_calls,
         },
         tc.diags,
     )
@@ -115,6 +119,11 @@ struct TypeChecker<'a> {
     /// through its bound (the "Zig fix"). The concrete impl is selected per
     /// monomorphized instance in the backend, via the active type substitution.
     bound_method_calls: HashMap<ExprId, BoundMethodCall>,
+    /// Expr id → the trait it coerces to as `dyn Trait` (Stage F); the backend
+    /// builds a `{ data, vtable }` fat pointer for the value's concrete type.
+    dyn_coercions: HashMap<ExprId, String>,
+    /// `Call`-expr id → the method name of a `dyn Trait` call (vtable dispatch).
+    dyn_calls: HashMap<ExprId, String>,
     /// The bracket type parameters in scope for the function being checked, each
     /// mapped to its declared bound (`None` if unbounded). Drives the body-side
     /// "only the bound's methods are callable on a `T` value" check.
@@ -472,6 +481,46 @@ impl<'a> TypeChecker<'a> {
             BoundMethodCall { trait_name: tr.clone(), method: mname.to_string(), type_param: tp.clone() },
         );
         Some(self.trait_method_ret(&tr, mname, recv_ty))
+    }
+
+    /// `recv.m(args)` where `recv: dyn Trait` (traits, Stage F): a **dynamic**
+    /// dispatch. `m` must be one of `Trait`'s methods; the call types by the trait
+    /// method's declared return and is recorded so the backend lowers it to a
+    /// vtable call. `None` ⇒ the receiver isn't a `dyn` value.
+    fn resolve_dyn_method(&mut self, call_id: ExprId, mname: &str, recv_ty: &Ty) -> Option<Ty> {
+        let tr = dyn_trait_of(recv_ty)?.to_string();
+        let span = self.ast.expr_at(call_id).span;
+        if !self.table.traits.get(&tr).is_some_and(|t| t.has_method(mname)) {
+            self.error(span, format!("no method `{mname}` on `dyn {tr}`: not a method of the trait"));
+            return Some(Ty::Error);
+        }
+        self.dyn_calls.insert(call_id, mname.to_string());
+        Some(self.trait_method_ret(&tr, mname, recv_ty))
+    }
+
+    /// If `expected` is a `dyn Trait` and `expr` has a *concrete* type that `impl`s
+    /// that trait, record the coercion so the backend wraps the value into a
+    /// `{ data, vtable }` fat pointer (Stage F). A concrete type that does **not**
+    /// implement the trait is an error; a value that is already `dyn Trait` (or a
+    /// non-`dyn` expected type) is left untouched.
+    fn record_dyn_coercion(&mut self, expr: ExprId, expected: &Ty) {
+        let Some(tr) = dyn_trait_of(expected) else { return };
+        let actual = self.expr_types[expr.0 as usize].clone();
+        // Already a `dyn` value (pass-through), or unresolved — nothing to wrap.
+        if dyn_trait_of(&actual).is_some() || matches!(actual, Ty::Unknown | Ty::Error) {
+            return;
+        }
+        let key = self.table.ty_key(&actual);
+        if self.table.impl_index.contains_key(&(tr.to_string(), key)) {
+            self.dyn_coercions.insert(expr, tr.to_string());
+        } else {
+            let span = self.ast.expr_at(expr).span;
+            let shown = actual.display(&self.table);
+            self.error(
+                span,
+                format!("type `{shown}` does not implement `{tr}`, so it cannot coerce to `dyn {tr}`"),
+            );
+        }
     }
 
     /// The declared return type of trait `trait_name`'s method `mname`, with `Self`
@@ -1240,6 +1289,10 @@ impl<'a> TypeChecker<'a> {
                     self.cur_expected = expected.clone();
                     let inferred = init.map(|e| self.infer(scope, typ, self_ty, e));
                     self.cur_expected = prev;
+                    // `let d: dyn Trait = concrete` coerces the initializer (Stage F).
+                    if let (Some(ann), Some(e)) = (&expected, init) {
+                        self.record_dyn_coercion(*e, ann);
+                    }
                     // A `distinct` type is *not* interchangeable with its base (or any
                     // other type): a mismatched initializer is an error suggesting `as`.
                     if let (Some(ann), Some(got)) = (&expected, &inferred) {
@@ -1264,6 +1317,10 @@ impl<'a> TypeChecker<'a> {
                         self.cur_expected = self.cur_ret.clone();
                         self.infer(scope, typ, self_ty, *v);
                         self.cur_expected = prev;
+                        // `fn f() -> dyn Trait { return concrete }` coerces (Stage F).
+                        if let Some(ret) = self.cur_ret.clone() {
+                            self.record_dyn_coercion(*v, &ret);
+                        }
                     }
                     result = Ty::Unit;
                 }
@@ -1418,6 +1475,11 @@ impl<'a> TypeChecker<'a> {
                     if let Some(ret) = self.resolve_bound_method(id, &name, &recv_ty) {
                         return self.set(id, ret);
                     }
+                    // `d.m(args)` where `d: dyn Trait` — a *dynamic* dispatch through
+                    // the vtable (traits, Stage F).
+                    if let Some(ret) = self.resolve_dyn_method(id, &name, &recv_ty) {
+                        return self.set(id, ret);
+                    }
                     return self.set(id, Ty::Unknown);
                 }
                 let callee_name = match &ast.expr_at(*callee).kind {
@@ -1448,6 +1510,11 @@ impl<'a> TypeChecker<'a> {
                     self.cur_expected = param_tys.get(i).cloned();
                     self.infer(scope, typ, self_ty, *a);
                     self.cur_expected = prev;
+                    // A concrete argument passed where a `dyn Trait` is expected
+                    // coerces into a fat pointer (Stage F).
+                    if let Some(pt) = param_tys.get(i) {
+                        self.record_dyn_coercion(*a, pt);
+                    }
                 }
                 if let Some(name) = callee_name {
                     self.check_visibility(&name, span);
@@ -2654,6 +2721,16 @@ fn op_trait_method(op: BinOp) -> Option<(&'static str, &'static str)> {
     })
 }
 
+/// If `ty` is a `dyn Trait` (lowered to `Ty::Opaque("dyn <Trait>")`), the trait
+/// name. The single place that decodes the `dyn` representation, shared by the
+/// coercion and dispatch paths (traits, Stage F).
+fn dyn_trait_of(ty: &Ty) -> Option<&str> {
+    match ty {
+        Ty::Opaque(s) => s.strip_prefix("dyn "),
+        _ => None,
+    }
+}
+
 /// The source spelling of a trait-backed operator, for diagnostics.
 fn op_symbol(op: BinOp) -> &'static str {
     use BinOp::*;
@@ -3302,6 +3379,72 @@ mod tests {
             "{:?}",
             d
         );
+    }
+
+    // --- traits: `dyn Trait` dynamic dispatch (Stage F) ---
+
+    #[test]
+    fn a_dyn_method_call_types_by_the_trait_method_return() {
+        // `s.show()` on a `dyn Show` types as `Show::show`'s return and is recorded
+        // for vtable dispatch.
+        let (ast, info) = analyze_full(
+            "trait Show { fn show(read self) -> i64 } \
+             impl Show for i32 { fn show(read self) -> i64 { return 1 } } \
+             fn describe(read s: dyn Show) -> i64 { return s.show() }",
+        );
+        let call = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| {
+                let id = ExprId(i as u32);
+                (matches!(e.kind, ExprKind::Call { .. }) && info.dyn_calls.contains_key(&id))
+                    .then_some(id)
+            })
+            .expect("the s.show() dyn call");
+        assert_eq!(info.type_of(call), &Ty::Prim("i64"), "typed by the trait method's return");
+    }
+
+    #[test]
+    fn a_concrete_value_coerces_to_dyn_at_a_call() {
+        // Passing an `i32` (which `impl`s `Show`) where `dyn Show` is expected
+        // records a coercion the backend turns into a fat pointer.
+        let (ast, info) = analyze_full(
+            "trait Show { fn show(read self) -> i32 } \
+             impl Show for i32 { fn show(read self) -> i32 { return self } } \
+             fn describe(read s: dyn Show) -> i32 { return s.show() } \
+             fn use_it(read n: i32) -> i32 { return describe(n) }",
+        );
+        let coerced = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .any(|(i, _)| info.dyn_coercions.contains_key(&ExprId(i as u32)));
+        assert!(coerced, "the i32 argument is recorded as a `dyn Show` coercion");
+    }
+
+    #[test]
+    fn coercing_a_type_without_the_impl_to_dyn_is_an_error() {
+        // A type that does not implement the trait cannot become `dyn Trait`.
+        let (_i, d) = analyze(
+            "trait Show { fn show(read self) -> i32 } \
+             fn describe(read s: dyn Show) -> i32 { return 0 } \
+             fn use_it(read n: i32) -> i32 { return describe(n) }",
+        );
+        assert!(
+            d.iter().any(|m| m.message.contains("does not implement `Show`")),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn calling_a_non_trait_method_on_dyn_is_an_error() {
+        let (_i, d) = analyze(
+            "trait Show { fn show(read self) -> i32 } \
+             fn describe(read s: dyn Show) -> i32 { return s.nope() }",
+        );
+        assert!(d.iter().any(|m| m.message.contains("no method `nope` on `dyn Show`")), "{:?}", d);
     }
 
     #[test]

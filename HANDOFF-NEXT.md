@@ -226,16 +226,46 @@ the impl methods, bracket-generic codegen monomorphizes the body + maintains
 
 ---
 
-## Main objective — trait **Stage F** (`dyn` vtable)
+## ✅ Done — trait **Stage F** (`dyn` vtable) · the trait epic is complete
 
-The last remaining trait stage. `dyn Trait` erases the receiver type and dispatches
-through a compiler-**synthesized vtable** struct that is byte-compatible with the
-hand-written fn-pointer-field vtable from the first done section — so it reuses the
-existing fn-pointer-field call machinery (the generic-struct field-call path
-finished at the top of this file) rather than inventing a parallel one. Emit a
-vtable struct per trait (one fn-pointer field per method), populate it from each
-`impl`, and lower a `dyn Trait` value to `{data_ptr, vtable_ptr}` with `d.m(args)`
-calling through the vtable slot. See `docs/TESTING.md §5.12`.
+`dyn Trait` now works end-to-end: the receiver type is erased and dispatch goes
+through a compiler-**synthesized vtable** that is byte-compatible with the
+hand-written fn-pointer-field vtable from the first done section.
+
+- **Representation:** `dyn Trait` lowers to a fat pointer `JestyrDyn_<Trait> =
+  { void* data; const JestyrVtable_<Trait>* vtable; }`; the vtable is a struct with
+  one function pointer per trait method (receiver erased to `void*`). Both are
+  synthesized by `cgen::dyn_typedefs` for every trait used as `dyn`.
+- **Per-impl vtables** (`cgen::dyn_vtables`): each `impl Trait for T` emits a shim
+  per method (casting the erased `void* self` back to `T` — deref'd for a by-value
+  `read self`) and a `static const` vtable instance `jestyr_vt_<Trait>__<T>` wired
+  to the shims in trait-method order.
+- **Coercion** (`typeck::record_dyn_coercion`, recorded in `dyn_coercions`): passing
+  a concrete value where `dyn Trait` is expected — at a call argument, a `let`, or a
+  `return` — verifies `impl Trait for <type>` and the backend builds the fat
+  pointer. A type without the impl is an error. Scalars are placed in a fresh,
+  block-scoped compound literal `&((T){v})` so the erased data has a **valid,
+  non-dangling** address that outlives the call (a statement-expression temp would
+  dangle); an aggregate's lvalue address is taken directly.
+- **Dispatch** (`typeck::resolve_dyn_method` → `dyn_calls`; `cgen` in `emit_call`):
+  `d.m(args)` lowers to `d.vtable->m(d.data, args)` — one function, the impl chosen
+  at **run time** by the value's actual type (the dynamic counterpart to the
+  monomorphizing "Zig fix").
+- **Tests (teeth-verified by mutation):** typeck unit (dispatch typed + recorded,
+  coercion recorded, missing-impl + non-trait-method errors), cgen unit (vtable
+  struct/typedef/shim/instance + dispatch + coercion; one function → two vtables),
+  property + determinism over `arb_dyn_program`, `fuzz_dyn_dispatch`, and the gcc
+  round-trip `examples/dyn_dispatch.jtr` (`42/70/70` — one `describe`, three values).
+  Suite **413 green**, warning-clean.
+- **Scope notes:** dispatch is single-method-name (defaulted trait methods an impl
+  omits aren't wired into the vtable yet); coercion needs an addressable source or a
+  struct/scalar literal (a struct-returning-call passed *directly* as `dyn` would
+  need a hoisted temp — bind it to a `let` first); non-object-safe traits (`Self` in
+  a method's args) aren't rejected, just unsupported through `dyn`.
+
+**Trait stages A–F are all done.** The next frontier is the broader roadmap
+(`jestyr-design.md §19`) — toward self-hosting, the high-value gaps are a `HashMap`
+in the standard library and file I/O. See the session summary in `~/Downloads`.
 
 ---
 
@@ -263,7 +293,7 @@ A *capturing* closure coerced to a fn-pointer is a clear error.
 `run`/`build` on a no-`main` library now reports a clear message instead of a raw
 C-linker `WinMain` error (`test` mode is exempt; it synthesizes its own `main`).
 
-### Traits / interfaces — Stages A–E done (epic in flight)
+### Traits / interfaces — Stages A–F done (epic complete)
 - **A — parse + represent:** `trait`/`impl`/`dyn Trait`/`[T: Bound]` into the AST
   (`Item::Trait`, `Item::Impl`, `TypeKind::Dyn`, `FnDecl::generics`); pipeline
   stays total with no semantics.
@@ -290,14 +320,20 @@ C-linker `WinMain` error (`test` mode is exempt; it synthesizes its own `main`).
   resolves through the bound (`resolve_bound_method`), erroring on a non-bound
   method, and dispatches to the concrete `impl` per instance via
   `bound_method_calls` + the active `subst`. See the done-section / §5.12.
-- **Remaining:** trait **F** `dyn` vtable (reuses the fn-pointer-field call
-  machinery — see Main Objective + the first done section's arc).
+- **F — `dyn` vtable:** `dyn Trait` erases the receiver to a `{ data, vtable }` fat
+  pointer; a concrete value coerces in (verifying the impl), and `d.m(args)`
+  dispatches through the vtable slot at run time. Synthesized vtable structs +
+  per-impl static instances, byte-compatible with the hand-written fn-pointer
+  vtable. See the done-section / §5.12.
+- **Remaining:** none — **the trait epic (A–F) is complete.** The frontier moves to
+  the broader roadmap (`jestyr-design.md §19`); the self-hosting-relevant gaps are a
+  `HashMap` stdlib + file I/O.
 
 ---
 
 ## Test posture
 
-Suite is **403 green**, warning-clean, clean across the `dharht-experiment` and
+Suite is **413 green**, warning-clean, clean across the `dharht-experiment` and
 `bench-alloc` feature builds. New coverage adapts to the *real* harness
 (`src/proptests.rs`: `mod prop` + `mod fuzz` + `arb_*_program` generators,
 `typeck_diags` for diagnostic differentials) — the handoff's referenced

@@ -1,0 +1,36 @@
+// Traits — Stage F: `dyn Trait`, the explicit dynamic-dispatch escape valve. A
+// `dyn Show` is a fat pointer `{ data, vtable }`; the vtable is a compiler-built
+// struct of function pointers, byte-compatible with a hand-written one. Unlike
+// the monomorphizing "Zig fix", `describe` is **one** function — the impl is
+// chosen at *run time* by the value's actual type.
+
+trait Show {
+    fn show(read self) -> i32
+}
+
+impl Show for i32 {
+    fn show(read self) -> i32 { return self + 1 }
+}
+
+struct P { v: i32 }
+impl Show for P {
+    fn show(read self) -> i32 { return self.v * 10 }
+}
+
+// Takes an erased `dyn Show`; the concrete value coerces at the call site.
+fn describe(read s: dyn Show) -> i32 {
+    return s.show()
+}
+
+fn main() -> i32 {
+    let n = 41
+    print_int(describe(n))        // 42 — vtable for i32
+    let p = P{ v: 7 }
+    print_int(describe(p))        // 70 — vtable for P
+
+    // A `dyn` local works too.
+    let d: dyn Show = p
+    print_int(d.show())           // 70
+
+    return 0
+}

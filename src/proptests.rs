@@ -498,6 +498,26 @@ mod prop {
         ) {
             prop_assert_eq!(compile(&p), compile(&p));
         }
+
+        // ── `dyn Trait` dynamic dispatch (Stage F) ────────────────────────────
+
+        /// **Vtable coercion + dispatch.** Passing a concrete `t` (which `impl`s
+        /// `xS`) as `dyn xS` emits a fat pointer carrying *that type's* vtable —
+        /// `&jestyr_vt_xS__<t>` — for every primitive. Teeth: without the coercion
+        /// the concrete value is passed raw and the vtable address is absent.
+        #[test]
+        fn a_concrete_value_coerced_to_dyn_carries_its_vtable(
+            (p, sym) in arb_dyn_program(),
+        ) {
+            let (c, _) = compile(&p);
+            prop_assert!(c.contains(&sym), "expected the per-type vtable `{}`:\n{}", sym, c);
+        }
+
+        /// Determinism holds on `dyn` programs — byte-identical C every run.
+        #[test]
+        fn dyn_programs_compile_deterministically((p, _s) in arb_dyn_program()) {
+            prop_assert_eq!(compile(&p), compile(&p));
+        }
     }
 
     /// A concrete primitive type to `impl` a trait for.
@@ -584,6 +604,21 @@ mod prop {
                  fn use_it(take y: {t}) -> {t} {{ return dup(y) }}"
             );
             (prog, format!("jestyr_dup__{t}("))
+        })
+    }
+
+    /// A *valid* program that coerces a concrete `t` (which `impl`s `xS`) to
+    /// `dyn xS` and dispatches through it. Paired with the per-type vtable address
+    /// the emitted C must contain.
+    fn arb_dyn_program() -> impl Strategy<Value = (String, String)> {
+        arb_prim_ty().prop_map(|t| {
+            let prog = format!(
+                "trait xS {{ fn xm(read self) -> i32 }} \
+                 impl xS for {t} {{ fn xm(read self) -> i32 {{ return 0 }} }} \
+                 fn describe(read s: dyn xS) -> i32 {{ return s.xm() }} \
+                 fn use_it(read y: {t}) -> i32 {{ return describe(y) }}"
+            );
+            (prog, format!("&jestyr_vt_xS__{t}"))
         })
     }
 
@@ -860,6 +895,23 @@ mod fuzz {
                  impl B for i32 {{ fn m(read self) -> i32 {{ return 0 }} }} \
                  fn g[T: B](read x: T) -> i32 {{ {s} }} \
                  fn c(read y: i32) -> i32 {{ return g(y) }}"
+            );
+            run_pipeline(&prog);
+            assert_eq!(compile(&prog), compile(&prog));
+        });
+    }
+
+    /// Coverage-guided fuzzing of **`dyn` dispatch** (Stage F): fuzz bytes fill a
+    /// `dyn`-taking function's body while a coercion + `d.xm()` drive the vtable
+    /// construction and dispatch. Total + deterministic on arbitrary body soup.
+    #[test]
+    fn fuzz_dyn_dispatch() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let prog = format!(
+                "trait xS {{ fn xm(read self) -> i32 }} \
+                 impl xS for i32 {{ fn xm(read self) -> i32 {{ return 0 }} }} \
+                 fn describe(read d: dyn xS) -> i32 {{ {s} return d.xm() }} \
+                 fn use_it(read y: i32) -> i32 {{ return describe(y) }}"
             );
             run_pipeline(&prog);
             assert_eq!(compile(&prog), compile(&prog));

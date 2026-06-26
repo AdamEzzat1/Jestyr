@@ -507,6 +507,13 @@ mod tests {
     }
 
     #[test]
+    fn dyn_dispatch_example_compiles_clean() {
+        // Traits Stage F: `dyn Trait` — a concrete value coerces to a `{ data,
+        // vtable }` fat pointer and `d.show()` dispatches through the vtable slot.
+        pipeline_is_clean("examples/dyn_dispatch.jtr");
+    }
+
+    #[test]
     fn tests_demo_example_builds_a_clean_test_harness() {
         // The `@test`/`@bench` runner (workstream O): emit in test mode and check
         // the harness is generated without diagnostics.

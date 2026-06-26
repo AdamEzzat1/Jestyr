@@ -336,8 +336,19 @@ Run: `cargo test trait_programs`, `cargo test parses_a_trait`, `cargo bolero tes
   (typeck: bound method typed, non-bound + unbounded errors; cgen: per-instance dispatch asserting
   the *call*, not the impl def), property + determinism over `arb_bound_method_program`,
   `fuzz_bound_method_calls`, gcc round-trip `examples/bound_method.jtr` (`42/70`).
-- ⏳ **Remaining:** trait **F** `dyn` vtable (reuses the fn-pointer-field call machinery). Lands with
-  the same three layers.
+- ✅ **Stage F — `dyn Trait` vtable.** `dyn Trait` lowers to a `{ void* data, const JestyrVtable_<T>*
+  vtable }` fat pointer; `cgen::dyn_typedefs` synthesizes the vtable struct (one fn-ptr per method,
+  receiver erased to `void*`) + the fat-pointer typedef, and `cgen::dyn_vtables` emits a per-method
+  shim (casting `void* self` back to the concrete type) + a `static const` vtable instance per `impl`.
+  A concrete value coerces in (`typeck::record_dyn_coercion`, at call-arg/`let`/`return`; verifies the
+  impl; backend builds the fat pointer with a block-scoped compound literal so the erased data has a
+  valid address), and `d.m(args)` dispatches through the vtable slot (`resolve_dyn_method` →
+  `dyn_calls`; `d.vtable->m(d.data, args)`) — run-time impl selection from *one* function. Unit
+  (typeck: dispatch typed + recorded, coercion recorded, missing-impl/non-trait-method errors; cgen:
+  vtable struct/typedef/shim/instance + dispatch + coercion, one function → two vtables), property +
+  determinism over `arb_dyn_program`, `fuzz_dyn_dispatch`, gcc round-trip `examples/dyn_dispatch.jtr`
+  (`42/70/70`).
+- ✅ **The trait epic (A–F) is complete.**
 
 ---
 

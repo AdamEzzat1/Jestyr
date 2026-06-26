@@ -253,6 +253,7 @@ pub struct BoundMethodCall {
     pub type_param: String,
 }
 
+
 /// All top-level declarations, indexed by name — the output of name resolution.
 #[derive(Default)]
 pub struct GlobalTable {
@@ -318,6 +319,13 @@ pub struct TypeInfo {
     /// its bound (the "Zig fix"); the backend selects the concrete impl per
     /// monomorphized instance via the active type substitution.
     pub bound_method_calls: HashMap<ExprId, BoundMethodCall>,
+    /// Expr id → the trait name it coerces to as `dyn Trait` (traits, Stage F):
+    /// the backend wraps the value into a `{ data, vtable }` fat pointer, picking
+    /// the vtable for the value's concrete type (from `type_of(expr)`).
+    pub dyn_coercions: HashMap<ExprId, String>,
+    /// `Call`-expr id → the method name of a `dyn Trait` call, dispatched through
+    /// the vtable slot (the trait is implicit in the receiver's fat-pointer type).
+    pub dyn_calls: HashMap<ExprId, String>,
 }
 
 impl TypeInfo {

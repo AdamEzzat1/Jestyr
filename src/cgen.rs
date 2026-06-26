@@ -121,6 +121,15 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool) -> (String, Vec<Dia
                 _ => None,
             })
             .collect(),
+        dyn_traits: ast
+            .types
+            .iter()
+            .filter_map(|t| match &t.kind {
+                TypeKind::Dyn(n) => Some(n.name.clone()),
+                _ => None,
+            })
+            .collect(),
+        dyn_guard: HashSet::new(),
         spawn_sites: Vec::new(),
         slice_instances: Vec::new(),
         genref_instances: Vec::new(),
@@ -181,11 +190,17 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool) -> (String, Vec<Dia
     g.slice_struct_defs();
     g.genref_struct_defs();
     g.result_defs();
+    // `dyn Trait` vtable structs + fat-pointer typedefs — after the value typedefs
+    // (a method's arg/return types are named) and before any function uses them.
+    g.dyn_typedefs();
     g.extern_protos();
     g.closure_types();
     g.fn_protos();
     g.method_protos();
     g.impl_protos();
+    // Vtable shims + static instances — after `impl_protos` so the shims can call
+    // the (forward-declared) impl methods.
+    g.dyn_vtables();
     g.spawn_runtime();
     g.consts();
     g.closure_fns();
@@ -322,6 +337,12 @@ struct Cgen<'a> {
     self_is_ptr: bool,
     /// names declared via `extern "c"` — called by their bare C name, not mangled.
     extern_fns: HashSet<String>,
+    /// trait names used as `dyn Trait` anywhere — each gets a synthesized vtable
+    /// struct + fat-pointer typedef, and a static vtable per `impl` (Stage F).
+    dyn_traits: HashSet<String>,
+    /// exprs currently being emitted *as* a `dyn` coercion — a recursion guard so
+    /// `emit_dyn_coercion` can re-emit the underlying concrete value (Stage F).
+    dyn_guard: HashSet<ExprId>,
     /// every `spawn` site, for emitting per-site arg structs + trampolines.
     spawn_sites: Vec<SpawnSite>,
     /// distinct slice element types, for emitting one `JestyrSlice_<T>` per type.
@@ -2757,6 +2778,14 @@ impl<'a> Cgen<'a> {
     // --- expressions ---
 
     fn emit_expr(&mut self, id: ExprId) -> String {
+        // A value coerced to `dyn Trait` is wrapped into a `{ data, vtable }` fat
+        // pointer (Stage F). The guard lets `emit_dyn_coercion` re-emit the
+        // underlying concrete value through this same path without re-wrapping.
+        if !self.dyn_guard.contains(&id) {
+            if let Some(tr) = self.info.dyn_coercions.get(&id).cloned() {
+                return self.emit_dyn_coercion(id, &tr);
+            }
+        }
         let ast = self.ast;
         let data = ast.expr_at(id);
         let span = data.span;
@@ -3125,6 +3154,18 @@ impl<'a> Cgen<'a> {
                 method: bmc.method,
             };
             return self.emit_impl_call(callee, &ic, args);
+        }
+        // `d.m(args)` on a `dyn Trait` receiver — a *dynamic* call through the
+        // vtable slot: `d.vtable->m(d.data, args)` (traits, Stage F).
+        if let Some(method) = self.info.dyn_calls.get(&call_id).cloned() {
+            if let ExprKind::Field { base, .. } = &self.ast.expr_at(callee).kind {
+                let recv = self.emit_expr(*base);
+                let mut parts = vec![format!("{recv}.data")];
+                for a in args {
+                    parts.push(self.emit_expr(*a));
+                }
+                return format!("{recv}.vtable->{method}({})", parts.join(", "));
+            }
         }
         // Invoking a closure value (a local bound to one, or an inline closure).
         if self.is_closure_typed(callee) {
@@ -4434,6 +4475,115 @@ impl<'a> Cgen<'a> {
         }
     }
 
+    /// Per `dyn`-used trait, synthesize the **vtable struct** (one function-pointer
+    /// field per method, receiver erased to `void*`) and the **fat-pointer typedef**
+    /// `{ data, vtable }` — byte-compatible with a hand-written fn-pointer vtable
+    /// (traits, Stage F). Emitted after the struct/result typedefs so a method's
+    /// argument/return types are already named.
+    fn dyn_typedefs(&mut self) {
+        let ast = self.ast;
+        let mut traits: Vec<&TraitDecl> = ast
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Trait(t) if self.dyn_traits.contains(&t.name.name) => Some(t),
+                _ => None,
+            })
+            .collect();
+        traits.sort_by(|a, b| a.name.name.cmp(&b.name.name));
+        for t in traits {
+            let tname = t.name.name.clone();
+            self.raw("typedef struct {\n".to_string());
+            for m in &t.methods {
+                let ret = m.ret_ty.map(|ty| self.c_ty_ast(ty)).unwrap_or_else(|| "void".to_string());
+                let mut params = vec!["void* self".to_string()];
+                for p in &m.params {
+                    if p.is_self || p.comptime {
+                        continue;
+                    }
+                    let base = p.ty.map(|ty| self.c_ty_ast(ty)).unwrap_or_else(|| "int".to_string());
+                    params.push(format!("{} j_{}", borrow_ptr_cty(&base, p.conv), p.name.name));
+                }
+                self.raw(format!("    {ret} (*{})({});\n", m.name.name, params.join(", ")));
+            }
+            self.raw(format!("}} JestyrVtable_{tname};\n"));
+            self.raw(format!(
+                "typedef struct {{ void* data; const JestyrVtable_{tname}* vtable; }} JestyrDyn_{tname};\n"
+            ));
+        }
+        if ast.items.iter().any(|it| matches!(it, Item::Trait(t) if self.dyn_traits.contains(&t.name.name))) {
+            self.raw("\n");
+        }
+    }
+
+    /// Per `impl` of a `dyn`-used trait, emit a **shim** for each method (adapting
+    /// the erased `void* self` to the concrete receiver) and a `static const`
+    /// **vtable instance** `jestyr_vt_<Trait>__<TypeKey>` wired to those shims, in
+    /// trait-method order (traits, Stage F).
+    fn dyn_vtables(&mut self) {
+        let ast = self.ast;
+        let empty = HashMap::new();
+        for item in &ast.items {
+            let Item::Impl(im) = item else { continue };
+            let tname = im.trait_name.name.clone();
+            if !self.dyn_traits.contains(&tname) {
+                continue;
+            }
+            let target = self.ast_type_to_ty(im.ty, &empty);
+            let key = self.info.table.ty_key(&target);
+            let concrete = self.c_ty_ast(im.ty);
+
+            // A shim per impl method: `void* self` is cast back to the concrete type
+            // (deref'd for a by-value `read self`, kept as a pointer for `mut self`).
+            for f in &im.methods {
+                let ret = f.ret_ty.map(|ty| self.c_ty_ast(ty)).unwrap_or_else(|| "void".to_string());
+                let self_is_ptr = f
+                    .params
+                    .iter()
+                    .find(|p| p.is_self)
+                    .map(|p| matches!(p.conv, Conv::Mut | Conv::Out))
+                    .unwrap_or(false);
+                let mut sig = vec!["void* self".to_string()];
+                let mut call_args =
+                    vec![if self_is_ptr { format!("({concrete}*)self") } else { format!("*({concrete}*)self") }];
+                for p in &f.params {
+                    if p.is_self || p.comptime {
+                        continue;
+                    }
+                    let base = p.ty.map(|ty| self.c_ty_ast(ty)).unwrap_or_else(|| "int".to_string());
+                    sig.push(format!("{} j_{}", borrow_ptr_cty(&base, p.conv), p.name.name));
+                    call_args.push(format!("j_{}", p.name.name));
+                }
+                let shim = format!("jestyr_vtshim_{tname}__{key}__{}", f.name.name);
+                let target_fn = impl_method_c_name(&tname, &key, &f.name.name);
+                let ret_kw = if ret == "void" { "" } else { "return " };
+                self.raw(format!(
+                    "static {ret} {shim}({}) {{ {ret_kw}{target_fn}({}); }}\n",
+                    sig.join(", "),
+                    call_args.join(", ")
+                ));
+            }
+
+            // The vtable instance: fields in *trait-method* order point at the shims.
+            let methods: Vec<String> = ast
+                .items
+                .iter()
+                .find_map(|it| match it {
+                    Item::Trait(t) if t.name.name == tname => {
+                        Some(t.methods.iter().map(|m| m.name.name.clone()).collect())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let inits: Vec<String> =
+                methods.iter().map(|m| format!("jestyr_vtshim_{tname}__{key}__{m}")).collect();
+            self.raw(format!(
+                "static const JestyrVtable_{tname} jestyr_vt_{tname}__{key} = {{ {} }};\n",
+                inits.join(", ")
+            ));
+        }
+    }
+
     fn impl_defs(&mut self) {
         let ast = self.ast;
         for item in &ast.items {
@@ -4524,6 +4674,27 @@ impl<'a> Cgen<'a> {
         } else {
             call
         }
+    }
+
+    /// Wrap a concrete value into a `dyn Trait` fat pointer (Stage F): build
+    /// `{ &value, &<vtable for its type> }`. The data pointer must outlive the call
+    /// the `dyn` is passed to — so a **scalar** is placed in a fresh compound
+    /// literal `&((T){ v })` (automatic storage of the *enclosing block*, not a
+    /// dangling statement-expression temp), while an aggregate's address is taken
+    /// directly (its source is a local/field lvalue, or itself a compound literal).
+    fn emit_dyn_coercion(&mut self, id: ExprId, trait_name: &str) -> String {
+        let concrete = self.info.type_of(id).clone();
+        let key = self.info.table.ty_key(&concrete);
+        let cty = self.c_type(&concrete);
+        self.dyn_guard.insert(id);
+        let inner = self.emit_expr(id);
+        self.dyn_guard.remove(&id);
+        let data = if is_scalar_ty(&concrete) {
+            format!("&(({cty}){{ {inner} }})")
+        } else {
+            format!("&({inner})")
+        };
+        format!("(JestyrDyn_{trait_name}){{ {data}, &jestyr_vt_{trait_name}__{key} }}")
     }
 
     // --- structured concurrency (`concurrent` / `spawn`) ---
@@ -5320,10 +5491,8 @@ impl<'a> Cgen<'a> {
                 let ty = self.ast_type_to_ty(id, &subst);
                 self.c_type(&ty)
             }
-            TypeKind::Dyn(_) => {
-                self.diag(span, "the C backend does not support `dyn` yet (traits Stage F)");
-                "void*".to_string()
-            }
+            // `dyn Trait` is the `{ data, vtable }` fat pointer typedef (Stage F).
+            TypeKind::Dyn(n) => format!("JestyrDyn_{}", n.name),
             TypeKind::Error => "int".to_string(),
         }
     }
@@ -5349,10 +5518,17 @@ impl<'a> Cgen<'a> {
                 format!("Jestyr_{}", self.info.table.types[*i].name)
             }
             // an inferred type parameter (e.g. `T`) under the active substitution
-            Ty::Opaque(n) => match self.subst.get(n).cloned() {
-                Some(t) => self.c_type(&t),
-                None => "int".to_string(),
-            },
+            Ty::Opaque(n) => {
+                // `dyn Trait` (lowered to `Opaque("dyn <Trait>")`) is its fat-pointer
+                // typedef; an ordinary opaque resolves through the active subst.
+                if let Some(tr) = n.strip_prefix("dyn ") {
+                    return format!("JestyrDyn_{tr}");
+                }
+                match self.subst.get(n).cloned() {
+                    Some(t) => self.c_type(&t),
+                    None => "int".to_string(),
+                }
+            }
             Ty::Result(ok) => self.result_c_name(ok),
             Ty::GenStruct { ctor, args } => self.gen_struct_c_name(ctor, args),
             Ty::GenEnum { ctor, args } => {
@@ -5962,6 +6138,18 @@ fn impl_method_c_name(trait_name: &str, type_key: &str, method: &str) -> String 
     format!("jestyr_impl_{trait_name}__{safe}__{method}")
 }
 
+/// Is `t` a C *scalar* (numeric/bool/char/pointer) rather than an aggregate? A
+/// scalar may be placed in a single-value compound literal `(T){ v }`; an
+/// aggregate (`str`/`String`, structs, slices, …) cannot, so its address is taken
+/// directly. Used by the `dyn` coercion to give the erased data a valid address.
+fn is_scalar_ty(t: &Ty) -> bool {
+    match t {
+        Ty::Prim(n) => !matches!(*n, "str" | "String" | "Builder"),
+        Ty::Ptr { .. } => true,
+        _ => false,
+    }
+}
+
 /// Is `name` a backend intrinsic (a prelude stand-in for the stdlib / C interop)?
 /// Used so a reference to one is not mistaken for a closure capture.
 fn is_intrinsic(name: &str) -> bool {
@@ -6536,6 +6724,58 @@ mod tests {
             c.contains("jestyr_impl_Show__P__show(j_x)"),
             "the P instance body dispatches to the P impl: {c}"
         );
+    }
+
+    // --- traits: `dyn Trait` dynamic dispatch (Stage F) ---
+
+    #[test]
+    fn lowers_dyn_to_a_vtable_fat_pointer_and_dispatches_through_it() {
+        let src = "trait Show { fn show(read self) -> i32 } \
+                   impl Show for i32 { fn show(read self) -> i32 { return self + 1 } } \
+                   fn describe(read s: dyn Show) -> i32 { return s.show() } \
+                   fn main() -> i32 { let n = 41 return describe(n) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        // The synthesized vtable struct + fat-pointer typedef.
+        assert!(c.contains("} JestyrVtable_Show;"), "vtable struct: {c}");
+        assert!(
+            c.contains("void* data; const JestyrVtable_Show* vtable;"),
+            "fat-pointer typedef: {c}"
+        );
+        // A shim erasing the receiver + a static vtable instance.
+        assert!(
+            c.contains("jestyr_vtshim_Show__i32__show(void* self)")
+                && c.contains("jestyr_impl_Show__i32__show(*(int32_t*)self)"),
+            "the i32 shim casts the erased self back: {c}"
+        );
+        assert!(
+            c.contains("static const JestyrVtable_Show jestyr_vt_Show__i32 = { jestyr_vtshim_Show__i32__show }"),
+            "static vtable instance: {c}"
+        );
+        // Dispatch through the vtable slot, and the coercion to a fat pointer.
+        assert!(c.contains("j_s.vtable->show(j_s.data)"), "dynamic dispatch: {c}");
+        assert!(
+            c.contains("&jestyr_vt_Show__i32"),
+            "the argument coerces into a fat pointer with the i32 vtable: {c}"
+        );
+    }
+
+    #[test]
+    fn a_dyn_call_dispatches_the_same_function_to_distinct_impls() {
+        // One `describe` (not monomorphized) dispatches to whichever impl the
+        // value's runtime type provides — the vtable picks i32 vs P.
+        let src = "trait Show { fn show(read self) -> i32 } \
+                   impl Show for i32 { fn show(read self) -> i32 { return self } } \
+                   struct P { v: i32 } \
+                   impl Show for P { fn show(read self) -> i32 { return self.v } } \
+                   fn describe(read s: dyn Show) -> i32 { return s.show() } \
+                   fn main() -> i32 { let n = 1 let p = P{ v: 2 } return describe(n) + describe(p) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        // A single describe function, but two vtables referenced at the call sites.
+        assert_eq!(c.matches("int32_t jestyr_describe(").count(), 2, "one proto + one def: {c}");
+        assert!(c.contains("&jestyr_vt_Show__i32"), "i32 call uses the i32 vtable: {c}");
+        assert!(c.contains("&jestyr_vt_Show__P"), "P call uses the P vtable: {c}");
     }
 
     #[test]
