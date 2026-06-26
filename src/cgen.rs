@@ -1614,18 +1614,72 @@ impl<'a> Cgen<'a> {
         None
     }
 
+    /// Mark each bare-name argument that lands at a `take` (consuming) parameter
+    /// of `call_id` as moved. Borrow conventions (`read`/`mut`/`out`) do not move,
+    /// so a droppable handed to a borrowing call still drops at scope exit. A
+    /// callee we can't resolve to a user `FnDecl` (an intrinsic, closure, or `dyn`
+    /// call) never takes ownership of a droppable in the bootstrap, so it moves
+    /// nothing. A *generic* callee's comptime type-arguments occupy argument slots,
+    /// so positions can't be aligned — there we fall back to the conservative
+    /// "every bare-name arg moves" (leak-safe).
+    fn mark_take_args(
+        &self,
+        call_id: ExprId,
+        callee: ExprId,
+        args: &[ExprId],
+        out: &mut HashSet<String>,
+    ) {
+        // A trait-impl method call resolves through `find_impl_method`.
+        if let Some(ic) = self.info.impl_calls.get(&call_id) {
+            if let Some(f) = self.find_impl_method(&ic.trait_name, &ic.type_key, &ic.method) {
+                self.mark_take_args_against(f, args, out);
+            }
+            return;
+        }
+        let fdecl = if let Some(mr) = self.info.method_calls.get(&call_id) {
+            self.find_fn(&mr.fn_name)
+        } else if let Some(q) = self.info.qualified.get(&call_id) {
+            self.find_fn(q)
+        } else if let ExprKind::Name(n) = &self.ast.expr_at(callee).kind {
+            self.find_fn(&n.name)
+        } else {
+            None
+        };
+        if let Some(f) = fdecl {
+            self.mark_take_args_against(f, args, out);
+        }
+    }
+
+    /// Helper for [`mark_take_args`]: align `args` to `f`'s non-self runtime
+    /// parameters and mark the `take` ones (or all, if `f` is generic).
+    fn mark_take_args_against(&self, f: &FnDecl, args: &[ExprId], out: &mut HashSet<String>) {
+        if f.params.iter().any(|p| p.comptime) {
+            for a in args {
+                if let Some(name) = self.as_name(*a) {
+                    out.insert(name);
+                }
+            }
+            return;
+        }
+        let runtime: Vec<Conv> =
+            f.params.iter().filter(|p| !p.comptime && !p.is_self).map(|p| p.conv).collect();
+        for (i, a) in args.iter().enumerate() {
+            if matches!(runtime.get(i), Some(Conv::Take)) {
+                if let Some(name) = self.as_name(*a) {
+                    out.insert(name);
+                }
+            }
+        }
+    }
+
     fn collect_moved_expr(&self, id: ExprId, out: &mut HashSet<String>) {
         let ast = self.ast;
         match &ast.expr_at(id).kind {
             ExprKind::Call { callee, args } => {
-                // Every by-value argument that is a bare name escapes into the
-                // callee (`take` owns it; a `read`/by-value copy is treated the
-                // same, conservatively — leak-safe).
-                for a in args {
-                    if let Some(name) = self.as_name(*a) {
-                        out.insert(name);
-                    }
-                }
+                // Only a `take` (consuming) argument moves the value; a `read`/`mut`/
+                // `out` borrow does not — so a droppable passed to a borrowing method
+                // (`vec.push(x)`, `free(vec)` taking `mut`) still drops at scope exit.
+                self.mark_take_args(id, *callee, args, out);
                 // A `take self` receiver consumes the base.
                 if matches!(self.recv_conv_of(id), Some(Conv::Take)) {
                     if let ExprKind::Field { base, .. } = &ast.expr_at(*callee).kind {
@@ -6756,6 +6810,22 @@ mod tests {
         let (ci, _) = gen(&inside);
         assert_eq!(co.matches("__drop(&j_a)").count(), 1, "outside a region:\n{co}");
         assert_eq!(ci.matches("__drop(&j_a)").count(), 0, "region-owned value:\n{ci}");
+    }
+
+    #[test]
+    fn allocator_value_routes_through_the_vtable_not_bare_malloc() {
+        // The explicit-allocator interface (Phase 3): `a.alloc_fn(a.ctx, ly)` is an
+        // *indirect* call through a struct fn-pointer field — the Zig vtable shape,
+        // not a direct `malloc`.
+        let src = "struct Layout { size: usize, align: usize } \
+            struct Allocator { ctx: *mut u8, alloc_fn: fn(*mut u8, Layout) -> *mut u8 } \
+            fn alloc_n(read a: Allocator, n: usize) -> *mut u8 { \
+                return a.alloc_fn(a.ctx, Layout{ size: n, align: 8 }) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("j_a.j_alloc_fn(j_a.j_ctx,"), "expected an indirect vtable call:\n{c}");
+        // The fn-pointer field is a real typedef'd thin pointer, not a closure.
+        assert!(c.contains("(*JestyrFn_"), "expected a fn-pointer typedef:\n{c}");
     }
 
     #[test]

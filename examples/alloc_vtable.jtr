@@ -1,0 +1,73 @@
+// examples/alloc_vtable.jtr — the explicit allocator interface (design Phase 3).
+//
+// Zig's `std.mem.Allocator` shape: an opaque context pointer plus a vtable of
+// function pointers, carried in one first-class value. Allocators are EXPLICIT
+// values, never a hidden global — and one code path (`alloc_n`/`free_n`) runs
+// over *any* allocator, dispatching through its vtable. This retires the bootstrap
+// enum-dispatch stand-in (`std/mem.jtr`) for a real fn-pointer vtable.
+//
+//   jestyrc run examples/alloc_vtable.jtr
+//   →   10        (system/malloc allocator: write then read back)
+//       20
+//       30        (arena allocator: SAME alloc_n code path, different strategy)
+//       40
+
+// A `Layout` carries the size and alignment of a request (Rust's GlobalAlloc).
+struct Layout { size: usize, align: usize }
+
+// The allocator value: a context + a vtable (inlined as two thin fn-pointers).
+struct Allocator {
+    ctx: *mut u8,
+    alloc_fn: fn(*mut u8, Layout) -> *mut u8,
+    free_fn: fn(*mut u8, *mut u8),
+}
+
+// The user-facing API — one path over whatever allocator it is handed.
+fn alloc_n(read a: Allocator, n: usize) -> *mut u8 {
+    return a.alloc_fn(a.ctx, Layout{ size: n, align: 8 })
+}
+fn free_n(read a: Allocator, p: *mut u8) { a.free_fn(a.ctx, p) }
+
+// Strategy 1 — the system (malloc) allocator. Context is unused (null).
+fn sys_alloc(ctx: *mut u8, ly: Layout) -> *mut u8 { return alloc(u8, ly.size) }
+fn sys_free(ctx: *mut u8, p: *mut u8) { free_ptr(p) }
+fn system_allocator() -> Allocator {
+    return Allocator{ ctx: null, alloc_fn: &sys_alloc, free_fn: &sys_free }
+}
+
+// Strategy 2 — a bump arena. Context is the arena handle; `free` is a no-op (the
+// whole arena is reclaimed at once by `arena_close`). SAME `Allocator` type.
+fn ar_alloc(ctx: *mut u8, ly: Layout) -> *mut u8 { return arena_alloc(ctx, u8, ly.size) }
+fn ar_free(ctx: *mut u8, p: *mut u8) {}
+fn arena_allocator(read h: *mut u8) -> Allocator {
+    return Allocator{ ctx: h, alloc_fn: &ar_alloc, free_fn: &ar_free }
+}
+
+// Typed access through a raw `*mut i32` buffer (helpers dodge the bootstrap's
+// "a value then `(` is a call" statement-boundary quirk).
+fn store(p: *mut i32, i: usize, v: i32) { unsafe { (p + i).* = v } }
+fn load(read p: *mut i32, i: usize) -> i32 { unsafe { return (p + i).* } }
+
+fn main() -> i32 {
+    // The system allocator: explicit value, vtable dispatch.
+    var sa: Allocator = system_allocator()
+    var p: *mut i32 = alloc_n(sa, 8) as *mut i32
+    store(p, 0, 10)
+    store(p, 1, 20)
+    print_int(load(p, 0))     // 10
+    print_int(load(p, 1))     // 20
+    free_n(sa, p as *mut u8)
+
+    // The arena allocator: the SAME alloc_n/free_n path, a different strategy.
+    var h: *mut u8 = arena_open(1024)
+    var aa: Allocator = arena_allocator(h)
+    var q: *mut i32 = alloc_n(aa, 8) as *mut i32
+    store(q, 0, 30)
+    store(q, 1, 40)
+    print_int(load(q, 0))     // 30
+    print_int(load(q, 1))     // 40
+    free_n(aa, q as *mut u8)  // a no-op for the arena
+    arena_close(h)            // bulk-frees everything
+
+    return 0
+}
