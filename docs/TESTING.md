@@ -287,8 +287,22 @@ Run: `cargo test trait_programs`, `cargo test parses_a_trait`, `cargo bolero tes
     real `x.m()` drives dispatch; total + deterministic.
   - gcc differential: `examples/traits_static.jtr` runs to `42/141/15/18`
     (`traits_static_example_compiles_clean`).
-- ⏳ **Remaining:** D definition-site bounds (`fn f[T: Tr]` checked once) · E operator traits
-  (`Add`/`Mul`/`Eq`/`Ord`) · F `dyn` vtable (reuses the fn-pointer-field call machinery). Each
+- ✅ **Stage D — definition-site bounds.** A bracket-form bound `[T: Tr]` is checked in two halves,
+  both typeck-only (no codegen — bracket generics aren't monomorphized yet, so there's no runtime
+  differential): **declaration** — every bound names a registered trait (`check_bound_traits_declared`,
+  over free fns + impl/struct methods); **call-site obligation** — at each call to `f[T: Tr](…)`,
+  the concrete `T` is recovered by unifying declared params against the actual arg types
+  (`unify_tp`) and must `impl Tr` (`check_call_bounds`, reusing `impl_index`); an unsatisfied bound
+  errors at the call. Unknown-bound and unresolved/opaque `T` are skipped in the call-site check
+  (the former is the declaration check's job; the latter avoids a false positive).
+  - Unit (typeck): unsatisfied bound errors, satisfied bound is clean, unknown-trait bound errors at
+    the definition, a struct receiver satisfies via its impl, an unbounded `[U]` imposes nothing.
+  - Property (`prop`): `unsatisfied_bound_always_errors_at_the_call` (soundness, distinct
+    impl/call types), `satisfied_bound_never_errors_at_the_call` (completeness).
+  - Fuzz (`fuzz`): `fuzz_definition_site_bounds` — fuzz bytes in a bracket-generic body, a real call
+    drives `check_call_bounds`; total + deterministic.
+- ⏳ **Remaining:** E operator traits (`Add`/`Mul`/`Eq`/`Ord`, the `f64` impl is the no-FMA
+  determinism seam) · F `dyn` vtable (reuses the fn-pointer-field call machinery). Each
   lands with the same three layers (+ a gcc differential once runtime behaviour matters).
 
 ---

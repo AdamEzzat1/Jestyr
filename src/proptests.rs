@@ -396,6 +396,46 @@ mod prop {
         fn trait_call_programs_compile_deterministically((p, _t) in arb_trait_call_program()) {
             prop_assert_eq!(compile(&p), compile(&p));
         }
+
+        // ── traits, Stage D: definition-site bounds ───────────────────────────
+
+        /// **Bound soundness.** A bracket-generic `xuse[T: xB]` instantiated at a
+        /// type with *no* matching `impl` always errors at the call — for every
+        /// distinct (impl-type, call-type) pair. Teeth: removing the call-site
+        /// bound check makes the unsatisfied instantiation type-check clean.
+        #[test]
+        fn unsatisfied_bound_always_errors_at_the_call((a, b) in (arb_prim_ty(), arb_prim_ty())) {
+            prop_assume!(a != b);
+            let p = format!(
+                "trait xB {{ fn xm(read self) -> i32 }} \
+                 impl xB for {a} {{ fn xm(read self) -> i32 {{ return 0 }} }} \
+                 fn xuse[T: xB](read x: T) -> i32 {{ return 0 }} \
+                 fn xc(read y: {b}) -> i32 {{ return xuse(y) }}"
+            );
+            let diags = typeck_diags(&p);
+            prop_assert!(
+                diags.iter().any(|d| d.contains("does not implement trait `xB`")),
+                "expected an unsatisfied-bound error for `{}`: {:?}", b, diags
+            );
+        }
+
+        /// **Bound completeness.** A bracket-generic instantiated at a type that
+        /// *does* `impl` the bound never raises a bound error (the oracle: the
+        /// impl is for that exact type).
+        #[test]
+        fn satisfied_bound_never_errors_at_the_call(t in arb_prim_ty()) {
+            let p = format!(
+                "trait xB {{ fn xm(read self) -> i32 }} \
+                 impl xB for {t} {{ fn xm(read self) -> i32 {{ return 0 }} }} \
+                 fn xuse[T: xB](read x: T) -> i32 {{ return 0 }} \
+                 fn xc(read y: {t}) -> i32 {{ return xuse(y) }}"
+            );
+            let diags = typeck_diags(&p);
+            prop_assert!(
+                !diags.iter().any(|d| d.contains("does not implement")),
+                "a satisfied bound must not error: {:?}", diags
+            );
+        }
     }
 
     /// A concrete primitive type to `impl` a trait for.
@@ -676,6 +716,24 @@ mod fuzz {
                 "trait T {{ fn m(read self) -> i32 }} \
                  impl T for i32 {{ fn m(read self) -> i32 {{ {s} }} }} \
                  fn u(read x: i32) -> i32 {{ return x.m() }}"
+            );
+            run_pipeline(&prog);
+            assert_eq!(compile(&prog), compile(&prog));
+        });
+    }
+
+    /// Coverage-guided fuzzing of **Stage D bound checking**: fuzz bytes fill a
+    /// bracket-generic body while a real call `g(y)` drives the call-site bound
+    /// check (`check_call_bounds` / `unify_tp`). Totality + determinism on
+    /// arbitrary body soup — the bound machinery must never panic or leak order.
+    #[test]
+    fn fuzz_definition_site_bounds() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let prog = format!(
+                "trait B {{ fn m(read self) -> i32 }} \
+                 impl B for i32 {{ fn m(read self) -> i32 {{ return 0 }} }} \
+                 fn g[T: B](read x: T) -> i32 {{ {s} }} \
+                 fn c(read y: i32) -> i32 {{ return g(y) }}"
             );
             run_pipeline(&prog);
             assert_eq!(compile(&prog), compile(&prog));

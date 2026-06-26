@@ -90,18 +90,54 @@ the receiver's type key.
 
 ---
 
-## Main objective — traits **Stage D** (definition-site bounds)
+## ✅ Done — traits **Stage D** (definition-site bounds)
 
-The trait epic resumes at **Stage D**: check a generic's declared bounds
-*once, at its definition* — `fn f[T: Tr](x: T)` requires every type `T` is later
-instantiated at to `impl Tr`. Stage B already parses `[T: Bound]` into
-`FnDecl::generics` and registers impls in `GlobalTable::{impls, impl_index}`; Stage
-D adds the **check**: at each generic call, verify the chosen `T` has an
-`impl Bound for T` (reuse `impl_index`), erroring at the call site otherwise. No
-new codegen — bounds are erased after checking (static dispatch already emits the
-concrete impl method). See the trait-stage ledger in `docs/TESTING.md §5.12` (E
-operator traits, F `dyn` vtable — which reuses the fn-pointer-field call machinery
-— follow).
+A bracket-form bound `[T: Tr]` is now **checked** (typeck-only — bracket generics
+aren't monomorphized yet, so there's no runtime differential and no new codegen):
+
+- **Declaration half** (`typeck::check_bound_traits_declared`, phase 4): every
+  bound names a registered trait, else an error at the definition — a typo
+  (`[T: Bogus]`) is caught, not silently ignored. Covers free fns, `impl` methods,
+  and struct methods.
+- **Call-site obligation** (`typeck::check_call_bounds`, in `infer`'s
+  `ExprKind::Call` name-callee path): at a call `f[T: Tr](…)`, the concrete `T` is
+  recovered by unifying `f`'s declared param types against the actual arg types
+  (`unify_tp`), then must `impl Tr` (reusing `impl_index`); an unsatisfied bound
+  errors *at the call*. Unknown-bound `T` (declaration half's job) and
+  unresolved/opaque `T` (a call nested in another generic) are skipped to avoid a
+  false positive. Comptime-generic and method-sugar calls are unaffected
+  (`generics` is empty / the hook is the free-call path only).
+- **Tests (teeth-verified by mutation):** typeck unit (unsatisfied → error,
+  satisfied → clean, unknown-trait bound → definition error, struct receiver
+  satisfies via its impl, unbounded `[U]` imposes nothing), properties
+  `unsatisfied_bound_always_errors_at_the_call` (soundness) +
+  `satisfied_bound_never_errors_at_the_call` (completeness), and
+  `fuzz_definition_site_bounds`. Suite **372 green**, warning-clean.
+
+**Note on scope.** This is the *enforcement* layer. Bracket generics still lower
+to `Ty::Opaque("T")` and the backend does not monomorphize them (a bracket-generic
+*call* still hits cgen's "cannot lower external type `T`"), so there is no gcc
+round-trip yet — that's a separate **bracket-generic codegen** workstream, not part
+of the trait stages. The complementary *body-side* "blame the generic code" check
+(inside `f[T: Tr]`, only `Tr`'s methods are callable on a `T` value — design §8.2's
+"Zig fix") is **not yet done**: it needs bracket params treated as real type
+parameters in `fn_type_params`/`lower_type` and method resolution through the bound.
+
+---
+
+## Main objective — traits **Stage E** (operator traits)
+
+The trait epic resumes at **Stage E**: desugar the built-in operators to trait
+methods — `+`/`*`/`==`/`<` → `Add`/`Mul`/`Eq`/`Ord` — so a user type that `impl`s
+the trait participates in operator syntax, lowering through the Stage C
+static-dispatch path. **The `f64` impl is the no-FMA determinism seam** (see
+`NUMERICS-RESEARCH.md` and the numerics memory): floating `+`/`*` must lower to
+contraction-free C (`-ffp-contract=off` / no fused multiply-add) so results are
+bit-reproducible. Wire the built-in operator traits into `GlobalTable::traits`,
+resolve a binary-op expr whose operands are a user type through
+`impl <OpTrait> for <lhs>`, and emit the impl method call (Stage C machinery).
+See the trait-stage ledger in `docs/TESTING.md §5.12` (F `dyn` vtable — which
+reuses the fn-pointer-field call machinery — follows).
 
 ---
 
@@ -129,7 +165,7 @@ A *capturing* closure coerced to a fn-pointer is a clear error.
 `run`/`build` on a no-`main` library now reports a clear message instead of a raw
 C-linker `WinMain` error (`test` mode is exempt; it synthesizes its own `main`).
 
-### Traits / interfaces — Stages A, B & C done (epic in flight)
+### Traits / interfaces — Stages A, B, C & D done (epic in flight)
 - **A — parse + represent:** `trait`/`impl`/`dyn Trait`/`[T: Bound]` into the AST
   (`Item::Trait`, `Item::Impl`, `TypeKind::Dyn`, `FnDecl::generics`); pipeline
   stays total with no semantics.
@@ -141,19 +177,21 @@ C-linker `WinMain` error (`test` mode is exempt; it synthesizes its own `main`).
 - **C — static, monomorphized dispatch:** the backend emits each impl method as a
   mangled C function (`jestyr_impl_<Trait>__<TypeKey>__<method>`, receiver-first,
   reusing the struct-method `self` machinery) and lowers a resolved `recv.m(args)`
-  to a *direct* call of it (no vtable). See the §5.12 ledger and the done-section
-  above.
-- **Remaining (in order):** **D** definition-site bounds (`fn f[T: Tr]` checked
-  once — see Main Objective above) · **E** operator traits (`+`/`*`/`==`/`<` →
-  `Add`/`Mul`/`Eq`/`Ord`, the `f64` impl is the no-FMA determinism seam) · **F**
-  `dyn` vtable (reuses the fn-pointer-field call machinery — see the first done
-  section's arc).
+  to a *direct* call of it (no vtable). See the §5.12 ledger.
+- **D — definition-site bounds:** typeck checks each bracket-form bound `[T: Tr]` —
+  the bound names a known trait (declaration), and every call instantiates `T` at a
+  type that `impl`s `Tr` (call-site obligation, reusing `impl_index`). Typeck-only;
+  bracket generics aren't monomorphized yet. See the done-section / §5.12 ledger.
+- **Remaining (in order):** **E** operator traits (`+`/`*`/`==`/`<` →
+  `Add`/`Mul`/`Eq`/`Ord`, the `f64` impl is the no-FMA determinism seam — see Main
+  Objective above) · **F** `dyn` vtable (reuses the fn-pointer-field call
+  machinery — see the first done section's arc).
 
 ---
 
 ## Test posture
 
-Suite is **364 green**, warning-clean, clean across the `dharht-experiment` and
+Suite is **372 green**, warning-clean, clean across the `dharht-experiment` and
 `bench-alloc` feature builds. New coverage adapts to the *real* harness
 (`src/proptests.rs`: `mod prop` + `mod fuzz` + `arb_*_program` generators,
 `typeck_diags` for diagnostic differentials) — the handoff's referenced

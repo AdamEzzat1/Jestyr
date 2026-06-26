@@ -295,6 +295,10 @@ impl<'a> TypeChecker<'a> {
         // Phase 3: traits, then impls (coherence-checked against the traits).
         self.register_traits();
         self.register_impls();
+        // Phase 4: definition-site bounds (traits, Stage D) — every declared
+        // bound `[T: Tr]` must name a registered trait (the per-call obligation
+        // that a *concrete* type satisfies the bound is checked in `infer`).
+        self.check_bound_traits_declared();
     }
 
     /// Register each `trait` (name → its method set, flagged required/defaulted).
@@ -407,6 +411,105 @@ impl<'a> TypeChecker<'a> {
         };
         self.impl_calls.insert(call_id, ImplCall { trait_name, type_key: key, method: method.to_string() });
         Some(ret)
+    }
+
+    /// Definition-site bounds (traits, Stage D), the declaration half: every
+    /// bracket-generic bound `[T: Tr]` must name a registered trait — a typo or
+    /// undeclared trait is caught at the *definition*, not silently ignored (which
+    /// is what would happen at the call site, where an unknown bound is skipped).
+    /// Covers free functions and their `impl`/struct method counterparts.
+    fn check_bound_traits_declared(&mut self) {
+        let ast = self.ast;
+        // Gather every function that can carry bracket-form generics (free fns,
+        // `impl` methods, struct methods) — `&'a` borrows, independent of `self`.
+        let mut fns: Vec<&FnDecl> = Vec::new();
+        for item in &ast.items {
+            match item {
+                Item::Fn(f) => fns.push(f),
+                Item::Impl(im) => fns.extend(im.methods.iter()),
+                Item::Struct { body, .. } => {
+                    for m in &body.members {
+                        if let StructMember::Method(f) = m {
+                            fns.push(f);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut errs: Vec<(Span, String)> = Vec::new();
+        for f in fns {
+            for g in &f.generics {
+                if let Some(b) = &g.bound {
+                    if !self.table.traits.contains_key(&b.name) {
+                        errs.push((
+                            b.span,
+                            format!(
+                                "unknown trait `{}` in bound on type parameter `{}`",
+                                b.name, g.name.name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        for (sp, msg) in errs {
+            self.error(sp, msg);
+        }
+    }
+
+    /// Definition-site bounds (traits, Stage D), the call-site obligation: at a
+    /// call to a bracket-generic `f[T: Tr](…)`, recover each bounded `T`'s
+    /// concrete type by unifying `f`'s declared parameter types against the actual
+    /// argument types, then require `impl Tr for <concrete>` (reusing
+    /// `impl_index`). An unsatisfied bound errors *at the call site* — the concrete
+    /// type is the caller's, but the obligation is the generic's contract. An
+    /// unknown bound trait is left to [`Self::check_bound_traits_declared`]; an
+    /// `Unknown`/opaque `T` (e.g. a call nested in another generic) is skipped
+    /// rather than risk a false positive.
+    fn check_call_bounds(&mut self, name: &str, arg_tys: &[Ty], span: Span) {
+        let generics: Vec<(String, Option<String>)> = match self.find_fn_decl(name) {
+            Some(f) if !f.generics.is_empty() => f
+                .generics
+                .iter()
+                .map(|g| (g.name.name.clone(), g.bound.as_ref().map(|b| b.name.clone())))
+                .collect(),
+            _ => return,
+        };
+        let tps: HashSet<String> = generics.iter().map(|(n, _)| n.clone()).collect();
+        let param_tys: Vec<Ty> = self
+            .table
+            .fns
+            .get(name)
+            .map(|s| s.params.iter().map(|p| p.ty.clone()).collect())
+            .unwrap_or_default();
+        let mut subst: HashMap<String, Ty> = HashMap::new();
+        for (pt, at) in param_tys.iter().zip(arg_tys) {
+            unify_tp(pt, at, &tps, &mut subst);
+        }
+        let mut violations: Vec<(String, String, String)> = Vec::new();
+        for (gname, bound) in &generics {
+            let Some(tr) = bound else { continue };
+            if !self.table.traits.contains_key(tr) {
+                continue; // unknown trait: reported at the definition site
+            }
+            let Some(concrete) = subst.get(gname) else { continue };
+            if matches!(concrete, Ty::Opaque(_) | Ty::Unknown | Ty::Error) {
+                continue; // unresolved `T` — don't risk a false positive
+            }
+            let key = self.table.ty_key(concrete);
+            if !self.table.impl_index.contains_key(&(tr.clone(), key.clone())) {
+                violations.push((key, tr.clone(), gname.clone()));
+            }
+        }
+        for (ty, tr, param) in violations {
+            self.error(
+                span,
+                format!(
+                    "type `{ty}` does not implement trait `{tr}` required by bound `{param}: {tr}` on `{name}`"
+                ),
+            );
+        }
     }
 
     fn register_type(&mut self, name: &Ident, is_enum: bool) -> usize {
@@ -1172,6 +1275,12 @@ impl<'a> TypeChecker<'a> {
                 }
                 if let Some(name) = callee_name {
                     self.check_visibility(&name, span);
+                    // Definition-site bounds (Stage D): a bracket-generic call
+                    // `f[T: Tr](…)` must instantiate `T` at a type that `impl`s
+                    // `Tr` — checked here, where `T` is concrete (the args carry it).
+                    let arg_tys: Vec<Ty> =
+                        args.iter().map(|a| self.expr_types[a.0 as usize].clone()).collect();
+                    self.check_call_bounds(&name, &arg_tys, span);
                     if let Some(sig) = self.table.fns.get(&name) {
                         let ret = sig.ret.clone();
                         let fallible = sig.fallible;
@@ -2683,6 +2792,74 @@ mod tests {
              impl T for i32 { fn show(read self) -> i32 { return 1 } }",
         );
         assert!(d.is_empty(), "a defaulted method may be omitted: {:?}", d);
+    }
+
+    // --- traits: definition-site bounds (Stage D) ---
+
+    #[test]
+    fn unsatisfied_definition_site_bound_is_an_error() {
+        // `xuse[T: Show]` is instantiated at `bool`, which has no `impl Show` — a
+        // call-site obligation failure ("blame the generic code, but the caller's
+        // type must satisfy the contract").
+        let (_i, d) = analyze(
+            "trait Show { fn show(read self) -> i32 } \
+             impl Show for i32 { fn show(read self) -> i32 { return 1 } } \
+             fn xuse[T: Show](read x: T) -> i32 { return 0 } \
+             fn caller(read b: bool) -> i32 { return xuse(b) }",
+        );
+        assert!(
+            d.iter().any(|m| m.message.contains("does not implement trait `Show`")),
+            "expected an unsatisfied-bound error: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn satisfied_definition_site_bound_is_accepted() {
+        // Instantiated at `i32`, which *does* `impl Show` — no bound error.
+        let (_i, d) = analyze(
+            "trait Show { fn show(read self) -> i32 } \
+             impl Show for i32 { fn show(read self) -> i32 { return 1 } } \
+             fn xuse[T: Show](read x: T) -> i32 { return 0 } \
+             fn caller(read n: i32) -> i32 { return xuse(n) }",
+        );
+        assert!(d.is_empty(), "a satisfied bound should type-check cleanly: {:?}", d);
+    }
+
+    #[test]
+    fn unknown_trait_in_a_bound_is_a_definition_site_error() {
+        // The declaration half: a bound naming an undeclared trait is caught at
+        // the definition, not silently ignored.
+        let (_i, d) = analyze("fn f[T: Bogus](read x: T) -> i32 { return 0 }");
+        assert!(
+            d.iter().any(|m| m.message.contains("unknown trait `Bogus`")),
+            "expected an unknown-trait-in-bound error: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn a_struct_receiver_satisfies_a_bound_via_its_impl() {
+        // The concrete type can be a user struct: the bound is keyed by the
+        // struct's name, so its `impl` satisfies the obligation.
+        let (_i, d) = analyze(
+            "trait Show { fn show(read self) -> i32 } \
+             struct P { a: i32 } \
+             impl Show for P { fn show(read self) -> i32 { return self.a } } \
+             fn xuse[T: Show](read x: T) -> i32 { return 0 } \
+             fn caller(read p: P) -> i32 { return xuse(p) }",
+        );
+        assert!(d.is_empty(), "a struct with the impl satisfies the bound: {:?}", d);
+    }
+
+    #[test]
+    fn an_unbounded_generic_param_is_never_a_bound_error() {
+        // `[U]` (no bound) imposes no obligation — any instantiation is fine.
+        let (_i, d) = analyze(
+            "fn xid[U](read x: U) -> i32 { return 0 } \
+             fn caller(read b: bool) -> i32 { return xid(b) }",
+        );
+        assert!(d.is_empty(), "an unbounded param accepts any type: {:?}", d);
     }
 
     #[test]
