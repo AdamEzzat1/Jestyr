@@ -216,3 +216,122 @@ pub fn sl_sort(comptime T: type, mut s: []T, less: fn(read T, read T) -> bool) {
         i = i + 1
     }
 }
+
+// ── Number parsing & formatting — locale-free, deterministic, bytewise ────────
+//
+// The std side of the numerics determinism contract: parse/format are defined by
+// construction (decimal, ASCII `0`–`9`, no locale, no float rounding modes), so
+// they are **bit-identical across platforms** — `parse(format(x)) == x` round-trips
+// and the digit bytes are the same everywhere. `core` stays no-alloc: `format_*`
+// writes into a **caller-provided `[]u8`** and returns the byte count (a 20-byte
+// buffer holds any `i64`/`u64` — up to 19–20 digits plus a sign).
+//
+// Integers only for now; correctly-rounded float parse/format (Eisel–Lemire + Ryū)
+// is the next numerics increment — see CORE-STD-PHASE3.md.
+//
+// Overflow is a *defined* error (`ParseIntError::overflow`), never silent wrap or
+// UB: the signed parser accumulates negatively (`acc*10 - d`) so `i64::MIN` is
+// representable, and checks the bound *before* each step.
+
+pub enum ParseIntError { empty, invalid_digit, overflow }
+
+// Parse a base-10 `i64` with an optional leading `+`/`-`. Locale-free; only ASCII
+// digits. Returns `err(overflow)` rather than wrapping past the `i64` range.
+pub fn parse_i64(s: str) -> Result(i64, ParseIntError) {
+    if s.len == 0 { return err(empty) }
+    var i: usize = 0
+    var neg: bool = false
+    if s[0] == 45 {
+        neg = true
+        i = 1
+    } else {
+        if s[0] == 43 { i = 1 }
+    }
+    if i == s.len { return err(empty) }     // a lone sign is not a number
+    let hi: i64 = 9223372036854775807       // i64::MAX
+    let lo: i64 = (0 - hi) - 1              // i64::MIN, without an out-of-range literal
+    var acc: i64 = 0                        // accumulate **negatively** so MIN fits
+    for i < s.len {
+        let b: u8 = s[i]
+        if b < 48 or b > 57 { return err(invalid_digit) }
+        let d: i64 = (b - 48) as i64
+        if neg {
+            if acc < (lo + d) / 10 { return err(overflow) }
+            acc = acc * 10 - d
+        } else {
+            if acc > (hi - d) / 10 { return err(overflow) }
+            acc = acc * 10 + d
+        }
+        i = i + 1
+    }
+    return ok(acc)
+}
+
+// Parse a base-10 `u64` with an optional leading `+`. A `-` sign is rejected.
+pub fn parse_u64(s: str) -> Result(u64, ParseIntError) {
+    if s.len == 0 { return err(empty) }
+    var i: usize = 0
+    if s[0] == 43 { i = 1 }
+    if i == s.len { return err(empty) }
+    let umax: u64 = 0 - 1                    // u64::MAX (wraps), no huge literal
+    var acc: u64 = 0
+    for i < s.len {
+        let b: u8 = s[i]
+        if b < 48 or b > 57 { return err(invalid_digit) }
+        let d: u64 = (b - 48) as u64
+        if acc > (umax - d) / 10 { return err(overflow) }
+        acc = acc * 10 + d
+        i = i + 1
+    }
+    return ok(acc)
+}
+
+// The number of base-10 digits in a `u64` (`0` has one digit).
+pub fn count_digits_u64(n: u64) -> usize {
+    if n == 0 { return 1 }
+    var c: usize = 0
+    var t: u64 = n
+    for t > 0 {
+        c = c + 1
+        t = t / 10
+    }
+    return c
+}
+
+// Write the decimal digits of a `u64` into `buf` (digits filled back-to-front so a
+// single pass needs no temporary). Returns the count. `buf` must hold ≥ 20 bytes.
+pub fn format_u64(n: u64, mut buf: []u8) -> usize {
+    if n == 0 {
+        buf[0] = 48
+        return 1
+    }
+    let count: usize = count_digits_u64(n)
+    var x: u64 = n
+    var pos: usize = count
+    for x > 0 {
+        pos = pos - 1
+        buf[pos] = (48 + (x % 10)) as u8
+        x = x / 10
+    }
+    return count
+}
+
+// Write the decimal digits of an `i64` (with a leading `-` when negative) into
+// `buf`; returns the byte count. `buf` must hold ≥ 20 bytes. `i64::MIN` is handled
+// via an unsigned magnitude (`0 - (n as u64)`), so it formats without overflow.
+pub fn format_i64(n: i64, mut buf: []u8) -> usize {
+    if n < 0 {
+        buf[0] = 45                         // '-'
+        let mag: u64 = 0 - (n as u64)       // magnitude; correct even for i64::MIN
+        let c: usize = count_digits_u64(mag)
+        var x: u64 = mag
+        var pos: usize = 1 + c
+        for x > 0 {
+            pos = pos - 1
+            buf[pos] = (48 + (x % 10)) as u8
+            x = x / 10
+        }
+        return 1 + c
+    }
+    return format_u64(n as u64, buf)
+}

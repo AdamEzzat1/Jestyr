@@ -1310,6 +1310,66 @@ mod core_props {
         }
     }
 
+    // ── Rust mirrors of core's integer parse/format (same structure as core.jtr) ─
+    /// Mirror of `core.parse_i64`: optional sign, ASCII digits, **negative
+    /// accumulation** (so `i64::MIN` fits) with overflow checked before each step.
+    fn m_parse_i64(s: &str) -> Option<i64> {
+        let b = s.as_bytes();
+        if b.is_empty() {
+            return None;
+        }
+        let (neg, mut i) = match b[0] {
+            b'-' => (true, 1usize),
+            b'+' => (false, 1usize),
+            _ => (false, 0usize),
+        };
+        if i == b.len() {
+            return None;
+        }
+        let mut acc: i64 = 0;
+        while i < b.len() {
+            let c = b[i];
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            let d = (c - b'0') as i64;
+            if neg {
+                if acc < (i64::MIN + d) / 10 {
+                    return None;
+                }
+                acc = acc * 10 - d;
+            } else {
+                if acc > (i64::MAX - d) / 10 {
+                    return None;
+                }
+                acc = acc * 10 + d;
+            }
+            i += 1;
+        }
+        Some(acc)
+    }
+
+    /// Mirror of `core.format_i64`: sign + magnitude (`0u64.wrapping_sub` handles
+    /// `i64::MIN`), digits emitted back-to-front.
+    fn m_format_i64(n: i64) -> String {
+        if n == 0 {
+            return "0".to_string();
+        }
+        let (sign, mag) = if n < 0 {
+            ("-", 0u64.wrapping_sub(n as u64))
+        } else {
+            ("", n as u64)
+        };
+        let mut digits: Vec<u8> = Vec::new();
+        let mut x = mag;
+        while x > 0 {
+            digits.push(b'0' + (x % 10) as u8);
+            x /= 10;
+        }
+        digits.reverse();
+        format!("{sign}{}", std::str::from_utf8(&digits).unwrap())
+    }
+
     /// A self-contained generic slice-fold program at element type `prim` — the real
     /// compiler path the slice algorithms ride (subst through the for-loop / index).
     fn slice_fold_source(prim: &str) -> String {
@@ -1468,6 +1528,40 @@ mod core_props {
                     prop_assert!(w[0].1 < w[1].1, "equal keys keep input order");
                 }
             }
+        }
+
+        // ── number parse / format laws (the determinism deliverable, int side) ──
+
+        /// The fundamental round-trip: `parse(format(x)) == x` for every `i64`.
+        #[test]
+        fn int_parse_format_roundtrips(x in any::<i64>()) {
+            prop_assert_eq!(m_parse_i64(&m_format_i64(x)), Some(x));
+        }
+
+        /// `format_i64` is byte-identical to Rust's shortest decimal (`Display`) —
+        /// locale-free and deterministic by construction.
+        #[test]
+        fn format_i64_matches_display(x in any::<i64>()) {
+            prop_assert_eq!(m_format_i64(x), format!("{x}"));
+        }
+
+        /// Differential parse: on arbitrary sign/digit/letter soup, `parse_i64`
+        /// agrees with Rust's correctly-implemented `str::parse::<i64>()` — same
+        /// successes (incl. overflow → error) and same values.
+        #[test]
+        fn parse_i64_matches_rust(s in "[-+0-9a-f]{0,22}") {
+            prop_assert_eq!(m_parse_i64(&s), s.parse::<i64>().ok());
+        }
+
+        /// Overflow is a *defined* error, never a wrap: one past `i64::MAX`/`MIN` and
+        /// the obviously-too-long string all fail to parse.
+        #[test]
+        fn parse_i64_overflow_is_defined(_ in 0u8..1) {
+            prop_assert_eq!(m_parse_i64("9223372036854775807"), Some(i64::MAX));
+            prop_assert_eq!(m_parse_i64("9223372036854775808"), None);
+            prop_assert_eq!(m_parse_i64("-9223372036854775808"), Some(i64::MIN));
+            prop_assert_eq!(m_parse_i64("-9223372036854775809"), None);
+            prop_assert_eq!(m_parse_i64("99999999999999999999"), None);
         }
     }
 }

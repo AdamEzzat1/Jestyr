@@ -486,17 +486,29 @@ the runtime side pinned by an end-to-end example and `cgen` goldens.
   **zero diagnostics** and **byte-identically** for every integer element type — the real
   compiler path the combinators ride (`core_option_combinator_compiles_clean_for_any_int_type`,
   `core_option_combinator_is_deterministic`).
+- ✅ **Slice-index assignment lowering.** `buf[i] = v` now lowers to a bounds-checked **lvalue**
+  assignment through the element pointer (`_s.ptr[_ix] = v`), not the rvalue statement-expression an
+  `Index` *read* produces — which is what lets the integer formatter write digits into a caller
+  `[]u8`. Golden `slice_index_assignment_lowers_to_an_lvalue`; teeth-verified.
+- ✅ **Number parse / format — the determinism deliverable (integer side).** Locale-free,
+  bytewise, deterministic by construction: `parse_i64`/`parse_u64` from a `str` (overflow is a
+  *defined* `ParseIntError`, never a silent wrap — the signed parser accumulates negatively so
+  `i64::MIN` is representable) and `format_i64`/`format_u64` into a caller `[]u8` (no allocation).
+  Laws as oracles (`core_props`, against a Rust mirror of the same algorithm): `parse(format(x)) == x`
+  for every `i64` (round-trip); `format_i64(x)` byte-identical to Rust's `Display`; differential
+  `parse_i64` vs `str::parse::<i64>()` on sign/digit/letter soup (same successes incl. overflow, same
+  values); and the defined-overflow boundaries (`i64::MAX`±1, `i64::MIN`±1).
 - ✅ **Wiring.** `module::core_combinators_example_compiles_clean` +
-  `slice_algos_example_compiles_clean`. gcc round-trips:
+  `slice_algos_example_compiles_clean` + `numbers_example_compiles_clean`. gcc round-trips:
   `jestyrc run examples/std/combinators.jtr` →
-  `1, 20, 7, 42, 21, 22, 99, 0, 40, 20, 21, 7, 21, 20, 20, 7, 40` (the `22` is functor
-  composition; the `21`/`20` pair is monad left/right identity); and
-  `jestyrc run examples/std/slice_algos.jtr` →
-  `100, 2, 1, 0, 2, 99, [10 20 30 40 50], 3, 99` (reduce/search, then the sorted slice, then
-  binary search).
-- **Remaining (future work):** defined-overflow math (`wrapping_*`/`saturating_*`/`checked_*`);
-  correctly-rounded deterministic number parse/format + the cross-OS canary; the allocating `std`
-  (Phase 2). See `CORE-STD-PHASE3.md`.
+  `1, 20, 7, 42, 21, 22, 99, 0, 40, 20, 21, 7, 21, 20, 20, 7, 40` (functor composition `22`; monad
+  identity `21`/`20`); `jestyrc run examples/std/slice_algos.jtr` →
+  `100, 2, 1, 0, 2, 99, [10 20 30 40 50], 3, 99`; and `jestyrc run examples/std/numbers.jtr` →
+  `12345, -42, 7, 9, -4271, -4271, 3` (parse, overflow/invalid → default, format, then a
+  format→parse round-trip).
+- **Remaining (future work):** **correctly-rounded float** parse/format (Eisel–Lemire + Ryū) + the
+  cross-OS locked-SHA-256 canary; defined-overflow integer math (`wrapping_*`/`saturating_*`/
+  `checked_*`); the allocating `std` (Phase 2). See `CORE-STD-PHASE3.md`.
 
 ---
 

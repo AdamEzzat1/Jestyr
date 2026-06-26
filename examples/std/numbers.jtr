@@ -1,0 +1,46 @@
+// examples/std/numbers.jtr — locale-free, deterministic integer parse/format.
+//
+// `core` parses base-10 integers from a `str` (overflow is a *defined* error, not a
+// silent wrap) and formats them into a caller-provided `[]u8` (no allocation). The
+// two are inverses: `parse(format(x)) == x`, byte-for-byte the same on every
+// platform — the std side of the numerics determinism contract.
+//
+//   jestyrc run examples/std/numbers.jtr
+//   →  12345      (parse "12345")
+//      -42        (parse "-42")
+//      7          (parse "9999999999999999999" overflows -> err -> default 7)
+//      9          (parse "12x" invalid digit -> err -> default 9)
+//      -4271      (format_i64(-4271) printed from the buffer)
+//      -4271      (round-trip: parse(format(-4271)))
+//      3          (format_i64 wrote 3 bytes for 705 -> "705")
+
+import "core"
+import "io"
+
+fn uo(take r: Result(i64, ParseIntError), take d: i64) -> i64 {
+    match r { ok(v) => v, err(e) => d }
+}
+
+fn main() -> i32 {
+    io.print_i32(uo(core.parse_i64("12345"), 0) as i32)                       // 12345
+    io.print_i32(uo(core.parse_i64("-42"), 0) as i32)                        // -42
+    io.print_i32(uo(core.parse_i64("9999999999999999999"), 7) as i32)        // 7  (overflow)
+    io.print_i32(uo(core.parse_i64("12x"), 9) as i32)                        // 9  (invalid)
+
+    // Format into a caller buffer, view the written bytes as a `str`, print it.
+    var buf: *mut u8 = alloc(u8, 24)
+    var b: []u8 = slice(u8, buf, 24)
+
+    let n1: usize = core.format_i64(-4271, b)
+    let v1: []u8 = slice(u8, buf, n1)
+    io.print_line(from_utf8(v1))                                              // -4271
+
+    // Round-trip: parse the very bytes we just formatted.
+    io.print_i32(uo(core.parse_i64(from_utf8(v1)), 0) as i32)                 // -4271
+
+    let n2: usize = core.format_i64(705, b)
+    io.print_i32(n2 as i32)                                                   // 3
+
+    free_ptr(buf)
+    return 0
+}

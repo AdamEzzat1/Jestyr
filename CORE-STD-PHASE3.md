@@ -15,9 +15,9 @@ teeth-verifies each new property by mutation, and is auto-committed.
 
 ## Achieved
 
-Several green, warning-clean, auto-committed increments. **468 tests pass** under
+Several green, warning-clean, auto-committed increments. **474 tests pass** under
 the default `cargo test` (from a 445 baseline: the codegen enablers' goldens, the
-combinator/slice `core_props` laws, and the wiring tests).
+combinator/slice/number `core_props` laws, and the wiring tests).
 
 ### Reframing what `core`'s "trait surface" actually is
 
@@ -124,6 +124,29 @@ producers like `map`/`filter` that build a new sequence are the allocating `std`
   `any`/`all` match the reference; **sort invariants** — sorted permutation,
   deterministic, and **stable** (equal keys keep input order).
 
+### Number parse / format — the determinism deliverable (integer side)
+
+Locale-free, bytewise, deterministic *by construction* (decimal, ASCII `0`–`9`, no
+locale, no rounding modes) — so the digit bytes are identical on every platform.
+`core` stays no-alloc: `format_*` writes into a **caller `[]u8`** and returns the
+byte count.
+
+- `parse_i64`/`parse_u64` (optional sign; overflow is a **defined**
+  `ParseIntError::overflow`, never a silent wrap — the signed parser accumulates
+  *negatively*, `acc*10 - d`, so `i64::MIN` is representable and the bound is
+  checked before each step) and `format_i64`/`format_u64` (digits written
+  back-to-front in one pass; `i64::MIN` formatted via an unsigned magnitude).
+- This needed a codegen fix: **slice-index assignment** (`buf[i] = v`) now lowers
+  to a bounds-checked *lvalue* (`_s.ptr[_ix] = v`), not the rvalue
+  statement-expression an `Index` read produces. Golden
+  `slice_index_assignment_lowers_to_an_lvalue`; teeth-verified.
+- Laws as oracles (`core_props`, against a Rust mirror of the same algorithm):
+  `parse(format(x)) == x` for every `i64`; `format_i64(x)` byte-identical to Rust's
+  `Display`; differential `parse_i64` vs `str::parse::<i64>()` on arbitrary
+  sign/digit/letter input; and the defined-overflow boundaries. End-to-end
+  format→parse round-trip in `examples/std/numbers.jtr` (via `from_utf8` over the
+  written bytes).
+
 ### Determinism guarantees realized
 
 - **Combinator lowering is deterministic** — byte-identical C twice, for any
@@ -167,16 +190,22 @@ Honest accounting of what is stubbed, deferred, or only partially covered.
 - **`Iterator` / `FromStr` traits are not built.** They need compiler features
   (associated types; static/UFCS dispatch). Slice/iterator algorithms will land as
   **generic free functions over `[]T`** instead of a trait, until then.
-- **Number parse/format not started.** The marquee determinism deliverable
-  (correctly-rounded, locale-free `parse_int`/`parse_float`, shortest-round-trip
-  `format_*`, the cross-OS canary) is future work — see below.
+- **Float parse/format not started.** Integer parse/format is done; the
+  **correctly-rounded float** half (Eisel–Lemire parse + Ryū shortest-round-trip
+  format) and the **cross-OS locked-SHA-256 canary** are the remaining marquee
+  determinism work — a multi-increment algorithm port (128-bit intermediate math)
+  likely to surface compiler gaps to fix along the way.
+- **Format needs a caller buffer (no `Display`/`Builder` sugar).**
+  `format_i64(n, buf)` returns a byte count into a `[]u8`; viewing it as a `str`
+  needs an exact-length `slice(u8, p, n)` + `from_utf8` (range sub-slicing `buf[0..n]`
+  on a `[]T` isn't supported in cgen yet — only on `str`).
 - **No allocating `std` (Phase 2).** Vec/deterministic-map/String over the
   allocator-as-value are gated on the Drop/allocator session and not begun here.
 - **No gcc-in-`cargo test` harness.** Runtime behavior is verified by running the
   example and pinning its output (plus `cgen` goldens on emitted C); the property
   layer asserts on emitted C / a Rust mirror, never compiling the C. (Same posture
-  as the Drop/alloc workstream; the `--features c-oracle` harness is shared future
-  work — `DROP-ALLOC-PHASE3.md` future item 3.)
+  as the Drop/alloc workstream; the `--features c-oracle` harness — needed for the
+  cross-OS canary — is shared future work, `DROP-ALLOC-PHASE3.md` future item 3.)
 
 ---
 
@@ -190,6 +219,9 @@ In rough priority order toward a usable `core` and self-hosting:
    laws + sort invariants as oracles. (Producers `map`/`filter`/`zip`/`enumerate`
    that build a new sequence — and `map_into` over a caller buffer — remain, the
    former gated on the allocating `std`.)
+2b. ✅ **Done — integer parse/format** (`parse_i64`/`parse_u64`/`format_i64`/
+   `format_u64`) with round-trip + differential-vs-Rust + defined-overflow laws.
+   The slice-index-assignment lvalue lowering landed with it.
 3. **Math with defined semantics** (ROADMAP J): `wrapping_*`/`saturating_*`/
    `checked_*`, bit-width-aware, with the overflow behavior pinned by property.
 4. **Number parse/format — the determinism deliverable.** Correctly-rounded,

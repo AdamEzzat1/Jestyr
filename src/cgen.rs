@@ -3321,6 +3321,30 @@ impl<'a> Cgen<'a> {
                 format!("({l} {} {r})", binop_c(*op))
             }
             ExprKind::Assign { op, target, value } => {
+                // A slice-index target (`s[i] = v`) needs an *lvalue* — but `emit_expr`
+                // on an `Index` yields the bounds-checked *statement-expression*
+                // (an rvalue). Emit the bounds check then assign through the element
+                // pointer. (The slice is spilled to a temp so a side-effecting base is
+                // evaluated once; copying the `{ptr,len}` view still writes the buffer.)
+                if let ExprKind::Index { base, index } = &self.ast.expr_at(*target).kind {
+                    let bt = apply_subst(&self.info.type_of(*base).clone(), &self.subst);
+                    if matches!(bt, Ty::Slice(_)) {
+                        let aop = assign_c(*op);
+                        let proven = self.index_in_range(*base, *index);
+                        let b = self.emit_expr(*base);
+                        let i = self.emit_expr(*index);
+                        let v = self.emit_expr(*value);
+                        if proven {
+                            return format!("({b}).ptr[({i})] {aop} {v}");
+                        }
+                        let sty = self.c_type(&bt);
+                        let n = self.tmp;
+                        self.tmp += 1;
+                        return format!(
+                            "({{ {sty} _s{n} = ({b}); size_t _ix{n} = (size_t)({i}); assert(_ix{n} < _s{n}.len); _s{n}.ptr[_ix{n}] {aop} {v}; }})"
+                        );
+                    }
+                }
                 let t = self.emit_expr(*target);
                 let v = self.emit_expr(*value);
                 format!("{t} {} {v}", assign_c(*op))
@@ -8782,6 +8806,18 @@ mod tests {
         let fnp = c.find("(*JestyrFn_fn_di32_ret_Option__i32)")
             .expect(&format!("fn-pointer typedef returning the instance: {c}"));
         assert!(fwd < fnp, "the instance must be forward-declared before the fn-pointer typedef: {c}");
+    }
+
+    #[test]
+    fn slice_index_assignment_lowers_to_an_lvalue() {
+        // `buf[i] = v` must lower to a bounds-checked *lvalue* assignment through the
+        // element pointer (`_s.ptr[_ix] = v`), not the rvalue statement-expression
+        // `emit_expr` produces for an `Index` read (which is not assignable). This is
+        // what lets the integer formatter write digits into a caller `[]u8`.
+        let (c, d) = gen("fn setb(mut s: []u8, v: u8) { s[0] = v }");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains(".ptr[_ix0] = j_v"), "lvalue element assignment: {c}");
+        assert!(c.contains("assert(_ix0 < "), "with a bounds check: {c}");
     }
 
     #[test]

@@ -438,6 +438,14 @@ mod tests {
     }
 
     #[test]
+    fn numbers_example_compiles_clean() {
+        // The core integer parse/format (parse_i64/parse_u64/format_i64/format_u64)
+        // resolve across `import "core"` and lower clean — including the slice-index
+        // assignment (`buf[i] = …`) the formatter writes through.
+        pipeline_is_clean("examples/std/numbers.jtr");
+    }
+
+    #[test]
     fn loops_example_compiles_clean() {
         // Every MVP loop form + `invariant` + bounds-check elision.
         pipeline_is_clean("examples/loops.jtr");
