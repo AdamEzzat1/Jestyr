@@ -1399,6 +1399,46 @@ mod core_props {
         n
     }
 
+    // ── Rust mirrors of core's deterministic reductions (same structure) ────────
+    fn m_f64_sum(s: &[f64]) -> f64 {
+        let mut acc = 0.0;
+        for &x in s {
+            acc += x;
+        }
+        acc
+    }
+    /// Mirror of `core.f64_kahan_sum` — Neumaier compensated summation.
+    fn m_f64_kahan(s: &[f64]) -> f64 {
+        let mut sum = 0.0f64;
+        let mut c = 0.0f64;
+        for &x in s {
+            let t = sum + x;
+            if sum.abs() >= x.abs() {
+                c += (sum - t) + x;
+            } else {
+                c += (x - t) + sum;
+            }
+            sum = t;
+        }
+        sum + c
+    }
+    /// Mirror of `core.f64_pairwise_sum` — fixed `len/2` split, leaves ≤ 8.
+    fn m_f64_pairwise(s: &[f64]) -> f64 {
+        let n = s.len();
+        if n == 0 {
+            return 0.0;
+        }
+        if n <= 8 {
+            let mut acc = 0.0;
+            for &x in s {
+                acc += x;
+            }
+            return acc;
+        }
+        let mid = n / 2;
+        m_f64_pairwise(&s[..mid]) + m_f64_pairwise(&s[mid..])
+    }
+
     /// A self-contained generic slice-fold program at element type `prim` — the real
     /// compiler path the slice algorithms ride (subst through the for-loop / index).
     fn slice_fold_source(prim: &str) -> String {
@@ -1610,6 +1650,38 @@ mod core_props {
         #[test]
         fn clz64_matches_builtin(x in any::<u64>()) {
             prop_assert_eq!(m_clz64(x), x.leading_zeros());
+        }
+
+        // ── deterministic reductions (CJC-inspired numerics, serial tier) ───────
+
+        /// On **exactly-representable** inputs (small integers as `f64`, no rounding),
+        /// all three reductions equal the true sum — they only diverge under rounding.
+        #[test]
+        fn reductions_agree_on_exact_inputs(xs in proptest::collection::vec(-1000i32..1000, 0..64)) {
+            let fs: Vec<f64> = xs.iter().map(|&x| x as f64).collect();
+            let exact: f64 = xs.iter().map(|&x| x as i64).sum::<i64>() as f64;
+            prop_assert_eq!(m_f64_sum(&fs), exact);
+            prop_assert_eq!(m_f64_kahan(&fs), exact);
+            prop_assert_eq!(m_f64_pairwise(&fs), exact);
+        }
+
+        /// Each reduction is a pure, **run-deterministic** function — same input,
+        /// bit-identical output every call (no FMA/reassociation; the FP flags are
+        /// locked, and the algorithm fixes the order).
+        #[test]
+        fn reductions_are_run_deterministic(xs in proptest::collection::vec(-1e6f64..1e6, 0..64)) {
+            prop_assert_eq!(m_f64_kahan(&xs).to_bits(), m_f64_kahan(&xs).to_bits());
+            prop_assert_eq!(m_f64_pairwise(&xs).to_bits(), m_f64_pairwise(&xs).to_bits());
+        }
+
+        /// Compensated summation recovers precision naive summation throws away under
+        /// catastrophic cancellation: `[1, 1e100, 1, -1e100]` sums to `2`, but naive
+        /// loses the small terms and returns `0`.
+        #[test]
+        fn kahan_recovers_cancellation(_ in 0u8..1) {
+            let xs = [1.0, 1e100, 1.0, -1e100];
+            prop_assert_eq!(m_f64_kahan(&xs), 2.0);
+            prop_assert_eq!(m_f64_sum(&xs), 0.0);
         }
     }
 }

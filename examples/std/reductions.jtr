@@ -1,0 +1,36 @@
+// examples/std/reductions.jtr — deterministic f64 reductions in `core` (CJC-inspired
+// numerics, serial tier). All three are run/platform-deterministic (the locked FP
+// flags forbid FMA/reassociation); Neumaier compensated summation recovers the
+// low-order bits naive summation throws away under catastrophic cancellation.
+//
+//   jestyrc run examples/std/reductions.jtr
+//   →  10  10  10        (a plain sum: naive == kahan == pairwise)
+//      0   2   0         (cancellation [1, 1e100, 1, -1e100]: only Kahan recovers the 2)
+import "core"
+import "io"
+
+fn setf(p: *mut f64, i: i32, v: f64) { unsafe { (p + i).* = v } }
+
+fn main() -> i32 {
+    var b: *mut f64 = alloc(f64, 4)
+
+    setf(b, 0, 1.0)
+    setf(b, 1, 2.0)
+    setf(b, 2, 3.0)
+    setf(b, 3, 4.0)
+    var s: []f64 = slice(f64, b, 4)
+    io.print_f64(core.f64_sum(s))            // 10
+    io.print_f64(core.f64_kahan_sum(s))      // 10
+    io.print_f64(core.f64_pairwise_sum(s))   // 10
+
+    setf(b, 0, 1.0)
+    setf(b, 1, 1.0e100)
+    setf(b, 2, 1.0)
+    setf(b, 3, 0.0 - 1.0e100)
+    io.print_f64(core.f64_sum(s))            // 0  (the small terms are lost)
+    io.print_f64(core.f64_kahan_sum(s))      // 2  (compensation recovers them)
+    io.print_f64(core.f64_pairwise_sum(s))   // 0
+
+    free_ptr(b)
+    return 0
+}

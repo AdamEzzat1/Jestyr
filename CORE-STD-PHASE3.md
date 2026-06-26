@@ -15,9 +15,10 @@ teeth-verifies each new property by mutation, and is auto-committed.
 
 ## Achieved
 
-Several green, warning-clean, auto-committed increments. **477 tests pass** under
+Several green, warning-clean, auto-committed increments. **482 tests pass** under
 the default `cargo test` (from a 445 baseline: the codegen enablers' goldens, the
-combinator/slice/number/float-primitive `core_props` laws, and the wiring tests).
+combinator/slice/number/float-primitive/reduction `core_props` laws, the FP-flag
+lock, and the wiring tests).
 
 ### Reframing what `core`'s "trait surface" actually is
 
@@ -165,6 +166,25 @@ directions.
   validated); `clz64_matches_builtin` vs `u64::leading_zeros`. Demo
   `examples/std/float_bits.jtr` → `3.14159, 1023, 0, 1, 51, 63`.
 
+### Numerics — the FP determinism contract + deterministic reductions (CJC-inspired)
+
+The first slice of the numerics workstream (`Jestyr-Remaining-And-Numerics-Research.md`
+Part 3), keeping CJC's *Determinism first* order while raising speed.
+
+- **Step 0 — the FP-codegen determinism seam, locked.** `CC_FLAGS` (in `main.rs`)
+  pins `-ffp-contract=off -fno-fast-math` for every translation unit, so an `f64`
+  reduction computes identical bits on every platform (no FMA fusion of `a*b+c`, no
+  reassociation). This is the seam CJC never faced — for CJC the no-FMA rule was a
+  *runtime* policy; for Jestyr it is a *codegen* obligation, now a checked invariant
+  (`fp_determinism_flags_are_locked`, teeth-checkable).
+- **Deterministic reductions (serial tier).** `f64_sum` (naive), `f64_kahan_sum`
+  (Neumaier compensated — recovers the bits naive drops under cancellation),
+  `f64_pairwise_sum` (fixed `len/2` split, O(log n) error). All run/platform-
+  deterministic under the locked flags. Laws (`core_props`, Rust mirrors): the three
+  agree with the exact sum on exactly-representable inputs; each is run-deterministic;
+  Kahan recovers `[1, 1e100, 1, -1e100] → 2` where naive gives `0`. Demo
+  `examples/std/reductions.jtr` → `10 10 10 | 0 2 0`.
+
 ### Determinism guarantees realized
 
 - **Combinator lowering is deterministic** — byte-identical C twice, for any
@@ -243,6 +263,18 @@ In rough priority order toward a usable `core` and self-hosting:
 2c. ✅ **Done — float-support primitives** (`mul64` 64×64→128, `clz64`, IEEE-754 bit
    access) with `mul64_matches_u128` validating the no-`u128` synthesis. The probe
    confirmed the float port is feasible.
+2d. ✅ **Done — numerics Step 0 (FP contract) + deterministic serial reductions**
+   (`f64_sum`/`f64_kahan_sum`/`f64_pairwise_sum`). See the numerics section above.
+2e. **Binned superaccumulator — the chunk-count-independent reduction (the numerics
+   headline).** 2048 exponent bins, 2Sum merge, ascending finalize → a parallel sum
+   bit-identical regardless of thread/chunk count (numerics research §3.6). **Gated
+   on a compiler feature this session surfaced: fixed-size arrays (`[N]T`).** Jestyr
+   has no stack arrays today (`[16]u8` is a parse error), so the doc's "2048
+   stack-allocated bins, zero heap" needs `[N]T` (parse `[N]T` + literals `[v; N]`/
+   `[a, b, …]` + indexing + C `T a[N]` codegen) — a worthwhile general feature — *or*
+   an interim heap-allocated bin buffer. The correctly-rounded *finalize*
+   (big-fixed-point → nearest `f64`) is the other non-trivial piece. This is the
+   recommended next numerics step, after `[N]T`.
 3. **Correctly-rounded float parse/format — the marquee determinism deliverable.**
    Now that the primitives exist: Eisel–Lemire `parse_float` and Ryū
    shortest-round-trip `format_float` into a caller buffer (`core` stays no-alloc),

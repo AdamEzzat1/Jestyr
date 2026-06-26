@@ -438,6 +438,14 @@ mod tests {
     }
 
     #[test]
+    fn reductions_example_compiles_clean() {
+        // The deterministic f64 reductions (naive/Neumaier-Kahan/pairwise) resolve
+        // across `import "core"` and lower clean — the serial tier of CJC-inspired
+        // numerics, run/platform-deterministic under the locked FP flags.
+        pipeline_is_clean("examples/std/reductions.jtr");
+    }
+
+    #[test]
     fn float_bits_example_compiles_clean() {
         // The float-support primitives in `core` — IEEE-754 bit access via an
         // untagged union, the field extractors, and `clz64` — resolve across

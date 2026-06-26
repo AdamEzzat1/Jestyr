@@ -403,3 +403,71 @@ pub fn f64_from_bits(u: u64) -> f64 {
 pub fn f64_sign(x: f64) -> u64 { return f64_bits(x) >> 63 }
 pub fn f64_raw_exp(x: f64) -> u64 { return (f64_bits(x) >> 52) & 0x7FF }
 pub fn f64_mantissa(x: f64) -> u64 { return f64_bits(x) & 0xFFFFFFFFFFFFF }
+
+pub fn abs_f64(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// ── Deterministic reductions (CJC-inspired numerics, serial tier) ─────────────
+//
+// The serial tiers of CJC's tiered reductions (§3.2 of the numerics research):
+// `f64_sum` is the naive baseline; `f64_kahan_sum` is **Neumaier compensated**
+// summation (tracks the low-order bits the running sum drops, robust whether the
+// next term is larger or smaller than the sum); `f64_pairwise_sum` reduces with a
+// fixed `len/2` split (a balanced tree → O(log n) error growth vs naive's O(n)).
+//
+// All three are *run-deterministic* (same input → bit-identical output, every run
+// and platform — the locked FP flags guarantee no FMA/reassociation) and exact in
+// codegen shape. They are **not yet chunk-count-independent**: that headline
+// property is the binned superaccumulator, which needs fixed-size arrays for its
+// 2048 stack-allocated bins — see CORE-STD-PHASE3.md / the numerics research §3.6.
+
+// Naive left-to-right sum — the O(n)-error baseline the others improve on.
+pub fn f64_sum(read s: []f64) -> f64 {
+    var acc: f64 = 0.0
+    for x in s { acc = acc + x }
+    return acc
+}
+
+// Neumaier compensated sum: `c` accumulates the bits lost at each step, added back
+// at the end. Recovers precision naive summation throws away (e.g. a tiny term
+// added to a huge running sum), at ~4 flops/element and zero allocation.
+pub fn f64_kahan_sum(read s: []f64) -> f64 {
+    var sum: f64 = 0.0
+    var c: f64 = 0.0
+    for x in s {
+        let t: f64 = sum + x
+        if abs_f64(sum) >= abs_f64(x) {
+            c = c + ((sum - t) + x)     // sum is larger → low bits of x are lost
+        } else {
+            c = c + ((x - t) + sum)     // x is larger → low bits of sum are lost
+        }
+        sum = t
+    }
+    return sum + c
+}
+
+// Sum `s[lo..hi]` by a fixed balanced split — the recursive core of pairwise sum.
+// The split rule (`mid = lo + n/2`, leaves of ≤ 8) is fixed, so the reduction tree
+// (and thus the result) is determined by the slice alone.
+pub fn f64_pairwise_range(read s: []f64, lo: usize, hi: usize) -> f64 {
+    let n: usize = hi - lo
+    if n == 0 { return 0.0 }
+    if n <= 8 {
+        var acc: f64 = 0.0
+        var i: usize = lo
+        for i < hi {
+            acc = acc + s[i]
+            i = i + 1
+        }
+        return acc
+    }
+    let mid: usize = lo + n / 2
+    return f64_pairwise_range(s, lo, mid) + f64_pairwise_range(s, mid, hi)
+}
+
+// Pairwise (cascade) sum: a balanced reduction tree, O(log n) error growth.
+pub fn f64_pairwise_sum(read s: []f64) -> f64 {
+    return f64_pairwise_range(s, 0, s.len)
+}

@@ -506,6 +506,20 @@ the runtime side pinned by an end-to-end example and `cgen` goldens.
   synthesized product equals Rust's native `u128` for any operands (the crux); `clz64_matches_builtin`
   vs `u64::leading_zeros`. Wiring `module::float_bits_example_compiles_clean`; gcc round-trip
   `examples/std/float_bits.jtr` → `3.14159, 1023, 0, 1, 51, 63`.
+- ✅ **FP-codegen determinism contract (numerics Step 0).** The floating-point compile flags are
+  *locked into the build command*, not hoped for: `CC_FLAGS = -O2 -std=c11 -ffp-contract=off
+  -fno-fast-math` (no FMA fusion of `a*b+c`; no reassociation/value-changing transforms). Test
+  `main::fp_contract_tests::fp_determinism_flags_are_locked` (teeth-checkable; the difference between
+  deterministic and usually-deterministic FP — numerics research §3.3).
+- ✅ **Deterministic reductions (CJC-inspired numerics, serial tier).** `f64_sum` (naive baseline),
+  `f64_kahan_sum` (**Neumaier** compensated — recovers the low-order bits naive throws away under
+  cancellation), `f64_pairwise_sum` (fixed `len/2` split → O(log n) error). All run/platform-
+  deterministic under the locked flags. Properties (`core_props`, Rust mirrors): all three equal the
+  true sum on exactly-representable inputs (`reductions_agree_on_exact_inputs`); each is
+  run-deterministic; Kahan recovers `[1, 1e100, 1, -1e100] → 2` where naive returns `0`. Wiring
+  `reductions_example_compiles_clean`; gcc round-trip `examples/std/reductions.jtr` →
+  `10 10 10 | 0 2 0`. (Chunk-count-independent reproducibility — the binned superaccumulator — is the
+  next numerics increment; it needs fixed-size arrays for its 2048 stack bins.)
 - ✅ **Wiring.** `module::core_combinators_example_compiles_clean` +
   `slice_algos_example_compiles_clean` + `numbers_example_compiles_clean`. gcc round-trips:
   `jestyrc run examples/std/combinators.jtr` →
