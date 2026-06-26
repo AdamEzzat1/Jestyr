@@ -391,11 +391,24 @@ so they run under the toolchain-free default `cargo test`.
   heap alloc / region; accepts a clean body; per-function, not inherited); property `alloc_props` —
   soundness **and** completeness against an independent oracle (rejected *iff* it allocates, no false
   positives). **Teeth:** neutering `is_alloc_intrinsic` fails the rejection tests, then passes on revert.
-- **Remaining (future work):** `defer`/`errdefer`; the fn-pointer-vtable `Allocator` value (retiring the
-  enum stand-in in `std/mem.jtr`); `Layout { size, align }`; an allocator-parameterized `Vec(T, A)`
-  end-to-end with a leak-catching debug allocator (the `--features c-oracle` gcc-round-trip exit
-  criterion); `@deterministic` allocators; linear / must-use types; conditional (per-branch) move
-  precision; transitive `@no_alloc` (calls-a-function-that-allocates closure). See `DROP-ALLOC-PHASE3.md`.
+- ✅ **fn-pointer-vtable `Allocator` + `Layout` (Increment 5).** Zig's `std.mem.Allocator` shape as a
+  real value (opaque `ctx` + thin `alloc_fn`/`free_fn` pointers), retiring the enum stand-in. One path
+  (`alloc_n`/`free_n`) runs over any allocator: `a.alloc_fn(a.ctx, layout)` lowers to an **indirect**
+  call, not a bare malloc. Golden `allocator_value_routes_through_the_vtable_not_bare_malloc`; gcc
+  round-trip `examples/alloc_vtable.jtr` (`10/20/30/40`, system + arena over one path).
+- ✅ **Take-vs-borrow move precision (Increment 5).** `collect_moved` moves a call argument **only** at a
+  `take` parameter; a `read`/`mut`/`out` borrow does not — so a droppable mutated via `mut` methods
+  still drops once. Goldens `mut_borrowed_droppable_still_drops_at_scope_exit` /
+  `taken_droppable_is_not_dropped_by_caller`; property `borrow_passed_droppable_still_drops_once`.
+  **Teeth:** reverting to "all args move" fails the seam tests, then passes on revert.
+- ✅ **Allocator-parameterized `Vec`, freed by RAII (Increment 6).** `IntVec` stores its `Allocator`,
+  grows via the vtable, and `Drop` frees the buffer at scope exit *through the stored allocator* — the
+  integration forcing function. gcc round-trip `examples/vec_alloc.jtr` (`5/10/50/99`, then auto-free).
+- **Remaining (future work):** `defer`/`errdefer`; generic `Vec(T, A)` (needs generic-struct `Drop`
+  monomorphization) + porting `std/mem.jtr`/`std/list.jtr` off the enum; owned (`take`) parameter drop;
+  a leak-catching debug allocator (the `--features c-oracle` gcc-round-trip exit criterion);
+  `@deterministic` allocators; linear / must-use types; conditional (per-branch) move precision;
+  transitive `@no_alloc`. See `DROP-ALLOC-PHASE3.md`.
 
 ---
 

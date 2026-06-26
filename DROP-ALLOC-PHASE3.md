@@ -16,8 +16,8 @@ main remaining piece.
 
 ## Achieved
 
-Five green, warning-clean, auto-committed increments. **434 tests pass** under the
-default toolchain-free `cargo test` (up from 413 at the start: +21 unit/property/fuzz).
+Seven green, warning-clean, auto-committed increments. **438 tests pass** under the
+default toolchain-free `cargo test` (up from 413 at the start: +25 unit/property/fuzz).
 
 ### Drop / RAII
 
@@ -68,6 +68,29 @@ default toolchain-free `cargo test` (up from 413 at the start: +21 unit/property
   The diagnostic fires at `jestyrc check` time, before any C is emitted. Gold for
   real-time / embedded / kernel paths. `@deterministic` is **registered (reserved)**
   in `attrs.rs` for the allocator-determinism contract.
+- **The fn-pointer-vtable `Allocator` value + `Layout` (Increment 5).** Zig's
+  `std.mem.Allocator` shape as a real first-class value, retiring the enum-dispatch
+  stand-in: an `Allocator` is an opaque `ctx: *mut u8` plus a vtable of thin function
+  pointers (`alloc_fn`/`free_fn`), with `Layout { size, align }` carrying the request.
+  **One** user-facing path (`alloc_n`/`free_n`) runs over *any* allocator —
+  `a.alloc_fn(a.ctx, layout)` lowers to a genuine **indirect call**, not a bare
+  `malloc`. [`examples/alloc_vtable.jtr`](examples/alloc_vtable.jtr) drives the same
+  path with two strategies (system/malloc and a bump arena) → `10, 20, 30, 40`.
+  This reuses the existing fn-pointer-type machinery; no parallel dispatch was invented.
+- **Allocator-parameterized `Vec`, freed by RAII (Increment 6) — the integration
+  forcing function.** `IntVec` *stores* its `Allocator` value (Rust's `Vec<T, A>`),
+  grows its buffer through that allocator's vtable, and its `Drop` impl frees the
+  buffer **at scope exit, through the very allocator it was allocated from** — no
+  manual free. [`examples/vec_alloc.jtr`](examples/vec_alloc.jtr) →
+  `5, 10, 50, 99` then `v` drops. This exercises every Phase-3 seam at once: the
+  vtable allocator, scope-exit drop glue, the **take-vs-borrow** move analysis (the
+  vector is mutated via `mut`-borrow `push` calls yet still drops exactly once), and
+  `@copy` on the cheap allocator handle so a collection may store it without escape.
+- **Take-vs-borrow move precision (Increment 5).** `cgen::collect_moved` treats a call
+  argument as a move **only when its parameter is `take`** (resolving the callee's
+  `FnDecl`); a `read`/`mut`/`out` borrow does not move, so a droppable handed to a
+  borrowing method still drops at scope exit. Generic callees stay conservative (their
+  comptime type-args occupy argument slots) — leak-safe.
 - **Static leak prevention is already real.** The escape checker's ownership/region
   proof statically kills a whole class of leaks/escapes; `@no_alloc` adds a checkable
   "this path allocates nothing" property on top. (The residual dynamic catch — a
@@ -86,17 +109,23 @@ default toolchain-free `cargo test` (up from 413 at the start: +21 unit/property
 | Implicit-but-inspectable (`--show-drops`) | ✅ |
 | Can't call `drop` manually | ✅ |
 | `@no_alloc` enforced contract | ✅ + sound/complete property + teeth |
+| Explicit fn-pointer-vtable `Allocator` + `Layout` | ✅ (retires the enum stand-in) |
+| One alloc path over many strategies (system/arena) | ✅ + golden |
+| Take-vs-borrow move precision | ✅ + property + teeth |
+| Allocator-parameterized `Vec`, freed by RAII | ✅ (concrete `IntVec`; generic `Vec(T,A)` future) |
 
 ### Tests (this workstream)
 
 - **Goldens** (`src/cgen.rs::tests`): drop call emitted; reverse order; move elision;
-  `--show-drops` comment; no glue without a `Drop` impl; region drop-elision.
+  `--show-drops` comment; no glue without a `Drop` impl; region drop-elision; the
+  allocator routes through the vtable (not bare malloc); a `mut`-borrowed droppable
+  still drops once; a `take`-consumed one is not dropped by the caller.
 - **Escape unit** (`src/escape.rs::tests`): `@no_alloc` rejects heap alloc / region,
   accepts a clean body, is per-function; manual `drop()` rejected.
 - **Properties** (`src/proptests.rs`): `drop_props` (drops-each-owned-exactly-once,
-  move elision, no-double-free, determinism, region bulk-drop metamorphic);
-  `alloc_props` (rejected *iff* allocates — soundness + completeness vs an independent
-  oracle).
+  move elision, no-double-free, determinism, region bulk-drop metamorphic,
+  borrow-passed-droppable-still-drops-once); `alloc_props` (rejected *iff* allocates —
+  soundness + completeness vs an independent oracle).
 - **Fuzz** (`bolero`): `fuzz_drop_alloc_pipeline`, `fuzz_drop_alloc_determinism`.
 - **Teeth-checked**: suppressing the drop emitter fails the drop count properties +
   goldens; neutering `is_alloc_intrinsic` fails the `@no_alloc` rejection tests — both
@@ -118,15 +147,20 @@ Honest accounting of what is stubbed, deferred, or only partially covered.
   one and a generic call or closure inside a `defer` silently vanishes from codegen. It
   was scoped out of this pass to avoid a half-applied ripple; the drop-scope stack it
   would plug into already exists.
-- **The fn-pointer-vtable `Allocator` is not built.** The allocator is still the
-  **enum-dispatch stand-in** in [`examples/std/mem.jtr`](examples/std/mem.jtr)
-  (`enum Allocator { system, arena(h) }`). The fn-pointer machinery to seed a real
-  vtable exists ([`examples/fn_ptr.jtr`](examples/fn_ptr.jtr) hand-writes exactly the
-  `std.mem.Allocator` shape), but the `{ alloc, resize, free } + ctx` value type, a
-  `Layout { size, align }`, and grow/shrink are not yet first-class.
-- **No allocator-parameterized `Vec(T, A)`.** `std/list.jtr` takes an allocator *value*
-  but over the enum, not the vtable; the end-to-end "push N, read back, debug allocator
-  reports zero leaks" integration (the Phase-3 exit criterion) is not done.
+- **The vtable `Allocator` is built but `std/` is not converted.** The real fn-pointer
+  vtable `Allocator` + `Layout` ship in [`examples/alloc_vtable.jtr`](examples/alloc_vtable.jtr)
+  / [`examples/vec_alloc.jtr`](examples/vec_alloc.jtr), but the **enum-dispatch stand-in**
+  in [`examples/std/mem.jtr`](examples/std/mem.jtr) (`enum Allocator { system, arena(h) }`)
+  and `std/list.jtr` have not yet been ported onto it. `resize`/grow-in-place and a
+  separate-vtable (vs. inlined-fn-pointers) layout are also future refinements.
+- **`Vec` is concrete (`IntVec`), not generic `Vec(T, A)`.** The allocator-parameterized
+  collection works end-to-end for `i32`; a *generic* `Vec(T)` needs generic-struct `Drop`
+  impl monomorphization (`impl Drop for Vec(i32)`), which the drop machinery does not yet
+  do (it recognises concrete named/primitive receivers only).
+- **A droppable `take` *parameter* is not dropped inside its callee.** Drop glue is
+  registered for `let`/`var` locals, not for owned (`take`) parameters — so a consumed
+  value that is neither moved-on nor returned leaks at the callee's scope exit
+  (leak-safe). Owned-parameter drop is a small future extension.
 - **No debug / fixed-buffer allocators.** The leak/double-free/UAF-catching debug
   allocator (the dynamic companion to the static escape proof) and `FixedBufferAllocator`
   are unbuilt — so there is **no `--features c-oracle` gcc-round-trip harness** yet
@@ -158,14 +192,15 @@ choices all fail toward **leaking, never double-freeing**.
 
 In rough priority order toward the Phase-3 exit criterion and self-hosting:
 
-1. **The fn-pointer-vtable `Allocator` value + `Layout`.** Define `Allocator` as a
-   `{ vtable: *const AllocatorVtable, ctx: *mut u8 }` (the Zig shape), reuse the trait
-   dictionary/vtable machinery (do **not** invent a parallel dispatch), and ship a
-   `Layout { size, align }`. Then **unify region ≡ arena allocator**: a `region r { }`
-   *is* a scoped default `Allocator` value, plus the compile-time escape proof Zig's
-   ArenaAllocator lacks.
-2. **`Vec(T, A)` end-to-end** over the vtable allocator (push/grow/read/scope-exit-free),
-   the integration forcing-function that validates the API by its consumer.
+1. **Generic `Vec(T, A)` + port `std/` onto the vtable allocator.** Generalize the
+   working concrete `IntVec` to a generic `Vec(T)` (needs generic-struct `Drop` impl
+   monomorphization), and convert `std/mem.jtr` + `std/list.jtr` off the enum stand-in.
+   Then **unify region ≡ arena allocator**: a `region r { }` *is* a scoped default
+   `Allocator` value, plus the compile-time escape proof Zig's ArenaAllocator lacks.
+   Add `resize`/grow-in-place and consider a separate `*const VTable` (vs. the inlined
+   fn-pointers) so one vtable instance is shared across allocators.
+2. **Owned-parameter drop.** Register `take` parameters for scope-exit drop glue (a
+   small extension of the local registration), closing the one remaining leak class.
 3. **The debug allocator + `--features c-oracle` harness.** A leak/double-free/UAF-
    catching allocator, wired to a gcc-compiling test layer: a full `Vec(T,A)` program
    pushes N, reads them back, and on scope exit the debug allocator **reports zero
