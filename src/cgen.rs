@@ -189,8 +189,14 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool, show_drops: bool) -
     g.closure_index = closure_index;
     g.prelude();
     g.forward_types();
+    // Forward-declare every monomorphized generic struct/enum instance too, before
+    // the fn-pointer typedefs — so a `JestyrFn_…` may *return* a generic enum by
+    // value (`fn(T) -> Option(U)`, the monadic-combinator shape). C accepts a
+    // forward-declared aggregate as a fn-pointer return/param type; the bodies
+    // follow in `gen_struct_defs`/`gen_enum_defs`.
+    g.gen_forward_types();
     // Function-pointer typedefs come right after the forward struct/enum
-    // typedefs (so a `JestyrFn_…` over a struct sees its forward name) and
+    // typedefs (so a `JestyrFn_…` over a struct/enum sees its forward name) and
     // *before* `struct_defs`, so a struct may hold a fn-pointer field — the
     // hand-written-vtable shape (e.g. an allocator interface).
     g.fn_type_typedefs();
@@ -994,12 +1000,31 @@ impl<'a> Cgen<'a> {
     }
 
     /// Emit a forward typedef and a definition for each monomorphized struct.
-    fn gen_struct_defs(&mut self) {
+    /// Forward-declare every monomorphized generic struct/enum instance (a niche
+    /// enum instance is a bare pointer, so it has no struct). Emitted before the
+    /// fn-pointer typedefs so a `fn(T) -> Option(U)` return resolves; the bodies
+    /// follow in `gen_struct_defs` / `gen_enum_defs`.
+    fn gen_forward_types(&mut self) {
+        let mut any = false;
         for (ctor, args) in self.struct_instances.clone() {
             let cname = self.gen_struct_c_name(&ctor, &args);
             self.raw(format!("typedef struct {cname} {cname};\n"));
+            any = true;
         }
-        self.raw("\n");
+        for (ctor, args) in self.enum_instances.clone() {
+            if self.niche_enum_instance(&ctor, &args).is_some() {
+                continue;
+            }
+            let cname = self.gen_struct_c_name(&ctor, &args);
+            self.raw(format!("typedef struct {cname} {cname};\n"));
+            any = true;
+        }
+        if any {
+            self.raw("\n");
+        }
+    }
+
+    fn gen_struct_defs(&mut self) {
         for (ctor, args) in self.struct_instances.clone() {
             self.emit_struct_instance(&ctor, &args);
         }
@@ -1105,15 +1130,8 @@ impl<'a> Cgen<'a> {
     }
 
     fn gen_enum_defs(&mut self) {
-        // Forward typedefs for non-niche instances (a niche instance is a pointer).
-        for (ctor, args) in self.enum_instances.clone() {
-            if self.niche_enum_instance(&ctor, &args).is_some() {
-                continue;
-            }
-            let cname = self.gen_struct_c_name(&ctor, &args);
-            self.raw(format!("typedef struct {cname} {cname};\n"));
-        }
-        self.raw("\n");
+        // Forward typedefs are emitted earlier by `gen_forward_types` (before the
+        // fn-pointer typedefs); here we emit only the bodies.
         for (ctor, args) in self.enum_instances.clone() {
             self.emit_enum_instance(&ctor, &args);
         }
@@ -8715,6 +8733,27 @@ mod tests {
             c.contains("jestyr_opt_map__i32_i32(Jestyr_Option__i32 j_o, JestyrFn_fn_di32_ret_i32 j_f)"),
             "instance signature references the typedef: {c}"
         );
+    }
+
+    #[test]
+    fn fn_pointer_returning_a_generic_enum_is_forward_declared_first() {
+        // The monadic combinator shape: `f: fn(T) -> Option(U)` is a fn-pointer
+        // returning a generic enum *by value*. Its typedef must follow a forward
+        // declaration of the `Option(i32)` instance — emitted by `gen_forward_types`
+        // before `fn_type_typedefs` — or the C is a forward-reference error. (Teeth:
+        // moving the instance forward-typedefs back into `gen_enum_defs` reorders
+        // them after the fn-pointer typedef and breaks this ordering.)
+        let src = "enum Option(T) { none, some(v: T) } \
+                   fn opt_and_then(comptime T: type, comptime U: type, take o: Option(T), f: fn(T) -> Option(U)) -> Option(U) { match o { some(v) => f(v), none => none } } \
+                   fn step(x: i32) -> Option(i32) { return some(x + 1) } \
+                   fn main() -> i32 { var a: Option(i32) = some(41) var b = opt_and_then(i32, i32, a, &step) return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        let fwd = c.find("typedef struct Jestyr_Option__i32 Jestyr_Option__i32;")
+            .expect(&format!("forward typedef for the instance: {c}"));
+        let fnp = c.find("(*JestyrFn_fn_di32_ret_Option__i32)")
+            .expect(&format!("fn-pointer typedef returning the instance: {c}"));
+        assert!(fwd < fnp, "the instance must be forward-declared before the fn-pointer typedef: {c}");
     }
 
     #[test]

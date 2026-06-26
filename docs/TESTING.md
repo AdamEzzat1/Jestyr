@@ -449,14 +449,25 @@ the runtime side pinned by an end-to-end example and `cgen` goldens.
   `collects_fn_pointer_typedef_through_a_generic_signature`,
   `generic_combinator_lowers_deterministically`. **Teeth:** disabling the tail-expected seed or
   the fn-type loop fails the goldens, then passes on revert.
+- ✅ **fn-pointer-returning-aggregate typedef ordering (the monad enabler).** A `fn(T) -> Option(U)`
+  parameter is a fn-pointer that returns a generic enum *by value*, so its typedef must follow a
+  forward declaration of the `Option(i32)` instance. `gen_forward_types` now forward-declares every
+  generic struct/enum instance **before** `fn_type_typedefs` (C accepts a forward-declared aggregate
+  as a fn-pointer return/param type; the bodies follow in `gen_struct_defs`/`gen_enum_defs`). Golden
+  `fn_pointer_returning_a_generic_enum_is_forward_declared_first` asserts the ordering. **Teeth:**
+  neutering `gen_forward_types` (forward typedefs back after the fn-pointer typedef) fails it.
 - ✅ **Option combinators.** `opt_is_some`/`opt_is_none`, `opt_unwrap_or`, `opt_unwrap_or_else`
-  (lazy default via `fn() -> T`), `opt_map` (functor), `opt_map_or`, `opt_ok_or` (→ `Result`).
+  (lazy default via `fn() -> T`), `opt_map` (functor), `opt_map_or`, `opt_ok_or` (→ `Result`),
+  `opt_and_then` (monadic bind), `opt_filter` (`pred: fn(read T) -> bool`, value survives),
+  `opt_or_else` (lazy alternative).
 - ✅ **Result combinators.** `res_is_ok`/`res_is_err`, `res_unwrap_or`, `res_map` (functor over
-  the ok value), `res_map_err`, `res_ok` (→ `Option`).
+  the ok value), `res_map_err`, `res_ok` (→ `Option`), `res_and_then` (monadic bind).
 - ✅ **Laws as oracles (`proptests::core_props`).** Functor identity (`map(id) == id`), functor
-  composition (`map(g∘f) == map(f) then map(g)`) for `Option` and `Result`, `unwrap_or`
-  selection, and the `res_ok(ok_or(o, e)) == o` bridge round-trip — asserted against a Rust
-  mirror of the combinators' `match` structure.
+  composition (`map(g∘f) == map(f) then map(g)`) for `Option` and `Result`; the **monad laws** —
+  left identity (`and_then(some(x), f) == f(x)`), right identity (`m.and_then(some) == m`),
+  associativity; `unwrap_or` selection; `filter` keep-iff-predicate; and the
+  `res_ok(ok_or(o, e)) == o` bridge round-trip — all against a Rust mirror of the combinators'
+  `match` structure.
 - ✅ **Codegen properties (`proptests::core_props`).** A generic Option combinator compiles with
   **zero diagnostics** and **byte-identically** for every integer element type — the real
   compiler path the combinators ride (`core_option_combinator_compiles_clean_for_any_int_type`,
@@ -464,11 +475,11 @@ the runtime side pinned by an end-to-end example and `cgen` goldens.
 - ✅ **Wiring.** `module::core_combinators_example_compiles_clean` —
   `examples/std/combinators.jtr` resolves the combinators across the `import "core"` boundary and
   lowers clean. gcc round-trip: `jestyrc run examples/std/combinators.jtr` →
-  `1, 20, 7, 42, 21, 22, 99, 0, 40, 20` (the `22` is the functor-composition law, operationally).
-- **Remaining (future work):** the monadic `opt_and_then`/`res_and_then` (whose `f` *returns* a
-  generic enum) need a fn-pointer-returning-aggregate typedef-ordering fix (forward-declare
-  aggregate typedefs before fn-pointer typedefs); slice/iterator algorithms; correctly-rounded
-  deterministic number parse/format; the allocating `std` (Phase 2). See `CORE-STD-PHASE3.md`.
+  `1, 20, 7, 42, 21, 22, 99, 0, 40, 20, 21, 7, 21, 20, 20, 7, 40` (the `22` is functor
+  composition; the `21`/`20` pair is monad left/right identity, operationally).
+- **Remaining (future work):** slice/iterator algorithms (generic free functions over `[]T`);
+  defined-overflow math; correctly-rounded deterministic number parse/format + the cross-OS canary;
+  the allocating `std` (Phase 2). See `CORE-STD-PHASE3.md`.
 
 ---
 

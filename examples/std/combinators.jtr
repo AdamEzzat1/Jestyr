@@ -17,6 +17,13 @@
 //      0   (ok_or none -> err -> unwrap_or)
 //      40  (ok_or some -> res_map -> unwrap_or)
 //      20  (round-trip: ok_or some -> res_ok -> unwrap_or)
+//      21  (and_then some — a fallible step)
+//      7   (and_then none — short-circuits)
+//      21  (monad left identity: and_then(some(x), f) == f(x))
+//      20  (monad right identity: m.and_then(some) == m)
+//      20  (filter keeps a passing value)
+//      7   (filter drops a failing value)
+//      40  (res_and_then on ok)
 
 import "core"
 import "io"
@@ -26,6 +33,12 @@ fn dbl(x: i32) -> i32 { return x + x }
 fn inc_then_dbl(x: i32) -> i32 { return (x + 1) + (x + 1) }   // g∘f where f=inc, g=dbl
 fn fortytwo() -> i32 { return 42 }
 fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
+
+// Monadic helpers: a fallible step returns an `Option`/`Result`.
+fn checked_inc(x: i32) -> Option(i32) { if x > 100 { return none } return some(x + 1) }
+fn wrap_some(x: i32) -> Option(i32) { return some(x) }        // the monad's `return`
+fn is_big(read x: i32) -> bool { return x > 10 }
+fn checked_res(x: i32) -> Result(i32, i32) { if x > 100 { return err(0 - 1) } return ok(x + x) }
 
 fn main() -> i32 {
     let a: Option(i32) = some(20)
@@ -53,6 +66,25 @@ fn main() -> i32 {
 
     // Round-trip Option -> Result -> Option preserves the value.
     io.print_i32(core.opt_unwrap_or(i32, core.res_ok(i32, i32, core.opt_ok_or(i32, i32, a, 5)), 0))  // 20
+
+    // Monad: bind a fallible step; the second arg short-circuits on none.
+    io.print_i32(core.opt_unwrap_or(i32, core.opt_and_then(i32, i32, a, &checked_inc), 0))    // 21
+    io.print_i32(core.opt_unwrap_or(i32, core.opt_and_then(i32, i32, some(200), &checked_inc), 7))  // 7
+
+    // Monad left identity, operationally: and_then(some(x), f) == f(x).
+    let lhs2: Option(i32) = core.opt_and_then(i32, i32, some(20), &checked_inc)
+    let rhs2: Option(i32) = checked_inc(20)
+    io.print_i32(core.opt_unwrap_or(i32, lhs2, 0) - core.opt_unwrap_or(i32, rhs2, 0) + 21)   // 21
+
+    // Monad right identity, operationally: m.and_then(some) == m.
+    let same: Option(i32) = core.opt_and_then(i32, i32, a, &wrap_some)
+    io.print_i32(core.opt_unwrap_or(i32, same, 0))                                            // 20
+
+    io.print_i32(core.opt_unwrap_or(i32, core.opt_filter(i32, a, &is_big), 0))                // 20
+    io.print_i32(core.opt_unwrap_or(i32, core.opt_filter(i32, some(5), &is_big), 7))          // 7
+
+    let r0: Result(i32, i32) = ok(20)
+    io.print_i32(core.res_unwrap_or(i32, i32, core.res_and_then(i32, i32, i32, r0, &checked_res), 0))  // 40
 
     return 0
 }

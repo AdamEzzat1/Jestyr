@@ -24,13 +24,13 @@ pub fn abs_i32(x: i32) -> i32 {
 // enum, so the receiver is the first value argument and the element/result types
 // are passed as `comptime` arguments: `core.opt_map(i32, i32, o, &f)`.
 //
-// They obey the functor laws by construction — `map(id) == id`,
-// `map(f) then map(g) == map(g∘f)` — which is exactly how `core_props` tests them
-// (laws as oracles). A higher-order combinator takes a thin `fn(T) -> U` pointer
-// (a non-capturing closure coerces to one), so `&inc` or `|x| x + 1` both work.
-//
-// NOTE: the monadic `and_then`/`flat_map` (whose `f` *returns* `Option(U)`) await
-// a fn-pointer-returning-aggregate typedef ordering fix — see CORE-STD-PHASE3.md.
+// They obey the functor *and* monad laws by construction — `map(id) == id`,
+// `map(f) then map(g) == map(g∘f)`, `some(x).and_then(f) == f(x)`,
+// `m.and_then(some) == m` — which is exactly how `core_props` tests them (laws as
+// oracles). A higher-order combinator takes a thin `fn(T) -> U` pointer (a
+// non-capturing closure coerces to one), so `&inc` or `|x| x + 1` both work; a
+// monadic `f` returns an `Option(U)`/`Result(U,E)` (a by-value aggregate return,
+// which the forward-declared instance typedefs make legal).
 
 pub enum Option(T) { none, some(v: T) }
 pub enum Result(T, E) { ok(v: T), err(e: E) }
@@ -70,6 +70,23 @@ pub fn opt_ok_or(comptime T: type, comptime E: type, take o: Option(T), take e: 
     match o { some(v) => ok(v), none => err(e) }
 }
 
+// The monadic bind: `opt_and_then(some(x), f) == f(x)`, `opt_and_then(none, f) == none`.
+// `f` itself returns an `Option(U)`, so chained fallible steps short-circuit on `none`.
+pub fn opt_and_then(comptime T: type, comptime U: type, take o: Option(T), f: fn(T) -> Option(U)) -> Option(U) {
+    match o { some(v) => f(v), none => none }
+}
+
+// Keep the value only if it passes `pred` (which *borrows* it, so the value
+// survives): `opt_filter(some(x), p) == if p(x) { some(x) } else { none }`.
+pub fn opt_filter(comptime T: type, take o: Option(T), pred: fn(read T) -> bool) -> Option(T) {
+    match o { some(v) => if pred(v) { some(v) } else { none }, none => none }
+}
+
+// Fall back to an alternative `Option`, produced lazily, only on `none`.
+pub fn opt_or_else(comptime T: type, take o: Option(T), f: fn() -> Option(T)) -> Option(T) {
+    match o { some(v) => some(v), none => f() }
+}
+
 // --- Result ---
 
 pub fn res_is_ok(comptime T: type, comptime E: type, read r: Result(T, E)) -> bool {
@@ -97,4 +114,9 @@ pub fn res_map_err(comptime T: type, comptime E: type, comptime F: type, take r:
 // Bridge back to `Option`, discarding the error: `ok(x) -> some(x)`, `err(_) -> none`.
 pub fn res_ok(comptime T: type, comptime E: type, take r: Result(T, E)) -> Option(T) {
     match r { ok(v) => some(v), err(e) => none }
+}
+
+// The monadic bind for `Result`: `res_and_then(ok(x), f) == f(x)`, error short-circuits.
+pub fn res_and_then(comptime T: type, comptime U: type, comptime E: type, take r: Result(T, E), f: fn(T) -> Result(U, E)) -> Result(U, E) {
+    match r { ok(v) => f(v), err(e) => err(e) }
 }

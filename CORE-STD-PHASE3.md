@@ -82,9 +82,23 @@ element/result types are `comptime`: `core.opt_map(i32, i32, o, &f)`. A thin
 `fn(T) -> U` pointer carries behavior (a non-capturing closure coerces to one).
 
 - **Option:** `opt_is_some`/`opt_is_none`, `opt_unwrap_or`, `opt_unwrap_or_else`
-  (lazy default via `fn() -> T`), `opt_map` (functor), `opt_map_or`, `opt_ok_or`.
+  (lazy default via `fn() -> T`), `opt_map` (functor), `opt_map_or`, `opt_ok_or`,
+  `opt_and_then` (monadic bind), `opt_filter` (`pred: fn(read T) -> bool`, value
+  survives), `opt_or_else` (lazy alternative).
 - **Result:** `res_is_ok`/`res_is_err`, `res_unwrap_or`, `res_map` (functor over
-  the ok value), `res_map_err`, `res_ok`.
+  the ok value), `res_map_err`, `res_ok`, `res_and_then` (monadic bind).
+
+### Monadic combinators — the fn-pointer-returning-aggregate typedef reorder
+
+A monadic `f: fn(T) -> Option(U)` is a fn-pointer that returns a generic enum *by
+value*, so its typedef must follow a forward declaration of the `Option(i32)`
+instance. `gen_forward_types` now forward-declares every generic struct/enum
+instance **before** `fn_type_typedefs` (C accepts a forward-declared aggregate as
+a fn-pointer return/param type; the bodies follow in `gen_struct_defs`/
+`gen_enum_defs`). This unblocked `opt_and_then`/`res_and_then`/`opt_filter` and the
+**monad laws** (left/right identity, associativity). Golden
+`fn_pointer_returning_a_generic_enum_is_forward_declared_first` pins the ordering;
+teeth: neutering `gen_forward_types` fails it.
 
 ### Determinism guarantees realized
 
@@ -117,19 +131,12 @@ Run them: `cargo test core_props`, `cargo test cgen::tests`. gcc round-trip via
 
 Honest accounting of what is stubbed, deferred, or only partially covered.
 
-- **No monadic `and_then` / `flat_map` yet.** A combinator whose `f` *returns* a
-  generic enum (`fn(T) -> Option(U)`) needs a fn-pointer typedef that returns an
-  aggregate by value, which must be emitted *after* that aggregate's typedef. Today
-  `fn_type_typedefs()` runs before the generic enum/struct defs (so a struct field
-  can be a fn-pointer), creating a forward-reference. C *does* accept a forward-
-  declared aggregate as a by-value fn-pointer return type, so the fix is to hoist
-  the aggregate **forward-declarations** ahead of `fn_type_typedefs()` (a named-
-  struct split of the current `typedef struct {…} X;` emission). Scoped out of this
-  pass to avoid a golden-churning reorder mid-stream; it is the next increment, and
-  unblocks the monad laws (`m.and_then(some) == m`, `some(x).and_then(f) == f(x)`).
-- **No `filter` with value reuse.** `opt_filter` wants `pred: fn(read T) -> bool`
-  so the matched value survives the predicate call (a `take`-convention predicate
-  would consume it). Deferred with `and_then`.
+- **A nullary/ambiguous generic variant in generic-call argument position needs a
+  typed binding.** `res_and_then(i32, i32, i32, ok(20), &f)` fails — a bare `ok(20)`
+  pins only `T`, not `E`, and the generic call doesn't propagate the substituted
+  parameter type `Result(i32, i32)` onto the argument as its expected type. Bind it
+  first (`let r: Result(i32, i32) = ok(20)`). A targeted fix would substitute the
+  callee's comptime args into the parameter types before inferring each argument.
 - **Combinators are free functions, not methods.** `core.opt_map(i32, i32, o, &f)`,
   not `o.map(f)`. Method-on-generic-enum sugar / UFCS is a compiler feature, not
   library text.
@@ -153,9 +160,7 @@ Honest accounting of what is stubbed, deferred, or only partially covered.
 
 In rough priority order toward a usable `core` and self-hosting:
 
-1. **Typedef forward-declaration reorder → `and_then`/`flat_map` + the monad
-   laws.** Hoist aggregate forward-declarations before `fn_type_typedefs()`; then
-   ship the monadic combinators and add the monad-law oracles to `core_props`.
+1. ✅ **Done — typedef reorder → `and_then`/`filter` + the monad laws** (this pass).
 2. **Slice / iterator algorithms** as generic free functions over `[]T`:
    `map`/`filter`/`fold`/`zip`/`enumerate`/`find`/`all`/`any`/`count`/`sum`;
    `binary_search`; a **deterministic stable `sort`** (laws: output is a sorted

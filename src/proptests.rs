@@ -1279,6 +1279,12 @@ mod core_props {
     fn m_res_map<T, U, E>(r: Result<T, E>, f: impl FnOnce(T) -> U) -> Result<U, E> {
         match r { Ok(v) => Ok(f(v)), Err(e) => Err(e) }
     }
+    fn m_and_then<T, U>(o: Option<T>, f: impl FnOnce(T) -> Option<U>) -> Option<U> {
+        match o { Some(v) => f(v), None => None }
+    }
+    fn m_filter<T>(o: Option<T>, pred: impl FnOnce(&T) -> bool) -> Option<T> {
+        match o { Some(v) => if pred(&v) { Some(v) } else { None }, None => None }
+    }
 
     proptest! {
         // ── codegen layer (the real Jestyr compiler path) ──────────────────────
@@ -1341,6 +1347,40 @@ mod core_props {
             let f = |v: i32| v.wrapping_add(1);
             let g = |v: i32| v.wrapping_mul(2);
             prop_assert_eq!(m_res_map(m_res_map(r, f), g), m_res_map(r, |v| g(f(v))));
+        }
+
+        // ── monad laws (now that `and_then` lowers — the typedef reorder) ───────
+
+        /// Monad left identity: `and_then(some(x), f) == f(x)`.
+        #[test]
+        fn option_monad_left_identity(x in any::<i32>()) {
+            let f = |v: i32| if v > 0 { Some(v.wrapping_add(1)) } else { None };
+            prop_assert_eq!(m_and_then(Some(x), f), f(x));
+        }
+
+        /// Monad right identity: `m.and_then(some) == m`.
+        #[test]
+        fn option_monad_right_identity(x in any::<i32>(), is_some in any::<bool>()) {
+            let o = if is_some { Some(x) } else { None };
+            prop_assert_eq!(m_and_then(o, Some), o);
+        }
+
+        /// Monad associativity: `m.and_then(f).and_then(g) == m.and_then(|x| f(x).and_then(g))`.
+        #[test]
+        fn option_monad_associativity(x in any::<i32>(), is_some in any::<bool>()) {
+            let o = if is_some { Some(x) } else { None };
+            let f = |v: i32| if v % 2 == 0 { Some(v.wrapping_add(1)) } else { None };
+            let g = |v: i32| if v > 0 { Some(v.wrapping_mul(2)) } else { None };
+            prop_assert_eq!(m_and_then(m_and_then(o, f), g), m_and_then(o, |v| m_and_then(f(v), g)));
+        }
+
+        /// `filter` keeps the value iff the predicate holds; `none` stays `none`.
+        #[test]
+        fn option_filter_keeps_iff_predicate(x in any::<i32>(), is_some in any::<bool>()) {
+            let o = if is_some { Some(x) } else { None };
+            let pred = |v: &i32| *v > 10;
+            let expect = if is_some && x > 10 { Some(x) } else { None };
+            prop_assert_eq!(m_filter(o, pred), expect);
         }
     }
 }
