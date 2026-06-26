@@ -15,3 +15,86 @@ pub fn abs_i32(x: i32) -> i32 {
     if x < 0 { return 0 - x }
     return x
 }
+
+// ── Option / Result + their combinators ──────────────────────────────────────
+//
+// The two fallible-value types of `core`, monomorphized per instantiation (so
+// `Option(*mut T)` even niche-optimizes to a bare pointer). The combinators are
+// allocation-free generic *functions* — Jestyr has no method syntax on a generic
+// enum, so the receiver is the first value argument and the element/result types
+// are passed as `comptime` arguments: `core.opt_map(i32, i32, o, &f)`.
+//
+// They obey the functor laws by construction — `map(id) == id`,
+// `map(f) then map(g) == map(g∘f)` — which is exactly how `core_props` tests them
+// (laws as oracles). A higher-order combinator takes a thin `fn(T) -> U` pointer
+// (a non-capturing closure coerces to one), so `&inc` or `|x| x + 1` both work.
+//
+// NOTE: the monadic `and_then`/`flat_map` (whose `f` *returns* `Option(U)`) await
+// a fn-pointer-returning-aggregate typedef ordering fix — see CORE-STD-PHASE3.md.
+
+pub enum Option(T) { none, some(v: T) }
+pub enum Result(T, E) { ok(v: T), err(e: E) }
+
+// --- Option ---
+
+pub fn opt_is_some(comptime T: type, read o: Option(T)) -> bool {
+    match o { some(v) => true, none => false }
+}
+
+pub fn opt_is_none(comptime T: type, read o: Option(T)) -> bool {
+    match o { some(v) => false, none => true }
+}
+
+// `unwrap_or(some(x), d) == x`; `unwrap_or(none, d) == d`.
+pub fn opt_unwrap_or(comptime T: type, take o: Option(T), take d: T) -> T {
+    match o { some(v) => v, none => d }
+}
+
+// Like `unwrap_or` but the default is produced lazily — only on `none`.
+pub fn opt_unwrap_or_else(comptime T: type, take o: Option(T), f: fn() -> T) -> T {
+    match o { some(v) => v, none => f() }
+}
+
+// The functor map: `opt_map(some(x), f) == some(f(x))`, `opt_map(none, f) == none`.
+pub fn opt_map(comptime T: type, comptime U: type, take o: Option(T), f: fn(T) -> U) -> Option(U) {
+    match o { some(v) => some(f(v)), none => none }
+}
+
+// `map` then `unwrap_or` in one step (no intermediate `Option(U)`).
+pub fn opt_map_or(comptime T: type, comptime U: type, take o: Option(T), take d: U, f: fn(T) -> U) -> U {
+    match o { some(v) => f(v), none => d }
+}
+
+// Bridge to `Result`: `some(x) -> ok(x)`, `none -> err(e)`.
+pub fn opt_ok_or(comptime T: type, comptime E: type, take o: Option(T), take e: E) -> Result(T, E) {
+    match o { some(v) => ok(v), none => err(e) }
+}
+
+// --- Result ---
+
+pub fn res_is_ok(comptime T: type, comptime E: type, read r: Result(T, E)) -> bool {
+    match r { ok(v) => true, err(e) => false }
+}
+
+pub fn res_is_err(comptime T: type, comptime E: type, read r: Result(T, E)) -> bool {
+    match r { ok(v) => false, err(e) => true }
+}
+
+pub fn res_unwrap_or(comptime T: type, comptime E: type, take r: Result(T, E), take d: T) -> T {
+    match r { ok(v) => v, err(e) => d }
+}
+
+// The functor map over the ok value; the error passes through unchanged.
+pub fn res_map(comptime T: type, comptime U: type, comptime E: type, take r: Result(T, E), f: fn(T) -> U) -> Result(U, E) {
+    match r { ok(v) => ok(f(v)), err(e) => err(e) }
+}
+
+// Map the error value; the ok passes through unchanged.
+pub fn res_map_err(comptime T: type, comptime E: type, comptime F: type, take r: Result(T, E), f: fn(E) -> F) -> Result(T, F) {
+    match r { ok(v) => ok(v), err(e) => err(f(e)) }
+}
+
+// Bridge back to `Option`, discarding the error: `ok(x) -> some(x)`, `err(_) -> none`.
+pub fn res_ok(comptime T: type, comptime E: type, take r: Result(T, E)) -> Option(T) {
+    match r { ok(v) => some(v), err(e) => none }
+}

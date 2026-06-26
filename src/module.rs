@@ -423,6 +423,14 @@ mod tests {
     }
 
     #[test]
+    fn core_combinators_example_compiles_clean() {
+        // The core Option/Result combinators (map/unwrap_or/ok_or/...) monomorphize
+        // and lower with no diagnostics across the `import "core"` module boundary —
+        // generic enums constructed and matched inside generic functions.
+        pipeline_is_clean("examples/std/combinators.jtr");
+    }
+
+    #[test]
     fn loops_example_compiles_clean() {
         // Every MVP loop form + `invariant` + bounds-check elision.
         pipeline_is_clean("examples/loops.jtr");

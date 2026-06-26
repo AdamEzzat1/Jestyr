@@ -113,6 +113,7 @@ cargo test                       # unit + property + replayed fuzz corpus (430+ 
 cargo test prop::                # just the property tests
 cargo test drop_props            # Drop/RAII scope-exit drop-glue properties (Phase 3)
 cargo test alloc_props           # @no_alloc soundness/completeness properties (Phase 3)
+cargo test core_props            # core Option/Result combinator laws + codegen (§5.14)
 cargo bolero test fuzz_pipeline  # real coverage-guided fuzzing of the pipeline
 cargo bolero test fuzz_drop_alloc_pipeline      # fuzz Drop/RAII + allocator lowering
 cargo run -- selfbench           # per-stage speed + footprint on a generated program
@@ -428,6 +429,46 @@ so they run under the toolchain-free default `cargo test`.
   (`take`) parameter drop; a leak-catching debug allocator (the `--features c-oracle` gcc-round-trip
   exit criterion); `@deterministic` allocators; linear / must-use types; conditional (per-branch) move
   precision; transitive `@no_alloc`. See `DROP-ALLOC-PHASE3.md`.
+
+### 5.14 `core` / `std` — Option/Result combinators (no-alloc `core`)
+
+The no-alloc `core` standard library (design §C). `Option(T)`/`Result(T,E)` and their
+allocation-free combinators live in `examples/std/core.jtr`; the oracle for the
+combinators is **the functor/monad laws** — checked against a faithful Rust mirror, with
+the runtime side pinned by an end-to-end example and `cgen` goldens.
+
+- ✅ **Generic-enum-in-generic-fn codegen (the enabler).** A generic `Option(T)`/`Result(T,E)`
+  *constructed* and *matched* inside a generic function now monomorphizes: cgen resolves the
+  inferred type through the active substitution before the concreteness check, the match tag
+  prefix, and the payload binding (`apply_subst` gained its missing `GenEnum` arm); typeck seeds
+  `cur_expected = cur_ret` so a tail `match`'s nullary `none` inherits the return type;
+  `collect_fn_types` walks generic *function signatures* (not just struct fields) so a
+  higher-order `f: fn(T) -> U` parameter gets its concrete typedef; `ty_mangle` gained
+  `GenEnum`/`Result` arms (both previously collided on `x`). Goldens (`cgen::tests`):
+  `monomorphizes_a_generic_enum_inside_a_generic_function`,
+  `collects_fn_pointer_typedef_through_a_generic_signature`,
+  `generic_combinator_lowers_deterministically`. **Teeth:** disabling the tail-expected seed or
+  the fn-type loop fails the goldens, then passes on revert.
+- ✅ **Option combinators.** `opt_is_some`/`opt_is_none`, `opt_unwrap_or`, `opt_unwrap_or_else`
+  (lazy default via `fn() -> T`), `opt_map` (functor), `opt_map_or`, `opt_ok_or` (→ `Result`).
+- ✅ **Result combinators.** `res_is_ok`/`res_is_err`, `res_unwrap_or`, `res_map` (functor over
+  the ok value), `res_map_err`, `res_ok` (→ `Option`).
+- ✅ **Laws as oracles (`proptests::core_props`).** Functor identity (`map(id) == id`), functor
+  composition (`map(g∘f) == map(f) then map(g)`) for `Option` and `Result`, `unwrap_or`
+  selection, and the `res_ok(ok_or(o, e)) == o` bridge round-trip — asserted against a Rust
+  mirror of the combinators' `match` structure.
+- ✅ **Codegen properties (`proptests::core_props`).** A generic Option combinator compiles with
+  **zero diagnostics** and **byte-identically** for every integer element type — the real
+  compiler path the combinators ride (`core_option_combinator_compiles_clean_for_any_int_type`,
+  `core_option_combinator_is_deterministic`).
+- ✅ **Wiring.** `module::core_combinators_example_compiles_clean` —
+  `examples/std/combinators.jtr` resolves the combinators across the `import "core"` boundary and
+  lowers clean. gcc round-trip: `jestyrc run examples/std/combinators.jtr` →
+  `1, 20, 7, 42, 21, 22, 99, 0, 40, 20` (the `22` is the functor-composition law, operationally).
+- **Remaining (future work):** the monadic `opt_and_then`/`res_and_then` (whose `f` *returns* a
+  generic enum) need a fn-pointer-returning-aggregate typedef-ordering fix (forward-declare
+  aggregate typedefs before fn-pointer typedefs); slice/iterator algorithms; correctly-rounded
+  deterministic number parse/format; the allocating `std` (Phase 2). See `CORE-STD-PHASE3.md`.
 
 ---
 

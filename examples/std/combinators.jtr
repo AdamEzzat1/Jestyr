@@ -1,0 +1,58 @@
+// examples/std/combinators.jtr — the `core` Option/Result combinators, end to end.
+//
+// `Option`/`Result` and their allocation-free combinators live in `core`; this
+// program drives them through real monomorphized codegen. The element/result
+// types are `comptime` arguments and the receiver is the first value argument
+// (`core.opt_map(i32, i32, o, &f)`), since `core` has no method syntax on a
+// generic enum. A thin `fn(T) -> U` pointer carries the behavior — `&inc` here.
+//
+//   jestyrc run examples/std/combinators.jtr
+//   →  1   (is_some)
+//      20  (unwrap_or some)
+//      7   (unwrap_or none)
+//      42  (unwrap_or_else none — default produced lazily)
+//      21  (map some, then unwrap)
+//      22  (functor composition: map(g∘f) == map(f) then map(g))
+//      99  (map_or none — the default)
+//      0   (ok_or none -> err -> unwrap_or)
+//      40  (ok_or some -> res_map -> unwrap_or)
+//      20  (round-trip: ok_or some -> res_ok -> unwrap_or)
+
+import "core"
+import "io"
+
+fn inc(x: i32) -> i32 { return x + 1 }
+fn dbl(x: i32) -> i32 { return x + x }
+fn inc_then_dbl(x: i32) -> i32 { return (x + 1) + (x + 1) }   // g∘f where f=inc, g=dbl
+fn fortytwo() -> i32 { return 42 }
+fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
+
+fn main() -> i32 {
+    let a: Option(i32) = some(20)
+    let n: Option(i32) = none
+
+    io.print_i32(b2i(core.opt_is_some(i32, a)))                                 // 1
+    io.print_i32(core.opt_unwrap_or(i32, a, 0))                                 // 20
+    io.print_i32(core.opt_unwrap_or(i32, n, 7))                                 // 7
+    io.print_i32(core.opt_unwrap_or_else(i32, n, &fortytwo))                    // 42
+
+    // Functor: map a function over the some-value.
+    io.print_i32(core.opt_unwrap_or(i32, core.opt_map(i32, i32, a, &inc), 0))   // 21
+
+    // Functor composition law, operationally: map(dbl∘inc) == map(inc) then map(dbl).
+    let lhs: Option(i32) = core.opt_map(i32, i32, a, &inc_then_dbl)
+    let rhs: Option(i32) = core.opt_map(i32, i32, core.opt_map(i32, i32, a, &inc), &dbl)
+    io.print_i32(core.opt_unwrap_or(i32, lhs, 0) - core.opt_unwrap_or(i32, rhs, 0) + 22)  // 22
+
+    io.print_i32(core.opt_map_or(i32, i32, n, 99, &dbl))                        // 99
+
+    // Option -> Result bridges and Result combinators.
+    io.print_i32(core.res_unwrap_or(i32, i32, core.opt_ok_or(i32, i32, n, 5), 0))           // 0
+    io.print_i32(core.res_unwrap_or(i32, i32,
+        core.res_map(i32, i32, i32, core.opt_ok_or(i32, i32, a, 5), &dbl), 0))              // 40
+
+    // Round-trip Option -> Result -> Option preserves the value.
+    io.print_i32(core.opt_unwrap_or(i32, core.res_ok(i32, i32, core.opt_ok_or(i32, i32, a, 5)), 0))  // 20
+
+    return 0
+}

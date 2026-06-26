@@ -1230,3 +1230,117 @@ mod fuzz {
         });
     }
 }
+
+/// Property tests for the no-alloc `core` Option/Result combinators
+/// (`examples/std/core.jtr`). Two layers:
+///   * **codegen** — a generic `Option(T)` combinator (constructed *and* matched
+///     inside generic functions) compiles clean and deterministically for *any*
+///     element type. This exercises the real compiler path the combinators ride.
+///   * **laws as oracles** — the functor/monad laws asserted against a faithful
+///     Rust mirror of the combinators' `match` structure (the contract the Jestyr
+///     code must satisfy; the runtime side is pinned by
+///     `examples/std/combinators.jtr` and the `cgen` goldens).
+mod core_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A self-contained program mirroring `core`'s Option combinators at element
+    /// type `prim`: `opt_map` (construct + match inside a generic fn) composed with
+    /// `opt_unwrap_or`. Concrete `idf`/literals keep it valid for any integer type.
+    fn option_combinator_source(prim: &str) -> String {
+        format!(
+            "enum Option(T) {{ none, some(v: T) }}\n\
+             fn idf(x: {p}) -> {p} {{ return x }}\n\
+             fn omap(comptime T: type, take o: Option(T), f: fn(T) -> T) -> Option(T) {{ match o {{ some(v) => some(f(v)), none => none }} }}\n\
+             fn ouw(comptime T: type, take o: Option(T), take d: T) -> T {{ match o {{ some(v) => v, none => d }} }}\n\
+             fn main() -> i32 {{ var a: Option({p}) = some(1) var b: Option({p}) = none \
+                return (ouw({p}, omap({p}, a, &idf), 1) as i32) + (ouw({p}, omap({p}, b, &idf), 0) as i32) }}",
+            p = prim
+        )
+    }
+
+    fn int_prim() -> impl Strategy<Value = &'static str> {
+        prop_oneof![Just("i32"), Just("i64"), Just("u8"), Just("u16"), Just("usize")]
+    }
+
+    // ── A faithful Rust mirror of core's combinators (same `match` structure) ────
+    fn m_map<T, U>(o: Option<T>, f: impl FnOnce(T) -> U) -> Option<U> {
+        match o { Some(v) => Some(f(v)), None => None }
+    }
+    fn m_unwrap_or<T>(o: Option<T>, d: T) -> T {
+        match o { Some(v) => v, None => d }
+    }
+    fn m_ok_or<T, E>(o: Option<T>, e: E) -> Result<T, E> {
+        match o { Some(v) => Ok(v), None => Err(e) }
+    }
+    fn m_res_ok<T, E>(r: Result<T, E>) -> Option<T> {
+        match r { Ok(v) => Some(v), Err(_) => None }
+    }
+    fn m_res_map<T, U, E>(r: Result<T, E>, f: impl FnOnce(T) -> U) -> Result<U, E> {
+        match r { Ok(v) => Ok(f(v)), Err(e) => Err(e) }
+    }
+
+    proptest! {
+        // ── codegen layer (the real Jestyr compiler path) ──────────────────────
+
+        /// A generic Option combinator monomorphizes with **no diagnostics** for any
+        /// element type — the generic-enum-in-generic-fn codegen this work landed.
+        /// (Teeth: dropping the `apply_subst`/tail-expected fixes reintroduces the
+        /// "cannot infer the type arguments of generic enum" diagnostic, failing this.)
+        #[test]
+        fn core_option_combinator_compiles_clean_for_any_int_type(p in int_prim()) {
+            let (_c, diags) = compile(&option_combinator_source(p));
+            prop_assert_eq!(diags, 0, "combinator over {} must compile clean", p);
+        }
+
+        /// The same combinator program emits **byte-identical C** twice — no
+        /// iteration-order leak in the new fn-type / generic-enum collectors.
+        #[test]
+        fn core_option_combinator_is_deterministic(p in int_prim()) {
+            let src = option_combinator_source(p);
+            prop_assert_eq!(compile(&src), compile(&src));
+        }
+
+        // ── laws as oracles (the contract the Jestyr combinators satisfy) ───────
+
+        /// Functor identity: `map(id) == id`.
+        #[test]
+        fn option_functor_identity(x in any::<i32>(), is_some in any::<bool>()) {
+            let o = if is_some { Some(x) } else { None };
+            prop_assert_eq!(m_map(o, |v| v), o);
+        }
+
+        /// Functor composition: `map(g∘f) == map(f) then map(g)`.
+        #[test]
+        fn option_functor_composition(x in any::<i32>(), is_some in any::<bool>()) {
+            let o = if is_some { Some(x) } else { None };
+            let f = |v: i32| v.wrapping_add(1);
+            let g = |v: i32| v.wrapping_mul(2);
+            prop_assert_eq!(m_map(m_map(o, f), g), m_map(o, |v| g(f(v))));
+        }
+
+        /// `unwrap_or` selects the value on `some`, the default on `none`.
+        #[test]
+        fn option_unwrap_or_selects(x in any::<i32>(), d in any::<i32>(), is_some in any::<bool>()) {
+            let o = if is_some { Some(x) } else { None };
+            let expect = if is_some { x } else { d };
+            prop_assert_eq!(m_unwrap_or(o, d), expect);
+        }
+
+        /// Bridge round-trip: `res_ok(ok_or(o, e)) == o` for every `o` and `e`.
+        #[test]
+        fn option_ok_or_then_res_ok_roundtrips(x in any::<i32>(), e in any::<i32>(), is_some in any::<bool>()) {
+            let o = if is_some { Some(x) } else { None };
+            prop_assert_eq!(m_res_ok(m_ok_or(o, e)), o);
+        }
+
+        /// Result functor composition over the ok value (the err passes through).
+        #[test]
+        fn result_map_composition(x in any::<i32>(), e in any::<i32>(), is_ok in any::<bool>()) {
+            let r: Result<i32, i32> = if is_ok { Ok(x) } else { Err(e) };
+            let f = |v: i32| v.wrapping_add(1);
+            let g = |v: i32| v.wrapping_mul(2);
+            prop_assert_eq!(m_res_map(m_res_map(r, f), g), m_res_map(r, |v| g(f(v))));
+        }
+    }
+}
