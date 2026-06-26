@@ -493,6 +493,22 @@ fn report_program(modules: &module::Modules, diags: &[diag::Diagnostic]) -> Exit
 
 /// Write the emitted C to a temp file, compile it with a detected C compiler,
 /// and (when `run` is set) execute the resulting binary.
+/// The C compile flags for every Jestyr translation unit. The floating-point pair
+/// is the **determinism seam** (`Jestyr-Remaining-And-Numerics-Research.md` §3.3):
+///
+/// - `-ffp-contract=off` forbids the compiler from fusing `a*b + c` into a single
+///   FMA — a *different* rounding than separate mul+add, which would break
+///   bit-identity between a machine with FMA and one without (and scalar vs SIMD).
+/// - `-fno-fast-math` guarantees none of the value-changing transforms
+///   (reassociation, `-Ofast`-style assumptions) ever creep in, even if a future
+///   default or build wrapper would enable them.
+///
+/// Both must be *locked*, not hoped for: that pair is the entire difference between
+/// "deterministic" and "usually deterministic" once floating point enters. Never
+/// add `-ffast-math`/`-Ofast`. (FTZ/DAZ is a runtime MXCSR state, not a flag — the
+/// emitted program simply never sets it.)
+const CC_FLAGS: &[&str] = &["-O2", "-std=c11", "-ffp-contract=off", "-fno-fast-math"];
+
 fn build_and_maybe_run(path: &str, c_src: &str, run: bool) -> ExitCode {
     let stem = Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("out");
     let mut c_file = std::env::temp_dir();
@@ -513,12 +529,7 @@ fn build_and_maybe_run(path: &str, c_src: &str, run: bool) -> ExitCode {
     };
 
     let mut cmd = Command::new(&cc);
-    // `-ffp-contract=off` is the floating-point **determinism seam** (traits Stage
-    // E / the numerics workstream): it forbids the compiler from fusing `a*b + c`
-    // into a single FMA, which would silently change the result and break
-    // bit-reproducibility across platforms. A user `f64` `+`/`*` must compute
-    // exactly what the source says — see `NUMERICS-RESEARCH.md`.
-    cmd.args(["-O2", "-std=c11", "-ffp-contract=off"]);
+    cmd.args(CC_FLAGS);
     // Structured-concurrency output uses pthreads; link it only when present.
     if c_src.contains("pthread") {
         cmd.arg("-pthread");
@@ -610,4 +621,22 @@ fn report(src: &str, path: &str, diags: &[diag::Diagnostic]) -> ExitCode {
     }
     eprintln!("{} error(s)", diags.len());
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod fp_contract_tests {
+    use super::CC_FLAGS;
+
+    /// The floating-point determinism seam is **locked into the build command**, not
+    /// hoped for: every translation unit forbids FMA contraction and value-changing
+    /// fast-math transforms. (Teeth: dropping either flag fails this; that is the
+    /// difference between deterministic and usually-deterministic FP — NUMERICS §3.3.)
+    #[test]
+    fn fp_determinism_flags_are_locked() {
+        assert!(CC_FLAGS.contains(&"-ffp-contract=off"), "FMA contraction must be off: {CC_FLAGS:?}");
+        assert!(CC_FLAGS.contains(&"-fno-fast-math"), "fast-math must be off: {CC_FLAGS:?}");
+        // And the value-changing escape hatches must never be present.
+        assert!(!CC_FLAGS.iter().any(|f| *f == "-ffast-math" || *f == "-Ofast"),
+            "no value-changing FP flags allowed: {CC_FLAGS:?}");
+    }
 }
