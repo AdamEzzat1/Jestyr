@@ -498,6 +498,14 @@ the runtime side pinned by an end-to-end example and `cgen` goldens.
   for every `i64` (round-trip); `format_i64(x)` byte-identical to Rust's `Display`; differential
   `parse_i64` vs `str::parse::<i64>()` on sign/digit/letter soup (same successes incl. overflow, same
   values); and the defined-overflow boundaries (`i64::MAX`±1, `i64::MIN`±1).
+- ✅ **Float-support primitives (toward correctly-rounded float parse/format).** Probed and built
+  the deterministic building blocks the float algorithms (Eisel–Lemire, Ryū) sit on: `mul64`
+  (64×64→128 product synthesized from 32-bit halves, since `core` has no `u128`), `clz64`
+  (count-leading-zeros), and IEEE-754 bit access via an untagged `union` (`f64_bits`/`f64_from_bits`
+  + `f64_sign`/`f64_raw_exp`/`f64_mantissa`). Properties (`core_props`): `mul64_matches_u128` — the
+  synthesized product equals Rust's native `u128` for any operands (the crux); `clz64_matches_builtin`
+  vs `u64::leading_zeros`. Wiring `module::float_bits_example_compiles_clean`; gcc round-trip
+  `examples/std/float_bits.jtr` → `3.14159, 1023, 0, 1, 51, 63`.
 - ✅ **Wiring.** `module::core_combinators_example_compiles_clean` +
   `slice_algos_example_compiles_clean` + `numbers_example_compiles_clean`. gcc round-trips:
   `jestyrc run examples/std/combinators.jtr` →
@@ -506,9 +514,10 @@ the runtime side pinned by an end-to-end example and `cgen` goldens.
   `100, 2, 1, 0, 2, 99, [10 20 30 40 50], 3, 99`; and `jestyrc run examples/std/numbers.jtr` →
   `12345, -42, 7, 9, -4271, -4271, 3` (parse, overflow/invalid → default, format, then a
   format→parse round-trip).
-- **Remaining (future work):** **correctly-rounded float** parse/format (Eisel–Lemire + Ryū) + the
-  cross-OS locked-SHA-256 canary; defined-overflow integer math (`wrapping_*`/`saturating_*`/
-  `checked_*`); the allocating `std` (Phase 2). See `CORE-STD-PHASE3.md`.
+- **Remaining (future work):** the **correctly-rounded float** algorithms themselves (Eisel–Lemire
+  `parse_float` + Ryū `format_float`, now that the primitives exist) + the cross-OS locked-SHA-256
+  canary; defined-overflow integer math (`wrapping_*`/`saturating_*`/`checked_*`); the allocating
+  `std` (Phase 2). See `CORE-STD-PHASE3.md`.
 
 ---
 

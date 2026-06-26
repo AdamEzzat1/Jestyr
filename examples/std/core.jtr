@@ -335,3 +335,71 @@ pub fn format_i64(n: i64, mut buf: []u8) -> usize {
     }
     return format_u64(n as u64, buf)
 }
+
+// ── Float support primitives (toward correctly-rounded parse/format) ──────────
+//
+// `core` has no `u128`, so the 64×64→128 products that correctly-rounded float
+// parse/format (Eisel–Lemire, Ryū) need are synthesized from 32-bit halves; and a
+// float's bits are read via an untagged `union` (byte reinterpretation). These are
+// the deterministic, locale-free building blocks the float algorithms sit on — see
+// CORE-STD-PHASE3.md. The IEEE-754 binary64 layout is sign(1) · exponent(11) ·
+// mantissa(52).
+
+// A 128-bit unsigned value as a high/low `u64` pair.
+pub struct U128 { hi: u64, lo: u64 }
+
+// The full 128-bit product `a * b`, computed from 32-bit halves (no `u128`):
+// (aH·2³² + aL)(bH·2³² + bL), carrying the cross terms into `hi`.
+pub fn mul64(a: u64, b: u64) -> U128 {
+    let mask: u64 = 0xFFFFFFFF
+    let al: u64 = a & mask
+    let ah: u64 = a >> 32
+    let bl: u64 = b & mask
+    let bh: u64 = b >> 32
+    let ll: u64 = al * bl
+    let lh: u64 = al * bh
+    let hl: u64 = ah * bl
+    let hh: u64 = ah * bh
+    let mid: u64 = (ll >> 32) + (lh & mask) + (hl & mask)
+    let lo: u64 = (ll & mask) | (mid << 32)
+    let hi: u64 = hh + (lh >> 32) + (hl >> 32) + (mid >> 32)
+    return U128{ hi: hi, lo: lo }
+}
+
+// Count leading zero bits of a `u64` (`clz64(0) == 64`) — the normalization step
+// Eisel–Lemire needs. A simple shift-until-top-bit loop; a stdlib `@intrinsic`
+// `leading_zeros` can replace it later.
+pub fn clz64(x: u64) -> u32 {
+    if x == 0 { return 64 }
+    let one: u64 = 1
+    let topbit: u64 = one << 63
+    var v: u64 = x
+    var n: u32 = 0
+    for (v & topbit) == 0 {
+        v = v << 1
+        n = n + 1
+    }
+    return n
+}
+
+// A float reinterpreted as its raw bits, and vice-versa — an untagged `union`
+// overlays the two, so reading the other field reinterprets the same bytes.
+union FU { f: f64, u: u64 }
+
+// The raw IEEE-754 bit pattern of an `f64`.
+pub fn f64_bits(x: f64) -> u64 {
+    var fu: FU = FU{ f: x }
+    return fu.u
+}
+
+// The `f64` with the given raw IEEE-754 bit pattern.
+pub fn f64_from_bits(u: u64) -> f64 {
+    var fu: FU = FU{ u: u }
+    return fu.f
+}
+
+// IEEE-754 binary64 field extractors (raw — the exponent is biased by 1023, the
+// mantissa excludes the implicit leading 1 for normals).
+pub fn f64_sign(x: f64) -> u64 { return f64_bits(x) >> 63 }
+pub fn f64_raw_exp(x: f64) -> u64 { return (f64_bits(x) >> 52) & 0x7FF }
+pub fn f64_mantissa(x: f64) -> u64 { return f64_bits(x) & 0xFFFFFFFFFFFFF }

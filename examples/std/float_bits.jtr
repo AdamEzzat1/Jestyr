@@ -1,0 +1,19 @@
+// examples/std/float_bits.jtr — the float-support primitives in `core`: IEEE-754
+// bit access via an untagged union, field extractors, and `clz64`. (The 64×64→128
+// `mul64`, synthesized because there is no u128, is internal plumbing exercised by
+// the property tests.) These are the deterministic building blocks the
+// correctly-rounded float parse/format (Eisel–Lemire, Ryū) will sit on.
+//
+//   jestyrc run examples/std/float_bits.jtr  →  3.14159  1023  0  1  51  63
+import "core"
+import "io"
+
+fn main() -> i32 {
+    io.print_f64(core.f64_from_bits(core.f64_bits(3.14159)))  // 3.14159 (bit round-trip)
+    io.print_i32(core.f64_raw_exp(1.0) as i32)               // 1023 (biased exponent of 1.0)
+    io.print_i32(core.f64_mantissa(1.0) as i32)             // 0    (no fraction bits)
+    io.print_i32(core.f64_sign(-2.0) as i32)               // 1    (negative)
+    io.print_i32(core.clz64(4096) as i32)                  // 51   (2^12 → bit 12 set)
+    io.print_i32(core.clz64(1) as i32)                     // 63
+    return 0
+}

@@ -1370,6 +1370,35 @@ mod core_props {
         format!("{sign}{}", std::str::from_utf8(&digits).unwrap())
     }
 
+    // ── Rust mirrors of core's float-support primitives (same structure) ────────
+    /// Mirror of `core.mul64`: the 64×64→128 product synthesized from 32-bit halves
+    /// (`core` has no `u128`). Validated against Rust's native `u128` below.
+    fn m_mul64(a: u64, b: u64) -> (u64, u64) {
+        let mask = 0xFFFF_FFFFu64;
+        let (al, ah, bl, bh) = (a & mask, a >> 32, b & mask, b >> 32);
+        let ll = al * bl;
+        let lh = al * bh;
+        let hl = ah * bl;
+        let hh = ah * bh;
+        let mid = (ll >> 32) + (lh & mask) + (hl & mask);
+        let lo = (ll & mask) | (mid << 32);
+        let hi = hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
+        (hi, lo)
+    }
+    /// Mirror of `core.clz64`: shift-until-top-bit.
+    fn m_clz64(x: u64) -> u32 {
+        if x == 0 {
+            return 64;
+        }
+        let mut v = x;
+        let mut n = 0u32;
+        while v & (1u64 << 63) == 0 {
+            v <<= 1;
+            n += 1;
+        }
+        n
+    }
+
     /// A self-contained generic slice-fold program at element type `prim` — the real
     /// compiler path the slice algorithms ride (subst through the for-loop / index).
     fn slice_fold_source(prim: &str) -> String {
@@ -1562,6 +1591,25 @@ mod core_props {
             prop_assert_eq!(m_parse_i64("-9223372036854775808"), Some(i64::MIN));
             prop_assert_eq!(m_parse_i64("-9223372036854775809"), None);
             prop_assert_eq!(m_parse_i64("99999999999999999999"), None);
+        }
+
+        // ── float-support primitives (toward correctly-rounded float parse/format) ─
+
+        /// The synthesized 64×64→128 product (no `u128` in `core`) equals the true
+        /// product computed with Rust's native `u128`, for any operands. This is the
+        /// crux primitive Eisel–Lemire / Ryū multiply through.
+        #[test]
+        fn mul64_matches_u128(a in any::<u64>(), b in any::<u64>()) {
+            let p = (a as u128) * (b as u128);
+            let (hi, lo) = m_mul64(a, b);
+            prop_assert_eq!(hi, (p >> 64) as u64);
+            prop_assert_eq!(lo, p as u64);
+        }
+
+        /// `clz64` agrees with the hardware `leading_zeros` for any input.
+        #[test]
+        fn clz64_matches_builtin(x in any::<u64>()) {
+            prop_assert_eq!(m_clz64(x), x.leading_zeros());
         }
     }
 }

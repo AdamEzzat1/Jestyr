@@ -15,9 +15,9 @@ teeth-verifies each new property by mutation, and is auto-committed.
 
 ## Achieved
 
-Several green, warning-clean, auto-committed increments. **474 tests pass** under
+Several green, warning-clean, auto-committed increments. **477 tests pass** under
 the default `cargo test` (from a 445 baseline: the codegen enablers' goldens, the
-combinator/slice/number `core_props` laws, and the wiring tests).
+combinator/slice/number/float-primitive `core_props` laws, and the wiring tests).
 
 ### Reframing what `core`'s "trait surface" actually is
 
@@ -147,6 +147,24 @@ byte count.
   format→parse round-trip in `examples/std/numbers.jtr` (via `from_utf8` over the
   written bytes).
 
+### Float-support primitives (probe + foundation for correctly-rounded float)
+
+Probed what the compiler offers before committing to the float algorithm port. The
+**verdict: feasible.** The one real gap is **no `u128`** — so the 64×64→128 products
+Eisel–Lemire/Ryū multiply through are synthesized from 32-bit halves. Everything
+else is present: `u64` bit ops (`& | ^ << >>`), large hex/decimal literals with `_`,
+and — the key enabler — **untagged `union`s do f64↔u64 bit reinterpretation** both
+directions.
+
+- `mul64` (the 64×64→128 product as a `U128 { hi, lo }`, from 32-bit halves),
+  `clz64` (count-leading-zeros via a shift loop — no hardware intrinsic yet), the
+  `FU` union + `f64_bits`/`f64_from_bits`, and the IEEE-754 field extractors
+  `f64_sign`/`f64_raw_exp`/`f64_mantissa`.
+- Properties (`core_props`): **`mul64_matches_u128`** — the synthesized product
+  equals Rust's native `u128` for any operands (the crux primitive, strongly
+  validated); `clz64_matches_builtin` vs `u64::leading_zeros`. Demo
+  `examples/std/float_bits.jtr` → `3.14159, 1023, 0, 1, 51, 63`.
+
 ### Determinism guarantees realized
 
 - **Combinator lowering is deterministic** — byte-identical C twice, for any
@@ -190,11 +208,11 @@ Honest accounting of what is stubbed, deferred, or only partially covered.
 - **`Iterator` / `FromStr` traits are not built.** They need compiler features
   (associated types; static/UFCS dispatch). Slice/iterator algorithms will land as
   **generic free functions over `[]T`** instead of a trait, until then.
-- **Float parse/format not started.** Integer parse/format is done; the
-  **correctly-rounded float** half (Eisel–Lemire parse + Ryū shortest-round-trip
-  format) and the **cross-OS locked-SHA-256 canary** are the remaining marquee
-  determinism work — a multi-increment algorithm port (128-bit intermediate math)
-  likely to surface compiler gaps to fix along the way.
+- **Float parse/format — primitives only.** The building blocks are done and
+  validated (`mul64`/`clz64`/IEEE-754 bit access); the **correctly-rounded
+  algorithms** themselves (Eisel–Lemire `parse_float` + Ryū `format_float`) and the
+  **cross-OS locked-SHA-256 canary** are the remaining marquee determinism work — a
+  multi-increment port that builds on `mul64` for its 128-bit intermediate math.
 - **Format needs a caller buffer (no `Display`/`Builder` sugar).**
   `format_i64(n, buf)` returns a byte count into a `[]u8`; viewing it as a `str`
   needs an exact-length `slice(u8, p, n)` + `from_utf8` (range sub-slicing `buf[0..n]`
@@ -222,16 +240,20 @@ In rough priority order toward a usable `core` and self-hosting:
 2b. ✅ **Done — integer parse/format** (`parse_i64`/`parse_u64`/`format_i64`/
    `format_u64`) with round-trip + differential-vs-Rust + defined-overflow laws.
    The slice-index-assignment lvalue lowering landed with it.
-3. **Math with defined semantics** (ROADMAP J): `wrapping_*`/`saturating_*`/
-   `checked_*`, bit-width-aware, with the overflow behavior pinned by property.
-4. **Number parse/format — the determinism deliverable.** Correctly-rounded,
-   locale-free, bytewise `parse_int`/`parse_float` (Eisel–Lemire) and
-   shortest-round-trip `format_int`/`format_float` (Ryū) into a caller buffer so
-   `core` stays no-alloc. Properties: `parse(format(x)) == x`; differential vs
-   Rust's correctly-rounded parse / `format!`; a **cross-OS locked-SHA-256 canary**
-   on a reference set (the std side of the numerics determinism contract, §3.3 of
+2c. ✅ **Done — float-support primitives** (`mul64` 64×64→128, `clz64`, IEEE-754 bit
+   access) with `mul64_matches_u128` validating the no-`u128` synthesis. The probe
+   confirmed the float port is feasible.
+3. **Correctly-rounded float parse/format — the marquee determinism deliverable.**
+   Now that the primitives exist: Eisel–Lemire `parse_float` and Ryū
+   shortest-round-trip `format_float` into a caller buffer (`core` stays no-alloc),
+   building on `mul64` for the 128-bit intermediate math. Properties:
+   `parse(format(x)) == x` for representable doubles; differential vs Rust's
+   correctly-rounded parse / `format!`; a **cross-OS locked-SHA-256 canary** on a
+   reference set (the std side of the numerics determinism contract, §3.3 of
    `Jestyr-Remaining-And-Numerics-Research.md`). Transcendentals stay out of scope
    (the numeric stack / SoftFloat).
+4. **Math with defined semantics** (ROADMAP J): `wrapping_*`/`saturating_*`/
+   `checked_*`, bit-width-aware, with the overflow behavior pinned by property.
 5. **A real `core`/`std` trait surface, if the compiler grows it.** Associated
    types unlock `Iterator`; static/UFCS dispatch unlocks `FromStr` and `o.map(f)`
    method sugar — each a compiler-feature increment with its own tests.

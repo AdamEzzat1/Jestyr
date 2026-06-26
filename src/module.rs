@@ -438,6 +438,14 @@ mod tests {
     }
 
     #[test]
+    fn float_bits_example_compiles_clean() {
+        // The float-support primitives in `core` — IEEE-754 bit access via an
+        // untagged union, the field extractors, and `clz64` — resolve across
+        // `import "core"` and lower clean (the foundation for float parse/format).
+        pipeline_is_clean("examples/std/float_bits.jtr");
+    }
+
+    #[test]
     fn numbers_example_compiles_clean() {
         // The core integer parse/format (parse_i64/parse_u64/format_i64/format_u64)
         // resolve across `import "core"` and lower clean — including the slice-index
