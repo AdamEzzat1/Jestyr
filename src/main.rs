@@ -624,6 +624,70 @@ fn report(src: &str, path: &str, diags: &[diag::Diagnostic]) -> ExitCode {
 }
 
 #[cfg(test)]
+mod budget_canary {
+    //! The `selfbench` baseline as an *enforced* regression gate (TESTING.md §5.11).
+    //! Two layers, by robustness:
+    //!  * a **deterministic** codegen-budget gate (emitted-C bytes per source line,
+    //!    AST density) — machine-independent, so it can assert tight bounds; it fires
+    //!    on a real codegen-bloat / output regression, not on a slow CI box;
+    //!  * a **generous** wall-clock floor that only catches a *catastrophic*
+    //!    (order-of-magnitude) throughput regression — the precise speed figure
+    //!    (137K lines/s release) is tracked by `jestyrc selfbench` + a CI job, since a
+    //!    tight wall-clock floor in `cargo test` (debug, varied CI hardware) flakes.
+    use super::gen_bench_program;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+    use crate::{cgen, escape, typeck};
+    use std::time::Instant;
+
+    fn compile(src: &str) -> (usize, usize, usize) {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
+        let nexpr = ast.exprs.len();
+        let (info, _) = typeck::check(&ast);
+        let _ = escape::check(&ast, &info);
+        let (c, _) = cgen::emit(&ast, &info);
+        (c.len(), nexpr, src.lines().count())
+    }
+
+    #[test]
+    fn codegen_budget_stays_within_envelope() {
+        // Deterministic: same generator → same emitted C, on every machine. The
+        // baseline is ~239 emitted-C bytes/line; the ceiling catches a ~35% bloat.
+        let src = gen_bench_program(200);
+        let (cbytes, nexpr, lines) = compile(&src);
+        let c_per_line = cbytes as f64 / lines as f64;
+        assert!(
+            c_per_line < 320.0,
+            "emitted-C budget exceeded: {c_per_line:.1} bytes/source-line (ceiling 320)"
+        );
+        // AST density sanity — a parser/generator regression would move this sharply.
+        assert!(nexpr > lines, "too few AST exprs: {nexpr} for {lines} lines");
+    }
+
+    #[test]
+    fn throughput_has_not_catastrophically_regressed() {
+        // GENEROUS floor: ~13K lines/s in a debug `cargo test`, ~137K release. A
+        // 2K-lines/s floor only trips on a >6x debug regression, so it won't flake on
+        // a slow CI box while still catching a pathological slowdown. The real budget
+        // tracking is `selfbench` (release) + CI — see the module docs.
+        let src = gen_bench_program(200);
+        let lines = src.lines().count() as f64;
+        let runs = 5;
+        let t0 = Instant::now();
+        for _ in 0..runs {
+            let _ = compile(&src);
+        }
+        let per = t0.elapsed().as_secs_f64() / runs as f64;
+        let lines_per_s = lines / per;
+        assert!(
+            lines_per_s > 2000.0,
+            "catastrophic throughput regression: {lines_per_s:.0} lines/s (floor 2000)"
+        );
+    }
+}
+
+#[cfg(test)]
 mod fp_contract_tests {
     use super::CC_FLAGS;
 

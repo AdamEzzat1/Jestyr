@@ -243,13 +243,21 @@ test a feature can have, far beyond the per-feature golden examples.
 - **F (have):** `fuzz_determinism`. Add a long `cargo bolero` soak in CI.
 
 ### 5.11 Benchmarking — speed & memory (deepen §3.5)
+- ✅ **Budget canary (`main::budget_canary`).** The `selfbench` baseline as an *enforced* gate, two
+  layers by robustness: a **deterministic** codegen-budget assert (emitted-C bytes per source line ≤
+  320 — baseline ~239 — plus AST-density sanity), machine-independent so it can be tight and fires on
+  real codegen bloat; and a **generous** wall-clock floor (>2K lines/s) that only catches a
+  catastrophic (>6× debug) regression without flaking on slow CI. Current speed (release):
+  **~137K lines/s** frontend (`cgen` ~47% of it — the one optimization lever); the precise figure is
+  tracked by `jestyrc selfbench` + a CI job (a tight wall-clock floor in `cargo test` would flake).
 - **Per-feature micro-benches** in `selfbench`: a generator knob to emit string-heavy /
   generic-heavy / match-heavy / deeply-nested programs, so each subsystem's throughput is tracked
   separately (today it's one mixed program).
 - **Memory efficiency:** beyond peak/total heap, report **bytes-per-AST-node** and
   **emitted-C-bytes-per-source-line** — efficiency ratios that catch bloat a raw peak misses.
-- **CI budget:** wire `selfbench --release` into a canary that fails if throughput drops below a
-  floor or peak memory rises above a ceiling — turning the §3.5 baseline into an enforced budget.
+- **CI budget (remaining):** wire `selfbench --release` into a scheduled CI canary that fails if
+  throughput drops below the 137K lines/s floor or peak memory rises above a ceiling — the wall-clock
+  half of the budget, run where the hardware is fixed.
 - **Allocation count:** extend the `bench-alloc` allocator to also count *number* of allocations
   (not just bytes) — a proxy for allocator pressure that the arena-AST design aims to keep low.
 
