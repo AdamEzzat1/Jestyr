@@ -1,0 +1,50 @@
+// examples/drop.jtr — deterministic Drop/RAII (design Phase 3).
+//
+// A `Drop` impl is a destructor the compiler runs automatically at scope exit, in
+// reverse declaration order — no runtime drop flags, no hidden per-value bool
+// (the ownership model makes liveness static). A value *moved out* (returned, or
+// given to a consumer) is NOT dropped at its origin: the new owner drops it.
+//
+//   jestyrc run examples/drop.jtr
+//   →   100      (use_res does its work first)
+//       2        (b drops before a — reverse declaration order)
+//       1
+//       200      (back in main)
+//       300      (after binding r = make(7))
+//       7        (r drops once, at main's scope exit before `return 0`)
+
+trait Drop {
+    fn drop(mut self)
+}
+
+struct Res {
+    id: i32,
+}
+
+impl Drop for Res {
+    fn drop(mut self) {
+        print_int(self.id)
+    }
+}
+
+// The constructed value is *returned* (moved to the caller), so it is not dropped
+// inside `make` — the caller owns and drops it.
+fn make(id: i32) -> Res {
+    return Res{ id: id }
+}
+
+// Two owned locals; both drop at scope exit, b before a.
+fn use_res() {
+    let a = Res{ id: 1 }
+    let b = Res{ id: 2 }
+    print_int(100)
+}
+
+fn main() -> i32 {
+    use_res()          // 100, then 2, 1
+    print_int(200)
+
+    let r = make(7)    // r is owned here; drops once at main's scope exit
+    print_int(300)
+    return 0           // before returning: drop r → 7
+}

@@ -282,6 +282,10 @@ enum Mode {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
+    // `emit-c <file> --show-drops` annotates each inserted scope-exit drop call
+    // with a `/* drop … */` comment, so the implicit RAII glue is inspectable.
+    let show_drops = args.iter().any(|a| a == "--show-drops");
+
     // Subcommands that take a file argument.
     let sub = |name: &str, m: Mode| -> Option<Result<(Mode, String), ()>> {
         if args.get(1).map(String::as_str) == Some(name) {
@@ -423,6 +427,8 @@ fn main() -> ExitCode {
             // the ordinary entry-point wrapper.
             let (c_src, cgen_diags) = if matches!(mode, Mode::Test) {
                 cgen::emit_tests(&prog.ast, &info)
+            } else if show_drops && matches!(mode, Mode::EmitC) {
+                cgen::emit_show_drops(&prog.ast, &info)
             } else {
                 cgen::emit(&prog.ast, &info)
             };

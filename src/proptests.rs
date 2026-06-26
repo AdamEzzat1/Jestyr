@@ -741,6 +741,96 @@ mod prop {
     }
 }
 
+/// Property tests for deterministic Drop/RAII scope-exit glue (design Phase 3).
+///
+/// The oracle is *known by construction*: a generator builds a program with a
+/// known number of owned, non-moved droppables, and the property asserts the
+/// emitted C contains exactly that many drop calls — a missed drop (`0`) is a
+/// leak, a doubled one (`≥2`) is a double-free. All pure-Rust (scans emitted C),
+/// so they run under the toolchain-free default `cargo test`.
+mod drop_props {
+    use super::compile;
+    use proptest::prelude::*;
+
+    const PRELUDE: &str = "trait Drop { fn drop(mut self) } struct R { id: i32 } \
+        impl Drop for R { fn drop(mut self) { print_int(self.id) } } ";
+
+    /// Non-overlapping occurrences of `needle` in `hay` (the in-test analogue of
+    /// the handoff's `count_c_definitions` — here counting drop *call sites*).
+    fn count(hay: &str, needle: &str) -> usize {
+        hay.matches(needle).count()
+    }
+
+    /// A function with `n` owned `R` locals (used only by borrow, so all live to
+    /// scope exit), optionally *returning the first* — which then moves to the
+    /// caller and must not be dropped here. Returns `(source, expected_drops)`.
+    fn drop_program(n: usize, move_first: bool) -> (String, usize) {
+        let mut body = String::new();
+        for i in 0..n {
+            body.push_str(&format!("let x{i} = R{{ id: {i} }} "));
+        }
+        let (sig, tail, expected) = if move_first {
+            ("fn f() -> R", "return x0", n - 1)
+        } else {
+            ("fn f()", "", n)
+        };
+        let src = format!("{PRELUDE} {sig} {{ {body}{tail} }} fn main() -> i32 {{ return 0 }}");
+        (src, expected)
+    }
+
+    proptest! {
+        /// Soundness **and** completeness of drop insertion: a function with `n`
+        /// owned, non-moved droppables emits *exactly* `n` drop calls — never
+        /// fewer (a leak) and never more (a double free).
+        #[test]
+        fn drops_each_owned_local_exactly_once(n in 1usize..6) {
+            let (src, expected) = drop_program(n, false);
+            let (c, diags) = compile(&src);
+            prop_assert_eq!(diags, 0, "should compile clean:\n{}", src);
+            prop_assert_eq!(
+                count(&c, "jestyr_impl_Drop__R__drop(&j_x"), expected,
+                "drop-call count mismatch:\n{}", c
+            );
+        }
+
+        /// Drop-after-move elision (known-by-construction): returning a droppable
+        /// moves it, so the origin drops `n-1` values and never the returned one.
+        #[test]
+        fn moved_out_value_is_not_dropped(n in 1usize..6) {
+            let (src, expected) = drop_program(n, true);
+            let (c, _diags) = compile(&src);
+            prop_assert_eq!(
+                count(&c, "jestyr_impl_Drop__R__drop(&j_x"), expected,
+                "moved value dropped at origin:\n{}", c
+            );
+            prop_assert_eq!(
+                count(&c, "jestyr_impl_Drop__R__drop(&j_x0)"), 0,
+                "the moved-out local x0 must not be dropped:\n{}", c
+            );
+        }
+
+        /// No-double-free: for every owned local, its drop call appears at most
+        /// once on the straight-line path (`≤ 1`, never `2`).
+        #[test]
+        fn no_local_is_dropped_twice(n in 1usize..6) {
+            let (src, _e) = drop_program(n, false);
+            let (c, _d) = compile(&src);
+            for i in 0..n {
+                let needle = format!("jestyr_impl_Drop__R__drop(&j_x{i})");
+                prop_assert!(count(&c, &needle) <= 1, "x{} dropped twice:\n{}", i, c);
+            }
+        }
+
+        /// Drop-glue determinism: compiling the same Drop-heavy program twice is
+        /// byte-identical (no iteration-order leak in drop lowering).
+        #[test]
+        fn drop_lowering_is_deterministic(n in 1usize..6) {
+            let (src, _e) = drop_program(n, false);
+            prop_assert_eq!(compile(&src), compile(&src));
+        }
+    }
+}
+
 /// Experiment (feature `dharht-experiment`): the strongest "can D-HARHT replace a
 /// `HashMap`?" check — a sealed D-HARHT (Memory profile) must agree with a HashMap
 /// on every key, across random key sets.
@@ -949,6 +1039,38 @@ mod fuzz {
                  fn use_it(read a: V, read b: V) -> V {{ return a + b }}"
             );
             run_pipeline(&prog);
+            assert_eq!(compile(&prog), compile(&prog));
+        });
+    }
+
+    /// Coverage-guided fuzzing of the **Drop/RAII** path (design Phase 3): fuzz
+    /// bytes fill a `Drop` impl body and a function body holding owned droppable
+    /// locals, so the scope-exit drop-glue insertion + move analysis run on
+    /// adversarial input. Never panics; deterministic.
+    #[test]
+    fn fuzz_drop_alloc_pipeline() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let prog = format!(
+                "trait Drop {{ fn drop(mut self) }} struct R {{ id: i32 }} \
+                 impl Drop for R {{ fn drop(mut self) {{ {s} }} }} \
+                 fn use_it() {{ let a = R{{ id: 1 }} let b = R{{ id: 2 }} {s} }}"
+            );
+            run_pipeline(&prog);
+            assert_eq!(compile(&prog), compile(&prog));
+        });
+    }
+
+    /// Determinism of Drop/RAII lowering under fuzzing: the same Drop-heavy source
+    /// compiles byte-identically (search for an iteration-order leak in drop/move
+    /// analysis).
+    #[test]
+    fn fuzz_drop_alloc_determinism() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let prog = format!(
+                "trait Drop {{ fn drop(mut self) }} struct R {{ id: i32 }} \
+                 impl Drop for R {{ fn drop(mut self) {{ print_int(self.id) }} }} \
+                 fn use_it() -> i32 {{ let a = R{{ id: 1 }} {s} return 0 }}"
+            );
             assert_eq!(compile(&prog), compile(&prog));
         });
     }

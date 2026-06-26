@@ -35,17 +35,25 @@ use crate::types::{prim_ty, ImplCall, MethodRes, Ty, TypeInfo, TypeKindG};
 /// Lower a program to C, ending with the ordinary entry-point wrapper around
 /// the user's `main`.
 pub fn emit(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
-    emit_program(ast, info, false)
+    emit_program(ast, info, false, false)
+}
+
+/// Like [`emit`], but annotates every inserted scope-exit drop call with a
+/// `/* drop … */` comment so the implicit-but-inspectable drop glue is visible in
+/// the emitted C (drives `jestyrc emit-c --show-drops`). Implicit ≠ hidden: the
+/// "transparent cost" thesis says auto-inserted control flow must be inspectable.
+pub fn emit_show_drops(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
+    emit_program(ast, info, false, true)
 }
 
 /// Lower a program to C in *test* mode: instead of the `main` wrapper, emit a
 /// harness `main` that runs every `@test` (reporting pass/fail) and times every
 /// `@bench`. Drives `jestyrc test` (roadmap workstream O).
 pub fn emit_tests(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
-    emit_program(ast, info, true)
+    emit_program(ast, info, true, false)
 }
 
-fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool) -> (String, Vec<Diagnostic>) {
+fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool, show_drops: bool) -> (String, Vec<Diagnostic>) {
     // Index every enum variant by name, so the backend can construct and match
     // on them by finding the owning enum and the variant's payload fields.
     let mut variants = HashMap::new();
@@ -161,6 +169,9 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool) -> (String, Vec<Dia
             })
             .collect(),
         test_mode,
+        show_drops,
+        drop_stack: Vec::new(),
+        cur_moved: HashSet::new(),
     };
     g.spawn_sites = g.collect_spawns();
     g.slice_instances = g.collect_slices();
@@ -384,6 +395,31 @@ struct Cgen<'a> {
     /// emitting a `jestyrc test` harness (`@test`/`@bench` runner) rather than the
     /// ordinary `main` wrapper.
     test_mode: bool,
+    /// annotate each inserted drop call with a `/* drop … */` comment so the
+    /// implicit drop glue is inspectable (`--show-drops`). Implicit ≠ hidden.
+    show_drops: bool,
+    /// the live-droppable stack: one entry per open `{ }` block, holding the owned
+    /// `Drop`-implementing locals declared in it (in declaration order). A normal
+    /// fall-through drops the top entry in reverse; a `return` drops every live
+    /// entry, innermost first. Because a local is only registered *as its `let` is
+    /// emitted*, an early `return` never drops a not-yet-declared local — this is
+    /// the static, drop-flag-free liveness the ownership model buys us.
+    drop_stack: Vec<Vec<DropLocal>>,
+    /// names of the current function's locals whose value *escapes* (is returned,
+    /// passed by value to a call, captured into a struct, or rebound) and so must
+    /// **not** get scope-exit drop glue — the consumer owns it. Over-approximated
+    /// (any by-value escape suppresses the drop), so the result is leak-safe: a
+    /// value is dropped at most once, never twice.
+    cur_moved: HashSet<String>,
+}
+
+/// One owned, `Drop`-implementing local that needs scope-exit drop glue.
+#[derive(Clone)]
+struct DropLocal {
+    /// the Jestyr local name (emitted as `j_<name>`).
+    name: String,
+    /// the `impl Drop for <type>` type key, for the mangled `drop` symbol.
+    key: String,
 }
 
 impl<'a> Cgen<'a> {
@@ -1361,6 +1397,10 @@ impl<'a> Cgen<'a> {
         self.cur_refines =
             f.params.iter().filter_map(|p| p.refine.map(|r| (p.name.name.clone(), r))).collect();
 
+        let mut moved = HashSet::new();
+        self.collect_moved(&f.body, &mut moved);
+        self.cur_moved = moved;
+
         let sig = self.fn_signature(f, c_name);
         let returns_value = self.ret_type(f) != "void";
         self.raw(format!("{sig}\n"));
@@ -1372,6 +1412,7 @@ impl<'a> Cgen<'a> {
         self.cur_ret_cty.clear();
         self.cur_refines.clear();
         self.cur_no_panic = false;
+        self.cur_moved.clear();
     }
 
     /// Like `emit_body`, but prefixed with the function's `requires`
@@ -1379,6 +1420,7 @@ impl<'a> Cgen<'a> {
     fn emit_fn_body(&mut self, block: &Block, ret: bool, requires: &[ExprId]) {
         self.line("{");
         self.depth += 1;
+        self.drop_scope_enter();
         for r in requires {
             let c = self.emit_expr(*r);
             self.line(format!("assert({c});"));
@@ -1396,6 +1438,13 @@ impl<'a> Cgen<'a> {
                 self.emit_stmt(stmt);
             }
         }
+        // A function body that returns by value has already dropped (the tail was a
+        // `return`); a fall-through (void) body drops its locals here.
+        if block_diverges(block, ret) {
+            self.drop_scope_exit_discard();
+        } else {
+            self.drop_scope_exit_emit();
+        }
         self.depth -= 1;
         self.line("}");
     }
@@ -1403,17 +1452,285 @@ impl<'a> Cgen<'a> {
     /// Emit a value-returning `return`, checking any `ensures` postconditions
     /// first (with `result` — emitted as `j_result` — bound to the value).
     fn emit_value_return(&mut self, value: String) {
-        if self.cur_ensures.is_empty() {
+        if self.cur_ensures.is_empty() && !self.has_live_drops() {
             self.line(format!("return {value};"));
             return;
         }
-        let rty = self.cur_ret_cty.clone();
-        self.line(format!("{rty} j_result = {value};"));
+        // Spill to a temp *before* running drops, so the returned value can't read
+        // a local we're about to drop (use-after-drop). The returned value itself,
+        // if a moved-out local, is never in a drop scope (`cur_moved`), so it is
+        // not double-freed. `__auto_type` covers methods, where `cur_ret_cty` is
+        // unset.
+        let decl =
+            if self.cur_ret_cty.is_empty() { "__auto_type".to_string() } else { self.cur_ret_cty.clone() };
+        self.line(format!("{decl} j_result = {value};"));
         for post in self.cur_ensures.clone() {
             let c = self.emit_expr(post);
             self.line(format!("assert({c});"));
         }
+        self.emit_all_drops();
         self.line("return j_result;");
+    }
+
+    // --- Drop / RAII: static, drop-flag-free scope-exit glue (design Phase 3) ---
+
+    /// The `impl Drop for <T>` type key if `ty` has a `Drop` impl, else `None`.
+    /// Only concrete named/primitive receivers are recognised (a generic `Drop`
+    /// impl is future work) — that keeps the glue sound: an unrecognised type
+    /// simply gets no auto-drop.
+    fn drop_key_of(&self, ty: &Ty) -> Option<String> {
+        let key = self.info.table.ty_key(ty);
+        if key.is_empty() {
+            return None;
+        }
+        if self.info.table.impl_index.contains_key(&("Drop".to_string(), key.clone())) {
+            Some(key)
+        } else {
+            None
+        }
+    }
+
+    /// Register a freshly-declared local for scope-exit drop glue, if its type has
+    /// a `Drop` impl and its value does not escape (`cur_moved`). Appends to the
+    /// innermost open drop scope; a no-op when there is none.
+    fn register_drop_local(&mut self, name: &str, ty: &Ty) {
+        if self.cur_moved.contains(name) {
+            return;
+        }
+        let Some(key) = self.drop_key_of(ty) else {
+            return;
+        };
+        if let Some(scope) = self.drop_stack.last_mut() {
+            scope.push(DropLocal { name: name.to_string(), key });
+        }
+    }
+
+    /// Emit the drop call for one local: `drop`'s `mut self` takes the receiver by
+    /// pointer, so we pass `&j_<name>`.
+    fn emit_one_drop(&mut self, d: &DropLocal) {
+        if self.show_drops {
+            self.line(format!("/* drop j_{} : {} */", d.name, d.key));
+        }
+        let f = impl_method_c_name("Drop", &d.key, "drop");
+        self.line(format!("{f}(&j_{});", d.name));
+    }
+
+    /// Open a drop scope for a `{ }` block.
+    fn drop_scope_enter(&mut self) {
+        self.drop_stack.push(Vec::new());
+    }
+
+    /// Close the innermost drop scope, emitting its locals' drops in reverse
+    /// declaration order (the normal fall-through path).
+    fn drop_scope_exit_emit(&mut self) {
+        if let Some(scope) = self.drop_stack.pop() {
+            for d in scope.iter().rev() {
+                let d = d.clone();
+                self.emit_one_drop(&d);
+            }
+        }
+    }
+
+    /// Close the innermost drop scope without emitting (the block already diverged
+    /// via a `return`, which dropped everything).
+    fn drop_scope_exit_discard(&mut self) {
+        self.drop_stack.pop();
+    }
+
+    /// Drop every live local across all open scopes (innermost first) — the
+    /// cleanup run *before* a `return`. Does not pop: the C locals stay in scope
+    /// until the actual `return` statement that follows.
+    fn emit_all_drops(&mut self) {
+        let scopes: Vec<Vec<DropLocal>> = self.drop_stack.iter().rev().cloned().collect();
+        for scope in &scopes {
+            for d in scope.iter().rev() {
+                let d = d.clone();
+                self.emit_one_drop(&d);
+            }
+        }
+    }
+
+    /// True if any open scope holds a live droppable — i.e. a `return` here needs
+    /// to spill its value to a temp, run drops, then return.
+    fn has_live_drops(&self) -> bool {
+        self.drop_stack.iter().any(|s| !s.is_empty())
+    }
+
+    /// Compute the set of a function's locals whose value *escapes* and so must
+    /// not be auto-dropped. Over-approximated (leak-safe): a name is "moved" if it
+    /// is returned, passed by value to any call, captured into a struct literal,
+    /// rebound, or used as the receiver of a `take self` method. Borrows (a field
+    /// read, an index, a `read`/`mut self` method call) do **not** move it.
+    fn collect_moved(&self, block: &Block, out: &mut HashSet<String>) {
+        let n = block.stmts.len();
+        for (i, stmt) in block.stmts.iter().enumerate() {
+            match stmt {
+                Stmt::Let { init: Some(e), .. } => {
+                    if let Some(name) = self.as_name(*e) {
+                        out.insert(name);
+                    }
+                    self.collect_moved_expr(*e, out);
+                }
+                Stmt::Let { init: None, .. } => {}
+                Stmt::Return { value: Some(e), .. } => {
+                    if let Some(name) = self.as_name(*e) {
+                        out.insert(name);
+                    }
+                    self.collect_moved_expr(*e, out);
+                }
+                Stmt::Return { value: None, .. } => {}
+                Stmt::Expr(e) => {
+                    // The block's tail expression may be an implicit return value.
+                    if i + 1 == n {
+                        if let Some(name) = self.as_name(*e) {
+                            out.insert(name);
+                        }
+                    }
+                    self.collect_moved_expr(*e, out);
+                }
+            }
+        }
+    }
+
+    /// The bare local name an expression refers to, if it is exactly `Name(n)`.
+    fn as_name(&self, id: ExprId) -> Option<String> {
+        match &self.ast.expr_at(id).kind {
+            ExprKind::Name(n) => Some(n.name.clone()),
+            _ => None,
+        }
+    }
+
+    /// The receiver-parameter convention of a resolved method/impl/operator call,
+    /// if the callee is a `recv.m(args)` form. Used to spot a `take self` consume.
+    fn recv_conv_of(&self, call_id: ExprId) -> Option<Conv> {
+        if let Some(mr) = self.info.method_calls.get(&call_id) {
+            return Some(mr.recv_conv);
+        }
+        if let Some(ic) = self.info.impl_calls.get(&call_id) {
+            return self
+                .find_impl_method(&ic.trait_name, &ic.type_key, &ic.method)
+                .and_then(|f| f.params.iter().find(|p| p.is_self).map(|p| p.conv));
+        }
+        None
+    }
+
+    fn collect_moved_expr(&self, id: ExprId, out: &mut HashSet<String>) {
+        let ast = self.ast;
+        match &ast.expr_at(id).kind {
+            ExprKind::Call { callee, args } => {
+                // Every by-value argument that is a bare name escapes into the
+                // callee (`take` owns it; a `read`/by-value copy is treated the
+                // same, conservatively — leak-safe).
+                for a in args {
+                    if let Some(name) = self.as_name(*a) {
+                        out.insert(name);
+                    }
+                }
+                // A `take self` receiver consumes the base.
+                if matches!(self.recv_conv_of(id), Some(Conv::Take)) {
+                    if let ExprKind::Field { base, .. } = &ast.expr_at(*callee).kind {
+                        if let Some(name) = self.as_name(*base) {
+                            out.insert(name);
+                        }
+                    }
+                }
+                self.collect_moved_expr(*callee, out);
+                for a in args {
+                    self.collect_moved_expr(*a, out);
+                }
+            }
+            ExprKind::Assign { target, value, .. } => {
+                if let Some(name) = self.as_name(*value) {
+                    out.insert(name);
+                }
+                self.collect_moved_expr(*target, out);
+                self.collect_moved_expr(*value, out);
+            }
+            ExprKind::StructLit { fields, spread, .. } => {
+                for f in fields {
+                    if let Some(name) = self.as_name(f.value) {
+                        out.insert(name);
+                    }
+                    self.collect_moved_expr(f.value, out);
+                }
+                if let Some(s) = spread {
+                    self.collect_moved_expr(*s, out);
+                }
+            }
+            ExprKind::GenStructLit { fields, .. } => {
+                for f in fields {
+                    if let Some(name) = self.as_name(f.value) {
+                        out.insert(name);
+                    }
+                    self.collect_moved_expr(f.value, out);
+                }
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.collect_moved_expr(*lhs, out);
+                self.collect_moved_expr(*rhs, out);
+            }
+            ExprKind::Unary { rhs, .. } => self.collect_moved_expr(*rhs, out),
+            ExprKind::Range { lo, hi, .. } => {
+                if let Some(l) = lo {
+                    self.collect_moved_expr(*l, out);
+                }
+                if let Some(h) = hi {
+                    self.collect_moved_expr(*h, out);
+                }
+            }
+            ExprKind::Field { base, .. } => self.collect_moved_expr(*base, out),
+            ExprKind::Index { base, index } => {
+                self.collect_moved_expr(*base, out);
+                self.collect_moved_expr(*index, out);
+            }
+            ExprKind::Deref { base } => self.collect_moved_expr(*base, out),
+            ExprKind::Cast { expr, .. } => self.collect_moved_expr(*expr, out),
+            ExprKind::Try { base } => self.collect_moved_expr(*base, out),
+            ExprKind::If { cond, then, els } => {
+                self.collect_moved_expr(*cond, out);
+                self.collect_moved(then, out);
+                if let Some(e) = els {
+                    self.collect_moved_expr(*e, out);
+                }
+            }
+            ExprKind::Match { scrut, arms } => {
+                self.collect_moved_expr(*scrut, out);
+                for a in arms {
+                    if let Some(g) = a.guard {
+                        self.collect_moved_expr(g, out);
+                    }
+                    self.collect_moved_expr(a.body, out);
+                }
+            }
+            ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::Concurrent(b) => {
+                self.collect_moved(b, out)
+            }
+            ExprKind::Region { body, .. } => self.collect_moved(body, out),
+            ExprKind::Closure { body, .. } => self.collect_moved_expr(*body, out),
+            ExprKind::Spawn(inner) => self.collect_moved_expr(*inner, out),
+            ExprKind::For { head, body, els, .. } => {
+                match head {
+                    ForHead::While(c) => self.collect_moved_expr(*c, out),
+                    ForHead::Iter { sources, .. } => {
+                        for s in sources {
+                            self.collect_moved_expr(*s, out);
+                        }
+                    }
+                    ForHead::Infinite => {}
+                }
+                self.collect_moved(body, out);
+                if let Some(els) = els {
+                    self.collect_moved(els, out);
+                }
+            }
+            ExprKind::Invariant(e) | ExprKind::Variant(e) => self.collect_moved_expr(*e, out),
+            ExprKind::FString { exprs, .. } => {
+                for e in exprs {
+                    self.collect_moved_expr(*e, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The C result-struct name if `f` is fallible, otherwise empty.
@@ -1599,6 +1916,7 @@ impl<'a> Cgen<'a> {
     fn emit_body(&mut self, block: &Block, ret: bool) {
         self.line("{");
         self.depth += 1;
+        self.drop_scope_enter();
         let n = block.stmts.len();
         for (i, stmt) in block.stmts.iter().enumerate() {
             let last = i + 1 == n;
@@ -1611,6 +1929,11 @@ impl<'a> Cgen<'a> {
             } else {
                 self.emit_stmt(stmt);
             }
+        }
+        if block_diverges(block, ret) {
+            self.drop_scope_exit_discard();
+        } else {
+            self.drop_scope_exit_emit();
         }
         self.depth -= 1;
         self.line("}");
@@ -1639,6 +1962,16 @@ impl<'a> Cgen<'a> {
                     format!("{cty} j_{};", name.name)
                 };
                 self.line(text);
+                // Register the local for scope-exit drop glue *after* its
+                // declaration, so an earlier `return` never references it.
+                let lty = if let Some(t) = ty {
+                    self.ast_type_to_ty(*t, &self.subst.clone())
+                } else if let Some(e) = init {
+                    self.info.type_of(*e).clone()
+                } else {
+                    Ty::Unknown
+                };
+                self.register_drop_local(&name.name, &lty);
             }
             Stmt::Return { value, .. } => self.emit_return(*value),
             Stmt::Expr(e) => {
@@ -1664,6 +1997,7 @@ impl<'a> Cgen<'a> {
 
     fn emit_return(&mut self, value: Option<ExprId>) {
         let Some(e) = value else {
+            self.emit_all_drops();
             self.line("return;");
             return;
         };
@@ -4938,11 +5272,20 @@ impl<'a> Cgen<'a> {
     fn emit_loop_body(&mut self, body: &Block) {
         self.line("{");
         self.depth += 1;
+        self.drop_scope_enter();
         if let Some(name) = self.scratch_reset.take() {
             self.line(format!("j_{name}.off = 0;"));
         }
         for stmt in &body.stmts {
             self.emit_stmt(stmt);
+        }
+        // A droppable created inside the loop drops at the end of each iteration
+        // (`break`/`continue` short-circuit it — leak-safe; precise per-path loop
+        // drops are future work).
+        if matches!(body.stmts.last(), Some(Stmt::Return { .. })) {
+            self.drop_scope_exit_discard();
+        } else {
+            self.drop_scope_exit_emit();
         }
         if let Some(lbl) = self.cont_label.take() {
             self.line(format!("{lbl}__continue: ;"));
@@ -5409,9 +5752,16 @@ impl<'a> Cgen<'a> {
     fn emit_region(&mut self, name: &str, body: &Block) {
         self.line("{");
         self.depth += 1;
+        self.drop_scope_enter();
         self.line(format!("JestyrArena j_{name} = jestyr_arena_new(1u << 20);"));
         for stmt in &body.stmts {
             self.emit_stmt(stmt);
+        }
+        // Per-value drops run before the arena is freed in bulk.
+        if matches!(body.stmts.last(), Some(Stmt::Return { .. })) {
+            self.drop_scope_exit_discard();
+        } else {
+            self.drop_scope_exit_emit();
         }
         self.line(format!("jestyr_arena_free(&j_{name});"));
         self.depth -= 1;
@@ -6126,6 +6476,15 @@ fn borrow_ptr_cty(base: &str, conv: Conv) -> String {
     }
 }
 
+/// Does control flow leave `block` via a `return` rather than falling off its
+/// closing brace? When `ret` is set the caller emits the tail statement as a
+/// `return` (so the block always diverges); otherwise only an explicit trailing
+/// `Stmt::Return` diverges. Used to decide whether scope-exit drop glue runs at
+/// the `}` (fall-through) or was already emitted before the `return`.
+fn block_diverges(block: &Block, ret: bool) -> bool {
+    ret || matches!(block.stmts.last(), Some(Stmt::Return { .. }))
+}
+
 /// The C symbol for a trait-`impl` method: `jestyr_impl_<Trait>__<TypeKey>__<method>`.
 /// The type key (`i32`, `Point`, …) is sanitised to a C identifier so exotic
 /// receiver types can't produce an invalid symbol. Both the definition and the
@@ -6336,6 +6695,64 @@ mod tests {
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("if ((j_n <= 1))"), "{c}");
         assert!(c.contains("return 1;"), "{c}");
+    }
+
+    // --- Drop / RAII (design Phase 3) ---
+
+    const DROP_PRELUDE: &str = "trait Drop { fn drop(mut self) } struct R { id: i32 } \
+        impl Drop for R { fn drop(mut self) { print_int(self.id) } } ";
+
+    #[test]
+    fn droppable_local_emits_a_scope_exit_drop_call() {
+        let (c, d) = gen(&format!("{DROP_PRELUDE} fn use_it() {{ let a = R{{ id: 1 }} }}"));
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("jestyr_impl_Drop__R__drop(&j_a);"), "{c}");
+    }
+
+    #[test]
+    fn drops_run_in_reverse_declaration_order() {
+        let (c, d) =
+            gen(&format!("{DROP_PRELUDE} fn two() {{ let a = R{{ id: 1 }} let b = R{{ id: 2 }} }}"));
+        assert!(d.is_empty(), "{:?}", d);
+        let drop_b = c.find("jestyr_impl_Drop__R__drop(&j_b)").expect("b dropped");
+        let drop_a = c.find("jestyr_impl_Drop__R__drop(&j_a)").expect("a dropped");
+        assert!(drop_b < drop_a, "b must drop before a (reverse order):\n{c}");
+    }
+
+    #[test]
+    fn moved_out_value_is_not_dropped_at_origin() {
+        // The constructed value is returned (moved), so `make` emits no drop glue:
+        // no drop *call site* (`__drop(&j_…`) exists anywhere in the program.
+        let (c, d) = gen(&format!("{DROP_PRELUDE} fn make() -> R {{ return R{{ id: 9 }} }}"));
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(!c.contains("__drop(&j_"), "make must not drop its returned value:\n{c}");
+    }
+
+    #[test]
+    fn returned_local_moves_and_is_not_dropped() {
+        // `r` is returned, so it is a move — dropped by the caller, not here.
+        let (c, d) =
+            gen(&format!("{DROP_PRELUDE} fn pass() -> R {{ let r = R{{ id: 3 }} return r }}"));
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(!c.contains("jestyr_impl_Drop__R__drop(&j_r)"), "moved `r` must not drop:\n{c}");
+    }
+
+    #[test]
+    fn show_drops_annotates_the_glue() {
+        let src = format!("{DROP_PRELUDE} fn use_it() {{ let a = R{{ id: 1 }} }}");
+        let (tokens, _) = Lexer::new(&src).tokenize();
+        let (ast, _) = Parser::new(&src, tokens).parse();
+        let (info, _) = crate::typeck::check(&ast);
+        let (c, _d) = emit_show_drops(&ast, &info);
+        assert!(c.contains("/* drop j_a : R */"), "show-drops comment missing:\n{c}");
+    }
+
+    #[test]
+    fn non_droppable_local_gets_no_glue() {
+        // A plain struct without a `Drop` impl is never auto-dropped.
+        let (c, d) = gen("struct P { x: i32 } fn f() { let p = P{ x: 1 } }");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(!c.contains("__drop"), "no Drop impl ⇒ no glue:\n{c}");
     }
 
     #[test]
