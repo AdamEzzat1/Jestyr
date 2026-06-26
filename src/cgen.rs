@@ -2286,7 +2286,11 @@ impl<'a> Cgen<'a> {
             _ => return,
         };
 
-        let scrut_ty = self.info.type_of(scrut).clone();
+        // Resolve the scrutinee type through the active monomorphization
+        // substitution: inside a generic function `o: Option(T)` is inferred as
+        // `Option(T)` with `T` opaque, but the instance being emitted binds `T` to a
+        // concrete type, so the tag prefix, C type, and payload bindings must use it.
+        let scrut_ty = apply_subst(&self.info.type_of(scrut).clone(), &self.subst);
         // A nested sub-pattern (a constructor inside a variant's fields) needs the
         // recursive decision-tree lowering — the flat switch/if-chain can't dispatch
         // it. Flat matches (bindings/`_`/`..` fields) keep their optimized paths.
@@ -3074,8 +3078,11 @@ impl<'a> Cgen<'a> {
             Some(v) => v,
             None => return "0".to_string(),
         };
-        // A generic-enum instance: the instantiation comes from the inferred type.
-        if let Ty::GenEnum { ctor, args } = self.info.type_of(id).clone() {
+        // A generic-enum instance: the instantiation comes from the inferred type,
+        // resolved through the active monomorphization substitution (so an `Option(U)`
+        // built inside a generic function names the concrete `Option(i32)` instance).
+        let inferred = self.info.type_of(id).clone();
+        if let Ty::GenEnum { ctor, args } = apply_subst(&inferred, &self.subst) {
             if !args.iter().all(Self::is_concrete) {
                 let sp = self.ast.expr_at(id).span;
                 self.diag(sp, format!("cannot infer the type arguments of generic enum `{ctor}` here"));
@@ -3136,7 +3143,11 @@ impl<'a> Cgen<'a> {
     ) -> String {
         // A generic-enum instance: the instantiation comes from this expression's
         // inferred type (`Option(i32)`), so the right monomorphized struct is used.
-        if let Ty::GenEnum { ctor, args: targs } = self.info.type_of(construct_id).clone() {
+        // Inside a generic function the inferred type is `Option(U)` with `U` still
+        // opaque; the active monomorphization substitution resolves it to a concrete
+        // instance (`{U -> i32}` => `Option(i32)`) before we check or name it.
+        let inferred = self.info.type_of(construct_id).clone();
+        if let Ty::GenEnum { ctor, args: targs } = apply_subst(&inferred, &self.subst) {
             if !targs.iter().all(Self::is_concrete) {
                 self.diag(
                     self.ast.expr_at(construct_id).span,
@@ -6228,6 +6239,23 @@ impl<'a> Cgen<'a> {
                 }
             }
         }
+        // A monomorphized generic *function* contributes the concrete fn-pointer type
+        // of each fn-pointer parameter (and return) under its substitution — e.g.
+        // `opt_map(i32, i32)`'s `f: fn(T) -> U` yields `fn(i32) -> i32`. Without this a
+        // higher-order generic combinator's signature references an un-emitted typedef.
+        for (name, args) in &self.instances {
+            let Some(f) = self.find_fn(name) else { continue };
+            let subst = self.make_subst(f, args);
+            let sig_tys = f.params.iter().filter_map(|p| p.ty).chain(f.ret_ty);
+            for ty in sig_tys {
+                if matches!(self.ast.type_at(ty).kind, TypeKind::Fn { .. }) {
+                    let fty = self.ast_type_to_ty(ty, &subst);
+                    if Self::is_concrete(&fty) && seen.insert(self.ty_mangle(&fty)) {
+                        out.push(fty);
+                    }
+                }
+            }
+        }
         out
     }
 
@@ -6394,6 +6422,14 @@ impl<'a> Cgen<'a> {
                 let a: Vec<String> = args.iter().map(|t| self.ty_mangle(t)).collect();
                 format!("{ctor}__{}", a.join("_"))
             }
+            // A generic enum instance mangles like a generic struct (so an
+            // `Option(i32)`-returning fn-pointer gets a distinct typedef from an
+            // `Option(f64)`-returning one — without this both collide on `x`).
+            Ty::GenEnum { ctor, args } => {
+                let a: Vec<String> = args.iter().map(|t| self.ty_mangle(t)).collect();
+                format!("{ctor}__{}", a.join("_"))
+            }
+            Ty::Result(ok) => format!("result_{}", self.ty_mangle(ok)),
             Ty::Slice(elem) => format!("slice_{}", self.ty_mangle(elem)),
             Ty::GenRef(elem) => format!("ref_{}", self.ty_mangle(elem)),
             Ty::RegionRef(elem) => format!("rref_{}", self.ty_mangle(elem)),
@@ -6739,6 +6775,9 @@ fn apply_subst(t: &Ty, subst: &HashMap<String, Ty>) -> Ty {
         Ty::Result(ok) => Ty::Result(Box::new(apply_subst(ok, subst))),
         Ty::GenStruct { ctor, args } => {
             Ty::GenStruct { ctor: ctor.clone(), args: args.iter().map(|a| apply_subst(a, subst)).collect() }
+        }
+        Ty::GenEnum { ctor, args } => {
+            Ty::GenEnum { ctor: ctor.clone(), args: args.iter().map(|a| apply_subst(a, subst)).collect() }
         }
         Ty::Slice(elem) => Ty::Slice(Box::new(apply_subst(elem, subst))),
         Ty::GenRef(elem) => Ty::GenRef(Box::new(apply_subst(elem, subst))),
@@ -8634,6 +8673,65 @@ mod tests {
         // Match switches on the instance's tag and binds the substituted payload.
         assert!(c.contains("case Jestyr_Option__i32_some:"), "match case: {c}");
         assert!(c.contains("int32_t j_v = "), "payload bound at concrete type: {c}");
+    }
+
+    #[test]
+    fn monomorphizes_a_generic_enum_inside_a_generic_function() {
+        // A generic combinator that *constructs* and *matches* a generic enum:
+        // inside `wrap`/`unwrap_or` the inferred type is `Option(U)`/`Option(T)`
+        // with the parameter still opaque; the active monomorphization substitution
+        // resolves it to the concrete instance for construction, the match tag
+        // prefix, and the payload binding. The nullary `none` in `return`/tail
+        // position inherits the function's return type. (Regression: previously
+        // these emitted a "cannot infer the type arguments" diagnostic or named the
+        // opaque `Option__U`/`Option__T`.)
+        let src = "enum Option(T) { none, some(v: T) } \
+                   fn wrap(comptime U: type, take v: U) -> Option(U) { return some(v) } \
+                   fn unwrap_or(comptime T: type, take o: Option(T), take d: T) -> T { match o { some(v) => v, none => d } } \
+                   fn main() -> i32 { return unwrap_or(i32, wrap(i32, 42), 0) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "no 'cannot infer' diagnostic inside the generic fn: {:?}", d);
+        assert!(c.contains(".tag = Jestyr_Option__i32_some"), "generic construction substituted: {c}");
+        assert!(c.contains("case Jestyr_Option__i32_some:"), "generic match substituted: {c}");
+        assert!(!c.contains("Option__U"), "the opaque param U was substituted away: {c}");
+        assert!(!c.contains("Option__T_"), "the opaque param T was substituted away: {c}");
+    }
+
+    #[test]
+    fn collects_fn_pointer_typedef_through_a_generic_signature() {
+        // A higher-order generic combinator: `opt_map`'s `f: fn(T) -> U` parameter
+        // must contribute the *concrete* fn-pointer typedef (`fn(i32) -> i32`) per
+        // instance, or its monomorphized signature would reference an un-emitted
+        // typedef. (Regression: fn-pointer typedefs were collected from struct
+        // fields but not from generic function signatures.)
+        let src = "enum Option(T) { none, some(v: T) } \
+                   fn opt_map(comptime T: type, comptime U: type, take o: Option(T), f: fn(T) -> U) -> Option(U) { match o { some(v) => some(f(v)), none => none } } \
+                   fn inc(x: i32) -> i32 { return x + 1 } \
+                   fn main() -> i32 { var a: Option(i32) = some(41) var b = opt_map(i32, i32, a, &inc) return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("typedef int32_t (*JestyrFn_fn_di32_ret_i32)(int32_t);"), "fn-ptr typedef: {c}");
+        assert!(
+            c.contains("jestyr_opt_map__i32_i32(Jestyr_Option__i32 j_o, JestyrFn_fn_di32_ret_i32 j_f)"),
+            "instance signature references the typedef: {c}"
+        );
+    }
+
+    #[test]
+    fn generic_combinator_lowers_deterministically() {
+        // The new collectors (fn-pointer typedefs through generic signatures; generic
+        // enum instances) iterate ordered `Vec`s and a pure substitution, so the same
+        // combinator-heavy source must emit byte-identical C every run — no iteration
+        // -order leak (the `compilation_is_deterministic` discipline, applied here).
+        let src = "enum Option(T) { none, some(v: T) } \
+                   fn opt_map(comptime T: type, comptime U: type, take o: Option(T), f: fn(T) -> U) -> Option(U) { match o { some(v) => some(f(v)), none => none } } \
+                   fn opt_unwrap_or(comptime T: type, take o: Option(T), take d: T) -> T { match o { some(v) => v, none => d } } \
+                   fn inc(x: i32) -> i32 { return x + 1 } \
+                   fn main() -> i32 { var a: Option(i32) = some(41) return opt_unwrap_or(i32, opt_map(i32, i32, a, &inc), 0) }";
+        let (c1, d1) = gen(src);
+        let (c2, _d2) = gen(src);
+        assert!(d1.is_empty(), "{:?}", d1);
+        assert_eq!(c1, c2, "combinator lowering must be byte-identical across runs");
     }
 
     #[test]

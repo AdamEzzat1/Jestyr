@@ -1267,10 +1267,18 @@ impl<'a> TypeChecker<'a> {
             let name = if p.is_self { "self".to_string() } else { p.name.name.clone() };
             scope[0].insert(name, pty);
         }
-        // The (ok) return type is the expected type for `return <expr>`.
+        // The (ok) return type is the expected type for `return <expr>` and for the
+        // block's **tail expression** (an implicit return). Seeding `cur_expected`
+        // here lets a tail `match`/`if` propagate the return type into its arms, so a
+        // nullary generic variant in tail position resolves: `-> Option(U) { match …
+        // { none => none } }`. Non-tail `let`/`return` statements save/restore
+        // `cur_expected`, so by the tail it is back to this seeded value.
         let prev_ret = self.cur_ret.take();
         self.cur_ret = f.ret_ty.map(|t| self.lower_type(&typ, t));
+        let prev_exp = self.cur_expected.take();
+        self.cur_expected = self.cur_ret.clone();
         self.infer_block(&mut scope, &typ, self_ty, &f.body);
+        self.cur_expected = prev_exp;
         self.cur_ret = prev_ret;
         self.cur_type_param_bounds = prev_bounds;
     }
