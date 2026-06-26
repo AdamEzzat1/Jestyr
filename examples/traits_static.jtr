@@ -1,0 +1,35 @@
+// Traits — Stage C: static, monomorphized dispatch. A `recv.m(args)` call that
+// resolves through `impl Trait for <recv>` lowers to a *direct* call of the
+// emitted impl-method function (no vtable): the receiver type is known at the
+// call site, so the target is fixed at compile time.
+
+trait Greet {
+    fn greet(read self) -> i32
+    fn greet_plus(read self, k: i32) -> i32
+}
+
+// An impl for a *primitive* receiver — `self` is the i32 value itself.
+impl Greet for i32 {
+    fn greet(read self) -> i32 { return self + 1 }
+    fn greet_plus(read self, k: i32) -> i32 { return self + k }
+}
+
+struct Point { x: i32, y: i32 }
+
+// An impl for a *struct* receiver — `self` projects its fields.
+impl Greet for Point {
+    fn greet(read self) -> i32 { return self.x + self.y }
+    fn greet_plus(read self, k: i32) -> i32 { return self.x + self.y + k }
+}
+
+fn main() -> i32 {
+    let n = 41
+    print_int(n.greet())          // 42  — Greet for i32
+    print_int(n.greet_plus(100))  // 141 — with an explicit argument
+
+    let p = Point{ x: 10, y: 5 }
+    print_int(p.greet())          // 15  — Greet for Point (distinct impl)
+    print_int(p.greet_plus(3))    // 18
+
+    return 0
+}

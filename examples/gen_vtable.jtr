@@ -20,5 +20,11 @@ fn main() -> i32 {
     let c = Box(i32){ op: |x| x + 100 }
     print_int(c.op(41)) // expect 141
 
+    // Bare field *read*: bind the fn-pointer field to a local, then call through
+    // it. The read resolves under the struct's type args (`fn(i32) -> i32`), so
+    // `f(7)` is a typed indirect call.
+    let f = b.op
+    print_int(f(7)) // expect 8
+
     return 0
 }

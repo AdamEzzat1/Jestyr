@@ -270,6 +270,28 @@ mod prop {
             prop_assert_eq!(compile(&p), compile(&p));
         }
 
+        /// **The bare generic-struct field-read invariant**: reading a fn-pointer
+        /// field off a generic-struct value (`let f = b.op`) resolves the field's
+        /// type under substitution, so the later `f(n)` infers `t` rather than
+        /// `Unknown`. Teeth: reverting `field_type`'s `Ty::GenStruct` arm makes
+        /// the read — and the call through it — type as `Unknown`.
+        #[test]
+        fn generic_vtable_bare_field_read_types_under_substitution(
+            (p, t) in arb_gen_vtable_read_program(),
+        ) {
+            let (ast, info) = typeck_full(&p);
+            let call = ast
+                .exprs
+                .iter()
+                .enumerate()
+                .find_map(|(i, e)| {
+                    matches!(e.kind, crate::ast::ExprKind::Call { .. })
+                        .then_some(crate::ast::ExprId(i as u32))
+                })
+                .expect("the f(n) call");
+            prop_assert_eq!(info.type_of(call), &crate::types::Ty::Prim(t), "program: {}", p);
+        }
+
         // ── traits / interfaces, Stage A (parse + represent) ──────────────────
 
         /// A generated trait program — a trait (required + default methods), an
@@ -352,6 +374,28 @@ mod prop {
             prop_assert_eq!(n_ab, 1);
             prop_assert_eq!(n_ab, n_ba);
         }
+
+        // ── traits, Stage C: static dispatch ──────────────────────────────────
+
+        /// **Static-dispatch lowering.** A `recv.m()` call resolved through
+        /// `impl xShow for <t>` lowers to a *direct* call of the mangled
+        /// impl-method symbol — for every concrete receiver type the generator
+        /// picks. Teeth: with Stage C disabled the call falls through to a
+        /// receiver-less form and this exact symbol-with-receiver never appears.
+        #[test]
+        fn trait_call_lowers_to_a_direct_impl_method_call((p, t) in arb_trait_call_program()) {
+            let (c, _) = compile(&p);
+            let call = format!("jestyr_impl_xShow__{t}__xm(j_s)");
+            prop_assert!(c.contains(&call), "expected a direct static call `{}`:\n{}", call, c);
+        }
+
+        /// Determinism holds on trait-dispatch programs — byte-identical C and the
+        /// same diagnostic count every run (impl-method emission iterates the item
+        /// list in source order; the mangle is a pure function of the resolution).
+        #[test]
+        fn trait_call_programs_compile_deterministically((p, _t) in arb_trait_call_program()) {
+            prop_assert_eq!(compile(&p), compile(&p));
+        }
     }
 
     /// A concrete primitive type to `impl` a trait for.
@@ -376,6 +420,21 @@ mod prop {
                 sigs.join("  "),
                 impls.join("  "),
             )
+        })
+    }
+
+    /// A small *valid* program that actually *calls* a trait method method-style
+    /// (`s.xm()`) on a concrete receiver `t`, so the call resolves through
+    /// `impl xShow for <t>` and exercises Stage C static-dispatch lowering. Paired
+    /// with `t` — the receiver type whose mangled symbol the call must target.
+    fn arb_trait_call_program() -> impl Strategy<Value = (String, &'static str)> {
+        arb_prim_ty().prop_map(|t| {
+            let prog = format!(
+                "trait xShow {{ fn xm(read self) -> i32 }} \
+                 impl xShow for {t} {{ fn xm(read self) -> i32 {{ return 7 }} }} \
+                 fn xuse(read s: {t}) -> i32 {{ return s.xm() }}"
+            );
+            (prog, t)
         })
     }
 
@@ -422,6 +481,20 @@ mod prop {
             let prog = format!(
                 "fn xBox(comptime T: type) -> type {{ return struct {{ op: fn(T) -> T }} }} \
                  fn xuse(n: {t}) -> {t} {{ let b = xBox({t}){{ op: |x| x }} return b.op(n) }}"
+            );
+            (prog, t)
+        })
+    }
+
+    /// Like [`arb_gen_vtable_program`], but the fn-pointer field is *read* into a
+    /// local before being called (`let f = b.op  return f(n)`) — the bare
+    /// field-read path through `field_type`'s generic-struct arm. The call's
+    /// result type must still resolve to `t` under substitution.
+    fn arb_gen_vtable_read_program() -> impl Strategy<Value = (String, &'static str)> {
+        arb_prim_ty().prop_map(|t| {
+            let prog = format!(
+                "fn xBox(comptime T: type) -> type {{ return struct {{ op: fn(T) -> T }} }} \
+                 fn xuse(n: {t}) -> {t} {{ let b = xBox({t}){{ op: |x| x }} let f = b.op return f(n) }}"
             );
             (prog, t)
         })
@@ -585,6 +658,24 @@ mod fuzz {
             let prog = format!(
                 "trait T {{ fn m(read self) -> i32 }} \
                  impl T for i32 {{ {s} }} fn u[X: T](read x: X) -> i32 {{ {s} }}"
+            );
+            run_pipeline(&prog);
+            assert_eq!(compile(&prog), compile(&prog));
+        });
+    }
+
+    /// Coverage-guided fuzzing of **Stage C static dispatch**: the fuzzer's bytes
+    /// fill the impl-method body — now actually *emitted* — while a real
+    /// `x.m()` call drives the dispatch lowering. Exercises `emit_impl_call`,
+    /// `emit_impl_method_decl`, and the mangle on arbitrary body soup; the
+    /// pipeline must stay total *and* deterministic.
+    #[test]
+    fn fuzz_trait_static_dispatch() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let prog = format!(
+                "trait T {{ fn m(read self) -> i32 }} \
+                 impl T for i32 {{ fn m(read self) -> i32 {{ {s} }} }} \
+                 fn u(read x: i32) -> i32 {{ return x.m() }}"
             );
             run_pipeline(&prog);
             assert_eq!(compile(&prog), compile(&prog));

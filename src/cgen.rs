@@ -29,7 +29,7 @@ use std::fmt::Write;
 use crate::ast::*;
 use crate::diag::Diagnostic;
 use crate::span::Span;
-use crate::types::{prim_ty, MethodRes, Ty, TypeInfo, TypeKindG};
+use crate::types::{prim_ty, ImplCall, MethodRes, Ty, TypeInfo, TypeKindG};
 
 /// Lower a program to C, ending with the ordinary entry-point wrapper around
 /// the user's `main`.
@@ -180,11 +180,13 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool) -> (String, Vec<Dia
     g.closure_types();
     g.fn_protos();
     g.method_protos();
+    g.impl_protos();
     g.spawn_runtime();
     g.consts();
     g.closure_fns();
     g.fn_defs();
     g.method_defs();
+    g.impl_defs();
     if g.test_mode {
         g.test_main();
     } else {
@@ -763,6 +765,13 @@ impl<'a> Cgen<'a> {
         for item in &ast.items {
             if let Item::Fn(f) = item {
                 if !self.is_generic(f) {
+                    self.collect_structs_in_fn(f, &empty, &mut seen, &mut order);
+                }
+            }
+            // A generic struct mentioned inside a trait-`impl` method body needs
+            // its concrete instance emitted, just as a free function's would.
+            if let Item::Impl(im) = item {
+                for f in &im.methods {
                     self.collect_structs_in_fn(f, &empty, &mut seen, &mut order);
                 }
             }
@@ -3087,6 +3096,12 @@ impl<'a> Cgen<'a> {
         if let Some(mr) = self.info.method_calls.get(&call_id).cloned() {
             return self.emit_method_call(callee, &mr, args);
         }
+        // `recv.m(args)` resolved through an `impl Trait for <recv>` (traits,
+        // Stage C): a direct, statically-dispatched call to the mangled impl
+        // method, the receiver threaded in as the first argument.
+        if let Some(ic) = self.info.impl_calls.get(&call_id).cloned() {
+            return self.emit_impl_call(callee, &ic, args);
+        }
         // Invoking a closure value (a local bound to one, or an inline closure).
         if self.is_closure_typed(callee) {
             return self.emit_closure_invoke(callee, args);
@@ -4293,6 +4308,159 @@ impl<'a> Cgen<'a> {
         }
     }
 
+    // --- trait static dispatch (traits, Stage C) ---
+
+    /// The `FnDecl` of an `impl Trait for Type` method, located by the same
+    /// `(trait, type-key, method)` triple the type checker recorded in
+    /// [`ImplCall`]. Used at a call site to recover the receiver/argument
+    /// conventions; `None` only if the impl/method has gone missing.
+    fn find_impl_method(
+        &self,
+        trait_name: &str,
+        type_key: &str,
+        method: &str,
+    ) -> Option<&'a FnDecl> {
+        let empty = HashMap::new();
+        for item in &self.ast.items {
+            let Item::Impl(im) = item else { continue };
+            if im.trait_name.name != trait_name {
+                continue;
+            }
+            let target = self.ast_type_to_ty(im.ty, &empty);
+            if self.info.table.ty_key(&target) != type_key {
+                continue;
+            }
+            if let Some(f) = im.methods.iter().find(|f| f.name.name == method) {
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    /// Emit one trait-`impl` method as a top-level C function — a forward
+    /// prototype (`body = false`) or a full definition (`body = true`). An `impl`
+    /// targets a *concrete* type, so there is no monomorphization: the method is
+    /// essentially a free function whose first parameter is the receiver (`j_self`,
+    /// taken by pointer for a `mut`/`out self`), reusing the struct-method
+    /// machinery for `self`.
+    fn emit_impl_method_decl(&mut self, im: &ImplDecl, f: &FnDecl, body: bool) {
+        if f.errors.is_some() {
+            if body {
+                self.diag(
+                    f.name.span,
+                    "the C backend does not support fallible trait-impl methods yet",
+                );
+            }
+            return;
+        }
+        let empty = HashMap::new();
+        let target = self.ast_type_to_ty(im.ty, &empty);
+        let type_key = self.info.table.ty_key(&target);
+
+        self.subst.clear();
+        self.self_cty = self.c_ty_ast(im.ty);
+        let self_conv =
+            f.params.iter().find(|p| p.is_self).map(|p| p.conv).unwrap_or(Conv::Default);
+        self.self_is_ptr = matches!(self_conv, Conv::Mut | Conv::Out);
+        self.ptr_params = f
+            .params
+            .iter()
+            .filter(|p| !p.comptime && !p.is_self && matches!(p.conv, Conv::Mut | Conv::Out))
+            .map(|p| p.name.name.clone())
+            .collect();
+        self.cur_result.clear();
+        self.cur_ensures.clear();
+        self.cur_no_panic = f.no_panic;
+
+        let prefix = self.fn_attr_prefix(f);
+        let ret = match f.ret_ty {
+            Some(t) => self.c_ty_ast(t),
+            None => "void".to_string(),
+        };
+        let cname = impl_method_c_name(&im.trait_name.name, &type_key, &f.name.name);
+        let params = self.method_params_str(f);
+        if body {
+            self.raw(format!("{prefix}{ret} {cname}({params})\n"));
+            self.emit_body(&f.body, ret != "void");
+            self.raw("\n");
+        } else {
+            self.raw(format!("{prefix}{ret} {cname}({params});\n"));
+        }
+
+        self.ptr_params.clear();
+        self.self_cty.clear();
+        self.self_is_ptr = false;
+        self.subst.clear();
+        self.cur_no_panic = false;
+    }
+
+    fn impl_protos(&mut self) {
+        let ast = self.ast;
+        let mut any = false;
+        for item in &ast.items {
+            if let Item::Impl(im) = item {
+                for f in &im.methods {
+                    self.emit_impl_method_decl(im, f, false);
+                    any = true;
+                }
+            }
+        }
+        if any {
+            self.raw("\n");
+        }
+    }
+
+    fn impl_defs(&mut self) {
+        let ast = self.ast;
+        for item in &ast.items {
+            if let Item::Impl(im) = item {
+                for f in &im.methods {
+                    self.emit_impl_method_decl(im, f, true);
+                }
+            }
+        }
+    }
+
+    /// Lower a trait-method call `recv.m(args)` that resolved through an
+    /// `impl Trait for <recv-type>` (recorded in `impl_calls`) to a **direct**
+    /// call of the mangled impl-method function — the receiver threaded in as the
+    /// first argument (by `&` for a `mut`/`out self`), `mut`/`out` arguments by
+    /// address. Static dispatch: no vtable, the target is known at compile time.
+    fn emit_impl_call(&mut self, callee: ExprId, ic: &ImplCall, args: &[ExprId]) -> String {
+        let base = match &self.ast.expr_at(callee).kind {
+            ExprKind::Field { base, .. } => *base,
+            _ => return "0".to_string(),
+        };
+        let (self_conv, arg_convs): (Conv, Vec<Conv>) = self
+            .find_impl_method(&ic.trait_name, &ic.type_key, &ic.method)
+            .map(|f| {
+                let sc =
+                    f.params.iter().find(|p| p.is_self).map(|p| p.conv).unwrap_or(Conv::Default);
+                let ac: Vec<Conv> =
+                    f.params.iter().filter(|p| !p.comptime && !p.is_self).map(|p| p.conv).collect();
+                (sc, ac)
+            })
+            .unwrap_or((Conv::Default, Vec::new()));
+
+        let recv = self.emit_expr(base);
+        let recv = if matches!(self_conv, Conv::Mut | Conv::Out) {
+            format!("&({recv})")
+        } else {
+            recv
+        };
+        let mut parts = vec![recv];
+        for (i, a) in args.iter().enumerate() {
+            let e = self.emit_expr(*a);
+            if matches!(arg_convs.get(i), Some(Conv::Mut) | Some(Conv::Out)) {
+                parts.push(format!("&({e})"));
+            } else {
+                parts.push(e);
+            }
+        }
+        let name = impl_method_c_name(&ic.trait_name, &ic.type_key, &ic.method);
+        format!("{name}({})", parts.join(", "))
+    }
+
     // --- structured concurrency (`concurrent` / `spawn`) ---
 
     fn collect_spawns(&self) -> Vec<SpawnSite> {
@@ -5484,6 +5652,13 @@ impl<'a> Cgen<'a> {
                     self.find_calls_block(&f.body, &empty, &mut work);
                 }
             }
+            // Trait-`impl` method bodies (Stage C) are emitted like free functions,
+            // so a generic call inside one must instantiate its target too.
+            if let Item::Impl(im) = item {
+                for f in &im.methods {
+                    self.find_calls_block(&f.body, &empty, &mut work);
+                }
+            }
         }
         while let Some(w) = work.pop() {
             match w {
@@ -5664,6 +5839,18 @@ fn borrow_ptr_cty(base: &str, conv: Conv) -> String {
     } else {
         base.to_string()
     }
+}
+
+/// The C symbol for a trait-`impl` method: `jestyr_impl_<Trait>__<TypeKey>__<method>`.
+/// The type key (`i32`, `Point`, …) is sanitised to a C identifier so exotic
+/// receiver types can't produce an invalid symbol. Both the definition and the
+/// call site derive the name from the same `(trait, type-key, method)` triple, so
+/// they always agree without a side table. (Coherence guarantees at most one impl
+/// per `(trait, type)`, so distinct impls never collide on this name.)
+fn impl_method_c_name(trait_name: &str, type_key: &str, method: &str) -> String {
+    let safe: String =
+        type_key.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    format!("jestyr_impl_{trait_name}__{safe}__{method}")
 }
 
 /// Is `name` a backend intrinsic (a prelude stand-in for the stdlib / C interop)?
@@ -6011,6 +6198,78 @@ mod tests {
         let (c, d) = gen(src);
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("j_b.j_op(&(j_n))"), "a `mut` field-pointer arg is passed by address: {c}");
+    }
+
+    // --- traits: static, monomorphized dispatch (Stage C) ---
+
+    #[test]
+    fn lowers_a_trait_impl_method_to_a_direct_static_call() {
+        // `x.show()` resolved through `impl Show for i32` becomes a *direct* call
+        // of the emitted, mangled impl-method function — no vtable, no indirection.
+        let src = "trait Show { fn show(read self) -> i32 } \
+                   impl Show for i32 { fn show(read self) -> i32 { return self + 1 } } \
+                   fn use_it(read x: i32) -> i32 { return x.show() }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(
+            c.contains("int32_t jestyr_impl_Show__i32__show(int32_t j_self)"),
+            "impl method emitted with a value `self`: {c}"
+        );
+        assert!(c.contains("return (j_self + 1);"), "the body projects `self`: {c}");
+        assert!(c.contains("jestyr_impl_Show__i32__show(j_x)"), "direct static-dispatch call: {c}");
+    }
+
+    #[test]
+    fn lowers_a_trait_impl_for_a_struct_receiver_with_an_argument() {
+        // A struct receiver (`self` projects fields) and an explicit argument
+        // threaded after the receiver — the call site is fully positional.
+        let src = "trait Area { fn scaled(read self, k: i32) -> i32 } \
+                   struct Rect { w: i32, h: i32 } \
+                   impl Area for Rect { fn scaled(read self, k: i32) -> i32 { return (self.w + self.h) * k } } \
+                   fn use_it(read r: Rect, k: i32) -> i32 { return r.scaled(k) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(
+            c.contains("int32_t jestyr_impl_Area__Rect__scaled(Jestyr_Rect j_self, int32_t j_k)"),
+            "struct `self` type + trailing arg: {c}"
+        );
+        assert!(
+            c.contains("jestyr_impl_Area__Rect__scaled(j_r, j_k)"),
+            "receiver then argument, positionally: {c}"
+        );
+    }
+
+    #[test]
+    fn trait_impl_mut_self_receiver_is_passed_by_pointer() {
+        // A `mut self` receiver lowers to `T* restrict` and the call passes the
+        // receiver by address — the same ABI as a hand-written `mut self` method.
+        let src = "trait Bump { fn bump(mut self) } \
+                   impl Bump for i32 { fn bump(mut self) { self = self + 1 } } \
+                   fn use_it() { var x: i32 = 5 x.bump() }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(
+            c.contains("void jestyr_impl_Bump__i32__bump(int32_t* restrict j_self)"),
+            "mut self → restrict pointer: {c}"
+        );
+        assert!(c.contains("jestyr_impl_Bump__i32__bump(&(j_x))"), "mut self passed by address: {c}");
+    }
+
+    #[test]
+    fn distinct_trait_impls_get_distinct_mangled_symbols() {
+        // Two impls of one trait for different receiver types produce two distinct
+        // C symbols, each selected at its call site by the receiver's type key —
+        // the essence of static dispatch.
+        let src = "trait G { fn g(read self) -> i32 } \
+                   struct P { a: i32 } \
+                   impl G for i32 { fn g(read self) -> i32 { return self } } \
+                   impl G for P { fn g(read self) -> i32 { return self.a } } \
+                   fn use_i(read n: i32) -> i32 { return n.g() } \
+                   fn use_p(read p: P) -> i32 { return p.g() }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("jestyr_impl_G__i32__g(j_n)"), "i32 receiver picks the i32 impl: {c}");
+        assert!(c.contains("jestyr_impl_G__P__g(j_p)"), "P receiver picks the P impl: {c}");
     }
 
     #[test]

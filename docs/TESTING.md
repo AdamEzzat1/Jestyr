@@ -273,9 +273,23 @@ Run: `cargo test trait_programs`, `cargo test parses_a_trait`, `cargo bolero tes
     call types by the impl return + is recorded.
   - Property (`prop`): `duplicate_impl_is_always_a_coherence_error` (soundness),
     `distinct_type_impls_are_accepted` (completeness), `coherence_verdict_is_order_independent`.
-- ⏳ **Remaining:** C static dispatch (monomorphized, no vtable) · D definition-site bounds ·
-  E operator traits (`Add`/`Mul`/`Eq`/`Ord`) · F `dyn` vtable. Each lands with the same three
-  layers (+ a gcc differential once runtime behaviour matters).
+- ✅ **Stage C — static, monomorphized dispatch.** The backend consumes `impl_calls`: each
+  `impl Trait for Type` method is emitted as a mangled top-level C function
+  (`jestyr_impl_<Trait>__<TypeKey>__<method>`, the receiver as the first parameter, reusing the
+  struct-method `self` machinery), and a resolved `recv.m(args)` lowers to a **direct** call of it
+  (no vtable — the target is fixed at compile time by the receiver's type key). Impl bodies are
+  walked by the instance collectors, so generic calls/structs inside them instantiate correctly.
+  - Unit (cgen): primitive + struct receivers, an explicit argument threaded after the receiver,
+    `mut self` by pointer, and two distinct impls → two distinct mangled symbols.
+  - Property (`prop`): `trait_call_lowers_to_a_direct_impl_method_call` (the call targets the
+    mangled symbol, every receiver type), `trait_call_programs_compile_deterministically`.
+  - Fuzz (`fuzz`): `fuzz_trait_static_dispatch` — fuzz bytes fill the now-emitted impl body while a
+    real `x.m()` drives dispatch; total + deterministic.
+  - gcc differential: `examples/traits_static.jtr` runs to `42/141/15/18`
+    (`traits_static_example_compiles_clean`).
+- ⏳ **Remaining:** D definition-site bounds (`fn f[T: Tr]` checked once) · E operator traits
+  (`Add`/`Mul`/`Eq`/`Ord`) · F `dyn` vtable (reuses the fn-pointer-field call machinery). Each
+  lands with the same three layers (+ a gcc differential once runtime behaviour matters).
 
 ---
 

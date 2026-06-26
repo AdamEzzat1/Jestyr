@@ -478,6 +478,14 @@ mod tests {
     }
 
     #[test]
+    fn traits_static_example_compiles_clean() {
+        // Traits Stage C: `recv.m(args)` resolved through `impl Trait for <recv>`
+        // lowers to a direct, statically-dispatched call of the mangled impl
+        // method — for both primitive and struct receivers, with arguments.
+        pipeline_is_clean("examples/traits_static.jtr");
+    }
+
+    #[test]
     fn tests_demo_example_builds_a_clean_test_harness() {
         // The `@test`/`@bench` runner (workstream O): emit in test mode and check
         // the harness is generated without diagnostics.

@@ -232,10 +232,9 @@ pub struct ImplDef {
     pub method_rets: HashMap<String, Ty>,
 }
 
-/// How a trait-method call `recv.m(args)` resolved — recorded for the backend
-/// (Stage C lowers it to the mangled impl-method call).
+/// How a trait-method call `recv.m(args)` resolved — recorded for the backend.
+/// Stage C lowers it to a direct call of the mangled impl-method function.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // fields consumed by cgen once static dispatch lands (Stage C)
 pub struct ImplCall {
     pub trait_name: String,
     pub type_key: String,

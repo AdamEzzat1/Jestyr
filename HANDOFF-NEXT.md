@@ -35,12 +35,14 @@ falling through to `Unknown`.
   `fuzz_generic_vtable_pipeline` target, and an end-to-end gcc round-trip example
   `examples/gen_vtable.jtr` (runs to `42/141`, covered by
   `gen_vtable_example_compiles_clean`). Suite now **353 green**, warning-clean.
-- **Known adjacent gap (out of scope, not yet done):** a *bare* fn-pointer-field
-  **read** on a generic struct — `let f = gen.op` without calling — still types as
-  `Unknown` (`typeck::field_type` only resolves fields for `Ty::Named`, returning
-  `Unknown` for `Ty::GenStruct`). The Main Objective was specifically the
-  method-style *call*; generic-struct field *reads* are a broader generic
-  field-access limitation to tackle separately if `dyn` needs it.
+- **Adjacent gap — now closed:** a *bare* fn-pointer-field **read** on a generic
+  struct (`let f = gen.op` without calling) used to type as `Unknown`.
+  `typeck::field_type` now resolves a field on `Ty::GenStruct` under substitution
+  (via `gen_struct_field_decl_ty`), so the read is fully typed and a later `f(n)`
+  is a typed indirect call (and a genuinely-missing field still diagnoses). Tests:
+  `bare_fn_ptr_field_read_on_a_generic_struct_*`, `unknown_field_on_a_generic_struct_is_reported`,
+  property `generic_vtable_bare_field_read_types_under_substitution`, and the
+  `examples/gen_vtable.jtr` round-trip (now `42/141/8`).
 
 **Why it mattered — the arc this completes.** A fn-pointer field on a struct *is*
 a hand-written vtable. Generic-struct vtable calls being fully typed was the last
@@ -51,14 +53,55 @@ field-call machinery instead of inventing a parallel one.
 
 ---
 
-## Main objective — traits **Stage C** (static, monomorphized dispatch)
+## ✅ Done — traits **Stage C** (static, monomorphized dispatch)
 
-With generic-vtable calls fully typed, the trait epic resumes at **Stage C**:
-consume the `impl_calls` recorded by Stage B's `resolve_impl_method`, emit and
-mangle the impl-method functions, and lower `recv.m(args)` to a **direct** call
-(monomorphized — no vtable yet). See the trait-stage ledger in
-`docs/TESTING.md §5.12` and the remaining-stages list below (D bounds, E operator
-traits, F `dyn` vtable — which builds on the machinery just finished).
+The backend now consumes the `impl_calls` Stage B records. A `recv.m(args)` call
+that resolved through `impl Trait for <recv>` lowers to a **direct** call of the
+emitted impl-method function — no vtable; the target is fixed at compile time by
+the receiver's type key.
+
+- **Emit:** `cgen::{impl_protos, impl_defs}` walk every `Item::Impl` and emit each
+  method as a top-level C function named
+  `jestyr_impl_<Trait>__<TypeKey>__<method>` (free helper `impl_method_c_name`,
+  the type key sanitised to a C identifier). The receiver is the first parameter
+  (`j_self`, by `T* restrict` for `mut`/`out self`), reusing the **struct-method**
+  `self` machinery (`self_cty`/`self_is_ptr`/`method_params_str`) rather than a
+  parallel `self` lowering — so `self.field` projection works for free.
+- **Lower:** `cgen::emit_impl_call` (dispatched from `emit_call` via
+  `info.impl_calls`) threads the receiver in as the first argument (by `&` for
+  `mut`/`out self`), `mut`/`out` args by address, and derives the same mangled
+  name from the `(trait, type-key, method)` triple — so definition and call site
+  always agree without a symbol table. `find_impl_method` recovers the conv.
+- **Monomorphization:** impl bodies are now walked by `collect_all_instances` and
+  `collect_struct_instances`, so a generic call/struct *inside* an impl method
+  instantiates correctly (they emit like free functions).
+- **Tests (teeth-verified by mutation):** cgen unit (primitive + struct receiver,
+  trailing arg, `mut self` by pointer, two impls → two symbols), properties
+  `trait_call_lowers_to_a_direct_impl_method_call` + determinism over
+  `arb_trait_call_program`, `fuzz_trait_static_dispatch`, and the gcc round-trip
+  `examples/traits_static.jtr` (`42/141/15/18`, `traits_static_example_compiles_clean`).
+  Suite now **364 green**, warning-clean across default + both feature builds.
+- **Stage-C limitations (documented, not blocking):** a trait **default method**
+  the impl omits is not yet dispatched (only *provided* methods are in
+  `method_rets`, so such a call doesn't resolve — Stage B behavior unchanged); and
+  **closures/`spawn` inside an impl-method body** aren't collected (a closure there
+  degrades to a clean "unsupported" diagnostic, not a crash). Lift these if a later
+  stage needs them.
+
+---
+
+## Main objective — traits **Stage D** (definition-site bounds)
+
+The trait epic resumes at **Stage D**: check a generic's declared bounds
+*once, at its definition* — `fn f[T: Tr](x: T)` requires every type `T` is later
+instantiated at to `impl Tr`. Stage B already parses `[T: Bound]` into
+`FnDecl::generics` and registers impls in `GlobalTable::{impls, impl_index}`; Stage
+D adds the **check**: at each generic call, verify the chosen `T` has an
+`impl Bound for T` (reuse `impl_index`), erroring at the call site otherwise. No
+new codegen — bounds are erased after checking (static dispatch already emits the
+concrete impl method). See the trait-stage ledger in `docs/TESTING.md §5.12` (E
+operator traits, F `dyn` vtable — which reuses the fn-pointer-field call machinery
+— follow).
 
 ---
 
@@ -86,7 +129,7 @@ A *capturing* closure coerced to a fn-pointer is a clear error.
 `run`/`build` on a no-`main` library now reports a clear message instead of a raw
 C-linker `WinMain` error (`test` mode is exempt; it synthesizes its own `main`).
 
-### Traits / interfaces — Stages A & B done (epic in flight)
+### Traits / interfaces — Stages A, B & C done (epic in flight)
 - **A — parse + represent:** `trait`/`impl`/`dyn Trait`/`[T: Bound]` into the AST
   (`Item::Trait`, `Item::Impl`, `TypeKind::Dyn`, `FnDecl::generics`); pipeline
   stays total with no semantics.
@@ -95,17 +138,22 @@ C-linker `WinMain` error (`test` mode is exempt; it synthesizes its own `main`).
   conflicting `(trait, type)`, missing required method, non-member method), and
   resolves `recv.m(args)` through `impl Trait for <recv>` (`resolve_impl_method`,
   recorded in `impl_calls` for the backend).
-- **Remaining (in order):** **C** static dispatch (monomorphized — consume
-  `impl_calls`, emit + mangle impl-method functions, lower to a *direct* call, no
-  vtable) · **D** definition-site bounds (`fn f[T: Tr]` checked once) · **E**
-  operator traits (`+`/`*`/`==`/`<` → `Add`/`Mul`/`Eq`/`Ord`, the `f64` impl is the
-  no-FMA determinism seam) · **F** `dyn` vtable (see Main Objective above).
+- **C — static, monomorphized dispatch:** the backend emits each impl method as a
+  mangled C function (`jestyr_impl_<Trait>__<TypeKey>__<method>`, receiver-first,
+  reusing the struct-method `self` machinery) and lowers a resolved `recv.m(args)`
+  to a *direct* call of it (no vtable). See the §5.12 ledger and the done-section
+  above.
+- **Remaining (in order):** **D** definition-site bounds (`fn f[T: Tr]` checked
+  once — see Main Objective above) · **E** operator traits (`+`/`*`/`==`/`<` →
+  `Add`/`Mul`/`Eq`/`Ord`, the `f64` impl is the no-FMA determinism seam) · **F**
+  `dyn` vtable (reuses the fn-pointer-field call machinery — see the first done
+  section's arc).
 
 ---
 
 ## Test posture
 
-Suite is **353 green**, warning-clean, clean across the `dharht-experiment` and
+Suite is **364 green**, warning-clean, clean across the `dharht-experiment` and
 `bench-alloc` feature builds. New coverage adapts to the *real* harness
 (`src/proptests.rs`: `mod prop` + `mod fuzz` + `arb_*_program` generators,
 `typeck_diags` for diagnostic differentials) — the handoff's referenced

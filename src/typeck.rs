@@ -1594,6 +1594,21 @@ impl<'a> TypeChecker<'a> {
         if matches!(base, Ty::Prim("String")) && fname == "len" {
             return Ty::Prim("usize"); // an owned String's byte length
         }
+        if let Ty::GenStruct { ctor, args } = base {
+            // A field *read* on a generic-struct value resolves under the
+            // receiver's type arguments — the same substitution the field-*call*
+            // path (`fn_ptr_field`) uses, so `let f = gen.op` on `Box(i32)` reads
+            // `op: fn(T) -> T` as the concrete `fn(i32) -> i32` instead of typing
+            // as `Unknown`. (A subsequent `f(n)` is then a typed indirect call.)
+            return match self.gen_struct_field_decl_ty(ctor, args, fname) {
+                Some(t) => t,
+                None => {
+                    let shown = base.display(&self.table);
+                    self.error(span, format!("no field `{fname}` on `{shown}`"));
+                    Ty::Error
+                }
+            };
+        }
         if let Ty::Named(i) = base {
             // Read what we need, dropping the table borrow before any diagnostic.
             let (found, sname, is_struct) = {
@@ -2562,6 +2577,48 @@ mod tests {
                    fn use_it(n: i32) -> i32 { let b = Box(i32){ op: |x| x + 1 } return b.op(n) }";
         let (_i, d) = analyze(src);
         assert!(d.is_empty(), "a generic-struct fn-pointer field call should typecheck cleanly: {:?}", d);
+    }
+
+    #[test]
+    fn bare_fn_ptr_field_read_on_a_generic_struct_types_under_substitution() {
+        // The adjacent gap: *reading* (not calling) a fn-pointer field on a
+        // generic-struct value. `let f = b.op` where `b: Box(i32)` must type `f`
+        // as the substituted `fn(i32) -> i32` (was `Unknown`), so the later
+        // `f(n)` is a typed indirect call. Teeth: the field-read expr is
+        // `fn(i32) -> i32`, and `f(n)` infers `i32`.
+        let src = "fn Box(comptime T: type) -> type { return struct { op: fn(T) -> T } } \
+                   fn use_it(n: i32) -> i32 { let b = Box(i32){ op: |x| x + 1 } let f = b.op return f(n) }";
+        let (ast, info) = analyze_full(src);
+        let field = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| matches!(e.kind, ExprKind::Field { .. }).then_some(ExprId(i as u32)))
+            .expect("the `b.op` field read");
+        match info.type_of(field) {
+            Ty::Fn { params, ret, .. } => {
+                assert_eq!(&*params[0].1, &Ty::Prim("i32"), "field-read param substituted to i32");
+                assert_eq!(&**ret, &Ty::Prim("i32"), "field-read return substituted to i32");
+            }
+            other => panic!("expected fn(i32) -> i32, got {other:?}"),
+        }
+        let call = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| matches!(e.kind, ExprKind::Call { .. }).then_some(ExprId(i as u32)))
+            .expect("the `f(n)` call");
+        assert_eq!(info.type_of(call), &Ty::Prim("i32"), "call through the read field types as i32");
+    }
+
+    #[test]
+    fn unknown_field_on_a_generic_struct_is_reported() {
+        // The new GenStruct arm of `field_type` still diagnoses a genuinely
+        // missing field (not silently `Unknown`), matching the plain-struct path.
+        let src = "fn Box(comptime T: type) -> type { return struct { op: fn(T) -> T } } \
+                   fn use_it() { let b = Box(i32){ op: |x| x + 1 } let z = b.nope }";
+        let (_i, d) = analyze(src);
+        assert!(d.iter().any(|m| m.message.contains("no field `nope`")), "{:?}", d);
     }
 
     // --- traits: resolve + coherence (Stage B) ---
