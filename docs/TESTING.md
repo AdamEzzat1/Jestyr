@@ -412,11 +412,22 @@ so they run under the toolchain-free default `cargo test`.
   `generic_call_borrow_arg_does_not_move_droppable`; property `generic_borrow_call_still_drops_once`;
   gcc round-trip `examples/vec_generic.jtr`. **Teeth:** reverting to "all generic args move" fails the
   seam tests, then passes on revert.
-- **Remaining (future work):** a *blanket* generic `impl[T] Drop for Vec(T)` + porting
-  `std/mem.jtr`/`std/list.jtr` off the enum; `defer`/`errdefer`; owned (`take`) parameter drop; a
-  leak-catching debug allocator (the `--features c-oracle` gcc-round-trip exit criterion);
-  `@deterministic` allocators; linear / must-use types; conditional (per-branch) move precision;
-  transitive `@no_alloc`. See `DROP-ALLOC-PHASE3.md`.
+- ✅ **`std/` ported onto the vtable allocator + RAII `List` (Increment 8).** `std/mem.jtr` is the
+  real vtable `Allocator` (retiring the enum stand-in); `std/list.jtr`'s `List(T)` stores its
+  allocator and frees by `Drop`. Wiring test `module::stdlib_demo_frees_its_list_by_raii` (the list
+  drops by RAII, allocation routes through the vtable); `stdlib_demo_compiles_clean` still green;
+  demos `examples/std/demo.jtr` (`5/10/50/40`) + `alloc_demo.jtr` (`60/60`).
+- ✅ **Blanket generic `impl[T] Drop for Ctor(T)` (Increment 9).** One impl covers every
+  instantiation; cgen monomorphizes the `drop` method per concrete `struct_instance`. `impl` gained
+  bracket generics (parsed + printed). Golden `blanket_generic_drop_impl_monomorphizes_per_instance`
+  (two instantiations, each a def + scope-exit call); fuzz `fuzz_blanket_drop_impl`. **Teeth:**
+  disabling the generic `drop_key` path fails the golden, then passes on revert. Both `std/list.jtr`
+  and `examples/vec_generic.jtr` now use a single blanket impl.
+- **Remaining (future work):** qualified calls + generic-helper calls inside impl-method bodies
+  (the std destructor delegates to a bare non-generic helper for now); `defer`/`errdefer`; owned
+  (`take`) parameter drop; a leak-catching debug allocator (the `--features c-oracle` gcc-round-trip
+  exit criterion); `@deterministic` allocators; linear / must-use types; conditional (per-branch) move
+  precision; transitive `@no_alloc`. See `DROP-ALLOC-PHASE3.md`.
 
 ---
 

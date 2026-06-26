@@ -16,8 +16,8 @@ main remaining piece.
 
 ## Achieved
 
-Eight green, warning-clean, auto-committed increments. **442 tests pass** under the
-default toolchain-free `cargo test` (up from 413 at the start: +29 unit/property/fuzz).
+Ten green, warning-clean, auto-committed increments. **445 tests pass** under the
+default toolchain-free `cargo test` (up from 413 at the start: +32 unit/property/fuzz).
 
 ### Drop / RAII
 
@@ -88,15 +88,30 @@ default toolchain-free `cargo test` (up from 413 at the start: +29 unit/property
   `@copy` on the cheap allocator handle so a collection may store it without escape.
 - **Generic `Vec(T, A)`, RAII-freed (Increment 7).** The concrete `IntVec`
   generalized: `Vec(T)` is monomorphized per element type, stores its `Allocator`,
-  and its concrete-instantiation `Drop` impl (`impl Drop for Vec(i32)`) frees the
-  buffer at scope exit — through generic, comptime-parameterized operations
-  (`vec_push(i32, v, …)`). [`examples/vec_generic.jtr`](examples/vec_generic.jtr) →
-  `5, 10, 50, 99`. Generic-struct `Drop` already lowered correctly (the impl-method
+  and frees the buffer at scope exit — through generic, comptime-parameterized
+  operations (`vec_push(i32, v, …)`). [`examples/vec_generic.jtr`](examples/vec_generic.jtr)
+  → `5, 10, 50, 99`. Generic-struct `Drop` already lowered correctly (the impl-method
   symbol derives from the GenStruct type key on both call and definition side); the
   fix was **move-analysis precision** — `collect_moved` now aligns arguments to
   parameters by call shape (a free call's leading `comptime` type-arg slot is
   skipped; a method/impl call offsets past the receiver), so a generic `mut`-borrow
   argument is correctly a borrow, not a move.
+- **`std/` ported onto the vtable allocator + RAII `List` (Increment 8).** The
+  enum-dispatch stand-in is retired: [`examples/std/mem.jtr`](examples/std/mem.jtr) is
+  now the real vtable `Allocator` (`alloc`/`free`/`destroy` fn-pointers + `Layout`,
+  system + arena strategies), and [`examples/std/list.jtr`](examples/std/list.jtr)'s
+  `List(T)` *stores* its allocator and frees its buffer **by RAII**. The shipped
+  demos are unchanged in output: [`examples/std/demo.jtr`](examples/std/demo.jtr)
+  (`5, 10, 50, 40`, then `xs` auto-frees) and `alloc_demo.jtr` (`60, 60`).
+- **Blanket generic `impl[T] Drop for Vec(T)` (Increment 9).** One impl covers every
+  instantiation — no per-type boilerplate. `impl` gained optional bracket generics
+  (`ImplDecl.generics`, parsed + printed); cgen's `generic_drop_impl(ctor)` detects a
+  blanket Drop impl by constructor, `drop_key_of` recognises a `Ctor(C)` local as
+  droppable through it, and `emit_generic_drop_methods` monomorphizes the `drop`
+  method once per concrete `struct_instance` (substituting the impl's type parameter,
+  named by the instance's type key so the existing call site resolves). A concrete
+  `impl Drop for Ctor(C)` takes precedence (coherence). Both `std/list.jtr` and
+  `vec_generic.jtr` now use a single blanket impl.
 - **Take-vs-borrow move precision (Increment 5).** `cgen::collect_moved` treats a call
   argument as a move **only when its parameter is `take`** (resolving the callee's
   `FnDecl`); a `read`/`mut`/`out` borrow does not move, so a droppable handed to a
@@ -125,6 +140,8 @@ default toolchain-free `cargo test` (up from 413 at the start: +29 unit/property
 | Take-vs-borrow move precision | ✅ + property + teeth |
 | Allocator-parameterized `Vec`, freed by RAII | ✅ concrete `IntVec` **and** generic `Vec(T,A)` |
 | Generic-struct `Drop` + generic-call move precision | ✅ + goldens + property + teeth |
+| `std/` (`mem`+`list`) on the vtable allocator, RAII `List` | ✅ + wiring test |
+| Blanket generic `impl[T] Drop for Ctor(T)` | ✅ + golden + fuzz + teeth |
 
 ### Tests (this workstream)
 
@@ -138,7 +155,12 @@ default toolchain-free `cargo test` (up from 413 at the start: +29 unit/property
   move elision, no-double-free, determinism, region bulk-drop metamorphic,
   borrow-passed-droppable-still-drops-once); `alloc_props` (rejected *iff* allocates —
   soundness + completeness vs an independent oracle).
-- **Fuzz** (`bolero`): `fuzz_drop_alloc_pipeline`, `fuzz_drop_alloc_determinism`.
+- **Wiring** (`module::tests`): `stdlib_demo_frees_its_list_by_raii` — the ported std
+  `List(i32)` drops by RAII and allocation routes through the vtable.
+- **Blanket impl** (`cgen::tests`): `blanket_generic_drop_impl_monomorphizes_per_instance`
+  — one `impl[T] Drop for Box(T)` emits a monomorphized `drop` (def + call) per instance.
+- **Fuzz** (`bolero`): `fuzz_drop_alloc_pipeline`, `fuzz_drop_alloc_determinism`,
+  `fuzz_blanket_drop_impl`.
 - **Teeth-checked**: suppressing the drop emitter fails the drop count properties +
   goldens; neutering `is_alloc_intrinsic` fails the `@no_alloc` rejection tests — both
   pass again on revert.
@@ -159,16 +181,18 @@ Honest accounting of what is stubbed, deferred, or only partially covered.
   one and a generic call or closure inside a `defer` silently vanishes from codegen. It
   was scoped out of this pass to avoid a half-applied ripple; the drop-scope stack it
   would plug into already exists.
-- **The vtable `Allocator` is built but `std/` is not converted.** The real fn-pointer
-  vtable `Allocator` + `Layout` ship in [`examples/alloc_vtable.jtr`](examples/alloc_vtable.jtr)
-  / [`examples/vec_alloc.jtr`](examples/vec_alloc.jtr), but the **enum-dispatch stand-in**
-  in [`examples/std/mem.jtr`](examples/std/mem.jtr) (`enum Allocator { system, arena(h) }`)
-  and `std/list.jtr` have not yet been ported onto it. `resize`/grow-in-place and a
-  separate-vtable (vs. inlined-fn-pointers) layout are also future refinements.
-- **No *blanket* generic `Drop` impl.** `Vec(T)` works for any element type, but each
-  concrete instantiation that needs RAII requires its own `impl Drop for Vec(i32)` —
-  a single generic `impl[T] Drop for Vec(T)` covering all `T` at once is not yet
-  supported (it would need a generic impl monomorphized per instantiation).
+- **A qualified call inside an `impl`-method body doesn't resolve.** `mem.release(…)`
+  written inside an `impl Drop` method is lowered as a *field access* (`j_mem.j_release`),
+  not a module-qualified call — so the std `List` destructor delegates to a bare,
+  same-module helper. A typeck fix (run qualified-access resolution over impl-method
+  bodies with the right import bindings) is future work.
+- **A blanket impl body can't call a *generic* helper.** The monomorphization worklist
+  does not descend into a generic impl-method body, so a call to a generic function
+  inside `impl[T] Drop for Ctor(T)` is not instantiated. The blanket impls therefore
+  delegate to a *non-generic* (`*mut u8`) free helper — sufficient for freeing, but a
+  general fix would extend the worklist to scan blanket-impl bodies under each subst.
+- **`resize`/grow-in-place and a shared `*const VTable`** (vs. the inlined fn-pointers)
+  are future allocator refinements.
 - **A droppable `take` *parameter* is not dropped inside its callee.** Drop glue is
   registered for `let`/`var` locals, not for owned (`take`) parameters — so a consumed
   value that is neither moved-on nor returned leaks at the callee's scope exit
@@ -204,14 +228,14 @@ choices all fail toward **leaking, never double-freeing**.
 
 In rough priority order toward the Phase-3 exit criterion and self-hosting:
 
-1. **Port `std/` onto the vtable allocator + a blanket generic `Drop` impl.** Generic
-   `Vec(T, A)` now works ([`examples/vec_generic.jtr`](examples/vec_generic.jtr)); next,
-   convert `std/mem.jtr` + `std/list.jtr` off the enum stand-in onto the vtable
-   `Allocator`, and add a single `impl[T] Drop for Vec(T)` (a generic impl monomorphized
-   per instantiation) so RAII needs no per-type boilerplate. Then **unify region ≡ arena
-   allocator**: a `region r { }` *is* a scoped default `Allocator` value, plus the
-   compile-time escape proof Zig's ArenaAllocator lacks. Add `resize`/grow-in-place and
-   consider a separate `*const VTable` (vs. the inlined fn-pointers).
+1. **Resolve qualified calls + generic helpers inside impl-method bodies, then unify
+   region ≡ arena.** `std/` is ported and the blanket `impl[T] Drop` works; the two
+   sharp edges left are (a) a module-qualified call inside an impl-method body (today a
+   field access) and (b) a *generic* helper call inside a blanket impl body (not
+   monomorphized). With both fixed, std destructors need no bare-helper shim. Then
+   **unify region ≡ arena allocator**: a `region r { }` *is* a scoped default
+   `Allocator` value, plus the compile-time escape proof Zig's ArenaAllocator lacks; add
+   `resize`/grow-in-place and a shared `*const VTable`.
 2. **Owned-parameter drop.** Register `take` parameters for scope-exit drop glue (a
    small extension of the local registration), closing the one remaining leak class.
 3. **The debug allocator + `--features c-oracle` harness.** A leak/double-free/UAF-
