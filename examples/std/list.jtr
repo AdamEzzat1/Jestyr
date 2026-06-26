@@ -59,18 +59,20 @@ pub fn free(comptime T: type, mut l: List(T)) {
     l.cap = 0
 }
 
-// Free an i32 buffer through its allocator. A free function (not the `impl`
-// method) so the module-qualified `mem.release` resolves — qualified calls inside
-// an `impl`-method body are not yet resolved (a known bootstrap limitation), so
-// the destructor delegates here by bare name.
-fn release_i32_buf(read a: Allocator, p: *mut i32, n: usize) {
-    if n != 0 { mem.release(i32, a, p) }
+// Free a buffer (already type-erased to bytes) through its allocator. A free
+// function — not the `impl` method — so the module-qualified `mem.free_bytes`
+// resolves (qualified calls inside an `impl`-method body are not yet resolved, a
+// known bootstrap limitation). It is non-generic (takes `*mut u8`), so it works
+// for every element type and needs no monomorphization.
+fn release_buf(read a: Allocator, p: *mut u8, n: usize) {
+    if n != 0 { mem.free_bytes(a, p) }
 }
 
-// RAII for the i32 instantiation: free the buffer through the stored allocator at
-// scope exit (per-instantiation; a blanket `impl[T] Drop for List(T)` is future work).
-impl Drop for List(i32) {
+// RAII for *every* `List(T)` at once — a blanket `impl[T] Drop for List(T)`,
+// monomorphized per concrete element type. The buffer is freed through the stored
+// allocator at scope exit; no manual free, no per-type boilerplate.
+impl[T] Drop for List(T) {
     fn drop(mut self) {
-        release_i32_buf(self.a, self.ptr, self.cap)
+        release_buf(self.a, self.ptr as *mut u8, self.cap)
     }
 }

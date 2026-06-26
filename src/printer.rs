@@ -91,7 +91,23 @@ impl<'a> Printer<'a> {
                 }
             }
             Item::Impl(im) => {
-                self.line(d, &format!("impl {} for {}", im.trait_name.name, self.type_str(im.ty)));
+                let gen = if im.generics.is_empty() {
+                    String::new()
+                } else {
+                    let gs: Vec<String> = im
+                        .generics
+                        .iter()
+                        .map(|g| match &g.bound {
+                            Some(b) => format!("{}: {}", g.name.name, b.name),
+                            None => g.name.name.clone(),
+                        })
+                        .collect();
+                    format!("[{}]", gs.join(", "))
+                };
+                self.line(
+                    d,
+                    &format!("impl{gen} {} for {}", im.trait_name.name, self.type_str(im.ty)),
+                );
                 for f in &im.methods {
                     self.func(d + 1, f, "method fn");
                 }

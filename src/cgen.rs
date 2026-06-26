@@ -1483,11 +1483,17 @@ impl<'a> Cgen<'a> {
         if key.is_empty() {
             return None;
         }
+        // A concrete `impl Drop for <ty>`.
         if self.info.table.impl_index.contains_key(&("Drop".to_string(), key.clone())) {
-            Some(key)
-        } else {
-            None
+            return Some(key);
         }
+        // A blanket `impl[T] Drop for Ctor(T)` covering this instantiation.
+        if let Ty::GenStruct { ctor, .. } = ty {
+            if self.generic_drop_impl(ctor).is_some() {
+                return Some(key);
+            }
+        }
+        None
     }
 
     /// Register a freshly-declared local for scope-exit drop glue, if its type has
@@ -4900,11 +4906,18 @@ impl<'a> Cgen<'a> {
         let mut any = false;
         for item in &ast.items {
             if let Item::Impl(im) = item {
+                // A blanket `impl[T] …` is monomorphized per instance separately.
+                if !im.generics.is_empty() {
+                    continue;
+                }
                 for f in &im.methods {
                     self.emit_impl_method_decl(im, f, false);
                     any = true;
                 }
             }
+        }
+        if self.emit_generic_drop_methods(false) {
+            any = true;
         }
         if any {
             self.raw("\n");
@@ -5024,11 +5037,96 @@ impl<'a> Cgen<'a> {
         let ast = self.ast;
         for item in &ast.items {
             if let Item::Impl(im) = item {
+                if !im.generics.is_empty() {
+                    continue;
+                }
                 for f in &im.methods {
                     self.emit_impl_method_decl(im, f, true);
                 }
             }
         }
+        self.emit_generic_drop_methods(true);
+    }
+
+    /// A blanket `impl[T] Drop for <Ctor>(T)` covering every instantiation: detect it
+    /// by constructor name. Returns the impl and the name of its single generic
+    /// parameter, so a concrete instance can substitute it.
+    fn generic_drop_impl(&self, ctor: &str) -> Option<(&'a ImplDecl, String)> {
+        let empty = HashMap::new();
+        for item in &self.ast.items {
+            let Item::Impl(im) = item else { continue };
+            if im.generics.is_empty() || im.trait_name.name != "Drop" {
+                continue;
+            }
+            if let Ty::GenStruct { ctor: c, .. } = self.ast_type_to_ty(im.ty, &empty) {
+                if c == ctor {
+                    let g = im.generics.first().map(|g| g.name.name.clone()).unwrap_or_default();
+                    return Some((im, g));
+                }
+            }
+        }
+        None
+    }
+
+    /// Monomorphize a blanket `impl[T] Drop for Ctor(T)` once per concrete instance
+    /// of `Ctor` actually used in the program (from `struct_instances`). Emits a
+    /// prototype (`body = false`) or full definition, with the impl's generic
+    /// parameter substituted to the instance's type argument — so the call site's
+    /// `jestyr_impl_Drop__Ctor_C___drop(&j_x)` resolves. Returns whether anything
+    /// was emitted (so the caller can manage trailing whitespace). An instance that
+    /// already has a *concrete* `impl Drop for Ctor(C)` is skipped (no duplicate).
+    fn emit_generic_drop_methods(&mut self, body: bool) -> bool {
+        let mut emitted = false;
+        for (ctor, args) in self.struct_instances.clone() {
+            let Some((im, gparam)) = self.generic_drop_impl(&ctor) else {
+                continue;
+            };
+            let concrete = Ty::GenStruct { ctor: ctor.clone(), args: args.clone() };
+            let key = self.info.table.ty_key(&concrete);
+            // Skip if a concrete impl already covers this instance (coherence).
+            if self.info.table.impl_index.contains_key(&("Drop".to_string(), key.clone())) {
+                continue;
+            }
+            let Some(f) = im.methods.iter().find(|m| m.name.name == "drop") else {
+                continue;
+            };
+            let subst: HashMap<String, Ty> =
+                std::iter::once((gparam.clone(), args.first().cloned().unwrap_or(Ty::Unknown))).collect();
+            let cname = impl_method_c_name("Drop", &key, "drop");
+            let self_cty = self.gen_struct_c_name(&ctor, &args);
+            let self_conv =
+                f.params.iter().find(|p| p.is_self).map(|p| p.conv).unwrap_or(Conv::Default);
+
+            self.subst = subst;
+            self.self_cty = self_cty;
+            self.self_is_ptr = matches!(self_conv, Conv::Mut | Conv::Out);
+            self.ptr_params = f
+                .params
+                .iter()
+                .filter(|p| !p.comptime && !p.is_self && matches!(p.conv, Conv::Mut | Conv::Out))
+                .map(|p| p.name.name.clone())
+                .collect();
+            self.cur_no_panic = f.no_panic;
+            let mut moved = HashSet::new();
+            self.collect_moved(&f.body, &mut moved);
+            self.cur_moved = moved;
+            let params = self.method_params_str(f);
+            if body {
+                self.raw(format!("void {cname}({params})\n"));
+                self.emit_body(&f.body, false);
+                self.raw("\n");
+            } else {
+                self.raw(format!("void {cname}({params});\n"));
+            }
+            self.subst.clear();
+            self.self_cty.clear();
+            self.self_is_ptr = false;
+            self.ptr_params.clear();
+            self.cur_no_panic = false;
+            self.cur_moved.clear();
+            emitted = true;
+        }
+        emitted
     }
 
     /// Lower a trait-method call `recv.m(args)` that resolved through an
@@ -6911,6 +7009,24 @@ mod tests {
             c.contains("void jestyr_impl_Drop__Box_i32___drop(Jestyr_Box__i32"),
             "matching impl definition:\n{c}"
         );
+    }
+
+    #[test]
+    fn blanket_generic_drop_impl_monomorphizes_per_instance() {
+        // One `impl[T] Drop for Box(T)` covers every instantiation: cgen emits a
+        // monomorphized `drop` per concrete element type, named by the instance's
+        // type key so the scope-exit call site resolves.
+        let src = "trait Drop { fn drop(mut self) } \
+            fn Box(comptime T: type) -> type { return struct { v: T } } \
+            impl[T] Drop for Box(T) { fn drop(mut self) { print_int(0) } } \
+            fn f() { var a = Box(i32){ v: 1 } var b = Box(f64){ v: 2.0 } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        // Both instances get a definition and a scope-exit drop call.
+        assert!(c.contains("void jestyr_impl_Drop__Box_i32___drop(Jestyr_Box__i32"), "i32 def:\n{c}");
+        assert!(c.contains("void jestyr_impl_Drop__Box_f64___drop(Jestyr_Box__f64"), "f64 def:\n{c}");
+        assert!(c.contains("jestyr_impl_Drop__Box_i32___drop(&j_a)"), "drop a:\n{c}");
+        assert!(c.contains("jestyr_impl_Drop__Box_f64___drop(&j_b)"), "drop b:\n{c}");
     }
 
     #[test]

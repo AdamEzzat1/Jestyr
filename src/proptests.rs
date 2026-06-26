@@ -1182,6 +1182,24 @@ mod fuzz {
         });
     }
 
+    /// Coverage-guided fuzzing of the **blanket generic `Drop` impl** path: fuzz
+    /// bytes fill the body of an `impl[T] Drop for Box(T)` while two distinct
+    /// instantiations drive per-instance monomorphization. Never panics;
+    /// deterministic.
+    #[test]
+    fn fuzz_blanket_drop_impl() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let prog = format!(
+                "trait Drop {{ fn drop(mut self) }} \
+                 fn Box(comptime T: type) -> type {{ return struct {{ v: T }} }} \
+                 impl[T] Drop for Box(T) {{ fn drop(mut self) {{ {s} }} }} \
+                 fn f() {{ var a = Box(i32){{ v: 1 }} var b = Box(f64){{ v: 2.0 }} }}"
+            );
+            run_pipeline(&prog);
+            assert_eq!(compile(&prog), compile(&prog));
+        });
+    }
+
     /// Determinism of Drop/RAII lowering under fuzzing: the same Drop-heavy source
     /// compiles byte-identically (search for an iteration-order leak in drop/move
     /// analysis).

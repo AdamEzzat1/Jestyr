@@ -540,6 +540,10 @@ pub struct TraitDecl {
 /// the monomorphizer specializes (static) or a `dyn` vtable points at (dynamic).
 #[derive(Clone, Debug)]
 pub struct ImplDecl {
+    /// Bracket-form generic parameters: `impl[T] Drop for Vec(T)` — a *blanket*
+    /// impl covering every instantiation of the target constructor, monomorphized
+    /// per concrete type. Empty for an ordinary concrete `impl Trait for Type`.
+    pub generics: Vec<GenericParam>,
     pub trait_name: Ident,
     pub ty: TypeId,
     pub methods: Vec<FnDecl>,

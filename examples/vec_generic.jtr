@@ -2,9 +2,9 @@
 // (design Phase 3 — `Vec<T, A>`, the std collection shape).
 //
 // `Vec(T)` is monomorphized per element type, stores its `Allocator` value, and
-// grows through that allocator's vtable. The concrete instantiation `Vec(i32)`
-// carries a `Drop` impl, so the buffer is freed **automatically at scope exit**
-// even though every operation goes through generic, comptime-parameterized
+// grows through that allocator's vtable. A single blanket `impl[T] Drop for Vec(T)`
+// covers every instantiation, so the buffer is freed **automatically at scope
+// exit** even though every operation goes through generic, comptime-parameterized
 // functions (`vec_push(i32, v, …)`). This is what the move analysis had to get
 // right: a generic call's `comptime` type argument occupies a slot, but the `mut`
 // receiver after it is a *borrow*, so `v` is not moved and still drops.
@@ -71,8 +71,9 @@ fn vec_get(comptime T: type, read v: Vec(T), i: usize) -> T {
 }
 fn vec_len(comptime T: type, read v: Vec(T)) -> usize { return v.len }
 
-// RAII for the i32 instantiation: free the buffer through the stored allocator.
-impl Drop for Vec(i32) {
+// RAII for *every* instantiation at once — a blanket `impl[T] Drop for Vec(T)`,
+// monomorphized per concrete element type. One impl, no per-type boilerplate.
+impl[T] Drop for Vec(T) {
     fn drop(mut self) {
         if self.cap != 0 { free_n(self.a, self.ptr as *mut u8) }
     }

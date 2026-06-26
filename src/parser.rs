@@ -378,6 +378,8 @@ impl<'src> Parser<'src> {
     fn parse_impl(&mut self) -> ImplDecl {
         let start = self.cur().span;
         self.expect(Impl, "`impl`");
+        // Optional bracket generics: `impl[T] Drop for Vec(T)` — a blanket impl.
+        let generics = self.parse_generics();
         let trait_name = self.eat_ident("trait name");
         self.expect(For, "`for`");
         let ty = self.parse_type();
@@ -401,7 +403,7 @@ impl<'src> Parser<'src> {
         }
         let end = self.cur().span;
         self.expect(RBrace, "`}`");
-        ImplDecl { trait_name, ty, methods, span: start.to(end) }
+        ImplDecl { generics, trait_name, ty, methods, span: start.to(end) }
     }
 
     /// `extern "c" fn name(params) -> ret` — a bodyless foreign declaration.
