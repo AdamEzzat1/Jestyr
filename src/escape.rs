@@ -375,6 +375,12 @@ impl<'a> Checker<'a> {
                 self.walk_expr(ctx, *base, false);
                 self.walk_expr(ctx, *index, false);
             }
+            ExprKind::ArrayRepeat { value, count } => {
+                // A `[v; N]` array literal is a value (it copies `v` N times); walk
+                // both sub-expressions, neither in tail/escape position.
+                self.walk_expr(ctx, *value, false);
+                self.walk_expr(ctx, *count, false);
+            }
             ExprKind::Deref { base } => self.walk_expr(ctx, *base, false),
             ExprKind::Try { base } => self.walk_expr(ctx, *base, false),
             ExprKind::Cast { expr, .. } => self.walk_expr(ctx, *expr, false),

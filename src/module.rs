@@ -462,6 +462,13 @@ mod tests {
     }
 
     #[test]
+    fn arrays_example_compiles_clean() {
+        // Fixed-size arrays `[N]T`: the value-struct typedef, `[v; N]` literal,
+        // bounds-checked index read/write, `.len`, and `for x in arr` iteration.
+        pipeline_is_clean("examples/arrays.jtr");
+    }
+
+    #[test]
     fn loops_example_compiles_clean() {
         // Every MVP loop form + `invariant` + bounds-check elision.
         pipeline_is_clean("examples/loops.jtr");

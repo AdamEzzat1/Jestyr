@@ -322,6 +322,9 @@ impl<'a> Printer<'a> {
             ExprKind::Index { base, index } => {
                 format!("{}[{}]", self.expr_inline(*base), self.expr_inline(*index))
             }
+            ExprKind::ArrayRepeat { value, count } => {
+                format!("[{}; {}]", self.expr_inline(*value), self.expr_inline(*count))
+            }
             ExprKind::StructLit { path, fields, spread } => {
                 let mut fs: Vec<String> = fields
                     .iter()
@@ -404,6 +407,9 @@ impl<'a> Printer<'a> {
                 format!("{}{}", m, self.type_str(*inner))
             }
             TypeKind::Slice(inner) => format!("[]{}", self.type_str(*inner)),
+            TypeKind::Array { len, elem } => {
+                format!("[{}]{}", self.expr_inline(*len), self.type_str(*elem))
+            }
             TypeKind::GenRef(inner) => format!("&{}", self.type_str(*inner)),
             TypeKind::RegionRef { region, inner } => {
                 format!("&[{}]{}", region.name, self.type_str(*inner))
@@ -544,6 +550,13 @@ mod tests {
         let out = printed("fn f(free_fn: fn(*mut u8)) { }");
         assert!(out.contains("fn(*mut u8)"), "{out}");
         assert!(!out.contains("fn(*mut u8) ->"), "no arrow for a unit-returning pointer: {out}");
+    }
+
+    #[test]
+    fn renders_a_fixed_array_type_and_repeat_literal() {
+        let out = printed("fn f() { var xs: [8]i32 = [0; 8] }");
+        assert!(out.contains("[8]i32"), "array type round-trips: {out}");
+        assert!(out.contains("[0; 8]"), "repeat literal round-trips: {out}");
     }
 
     #[test]

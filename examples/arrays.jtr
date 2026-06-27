@@ -1,0 +1,29 @@
+// examples/arrays.jtr — fixed-size arrays `[N]T` (a *value* type, distinct from the
+// `[]T` slice view). `[v; N]` builds one; `a[i]` is bounds-checked against the
+// constant length; `a.len` is that constant; `for x in a` iterates the elements.
+// Lowered to a C `struct { T a[N]; }`, so arrays copy / pass / return by value.
+//
+//   jestyrc run examples/arrays.jtr   →  10, 40, 8, 120, 11
+fn main() -> i32 {
+    var xs: [8]i32 = [0; 8]      // eight zeros, stack-allocated (no heap)
+    xs[0] = 10
+    xs[3] = 40
+    xs[7] = 70
+
+    print_int(xs[0])             // 10  (bounds-checked index)
+    print_int(xs[3])             // 40
+    print_int(xs.len as i32)     // 8   (the constant length)
+
+    var sum: i32 = 0
+    for v in xs { sum = sum + v }
+    print_int(sum)               // 120 = 10 + 40 + 70
+
+    // Index loop with write-back through the array.
+    var i: usize = 0
+    for i < xs.len {
+        xs[i] = xs[i] + 1
+        i = i + 1
+    }
+    print_int(xs[0])             // 11
+    return 0
+}

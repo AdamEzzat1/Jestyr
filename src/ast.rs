@@ -108,6 +108,11 @@ pub enum TypeKind {
     TypeKw,                                    // the `type` keyword (the type of types)
     Ptr { mutbl: PtrMut, inner: TypeId },      // *T, *mut T, *const T
     Slice(TypeId),                             // []T — a fat pointer (ptr + len)
+    /// `[N]T` — a fixed-size array of `N` elements, a *value* type (lowered to a C
+    /// `struct { T a[N]; }` so it copies/returns/passes by value). `len` is a
+    /// constant expression (a literal or `const` today). Distinct from the `[]T`
+    /// slice (a borrowed view) above.
+    Array { len: ExprId, elem: TypeId },
     GenRef(TypeId),                            // &T — a generational reference (§4.4)
     RegionRef { region: Ident, inner: TypeId }, // &[r]T — a zero-cost region reference (§4.4)
     App { ctor: Ident, args: Vec<TypeId> },    // List(i32) — applied generic struct
@@ -216,6 +221,10 @@ pub enum ExprKind {
     Try { base: ExprId },   // base?
     Index { base: ExprId, index: ExprId },
     Cast { expr: ExprId, ty: TypeId }, // `expr as T` — an explicit conversion
+
+    /// `[value; count]` — a fixed-size array literal repeating `value` `count`
+    /// times (`count` a constant). The value form `[a, b, c]` is future work.
+    ArrayRepeat { value: ExprId, count: ExprId },
 
     // composite
     // Self{...}, Foo{...}; `spread` is the `..base` functional-update source, if any.

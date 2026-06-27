@@ -610,6 +610,13 @@ fn ty_str(ast: &Ast, id: TypeId) -> String {
             format!("{m}{}", ty_str(ast, *inner))
         }
         TypeKind::Slice(inner) => format!("[]{}", ty_str(ast, *inner)),
+        TypeKind::Array { len, elem } => {
+            let n = match &ast.expr_at(*len).kind {
+                ExprKind::Int(s) => s.clone(),
+                _ => "_".to_string(),
+            };
+            format!("[{n}]{}", ty_str(ast, *elem))
+        }
         TypeKind::GenRef(inner) => format!("&{}", ty_str(ast, *inner)),
         TypeKind::RegionRef { region, inner } => format!("&[{}]{}", region.name, ty_str(ast, *inner)),
         TypeKind::App { ctor, args } => {

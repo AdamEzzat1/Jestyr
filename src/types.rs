@@ -39,6 +39,9 @@ pub enum Ty {
     GenEnum { ctor: String, args: Vec<Ty> },
     /// A slice `[]T` — a fat pointer `{ptr, len}`. Non-`Copy` (it borrows data).
     Slice(Box<Ty>),
+    /// A fixed-size array `[N]T` — a *value* type of `N` elements (lowered to a C
+    /// `struct { T a[N]; }`). `Copy` iff its element type is `Copy`.
+    Array { elem: Box<Ty>, len: usize },
     /// A generational reference `&T` — `{ptr, gen}` (§4.4). `Copy`: it may be
     /// freely stored/aliased; a stale deref faults at runtime, not at compile time.
     GenRef(Box<Ty>),
@@ -74,6 +77,7 @@ impl Ty {
             Ty::GenStruct { .. } => false,
             Ty::GenEnum { .. } => false,
             Ty::Slice(_) => false,
+            Ty::Array { elem, .. } => elem.is_copy(tbl), // a value array: Copy iff its element is
             Ty::GenRef(_) => true, // a generational reference is a copyable fat pointer
             Ty::RegionRef(_) => true, // a region reference is a copyable plain pointer
             Ty::Fn { .. } => true, // a thin fn-pointer captures nothing — first-class, escapes freely
@@ -105,6 +109,7 @@ impl Ty {
                 format!("{ctor}({})", a.join(", "))
             }
             Ty::Slice(t) => format!("[]{}", t.display(tbl)),
+            Ty::Array { elem, len } => format!("[{len}]{}", elem.display(tbl)),
             Ty::GenRef(t) => format!("&{}", t.display(tbl)),
             Ty::RegionRef(t) => format!("&[r]{}", t.display(tbl)),
             Ty::Fn { params, ret, ret_conv } => {

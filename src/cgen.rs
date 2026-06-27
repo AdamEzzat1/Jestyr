@@ -140,6 +140,7 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool, show_drops: bool) -
         dyn_guard: HashSet::new(),
         spawn_sites: Vec::new(),
         slice_instances: Vec::new(),
+        array_instances: Vec::new(),
         genref_instances: Vec::new(),
         fn_type_instances: Vec::new(),
         cur_refines: HashMap::new(),
@@ -183,6 +184,7 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool, show_drops: bool) -
     // concrete `JestyrSlice_<T>` typedef even when the caller never writes a
     // `slice(T, …)` literal locally.
     g.slice_instances = g.collect_slices();
+    g.array_instances = g.collect_arrays();
     g.struct_instances = g.collect_struct_instances();
     g.enum_instances = g.collect_enum_instances();
     // After struct instances: a monomorphized generic-struct's fn-pointer fields
@@ -209,6 +211,7 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool, show_drops: bool) -
     g.gen_struct_defs();
     g.gen_enum_defs();
     g.slice_struct_defs();
+    g.array_struct_defs();
     g.genref_struct_defs();
     g.result_defs();
     // `dyn Trait` vtable structs + fat-pointer typedefs — after the value typedefs
@@ -368,6 +371,9 @@ struct Cgen<'a> {
     spawn_sites: Vec<SpawnSite>,
     /// distinct slice element types, for emitting one `JestyrSlice_<T>` per type.
     slice_instances: Vec<Ty>,
+    /// Every distinct fixed-size array type `[N]T` the program uses (one
+    /// `JestyrArr_<T>_<N>` typedef each). Each is a `Ty::Array`.
+    array_instances: Vec<Ty>,
     /// distinct generational-reference element types (one `JestyrRef_<T>` each).
     genref_instances: Vec<Ty>,
     /// distinct function-pointer signatures, for emitting one `JestyrFn_<sig>`
@@ -748,6 +754,30 @@ impl<'a> Cgen<'a> {
         format!("Jestyr_{ctor}__{}", parts.join("_"))
     }
 
+    /// The C struct name for a fixed-size array `[N]T` — one `typedef` per distinct
+    /// (element, length), holding a C array field so it copies/returns by value.
+    fn array_c_name(&self, elem: &Ty, len: usize) -> String {
+        format!("JestyrArr_{}_{len}", self.ty_mangle(elem))
+    }
+
+    /// Evaluate a `[N]T` length expression to a `usize` (integer literal — the
+    /// common case; the typeck side validates the same way).
+    fn array_len(&self, id: ExprId) -> usize {
+        match &self.ast.expr_at(id).kind {
+            ExprKind::Int(text) => {
+                let t: String = text.chars().filter(|c| *c != '_').collect();
+                if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                    usize::from_str_radix(h, 16).unwrap_or(0)
+                } else if let Some(b) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+                    usize::from_str_radix(b, 2).unwrap_or(0)
+                } else {
+                    t.parse::<usize>().unwrap_or(0)
+                }
+            }
+            _ => 0,
+        }
+    }
+
     /// Lower an AST type to a `Ty`, applying the given type-parameter substitution.
     fn ast_type_to_ty(&self, id: TypeId, subst: &HashMap<String, Ty>) -> Ty {
         match &self.ast.type_at(id).kind {
@@ -774,6 +804,10 @@ impl<'a> Cgen<'a> {
                 }
             }
             TypeKind::Slice(inner) => Ty::Slice(Box::new(self.ast_type_to_ty(*inner, subst))),
+            TypeKind::Array { len, elem } => Ty::Array {
+                elem: Box::new(self.ast_type_to_ty(*elem, subst)),
+                len: self.array_len(*len),
+            },
             TypeKind::GenRef(inner) => Ty::GenRef(Box::new(self.ast_type_to_ty(*inner, subst))),
             TypeKind::RegionRef { inner, .. } => {
                 Ty::RegionRef(Box::new(self.ast_type_to_ty(*inner, subst)))
@@ -1069,6 +1103,7 @@ impl<'a> Cgen<'a> {
             Ty::GenStruct { args, .. } | Ty::GenEnum { args, .. } => {
                 args.iter().all(Self::is_concrete)
             }
+            Ty::Array { elem, .. } => Self::is_concrete(elem),
             Ty::Fn { params, ret, .. } => {
                 params.iter().all(|(_, t)| Self::is_concrete(t)) && Self::is_concrete(ret)
             }
@@ -3344,6 +3379,21 @@ impl<'a> Cgen<'a> {
                             "({{ {sty} _s{n} = ({b}); size_t _ix{n} = (size_t)({i}); assert(_ix{n} < _s{n}.len); _s{n}.ptr[_ix{n}] {aop} {v}; }})"
                         );
                     }
+                    // `arr[i] = v` — assign into the array's inline field, bounds-checked
+                    // against the constant length, through the array's address (no copy).
+                    if let Ty::Array { len, .. } = &bt {
+                        let nlen = *len;
+                        let aop = assign_c(*op);
+                        let aty = self.c_type(&bt);
+                        let b = self.emit_expr(*base);
+                        let i = self.emit_expr(*index);
+                        let v = self.emit_expr(*value);
+                        let n = self.tmp;
+                        self.tmp += 1;
+                        return format!(
+                            "({{ {aty}* _a{n} = &({b}); size_t _ix{n} = (size_t)({i}); assert(_ix{n} < {nlen}); _a{n}->a[_ix{n}] {aop} {v}; }})"
+                        );
+                    }
                 }
                 let t = self.emit_expr(*target);
                 let v = self.emit_expr(*value);
@@ -3355,7 +3405,15 @@ impl<'a> Cgen<'a> {
                 if let Some(qname) = self.info.qualified.get(&id).cloned() {
                     return format!("j_{qname}");
                 }
-                let bt = self.info.type_of(*base).clone();
+                let bt = apply_subst(&self.info.type_of(*base).clone(), &self.subst);
+                // A fixed-size array's `.len` is its constant length (not a struct
+                // field). (`base` is a place expression in practice, so not emitting it
+                // loses no side effect.)
+                if let Ty::Array { len, .. } = &bt {
+                    if name.name == "len" {
+                        return format!("((size_t){len})");
+                    }
+                }
                 let b = self.emit_expr(*base);
                 // A slice's `ptr`/`len` are real C fields (not `j_`-prefixed).
                 if matches!(bt, Ty::Slice(_)) && (name.name == "len" || name.name == "ptr") {
@@ -3403,6 +3461,17 @@ impl<'a> Cgen<'a> {
                 if matches!(bt, Ty::Prim("str")) {
                     // A string view indexes into its byte buffer.
                     format!("((uint8_t)({b}).ptr[({i})])")
+                } else if let Ty::Array { len, .. } = &bt {
+                    // A fixed-size array indexes its inline `a[N]` field, bounds-checked
+                    // against the constant length. We take the array's *address* (not a
+                    // copy) so reading one element never copies the whole array.
+                    let nlen = *len;
+                    let aty = self.c_type(&bt);
+                    let n = self.tmp;
+                    self.tmp += 1;
+                    format!(
+                        "({{ {aty}* _a{n} = &({b}); size_t _ix{n} = (size_t)({i}); assert(_ix{n} < {nlen}); _a{n}->a[_ix{n}]; }})"
+                    )
                 } else if !matches!(bt, Ty::Slice(_)) {
                     format!("({b})[{i}]")
                 } else if proven {
@@ -3424,6 +3493,21 @@ impl<'a> Cgen<'a> {
                         "({{ {sty} _s{n} = ({b}); size_t _ix{n} = (size_t)({i}); assert(_ix{n} < _s{n}.len); _s{n}.ptr[_ix{n}]; }})"
                     )
                 }
+            }
+            ExprKind::ArrayRepeat { value, count } => {
+                // `[v; N]` — a fixed-size array value. Evaluate `v` once into a temp,
+                // then fill all N elements (a statement-expression yielding the array).
+                let ty = apply_subst(&self.info.type_of(id).clone(), &self.subst);
+                let (aty, ecty, nlen) = match &ty {
+                    Ty::Array { elem, len } => (self.c_type(&ty), self.c_type(elem), *len),
+                    _ => ("int".to_string(), "int".to_string(), self.array_len(*count)),
+                };
+                let v = self.emit_expr(*value);
+                let n = self.tmp;
+                self.tmp += 1;
+                format!(
+                    "({{ {aty} _ar{n}; {ecty} _v{n} = ({v}); for (size_t _k{n} = 0; _k{n} < {nlen}; _k{n}++) _ar{n}.a[_k{n}] = _v{n}; _ar{n}; }})"
+                )
             }
             ExprKind::Cast { expr, ty } => {
                 let cty = self.c_ty_ast(*ty);
@@ -5591,6 +5675,10 @@ impl<'a> Cgen<'a> {
                     // String iteration — byte by byte through the view.
                     let index = binds.get(1).map(|b| b.name.clone());
                     self.emit_str_for(&b0.name, index.as_ref(), src, body);
+                } else if matches!(apply_subst(&self.info.type_of(src).clone(), &self.subst), Ty::Array { .. }) {
+                    // Fixed-size array iteration over its inline `a[N]` field.
+                    let index = binds.get(1).map(|b| b.name.clone());
+                    self.emit_array_for(b0.conv, &b0.name, index.as_ref(), src, body);
                 } else {
                     // Slice iteration, with an optional index binding (`for x, i in xs`).
                     let index = binds.get(1).map(|b| b.name.clone());
@@ -5708,6 +5796,67 @@ impl<'a> Cgen<'a> {
                 self.line(format!("{ecty}* j_{} = &_s{n}.ptr[_k{n}];", binding.name));
             } else {
                 self.line(format!("{ecty} j_{} = _s{n}.ptr[_k{n}];", binding.name));
+            }
+        }
+        let added_ptr = is_mut && exposed;
+        if added_ptr {
+            self.ptr_params.insert(binding.name.clone());
+        }
+        for stmt in &body.stmts {
+            self.emit_stmt(stmt);
+        }
+        if added_ptr {
+            self.ptr_params.remove(&binding.name);
+        }
+        if let Some(lbl) = self.cont_label.take() {
+            self.line(format!("{lbl}__continue: ;"));
+        }
+        self.depth -= 1;
+        self.line("}");
+    }
+
+    /// `for x in arr { B }` → iterate a fixed-size array over its inline `a[N]`
+    /// field. The array is iterated *in place* (by address), so there is no
+    /// whole-array copy and a `mut x` binding writes back; an optional `index`
+    /// binding gets the position. Mirrors [`Self::emit_slice_for`].
+    fn emit_array_for(
+        &mut self,
+        conv: Conv,
+        binding: &Ident,
+        index: Option<&Ident>,
+        iter: ExprId,
+        body: &Block,
+    ) {
+        let at = apply_subst(&self.info.type_of(iter).clone(), &self.subst);
+        let (elem, len) = match &at {
+            Ty::Array { elem, len } => ((**elem).clone(), *len),
+            _ => (Ty::Unknown, 0),
+        };
+        let ecty = self.c_type(&elem);
+        let acty = self.c_type(&at);
+        let a_iter = self.emit_expr(iter);
+        let n = self.tmp;
+        self.tmp += 1;
+        let is_mut = matches!(conv, Conv::Mut);
+        let exposed = binding.name != "_";
+
+        self.line(format!("{acty}* _a{n} = &({a_iter});"));
+        self.line(format!("for (size_t _k{n} = 0; _k{n} < {len}; _k{n}++)"));
+        self.line("{");
+        self.depth += 1;
+        if let Some(name) = self.scratch_reset.take() {
+            self.line(format!("j_{name}.off = 0;"));
+        }
+        if let Some(idx) = index {
+            if idx.name != "_" {
+                self.line(format!("size_t j_{} = _k{n};", idx.name));
+            }
+        }
+        if exposed {
+            if is_mut {
+                self.line(format!("{ecty}* j_{} = &_a{n}->a[_k{n}];", binding.name));
+            } else {
+                self.line(format!("{ecty} j_{} = _a{n}->a[_k{n}];", binding.name));
             }
         }
         let added_ptr = is_mut && exposed;
@@ -6083,6 +6232,11 @@ impl<'a> Cgen<'a> {
                 let elem = self.ast_type_to_ty(*inner, &subst);
                 self.slice_c_name(&elem)
             }
+            TypeKind::Array { len, elem } => {
+                let subst = self.subst.clone();
+                let et = self.ast_type_to_ty(*elem, &subst);
+                self.array_c_name(&et, self.array_len(*len))
+            }
             TypeKind::GenRef(inner) => {
                 let subst = self.subst.clone();
                 let elem = self.ast_type_to_ty(*inner, &subst);
@@ -6149,6 +6303,7 @@ impl<'a> Cgen<'a> {
                 self.gen_struct_c_name(ctor, args)
             }
             Ty::Slice(elem) => self.slice_c_name(elem),
+            Ty::Array { elem, len } => self.array_c_name(elem, *len),
             Ty::GenRef(elem) => self.genref_c_name(elem),
             Ty::RegionRef(elem) => {
                 let i = self.c_type(elem);
@@ -6235,6 +6390,54 @@ impl<'a> Cgen<'a> {
             self.raw(format!("typedef struct {{ {ecty}* ptr; size_t len; }} {name};\n"));
         }
         if !self.slice_instances.is_empty() {
+            self.raw("\n");
+        }
+    }
+
+    /// Every distinct fixed-size array `[N]T` the program uses — from inferred expr
+    /// types, function signatures, and monomorphized generic-function signatures.
+    fn collect_arrays(&self) -> Vec<Ty> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out: Vec<Ty> = Vec::new();
+        let add = |t: Ty, seen: &mut HashSet<String>, out: &mut Vec<Ty>| {
+            if matches!(&t, Ty::Array { .. }) && Self::is_concrete(&t) && seen.insert(self.ty_mangle(&t)) {
+                out.push(t);
+            }
+        };
+        for t in &self.info.expr_types {
+            add(t.clone(), &mut seen, &mut out);
+        }
+        for sig in self.info.table.fns.values() {
+            for p in &sig.params {
+                add(p.ty.clone(), &mut seen, &mut out);
+            }
+            add(sig.ret.clone(), &mut seen, &mut out);
+        }
+        for (name, args) in &self.instances {
+            let Some(f) = self.find_fn(name) else { continue };
+            let subst = self.make_subst(f, args);
+            let sig_tys = f.params.iter().filter_map(|p| p.ty).chain(f.ret_ty);
+            for ty in sig_tys {
+                if matches!(self.ast.type_at(ty).kind, TypeKind::Array { .. }) {
+                    let t = self.ast_type_to_ty(ty, &subst);
+                    add(t, &mut seen, &mut out);
+                }
+            }
+        }
+        out
+    }
+
+    /// Emit `typedef struct { T a[N]; } JestyrArr_<T>_<N>;` per array instance — a
+    /// value type (the inline C array copies/returns by value via the struct).
+    fn array_struct_defs(&mut self) {
+        for t in self.array_instances.clone() {
+            if let Ty::Array { elem, len } = &t {
+                let name = self.array_c_name(elem, *len);
+                let ecty = self.c_type(elem);
+                self.raw(format!("typedef struct {{ {ecty} a[{len}]; }} {name};\n"));
+            }
+        }
+        if !self.array_instances.is_empty() {
             self.raw("\n");
         }
     }
@@ -6501,6 +6704,7 @@ impl<'a> Cgen<'a> {
             }
             Ty::Result(ok) => format!("result_{}", self.ty_mangle(ok)),
             Ty::Slice(elem) => format!("slice_{}", self.ty_mangle(elem)),
+            Ty::Array { elem, len } => format!("arr_{}_{len}", self.ty_mangle(elem)),
             Ty::GenRef(elem) => format!("ref_{}", self.ty_mangle(elem)),
             Ty::RegionRef(elem) => format!("rref_{}", self.ty_mangle(elem)),
             // A fn-pointer mangle must vary with each parameter's *convention*
@@ -6850,6 +7054,7 @@ fn apply_subst(t: &Ty, subst: &HashMap<String, Ty>) -> Ty {
             Ty::GenEnum { ctor: ctor.clone(), args: args.iter().map(|a| apply_subst(a, subst)).collect() }
         }
         Ty::Slice(elem) => Ty::Slice(Box::new(apply_subst(elem, subst))),
+        Ty::Array { elem, len } => Ty::Array { elem: Box::new(apply_subst(elem, subst)), len: *len },
         Ty::GenRef(elem) => Ty::GenRef(Box::new(apply_subst(elem, subst))),
         Ty::RegionRef(elem) => Ty::RegionRef(Box::new(apply_subst(elem, subst))),
         Ty::Fn { params, ret, ret_conv } => Ty::Fn {
@@ -8818,6 +9023,21 @@ mod tests {
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains(".ptr[_ix0] = j_v"), "lvalue element assignment: {c}");
         assert!(c.contains("assert(_ix0 < "), "with a bounds check: {c}");
+    }
+
+    #[test]
+    fn fixed_array_lowers_to_a_value_struct_with_bounds_checked_indexing() {
+        // `[N]T` is a value type: a C `struct { T a[N]; }`. `[v; N]` fills it, `a[i]`
+        // is bounds-checked against the constant length (through the array's address,
+        // no copy), `a.len` is that constant, and `for x in a` walks `.a[k]`.
+        let src = "fn sum() -> i32 { var xs: [4]i32 = [0; 4] xs[2] = 9 var s: i32 = 0 for v in xs { s = s + v } return s + (xs.len as i32) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("typedef struct { int32_t a[4]; } JestyrArr_i32_4;"), "value-struct typedef: {c}");
+        assert!(c.contains("_ar0.a[_k0] = _v0"), "repeat literal fills the array: {c}");
+        assert!(c.contains("assert(_ix") && c.contains("->a[_ix"), "bounds-checked element access: {c}");
+        assert!(c.contains("((size_t)4)"), "`.len` is the constant length: {c}");
+        assert!(c.contains("_a") && c.contains("->a[_k"), "for-loop iterates the inline field: {c}");
     }
 
     #[test]

@@ -771,10 +771,19 @@ impl<'src> Parser<'src> {
             }
             LBracket => {
                 self.bump();
-                self.expect(RBracket, "`]`"); // `[]T` — a slice
-                let inner = self.parse_type();
-                let span = start.to(self.ast.type_at(inner).span);
-                self.ast.ty(TypeKind::Slice(inner), span)
+                if self.eat(RBracket) {
+                    // `[]T` — a slice (fat pointer).
+                    let inner = self.parse_type();
+                    let span = start.to(self.ast.type_at(inner).span);
+                    self.ast.ty(TypeKind::Slice(inner), span)
+                } else {
+                    // `[N]T` — a fixed-size array. `N` is a constant expression.
+                    let len = self.parse_expr();
+                    self.expect(RBracket, "`]`");
+                    let elem = self.parse_type();
+                    let span = start.to(self.ast.type_at(elem).span);
+                    self.ast.ty(TypeKind::Array { len, elem }, span)
+                }
             }
             Amp => {
                 self.bump();
@@ -1143,6 +1152,19 @@ impl<'src> Parser<'src> {
                 let name = self.eat_ident("attribute name");
                 let sp = span.to(name.span);
                 self.ast.expr(ExprKind::Attr(name), sp)
+            }
+            LBracket => {
+                // `[value; count]` — a fixed-size array literal (repeat form).
+                self.bump();
+                let saved = self.no_struct;
+                self.no_struct = false;
+                let value = self.parse_expr();
+                self.expect(Semi, "`;` in an array literal `[value; count]`");
+                let count = self.parse_expr();
+                self.no_struct = saved;
+                let end = self.cur().span;
+                self.expect(RBracket, "`]`");
+                self.ast.expr(ExprKind::ArrayRepeat { value, count }, span.to(end))
             }
             LParen => {
                 self.bump();

@@ -827,6 +827,17 @@ impl<'a> TypeChecker<'a> {
         set
     }
 
+    /// Evaluate a `[N]T` array length to a constant `usize`. Supports an integer
+    /// literal (decimal/`0x`/`0b`, `_` separators ignored) — the common case; a
+    /// `const`-name fallback can follow. Non-constant lengths resolve to 0 (and are
+    /// caught downstream), rather than panicking the type-checker.
+    fn eval_array_len(&self, id: ExprId) -> usize {
+        match &self.ast.expr_at(id).kind {
+            ExprKind::Int(text) => parse_int_literal_usize(text).unwrap_or(0),
+            _ => 0,
+        }
+    }
+
     fn lower_type(&self, ty_params: &HashSet<String>, id: TypeId) -> Ty {
         match &self.ast.type_at(id).kind {
             TypeKind::Name(n) => {
@@ -845,6 +856,10 @@ impl<'a> TypeChecker<'a> {
                 Ty::Ptr { mutbl: *mutbl, inner: Box::new(self.lower_type(ty_params, *inner)) }
             }
             TypeKind::Slice(inner) => Ty::Slice(Box::new(self.lower_type(ty_params, *inner))),
+            TypeKind::Array { len, elem } => Ty::Array {
+                elem: Box::new(self.lower_type(ty_params, *elem)),
+                len: self.eval_array_len(*len),
+            },
             TypeKind::GenRef(inner) => Ty::GenRef(Box::new(self.lower_type(ty_params, *inner))),
             TypeKind::RegionRef { inner, .. } => {
                 Ty::RegionRef(Box::new(self.lower_type(ty_params, *inner)))
@@ -1596,6 +1611,7 @@ impl<'a> TypeChecker<'a> {
                 // *except* `s[i..j]` (a range index) which slices a sub-`str`.
                 match bt {
                     Ty::Slice(elem) => *elem,
+                    Ty::Array { elem, .. } => *elem, // a fixed-size array indexes to its element
                     Ty::Prim("str") => {
                         if matches!(ast.expr_at(*index).kind, ExprKind::Range { .. }) {
                             Ty::Prim("str")
@@ -1605,6 +1621,10 @@ impl<'a> TypeChecker<'a> {
                     }
                     _ => Ty::Unknown,
                 }
+            }
+            ExprKind::ArrayRepeat { value, count } => {
+                let elem = self.infer(scope, typ, self_ty, *value);
+                Ty::Array { elem: Box::new(elem), len: self.eval_array_len(*count) }
             }
             ExprKind::Deref { base } => {
                 let bt = self.infer(scope, typ, self_ty, *base);
@@ -1872,6 +1892,7 @@ impl<'a> TypeChecker<'a> {
             }
             match t {
                 Ty::Slice(e) => *e,
+                Ty::Array { elem, .. } => *elem, // iterating a fixed-size array yields its element
                 Ty::Prim("str") => Ty::Prim("u8"), // iterating a string yields bytes
                 _ => Ty::Unknown,
             }
@@ -1934,6 +1955,14 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn field_type(&mut self, span: Span, base: &Ty, fname: &str) -> Ty {
+        if let Ty::Array { len, .. } = base {
+            // A fixed-size array's `.len` is its constant length (an O(1) `usize`).
+            if fname == "len" {
+                let _ = len;
+                return Ty::Prim("usize");
+            }
+            return Ty::Unknown;
+        }
         if let Ty::Slice(elem) = base {
             // A slice exposes `ptr` (the data pointer) and `len` (the length).
             return match fname {
@@ -2790,6 +2819,19 @@ pub(crate) fn unify_tp(param: &Ty, actual: &Ty, tps: &HashSet<String>, subst: &m
     }
 }
 
+/// Parse an integer literal's source text to a `usize` (the `[N]T` array length):
+/// decimal, `0x`/`0X` hex, or `0b`/`0B` binary, with `_` digit separators ignored.
+fn parse_int_literal_usize(text: &str) -> Option<usize> {
+    let t: String = text.chars().filter(|c| *c != '_').collect();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        usize::from_str_radix(hex, 16).ok()
+    } else if let Some(bin) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+        usize::from_str_radix(bin, 2).ok()
+    } else {
+        t.parse::<usize>().ok()
+    }
+}
+
 /// Substitute type parameters (`Ty::Opaque(name)`) throughout a type.
 fn subst_ty(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
     match ty {
@@ -2805,6 +2847,7 @@ fn subst_ty(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
             args: args.iter().map(|a| subst_ty(a, subst)).collect(),
         },
         Ty::Slice(elem) => Ty::Slice(Box::new(subst_ty(elem, subst))),
+        Ty::Array { elem, len } => Ty::Array { elem: Box::new(subst_ty(elem, subst)), len: *len },
         Ty::GenRef(elem) => Ty::GenRef(Box::new(subst_ty(elem, subst))),
         Ty::RegionRef(elem) => Ty::RegionRef(Box::new(subst_ty(elem, subst))),
         Ty::Fn { params, ret, ret_conv } => Ty::Fn {
