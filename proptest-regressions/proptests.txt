@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc ee3ff726a78cb57e54f260efd4e8931c22935fa933f2ab9aab8d27cf126e56cf # shrinks to body = "(0 + (0 + var))"
+cc b598eeac63601295ba2010058f7e95b1c7a0f50e7e54452548dc27e606cea043 # shrinks to m = 1, p = 0, n = 2048, split = 0

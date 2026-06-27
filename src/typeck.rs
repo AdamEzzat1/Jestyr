@@ -1638,6 +1638,26 @@ impl<'a> TypeChecker<'a> {
                 let elem = exp_elem.unwrap_or(inferred);
                 Ty::Array { elem: Box::new(elem), len: self.eval_array_len(*count) }
             }
+            ExprKind::ArrayLit { elems } => {
+                // Adopt an expected element type (`var t: [N]u64 = [a, b, …]`) so an
+                // `i32`-by-default literal element takes the annotated element type.
+                let exp_elem = match &self.cur_expected {
+                    Some(Ty::Array { elem, .. }) => Some((**elem).clone()),
+                    _ => None,
+                };
+                let mut elem_ty = exp_elem.clone();
+                for e in elems {
+                    let prev = self.cur_expected.take();
+                    self.cur_expected = exp_elem.clone();
+                    let t = self.infer(scope, typ, self_ty, *e);
+                    self.cur_expected = prev;
+                    if elem_ty.is_none() {
+                        elem_ty = Some(t);
+                    }
+                }
+                let elem = elem_ty.unwrap_or(Ty::Unknown);
+                Ty::Array { elem: Box::new(elem), len: elems.len() }
+            }
             ExprKind::Deref { base } => {
                 let bt = self.infer(scope, typ, self_ty, *base);
                 match bt {

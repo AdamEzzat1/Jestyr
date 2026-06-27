@@ -223,8 +223,11 @@ pub enum ExprKind {
     Cast { expr: ExprId, ty: TypeId }, // `expr as T` — an explicit conversion
 
     /// `[value; count]` — a fixed-size array literal repeating `value` `count`
-    /// times (`count` a constant). The value form `[a, b, c]` is future work.
+    /// times (`count` a constant).
     ArrayRepeat { value: ExprId, count: ExprId },
+    /// `[e0, e1, …]` — a fixed-size array literal listing each element. Its length
+    /// is `elems.len()`; the elements share one type (the array's element type).
+    ArrayLit { elems: Vec<ExprId> },
 
     // composite
     // Self{...}, Foo{...}; `spread` is the `..base` functional-update source, if any.

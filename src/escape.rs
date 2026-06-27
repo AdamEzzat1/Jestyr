@@ -381,6 +381,12 @@ impl<'a> Checker<'a> {
                 self.walk_expr(ctx, *value, false);
                 self.walk_expr(ctx, *count, false);
             }
+            ExprKind::ArrayLit { elems } => {
+                // `[e0, e1, …]` is a value; walk each element, none escaping.
+                for e in elems {
+                    self.walk_expr(ctx, *e, false);
+                }
+            }
             ExprKind::Deref { base } => self.walk_expr(ctx, *base, false),
             ExprKind::Try { base } => self.walk_expr(ctx, *base, false),
             ExprKind::Cast { expr, .. } => self.walk_expr(ctx, *expr, false),

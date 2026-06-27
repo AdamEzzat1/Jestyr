@@ -1386,7 +1386,29 @@ impl<'a> Cgen<'a> {
                     let t = self.info.type_of(c.value).clone();
                     self.c_type(&t)
                 };
-                let v = self.emit_expr(c.value);
+                // An array-literal const must be a brace initializer, not the
+                // statement-expression `emit_expr` would give (a `static const`
+                // cannot be initialized by a GNU statement-expression). The C array
+                // type is `struct { T a[N]; }`, so the initializer is `{ { … } }`.
+                let arr_init: Option<(Vec<ExprId>, Option<ExprId>)> =
+                    match &ast.expr_at(c.value).kind {
+                        ExprKind::ArrayLit { elems } => Some((elems.clone(), None)),
+                        ExprKind::ArrayRepeat { value, count } => {
+                            Some((vec![*value], Some(*count)))
+                        }
+                        _ => None,
+                    };
+                let v = if let Some((elems, repeat)) = arr_init {
+                    let parts: Vec<String> = if let Some(count) = repeat {
+                        let one = self.emit_expr(elems[0]);
+                        vec![one; self.array_len(count)]
+                    } else {
+                        elems.iter().map(|e| self.emit_expr(*e)).collect()
+                    };
+                    format!("{{ {{ {} }} }}", parts.join(", "))
+                } else {
+                    self.emit_expr(c.value)
+                };
                 // `@section(".name")` places the global in a named linker section.
                 let section = c
                     .attr("section")
@@ -3464,13 +3486,15 @@ impl<'a> Cgen<'a> {
                 } else if let Ty::Array { len, .. } = &bt {
                     // A fixed-size array indexes its inline `a[N]` field, bounds-checked
                     // against the constant length. We take the array's *address* (not a
-                    // copy) so reading one element never copies the whole array.
+                    // copy) so reading one element never copies the whole array. The
+                    // pointer is `const` (this is a read) so indexing a `const` table
+                    // does not discard the qualifier.
                     let nlen = *len;
                     let aty = self.c_type(&bt);
                     let n = self.tmp;
                     self.tmp += 1;
                     format!(
-                        "({{ {aty}* _a{n} = &({b}); size_t _ix{n} = (size_t)({i}); assert(_ix{n} < {nlen}); _a{n}->a[_ix{n}]; }})"
+                        "({{ const {aty}* _a{n} = &({b}); size_t _ix{n} = (size_t)({i}); assert(_ix{n} < {nlen}); _a{n}->a[_ix{n}]; }})"
                     )
                 } else if !matches!(bt, Ty::Slice(_)) {
                     format!("({b})[{i}]")
@@ -3508,6 +3532,26 @@ impl<'a> Cgen<'a> {
                 format!(
                     "({{ {aty} _ar{n}; {ecty} _v{n} = ({v}); for (size_t _k{n} = 0; _k{n} < {nlen}; _k{n}++) _ar{n}.a[_k{n}] = _v{n}; _ar{n}; }})"
                 )
+            }
+            ExprKind::ArrayLit { elems } => {
+                // `[e0, e1, …]` — fill each element of a fresh array value (a
+                // statement-expression yielding the array). At a `const`/static
+                // initializer this path is bypassed for a brace initializer (see
+                // `consts`), which is the form a large lookup table needs.
+                let ty = apply_subst(&self.info.type_of(id).clone(), &self.subst);
+                let aty = match &ty {
+                    Ty::Array { .. } => self.c_type(&ty),
+                    _ => "int".to_string(),
+                };
+                let n = self.tmp;
+                self.tmp += 1;
+                let mut s = format!("({{ {aty} _al{n};");
+                for (i, e) in elems.iter().enumerate() {
+                    let v = self.emit_expr(*e);
+                    let _ = write!(s, " _al{n}.a[{i}] = ({v});");
+                }
+                let _ = write!(s, " _al{n}; }})");
+                s
             }
             ExprKind::Cast { expr, ty } => {
                 let cty = self.c_ty_ast(*ty);

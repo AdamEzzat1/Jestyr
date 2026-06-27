@@ -325,6 +325,10 @@ impl<'a> Printer<'a> {
             ExprKind::ArrayRepeat { value, count } => {
                 format!("[{}; {}]", self.expr_inline(*value), self.expr_inline(*count))
             }
+            ExprKind::ArrayLit { elems } => {
+                let es: Vec<String> = elems.iter().map(|e| self.expr_inline(*e)).collect();
+                format!("[{}]", es.join(", "))
+            }
             ExprKind::StructLit { path, fields, spread } => {
                 let mut fs: Vec<String> = fields
                     .iter()

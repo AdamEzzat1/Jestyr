@@ -1997,3 +1997,60 @@ mod core_props {
         }
     }
 }
+
+/// Array *list* literals `[e0, e1, …]` — the lookup-table enabler (TESTING.md §5,
+/// per-feature unit layer). The repeat form `[v; N]` already existed; these pin the
+/// list form, in particular that a `const` table lowers to a C **brace initializer**
+/// (a statement-expression cannot initialize a `static const`).
+#[cfg(test)]
+mod array_literals {
+    use super::compile;
+
+    const PROG: &str = "\
+const T: [4]u64 = [0x8000000000000000, 1, 2, 3]\n\
+fn pick(read t: [4]u64, i: usize) -> u64 { return t[i] }\n\
+fn main() -> i32 {\n\
+    let local: [3]i64 = [10, 20, 30]\n\
+    var s: i64 = 0\n\
+    for x in local { s = s + x }\n\
+    return (pick(T, 0) as i64 + s) as i32\n\
+}\n";
+
+    #[test]
+    fn array_list_literal_compiles_clean() {
+        let (_c, diags) = compile(PROG);
+        assert_eq!(diags, 0, "array list literal program must compile clean");
+    }
+
+    #[test]
+    fn const_array_is_a_brace_initializer() {
+        let (c, _) = compile(PROG);
+        // The const table is a static brace initializer carrying every element —
+        // NOT a statement-expression (`= ({`), which C rejects for a static const.
+        assert!(c.contains("j_T = { {"), "const table not brace-initialized:\n{c}");
+        assert!(
+            c.contains("0x8000000000000000"),
+            "table element missing from initializer:\n{c}"
+        );
+        assert!(
+            !c.contains("j_T = ({"),
+            "const table wrongly emitted as a statement-expression:\n{c}"
+        );
+    }
+
+    #[test]
+    fn const_array_element_type_is_adopted() {
+        // The `[4]u64` annotation makes the array a u64 array (not i32-by-default),
+        // so the emitted struct holds `uint64_t a[4]`.
+        let (c, _) = compile(PROG);
+        assert!(
+            c.contains("uint64_t a[4]"),
+            "u64 element type not adopted:\n{c}"
+        );
+    }
+
+    #[test]
+    fn array_list_literal_is_deterministic() {
+        assert_eq!(compile(PROG), compile(PROG));
+    }
+}

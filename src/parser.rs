@@ -1154,17 +1154,31 @@ impl<'src> Parser<'src> {
                 self.ast.expr(ExprKind::Attr(name), sp)
             }
             LBracket => {
-                // `[value; count]` — a fixed-size array literal (repeat form).
+                // A fixed-size array literal: `[value; count]` (repeat) or
+                // `[e0, e1, …]` (list). The token after the first element selects.
                 self.bump();
                 let saved = self.no_struct;
                 self.no_struct = false;
-                let value = self.parse_expr();
-                self.expect(Semi, "`;` in an array literal `[value; count]`");
-                let count = self.parse_expr();
+                let first = self.parse_expr();
+                let node = if self.at(Semi) {
+                    self.bump();
+                    let count = self.parse_expr();
+                    ExprKind::ArrayRepeat { value: first, count }
+                } else {
+                    let mut elems = vec![first];
+                    while self.at(Comma) {
+                        self.bump();
+                        if self.at(RBracket) {
+                            break; // tolerate a trailing comma
+                        }
+                        elems.push(self.parse_expr());
+                    }
+                    ExprKind::ArrayLit { elems }
+                };
                 self.no_struct = saved;
                 let end = self.cur().span;
                 self.expect(RBracket, "`]`");
-                self.ast.expr(ExprKind::ArrayRepeat { value, count }, span.to(end))
+                self.ast.expr(node, span.to(end))
             }
             LParen => {
                 self.bump();
