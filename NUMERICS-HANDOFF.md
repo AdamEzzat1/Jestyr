@@ -1,12 +1,13 @@
 # Numerics & `core`/`std` — Handoff (continue in a fresh session)
 
 > Written at the close of the `core`/`std` + numerics workstream. Everything below
-> is **on `master`** (head `05a57f8`), **502 tests green** (2 ignored),
+> is **on `master`** (head `18a9ad8`), **502 tests green** (2 ignored),
 > warning-clean. This note is self-contained: it says what exists, where, and
-> exactly how to pick up each of the open fronts cold. **Front A (binned finish) and
-> Front C (parse_float + format_float — the marquee, round-trip closed) are now
-> DONE** — see their sections. **Front B is the main remaining front.** Read with
-> [`CORE-STD-PHASE3.md`](CORE-STD-PHASE3.md)
+> exactly how to pick up each of the open fronts cold. **Front A (binned finish),
+> Front C (parse_float + format_float — the marquee, round-trip closed), and Front
+> B's first slice (`par_binned_sum`, deterministic parallel reduction on real
+> threads) are DONE.** What remains is research-grade / polish (see each section).
+> Read with [`CORE-STD-PHASE3.md`](CORE-STD-PHASE3.md)
 > (the full ledger), [`Jestyr-Remaining-And-Numerics-Research.md`](Jestyr-Remaining-And-Numerics-Research.md)
 > (Part 3 is the numerics plan), and [`docs/TESTING.md`](docs/TESTING.md) §5.14
 > (the test layer for all of this).
@@ -103,20 +104,42 @@ Not yet done (optional follow-ups, neither blocks B or C): carry-normalize insid
 merge of two is safe; a long sequential merge chain of many could approach the
 bound), and an `f64`/runtime SHA canary once the gcc-in-test harness exists.
 
-### B. Deterministic `par` runtime (parallel reduction that never changes the answer)
+### B. Deterministic `par` runtime — first slice ✅ DONE; static proof remains
 
-The binned accumulator's **merge** is the order-independent combine, so a parallel
-reduction is now *expressible*: split the slice across threads, each fills a local
-accumulator, then `binned_merge` them → bit-identical regardless of thread count.
+**Done (commit `18a9ad8`):** `core.par_binned_sum(s)` — a *parallel* sum
+bit-identical to the serial `f64_binned_sum`, on real OS threads. Splits the slice
+across `PAR_WORKERS` (=4) via `concurrent { spawn … }`; each worker bins its chunk
+into a LOCAL `[2048]i64` (reusing `binned_add`, so the carry/correct-rounding logic
+is never re-implemented) and copies it to its own heap region; after the join the
+regions merge by elementwise integer add and finalize once. Disjointness is **by
+construction** (region `w` = `[w·2048, w·2048+2048)`), so no race and no atomics on
+the hot path. Demo `examples/std/par_reduce.jtr` (par == serial across cancellation,
+n=1000, uneven n=7); the contract is property-proven for arbitrary splits by
+`core_props::binned_sum_is_chunk_independent`. **Mechanism learned:** a slice / raw
+pointer passed *by value* into the spawn arg-struct still aliases the same heap, so
+worker writes survive the join — that's what lets per-worker accumulators work
+without `mut`-array spawn args (which the spawn lowering does **not** support: it
+stores args by value, but a `mut` param is by-address → mismatch; pass `*mut i64` /
+slices instead).
 
-What's there: `concurrent { spawn … }` → pthreads + scoped join
-(`examples/concurrent.jtr`), atomics (`examples/atomics.jtr`). What's missing
-(research doc §2.5 / §3.4.3): task **results**, and the **escape-checker disjointness
-proof** for parallel writes. **First slice:** a `par`-style fold that spawns N
-workers each summing a chunk into its own `[2048]i64`, joins, merges, finalizes;
-assert the result is independent of N (the determinism canary). The hard part is the
-join-safety / disjoint-write proof, not the reduction (already solved). Touches
-`src/escape.rs` + the concurrency codegen. Bigger than A.
+**What's there in the compiler:** `concurrent { spawn f(args) }` → pthread-per-spawn
++ join-at-`}`; args copied into a per-site struct (`emit_concurrent`/`spawn_runtime`
+in `cgen.rs`). `spawn` only works as a **literal statement** in the concurrent
+block (not in a loop → no dynamic N), targets a **direct named call**, and has **no
+result**. Atomics via `__atomic_*` (`examples/atomics.jtr`).
+
+**Remaining (the research-grade parts the handoff flagged):**
+1. **Static disjoint-write proof** in `src/escape.rs` — today `ExprKind::Spawn` just
+   walks the call (join-safety holds: structured join means borrows don't outlive the
+   frame), but nothing proves two tasks write *disjoint* memory. A naive "same
+   pointer to two spawns" check is **wrong** — `examples/concurrent.jtr` deliberately
+   passes the *same* `buf` to four spawns that write different slots. Real
+   disjointness needs alias/region analysis (or a typed split-ownership API, e.g. a
+   `split_mut` that hands each task a provably-disjoint subslice). This is the hard,
+   unsolved piece; `par_binned_sum` is safe by construction, not by proof.
+2. **Dynamic-N spawn** (spawn-in-a-loop with a handle array) so the worker count
+   isn't fixed at 4 — needs `emit_concurrent` to handle `for { spawn … }`.
+3. **Task results** (a `spawn` that returns a value joined back).
 
 ### C. Correctly-rounded float parse/format (Eisel–Lemire + Ryū) — the marquee
 
@@ -156,9 +179,11 @@ The distinctly-Jestyr deliverable (closes CJC's transcendental-determinism gap).
      item 3 + research §3.6 Step 0). Until then the Rust mirrors + examples validate.
 
 **Recommended order:** ~~A (accumulator)~~ ✅, ~~C parse_float~~ ✅,
-~~C format_float~~ ✅, then **B (deterministic `par` runtime)** ← *next* (needs the
-escape-checker disjoint-write proof), then the parse_float slow path / Ryū / canary
-as polish.
+~~C format_float~~ ✅, ~~B first slice (`par_binned_sum`)~~ ✅. **All remaining work
+is research-grade or polish** — pick by appetite: the **parse_float slow path**
+(bounded, removes the >19-digit caveat; reuses a Dragon-style bignum) is the highest
+value-per-effort; then B's static disjoint-write proof (research), the Ryū perf
+swap, and the SHA canary (needs the gcc-in-test harness).
 
 ---
 
@@ -206,7 +231,8 @@ as polish.
 | Area | Where |
 |---|---|
 | Numerics + `core` library | `examples/std/core.jtr` |
-| Demos | `examples/std/{binned,reductions,numbers,float_bits,combinators,slice_algos,parse_float,format_float}.jtr`, `examples/{arrays,array_lit}.jtr` |
+| Demos | `examples/std/{binned,reductions,numbers,float_bits,combinators,slice_algos,parse_float,format_float,par_reduce}.jtr`, `examples/{arrays,array_lit,concurrent,atomics}.jtr` |
+| par reduction | `examples/std/core.jtr` (`par_binned_sum`/`par_worker`); concurrency lowering `src/cgen.rs` (`emit_concurrent`/`spawn_runtime`); join-safety `src/escape.rs` (`ExprKind::Spawn`) |
 | parse_float + table | `examples/std/core.jtr` (`parse_float`/`lemire_*`/`POW10_128`); reference + table generator `src/proptests.rs` → `mod lemire` |
 | format_float (Dragon4) | `examples/std/core.jtr` (`format_float`/`d4_*`); reference `src/proptests.rs` → `mod dragon` |
 | Property/law tests | `src/proptests.rs` → `mod core_props` (mirrors + laws), `mod prop`, `mod fuzz` |

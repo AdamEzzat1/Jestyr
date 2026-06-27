@@ -277,6 +277,11 @@ In rough priority order toward a usable `core` and self-hosting:
    `binned_round_is_correctly_rounded`) **and a per-bin cascading carry** in
    `binned_add` (lifts the ~2¹⁰-same-exponent-adds overflow bound for arbitrary
    counts — `binned_handles_per_bin_overflow`). Commits `8f39ee1`, `6e1ccb8`.
+   **And: `par_binned_sum`** (commit `18a9ad8`) — a deterministic *parallel* reduction
+   on real OS threads (4 workers, each its own accumulator region → merge → finalize),
+   bit-identical to the serial sum; demo `examples/std/par_reduce.jtr`. Disjointness
+   is by construction; a static disjoint-write proof for arbitrary spawn code remains
+   the research-grade open piece (Front B in `NUMERICS-HANDOFF.md`).
 3. **Correctly-rounded float parse/format — the marquee determinism deliverable.**
    - ✅ **`parse_float` done** (Eisel–Lemire fast path): `core.parse_float(str) ->
      Result(f64, ParseFloatError)`, one `mul64` against the verified 1302-entry
