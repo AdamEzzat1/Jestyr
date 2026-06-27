@@ -480,13 +480,14 @@ pub fn f64_pairwise_sum(read s: []f64) -> f64 {
 // into its exponent's bin — and **integer addition is exactly associative and
 // commutative**, so the bins are independent of the order (or chunking) of the
 // inputs. Two accumulators **merge** by adding bins elementwise; `binned_sum`
-// finalizes by folding the bins in a **fixed ascending-exponent order**. The
-// result is therefore **bit-identical regardless of how the sum was split across
-// threads/chunks** — the property `f64_sum`/`kahan`/`pairwise` cannot give.
+// reconstructs the bins' **exact** value and rounds it **once** to nearest-even.
+// The result is therefore **bit-identical regardless of how the sum was split
+// across threads/chunks** AND **correctly rounded** — neither of which
+// `f64_sum`/`kahan`/`pairwise` can give.
 //
-// A bin is an `i64`, so up to ~2^10 same-exponent values accumulate before it
-// could overflow; per-bin carry (to lift that bound) and a correctly-rounded
-// finalize are future refinements — see CORE-STD-PHASE3.md.
+// `binned_add` **cascades a carry** up the exponents so no `i64` bin can overflow
+// (lifting the old ~2^10-same-exponent-adds bound); the carry is value-preserving,
+// so it changes only the bin layout, never the rounded result.
 
 // 2^k as an `f64` (k in the normal-exponent range), via the IEEE-754 bit layout.
 pub fn f64_pow2(k: i64) -> f64 {
@@ -499,9 +500,20 @@ pub fn binned_new() -> [2048]i64 {
     return [0; 2048]
 }
 
-// Deposit `v`'s integer significand into its exponent bin. Order-independent:
-// this is exact integer addition, so the bin's value never depends on when `v`
-// arrived relative to the others.
+// Above this magnitude a bin is carried up. Well below i64::MAX and below 2^53, so
+// even after the worst-case single add (significand ≤ 2^53) and an elementwise
+// merge of two accumulators, no bin can wrap an i64.
+const BIN_CARRY_THRESH: i64 = 9007199254740992   // 2^53
+
+// Deposit `v`'s integer significand into its exponent bin, then **cascade a carry**
+// up the exponents so no bin can overflow its i64 (the old ~2^10-same-exponent-adds
+// bound). A bin-e unit is worth two bin-(e-1) units, so carrying `c` out of bin e
+// means depositing `c/2`-equivalent... precisely: moving `c` units from bin e to
+// bin e+1 (where each unit is 2× as large) leaves `c·2` of bin e's value behind —
+// so we keep the remainder `v - 2c` (magnitude ≤ 1) and pass `c = v/2` up. Bins 0
+// and 1 share a ULP, so that first carry is 1:1 (move the whole bin). The carry is
+// **exact** — it preserves the accumulator's value — so it does not change the
+// (correctly-rounded) result, only the bin layout.
 pub fn binned_add(mut bins: [2048]i64, v: f64) {
     let bits: u64 = f64_bits(v)
     let sign: u64 = bits >> 63
@@ -512,7 +524,24 @@ pub fn binned_add(mut bins: [2048]i64, v: f64) {
     if be != 0 { sigu = (one << 52) | mant }   // normal: restore the implicit leading 1
     var sig: i64 = sigu as i64
     if sign == 1 { sig = 0 - sig }
-    bins[be] = bins[be] + sig
+
+    var e: usize = be
+    bins[e] = bins[e] + sig
+    for e < 2047 {                             // top bin (inf/nan exponent) never carries
+        let v2: i64 = bins[e]
+        var mag: i64 = v2
+        if v2 < 0 { mag = 0 - v2 }
+        if mag < BIN_CARRY_THRESH { break }
+        var c: i64 = v2                        // bin 0 → bin 1 is 1:1 (shared ULP)
+        if e != 0 {
+            c = v2 / 2                          // bin e → bin e+1 is 2:1
+            bins[e] = v2 - c * 2               // remainder stays (magnitude ≤ 1)
+        } else {
+            bins[e] = 0
+        }
+        bins[e + 1] = bins[e + 1] + c
+        e = e + 1
+    }
 }
 
 // Merge accumulator `b` into `a` (bins added elementwise). Associative and

@@ -8,7 +8,7 @@
 // The finalize is also **correctly rounded** (round-to-nearest-even of the bins'
 // exact value), which a naive float sum is not.
 //
-//   jestyrc run examples/std/binned.jtr   →   4, 4, 1, 1, 1, 1
+//   jestyrc run examples/std/binned.jtr   →   4, 4, 1, 1, 1, 1, 1
 import "core"
 import "io"
 
@@ -64,5 +64,18 @@ fn main() -> i32 {
     io.print_i32(b2i(core.f64_bits(rounded) != core.f64_bits(naive)))      // 1
 
     free_ptr(rb)
+
+    // Per-bin overflow: 3000 × 1.0 all land in one exponent bin. 3000·2^52 ≈ 1.35e19
+    // exceeds i64::MAX (≈9.22e18), so without the add-time carry the bin would wrap.
+    // The cascading carry keeps it exact → 3000.0.
+    var ov: [2048]i64 = core.binned_new()
+    var k: i32 = 0
+    for k < 3000 {
+        core.binned_add(ov, 1.0)
+        k = k + 1
+    }
+    let big: f64 = core.binned_sum(ov)
+    io.print_i32(b2i(core.f64_bits(big) == core.f64_bits(3000.0)))   // 1
+
     return 0
 }

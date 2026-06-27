@@ -1455,7 +1455,28 @@ mod core_props {
         if sign == 1 {
             sig = -sig;
         }
-        bins[be] = bins[be].wrapping_add(sig);
+        // Cascade a carry up the exponents so no bin can overflow its i64 (mirror of
+        // the carry in `core.binned_add`). Exact — preserves the accumulator value —
+        // so it changes only the bin layout, never the rounded result.
+        const THRESH: i64 = 1 << 53;
+        let mut e = be;
+        bins[e] = bins[e].wrapping_add(sig);
+        while e < 2047 {
+            let v = bins[e];
+            if v.unsigned_abs() < THRESH as u64 {
+                break;
+            }
+            let c = if e == 0 {
+                bins[0] = 0; // bin 0 → bin 1 is 1:1 (shared ULP)
+                v
+            } else {
+                let c = v / 2; // bin e → bin e+1 is 2:1
+                bins[e] = v - c * 2;
+                c
+            };
+            bins[e + 1] = bins[e + 1].wrapping_add(c);
+            e += 1;
+        }
     }
     // ── Correctly-rounded finalize (mirror of `core.binned_sum`) ────────────────
     // The bins are an *exact* big fixed-point number: X = Σ bins[e]·2^(e-1075), with
@@ -1928,6 +1949,51 @@ mod core_props {
                 m_binned_add(&mut bins, x);
             }
             prop_assert_eq!(m_binned_round(&bins).to_bits(), oracle.to_bits());
+        }
+
+        /// **The add-time carry lifts the per-bin overflow bound.** Depositing the
+        /// same value `n > 2^10` times would wrap a single `i64` bin (≈2^10 max-
+        /// significand adds reach 2^63) — the documented old limitation. With the
+        /// cascading carry the accumulator stays exact, so (a) the sum is still
+        /// **bit-identical** however it is chunked/merged, and (b) it equals the
+        /// correctly-rounded true total `n·base`. (Teeth: dropping the carry from
+        /// `m_binned_add` wraps the bin — both assertions then fail, since whole and
+        /// chunked wrap differently and neither matches the oracle.)
+        #[test]
+        fn binned_handles_per_bin_overflow(
+            m in 1i64..(1i64 << 53),
+            p in -6i32..6,
+            n in 1100usize..4000,
+            split in 0usize..4000,
+        ) {
+            let base = (m as f64) * 2f64.powi(p);
+            let mut whole = [0i64; 2048];
+            for _ in 0..n {
+                m_binned_add(&mut whole, base);
+            }
+            let s = split.min(n);
+            let mut a = [0i64; 2048];
+            let mut b = [0i64; 2048];
+            for _ in 0..s {
+                m_binned_add(&mut a, base);
+            }
+            for _ in s..n {
+                m_binned_add(&mut b, base);
+            }
+            for i in 0..2048 {
+                a[i] = a[i].wrapping_add(b[i]); // merge
+            }
+            // (a) chunk-independent even though a single bin overflowed
+            prop_assert_eq!(m_binned_round(&whole).to_bits(), m_binned_round(&a).to_bits());
+            // (b) correct: the exact total n·base rounded once to nearest
+            let bits = base.to_bits();
+            let be = ((bits >> 52) & 0x7FF) as i64;
+            let mant = (bits & 0xFFFF_FFFF_FFFFF) as i128;
+            let sig0 = if be != 0 { (1i128 << 52) | mant } else { mant };
+            let k0 = if be == 0 { -1074 } else { be - 1075 };
+            let oracle = (sig0 * n as i128) as f64 * 2f64.powi(k0 as i32);
+            prop_assume!(oracle.is_finite() && (oracle == 0.0 || oracle.abs() >= f64::MIN_POSITIVE));
+            prop_assert_eq!(m_binned_round(&whole).to_bits(), oracle.to_bits());
         }
     }
 }
