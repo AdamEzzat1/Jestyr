@@ -1439,6 +1439,36 @@ mod core_props {
         m_f64_pairwise(&s[..mid]) + m_f64_pairwise(&s[mid..])
     }
 
+    // ── Rust mirror of core's binned superaccumulator (same structure) ──────────
+    /// Deposit `v`'s integer significand into its exponent bin (mirror of
+    /// `core.binned_add`). Integer addition → order-independent bins.
+    fn m_binned_add(bins: &mut [i64; 2048], v: f64) {
+        let bits = v.to_bits();
+        let sign = bits >> 63;
+        let be = ((bits >> 52) & 0x7FF) as usize;
+        let mant = bits & 0xFFFF_FFFF_FFFFF;
+        let mut sigu = mant;
+        if be != 0 {
+            sigu = (1u64 << 52) | mant;
+        }
+        let mut sig = sigu as i64;
+        if sign == 1 {
+            sig = -sig;
+        }
+        bins[be] = bins[be].wrapping_add(sig);
+    }
+    /// Fold the bins in fixed ascending-exponent order (mirror of `core.binned_sum`).
+    fn m_binned_sum(bins: &[i64; 2048]) -> f64 {
+        let mut acc = 0.0f64;
+        for (e, &b) in bins.iter().enumerate() {
+            if b != 0 {
+                let k = if e == 0 { -1074i64 } else { e as i64 - 1075 };
+                acc += (b as f64) * f64::from_bits(((k + 1023) as u64) << 52);
+            }
+        }
+        acc
+    }
+
     /// A self-contained generic slice-fold program at element type `prim` — the real
     /// compiler path the slice algorithms ride (subst through the for-loop / index).
     fn slice_fold_source(prim: &str) -> String {
@@ -1682,6 +1712,49 @@ mod core_props {
             let xs = [1.0, 1e100, 1.0, -1e100];
             prop_assert_eq!(m_f64_kahan(&xs), 2.0);
             prop_assert_eq!(m_f64_sum(&xs), 0.0);
+        }
+
+        // ── binned superaccumulator — the chunk-count-independent reduction ─────
+
+        /// **The headline determinism property:** the binned sum is **bit-identical**
+        /// however the data is split across chunks (accumulate per chunk, merge bins,
+        /// finalize == accumulate the whole). Integer bins make this true *by
+        /// construction* — the property naive/Kahan/pairwise summation cannot give.
+        #[test]
+        fn binned_sum_is_chunk_independent(
+            xs in proptest::collection::vec(-1e6f64..1e6, 0..96),
+            split in 0usize..96,
+        ) {
+            let mut whole = [0i64; 2048];
+            for &x in &xs {
+                m_binned_add(&mut whole, x);
+            }
+            let s = split.min(xs.len());
+            let mut a = [0i64; 2048];
+            let mut b = [0i64; 2048];
+            for &x in &xs[..s] {
+                m_binned_add(&mut a, x);
+            }
+            for &x in &xs[s..] {
+                m_binned_add(&mut b, x);
+            }
+            for i in 0..2048 {
+                a[i] = a[i].wrapping_add(b[i]); // merge
+            }
+            prop_assert_eq!(m_binned_sum(&whole).to_bits(), m_binned_sum(&a).to_bits());
+        }
+
+        /// On exactly-representable inputs the binned sum equals the true sum.
+        #[test]
+        fn binned_sum_is_exact_on_representable_inputs(
+            xs in proptest::collection::vec(-1000i32..1000, 0..96),
+        ) {
+            let mut bins = [0i64; 2048];
+            for &x in &xs {
+                m_binned_add(&mut bins, x as f64);
+            }
+            let exact = xs.iter().map(|&x| x as i64).sum::<i64>() as f64;
+            prop_assert_eq!(m_binned_sum(&bins), exact);
         }
     }
 }

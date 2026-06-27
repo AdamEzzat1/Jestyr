@@ -1623,7 +1623,19 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             ExprKind::ArrayRepeat { value, count } => {
-                let elem = self.infer(scope, typ, self_ty, *value);
+                // If an array type is expected (`var xs: [N]i64 = [0; N]`), adopt its
+                // element type so an `i32`-by-default literal element (`0`) takes the
+                // annotated element type — otherwise the literal would be `[N]i32`,
+                // a *different* value-struct than the `[N]i64` binding.
+                let exp_elem = match &self.cur_expected {
+                    Some(Ty::Array { elem, .. }) => Some((**elem).clone()),
+                    _ => None,
+                };
+                let prev = self.cur_expected.take();
+                self.cur_expected = exp_elem.clone();
+                let inferred = self.infer(scope, typ, self_ty, *value);
+                self.cur_expected = prev;
+                let elem = exp_elem.unwrap_or(inferred);
                 Ty::Array { elem: Box::new(elem), len: self.eval_array_len(*count) }
             }
             ExprKind::Deref { base } => {

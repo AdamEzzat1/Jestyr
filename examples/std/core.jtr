@@ -471,3 +471,81 @@ pub fn f64_pairwise_range(read s: []f64, lo: usize, hi: usize) -> f64 {
 pub fn f64_pairwise_sum(read s: []f64) -> f64 {
     return f64_pairwise_range(s, 0, s.len)
 }
+
+// ── Binned superaccumulator — the chunk-count-independent reduction ───────────
+//
+// CJC's defining determinism primitive (numerics research §3.2/§3.6), ported onto
+// the new fixed-size arrays. The accumulator is **2048 integer bins, one per
+// IEEE-754 biased exponent**. Adding a value deposits its *integer significand*
+// into its exponent's bin — and **integer addition is exactly associative and
+// commutative**, so the bins are independent of the order (or chunking) of the
+// inputs. Two accumulators **merge** by adding bins elementwise; `binned_sum`
+// finalizes by folding the bins in a **fixed ascending-exponent order**. The
+// result is therefore **bit-identical regardless of how the sum was split across
+// threads/chunks** — the property `f64_sum`/`kahan`/`pairwise` cannot give.
+//
+// A bin is an `i64`, so up to ~2^10 same-exponent values accumulate before it
+// could overflow; per-bin carry (to lift that bound) and a correctly-rounded
+// finalize are future refinements — see CORE-STD-PHASE3.md.
+
+// 2^k as an `f64` (k in the normal-exponent range), via the IEEE-754 bit layout.
+pub fn f64_pow2(k: i64) -> f64 {
+    let biased: i64 = k + 1023
+    return f64_from_bits((biased as u64) << 52)
+}
+
+// A fresh, zeroed accumulator (2048 exponent bins).
+pub fn binned_new() -> [2048]i64 {
+    return [0; 2048]
+}
+
+// Deposit `v`'s integer significand into its exponent bin. Order-independent:
+// this is exact integer addition, so the bin's value never depends on when `v`
+// arrived relative to the others.
+pub fn binned_add(mut bins: [2048]i64, v: f64) {
+    let bits: u64 = f64_bits(v)
+    let sign: u64 = bits >> 63
+    let be: usize = ((bits >> 52) & 0x7FF) as usize
+    let mant: u64 = bits & 0xFFFFFFFFFFFFF
+    let one: u64 = 1
+    var sigu: u64 = mant                       // subnormal: significand = mantissa
+    if be != 0 { sigu = (one << 52) | mant }   // normal: restore the implicit leading 1
+    var sig: i64 = sigu as i64
+    if sign == 1 { sig = 0 - sig }
+    bins[be] = bins[be] + sig
+}
+
+// Merge accumulator `b` into `a` (bins added elementwise). Associative and
+// commutative — the basis of a deterministic parallel reduction.
+pub fn binned_merge(mut a: [2048]i64, read b: [2048]i64) {
+    var i: usize = 0
+    for i < 2048 {
+        a[i] = a[i] + b[i]
+        i = i + 1
+    }
+}
+
+// Finalize: fold the bins in a fixed ascending-exponent order. Deterministic, and
+// since the bins are order-independent, so is the result.
+pub fn binned_sum(read bins: [2048]i64) -> f64 {
+    var acc: f64 = 0.0
+    var e: usize = 0
+    for e < 2048 {
+        let b: i64 = bins[e]
+        if b != 0 {
+            var k: i64 = (e as i64) - 1075       // a bin-e unit is 2^(e-1075)
+            if e == 0 { k = 0 - 1074 }           // subnormals share the smallest-normal ULP
+            acc = acc + (b as f64) * f64_pow2(k)
+        }
+        e = e + 1
+    }
+    return acc
+}
+
+// Convenience: a reproducible sum of a slice through the binned accumulator —
+// bit-identical no matter how the slice is later split and merged across threads.
+pub fn f64_binned_sum(read s: []f64) -> f64 {
+    var acc: [2048]i64 = [0; 2048]
+    for x in s { binned_add(acc, x) }
+    return binned_sum(acc)
+}

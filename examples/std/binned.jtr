@@ -1,0 +1,43 @@
+// examples/std/binned.jtr — the binned superaccumulator (CJC's defining determinism
+// primitive), the chunk-count-independent reduction. Adding a value deposits its
+// integer significand into its exponent bin; integer addition is exactly
+// associative+commutative, so two accumulators filled from different *chunks* and
+// then merged give a **bit-identical** result to one filled from the whole — the
+// guarantee a naive/Kahan/pairwise sum cannot make.
+//
+//   jestyrc run examples/std/binned.jtr   →   4, 4, 1
+import "core"
+import "io"
+
+fn setf(p: *mut f64, i: i32, v: f64) { unsafe { (p + i).* = v } }
+fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
+
+fn main() -> i32 {
+    var buf: *mut f64 = alloc(f64, 4)
+    setf(buf, 0, 1.0)
+    setf(buf, 1, 1.0e16)
+    setf(buf, 2, 0.0 - 1.0e16)
+    setf(buf, 3, 3.0)
+    var s: []f64 = slice(f64, buf, 4)
+
+    // Whole: one accumulator over the entire slice.
+    let whole: f64 = core.f64_binned_sum(s)
+    io.print_f64(whole)                                  // 4
+
+    // Chunked: two accumulators over the two halves, then merged.
+    var a: [2048]i64 = core.binned_new()
+    var b: [2048]i64 = core.binned_new()
+    core.binned_add(a, 1.0)
+    core.binned_add(a, 1.0e16)
+    core.binned_add(b, 0.0 - 1.0e16)
+    core.binned_add(b, 3.0)
+    core.binned_merge(a, b)
+    let chunked: f64 = core.binned_sum(a)
+    io.print_f64(chunked)                                // 4
+
+    // The two are bit-identical regardless of the split — the headline property.
+    io.print_i32(b2i(core.f64_bits(whole) == core.f64_bits(chunked)))   // 1
+
+    free_ptr(buf)
+    return 0
+}

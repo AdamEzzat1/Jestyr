@@ -526,8 +526,21 @@ the runtime side pinned by an end-to-end example and `cgen` goldens.
   true sum on exactly-representable inputs (`reductions_agree_on_exact_inputs`); each is
   run-deterministic; Kahan recovers `[1, 1e100, 1, -1e100] → 2` where naive returns `0`. Wiring
   `reductions_example_compiles_clean`; gcc round-trip `examples/std/reductions.jtr` →
-  `10 10 10 | 0 2 0`. (Chunk-count-independent reproducibility — the binned superaccumulator — is the
-  next numerics increment; it needs fixed-size arrays for its 2048 stack bins.)
+  `10 10 10 | 0 2 0`.
+- ✅ **Binned superaccumulator — the chunk-count-independent reduction (the numerics headline).**
+  CJC's defining determinism primitive, ported onto the new `[N]T` arrays: 2048 integer bins, one per
+  IEEE-754 biased exponent; `binned_add` deposits a value's integer significand into its bin (integer
+  addition → order-independent bins); `binned_merge` adds bins elementwise; `binned_sum` folds in fixed
+  ascending order. The sum is **bit-identical regardless of how the data is split across
+  threads/chunks** — what naive/Kahan/pairwise cannot guarantee. Properties (`core_props`, Rust
+  mirror): **`binned_sum_is_chunk_independent`** (whole == any chunk-split-then-merge, bit-for-bit) and
+  `binned_sum_is_exact_on_representable_inputs`. Wiring `binned_example_compiles_clean`; gcc round-trip
+  `examples/std/binned.jtr` → `4, 4, 1`. (Per-bin carry for arbitrary counts and a correctly-rounded
+  finalize are future refinements.)
+- ✅ **Fixed-size arrays `[N]T`** (the enabler): a value type lowered to a C `struct { T a[N]; }`;
+  `[v; N]` literal, bounds-checked index read/write, `.len`, `for x in arr`. Golden
+  `cgen::fixed_array_lowers_to_a_value_struct_with_bounds_checked_indexing`, printer round-trip,
+  `module::arrays_example_compiles_clean` (`examples/arrays.jtr` → `10 40 8 120 11`).
 - ✅ **Wiring.** `module::core_combinators_example_compiles_clean` +
   `slice_algos_example_compiles_clean` + `numbers_example_compiles_clean`. gcc round-trips:
   `jestyrc run examples/std/combinators.jtr` →

@@ -438,6 +438,14 @@ mod tests {
     }
 
     #[test]
+    fn binned_example_compiles_clean() {
+        // The binned superaccumulator (2048 integer exponent bins over `[N]T`
+        // arrays) — the chunk-count-independent reduction — resolves across
+        // `import "core"` and lowers clean.
+        pipeline_is_clean("examples/std/binned.jtr");
+    }
+
+    #[test]
     fn reductions_example_compiles_clean() {
         // The deterministic f64 reductions (naive/Neumaier-Kahan/pairwise) resolve
         // across `import "core"` and lower clean — the serial tier of CJC-inspired

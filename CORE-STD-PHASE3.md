@@ -15,10 +15,10 @@ teeth-verifies each new property by mutation, and is auto-committed.
 
 ## Achieved
 
-Several green, warning-clean, auto-committed increments. **482 tests pass** under
+Several green, warning-clean, auto-committed increments. **490 tests pass** under
 the default `cargo test` (from a 445 baseline: the codegen enablers' goldens, the
-combinator/slice/number/float-primitive/reduction `core_props` laws, the FP-flag
-lock, and the wiring tests).
+combinator/slice/number/float-primitive/reduction/binned `core_props` laws, the
+FP-flag lock, the budget canary, `[N]T` arrays, and the wiring tests).
 
 ### Reframing what `core`'s "trait surface" actually is
 
@@ -265,16 +265,15 @@ In rough priority order toward a usable `core` and self-hosting:
    confirmed the float port is feasible.
 2d. ✅ **Done — numerics Step 0 (FP contract) + deterministic serial reductions**
    (`f64_sum`/`f64_kahan_sum`/`f64_pairwise_sum`). See the numerics section above.
-2e. **Binned superaccumulator — the chunk-count-independent reduction (the numerics
-   headline).** 2048 exponent bins, 2Sum merge, ascending finalize → a parallel sum
-   bit-identical regardless of thread/chunk count (numerics research §3.6). **Gated
-   on a compiler feature this session surfaced: fixed-size arrays (`[N]T`).** Jestyr
-   has no stack arrays today (`[16]u8` is a parse error), so the doc's "2048
-   stack-allocated bins, zero heap" needs `[N]T` (parse `[N]T` + literals `[v; N]`/
-   `[a, b, …]` + indexing + C `T a[N]` codegen) — a worthwhile general feature — *or*
-   an interim heap-allocated bin buffer. The correctly-rounded *finalize*
-   (big-fixed-point → nearest `f64`) is the other non-trivial piece. This is the
-   recommended next numerics step, after `[N]T`.
+2e. ✅ **Done — fixed-size arrays `[N]T`** (the enabler this session surfaced and then
+   built): a value type lowered to a C `struct { T a[N]; }`; `[v; N]` literal,
+   bounds-checked index read/write, `.len`, `for x in arr`. (List literal `[a, b, c]`
+   is future work.)
+2f. ✅ **Done — binned superaccumulator** (the numerics headline): 2048 integer
+   exponent bins over `[N]T`; `binned_add`/`binned_merge`/`binned_sum`, with
+   `binned_sum_is_chunk_independent` proving the bit-identical-regardless-of-split
+   property. Per-bin carry (for arbitrary counts) and a correctly-rounded finalize
+   (vs the current fixed-ascending-order fold) are future refinements.
 3. **Correctly-rounded float parse/format — the marquee determinism deliverable.**
    Now that the primitives exist: Eisel–Lemire `parse_float` and Ryū
    shortest-round-trip `format_float` into a caller buffer (`core` stays no-alloc),
