@@ -1,10 +1,11 @@
 # Numerics & `core`/`std` — Handoff (continue in a fresh session)
 
 > Written at the close of the `core`/`std` + numerics workstream. Everything below
-> is **on `master`** (head `6e1ccb8`), **492 tests green**, warning-clean. This note
-> is self-contained: it says what exists, where, and exactly how to pick up each of
-> the open fronts cold. **Front A (binned accumulator finish) is now DONE** — see
-> its section below. Read with [`CORE-STD-PHASE3.md`](CORE-STD-PHASE3.md)
+> is **on `master`** (head `7cccce7`), **500 tests green** (1 ignored),
+> warning-clean. This note is self-contained: it says what exists, where, and
+> exactly how to pick up each of the open fronts cold. **Front A (binned finish) and
+> Front C `parse_float` are now DONE** — see their sections. Read with
+> [`CORE-STD-PHASE3.md`](CORE-STD-PHASE3.md)
 > (the full ledger), [`Jestyr-Remaining-And-Numerics-Research.md`](Jestyr-Remaining-And-Numerics-Research.md)
 > (Part 3 is the numerics plan), and [`docs/TESTING.md`](docs/TESTING.md) §5.14
 > (the test layer for all of this).
@@ -118,29 +119,37 @@ join-safety / disjoint-write proof, not the reduction (already solved). Touches
 
 ### C. Correctly-rounded float parse/format (Eisel–Lemire + Ryū) — the marquee
 
-The primitives are ready and validated (`mul64`, `clz64`, `f64_bits`/`f64_from_bits`,
-field extractors). This is the distinctly-Jestyr deliverable (closes CJC's
-transcendental-determinism gap) and the largest.
+The distinctly-Jestyr deliverable (closes CJC's transcendental-determinism gap).
 
-- **`parse_float` (Eisel–Lemire)** is the smaller half. Reuse the `parse_i64` digit
-  loop to read the decimal significand + power-of-ten exponent, normalize, do **one
-  `mul64`** against a precomputed power-of-ten table (~`5e-22..5e22`, ≈ 650 `u64`
-  hi/lo pairs — generate it and verify each entry against Rust), derive the 53-bit
-  mantissa + binary exponent, handle the rounding-tie (the "is the product exactly
-  halfway" check) and the slow-path fallback. Reference: Lemire's *fast_float*. The
-  table is the bulk of the code; `[N]T` arrays now hold it.
-- **`format_float` (Ryū)** — shortest round-trip — is the bigger half (its own lookup
-  tables + the algorithm). Do it after parse.
+- **`parse_float` (Eisel–Lemire) — ✅ DONE** (commits: array literals `539a3bc`
+  enabler, reference `4091488`, port `7cccce7`). `core.parse_float(str) ->
+  Result(f64, ParseFloatError)`: a fast-path decimal scanner (≤ 19 significant
+  digits) feeding compute_float (one `mul64` against the 1302-entry `POW10_128`
+  table, upperbit, subnormal path, in-range round-to-even tie, overflow→±inf).
+  Correctly rounded; > 19 digits returns `err(pf_too_many_digits)`. The table is
+  generated **and validated end-to-end** by `proptests::lemire` (the same generator
+  emits the Jestyr const via the `#[ignore] dump_pow10_table` test) against Rust's
+  correctly-rounded `str::parse::<f64>()` over ~1M cases + hard cases; runtime pinned
+  by `examples/std/parse_float.jtr`.
+- **Remaining on C:**
+  1. **`parse_float` slow path** — the > 19-digit / ambiguous cases that the fast
+     path bails on (today: `err(pf_too_many_digits)`). A big-integer / AlgorithmM
+     fallback. Smaller than format.
+  2. **`format_float` (Ryū)** — shortest round-trip — the bigger half (its own
+     lookup tables + the algorithm). Do it after the slow path or skip straight to
+     it. With both halves, the `parse(format(x)) == x` round-trip property closes.
 - **API:** locale-free, into a caller `[]u8` (no-alloc), like `format_i64`.
-- **Tests:** `parse(format(x)) == x` for representable doubles; differential vs
-  Rust's correctly-rounded parse / `format!`; and the **cross-OS locked-SHA-256
-  canary** — which needs the **`--features c-oracle` gcc-in-test harness** to exist
-  first (shared future work; `DROP-ALLOC-PHASE3.md` future item 3 + research §3.6
-  Step 0). Until then, validate via the Rust mirror + the example.
+- **Tests for what remains:** `parse(format(x)) == x` for representable doubles;
+  differential vs Rust's `format!`; and the **cross-OS locked-SHA-256 canary** —
+  which needs the **`--features c-oracle` gcc-in-test harness** to exist first
+  (shared future work; `DROP-ALLOC-PHASE3.md` future item 3 + research §3.6 Step 0).
+  Until then, validate via the Rust mirror + the example (the pattern parse_float
+  used).
 
-**Recommended order:** ~~A (small, finishes the accumulator)~~ ✅ done, then
-**C parse_float** (marquee, primitives ready) ← *next*, then B (needs the
-disjointness proof), then C format_float, then the canary harness.
+**Recommended order:** ~~A (finishes the accumulator)~~ ✅, ~~C parse_float~~ ✅,
+then **C format_float (Ryū)** ← *next* (or the parse_float slow path first, if you
+want parse fully correct before starting format), then B (needs the disjointness
+proof), then the canary harness.
 
 ---
 
@@ -160,6 +169,20 @@ disjointness proof), then C format_float, then the canary harness.
   (`is_err`, `is_ok`, …). Prefix your helpers (`res_is_err`, etc.).
 - **Huge `u64` decimal literals** warn in the emitted C ("constant so large it is
   unsigned"). Compute them instead (`0 - 1` for `u64::MAX`, shifts for powers of two).
+  *But* **hex** literals ≥ 2⁶³ are fine (C makes them unsigned, no warning) — that is
+  how `POW10_128` holds its top-bit-set entries.
+- **`(0 - 1) >> 55` shifts in 32-bit.** Bare integer literals are `i32`, so `0 - 1`
+  is `-1:i32` and `>> 55` overflows the type (wrong value + a warning). Force the
+  width *before* the shift: bind `let allone: u64 = 0 - 1` then shift, or just write
+  the constant (`511`). Same trap for any `1 << k` with `k ≥ 31` — use `let one: u64
+  = 1` then `one << k`, or `(1 as u64) << k`.
+- **Enum variant constructors are global**, not scoped to their enum. A second enum
+  reusing a variant name (`ParseFloatError::empty` vs `ParseIntError::empty`) makes
+  the bare `empty` ambiguous and silently miscompiles the *other* enum's `err(empty)`.
+  Prefix variants (`pf_empty`, …) to keep them unique across the module.
+- **Array list literals** (`[e0, e1, …]`, commit `539a3bc`) now exist alongside
+  `[v; N]`. A top-level `const` array lowers to a C **brace initializer**; inside a
+  function it is a statement-expression. Indexing a `const` array is `const`-correct.
 - **The recurring codegen pattern:** every generic lowering must resolve the inferred
   type through the active monomorphization subst *before* naming a C type —
   `apply_subst(&self.info.type_of(id), &self.subst)`. It was missing in enum
@@ -167,14 +190,15 @@ disjointness proof), then C format_float, then the canary harness.
   all fixed. **Latent refactor:** a single `resolve_monomorphized_type(id)` helper
   every lowering path calls, instead of raw `self.info.type_of(id)`.
 - **No fixed-size stack arrays** *was* the blocker for the accumulator — now solved
-  (`[N]T`). List literals `[a, b, c]` are still unbuilt (only `[v; N]` repeat).
+  (`[N]T`), and list literals `[a, b, c]` are now built too (the table enabler).
 
 ## Pointers
 
 | Area | Where |
 |---|---|
 | Numerics + `core` library | `examples/std/core.jtr` |
-| Demos | `examples/std/{binned,reductions,numbers,float_bits,combinators,slice_algos}.jtr`, `examples/arrays.jtr` |
+| Demos | `examples/std/{binned,reductions,numbers,float_bits,combinators,slice_algos,parse_float}.jtr`, `examples/{arrays,array_lit}.jtr` |
+| parse_float + table | `examples/std/core.jtr` (`parse_float`/`lemire_*`/`POW10_128`); reference + table generator `src/proptests.rs` → `mod lemire` |
 | Property/law tests | `src/proptests.rs` → `mod core_props` (mirrors + laws), `mod prop`, `mod fuzz` |
 | FP flags | `src/main.rs` → `CC_FLAGS` + `mod fp_contract_tests` |
 | Budget canary | `src/main.rs` → `mod budget_canary` |

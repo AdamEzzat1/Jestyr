@@ -278,14 +278,19 @@ In rough priority order toward a usable `core` and self-hosting:
    `binned_add` (lifts the ~2¹⁰-same-exponent-adds overflow bound for arbitrary
    counts — `binned_handles_per_bin_overflow`). Commits `8f39ee1`, `6e1ccb8`.
 3. **Correctly-rounded float parse/format — the marquee determinism deliverable.**
-   Now that the primitives exist: Eisel–Lemire `parse_float` and Ryū
-   shortest-round-trip `format_float` into a caller buffer (`core` stays no-alloc),
-   building on `mul64` for the 128-bit intermediate math. Properties:
-   `parse(format(x)) == x` for representable doubles; differential vs Rust's
-   correctly-rounded parse / `format!`; a **cross-OS locked-SHA-256 canary** on a
-   reference set (the std side of the numerics determinism contract, §3.3 of
-   `Jestyr-Remaining-And-Numerics-Research.md`). Transcendentals stay out of scope
-   (the numeric stack / SoftFloat).
+   - ✅ **`parse_float` done** (Eisel–Lemire fast path): `core.parse_float(str) ->
+     Result(f64, ParseFloatError)`, one `mul64` against the verified 1302-entry
+     `POW10_128` table; correctly rounded for ≤ 19 significant digits (> 19 →
+     `err(pf_too_many_digits)`, the slow path is future work). Validated end-to-end
+     vs Rust's correctly-rounded parser by `proptests::lemire` (~1M cases + hard
+     cases); the array-list-literal feature (`539a3bc`) holds the table. Commits
+     `539a3bc`, `4091488`, `7cccce7`. Demo `examples/std/parse_float.jtr`.
+   - **Remaining:** the parse_float slow path (> 19 digits / ambiguous), then Ryū
+     `format_float` (shortest round-trip, its own tables) into a caller buffer
+     (`core` stays no-alloc). With both, the `parse(format(x)) == x` round-trip and
+     the **cross-OS locked-SHA-256 canary** (needs the `--features c-oracle`
+     gcc-in-test harness) close the std side of the determinism contract (§3.3 of
+     `Jestyr-Remaining-And-Numerics-Research.md`). Transcendentals stay out of scope.
 4. **Math with defined semantics** (ROADMAP J): `wrapping_*`/`saturating_*`/
    `checked_*`, bit-width-aware, with the overflow behavior pinned by property.
 5. **A real `core`/`std` trait surface, if the compiler grows it.** Associated
