@@ -5,18 +5,28 @@
 // determinism contract. Each check compares the parsed bits to the bits of the
 // equivalent Jestyr float literal (which the C backend rounds the same way).
 //
-//   jestyrc run examples/std/parse_float.jtr   →   thirteen 1s
+//   jestyrc run examples/std/parse_float.jtr   →   sixteen 1s
 import "core"
 import "io"
 
 fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
 
+// unwrap a parse result with a default (tail-position match — the supported form).
+fn uo(take r: Result(f64, ParseFloatError), take d: f64) -> f64 {
+    match r { ok(v) => v, err(e) => d }
+}
+
 // 1 iff `s` parses and its bits equal `expected`'s bits.
 fn eqf(s: str, expected: f64) -> i32 {
-    match core.parse_float(s) {
-        ok(v) => b2i(core.f64_bits(v) == core.f64_bits(expected)),
-        err(e) => 0,
-    }
+    return b2i(core.f64_bits(uo(core.parse_float(s), 0.0 - 1.0)) == core.f64_bits(expected))
+}
+
+// 1 iff `a` and `b` parse to the same double (the long form and its shortest form
+// must round identically — exercises the > 19-digit slow path against the fast one).
+fn same(a: str, b: str) -> i32 {
+    let va: f64 = uo(core.parse_float(a), 0.0 - 1.0)
+    let vb: f64 = uo(core.parse_float(b), 0.0 - 2.0)
+    return b2i(core.f64_bits(va) == core.f64_bits(vb))
 }
 
 // 1 iff `s` is rejected (an error, not a value).
@@ -45,8 +55,15 @@ fn main() -> i32 {
     // smallest subnormal, via the subnormal path
     io.print_i32(eqf("5e-324", 5.0e-324))                     // 1
 
-    // rejections: malformed, and > 19 significant digits (fast path → err)
+    // ── slow path (> 19 significant digits) — correctly rounded ──
+    // long forms must round to the same double as their shortest form
+    io.print_i32(same("3.141592653589793238462643383279", "3.141592653589793"))   // 1
+    io.print_i32(same("1.00000000000000000000000000001", "1"))                     // 1
+    io.print_i32(same("0.1000000000000000055511151231257827", "0.1"))             // 1
+    // just past the 9007199254740993 tie → rounds UP to 9007199254740994
+    io.print_i32(same("9007199254740993.0000000000000001", "9007199254740994"))   // 1
+
+    // rejection: genuinely malformed (a 20-digit number now parses via the slow path)
     io.print_i32(rej("12x"))                                  // 1
-    io.print_i32(rej("12345678901234567890"))                // 1
     return 0
 }

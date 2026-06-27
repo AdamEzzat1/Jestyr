@@ -851,6 +851,227 @@ fn lemire_product(q: i64, w: u64) -> U128 {
     return p
 }
 
+// The Eisel–Lemire fast path as a reusable helper: round `mant · 10^q` (mant a
+// ≤19-digit u64) to the nearest f64, returning its raw bits. Used both for the
+// fast path and as the slow path's starting candidate.
+fn lemire_f64(neg: bool, mant: u64, q: i64) -> u64 {
+    let one: u64 = 1
+    var sign: u64 = 0
+    if neg { sign = one << 63 }
+    if mant == 0 or q < (0 - 342) { return sign }                       // ±0
+    if q > 308 { return sign | ((2047 as u64) << 52) }                  // ±inf
+    let lz: i64 = clz64(mant) as i64
+    let w: u64 = mant << (lz as u64)
+    let p: U128 = lemire_product(q, w)
+    let upperbit: i64 = (p.hi >> 63) as i64
+    let sh: u64 = (upperbit + 9) as u64
+    var m: u64 = p.hi >> sh
+    var power2: i64 = lemire_power(q) + upperbit - lz + 1023
+    if power2 <= 0 {
+        let rsh: i64 = (0 - power2) + 1
+        if rsh >= 64 { return sign }                                    // underflow → ±0
+        m = m >> (rsh as u64)
+        m = m + (m & 1)
+        m = m >> 1
+        var bexp: i64 = 0
+        if m >= (one << 52) { bexp = 1 }
+        return sign | m | ((bexp as u64) << 52)
+    }
+    if p.lo <= 1 and q >= (0 - 4) and q <= 23 {
+        if (m & 3) == 1 {
+            if (m << sh) == p.hi { m = m - (m & 1) }
+        }
+    }
+    m = m + (m & 1)
+    m = m >> 1
+    if m >= (one << 53) {
+        m = one << 52
+        power2 = power2 + 1
+    }
+    m = m & ((one << 52) - 1)
+    if power2 >= 2047 { return sign | ((2047 as u64) << 52) }           // overflow → ±inf
+    return sign | m | ((power2 as u64) << 52)
+}
+
+// ── Slow path (> 19 digits): arbitrary-precision, correctly rounded ───────────
+//
+// The fast path can't form the 64-bit mantissa beyond 19 digits. Take its result
+// on the first 19 digits as a candidate `g` (within ~0.01 ULP of the true value),
+// then decide between `g` and its bit-pattern neighbours `g±1` by comparing the
+// exact value `D·10^E` to the relevant rounding midpoint — a cross-multiplied
+// big-integer comparison (multiply by 5ⁿ, shift, compare; never divide). The
+// comparison keeps up to 768 significant digits exactly (a boundary's exact decimal
+// has < 768), with a sticky bit for the rest. A 56-limb (3584-bit) bignum holds it.
+
+fn sp_from_u64(x: u64) -> [56]u64 {
+    var a: [56]u64 = [0; 56]
+    a[0] = x
+    return a
+}
+fn sp_mul_small(mut a: [56]u64, m: u64) {
+    var carry: u64 = 0
+    var i: usize = 0
+    for i < 56 {
+        let prod: U128 = mul64(a[i], m)
+        let lo: u64 = prod.lo + carry
+        var c2: u64 = 0
+        if lo < carry { c2 = 1 }
+        a[i] = lo
+        carry = prod.hi + c2
+        i = i + 1
+    }
+}
+fn sp_add_small(mut a: [56]u64, x: u64) {
+    var carry: u64 = x
+    var i: usize = 0
+    for carry != 0 {
+        if i >= 56 { return }
+        let s: u64 = a[i] + carry
+        var c: u64 = 0
+        if s < a[i] { c = 1 }
+        a[i] = s
+        carry = c
+        i = i + 1
+    }
+}
+fn sp_shl(mut a: [56]u64, n: usize) {
+    let words: usize = n / 64
+    let bits: usize = n % 64
+    if bits != 0 {
+        var carry: u64 = 0
+        var i: usize = 0
+        for i < 56 {
+            let v: u64 = a[i]
+            a[i] = (v << bits) | carry
+            carry = v >> (64 - bits)
+            i = i + 1
+        }
+    }
+    if words != 0 {
+        var j: usize = 56
+        for j > 0 {
+            j = j - 1
+            if j >= words { a[j] = a[j - words] } else { a[j] = 0 }
+        }
+    }
+}
+fn sp_cmp(read a: [56]u64, read b: [56]u64) -> i32 {
+    var i: usize = 56
+    for i > 0 {
+        i = i - 1
+        if a[i] != b[i] {
+            if a[i] < b[i] { return 0 - 1 }
+            return 1
+        }
+    }
+    return 0
+}
+fn sp_mul_pow5(mut a: [56]u64, e: usize) {
+    var i: usize = 0
+    for i < e {
+        sp_mul_small(a, 5)
+        i = i + 1
+    }
+}
+fn sp_from_digits(read d: [768]u8, t: usize) -> [56]u64 {
+    var b: [56]u64 = [0; 56]
+    var i: usize = 0
+    for i < t {
+        sp_mul_small(b, 10)
+        sp_add_small(b, (d[i] - 48) as u64)
+        i = i + 1
+    }
+    return b
+}
+
+// Compare `dt · 10^et` against the boundary `c · 2^p`; `sticky` means the true
+// value is strictly larger than `dt·10^et`. Returns -1 / 0 / 1. Division-free.
+fn sp_cmp_boundary(read dt: [56]u64, et: i64, c: u64, p: i64, sticky: bool) -> i32 {
+    var l: [56]u64 = dt
+    var r: [56]u64 = sp_from_u64(c)
+    if et >= 0 {
+        sp_mul_pow5(l, et as usize)
+    } else {
+        sp_mul_pow5(r, (0 - et) as usize)
+    }
+    var mn: i64 = et
+    if p < mn { mn = p }
+    sp_shl(l, (et - mn) as usize)
+    sp_shl(r, (p - mn) as usize)
+    let o: i32 = sp_cmp(l, r)
+    if o == 0 {
+        if sticky { return 1 }
+    }
+    return o
+}
+
+// `t` = digits stored in `d` (= min(nd, 768)); `nd` = total significant digits;
+// value = (full significand) · 10^e; `sticky` = any dropped digit nonzero.
+fn slow_parse(neg: bool, read d: [768]u8, t: usize, nd: usize, e: i64, sticky: bool) -> u64 {
+    let one: u64 = 1
+    var sign: u64 = 0
+    if neg { sign = one << 63 }
+    // candidate from the first 19 significant digits
+    var w: u64 = 0
+    var ci: usize = 0
+    for ci < 19 {
+        w = w * 10 + ((d[ci] - 48) as u64)
+        ci = ci + 1
+    }
+    let q19: i64 = e + ((nd as i64) - 19)
+    var gbits: u64 = lemire_f64(neg, w, q19) & ((one << 63) - 1)        // magnitude
+    let be: u64 = (gbits >> 52) & 0x7FF
+    if be == 2047 { return sign | gbits }                              // ±inf
+    let dt: [56]u64 = sp_from_digits(d, t)
+    let et: i64 = e + ((nd as i64) - (t as i64))
+    let mant: u64 = gbits & 0xFFFFFFFFFFFFF
+    var m: u64 = mant
+    var k: i64 = 0 - 1074
+    if be != 0 {
+        m = (one << 52) | mant
+        k = (be as i64) - 1075
+    }
+    var resbits: u64 = gbits
+    if m == 0 {
+        // candidate ±0: boundary to the smallest subnormal is 2^-1075
+        if sp_cmp_boundary(dt, et, 1, 0 - 1075, sticky) > 0 { resbits = gbits + 1 }
+    } else {
+        let c0: i32 = sp_cmp_boundary(dt, et, 2 * m, k - 1, sticky)    // vs g itself
+        if c0 > 0 {
+            // V above g → g or succ; upper midpoint (2m+1)·2^(k-1)
+            let ch: i32 = sp_cmp_boundary(dt, et, 2 * m + 1, k - 1, sticky)
+            if ch > 0 {
+                resbits = gbits + 1
+            } else {
+                if ch == 0 {
+                    if (m & 1) == 1 { resbits = gbits + 1 }            // tie → even
+                }
+            }
+        } else {
+            if c0 < 0 {
+                // V below g → g or pred; lower midpoint (asymmetric at powers of two)
+                var cc: u64 = 2 * m - 1
+                var pp: i64 = k - 1
+                if mant == 0 {
+                    if be > 1 {
+                        cc = 4 * m - 1
+                        pp = k - 2
+                    }
+                }
+                let cl: i32 = sp_cmp_boundary(dt, et, cc, pp, sticky)
+                if cl < 0 {
+                    resbits = gbits - 1
+                } else {
+                    if cl == 0 {
+                        if (m & 1) == 1 { resbits = gbits - 1 }        // tie → even
+                    }
+                }
+            }
+        }
+    }
+    return sign | resbits
+}
+
 pub fn parse_float(s: str) -> Result(f64, ParseFloatError) {
     let one: u64 = 1
     if s.len == 0 { return err(pf_empty) }
@@ -862,25 +1083,35 @@ pub fn parse_float(s: str) -> Result(f64, ParseFloatError) {
     } else {
         if s[0] == 43 { i = 1 }
     }
-    var mant: u64 = 0
-    var digits: i64 = 0
-    var dot_at: i64 = 0 - 1                          // -1 ⇒ no decimal point seen
-    var overflowed: bool = false
+    var digbuf: [768]u8 = [0; 768]
+    var nd: usize = 0                                // total significant digits (uncapped)
+    var stored: usize = 0                            // significant digits kept in digbuf (≤768)
+    var sticky: bool = false                         // a dropped significant digit was nonzero
+    var frac: i64 = 0                                // digit count after the decimal point
+    var dot: bool = false
     var seen: bool = false
+    var seen_nz: bool = false                        // first nonzero digit seen (skip leading 0s)
     for i < s.len {
         let b: u8 = s[i]
         if b >= 48 and b <= 57 {
             seen = true
-            if digits < 19 {
-                mant = mant * 10 + ((b - 48) as u64)
-                digits = digits + 1
+            if dot { frac = frac + 1 }
+            if b == 48 and seen_nz == false {
+                // leading zero — not significant (its place is tracked by `frac`/exp)
             } else {
-                overflowed = true                   // > 19 significant digits → slow path
+                seen_nz = true
+                if stored < 768 {
+                    digbuf[stored] = b
+                    stored = stored + 1
+                } else {
+                    if b != 48 { sticky = true }
+                }
+                nd = nd + 1
             }
             i = i + 1
         } else {
-            if b == 46 and dot_at == (0 - 1) {
-                dot_at = digits
+            if b == 46 and dot == false {
+                dot = true
                 i = i + 1
             } else {
                 break
@@ -888,9 +1119,7 @@ pub fn parse_float(s: str) -> Result(f64, ParseFloatError) {
         }
     }
     if seen == false { return err(pf_invalid) }
-    if overflowed { return err(pf_too_many_digits) }
-    var q: i64 = 0
-    if dot_at != (0 - 1) { q = dot_at - digits }     // digits after the point lower q
+    var expo: i64 = 0
     if i < s.len {
         let e0: u8 = s[i]
         if e0 == 101 or e0 == 69 {                    // 'e' / 'E'
@@ -915,49 +1144,24 @@ pub fn parse_float(s: str) -> Result(f64, ParseFloatError) {
                 i = i + 1
             }
             if any == false { return err(pf_invalid) }
-            q = q + esign * ev
+            expo = esign * ev
         }
     }
     if i != s.len { return err(pf_invalid) }         // trailing junk
-
-    // ── Eisel–Lemire ──
     var sign: u64 = 0
     if neg { sign = one << 63 }
-    if mant == 0 or q < (0 - 342) { return ok(f64_from_bits(sign)) }            // ±0
-    if q > 308 { return ok(f64_from_bits(sign | ((2047 as u64) << 52))) }       // ±inf
-    let lz: i64 = clz64(mant) as i64
-    let w: u64 = mant << (lz as u64)
-    let p: U128 = lemire_product(q, w)
-    let upperbit: i64 = (p.hi >> 63) as i64
-    let sh: u64 = (upperbit + 9) as u64                                          // upperbit + 64-52-3
-    var m: u64 = p.hi >> sh
-    var power2: i64 = lemire_power(q) + upperbit - lz + 1023
-    if power2 <= 0 {
-        let rsh: i64 = (0 - power2) + 1
-        if rsh >= 64 { return ok(f64_from_bits(sign)) }                         // underflow → ±0
-        m = m >> (rsh as u64)
-        m = m + (m & 1)
-        m = m >> 1
-        var bexp: i64 = 0
-        if m >= (one << 52) { bexp = 1 }            // rounded up into the smallest normal
-        return ok(f64_from_bits(sign | m | ((bexp as u64) << 52)))
-    }
-    // exact-halfway → round to even, only where the product is exact (lo ≤ 1) and q
-    // is in the safe range
-    if p.lo <= 1 and q >= (0 - 4) and q <= 23 {
-        if (m & 3) == 1 {
-            if (m << sh) == p.hi { m = m - (m & 1) }
+    if seen_nz == false { return ok(f64_from_bits(sign)) }   // all zeros → ±0
+    let e: i64 = expo - frac                          // value = (significand) · 10^e
+    if nd <= 19 {
+        var w: u64 = 0
+        var j: usize = 0
+        for j < stored {
+            w = w * 10 + ((digbuf[j] - 48) as u64)
+            j = j + 1
         }
+        return ok(f64_from_bits(lemire_f64(neg, w, e)))
     }
-    m = m + (m & 1)
-    m = m >> 1
-    if m >= (one << 53) {                            // mantissa carried out → renormalize
-        m = one << 52
-        power2 = power2 + 1
-    }
-    m = m & ((one << 52) - 1)                        // drop the implicit bit
-    if power2 >= 2047 { return ok(f64_from_bits(sign | ((2047 as u64) << 52))) }  // overflow → ±inf
-    return ok(f64_from_bits(sign | m | ((power2 as u64) << 52)))
+    return ok(f64_from_bits(slow_parse(neg, digbuf, stored, nd, e, sticky)))
 }
 
 // ── Shortest correctly-rounded float format — Dragon4 ─────────────────────────
