@@ -23,6 +23,11 @@ bench-alloc = []
 # Experimental: vendored D-HARHT deterministic table + `jestyrc dharht-bench`
 # (D-HARHT Memory profile vs HashMap). Off by default; see docs/TESTING.md §6.
 dharht-experiment = []
+# gcc-in-test oracle: compile + run the `examples/std` demos through a real C
+# compiler and assert their output (and a locked cross-OS SHA-256 canary). Requires
+# a C compiler on PATH, so it is opt-in — default `cargo test` stays toolchain-free.
+# Run with: `cargo test --features c-oracle`.
+c-oracle = []
 
 [profile.dev]
 opt-level = 0

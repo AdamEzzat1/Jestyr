@@ -3305,3 +3305,187 @@ mod dragon {
         }
     }
 }
+
+/// A dependency-free SHA-256 (FIPS 180-4) — the digest for the cross-OS numerics
+/// determinism canary. Self-tested against the standard vectors.
+#[cfg(test)]
+mod sha256 {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+
+    pub fn hex(data: &[u8]) -> String {
+        let mut h: [u32; 8] = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        ];
+        let mut msg = data.to_vec();
+        let bitlen = (data.len() as u64).wrapping_mul(8);
+        msg.push(0x80);
+        while msg.len() % 64 != 56 {
+            msg.push(0);
+        }
+        msg.extend_from_slice(&bitlen.to_be_bytes());
+        for chunk in msg.chunks(64) {
+            let mut w = [0u32; 64];
+            for i in 0..16 {
+                w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
+            }
+            for i in 16..64 {
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+            }
+            let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+                (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+            for i in 0..64 {
+                let big_s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let ch = (e & f) ^ ((!e) & g);
+                let t1 = hh.wrapping_add(big_s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+                let big_s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let maj = (a & b) ^ (a & c) ^ (b & c);
+                let t2 = big_s0.wrapping_add(maj);
+                hh = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(t1);
+                d = c;
+                c = b;
+                b = a;
+                a = t1.wrapping_add(t2);
+            }
+            h[0] = h[0].wrapping_add(a);
+            h[1] = h[1].wrapping_add(b);
+            h[2] = h[2].wrapping_add(c);
+            h[3] = h[3].wrapping_add(d);
+            h[4] = h[4].wrapping_add(e);
+            h[5] = h[5].wrapping_add(f);
+            h[6] = h[6].wrapping_add(g);
+            h[7] = h[7].wrapping_add(hh);
+        }
+        let mut s = String::with_capacity(64);
+        for x in h {
+            s.push_str(&format!("{x:08x}"));
+        }
+        s
+    }
+
+    #[test]
+    fn known_vectors() {
+        assert_eq!(hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(
+            hex(b"The quick brown fox jumps over the lazy dog"),
+            "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"
+        );
+    }
+}
+
+/// **The gcc-in-test oracle (`--features c-oracle`).** Compile + run each
+/// `examples/std` demo through a real C compiler (exactly as `jestyrc run` does) and
+/// assert its output — turning the demos into end-to-end regression tests — plus a
+/// **locked SHA-256 over all numerics output**: the cross-OS/-compiler determinism
+/// canary. If FP determinism ever slips (an FMA fusion, a reassociation, a rounding
+/// change), the digest moves and this fails. Opt-in because it needs a C compiler.
+#[cfg(all(test, feature = "c-oracle"))]
+mod c_oracle {
+    use super::sha256;
+    use std::process::Command;
+
+    /// Compile `rel` (a `.jtr` path, with imports) to C, build with the locked FP
+    /// flags, run it, and return its stdout — the same pipeline as `jestyrc run`.
+    fn build_and_run(rel: &str) -> String {
+        let prog = crate::module::load(rel);
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "load/parse errors in {rel}: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(!td.iter().any(|d| d.is_error()), "typeck errors in {rel}");
+        let ed = crate::escape::check(&prog.ast, &info);
+        assert!(!ed.iter().any(|d| d.is_error()), "escape errors in {rel}");
+        let (c_src, _cd) = crate::cgen::emit(&prog.ast, &info);
+
+        let stem: String = rel.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        let dir = std::env::temp_dir();
+        let cfile = dir.join(format!("jestyr_oracle_{stem}.c"));
+        let exe = dir.join(format!("jestyr_oracle_{stem}{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&cfile, &c_src).unwrap();
+
+        let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
+        let mut cmd = Command::new(&cc);
+        cmd.args(crate::CC_FLAGS);
+        if c_src.contains("pthread") {
+            cmd.arg("-pthread");
+        }
+        let st = cmd.arg("-o").arg(&exe).arg(&cfile).status().unwrap();
+        assert!(st.success(), "gcc failed for {rel}");
+        let out = Command::new(&exe).output().unwrap();
+        assert!(out.status.success(), "run of {rel} failed");
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// Whitespace-normalized tokens of a demo's output (robust to newline style).
+    fn toks(rel: &str) -> Vec<String> {
+        build_and_run(rel).split_whitespace().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn binned_demo() {
+        assert_eq!(toks("examples/std/binned.jtr"), ["4", "4", "1", "1", "1", "1", "1"]);
+    }
+    #[test]
+    fn reductions_demo() {
+        assert_eq!(toks("examples/std/reductions.jtr"), ["10", "10", "10", "0", "2", "0"]);
+    }
+    #[test]
+    fn numbers_demo() {
+        assert_eq!(toks("examples/std/numbers.jtr"), ["12345", "-42", "7", "9", "-4271", "-4271", "3"]);
+    }
+    #[test]
+    fn parse_float_demo() {
+        let t = toks("examples/std/parse_float.jtr");
+        assert!(t.len() == 16 && t.iter().all(|x| x == "1"), "parse_float: {t:?}");
+    }
+    #[test]
+    fn format_float_demo() {
+        let t = toks("examples/std/format_float.jtr");
+        assert_eq!(&t[..11], &["1"; 11]);
+        assert_eq!(&t[11..], ["1.5e0", "5e-1", "1e0", "3.14159265358979e0"]);
+    }
+    #[test]
+    fn par_reduce_demo() {
+        assert_eq!(toks("examples/std/par_reduce.jtr"), ["1", "1", "1"]);
+    }
+
+    /// The locked canary: SHA-256 over every numerics demo's output, concatenated in
+    /// a fixed order. One value pinning the whole numeric stack's behaviour across OS
+    /// and compiler. Re-lock the constant only with a reviewed reason.
+    #[test]
+    fn numerics_determinism_canary() {
+        let demos = [
+            "examples/std/binned.jtr",
+            "examples/std/reductions.jtr",
+            "examples/std/numbers.jtr",
+            "examples/std/float_bits.jtr",
+            "examples/std/parse_float.jtr",
+            "examples/std/format_float.jtr",
+            "examples/std/par_reduce.jtr",
+        ];
+        let mut all = String::new();
+        for d in demos {
+            for t in toks(d) {
+                all.push_str(&t);
+                all.push('\n');
+            }
+        }
+        let digest = sha256::hex(all.as_bytes());
+        assert_eq!(
+            digest, "dfe9f73512629068c28ea3072eb251555cee6f98b2d141e38a23eef16a95a78e",
+            "numerics output changed — if intentional, re-lock; output was:\n{all}"
+        );
+    }
+}
