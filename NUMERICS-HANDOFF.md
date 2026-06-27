@@ -1,13 +1,15 @@
 # Numerics & `core`/`std` — Handoff (continue in a fresh session)
 
 > Written at the close of the `core`/`std` + numerics workstream. Everything below
-> is **on `master`** (head `18a9ad8`), **502 tests green** (2 ignored),
-> warning-clean. This note is self-contained: it says what exists, where, and
-> exactly how to pick up each of the open fronts cold. **Front A (binned finish),
-> Front C (parse_float + format_float — the marquee, round-trip closed), and Front
-> B's first slice (`par_binned_sum`, deterministic parallel reduction on real
-> threads) are DONE.** What remains is research-grade / polish (see each section).
-> Read with [`CORE-STD-PHASE3.md`](CORE-STD-PHASE3.md)
+> is **on `master`** (head `bbf426b`), **508 tests green** (3 ignored) + 7 more
+> under `--features c-oracle`, warning-clean. This note is self-contained. **Done:
+> Front A (binned finish); Front C — the marquee — parse_float (incl. the >19-digit
+> slow path, so it is correctly rounded with *no* caveat) + format_float, round-trip
+> closed; Front B's deterministic `par_binned_sum` + a sound spawn data-race rule;
+> and the gcc-in-test c-oracle harness with a locked SHA-256 cross-OS determinism
+> canary.** What remains is research-grade (a general disjoint-write proof) or
+> deliberately-skipped polish (a Ryū perf swap — identical output). Read with
+> [`CORE-STD-PHASE3.md`](CORE-STD-PHASE3.md)
 > (the full ledger), [`Jestyr-Remaining-And-Numerics-Research.md`](Jestyr-Remaining-And-Numerics-Research.md)
 > (Part 3 is the numerics plan), and [`docs/TESTING.md`](docs/TESTING.md) §5.14
 > (the test layer for all of this).
@@ -128,15 +130,20 @@ in `cgen.rs`). `spawn` only works as a **literal statement** in the concurrent
 block (not in a loop → no dynamic N), targets a **direct named call**, and has **no
 result**. Atomics via `__atomic_*` (`examples/atomics.jtr`).
 
-**Remaining (the research-grade parts the handoff flagged):**
-1. **Static disjoint-write proof** in `src/escape.rs` — today `ExprKind::Spawn` just
-   walks the call (join-safety holds: structured join means borrows don't outlive the
-   frame), but nothing proves two tasks write *disjoint* memory. A naive "same
-   pointer to two spawns" check is **wrong** — `examples/concurrent.jtr` deliberately
-   passes the *same* `buf` to four spawns that write different slots. Real
-   disjointness needs alias/region analysis (or a typed split-ownership API, e.g. a
-   `split_mut` that hands each task a provably-disjoint subslice). This is the hard,
-   unsolved piece; `par_binned_sum` is safe by construction, not by proof.
+**Data-race rule — ✅ DONE (the soundly-deliverable part, commit `bbf426b`):**
+`src/escape.rs` `check_spawn_no_shared_mut_slice` rejects spawning a function that
+takes a `mut`/`out` **slice** — the one safe-subset data race (a shared slice's `ptr`
+aliases; a `mut [N]T` value-array arg is copied, so it can't). Shared mutable state
+across tasks must now go through a raw `*mut T` in `unsafe` (each task a disjoint
+region, as `par_binned_sum` does). The safe subset is therefore race-free; join-
+safety was already enforced by the structured-concurrency walk.
+
+**Remaining (genuinely research-grade / nice-to-have):**
+1. **General disjoint-write proof** for the *unsafe* raw-pointer case — proving
+   `raw+0` vs `raw+2048` (or `buf` slot 0 vs slot 1) don't overlap needs range-aware
+   alias analysis, or a typed split-ownership API (`split_mut` handing each task a
+   provably-disjoint subslice). A naive "same base → reject" wrongly flags
+   `par_binned_sum`/`concurrent.jtr`. Today: programmer-asserted inside `unsafe`.
 2. **Dynamic-N spawn** (spawn-in-a-loop with a handle array) so the worker count
    isn't fixed at 4 — needs `emit_concurrent` to handle `for { spawn … }`.
 3. **Task results** (a `spawn` that returns a value joined back).
@@ -150,11 +157,17 @@ The distinctly-Jestyr deliverable (closes CJC's transcendental-determinism gap).
   Result(f64, ParseFloatError)`: a fast-path decimal scanner (≤ 19 significant
   digits) feeding compute_float (one `mul64` against the 1302-entry `POW10_128`
   table, upperbit, subnormal path, in-range round-to-even tie, overflow→±inf).
-  Correctly rounded; > 19 digits returns `err(pf_too_many_digits)`. The table is
-  generated **and validated end-to-end** by `proptests::lemire` (the same generator
-  emits the Jestyr const via the `#[ignore] dump_pow10_table` test) against Rust's
-  correctly-rounded `str::parse::<f64>()` over ~1M cases + hard cases; runtime pinned
-  by `examples/std/parse_float.jtr`.
+  Correctly rounded. The table is generated **and validated end-to-end** by
+  `proptests::lemire` (the same generator emits the Jestyr const via the `#[ignore]
+  dump_pow10_table` test) against Rust's correctly-rounded `str::parse::<f64>()` over
+  ~1M cases + hard cases; runtime pinned by `examples/std/parse_float.jtr`.
+  **Slow path — ✅ DONE** (reference `14f23b5`, Jestyr port `79b9d4b`): > 19 digits no
+  longer bails — a candidate `g` from the first 19 digits is refined by a
+  division-free big-integer comparison of `D·10^E` to the rounding midpoint
+  (`slow_parse`/`sp_*` 56-limb bignum; full significand kept, sticky past 768 digits).
+  parse_float is now correctly rounded with **no digit caveat**. Validated by
+  `proptests::lemire::slow_parse_*` (incl. exact-midpoint teeth + a 2M `#[ignore]`
+  sweep).
 - **`format_float` (shortest round-trip) — ✅ DONE** (commit `05a57f8`).
   `core.format_float(x, []u8) -> usize` writes the shortest decimal that parses back
   to `x`, as `[-]d[.ddd]e±E`. Implemented as **Dragon4** (Steele-White /
@@ -166,24 +179,25 @@ The distinctly-Jestyr deliverable (closes CJC's transcendental-determinism gap).
   all-but-last-digit match vs Rust `{:e}`; 2M-case `#[ignore]` thorough run green);
   runtime pinned by `examples/std/format_float.jtr` (round-trip via parse_float).
   **The `parse(format(x)) == x` contract is now closed.**
-- **Remaining on C (smaller follow-ups, neither blocks B):**
-  1. **`parse_float` slow path** — the > 19-digit / ambiguous inputs the fast path
-     bails on (today `err(pf_too_many_digits)`). A big-integer / AlgorithmM fallback;
-     the `d4_*`/Dragon-style bignum is most of the machinery. Makes parse fully
-     correctly-rounded with no caveat.
-  2. **Ryū `format_float`** (optional perf): replace Dragon4's per-digit big-integer
-     loop with Ryū's two 128-bit tables. Pure optimization — identical output, so the
-     existing `dragon` differential is its oracle.
-  3. **The cross-OS locked-SHA-256 canary** — needs the **`--features c-oracle`
-     gcc-in-test harness** first (shared future work; `DROP-ALLOC-PHASE3.md` future
-     item 3 + research §3.6 Step 0). Until then the Rust mirrors + examples validate.
+- **The cross-OS SHA-256 canary — ✅ DONE** (commit `1670498`): the `--features
+  c-oracle` gcc-in-test harness (`proptests::c_oracle`) compiles + runs the demos
+  through gcc (the `jestyrc run` pipeline) and locks a SHA-256 over all numerics
+  output (`dfe9f735…`). A dep-free self-tested SHA-256 lives in `proptests::sha256`.
+  This is the artifact a CI matrix would run on Linux/macOS/Windows to *prove*
+  byte-identical numeric output — the determinism guarantee a Rust-oracle diff can't.
+- **Remaining on C — only a deliberate non-goal:** a **Ryū `format_float`** swap
+  (replace Dragon4's per-digit big-integer loop with Ryū's two 128-bit tables). It is
+  **pure perf with byte-identical output**, and reproducing Ryū's precision-125 tables
+  is the exact from-memory risk Dragon4 was chosen to avoid — so it is **not worth
+  doing** unless format throughput becomes a real bottleneck. If ever needed, the
+  `proptests::dragon` differential is its ready-made oracle. The Jestyr Dragon4
+  already allocates nothing (fixed `d4_*` bignum), so even the perf motivation is weak.
 
-**Recommended order:** ~~A (accumulator)~~ ✅, ~~C parse_float~~ ✅,
-~~C format_float~~ ✅, ~~B first slice (`par_binned_sum`)~~ ✅. **All remaining work
-is research-grade or polish** — pick by appetite: the **parse_float slow path**
-(bounded, removes the >19-digit caveat; reuses a Dragon-style bignum) is the highest
-value-per-effort; then B's static disjoint-write proof (research), the Ryū perf
-swap, and the SHA canary (needs the gcc-in-test harness).
+**Recommended order:** ~~A~~ ✅, ~~C parse_float (incl. slow path)~~ ✅,
+~~C format_float~~ ✅, ~~B `par_binned_sum` + spawn data-race rule~~ ✅,
+~~SHA canary~~ ✅. **The only substantive open item is Front B's general
+disjoint-write proof** (range-aware alias analysis or a `split_mut` ownership API —
+research-grade). Ryū is an explicit non-goal (see above).
 
 ---
 
@@ -233,8 +247,10 @@ swap, and the SHA canary (needs the gcc-in-test harness).
 | Numerics + `core` library | `examples/std/core.jtr` |
 | Demos | `examples/std/{binned,reductions,numbers,float_bits,combinators,slice_algos,parse_float,format_float,par_reduce}.jtr`, `examples/{arrays,array_lit,concurrent,atomics}.jtr` |
 | par reduction | `examples/std/core.jtr` (`par_binned_sum`/`par_worker`); concurrency lowering `src/cgen.rs` (`emit_concurrent`/`spawn_runtime`); join-safety `src/escape.rs` (`ExprKind::Spawn`) |
-| parse_float + table | `examples/std/core.jtr` (`parse_float`/`lemire_*`/`POW10_128`); reference + table generator `src/proptests.rs` → `mod lemire` |
+| parse_float + table | `examples/std/core.jtr` (`parse_float`/`lemire_*`/`POW10_128`/`slow_parse`/`sp_*`); reference + table generator + slow-path `src/proptests.rs` → `mod lemire` |
 | format_float (Dragon4) | `examples/std/core.jtr` (`format_float`/`d4_*`); reference `src/proptests.rs` → `mod dragon` |
+| determinism canary | `src/proptests.rs` → `mod c_oracle` (gcc-in-test, `--features c-oracle`) + `mod sha256`; locked digest there. Run: `cargo test --features c-oracle` |
+| spawn data-race rule | `src/escape.rs` (`check_spawn_no_shared_mut_slice`) |
 | Property/law tests | `src/proptests.rs` → `mod core_props` (mirrors + laws), `mod prop`, `mod fuzz` |
 | FP flags | `src/main.rs` → `CC_FLAGS` + `mod fp_contract_tests` |
 | Budget canary | `src/main.rs` → `mod budget_canary` |

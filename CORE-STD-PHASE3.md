@@ -280,16 +280,18 @@ In rough priority order toward a usable `core` and self-hosting:
    **And: `par_binned_sum`** (commit `18a9ad8`) — a deterministic *parallel* reduction
    on real OS threads (4 workers, each its own accumulator region → merge → finalize),
    bit-identical to the serial sum; demo `examples/std/par_reduce.jtr`. Disjointness
-   is by construction; a static disjoint-write proof for arbitrary spawn code remains
-   the research-grade open piece (Front B in `NUMERICS-HANDOFF.md`).
+   is by construction; the escape checker now **forbids `mut` slice spawn params**
+   (commit `bbf426b`) so the safe subset is race-free — a general disjoint-write proof
+   for raw-pointer sharing remains research-grade (Front B in `NUMERICS-HANDOFF.md`).
 3. **Correctly-rounded float parse/format — the marquee determinism deliverable.**
-   - ✅ **`parse_float` done** (Eisel–Lemire fast path): `core.parse_float(str) ->
+   - ✅ **`parse_float` done** (Eisel–Lemire + slow path): `core.parse_float(str) ->
      Result(f64, ParseFloatError)`, one `mul64` against the verified 1302-entry
-     `POW10_128` table; correctly rounded for ≤ 19 significant digits (> 19 →
-     `err(pf_too_many_digits)`, the slow path is future work). Validated end-to-end
-     vs Rust's correctly-rounded parser by `proptests::lemire` (~1M cases + hard
-     cases); the array-list-literal feature (`539a3bc`) holds the table. Commits
-     `539a3bc`, `4091488`, `7cccce7`. Demo `examples/std/parse_float.jtr`.
+     `POW10_128` table for ≤19 digits; **a division-free big-integer slow path
+     (`slow_parse`/`sp_*`) for >19 digits**, so it is correctly rounded with **no digit
+     caveat**. Validated end-to-end vs Rust's correctly-rounded parser by
+     `proptests::lemire` (~1M fast + 2M slow cases + exact-midpoint teeth); the
+     array-list-literal feature (`539a3bc`) holds the table. Commits `539a3bc`,
+     `4091488`, `7cccce7`, `14f23b5`, `79b9d4b`. Demo `examples/std/parse_float.jtr`.
    - ✅ **`format_float` done** (shortest correctly-rounded f64→decimal):
      `core.format_float(x, []u8) -> usize`, **Dragon4** (big-integer, table-free) so
      there are no precision-coupled tables to get wrong — same shortest output as Ryū
@@ -297,11 +299,15 @@ In rough priority order toward a usable `core` and self-hosting:
      length + all-but-last-digit vs Rust `{:e}`; 2M-case thorough run); demo
      `examples/std/format_float.jtr`. **`parse(format(x)) == x` is closed.** Commit
      `05a57f8`.
-   - **Remaining (polish):** the parse_float slow path (> 19 digits / ambiguous),
-     an optional Ryū swap for format, and the **cross-OS locked-SHA-256 canary**
-     (needs the `--features c-oracle` gcc-in-test harness) to fully close the std
-     side of the determinism contract (§3.3 of
-     `Jestyr-Remaining-And-Numerics-Research.md`). Transcendentals stay out of scope.
+   - ✅ **Cross-OS determinism canary done** (commit `1670498`): the `--features
+     c-oracle` gcc-in-test harness (`proptests::c_oracle`) compiles+runs the demos
+     through gcc and locks a SHA-256 over all numerics output (dep-free SHA-256 in
+     `proptests::sha256`) — the std side of the determinism contract (§3.3 of
+     `Jestyr-Remaining-And-Numerics-Research.md`), ready for a cross-OS CI matrix.
+   - **Deliberate non-goal:** a Ryū swap for `format_float` — byte-identical output to
+     the (done) Dragon4, so pure perf; reproducing Ryū's precision-125 tables is the
+     from-memory risk Dragon4 was chosen to avoid. Not worth it unless format
+     throughput becomes a bottleneck. Transcendentals stay out of scope.
 4. **Math with defined semantics** (ROADMAP J): `wrapping_*`/`saturating_*`/
    `checked_*`, bit-width-aware, with the overflow behavior pinned by property.
 5. **A real `core`/`std` trait surface, if the compiler grows it.** Associated
