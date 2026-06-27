@@ -1457,16 +1457,138 @@ mod core_props {
         }
         bins[be] = bins[be].wrapping_add(sig);
     }
-    /// Fold the bins in fixed ascending-exponent order (mirror of `core.binned_sum`).
-    fn m_binned_sum(bins: &[i64; 2048]) -> f64 {
-        let mut acc = 0.0f64;
-        for (e, &b) in bins.iter().enumerate() {
-            if b != 0 {
-                let k = if e == 0 { -1074i64 } else { e as i64 - 1075 };
-                acc += (b as f64) * f64::from_bits(((k + 1023) as u64) << 52);
+    // ── Correctly-rounded finalize (mirror of `core.binned_sum`) ────────────────
+    // The bins are an *exact* big fixed-point number: X = Σ bins[e]·2^(e-1075), with
+    // bin 0 sharing bin 1's ULP (2^-1074). Scaling by 2^1074 makes it the integer
+    // Y = bins[0] + Σ_{e≥1} bins[e]·2^(e-1), so X = Y·2^-1074. We reconstruct |Y| as
+    // a fixed-width unsigned bignum (split into non-negative Pos/Neg halves, then
+    // subtract — no two's-complement sign-extension needed) and round once to
+    // nearest-even. Max bit ≈ 2046 (top bitpos) + 63 (bin width) ≈ 2109, so 36
+    // 64-bit limbs (2304 bits) clears it with margin.
+    const M_NL: usize = 36;
+    /// Add `u << shift` into an unsigned little-endian limb array, carrying upward.
+    fn m_mag_add_shifted(acc: &mut [u64; M_NL], u: u64, shift: usize) {
+        let li = shift / 64;
+        let off = shift % 64;
+        let lo = u << off;
+        let hi = if off == 0 { 0 } else { u >> (64 - off) };
+        m_add_at(acc, li, lo);
+        m_add_at(acc, li + 1, hi);
+    }
+    fn m_add_at(acc: &mut [u64; M_NL], idx: usize, val: u64) {
+        let mut carry = val;
+        let mut i = idx;
+        while carry != 0 && i < M_NL {
+            let (s, c) = acc[i].overflowing_add(carry);
+            acc[i] = s;
+            carry = c as u64;
+            i += 1;
+        }
+    }
+    /// Compare two magnitudes (top-down): -1 if a<b, 0 if equal, 1 if a>b.
+    fn m_mag_cmp(a: &[u64; M_NL], b: &[u64; M_NL]) -> i32 {
+        for i in (0..M_NL).rev() {
+            if a[i] != b[i] {
+                return if a[i] < b[i] { -1 } else { 1 };
             }
         }
-        acc
+        0
+    }
+    /// big - small (caller guarantees big ≥ small), borrow-propagated.
+    fn m_mag_sub(big: &[u64; M_NL], small: &[u64; M_NL]) -> [u64; M_NL] {
+        let mut out = [0u64; M_NL];
+        let mut borrow = 0u64;
+        for i in 0..M_NL {
+            let (d1, b1) = big[i].overflowing_sub(small[i]);
+            let (d2, b2) = d1.overflowing_sub(borrow);
+            out[i] = d2;
+            borrow = (b1 as u64) | (b2 as u64);
+        }
+        out
+    }
+    fn m_bit(mag: &[u64; M_NL], i: usize) -> u64 {
+        (mag[i / 64] >> (i % 64)) & 1
+    }
+    /// Extract `n` (≤53) bits of `mag` starting at bit `start`.
+    fn m_extract(mag: &[u64; M_NL], start: usize, n: usize) -> u64 {
+        let li = start / 64;
+        let off = start % 64;
+        let mut v = mag[li] >> off;
+        if off != 0 && li + 1 < M_NL {
+            v |= mag[li + 1] << (64 - off);
+        }
+        v & ((1u64 << n) - 1)
+    }
+    /// Is any bit of `mag` strictly below index `pos` set? (the sticky bit)
+    fn m_any_below(mag: &[u64; M_NL], pos: usize) -> bool {
+        let lp = pos / 64;
+        let op = pos % 64;
+        for i in 0..lp {
+            if mag[i] != 0 {
+                return true;
+            }
+        }
+        op > 0 && (mag[lp] & ((1u64 << op) - 1)) != 0
+    }
+    /// Round `mag · 2^-1074` (mag a non-negative integer) to the nearest f64.
+    fn m_round_mag(mag: &[u64; M_NL], neg: bool) -> f64 {
+        // highest set bit
+        let mut top = M_NL;
+        while top > 0 && mag[top - 1] == 0 {
+            top -= 1;
+        }
+        if top == 0 {
+            return 0.0;
+        }
+        let hl = top - 1;
+        let msb = hl * 64 + (63 - mag[hl].leading_zeros() as usize);
+        let sgn = if neg { 1u64 << 63 } else { 0 };
+        // msb ≤ 52: value < 2^-1021 and exactly representable (subnormal / smallest
+        // normals). Compose by exact scaling of the (≤53-bit) integer.
+        if msb <= 52 {
+            return f64::from_bits(sgn) + (if neg { -1.0 } else { 1.0 }) * (mag[0] as f64)
+                * f64::from_bits(1); // 2^-1074
+        }
+        let e = msb as i64 - 1074; // unbiased exponent of the leading bit
+        let shift = msb - 52; // keep the 53 bits [shift, msb]
+        let sig = m_extract(mag, shift, 53);
+        let round_bit = m_bit(mag, shift - 1);
+        let sticky = m_any_below(mag, shift - 1);
+        let mut m = sig;
+        if round_bit == 1 && (sticky || (m & 1) == 1) {
+            m += 1;
+        }
+        let mut biased = e + 1023;
+        if m == (1u64 << 53) {
+            m >>= 1; // mantissa carried out → renormalize
+            biased += 1;
+        }
+        if biased >= 2047 {
+            return f64::from_bits(sgn | (2047u64 << 52)); // ±inf
+        }
+        f64::from_bits(sgn | ((biased as u64) << 52) | (m - (1u64 << 52)))
+    }
+    /// Reconstruct the bins' exact value and round it once to nearest-even.
+    fn m_binned_round(bins: &[i64; 2048]) -> f64 {
+        let mut pos = [0u64; M_NL];
+        let mut neg = [0u64; M_NL];
+        for (e, &b) in bins.iter().enumerate() {
+            if b == 0 {
+                continue;
+            }
+            let shift = if e == 0 { 0 } else { e - 1 };
+            let u = (b as i128).unsigned_abs() as u64;
+            if b > 0 {
+                m_mag_add_shifted(&mut pos, u, shift);
+            } else {
+                m_mag_add_shifted(&mut neg, u, shift);
+            }
+        }
+        match m_mag_cmp(&pos, &neg) {
+            0 => 0.0,
+            1 => m_round_mag(&m_mag_sub(&pos, &neg), false),
+            _ => m_round_mag(&m_mag_sub(&neg, &pos), true),
+        }
     }
 
     /// A self-contained generic slice-fold program at element type `prim` — the real
@@ -1741,7 +1863,7 @@ mod core_props {
             for i in 0..2048 {
                 a[i] = a[i].wrapping_add(b[i]); // merge
             }
-            prop_assert_eq!(m_binned_sum(&whole).to_bits(), m_binned_sum(&a).to_bits());
+            prop_assert_eq!(m_binned_round(&whole).to_bits(), m_binned_round(&a).to_bits());
         }
 
         /// On exactly-representable inputs the binned sum equals the true sum.
@@ -1754,7 +1876,58 @@ mod core_props {
                 m_binned_add(&mut bins, x as f64);
             }
             let exact = xs.iter().map(|&x| x as i64).sum::<i64>() as f64;
-            prop_assert_eq!(m_binned_sum(&bins), exact);
+            prop_assert_eq!(m_binned_round(&bins), exact);
+        }
+
+        /// **The correctly-rounded finalize is correctly rounded.** Against an
+        /// independent oracle — sum the inputs' significands exactly into an `i128`
+        /// at the finest common scale, then let `i128 as f64` (a correctly-rounded
+        /// conversion) plus exact power-of-two scaling produce the reference result.
+        /// Inputs are `m·2^p` with bounded exponent so the exact sum fits in `i128`
+        /// and the result stays in the normal range (so the scaling can't double-
+        /// round). Full-width significands make summation genuinely round.
+        /// (Teeth: changing the tie rule to truncation — drop the `(m & 1)` term —
+        /// or off-by-one in `shift`/`msb` makes the bits mismatch the oracle.)
+        #[test]
+        fn binned_round_is_correctly_rounded(
+            mps in proptest::collection::vec(
+                ((-(1i64 << 53))..(1i64 << 53), -6i32..6i32), 0..64),
+        ) {
+            let xs: Vec<f64> = mps.iter().map(|&(m, p)| (m as f64) * 2f64.powi(p)).collect();
+            // independent oracle: exact i128 sum at the finest scale, then a
+            // correctly-rounded i128→f64 conversion times an exact power of two.
+            // Zeros contribute nothing and are dropped (they would otherwise pin
+            // kmin to the subnormal floor and force the whole case to be skipped).
+            let mut acc: i128 = 0;
+            let mut kmin = i64::MAX;
+            let parts: Vec<(i128, i64)> = xs.iter().filter(|&&x| x != 0.0).map(|&x| {
+                let bits = x.to_bits();
+                let be = ((bits >> 52) & 0x7FF) as i64;
+                let mant = (bits & 0xFFFF_FFFF_FFFFF) as i128;
+                let sigu = if be != 0 { (1i128 << 52) | mant } else { mant };
+                let sig = if (bits >> 63) == 1 { -sigu } else { sigu };
+                let k = if be == 0 { -1074 } else { be - 1075 };
+                (sig, k)
+            }).collect();
+            for &(_, k) in &parts { kmin = kmin.min(k); }
+            let mut ok = true;
+            for &(sig, k) in &parts {
+                let sh = (k - kmin) as u32;
+                match sig.checked_shl(sh).and_then(|t| acc.checked_add(t)) {
+                    Some(v) => acc = v,
+                    None => { ok = false; break; }
+                }
+            }
+            // skip pathological dynamic ranges that overflow the i128 oracle
+            prop_assume!(ok && kmin != i64::MAX);
+            let oracle = (acc as f64) * 2f64.powi(kmin as i32);
+            prop_assume!(oracle.is_finite() && (oracle == 0.0 || oracle.abs() >= f64::MIN_POSITIVE));
+
+            let mut bins = [0i64; 2048];
+            for &x in &xs {
+                m_binned_add(&mut bins, x);
+            }
+            prop_assert_eq!(m_binned_round(&bins).to_bits(), oracle.to_bits());
         }
     }
 }

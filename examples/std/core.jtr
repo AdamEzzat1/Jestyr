@@ -525,21 +525,187 @@ pub fn binned_merge(mut a: [2048]i64, read b: [2048]i64) {
     }
 }
 
-// Finalize: fold the bins in a fixed ascending-exponent order. Deterministic, and
-// since the bins are order-independent, so is the result.
+// ── Correctly-rounded finalize ────────────────────────────────────────────────
+//
+// The bins are an **exact** big fixed-point number. Scaling by 2^1074 turns it into
+// the integer `Y = bins[0] + Σ_{e≥1} bins[e]·2^(e-1)`, so the true sum is `Y·2^-1074`.
+// We reconstruct |Y| as a fixed-width unsigned bignum and round it **once** to
+// nearest-even. Because this reads the *exact value* (not the bin layout), the
+// result is bit-identical for any chunking/merge **and** independent of any
+// value-preserving carry between bins — the two properties the old `(b as f64)·2^k`
+// fold could not give (that cast is already lossy once a bin exceeds 2^53).
+//
+// The bignum is 36 little-endian `u64` limbs (2304 bits) — clears the worst-case
+// top bit (≈ bitpos 2046 + a 63-bit bin ≈ 2109). To avoid two's-complement sign
+// handling we keep two non-negative halves (`pos`/`neg`) and subtract at the end.
+const BIG_NL: usize = 36
+
+// Add `val` into limb `idx`, propagating the carry upward. Carry-out of an unsigned
+// add is detected by the wrapped sum being smaller than the addend.
+fn big_add_at(mut acc: [36]u64, idx: usize, val: u64) {
+    var carry: u64 = val
+    var i: usize = idx
+    for carry != 0 {
+        if i >= BIG_NL { return }
+        let prev: u64 = acc[i]
+        let s: u64 = prev + carry
+        acc[i] = s
+        if s < prev { carry = 1 } else { carry = 0 }
+        i = i + 1
+    }
+}
+
+// Add `u << shift` into the bignum (the value of one bin: significand `u` at the
+// bin's binary weight). The shift can straddle a limb boundary → up to two limbs.
+fn big_add_shifted(mut acc: [36]u64, u: u64, shift: usize) {
+    let li: usize = shift / 64
+    let off: usize = shift % 64
+    let lo: u64 = u << off
+    var hi: u64 = 0
+    if off != 0 { hi = u >> (64 - off) }
+    big_add_at(acc, li, lo)
+    big_add_at(acc, li + 1, hi)
+}
+
+// Compare two magnitudes (top limb first): -1 if a<b, 0 if equal, 1 if a>b.
+fn big_cmp(read a: [36]u64, read b: [36]u64) -> i32 {
+    var i: usize = BIG_NL
+    for i > 0 {
+        i = i - 1
+        if a[i] != b[i] {
+            if a[i] < b[i] { return 0 - 1 }
+            return 1
+        }
+    }
+    return 0
+}
+
+// `out = big - small`, caller guarantees big ≥ small; borrow-propagated.
+fn big_sub(read big: [36]u64, read small: [36]u64, mut dst: [36]u64) {
+    var borrow: u64 = 0
+    var i: usize = 0
+    for i < BIG_NL {
+        let bi: u64 = big[i]
+        let si: u64 = small[i]
+        let d1: u64 = bi - si
+        var b1: u64 = 0
+        if bi < si { b1 = 1 }
+        let d2: u64 = d1 - borrow
+        var b2: u64 = 0
+        if d1 < borrow { b2 = 1 }
+        dst[i] = d2
+        borrow = b1 | b2
+        i = i + 1
+    }
+}
+
+// Bit `i` of the bignum.
+fn big_bit(read mag: [36]u64, i: usize) -> u64 {
+    return (mag[i / 64] >> (i % 64)) & 1
+}
+
+// Extract `n` (≤ 53) bits of `mag` starting at bit `start` (may span two limbs).
+fn big_extract(read mag: [36]u64, start: usize, n: usize) -> u64 {
+    let li: usize = start / 64
+    let off: usize = start % 64
+    var v: u64 = mag[li] >> off
+    if off != 0 {
+        if li + 1 < BIG_NL { v = v | (mag[li + 1] << (64 - off)) }
+    }
+    let one: u64 = 1
+    return v & ((one << n) - 1)
+}
+
+// Is any bit of `mag` strictly below index `pos` set? (the sticky bit)
+fn big_any_below(read mag: [36]u64, pos: usize) -> bool {
+    let lp: usize = pos / 64
+    let op: usize = pos % 64
+    var i: usize = 0
+    for i < lp {
+        if mag[i] != 0 { return true }
+        i = i + 1
+    }
+    if op > 0 {
+        let one: u64 = 1
+        if (mag[lp] & ((one << op) - 1)) != 0 { return true }
+    }
+    return false
+}
+
+// Round the non-negative integer `mag` times 2^-1074 to the nearest f64
+// (ties-to-even), with sign `neg`. Overflow → ±inf; small values are exact.
+fn big_round(read mag: [36]u64, neg: bool) -> f64 {
+    var top: usize = BIG_NL
+    for top > 0 {
+        if mag[top - 1] != 0 { break }
+        top = top - 1
+    }
+    if top == 0 { return 0.0 }
+    let hl: usize = top - 1
+    let one: u64 = 1
+    var sgn: u64 = 0
+    if neg { sgn = one << 63 }
+    let msb: usize = hl * 64 + (63 - (clz64(mag[hl]) as usize))
+    // msb ≤ 52: value < 2^-1021, exactly representable (subnormals / smallest
+    // normals); compose by exact scaling of the (≤ 53-bit) integer.
+    if msb <= 52 {
+        var val: f64 = (mag[0] as f64) * f64_from_bits(1)   // 2^-1074
+        if neg { val = 0.0 - val }
+        return val
+    }
+    let e: i64 = (msb as i64) - 1074
+    let shift: usize = msb - 52                              // keep bits [shift, msb]
+    let sig: u64 = big_extract(mag, shift, 53)
+    let round_bit: u64 = big_bit(mag, shift - 1)
+    let sticky: bool = big_any_below(mag, shift - 1)
+    var m: u64 = sig
+    var do_round: bool = false
+    if round_bit == 1 {
+        if sticky { do_round = true }
+        if (m & 1) == 1 { do_round = true }
+    }
+    if do_round { m = m + 1 }
+    var biased: i64 = e + 1023
+    let two53: u64 = one << 53
+    if m == two53 {                                         // mantissa carried out
+        m = m >> 1
+        biased = biased + 1
+    }
+    if biased >= 2047 { return f64_from_bits(sgn | ((2047 as u64) << 52)) }   // ±inf
+    let two52: u64 = one << 52
+    return f64_from_bits(sgn | ((biased as u64) << 52) | (m - two52))
+}
+
+// Finalize: reconstruct the bins' exact value and round it once to nearest-even.
+// Deterministic, chunk-independent, and now **correctly rounded**.
 pub fn binned_sum(read bins: [2048]i64) -> f64 {
-    var acc: f64 = 0.0
+    var pos: [36]u64 = [0; 36]
+    var neg: [36]u64 = [0; 36]
     var e: usize = 0
     for e < 2048 {
         let b: i64 = bins[e]
         if b != 0 {
-            var k: i64 = (e as i64) - 1075       // a bin-e unit is 2^(e-1075)
-            if e == 0 { k = 0 - 1074 }           // subnormals share the smallest-normal ULP
-            acc = acc + (b as f64) * f64_pow2(k)
+            var shift: usize = 0
+            if e != 0 { shift = e - 1 }       // bin 0 shares bin 1's ULP (weight 2^0)
+            var u: u64 = b as u64
+            if b < 0 { u = 0 - (b as u64) }   // |b| as u64 (works for i64::MIN too)
+            if b > 0 {
+                big_add_shifted(pos, u, shift)
+            } else {
+                big_add_shifted(neg, u, shift)
+            }
         }
         e = e + 1
     }
-    return acc
+    let c: i32 = big_cmp(pos, neg)
+    if c == 0 { return 0.0 }
+    var dst: [36]u64 = [0; 36]
+    if c == 1 {
+        big_sub(pos, neg, dst)
+        return big_round(dst, false)
+    }
+    big_sub(neg, pos, dst)
+    return big_round(dst, true)
 }
 
 // Convenience: a reproducible sum of a slice through the binned accumulator —

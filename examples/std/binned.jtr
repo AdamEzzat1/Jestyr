@@ -5,7 +5,10 @@
 // then merged give a **bit-identical** result to one filled from the whole — the
 // guarantee a naive/Kahan/pairwise sum cannot make.
 //
-//   jestyrc run examples/std/binned.jtr   →   4, 4, 1
+// The finalize is also **correctly rounded** (round-to-nearest-even of the bins'
+// exact value), which a naive float sum is not.
+//
+//   jestyrc run examples/std/binned.jtr   →   4, 4, 1, 1, 1, 1
 import "core"
 import "io"
 
@@ -39,5 +42,27 @@ fn main() -> i32 {
     io.print_i32(b2i(core.f64_bits(whole) == core.f64_bits(chunked)))   // 1
 
     free_ptr(buf)
+
+    // Correct rounding vs naive: 2^53 + 1 + 1 + 1. The exact sum is 2^53+3, which
+    // sits exactly between the representable 2^53+2 and 2^53+4 → ties-to-even rounds
+    // it to 2^53+4. Naive left-to-right summation instead absorbs each +1 into 2^53
+    // (each step rounds back down) and yields 2^53. The binned finalize is *correctly
+    // rounded*; naive is not.
+    let p53: f64 = core.f64_from_bits((1076 as u64) << 52)   // 2^53
+    var rb: *mut f64 = alloc(f64, 4)
+    setf(rb, 0, p53)
+    setf(rb, 1, 1.0)
+    setf(rb, 2, 1.0)
+    setf(rb, 3, 1.0)
+    var rs: []f64 = slice(f64, rb, 4)
+
+    let rounded: f64 = core.f64_binned_sum(rs)
+    let naive: f64 = core.f64_sum(rs)
+    let expected: f64 = p53 + 4.0                            // 2^53 + 4, exact
+    io.print_i32(b2i(core.f64_bits(rounded) == core.f64_bits(expected)))   // 1
+    io.print_i32(b2i(core.f64_bits(naive) == core.f64_bits(p53)))          // 1
+    io.print_i32(b2i(core.f64_bits(rounded) != core.f64_bits(naive)))      // 1
+
+    free_ptr(rb)
     return 0
 }
