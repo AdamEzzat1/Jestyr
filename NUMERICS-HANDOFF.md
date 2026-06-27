@@ -1,10 +1,11 @@
 # Numerics & `core`/`std` — Handoff (continue in a fresh session)
 
 > Written at the close of the `core`/`std` + numerics workstream. Everything below
-> is **on `master`** (head `7cccce7`), **500 tests green** (1 ignored),
+> is **on `master`** (head `05a57f8`), **502 tests green** (2 ignored),
 > warning-clean. This note is self-contained: it says what exists, where, and
 > exactly how to pick up each of the open fronts cold. **Front A (binned finish) and
-> Front C `parse_float` are now DONE** — see their sections. Read with
+> Front C (parse_float + format_float — the marquee, round-trip closed) are now
+> DONE** — see their sections. **Front B is the main remaining front.** Read with
 > [`CORE-STD-PHASE3.md`](CORE-STD-PHASE3.md)
 > (the full ledger), [`Jestyr-Remaining-And-Numerics-Research.md`](Jestyr-Remaining-And-Numerics-Research.md)
 > (Part 3 is the numerics plan), and [`docs/TESTING.md`](docs/TESTING.md) §5.14
@@ -131,25 +132,33 @@ The distinctly-Jestyr deliverable (closes CJC's transcendental-determinism gap).
   emits the Jestyr const via the `#[ignore] dump_pow10_table` test) against Rust's
   correctly-rounded `str::parse::<f64>()` over ~1M cases + hard cases; runtime pinned
   by `examples/std/parse_float.jtr`.
-- **Remaining on C:**
-  1. **`parse_float` slow path** — the > 19-digit / ambiguous cases that the fast
-     path bails on (today: `err(pf_too_many_digits)`). A big-integer / AlgorithmM
-     fallback. Smaller than format.
-  2. **`format_float` (Ryū)** — shortest round-trip — the bigger half (its own
-     lookup tables + the algorithm). Do it after the slow path or skip straight to
-     it. With both halves, the `parse(format(x)) == x` round-trip property closes.
-- **API:** locale-free, into a caller `[]u8` (no-alloc), like `format_i64`.
-- **Tests for what remains:** `parse(format(x)) == x` for representable doubles;
-  differential vs Rust's `format!`; and the **cross-OS locked-SHA-256 canary** —
-  which needs the **`--features c-oracle` gcc-in-test harness** to exist first
-  (shared future work; `DROP-ALLOC-PHASE3.md` future item 3 + research §3.6 Step 0).
-  Until then, validate via the Rust mirror + the example (the pattern parse_float
-  used).
+- **`format_float` (shortest round-trip) — ✅ DONE** (commit `05a57f8`).
+  `core.format_float(x, []u8) -> usize` writes the shortest decimal that parses back
+  to `x`, as `[-]d[.ddd]e±E`. Implemented as **Dragon4** (Steele-White /
+  Burger-Dubois), *not* Ryū: same shortest-round-trip output, but big-integer and
+  **table-free** — no precision-coupled lookup tables to get subtly wrong (the right
+  trade for a from-scratch auditable `core`; Ryū is a later perf swap with identical
+  output). The 40-limb fixed bignum (`d4_*`) needs no division (each digit is ≤ 9
+  subtractions). Validated by `proptests::dragon` (round-trips + minimal length +
+  all-but-last-digit match vs Rust `{:e}`; 2M-case `#[ignore]` thorough run green);
+  runtime pinned by `examples/std/format_float.jtr` (round-trip via parse_float).
+  **The `parse(format(x)) == x` contract is now closed.**
+- **Remaining on C (smaller follow-ups, neither blocks B):**
+  1. **`parse_float` slow path** — the > 19-digit / ambiguous inputs the fast path
+     bails on (today `err(pf_too_many_digits)`). A big-integer / AlgorithmM fallback;
+     the `d4_*`/Dragon-style bignum is most of the machinery. Makes parse fully
+     correctly-rounded with no caveat.
+  2. **Ryū `format_float`** (optional perf): replace Dragon4's per-digit big-integer
+     loop with Ryū's two 128-bit tables. Pure optimization — identical output, so the
+     existing `dragon` differential is its oracle.
+  3. **The cross-OS locked-SHA-256 canary** — needs the **`--features c-oracle`
+     gcc-in-test harness** first (shared future work; `DROP-ALLOC-PHASE3.md` future
+     item 3 + research §3.6 Step 0). Until then the Rust mirrors + examples validate.
 
-**Recommended order:** ~~A (finishes the accumulator)~~ ✅, ~~C parse_float~~ ✅,
-then **C format_float (Ryū)** ← *next* (or the parse_float slow path first, if you
-want parse fully correct before starting format), then B (needs the disjointness
-proof), then the canary harness.
+**Recommended order:** ~~A (accumulator)~~ ✅, ~~C parse_float~~ ✅,
+~~C format_float~~ ✅, then **B (deterministic `par` runtime)** ← *next* (needs the
+escape-checker disjoint-write proof), then the parse_float slow path / Ryū / canary
+as polish.
 
 ---
 
@@ -197,8 +206,9 @@ proof), then the canary harness.
 | Area | Where |
 |---|---|
 | Numerics + `core` library | `examples/std/core.jtr` |
-| Demos | `examples/std/{binned,reductions,numbers,float_bits,combinators,slice_algos,parse_float}.jtr`, `examples/{arrays,array_lit}.jtr` |
+| Demos | `examples/std/{binned,reductions,numbers,float_bits,combinators,slice_algos,parse_float,format_float}.jtr`, `examples/{arrays,array_lit}.jtr` |
 | parse_float + table | `examples/std/core.jtr` (`parse_float`/`lemire_*`/`POW10_128`); reference + table generator `src/proptests.rs` → `mod lemire` |
+| format_float (Dragon4) | `examples/std/core.jtr` (`format_float`/`d4_*`); reference `src/proptests.rs` → `mod dragon` |
 | Property/law tests | `src/proptests.rs` → `mod core_props` (mirrors + laws), `mod prop`, `mod fuzz` |
 | FP flags | `src/main.rs` → `CC_FLAGS` + `mod fp_contract_tests` |
 | Budget canary | `src/main.rs` → `mod budget_canary` |

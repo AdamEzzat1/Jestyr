@@ -285,11 +285,17 @@ In rough priority order toward a usable `core` and self-hosting:
      vs Rust's correctly-rounded parser by `proptests::lemire` (~1M cases + hard
      cases); the array-list-literal feature (`539a3bc`) holds the table. Commits
      `539a3bc`, `4091488`, `7cccce7`. Demo `examples/std/parse_float.jtr`.
-   - **Remaining:** the parse_float slow path (> 19 digits / ambiguous), then Ryū
-     `format_float` (shortest round-trip, its own tables) into a caller buffer
-     (`core` stays no-alloc). With both, the `parse(format(x)) == x` round-trip and
-     the **cross-OS locked-SHA-256 canary** (needs the `--features c-oracle`
-     gcc-in-test harness) close the std side of the determinism contract (§3.3 of
+   - ✅ **`format_float` done** (shortest correctly-rounded f64→decimal):
+     `core.format_float(x, []u8) -> usize`, **Dragon4** (big-integer, table-free) so
+     there are no precision-coupled tables to get wrong — same shortest output as Ryū
+     (a later perf swap). Validated by `proptests::dragon` (round-trips + minimal
+     length + all-but-last-digit vs Rust `{:e}`; 2M-case thorough run); demo
+     `examples/std/format_float.jtr`. **`parse(format(x)) == x` is closed.** Commit
+     `05a57f8`.
+   - **Remaining (polish):** the parse_float slow path (> 19 digits / ambiguous),
+     an optional Ryū swap for format, and the **cross-OS locked-SHA-256 canary**
+     (needs the `--features c-oracle` gcc-in-test harness) to fully close the std
+     side of the determinism contract (§3.3 of
      `Jestyr-Remaining-And-Numerics-Research.md`). Transcendentals stay out of scope.
 4. **Math with defined semantics** (ROADMAP J): `wrapping_*`/`saturating_*`/
    `checked_*`, bit-width-aware, with the overflow behavior pinned by property.
