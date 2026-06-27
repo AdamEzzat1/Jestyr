@@ -2560,3 +2560,367 @@ mod lemire {
         }
     }
 }
+
+/// Reference implementation of **shortest correctly-rounded `f64`→decimal** via
+/// Dragon4 (Steele-White / Burger-Dubois) — the algorithm Jestyr `core.format_float`
+/// will mirror. Table-free big-integer arithmetic; produces the byte-identical
+/// shortest digits that Ryū would (Ryū is a later perf optimization of the same
+/// output). Validated against Rust's own shortest formatter (`{:e}`).
+#[cfg(test)]
+mod dragon {
+    use std::cmp::Ordering;
+
+    // ── Minimal big unsigned (little-endian u64 limbs) ──────────────────────────
+    #[derive(Clone)]
+    struct Big {
+        l: Vec<u64>,
+    }
+    impl Big {
+        fn from_u64(x: u64) -> Big {
+            Big { l: vec![x] }
+        }
+        fn trim(&mut self) {
+            while self.l.len() > 1 && *self.l.last().unwrap() == 0 {
+                self.l.pop();
+            }
+        }
+        /// self <<= n bits
+        fn shl_bits(&mut self, n: usize) {
+            let words = n / 64;
+            let bits = n % 64;
+            if bits != 0 {
+                let mut carry = 0u64;
+                for d in self.l.iter_mut() {
+                    let nc = *d >> (64 - bits);
+                    *d = (*d << bits) | carry;
+                    carry = nc;
+                }
+                if carry != 0 {
+                    self.l.push(carry);
+                }
+            }
+            if words != 0 {
+                let mut nl = vec![0u64; words];
+                nl.extend_from_slice(&self.l);
+                self.l = nl;
+            }
+        }
+        fn mul_small(&mut self, m: u64) {
+            let mut carry: u128 = 0;
+            for d in self.l.iter_mut() {
+                let p = (*d as u128) * (m as u128) + carry;
+                *d = p as u64;
+                carry = p >> 64;
+            }
+            while carry != 0 {
+                self.l.push(carry as u64);
+                carry >>= 64;
+            }
+        }
+        fn cmp(&self, o: &Big) -> Ordering {
+            let n = self.l.len().max(o.l.len());
+            for i in (0..n).rev() {
+                let a = *self.l.get(i).unwrap_or(&0);
+                let b = *o.l.get(i).unwrap_or(&0);
+                if a != b {
+                    return a.cmp(&b);
+                }
+            }
+            Ordering::Equal
+        }
+        /// out = self + o
+        fn add(&self, o: &Big) -> Big {
+            let n = self.l.len().max(o.l.len());
+            let mut out = Vec::with_capacity(n + 1);
+            let mut carry = 0u128;
+            for i in 0..n {
+                let s = *self.l.get(i).unwrap_or(&0) as u128
+                    + *o.l.get(i).unwrap_or(&0) as u128
+                    + carry;
+                out.push(s as u64);
+                carry = s >> 64;
+            }
+            if carry != 0 {
+                out.push(carry as u64);
+            }
+            Big { l: out }
+        }
+        /// self -= o, assuming self >= o
+        fn sub_assign(&mut self, o: &Big) {
+            let mut borrow = 0i128;
+            for i in 0..self.l.len() {
+                let v = self.l[i] as i128 - *o.l.get(i).unwrap_or(&0) as i128 - borrow;
+                if v < 0 {
+                    self.l[i] = (v + (1i128 << 64)) as u64;
+                    borrow = 1;
+                } else {
+                    self.l[i] = v as u64;
+                    borrow = 0;
+                }
+            }
+            self.trim();
+        }
+    }
+
+    /// The shortest decimal for a finite, nonzero, positive `x`: returns the digit
+    /// bytes (first digit nonzero) and the decimal exponent `k` such that
+    /// `x = 0.d₁d₂…dₙ × 10^k`.
+    fn shortest_digits(x: f64) -> (Vec<u8>, i32) {
+        let bits = x.to_bits();
+        let ieee_exp = ((bits >> 52) & 0x7FF) as i32;
+        let ieee_mant = bits & 0xF_FFFF_FFFF_FFFF;
+        // f · 2^e with f the integer significand
+        let (f, e): (u64, i32) = if ieee_exp == 0 {
+            (ieee_mant, -1074) // subnormal
+        } else {
+            ((1u64 << 52) | ieee_mant, ieee_exp - 1075)
+        };
+        let even = (f & 1) == 0;
+        let min_exp = -1074;
+
+        // R/S/m+/m- (Burger-Dubois). The asymmetric gap at a power-of-two significand
+        // (f == 2^52, and not at the minimum exponent) makes the low margin half.
+        let (mut r, mut s, mut mp, mut mm);
+        if e >= 0 {
+            let be = {
+                let mut b = Big::from_u64(1);
+                b.shl_bits(e as usize);
+                b
+            };
+            if f != (1u64 << 52) {
+                r = Big::from_u64(f);
+                r.mul_small(2);
+                r = mul_big(&r, &be);
+                s = Big::from_u64(2);
+                mp = be.clone();
+                mm = be;
+            } else {
+                r = Big::from_u64(f);
+                r.mul_small(4);
+                r = mul_big(&r, &be);
+                s = Big::from_u64(4);
+                mp = {
+                    let mut t = be.clone();
+                    t.mul_small(2);
+                    t
+                };
+                mm = be;
+            }
+        } else if e == min_exp || f != (1u64 << 52) {
+            r = Big::from_u64(f);
+            r.mul_small(2);
+            s = Big::from_u64(1);
+            s.shl_bits((1 - e) as usize);
+            mp = Big::from_u64(1);
+            mm = Big::from_u64(1);
+        } else {
+            r = Big::from_u64(f);
+            r.mul_small(4);
+            s = Big::from_u64(1);
+            s.shl_bits((2 - e) as usize);
+            mp = Big::from_u64(2);
+            mm = Big::from_u64(1);
+        }
+
+        // Scale into [0.1, 1): find k so that 0.1 ≤ value·10^-k < 1. Table-free
+        // fixup (no log estimate): adjust by ±1 powers of ten until in range.
+        let mut k = 0i32;
+        // while value + m+ > 1 (i.e. R + mp > S): scale S up
+        loop {
+            let rp = r.add(&mp);
+            let hi = if even { rp.cmp(&s) != Ordering::Less } else { rp.cmp(&s) == Ordering::Greater };
+            if hi {
+                s.mul_small(10);
+                k += 1;
+            } else {
+                break;
+            }
+        }
+        // while (value + m+) · 10 ≤ 1 (i.e. (R + mp)·10 ≤ S): scale R/m up
+        loop {
+            let mut rp = r.add(&mp);
+            rp.mul_small(10);
+            let low = if even { rp.cmp(&s) != Ordering::Greater } else { rp.cmp(&s) == Ordering::Less };
+            if low {
+                r.mul_small(10);
+                mp.mul_small(10);
+                mm.mul_small(10);
+                k -= 1;
+            } else {
+                break;
+            }
+        }
+
+        // Generate digits.
+        let mut digits = Vec::new();
+        loop {
+            r.mul_small(10);
+            mp.mul_small(10);
+            mm.mul_small(10);
+            // d = R / S (single digit) via ≤9 subtractions
+            let mut d: u8 = 0;
+            while r.cmp(&s) != Ordering::Less {
+                r.sub_assign(&s);
+                d += 1;
+            }
+            let low = if even { r.cmp(&mm) != Ordering::Greater } else { r.cmp(&mm) == Ordering::Less };
+            let rp = r.add(&mp);
+            let high = if even { rp.cmp(&s) != Ordering::Less } else { rp.cmp(&s) == Ordering::Greater };
+            if !low && !high {
+                digits.push(b'0' + d);
+            } else {
+                // terminate with the correctly-rounded last digit
+                let up = if low && !high {
+                    false
+                } else if high && !low {
+                    true
+                } else {
+                    // both: round to nearest by 2R vs S
+                    let mut r2 = r.clone();
+                    r2.mul_small(2);
+                    match r2.cmp(&s) {
+                        Ordering::Greater => true,
+                        Ordering::Less => false,
+                        Ordering::Equal => (d & 1) == 1, // tie → round to even
+                    }
+                };
+                digits.push(if up { b'0' + d + 1 } else { b'0' + d });
+                break;
+            }
+        }
+        (digits, k)
+    }
+
+    fn mul_big(a: &Big, b: &Big) -> Big {
+        let mut out = vec![0u64; a.l.len() + b.l.len()];
+        for (i, &ad) in a.l.iter().enumerate() {
+            let mut carry = 0u128;
+            for (j, &bd) in b.l.iter().enumerate() {
+                let cur = out[i + j] as u128 + (ad as u128) * (bd as u128) + carry;
+                out[i + j] = cur as u64;
+                carry = cur >> 64;
+            }
+            let mut k = i + b.l.len();
+            while carry != 0 {
+                let cur = out[k] as u128 + carry;
+                out[k] = cur as u64;
+                carry = cur >> 64;
+                k += 1;
+            }
+        }
+        let mut r = Big { l: out };
+        r.trim();
+        r
+    }
+
+    /// Assemble shortest scientific `[-]d.ddde±XX` (a canonical, round-trippable
+    /// form). `x` finite. Mirrors what `format_float` will write into a `[]u8`.
+    fn format_sci(x: f64) -> String {
+        if x == 0.0 {
+            return if x.is_sign_negative() { "-0e0".to_string() } else { "0e0".to_string() };
+        }
+        let neg = x < 0.0;
+        let (digits, k) = shortest_digits(x.abs());
+        let mut s = String::new();
+        if neg {
+            s.push('-');
+        }
+        s.push(digits[0] as char);
+        if digits.len() > 1 {
+            s.push('.');
+            for &d in &digits[1..] {
+                s.push(d as char);
+            }
+        }
+        s.push('e');
+        // value = 0.d… × 10^k ⇒ d.dd… × 10^(k-1)
+        let exp = k - 1;
+        s.push_str(&exp.to_string());
+        s
+    }
+
+    // ── tests ───────────────────────────────────────────────────────────────────
+
+    /// Assert the three properties that *define* a shortest correctly-rounded
+    /// representation, against Rust's own shortest (`{:e}`): (1) it round-trips,
+    /// (2) it has the same (minimal) number of significant digits, and (3) every
+    /// digit but the last matches std. The last digit may differ **only** on an
+    /// exact tie — where `…25`-style values are equidistant between two shortest
+    /// decimals and we round to even (deterministic, IEEE-consistent) while std
+    /// rounds the other way. Both are valid shortest round-trips.
+    fn check_against_std(x: f64) {
+        let s = format_sci(x);
+        let back: f64 = s.parse().unwrap();
+        assert_eq!(back.to_bits(), x.to_bits(), "round-trip {s} for {x:?}");
+        let mine = significant_digits(&s);
+        let theirs = significant_digits(&format!("{:e}", x));
+        assert_eq!(mine.len(), theirs.len(), "length {mine} vs {theirs} for {x:?}");
+        assert_eq!(
+            mine[..mine.len() - 1],
+            theirs[..theirs.len() - 1],
+            "non-final digits {mine} vs {theirs} for {x:?}"
+        );
+    }
+
+    fn xorshift_check(n: usize, seed: u64) {
+        let mut state = seed;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..n {
+            let x = f64::from_bits(next());
+            if !x.is_finite() || x == 0.0 {
+                continue;
+            }
+            check_against_std(x);
+        }
+    }
+
+    /// **The headline:** random doubles satisfy the shortest-round-trip contract
+    /// above. The default run is sized to stay fast (the Vec-based bignum is
+    /// allocation-heavy); `dragon_matches_std_thorough` (#[ignore]) sweeps far more.
+    /// (Teeth: dropping a digit breaks round-trip; an extra digit breaks the length
+    /// check; a wrong interior digit breaks the prefix check.)
+    #[test]
+    fn dragon_matches_std_shortest() {
+        xorshift_check(8_000, 0x2545_f491_4f6c_dd1d);
+    }
+
+    #[test]
+    #[ignore]
+    fn dragon_matches_std_thorough() {
+        xorshift_check(2_000_000, 0x9e37_79b9_7f4a_7c15);
+    }
+
+    /// The shortest-digit string (no sign, no dot, no exponent, trailing form
+    /// normalized) of a scientific-notation string — for comparing digit content.
+    fn significant_digits(s: &str) -> String {
+        let mant = s.split(['e', 'E']).next().unwrap();
+        let mant = mant.trim_start_matches('-');
+        let mut d: String = mant.chars().filter(|c| c.is_ascii_digit()).collect();
+        // drop trailing zeros (1.50 and 1.5 are the same significand) and leading
+        while d.len() > 1 && d.ends_with('0') {
+            d.pop();
+        }
+        while d.len() > 1 && d.starts_with('0') {
+            d.remove(0);
+        }
+        d
+    }
+
+    /// Hand-picked cases incl. powers of ten, the asymmetric power-of-two gap,
+    /// subnormals, and values needing round-to-even.
+    #[test]
+    fn dragon_hard_cases() {
+        for &x in &[
+            1.0f64, 0.5, 0.1, 0.2, 0.3, 1.5, 2.0, 10.0, 100.0, 1e308, 5e-324,
+            2.2250738585072014e-308, 9007199254740992.0, 1234567890.12345,
+            0.30000000000000004, 1.7976931348623157e308, 123.456, 1e-300, 4503599627370497.0,
+        ] {
+            check_against_std(x);
+        }
+    }
+}

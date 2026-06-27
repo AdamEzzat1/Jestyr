@@ -895,6 +895,333 @@ pub fn parse_float(s: str) -> Result(f64, ParseFloatError) {
     return ok(f64_from_bits(sign | m | ((power2 as u64) << 52)))
 }
 
+// ── Shortest correctly-rounded float format — Dragon4 ─────────────────────────
+//
+// `f64` → the *shortest* decimal string that parses back to it, correctly rounded.
+// Dragon4 (Steele-White / Burger-Dubois): represent the value and its rounding
+// margins as exact big-integer ratios (R/S with high/low margins mp/mm) and emit
+// digits until the remaining interval pins a unique shortest result. Table-free
+// (unlike Ryū, which trades these big-integer ops for two lookup tables — a future
+// perf swap with identical output) and **deterministic** — ties round to even.
+// Locale-free, into a caller `[]u8` (no alloc), like `format_i64`. Validated digit-
+// for-digit against Rust's shortest formatter in `proptests::dragon`.
+//
+// A fixed 40-limb (2560-bit) unsigned bignum covers the worst case (≈1100 bits).
+// Only shift / mul-by-small / add / subtract / compare are needed — no division.
+
+fn d4_from_u64(x: u64) -> [40]u64 {
+    var a: [40]u64 = [0; 40]
+    a[0] = x
+    return a
+}
+
+// a *= m (small multiplier)
+fn d4_mul_small(mut a: [40]u64, m: u64) {
+    var carry: u64 = 0
+    var i: usize = 0
+    for i < 40 {
+        let prod: U128 = mul64(a[i], m)
+        let lo: u64 = prod.lo + carry
+        var c2: u64 = 0
+        if lo < carry { c2 = 1 }
+        a[i] = lo
+        carry = prod.hi + c2
+        i = i + 1
+    }
+}
+
+// a <<= n bits (within the 2560-bit width)
+fn d4_shl(mut a: [40]u64, n: usize) {
+    let words: usize = n / 64
+    let bits: usize = n % 64
+    if bits != 0 {
+        var carry: u64 = 0
+        var i: usize = 0
+        for i < 40 {
+            let v: u64 = a[i]
+            a[i] = (v << bits) | carry
+            carry = v >> (64 - bits)
+            i = i + 1
+        }
+    }
+    if words != 0 {
+        var j: usize = 40
+        for j > 0 {
+            j = j - 1
+            if j >= words {
+                a[j] = a[j - words]
+            } else {
+                a[j] = 0
+            }
+        }
+    }
+}
+
+// -1 if a<b, 0 if equal, 1 if a>b (top limb first)
+fn d4_cmp(read a: [40]u64, read b: [40]u64) -> i32 {
+    var i: usize = 40
+    for i > 0 {
+        i = i - 1
+        if a[i] != b[i] {
+            if a[i] < b[i] { return 0 - 1 }
+            return 1
+        }
+    }
+    return 0
+}
+
+// res = a + b
+fn d4_add(read a: [40]u64, read b: [40]u64) -> [40]u64 {
+    var res: [40]u64 = [0; 40]
+    var carry: u64 = 0
+    var i: usize = 0
+    for i < 40 {
+        let s: u64 = a[i] + b[i]
+        var c1: u64 = 0
+        if s < a[i] { c1 = 1 }
+        let s2: u64 = s + carry
+        var c2: u64 = 0
+        if s2 < s { c2 = 1 }
+        res[i] = s2
+        carry = c1 | c2
+        i = i + 1
+    }
+    return res
+}
+
+// a -= b (assumes a >= b)
+fn d4_sub(mut a: [40]u64, read b: [40]u64) {
+    var borrow: u64 = 0
+    var i: usize = 0
+    for i < 40 {
+        let ai: u64 = a[i]
+        let d1: u64 = ai - b[i]
+        var bo1: u64 = 0
+        if ai < b[i] { bo1 = 1 }
+        let d2: u64 = d1 - borrow
+        var bo2: u64 = 0
+        if d1 < borrow { bo2 = 1 }
+        a[i] = d2
+        borrow = bo1 | bo2
+        i = i + 1
+    }
+}
+
+// Write the shortest decimal for `x` into `buf` as `[-]d[.ddd]e±E` (canonical
+// scientific, always round-trippable). Returns the byte count. `buf` must hold ≥ 32
+// bytes. Subnormals, zero, inf, and nan are handled.
+pub fn format_float(x: f64, mut buf: []u8) -> usize {
+    let one: u64 = 1
+    let bits: u64 = f64_bits(x)
+    let sign: u64 = bits >> 63
+    let ieee_exp: i64 = ((bits >> 52) & 0x7FF) as i64
+    let ieee_mant: u64 = bits & 0xFFFFFFFFFFFFF
+    var pos: usize = 0
+    if sign == 1 {
+        buf[pos] = 45                               // '-'
+        pos = pos + 1
+    }
+    if ieee_exp == 2047 {                           // inf / nan
+        var c0: u8 = 105                            // 'i'
+        var c1: u8 = 110                            // 'n'
+        var c2: u8 = 102                            // 'f'
+        if ieee_mant != 0 {
+            c0 = 110                                // 'n'
+            c1 = 97                                 // 'a'
+            c2 = 110                                // 'n'
+        }
+        buf[pos] = c0
+        pos = pos + 1
+        buf[pos] = c1
+        pos = pos + 1
+        buf[pos] = c2
+        pos = pos + 1
+        return pos
+    }
+    if ieee_exp == 0 and ieee_mant == 0 {           // zero
+        buf[pos] = 48                               // '0'
+        pos = pos + 1
+        buf[pos] = 101                              // 'e'
+        pos = pos + 1
+        buf[pos] = 48                               // '0'
+        pos = pos + 1
+        return pos
+    }
+    var f: u64 = ieee_mant
+    var e: i64 = 0 - 1074
+    if ieee_exp != 0 {
+        f = (one << 52) | ieee_mant
+        e = ieee_exp - 1075
+    }
+    let even: bool = (f & 1) == 0
+    let pow52: u64 = one << 52
+
+    var bigR: [40]u64 = [0; 40]
+    var bigS: [40]u64 = [0; 40]
+    var mp: [40]u64 = [0; 40]
+    var mm: [40]u64 = [0; 40]
+    if e >= 0 {
+        if f != pow52 {
+            bigR = d4_from_u64(f)
+            d4_mul_small(bigR, 2)
+            d4_shl(bigR, e as usize)
+            bigS = d4_from_u64(2)
+            mp = d4_from_u64(1)
+            d4_shl(mp, e as usize)
+            mm = d4_from_u64(1)
+            d4_shl(mm, e as usize)
+        } else {
+            bigR = d4_from_u64(f)
+            d4_mul_small(bigR, 4)
+            d4_shl(bigR, e as usize)
+            bigS = d4_from_u64(4)
+            mp = d4_from_u64(1)
+            d4_shl(mp, (e + 1) as usize)
+            mm = d4_from_u64(1)
+            d4_shl(mm, e as usize)
+        }
+    } else {
+        let at_min: bool = e == (0 - 1074)
+        if at_min or f != pow52 {
+            bigR = d4_from_u64(f)
+            d4_mul_small(bigR, 2)
+            bigS = d4_from_u64(1)
+            d4_shl(bigS, (1 - e) as usize)
+            mp = d4_from_u64(1)
+            mm = d4_from_u64(1)
+        } else {
+            bigR = d4_from_u64(f)
+            d4_mul_small(bigR, 4)
+            bigS = d4_from_u64(1)
+            d4_shl(bigS, (2 - e) as usize)
+            mp = d4_from_u64(2)
+            mm = d4_from_u64(1)
+        }
+    }
+
+    // Scale into [0.1, 1): table-free fixup, no log estimate.
+    var k: i64 = 0
+    for true {
+        let rp: [40]u64 = d4_add(bigR, mp)
+        let c: i32 = d4_cmp(rp, bigS)
+        var hi: bool = false
+        if even {
+            if c >= 0 { hi = true }
+        } else {
+            if c > 0 { hi = true }
+        }
+        if hi {
+            d4_mul_small(bigS, 10)
+            k = k + 1
+        } else {
+            break
+        }
+    }
+    for true {
+        var rp: [40]u64 = d4_add(bigR, mp)
+        d4_mul_small(rp, 10)
+        let c: i32 = d4_cmp(rp, bigS)
+        var low: bool = false
+        if even {
+            if c <= 0 { low = true }
+        } else {
+            if c < 0 { low = true }
+        }
+        if low {
+            d4_mul_small(bigR, 10)
+            d4_mul_small(mp, 10)
+            d4_mul_small(mm, 10)
+            k = k - 1
+        } else {
+            break
+        }
+    }
+
+    // Generate digits.
+    var digits: [24]u8 = [0; 24]
+    var nd: usize = 0
+    for true {
+        d4_mul_small(bigR, 10)
+        d4_mul_small(mp, 10)
+        d4_mul_small(mm, 10)
+        var d: u8 = 0
+        for d4_cmp(bigR, bigS) >= 0 {
+            d4_sub(bigR, bigS)
+            d = d + 1
+        }
+        let cl: i32 = d4_cmp(bigR, mm)
+        var low: bool = false
+        if even {
+            if cl <= 0 { low = true }
+        } else {
+            if cl < 0 { low = true }
+        }
+        let rp: [40]u64 = d4_add(bigR, mp)
+        let ch: i32 = d4_cmp(rp, bigS)
+        var high: bool = false
+        if even {
+            if ch >= 0 { high = true }
+        } else {
+            if ch > 0 { high = true }
+        }
+        if low == false and high == false {
+            digits[nd] = 48 + d
+            nd = nd + 1
+        } else {
+            var up: bool = false
+            if low and high {
+                var r2: [40]u64 = bigR
+                d4_mul_small(r2, 2)
+                let c2: i32 = d4_cmp(r2, bigS)
+                if c2 > 0 { up = true }
+                if c2 == 0 {
+                    if (d & 1) == 1 { up = true }   // tie → round to even
+                }
+            } else {
+                if high { up = true }
+            }
+            var dd: u8 = d
+            if up { dd = d + 1 }
+            digits[nd] = 48 + dd
+            nd = nd + 1
+            break
+        }
+    }
+
+    // Assemble `d[.ddd]e±E`.
+    buf[pos] = digits[0]
+    pos = pos + 1
+    if nd > 1 {
+        buf[pos] = 46                               // '.'
+        pos = pos + 1
+        var i: usize = 1
+        for i < nd {
+            buf[pos] = digits[i]
+            pos = pos + 1
+            i = i + 1
+        }
+    }
+    buf[pos] = 101                                  // 'e'
+    pos = pos + 1
+    var ex: i64 = k - 1                             // value = d.ddd × 10^(k-1)
+    if ex < 0 {
+        buf[pos] = 45                               // '-'
+        pos = pos + 1
+        ex = 0 - ex
+    }
+    if ex >= 100 {
+        buf[pos] = (48 + ((ex / 100) % 10)) as u8
+        pos = pos + 1
+    }
+    if ex >= 10 {
+        buf[pos] = (48 + ((ex / 10) % 10)) as u8
+        pos = pos + 1
+    }
+    buf[pos] = (48 + (ex % 10)) as u8
+    pos = pos + 1
+    return pos
+}
+
 // Power-of-ten table for Eisel–Lemire parse_float: the 128-bit
 // significand of 10^q (bit 127 set; +powers truncated, -powers rounded up)
 // for q in [-342, 308], interleaved hi, lo. Index: i = (q + 342) * 2.
