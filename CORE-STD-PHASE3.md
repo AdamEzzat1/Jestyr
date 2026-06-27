@@ -272,8 +272,11 @@ In rough priority order toward a usable `core` and self-hosting:
 2f. ✅ **Done — binned superaccumulator** (the numerics headline): 2048 integer
    exponent bins over `[N]T`; `binned_add`/`binned_merge`/`binned_sum`, with
    `binned_sum_is_chunk_independent` proving the bit-identical-regardless-of-split
-   property. Per-bin carry (for arbitrary counts) and a correctly-rounded finalize
-   (vs the current fixed-ascending-order fold) are future refinements.
+   property. **Now also: correctly-rounded finalize** (`binned_sum` reconstructs the
+   bins' exact value via a 36-limb bignum and rounds once to nearest-even —
+   `binned_round_is_correctly_rounded`) **and a per-bin cascading carry** in
+   `binned_add` (lifts the ~2¹⁰-same-exponent-adds overflow bound for arbitrary
+   counts — `binned_handles_per_bin_overflow`). Commits `8f39ee1`, `6e1ccb8`.
 3. **Correctly-rounded float parse/format — the marquee determinism deliverable.**
    Now that the primitives exist: Eisel–Lemire `parse_float` and Ryū
    shortest-round-trip `format_float` into a caller buffer (`core` stays no-alloc),

@@ -1,9 +1,10 @@
 # Numerics & `core`/`std` — Handoff (continue in a fresh session)
 
 > Written at the close of the `core`/`std` + numerics workstream. Everything below
-> is **on `master`** (head `f297058`), **490 tests green**, warning-clean. This note
+> is **on `master`** (head `6e1ccb8`), **492 tests green**, warning-clean. This note
 > is self-contained: it says what exists, where, and exactly how to pick up each of
-> the three open fronts cold. Read with [`CORE-STD-PHASE3.md`](CORE-STD-PHASE3.md)
+> the open fronts cold. **Front A (binned accumulator finish) is now DONE** — see
+> its section below. Read with [`CORE-STD-PHASE3.md`](CORE-STD-PHASE3.md)
 > (the full ledger), [`Jestyr-Remaining-And-Numerics-Research.md`](Jestyr-Remaining-And-Numerics-Research.md)
 > (Part 3 is the numerics plan), and [`docs/TESTING.md`](docs/TESTING.md) §5.14
 > (the test layer for all of this).
@@ -61,40 +62,44 @@ assignment lvalue; and **`[N]T` fixed-size arrays** (a value type → C
 `struct { T a[N]; }`; `[v; N]` literal, bounds-checked index r/w, `.len`,
 `for x in arr`; demo `examples/arrays.jtr`).
 
-Test entry points: `cargo test core_props`, `cargo test --quiet` (all 490),
+Test entry points: `cargo test core_props`, `cargo test --quiet` (all 492),
 `cargo run --release -- selfbench` (speed: ~137K lines/s frontend; `cgen` ~47%).
 
 ---
 
-## The three open fronts (pick one; each is a clean starting point)
+## The open fronts (pick one; each is a clean starting point)
 
-### A. Binned accumulator — per-bin carry + correctly-rounded finalize
+### A. Binned accumulator — per-bin carry + correctly-rounded finalize — ✅ DONE
 
-Two known limitations of the current binned accumulator (both documented in
-`core.jtr` and `CORE-STD-PHASE3.md`):
+Both former limitations are resolved (commits `8f39ee1`, `6e1ccb8`):
 
-1. **Per-bin overflow.** A bin is one `i64`; ~2¹⁰ same-exponent values can overflow
-   it. The `core_props::binned_sum_is_chunk_independent` test currently uses small
-   `n` (≤ 96) to stay under that. **Fix options:** (a) two `i64` per bin (a `hi`/`lo`
-   limb pair) — widen `[2048]i64` to a `[2048]i64` pair or a struct array; or (b)
-   *carry at finalize* — keep `binned_add` a pure `+=` (so bins stay order-
-   independent), then in a deterministic pre-finalize pass normalize low→high:
-   while `|bins[e]| ≥ 2^53`, move the overflow into the next exponent bin. Carry
-   math: a bin-`e` unit is `2^(e-1075)`; an overflow of `2^53` units at bin `e`
-   equals `2^52` units at bin `e+1`. **(b) is cheaper and keeps the add hot-path
-   trivial — recommended.** Then widen the chunk-independence property's `n` to force
-   overflow and confirm it still holds.
-2. **Finalize is fixed-order, not correctly-rounded.** `binned_sum` does
-   `acc += (bins[e] as f64) * 2^(e-1075)` ascending — deterministic, but the
-   `i64→f64` cast and the FP adds round. For a *correctly-rounded* result,
-   reconstruct the exact value (the bins **are** an exact big fixed-point number)
-   and round once to nearest-even. This is the renormalize-then-round step of
-   reproducible BLAS / a Kulisch accumulator. **Oracle for the test:** the exact sum
-   is `Σ bins[e]·2^(e-1075)` as a rational/bignum; compare the Jestyr/mirror finalize
-   to that rounded to `f64`. (A Rust `i128`/bignum mirror is the easiest oracle.)
+1. **Correctly-rounded finalize** (was: fixed-order FP fold). `binned_sum` now
+   reconstructs the bins' **exact** integer value — they are an exact big fixed-point
+   number `Y·2^-1074` — as a 36-limb (2304-bit) unsigned bignum (two non-negative
+   `pos`/`neg` halves, subtracted, to dodge two's-complement sign handling), finds
+   the MSB, extracts the top 53 bits + round + sticky, and rounds **once** to
+   nearest-even (overflow → ±inf; values < 2^-1021 exact). Helpers `big_*` in
+   `core.jtr`; mirror `m_binned_round` + independent dep-free oracle (exact `i128`
+   sum at the finest scale → correctly-rounded `i128→f64` × exact power of two) in
+   `core_props::binned_round_is_correctly_rounded`.
+2. **Per-bin overflow** (was: ~2¹⁰-same-exponent-adds i64 wrap). `binned_add` now
+   **cascades a carry** up the exponents (2:1 between bins, 1:1 across the bin-0/1
+   shared ULP) when a bin reaches 2^53 — amortized O(1), keeps bins bounded so merges
+   can't wrap either. The carry is value-preserving, so it is sound *only because*
+   the finalize reads the exact value, not the bin layout. Property
+   `core_props::binned_handles_per_bin_overflow` (n > 2¹⁰ identical adds; asserts
+   chunk-independence **and** correctness vs the true total).
 
-Start in `core.jtr` (`binned_add`/`binned_sum`) + `core_props` (extend the mirror
-`m_binned_*` and the two properties). Smallest of the three; no new compiler work.
+**Key design lesson (recorded for B/C):** output bit-identicality requires only the
+bins' *exact value* to be chunk-invariant, **not** the bins themselves. The
+correctly-rounded finalize is what decouples representation from result — and that
+decoupling is exactly what makes a future deterministic parallel reduction (Front B)
+free to merge/normalize however it likes.
+
+Not yet done (optional follow-ups, neither blocks B or C): carry-normalize inside
+`binned_merge` so an *unbounded* fan-in of accumulators can't wrap (today a single
+merge of two is safe; a long sequential merge chain of many could approach the
+bound), and an `f64`/runtime SHA canary once the gcc-in-test harness exists.
 
 ### B. Deterministic `par` runtime (parallel reduction that never changes the answer)
 
@@ -133,9 +138,9 @@ transcendental-determinism gap) and the largest.
   first (shared future work; `DROP-ALLOC-PHASE3.md` future item 3 + research §3.6
   Step 0). Until then, validate via the Rust mirror + the example.
 
-**Recommended order:** A (small, finishes the accumulator), then C parse_float
-(marquee, primitives ready), then B (needs the disjointness proof), then C
-format_float, then the canary harness.
+**Recommended order:** ~~A (small, finishes the accumulator)~~ ✅ done, then
+**C parse_float** (marquee, primitives ready) ← *next*, then B (needs the
+disjointness proof), then C format_float, then the canary harness.
 
 ---
 
