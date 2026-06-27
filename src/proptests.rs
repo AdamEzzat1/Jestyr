@@ -2201,6 +2201,81 @@ mod lemire {
             }
             (hi, lo)
         }
+        // ── extra ops for the slow path ─────────────────────────────────────────
+        fn from_u64(x: u64) -> Big {
+            Big { l: vec![x] }
+        }
+        fn add_small(&mut self, x: u64) {
+            let mut carry = x as u128;
+            let mut i = 0;
+            while carry != 0 {
+                if i == self.l.len() {
+                    self.l.push(0);
+                }
+                let s = self.l[i] as u128 + carry;
+                self.l[i] = s as u64;
+                carry = s >> 64;
+                i += 1;
+            }
+        }
+        fn shl_bits(&mut self, n: usize) {
+            let words = n / 64;
+            let bits = n % 64;
+            if bits != 0 {
+                let mut carry = 0u64;
+                for d in self.l.iter_mut() {
+                    let nc = *d >> (64 - bits);
+                    *d = (*d << bits) | carry;
+                    carry = nc;
+                }
+                if carry != 0 {
+                    self.l.push(carry);
+                }
+            }
+            if words != 0 {
+                let mut nl = vec![0u64; words];
+                nl.extend_from_slice(&self.l);
+                self.l = nl;
+            }
+        }
+        fn mul_pow5(&mut self, e: usize) {
+            for _ in 0..e {
+                self.mul_small(5);
+            }
+        }
+        /// In-place divide by a small divisor; returns the remainder. (Test helper
+        /// for building exact midpoint decimals.)
+        fn div_small(&mut self, d: u64) -> u64 {
+            let mut rem: u128 = 0;
+            for i in (0..self.l.len()).rev() {
+                let cur = (rem << 64) | self.l[i] as u128;
+                self.l[i] = (cur / d as u128) as u64;
+                rem = cur % d as u128;
+            }
+            self.trim();
+            rem as u64
+        }
+        fn to_decimal(&self) -> String {
+            if self.is_zero() {
+                return "0".to_string();
+            }
+            let mut n = self.clone();
+            let mut ds = Vec::new();
+            while !n.is_zero() {
+                ds.push(b'0' + n.div_small(10) as u8);
+            }
+            ds.reverse();
+            String::from_utf8(ds).unwrap()
+        }
+        /// The big integer of the decimal `digits` (each a byte b'0'..=b'9').
+        fn from_digits(digits: &[u8]) -> Big {
+            let mut b = Big::zero();
+            for &d in digits {
+                b.mul_small(10);
+                b.add_small((d - b'0') as u64);
+            }
+            b
+        }
     }
 
     // ── Algorithm constants for binary64 ────────────────────────────────────────
@@ -2431,6 +2506,194 @@ mod lemire {
         lemire(neg, mant, q, table).map(f64::from_bits)
     }
 
+    // ── Slow path: arbitrary-precision, correctly rounded ───────────────────────
+    // For inputs with > 19 significant digits, the fast path can't form the 64-bit
+    // mantissa. The slow path takes the fast-path result on the first 19 digits as a
+    // candidate `g` (within ~0.01 ULP of the true value), then decides between `g`
+    // and its bit-pattern neighbours `g±1` by comparing the exact value `D·10^E`
+    // against the relevant rounding midpoint — a cross-multiplied big-integer
+    // comparison (multiply by 5ⁿ, shift, compare; never divide). Only the first
+    // `SLOW_DIGITS` significant digits + a sticky bit are needed (more can't affect
+    // an f64 except at an exact tie, which the sticky bit resolves).
+    const SLOW_DIGITS: usize = 800;
+
+    /// Parse a decimal string into (neg, significant digits with leading zeros
+    /// stripped, decimal exponent E) such that value = digits·10^E. None on malformed.
+    fn parse_decimal_full(s: &str) -> Option<(bool, Vec<u8>, i32)> {
+        let b = s.as_bytes();
+        let mut i = 0;
+        let mut neg = false;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            neg = b[i] == b'-';
+            i += 1;
+        }
+        let mut digits: Vec<u8> = Vec::new();
+        let mut frac = 0i32;
+        let mut dot = false;
+        let mut seen = false;
+        while i < b.len() {
+            let c = b[i];
+            if c.is_ascii_digit() {
+                seen = true;
+                digits.push(c);
+                if dot {
+                    frac += 1;
+                }
+                i += 1;
+            } else if c == b'.' && !dot {
+                dot = true;
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if !seen {
+            return None;
+        }
+        let mut e = -frac;
+        if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+            i += 1;
+            let mut es = 1i32;
+            if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+                if b[i] == b'-' {
+                    es = -1;
+                }
+                i += 1;
+            }
+            let mut ev = 0i32;
+            let mut any = false;
+            while i < b.len() && b[i].is_ascii_digit() {
+                any = true;
+                ev = ev.saturating_mul(10).saturating_add((b[i] - b'0') as i32);
+                i += 1;
+            }
+            if !any {
+                return None;
+            }
+            e += es * ev;
+        }
+        if i != b.len() {
+            return None;
+        }
+        // strip leading zeros (they don't change the integer value)
+        let mut start = 0;
+        while start + 1 < digits.len() && digits[start] == b'0' {
+            start += 1;
+        }
+        Some((neg, digits[start..].to_vec(), e))
+    }
+
+    /// Compare `dt · 10^et` against `c · 2^p` (the boundary), with `sticky` meaning
+    /// the true value is strictly larger than `dt·10^et`. Cross-multiplies to clear
+    /// denominators — division-free.
+    fn cmp_boundary(dt: &Big, et: i32, c: u64, p: i32, sticky: bool) -> Ordering {
+        let mut l = dt.clone();
+        let mut r = Big::from_u64(c);
+        // fold the 5-powers onto the side whose 5-exponent is positive
+        if et >= 0 {
+            l.mul_pow5(et as usize);
+        } else {
+            r.mul_pow5((-et) as usize);
+        }
+        // remaining 2-powers: l has 2^et, r has 2^p; factor out 2^min and shift
+        let m = et.min(p);
+        l.shl_bits((et - m) as usize);
+        r.shl_bits((p - m) as usize);
+        match l.cmp(&r) {
+            Ordering::Equal if sticky => Ordering::Greater,
+            ord => ord,
+        }
+    }
+
+    /// Correctly-rounded slow path for any number of significant digits.
+    fn slow_parse(neg: bool, digits: &[u8], e: i32, table: &[(u64, u64)]) -> u64 {
+        let sign = if neg { 1u64 << 63 } else { 0 };
+        let nd = digits.len();
+        if nd == 0 || digits.iter().all(|&d| d == b'0') {
+            return sign;
+        }
+        // candidate g from the first ≤19 digits
+        let take = nd.min(19);
+        let mut w: u64 = 0;
+        for &d in &digits[..take] {
+            w = w * 10 + (d - b'0') as u64;
+        }
+        let q = e + (nd as i32 - take as i32);
+        let gbits = lemire(neg, w, q, table).unwrap() & !(1u64 << 63); // magnitude pattern
+        let be = (gbits >> 52) & 0x7FF;
+        if be == 0x7FF {
+            return sign | gbits; // already ±inf
+        }
+        // Keep up to SLOW_DIGITS significant digits exactly (more cannot change the
+        // rounding except via the sticky bit — a boundary's exact decimal has < 768
+        // significant digits, so beyond that no input can *equal* a boundary).
+        let t = nd.min(SLOW_DIGITS);
+        let dt = Big::from_digits(&digits[..t]);
+        let sticky = digits[t..].iter().any(|&d| d != b'0');
+        let et = e + (nd as i32 - t as i32);
+        // g's significand m and binary exponent k
+        let mant = gbits & 0xF_FFFF_FFFF_FFFF;
+        let (m, k) = if be == 0 { (mant, -1074i64) } else { ((1u64 << 52) | mant, be as i64 - 1075) };
+        // compare V to g's value (= 2m · 2^(k-1))
+        let to_bv = |c: u64, p: i64| cmp_boundary(&dt, et, c, p as i32, sticky);
+        let mut out = gbits;
+        if m == 0 {
+            // candidate is zero: boundary to the smallest subnormal is 2^-1075
+            if to_bv(1, -1075) == Ordering::Greater {
+                out = gbits + 1;
+            }
+        } else {
+            match to_bv(2 * m, k - 1) {
+                Ordering::Equal => {} // exact: g is correct
+                Ordering::Greater => {
+                    // V above g → g or succ; midpoint (2m+1)·2^(k-1)
+                    match to_bv(2 * m + 1, k - 1) {
+                        Ordering::Greater => out = gbits + 1,
+                        Ordering::Less => {}
+                        Ordering::Equal => {
+                            if m & 1 == 1 {
+                                out = gbits + 1; // tie → even
+                            }
+                        }
+                    }
+                }
+                Ordering::Less => {
+                    // V below g → g or pred; midpoint depends on the power-of-two gap
+                    let (c, p) = if mant == 0 && be > 1 {
+                        (4 * m - 1, k - 2) // asymmetric: pred is half-ulp below
+                    } else {
+                        (2 * m - 1, k - 1)
+                    };
+                    match to_bv(c, p) {
+                        Ordering::Less => out = gbits - 1,
+                        Ordering::Greater => {}
+                        Ordering::Equal => {
+                            if m & 1 == 1 {
+                                out = gbits - 1; // tie → even
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        sign | out
+    }
+
+    /// Full correctly-rounded parser: fast path for ≤ 19 digits, slow path otherwise.
+    fn parse_f64_full(s: &str, table: &[(u64, u64)]) -> Option<f64> {
+        let (neg, digits, e) = parse_decimal_full(s)?;
+        let nd = digits.len();
+        if nd <= 19 {
+            // route through the fast path (rebuild the u64 significand)
+            let mut w: u64 = 0;
+            for &d in &digits {
+                w = w * 10 + (d - b'0') as u64;
+            }
+            return lemire(neg, w, e, table).map(f64::from_bits);
+        }
+        Some(f64::from_bits(slow_parse(neg, &digits, e, table)))
+    }
+
     // ── tests ───────────────────────────────────────────────────────────────────
 
     /// `power(q)` equals the true `⌊log₂(10^q)⌋` across the whole table range — the
@@ -2557,6 +2820,124 @@ mod lemire {
                 let want: f64 = s.parse().unwrap();
                 assert_eq!(v.to_bits(), want.to_bits(), "hard case {s}");
             }
+        }
+    }
+
+    /// **The slow path is correctly rounded for arbitrarily many digits.** Format
+    /// random doubles to full (and over-full) precision so the parser must take the
+    /// > 19-digit slow path, and assert the bits match std. (Teeth: skipping the
+    /// midpoint adjustment, or dropping the sticky bit, makes near-boundary cases
+    /// disagree with std.)
+    fn slow_sweep(n: usize, seed: u64) -> u64 {
+        let t = gen_table();
+        let mut state = seed;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut took_slow = 0u64;
+        for _ in 0..n {
+            let x = f64::from_bits(next());
+            if !x.is_finite() {
+                continue;
+            }
+            // {:.30e} / {:.45e} have 31 / 46 significant digits → force the slow path
+            for s in [format!("{:.30e}", x), format!("{:.45e}", x)] {
+                let v = parse_f64_full(&s, &t).unwrap();
+                let want: f64 = s.parse().unwrap();
+                assert_eq!(v.to_bits(), want.to_bits(), "slow parse({s})");
+                took_slow += 1;
+            }
+        }
+        took_slow
+    }
+
+    #[test]
+    fn slow_parse_matches_std() {
+        let n = slow_sweep(25_000, 0xda3e_39cb_94b9_5bdb);
+        assert!(n > 40_000, "slow path under-exercised: {n}");
+    }
+
+    #[test]
+    #[ignore]
+    fn slow_parse_matches_std_thorough() {
+        slow_sweep(1_000_000, 0x106e_b8a3_2f1d_77c9);
+    }
+
+    /// The exact decimal of the midpoint between `x` and `succ(x)` — a value that is
+    /// genuinely halfway, so the digits past the 19-digit candidate decide the
+    /// rounding. `x` must be a positive finite normal.
+    fn succ_midpoint_decimal(x: f64) -> String {
+        let bits = x.to_bits();
+        let be = (bits >> 52) & 0x7FF;
+        let mant = bits & 0xF_FFFF_FFFF_FFFF;
+        let (m, k) = if be == 0 { (mant, -1074i64) } else { ((1u64 << 52) | mant, be as i64 - 1075) };
+        let c = 2 * m + 1; // midpoint = c · 2^(k-1)
+        let kk = k - 1;
+        if kk >= 0 {
+            let mut b = Big::from_u64(c);
+            b.shl_bits(kk as usize);
+            b.to_decimal()
+        } else {
+            // c / 2^(-kk) = c·5^(-kk) / 10^(-kk): integer digits with a point
+            let f = (-kk) as usize;
+            let mut b = Big::from_u64(c);
+            b.mul_pow5(f);
+            let mut s = b.to_decimal();
+            while s.len() <= f {
+                s.insert(0, '0'); // pad so the point has digits on its left
+            }
+            let dot = s.len() - f;
+            s.insert(dot, '.');
+            s
+        }
+    }
+
+    /// **Teeth for the adjustment:** parse exact midpoints and midpoints nudged just
+    /// above — the cases where the 19-digit candidate is on the wrong side and only
+    /// the big-integer midpoint comparison gets the answer right. Each must match std.
+    #[test]
+    fn slow_parse_near_boundaries() {
+        let t = gen_table();
+        let xs = [
+            1.0f64, 2.0, 0.5, 3.14159, 1e10, 1e-10, 123456.789,
+            9007199254740992.0, 1e100, 1e-100, 2.5, 0.1, 100.0,
+        ];
+        for &x in &xs {
+            let mid = succ_midpoint_decimal(x);
+            // exact midpoint → ties to even; nudged up → rounds to succ(x). Both via std.
+            for s in [mid.clone(), format!("{mid}1"), format!("{mid}00001"), format!("{mid}5")] {
+                let v = parse_f64_full(&s, &t).unwrap();
+                let want: f64 = s.parse().unwrap();
+                assert_eq!(v.to_bits(), want.to_bits(), "near-boundary {s} (x={x:?})");
+            }
+        }
+    }
+
+    /// Long-digit hard cases: many digits straddling a rounding boundary, long zero
+    /// tails (exact ties), subnormals with long tails, and the classic denormal
+    /// boundary 2.2250738585072011e-308 written long.
+    #[test]
+    fn slow_parse_hard_cases() {
+        let t = gen_table();
+        let cases: &[&str] = &[
+            "1.00000000000000000000000000000001",          // just above 1
+            "0.99999999999999999999999999999999",          // just below 1
+            "9007199254740993.0000000000000000",           // tie → 2^53 (even)
+            "9007199254740995.0000000000000000",           // tie → 9007199254740996
+            "2.22507385850720113605740979670913197593481954635164564e-308",
+            "4.9406564584124654417656879286822137236505980e-324", // smallest subnormal
+            "1.7976931348623158e308",                      // overflow → inf
+            "0.0000000000000000000000000000000000000001",  // tiny → 1e-40
+            "123456789012345678901234567890",              // 30-digit integer
+            "1.000000000000000000000000000000000000000000000000005",
+        ];
+        for &s in cases {
+            let v = parse_f64_full(s, &t).unwrap();
+            let want: f64 = s.parse().unwrap();
+            assert_eq!(v.to_bits(), want.to_bits(), "slow hard {s}");
         }
     }
 }
