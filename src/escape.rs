@@ -408,6 +408,20 @@ impl<'a> Checker<'a> {
                 return;
             }
             ExprKind::Spawn(call) => {
+                // Data-race safety. Structured concurrency already gives join-safety
+                // (a task can't outlive its scope, so a borrow into it stays frame-
+                // safe). The remaining hazard is two tasks writing the *same* memory.
+                // In the safe subset the only shareable mutable handle is a slice
+                // (a `mut [N]T` value-array arg is copied into each task, so it can't
+                // alias) — so a `mut`/`out` slice parameter on a spawn target is the
+                // one way to create a safe data race. Forbid it: shared mutable state
+                // across tasks must go through a raw `*mut T` in `unsafe`, where the
+                // programmer asserts the regions are disjoint (as `par_binned_sum`
+                // does — each worker gets its own region). A general *proof* that two
+                // raw pointers don't overlap needs range-aware alias analysis (e.g.
+                // `raw+0` vs `raw+2048`), which is out of scope; this rule keeps the
+                // safe subset race-free and makes the unsafe boundary explicit.
+                self.check_spawn_no_shared_mut_slice(*call);
                 self.walk_expr(ctx, *call, false);
                 return;
             }
@@ -588,6 +602,34 @@ impl<'a> Checker<'a> {
             return self.is_borrow_place(ctx, id);
         }
         self.is_borrow_place(ctx, id) && self.info.is_non_copy(id)
+    }
+
+    /// Reject a `spawn` whose target takes a `mut`/`out` **slice** parameter — a
+    /// shared mutable slice across parallel tasks can race (its `ptr` aliases). The
+    /// safe way to share mutable state across tasks is a raw `*mut T` in `unsafe`.
+    fn check_spawn_no_shared_mut_slice(&mut self, call: ExprId) {
+        let ExprKind::Call { callee, .. } = &self.ast.expr_at(call).kind else { return };
+        let ExprKind::Name(n) = &self.ast.expr_at(*callee).kind else { return };
+        let Some(sig) = self.info.table.fns.get(&n.name) else { return };
+        let mut hit: Option<String> = None;
+        for p in &sig.params {
+            if matches!(p.conv, Conv::Mut | Conv::Out) && matches!(p.ty, Ty::Slice(_)) {
+                hit = Some(p.name.clone());
+                break;
+            }
+        }
+        if let Some(pname) = hit {
+            let span = self.ast.expr_at(call).span;
+            let fname = n.name.clone();
+            self.error(
+                span,
+                format!(
+                    "`spawn`: `{fname}` takes a `mut` slice `{pname}` — a shared mutable slice can \
+                     race across parallel tasks. Share mutable state through a raw `*mut T` in \
+                     `unsafe` (each task a disjoint region, as `par_binned_sum` does), or pass it `read`."
+                ),
+            );
+        }
     }
 
     /// Route 4: passing a borrow to a `take` parameter of a known function —
@@ -1271,5 +1313,30 @@ mod tests {
         );
         assert_eq!(d.len(), 1, "{:?}", d);
         assert!(d[0].message.contains("store borrow"), "{:?}", d);
+    }
+
+    // --- data-race safety: a spawn target may not take a shared mutable slice ---
+
+    #[test]
+    fn rejects_spawn_with_mut_slice_param() {
+        // A `mut []i64` worker would let two tasks alias the same backing store.
+        let d = escapes(
+            "fn w(mut s: []i64) { s[0] = 1 } \
+             fn main() -> i32 { var p: *mut i64 = alloc(i64, 4) var s: []i64 = slice(i64, p, 4) \
+             concurrent { spawn w(s) } free_ptr(p) return 0 }",
+        );
+        assert!(d.iter().any(|m| m.message.contains("shared mutable slice")), "{:?}", d);
+    }
+
+    #[test]
+    fn accepts_spawn_with_raw_pointer_and_read_slice() {
+        // The `par_binned_sum` shape: a raw `*mut` (the unsafe sharing hatch) plus a
+        // `read` slice (shared read, no race) — both fine.
+        let d = escapes(
+            "fn w(read chunk: []f64, acc: *mut i64) { unsafe { acc.* = 0 } } \
+             fn main() -> i32 { var p: *mut f64 = alloc(f64, 4) var s: []f64 = slice(f64, p, 4) \
+             var a: *mut i64 = alloc(i64, 1) concurrent { spawn w(s, a) } free_ptr(p) free_ptr(a) return 0 }",
+        );
+        assert!(!d.iter().any(|m| m.message.contains("shared mutable slice")), "false positive: {:?}", d);
     }
 }
