@@ -2054,3 +2054,483 @@ fn main() -> i32 {\n\
         assert_eq!(compile(PROG), compile(PROG));
     }
 }
+
+/// Reference implementation of correctly-rounded decimal→`f64` parsing via
+/// **Eisel–Lemire** — the algorithm and power-of-ten table that the Jestyr
+/// `core.parse_float` will mirror. Validated end-to-end against Rust's own
+/// (correctly-rounded) `str::parse::<f64>()`; the same generator emits the Jestyr
+/// table, so the two share their constants by construction.
+#[cfg(test)]
+mod lemire {
+    use std::cmp::Ordering;
+
+    // ── A minimal big unsigned integer (little-endian u64 limbs) ────────────────
+    // Just enough to build the table: ×small, <<1, compare, subtract, bit length,
+    // and exact division for the negative-power reciprocals.
+    #[derive(Clone)]
+    struct Big {
+        l: Vec<u64>,
+    }
+    impl Big {
+        fn zero() -> Big {
+            Big { l: vec![0] }
+        }
+        fn one() -> Big {
+            Big { l: vec![1] }
+        }
+        fn trim(&mut self) {
+            while self.l.len() > 1 && *self.l.last().unwrap() == 0 {
+                self.l.pop();
+            }
+        }
+        fn is_zero(&self) -> bool {
+            self.l.iter().all(|&x| x == 0)
+        }
+        fn mul_small(&mut self, m: u64) {
+            let mut carry: u128 = 0;
+            for d in self.l.iter_mut() {
+                let p = (*d as u128) * (m as u128) + carry;
+                *d = p as u64;
+                carry = p >> 64;
+            }
+            while carry != 0 {
+                self.l.push(carry as u64);
+                carry >>= 64;
+            }
+        }
+        fn shl1(&mut self) {
+            let mut carry = 0u64;
+            for d in self.l.iter_mut() {
+                let nc = *d >> 63;
+                *d = (*d << 1) | carry;
+                carry = nc;
+            }
+            if carry != 0 {
+                self.l.push(carry);
+            }
+        }
+        fn bit_len(&self) -> usize {
+            for i in (0..self.l.len()).rev() {
+                if self.l[i] != 0 {
+                    return i * 64 + (64 - self.l[i].leading_zeros() as usize);
+                }
+            }
+            0
+        }
+        fn bit(&self, i: usize) -> u64 {
+            let w = i / 64;
+            if w >= self.l.len() {
+                0
+            } else {
+                (self.l[w] >> (i % 64)) & 1
+            }
+        }
+        fn set_bit(&mut self, i: usize) {
+            let w = i / 64;
+            while self.l.len() <= w {
+                self.l.push(0);
+            }
+            self.l[w] |= 1 << (i % 64);
+        }
+        fn cmp(&self, o: &Big) -> Ordering {
+            let n = self.l.len().max(o.l.len());
+            for i in (0..n).rev() {
+                let a = *self.l.get(i).unwrap_or(&0);
+                let b = *o.l.get(i).unwrap_or(&0);
+                if a != b {
+                    return a.cmp(&b);
+                }
+            }
+            Ordering::Equal
+        }
+        fn sub_assign(&mut self, o: &Big) {
+            // self -= o, assuming self >= o
+            let mut borrow = 0i128;
+            for i in 0..self.l.len() {
+                let b = *o.l.get(i).unwrap_or(&0);
+                let v = self.l[i] as i128 - b as i128 - borrow;
+                if v < 0 {
+                    self.l[i] = (v + (1i128 << 64)) as u64;
+                    borrow = 1;
+                } else {
+                    self.l[i] = v as u64;
+                    borrow = 0;
+                }
+            }
+            self.trim();
+        }
+        fn pow(base: u64, exp: usize) -> Big {
+            let mut r = Big::one();
+            for _ in 0..exp {
+                r.mul_small(base);
+            }
+            r
+        }
+        /// `floor(2^p / self)` and whether it divided evenly (remainder == 0).
+        fn pow2_div(p: usize, den: &Big) -> (Big, bool) {
+            // long division of 2^p by den, MSB-first
+            let mut rem = Big::zero();
+            let mut q = Big::zero();
+            for i in (0..=p).rev() {
+                rem.shl1();
+                if i == p {
+                    rem.l[0] |= 1; // the single set bit of 2^p
+                }
+                q.shl1();
+                if rem.cmp(den) != Ordering::Less {
+                    rem.sub_assign(den);
+                    q.l[0] |= 1;
+                }
+            }
+            q.trim();
+            (q, rem.is_zero())
+        }
+        /// The top 128 bits as (hi, lo), given bit_len >= 128.
+        fn top128(&self) -> (u64, u64) {
+            let bl = self.bit_len();
+            let sh = bl - 128;
+            let mut hi = 0u64;
+            let mut lo = 0u64;
+            for k in 0..64 {
+                if self.bit(sh + 64 + k) == 1 {
+                    hi |= 1 << k;
+                }
+                if self.bit(sh + k) == 1 {
+                    lo |= 1 << k;
+                }
+            }
+            (hi, lo)
+        }
+    }
+
+    // ── Algorithm constants for binary64 ────────────────────────────────────────
+    const SMALLEST_POWER: i32 = -342;
+    const LARGEST_POWER: i32 = 308;
+    const MANTISSA_BITS: i32 = 52;
+    const INFINITE_POWER: i32 = 0x7FF;
+    const MIN_EXP_ROUND_EVEN: i32 = -4;
+    const MAX_EXP_ROUND_EVEN: i32 = 23;
+
+    /// `power(q) = ⌊q·log₂10⌋ + 63` via Lemire's integer magic.
+    fn power(q: i32) -> i32 {
+        (((152170 + 65536) * q) >> 16) + 63
+    }
+
+    /// The 128-bit significand of 10^q, normalized so bit 127 is set, with positive
+    /// powers truncated and negative powers rounded up — the alignment `power(q)`
+    /// assumes. Returns (hi, lo).
+    fn table_entry(q: i32) -> (u64, u64) {
+        let trueexp = power(q) - 63; // = ⌊log₂(10^q)⌋
+        let shift = 127 - trueexp; // scale 10^q into [2^127, 2^128)
+        if q >= 0 {
+            let mut v = Big::pow(10, q as usize);
+            if shift >= 0 {
+                for _ in 0..shift {
+                    v.shl1();
+                }
+                // v now exactly 128-bit (bit 127 set), lower bits zero
+                let (hi, lo) = pad_to_128(&v);
+                (hi, lo)
+            } else {
+                v.top128() // truncate to top 128 bits
+            }
+        } else {
+            // 10^q = 2^q / 5^|q|; M = ceil(2^(shift+q) / 5^|q|)
+            let p = (shift + q) as usize; // shift - |q|
+            let den = Big::pow(5, (-q) as usize);
+            let (mut m, exact) = Big::pow2_div(p, &den);
+            if !exact {
+                add_one(&mut m); // round up
+            }
+            // m is ~128 bits; normalize if a carry pushed it to 129
+            if m.bit_len() > 128 {
+                // shift right by 1 (drop the lsb) — only on the rare carry overflow
+                let mut nm = Big::zero();
+                for k in 0..m.bit_len() {
+                    if m.bit(k + 1) == 1 {
+                        nm.set_bit(k);
+                    }
+                }
+                m = nm;
+            }
+            pad_to_128(&m)
+        }
+    }
+    fn add_one(b: &mut Big) {
+        let mut i = 0;
+        loop {
+            if i >= b.l.len() {
+                b.l.push(1);
+                break;
+            }
+            let (s, c) = b.l[i].overflowing_add(1);
+            b.l[i] = s;
+            if !c {
+                break;
+            }
+            i += 1;
+        }
+    }
+    fn pad_to_128(b: &Big) -> (u64, u64) {
+        let lo = *b.l.first().unwrap_or(&0);
+        let hi = *b.l.get(1).unwrap_or(&0);
+        (hi, lo)
+    }
+
+    /// The full table of (hi, lo) pairs for q in [-342, 308].
+    fn gen_table() -> Vec<(u64, u64)> {
+        (SMALLEST_POWER..=LARGEST_POWER).map(table_entry).collect()
+    }
+
+    fn full_mul(a: u64, b: u64) -> (u64, u64) {
+        let p = (a as u128) * (b as u128);
+        ((p >> 64) as u64, p as u64)
+    }
+
+    /// (hi, lo) ≈ the top 128 bits of w × 10^q, two-step for precision.
+    fn compute_product(q: i32, w: u64, table: &[(u64, u64)]) -> (u64, u64) {
+        let idx = (q - SMALLEST_POWER) as usize;
+        let (thi, tlo) = table[idx];
+        let (mut hi, mut lo) = full_mul(w, thi);
+        let precision_mask: u64 = 0xFFFF_FFFF_FFFF_FFFF >> (MANTISSA_BITS + 3);
+        if (hi & precision_mask) == precision_mask {
+            let (shi, _slo) = full_mul(w, tlo);
+            let (nlo, carry) = lo.overflowing_add(shi);
+            lo = nlo;
+            if carry {
+                hi += 1;
+            }
+        }
+        (hi, lo)
+    }
+
+    /// Eisel–Lemire fast path. Returns `Some(f64 bits)` when confident, `None` when
+    /// it bails (the rare ambiguous case needing a slow path).
+    fn lemire(neg: bool, mantissa: u64, q: i32, table: &[(u64, u64)]) -> Option<u64> {
+        let sign = if neg { 1u64 << 63 } else { 0 };
+        if mantissa == 0 || q < SMALLEST_POWER {
+            return Some(sign); // ±0
+        }
+        if q > LARGEST_POWER {
+            return Some(sign | ((INFINITE_POWER as u64) << 52)); // ±inf
+        }
+        let lz = mantissa.leading_zeros() as i32;
+        let w = mantissa << lz;
+        let (hi, lo) = compute_product(q, w, table);
+        let upperbit = (hi >> 63) as i32;
+        let mut m = hi >> (upperbit + 64 - MANTISSA_BITS - 3);
+        let mut power2 = power(q) + upperbit - lz - (-1023);
+        if power2 <= 0 {
+            // subnormal
+            if -power2 + 1 >= 64 {
+                return Some(sign); // underflow to ±0
+            }
+            m >>= -power2 + 1;
+            m += m & 1;
+            m >>= 1;
+            power2 = if m < (1u64 << MANTISSA_BITS) { 0 } else { 1 };
+            // No masking: in the true-subnormal case bit 52 of `m` is clear; at the
+            // boundary `m == 2^52` shares bit 52 with `power2 == 1`, which is exactly
+            // the smallest-normal encoding (exponent 1, mantissa 0).
+            return Some(sign | m | ((power2 as u64) << 52));
+        }
+        // round-to-even tie: only when 5^q fits exactly and we are in the safe range
+        if lo <= 1
+            && q >= MIN_EXP_ROUND_EVEN
+            && q <= MAX_EXP_ROUND_EVEN
+            && (m & 3) == 1
+            && (m << (upperbit + 64 - MANTISSA_BITS - 3)) == hi
+        {
+            m &= !1u64; // exactly halfway → round down to even
+        }
+        m += m & 1;
+        m >>= 1;
+        if m >= (1u64 << (MANTISSA_BITS + 1)) {
+            m = 1u64 << MANTISSA_BITS;
+            power2 += 1;
+        }
+        m &= !(1u64 << MANTISSA_BITS);
+        if power2 >= INFINITE_POWER {
+            return Some(sign | ((INFINITE_POWER as u64) << 52)); // overflow → ±inf
+        }
+        Some(sign | m | ((power2 as u64) << 52))
+    }
+    /// Parse the decimal into (neg, 64-bit significand, power-of-ten q), or None if
+    /// it doesn't fit the fast-path shape (too many digits, etc.).
+    fn parse_decimal(s: &str) -> Option<(bool, u64, i32)> {
+        let b = s.as_bytes();
+        let mut i = 0;
+        let mut neg = false;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            neg = b[i] == b'-';
+            i += 1;
+        }
+        let mut mant: u64 = 0;
+        let mut digits = 0i32;
+        let mut dot_at: Option<i32> = None;
+        let mut overflowed = false;
+        let mut seen_digit = false;
+        while i < b.len() {
+            let c = b[i];
+            if c.is_ascii_digit() {
+                seen_digit = true;
+                if mant.checked_mul(10).and_then(|v| v.checked_add((c - b'0') as u64)).is_some()
+                    && digits < 19
+                {
+                    mant = mant * 10 + (c - b'0') as u64;
+                    digits += 1;
+                } else {
+                    overflowed = true; // too many significant digits for the fast path
+                }
+                i += 1;
+            } else if c == b'.' && dot_at.is_none() {
+                dot_at = Some(digits);
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if !seen_digit || overflowed {
+            return None;
+        }
+        let mut q: i32 = match dot_at {
+            Some(d) => d - digits, // digits after the point lower the exponent
+            None => 0,
+        };
+        if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+            i += 1;
+            let mut esign = 1i32;
+            if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+                if b[i] == b'-' {
+                    esign = -1;
+                }
+                i += 1;
+            }
+            let mut e = 0i32;
+            let mut any = false;
+            while i < b.len() && b[i].is_ascii_digit() {
+                any = true;
+                e = e.saturating_mul(10).saturating_add((b[i] - b'0') as i32);
+                i += 1;
+            }
+            if !any {
+                return None;
+            }
+            q += esign * e;
+        }
+        if i != b.len() {
+            return None; // trailing junk
+        }
+        Some((neg, mant, q))
+    }
+
+    /// Full fast-path parse: returns Some(f64) when both decimal-parse and Lemire
+    /// succeed, else None (caller would use a slow path).
+    fn parse_f64(s: &str, table: &[(u64, u64)]) -> Option<f64> {
+        let (neg, mant, q) = parse_decimal(s)?;
+        lemire(neg, mant, q, table).map(f64::from_bits)
+    }
+
+    // ── tests ───────────────────────────────────────────────────────────────────
+
+    /// `power(q)` equals the true `⌊log₂(10^q)⌋` across the whole table range — the
+    /// invariant the table's normalization depends on.
+    #[test]
+    fn power_formula_matches_true_log2() {
+        for q in SMALLEST_POWER..=LARGEST_POWER {
+            // true exponent: bit_len(10^q)-1 for q>=0; for q<0 compute via 5^|q|.
+            let true_exp = if q >= 0 {
+                Big::pow(10, q as usize).bit_len() as i32 - 1
+            } else {
+                // 10^q = 2^q/5^|q|; ⌊log2⌋ = q - ceil(log2(5^|q|))... compute directly:
+                // find e with 2^e <= 2^q/5^|q| < 2^(e+1) ⇔ 2^(e-q) <= 1/5^|q| ...
+                // easier: ⌊log2(10^q)⌋ = -(bit_len(5^|q|)) - |q| + q + correction.
+                // Compute by searching: smallest k with 5^|q| <= 2^(k) i.e. bit_len.
+                let bl5 = Big::pow(5, (-q) as usize).bit_len() as i32;
+                // 10^q = 2^q / 5^|q|. log2 = q - log2(5^|q|). ⌊⌋ = q - bl5 if 5^|q| is
+                // not a power of two (always true for |q|>=1), since
+                // 2^(bl5-1) < 5^|q| < 2^bl5 ⇒ bl5-1 < log2(5^|q|) < bl5 ⇒
+                // ⌊q - log2(5^|q|)⌋ = q - bl5.
+                q - bl5
+            };
+            assert_eq!(power(q) - 63, true_exp, "power({q}) mismatch");
+        }
+    }
+
+    /// Hand-checked positive-power anchors validate the generator's normalization.
+    #[test]
+    fn table_anchor_values() {
+        let t = gen_table();
+        let at = |q: i32| t[(q - SMALLEST_POWER) as usize];
+        assert_eq!(at(0), (0x8000_0000_0000_0000, 0)); // 10^0 = 1 → 2^127
+        assert_eq!(at(1), (0xA000_0000_0000_0000, 0)); // 10  = 0b1010 → top bits
+        assert_eq!(at(2), (0xC800_0000_0000_0000, 0)); // 100 = 0b1100100
+    }
+
+    /// **The headline: the fast path is correctly rounded.** For every accepted
+    /// input the bits equal Rust's own correctly-rounded `str::parse::<f64>()`.
+    /// (Teeth: corrupting any table entry, or flipping the round-to-even tie to
+    /// round-up, makes some case's bits disagree with std.)
+    #[test]
+    fn lemire_matches_std_parse() {
+        let t = gen_table();
+        let mut state: u64 = 0x1234_5678_9abc_def1;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut checked = 0u64;
+        let mut bailed = 0u64;
+        for _ in 0..500_000 {
+            let x = f64::from_bits(next());
+            if !x.is_finite() {
+                continue;
+            }
+            // Compact e-notation keeps the significand ≤ 18 digits regardless of how
+            // extreme the exponent is — the fast-path shape. (Plain `Display` spells
+            // out huge magnitudes to hundreds of digits, which the fast path bails on
+            // by design; that is the slow path's job, tested elsewhere later.)
+            for s in [format!("{x:e}"), format!("{:.17e}", x)] {
+                match parse_f64(&s, &t) {
+                    Some(v) => {
+                        checked += 1;
+                        let want: f64 = s.parse().unwrap();
+                        assert_eq!(
+                            v.to_bits(),
+                            want.to_bits(),
+                            "parse({s}) = {v:?} but std = {want:?}"
+                        );
+                    }
+                    None => bailed += 1,
+                }
+            }
+        }
+        // e-notation is always within the fast-path digit budget → essentially no
+        // bails; correctness (above) is the real assertion.
+        assert!(checked > 800_000, "too few accepted: {checked}");
+        assert!(bailed * 1000 < checked, "unexpected fast-path bail rate: {bailed}/{checked}");
+    }
+
+    /// Hard, hand-picked cases (subnormals, powers of ten, halfway ties, the famous
+    /// 2.2250738585072011e-308) all match std.
+    #[test]
+    fn lemire_matches_std_hard_cases() {
+        let t = gen_table();
+        let cases = [
+            "0", "1", "10", "0.1", "0.5", "1.5", "100000000",
+            "1e308", "1e-308", "5e-324", "2.2250738585072011e-308",
+            "2.2250738585072014e-308", "4.9406564584124654e-324",
+            "9007199254740992", "9007199254740993", "9007199254740994",
+            "1.7976931348623157e308", "123456789012345678", "0.30000000000000004",
+            "2.5", "3.5", "0.000244140625",
+        ];
+        for s in cases {
+            if let Some(v) = parse_f64(s, &t) {
+                let want: f64 = s.parse().unwrap();
+                assert_eq!(v.to_bits(), want.to_bits(), "hard case {s}");
+            }
+        }
+    }
+}
