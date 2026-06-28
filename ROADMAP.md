@@ -239,14 +239,26 @@ compiler can't run without are now built (each with a demo + gcc-oracle test):
 - **A symbol-table map** ✅ — `std/strmap.jtr`, an open-addressing `str -> i64` table
   (FNV-1a + SplitMix64, owned keys, RAII), the deliberate cache-friendly/deterministic
   alternative to a chaining hashmap. Every pass past the lexer needs one.
+- **A string interner** ✅ — `std/intern.jtr`, str→dense id + id→str (inline
+  open-addressing, single-copy, RAII). Makes downstream tables integer-keyed (rustc's
+  `Symbol`). Inline rather than nesting a `StrMap` because Jestyr does **not** auto-drop
+  struct fields (verified) — a nested Drop-having field would leak.
 
-**Recommended first step (now unblocked):** the *vertical slice* — port the **lexer**
-to Jestyr (`fs.read_text` the source, lex to a token stream); it's small, self-contained,
-and will surface the remaining gaps (likely `Self {}` literals and per-module
-namespaces, K). **Still open before a comfortable full port:** per-module namespaces +
-a basic `build.jestyr` (K), and the ~27K-line port itself. **Follow-ups on the
-plumbing:** a recoverable `read_file -> String !IoError`; a generic-value `StrMap(V)` /
-string interner (str→dense-id) so downstream tables go integer-keyed.
+**Vertical slice — ✅ DONE:** `examples/std/lexer.jtr` — a lexer for a Jestyr subset,
+*written in Jestyr*, composing `fs` (read source) + `env` (argv) + `intern` (keyword/id
+classification). Lexes a built-in sample deterministically and a real file from disk
+(gcc-oracle tested). This is the front-end-in-Jestyr proof.
+
+**Surfaced by the slice (real, now-known gaps):** Jestyr doesn't auto-drop **struct
+fields** (so containers-of-containers must free explicitly); `unsafe {}` isn't a valid
+`let` initializer (use a tail-`unsafe` reader helper); and **per-module namespaces** (K)
+bite as soon as two std modules share a helper name (`make`, `destroy`) — top-level
+names are globally unique today.
+
+**Still open before a full self-host:** extend the lexer to the *full* token set
+(floats/hex, block comments, strings, all operators) → port the parser → typeck →
+escape → cgen (~27K lines); plus per-module namespaces + a basic `build.jestyr` (K) for
+comfort. **Plumbing follow-up:** a recoverable `read_file -> String !IoError`.
 
 ---
 
