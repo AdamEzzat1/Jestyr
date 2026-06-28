@@ -3475,6 +3475,12 @@ mod c_oracle {
             ["1", "1", "13", "hello,", "jestyr", "1", "0", "0"]
         );
     }
+    #[test]
+    fn args_demo() {
+        // The oracle runs the exe with no extra args (argc = 1, just the program
+        // path): count=1, argv[0] non-empty, out-of-range empty, no user args → sum 0.
+        assert_eq!(toks("examples/std/args.jtr"), ["1", "1", "0", "0"]);
+    }
 
     /// The PURE canary demo: exercises the whole numeric stack but prints ONLY
     /// integers and `format_float` strings — never `print_f64`/`printf("%g")`. Its

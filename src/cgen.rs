@@ -532,6 +532,16 @@ impl<'a> Cgen<'a> {
         self.raw("static bool jestyr_rt_write_file(JestyrStr path, JestyrStr data) { char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, \"wb\"); free(cp); if (!f) return false; size_t put = data.len ? fwrite(data.ptr, 1, data.len, f) : 0; int rc = fclose(f); return rc == 0 && put == data.len; }\n");
         self.raw("static bool jestyr_rt_file_exists(JestyrStr path) { char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, \"rb\"); free(cp); if (f) { fclose(f); return true; } return false; }\n");
         self.raw("static bool jestyr_rt_remove_file(JestyrStr path) { char* cp = jestyr_rt_cpath(path); int rc = remove(cp); free(cp); return rc == 0; }\n\n");
+        self.raw("/* Command-line arguments (self-hosting plumbing): argv is captured in main()\n");
+        self.raw("   into file-scope globals, exposed to Jestyr as arg_count() -> i32 and\n");
+        self.raw("   arg(i) -> str (a zero-copy view into argv[i]; out-of-range yields empty).\n");
+        self.raw("   arg(0) is the program path. argv strings are NUL-terminated, OS-owned. */\n");
+        self.raw("static int jestyr_rt_argc = 0;\n");
+        self.raw("static char** jestyr_rt_argv = NULL;\n");
+        self.raw("static int64_t jestyr_rt_arg_count(void) { return (int64_t)jestyr_rt_argc; }\n");
+        // Length by manual scan, not strlen — the generated C keeps its zero-strlen
+        // invariant (str is length-carrying; strlen was deliberately retired).
+        self.raw("static JestyrStr jestyr_rt_arg(int64_t i) { if (i < 0 || i >= (int64_t)jestyr_rt_argc) return (JestyrStr){ \"\", 0 }; const char* a = jestyr_rt_argv[i]; size_t n = 0; while (a[n]) n++; return (JestyrStr){ a, n }; }\n\n");
         if self.uses_arena() {
             self.raw("/* Jestyr bump arena — backs region refs (`&[r]T`) and the std arena allocator. */\n");
             self.raw("typedef struct { char* buf; size_t off; size_t cap; } JestyrArena;\n");
@@ -1994,8 +2004,11 @@ impl<'a> Cgen<'a> {
             }
         }
         match main_has_ret {
-            Some(true) => self.raw("int main(void) { return (int) jestyr_main(); }\n"),
-            Some(false) => self.raw("int main(void) { jestyr_main(); return 0; }\n"),
+            // main() captures argc/argv into the globals that back arg()/arg_count(),
+            // so a Jestyr program can read its command line (the assignment also means
+            // the params are "used" — no unused-parameter noise).
+            Some(true) => self.raw("int main(int argc, char** argv) { jestyr_rt_argc = argc; jestyr_rt_argv = argv; return (int) jestyr_main(); }\n"),
+            Some(false) => self.raw("int main(int argc, char** argv) { jestyr_rt_argc = argc; jestyr_rt_argv = argv; jestyr_main(); return 0; }\n"),
             None => {}
         }
     }
@@ -3880,6 +3893,13 @@ impl<'a> Cgen<'a> {
                 "remove_file" => {
                     let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
                     return format!("jestyr_rt_remove_file({p})");
+                }
+                // Command-line args. `arg_count()` is argc; `arg(i)` is a `str` view of
+                // argv[i] (arg(0) = program path, out-of-range = empty).
+                "arg_count" => return "jestyr_rt_arg_count()".to_string(),
+                "arg" => {
+                    let i = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".to_string());
+                    return format!("jestyr_rt_arg((int64_t)({i}))");
                 }
                 // --- Concurrency (workstream N) ---
                 // Atomics: sequentially-consistent ops on an `int64_t` cell, via GCC
@@ -7110,6 +7130,7 @@ fn is_intrinsic(name: &str) -> bool {
             | "gen_new" | "gen_free" | "region_alloc" | "ok" | "err" | "is_err" | "unwrap"
             | "arena_open" | "arena_alloc" | "arena_close"
             | "read_file" | "write_file" | "file_exists" | "remove_file"
+            | "arg_count" | "arg"
     )
 }
 
@@ -7465,7 +7486,7 @@ mod tests {
         let (c, d) = gen("fn main() -> i32 { print_int(42) return 0 }");
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("jestyr_rt_print_int(42)"), "{c}");
-        assert!(c.contains("int main(void) { return (int) jestyr_main(); }"), "{c}");
+        assert!(c.contains("int main(int argc, char** argv) { jestyr_rt_argc = argc; jestyr_rt_argv = argv; return (int) jestyr_main(); }"), "{c}");
     }
 
     #[test]
@@ -8380,6 +8401,17 @@ mod tests {
         assert!(c.contains("jestyr_rt_write_file("), "write call lowered: {c}");
         assert!(c.contains("jestyr_rt_file_exists("), "exists call lowered: {c}");
         assert!(c.contains("jestyr_rt_remove_file("), "remove call lowered: {c}");
+    }
+
+    #[test]
+    fn command_line_args_lower_to_runtime_accessors() {
+        // arg_count() -> i32 and arg(i) -> str (a bounds-checked view of argv[i]).
+        let src = "fn f() -> i32 { var n: i32 = arg_count() let p: str = arg(0) return n + (p.len as i32) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("static int jestyr_rt_argc = 0;"), "argc global declared in the prelude: {c}");
+        assert!(c.contains("jestyr_rt_arg_count()"), "arg_count lowers to the runtime accessor: {c}");
+        assert!(c.contains("jestyr_rt_arg((int64_t)(0))"), "arg(i) lowers to the bounds-checked view: {c}");
     }
 
     #[test]

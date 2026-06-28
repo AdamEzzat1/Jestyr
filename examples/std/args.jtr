@@ -1,0 +1,33 @@
+// examples/std/args.jtr — command-line arguments (self-hosting plumbing). A
+// self-hosted compiler reads `argv` to learn which `.jtr` file to compile; this is
+// the primitive. Output is kept deterministic (it never prints argv[0]'s value, which
+// is the non-reproducible executable path). The four printed values are
+// argc, argv[0]-is-non-empty, argv[99]-length (out of range), and the summed length of
+// the user args (everything after argv[0]):
+//
+//   <exe>                        →  1  1  0  0    (just the program path; no user args)
+//   <exe> main.jtr -o out.c      →  4  1  0  15   (argc=4; |main.jtr|+|-o|+|out.c| = 8+2+5)
+//
+// Note: `jestyrc run` does not forward extra args to the built exe, so via `run` argc
+// is always 1 — invoke the built executable directly to pass arguments through.
+import "env"
+
+fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
+
+fn main() -> i32 {
+    print_int(env.argc())                       // arg count (≥ 1: the program path)
+    print_int(b2i(env.argv(0).len > 0))         // 1  — argv[0] (program path) is non-empty
+    print_int(env.argv(99).len as i32)          // 0  — an out-of-range index is empty
+
+    // The real use: iterate the user-supplied args (everything after argv[0]) and act
+    // on each. Here we just sum their lengths to prove the loop works deterministically
+    // regardless of what (if anything) was passed.
+    var total: i32 = 0
+    var i: i32 = 1
+    for i < env.argc() {
+        total = total + (env.argv(i).len as i32)
+        i = i + 1
+    }
+    print_int(total)                            // sum of arg lengths (0 when none passed)
+    return 0
+}

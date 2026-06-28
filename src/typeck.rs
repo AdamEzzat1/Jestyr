@@ -2767,6 +2767,8 @@ fn io_intrinsic_ret(name: &str) -> Option<Ty> {
     Some(match name {
         "read_file" => Ty::Prim("String"),
         "write_file" | "file_exists" | "remove_file" => Ty::Prim("bool"),
+        "arg_count" => Ty::Prim("i32"),
+        "arg" => Ty::Prim("str"),
         _ => return None,
     })
 }
