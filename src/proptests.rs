@@ -3466,6 +3466,15 @@ mod c_oracle {
     fn par_reduce_demo() {
         assert_eq!(toks("examples/std/par_reduce.jtr"), ["1", "1", "1"]);
     }
+    #[test]
+    fn files_demo() {
+        // End-to-end file I/O through the real gcc pipeline: write → exists → read
+        // back ("hello, jestyr" = 13 bytes) → remove → gone → missing reads empty.
+        assert_eq!(
+            toks("examples/std/files.jtr"),
+            ["1", "1", "13", "hello,", "jestyr", "1", "0", "0"]
+        );
+    }
 
     /// The PURE canary demo: exercises the whole numeric stack but prints ONLY
     /// integers and `format_float` strings — never `print_f64`/`printf("%g")`. Its

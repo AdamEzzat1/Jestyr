@@ -523,6 +523,15 @@ impl<'a> Cgen<'a> {
         self.raw("static void jestyr_rt_print_float(double x) { printf(\"%g\\n\", x); }\n");
         self.raw("static void jestyr_rt_print_str(JestyrStr s) { printf(\"%.*s\\n\", (int) s.len, s.ptr); }\n");
         self.raw("static void jestyr_rt_print_bool(bool b) { printf(\"%s\\n\", b ? \"true\" : \"false\"); }\n\n");
+        self.raw("/* Jestyr file I/O (self-hosting plumbing): whole-file read/write. A `str` path\n");
+        self.raw("   is a {ptr,len} view (not NUL-terminated), so each call copies it into a\n");
+        self.raw("   NUL-terminated temporary for libc. Binary mode + whole-file-at-once = no\n");
+        self.raw("   buffering or newline-translation surprises (deterministic across platforms). */\n");
+        self.raw("static char* jestyr_rt_cpath(JestyrStr p) { char* c = (char*)malloc(p.len + 1); memcpy(c, p.ptr, p.len); c[p.len] = '\\0'; return c; }\n");
+        self.raw("static JestyrString jestyr_rt_read_file(JestyrStr path) { char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, \"rb\"); free(cp); JestyrString s = jestyr_rt_str_new(); if (!f) return s; if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return s; } long sz = ftell(f); if (sz < 0) { fclose(f); return s; } rewind(f); size_t cap = (size_t)sz ? (size_t)sz : 1; s.ptr = (char*)malloc(cap); s.cap = cap; s.len = fread(s.ptr, 1, (size_t)sz, f); fclose(f); return s; }\n");
+        self.raw("static bool jestyr_rt_write_file(JestyrStr path, JestyrStr data) { char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, \"wb\"); free(cp); if (!f) return false; size_t put = data.len ? fwrite(data.ptr, 1, data.len, f) : 0; int rc = fclose(f); return rc == 0 && put == data.len; }\n");
+        self.raw("static bool jestyr_rt_file_exists(JestyrStr path) { char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, \"rb\"); free(cp); if (f) { fclose(f); return true; } return false; }\n");
+        self.raw("static bool jestyr_rt_remove_file(JestyrStr path) { char* cp = jestyr_rt_cpath(path); int rc = remove(cp); free(cp); return rc == 0; }\n\n");
         if self.uses_arena() {
             self.raw("/* Jestyr bump arena — backs region refs (`&[r]T`) and the std arena allocator. */\n");
             self.raw("typedef struct { char* buf; size_t off; size_t cap; } JestyrArena;\n");
@@ -3851,6 +3860,27 @@ impl<'a> Cgen<'a> {
                     let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "NULL".to_string());
                     return format!("free({p})");
                 }
+                // File I/O (self-hosting plumbing). `read_file` yields an owned `String`
+                // of the whole file (empty if it can't be opened — the recoverable
+                // `try_read_file -> String !IoError` form is a follow-up, mirroring
+                // `from_utf8`/`try_from_utf8`). `write_file`/`file_exists` yield `bool`.
+                "read_file" => {
+                    let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    return format!("jestyr_rt_read_file({p})");
+                }
+                "write_file" => {
+                    let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    let d = args.get(1).map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    return format!("jestyr_rt_write_file({p}, {d})");
+                }
+                "file_exists" => {
+                    let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    return format!("jestyr_rt_file_exists({p})");
+                }
+                "remove_file" => {
+                    let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    return format!("jestyr_rt_remove_file({p})");
+                }
                 // --- Concurrency (workstream N) ---
                 // Atomics: sequentially-consistent ops on an `int64_t` cell, via GCC
                 // `__atomic_*` builtins (no `<stdatomic.h>`, no special type). A
@@ -7079,6 +7109,7 @@ fn is_intrinsic(name: &str) -> bool {
             | "region_str" | "region_concat" | "bytes"
             | "gen_new" | "gen_free" | "region_alloc" | "ok" | "err" | "is_err" | "unwrap"
             | "arena_open" | "arena_alloc" | "arena_close"
+            | "read_file" | "write_file" | "file_exists" | "remove_file"
     )
 }
 
@@ -8331,6 +8362,24 @@ mod tests {
         assert!(c.contains("JestyrResult_str j_r"), "result-typed binding (no annotation): {c}");
         assert!(c.contains("(JestyrResult_str){ .is_err = false"), "ok construction: {c}");
         assert!(c.contains(".ok).len"), "unwrap(r).len projects the str length: {c}");
+    }
+
+    #[test]
+    fn file_io_intrinsics_lower_to_runtime_calls() {
+        // Exercises all four file-I/O intrinsics: read_file -> owned String,
+        // write_file/file_exists/remove_file -> bool. No `and`/unused bindings (so
+        // the program is diagnostic-clean) — each bool is consumed by an `if`.
+        let src = "fn f() -> i32 { var s: String = read_file(\"p\") var n: i32 = s.len as i32 string_free(s) if write_file(\"p\", \"data\") { n = n + 1 } if file_exists(\"p\") { n = n + 1 } if remove_file(\"p\") { n = n + 1 } return n }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        // The runtime functions are defined in the prelude...
+        assert!(c.contains("jestyr_rt_read_file(JestyrStr path)"), "read_file runtime defined: {c}");
+        assert!(c.contains("jestyr_rt_write_file(JestyrStr path, JestyrStr data)"), "write_file runtime defined: {c}");
+        // ...and each call site lowers to them; read_file yields an owned String.
+        assert!(c.contains("JestyrString j_s = jestyr_rt_read_file("), "read_file binds an owned String: {c}");
+        assert!(c.contains("jestyr_rt_write_file("), "write call lowered: {c}");
+        assert!(c.contains("jestyr_rt_file_exists("), "exists call lowered: {c}");
+        assert!(c.contains("jestyr_rt_remove_file("), "remove call lowered: {c}");
     }
 
     #[test]

@@ -1,0 +1,31 @@
+// examples/std/files.jtr — file I/O (self-hosting plumbing). Write a file, confirm it
+// exists, read it back, verify the round-trip, then clean up — the exact OS-facing
+// loop a self-hosted compiler runs to load `.jtr` source and emit output.
+//
+//   jestyrc run examples/std/files.jtr
+//   →  1  1  13   then   hello, jestyr   then   1  0  0
+import "fs"
+
+fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
+
+fn main() -> i32 {
+    let path: str = "jestyr_files_demo.tmp"
+
+    // Write, then confirm the file now exists.
+    print_int(b2i(fs.write(path, "hello, jestyr")))   // 1  (write succeeded)
+    print_int(b2i(fs.exists(path)))                    // 1  (now present)
+
+    // Read it back and verify the round-trip, byte-for-byte.
+    var s: String = fs.read_text(path)
+    print_int(s.len as i32)                            // 13 (length of "hello, jestyr")
+    print_str(string_view(s))                          // hello, jestyr
+    string_free(s)
+
+    // Clean up; the file is then gone, and a missing file reads back empty.
+    print_int(b2i(fs.remove(path)))                    // 1  (removed)
+    print_int(b2i(fs.exists(path)))                    // 0  (gone)
+    var miss: String = fs.read_text("jestyr_no_such_file.tmp")
+    print_int(miss.len as i32)                         // 0  (missing → empty)
+    string_free(miss)
+    return 0
+}

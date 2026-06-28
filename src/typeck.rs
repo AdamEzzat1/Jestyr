@@ -1583,6 +1583,10 @@ impl<'a> TypeChecker<'a> {
                         // String intrinsics aren't declared functions; type their
                         // results so a `let` (without an annotation) gets the right C type.
                         t
+                    } else if let Some(t) = io_intrinsic_ret(&name) {
+                        // File-I/O intrinsics, same deal: `read_file -> String`,
+                        // `write_file`/`file_exists -> bool`.
+                        t
                     } else {
                         Ty::Unknown
                     }
@@ -2750,6 +2754,19 @@ fn string_intrinsic_ret(name: &str) -> Option<Ty> {
         "is_utf8" | "str_eq" | "eq_fold" | "starts_with" | "ends_with" | "contains" => {
             Ty::Prim("bool")
         }
+        _ => return None,
+    })
+}
+
+/// The return type of a file-I/O intrinsic (not a declared function), so a `let`
+/// bound to one gets the right C type without an annotation. `read_file` yields an
+/// owned `String` (empty if the file can't be opened — the recoverable
+/// `String !IoError` form is a future refinement, like `try_from_utf8`);
+/// `write_file`/`file_exists` report success as a `bool`.
+fn io_intrinsic_ret(name: &str) -> Option<Ty> {
+    Some(match name {
+        "read_file" => Ty::Prim("String"),
+        "write_file" | "file_exists" | "remove_file" => Ty::Prim("bool"),
         _ => return None,
     })
 }

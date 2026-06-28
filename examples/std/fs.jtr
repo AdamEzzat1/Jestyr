@@ -1,0 +1,28 @@
+// std/fs.jtr — the `std` filesystem tier: thin, named wrappers over the runtime's
+// file-I/O intrinsics, so user code says `fs.read("path")` instead of reaching for a
+// bare compiler builtin. (When `extern "c"` retires the intrinsics, only this module
+// changes — design §14.) This is the OS-facing primitive a self-hosted compiler needs
+// to load `.jtr` source and emit its output.
+
+// Read the whole file at `path` into a fresh owned `String`. On failure (missing /
+// unreadable) the String is empty — the caller can pre-check with `fs.exists`, and a
+// recoverable `String !IoError` form is a future refinement (cf. `try_from_utf8`).
+// The caller owns the result and must `string_free` it.
+pub fn read_text(path: str) -> String {
+    return read_file(path)
+}
+
+// Write `data` to `path` (created/truncated, binary mode). Returns true on success.
+pub fn write(path: str, data: str) -> bool {
+    return write_file(path, data)
+}
+
+// True iff `path` can be opened for reading.
+pub fn exists(path: str) -> bool {
+    return file_exists(path)
+}
+
+// Delete `path`. Returns true on success.
+pub fn remove(path: str) -> bool {
+    return remove_file(path)
+}
