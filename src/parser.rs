@@ -804,6 +804,28 @@ impl<'src> Parser<'src> {
             TokenKind::Ident => {
                 let t = self.bump();
                 let id = self.ident(t);
+                // Module-qualified type path: `mod.Type` or `mod.Type(args)` — the
+                // head ident is the import binding, the segment after `.` the type.
+                if self.at(Dot) {
+                    self.bump();
+                    let name = self.eat_ident("type name");
+                    let args = if self.at(LParen) {
+                        self.bump();
+                        let mut args = Vec::new();
+                        while !self.at(RParen) && !self.at(Eof) {
+                            args.push(self.parse_type());
+                            if !self.eat(Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(RParen, "`)`");
+                        args
+                    } else {
+                        Vec::new()
+                    };
+                    let span = t.span.to(self.prev_span());
+                    return self.ast.ty(TypeKind::Path { module: id, name, args }, span);
+                }
                 // type application: `List(i32)`
                 if self.at(LParen) {
                     self.bump();

@@ -448,6 +448,14 @@ impl<'a> Printer<'a> {
                 format!("fn({}){}", ps.join(", "), tail)
             }
             TypeKind::Dyn(n) => format!("dyn {}", n.name),
+            TypeKind::Path { module, name, args } => {
+                if args.is_empty() {
+                    format!("{}.{}", module.name, name.name)
+                } else {
+                    let a: Vec<String> = args.iter().map(|t| self.type_str(*t)).collect();
+                    format!("{}.{}({})", module.name, name.name, a.join(", "))
+                }
+            }
             TypeKind::Error => "<error-type>".to_string(),
         }
     }

@@ -913,6 +913,28 @@ impl<'a> Cgen<'a> {
                 Ty::Fn { params: ps, ret: Box::new(r), ret_conv: *ret_conv }
             }
             TypeKind::Dyn(n) => Ty::Opaque(format!("dyn {}", n.name)),
+            // A module-qualified type resolves by name (types are globally unique);
+            // mirrors `Name`/`App`.
+            TypeKind::Path { name, args, .. } => {
+                if args.is_empty() {
+                    if let Some(t) = subst.get(&name.name) {
+                        t.clone()
+                    } else if let Some(p) = prim_ty(&name.name) {
+                        Ty::Prim(p)
+                    } else if let Some(&i) = self.info.table.type_index.get(&name.name) {
+                        Ty::Named(i)
+                    } else {
+                        Ty::Opaque(name.name.clone())
+                    }
+                } else {
+                    let aty: Vec<Ty> = args.iter().map(|a| self.ast_type_to_ty(*a, subst)).collect();
+                    if self.enum_is_generic(&name.name) {
+                        Ty::GenEnum { ctor: name.name.clone(), args: aty }
+                    } else {
+                        Ty::GenStruct { ctor: name.name.clone(), args: aty }
+                    }
+                }
+            }
             TypeKind::TypeKw => Ty::TypeKw,
             TypeKind::Error => Ty::Error,
         }
@@ -6463,6 +6485,13 @@ impl<'a> Cgen<'a> {
             }
             // `dyn Trait` is the `{ data, vtable }` fat pointer typedef (Stage F).
             TypeKind::Dyn(n) => format!("JestyrDyn_{}", n.name),
+            // A module-qualified type lowers through its resolved `Ty` (handles the
+            // plain and generic cases uniformly; types are globally unique today).
+            TypeKind::Path { .. } => {
+                let subst = self.subst.clone();
+                let ty = self.ast_type_to_ty(id, &subst);
+                self.c_type(&ty)
+            }
             TypeKind::Error => "int".to_string(),
         }
     }

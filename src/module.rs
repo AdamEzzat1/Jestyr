@@ -772,4 +772,90 @@ mod tests {
         assert!(c.contains("jestyr_solo(void)"), "a non-colliding name stays bare:\n{c}");
         assert!(!c.contains("jestyr_solo__m"), "and is never module-disambiguated:\n{c}");
     }
+
+    // --- qualified type paths `mod.Type` (modules-v2, increment 2) ---
+
+    /// A module-qualified type `lib.Point` resolves in a signature position and
+    /// lowers to the right C type — the type-position twin of a qualified call.
+    #[test]
+    fn qualified_type_path_resolves_across_modules() {
+        let dir = fixture(
+            "qualtype",
+            &[
+                (
+                    "main.jtr",
+                    "import \"lib\"\nfn get_x(p: lib.Point) -> i32 { return p.x }\nfn main() -> i32 { return get_x(lib.origin()) }",
+                ),
+                (
+                    "lib.jtr",
+                    "pub struct Point { pub x: i32, pub y: i32 }\npub fn origin() -> Point { return Point { x: 7, y: 0 } }",
+                ),
+            ],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(diags.is_empty(), "`lib.Point` resolves cleanly: {:?}", diags);
+        let (c, cd) = crate::cgen::emit(&prog.ast, &info);
+        assert!(cd.is_empty(), "cgen diags: {:?}", cd);
+        assert!(
+            c.contains("jestyr_get_x(Jestyr_Point"),
+            "the `lib.Point` parameter lowers to its C struct type:\n{c}"
+        );
+    }
+
+    /// `mod.Type` referencing a *private* type is a visibility error (the type
+    /// must be `pub` in the target module).
+    #[test]
+    fn qualified_type_path_to_a_private_type_is_an_error() {
+        let dir = fixture(
+            "qualtype_priv",
+            &[
+                ("main.jtr", "import \"lib\"\nfn f(s: lib.Secret) -> i32 { return 0 }\nfn main() -> i32 { return 0 }"),
+                ("lib.jtr", "struct Secret { v: i32 }\npub fn ok() -> i32 { return 0 }"),
+            ],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        let (_info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(
+            diags.iter().any(|d| d.message.contains("`Secret` is private to module `lib`")),
+            "a private qualified type must error: {:?}",
+            diags
+        );
+    }
+
+    /// `mod.Type` naming a type the target module does not export is an error.
+    #[test]
+    fn qualified_type_path_to_an_unknown_type_is_an_error() {
+        let dir = fixture(
+            "qualtype_unknown",
+            &[
+                ("main.jtr", "import \"lib\"\nfn f(s: lib.Nope) -> i32 { return 0 }\nfn main() -> i32 { return 0 }"),
+                ("lib.jtr", "pub fn ok() -> i32 { return 0 }"),
+            ],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        let (_info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(
+            diags.iter().any(|d| d.message.contains("module `lib` has no public type `Nope`")),
+            "an unknown qualified type must error: {:?}",
+            diags
+        );
+    }
+
+    /// `mod.Type` whose head is not an imported module is an error.
+    #[test]
+    fn qualified_type_path_with_unbound_module_is_an_error() {
+        let dir = fixture(
+            "qualtype_unbound",
+            &[("main.jtr", "fn f(s: nope.Point) -> i32 { return 0 }\nfn main() -> i32 { return 0 }")],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        let (_info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(
+            diags.iter().any(|d| d.message.contains("`nope` is not an imported module")),
+            "an unbound module qualifier must error: {:?}",
+            diags
+        );
+    }
 }

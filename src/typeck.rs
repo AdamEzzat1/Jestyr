@@ -65,6 +65,7 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
         diags: Vec::new(),
     };
     tc.build_table();
+    tc.audit_type_paths();
     tc.check_items();
     (
         TypeInfo {
@@ -961,6 +962,29 @@ impl<'a> TypeChecker<'a> {
                     Ty::GenStruct { ctor: ctor.name.clone(), args: aty }
                 }
             }
+            // `mod.Type` / `mod.Type(args)`: a module-qualified type. Types are
+            // globally unique today, so the *type* resolves by name exactly like
+            // `Name`/`App`; the module qualifier is validated for visibility by
+            // `audit_type_paths` (full type namespacing — same-name types across
+            // modules — is a deferred follow-up).
+            TypeKind::Path { name, args, .. } => {
+                if args.is_empty() {
+                    if let Some(p) = prim_ty(&name.name) {
+                        Ty::Prim(p)
+                    } else if let Some(&i) = self.table.type_index.get(&name.name) {
+                        Ty::Named(i)
+                    } else {
+                        Ty::Opaque(name.name.clone())
+                    }
+                } else {
+                    let aty: Vec<Ty> = args.iter().map(|a| self.lower_type(ty_params, *a)).collect();
+                    if self.is_generic_enum(&name.name) {
+                        Ty::GenEnum { ctor: name.name.clone(), args: aty }
+                    } else {
+                        Ty::GenStruct { ctor: name.name.clone(), args: aty }
+                    }
+                }
+            }
             TypeKind::Error => Ty::Error,
         }
     }
@@ -1289,6 +1313,139 @@ impl<'a> TypeChecker<'a> {
                 self.error(span, format!("module `{binding}` has no public item `{name}`"));
                 self.set(id, Ty::Unknown)
             }
+        }
+    }
+
+    // --- qualified type paths (`mod.Type`) — visibility audit ---
+
+    /// Validate every `mod.Type` path in the program: the head must be an import
+    /// binding of the referencing module, and the type must be `pub` in (and owned
+    /// by) the target module — the type-position twin of `resolve_qualified_call`.
+    /// Resolution of the type itself happens in `lower_type`; this pass only
+    /// reports the visibility/ownership errors that `lower_type` (a `&self` method)
+    /// cannot. Run after the global table is built.
+    fn audit_type_paths(&mut self) {
+        let ast = self.ast;
+        for (i, item) in ast.items.iter().enumerate() {
+            self.cur_mod = *self.modules.item_mod.get(i).unwrap_or(&0);
+            match item {
+                Item::Fn(f) => self.audit_fn_sig(f),
+                Item::Struct { body, .. } => {
+                    for m in &body.members {
+                        match m {
+                            StructMember::Field { ty, .. } => self.audit_type_id(*ty),
+                            StructMember::Method(f) => self.audit_fn_sig(f),
+                        }
+                    }
+                }
+                Item::Const(c) => {
+                    if let Some(t) = c.ty {
+                        self.audit_type_id(t);
+                    }
+                }
+                Item::Distinct(d) => self.audit_type_id(d.base),
+                Item::Extern(e) => {
+                    for p in &e.params {
+                        if let Some(t) = p.ty {
+                            self.audit_type_id(t);
+                        }
+                    }
+                    if let Some(t) = e.ret_ty {
+                        self.audit_type_id(t);
+                    }
+                }
+                Item::Enum(en) => {
+                    for v in &en.variants {
+                        for (_, t) in &v.fields {
+                            self.audit_type_id(*t);
+                        }
+                    }
+                }
+                Item::Trait(tr) => {
+                    for m in &tr.methods {
+                        for p in &m.params {
+                            if let Some(t) = p.ty {
+                                self.audit_type_id(t);
+                            }
+                        }
+                        if let Some(t) = m.ret_ty {
+                            self.audit_type_id(t);
+                        }
+                    }
+                }
+                Item::Impl(im) => {
+                    self.audit_type_id(im.ty);
+                    for m in &im.methods {
+                        self.audit_fn_sig(m);
+                    }
+                }
+                Item::Import(_) => {}
+            }
+        }
+    }
+
+    fn audit_fn_sig(&mut self, f: &FnDecl) {
+        for p in &f.params {
+            if let Some(t) = p.ty {
+                self.audit_type_id(t);
+            }
+        }
+        if let Some(t) = f.ret_ty {
+            self.audit_type_id(t);
+        }
+    }
+
+    /// Recurse through a type, validating any `mod.Type` paths within. The node's
+    /// kind is cloned first so the recursive `&mut self` calls don't alias the
+    /// `&self.ast` borrow (the same pattern `lower_type` avoids by being `&self`).
+    fn audit_type_id(&mut self, id: TypeId) {
+        let kind = self.ast.type_at(id).kind.clone();
+        let span = self.ast.type_at(id).span;
+        match kind {
+            TypeKind::Ptr { inner, .. }
+            | TypeKind::Slice(inner)
+            | TypeKind::GenRef(inner)
+            | TypeKind::RegionRef { inner, .. } => self.audit_type_id(inner),
+            TypeKind::Array { elem, .. } => self.audit_type_id(elem),
+            TypeKind::App { args, .. } => {
+                for a in args {
+                    self.audit_type_id(a);
+                }
+            }
+            TypeKind::Fn { params, ret, .. } => {
+                for p in params {
+                    self.audit_type_id(p.ty);
+                }
+                if let Some(r) = ret {
+                    self.audit_type_id(r);
+                }
+            }
+            TypeKind::Path { module, name, args } => {
+                for a in &args {
+                    self.audit_type_id(*a);
+                }
+                self.audit_one_path(&module, &name, span);
+            }
+            TypeKind::Name(_) | TypeKind::TypeKw | TypeKind::Dyn(_) | TypeKind::Error => {}
+        }
+    }
+
+    /// Check one `module.name` type path: the head is an import binding, and the
+    /// target module exposes `name` as a `pub` item.
+    fn audit_one_path(&mut self, module: &Ident, name: &Ident, span: Span) {
+        let Some(target) = self.binding_module(&module.name) else {
+            self.error(span, format!("`{}` is not an imported module", module.name));
+            return;
+        };
+        match self.owner.get(&(target, name.name.clone())).copied() {
+            Some(true) => {} // a public item of the target module — fine
+            Some(false) => {
+                self.error(span, format!("type `{}` is private to module `{}`", name.name, module.name))
+            }
+            None => self.error(
+                span,
+                format!("module `{}` has no public type `{}`", module.name, name.name),
+            ),
         }
     }
 

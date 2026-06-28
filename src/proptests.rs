@@ -1552,6 +1552,29 @@ mod modules_props {
                 diags
             );
         }
+
+        /// **Qualified type paths (`mod.Type`) resolve + lower + are deterministic.**
+        /// `n` modules each export a distinct `pub struct T<k>`; the root references
+        /// each via `m<k>.T<k>` in a signature. Compiles cleanly, every type lowers
+        /// to its C struct, and the emitted C is reproducible.
+        #[test]
+        fn qualified_type_paths_resolve_and_lower(k in 2usize..=4) {
+            let mut files = Vec::new();
+            let mut imports = String::new();
+            let mut fns = String::new();
+            for j in 0..k {
+                files.push((format!("m{j}.jtr"), format!("pub struct T{j} {{ pub a: i32 }}")));
+                imports.push_str(&format!("import \"m{j}\"\n"));
+                fns.push_str(&format!("fn use{j}(p: m{j}.T{j}) -> i32 {{ return p.a }}\n"));
+            }
+            files.insert(0, ("main.jtr".to_string(), format!("{imports}{fns}fn main() -> i32 {{ return 0 }}")));
+            let (diags, c) = pipeline_multi(&files);
+            prop_assert!(diags.is_empty(), "qualified type paths compile cleanly: {:?}", diags);
+            for j in 0..k {
+                prop_assert!(c.contains(&format!("jestyr_use{j}(Jestyr_T{j}")), "T{j} lowered:\n{c}");
+            }
+            prop_assert_eq!(pipeline_multi(&files).1, c);
+        }
     }
 }
 

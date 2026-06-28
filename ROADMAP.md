@@ -94,7 +94,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | H | Function-pointer types | 0% | HIGH | M | ✓ | ✓ (vtables) |
 | I | Error-handling polish | ~70% | MED | S | ✓ | — |
 | J | Numeric / operator completeness | ~70% | MED | S–M | ✓ | ✓ (determinism) |
-| K | Module system v2 | ~70% | MED | M | ✓ | ✓✓ (build/incremental) |
+| K | Module system v2 | ~75% | MED | M | ✓ | ✓✓ (build/incremental) |
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
 | N | Concurrency polish | ~50% | MED | M | ✓ | — |
@@ -197,7 +197,7 @@ determinism** cares); float↔int cast edge cases; bit-width-aware literals; `as
 done; possibly operator methods. Determinism-relevant: no-FMA, compensated ops are a
 *Motley* concern but the numeric model starts here.
 
-### K. Module system v2 — ~70% (MED conflict; files: module.rs + typeck)
+### K. Module system v2 — ~75% (MED conflict; files: module.rs + typeck)
 **Done:** `import`, `pub` visibility, qualified access, cycle detection, multi-file
 merge; **per-module namespaces for functions + consts** (increment 1) — resolution
 is keyed on `(ModId, name)`, an unqualified name resolves current-module-first and
@@ -206,13 +206,20 @@ unresolved-name error), and colliding symbols are disambiguated in cgen via a
 canonical name (`make` → `jestyr_make__m<mod>`) that is a **no-op for any
 non-colliding program** (single- and multi-module C stays byte-identical — verified).
 Two modules may now each define `make`/`get`/`helper` (incl. a *generic* `make`
-alongside a *non-generic* one), which **clears the logged self-host blocker**
-(`intern` could not be imported beside `list`/`strmap`). **Left:** qualified *type*
-paths (`mod.Type`, increment 2); **directory-as-module**; **module content-hashing**
-(the unique feature — sha256 of each module's normalized form → provably-incremental
-builds, pairs with O's `attest`); then `build.jestyr`/manifest (deferred:
-lockfile/vendored-deps/effects — ecosystem-premature). **Motley:** the DAG already
-enables the parallel/incremental-compilation story; hashing makes it provable.
+alongside a *non-generic* one), which **cleared the logged self-host blocker**
+(`intern` could not be imported beside `list`/`strmap`). **Qualified type paths
+`mod.Type` / `mod.Type(args)`** (increment 2) — a new additive `TypeKind::Path`
+arm, parsed in type position and lowered like `Name`/`App`, with a visibility audit
+enforcing the type is `pub` in (and owned by) the target module (private / unknown /
+unbound-module qualifiers all error). **Left:** **directory-as-module**; **module
+content-hashing** (the unique feature — sha256 of each module's normalized form →
+provably-incremental builds, pairs with O's `attest`); then `build.jestyr`/manifest
+(deferred: lockfile/vendored-deps/effects — ecosystem-premature). **Also deferred:**
+full *type* namespacing (two modules defining the same type name) — types stay
+globally unique today, so `mod.Type` resolves a unique type + enforces visibility;
+same-name-type collisions are a mechanical follow-up on the increment-1 pattern.
+**Motley:** the DAG already enables the parallel/incremental-compilation story;
+hashing makes it provable.
 
 ### L. Memory-layout pass — 0% (MED conflict; files: a new analysis + cgen)
 **Design §16 / a Motley principle.** **Left:** a layout pass computing size/align,

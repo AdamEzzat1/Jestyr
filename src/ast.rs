@@ -116,6 +116,11 @@ pub enum TypeKind {
     GenRef(TypeId),                            // &T — a generational reference (§4.4)
     RegionRef { region: Ident, inner: TypeId }, // &[r]T — a zero-cost region reference (§4.4)
     App { ctor: Ident, args: Vec<TypeId> },    // List(i32) — applied generic struct
+    /// A module-qualified type path `mod.Type` (and `mod.Type(args)`) — the type
+    /// in an imported module, the type-position twin of a qualified call
+    /// `mod.func(…)` (modules-v2, increment 2). Additive: a plain `Name`/`App` is
+    /// produced unless a `.` follows the head identifier in type position.
+    Path { module: Ident, name: Ident, args: Vec<TypeId> },
     /// A *thin* function-pointer type `fn(T1, T2) -> R` — a capture-free,
     /// first-class value (one machine pointer), distinct from a fat capturing
     /// [`ExprKind::Closure`]. `ret` is `None` for a unit-returning pointer. The
