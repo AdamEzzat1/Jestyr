@@ -953,6 +953,253 @@ mod alloc_props {
     }
 }
 
+/// Tests for the `jestyrc test` runner polish (workstream O, increment 1): the
+/// `@test`/`@bench` discovery (`cgen::list_tests`), the codegen-time name filter
+/// (`cgen::emit_tests_filtered`), and their plumbing through the real pipeline.
+///
+/// The oracle is known *by construction*: a generator emits a program with a known
+/// set of `@test`/`@bench` names plus decoys (a plain helper, a generic `@test`),
+/// and the properties assert discovery and filtering match that set exactly —
+/// soundness (never name a non-runnable item) and completeness (never drop a
+/// runnable one). All pure-Rust (it inspects the emitted C string), so it runs
+/// under the toolchain-free default `cargo test`; an end-to-end gcc check lives in
+/// the `c_oracle` module behind `--features c-oracle`.
+mod test_runner {
+    use super::*;
+    use crate::cgen::{self, TestKind};
+
+    /// Type-check `src` and emit its `@test`/`@bench` harness narrowed by `filter`.
+    fn harness(src: &str, filter: Option<&str>) -> String {
+        let (ast, info) = typeck_full(src);
+        cgen::emit_tests_filtered(&ast, &info, filter).0
+    }
+
+    /// The `N` of the harness's `running N test(s)\n` banner — the count of tests
+    /// actually baked in. Panics if absent, so a harness that loses the banner
+    /// fails loudly rather than silently reporting zero.
+    fn baked_test_count(c: &str) -> usize {
+        let at = c.find("running ").expect("harness must print the running banner");
+        c[at + "running ".len()..]
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("running banner must carry a count")
+    }
+
+    /// `cgen::list_tests` over a parsed `src` (the data behind `--list`).
+    fn list(src: &str) -> Vec<(String, TestKind)> {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
+        cgen::list_tests(&ast)
+    }
+
+    // ── unit: discovery (`list_tests`) ────────────────────────────────────────
+
+    #[test]
+    fn list_tests_finds_tests_and_benches_in_source_order() {
+        let src = "@test fn a() -> bool { return true } \
+                   fn helper() -> i32 { return 0 } \
+                   @bench fn z() { } \
+                   @test fn m() -> bool { return true }";
+        assert_eq!(
+            list(src),
+            vec![
+                ("a".to_string(), TestKind::Test),
+                ("z".to_string(), TestKind::Bench),
+                ("m".to_string(), TestKind::Test),
+            ],
+            "discovery must list tests+benches in source order and skip plain fns"
+        );
+    }
+
+    #[test]
+    fn list_tests_skips_a_generic_test() {
+        // A `comptime T: type` test is a monomorphization template — never emitted
+        // directly, so the harness can't run it; `--list` must not name it either.
+        let src = "@test fn good() -> bool { return true } \
+                   @test fn gen(comptime T: type) -> bool { return true }";
+        assert_eq!(list(src), vec![("good".to_string(), TestKind::Test)]);
+    }
+
+    #[test]
+    fn list_tests_is_empty_without_attributes() {
+        assert!(list("fn main() -> i32 { return 0 }").is_empty());
+    }
+
+    // ── unit/golden: the codegen-time name filter ─────────────────────────────
+
+    const THREE: &str = "@test fn add_one() -> bool { return true } \
+                         @test fn add_two() -> bool { return true } \
+                         @test fn sub_one() -> bool { return true }";
+
+    #[test]
+    fn unfiltered_harness_bakes_every_test() {
+        let c = harness(THREE, None);
+        assert_eq!(baked_test_count(&c), 3);
+        assert!(c.contains("jestyr_add_one()") && c.contains("jestyr_sub_one()"));
+    }
+
+    #[test]
+    fn a_substring_filter_bakes_only_matching_tests() {
+        // `add` matches the two `add_*` tests; `sub_one` is excluded from both the
+        // count and the call sites — the codegen-time filter, not a runtime skip.
+        let c = harness(THREE, Some("add"));
+        assert_eq!(baked_test_count(&c), 2, "filtered count: {c}");
+        assert!(c.contains("jestyr_add_one()"), "kept add_one: {c}");
+        assert!(c.contains("jestyr_add_two()"), "kept add_two: {c}");
+        assert!(!c.contains("jestyr_sub_one()"), "sub_one must be filtered out: {c}");
+    }
+
+    #[test]
+    fn an_empty_match_bakes_a_zero_test_harness() {
+        let c = harness(THREE, Some("nomatch"));
+        assert_eq!(baked_test_count(&c), 0);
+        assert!(c.contains("result: %d passed; %d failed"), "still a well-formed harness: {c}");
+    }
+
+    #[test]
+    fn the_filter_also_narrows_benches() {
+        let src = "@test fn keep_t() -> bool { return true } \
+                   @bench fn keep_b() { } \
+                   @bench fn drop_b() { }";
+        let c = harness(src, Some("keep"));
+        assert!(c.contains("jestyr_keep_b()"), "kept bench: {c}");
+        assert!(!c.contains("jestyr_drop_b()"), "dropped bench must be filtered: {c}");
+    }
+
+    #[test]
+    fn unfiltered_equals_empty_filter_byte_for_byte() {
+        // The whole point of codegen-time (not argv-time) filtering: `None` is the
+        // ordinary harness, so `jestyrc test <file>` is unchanged.
+        assert_eq!(harness(THREE, None), harness(THREE, Some("")));
+    }
+
+    // ── wiring: plumbed through the real loader, on the shipped demo ───────────
+
+    #[test]
+    fn filter_is_plumbed_through_the_pipeline_on_the_demo() {
+        // Drive the same `module::load → typeck → escape` path `jestyrc test` uses,
+        // then the filtered emit, on the real `examples/tests_demo.jtr`.
+        let prog = crate::module::load("examples/tests_demo.jtr");
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(td.is_empty(), "typeck: {:?}", td);
+        assert!(crate::escape::check(&prog.ast, &info).is_empty());
+
+        // The demo has two tests: `add_is_commutative`, `doubling_works`.
+        let all = cgen::emit_tests_filtered(&prog.ast, &info, None).0;
+        assert_eq!(baked_test_count(&all), 2, "demo has two tests");
+        let only_double = cgen::emit_tests_filtered(&prog.ast, &info, Some("doub")).0;
+        assert_eq!(baked_test_count(&only_double), 1, "`doub` selects one");
+        assert!(only_double.contains("jestyr_doubling_works()"));
+        assert!(!only_double.contains("jestyr_add_is_commutative()"));
+
+        // `--list` discovery on the same AST (one greppable line per item upstream).
+        assert_eq!(
+            cgen::list_tests(&prog.ast),
+            vec![
+                ("add_is_commutative".to_string(), TestKind::Test),
+                ("doubling_works".to_string(), TestKind::Test),
+                ("sum_to_1000".to_string(), TestKind::Bench),
+            ]
+        );
+    }
+}
+
+/// Property + fuzz tests for the `jestyrc test` runner (workstream O). The
+/// generator builds a program with a *known* roster of `@test`/`@bench` names plus
+/// decoys, so discovery and filtering have a by-construction oracle.
+mod test_runner_props {
+    use super::*;
+    use crate::cgen::{self, TestKind};
+    use proptest::prelude::*;
+
+    /// Discovery + filtered emit over a parsed source.
+    fn list(src: &str) -> Vec<(String, TestKind)> {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
+        cgen::list_tests(&ast)
+    }
+    fn baked_count(src: &str, filter: Option<&str>) -> usize {
+        let (ast, info) = typeck_full(src);
+        let c = cgen::emit_tests_filtered(&ast, &info, filter).0;
+        let at = c.find("running ").expect("running banner");
+        c[at + 8..].split_whitespace().next().unwrap().parse().unwrap()
+    }
+
+    /// A *valid* program with `t` tests `xtest{i}` and `b` benches `xbench{i}`, plus
+    /// two decoys that must never be discovered: a plain `xhelper` and a *generic*
+    /// `@test xgen` (a monomorphization template). Returns `(src, t, b)`.
+    fn arb_test_program() -> impl Strategy<Value = (String, usize, usize)> {
+        (1usize..5, 0usize..4).prop_map(|(t, b)| {
+            let tests: String = (0..t)
+                .map(|i| format!("@test fn xtest{i}() -> bool {{ return true }} "))
+                .collect();
+            let benches: String =
+                (0..b).map(|i| format!("@bench fn xbench{i}() {{ }} ")).collect();
+            let decoys = "fn xhelper() -> i32 { return 0 } \
+                          @test fn xgen(comptime T: type) -> bool { return true }";
+            (format!("{tests}{benches}{decoys}"), t, b)
+        })
+    }
+
+    proptest! {
+        /// **Discovery soundness + completeness.** `list_tests` names *exactly* the
+        /// `t` tests and `b` benches — never the plain helper, never the generic
+        /// `@test` decoy. Teeth: dropping the `is_generic_ast` guard in `list_tests`
+        /// makes `xgen` appear and the count overshoots.
+        #[test]
+        fn discovery_matches_the_known_roster((src, t, b) in arb_test_program()) {
+            let found = list(&src);
+            prop_assert_eq!(found.len(), t + b, "roster size in {}", src);
+            let n_tests = found.iter().filter(|(_, k)| *k == TestKind::Test).count();
+            let n_bench = found.iter().filter(|(_, k)| *k == TestKind::Bench).count();
+            prop_assert_eq!(n_tests, t);
+            prop_assert_eq!(n_bench, b);
+            prop_assert!(!found.iter().any(|(n, _)| n == "xhelper" || n == "xgen"),
+                "a decoy was discovered: {:?}", found);
+        }
+
+        /// **Filter completeness.** The empty/`None` filter bakes every test — the
+        /// banner count equals `t`. (And `None` ≡ `Some("")`.)
+        #[test]
+        fn the_unfiltered_count_is_the_test_count((src, t, _b) in arb_test_program()) {
+            prop_assert_eq!(baked_count(&src, None), t, "in {}", src);
+            prop_assert_eq!(baked_count(&src, Some("")), t);
+        }
+
+        /// **Filter soundness.** A substring shared by *all* test names (`xtest`)
+        /// keeps every test; a substring matching *none* (`zzz`) bakes zero. Teeth:
+        /// making the filter a no-op keeps the count at `t` for the `zzz` case.
+        #[test]
+        fn a_filter_selects_by_substring((src, t, _b) in arb_test_program()) {
+            prop_assert_eq!(baked_count(&src, Some("xtest")), t, "shared substring keeps all");
+            prop_assert_eq!(baked_count(&src, Some("zzz")), 0, "no-match bakes zero");
+        }
+
+        /// **Single-name selection.** Filtering by one exact test name `xtest{i}`
+        /// bakes exactly one — the names are distinct by construction, so a
+        /// substring equal to a full name matches only itself.
+        #[test]
+        fn an_exact_name_filter_bakes_exactly_one((src, t, _b) in arb_test_program()) {
+            for i in 0..t {
+                prop_assert_eq!(baked_count(&src, Some(&format!("xtest{i}"))), 1,
+                    "exact name xtest{} in {}", i, src);
+            }
+        }
+
+        /// **Determinism.** The filtered harness is byte-identical across runs — no
+        /// `HashMap`/`HashSet` iteration order leaks through discovery or emission.
+        #[test]
+        fn filtered_harness_is_deterministic((src, _t, _b) in arb_test_program()) {
+            let (ast, info) = typeck_full(&src);
+            let a = cgen::emit_tests_filtered(&ast, &info, Some("xtest")).0;
+            let b = cgen::emit_tests_filtered(&ast, &info, Some("xtest")).0;
+            prop_assert_eq!(a, b);
+        }
+    }
+}
+
 /// Experiment (feature `dharht-experiment`): the strongest "can D-HARHT replace a
 /// `HashMap`?" check — a sealed D-HARHT (Memory profile) must agree with a HashMap
 /// on every key, across random key sets.
@@ -1162,6 +1409,44 @@ mod fuzz {
             );
             run_pipeline(&prog);
             assert_eq!(compile(&prog), compile(&prog));
+        });
+    }
+
+    /// Coverage-guided fuzzing of the **`jestyrc test` runner** (workstream O): the
+    /// fuzzer's bytes are used both as a `@test` name slot *and* as the filter
+    /// substring, so `cgen::list_tests` and `emit_tests_filtered` run on adversarial
+    /// names/filters. Invariants: the harness emit never panics and always prints a
+    /// well-formed `running …` banner, the baked count never exceeds the discovered
+    /// test count, and emission stays deterministic. `list_tests` and the filter
+    /// agree (filtered count ≤ unfiltered).
+    #[test]
+    fn fuzz_test_runner() {
+        bolero::check!().with_type::<(String, String)>().for_each(|(name, filt): &(String, String)| {
+            // Drop the name into a `@test` slot and a second fixed test, so there is
+            // always at least one discoverable test regardless of the fuzzer's bytes.
+            let prog = format!(
+                "@test fn {name}() -> bool {{ return true }} \
+                 @test fn xfixed() -> bool {{ return true }}"
+            );
+            let (tokens, _) = Lexer::new(&prog).tokenize();
+            let (ast, _) = Parser::new(&prog, tokens).parse();
+            let (info, _) = crate::typeck::check(&ast);
+
+            let discovered = cgen::list_tests(&ast).len();
+            let count = |c: &str| -> usize {
+                c.find("running ")
+                    .and_then(|at| c[at + 8..].split_whitespace().next())
+                    .and_then(|n| n.parse().ok())
+                    .expect("a well-formed running banner")
+            };
+            let (full, _) = cgen::emit_tests_filtered(&ast, &info, None);
+            let (filtered, _) = cgen::emit_tests_filtered(&ast, &info, Some(filt));
+            let nfull = count(&full);
+            let nfilt = count(&filtered);
+            assert!(nfull <= discovered, "baked > discovered: {nfull} > {discovered}");
+            assert!(nfilt <= nfull, "filter grew the roster: {nfilt} > {nfull}");
+            // Determinism: identical bytes on a re-emit.
+            assert_eq!(filtered, cgen::emit_tests_filtered(&ast, &info, Some(filt)).0);
         });
     }
 
@@ -3437,6 +3722,73 @@ mod c_oracle {
     /// Whitespace-normalized tokens of a demo's output (robust to newline style).
     fn toks(rel: &str) -> Vec<String> {
         build_and_run(rel).split_whitespace().map(|s| s.to_string()).collect()
+    }
+
+    /// Build `rel`'s `@test`/`@bench` **harness** (narrowed by `filter`) through the
+    /// real gcc pipeline — exactly what `jestyrc test [substr]` does — run it, and
+    /// return `(stdout, exit_code)`. The exit code is the runner's pass/fail tally
+    /// (`0` iff every baked test passed), so this asserts the end-to-end contract
+    /// CI relies on: a filtered run compiles, runs, and reports correctly.
+    fn build_tests_and_run(rel: &str, filter: Option<&str>) -> (String, i32) {
+        let prog = crate::module::load(rel);
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "load errors in {rel}: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(!td.iter().any(|d| d.is_error()), "typeck errors in {rel}");
+        let ed = crate::escape::check(&prog.ast, &info);
+        assert!(!ed.iter().any(|d| d.is_error()), "escape errors in {rel}");
+        let (c_src, _cd) = crate::cgen::emit_tests_filtered(&prog.ast, &info, filter);
+
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let stem: String = rel.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        let dir = std::env::temp_dir();
+        let cfile = dir.join(format!("jestyr_testrun_{stem}_{uniq}.c"));
+        let exe = dir.join(format!("jestyr_testrun_{stem}_{uniq}{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&cfile, &c_src).unwrap();
+
+        let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
+        let mut cmd = Command::new(&cc);
+        cmd.args(crate::CC_FLAGS);
+        if c_src.contains("pthread") {
+            cmd.arg("-pthread");
+        }
+        assert!(cmd.arg("-o").arg(&exe).arg(&cfile).status().unwrap().success(), "gcc failed for {rel}");
+        let out = Command::new(&exe).output().unwrap();
+        (String::from_utf8(out.stdout).unwrap(), out.status.code().unwrap_or(-1))
+    }
+
+    /// End-to-end runner check on the shipped demo: an unfiltered run runs both
+    /// tests and the bench and exits 0; a `doub` filter runs only `doubling_works`
+    /// (and drops the bench) yet still exits 0. The exact stdout is pinned so a
+    /// harness-shape regression is caught, and the exit code proves the pass/fail
+    /// tally reaches the process status.
+    #[test]
+    fn test_runner_filters_end_to_end() {
+        let (all, all_code) = build_tests_and_run("examples/tests_demo.jtr", None);
+        assert_eq!(all_code, 0, "all demo tests pass: {all}");
+        assert_eq!(
+            all.split_whitespace().collect::<Vec<_>>(),
+            [
+                "running", "2", "test(s)",
+                "test", "add_is_commutative", "...", "ok",
+                "test", "doubling_works", "...", "ok",
+                "bench", "sum_to_1000", "...", "0.000", "ms",
+                "result:", "2", "passed;", "0", "failed",
+            ]
+        );
+
+        let (only, only_code) = build_tests_and_run("examples/tests_demo.jtr", Some("doub"));
+        assert_eq!(only_code, 0, "the one selected test passes: {only}");
+        assert_eq!(
+            only.split_whitespace().collect::<Vec<_>>(),
+            [
+                "running", "1", "test(s)",
+                "test", "doubling_works", "...", "ok",
+                "result:", "1", "passed;", "0", "failed",
+            ],
+            "filter must select only doubling_works and drop the bench"
+        );
     }
 
     #[test]

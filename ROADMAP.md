@@ -98,7 +98,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
 | N | Concurrency polish | ~50% | MED | M | ✓ | — |
-| O | Tooling (fmt / test / doc / LSP) | 0% | LOW | M | ✓✓ | ✓ |
+| O | Tooling (fmt / test / doc / LSP) | test-runner polish ✅; attest next | LOW | M | ✓✓ | ✓ |
 | P | Self-hosting | plumbing ✅; port open | — | XL | ✓✓ | ✓✓ (the gate) |
 
 ---
@@ -222,10 +222,29 @@ closures; task **results** + `await` (keyword reserved); sync types (`Mutex`/`At
 channels); escape-checked join-safety; the `par` loop (design + MOTLEY note: must be
 *deterministic*). 
 
-### O. Tooling — 0% (LOW conflict; files: new binaries/subcommands)
-**Design §15: one `jestyr` binary.** **Left:** a **formatter**, a **test runner**, a
-**doc generator** (pairs with C), eventually an **LSP**. Each is a largely new
-file/subcommand → **excellent parallel candidates** that barely touch the core.
+### O. Tooling — in progress (LOW conflict; files: new binaries/subcommands)
+**Design §15: one `jestyr` binary.** Each tool is a largely new file/subcommand →
+**excellent parallel candidates** that barely touch the core.
+
+**Test-runner polish — ✅ DONE (increment 1).** `jestyrc test` gained codegen-time
+name filtering and a `--list` mode:
+- `jestyrc test <file> <substr>` bakes only the `@test`/`@bench` items whose name
+  *contains* the substring (so `running N test(s)` and the pass/fail exit code reflect
+  the filtered roster). Filtering is at codegen, not via `argv`, so the unfiltered
+  harness is byte-for-byte unchanged (`emit_tests(x) == emit_tests_filtered(x, None)`).
+- `jestyrc test <file> --list` prints the runnable test/bench names (one greppable
+  `test <name>` / `bench <name>` line each, source order) — toolchain-free, no compile.
+- New `cgen::{emit_tests_filtered, list_tests, TestKind}` (the discovery predicate
+  mirrors `test_main`'s `runnable` exactly: skips generic/unsupported `@test`s).
+- Rigor: unit + wiring + golden + property (`arb_test_program` — discovery
+  soundness/completeness, filter soundness, determinism) + a `fuzz_test_runner` bolero
+  target + a `--features c-oracle` end-to-end run of the filtered harness; every
+  property teeth-verified by mutation. `cargo test` stays toolchain-free.
+
+**Left:** **`jestyr attest`** (the headline — reproducible-build + machine-checked
+guarantee manifest, then `--diff`), a **doc generator** (exists: `jestyrc doc`),
+eventually an **LSP**. (Deferred: a faithful `fmt` — the lexer discards comments/layout;
+`printer.rs` is a debug printer. See `TOOLING-HANDOFF.md` "What NOT to build".)
 
 ### P. Self-hosting — plumbing landed; the port itself remains (the gate; XL)
 **Design §19 / Motley prerequisite.** Rewrite the Jestyr compiler in Jestyr. The

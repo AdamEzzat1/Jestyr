@@ -14,6 +14,9 @@
 //!   jestyrc emit-c <file.jtr>   lower to C and print it
 //!   jestyrc build  <file.jtr>   lower to C and compile a native binary
 //!   jestyrc run    <file.jtr>   build, then execute the binary
+//!   jestyrc test   <file.jtr>   build & run the `@test`/`@bench` harness;
+//!                               `test <file> <substr>` runs only matching names,
+//!                               `test <file> --list` lists them (no compile)
 //!   jestyrc tokens <file.jtr>   stop after lexing and dump the token stream
 //!   jestyrc doc    <file.jtr>   render the file's API docs as Markdown (--html for HTML)
 //!   jestyrc selfbench           compile a generated program; report per-stage speed +
@@ -274,7 +277,10 @@ enum Mode {
     EmitC,
     Build,
     Run,
-    Test,
+    /// `jestyrc test <file> [substr] [--list]` — build & run the `@test`/`@bench`
+    /// harness. `list`: print runnable test/bench names and exit (no compile).
+    /// `filter`: bake only items whose name contains the substring.
+    Test { list: bool, filter: Option<String> },
     Tokens,
     Doc { html: bool },
 }
@@ -329,8 +335,21 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("test") => {
+            // `test` takes an optional `--list` flag and an optional name-filter
+            // substring, in any order after the file. The file is the first
+            // non-flag argument; a second non-flag argument is the filter.
+            let list = args[2..].iter().any(|a| a == "--list");
+            let mut nonflags = args[2..].iter().filter(|a| !a.starts_with("--"));
+            let Some(path) = nonflags.next() else {
+                eprintln!("error: `test` needs a file argument");
+                return ExitCode::FAILURE;
+            };
+            let filter = nonflags.next().cloned();
+            (Mode::Test { list, filter }, path.clone())
+        }
         Some("tokens") | Some("parse") | Some("check") | Some("emit-c") | Some("build")
-        | Some("run") | Some("test") => {
+        | Some("run") => {
             let candidates = [
                 sub("tokens", Mode::Tokens),
                 sub("parse", Mode::Parse),
@@ -338,7 +357,6 @@ fn main() -> ExitCode {
                 sub("emit-c", Mode::EmitC),
                 sub("build", Mode::Build),
                 sub("run", Mode::Run),
-                sub("test", Mode::Test),
             ];
             match candidates.into_iter().flatten().next() {
                 Some(Ok(pair)) => pair,
@@ -405,7 +423,7 @@ fn main() -> ExitCode {
             }
             report_program(&prog.modules, &diags)
         }
-        Mode::EmitC | Mode::Build | Mode::Run | Mode::Test => {
+        Mode::EmitC | Mode::Build | Mode::Run | Mode::Test { .. } => {
             // Codegen only ever sees well-formed programs: gate on every check.
             let prog = module::load(&path);
             if !prog.diags.is_empty() {
@@ -423,10 +441,19 @@ fn main() -> ExitCode {
                 eprintln!("{}", prog.modules.render(d, d.severity));
             }
 
-            // `test` mode emits a `@test`/`@bench` harness `main`; the rest emit
-            // the ordinary entry-point wrapper.
-            let (c_src, cgen_diags) = if matches!(mode, Mode::Test) {
-                cgen::emit_tests(&prog.ast, &info)
+            // `jestyrc test --list` prints the runnable test/bench names (optionally
+            // narrowed by the same name filter) and exits — no codegen, no compiler.
+            if let Mode::Test { list: true, filter } = &mode {
+                return list_tests(&prog.ast, filter.as_deref());
+            }
+
+            // `test` mode emits a `@test`/`@bench` harness `main` (with optional
+            // name filtering); the rest emit the ordinary entry-point wrapper.
+            let (c_src, cgen_diags) = if let Mode::Test { filter, .. } = &mode {
+                match filter {
+                    Some(f) => cgen::emit_tests_filtered(&prog.ast, &info, Some(f)),
+                    None => cgen::emit_tests(&prog.ast, &info),
+                }
             } else if show_drops && matches!(mode, Mode::EmitC) {
                 cgen::emit_show_drops(&prog.ast, &info)
             } else {
@@ -458,7 +485,7 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                     // `run` and `test` both execute the built binary.
-                    build_and_maybe_run(&path, &c_src, matches!(mode, Mode::Run | Mode::Test))
+                    build_and_maybe_run(&path, &c_src, matches!(mode, Mode::Run | Mode::Test { .. }))
                 }
             }
         }
@@ -469,6 +496,32 @@ fn main() -> ExitCode {
 /// entry point; a library file (no `main`) is a `check`-only artifact.
 fn program_has_main(ast: &ast::Ast) -> bool {
     ast.items.iter().any(|it| matches!(it, ast::Item::Fn(f) if f.name.name == "main"))
+}
+
+/// `jestyrc test --list`: print the runnable `@test`/`@bench` names (each on its
+/// own line, tagged `test`/`bench`, in source order), narrowed by the optional
+/// `filter` substring. One greppable line per item, so CI can slice the harness.
+/// Always succeeds — listing zero items (e.g. an over-narrow filter) is not an
+/// error, just an empty list with a stderr note.
+fn list_tests(ast: &ast::Ast, filter: Option<&str>) -> ExitCode {
+    let items: Vec<(String, cgen::TestKind)> = cgen::list_tests(ast)
+        .into_iter()
+        .filter(|(name, _)| filter.is_none_or(|f| name.contains(f)))
+        .collect();
+    for (name, kind) in &items {
+        let tag = match kind {
+            cgen::TestKind::Test => "test",
+            cgen::TestKind::Bench => "bench",
+        };
+        println!("{tag} {name}");
+    }
+    if items.is_empty() {
+        match filter {
+            Some(f) => eprintln!("note: no tests or benches match `{f}`"),
+            None => eprintln!("note: no `@test` or `@bench` functions found"),
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// Report diagnostics that may originate from any module, rendering each against
@@ -597,6 +650,7 @@ fn print_usage() {
     eprintln!("    jestyrc build  <file.jtr>   lower to C and compile a native binary");
     eprintln!("    jestyrc run    <file.jtr>   build, then execute the binary");
     eprintln!("    jestyrc test   <file.jtr>   build & run the `@test`/`@bench` harness");
+    eprintln!("                               (test [substr] runs matching names; --list lists them)");
     eprintln!("    jestyrc tokens <file.jtr>   stop after lexing and dump tokens");
     eprintln!("    jestyrc doc    <file.jtr>   render the file's API docs as Markdown");
     eprintln!("                               (add --html for an HTML page)");

@@ -35,7 +35,7 @@ use crate::types::{prim_ty, ImplCall, MethodRes, Ty, TypeInfo, TypeKindG};
 /// Lower a program to C, ending with the ordinary entry-point wrapper around
 /// the user's `main`.
 pub fn emit(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
-    emit_program(ast, info, false, false)
+    emit_program(ast, info, false, false, None)
 }
 
 /// Like [`emit`], but annotates every inserted scope-exit drop call with a
@@ -43,17 +43,79 @@ pub fn emit(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
 /// the emitted C (drives `jestyrc emit-c --show-drops`). Implicit ≠ hidden: the
 /// "transparent cost" thesis says auto-inserted control flow must be inspectable.
 pub fn emit_show_drops(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
-    emit_program(ast, info, false, true)
+    emit_program(ast, info, false, true, None)
 }
 
 /// Lower a program to C in *test* mode: instead of the `main` wrapper, emit a
 /// harness `main` that runs every `@test` (reporting pass/fail) and times every
 /// `@bench`. Drives `jestyrc test` (roadmap workstream O).
 pub fn emit_tests(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
-    emit_program(ast, info, true, false)
+    emit_program(ast, info, true, false, None)
 }
 
-fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool, show_drops: bool) -> (String, Vec<Diagnostic>) {
+/// Like [`emit_tests`], but bakes only the `@test`/`@bench` items whose name
+/// *contains* `filter` into the harness — the codegen half of `jestyrc test
+/// <substr>` name filtering. With `None`, identical to [`emit_tests`]. Filtering
+/// at codegen (not at runtime via `argv`) keeps the harness's `running N test(s)`
+/// line equal to the *baked* count, so an empty filter is byte-for-byte the
+/// unfiltered harness. (Workstream O.)
+pub fn emit_tests_filtered(ast: &Ast, info: &TypeInfo, filter: Option<&str>) -> (String, Vec<Diagnostic>) {
+    emit_program(ast, info, true, false, filter)
+}
+
+/// A runnable harness entry: a `@test` (a no-arg `-> bool`, `true` = pass) or a
+/// `@bench` (a no-arg body timed with `clock()`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TestKind {
+    Test,
+    Bench,
+}
+
+/// The runnable `@test`/`@bench` items of a program, in source order — the data
+/// behind `jestyrc test --list` (and the oracle for the filtered harness). Mirrors
+/// `test_main`'s `runnable` predicate exactly (non-generic, backend-supported), so
+/// the list never names a test the harness would silently skip. Pure: needs no
+/// `TypeInfo` and never compiles, so `--list` is toolchain-free.
+pub fn list_tests(ast: &Ast) -> Vec<(String, TestKind)> {
+    ast.items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Fn(f) if is_generic_ast(ast, f) || !fn_supported_ast(ast, f) => None,
+            Item::Fn(f) if f.has_attr("test") => Some((f.name.name.clone(), TestKind::Test)),
+            Item::Fn(f) if f.has_attr("bench") => Some((f.name.name.clone(), TestKind::Bench)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A `comptime <name>: type` parameter — an erased monomorphization knob, not a
+/// runtime argument. Free-function form of `Cgen::is_type_param`, so `list_tests`
+/// can share the predicate without a fully-built `Cgen`.
+fn is_type_param_ast(ast: &Ast, p: &Param) -> bool {
+    p.comptime && p.ty.is_some_and(|t| matches!(ast.type_at(t).kind, TypeKind::TypeKw))
+}
+
+/// A monomorphization template — has a `comptime T: type` or a bracket-form
+/// `[T: Bound]` generic. Such a function is never emitted directly, so it can't be
+/// a runnable test. Free-function form of `Cgen::is_generic`.
+fn is_generic_ast(ast: &Ast, f: &FnDecl) -> bool {
+    !f.generics.is_empty() || f.params.iter().any(|p| is_type_param_ast(ast, p))
+}
+
+/// Backend-emittable: no `self` (methods) and no `comptime` *value* parameters
+/// (only `comptime` *type* parameters are ok). Free-function form of
+/// `Cgen::fn_supported`.
+fn fn_supported_ast(ast: &Ast, f: &FnDecl) -> bool {
+    f.params.iter().all(|p| !p.is_self && (!p.comptime || is_type_param_ast(ast, p)))
+}
+
+fn emit_program(
+    ast: &Ast,
+    info: &TypeInfo,
+    test_mode: bool,
+    show_drops: bool,
+    test_filter: Option<&str>,
+) -> (String, Vec<Diagnostic>) {
     // Index every enum variant by name, so the backend can construct and match
     // on them by finding the owning enum and the variant's payload fields.
     let mut variants = HashMap::new();
@@ -170,6 +232,7 @@ fn emit_program(ast: &Ast, info: &TypeInfo, test_mode: bool, show_drops: bool) -
             })
             .collect(),
         test_mode,
+        test_filter: test_filter.map(str::to_string),
         show_drops,
         drop_stack: Vec::new(),
         cur_moved: HashSet::new(),
@@ -411,6 +474,10 @@ struct Cgen<'a> {
     /// emitting a `jestyrc test` harness (`@test`/`@bench` runner) rather than the
     /// ordinary `main` wrapper.
     test_mode: bool,
+    /// when set, the test harness bakes only the `@test`/`@bench` items whose name
+    /// *contains* this substring — `jestyrc test <substr>` name filtering, applied
+    /// at codegen so `running N test(s)` equals the baked count. `None` = run all.
+    test_filter: Option<String>,
     /// annotate each inserted drop call with a `/* drop … */` comment so the
     /// implicit drop glue is inspectable (`--show-drops`). Implicit ≠ hidden.
     show_drops: bool,
@@ -2019,11 +2086,18 @@ impl<'a> Cgen<'a> {
     fn test_main(&mut self) {
         let ast = self.ast;
         let runnable = |f: &FnDecl| !self.is_generic(f) && self.fn_supported(f);
+        // A name passes the optional `jestyrc test <substr>` filter iff it contains
+        // the substring (`None` = no filter = everything). Cloned out of `self`
+        // first so it doesn't alias the `runnable` closure's borrow.
+        let filter = self.test_filter.clone();
+        let passes = |name: &str| filter.as_deref().is_none_or(|f| name.contains(f));
         let tests: Vec<String> = ast
             .items
             .iter()
             .filter_map(|it| match it {
-                Item::Fn(f) if f.has_attr("test") && runnable(f) => Some(f.name.name.clone()),
+                Item::Fn(f) if f.has_attr("test") && runnable(f) && passes(&f.name.name) => {
+                    Some(f.name.name.clone())
+                }
                 _ => None,
             })
             .collect();
@@ -2031,7 +2105,9 @@ impl<'a> Cgen<'a> {
             .items
             .iter()
             .filter_map(|it| match it {
-                Item::Fn(f) if f.has_attr("bench") && runnable(f) => Some(f.name.name.clone()),
+                Item::Fn(f) if f.has_attr("bench") && runnable(f) && passes(&f.name.name) => {
+                    Some(f.name.name.clone())
+                }
                 _ => None,
             })
             .collect();
@@ -6695,13 +6771,13 @@ impl<'a> Cgen<'a> {
     // --- monomorphization ---
 
     fn is_type_param(&self, p: &Param) -> bool {
-        p.comptime && p.ty.is_some_and(|t| matches!(self.ast.type_at(t).kind, TypeKind::TypeKw))
+        is_type_param_ast(self.ast, p)
     }
 
     /// A generic function has a `comptime <name>: type` parameter or a bracket-form
     /// `[T: Bound]` generic — either makes it a monomorphization template.
     fn is_generic(&self, f: &FnDecl) -> bool {
-        !f.generics.is_empty() || f.params.iter().any(|p| self.is_type_param(p))
+        is_generic_ast(self.ast, f)
     }
 
     /// The bracket-form generic parameter names of `f`, in declaration order.
@@ -6740,7 +6816,7 @@ impl<'a> Cgen<'a> {
     /// The backend can emit a function if it has no `self` (methods) and no
     /// `comptime` *value* parameters (only `comptime` type parameters are ok).
     fn fn_supported(&self, f: &FnDecl) -> bool {
-        f.params.iter().all(|p| !p.is_self && (!p.comptime || self.is_type_param(p)))
+        fn_supported_ast(self.ast, f)
     }
 
     fn comptime_positions(&self, f: &FnDecl) -> Vec<usize> {
