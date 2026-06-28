@@ -1,0 +1,237 @@
+// std/strmap.jtr — a string-keyed symbol table, `str -> i64`, for the self-hosted
+// compiler (lexer keyword sets, name→decl indices, type-id tables, string interning).
+//
+// ─── Why this shape (the "alternative to a textbook hashmap") ───────────────────
+// A self-hosted compiler lives or dies on its symbol tables, so the data structure
+// is chosen deliberately for *speed*, *memory*, *security*, and *determinism*:
+//
+//  • Open addressing, not separate chaining. A chained map allocates one heap node
+//    per entry and pointer-chases through them — cache-hostile and fragmenting. This
+//    is a single flat array of inline slots: probes walk *sequential* memory (cache
+//    friendly), and there are zero per-entry allocations beyond the key bytes you
+//    must store anyway. Memory is one contiguous block; load factor is capped at 0.7.
+//
+//  • A strong, deterministic hash. FNV-1a accumulates the bytes, then a SplitMix64
+//    finalizer avalanches the result. FNV *alone* diffuses poorly and is trivially
+//    collision-flooded; the finalizer scatters near-identical keys (the common case
+//    in source code: `x1`,`x2`,…) across the table, so probe chains stay short. The
+//    constants are fixed — no random seed — so the table is **bit-reproducible** run
+//    to run (the Motley determinism spine). Security note: true hash-flooding
+//    immunity wants a *keyed* hash (SipHash) with a *secret* key, which trades away
+//    determinism; for trusted compiler input the fixed strong-avalanche hash + the
+//    0.7 load cap is the right posture. For an adversarial threat model, swap
+//    `hash_str` for fixed-key SipHash, or use a sorted-array + binary-search table
+//    (zero hashing ⇒ no flooding surface) for small, security-critical maps.
+//
+//  • Owned keys. The map copies each key into its own allocation (freed by RAII on
+//    Drop), so callers needn't keep transient key bytes alive — no lifetime footgun.
+//    `i64` values hold anything a symbol table needs: a decl index, a type id, an
+//    enum tag, or a pointer reinterpreted as an integer.
+
+import "mem"
+
+// One inline slot. `kptr/klen` own the key bytes; `hash` is cached so a grow can
+// re-place entries without re-hashing and a probe can skip the byte-compare on a
+// hash mismatch.
+struct Slot { used: bool, hash: u64, kptr: *mut u8, klen: usize, val: i64 }
+
+pub struct StrMap {
+    slots: *mut Slot,
+    cap: usize,    // power of two (0 = unallocated)
+    len: usize,    // occupied slots
+    a: Allocator,
+}
+
+// An empty map bound to allocator `a`. Owns no memory until the first `put`.
+pub fn make(read a: Allocator) -> StrMap {
+    return StrMap{ slots: null, cap: 0, len: 0, a: a }
+}
+
+// Pointer reads, factored out: `unsafe { ptr.* }` is only allowed in statement/return
+// position (not as a `var x = …` initializer), so these tail-`unsafe` helpers let the
+// callers bind a read value with a plain `let`/`var`.
+fn slot_at(slots: *mut Slot, i: usize) -> Slot {
+    unsafe { (slots + i).* }
+}
+fn byte_at(p: *mut u8, i: usize) -> u8 {
+    unsafe { (p + i).* }
+}
+
+pub fn len(read m: StrMap) -> usize {
+    return m.len
+}
+
+// FNV-1a over the bytes, then a SplitMix64 finalizer for avalanche.
+fn hash_str(read s: str) -> u64 {
+    var h: u64 = 0xcbf29ce484222325
+    let prime: u64 = 0x100000001b3
+    var i: usize = 0
+    for i < s.len {
+        let b: u64 = s[i] as u64
+        h = (h ^ b) * prime
+        i = i + 1
+    }
+    var z: u64 = h
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+    z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+    z = z ^ (z >> 31)
+    return z
+}
+
+// Compare an owned key (kptr/klen) against a `str` without rebuilding a view.
+fn key_eq(kptr: *mut u8, klen: usize, read key: str) -> bool {
+    if klen != key.len { return false }
+    var i: usize = 0
+    for i < klen {
+        let a: u8 = byte_at(kptr, i)
+        if a != key[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Copy a key's bytes into a fresh allocation the map owns.
+fn copy_key(read a: Allocator, read key: str) -> *mut u8 {
+    var p: *mut u8 = mem.allocate(u8, a, key.len)
+    var i: usize = 0
+    for i < key.len {
+        unsafe { (p + i).* = key[i] }
+        i = i + 1
+    }
+    return p
+}
+
+// Allocate a fresh slot array of `cap` empty slots.
+fn fresh_slots(read a: Allocator, cap: usize) -> *mut Slot {
+    var p: *mut Slot = mem.allocate(Slot, a, cap)
+    var i: usize = 0
+    for i < cap {
+        unsafe { (p + i).* = Slot{ used: false, hash: 0, kptr: null, klen: 0, val: 0 } }
+        i = i + 1
+    }
+    return p
+}
+
+// Place an already-owned key (kptr/klen + cached hash) into `slots` (cap is a power
+// of two). Used by both `put` (new key) and `grow` (rehash). No growth, no compare-
+// for-overwrite: the caller guarantees the key is absent.
+fn place(slots: *mut Slot, cap: usize, h: u64, kptr: *mut u8, klen: usize, val: i64) {
+    var idx: usize = (h as usize) & (cap - 1)
+    var probes: usize = 0
+    for probes < cap {
+        var s: Slot = slot_at(slots, idx)
+        if not s.used {
+            unsafe { (slots + idx).* = Slot{ used: true, hash: h, kptr: kptr, klen: klen, val: val } }
+            return
+        }
+        idx = (idx + 1) & (cap - 1)
+        probes = probes + 1
+    }
+}
+
+// Grow to `newcap` and rehash every occupied slot into the new array. Keys move with
+// their slots (their byte allocations are untouched — only the slot array is freed).
+fn grow(mut m: StrMap, newcap: usize) {
+    var np: *mut Slot = fresh_slots(m.a, newcap)
+    let oldp: *mut Slot = m.slots
+    let oldcap: usize = m.cap
+    var i: usize = 0
+    for i < oldcap {
+        var s: Slot = slot_at(oldp, i)
+        if s.used {
+            place(np, newcap, s.hash, s.kptr, s.klen, s.val)
+        }
+        i = i + 1
+    }
+    m.slots = np
+    m.cap = newcap
+    if oldcap != 0 { mem.release(Slot, m.a, oldp) }
+}
+
+// Insert or overwrite `key -> val`. A new key is copied into the map's own storage;
+// an existing key's value is replaced (the count is unchanged).
+pub fn put(mut m: StrMap, read key: str, val: i64) {
+    // Ensure load factor stays <= 0.7 *before* inserting, so an empty slot exists.
+    if m.cap == 0 {
+        grow(m, 8)
+    } else {
+        if (m.len + 1) * 10 > m.cap * 7 { grow(m, m.cap * 2) }
+    }
+    let h: u64 = hash_str(key)
+    var idx: usize = (h as usize) & (m.cap - 1)
+    var probes: usize = 0
+    for probes < m.cap {
+        var s: Slot = slot_at(m.slots, idx)
+        if not s.used {
+            let kp: *mut u8 = copy_key(m.a, key)
+            unsafe { (m.slots + idx).* = Slot{ used: true, hash: h, kptr: kp, klen: key.len, val: val } }
+            m.len = m.len + 1
+            return
+        }
+        if s.hash == h {
+            if key_eq(s.kptr, s.klen, key) {
+                unsafe { (m.slots + idx).* = Slot{ used: true, hash: h, kptr: s.kptr, klen: s.klen, val: val } }
+                return
+            }
+        }
+        idx = (idx + 1) & (m.cap - 1)
+        probes = probes + 1
+    }
+}
+
+// The value for `key`, or `default` if absent.
+pub fn get(read m: StrMap, read key: str, default: i64) -> i64 {
+    if m.cap == 0 { return default }
+    let h: u64 = hash_str(key)
+    var idx: usize = (h as usize) & (m.cap - 1)
+    var probes: usize = 0
+    for probes < m.cap {
+        var s: Slot = slot_at(m.slots, idx)
+        if not s.used { return default }
+        if s.hash == h {
+            if key_eq(s.kptr, s.klen, key) { return s.val }
+        }
+        idx = (idx + 1) & (m.cap - 1)
+        probes = probes + 1
+    }
+    return default
+}
+
+// Whether `key` is present.
+pub fn has(read m: StrMap, read key: str) -> bool {
+    if m.cap == 0 { return false }
+    let h: u64 = hash_str(key)
+    var idx: usize = (h as usize) & (m.cap - 1)
+    var probes: usize = 0
+    for probes < m.cap {
+        var s: Slot = slot_at(m.slots, idx)
+        if not s.used { return false }
+        if s.hash == h {
+            if key_eq(s.kptr, s.klen, key) { return true }
+        }
+        idx = (idx + 1) & (m.cap - 1)
+        probes = probes + 1
+    }
+    return false
+}
+
+// Free every owned key and then the slot array. A free function (not the `impl`
+// method) so the module-qualified `mem.free_bytes` resolves — qualified calls inside
+// an impl-method body are a known bootstrap limitation (see std/list.jtr).
+fn destroy_slots(read a: Allocator, slots: *mut Slot, cap: usize) {
+    if cap == 0 { return }
+    var i: usize = 0
+    for i < cap {
+        var s: Slot = slot_at(slots, i)
+        if s.used { mem.free_bytes(a, s.kptr) }
+        i = i + 1
+    }
+    mem.free_bytes(a, slots as *mut u8)
+}
+
+// RAII: the slot array and all owned keys are released at scope exit — no manual free.
+impl Drop for StrMap {
+    fn drop(mut self) {
+        destroy_slots(self.a, self.slots, self.cap)
+    }
+}

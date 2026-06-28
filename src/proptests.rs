@@ -3481,6 +3481,17 @@ mod c_oracle {
         // path): count=1, argv[0] non-empty, out-of-range empty, no user args → sum 0.
         assert_eq!(toks("examples/std/args.jtr"), ["1", "1", "0", "0"]);
     }
+    #[test]
+    fn strmap_demo() {
+        // The open-addressing str->i64 symbol table, run through gcc: basic get
+        // (1,2,3), a missing key (-1), has (1,0), overwrite (99), count (3), then a
+        // 300-key stress run forcing several grow/rehash cycles — count 303, all 300
+        // read back correctly (1), and a never-inserted key absent (0).
+        assert_eq!(
+            toks("examples/std/strmap_demo.jtr"),
+            ["1", "2", "3", "-1", "1", "0", "99", "3", "303", "1", "0"]
+        );
+    }
 
     /// The PURE canary demo: exercises the whole numeric stack but prints ONLY
     /// integers and `format_float` strings — never `print_f64`/`printf("%g")`. Its

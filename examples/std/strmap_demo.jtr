@@ -1,0 +1,64 @@
+// examples/std/strmap_demo.jtr — the string-keyed symbol table (str -> i64), the
+// associative structure a self-hosted compiler needs for keyword sets, name→decl
+// tables, and string interning. Exercises basic put/get/has, overwrite, a missing
+// key, and a 300-key stress run that forces several grow/rehash cycles and many probe
+// collisions — all through the real gcc pipeline.
+//
+//   jestyrc run examples/std/strmap_demo.jtr
+//   →  1 2 3 -1 1 0   99 3   303 1 0
+import "core"
+import "mem"
+import "strmap"
+
+fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
+
+fn main() -> i32 {
+    var a: Allocator = mem.system_allocator()
+    var m: StrMap = strmap.make(a)
+
+    // Basic insert + lookup.
+    strmap.put(m, "fn", 1)
+    strmap.put(m, "let", 2)
+    strmap.put(m, "return", 3)
+    print_int(strmap.get(m, "fn", -1) as i32)         // 1
+    print_int(strmap.get(m, "let", -1) as i32)        // 2
+    print_int(strmap.get(m, "return", -1) as i32)     // 3
+    print_int(strmap.get(m, "missing", -1) as i32)    // -1 (absent → default)
+    print_int(b2i(strmap.has(m, "fn")))               // 1
+    print_int(b2i(strmap.has(m, "nope")))             // 0
+
+    // Overwrite replaces the value without changing the count.
+    strmap.put(m, "fn", 99)
+    print_int(strmap.get(m, "fn", -1) as i32)         // 99
+    print_int(strmap.len(m) as i32)                   // 3
+
+    // Stress: 300 distinct decimal-string keys → forces grow 8→16→…→512 and lots of
+    // probe collisions. Keys are copied by the map, so reusing one buffer is safe.
+    var buf: *mut u8 = alloc(u8, 16)
+    var bs: []u8 = slice(u8, buf, 16)
+    var n: i32 = 0
+    for n < 300 {
+        let klen: usize = core.format_i64(n as i64, bs)
+        let ks: []u8 = slice(u8, buf, klen)
+        let key: str = from_utf8(ks)
+        strmap.put(m, key, (n as i64) * 7)
+        n = n + 1
+    }
+    print_int(strmap.len(m) as i32)                   // 303 (3 keywords + 300 numbers)
+
+    // Read all 300 back — every key present with the right value despite the rehashes.
+    var ok: i32 = 1
+    var v: i32 = 0
+    for v < 300 {
+        let klen: usize = core.format_i64(v as i64, bs)
+        let ks: []u8 = slice(u8, buf, klen)
+        let key: str = from_utf8(ks)
+        if strmap.get(m, key, -1) != (v as i64) * 7 { ok = 0 }
+        v = v + 1
+    }
+    print_int(ok)                                     // 1 (all present & correct)
+    print_int(b2i(strmap.has(m, "9999")))             // 0 (a never-inserted key)
+
+    free_ptr(buf)
+    return 0   // m drops here: 303 owned keys + the slot array are freed by RAII
+}

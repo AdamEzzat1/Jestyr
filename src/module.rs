@@ -470,6 +470,28 @@ mod tests {
     }
 
     #[test]
+    fn files_example_compiles_clean() {
+        // File I/O (self-hosting plumbing): the std `fs` wrappers over the
+        // read_file/write_file/file_exists/remove_file intrinsics resolve and lower.
+        pipeline_is_clean("examples/std/files.jtr");
+    }
+
+    #[test]
+    fn args_example_compiles_clean() {
+        // Command-line args: the std `env` wrappers over arg_count()/arg(i) resolve
+        // across `import "env"` and lower clean (the loop over argv included).
+        pipeline_is_clean("examples/std/args.jtr");
+    }
+
+    #[test]
+    fn strmap_example_compiles_clean() {
+        // The string-keyed symbol table (open-addressing str->i64 map): a non-generic
+        // struct with a `Drop` impl, pointer-array slots, and the FNV-1a+SplitMix hash
+        // resolve across `import "mem"`/`import "core"` and lower clean.
+        pipeline_is_clean("examples/std/strmap_demo.jtr");
+    }
+
+    #[test]
     fn arrays_example_compiles_clean() {
         // Fixed-size arrays `[N]T`: the value-struct typedef, `[v; N]` literal,
         // bounds-checked index read/write, `.len`, and `for x in arr` iteration.
