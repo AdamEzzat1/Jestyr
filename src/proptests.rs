@@ -3492,6 +3492,16 @@ mod c_oracle {
             ["1", "2", "3", "-1", "1", "0", "99", "3", "303", "1", "0"]
         );
     }
+    #[test]
+    fn intern_demo() {
+        // The string interner through gcc: first-seen ids (0,1,2), dedup (1,1), count
+        // (3), id→string lookup (fn, return), a 200-key round-trip stress (1, 203),
+        // and a stable re-intern that doesn't grow the count (1, 203).
+        assert_eq!(
+            toks("examples/std/intern_demo.jtr"),
+            ["0", "1", "2", "1", "1", "3", "fn", "return", "1", "203", "1", "203"]
+        );
+    }
 
     /// The PURE canary demo: exercises the whole numeric stack but prints ONLY
     /// integers and `format_float` strings — never `print_f64`/`printf("%g")`. Its

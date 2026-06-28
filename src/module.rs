@@ -492,6 +492,14 @@ mod tests {
     }
 
     #[test]
+    fn intern_example_compiles_clean() {
+        // The string interner (str->dense id + id->str): an inline open-addressing
+        // table with a parallel id array and a `Drop` impl, resolving across
+        // `import "mem"`/`import "core"` and lowering clean.
+        pipeline_is_clean("examples/std/intern_demo.jtr");
+    }
+
+    #[test]
     fn arrays_example_compiles_clean() {
         // Fixed-size arrays `[N]T`: the value-struct typedef, `[v; N]` literal,
         // bounds-checked index read/write, `.len`, and `for x in arr` iteration.

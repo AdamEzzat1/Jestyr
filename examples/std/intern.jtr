@@ -1,0 +1,216 @@
+// std/intern.jtr — a string interner: map each distinct string to a small dense
+// integer id (and back), so the rest of a self-hosted compiler compares and stores
+// `u32` ids instead of re-hashing or re-comparing identifier text. Interning is the
+// trick that makes downstream tables integer-keyed — a plain array indexed by id —
+// which is why real compilers (rustc's `Symbol`, clang's `IdentifierInfo`) lean on it.
+//
+// ─── Design ─────────────────────────────────────────────────────────────────────
+// It uses the SAME open-addressing + FNV-1a/SplitMix64 technique as std/strmap.jtr,
+// but *inline* rather than by embedding a `StrMap`, for two concrete reasons:
+//   (1) Jestyr does not auto-drop struct fields, so a nested `StrMap` field would
+//       leak its slots/keys — a single self-owned table lets one `Drop` free
+//       everything; and
+//   (2) each distinct string's bytes are stored exactly once (the slot owns them)
+//       and both the table key and `lookup(id)` are views into that single copy —
+//       so interning is single-copy and id→str is zero-copy (more memory-efficient
+//       than mapping through a key-copying `StrMap`).
+// Ids are assigned in first-seen order, so interning is deterministic for a given
+// input order (the Motley spine). A parallel `byid` array gives O(1) id→string.
+
+import "mem"
+
+// One table entry: owns the key bytes (`kptr`/`klen`) and records the assigned `id`.
+// `hash` is cached so a grow re-places without re-hashing and a probe skips the
+// byte-compare on a hash mismatch.
+struct ISlot { used: bool, hash: u64, kptr: *mut u8, klen: usize, id: u32 }
+
+pub struct Interner {
+    slots: *mut ISlot,   // open-addressing hash table: string -> id
+    cap: usize,          // power of two (0 = unallocated)
+    n: usize,            // number of distinct strings = next id to assign
+    byid: *mut ISlot,    // id -> entry (O(1) id→string); parallel, grown on new ids
+    idcap: usize,
+    a: Allocator,
+}
+
+// An empty interner bound to allocator `a`. Owns no memory until the first `intern`.
+pub fn make(read a: Allocator) -> Interner {
+    return Interner{ slots: null, cap: 0, n: 0, byid: null, idcap: 0, a: a }
+}
+
+// The number of distinct strings interned so far (= the next id).
+pub fn count(read it: Interner) -> usize {
+    return it.n
+}
+
+// Pointer reads via tail-`unsafe` helpers (`unsafe {}` can't be a `let` initializer).
+fn slot_at(p: *mut ISlot, i: usize) -> ISlot {
+    unsafe { (p + i).* }
+}
+fn byte_at(p: *mut u8, i: usize) -> u8 {
+    unsafe { (p + i).* }
+}
+
+// FNV-1a over the bytes, then a SplitMix64 finalizer for avalanche (matches
+// std/strmap.jtr — same deterministic, flood-resistant mixing).
+fn hash_str(read s: str) -> u64 {
+    var h: u64 = 0xcbf29ce484222325
+    let prime: u64 = 0x100000001b3
+    var i: usize = 0
+    for i < s.len {
+        let b: u64 = s[i] as u64
+        h = (h ^ b) * prime
+        i = i + 1
+    }
+    var z: u64 = h
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+    z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+    z = z ^ (z >> 31)
+    return z
+}
+
+fn key_eq(kptr: *mut u8, klen: usize, read key: str) -> bool {
+    if klen != key.len { return false }
+    var i: usize = 0
+    for i < klen {
+        let a: u8 = byte_at(kptr, i)
+        if a != key[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn copy_key(read a: Allocator, read key: str) -> *mut u8 {
+    var p: *mut u8 = mem.allocate(u8, a, key.len)
+    var i: usize = 0
+    for i < key.len {
+        unsafe { (p + i).* = key[i] }
+        i = i + 1
+    }
+    return p
+}
+
+fn fresh(read a: Allocator, cap: usize) -> *mut ISlot {
+    var p: *mut ISlot = mem.allocate(ISlot, a, cap)
+    var i: usize = 0
+    for i < cap {
+        unsafe { (p + i).* = ISlot{ used: false, hash: 0, kptr: null, klen: 0, id: 0 } }
+        i = i + 1
+    }
+    return p
+}
+
+// Re-place an already-owned entry into `slots` (cap a power of two). The key is known
+// absent, so no compare-for-overwrite.
+fn place(slots: *mut ISlot, cap: usize, item: ISlot) {
+    var idx: usize = (item.hash as usize) & (cap - 1)
+    var probes: usize = 0
+    for probes < cap {
+        var s: ISlot = slot_at(slots, idx)
+        if not s.used {
+            unsafe { (slots + idx).* = item }
+            return
+        }
+        idx = (idx + 1) & (cap - 1)
+        probes = probes + 1
+    }
+}
+
+// Grow the hash table to `newcap` and rehash. Keys (kptr) are stable — only the slot
+// array moves — so byid is untouched.
+fn grow_slots(mut it: Interner, newcap: usize) {
+    var np: *mut ISlot = fresh(it.a, newcap)
+    let oldp: *mut ISlot = it.slots
+    let oldcap: usize = it.cap
+    var i: usize = 0
+    for i < oldcap {
+        var s: ISlot = slot_at(oldp, i)
+        if s.used {
+            place(np, newcap, s)
+        }
+        i = i + 1
+    }
+    it.slots = np
+    it.cap = newcap
+    if oldcap != 0 { mem.release(ISlot, it.a, oldp) }
+}
+
+// Ensure `byid` can hold `need` ids, copying the existing entries on grow.
+fn ensure_byid(mut it: Interner, need: usize) {
+    if need <= it.idcap { return }
+    var newcap: usize = 8
+    if it.idcap != 0 { newcap = it.idcap * 2 }
+    for newcap < need { newcap = newcap * 2 }
+    var np: *mut ISlot = fresh(it.a, newcap)
+    var i: usize = 0
+    for i < it.n {
+        unsafe { (np + i).* = slot_at(it.byid, i) }
+        i = i + 1
+    }
+    let oldp: *mut ISlot = it.byid
+    let oldcap: usize = it.idcap
+    it.byid = np
+    it.idcap = newcap
+    if oldcap != 0 { mem.release(ISlot, it.a, oldp) }
+}
+
+// Intern `s`: return its existing id if already seen, else copy it into the interner's
+// own storage, assign the next id, and return that. The returned id is stable for the
+// lifetime of the interner.
+pub fn intern(mut it: Interner, read s: str) -> i64 {
+    if it.cap == 0 {
+        grow_slots(it, 8)
+    } else {
+        if (it.n + 1) * 10 > it.cap * 7 { grow_slots(it, it.cap * 2) }
+    }
+    let h: u64 = hash_str(s)
+    var idx: usize = (h as usize) & (it.cap - 1)
+    var probes: usize = 0
+    for probes < it.cap {
+        var slot: ISlot = slot_at(it.slots, idx)
+        if not slot.used {
+            let kp: *mut u8 = copy_key(it.a, s)
+            let id: u32 = it.n as u32
+            let item: ISlot = ISlot{ used: true, hash: h, kptr: kp, klen: s.len, id: id }
+            unsafe { (it.slots + idx).* = item }
+            ensure_byid(it, it.n + 1)
+            unsafe { (it.byid + it.n).* = item }
+            it.n = it.n + 1
+            return id as i64
+        }
+        if slot.hash == h {
+            if key_eq(slot.kptr, slot.klen, s) { return slot.id as i64 }
+        }
+        idx = (idx + 1) & (it.cap - 1)
+        probes = probes + 1
+    }
+    return -1
+}
+
+// The string an id names, as a zero-copy view into the interner's storage.
+pub fn lookup(read it: Interner, id: i64) -> str {
+    let r: ISlot = slot_at(it.byid, id as usize)
+    let vs: []u8 = slice(u8, r.kptr, r.klen)
+    return from_utf8(vs)
+}
+
+// Free every owned key, the table, and the id array. A free function so the
+// module-qualified `mem.free_bytes` resolves (qualified calls inside an impl-method
+// body are a known bootstrap limitation; see std/list.jtr).
+fn free_interner(read a: Allocator, slots: *mut ISlot, byid: *mut ISlot, n: usize, cap: usize, idcap: usize) {
+    var i: usize = 0
+    for i < n {
+        var r: ISlot = slot_at(byid, i)
+        mem.free_bytes(a, r.kptr)
+        i = i + 1
+    }
+    if cap != 0 { mem.free_bytes(a, slots as *mut u8) }
+    if idcap != 0 { mem.free_bytes(a, byid as *mut u8) }
+}
+
+// RAII: keys, table, and id array released at scope exit — no manual free.
+impl Drop for Interner {
+    fn drop(mut self) {
+        free_interner(self.a, self.slots, self.byid, self.n, self.cap, self.idcap)
+    }
+}
