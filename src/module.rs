@@ -36,21 +36,29 @@ use crate::span::Span;
 pub type ModId = usize;
 
 /// Per-module bookkeeping, threaded into the type checker.
+///
+/// Two index spaces share this struct. **Modules** are namespaces (`ModId`): a
+/// single `.jtr` file, or — under directory-as-module (design §9) — a whole
+/// directory of files sharing one namespace. **Regions** are individual source
+/// files, one per loaded file, used for diagnostic rendering. For a program of
+/// only single-file modules the two spaces coincide (one region per module); a
+/// directory-module is one module spanning several regions.
 #[derive(Default)]
 pub struct Modules {
-    /// Display name of each module (its file stem), e.g. `mem`.
+    /// Display name of each *module* (a file stem, or a directory stem for a
+    /// directory-module). Indexed by `ModId`.
     pub names: Vec<String>,
-    /// Path shown in diagnostics for each module.
+    /// Path shown in diagnostics for each *source region*.
     pub paths: Vec<String>,
-    /// Each module's own source text (for local-offset diagnostic rendering).
+    /// Each *region*'s own source text (for local-offset diagnostic rendering).
     pub srcs: Vec<String>,
-    /// Each module's base offset within the concatenated global source buffer.
+    /// Each *region*'s base offset within the concatenated global source buffer.
     pub bases: Vec<usize>,
-    /// The owning module of each item in `Program::ast.items` (parallel vector).
+    /// The owning *module* of each item in `Program::ast.items` (parallel vector).
     pub item_mod: Vec<ModId>,
     /// Whether each item in `Program::ast.items` is `pub` (parallel vector).
     pub item_pub: Vec<bool>,
-    /// Per module: import binding name → the module it refers to.
+    /// Per *module*: import binding name → the module it refers to.
     pub imports: Vec<HashMap<String, ModId>>,
 }
 
@@ -70,15 +78,16 @@ impl Modules {
         }
     }
 
-    /// The module a global span falls in (by base-offset range). Falls back to
-    /// module 0 if nothing matches (e.g. a synthesized span).
-    fn module_of(&self, span: Span) -> ModId {
+    /// The *source region* a global span falls in (by base-offset range). Falls
+    /// back to region 0 if nothing matches (e.g. a synthesized span). Used for
+    /// diagnostics, so it indexes the per-region arrays, not the module space.
+    fn region_of(&self, span: Span) -> usize {
         let at = span.start as usize;
-        for m in 0..self.bases.len() {
-            let lo = self.bases[m];
-            let hi = lo + self.srcs[m].len();
+        for r in 0..self.bases.len() {
+            let lo = self.bases[r];
+            let hi = lo + self.srcs[r].len();
             if at >= lo && at <= hi {
-                return m;
+                return r;
             }
         }
         0
@@ -87,15 +96,15 @@ impl Modules {
     /// Render a diagnostic against its own file, translating the global span back
     /// to that file's local offsets so `path:line:col` and the caret are correct.
     pub fn render(&self, d: &Diagnostic, severity: Severity) -> String {
-        let m = self.module_of(d.span);
-        let base = self.bases[m];
+        let r = self.region_of(d.span);
+        let base = self.bases[r];
         let local = Span::new(
             (d.span.start as usize).saturating_sub(base),
             (d.span.end as usize).saturating_sub(base),
         );
         let mut d = d.clone();
         d.span = local;
-        d.render(&self.srcs[m], &self.paths[m], severity)
+        d.render(&self.srcs[r], &self.paths[r], severity)
     }
 }
 
@@ -151,13 +160,34 @@ impl Loader {
     /// the `import` that pulled this file in, so a missing-file or cycle error
     /// points at the offending `import`. Returns the loaded module's id, or
     /// `None` if the file could not be loaded.
+    /// Resolve an `import "p"` (relative to `from_dir`) to either a file `p.jtr`
+    /// or a directory `p/` — directory-as-module (design §9), a directory of
+    /// `.jtr` files sharing one namespace. A file is preferred when both exist.
+    fn load_import(&mut self, from_dir: &Path, p: &str, import_span: Option<Span>) -> Option<ModId> {
+        let file = from_dir.join(format!("{p}.jtr"));
+        if file.is_file() {
+            return self.load_file(&file, import_span);
+        }
+        let dir = from_dir.join(p);
+        if dir.is_dir() {
+            return self.load_dir(&dir, import_span);
+        }
+        // Neither spelling exists — report against the `.jtr` form (the common case).
+        let span = import_span.unwrap_or(Span::new(0, 0));
+        self.diags.push(Diagnostic::new(
+            format!("cannot read module `{}`: no such file or directory", file.display()),
+            span,
+        ));
+        None
+    }
+
+    /// Load a single `.jtr` file as its own module (one module, one region).
     fn load_file(&mut self, path: &Path, import_span: Option<Span>) -> Option<ModId> {
         // A stable key for memoization + cycle detection. `canonicalize` resolves
         // `.`/`..`/symlinks/case so two spellings of one file share a module; if
         // it fails (e.g. the file is missing) fall back to the raw path so the
         // read below produces the user-facing "cannot read" error.
         let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-
         if let Some(&id) = self.loaded.get(&key) {
             return Some(id); // already merged (diamond import)
         }
@@ -165,7 +195,6 @@ impl Loader {
             self.cycle_error(&key, import_span);
             return None;
         }
-
         let src = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
@@ -177,21 +206,80 @@ impl Loader {
                 return None;
             }
         };
+        let mid = self.new_module(module_stem(path));
+        self.visiting.push(key.clone());
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        self.add_file_to_module(mid, src, path, &dir);
+        self.visiting.pop();
+        self.loaded.insert(key, mid);
+        Some(mid)
+    }
 
-        // Reserve this module's id and record its global source region.
-        let id = self.names.len();
+    /// Load every `.jtr` file in a directory as **one** shared-namespace module
+    /// (design §9: a directory is a module). Files are merged in sorted order, so
+    /// the module is a deterministic function of its contents regardless of the
+    /// filesystem's enumeration order.
+    fn load_dir(&mut self, dir: &Path, import_span: Option<Span>) -> Option<ModId> {
+        let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        if let Some(&id) = self.loaded.get(&key) {
+            return Some(id); // already merged (diamond import)
+        }
+        if self.visiting.contains(&key) {
+            self.cycle_error(&key, import_span);
+            return None;
+        }
+        let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
+            Ok(rd) => rd
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("jtr"))
+                .collect(),
+            Err(e) => {
+                let span = import_span.unwrap_or(Span::new(0, 0));
+                self.diags.push(Diagnostic::new(
+                    format!("cannot read module directory `{}`: {e}", dir.display()),
+                    span,
+                ));
+                return None;
+            }
+        };
+        files.sort(); // determinism: never depend on read_dir order
+        let mid = self.new_module(module_stem(dir));
+        self.visiting.push(key.clone());
+        // Memoize before loading the files so a diamond — or an intra-directory
+        // file that imports its own package — resolves to this same module.
+        self.loaded.insert(key.clone(), mid);
+        for f in files {
+            match std::fs::read_to_string(&f) {
+                Ok(src) => self.add_file_to_module(mid, src, &f, dir),
+                Err(e) => self.diags.push(Diagnostic::new(
+                    format!("cannot read module file `{}`: {e}", f.display()),
+                    import_span.unwrap_or(Span::new(0, 0)),
+                )),
+            }
+        }
+        self.visiting.pop();
+        Some(mid)
+    }
+
+    /// Reserve a fresh module id with the given display name.
+    fn new_module(&mut self, name: String) -> ModId {
+        let mid = self.names.len();
+        self.names.push(name);
+        self.imports.push(HashMap::new());
+        mid
+    }
+
+    /// Add one source file as a *region* of module `mid`: record its global source
+    /// region, lex + parse it into the shared arena, route its items to `mid`, and
+    /// merge its imports (resolved relative to `from_dir`) into `mid`'s bindings.
+    fn add_file_to_module(&mut self, mid: ModId, src: String, path: &Path, from_dir: &Path) {
         let base = self.src_all.len();
         self.src_all.push_str(&src);
         let end = self.src_all.len();
-        self.src_all.push('\n'); // keep module regions disjoint
-
-        self.names.push(module_stem(path));
+        self.src_all.push('\n'); // keep regions disjoint
         self.paths.push(path.display().to_string());
         self.srcs.push(src);
         self.bases.push(base);
-        self.imports.push(HashMap::new());
-
-        self.visiting.push(key.clone());
 
         // Lex this file's *region* of the shared buffer → global spans.
         let (tokens, lex_diags) = Lexer::new_slice(&self.src_all, base, end).tokenize();
@@ -203,31 +291,23 @@ impl Loader {
         self.ast = ast;
         self.diags.extend(parse_diags);
 
-        // Process imports first (so dependencies are merged), then this module's
-        // own items.
-        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
         for item in items {
             if let Item::Import(im) = item {
-                let target = dir.join(format!("{}.jtr", im.path));
                 let binding = im
                     .alias
                     .as_ref()
                     .map(|a| a.name.clone())
                     .unwrap_or_else(|| last_segment(&im.path));
-                if let Some(mid) = self.load_file(&target, Some(im.span)) {
-                    self.imports[id].insert(binding, mid);
+                if let Some(tmid) = self.load_import(from_dir, &im.path, Some(im.span)) {
+                    self.imports[mid].insert(binding, tmid);
                 }
                 continue;
             }
             let is_pub = item_is_pub(&item);
             self.ast.items.push(item);
-            self.item_mod.push(id);
+            self.item_mod.push(mid);
             self.item_pub.push(is_pub);
         }
-
-        self.visiting.pop();
-        self.loaded.insert(key, id);
-        Some(id)
     }
 
     fn cycle_error(&mut self, key: &Path, import_span: Option<Span>) {
@@ -285,7 +365,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for (name, contents) in files {
-            std::fs::write(dir.join(name), contents).unwrap();
+            let path = dir.join(name);
+            // Allow nested names like `pkg/a.jtr` (directory-as-module fixtures).
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, contents).unwrap();
         }
         dir
     }
@@ -856,6 +941,86 @@ mod tests {
             diags.iter().any(|d| d.message.contains("`nope` is not an imported module")),
             "an unbound module qualifier must error: {:?}",
             diags
+        );
+    }
+
+    // --- directory-as-module (modules-v2, increment 3; design §9) ---
+
+    /// `import "pkg"` where `pkg/` is a directory loads **all** its `.jtr` files
+    /// as one shared-namespace module: items in one file see the (even private)
+    /// items of its sibling files unqualified, and the directory is one `ModId`.
+    #[test]
+    fn a_directory_is_one_shared_namespace_module() {
+        let dir = fixture(
+            "dirmod",
+            &[
+                ("main.jtr", "import \"pkg\"\nfn main() -> i32 { return pkg.alpha() }"),
+                // `alpha` (in a.jtr) calls `helper` (private, a.jtr) and `beta`
+                // (b.jtr) *unqualified* — only possible if the directory's files
+                // share one namespace.
+                ("pkg/a.jtr", "pub fn alpha() -> i32 { return helper() + beta() }\nfn helper() -> i32 { return 2 }"),
+                ("pkg/b.jtr", "pub fn beta() -> i32 { return helper() * 20 }"),
+            ],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        // Two *modules* (main + pkg), but three *regions* (main.jtr, a.jtr, b.jtr).
+        assert_eq!(prog.modules.names.len(), 2, "main + the merged `pkg` directory module");
+        assert_eq!(prog.modules.srcs.len(), 3, "three source-file regions: main, a, b");
+        // All of pkg's items belong to the *same* module id.
+        let pkg_mods: std::collections::HashSet<ModId> = prog
+            .ast
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| match it {
+                Item::Fn(f) if matches!(f.name.name.as_str(), "alpha" | "beta" | "helper") => {
+                    Some(prog.modules.item_mod[i])
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pkg_mods.len(), 1, "alpha/beta/helper all share one module id: {pkg_mods:?}");
+        let (info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(diags.is_empty(), "cross-file unqualified calls within the package resolve: {:?}", diags);
+        let (_c, cd) = crate::cgen::emit(&prog.ast, &info);
+        assert!(cd.is_empty(), "cgen diags: {:?}", cd);
+    }
+
+    /// Two files of the same directory-module defining the same top-level name is
+    /// a *duplicate* (they share one namespace) — and the error points at the
+    /// offending file (per-region diagnostic rendering survives the merge).
+    #[test]
+    fn same_name_in_two_files_of_a_directory_is_a_duplicate() {
+        let dir = fixture(
+            "dirmod_dup",
+            &[
+                ("main.jtr", "import \"pkg\"\nfn main() -> i32 { return pkg.dup() }"),
+                ("pkg/a.jtr", "pub fn dup() -> i32 { return 1 }"),
+                ("pkg/b.jtr", "pub fn dup() -> i32 { return 2 }"),
+            ],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        let (_info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        let dup = diags.iter().find(|d| d.message.contains("duplicate definition of `dup`"));
+        assert!(dup.is_some(), "same name in two package files is a duplicate: {:?}", diags);
+        // The diagnostic renders against the file it occurred in (region-accurate).
+        let rendered = prog.modules.render(dup.unwrap(), crate::diag::Severity::Error);
+        assert!(rendered.contains("b.jtr"), "duplicate points at the offending file:\n{rendered}");
+    }
+
+    /// A non-existent import (neither `p.jtr` nor `p/`) is a clean load error.
+    #[test]
+    fn a_missing_import_reports_cleanly() {
+        let dir = fixture(
+            "dirmod_missing",
+            &[("main.jtr", "import \"ghost\"\nfn main() -> i32 { return 0 }")],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        assert!(
+            prog.diags.iter().any(|d| d.message.contains("cannot read module") && d.message.contains("ghost")),
+            "a missing import must report: {:?}",
+            prog.diags
         );
     }
 }

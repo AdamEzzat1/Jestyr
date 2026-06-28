@@ -94,7 +94,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | H | Function-pointer types | 0% | HIGH | M | ✓ | ✓ (vtables) |
 | I | Error-handling polish | ~70% | MED | S | ✓ | — |
 | J | Numeric / operator completeness | ~70% | MED | S–M | ✓ | ✓ (determinism) |
-| K | Module system v2 | ~75% | MED | M | ✓ | ✓✓ (build/incremental) |
+| K | Module system v2 | ~85% | MED | M | ✓ | ✓✓ (build/incremental) |
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
 | N | Concurrency polish | ~50% | MED | M | ✓ | — |
@@ -197,7 +197,7 @@ determinism** cares); float↔int cast edge cases; bit-width-aware literals; `as
 done; possibly operator methods. Determinism-relevant: no-FMA, compensated ops are a
 *Motley* concern but the numeric model starts here.
 
-### K. Module system v2 — ~75% (MED conflict; files: module.rs + typeck)
+### K. Module system v2 — ~85% (MED conflict; files: module.rs + typeck)
 **Done:** `import`, `pub` visibility, qualified access, cycle detection, multi-file
 merge; **per-module namespaces for functions + consts** (increment 1) — resolution
 is keyed on `(ModId, name)`, an unqualified name resolves current-module-first and
@@ -211,10 +211,16 @@ alongside a *non-generic* one), which **cleared the logged self-host blocker**
 `mod.Type` / `mod.Type(args)`** (increment 2) — a new additive `TypeKind::Path`
 arm, parsed in type position and lowered like `Name`/`App`, with a visibility audit
 enforcing the type is `pub` in (and owned by) the target module (private / unknown /
-unbound-module qualifiers all error). **Left:** **directory-as-module**; **module
-content-hashing** (the unique feature — sha256 of each module's normalized form →
-provably-incremental builds, pairs with O's `attest`); then `build.jestyr`/manifest
-(deferred: lockfile/vendored-deps/effects — ecosystem-premature). **Also deferred:**
+unbound-module qualifiers all error). **Directory-as-module** (increment 3, design §9)
+— `import "pkg"` where `pkg/` is a directory loads *all* its `.jtr` files as one
+shared-namespace module (sorted for determinism); the loader now separates the
+*module* id space (namespaces) from the *region* id space (source files) so
+diagnostics still point at the exact file while items across a package's files share
+one namespace (a private helper in one file is visible to its siblings; two files
+defining the same name is a duplicate). **Left:** **module content-hashing** (the
+unique feature — sha256 of each module's normalized form → provably-incremental
+builds, pairs with O's `attest`); then `build.jestyr`/manifest (deferred:
+lockfile/vendored-deps/effects — ecosystem-premature). **Also deferred:**
 full *type* namespacing (two modules defining the same type name) — types stay
 globally unique today, so `mod.Type` resolves a unique type + enforces visibility;
 same-name-type collisions are a mechanical follow-up on the increment-1 pattern.

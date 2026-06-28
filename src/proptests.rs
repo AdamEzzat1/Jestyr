@@ -1754,7 +1754,11 @@ mod modules_props {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for (name, src) in files {
-            std::fs::write(dir.join(name), src).unwrap();
+            let path = dir.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, src).unwrap();
         }
         let prog = crate::module::load(dir.join("main.jtr").to_str().unwrap());
         let mut diags: Vec<String> = prog.diags.iter().map(|d| d.message.clone()).collect();
@@ -1854,6 +1858,34 @@ mod modules_props {
             prop_assert!(diags.is_empty(), "qualified type paths compile cleanly: {:?}", diags);
             for j in 0..k {
                 prop_assert!(c.contains(&format!("jestyr_use{j}(Jestyr_T{j}")), "T{j} lowered:\n{c}");
+            }
+            prop_assert_eq!(pipeline_multi(&files).1, c);
+        }
+
+        /// **Directory-as-module is one shared namespace + deterministic.** A `pkg/`
+        /// of `k` files, each defining a `pub fn f<j>` that the next references
+        /// *unqualified*, plus a root importing `pkg`. They share a namespace (no
+        /// qualification needed between files), compile cleanly, and the merged
+        /// module is order-independent — the same program lowers to identical C.
+        #[test]
+        fn directory_is_a_deterministic_shared_namespace(k in 2usize..=4) {
+            let mut files = Vec::new();
+            for j in 0..k {
+                // f0 returns a constant; f<j> (j>0) calls f<j-1> — a cross-file
+                // unqualified call, only valid because the package shares a namespace.
+                let body = if j == 0 {
+                    format!("pub fn f0() -> i32 {{ return 1 }}")
+                } else {
+                    format!("pub fn f{j}() -> i32 {{ return f{} () + 1 }}", j - 1)
+                };
+                files.push((format!("pkg/g{j}.jtr"), body));
+            }
+            files.push(("main.jtr".to_string(), format!("import \"pkg\"\nfn main() -> i32 {{ return pkg.f{}() }}", k - 1)));
+            let (diags, c) = pipeline_multi(&files);
+            prop_assert!(diags.is_empty(), "package files share a namespace and compile: {:?}", diags);
+            // One module for the whole package: every f<j> emits a bare symbol.
+            for j in 0..k {
+                prop_assert!(c.contains(&format!("jestyr_f{j}(void)")), "f{j} emitted:\n{c}");
             }
             prop_assert_eq!(pipeline_multi(&files).1, c);
         }
