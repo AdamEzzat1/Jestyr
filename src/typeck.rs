@@ -49,6 +49,7 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
         owner,
         name_mods,
         dup,
+        type_first_mod: HashMap::new(),
         cur_mod: 0,
         table: GlobalTable::default(),
         expr_types: vec![Ty::Unknown; ast.exprs.len()],
@@ -145,6 +146,11 @@ struct TypeChecker<'a> {
     name_mods: HashMap<String, Vec<ModId>>,
     /// fn/const names defined in more than one module (drives `canon`).
     dup: HashSet<String>,
+    /// type name → the module that first defined it, to tell a same-module
+    /// redefinition from a cross-module type-name collision (types are still
+    /// global across modules — increment 6 is the *diagnostic*, not full type
+    /// namespacing).
+    type_first_mod: HashMap<String, ModId>,
     /// The module whose item is currently being checked.
     cur_mod: ModId,
     table: GlobalTable,
@@ -231,8 +237,10 @@ impl<'a> TypeChecker<'a> {
         let ast = self.ast;
 
         // Phase 1: register the names of all user types so they can be referred
-        // to in any order.
-        for item in &ast.items {
+        // to in any order. `cur_mod` is tracked so a re-registration can tell a
+        // same-module redefinition from a cross-module type-name collision.
+        for (i, item) in ast.items.iter().enumerate() {
+            self.cur_mod = *self.modules.item_mod.get(i).unwrap_or(&0);
             match item {
                 Item::Struct { name, is_record, attrs, .. } => {
                     let i = self.register_type(name, false);
@@ -253,7 +261,8 @@ impl<'a> TypeChecker<'a> {
                 Item::Distinct(d) => {
                     // Register the name now; the base type is lowered in phase 2.
                     if self.table.type_index.contains_key(&d.name.name) {
-                        self.error(d.name.span, format!("duplicate definition of `{}`", d.name.name));
+                        let msg = self.type_dup_message(&d.name.name);
+                        self.error(d.name.span, msg);
                     } else {
                         let idx = self.table.types.len();
                         self.table.types.push(TypeDecl {
@@ -264,6 +273,7 @@ impl<'a> TypeChecker<'a> {
                             type_params: Vec::new(),
                         });
                         self.table.type_index.insert(d.name.name.clone(), idx);
+                        self.type_first_mod.insert(d.name.name.clone(), self.cur_mod);
                     }
                 }
                 _ => {}
@@ -767,7 +777,8 @@ impl<'a> TypeChecker<'a> {
 
     fn register_type(&mut self, name: &Ident, is_enum: bool) -> usize {
         if let Some(&i) = self.table.type_index.get(&name.name) {
-            self.error(name.span, format!("duplicate definition of `{}`", name.name));
+            let msg = self.type_dup_message(&name.name);
+            self.error(name.span, msg);
             return i;
         }
         let idx = self.table.types.len();
@@ -784,7 +795,27 @@ impl<'a> TypeChecker<'a> {
             type_params: Vec::new(),
         });
         self.table.type_index.insert(name.name.clone(), idx);
+        self.type_first_mod.insert(name.name.clone(), self.cur_mod);
         idx
+    }
+
+    /// The diagnostic for redefining a type `name`. A genuine same-module
+    /// redefinition is a plain "duplicate definition"; a name defined in *two
+    /// different modules* is a cross-module collision — type names are still global
+    /// across modules (per-module *type* namespaces are a deferred follow-up of
+    /// the function/const namespacing), so the user must rename one. Distinguishing
+    /// the two turns a confusing "duplicate" into an actionable message.
+    fn type_dup_message(&self, name: &str) -> String {
+        match self.type_first_mod.get(name) {
+            Some(&other) if other != self.cur_mod => {
+                let a = self.modules.names.get(other).map(String::as_str).unwrap_or("?");
+                let b = self.modules.names.get(self.cur_mod).map(String::as_str).unwrap_or("?");
+                format!(
+                    "type `{name}` is defined in both module `{a}` and module `{b}` — type names are global across modules, so rename one (per-module type namespaces are not yet supported)"
+                )
+            }
+            _ => format!("duplicate definition of `{name}`"),
+        }
     }
 
     /// Reject a field that stores the enclosing type *by value* (`struct Node {

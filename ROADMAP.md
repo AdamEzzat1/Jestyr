@@ -94,7 +94,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | H | Function-pointer types | 0% | HIGH | M | ✓ | ✓ (vtables) |
 | I | Error-handling polish | ~70% | MED | S | ✓ | — |
 | J | Numeric / operator completeness | ~70% | MED | S–M | ✓ | ✓ (determinism) |
-| K | Module system v2 | ~92% | MED | M | ✓ | ✓✓ (build/incremental) |
+| K | Module system v2 | ~93% | MED | M | ✓ | ✓✓ (build/incremental) |
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
 | N | Concurrency polish | ~50% | MED | M | ✓ | — |
@@ -197,7 +197,7 @@ determinism** cares); float↔int cast edge cases; bit-width-aware literals; `as
 done; possibly operator methods. Determinism-relevant: no-FMA, compensated ops are a
 *Motley* concern but the numeric model starts here.
 
-### K. Module system v2 — ~92% (MED conflict; files: module.rs + typeck)
+### K. Module system v2 — ~93% (MED conflict; files: module.rs + typeck)
 **Done:** `import`, `pub` visibility, qualified access, cycle detection, multi-file
 merge; **per-module namespaces for functions + consts** (increment 1) — resolution
 is keyed on `(ModId, name)`, an unqualified name resolves current-module-first and
@@ -231,8 +231,12 @@ computed hash matches and errors on drift (lockfile-lite reproducibility; opt-in
 unpinned imports are never checked). **Left:** `build.jestyr`/manifest (deferred:
 lockfile/vendored-deps/effects — ecosystem-premature). **Also deferred:**
 full *type* namespacing (two modules defining the same type name) — types stay
-globally unique today, so `mod.Type` resolves a unique type + enforces visibility;
-same-name-type collisions are a mechanical follow-up on the increment-1 pattern.
+globally unique, so `mod.Type` resolves a unique type + enforces visibility; a
+cross-module type-name collision is now a **clear, actionable error** naming both
+modules (increment 6) rather than a confusing "duplicate definition", but making
+such types actually *collidable* is a wide cgen change (module-aware canon through
+~20 `Jestyr_<type>` sites + generics/variants) with no blocker — a mechanical
+follow-up on the increment-1 pattern, intentionally not done.
 **Motley:** the DAG already enables the parallel/incremental-compilation story;
 hashing makes it provable.
 

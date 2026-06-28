@@ -1258,6 +1258,58 @@ mod tests {
         );
     }
 
+    // --- cross-module type-name collision diagnostic (modules-v2, increment 6) ---
+
+    /// Two modules each defining a type `Slot` is a cross-module collision (type
+    /// names are still global across modules) — reported with an actionable message
+    /// that names both modules, distinct from a same-module redefinition.
+    #[test]
+    fn a_cross_module_type_collision_names_both_modules() {
+        let dir = fixture(
+            "typecol",
+            &[
+                ("main.jtr", "import \"a\"\nimport \"b\"\nfn main() -> i32 { return b.g() }"),
+                ("a.jtr", "pub struct Slot { pub v: i32 }"),
+                ("b.jtr", "pub struct Slot { pub v: i32 }\npub fn g() -> i32 { return 0 }"),
+            ],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        let (_info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(
+            diags.iter().any(|d| d.message.contains("type `Slot` is defined in both module `a` and module `b`")),
+            "a cross-module type collision must name both modules: {:?}",
+            diags
+        );
+        // It must NOT be reported as a plain same-module duplicate.
+        assert!(
+            !diags.iter().any(|d| d.message == "duplicate definition of `Slot`"),
+            "the cross-module case should not use the same-module wording: {:?}",
+            diags
+        );
+    }
+
+    /// Two same-named types *within one module* is still a plain duplicate
+    /// definition (the genuine redefinition bug), not the cross-module message.
+    #[test]
+    fn a_same_module_type_duplicate_stays_a_plain_duplicate() {
+        let dir = fixture(
+            "typedup",
+            &[("main.jtr", "struct X { a: i32 }\nstruct X { b: i32 }\nfn main() -> i32 { return 0 }")],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        let (_info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(
+            diags.iter().any(|d| d.message == "duplicate definition of `X`"),
+            "a same-module duplicate stays plain: {:?}",
+            diags
+        );
+        assert!(
+            !diags.iter().any(|d| d.message.contains("defined in both module")),
+            "a same-module duplicate is not a cross-module collision: {:?}",
+            diags
+        );
+    }
+
     /// A non-existent import (neither `p.jtr` nor `p/`) is a clean load error.
     #[test]
     fn a_missing_import_reports_cleanly() {
