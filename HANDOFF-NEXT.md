@@ -264,8 +264,14 @@ hand-written fn-pointer-field vtable from the first done section.
   a method's args) aren't rejected, just unsupported through `dyn`.
 
 **Trait stages A–F are all done.** The next frontier is the broader roadmap
-(`jestyr-design.md §19`) — toward self-hosting, the high-value gaps are a `HashMap`
-in the standard library and file I/O. See the session summary in `~/Downloads`.
+(`jestyr-design.md §19`) — toward self-hosting. The three OS-/stdlib gaps a compiler
+can't run without are now **built** (each demo + gcc-oracle tested): **file I/O**
+(`std/fs.jtr` + read_file/write_file/file_exists/remove_file intrinsics),
+**command-line args** (`std/env.jtr` + `main(argc,argv)` capture), and a **symbol-table
+map** (`std/strmap.jtr` — an open-addressing `str -> i64` table, the deterministic
+alternative to a chaining `HashMap`). See ROADMAP workstream P. The remaining
+self-hosting work is the lexer vertical slice → the ~27K-line port, plus per-module
+namespaces (K) for comfort.
 
 ---
 
@@ -326,8 +332,9 @@ C-linker `WinMain` error (`test` mode is exempt; it synthesizes its own `main`).
   per-impl static instances, byte-compatible with the hand-written fn-pointer
   vtable. See the done-section / §5.12.
 - **Remaining:** none — **the trait epic (A–F) is complete.** The frontier moves to
-  the broader roadmap (`jestyr-design.md §19`); the self-hosting-relevant gaps are a
-  `HashMap` stdlib + file I/O.
+  the broader roadmap (`jestyr-design.md §19`); the self-hosting plumbing — file I/O,
+  command-line args, and a symbol-table map (`std/{fs,env,strmap}.jtr`) — is now built
+  (ROADMAP workstream P), leaving the lexer slice + the full port.
 
 ---
 

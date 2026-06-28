@@ -22,6 +22,10 @@ model (`&T`/`&[r]T`), generics + monomorphization, methods, closures, error sets
 layout attributes, **modules** (item K), **stdlib + allocator-as-value** (item I),
 the full **loop** system (unified `for` + fast-follows), **casts**, **byte-level
 string iteration**, and **doc comments + a doc generator** (item C, `jestyrc doc`).
+Since this snapshot: traits A–F + `dyn`, fn-pointer types, owned `String`/text ops,
+fixed-size arrays, the numerics/determinism stack, and the **self-hosting plumbing** —
+**file I/O**, **command-line args**, and a **symbol-table map** (`std/{fs,env,strmap}.jtr`;
+see workstream P).
 
 ---
 
@@ -95,7 +99,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
 | N | Concurrency polish | ~50% | MED | M | ✓ | — |
 | O | Tooling (fmt / test / doc / LSP) | 0% | LOW | M | ✓✓ | ✓ |
-| P | Self-hosting | 0% | — | XL | ✓✓ | ✓✓ (the gate) |
+| P | Self-hosting | plumbing ✅; port open | — | XL | ✓✓ | ✓✓ (the gate) |
 
 ---
 
@@ -223,12 +227,26 @@ channels); escape-checked join-safety; the `par` loop (design + MOTLEY note: mus
 **doc generator** (pairs with C), eventually an **LSP**. Each is a largely new
 file/subcommand → **excellent parallel candidates** that barely touch the core.
 
-### P. Self-hosting — 0% (the gate; XL)
-**Design §19 / Motley prerequisite.** Rewrite the Jestyr compiler in Jestyr. **Gated
-on:** E (real strings — a compiler is a text processor), probably F or H (dispatch
-tables), and arguably the layout/efficiency work. **Recommended first step:** a
-*vertical slice* — port the **lexer** to Jestyr; it's small, self-contained, and will
-surface exactly which features are still missing.
+### P. Self-hosting — plumbing landed; the port itself remains (the gate; XL)
+**Design §19 / Motley prerequisite.** Rewrite the Jestyr compiler in Jestyr. The
+language prerequisites are now largely met — E (real strings) ✅, F (traits) ✅, H
+(fn-pointer types) ✅ — and the three OS-/stdlib-facing **self-hosting unblockers** a
+compiler can't run without are now built (each with a demo + gcc-oracle test):
+- **File I/O** ✅ — `read_file`/`write_file`/`file_exists`/`remove_file` intrinsics +
+  `std/fs.jtr` (`fs.read_text`/`write`/`exists`/`remove`). Read `.jtr` source, emit output.
+- **Command-line args** ✅ — `main(argc, argv)` capture + `arg_count`/`arg` intrinsics
+  + `std/env.jtr` (`env.argc`/`env.argv`). Learn *which* file to compile.
+- **A symbol-table map** ✅ — `std/strmap.jtr`, an open-addressing `str -> i64` table
+  (FNV-1a + SplitMix64, owned keys, RAII), the deliberate cache-friendly/deterministic
+  alternative to a chaining hashmap. Every pass past the lexer needs one.
+
+**Recommended first step (now unblocked):** the *vertical slice* — port the **lexer**
+to Jestyr (`fs.read_text` the source, lex to a token stream); it's small, self-contained,
+and will surface the remaining gaps (likely `Self {}` literals and per-module
+namespaces, K). **Still open before a comfortable full port:** per-module namespaces +
+a basic `build.jestyr` (K), and the ~27K-line port itself. **Follow-ups on the
+plumbing:** a recoverable `read_file -> String !IoError`; a generic-value `StrMap(V)` /
+string interner (str→dense-id) so downstream tables go integer-keyed.
 
 ---
 
