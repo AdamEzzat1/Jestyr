@@ -1889,6 +1889,29 @@ mod modules_props {
             }
             prop_assert_eq!(pipeline_multi(&files).1, c);
         }
+
+        /// **Module content-hash: comment/whitespace-insensitive, deterministic, and
+        /// semantics-sensitive.** The hash is over the normalized post-parse form, so
+        /// a comment/whitespace-only edit leaves it unchanged and is reproducible,
+        /// while a changed literal changes it.
+        #[test]
+        fn module_hash_is_normalized_deterministic_and_semantic(v in 0i32..10_000) {
+            let plain = format!("fn main() -> i32 {{ return {v} }}");
+            let noisy = format!("// lead\nfn   main ()  -> i32 {{\n    return   {v}  // trail\n}}");
+            let other = format!("fn main() -> i32 {{ return {} }}", v + 1);
+            let hp = single_hash(&plain);
+            prop_assert_eq!(&hp, &single_hash(&noisy), "comment/whitespace edit must not change the hash");
+            prop_assert_eq!(&hp, &single_hash(&plain), "the hash is deterministic");
+            prop_assert_ne!(&hp, &single_hash(&other), "a semantic edit must change the hash");
+            prop_assert_eq!(hp.len(), 64, "a sha256 hex digest");
+        }
+    }
+
+    /// The single-module content hash of a source string (in-memory; no loader).
+    fn single_hash(src: &str) -> String {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
+        crate::module::Modules::single(&ast).hashes.first().cloned().unwrap_or_default()
     }
 }
 
@@ -1922,6 +1945,7 @@ mod fuzz {
             item_mod: (0..n).map(|i| i % 2).collect(),
             item_pub: vec![true; n],
             imports,
+            hashes: vec![String::new(), String::new()],
         }
     }
 
@@ -1941,6 +1965,20 @@ mod fuzz {
             let mut dup = std::collections::HashSet::new();
             dup.insert(s.clone());
             let _ = crate::types::canon(1, s, &dup);
+        });
+    }
+
+    /// **Module content-hashing never panics and is deterministic.** Computing the
+    /// hash over an arbitrary parsed program (via `Modules::single`, which runs the
+    /// hash path) must not panic and must reproduce — on any adversarial input.
+    #[test]
+    fn fuzz_module_hash() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let (tokens, _) = Lexer::new(s).tokenize();
+            let (ast, _) = Parser::new(s, tokens).parse();
+            let h1 = crate::module::Modules::single(&ast).hashes;
+            let h2 = crate::module::Modules::single(&ast).hashes;
+            assert_eq!(h1, h2, "module hashing is deterministic");
         });
     }
 

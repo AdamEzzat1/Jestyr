@@ -60,6 +60,12 @@ pub struct Modules {
     pub item_pub: Vec<bool>,
     /// Per *module*: import binding name → the module it refers to.
     pub imports: Vec<HashMap<String, ModId>>,
+    /// Per *module*: a content hash (sha256 hex) of its normalized post-parse form
+    /// combined with the hashes of its imports (modules-v2 §9, the unique feature).
+    /// Identical inputs ⇒ identical hash ⇒ the module's compiled output is provably
+    /// reusable; a comment/whitespace-only edit does not change it, a semantic edit
+    /// does. The hash of any module transitively reflects every module it imports.
+    pub hashes: Vec<String>,
 }
 
 impl Modules {
@@ -67,7 +73,7 @@ impl Modules {
     /// the loader): every item belongs to module 0, nothing is imported.
     #[allow(dead_code)]
     pub fn single(ast: &Ast) -> Modules {
-        Modules {
+        let mut m = Modules {
             names: vec!["main".to_string()],
             paths: vec!["<input>".to_string()],
             srcs: vec![String::new()],
@@ -75,7 +81,16 @@ impl Modules {
             item_mod: vec![0; ast.items.len()],
             item_pub: vec![true; ast.items.len()],
             imports: vec![HashMap::new()],
-        }
+            hashes: Vec::new(),
+        };
+        m.hashes = compute_hashes(ast, &m.item_mod, &m.imports, m.names.len());
+        m
+    }
+
+    /// The content hash of a module (empty string if out of range).
+    #[allow(dead_code)]
+    pub fn hash(&self, m: ModId) -> &str {
+        self.hashes.get(m).map(String::as_str).unwrap_or("")
     }
 
     /// The *source region* a global span falls in (by base-offset range). Falls
@@ -121,6 +136,7 @@ pub struct Program {
 pub fn load(root: &str) -> Program {
     let mut l = Loader::default();
     l.load_file(Path::new(root), None);
+    let hashes = compute_hashes(&l.ast, &l.item_mod, &l.imports, l.names.len());
     Program {
         ast: l.ast,
         diags: l.diags,
@@ -132,8 +148,73 @@ pub fn load(root: &str) -> Program {
             item_mod: l.item_mod,
             item_pub: l.item_pub,
             imports: l.imports,
+            hashes,
         },
     }
+}
+
+/// Compute every module's content hash (modules-v2 §9). A module's hash is the
+/// sha256 of its **normalized post-parse form** — the sorted set of its items'
+/// pretty-printed (comment/whitespace-free) renderings, so a comment- or
+/// whitespace-only edit, or a reordering of order-independent declarations, does
+/// not change it, while a semantic edit does — **combined with** the hashes of
+/// the modules it imports (each tagged by its import binding). The combination
+/// makes the hash transitive: a module's identity reflects every module it
+/// depends on, so identical inputs provably yield an identical artifact (the seed
+/// of provably-incremental + cacheable builds; pairs with `jestyr attest`). The
+/// import graph is a DAG (the loader rejects cycles), so a memoized DFS suffices.
+fn compute_hashes(
+    ast: &Ast,
+    item_mod: &[ModId],
+    imports: &[HashMap<String, ModId>],
+    n_modules: usize,
+) -> Vec<String> {
+    // Each module's own normalized form: its items' printed renderings, sorted so
+    // the hash is independent of declaration order (design §9: top-level decls are
+    // order-independent) and of which file in a directory-module they came from.
+    let mut own: Vec<Vec<String>> = vec![Vec::new(); n_modules];
+    for (i, item) in ast.items.iter().enumerate() {
+        let m = *item_mod.get(i).unwrap_or(&0);
+        if m < n_modules {
+            own[m].push(crate::printer::print_item(ast, item));
+        }
+    }
+    for forms in &mut own {
+        forms.sort();
+    }
+    let mut memo: Vec<Option<String>> = vec![None; n_modules];
+    for m in 0..n_modules {
+        module_hash(m, &own, imports, &mut memo);
+    }
+    memo.into_iter().map(|h| h.unwrap_or_default()).collect()
+}
+
+/// The content hash of module `m`, memoized. Recurses into imports first (a DAG),
+/// folding each import's hash in under its binding name (sorted, for determinism).
+fn module_hash(
+    m: ModId,
+    own: &[Vec<String>],
+    imports: &[HashMap<String, ModId>],
+    memo: &mut [Option<String>],
+) -> String {
+    if let Some(h) = &memo[m] {
+        return h.clone();
+    }
+    let mut s = String::new();
+    for form in &own[m] {
+        s.push_str(form);
+        s.push('\n');
+    }
+    let mut imps: Vec<(String, ModId)> =
+        imports[m].iter().map(|(b, &t)| (b.clone(), t)).collect();
+    imps.sort();
+    for (binding, target) in imps {
+        let h = module_hash(target, own, imports, memo);
+        s.push_str(&format!("import {binding} = {h}\n"));
+    }
+    let hash = crate::sha256::hex(s.as_bytes());
+    memo[m] = Some(hash.clone());
+    hash
 }
 
 #[derive(Default)]
@@ -1007,6 +1088,83 @@ mod tests {
         // The diagnostic renders against the file it occurred in (region-accurate).
         let rendered = prog.modules.render(dup.unwrap(), crate::diag::Severity::Error);
         assert!(rendered.contains("b.jtr"), "duplicate points at the offending file:\n{rendered}");
+    }
+
+    // --- module content-hashing (modules-v2, increment 4; the unique feature) ---
+
+    /// Loading the same program twice yields identical module hashes — a
+    /// deterministic function of content (no HashMap iteration order leaks in).
+    #[test]
+    fn module_hashes_are_deterministic() {
+        let files: &[(&str, &str)] = &[
+            ("main.jtr", "import \"lib\"\nfn main() -> i32 { return lib.f(2) }"),
+            ("lib.jtr", "pub fn f(x: i32) -> i32 { return x + 1 }"),
+        ];
+        let d1 = fixture("hash_det1", files);
+        let d2 = fixture("hash_det2", files);
+        let h1 = load(d1.join("main.jtr").to_str().unwrap()).modules.hashes;
+        let h2 = load(d2.join("main.jtr").to_str().unwrap()).modules.hashes;
+        assert_eq!(h1, h2, "same program → identical hashes");
+        assert!(h1.iter().all(|h| h.len() == 64), "each is a sha256 hex digest: {h1:?}");
+    }
+
+    /// A comment- or whitespace-only edit leaves a module's hash unchanged — the
+    /// hash is over the *normalized post-parse form*, not the raw bytes.
+    #[test]
+    fn comment_or_whitespace_edit_does_not_change_the_hash() {
+        let plain = fixture("hash_plain", &[("main.jtr", "fn main() -> i32 { return 1 + 2 }")]);
+        let noisy = fixture(
+            "hash_noisy",
+            &[("main.jtr", "// a leading comment\nfn   main()  ->  i32  {\n    return 1 +    2  // trailing\n}")],
+        );
+        let hp = load(plain.join("main.jtr").to_str().unwrap()).modules.hashes;
+        let hn = load(noisy.join("main.jtr").to_str().unwrap()).modules.hashes;
+        assert_eq!(hp[0], hn[0], "comment/whitespace-only edits must not change the hash");
+    }
+
+    /// A semantic edit (a different literal) *does* change the hash.
+    #[test]
+    fn a_semantic_edit_changes_the_hash() {
+        let a = fixture("hash_sem_a", &[("main.jtr", "fn main() -> i32 { return 1 }")]);
+        let b = fixture("hash_sem_b", &[("main.jtr", "fn main() -> i32 { return 2 }")]);
+        let ha = load(a.join("main.jtr").to_str().unwrap()).modules.hashes;
+        let hb = load(b.join("main.jtr").to_str().unwrap()).modules.hashes;
+        assert_ne!(ha[0], hb[0], "a semantic change must change the hash");
+    }
+
+    /// Reordering order-independent top-level declarations does not change the hash
+    /// (the items' normalized forms are sorted before hashing).
+    #[test]
+    fn reordering_declarations_does_not_change_the_hash() {
+        let ab = fixture("hash_ord_ab", &[("main.jtr", "fn a() -> i32 { return 1 }\nfn b() -> i32 { return 2 }\nfn main() -> i32 { return a() }")]);
+        let ba = fixture("hash_ord_ba", &[("main.jtr", "fn main() -> i32 { return a() }\nfn b() -> i32 { return 2 }\nfn a() -> i32 { return 1 }")]);
+        let hab = load(ab.join("main.jtr").to_str().unwrap()).modules.hashes;
+        let hba = load(ba.join("main.jtr").to_str().unwrap()).modules.hashes;
+        assert_eq!(hab[0], hba[0], "declaration order must not change the hash");
+    }
+
+    /// A module's hash is *transitive*: changing a dependency changes the
+    /// dependent's hash (it folds in the import's hash), while an unrelated
+    /// module's hash is untouched.
+    #[test]
+    fn changing_a_dependency_changes_the_dependents_hash() {
+        let mk = |tag: &str, lib_body: &str| -> Modules {
+            let dir = fixture(
+                tag,
+                &[
+                    ("main.jtr", "import \"lib\"\nimport \"other\"\nfn main() -> i32 { return lib.f() + other.g() }"),
+                    ("lib.jtr", lib_body),
+                    ("other.jtr", "pub fn g() -> i32 { return 100 }"),
+                ],
+            );
+            load(dir.join("main.jtr").to_str().unwrap()).modules
+        };
+        let m1 = mk("hash_dep1", "pub fn f() -> i32 { return 1 }");
+        let m2 = mk("hash_dep2", "pub fn f() -> i32 { return 999 }");
+        // Module order: main=0, lib=1, other=2 (DFS).
+        assert_ne!(m1.hashes[1], m2.hashes[1], "lib's own hash changes");
+        assert_ne!(m1.hashes[0], m2.hashes[0], "main's hash changes transitively via its import of lib");
+        assert_eq!(m1.hashes[2], m2.hashes[2], "the unrelated `other` module's hash is unchanged");
     }
 
     /// A non-existent import (neither `p.jtr` nor `p/`) is a clean load error.

@@ -94,7 +94,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | H | Function-pointer types | 0% | HIGH | M | ✓ | ✓ (vtables) |
 | I | Error-handling polish | ~70% | MED | S | ✓ | — |
 | J | Numeric / operator completeness | ~70% | MED | S–M | ✓ | ✓ (determinism) |
-| K | Module system v2 | ~85% | MED | M | ✓ | ✓✓ (build/incremental) |
+| K | Module system v2 | ~90% | MED | M | ✓ | ✓✓ (build/incremental) |
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
 | N | Concurrency polish | ~50% | MED | M | ✓ | — |
@@ -197,7 +197,7 @@ determinism** cares); float↔int cast edge cases; bit-width-aware literals; `as
 done; possibly operator methods. Determinism-relevant: no-FMA, compensated ops are a
 *Motley* concern but the numeric model starts here.
 
-### K. Module system v2 — ~85% (MED conflict; files: module.rs + typeck)
+### K. Module system v2 — ~90% (MED conflict; files: module.rs + typeck)
 **Done:** `import`, `pub` visibility, qualified access, cycle detection, multi-file
 merge; **per-module namespaces for functions + consts** (increment 1) — resolution
 is keyed on `(ModId, name)`, an unqualified name resolves current-module-first and
@@ -217,10 +217,17 @@ shared-namespace module (sorted for determinism); the loader now separates the
 *module* id space (namespaces) from the *region* id space (source files) so
 diagnostics still point at the exact file while items across a package's files share
 one namespace (a private helper in one file is visible to its siblings; two files
-defining the same name is a duplicate). **Left:** **module content-hashing** (the
-unique feature — sha256 of each module's normalized form → provably-incremental
-builds, pairs with O's `attest`); then `build.jestyr`/manifest (deferred:
-lockfile/vendored-deps/effects — ecosystem-premature). **Also deferred:**
+defining the same name is a duplicate). **Module content-hashing** (increment 4, the
+unique on-thesis feature) — every module gets a sha256 over its *normalized
+post-parse form* (the sorted set of its items' pretty-printed renderings, so a
+comment/whitespace-only edit or a declaration reordering does **not** change it,
+while a semantic edit does) **combined with its imports' hashes** (so the hash is
+transitive — a module's identity reflects every module it depends on). Stored in
+`Modules.hashes`, exposed via `Modules::hash(m)`. Identical inputs ⇒ identical hash ⇒
+the seed of provably-incremental + cacheable builds; pairs with O's `jestyr attest`.
+**Left:** manifest hash-verification (`import "x" = <sha256>`); then
+`build.jestyr`/manifest (deferred: lockfile/vendored-deps/effects —
+ecosystem-premature). **Also deferred:**
 full *type* namespacing (two modules defining the same type name) — types stay
 globally unique today, so `mod.Type` resolves a unique type + enforces visibility;
 same-name-type collisions are a mechanical follow-up on the increment-1 pattern.

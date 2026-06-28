@@ -20,6 +20,16 @@ pub fn print_ast(ast: &Ast) -> String {
     p.out
 }
 
+/// Render a single top-level item to its normalized tree form. Comments and
+/// layout are trivia (never in the AST), so this is the *post-parse* normal form
+/// — the unit the module content-hash (modules-v2 §9) is built from, so a
+/// comment- or whitespace-only edit leaves the hash unchanged.
+pub fn print_item(ast: &Ast, item: &Item) -> String {
+    let mut p = Printer { ast, out: String::new() };
+    p.item(0, item);
+    p.out
+}
+
 struct Printer<'a> {
     ast: &'a Ast,
     out: String,
