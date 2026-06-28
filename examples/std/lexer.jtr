@@ -1,0 +1,159 @@
+// examples/std/lexer.jtr — the self-hosting VERTICAL SLICE: a lexer for (a subset of)
+// Jestyr, written *in Jestyr*. It composes the three self-hosting unblockers — read
+// source with `fs`, take a path from `env` (argv), and classify identifiers with the
+// `intern`er — to turn source text into a token stream. This is the proof-of-concept
+// that Jestyr can implement its own front end.
+//
+// Design notes:
+//   • Keywords are interned FIRST, so they own ids 0..KW_COUNT-1. A scanned identifier
+//     is then a keyword iff its interned id is < KW_COUNT — the interner doubles as the
+//     keyword table, no separate set.
+//   • Each token prints its exact source lexeme (`src[start..i]`), so the output *is*
+//     the source with whitespace and `//` comments stripped — a faithful, deterministic
+//     token dump. A summary line follows: total tokens, #keywords, #identifiers,
+//     #integers, #punctuation, and #distinct user identifiers (via the interner).
+//   • Run with a path to lex a real file (`lexer.exe foo.jtr`); with no args it lexes a
+//     built-in sample (deterministic — what the test pins).
+//
+// Subset (enough to prove the loop; the full lexer adds floats/hex, block comments,
+// strings, and the rest of the operators): identifiers/keywords, decimal integers,
+// `//` line comments, the `->` operator, and single-character punctuation.
+import "mem"
+import "intern"
+import "fs"
+import "env"
+
+fn is_space(x: i32) -> bool {
+    if x == 32 { return true }   // space
+    if x == 9 { return true }    // tab
+    if x == 10 { return true }   // newline
+    if x == 13 { return true }   // carriage return
+    return false
+}
+fn is_alpha(c: u8) -> bool {
+    let x: i32 = c as i32
+    if x >= 65 { if x <= 90 { return true } }    // A-Z
+    if x >= 97 { if x <= 122 { return true } }   // a-z
+    if x == 95 { return true }                   // _
+    return false
+}
+fn is_digit(c: u8) -> bool {
+    let x: i32 = c as i32
+    if x >= 48 { if x <= 57 { return true } }    // 0-9
+    return false
+}
+fn is_alnum(c: u8) -> bool {
+    if is_alpha(c) { return true }
+    return is_digit(c)
+}
+
+// Intern the keyword set (in fixed order → ids 0..N-1). Returns the count N.
+fn intern_keywords(mut it: Interner) -> i64 {
+    intern.intern(it, "fn")
+    intern.intern(it, "let")
+    intern.intern(it, "var")
+    intern.intern(it, "if")
+    intern.intern(it, "else")
+    intern.intern(it, "return")
+    intern.intern(it, "for")
+    intern.intern(it, "while")
+    intern.intern(it, "struct")
+    intern.intern(it, "enum")
+    intern.intern(it, "match")
+    intern.intern(it, "import")
+    intern.intern(it, "pub")
+    return intern.count(it) as i64
+}
+
+// Scan `src`, printing each token's source lexeme, then a 6-number summary.
+fn lex(read src: str, mut it: Interner, kwcount: i64) {
+    let n: usize = src.len
+    var i: usize = 0
+    var total: i32 = 0
+    var nkw: i32 = 0
+    var nid: i32 = 0
+    var nint: i32 = 0
+    var npunct: i32 = 0
+    for i < n {
+        let c: u8 = src[i]
+        let x: i32 = c as i32
+        if is_space(x) {
+            i = i + 1
+        } else {
+            var iscomment: bool = false
+            if x == 47 {                                  // '/'
+                if i + 1 < n {
+                    if (src[i + 1] as i32) == 47 { iscomment = true }
+                }
+            }
+            if iscomment {
+                // `//` line comment — skip to end of line.
+                for i < n {
+                    if (src[i] as i32) == 10 { break }
+                    i = i + 1
+                }
+            } else {
+                let start: usize = i
+                if is_alpha(c) {
+                    i = i + 1
+                    for i < n {
+                        if is_alnum(src[i]) { i = i + 1 } else { break }
+                    }
+                    let lexeme: str = src[start..i]
+                    let id: i64 = intern.intern(it, lexeme)
+                    if id < kwcount { nkw = nkw + 1 } else { nid = nid + 1 }
+                    print_str(lexeme)
+                    total = total + 1
+                } else {
+                    if is_digit(c) {
+                        i = i + 1
+                        for i < n {
+                            if is_digit(src[i]) { i = i + 1 } else { break }
+                        }
+                        print_str(src[start..i])
+                        nint = nint + 1
+                        total = total + 1
+                    } else {
+                        // Punctuation: greedily take `->`, else one character.
+                        var w: usize = 1
+                        if x == 45 {                       // '-'
+                            if i + 1 < n {
+                                if (src[i + 1] as i32) == 62 { w = 2 }   // '>'
+                            }
+                        }
+                        i = i + w
+                        print_str(src[start..i])
+                        npunct = npunct + 1
+                        total = total + 1
+                    }
+                }
+            }
+        }
+    }
+    // Summary: total, keywords, identifiers, integers, punctuation, distinct user ids.
+    let distinct_users: i32 = (intern.count(it) as i64 - kwcount) as i32
+    print_int(total)
+    print_int(nkw)
+    print_int(nid)
+    print_int(nint)
+    print_int(npunct)
+    print_int(distinct_users)
+}
+
+fn main() -> i32 {
+    var a: Allocator = mem.system_allocator()
+    var it: Interner = intern.make(a)
+    let kwcount: i64 = intern_keywords(it)
+
+    if env.argc() > 1 {
+        // Real use: lex the file named on the command line (the self-hosting loop).
+        var src: String = fs.read_text(env.argv(1))
+        lex(string_view(src), it, kwcount)
+        string_free(src)
+    } else {
+        // Deterministic built-in sample (what the test pins).
+        let sample: str = "// add two ints\nfn add(x: i32, y: i32) -> i32 {\n    return x + y\n}\n"
+        lex(sample, it, kwcount)
+    }
+    return 0   // `it` drops here (RAII): interner table, keys, and id array freed
+}

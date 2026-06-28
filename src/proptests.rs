@@ -3502,6 +3502,21 @@ mod c_oracle {
             ["0", "1", "2", "1", "1", "3", "fn", "return", "1", "203", "1", "203"]
         );
     }
+    #[test]
+    fn lexer_slice_demo() {
+        // The self-hosting lexer slice, no args → lexes its built-in sample
+        // `fn add(x: i32, y: i32) -> i32 { return x + y }` (comment + whitespace
+        // stripped, `->` one token), then a 6-number summary: 19 tokens, 2 keywords,
+        // 8 identifiers, 0 integers, 9 punctuation, 4 distinct user identifiers.
+        assert_eq!(
+            toks("examples/std/lexer.jtr"),
+            [
+                "fn", "add", "(", "x", ":", "i32", ",", "y", ":", "i32", ")", "->",
+                "i32", "{", "return", "x", "+", "y", "}",
+                "19", "2", "8", "0", "9", "4",
+            ]
+        );
+    }
 
     /// The PURE canary demo: exercises the whole numeric stack but prints ONLY
     /// integers and `format_float` strings — never `print_f64`/`printf("%g")`. Its

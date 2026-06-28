@@ -500,6 +500,14 @@ mod tests {
     }
 
     #[test]
+    fn lexer_slice_compiles_clean() {
+        // The self-hosting vertical slice: a Jestyr lexer composing `fs` (read source),
+        // `env` (argv), and the `intern`er (keyword/identifier classification). Resolves
+        // across four std imports and lowers clean — the front-end-in-Jestyr proof.
+        pipeline_is_clean("examples/std/lexer.jtr");
+    }
+
+    #[test]
     fn arrays_example_compiles_clean() {
         // Fixed-size arrays `[N]T`: the value-struct typedef, `[v; N]` literal,
         // bounds-checked index read/write, `.len`, and `for x in arr` iteration.
