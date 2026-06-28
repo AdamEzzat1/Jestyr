@@ -250,7 +250,20 @@ impl<'src> Parser<'src> {
             String::new()
         };
         let alias = if self.eat(As) { Some(self.eat_ident("import alias")) } else { None };
-        ImportDecl { path, alias, span: start.to(self.prev_span()) }
+        // Optional pinned content hash: `import "x" = "<sha256>"`.
+        let expected_hash = if self.eat(Eq) {
+            if self.at(Str) {
+                let sp = self.cur().span;
+                self.bump();
+                Some(self.text(sp).trim_matches('"').to_string())
+            } else {
+                self.error(self.cur().span, "expected a quoted sha256 hash after `=` in an import");
+                None
+            }
+        } else {
+            None
+        };
+        ImportDecl { path, alias, expected_hash, span: start.to(self.prev_span()) }
     }
 
     fn parse_fn(&mut self, attrs: Vec<Attribute>) -> FnDecl {

@@ -497,13 +497,19 @@ pub struct ExternFn {
     pub span: Span,
 }
 
-/// `import "path"` or `import "path" as alias` (design §9). A module is a file;
-/// the path is resolved relative to the importing file. The binding defaults to
-/// the path's last segment (`"std/mem"` → `mem`) unless an `as` alias is given.
+/// `import "path"`, `import "path" as alias`, or — pinning the dependency to an
+/// exact content hash — `import "path" = "<sha256>"` (design §9; the manifest /
+/// lockfile-lite surface). A module is a file (or a directory); the path is
+/// resolved relative to the importing file. The binding defaults to the path's
+/// last segment (`"std/mem"` → `mem`) unless an `as` alias is given.
 #[derive(Clone, Debug)]
 pub struct ImportDecl {
     pub path: String,
     pub alias: Option<Ident>,
+    /// An optional pinned content hash: the loader verifies the imported module's
+    /// computed hash equals this, erroring on drift (modules-v2 §9). `None` means
+    /// "don't verify".
+    pub expected_hash: Option<String>,
     pub span: Span,
 }
 

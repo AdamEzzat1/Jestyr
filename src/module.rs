@@ -137,6 +137,22 @@ pub fn load(root: &str) -> Program {
     let mut l = Loader::default();
     l.load_file(Path::new(root), None);
     let hashes = compute_hashes(&l.ast, &l.item_mod, &l.imports, l.names.len());
+    // Verify every pinned-hash import (`import "x" = "<sha256>"`) now that all
+    // module hashes are known: a mismatch means the dependency drifted from the
+    // pinned, reproducible input — the lockfile-lite reproducibility guarantee.
+    for (mid, expected, span) in &l.hash_checks {
+        if let Some(actual) = hashes.get(*mid) {
+            if actual != expected {
+                let name = l.names.get(*mid).map(String::as_str).unwrap_or("?");
+                l.diags.push(Diagnostic::new(
+                    format!(
+                        "module `{name}` hash mismatch: pinned `{expected}`, but its content hashes to `{actual}`"
+                    ),
+                    *span,
+                ));
+            }
+        }
+    }
     Program {
         ast: l.ast,
         diags: l.diags,
@@ -234,6 +250,9 @@ struct Loader {
     loaded: HashMap<PathBuf, ModId>,
     /// The DFS stack of canonical paths currently being loaded (cycle detection).
     visiting: Vec<PathBuf>,
+    /// Pinned-hash checks from `import "x" = "<sha256>"`: (target module, expected
+    /// hash, the import's span). Verified once all module hashes are computed.
+    hash_checks: Vec<(ModId, String, Span)>,
 }
 
 impl Loader {
@@ -381,6 +400,11 @@ impl Loader {
                     .unwrap_or_else(|| last_segment(&im.path));
                 if let Some(tmid) = self.load_import(from_dir, &im.path, Some(im.span)) {
                     self.imports[mid].insert(binding, tmid);
+                    // Pinned-hash verification (`import "x" = "<sha256>"`) is
+                    // deferred until every module's hash is known.
+                    if let Some(expected) = &im.expected_hash {
+                        self.hash_checks.push((tmid, expected.clone(), im.span));
+                    }
                 }
                 continue;
             }
@@ -1165,6 +1189,73 @@ mod tests {
         assert_ne!(m1.hashes[1], m2.hashes[1], "lib's own hash changes");
         assert_ne!(m1.hashes[0], m2.hashes[0], "main's hash changes transitively via its import of lib");
         assert_eq!(m1.hashes[2], m2.hashes[2], "the unrelated `other` module's hash is unchanged");
+    }
+
+    // --- manifest hash-verification (`import "x" = "<sha256>"`) ---
+
+    /// Pinning an import to the dependency's *actual* content hash verifies clean;
+    /// a wrong pin is a mismatch error. (First load unpinned to learn lib's hash,
+    /// then re-load with that pin / a bogus pin.)
+    #[test]
+    fn a_pinned_import_hash_verifies_and_a_wrong_one_errors() {
+        let lib = "pub fn f(x: i32) -> i32 { return x + 1 }";
+        // Learn lib's hash from an unpinned load (module order: main=0, lib=1).
+        let probe = fixture(
+            "pin_probe",
+            &[("main.jtr", "import \"lib\"\nfn main() -> i32 { return lib.f(2) }"), ("lib.jtr", lib)],
+        );
+        let lib_hash = load(probe.join("main.jtr").to_str().unwrap()).modules.hashes[1].clone();
+        assert_eq!(lib_hash.len(), 64);
+
+        // Correct pin → clean.
+        let good = fixture(
+            "pin_good",
+            &[
+                ("main.jtr", &format!("import \"lib\" = \"{lib_hash}\"\nfn main() -> i32 {{ return lib.f(2) }}")),
+                ("lib.jtr", lib),
+            ],
+        );
+        let prog = load(good.join("main.jtr").to_str().unwrap());
+        assert!(
+            !prog.diags.iter().any(|d| d.message.contains("hash mismatch")),
+            "a correct pin must verify: {:?}",
+            prog.diags
+        );
+
+        // Wrong pin → mismatch error naming both hashes.
+        let bad_hash = "0".repeat(64);
+        let bad = fixture(
+            "pin_bad",
+            &[
+                ("main.jtr", &format!("import \"lib\" = \"{bad_hash}\"\nfn main() -> i32 {{ return lib.f(2) }}")),
+                ("lib.jtr", lib),
+            ],
+        );
+        let prog = load(bad.join("main.jtr").to_str().unwrap());
+        assert!(
+            prog.diags.iter().any(|d| d.message.contains("module `lib` hash mismatch")
+                && d.message.contains(&lib_hash)),
+            "a wrong pin must error with the actual hash: {:?}",
+            prog.diags
+        );
+    }
+
+    /// An ordinary unpinned import is never hash-checked (the pin is opt-in).
+    #[test]
+    fn an_unpinned_import_is_not_hash_checked() {
+        let dir = fixture(
+            "pin_none",
+            &[
+                ("main.jtr", "import \"lib\"\nfn main() -> i32 { return lib.f(2) }"),
+                ("lib.jtr", "pub fn f(x: i32) -> i32 { return x + 1 }"),
+            ],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        assert!(
+            !prog.diags.iter().any(|d| d.message.contains("hash mismatch")),
+            "an unpinned import is not verified: {:?}",
+            prog.diags
+        );
     }
 
     /// A non-existent import (neither `p.jtr` nor `p/`) is a clean load error.

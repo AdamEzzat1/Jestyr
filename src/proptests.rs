@@ -1905,6 +1905,33 @@ mod modules_props {
             prop_assert_ne!(&hp, &single_hash(&other), "a semantic edit must change the hash");
             prop_assert_eq!(hp.len(), 64, "a sha256 hex digest");
         }
+
+        /// **Pinned-hash verification round-trips.** Pinning an import to the
+        /// dependency's *computed* hash verifies clean; any other pin errors — the
+        /// lockfile-lite reproducibility guarantee, over varied dependencies.
+        #[test]
+        fn pinning_the_computed_hash_verifies_else_errors(v in 0i32..10_000) {
+            let lib = format!("pub fn f() -> i32 {{ return {v} }}");
+            // Learn lib's hash from an unpinned load (module order: main=0, lib=1).
+            let probe = vec![
+                ("main.jtr".to_string(), "import \"lib\"\nfn main() -> i32 { return lib.f() }".to_string()),
+                ("lib.jtr".to_string(), lib.clone()),
+            ];
+            let h = pipeline_multi_load(&probe).hashes[1].clone();
+            let good = vec![
+                ("main.jtr".to_string(), format!("import \"lib\" = \"{h}\"\nfn main() -> i32 {{ return lib.f() }}")),
+                ("lib.jtr".to_string(), lib.clone()),
+            ];
+            let (gd, _) = pipeline_multi(&good);
+            prop_assert!(!gd.iter().any(|d| d.contains("hash mismatch")), "correct pin verifies: {:?}", gd);
+            let wrong = format!("{:0>64}", v + 1); // a 64-char string that won't be the real hash
+            let bad = vec![
+                ("main.jtr".to_string(), format!("import \"lib\" = \"{wrong}\"\nfn main() -> i32 {{ return lib.f() }}")),
+                ("lib.jtr".to_string(), lib),
+            ];
+            let (bd, _) = pipeline_multi(&bad);
+            prop_assert!(bd.iter().any(|d| d.contains("hash mismatch")), "wrong pin errors: {:?}", bd);
+        }
     }
 
     /// The single-module content hash of a source string (in-memory; no loader).
@@ -1912,6 +1939,24 @@ mod modules_props {
         let (tokens, _) = Lexer::new(src).tokenize();
         let (ast, _) = Parser::new(src, tokens).parse();
         crate::module::Modules::single(&ast).hashes.first().cloned().unwrap_or_default()
+    }
+
+    /// Like `pipeline_multi` but returns the loaded `Modules` (for its hashes).
+    fn pipeline_multi_load(files: &[(String, String)]) -> crate::module::Modules {
+        let id = CASE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("jestyr_modprobe_{id:016x}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, src) in files {
+            let path = dir.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, src).unwrap();
+        }
+        let m = crate::module::load(dir.join("main.jtr").to_str().unwrap()).modules;
+        let _ = std::fs::remove_dir_all(&dir);
+        m
     }
 }
 
