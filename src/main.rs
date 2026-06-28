@@ -19,10 +19,14 @@
 //!                               `test <file> --list` lists them (no compile)
 //!   jestyrc tokens <file.jtr>   stop after lexing and dump the token stream
 //!   jestyrc doc    <file.jtr>   render the file's API docs as Markdown (--html for HTML)
+//!   jestyrc attest <file.jtr>   emit the reproducible-build + guarantee manifest
+//!                               (sha256 of the emitted C, the locked CC flags, and
+//!                               every item's machine-checked contracts)
 //!   jestyrc selfbench           compile a generated program; report per-stage speed +
 //!                               footprint (build `--features bench-alloc` for heap bytes)
 
 mod ast;
+mod attest;
 mod attrs;
 mod cgen;
 mod diag;
@@ -34,6 +38,7 @@ mod lexer;
 mod module;
 mod parser;
 mod printer;
+mod sha256;
 mod span;
 mod token;
 mod typeck;
@@ -281,6 +286,8 @@ enum Mode {
     /// harness. `list`: print runnable test/bench names and exit (no compile).
     /// `filter`: bake only items whose name contains the substring.
     Test { list: bool, filter: Option<String> },
+    /// `jestyrc attest <file>` — emit the reproducible-build + guarantee manifest.
+    Attest,
     Tokens,
     Doc { html: bool },
 }
@@ -349,7 +356,7 @@ fn main() -> ExitCode {
             (Mode::Test { list, filter }, path.clone())
         }
         Some("tokens") | Some("parse") | Some("check") | Some("emit-c") | Some("build")
-        | Some("run") => {
+        | Some("run") | Some("attest") => {
             let candidates = [
                 sub("tokens", Mode::Tokens),
                 sub("parse", Mode::Parse),
@@ -357,6 +364,7 @@ fn main() -> ExitCode {
                 sub("emit-c", Mode::EmitC),
                 sub("build", Mode::Build),
                 sub("run", Mode::Run),
+                sub("attest", Mode::Attest),
             ];
             match candidates.into_iter().flatten().next() {
                 Some(Ok(pair)) => pair,
@@ -422,6 +430,27 @@ fn main() -> ExitCode {
                 diags = sema;
             }
             report_program(&prog.modules, &diags)
+        }
+        Mode::Attest => {
+            // Attestation must describe a *valid* program: run the same
+            // load → typeck → escape gate as codegen, then emit the manifest. The
+            // C hash inside is over the very C `build`/`run` would compile.
+            let prog = module::load(&path);
+            if !prog.diags.is_empty() {
+                return report_program(&prog.modules, &prog.diags);
+            }
+            let (info, type_diags) = typeck::check_program(&prog.ast, &prog.modules);
+            let mut diags = type_diags;
+            diags.extend(escape::check(&prog.ast, &info));
+            if diags.iter().any(|d| d.is_error()) {
+                return report_program(&prog.modules, &diags);
+            }
+            for d in &diags {
+                eprintln!("{}", prog.modules.render(d, d.severity));
+            }
+            let src = attest::global_src(&prog.modules);
+            print!("{}", attest::manifest(&path, &src, &prog.ast, &info));
+            ExitCode::SUCCESS
         }
         Mode::EmitC | Mode::Build | Mode::Run | Mode::Test { .. } => {
             // Codegen only ever sees well-formed programs: gate on every check.
@@ -654,6 +683,9 @@ fn print_usage() {
     eprintln!("    jestyrc tokens <file.jtr>   stop after lexing and dump tokens");
     eprintln!("    jestyrc doc    <file.jtr>   render the file's API docs as Markdown");
     eprintln!("                               (add --html for an HTML page)");
+    eprintln!("    jestyrc attest <file.jtr>   emit the reproducible-build + guarantee manifest");
+    eprintln!("                               (sha256 of the emitted C + locked CC flags +");
+    eprintln!("                                every item's proven contracts)");
 }
 
 fn dump_tokens(src: &str, path: &str, tokens: &[token::Token]) {

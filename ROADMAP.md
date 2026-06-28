@@ -98,7 +98,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
 | N | Concurrency polish | ~50% | MED | M | ✓ | — |
-| O | Tooling (fmt / test / doc / LSP) | test-runner polish ✅; attest next | LOW | M | ✓✓ | ✓ |
+| O | Tooling (fmt / test / doc / LSP) | test-runner ✅, attest ✅; attest --diff next | LOW | M | ✓✓ | ✓ |
 | P | Self-hosting | plumbing ✅; port open | — | XL | ✓✓ | ✓✓ (the gate) |
 
 ---
@@ -241,10 +241,31 @@ name filtering and a `--list` mode:
   target + a `--features c-oracle` end-to-end run of the filtered harness; every
   property teeth-verified by mutation. `cargo test` stays toolchain-free.
 
-**Left:** **`jestyr attest`** (the headline — reproducible-build + machine-checked
-guarantee manifest, then `--diff`), a **doc generator** (exists: `jestyrc doc`),
-eventually an **LSP**. (Deferred: a faithful `fmt` — the lexer discards comments/layout;
-`printer.rs` is a debug printer. See `TOOLING-HANDOFF.md` "What NOT to build".)
+**`jestyrc attest` — ✅ DONE (increment 2, the headline).** A sound reproducible-build
++ machine-checked-guarantee manifest (`jestyr-attest/v1`): the **SHA-256 of the emitted
+C** (a real attestation — codegen is a *proven* deterministic function of the source,
+locked by `CC_FLAGS`/the FP seam/the cross-OS canary), the **locked compile command**,
+and **every top-level item's machine-checked guarantees** (`requires`/`ensures`/error
+set/`@no_panic`/refined params) reconstructed from the AST by the *same*
+`doc::fn_guarantees` the doc generator uses — so the attested behavioral ABI can never
+drift from the rendered docs. This is what `cargo-semver-checks` structurally cannot do:
+the contracts *are* the public ABI.
+- New `src/attest.rs` (`manifest`) + `src/sha256.rs` (the canary's dep-free SHA-256
+  lifted to a shared non-test module, so both consumers hash with one self-tested copy);
+  `Mode::Attest` in main.rs; a behavior-preserving `pub(crate)` bump on the `doc.rs`
+  signature/guarantee helpers.
+- Rigor: unit + wiring + a **pinned golden** on `examples/docs.jtr` (every byte fixed;
+  hash cross-checked against an independent SHA of the emitted C) + property
+  (determinism incl. the hash, hash==emitted-C digest, completeness, guarantee fidelity
+  vs the doc extractor) + a `fuzz_attest` bolero target; every invariant teeth-verified
+  (hash the wrong bytes → 4 fail; drop guarantees → 4 fail; skip an item → completeness
+  fails). Fully toolchain-free (the C is *hashed*, not built).
+
+**Left:** **`jestyr attest --diff <old> <new>`** (the killer follow-up — a *sound*
+breaking-change detector classifying added-error/strengthened-`requires`/lost-`@no_panic`
+/narrowed-refinement as breaking, the duals as compatible), eventually an **LSP**.
+(Deferred: a faithful `fmt` — the lexer discards comments/layout; `printer.rs` is a debug
+printer. See `TOOLING-HANDOFF.md` "What NOT to build".)
 
 ### P. Self-hosting — plumbing landed; the port itself remains (the gate; XL)
 **Design §19 / Motley prerequisite.** Rewrite the Jestyr compiler in Jestyr. The

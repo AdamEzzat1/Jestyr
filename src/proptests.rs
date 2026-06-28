@@ -174,14 +174,14 @@ mod prop {
         /// which exercise the monomorphization/struct/enum collectors where ordering
         /// bugs would hide.
         #[test]
-        fn valid_programs_compile_deterministically(p in arb_program()) {
+        fn valid_programs_compile_deterministically(p in super::prop::arb_program()) {
             prop_assert_eq!(compile(&p), compile(&p));
         }
 
         /// A generated valid program lowers to *some* C built on the runtime prelude
         /// (cgen never silently produces nothing for a well-formed program).
         #[test]
-        fn valid_program_emits_prelude(p in arb_program()) {
+        fn valid_program_emits_prelude(p in super::prop::arb_program()) {
             let (c, _) = compile(&p);
             prop_assert!(c.contains("#include"), "no prelude in: {}", c);
         }
@@ -189,14 +189,14 @@ mod prop {
         /// **Metamorphic — whitespace insensitivity.** The lexer discards layout, so
         /// doubling every space leaves the token-kind sequence unchanged.
         #[test]
-        fn whitespace_does_not_change_tokens(p in arb_program()) {
+        fn whitespace_does_not_change_tokens(p in super::prop::arb_program()) {
             prop_assert_eq!(token_kinds(&p), token_kinds(&p.replace(' ', "   ")));
         }
 
         /// **Metamorphic — comment insensitivity.** Comments are trivia (no tokens,
         /// no AST nodes), so prepending one cannot change the emitted C.
         #[test]
-        fn comments_do_not_change_codegen(p in arb_program()) {
+        fn comments_do_not_change_codegen(p in super::prop::arb_program()) {
             let plain = compile(&p).0;
             let commented = compile(&format!("// a comment\n{p}")).0;
             prop_assert_eq!(plain, commented);
@@ -205,7 +205,7 @@ mod prop {
         /// The AST printer is total and **idempotent** (printing twice is stable) on
         /// any generated program.
         #[test]
-        fn printer_is_total_and_stable(p in arb_program()) {
+        fn printer_is_total_and_stable(p in super::prop::arb_program()) {
             let (tokens, _) = Lexer::new(&p).tokenize();
             let (ast, _) = Parser::new(&p, tokens).parse();
             let a = crate::printer::print_ast(&ast);
@@ -714,7 +714,7 @@ mod prop {
     /// a function whose body is an arbitrary arithmetic expression. Names are
     /// `x`-prefixed + index-suffixed, so they are unique and never collide with a
     /// keyword — the program always lexes and parses clean.
-    fn arb_program() -> impl Strategy<Value = String> {
+    pub(super) fn arb_program() -> impl Strategy<Value = String> {
         (
             proptest::collection::vec("x[a-z0-9]{0,4}", 1..4),
             proptest::collection::vec("x[a-z0-9]{0,4}", 1..4),
@@ -1200,6 +1200,226 @@ mod test_runner_props {
     }
 }
 
+/// Unit, wiring, and golden tests for `jestyrc attest` (workstream O, the headline).
+/// The manifest is a pure function of the (checked) AST + emitted C, so these run
+/// under the toolchain-free default `cargo test` — no C compiler needed (the C is
+/// *hashed*, not built).
+mod attest {
+    use super::*;
+    use crate::attest;
+
+    /// Type-check a single-file source and build its manifest. (Single-file: no
+    /// imports, so `src` *is* the span buffer the AST indexes into.)
+    fn manifest(source_id: &str, src: &str) -> String {
+        let (ast, info) = typeck_full(src);
+        attest::manifest(source_id, src, &ast, &info)
+    }
+
+    /// The value of a `key ` header line (e.g. `c-sha256`), or `None` if absent.
+    fn header<'a>(m: &'a str, key: &str) -> Option<&'a str> {
+        m.lines().find_map(|l| l.strip_prefix(key).map(|r| r.trim()))
+    }
+
+    // ── unit: the manifest's shape and content ────────────────────────────────
+
+    #[test]
+    fn manifest_has_the_locked_header() {
+        let m = manifest("t", "fn main() -> i32 { return 0 }");
+        let mut lines = m.lines();
+        assert_eq!(lines.next(), Some("jestyr-attest/v1"));
+        assert_eq!(lines.next(), Some("source t"));
+        let sha = lines.next().unwrap();
+        assert!(sha.starts_with("c-sha256 "), "third line is the C hash: {sha}");
+        // The locked compile command is recorded verbatim — the determinism seam.
+        assert_eq!(
+            lines.next(),
+            Some("cc-flags -O2 -std=c11 -ffp-contract=off -fno-fast-math")
+        );
+    }
+
+    #[test]
+    fn the_c_hash_is_64_lowercase_hex_and_is_the_real_emitted_c() {
+        let src = "fn main() -> i32 { return 0 }";
+        let (ast, info) = typeck_full(src);
+        let m = attest::manifest("t", src, &ast, &info);
+        let sha = header(&m, "c-sha256").expect("a c-sha256 line");
+        assert_eq!(sha.len(), 64, "sha is 64 hex chars: {sha}");
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        // It is exactly the SHA-256 of the C `build`/`run` would emit — the
+        // attestation, cross-checked against an independent hash of the same bytes.
+        let (c, _) = crate::cgen::emit(&ast, &info);
+        assert_eq!(sha, crate::sha256::hex(c.as_bytes()));
+    }
+
+    #[test]
+    fn a_functions_guarantees_are_reconstructed_from_the_ast() {
+        // ensures + error set + @no_panic + a refined parameter — each must surface
+        // as a `guarantee:` line, drawn from the same extractor the doc generator uses.
+        let src = "@no_panic fn f(n: i32 in 0..10) -> i32 \
+                   requires n >= 0 \
+                   ensures result >= 0 \
+                   { return n }";
+        let m = manifest("t", src);
+        let gs: Vec<&str> = m.lines().filter_map(|l| l.strip_prefix("  guarantee: ")).collect();
+        assert!(gs.iter().any(|g| g.contains("@no_panic")), "no_panic: {gs:?}");
+        assert!(gs.iter().any(|g| g.contains("requires n >= 0")), "requires: {gs:?}");
+        assert!(gs.iter().any(|g| g.contains("ensures result >= 0")), "ensures: {gs:?}");
+        assert!(gs.iter().any(|g| g.contains("constrained to `0..10`")), "refine: {gs:?}");
+    }
+
+    #[test]
+    fn visibility_is_recorded_per_item() {
+        let src = "pub fn shown() -> i32 { return 1 } fn hidden() -> i32 { return 2 }";
+        let m = manifest("t", src);
+        // The block order is sorted by (kind, name): hidden before shown.
+        let blocks: Vec<&str> = m.split("\n\n").collect();
+        let hidden = blocks.iter().find(|b| b.starts_with("fn hidden")).unwrap();
+        let shown = blocks.iter().find(|b| b.starts_with("fn shown")).unwrap();
+        assert!(hidden.contains("vis: priv"), "hidden is priv: {hidden}");
+        assert!(shown.contains("vis: pub"), "shown is pub: {shown}");
+    }
+
+    #[test]
+    fn items_are_sorted_by_kind_then_name() {
+        let src = "fn zebra() -> i32 { return 0 } \
+                   const APPLE: i32 = 1 \
+                   fn alpha() -> i32 { return 0 } \
+                   struct Box { n: i32 }";
+        let m = manifest("t", src);
+        let keys: Vec<&str> = m
+            .lines()
+            .filter(|l| !l.starts_with(' ') && !l.is_empty() && !l.contains(' ') == false)
+            .filter(|l| {
+                l.starts_with("fn ") || l.starts_with("const ") || l.starts_with("struct ")
+            })
+            .collect();
+        assert_eq!(keys, ["const APPLE", "fn alpha", "fn zebra", "struct Box"], "{m}");
+    }
+
+    // ── golden: the full manifest on the shipped doc demo ─────────────────────
+
+    #[test]
+    fn docs_demo_manifest_is_pinned() {
+        // The golden: every byte of `attest examples/docs.jtr` is fixed except the
+        // hash, which is spliced from the live emitted C (so the structure, the
+        // guarantee phrasing, the sort order, and the per-item visibility are all
+        // locked, while the assertion stays robust to a deliberate codegen change —
+        // which the separate hash cross-check above would catch).
+        let src = std::fs::read_to_string("examples/docs.jtr").expect("read docs.jtr");
+        let (ast, info) = typeck_full(&src);
+        let (c, _) = crate::cgen::emit(&ast, &info);
+        let hash = crate::sha256::hex(c.as_bytes());
+        let expected = format!(
+            "jestyr-attest/v1\n\
+             source examples/docs.jtr\n\
+             c-sha256 {hash}\n\
+             cc-flags -O2 -std=c11 -ffp-contract=off -fno-fast-math\n\
+             \n\
+             const ANSWER\n  vis: priv\n  sig: const ANSWER: i32 = 42\n\
+             \n\
+             fn abs\n  vis: priv\n  sig: fn abs(x: i32) -> i32\n  \
+             guarantee: `ensures result >= 0`\n\
+             \n\
+             fn add\n  vis: priv\n  sig: @no_panic fn add(a: i32, b: i32) -> i32\n  \
+             guarantee: `@no_panic` — proven free of faulting operations\n\
+             \n\
+             fn at\n  vis: priv\n  sig: fn at(xs: []i32, i: usize in 0..xs.len) -> i32\n  \
+             guarantee: parameter `i` is constrained to `0..xs.len`\n\
+             \n\
+             fn main\n  vis: priv\n  sig: fn main() -> i32\n\
+             \n\
+             fn set\n  vis: priv\n  sig: fn set(p: *mut i32, i: i32, v: i32)\n\
+             \n\
+             struct Counter\n  vis: priv\n  sig: struct Counter\n"
+        );
+        let got = attest::manifest("examples/docs.jtr", &src, &ast, &info);
+        assert_eq!(got, expected, "manifest drift:\n{got}");
+    }
+
+    // ── wiring: plumbed through the loader (the path `jestyrc attest` runs) ────
+
+    #[test]
+    fn attest_runs_through_the_loader_pipeline() {
+        // Drive the same `module::load → typeck → escape → manifest` chain the
+        // `Mode::Attest` arm uses, on the real demo — confirming the subcommand is
+        // wired to the live pipeline, not a parallel reimplementation.
+        let prog = crate::module::load("examples/docs.jtr");
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(td.is_empty(), "typeck: {:?}", td);
+        assert!(crate::escape::check(&prog.ast, &info).is_empty());
+        let src = attest::global_src(&prog.modules);
+        let m = attest::manifest("examples/docs.jtr", &src, &prog.ast, &info);
+        assert!(m.starts_with("jestyr-attest/v1\n"));
+        assert!(m.contains("guarantee: `ensures result >= 0`"), "known guarantee present: {m}");
+        assert_eq!(header(&m, "c-sha256").unwrap().len(), 64);
+    }
+}
+
+/// Property + fuzz tests for `jestyrc attest`. The on-thesis invariants:
+/// **determinism** (the manifest, hash and all, is byte-identical every run),
+/// **soundness of the hash** (it is exactly the emitted-C digest), and
+/// **completeness** (every top-level item appears, with its full guarantee set).
+mod attest_props {
+    use super::*;
+    use crate::attest;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// **Determinism (the headline).** `attest` of the same source twice is
+        /// byte-identical — manifest *and* the C hash inside it. A search for any
+        /// `HashMap`/`HashSet` iteration-order leak in record collection or codegen.
+        #[test]
+        fn attest_is_deterministic(p in super::prop::arb_program()) {
+            let (ast, info) = typeck_full(&p);
+            let a = attest::manifest("p", &p, &ast, &info);
+            let b = attest::manifest("p", &p, &ast, &info);
+            prop_assert_eq!(a, b);
+        }
+
+        /// **Hash soundness.** The manifest's `c-sha256` is exactly the SHA-256 of
+        /// the C `build` emits — never a stale or unrelated digest. Teeth: hashing
+        /// anything but `cgen::emit(ast,info)` makes this fail.
+        #[test]
+        fn the_manifest_hash_is_the_emitted_c_digest(p in super::prop::arb_program()) {
+            let (ast, info) = typeck_full(&p);
+            let m = attest::manifest("p", &p, &ast, &info);
+            let sha = m.lines().find_map(|l| l.strip_prefix("c-sha256 ")).unwrap();
+            let (c, _) = cgen::emit(&ast, &info);
+            prop_assert_eq!(sha, crate::sha256::hex(c.as_bytes()));
+        }
+
+        /// **Completeness.** Every top-level `fn`/`struct`/`enum` the generator
+        /// emitted appears as a manifest record (`<kind> <name>` key line). The
+        /// generator's `arb_program` builds `struct S`, `enum E`, and `fn f`.
+        #[test]
+        fn every_item_is_attested(p in super::prop::arb_program()) {
+            let (ast, info) = typeck_full(&p);
+            let m = attest::manifest("p", &p, &ast, &info);
+            prop_assert!(m.contains("\nstruct S\n"), "struct S missing:\n{}", m);
+            prop_assert!(m.contains("\nenum E\n"), "enum E missing:\n{}", m);
+            prop_assert!(m.contains("\nfn f\n"), "fn f missing:\n{}", m);
+        }
+
+        /// **Guarantee fidelity.** Each fn's `guarantee:` lines are exactly
+        /// `doc::fn_guarantees` — the attested ABI cannot drift from the doc
+        /// generator. (Oracle: the shared extractor, over a contract-rich program.)
+        #[test]
+        fn guarantee_count_matches_the_doc_extractor(
+            (np, req, ens) in (any::<bool>(), any::<bool>(), any::<bool>()),
+        ) {
+            let np_s = if np { "@no_panic " } else { "" };
+            let req_s = if req { "requires n >= 0 " } else { "" };
+            let ens_s = if ens { "ensures result >= 0 " } else { "" };
+            let src = format!("{np_s}fn f(n: i32) -> i32 {req_s}{ens_s}{{ return n }}");
+            let (ast, info) = typeck_full(&src);
+            let m = attest::manifest("p", &src, &ast, &info);
+            let got = m.lines().filter(|l| l.starts_with("  guarantee: ")).count();
+            prop_assert_eq!(got, np as usize + req as usize + ens as usize, "in {}", src);
+        }
+    }
+}
+
 /// Experiment (feature `dharht-experiment`): the strongest "can D-HARHT replace a
 /// `HashMap`?" check — a sealed D-HARHT (Memory profile) must agree with a HashMap
 /// on every key, across random key sets.
@@ -1447,6 +1667,32 @@ mod fuzz {
             assert!(nfilt <= nfull, "filter grew the roster: {nfilt} > {nfull}");
             // Determinism: identical bytes on a re-emit.
             assert_eq!(filtered, cgen::emit_tests_filtered(&ast, &info, Some(filt)).0);
+        });
+    }
+
+    /// Coverage-guided fuzzing of **`jestyrc attest`** (workstream O): fuzz bytes
+    /// fill a function body and a `requires` clause, so record collection, signature
+    /// reconstruction, guarantee extraction, codegen, and the SHA all run on
+    /// adversarial input. Invariants on whatever soup lands: `manifest` never panics,
+    /// always emits the locked 4-line header with a 64-hex C hash, that hash is
+    /// exactly the emitted-C digest, and the whole manifest is deterministic.
+    #[test]
+    fn fuzz_attest() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let prog = format!(
+                "fn f(n: i32) -> i32 requires {s} {{ {s} return n }} \
+                 fn main() -> i32 {{ return 0 }}"
+            );
+            let (tokens, _) = Lexer::new(&prog).tokenize();
+            let (ast, _) = Parser::new(&prog, tokens).parse();
+            let (info, _) = crate::typeck::check(&ast);
+            let m = crate::attest::manifest("fuzz", &prog, &ast, &info);
+            assert!(m.starts_with("jestyr-attest/v1\nsource fuzz\nc-sha256 "), "header: {m}");
+            let sha = m.lines().find_map(|l| l.strip_prefix("c-sha256 ")).expect("a hash line");
+            assert_eq!(sha.len(), 64, "64-hex hash: {sha}");
+            let (c, _) = cgen::emit(&ast, &info);
+            assert_eq!(sha, crate::sha256::hex(c.as_bytes()));
+            assert_eq!(m, crate::attest::manifest("fuzz", &prog, &ast, &info), "deterministic");
         });
     }
 
@@ -3591,86 +3837,13 @@ mod dragon {
     }
 }
 
-/// A dependency-free SHA-256 (FIPS 180-4) — the digest for the cross-OS numerics
-/// determinism canary. Self-tested against the standard vectors.
-#[cfg(test)]
-mod sha256 {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-    ];
-
-    pub fn hex(data: &[u8]) -> String {
-        let mut h: [u32; 8] = [
-            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-        ];
-        let mut msg = data.to_vec();
-        let bitlen = (data.len() as u64).wrapping_mul(8);
-        msg.push(0x80);
-        while msg.len() % 64 != 56 {
-            msg.push(0);
-        }
-        msg.extend_from_slice(&bitlen.to_be_bytes());
-        for chunk in msg.chunks(64) {
-            let mut w = [0u32; 64];
-            for i in 0..16 {
-                w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
-            }
-            for i in 16..64 {
-                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-                w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-            }
-            let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
-                (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
-            for i in 0..64 {
-                let big_s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-                let ch = (e & f) ^ ((!e) & g);
-                let t1 = hh.wrapping_add(big_s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
-                let big_s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-                let maj = (a & b) ^ (a & c) ^ (b & c);
-                let t2 = big_s0.wrapping_add(maj);
-                hh = g;
-                g = f;
-                f = e;
-                e = d.wrapping_add(t1);
-                d = c;
-                c = b;
-                b = a;
-                a = t1.wrapping_add(t2);
-            }
-            h[0] = h[0].wrapping_add(a);
-            h[1] = h[1].wrapping_add(b);
-            h[2] = h[2].wrapping_add(c);
-            h[3] = h[3].wrapping_add(d);
-            h[4] = h[4].wrapping_add(e);
-            h[5] = h[5].wrapping_add(f);
-            h[6] = h[6].wrapping_add(g);
-            h[7] = h[7].wrapping_add(hh);
-        }
-        let mut s = String::with_capacity(64);
-        for x in h {
-            s.push_str(&format!("{x:08x}"));
-        }
-        s
-    }
-
-    #[test]
-    fn known_vectors() {
-        assert_eq!(hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-        assert_eq!(hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-        assert_eq!(
-            hex(b"The quick brown fox jumps over the lazy dog"),
-            "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"
-        );
-    }
-}
+/// SHA-256 now lives in the shared, non-test `crate::sha256` module — both this
+/// numerics-determinism canary and `jestyrc attest` hash with the same code, so the
+/// vectors that vouch for one vouch for the other. Re-exported here so the existing
+/// `super::sha256` reference in the `c_oracle` submodule keeps resolving unchanged.
+/// (Gated to `c-oracle`, the only consumer, so the default build sees no dead import.)
+#[cfg(feature = "c-oracle")]
+use crate::sha256;
 
 /// **The gcc-in-test oracle (`--features c-oracle`).** Compile + run each
 /// `examples/std` demo through a real C compiler (exactly as `jestyrc run` does) and

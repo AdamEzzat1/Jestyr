@@ -439,7 +439,11 @@ fn item_span(item: &Item) -> Span {
 
 // --- guarantee extraction (the proven half) ---
 
-fn fn_guarantees(ast: &Ast, src: &str, f: &FnDecl) -> Vec<String> {
+/// The machine-checked guarantees of `f`, each as a human-readable phrase, in a
+/// fixed order (`@no_panic`, `requires`, `ensures`, refinements, error set). The
+/// doc generator's **Guarantees** block and `jestyrc attest`'s manifest share this
+/// one extractor, so the attested ABI can never drift from the rendered docs.
+pub(crate) fn fn_guarantees(ast: &Ast, src: &str, f: &FnDecl) -> Vec<String> {
     let mut g = Vec::new();
     if f.no_panic {
         g.push("`@no_panic` — proven free of faulting operations".to_string());
@@ -463,14 +467,14 @@ fn fn_guarantees(ast: &Ast, src: &str, f: &FnDecl) -> Vec<String> {
 }
 
 /// The exact source text of an expression (faithful, and avoids re-printing).
-fn expr_src(ast: &Ast, src: &str, e: ExprId) -> String {
+pub(crate) fn expr_src(ast: &Ast, src: &str, e: ExprId) -> String {
     let sp = ast.expr_at(e).span;
     src.get(sp.range()).unwrap_or("").trim().to_string()
 }
 
 // --- signature reconstruction ---
 
-fn fn_sig(ast: &Ast, src: &str, f: &FnDecl) -> String {
+pub(crate) fn fn_sig(ast: &Ast, src: &str, f: &FnDecl) -> String {
     let mut s = String::new();
     if f.is_pub {
         s.push_str("pub ");
@@ -498,7 +502,7 @@ fn fn_sig(ast: &Ast, src: &str, f: &FnDecl) -> String {
     s
 }
 
-fn extern_sig(ast: &Ast, e: &ExternFn) -> String {
+pub(crate) fn extern_sig(ast: &Ast, e: &ExternFn) -> String {
     let mut s = String::new();
     if e.is_pub {
         s.push_str("pub ");
@@ -590,14 +594,14 @@ fn enum_sig(ast: &Ast, e: &EnumDecl) -> String {
     }
 }
 
-fn const_sig(ast: &Ast, src: &str, c: &ConstDecl) -> String {
+pub(crate) fn const_sig(ast: &Ast, src: &str, c: &ConstDecl) -> String {
     let ty = c.ty.map(|t| format!(": {}", ty_str(ast, t))).unwrap_or_default();
     let vis = if c.is_pub { "pub " } else { "" };
     format!("{vis}const {}{} = {}", c.name.name, ty, expr_src(ast, src, c.value))
 }
 
 /// Render a type, mirroring the pretty-printer's surface syntax.
-fn ty_str(ast: &Ast, id: TypeId) -> String {
+pub(crate) fn ty_str(ast: &Ast, id: TypeId) -> String {
     match &ast.type_at(id).kind {
         TypeKind::Name(n) => n.name.clone(),
         TypeKind::TypeKw => "type".to_string(),
