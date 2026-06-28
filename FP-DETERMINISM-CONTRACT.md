@@ -2,11 +2,14 @@
 
 > **Honest status: the contract is *substantially* locked, not *proven*.** The parts
 > that are Jestyr's to control — the FP-codegen flags and the determinism-by-
-> construction primitives — are locked and tested. The cross-platform *proof* (the
-> SHA-256 canary confirmed identical on a second OS/compiler) is **not done**: the
-> locked digest has only ever been computed on one machine (Windows + gcc). Read this
-> before claiming "cross-OS determinism." Everything below is on `master` (head
-> `463624a`), **508 tests green** (+7 under `--features c-oracle`), warning-clean.
+> construction primitives — are locked and tested, and the canary is now **purified**
+> (gap #2 below, closed): it hashes a dedicated demo that emits *only* integers and
+> our own `format_float` strings, so no `printf("%g")` output rides in the digest. The
+> one remaining blocker to *proof* is mechanical: the cross-platform run (gap #1). The
+> SHA-256 canary has still only been computed on one machine (Windows + gcc), so the
+> digest's *cross-OS identity* is **unverified**. Read this before claiming "cross-OS
+> determinism." Everything below is on `master`, **508 tests green** (+8 under
+> `--features c-oracle`), warning-clean.
 >
 > Companion docs: [`NUMERICS-HANDOFF.md`](NUMERICS-HANDOFF.md) (the whole numerics
 > workstream), [`CORE-STD-PHASE3.md`](CORE-STD-PHASE3.md) (ledger),
@@ -43,35 +46,47 @@ digest. CJC handled this as a *runtime* policy; Jestyr must do it at *codegen* t
    - **`format_float`** — Dragon4 shortest round-trip, correctly rounded. (`proptests::dragon`.)
    - **`par_binned_sum`** — parallel reduction bit-identical to serial; the escape
      checker forbids `mut`-slice spawn params so the safe subset is race-free.
-3. **The canary *mechanism*.** `cargo test --features c-oracle`
-   (`proptests::c_oracle`) compiles + runs the `examples/std` demos through gcc — the
-   real `jestyrc run` pipeline — and hashes their combined output with a dep-free,
-   self-tested SHA-256 (`proptests::sha256`). Currently locked to
-   `dfe9f73512629068c28ea3072eb251555cee6f98b2d141e38a23eef16a95a78e`.
+3. **The canary *mechanism* + a *purified* hash input.** `cargo test --features
+   c-oracle` (`proptests::c_oracle`) compiles + runs demos through gcc — the real
+   `jestyrc run` pipeline — and hashes output with a dep-free, self-tested SHA-256
+   (`proptests::sha256`). The hashed input is now the single dedicated demo
+   [`examples/std/numerics_canary.jtr`](examples/std/numerics_canary.jtr), which
+   exercises the whole numeric stack (bit primitives, serial + parallel reductions,
+   binned superaccumulator, parse/format) but prints **only** `print_i32` integers and
+   `format_float` strings — *nothing* through `printf("%g")`. Results are pinned by
+   their `format_float` value, not bare 0/1 flags, so the canary stays sensitive.
+   Locked to `886d1b6aa0d4e57af37763903f34bcaff000fcc06929f07d3a4d031cc92af7e3`.
+   (The seven per-demo regression tests still run the readable `print_f64` demos as a
+   single-platform sanity check; they're just no longer part of the hashed digest.)
 
 ---
 
 ## ⚠️ NOT yet proven — what "locking the contract" still needs
 
-These are the gaps. Until they're closed, describe this as "flags + construction
-locked, single-platform regression canary," **not** "cross-OS determinism proven."
+These are the gaps. Until #1 is closed, describe this as "flags + construction
+locked, **purified** single-platform regression canary," **not** "cross-OS
+determinism proven."
 
 1. **The canary digest is single-platform.** It was computed once on Windows/gcc. The
    whole point is cross-OS identity, which is **unverified**. → **Run `cargo test
    --features c-oracle` on Linux and macOS (and ideally clang).** If the digest
-   matches, the contract is *actually* locked — update this note to say so. If it
-   differs, triage (see #2) before re-locking.
+   (`886d1b6a…`) matches, the contract is *actually* locked — update this note to say
+   so. If it differs now, it is a **genuine** determinism break (the libc-formatting
+   false-alarm risk was removed in #2), so triage the numerics, don't just re-lock.
+   *This is now the only blocker to proof.*
 
-2. **The canary hashes some `printf`-formatted output — an impurity.** `binned.jtr`
-   and `reductions.jtr` print floats via `print_f64` → the runtime `print_float`
-   intrinsic → C `printf`, whose float formatting is **not** guaranteed identical
-   across libc. So a cross-OS digest difference *might be glibc-vs-msvcrt, not a real
-   Jestyr break* — a false alarm baked in. → **Make the canary hash only (a) integer
-   output and (b) `format_float` output (our own deterministic formatter), dropping
-   the `print_f64`/printf-rendered values.** Then a digest diff can *only* mean a
-   genuine determinism break. (Either change the demos to format via `format_float`,
-   or have `c_oracle` filter/normalize, or add a dedicated canary demo that only
-   prints integers + `format_float` strings.) Re-lock the digest after this change.
+2. ~~**The canary hashes some `printf`-formatted output — an impurity.**~~ — ✅ **DONE.**
+   Was: `binned.jtr`/`reductions.jtr`/`float_bits.jtr` printed floats via `print_f64`
+   → `printf("%g")`, whose formatting isn't identical across libc, so a cross-OS
+   digest diff *might* have been glibc-vs-msvcrt rather than a real break. Fixed by the
+   dedicated [`examples/std/numerics_canary.jtr`](examples/std/numerics_canary.jtr):
+   the canary now hashes **only** that demo, which prints solely integers and
+   `format_float` strings (our own deterministic, locale-free, correctly-rounded
+   formatter) — zero `printf`-rendered floats. A digest diff can now *only* mean a
+   genuine determinism break. Re-locked to `886d1b6a…`; mutation-verified (changing one
+   parsed value moves the digest *and* trips the token-assert `numerics_canary_demo`).
+   (Also fixed a latent temp-file race in `build_and_run` — two tests building the same
+   demo concurrently now get uniquely-named `.c`/`.exe`, disjoint by construction.)
 
 3. **The contract holds only through the `jestyrc` build path.** Emit the C
    (`jestyrc emit-c`) and compile it yourself without `CC_FLAGS` → determinism gone.
@@ -89,13 +104,13 @@ locked, single-platform regression canary," **not** "cross-OS determinism proven
 
 ## Recommended order to *finish* locking it
 
-1. **Purify the canary** (#2) — change what's hashed to integer + `format_float` only;
-   re-lock the digest. Cheap, removes the libc false-alarm risk. Do this first so the
-   cross-platform run in step 2 is meaningful.
-2. **Verify cross-platform** (#1) — run `cargo test --features c-oracle` on Linux
-   (and macOS if available). Same digest ⇒ the contract is *proven*; record the
-   platforms + compiler versions here. This is the step that turns "locked" from a
-   claim into a fact.
+1. ~~**Purify the canary** (#2)~~ — ✅ **DONE** (this session). Hashed input is now
+   `numerics_canary.jtr` (integers + `format_float` only); re-locked to `886d1b6a…`.
+   The libc false-alarm risk is gone, so the cross-platform run below is now meaningful.
+2. **Verify cross-platform** (#1) — **← the next step, and the only blocker to proof.**
+   Run `cargo test --features c-oracle` on Linux (and macOS if available). Same digest
+   (`886d1b6a…`) ⇒ the contract is *proven*; record the platforms + compiler versions
+   here. A *different* digest now means a real break (not formatting), so triage it.
 3. **Wire it into CI** — a matrix (linux/macos/windows × gcc/clang) running
    `cargo test --features c-oracle`. The canary failing on any cell is then a genuine
    determinism regression signal. (Research §3.6 Step 0.)
@@ -108,17 +123,18 @@ locked, single-platform regression canary," **not** "cross-OS determinism proven
 | Thing | Where |
 |---|---|
 | FP flags + their lock test | `src/main.rs` → `CC_FLAGS`, `mod fp_contract_tests` |
-| Canary harness + locked digest | `src/proptests.rs` → `mod c_oracle` (`--features c-oracle`) |
+| Canary harness + locked digest | `src/proptests.rs` → `mod c_oracle` (`--features c-oracle`); `numerics_determinism_canary` (hash) + `numerics_canary_demo` (token assert) |
 | SHA-256 (dep-free, self-tested) | `src/proptests.rs` → `mod sha256` |
+| **Purified canary demo (the hashed input)** | `examples/std/numerics_canary.jtr` — integers + `format_float` only, no `print_f64` |
 | Determinism primitives | `examples/std/core.jtr` (`binned_*`, `parse_float`, `format_float`, `par_binned_sum`) |
 | Spawn data-race rule | `src/escape.rs` → `check_spawn_no_shared_mut_slice` |
-| Demos the canary runs | `examples/std/{binned,reductions,numbers,float_bits,parse_float,format_float,par_reduce}.jtr` |
+| Readable per-demo regression tests (not hashed) | `examples/std/{binned,reductions,numbers,float_bits,parse_float,format_float,par_reduce}.jtr` |
 | Run the canary | `cargo test --features c-oracle` (needs a C compiler on PATH) |
 
 ## One-line summary
 
 Flags locked + tested; primitives deterministic by construction + tested; canary
-mechanism built and locked **on one platform**. To truly lock the contract: purify
-the canary (drop printf-formatted output), then confirm the digest is identical on a
-second OS/compiler. That last step is the difference between "deterministic" and
-"proven deterministic."
+mechanism built, **purified** (hashes integer + `format_float` output only — no
+`printf`), and locked **on one platform** (`886d1b6a…`). The only step left to turn
+"deterministic" into "proven deterministic": run `cargo test --features c-oracle` on a
+second OS/compiler and confirm the digest is identical.

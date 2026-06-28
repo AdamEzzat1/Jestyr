@@ -3409,10 +3409,16 @@ mod c_oracle {
         assert!(!ed.iter().any(|d| d.is_error()), "escape errors in {rel}");
         let (c_src, _cd) = crate::cgen::emit(&prog.ast, &info);
 
+        // Unique output names per call: cargo runs tests in parallel, and a demo built
+        // by two tests (e.g. its per-demo test *and* the canary) would otherwise share
+        // one `.c`/`.exe` and clobber each other mid-compile. Disjoint by construction.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
         let stem: String = rel.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
         let dir = std::env::temp_dir();
-        let cfile = dir.join(format!("jestyr_oracle_{stem}.c"));
-        let exe = dir.join(format!("jestyr_oracle_{stem}{}", std::env::consts::EXE_SUFFIX));
+        let cfile = dir.join(format!("jestyr_oracle_{stem}_{uniq}.c"));
+        let exe = dir.join(format!("jestyr_oracle_{stem}_{uniq}{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&cfile, &c_src).unwrap();
 
         let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
@@ -3461,30 +3467,56 @@ mod c_oracle {
         assert_eq!(toks("examples/std/par_reduce.jtr"), ["1", "1", "1"]);
     }
 
-    /// The locked canary: SHA-256 over every numerics demo's output, concatenated in
-    /// a fixed order. One value pinning the whole numeric stack's behaviour across OS
-    /// and compiler. Re-lock the constant only with a reviewed reason.
+    /// The PURE canary demo: exercises the whole numeric stack but prints ONLY
+    /// integers and `format_float` strings — never `print_f64`/`printf("%g")`. Its
+    /// output is the locked-digest input; pin it token-for-token here too so a change
+    /// is caught even without re-deriving the SHA. (See `numerics_canary.jtr`.)
+    #[test]
+    fn numerics_canary_demo() {
+        assert_eq!(
+            toks("examples/std/numerics_canary.jtr"),
+            [
+                // IEEE-754 bit primitives
+                "3.14159e0", "1023", "0", "1", "51", "63",
+                // serial reductions (10,10,10 | 0,2,0) as deterministic format_float strings
+                "1e1", "1e1", "1e1", "0e0", "2e0", "0e0",
+                // binned: whole==chunked==4, then the equality flag
+                "4e0", "4e0", "1",
+                // correct rounding (2^53+4) vs naive (2^53), then per-bin overflow (3000)
+                "9.007199254740996e15", "9.007199254740992e15", "3e3",
+                // parallel reduction == serial (100), then the equality flag
+                "1e2", "1",
+                // parse_float round-trips (parse then format_float)
+                "1e-1", "3.0000000000000004e-1", "1.234567890123456e15", "1e10",
+                "3.14159265358979e0", "9.007199254740992e15", "5e-324",
+                "1.7976931348623157e308",
+                // slow path (> 19 digits): identical to short form
+                "3.141592653589793e0", "9.007199254740994e15",
+                // malformed → rejected
+                "1",
+                // integer parse/format
+                "12345", "-42", "7", "9", "-4271", "-4271",
+            ]
+        );
+    }
+
+    /// The locked canary: SHA-256 over the PURE `numerics_canary.jtr` output. That
+    /// demo, by construction, emits only `print_i32` integers and `format_float`
+    /// strings — NOTHING routes through C `printf("%g")`, whose float rendering is not
+    /// guaranteed identical across libc. So a digest diff can only mean a genuine
+    /// numeric-determinism break (an FMA fusion, a reassociation, a rounding change),
+    /// never a glibc-vs-msvcrt formatting quirk. Run on a second OS/compiler: an
+    /// identical digest *proves* the contract. Re-lock only with a reviewed reason.
     #[test]
     fn numerics_determinism_canary() {
-        let demos = [
-            "examples/std/binned.jtr",
-            "examples/std/reductions.jtr",
-            "examples/std/numbers.jtr",
-            "examples/std/float_bits.jtr",
-            "examples/std/parse_float.jtr",
-            "examples/std/format_float.jtr",
-            "examples/std/par_reduce.jtr",
-        ];
         let mut all = String::new();
-        for d in demos {
-            for t in toks(d) {
-                all.push_str(&t);
-                all.push('\n');
-            }
+        for t in toks("examples/std/numerics_canary.jtr") {
+            all.push_str(&t);
+            all.push('\n');
         }
         let digest = sha256::hex(all.as_bytes());
         assert_eq!(
-            digest, "dfe9f73512629068c28ea3072eb251555cee6f98b2d141e38a23eef16a95a78e",
+            digest, "886d1b6aa0d4e57af37763903f34bcaff000fcc06929f07d3a4d031cc92af7e3",
             "numerics output changed — if intentional, re-lock; output was:\n{all}"
         );
     }

@@ -1,0 +1,170 @@
+// examples/std/numerics_canary.jtr — the PURE cross-OS determinism canary.
+//
+// Every other demo prints floats with `io.print_f64`, which lowers to C
+// `printf("%g")` — and `%g`'s rendering is NOT guaranteed identical across libc
+// (glibc vs msvcrt vs Apple). Hashing that output bakes a false-alarm into the
+// canary: a digest diff might be a formatting quirk, not a real break.
+//
+// This demo prints ONLY output Jestyr formats itself:
+//   * integers via `io.print_i32`, and
+//   * `core.format_float` strings — our own deterministic, locale-free,
+//     correctly-rounded shortest formatter (Dragon4).
+// It never calls `io.print_f64`, so NONE of its bytes pass through `printf`. A
+// SHA-256 over this demo's output therefore changes ONLY on a genuine numeric
+// determinism break — never on a libc formatting difference. This is the single
+// artifact the locked canary (`proptests::c_oracle::numerics_determinism_canary`)
+// hashes; run it on a second OS/compiler and an identical digest *proves* the
+// contract rather than merely asserting it.
+//
+// Results are pinned by their `format_float` STRING (the exact value), not a bare
+// 0/1 equality flag — a flag only flips when an equality breaks, but a string
+// catches a different-but-self-consistent wrong value too. Keep it sensitive.
+
+import "core"
+import "io"
+
+fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
+fn setf(p: *mut f64, i: usize, v: f64) { unsafe { (p + i).* = v } }
+
+fn uo_f(take r: Result(f64, ParseFloatError), take d: f64) -> f64 {
+    match r { ok(v) => v, err(e) => d }
+}
+fn uo_i(take r: Result(i64, ParseIntError), take d: i64) -> i64 {
+    match r { ok(v) => v, err(e) => d }
+}
+fn rej_f(s: str) -> i32 {
+    match core.parse_float(s) { ok(v) => 0, err(e) => 1 }
+}
+
+// format x with our deterministic formatter and print the string.
+fn show(x: f64) {
+    var raw: *mut u8 = alloc(u8, 32)
+    var buf: []u8 = slice(u8, raw, 32)
+    let n: usize = core.format_float(x, buf)
+    let sv: []u8 = slice(u8, raw, n)
+    io.print_line(from_utf8(sv))
+    free_ptr(raw)
+}
+
+// parse s, then print format_float of the result — pins parse AND format together.
+fn show_parse(s: str) {
+    show(uo_f(core.parse_float(s), 0.0 - 1.0))
+}
+
+fn main() -> i32 {
+    // ── IEEE-754 bit primitives (deterministic ints; the one float via format_float) ──
+    show(core.f64_from_bits(core.f64_bits(3.14159)))   // bit round-trip, pinned shortest form
+    io.print_i32(core.f64_raw_exp(1.0) as i32)         // 1023
+    io.print_i32(core.f64_mantissa(1.0) as i32)        // 0
+    io.print_i32(core.f64_sign(-2.0) as i32)           // 1
+    io.print_i32(core.clz64(4096) as i32)              // 51
+    io.print_i32(core.clz64(1) as i32)                 // 63
+
+    // ── deterministic serial reductions (values pinned by format_float, not %g) ──
+    var rb: *mut f64 = alloc(f64, 4)
+    setf(rb, 0, 1.0)
+    setf(rb, 1, 2.0)
+    setf(rb, 2, 3.0)
+    setf(rb, 3, 4.0)
+    var rs: []f64 = slice(f64, rb, 4)
+    show(core.f64_sum(rs))            // 10
+    show(core.f64_kahan_sum(rs))      // 10
+    show(core.f64_pairwise_sum(rs))   // 10
+
+    // catastrophic cancellation [1, 1e100, 1, -1e100]: only Neumaier recovers the 2.
+    setf(rb, 0, 1.0)
+    setf(rb, 1, 1.0e100)
+    setf(rb, 2, 1.0)
+    setf(rb, 3, 0.0 - 1.0e100)
+    show(core.f64_sum(rs))            // 0  (small terms lost)
+    show(core.f64_kahan_sum(rs))      // 2  (recovered)
+    show(core.f64_pairwise_sum(rs))   // 0
+    free_ptr(rb)
+
+    // ── binned superaccumulator: chunk-independent AND correctly rounded ──
+    var bb: *mut f64 = alloc(f64, 4)
+    setf(bb, 0, 1.0)
+    setf(bb, 1, 1.0e16)
+    setf(bb, 2, 0.0 - 1.0e16)
+    setf(bb, 3, 3.0)
+    var bs: []f64 = slice(f64, bb, 4)
+    let whole: f64 = core.f64_binned_sum(bs)
+    show(whole)                                                       // 4
+
+    var a: [2048]i64 = core.binned_new()
+    var b: [2048]i64 = core.binned_new()
+    core.binned_add(a, 1.0)
+    core.binned_add(a, 1.0e16)
+    core.binned_add(b, 0.0 - 1.0e16)
+    core.binned_add(b, 3.0)
+    core.binned_merge(a, b)
+    let chunked: f64 = core.binned_sum(a)
+    show(chunked)                                                     // 4 (bit-identical to whole)
+    io.print_i32(b2i(core.f64_bits(whole) == core.f64_bits(chunked)))   // 1
+    free_ptr(bb)
+
+    // correct rounding: 2^53 + 1 + 1 + 1 → ties-to-even to 2^53 + 4, not 2^53 (naive).
+    let p53: f64 = core.f64_from_bits((1076 as u64) << 52)            // 2^53
+    var cb: *mut f64 = alloc(f64, 4)
+    setf(cb, 0, p53)
+    setf(cb, 1, 1.0)
+    setf(cb, 2, 1.0)
+    setf(cb, 3, 1.0)
+    var cs: []f64 = slice(f64, cb, 4)
+    show(core.f64_binned_sum(cs))    // 2^53 + 4 (correctly rounded)
+    show(core.f64_sum(cs))           // 2^53     (naive, a distinct string)
+    free_ptr(cb)
+
+    // per-bin overflow carry: 3000 × 1.0 all land in one exponent bin → 3000 exactly.
+    var ov: [2048]i64 = core.binned_new()
+    var k: i32 = 0
+    for k < 3000 {
+        core.binned_add(ov, 1.0)
+        k = k + 1
+    }
+    show(core.binned_sum(ov))        // 3000
+
+    // ── parallel reduction: bit-identical to serial, value pinned by format_float ──
+    var pb: *mut f64 = alloc(f64, 1000)
+    var pj: usize = 0
+    for pj < 1000 {
+        setf(pb, pj, 0.1)
+        pj = pj + 1
+    }
+    var ps: []f64 = slice(f64, pb, 1000)
+    let par: f64 = core.par_binned_sum(ps)
+    let ser: f64 = core.f64_binned_sum(ps)
+    show(par)                                                    // 100 (== serial)
+    io.print_i32(b2i(core.f64_bits(par) == core.f64_bits(ser)))   // 1
+    free_ptr(pb)
+
+    // ── parse_float round-trips (parse THEN format — the strongest pin) ──
+    show_parse("0.1")
+    show_parse("0.30000000000000004")
+    show_parse("1234567890123456")
+    show_parse("1e10")
+    show_parse("3.14159265358979")
+    show_parse("9007199254740993")                    // round-to-even tie → 2^53
+    show_parse("5e-324")                              // smallest subnormal
+    show_parse("1.7976931348623157e308")              // max normal
+    // slow path (> 19 digits) must round to the same double as the short form:
+    show_parse("3.141592653589793238462643383279")    // → 3.141592653589793
+    show_parse("9007199254740993.0000000000000001")   // → 9007199254740994
+    io.print_i32(rej_f("12x"))                         // 1 (malformed → rejected)
+
+    // ── integer parse/format (locale-free, deterministic) ──
+    io.print_i32(uo_i(core.parse_i64("12345"), 0) as i32)                  // 12345
+    io.print_i32(uo_i(core.parse_i64("-42"), 0) as i32)                    // -42
+    io.print_i32(uo_i(core.parse_i64("9999999999999999999"), 7) as i32)    // 7 (overflow)
+    io.print_i32(uo_i(core.parse_i64("12x"), 9) as i32)                    // 9 (invalid)
+
+    var ib: *mut u8 = alloc(u8, 24)
+    var iv: []u8 = slice(u8, ib, 24)
+    let n1: usize = core.format_i64(-4271, iv)
+    let s1: []u8 = slice(u8, ib, n1)
+    io.print_line(from_utf8(s1))                                           // -4271
+    io.print_i32(uo_i(core.parse_i64(from_utf8(s1)), 0) as i32)            // -4271 (round-trip)
+    free_ptr(ib)
+
+    return 0
+}

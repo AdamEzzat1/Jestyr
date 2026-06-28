@@ -1,7 +1,7 @@
 # Numerics & `core`/`std` — Handoff (continue in a fresh session)
 
 > Written at the close of the `core`/`std` + numerics workstream. Everything below
-> is **on `master`** (head `bbf426b`), **508 tests green** (3 ignored) + 7 more
+> is **on `master`** (head `bbf426b`), **508 tests green** (3 ignored) + 8 more
 > under `--features c-oracle`, warning-clean. This note is self-contained. **Done:
 > Front A (binned finish); Front C — the marquee — parse_float (incl. the >19-digit
 > slow path, so it is correctly rounded with *no* caveat) + format_float, round-trip
@@ -179,12 +179,17 @@ The distinctly-Jestyr deliverable (closes CJC's transcendental-determinism gap).
   all-but-last-digit match vs Rust `{:e}`; 2M-case `#[ignore]` thorough run green);
   runtime pinned by `examples/std/format_float.jtr` (round-trip via parse_float).
   **The `parse(format(x)) == x` contract is now closed.**
-- **The cross-OS SHA-256 canary — ✅ DONE** (commit `1670498`): the `--features
-  c-oracle` gcc-in-test harness (`proptests::c_oracle`) compiles + runs the demos
-  through gcc (the `jestyrc run` pipeline) and locks a SHA-256 over all numerics
-  output (`dfe9f735…`). A dep-free self-tested SHA-256 lives in `proptests::sha256`.
-  This is the artifact a CI matrix would run on Linux/macOS/Windows to *prove*
-  byte-identical numeric output — the determinism guarantee a Rust-oracle diff can't.
+- **The cross-OS SHA-256 canary — ✅ DONE + ✅ PURIFIED** (commits `1670498`, then
+  purified this session): the `--features c-oracle` gcc-in-test harness
+  (`proptests::c_oracle`) compiles + runs demos through gcc (the `jestyrc run`
+  pipeline) and locks a SHA-256. The hashed input is now the dedicated
+  `examples/std/numerics_canary.jtr`, which prints **only** integers + `format_float`
+  strings (no `print_f64`/`printf("%g")`), so the digest can't false-alarm on libc
+  formatting — a diff means a *genuine* determinism break. Locked to `886d1b6a…`
+  (was `dfe9f735…` pre-purification). A dep-free self-tested SHA-256 lives in
+  `proptests::sha256`. This is the artifact a CI matrix runs on Linux/macOS/Windows to
+  *prove* byte-identical numeric output. **Still single-platform** — see
+  [`FP-DETERMINISM-CONTRACT.md`](FP-DETERMINISM-CONTRACT.md) gap #1 for the cross-OS run.
 - **Remaining on C — only a deliberate non-goal:** a **Ryū `format_float`** swap
   (replace Dragon4's per-digit big-integer loop with Ryū's two 128-bit tables). It is
   **pure perf with byte-identical output**, and reproducing Ryū's precision-125 tables
@@ -245,11 +250,11 @@ research-grade). Ryū is an explicit non-goal (see above).
 | Area | Where |
 |---|---|
 | Numerics + `core` library | `examples/std/core.jtr` |
-| Demos | `examples/std/{binned,reductions,numbers,float_bits,combinators,slice_algos,parse_float,format_float,par_reduce}.jtr`, `examples/{arrays,array_lit,concurrent,atomics}.jtr` |
+| Demos | `examples/std/{binned,reductions,numbers,float_bits,combinators,slice_algos,parse_float,format_float,par_reduce,numerics_canary}.jtr`, `examples/{arrays,array_lit,concurrent,atomics}.jtr` |
 | par reduction | `examples/std/core.jtr` (`par_binned_sum`/`par_worker`); concurrency lowering `src/cgen.rs` (`emit_concurrent`/`spawn_runtime`); join-safety `src/escape.rs` (`ExprKind::Spawn`) |
 | parse_float + table | `examples/std/core.jtr` (`parse_float`/`lemire_*`/`POW10_128`/`slow_parse`/`sp_*`); reference + table generator + slow-path `src/proptests.rs` → `mod lemire` |
 | format_float (Dragon4) | `examples/std/core.jtr` (`format_float`/`d4_*`); reference `src/proptests.rs` → `mod dragon` |
-| determinism canary | `src/proptests.rs` → `mod c_oracle` (gcc-in-test, `--features c-oracle`) + `mod sha256`; locked digest there. Run: `cargo test --features c-oracle` |
+| determinism canary | `src/proptests.rs` → `mod c_oracle` (gcc-in-test, `--features c-oracle`) + `mod sha256`; locked digest `886d1b6a…` over the **purified** `examples/std/numerics_canary.jtr` (integers + `format_float` only). Run: `cargo test --features c-oracle` |
 | spawn data-race rule | `src/escape.rs` (`check_spawn_no_shared_mut_slice`) |
 | Property/law tests | `src/proptests.rs` → `mod core_props` (mirrors + laws), `mod prop`, `mod fuzz` |
 | FP flags | `src/main.rs` → `CC_FLAGS` + `mod fp_contract_tests` |
