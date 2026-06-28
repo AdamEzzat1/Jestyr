@@ -22,6 +22,8 @@
 //!   jestyrc attest <file.jtr>   emit the reproducible-build + guarantee manifest
 //!                               (sha256 of the emitted C, the locked CC flags, and
 //!                               every item's machine-checked contracts)
+//!   jestyrc attest --diff <old> <new>   classify breaking vs compatible contract
+//!                               changes between two manifests (exit 1 if breaking)
 //!   jestyrc selfbench           compile a generated program; report per-stage speed +
 //!                               footprint (build `--features bench-alloc` for heap bytes)
 
@@ -355,8 +357,29 @@ fn main() -> ExitCode {
             let filter = nonflags.next().cloned();
             (Mode::Test { list, filter }, path.clone())
         }
+        Some("attest") => {
+            // `attest --diff <old> <new>` compares two manifest files; plain
+            // `attest <file>` emits one. The file args are the non-flag arguments.
+            let mut nonflags = args[2..].iter().filter(|a| !a.starts_with("--"));
+            if args[2..].iter().any(|a| a == "--diff") {
+                return match (nonflags.next(), nonflags.next()) {
+                    (Some(old), Some(new)) => run_attest_diff(old, new),
+                    _ => {
+                        eprintln!("error: `attest --diff` needs two manifest files: <old> <new>");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            match nonflags.next() {
+                Some(p) => (Mode::Attest, p.clone()),
+                None => {
+                    eprintln!("error: `attest` needs a file argument");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         Some("tokens") | Some("parse") | Some("check") | Some("emit-c") | Some("build")
-        | Some("run") | Some("attest") => {
+        | Some("run") => {
             let candidates = [
                 sub("tokens", Mode::Tokens),
                 sub("parse", Mode::Parse),
@@ -364,7 +387,6 @@ fn main() -> ExitCode {
                 sub("emit-c", Mode::EmitC),
                 sub("build", Mode::Build),
                 sub("run", Mode::Run),
-                sub("attest", Mode::Attest),
             ];
             match candidates.into_iter().flatten().next() {
                 Some(Ok(pair)) => pair,
@@ -527,6 +549,41 @@ fn program_has_main(ast: &ast::Ast) -> bool {
     ast.items.iter().any(|it| matches!(it, ast::Item::Fn(f) if f.name.name == "main"))
 }
 
+/// `jestyrc attest --diff <old> <new>`: read two manifest files, classify every
+/// per-item contract change as breaking or compatible, print the report, and exit
+/// non-zero iff any breaking change is found — a drop-in CI ABI gate.
+fn run_attest_diff(old_path: &str, new_path: &str) -> ExitCode {
+    let read = |p: &str| -> Result<String, ExitCode> {
+        std::fs::read_to_string(p).map_err(|e| {
+            eprintln!("error: cannot read `{p}`: {e}");
+            ExitCode::FAILURE
+        })
+    };
+    let (old_text, new_text) = match (read(old_path), read(new_path)) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => return ExitCode::FAILURE,
+    };
+    let parse = |p: &str, t: &str| -> Result<attest::ParsedManifest, ExitCode> {
+        attest::parse_manifest(t).map_err(|e| {
+            eprintln!("error: `{p}` is not a valid attest manifest: {e}");
+            eprintln!("note: pass files produced by `jestyrc attest <file.jtr>`");
+            ExitCode::FAILURE
+        })
+    };
+    let (old, new) = match (parse(old_path, &old_text), parse(new_path, &new_text)) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => return ExitCode::FAILURE,
+    };
+    let report = attest::diff(&old, &new);
+    print!("{}", report.render());
+    // Breaking changes fail the gate; a compatible-only (or empty) diff passes.
+    if report.has_breaking() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
 /// `jestyrc test --list`: print the runnable `@test`/`@bench` names (each on its
 /// own line, tagged `test`/`bench`, in source order), narrowed by the optional
 /// `filter` substring. One greppable line per item, so CI can slice the harness.
@@ -686,6 +743,9 @@ fn print_usage() {
     eprintln!("    jestyrc attest <file.jtr>   emit the reproducible-build + guarantee manifest");
     eprintln!("                               (sha256 of the emitted C + locked CC flags +");
     eprintln!("                                every item's proven contracts)");
+    eprintln!("    jestyrc attest --diff <old> <new>");
+    eprintln!("                               classify contract changes between two manifests");
+    eprintln!("                               as breaking/compatible (exit 1 if any breaking)");
 }
 
 fn dump_tokens(src: &str, path: &str, tokens: &[token::Token]) {

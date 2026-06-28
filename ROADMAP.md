@@ -98,7 +98,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
 | N | Concurrency polish | ~50% | MED | M | ✓ | — |
-| O | Tooling (fmt / test / doc / LSP) | test-runner ✅, attest ✅; attest --diff next | LOW | M | ✓✓ | ✓ |
+| O | Tooling (fmt / test / doc / LSP) | test-runner ✅, attest ✅, attest --diff ✅; LSP/fmt deferred | LOW | M | ✓✓ | ✓ |
 | P | Self-hosting | plumbing ✅; port open | — | XL | ✓✓ | ✓✓ (the gate) |
 
 ---
@@ -277,11 +277,24 @@ the contracts *are* the public ABI.
   (hash the wrong bytes → 4 fail; drop guarantees → 4 fail; skip an item → completeness
   fails). Fully toolchain-free (the C is *hashed*, not built).
 
-**Left:** **`jestyr attest --diff <old> <new>`** (the killer follow-up — a *sound*
-breaking-change detector classifying added-error/strengthened-`requires`/lost-`@no_panic`
-/narrowed-refinement as breaking, the duals as compatible), eventually an **LSP**.
-(Deferred: a faithful `fmt` — the lexer discards comments/layout; `printer.rs` is a debug
-printer. See `TOOLING-HANDOFF.md` "What NOT to build".)
+**`jestyrc attest --diff <old> <new>` — ✅ DONE (increment 3).** A *sound* semantic
+breaking-change detector: parse two manifests back into structured contracts and classify
+every per-item change. **Breaking** = error added / `requires` strengthened / `ensures`
+dropped / `@no_panic` lost / refinement narrowed / `pub` item removed or demoted / type
+signature changed. **Compatible** = each dual. Sound by construction — only *provably*
+compatible changes get the compatible verdict; anything a heuristic can't prove safe
+(e.g. a non-literal refinement change) defaults to breaking. Exits non-zero iff any
+breaking change (a drop-in CI ABI gate). New `attest::{parse_manifest, diff, DiffReport,
+Verdict}`; `run_attest_diff` in main.rs. Rigor: a unit test per rule (one edit at a
+time), a pinned multi-edit golden, a self-diff wiring test, properties (reflexivity:
+self-diff empty; sharpness+soundness: one edit → exactly one correctly-classified change;
+direction asymmetry: swapping old/new flips the verdict) + a two-layer `fuzz_attest_diff`
+(parser total on arbitrary bytes; classifier total + reflexive on real manifests); every
+rule teeth-verified (flip error-add → 3 fail; neuter `range_widened` → 2 fail).
+
+**Left:** eventually an **LSP** (deferred — needs an incremental query layer). (Deferred:
+a faithful `fmt` — the lexer discards comments/layout; `printer.rs` is a debug printer.
+See `TOOLING-HANDOFF.md` "What NOT to build".)
 
 ### P. Self-hosting — plumbing landed; the port itself remains (the gate; XL)
 **Design §19 / Motley prerequisite.** Rewrite the Jestyr compiler in Jestyr. The

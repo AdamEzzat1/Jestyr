@@ -1420,6 +1420,288 @@ mod attest_props {
     }
 }
 
+/// Unit, golden, wiring, and property tests for `jestyrc attest --diff` (workstream
+/// O, increment 3 — the sound breaking-change detector). The oracle is known by
+/// construction: a base program is mutated by one contract edit whose verdict we
+/// know, and the diff must report exactly that change with that verdict. All
+/// pure-Rust (it diffs manifest *text*), so toolchain-free.
+mod attest_diff {
+    use super::*;
+    use crate::attest::{self, Verdict};
+
+    /// Attest a single-file source to its manifest text (the `jestyrc attest` output).
+    fn attest_src(id: &str, src: &str) -> String {
+        let (ast, info) = typeck_full(src);
+        attest::manifest(id, src, &ast, &info)
+    }
+
+    /// Diff two sources by attesting each and classifying — the full `--diff` path.
+    fn diff(old_src: &str, new_src: &str) -> attest::DiffReport {
+        let om = attest::parse_manifest(&attest_src("old", old_src)).expect("old parses");
+        let nm = attest::parse_manifest(&attest_src("new", new_src)).expect("new parses");
+        attest::diff(&om, &nm)
+    }
+
+    /// The single change's `(verdict, detail)` — panics unless there is exactly one,
+    /// which is the point: a one-edit mutation must produce a one-change diff.
+    /// Returns owned strings so callers can pass a temporary `diff(...)`.
+    fn sole(report: &attest::DiffReport) -> (Verdict, String) {
+        assert_eq!(report.changes.len(), 1, "expected exactly one change: {}", report.render());
+        let c = &report.changes[0];
+        (c.verdict, c.detail.clone())
+    }
+
+    // ── unit: round-trip the manifest parser ──────────────────────────────────
+
+    #[test]
+    fn parse_round_trips_guarantees() {
+        let src = "@no_panic pub fn f(n: i32 in 0..10) -> i32 !{ Bad } \
+                   requires n >= 0 ensures result >= 0 { return n }";
+        let m = attest::parse_manifest(&attest_src("t", src)).unwrap();
+        let it = m.items.get("fn f").expect("fn f present");
+        assert!(it.is_pub);
+        assert!(it.no_panic);
+        assert!(it.requires.contains("n >= 0"), "{:?}", it.requires);
+        assert!(it.ensures.contains("result >= 0"), "{:?}", it.ensures);
+        assert!(it.errors.contains("Bad"), "{:?}", it.errors);
+        assert_eq!(it.refines.get("n").map(String::as_str), Some("0..10"));
+    }
+
+    // ── unit: each classification rule, one edit at a time ────────────────────
+
+    const BASE: &str = "pub fn f(n: i32) -> i32 { return n }";
+
+    #[test]
+    fn an_added_error_is_breaking() {
+        let new = "pub fn f(n: i32) -> i32 !{ Overflow } { return n }";
+        let (v, d) = sole(&diff(BASE, new));
+        assert_eq!(v, Verdict::Breaking);
+        assert!(d.contains("error added `Overflow`"), "{d}");
+    }
+
+    #[test]
+    fn a_removed_error_is_compatible() {
+        let old = "pub fn f(n: i32) -> i32 !{ Overflow } { return n }";
+        let (v, d) = sole(&diff(old, BASE));
+        assert_eq!(v, Verdict::Compatible);
+        assert!(d.contains("error removed `Overflow`"), "{d}");
+    }
+
+    #[test]
+    fn a_strengthened_requires_is_breaking() {
+        let new = "pub fn f(n: i32) -> i32 requires n >= 0 { return n }";
+        let (v, d) = sole(&diff(BASE, new));
+        assert_eq!(v, Verdict::Breaking);
+        assert!(d.contains("`requires n >= 0` added"), "{d}");
+    }
+
+    #[test]
+    fn a_dropped_requires_is_compatible() {
+        let old = "pub fn f(n: i32) -> i32 requires n >= 0 { return n }";
+        let (v, _d) = sole(&diff(old, BASE));
+        assert_eq!(v, Verdict::Compatible);
+    }
+
+    #[test]
+    fn an_added_ensures_is_compatible() {
+        let new = "pub fn f(n: i32) -> i32 ensures result >= 0 { return n }";
+        let (v, d) = sole(&diff(BASE, new));
+        assert_eq!(v, Verdict::Compatible);
+        assert!(d.contains("`ensures result >= 0` added"), "{d}");
+    }
+
+    #[test]
+    fn a_dropped_ensures_is_breaking() {
+        let old = "pub fn f(n: i32) -> i32 ensures result >= 0 { return n }";
+        let (v, _d) = sole(&diff(old, BASE));
+        assert_eq!(v, Verdict::Breaking);
+    }
+
+    #[test]
+    fn losing_no_panic_is_breaking() {
+        let old = "@no_panic pub fn f(n: i32) -> i32 { return n }";
+        let (v, d) = sole(&diff(old, BASE));
+        assert_eq!(v, Verdict::Breaking);
+        assert!(d.contains("lost `@no_panic`"), "{d}");
+    }
+
+    #[test]
+    fn gaining_no_panic_is_compatible() {
+        let new = "@no_panic pub fn f(n: i32) -> i32 { return n }";
+        let (v, _d) = sole(&diff(BASE, new));
+        assert_eq!(v, Verdict::Compatible);
+    }
+
+    #[test]
+    fn narrowing_a_refinement_is_breaking() {
+        let old = "pub fn f(n: i32 in 0..100) -> i32 { return n }";
+        let new = "pub fn f(n: i32 in 1..100) -> i32 { return n }";
+        let (v, d) = sole(&diff(old, new));
+        assert_eq!(v, Verdict::Breaking);
+        assert!(d.contains("narrowed `0..100` → `1..100`"), "{d}");
+    }
+
+    #[test]
+    fn widening_a_refinement_is_compatible() {
+        let old = "pub fn f(n: i32 in 1..100) -> i32 { return n }";
+        let new = "pub fn f(n: i32 in 0..1000) -> i32 { return n }";
+        let (v, d) = sole(&diff(old, new));
+        assert_eq!(v, Verdict::Compatible);
+        assert!(d.contains("widened `1..100` → `0..1000`"), "{d}");
+    }
+
+    #[test]
+    fn a_non_literal_refinement_change_is_conservatively_breaking() {
+        // Can't prove `0..xs.len ⊇ 0..n`, so the sound verdict is breaking.
+        let old = "pub fn f(xs: []i32, i: usize in 0..xs.len) -> i32 { return xs[i] }";
+        let new = "pub fn f(xs: []i32, i: usize in 0..i) -> i32 { return xs[i] }";
+        let report = diff(old, new);
+        assert!(
+            report.changes.iter().any(|c| c.verdict == Verdict::Breaking && c.detail.contains("narrowed")),
+            "non-literal refinement change must be breaking: {}", report.render()
+        );
+    }
+
+    #[test]
+    fn removing_a_pub_item_is_breaking_but_a_private_one_is_not() {
+        let old = "pub fn a() -> i32 { return 0 } fn b() -> i32 { return 0 }";
+        // remove both a (pub) and b (priv); add nothing.
+        let new = "fn keep() -> i32 { return 0 }";
+        let report = diff(old, new);
+        let a = report.changes.iter().find(|c| c.item == "fn a").expect("fn a change");
+        let b = report.changes.iter().find(|c| c.item == "fn b").expect("fn b change");
+        assert_eq!(a.verdict, Verdict::Breaking, "pub removal: {}", a.detail);
+        assert_eq!(b.verdict, Verdict::Compatible, "priv removal: {}", b.detail);
+    }
+
+    #[test]
+    fn a_return_type_change_is_breaking() {
+        let old = "pub fn f(n: i32) -> i32 { return n }";
+        let new = "pub fn f(n: i32) -> i64 { return n }";
+        let (v, d) = sole(&diff(old, new));
+        assert_eq!(v, Verdict::Breaking);
+        assert!(d.contains("signature changed"), "{d}");
+    }
+
+    #[test]
+    fn losing_no_panic_reports_once_not_also_as_a_sig_change() {
+        // Regression: `@no_panic` is in the `sig:` line too; `sig_core` must strip it
+        // so the loss is reported exactly once (not also as "signature changed").
+        let old = "@no_panic pub fn f(n: i32) -> i32 { return n }";
+        let (v, d) = sole(&diff(old, BASE));
+        assert_eq!(v, Verdict::Breaking);
+        assert!(d.contains("@no_panic"), "the single change names @no_panic: {d}");
+    }
+
+    // ── golden + exit-gate: a multi-edit report, pinned ───────────────────────
+
+    #[test]
+    fn a_mixed_diff_report_is_pinned_and_gates() {
+        let old = "pub fn parse(s: i32) -> i32 requires s >= 0 { return s } \
+                   @no_panic pub fn push(x: i32) -> i32 { return x }";
+        // parse: +error (breaking) and -requires (compatible); push: -@no_panic (breaking).
+        let new = "pub fn parse(s: i32) -> i32 !{ Overflow } { return s } \
+                   pub fn push(x: i32) -> i32 { return x }";
+        let report = diff(old, new);
+        assert!(report.has_breaking(), "must gate (exit non-zero)");
+        assert_eq!((report.breaking(), report.compatible()), (2, 1));
+        // The body lines, sorted by (item, verdict, detail) — deterministic.
+        let rendered = report.render();
+        let body: Vec<&str> = rendered
+            .lines()
+            .filter(|l| l.starts_with("BREAKING") || l.starts_with("compatible"))
+            .collect();
+        assert_eq!(
+            body,
+            [
+                "BREAKING    fn parse  error added `Overflow`",
+                "compatible  fn parse  `requires s >= 0` removed",
+                "BREAKING    fn push  lost `@no_panic`",
+            ]
+        );
+    }
+
+    // ── wiring: identical manifests → zero changes ────────────────────────────
+
+    #[test]
+    fn a_manifest_diffed_against_itself_has_no_changes() {
+        let m = attest::parse_manifest(&attest_src("t", BASE)).unwrap();
+        let report = attest::diff(&m, &m);
+        assert!(report.changes.is_empty(), "self-diff must be empty: {}", report.render());
+        assert!(!report.has_breaking());
+    }
+}
+
+/// Property + fuzz tests for `attest --diff`. The on-thesis invariants: a manifest
+/// vs itself yields **zero** changes (reflexivity), and any single contract mutation
+/// yields **exactly one** correctly-classified change (soundness + sharpness).
+mod attest_diff_props {
+    use super::*;
+    use crate::attest::{self, Verdict};
+    use proptest::prelude::*;
+
+    fn parsed(src: &str) -> attest::ParsedManifest {
+        let (ast, info) = typeck_full(src);
+        attest::parse_manifest(&attest::manifest("p", src, &ast, &info)).expect("parses")
+    }
+
+    /// A base program (`f` over `t`) plus the same program after one contract edit,
+    /// paired with that edit's known verdict. Each arm changes exactly one clause.
+    fn arb_one_edit() -> impl Strategy<Value = (String, String, Verdict)> {
+        let prim = prop_oneof![Just("i32"), Just("i64"), Just("u8")];
+        (prim, 0usize..6).prop_map(|(t, which)| {
+            let base = format!("pub fn f(n: {t}) -> {t} {{ return n }}");
+            let (new, verdict) = match which {
+                0 => (format!("pub fn f(n: {t}) -> {t} !{{ E }} {{ return n }}"), Verdict::Breaking),
+                1 => (format!("pub fn f(n: {t}) -> {t} requires n >= 0 {{ return n }}"), Verdict::Breaking),
+                2 => (format!("@no_panic pub fn f(n: {t}) -> {t} {{ return n }}"), Verdict::Compatible),
+                3 => (format!("pub fn f(n: {t}) -> {t} ensures result >= 0 {{ return n }}"), Verdict::Compatible),
+                4 => (format!("pub fn f(n: {t} in 0..10) -> {t} {{ return n }}"), Verdict::Breaking),
+                _ => (format!("fn f(n: {t}) -> {t} {{ return n }}"), Verdict::Breaking), // pub -> priv
+            };
+            (base, new, verdict)
+        })
+    }
+
+    proptest! {
+        /// **Reflexivity.** A manifest diffed against itself has zero changes — for
+        /// every generated program. Teeth: any spurious change (e.g. comparing
+        /// unordered sets by sequence) breaks this.
+        #[test]
+        fn self_diff_is_empty(p in super::prop::arb_program()) {
+            let m = parsed(&p);
+            let report = attest::diff(&m, &m);
+            prop_assert!(report.changes.is_empty(), "self-diff not empty:\n{}", report.render());
+        }
+
+        /// **Sharpness + soundness.** One contract edit yields exactly one change,
+        /// with the verdict the generator knows by construction. Teeth: flipping any
+        /// rule's verdict (e.g. error-add → compatible) fails for that arm.
+        #[test]
+        fn one_edit_yields_one_correctly_classified_change(
+            (old, new, want) in arb_one_edit(),
+        ) {
+            let report = attest::diff(&parsed(&old), &parsed(&new));
+            prop_assert_eq!(report.changes.len(), 1, "edit:\n{} ->\n{}\n{}", old, new, report.render());
+            prop_assert_eq!(report.changes[0].verdict, want, "{}", report.render());
+        }
+
+        /// **Direction asymmetry.** Swapping old/new flips every verdict — a change
+        /// breaking forwards is compatible backwards and vice-versa (no rule is
+        /// accidentally symmetric). True for the contract rules the generator covers.
+        #[test]
+        fn swapping_old_and_new_flips_the_verdict((old, new, want) in arb_one_edit()) {
+            let rev = attest::diff(&parsed(&new), &parsed(&old));
+            prop_assert_eq!(rev.changes.len(), 1);
+            let flipped = match want {
+                Verdict::Breaking => Verdict::Compatible,
+                Verdict::Compatible => Verdict::Breaking,
+            };
+            prop_assert_eq!(rev.changes[0].verdict, flipped, "{}", rev.render());
+        }
+    }
+}
+
 /// Experiment (feature `dharht-experiment`): the strongest "can D-HARHT replace a
 /// `HashMap`?" check — a sealed D-HARHT (Memory profile) must agree with a HashMap
 /// on every key, across random key sets.
@@ -1858,6 +2140,36 @@ mod fuzz {
             let (c, _) = cgen::emit(&ast, &info);
             assert_eq!(sha, crate::sha256::hex(c.as_bytes()));
             assert_eq!(m, crate::attest::manifest("fuzz", &prog, &ast, &info), "deterministic");
+        });
+    }
+
+    /// Coverage-guided fuzzing of **`attest --diff`** (workstream O): two layers.
+    /// First, `parse_manifest` must never panic on arbitrary bytes (it parses
+    /// untrusted manifest files). Second, `diff` of two *real* manifests built from
+    /// fuzzed contract clauses must never panic and stays reflexive (a manifest vs
+    /// itself is empty) — exercising the classifier on adversarial guarantee text.
+    #[test]
+    fn fuzz_attest_diff() {
+        bolero::check!().with_type::<(String, String)>().for_each(|(a, b): &(String, String)| {
+            // Layer 1: the parser is total on arbitrary text.
+            let _ = crate::attest::parse_manifest(a);
+            let _ = crate::attest::parse_manifest(b);
+
+            // Layer 2: build two genuine manifests with fuzzed contract bodies and
+            // diff them; the classifier never panics, and self-diff is empty.
+            let prog = |s: &str| {
+                format!("pub fn f(n: i32) -> i32 requires {s} {{ {s} return n }}")
+            };
+            let mk = |s: &str| {
+                let src = prog(s);
+                let (tokens, _) = Lexer::new(&src).tokenize();
+                let (ast, _) = Parser::new(&src, tokens).parse();
+                let (info, _) = crate::typeck::check(&ast);
+                crate::attest::parse_manifest(&crate::attest::manifest("f", &src, &ast, &info)).unwrap()
+            };
+            let (ma, mb) = (mk(a), mk(b));
+            let _ = crate::attest::diff(&ma, &mb).render();
+            assert!(crate::attest::diff(&ma, &ma).changes.is_empty(), "self-diff must be empty");
         });
     }
 
