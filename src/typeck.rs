@@ -40,16 +40,21 @@ pub fn check(ast: &Ast) -> (TypeInfo, Vec<Diagnostic>) {
 /// item belongs to, what each module imports, and what is `pub` — so the checker
 /// can enforce visibility and resolve qualified access (`mem.allocate`).
 pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>) {
-    let owner = build_owner(ast, modules);
+    let Owners { owner, name_mods, dup } = build_owner(ast, modules);
+    let item_mod: Vec<ModId> =
+        (0..ast.items.len()).map(|i| *modules.item_mod.get(i).unwrap_or(&0)).collect();
     let mut tc = TypeChecker {
         ast,
         modules,
         owner,
+        name_mods,
+        dup,
         cur_mod: 0,
         table: GlobalTable::default(),
         expr_types: vec![Ty::Unknown; ast.exprs.len()],
         method_calls: HashMap::new(),
         qualified: HashMap::new(),
+        call_sym: HashMap::new(),
         impl_calls: HashMap::new(),
         bound_method_calls: HashMap::new(),
         dyn_coercions: HashMap::new(),
@@ -65,6 +70,9 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
         TypeInfo {
             table: tc.table,
             expr_types: tc.expr_types,
+            item_mod,
+            dup_fns: tc.dup,
+            call_sym: tc.call_sym,
             method_calls: tc.method_calls,
             qualified: tc.qualified,
             impl_calls: tc.impl_calls,
@@ -76,43 +84,78 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
     )
 }
 
+/// The result of the ownership pass: who owns what, and which names collide.
+struct Owners {
+    /// `(owning module, item name)` → is it `pub`. The basis for cross-module
+    /// visibility and qualified-access resolution; keyed on the module so two
+    /// modules may own the same bare name independently (the namespace fix).
+    owner: HashMap<(ModId, String), bool>,
+    /// fn/const name → the modules that define it. Drives `dup` and the
+    /// "defined in another module — call it qualified" diagnostic.
+    name_mods: HashMap<String, Vec<ModId>>,
+    /// fn/const names defined in more than one module (see [`crate::types::canon`]).
+    dup: HashSet<String>,
+}
+
 /// The owning module and visibility of every named top-level item — the basis
-/// for cross-module visibility checks and qualified-access resolution.
-fn build_owner(ast: &Ast, modules: &Modules) -> HashMap<String, (ModId, bool)> {
-    let mut owner = HashMap::new();
+/// for cross-module visibility checks, namespace isolation, and qualified-access
+/// resolution. Unlike the v1 flat pool, ownership is keyed on `(module, name)`,
+/// so two modules each defining `make` are distinct entries, not a collision.
+fn build_owner(ast: &Ast, modules: &Modules) -> Owners {
+    let mut owner: HashMap<(ModId, String), bool> = HashMap::new();
+    let mut name_mods: HashMap<String, Vec<ModId>> = HashMap::new();
     for (i, item) in ast.items.iter().enumerate() {
         let m = *modules.item_mod.get(i).unwrap_or(&0);
         let is_pub = *modules.item_pub.get(i).unwrap_or(&true);
-        let name = match item {
-            Item::Fn(f) => Some(f.name.name.clone()),
-            Item::Enum(e) => Some(e.name.name.clone()),
-            Item::Const(c) => Some(c.name.name.clone()),
-            Item::Struct { name, .. } => Some(name.name.clone()),
-            Item::Distinct(d) => Some(d.name.name.clone()),
-            Item::Extern(e) => Some(e.name.name.clone()),
-            Item::Trait(t) => Some(t.name.name.clone()),
-            Item::Impl(_) | Item::Import(_) => None,
+        // `namespaced` names participate in collision disambiguation (functions
+        // and consts — increment 1's scope); externs keep their bare linker name
+        // and types/variants/traits still resolve globally (increment 2).
+        let (name, namespaced) = match item {
+            Item::Fn(f) => (Some(f.name.name.clone()), true),
+            Item::Const(c) => (Some(c.name.name.clone()), true),
+            Item::Enum(e) => (Some(e.name.name.clone()), false),
+            Item::Struct { name, .. } => (Some(name.name.clone()), false),
+            Item::Distinct(d) => (Some(d.name.name.clone()), false),
+            Item::Extern(e) => (Some(e.name.name.clone()), false),
+            Item::Trait(t) => (Some(t.name.name.clone()), false),
+            Item::Impl(_) | Item::Import(_) => (None, false),
         };
         if let Some(n) = name {
-            owner.entry(n).or_insert((m, is_pub));
+            owner.entry((m, n.clone())).or_insert(is_pub);
+            if namespaced {
+                let mods = name_mods.entry(n).or_default();
+                if !mods.contains(&m) {
+                    mods.push(m);
+                }
+            }
         }
     }
-    owner
+    let dup: HashSet<String> =
+        name_mods.iter().filter(|(_, ms)| ms.len() > 1).map(|(n, _)| n.clone()).collect();
+    Owners { owner, name_mods, dup }
 }
 
 struct TypeChecker<'a> {
     ast: &'a Ast,
     modules: &'a Modules,
-    /// name → (owning module, is_pub), for visibility + qualified resolution.
-    owner: HashMap<String, (ModId, bool)>,
+    /// `(module, name)` → is_pub, for visibility + namespace-isolated resolution.
+    owner: HashMap<(ModId, String), bool>,
+    /// fn/const name → the modules defining it (cross-module diagnostics).
+    name_mods: HashMap<String, Vec<ModId>>,
+    /// fn/const names defined in more than one module (drives `canon`).
+    dup: HashSet<String>,
     /// The module whose item is currently being checked.
     cur_mod: ModId,
     table: GlobalTable,
     expr_types: Vec<Ty>,
     /// `Call`-expr id → method resolution (see [`MethodRes`]).
     method_calls: HashMap<ExprId, MethodRes>,
-    /// Qualified access (`mem.allocate` / `mem.PAGE`) → the resolved bare name.
+    /// Qualified access (`mem.allocate` / `mem.PAGE`) → the resolved *canonical*
+    /// name (bare unless the name collides across modules; see `canon`).
     qualified: HashMap<ExprId, String>,
+    /// Unqualified direct call → its target's canonical name, recorded only when
+    /// it differs from the bare callee (a within-module call to a colliding name).
+    call_sym: HashMap<ExprId, String>,
     /// `Call`-expr id → trait-impl method resolution (traits, Stage B).
     impl_calls: HashMap<ExprId, ImplCall>,
     /// `Call`-expr id → a method call on a *bracket type parameter* resolved
@@ -153,6 +196,32 @@ impl<'a> TypeChecker<'a> {
     fn set(&mut self, id: ExprId, ty: Ty) -> Ty {
         self.expr_types[id.0 as usize] = ty.clone();
         ty
+    }
+
+    // --- per-module namespacing ---
+
+    /// The canonical symbol name of `name` as owned by module `m` (the global
+    /// table's key and the backend's C symbol — bare unless the name collides).
+    fn canon_in(&self, m: ModId, name: &str) -> String {
+        crate::types::canon(m, name, &self.dup)
+    }
+
+    /// The canonical name of `name` resolved from the *current* module.
+    fn canon_cur(&self, name: &str) -> String {
+        self.canon_in(self.cur_mod, name)
+    }
+
+    /// Does the current module itself define a top-level item called `name`?
+    /// (An unqualified name resolves only against its own module — namespace
+    /// isolation; cross-module access must be qualified.)
+    fn owns_local(&self, name: &str) -> bool {
+        self.owner.contains_key(&(self.cur_mod, name.to_string()))
+    }
+
+    /// The module that defines a top-level `name`, if exactly one does — used for
+    /// non-namespaced kinds (types) where the name is unique program-wide.
+    fn defining_module(&self, name: &str) -> Option<ModId> {
+        self.owner.keys().find(|(_, n)| n == name).map(|(m, _)| *m)
     }
 
     // --- building the global table ---
@@ -203,7 +272,8 @@ impl<'a> TypeChecker<'a> {
         // Phase 2: lower field/variant/parameter/return types now that every
         // type name has an index.
         let empty = HashSet::new();
-        for item in &ast.items {
+        for (item_ix, item) in ast.items.iter().enumerate() {
+            let item_m = *self.modules.item_mod.get(item_ix).unwrap_or(&0);
             match item {
                 Item::Struct { name, body, .. } => {
                     let self_idx = self.table.type_index.get(&name.name).copied();
@@ -275,17 +345,20 @@ impl<'a> TypeChecker<'a> {
                         })
                         .collect();
                     let ret = f.ret_ty.map(|t| self.lower_type(&typ, t)).unwrap_or(Ty::Unit);
-                    if self.table.fns.contains_key(&f.name.name) {
+                    // Key on the canonical name so two modules may each define
+                    // `make`; a clash here is a *same-module* redefinition.
+                    let key = self.canon_in(item_m, &f.name.name);
+                    if self.table.fns.contains_key(&key) {
                         self.error(f.name.span, format!("duplicate definition of `{}`", f.name.name));
                     }
                     self.table.fns.insert(
-                        f.name.name.clone(),
+                        key,
                         FnSig { params, ret, ret_conv: f.ret_conv, fallible: f.errors.is_some() },
                     );
                 }
                 Item::Const(c) => {
                     let t = c.ty.map(|t| self.lower_type(&empty, t)).unwrap_or(Ty::Unknown);
-                    self.table.consts.insert(c.name.name.clone(), t);
+                    self.table.consts.insert(self.canon_in(item_m, &c.name.name), t);
                 }
                 Item::Extern(e) => {
                     let params: Vec<ParamSig> = e
@@ -910,9 +983,16 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Find a top-level function by its *canonical* name (`canon`). For a name
+    /// that doesn't collide across modules this is just the bare name, so callers
+    /// passing a bare name resolve exactly as before; for a colliding name the
+    /// caller must pass the disambiguated `name__m<mod>` so the right module's
+    /// definition is selected.
     fn find_fn_decl(&self, name: &str) -> Option<&'a FnDecl> {
-        self.ast.items.iter().find_map(|it| match it {
-            Item::Fn(f) if f.name.name == name => Some(f),
+        self.ast.items.iter().enumerate().find_map(|(i, it)| match it {
+            Item::Fn(f) if self.canon_in(*self.modules.item_mod.get(i).unwrap_or(&0), &f.name.name) == name => {
+                Some(f)
+            }
             _ => None,
         })
     }
@@ -1149,10 +1229,14 @@ impl<'a> TypeChecker<'a> {
         for a in args {
             self.infer(scope, typ, self_ty, *a);
         }
-        match self.owner.get(fname).copied() {
-            Some((owner, is_pub)) if owner == target_mod && is_pub => {
-                self.qualified.insert(id, fname.to_string());
-                if let Some(sig) = self.table.fns.get(fname) {
+        match self.owner.get(&(target_mod, fname.to_string())).copied() {
+            Some(true) => {
+                // Canonical key: selects this module's definition even when the
+                // name is shared with another module, and is the symbol the
+                // backend emits for the direct call.
+                let key = self.canon_in(target_mod, fname);
+                self.qualified.insert(id, key.clone());
+                if let Some(sig) = self.table.fns.get(&key) {
                     let ret = sig.ret.clone();
                     let fallible = sig.fallible;
                     let want = sig.params.len();
@@ -1162,18 +1246,18 @@ impl<'a> TypeChecker<'a> {
                             format!("`{binding}.{fname}` expects {want} argument(s), found {}", args.len()),
                         );
                     }
-                    let ret = self.monomorphize_ret(fname, args, typ, ret);
+                    let ret = self.monomorphize_ret(&key, args, typ, ret);
                     let t = if fallible { Ty::Result(Box::new(ret)) } else { ret };
                     self.set(id, t)
                 } else {
                     self.set(id, Ty::Unknown)
                 }
             }
-            Some((owner, _)) if owner == target_mod => {
+            Some(false) => {
                 self.error(span, format!("`{fname}` is private to module `{binding}`"));
                 self.set(id, Ty::Unknown)
             }
-            _ => {
+            None => {
                 self.error(span, format!("module `{binding}` has no public function `{fname}`"));
                 self.set(id, Ty::Unknown)
             }
@@ -1190,17 +1274,18 @@ impl<'a> TypeChecker<'a> {
         name: &str,
     ) -> Ty {
         let span = self.ast.expr_at(id).span;
-        match self.owner.get(name).copied() {
-            Some((owner, is_pub)) if owner == target_mod && is_pub => {
-                self.qualified.insert(id, name.to_string());
-                let t = self.table.consts.get(name).cloned().unwrap_or(Ty::Unknown);
+        match self.owner.get(&(target_mod, name.to_string())).copied() {
+            Some(true) => {
+                let key = self.canon_in(target_mod, name);
+                self.qualified.insert(id, key.clone());
+                let t = self.table.consts.get(&key).cloned().unwrap_or(Ty::Unknown);
                 self.set(id, t)
             }
-            Some((owner, _)) if owner == target_mod => {
+            Some(false) => {
                 self.error(span, format!("`{name}` is private to module `{binding}`"));
                 self.set(id, Ty::Unknown)
             }
-            _ => {
+            None => {
                 self.error(span, format!("module `{binding}` has no public item `{name}`"));
                 self.set(id, Ty::Unknown)
             }
@@ -1214,17 +1299,22 @@ impl<'a> TypeChecker<'a> {
         self.modules.imports.get(self.cur_mod).and_then(|m| m.get(binding)).copied()
     }
 
-    /// Error if `name` resolves to a top-level item in *another* module that is
-    /// not `pub` — the bootstrap's visibility rule (design §9). A name local to
-    /// the current module, or a builtin/unknown name, is fine.
-    fn check_visibility(&mut self, name: &str, span: Span) {
-        if let Some(&(owner, is_pub)) = self.owner.get(name) {
-            if owner != self.cur_mod && !is_pub {
-                self.error(
-                    span,
-                    format!("`{name}` is private to module `{}`", self.modules.names[owner]),
-                );
-            }
+    /// An unqualified `name` that the current module does not define, but which
+    /// *another* module does, is an unresolved-name error under per-module
+    /// namespacing (design §9): cross-module access must be qualified. A name no
+    /// module defines (a builtin/intrinsic/opaque symbol) stays quiet.
+    fn report_cross_module_name(&mut self, name: &str, span: Span) {
+        if let Some(mods) = self.name_mods.get(name) {
+            // (It can't be owned by the current module here — that path resolved
+            // it locally — so every listed module is a different one.)
+            let m = mods[0];
+            let owner = self.modules.names.get(m).map(String::as_str).unwrap_or("?");
+            self.error(
+                span,
+                format!(
+                    "cannot find `{name}` in this module; it is defined in module `{owner}` — call it qualified as `{owner}.{name}`"
+                ),
+            );
         }
     }
 
@@ -1372,15 +1462,30 @@ impl<'a> TypeChecker<'a> {
             ExprKind::Null => Ty::Ptr { mutbl: PtrMut::Default, inner: Box::new(Ty::Unknown) },
 
             ExprKind::Name(n) => {
+                let local_const =
+                    if self.owns_local(&n.name) { self.table.consts.get(&self.canon_cur(&n.name)) } else { None };
                 if let Some(t) = scope_lookup(scope, &n.name) {
                     t
-                } else if let Some(t) = self.table.consts.get(&n.name) {
-                    t.clone()
+                } else if let Some(t) = local_const {
+                    let t = t.clone();
+                    let key = self.canon_cur(&n.name);
+                    if key != n.name {
+                        self.call_sym.insert(id, key);
+                    }
+                    t
                 } else if let Some(&i) = self.table.variants.get(&n.name) {
                     // A bare nullary variant, e.g. `none` — for a generic enum its
                     // instantiation comes from the expected type (`variant_ctor_type`).
                     self.variant_ctor_type(i, &n.name, &[])
                 } else {
+                    // A bare function name used as a value (e.g. `&make` to take
+                    // its address). Its type stays opaque here, but record the
+                    // canonical symbol so the backend names the right one when the
+                    // name collides across modules.
+                    let key = self.canon_cur(&n.name);
+                    if key != n.name && self.owns_local(&n.name) && self.table.fns.contains_key(&key) {
+                        self.call_sym.insert(id, key);
+                    }
                     Ty::Unknown // a function name or external symbol: stay quiet
                 }
             }
@@ -1525,7 +1630,8 @@ impl<'a> TypeChecker<'a> {
                 // `get(o: Option(i32), …)` types `none` as `Option(i32)`.
                 let param_tys: Vec<Ty> = callee_name
                     .as_ref()
-                    .and_then(|n| self.table.fns.get(n))
+                    .filter(|n| self.owns_local(n))
+                    .and_then(|n| self.table.fns.get(&self.canon_cur(n)))
                     .map(|sig| sig.params.iter().map(|p| p.ty.clone()).collect())
                     .unwrap_or_default();
                 for (i, a) in args.iter().enumerate() {
@@ -1540,17 +1646,27 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
                 if let Some(name) = callee_name {
-                    self.check_visibility(&name, span);
                     // Definition-site bounds (Stage D): a bracket-generic call
                     // `f[T: Tr](…)` must instantiate `T` at a type that `impl`s
                     // `Tr` — checked here, where `T` is concrete (the args carry it).
                     let arg_tys: Vec<Ty> =
                         args.iter().map(|a| self.expr_types[a.0 as usize].clone()).collect();
                     self.check_call_bounds(&name, &arg_tys, span);
-                    if let Some(sig) = self.table.fns.get(&name) {
-                        let ret = sig.ret.clone();
-                        let fallible = sig.fallible;
-                        let want = sig.params.len();
+                    // Namespace isolation: an unqualified name resolves *only*
+                    // against the current module's own items. The canonical key
+                    // picks this module's definition of a possibly-shared name,
+                    // and (when that differs from the bare name) is handed to the
+                    // backend so the call targets the right C symbol.
+                    let key = self.canon_cur(&name);
+                    let resolved = if self.owns_local(&name) {
+                        self.table.fns.get(&key).map(|sig| (sig.ret.clone(), sig.fallible, sig.params.len()))
+                    } else {
+                        None
+                    };
+                    if let Some((ret, fallible, want)) = resolved {
+                        if key != name {
+                            self.call_sym.insert(id, key.clone());
+                        }
                         if want != args.len() {
                             self.error(
                                 span,
@@ -1558,7 +1674,7 @@ impl<'a> TypeChecker<'a> {
                             );
                         }
                         // For a generic call, resolve type parameters in the return.
-                        let ret = self.monomorphize_ret(&name, args, typ, ret);
+                        let ret = self.monomorphize_ret(&key, args, typ, ret);
                         // A fallible call yields `T !E`; `?` later unwraps it.
                         if fallible {
                             Ty::Result(Box::new(ret))
@@ -1588,6 +1704,11 @@ impl<'a> TypeChecker<'a> {
                         // `write_file`/`file_exists -> bool`.
                         t
                     } else {
+                        // Not local, not a variant/intrinsic: if some *other*
+                        // module defines it, this is the v1 namespace leak that is
+                        // now an error — the name must be reached qualified
+                        // (`mod.name`). Otherwise it stays an opaque/builtin name.
+                        self.report_cross_module_name(&name, span);
                         Ty::Unknown
                     }
                 } else {
@@ -2054,7 +2175,7 @@ impl<'a> TypeChecker<'a> {
                     // Per-field visibility: a non-`pub` struct field is private to
                     // its defining module (design §2.8). Same-module access is free.
                     if is_struct {
-                        if let Some(&(owner, _)) = self.owner.get(&sname) {
+                        if let Some(owner) = self.defining_module(&sname) {
                             if owner != self.cur_mod && !self.field_is_pub(&sname, fname) {
                                 let m = self.modules.names[owner].clone();
                                 self.error(

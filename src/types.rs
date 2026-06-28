@@ -14,9 +14,31 @@
 //! choice: for a generic `T` you must assume moves, so a borrow of `T` still
 //! can't escape.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Conv, ExprId, PtrMut};
+use crate::module::ModId;
+
+/// The canonical symbol name of a top-level item — what the global table is keyed
+/// on and what codegen mangles into a C symbol.
+///
+/// It is the item's **bare name** unless that name is defined in more than one
+/// module (`dup`), in which case it is disambiguated with the owning module's id
+/// (`make` → `make__m3`). The crucial property: for any name that is *not*
+/// actually duplicated, `canon == name`, so every single-module program — and
+/// every collision-free multi-module program — keys and mangles exactly as
+/// before (byte-identical C). Disambiguation only fires for a genuine collision,
+/// which is new capability the flat name pool could not express at all.
+///
+/// Shared by the type checker (table keys + resolution) and the backend (symbol
+/// emission) so the two never disagree on a symbol's name.
+pub fn canon(modid: ModId, name: &str, dup: &HashSet<String>) -> String {
+    if dup.contains(name) {
+        format!("{name}__m{modid}")
+    } else {
+        name.to_string()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ty {
@@ -310,11 +332,26 @@ pub struct MethodRes {
 pub struct TypeInfo {
     pub table: GlobalTable,
     pub expr_types: Vec<Ty>,
+    /// The owning module of each item in `Ast::items` (parallel vector), so the
+    /// backend can compute a definition's canonical symbol via [`canon`].
+    pub item_mod: Vec<ModId>,
+    /// Top-level function/const names defined in more than one module — the set
+    /// that drives [`canon`] disambiguation. Empty for any collision-free
+    /// program, so the backend's symbol emission is unchanged in that case.
+    pub dup_fns: HashSet<String>,
+    /// An *unqualified* direct call (`make(a)`) → the canonical name of the
+    /// function it resolved to, recorded **only** when that differs from the bare
+    /// callee name (i.e. the name collides across modules). The backend prefers
+    /// this over the AST's bare name so a within-module call to a duplicated name
+    /// targets the right C symbol; absent for every non-colliding call, keeping
+    /// the emitted C byte-identical there.
+    pub call_sym: HashMap<ExprId, String>,
     /// `Call`-expr id → its method resolution, for `base.name(args)` calls.
     pub method_calls: HashMap<ExprId, MethodRes>,
-    /// Module-qualified access, resolved to the target's *bare* name: a `Call`
+    /// Module-qualified access, resolved to the target's *canonical* name (see
+    /// [`canon`] — the bare name unless it collides across modules): a `Call`
     /// expr id (`mem.allocate(x)`) or a `Field` expr id (`mem.PAGE_SIZE`) →
-    /// the underlying function/const name. The backend emits a direct reference,
+    /// the underlying function/const symbol. The backend emits a direct reference,
     /// not a field access / method call (design §9, qualified access).
     pub qualified: HashMap<ExprId, String>,
     /// `Call`-expr id → trait-impl method resolution, for `recv.m(args)` calls

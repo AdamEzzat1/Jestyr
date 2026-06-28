@@ -94,7 +94,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | H | Function-pointer types | 0% | HIGH | M | ✓ | ✓ (vtables) |
 | I | Error-handling polish | ~70% | MED | S | ✓ | — |
 | J | Numeric / operator completeness | ~70% | MED | S–M | ✓ | ✓ (determinism) |
-| K | Module system v2 | ~60% | MED | M | ✓ | ✓✓ (build/incremental) |
+| K | Module system v2 | ~70% | MED | M | ✓ | ✓✓ (build/incremental) |
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
 | N | Concurrency polish | ~50% | MED | M | ✓ | — |
@@ -197,13 +197,22 @@ determinism** cares); float↔int cast edge cases; bit-width-aware literals; `as
 done; possibly operator methods. Determinism-relevant: no-FMA, compensated ops are a
 *Motley* concern but the numeric model starts here.
 
-### K. Module system v2 — ~60% (MED conflict; files: module.rs + typeck)
+### K. Module system v2 — ~70% (MED conflict; files: module.rs + typeck)
 **Done:** `import`, `pub` visibility, qualified access, cycle detection, multi-file
-merge (flat namespace). **Left:** **true per-module namespaces** (today names must be
-globally unique — the flat-namespace limitation, HANDOFF §5.24); **directory-as-
-module**; qualified *type* paths (`mod.Type`); **`build.jestyr`** + manifest +
-lockfile + vendored deps (design §9). **Motley:** the DAG already enables the
-parallel/incremental-compilation story.
+merge; **per-module namespaces for functions + consts** (increment 1) — resolution
+is keyed on `(ModId, name)`, an unqualified name resolves current-module-first and
+cross-module access *must* be qualified (a sibling's name unqualified is now an
+unresolved-name error), and colliding symbols are disambiguated in cgen via a
+canonical name (`make` → `jestyr_make__m<mod>`) that is a **no-op for any
+non-colliding program** (single- and multi-module C stays byte-identical — verified).
+Two modules may now each define `make`/`get`/`helper` (incl. a *generic* `make`
+alongside a *non-generic* one), which **clears the logged self-host blocker**
+(`intern` could not be imported beside `list`/`strmap`). **Left:** qualified *type*
+paths (`mod.Type`, increment 2); **directory-as-module**; **module content-hashing**
+(the unique feature — sha256 of each module's normalized form → provably-incremental
+builds, pairs with O's `attest`); then `build.jestyr`/manifest (deferred:
+lockfile/vendored-deps/effects — ecosystem-premature). **Motley:** the DAG already
+enables the parallel/incremental-compilation story; hashing makes it provable.
 
 ### L. Memory-layout pass — 0% (MED conflict; files: a new analysis + cgen)
 **Design §16 / a Motley principle.** **Left:** a layout pass computing size/align,
@@ -291,13 +300,15 @@ classification). Lexes a built-in sample deterministically and a real file from 
 
 **Surfaced by the slice (real, now-known gaps):** Jestyr doesn't auto-drop **struct
 fields** (so containers-of-containers must free explicitly); `unsafe {}` isn't a valid
-`let` initializer (use a tail-`unsafe` reader helper); and **per-module namespaces** (K)
-bite as soon as two std modules share a helper name (`make`, `destroy`) — top-level
-names are globally unique today.
+`let` initializer (use a tail-`unsafe` reader helper). **Per-module namespaces** (K)
+used to bite as soon as two std modules shared a helper name (`make`, `destroy`,
+`hash_str`, …) — **fixed (increment 1):** functions/consts are now per-module, so
+`intern` imports cleanly beside `list`/`strmap` and shared helper names no longer
+collide. (`mod.Type` paths + directory-as-module are the remaining K niceties.)
 
 **Still open before a full self-host:** extend the lexer to the *full* token set
 (floats/hex, block comments, strings, all operators) → port the parser → typeck →
-escape → cgen (~27K lines); plus per-module namespaces + a basic `build.jestyr` (K) for
+escape → cgen (~27K lines); plus qualified type paths + a basic `build.jestyr` (K) for
 comfort. **Plumbing follow-up:** a recoverable `read_file -> String !IoError`.
 
 ---

@@ -659,4 +659,117 @@ mod tests {
             info.qualified.values().collect::<Vec<_>>()
         );
     }
+
+    // --- per-module namespaces (modules-v2, increment 1) ---
+
+    /// The headline: two modules may each define a top-level `make` (and a
+    /// private `helper`). Both compile, the qualified calls resolve to the right
+    /// implementation, and each gets a *distinct* C symbol — exactly what the v1
+    /// flat name pool could not express (both would have collided on `jestyr_make`).
+    #[test]
+    fn two_modules_may_define_the_same_top_level_name() {
+        let dir = fixture(
+            "dupname",
+            &[
+                ("main.jtr", "import \"a\"\nimport \"b\"\nfn main() -> i32 { return a.make() + b.make() }"),
+                ("a.jtr", "pub fn make() -> i32 { return helper() }\nfn helper() -> i32 { return 1 }"),
+                ("b.jtr", "pub fn make() -> i32 { return helper() }\nfn helper() -> i32 { return 2 }"),
+            ],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(diags.is_empty(), "both modules' `make`/`helper` coexist cleanly: {:?}", diags);
+        let (c, cd) = crate::cgen::emit(&prog.ast, &info);
+        assert!(cd.is_empty(), "cgen diags: {:?}", cd);
+        // Distinct symbols per owning module (root = m0, a = m1, b = m2).
+        assert!(
+            c.contains("jestyr_make__m1(void)") && c.contains("jestyr_make__m2(void)"),
+            "each module's `make` gets a distinct C symbol:\n{c}"
+        );
+        assert!(
+            c.contains("jestyr_helper__m1(void)") && c.contains("jestyr_helper__m2(void)"),
+            "each module's private `helper` gets a distinct C symbol too:\n{c}"
+        );
+        // The qualified calls resolved to the two *different* canonical names.
+        let mut q: Vec<&String> = info.qualified.values().collect();
+        q.sort();
+        assert!(
+            q.iter().any(|n| *n == "make__m1") && q.iter().any(|n| *n == "make__m2"),
+            "a.make and b.make resolve to distinct canonical names: {q:?}"
+        );
+    }
+
+    /// The negative half: an *unqualified* reference to a name defined only in
+    /// another module no longer silently resolves across the boundary — it is an
+    /// unresolved-name error directing the caller to qualify it.
+    #[test]
+    fn unqualified_cross_module_name_is_unresolved() {
+        let dir = fixture(
+            "dupneg",
+            &[
+                ("main.jtr", "import \"a\"\nfn main() -> i32 { return make() }"),
+                ("a.jtr", "pub fn make() -> i32 { return 1 }"),
+            ],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (_info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(
+            diags.iter().any(|d| d.message.contains("cannot find `make` in this module")
+                && d.message.contains("module `a`")),
+            "an unqualified cross-module name must error: {:?}",
+            diags
+        );
+    }
+
+    /// The real self-host blocker shape: a *generic* `make` (à la `list`) and a
+    /// *non-generic* `make` (à la `intern`/`strmap`) imported together. The
+    /// generic one monomorphizes under its module-disambiguated name; the
+    /// non-generic one keeps a distinct symbol — they no longer collide.
+    #[test]
+    fn a_generic_and_a_nongeneric_same_name_coexist() {
+        let dir = fixture(
+            "dupgen",
+            &[
+                ("main.jtr", "import \"list\"\nimport \"box\"\nfn main() -> i32 { return list.make(i32, 5) + box.make(2) }"),
+                ("list.jtr", "pub fn make(comptime T: type, n: i32) -> i32 { return n + 5 }"),
+                ("box.jtr", "pub fn make(v: i32) -> i32 { return v + 100 }"),
+            ],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(diags.is_empty(), "generic + non-generic `make` coexist: {:?}", diags);
+        let (c, cd) = crate::cgen::emit(&prog.ast, &info);
+        assert!(cd.is_empty(), "cgen diags: {:?}", cd);
+        // list = m1 (generic, monomorphized with `i32`); box = m2 (non-generic).
+        assert!(
+            c.contains("jestyr_make__m1__i32("),
+            "the generic `make` monomorphizes under its disambiguated name:\n{c}"
+        );
+        assert!(
+            c.contains("jestyr_make__m2(int32_t"),
+            "the non-generic `make` keeps its own distinct symbol:\n{c}"
+        );
+    }
+
+    /// A name defined in only one module is *not* disambiguated — single-module
+    /// and collision-free programs keep their bare `jestyr_<name>` symbol, so the
+    /// mangle change is a no-op there (the repo's byte-identical invariant).
+    #[test]
+    fn a_unique_name_keeps_its_bare_symbol() {
+        let dir = fixture(
+            "uniqsym",
+            &[
+                ("main.jtr", "import \"lib\"\nfn main() -> i32 { return lib.solo() }"),
+                ("lib.jtr", "pub fn solo() -> i32 { return 7 }"),
+            ],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        let (info, _d) = typeck::check_program(&prog.ast, &prog.modules);
+        let (c, _cd) = crate::cgen::emit(&prog.ast, &info);
+        assert!(c.contains("jestyr_solo(void)"), "a non-colliding name stays bare:\n{c}");
+        assert!(!c.contains("jestyr_solo__m"), "and is never module-disambiguated:\n{c}");
+    }
 }

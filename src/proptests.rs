@@ -1452,6 +1452,109 @@ mod dharht_experiment {
     }
 }
 
+/// Per-module namespaces (modules-v2, increment 1): the property layer over
+/// *multi-module* programs — resolution soundness, namespace isolation, and
+/// determinism. Unlike the single-source `mod prop` helpers, these drive the real
+/// loader (`module::load`) over a small temp directory per case.
+mod modules_props {
+    use super::*;
+    use proptest::prelude::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CASE: AtomicU64 = AtomicU64::new(0);
+
+    /// Write `files` to a fresh, uniquely-named temp dir, run load → type-check →
+    /// escape → lower, and return (all diagnostic messages, emitted C). The dir is
+    /// removed afterwards.
+    fn pipeline_multi(files: &[(String, String)]) -> (Vec<String>, String) {
+        let id = CASE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("jestyr_modprop_{id:016x}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, src) in files {
+            std::fs::write(dir.join(name), src).unwrap();
+        }
+        let prog = crate::module::load(dir.join("main.jtr").to_str().unwrap());
+        let mut diags: Vec<String> = prog.diags.iter().map(|d| d.message.clone()).collect();
+        let (info, td) = typeck::check_program(&prog.ast, &prog.modules);
+        diags.extend(td.iter().map(|d| d.message.clone()));
+        diags.extend(escape::check(&prog.ast, &info).iter().map(|d| d.message.clone()));
+        let (c, cd) = cgen::emit(&prog.ast, &info);
+        diags.extend(cd.iter().map(|d| d.message.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
+        (diags, c)
+    }
+
+    /// `n` (2..=3) sibling modules, each defining `pub fn f` and a private
+    /// `helper` returning a distinct constant, plus a root that calls each `f`
+    /// **qualified**. The names collide across modules by construction — exactly
+    /// what v1's flat pool forbade.
+    fn arb_multimod() -> impl Strategy<Value = Vec<(String, String)>> {
+        proptest::collection::vec(0i32..1000, 2..=3).prop_map(|vals| {
+            let mut files = Vec::new();
+            let mut imports = String::new();
+            let mut sum = String::new();
+            for (k, v) in vals.iter().enumerate() {
+                let name = format!("m{k}");
+                files.push((
+                    format!("{name}.jtr"),
+                    format!("pub fn f() -> i32 {{ return helper() }}\nfn helper() -> i32 {{ return {v} }}"),
+                ));
+                imports.push_str(&format!("import \"{name}\"\n"));
+                if k > 0 {
+                    sum.push_str(" + ");
+                }
+                sum.push_str(&format!("{name}.f()"));
+            }
+            files.insert(0, ("main.jtr".to_string(), format!("{imports}fn main() -> i32 {{ return {sum} }}")));
+            files
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+
+        /// **Namespace isolation + soundness.** Several modules each defining `f`
+        /// (and a private `helper`) compile cleanly, and every module's `f`/`helper`
+        /// gets its own C symbol — never a silent cross-module collision.
+        #[test]
+        fn same_named_items_across_modules_get_distinct_symbols(files in arb_multimod()) {
+            let (diags, c) = pipeline_multi(&files);
+            prop_assert!(diags.is_empty(), "clean multi-module compile: {:?}", diags);
+            // Root is module 0; the k-th sibling (1-indexed) is module k.
+            let n = files.len() - 1;
+            for k in 1..=n {
+                prop_assert!(c.contains(&format!("jestyr_f__m{k}(void)")), "f__m{k} missing:\n{c}");
+                prop_assert!(c.contains(&format!("jestyr_helper__m{k}(void)")), "helper__m{k} missing:\n{c}");
+            }
+        }
+
+        /// **Determinism.** The same multi-module program lowers to byte-identical C.
+        #[test]
+        fn multimodule_compilation_is_deterministic(files in arb_multimod()) {
+            prop_assert_eq!(pipeline_multi(&files).1, pipeline_multi(&files).1);
+        }
+
+        /// **Negative soundness.** Calling a sibling's `f` *unqualified* from the
+        /// root never resolves silently — it is an unresolved-name error.
+        #[test]
+        fn unqualified_sibling_call_never_resolves(files in arb_multimod()) {
+            let mut files = files;
+            let imports: String = files[1..]
+                .iter()
+                .map(|(n, _)| format!("import \"{}\"\n", n.trim_end_matches(".jtr")))
+                .collect();
+            files[0].1 = format!("{imports}fn main() -> i32 {{ return f() }}");
+            let (diags, _c) = pipeline_multi(&files);
+            prop_assert!(
+                diags.iter().any(|d| d.contains("cannot find `f` in this module")),
+                "an unqualified cross-module `f` must error: {:?}",
+                diags
+            );
+        }
+    }
+}
+
 mod fuzz {
     use super::*;
 
@@ -1462,6 +1565,45 @@ mod fuzz {
     fn fuzz_pipeline() {
         bolero::check!().with_type::<String>().for_each(|s: &String| {
             run_pipeline(s);
+        });
+    }
+
+    /// Build a synthetic two-module `Modules` over a single parsed AST by
+    /// assigning items alternately to module 0/1 (each importing the other). Lets
+    /// the multi-module resolver be fuzzed in-memory — no filesystem.
+    fn split_two_modules(ast: &crate::ast::Ast) -> crate::module::Modules {
+        use std::collections::HashMap;
+        let n = ast.items.len();
+        let mut imports = vec![HashMap::new(), HashMap::new()];
+        imports[0].insert("m1".to_string(), 1usize);
+        imports[1].insert("m0".to_string(), 0usize);
+        crate::module::Modules {
+            names: vec!["m0".to_string(), "m1".to_string()],
+            paths: vec!["<m0>".to_string(), "<m1>".to_string()],
+            srcs: vec![String::new(), String::new()],
+            bases: vec![0, 0],
+            item_mod: (0..n).map(|i| i % 2).collect(),
+            item_pub: vec![true; n],
+            imports,
+        }
+    }
+
+    /// **Multi-module resolution never panics.** Parse arbitrary source, split its
+    /// items across two synthetic modules, then run name resolution + lowering —
+    /// exercising the `(module, name)` owner keying, collision detection, and
+    /// `canon` on adversarial input without touching disk. `canon` itself is also
+    /// hit directly on the raw bytes as a name.
+    #[test]
+    fn fuzz_multimodule_resolution() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let (tokens, _) = Lexer::new(s).tokenize();
+            let (ast, _) = Parser::new(s, tokens).parse();
+            let modules = split_two_modules(&ast);
+            let (info, _td) = typeck::check_program(&ast, &modules);
+            let _ = cgen::emit(&ast, &info);
+            let mut dup = std::collections::HashSet::new();
+            dup.insert(s.clone());
+            let _ = crate::types::canon(1, s, &dup);
         });
     }
 

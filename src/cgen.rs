@@ -138,7 +138,7 @@ fn emit_program(
     let mut generics = HashSet::new();
     // Every error name across all error sets, mapped to a distinct integer tag.
     let mut error_tags: HashMap<String, i64> = HashMap::new();
-    for item in &ast.items {
+    for (i, item) in ast.items.iter().enumerate() {
         if let Item::Fn(f) = item {
             // A function is monomorphized if it has a `comptime T: type` parameter
             // *or* a bracket-form `[T: Bound]` generic — both are templates emitted
@@ -148,7 +148,10 @@ fn emit_program(
                     p.comptime && p.ty.is_some_and(|t| matches!(ast.type_at(t).kind, TypeKind::TypeKw))
                 });
             if is_gen {
-                generics.insert(f.name.name.clone());
+                // Keyed on the canonical name so two modules' generic templates of
+                // the same name stay distinct (bare name when not duplicated).
+                let m = *info.item_mod.get(i).unwrap_or(&0);
+                generics.insert(crate::types::canon(m, &f.name.name, &info.dup_fns));
             }
             if let Some(es) = &f.errors {
                 for name in &es.names {
@@ -1328,7 +1331,7 @@ impl<'a> Cgen<'a> {
                 if f.errors.is_none() {
                     continue;
                 }
-                let ok = self.info.table.fns.get(&f.name.name).map(|s| s.ret.clone()).unwrap_or(Ty::Unit);
+                let ok = self.info.table.fns.get(&self.fn_canon(f)).map(|s| s.ret.clone()).unwrap_or(Ty::Unit);
                 let cname = self.result_c_name(&ok);
                 if !seen.insert(cname.clone()) {
                     continue;
@@ -1403,7 +1406,7 @@ impl<'a> Cgen<'a> {
                     continue;
                 }
                 self.subst.clear();
-                let cname = self.c_fn_name(&f.name.name);
+                let cname = self.c_fn_name(&self.fn_canon(f));
                 let sig = self.fn_signature(f, &cname);
                 self.raw(format!("{sig};\n"));
             }
@@ -1531,7 +1534,7 @@ impl<'a> Cgen<'a> {
                     continue;
                 }
                 self.subst.clear();
-                let cname = self.c_fn_name(&f.name.name);
+                let cname = self.c_fn_name(&self.fn_canon(f));
                 self.emit_fn(f, &cname);
             }
         }
@@ -1981,12 +1984,33 @@ impl<'a> Cgen<'a> {
         }
     }
 
+    /// The canonical name of the item at `ast.items[i]` (bare unless its name
+    /// collides across modules; see [`crate::types::canon`]).
+    fn canon_item(&self, i: usize, name: &str) -> String {
+        let m = *self.info.item_mod.get(i).unwrap_or(&0);
+        crate::types::canon(m, name, &self.info.dup_fns)
+    }
+
+    /// The canonical name of a top-level function declaration, found by identity
+    /// among the program's items. A nested method (not a top-level item) is never
+    /// a cross-module collision, so it falls back to its bare name.
+    fn fn_canon(&self, f: &FnDecl) -> String {
+        for (i, it) in self.ast.items.iter().enumerate() {
+            if let Item::Fn(g) = it {
+                if std::ptr::eq(g, f) {
+                    return self.canon_item(i, &f.name.name);
+                }
+            }
+        }
+        f.name.name.clone()
+    }
+
     /// The C result-struct name if `f` is fallible, otherwise empty.
     fn fn_result_type(&self, f: &FnDecl) -> String {
         if f.errors.is_none() {
             return String::new();
         }
-        let ok = self.info.table.fns.get(&f.name.name).map(|s| s.ret.clone()).unwrap_or(Ty::Unit);
+        let ok = self.info.table.fns.get(&self.fn_canon(f)).map(|s| s.ret.clone()).unwrap_or(Ty::Unit);
         self.result_c_name(&ok)
     }
 
@@ -3456,8 +3480,13 @@ impl<'a> Cgen<'a> {
                         if self.extern_fns.contains(&n.name) {
                             return format!("(&{})", n.name);
                         }
-                        if self.info.table.fns.contains_key(&n.name) {
-                            return format!("(&{})", self.c_fn_name(&n.name));
+                        // Canonical name for a colliding function referenced by
+                        // address (the checker recorded it on the name expr);
+                        // bare otherwise, so non-colliding `&fn` is unchanged.
+                        let cname =
+                            self.info.call_sym.get(rhs).cloned().unwrap_or_else(|| n.name.clone());
+                        if self.info.table.fns.contains_key(&cname) {
+                            return format!("(&{})", self.c_fn_name(&cname));
                         }
                     }
                 }
@@ -4346,11 +4375,15 @@ impl<'a> Cgen<'a> {
                 return format!("{}({})", n.name, parts.join(", "));
             }
 
+            // The callee's canonical name: the type checker recorded it when an
+            // unqualified call targets a name that collides across modules;
+            // otherwise it is the bare name (so non-colliding calls are unchanged).
+            let cname = self.info.call_sym.get(&call_id).cloned().unwrap_or_else(|| n.name.clone());
+
             // A generic function: pick (or already-collected) the monomorphized
             // instance for these type arguments and call it.
-            if self.generics.contains(&n.name) {
-                let name = n.name.clone();
-                return self.emit_generic_call(&name, args);
+            if self.generics.contains(&cname) {
+                return self.emit_generic_call(&cname, args);
             }
 
             // A known function: take `&arg` for `mut`/`out` parameters.
@@ -4358,7 +4391,7 @@ impl<'a> Cgen<'a> {
                 .info
                 .table
                 .fns
-                .get(&n.name)
+                .get(&cname)
                 .map(|sig| sig.params.iter().map(|p| p.conv).collect())
                 .unwrap_or_default();
             let mut parts = Vec::new();
@@ -4370,7 +4403,7 @@ impl<'a> Cgen<'a> {
                     parts.push(e);
                 }
             }
-            return format!("{}({})", self.c_fn_name(&n.name), parts.join(", "));
+            return format!("{}({})", self.c_fn_name(&cname), parts.join(", "));
         }
 
         let c = self.emit_expr(callee);
@@ -4633,6 +4666,9 @@ impl<'a> Cgen<'a> {
             || self.info.table.variants.contains_key(name)
             || self.info.table.type_index.contains_key(name)
             || self.generics.contains(name)
+            // A name that collides across modules is table-keyed by its canonical
+            // form, so its bare spelling misses the maps above — recognise it here.
+            || self.info.dup_fns.contains(name)
             || is_intrinsic(name)
     }
 
@@ -6832,10 +6868,14 @@ impl<'a> Cgen<'a> {
         f.params.iter().filter(|p| self.is_type_param(p)).map(|p| p.name.name.clone()).collect()
     }
 
+    /// Find a top-level function by its *canonical* name. For a non-colliding
+    /// name this is the bare name (callers passing a bare name are unaffected);
+    /// for a duplicated name the caller passes the disambiguated `name__m<mod>`,
+    /// selecting the right module's definition.
     fn find_fn(&self, name: &str) -> Option<&'a FnDecl> {
         let ast = self.ast;
-        ast.items.iter().find_map(|it| match it {
-            Item::Fn(f) if f.name.name == name => Some(f),
+        ast.items.iter().enumerate().find_map(|(i, it)| match it {
+            Item::Fn(f) if self.canon_item(i, &f.name.name) == name => Some(f),
             _ => None,
         })
     }
@@ -7044,8 +7084,11 @@ impl<'a> Cgen<'a> {
                         }
                     }
                 } else if let ExprKind::Name(n) = &ast.expr_at(*callee).kind {
-                    if self.generics.contains(&n.name) {
-                        if let Some(gf) = self.find_fn(&n.name) {
+                    // Canonical callee name for a within-module call to a
+                    // possibly-colliding generic (bare when it doesn't collide).
+                    let cname = self.info.call_sym.get(&id).cloned().unwrap_or_else(|| n.name.clone());
+                    if self.generics.contains(&cname) {
+                        if let Some(gf) = self.find_fn(&cname) {
                             let mut type_args: Vec<Ty> = self
                                 .comptime_positions(gf)
                                 .iter()
@@ -7053,7 +7096,7 @@ impl<'a> Cgen<'a> {
                                 .map(|a| self.eval_type_arg(*a, subst))
                                 .collect();
                             type_args.extend(self.infer_bracket_args(gf, args, subst));
-                            work.push(Work::Fn(n.name.clone(), type_args));
+                            work.push(Work::Fn(cname, type_args));
                         }
                     }
                 }
