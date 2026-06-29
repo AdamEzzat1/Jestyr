@@ -97,7 +97,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | K | Module system v2 | ~98% | MED | M | ✓ | ✓✓ (build/incremental) |
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
-| N | Concurrency polish | ~88% | MED | M | ✓ | — |
+| N | Concurrency polish | ~95% | MED | M | ✓ | — |
 | O | Tooling (fmt / test / doc / LSP) | test-runner ✅, attest ✅, attest --diff ✅; LSP/fmt deferred | LOW | M | ✓✓ | ✓ |
 | P | Self-hosting | plumbing ✅; port open | — | XL | ✓✓ | ✓✓ (the gate) |
 | Q | Parallelism (data-parallel) | ~18% (tier-1 SOACs `par_reduce`/`par_map`/`par_scan` ✅) | MED | L | ✓✓ | ✓✓ (cost model) |
@@ -267,12 +267,55 @@ layer."** Mostly a new pass + cgen tweaks → reasonably isolated.
 from runtime asserts into **static proof obligations** discharged by an SMT backend.
 **Motley:** verifying the compiler's own passes. Long-horizon; do after F/G.
 
-### N. Concurrency polish — ~88% (MED conflict; files: ast, parser, typeck, escape, cgen, printer)
+### N. Concurrency polish — ~95% (MED conflict; files: ast, parser, typeck, escape, cgen, printer)
 **Done:** `concurrent { spawn … }` → pthreads, scoped join; atomics (`__atomic_*`);
 `core.par_binned_sum`; **Mutex** (protected object); **move-only channels**; the
-generalized **`par_reduce`** library; **task results + `await`** (below). **Left:** the
-`par … reduce(r)` loop surface + non-deterministic-reduction rejection (the headline *checked*
-guarantee — `par_reduce` is its runtime engine); `spawn` of closures; dynamic-N spawn.
+generalized **`par_reduce`** library; **task results + `await`**; the headline **`par for …
+reduce(r)`** surface with **compile-time non-deterministic-reduction rejection** (below).
+**Left:** `spawn` of closures; dynamic-N spawn (the shared `emit_concurrent` change that also
+unblocks Q's schedule-split); optionally `select` and a `@deterministic` region.
+
+**`par for … reduce(r)` — ✅ DONE (increment 5, THE headline; shared surface with Q).**
+`par for x in xs reduce(r) { body }` maps each element through `body` and reduces the results
+in **parallel**, with the marquee *checked* guarantee: the compiler **accepts only declared
+deterministic reductions** (the `core` built-ins `sum`/`min`/`max`/`xor`) and **rejects a
+non-deterministic one at compile time** — "parallelism that cannot change your answer," a
+compile error if you try to violate it. New `ExprKind::ParFor` threaded through all six files;
+new `par` keyword + contextual `reduce`. Desugars onto `core.par_reduce` (the tested
+deterministic engine): a serial element-wise map (always deterministic) into a scratch `[]i64`,
+then the parallel reassociation-sensitive reduction — bit-identical to serial for any schedule.
+- The check (typeck): the `reduce(r)` constructor name must be in the declared-deterministic
+  allowlist; anything else errors with a diagnostic explaining the reassociation hazard. (A
+  `@deterministic` attribute admitting *user* reductions is future work; today the trusted set
+  is the four `core` built-ins.) `[]i64` element/`i64` body/`i64` result for now.
+- `examples/std/par_for.jtr` — a parallel sum-of-squares of 1..=13 (819), bit-identical to the
+  serial fold (1), and a parallel max (13). `module.rs`/`main.rs` untouched.
+- Rigor: parser test (`ParFor` parses); typeck tests (**accepts** a deterministic reduction →
+  `i64`; **rejects** a non-deterministic one — the headline, **teeth-verified by mutation**:
+  relax the allowlist → the reject test fails); cgen lowering test (serial map + `par_reduce`
+  call); `--features c-oracle` real-thread `par_for_demo` (×8, pinned `819 1 13`). Determinism
+  itself is inherited from `core_props::par_reduce_is_split_independent` (the engine).
+
+**Task results + `await` — ✅ DONE (increment 4, the first non-library slice).** `let h =
+spawn f(args)` now binds an awaitable handle of type **`Task(T)`** (T = f's return); `await h`
+joins the task and yields its result. The first increment to thread a new AST node + a new
+`Ty` through all six files. Lowering: the per-site task box gains a `ret` field the trampoline
+writes (`_a->ret = f(args)`); `await h` is a statement-expr `({ if(!_jd) {join; _jd=1;}
+_ja.ret; })` that joins-once (a `_jd` flag guards against the nursery's safety-net brace-join,
+which is now conditional for awaitable handles). Bare `spawn` stays fire-and-forget.
+- `await` parses at the **postfix** level so it binds tighter than `as`/binary: `await a +
+  await b`, `await t as i32` parse as expected. `Ty::Task(Box<Ty>)` is non-`Copy` and never
+  materializes as a runtime value (resolved to thread vars in the `concurrent` scope), so
+  `c_type`'s catch-all suffices — only `is_copy`/`display` needed the new arm.
+- `examples/std/await.jtr` — two tasks compute disjoint partial sums-of-squares in parallel,
+  `await` combines them (385); a single awaited task (14). `module.rs`/`main.rs` untouched.
+- Rigor: parser tests (binding+await; **precedence** `await a as i32` = `(await a) as i32`);
+  typeck tests (`spawn`→`Task(i64)`, `await` unwraps; **awaiting a non-task is rejected**);
+  cgen lowering test (ret field, store, guarded join, `.ret` read) **teeth-verified by
+  mutation** (drop the store → test fails); `--features c-oracle` real-thread `await_demo`
+  (×8, pinned `385 14`). `cargo test` stays toolchain-free.
+- Constraint surfaced: `await` resolves a handle bound in the same `concurrent` scope (a
+  handle is await-only — not stored/passed elsewhere); cross-scope handles are future work.
 
 **Task results + `await` — ✅ DONE (increment 4, the first non-library slice).** `let h =
 spawn f(args)` now binds an awaitable handle of type **`Task(T)`** (T = f's return); `await h`

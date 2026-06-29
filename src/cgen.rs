@@ -1234,6 +1234,11 @@ impl<'a> Cgen<'a> {
                 }
             }
             ExprKind::Invariant(e) | ExprKind::Variant(e) => self.collect_structs_in_expr(*e, subst, seen, order),
+            ExprKind::ParFor { iter, reduction, body, .. } => {
+                self.collect_structs_in_expr(*iter, subst, seen, order);
+                self.collect_structs_in_expr(*reduction, subst, seen, order);
+                self.collect_structs_in_expr(*body, subst, seen, order);
+            }
             _ => {}
         }
     }
@@ -2073,6 +2078,11 @@ impl<'a> Cgen<'a> {
             ExprKind::Region { body, .. } => self.collect_moved(body, out),
             ExprKind::Closure { body, .. } => self.collect_moved_expr(*body, out),
             ExprKind::Spawn(inner) => self.collect_moved_expr(*inner, out),
+            ExprKind::ParFor { iter, reduction, body, .. } => {
+                self.collect_moved_expr(*iter, out);
+                self.collect_moved_expr(*reduction, out);
+                self.collect_moved_expr(*body, out);
+            }
             ExprKind::For { head, body, els, .. } => {
                 match head {
                     ForHead::While(c) => self.collect_moved_expr(*c, out),
@@ -3950,6 +3960,9 @@ impl<'a> Cgen<'a> {
                     }
                 }
             }
+            ExprKind::ParFor { var, iter, reduction, body } => {
+                self.emit_par_for(var, *iter, *reduction, *body)
+            }
             ExprKind::Region { .. } => {
                 self.diag(span, "`region` is only supported in statement position");
                 "0".to_string()
@@ -4773,6 +4786,11 @@ impl<'a> Cgen<'a> {
                 }
             }
             ExprKind::Invariant(e) | ExprKind::Variant(e) => self.find_closures_expr(*e, found, seen),
+            ExprKind::ParFor { iter, reduction, body, .. } => {
+                self.find_closures_expr(*iter, found, seen);
+                self.find_closures_expr(*reduction, found, seen);
+                self.find_closures_expr(*body, found, seen);
+            }
             _ => {}
         }
     }
@@ -4896,6 +4914,11 @@ impl<'a> Cgen<'a> {
                 }
             }
             ExprKind::Invariant(e) | ExprKind::Variant(e) => self.collect_refs(*e, out),
+            ExprKind::ParFor { iter, reduction, body, .. } => {
+                self.collect_refs(*iter, out);
+                self.collect_refs(*reduction, out);
+                self.collect_refs(*body, out);
+            }
             _ => {}
         }
     }
@@ -5861,6 +5884,32 @@ impl<'a> Cgen<'a> {
         if !self.spawn_sites.is_empty() {
             self.raw("\n");
         }
+    }
+
+    /// Lower a `par for v in xs reduce(r) { body }` to a statement-expression: map
+    /// each element through `body` (serially) into a scratch `[]i64`, then run the
+    /// **deterministic parallel reduction** `core.par_reduce` over it (the engine that
+    /// guarantees bit-identical-to-serial for any thread schedule). The map is
+    /// element-wise (always deterministic); the parallel, reassociation-sensitive part
+    /// is `par_reduce`, whose reduction was already checked deterministic by typeck.
+    /// Requires `import "core"` (the reduction value comes from there, so it always is).
+    fn emit_par_for(&mut self, var: &Ident, iter: ExprId, reduction: ExprId, body: ExprId) -> String {
+        let n = self.tmp;
+        self.tmp += 1;
+        let sl = self.slice_c_name(&Ty::Prim("i64"));
+        let src = self.emit_expr(iter);
+        let red = self.emit_expr(reduction);
+        let vname = format!("j_{}", var.name);
+        let bodyc = self.emit_expr(body); // references the loop var as `j_<var>`
+        let prc = self.c_fn_name("par_reduce");
+        format!(
+            "({{ {sl} _pf{n} = {src}; \
+             int64_t* _pm{n} = (int64_t*)malloc(_pf{n}.len * sizeof(int64_t)); \
+             for (size_t _pi{n} = 0; _pi{n} < _pf{n}.len; _pi{n}++) {{ \
+             int64_t {vname} = _pf{n}.ptr[_pi{n}]; _pm{n}[_pi{n}] = {bodyc}; }} \
+             int64_t _pr{n} = {prc}(({sl}){{ _pm{n}, _pf{n}.len }}, {red}); \
+             free(_pm{n}); _pr{n}; }})"
+        )
     }
 
     /// The C return type a `spawn` target stores in its task box (`None` for a
@@ -7384,6 +7433,13 @@ impl<'a> Cgen<'a> {
             ExprKind::Region { body, .. } => self.find_calls_block(body, subst, work),
             ExprKind::Closure { body, .. } => self.find_calls_expr(*body, subst, work),
             ExprKind::Spawn(inner) => self.find_calls_expr(*inner, subst, work),
+            ExprKind::ParFor { iter, reduction, body, .. } => {
+                // Descend so any (possibly generic) calls in the iterable, the
+                // reduction, or the per-element body are monomorphized + emitted.
+                self.find_calls_expr(*iter, subst, work);
+                self.find_calls_expr(*reduction, subst, work);
+                self.find_calls_expr(*body, subst, work);
+            }
             ExprKind::For { head, body, els, .. } => {
                 match head {
                     ForHead::While(c) => self.find_calls_expr(*c, subst, work),
@@ -8443,6 +8499,20 @@ mod tests {
         );
         assert!(c.contains("_ja0.ret"), "await reads the stored result: {c}");
         assert!(c.contains("if (!_jd0) pthread_join(_jt0, NULL);"), "brace-join is guarded: {c}");
+    }
+
+    #[test]
+    fn lowers_par_for_to_serial_map_plus_parallel_reduce() {
+        // `par for x in s reduce(r) { x*x }` lowers to: a serial map of the body into a
+        // scratch buffer, then a call to the deterministic engine `core.par_reduce`.
+        let src = "fn sum_reduction() -> i64 { return 0 } \
+                   fn main() -> i32 { var a: *mut i64 = alloc(i64, 4) let s: []i64 = slice(i64, a, 4) \
+                       let r: i64 = par for x in s reduce(sum_reduction()) { x * x } return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("malloc("), "par for maps into a scratch buffer: {c}");
+        assert!(c.contains("jestyr_par_reduce("), "par for reduces via the par_reduce engine: {c}");
+        assert!(c.contains("(JestyrSlice_i64){ _pm"), "the mapped buffer is passed as a slice: {c}");
     }
 
     #[test]

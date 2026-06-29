@@ -1,0 +1,54 @@
+// examples/std/par_for.jtr — the headline: `par for … reduce(r)`, a deterministic
+// parallel reduction loop (concurrency/parallelism, workstream N).
+//
+// `par for x in xs reduce(r) { body }` maps each element through `body` and reduces
+// the results in parallel. The compiler ACCEPTS only *declared deterministic*
+// reductions (the `core` built-ins sum/min/max/xor) and REJECTS a non-deterministic
+// one (e.g. a naive float `+`, which reassociates under parallelism) — at COMPILE
+// TIME. So the result is bit-identical to the serial fold for any thread schedule:
+// "parallelism that cannot change your answer," enforced by the compiler. It
+// desugars onto `core.par_reduce` (the tested deterministic engine).
+//
+//   jestyrc run examples/std/par_for.jtr   →   819, 1, 13
+//
+// 819 = Σ k² for k in 1..=13 (a parallel sum-of-squares); 1 = that equals the serial
+// fold bit-for-bit; 13 = the parallel max. (See the rejection in the test suite: a
+// non-declared reduction is a compile error.)
+import "core"
+import "io"
+
+fn seti(p: *mut i64, i: usize, v: i64) { unsafe { (p + i).* = v } }
+fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
+
+// The serial reference: sum of squares, left to right.
+fn serial_sum_sq(read s: []i64) -> i64 {
+    var acc: i64 = 0
+    for x in s { acc = acc + x * x }
+    return acc
+}
+
+fn main() -> i32 {
+    // 13 elements (not a multiple of the worker count → an uneven last chunk).
+    var a: *mut i64 = alloc(i64, 13)
+    var i: usize = 0
+    for i < 13 {
+        seti(a, i, (i as i64) + 1)        // 1, 2, …, 13
+        i = i + 1
+    }
+    let s: []i64 = slice(i64, a, 13)
+
+    // A parallel sum-of-squares: map each element to x², reduce with the (declared
+    // deterministic) integer-sum reduction.
+    let par_sq: i64 = par for x in s reduce(core.sum_reduction()) { x * x }
+    io.print_i32(par_sq as i32)                          // 819
+
+    // The determinism guarantee, demonstrated: bit-identical to the serial fold.
+    io.print_i32(b2i(par_sq == serial_sum_sq(s)))        // 1
+
+    // A parallel max (identity map).
+    let par_max: i64 = par for x in s reduce(core.max_reduction()) { x }
+    io.print_i32(par_max as i32)                         // 13
+
+    free_ptr(a)
+    return 0
+}

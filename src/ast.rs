@@ -259,6 +259,13 @@ pub enum ExprKind {
     /// `await <task>` — join a task handle and yield its result value. The operand
     /// is a task handle bound in the same `concurrent` scope (`let h = spawn …`).
     Await(ExprId),
+    /// `par for <var> in <iter> reduce(<reduction>) { <body> }` — a deterministic
+    /// parallel reduction loop (design §10, the headline). `body` maps each element
+    /// to its contribution; `reduction` must be a *declared deterministic* reduction
+    /// (a `core` built-in), enforced at compile time — a non-deterministic reduction
+    /// (which would reassociate under parallelism) is a compile error. Desugars onto
+    /// the `core.par_reduce` engine: bit-identical to serial for any thread schedule.
+    ParFor { var: Ident, iter: ExprId, reduction: ExprId, body: ExprId },
 
     /// `region r { … }` — a named arena scope (design §4.4). `&[r]T` references
     /// into it are zero-cost; the whole arena is freed at the block's end.

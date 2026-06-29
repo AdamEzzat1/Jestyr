@@ -371,6 +371,13 @@ impl<'a> Printer<'a> {
             ExprKind::Concurrent(_) => "concurrent { ... }".to_string(),
             ExprKind::Spawn(e) => format!("spawn {}", self.expr_inline(*e)),
             ExprKind::Await(e) => format!("await {}", self.expr_inline(*e)),
+            ExprKind::ParFor { var, iter, reduction, body } => format!(
+                "par for {} in {} reduce({}) {{ {} }}",
+                var.name,
+                self.expr_inline(*iter),
+                self.expr_inline(*reduction),
+                self.expr_inline(*body)
+            ),
             ExprKind::Region { name, .. } => format!("region {} {{ ... }}", name.name),
             ExprKind::For { head, els, .. } => {
                 let tail = if els.is_some() { " else { ... }" } else { "" };

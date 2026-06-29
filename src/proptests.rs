@@ -5132,6 +5132,16 @@ mod c_oracle {
         }
     }
     #[test]
+    fn par_for_demo() {
+        // The headline surface on real threads: a parallel sum-of-squares of 1..=13
+        // (819), a bit-identical-to-serial flag (1), and a parallel max (13). The
+        // reduction is checked deterministic at compile time, so the result is
+        // schedule-independent — repeated to confirm.
+        for _ in 0..8 {
+            assert_eq!(toks("examples/std/par_for.jtr"), ["819", "1", "13"], "par for result wrong");
+        }
+    }
+    #[test]
     fn await_demo() {
         // Task results + await on real OS threads: two tasks compute disjoint partial
         // sums-of-squares in parallel and `await` combines them (385), then a single

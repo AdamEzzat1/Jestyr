@@ -1236,6 +1236,7 @@ impl<'src> Parser<'src> {
             Concurrent => self.parse_concurrent(),
             Spawn => self.parse_spawn(),
             Await => self.parse_await(),
+            Par => self.parse_par_for(),
             Region => self.parse_region(),
             For => self.parse_for(),
             While | Loop => self.parse_reserved_loop(),
@@ -1383,6 +1384,39 @@ impl<'src> Parser<'src> {
         let inner = self.parse_unary();
         let span = start.to(self.ast.expr_at(inner).span);
         self.ast.expr(ExprKind::Spawn(inner), span)
+    }
+
+    /// `par for <var> in <iter> reduce(<reduction>) { <body> }` — a deterministic
+    /// parallel reduction loop. `body` is a single expression mapping each element to
+    /// its contribution; `reduce(r)` names the reduction (a `core` deterministic
+    /// built-in — enforced by typeck). `reduce` is a contextual keyword (like `step`).
+    fn parse_par_for(&mut self) -> ExprId {
+        let start = self.cur().span;
+        self.expect(Par, "`par`");
+        self.expect(For, "`for` after `par`");
+        let var = self.eat_ident("the `par for` loop variable");
+        self.expect(In, "`in`");
+        // Iterable: a trailing `reduce`/`{` is the clause, not part of the expr.
+        let saved = self.no_struct;
+        self.no_struct = true;
+        let iter = self.parse_expr();
+        self.no_struct = saved;
+        // `reduce ( <reduction> )` — `reduce` is contextual (an ordinary ident token).
+        if self.at(TokenKind::Ident) && self.text(self.cur().span) == "reduce" {
+            self.bump();
+        } else {
+            self.error(self.cur().span, "expected `reduce(<reduction>)` after the `par for` iterable");
+        }
+        self.expect(LParen, "`(`");
+        let reduction = self.parse_expr();
+        self.expect(RParen, "`)`");
+        // Body: a single map expression in braces.
+        self.expect(LBrace, "`{`");
+        let body = self.parse_expr();
+        let end = self.cur().span;
+        self.expect(RBrace, "`}`");
+        let span = start.to(end);
+        self.ast.expr(ExprKind::ParFor { var, iter, reduction, body }, span)
     }
 
     /// `await <task>` — join a task handle and yield its result. The operand is a
@@ -2326,6 +2360,16 @@ mod tests {
         let has_spawn = ast.exprs.iter().filter(|e| matches!(e.kind, ExprKind::Spawn(_))).count();
         assert!(has_conc, "a concurrent nursery was parsed");
         assert_eq!(has_spawn, 2, "two spawn tasks");
+    }
+
+    #[test]
+    fn parses_par_for_reduce() {
+        let ast = parse_ok("fn f() { let t = par for x in xs reduce(core.sum_reduction()) { x * x } }");
+        let pf = ast.exprs.iter().find_map(|e| match &e.kind {
+            ExprKind::ParFor { var, .. } => Some(var.name.clone()),
+            _ => None,
+        });
+        assert_eq!(pf.as_deref(), Some("x"), "par for parsed with its loop variable");
     }
 
     #[test]

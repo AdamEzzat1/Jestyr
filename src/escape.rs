@@ -445,6 +445,20 @@ impl<'a> Checker<'a> {
                 self.region_depths.pop();
                 return;
             }
+            ExprKind::ParFor { var, iter, reduction, body } => {
+                // The loop variable is a *fresh* i64 element value (par_reduce copies
+                // each element into a worker), not a borrow into the iterable — so it
+                // can't escape. Walk the iterable, the per-element body, and the
+                // reduction. No new data-race surface: the reduction's disjoint-region
+                // writes live inside the tested `core.par_reduce` engine.
+                self.walk_expr(ctx, *iter, false);
+                self.walk_expr(ctx, *reduction, false);
+                ctx.push();
+                ctx.bind(&var.name, false);
+                self.walk_expr(ctx, *body, false);
+                ctx.pop();
+                return;
+            }
             ExprKind::For { head, body, els, region, .. } => {
                 // A region-scoped loop allocates a per-iteration scratch arena.
                 if self.no_alloc && region.is_some() {

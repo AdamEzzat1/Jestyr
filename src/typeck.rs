@@ -1705,6 +1705,21 @@ impl<'a> TypeChecker<'a> {
         result
     }
 
+    /// The constructor name of a `par for … reduce(r)` argument, for the
+    /// deterministic-reduction check: `core.sum_reduction()` → `Some("sum_reduction")`,
+    /// reading the call's callee (a qualified `Field` or a bare `Name`). A reduction
+    /// that isn't a direct constructor call yields `None` (and is rejected).
+    fn reduction_ctor_name(&self, e: ExprId) -> Option<String> {
+        if let ExprKind::Call { callee, .. } = &self.ast.expr_at(e).kind {
+            match &self.ast.expr_at(*callee).kind {
+                ExprKind::Name(n) => return Some(n.name.clone()),
+                ExprKind::Field { name, .. } => return Some(name.name.clone()),
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn infer(&mut self, scope: &mut Scope, typ: &HashSet<String>, self_ty: &Ty, id: ExprId) -> Ty {
         let ast = self.ast;
         let data = ast.expr_at(id);
@@ -2227,6 +2242,58 @@ impl<'a> TypeChecker<'a> {
                         Ty::Unknown
                     }
                 }
+            }
+            ExprKind::ParFor { var, iter, reduction, body } => {
+                // The deterministic parallel reduction loop. Today the engine reduces
+                // `[]i64`, so require an `[]i64` iterable, an `i64`-valued body (each
+                // element's contribution), and a *declared deterministic* reduction.
+                let elem = self.iter_elem_type(scope, typ, self_ty, *iter);
+                if !matches!(elem, Ty::Prim("i64") | Ty::Unknown | Ty::Error) {
+                    self.error(
+                        span,
+                        format!(
+                            "`par for` reduces over `[]i64`; found element type `{}`",
+                            elem.display(&self.table)
+                        ),
+                    );
+                }
+                scope.push(HashMap::new());
+                scope.last_mut().unwrap().insert(var.name.clone(), Ty::Prim("i64"));
+                let body_ty = self.infer(scope, typ, self_ty, *body);
+                scope.pop();
+                if !matches!(body_ty, Ty::Prim("i64") | Ty::Unknown | Ty::Error) {
+                    self.error(
+                        span,
+                        format!(
+                            "a `par for` body must produce `i64` (the per-element contribution); found `{}`",
+                            body_ty.display(&self.table)
+                        ),
+                    );
+                }
+                // Infer the reduction (records its resolution), then enforce THE checked
+                // guarantee: it must be a declared deterministic reduction. A
+                // non-deterministic one would reassociate under parallelism — a compile
+                // error, the property `par for` exists to make impossible.
+                let _ = self.infer(scope, typ, self_ty, *reduction);
+                match self.reduction_ctor_name(*reduction) {
+                    Some(n) if DETERMINISTIC_REDUCTIONS.contains(&n.as_str()) => {}
+                    other => {
+                        let shown = other.unwrap_or_else(|| "this reduction".to_string());
+                        self.error(
+                            span,
+                            format!(
+                                "`par for` requires a declared deterministic reduction \
+                                 (one of: {}); `{}` is not one. A non-deterministic reduction \
+                                 (e.g. a naive float `+`, which reassociates under parallelism) \
+                                 would make the result depend on the thread schedule — exactly \
+                                 what `par for` exists to prevent.",
+                                DETERMINISTIC_REDUCTIONS.join(", "),
+                                shown
+                            ),
+                        );
+                    }
+                }
+                Ty::Prim("i64")
             }
             ExprKind::Region { body, .. } => {
                 self.infer_block(scope, typ, self_ty, body);
@@ -3187,6 +3254,15 @@ fn atomic_intrinsic_ret(name: &str) -> Option<Ty> {
     })
 }
 
+/// The declared *deterministic* reductions a `par for … reduce(r)` may use — the
+/// `core` built-ins whose `combine` is associative *and* commutative at the
+/// machine-integer level, so the parallel result is bit-identical to serial for any
+/// schedule. Anything else (a custom or non-deterministic reduction) is rejected at
+/// compile time — the checked guarantee. (A `@deterministic` attribute admitting
+/// user-declared reductions is future work; today the trusted set is these.)
+const DETERMINISTIC_REDUCTIONS: [&str; 4] =
+    ["sum_reduction", "min_reduction", "max_reduction", "xor_reduction"];
+
 /// Does the parameter type's head constructor match the receiver's? Confirms
 /// that `base.name(...)` really is a method on `base`'s type (and not a typo
 /// that happens to share a name with some unrelated function).
@@ -3426,6 +3502,43 @@ mod tests {
         assert!(
             d.iter().any(|m| m.message.contains("await") && m.message.contains("task handle")),
             "awaiting a non-task must error: {d:?}"
+        );
+    }
+
+    // --- par for … reduce(r) (the checked deterministic-reduction guarantee) ---
+
+    #[test]
+    fn par_for_accepts_a_deterministic_reduction_and_types_as_i64() {
+        // A reduction whose constructor is on the declared-deterministic list is
+        // accepted; the loop types as `i64`. (The name check is what matters, so a
+        // local `sum_reduction` stands in for `core.sum_reduction` here.)
+        let (ast, info) = analyze_full(
+            "fn sum_reduction() -> i64 { return 0 } \
+             fn main() -> i32 { var a: *mut i64 = alloc(i64, 4) let s: []i64 = slice(i64, a, 4) \
+                 let r: i64 = par for x in s reduce(sum_reduction()) { x * x } return 0 }",
+        );
+        let pf = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| matches!(e.kind, ExprKind::ParFor { .. }).then_some(ExprId(i as u32)))
+            .expect("the par for expr");
+        assert_eq!(info.type_of(pf), &Ty::Prim("i64"), "par for types as i64");
+    }
+
+    #[test]
+    fn par_for_rejects_a_non_deterministic_reduction() {
+        // THE headline check: a reduction not on the declared-deterministic list is a
+        // compile error — the parallel result could otherwise depend on the schedule.
+        let (_info, d) = analyze(
+            "fn my_reduction() -> i64 { return 0 } \
+             fn main() -> i32 { var a: *mut i64 = alloc(i64, 4) let s: []i64 = slice(i64, a, 4) \
+                 let r: i64 = par for x in s reduce(my_reduction()) { x } return 0 }",
+        );
+        assert!(
+            d.iter()
+                .any(|m| m.message.contains("deterministic reduction") && m.message.contains("my_reduction")),
+            "a non-deterministic reduction must be rejected: {d:?}"
         );
     }
 
