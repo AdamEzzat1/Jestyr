@@ -100,6 +100,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | N | Concurrency polish | ~70% | MED | M | ✓ | — |
 | O | Tooling (fmt / test / doc / LSP) | test-runner ✅, attest ✅, attest --diff ✅; LSP/fmt deferred | LOW | M | ✓✓ | ✓ |
 | P | Self-hosting | plumbing ✅; port open | — | XL | ✓✓ | ✓✓ (the gate) |
+| Q | Parallelism (data-parallel) | 0% (seed `par_binned_sum` ✅) | MED | L | ✓✓ | ✓✓ (cost model) |
 
 ---
 
@@ -391,6 +392,23 @@ collide. (`mod.Type` paths + directory-as-module are the remaining K niceties.)
 (floats/hex, block comments, strings, all operators) → port the parser → typeck →
 escape → cgen (~27K lines); plus qualified type paths + a basic `build.jestyr` (K) for
 comfort. **Plumbing follow-up:** a recoverable `read_file -> String !IoError`.
+
+### Q. Parallelism (data-parallel) — 0% (MED conflict; files: ast, parser, typeck, escape, cgen, printer + new `std/parallel.jtr`)
+**Distinct from N (concurrency = task structuring); Q = data parallelism (make one
+computation faster across cores / lanes / GPU).** They share exactly one bridge: the
+deterministic `par` reduction. **Seed already in-tree:** `core.par_binned_sum` —
+bit-identical-to-serial parallel sum via disjoint-region binning. **Headline:**
+schedule-independent parallelism as a *checked* guarantee — separate the algorithm from
+the schedule (threads/chunk/lane-width) and the compiler **guarantees a bit-identical
+result for every legal schedule** (Halide's idea, made general + checked; impossible
+elsewhere because IEEE-754 reassociation breaks it — Jestyr's FP contract + binned
+reductions + SHA canary make it real). **Increment order:** `par_reduce` library (no
+compiler change) → `par_map`/`par_scan` → `par for … reduce(r)` surface +
+non-deterministic-reduction rejection → the `with schedule(...)` split (needs dynamic-N
+spawn, shared with N) → a **work-span (`W`/`D`) cost model** (`@span(log n)` checked,
++CJC thermal/energy — the Motley tie-in) → far-tier SIMD (`uniform`/`varying` + lane
+reductions bit-identical across vector widths) + GPU SOACs. **Coordinate the `core.jtr`
+`par_*` region with N.** Full handoff: `PARALLELISM-HANDOFF.md`.
 
 ---
 
