@@ -94,7 +94,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | H | Function-pointer types | 0% | HIGH | M | ✓ | ✓ (vtables) |
 | I | Error-handling polish | ~70% | MED | S | ✓ | — |
 | J | Numeric / operator completeness | ~70% | MED | S–M | ✓ | ✓ (determinism) |
-| K | Module system v2 | ~97% | MED | M | ✓ | ✓✓ (build/incremental) |
+| K | Module system v2 | ~98% | MED | M | ✓ | ✓✓ (build/incremental) |
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
 | N | Concurrency polish | ~80% | MED | M | ✓ | — |
@@ -198,7 +198,7 @@ determinism** cares); float↔int cast edge cases; bit-width-aware literals; `as
 done; possibly operator methods. Determinism-relevant: no-FMA, compensated ops are a
 *Motley* concern but the numeric model starts here.
 
-### K. Module system v2 — ~97% (MED conflict; files: module.rs + typeck)
+### K. Module system v2 — ~98% (MED conflict; files: module.rs + typeck)
 **Done:** `import`, `pub` visibility, qualified access, cycle detection, multi-file
 merge; **per-module namespaces for functions + consts** (increment 1) — resolution
 is keyed on `(ModId, name)`, an unqualified name resolves current-module-first and
@@ -242,12 +242,17 @@ variant construction / `match` hits the right one. **Declarative module manifest
 name + hash, imports tagged with their target's hash) as a deterministic, parseable
 artifact, and `verify_manifest` re-checks a committed manifest against a fresh load,
 reporting per-module (transitive) drift — the lockfile-lite declarative surface that
-tooling reads without executing build code; pairs with O's `attest`. **Left:** the
-*executable* `build.jestyr` half (deferred: needs CTFE; lockfile/vendored-deps/
-effects — ecosystem-premature). **Also deferred:**
-*generic* type-name collisions (two modules each defining the same `enum Box(T)` /
-generic-struct) — the monomorphized-instance mangling (`Jestyr_<ctor>__<args>`)
-overlaps function-ctor canon; left globally-keyed (no blocker).
+tooling reads without executing build code; pairs with O's `attest`. **Generic-enum
+collisions** (increment 7) — two modules may each define the same `enum Box(T)`: the
+`GenEnum` ctor is canonicalized at resolution so the monomorphized instances mangle
+to distinct `Jestyr_Box__m<a>__i32` / `__m<b>__i32` (a shared canon-aware finder
+resolves a collided generic enum by its canon key; a misclassified bare instance is
+filtered out of struct-instance collection). No-op + byte-identical for the
+non-colliding generics (`core`'s `Option`/`Result`). **Left:** the *executable*
+`build.jestyr` half (deferred: needs CTFE; lockfile/vendored-deps/effects —
+ecosystem-premature). **Also deferred:** *generic-struct* collisions (the
+comptime-fn-form ctor lives in the function namespace; its instance mangling would
+need the `dup_fns` canon — same pattern, no blocker).
 **Motley:** the DAG already enables the parallel/incremental-compilation story;
 hashing makes it provable.
 

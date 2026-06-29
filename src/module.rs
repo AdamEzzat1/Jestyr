@@ -1364,6 +1364,33 @@ mod tests {
         );
     }
 
+    /// Two modules each defining the **generic** `enum Box(T)` monomorphize to
+    /// distinct instance symbols (`Jestyr_Box__m<a>__i32` / `__m<b>__i32`) — the
+    /// generic-type-collision case (the ctor is canonicalized before mangling).
+    #[test]
+    fn two_modules_may_define_the_same_generic_enum() {
+        let dir = fixture(
+            "collide_genenum",
+            &[
+                ("main.jtr", "import \"a\"\nimport \"b\"\nfn main() -> i32 { return a.get(a.make()) + b.get(b.make()) }"),
+                ("a.jtr", "pub enum Box(T) { full(x: T), empty }\npub fn make() -> Box(i32) { return full(7) }\npub fn get(b: Box(i32)) -> i32 { return match b { full(x) => x, empty => 0 } }"),
+                ("b.jtr", "pub enum Box(T) { full(x: T), empty }\npub fn make() -> Box(i32) { return full(35) }\npub fn get(b: Box(i32)) -> i32 { return match b { full(x) => x, empty => 0 } }"),
+            ],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(diags.is_empty(), "two modules may define generic `Box(T)`: {:?}", diags);
+        let (c, cd) = crate::cgen::emit(&prog.ast, &info);
+        assert!(cd.is_empty(), "cgen diags: {:?}", cd);
+        assert!(
+            c.contains("Jestyr_Box__m1__i32") && c.contains("Jestyr_Box__m2__i32"),
+            "distinct generic-enum instance symbols:\n{c}"
+        );
+        // The misclassified bare instance must not leak.
+        assert!(!c.contains("struct Jestyr_Box__i32 "), "no bare `Jestyr_Box__i32` instance:\n{c}");
+    }
+
     /// Two same-named types *within one module* is still a plain duplicate
     /// definition (the genuine redefinition bug), not the cross-module message.
     #[test]

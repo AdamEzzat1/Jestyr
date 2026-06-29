@@ -748,12 +748,22 @@ impl<'a> Cgen<'a> {
 
     /// Niche info for a *generic enum instance* `ctor(args)`: substitute the type
     /// arguments into the variant templates, then apply the same niche rule. So
+    /// The generic-enum declaration whose *canonical* name is `ctor` (so a
+    /// collided generic enum is found by its disambiguated key — bare otherwise).
+    fn find_generic_enum(&self, ctor: &str) -> Option<&'a EnumDecl> {
+        self.ast.items.iter().enumerate().find_map(|(i, it)| match it {
+            Item::Enum(e)
+                if e.is_generic() && self.canon_type_in(self.item_module(i), &e.name.name) == ctor =>
+            {
+                Some(e)
+            }
+            _ => None,
+        })
+    }
+
     /// `Option(*T)`/`Option(&[r]T)` inherit the niche optimization automatically.
     fn niche_enum_instance(&self, ctor: &str, args: &[Ty]) -> Option<NicheInfo> {
-        let e = self.ast.items.iter().find_map(|it| match it {
-            Item::Enum(e) if e.name.name == ctor && e.is_generic() => Some(e),
-            _ => None,
-        })?;
+        let e = self.find_generic_enum(ctor)?;
         if e.variants.len() != 2 {
             return None;
         }
@@ -799,18 +809,13 @@ impl<'a> Cgen<'a> {
 
     /// The type-param → arg substitution for a generic enum instance `ctor(args)`.
     fn gen_enum_subst(&self, ctor: &str, args: &[Ty]) -> HashMap<String, Ty> {
-        self.ast
-            .items
-            .iter()
-            .find_map(|it| match it {
-                Item::Enum(e) if e.name.name == ctor && e.is_generic() => Some(
-                    e.type_params
-                        .iter()
-                        .map(|p| p.name.clone())
-                        .zip(args.iter().cloned())
-                        .collect(),
-                ),
-                _ => None,
+        self.find_generic_enum(ctor)
+            .map(|e| {
+                e.type_params
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .zip(args.iter().cloned())
+                    .collect()
             })
             .unwrap_or_default()
     }
@@ -931,8 +936,9 @@ impl<'a> Cgen<'a> {
             }
             TypeKind::App { ctor, args } => {
                 let aty: Vec<Ty> = args.iter().map(|a| self.ast_type_to_ty(*a, subst)).collect();
-                if self.enum_is_generic(&ctor.name) {
-                    Ty::GenEnum { ctor: ctor.name.clone(), args: aty }
+                let key = self.canon_type(&ctor.name);
+                if self.enum_is_generic(&key) {
+                    Ty::GenEnum { ctor: key, args: aty }
                 } else {
                     Ty::GenStruct { ctor: ctor.name.clone(), args: aty }
                 }
@@ -979,8 +985,12 @@ impl<'a> Cgen<'a> {
                     }
                 } else {
                     let aty: Vec<Ty> = args.iter().map(|a| self.ast_type_to_ty(*a, subst)).collect();
-                    if self.enum_is_generic(&name.name) {
-                        Ty::GenEnum { ctor: name.name.clone(), args: aty }
+                    let key = match self.path_target(&module.name) {
+                        Some(t) => self.canon_type_in(t, &name.name),
+                        None => self.canon_type(&name.name),
+                    };
+                    if self.enum_is_generic(&key) {
+                        Ty::GenEnum { ctor: key, args: aty }
                     } else {
                         Ty::GenStruct { ctor: name.name.clone(), args: aty }
                     }
@@ -1062,7 +1072,22 @@ impl<'a> Cgen<'a> {
                 self.collect_structs_in_fn(mf, &subst, &mut seen, &mut order);
             }
         }
+        // A *collided* generic enum referenced here is lowered without per-item
+        // module context (this collection runs before `cur_mod` is set), so it can be
+        // misclassified as a generic struct under its bare name. Its real,
+        // module-canon instances are gathered by `collect_enum_instances`; drop any
+        // "struct" instance whose name is in fact a generic enum.
+        order.retain(|(ctor, _)| !self.is_generic_enum_anywhere(ctor));
         order
+    }
+
+    /// Does any module define a generic enum named `bare` (by its source name)?
+    /// Used to filter a collided generic enum mis-collected as a generic struct.
+    fn is_generic_enum_anywhere(&self, bare: &str) -> bool {
+        self.ast
+            .items
+            .iter()
+            .any(|it| matches!(it, Item::Enum(e) if e.is_generic() && e.name.name == bare))
     }
 
     fn collect_structs_in_fn(
@@ -1344,10 +1369,7 @@ impl<'a> Cgen<'a> {
         if self.niche_enum_instance(ctor, args).is_some() {
             return;
         }
-        let Some(e) = self.ast.items.iter().find_map(|it| match it {
-            Item::Enum(e) if e.name.name == ctor && e.is_generic() => Some(e.clone()),
-            _ => None,
-        }) else {
+        let Some(e) = self.find_generic_enum(ctor).cloned() else {
             return;
         };
         let subst: HashMap<String, Ty> = e
@@ -3307,10 +3329,7 @@ impl<'a> Cgen<'a> {
 
     /// Is `name` a generic enum (a monomorphizable template)?
     fn enum_is_generic(&self, name: &str) -> bool {
-        self.ast
-            .items
-            .iter()
-            .any(|it| matches!(it, Item::Enum(e) if e.name.name == name && e.is_generic()))
+        self.find_generic_enum(name).is_some()
     }
 
     /// Emit a two-`str`-argument string operation `helper(a, b)` (equality,
@@ -6519,13 +6538,16 @@ impl<'a> Cgen<'a> {
             TypeKind::App { ctor, args } => {
                 let subst = self.subst.clone();
                 let aty: Vec<Ty> = args.iter().map(|a| self.ast_type_to_ty(*a, &subst)).collect();
+                // Canon the ctor so a collided generic enum gets its own instance
+                // symbol (bare for a generic struct / non-colliding name).
+                let key = self.canon_type(&ctor.name);
                 // A generic-enum instance may be niche-optimized to a bare pointer.
-                if self.enum_is_generic(&ctor.name) {
-                    if let Some(n) = self.niche_enum_instance(&ctor.name, &aty) {
+                if self.enum_is_generic(&key) {
+                    if let Some(n) = self.niche_enum_instance(&key, &aty) {
                         return self.c_type(&n.payload);
                     }
                 }
-                self.gen_struct_c_name(&ctor.name, &aty)
+                self.gen_struct_c_name(&key, &aty)
             }
             TypeKind::Slice(inner) => {
                 let subst = self.subst.clone();

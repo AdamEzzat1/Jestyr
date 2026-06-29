@@ -138,14 +138,12 @@ fn build_owner(ast: &Ast, modules: &Modules) -> Owners {
             Item::Fn(f) => (Some(f.name.name.clone()), true),
             Item::Const(c) => (Some(c.name.name.clone()), true),
             Item::Enum(e) => {
-                // Only *non-generic* enums are collidable here; a generic enum's
-                // monomorphized instance mangling (`Jestyr_<ctor>__<args>`) is the
-                // deferred case, so leave those globally keyed.
-                if e.type_params.is_empty() {
-                    note(&mut type_mods, e.name.name.clone(), m);
-                    for v in &e.variants {
-                        note(&mut variant_mods, v.name.name.clone(), m);
-                    }
+                // Both plain and *generic* enums are collidable: the type name is
+                // canon-keyed, and a generic enum's monomorphized instance mangling
+                // (`Jestyr_<ctor>__<args>`) disambiguates via the canon ctor.
+                note(&mut type_mods, e.name.name.clone(), m);
+                for v in &e.variants {
+                    note(&mut variant_mods, v.name.name.clone(), m);
                 }
                 (Some(e.name.name.clone()), false)
             }
@@ -899,9 +897,16 @@ impl<'a> TypeChecker<'a> {
         !loose(ann) && !loose(got) && ann != got
     }
 
-    /// Does `name` denote a generic enum (an `enum Name(T) { … }` template)?
+    /// Does the bare type name `name` (resolved from the current module) denote a
+    /// generic enum (an `enum Name(T) { … }` template)?
     fn is_generic_enum(&self, name: &str) -> bool {
-        self.table.type_index.get(name).is_some_and(|&i| {
+        self.is_generic_enum_key(&self.canon_type_cur(name))
+    }
+
+    /// As [`is_generic_enum`] but for an already-canonical `type_index` key (so a
+    /// `mod.Box(T)` path can be checked in its *target* module).
+    fn is_generic_enum_key(&self, key: &str) -> bool {
+        self.table.type_index.get(key).is_some_and(|&i| {
             !self.table.types[i].type_params.is_empty()
                 && matches!(self.table.types[i].kind, TypeKindG::Enum { .. })
         })
@@ -1034,8 +1039,10 @@ impl<'a> TypeChecker<'a> {
                 let aty: Vec<Ty> = args.iter().map(|a| self.lower_type(ty_params, *a)).collect();
                 // `Ctor(args)` is a generic *enum* instance if `Ctor` names a
                 // generic enum; otherwise a generic struct (the comptime-fn form).
+                // A generic enum's ctor is canonicalized so two modules' `Box(T)`
+                // monomorphize to distinct `Jestyr_Box__m<…>__<args>` symbols.
                 if self.is_generic_enum(&ctor.name) {
-                    Ty::GenEnum { ctor: ctor.name.clone(), args: aty }
+                    Ty::GenEnum { ctor: self.canon_type_cur(&ctor.name), args: aty }
                 } else {
                     Ty::GenStruct { ctor: ctor.name.clone(), args: aty }
                 }
@@ -1061,8 +1068,14 @@ impl<'a> TypeChecker<'a> {
                     }
                 } else {
                     let aty: Vec<Ty> = args.iter().map(|a| self.lower_type(ty_params, *a)).collect();
-                    if self.is_generic_enum(&name.name) {
-                        Ty::GenEnum { ctor: name.name.clone(), args: aty }
+                    // Resolve the generic enum in the *target* module so `mod.Box(T)`
+                    // picks that module's (possibly colliding) template.
+                    let key = match target {
+                        Some(t) => self.canon_type_in(t, &name.name),
+                        None => self.canon_type_cur(&name.name),
+                    };
+                    if self.is_generic_enum_key(&key) {
+                        Ty::GenEnum { ctor: key, args: aty }
                     } else {
                         Ty::GenStruct { ctor: name.name.clone(), args: aty }
                     }
