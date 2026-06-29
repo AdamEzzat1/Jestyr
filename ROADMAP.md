@@ -97,7 +97,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | K | Module system v2 | ~93% | MED | M | ✓ | ✓✓ (build/incremental) |
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
-| N | Concurrency polish | ~50% | MED | M | ✓ | — |
+| N | Concurrency polish | ~60% | MED | M | ✓ | — |
 | O | Tooling (fmt / test / doc / LSP) | test-runner ✅, attest ✅, attest --diff ✅; LSP/fmt deferred | LOW | M | ✓✓ | ✓ |
 | P | Self-hosting | plumbing ✅; port open | — | XL | ✓✓ | ✓✓ (the gate) |
 
@@ -251,11 +251,33 @@ layer."** Mostly a new pass + cgen tweaks → reasonably isolated.
 from runtime asserts into **static proof obligations** discharged by an SMT backend.
 **Motley:** verifying the compiler's own passes. Long-horizon; do after F/G.
 
-### N. Concurrency polish — ~50% (MED conflict; files: cgen, escape)
-**Done:** `concurrent { spawn … }` → pthreads, scoped join. **Left:** `spawn` of
-closures; task **results** + `await` (keyword reserved); sync types (`Mutex`/`Atomic`/
-channels); escape-checked join-safety; the `par` loop (design + MOTLEY note: must be
-*deterministic*). 
+### N. Concurrency polish — ~60% (MED conflict; files: cgen, escape)
+**Done:** `concurrent { spawn … }` → pthreads, scoped join; atomics (`__atomic_*`);
+the proven deterministic parallel reduction (`core.par_binned_sum`). **Left:** move-only
+channels; task **results** + `await` (keyword reserved); the `par … reduce(r)` loop
+surface + non-deterministic-reduction rejection (the headline checked guarantee); `spawn`
+of closures; dynamic-N spawn.
+
+**Mutex — ✅ DONE (increment 1, the Ada-style protected object).** `std/sync.jtr`'s
+`Mutex(T)` bundles the guarded value, its lock, and the operations as one unit: the only
+way to reach the value is `mutex_with`/`mutex_get`, each bracketing the access between lock
+acquire/release — so you *cannot forget to lock*, mutual exclusion is structural. The lock
+is a **test-and-set spinlock over one atomic `int64`** (one new intrinsic, `atomic_xchg` →
+`__atomic_exchange_n`), so the whole primitive is library Jestyr over the existing atomics —
+no OS mutex, no special type, portable. Shared by-value across a `concurrent { spawn … }`
+nursery (the pointers alias deliberately; the lock serializes), and freed once after the
+scope joins.
+- New `atomic_xchg` cgen intrinsic + `atomic_intrinsic_ret` (atomics now type as `i64`, so
+  the spinlock's `atomic_xchg(lock,1) != 0` test needs no cast); `examples/std/sync.jtr`
+  (the protected object) + `examples/std/mutex.jtr` (8 threads → exactly 8). No new syntax;
+  `module.rs`/`main.rs` untouched.
+- Rigor: cgen unit (xchg → `__atomic_exchange_n`) + toolchain-free wiring (`mutex_example_
+  compiles_clean`) + a pure-Rust **mutual-exclusion property** (`tas_lock_serializes_
+  increments`: a model of the emitted TAS lock + guarded counter ends at exactly `n*k` for
+  *any* interleaving) teeth-verified by `unlocked_increments_lose_updates` + a
+  `fuzz_concurrency_pipeline` bolero target + a `--features c-oracle` 8-thread run
+  (`mutex_demo`, repeated 8×, pinned to `8`). `cargo test` stays toolchain-free. Teeth:
+  breaking `lock_acquire` drops the live demo to a non-deterministic <N (verified, reverted).
 
 ### O. Tooling — in progress (LOW conflict; files: new binaries/subcommands)
 **Design §15: one `jestyr` binary.** Each tool is a largely new file/subcommand →

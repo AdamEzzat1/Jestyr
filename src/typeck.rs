@@ -1891,6 +1891,11 @@ impl<'a> TypeChecker<'a> {
                         // File-I/O intrinsics, same deal: `read_file -> String`,
                         // `write_file`/`file_exists -> bool`.
                         t
+                    } else if let Some(t) = atomic_intrinsic_ret(&name) {
+                        // Atomics yield `i64` (a seq-cst op on an `int64` cell), so a
+                        // `let`/comparison like `atomic_xchg(lock,1) != 0` in the
+                        // spinlock types without an explicit annotation or cast.
+                        t
                     } else {
                         // Not local, not a variant/intrinsic: if some *other*
                         // module defines it, this is the v1 namespace leak that is
@@ -3078,6 +3083,18 @@ fn io_intrinsic_ret(name: &str) -> Option<Ty> {
         "write_file" | "file_exists" | "remove_file" => Ty::Prim("bool"),
         "arg_count" => Ty::Prim("i32"),
         "arg" => Ty::Prim("str"),
+        _ => return None,
+    })
+}
+
+/// The return type of an atomic intrinsic (a seq-cst op on an `int64` cell): all
+/// yield `i64` — the prior/loaded value (`atomic_load`/`add`/`sub`/`xchg`).
+/// `atomic_store` is statement-position only, so it needs no type. Registering
+/// these lets the spinlock's `atomic_xchg(lock,1) != 0` test (and any `let`-bound
+/// atomic result) type without an explicit annotation or `as` cast.
+fn atomic_intrinsic_ret(name: &str) -> Option<Ty> {
+    Some(match name {
+        "atomic_load" | "atomic_add" | "atomic_sub" | "atomic_xchg" => Ty::Prim("i64"),
         _ => return None,
     })
 }

@@ -4053,6 +4053,17 @@ impl<'a> Cgen<'a> {
                     let v = args.get(1).map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".to_string());
                     return format!("__atomic_fetch_sub((int64_t*)({p}), (int64_t)({v}), __ATOMIC_SEQ_CST)");
                 }
+                // Atomic exchange (test-and-set primitive): store `v` and return the
+                // PREVIOUS value as one indivisible step. This is the single extra atom
+                // a spinlock needs — `lock_acquire` spins on `atomic_xchg(lock, 1)`
+                // until it observes the previous value `0` (the lock was free, and is
+                // now ours). The Mutex protected object (`std/sync.jtr`) is built
+                // entirely on this plus `atomic_store` for release.
+                "atomic_xchg" => {
+                    let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "NULL".to_string());
+                    let v = args.get(1).map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".to_string());
+                    return format!("__atomic_exchange_n((int64_t*)({p}), (int64_t)({v}), __ATOMIC_SEQ_CST)");
+                }
                 // Region allocation: `region_alloc(r, T, value)` — bump-allocate
                 // into region `r`'s arena and return a zero-cost `&[r]T` (plain ptr).
                 "region_alloc" => {
@@ -8203,6 +8214,18 @@ mod tests {
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("__atomic_fetch_add((int64_t*)(j_p), (int64_t)(1), __ATOMIC_SEQ_CST)"), "{c}");
         assert!(c.contains("__atomic_load_n((int64_t*)(j_p), __ATOMIC_SEQ_CST)"), "{c}");
+    }
+
+    #[test]
+    fn atomic_xchg_lowers_to_exchange_builtin() {
+        // Test-and-set: `atomic_xchg(lock, 1)` stores 1 and returns the prior value
+        // as one indivisible op — the single atom a spinlock (`std/sync.jtr`) needs.
+        let (c, d) = gen("fn tas(p: *mut i64) -> i64 { return atomic_xchg(p, 1) }");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(
+            c.contains("__atomic_exchange_n((int64_t*)(j_p), (int64_t)(1), __ATOMIC_SEQ_CST)"),
+            "atomic_xchg must lower to __atomic_exchange_n: {c}"
+        );
     }
 
     #[test]

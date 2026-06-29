@@ -1,0 +1,39 @@
+// examples/std/mutex.jtr — mutual exclusion via the Mutex protected object
+// (concurrency, workstream N).
+//
+// Eight OS threads each increment ONE shared counter through `sync.mutex_with`.
+// An unsynchronized `c = c + 1` from many threads loses updates (read-modify-write
+// races), so the total would be < 8. Because every increment runs under the
+// Mutex's lock — and `mutex_with` is the *only* way to touch the value — no update
+// is lost: the final count is EXACTLY 8, deterministically.
+//
+//   jestyrc run examples/std/mutex.jtr   →   8
+//
+// The result is schedule-independent (the lock serializes the increments), so it
+// is pinned in the cross-OS determinism canary just like the parallel reduction.
+import "sync"
+
+// A protected operation: bump the guarded counter by one. `mutex_with` only ever
+// runs this while the lock is held, so the read-modify-write is atomic w.r.t. the
+// other tasks.
+fn incr(c: *mut i64) { unsafe { c.* = c.* + 1 } }
+
+// One task: increment the shared counter once, under the lock.
+fn bump(read m: sync.Mutex(i64)) { sync.mutex_with(i64, m, &incr) }
+
+fn main() -> i32 {
+    var m = sync.mutex_make(i64, 0)
+    concurrent {
+        spawn bump(m)
+        spawn bump(m)
+        spawn bump(m)
+        spawn bump(m)
+        spawn bump(m)
+        spawn bump(m)
+        spawn bump(m)
+        spawn bump(m)
+    }
+    print_int(sync.mutex_get(i64, m) as i32)   // 8 — no lost updates
+    sync.mutex_free(i64, m)
+    return 0
+}

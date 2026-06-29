@@ -1,0 +1,84 @@
+// std/sync.jtr — concurrency synchronization primitives (workstream N).
+//
+// `Mutex(T)` is an Ada-style PROTECTED OBJECT: the guarded value, its lock, and
+// the operations that touch the value are one unit. The only way to reach the
+// value is through `mutex_with`/`mutex_get`, each of which brackets the access
+// between a lock acquire and release — so a caller *cannot forget to lock*. Mutual
+// exclusion is structural, not a convention you have to remember.
+//
+// The lock is a test-and-set SPINLOCK over a single atomic `int64` cell (the
+// `atomic_xchg` intrinsic): the whole primitive is library code over the existing
+// atomics — no OS mutex, no special type, fully portable. Combined with the
+// structured `concurrent { … }` scope (which joins every task before the value is
+// freed), a Mutex can't be used after free either.
+//
+//   N threads each incrementing the guarded counter through `mutex_with` see no
+//   lost updates: the final value is *exactly* N (see examples/std/mutex.jtr).
+
+// Acquire `lock`: atomically swap in 1 and read the previous value. If it was 0
+// the lock was free and is now ours; otherwise another task holds it, so spin
+// until a release stores 0 back. Test-and-set is the minimal mutual-exclusion
+// atom — one indivisible read-modify-write.
+pub fn lock_acquire(lock: *mut i64) {
+    var held: i64 = atomic_xchg(lock, 1)
+    for held != 0 {
+        held = atomic_xchg(lock, 1)
+    }
+}
+
+// Release `lock`: a single seq-cst store of 0. The release publishes every write
+// made while the lock was held to whichever task acquires it next.
+pub fn lock_release(lock: *mut i64) {
+    atomic_store(lock, 0)
+}
+
+// The protected object. The guarded value lives on the heap (`data`) paired with
+// its lock word (`lock`); every task that holds a copy of the Mutex shares those
+// same two cells. The pointers alias deliberately — that *is* the shared state —
+// and all access to it is serialized by the lock.
+pub fn Mutex(comptime T: type) -> type {
+    return struct {
+        data: *mut T,
+        lock: *mut i64,
+    }
+}
+
+// Read a cell behind a raw pointer (the one unsafe step, localized here so the
+// public operations stay safe). Always called while the lock is held.
+fn load_cell(comptime T: type, p: *mut T) -> T { unsafe { return (p + 0).* } }
+
+// Create a Mutex guarding `init`: allocate the value cell and the lock cell
+// (initialized unlocked, i.e. 0).
+pub fn mutex_make(comptime T: type, init: T) -> Mutex(T) {
+    var d: *mut T = alloc(T, 1)
+    unsafe { d.* = init }
+    var l: *mut i64 = alloc(i64, 1)
+    atomic_store(l, 0)
+    return Mutex(T){ data: d, lock: l }
+}
+
+// The protected procedure: run `op` with EXCLUSIVE access to the guarded value.
+// Acquire the lock, hand `op` a `*mut T` to the value, release. `op` is the only
+// code that sees the value, and it always runs under the lock — there is no path
+// that mutates the value without holding it.
+pub fn mutex_with(comptime T: type, read m: Mutex(T), op: fn(*mut T)) {
+    lock_acquire(m.lock)
+    op(m.data)
+    lock_release(m.lock)
+}
+
+// The protected function: a locked snapshot of the guarded value (read under the
+// lock, return a copy).
+pub fn mutex_get(comptime T: type, read m: Mutex(T)) -> T {
+    lock_acquire(m.lock)
+    let v: T = load_cell(T, m.data)
+    lock_release(m.lock)
+    return v
+}
+
+// Release the Mutex's heap cells. Call once, after every task sharing it has
+// joined — the `concurrent { … }` scope guarantees that at its closing brace.
+pub fn mutex_free(comptime T: type, read m: Mutex(T)) {
+    free_ptr(m.data)
+    free_ptr(m.lock)
+}

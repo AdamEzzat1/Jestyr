@@ -1960,6 +1960,161 @@ mod modules_props {
     }
 }
 
+/// Concurrency sync primitives (workstream N, increment 1): the Mutex protected
+/// object. Two layers here — a toolchain-free wiring check that the shipped demo
+/// lowers cleanly through the *real* module pipeline, and a pure-Rust model of the
+/// test-and-set spinlock proving mutual exclusion holds under **any** interleaving
+/// (the on-thesis property: the result is schedule-independent). The actual
+/// thread-run proof lives in `c_oracle::mutex_demo` (gated behind `c-oracle`).
+mod sync_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Load → typeck → escape → lower a real example file through the module
+    /// loader, returning every diagnostic message (mirrors `module::pipeline_is_clean`
+    /// without touching that file).
+    fn example_diags(rel: &str) -> Vec<String> {
+        let prog = crate::module::load(rel);
+        let mut diags: Vec<String> = prog.diags.iter().map(|d| d.message.clone()).collect();
+        let (info, td) = typeck::check_program(&prog.ast, &prog.modules);
+        diags.extend(td.iter().map(|d| d.message.clone()));
+        diags.extend(escape::check(&prog.ast, &info).iter().map(|d| d.message.clone()));
+        let (_c, cd) = cgen::emit(&prog.ast, &info);
+        diags.extend(cd.iter().map(|d| d.message.clone()));
+        diags
+    }
+
+    /// **Wiring (toolchain-free).** The shipped Mutex demo — which `import`s
+    /// `sync.jtr`, builds a `Mutex(i64)` protected object, and shares it across a
+    /// `concurrent { spawn … }` nursery — lowers with zero diagnostics. This proves
+    /// a `read Mutex(T)` spawn argument is *accepted* by the escape checker (the
+    /// protected object is the sanctioned sharing path), while the existing
+    /// `mut`-slice spawn rule stays in force (see `escape` tests).
+    #[test]
+    fn mutex_example_compiles_clean() {
+        let diags = example_diags("examples/std/mutex.jtr");
+        assert!(diags.is_empty(), "examples/std/mutex.jtr: {diags:?}");
+    }
+
+    /// A model of the emitted test-and-set spinlock + guarded counter. `n` threads
+    /// each perform `k` increments; each increment is the four-step critical region
+    /// the lowering produces — acquire (TAS the lock word), read the counter, add
+    /// one, write it back — then release. A generated `schedule` drives an arbitrary
+    /// interleaving of *ready* steps; spinning threads make no progress until the
+    /// holder releases. After replaying the schedule we deterministically drain to
+    /// completion. The invariant: the final counter is **exactly `n*k`**, for every
+    /// interleaving — no lost updates, the mutual-exclusion guarantee.
+    fn run_locked_model(n: usize, k: usize, schedule: &[usize], lock_enabled: bool) -> i64 {
+        // Per-thread critical-section progress: 0 = need lock, 1 = loaded, 2 = added,
+        // 3 = holding, ready to store+release. `reg` is the thread's private copy.
+        let mut phase = vec![0u8; n];
+        let mut reg = vec![0i64; n];
+        let mut iters = vec![k; n];
+        let mut lock: i64 = 0; // 0 = free, 1 = held
+        let mut counter: i64 = 0;
+
+        // Step thread `t` if it can make progress; return true if it did.
+        let step = |t: usize,
+                    phase: &mut [u8],
+                    reg: &mut [i64],
+                    iters: &mut [usize],
+                    lock: &mut i64,
+                    counter: &mut i64|
+         -> bool {
+            if iters[t] == 0 {
+                return false;
+            }
+            match phase[t] {
+                0 => {
+                    // Test-and-set acquire. With the lock disabled (teeth), always
+                    // "acquire" so critical sections can interleave and race.
+                    if lock_enabled {
+                        if *lock != 0 {
+                            return false; // spinning — no progress
+                        }
+                        *lock = 1;
+                    }
+                    reg[t] = *counter; // read under the lock
+                    phase[t] = 1;
+                    true
+                }
+                1 => {
+                    reg[t] += 1; // compute
+                    phase[t] = 2;
+                    true
+                }
+                2 => {
+                    *counter = reg[t]; // write back
+                    phase[t] = 3;
+                    true
+                }
+                _ => {
+                    if lock_enabled {
+                        *lock = 0; // release
+                    }
+                    phase[t] = 0;
+                    iters[t] -= 1;
+                    true
+                }
+            }
+        };
+
+        for &raw in schedule {
+            let t = raw % n;
+            let _ = step(t, &mut phase, &mut reg, &mut iters, &mut lock, &mut counter);
+        }
+        // Drain any unfinished work to completion (the schedule may be short).
+        let mut guard = 0;
+        loop {
+            let mut progressed = false;
+            for t in 0..n {
+                if step(t, &mut phase, &mut reg, &mut iters, &mut lock, &mut counter) {
+                    progressed = true;
+                }
+            }
+            if iters.iter().all(|&i| i == 0) {
+                break;
+            }
+            guard += 1;
+            assert!(guard < 1_000_000, "model failed to converge");
+            let _ = progressed;
+        }
+        counter
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+        /// **Mutual exclusion is schedule-independent.** For any thread count,
+        /// per-thread increment count, and interleaving, the lock serializes the
+        /// read-modify-writes so the guarded counter ends at exactly `n*k`.
+        #[test]
+        fn tas_lock_serializes_increments(
+            n in 2usize..6,
+            k in 1usize..16,
+            schedule in proptest::collection::vec(0usize..6, 0..400),
+        ) {
+            let got = run_locked_model(n, k, &schedule, true);
+            prop_assert_eq!(got, (n * k) as i64, "lock must lose no updates");
+        }
+    }
+
+    /// **Teeth.** Disable the lock and there exists an interleaving that loses
+    /// updates — proving the property above is enforced by the lock, not by the
+    /// model's structure. The adversarial schedule reads every thread, then adds,
+    /// then writes: all writes clobber to 1 though two increments were intended.
+    #[test]
+    fn unlocked_increments_lose_updates() {
+        // 2 threads, 1 increment each: load both (reg=0,0), add both (1,1), store
+        // both (counter=1) — one update lost. With the lock the result would be 2.
+        let schedule = [0usize, 1, 0, 1, 0, 1];
+        let got = run_locked_model(2, 1, &schedule, false);
+        assert!(got < 2, "without the lock an interleaving must lose an update, got {got}");
+        // Sanity: the *same* schedule under the lock is exact.
+        assert_eq!(run_locked_model(2, 1, &schedule, true), 2);
+    }
+}
+
 mod fuzz {
     use super::*;
 
@@ -2084,6 +2239,26 @@ mod fuzz {
             let prog = format!(
                 "fn xBox(comptime T: type) -> type {{ return struct {{ op: fn({s}) -> T }} }} \
                  fn xuse(n: i32) -> i32 {{ let b = xBox(i32){{ op: |x| x }} return b.op({s}) }}"
+            );
+            run_pipeline(&prog);
+            assert_eq!(compile(&prog), compile(&prog));
+        });
+    }
+
+    /// Coverage-guided fuzzing of the **concurrency** lowering: the fuzzer's bytes
+    /// land in a spawn-target's body and a `concurrent { spawn … }` argument slot,
+    /// alongside the atomics + `atomic_xchg` (the spinlock atom) the Mutex is built
+    /// on. The `concurrent`/`spawn` desugaring, the spawn-site arg-struct emission,
+    /// and the escape data-race check must stay total *and* deterministic — and the
+    /// escape checker must never silently accept a `mut`-slice spawn — on whatever
+    /// soup lands inside.
+    #[test]
+    fn fuzz_concurrency_pipeline() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let prog = format!(
+                "fn wk(p: *mut i64) {{ atomic_xchg(p, 1) {s} }} \
+                 fn main() -> i32 {{ var c: *mut i64 = alloc(i64, 1) atomic_store(c, 0) \
+                     concurrent {{ spawn wk(c) spawn wk({s}) }} free_ptr(c) return 0 }}"
             );
             run_pipeline(&prog);
             assert_eq!(compile(&prog), compile(&prog));
@@ -4582,6 +4757,17 @@ mod c_oracle {
     #[test]
     fn par_reduce_demo() {
         assert_eq!(toks("examples/std/par_reduce.jtr"), ["1", "1", "1"]);
+    }
+    #[test]
+    fn mutex_demo() {
+        // Mutual exclusion on real OS threads: eight tasks each increment one
+        // counter through the Mutex protected object. The lock serializes the
+        // read-modify-writes, so no update is lost — the total is EXACTLY 8,
+        // deterministically (schedule-independent). Run it repeatedly to shake out
+        // any race: the answer must be 8 every time.
+        for _ in 0..8 {
+            assert_eq!(toks("examples/std/mutex.jtr"), ["8"], "mutex lost an update");
+        }
     }
     #[test]
     fn files_demo() {
