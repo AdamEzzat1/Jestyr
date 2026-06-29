@@ -82,3 +82,90 @@ pub fn mutex_free(comptime T: type, read m: Mutex(T)) {
     free_ptr(m.data)
     free_ptr(m.lock)
 }
+
+// ── Channels: move-only message passing (share by communicating) ──────────────
+//
+// `Channel(T)` is a bounded ring buffer guarded by the same spinlock. The headline
+// is its `send`: it takes the value by `take`, so OWNERSHIP MOVES INTO the channel
+// and no alias survives in the sender. Race-freedom then falls out of the existing
+// escape analysis with no `Send`/`Sync` marker traits and no runtime detector — the
+// give-away rule already forbids handing a *borrow* to a `take` parameter, so you
+// can only send something you own, and once sent it is the receiver's. This is the
+// Erlang/Pony share-nothing model expressed through Jestyr's second-class refs (a
+// uniquely-owned `take` value ≈ Pony `iso`); combined with `concurrent { … }`, a
+// message can't be touched by its sender after it leaves.
+//
+// The control word packs the four shared counters into one `[4]i64` cell so a
+// channel handle is two heap allocations (buffer + control), copied by value into
+// each task — every copy shares the same buffer, indices, and lock.
+
+pub fn Channel(comptime T: type) -> type {
+    return struct {
+        buf:  *mut T,    // `cap` slots, used as a ring
+        ctrl: *mut i64,  // [0]=head  [1]=tail  [2]=count  [3]=lock
+        cap:  i64,
+    }
+}
+
+// Make a channel that can buffer `cap` in-flight values (cap ≥ 1).
+pub fn channel_make(comptime T: type, cap: i64) -> Channel(T) {
+    var b: *mut T = alloc(T, cap as usize)
+    var c: *mut i64 = alloc(i64, 4)
+    atomic_store(c + 0, 0)   // head  — next recv slot
+    atomic_store(c + 1, 0)   // tail  — next send slot
+    atomic_store(c + 2, 0)   // count — buffered items
+    atomic_store(c + 3, 0)   // lock  — unlocked
+    return Channel(T){ buf: b, ctrl: c, cap: cap }
+}
+
+// Send `v` by move. Blocks (spins) until the buffer has room, then writes the
+// value under the lock and advances the tail. After this call the sender no longer
+// owns `v` — using it would be a use-after-move; passing a *borrow* here is a
+// compile error (the give-away rule). Bounded capacity gives natural backpressure.
+pub fn channel_send(comptime T: type, read ch: Channel(T), take v: T) {
+    var sent: bool = false
+    for !sent {
+        lock_acquire(ch.ctrl + 3)
+        let count: i64 = atomic_load(ch.ctrl + 2)
+        if count < ch.cap {
+            let tail: i64 = atomic_load(ch.ctrl + 1)
+            unsafe { (ch.buf + (tail as usize)).* = v }   // ownership moves into the buffer
+            atomic_store(ch.ctrl + 1, (tail + 1) % ch.cap)
+            atomic_store(ch.ctrl + 2, count + 1)
+            sent = true
+        }
+        lock_release(ch.ctrl + 3)
+    }
+}
+
+// Receive the next value by move. Blocks (spins) until an item is available, then
+// reads it out *under the lock* (so no concurrent sender can overwrite the slot
+// mid-read) and advances the head. Ownership transfers to the caller.
+pub fn channel_recv(comptime T: type, read ch: Channel(T)) -> T {
+    for {
+        lock_acquire(ch.ctrl + 3)
+        let count: i64 = atomic_load(ch.ctrl + 2)
+        if count > 0 {
+            let head: i64 = atomic_load(ch.ctrl + 0)
+            let v: T = load_cell(T, ch.buf + (head as usize))
+            atomic_store(ch.ctrl + 0, (head + 1) % ch.cap)
+            atomic_store(ch.ctrl + 2, count - 1)
+            lock_release(ch.ctrl + 3)
+            return v
+        }
+        lock_release(ch.ctrl + 3)
+    }
+}
+
+// Number of buffered (not-yet-received) items — a snapshot, for draining loops.
+pub fn channel_len(comptime T: type, read ch: Channel(T)) -> i64 {
+    return atomic_load(ch.ctrl + 2)
+}
+
+// Release the channel's heap cells. Call once, after every task sharing it has
+// joined and the buffer has been drained (any values still buffered are leaked —
+// the channel does not drop them in the bootstrap).
+pub fn channel_free(comptime T: type, read ch: Channel(T)) {
+    free_ptr(ch.buf)
+    free_ptr(ch.ctrl)
+}

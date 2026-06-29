@@ -664,6 +664,15 @@ impl<'a> Checker<'a> {
 
         let name = match &self.ast.expr_at(callee).kind {
             ExprKind::Name(n) => n.name.clone(),
+            // A module-qualified call (`mod.f(…)`) has a `Field` callee; typeck
+            // recorded its resolved (canonical) target in `qualified`, keyed the same
+            // as `table.fns`. Without this arm a `take` parameter reached through a
+            // qualified call — e.g. the move-only `sync.channel_send(T, ch, take v)` —
+            // would silently skip the give-away check, letting a *borrow* be sent.
+            ExprKind::Field { .. } => match self.info.qualified.get(&call_id) {
+                Some(q) => q.clone(),
+                None => return,
+            },
             _ => return,
         };
         let Some(sig) = self.info.table.fns.get(&name) else { return };

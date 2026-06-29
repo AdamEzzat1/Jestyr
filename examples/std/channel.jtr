@@ -1,0 +1,80 @@
+// examples/std/channel.jtr — move-only channels: share by communicating
+// (concurrency, workstream N).
+//
+// A `Channel(T)` moves values between threads: `channel_send` takes its argument by
+// `take`, so ownership transfers INTO the channel and no alias survives in the
+// sender. You can only send something you own (sending a borrow is a compile error,
+// the give-away rule), so message passing is race-free by the *existing* escape
+// analysis — no `Send`/`Sync`, no runtime detector.
+//
+//   jestyrc run examples/std/channel.jtr   →   264, 36
+//
+// Part 1 proves multi-producer move-passing; part 2 proves a bounded channel's
+// backpressure with a producer and consumer running *concurrently*. Both totals are
+// order-independent sums, so the results are deterministic.
+import "sync"
+
+// --- Part 1: four producers fill a channel, the main thread drains it. ---
+
+// One producer: send four consecutive values starting at `base` (by move).
+fn producer(read ch: sync.Channel(i64), base: i64) {
+    sync.channel_send(i64, ch, base + 0)
+    sync.channel_send(i64, ch, base + 1)
+    sync.channel_send(i64, ch, base + 2)
+    sync.channel_send(i64, ch, base + 3)
+}
+
+// --- Part 2: a bounded (cap 2) channel with a concurrent producer + consumer. ---
+
+// Producer: send 1..=8 into the channel. With cap 2 it blocks when full, so this
+// only makes progress as the consumer drains — exercising backpressure.
+fn stream(read ch: sync.Channel(i64)) {
+    var i: i64 = 1
+    for i <= 8 {
+        sync.channel_send(i64, ch, i)
+        i = i + 1
+    }
+}
+
+// Consumer: receive `n` values and accumulate their sum into a shared atomic cell.
+fn drain(read ch: sync.Channel(i64), sink: *mut i64, n: i64) {
+    var i: i64 = 0
+    for i < n {
+        atomic_add(sink, sync.channel_recv(i64, ch))
+        i = i + 1
+    }
+}
+
+fn main() -> i32 {
+    // Part 1: capacity 16 holds every value, so producers never block; after the
+    // nursery joins, all 16 are buffered and the main thread sums them.
+    var ch = sync.channel_make(i64, 16)
+    concurrent {
+        spawn producer(ch, 0)
+        spawn producer(ch, 10)
+        spawn producer(ch, 20)
+        spawn producer(ch, 30)
+    }
+    var total: i64 = 0
+    var i: i64 = 0
+    for i < 16 {
+        total = total + sync.channel_recv(i64, ch)
+        i = i + 1
+    }
+    print_int(total as i32)          // 264 = (0+1+2+3)+(10..13)+(20..23)+(30..33)
+    sync.channel_free(i64, ch)
+
+    // Part 2: capacity 2 forces backpressure between a producer and a consumer that
+    // run at the same time. The consumer sums 1..=8 into `acc`.
+    var bc = sync.channel_make(i64, 2)
+    var acc: *mut i64 = alloc(i64, 1)
+    atomic_store(acc, 0)
+    concurrent {
+        spawn stream(bc)
+        spawn drain(bc, acc, 8)
+    }
+    print_int(atomic_load(acc) as i32)   // 36 = 1+2+…+8
+    free_ptr(acc)
+    sync.channel_free(i64, bc)
+    return 0
+}

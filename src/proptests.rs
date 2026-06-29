@@ -2113,6 +2113,143 @@ mod sync_props {
         // Sanity: the *same* schedule under the lock is exact.
         assert_eq!(run_locked_model(2, 1, &schedule, true), 2);
     }
+
+    // ── Channels (increment 2) ────────────────────────────────────────────────
+
+    /// **Wiring (toolchain-free).** The shipped channel demo — which builds a
+    /// `Channel(i64)`, fills it from a `concurrent { spawn … }` nursery (move-only
+    /// `channel_send`), and drains it — lowers with zero diagnostics through the real
+    /// module pipeline.
+    #[test]
+    fn channel_example_compiles_clean() {
+        let diags = example_diags("examples/std/channel.jtr");
+        assert!(diags.is_empty(), "examples/std/channel.jtr: {diags:?}");
+    }
+
+    /// Write `files` to a fresh temp dir, run load → typeck → escape → lower, and
+    /// return every diagnostic message. Used to drive a *qualified* call across a
+    /// real module boundary (single-source `compile` can't model `mod.f(…)`).
+    fn multi_diags(files: &[(&str, &str)]) -> Vec<String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CASE: AtomicU64 = AtomicU64::new(0);
+        let id = CASE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("jestyr_syncprop_{id:016x}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, src) in files {
+            std::fs::write(dir.join(name), src).unwrap();
+        }
+        let prog = crate::module::load(dir.join("main.jtr").to_str().unwrap());
+        let mut diags: Vec<String> = prog.diags.iter().map(|d| d.message.clone()).collect();
+        let (info, td) = typeck::check_program(&prog.ast, &prog.modules);
+        diags.extend(td.iter().map(|d| d.message.clone()));
+        diags.extend(escape::check(&prog.ast, &info).iter().map(|d| d.message.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
+        diags
+    }
+
+    /// **Move-on-send soundness (the channel safety guarantee).** Sending a value
+    /// through a move-only `take` parameter reached by a *qualified, generic* call
+    /// (`q.sink(T, take v)`) must reject a **borrow** — you can only send something
+    /// you own. This pins the give-away route's qualified-call arm; without it a
+    /// borrow could be handed across a channel send and aliased after the move.
+    #[test]
+    fn qualified_take_of_borrow_is_rejected() {
+        // `lib.sink` takes its value by `take` (the channel-send shape). `relay`
+        // only *borrows* `b`, so handing it to `sink` is a give-away error.
+        let lib = "pub fn sink(comptime T: type, take v: T) {}";
+        let main = "import \"lib\"\n\
+                    struct Box { p: *mut i64 }\n\
+                    fn relay(read b: Box) { lib.sink(Box, b) }\n\
+                    fn main() -> i32 { return 0 }";
+        let diags = multi_diags(&[("lib.jtr", lib), ("main.jtr", main)]);
+        assert!(
+            diags.iter().any(|d| d.contains("give") || d.contains("borrow") || d.contains("own")),
+            "sending a borrow through a qualified `take` must be rejected, got: {diags:?}"
+        );
+    }
+
+    /// **Teeth for the rejection.** The *same* call with an **owned** value compiles
+    /// clean — the check rejects only borrows, never legitimate moves.
+    #[test]
+    fn qualified_take_of_owned_is_accepted() {
+        let lib = "pub fn sink(comptime T: type, take v: T) {}";
+        let main = "import \"lib\"\n\
+                    struct Box { p: *mut i64 }\n\
+                    fn give() { var b: Box = Box{ p: null } lib.sink(Box, b) }\n\
+                    fn main() -> i32 { return 0 }";
+        let diags = multi_diags(&[("lib.jtr", lib), ("main.jtr", main)]);
+        assert!(diags.is_empty(), "moving an owned value must be fine, got: {diags:?}");
+    }
+
+    /// A model of the channel's ring buffer + the send/recv index math. `n` producers
+    /// each enqueue a block of distinct values; an interleaved consumer dequeues. The
+    /// invariant: **every value sent is received exactly once, in FIFO order per
+    /// producer block** — the buffer never drops, duplicates, or corrupts an item,
+    /// for any capacity and any interleaving. (The cross-thread *result* sum is also
+    /// order-independent, mirroring the live demo.)
+    fn ring_roundtrip(cap: usize, blocks: &[Vec<i64>], sched: &[bool]) -> Vec<i64> {
+        let mut buf = vec![0i64; cap.max(1)];
+        let (mut head, mut tail, mut count) = (0usize, 0usize, 0usize);
+        // Flatten producers into a single FIFO of pending sends (the demo's producers
+        // are independent; per-producer order is preserved by sending in block order).
+        let mut pending: Vec<i64> = blocks.iter().flatten().copied().collect();
+        let mut pi = 0usize;
+        let mut out = Vec::new();
+        // `sched` chooses send (true) vs recv (false) at each step; blocked ops are
+        // skipped. Drain to completion afterwards.
+        let mut send = |buf: &mut [i64], head: &mut usize, tail: &mut usize, count: &mut usize, pi: &mut usize| {
+            if *pi < pending.len() && *count < buf.len() {
+                buf[*tail] = pending[*pi];
+                *tail = (*tail + 1) % buf.len();
+                *count += 1;
+                *pi += 1;
+            }
+        };
+        let mut recv = |buf: &mut [i64], head: &mut usize, _tail: &mut usize, count: &mut usize, out: &mut Vec<i64>| {
+            if *count > 0 {
+                out.push(buf[*head]);
+                *head = (*head + 1) % buf.len();
+                *count -= 1;
+            }
+        };
+        for &is_send in sched {
+            if is_send {
+                send(&mut buf, &mut head, &mut tail, &mut count, &mut pi);
+            } else {
+                recv(&mut buf, &mut head, &mut tail, &mut count, &mut out);
+            }
+        }
+        while pi < pending.len() {
+            send(&mut buf, &mut head, &mut tail, &mut count, &mut pi);
+            recv(&mut buf, &mut head, &mut tail, &mut count, &mut out);
+        }
+        while count > 0 {
+            recv(&mut buf, &mut head, &mut tail, &mut count, &mut out);
+        }
+        out
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+        /// The ring buffer transfers every value exactly once (multiset-preserving),
+        /// for any capacity and any send/recv interleaving.
+        #[test]
+        fn channel_ring_preserves_every_value(
+            cap in 1usize..8,
+            blocks in proptest::collection::vec(
+                proptest::collection::vec(0i64..1000, 0..6), 1..5),
+            sched in proptest::collection::vec(any::<bool>(), 0..200),
+        ) {
+            let out = ring_roundtrip(cap, &blocks, &sched);
+            let mut sent: Vec<i64> = blocks.iter().flatten().copied().collect();
+            let mut got = out.clone();
+            sent.sort_unstable();
+            got.sort_unstable();
+            prop_assert_eq!(sent, got, "every sent value received exactly once");
+        }
+    }
 }
 
 mod fuzz {
@@ -4767,6 +4904,16 @@ mod c_oracle {
         // any race: the answer must be 8 every time.
         for _ in 0..8 {
             assert_eq!(toks("examples/std/mutex.jtr"), ["8"], "mutex lost an update");
+        }
+    }
+    #[test]
+    fn channel_demo() {
+        // Move-only channels on real OS threads. Part 1: four producers send 16
+        // values, the main thread drains them → 264. Part 2: a cap-2 channel with a
+        // concurrent producer + consumer (real backpressure) sums 1..=8 → 36. Both
+        // are order-independent sums, so deterministic; repeated to shake out races.
+        for _ in 0..8 {
+            assert_eq!(toks("examples/std/channel.jtr"), ["264", "36"], "channel transfer wrong");
         }
     }
     #[test]

@@ -97,7 +97,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | K | Module system v2 | ~93% | MED | M | ✓ | ✓✓ (build/incremental) |
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
-| N | Concurrency polish | ~60% | MED | M | ✓ | — |
+| N | Concurrency polish | ~70% | MED | M | ✓ | — |
 | O | Tooling (fmt / test / doc / LSP) | test-runner ✅, attest ✅, attest --diff ✅; LSP/fmt deferred | LOW | M | ✓✓ | ✓ |
 | P | Self-hosting | plumbing ✅; port open | — | XL | ✓✓ | ✓✓ (the gate) |
 
@@ -251,12 +251,32 @@ layer."** Mostly a new pass + cgen tweaks → reasonably isolated.
 from runtime asserts into **static proof obligations** discharged by an SMT backend.
 **Motley:** verifying the compiler's own passes. Long-horizon; do after F/G.
 
-### N. Concurrency polish — ~60% (MED conflict; files: cgen, escape)
+### N. Concurrency polish — ~70% (MED conflict; files: cgen, escape)
 **Done:** `concurrent { spawn … }` → pthreads, scoped join; atomics (`__atomic_*`);
-the proven deterministic parallel reduction (`core.par_binned_sum`). **Left:** move-only
-channels; task **results** + `await` (keyword reserved); the `par … reduce(r)` loop
-surface + non-deterministic-reduction rejection (the headline checked guarantee); `spawn`
-of closures; dynamic-N spawn.
+the proven deterministic parallel reduction (`core.par_binned_sum`); **Mutex** (protected
+object) and **move-only channels** (below). **Left:** task **results** + `await` (keyword
+reserved); the `par … reduce(r)` loop surface + non-deterministic-reduction rejection (the
+headline checked guarantee); `spawn` of closures; dynamic-N spawn.
+
+**Move-only channels — ✅ DONE (increment 2, share by communicating).** `std/sync.jtr`'s
+`Channel(T)` is a bounded ring buffer over the spinlock whose `channel_send` takes its value
+by **`take`**: ownership *moves into* the channel, so no alias survives in the sender.
+Race-freedom then falls out of the *existing* escape analysis — no `Send`/`Sync`, no runtime
+detector: the give-away rule forbids handing a *borrow* to a `take` parameter, so you can
+only send what you own (Erlang/Pony share-nothing via Jestyr's second-class refs; a `take`
+value ≈ Pony `iso`). `channel_recv` reads out under the lock; bounded capacity gives natural
+backpressure. Pure library Jestyr — **no compiler change** beyond one escape fix.
+- Escape fix (additive): the give-away route (route 4) now resolves **module-qualified**
+  callees via `info.qualified`, so a `take` param reached through `mod.f(T, take v)` — e.g.
+  every channel `send` — is checked. Previously a qualified generic call silently skipped it.
+  Teeth-verified: before the fix, sending a borrow compiled; after, it errors at the arg.
+- `examples/std/channel.jtr` (multi-producer fill+drain → 264; cap-2 concurrent
+  producer+consumer with real backpressure → 36). `module.rs`/`main.rs` untouched.
+- Rigor: toolchain-free wiring (`channel_example_compiles_clean`) + **move-on-send soundness**
+  (`qualified_take_of_borrow_is_rejected`, with `…_of_owned_is_accepted` as its teeth) + a
+  pure-Rust **ring-buffer model property** (`channel_ring_preserves_every_value`: every sent
+  value received exactly once, any capacity/interleaving) + a `--features c-oracle` real-thread
+  run (`channel_demo`, ×8, pinned to `264 36`). `cargo test` stays toolchain-free.
 
 **Mutex — ✅ DONE (increment 1, the Ada-style protected object).** `std/sync.jtr`'s
 `Mutex(T)` bundles the guarded value, its lock, and the operations as one unit: the only
