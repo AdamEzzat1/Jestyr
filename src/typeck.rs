@@ -40,7 +40,7 @@ pub fn check(ast: &Ast) -> (TypeInfo, Vec<Diagnostic>) {
 /// item belongs to, what each module imports, and what is `pub` — so the checker
 /// can enforce visibility and resolve qualified access (`mem.allocate`).
 pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>) {
-    let Owners { owner, name_mods, dup } = build_owner(ast, modules);
+    let Owners { owner, name_mods, dup, dup_types, dup_variants } = build_owner(ast, modules);
     let item_mod: Vec<ModId> =
         (0..ast.items.len()).map(|i| *modules.item_mod.get(i).unwrap_or(&0)).collect();
     let mut tc = TypeChecker {
@@ -49,7 +49,8 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
         owner,
         name_mods,
         dup,
-        type_first_mod: HashMap::new(),
+        dup_types,
+        dup_variants,
         cur_mod: 0,
         table: GlobalTable::default(),
         expr_types: vec![Ty::Unknown; ast.exprs.len()],
@@ -74,6 +75,9 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
             expr_types: tc.expr_types,
             item_mod,
             dup_fns: tc.dup,
+            dup_types: tc.dup_types,
+            dup_variants: tc.dup_variants,
+            imports: modules.imports.clone(),
             call_sym: tc.call_sym,
             method_calls: tc.method_calls,
             qualified: tc.qualified,
@@ -97,6 +101,12 @@ struct Owners {
     name_mods: HashMap<String, Vec<ModId>>,
     /// fn/const names defined in more than one module (see [`crate::types::canon`]).
     dup: HashSet<String>,
+    /// non-generic type names (struct/enum/distinct) defined in more than one
+    /// module — drives `canon` for the `Jestyr_<type>` C symbol.
+    dup_types: HashSet<String>,
+    /// enum variant names defined in more than one module — drives `canon` for the
+    /// variant→enum lookup.
+    dup_variants: HashSet<String>,
 }
 
 /// The owning module and visibility of every named top-level item — the basis
@@ -106,18 +116,47 @@ struct Owners {
 fn build_owner(ast: &Ast, modules: &Modules) -> Owners {
     let mut owner: HashMap<(ModId, String), bool> = HashMap::new();
     let mut name_mods: HashMap<String, Vec<ModId>> = HashMap::new();
+    // Per-module-set trackers for the two type-side namespaces (non-generic type
+    // names and enum variant names), so two modules can each define `Slot` or a
+    // variant `red` and get distinct C symbols.
+    let mut type_mods: HashMap<String, Vec<ModId>> = HashMap::new();
+    let mut variant_mods: HashMap<String, Vec<ModId>> = HashMap::new();
+    let note = |map: &mut HashMap<String, Vec<ModId>>, n: String, m: ModId| {
+        let v = map.entry(n).or_default();
+        if !v.contains(&m) {
+            v.push(m);
+        }
+    };
     for (i, item) in ast.items.iter().enumerate() {
         let m = *modules.item_mod.get(i).unwrap_or(&0);
         let is_pub = *modules.item_pub.get(i).unwrap_or(&true);
-        // `namespaced` names participate in collision disambiguation (functions
-        // and consts — increment 1's scope); externs keep their bare linker name
-        // and types/variants/traits still resolve globally (increment 2).
+        // `namespaced` names participate in *function/const* collision
+        // disambiguation (increment 1); types and variants have their own dup
+        // sets (collidable types); externs keep their bare linker name and traits
+        // still resolve globally.
         let (name, namespaced) = match item {
             Item::Fn(f) => (Some(f.name.name.clone()), true),
             Item::Const(c) => (Some(c.name.name.clone()), true),
-            Item::Enum(e) => (Some(e.name.name.clone()), false),
-            Item::Struct { name, .. } => (Some(name.name.clone()), false),
-            Item::Distinct(d) => (Some(d.name.name.clone()), false),
+            Item::Enum(e) => {
+                // Only *non-generic* enums are collidable here; a generic enum's
+                // monomorphized instance mangling (`Jestyr_<ctor>__<args>`) is the
+                // deferred case, so leave those globally keyed.
+                if e.type_params.is_empty() {
+                    note(&mut type_mods, e.name.name.clone(), m);
+                    for v in &e.variants {
+                        note(&mut variant_mods, v.name.name.clone(), m);
+                    }
+                }
+                (Some(e.name.name.clone()), false)
+            }
+            Item::Struct { name, .. } => {
+                note(&mut type_mods, name.name.clone(), m);
+                (Some(name.name.clone()), false)
+            }
+            Item::Distinct(d) => {
+                note(&mut type_mods, d.name.name.clone(), m);
+                (Some(d.name.name.clone()), false)
+            }
             Item::Extern(e) => (Some(e.name.name.clone()), false),
             Item::Trait(t) => (Some(t.name.name.clone()), false),
             Item::Impl(_) | Item::Import(_) => (None, false),
@@ -125,16 +164,17 @@ fn build_owner(ast: &Ast, modules: &Modules) -> Owners {
         if let Some(n) = name {
             owner.entry((m, n.clone())).or_insert(is_pub);
             if namespaced {
-                let mods = name_mods.entry(n).or_default();
-                if !mods.contains(&m) {
-                    mods.push(m);
-                }
+                note(&mut name_mods, n, m);
             }
         }
     }
-    let dup: HashSet<String> =
-        name_mods.iter().filter(|(_, ms)| ms.len() > 1).map(|(n, _)| n.clone()).collect();
-    Owners { owner, name_mods, dup }
+    let dups = |map: &HashMap<String, Vec<ModId>>| -> HashSet<String> {
+        map.iter().filter(|(_, ms)| ms.len() > 1).map(|(n, _)| n.clone()).collect()
+    };
+    let dup = dups(&name_mods);
+    let dup_types = dups(&type_mods);
+    let dup_variants = dups(&variant_mods);
+    Owners { owner, name_mods, dup, dup_types, dup_variants }
 }
 
 struct TypeChecker<'a> {
@@ -146,11 +186,12 @@ struct TypeChecker<'a> {
     name_mods: HashMap<String, Vec<ModId>>,
     /// fn/const names defined in more than one module (drives `canon`).
     dup: HashSet<String>,
-    /// type name → the module that first defined it, to tell a same-module
-    /// redefinition from a cross-module type-name collision (types are still
-    /// global across modules — increment 6 is the *diagnostic*, not full type
-    /// namespacing).
-    type_first_mod: HashMap<String, ModId>,
+    /// non-generic type names defined in more than one module (drives the type
+    /// `canon` — two modules may each define `Slot`).
+    dup_types: HashSet<String>,
+    /// enum variant names defined in more than one module (drives the variant
+    /// `canon`).
+    dup_variants: HashSet<String>,
     /// The module whose item is currently being checked.
     cur_mod: ModId,
     table: GlobalTable,
@@ -218,6 +259,22 @@ impl<'a> TypeChecker<'a> {
         self.canon_in(self.cur_mod, name)
     }
 
+    /// The canonical *type* name owned by module `m` — the `type_index` key and the
+    /// backend's `Jestyr_<type>` symbol (bare unless the type name collides).
+    fn canon_type_in(&self, m: ModId, name: &str) -> String {
+        crate::types::canon(m, name, &self.dup_types)
+    }
+
+    /// The canonical type name resolved from the current module.
+    fn canon_type_cur(&self, name: &str) -> String {
+        self.canon_type_in(self.cur_mod, name)
+    }
+
+    /// The canonical *variant* name owned by module `m` (the key of `variants`).
+    fn canon_variant_in(&self, m: ModId, name: &str) -> String {
+        crate::types::canon(m, name, &self.dup_variants)
+    }
+
     /// Does the current module itself define a top-level item called `name`?
     /// (An unqualified name resolves only against its own module — namespace
     /// isolation; cross-module access must be qualified.)
@@ -255,25 +312,26 @@ impl<'a> TypeChecker<'a> {
                     self.table.types[idx].type_params =
                         e.type_params.iter().map(|p| p.name.clone()).collect();
                     for v in &e.variants {
-                        self.table.variants.insert(v.name.name.clone(), idx);
+                        let vkey = self.canon_variant_in(self.cur_mod, &v.name.name);
+                        self.table.variants.insert(vkey, idx);
                     }
                 }
                 Item::Distinct(d) => {
-                    // Register the name now; the base type is lowered in phase 2.
-                    if self.table.type_index.contains_key(&d.name.name) {
-                        let msg = self.type_dup_message(&d.name.name);
-                        self.error(d.name.span, msg);
+                    // Register the name now (by canonical key); the base type is
+                    // lowered in phase 2.
+                    let key = self.canon_type_cur(&d.name.name);
+                    if self.table.type_index.contains_key(&key) {
+                        self.error(d.name.span, format!("duplicate definition of `{}`", d.name.name));
                     } else {
                         let idx = self.table.types.len();
                         self.table.types.push(TypeDecl {
-                            name: d.name.name.clone(),
+                            name: key.clone(),
                             kind: TypeKindG::Distinct { base: Ty::Unknown },
                             is_copy: false,
                             is_record: false,
                             type_params: Vec::new(),
                         });
-                        self.table.type_index.insert(d.name.name.clone(), idx);
-                        self.type_first_mod.insert(d.name.name.clone(), self.cur_mod);
+                        self.table.type_index.insert(key, idx);
                     }
                 }
                 _ => {}
@@ -285,9 +343,13 @@ impl<'a> TypeChecker<'a> {
         let empty = HashSet::new();
         for (item_ix, item) in ast.items.iter().enumerate() {
             let item_m = *self.modules.item_mod.get(item_ix).unwrap_or(&0);
+            // Lower this item's types *from its own module's view*, so an
+            // unqualified type name resolves current-module-first (collidable types).
+            self.cur_mod = item_m;
             match item {
                 Item::Struct { name, body, .. } => {
-                    let self_idx = self.table.type_index.get(&name.name).copied();
+                    let key = self.canon_type_cur(&name.name);
+                    let self_idx = self.table.type_index.get(&key).copied();
                     let mut fields = Vec::new();
                     for m in &body.members {
                         if let StructMember::Field { name: fname, ty, .. } = m {
@@ -298,7 +360,7 @@ impl<'a> TypeChecker<'a> {
                             fields.push((fname.name.clone(), fty));
                         }
                     }
-                    if let Some(&i) = self.table.type_index.get(&name.name) {
+                    if let Some(i) = self_idx {
                         if let TypeKindG::Struct { fields: slot } = &mut self.table.types[i].kind {
                             *slot = fields;
                         }
@@ -309,7 +371,7 @@ impl<'a> TypeChecker<'a> {
                     // parameters (`some(x: T)`), so lower them with those in scope.
                     let tp: HashSet<String> =
                         e.type_params.iter().map(|p| p.name.clone()).collect();
-                    let self_idx = self.table.type_index.get(&e.name.name).copied();
+                    let self_idx = self.table.type_index.get(&self.canon_type_cur(&e.name.name)).copied();
                     let mut variants = Vec::new();
                     for v in &e.variants {
                         let mut ftys = Vec::new();
@@ -322,7 +384,7 @@ impl<'a> TypeChecker<'a> {
                         }
                         variants.push((v.name.name.clone(), ftys));
                     }
-                    if let Some(&i) = self.table.type_index.get(&e.name.name) {
+                    if let Some(i) = self_idx {
                         if let TypeKindG::Enum { variants: slot } = &mut self.table.types[i].kind {
                             *slot = variants;
                         }
@@ -332,7 +394,7 @@ impl<'a> TypeChecker<'a> {
                     // Lower the base type; a distinct type is `Copy` iff its base is.
                     let base = self.lower_type(&empty, d.base);
                     let copy = base.is_copy(&self.table);
-                    if let Some(&i) = self.table.type_index.get(&d.name.name) {
+                    if let Some(&i) = self.table.type_index.get(&self.canon_type_cur(&d.name.name)) {
                         self.table.types[i].is_copy = copy;
                         if let TypeKindG::Distinct { base: slot } = &mut self.table.types[i].kind {
                             *slot = base;
@@ -776,9 +838,12 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn register_type(&mut self, name: &Ident, is_enum: bool) -> usize {
-        if let Some(&i) = self.table.type_index.get(&name.name) {
-            let msg = self.type_dup_message(&name.name);
-            self.error(name.span, msg);
+        // Key by the *canonical* type name: two modules each defining `Slot` get
+        // distinct keys (`Slot__m<a>` / `Slot__m<b>`), so a clash here is now a
+        // genuine same-module redefinition.
+        let key = self.canon_type_cur(&name.name);
+        if let Some(&i) = self.table.type_index.get(&key) {
+            self.error(name.span, format!("duplicate definition of `{}`", name.name));
             return i;
         }
         let idx = self.table.types.len();
@@ -788,34 +853,16 @@ impl<'a> TypeChecker<'a> {
             TypeKindG::Struct { fields: Vec::new() }
         };
         self.table.types.push(TypeDecl {
-            name: name.name.clone(),
+            // The canonical name *is* the type's identity (its C symbol); for a
+            // non-colliding type this is just the bare name, so output is unchanged.
+            name: key.clone(),
             kind,
             is_copy: false,
             is_record: false,
             type_params: Vec::new(),
         });
-        self.table.type_index.insert(name.name.clone(), idx);
-        self.type_first_mod.insert(name.name.clone(), self.cur_mod);
+        self.table.type_index.insert(key, idx);
         idx
-    }
-
-    /// The diagnostic for redefining a type `name`. A genuine same-module
-    /// redefinition is a plain "duplicate definition"; a name defined in *two
-    /// different modules* is a cross-module collision — type names are still global
-    /// across modules (per-module *type* namespaces are a deferred follow-up of
-    /// the function/const namespacing), so the user must rename one. Distinguishing
-    /// the two turns a confusing "duplicate" into an actionable message.
-    fn type_dup_message(&self, name: &str) -> String {
-        match self.type_first_mod.get(name) {
-            Some(&other) if other != self.cur_mod => {
-                let a = self.modules.names.get(other).map(String::as_str).unwrap_or("?");
-                let b = self.modules.names.get(self.cur_mod).map(String::as_str).unwrap_or("?");
-                format!(
-                    "type `{name}` is defined in both module `{a}` and module `{b}` — type names are global across modules, so rename one (per-module type namespaces are not yet supported)"
-                )
-            }
-            _ => format!("duplicate definition of `{name}`"),
-        }
     }
 
     /// Reject a field that stores the enclosing type *by value* (`struct Node {
@@ -950,7 +997,7 @@ impl<'a> TypeChecker<'a> {
                     Ty::Opaque(n.name.clone())
                 } else if let Some(p) = prim_ty(&n.name) {
                     Ty::Prim(p)
-                } else if let Some(&i) = self.table.type_index.get(&n.name) {
+                } else if let Some(&i) = self.table.type_index.get(&self.canon_type_cur(&n.name)) {
                     Ty::Named(i)
                 } else {
                     Ty::Opaque(n.name.clone()) // external / not-yet-known: stay quiet
@@ -993,19 +1040,24 @@ impl<'a> TypeChecker<'a> {
                     Ty::GenStruct { ctor: ctor.name.clone(), args: aty }
                 }
             }
-            // `mod.Type` / `mod.Type(args)`: a module-qualified type. Types are
-            // globally unique today, so the *type* resolves by name exactly like
-            // `Name`/`App`; the module qualifier is validated for visibility by
-            // `audit_type_paths` (full type namespacing — same-name types across
-            // modules — is a deferred follow-up).
-            TypeKind::Path { name, args, .. } => {
+            // `mod.Type` / `mod.Type(args)`: a module-qualified type, resolved in
+            // the *target* module (so it picks that module's type even when the
+            // name collides across modules). Visibility is checked separately by
+            // `audit_type_paths`.
+            TypeKind::Path { module, name, args } => {
+                let target = self.binding_module(&module.name);
                 if args.is_empty() {
                     if let Some(p) = prim_ty(&name.name) {
                         Ty::Prim(p)
-                    } else if let Some(&i) = self.table.type_index.get(&name.name) {
-                        Ty::Named(i)
                     } else {
-                        Ty::Opaque(name.name.clone())
+                        let key = match target {
+                            Some(t) => self.canon_type_in(t, &name.name),
+                            None => name.name.clone(),
+                        };
+                        match self.table.type_index.get(&key) {
+                            Some(&i) => Ty::Named(i),
+                            None => Ty::Opaque(name.name.clone()),
+                        }
                     }
                 } else {
                     let aty: Vec<Ty> = args.iter().map(|a| self.lower_type(ty_params, *a)).collect();
@@ -1028,7 +1080,7 @@ impl<'a> TypeChecker<'a> {
                     Ty::Opaque(n.name.clone())
                 } else if let Some(p) = prim_ty(&n.name) {
                     Ty::Prim(p)
-                } else if let Some(&i) = self.table.type_index.get(&n.name) {
+                } else if let Some(&i) = self.table.type_index.get(&self.canon_type_cur(&n.name)) {
                     Ty::Named(i)
                 } else {
                     Ty::Opaque(n.name.clone())
@@ -1661,7 +1713,7 @@ impl<'a> TypeChecker<'a> {
                         self.call_sym.insert(id, key);
                     }
                     t
-                } else if let Some(&i) = self.table.variants.get(&n.name) {
+                } else if let Some(&i) = self.table.variants.get(&self.canon_variant_in(self.cur_mod, &n.name)) {
                     // A bare nullary variant, e.g. `none` — for a generic enum its
                     // instantiation comes from the expected type (`variant_ctor_type`).
                     self.variant_ctor_type(i, &n.name, &[])
@@ -1869,7 +1921,7 @@ impl<'a> TypeChecker<'a> {
                         } else {
                             ret
                         }
-                    } else if let Some(&ei) = self.table.variants.get(&name) {
+                    } else if let Some(&ei) = self.table.variants.get(&self.canon_variant_in(self.cur_mod, &name)) {
                         // An enum-variant constructor, e.g. `circle(2.0)`. For a
                         // generic enum, recover its type arguments from the args.
                         let arg_tys: Vec<Ty> =
@@ -2002,8 +2054,10 @@ impl<'a> TypeChecker<'a> {
                 // value is inferred against its **declared field type** as the
                 // expected type. That is what lets a fn-pointer-typed field accept a
                 // coercing closure literal — `Allocator{ alloc_fn: |n| … }`.
-                let named_idx = if path.name != "Self" && !self.table.variants.contains_key(&path.name) {
-                    self.table.type_index.get(&path.name).copied()
+                let named_idx = if path.name != "Self"
+                    && !self.table.variants.contains_key(&self.canon_variant_in(self.cur_mod, &path.name))
+                {
+                    self.table.type_index.get(&self.canon_type_cur(&path.name)).copied()
                 } else {
                     None
                 };
@@ -2020,7 +2074,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 if path.name == "Self" {
                     self_ty.clone()
-                } else if let Some(&ei) = self.table.variants.get(&path.name) {
+                } else if let Some(&ei) = self.table.variants.get(&self.canon_variant_in(self.cur_mod, &path.name)) {
                     // `circle { r: 2.0 }` — a struct-variant construction (the path is
                     // an enum variant, not a struct type). Reuse the positional
                     // inference (source order is taken as field order).
@@ -2419,7 +2473,7 @@ impl<'a> TypeChecker<'a> {
             PatKind::Ident(n) => {
                 // A nullary variant (`none`) binds nothing; a plain identifier is
                 // a catch-all binding the whole scrutinee.
-                if !self.table.variants.contains_key(&n.name) {
+                if !self.table.variants.contains_key(&self.canon_variant_in(self.cur_mod, &n.name)) {
                     scope.last_mut().unwrap().insert(n.name.clone(), scrut.clone());
                 }
             }
@@ -2453,7 +2507,7 @@ impl<'a> TypeChecker<'a> {
 
     /// The payload field types of an enum variant, in order.
     fn variant_field_types(&self, vname: &str) -> Vec<Ty> {
-        if let Some(&ei) = self.table.variants.get(vname) {
+        if let Some(&ei) = self.table.variants.get(&self.canon_variant_in(self.cur_mod, vname)) {
             if let TypeKindG::Enum { variants } = &self.table.types[ei].kind {
                 if let Some((_, ftys)) = variants.iter().find(|(n, _)| n == vname) {
                     return ftys.clone();
@@ -2826,7 +2880,7 @@ impl<'a> TypeChecker<'a> {
 
     /// The full variant set (name + arity) of the enum that owns `vname`.
     fn enum_variants_of(&self, vname: &str) -> Option<Vec<(String, usize)>> {
-        let &ei = self.table.variants.get(vname)?;
+        let &ei = self.table.variants.get(&self.canon_variant_in(self.cur_mod, vname))?;
         if let TypeKindG::Enum { variants } = &self.table.types[ei].kind {
             Some(variants.iter().map(|(n, ftys)| (n.clone(), ftys.len())).collect())
         } else {
@@ -2840,7 +2894,7 @@ impl<'a> TypeChecker<'a> {
         match &self.ast.pat_at(pat).kind {
             PatKind::Wildcard | PatKind::Rest | PatKind::Error => Pat::Wild,
             PatKind::Ident(n) => {
-                if self.table.variants.contains_key(&n.name) {
+                if self.table.variants.contains_key(&self.canon_variant_in(self.cur_mod, &n.name)) {
                     Pat::Var(n.name.clone(), vec![])
                 } else {
                     Pat::Wild // a binding matches anything
@@ -2890,7 +2944,7 @@ impl<'a> TypeChecker<'a> {
         match &self.ast.pat_at(pat).kind {
             PatKind::Wildcard | PatKind::Rest => *full = true,
             PatKind::Ident(n) => {
-                if !self.table.variants.contains_key(&n.name) {
+                if !self.table.variants.contains_key(&self.canon_variant_in(self.cur_mod, &n.name)) {
                     *full = true; // a binding catches everything
                 }
             }

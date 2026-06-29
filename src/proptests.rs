@@ -1906,6 +1906,35 @@ mod modules_props {
             prop_assert_eq!(hp.len(), 64, "a sha256 hex digest");
         }
 
+        /// **Same-named types across modules get distinct C symbols.** `k` modules
+        /// each define `struct T` (+ a constructor and accessor); the root uses each
+        /// via `m<j>.T`. They compile cleanly, each lowers to a distinct
+        /// `Jestyr_T__m<id>` (never the bare `Jestyr_T`), and output is deterministic.
+        #[test]
+        fn same_named_types_across_modules_get_distinct_symbols(k in 2usize..=4) {
+            let mut files = Vec::new();
+            let mut imports = String::new();
+            let mut uses = String::new();
+            let mut body = String::from("fn main() -> i32 { return 0");
+            for j in 0..k {
+                files.push((format!("m{j}.jtr"),
+                    format!("pub struct T {{ pub v: i32 }}\npub fn mk() -> T {{ return T {{ v: {j} }} }}\npub fn val(s: T) -> i32 {{ return s.v }}")));
+                imports.push_str(&format!("import \"m{j}\"\n"));
+                uses.push_str(&format!("fn u{j}(s: m{j}.T) -> i32 {{ return m{j}.val(s) }}\n"));
+                body.push_str(&format!(" + u{j}(m{j}.mk())"));
+            }
+            body.push_str(" }");
+            files.insert(0, ("main.jtr".to_string(), format!("{imports}{uses}{body}")));
+            let (diags, c) = pipeline_multi(&files);
+            prop_assert!(diags.is_empty(), "collidable `T` compiles: {:?}", diags);
+            // Module ids are 1..=k (main is 0); each `T` is disambiguated by id.
+            for id in 1..=k {
+                prop_assert!(c.contains(&format!("Jestyr_T__m{id}")), "T__m{id} present:\n{c}");
+            }
+            prop_assert!(!c.contains("struct Jestyr_T "), "the bare `Jestyr_T` must not appear:\n{c}");
+            prop_assert_eq!(pipeline_multi(&files).1, c);
+        }
+
         /// **Pinned-hash verification round-trips.** Pinning an import to the
         /// dependency's *computed* hash verifies clean; any other pin errors — the
         /// lockfile-lite reproducibility guarantee, over varied dependencies.

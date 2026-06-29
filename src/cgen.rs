@@ -28,6 +28,7 @@ use std::fmt::Write;
 
 use crate::ast::*;
 use crate::diag::Diagnostic;
+use crate::module::ModId;
 use crate::span::Span;
 use crate::typeck::unify_tp;
 use crate::types::{prim_ty, ImplCall, MethodRes, Ty, TypeInfo, TypeKindG};
@@ -119,13 +120,17 @@ fn emit_program(
     // Index every enum variant by name, so the backend can construct and match
     // on them by finding the owning enum and the variant's payload fields.
     let mut variants = HashMap::new();
-    for item in &ast.items {
+    for (i, item) in ast.items.iter().enumerate() {
         if let Item::Enum(e) = item {
+            // Key by the *canonical* variant name and store the *canonical* enum
+            // name, so two modules' same-named variants/enums don't alias (bare
+            // for any non-colliding name, so output is unchanged there).
+            let m = *info.item_mod.get(i).unwrap_or(&0);
             for v in &e.variants {
                 variants.insert(
-                    v.name.name.clone(),
+                    crate::types::canon(m, &v.name.name, &info.dup_variants),
                     VariantInfo {
-                        enum_name: e.name.name.clone(),
+                        enum_name: crate::types::canon(m, &e.name.name, &info.dup_types),
                         fields: v.fields.iter().map(|(id, t)| (id.name.clone(), *t)).collect(),
                     },
                 );
@@ -168,6 +173,7 @@ fn emit_program(
         out: String::new(),
         diags: Vec::new(),
         depth: 0,
+        cur_mod: 0,
         ptr_params: HashSet::new(),
         variants,
         tmp: 0,
@@ -388,8 +394,13 @@ struct Cgen<'a> {
     /// Names of the current function's by-pointer (`mut`/`out`) parameters, which
     /// must be dereferenced on use.
     ptr_params: HashSet<String>,
-    /// variant name → its enum and payload field list.
+    /// *canonical* variant name → its enum and payload field list.
     variants: HashMap<String, VariantInfo>,
+    /// The module whose item is currently being emitted — so a bare type/variant
+    /// name resolves to the right `Jestyr_<type>` C symbol when the name collides
+    /// across modules (collidable types). 0 (the root) for synthesized contexts;
+    /// harmless there because `canon` is the identity for any non-colliding name.
+    cur_mod: ModId,
     /// counter for unique `match` scrutinee temporaries.
     tmp: usize,
     /// names of generic function templates.
@@ -511,6 +522,35 @@ struct DropLocal {
 impl<'a> Cgen<'a> {
     fn diag(&mut self, span: Span, msg: impl Into<String>) {
         self.diags.push(Diagnostic::new(msg, span));
+    }
+
+    /// The canonical *type* name owned by module `m` — the `Jestyr_<type>` C symbol
+    /// (bare unless the type name collides across modules, so output is unchanged
+    /// for every collision-free program).
+    fn canon_type_in(&self, m: ModId, name: &str) -> String {
+        crate::types::canon(m, name, &self.info.dup_types)
+    }
+
+    /// The canonical type name resolved from the module currently being emitted.
+    fn canon_type(&self, name: &str) -> String {
+        self.canon_type_in(self.cur_mod, name)
+    }
+
+    /// The canonical *variant* name resolved from the module currently being
+    /// emitted (the key of the `variants` table).
+    fn canon_variant(&self, name: &str) -> String {
+        crate::types::canon(self.cur_mod, name, &self.info.dup_variants)
+    }
+
+    /// The owning module of the item at `ast.items[i]`.
+    fn item_module(&self, i: usize) -> ModId {
+        *self.info.item_mod.get(i).unwrap_or(&0)
+    }
+
+    /// The module an import `binding` refers to, from the module being emitted —
+    /// so a `mod.Type` path resolves to that module's (possibly colliding) type.
+    fn path_target(&self, binding: &str) -> Option<ModId> {
+        self.info.imports.get(self.cur_mod).and_then(|m| m.get(binding)).copied()
     }
 
     fn raw(&mut self, s: impl AsRef<str>) {
@@ -639,16 +679,19 @@ impl<'a> Cgen<'a> {
 
     fn forward_types(&mut self) {
         let ast = self.ast;
-        for item in &ast.items {
+        for (i, item) in ast.items.iter().enumerate() {
+            self.cur_mod = self.item_module(i);
             match item {
                 Item::Struct { name, is_union, .. } => {
                     let kw = if *is_union { "union" } else { "struct" };
-                    self.raw(format!("typedef {kw} Jestyr_{0} Jestyr_{0};\n", name.name));
+                    let c = self.canon_type(&name.name);
+                    self.raw(format!("typedef {kw} Jestyr_{c} Jestyr_{c};\n"));
                 }
                 // `distinct UserId = u64` → a zero-cost C typedef of the base.
                 Item::Distinct(dd) => {
                     let base = self.c_ty_ast(dd.base);
-                    self.raw(format!("typedef {base} Jestyr_{};\n", dd.name.name));
+                    let c = self.canon_type(&dd.name.name);
+                    self.raw(format!("typedef {base} Jestyr_{c};\n"));
                 }
                 Item::Enum(e) => {
                     // Generic-enum templates and niche-optimized enums have no
@@ -660,12 +703,13 @@ impl<'a> Cgen<'a> {
                         .info
                         .table
                         .type_index
-                        .get(&e.name.name)
+                        .get(&self.canon_type(&e.name.name))
                         .is_some_and(|&i| self.niche_enum_at(i).is_some())
                     {
                         continue;
                     }
-                    self.raw(format!("typedef struct Jestyr_{0} Jestyr_{0};\n", e.name.name));
+                    let c = self.canon_type(&e.name.name);
+                    self.raw(format!("typedef struct Jestyr_{c} Jestyr_{c};\n"));
                 }
                 _ => {}
             }
@@ -776,7 +820,8 @@ impl<'a> Cgen<'a> {
     /// no union member. A niche-optimized enum is skipped (it has no struct).
     fn enum_defs(&mut self) {
         let ast = self.ast;
-        for item in &ast.items {
+        for (i, item) in ast.items.iter().enumerate() {
+            self.cur_mod = self.item_module(i);
             if let Item::Enum(e) = item {
                 // A generic enum is a *template* (monomorphized per instantiation,
                 // like a generic struct/fn) — never emitted directly. (Codegen of
@@ -790,12 +835,12 @@ impl<'a> Cgen<'a> {
                     .info
                     .table
                     .type_index
-                    .get(&e.name.name)
+                    .get(&self.canon_type(&e.name.name))
                     .is_some_and(|&i| self.niche_enum_at(i).is_some())
                 {
                     continue;
                 }
-                let en = e.name.name.clone();
+                let en = self.canon_type(&e.name.name);
                 self.raw(format!("enum Jestyr_{en}_tag {{\n"));
                 for v in &e.variants {
                     // An explicit discriminant sets the tag's integer value.
@@ -875,7 +920,7 @@ impl<'a> Cgen<'a> {
                     t.clone()
                 } else if let Some(p) = prim_ty(&n.name) {
                     Ty::Prim(p)
-                } else if let Some(&i) = self.info.table.type_index.get(&n.name) {
+                } else if let Some(&i) = self.info.table.type_index.get(&self.canon_type(&n.name)) {
                     Ty::Named(i)
                 } else {
                     Ty::Opaque(n.name.clone())
@@ -913,18 +958,24 @@ impl<'a> Cgen<'a> {
                 Ty::Fn { params: ps, ret: Box::new(r), ret_conv: *ret_conv }
             }
             TypeKind::Dyn(n) => Ty::Opaque(format!("dyn {}", n.name)),
-            // A module-qualified type resolves by name (types are globally unique);
-            // mirrors `Name`/`App`.
-            TypeKind::Path { name, args, .. } => {
+            // A module-qualified type `mod.Type`, resolved in the *target* module
+            // (via the import map) so it picks that module's type even when the name
+            // collides across modules.
+            TypeKind::Path { module, name, args } => {
                 if args.is_empty() {
                     if let Some(t) = subst.get(&name.name) {
                         t.clone()
                     } else if let Some(p) = prim_ty(&name.name) {
                         Ty::Prim(p)
-                    } else if let Some(&i) = self.info.table.type_index.get(&name.name) {
-                        Ty::Named(i)
                     } else {
-                        Ty::Opaque(name.name.clone())
+                        let key = match self.path_target(&module.name) {
+                            Some(t) => self.canon_type_in(t, &name.name),
+                            None => self.canon_type(&name.name),
+                        };
+                        match self.info.table.type_index.get(&key) {
+                            Some(&i) => Ty::Named(i),
+                            None => Ty::Opaque(name.name.clone()),
+                        }
                     }
                 } else {
                     let aty: Vec<Ty> = args.iter().map(|a| self.ast_type_to_ty(*a, subst)).collect();
@@ -1371,11 +1422,13 @@ impl<'a> Cgen<'a> {
 
     fn struct_defs(&mut self) {
         let ast = self.ast;
-        for item in &ast.items {
+        for (i, item) in ast.items.iter().enumerate() {
+            self.cur_mod = self.item_module(i);
             if let Item::Struct { name, body, attrs, is_union, .. } = item {
                 let attr = self.struct_attr(attrs);
                 let kw = if *is_union { "union" } else { "struct" };
-                self.raw(format!("{kw}{attr} Jestyr_{} {{\n", name.name));
+                let c = self.canon_type(&name.name);
+                self.raw(format!("{kw}{attr} Jestyr_{c} {{\n"));
                 for m in &body.members {
                     if let StructMember::Field { name: fname, ty, volatile, bits, .. } = m {
                         let cty = self.c_ty_ast(*ty);
@@ -1422,7 +1475,8 @@ impl<'a> Cgen<'a> {
     fn fn_protos(&mut self) {
         let ast = self.ast;
         // non-generic functions
-        for item in &ast.items {
+        for (i, item) in ast.items.iter().enumerate() {
+            self.cur_mod = self.item_module(i);
             if let Item::Fn(f) = item {
                 if self.is_generic(f) || !self.fn_supported(f) {
                     continue;
@@ -1489,7 +1543,8 @@ impl<'a> Cgen<'a> {
 
     fn consts(&mut self) {
         let ast = self.ast;
-        for item in &ast.items {
+        for (i, item) in ast.items.iter().enumerate() {
+            self.cur_mod = self.item_module(i);
             if let Item::Const(c) = item {
                 let cty = if let Some(t) = c.ty {
                     self.c_ty_ast(t)
@@ -1543,7 +1598,8 @@ impl<'a> Cgen<'a> {
     fn fn_defs(&mut self) {
         let ast = self.ast;
         // non-generic functions
-        for item in &ast.items {
+        for (i, item) in ast.items.iter().enumerate() {
+            self.cur_mod = self.item_module(i);
             if let Item::Fn(f) = item {
                 if self.is_generic(f) {
                     continue; // emitted as monomorphized instances below
@@ -2583,12 +2639,12 @@ impl<'a> Cgen<'a> {
                     self.line(format!("case {tag_prefix}_{}:", vname.name));
                     self.line("{");
                     self.depth += 1;
-                    if let Some(vi) = self.variants.get(&vname.name).cloned() {
+                    if let Some(vi) = self.variants.get(&self.canon_variant(&vname.name)).cloned() {
                         for (i, sp) in subpats.iter().enumerate() {
                             match &ast.pat_at(*sp).kind {
                                 // a plain binding → project the field
                                 PatKind::Ident(bind)
-                                    if !self.variants.contains_key(&bind.name) =>
+                                    if !self.variants.contains_key(&self.canon_variant(&bind.name)) =>
                                 {
                                     if let Some((fname, fty)) = vi.fields.get(i) {
                                         // Substitute the instance's type args (no-op for
@@ -2620,7 +2676,7 @@ impl<'a> Cgen<'a> {
                     self.depth -= 1;
                     self.line("}");
                 }
-                PatKind::Ident(vname) if self.variants.contains_key(&vname.name) => {
+                PatKind::Ident(vname) if self.variants.contains_key(&self.canon_variant(&vname.name)) => {
                     // a nullary variant pattern, e.g. `none`
                     self.line(format!("case {tag_prefix}_{}:", vname.name));
                     self.line("{");
@@ -2743,11 +2799,11 @@ impl<'a> Cgen<'a> {
                     self.line(format!("if ({tmp}.tag == {tag_prefix}_{})", vname.name));
                     self.line("{");
                     self.depth += 1;
-                    if let Some(vi) = self.variants.get(&vname.name).cloned() {
+                    if let Some(vi) = self.variants.get(&self.canon_variant(&vname.name)).cloned() {
                         for (i, sp) in subpats.iter().enumerate() {
                             match &ast.pat_at(*sp).kind {
                                 PatKind::Ident(bind)
-                                    if !self.variants.contains_key(&bind.name) =>
+                                    if !self.variants.contains_key(&self.canon_variant(&bind.name)) =>
                                 {
                                     if let Some((fname, fty)) = vi.fields.get(i) {
                                         let ft = self.ast_type_to_ty(*fty, subst);
@@ -2770,7 +2826,7 @@ impl<'a> Cgen<'a> {
                     self.depth -= 1;
                     self.line("}");
                 }
-                PatKind::Ident(vname) if self.variants.contains_key(&vname.name) => {
+                PatKind::Ident(vname) if self.variants.contains_key(&self.canon_variant(&vname.name)) => {
                     // a nullary variant pattern, e.g. `none`
                     self.line(format!("if ({tmp}.tag == {tag_prefix}_{})", vname.name));
                     self.line("{");
@@ -2910,7 +2966,7 @@ impl<'a> Cgen<'a> {
     /// alternatives in the bootstrap).
     fn or_variant_names(&self, pat: PatId) -> Option<Vec<String>> {
         match &self.ast.pat_at(pat).kind {
-            PatKind::Ident(n) if self.variants.contains_key(&n.name) => Some(vec![n.name.clone()]),
+            PatKind::Ident(n) if self.variants.contains_key(&self.canon_variant(&n.name)) => Some(vec![n.name.clone()]),
             PatKind::Variant { name, subpats } if subpats.is_empty() => Some(vec![name.name.clone()]),
             PatKind::Or(alts) => {
                 let mut out = Vec::new();
@@ -2997,7 +3053,7 @@ impl<'a> Cgen<'a> {
     fn is_flat_subpat(&self, sp: PatId) -> bool {
         match &self.ast.pat_at(sp).kind {
             PatKind::Wildcard | PatKind::Rest => true,
-            PatKind::Ident(n) => !self.variants.contains_key(&n.name), // a binding, not a variant
+            PatKind::Ident(n) => !self.variants.contains_key(&self.canon_variant(&n.name)), // a binding, not a variant
             _ => false,
         }
     }
@@ -3008,7 +3064,7 @@ impl<'a> Cgen<'a> {
             | PatKind::StructVariant { .. }
             | PatKind::Lit(_)
             | PatKind::Range { .. } => true,
-            PatKind::Ident(n) => self.variants.contains_key(&n.name), // a nullary variant
+            PatKind::Ident(n) => self.variants.contains_key(&self.canon_variant(&n.name)), // a nullary variant
             PatKind::Or(alts) => alts.iter().any(|a| self.pat_is_constructor(*a)),
             _ => false,
         }
@@ -3061,7 +3117,7 @@ impl<'a> Cgen<'a> {
             }
             return None;
         }
-        let vi = self.variants.get(vname)?.clone();
+        let vi = self.variants.get(&self.canon_variant(vname))?.clone();
         let (fname, fty_id) = vi.fields.get(i)?;
         let subst = match subject_ty {
             Ty::GenEnum { ctor, args } => self.gen_enum_subst(ctor, args),
@@ -3086,7 +3142,7 @@ impl<'a> Cgen<'a> {
             }
             return None;
         }
-        let vi = self.variants.get(vname)?.clone();
+        let vi = self.variants.get(&self.canon_variant(vname))?.clone();
         let (fname, fty_id) = vi.fields.iter().find(|(f, _)| f == fieldname)?;
         let subst = match subject_ty {
             Ty::GenEnum { ctor, args } => self.gen_enum_subst(ctor, args),
@@ -3105,7 +3161,7 @@ impl<'a> Cgen<'a> {
         let ast = self.ast;
         match &ast.pat_at(pat).kind {
             PatKind::Wildcard | PatKind::Rest | PatKind::Error => ("1".to_string(), vec![]),
-            PatKind::Ident(n) if !self.variants.contains_key(&n.name) => {
+            PatKind::Ident(n) if !self.variants.contains_key(&self.canon_variant(&n.name)) => {
                 let cty = self.c_type(subject_ty);
                 ("1".to_string(), vec![format!("{cty} j_{} = {subject};", n.name)])
             }
@@ -3297,7 +3353,7 @@ impl<'a> Cgen<'a> {
         vname: &str,
         fields: &[FieldInit],
     ) -> String {
-        let vi = match self.variants.get(vname).cloned() {
+        let vi = match self.variants.get(&self.canon_variant(vname)).cloned() {
             Some(v) => v,
             None => return "0".to_string(),
         };
@@ -3458,7 +3514,7 @@ impl<'a> Cgen<'a> {
                 // a bare name that is a *nullary* enum variant, e.g. `none`. A
                 // payload-bearing variant referenced bare is not a construction
                 // (it would be called), so it must not shadow a same-named local.
-                if let Some(vi) = self.variants.get(&n.name).cloned() {
+                if let Some(vi) = self.variants.get(&self.canon_variant(&n.name)).cloned() {
                     if vi.fields.is_empty() {
                         let vname = n.name.clone();
                         return self.emit_variant_construct(id, &vi, &vname, &[]);
@@ -3737,7 +3793,7 @@ impl<'a> Cgen<'a> {
                 }
                 // `circle { r: 2.0 }` — a *struct-variant construction*: the path is
                 // an enum variant, not a struct type.
-                if self.variants.contains_key(&path.name) {
+                if self.variants.contains_key(&self.canon_variant(&path.name)) {
                     return self.emit_struct_variant_construct(id, &path.name, fields);
                 }
                 // `Point { x: 9, ..p }` — functional update: copy `p`, then assign the
@@ -3746,7 +3802,7 @@ impl<'a> Cgen<'a> {
                     let base = self.emit_expr(*sp);
                     let tmp = format!("jss_{}", self.tmp);
                     self.tmp += 1;
-                    let mut s = format!("({{ Jestyr_{} {tmp} = {base}; ", path.name);
+                    let mut s = format!("({{ Jestyr_{} {tmp} = {base}; ", self.canon_type(&path.name));
                     for fi in fields {
                         let v = self.emit_expr(fi.value);
                         let _ = write!(s, "{tmp}.j_{} = {v}; ", fi.name.name);
@@ -3754,7 +3810,7 @@ impl<'a> Cgen<'a> {
                     let _ = write!(s, "{tmp}; }})");
                     return s;
                 }
-                let mut s = format!("(Jestyr_{}){{ ", path.name);
+                let mut s = format!("(Jestyr_{}){{ ", self.canon_type(&path.name));
                 let mut first = true;
                 for fi in fields {
                     if !first {
@@ -3942,7 +3998,7 @@ impl<'a> Cgen<'a> {
         }
         if let ExprKind::Name(n) = &ast.expr_at(callee).kind {
             // enum-variant constructor with a payload, e.g. `circle(2.0)`
-            if let Some(vi) = self.variants.get(&n.name).cloned() {
+            if let Some(vi) = self.variants.get(&self.canon_variant(&n.name)).cloned() {
                 let vname = n.name.clone();
                 return self.emit_variant_construct(call_id, &vi, &vname, args);
             }
@@ -4702,6 +4758,8 @@ impl<'a> Cgen<'a> {
             // A name that collides across modules is table-keyed by its canonical
             // form, so its bare spelling misses the maps above — recognise it here.
             || self.info.dup_fns.contains(name)
+            || self.info.dup_types.contains(name)
+            || self.info.dup_variants.contains(name)
             || is_intrinsic(name)
     }
 
@@ -5286,7 +5344,8 @@ impl<'a> Cgen<'a> {
     fn impl_protos(&mut self) {
         let ast = self.ast;
         let mut any = false;
-        for item in &ast.items {
+        for (i, item) in ast.items.iter().enumerate() {
+            self.cur_mod = self.item_module(i);
             if let Item::Impl(im) = item {
                 // A blanket `impl[T] …` is monomorphized per instance separately.
                 if !im.generics.is_empty() {
@@ -5417,7 +5476,8 @@ impl<'a> Cgen<'a> {
 
     fn impl_defs(&mut self) {
         let ast = self.ast;
-        for item in &ast.items {
+        for (i, item) in ast.items.iter().enumerate() {
+            self.cur_mod = self.item_module(i);
             if let Item::Impl(im) = item {
                 if !im.generics.is_empty() {
                     continue;
@@ -6430,14 +6490,15 @@ impl<'a> Cgen<'a> {
                 if let Some(p) = prim_c(&n.name) {
                     return p.to_string();
                 }
-                match self.info.table.type_index.get(&n.name).copied() {
+                match self.info.table.type_index.get(&self.canon_type(&n.name)).copied() {
                     // A niche-optimized enum lowers to its bare pointer payload.
                     Some(i) if self.niche_enum_at(i).is_some() => {
                         let payload = self.niche_enum_at(i).unwrap().payload;
                         self.c_type(&payload)
                     }
-                    // structs and enums both lower to a `Jestyr_<Name>` typedef.
-                    Some(_) => format!("Jestyr_{}", n.name),
+                    // structs and enums both lower to a `Jestyr_<Name>` typedef
+                    // (the decl's name is the canonical form).
+                    Some(i) => format!("Jestyr_{}", self.info.table.types[i].name),
                     None => {
                         self.diag(span, format!("the C backend cannot lower the external type `{}` yet", n.name));
                         "int".to_string()
@@ -6989,7 +7050,7 @@ impl<'a> Cgen<'a> {
                     t.clone()
                 } else if let Some(p) = prim_ty(&n.name) {
                     Ty::Prim(p)
-                } else if let Some(&i) = self.info.table.type_index.get(&n.name) {
+                } else if let Some(&i) = self.info.table.type_index.get(&self.canon_type(&n.name)) {
                     Ty::Named(i)
                 } else {
                     Ty::Opaque(n.name.clone())

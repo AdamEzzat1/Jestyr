@@ -339,6 +339,19 @@ pub struct TypeInfo {
     /// that drives [`canon`] disambiguation. Empty for any collision-free
     /// program, so the backend's symbol emission is unchanged in that case.
     pub dup_fns: HashSet<String>,
+    /// Non-generic **type** names (struct / enum / distinct) defined in more than
+    /// one module — drives [`canon`] for the `Jestyr_<type>` C symbol so two
+    /// modules can each define `Slot`. Empty for any collision-free program (and
+    /// `TypeDecl::name` already holds the canonical form), so type-symbol emission
+    /// is byte-identical there.
+    pub dup_types: HashSet<String>,
+    /// Enum **variant** names defined in more than one module — drives [`canon`]
+    /// for the backend's variant→enum lookup so two modules' same-named variants
+    /// don't alias. Empty for any collision-free program.
+    pub dup_variants: HashSet<String>,
+    /// Per-module import bindings (binding name → target module), so the backend can
+    /// resolve a `mod.Type` path to the right module's (possibly colliding) type.
+    pub imports: Vec<std::collections::HashMap<String, ModId>>,
     /// An *unqualified* direct call (`make(a)`) → the canonical name of the
     /// function it resolved to, recorded **only** when that differs from the bare
     /// callee name (i.e. the name collides across modules). The backend prefers

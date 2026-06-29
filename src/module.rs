@@ -1258,33 +1258,56 @@ mod tests {
         );
     }
 
-    // --- cross-module type-name collision diagnostic (modules-v2, increment 6) ---
+    // --- collidable types: two modules may define the same type name ---
 
-    /// Two modules each defining a type `Slot` is a cross-module collision (type
-    /// names are still global across modules) — reported with an actionable message
-    /// that names both modules, distinct from a same-module redefinition.
+    /// Two modules each defining `struct Slot` compile together, get **distinct** C
+    /// symbols (`Jestyr_Slot__m<a>` / `__m<b>`), and each `mod.Slot` resolves to its
+    /// own module's struct.
     #[test]
-    fn a_cross_module_type_collision_names_both_modules() {
+    fn two_modules_may_define_the_same_struct() {
         let dir = fixture(
-            "typecol",
+            "collide_struct",
             &[
-                ("main.jtr", "import \"a\"\nimport \"b\"\nfn main() -> i32 { return b.g() }"),
-                ("a.jtr", "pub struct Slot { pub v: i32 }"),
-                ("b.jtr", "pub struct Slot { pub v: i32 }\npub fn g() -> i32 { return 0 }"),
+                (
+                    "main.jtr",
+                    "import \"a\"\nimport \"b\"\nfn ua(s: a.Slot) -> i32 { return a.val(s) }\nfn ub(s: b.Slot) -> i32 { return b.val(s) }\nfn main() -> i32 { return ua(a.mk()) + ub(b.mk()) }",
+                ),
+                ("a.jtr", "pub struct Slot { pub v: i32 }\npub fn mk() -> Slot { return Slot { v: 10 } }\npub fn val(s: Slot) -> i32 { return s.v }"),
+                ("b.jtr", "pub struct Slot { pub v: i32 }\npub fn mk() -> Slot { return Slot { v: 32 } }\npub fn val(s: Slot) -> i32 { return s.v }"),
             ],
         );
         let prog = load(dir.join("main.jtr").to_str().unwrap());
-        let (_info, diags) = typeck::check_program(&prog.ast, &prog.modules);
-        assert!(
-            diags.iter().any(|d| d.message.contains("type `Slot` is defined in both module `a` and module `b`")),
-            "a cross-module type collision must name both modules: {:?}",
-            diags
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(diags.is_empty(), "two modules may define `Slot`: {:?}", diags);
+        let (c, cd) = crate::cgen::emit(&prog.ast, &info);
+        assert!(cd.is_empty(), "cgen diags: {:?}", cd);
+        assert!(c.contains("Jestyr_Slot__m1") && c.contains("Jestyr_Slot__m2"), "distinct struct symbols:\n{c}");
+        assert!(!c.contains("struct Jestyr_Slot "), "the bare `Jestyr_Slot` symbol must not appear:\n{c}");
+    }
+
+    /// Two modules each defining `enum Color { red, green }` compile together with
+    /// distinct enum + variant symbols, and each module's variant construction /
+    /// `match` dispatches against its own enum.
+    #[test]
+    fn two_modules_may_define_the_same_enum() {
+        let dir = fixture(
+            "collide_enum",
+            &[
+                ("main.jtr", "import \"a\"\nimport \"b\"\nfn main() -> i32 { return a.code(a.pick()) + b.code(b.pick()) }"),
+                ("a.jtr", "pub enum Color { red, green }\npub fn pick() -> Color { return green }\npub fn code(c: Color) -> i32 { return match c { red => 1, green => 2 } }"),
+                ("b.jtr", "pub enum Color { red, green }\npub fn pick() -> Color { return red }\npub fn code(c: Color) -> i32 { return match c { red => 10, green => 20 } }"),
+            ],
         );
-        // It must NOT be reported as a plain same-module duplicate.
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(diags.is_empty(), "two modules may define `Color`: {:?}", diags);
+        let (c, cd) = crate::cgen::emit(&prog.ast, &info);
+        assert!(cd.is_empty(), "cgen diags: {:?}", cd);
         assert!(
-            !diags.iter().any(|d| d.message == "duplicate definition of `Slot`"),
-            "the cross-module case should not use the same-module wording: {:?}",
-            diags
+            c.contains("Jestyr_Color__m1_tag") && c.contains("Jestyr_Color__m2_tag"),
+            "distinct enum tag symbols:\n{c}"
         );
     }
 
