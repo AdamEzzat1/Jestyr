@@ -129,6 +129,22 @@ const SPECS: &[Spec] = &[
         args: Args::None,
         status: Status::Active,
     },
+    // `@span(<class>)` (Workstream Q — the work-span cost model; Cilk/NESL) — a
+    // **checked** asymptotic bound on the function's parallel *span* (depth: its
+    // critical-path length, the time on unbounded processors). The compiler computes
+    // the body's span from its loop structure — a sequential loop multiplies by `n`,
+    // a deterministic `par for … reduce(r)` contributes only `log n` (a parallel tree
+    // reduction) — and rejects a body whose span exceeds the declared class. So a
+    // refactor that accidentally *serializes* a reduction (span `log n → n`) becomes a
+    // diagnostic, not a silent regression. Classes: `constant`, `log`, `linear`,
+    // `linearithmic`, `quadratic`. The Motley cost-model tie-in (see MOTLEY.md); the
+    // thermal/energy facet can layer onto the same machinery later.
+    Spec {
+        name: "span",
+        targets: &[Target::Fn, Target::Method],
+        args: Args::Word,
+        status: Status::Active,
+    },
     // ── optimization intent (functions) ────────────────────────────────────
     Spec {
         name: "inline",
@@ -314,6 +330,176 @@ pub fn validate_fn(ast: &Ast, f: &FnDecl, is_method: bool, diags: &mut Vec<Diagn
         if runtime_params != 0 {
             diags.push(test_shape_error("bench", "take no parameters", a.span));
         }
+    }
+
+    // `@span(<class>)` — the checked work-span (depth) contract (Workstream Q).
+    if let Some(a) = f.attr("span") {
+        check_span_contract(ast, f, a, diags);
+    }
+}
+
+// ── `@span` — the work-span (depth) cost model (Workstream Q; Cilk/NESL) ──────────
+//
+// An asymptotic cost expressed as `n^k · (log n)^j` — enough for the classes a
+// structured loop/`par for` body produces. Ordered by growth: compare `k` (the
+// polynomial degree, which always dominates) first, then `j` (the log power). A
+// sequential loop multiplies a cost by `n` (`k += 1`); a `par for … reduce(r)`
+// contributes `log n` (`j = 1, k = 0`) — the parallel tree reduction's depth, NOT the
+// `n` a sequential fold would cost. That single difference is what lets the contract
+// catch an accidental serialization.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Cost {
+    k: u32, // polynomial degree (count of nested sequential loops)
+    j: u32, // power of log n (parallel-reduction depth)
+}
+
+impl Cost {
+    const CONST: Cost = Cost { k: 0, j: 0 };
+    const LOG: Cost = Cost { k: 0, j: 1 };
+    const LINEAR: Cost = Cost { k: 1, j: 0 };
+
+    /// Asymptotic order: `k` dominates (a polynomial factor beats any log), then `j`.
+    fn rank(self) -> (u32, u32) {
+        (self.k, self.j)
+    }
+    /// The larger of two costs (sequential statements / branches — the critical path
+    /// is the worst arm; asymptotically the max).
+    fn max(self, o: Cost) -> Cost {
+        if self.rank() >= o.rank() { self } else { o }
+    }
+    /// The product of two costs (nesting one inside the other — exponents add).
+    fn mul(self, o: Cost) -> Cost {
+        Cost { k: self.k + o.k, j: self.j + o.j }
+    }
+    /// A human-readable class name for diagnostics.
+    fn describe(self) -> String {
+        match (self.k, self.j) {
+            (0, 0) => "constant (O(1))".to_string(),
+            (0, 1) => "logarithmic (O(log n))".to_string(),
+            (0, _) => format!("O((log n)^{})", self.j),
+            (1, 0) => "linear (O(n))".to_string(),
+            (1, 1) => "linearithmic (O(n log n))".to_string(),
+            (2, 0) => "quadratic (O(n²))".to_string(),
+            (k, 0) => format!("O(n^{k})"),
+            (k, j) => format!("O(n^{k} (log n)^{j})"),
+        }
+    }
+}
+
+/// Map a `@span(<word>)` class name to its cost, or `None` if unrecognized.
+fn span_class(word: &str) -> Option<Cost> {
+    Some(match word {
+        // `constant`, not `const` — the latter is a reserved keyword, so it cannot
+        // appear as the attribute's identifier argument.
+        "constant" => Cost::CONST,
+        "log" => Cost::LOG,
+        "linear" => Cost::LINEAR,
+        "linearithmic" => Cost { k: 1, j: 1 },
+        "quadratic" => Cost { k: 2, j: 0 },
+        _ => return None,
+    })
+}
+
+/// Compute the span of a function body and check it against the declared `@span`.
+/// Intraprocedural: a call is treated as O(1) here (its own `@span` is its contract),
+/// so the model reasons about *this* body's loop structure — exactly what catches a
+/// `par for` quietly rewritten into a sequential `for`.
+fn check_span_contract(ast: &Ast, f: &FnDecl, a: &Attribute, diags: &mut Vec<Diagnostic>) {
+    // The argument shape (single identifier) was already validated by `check_args`;
+    // here we only need its spelling. Bail quietly if it wasn't an identifier.
+    let word = match a.args.first().map(|id| &ast.expr_at(*id).kind) {
+        Some(ExprKind::Name(n)) => n.name.clone(),
+        _ => return,
+    };
+    let Some(declared) = span_class(&word) else {
+        diags.push(
+            Diagnostic::new(format!("unknown span class `{word}` in `@span`"), a.span)
+                .with_help("expected one of `constant`, `log`, `linear`, `linearithmic`, `quadratic`"),
+        );
+        return;
+    };
+    let actual = span_of_block(ast, &f.body);
+    if actual.rank() > declared.rank() {
+        diags.push(
+            Diagnostic::new(
+                format!(
+                    "`@span({word})` is violated: this function's span is {}, which exceeds the declared {}",
+                    actual.describe(),
+                    declared.describe()
+                ),
+                a.span,
+            )
+            .with_help(
+                "a sequential loop over the input has span O(n); a deterministic `par for … reduce(r)` has span O(log n) — did a parallel reduction get serialized?",
+            ),
+        );
+    }
+}
+
+/// The span of a block: the max over its statements (the critical path runs them in
+/// sequence, so asymptotically the worst one dominates).
+fn span_of_block(ast: &Ast, b: &crate::ast::Block) -> Cost {
+    let mut c = Cost::CONST;
+    for s in &b.stmts {
+        c = c.max(span_of_stmt(ast, s));
+    }
+    c
+}
+
+fn span_of_stmt(ast: &Ast, s: &crate::ast::Stmt) -> Cost {
+    use crate::ast::Stmt;
+    match s {
+        Stmt::Let { init: Some(e), .. } => span_of_expr(ast, *e),
+        Stmt::Return { value: Some(e), .. } => span_of_expr(ast, *e),
+        Stmt::Let { .. } | Stmt::Return { .. } => Cost::CONST,
+        Stmt::Expr(e) => span_of_expr(ast, *e),
+    }
+}
+
+/// The span of an expression. Only the control-flow / loop kinds carry asymptotic
+/// cost; everything else is O(1) (a call's cost is the callee's own `@span` contract,
+/// not counted here). A sequential `for` multiplies its body by `n`; a `par for …
+/// reduce(r)` contributes `log n`.
+fn span_of_expr(ast: &Ast, id: crate::ast::ExprId) -> Cost {
+    use crate::ast::ForHead;
+    match &ast.expr_at(id).kind {
+        ExprKind::For { head, body, els, .. } => {
+            let mut inner = span_of_block(ast, body);
+            if let ForHead::While(c) = head {
+                inner = inner.max(span_of_expr(ast, *c));
+            }
+            // The loop runs its body `n` times in sequence → multiply by `n`.
+            let mut c = Cost::LINEAR.mul(inner);
+            if let Some(e) = els {
+                c = c.max(span_of_block(ast, e));
+            }
+            c
+        }
+        ExprKind::ParFor { iter, reduction, body, .. } => {
+            // A deterministic parallel reduction: its depth is the merge tree's
+            // `log n`, independent of how the per-element `body` maps each element.
+            Cost::LOG
+                .max(span_of_expr(ast, *iter))
+                .max(span_of_expr(ast, *reduction))
+                .max(span_of_expr(ast, *body))
+        }
+        ExprKind::If { cond, then, els } => {
+            let mut c = span_of_expr(ast, *cond).max(span_of_block(ast, then));
+            if let Some(e) = els {
+                c = c.max(span_of_expr(ast, *e));
+            }
+            c
+        }
+        ExprKind::Match { scrut, arms } => {
+            let mut c = span_of_expr(ast, *scrut);
+            for arm in arms {
+                c = c.max(span_of_expr(ast, arm.body));
+            }
+            c
+        }
+        ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::Concurrent(b) => span_of_block(ast, b),
+        ExprKind::Region { body, .. } => span_of_block(ast, body),
+        _ => Cost::CONST,
     }
 }
 

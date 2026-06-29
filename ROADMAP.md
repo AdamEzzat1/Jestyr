@@ -100,7 +100,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | N | Concurrency polish | ~100% | MED | M | ✓ | — |
 | O | Tooling (fmt / test / doc / LSP) | test-runner ✅, attest ✅, attest --diff ✅; LSP/fmt deferred | LOW | M | ✓✓ | ✓ |
 | P | Self-hosting | plumbing ✅; port open | — | XL | ✓✓ | ✓✓ (the gate) |
-| Q | Parallelism (data-parallel) | ~18% (tier-1 SOACs `par_reduce`/`par_map`/`par_scan` ✅) | MED | L | ✓✓ | ✓✓ (cost model) |
+| Q | Parallelism (data-parallel) | ~45% (SOACs + `par for` surface + `@span` cost model ✅) | MED | L | ✓✓ | ✓✓ (cost model) |
 
 ---
 
@@ -538,7 +538,7 @@ collide. (`mod.Type` paths + directory-as-module are the remaining K niceties.)
 escape → cgen (~27K lines); plus qualified type paths + a basic `build.jestyr` (K) for
 comfort. **Plumbing follow-up:** a recoverable `read_file -> String !IoError`.
 
-### Q. Parallelism (data-parallel) — ~18% (MED conflict; files: ast, parser, typeck, escape, cgen, printer + new `std/parallel.jtr`)
+### Q. Parallelism (data-parallel) — ~45% (MED conflict; files: ast, parser, typeck, escape, cgen, printer + new `std/parallel.jtr`)
 **Distinct from N (concurrency = task structuring); Q = data parallelism (make one
 computation faster across cores / lanes / GPU).** They share exactly one bridge: the
 deterministic `par` reduction. **Seed already in-tree:** `core.par_binned_sum` —
@@ -572,8 +572,26 @@ deterministic by construction.
   not touch `core`'s `par_*` region — coordinated with N). Demo `par_soac.jtr`. Tests:
   `parallel_props::{par_scan,par_map}_is_split_independent` (toolchain-free determinism
   stars), `par_soac_example_compiles_clean`, `c_oracle::par_soac_demo` (gcc + real threads,
-  8×). **Next:** the `par for … reduce(r)` surface — the first compiler change, where a
-  non-deterministic reduction is *rejected at compile time*.
+  8×).
+
+**Built (tier 2-3 — compiler):** the `par for … reduce(r)` surface (`ExprKind::ParFor`,
+desugars onto `core.par_reduce`, compile-time rejection of a non-declared reduction) **landed
+via the N session** (the N/Q overlap; `par` is a contextual keyword). Q **pinned its
+determinism in the cross-OS SHA canary** (an i64 sum/min/max/xor `par for` section in
+`numerics_canary.jtr`; the realized values are locked, so a schedule-dependence break flips
+the digest — master `a7b9f18`).
+
+**Built (tier 5 — the cost model, Q-distinct, Motley tie-in):** **`@span(<class>)`** — a
+*checked* asymptotic bound on a function's parallel **span** (depth). `attrs::validate_fn`
+computes the body's span from its loop structure as `n^k·(log n)^j` — a sequential loop ×`n`,
+a `par for … reduce(r)` contributes `log n` — and rejects a body whose span exceeds the
+declared class (`constant`/`log`/`linear`/`linearithmic`/`quadratic`). So serializing a
+reduction (`par for` → `for`, span `log n → n`) is a **compile error, not a silent
+regression** — the Cilk/NESL work-span idea as a contract. Intraprocedural v1 (a call is
+O(1)); in `attrs.rs` (no new pass — `main.rs` owns the driver). Demo `par_cost.jtr`; tests
+`cost_model::*` (rejection-soundness stars) + `c_oracle::par_cost_demo`. **Next (non-
+overlapping):** layer CJC **thermal/energy** onto `@span`; the `with schedule(...)` split (now
+mostly enabled by N's dynamic-N spawn); far-tier SIMD + GPU SOACs.
 
 ---
 

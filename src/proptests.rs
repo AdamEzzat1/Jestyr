@@ -3753,6 +3753,91 @@ fn par_soac_example_compiles_clean() {
     assert!(!ed.iter().any(|d| d.is_error()), "escape errors: {:?}", ed);
 }
 
+/// **Workstream Q — the work-span cost model (`@span`).** The compiler computes a
+/// function's parallel *span* (depth) from its loop structure and checks it against
+/// the declared `@span(...)`: a sequential loop is O(n), a deterministic `par for …
+/// reduce(r)` is O(log n). The headline property is **rejection soundness** — a
+/// serialized reduction (a `par for` rewritten as `for`) overshoots its declared span
+/// and becomes a compile error. The check runs in the parser (`attrs::validate_fn`),
+/// so these assert over the parse diagnostics — toolchain-free.
+#[cfg(test)]
+mod cost_model {
+    use super::*;
+
+    fn span_diags(src: &str) -> Vec<String> {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (_ast, pd) = Parser::new(src, tokens).parse();
+        pd.iter().map(|d| d.message.clone()).collect()
+    }
+    fn has_span_violation(src: &str) -> bool {
+        span_diags(src).iter().any(|m| m.contains("is violated"))
+    }
+    fn clean(src: &str) -> bool {
+        span_diags(src).iter().all(|m| !m.contains("@span") && !m.contains("span class"))
+    }
+
+    /// `@span(log)` accepts a `par for` reduction (O(log n)) but **rejects** the same
+    /// reduction written as a sequential `for` (O(n)) — the serialization guard.
+    #[test]
+    fn span_log_accepts_par_for_rejects_serial() {
+        assert!(
+            clean("@span(log) fn f(s: []i64) -> i64 { par for x in s reduce(red()) { x } }"),
+            "a par-for reduction has span O(log n) → satisfies @span(log)"
+        );
+        assert!(
+            has_span_violation(
+                "@span(log) fn f(s: []i64) -> i64 { var a: i64 = 0 for x in s { a = a + x } return a }"
+            ),
+            "the same fold written sequentially is O(n) → must violate @span(log)"
+        );
+    }
+
+    /// Span classes compose: a single loop is linear, nested loops are quadratic, a
+    /// loop-free body is constant. The declared class must not be undershot.
+    #[test]
+    fn span_classes_compose_and_check() {
+        assert!(clean("@span(linear) fn f(s: []i64) { for x in s { } }"), "one loop is O(n)");
+        assert!(
+            span_diags("@span(linear) fn f(s: []i64) { for x in s { for y in s { } } }")
+                .iter()
+                .any(|m| m.contains("is violated") && m.contains("quadratic")),
+            "nested loops are O(n²) → violate @span(linear)"
+        );
+        assert!(clean("@span(quadratic) fn f(s: []i64) { for x in s { for y in s { } } }"), "and satisfy @span(quadratic)");
+        assert!(clean("@span(constant) fn f() -> i64 { return 0 }"), "a loop-free body is O(1)");
+        assert!(
+            has_span_violation("@span(constant) fn f(s: []i64) { for x in s { } }"),
+            "a loop overshoots @span(constant)"
+        );
+    }
+
+    /// A declaration *looser* than the actual span is allowed (like weakening a
+    /// `requires`); an unknown class name is a clean error.
+    #[test]
+    fn span_looser_ok_unknown_class_errors() {
+        // par-for is O(log n); declaring the looser O(n) is fine.
+        assert!(clean("@span(linear) fn f(s: []i64) -> i64 { par for x in s reduce(red()) { x } }"));
+        assert!(
+            span_diags("@span(bogus) fn f() -> i64 { return 0 }")
+                .iter()
+                .any(|m| m.contains("unknown span class")),
+            "an unrecognized class is rejected"
+        );
+    }
+
+    /// The shipped demo compiles clean: both `@span(log)` (the `par for`) and
+    /// `@span(linear)` (its serial reference) are satisfied.
+    #[test]
+    fn par_cost_example_compiles_clean() {
+        let prog = crate::module::load("examples/std/par_cost.jtr");
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "load errors: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(!td.iter().any(|d| d.is_error()), "typeck errors: {:?}", td);
+        let ed = crate::escape::check(&prog.ast, &info);
+        assert!(!ed.iter().any(|d| d.is_error()), "escape errors: {:?}", ed);
+    }
+}
+
 /// Array *list* literals `[e0, e1, …]` — the lookup-table enabler (TESTING.md §5,
 /// per-feature unit layer). The repeat form `[v; N]` already existed; these pin the
 /// list form, in particular that a `const` table lowers to a C **brace initializer**
@@ -5239,6 +5324,13 @@ mod c_oracle {
                 "a parallel SOAC diverged from serial"
             );
         }
+    }
+    #[test]
+    fn par_cost_demo() {
+        // Workstream Q cost model: the `@span(log)` par-for reduction and its
+        // `@span(linear)` serial reference both pass the checked cost contract, and
+        // agree at runtime — sum of 1..=100 is 5050, bit-identical to serial.
+        assert_eq!(toks("examples/std/par_cost.jtr"), ["5050", "1"]);
     }
     #[test]
     fn mutex_demo() {
