@@ -1235,6 +1235,7 @@ impl<'src> Parser<'src> {
             Unsafe => self.parse_unsafe(),
             Concurrent => self.parse_concurrent(),
             Spawn => self.parse_spawn(),
+            Await => self.parse_await(),
             Region => self.parse_region(),
             For => self.parse_for(),
             While | Loop => self.parse_reserved_loop(),
@@ -1382,6 +1383,19 @@ impl<'src> Parser<'src> {
         let inner = self.parse_unary();
         let span = start.to(self.ast.expr_at(inner).span);
         self.ast.expr(ExprKind::Spawn(inner), span)
+    }
+
+    /// `await <task>` — join a task handle and yield its result. The operand is a
+    /// handle bound by `let h = spawn f(x)` in the enclosing `concurrent` scope.
+    /// Parsed at the *postfix* level so `await` binds tighter than `as` and binary
+    /// operators: `await t as i32` is `(await t) as i32`, `await a + await b` is
+    /// `(await a) + (await b)`.
+    fn parse_await(&mut self) -> ExprId {
+        let start = self.cur().span;
+        self.expect(Await, "`await`");
+        let inner = self.parse_postfix();
+        let span = start.to(self.ast.expr_at(inner).span);
+        self.ast.expr(ExprKind::Await(inner), span)
     }
 
     /// `region r { … }` — an arena scope. `&[r]T` references into it are zero-cost
@@ -2312,6 +2326,31 @@ mod tests {
         let has_spawn = ast.exprs.iter().filter(|e| matches!(e.kind, ExprKind::Spawn(_))).count();
         assert!(has_conc, "a concurrent nursery was parsed");
         assert_eq!(has_spawn, 2, "two spawn tasks");
+    }
+
+    #[test]
+    fn parses_spawn_binding_and_await() {
+        let ast = parse_ok("fn f() { concurrent { let h = spawn g() print(await h) } }");
+        assert!(ast.exprs.iter().any(|e| matches!(e.kind, ExprKind::Spawn(_))), "spawn parsed");
+        assert!(ast.exprs.iter().any(|e| matches!(e.kind, ExprKind::Await(_))), "await parsed");
+    }
+
+    #[test]
+    fn await_binds_tighter_than_cast_and_binary() {
+        // `await a as i32` is `(await a) as i32`; `await a + await b` is two awaits.
+        let ast = parse_ok("fn f() { concurrent { let a = spawn g() let b = spawn h() \
+                            let r = await a + await b let c = await a as i32 } }");
+        let awaits = ast.exprs.iter().filter(|e| matches!(e.kind, ExprKind::Await(_))).count();
+        assert_eq!(awaits, 3, "three await expressions (two in the sum, one before the cast)");
+        // The cast wraps the await: a `Cast` whose inner expr is an `Await`.
+        let cast_over_await = ast.exprs.iter().any(|e| {
+            if let ExprKind::Cast { expr, .. } = &e.kind {
+                matches!(ast.expr_at(*expr).kind, ExprKind::Await(_))
+            } else {
+                false
+            }
+        });
+        assert!(cast_over_await, "`await a as i32` must parse as `(await a) as i32`");
     }
 
     #[test]

@@ -370,6 +370,7 @@ impl<'a> Printer<'a> {
             ExprKind::StructType(_) => "struct { ... }".to_string(),
             ExprKind::Concurrent(_) => "concurrent { ... }".to_string(),
             ExprKind::Spawn(e) => format!("spawn {}", self.expr_inline(*e)),
+            ExprKind::Await(e) => format!("await {}", self.expr_inline(*e)),
             ExprKind::Region { name, .. } => format!("region {} {{ ... }}", name.name),
             ExprKind::For { head, els, .. } => {
                 let tail = if els.is_some() { " else { ... }" } else { "" };

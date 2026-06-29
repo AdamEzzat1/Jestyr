@@ -76,6 +76,11 @@ pub enum Ty {
     /// second-class, but a bare fn-pointer is first-class). Each parameter
     /// carries its passing [`Conv`]; `ret` is the (possibly `Unit`) result type.
     Fn { params: Vec<(Conv, Box<Ty>)>, ret: Box<Ty>, ret_conv: Conv },
+    /// A task handle `Task(T)` — the result of `spawn f(…)` whose target returns
+    /// `T`, joined by `await` to yield that `T`. Non-`Copy`: a one-shot handle
+    /// (each task is joined once). It never materializes as a runtime value — the
+    /// backend resolves `spawn`/`await` to thread vars inside the `concurrent` scope.
+    Task(Box<Ty>),
     /// The type of types (a `comptime` value), e.g. the result of `type`.
     TypeKw,
     /// Inference gave up here. Treated as `Copy` so we don't raise false escapes.
@@ -103,6 +108,7 @@ impl Ty {
             Ty::GenRef(_) => true, // a generational reference is a copyable fat pointer
             Ty::RegionRef(_) => true, // a region reference is a copyable plain pointer
             Ty::Fn { .. } => true, // a thin fn-pointer captures nothing — first-class, escapes freely
+            Ty::Task(_) => false,  // a one-shot task handle: joined once, not duplicated
             Ty::TypeKw => true,
             Ty::Unknown => true, // lenient: suppress escapes we couldn't type
             Ty::Error => true,   // suppress cascades
@@ -150,6 +156,7 @@ impl Ty {
                 let rcs = if rc.is_empty() { String::new() } else { format!("{rc} ") };
                 format!("fn({}) -> {rcs}{}", ps.join(", "), ret.display(tbl))
             }
+            Ty::Task(inner) => format!("Task({})", inner.display(tbl)),
             Ty::TypeKw => "type".to_string(),
             Ty::Unknown => "?".to_string(),
             Ty::Error => "<error>".to_string(),

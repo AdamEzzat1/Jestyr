@@ -253,7 +253,12 @@ pub enum ExprKind {
     /// as a task that *must* join before the block exits.
     Concurrent(Block),
     /// `spawn <call>` — launch a task within the enclosing `concurrent` scope.
+    /// As a statement it is fire-and-forget (joined at the nursery's brace); bound
+    /// with `let h = spawn f(x)` it yields a `Task(T)` handle awaitable with `await`.
     Spawn(ExprId),
+    /// `await <task>` — join a task handle and yield its result value. The operand
+    /// is a task handle bound in the same `concurrent` scope (`let h = spawn …`).
+    Await(ExprId),
 
     /// `region r { … }` — a named arena scope (design §4.4). `&[r]T` references
     /// into it are zero-cost; the whole arena is freed at the block's end.

@@ -425,6 +425,13 @@ impl<'a> Checker<'a> {
                 self.walk_expr(ctx, *call, false);
                 return;
             }
+            ExprKind::Await(task) => {
+                // `await` joins a task and yields its return value — an owned value the
+                // task produced, never a borrow of the awaiter's frame. No escape; just
+                // walk the handle operand.
+                self.walk_expr(ctx, *task, false);
+                return;
+            }
             ExprKind::Region { body, .. } => {
                 // A `region` block opens an arena (a heap allocation), so it is
                 // forbidden in a `@no_alloc` function.

@@ -210,6 +210,7 @@ fn emit_program(
             .collect(),
         dyn_guard: HashSet::new(),
         spawn_sites: Vec::new(),
+        task_handles: HashMap::new(),
         slice_instances: Vec::new(),
         array_instances: Vec::new(),
         genref_instances: Vec::new(),
@@ -359,6 +360,16 @@ struct SpawnSite {
     args: Vec<ExprId>,
 }
 
+/// A `let h = spawn f(…)` task handle live inside a `concurrent` scope: maps the
+/// binding name to the C thread/arg-struct/joined-flag suffix (`_jt<idx>` etc.) and
+/// the task's result C type (`None` for a `void` target). `await h` joins-if-needed
+/// (the `_jd<idx>` flag guards against a double-join at the brace) and reads `.ret`.
+#[derive(Clone)]
+struct TaskHandle {
+    idx: usize,
+    ret_cty: Option<String>,
+}
+
 /// A unit of monomorphization work. Generic functions and generic-struct methods
 /// can each pull in the other, so a single worklist threads them together.
 enum Work {
@@ -446,6 +457,9 @@ struct Cgen<'a> {
     dyn_guard: HashSet<ExprId>,
     /// every `spawn` site, for emitting per-site arg structs + trampolines.
     spawn_sites: Vec<SpawnSite>,
+    /// task handles (`let h = spawn …`) live in the current `concurrent` scope,
+    /// keyed by binding name — consumed by `await`. Saved/restored across nesting.
+    task_handles: HashMap<String, TaskHandle>,
     /// distinct slice element types, for emitting one `JestyrSlice_<T>` per type.
     slice_instances: Vec<Ty>,
     /// Every distinct fixed-size array type `[N]T` the program uses (one
@@ -3910,6 +3924,32 @@ impl<'a> Cgen<'a> {
                 self.diag(span, "`spawn` may only appear inside a `concurrent` block");
                 "0".to_string()
             }
+            ExprKind::Await(task) => {
+                // `await h`: resolve the handle bound by `let h = spawn …` in the
+                // enclosing `concurrent` scope, join it if not already joined (the
+                // `_jd` flag guards the brace's safety-net join), and yield `.ret`.
+                let name = match &ast.expr_at(*task).kind {
+                    ExprKind::Name(n) => Some(n.name.clone()),
+                    _ => None,
+                };
+                match name.and_then(|n| self.task_handles.get(&n).cloned()) {
+                    Some(h) => {
+                        let i = h.idx;
+                        let join = format!("if (!_jd{i}) {{ pthread_join(_jt{i}, NULL); _jd{i} = 1; }}");
+                        match h.ret_cty {
+                            Some(_) => format!("({{ {join} _ja{i}.ret; }})"),
+                            None => format!("({{ {join} }})"),
+                        }
+                    }
+                    None => {
+                        self.diag(
+                            span,
+                            "`await` expects a task handle bound by `let h = spawn …` in the enclosing `concurrent` block",
+                        );
+                        "0".to_string()
+                    }
+                }
+            }
             ExprKind::Region { .. } => {
                 self.diag(span, "`region` is only supported in statement position");
                 "0".to_string()
@@ -5782,51 +5822,106 @@ impl<'a> Cgen<'a> {
                 continue;
             };
             let id = site.call_id.0;
+            let ret_tid = f.ret_ty; // Option<TypeId> (Copy) — capture before &mut self use
             let runtime: Vec<&Param> = f.params.iter().filter(|p| !p.comptime && !p.is_self).collect();
-
-            self.raw(format!("struct _jsp_{id} {{ "));
-            if runtime.is_empty() {
-                self.raw("char _unused; ");
-            }
-            for (i, p) in runtime.iter().enumerate() {
-                let cty = match p.ty {
+            // A result-bearing task stores its return value in the arg struct's `ret`
+            // field, which `await` reads after the join. `void` targets have no `ret`.
+            let runtime_tys: Vec<String> = runtime
+                .iter()
+                .map(|p| match p.ty {
                     Some(t) => self.c_ty_ast(t),
                     None => "int".to_string(),
-                };
+                })
+                .collect();
+            let ret_cty = ret_tid.map(|t| self.c_ty_ast(t)).filter(|c| c != "void");
+
+            self.raw(format!("struct _jsp_{id} {{ "));
+            if runtime.is_empty() && ret_cty.is_none() {
+                self.raw("char _unused; ");
+            }
+            for (i, cty) in runtime_tys.iter().enumerate() {
                 self.raw(format!("{cty} a{i}; "));
+            }
+            if let Some(rc) = &ret_cty {
+                self.raw(format!("{rc} ret; "));
             }
             self.raw("};\n");
 
             let call_args: Vec<String> = (0..runtime.len()).map(|i| format!("_a->a{i}")).collect();
             let callee = self.c_fn_name(&site.fn_name); // honour `@no_mangle` spawn targets
+            let call = format!("{callee}({})", call_args.join(", "));
             self.raw(format!("static void* jestyr_task_{id}(void* _vp) {{ "));
             self.raw(format!("struct _jsp_{id}* _a = (struct _jsp_{id}*)_vp; "));
-            self.raw(format!("{callee}({}); return NULL; }}\n", call_args.join(", ")));
+            if ret_cty.is_some() {
+                self.raw(format!("_a->ret = {call}; return NULL; }}\n"));
+            } else {
+                self.raw(format!("{call}; return NULL; }}\n"));
+            }
         }
         if !self.spawn_sites.is_empty() {
             self.raw("\n");
         }
     }
 
-    /// Lower a `concurrent { … }` nursery: each `spawn` creates a thread; the
-    /// scope joins them all before it exits (structured concurrency).
+    /// The C return type a `spawn` target stores in its task box (`None` for a
+    /// `void` target). Mirrors the `ret` field decided in [`Cgen::spawn_runtime`].
+    fn task_ret_cty(&mut self, fn_name: &str) -> Option<String> {
+        let ret_tid = self.find_fn(fn_name).and_then(|f| f.ret_ty);
+        ret_tid.map(|t| self.c_ty_ast(t)).filter(|c| c != "void")
+    }
+
+    /// Emit the thread-creation triple for one spawn at handle index `h`: declare
+    /// the `pthread_t`, build the arg box (args zero-extend the `ret` field), and
+    /// `pthread_create` the trampoline.
+    fn emit_spawn_create(&mut self, site: &SpawnSite, h: usize) {
+        let id = site.call_id.0;
+        let vals: Vec<String> = site.args.iter().map(|a| self.emit_expr(*a)).collect();
+        let init = if vals.is_empty() { "{0}".to_string() } else { format!("{{ {} }}", vals.join(", ")) };
+        self.line(format!("pthread_t _jt{h};"));
+        self.line(format!("struct _jsp_{id} _ja{h} = {init};"));
+        self.line(format!("pthread_create(&_jt{h}, NULL, jestyr_task_{id}, &_ja{h});"));
+    }
+
+    /// Lower a `concurrent { … }` nursery: each `spawn` creates a thread; the scope
+    /// joins them all before it exits (structured concurrency). A `let h = spawn …`
+    /// binds an awaitable task handle whose result is read back by `await h`; such a
+    /// handle carries a `_jd` joined-flag so an `await` and the brace's safety-net
+    /// join don't double-join. Bare `spawn` statements stay fire-and-forget.
     fn emit_concurrent(&mut self, block: &Block) {
         let ast = self.ast;
+        let saved_handles = std::mem::take(&mut self.task_handles);
         self.line("{");
         self.depth += 1;
         let mut handles = 0usize;
+        // (handle index, guarded?) — let-bound handles guard the brace-join with
+        // their `_jd` flag (an `await` may have joined already); bare spawns don't.
+        let mut joins: Vec<(usize, bool)> = Vec::new();
+
         for stmt in &block.stmts {
+            // `let h = spawn f(args)` — a result task bound to an awaitable handle.
+            if let Stmt::Let { name, init: Some(e), .. } = stmt {
+                if let ExprKind::Spawn(inner) = &ast.expr_at(*e).kind {
+                    if let Some(site) = self.spawn_site(*inner) {
+                        let h = handles;
+                        self.emit_spawn_create(&site, h);
+                        self.line(format!("int _jd{h} = 0;"));
+                        let ret_cty = self.task_ret_cty(&site.fn_name);
+                        self.task_handles.insert(name.name.clone(), TaskHandle { idx: h, ret_cty });
+                        joins.push((h, true));
+                        handles += 1;
+                        continue;
+                    }
+                    self.diag(ast.expr_at(*e).span, "`spawn` expects a direct function call");
+                    continue;
+                }
+            }
+            // Bare `spawn f(args)` — fire-and-forget, joined at the brace.
             if let Stmt::Expr(e) = stmt {
                 if let ExprKind::Spawn(inner) = &ast.expr_at(*e).kind {
                     if let Some(site) = self.spawn_site(*inner) {
-                        let id = site.call_id.0;
                         let h = handles;
-                        let vals: Vec<String> = site.args.iter().map(|a| self.emit_expr(*a)).collect();
-                        let init =
-                            if vals.is_empty() { "{0}".to_string() } else { format!("{{ {} }}", vals.join(", ")) };
-                        self.line(format!("pthread_t _jt{h};"));
-                        self.line(format!("struct _jsp_{id} _ja{h} = {init};"));
-                        self.line(format!("pthread_create(&_jt{h}, NULL, jestyr_task_{id}, &_ja{h});"));
+                        self.emit_spawn_create(&site, h);
+                        joins.push((h, false));
                         handles += 1;
                         continue;
                     }
@@ -5836,11 +5931,16 @@ impl<'a> Cgen<'a> {
             }
             self.emit_stmt(stmt);
         }
-        for h in 0..handles {
-            self.line(format!("pthread_join(_jt{h}, NULL);"));
+        for (h, guarded) in joins {
+            if guarded {
+                self.line(format!("if (!_jd{h}) pthread_join(_jt{h}, NULL);"));
+            } else {
+                self.line(format!("pthread_join(_jt{h}, NULL);"));
+            }
         }
         self.depth -= 1;
         self.line("}");
+        self.task_handles = saved_handles;
     }
 
     /// Lower a `for` loop (see `docs/loops-spec.md`). The header selects the shape;
@@ -8322,6 +8422,27 @@ mod tests {
         assert!(c.contains("static void* jestyr_task_"), "a trampoline per spawn site: {c}");
         assert!(c.contains("pthread_create(&_jt0"), "spawns create threads: {c}");
         assert!(c.contains("pthread_join(_jt0"), "scope joins all tasks: {c}");
+    }
+
+    #[test]
+    fn lowers_spawn_result_and_await_to_join_and_read() {
+        // `let h = spawn f(x)` stores the result in the task box's `ret` field; the
+        // trampoline writes it; `await h` joins-if-needed (guarded by a `_jd` flag so
+        // the brace's safety-net join doesn't double-join) and reads `.ret`.
+        let src = "fn sq(n: i64) -> i64 { return n * n } \
+                   fn main() -> i32 { concurrent { let h = spawn sq(7) \
+                       print_int(await h as i32) } return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("int64_t ret;"), "the task box carries a result field: {c}");
+        assert!(c.contains("_a->ret = "), "the trampoline stores the result: {c}");
+        assert!(c.contains("int _jd0 = 0;"), "an awaitable handle gets a joined-flag: {c}");
+        assert!(
+            c.contains("if (!_jd0) { pthread_join(_jt0, NULL); _jd0 = 1; }"),
+            "await joins once: {c}"
+        );
+        assert!(c.contains("_ja0.ret"), "await reads the stored result: {c}");
+        assert!(c.contains("if (!_jd0) pthread_join(_jt0, NULL);"), "brace-join is guarded: {c}");
     }
 
     #[test]

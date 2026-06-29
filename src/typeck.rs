@@ -2207,8 +2207,26 @@ impl<'a> TypeChecker<'a> {
                 Ty::Unit
             }
             ExprKind::Spawn(call) => {
-                self.infer(scope, typ, self_ty, *call);
-                Ty::Unit
+                // `spawn f(args)` yields a `Task(T)` where `T` is the target's return
+                // type — the type of the inner call. As a bare statement the handle is
+                // discarded (fire-and-forget); bound with `let h = …` it is awaitable.
+                let t = self.infer(scope, typ, self_ty, *call);
+                Ty::Task(Box::new(t))
+            }
+            ExprKind::Await(task) => {
+                // `await h` joins the task handle and yields its result `T`.
+                let t = self.infer(scope, typ, self_ty, *task);
+                match t {
+                    Ty::Task(inner) => *inner,
+                    Ty::Unknown | Ty::Error => Ty::Unknown,
+                    other => {
+                        self.error(
+                            span,
+                            format!("`await` expects a task handle (`Task(T)` from `spawn`), found `{}`", other.display(&self.table)),
+                        );
+                        Ty::Unknown
+                    }
+                }
             }
             ExprKind::Region { body, .. } => {
                 self.infer_block(scope, typ, self_ty, body);
@@ -3368,6 +3386,47 @@ mod tests {
             .find_map(|(i, e)| matches!(e.kind, ExprKind::Call { .. }).then_some(ExprId(i as u32)))
             .expect("the `f(x)` call");
         assert_eq!(info.type_of(call), &Ty::Prim("i64"), "indirect call types as the pointer return");
+    }
+
+    // --- task results + await (concurrency N) ---
+
+    #[test]
+    fn spawn_yields_a_task_handle_and_await_unwraps_it() {
+        // `spawn sq(3)` types as `Task(i64)` (sq returns i64); `await h` unwraps to i64.
+        let (ast, info) = analyze_full(
+            "fn sq(n: i64) -> i64 { return n * n } \
+             fn main() -> i32 { concurrent { let h = spawn sq(3) print_int(await h as i32) } return 0 }",
+        );
+        let spawn = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| matches!(e.kind, ExprKind::Spawn(_)).then_some(ExprId(i as u32)))
+            .expect("the spawn expr");
+        assert_eq!(
+            info.type_of(spawn),
+            &Ty::Task(Box::new(Ty::Prim("i64"))),
+            "spawn yields Task(T) where T is the target's return"
+        );
+        let await_e = ast
+            .exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| matches!(e.kind, ExprKind::Await(_)).then_some(ExprId(i as u32)))
+            .expect("the await expr");
+        assert_eq!(info.type_of(await_e), &Ty::Prim("i64"), "await unwraps Task(i64) to i64");
+    }
+
+    #[test]
+    fn await_of_a_non_task_is_a_type_error() {
+        // `await` requires a `Task(T)` from `spawn`; awaiting a plain value is rejected.
+        let (_info, d) = analyze(
+            "fn main() -> i32 { let x: i64 = 1 concurrent { print_int(await x as i32) } return 0 }",
+        );
+        assert!(
+            d.iter().any(|m| m.message.contains("await") && m.message.contains("task handle")),
+            "awaiting a non-task must error: {d:?}"
+        );
     }
 
     #[test]

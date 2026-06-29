@@ -4980,6 +4980,16 @@ mod c_oracle {
         }
     }
     #[test]
+    fn await_demo() {
+        // Task results + await on real OS threads: two tasks compute disjoint partial
+        // sums-of-squares in parallel and `await` combines them (385), then a single
+        // awaited task (14). Deterministic (the partials are fixed), repeated to shake
+        // out join races.
+        for _ in 0..8 {
+            assert_eq!(toks("examples/std/await.jtr"), ["385", "14"], "await result wrong");
+        }
+    }
+    #[test]
     fn channel_demo() {
         // Move-only channels on real OS threads. Part 1: four producers send 16
         // values, the main thread drains them → 264. Part 2: a cap-2 channel with a
