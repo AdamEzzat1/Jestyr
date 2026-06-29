@@ -889,6 +889,103 @@ mod drop_props {
             prop_assert_eq!(co.matches("__drop(&j_a)").count(), 1, "outside:\n{}", co);
             prop_assert_eq!(ci.matches("__drop(&j_a)").count(), 0, "region:\n{}", ci);
         }
+
+        // --- B1: recursive field/payload drop (design §2.8) ---
+
+        /// Field-drop completeness (known-by-construction): a container struct with
+        /// no `Drop` of its own but `w` owned `R` *fields* drops every field exactly
+        /// once — `w` leaf destructor calls, never fewer (a leak) nor more (a double
+        /// free). The container itself has no own-drop symbol, so all `R` drops here
+        /// are field recursion.
+        #[test]
+        fn struct_field_count_drops_each_field_once(w in 1usize..6) {
+            let (src, _) = nested_drop_program(w, 1);
+            let (c, diags) = compile(&src);
+            prop_assert_eq!(diags, 0, "should compile clean:\n{}", src);
+            prop_assert_eq!(
+                count(&c, "jestyr_impl_Drop__R__drop(&j_h.j_f"), w,
+                "expected {} field drops:\n{}", w, c
+            );
+        }
+
+        /// Depth-invariance: however deeply a single droppable is nested inside
+        /// chained field owners, the leaf destructor fires *exactly once* — the
+        /// recursion follows the chain to the bottom and no further.
+        #[test]
+        fn arbitrary_nesting_drops_the_leaf_exactly_once(d in 1usize..6) {
+            let (src, _) = nested_drop_program(1, d);
+            let (c, diags) = compile(&src);
+            prop_assert_eq!(diags, 0, "should compile clean:\n{}", src);
+            prop_assert_eq!(
+                count(&c, "jestyr_impl_Drop__R__drop(&"), 1,
+                "a single nested leaf must drop exactly once at depth {}:\n{}", d, c
+            );
+        }
+
+        /// Width×depth: a `w`-field container nested `d` levels deep drops exactly
+        /// `w` leaves — the structural recursion visits every owned leaf once,
+        /// independent of how the aggregates are shaped.
+        #[test]
+        fn nested_aggregate_drops_every_leaf_once(w in 1usize..5, d in 1usize..5) {
+            let (src, expected_leaves) = nested_drop_program(w, d);
+            let (c, diags) = compile(&src);
+            prop_assert_eq!(diags, 0, "should compile clean:\n{}", src);
+            prop_assert_eq!(
+                count(&c, "jestyr_impl_Drop__R__drop(&"), expected_leaves,
+                "expected {} leaf drops:\n{}", expected_leaves, c
+            );
+        }
+
+        /// An enum payload drops once under a tag switch, for the live variant — and
+        /// the inactive nullary variant contributes no spurious drop.
+        #[test]
+        fn enum_payload_drops_once_for_live_variant(id in 0i32..50) {
+            let src = format!(
+                "{PRELUDE} enum N {{ leaf, wrap(r: R) }} \
+                 fn f() {{ let n = wrap(R{{ id: {id} }}) }} fn main() -> i32 {{ return 0 }}"
+            );
+            let (c, diags) = compile(&src);
+            prop_assert_eq!(diags, 0, "should compile clean:\n{}", src);
+            prop_assert_eq!(
+                count(&c, "jestyr_impl_Drop__R__drop(&j_n.u.wrap.j_r)"), 1,
+                "live enum payload must drop exactly once:\n{}", c
+            );
+        }
+
+        /// Field/payload-drop determinism: compiling a nested-drop program twice is
+        /// byte-identical — no iteration-order leak in the recursive walk.
+        #[test]
+        fn nested_drop_lowering_is_deterministic(w in 1usize..5, d in 1usize..5) {
+            let (src, _) = nested_drop_program(w, d);
+            prop_assert_eq!(compile(&src), compile(&src));
+        }
+    }
+
+    /// Build a program whose local `h` is a `w`-field struct nested `d` levels deep,
+    /// each leaf an owned `R`. Returns `(source, leaf_count)` where `leaf_count` is
+    /// the number of `R` destructor calls auto-drop must emit. At `d == 1` the
+    /// container directly holds `w` `R` fields; deeper levels wrap the previous
+    /// level in a single-field struct, so the leaf count stays `w` (one chain of
+    /// containers around the `w`-wide base). The container types have no `Drop` of
+    /// their own — every emitted `R` drop is field recursion.
+    fn nested_drop_program(w: usize, d: usize) -> (String, usize) {
+        // Level 0: the wide base struct `L0 { f0: R, f1: R, … }` and its literal.
+        let base_fields: Vec<String> = (0..w).map(|i| format!("f{i}: R")).collect();
+        let base_lit: Vec<String> = (0..w).map(|i| format!("f{i}: R{{ id: {i} }}")).collect();
+        let mut decls = format!("struct L0 {{ {} }} ", base_fields.join(", "));
+        // Levels 1..d: each wraps the previous in a single field `f0`.
+        for lvl in 1..d {
+            decls.push_str(&format!("struct L{lvl} {{ f0: L{} }} ", lvl - 1));
+        }
+        // Build the literal from the inside out (its top type is `L{d-1}`).
+        let mut lit = format!("L0{{ {} }}", base_lit.join(", "));
+        for lvl in 1..d {
+            lit = format!("L{lvl}{{ f0: {lit} }}");
+        }
+        let src = format!(
+            "{PRELUDE} {decls} fn f() {{ let h = {lit} }} fn main() -> i32 {{ return 0 }}",
+        );
+        (src, w)
     }
 }
 
@@ -2291,6 +2388,29 @@ mod fuzz {
     fn fuzz_pipeline() {
         bolero::check!().with_type::<String>().for_each(|s: &String| {
             run_pipeline(s);
+        });
+    }
+
+    /// **The recursive drop-glue synthesizer never panics (B1, totality).** Drive
+    /// arbitrary source through the full parse→typeck→escape→cgen pipeline while it
+    /// is biased toward the field/payload-drop path: a `Drop`-having `R`, a struct
+    /// that *owns* an `R`, and an enum with an `R` payload are all in scope, so the
+    /// adversarial body can nest, move, and match droppable aggregates. The
+    /// recursion over aggregates must terminate and never panic on any input.
+    #[test]
+    fn fuzz_drop_glue() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let src = format!(
+                "trait Drop {{ fn drop(mut self) }} struct R {{ id: i32 }} \
+                 impl Drop for R {{ fn drop(mut self) {{ print_int(self.id) }} }} \
+                 struct Holder {{ r: R }} enum Node {{ leaf, wrap(r: R) }} \
+                 fn f() {{ {s} }}"
+            );
+            let (tokens, _) = Lexer::new(&src).tokenize();
+            let (ast, _) = Parser::new(&src, tokens).parse();
+            let (info, _td) = typeck::check(&ast);
+            let _ed = escape::check(&ast, &info);
+            let _ = cgen::emit(&ast, &info);
         });
     }
 
@@ -5220,6 +5340,21 @@ mod c_oracle {
             toks("examples/std/intern_demo.jtr"),
             ["0", "1", "2", "1", "1", "3", "fn", "return", "1", "203", "1", "203"]
         );
+    }
+    #[test]
+    fn drop_nested_demo() {
+        // Field/payload auto-drop (B1) through the real gcc pipeline. The exact
+        // sequence proves: struct fields drop in reverse order (2 before 1), a live
+        // enum payload drops (7) while a `leaf` owns nothing (only 150), and a
+        // struct-in-a-struct reaches its leaf destructor (9). Run it several times —
+        // a stray double-drop or missed drop would shift the token stream.
+        for _ in 0..4 {
+            assert_eq!(
+                toks("examples/drop_nested.jtr"),
+                ["100", "2", "1", "200", "7", "150", "300", "9"],
+                "nested drop order/count wrong"
+            );
+        }
     }
     #[test]
     fn lexer_slice_demo() {

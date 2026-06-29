@@ -511,17 +511,23 @@ compiler can't run without are now built (each with a demo + gcc-oracle test):
   alternative to a chaining hashmap. Every pass past the lexer needs one.
 - **A string interner** ✅ — `std/intern.jtr`, str→dense id + id→str (inline
   open-addressing, single-copy, RAII). Makes downstream tables integer-keyed (rustc's
-  `Symbol`). Inline rather than nesting a `StrMap` because Jestyr does **not** auto-drop
-  struct fields (verified) — a nested Drop-having field would leak.
+  `Symbol`). Was inlined rather than nesting a `StrMap` because Jestyr used not to
+  auto-drop struct fields — **now fixed (B1):** RAII recurses into owned struct fields
+  and live enum payloads (reverse declaration order, after the value's own `drop`), so
+  a nested `Drop`-having field is freed automatically. A container-of-containers no
+  longer leaks; the inline interner stays as a single-copy optimization, not a
+  necessity. See `DROP-ALLOC-PHASE3.md` (field/payload drop) + `examples/drop_nested.jtr`.
 
 **Vertical slice — ✅ DONE:** `examples/std/lexer.jtr` — a lexer for a Jestyr subset,
 *written in Jestyr*, composing `fs` (read source) + `env` (argv) + `intern` (keyword/id
 classification). Lexes a built-in sample deterministically and a real file from disk
 (gcc-oracle tested). This is the front-end-in-Jestyr proof.
 
-**Surfaced by the slice (real, now-known gaps):** Jestyr doesn't auto-drop **struct
-fields** (so containers-of-containers must free explicitly); `unsafe {}` isn't a valid
-`let` initializer (use a tail-`unsafe` reader helper). **Per-module namespaces** (K)
+**Surfaced by the slice (gaps, with status):** ~~Jestyr doesn't auto-drop **struct
+fields**~~ — **fixed (B1):** RAII now recurses into owned struct fields and live enum
+payloads, so containers-of-containers free automatically (no manual frees). `unsafe {}`
+isn't a valid `let` initializer (use a tail-`unsafe` reader helper). **Per-module
+namespaces** (K)
 used to bite as soon as two std modules shared a helper name (`make`, `destroy`,
 `hash_str`, …) — **fixed (increment 1):** functions/consts are now per-module, so
 `intern` imports cleanly beside `list`/`strmap` and shared helper names no longer

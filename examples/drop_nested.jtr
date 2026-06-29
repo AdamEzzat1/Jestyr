@@ -1,0 +1,77 @@
+// examples/drop_nested.jtr — RAII now recurses into owned fields & payloads (§2.8).
+//
+// A `Drop` impl runs automatically at scope exit. As of the field/payload-drop
+// increment (B1), the compiler also recurses into a value's *owned* parts: a
+// struct's fields and a live enum variant's payload, in reverse declaration order,
+// after the value's own destructor (if any). No `Drop` impl on the *container* is
+// needed — owning the data is enough.
+//
+//   jestyrc run examples/drop_nested.jtr
+//   →   100              (holder_demo body runs first)
+//       2  1             (fields drop in reverse order: b=2 before a=1)
+//       200              (enum_demo body)
+//       7                (the live `wrap` payload drops; an inactive arm would not)
+//       150              (a `leaf` value owns nothing droppable → no drop fires)
+//       300              (deep_demo body)
+//       9                (a struct-in-a-struct reaches the leaf destructor)
+
+trait Drop {
+    fn drop(mut self)
+}
+
+struct Res {
+    id: i32,
+}
+
+impl Drop for Res {
+    fn drop(mut self) {
+        print_int(self.id)
+    }
+}
+
+// No `Drop` impl of its own — yet both fields are owned `Res`, so each drops at
+// scope exit, b before a (reverse declaration order).
+struct Holder {
+    a: Res,
+    b: Res,
+}
+
+fn holder_demo() {
+    let h = Holder{ a: Res{ id: 1 }, b: Res{ id: 2 } }
+    print_int(100)
+}
+
+// An enum payload drops only for the *live* variant — under a tag switch, never a
+// blind drop of the inactive union arm.
+enum Node {
+    leaf,
+    wrap(r: Res),
+}
+
+fn enum_demo() {
+    let n = wrap(Res{ id: 7 })
+    print_int(200)
+}
+
+// A struct nested in a struct: the recursion is transitive, reaching the leaf `Res`.
+struct Mid {
+    r: Res,
+}
+
+struct Top {
+    m: Mid,
+}
+
+fn deep_demo() {
+    let t = Top{ m: Mid{ r: Res{ id: 9 } } }
+    print_int(300)
+}
+
+fn main() -> i32 {
+    holder_demo()              // 100, then 2, 1
+    enum_demo()                // 200, then 7
+    let m = leaf               // owns nothing droppable …
+    print_int(150)             // … so only 150 prints, no drop
+    deep_demo()                // 300, then 9
+    return 0
+}

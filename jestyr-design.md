@@ -80,7 +80,7 @@ let twin = buf.clone(alloc)                   // explicit deep copy; both valid
 
 - **Move is the default** for non-`Copy` types. Use-after-move is a compile error.
 - `Copy` is a trait a type *has* (trivially copyable, no destructor, e.g. `i32`, `Point`). Copy types are duplicated implicitly; everything else moves.
-- When a custodian goes out of scope, its `drop` runs (RAII, deterministic, C++/Rust style). No GC, no finalizer thread.
+- When a custodian goes out of scope, its `drop` runs (RAII, deterministic, C++/Rust style). No GC, no finalizer thread. RAII **recurses into owned data**: after a value's own `drop` (if any), the compiler drops each owned struct field and the live enum variant's payload, in reverse declaration order — so a container of `Drop`-having values frees them all without a hand-written destructor. Indirection (pointers/refs) is not followed; the heap behind it stays a `drop` impl's responsibility.
 
 ### 4.3 Passing conventions: the elegant core
 

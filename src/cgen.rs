@@ -529,13 +529,15 @@ struct Cgen<'a> {
     cur_moved: HashSet<String>,
 }
 
-/// One owned, `Drop`-implementing local that needs scope-exit drop glue.
+/// One owned local that needs scope-exit drop glue — either it has its own `Drop`
+/// impl, or it transitively owns a field/payload that does (design Phase 3, §2.8).
 #[derive(Clone)]
 struct DropLocal {
     /// the Jestyr local name (emitted as `j_<name>`).
     name: String,
-    /// the `impl Drop for <type>` type key, for the mangled `drop` symbol.
-    key: String,
+    /// the local's type — walked at emission to drop its own value (if `Drop`) and
+    /// then recurse into owned struct fields / live enum payloads.
+    ty: Ty,
 }
 
 impl<'a> Cgen<'a> {
@@ -1794,29 +1796,197 @@ impl<'a> Cgen<'a> {
         None
     }
 
-    /// Register a freshly-declared local for scope-exit drop glue, if its type has
-    /// a `Drop` impl and its value does not escape (`cur_moved`). Appends to the
-    /// innermost open drop scope; a no-op when there is none.
+    /// Register a freshly-declared local for scope-exit drop glue, if its type
+    /// *needs drop* (has a `Drop` impl, or transitively owns a field/payload that
+    /// does) and its value does not escape (`cur_moved`). Appends to the innermost
+    /// open drop scope; a no-op when there is none.
     fn register_drop_local(&mut self, name: &str, ty: &Ty) {
         if self.cur_moved.contains(name) {
             return;
         }
-        let Some(key) = self.drop_key_of(ty) else {
+        if !self.needs_drop(ty) {
             return;
-        };
+        }
         if let Some(scope) = self.drop_stack.last_mut() {
-            scope.push(DropLocal { name: name.to_string(), key });
+            scope.push(DropLocal { name: name.to_string(), ty: ty.clone() });
         }
     }
 
-    /// Emit the drop call for one local: `drop`'s `mut self` takes the receiver by
-    /// pointer, so we pass `&j_<name>`.
-    fn emit_one_drop(&mut self, d: &DropLocal) {
-        if self.show_drops {
-            self.line(format!("/* drop j_{} : {} */", d.name, d.key));
+    /// True if a value of `ty` requires any drop glue: it has its own `Drop` impl,
+    /// or it transitively owns a by-value struct field / enum payload that needs
+    /// drop. Pointers, references, and niche payloads are **not** followed —
+    /// dropping through the heap is a `Drop` impl's own job, and stopping at
+    /// indirection also guarantees termination (a by-value aggregate can't contain
+    /// itself). `@copy` aggregates never drop.
+    fn needs_drop(&self, ty: &Ty) -> bool {
+        if ty.is_copy(&self.info.table) {
+            return false;
         }
-        let f = impl_method_c_name("Drop", &d.key, "drop");
-        self.line(format!("{f}(&j_{});", d.name));
+        if self.drop_key_of(ty).is_some() {
+            return true;
+        }
+        // A concrete struct: any owned field needs drop?
+        if let Some(fields) = self.aggregate_drop_fields(ty) {
+            return fields.iter().any(|(_, fty)| self.needs_drop(fty));
+        }
+        // A concrete (non-niche) enum: any live-variant payload needs drop?
+        if let Some(variants) = self.enum_drop_variants(ty) {
+            return variants.iter().any(|(_, payload)| payload.iter().any(|(_, fty)| self.needs_drop(fty)));
+        }
+        false
+    }
+
+    /// The owned (drop-recursable) fields of a concrete `struct`/`record`:
+    /// `(field-name, field-type)` in declaration order, or `None` if `ty` is not a
+    /// named non-generic struct. Pointer/reference fields are dropped from the list
+    /// (we don't follow indirection); their own `Drop` impl, if any, is reached only
+    /// when the field is itself a by-value aggregate.
+    fn aggregate_drop_fields(&self, ty: &Ty) -> Option<Vec<(String, Ty)>> {
+        let Ty::Named(i) = ty else { return None };
+        let decl = self.info.table.types.get(*i)?;
+        if !matches!(decl.kind, TypeKindG::Struct { .. }) {
+            return None;
+        }
+        // Read field names + types from the AST decl (the type table's struct
+        // fields carry the same data, but the AST is the source of truth for the
+        // `j_<name>` C accessor and is what the enum path must use anyway).
+        let name = &decl.name;
+        for item in &self.ast.items {
+            if let Item::Struct { name: sname, body, is_union, .. } = item {
+                if &sname.name != name {
+                    continue;
+                }
+                // An untagged `union` has no single live field — never auto-drop it.
+                if *is_union {
+                    return Some(Vec::new());
+                }
+                let empty = HashMap::new();
+                let fields = body
+                    .members
+                    .iter()
+                    .filter_map(|m| match m {
+                        StructMember::Field { name: fname, ty: fty, .. } => {
+                            Some((fname.name.clone(), self.ast_type_to_ty(*fty, &empty)))
+                        }
+                        _ => None,
+                    })
+                    .filter(|(_, t)| !Self::is_indirect_ty(t))
+                    .collect();
+                return Some(fields);
+            }
+        }
+        Some(Vec::new())
+    }
+
+    /// The variants of a concrete (non-generic, non-niche) `enum` that the drop
+    /// walker must consider: `(variant-name, [(payload-field-name, type)])` in
+    /// declaration order. `None` if `ty` is not such an enum. Pointer payloads are
+    /// dropped from each variant's list (indirection is not followed).
+    fn enum_drop_variants(&self, ty: &Ty) -> Option<Vec<(String, Vec<(String, Ty)>)>> {
+        let Ty::Named(i) = ty else { return None };
+        let decl = self.info.table.types.get(*i)?;
+        if !matches!(decl.kind, TypeKindG::Enum { .. }) {
+            return None;
+        }
+        // A niche-optimized enum has no tag/union; its payload is a bare pointer we
+        // don't follow. Only its own `Drop` impl (if any) runs — never a payload walk.
+        if self.niche_enum_at(*i).is_some() {
+            return Some(Vec::new());
+        }
+        let name = decl.name.clone();
+        for item in &self.ast.items {
+            if let Item::Enum(e) = item {
+                if e.name.name != name || e.is_generic() {
+                    continue;
+                }
+                let empty = HashMap::new();
+                let variants = e
+                    .variants
+                    .iter()
+                    .map(|v| {
+                        let payload = v
+                            .fields
+                            .iter()
+                            .map(|(fname, fty)| (fname.name.clone(), self.ast_type_to_ty(*fty, &empty)))
+                            .filter(|(_, t)| !Self::is_indirect_ty(t))
+                            .collect();
+                        (v.name.name.clone(), payload)
+                    })
+                    .collect();
+                return Some(variants);
+            }
+        }
+        Some(Vec::new())
+    }
+
+    /// Indirection we do not drop-recurse through (a raw pointer or a reference):
+    /// the heap behind it is owned by a `Drop` impl, not by structural recursion.
+    fn is_indirect_ty(ty: &Ty) -> bool {
+        matches!(ty, Ty::Ptr { .. } | Ty::GenRef(_) | Ty::RegionRef(_))
+    }
+
+    /// Emit the drop glue for one local: its own `Drop::drop` (if any), then a
+    /// recursive walk of its owned fields/payloads. The C local is `j_<name>`.
+    fn emit_one_drop(&mut self, d: &DropLocal) {
+        let ty = d.ty.clone();
+        let place = format!("j_{}", d.name);
+        self.emit_drop_place(&place, &ty);
+    }
+
+    /// Emit drop glue for the value at C lvalue `place` of type `ty`: first its own
+    /// `Drop::drop` (the receiver passed by `&place`, since `drop` takes `mut self`),
+    /// then — additively — a recursion into each owned struct field / live enum
+    /// payload in **reverse declaration order**. A value with no droppable fields
+    /// emits exactly its own drop (or nothing), so output is byte-identical for any
+    /// program that doesn't use field/payload drop. Pointers/references are not
+    /// followed (the heap behind them is a `Drop` impl's responsibility), which also
+    /// bounds the recursion.
+    fn emit_drop_place(&mut self, place: &str, ty: &Ty) {
+        // 1. The value's own destructor, if it has one.
+        if let Some(key) = self.drop_key_of(ty) {
+            if self.show_drops {
+                self.line(format!("/* drop {place} : {key} */"));
+            }
+            let f = impl_method_c_name("Drop", &key, "drop");
+            self.line(format!("{f}(&{place});"));
+        }
+        // 2. Owned struct fields, reverse declaration order.
+        if let Some(fields) = self.aggregate_drop_fields(ty) {
+            for (fname, fty) in fields.iter().rev() {
+                if self.needs_drop(fty) {
+                    let sub = format!("{place}.j_{fname}");
+                    self.emit_drop_place(&sub, fty);
+                }
+            }
+            return;
+        }
+        // 3. Live enum payload — switch on the tag, drop only the active variant's
+        //    owned payload fields (reverse declaration order). Variants with no
+        //    droppable payload contribute no `case`.
+        if let Some(variants) = self.enum_drop_variants(ty) {
+            let droppable: Vec<(String, Vec<(String, Ty)>)> = variants
+                .into_iter()
+                .filter(|(_, payload)| payload.iter().any(|(_, fty)| self.needs_drop(fty)))
+                .collect();
+            if droppable.is_empty() {
+                return;
+            }
+            let prefix = self.enum_tag_prefix(ty);
+            self.line(format!("switch ({place}.tag) {{"));
+            for (vname, payload) in &droppable {
+                self.line(format!("case {prefix}_{vname}: {{"));
+                for (fname, fty) in payload.iter().rev() {
+                    if self.needs_drop(fty) {
+                        let sub = format!("{place}.u.{vname}.j_{fname}");
+                        self.emit_drop_place(&sub, fty);
+                    }
+                }
+                self.line("break;".to_string());
+                self.line("}".to_string());
+            }
+            self.line("default: break;".to_string());
+            self.line("}".to_string());
+        }
     }
 
     /// Open a drop scope for a `{ }` block.
@@ -7991,6 +8161,116 @@ mod tests {
             1,
             "a generic mut-borrow arg must not move the droppable:\n{c}"
         );
+    }
+
+    // --- B1: recursive drop of owned struct fields & enum payloads (design §2.8) ---
+
+    #[test]
+    fn nested_struct_field_drops_at_scope_exit() {
+        // A struct with no `Drop` impl of its own but a droppable *field* must drop
+        // that field at scope exit — RAII recurses into aggregates.
+        let src = format!(
+            "{DROP_PRELUDE} struct Holder {{ a: R, b: R }} \
+             fn f() {{ let h = Holder{{ a: R{{ id: 1 }}, b: R{{ id: 2 }} }} }}"
+        );
+        let (c, d) = gen(&src);
+        assert!(d.is_empty(), "{:?}", d);
+        // Both fields drop, through the field accessor, and in reverse field order.
+        let db = c.find("jestyr_impl_Drop__R__drop(&j_h.j_b)").expect("field b dropped");
+        let da = c.find("jestyr_impl_Drop__R__drop(&j_h.j_a)").expect("field a dropped");
+        assert!(db < da, "b must drop before a (reverse field order):\n{c}");
+    }
+
+    #[test]
+    fn record_field_drops_at_scope_exit() {
+        // A `record` (immutable struct) recurses into its droppable fields too.
+        let src = format!(
+            "{DROP_PRELUDE} record Wrap {{ inner: R }} \
+             fn f() {{ let w = Wrap{{ inner: R{{ id: 5 }} }} }}"
+        );
+        let (c, d) = gen(&src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("jestyr_impl_Drop__R__drop(&j_w.j_inner)"), "record field dropped:\n{c}");
+    }
+
+    #[test]
+    fn own_drop_runs_before_field_drops() {
+        // A struct with *both* its own `Drop` impl and a droppable field runs its
+        // own destructor first, then drops the field (Rust's outer-then-inner order).
+        let src = "trait Drop { fn drop(mut self) } struct R { id: i32 } \
+            impl Drop for R { fn drop(mut self) { print_int(self.id) } } \
+            struct Outer { inner: R } \
+            impl Drop for Outer { fn drop(mut self) { print_int(99) } } \
+            fn f() { let o = Outer{ inner: R{ id: 1 } } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        let own = c.find("jestyr_impl_Drop__Outer__drop(&j_o)").expect("own drop");
+        let field = c.find("jestyr_impl_Drop__R__drop(&j_o.j_inner)").expect("field drop");
+        assert!(own < field, "own destructor must run before field drops:\n{c}");
+    }
+
+    #[test]
+    fn enum_payload_drops_only_for_the_live_variant() {
+        // An enum payload drops under a `switch` on the tag — only the live
+        // variant's owned payload is dropped (no blind drop of an inactive union arm).
+        let src = format!(
+            "{DROP_PRELUDE} enum Node {{ leaf, wrap(r: R) }} \
+             fn f() {{ let n = wrap(R{{ id: 7 }}) }}"
+        );
+        let (c, d) = gen(&src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("switch (j_n.tag)"), "tag switch present:\n{c}");
+        assert!(c.contains("case Jestyr_Node_wrap:"), "live variant case:\n{c}");
+        assert!(c.contains("jestyr_impl_Drop__R__drop(&j_n.u.wrap.j_r)"), "payload dropped:\n{c}");
+        // The nullary `leaf` variant carries nothing droppable, so it gets no case.
+        assert!(!c.contains("case Jestyr_Node_leaf:"), "nullary variant needs no case:\n{c}");
+    }
+
+    #[test]
+    fn non_droppable_aggregate_emits_no_drop_glue() {
+        // Byte-identical guard: a struct/enum with no droppable field emits *no*
+        // drop call at all — the new recursion is purely additive.
+        let src = "struct Plain { x: i32, y: i32 } fn f() { let p = Plain{ x: 1, y: 2 } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(!c.contains("__drop(&j_"), "a plain aggregate must not drop:\n{c}");
+        assert!(!c.contains("switch (j_p.tag)"), "no spurious tag switch:\n{c}");
+    }
+
+    #[test]
+    fn moved_out_field_owner_is_not_dropped() {
+        // A nested-field owner that is *returned* (moved) drops neither itself nor
+        // its fields here — the caller owns the whole aggregate. No double-drop.
+        let src = format!(
+            "{DROP_PRELUDE} struct Holder {{ a: R }} \
+             fn make() -> Holder {{ let h = Holder{{ a: R{{ id: 1 }} }} return h }}"
+        );
+        let (c, d) = gen(&src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(!c.contains("__drop(&j_h"), "a moved aggregate must not drop its fields:\n{c}");
+    }
+
+    #[test]
+    fn copy_aggregate_is_never_dropped() {
+        // An `@copy` aggregate is duplicated, never owned at a single site — it must
+        // never get drop glue even if structurally it could carry a droppable field.
+        let src = "@copy struct Pt { x: i32, y: i32 } fn f() { let p = Pt{ x: 1, y: 2 } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(!c.contains("__drop(&j_p"), "a @copy aggregate must not drop:\n{c}");
+    }
+
+    #[test]
+    fn deeply_nested_fields_drop_recursively() {
+        // Recursion is transitive: a struct holding a struct holding a droppable
+        // reaches the leaf destructor through a chained field accessor.
+        let src = format!(
+            "{DROP_PRELUDE} struct Mid {{ r: R }} struct Top {{ m: Mid }} \
+             fn f() {{ let t = Top{{ m: Mid{{ r: R{{ id: 1 }} }} }} }}"
+        );
+        let (c, d) = gen(&src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("jestyr_impl_Drop__R__drop(&j_t.j_m.j_r)"), "leaf dropped via chain:\n{c}");
     }
 
     #[test]

@@ -34,6 +34,27 @@ default toolchain-free `cargo test` (up from 413 at the start: +32 unit/property
     which is why every `if`/`match`/`block` return-tail is covered for free.
   - **No unwinding → straight-line drop:** Jestyr aborts on fault, so there are no
     landing pads or double-panic cases; the glue is plain sequential C.
+- **Field & payload auto-drop (B1) — RAII recurses into aggregates.** Scope-exit drop
+  now descends into a value's *owned parts*: after a value's own `Drop::drop` (if any),
+  the glue drops each owned **struct field** and the **live enum variant's payload**, in
+  **reverse declaration order**. A container needs no `Drop` impl of its own — owning the
+  data is enough, so `struct Holder { items: List(i32) }` frees its `List` automatically.
+  The implementation (`src/cgen.rs`, `needs_drop`/`emit_drop_place`):
+  - **needs-drop is transitive** — a type needs drop if it has a `Drop` impl *or* owns a
+    by-value field/payload that does; `register_drop_local` registers any needs-drop
+    local, not just directly-`Drop` ones.
+  - **enums switch on the tag** — only the active variant's payload is dropped (a `switch
+    (v.tag)` with one `case` per droppable variant); an inactive union arm is never touched.
+  - **additive & byte-identical** — a value with no droppable field emits exactly its own
+    drop (or nothing), so every pre-B1 program emits identical C (verified by diffing the
+    std/enum demos against the pre-change compiler).
+  - **terminates by construction** — recursion follows only *by-value* aggregates;
+    pointers, references, and niche payloads are not followed (the heap behind them is a
+    `Drop` impl's own job), and a by-value aggregate can't contain itself. Generic-struct
+    field recursion (a generic container with no own `Drop` but a droppable field) is the
+    one deferred case — generic containers in std (`List`) supply their own `Drop`, which
+    is reached directly. Demo: [`examples/drop_nested.jtr`](examples/drop_nested.jtr) →
+    `100, 2, 1, 200, 7, 150, 300, 9`.
 - **Move analysis / drop-after-move elision.** `cgen::collect_moved` computes (over-
   approximately, hence leak-safe) the locals whose value *escapes* — returned, passed
   by value to a call, captured into a struct, rebound, or consumed by a `take self`
