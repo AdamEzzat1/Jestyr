@@ -1244,6 +1244,12 @@ impl<'a> Cgen<'a> {
                 self.collect_structs_in_expr(*reduction, subst, seen, order);
                 self.collect_structs_in_expr(*body, subst, seen, order);
             }
+            ExprKind::Select(arms) => {
+                for arm in arms {
+                    self.collect_structs_in_expr(arm.chan, subst, seen, order);
+                    self.collect_structs_in_block(&arm.body, subst, seen, order);
+                }
+            }
             _ => {}
         }
     }
@@ -2088,6 +2094,12 @@ impl<'a> Cgen<'a> {
                 self.collect_moved_expr(*reduction, out);
                 self.collect_moved_expr(*body, out);
             }
+            ExprKind::Select(arms) => {
+                for arm in arms {
+                    self.collect_moved_expr(arm.chan, out);
+                    self.collect_moved(&arm.body, out);
+                }
+            }
             ExprKind::For { head, body, els, .. } => {
                 match head {
                     ForHead::While(c) => self.collect_moved_expr(*c, out),
@@ -2395,6 +2407,7 @@ impl<'a> Cgen<'a> {
                     ExprKind::Block(b) => self.emit_body(b, false),
                     ExprKind::Unsafe(b) => self.emit_body(b, false),
                     ExprKind::Concurrent(b) => self.emit_concurrent(b),
+                    ExprKind::Select(arms) => self.emit_select(arms),
                     ExprKind::Region { name, body } => self.emit_region(&name.name, body),
                     ExprKind::For { label, head, region, body, els } => {
                         self.emit_for(label.as_ref(), head, region.as_ref(), body, els.as_ref())
@@ -3972,6 +3985,10 @@ impl<'a> Cgen<'a> {
             ExprKind::ParFor { var, iter, reduction, body } => {
                 self.emit_par_for(var, *iter, *reduction, *body)
             }
+            ExprKind::Select(_) => {
+                self.diag(span, "`select` is only supported in statement position");
+                "0".to_string()
+            }
             ExprKind::Region { .. } => {
                 self.diag(span, "`region` is only supported in statement position");
                 "0".to_string()
@@ -4800,6 +4817,12 @@ impl<'a> Cgen<'a> {
                 self.find_closures_expr(*reduction, found, seen);
                 self.find_closures_expr(*body, found, seen);
             }
+            ExprKind::Select(arms) => {
+                for arm in arms {
+                    self.find_closures_expr(arm.chan, found, seen);
+                    self.find_closures_block(&arm.body, found, seen);
+                }
+            }
             _ => {}
         }
     }
@@ -4927,6 +4950,12 @@ impl<'a> Cgen<'a> {
                 self.collect_refs(*iter, out);
                 self.collect_refs(*reduction, out);
                 self.collect_refs(*body, out);
+            }
+            ExprKind::Select(arms) => {
+                for arm in arms {
+                    self.collect_refs(arm.chan, out);
+                    self.collect_refs_block(&arm.body, out);
+                }
             }
             _ => {}
         }
@@ -5827,6 +5856,12 @@ impl<'a> Cgen<'a> {
                     self.find_spawns_block(els, out);
                 }
             }
+            ExprKind::Select(arms) => {
+                for arm in arms {
+                    self.find_spawns_expr(arm.chan, out);
+                    self.find_spawns_block(&arm.body, out);
+                }
+            }
             _ => {}
         }
     }
@@ -6050,6 +6085,43 @@ impl<'a> Cgen<'a> {
         self.line("}");
         self.task_handles = saved_handles;
         self.dyn_spawn_active = saved_dyn;
+    }
+
+    /// Lower a `select { recv(ch) => x { body } … }`: hoist each channel value, then
+    /// spin, and the first arm whose channel has a buffered item receives it and runs
+    /// (an `else if` chain so exactly one arm fires per pass). Single-consumer (the
+    /// `len > 0` then `recv` is race-free when this is the only receiver). Reuses the
+    /// non-generic `channel_len_i64`/`channel_recv_i64` wrappers from `std/sync.jtr`.
+    fn emit_select(&mut self, arms: &[SelectArm]) {
+        self.line("{");
+        self.depth += 1;
+        // Hoist each channel to a local so it is evaluated once, not per spin.
+        let mut chvars = Vec::new();
+        for (i, arm) in arms.iter().enumerate() {
+            let cty = self.c_type(&self.info.type_of(arm.chan).clone());
+            let v = self.emit_expr(arm.chan);
+            self.line(format!("{cty} _sel{i} = {v};"));
+            chvars.push(i);
+        }
+        self.line("int _seldone = 0;");
+        self.line("while (!_seldone) {");
+        self.depth += 1;
+        for (i, arm) in arms.iter().enumerate() {
+            let lead = if i == 0 { "if" } else { "else if" };
+            self.line(format!("{lead} (jestyr_channel_len_i64(_sel{i}) > 0) {{"));
+            self.depth += 1;
+            self.line(format!("int64_t j_{} = jestyr_channel_recv_i64(_sel{i});", arm.bind.name));
+            for stmt in &arm.body.stmts {
+                self.emit_stmt(stmt);
+            }
+            self.line("_seldone = 1;");
+            self.depth -= 1;
+            self.line("}");
+        }
+        self.depth -= 1;
+        self.line("}");
+        self.depth -= 1;
+        self.line("}");
     }
 
     /// Lower a `for` loop (see `docs/loops-spec.md`). The header selects the shape;
@@ -7500,6 +7572,12 @@ impl<'a> Cgen<'a> {
                 self.find_calls_expr(*reduction, subst, work);
                 self.find_calls_expr(*body, subst, work);
             }
+            ExprKind::Select(arms) => {
+                for arm in arms {
+                    self.find_calls_expr(arm.chan, subst, work);
+                    self.find_calls_block(&arm.body, subst, work);
+                }
+            }
             ExprKind::For { head, body, els, .. } => {
                 match head {
                     ForHead::While(c) => self.find_calls_expr(*c, subst, work),
@@ -8580,6 +8658,21 @@ mod tests {
             c.contains("for (size_t _dk = 0; _dk < _dn; _dk++) { pthread_join(_dt[_dk], NULL); free(_da[_dk]); }"),
             "the brace joins every dynamic task and frees its box: {c}"
         );
+    }
+
+    #[test]
+    fn lowers_select_to_a_poll_loop() {
+        // `select` hoists each channel, then spins: the first arm whose channel has a
+        // value (via `channel_len_i64`) receives it (`channel_recv_i64`) and runs,
+        // setting the done flag. (Single-source: the wrappers aren't defined here, but
+        // the lowering shape is what we assert.)
+        let src = "fn g(v: i64) {} fn f(c: i64) { select { recv(c) => x { g(x) } } }";
+        let (c, _d) = gen(src);
+        assert!(c.contains("int _seldone = 0;"), "a done flag: {c}");
+        assert!(c.contains("while (!_seldone)"), "the wait loop: {c}");
+        assert!(c.contains("jestyr_channel_len_i64("), "polls readiness via the i64 wrapper: {c}");
+        assert!(c.contains("jestyr_channel_recv_i64("), "receives via the i64 wrapper: {c}");
+        assert!(c.contains("_seldone = 1;"), "a fired arm ends the wait: {c}");
     }
 
     #[test]

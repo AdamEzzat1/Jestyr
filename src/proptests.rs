@@ -5132,6 +5132,15 @@ mod c_oracle {
         }
     }
     #[test]
+    fn select_demo() {
+        // `select` over move-only channels on real threads: two spawned producers fill
+        // two channels; the main thread drains all four via `select`. Order-independent
+        // sum → deterministic: 11+12+21+22 = 66.
+        for _ in 0..8 {
+            assert_eq!(toks("examples/std/select.jtr"), ["66"], "select result wrong");
+        }
+    }
+    #[test]
     fn deterministic_demo() {
         // A `@deterministic`-certified function (its only parallelism is a checked
         // `par for`) runs and gives the bit-stable result: Σ k² for 1..=10 = 385.

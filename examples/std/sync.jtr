@@ -162,6 +162,11 @@ pub fn channel_len(comptime T: type, read ch: Channel(T)) -> i64 {
     return atomic_load(ch.ctrl + 2)
 }
 
+// Monomorphic `i64` wrappers — the `select` lowering calls these by their stable
+// (non-generic) C names, so the compiler need not synthesize a monomorphized call.
+pub fn channel_len_i64(read ch: Channel(i64)) -> i64 { return channel_len(i64, ch) }
+pub fn channel_recv_i64(read ch: Channel(i64)) -> i64 { return channel_recv(i64, ch) }
+
 // Release the channel's heap cells. Call once, after every task sharing it has
 // joined and the buffer has been drained (any values still buffered are leaked —
 // the channel does not drop them in the bootstrap).

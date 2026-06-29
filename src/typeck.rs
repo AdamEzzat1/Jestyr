@@ -2295,6 +2295,29 @@ impl<'a> TypeChecker<'a> {
                 }
                 Ty::Prim("i64")
             }
+            ExprKind::Select(arms) => {
+                // Each arm waits on a `Channel(i64)` and binds the received `i64`.
+                for arm in arms {
+                    let cht = self.infer(scope, typ, self_ty, arm.chan);
+                    let ok = matches!(&cht,
+                        Ty::GenStruct { ctor, args } if ctor == "Channel"
+                            && matches!(args.as_slice(), [Ty::Prim("i64")]));
+                    if !ok && !matches!(cht, Ty::Unknown | Ty::Error) {
+                        self.error(
+                            self.ast.expr_at(arm.chan).span,
+                            format!(
+                                "a `select` arm waits on a `Channel(i64)`; found `{}`",
+                                cht.display(&self.table)
+                            ),
+                        );
+                    }
+                    scope.push(HashMap::new());
+                    scope.last_mut().unwrap().insert(arm.bind.name.clone(), Ty::Prim("i64"));
+                    self.infer_block(scope, typ, self_ty, &arm.body);
+                    scope.pop();
+                }
+                Ty::Unit
+            }
             ExprKind::Region { body, .. } => {
                 self.infer_block(scope, typ, self_ty, body);
                 Ty::Unit
@@ -3491,6 +3514,16 @@ mod tests {
             .find_map(|(i, e)| matches!(e.kind, ExprKind::Await(_)).then_some(ExprId(i as u32)))
             .expect("the await expr");
         assert_eq!(info.type_of(await_e), &Ty::Prim("i64"), "await unwraps Task(i64) to i64");
+    }
+
+    #[test]
+    fn select_rejects_a_non_channel_arm() {
+        // A `select` arm must wait on a `Channel(i64)`; an `i64` is rejected.
+        let (_info, d) = analyze("fn f(c: i64) { select { recv(c) => x { } } }");
+        assert!(
+            d.iter().any(|m| m.message.contains("select") && m.message.contains("Channel(i64)")),
+            "a non-channel select arm must error: {d:?}"
+        );
     }
 
     #[test]

@@ -378,6 +378,13 @@ impl<'a> Printer<'a> {
                 self.expr_inline(*reduction),
                 self.expr_inline(*body)
             ),
+            ExprKind::Select(arms) => {
+                let a: Vec<String> = arms
+                    .iter()
+                    .map(|arm| format!("recv({}) => {} {{ … }}", self.expr_inline(arm.chan), arm.bind.name))
+                    .collect();
+                format!("select {{ {} }}", a.join(" "))
+            }
             ExprKind::Region { name, .. } => format!("region {} {{ ... }}", name.name),
             ExprKind::For { head, els, .. } => {
                 let tail = if els.is_some() { " else { ... }" } else { "" };

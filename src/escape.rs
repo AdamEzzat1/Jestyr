@@ -478,6 +478,26 @@ impl<'a> Checker<'a> {
                 ctx.pop();
                 return;
             }
+            ExprKind::Select(arms) => {
+                // Each arm receives an owned `i64` (a fresh value moved out of the
+                // channel), not a borrow — so the binding can't escape. Walk the
+                // channel expression and the arm body.
+                for arm in arms {
+                    self.walk_expr(ctx, arm.chan, false);
+                    ctx.push();
+                    ctx.bind(&arm.bind.name, false);
+                    self.check_block(ctx, &arm.body, false);
+                    ctx.pop();
+                }
+                if self.deterministic {
+                    self.error(
+                        span,
+                        "`select` waits on channels — its choice depends on the schedule; \
+                         forbidden in a `@deterministic` function.",
+                    );
+                }
+                return;
+            }
             ExprKind::For { head, body, els, region, .. } => {
                 // A region-scoped loop allocates a per-iteration scratch arena.
                 if self.no_alloc && region.is_some() {

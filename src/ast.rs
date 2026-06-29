@@ -181,6 +181,15 @@ pub struct FieldInit {
     pub value: ExprId,
 }
 
+/// One arm of a `select`: `recv(<chan>) => <bind> { <body> }`. When `chan` has a
+/// value ready, it is received into `bind` and `body` runs.
+#[derive(Clone, Debug)]
+pub struct SelectArm {
+    pub chan: ExprId,
+    pub bind: Ident,
+    pub body: Block,
+}
+
 #[derive(Clone, Debug)]
 pub struct MatchArm {
     pub pat: PatId,
@@ -266,6 +275,10 @@ pub enum ExprKind {
     /// (which would reassociate under parallelism) is a compile error. Desugars onto
     /// the `core.par_reduce` engine: bit-identical to serial for any thread schedule.
     ParFor { var: Ident, iter: ExprId, reduction: ExprId, body: ExprId },
+    /// `select { recv(<chan>) => <bind> { <body> } … }` — wait on several channels and
+    /// run the arm of whichever has a value ready (Crystal/Go CSP ergonomics over the
+    /// move-only `Channel(i64)`). Single-consumer, recv-only for now.
+    Select(Vec<SelectArm>),
 
     /// `region r { … }` — a named arena scope (design §4.4). `&[r]T` references
     /// into it are zero-cost; the whole arena is freed at the block's end.

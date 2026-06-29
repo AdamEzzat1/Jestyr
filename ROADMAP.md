@@ -97,7 +97,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | K | Module system v2 | ~98% | MED | M | ✓ | ✓✓ (build/incremental) |
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
-| N | Concurrency polish | ~99% | MED | M | ✓ | — |
+| N | Concurrency polish | ~100% | MED | M | ✓ | — |
 | O | Tooling (fmt / test / doc / LSP) | test-runner ✅, attest ✅, attest --diff ✅; LSP/fmt deferred | LOW | M | ✓✓ | ✓ |
 | P | Self-hosting | plumbing ✅; port open | — | XL | ✓✓ | ✓✓ (the gate) |
 | Q | Parallelism (data-parallel) | ~18% (tier-1 SOACs `par_reduce`/`par_map`/`par_scan` ✅) | MED | L | ✓✓ | ✓✓ (cost model) |
@@ -267,13 +267,26 @@ layer."** Mostly a new pass + cgen tweaks → reasonably isolated.
 from runtime asserts into **static proof obligations** discharged by an SMT backend.
 **Motley:** verifying the compiler's own passes. Long-horizon; do after F/G.
 
-### N. Concurrency polish — ~99% (MED conflict; files: ast, parser, typeck, escape, cgen, printer)
+### N. Concurrency polish — ~100% (MED conflict; files: ast, parser, typeck, escape, cgen, printer)
 **Done:** `concurrent { spawn … }` → pthreads, scoped join; atomics (`__atomic_*`);
 `core.par_binned_sum`; **Mutex** (protected object); **move-only channels**; the
 generalized **`par_reduce`** library; **task results + `await`**; the headline **`par for …
 reduce(r)`** surface with **compile-time non-deterministic-reduction rejection**; **dynamic-N
-spawn**; the **`@deterministic`** schedule-independence contract (below). **Left:** optionally
-`select` (Crystal/Go channel choice); `spawn` of closures.
+spawn**; the **`@deterministic`** schedule-independence contract; **`select`** over channels
+(below). **Left (nice-to-have):** `spawn` of closures; multi-type / send-arm `select`.
+
+**`select` over channels — ✅ DONE (Crystal/Go CSP ergonomics).** `select { recv(ch) => x { … }
+… }` waits on several `Channel(i64)` and runs the arm of whichever has a value ready. New
+`ExprKind::Select` + `SelectArm` threaded through all six files; new `select` keyword, contextual
+`recv`. Lowering: hoist each channel, then spin with an `else if` chain (exactly one arm per
+pass) calling the non-generic `channel_len_i64`/`channel_recv_i64` wrappers added to
+`std/sync.jtr`. Single-consumer, recv-only, `Channel(i64)` for now; forbidden in a
+`@deterministic` function (its choice depends on the schedule).
+- `examples/std/select.jtr` — two spawned producers fill two channels; the main thread drains
+  all four via `select` → `66` (order-independent sum, deterministic). `module.rs`/`main.rs`
+  untouched.
+- Rigor: parser test (`Select` + arms); typeck reject test (a non-`Channel(i64)` arm errors);
+  cgen lowering test (the poll loop + i64 wrappers); a c-oracle `select_demo` (×8, pinned `66`).
 
 **`@deterministic` contract — ✅ DONE (the `@verified` tie-in).** A `@deterministic` function is
 certified **schedule-independent**: the escape checker forbids the raw concurrency primitives

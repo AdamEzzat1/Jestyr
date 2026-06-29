@@ -1,0 +1,41 @@
+// examples/std/select.jtr — `select` over move-only channels (concurrency,
+// workstream N): wait on several channels, take from whichever is ready.
+//
+// Two tasks fill two channels; the main thread then drains all four values with a
+// `select` loop — each `select` runs the arm of whichever channel currently has a
+// value (Crystal/Go CSP ergonomics, here over Jestyr's move-only `Channel(i64)`).
+// The total is an order-independent sum, so the result is deterministic.
+//
+//   jestyrc run examples/std/select.jtr   →   66
+import "sync"
+
+// One producer: send two values into its channel (by move).
+fn fill(read ch: sync.Channel(i64), base: i64) {
+    sync.channel_send(i64, ch, base + 1)
+    sync.channel_send(i64, ch, base + 2)
+}
+
+fn main() -> i32 {
+    var a = sync.channel_make(i64, 8)
+    var b = sync.channel_make(i64, 8)
+    concurrent {
+        spawn fill(a, 10)        // 11, 12
+        spawn fill(b, 20)        // 21, 22
+    }
+
+    // Drain all four values, taking from whichever channel is ready each time.
+    var total: i64 = 0
+    var n: i64 = 0
+    for n < 4 {
+        select {
+            recv(a) => x { total = total + x }
+            recv(b) => y { total = total + y }
+        }
+        n = n + 1
+    }
+    print_int(total as i32)      // 11 + 12 + 21 + 22 = 66
+
+    sync.channel_free(i64, a)
+    sync.channel_free(i64, b)
+    return 0
+}

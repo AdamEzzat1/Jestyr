@@ -950,7 +950,7 @@ impl<'src> Parser<'src> {
             }
             // Block-led expressions in statement position: parse only the block
             // form so a trailing operator cannot extend them.
-            If | Match | Unsafe | Concurrent | Region | For | While | Loop | LBrace => {
+            If | Match | Unsafe | Concurrent | Select | Region | For | While | Loop | LBrace => {
                 Stmt::Expr(self.parse_block_like())
             }
             _ => Stmt::Expr(self.parse_expr()),
@@ -963,6 +963,7 @@ impl<'src> Parser<'src> {
             Match => self.parse_match(),
             Unsafe => self.parse_unsafe(),
             Concurrent => self.parse_concurrent(),
+            Select => self.parse_select(),
             Region => self.parse_region(),
             For => self.parse_for(),
             While | Loop => self.parse_reserved_loop(),
@@ -1242,6 +1243,7 @@ impl<'src> Parser<'src> {
             Concurrent => self.parse_concurrent(),
             Spawn => self.parse_spawn(),
             Await => self.parse_await(),
+            Select => self.parse_select(),
             Region => self.parse_region(),
             For => self.parse_for(),
             While | Loop => self.parse_reserved_loop(),
@@ -1380,6 +1382,35 @@ impl<'src> Parser<'src> {
         let b = self.parse_block();
         let span = start.to(b.span);
         self.ast.expr(ExprKind::Concurrent(b), span)
+    }
+
+    /// `select { recv(<chan>) => <bind> { <body> } … }` — wait on several channels,
+    /// run the arm of whichever has a value ready. `recv` is contextual.
+    fn parse_select(&mut self) -> ExprId {
+        let start = self.cur().span;
+        self.expect(Select, "`select`");
+        self.expect(LBrace, "`{`");
+        let mut arms = Vec::new();
+        while !self.at(RBrace) && !self.at(Eof) {
+            if self.at(TokenKind::Ident) && self.text(self.cur().span) == "recv" {
+                self.bump();
+            } else {
+                self.error(self.cur().span, "expected `recv(<channel>)` to start a `select` arm");
+            }
+            self.expect(LParen, "`(`");
+            let saved = self.no_struct;
+            self.no_struct = false;
+            let chan = self.parse_expr();
+            self.no_struct = saved;
+            self.expect(RParen, "`)`");
+            self.expect(FatArrow, "`=>`");
+            let bind = self.eat_ident("the received-value binding");
+            let body = self.parse_block();
+            arms.push(SelectArm { chan, bind, body });
+        }
+        let end = self.cur().span;
+        self.expect(RBrace, "`}`");
+        self.ast.expr(ExprKind::Select(arms), start.to(end))
     }
 
     /// `spawn <call>` — launch a task. The inner expression is normally a call.
@@ -2382,6 +2413,16 @@ mod tests {
         let has_spawn = ast.exprs.iter().filter(|e| matches!(e.kind, ExprKind::Spawn(_))).count();
         assert!(has_conc, "a concurrent nursery was parsed");
         assert_eq!(has_spawn, 2, "two spawn tasks");
+    }
+
+    #[test]
+    fn parses_select_with_recv_arms() {
+        let ast = parse_ok("fn f() { select { recv(a) => x { g(x) } recv(b) => y { g(y) } } }");
+        let arms = ast.exprs.iter().find_map(|e| match &e.kind {
+            ExprKind::Select(arms) => Some(arms.len()),
+            _ => None,
+        });
+        assert_eq!(arms, Some(2), "select parsed with two recv arms");
     }
 
     #[test]
