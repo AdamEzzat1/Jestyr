@@ -5247,6 +5247,9 @@ mod c_oracle {
                 "9.007199254740996e15", "9.007199254740992e15", "3e3",
                 // parallel reduction == serial (100), then the equality flag
                 "1e2", "1",
+                // `par for … reduce(r)`: sum (92), sum-of-squares (1380), max (15),
+                // min (-7), xor (-8), then the two `== serial` determinism flags
+                "92", "1380", "15", "-7", "-8", "1", "1",
                 // parse_float round-trips (parse then format_float)
                 "1e-1", "3.0000000000000004e-1", "1.234567890123456e15", "1e10",
                 "3.14159265358979e0", "9.007199254740992e15", "5e-324",
@@ -5277,7 +5280,7 @@ mod c_oracle {
         }
         let digest = sha256::hex(all.as_bytes());
         assert_eq!(
-            digest, "886d1b6aa0d4e57af37763903f34bcaff000fcc06929f07d3a4d031cc92af7e3",
+            digest, "3e0cc5c80a6812902812566c8d13ae4720d1c85f04e3058b8a66f5baeeb2d399",
             "numerics output changed — if intentional, re-lock; output was:\n{all}"
         );
     }

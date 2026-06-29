@@ -25,6 +25,20 @@ import "io"
 
 fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
 fn setf(p: *mut f64, i: usize, v: f64) { unsafe { (p + i).* = v } }
+fn seti(p: *mut i64, i: usize, v: i64) { unsafe { (p + i).* = v } }
+
+// Serial reference folds for the `par for` canary section (the oracles a parallel
+// reduction must match bit-for-bit, for any schedule).
+fn serial_sum(read s: []i64) -> i64 {
+    var a: i64 = 0
+    for x in s { a = a + x }
+    return a
+}
+fn serial_sumsq(read s: []i64) -> i64 {
+    var a: i64 = 0
+    for x in s { a = a + x * x }
+    return a
+}
 
 fn uo_f(take r: Result(f64, ParseFloatError), take d: f64) -> f64 {
     match r { ok(v) => v, err(e) => d }
@@ -137,6 +151,35 @@ fn main() -> i32 {
     show(par)                                                    // 100 (== serial)
     io.print_i32(b2i(core.f64_bits(par) == core.f64_bits(ser)))   // 1
     free_ptr(pb)
+
+    // ── `par for … reduce(r)`: the headline parallel-reduction loop, pinned ──
+    // `par for x in xs reduce(r) { body }` desugars onto the deterministic
+    // `core.par_reduce`, so its result is bit-identical to the serial fold for ANY
+    // thread schedule — "parallelism that cannot change your answer." These are i64
+    // reductions (no `printf("%g")`), so pinning their realized values makes a
+    // schedule-dependence break flip the locked digest. 23 mixed-sign elements give an
+    // uneven last chunk across the worker count — the split a wrong reduction trips on.
+    var qb: *mut i64 = alloc(i64, 23)
+    var qi: usize = 0
+    for qi < 23 {
+        seti(qb, qi, (qi as i64) - 7)            // -7, -6, …, 15
+        qi = qi + 1
+    }
+    let qs: []i64 = slice(i64, qb, 23)
+    let psum: i64 = par for x in qs reduce(core.sum_reduction()) { x }
+    let pssq: i64 = par for x in qs reduce(core.sum_reduction()) { x * x }
+    let pmax: i64 = par for x in qs reduce(core.max_reduction()) { x }
+    let pmin: i64 = par for x in qs reduce(core.min_reduction()) { x }
+    let pxor: i64 = par for x in qs reduce(core.xor_reduction()) { x }
+    io.print_i32(psum as i32)                                    // 92
+    io.print_i32(pssq as i32)                                    // 1380
+    io.print_i32(pmax as i32)                                    // 15
+    io.print_i32(pmin as i32)                                    // -7
+    io.print_i32(pxor as i32)                                    // (pinned by value)
+    // The determinism guarantee, demonstrated: bit-identical to the serial folds.
+    io.print_i32(b2i(psum == serial_sum(qs)))                    // 1
+    io.print_i32(b2i(pssq == serial_sumsq(qs)))                  // 1
+    free_ptr(qb)
 
     // ── parse_float round-trips (parse THEN format — the strongest pin) ──
     show_parse("0.1")

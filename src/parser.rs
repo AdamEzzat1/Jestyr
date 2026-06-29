@@ -1886,6 +1886,23 @@ mod tests {
         ast
     }
 
+    /// `par` is a **contextual** keyword — special only immediately before `for`, so
+    /// it must remain usable as an ordinary identifier. (A hard `par` keyword regressed
+    /// the determinism canary, whose pre-existing `let par = …` stopped parsing — a
+    /// break visible only under `--features c-oracle`; this guards it toolchain-free.)
+    /// And `par for …` must still parse to a `ParFor`.
+    #[test]
+    fn par_is_a_contextual_keyword() {
+        // `par` as an ordinary identifier (parameter name + use).
+        parse_ok("fn g(par: i32) -> i32 { return par }");
+        // `par for …` still parses to a ParFor expression.
+        let ast = parse_ok("fn h(xs: []i64) -> i64 { par for x in xs reduce(sum_reduction()) { x } }");
+        assert!(
+            ast.exprs.iter().any(|e| matches!(e.kind, ExprKind::ParFor { .. })),
+            "`par for` must still parse to a ParFor"
+        );
+    }
+
     #[test]
     fn parses_region_block_and_region_ref() {
         let ast = parse_ok("fn f() { region r { var a: &[r]i32 = region_alloc(r, i32, 1) } }");
