@@ -5132,6 +5132,15 @@ mod c_oracle {
         }
     }
     #[test]
+    fn dynamic_spawn_demo() {
+        // Dynamic-N spawn on real threads: a runtime number of tasks (10, then 64),
+        // each writing a disjoint slot, joined at the brace. Disjoint writes → the
+        // summed result is deterministic. Repeated to shake out races at 64 threads.
+        for _ in 0..8 {
+            assert_eq!(toks("examples/std/dynamic_spawn.jtr"), ["285", "85344"], "dynamic spawn result wrong");
+        }
+    }
+    #[test]
     fn par_for_demo() {
         // The headline surface on real threads: a parallel sum-of-squares of 1..=13
         // (819), a bit-identical-to-serial flag (1), and a parallel max (13). The

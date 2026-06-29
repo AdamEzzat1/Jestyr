@@ -97,7 +97,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | K | Module system v2 | ~98% | MED | M | ✓ | ✓✓ (build/incremental) |
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
-| N | Concurrency polish | ~95% | MED | M | ✓ | — |
+| N | Concurrency polish | ~98% | MED | M | ✓ | — |
 | O | Tooling (fmt / test / doc / LSP) | test-runner ✅, attest ✅, attest --diff ✅; LSP/fmt deferred | LOW | M | ✓✓ | ✓ |
 | P | Self-hosting | plumbing ✅; port open | — | XL | ✓✓ | ✓✓ (the gate) |
 | Q | Parallelism (data-parallel) | ~18% (tier-1 SOACs `par_reduce`/`par_map`/`par_scan` ✅) | MED | L | ✓✓ | ✓✓ (cost model) |
@@ -267,13 +267,26 @@ layer."** Mostly a new pass + cgen tweaks → reasonably isolated.
 from runtime asserts into **static proof obligations** discharged by an SMT backend.
 **Motley:** verifying the compiler's own passes. Long-horizon; do after F/G.
 
-### N. Concurrency polish — ~95% (MED conflict; files: ast, parser, typeck, escape, cgen, printer)
+### N. Concurrency polish — ~98% (MED conflict; files: ast, parser, typeck, escape, cgen, printer)
 **Done:** `concurrent { spawn … }` → pthreads, scoped join; atomics (`__atomic_*`);
 `core.par_binned_sum`; **Mutex** (protected object); **move-only channels**; the
 generalized **`par_reduce`** library; **task results + `await`**; the headline **`par for …
-reduce(r)`** surface with **compile-time non-deterministic-reduction rejection** (below).
-**Left:** `spawn` of closures; dynamic-N spawn (the shared `emit_concurrent` change that also
-unblocks Q's schedule-split); optionally `select` and a `@deterministic` region.
+reduce(r)`** surface with **compile-time non-deterministic-reduction rejection**; **dynamic-N
+spawn** (below). **Left:** `spawn` of closures; optionally `select` and a `@deterministic` region.
+
+**Dynamic-N spawn — ✅ DONE (increment 6, the shared `emit_concurrent` change).** A `spawn`
+*inside a loop* now launches a **runtime** number of tasks: the `concurrent { … }` nursery
+collects them on a **growable handle array** (`_dt`/`_da`) and joins them all at the brace —
+structured concurrency with a dynamic worker count, the building block Q's `with
+schedule(threads, chunk)` split needs. Each task's arg box is heap-allocated (a stable address
+the thread reads, since the arrays may `realloc`-move) and freed after its join. Coexists with
+the fixed numbered-handle path (top-level `spawn` / `let h = spawn`); a spawn nested in a loop
+*or* an `if` triggers the dynamic path. `module.rs`/`main.rs` untouched.
+- `examples/std/dynamic_spawn.jtr` — a runtime worker count (10, then 64) each writing a
+  disjoint slot, summed deterministically → `285`, `85344`.
+- Rigor: cgen lowering test (growable array + heap arg boxes + join-and-free loop); a
+  `--features c-oracle` real-thread `dynamic_spawn_demo` (×8 at up to 64 threads, pinned).
+  The existing escape data-race rule still guards each spawn (no shared `mut` slice).
 
 **`par for … reduce(r)` — ✅ DONE (increment 5, THE headline; shared surface with Q).**
 `par for x in xs reduce(r) { body }` maps each element through `body` and reduces the results

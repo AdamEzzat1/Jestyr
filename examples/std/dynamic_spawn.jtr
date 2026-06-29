@@ -1,0 +1,42 @@
+// examples/std/dynamic_spawn.jtr — dynamic-N spawn (concurrency, workstream N).
+//
+// A `spawn` *inside a loop* launches a number of tasks chosen at RUNTIME (not pinned
+// at compile time). The `concurrent { … }` nursery collects every spawned thread on a
+// growable handle array and joins them all at the closing brace — structured
+// concurrency with a dynamic worker count. Each task writes a DISJOINT slot of the
+// buffer (race-free by construction), so the summed result is deterministic.
+//
+//   jestyrc run examples/std/dynamic_spawn.jtr   →   285, 85344
+//
+// This is the building block the parallelism workstream's tunable `with
+// schedule(threads, chunk)` split needs: a runtime number of workers, each handling
+// a chunk.
+
+// One task: write i² into its own slot.
+fn square_into(buf: *mut i64, i: i64) { unsafe { (buf + (i as usize)).* = i * i } }
+
+// Spawn `n` tasks (n chosen at runtime), one per index, then sum the slots.
+fn sum_squares_par(n: i64) -> i64 {
+    var buf: *mut i64 = alloc(i64, n as usize)
+    concurrent {
+        var w: i64 = 0
+        for w < n {
+            spawn square_into(buf, w)   // dynamic-N: a spawn in a loop
+            w = w + 1
+        }
+    }
+    var total: i64 = 0
+    var i: usize = 0
+    for i < (n as usize) {
+        unsafe { total = total + (buf + i).* }
+        i = i + 1
+    }
+    free_ptr(buf)
+    return total
+}
+
+fn main() -> i32 {
+    print_int(sum_squares_par(10) as i32)   // Σ i² for i in 0..10 = 285
+    print_int(sum_squares_par(64) as i32)   // Σ i² for i in 0..64 = 85344
+    return 0
+}

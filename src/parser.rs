@@ -1175,6 +1175,12 @@ impl<'src> Parser<'src> {
                 self.ast.expr(ExprKind::SelfType, span)
             }
             TokenKind::Ident => {
+                // `par for …` — a contextual keyword: `par` only introduces a parallel
+                // reduction loop when immediately followed by `for`, so it stays a
+                // valid ordinary identifier everywhere else.
+                if self.text(self.cur().span) == "par" && self.peek_kind(1) == For {
+                    return self.parse_par_for();
+                }
                 let t = self.bump();
                 let id = self.ident(t);
                 if self.at(LBrace) && !self.no_struct {
@@ -1236,7 +1242,6 @@ impl<'src> Parser<'src> {
             Concurrent => self.parse_concurrent(),
             Spawn => self.parse_spawn(),
             Await => self.parse_await(),
-            Par => self.parse_par_for(),
             Region => self.parse_region(),
             For => self.parse_for(),
             While | Loop => self.parse_reserved_loop(),
@@ -1392,7 +1397,7 @@ impl<'src> Parser<'src> {
     /// built-in — enforced by typeck). `reduce` is a contextual keyword (like `step`).
     fn parse_par_for(&mut self) -> ExprId {
         let start = self.cur().span;
-        self.expect(Par, "`par`");
+        self.bump(); // the contextual `par` keyword (an `Ident` token)
         self.expect(For, "`for` after `par`");
         let var = self.eat_ident("the `par for` loop variable");
         self.expect(In, "`in`");

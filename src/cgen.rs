@@ -211,6 +211,7 @@ fn emit_program(
         dyn_guard: HashSet::new(),
         spawn_sites: Vec::new(),
         task_handles: HashMap::new(),
+        dyn_spawn_active: false,
         slice_instances: Vec::new(),
         array_instances: Vec::new(),
         genref_instances: Vec::new(),
@@ -460,6 +461,10 @@ struct Cgen<'a> {
     /// task handles (`let h = spawn …`) live in the current `concurrent` scope,
     /// keyed by binding name — consumed by `await`. Saved/restored across nesting.
     task_handles: HashMap<String, TaskHandle>,
+    /// true while emitting the body of a `concurrent` block that has dynamic-N spawns
+    /// (a `spawn` inside a loop): a bare `spawn` then pushes onto the growable handle
+    /// array `_dt`/`_da` rather than getting a fixed numbered handle.
+    dyn_spawn_active: bool,
     /// distinct slice element types, for emitting one `JestyrSlice_<T>` per type.
     slice_instances: Vec<Ty>,
     /// Every distinct fixed-size array type `[N]T` the program uses (one
@@ -2394,6 +2399,10 @@ impl<'a> Cgen<'a> {
                     ExprKind::For { label, head, region, body, els } => {
                         self.emit_for(label.as_ref(), head, region.as_ref(), body, els.as_ref())
                     }
+                    // A bare `spawn f(args)` reached *inside* a `concurrent` block's
+                    // dynamic region (e.g. a spawn-in-a-loop): push it onto the growable
+                    // handle array rather than erroring.
+                    ExprKind::Spawn(inner) if self.dyn_spawn_active => self.emit_dyn_spawn(*inner),
                     _ => {
                         let v = self.emit_expr(*e);
                         self.line(format!("{v};"));
@@ -5931,17 +5940,61 @@ impl<'a> Cgen<'a> {
         self.line(format!("pthread_create(&_jt{h}, NULL, jestyr_task_{id}, &_ja{h});"));
     }
 
+    /// Push one dynamic-N spawn onto the growable handle array `_dt`/`_da` (declared
+    /// by `emit_concurrent`). Each task's arg box is heap-allocated (a stable address
+    /// the thread reads — the arrays may `realloc`-move, but the boxes don't); the box
+    /// is freed after its `pthread_join`. Used for a `spawn` inside a loop, where the
+    /// worker count is a runtime value.
+    fn emit_dyn_spawn(&mut self, inner: ExprId) {
+        let Some(site) = self.spawn_site(inner) else {
+            self.diag(self.ast.expr_at(inner).span, "`spawn` expects a direct function call");
+            return;
+        };
+        let id = site.call_id.0;
+        let vals: Vec<String> = site.args.iter().map(|a| self.emit_expr(*a)).collect();
+        let init = if vals.is_empty() { "{0}".to_string() } else { format!("{{ {} }}", vals.join(", ")) };
+        self.line("if (_dn == _dc) { _dc = _dc ? _dc * 2 : 8; _dt = (pthread_t*)realloc(_dt, _dc * sizeof(pthread_t)); _da = (void**)realloc(_da, _dc * sizeof(void*)); }");
+        self.line(format!("struct _jsp_{id}* _dap = (struct _jsp_{id}*)malloc(sizeof(struct _jsp_{id})); *_dap = (struct _jsp_{id}){init};"));
+        self.line(format!("_da[_dn] = _dap; pthread_create(&_dt[_dn], NULL, jestyr_task_{id}, _dap); _dn++;"));
+    }
+
+    /// Does `stmt` contain a `spawn` *not* at the concurrent block's top level (i.e.
+    /// nested in a loop/if) — a dynamic-N spawn needing the growable handle array?
+    /// Top-level fixed forms (a bare `spawn` statement, a `let h = spawn`) are handled
+    /// by numbered handles and don't count.
+    fn stmt_has_nested_spawn(&self, stmt: &Stmt) -> bool {
+        let e = match stmt {
+            Stmt::Expr(e) | Stmt::Let { init: Some(e), .. } => *e,
+            _ => return false,
+        };
+        if matches!(self.ast.expr_at(e).kind, ExprKind::Spawn(_)) {
+            return false; // a top-level fixed spawn
+        }
+        let mut v = Vec::new();
+        self.find_spawns_expr(e, &mut v);
+        !v.is_empty()
+    }
+
     /// Lower a `concurrent { … }` nursery: each `spawn` creates a thread; the scope
     /// joins them all before it exits (structured concurrency). A `let h = spawn …`
     /// binds an awaitable task handle whose result is read back by `await h`; such a
     /// handle carries a `_jd` joined-flag so an `await` and the brace's safety-net
-    /// join don't double-join. Bare `spawn` statements stay fire-and-forget.
+    /// join don't double-join. Bare `spawn` statements stay fire-and-forget. A `spawn`
+    /// *inside a loop* is dynamic-N: it pushes onto a growable handle array joined at
+    /// the brace (so the worker count can be a runtime value).
     fn emit_concurrent(&mut self, block: &Block) {
         let ast = self.ast;
         let saved_handles = std::mem::take(&mut self.task_handles);
+        let saved_dyn = self.dyn_spawn_active;
         self.line("{");
         self.depth += 1;
         let mut handles = 0usize;
+        // Declare the growable dynamic-spawn array iff some statement spawns in a loop.
+        let needs_dyn = block.stmts.iter().any(|s| self.stmt_has_nested_spawn(s));
+        if needs_dyn {
+            self.line("pthread_t* _dt = NULL; void** _da = NULL; size_t _dn = 0, _dc = 0;");
+        }
+        self.dyn_spawn_active = needs_dyn;
         // (handle index, guarded?) — let-bound handles guard the brace-join with
         // their `_jd` flag (an `await` may have joined already); bare spawns don't.
         let mut joins: Vec<(usize, bool)> = Vec::new();
@@ -5987,9 +6040,16 @@ impl<'a> Cgen<'a> {
                 self.line(format!("pthread_join(_jt{h}, NULL);"));
             }
         }
+        // Join every dynamically-spawned task (any order — structured join), free each
+        // task's arg box, then the arrays.
+        if needs_dyn {
+            self.line("for (size_t _dk = 0; _dk < _dn; _dk++) { pthread_join(_dt[_dk], NULL); free(_da[_dk]); }");
+            self.line("free(_dt); free(_da);");
+        }
         self.depth -= 1;
         self.line("}");
         self.task_handles = saved_handles;
+        self.dyn_spawn_active = saved_dyn;
     }
 
     /// Lower a `for` loop (see `docs/loops-spec.md`). The header selects the shape;
@@ -8499,6 +8559,27 @@ mod tests {
         );
         assert!(c.contains("_ja0.ret"), "await reads the stored result: {c}");
         assert!(c.contains("if (!_jd0) pthread_join(_jt0, NULL);"), "brace-join is guarded: {c}");
+    }
+
+    #[test]
+    fn lowers_dynamic_spawn_in_a_loop_to_a_growable_handle_array() {
+        // A `spawn` inside a loop is dynamic-N: it pushes onto a growable `_dt`/`_da`
+        // array (heap-allocated arg boxes for stable addresses), all joined + freed at
+        // the brace — the worker count is a runtime value.
+        let src = "fn w(p: *mut i64, i: i64) { unsafe { (p + (i as usize)).* = i } } \
+                   fn main() -> i32 { var b: *mut i64 = alloc(i64, 4) \
+                       concurrent { var k: i64 = 0 for k < 4 { spawn w(b, k) k = k + 1 } } \
+                       free_ptr(b) return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("pthread_t* _dt = NULL"), "declares the growable handle array: {c}");
+        assert!(c.contains("realloc(_dt"), "grows the array as tasks are spawned: {c}");
+        assert!(c.contains("malloc(sizeof(struct _jsp_"), "heap-allocates each arg box: {c}");
+        assert!(c.contains("pthread_create(&_dt[_dn]"), "each spawn pushes a thread: {c}");
+        assert!(
+            c.contains("for (size_t _dk = 0; _dk < _dn; _dk++) { pthread_join(_dt[_dk], NULL); free(_da[_dk]); }"),
+            "the brace joins every dynamic task and frees its box: {c}"
+        );
     }
 
     #[test]
