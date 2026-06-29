@@ -1044,6 +1044,9 @@ impl<'a> TypeChecker<'a> {
                 if self.is_generic_enum(&ctor.name) {
                     Ty::GenEnum { ctor: self.canon_type_cur(&ctor.name), args: aty }
                 } else {
+                    // Generic struct (comptime-fn form): ctor left bare — collidable
+                    // generic structs are a deferred follow-up (the AST-walking
+                    // instance collection would need per-item module context).
                     Ty::GenStruct { ctor: ctor.name.clone(), args: aty }
                 }
             }
