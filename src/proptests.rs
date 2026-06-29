@@ -3496,6 +3496,143 @@ mod core_props {
     }
 }
 
+/// **Workstream Q (data parallelism), tier 1 — `parallel.par_map` / `par_scan`.**
+/// The other two SOACs beside `core.par_reduce`. These pin the determinism guarantee
+/// for each: `par_map` is embarrassingly parallel (output[i] depends only on input[i]),
+/// so any split is identical to serial *by construction*; `par_scan` is the subtle one
+/// — a left-to-right prefix scan that parallelizes via the two-pass algorithm, whose
+/// split-independence rests entirely on the operator being **associative**. Both
+/// mirrors are toolchain-free (the gcc/thread proof is `c_oracle::par_soac_demo`).
+#[cfg(test)]
+mod parallel_props {
+    use proptest::prelude::*;
+
+    /// The four associative built-in ops, with their identities (matching
+    /// `parallel.jtr`): 0 sum/xor, i64::MAX min, i64::MIN max.
+    fn op(tag: u8, a: i64, b: i64) -> i64 {
+        match tag {
+            1 => a.min(b),
+            2 => a.max(b),
+            3 => a ^ b,
+            _ => a.wrapping_add(b),
+        }
+    }
+    fn identity(tag: u8) -> i64 {
+        match tag {
+            1 => i64::MAX,
+            2 => i64::MIN,
+            _ => 0,
+        }
+    }
+
+    /// Serial inclusive scan: `out[i] = identity ⊕ s[0] ⊕ … ⊕ s[i]` (the oracle).
+    fn serial_scan(xs: &[i64], tag: u8) -> Vec<i64> {
+        let mut run = identity(tag);
+        let mut out = Vec::with_capacity(xs.len());
+        for &x in xs {
+            run = op(tag, run, x);
+            out.push(run);
+        }
+        out
+    }
+
+    /// The two-pass parallel scan, mirroring `parallel.par_scan` over an *arbitrary*
+    /// partition: (1) reduce each chunk to its total; (2) exclusive-prefix the totals
+    /// into per-chunk seeds; (3) scan each chunk seeded with its prefix.
+    fn two_pass_scan(xs: &[i64], bounds: &[usize], tag: u8) -> Vec<i64> {
+        // Pass 1: chunk totals.
+        let mut totals = Vec::new();
+        for w in bounds.windows(2) {
+            let mut acc = identity(tag);
+            for &x in &xs[w[0]..w[1]] {
+                acc = op(tag, acc, x);
+            }
+            totals.push(acc);
+        }
+        // Exclusive prefix → seeds.
+        let mut seeds = Vec::with_capacity(totals.len());
+        let mut pre = identity(tag);
+        for &t in &totals {
+            seeds.push(pre);
+            pre = op(tag, pre, t);
+        }
+        // Pass 2: scan each chunk seeded with its prefix.
+        let mut out = vec![0i64; xs.len()];
+        for (ci, w) in bounds.windows(2).enumerate() {
+            let mut run = seeds[ci];
+            for i in w[0]..w[1] {
+                run = op(tag, run, xs[i]);
+                out[i] = run;
+            }
+        }
+        out
+    }
+
+    /// Build an arbitrary ordered partition of `0..len` from cut points.
+    fn partition(cuts: &[usize], len: usize) -> Vec<usize> {
+        let mut b: Vec<usize> = cuts.iter().map(|&c| c.min(len)).collect();
+        b.push(0);
+        b.push(len);
+        b.sort_unstable();
+        b.dedup();
+        b
+    }
+
+    proptest! {
+        /// **par_scan determinism:** the two-pass chunked scan equals the serial
+        /// inclusive scan for *every* partition and every associative built-in op —
+        /// the bit-identical-across-worker-counts guarantee. This holds only because
+        /// the op is associative; it is why a non-associative float `+` scan is not
+        /// offered. (Teeth: a non-associative op — e.g. saturating-then-wrapping mix —
+        /// breaks this immediately.)
+        #[test]
+        fn par_scan_is_split_independent(
+            xs in proptest::collection::vec(any::<i64>(), 0..96),
+            cuts in proptest::collection::vec(0usize..96, 0..6),
+            tag in 0u8..4,
+        ) {
+            let bounds = partition(&cuts, xs.len());
+            prop_assert_eq!(serial_scan(&xs, tag), two_pass_scan(&xs, &bounds, tag));
+        }
+
+        /// **par_map determinism:** a chunked element-wise map equals the whole-slice
+        /// map for any partition — trivially, since each output element depends only on
+        /// its own input. (`f(x) = x*x` as a representative pure map.)
+        #[test]
+        fn par_map_is_split_independent(
+            xs in proptest::collection::vec(-3_000_000_000i64..3_000_000_000, 0..96),
+            cuts in proptest::collection::vec(0usize..96, 0..6),
+        ) {
+            let f = |x: i64| x.wrapping_mul(x);
+            let whole: Vec<i64> = xs.iter().map(|&x| f(x)).collect();
+            let bounds = partition(&cuts, xs.len());
+            let mut chunked = vec![0i64; xs.len()];
+            for w in bounds.windows(2) {
+                for i in w[0]..w[1] {
+                    chunked[i] = f(xs[i]);
+                }
+            }
+            prop_assert_eq!(whole, chunked);
+        }
+    }
+}
+
+/// **Workstream Q — `examples/std/parallel.jtr` + `par_soac.jtr` compile clean.**
+/// Toolchain-free guard (no gcc): the SOAC module and its demo load, type-check, and
+/// pass the ownership/escape checker — in particular the spawned workers (a `read`
+/// slice + raw `*mut i64` + an `fn` pointer) are accepted while the disjoint-region
+/// writes stay race-free. The end-to-end thread run is `c_oracle::par_soac_demo`.
+#[cfg(test)]
+#[test]
+fn par_soac_example_compiles_clean() {
+    let prog = crate::module::load("examples/std/par_soac.jtr");
+    assert!(!prog.diags.iter().any(|d| d.is_error()), "load errors: {:?}", prog.diags);
+    let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+    assert!(!td.iter().any(|d| d.is_error()), "typeck errors: {:?}", td);
+    let ed = crate::escape::check(&prog.ast, &info);
+    assert!(!ed.iter().any(|d| d.is_error()), "escape errors: {:?}", ed);
+}
+
 /// Array *list* literals `[e0, e1, …]` — the lookup-table enabler (TESTING.md §5,
 /// per-feature unit layer). The repeat form `[v; N]` already existed; these pin the
 /// list form, in particular that a `const` table lowers to a C **brace initializer**
@@ -4967,6 +5104,21 @@ mod c_oracle {
             toks("examples/std/par_reduce_int.jtr"),
             ["153", "1", "17", "1", "1", "1", "1", "1"]
         );
+    }
+    #[test]
+    fn par_soac_demo() {
+        // Workstream Q tier 1: par_map + par_scan on real OS threads. Two maps and two
+        // scans (sum + max, general API) plus the par_scan_sum wrapper all match their
+        // serial oracle bit-for-bit over 1003 mixed-sign values with an uneven last
+        // chunk (five 1s), then the prefix sum of 1..=1000 ends at 500500. Repeated to
+        // shake out any thread race: every token must be identical each run.
+        for _ in 0..8 {
+            assert_eq!(
+                toks("examples/std/par_soac.jtr"),
+                ["1", "1", "1", "1", "1", "500500"],
+                "a parallel SOAC diverged from serial"
+            );
+        }
     }
     #[test]
     fn mutex_demo() {

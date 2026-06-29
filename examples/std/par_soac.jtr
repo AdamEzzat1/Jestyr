@@ -1,0 +1,111 @@
+// examples/std/par_soac.jtr — tier-1 data-parallel SOACs: `par_map` + `par_scan`.
+//
+// Builds on `core.par_reduce` (the deterministic reduce). `par_map` applies a function
+// to every element across four workers (disjoint output regions, no merge); `par_scan`
+// computes an inclusive prefix scan via the two-pass algorithm. Both are bit-identical
+// to their serial oracle for any split — `par_map` by construction, `par_scan` because
+// the reduction operator is associative. We check map (with two different functions)
+// and scan (with sum and max), plus pin the prefix-sum total of 1..=1000.
+//
+//   jestyrc run examples/std/par_soac.jtr   →   1 1 1 1 1 500500
+import "parallel"
+import "io"
+
+fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
+fn seti(p: *mut i64, i: usize, v: i64) { unsafe { (p + i).* = v } }
+fn geti(read p: *mut i64, i: usize) -> i64 { unsafe { return (p + i).* } }
+
+fn dbl(x: i64) -> i64 { return x + x }
+fn sq(x: i64) -> i64 { return x * x }
+
+// Local associative ops for the general `par_scan` API (same-module `&` address-of).
+fn add2(a: i64, b: i64) -> i64 { return a + b }
+fn max2(a: i64, b: i64) -> i64 { if a > b { return a } return b }
+
+// 1 iff the wrapper `par_scan_sum` matches the serial sum-scan on every element.
+fn wrap_sum_ok(read s: []i64, n: usize) -> i32 {
+    var a: *mut i64 = alloc(i64, n)
+    var b: *mut i64 = alloc(i64, n)
+    parallel.serial_scan(s, a, 0, &add2)
+    parallel.par_scan_sum(s, b)
+    var ok: bool = true
+    var i: usize = 0
+    for i < n {
+        if geti(a, i) != geti(b, i) { ok = false }
+        i = i + 1
+    }
+    free_ptr(a)
+    free_ptr(b)
+    return b2i(ok)
+}
+
+// 1 iff par_map(f) matches serial_map(f) on every element of an n-element input.
+fn map_ok(read s: []i64, n: usize, f: fn(i64) -> i64) -> i32 {
+    var a: *mut i64 = alloc(i64, n)
+    var b: *mut i64 = alloc(i64, n)
+    parallel.serial_map(s, a, f)
+    parallel.par_map(s, b, f)
+    var ok: bool = true
+    var i: usize = 0
+    for i < n {
+        if geti(a, i) != geti(b, i) { ok = false }
+        i = i + 1
+    }
+    free_ptr(a)
+    free_ptr(b)
+    return b2i(ok)
+}
+
+// 1 iff par_scan matches serial_scan on every element, for an associative `op`.
+fn scan_ok(read s: []i64, n: usize, identity: i64, op: fn(i64, i64) -> i64) -> i32 {
+    var a: *mut i64 = alloc(i64, n)
+    var b: *mut i64 = alloc(i64, n)
+    parallel.serial_scan(s, a, identity, op)
+    parallel.par_scan(s, b, identity, op)
+    var ok: bool = true
+    var i: usize = 0
+    for i < n {
+        if geti(a, i) != geti(b, i) { ok = false }
+        i = i + 1
+    }
+    free_ptr(a)
+    free_ptr(b)
+    return b2i(ok)
+}
+
+fn main() -> i32 {
+    // 1003 mixed-sign values: n not divisible by 4 (uneven last chunk) — the case a
+    // split-dependent SOAC would get wrong.
+    let n: usize = 1003
+    var src: *mut i64 = alloc(i64, n)
+    var i: usize = 0
+    for i < n {
+        seti(src, i, (i as i64) * 7 - 1500)
+        i = i + 1
+    }
+    let s: []i64 = slice(i64, src, n)
+
+    io.print_i32(map_ok(s, n, &dbl))                       // 1  (par_map vs serial)
+    io.print_i32(map_ok(s, n, &sq))                        // 1  (a second map fn)
+    io.print_i32(scan_ok(s, n, 0, &add2))                  // 1  (sum-scan, general API)
+    io.print_i32(scan_ok(s, n, (0 - 9223372036854775807) - 1, &max2))  // 1 (max-scan)
+    io.print_i32(wrap_sum_ok(s, n))                        // 1  (par_scan_sum wrapper)
+    free_ptr(src)
+
+    // Pin a concrete prefix-sum: inclusive scan of 1..=1000 ends at 500500 (the last
+    // element is the full triangular number).
+    let m: usize = 1000
+    var ones: *mut i64 = alloc(i64, m)
+    var j: usize = 0
+    for j < m {
+        seti(ones, j, (j as i64) + 1)
+        j = j + 1
+    }
+    let t: []i64 = slice(i64, ones, m)
+    var pre: *mut i64 = alloc(i64, m)
+    parallel.par_scan_sum(t, pre)
+    io.print_i32(geti(pre, m - 1) as i32)                  // 500500 (fits in i32)
+    free_ptr(pre)
+    free_ptr(ones)
+    return 0
+}

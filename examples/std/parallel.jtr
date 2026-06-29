@@ -1,0 +1,168 @@
+// examples/std/parallel.jtr — data-parallel SOACs, tier 1 (cont.): `par_map` and
+// `par_scan`, the two workhorse SOACs beside the deterministic reduce `core` ships.
+//
+// `core.par_reduce` proved the *reduce* SOAC (fold a slice to one value, bit-identical
+// to serial for any split). This module adds the other two, in the same library tier —
+// NO compiler change, reusing `concurrent`/`spawn`:
+//
+//   • par_map   — apply `fn(i64) -> i64` to every element, writing DISJOINT output
+//                 regions. Embarrassingly parallel: output[i] depends only on input[i],
+//                 so there is no merge and the result is identical to serial *by
+//                 construction*, for any split.
+//   • par_scan  — inclusive prefix scan under an ASSOCIATIVE operator, via the classic
+//                 TWO-PASS algorithm (reduce each chunk → exclusive prefix of the
+//                 chunk-totals → re-scan each chunk seeded with its prefix). Bit-
+//                 identical to the serial scan for any worker count *because the
+//                 operator is associative* — `(a⊕b)⊕c == a⊕(b⊕c)` is what lets the
+//                 stream be regrouped into chunks without changing the answer. A non-
+//                 associative reduction (naive float `+`) would NOT be schedule-
+//                 independent and is deliberately not offered.
+//
+// `par_scan` takes the associative op + its identity directly (rather than `core`'s
+// `Reduction`, whose fields are module-private) — the same associativity precondition
+// `core.Reduction` documents. The four built-in ops are provided, with `par_scan_*`
+// convenience wrappers; a custom associative op works via the general `par_scan`.
+//
+// Both partition into four chunks of disjoint memory — race-free, no atomics. The
+// worker count does not affect the result (the determinism guarantee); making it a
+// tunable schedule is the later `with schedule(...)` increment.
+//
+//   jestyrc run examples/std/par_soac.jtr   →   1 1 1 1 1 1 500500
+
+// ── Built-in associative operators (identity in each `par_scan_*` wrapper) ─────
+pub fn op_add(a: i64, b: i64) -> i64 { return a + b }
+pub fn op_min(a: i64, b: i64) -> i64 { if a < b { return a } return b }
+pub fn op_max(a: i64, b: i64) -> i64 { if a > b { return a } return b }
+pub fn op_xor(a: i64, b: i64) -> i64 { return a ^ b }
+
+// ── par_map — embarrassingly parallel element-wise map ────────────────────────
+
+// One worker: map its chunk into the matching region of the output. `dst` points at
+// the region for THIS chunk (no other worker touches it), so the writes are race-free
+// and there is nothing to merge.
+fn par_map_worker(read src: []i64, dst: *mut i64, f: fn(i64) -> i64) {
+    var i: usize = 0
+    for i < src.len {
+        unsafe { (dst + i).* = f(src[i]) }
+        i = i + 1
+    }
+}
+
+// Serial reference map — the in-program oracle.
+pub fn serial_map(read s: []i64, dst: *mut i64, f: fn(i64) -> i64) {
+    var i: usize = 0
+    for i < s.len {
+        unsafe { (dst + i).* = f(s[i]) }
+        i = i + 1
+    }
+}
+
+// Parallel map: split `s` across four workers, each writing the output region aligned
+// with its input chunk. `dst` must hold `s.len` elements. Result is identical to
+// `serial_map(s, dst, f)` for any split (each output element is independent).
+pub fn par_map(read s: []i64, dst: *mut i64, f: fn(i64) -> i64) {
+    let n: usize = s.len
+    let q: usize = n / 4
+    let c0: []i64 = slice(i64, s.ptr + 0, q)
+    let c1: []i64 = slice(i64, s.ptr + q, q)
+    let c2: []i64 = slice(i64, s.ptr + (q + q), q)
+    let c3: []i64 = slice(i64, s.ptr + (q + q + q), n - (q + q + q))
+    concurrent {
+        spawn par_map_worker(c0, dst + 0, f)
+        spawn par_map_worker(c1, dst + q, f)
+        spawn par_map_worker(c2, dst + (q + q), f)
+        spawn par_map_worker(c3, dst + (q + q + q), f)
+    }
+}
+
+// ── par_scan — deterministic inclusive prefix scan (two-pass) ──────────────────
+
+// Pass 1: reduce `chunk` to its single total (fold from `ident` with `op`), writing it
+// to `slot` — its own disjoint cell.
+fn scan_total_worker(read chunk: []i64, slot: *mut i64, ident: i64, op: fn(i64, i64) -> i64) {
+    var acc: i64 = ident
+    for x in chunk { acc = op(acc, x) }
+    unsafe { slot.* = acc }
+}
+
+// Pass 2: inclusive scan of `chunk` seeded with `seed` (the prefix of all earlier
+// chunks), writing the running value to each position of `dst` — this chunk's region.
+fn scan_emit_worker(read chunk: []i64, dst: *mut i64, seed: i64, op: fn(i64, i64) -> i64) {
+    var run: i64 = seed
+    var i: usize = 0
+    for i < chunk.len {
+        run = op(run, chunk[i])
+        unsafe { (dst + i).* = run }
+        i = i + 1
+    }
+}
+
+// Serial reference inclusive scan: `dst[i] = identity ⊕ s[0] ⊕ … ⊕ s[i]`.
+pub fn serial_scan(read s: []i64, dst: *mut i64, identity: i64, op: fn(i64, i64) -> i64) {
+    var run: i64 = identity
+    var i: usize = 0
+    for i < s.len {
+        run = op(run, s[i])
+        unsafe { (dst + i).* = run }
+        i = i + 1
+    }
+}
+
+// Parallel inclusive prefix scan. `dst` must hold `s.len` elements. `op` MUST be
+// associative with unit `identity`; then the result is bit-identical to
+// `serial_scan(s, dst, identity, op)` for any worker count.
+//
+// Two passes with a tiny sequential middle: (1) each worker reduces its chunk to a
+// total; (2) the four totals are exclusive-prefixed into per-chunk seeds (a 3-step
+// fold — the only sequential part, constant work); (3) each worker scans its chunk
+// seeded with that prefix. Associativity makes the seeds equal the true prefix at each
+// chunk boundary, so the output matches the serial scan exactly.
+pub fn par_scan(read s: []i64, dst: *mut i64, identity: i64, op: fn(i64, i64) -> i64) {
+    let n: usize = s.len
+    let q: usize = n / 4
+    let c0: []i64 = slice(i64, s.ptr + 0, q)
+    let c1: []i64 = slice(i64, s.ptr + q, q)
+    let c2: []i64 = slice(i64, s.ptr + (q + q), q)
+    let c3: []i64 = slice(i64, s.ptr + (q + q + q), n - (q + q + q))
+
+    // Pass 1: per-chunk totals into four disjoint cells.
+    var part: *mut i64 = alloc(i64, 4)
+    concurrent {
+        spawn scan_total_worker(c0, part + 0, identity, op)
+        spawn scan_total_worker(c1, part + 1, identity, op)
+        spawn scan_total_worker(c2, part + 2, identity, op)
+        spawn scan_total_worker(c3, part + 3, identity, op)
+    }
+
+    // Exclusive prefix of the four totals → the seed each chunk starts from. Read the
+    // partials into locals first so the spawn arguments are plain i64 values.
+    var p0: i64 = 0
+    var p1: i64 = 0
+    var p2: i64 = 0
+    unsafe {
+        p0 = (part + 0).*
+        p1 = (part + 1).*
+        p2 = (part + 2).*
+    }
+    let seed0: i64 = identity
+    let seed1: i64 = op(seed0, p0)
+    let seed2: i64 = op(seed1, p1)
+    let seed3: i64 = op(seed2, p2)
+
+    // Pass 2: each worker scans its chunk seeded with its prefix, into its own region.
+    concurrent {
+        spawn scan_emit_worker(c0, dst + 0, seed0, op)
+        spawn scan_emit_worker(c1, dst + q, seed1, op)
+        spawn scan_emit_worker(c2, dst + (q + q), seed2, op)
+        spawn scan_emit_worker(c3, dst + (q + q + q), seed3, op)
+    }
+    free_ptr(part)
+}
+
+// ── Convenience wrappers for the built-in associative ops ──────────────────────
+// (Each takes the address of a same-module op, so callers never write `&`.)
+pub fn par_scan_sum(read s: []i64, dst: *mut i64) { par_scan(s, dst, 0, &op_add) }
+pub fn par_scan_min(read s: []i64, dst: *mut i64) { par_scan(s, dst, 9223372036854775807, &op_min) }
+// max identity is i64::MIN, written without an out-of-range literal (mirrors `core`).
+pub fn par_scan_max(read s: []i64, dst: *mut i64) { par_scan(s, dst, (0 - 9223372036854775807) - 1, &op_max) }
+pub fn par_scan_xor(read s: []i64, dst: *mut i64) { par_scan(s, dst, 0, &op_xor) }

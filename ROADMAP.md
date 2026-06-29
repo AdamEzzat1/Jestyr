@@ -100,7 +100,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | N | Concurrency polish | ~88% | MED | M | ✓ | — |
 | O | Tooling (fmt / test / doc / LSP) | test-runner ✅, attest ✅, attest --diff ✅; LSP/fmt deferred | LOW | M | ✓✓ | ✓ |
 | P | Self-hosting | plumbing ✅; port open | — | XL | ✓✓ | ✓✓ (the gate) |
-| Q | Parallelism (data-parallel) | 0% (seed `par_binned_sum` ✅) | MED | L | ✓✓ | ✓✓ (cost model) |
+| Q | Parallelism (data-parallel) | ~18% (tier-1 SOACs `par_reduce`/`par_map`/`par_scan` ✅) | MED | L | ✓✓ | ✓✓ (cost model) |
 
 ---
 
@@ -448,7 +448,7 @@ collide. (`mod.Type` paths + directory-as-module are the remaining K niceties.)
 escape → cgen (~27K lines); plus qualified type paths + a basic `build.jestyr` (K) for
 comfort. **Plumbing follow-up:** a recoverable `read_file -> String !IoError`.
 
-### Q. Parallelism (data-parallel) — 0% (MED conflict; files: ast, parser, typeck, escape, cgen, printer + new `std/parallel.jtr`)
+### Q. Parallelism (data-parallel) — ~18% (MED conflict; files: ast, parser, typeck, escape, cgen, printer + new `std/parallel.jtr`)
 **Distinct from N (concurrency = task structuring); Q = data parallelism (make one
 computation faster across cores / lanes / GPU).** They share exactly one bridge: the
 deterministic `par` reduction. **Seed already in-tree:** `core.par_binned_sum` —
@@ -464,6 +464,26 @@ spawn, shared with N) → a **work-span (`W`/`D`) cost model** (`@span(log n)` c
 +CJC thermal/energy — the Motley tie-in) → far-tier SIMD (`uniform`/`varying` + lane
 reductions bit-identical across vector widths) + GPU SOACs. **Coordinate the `core.jtr`
 `par_*` region with N.** Full handoff: `PARALLELISM-HANDOFF.md`.
+
+**Built (tier 1 — library, no compiler change):** the three workhorse SOACs, all
+deterministic by construction.
+- **`core.par_reduce`** (landed via N) — fold a slice to one value over a `Reduction`
+  (identity + associative `accumulate`/`combine`; built-ins sum/min/max/xor). Disjoint
+  per-worker slots, merge with `combine` — bit-identical to serial for any split.
+- **`parallel.par_map`** — element-wise `fn(i64)->i64` across four workers into disjoint
+  output regions, no merge (output[i] depends only on input[i] → split-independent by
+  construction).
+- **`parallel.par_scan`** — inclusive prefix scan via the two-pass algorithm (reduce each
+  chunk → exclusive-prefix the chunk-totals → re-scan each chunk seeded with its prefix);
+  bit-identical to serial for any worker count *because the op is associative*. Takes the
+  op + identity directly (decoupled from `core.Reduction`'s module-private fields) with
+  `op_add/min/max/xor` + `par_scan_sum/min/max/xor` wrappers; naive float `+` is non-
+  associative and deliberately not offered. New module `examples/std/parallel.jtr` (does
+  not touch `core`'s `par_*` region — coordinated with N). Demo `par_soac.jtr`. Tests:
+  `parallel_props::{par_scan,par_map}_is_split_independent` (toolchain-free determinism
+  stars), `par_soac_example_compiles_clean`, `c_oracle::par_soac_demo` (gcc + real threads,
+  8×). **Next:** the `par for … reduce(r)` surface — the first compiler change, where a
+  non-deterministic reduction is *rejected at compile time*.
 
 ---
 
