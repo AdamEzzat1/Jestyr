@@ -54,6 +54,7 @@ pub fn check(ast: &Ast, info: &TypeInfo) -> Vec<Diagnostic> {
         frozen: Vec::new(),
         region_depths: Vec::new(),
         no_alloc: false,
+        deterministic: false,
     };
     for item in &ast.items {
         ck.check_item(item);
@@ -70,6 +71,12 @@ struct Checker<'a> {
     /// compile error — the enforced allocation-free contract (the `@no_panic`
     /// analog). Saved/restored around nested method bodies.
     no_alloc: bool,
+    /// Is the function currently being checked `@deterministic`? If so, the raw
+    /// concurrency primitives whose result can depend on the thread schedule —
+    /// `concurrent`/`spawn` and the `atomic_*` ops — are compile errors; parallelism
+    /// is permitted only through the *checked* deterministic `par for … reduce(r)`.
+    /// The schedule-independence contract. Saved/restored around nested bodies.
+    deterministic: bool,
     /// Collections currently being iterated (by simple name). A `for … in xs`
     /// loop holds a borrow of `xs` for its body, so mutating `xs` there is
     /// forbidden (iterator invalidation — the borrow contract of a loop). A stack
@@ -164,9 +171,12 @@ impl<'a> Checker<'a> {
         // not inherit (or clobber) the enclosing function's contract.
         let saved_no_alloc = self.no_alloc;
         self.no_alloc = f.has_attr("no_alloc");
+        let saved_det = self.deterministic;
+        self.deterministic = f.has_attr("deterministic");
         // The body is in return position: its tail expression is the result.
         self.check_block(&mut ctx, &f.body, true);
         self.no_alloc = saved_no_alloc;
+        self.deterministic = saved_det;
     }
 
     fn check_block(&mut self, ctx: &mut FnCtx, block: &Block, tail: bool) {
@@ -354,6 +364,7 @@ impl<'a> Checker<'a> {
                 self.check_give_away(ctx, id, *callee, args);
                 self.check_loop_mutation(ctx, id, *callee, args);
                 self.check_no_alloc_call(id, *callee, span);
+                self.check_deterministic_call(id, *callee, span);
                 self.check_manual_drop(id, span);
                 return;
             }
@@ -404,6 +415,14 @@ impl<'a> Checker<'a> {
             ExprKind::Concurrent(b) => {
                 // Structured concurrency: tasks join at the scope's end, so a
                 // borrow flowing into a `spawn` does *not* outlive its frame.
+                if self.deterministic {
+                    self.error(
+                        span,
+                        "raw `concurrent` is forbidden in a `@deterministic` function — its result \
+                         can depend on the thread schedule. Use `par for … reduce(r)` (a checked \
+                         deterministic reduction) for schedule-independent parallelism.",
+                    );
+                }
                 self.check_block(ctx, b, false);
                 return;
             }
@@ -756,6 +775,35 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// In a `@deterministic` function, reject a call to an `atomic_*` op — a
+    /// sequentially-consistent atomic can *observe* the interleaving (e.g.
+    /// `atomic_load` after concurrent `atomic_add`s), so a result built on it can
+    /// depend on the schedule. The direct, per-op enforcement (the `@no_alloc`
+    /// analog); the *transitive* "calls a function that uses atomics" closure (so a
+    /// `Mutex`/`Channel` op is caught) is future work, as for `@no_alloc`.
+    fn check_deterministic_call(&mut self, call_id: ExprId, callee: ExprId, span: Span) {
+        if !self.deterministic {
+            return;
+        }
+        let name = if let Some(q) = self.info.qualified.get(&call_id) {
+            q.clone()
+        } else if let ExprKind::Name(n) = &self.ast.expr_at(callee).kind {
+            n.name.clone()
+        } else {
+            return;
+        };
+        if matches!(name.as_str(), "atomic_store" | "atomic_load" | "atomic_add" | "atomic_sub" | "atomic_xchg") {
+            self.error(
+                span,
+                format!(
+                    "`{name}` is an atomic op whose result can depend on the thread schedule — \
+                     forbidden in a `@deterministic` function. Use `par for … reduce(r)` for \
+                     schedule-independent parallelism."
+                ),
+            );
+        }
+    }
+
     /// Reject passing a *currently-iterated* collection to a parameter that could
     /// mutate or consume it (`mut`/`out`/`take`) — the call-site half of the loop
     /// borrow contract. Covers free calls, qualified calls, and method sugar.
@@ -1042,6 +1090,40 @@ mod tests {
         let d = escapes("@no_alloc fn f() -> i32 { region r { let x = region_alloc(r, i32, 1) } return 0 }");
         assert!(!d.is_empty(), "a region block must be rejected: {:?}", d);
         assert!(d.iter().any(|m| m.message.contains("region")), "{:?}", d);
+    }
+
+    // --- @deterministic: the schedule-independence contract (workstream N) ---
+
+    #[test]
+    fn deterministic_accepts_a_par_for() {
+        // The only parallelism inside a `@deterministic` function may be the checked
+        // deterministic `par for` — that is accepted with no diagnostic.
+        let d = escapes(
+            "fn sum_reduction() -> i64 { return 0 } \
+             @deterministic fn f(read s: []i64) -> i64 { return par for x in s reduce(sum_reduction()) { x } }",
+        );
+        assert!(d.is_empty(), "a par for must be allowed in @deterministic: {d:?}");
+    }
+
+    #[test]
+    fn deterministic_rejects_raw_concurrent() {
+        let d = escapes(
+            "fn w(c: *mut i64) {} \
+             @deterministic fn f(c: *mut i64) { concurrent { spawn w(c) } }",
+        );
+        assert!(
+            d.iter().any(|m| m.message.contains("@deterministic") && m.message.contains("concurrent")),
+            "raw concurrent must be rejected in @deterministic: {d:?}"
+        );
+    }
+
+    #[test]
+    fn deterministic_rejects_atomics() {
+        let d = escapes("@deterministic fn f(c: *mut i64) -> i64 { return atomic_load(c) }");
+        assert!(
+            d.iter().any(|m| m.message.contains("@deterministic") && m.message.contains("atomic_load")),
+            "an atomic op must be rejected in @deterministic: {d:?}"
+        );
     }
 
     #[test]

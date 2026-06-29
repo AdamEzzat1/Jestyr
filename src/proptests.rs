@@ -5132,6 +5132,12 @@ mod c_oracle {
         }
     }
     #[test]
+    fn deterministic_demo() {
+        // A `@deterministic`-certified function (its only parallelism is a checked
+        // `par for`) runs and gives the bit-stable result: Σ k² for 1..=10 = 385.
+        assert_eq!(toks("examples/std/deterministic.jtr"), ["385"], "@deterministic result wrong");
+    }
+    #[test]
     fn dynamic_spawn_demo() {
         // Dynamic-N spawn on real threads: a runtime number of tasks (10, then 64),
         // each writing a disjoint slot, joined at the brace. Disjoint writes → the

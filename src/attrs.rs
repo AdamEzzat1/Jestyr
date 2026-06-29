@@ -115,13 +115,19 @@ const SPECS: &[Spec] = &[
         args: Args::None,
         status: Status::Active,
     },
-    // `@deterministic` (design Phase 3) — recognized; the allocator-determinism
-    // contract ("same alloc sequence ⇒ same slot layout") is not yet enforced.
+    // `@deterministic` (design §10 / Phase 3) — the escape checker certifies the
+    // function's result is **schedule-independent**: it forbids the raw concurrency
+    // primitives whose result can depend on the thread schedule (`concurrent`/`spawn`,
+    // the `atomic_*` ops), permitting parallelism only through the *checked*
+    // deterministic `par for … reduce(r)`. The Ada/Ravenscar provable-subset idea
+    // fused with the determinism thesis (the `@verified` tie-in). (The complementary
+    // allocator-determinism facet — "same alloc sequence ⇒ same slot layout" — can
+    // layer onto the same attribute later; both are aspects of "deterministic".)
     Spec {
         name: "deterministic",
         targets: &[Target::Fn, Target::Method],
         args: Args::None,
-        status: Status::Reserved("allocator-determinism contract (design Phase 3; NUMERICS-RESEARCH.md)"),
+        status: Status::Active,
     },
     // ── optimization intent (functions) ────────────────────────────────────
     Spec {

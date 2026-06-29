@@ -1,0 +1,34 @@
+// examples/std/deterministic.jtr — the `@deterministic` contract (concurrency,
+// workstream N): a function the compiler CERTIFIES is schedule-independent.
+//
+// Inside a `@deterministic` function the only parallelism allowed is the *checked*
+// deterministic `par for … reduce(r)`. The raw concurrency primitives whose result
+// can depend on the thread schedule — `concurrent`/`spawn` and the `atomic_*` ops —
+// are COMPILE ERRORS here. So the result is provably the same for any thread
+// schedule: the Ada/Ravenscar "provable subset" fused with Jestyr's determinism
+// thesis (the `@verified` tie-in). The rejection is exercised in the test suite; a
+// runnable demo can only show the accepted form.
+//
+//   jestyrc run examples/std/deterministic.jtr   →   385
+import "core"
+import "io"
+
+fn seti(p: *mut i64, i: usize, v: i64) { unsafe { (p + i).* = v } }
+
+// Certified schedule-independent: its parallelism is a checked deterministic
+// reduction, nothing that can observe the interleaving.
+@deterministic fn sum_of_squares(read s: []i64) -> i64 {
+    return par for x in s reduce(core.sum_reduction()) { x * x }
+}
+
+fn main() -> i32 {
+    var a: *mut i64 = alloc(i64, 10)
+    var i: usize = 0
+    for i < 10 {
+        seti(a, i, (i as i64) + 1)        // 1, 2, …, 10
+        i = i + 1
+    }
+    io.print_i32(sum_of_squares(slice(i64, a, 10)) as i32)   // Σ k² for 1..=10 = 385
+    free_ptr(a)
+    return 0
+}

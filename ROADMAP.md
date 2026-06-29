@@ -97,7 +97,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | K | Module system v2 | ~98% | MED | M | ✓ | ✓✓ (build/incremental) |
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
-| N | Concurrency polish | ~98% | MED | M | ✓ | — |
+| N | Concurrency polish | ~99% | MED | M | ✓ | — |
 | O | Tooling (fmt / test / doc / LSP) | test-runner ✅, attest ✅, attest --diff ✅; LSP/fmt deferred | LOW | M | ✓✓ | ✓ |
 | P | Self-hosting | plumbing ✅; port open | — | XL | ✓✓ | ✓✓ (the gate) |
 | Q | Parallelism (data-parallel) | ~18% (tier-1 SOACs `par_reduce`/`par_map`/`par_scan` ✅) | MED | L | ✓✓ | ✓✓ (cost model) |
@@ -267,12 +267,27 @@ layer."** Mostly a new pass + cgen tweaks → reasonably isolated.
 from runtime asserts into **static proof obligations** discharged by an SMT backend.
 **Motley:** verifying the compiler's own passes. Long-horizon; do after F/G.
 
-### N. Concurrency polish — ~98% (MED conflict; files: ast, parser, typeck, escape, cgen, printer)
+### N. Concurrency polish — ~99% (MED conflict; files: ast, parser, typeck, escape, cgen, printer)
 **Done:** `concurrent { spawn … }` → pthreads, scoped join; atomics (`__atomic_*`);
 `core.par_binned_sum`; **Mutex** (protected object); **move-only channels**; the
 generalized **`par_reduce`** library; **task results + `await`**; the headline **`par for …
 reduce(r)`** surface with **compile-time non-deterministic-reduction rejection**; **dynamic-N
-spawn** (below). **Left:** `spawn` of closures; optionally `select` and a `@deterministic` region.
+spawn**; the **`@deterministic`** schedule-independence contract (below). **Left:** optionally
+`select` (Crystal/Go channel choice); `spawn` of closures.
+
+**`@deterministic` contract — ✅ DONE (the `@verified` tie-in).** A `@deterministic` function is
+certified **schedule-independent**: the escape checker forbids the raw concurrency primitives
+whose result can depend on the thread schedule — `concurrent`/`spawn` and the `atomic_*` ops —
+permitting parallelism only through the *checked* deterministic `par for … reduce(r)`. The
+Ada/Ravenscar provable-subset idea fused with the determinism thesis. Mirrors the `@no_alloc`
+machinery (a per-function escape flag + per-op rejection; transitive "calls a function that uses
+atomics" closure is future work, as for `@no_alloc`). The attribute was already reserved; now
+`Active` — schedule-determinism is a facet of "deterministic" that composes with the numerics
+allocator-determinism facet (both only *reject* non-deterministic code).
+- `examples/std/deterministic.jtr` — a `@deterministic` sum-of-squares (its only parallelism a
+  checked `par for`) → `385`. Rigor: escape tests (**accepts** a `par for`; **rejects** raw
+  `concurrent`; **rejects** `atomic_*`) + a c-oracle `deterministic_demo`. `attrs.rs` flip to
+  `Active`; `module.rs`/`main.rs` untouched.
 
 **Dynamic-N spawn — ✅ DONE (increment 6, the shared `emit_concurrent` change).** A `spawn`
 *inside a loop* now launches a **runtime** number of tasks: the `concurrent { … }` nursery
