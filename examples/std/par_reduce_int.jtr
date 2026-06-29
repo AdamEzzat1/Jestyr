@@ -1,0 +1,51 @@
+// examples/std/par_reduce_int.jtr — the generalized deterministic parallel
+// reduction (`core.par_reduce`), the headline at library tier (workstream N).
+//
+// `par_reduce(s, r)` runs a reduction declared as a value — a `Reduction` carrying
+// an identity, an `accumulate`, and an order-independent `combine` — across worker
+// threads, each folding a disjoint chunk, then merging. For a DETERMINISTIC
+// reduction (integer sum/min/max/xor, all exactly associative+commutative) the
+// result is bit-identical to the serial fold for any chunk split or thread
+// schedule. No naive `f64 +` here: that reassociates and is rejected at the `par
+// for` surface (tier 2); the bit-exact float case is `par_binned_sum`.
+//
+//   jestyrc run examples/std/par_reduce_int.jtr   →   153, 1, 17, 1,  1, 1, 1, 1
+//
+// The first four are sum/min/max/xor of 1..=17 (17 values — not divisible by the
+// worker count, so the chunks are uneven); the last four are the par==serial
+// equality flags, one per reduction.
+import "core"
+import "io"
+
+fn seti(p: *mut i64, i: usize, v: i64) { unsafe { (p + i).* = v } }
+fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
+
+// 1 iff the parallel reduction equals the serial one bit-for-bit.
+fn agrees(read s: []i64, r: core.Reduction) -> i32 {
+    return b2i(core.par_reduce(s, r) == core.serial_reduce(s, r))
+}
+
+fn main() -> i32 {
+    var a: *mut i64 = alloc(i64, 17)
+    var i: usize = 0
+    for i < 17 {
+        seti(a, i, (i as i64) + 1)        // 1, 2, …, 17
+        i = i + 1
+    }
+    let s: []i64 = slice(i64, a, 17)
+
+    // The reduction *results* (deterministic, so safe to pin).
+    io.print_i32(core.par_reduce(s, core.sum_reduction()) as i32)   // 153 = 1+…+17
+    io.print_i32(core.par_reduce(s, core.min_reduction()) as i32)   // 1
+    io.print_i32(core.par_reduce(s, core.max_reduction()) as i32)   // 17
+    io.print_i32(core.par_reduce(s, core.xor_reduction()) as i32)   // 1 = xor(1..17)
+
+    // Each parallel result equals the serial fold, bit-for-bit.
+    io.print_i32(agrees(s, core.sum_reduction()))   // 1
+    io.print_i32(agrees(s, core.min_reduction()))   // 1
+    io.print_i32(agrees(s, core.max_reduction()))   // 1
+    io.print_i32(agrees(s, core.xor_reduction()))   // 1
+
+    free_ptr(a)
+    return 0
+}

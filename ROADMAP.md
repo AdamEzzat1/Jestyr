@@ -97,7 +97,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | K | Module system v2 | ~96% | MED | M | ✓ | ✓✓ (build/incremental) |
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
-| N | Concurrency polish | ~70% | MED | M | ✓ | — |
+| N | Concurrency polish | ~80% | MED | M | ✓ | — |
 | O | Tooling (fmt / test / doc / LSP) | test-runner ✅, attest ✅, attest --diff ✅; LSP/fmt deferred | LOW | M | ✓✓ | ✓ |
 | P | Self-hosting | plumbing ✅; port open | — | XL | ✓✓ | ✓✓ (the gate) |
 | Q | Parallelism (data-parallel) | 0% (seed `par_binned_sum` ✅) | MED | L | ✓✓ | ✓✓ (cost model) |
@@ -256,12 +256,32 @@ layer."** Mostly a new pass + cgen tweaks → reasonably isolated.
 from runtime asserts into **static proof obligations** discharged by an SMT backend.
 **Motley:** verifying the compiler's own passes. Long-horizon; do after F/G.
 
-### N. Concurrency polish — ~70% (MED conflict; files: cgen, escape)
+### N. Concurrency polish — ~80% (MED conflict; files: cgen, escape)
 **Done:** `concurrent { spawn … }` → pthreads, scoped join; atomics (`__atomic_*`);
-the proven deterministic parallel reduction (`core.par_binned_sum`); **Mutex** (protected
-object) and **move-only channels** (below). **Left:** task **results** + `await` (keyword
+`core.par_binned_sum`; **Mutex** (protected object); **move-only channels**; the
+generalized **`par_reduce`** library (below). **Left:** task **results** + `await` (keyword
 reserved); the `par … reduce(r)` loop surface + non-deterministic-reduction rejection (the
-headline checked guarantee); `spawn` of closures; dynamic-N spawn.
+headline *checked* guarantee — `par_reduce` is its runtime engine); `spawn` of closures;
+dynamic-N spawn.
+
+**`par_reduce` library — ✅ DONE (increment 3, the headline at library tier).** `core.jtr`'s
+`par_reduce(s, r)` generalizes `par_binned_sum`'s disjoint-region shape to any reduction
+declared as a value: a `Reduction` carries an `identity`, an `accumulate` (fold one element),
+and an order-independent `combine` (merge two accumulators). Workers fold disjoint chunks into
+disjoint slots; the slots merge with `combine`; the result is **bit-identical to the serial
+fold for any chunk split or thread schedule** — because integer +/min/max/xor are associative
+*and* commutative. Built-ins: `sum_reduction`/`min_reduction`/`max_reduction`/`xor_reduction`,
+plus `serial_reduce` (the in-program oracle). **Zero compiler change.**
+- The accumulator is `i64` so the worker stays monomorphic (`spawn` targets cannot be generic
+  — verified: a generic worker fails C lowering). A naive `f64 +` reduction is *deliberately
+  not* offered — it reassociates and is the rejection target for the `par for` surface; the
+  bit-exact float case remains `par_binned_sum`.
+- `examples/std/par_reduce_int.jtr` — sum/min/max/xor of 1..=17 (`153 1 17 1`) + four
+  par==serial flags. `module.rs`/`main.rs` untouched.
+- Rigor: the determinism **star** `core_props::par_reduce_is_split_independent` (for each
+  built-in, whole-fold == chunked-fold-then-merge for any split, mirroring
+  `binned_sum_is_chunk_independent`) + a `--features c-oracle` real-thread run
+  (`par_reduce_int_demo`, pinned cross-OS). `cargo test` stays toolchain-free.
 
 **Move-only channels — ✅ DONE (increment 2, share by communicating).** `std/sync.jtr`'s
 `Channel(T)` is a bounded ring buffer over the spinlock whose `channel_send` takes its value

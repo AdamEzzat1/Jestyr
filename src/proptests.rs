@@ -3351,6 +3351,40 @@ mod core_props {
             prop_assert_eq!(m_binned_round(&whole).to_bits(), m_binned_round(&a).to_bits());
         }
 
+        /// **The `par_reduce` determinism property:** for each deterministic integer
+        /// reduction (sum/min/max/xor), folding the whole slice equals folding
+        /// arbitrary disjoint chunks and merging them with the same op — for ANY
+        /// split into `nchunks` pieces. This is exactly what `core.par_reduce` does
+        /// (each worker folds a chunk, `combine` merges), so its result is
+        /// bit-identical to `serial_reduce` regardless of the chunk split or thread
+        /// schedule. True by construction: integer +/min/max/xor are associative AND
+        /// commutative. Inputs are bounded so the sum cannot overflow (where i64 `+`
+        /// would otherwise leave the exact, associative regime).
+        #[test]
+        fn par_reduce_is_split_independent(
+            xs in proptest::collection::vec(-1_000_000i64..1_000_000, 0..200),
+            nchunks in 1usize..8,
+        ) {
+            // (identity, op) for each built-in. `wrapping_add` models i64 `+`; inputs
+            // are bounded so no wrap actually occurs (the exact regime).
+            let ops: [(i64, fn(i64, i64) -> i64); 4] = [
+                (0, |a, b| a.wrapping_add(b)),
+                (i64::MAX, |a, b| a.min(b)),
+                (i64::MIN, |a, b| a.max(b)),
+                (0, |a, b| a ^ b),
+            ];
+            for (ident, op) in ops {
+                let serial = xs.iter().fold(ident, |acc, &x| op(acc, x));
+                // Split xs into `nchunks` near-equal pieces, fold each, merge.
+                let chunk = xs.len().div_ceil(nchunks).max(1);
+                let merged = xs
+                    .chunks(chunk)
+                    .map(|c| c.iter().fold(ident, |acc, &x| op(acc, x)))
+                    .fold(ident, |acc, part| op(acc, part));
+                prop_assert_eq!(serial, merged, "split-dependent result for a deterministic reduction");
+            }
+        }
+
         /// On exactly-representable inputs the binned sum equals the true sum.
         #[test]
         fn binned_sum_is_exact_on_representable_inputs(
@@ -4923,6 +4957,16 @@ mod c_oracle {
     #[test]
     fn par_reduce_demo() {
         assert_eq!(toks("examples/std/par_reduce.jtr"), ["1", "1", "1"]);
+    }
+    #[test]
+    fn par_reduce_int_demo() {
+        // The generalized parallel reduction on real threads: sum/min/max/xor of
+        // 1..=17 (153, 1, 17, 1), then four par==serial equality flags. Every
+        // reduction is deterministic, so the result is bit-identical to serial.
+        assert_eq!(
+            toks("examples/std/par_reduce_int.jtr"),
+            ["153", "1", "17", "1", "1", "1", "1", "1"]
+        );
     }
     #[test]
     fn mutex_demo() {

@@ -810,6 +810,101 @@ pub fn par_binned_sum(read s: []f64) -> f64 {
     return result
 }
 
+// ── Generalized deterministic parallel reduction — `par_reduce` ───────────────
+//
+// THE HEADLINE, library tier. `par_binned_sum` proved one bit-reproducible parallel
+// reduction; this generalizes the *shape* to any reduction declared as a value: a
+// `Reduction` carries an `identity`, an `accumulate` (fold one element into a
+// worker-local accumulator), and an order-independent `combine` (merge two
+// accumulators). `par_reduce` partitions the slice across `PAR_WORKERS`, each worker
+// folds its chunk into a DISJOINT accumulator slot, then the slots are merged with
+// `combine` and the result returned — **bit-identical to the serial fold for any
+// chunk split or thread schedule**, because `combine` is associative *and*
+// commutative at the machine-integer level (integer +, min, max, xor are exact).
+//
+// The accumulator is `i64` (so the worker is monomorphic — `spawn` targets cannot
+// be generic). That covers the deterministic integer reductions below. The *float*
+// case is exactly where determinism is hard: the binned superaccumulator
+// (`par_binned_sum`) is the bit-exact answer, and a NAIVE `f64 +` reduction is
+// deliberately NOT offered here because it reassociates under parallelism — the
+// compile-time rejection of such non-deterministic reductions is the `par for …
+// reduce(r)` surface (workstream N, tier 2). Determinism here is provable today
+// (`core_props::par_reduce_is_split_independent`).
+
+pub struct Reduction {
+    identity:   i64,
+    accumulate: fn(i64, i64) -> i64,   // fold an element into the accumulator
+    combine:    fn(i64, i64) -> i64,   // merge two accumulators (order-independent)
+}
+
+// Element/merge ops for the built-in reductions. For T == accumulator == i64,
+// `accumulate` and `combine` are the same associative+commutative operation.
+fn red_add(a: i64, b: i64) -> i64 { return a + b }
+fn red_min(a: i64, b: i64) -> i64 { if a < b { return a } return b }
+fn red_max(a: i64, b: i64) -> i64 { if a > b { return a } return b }
+fn red_xor(a: i64, b: i64) -> i64 { return a ^ b }
+
+// The four deterministic built-ins. `identity` is the op's unit: 0 for sum/xor,
+// the largest i64 for min, the smallest for max (so `op(identity, x) == x`).
+pub fn sum_reduction() -> Reduction {
+    return Reduction{ identity: 0, accumulate: &red_add, combine: &red_add }
+}
+pub fn min_reduction() -> Reduction {
+    return Reduction{ identity: 9223372036854775807, accumulate: &red_min, combine: &red_min }
+}
+pub fn max_reduction() -> Reduction {
+    return Reduction{ identity: (0 - 9223372036854775807) - 1, accumulate: &red_max, combine: &red_max }
+}
+pub fn xor_reduction() -> Reduction {
+    return Reduction{ identity: 0, accumulate: &red_xor, combine: &red_xor }
+}
+
+// One worker: fold `chunk` into a local accumulator starting from `ident`, then
+// write it to slot `slot` (a region no other worker touches → race-free).
+fn par_reduce_worker(read chunk: []i64, slot: *mut i64, ident: i64, accfn: fn(i64, i64) -> i64) {
+    var acc: i64 = ident
+    for x in chunk { acc = accfn(acc, x) }
+    unsafe { (slot + 0).* = acc }
+}
+
+// The serial reference fold (left-to-right). For a deterministic `Reduction` the
+// parallel result equals this bit-for-bit; it doubles as the in-program oracle.
+pub fn serial_reduce(read s: []i64, r: Reduction) -> i64 {
+    var acc: i64 = r.identity
+    for x in s { acc = r.accumulate(acc, x) }
+    return acc
+}
+
+// Reproducible parallel reduction: split `s` across `PAR_WORKERS` threads, each
+// folding its chunk into its own slot, then merge with `combine` and return.
+// Bit-identical to `serial_reduce(s, r)` for any input and any thread count when
+// `r` is a deterministic reduction (the integer built-ins above).
+pub fn par_reduce(read s: []i64, r: Reduction) -> i64 {
+    let n: usize = s.len
+    var raw: *mut i64 = alloc(i64, 4)
+    let q: usize = n / 4
+    let c0: []i64 = slice(i64, s.ptr + 0, q)
+    let c1: []i64 = slice(i64, s.ptr + q, q)
+    let c2: []i64 = slice(i64, s.ptr + (q + q), q)
+    let c3: []i64 = slice(i64, s.ptr + (q + q + q), n - (q + q + q))
+    concurrent {
+        spawn par_reduce_worker(c0, raw + 0, r.identity, r.accumulate)
+        spawn par_reduce_worker(c1, raw + 1, r.identity, r.accumulate)
+        spawn par_reduce_worker(c2, raw + 2, r.identity, r.accumulate)
+        spawn par_reduce_worker(c3, raw + 3, r.identity, r.accumulate)
+    }
+    // Merge the four slots with the order-independent combine (fixed order, but the
+    // result does not depend on it), starting from the identity.
+    var acc: i64 = r.identity
+    var w: usize = 0
+    for w < 4 {
+        unsafe { acc = r.combine(acc, (raw + w).*) }
+        w = w + 1
+    }
+    free_ptr(raw)
+    return acc
+}
+
 // ── Correctly-rounded float parse — Eisel–Lemire (fast path) ──────────────────
 //
 // Decimal → nearest `f64`, locale-free. Parse the digits into a ≤19-digit u64
