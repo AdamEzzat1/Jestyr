@@ -94,7 +94,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | H | Function-pointer types | 0% | HIGH | M | ✓ | ✓ (vtables) |
 | I | Error-handling polish | ~70% | MED | S | ✓ | — |
 | J | Numeric / operator completeness | ~70% | MED | S–M | ✓ | ✓ (determinism) |
-| K | Module system v2 | ~96% | MED | M | ✓ | ✓✓ (build/incremental) |
+| K | Module system v2 | ~97% | MED | M | ✓ | ✓✓ (build/incremental) |
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
 | N | Concurrency polish | ~80% | MED | M | ✓ | — |
@@ -198,7 +198,7 @@ determinism** cares); float↔int cast edge cases; bit-width-aware literals; `as
 done; possibly operator methods. Determinism-relevant: no-FMA, compensated ops are a
 *Motley* concern but the numeric model starts here.
 
-### K. Module system v2 — ~96% (MED conflict; files: module.rs + typeck)
+### K. Module system v2 — ~97% (MED conflict; files: module.rs + typeck)
 **Done:** `import`, `pub` visibility, qualified access, cycle detection, multi-file
 merge; **per-module namespaces for functions + consts** (increment 1) — resolution
 is keyed on `(ModId, name)`, an unqualified name resolves current-module-first and
@@ -237,8 +237,14 @@ current-module-first, `mod.Type` resolves in the target module (the backend gets
 import map), and every `Jestyr_<type>` / enum-tag / variant site canonicalizes —
 all a **no-op for any non-colliding program** (output byte-identical, verified). So
 two modules' `Slot` become `Jestyr_Slot__m<a>` / `__m<b>` and each `mod.Slot` /
-variant construction / `match` hits the right one. **Left:** `build.jestyr`/manifest
-(deferred: lockfile/vendored-deps/effects — ecosystem-premature). **Also deferred:**
+variant construction / `match` hits the right one. **Declarative module manifest**
+(increment 8) — `Modules::render_manifest` emits the content-hash DAG (each module's
+name + hash, imports tagged with their target's hash) as a deterministic, parseable
+artifact, and `verify_manifest` re-checks a committed manifest against a fresh load,
+reporting per-module (transitive) drift — the lockfile-lite declarative surface that
+tooling reads without executing build code; pairs with O's `attest`. **Left:** the
+*executable* `build.jestyr` half (deferred: needs CTFE; lockfile/vendored-deps/
+effects — ecosystem-premature). **Also deferred:**
 *generic* type-name collisions (two modules each defining the same `enum Box(T)` /
 generic-struct) — the monomorphized-instance mangling (`Jestyr_<ctor>__<args>`)
 overlaps function-ctor canon; left globally-keyed (no blocker).

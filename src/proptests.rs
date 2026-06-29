@@ -2222,12 +2222,12 @@ mod sync_props {
         let (mut head, mut tail, mut count) = (0usize, 0usize, 0usize);
         // Flatten producers into a single FIFO of pending sends (the demo's producers
         // are independent; per-producer order is preserved by sending in block order).
-        let mut pending: Vec<i64> = blocks.iter().flatten().copied().collect();
+        let pending: Vec<i64> = blocks.iter().flatten().copied().collect();
         let mut pi = 0usize;
         let mut out = Vec::new();
         // `sched` chooses send (true) vs recv (false) at each step; blocked ops are
         // skipped. Drain to completion afterwards.
-        let mut send = |buf: &mut [i64], head: &mut usize, tail: &mut usize, count: &mut usize, pi: &mut usize| {
+        let send = |buf: &mut [i64], _head: &mut usize, tail: &mut usize, count: &mut usize, pi: &mut usize| {
             if *pi < pending.len() && *count < buf.len() {
                 buf[*tail] = pending[*pi];
                 *tail = (*tail + 1) % buf.len();
@@ -2235,7 +2235,7 @@ mod sync_props {
                 *pi += 1;
             }
         };
-        let mut recv = |buf: &mut [i64], head: &mut usize, _tail: &mut usize, count: &mut usize, out: &mut Vec<i64>| {
+        let recv = |buf: &mut [i64], head: &mut usize, _tail: &mut usize, count: &mut usize, out: &mut Vec<i64>| {
             if *count > 0 {
                 out.push(buf[*head]);
                 *head = (*head + 1) % buf.len();

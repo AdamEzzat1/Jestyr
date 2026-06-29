@@ -93,6 +93,59 @@ impl Modules {
         self.hashes.get(m).map(String::as_str).unwrap_or("")
     }
 
+    /// Render the program's **declarative module manifest** (modules-v2 §9): the
+    /// content-hash DAG as a deterministic, parseable text — each module's name and
+    /// hash, then its import bindings each tagged with the imported module's hash.
+    /// This is the *declarative* half of the build surface (a dependency + hash list
+    /// tooling can read without executing any build code), the lockfile-lite that
+    /// pairs with O's `jestyr attest` (input-side module hashes vs attest's
+    /// output-side C hash). It is a pure function of the loaded program, so a
+    /// committed manifest pins the whole build graph; `verify_manifest` re-checks it.
+    #[allow(dead_code)] // surfaced via tooling (O's `main.rs`) later
+    pub fn render_manifest(&self) -> String {
+        let mut s = String::from("jestyr-manifest/v1\n");
+        for m in 0..self.names.len() {
+            s.push_str(&format!("module {} {}\n", self.names[m], self.hash(m)));
+            // Imports sorted by binding so the manifest is order-independent.
+            let mut imps: Vec<(&String, ModId)> =
+                self.imports[m].iter().map(|(b, &t)| (b, t)).collect();
+            imps.sort();
+            for (binding, target) in imps {
+                s.push_str(&format!("  import {} {}\n", binding, self.hash(target)));
+            }
+        }
+        s
+    }
+
+    /// Verify a previously-rendered manifest against this freshly-loaded program:
+    /// re-render and, for every pinned `module <name> <hash>` line, report any whose
+    /// hash drifted or whose module is now absent. An empty result means the build
+    /// graph is bit-for-bit the one the manifest pinned (reproducible). Robust to
+    /// reformatting — it compares the parsed `(name → hash)` pairs, not raw text.
+    #[allow(dead_code)] // surfaced via tooling (O's `main.rs`) later
+    pub fn verify_manifest(&self, manifest: &str) -> Vec<String> {
+        use std::collections::HashMap as Map;
+        let current: Map<&str, &str> =
+            (0..self.names.len()).map(|m| (self.names[m].as_str(), self.hash(m))).collect();
+        let mut drift = Vec::new();
+        for line in manifest.lines() {
+            let line = line.trim();
+            let mut it = line.split_whitespace();
+            if it.next() != Some("module") {
+                continue; // header, `import` lines, blanks
+            }
+            let (Some(name), Some(want)) = (it.next(), it.next()) else { continue };
+            match current.get(name) {
+                Some(&got) if got == want => {}
+                Some(&got) => drift.push(format!(
+                    "module `{name}` hash drifted: manifest pinned `{want}`, now `{got}`"
+                )),
+                None => drift.push(format!("module `{name}` in the manifest is no longer loaded")),
+            }
+        }
+        drift
+    }
+
     /// The *source region* a global span falls in (by base-offset range). Falls
     /// back to region 0 if nothing matches (e.g. a synthesized span). Used for
     /// diagnostics, so it indexes the per-region arrays, not the module space.
@@ -1346,5 +1399,58 @@ mod tests {
             "a missing import must report: {:?}",
             prog.diags
         );
+    }
+
+    // --- declarative module manifest (modules-v2 §9) ---
+
+    /// The manifest renders the module-hash DAG: each module's name + hash, and each
+    /// import tagged with the imported module's hash (which equals that module's own
+    /// line). Deterministic.
+    #[test]
+    fn manifest_renders_the_module_hash_dag() {
+        let dir = fixture(
+            "manifest",
+            &[
+                ("main.jtr", "import \"lib\"\nfn main() -> i32 { return lib.f(2) }"),
+                ("lib.jtr", "pub fn f(x: i32) -> i32 { return x + 1 }"),
+            ],
+        );
+        let m = load(dir.join("main.jtr").to_str().unwrap()).modules;
+        let manifest = m.render_manifest();
+        assert!(manifest.starts_with("jestyr-manifest/v1\n"), "versioned header:\n{manifest}");
+        assert!(manifest.contains(&format!("module main {}", m.hash(0))), "main line:\n{manifest}");
+        assert!(manifest.contains(&format!("module lib {}", m.hash(1))), "lib line:\n{manifest}");
+        // The `import lib <hash>` tag equals lib's own module hash.
+        assert!(manifest.contains(&format!("  import lib {}", m.hash(1))), "import tag = lib hash:\n{manifest}");
+        assert_eq!(manifest, m.render_manifest(), "the manifest render is deterministic");
+    }
+
+    /// A manifest verifies clean against the program it was rendered from, and a
+    /// later semantic edit to a dependency is reported as drift — for the changed
+    /// module and (transitively) every module that imports it.
+    #[test]
+    fn manifest_verifies_clean_and_detects_drift() {
+        let v1 = fixture(
+            "manifest_v1",
+            &[
+                ("main.jtr", "import \"lib\"\nfn main() -> i32 { return lib.f() }"),
+                ("lib.jtr", "pub fn f() -> i32 { return 1 }"),
+            ],
+        );
+        let pinned = load(v1.join("main.jtr").to_str().unwrap()).modules.render_manifest();
+        // Same program → no drift.
+        let again = load(v1.join("main.jtr").to_str().unwrap()).modules;
+        assert!(again.verify_manifest(&pinned).is_empty(), "an unchanged program verifies clean");
+        // Change lib's body → lib's hash drifts, and main's does too (transitive).
+        let v2 = fixture(
+            "manifest_v2",
+            &[
+                ("main.jtr", "import \"lib\"\nfn main() -> i32 { return lib.f() }"),
+                ("lib.jtr", "pub fn f() -> i32 { return 999 }"),
+            ],
+        );
+        let drift = load(v2.join("main.jtr").to_str().unwrap()).modules.verify_manifest(&pinned);
+        assert!(drift.iter().any(|d| d.contains("`lib`") && d.contains("drifted")), "lib drift: {drift:?}");
+        assert!(drift.iter().any(|d| d.contains("`main`") && d.contains("drifted")), "main drift (transitive): {drift:?}");
     }
 }
