@@ -1767,6 +1767,10 @@ impl<'a> Cgen<'a> {
         self.depth += 1;
         self.drop_scope_enter();
         for r in requires {
+            // Point a precondition's `assert` at the `requires` clause itself, so a
+            // contract failure blames the `.jtr` contract, not generated C (incr. c).
+            let sp = self.ast.expr_at(*r).span;
+            self.mark_line(sp);
             let c = self.emit_expr(*r);
             self.line(format!("assert({c});"));
         }
@@ -1814,6 +1818,9 @@ impl<'a> Cgen<'a> {
             if self.cur_ret_cty.is_empty() { "__auto_type".to_string() } else { self.cur_ret_cty.clone() };
         self.line(format!("{decl} j_result = {value};"));
         for post in self.cur_ensures.clone() {
+            // Point a postcondition's `assert` at the `ensures` clause (increment c).
+            let sp = self.ast.expr_at(post).span;
+            self.mark_line(sp);
             let c = self.emit_expr(post);
             self.line(format!("assert({c});"));
         }
@@ -8155,6 +8162,18 @@ mod tests {
         assert!(c.contains("#line 2 \"t.jtr\""), "`let a` on line 2:\n{c}");
         assert!(c.contains("#line 3 \"t.jtr\""), "`let b` on line 3:\n{c}");
         assert!(c.contains("#line 4 \"t.jtr\""), "`return` on line 4:\n{c}");
+    }
+
+    /// Increment (c): a contract's lowered `assert` is preceded by a `#line` at the
+    /// `requires`/`ensures` clause, so a contract failure blames the `.jtr` source.
+    #[test]
+    fn contract_asserts_point_at_the_clause() {
+        // `requires` on line 2, `ensures` on line 3.
+        let src = "fn f(x: i32) -> i32\n    requires x >= 0\n    ensures result >= 0\n{\n    return x\n}\n";
+        let (c, d) = gen_dbg(src);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(c.contains("#line 2 \"t.jtr\""), "requires assert maps to line 2:\n{c}");
+        assert!(c.contains("#line 3 \"t.jtr\""), "ensures assert maps to line 3:\n{c}");
     }
 
     /// Increment (b): a run of statements on *one* physical line costs a single
