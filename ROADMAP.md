@@ -256,6 +256,14 @@ need the `dup_fns` canon — same pattern, no blocker).
 **Motley:** the DAG already enables the parallel/incremental-compilation story;
 hashing makes it provable.
 
+### Debug info (`#line`→DWARF) — ✅ DONE (LOW conflict; files: types, typeck, cgen, main)
+Systems-handoff §1. Emitted C carries `#line N "file.jtr"` (per-function, per-statement,
+and on `requires`/`ensures` asserts) and cc is invoked with `-g`, so debuggers/profilers
+map the binary back to `.jtr`. Seam: `TypeInfo.debug` (empty on the single-file path ⇒
+no `#line` ⇒ byte-identical there; only the loader path emits). `-g` is separate from the
+`CC_FLAGS` determinism/attest seam. Full test rigor + teeth. See `jestyr-debuginfo.md`.
+**Next systems items (untouched):** cross-compile (`--target` via `zig cc`), then L, then M.
+
 ### L. Memory-layout pass — 0% (MED conflict; files: a new analysis + cgen)
 **Design §16 / a Motley principle.** **Left:** a layout pass computing size/align,
 **field reordering**, **enum niche-packing**, pass-large-aggregates-by-`const*`
