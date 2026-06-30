@@ -648,6 +648,26 @@ fn report_program(modules: &module::Modules, diags: &[diag::Diagnostic]) -> Exit
 /// emitted program simply never sets it.)
 const CC_FLAGS: &[&str] = &["-O2", "-std=c11", "-ffp-contract=off", "-fno-fast-math"];
 
+/// Emit debug info: the C compiler carries the `#line N "file.jtr"` directives the
+/// backend emits into DWARF, so gdb/lldb/perf/Valgrind map the binary back to
+/// `.jtr` source instead of generated C. Kept **separate** from [`CC_FLAGS`]
+/// because it is a usability flag, not part of the FP-determinism seam: it does
+/// not change codegen, the emitted C, or its hash — so it stays out of the
+/// `jestyr attest` provenance (which pins exactly the determinism flags) and out
+/// of the FP-lock invariant. `-g` does not affect the locked rounding behavior.
+const DEBUG_FLAG: &str = "-g";
+
+/// The full flag list prepended to every cc invocation: the locked determinism
+/// seam ([`CC_FLAGS`]) followed by debug info ([`DEBUG_FLAG`]). A pure function so
+/// a test can assert the command carries **both** the FP flags and `-g` without
+/// running a compiler (mirrors how `fp_determinism_flags_are_locked` inspects the
+/// const directly).
+fn cc_base_flags() -> Vec<&'static str> {
+    let mut flags: Vec<&'static str> = CC_FLAGS.to_vec();
+    flags.push(DEBUG_FLAG);
+    flags
+}
+
 fn build_and_maybe_run(path: &str, c_src: &str, run: bool) -> ExitCode {
     let stem = Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("out");
     let mut c_file = std::env::temp_dir();
@@ -668,7 +688,7 @@ fn build_and_maybe_run(path: &str, c_src: &str, run: bool) -> ExitCode {
     };
 
     let mut cmd = Command::new(&cc);
-    cmd.args(CC_FLAGS);
+    cmd.args(cc_base_flags());
     // Structured-concurrency output uses pthreads; link it only when present.
     if c_src.contains("pthread") {
         cmd.arg("-pthread");
@@ -835,7 +855,7 @@ mod budget_canary {
 
 #[cfg(test)]
 mod fp_contract_tests {
-    use super::CC_FLAGS;
+    use super::{cc_base_flags, CC_FLAGS, DEBUG_FLAG};
 
     /// The floating-point determinism seam is **locked into the build command**, not
     /// hoped for: every translation unit forbids FMA contraction and value-changing
@@ -848,5 +868,22 @@ mod fp_contract_tests {
         // And the value-changing escape hatches must never be present.
         assert!(!CC_FLAGS.iter().any(|f| *f == "-ffast-math" || *f == "-Ofast"),
             "no value-changing FP flags allowed: {CC_FLAGS:?}");
+    }
+
+    /// Wiring: every cc invocation carries `-g` so the emitted `#line` directives
+    /// reach DWARF — and it rides *alongside*, not *inside*, the determinism seam.
+    /// (Teeth: dropping `DEBUG_FLAG` from `cc_base_flags` fails the first assert;
+    /// folding `-g` into `CC_FLAGS` — which would corrupt the `attest` provenance —
+    /// fails the second.)
+    #[test]
+    fn debug_flag_is_carried_and_separate_from_the_determinism_seam() {
+        assert_eq!(DEBUG_FLAG, "-g");
+        let flags = cc_base_flags();
+        assert!(flags.contains(&"-g"), "cc command must carry -g for DWARF: {flags:?}");
+        // The base flags are the determinism seam plus exactly `-g`, in order.
+        assert!(CC_FLAGS.iter().all(|f| flags.contains(f)), "FP flags must survive: {flags:?}");
+        assert_eq!(flags.len(), CC_FLAGS.len() + 1, "only -g is added: {flags:?}");
+        // `-g` is a usability flag, never part of the locked determinism/provenance set.
+        assert!(!CC_FLAGS.contains(&"-g"), "-g must stay out of CC_FLAGS (attest provenance)");
     }
 }

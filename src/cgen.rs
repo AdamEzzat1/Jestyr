@@ -583,6 +583,22 @@ impl<'a> Cgen<'a> {
         let _ = writeln!(self.out, "{pad}{}", s.as_ref());
     }
 
+    /// Emit a C `#line <line> "<file>"` preprocessor directive for `span`, so a
+    /// debugger/profiler maps the generated C that follows back to its `.jtr`
+    /// source (gcc carries `#line` into DWARF). A **no-op** when there is no
+    /// source-region info — the single-file unit-test path leaves `TypeInfo::debug`
+    /// empty, keeping its emitted C byte-identical. The directive is written at
+    /// column 0 (preprocessor directives are not indented) and the path is
+    /// normalized to forward slashes so a Windows path like `C:\a\b.jtr` does not
+    /// turn `\a`/`\b` into C string escapes. `#line` is purely informational: it
+    /// never changes the program's behavior or the locked FP determinism flags.
+    fn line_directive(&mut self, span: Span) {
+        if let Some((path, line)) = self.info.debug.span_to_file_line(span) {
+            let norm = path.replace('\\', "/");
+            let _ = writeln!(self.out, "#line {line} \"{norm}\"");
+        }
+    }
+
     // --- top-level sections ---
 
     fn prelude(&mut self) {
@@ -1704,6 +1720,10 @@ impl<'a> Cgen<'a> {
         let sig = self.fn_signature(f, c_name);
         let returns_value = self.ret_type(f) != "void";
         self.raw(format!("{sig}\n"));
+        // Map the function's emitted body back to its `.jtr` declaration line
+        // (MVP granularity: once per function, at the name). Per-statement `#line`
+        // is increment (b).
+        self.line_directive(f.name.span);
         self.emit_fn_body(&f.body, returns_value, &f.requires);
         self.raw("\n");
         self.ptr_params.clear();
@@ -7974,6 +7994,119 @@ mod tests {
         assert!(pd.is_empty(), "parse: {:?}", pd);
         let (info, _td) = crate::typeck::check(&ast);
         emit_tests(&ast, &info)
+    }
+
+    /// Like [`gen`], but with single-file debug-info populated (path `t.jtr`,
+    /// base 0), so the backend emits `#line` directives — the loader path's
+    /// behavior, reproduced without a temp file.
+    fn gen_dbg(src: &str) -> (String, Vec<Diagnostic>) {
+        let (tokens, ld) = Lexer::new(src).tokenize();
+        assert!(ld.is_empty(), "lex: {:?}", ld);
+        let (ast, pd) = Parser::new(src, tokens).parse();
+        assert!(pd.is_empty(), "parse: {:?}", pd);
+        let (mut info, _td) = crate::typeck::check(&ast);
+        info.debug = crate::types::DebugInfo::new(
+            vec!["t.jtr".to_string()],
+            vec![src.to_string()],
+            vec![0],
+        );
+        emit(&ast, &info)
+    }
+
+    // ── debug info: `#line` directives (workstream: debug info, increment a) ───
+
+    /// Wiring: a function emits a `#line N "file"` directive with the *correct*
+    /// line for its declaration, and gates only on populated source.
+    #[test]
+    fn emits_line_directives() {
+        // `add` is declared on physical line 3 (1-based).
+        let src = "\n\nfn add(a: i32, b: i32) -> i32 { a + b }\n";
+        let (c, d) = gen_dbg(src);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(c.contains("#line 3 \"t.jtr\""), "expected `#line 3 \"t.jtr\"` in:\n{c}");
+        // The bare single-file path (empty debug) emits no `#line` — byte-identical.
+        let (plain, _) = gen(src);
+        assert!(!plain.contains("#line"), "no debug info ⇒ no `#line`:\n{plain}");
+    }
+
+    /// Wiring (multi-region): a span in an imported region resolves to *that*
+    /// region's path + local line, not the root's. Simulated with two regions in
+    /// the global buffer (the loader concatenates files with a `\n` separator).
+    #[test]
+    fn line_directive_points_at_the_imported_file() {
+        // Region 0 ("root.jtr"): `fn root...` then a newline separator.
+        // Region 1 ("dep.jtr"): a two-line file whose `fn dep` is local line 2.
+        let root = "fn root() -> i32 { 0 }\n";
+        let dep = "\nfn dep() -> i32 { 1 }\n";
+        let src = format!("{root}{dep}");
+        let (tokens, _) = Lexer::new(&src).tokenize();
+        let (ast, _) = Parser::new(&src, tokens).parse();
+        let (mut info, _td) = crate::typeck::check(&ast);
+        info.debug = crate::types::DebugInfo::new(
+            vec!["root.jtr".to_string(), "dep.jtr".to_string()],
+            vec![root.to_string(), dep.to_string()],
+            vec![0, root.len()],
+        );
+        let (c, _) = emit(&ast, &info);
+        assert!(c.contains("#line 1 \"root.jtr\""), "root fn maps to root.jtr:1:\n{c}");
+        assert!(c.contains("#line 2 \"dep.jtr\""), "dep fn maps to dep.jtr:2 (local line):\n{c}");
+    }
+
+    /// Unit: `span_to_file_line` on hand-chosen offsets — first byte, a newline
+    /// boundary, the last byte, a second region at a nonzero base, and an
+    /// out-of-range (synthesized) span. Region bases include the loader's `\n`
+    /// separator (`module.rs` pushes one between files), so region b's base is
+    /// `a.len() + 1`, not `a.len()` — there is no exact base collision in practice.
+    #[test]
+    fn span_to_file_line_maps_offsets() {
+        use crate::span::Span;
+        let a = "ab\ncd\n"; // bytes: a@0 b@1 \n@2 c@3 d@4 \n@5  (lines 1,2)
+        let b = "xy\n"; // its own line 1
+        let b_base = a.len() + 1; // +1 for the loader's region separator
+        let dbg = crate::types::DebugInfo::new(
+            vec!["a.jtr".to_string(), "b.jtr".to_string()],
+            vec![a.to_string(), b.to_string()],
+            vec![0, b_base],
+        );
+        let at = |o: usize| dbg.span_to_file_line(Span::new(o, o + 1));
+        assert_eq!(at(0), Some(("a.jtr", 1))); // first byte
+        assert_eq!(at(2), Some(("a.jtr", 1))); // the '\n' still closes line 1
+        assert_eq!(at(3), Some(("a.jtr", 2))); // first byte after the newline
+        assert_eq!(at(4), Some(("a.jtr", 2))); // last real byte of region a
+        assert_eq!(at(b_base), Some(("b.jtr", 1))); // first byte of region b
+        assert_eq!(at(b_base + 2), Some(("b.jtr", 1))); // its trailing '\n'
+        // A span past every region (synthesized) resolves to nothing.
+        assert_eq!(dbg.span_to_file_line(Span::new(999, 1000)), None);
+        // Empty tables ⇒ no resolution (the single-file unit-test path).
+        assert_eq!(
+            crate::types::DebugInfo::default().span_to_file_line(Span::new(0, 1)),
+            None
+        );
+    }
+
+    /// Behavioral wiring: enabling `#line` changes the C *only* by adding `#line`
+    /// lines — strip them and the output equals the no-debug build byte-for-byte.
+    #[test]
+    fn line_directives_are_purely_additive() {
+        let src = "fn a() -> i32 { 1 }\nfn b(x: i32) -> i32 { x }\n";
+        let (with, _) = gen_dbg(src);
+        let (without, _) = gen(src);
+        let stripped: String =
+            with.lines().filter(|l| !l.starts_with("#line ")).map(|l| format!("{l}\n")).collect();
+        assert_eq!(stripped, without, "removing `#line` lines must recover the plain C");
+        // Windows-style backslash paths are normalized so they aren't C escapes
+        // (`\p` / `\m` would otherwise be invalid/ambiguous escape sequences).
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
+        let (mut info, _td) = crate::typeck::check(&ast);
+        info.debug = crate::types::DebugInfo::new(
+            vec!["C:\\proj\\m.jtr".to_string()],
+            vec![src.to_string()],
+            vec![0],
+        );
+        let (c, _) = emit(&ast, &info);
+        assert!(c.contains("\"C:/proj/m.jtr\""), "backslashes normalized to forward slashes:\n{c}");
+        assert!(!c.contains("C:\\proj"), "no raw backslashes in a C string literal:\n{c}");
     }
 
     #[test]

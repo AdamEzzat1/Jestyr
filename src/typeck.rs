@@ -73,6 +73,15 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
         TypeInfo {
             table: tc.table,
             expr_types: tc.expr_types,
+            // Carry the per-region source tables so the backend can emit `#line`
+            // directives mapping generated C back to `.jtr`. `Modules::single`
+            // (the unit-test path) leaves `srcs` empty ⇒ no `#line` ⇒ that path's
+            // emitted C is byte-identical.
+            debug: DebugInfo::new(
+                modules.paths.clone(),
+                modules.srcs.clone(),
+                modules.bases.clone(),
+            ),
             item_mod,
             dup_fns: tc.dup,
             dup_types: tc.dup_types,

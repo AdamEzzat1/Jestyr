@@ -750,6 +750,96 @@ mod prop {
     }
 }
 
+/// Property tests for `#line` debug-info emission (workstream: debug info).
+///
+/// The on-thesis invariants are **behavioral invariance** (debug info must never
+/// change results — `#line` is purely additive, so stripping the directives
+/// recovers the no-debug C byte-for-byte), **bounded line numbers** (every
+/// emitted line is a real `1..=file_line_count`), and **determinism** (the
+/// debug-enabled emit is byte-identical across runs). All pure-Rust — they scan
+/// the emitted C, so they run under the toolchain-free default `cargo test`.
+mod debuginfo_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Emit C with single-file debug info populated (the loader path's behavior).
+    fn emit_with_debug(src: &str) -> String {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
+        let (mut info, _td) = typeck::check(&ast);
+        info.debug = crate::types::DebugInfo::new(
+            vec!["p.jtr".to_string()],
+            vec![src.to_string()],
+            vec![0],
+        );
+        cgen::emit(&ast, &info).0
+    }
+
+    /// Emit C with no debug info (empty tables) — no `#line` is produced.
+    fn emit_plain(src: &str) -> String {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
+        let (info, _td) = typeck::check(&ast);
+        cgen::emit(&ast, &info).0
+    }
+
+    /// Drop every `#line` directive, line-normalized — the canonical "what the C
+    /// would be without debug info" form, applied identically to both builds so a
+    /// trailing-newline difference can't masquerade as a real divergence.
+    fn without_line_directives(c: &str) -> String {
+        c.lines().filter(|l| !l.starts_with("#line ")).map(|l| format!("{l}\n")).collect()
+    }
+
+    proptest! {
+        /// **Behavioral invariance (the star).** Emitting `#line` only *adds*
+        /// `#line` lines: strip them and the result equals the no-debug build.
+        /// Debug info can never change the program the compiler produces.
+        #[test]
+        fn debug_info_is_purely_additive(p in super::prop::arb_program()) {
+            let dbg = emit_with_debug(&p);
+            let plain = emit_plain(&p);
+            prop_assert_eq!(without_line_directives(&dbg), without_line_directives(&plain));
+        }
+
+        /// **Bounded line numbers.** Every emitted `#line N` names a real source
+        /// line: `1 <= N <= file_line_count`. An off-by-one in `span_to_file_line`
+        /// that walked past the file end would trip the upper bound.
+        #[test]
+        fn line_numbers_are_in_range(p in super::prop::arb_program()) {
+            let c = emit_with_debug(&p);
+            // A real token's offset is always < src.len(), so the largest line a
+            // span can resolve to is `newline_count + 1`.
+            let max_line = p.matches('\n').count() as u32 + 1;
+            for l in c.lines() {
+                if let Some(rest) = l.strip_prefix("#line ") {
+                    let n: u32 = rest.split_whitespace().next().unwrap().parse().unwrap();
+                    prop_assert!(n >= 1, "line number must be >= 1: {l}");
+                    prop_assert!(n <= max_line, "line {n} exceeds file line count {max_line}: {l}");
+                }
+            }
+        }
+
+        /// **Determinism preserved.** Debug-enabled emission is byte-identical
+        /// across runs — no `HashMap`/`HashSet` order leaks via the `#line` path.
+        #[test]
+        fn debug_emit_is_deterministic(p in super::prop::arb_program()) {
+            prop_assert_eq!(emit_with_debug(&p), emit_with_debug(&p));
+        }
+
+        /// Every emitted directive is *well-formed*: a quoted path, no embedded
+        /// newline inside the quotes, and no raw backslash (paths are normalized).
+        #[test]
+        fn emitted_directives_are_well_formed(p in super::prop::arb_program()) {
+            for l in emit_with_debug(&p).lines() {
+                if l.starts_with("#line ") {
+                    prop_assert!(l.matches('"').count() == 2, "path must be quoted: {l}");
+                    prop_assert!(!l.contains('\\'), "path must be backslash-free: {l}");
+                }
+            }
+        }
+    }
+}
+
 /// Property tests for deterministic Drop/RAII scope-exit glue (design Phase 3).
 ///
 /// The oracle is *known by construction*: a generator builds a program with a
@@ -1842,10 +1932,27 @@ mod modules_props {
 
     static CASE: AtomicU64 = AtomicU64::new(0);
 
-    /// Write `files` to a fresh, uniquely-named temp dir, run load → type-check →
-    /// escape → lower, and return (all diagnostic messages, emitted C). The dir is
-    /// removed afterwards.
-    fn pipeline_multi(files: &[(String, String)]) -> (Vec<String>, String) {
+    /// Run load → type-check → escape → lower over a materialized dir, returning
+    /// (all diagnostic messages, emitted C). Pulled out of [`pipeline_multi`] so a
+    /// determinism check can build *twice from the same directory*: the emitted C
+    /// now carries `#line` directives naming the loaded file paths (debug info), so
+    /// two builds are byte-identical only when they share a path — exactly as a C
+    /// toolchain bakes the path you pass it. The per-call unique dir of
+    /// `pipeline_multi` is the right default for a single build; determinism
+    /// comparisons use [`pipeline_multi_twice`] to hold the path fixed.
+    fn compile_dir(dir: &std::path::Path) -> (Vec<String>, String) {
+        let prog = crate::module::load(dir.join("main.jtr").to_str().unwrap());
+        let mut diags: Vec<String> = prog.diags.iter().map(|d| d.message.clone()).collect();
+        let (info, td) = typeck::check_program(&prog.ast, &prog.modules);
+        diags.extend(td.iter().map(|d| d.message.clone()));
+        diags.extend(escape::check(&prog.ast, &info).iter().map(|d| d.message.clone()));
+        let (c, cd) = cgen::emit(&prog.ast, &info);
+        diags.extend(cd.iter().map(|d| d.message.clone()));
+        (diags, c)
+    }
+
+    /// Materialize `files` into a fresh, uniquely-named temp dir.
+    fn materialize(files: &[(String, String)]) -> std::path::PathBuf {
         let id = CASE.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("jestyr_modprop_{id:016x}"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1857,15 +1964,28 @@ mod modules_props {
             }
             std::fs::write(path, src).unwrap();
         }
-        let prog = crate::module::load(dir.join("main.jtr").to_str().unwrap());
-        let mut diags: Vec<String> = prog.diags.iter().map(|d| d.message.clone()).collect();
-        let (info, td) = typeck::check_program(&prog.ast, &prog.modules);
-        diags.extend(td.iter().map(|d| d.message.clone()));
-        diags.extend(escape::check(&prog.ast, &info).iter().map(|d| d.message.clone()));
-        let (c, cd) = cgen::emit(&prog.ast, &info);
-        diags.extend(cd.iter().map(|d| d.message.clone()));
+        dir
+    }
+
+    /// Write `files` to a fresh, uniquely-named temp dir, compile, and return
+    /// (all diagnostic messages, emitted C). The dir is removed afterwards.
+    fn pipeline_multi(files: &[(String, String)]) -> (Vec<String>, String) {
+        let dir = materialize(files);
+        let out = compile_dir(&dir);
         let _ = std::fs::remove_dir_all(&dir);
-        (diags, c)
+        out
+    }
+
+    /// Compile the same materialized program **twice from one directory**, so the
+    /// path baked into `#line` is held fixed — the apples-to-apples determinism
+    /// comparison now that the emitted C is a function of the loaded path. Returns
+    /// (first build's diagnostics, first C, second C).
+    fn pipeline_multi_twice(files: &[(String, String)]) -> (Vec<String>, String, String) {
+        let dir = materialize(files);
+        let (diags, a) = compile_dir(&dir);
+        let b = compile_dir(&dir).1;
+        let _ = std::fs::remove_dir_all(&dir);
+        (diags, a, b)
     }
 
     /// `n` (2..=3) sibling modules, each defining `pub fn f` and a private
@@ -1912,10 +2032,12 @@ mod modules_props {
             }
         }
 
-        /// **Determinism.** The same multi-module program lowers to byte-identical C.
+        /// **Determinism.** The same multi-module program lowers to byte-identical C
+        /// (built twice from one directory, so the `#line` paths are held fixed).
         #[test]
         fn multimodule_compilation_is_deterministic(files in arb_multimod()) {
-            prop_assert_eq!(pipeline_multi(&files).1, pipeline_multi(&files).1);
+            let (_diags, a, b) = pipeline_multi_twice(&files);
+            prop_assert_eq!(a, b);
         }
 
         /// **Negative soundness.** Calling a sibling's `f` *unqualified* from the
@@ -1951,12 +2073,12 @@ mod modules_props {
                 fns.push_str(&format!("fn use{j}(p: m{j}.T{j}) -> i32 {{ return p.a }}\n"));
             }
             files.insert(0, ("main.jtr".to_string(), format!("{imports}{fns}fn main() -> i32 {{ return 0 }}")));
-            let (diags, c) = pipeline_multi(&files);
+            let (diags, c, c2) = pipeline_multi_twice(&files);
             prop_assert!(diags.is_empty(), "qualified type paths compile cleanly: {:?}", diags);
             for j in 0..k {
                 prop_assert!(c.contains(&format!("jestyr_use{j}(Jestyr_T{j}")), "T{j} lowered:\n{c}");
             }
-            prop_assert_eq!(pipeline_multi(&files).1, c);
+            prop_assert_eq!(c2, c);
         }
 
         /// **Directory-as-module is one shared namespace + deterministic.** A `pkg/`
@@ -1978,13 +2100,13 @@ mod modules_props {
                 files.push((format!("pkg/g{j}.jtr"), body));
             }
             files.push(("main.jtr".to_string(), format!("import \"pkg\"\nfn main() -> i32 {{ return pkg.f{}() }}", k - 1)));
-            let (diags, c) = pipeline_multi(&files);
+            let (diags, c, c2) = pipeline_multi_twice(&files);
             prop_assert!(diags.is_empty(), "package files share a namespace and compile: {:?}", diags);
             // One module for the whole package: every f<j> emits a bare symbol.
             for j in 0..k {
                 prop_assert!(c.contains(&format!("jestyr_f{j}(void)")), "f{j} emitted:\n{c}");
             }
-            prop_assert_eq!(pipeline_multi(&files).1, c);
+            prop_assert_eq!(c2, c);
         }
 
         /// **Module content-hash: comment/whitespace-insensitive, deterministic, and
@@ -2022,14 +2144,14 @@ mod modules_props {
             }
             body.push_str(" }");
             files.insert(0, ("main.jtr".to_string(), format!("{imports}{uses}{body}")));
-            let (diags, c) = pipeline_multi(&files);
+            let (diags, c, c2) = pipeline_multi_twice(&files);
             prop_assert!(diags.is_empty(), "collidable `T` compiles: {:?}", diags);
             // Module ids are 1..=k (main is 0); each `T` is disambiguated by id.
             for id in 1..=k {
                 prop_assert!(c.contains(&format!("Jestyr_T__m{id}")), "T__m{id} present:\n{c}");
             }
             prop_assert!(!c.contains("struct Jestyr_T "), "the bare `Jestyr_T` must not appear:\n{c}");
-            prop_assert_eq!(pipeline_multi(&files).1, c);
+            prop_assert_eq!(c2, c);
         }
 
         /// **Pinned-hash verification round-trips.** Pinning an import to the
@@ -2388,6 +2510,36 @@ mod fuzz {
     fn fuzz_pipeline() {
         bolero::check!().with_type::<String>().for_each(|s: &String| {
             run_pipeline(s);
+        });
+    }
+
+    /// **`#line` debug-info emission never panics and never malforms a directive.**
+    /// Wrap arbitrary source in a function (so the backend reaches the per-function
+    /// `#line` site) with single-file debug info populated, then assert every
+    /// emitted directive is well-formed: a line number ≥ 1, a quoted path, no
+    /// embedded newline, no raw backslash. `span_to_file_line` must be total over
+    /// any spans the arbitrary body produces.
+    #[test]
+    fn fuzz_line_directives() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let src = format!("fn f() {{ {s} }}");
+            let (tokens, _) = Lexer::new(&src).tokenize();
+            let (ast, _) = Parser::new(&src, tokens).parse();
+            let (mut info, _td) = typeck::check(&ast);
+            info.debug = crate::types::DebugInfo::new(
+                vec!["f.jtr".to_string()],
+                vec![src.to_string()],
+                vec![0],
+            );
+            let (c, _) = cgen::emit(&ast, &info);
+            for l in c.lines() {
+                if let Some(rest) = l.strip_prefix("#line ") {
+                    let n: u32 = rest.split_whitespace().next().unwrap().parse().unwrap();
+                    assert!(n >= 1, "line >= 1: {l}");
+                    assert_eq!(l.matches('"').count(), 2, "path quoted: {l}");
+                    assert!(!l.contains('\\'), "no raw backslash: {l}");
+                }
+            }
         });
     }
 

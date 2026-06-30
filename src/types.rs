@@ -334,11 +334,67 @@ pub struct MethodRes {
     pub recv_conv: Conv,
 }
 
+/// Source-region tables for emitting C `#line N "file.jtr"` debug directives.
+///
+/// A `Span` is a byte offset into the *concatenated* multi-file source buffer;
+/// to map it back to a `(file, line)` we need each source region's path, its own
+/// text, and its base offset in that buffer — exactly the per-region arrays the
+/// module loader already keeps for diagnostic rendering ([`crate::module::Modules`]).
+/// We copy them here so the backend, which only sees a [`TypeInfo`], can resolve a
+/// span without taking a `Modules` argument (`cgen::emit` has a wide call surface).
+///
+/// **Empty by default.** The single-file unit-test path ([`crate::typeck::check`]
+/// via `Modules::single`) leaves `srcs` empty, so [`span_to_file_line`] returns
+/// `None` and the backend emits no `#line` — keeping that path's emitted C
+/// byte-identical. Only the real loader path (`check_program`) populates it.
+///
+/// [`span_to_file_line`]: DebugInfo::span_to_file_line
+#[derive(Default)]
+pub struct DebugInfo {
+    /// Display path of each source region (1:1 with `Modules::paths`).
+    paths: Vec<String>,
+    /// Each region's own source text — needed to count newlines for a line number.
+    srcs: Vec<String>,
+    /// Each region's base offset within the concatenated global source buffer.
+    bases: Vec<usize>,
+}
+
+impl DebugInfo {
+    /// Build the region tables from the loaded modules (the loader path). The
+    /// arrays are 1:1 with `Modules`'s per-region vectors.
+    pub fn new(paths: Vec<String>, srcs: Vec<String>, bases: Vec<usize>) -> DebugInfo {
+        DebugInfo { paths, srcs, bases }
+    }
+
+    /// Resolve a global span to `(file path, 1-based line)`, or `None` when there
+    /// is no region info (empty tables — the single-file unit-test path) or the
+    /// span falls outside every region (a synthesized span). Mirrors
+    /// `Modules::region_of`'s base-offset range lookup, then [`crate::span::line_col`]
+    /// on *that region's* source so an imported file gets its own line, not the
+    /// root's. Pure and side-effect-free: `#line` never changes program behavior.
+    pub fn span_to_file_line(&self, span: crate::span::Span) -> Option<(&str, u32)> {
+        let at = span.start as usize;
+        for r in 0..self.bases.len() {
+            let lo = self.bases[r];
+            let hi = lo + self.srcs[r].len();
+            if at >= lo && at <= hi {
+                let local = (at - lo) as u32;
+                let line = crate::span::line_col(&self.srcs[r], local).line;
+                return Some((&self.paths[r], line));
+            }
+        }
+        None
+    }
+}
+
 /// The result of type checking: the global table plus a type for every
 /// expression (indexed by `ExprId`).
 pub struct TypeInfo {
     pub table: GlobalTable,
     pub expr_types: Vec<Ty>,
+    /// Source-region tables for `#line` debug directives (empty on the
+    /// single-file unit-test path, so its emitted C is byte-identical).
+    pub debug: DebugInfo,
     /// The owning module of each item in `Ast::items` (parallel vector), so the
     /// backend can compute a definition's canonical symbol via [`canon`].
     pub item_mod: Vec<ModId>,
