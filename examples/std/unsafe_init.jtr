@@ -1,0 +1,17 @@
+// B4 demo — `unsafe { … }` is now a valid `let`/`var` initializer.
+//
+// Before, an `unsafe` block was only valid in statement/return position, so a
+// pointer read had to route through a tail-`unsafe` reader *helper function*
+// (see the note in std/intern.jtr). Now the read can be written inline:
+//
+//     let v: T = unsafe { p.* }
+//
+// `unsafe` is a compile-time *permission* marker with no runtime effect, so in
+// value position the block lowers to exactly its tail expression's value.
+fn main() -> i32 {
+    var d: *mut i64 = alloc(i64, 1)
+    unsafe { d.* = 42 }
+    let y: i64 = unsafe { d.* } // <- the unsafe block directly initializes `y`
+    print_int(y)
+    return 0
+}

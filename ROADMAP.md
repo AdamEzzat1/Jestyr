@@ -533,8 +533,11 @@ classification). Lexes a built-in sample deterministically and a real file from 
 
 **Surfaced by the slice (gaps, with status):** ~~Jestyr doesn't auto-drop **struct
 fields**~~ — **fixed (B1):** RAII now recurses into owned struct fields and live enum
-payloads, so containers-of-containers free automatically (no manual frees). `unsafe {}`
-isn't a valid `let` initializer (use a tail-`unsafe` reader helper). **Per-module
+payloads, so containers-of-containers free automatically (no manual frees). ~~`unsafe {}`
+isn't a valid `let` initializer~~ — **fixed (B4):** a value-position `unsafe { … }` (and a
+plain `{ … }`) yields its tail expression, so `let v = unsafe { p.* }` works inline
+(`unsafe` is a compile-time marker — zero runtime effect; `examples/std/unsafe_init.jtr`).
+**Per-module
 namespaces** (K)
 used to bite as soon as two std modules shared a helper name (`make`, `destroy`,
 `hash_str`, …) — **fixed (increment 1):** functions/consts are now per-module, so

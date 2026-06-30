@@ -43,7 +43,9 @@ pub fn count(read it: Interner) -> usize {
     return it.n
 }
 
-// Pointer reads via tail-`unsafe` helpers (`unsafe {}` can't be a `let` initializer).
+// Pointer reads via a tail-`unsafe` helper. (As of B4, `unsafe { … }` is also a
+// valid `let`/`var` initializer, so a caller could inline `let s = unsafe { (p+i).* }`;
+// the helper is kept here for readability.)
 fn slot_at(p: *mut ISlot, i: usize) -> ISlot {
     unsafe { (p + i).* }
 }

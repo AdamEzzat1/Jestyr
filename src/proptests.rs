@@ -736,7 +736,7 @@ mod prop {
     /// A recursively-built, always-valid arithmetic expression. Identifiers are
     /// `x`-prefixed so they can never collide with a keyword — no Jestyr keyword
     /// begins with `x` (whereas `v` would admit `var`).
-    fn arb_expr() -> impl Strategy<Value = String> {
+    pub(super) fn arb_expr() -> impl Strategy<Value = String> {
         let leaf = prop_oneof![
             (0u32..1000).prop_map(|n| n.to_string()),
             "x[a-z0-9]{0,4}".prop_map(|s| s),
@@ -836,6 +836,46 @@ mod debuginfo_props {
                     prop_assert!(!l.contains('\\'), "path must be backslash-free: {l}");
                 }
             }
+        }
+    }
+}
+
+/// Property tests for B4 — `unsafe`/block as a value (a `let`/`var` initializer).
+///
+/// The invariant is **transparency**: `unsafe { E }` (and a plain `{ E }`) in
+/// value position is byte-identical to bare `E`, because `unsafe` is a
+/// compile-time permission marker with no runtime effect. Plus determinism and
+/// totality. All pure-Rust (scan emitted C) — toolchain-free.
+mod unsafe_init_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    // Each property builds `fn f() { let y = <init> return 0 }` — `return 0`
+    // (not `y`) so the body type-checks for any expression shape, and an unused
+    // `y` warns identically on the wrapped and bare sides (so the metamorphic
+    // equality still holds).
+    proptest! {
+        /// `unsafe { E }` as an initializer ≡ bare `E` (the transparency invariant).
+        #[test]
+        fn unsafe_initializer_is_transparent(e in super::prop::arb_expr()) {
+            let wrapped = format!("fn f() -> i32 {{ let y = unsafe {{ {e} }} return 0 }}");
+            let bare = format!("fn f() -> i32 {{ let y = {e} return 0 }}");
+            prop_assert_eq!(compile(&wrapped), compile(&bare));
+        }
+
+        /// A plain `{ E }` block as an initializer ≡ bare `E`.
+        #[test]
+        fn block_initializer_is_transparent(e in super::prop::arb_expr()) {
+            let block = format!("fn f() -> i32 {{ let y = {{ {e} }} return 0 }}");
+            let bare = format!("fn f() -> i32 {{ let y = {e} return 0 }}");
+            prop_assert_eq!(compile(&block), compile(&bare));
+        }
+
+        /// Determinism: the unsafe-initializer form compiles byte-identically twice.
+        #[test]
+        fn unsafe_initializer_is_deterministic(e in super::prop::arb_expr()) {
+            let s = format!("fn f() -> i32 {{ let y = unsafe {{ {e} }} return 0 }}");
+            prop_assert_eq!(compile(&s), compile(&s));
         }
     }
 }
@@ -2510,6 +2550,21 @@ mod fuzz {
     fn fuzz_pipeline() {
         bolero::check!().with_type::<String>().for_each(|s: &String| {
             run_pipeline(s);
+        });
+    }
+
+    /// **Value-position `unsafe`/block lowering never panics (B4, totality).**
+    /// Drive arbitrary source as the body of an `unsafe`-block `let` initializer
+    /// through the full parse→typeck→cgen pipeline; the new value-position lowering
+    /// must be total on any input.
+    #[test]
+    fn fuzz_unsafe_blocks() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let src = format!("fn f() -> i32 {{ let y = unsafe {{ {s} }} return 0 }}");
+            let (tokens, _) = Lexer::new(&src).tokenize();
+            let (ast, _) = Parser::new(&src, tokens).parse();
+            let (info, _td) = typeck::check(&ast);
+            let _ = cgen::emit(&ast, &info);
         });
     }
 
@@ -5432,6 +5487,11 @@ mod c_oracle {
     #[test]
     fn reductions_demo() {
         assert_eq!(toks("examples/std/reductions.jtr"), ["10", "10", "10", "0", "2", "0"]);
+    }
+    /// B4 end-to-end: `let y = unsafe { d.* }` reads the pointer and prints 42.
+    #[test]
+    fn unsafe_init_demo() {
+        assert_eq!(toks("examples/std/unsafe_init.jtr"), ["42"]);
     }
     #[test]
     fn numbers_demo() {

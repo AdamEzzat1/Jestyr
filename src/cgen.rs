@@ -4177,7 +4177,28 @@ impl<'a> Cgen<'a> {
                 self.diag(span, "the C backend does not support type-expressions yet");
                 "0".to_string()
             }
-            ExprKind::Block(_) | ExprKind::If { .. } | ExprKind::Unsafe(_) => {
+            ExprKind::Unsafe(b) | ExprKind::Block(b) => {
+                // In *value* position (e.g. `let v = unsafe { (p + i).* }`), a block
+                // yields its tail expression's value. `unsafe` is a compile-time
+                // permission marker with no runtime effect, so it lowers to exactly
+                // its inner value — that is the B4 self-host unblock (an `unsafe`
+                // block is now a valid `let`/`var` initializer). We support the
+                // single-tail-expression form (by far the common case, and all the
+                // self-host readers need); a value block with leading statements
+                // would need a GNU statement-expression with drop-safe spilling and
+                // stays a clear error for now.
+                if let [Stmt::Expr(e)] = b.stmts.as_slice() {
+                    self.emit_expr(*e)
+                } else {
+                    self.diag(
+                        span,
+                        "a block used as a value must be a single tail expression here \
+                         (only statement/return position supports multi-statement blocks)",
+                    );
+                    "0".to_string()
+                }
+            }
+            ExprKind::If { .. } => {
                 self.diag(span, "this control-flow expression is only supported in statement or return position");
                 "0".to_string()
             }
@@ -8162,6 +8183,48 @@ mod tests {
         assert!(c.contains("#line 2 \"t.jtr\""), "`let a` on line 2:\n{c}");
         assert!(c.contains("#line 3 \"t.jtr\""), "`let b` on line 3:\n{c}");
         assert!(c.contains("#line 4 \"t.jtr\""), "`return` on line 4:\n{c}");
+    }
+
+    // ── B4: `unsafe`/block as a value (let/var initializer) ───────────────────
+
+    /// Wiring: `unsafe { p.* }` as a `let` initializer lowers to the inner deref
+    /// with no diagnostic and no statement-position rejection.
+    #[test]
+    fn unsafe_block_is_a_valid_value_initializer() {
+        let src = "fn f() -> i64 { var d: *mut i64 = alloc(i64, 1) let y: i64 = unsafe { d.* } return y }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "no diagnostics for an unsafe initializer: {d:?}");
+        assert!(c.contains("int64_t j_y = (*j_d);"), "unsafe init lowers to the deref:\n{c}");
+        assert!(!c.contains("only supported in statement"), "no value-position rejection:\n{c}");
+    }
+
+    /// Metamorphic wiring: `unsafe { E }` in value position is byte-identical to
+    /// bare `E` — `unsafe` is a compile-time marker with no runtime effect.
+    #[test]
+    fn unsafe_value_block_equals_the_bare_expression() {
+        let wrapped = "fn f() -> i64 { let y: i64 = unsafe { 3 + 4 } return y }";
+        let bare = "fn f() -> i64 { let y: i64 = 3 + 4 return y }";
+        assert_eq!(gen(wrapped).0, gen(bare).0, "`unsafe {{ E }}` ≡ `E` as a value");
+    }
+
+    /// A plain `{ E }` block also yields its tail expression in value position.
+    #[test]
+    fn plain_block_yields_its_tail_as_a_value() {
+        let block = "fn f() -> i64 { let y: i64 = { 5 + 6 } return y }";
+        let bare = "fn f() -> i64 { let y: i64 = 5 + 6 return y }";
+        assert_eq!(gen(block).0, gen(bare).0, "`{{ E }}` ≡ `E` as a value");
+    }
+
+    /// A value-position block with leading statements is still a clear error (the
+    /// statement-expression form is future work, not silently miscompiled).
+    #[test]
+    fn multi_statement_value_block_is_rejected() {
+        let src = "fn f() -> i64 { var d: *mut i64 = alloc(i64, 1) let y: i64 = unsafe { d.* = 1 d.* } return y }";
+        let (_c, d) = gen(src);
+        assert!(
+            d.iter().any(|x| x.message.contains("single tail expression")),
+            "a multi-statement value block must error: {d:?}"
+        );
     }
 
     /// Increment (c): a contract's lowered `assert` is preceded by a `#line` at the
