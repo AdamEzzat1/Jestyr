@@ -173,6 +173,7 @@ fn emit_program(
         out: String::new(),
         diags: Vec::new(),
         depth: 0,
+        dbg_last: None,
         cur_mod: 0,
         ptr_params: HashSet::new(),
         variants,
@@ -403,6 +404,11 @@ struct Cgen<'a> {
     out: String,
     diags: Vec<Diagnostic>,
     depth: usize,
+    /// The `(path, line)` of the last `#line` directive emitted, so per-statement
+    /// debug info only emits a directive when the source line actually changes
+    /// (increment b). Reset to `None` at each function entry. Always `None`'s
+    /// effect on the empty-debug path: `mark_line` is a no-op there.
+    dbg_last: Option<(String, u32)>,
     /// Names of the current function's by-pointer (`mut`/`out`) parameters, which
     /// must be dereferenced on use.
     ptr_params: HashSet<String>,
@@ -583,19 +589,37 @@ impl<'a> Cgen<'a> {
         let _ = writeln!(self.out, "{pad}{}", s.as_ref());
     }
 
-    /// Emit a C `#line <line> "<file>"` preprocessor directive for `span`, so a
-    /// debugger/profiler maps the generated C that follows back to its `.jtr`
-    /// source (gcc carries `#line` into DWARF). A **no-op** when there is no
-    /// source-region info — the single-file unit-test path leaves `TypeInfo::debug`
-    /// empty, keeping its emitted C byte-identical. The directive is written at
-    /// column 0 (preprocessor directives are not indented) and the path is
-    /// normalized to forward slashes so a Windows path like `C:\a\b.jtr` does not
-    /// turn `\a`/`\b` into C string escapes. `#line` is purely informational: it
-    /// never changes the program's behavior or the locked FP determinism flags.
-    fn line_directive(&mut self, span: Span) {
-        if let Some((path, line)) = self.info.debug.span_to_file_line(span) {
-            let norm = path.replace('\\', "/");
-            let _ = writeln!(self.out, "#line {line} \"{norm}\"");
+    /// Emit a C `#line <line> "<file>"` preprocessor directive for `span` — but
+    /// only when the resolved `(path, line)` differs from the last one emitted, so
+    /// a run of statements on the same source line costs one directive, not many
+    /// (increment b). A debugger/profiler then maps the generated C that follows
+    /// back to its `.jtr` source (gcc carries `#line` into DWARF).
+    ///
+    /// A **no-op** when there is no source-region info — the single-file unit-test
+    /// path leaves `TypeInfo::debug` empty, keeping its emitted C byte-identical.
+    /// The directive is written at column 0 (preprocessor directives are not
+    /// indented) and the path is normalized to forward slashes so a Windows path
+    /// like `C:\a\b.jtr` does not turn `\a`/`\b` into C string escapes. `#line` is
+    /// purely additive: it never changes behavior or the locked FP determinism flags.
+    fn mark_line(&mut self, span: Span) {
+        // Resolve to an owned `(path, line)` first, ending the borrow of `self.info`
+        // before mutating `self.out`/`self.dbg_last`.
+        let resolved = self.info.debug.span_to_file_line(span).map(|(p, l)| (p.replace('\\', "/"), l));
+        if let Some((norm, line)) = resolved {
+            if self.dbg_last.as_ref().map(|(p, l)| (p.as_str(), *l)) != Some((norm.as_str(), line)) {
+                let _ = writeln!(self.out, "#line {line} \"{norm}\"");
+                self.dbg_last = Some((norm, line));
+            }
+        }
+    }
+
+    /// The source span of a statement, for `#line` mapping: `Let`/`Return` carry
+    /// their own span; an expression-statement uses its expression's span.
+    fn stmt_span(&self, stmt: &Stmt) -> Span {
+        match stmt {
+            Stmt::Let { span, .. } => *span,
+            Stmt::Return { span, .. } => *span,
+            Stmt::Expr(e) => self.ast.expr_at(*e).span,
         }
     }
 
@@ -1720,10 +1744,11 @@ impl<'a> Cgen<'a> {
         let sig = self.fn_signature(f, c_name);
         let returns_value = self.ret_type(f) != "void";
         self.raw(format!("{sig}\n"));
-        // Map the function's emitted body back to its `.jtr` declaration line
-        // (MVP granularity: once per function, at the name). Per-statement `#line`
-        // is increment (b).
-        self.line_directive(f.name.span);
+        // Map the function's emitted body back to its `.jtr` declaration line. The
+        // per-statement directives (increment b) then refine the mapping; reset the
+        // dedup state so this entry directive always fires for a new function.
+        self.dbg_last = None;
+        self.mark_line(f.name.span);
         self.emit_fn_body(&f.body, returns_value, &f.requires);
         self.raw("\n");
         self.ptr_params.clear();
@@ -1749,6 +1774,10 @@ impl<'a> Cgen<'a> {
         for (i, stmt) in block.stmts.iter().enumerate() {
             let last = i + 1 == n;
             if last && ret {
+                // The tail is emitted as a `return` directly (bypassing
+                // `emit_stmt`), so map its line here for per-statement debug info.
+                let sp = self.stmt_span(stmt);
+                self.mark_line(sp);
                 match stmt {
                     Stmt::Expr(e) => self.emit_return(Some(*e)),
                     Stmt::Return { value, .. } => self.emit_return(*value),
@@ -2536,6 +2565,10 @@ impl<'a> Cgen<'a> {
         for (i, stmt) in block.stmts.iter().enumerate() {
             let last = i + 1 == n;
             if last && ret {
+                // The tail is emitted as a `return` directly (bypassing
+                // `emit_stmt`), so map its line here for per-statement debug info.
+                let sp = self.stmt_span(stmt);
+                self.mark_line(sp);
                 match stmt {
                     Stmt::Expr(e) => self.emit_return(Some(*e)),
                     Stmt::Return { value, .. } => self.emit_return(*value),
@@ -2555,6 +2588,10 @@ impl<'a> Cgen<'a> {
     }
 
     fn emit_stmt(&mut self, stmt: &Stmt) {
+        // Per-statement `#line`: map the C that follows back to this statement's
+        // source line (deduped — only emits when the line changes).
+        let sp = self.stmt_span(stmt);
+        self.mark_line(sp);
         match stmt {
             Stmt::Let { name, ty, init, .. } => {
                 let cty = if let Some(t) = ty {
@@ -8107,6 +8144,31 @@ mod tests {
         let (c, _) = emit(&ast, &info);
         assert!(c.contains("\"C:/proj/m.jtr\""), "backslashes normalized to forward slashes:\n{c}");
         assert!(!c.contains("C:\\proj"), "no raw backslashes in a C string literal:\n{c}");
+    }
+
+    /// Increment (b): each statement on its own line gets its own `#line`.
+    #[test]
+    fn per_statement_line_directives() {
+        let src = "fn f() -> i32 {\n    let a = 1\n    let b = 2\n    return a + b\n}\n";
+        let (c, d) = gen_dbg(src);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(c.contains("#line 2 \"t.jtr\""), "`let a` on line 2:\n{c}");
+        assert!(c.contains("#line 3 \"t.jtr\""), "`let b` on line 3:\n{c}");
+        assert!(c.contains("#line 4 \"t.jtr\""), "`return` on line 4:\n{c}");
+    }
+
+    /// Increment (b): a run of statements on *one* physical line costs a single
+    /// directive, not one per statement (the dedup that keeps the C from bloating).
+    #[test]
+    fn line_directives_dedup_within_a_line() {
+        let src = "fn f() -> i32 {\n    let a = 1 let b = 2 return a + b\n}\n";
+        let (c, d) = gen_dbg(src);
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(
+            c.matches("#line 2 \"t.jtr\"").count(),
+            1,
+            "three statements share line 2 ⇒ exactly one directive:\n{c}"
+        );
     }
 
     #[test]
