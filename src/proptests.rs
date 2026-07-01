@@ -5512,6 +5512,61 @@ mod c_oracle {
         build_and_run(rel).split_whitespace().map(|s| s.to_string()).collect()
     }
 
+    /// Compile `rel` to an executable and return its path (does NOT run it) — for
+    /// programs that take command-line arguments, like the self-hosting lexer.
+    fn build_exe(rel: &str) -> std::path::PathBuf {
+        let prog = crate::module::load(rel);
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "load errors in {rel}: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(!td.iter().any(|d| d.is_error()), "typeck errors in {rel}");
+        assert!(!crate::escape::check(&prog.ast, &info).iter().any(|d| d.is_error()), "escape errors in {rel}");
+        let (c_src, _cd) = crate::cgen::emit(&prog.ast, &info);
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let stem: String = rel.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        let dir = std::env::temp_dir();
+        let cfile = dir.join(format!("jestyr_exe_{stem}_{uniq}.c"));
+        let exe = dir.join(format!("jestyr_exe_{stem}_{uniq}{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&cfile, &c_src).unwrap();
+        let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
+        let mut cmd = Command::new(&cc);
+        cmd.args(crate::CC_FLAGS);
+        if c_src.contains("pthread") {
+            cmd.arg("-pthread");
+        }
+        assert!(cmd.arg("-o").arg(&exe).arg(&cfile).status().unwrap().success(), "gcc failed for {rel}");
+        exe
+    }
+
+    /// The Rust *reference* lexer's lexeme stream for `src`: each non-`Eof` token's
+    /// exact source text. The oracle the Jestyr-written lexer must reproduce.
+    fn rust_lexemes(src: &str) -> Vec<String> {
+        use crate::token::TokenKind;
+        crate::lexer::Lexer::new(src)
+            .tokenize()
+            .0
+            .into_iter()
+            .filter(|t| t.kind != TokenKind::Eof)
+            .map(|t| src[t.span.range()].to_string())
+            .collect()
+    }
+
+    /// The Jestyr lexer's lexeme stream for a file: run the built lexer exe with the
+    /// file as argv[1], take its stdout lines, and drop the trailing 6 summary
+    /// numbers. (Token lexemes in the corpus never contain a raw newline — strings
+    /// are single-line, block comments are skipped — so one-lexeme-per-line holds.)
+    fn jestyr_lexemes(lexer_exe: &std::path::Path, file: &str) -> Vec<String> {
+        let out = Command::new(lexer_exe).arg(file).output().unwrap();
+        assert!(out.status.success(), "jestyr lexer failed on {file}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+        let n = lines.len();
+        assert!(n >= 6, "lexer output too short for {file}: {text}");
+        lines.truncate(n - 6); // the summary: total, kw, id, num, punct, distinct
+        lines
+    }
+
     /// Build `rel`'s `@test`/`@bench` **harness** (narrowed by `filter`) through the
     /// real gcc pipeline — exactly what `jestyrc test [substr]` does — run it, and
     /// return `(stdout, exit_code)`. The exit code is the runner's pass/fail tally
@@ -5784,6 +5839,68 @@ mod c_oracle {
                 "19", "2", "8", "0", "9", "4",
             ]
         );
+    }
+
+    /// **P1 cross-implementation golden.** The Jestyr-written lexer produces the
+    /// *exact same token (lexeme) stream* as the Rust reference lexer, across a
+    /// diverse slice of the real corpus — strings, floats, hex/binary ints, char
+    /// literals, f-strings, nested block comments, and every multi-char operator.
+    /// This is the P1 acceptance test: the front-end port is faithful token-for-token.
+    #[test]
+    fn jestyr_lexer_matches_reference_on_corpus() {
+        let lexer = build_exe("examples/std/lexer.jtr");
+        // Walk the *entire* example corpus (examples/ + examples/std/), sorted for
+        // determinism — every real Jestyr file, not a hand-picked slice.
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for dir in ["examples", "examples/std"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("jtr") {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+        files.sort();
+        assert!(files.len() > 20, "expected the whole corpus, found {}", files.len());
+        for p in &files {
+            let f = p.to_str().unwrap();
+            let src = std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {f}: {e}"));
+            let want = rust_lexemes(&src);
+            let got = jestyr_lexemes(&lexer, f);
+            assert_eq!(got, want, "Jestyr lexer diverged from the reference on {f}");
+        }
+        eprintln!("cross-checked {} corpus files, all token-for-token identical", files.len());
+    }
+
+    /// Focused P1 probe: a crafted file exercising every new token class at once —
+    /// strings with escapes, floats with exponent, hex/binary with `_` separators,
+    /// `..=`/`.*`, f-strings, char escapes, and a *nested* block comment. Matches the
+    /// reference and pins the exact lexemes, so a regression names the exact class.
+    #[test]
+    fn jestyr_lexer_handles_every_token_class() {
+        let lexer = build_exe("examples/std/lexer.jtr");
+        let src = "let s = \"a\\n b\"\nlet f = 1.5e-3\nlet h = 0xFF_00\nlet b = 0b1010\n\
+                   x == y != z\n0..10 0..=9 p.*\nf\"hi {x}\"\n'a' '\\n'\n\
+                   /* nested /* c */ still */ end\n";
+        let probe = std::env::temp_dir().join("jestyr_lex_probe.jtr");
+        std::fs::write(&probe, src).unwrap();
+        let got = jestyr_lexemes(&lexer, probe.to_str().unwrap());
+        assert_eq!(got, rust_lexemes(src), "probe diverged from the reference");
+        for needle in [
+            "\"a\\n b\"", // string literal (with an escape) as one token
+            "1.5e-3",     // float with signed exponent
+            "0xFF_00",    // hex int with digit separator
+            "0b1010",     // binary int
+            "==", "!=",   // multi-char comparison operators
+            "..", "..=", ".*", // range + deref operators
+            "f\"hi {x}\"", // f-string as one token
+            "'\\n'",       // char literal with an escape
+            "end",         // the token after a *nested* block comment (fully skipped)
+        ] {
+            assert!(got.iter().any(|t| t == needle), "missing `{needle}` in {got:?}");
+        }
     }
 
     /// The PURE canary demo: exercises the whole numeric stack but prints ONLY

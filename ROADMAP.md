@@ -526,10 +526,20 @@ compiler can't run without are now built (each with a demo + gcc-oracle test):
   longer leaks; the inline interner stays as a single-copy optimization, not a
   necessity. See `DROP-ALLOC-PHASE3.md` (field/payload drop) + `examples/drop_nested.jtr`.
 
-**Vertical slice — ✅ DONE:** `examples/std/lexer.jtr` — a lexer for a Jestyr subset,
-*written in Jestyr*, composing `fs` (read source) + `env` (argv) + `intern` (keyword/id
-classification). Lexes a built-in sample deterministically and a real file from disk
-(gcc-oracle tested). This is the front-end-in-Jestyr proof.
+**Vertical slice — ✅ DONE:** `examples/std/lexer.jtr` — a lexer *written in Jestyr*,
+composing `fs` (read source) + `env` (argv) + `intern` (keyword/id classification).
+Lexes a built-in sample deterministically and a real file from disk (gcc-oracle tested).
+This is the front-end-in-Jestyr proof.
+
+**P1 — full token set: ✅ DONE.** The Jestyr lexer now matches the Rust reference
+(`src/lexer.rs`) **token-for-token**: string/char literals with `\` escapes, f-strings,
+decimal/hex(`0x`)/binary(`0b`) ints with `_` separators, floats (fraction + `e`/`E`
+exponent), nested `/* */` block comments, and every multi-char operator (`->`,`=>`,`::`,
+`..`,`..=`,`.*`,`<<`,`>>`,`==`,`!=`,`<=`,`>=`,`&&`,`||`, compound-assigns). The
+acceptance test (`jestyr_lexer_matches_reference_on_corpus`, `--features c-oracle`)
+cross-checks the Jestyr lexer's lexeme stream against the Rust lexer over the **whole
+122-file corpus** — all identical — plus a per-token-class probe. Next in the port:
+**P2 parser → P3 typeck → P4 escape → P5 cgen**, then **R2** fixpoint.
 
 **Surfaced by the slice (gaps, with status):** ~~Jestyr doesn't auto-drop **struct
 fields**~~ — **fixed (B1):** RAII now recurses into owned struct fields and live enum
