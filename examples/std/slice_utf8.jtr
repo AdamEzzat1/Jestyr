@@ -1,0 +1,14 @@
+// B5 demo — an inline `slice(T, buf, n)` now carries its `[]T` type in argument
+// position, so it can be fed straight into `from_utf8(...)` without first binding
+// a typed `let vs: []u8`. (Before, the inline temp mis-inferred as `int` and the
+// generated C failed to compile.)
+fn main() -> i32 {
+    var buf: *mut u8 = alloc(u8, 2)
+    unsafe { buf.* = 72 }            // 'H'
+    unsafe { (buf + 1).* = 105 }     // 'i'
+    // Inline: `slice(u8, buf, 2)` types as `[]u8`, validated into a `str`.
+    let s: str = from_utf8(slice(u8, buf, 2))
+    print_str(s)
+    print_int(s.len as i64)
+    return 0
+}

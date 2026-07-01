@@ -880,6 +880,41 @@ mod unsafe_init_props {
     }
 }
 
+/// Property tests for B5 — inline `slice(T, …)` typing in argument position.
+///
+/// The invariant: an *unannotated* `slice(u8, b, n)` fed straight into `from_utf8`
+/// lowers byte-identically to the annotated-`let` workaround, for any buffer size,
+/// and never falls back to the old `int _u` temp (which failed to compile). Plus
+/// determinism. Pure-Rust (scan emitted C) — toolchain-free.
+mod slice_typing_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn inline(n: usize) -> String {
+        format!(
+            "fn f() -> i64 {{ var b: *mut u8 = alloc(u8, {n}) \
+             let s: str = from_utf8(slice(u8, b, {n})) return s.len as i64 }}"
+        )
+    }
+
+    proptest! {
+        /// The inline slice temp is always typed `JestyrSlice_u8`, never `int`.
+        #[test]
+        fn inline_slice_temp_is_typed(n in 1usize..32) {
+            let (c, _) = compile(&inline(n));
+            prop_assert!(c.contains("JestyrSlice_u8 _u ="), "slice temp typed:\n{}", c);
+            prop_assert!(!c.contains("int _u ="), "no int fallback:\n{}", c);
+        }
+
+        /// Determinism: the inline form compiles byte-identically twice.
+        #[test]
+        fn inline_slice_is_deterministic(n in 1usize..32) {
+            let s = inline(n);
+            prop_assert_eq!(compile(&s), compile(&s));
+        }
+    }
+}
+
 /// Property tests for deterministic Drop/RAII scope-exit glue (design Phase 3).
 ///
 /// The oracle is *known by construction*: a generator builds a program with a
@@ -2550,6 +2585,23 @@ mod fuzz {
     fn fuzz_pipeline() {
         bolero::check!().with_type::<String>().for_each(|s: &String| {
             run_pipeline(s);
+        });
+    }
+
+    /// **Inline `slice(…)` arg-position typing never panics (B5, totality).** Feed
+    /// an arbitrary first (type) argument to `slice(…)` in `from_utf8` position;
+    /// the typeck arm that reads it as the element type must be total.
+    #[test]
+    fn fuzz_slice_arg_typing() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let src = format!(
+                "fn f() -> i64 {{ var b: *mut u8 = alloc(u8, 4) \
+                 let v = from_utf8(slice({s}, b, 4)) return 0 }}"
+            );
+            let (tokens, _) = Lexer::new(&src).tokenize();
+            let (ast, _) = Parser::new(&src, tokens).parse();
+            let (info, _td) = typeck::check(&ast);
+            let _ = cgen::emit(&ast, &info);
         });
     }
 
@@ -5492,6 +5544,11 @@ mod c_oracle {
     #[test]
     fn unsafe_init_demo() {
         assert_eq!(toks("examples/std/unsafe_init.jtr"), ["42"]);
+    }
+    /// B5 end-to-end: inline `from_utf8(slice(u8, buf, 2))` yields "Hi" (len 2).
+    #[test]
+    fn slice_utf8_demo() {
+        assert_eq!(toks("examples/std/slice_utf8.jtr"), ["Hi", "2"]);
     }
     #[test]
     fn numbers_demo() {

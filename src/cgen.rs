@@ -8185,6 +8185,33 @@ mod tests {
         assert!(c.contains("#line 4 \"t.jtr\""), "`return` on line 4:\n{c}");
     }
 
+    // ── B5: inline `slice(T, …)` typing in argument position ──────────────────
+
+    /// Wiring: an *unannotated* `slice(u8, …)` fed straight into `from_utf8`
+    /// gives its temp the slice type `JestyrSlice_u8`, not the old `int` fallback
+    /// (which made the generated C fail to compile).
+    #[test]
+    fn inline_slice_into_from_utf8_types_as_a_slice() {
+        let src = "fn f() -> i64 { var b: *mut u8 = alloc(u8, 4) let s: str = from_utf8(slice(u8, b, 4)) return s.len as i64 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "no diagnostics: {d:?}");
+        assert!(c.contains("JestyrSlice_u8 _u ="), "slice temp is typed []u8:\n{c}");
+        assert!(!c.contains("int _u ="), "must NOT fall back to `int`:\n{c}");
+    }
+
+    /// The inline form lowers identically to the annotated-`let` workaround — the
+    /// fix removes the need for the temporary binding, it doesn't change codegen.
+    #[test]
+    fn inline_slice_equals_the_annotated_workaround() {
+        let inline = "fn f() -> i64 { var b: *mut u8 = alloc(u8, 4) let s: str = from_utf8(slice(u8, b, 4)) return s.len as i64 }";
+        let annotated = "fn f() -> i64 { var b: *mut u8 = alloc(u8, 4) let vs: []u8 = slice(u8, b, 4) let s: str = from_utf8(vs) return s.len as i64 }";
+        // The `from_utf8(_u)` statement-expression must be identical between forms.
+        let (ci, _) = gen(inline);
+        let (ca, _) = gen(annotated);
+        assert!(ci.contains("JestyrSlice_u8 _u = (JestyrSlice_u8){ j_b, (size_t)(4) }"), "{ci}");
+        assert!(ca.contains("JestyrSlice_u8 _u = j_vs"), "annotated form binds first:\n{ca}");
+    }
+
     // ── B4: `unsafe`/block as a value (let/var initializer) ───────────────────
 
     /// Wiring: `unsafe { p.* }` as a `let` initializer lowers to the inner deref

@@ -1988,6 +1988,13 @@ impl<'a> TypeChecker<'a> {
                         // `let`/comparison like `atomic_xchg(lock,1) != 0` in the
                         // spinlock types without an explicit annotation or cast.
                         t
+                    } else if name == "slice" && !args.is_empty() {
+                        // `slice(T, buf, n) -> []T` (B5): the element type is the first
+                        // (type) argument. Typing it here means the builder works
+                        // *unannotated* in argument position — e.g. straight into
+                        // `from_utf8(slice(u8, buf, n))` — instead of mis-inferring its
+                        // temp as `int` and only working bound to an annotated `let`.
+                        Ty::Slice(Box::new(self.eval_type_expr(typ, args[0])))
                     } else {
                         // Not local, not a variant/intrinsic: if some *other*
                         // module defines it, this is the v1 namespace leak that is
