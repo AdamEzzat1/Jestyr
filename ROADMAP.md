@@ -538,8 +538,16 @@ exponent), nested `/* */` block comments, and every multi-char operator (`->`,`=
 `..`,`..=`,`.*`,`<<`,`>>`,`==`,`!=`,`<=`,`>=`,`&&`,`||`, compound-assigns). The
 acceptance test (`jestyr_lexer_matches_reference_on_corpus`, `--features c-oracle`)
 cross-checks the Jestyr lexer's lexeme stream against the Rust lexer over the **whole
-122-file corpus** — all identical — plus a per-token-class probe. Next in the port:
-**P2 parser → P3 typeck → P4 escape → P5 cgen**, then **R2** fixpoint.
+122-file corpus** — all identical — plus a per-token-class probe.
+
+**P2a — fully-classified token stream: ✅ DONE.** The Jestyr lexer's keyword set is now
+complete (all 56 `TokenKind::keyword`s), it distinguishes Int vs Float, and a kind-dump
+mode (`lexer.exe <file> kinds`) emits each token's kind label matching
+`TokenKind::describe`. `jestyr_lexer_kinds_match_reference_on_corpus` cross-checks the
+*token kinds* (keyword vs ident, int vs float, every operator) against the reference over
+the whole 122-file corpus — all classified identically. This is the classified token
+stream the parser consumes. Next: **P2 parser** (AST-dump golden) → P3 typeck → P4 escape
+→ P5 cgen → **R2** fixpoint.
 
 **Surfaced by the slice (gaps, with status):** ~~Jestyr doesn't auto-drop **struct
 fields**~~ — **fixed (B1):** RAII now recurses into owned struct fields and live enum

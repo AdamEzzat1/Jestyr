@@ -5552,12 +5552,12 @@ mod c_oracle {
             .collect()
     }
 
-    /// The Jestyr lexer's lexeme stream for a file: run the built lexer exe with the
-    /// file as argv[1], take its stdout lines, and drop the trailing 6 summary
-    /// numbers. (Token lexemes in the corpus never contain a raw newline — strings
-    /// are single-line, block comments are skipped — so one-lexeme-per-line holds.)
-    fn jestyr_lexemes(lexer_exe: &std::path::Path, file: &str) -> Vec<String> {
-        let out = Command::new(lexer_exe).arg(file).output().unwrap();
+    /// Run the built Jestyr lexer exe on `file` with `extra` args, take its stdout
+    /// lines, and drop the trailing 6 summary numbers. With no extra args it dumps
+    /// lexemes; with a second arg it dumps kind labels. (Token output never contains
+    /// a raw newline — strings are single-line, comments skipped — so one-per-line holds.)
+    fn run_jestyr_lexer(lexer_exe: &std::path::Path, file: &str, extra: &[&str]) -> Vec<String> {
+        let out = Command::new(lexer_exe).arg(file).args(extra).output().unwrap();
         assert!(out.status.success(), "jestyr lexer failed on {file}");
         let text = String::from_utf8(out.stdout).unwrap();
         let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
@@ -5565,6 +5565,29 @@ mod c_oracle {
         assert!(n >= 6, "lexer output too short for {file}: {text}");
         lines.truncate(n - 6); // the summary: total, kw, id, num, punct, distinct
         lines
+    }
+
+    /// The Jestyr lexer's lexeme stream for a file (P1 golden).
+    fn jestyr_lexemes(lexer_exe: &std::path::Path, file: &str) -> Vec<String> {
+        run_jestyr_lexer(lexer_exe, file, &[])
+    }
+
+    /// The Jestyr lexer's *kind-label* stream for a file (the parser's input, P2 golden).
+    fn jestyr_kinds(lexer_exe: &std::path::Path, file: &str) -> Vec<String> {
+        run_jestyr_lexer(lexer_exe, file, &["kinds"])
+    }
+
+    /// The Rust *reference* lexer's kind-label stream for `src`: each non-`Eof`
+    /// token's `TokenKind::describe()`. The oracle the Jestyr kind dump must match.
+    fn rust_kinds(src: &str) -> Vec<String> {
+        use crate::token::TokenKind;
+        crate::lexer::Lexer::new(src)
+            .tokenize()
+            .0
+            .into_iter()
+            .filter(|t| t.kind != TokenKind::Eof)
+            .map(|t| t.kind.describe().to_string())
+            .collect()
     }
 
     /// Build `rel`'s `@test`/`@bench` **harness** (narrowed by `filter`) through the
@@ -5874,6 +5897,36 @@ mod c_oracle {
         eprintln!("cross-checked {} corpus files, all token-for-token identical", files.len());
     }
 
+    /// **P2 token-kind cross-implementation golden.** Beyond lexeme *boundaries* (the
+    /// P1 test), the Jestyr lexer must classify every token into the *same kind* as the
+    /// reference — keyword vs ident, Int vs Float, each operator — across the whole
+    /// corpus. This is the fully-classified token stream the parser (P2) consumes.
+    #[test]
+    fn jestyr_lexer_kinds_match_reference_on_corpus() {
+        let lexer = build_exe("examples/std/lexer.jtr");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for dir in ["examples", "examples/std"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("jtr") {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+        files.sort();
+        assert!(files.len() > 20, "expected the whole corpus, found {}", files.len());
+        for p in &files {
+            let f = p.to_str().unwrap();
+            let src = std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {f}: {e}"));
+            let want = rust_kinds(&src);
+            let got = jestyr_kinds(&lexer, f);
+            assert_eq!(got, want, "Jestyr lexer kinds diverged from the reference on {f}");
+        }
+        eprintln!("kind-checked {} corpus files, all classified identically", files.len());
+    }
+
     /// Focused P1 probe: a crafted file exercising every new token class at once —
     /// strings with escapes, floats with exponent, hex/binary with `_` separators,
     /// `..=`/`.*`, f-strings, char escapes, and a *nested* block comment. Matches the
@@ -5901,6 +5954,23 @@ mod c_oracle {
         ] {
             assert!(got.iter().any(|t| t == needle), "missing `{needle}` in {got:?}");
         }
+    }
+
+    /// Focused P2 kind probe: pins the classifications P1 could not test — keyword vs
+    /// ident, and Int vs Float — so a regression names the exact confusion.
+    #[test]
+    fn jestyr_lexer_kinds_distinguish_int_float_keyword_ident() {
+        let lexer = build_exe("examples/std/lexer.jtr");
+        let src = "const x = 1 let y = 1.5 fn z\n";
+        let probe = std::env::temp_dir().join("jestyr_kind_probe.jtr");
+        std::fs::write(&probe, src).unwrap();
+        let got = jestyr_kinds(&lexer, probe.to_str().unwrap());
+        assert_eq!(got, rust_kinds(src), "kind probe diverged from the reference");
+        assert_eq!(
+            got,
+            ["const", "ident", "=", "int", "let", "ident", "=", "float", "fn", "ident"],
+            "keyword/ident and int/float must be distinguished: {got:?}"
+        );
     }
 
     /// The PURE canary demo: exercises the whole numeric stack but prints ONLY
