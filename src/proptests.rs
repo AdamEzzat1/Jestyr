@@ -880,6 +880,39 @@ mod unsafe_init_props {
     }
 }
 
+/// Property tests for B3 — recoverable `try_read_file -> String !IoError`.
+///
+/// Invariants: over any path string the call lowers to the tagged result (never
+/// panics, never the plain read), it is deterministic, and — the additive gate —
+/// a program that doesn't use it emits no `try_read` runtime/typedef. Pure-Rust.
+mod try_read_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// For any path literal, `try_read_file` lowers to the recoverable result
+        /// (its runtime helper + `JestyrResult_String`), and compiles deterministically.
+        #[test]
+        fn try_read_lowers_and_is_deterministic(p in "[a-zA-Z0-9_./-]{0,24}") {
+            let src = format!("fn main() -> i32 {{ let r = try_read_file(\"{p}\") if is_err(r) {{ return 1 }} return 0 }}");
+            let (c, _) = compile(&src);
+            prop_assert!(c.contains("jestyr_rt_try_read_file"), "runtime helper present");
+            prop_assert!(c.contains("JestyrResult_String"), "result typedef present");
+            prop_assert_eq!(compile(&src), compile(&src));
+        }
+
+        /// The additive gate holds for arbitrary programs that never mention it:
+        /// no `try_read` runtime/typedef leaks in.
+        #[test]
+        fn unrelated_programs_have_no_try_read(body in super::prop::arb_expr()) {
+            let src = format!("fn f() -> i32 {{ let y = {body} return 0 }}");
+            let (c, _) = compile(&src);
+            prop_assert!(!c.contains("jestyr_rt_try_read_file"));
+            prop_assert!(!c.contains("JestyrResult_String"));
+        }
+    }
+}
+
 /// Property tests for B5 — inline `slice(T, …)` typing in argument position.
 ///
 /// The invariant: an *unannotated* `slice(u8, b, n)` fed straight into `from_utf8`
@@ -2585,6 +2618,20 @@ mod fuzz {
     fn fuzz_pipeline() {
         bolero::check!().with_type::<String>().for_each(|s: &String| {
             run_pipeline(s);
+        });
+    }
+
+    /// **Recoverable `try_read_file` lowering never panics (B3, totality).** Feed
+    /// an arbitrary path expression to `try_read_file` through the full pipeline; the
+    /// intrinsic arm and the result-struct emission must be total.
+    #[test]
+    fn fuzz_fs_try() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let src = format!("fn main() -> i32 {{ let r = try_read_file({s}) return 0 }}");
+            let (tokens, _) = Lexer::new(&src).tokenize();
+            let (ast, _) = Parser::new(&src, tokens).parse();
+            let (info, _td) = typeck::check(&ast);
+            let _ = cgen::emit(&ast, &info);
         });
     }
 
@@ -5549,6 +5596,12 @@ mod c_oracle {
     #[test]
     fn slice_utf8_demo() {
         assert_eq!(toks("examples/std/slice_utf8.jtr"), ["Hi", "2"]);
+    }
+    /// B3 end-to-end: `fs.try_read_text` recovers an existing file (ok, len 13)
+    /// and takes the err branch on a missing one — no abort either way.
+    #[test]
+    fn try_read_demo() {
+        assert_eq!(toks("examples/std/try_read.jtr"), ["true", "13", "true"]);
     }
     #[test]
     fn numbers_demo() {

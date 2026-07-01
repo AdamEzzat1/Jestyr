@@ -547,7 +547,14 @@ collide. (`mod.Type` paths + directory-as-module are the remaining K niceties.)
 **Still open before a full self-host:** extend the lexer to the *full* token set
 (floats/hex, block comments, strings, all operators) → port the parser → typeck →
 escape → cgen (~27K lines); plus qualified type paths + a basic `build.jestyr` (K) for
-comfort. **Plumbing follow-up:** a recoverable `read_file -> String !IoError`.
+comfort. ~~**Plumbing follow-up:** a recoverable `read_file -> String !IoError`.~~
+**Done (B3):** `try_read_file -> String !IoError` intrinsic + `fs.try_read_text`
+wrapper — a missing/unreadable file takes the `err` branch (compose with `?`/`unwrap`),
+not a silent empty String (`examples/std/try_read.jtr`). The `try_read_file` runtime
+helper + `JestyrResult_String` typedef are emitted only when used (byte-identical
+otherwise). **Ergonomic gaps B4 (unsafe/block as `let` initializer) and B5 (inline
+`slice(T,…)` typing) are also done** — the three Tier-2 self-host unblockers are cleared;
+only the port (P1–P5) + the fixpoint test (R2) remain.
 
 ### Q. Parallelism (data-parallel) — ~45% (MED conflict; files: ast, parser, typeck, escape, cgen, printer + new `std/parallel.jtr`)
 **Distinct from N (concurrency = task structuring); Q = data parallelism (make one

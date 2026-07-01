@@ -1,0 +1,30 @@
+// B3 demo — the *recoverable* file read, `fs.try_read_text -> String !IoError`.
+//
+// Unlike `fs.read_text` (which yields an empty String on failure, indistinguishable
+// from an empty file), `try_read_text` takes the `err` branch on a missing/unreadable
+// file — so a self-hosted compiler can *report* a bad source path instead of silently
+// compiling nothing. The demo writes a file, reads it back recoverably (ok branch),
+// then reads a path that does not exist (err branch) — no abort either way.
+import "fs"
+
+fn main() -> i32 {
+    let path: str = "jestyr_b3_try.tmp"
+    // Success path: write, then recover-read the same file.
+    let wrote: bool = fs.write(path, "hello, jestyr")
+    print_bool(wrote) // true
+
+    let ok = fs.try_read_text(path)
+    if is_err(ok) {
+        print_str("unexpected-missing")
+        return 2
+    }
+    let s: String = unwrap(ok)
+    print_int(s.len as i64) // 13  (length of "hello, jestyr")
+    string_free(s)
+    fs.remove(path)
+
+    // Failure path: a missing file takes the `err` branch, no crash.
+    let miss = fs.try_read_text("jestyr_b3_definitely_absent.tmp")
+    print_bool(is_err(miss)) // true
+    return 0
+}

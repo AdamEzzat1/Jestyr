@@ -3268,12 +3268,13 @@ fn string_intrinsic_ret(name: &str) -> Option<Ty> {
 
 /// The return type of a file-I/O intrinsic (not a declared function), so a `let`
 /// bound to one gets the right C type without an annotation. `read_file` yields an
-/// owned `String` (empty if the file can't be opened — the recoverable
-/// `String !IoError` form is a future refinement, like `try_from_utf8`);
-/// `write_file`/`file_exists` report success as a `bool`.
+/// owned `String` (empty if the file can't be opened); `try_read_file` is the
+/// recoverable form — `String !IoError` (a `Ty::Result`), so `?`/`unwrap`/`is_err`
+/// compose; `write_file`/`file_exists` report success as a `bool`.
 fn io_intrinsic_ret(name: &str) -> Option<Ty> {
     Some(match name {
         "read_file" => Ty::Prim("String"),
+        "try_read_file" => Ty::Result(Box::new(Ty::Prim("String"))),
         "write_file" | "file_exists" | "remove_file" => Ty::Prim("bool"),
         "arg_count" => Ty::Prim("i32"),
         "arg" => Ty::Prim("str"),

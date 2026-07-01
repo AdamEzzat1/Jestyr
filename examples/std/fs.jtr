@@ -5,11 +5,18 @@
 // to load `.jtr` source and emit its output.
 
 // Read the whole file at `path` into a fresh owned `String`. On failure (missing /
-// unreadable) the String is empty — the caller can pre-check with `fs.exists`, and a
-// recoverable `String !IoError` form is a future refinement (cf. `try_from_utf8`).
-// The caller owns the result and must `string_free` it.
+// unreadable) the String is empty — the caller can pre-check with `fs.exists`, or use
+// the recoverable `try_read_text` below. The caller owns the result and `string_free`s it.
 pub fn read_text(path: str) -> String {
     return read_file(path)
+}
+
+// The **recoverable** whole-file read: `String !IoError`. On an open/read failure it
+// yields the `err` branch (tag `IoError`) instead of an empty String, so a compiler can
+// *report* a missing/unreadable source file rather than silently proceeding. Compose
+// with `?` / `unwrap` / `is_err`; on the ok branch the caller owns the `String`.
+pub fn try_read_text(path: str) -> String !{ IoError } {
+    return try_read_file(path)
 }
 
 // Write `data` to `path` (created/truncated, binary mode). Returns true on success.

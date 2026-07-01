@@ -211,6 +211,15 @@ fn emit_program(
             .collect(),
         dyn_guard: HashSet::new(),
         spawn_sites: Vec::new(),
+        // Gate the `try_read_file` runtime + result typedef on actual use, so an
+        // unrelated program's C is byte-identical (the additive invariant).
+        uses_try_read: ast.exprs.iter().any(|e| {
+            if let ExprKind::Call { callee, .. } = &e.kind {
+                matches!(&ast.expr_at(*callee).kind, ExprKind::Name(n) if n.name == "try_read_file")
+            } else {
+                false
+            }
+        }),
         task_handles: HashMap::new(),
         dyn_spawn_active: false,
         slice_instances: Vec::new(),
@@ -464,6 +473,10 @@ struct Cgen<'a> {
     dyn_guard: HashSet<ExprId>,
     /// every `spawn` site, for emitting per-site arg structs + trampolines.
     spawn_sites: Vec<SpawnSite>,
+    /// Whether the program calls `try_read_file` (B3), so its runtime helper and
+    /// the `JestyrResult_String` typedef are emitted *only when used* — keeping the
+    /// C for every program that doesn't use it byte-identical.
+    uses_try_read: bool,
     /// task handles (`let h = spawn …`) live in the current `concurrent` scope,
     /// keyed by binding name — consumed by `await`. Saved/restored across nesting.
     task_handles: HashMap<String, TaskHandle>,
@@ -702,7 +715,17 @@ impl<'a> Cgen<'a> {
         self.raw("static JestyrString jestyr_rt_read_file(JestyrStr path) { char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, \"rb\"); free(cp); JestyrString s = jestyr_rt_str_new(); if (!f) return s; if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return s; } long sz = ftell(f); if (sz < 0) { fclose(f); return s; } rewind(f); size_t cap = (size_t)sz ? (size_t)sz : 1; s.ptr = (char*)malloc(cap); s.cap = cap; s.len = fread(s.ptr, 1, (size_t)sz, f); fclose(f); return s; }\n");
         self.raw("static bool jestyr_rt_write_file(JestyrStr path, JestyrStr data) { char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, \"wb\"); free(cp); if (!f) return false; size_t put = data.len ? fwrite(data.ptr, 1, data.len, f) : 0; int rc = fclose(f); return rc == 0 && put == data.len; }\n");
         self.raw("static bool jestyr_rt_file_exists(JestyrStr path) { char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, \"rb\"); free(cp); if (f) { fclose(f); return true; } return false; }\n");
-        self.raw("static bool jestyr_rt_remove_file(JestyrStr path) { char* cp = jestyr_rt_cpath(path); int rc = remove(cp); free(cp); return rc == 0; }\n\n");
+        self.raw("static bool jestyr_rt_remove_file(JestyrStr path) { char* cp = jestyr_rt_cpath(path); int rc = remove(cp); free(cp); return rc == 0; }\n");
+        // Recoverable read (B3): reports open/read failure via its `bool` return and
+        // writes the whole file into `*out`. Emitted only when `try_read_file` is
+        // used, so a program that doesn't use it is byte-identical. Uses only the
+        // always-present `jestyr_rt_cpath`/`jestyr_rt_str_new`, so it needs no
+        // forward reference to `JestyrResult_String` (that lives in `result_defs`).
+        if self.uses_try_read {
+            self.raw("/* Recoverable whole-file read: false on open/seek failure (the `String !IoError` err branch). */\n");
+            self.raw("static bool jestyr_rt_try_read_file(JestyrStr path, JestyrString* out) { *out = jestyr_rt_str_new(); char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, \"rb\"); free(cp); if (!f) return false; if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; } long sz = ftell(f); if (sz < 0) { fclose(f); return false; } rewind(f); size_t cap = (size_t)sz ? (size_t)sz : 1; out->ptr = (char*)malloc(cap); out->cap = cap; out->len = fread(out->ptr, 1, (size_t)sz, f); fclose(f); return true; }\n");
+        }
+        self.raw("\n");
         self.raw("/* Command-line arguments (self-hosting plumbing): argv is captured in main()\n");
         self.raw("   into file-scope globals, exposed to Jestyr as arg_count() -> i32 and\n");
         self.raw("   arg(i) -> str (a zero-copy view into argv[i]; out-of-range yields empty).\n");
@@ -1493,6 +1516,15 @@ impl<'a> Cgen<'a> {
         // `seen` so a user `str !E` function doesn't duplicate the typedef).
         self.raw("typedef struct { bool is_err; JestyrStr ok; int err; } JestyrResult_str;\n");
         seen.insert("JestyrResult_str".to_string());
+        // `try_read_file(...) -> String !IoError` is an intrinsic, so its result type
+        // isn't discovered from a fn signature — emit it (only when used, to keep
+        // unrelated programs byte-identical) and seed `seen` so a user `String !E`
+        // function doesn't duplicate the typedef.
+        if self.uses_try_read {
+            let rname = self.result_c_name(&Ty::Prim("String"));
+            self.raw(format!("typedef struct {{ bool is_err; JestyrString ok; int err; }} {rname};\n"));
+            seen.insert(rname);
+        }
         for item in &ast.items {
             if let Item::Fn(f) = item {
                 if f.errors.is_none() {
@@ -4410,12 +4442,27 @@ impl<'a> Cgen<'a> {
                     return format!("free({p})");
                 }
                 // File I/O (self-hosting plumbing). `read_file` yields an owned `String`
-                // of the whole file (empty if it can't be opened — the recoverable
-                // `try_read_file -> String !IoError` form is a follow-up, mirroring
-                // `from_utf8`/`try_from_utf8`). `write_file`/`file_exists` yield `bool`.
+                // of the whole file (empty if it can't be opened); `try_read_file`
+                // is the *recoverable* form — `String !IoError` — so a compiler can
+                // report a missing/unreadable file instead of silently getting "".
+                // `write_file`/`file_exists` yield `bool`.
                 "read_file" => {
                     let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
                     return format!("jestyr_rt_read_file({p})");
+                }
+                // `try_read_file(path) -> String !IoError` — the recoverable read.
+                // Lowered inline (like `try_from_utf8`) to a statement-expression: the
+                // runtime helper reports open/read failure via its bool return and
+                // writes the file into an out-param, which we wrap into the tagged
+                // result. `.err = 1` is the single `IoError` tag.
+                "try_read_file" => {
+                    let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    let rname = self.result_c_name(&Ty::Prim("String"));
+                    return format!(
+                        "({{ JestyrString _s; bool _ok = jestyr_rt_try_read_file({p}, &_s); \
+                         _ok ? ({rname}){{ .is_err = false, .ok = _s }} \
+                             : ({rname}){{ .is_err = true, .err = 1 }}; }})"
+                    );
                 }
                 "write_file" => {
                     let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
@@ -7920,7 +7967,7 @@ fn is_intrinsic(name: &str) -> bool {
             | "region_str" | "region_concat" | "bytes"
             | "gen_new" | "gen_free" | "region_alloc" | "ok" | "err" | "is_err" | "unwrap"
             | "arena_open" | "arena_alloc" | "arena_close"
-            | "read_file" | "write_file" | "file_exists" | "remove_file"
+            | "read_file" | "try_read_file" | "write_file" | "file_exists" | "remove_file"
             | "arg_count" | "arg"
     )
 }
@@ -8183,6 +8230,31 @@ mod tests {
         assert!(c.contains("#line 2 \"t.jtr\""), "`let a` on line 2:\n{c}");
         assert!(c.contains("#line 3 \"t.jtr\""), "`let b` on line 3:\n{c}");
         assert!(c.contains("#line 4 \"t.jtr\""), "`return` on line 4:\n{c}");
+    }
+
+    // ── B3: recoverable `try_read_file -> String !IoError` ────────────────────
+
+    /// Wiring: `try_read_file` lowers to a tagged `JestyrResult_String`, gets its
+    /// out-param runtime helper, and its err branch carries the `IoError` tag.
+    #[test]
+    fn try_read_file_lowers_to_a_recoverable_result() {
+        let src = "fn main() -> i32 { let r = try_read_file(\"x\") if is_err(r) { return 1 } return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "no diagnostics: {d:?}");
+        assert!(c.contains("typedef struct { bool is_err; JestyrString ok; int err; } JestyrResult_String;"), "result typedef:\n{c}");
+        assert!(c.contains("bool jestyr_rt_try_read_file(JestyrStr path, JestyrString* out)"), "runtime helper:\n{c}");
+        assert!(c.contains(".is_err = true, .err = 1"), "err branch carries the IoError tag:\n{c}");
+    }
+
+    /// Byte-identity gate: a program that uses only `read_file` (not `try_read_file`)
+    /// emits neither the result typedef nor the recoverable runtime helper — the
+    /// feature is strictly additive, so unrelated programs are unchanged.
+    #[test]
+    fn try_read_gating_keeps_unrelated_programs_clean() {
+        let src = "fn main() -> i32 { let s: String = read_file(\"x\") return s.len as i32 }";
+        let (c, _) = gen(src);
+        assert!(!c.contains("JestyrResult_String"), "no result typedef when unused:\n{c}");
+        assert!(!c.contains("jestyr_rt_try_read_file"), "no recoverable helper when unused:\n{c}");
     }
 
     // ── B5: inline `slice(T, …)` typing in argument position ──────────────────
