@@ -1,106 +1,165 @@
-# Jestyr self-hosting — the port: P2–P5 + R2 fixpoint (handoff)
+# Jestyr self-hosting — the remaining port: P2 → P5 + R2 (cold-start handoff)
 
-> Cold-start handoff for the remainder of the self-hosting port (ROADMAP workstream P).
-> **P1 (full-token-set lexer) is DONE** — `examples/std/lexer.jtr` matches the Rust
-> reference lexer token-for-token across the whole 122-file corpus (`489aa2d`). What
-> remains is the bulk of the work: porting **parser → typeck → escape → cgen** to Jestyr
-> (~27K lines), each gated by *cross-implementation equivalence* on a shared corpus, then
-> standing up the **R2 fixpoint** as the acceptance test. Read with the repo's
-> `jestyr-selfhost-blockers-handoff.md` (§4 Tier-3, §5 Tier-4), `jestyr-design.md` (§19),
-> `ROADMAP.md` §P, and the P1 commit.
+> Authoritative handoff for the rest of the self-hosting port (ROADMAP workstream P).
+> **Front end classification is DONE and cross-checked:** P1 (full token set, lexeme
+> boundaries) and P2a (full token *kinds*) both match the Rust reference token-for-token
+> over the whole 122-file corpus. What remains is the bulk: **P2 parser → P3 typeck →
+> P4 escape → P5 cgen** (~27K lines), each gated by a cross-implementation golden on the
+> shared corpus, then the **R2 fixpoint** as the acceptance test.
+>
+> Read with `ROADMAP.md` §P, `jestyr-selfhost-blockers-handoff.md` (§4 Tier-3, §5 Tier-4),
+> `jestyr-design.md` §19, and the commits `489aa2d` (P1), `6e10361` (P2a).
 
 ---
 
 ## 0. Discipline (unchanged — applies to every increment)
 
-Every increment stays `cargo test`-green and warning-clean (default suite stays
-toolchain-free; the gcc-oracle cross-checks live behind `--features c-oracle`). Ship the
-four test layers (unit/wiring, property, bolero fuzz, teeth-by-mutation), keep programs
-that don't use a new feature byte-identical, and **auto-commit each green increment to
-`master`** (`git commit -F <file>`, `Co-Authored-By: Claude Opus 4.8 …`), then push.
-Write a session summary to `~/Downloads/` when a stage's first cut lands.
-
-**The load-bearing pattern for the whole port** — established by P1, reuse it verbatim:
-the Jestyr-written pass and the Rust pass must produce **identical output on the same
-corpus**. P1's test (`proptests.rs::c_oracle::jestyr_lexer_matches_reference_on_corpus`)
-is the template: build the Jestyr pass to an exe (`build_exe`), run it on every
-`examples/**/*.jtr`, and diff its output against the Rust pass used as a library. Each of
-P2–P5 gets its own such golden. This is *why* the project built module content-hashing +
-`attest`: "same input ⇒ same output" is mechanically checkable across implementations.
+- Stay `cargo test`-green and warning-clean. Default suite stays toolchain-free; the
+  cross-impl goldens live behind `--features c-oracle` (they build a Jestyr program with
+  gcc and run it).
+- Ship the four test layers: **unit/wiring**, **property**, **bolero fuzz**, and
+  **teeth-by-mutation** (break the new logic, watch a test fail, revert).
+- Keep programs that don't use a new feature **byte-identical**.
+- **Auto-commit each green increment to `master`** (`git commit -F <file>`, end with
+  `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`), then `git push origin master`.
+- Land increments small. A pass is ported *construct by construct*, each with its slice of
+  the golden — never a 2.6K-line drop.
 
 ---
 
-## 1. What exists to build on
+## 1. The load-bearing pattern — the cross-implementation golden
 
-- **P1 lexer (`examples/std/lexer.jtr`)** — full token set, cross-checked. Its output is a
-  lexeme-per-line dump + a 6-number summary; the cross-check strips the summary and diffs
-  lexemes. For P2 the parser will consume *tokens*, so the lexer likely needs a companion
-  that emits `(kind, span)` per token rather than bare lexemes — see §2.
-- **std toolbox in Jestyr:** `fs` (recoverable `try_read_text` too, B3), `env` (argv),
-  `intern` (str→dense id, the `Symbol` pattern — **the chosen symbol-table strategy, B2**),
+Every Jestyr-written pass must produce **identical output to the Rust pass on the same
+corpus**. This is already mechanized; **reuse the toolkit verbatim**
+(`src/proptests.rs`, `mod c_oracle`, behind `--features c-oracle`):
+
+- `build_exe(rel) -> PathBuf` — compile a `.jtr` program to a native exe (load → typeck →
+  escape → cgen → gcc), returns the exe path. Use for any Jestyr pass that takes CLI args.
+- `run_jestyr_lexer(exe, file, extra) -> Vec<String>` — run the exe, drop the trailing
+  6 summary lines, return output lines. Generalize/rename per pass.
+- `rust_lexemes(src)` / `rust_kinds(src)` — the Rust reference output (lexer used as a
+  **library**, not a subprocess). Model P3/P4/P5 references the same way: call
+  `typeck::check_program`, `escape::check`, `cgen::emit` directly.
+- The two goldens already in place — `jestyr_lexer_matches_reference_on_corpus` (P1,
+  lexemes) and `jestyr_lexer_kinds_match_reference_on_corpus` (P2a, kinds) — are the
+  **templates**. Each of P2–P5 adds one: AST dump → resolved-type dump → diagnostic set →
+  byte-identical C.
+
+This is *why* module content-hashing + `attest` exist: "same input ⇒ same output" is a
+mechanical hash compare across implementations and stages.
+
+---
+
+## 2. What exists to build on (the Jestyr-side toolbox)
+
+- **Front end (Jestyr):** `examples/std/lexer.jtr` — full token set (P1), kind-dump mode
+  (`lexer.exe <file> kinds`, P2a). Its output is one token per line (lexeme, or kind
+  label with a 2nd CLI arg) + a 6-number summary. For the parser it will likely become a
+  *module* the parser imports and calls in-process (see §3).
+- **std toolbox:** `fs` (+ recoverable `try_read_text`, B3), `env` (argv), `intern`
+  (str→dense id — **the chosen symbol-table strategy, B2**, the rustc `Symbol` pattern),
   `strmap` (str→i64 open-addressing), `list` (growable `List(T)`), `mem`, `core`.
-- **Language features cleared:** real strings, traits + `dyn`, fn-pointer types, generics
-  + monomorphization, recursive ADTs (`indirect`), enums + `match` + exhaustiveness, error
-  sets + `?`, RAII incl. nested fields (B1), value-position `unsafe`/block (B4), inline
-  `slice` typing (B5). No known language blocker remains for writing the compiler.
-- **The Rust compiler is the reference/oracle** for every stage: `src/lexer.rs`,
-  `src/parser.rs` (~2.6K), `src/typeck.rs` (~4.4K), `src/escape.rs` (~1.4K),
-  `src/cgen.rs` (~9.6K), `src/{ast,types,token,span,module,diag}.rs`.
+- **Language features cleared** (no known blocker to writing the compiler): real strings,
+  traits + `dyn`, fn-pointer types, generics + monomorphization, recursive ADTs
+  (`indirect`), enums + `match` + exhaustiveness, error sets + `?`, RAII incl. nested
+  fields (B1), value-position `unsafe`/block (B4), inline `slice` typing (B5).
+- **The Rust compiler is the reference/oracle** for every stage:
+  `src/lexer.rs`, `src/parser.rs` (~2.6K), `src/typeck.rs` (~4.4K), `src/escape.rs`
+  (~1.4K), `src/cgen.rs` (~9.6K), and `src/{ast,types,token,span,module,diag}.rs`.
 
-## 2. P2 — the parser (recursive-descent → AST)
+---
 
-**Goal:** a Jestyr program that reads tokens and builds an AST, matching `src/parser.rs`.
+## 3. P2 — the parser (the next major effort; ~2.6K lines)
 
-- **First: a token stream the parser can consume.** The P1 lexer prints lexemes; the
-  parser needs `(kind, start, end)` per token. Options: (a) extend `lexer.jtr` with a
-  `dump-kinds` mode that prints `<kind-tag> <start> <end>` per line, and add a matching
-  Rust `jestyrc lex-dump --kinds` so the token *stream* (not just lexemes) is cross-checked
-  first; or (b) have the Jestyr parser call the lexer in-process (both are Jestyr modules).
-  Prefer (b) for the real compiler, but land (a) first as a cheap cross-impl gate on token
-  kinds (P1 only proved lexeme boundaries; kinds like Int-vs-Float aren't yet differentially
-  tested — a good small increment to add).
-- **AST representation.** The Rust AST uses arena vectors (`exprs`, `types`, `pats`) with
-  integer ids (`ExprId(u32)`), which ports cleanly to Jestyr `List(T)` + integer indices —
-  and dodges recursive-enum ownership questions. Mirror `ast.rs`'s `ExprKind`/`Stmt`/`Item`
-  as Jestyr enums; keep the same node set.
-- **Cross-impl golden.** Add a Rust `jestyrc parse --dump` canonical S-expression/JSON AST
-  printer (there's already `print_ast` for `Mode::Parse`), and have the Jestyr parser emit
-  the *same* canonical form. Diff over the corpus. **Watch:** the printer must be a pure
-  function of the AST (deterministic field order) so the two agree byte-for-byte.
-- **Watch (R1, already observed):** the Rust parser **stack-overflows on ~1000-deep
-  expressions** (see the flagged bug / `task_109fb4cb`). A Jestyr recursive-descent parser
-  will hit the same wall *sooner or later* on its own stack — decide the depth-guard story
-  before the port hardens, and add the guard to *both* implementations so they still agree
-  (both reject over-deep input with a diagnostic rather than one crashing).
+**Goal:** a Jestyr program that reads the classified token stream and builds an AST,
+matching `src/parser.rs` construct for construct, verified by an AST-dump golden.
 
-## 3. P3 — typeck/resolve, then P4 — escape
+### 3.1 Prerequisite: fix the deep-expression stack overflow FIRST
+The Rust parser (and typeck/cgen) recursive walks **stack-overflow between expression
+depth 500 (ok) and 1000 (overflow)** — measured in the self-host experiment; flagged as
+background task `task_109fb4cb`. A Jestyr recursive-descent parser will hit the same wall
+on its own stack. Add a **recursion-depth guard** that emits a clean "expression nesting
+too deep" diagnostic to *both* implementations (so they still agree: both reject
+over-deep input rather than one crashing). Repro: `fn main() -> i32 { return 1+1+…+1 }`
+with ≥1000 operands.
 
-- **P3 typeck** (`src/typeck.rs`): name resolution + type inference, producing the
-  per-expr type table. This is the largest pass after cgen; stage it — build the global
-  table first (two-phase, order-independent — `build_table`), then check bodies. The
-  symbol tables use the intern+id-indexed-array discipline (B2). **Cross-impl golden:** a
-  resolved-type dump (each `ExprId` → its `Ty`) diffed over the corpus. Leniency rules
-  (unknown named types → `Opaque`) must match exactly.
-- **P4 escape** (`src/escape.rs`): the ownership/borrow-escape checker. Smaller (~1.4K).
-  **Cross-impl golden:** the *set of diagnostics* (message + span) must match the Rust
-  checker on the corpus — the escape examples (`examples/escapes.jtr`,
-  `examples/region_escape.jtr`) already pin expected error counts.
+### 3.2 AST representation — arenas, not recursive enums
+Mirror `src/ast.rs`: the Rust AST is **arena vectors** (`exprs: Vec<ExprData>`,
+`types`, `pats`) addressed by integer newtype ids (`ExprId(u32)`, `TypeId`, `PatId`).
+Port this directly to Jestyr: `List(ExprData)` + integer indices. This **dodges
+recursive-enum ownership questions** (a node references children by id, not by owned
+pointer) and matches the reference structure 1:1, which makes the AST dump easy to align.
+- Mirror `ExprKind` / `Stmt` / `Item` / `TypeKind` / `PatKind` as Jestyr enums. Keep the
+  exact node set and field order.
+- `Span` is `{start: u32, end: u32}` — trivial to carry.
 
-## 4. P5 — cgen (the big one), and the byte-identity lever
+### 3.3 Token feed
+The parser needs random-ish access to a token vector with `(kind, span)`. Two options:
+- **(a) In-process (preferred for the real compiler):** refactor `lexer.jtr` so the
+  tokenizer fills a `List(Token)` (a `Token` = `{kind: i32, start: usize, end: usize}`)
+  that the parser imports and consumes. The kind is an integer tag matching `TokenKind`'s
+  discriminant order (define a shared numbering).
+- **(b) Text hand-off (cheap first step):** have the parser read the kind-dump the lexer
+  already emits. Brittle for spans; use only to bootstrap.
+  Prefer (a). It also lets you keep the P2a kind cross-check as a unit test of the shared
+  tokenizer.
 
-- **P5 cgen** (`src/cgen.rs`, ~9.6K): lower the AST+types to C. The acceptance bar is the
-  strongest possible and already mechanized: **the Jestyr cgen must emit byte-identical C
-  to the Rust cgen** on every corpus program. That is exactly what
-  `proptests.rs::compilation_is_deterministic` + the `attest` C-hash already assert *within*
-  the Rust impl; the cross-impl version diffs Jestyr-emitted C against Rust-emitted C. If
-  the C matches, the downstream gcc build + run behavior is identical for free.
-- Port incrementally by construct (the Rust cgen is a big `emit_expr`/`emit_stmt` match);
-  after each construct, the subset of the corpus using only ported constructs must match.
-- **This is where module content-hashing + `attest` earn their keep** (design already
-  anticipated this): use the module content-hash as the cache key and `attest` to pin the
-  emitted-C hash, so cross-impl equality is a hash compare, not a full text diff.
+### 3.4 The AST-dump golden
+- The Rust side already has `print_ast` (drives `jestyrc parse`). Make it (or a new
+  canonical printer) emit a **deterministic, structural dump** — e.g. an S-expression per
+  node with kind + children ids + spans — that is a *pure function of the AST* (fixed
+  field order, no HashMap iteration).
+- The Jestyr parser emits the **same** canonical dump. Cross-check: for each corpus file,
+  `jestyr_parse_dump(f) == rust_parse_dump(src)`. Stage it: start with only the
+  constructs the Jestyr parser handles and a corpus subset that uses only those; grow both.
+- **Watch:** the dump must be span-exact and order-exact, or the diff is noisy. Decide the
+  canonical form up front and pin it with a small golden before scaling to the corpus.
 
-## 5. R2 — the fixpoint (the acceptance criterion)
+### 3.5 Staging (suggested increment order)
+1. Depth-guard fix (both impls) — a self-contained increment with its own tests.
+2. Shared tokenizer producing `List(Token)` + a unit test it matches the P2a kind stream.
+3. Expression parser (precedence climbing, matching `parse_expr`) + AST dump for exprs;
+   golden on expression-only snippets.
+4. Type parser + pattern parser.
+5. Statement parser (`let`/`var`/`return`/expr-stmt/blocks/`if`/`match`/loops).
+6. Item parser (`fn`, `struct`/`record`/`union`, `enum`, `trait`/`impl`, `const`,
+   `distinct`, `import`, attributes, contracts) — then the whole-corpus AST golden.
+
+---
+
+## 4. P3 typeck → P4 escape
+
+- **P3 typeck** (`src/typeck.rs`, ~4.4K): name resolution + type inference producing the
+  per-expr `Ty` table. Largest pass after cgen. Stage it as the Rust one is structured:
+  build the global table first (two-phase, order-independent — `build_table`/`GlobalTable`),
+  then check bodies. Use the intern+id-indexed-array discipline (B2) for symbol tables.
+  **Golden:** a resolved-type dump — each `ExprId` → its `Ty` (canonical form) — diffed
+  over the corpus. The leniency rules must match exactly (unknown named type → `Opaque`,
+  generic param → `Opaque`, treated non-`Copy`).
+- **P4 escape** (`src/escape.rs`, ~1.4K): the ownership/borrow-escape checker (the
+  smallest pass). **Golden:** the *set of diagnostics* (message + span) must equal the
+  Rust checker's on the corpus. The escape examples (`examples/escapes.jtr`,
+  `examples/region_escape.jtr`) already pin expected error counts — reuse them.
+
+---
+
+## 5. P5 — cgen (the biggest pass) and the byte-identity lever
+
+- **P5 cgen** (`src/cgen.rs`, ~9.6K): lower AST + types to C. The acceptance bar is the
+  strongest and already mechanized: **the Jestyr cgen must emit byte-identical C to the
+  Rust cgen** on every corpus program. That is exactly what
+  `proptests.rs::compilation_is_deterministic` + the `attest` C-hash assert *within* the
+  Rust impl; the cross-impl version diffs Jestyr-emitted C vs Rust-emitted C.
+- Port by construct (the Rust cgen is a big `emit_expr`/`emit_stmt` match). After each
+  construct, the subset of the corpus using only ported constructs must match byte-for-byte.
+- **Content-hash + `attest` earn their keep here:** use the module content-hash as the
+  cache key and `attest` to pin the emitted-C hash, so cross-impl equality is a hash
+  compare, not a full text diff.
+- If the emitted C matches, the downstream gcc build + run behavior is identical for free.
+
+---
+
+## 6. R2 — the fixpoint (the acceptance criterion)
 
 Self-hosting is *proven* by a 3-stage fixpoint (gate behind `--features selfhost-fixpoint`,
 outside the toolchain-free default suite):
@@ -109,55 +168,56 @@ outside the toolchain-free default suite):
 - **stage-3:** `jc2` builds itself → `jc3`.
 - **Assert `jc2 ≡ jc3` byte-for-byte** (the emitted C, and ideally the final binary).
 
-Stand it up *as soon as a partial stage-1 self-build exists* (even before P5 is complete —
-e.g. a compiler that only handles a language subset can fixpoint on a subset corpus), so
-regressions are caught from day one. Use the compiler source's module content-hash as the
-cache key; `attest` pins the stage-2/stage-3 artifacts. **Teeth:** perturb one byte of a
-stage input → the fixpoint diff fails.
+Stand it up *as soon as a partial stage-1 self-build exists* — even a compiler that only
+handles a language subset can fixpoint on a subset corpus — so regressions are caught from
+day one. Use the compiler source's module content-hash as the cache key; `attest` pins the
+stage-2/stage-3 artifacts. **Teeth:** perturb one byte of a stage input → the diff fails.
 
-## 6. R1 — scaling (partly measured; a known bug to fix first)
+---
 
-The self-host experiment (this session) established:
+## 7. R1 — scaling (measured; one bug to fix first)
+
+From the self-host experiment (evidence, not speculation):
 - **Program *size* scales fine:** 3000 functions / 15K lines compiles without issue.
-- **Expression *depth* does NOT:** the Rust parser/typeck/cgen recursive walks
-  **stack-overflow between depth 500 (ok) and 1000 (overflow)**. Fix before the port
-  hardens (flagged as a background task): a recursion-depth-guard diagnostic in the parser
-  (and check typeck/cgen). A 27K-line real compiler source won't nest expressions that
-  deep, but a fuzzer or generated corpus can, and the Jestyr port will have the same limit
-  on its own stack.
+- **Expression *depth* does not:** recursive walks **stack-overflow between depth 500 (ok)
+  and 1000 (overflow)**. Fix before the port hardens (§3.1, task `task_109fb4cb`).
 - **Mitigation to build early:** a "large input" corpus (concatenate std+examples into
   ever-bigger single modules) + a `huge_program_compiles` test; profile cgen if compile
   time bites at 27K lines.
 
-## 7. Recommended order
+---
 
-1. **P2a — token-kind cross-check** (cheap): differential-test token *kinds* (Int vs Float,
-   keyword vs ident, each operator kind), not just lexeme boundaries. Closes the one gap P1
-   left (P1 proved boundaries, not classification).
-2. **Fix the deep-expression stack overflow** (task `task_109fb4cb`) in the Rust compiler —
-   before the Jestyr port inherits the pattern.
-3. **P2 parser** → cross-impl AST-dump golden.
-4. **P3 typeck** → resolved-type-dump golden. **P4 escape** → diagnostic-set golden.
-5. **P5 cgen** → byte-identical-C golden (per construct, then whole corpus).
-6. **R2 fixpoint** → stand up early on a subset; expand as P5 completes.
+## 8. Recommended order
 
-## 8. Anchors
+1. **Fix the deep-expression stack overflow** (both impls) — before the Jestyr port
+   inherits the pattern. (task `task_109fb4cb`)
+2. **P2 parser** — shared tokenizer → expr parser → types/patterns → statements → items,
+   each with its slice of the AST-dump golden.
+3. **P3 typeck** → resolved-type-dump golden. **P4 escape** → diagnostic-set golden.
+4. **P5 cgen** → byte-identical-C golden (per construct, then whole corpus).
+5. **R2 fixpoint** → stand up early on a subset; expand as P5 completes.
+
+---
+
+## 9. Anchors
 
 | Thing | Where |
 |---|---|
-| Reference lexer / token set | `src/lexer.rs`, `src/token.rs` (`TokenKind`) |
-| P1 Jestyr lexer + cross-check | `examples/std/lexer.jtr`; `proptests.rs::c_oracle::{build_exe, rust_lexemes, jestyr_lexemes, jestyr_lexer_matches_reference_on_corpus}` |
-| Reference parser / AST | `src/parser.rs`, `src/ast.rs` (`print_ast` for the dump) |
-| Reference typeck / types | `src/typeck.rs`, `src/types.rs` (`TypeInfo`) |
-| Reference escape | `src/escape.rs` (+ `examples/escapes.jtr`) |
-| Reference cgen | `src/cgen.rs` (+ `attest` C-hash, `Modules::hashes`) |
-| Symbol strategy (B2) | `examples/std/intern.jtr` (intern + id-indexed arrays) |
-| Deep-expr overflow (R1) | flagged task `task_109fb4cb`; repro: `return 1+1+…` depth ≥ 1000 |
+| Reference lexer / token set | `src/lexer.rs`, `src/token.rs` (`TokenKind`, `describe`) |
+| P1/P2a Jestyr lexer | `examples/std/lexer.jtr` |
+| Cross-impl golden toolkit | `src/proptests.rs` `mod c_oracle`: `build_exe`, `run_jestyr_lexer`, `rust_lexemes`, `rust_kinds`, `jestyr_lexemes`, `jestyr_kinds`, and the two `..._match_reference_on_corpus` tests |
+| Reference parser / AST | `src/parser.rs`, `src/ast.rs` (`ExprId`/arenas; `print_ast`) |
+| Reference typeck / types | `src/typeck.rs`, `src/types.rs` (`TypeInfo`, `GlobalTable`) |
+| Reference escape | `src/escape.rs` (+ `examples/escapes.jtr`, `region_escape.jtr`) |
+| Reference cgen | `src/cgen.rs` (+ `attest` C-hash, `Modules::hashes`, `compilation_is_deterministic`) |
+| Symbol strategy (B2) | `examples/std/intern.jtr` |
+| Deep-expr overflow (R1) | task `task_109fb4cb`; repro `return 1+1+…` depth ≥ 1000 |
 
 ## One-line summary
 
-P1 (lexer) is done and cross-checked token-for-token over 122 files. The rest of the port
-is **P2 parser → P3 typeck → P4 escape → P5 cgen**, each gated by a cross-implementation
-golden on the shared corpus (AST dump → type dump → diagnostic set → byte-identical C),
-then the **R2 fixpoint** (`jc2 ≡ jc3`) as the acceptance test — stood up early on a subset.
-Fix the known deep-expression stack overflow before the Jestyr port inherits it.
+Front-end classification is done and cross-checked (P1 lexemes + P2a kinds, 122 files
+each). The remaining port is **P2 parser → P3 typeck → P4 escape → P5 cgen**, each gated
+by a cross-implementation golden on the shared corpus (AST dump → resolved-type dump →
+diagnostic set → byte-identical C), then the **R2 fixpoint** (`jc2 ≡ jc3`) as acceptance —
+stood up early on a subset. Represent the AST as `List(T)` arenas + integer ids, and fix
+the deep-expression stack overflow before the Jestyr port inherits it.
