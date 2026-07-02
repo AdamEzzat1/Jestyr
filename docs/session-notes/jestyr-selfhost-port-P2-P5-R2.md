@@ -127,8 +127,19 @@ The parser needs random-ish access to a token vector with `(kind, span)`. Two op
    integer tag per token, cross-checked vs the reference discriminants over the whole
    corpus (`jestyr_lexer_kind_ids_match_reference_on_corpus`) — closes the label golden's
    blind spot (operator/keyword labels are span-derived, so the *integers* were unverified).
-   `List(struct)` confirmed working (the AST-arena primitive). *Next:* extract `tokenize`
-   into an importable module so the parser can consume it in-process (option (a) above).
+   `List(struct)` confirmed working (the AST-arena primitive).
+   **Extraction DONE:** the tokenizer now lives in `examples/std/tokens.jtr` (`pub struct
+   Token { pub kind, pub start, pub end }`, `pub fn tokenize -> List(Token)`,
+   `pub fn intern_keywords`); `lexer.jtr` is a thin driver that `import`s it. The parser
+   will `import "tokens"` and hold `List(tokens.Token)` in-process. This required a **cgen
+   fix** (`eval_type_arg`, cgen.rs): a module-qualified comptime type argument `mod.Type`
+   (e.g. `list.get(tokens.Token, …)`) previously degraded to `Opaque("?")`, so a generic
+   container instantiated over an imported type mangled to `Jestyr_List__?` in the consumer
+   vs `Jestyr_List__Token` in the producer → invalid C. Now it resolves via the import map
+   like the type-position `TypeKind::Path` resolver, so producer and consumer agree. This
+   unblocks the whole modular architecture (any module returning `List(ExprData)` etc.).
+   (Aside: naming a user struct literally `T` still collides with the blanket-impl generic
+   param `T` and skips its Drop glue — a separate pre-existing corner; `Token` avoids it.)
 3. Expression parser (precedence climbing, matching `parse_expr`) + AST dump for exprs;
    golden on expression-only snippets.
 4. Type parser + pattern parser.

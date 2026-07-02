@@ -1,353 +1,31 @@
-// examples/std/lexer.jtr — the self-hosting front-end slice: a lexer for Jestyr,
-// written *in Jestyr*. It composes the three self-hosting unblockers — read source
-// with `fs`, take a path from `env` (argv), and classify identifiers with the
-// `intern`er — to turn source text into a token stream. Proof that Jestyr can
-// implement its own front end.
+// examples/std/lexer.jtr — the self-hosting front-end driver. It composes the
+// self-hosting unblockers — read source with `fs`, take a path from `env` (argv),
+// classify identifiers with the `intern`er — and the shared `tokens` module to turn
+// source text into a token stream and dump it. Proof that Jestyr can implement its
+// own front end.
 //
-// **Full token set (P1) + full kinds (P2a), now as an in-process `List(Token)`.**
-// `tokenize` builds a `List(Token)` — each `Token` is a payload-free `{kind, start,
-// end}`, mirroring the Rust reference (`src/token.rs`): the *kind* is an integer tag
-// matching `TokenKind`'s discriminant order, and the lexeme is recovered from the
-// source via `[start..end]` when needed. This is the random-access token feed the
-// parser (P2) consumes in-process (handoff §3.3a), not a text hand-off. `lex` then
-// walks that vector to print either lexemes (P1 golden) or kind labels (P2a golden),
-// so the observable output stays byte-identical to the print-as-you-scan version and
-// the two `..._match_reference_on_corpus` goldens remain the acceptance test.
+// **The tokenizer now lives in `tokens.jtr`** (extracted so the parser can import it
+// in-process, handoff §3.3a). This driver `import`s it, calls `tokens.tokenize` to get
+// a `List(tokens.Token)`, and walks that vector to print the token stream in one of
+// three modes:
+//   • lexemes — each token's raw source slice `[start..end]`  (the P1 golden)
+//   • kinds   — each token's `TokenKind::describe()` label     (the P2a label golden)
+//   • nums    — each token's integer `TokenKind` discriminant  (the P2a tag golden —
+//               the actual integers the parser switches on)
+// followed by a 6-number summary. The observable output is byte-identical to the
+// pre-extraction lexer, so the `..._match_reference_on_corpus` goldens remain the
+// acceptance test — and building this driver now exercises cross-module generic
+// monomorphization (`list.get(tokens.Token, …)` resolving to the producer's instance).
 //
-// Design notes:
-//   • Keywords are interned FIRST, in the SAME order as `TokenKind`'s keyword
-//     discriminants, so a scanned keyword's kind is just `interned_id + 7` (Fn is
-//     discriminant 7, interned id 0) — the interner doubles as the keyword table and
-//     the classification stays in lockstep with the reference by construction.
-//   • `Token.kind` is the integer discriminant of `TokenKind` (Ident=0 … Unknown=111).
-//     `kind_label` maps it back to the reference's `describe()` string for the kinds
-//     dump; for keywords/operators that label *is* the source slice, so only the
-//     literal/ident kinds (and `<unknown>`) need a special case.
-//   • Run with a path to lex a real file (`lexer.exe foo.jtr`); a second arg switches to
-//     kind-label output (`lexer.exe foo.jtr kinds`) or integer kind tags
-//     (`lexer.exe foo.jtr nums` — the parser's actual switch input). With no args it
-//     lexes a built-in sample (what the test pins).
-//
-// Byte-level (ASCII) classification, like the reference on ASCII source; the corpus
-// is ASCII outside comments/strings, which are slurped whole so their bytes never
-// need per-character classification.
+// Run with a path to lex a real file (`lexer.exe foo.jtr`); a second arg switches to
+// kind-label output (`lexer.exe foo.jtr kinds`) or integer kind tags
+// (`lexer.exe foo.jtr nums`). With no args it lexes a built-in sample (what the test pins).
 import "mem"
 import "intern"
 import "fs"
 import "env"
 import "list"
-
-// A payload-free token: the integer `kind` tag (a `TokenKind` discriminant) plus the
-// half-open source span `[start, end)`. The text/value is recovered from the source
-// on demand, exactly as the Rust `Token` keeps `TokenKind` `Copy` and span-addressed.
-struct Token { kind: i32, start: usize, end: usize }
-
-// An operator's kind tag together with its byte width (maximal munch), returned as a
-// pair so `tokenize` can both classify and advance in one step.
-struct OpTok { kind: i32, width: usize }
-
-fn is_space(x: i32) -> bool {
-    if x == 32 { return true }   // space
-    if x == 9 { return true }    // tab
-    if x == 10 { return true }   // newline
-    if x == 13 { return true }   // carriage return
-    return false
-}
-fn is_alpha(c: u8) -> bool {
-    let x: i32 = c as i32
-    if x >= 65 { if x <= 90 { return true } }    // A-Z
-    if x >= 97 { if x <= 122 { return true } }   // a-z
-    if x == 95 { return true }                   // _
-    return false
-}
-fn is_digit(c: u8) -> bool {
-    let x: i32 = c as i32
-    if x >= 48 { if x <= 57 { return true } }    // 0-9
-    return false
-}
-fn is_alnum(c: u8) -> bool {
-    if is_alpha(c) { return true }
-    return is_digit(c)
-}
-fn is_hex(c: u8) -> bool {
-    if is_digit(c) { return true }
-    let x: i32 = c as i32
-    if x >= 65 { if x <= 70 { return true } }    // A-F
-    if x >= 97 { if x <= 102 { return true } }   // a-f
-    return false
-}
-// A digit or the `_` digit separator (`1_000`, `0xC000_0000`).
-fn is_digit_us(c: u8) -> bool {
-    if is_digit(c) { return true }
-    if (c as i32) == 95 { return true }
-    return false
-}
-
-// Is the already-scanned number `src[from..to]` a float (vs an integer)? Matches
-// the reference's Int/Float split: radix literals (`0x`/`0b`) are always integers;
-// otherwise a `.` or an `e`/`E` exponent makes it a float.
-fn num_is_float(read src: str, from: usize, to: usize) -> bool {
-    if to - from >= 2 {
-        if (src[from] as i32) == 48 {          // leading '0' — a radix prefix is an int
-            let d: i32 = src[from + 1] as i32
-            if d == 120 { return false }       // x
-            if d == 88 { return false }        // X
-            if d == 98 { return false }        // b
-            if d == 66 { return false }        // B
-        }
-    }
-    var i: usize = from
-    for i < to {
-        let c: i32 = src[i] as i32
-        if c == 46 { return true }             // '.'
-        if c == 101 { return true }            // 'e'
-        if c == 69 { return true }             // 'E'
-        i = i + 1
-    }
-    return false
-}
-
-// Skip whitespace and comments (both plain and doc — comments are never tokens),
-// honouring nested `/* … */`. Returns the index of the next real token byte.
-fn skip_trivia(read src: str, n: usize, from: usize) -> usize {
-    var i: usize = from
-    for i < n {
-        let c: i32 = src[i] as i32
-        if is_space(c) {
-            i = i + 1
-        } else if c == 47 {                          // '/'
-            if i + 1 >= n {
-                break                                // a lone '/' is a real token
-            } else if (src[i + 1] as i32) == 47 {    // '//' line comment
-                i = i + 2
-                for i < n {
-                    if (src[i] as i32) == 10 { break }
-                    i = i + 1
-                }
-            } else if (src[i + 1] as i32) == 42 {    // '/*' block comment (nested)
-                i = i + 2
-                var depth: i32 = 1
-                for i < n {
-                    if depth == 0 { break }
-                    let e: i32 = src[i] as i32
-                    if e == 47 {
-                        if i + 1 < n {
-                            if (src[i + 1] as i32) == 42 { depth = depth + 1  i = i + 2 } else { i = i + 1 }
-                        } else { i = i + 1 }
-                    } else if e == 42 {
-                        if i + 1 < n {
-                            if (src[i + 1] as i32) == 47 { depth = depth - 1  i = i + 2 } else { i = i + 1 }
-                        } else { i = i + 1 }
-                    } else {
-                        i = i + 1
-                    }
-                }
-            } else {
-                break                                // '/' or '/=' — a real token
-            }
-        } else {
-            break                                    // a real token starts here
-        }
-    }
-    return i
-}
-
-// Scan a string body starting just past the opening quote; return the index one
-// past the closing quote. `\` escapes the next byte (validation happens later).
-fn scan_string(read src: str, n: usize, from: usize) -> usize {
-    var i: usize = from
-    for i < n {
-        let c: i32 = src[i] as i32
-        if c == 34 {              // closing '"'
-            i = i + 1
-            break
-        } else if c == 92 {       // '\' escape: skip it and the next byte
-            i = i + 1
-            if i < n { i = i + 1 }
-        } else {
-            i = i + 1
-        }
-    }
-    return i
-}
-
-// Scan a char literal starting just past the opening quote; return one past the
-// closing quote (mirrors the reference: one char or a `\`-escape, then a `'`).
-fn scan_char(read src: str, n: usize, from: usize) -> usize {
-    var i: usize = from
-    if i < n {
-        if (src[i] as i32) == 92 {          // '\' escape
-            i = i + 1
-            if i < n { i = i + 1 }
-        } else {
-            i = i + 1
-        }
-    }
-    if i < n {
-        if (src[i] as i32) == 39 { i = i + 1 }   // closing '\''
-    }
-    return i
-}
-
-// Scan a `0x…` hex integer body (from = just past the `0x`).
-fn scan_hex(read src: str, n: usize, from: usize) -> usize {
-    var i: usize = from
-    for i < n {
-        let c: u8 = src[i]
-        if is_hex(c) { i = i + 1 } else if (c as i32) == 95 { i = i + 1 } else { break }
-    }
-    return i
-}
-
-// Scan a `0b…` binary integer body (from = just past the `0b`).
-fn scan_bin(read src: str, n: usize, from: usize) -> usize {
-    var i: usize = from
-    for i < n {
-        let c: i32 = src[i] as i32
-        if c == 48 { i = i + 1 } else if c == 49 { i = i + 1 } else if c == 95 { i = i + 1 } else { break }
-    }
-    return i
-}
-
-// Scan a float exponent starting at `e`/`E`; return one past the exponent digits.
-fn scan_exp(read src: str, n: usize, from: usize) -> usize {
-    var i: usize = from + 1                  // consume 'e' / 'E'
-    if i < n {
-        let s: i32 = src[i] as i32
-        if s == 43 { i = i + 1 } else if s == 45 { i = i + 1 }   // optional '+' / '-'
-    }
-    for i < n {
-        if is_digit_us(src[i]) { i = i + 1 } else { break }
-    }
-    return i
-}
-
-// Scan a number starting at its first digit; return one past the last byte. Handles
-// `0x`/`0b` radix, decimal integers, a fractional part (only when a digit follows
-// the dot — so `1..2` stays `1`,`..`,`2`), and an `e`/`E` exponent.
-fn scan_number(read src: str, n: usize, from: usize) -> usize {
-    var i: usize = from
-    if (src[i] as i32) == 48 {               // leading '0' — check for a radix prefix
-        if i + 1 < n {
-            let d: i32 = src[i + 1] as i32
-            if d == 120 { return scan_hex(src, n, i + 2) }   // 'x'
-            if d == 88  { return scan_hex(src, n, i + 2) }   // 'X'
-            if d == 98  { return scan_bin(src, n, i + 2) }   // 'b'
-            if d == 66  { return scan_bin(src, n, i + 2) }   // 'B'
-        }
-    }
-    for i < n {                              // integer part
-        if is_digit_us(src[i]) { i = i + 1 } else { break }
-    }
-    if i + 1 < n {                           // fractional part — need a digit after '.'
-        if (src[i] as i32) == 46 {
-            if is_digit(src[i + 1]) {
-                i = i + 1
-                for i < n {
-                    if is_digit_us(src[i]) { i = i + 1 } else { break }
-                }
-            }
-        }
-    }
-    if i < n {                               // exponent
-        let e: i32 = src[i] as i32
-        if e == 101 { i = scan_exp(src, n, i) } else if e == 69 { i = scan_exp(src, n, i) }
-    }
-    return i
-}
-
-// Classify the operator/punctuator at `i` (maximal munch): its `TokenKind`
-// discriminant and byte width, matching the reference lexer's dispatch exactly.
-// `//` and `/*` are handled as trivia before this is ever reached, so a `/` here is a
-// real `/` or `/=`. An unrecognized single byte is `Unknown` (111), as in the
-// reference (which also records a diagnostic; the corpus has none).
-fn classify_op(read src: str, n: usize, i: usize) -> OpTok {
-    let c: i32 = src[i] as i32
-    var d: i32 = 0
-    if i + 1 < n { d = src[i + 1] as i32 }
-    var e: i32 = 0
-    if i + 2 < n { e = src[i + 2] as i32 }
-
-    if c == 40 { return OpTok{ kind: 63, width: 1 } }   // (   LParen
-    if c == 41 { return OpTok{ kind: 64, width: 1 } }   // )   RParen
-    if c == 123 { return OpTok{ kind: 65, width: 1 } }  // {   LBrace
-    if c == 125 { return OpTok{ kind: 66, width: 1 } }  // }   RBrace
-    if c == 91 { return OpTok{ kind: 67, width: 1 } }   // [   LBracket
-    if c == 93 { return OpTok{ kind: 68, width: 1 } }   // ]   RBracket
-    if c == 44 { return OpTok{ kind: 69, width: 1 } }   // ,   Comma
-    if c == 59 { return OpTok{ kind: 70, width: 1 } }   // ;   Semi
-    if c == 64 { return OpTok{ kind: 101, width: 1 } }  // @   At
-    if c == 126 { return OpTok{ kind: 96, width: 1 } }  // ~   Tilde
-    if c == 63 { return OpTok{ kind: 100, width: 1 } }  // ?   Question
-
-    if c == 58 {                                        // ':' / '::'
-        if d == 58 { return OpTok{ kind: 72, width: 2 } }
-        return OpTok{ kind: 71, width: 1 }
-    }
-    if c == 46 {                                        // '.' / '..' / '..=' / '.*'
-        if d == 46 {
-            if e == 61 { return OpTok{ kind: 75, width: 3 } }   // ..=  DotDotEq
-            return OpTok{ kind: 74, width: 2 }                  // ..   DotDot
-        }
-        if d == 42 { return OpTok{ kind: 76, width: 2 } }       // .*   DotStar
-        return OpTok{ kind: 73, width: 1 }                      // .    Dot
-    }
-    if c == 43 {                                        // '+' / '+='
-        if d == 61 { return OpTok{ kind: 102, width: 2 } }
-        return OpTok{ kind: 79, width: 1 }
-    }
-    if c == 45 {                                        // '-' / '->' / '-='
-        if d == 62 { return OpTok{ kind: 77, width: 2 } }       // ->   Arrow
-        if d == 61 { return OpTok{ kind: 103, width: 2 } }      // -=   MinusEq
-        return OpTok{ kind: 80, width: 1 }
-    }
-    if c == 42 {                                        // '*' / '*='
-        if d == 61 { return OpTok{ kind: 104, width: 2 } }
-        return OpTok{ kind: 81, width: 1 }
-    }
-    if c == 47 {                                        // '/' / '/='
-        if d == 61 { return OpTok{ kind: 105, width: 2 } }
-        return OpTok{ kind: 82, width: 1 }
-    }
-    if c == 37 {                                        // '%' / '%='
-        if d == 61 { return OpTok{ kind: 106, width: 2 } }
-        return OpTok{ kind: 83, width: 1 }
-    }
-    if c == 61 {                                        // '=' / '==' / '=>'
-        if d == 61 { return OpTok{ kind: 85, width: 2 } }       // ==   EqEq
-        if d == 62 { return OpTok{ kind: 78, width: 2 } }       // =>   FatArrow
-        return OpTok{ kind: 84, width: 1 }
-    }
-    if c == 33 {                                        // '!' / '!='
-        if d == 61 { return OpTok{ kind: 86, width: 2 } }
-        return OpTok{ kind: 99, width: 1 }
-    }
-    if c == 60 {                                        // '<' / '<=' / '<<'
-        if d == 61 { return OpTok{ kind: 88, width: 2 } }       // <=   Le
-        if d == 60 { return OpTok{ kind: 97, width: 2 } }       // <<   Shl
-        return OpTok{ kind: 87, width: 1 }
-    }
-    if c == 62 {                                        // '>' / '>=' / '>>'
-        if d == 61 { return OpTok{ kind: 90, width: 2 } }       // >=   Ge
-        if d == 62 { return OpTok{ kind: 98, width: 2 } }       // >>   Shr
-        return OpTok{ kind: 89, width: 1 }
-    }
-    if c == 38 {                                        // '&' / '&&' / '&='
-        if d == 38 { return OpTok{ kind: 92, width: 2 } }       // &&   AmpAmp
-        if d == 61 { return OpTok{ kind: 107, width: 2 } }      // &=   AmpEq
-        return OpTok{ kind: 91, width: 1 }
-    }
-    if c == 124 {                                       // '|' / '||' / '|='
-        if d == 124 { return OpTok{ kind: 94, width: 2 } }      // ||   PipePipe
-        if d == 61 { return OpTok{ kind: 108, width: 2 } }      // |=   PipeEq
-        return OpTok{ kind: 93, width: 1 }
-    }
-    if c == 94 {                                        // '^' / '^='
-        if d == 61 { return OpTok{ kind: 109, width: 2 } }
-        return OpTok{ kind: 95, width: 1 }
-    }
-    return OpTok{ kind: 111, width: 1 }                 // Unknown
-}
+import "tokens"
 
 // Byte-wise equality of two string views — enough to pick the output mode from argv.
 fn str_eq(read a: str, read b: str) -> bool {
@@ -360,12 +38,12 @@ fn str_eq(read a: str, read b: str) -> bool {
     return true
 }
 
-// Print the reference `TokenKind::describe()` label for a token's kind — what the P2a
-// kinds dump emits. For keywords and operators the label *is* the source slice, so only
-// the literal/identifier kinds and the `<unknown>` sentinel need naming here. The label
-// is *printed* (a slice passed further down to `print_str`), never returned: a `read`
-// borrow of `src` is second-class and may not escape the call.
-fn print_kind(read src: str, t: Token) {
+// Print the reference `TokenKind::describe()` label for a token's kind — what the kinds
+// dump emits. For keywords and operators the label *is* the source slice, so only the
+// literal/identifier kinds and the `<unknown>` sentinel need naming here. The label is
+// *printed* (a slice passed further down to `print_str`), never returned: a `read` borrow
+// of `src` is second-class and may not escape the call.
+fn print_kind(read src: str, t: tokens.Token) {
     let k: i32 = t.kind
     if k == 0 { print_str("ident") return }
     if k == 1 { print_str("int") return }
@@ -378,76 +56,16 @@ fn print_kind(read src: str, t: Token) {
     print_str(src[t.start..t.end])   // keyword or operator: label == source symbol
 }
 
-// Scan `src` into a `List(Token)` — the in-process, random-access token feed the
-// parser consumes. Each token carries its `TokenKind` discriminant and half-open
-// source span; the interner `it` is filled along the way (identifiers, including the
-// lone `_`, are interned so keyword-vs-ident is `id < kwcount` and the distinct-user
-// count is exact). Keywords own ids `0..kwcount-1`, so a keyword's kind is `id + 7`.
-fn tokenize(read src: str, mut it: Interner, kwcount: i64, read a: Allocator) -> List(Token) {
-    let n: usize = src.len
-    var toks: List(Token) = list.make(Token, a)
-    var i: usize = 0
-    for i < n {
-        i = skip_trivia(src, n, i)
-        if i >= n { break }
-        let start: usize = i
-        let c: u8 = src[i]
-        let x: i32 = c as i32
-        if is_alpha(c) {
-            i = i + 1
-            for i < n {
-                if is_alnum(src[i]) { i = i + 1 } else { break }
-            }
-            // f-string: the lexeme is exactly `f` and a `"` immediately follows.
-            var isf: bool = false
-            if i - start == 1 {
-                if x == 102 {                       // 'f'
-                    if i < n { if (src[i] as i32) == 34 { isf = true } }
-                }
-            }
-            if isf {
-                i = scan_string(src, n, i + 1)      // consume opening quote + body
-                list.push(Token, toks, Token{ kind: 4, start: start, end: i })   // FStr
-            } else {
-                let lexeme: str = src[start..i]
-                let id: i64 = intern.intern(it, lexeme)
-                var kind: i32 = 0                   // Ident
-                var isund: bool = false
-                if i - start == 1 { if (src[start] as i32) == 95 { isund = true } }
-                if isund { kind = 6 }                          // Underscore (a lone `_`)
-                else if id < kwcount { kind = (id as i32) + 7 } // keyword: id + 7
-                list.push(Token, toks, Token{ kind: kind, start: start, end: i })
-            }
-        } else if is_digit(c) {
-            i = scan_number(src, n, i)
-            var kind: i32 = 1                        // Int
-            if num_is_float(src, start, i) { kind = 2 }  // Float
-            list.push(Token, toks, Token{ kind: kind, start: start, end: i })
-        } else if x == 34 {                          // '"' string
-            i = scan_string(src, n, i + 1)
-            list.push(Token, toks, Token{ kind: 3, start: start, end: i })       // Str
-        } else if x == 39 {                          // '\'' char
-            i = scan_char(src, n, i + 1)
-            list.push(Token, toks, Token{ kind: 5, start: start, end: i })       // Char
-        } else {                                     // operator / punctuation
-            let op: OpTok = classify_op(src, n, i)
-            i = i + op.width
-            list.push(Token, toks, Token{ kind: op.kind, start: start, end: i })
-        }
-    }
-    return toks
-}
-
-// Tokenize `src`, then walk the token vector printing each token — followed by a
-// 6-number summary. The `mode` selects what each token prints: 0 = its raw source
-// lexeme (P1 golden), 1 = its kind *label* (P2a `describe()` golden), 2 = its integer
-// kind *tag* (the discriminant the parser switches on — the strongest cross-check).
+// Tokenize `src` (via the shared `tokens` module), then walk the token vector printing
+// each token — followed by a 6-number summary. The `mode` selects what each token
+// prints: 0 = its raw source lexeme (P1 golden), 1 = its kind *label* (P2a label
+// golden), 2 = its integer kind *tag* (the discriminant the parser switches on).
 // Every output is derived purely from the `List(Token)`, so modes 0/1 stay
-// byte-identical to the print-as-you-scan version. Summary: total, #keywords,
-// #identifiers, #number literals, #punctuation, #distinct user ids.
+// byte-identical to the pre-extraction lexer. Summary: total, #keywords, #identifiers,
+// #number literals, #punctuation, #distinct user ids.
 fn lex(read src: str, mut it: Interner, kwcount: i64, read a: Allocator, mode: i32) {
-    var toks: List(Token) = tokenize(src, it, kwcount, a)
-    let m: usize = list.len(Token, toks)
+    var toks: List(tokens.Token) = tokens.tokenize(src, it, kwcount, a)
+    let m: usize = list.len(tokens.Token, toks)
     var total: i32 = 0
     var nkw: i32 = 0
     var nid: i32 = 0
@@ -455,7 +73,7 @@ fn lex(read src: str, mut it: Interner, kwcount: i64, read a: Allocator, mode: i
     var npunct: i32 = 0
     var j: usize = 0
     for j < m {
-        let t: Token = list.get(Token, toks, j)
+        let t: tokens.Token = list.get(tokens.Token, toks, j)
         let k: i32 = t.kind
         if mode == 2 { print_int(k) } else if mode == 1 { print_kind(src, t) } else { print_str(src[t.start..t.end]) }
         // Tally by kind, matching the original per-branch counters: keywords are
@@ -483,7 +101,7 @@ fn lex(read src: str, mut it: Interner, kwcount: i64, read a: Allocator, mode: i
 fn main() -> i32 {
     var a: Allocator = mem.system_allocator()
     var it: Interner = intern.make(a)
-    let kwcount: i64 = intern_keywords(it)
+    let kwcount: i64 = tokens.intern_keywords(it)
 
     if env.argc() > 1 {
         // Real use: lex the file named on the command line (the self-hosting loop).
@@ -502,69 +120,4 @@ fn main() -> i32 {
         lex(sample, it, kwcount, a, 0)
     }
     return 0   // `it`/`toks` drop here (RAII): interner table + token buffer freed
-}
-
-// Intern the FULL keyword set (exactly `TokenKind::keyword` in src/token.rs), so an
-// identifier is a keyword iff its interned id < N — the interner is the keyword table.
-// Returns the count N. Kept complete and IN DISCRIMINANT ORDER so a keyword's kind is
-// `id + 7` and keyword-vs-ident classification matches the reference lexer (the P2a
-// kind cross-check depends on it).
-fn intern_keywords(mut it: Interner) -> i64 {
-    intern.intern(it, "fn")
-    intern.intern(it, "let")
-    intern.intern(it, "var")
-    intern.intern(it, "const")
-    intern.intern(it, "struct")
-    intern.intern(it, "record")
-    intern.intern(it, "enum")
-    intern.intern(it, "union")
-    intern.intern(it, "trait")
-    intern.intern(it, "impl")
-    intern.intern(it, "type")
-    intern.intern(it, "distinct")
-    intern.intern(it, "indirect")
-    intern.intern(it, "error")
-    intern.intern(it, "match")
-    intern.intern(it, "if")
-    intern.intern(it, "else")
-    intern.intern(it, "for")
-    intern.intern(it, "in")
-    intern.intern(it, "while")
-    intern.intern(it, "loop")
-    intern.intern(it, "return")
-    intern.intern(it, "break")
-    intern.intern(it, "continue")
-    intern.intern(it, "comptime")
-    intern.intern(it, "region")
-    intern.intern(it, "scope")
-    intern.intern(it, "concurrent")
-    intern.intern(it, "spawn")
-    intern.intern(it, "await")
-    intern.intern(it, "select")
-    intern.intern(it, "unsafe")
-    intern.intern(it, "trusted")
-    intern.intern(it, "extern")
-    intern.intern(it, "import")
-    intern.intern(it, "pub")
-    intern.intern(it, "requires")
-    intern.intern(it, "ensures")
-    intern.intern(it, "invariant")
-    intern.intern(it, "variant")
-    intern.intern(it, "where")
-    intern.intern(it, "as")
-    intern.intern(it, "and")
-    intern.intern(it, "or")
-    intern.intern(it, "not")
-    intern.intern(it, "dyn")
-    intern.intern(it, "catch")
-    intern.intern(it, "read")
-    intern.intern(it, "mut")
-    intern.intern(it, "take")
-    intern.intern(it, "out")
-    intern.intern(it, "true")
-    intern.intern(it, "false")
-    intern.intern(it, "null")
-    intern.intern(it, "self")
-    intern.intern(it, "Self")
-    return intern.count(it) as i64
 }

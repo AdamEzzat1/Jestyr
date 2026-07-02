@@ -7661,6 +7661,25 @@ impl<'a> Cgen<'a> {
                     Ty::Opaque(n.name.clone())
                 }
             }
+            // A module-qualified type argument `mod.Type` (e.g. `tokens.Token`),
+            // resolved in the target module via the import map — mirrors the
+            // `TypeKind::Path` resolver (see `ast_type_to_ty`) so a generic
+            // instantiated over an imported type mangles identically in the producer
+            // and the consumer. Without this the element degrades to `Opaque("?")` and
+            // the two modules disagree on the instance's C name (`Jestyr_List__?` in
+            // the consumer vs `Jestyr_List__T` in the producer → invalid C).
+            ExprKind::Field { base, name } => {
+                if let ExprKind::Name(m) = &self.ast.expr_at(*base).kind {
+                    let key = match self.path_target(&m.name) {
+                        Some(t) => self.canon_type_in(t, &name.name),
+                        None => self.canon_type(&name.name),
+                    };
+                    if let Some(&i) = self.info.table.type_index.get(&key) {
+                        return Ty::Named(i);
+                    }
+                }
+                Ty::Opaque("?".to_string())
+            }
             _ => Ty::Opaque("?".to_string()),
         }
     }
