@@ -5765,6 +5765,157 @@ mod c_oracle {
             .collect()
     }
 
+    // --- P2 expression-parser cross-check (parser AST-dump golden) ---
+
+    /// Canonical `UnOp` label for the AST dump — matches `unop_label` in
+    /// `examples/std/parser.jtr`.
+    fn ref_unop_label(op: crate::ast::UnOp) -> &'static str {
+        use crate::ast::UnOp::*;
+        match op {
+            Neg => "neg",
+            Not => "not",
+            BitNot => "bitnot",
+            Ref => "ref",
+        }
+    }
+
+    /// Canonical `BinOp` label for the AST dump — matches `binop_label` in
+    /// `examples/std/parser.jtr`.
+    fn ref_binop_label(op: crate::ast::BinOp) -> &'static str {
+        use crate::ast::BinOp::*;
+        match op {
+            Add => "add",
+            Sub => "sub",
+            Mul => "mul",
+            Div => "div",
+            Rem => "rem",
+            Eq => "eq",
+            Ne => "ne",
+            Lt => "lt",
+            Le => "le",
+            Gt => "gt",
+            Ge => "ge",
+            And => "and",
+            Or => "or",
+            BitAnd => "bitand",
+            BitOr => "bitor",
+            BitXor => "bitxor",
+            Shl => "shl",
+            Shr => "shr",
+        }
+    }
+
+    /// The Rust *reference* canonical AST dump for one expression node: a flattened
+    /// S-expression, one atom per line — `(`, the kind label, (operator label,) the
+    /// span `start`/`end`, then each child's dump in order, then `)`. A **pure function
+    /// of the AST**: no source text, no HashMap iteration, fixed field/child order — so
+    /// the Jestyr-written `dump` in `parser.jtr` can reproduce it atom-for-atom. This is
+    /// the oracle the P2 parser golden diffs against.
+    fn ref_dump_expr(ast: &crate::ast::Ast, id: crate::ast::ExprId, out: &mut Vec<String>) {
+        use crate::ast::ExprKind;
+        let e = ast.expr_at(id);
+        let s = e.span.start.to_string();
+        let en = e.span.end.to_string();
+        out.push("(".to_string());
+        match &e.kind {
+            ExprKind::Int(_) => {
+                out.push("int".to_string());
+                out.push(s);
+                out.push(en);
+            }
+            ExprKind::Float(_) => {
+                out.push("float".to_string());
+                out.push(s);
+                out.push(en);
+            }
+            ExprKind::Name(_) => {
+                out.push("name".to_string());
+                out.push(s);
+                out.push(en);
+            }
+            ExprKind::Unary { op, rhs } => {
+                out.push("unary".to_string());
+                out.push(ref_unop_label(*op).to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *rhs, out);
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                out.push("binary".to_string());
+                out.push(ref_binop_label(*op).to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *lhs, out);
+                ref_dump_expr(ast, *rhs, out);
+            }
+            // Any construct the P2 slice does not yet build dumps as `error`; the golden
+            // corpus is curated to the handled constructs, so this arm stays unexercised.
+            _ => {
+                out.push("error".to_string());
+                out.push(s);
+                out.push(en);
+            }
+        }
+        out.push(")".to_string());
+    }
+
+    /// The reference expression-dump line stream for `src`: lex, parse a single
+    /// expression, and dump it canonically.
+    fn rust_expr_dump(src: &str) -> Vec<String> {
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (ast, root, _diags) = crate::parser::Parser::new(src, tokens).parse_single_expr();
+        let mut out = Vec::new();
+        ref_dump_expr(&ast, root, &mut out);
+        out
+    }
+
+    /// Run the built Jestyr parser exe on `file` and return its stdout lines (the
+    /// flattened AST dump — no trailing summary, so every line is compared).
+    fn jestyr_expr_dump(parser_exe: &std::path::Path, file: &str) -> Vec<String> {
+        let out = Command::new(parser_exe).arg(file).output().unwrap();
+        assert!(out.status.success(), "jestyr parser failed on {file}");
+        String::from_utf8(out.stdout).unwrap().lines().map(|s| s.to_string()).collect()
+    }
+
+    /// **P2 expression-parser cross-implementation golden.** The Jestyr-written Pratt
+    /// parser (`examples/std/parser.jtr`) must build the *same expression AST* as the
+    /// Rust reference on a curated corpus that exercises operator precedence,
+    /// left-associativity, prefix unary, `( … )` grouping, and int/float/name leaves —
+    /// verified by diffing the canonical AST dump (node kind + operator + exact span +
+    /// child order) atom-for-atom. This is the acceptance test for the P2 expression
+    /// slice; the corpus grows as the parser gains constructs.
+    #[test]
+    fn jestyr_parser_expr_dump_matches_reference() {
+        let parser = build_exe("examples/std/parser.jtr");
+        let snippets = [
+            "1 + 2 * 3",       // multiplicative binds tighter than additive
+            "1 * 2 + 3",       // …either side
+            "(1 + 2) * 3",     // grouping overrides precedence
+            "a + b + c",       // additive is left-associative
+            "a - b - c",       // …and subtraction
+            "x % y / z * w",   // same-precedence multiplicative chain, left-assoc
+            "- - x",           // nested prefix negation
+            "!a and b",        // `!` binds tighter than `and`
+            "not a or b and c", // `and` binds tighter than `or`; `not` tightest
+            "a == b + c",      // additive binds tighter than comparison
+            "a < b == c",      // comparisons share precedence (left-assoc here)
+            "a | b ^ c & d",   // bitwise: & > ^ > |
+            "a << b + c",      // additive binds tighter than shift
+            "~x + 1",          // bitwise-not prefix
+            "&a == &b",        // reference prefix vs comparison
+            "1.5 * x - 2.0",   // float + name leaves
+            "((a))",           // redundant nested grouping collapses
+            "a and b or c",    // `and` before `or`
+        ];
+        for src in snippets {
+            let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");
+            std::fs::write(&probe, src).unwrap();
+            let got = jestyr_expr_dump(&parser, probe.to_str().unwrap());
+            let want = rust_expr_dump(src);
+            assert_eq!(got, want, "expression AST dump diverged on `{src}`");
+        }
+    }
+
     /// Build `rel`'s `@test`/`@bench` **harness** (narrowed by `filter`) through the
     /// real gcc pipeline — exactly what `jestyrc test [substr]` does — run it, and
     /// return `(stdout, exit_code)`. The exit code is the runner's pass/fail tally

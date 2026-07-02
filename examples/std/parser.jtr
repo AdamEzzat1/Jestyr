@@ -1,0 +1,270 @@
+// examples/std/parser.jtr — the P2 expression parser, written *in Jestyr*. It consumes
+// the shared tokenizer (`tokens.tokenize`) in-process and builds an expression AST as an
+// **arena** — a `List(ExprData)` addressed by integer ids — mirroring the Rust reference
+// (`src/parser.rs`, `src/ast.rs`), which stores its AST as arena vectors indexed by
+// `ExprId(u32)`. Representing the tree as a flat list + integer child ids (rather than a
+// recursive enum) dodges recursive-ownership questions and matches the reference 1:1,
+// which is what makes the AST-dump cross-check align.
+//
+// **This first slice** is the Pratt (precedence-climbing) core: integer/float literals,
+// identifiers, prefix unary (`-`/`!`/`not`/`~`/`&`), the full binary-operator precedence
+// table (matching `bin_op` in the reference), and `( … )` grouping. Assignment, ranges,
+// casts, postfix (call/field/index/`?`/`.*`), and the composite forms
+// (`if`/`match`/struct-literals/…) are later increments; the golden runs on a curated
+// expression corpus that uses only the constructs handled here, and grows with the parser.
+//
+// Verification: `dump` emits a canonical **flattened S-expression** — one atom per line,
+// parens as their own atoms — that is a pure function of the AST (node kind + operator
+// label + span, children in order). The Rust reference emits the identical line stream
+// via `parse_expr_only` + a matching dumper; the cross-check diffs the two over the corpus
+// (`jestyr_parser_expr_dump_matches_reference`). Spans are exact: leaf = token span,
+// unary = `op.start .. rhs.end`, binary = `lhs.start .. rhs.end` (the reference's `Span::to`).
+//
+// Design note — arenas are threaded, not nested: the node arena `List(ExprData)` and the
+// token vector are passed as standalone `mut`/`read` parameters (plus a small scalar
+// `Cur` cursor), never stored inside a parser struct — a generic `List` embedded by value
+// in another struct is not yet ordered correctly by cgen. This matches the reference,
+// where `Ast` owns the vectors and the `Parser` borrows them.
+import "mem"
+import "intern"
+import "fs"
+import "env"
+import "list"
+import "tokens"
+
+// One arena node. `kind`: 0=Int 1=Float 2=Name 3=Unary 4=Binary 9=Error. `start`/`end`
+// are the source span. `op` is the operator code (unary or binary; 0 for leaves). `a`/`b`
+// are child `ExprId`s (arena indices): unary uses `a` (the operand), binary uses `a` (lhs)
+// and `b` (rhs); `-1` means "none".
+struct ExprData { kind: i32, start: usize, end: usize, op: i32, a: i32, b: i32 }
+
+// A binary-operator lookup: whether `k` is an infix operator, its left/right binding
+// powers (precedence climbing), and its `BinOp` code. Mirrors `bin_op` in the reference.
+struct BinInfo { ok: bool, lbp: i32, rbp: i32, code: i32 }
+
+// The token cursor: current position and the token count. Scalar-only, so it is safe to
+// pass `mut` (an in-out reference) without tripping the generic-field cgen limitation.
+struct Cur { pos: usize, n: usize }
+
+// ---- cursor helpers ----
+
+// The kind of the current token, or 110 (Eof) past the end.
+fn cur_kind(read tk: List(tokens.Token), c: Cur) -> i32 {
+    if c.pos >= c.n { return 110 }
+    let t: tokens.Token = list.get(tokens.Token, tk, c.pos)
+    return t.kind
+}
+fn cur_tok(read tk: List(tokens.Token), c: Cur) -> tokens.Token {
+    return list.get(tokens.Token, tk, c.pos)
+}
+fn bump(mut c: Cur) { c.pos = c.pos + 1 }
+
+// ---- arena helpers ----
+
+// Append a node and return its `ExprId` (its index in the arena).
+fn mk(mut ex: List(ExprData), kind: i32, start: usize, end: usize, op: i32, a: i32, b: i32) -> i32 {
+    let id: i32 = list.len(ExprData, ex) as i32
+    list.push(ExprData, ex, ExprData{ kind: kind, start: start, end: end, op: op, a: a, b: b })
+    return id
+}
+fn node_start(read ex: List(ExprData), id: i32) -> usize {
+    let d: ExprData = list.get(ExprData, ex, id as usize)
+    return d.start
+}
+fn node_end(read ex: List(ExprData), id: i32) -> usize {
+    let d: ExprData = list.get(ExprData, ex, id as usize)
+    return d.end
+}
+
+// ---- operator table ----
+
+// Classify an infix operator by token kind, returning its binding powers and `BinOp`
+// code. The powers are exactly the reference's `bin_op` table: `or` < `and` < comparison
+// < `|` < `^` < `&` < shifts < additive < multiplicative, each left-associative
+// (`lbp` even, `rbp = lbp + 1`). BinOp codes: 1=add 2=sub 3=mul 4=div 5=rem 6=eq 7=ne
+// 8=lt 9=le 10=gt 11=ge 12=and 13=or 14=bitand 15=bitor 16=bitxor 17=shl 18=shr.
+fn bin_op(k: i32) -> BinInfo {
+    if k == 50 { return BinInfo{ ok: true, lbp: 7, rbp: 8, code: 13 } }    // or
+    if k == 49 { return BinInfo{ ok: true, lbp: 9, rbp: 10, code: 12 } }   // and
+    if k == 85 { return BinInfo{ ok: true, lbp: 11, rbp: 12, code: 6 } }   // ==
+    if k == 86 { return BinInfo{ ok: true, lbp: 11, rbp: 12, code: 7 } }   // !=
+    if k == 87 { return BinInfo{ ok: true, lbp: 11, rbp: 12, code: 8 } }   // <
+    if k == 88 { return BinInfo{ ok: true, lbp: 11, rbp: 12, code: 9 } }   // <=
+    if k == 89 { return BinInfo{ ok: true, lbp: 11, rbp: 12, code: 10 } }  // >
+    if k == 90 { return BinInfo{ ok: true, lbp: 11, rbp: 12, code: 11 } }  // >=
+    if k == 93 { return BinInfo{ ok: true, lbp: 13, rbp: 14, code: 15 } }  // |  bitor
+    if k == 95 { return BinInfo{ ok: true, lbp: 15, rbp: 16, code: 16 } }  // ^  bitxor
+    if k == 91 { return BinInfo{ ok: true, lbp: 17, rbp: 18, code: 14 } }  // &  bitand
+    if k == 97 { return BinInfo{ ok: true, lbp: 19, rbp: 20, code: 17 } }  // << shl
+    if k == 98 { return BinInfo{ ok: true, lbp: 19, rbp: 20, code: 18 } }  // >> shr
+    if k == 79 { return BinInfo{ ok: true, lbp: 21, rbp: 22, code: 1 } }   // +  add
+    if k == 80 { return BinInfo{ ok: true, lbp: 21, rbp: 22, code: 2 } }   // -  sub
+    if k == 81 { return BinInfo{ ok: true, lbp: 23, rbp: 24, code: 3 } }   // *  mul
+    if k == 82 { return BinInfo{ ok: true, lbp: 23, rbp: 24, code: 4 } }   // /  div
+    if k == 83 { return BinInfo{ ok: true, lbp: 23, rbp: 24, code: 5 } }   // %  rem
+    return BinInfo{ ok: false, lbp: 0, rbp: 0, code: 0 }
+}
+
+// ---- the Pratt parser (mirrors parse_primary / parse_unary / parse_binary) ----
+
+// A leaf or a parenthesized group. `( e )` returns the inner expression unchanged
+// (grouping only, its own span) — exactly as the reference does. An unhandled token
+// yields an `Error` node so the walk still terminates.
+fn parse_primary(mut ex: List(ExprData), read tk: List(tokens.Token), mut c: Cur) -> i32 {
+    let k: i32 = cur_kind(tk, c)
+    if k == 1 {                                    // Int
+        let t: tokens.Token = cur_tok(tk, c)
+        bump(c)
+        return mk(ex, 0, t.start, t.end, 0, 0 - 1, 0 - 1)
+    }
+    if k == 2 {                                    // Float
+        let t: tokens.Token = cur_tok(tk, c)
+        bump(c)
+        return mk(ex, 1, t.start, t.end, 0, 0 - 1, 0 - 1)
+    }
+    if k == 0 {                                    // Ident -> Name
+        let t: tokens.Token = cur_tok(tk, c)
+        bump(c)
+        return mk(ex, 2, t.start, t.end, 0, 0 - 1, 0 - 1)
+    }
+    if k == 63 {                                   // '(' grouping
+        bump(c)
+        let inner: i32 = parse_binary(ex, tk, c, 0)
+        if cur_kind(tk, c) == 64 { bump(c) }       // ')'
+        return inner
+    }
+    // Unhandled construct: an Error node over the offending token (or an empty span).
+    if c.pos < c.n {
+        let t: tokens.Token = cur_tok(tk, c)
+        bump(c)
+        return mk(ex, 9, t.start, t.end, 0, 0 - 1, 0 - 1)
+    }
+    return mk(ex, 9, 0, 0, 0, 0 - 1, 0 - 1)
+}
+
+// Prefix unary: `-` (neg), `!`/`not` (not), `~` (bitnot), `&` (ref). Right-recursive, so
+// `- - x` nests. UnOp codes: 1=neg 2=not 3=bitnot 4=ref. Span = op.start .. rhs.end.
+fn parse_unary(mut ex: List(ExprData), read tk: List(tokens.Token), mut c: Cur) -> i32 {
+    let k: i32 = cur_kind(tk, c)
+    var opc: i32 = 0
+    if k == 80 { opc = 1 }                         // Minus -> neg
+    else if k == 51 { opc = 2 }                    // not   -> not
+    else if k == 99 { opc = 2 }                    // Bang  -> not
+    else if k == 96 { opc = 3 }                    // Tilde -> bitnot
+    else if k == 91 { opc = 4 }                    // Amp   -> ref (prefix position)
+    if opc != 0 {
+        let ct: tokens.Token = cur_tok(tk, c)
+        let st: usize = ct.start
+        bump(c)
+        let rhs: i32 = parse_unary(ex, tk, c)
+        let e: usize = node_end(ex, rhs)
+        return mk(ex, 3, st, e, opc, rhs, 0 - 1)
+    }
+    return parse_primary(ex, tk, c)
+}
+
+// Precedence climbing. `min_bp` is the minimum left binding power that may extend the
+// current left operand; an operator with `lbp < min_bp` stops this level. The left spine
+// folds iteratively (so `1+1+…` is a loop, not deep recursion) while the right operand
+// re-enters at `rbp` (left-associative). Span = lhs.start .. rhs.end.
+fn parse_binary(mut ex: List(ExprData), read tk: List(tokens.Token), mut c: Cur, min_bp: i32) -> i32 {
+    var lhs: i32 = parse_unary(ex, tk, c)
+    var go: bool = true
+    for go {
+        let k: i32 = cur_kind(tk, c)
+        let bi: BinInfo = bin_op(k)
+        if !bi.ok {
+            go = false
+        } else if bi.lbp < min_bp {
+            go = false
+        } else {
+            bump(c)
+            let rhs: i32 = parse_binary(ex, tk, c, bi.rbp)
+            let s: usize = node_start(ex, lhs)
+            let e: usize = node_end(ex, rhs)
+            lhs = mk(ex, 4, s, e, bi.code, lhs, rhs)
+        }
+    }
+    return lhs
+}
+
+// ---- the canonical AST dump (a pure function of the arena) ----
+
+fn print_uint(x: usize) { print_int(x as i64) }
+
+fn binop_label(code: i32) {
+    if code == 1 { print_str("add") return }
+    if code == 2 { print_str("sub") return }
+    if code == 3 { print_str("mul") return }
+    if code == 4 { print_str("div") return }
+    if code == 5 { print_str("rem") return }
+    if code == 6 { print_str("eq") return }
+    if code == 7 { print_str("ne") return }
+    if code == 8 { print_str("lt") return }
+    if code == 9 { print_str("le") return }
+    if code == 10 { print_str("gt") return }
+    if code == 11 { print_str("ge") return }
+    if code == 12 { print_str("and") return }
+    if code == 13 { print_str("or") return }
+    if code == 14 { print_str("bitand") return }
+    if code == 15 { print_str("bitor") return }
+    if code == 16 { print_str("bitxor") return }
+    if code == 17 { print_str("shl") return }
+    print_str("shr")   // 18
+}
+fn unop_label(code: i32) {
+    if code == 1 { print_str("neg") return }
+    if code == 2 { print_str("not") return }
+    if code == 3 { print_str("bitnot") return }
+    print_str("ref")   // 4
+}
+
+// Emit a flattened S-expression: `(`, the head atoms (kind label, operator label,
+// start, end), then each child's dump in order, then `)` — one atom per line.
+fn dump(read ex: List(ExprData), id: i32) {
+    let d: ExprData = list.get(ExprData, ex, id as usize)
+    print_str("(")
+    if d.kind == 0 {
+        print_str("int")   print_uint(d.start)   print_uint(d.end)
+    } else if d.kind == 1 {
+        print_str("float") print_uint(d.start)   print_uint(d.end)
+    } else if d.kind == 2 {
+        print_str("name")  print_uint(d.start)   print_uint(d.end)
+    } else if d.kind == 3 {
+        print_str("unary") unop_label(d.op)  print_uint(d.start) print_uint(d.end)
+        dump(ex, d.a)
+    } else if d.kind == 4 {
+        print_str("binary") binop_label(d.op) print_uint(d.start) print_uint(d.end)
+        dump(ex, d.a)
+        dump(ex, d.b)
+    } else {
+        print_str("error") print_uint(d.start) print_uint(d.end)
+    }
+    print_str(")")
+}
+
+// Tokenize `src`, parse one expression, dump it.
+fn parse_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Allocator) {
+    var tk: List(tokens.Token) = tokens.tokenize(src, it, kwcount, a)
+    let n: usize = list.len(tokens.Token, tk)
+    var ex: List(ExprData) = list.make(ExprData, a)
+    var c: Cur = Cur{ pos: 0, n: n }
+    let root: i32 = parse_binary(ex, tk, c, 0)
+    dump(ex, root)
+}
+
+fn main() -> i32 {
+    var a: Allocator = mem.system_allocator()
+    var it: Interner = intern.make(a)
+    let kwcount: i64 = tokens.intern_keywords(it)
+
+    if env.argc() > 1 {
+        var src: String = fs.read_text(env.argv(1))
+        parse_and_dump(string_view(src), it, kwcount, a)
+        string_free(src)
+    } else {
+        let sample: str = "1 + 2 * 3"
+        parse_and_dump(sample, it, kwcount, a)
+    }
+    return 0
+}

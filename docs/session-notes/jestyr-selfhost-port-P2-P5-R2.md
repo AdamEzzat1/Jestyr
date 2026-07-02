@@ -140,8 +140,28 @@ The parser needs random-ish access to a token vector with `(kind, span)`. Two op
    unblocks the whole modular architecture (any module returning `List(ExprData)` etc.).
    (Aside: naming a user struct literally `T` still collides with the blanket-impl generic
    param `T` and skips its Drop glue — a separate pre-existing corner; `Token` avoids it.)
-3. Expression parser (precedence climbing, matching `parse_expr`) + AST dump for exprs;
-   golden on expression-only snippets.
+3. **Expression parser — first slice DONE.** `examples/std/parser.jtr` imports `tokens`,
+   builds an expression AST as a threaded `List(ExprData)` arena + integer child ids
+   (mirroring `src/ast.rs`'s `ExprId` arenas), and dumps a canonical **flattened
+   S-expression** (one atom/line: kind label + operator label + exact span + children in
+   order — a pure function of the arena). The Rust reference emits the identical stream via
+   a new `Parser::parse_single_expr` (parser.rs) + `ref_dump_expr` (proptests.rs); the
+   golden `jestyr_parser_expr_dump_matches_reference` diffs them over a curated expression
+   corpus. Handled: int/float/name leaves, prefix unary (`-`/`!`/`not`/`~`/`&`), the full
+   binary precedence table (matching `bin_op`), `( … )` grouping. Spans exact (leaf = token
+   span; unary = `op.start..rhs.end`; binary = `lhs.start..rhs.end` per `Span::to`). Teeth:
+   perturbing `*`'s precedence flips `1+2*3`'s tree and fails the golden (shape + span).
+   *Deferred to later slices (grow the corpus alongside):* assignment, ranges, `as` casts,
+   postfix (call/field/index/`?`/`.*`), struct/array literals, `if`/`match`/blocks, and the
+   recursion-depth guard (§3.1) — the Jestyr parser recurses, so it needs the same
+   `MAX_EXPR_DEPTH` cap before it sees adversarially-deep input.
+   **Design constraint discovered (arenas are threaded, not nested):** cgen does not yet
+   order a generic `List(T)` embedded *by value as a struct field* before its container
+   (emits an incomplete C type), so the parser threads the arena + token vector as
+   standalone `mut`/`read` params plus a scalar-only `Cur` cursor — which also matches the
+   reference (`Ast` owns the vecs, `Parser` borrows them). Two cgen gaps logged for a later
+   dedicated pass: (a) generic-`List`-as-struct-field ordering; (b) a user struct literally
+   named `T` collides with the blanket-impl generic param `T` and skips its Drop glue.
 4. Type parser + pattern parser.
 5. Statement parser (`let`/`var`/`return`/expr-stmt/blocks/`if`/`match`/loops).
 6. Item parser (`fn`, `struct`/`record`/`union`, `enum`, `trait`/`impl`, `const`,

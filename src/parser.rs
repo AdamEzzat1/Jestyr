@@ -75,6 +75,17 @@ impl<'src> Parser<'src> {
         (ast, diags)
     }
 
+    /// Parse the whole input as a **single expression** (not a module) and return
+    /// the AST arena, the root `ExprId`, and any diagnostics. The oracle for the P2
+    /// expression cross-check: the Jestyr-written parser must build the same tree.
+    /// Trailing tokens after the expression are ignored — the caller feeds exactly
+    /// one expression.
+    #[allow(dead_code)] // used by the `c-oracle` P2 expression-parser golden
+    pub fn parse_single_expr(mut self) -> (Ast, ExprId, Vec<Diagnostic>) {
+        let e = self.parse_expr();
+        (self.ast, e, self.diagnostics)
+    }
+
     /// Parse one file's items, returning them *separately* from the shared arena
     /// (rather than pushing into `ast.items`) so the loader can tag each item
     /// with its owning module before inserting it into the program.
