@@ -5744,6 +5744,27 @@ mod c_oracle {
             .collect()
     }
 
+    /// The Jestyr lexer's integer *kind-tag* stream for a file (P2a, strongest form).
+    fn jestyr_kind_ids(lexer_exe: &std::path::Path, file: &str) -> Vec<String> {
+        run_jestyr_lexer(lexer_exe, file, &["nums"])
+    }
+
+    /// The Rust *reference* lexer's integer kind-tag stream for `src`: each non-`Eof`
+    /// token's `TokenKind` discriminant (`kind as u32`). `TokenKind` is a unit-only
+    /// enum, so the cast yields the enum's declaration order — exactly the numbering
+    /// the Jestyr lexer assigns (Ident=0 … Unknown=111). Unlike `rust_kinds`, this pins
+    /// the operator/keyword tags themselves, not just their (span-derived) labels.
+    fn rust_kind_ids(src: &str) -> Vec<String> {
+        use crate::token::TokenKind;
+        crate::lexer::Lexer::new(src)
+            .tokenize()
+            .0
+            .into_iter()
+            .filter(|t| t.kind != TokenKind::Eof)
+            .map(|t| (t.kind as u32).to_string())
+            .collect()
+    }
+
     /// Build `rel`'s `@test`/`@bench` **harness** (narrowed by `filter`) through the
     /// real gcc pipeline — exactly what `jestyrc test [substr]` does — run it, and
     /// return `(stdout, exit_code)`. The exit code is the runner's pass/fail tally
@@ -6079,6 +6100,59 @@ mod c_oracle {
             assert_eq!(got, want, "Jestyr lexer kinds diverged from the reference on {f}");
         }
         eprintln!("kind-checked {} corpus files, all classified identically", files.len());
+    }
+
+    /// **P2a kind-*tag* cross-implementation golden — the strongest form.** The label
+    /// golden above prints each token via `describe()`, and for keywords/operators that
+    /// label is the *source slice*, so it can't distinguish, say, `+`(Plus) from a
+    /// mis-tagged kind that still spans `+`. This golden compares the raw integer
+    /// `TokenKind` discriminant of every token to the reference across the whole corpus,
+    /// so the `List(Token)` the parser consumes is verified tag-for-tag — the actual
+    /// integers the parser will `match` on, not just their rendered labels.
+    #[test]
+    fn jestyr_lexer_kind_ids_match_reference_on_corpus() {
+        let lexer = build_exe("examples/std/lexer.jtr");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for dir in ["examples", "examples/std"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("jtr") {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+        files.sort();
+        assert!(files.len() > 20, "expected the whole corpus, found {}", files.len());
+        for p in &files {
+            let f = p.to_str().unwrap();
+            let src = std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {f}: {e}"));
+            let want = rust_kind_ids(&src);
+            let got = jestyr_kind_ids(&lexer, f);
+            assert_eq!(got, want, "Jestyr lexer kind tags diverged from the reference on {f}");
+        }
+        eprintln!("tag-checked {} corpus files, all discriminants identical", files.len());
+    }
+
+    /// Focused P2a tag probe: pins the exact integer discriminants for one token of
+    /// every lexical class, so a regression in the tag numbering names the class. These
+    /// are the numbers `examples/std/lexer.jtr` hard-codes and the parser will switch on.
+    #[test]
+    fn jestyr_lexer_kind_ids_pin_the_numbering() {
+        let lexer = build_exe("examples/std/lexer.jtr");
+        // ident, int, float, string, char, `_`, a keyword (`fn`=7), and a spread of
+        // operators: `+`=79 `->`=77 `..=`=75 `::`=72 `==`=85 `.*`=76 `@`=101.
+        let src = "x 1 1.5 \"s\" 'c' _ fn + -> ..= :: == .* @\n";
+        let probe = std::env::temp_dir().join("jestyr_tag_probe.jtr");
+        std::fs::write(&probe, src).unwrap();
+        let got = jestyr_kind_ids(&lexer, probe.to_str().unwrap());
+        assert_eq!(got, rust_kind_ids(src), "tag probe diverged from the reference");
+        assert_eq!(
+            got,
+            ["0", "1", "2", "3", "5", "6", "7", "79", "77", "75", "72", "85", "76", "101"],
+            "kind-tag numbering must match TokenKind's discriminants: {got:?}"
+        );
     }
 
     /// Focused P1 probe: a crafted file exercising every new token class at once —

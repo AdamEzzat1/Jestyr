@@ -4,25 +4,29 @@
 // `intern`er — to turn source text into a token stream. Proof that Jestyr can
 // implement its own front end.
 //
-// **Full token set (P1 complete).** This now matches the Rust reference lexer
-// (`src/lexer.rs`) token-for-token on real Jestyr source: identifiers/keywords,
-// decimal / hex (`0x`) / binary (`0b`) integers, float literals (fraction +
-// `e`/`E` exponent), string and char literals (with `\` escapes), f-strings
-// (`f"…"`), `//` line comments, nested `/* … */` block comments, and every
-// multi-character operator (`->`, `=>`, `::`, `..`, `..=`, `.*`, `<<`, `>>`, `==`,
-// `!=`, `<=`, `>=`, `&&`, `||`, and the `?=` compound-assign family).
+// **Full token set (P1) + full kinds (P2a), now as an in-process `List(Token)`.**
+// `tokenize` builds a `List(Token)` — each `Token` is a payload-free `{kind, start,
+// end}`, mirroring the Rust reference (`src/token.rs`): the *kind* is an integer tag
+// matching `TokenKind`'s discriminant order, and the lexeme is recovered from the
+// source via `[start..end]` when needed. This is the random-access token feed the
+// parser (P2) consumes in-process (handoff §3.3a), not a text hand-off. `lex` then
+// walks that vector to print either lexemes (P1 golden) or kind labels (P2a golden),
+// so the observable output stays byte-identical to the print-as-you-scan version and
+// the two `..._match_reference_on_corpus` goldens remain the acceptance test.
 //
 // Design notes:
-//   • Keywords are interned FIRST, so they own ids 0..KW_COUNT-1. A scanned
-//     identifier is then a keyword iff its interned id is < KW_COUNT — the interner
-//     doubles as the keyword table, no separate set.
-//   • Each token prints its exact source lexeme (`src[start..i]`), so the output *is*
-//     the source with whitespace and comments stripped — a faithful, deterministic
-//     token dump (the cross-implementation golden vs `jestyrc lex-dump`). A summary
-//     line follows: total tokens, #keywords, #identifiers, #number literals,
-//     #punctuation, #distinct user identifiers (via the interner).
-//   • Run with a path to lex a real file (`lexer.exe foo.jtr`); with no args it lexes
-//     a built-in sample (deterministic — what the test pins).
+//   • Keywords are interned FIRST, in the SAME order as `TokenKind`'s keyword
+//     discriminants, so a scanned keyword's kind is just `interned_id + 7` (Fn is
+//     discriminant 7, interned id 0) — the interner doubles as the keyword table and
+//     the classification stays in lockstep with the reference by construction.
+//   • `Token.kind` is the integer discriminant of `TokenKind` (Ident=0 … Unknown=111).
+//     `kind_label` maps it back to the reference's `describe()` string for the kinds
+//     dump; for keywords/operators that label *is* the source slice, so only the
+//     literal/ident kinds (and `<unknown>`) need a special case.
+//   • Run with a path to lex a real file (`lexer.exe foo.jtr`); a second arg switches to
+//     kind-label output (`lexer.exe foo.jtr kinds`) or integer kind tags
+//     (`lexer.exe foo.jtr nums` — the parser's actual switch input). With no args it
+//     lexes a built-in sample (what the test pins).
 //
 // Byte-level (ASCII) classification, like the reference on ASCII source; the corpus
 // is ASCII outside comments/strings, which are slurped whole so their bytes never
@@ -31,6 +35,16 @@ import "mem"
 import "intern"
 import "fs"
 import "env"
+import "list"
+
+// A payload-free token: the integer `kind` tag (a `TokenKind` discriminant) plus the
+// half-open source span `[start, end)`. The text/value is recovered from the source
+// on demand, exactly as the Rust `Token` keeps `TokenKind` `Copy` and span-addressed.
+struct Token { kind: i32, start: usize, end: usize }
+
+// An operator's kind tag together with its byte width (maximal munch), returned as a
+// pair so `tokenize` can both classify and advance in one step.
+struct OpTok { kind: i32, width: usize }
 
 fn is_space(x: i32) -> bool {
     if x == 32 { return true }   // space
@@ -242,50 +256,137 @@ fn scan_number(read src: str, n: usize, from: usize) -> usize {
     return i
 }
 
-// The byte-width of the operator/punctuator at `i` (maximal munch), matching the
-// reference lexer's dispatch exactly. `//` and `/*` are handled as trivia before
-// this is ever reached, so a `/` here is a real `/` or `/=`.
-fn op_width(read src: str, n: usize, i: usize) -> usize {
+// Classify the operator/punctuator at `i` (maximal munch): its `TokenKind`
+// discriminant and byte width, matching the reference lexer's dispatch exactly.
+// `//` and `/*` are handled as trivia before this is ever reached, so a `/` here is a
+// real `/` or `/=`. An unrecognized single byte is `Unknown` (111), as in the
+// reference (which also records a diagnostic; the corpus has none).
+fn classify_op(read src: str, n: usize, i: usize) -> OpTok {
     let c: i32 = src[i] as i32
     var d: i32 = 0
     if i + 1 < n { d = src[i + 1] as i32 }
     var e: i32 = 0
     if i + 2 < n { e = src[i + 2] as i32 }
 
-    if c == 46 {                                   // '.'
-        if d == 46 { if e == 61 { return 3 } return 2 }   // '..' / '..='
-        if d == 42 { return 2 }                            // '.*'
-        return 1
+    if c == 40 { return OpTok{ kind: 63, width: 1 } }   // (   LParen
+    if c == 41 { return OpTok{ kind: 64, width: 1 } }   // )   RParen
+    if c == 123 { return OpTok{ kind: 65, width: 1 } }  // {   LBrace
+    if c == 125 { return OpTok{ kind: 66, width: 1 } }  // }   RBrace
+    if c == 91 { return OpTok{ kind: 67, width: 1 } }   // [   LBracket
+    if c == 93 { return OpTok{ kind: 68, width: 1 } }   // ]   RBracket
+    if c == 44 { return OpTok{ kind: 69, width: 1 } }   // ,   Comma
+    if c == 59 { return OpTok{ kind: 70, width: 1 } }   // ;   Semi
+    if c == 64 { return OpTok{ kind: 101, width: 1 } }  // @   At
+    if c == 126 { return OpTok{ kind: 96, width: 1 } }  // ~   Tilde
+    if c == 63 { return OpTok{ kind: 100, width: 1 } }  // ?   Question
+
+    if c == 58 {                                        // ':' / '::'
+        if d == 58 { return OpTok{ kind: 72, width: 2 } }
+        return OpTok{ kind: 71, width: 1 }
     }
-    if c == 58 { if d == 58 { return 2 } return 1 }        // ':' / '::'
-    if c == 45 { if d == 62 { return 2 } if d == 61 { return 2 } return 1 }   // '-' '->' '-='
-    if c == 43 { if d == 61 { return 2 } return 1 }        // '+' '+='
-    if c == 42 { if d == 61 { return 2 } return 1 }        // '*' '*='
-    if c == 47 { if d == 61 { return 2 } return 1 }        // '/' '/='
-    if c == 37 { if d == 61 { return 2 } return 1 }        // '%' '%='
-    if c == 61 { if d == 61 { return 2 } if d == 62 { return 2 } return 1 }   // '=' '==' '=>'
-    if c == 33 { if d == 61 { return 2 } return 1 }        // '!' '!='
-    if c == 60 { if d == 61 { return 2 } if d == 60 { return 2 } return 1 }   // '<' '<=' '<<'
-    if c == 62 { if d == 61 { return 2 } if d == 62 { return 2 } return 1 }   // '>' '>=' '>>'
-    if c == 38 { if d == 38 { return 2 } if d == 61 { return 2 } return 1 }   // '&' '&&' '&='
-    if c == 124 { if d == 124 { return 2 } if d == 61 { return 2 } return 1 } // '|' '||' '|='
-    if c == 94 { if d == 61 { return 2 } return 1 }        // '^' '^='
-    return 1                                       // single: ( ) { } [ ] , ; @ ~ ? and unknowns
+    if c == 46 {                                        // '.' / '..' / '..=' / '.*'
+        if d == 46 {
+            if e == 61 { return OpTok{ kind: 75, width: 3 } }   // ..=  DotDotEq
+            return OpTok{ kind: 74, width: 2 }                  // ..   DotDot
+        }
+        if d == 42 { return OpTok{ kind: 76, width: 2 } }       // .*   DotStar
+        return OpTok{ kind: 73, width: 1 }                      // .    Dot
+    }
+    if c == 43 {                                        // '+' / '+='
+        if d == 61 { return OpTok{ kind: 102, width: 2 } }
+        return OpTok{ kind: 79, width: 1 }
+    }
+    if c == 45 {                                        // '-' / '->' / '-='
+        if d == 62 { return OpTok{ kind: 77, width: 2 } }       // ->   Arrow
+        if d == 61 { return OpTok{ kind: 103, width: 2 } }      // -=   MinusEq
+        return OpTok{ kind: 80, width: 1 }
+    }
+    if c == 42 {                                        // '*' / '*='
+        if d == 61 { return OpTok{ kind: 104, width: 2 } }
+        return OpTok{ kind: 81, width: 1 }
+    }
+    if c == 47 {                                        // '/' / '/='
+        if d == 61 { return OpTok{ kind: 105, width: 2 } }
+        return OpTok{ kind: 82, width: 1 }
+    }
+    if c == 37 {                                        // '%' / '%='
+        if d == 61 { return OpTok{ kind: 106, width: 2 } }
+        return OpTok{ kind: 83, width: 1 }
+    }
+    if c == 61 {                                        // '=' / '==' / '=>'
+        if d == 61 { return OpTok{ kind: 85, width: 2 } }       // ==   EqEq
+        if d == 62 { return OpTok{ kind: 78, width: 2 } }       // =>   FatArrow
+        return OpTok{ kind: 84, width: 1 }
+    }
+    if c == 33 {                                        // '!' / '!='
+        if d == 61 { return OpTok{ kind: 86, width: 2 } }
+        return OpTok{ kind: 99, width: 1 }
+    }
+    if c == 60 {                                        // '<' / '<=' / '<<'
+        if d == 61 { return OpTok{ kind: 88, width: 2 } }       // <=   Le
+        if d == 60 { return OpTok{ kind: 97, width: 2 } }       // <<   Shl
+        return OpTok{ kind: 87, width: 1 }
+    }
+    if c == 62 {                                        // '>' / '>=' / '>>'
+        if d == 61 { return OpTok{ kind: 90, width: 2 } }       // >=   Ge
+        if d == 62 { return OpTok{ kind: 98, width: 2 } }       // >>   Shr
+        return OpTok{ kind: 89, width: 1 }
+    }
+    if c == 38 {                                        // '&' / '&&' / '&='
+        if d == 38 { return OpTok{ kind: 92, width: 2 } }       // &&   AmpAmp
+        if d == 61 { return OpTok{ kind: 107, width: 2 } }      // &=   AmpEq
+        return OpTok{ kind: 91, width: 1 }
+    }
+    if c == 124 {                                       // '|' / '||' / '|='
+        if d == 124 { return OpTok{ kind: 94, width: 2 } }      // ||   PipePipe
+        if d == 61 { return OpTok{ kind: 108, width: 2 } }      // |=   PipeEq
+        return OpTok{ kind: 93, width: 1 }
+    }
+    if c == 94 {                                        // '^' / '^='
+        if d == 61 { return OpTok{ kind: 109, width: 2 } }
+        return OpTok{ kind: 95, width: 1 }
+    }
+    return OpTok{ kind: 111, width: 1 }                 // Unknown
 }
 
-// Scan `src`, printing each token, then a 6-number summary. When `emit_kinds` is
-// true each token prints its *kind label* (matching `TokenKind::describe` in the
-// reference: "ident"/"int"/"float"/"string"/"char"/"f-string"/"_", a keyword's
-// spelling, or an operator's symbol) instead of its raw lexeme — the token stream
-// the parser consumes, and the P2 cross-implementation golden.
-fn lex(read src: str, mut it: Interner, kwcount: i64, emit_kinds: bool) {
-    let n: usize = src.len
+// Byte-wise equality of two string views — enough to pick the output mode from argv.
+fn str_eq(read a: str, read b: str) -> bool {
+    if a.len != b.len { return false }
     var i: usize = 0
-    var total: i32 = 0
-    var nkw: i32 = 0
-    var nid: i32 = 0
-    var nnum: i32 = 0
-    var npunct: i32 = 0
+    for i < a.len {
+        if (a[i] as i32) != (b[i] as i32) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Print the reference `TokenKind::describe()` label for a token's kind — what the P2a
+// kinds dump emits. For keywords and operators the label *is* the source slice, so only
+// the literal/identifier kinds and the `<unknown>` sentinel need naming here. The label
+// is *printed* (a slice passed further down to `print_str`), never returned: a `read`
+// borrow of `src` is second-class and may not escape the call.
+fn print_kind(read src: str, t: Token) {
+    let k: i32 = t.kind
+    if k == 0 { print_str("ident") return }
+    if k == 1 { print_str("int") return }
+    if k == 2 { print_str("float") return }
+    if k == 3 { print_str("string") return }
+    if k == 4 { print_str("f-string") return }
+    if k == 5 { print_str("char") return }
+    if k == 6 { print_str("_") return }
+    if k == 111 { print_str("<unknown>") return }
+    print_str(src[t.start..t.end])   // keyword or operator: label == source symbol
+}
+
+// Scan `src` into a `List(Token)` — the in-process, random-access token feed the
+// parser consumes. Each token carries its `TokenKind` discriminant and half-open
+// source span; the interner `it` is filled along the way (identifiers, including the
+// lone `_`, are interned so keyword-vs-ident is `id < kwcount` and the distinct-user
+// count is exact). Keywords own ids `0..kwcount-1`, so a keyword's kind is `id + 7`.
+fn tokenize(read src: str, mut it: Interner, kwcount: i64, read a: Allocator) -> List(Token) {
+    let n: usize = src.len
+    var toks: List(Token) = list.make(Token, a)
+    var i: usize = 0
     for i < n {
         i = skip_trivia(src, n, i)
         if i >= n { break }
@@ -306,49 +407,70 @@ fn lex(read src: str, mut it: Interner, kwcount: i64, emit_kinds: bool) {
             }
             if isf {
                 i = scan_string(src, n, i + 1)      // consume opening quote + body
-                if emit_kinds { print_str("f-string") } else { print_str(src[start..i]) }
-                total = total + 1
+                list.push(Token, toks, Token{ kind: 4, start: start, end: i })   // FStr
             } else {
                 let lexeme: str = src[start..i]
                 let id: i64 = intern.intern(it, lexeme)
-                if id < kwcount { nkw = nkw + 1 } else { nid = nid + 1 }
-                if emit_kinds {
-                    var isund: bool = false
-                    if i - start == 1 { if (src[start] as i32) == 95 { isund = true } }
-                    if isund { print_str("_") }             // a lone `_` is the wildcard
-                    else if id < kwcount { print_str(lexeme) }  // keyword: label == spelling
-                    else { print_str("ident") }
-                } else {
-                    print_str(lexeme)
-                }
-                total = total + 1
+                var kind: i32 = 0                   // Ident
+                var isund: bool = false
+                if i - start == 1 { if (src[start] as i32) == 95 { isund = true } }
+                if isund { kind = 6 }                          // Underscore (a lone `_`)
+                else if id < kwcount { kind = (id as i32) + 7 } // keyword: id + 7
+                list.push(Token, toks, Token{ kind: kind, start: start, end: i })
             }
         } else if is_digit(c) {
             i = scan_number(src, n, i)
-            if emit_kinds {
-                if num_is_float(src, start, i) { print_str("float") } else { print_str("int") }
-            } else {
-                print_str(src[start..i])
-            }
-            nnum = nnum + 1
-            total = total + 1
-        } else if x == 34 {                         // '"' string
+            var kind: i32 = 1                        // Int
+            if num_is_float(src, start, i) { kind = 2 }  // Float
+            list.push(Token, toks, Token{ kind: kind, start: start, end: i })
+        } else if x == 34 {                          // '"' string
             i = scan_string(src, n, i + 1)
-            if emit_kinds { print_str("string") } else { print_str(src[start..i]) }
-            total = total + 1
-        } else if x == 39 {                         // '\'' char
+            list.push(Token, toks, Token{ kind: 3, start: start, end: i })       // Str
+        } else if x == 39 {                          // '\'' char
             i = scan_char(src, n, i + 1)
-            if emit_kinds { print_str("char") } else { print_str(src[start..i]) }
-            total = total + 1
-        } else {                                    // operator / punctuation (label == symbol)
-            let w: usize = op_width(src, n, i)
-            i = i + w
-            print_str(src[start..i])
-            npunct = npunct + 1
-            total = total + 1
+            list.push(Token, toks, Token{ kind: 5, start: start, end: i })       // Char
+        } else {                                     // operator / punctuation
+            let op: OpTok = classify_op(src, n, i)
+            i = i + op.width
+            list.push(Token, toks, Token{ kind: op.kind, start: start, end: i })
         }
     }
-    // Summary: total, keywords, identifiers, number literals, punctuation, distinct user ids.
+    return toks
+}
+
+// Tokenize `src`, then walk the token vector printing each token — followed by a
+// 6-number summary. The `mode` selects what each token prints: 0 = its raw source
+// lexeme (P1 golden), 1 = its kind *label* (P2a `describe()` golden), 2 = its integer
+// kind *tag* (the discriminant the parser switches on — the strongest cross-check).
+// Every output is derived purely from the `List(Token)`, so modes 0/1 stay
+// byte-identical to the print-as-you-scan version. Summary: total, #keywords,
+// #identifiers, #number literals, #punctuation, #distinct user ids.
+fn lex(read src: str, mut it: Interner, kwcount: i64, read a: Allocator, mode: i32) {
+    var toks: List(Token) = tokenize(src, it, kwcount, a)
+    let m: usize = list.len(Token, toks)
+    var total: i32 = 0
+    var nkw: i32 = 0
+    var nid: i32 = 0
+    var nnum: i32 = 0
+    var npunct: i32 = 0
+    var j: usize = 0
+    for j < m {
+        let t: Token = list.get(Token, toks, j)
+        let k: i32 = t.kind
+        if mode == 2 { print_int(k) } else if mode == 1 { print_kind(src, t) } else { print_str(src[t.start..t.end]) }
+        // Tally by kind, matching the original per-branch counters: keywords are
+        // 7..=62, idents are Ident(0) and the lone `_`(6), numbers are Int(1)/Float(2),
+        // and punctuation is every operator/Unknown (>= 63). Strings, chars, and
+        // f-strings count only toward the total.
+        if k >= 7 { if k <= 62 { nkw = nkw + 1 } }
+        if k == 0 { nid = nid + 1 }
+        if k == 6 { nid = nid + 1 }
+        if k == 1 { nnum = nnum + 1 }
+        if k == 2 { nnum = nnum + 1 }
+        if k >= 63 { npunct = npunct + 1 }
+        total = total + 1
+        j = j + 1
+    }
     let distinct_users: i32 = (intern.count(it) as i64 - kwcount) as i32
     print_int(total)
     print_int(nkw)
@@ -365,24 +487,28 @@ fn main() -> i32 {
 
     if env.argc() > 1 {
         // Real use: lex the file named on the command line (the self-hosting loop).
-        // A second argument (any) switches to kind-label output (the parser's input,
-        // and the P2 cross-implementation golden); with just the path it prints lexemes.
-        let emit_kinds: bool = env.argc() > 2
+        // A second argument selects the dump: `nums` prints integer kind tags, any other
+        // value (e.g. `kinds`) prints kind labels; with just the path it prints lexemes.
+        var mode: i32 = 0
+        if env.argc() > 2 {
+            if str_eq(env.argv(2), "nums") { mode = 2 } else { mode = 1 }
+        }
         var src: String = fs.read_text(env.argv(1))
-        lex(string_view(src), it, kwcount, emit_kinds)
+        lex(string_view(src), it, kwcount, a, mode)
         string_free(src)
     } else {
         // Deterministic built-in sample (what the test pins).
         let sample: str = "// add two ints\nfn add(x: i32, y: i32) -> i32 {\n    return x + y\n}\n"
-        lex(sample, it, kwcount, false)
+        lex(sample, it, kwcount, a, 0)
     }
-    return 0   // `it` drops here (RAII): interner table, keys, and id array freed
+    return 0   // `it`/`toks` drop here (RAII): interner table + token buffer freed
 }
 
 // Intern the FULL keyword set (exactly `TokenKind::keyword` in src/token.rs), so an
 // identifier is a keyword iff its interned id < N — the interner is the keyword table.
-// Returns the count N. Kept complete so keyword-vs-ident classification matches the
-// reference lexer (the P2 kind cross-check depends on it).
+// Returns the count N. Kept complete and IN DISCRIMINANT ORDER so a keyword's kind is
+// `id + 7` and keyword-vs-ident classification matches the reference lexer (the P2a
+// kind cross-check depends on it).
 fn intern_keywords(mut it: Interner) -> i64 {
     intern.intern(it, "fn")
     intern.intern(it, "let")

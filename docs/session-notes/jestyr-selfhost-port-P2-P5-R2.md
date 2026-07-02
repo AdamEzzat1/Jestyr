@@ -116,8 +116,19 @@ The parser needs random-ish access to a token vector with `(kind, span)`. Two op
   canonical form up front and pin it with a small golden before scaling to the corpus.
 
 ### 3.5 Staging (suggested increment order)
-1. Depth-guard fix (both impls) — a self-contained increment with its own tests.
-2. Shared tokenizer producing `List(Token)` + a unit test it matches the P2a kind stream.
+1. **DONE** (commit `89721f0`). Depth-guard fix — `parser::MAX_EXPR_DEPTH = 256` bounds
+   AST *height* (so a left-deep `1+1+…` fold is caught too), reports once, teeth in
+   `parser.rs`. Jestyr inherits the same cap when P2's parser is written.
+2. **DONE.** Shared tokenizer producing `List(Token)`. `examples/std/lexer.jtr` now has
+   `tokenize(...) -> List(Token)` — each `Token` is `{kind: i32, start, end}` with `kind`
+   the `TokenKind` discriminant (Ident=0 … Unknown=111); keyword kind = `interned_id + 7`,
+   operators via `classify_op`. `lex` walks the list to print lexemes / labels / integer
+   tags, so P1 + P2a stay byte-identical. **Golden strengthened:** a `nums` mode emits the
+   integer tag per token, cross-checked vs the reference discriminants over the whole
+   corpus (`jestyr_lexer_kind_ids_match_reference_on_corpus`) — closes the label golden's
+   blind spot (operator/keyword labels are span-derived, so the *integers* were unverified).
+   `List(struct)` confirmed working (the AST-arena primitive). *Next:* extract `tokenize`
+   into an importable module so the parser can consume it in-process (option (a) above).
 3. Expression parser (precedence climbing, matching `parse_expr`) + AST dump for exprs;
    golden on expression-only snippets.
 4. Type parser + pattern parser.
