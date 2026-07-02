@@ -90,6 +90,107 @@ fn token_kinds(src: &str) -> Vec<TokenKind> {
     tokens.iter().map(|t| t.kind).filter(|k| *k != TokenKind::Eof).collect()
 }
 
+/// Run `f` on a thread with a large stack, mirroring the compiler's own worker
+/// thread (`WORKER_STACK` in `main.rs`). The recursive back-end passes
+/// (`typeck`, `escape`, `cgen`, the printer) need more than a test thread's
+/// default stack to walk an expression nested up to the parser's
+/// [`crate::parser::MAX_EXPR_DEPTH`] cap — production always provides it, so the
+/// deep-input tests reproduce that environment rather than assuming a stack size.
+fn with_big_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn big-stack test thread")
+        .join()
+        .expect("big-stack test thread panicked")
+}
+
+/// A left-associative fold `1+1+…+1` of `depth` `+` operators — parses
+/// iteratively (no parser recursion) yet builds a left-deep tree of height
+/// ~`depth`, the exact shape that overflowed a later pass before the depth guard.
+fn add_chain(depth: usize) -> String {
+    let mut body = String::with_capacity(1 + depth * 2);
+    body.push('1');
+    for _ in 0..depth {
+        body.push_str("+1");
+    }
+    format!("fn main() -> i64 {{ return {body} }}")
+}
+
+/// **The deepest expression the parser accepts is walkable by every later pass.**
+/// The guard admits nesting up to [`crate::parser::MAX_EXPR_DEPTH`]; the recursive
+/// back end must handle a tree exactly that tall. Mirrors production by running on
+/// a large stack, then asserts the whole pipeline is total on the max depth that
+/// parses — the case the handoff calls out ("test with the max depth that parses").
+#[test]
+fn max_parseable_depth_is_walkable_end_to_end() {
+    with_big_stack(|| {
+        let src = add_chain(crate::parser::MAX_EXPR_DEPTH - 8); // just under the cap
+        let (tokens, _) = Lexer::new(&src).tokenize();
+        let (ast, pd) = Parser::new(&src, tokens).parse();
+        assert!(
+            !pd.iter().any(|d| d.message.contains("too deep")),
+            "a fold just under the cap must parse clean: {pd:?}"
+        );
+        // typeck → escape → cgen all complete without overflowing.
+        let (info, td) = typeck::check(&ast);
+        assert!(td.is_empty(), "the integer fold is well-typed: {td:?}");
+        let _ = escape::check(&ast, &info);
+        let (c, cd) = cgen::emit(&ast, &info);
+        assert!(cd.is_empty(), "no cgen notes for a plain integer fold: {cd:?}");
+        assert!(!c.is_empty(), "emitted C is non-empty");
+    });
+}
+
+/// A chain *past* the cap is height-bounded — the parser drains the surplus — so
+/// the full pipeline stays total even far beyond the limit. Guards against a
+/// regression where the guard reports but still builds (and forwards) a tall tree.
+#[test]
+fn over_cap_chain_keeps_the_pipeline_total() {
+    with_big_stack(|| {
+        run_pipeline(&add_chain(crate::parser::MAX_EXPR_DEPTH * 50));
+    });
+}
+
+/// The *recursive* deepening paths — prefix-op recursion (`!!!…`) and parenthesis
+/// recursion (`((…))`) — hit the depth guard rather than overflowing the parser.
+/// These recurse O(depth) in the parser, so (unlike the iterative folds) reaching
+/// the cap needs the compiler's worker-sized stack; run there and assert the guard
+/// fires. Removing the `parse_unary` / `parse_binary` entry guards regresses this.
+#[test]
+fn recursive_deep_shapes_report_on_the_worker_stack() {
+    with_big_stack(|| {
+        for shape in ["not", "paren"] {
+            let depth = crate::parser::MAX_EXPR_DEPTH * 3;
+            let body = if shape == "not" {
+                let mut e = String::with_capacity(depth + 4);
+                for _ in 0..depth {
+                    e.push('!');
+                }
+                e.push_str("true");
+                e
+            } else {
+                let mut e = String::with_capacity(depth * 2 + 1);
+                for _ in 0..depth {
+                    e.push('(');
+                }
+                e.push('1');
+                for _ in 0..depth {
+                    e.push(')');
+                }
+                e
+            };
+            let src = format!("fn main() -> i64 {{ return {body} }}");
+            let (tokens, _) = Lexer::new(&src).tokenize();
+            let (_ast, pd) = Parser::new(&src, tokens).parse();
+            assert!(
+                pd.iter().any(|d| d.message.contains("expression nesting too deep")),
+                "shape `{shape}` should report the depth guard, got {pd:?}"
+            );
+        }
+    });
+}
+
 mod prop {
     use super::*;
     use proptest::prelude::*;
@@ -111,6 +212,26 @@ mod prop {
         #[test]
         fn pipeline_is_total(s in ".{0,400}") {
             run_pipeline(&s);
+        }
+
+        /// **Deeply-nested expressions error, they don't crash.** For any depth
+        /// past the parser's [`crate::parser::MAX_EXPR_DEPTH`] cap, a left-deep
+        /// fold parses without overflowing the stack and reports the "too deep"
+        /// diagnostic exactly once — no cascade — rather than building an
+        /// unbounded tree a later recursive pass would blow up on. (Parse-only,
+        /// so this is safe on the default test stack: a left-associative fold
+        /// parses iteratively regardless of depth.)
+        #[test]
+        fn deep_expressions_error_not_crash(extra in 1usize..2048) {
+            let depth = crate::parser::MAX_EXPR_DEPTH + extra;
+            let src = add_chain(depth);
+            let (tokens, _) = Lexer::new(&src).tokenize();
+            let (_ast, pd) = Parser::new(&src, tokens).parse();
+            prop_assert_eq!(pd.len(), 1, "expected exactly one diagnostic at depth {}", depth);
+            prop_assert!(
+                pd[0].message.contains("expression nesting too deep"),
+                "wrong diagnostic: {:?}", pd[0].message
+            );
         }
 
         /// The doc generator (lex-with-docs → parse → attach → render) never
@@ -2618,6 +2739,39 @@ mod fuzz {
     fn fuzz_pipeline() {
         bolero::check!().with_type::<String>().for_each(|s: &String| {
             run_pipeline(s);
+        });
+    }
+
+    /// **Deep expression nesting never panics the parser.** Derive a depth from the
+    /// fuzz input and feed a deeply-nested expression to the parser; the depth guard
+    /// must resolve *any* depth to a bounded tree plus a clean diagnostic, never a
+    /// stack overflow. Uses the two *iterative*-to-parse shapes — the left fold and
+    /// the postfix chain — which stay O(1) on the parser stack at any depth, so this
+    /// is safe on the fuzz thread's stack; the recursive shapes (which need the
+    /// worker stack) are covered by `recursive_deep_shapes_report_on_the_worker_stack`.
+    #[test]
+    fn fuzz_deep_nesting() {
+        bolero::check!().with_type::<Vec<u8>>().for_each(|bytes: &Vec<u8>| {
+            let b0 = bytes.first().copied().unwrap_or(0);
+            let b1 = bytes.get(1).copied().unwrap_or(0);
+            // Two bytes reach depths on both sides of the cap from a tiny input.
+            let depth = u16::from_le_bytes([b0, b1]) as usize % 4096;
+            let body = if b0 & 1 == 0 {
+                let mut e = String::from("1");
+                for _ in 0..depth {
+                    e.push_str("+1");
+                }
+                e
+            } else {
+                let mut e = String::from("x");
+                for _ in 0..depth {
+                    e.push_str(".f");
+                }
+                e
+            };
+            let src = format!("fn main() -> i64 {{ return {body} }}");
+            let (tokens, _) = Lexer::new(&src).tokenize();
+            let _ = Parser::new(&src, tokens).parse();
         });
     }
 

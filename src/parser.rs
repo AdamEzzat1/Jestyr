@@ -28,9 +28,33 @@ pub struct Parser<'src> {
     /// While true, `Ident {` is not treated as a struct literal (set inside
     /// control-flow headers so the `{` can open the body block).
     no_struct: bool,
+    /// Running nesting depth of the expression currently being built, capped at
+    /// [`MAX_EXPR_DEPTH`]. Tracks AST *height*, not parser recursion, so it also
+    /// bounds a left-associative fold (`1+1+…+1`) — which parses iteratively but
+    /// still yields a left-deep tree that a later recursive pass would overflow on.
+    expr_depth: usize,
+    /// Set once the depth cap is first hit, so the "too deep" diagnostic is
+    /// reported a single time instead of once per surplus node.
+    depth_exceeded: bool,
     pub ast: Ast,
     pub diagnostics: Vec<Diagnostic>,
 }
+
+/// The deepest expression nesting the parser will build before it emits a
+/// diagnostic instead of a node. Past this, an adversarial or generated input
+/// (a fuzzer, a code generator) would otherwise produce an AST so tall that a
+/// later recursive walk — `typeck`, `escape`, `cgen`, or the printer — overflows
+/// the native stack.
+///
+/// The value is chosen so the guard is *self-sufficient*: a nested-paren chain,
+/// the shape that costs the most parser stack per level (~2 KiB of frames), stays
+/// well under a 1 MiB stack at this depth, so parsing can't overflow before the
+/// guard fires even when the parser is embedded off the compiler's large worker
+/// thread (see `WORKER_STACK` in `main.rs`, which additionally gives the *later*
+/// passes headroom to walk a tree this tall on small-stacked platforms like
+/// Windows). It is still an order of magnitude beyond any realistic hand-written
+/// or generated expression, so normal programs never reach it.
+pub const MAX_EXPR_DEPTH: usize = 256;
 
 impl<'src> Parser<'src> {
     pub fn new(src: &'src str, tokens: Vec<Token>) -> Parser<'src> {
@@ -42,7 +66,7 @@ impl<'src> Parser<'src> {
     /// `TypeId`/`PatId` handles live in a single id-space — the same "one
     /// translation unit" model the C backend already uses (no id remapping).
     pub fn resume(src: &'src str, tokens: Vec<Token>, ast: Ast) -> Parser<'src> {
-        Parser { src, tokens, pos: 0, no_struct: false, ast, diagnostics: Vec::new() }
+        Parser { src, tokens, pos: 0, no_struct: false, expr_depth: 0, depth_exceeded: false, ast, diagnostics: Vec::new() }
     }
 
     pub fn parse(self) -> (Ast, Vec<Diagnostic>) {
@@ -140,6 +164,28 @@ impl<'src> Parser<'src> {
 
     fn error(&mut self, span: Span, message: impl Into<String>) {
         self.diagnostics.push(Diagnostic::new(message, span));
+    }
+
+    /// Record one more level of expression nesting. Returns `true` while there is
+    /// still room to descend; on the first overflow it emits a single teaching
+    /// diagnostic and returns `false`, signalling the caller to stop deepening
+    /// (recursing or folding) so the stack unwinds cleanly rather than blowing
+    /// past [`MAX_EXPR_DEPTH`]. Callers restore [`Self::expr_depth`] on the way
+    /// out, so the counter measures the *current* path from the root, and its
+    /// peak is the height of the tallest subtree parsed.
+    fn descend(&mut self, span: Span) -> bool {
+        self.expr_depth += 1;
+        if self.expr_depth > MAX_EXPR_DEPTH {
+            if !self.depth_exceeded {
+                self.depth_exceeded = true;
+                self.error(
+                    span,
+                    format!("expression nesting too deep (exceeds the {MAX_EXPR_DEPTH}-level limit)"),
+                );
+            }
+            return false;
+        }
+        true
     }
 
     // --- items ---
@@ -994,6 +1040,13 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_binary(&mut self, min_bp: u8) -> ExprId {
+        // Entry guard bounds parser *recursion* — the right operand of every
+        // operator and every parenthesised sub-expression re-enters here.
+        let saved = self.expr_depth;
+        if !self.descend(self.cur().span) {
+            self.expr_depth = saved;
+            return self.parse_unary(); // one atom for recovery; deeper guards bail at once
+        }
         let mut lhs = self.parse_unary();
         loop {
             let k = self.cur().kind;
@@ -1002,6 +1055,9 @@ impl<'src> Parser<'src> {
             if k == DotDot || k == DotDotEq {
                 let (lbp, rbp) = (5, 6);
                 if lbp < min_bp {
+                    break;
+                }
+                if !self.descend(self.cur().span) {
                     break;
                 }
                 let inclusive = k == DotDotEq;
@@ -1017,12 +1073,49 @@ impl<'src> Parser<'src> {
             if lbp < min_bp {
                 break;
             }
+            // Each fold wraps `lhs` one level deeper, so bound the left spine too:
+            // `1+1+…+1` parses in this loop, not by recursion, but still builds a
+            // left-deep tree a later pass walks recursively.
+            if !self.descend(self.cur().span) {
+                self.drain_binary_chain(min_bp);
+                break;
+            }
             self.bump();
             let rhs = self.parse_binary(rbp);
             let span = self.ast.expr_at(lhs).span.to(self.ast.expr_at(rhs).span);
             lhs = self.ast.expr(ExprKind::Binary { op, lhs, rhs }, span);
         }
+        self.expr_depth = saved;
         lhs
+    }
+
+    /// Once the depth cap is hit mid-fold, consume the remaining `op operand`
+    /// pairs of this flat operator chain *without* nesting them, so the surplus
+    /// tokens don't cascade into bogus "expected expression" errors after the
+    /// single "too deep" diagnostic. Discarding the operands is fine: the input
+    /// is already rejected. Each `parse_binary` here bails to a shallow atom
+    /// (the depth cap is still exceeded), so this stays bounded.
+    fn drain_binary_chain(&mut self, min_bp: u8) {
+        loop {
+            let k = self.cur().kind;
+            let cont = if k == DotDot || k == DotDotEq {
+                5 >= min_bp
+            } else {
+                bin_op(k).map(|(lbp, _, _)| lbp >= min_bp).unwrap_or(false)
+            };
+            if !cont {
+                break;
+            }
+            let rbp = if k == DotDot || k == DotDotEq { 6 } else { bin_op(k).unwrap().1 };
+            self.bump();
+            if k == DotDot || k == DotDotEq {
+                if self.starts_expr() {
+                    let _ = self.parse_binary(rbp);
+                }
+            } else {
+                let _ = self.parse_binary(rbp);
+            }
+        }
     }
 
     fn parse_unary(&mut self) -> ExprId {
@@ -1035,9 +1128,20 @@ impl<'src> Parser<'src> {
             _ => None,
         };
         if let Some(op) = op {
+            let saved = self.expr_depth;
+            if !self.descend(start) {
+                self.expr_depth = saved;
+                // Drain the rest of the prefix-op run without recursing, then take
+                // one atom, so `!!!…x` past the cap unwinds instead of overflowing.
+                while matches!(self.cur().kind, Minus | Not | Bang | Tilde | Amp) {
+                    self.bump();
+                }
+                return self.parse_cast();
+            }
             self.bump();
             let rhs = self.parse_unary();
             let span = start.to(self.ast.expr_at(rhs).span);
+            self.expr_depth = saved;
             return self.ast.expr(ExprKind::Unary { op, rhs }, span);
         }
         self.parse_cast()
@@ -1046,19 +1150,37 @@ impl<'src> Parser<'src> {
     /// `expr as T` — binds tighter than binary operators (`a + b as T` is
     /// `a + (b as T)`) and chains left (`x as A as B`).
     fn parse_cast(&mut self) -> ExprId {
+        let saved = self.expr_depth;
         let mut e = self.parse_postfix();
         while self.at(As) {
+            if !self.descend(self.cur().span) {
+                while self.at(As) {
+                    self.bump();
+                    let _ = self.parse_type(); // drain remaining casts flat
+                }
+                break;
+            }
             self.bump();
             let ty = self.parse_type();
             let span = self.ast.expr_at(e).span.to(self.ast.type_at(ty).span);
             e = self.ast.expr(ExprKind::Cast { expr: e, ty }, span);
         }
+        self.expr_depth = saved;
         e
     }
 
     fn parse_postfix(&mut self) -> ExprId {
+        let depth0 = self.expr_depth;
         let mut e = self.parse_primary();
         loop {
+            // Every postfix operation (`.f`, `()`, `[]`, `.*`, `?`) wraps `e` one
+            // level deeper, so bound the chain: `a.b.c.…` is left-deep too.
+            if !matches!(self.cur().kind, LParen | LBracket | DotStar | Dot | Question) {
+                break;
+            }
+            if !self.descend(self.cur().span) {
+                break;
+            }
             match self.cur().kind {
                 LParen => {
                     self.bump();
@@ -1114,9 +1236,10 @@ impl<'src> Parser<'src> {
                     let span = self.ast.expr_at(e).span.to(t.span);
                     e = self.ast.expr(ExprKind::Try { base: e }, span);
                 }
-                _ => break,
+                _ => unreachable!("guarded by the postfix-token check above"),
             }
         }
+        self.expr_depth = depth0;
         e
     }
 
@@ -1916,6 +2039,86 @@ mod tests {
         assert!(diags.is_empty(), "parse errors: {:?}", diags);
         ast
     }
+
+    /// A `main` returning one expression nested `depth` levels, in a shape that
+    /// parses *iteratively* (so it is safe to build to any depth on the default
+    /// test stack): `add` is the left-associative fold (`parse_binary`'s loop),
+    /// `field` the left-deep postfix chain (`parse_postfix`'s loop). The recursive
+    /// shapes are exercised on a worker-sized stack in `proptests`.
+    fn deep_expr_src(shape: &str, depth: usize) -> String {
+        let body = match shape {
+            "add" => {
+                let mut e = String::from("1");
+                for _ in 0..depth {
+                    e.push_str("+1");
+                }
+                e
+            }
+            "field" => {
+                let mut e = String::from("x");
+                for _ in 0..depth {
+                    e.push_str(".f");
+                }
+                e
+            }
+            _ => unreachable!("unknown shape {shape}"),
+        };
+        format!("fn main() -> i64 {{\n    return {body}\n}}\n")
+    }
+
+    fn too_deep_count(diags: &[Diagnostic]) -> usize {
+        diags.iter().filter(|d| d.message.contains("expression nesting too deep")).count()
+    }
+
+    /// **Wiring:** the two *iterative* deepening paths — the left-associative fold
+    /// (`parse_binary`'s loop) and the postfix chain (`parse_postfix`'s loop) —
+    /// report the `expression nesting too deep` diagnostic once past
+    /// [`MAX_EXPR_DEPTH`], rather than handing a later pass an unwalkable tree.
+    /// (These parse iteratively, so they're safe to build to any depth on the
+    /// default test stack; the *recursive* shapes are covered on a worker-sized
+    /// stack in `proptests`.)
+    #[test]
+    fn deep_nesting_reports_the_depth_diagnostic() {
+        for shape in ["add", "field"] {
+            let src = deep_expr_src(shape, MAX_EXPR_DEPTH * 3);
+            let (_ast, diags) = parse(&src);
+            assert_eq!(
+                too_deep_count(&diags),
+                1,
+                "shape `{shape}`: want exactly one too-deep diagnostic, got {diags:?}"
+            );
+            assert!(diags.iter().any(|d| d.is_error()), "shape `{shape}`: the diagnostic is an error");
+        }
+    }
+
+    /// **Soundness:** a moderately deep but legal expression (well under the cap)
+    /// still parses with no diagnostics — the guard must not fire on ordinary code,
+    /// keeping output byte-identical for everything short of the cap.
+    #[test]
+    fn nesting_under_the_cap_parses_clean() {
+        for shape in ["add", "field"] {
+            let src = deep_expr_src(shape, MAX_EXPR_DEPTH / 2);
+            let (_ast, diags) = parse(&src);
+            assert!(diags.is_empty(), "shape `{shape}` under the cap should parse clean: {diags:?}");
+        }
+    }
+
+    /// **Teeth:** the guard is depth-driven — a chain comfortably under the cap
+    /// trips nothing, while one past it yields *exactly one* diagnostic (the drain
+    /// swallows the rest of the flat chain, so there is no error cascade). Delete
+    /// the `descend` guard and the deep case stops reporting (or overflows);
+    /// break `drain_binary_chain` and the single-diagnostic assertion fails.
+    #[test]
+    fn depth_guard_boundary_has_teeth() {
+        let (_a, shallow) = parse(&deep_expr_src("add", 64));
+        assert_eq!(too_deep_count(&shallow), 0, "a 64-deep fold must not trip the guard");
+
+        let (_b, deep) = parse(&deep_expr_src("add", MAX_EXPR_DEPTH * 10));
+        assert_eq!(deep.len(), 1, "a deep fold must yield exactly one diagnostic (no cascade): {deep:?}");
+        assert!(deep[0].message.contains("expression nesting too deep"), "{:?}", deep[0].message);
+    }
+
+
 
     /// `par` is a **contextual** keyword — special only immediately before `for`, so
     /// it must remain usable as an ordinary identifier. (A hard `par` keyword regressed

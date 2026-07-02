@@ -294,7 +294,26 @@ enum Mode {
     Doc { html: bool },
 }
 
+/// Stack for the compiler's worker thread. Every pass after the parser —
+/// `typeck::infer`, `escape`, `cgen::emit_expr`, and the AST printer — walks the
+/// expression tree recursively, so a legitimately deep (but bounded, see
+/// [`parser::MAX_EXPR_DEPTH`]) expression needs headroom the platform default
+/// won't always give: Windows' main thread gets only ~1 MiB, enough to overflow
+/// on a few hundred nested nodes. Run the whole driver on a thread we size
+/// ourselves so the depth the *parser* accepts is the depth every later pass can
+/// walk, on every platform.
+const WORKER_STACK: usize = 256 * 1024 * 1024;
+
 fn main() -> ExitCode {
+    std::thread::Builder::new()
+        .stack_size(WORKER_STACK)
+        .spawn(run)
+        .expect("spawn compiler worker thread")
+        .join()
+        .unwrap_or(ExitCode::FAILURE)
+}
+
+fn run() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
     // `emit-c <file> --show-drops` annotates each inserted scope-exit drop call
