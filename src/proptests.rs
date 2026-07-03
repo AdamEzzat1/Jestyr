@@ -5987,6 +5987,32 @@ mod c_oracle {
                     out.push(")".to_string());
                 }
             }
+            // GenStructLit: type-arg count, field count, the ctor (as a synthetic `(name
+            // span)` node), then each type-arg expr, then each `(fieldinit <name span>
+            // <value>)`. No spread (generic struct literals have none).
+            ExprKind::GenStructLit { ctor, type_args, fields } => {
+                out.push("genstructlit".to_string());
+                out.push(type_args.len().to_string());
+                out.push(fields.len().to_string());
+                out.push(s);
+                out.push(en);
+                out.push("(".to_string());
+                out.push("name".to_string());
+                out.push(ctor.span.start.to_string());
+                out.push(ctor.span.end.to_string());
+                out.push(")".to_string());
+                for ta in type_args {
+                    ref_dump_expr(ast, *ta, out);
+                }
+                for f in fields {
+                    out.push("(".to_string());
+                    out.push("fieldinit".to_string());
+                    out.push(f.name.span.start.to_string());
+                    out.push(f.name.span.end.to_string());
+                    ref_dump_expr(ast, f.value, out);
+                    out.push(")".to_string());
+                }
+            }
             // Any construct the P2 slice does not yet build dumps as `error`; the golden
             // corpus is curated to the handled constructs, so this arm stays unexercised.
             _ => {
@@ -6115,6 +6141,14 @@ mod c_oracle {
             "Wrap{ inner: Point{ x: 1, y: 2 } }", // nested struct literal
             "Empty{}",                   // no fields
             "Line{ a: p, b: q, }",       // trailing comma
+            // generic struct literals: `Ctor(type_args){ fields }` — the parenthesized args
+            // are reinterpreted as type arguments once the `{` is seen
+            "List(i32){ len: 0 }",       // one type arg, one field
+            "Map(K, V){ n: 0 }",         // several type args
+            "Vec(T){}",                  // type arg, no fields
+            "Pair(A, B){ a: x, b: y }",  // several type args + several fields
+            "Box(i32){ v: f(x) }",       // a call as a field value (arg vs type-arg arenas coexist)
+            "Wrap(T){ inner: List(i32){ len: 1 } }", // nested generic struct literal
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");
