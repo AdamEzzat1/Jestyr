@@ -6013,6 +6013,26 @@ mod c_oracle {
                     out.push(")".to_string());
                 }
             }
+            // `self` / `Self` value-and-type keywords: just their span.
+            ExprKind::SelfValue => {
+                out.push("selfval".to_string());
+                out.push(s);
+                out.push(en);
+            }
+            ExprKind::SelfType => {
+                out.push("selftype".to_string());
+                out.push(s);
+                out.push(en);
+            }
+            // Attr `@name`: the name's source span (which attribute), then the node span. A
+            // call postfix on top (`@address(0x10)`) dumps as an ordinary `call` over it.
+            ExprKind::Attr(name) => {
+                out.push("attr".to_string());
+                out.push(name.span.start.to_string());
+                out.push(name.span.end.to_string());
+                out.push(s);
+                out.push(en);
+            }
             // Any construct the P2 slice does not yet build dumps as `error`; the golden
             // corpus is curated to the handled constructs, so this arm stays unexercised.
             _ => {
@@ -6149,6 +6169,17 @@ mod c_oracle {
             "Pair(A, B){ a: x, b: y }",  // several type args + several fields
             "Box(i32){ v: f(x) }",       // a call as a field value (arg vs type-arg arenas coexist)
             "Wrap(T){ inner: List(i32){ len: 1 } }", // nested generic struct literal
+            // self / Self keywords, Self struct literal, and @attr callables
+            "self",                      // the self value
+            "self.x",                    // postfix field on self: field(selfval, x)
+            "self.f(x)",                 // method call on self
+            "Self",                      // the Self type
+            "Self{ x: 1 }",              // `Self { … }` struct literal (path span = Self)
+            "Self{ p: self }",           // self value as a field value
+            "@inline",                   // a bare attribute
+            "@align(16)",                // a callable attribute: call(attr, 16)
+            "@repr(C)",                  // callable attr with a Name argument
+            "@address(0x10)",            // callable attr with a hex-literal argument
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");

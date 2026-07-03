@@ -35,7 +35,8 @@ import "tokens"
 
 // One arena node. `kind`: 0=Int 1=Float 2=Name 3=Unary 4=Binary 5=Field 6=Index 7=Deref
 // 8=Try 9=Error 10=Call 11=Cast 12=Assign 13=Range 14=ArrayLit 15=ArrayRepeat 16=StructLit
-// 17=GenStructLit 18=FieldInit. `a`/`b` are child `ExprId`s: unary/postfix use `a` for the
+// 17=GenStructLit 18=FieldInit 19=SelfValue 20=SelfType 21=Attr. `a`/`b` are child
+// `ExprId`s: unary/postfix use `a` for the
 // operand/base, binary uses `a`=lhs `b`=rhs, index uses `a`=base `b`=index, call/cast use
 // `a`=callee/expr. `x`/`y` are auxiliary integers: Field stores its name's source span
 // `(x, y)`; Call stores `(arg_start, arg_count)` into the arg arena; Cast stores its
@@ -171,6 +172,14 @@ fn mk_genstructlit(mut p: Parser, start: usize, end: usize, ctor: i32, targ_star
 fn mk_fieldinit(mut p: Parser, name_start: usize, name_end: usize, value: i32) -> i32 {
     let id: i32 = list.len(ExprData, p.ex) as i32
     list.push(ExprData, p.ex, ExprData{ kind: 18, start: name_start, end: name_end, op: 0, a: value, b: 0 - 1, x: name_start as i32, y: name_end as i32 })
+    return id
+}
+// An Attr node `@name`: `(x, y)` the name's source span (which attribute); node span runs
+// from the `@` to the name's end. It is a primary — a call postfix `(…)` on top makes it a
+// callable attribute like `@address(0x10)`.
+fn mk_attr(mut p: Parser, start: usize, end: usize, name_start: usize, name_end: usize) -> i32 {
+    let id: i32 = list.len(ExprData, p.ex) as i32
+    list.push(ExprData, p.ex, ExprData{ kind: 21, start: start, end: end, op: 0, a: 0 - 1, b: 0 - 1, x: name_start as i32, y: name_end as i32 })
     return id
 }
 fn node_start(read p: Parser, id: i32) -> usize {
@@ -369,6 +378,34 @@ fn parse_primary(mut p: Parser) -> i32 {
             if !p.no_struct { return parse_struct_lit(p, nm, t.start) }
         }
         return nm
+    }
+    if k == 61 {                                   // self -> SelfValue
+        let t: tokens.Token = cur_tok(p)
+        bump(p)
+        return mk(p, 19, t.start, t.end, 0, 0 - 1, 0 - 1)
+    }
+    if k == 62 {                                   // Self -> SelfType, or `Self { … }`
+        let t: tokens.Token = cur_tok(p)
+        bump(p)
+        if cur_kind(p) == 65 {                     // `{` -> `Self { … }` (unless suppressed)
+            if !p.no_struct {
+                // The path is a Name node carrying the `Self` span (the reference uses a
+                // synthetic `Self` Ident); parse_struct_lit dumps it identically.
+                let nm: i32 = mk(p, 2, t.start, t.end, 0, 0 - 1, 0 - 1)
+                return parse_struct_lit(p, nm, t.start)
+            }
+        }
+        return mk(p, 20, t.start, t.end, 0, 0 - 1, 0 - 1)
+    }
+    if k == 101 {                                  // @name -> Attr (callable via postfix `(…)`)
+        let at: tokens.Token = cur_tok(p)
+        bump(p)
+        if cur_kind(p) == 0 {                      // the attribute name
+            let nt: tokens.Token = cur_tok(p)
+            bump(p)
+            return mk_attr(p, at.start, nt.end, nt.start, nt.end)
+        }
+        return mk_attr(p, at.start, at.end, at.end, at.end)   // missing name: empty at `@`.end
     }
     if k == 63 {                                   // '(' grouping
         bump(p)
@@ -826,6 +863,13 @@ fn dump(read p: Parser, id: i32) {
         // FieldInit: the name's source span (x, y), then the value.
         print_str("fieldinit") print_int(d.x as i64) print_int(d.y as i64)
         dump(p, d.a)
+    } else if d.kind == 19 {
+        print_str("selfval") print_uint(d.start) print_uint(d.end)
+    } else if d.kind == 20 {
+        print_str("selftype") print_uint(d.start) print_uint(d.end)
+    } else if d.kind == 21 {
+        // Attr: the name's source span (x, y) identifies which attribute, then the node span.
+        print_str("attr") print_int(d.x as i64) print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
     } else {
         print_str("error") print_uint(d.start) print_uint(d.end)
     }
