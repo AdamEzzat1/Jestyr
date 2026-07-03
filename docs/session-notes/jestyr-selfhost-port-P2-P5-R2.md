@@ -147,17 +147,27 @@ The parser needs random-ish access to a token vector with `(kind, span)`. Two op
    order — a pure function of the arena). The Rust reference emits the identical stream via
    a new `Parser::parse_single_expr` (parser.rs) + `ref_dump_expr` (proptests.rs); the
    golden `jestyr_parser_expr_dump_matches_reference` diffs them over a curated expression
-   corpus. Handled: int/float/name leaves, prefix unary (`-`/`!`/`not`/`~`/`&`), the full
-   binary precedence table (matching `bin_op`), `( … )` grouping. Spans exact (leaf = token
-   span; unary = `op.start..rhs.end`; binary = `lhs.start..rhs.end` per `Span::to`). Teeth:
-   perturbing `*`'s precedence flips `1+2*3`'s tree and fails the golden (shape + span).
-   *Deferred to later slices (grow the corpus alongside):* assignment, ranges, `as` casts,
-   postfix (call/field/index/`?`/`.*`), struct/array literals, `if`/`match`/blocks, and the
-   recursion-depth guard (§3.1) — the Jestyr parser recurses, so it needs the same
-   `MAX_EXPR_DEPTH` cap before it sees adversarially-deep input.
-   **Design note (arenas are threaded, not nested):** the parser threads the arena + token
-   vector as standalone `mut`/`read` params plus a scalar-only `Cur` cursor — which matches
-   the reference (`Ast` owns the vecs, `Parser` borrows them). The two cgen gaps this
+   corpus. **Handled so far** (grown construct by construct, each with its golden slice):
+   int/float/name leaves; prefix unary (`-`/`!`/`not`/`~`/`&`); the full binary precedence
+   table (matching `bin_op`); `( … )` grouping; **postfix** `.field`/`[index]`/`.*`/`?`/
+   `(args)` — calls use a call-arg arena a Call node slices, with nested calls buffering args
+   in a per-call temp list to keep each slice contiguous; and **`as` casts** (named + pointer
+   types via a minimal `parse_type` consuming exactly the reference's tokens, so the type's
+   dumped *span* agrees; the structural type parser/dump is step 4). Spans exact throughout
+   (`Span::to`). **Depth guard DONE** (§3.1): `Parser.depth`/`over` + `descend`/
+   `max_depth()=256` matching the reference bounds AST *height* at the recursive entry points
+   and the iterative folds/chains, and `descend` respects the latched `over` so adversarial
+   nesting bails cleanly (bounded) instead of overflowing the parser — or the recursive
+   `dump` — stack (`jestyr_parser_bounds_deep_nesting`). Teeth: perturbing `*`'s precedence
+   flips `1+2*3`; raising the cap crashes the deep-nesting test.
+   *Deferred to later slices (grow the corpus alongside):* assignment, ranges, struct/array
+   literals, f-strings, `if`/`match`/`unsafe`/blocks; then the type & pattern parsers (which
+   also upgrade the cast dump from span to structure).
+   **Design note (arenas):** the parser state is now a single **`Parser` struct** (token
+   vector + expr arena + call-arg arena + allocator + cursor + depth guard) threaded `mut`,
+   mirroring the reference (`Ast` owns the arenas, `Parser` holds them) — this dogfoods the
+   gap-1 cgen fix (a generic `List` nested by value in a struct), which the initial
+   threaded-params design worked around. The two cgen gaps this
    surfaced are now **FIXED** (so nesting an arena in a struct would also work): (a)
    generic-`List(T)`-as-by-value-struct-field ordering — the aggregate-definition emitter
    topologically orders definitions by their by-value field edges (stable → byte-identical
