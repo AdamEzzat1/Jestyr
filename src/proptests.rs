@@ -5805,6 +5805,36 @@ mod c_oracle {
         }
     }
 
+    /// Canonical `AssignOp` label for the AST dump — matches `assign_label` in
+    /// `examples/std/parser.jtr`.
+    fn ref_assign_label(op: crate::ast::AssignOp) -> &'static str {
+        use crate::ast::AssignOp::*;
+        match op {
+            Assign => "set",
+            Add => "add",
+            Sub => "sub",
+            Mul => "mul",
+            Div => "div",
+            Rem => "rem",
+            BitAnd => "bitand",
+            BitOr => "bitor",
+            BitXor => "bitxor",
+        }
+    }
+
+    /// Dump an optional child expression: the node if present, else a `(none)` marker —
+    /// matches `dump_opt` in `examples/std/parser.jtr`.
+    fn ref_dump_opt(ast: &crate::ast::Ast, id: Option<crate::ast::ExprId>, out: &mut Vec<String>) {
+        match id {
+            Some(e) => ref_dump_expr(ast, e, out),
+            None => {
+                out.push("(".to_string());
+                out.push("none".to_string());
+                out.push(")".to_string());
+            }
+        }
+    }
+
     /// The Rust *reference* canonical AST dump for one expression node: a flattened
     /// S-expression, one atom per line — `(`, the kind label, (operator label,) the
     /// span `start`/`end`, then each child's dump in order, then `)`. A **pure function
@@ -5899,6 +5929,24 @@ mod c_oracle {
                 out.push(en);
                 ref_dump_expr(ast, *expr, out);
             }
+            // Assign: the compound operator, then target and value.
+            ExprKind::Assign { op, target, value } => {
+                out.push("assign".to_string());
+                out.push(ref_assign_label(*op).to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *target, out);
+                ref_dump_expr(ast, *value, out);
+            }
+            // Range: inclusive flag, then the optional lo/hi bounds (`(none)` when absent).
+            ExprKind::Range { lo, hi, inclusive } => {
+                out.push("range".to_string());
+                out.push(if *inclusive { "1" } else { "0" }.to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_opt(ast, *lo, out);
+                ref_dump_opt(ast, *hi, out);
+            }
             // Any construct the P2 slice does not yet build dumps as `error`; the golden
             // corpus is curated to the handled constructs, so this arm stays unexercised.
             _ => {
@@ -5992,6 +6040,24 @@ mod c_oracle {
             "a.b as usize",    // postfix field then cast
             "arr[i] as u8",    // postfix index then cast
             "q as *mut u8",    // pointer-type cast
+            // assignment (lowest precedence, right-associative) + compound assigns
+            "a = b",           // plain assignment
+            "a += 1",          // compound: add-assign
+            "a -= b * c",      // value is a binary expression
+            "x = y = z",       // right-associative: assign(x, assign(y, z))
+            "a.b = c",         // a field as the target
+            "arr[i] = v",      // an index as the target
+            "n *= 2",          //
+            "f &= g | h",      // bit-and-assign of a bitwise value
+            // ranges (infix `..` / `..=`, with an optional upper bound)
+            "0..n",            // exclusive range
+            "0..=len",         // inclusive range
+            "a..b",            //
+            "i..j + 1",        // the upper bound is a binary expression: i..(j+1)
+            "lo..=hi",         //
+            "arr[i..]",        // open-ended range (no upper bound) inside an index
+            "arr[1..n]",       // a bounded range as an index
+            "x = 0..count",    // a range as an assignment value
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");

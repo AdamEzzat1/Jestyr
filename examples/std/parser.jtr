@@ -116,6 +116,19 @@ fn mk_cast(mut p: Parser, start: usize, end: usize, expr: i32, ty_start: usize, 
     list.push(ExprData, p.ex, ExprData{ kind: 11, start: start, end: end, op: 0, a: expr, b: 0 - 1, x: ty_start as i32, y: ty_end as i32 })
     return id
 }
+// An Assign node `target op= value`: `op` is the AssignOp code, `a`=target, `b`=value.
+fn mk_assign(mut p: Parser, start: usize, end: usize, op: i32, target: i32, value: i32) -> i32 {
+    let id: i32 = list.len(ExprData, p.ex) as i32
+    list.push(ExprData, p.ex, ExprData{ kind: 12, start: start, end: end, op: op, a: target, b: value, x: 0 - 1, y: 0 - 1 })
+    return id
+}
+// A Range node `lo .. hi` / `lo ..= hi`: `op` is 1 when inclusive, `a`=lo, `b`=hi (either
+// -1 for an absent bound).
+fn mk_range(mut p: Parser, start: usize, end: usize, inclusive: i32, lo: i32, hi: i32) -> i32 {
+    let id: i32 = list.len(ExprData, p.ex) as i32
+    list.push(ExprData, p.ex, ExprData{ kind: 13, start: start, end: end, op: inclusive, a: lo, b: hi, x: 0 - 1, y: 0 - 1 })
+    return id
+}
 fn node_start(read p: Parser, id: i32) -> usize {
     let d: ExprData = list.get(ExprData, p.ex, id as usize)
     return d.start
@@ -163,6 +176,54 @@ fn bin_op(k: i32) -> BinInfo {
     return BinInfo{ ok: false, lbp: 0, rbp: 0, code: 0 }
 }
 
+// The AssignOp code for a token, or 0 if it is not an assignment operator. Codes:
+// 1=set(`=`) 2=add(`+=`) 3=sub(`-=`) 4=mul(`*=`) 5=div(`/=`) 6=rem(`%=`) 7=bitand(`&=`)
+// 8=bitor(`|=`) 9=bitxor(`^=`). Mirrors `assign_op` in the reference.
+fn assign_op(k: i32) -> i32 {
+    if k == 84 { return 1 }    // =
+    if k == 102 { return 2 }   // +=
+    if k == 103 { return 3 }   // -=
+    if k == 104 { return 4 }   // *=
+    if k == 105 { return 5 }   // /=
+    if k == 106 { return 6 }   // %=
+    if k == 107 { return 7 }   // &=
+    if k == 108 { return 8 }   // |=
+    if k == 109 { return 9 }   // ^=
+    return 0
+}
+
+// Can the current token begin an expression? Used to decide whether a range `lo..` has an
+// upper bound. Mirrors `starts_expr` in the reference (the exact token set).
+fn starts_expr(read p: Parser) -> bool {
+    let k: i32 = cur_kind(p)
+    if k == 1 { return true }    // Int
+    if k == 2 { return true }    // Float
+    if k == 3 { return true }    // Str
+    if k == 5 { return true }    // Char
+    if k == 58 { return true }   // true
+    if k == 59 { return true }   // false
+    if k == 60 { return true }   // null
+    if k == 0 { return true }    // Ident
+    if k == 6 { return true }    // _
+    if k == 61 { return true }   // self
+    if k == 62 { return true }   // Self
+    if k == 63 { return true }   // (
+    if k == 101 { return true }  // @
+    if k == 22 { return true }   // if
+    if k == 21 { return true }   // match
+    if k == 38 { return true }   // unsafe
+    if k == 65 { return true }   // {
+    if k == 11 { return true }   // struct
+    if k == 80 { return true }   // -
+    if k == 51 { return true }   // not
+    if k == 99 { return true }   // !
+    if k == 96 { return true }   // ~
+    if k == 91 { return true }   // &
+    if k == 93 { return true }   // |
+    if k == 94 { return true }   // ||
+    return false
+}
+
 // ---- the Pratt parser (mirrors parse_primary / parse_cast / parse_postfix / parse_unary
 //      / parse_binary in the reference) ----
 
@@ -188,7 +249,7 @@ fn parse_primary(mut p: Parser) -> i32 {
     }
     if k == 63 {                                   // '(' grouping
         bump(p)
-        let inner: i32 = parse_binary(p, 0)
+        let inner: i32 = parse_expr(p)
         if cur_kind(p) == 64 { bump(p) }           // ')'
         return inner
     }
@@ -264,7 +325,7 @@ fn parse_postfix(mut p: Parser) -> i32 {
             if !descend(p) { go = false }
             else {
                 bump(p)
-                let idx: i32 = parse_binary(p, 0)
+                let idx: i32 = parse_expr(p)
                 var endp: usize = node_end(p, idx)
                 if cur_kind(p) == 68 {                  // ']'
                     let rb: tokens.Token = cur_tok(p)
@@ -289,7 +350,7 @@ fn parse_postfix(mut p: Parser) -> i32 {
                     if ak == 64 { more = false }        // ')'
                     else if ak == 110 { more = false }  // Eof
                     else {
-                        let arg: i32 = parse_binary(p, 0)
+                        let arg: i32 = parse_expr(p)
                         list.push(i32, tmp, arg)
                         if cur_kind(p) == 69 { bump(p) }   // ',' -> another arg
                         else { more = false }
@@ -372,6 +433,22 @@ fn parse_unary(mut p: Parser) -> i32 {
 // folds iteratively (so `1+1+…` is a loop, not deep recursion) while the right operand
 // re-enters at `rbp` (left-associative). Span = lhs.start .. rhs.end. Bounded by `descend`
 // at the entry (recursion) and per fold (left-spine height).
+// Build a Range node once a `..`/`..=` has been seen (the op is still current). `lo` is
+// the left operand; the upper bound is parsed at rbp=6 only if an expression follows (so
+// `arr[i..]` leaves `hi` open). Span = lo.start .. (hi.end | lo.end). Mirrors the range
+// arm of the reference `parse_binary`.
+fn parse_range_tail(mut p: Parser, lo: i32, inclusive: i32) -> i32 {
+    bump(p)                                         // consume `..` / `..=`
+    var hi: i32 = 0 - 1
+    var e: usize = node_end(p, lo)
+    if starts_expr(p) {
+        hi = parse_binary(p, 6)
+        e = node_end(p, hi)
+    }
+    let s: usize = node_start(p, lo)
+    return mk_range(p, s, e, inclusive, lo, hi)
+}
+
 fn parse_binary(mut p: Parser, min_bp: i32) -> i32 {
     let saved: i32 = p.depth
     if !descend(p) { p.depth = saved  return err_here(p) }
@@ -379,20 +456,50 @@ fn parse_binary(mut p: Parser, min_bp: i32) -> i32 {
     var go: bool = true
     for go {
         let k: i32 = cur_kind(p)
-        let bi: BinInfo = bin_op(k)
-        if !bi.ok {
-            go = false
-        } else if bi.lbp < min_bp {
-            go = false
-        } else if !descend(p) {
-            go = false
+        if k == 74 {                               // '..'  -> exclusive Range (lbp 5, rbp 6)
+            if 5 < min_bp { go = false }
+            else if !descend(p) { go = false }
+            else { lhs = parse_range_tail(p, lhs, 0) }
+        } else if k == 75 {                        // '..=' -> inclusive Range
+            if 5 < min_bp { go = false }
+            else if !descend(p) { go = false }
+            else { lhs = parse_range_tail(p, lhs, 1) }
         } else {
-            bump(p)
-            let rhs: i32 = parse_binary(p, bi.rbp)
-            let s: usize = node_start(p, lhs)
-            let e: usize = node_end(p, rhs)
-            lhs = mk(p, 4, s, e, bi.code, lhs, rhs)
+            let bi: BinInfo = bin_op(k)
+            if !bi.ok {
+                go = false
+            } else if bi.lbp < min_bp {
+                go = false
+            } else if !descend(p) {
+                go = false
+            } else {
+                bump(p)
+                let rhs: i32 = parse_binary(p, bi.rbp)
+                let s: usize = node_start(p, lhs)
+                let e: usize = node_end(p, rhs)
+                lhs = mk(p, 4, s, e, bi.code, lhs, rhs)
+            }
         }
+    }
+    p.depth = saved
+    return lhs
+}
+
+// The full expression entry: assignment is the outermost, lowest-precedence layer, and is
+// right-associative (`a = b = c` is `a = (b = c)`). Everything else is a binary/unary/
+// postfix/primary chain. Mirrors `parse_expr`/`parse_assignment` in the reference.
+fn parse_expr(mut p: Parser) -> i32 {
+    let saved: i32 = p.depth
+    if !descend(p) { p.depth = saved  return err_here(p) }
+    let lhs: i32 = parse_binary(p, 0)
+    let ac: i32 = assign_op(cur_kind(p))
+    if ac != 0 {
+        bump(p)
+        let value: i32 = parse_expr(p)             // right-associative
+        let s: usize = node_start(p, lhs)
+        let e: usize = node_end(p, value)
+        p.depth = saved
+        return mk_assign(p, s, e, ac, lhs, value)
     }
     p.depth = saved
     return lhs
@@ -427,6 +534,24 @@ fn unop_label(code: i32) {
     if code == 2 { print_str("not") return }
     if code == 3 { print_str("bitnot") return }
     print_str("ref")   // 4
+}
+fn assign_label(code: i32) {
+    if code == 1 { print_str("set") return }
+    if code == 2 { print_str("add") return }
+    if code == 3 { print_str("sub") return }
+    if code == 4 { print_str("mul") return }
+    if code == 5 { print_str("div") return }
+    if code == 6 { print_str("rem") return }
+    if code == 7 { print_str("bitand") return }
+    if code == 8 { print_str("bitor") return }
+    print_str("bitxor")   // 9
+}
+
+// Dump an optional child: the node if present, else a `(none)` marker (so a Range with an
+// absent bound still has a fixed two-child shape).
+fn dump_opt(read p: Parser, id: i32) {
+    if id < 0 { print_str("(") print_str("none") print_str(")") }
+    else { dump(p, id) }
 }
 
 // Emit a flattened S-expression: `(`, the head atoms (kind label, operator/aux, start,
@@ -475,6 +600,15 @@ fn dump(read p: Parser, id: i32) {
         // Cast: the target type's source span (x, y), then the operand.
         print_str("cast") print_int(d.x as i64) print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
         dump(p, d.a)
+    } else if d.kind == 12 {
+        print_str("assign") assign_label(d.op) print_uint(d.start) print_uint(d.end)
+        dump(p, d.a)
+        dump(p, d.b)
+    } else if d.kind == 13 {
+        // Range: `op` is the inclusive flag (0/1); lo/hi are optional bounds.
+        print_str("range") print_int(d.op as i64) print_uint(d.start) print_uint(d.end)
+        dump_opt(p, d.a)
+        dump_opt(p, d.b)
     } else {
         print_str("error") print_uint(d.start) print_uint(d.end)
     }
@@ -486,7 +620,7 @@ fn parse_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Allocat
     var tk: List(tokens.Token) = tokens.tokenize(src, it, kwcount, a)
     let n: usize = list.len(tokens.Token, tk)
     var p: Parser = Parser{ toks: tk, ex: list.make(ExprData, a), ar: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false }
-    let root: i32 = parse_binary(p, 0)
+    let root: i32 = parse_expr(p)
     dump(p, root)
 }
 
@@ -500,7 +634,7 @@ fn main() -> i32 {
         parse_and_dump(string_view(src), it, kwcount, a)
         string_free(src)
     } else {
-        let sample: str = "f(a.b, 1 + 2) as i32"
+        let sample: str = "sum = 0 ..= n - 1"
         parse_and_dump(sample, it, kwcount, a)
     }
     return 0
