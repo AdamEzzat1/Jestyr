@@ -5895,7 +5895,6 @@ mod c_oracle {
 
     /// A parenthesized block, for blocks that are a *child* of another node (`if`'s `then`,
     /// `unsafe`'s body) rather than an `ExprKind::Block` reached through `ref_dump_expr`.
-    #[allow(dead_code)]
     fn ref_dump_block(ast: &crate::ast::Ast, b: &crate::ast::Block, out: &mut Vec<String>) {
         out.push("(".to_string());
         ref_dump_block_body(ast, b, out);
@@ -6125,6 +6124,23 @@ mod c_oracle {
             ExprKind::Block(b) => {
                 ref_dump_block_body(ast, b, out);
             }
+            // If: the condition, the then-block (wrapped), then the optional else (a Block
+            // expr or a chained If).
+            ExprKind::If { cond, then, els } => {
+                out.push("if".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *cond, out);
+                ref_dump_block(ast, then, out);
+                ref_dump_opt(ast, *els, out);
+            }
+            // Unsafe: just its block (wrapped).
+            ExprKind::Unsafe(b) => {
+                out.push("unsafe".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_block(ast, b, out);
+            }
             // Any construct the P2 slice does not yet build dumps as `error`; the golden
             // corpus is curated to the handled constructs, so this arm stays unexercised.
             _ => {
@@ -6294,6 +6310,16 @@ mod c_oracle {
             "{ let p = f(a, b)  p.field }", // a call initializer, a field tail
             "{ { 1 } }",                 // a nested block as the tail
             "{ let q: *mut u8 = p  q.* }", // pointer-type annotation + deref tail
+            // if / else / else-if chains, and unsafe blocks
+            "if a { 1 }",                // if with no else
+            "if a { 1 } else { 2 }",     // if / else
+            "if a == b { x } else { y }", // a comparison condition (no_struct in the header)
+            "if a { 1 } else if b { 2 } else { 3 }", // an else-if chain
+            "if f(x) { g() }",           // a call condition, a call in the then-block
+            "unsafe { p.* }",            // an unsafe block with a deref tail
+            "unsafe { let v = q  v }",   // unsafe block with statements
+            "{ if a { 1 } else { 2 } }", // an if as a block statement (block-only position)
+            "if a { let x = 1  x } else { 0 }", // then-block with statements + tail
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");
