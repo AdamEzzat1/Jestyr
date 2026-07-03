@@ -5947,6 +5947,23 @@ mod c_oracle {
                 ref_dump_opt(ast, *lo, out);
                 ref_dump_opt(ast, *hi, out);
             }
+            // Array literals: `[e0, …]` (count + elements) and `[value; count]`.
+            ExprKind::ArrayLit { elems } => {
+                out.push("array".to_string());
+                out.push(elems.len().to_string());
+                out.push(s);
+                out.push(en);
+                for e in elems {
+                    ref_dump_expr(ast, *e, out);
+                }
+            }
+            ExprKind::ArrayRepeat { value, count } => {
+                out.push("arrayrepeat".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *value, out);
+                ref_dump_expr(ast, *count, out);
+            }
             // Any construct the P2 slice does not yet build dumps as `error`; the golden
             // corpus is curated to the handled constructs, so this arm stays unexercised.
             _ => {
@@ -6058,6 +6075,16 @@ mod c_oracle {
             "arr[i..]",        // open-ended range (no upper bound) inside an index
             "arr[1..n]",       // a bounded range as an index
             "x = 0..count",    // a range as an assignment value
+            // array literals: list form (with trailing comma + nesting) and repeat form
+            "[1, 2, 3]",       // list of literals
+            "[a, b]",          //
+            "[x]",             // single element
+            "[f(x), g(y)]",    // calls as elements (arg arena coexists with elem arena)
+            "[1, 2, 3,]",      // trailing comma tolerated
+            "[[1], [2, 3]]",   // nested arrays
+            "[0; 10]",         // `[value; count]` repeat
+            "[a + b; n]",      // repeat with expression value/count
+            "[x][0]",          // an array literal then an index: index(array, 0)
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");
