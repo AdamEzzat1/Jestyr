@@ -257,6 +257,7 @@ fn emit_program(
         show_drops,
         drop_stack: Vec::new(),
         cur_moved: HashSet::new(),
+        def_cap: None,
     };
     g.spawn_sites = g.collect_spawns();
     g.genref_instances = g.collect_genrefs();
@@ -290,6 +291,11 @@ fn emit_program(
     // *before* `struct_defs`, so a struct may hold a fn-pointer field — the
     // hand-written-vtable shape (e.g. an allocator interface).
     g.fn_type_typedefs();
+    // Aggregate definitions are captured per-unit and flushed in a topological order
+    // so a struct embedding another aggregate *by value* (e.g. a `List(E)` field) is
+    // emitted after that aggregate's definition. A no-op reorder for programs with no
+    // forward by-value dependency (byte-identical output).
+    g.begin_def_capture();
     g.struct_defs();
     g.enum_defs();
     g.gen_struct_defs();
@@ -298,6 +304,7 @@ fn emit_program(
     g.array_struct_defs();
     g.genref_struct_defs();
     g.result_defs();
+    g.flush_def_capture();
     // `dyn Trait` vtable structs + fat-pointer typedefs — after the value typedefs
     // (a method's arg/return types are named) and before any function uses them.
     g.dyn_typedefs();
@@ -546,6 +553,43 @@ struct Cgen<'a> {
     /// (any by-value escape suppresses the drop), so the result is leak-safe: a
     /// value is dropped at most once, never twice.
     cur_moved: HashSet<String>,
+    /// While emitting aggregate *definitions* (structs/enums/generic instances/
+    /// slices/arrays/genrefs/results), captures each definition as a segment of the
+    /// output buffer plus its by-value type dependencies, so `flush_def_capture` can
+    /// re-emit them in a topological order — a struct that embeds another aggregate
+    /// *by value* (e.g. a field of type `List(E)`) needs that aggregate's full C
+    /// definition to precede it. `None` outside the capture window. The sort is
+    /// stable (input order preserved except where a dependency forces a move), so a
+    /// program with no forward by-value dependency is emitted byte-identically.
+    def_cap: Option<DefCapture>,
+}
+
+/// Accumulates aggregate-definition output for topological reordering
+/// (see [`Cgen::def_cap`]). Segments cover the capture buffer in order; a segment
+/// with `cname: Some(_)` is one aggregate definition (dependency-orderable), and a
+/// `cname: None` segment is interstitial glue (blank lines, intrinsic typedefs) held
+/// in place.
+#[derive(Default)]
+struct DefCapture {
+    segs: Vec<DefSeg>,
+    /// End offset (into the capture buffer) of the last finalized segment.
+    last: usize,
+    /// The open unit's (cname, deps, start offset), between `def_begin`/`def_end`.
+    pending: Option<(String, Vec<String>, usize)>,
+    /// The real output buffer, set aside while definitions accumulate in `self.out`.
+    real: String,
+}
+
+/// One segment of captured aggregate-definition output.
+struct DefSeg {
+    /// The C type name this segment *defines* (for dependency matching), or `None`
+    /// for interstitial glue.
+    cname: Option<String>,
+    /// The C type names this definition embeds *by value* (must precede it).
+    deps: Vec<String>,
+    /// Half-open byte range into the capture buffer.
+    start: usize,
+    end: usize,
 }
 
 /// One owned local that needs scope-exit drop glue — either it has its own `Drop`
@@ -761,6 +805,130 @@ impl<'a> Cgen<'a> {
         })
     }
 
+    // --- aggregate-definition capture + topological flush (see `def_cap`) ---
+
+    /// Redirect output into a capture buffer so the aggregate-definition phases
+    /// register each definition as a segment; [`Self::flush_def_capture`] then emits
+    /// them in dependency order.
+    fn begin_def_capture(&mut self) {
+        let real = std::mem::take(&mut self.out);
+        self.def_cap = Some(DefCapture { real, ..Default::default() });
+    }
+
+    /// Open a definition segment named `cname` that embeds `deps` by value. Text
+    /// written until [`Self::def_end`] is that definition's body; any text written
+    /// since the previous segment becomes an anonymous glue segment held in place.
+    fn def_begin(&mut self, cname: String, deps: Vec<String>) {
+        let start = self.out.len();
+        if let Some(cap) = &mut self.def_cap {
+            if start > cap.last {
+                cap.segs.push(DefSeg { cname: None, deps: Vec::new(), start: cap.last, end: start });
+                cap.last = start;
+            }
+            cap.pending = Some((cname, deps, start));
+        }
+    }
+
+    /// Close the current definition segment.
+    fn def_end(&mut self) {
+        let end = self.out.len();
+        if let Some(cap) = &mut self.def_cap {
+            if let Some((cname, deps, start)) = cap.pending.take() {
+                cap.segs.push(DefSeg { cname: Some(cname), deps, start, end });
+                cap.last = end;
+            }
+        }
+    }
+
+    /// The C type name a *by-value* field of C type `c` depends on being complete —
+    /// `None` for a pointer (a forward declaration suffices) or a type that names no
+    /// aggregate unit (a primitive never matches a unit, so it is a harmless no-op).
+    fn dep_of_cty(c: String) -> Option<String> {
+        if c.contains('*') {
+            None
+        } else {
+            Some(c)
+        }
+    }
+
+    /// Push `dep` (if any) onto `deps`, de-duplicated.
+    fn add_dep(deps: &mut Vec<String>, dep: Option<String>) {
+        if let Some(d) = dep {
+            if !deps.contains(&d) {
+                deps.push(d);
+            }
+        }
+    }
+
+    /// The by-value aggregate dependencies of a struct body's fields, spelled with the
+    /// same `c_ty_ast` the definition uses (so a `List(E)` field yields exactly the
+    /// `Jestyr_List__E` unit name). `cur_mod` must already be set for the owning item.
+    fn aggregate_field_deps_ast(&mut self, body: &StructBody) -> Vec<String> {
+        let mut deps = Vec::new();
+        for m in &body.members {
+            if let StructMember::Field { ty, .. } = m {
+                let c = self.c_ty_ast(*ty);
+                Self::add_dep(&mut deps, Self::dep_of_cty(c));
+            }
+        }
+        deps
+    }
+
+    /// End the capture window and emit the collected definitions in a topological
+    /// order (each definition after the aggregates it embeds by value). A stable
+    /// post-order DFS in segment order: a program with no forward by-value
+    /// dependency emits in the original order (byte-identical).
+    fn flush_def_capture(&mut self) {
+        let Some(cap) = self.def_cap.take() else { return };
+        let mut segs = cap.segs;
+        // Any trailing text after the last segment is glue.
+        let buflen = self.out.len();
+        if buflen > cap.last {
+            segs.push(DefSeg { cname: None, deps: Vec::new(), start: cap.last, end: buflen });
+        }
+        // Swap the captured definitions out and restore the real output buffer.
+        let buf = std::mem::replace(&mut self.out, cap.real);
+
+        // Map each named definition to its segment index for dependency resolution.
+        let mut by_name: HashMap<&str, usize> = HashMap::new();
+        for (i, s) in segs.iter().enumerate() {
+            if let Some(n) = &s.cname {
+                by_name.insert(n.as_str(), i);
+            }
+        }
+        // Iterative post-order DFS (deps before dependents), stable in segment order.
+        let n = segs.len();
+        let mut state = vec![0u8; n]; // 0 = unvisited, 1 = on stack, 2 = done
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        for root in 0..n {
+            if state[root] != 0 {
+                continue;
+            }
+            state[root] = 1;
+            let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+            while let Some(&(node, di)) = stack.last() {
+                let deps = &segs[node].deps;
+                if di < deps.len() {
+                    stack.last_mut().unwrap().1 += 1; // advance to the next dep
+                    if let Some(&j) = by_name.get(deps[di].as_str()) {
+                        if state[j] == 0 {
+                            state[j] = 1;
+                            stack.push((j, 0));
+                        }
+                    }
+                } else {
+                    order.push(node);
+                    state[node] = 2;
+                    stack.pop();
+                }
+            }
+        }
+        for i in order {
+            let s = &segs[i];
+            self.out.push_str(&buf[s.start..s.end]);
+        }
+    }
+
     fn forward_types(&mut self) {
         let ast = self.ast;
         for (i, item) in ast.items.iter().enumerate() {
@@ -930,6 +1098,14 @@ impl<'a> Cgen<'a> {
                     continue;
                 }
                 let en = self.canon_type(&e.name.name);
+                let mut deps = Vec::new();
+                for v in &e.variants {
+                    for (_, fty) in &v.fields {
+                        let c = self.c_ty_ast(*fty);
+                        Self::add_dep(&mut deps, Self::dep_of_cty(c));
+                    }
+                }
+                self.def_begin(format!("Jestyr_{en}"), deps);
                 self.raw(format!("enum Jestyr_{en}_tag {{\n"));
                 for v in &e.variants {
                     // An explicit discriminant sets the tag's integer value.
@@ -961,6 +1137,7 @@ impl<'a> Cgen<'a> {
                     self.raw("    } u;\n");
                 }
                 self.raw("};\n\n");
+                self.def_end();
             }
         }
     }
@@ -1359,6 +1536,15 @@ impl<'a> Cgen<'a> {
         let names = self.type_param_names(f);
         let subst: HashMap<String, Ty> = names.into_iter().zip(args.iter().cloned()).collect();
         let cname = self.gen_struct_c_name(ctor, args);
+        let mut deps = Vec::new();
+        for m in &body.members {
+            if let StructMember::Field { ty, .. } = m {
+                let fty = self.ast_type_to_ty(*ty, &subst);
+                let c = self.c_type(&fty);
+                Self::add_dep(&mut deps, Self::dep_of_cty(c));
+            }
+        }
+        self.def_begin(cname.clone(), deps);
         self.raw(format!("struct {cname} {{\n"));
         for m in &body.members {
             if let StructMember::Field { name, ty, .. } = m {
@@ -1368,6 +1554,7 @@ impl<'a> Cgen<'a> {
             }
         }
         self.raw("};\n\n");
+        self.def_end();
     }
 
     // --- generic enums (monomorphization) ---
@@ -1474,6 +1661,15 @@ impl<'a> Cgen<'a> {
             .zip(args.iter().cloned())
             .collect();
         let cname = self.gen_struct_c_name(ctor, args);
+        let mut deps = Vec::new();
+        for v in &e.variants {
+            for (_, tid) in &v.fields {
+                let fty = self.ast_type_to_ty(*tid, &subst);
+                let c = self.c_type(&fty);
+                Self::add_dep(&mut deps, Self::dep_of_cty(c));
+            }
+        }
+        self.def_begin(cname.clone(), deps);
         self.raw(format!("enum {cname}_tag {{\n"));
         for v in &e.variants {
             match v.discriminant {
@@ -1504,6 +1700,7 @@ impl<'a> Cgen<'a> {
             self.raw("    } u;\n");
         }
         self.raw("};\n\n");
+        self.def_end();
     }
 
     /// Emit one tagged result struct per distinct ok-type used by a fallible
@@ -1514,7 +1711,9 @@ impl<'a> Cgen<'a> {
         // `try_from_utf8(...) -> str !Utf8Error` is an *intrinsic*, so its result
         // type isn't discovered from a fn signature — emit it up front (and seed
         // `seen` so a user `str !E` function doesn't duplicate the typedef).
+        self.def_begin("JestyrResult_str".to_string(), Vec::new());
         self.raw("typedef struct { bool is_err; JestyrStr ok; int err; } JestyrResult_str;\n");
+        self.def_end();
         seen.insert("JestyrResult_str".to_string());
         // `try_read_file(...) -> String !IoError` is an intrinsic, so its result type
         // isn't discovered from a fn signature — emit it (only when used, to keep
@@ -1522,7 +1721,9 @@ impl<'a> Cgen<'a> {
         // function doesn't duplicate the typedef.
         if self.uses_try_read {
             let rname = self.result_c_name(&Ty::Prim("String"));
+            self.def_begin(rname.clone(), Vec::new());
             self.raw(format!("typedef struct {{ bool is_err; JestyrString ok; int err; }} {rname};\n"));
+            self.def_end();
             seen.insert(rname);
         }
         for item in &ast.items {
@@ -1535,12 +1736,19 @@ impl<'a> Cgen<'a> {
                 if !seen.insert(cname.clone()) {
                     continue;
                 }
+                let deps = if ok != Ty::Unit {
+                    Self::dep_of_cty(self.c_type(&ok)).into_iter().collect()
+                } else {
+                    Vec::new()
+                };
+                self.def_begin(cname.clone(), deps);
                 self.raw(format!("typedef struct {{ bool is_err; "));
                 if ok != Ty::Unit {
                     let okc = self.c_type(&ok);
                     self.raw(format!("{okc} ok; "));
                 }
                 self.raw(format!("int err; }} {cname};\n"));
+                self.def_end();
             }
         }
         self.raw("\n");
@@ -1554,6 +1762,8 @@ impl<'a> Cgen<'a> {
                 let attr = self.struct_attr(attrs);
                 let kw = if *is_union { "union" } else { "struct" };
                 let c = self.canon_type(&name.name);
+                let deps = self.aggregate_field_deps_ast(body);
+                self.def_begin(format!("Jestyr_{c}"), deps);
                 self.raw(format!("{kw}{attr} Jestyr_{c} {{\n"));
                 for m in &body.members {
                     if let StructMember::Field { name: fname, ty, volatile, bits, .. } = m {
@@ -1568,6 +1778,7 @@ impl<'a> Cgen<'a> {
                     }
                 }
                 self.raw("};\n\n");
+                self.def_end();
             }
         }
     }
@@ -7299,7 +7510,11 @@ impl<'a> Cgen<'a> {
         for elem in self.slice_instances.clone() {
             let name = self.slice_c_name(&elem);
             let ecty = self.c_type(&elem);
+            // A slice is `{ E* ptr; len }` — it embeds `E` only through a pointer, so
+            // it has no by-value dependency (a forward declaration of `E` suffices).
+            self.def_begin(name.clone(), Vec::new());
             self.raw(format!("typedef struct {{ {ecty}* ptr; size_t len; }} {name};\n"));
+            self.def_end();
         }
         if !self.slice_instances.is_empty() {
             self.raw("\n");
@@ -7346,7 +7561,11 @@ impl<'a> Cgen<'a> {
             if let Ty::Array { elem, len } = &t {
                 let name = self.array_c_name(elem, *len);
                 let ecty = self.c_type(elem);
+                // `{ E a[N]; }` embeds `E` *by value*, so it depends on `E`'s definition.
+                let deps = Self::dep_of_cty(ecty.clone()).into_iter().collect();
+                self.def_begin(name.clone(), deps);
                 self.raw(format!("typedef struct {{ {ecty} a[{len}]; }} {name};\n"));
+                self.def_end();
             }
         }
         if !self.array_instances.is_empty() {
@@ -7480,7 +7699,10 @@ impl<'a> Cgen<'a> {
         for elem in self.genref_instances.clone() {
             let name = self.genref_c_name(&elem);
             let ecty = self.c_type(&elem);
+            // `{ E* ptr; gen }` embeds `E` only through a pointer — no by-value dep.
+            self.def_begin(name.clone(), Vec::new());
             self.raw(format!("typedef struct {{ {ecty}* ptr; uint64_t gen; }} {name};\n"));
+            self.def_end();
         }
         if !self.genref_instances.is_empty() {
             self.raw("\n");
@@ -8386,6 +8608,28 @@ mod tests {
         assert!(c.contains("typedef struct Jestyr_P Jestyr_P;"), "{c}");
         assert!(c.contains("int32_t j_x;"), "{c}");
         assert!(c.contains("(Jestyr_P){ .j_x = 1, .j_y = 2 }"), "{c}");
+    }
+
+    /// A struct embedding a generic-struct instance **by value** — the instance's C
+    /// definition must precede the struct that embeds it, or C rejects the incomplete
+    /// type (the reported gap: a `List(E)` field). The aggregate-definition emitter
+    /// topologically orders definitions by their by-value field edges. Here `Holder`
+    /// embeds `Box(Leaf)` which embeds `Leaf`, so the C order must be
+    /// `Leaf` → `Box(Leaf)` → `Holder`.
+    #[test]
+    fn aggregate_defs_topologically_ordered_by_by_value_fields() {
+        let src = "fn Box(comptime T: type) -> type { return struct { v: T } } \
+                   struct Leaf { x: i32 } \
+                   struct Holder { b: Box(Leaf), n: i32 } \
+                   fn main() -> i32 { let h = Holder{ b: Box(Leaf){ v: Leaf{ x: 5 } }, n: 1 } return h.b.v.x }";
+        let (c, d) = gen(src);
+        assert!(!d.iter().any(|x| x.is_error()), "diags: {:?}", d);
+        let leaf = c.find("struct Jestyr_Leaf {").expect("Leaf defined");
+        let boxed = c.find("struct Jestyr_Box__Leaf {").expect("Box(Leaf) defined");
+        let holder = c.find("struct Jestyr_Holder {").expect("Holder defined");
+        // Each container's by-value field type is defined before the container.
+        assert!(leaf < boxed, "Leaf must precede Box(Leaf):\n{c}");
+        assert!(boxed < holder, "Box(Leaf) must precede Holder:\n{c}");
     }
 
     #[test]
