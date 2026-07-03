@@ -6143,6 +6143,23 @@ impl<'a> Cgen<'a> {
         None
     }
 
+    /// Is there a user-written *concrete* (non-generic) `impl Drop for <ty>`? Distinct
+    /// from a bare `impl_index` lookup, which a blanket `impl[T] Drop for Ctor(T)` also
+    /// populates under its generic-param key (colliding with an instance whose type
+    /// argument is named like that param). Compares the lowered impl target by
+    /// `ty_key`, matching only genuinely concrete overrides.
+    fn has_concrete_drop_impl(&self, ty: &Ty) -> bool {
+        let empty = HashMap::new();
+        let key = self.info.table.ty_key(ty);
+        let ast = self.ast;
+        ast.items.iter().any(|it| {
+            matches!(it, Item::Impl(im)
+                if im.generics.is_empty()
+                    && im.trait_name.name == "Drop"
+                    && self.info.table.ty_key(&self.ast_type_to_ty(im.ty, &empty)) == key)
+        })
+    }
+
     /// Monomorphize a blanket `impl[T] Drop for Ctor(T)` once per concrete instance
     /// of `Ctor` actually used in the program (from `struct_instances`). Emits a
     /// prototype (`body = false`) or full definition, with the impl's generic
@@ -6158,8 +6175,13 @@ impl<'a> Cgen<'a> {
             };
             let concrete = Ty::GenStruct { ctor: ctor.clone(), args: args.clone() };
             let key = self.info.table.ty_key(&concrete);
-            // Skip if a concrete impl already covers this instance (coherence).
-            if self.info.table.impl_index.contains_key(&("Drop".to_string(), key.clone())) {
+            // Skip only if a *concrete* `impl Drop for <this instance>` overrides the
+            // blanket (coherence — the concrete wins). A bare `impl_index` lookup is
+            // wrong here: a blanket `impl[T] Drop for Ctor(T)` also occupies the index
+            // under a key derived from its generic parameter `T`, which collides with
+            // an instance whose type argument is *named* `T` (a user `struct T`) — and
+            // would then wrongly skip that instance's drop glue.
+            if self.has_concrete_drop_impl(&concrete) {
                 continue;
             }
             let Some(f) = im.methods.iter().find(|m| m.name.name == "drop") else {

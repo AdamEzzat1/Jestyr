@@ -1,0 +1,22 @@
+// Regression: a user struct named `T` collides in *name* with the blanket
+// `impl[T] Drop for List(T)`'s generic parameter (which lives in `std/list.jtr`, a
+// different module, so it lowers to an opaque `T` whose mangled key `List_T` matches
+// a `List(<struct T>)` instance). The RAII drop glue for `List(T)` must still be
+// emitted: cgen's coherence skip must recognize that the colliding `impl_index` entry
+// is the blanket itself, not a concrete `impl Drop for List(<struct T>)` override.
+//
+// Before the fix this failed to link (`undefined reference to
+// jestyr_impl_Drop__List_T___drop`). It prints `2`; `xs` drops at scope exit.
+import "mem"
+import "list"
+
+struct T { x: i32 }
+
+fn main() -> i32 {
+    var a: Allocator = mem.system_allocator()
+    var xs: List(T) = list.make(T, a)
+    list.push(T, xs, T{ x: 5 })
+    list.push(T, xs, T{ x: 6 })
+    print_int(list.len(T, xs) as i32)   // 2 — `xs` (a List(T)) drops here via the blanket
+    return 0
+}

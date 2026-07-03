@@ -6175,6 +6175,14 @@ mod c_oracle {
         }
     }
     #[test]
+    fn drop_glue_for_struct_named_like_generic_param() {
+        // A user `struct T` collides in name with the blanket `impl[T] Drop for
+        // List(T)`'s generic parameter. Its `List(T)` drop glue must still be emitted —
+        // otherwise gcc fails to link `jestyr_impl_Drop__List_T___drop`, so building and
+        // running the program at all is the regression check (it prints the pushed count).
+        assert_eq!(toks("examples/std/drop_named_type_param.jtr"), ["2"]);
+    }
+    #[test]
     fn lexer_slice_demo() {
         // The self-hosting lexer slice, no args → lexes its built-in sample
         // `fn add(x: i32, y: i32) -> i32 { return x + y }` (comment + whitespace
