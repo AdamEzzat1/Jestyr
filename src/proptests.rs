@@ -5848,6 +5848,35 @@ mod c_oracle {
                 ref_dump_expr(ast, *lhs, out);
                 ref_dump_expr(ast, *rhs, out);
             }
+            // Postfix: `.field` carries the field name's span (which field), `[index]`
+            // has base + index children, `.*`/`?` wrap a single base.
+            ExprKind::Field { base, name } => {
+                out.push("field".to_string());
+                out.push(name.span.start.to_string());
+                out.push(name.span.end.to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *base, out);
+            }
+            ExprKind::Index { base, index } => {
+                out.push("index".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *base, out);
+                ref_dump_expr(ast, *index, out);
+            }
+            ExprKind::Deref { base } => {
+                out.push("deref".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *base, out);
+            }
+            ExprKind::Try { base } => {
+                out.push("try".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *base, out);
+            }
             // Any construct the P2 slice does not yet build dumps as `error`; the golden
             // corpus is curated to the handled constructs, so this arm stays unexercised.
             _ => {
@@ -5906,6 +5935,21 @@ mod c_oracle {
             "1.5 * x - 2.0",   // float + name leaves
             "((a))",           // redundant nested grouping collapses
             "a and b or c",    // `and` before `or`
+            // postfix: field / index / deref / try, and chains + mixes
+            "a.b",             // field access
+            "a.b.c",           // field chain is left-deep: field(field(a,b),c)
+            "a[0]",            // index with a literal
+            "a[i][j]",         // index chain
+            "p.*",             // pointer deref
+            "x?",              // try
+            "a.b[c].d",        // mixed field/index/field chain
+            "- a.b",           // prefix binds looser than postfix: neg(field(a,b))
+            "!a.b",            // …and `not`
+            "p.*.x",           // deref then field: field(deref(p),x)
+            "a.b?",            // field then try: try(field(a,b))
+            "a.len + b.len",   // fields as binary operands
+            "arr[i + 1]",      // a binary expression inside an index
+            "a[i] < b[j]",     // indexed operands in a comparison
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");
@@ -5913,6 +5957,29 @@ mod c_oracle {
             let got = jestyr_expr_dump(&parser, probe.to_str().unwrap());
             let want = rust_expr_dump(src);
             assert_eq!(got, want, "expression AST dump diverged on `{src}`");
+        }
+    }
+
+    /// **P2 depth guard.** The Jestyr parser bounds AST *height* at `MAX_EXPR_DEPTH`
+    /// (like the reference), so adversarially-deep input terminates with a bounded tree
+    /// instead of overflowing. Two shapes stress different stacks: a left-deep fold
+    /// (`1+1+…`) parses iteratively but would overflow the *recursive dump* without the
+    /// height cap, and deep parens (`(((…)))`) would overflow the *parser's* recursion.
+    /// Building/running to completion (bounded output, no crash) is the check.
+    #[test]
+    fn jestyr_parser_bounds_deep_nesting() {
+        let parser = build_exe("examples/std/parser.jtr");
+        let deep_fold = "1+".repeat(20_000) + "1";
+        let deep_parens = format!("{}x{}", "(".repeat(20_000), ")".repeat(20_000));
+        for src in [deep_fold, deep_parens] {
+            let probe = std::env::temp_dir().join("jestyr_deep_probe.jtr");
+            std::fs::write(&probe, &src).unwrap();
+            let out = Command::new(&parser).arg(probe.to_str().unwrap()).output().unwrap();
+            assert!(out.status.success(), "parser did not terminate cleanly on {}-byte input", src.len());
+            // The tree is capped near MAX_EXPR_DEPTH, so the dump is bounded regardless of
+            // input size — an uncapped parser/dump would overflow (crash) on 20k nesting.
+            let lines = String::from_utf8(out.stdout).unwrap().lines().count();
+            assert!(lines > 0 && lines < 8_000, "dump not height-bounded: {lines} lines");
         }
     }
 
