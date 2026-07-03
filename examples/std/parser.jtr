@@ -56,7 +56,15 @@ struct TySpan { start: usize, end: usize }
 //   pos/n — the token cursor and count
 //   depth — current AST height on the path from the root (bumped on every deepening
 //           step, restored on unwind); `over` latches once the cap is exceeded.
-struct Parser { toks: List(tokens.Token), ex: List(ExprData), ar: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool }
+// `no_struct` suppresses `Name { … }` struct-literal parsing (set inside a control-flow
+// header so its `{` opens the body block, not a literal). Nothing sets it yet — control
+// flow (`if`/`match`/`for`) is a later slice — so it stays false and struct literals always
+// parse; it is threaded now so those headers only need to flip it.
+struct Parser { toks: List(tokens.Token), ex: List(ExprData), ar: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool, no_struct: bool }
+
+// The result of parsing a `{ field, …, ..spread }` initializer body: the field-init nodes'
+// slice into the arg arena, the optional spread expr (-1 if none), and the `}` end offset.
+struct FieldsResult { field_start: i32, field_count: i32, spread: i32, endp: usize }
 
 // ---- cursor helpers ----
 
@@ -139,6 +147,20 @@ fn mk_arraylit(mut p: Parser, start: usize, end: usize, elem_start: i32, elem_co
 fn mk_arrayrepeat(mut p: Parser, start: usize, end: usize, value: i32, count: i32) -> i32 {
     let id: i32 = list.len(ExprData, p.ex) as i32
     list.push(ExprData, p.ex, ExprData{ kind: 15, start: start, end: end, op: 0, a: value, b: count, x: 0 - 1, y: 0 - 1 })
+    return id
+}
+// A StructLit node `Path { fields, ..spread }`: `a`=path (a Name node), `b`=spread (-1 if
+// none), `(x, y)` = (field_start, field_count) of FieldInit nodes in the arg arena.
+fn mk_structlit(mut p: Parser, start: usize, end: usize, path: i32, spread: i32, field_start: i32, field_count: i32) -> i32 {
+    let id: i32 = list.len(ExprData, p.ex) as i32
+    list.push(ExprData, p.ex, ExprData{ kind: 16, start: start, end: end, op: 0, a: path, b: spread, x: field_start, y: field_count })
+    return id
+}
+// A FieldInit node `name: value`: `(x, y)` the name's source span, `a`=value. Stored as an
+// ordinary arena node so a StructLit's field list is just a run of ExprIds in the arg arena.
+fn mk_fieldinit(mut p: Parser, name_start: usize, name_end: usize, value: i32) -> i32 {
+    let id: i32 = list.len(ExprData, p.ex) as i32
+    list.push(ExprData, p.ex, ExprData{ kind: 18, start: name_start, end: name_end, op: 0, a: value, b: 0 - 1, x: name_start as i32, y: name_end as i32 })
     return id
 }
 fn node_start(read p: Parser, id: i32) -> usize {
@@ -239,6 +261,56 @@ fn starts_expr(read p: Parser) -> bool {
 // ---- the Pratt parser (mirrors parse_primary / parse_cast / parse_postfix / parse_unary
 //      / parse_binary in the reference) ----
 
+// Parse a `{ name: value, …, ..spread }` initializer body (cur is `{`). Field-init nodes
+// are buffered in a temp list, then appended contiguously to the arg arena (so a nested
+// struct/call in a field value doesn't scatter the slice). A leading `..expr` is a
+// functional-update spread and ends the list. Mirrors `parse_struct_lit`'s body.
+fn parse_fields(mut p: Parser) -> FieldsResult {
+    bump(p)                                        // consume `{`
+    var tmp: List(i32) = list.make(i32, p.alloc)
+    var spread: i32 = 0 - 1
+    var more: bool = true
+    for more {
+        let k: i32 = cur_kind(p)
+        if k == 66 { more = false }                // `}`
+        else if k == 110 { more = false }          // Eof
+        else if k == 74 {                          // `..` -> spread (last element)
+            bump(p)
+            spread = parse_expr(p)
+            more = false
+        } else {
+            let nt: tokens.Token = cur_tok(p)      // field name
+            if cur_kind(p) == 0 { bump(p) }        // consume the name ident
+            if cur_kind(p) == 71 { bump(p) }       // `:`
+            let value: i32 = parse_expr(p)
+            let fi: i32 = mk_fieldinit(p, nt.start, nt.end, value)
+            list.push(i32, tmp, fi)
+            if cur_kind(p) == 69 { bump(p) } else { more = false }   // `,`
+        }
+    }
+    var endp: usize = 0
+    if cur_kind(p) == 66 {                          // `}`
+        let rb: tokens.Token = cur_tok(p)
+        endp = rb.end
+        bump(p)
+    }
+    let field_start: i32 = list.len(i32, p.ar) as i32
+    let field_count: i32 = list.len(i32, tmp) as i32
+    var j: usize = 0
+    for j < list.len(i32, tmp) {
+        list.push(i32, p.ar, list.get(i32, tmp, j))
+        j = j + 1
+    }
+    return FieldsResult{ field_start: field_start, field_count: field_count, spread: spread, endp: endp }
+}
+
+// `Path { … }` — a struct literal. `path` is the already-built Name node, `start` its span
+// start; the span runs to the closing `}`.
+fn parse_struct_lit(mut p: Parser, path: i32, start: usize) -> i32 {
+    let fr: FieldsResult = parse_fields(p)
+    return mk_structlit(p, start, fr.endp, path, fr.spread, fr.field_start, fr.field_count)
+}
+
 // A leaf or a parenthesized group. `( e )` returns the inner expression unchanged
 // (grouping only, its own span). An unhandled token yields an `Error` node so the walk
 // still terminates.
@@ -254,10 +326,14 @@ fn parse_primary(mut p: Parser) -> i32 {
         bump(p)
         return mk(p, 1, t.start, t.end, 0, 0 - 1, 0 - 1)
     }
-    if k == 0 {                                    // Ident -> Name
+    if k == 0 {                                    // Ident -> Name, or a struct literal
         let t: tokens.Token = cur_tok(p)
         bump(p)
-        return mk(p, 2, t.start, t.end, 0, 0 - 1, 0 - 1)
+        let nm: i32 = mk(p, 2, t.start, t.end, 0, 0 - 1, 0 - 1)
+        if cur_kind(p) == 65 {                     // `{` -> `Path { … }` (unless suppressed)
+            if !p.no_struct { return parse_struct_lit(p, nm, t.start) }
+        }
+        return nm
     }
     if k == 63 {                                   // '(' grouping
         bump(p)
@@ -681,6 +757,21 @@ fn dump(read p: Parser, id: i32) {
         print_str("arrayrepeat") print_uint(d.start) print_uint(d.end)
         dump(p, d.a)
         dump(p, d.b)
+    } else if d.kind == 16 {
+        // StructLit: field count, path (a Name node), optional spread, then each FieldInit.
+        print_str("structlit") print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
+        dump(p, d.a)
+        dump_opt(p, d.b)
+        var i: i32 = 0
+        for i < d.y {
+            let fid: i32 = list.get(i32, p.ar, (d.x + i) as usize)
+            dump(p, fid)
+            i = i + 1
+        }
+    } else if d.kind == 18 {
+        // FieldInit: the name's source span (x, y), then the value.
+        print_str("fieldinit") print_int(d.x as i64) print_int(d.y as i64)
+        dump(p, d.a)
     } else {
         print_str("error") print_uint(d.start) print_uint(d.end)
     }
@@ -691,7 +782,7 @@ fn dump(read p: Parser, id: i32) {
 fn parse_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Allocator) {
     var tk: List(tokens.Token) = tokens.tokenize(src, it, kwcount, a)
     let n: usize = list.len(tokens.Token, tk)
-    var p: Parser = Parser{ toks: tk, ex: list.make(ExprData, a), ar: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false }
+    var p: Parser = Parser{ toks: tk, ex: list.make(ExprData, a), ar: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
     let root: i32 = parse_expr(p)
     dump(p, root)
 }
@@ -706,7 +797,7 @@ fn main() -> i32 {
         parse_and_dump(string_view(src), it, kwcount, a)
         string_free(src)
     } else {
-        let sample: str = "[a, 1 + 2, f(x)]"
+        let sample: str = "Point{ x: 1, y: a + b, ..base }"
         parse_and_dump(sample, it, kwcount, a)
     }
     return 0

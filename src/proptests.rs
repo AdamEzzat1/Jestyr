@@ -5964,6 +5964,29 @@ mod c_oracle {
                 ref_dump_expr(ast, *value, out);
                 ref_dump_expr(ast, *count, out);
             }
+            // StructLit: field count, the path (as a synthetic `(name span)` node matching
+            // the Jestyr parser), the optional spread, then each field as
+            // `(fieldinit <name span> <value>)`.
+            ExprKind::StructLit { path, fields, spread } => {
+                out.push("structlit".to_string());
+                out.push(fields.len().to_string());
+                out.push(s);
+                out.push(en);
+                out.push("(".to_string());
+                out.push("name".to_string());
+                out.push(path.span.start.to_string());
+                out.push(path.span.end.to_string());
+                out.push(")".to_string());
+                ref_dump_opt(ast, *spread, out);
+                for f in fields {
+                    out.push("(".to_string());
+                    out.push("fieldinit".to_string());
+                    out.push(f.name.span.start.to_string());
+                    out.push(f.name.span.end.to_string());
+                    ref_dump_expr(ast, f.value, out);
+                    out.push(")".to_string());
+                }
+            }
             // Any construct the P2 slice does not yet build dumps as `error`; the golden
             // corpus is curated to the handled constructs, so this arm stays unexercised.
             _ => {
@@ -6085,6 +6108,13 @@ mod c_oracle {
             "[0; 10]",         // `[value; count]` repeat
             "[a + b; n]",      // repeat with expression value/count
             "[x][0]",          // an array literal then an index: index(array, 0)
+            // struct literals: fields, spread, nesting, empty
+            "Point{ x: 1, y: 2 }",       // named fields
+            "P{ a: f(x) }",              // a call as a field value
+            "Config{ x: 1, ..base }",    // functional-update spread
+            "Wrap{ inner: Point{ x: 1, y: 2 } }", // nested struct literal
+            "Empty{}",                   // no fields
+            "Line{ a: p, b: q, }",       // trailing comma
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");
