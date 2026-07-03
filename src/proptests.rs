@@ -5929,6 +5929,17 @@ mod c_oracle {
                 out.push(s);
                 out.push(en);
             }
+            ExprKind::Char(_) => {
+                out.push("char".to_string());
+                out.push(s);
+                out.push(en);
+            }
+            ExprKind::Bool(b) => {
+                out.push("bool".to_string());
+                out.push(if *b { "1" } else { "0" }.to_string());
+                out.push(s);
+                out.push(en);
+            }
             ExprKind::Unary { op, rhs } => {
                 out.push("unary".to_string());
                 out.push(ref_unop_label(*op).to_string());
@@ -6320,6 +6331,13 @@ mod c_oracle {
             "unsafe { let v = q  v }",   // unsafe block with statements
             "{ if a { 1 } else { 2 } }", // an if as a block statement (block-only position)
             "if a { let x = 1  x } else { 0 }", // then-block with statements + tail
+            // char and bool literal leaves
+            "'a'",                       // a char literal
+            "true",                      // bool true
+            "false",                     // bool false
+            "c == 'x'",                  // char literal as a binary operand
+            "flag or false",             // bool literal as a binary operand
+            "if true { 1 } else { 0 }",  // bool literal as an if condition
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");

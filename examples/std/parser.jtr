@@ -39,7 +39,7 @@ import "tokens"
 // One arena node. `kind`: 0=Int 1=Float 2=Name 3=Unary 4=Binary 5=Field 6=Index 7=Deref
 // 8=Try 9=Error 10=Call 11=Cast 12=Assign 13=Range 14=ArrayLit 15=ArrayRepeat 16=StructLit
 // 17=GenStructLit 18=FieldInit 19=SelfValue 20=SelfType 21=Attr 22=FString 23=Block 24=If
-// 25=Unsafe. `a`/`b` are child `ExprId`s: unary/postfix use `a` for the
+// 25=Unsafe 26=Char 27=Bool. `a`/`b` are child `ExprId`s: unary/postfix use `a` for the
 // operand/base, binary uses `a`=lhs `b`=rhs, index uses `a`=base `b`=index, call/cast use
 // `a`=callee/expr. `x`/`y` are auxiliary integers: Field stores its name's source span
 // `(x, y)`; Call stores `(arg_start, arg_count)` into the arg arena; Cast stores its
@@ -577,6 +577,21 @@ fn parse_primary(mut p: Parser) -> i32 {
         bump(p)
         return mk(p, 1, t.start, t.end, 0, 0 - 1, 0 - 1)
     }
+    if k == 5 {                                    // Char literal
+        let t: tokens.Token = cur_tok(p)
+        bump(p)
+        return mk(p, 26, t.start, t.end, 0, 0 - 1, 0 - 1)
+    }
+    if k == 58 {                                   // `true`
+        let t: tokens.Token = cur_tok(p)
+        bump(p)
+        return mk(p, 27, t.start, t.end, 1, 0 - 1, 0 - 1)
+    }
+    if k == 59 {                                   // `false`
+        let t: tokens.Token = cur_tok(p)
+        bump(p)
+        return mk(p, 27, t.start, t.end, 0, 0 - 1, 0 - 1)
+    }
     if k == 0 {                                    // Ident -> Name, or a struct literal
         let t: tokens.Token = cur_tok(p)
         bump(p)
@@ -1068,6 +1083,11 @@ fn dump(read src: str, read p: Parser, id: i32) {
         print_str("float") print_uint(d.start)   print_uint(d.end)
     } else if d.kind == 2 {
         print_str("name")  print_uint(d.start)   print_uint(d.end)
+    } else if d.kind == 26 {
+        print_str("char")  print_uint(d.start)   print_uint(d.end)
+    } else if d.kind == 27 {
+        // Bool: `op` is 1 for `true`, 0 for `false`.
+        print_str("bool")  print_int(d.op as i64) print_uint(d.start) print_uint(d.end)
     } else if d.kind == 3 {
         print_str("unary") unop_label(d.op)  print_uint(d.start) print_uint(d.end)
         dump(src, p, d.a)
