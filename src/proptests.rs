@@ -6033,6 +6033,26 @@ mod c_oracle {
                 out.push(s);
                 out.push(en);
             }
+            // FString: part count, expr count, span; then each literal part's *text*, then
+            // each interpolation's *name text*. Text (not spans) is the canonical form because
+            // the interpolation `Name` nodes all carry the whole f-string span — see
+            // parse_fstring. The Jestyr side reproduces the same text by slicing `src`.
+            ExprKind::FString { parts, exprs } => {
+                out.push("fstring".to_string());
+                out.push(parts.len().to_string());
+                out.push(exprs.len().to_string());
+                out.push(s);
+                out.push(en);
+                for part in parts {
+                    out.push(part.clone());
+                }
+                for e in exprs {
+                    match &ast.expr_at(*e).kind {
+                        ExprKind::Name(id) => out.push(id.name.clone()),
+                        _ => out.push(String::new()),
+                    }
+                }
+            }
             // Any construct the P2 slice does not yet build dumps as `error`; the golden
             // corpus is curated to the handled constructs, so this arm stays unexercised.
             _ => {
@@ -6180,6 +6200,16 @@ mod c_oracle {
             "@align(16)",                // a callable attribute: call(attr, 16)
             "@repr(C)",                  // callable attr with a Name argument
             "@address(0x10)",            // callable attr with a hex-literal argument
+            // f-strings: literal parts + `{ident}` interpolations (dumped as text, since the
+            // reference's interpolation Name nodes all carry the whole f-string span)
+            "f\"hello\"",                // one literal part, no interpolation
+            "f\"x = {x}\"",              // one interpolation with surrounding text
+            "f\"a {x} b\"",              // parts carry leading/trailing spaces
+            "f\"{x}\"",                  // empty parts on both sides of the interpolation
+            "f\"{x}{y}\"",               // adjacent interpolations (three empty parts)
+            "f\"sum={a}+{b}\"",          // two interpolations with a literal between
+            "f\"{ x }\"",                // whitespace inside the braces is trimmed
+            "f\"\"",                     // empty f-string (one empty part)
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");
