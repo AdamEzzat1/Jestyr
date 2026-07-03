@@ -38,8 +38,8 @@ import "tokens"
 
 // One arena node. `kind`: 0=Int 1=Float 2=Name 3=Unary 4=Binary 5=Field 6=Index 7=Deref
 // 8=Try 9=Error 10=Call 11=Cast 12=Assign 13=Range 14=ArrayLit 15=ArrayRepeat 16=StructLit
-// 17=GenStructLit 18=FieldInit 19=SelfValue 20=SelfType 21=Attr 22=FString. `a`/`b` are
-// child `ExprId`s: unary/postfix use `a` for the
+// 17=GenStructLit 18=FieldInit 19=SelfValue 20=SelfType 21=Attr 22=FString 23=Block. `a`/`b`
+// are child `ExprId`s: unary/postfix use `a` for the
 // operand/base, binary uses `a`=lhs `b`=rhs, index uses `a`=base `b`=index, call/cast use
 // `a`=callee/expr. `x`/`y` are auxiliary integers: Field stores its name's source span
 // `(x, y)`; Call stores `(arg_start, arg_count)` into the arg arena; Cast stores its
@@ -66,7 +66,18 @@ struct TySpan { start: usize, end: usize }
 // header so its `{` opens the body block, not a literal). Nothing sets it yet — control
 // flow (`if`/`match`/`for`) is a later slice — so it stays false and struct literals always
 // parse; it is threaded now so those headers only need to flip it.
-struct Parser { toks: List(tokens.Token), ex: List(ExprData), ar: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool, no_struct: bool }
+// One statement arena node (`StmtId` = index into `st`). `kind`: 0=Let 1=Return 2=Expr.
+//   Let:    `op`=mutbl (0=`let`, 1=`var`); `a`=init `ExprId` (-1 if none); `(x, y)`=the
+//           variable name's source span; `(ts, te)`=the type annotation's source span
+//           (`ts`=-1 when there is no `: T`). `start`/`end` = the whole statement span.
+//   Return: `a`=value `ExprId` (-1 if bare). `start`/`end` = the statement span.
+//   Expr:   `a`=the expression `ExprId`. (No own span — the dump uses the expr's.)
+struct StmtData { kind: i32, start: usize, end: usize, op: i32, a: i32, x: i32, y: i32, ts: i32, te: i32 }
+
+// `st` is the statement arena; `sar` is the statement-id child arena a Block node slices
+// via `(stmt_start, stmt_count)` (buffered-then-appended like `ar`, so a nested block's
+// statements don't scatter the enclosing block's slice).
+struct Parser { toks: List(tokens.Token), ex: List(ExprData), ar: List(i32), st: List(StmtData), sar: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool, no_struct: bool }
 
 // The result of parsing a `{ field, …, ..spread }` initializer body: the field-init nodes'
 // slice into the arg arena, the optional spread expr (-1 if none), and the `}` end offset.
@@ -84,6 +95,14 @@ fn cur_tok(read p: Parser) -> tokens.Token {
     return list.get(tokens.Token, p.toks, p.pos)
 }
 fn bump(mut p: Parser) { p.pos = p.pos + 1 }
+
+// The end offset of the previously consumed token (the reference's `prev_span().end`), used
+// for a statement span that runs to its last token.
+fn prev_end(read p: Parser) -> usize {
+    if p.pos == 0 { let t: tokens.Token = list.get(tokens.Token, p.toks, 0)  return t.end }
+    let t: tokens.Token = list.get(tokens.Token, p.toks, p.pos - 1)
+    return t.end
+}
 
 // The deepest expression nesting the parser will build before bailing to an `Error` node,
 // matching the reference's `MAX_EXPR_DEPTH`. Bounds AST *height* — so a left-deep fold
@@ -183,6 +202,31 @@ fn mk_fieldinit(mut p: Parser, name_start: usize, name_end: usize, value: i32) -
 fn mk_attr(mut p: Parser, start: usize, end: usize, name_start: usize, name_end: usize) -> i32 {
     let id: i32 = list.len(ExprData, p.ex) as i32
     list.push(ExprData, p.ex, ExprData{ kind: 21, start: start, end: end, op: 0, a: 0 - 1, b: 0 - 1, x: name_start as i32, y: name_end as i32 })
+    return id
+}
+// A Block expression `{ stmts }` (kind 23): `(x, y)` = (stmt_start, stmt_count) into `sar`.
+fn mk_block(mut p: Parser, start: usize, end: usize, stmt_start: i32, stmt_count: i32) -> i32 {
+    let id: i32 = list.len(ExprData, p.ex) as i32
+    list.push(ExprData, p.ex, ExprData{ kind: 23, start: start, end: end, op: 0, a: 0 - 1, b: 0 - 1, x: stmt_start, y: stmt_count })
+    return id
+}
+// A `let`/`var` statement: `op`=mutbl, `(x,y)`=name span, `(ts,te)`=type span (ts=-1 none),
+// `a`=init ExprId (-1 none).
+fn mk_let(mut p: Parser, start: usize, end: usize, mutbl: i32, ns: usize, ne: usize, ts: i32, te: i32, init: i32) -> i32 {
+    let id: i32 = list.len(StmtData, p.st) as i32
+    list.push(StmtData, p.st, StmtData{ kind: 0, start: start, end: end, op: mutbl, a: init, x: ns as i32, y: ne as i32, ts: ts, te: te })
+    return id
+}
+// A `return [expr]` statement: `a`=value ExprId (-1 if bare).
+fn mk_return(mut p: Parser, start: usize, end: usize, value: i32) -> i32 {
+    let id: i32 = list.len(StmtData, p.st) as i32
+    list.push(StmtData, p.st, StmtData{ kind: 1, start: start, end: end, op: 0, a: value, x: 0 - 1, y: 0 - 1, ts: 0 - 1, te: 0 - 1 })
+    return id
+}
+// An expression statement: `a`=the expression (its own span drives the dump).
+fn mk_exprstmt(mut p: Parser, e: i32) -> i32 {
+    let id: i32 = list.len(StmtData, p.st) as i32
+    list.push(StmtData, p.st, StmtData{ kind: 2, start: 0, end: 0, op: 0, a: e, x: 0 - 1, y: 0 - 1, ts: 0 - 1, te: 0 - 1 })
     return id
 }
 fn node_start(read p: Parser, id: i32) -> usize {
@@ -369,6 +413,105 @@ fn parse_fstring(mut p: Parser, start: usize, end: usize) -> i32 {
     return mk(p, 22, start, end, 0, 0 - 1, 0 - 1)
 }
 
+// A brace-delimited block `{ stmt … }` (cur is `{`) as a Block expression. Statements are
+// buffered in a temp list then appended contiguously to `sar` (so a nested block's
+// statements don't scatter this block's slice). `;` between statements is optional. Mirrors
+// `parse_block` in the reference (which re-enables struct literals inside the body). The
+// block's value, if any, is just its last statement being an expression — no separate tail.
+fn parse_block(mut p: Parser) -> i32 {
+    let lb: tokens.Token = cur_tok(p)
+    let start: usize = lb.start
+    bump(p)                                        // consume `{`
+    let saved_ns: bool = p.no_struct
+    p.no_struct = false                            // struct literals are fine inside a block
+    var tmp: List(i32) = list.make(i32, p.alloc)
+    var more: bool = true
+    for more {
+        let k: i32 = cur_kind(p)
+        if k == 66 { more = false }                // `}`
+        else if k == 110 { more = false }          // Eof
+        else {
+            let before: usize = p.pos
+            let sid: i32 = parse_stmt(p)
+            list.push(i32, tmp, sid)
+            if cur_kind(p) == 70 { bump(p) }       // optional `;` separator
+            if p.pos == before { bump(p) }         // guarantee progress on stuck input
+        }
+    }
+    var endp: usize = start
+    if cur_kind(p) == 66 {                          // `}`
+        let rb: tokens.Token = cur_tok(p)
+        endp = rb.end
+        bump(p)
+    }
+    let stmt_start: i32 = list.len(i32, p.sar) as i32
+    let stmt_count: i32 = list.len(i32, tmp) as i32
+    var j: usize = 0
+    for j < list.len(i32, tmp) {
+        list.push(i32, p.sar, list.get(i32, tmp, j))
+        j = j + 1
+    }
+    p.no_struct = saved_ns
+    return mk_block(p, start, endp, stmt_start, stmt_count)
+}
+
+// One statement: `let`/`var` binding, `return`, a block-led expression (block-only, so a
+// trailing operator can't extend it — statement position), or a plain expression statement.
+// Mirrors `parse_stmt` in the reference. Returns a `StmtId`.
+fn parse_stmt(mut p: Parser) -> i32 {
+    let k: i32 = cur_kind(p)
+    if k == 28 {                                   // return
+        let rt: tokens.Token = cur_tok(p)
+        let start: usize = rt.start
+        bump(p)
+        var value: i32 = 0 - 1
+        let nk: i32 = cur_kind(p)
+        if nk == 66 { value = 0 - 1 }              // `}` -> bare return
+        else if nk == 70 { value = 0 - 1 }         // `;`
+        else if nk == 110 { value = 0 - 1 }        // Eof
+        else { value = parse_expr(p) }
+        var endp: usize = rt.end
+        if value >= 0 { endp = node_end(p, value) }
+        return mk_return(p, start, endp, value)
+    }
+    if k == 8 or k == 9 {                          // let / var
+        var mutbl: i32 = 0
+        if k == 9 { mutbl = 1 }                    // `var` is mutable
+        let lt: tokens.Token = cur_tok(p)
+        let start: usize = lt.start
+        bump(p)
+        var ns: usize = start                      // the variable name's span
+        var ne: usize = start
+        if cur_kind(p) == 0 { let nt: tokens.Token = cur_tok(p)  ns = nt.start  ne = nt.end  bump(p) }
+        var ts: i32 = 0 - 1                        // optional `: T` type annotation
+        var te: i32 = 0 - 1
+        if cur_kind(p) == 71 {                      // `:`
+            bump(p)
+            let ty: TySpan = parse_type(p)
+            ts = ty.start as i32
+            te = ty.end as i32
+        }
+        var init: i32 = 0 - 1                       // optional `= expr` initializer
+        if cur_kind(p) == 84 { bump(p)  init = parse_expr(p) }   // `=`
+        return mk_let(p, start, prev_end(p), mutbl, ns, ne, ts, te, init)
+    }
+    // Block-led expressions in statement position parse *block-only* (no trailing operator).
+    // For this slice only `{ … }` is handled; `if`/`match`/`unsafe` join in a later slice.
+    if k == 65 {                                   // `{`
+        let e: i32 = parse_block_like(p)
+        return mk_exprstmt(p, e)
+    }
+    let e: i32 = parse_expr(p)
+    return mk_exprstmt(p, e)
+}
+
+// Dispatch a block-led expression in statement position (block form only). For now just the
+// bare block; `if`/`match`/`unsafe` are added with their parsers. Mirrors `parse_block_like`.
+fn parse_block_like(mut p: Parser) -> i32 {
+    if cur_kind(p) == 65 { return parse_block(p) }   // `{`
+    return parse_expr(p)
+}
+
 // A leaf or a parenthesized group. `( e )` returns the inner expression unchanged
 // (grouping only, its own span). An unhandled token yields an `Error` node so the walk
 // still terminates.
@@ -397,6 +540,9 @@ fn parse_primary(mut p: Parser) -> i32 {
         let t: tokens.Token = cur_tok(p)
         bump(p)
         return parse_fstring(p, t.start, t.end)
+    }
+    if k == 65 {                                   // `{` -> Block expression
+        return parse_block(p)
     }
     if k == 61 {                                   // self -> SelfValue
         let t: tokens.Token = cur_tok(p)
@@ -834,6 +980,27 @@ fn dump_fstring(read src: str, start: usize, end: usize) {
     }
 }
 
+// Dump one statement. `let`: mutbl flag, name span, statement span, an optional `(type s e)`
+// (or `(none)`), then the optional initializer. `return`: statement span then the optional
+// value. `exprstmt`: just the wrapped expression. Mirrors `ref_dump_stmt` in the reference.
+fn dump_stmt(read src: str, read p: Parser, sid: i32) {
+    let s: StmtData = list.get(StmtData, p.st, sid as usize)
+    print_str("(")
+    if s.kind == 0 {
+        print_str("let") print_int(s.op as i64) print_int(s.x as i64) print_int(s.y as i64) print_uint(s.start) print_uint(s.end)
+        if s.ts < 0 { print_str("(") print_str("none") print_str(")") }
+        else { print_str("(") print_str("type") print_int(s.ts as i64) print_int(s.te as i64) print_str(")") }
+        dump_opt(src, p, s.a)
+    } else if s.kind == 1 {
+        print_str("return") print_uint(s.start) print_uint(s.end)
+        dump_opt(src, p, s.a)
+    } else {
+        print_str("exprstmt")
+        dump(src, p, s.a)
+    }
+    print_str(")")
+}
+
 // Emit a flattened S-expression: `(`, the head atoms (kind label, operator/aux, start,
 // end), then each child's dump in order, then `)` — one atom per line.
 fn dump(read src: str, read p: Parser, id: i32) {
@@ -944,6 +1111,15 @@ fn dump(read src: str, read p: Parser, id: i32) {
     } else if d.kind == 22 {
         // FString: re-scan the token span from src for its parts + interpolation names.
         dump_fstring(src, d.start, d.end)
+    } else if d.kind == 23 {
+        // Block: statement count, span, then each statement (from the statement-id arena).
+        print_str("block") print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
+        var i: i32 = 0
+        for i < d.y {
+            let sid: i32 = list.get(i32, p.sar, (d.x + i) as usize)
+            dump_stmt(src, p, sid)
+            i = i + 1
+        }
     } else {
         print_str("error") print_uint(d.start) print_uint(d.end)
     }
@@ -954,7 +1130,7 @@ fn dump(read src: str, read p: Parser, id: i32) {
 fn parse_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Allocator) {
     var tk: List(tokens.Token) = tokens.tokenize(src, it, kwcount, a)
     let n: usize = list.len(tokens.Token, tk)
-    var p: Parser = Parser{ toks: tk, ex: list.make(ExprData, a), ar: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
+    var p: Parser = Parser{ toks: tk, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
     let root: i32 = parse_expr(p)
     dump(src, p, root)
 }

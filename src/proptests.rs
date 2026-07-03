@@ -5835,6 +5835,73 @@ mod c_oracle {
         }
     }
 
+    /// Dump one statement (matching the Jestyr `dump_stmt`): `(let <mutbl> <name span>
+    /// <stmt span> <type-opt> <init-opt>)`, `(return <stmt span> <value-opt>)`, or
+    /// `(exprstmt <expr>)`.
+    fn ref_dump_stmt(ast: &crate::ast::Ast, st: &crate::ast::Stmt, out: &mut Vec<String>) {
+        use crate::ast::Stmt;
+        out.push("(".to_string());
+        match st {
+            Stmt::Let { mutbl, name, ty, init, span } => {
+                out.push("let".to_string());
+                out.push(if *mutbl { "1" } else { "0" }.to_string());
+                out.push(name.span.start.to_string());
+                out.push(name.span.end.to_string());
+                out.push(span.start.to_string());
+                out.push(span.end.to_string());
+                match ty {
+                    Some(tid) => {
+                        let tsp = ast.type_at(*tid).span;
+                        out.push("(".to_string());
+                        out.push("type".to_string());
+                        out.push(tsp.start.to_string());
+                        out.push(tsp.end.to_string());
+                        out.push(")".to_string());
+                    }
+                    None => {
+                        out.push("(".to_string());
+                        out.push("none".to_string());
+                        out.push(")".to_string());
+                    }
+                }
+                ref_dump_opt(ast, *init, out);
+            }
+            Stmt::Return { value, span } => {
+                out.push("return".to_string());
+                out.push(span.start.to_string());
+                out.push(span.end.to_string());
+                ref_dump_opt(ast, *value, out);
+            }
+            Stmt::Expr(id) => {
+                out.push("exprstmt".to_string());
+                ref_dump_expr(ast, *id, out);
+            }
+        }
+        out.push(")".to_string());
+    }
+
+    /// The atoms of a block body — `block`, statement count, span, each statement — with NO
+    /// surrounding parens (the caller wraps: `ref_dump_expr`'s outer parens for a `Block`
+    /// expr, or `ref_dump_block` for a block nested in `if`/`unsafe`).
+    fn ref_dump_block_body(ast: &crate::ast::Ast, b: &crate::ast::Block, out: &mut Vec<String>) {
+        out.push("block".to_string());
+        out.push(b.stmts.len().to_string());
+        out.push(b.span.start.to_string());
+        out.push(b.span.end.to_string());
+        for st in &b.stmts {
+            ref_dump_stmt(ast, st, out);
+        }
+    }
+
+    /// A parenthesized block, for blocks that are a *child* of another node (`if`'s `then`,
+    /// `unsafe`'s body) rather than an `ExprKind::Block` reached through `ref_dump_expr`.
+    #[allow(dead_code)]
+    fn ref_dump_block(ast: &crate::ast::Ast, b: &crate::ast::Block, out: &mut Vec<String>) {
+        out.push("(".to_string());
+        ref_dump_block_body(ast, b, out);
+        out.push(")".to_string());
+    }
+
     /// The Rust *reference* canonical AST dump for one expression node: a flattened
     /// S-expression, one atom per line — `(`, the kind label, (operator label,) the
     /// span `start`/`end`, then each child's dump in order, then `)`. A **pure function
@@ -6053,6 +6120,11 @@ mod c_oracle {
                     }
                 }
             }
+            // Block: `block`, statement count, span, then each statement. (ref_dump_expr's
+            // own outer parens wrap this — so we emit the body atoms only.)
+            ExprKind::Block(b) => {
+                ref_dump_block_body(ast, b, out);
+            }
             // Any construct the P2 slice does not yet build dumps as `error`; the golden
             // corpus is curated to the handled constructs, so this arm stays unexercised.
             _ => {
@@ -6210,6 +6282,18 @@ mod c_oracle {
             "f\"sum={a}+{b}\"",          // two interpolations with a literal between
             "f\"{ x }\"",                // whitespace inside the braces is trimmed
             "f\"\"",                     // empty f-string (one empty part)
+            // blocks + statements: let/var/return/expr-stmt, tail expr, nesting, empty
+            "{ 1 }",                     // a block whose value is a tail expression
+            "{ }",                       // an empty block
+            "{ a  b }",                  // two expression statements
+            "{ a; b; c }",               // explicit `;` separators
+            "{ let x = 1  x }",          // a `let` then a tail expression
+            "{ var y = 0  y = y + 1  y }", // `var`, an assignment statement, a tail
+            "{ let x: i32 = 5  return x }", // a typed `let` and a `return` with a value
+            "{ return }",                // a bare `return` (no value)
+            "{ let p = f(a, b)  p.field }", // a call initializer, a field tail
+            "{ { 1 } }",                 // a nested block as the tail
+            "{ let q: *mut u8 = p  q.* }", // pointer-type annotation + deref tail
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");
