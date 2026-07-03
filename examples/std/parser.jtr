@@ -2,29 +2,30 @@
 // the shared tokenizer (`tokens.tokenize`) in-process and builds an expression AST as an
 // **arena** — a `List(ExprData)` addressed by integer ids — mirroring the Rust reference
 // (`src/parser.rs`, `src/ast.rs`), which stores its AST as arena vectors indexed by
-// `ExprId(u32)`. Representing the tree as a flat list + integer child ids (rather than a
-// recursive enum) dodges recursive-ownership questions and matches the reference 1:1,
-// which is what makes the AST-dump cross-check align.
+// `ExprId(u32)`. A node references its children by id, not by owned pointer, which dodges
+// recursive-ownership questions and matches the reference 1:1 (what makes the AST-dump
+// cross-check align).
 //
-// **This first slice** is the Pratt (precedence-climbing) core: integer/float literals,
-// identifiers, prefix unary (`-`/`!`/`not`/`~`/`&`), the full binary-operator precedence
-// table (matching `bin_op` in the reference), and `( … )` grouping. Assignment, ranges,
-// casts, postfix (call/field/index/`?`/`.*`), and the composite forms
-// (`if`/`match`/struct-literals/…) are later increments; the golden runs on a curated
-// expression corpus that uses only the constructs handled here, and grows with the parser.
+// **Current coverage** (the Pratt precedence-climbing core, grown construct by construct):
+// integer/float/name leaves; prefix unary (`-`/`!`/`not`/`~`/`&`); the full binary
+// precedence table; `( … )` grouping; postfix `.field` / `[index]` / `.*` (deref) / `?`
+// (try) / `(args)` (call); and `as` casts (named + pointer types). Struct/array literals,
+// ranges, assignment, `if`/`match`/blocks are later slices; the golden corpus is curated
+// to the handled constructs and grows with the parser.
 //
-// Verification: `dump` emits a canonical **flattened S-expression** — one atom per line,
-// parens as their own atoms — that is a pure function of the AST (node kind + operator
-// label + span, children in order). The Rust reference emits the identical line stream
-// via `parse_expr_only` + a matching dumper; the cross-check diffs the two over the corpus
-// (`jestyr_parser_expr_dump_matches_reference`). Spans are exact: leaf = token span,
-// unary = `op.start .. rhs.end`, binary = `lhs.start .. rhs.end` (the reference's `Span::to`).
+// The parser state is a single `Parser` value threaded `mut` through the recursive
+// descent — mirroring the reference, where `Ast` owns the arenas and `Parser` holds them.
+// It bundles the token vector, the expression arena, a **call-arg arena** (`ar` — a
+// `List(i32)` of `ExprId`s that a Call node slices, since a node can't hold a variable
+// number of children), the cursor, and the nesting-depth guard.
 //
-// Design note — arenas are threaded, not nested: the node arena `List(ExprData)` and the
-// token vector are passed as standalone `mut`/`read` parameters (plus a small scalar
-// `Cur` cursor), never stored inside a parser struct — a generic `List` embedded by value
-// in another struct is not yet ordered correctly by cgen. This matches the reference,
-// where `Ast` owns the vectors and the `Parser` borrows them.
+// Verification: `dump` emits a canonical **flattened S-expression** — one atom per line
+// (node kind + operator/aux + exact span + children in order) — a pure function of the
+// arena. The Rust reference emits the identical stream via `Parser::parse_single_expr` +
+// `ref_dump_expr`; `jestyr_parser_expr_dump_matches_reference` diffs them over the corpus.
+// A `MAX_EXPR_DEPTH` guard bounds AST *height* so adversarial nesting errors (a bounded
+// `Error` node) instead of overflowing the parser — or the recursive `dump` — stack
+// (`jestyr_parser_bounds_deep_nesting`).
 import "mem"
 import "intern"
 import "fs"
@@ -32,98 +33,114 @@ import "env"
 import "list"
 import "tokens"
 
-// One arena node. `kind`: 0=Int 1=Float 2=Name 3=Unary 4=Binary 9=Error. `start`/`end`
-// are the source span. `op` is the operator code (unary or binary; 0 for leaves). `a`/`b`
-// are child `ExprId`s (arena indices): unary uses `a` (the operand), binary uses `a` (lhs)
-// and `b` (rhs); `-1` means "none".
 // One arena node. `kind`: 0=Int 1=Float 2=Name 3=Unary 4=Binary 5=Field 6=Index 7=Deref
-// 8=Try 9=Error. `a`/`b` are child `ExprId`s (unary/postfix use `a` for the operand/base,
-// binary uses `a`=lhs `b`=rhs, index uses `a`=base `b`=index). `x`/`y` are auxiliary
-// integers: a Field stores its name's source span in `(x, y)`; other kinds leave them -1.
+// 8=Try 9=Error 10=Call 11=Cast. `a`/`b` are child `ExprId`s: unary/postfix use `a` for
+// the operand/base, binary uses `a`=lhs `b`=rhs, index uses `a`=base `b`=index, call/cast
+// use `a`=callee/expr. `x`/`y` are auxiliary integers: Field stores its name's source span
+// `(x, y)`; Call stores `(arg_start, arg_count)` into the arg arena; Cast stores its
+// type's source span `(x, y)`. Unused aux fields are -1.
 struct ExprData { kind: i32, start: usize, end: usize, op: i32, a: i32, b: i32, x: i32, y: i32 }
 
 // A binary-operator lookup: whether `k` is an infix operator, its left/right binding
 // powers (precedence climbing), and its `BinOp` code. Mirrors `bin_op` in the reference.
 struct BinInfo { ok: bool, lbp: i32, rbp: i32, code: i32 }
 
-// The token cursor plus the expression-nesting guard. `pos`/`n` are the token index and
-// count; `depth` is the current AST height on the path from the root (bumped on every
-// deepening step, restored on unwind), and `over` latches once the cap is exceeded.
-// Scalar-only, so it is safe to pass `mut` (an in-out reference). Mirrors the reference
-// parser's `expr_depth`/`MAX_EXPR_DEPTH` guard: a program nested past the cap errors
-// (a bounded `Error` node) instead of overflowing the parser's — or the dump's — stack.
-struct Cur { pos: usize, n: usize, depth: i32, over: bool }
+// A parsed type's source span (this slice only needs the span, not a structural type
+// node — the cast dump verifies the type by its `[start, end)` bytes).
+struct TySpan { start: usize, end: usize }
+
+// The whole parser state, threaded `mut` through the recursive descent:
+//   toks  — the token vector (read-only input)
+//   ex    — the expression arena (`ExprId` = index)
+//   ar    — the call-arg arena: `ExprId`s a Call node slices via (arg_start, arg_count)
+//   pos/n — the token cursor and count
+//   depth — current AST height on the path from the root (bumped on every deepening
+//           step, restored on unwind); `over` latches once the cap is exceeded.
+struct Parser { toks: List(tokens.Token), ex: List(ExprData), ar: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool }
 
 // ---- cursor helpers ----
 
 // The kind of the current token, or 110 (Eof) past the end.
-fn cur_kind(read tk: List(tokens.Token), c: Cur) -> i32 {
-    if c.pos >= c.n { return 110 }
-    let t: tokens.Token = list.get(tokens.Token, tk, c.pos)
+fn cur_kind(read p: Parser) -> i32 {
+    if p.pos >= p.n { return 110 }
+    let t: tokens.Token = list.get(tokens.Token, p.toks, p.pos)
     return t.kind
 }
-fn cur_tok(read tk: List(tokens.Token), c: Cur) -> tokens.Token {
-    return list.get(tokens.Token, tk, c.pos)
+fn cur_tok(read p: Parser) -> tokens.Token {
+    return list.get(tokens.Token, p.toks, p.pos)
 }
-fn bump(mut c: Cur) { c.pos = c.pos + 1 }
+fn bump(mut p: Parser) { p.pos = p.pos + 1 }
 
-// The deepest expression nesting the parser will build before bailing to an `Error`
-// node, matching the reference's `MAX_EXPR_DEPTH`. Bounds AST *height* — so a left-deep
-// fold (`1+1+…`) or postfix chain (`a.b.c.…`), which parse iteratively, still can't build
-// a tree taller than this for a later recursive walk (or `dump`) to overflow on.
+// The deepest expression nesting the parser will build before bailing to an `Error` node,
+// matching the reference's `MAX_EXPR_DEPTH`. Bounds AST *height* — so a left-deep fold
+// (`1+1+…`) or postfix chain (`a.b.c.…`), which parse iteratively, still can't build a
+// tree taller than this for a later recursive walk (or `dump`) to overflow on.
 fn max_depth() -> i32 { return 256 }
 
 // Record one more level of nesting; returns true while there is room, false once past the
 // cap (latching `over`). Callers restore `depth` on the way out, so it measures the
 // current root-to-node path and its peak is the tallest subtree parsed.
-fn descend(mut c: Cur) -> bool {
-    c.depth = c.depth + 1
-    if c.depth > max_depth() { c.over = true  return false }
+fn descend(mut p: Parser) -> bool {
+    if p.over { return false }         // already past the cap: stay bailed so parsing
+                                       // stops cleanly instead of churning the surplus
+                                       // tokens (a postfix `(`/`[`/`.` run) into nodes.
+    p.depth = p.depth + 1
+    if p.depth > max_depth() { p.over = true  return false }
     return true
 }
 
 // ---- arena helpers ----
 
 // Append a node and return its `ExprId` (its index in the arena). `x`/`y` default to -1;
-// use `mk_field` for a Field node that carries its name span.
-fn mk(mut ex: List(ExprData), kind: i32, start: usize, end: usize, op: i32, a: i32, b: i32) -> i32 {
-    let id: i32 = list.len(ExprData, ex) as i32
-    list.push(ExprData, ex, ExprData{ kind: kind, start: start, end: end, op: op, a: a, b: b, x: 0 - 1, y: 0 - 1 })
+// use `mk_field`/`mk_call`/`mk_cast` for nodes that carry aux data.
+fn mk(mut p: Parser, kind: i32, start: usize, end: usize, op: i32, a: i32, b: i32) -> i32 {
+    let id: i32 = list.len(ExprData, p.ex) as i32
+    list.push(ExprData, p.ex, ExprData{ kind: kind, start: start, end: end, op: op, a: a, b: b, x: 0 - 1, y: 0 - 1 })
     return id
 }
-
 // A Field node `base.name`: `a` is the base, `(x, y)` the name's source span.
-fn mk_field(mut ex: List(ExprData), start: usize, end: usize, base: i32, name_start: usize, name_end: usize) -> i32 {
-    let id: i32 = list.len(ExprData, ex) as i32
-    list.push(ExprData, ex, ExprData{ kind: 5, start: start, end: end, op: 0, a: base, b: 0 - 1, x: name_start as i32, y: name_end as i32 })
+fn mk_field(mut p: Parser, start: usize, end: usize, base: i32, name_start: usize, name_end: usize) -> i32 {
+    let id: i32 = list.len(ExprData, p.ex) as i32
+    list.push(ExprData, p.ex, ExprData{ kind: 5, start: start, end: end, op: 0, a: base, b: 0 - 1, x: name_start as i32, y: name_end as i32 })
     return id
 }
-
-// An `Error` node spanning the current token (or empty at end of input) — the bounded
-// result when the nesting guard fires.
-fn err_here(mut ex: List(ExprData), read tk: List(tokens.Token), c: Cur) -> i32 {
-    if c.pos < c.n {
-        let t: tokens.Token = cur_tok(tk, c)
-        return mk(ex, 9, t.start, t.end, 0, 0 - 1, 0 - 1)
-    }
-    return mk(ex, 9, 0, 0, 0, 0 - 1, 0 - 1)
+// A Call node `callee(args)`: `a` is the callee, `(x, y)` = (arg_start, arg_count) into `ar`.
+fn mk_call(mut p: Parser, start: usize, end: usize, callee: i32, arg_start: i32, arg_count: i32) -> i32 {
+    let id: i32 = list.len(ExprData, p.ex) as i32
+    list.push(ExprData, p.ex, ExprData{ kind: 10, start: start, end: end, op: 0, a: callee, b: 0 - 1, x: arg_start, y: arg_count })
+    return id
 }
-fn node_start(read ex: List(ExprData), id: i32) -> usize {
-    let d: ExprData = list.get(ExprData, ex, id as usize)
+// A Cast node `expr as T`: `a` is the expr, `(x, y)` the type's source span.
+fn mk_cast(mut p: Parser, start: usize, end: usize, expr: i32, ty_start: usize, ty_end: usize) -> i32 {
+    let id: i32 = list.len(ExprData, p.ex) as i32
+    list.push(ExprData, p.ex, ExprData{ kind: 11, start: start, end: end, op: 0, a: expr, b: 0 - 1, x: ty_start as i32, y: ty_end as i32 })
+    return id
+}
+fn node_start(read p: Parser, id: i32) -> usize {
+    let d: ExprData = list.get(ExprData, p.ex, id as usize)
     return d.start
 }
-fn node_end(read ex: List(ExprData), id: i32) -> usize {
-    let d: ExprData = list.get(ExprData, ex, id as usize)
+fn node_end(read p: Parser, id: i32) -> usize {
+    let d: ExprData = list.get(ExprData, p.ex, id as usize)
     return d.end
+}
+// An `Error` node spanning the current token (or empty at end of input) — the bounded
+// result when the nesting guard fires.
+fn err_here(mut p: Parser) -> i32 {
+    if p.pos < p.n {
+        let t: tokens.Token = cur_tok(p)
+        return mk(p, 9, t.start, t.end, 0, 0 - 1, 0 - 1)
+    }
+    return mk(p, 9, 0, 0, 0, 0 - 1, 0 - 1)
 }
 
 // ---- operator table ----
 
-// Classify an infix operator by token kind, returning its binding powers and `BinOp`
-// code. The powers are exactly the reference's `bin_op` table: `or` < `and` < comparison
-// < `|` < `^` < `&` < shifts < additive < multiplicative, each left-associative
-// (`lbp` even, `rbp = lbp + 1`). BinOp codes: 1=add 2=sub 3=mul 4=div 5=rem 6=eq 7=ne
-// 8=lt 9=le 10=gt 11=ge 12=and 13=or 14=bitand 15=bitor 16=bitxor 17=shl 18=shr.
+// Classify an infix operator by token kind, returning its binding powers and `BinOp` code.
+// The powers are exactly the reference's `bin_op` table: `or` < `and` < comparison < `|` <
+// `^` < `&` < shifts < additive < multiplicative, each left-associative (`lbp` even,
+// `rbp = lbp + 1`). BinOp codes: 1=add 2=sub 3=mul 4=div 5=rem 6=eq 7=ne 8=lt 9=le 10=gt
+// 11=ge 12=and 13=or 14=bitand 15=bitor 16=bitxor 17=shl 18=shr.
 fn bin_op(k: i32) -> BinInfo {
     if k == 50 { return BinInfo{ ok: true, lbp: 7, rbp: 8, code: 13 } }    // or
     if k == 49 { return BinInfo{ ok: true, lbp: 9, rbp: 10, code: 12 } }   // and
@@ -146,107 +163,190 @@ fn bin_op(k: i32) -> BinInfo {
     return BinInfo{ ok: false, lbp: 0, rbp: 0, code: 0 }
 }
 
-// ---- the Pratt parser (mirrors parse_primary / parse_unary / parse_binary) ----
+// ---- the Pratt parser (mirrors parse_primary / parse_cast / parse_postfix / parse_unary
+//      / parse_binary in the reference) ----
 
 // A leaf or a parenthesized group. `( e )` returns the inner expression unchanged
-// (grouping only, its own span) — exactly as the reference does. An unhandled token
-// yields an `Error` node so the walk still terminates.
-fn parse_primary(mut ex: List(ExprData), read tk: List(tokens.Token), mut c: Cur) -> i32 {
-    let k: i32 = cur_kind(tk, c)
+// (grouping only, its own span). An unhandled token yields an `Error` node so the walk
+// still terminates.
+fn parse_primary(mut p: Parser) -> i32 {
+    let k: i32 = cur_kind(p)
     if k == 1 {                                    // Int
-        let t: tokens.Token = cur_tok(tk, c)
-        bump(c)
-        return mk(ex, 0, t.start, t.end, 0, 0 - 1, 0 - 1)
+        let t: tokens.Token = cur_tok(p)
+        bump(p)
+        return mk(p, 0, t.start, t.end, 0, 0 - 1, 0 - 1)
     }
     if k == 2 {                                    // Float
-        let t: tokens.Token = cur_tok(tk, c)
-        bump(c)
-        return mk(ex, 1, t.start, t.end, 0, 0 - 1, 0 - 1)
+        let t: tokens.Token = cur_tok(p)
+        bump(p)
+        return mk(p, 1, t.start, t.end, 0, 0 - 1, 0 - 1)
     }
     if k == 0 {                                    // Ident -> Name
-        let t: tokens.Token = cur_tok(tk, c)
-        bump(c)
-        return mk(ex, 2, t.start, t.end, 0, 0 - 1, 0 - 1)
+        let t: tokens.Token = cur_tok(p)
+        bump(p)
+        return mk(p, 2, t.start, t.end, 0, 0 - 1, 0 - 1)
     }
     if k == 63 {                                   // '(' grouping
-        bump(c)
-        let inner: i32 = parse_binary(ex, tk, c, 0)
-        if cur_kind(tk, c) == 64 { bump(c) }       // ')'
+        bump(p)
+        let inner: i32 = parse_binary(p, 0)
+        if cur_kind(p) == 64 { bump(p) }           // ')'
         return inner
     }
-    // Unhandled construct: an Error node over the offending token (or an empty span).
-    if c.pos < c.n {
-        let t: tokens.Token = cur_tok(tk, c)
-        bump(c)
-        return mk(ex, 9, t.start, t.end, 0, 0 - 1, 0 - 1)
+    if p.pos < p.n {
+        let t: tokens.Token = cur_tok(p)
+        bump(p)
+        return mk(p, 9, t.start, t.end, 0, 0 - 1, 0 - 1)   // Error over the offending token
     }
-    return mk(ex, 9, 0, 0, 0, 0 - 1, 0 - 1)
+    return mk(p, 9, 0, 0, 0, 0 - 1, 0 - 1)
 }
 
-// Postfix chain: a primary followed by any run of `.field`, `[index]`, `.*` (deref),
-// and `?` (try) — each wraps the previous expression as its base, building a left-deep
-// tree (so `a.b.c` is `field(field(a,b),c)`). The chain is bounded by `descend` so a
-// pathologically long run can't build a tree taller than the cap. Spans mirror the
-// reference: field = `base.start..name.end`, index = `base.start..].end`, deref/try =
-// `base.start..op.end`.
-fn parse_postfix(mut ex: List(ExprData), read tk: List(tokens.Token), mut c: Cur) -> i32 {
-    let saved: i32 = c.depth
-    var e: i32 = parse_primary(ex, tk, c)
+// Consume a type and return its source span. Handles the forms that appear after `as` in
+// the corpus: a pointer prefix `*` (optionally `mut`/`const`) wrapping a type, or a bare
+// type name. (The full structural type parser is a later slice; the cast dump only needs
+// the span, and this consumes exactly the tokens the reference `parse_type` does for these
+// forms, so the spans agree.)
+fn parse_type(mut p: Parser) -> TySpan {
+    let k: i32 = cur_kind(p)
+    if k == 81 {                                   // '*' -> pointer
+        let st: tokens.Token = cur_tok(p)
+        bump(p)
+        let k2: i32 = cur_kind(p)
+        if k2 == 55 { bump(p) }                    // 'mut'
+        else if k2 == 10 { bump(p) }               // 'const'
+        let inner: TySpan = parse_type(p)
+        return TySpan{ start: st.start, end: inner.end }
+    }
+    if p.pos < p.n {                               // a type name (or, best-effort, one token)
+        let t: tokens.Token = cur_tok(p)
+        bump(p)
+        return TySpan{ start: t.start, end: t.end }
+    }
+    return TySpan{ start: 0, end: 0 }
+}
+
+// Postfix chain: a primary followed by any run of `.field`, `[index]`, `.*` (deref), `?`
+// (try), and `(args)` (call) — each wraps the previous expression as its base/callee,
+// building a left-deep tree (so `a.b.c` is `field(field(a,b),c)`). The chain is bounded by
+// `descend`. Spans mirror the reference: field = `base.start..name.end`, index/call =
+// `base.start..].end`/`base.start..).end`, deref/try = `base.start..op.end`.
+fn parse_postfix(mut p: Parser) -> i32 {
+    let saved: i32 = p.depth
+    var e: i32 = parse_primary(p)
     var go: bool = true
     for go {
-        let k: i32 = cur_kind(tk, c)
+        let k: i32 = cur_kind(p)
         if k == 73 {                               // '.'  -> Field
-            if !descend(c) { go = false }
+            if !descend(p) { go = false }
             else {
-                bump(c)
-                let nt: tokens.Token = cur_tok(tk, c)   // the field-name ident
-                if cur_kind(tk, c) == 0 { bump(c) }     // consume the name if present
-                let s: usize = node_start(ex, e)
-                e = mk_field(ex, s, nt.end, e, nt.start, nt.end)
+                bump(p)
+                let nt: tokens.Token = cur_tok(p)       // the field-name ident
+                if cur_kind(p) == 0 { bump(p) }         // consume the name if present
+                let s: usize = node_start(p, e)
+                e = mk_field(p, s, nt.end, e, nt.start, nt.end)
             }
         } else if k == 76 {                        // '.*' -> Deref
-            if !descend(c) { go = false }
+            if !descend(p) { go = false }
             else {
-                let dt: tokens.Token = cur_tok(tk, c)
-                bump(c)
-                let s: usize = node_start(ex, e)
-                e = mk(ex, 7, s, dt.end, 0, e, 0 - 1)
+                let dt: tokens.Token = cur_tok(p)
+                bump(p)
+                let s: usize = node_start(p, e)
+                e = mk(p, 7, s, dt.end, 0, e, 0 - 1)
             }
         } else if k == 100 {                       // '?'  -> Try
-            if !descend(c) { go = false }
+            if !descend(p) { go = false }
             else {
-                let qt: tokens.Token = cur_tok(tk, c)
-                bump(c)
-                let s: usize = node_start(ex, e)
-                e = mk(ex, 8, s, qt.end, 0, e, 0 - 1)
+                let qt: tokens.Token = cur_tok(p)
+                bump(p)
+                let s: usize = node_start(p, e)
+                e = mk(p, 8, s, qt.end, 0, e, 0 - 1)
             }
         } else if k == 67 {                        // '['  -> Index
-            if !descend(c) { go = false }
+            if !descend(p) { go = false }
             else {
-                bump(c)
-                let idx: i32 = parse_binary(ex, tk, c, 0)
-                var endp: usize = node_end(ex, idx)
-                if cur_kind(tk, c) == 68 {              // ']'
-                    let rb: tokens.Token = cur_tok(tk, c)
+                bump(p)
+                let idx: i32 = parse_binary(p, 0)
+                var endp: usize = node_end(p, idx)
+                if cur_kind(p) == 68 {                  // ']'
+                    let rb: tokens.Token = cur_tok(p)
                     endp = rb.end
-                    bump(c)
+                    bump(p)
                 }
-                let s: usize = node_start(ex, e)
-                e = mk(ex, 6, s, endp, 0, e, idx)
+                let s: usize = node_start(p, e)
+                e = mk(p, 6, s, endp, 0, e, idx)
+            }
+        } else if k == 63 {                        // '('  -> Call
+            if !descend(p) { go = false }
+            else {
+                bump(p)
+                // Collect this call's argument ids in a per-call temp list, so a nested
+                // call's pushes into `p.ar` (which happen *while* we parse an argument)
+                // don't interleave with — and scatter — this call's arg block. After the
+                // loop we append the temp contiguously, giving each call a clean slice.
+                var tmp: List(i32) = list.make(i32, p.alloc)
+                var more: bool = true
+                for more {
+                    let ak: i32 = cur_kind(p)
+                    if ak == 64 { more = false }        // ')'
+                    else if ak == 110 { more = false }  // Eof
+                    else {
+                        let arg: i32 = parse_binary(p, 0)
+                        list.push(i32, tmp, arg)
+                        if cur_kind(p) == 69 { bump(p) }   // ',' -> another arg
+                        else { more = false }
+                    }
+                }
+                var endp: usize = node_end(p, e)
+                if cur_kind(p) == 64 {                  // ')'
+                    let rp: tokens.Token = cur_tok(p)
+                    endp = rp.end
+                    bump(p)
+                }
+                let arg_start: i32 = list.len(i32, p.ar) as i32
+                let argc: i32 = list.len(i32, tmp) as i32
+                var j: usize = 0
+                for j < list.len(i32, tmp) {
+                    list.push(i32, p.ar, list.get(i32, tmp, j))
+                    j = j + 1
+                }
+                let s: usize = node_start(p, e)
+                e = mk_call(p, s, endp, e, arg_start, argc)
             }
         } else {
             go = false
         }
     }
-    c.depth = saved
+    p.depth = saved
+    return e
+}
+
+// `expr as T` — binds tighter than binary operators (`a + b as T` is `a + (b as T)`) and
+// chains left (`x as A as B`). Span = expr.start .. type.end.
+fn parse_cast(mut p: Parser) -> i32 {
+    let saved: i32 = p.depth
+    var e: i32 = parse_postfix(p)
+    var go: bool = true
+    for go {
+        if cur_kind(p) == 48 {                     // 'as'
+            if !descend(p) { go = false }
+            else {
+                bump(p)
+                let ts: TySpan = parse_type(p)
+                let s: usize = node_start(p, e)
+                e = mk_cast(p, s, ts.end, e, ts.start, ts.end)
+            }
+        } else {
+            go = false
+        }
+    }
+    p.depth = saved
     return e
 }
 
 // Prefix unary: `-` (neg), `!`/`not` (not), `~` (bitnot), `&` (ref). Right-recursive, so
 // `- - x` nests (bounded by `descend`). UnOp codes: 1=neg 2=not 3=bitnot 4=ref. Span =
-// op.start .. rhs.end. A non-prefix token falls through to the postfix/primary layer.
-fn parse_unary(mut ex: List(ExprData), read tk: List(tokens.Token), mut c: Cur) -> i32 {
-    let k: i32 = cur_kind(tk, c)
+// op.start .. rhs.end. A non-prefix token falls through to the cast/postfix/primary layer.
+fn parse_unary(mut p: Parser) -> i32 {
+    let k: i32 = cur_kind(p)
     var opc: i32 = 0
     if k == 80 { opc = 1 }                         // Minus -> neg
     else if k == 51 { opc = 2 }                    // not   -> not
@@ -254,46 +354,47 @@ fn parse_unary(mut ex: List(ExprData), read tk: List(tokens.Token), mut c: Cur) 
     else if k == 96 { opc = 3 }                    // Tilde -> bitnot
     else if k == 91 { opc = 4 }                    // Amp   -> ref (prefix position)
     if opc != 0 {
-        let saved: i32 = c.depth
-        if !descend(c) { c.depth = saved  return err_here(ex, tk, c) }
-        let ct: tokens.Token = cur_tok(tk, c)
+        let saved: i32 = p.depth
+        if !descend(p) { p.depth = saved  return err_here(p) }
+        let ct: tokens.Token = cur_tok(p)
         let st: usize = ct.start
-        bump(c)
-        let rhs: i32 = parse_unary(ex, tk, c)
-        let e: usize = node_end(ex, rhs)
-        c.depth = saved
-        return mk(ex, 3, st, e, opc, rhs, 0 - 1)
+        bump(p)
+        let rhs: i32 = parse_unary(p)
+        let e: usize = node_end(p, rhs)
+        p.depth = saved
+        return mk(p, 3, st, e, opc, rhs, 0 - 1)
     }
-    return parse_postfix(ex, tk, c)
+    return parse_cast(p)
 }
 
 // Precedence climbing. `min_bp` is the minimum left binding power that may extend the
 // current left operand; an operator with `lbp < min_bp` stops this level. The left spine
 // folds iteratively (so `1+1+…` is a loop, not deep recursion) while the right operand
-// re-enters at `rbp` (left-associative). Span = lhs.start .. rhs.end.
-fn parse_binary(mut ex: List(ExprData), read tk: List(tokens.Token), mut c: Cur, min_bp: i32) -> i32 {
-    let saved: i32 = c.depth
-    if !descend(c) { c.depth = saved  return err_here(ex, tk, c) }
-    var lhs: i32 = parse_unary(ex, tk, c)
+// re-enters at `rbp` (left-associative). Span = lhs.start .. rhs.end. Bounded by `descend`
+// at the entry (recursion) and per fold (left-spine height).
+fn parse_binary(mut p: Parser, min_bp: i32) -> i32 {
+    let saved: i32 = p.depth
+    if !descend(p) { p.depth = saved  return err_here(p) }
+    var lhs: i32 = parse_unary(p)
     var go: bool = true
     for go {
-        let k: i32 = cur_kind(tk, c)
+        let k: i32 = cur_kind(p)
         let bi: BinInfo = bin_op(k)
         if !bi.ok {
             go = false
         } else if bi.lbp < min_bp {
             go = false
-        } else if !descend(c) {                    // bound the left-spine height too
+        } else if !descend(p) {
             go = false
         } else {
-            bump(c)
-            let rhs: i32 = parse_binary(ex, tk, c, bi.rbp)
-            let s: usize = node_start(ex, lhs)
-            let e: usize = node_end(ex, rhs)
-            lhs = mk(ex, 4, s, e, bi.code, lhs, rhs)
+            bump(p)
+            let rhs: i32 = parse_binary(p, bi.rbp)
+            let s: usize = node_start(p, lhs)
+            let e: usize = node_end(p, rhs)
+            lhs = mk(p, 4, s, e, bi.code, lhs, rhs)
         }
     }
-    c.depth = saved
+    p.depth = saved
     return lhs
 }
 
@@ -328,10 +429,10 @@ fn unop_label(code: i32) {
     print_str("ref")   // 4
 }
 
-// Emit a flattened S-expression: `(`, the head atoms (kind label, operator label,
-// start, end), then each child's dump in order, then `)` — one atom per line.
-fn dump(read ex: List(ExprData), id: i32) {
-    let d: ExprData = list.get(ExprData, ex, id as usize)
+// Emit a flattened S-expression: `(`, the head atoms (kind label, operator/aux, start,
+// end), then each child's dump in order, then `)` — one atom per line.
+fn dump(read p: Parser, id: i32) {
+    let d: ExprData = list.get(ExprData, p.ex, id as usize)
     print_str("(")
     if d.kind == 0 {
         print_str("int")   print_uint(d.start)   print_uint(d.end)
@@ -341,25 +442,39 @@ fn dump(read ex: List(ExprData), id: i32) {
         print_str("name")  print_uint(d.start)   print_uint(d.end)
     } else if d.kind == 3 {
         print_str("unary") unop_label(d.op)  print_uint(d.start) print_uint(d.end)
-        dump(ex, d.a)
+        dump(p, d.a)
     } else if d.kind == 4 {
         print_str("binary") binop_label(d.op) print_uint(d.start) print_uint(d.end)
-        dump(ex, d.a)
-        dump(ex, d.b)
+        dump(p, d.a)
+        dump(p, d.b)
     } else if d.kind == 5 {
         // Field: the name's source span (x, y) identifies which field, then the base.
         print_str("field") print_int(d.x as i64) print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
-        dump(ex, d.a)
+        dump(p, d.a)
     } else if d.kind == 6 {
         print_str("index") print_uint(d.start) print_uint(d.end)
-        dump(ex, d.a)
-        dump(ex, d.b)
+        dump(p, d.a)
+        dump(p, d.b)
     } else if d.kind == 7 {
         print_str("deref") print_uint(d.start) print_uint(d.end)
-        dump(ex, d.a)
+        dump(p, d.a)
     } else if d.kind == 8 {
         print_str("try") print_uint(d.start) print_uint(d.end)
-        dump(ex, d.a)
+        dump(p, d.a)
+    } else if d.kind == 10 {
+        // Call: arg count, then the callee, then each argument (from the arg arena).
+        print_str("call") print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
+        dump(p, d.a)
+        var i: i32 = 0
+        for i < d.y {
+            let argid: i32 = list.get(i32, p.ar, (d.x + i) as usize)
+            dump(p, argid)
+            i = i + 1
+        }
+    } else if d.kind == 11 {
+        // Cast: the target type's source span (x, y), then the operand.
+        print_str("cast") print_int(d.x as i64) print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
+        dump(p, d.a)
     } else {
         print_str("error") print_uint(d.start) print_uint(d.end)
     }
@@ -370,10 +485,9 @@ fn dump(read ex: List(ExprData), id: i32) {
 fn parse_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Allocator) {
     var tk: List(tokens.Token) = tokens.tokenize(src, it, kwcount, a)
     let n: usize = list.len(tokens.Token, tk)
-    var ex: List(ExprData) = list.make(ExprData, a)
-    var c: Cur = Cur{ pos: 0, n: n, depth: 0, over: false }
-    let root: i32 = parse_binary(ex, tk, c, 0)
-    dump(ex, root)
+    var p: Parser = Parser{ toks: tk, ex: list.make(ExprData, a), ar: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false }
+    let root: i32 = parse_binary(p, 0)
+    dump(p, root)
 }
 
 fn main() -> i32 {
@@ -386,7 +500,7 @@ fn main() -> i32 {
         parse_and_dump(string_view(src), it, kwcount, a)
         string_free(src)
     } else {
-        let sample: str = "1 + 2 * 3"
+        let sample: str = "f(a.b, 1 + 2) as i32"
         parse_and_dump(sample, it, kwcount, a)
     }
     return 0

@@ -5877,6 +5877,28 @@ mod c_oracle {
                 out.push(en);
                 ref_dump_expr(ast, *base, out);
             }
+            // Call: arg count, then the callee, then each argument in order.
+            ExprKind::Call { callee, args } => {
+                out.push("call".to_string());
+                out.push(args.len().to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *callee, out);
+                for arg in args {
+                    ref_dump_expr(ast, *arg, out);
+                }
+            }
+            // Cast: the target type's source span (matching the Jestyr parser, which
+            // dumps the type by span rather than structure this slice), then the operand.
+            ExprKind::Cast { expr, ty } => {
+                let tsp = ast.type_at(*ty).span;
+                out.push("cast".to_string());
+                out.push(tsp.start.to_string());
+                out.push(tsp.end.to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *expr, out);
+            }
             // Any construct the P2 slice does not yet build dumps as `error`; the golden
             // corpus is curated to the handled constructs, so this arm stays unexercised.
             _ => {
@@ -5950,6 +5972,26 @@ mod c_oracle {
             "a.len + b.len",   // fields as binary operands
             "arr[i + 1]",      // a binary expression inside an index
             "a[i] < b[j]",     // indexed operands in a comparison
+            // calls: zero/one/many args, chaining, and mixing with other postfix
+            "f()",             // no-arg call
+            "f(x)",            // one arg
+            "f(x, y, z)",      // several args
+            "g(a + b)",        // an expression argument
+            "f(g(x))",         // nested call
+            "f(x)(y)",         // curried: call(call(f,x),y)
+            "a.f(x)",          // method-style: call(field(a,f),x)
+            "f(x) + 1",        // a call as a binary operand
+            "arr[f(i)]",       // a call inside an index
+            // casts: named + pointer types, chaining, precedence vs unary/binary/postfix
+            "x as i32",        // named-type cast
+            "x as i32 + 1",    // cast binds tighter than `+`: (x as i32) + 1
+            "a + b as u8",     // …either side: a + (b as u8)
+            "p as usize",      //
+            "x as i32 as i64", // left-chained cast
+            "- x as u8",       // prefix vs cast
+            "a.b as usize",    // postfix field then cast
+            "arr[i] as u8",    // postfix index then cast
+            "q as *mut u8",    // pointer-type cast
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");
