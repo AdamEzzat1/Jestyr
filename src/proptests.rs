@@ -5901,6 +5901,90 @@ mod c_oracle {
         out.push(")".to_string());
     }
 
+    /// Dump one pattern (matching the Jestyr `dump_pat`): `patwild`/`patident`/`patrest`/
+    /// `paterr` carry a span; `patvariant` its name span + subpat count + span + subpatterns;
+    /// `patstruct` adds has_rest and `(patfield <fname span> <subpat>)` fields; `patlit` /
+    /// `patrange` dump their literal expressions; `pator` its alternative count + alternatives.
+    fn ref_dump_pat(ast: &crate::ast::Ast, pid: crate::ast::PatId, out: &mut Vec<String>) {
+        use crate::ast::PatKind;
+        let p = ast.pat_at(pid);
+        let s = p.span.start.to_string();
+        let en = p.span.end.to_string();
+        out.push("(".to_string());
+        match &p.kind {
+            PatKind::Wildcard => {
+                out.push("patwild".to_string());
+                out.push(s);
+                out.push(en);
+            }
+            PatKind::Ident(_) => {
+                out.push("patident".to_string());
+                out.push(s);
+                out.push(en);
+            }
+            PatKind::Variant { name, subpats } => {
+                out.push("patvariant".to_string());
+                out.push(name.span.start.to_string());
+                out.push(name.span.end.to_string());
+                out.push(subpats.len().to_string());
+                out.push(s);
+                out.push(en);
+                for sp in subpats {
+                    ref_dump_pat(ast, *sp, out);
+                }
+            }
+            PatKind::StructVariant { name, fields, has_rest } => {
+                out.push("patstruct".to_string());
+                out.push(name.span.start.to_string());
+                out.push(name.span.end.to_string());
+                out.push(if *has_rest { "1" } else { "0" }.to_string());
+                out.push(fields.len().to_string());
+                out.push(s);
+                out.push(en);
+                for (fname, sub) in fields {
+                    out.push("(".to_string());
+                    out.push("patfield".to_string());
+                    out.push(fname.span.start.to_string());
+                    out.push(fname.span.end.to_string());
+                    ref_dump_pat(ast, *sub, out);
+                    out.push(")".to_string());
+                }
+            }
+            PatKind::Lit(e) => {
+                out.push("patlit".to_string());
+                ref_dump_expr(ast, *e, out);
+            }
+            PatKind::Range { lo, hi, inclusive } => {
+                out.push("patrange".to_string());
+                out.push(if *inclusive { "1" } else { "0" }.to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *lo, out);
+                ref_dump_expr(ast, *hi, out);
+            }
+            PatKind::Or(alts) => {
+                out.push("pator".to_string());
+                out.push(alts.len().to_string());
+                out.push(s);
+                out.push(en);
+                for a in alts {
+                    ref_dump_pat(ast, *a, out);
+                }
+            }
+            PatKind::Rest => {
+                out.push("patrest".to_string());
+                out.push(s);
+                out.push(en);
+            }
+            PatKind::Error => {
+                out.push("paterr".to_string());
+                out.push(s);
+                out.push(en);
+            }
+        }
+        out.push(")".to_string());
+    }
+
     /// The Rust *reference* canonical AST dump for one expression node: a flattened
     /// S-expression, one atom per line — `(`, the kind label, (operator label,) the
     /// span `start`/`end`, then each child's dump in order, then `)`. A **pure function
@@ -6152,6 +6236,23 @@ mod c_oracle {
                 out.push(en);
                 ref_dump_block(ast, b, out);
             }
+            // Match: arm count, span, the scrutinee, then each arm as `(arm <pat> <guard-opt>
+            // <body>)`.
+            ExprKind::Match { scrut, arms } => {
+                out.push("match".to_string());
+                out.push(arms.len().to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *scrut, out);
+                for arm in arms {
+                    out.push("(".to_string());
+                    out.push("arm".to_string());
+                    ref_dump_pat(ast, arm.pat, out);
+                    ref_dump_opt(ast, arm.guard, out);
+                    ref_dump_expr(ast, arm.body, out);
+                    out.push(")".to_string());
+                }
+            }
             // Any construct the P2 slice does not yet build dumps as `error`; the golden
             // corpus is curated to the handled constructs, so this arm stays unexercised.
             _ => {
@@ -6338,6 +6439,20 @@ mod c_oracle {
             "c == 'x'",                  // char literal as a binary operand
             "flag or false",             // bool literal as a binary operand
             "if true { 1 } else { 0 }",  // bool literal as an if condition
+            // match + patterns: literals, wildcard, bindings, variants, struct-variants,
+            // or-patterns, ranges, guards, rest
+            "match x { 0 => a, _ => b }", // a literal arm and a wildcard
+            "match x { n => n }",         // an identifier binding
+            "match e { circle(r) => r, rect(w, h) => w }", // positional variant patterns
+            "match e { rect { w, h } => w }", // struct-variant with shorthand fields
+            "match e { rect { w: 0, .. } => w }", // struct-variant with a subpattern + rest
+            "match c { red | green | blue => 0, _ => 1 }", // an or-pattern
+            "match n { 0..=9 => a, 10..99 => b, _ => c }", // inclusive + half-open ranges
+            "match n { -1 => a, 0 => b }", // a negative literal pattern
+            "match p { circle(r) if r > 0 => r, _ => 0 }", // a guard
+            "match v { pair(a, ..) => a }", // `..` rest as the last variant field
+            "match x { 'a' => 1, 'z' => 2, _ => 0 }", // char-literal patterns
+            "match b { true => 1, false => 0 }", // bool-literal patterns
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");

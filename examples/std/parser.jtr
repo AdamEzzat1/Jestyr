@@ -12,9 +12,11 @@
 // (try) / `(args)` (call); `as` casts (named + pointer types); assignment + compound
 // assigns; ranges (`..` / `..=`); array literals (`[e…]` and `[v; n]`); struct literals
 // (`Path{ … }`) and generic struct literals (`Ctor(T…){ … }`); `self` / `Self` (and
-// `Self{ … }`); `@attr` callables; and f-strings (`f"… {x} …"`). Block-led forms
-// (`if`/`match`/blocks) and the type/pattern/statement/item layers are later slices; the
-// golden corpus is curated to the handled constructs and grows with the parser.
+// `Self{ … }`); `@attr` callables; f-strings (`f"… {x} …"`); char/bool leaves; statements
+// (`let`/`var`/`return`/expr) with `{ … }` blocks; the block-led `if`/`else`, `unsafe`, and
+// `match` (with a full pattern parser — bindings, wildcards, variants, struct-variants,
+// or-patterns, ranges, guards, rest). The type parser is still a minimal span-consumer, and
+// the item layer is a later slice; the golden corpus is curated to the handled constructs.
 //
 // The parser state is a single `Parser` value threaded `mut` through the recursive
 // descent — mirroring the reference, where `Ast` owns the arenas and `Parser` holds them.
@@ -39,7 +41,7 @@ import "tokens"
 // One arena node. `kind`: 0=Int 1=Float 2=Name 3=Unary 4=Binary 5=Field 6=Index 7=Deref
 // 8=Try 9=Error 10=Call 11=Cast 12=Assign 13=Range 14=ArrayLit 15=ArrayRepeat 16=StructLit
 // 17=GenStructLit 18=FieldInit 19=SelfValue 20=SelfType 21=Attr 22=FString 23=Block 24=If
-// 25=Unsafe 26=Char 27=Bool. `a`/`b` are child `ExprId`s: unary/postfix use `a` for the
+// 25=Unsafe 26=Char 27=Bool 28=Match. `a`/`b` are child `ExprId`s: unary/postfix use `a` for the
 // operand/base, binary uses `a`=lhs `b`=rhs, index uses `a`=base `b`=index, call/cast use
 // `a`=callee/expr. `x`/`y` are auxiliary integers: Field stores its name's source span
 // `(x, y)`; Call stores `(arg_start, arg_count)` into the arg arena; Cast stores its
@@ -74,10 +76,23 @@ struct TySpan { start: usize, end: usize }
 //   Expr:   `a`=the expression `ExprId`. (No own span — the dump uses the expr's.)
 struct StmtData { kind: i32, start: usize, end: usize, op: i32, a: i32, x: i32, y: i32, ts: i32, te: i32 }
 
-// `st` is the statement arena; `sar` is the statement-id child arena a Block node slices
-// via `(stmt_start, stmt_count)` (buffered-then-appended like `ar`, so a nested block's
-// statements don't scatter the enclosing block's slice).
-struct Parser { toks: List(tokens.Token), ex: List(ExprData), ar: List(i32), st: List(StmtData), sar: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool, no_struct: bool }
+// One pattern arena node (`PatId` = index into `pt`). `kind`: 0=Wildcard 1=Ident 2=Variant
+// 3=StructVariant 4=Lit 5=Range 6=Or 7=Rest 8=Error.
+//   Ident/Wildcard/Rest/Error: span only.
+//   Variant `name(subpats)`: `(x, y)`=name span; `(op, a)`=(subpat_start, subpat_count) into
+//     `par` (each entry a `PatId`).
+//   StructVariant `name{ fields, .. }`: `(x, y)`=name span; `(op, a)`=(field_start,
+//     field_count) into `par` (each field = 3 ints: fname_start, fname_end, subpat `PatId`);
+//     `b`=has_rest (0/1).
+//   Lit: `a`=the literal `ExprId`. Range: `a`=lo `ExprId`, `b`=hi `ExprId`, `op`=inclusive.
+//   Or: `(op, a)`=(alt_start, alt_count) into `par` (each a `PatId`).
+struct PatData { kind: i32, start: usize, end: usize, op: i32, a: i32, b: i32, x: i32, y: i32 }
+
+// `st` is the statement arena; `sar` the statement-id child arena a Block slices. `pt` is
+// the pattern arena; `par` a shared i32 child arena for pattern children (variant subpats,
+// or-alternatives, struct-variant field triples) *and* match-arm triples (pat, guard, body)
+// — all buffered-then-appended so nested parses don't scatter an enclosing slice.
+struct Parser { toks: List(tokens.Token), ex: List(ExprData), ar: List(i32), st: List(StmtData), sar: List(i32), pt: List(PatData), par: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool, no_struct: bool }
 
 // The result of parsing a `{ field, …, ..spread }` initializer body: the field-init nodes'
 // slice into the arg arena, the optional spread expr (-1 if none), and the `}` end offset.
@@ -223,6 +238,59 @@ fn mk_unsafe(mut p: Parser, start: usize, end: usize, body: i32) -> i32 {
     list.push(ExprData, p.ex, ExprData{ kind: 25, start: start, end: end, op: 0, a: body, b: 0 - 1, x: 0 - 1, y: 0 - 1 })
     return id
 }
+// A `match` expression (kind 28): `a`=scrutinee `ExprId`; `(x, y)`=(arm_start, arm_count)
+// into `par`, each arm a triple (pat `PatId`, guard `ExprId` or -1, body `ExprId`).
+fn mk_match(mut p: Parser, start: usize, end: usize, scrut: i32, arm_start: i32, arm_count: i32) -> i32 {
+    let id: i32 = list.len(ExprData, p.ex) as i32
+    list.push(ExprData, p.ex, ExprData{ kind: 28, start: start, end: end, op: 0, a: scrut, b: 0 - 1, x: arm_start, y: arm_count })
+    return id
+}
+// ---- pattern arena constructors ----
+// A simple span-only pattern (Wildcard=0, Ident=1, Rest=7, Error=8).
+fn mk_pat(mut p: Parser, kind: i32, start: usize, end: usize) -> i32 {
+    let id: i32 = list.len(PatData, p.pt) as i32
+    list.push(PatData, p.pt, PatData{ kind: kind, start: start, end: end, op: 0 - 1, a: 0 - 1, b: 0 - 1, x: 0 - 1, y: 0 - 1 })
+    return id
+}
+// A Variant pattern `name(subpats)`: `(x,y)`=name span, `(op,a)`=(subpat_start, subpat_count).
+fn mk_pat_variant(mut p: Parser, start: usize, end: usize, ns: usize, ne: usize, sub_start: i32, sub_count: i32) -> i32 {
+    let id: i32 = list.len(PatData, p.pt) as i32
+    list.push(PatData, p.pt, PatData{ kind: 2, start: start, end: end, op: sub_start, a: sub_count, b: 0 - 1, x: ns as i32, y: ne as i32 })
+    return id
+}
+// A StructVariant pattern: `(x,y)`=name span, `(op,a)`=(field_start, field_count), `b`=has_rest.
+fn mk_pat_struct(mut p: Parser, start: usize, end: usize, ns: usize, ne: usize, field_start: i32, field_count: i32, has_rest: i32) -> i32 {
+    let id: i32 = list.len(PatData, p.pt) as i32
+    list.push(PatData, p.pt, PatData{ kind: 3, start: start, end: end, op: field_start, a: field_count, b: has_rest, x: ns as i32, y: ne as i32 })
+    return id
+}
+// A literal pattern: `a`=the literal ExprId.
+fn mk_pat_lit(mut p: Parser, start: usize, end: usize, e: i32) -> i32 {
+    let id: i32 = list.len(PatData, p.pt) as i32
+    list.push(PatData, p.pt, PatData{ kind: 4, start: start, end: end, op: 0 - 1, a: e, b: 0 - 1, x: 0 - 1, y: 0 - 1 })
+    return id
+}
+// A range pattern `lo..hi` / `lo..=hi`: `a`=lo ExprId, `b`=hi ExprId, `op`=inclusive.
+fn mk_pat_range(mut p: Parser, start: usize, end: usize, inclusive: i32, lo: i32, hi: i32) -> i32 {
+    let id: i32 = list.len(PatData, p.pt) as i32
+    list.push(PatData, p.pt, PatData{ kind: 5, start: start, end: end, op: inclusive, a: lo, b: hi, x: 0 - 1, y: 0 - 1 })
+    return id
+}
+// An or-pattern `a | b | …`: `(op,a)`=(alt_start, alt_count).
+fn mk_pat_or(mut p: Parser, start: usize, end: usize, alt_start: i32, alt_count: i32) -> i32 {
+    let id: i32 = list.len(PatData, p.pt) as i32
+    list.push(PatData, p.pt, PatData{ kind: 6, start: start, end: end, op: alt_start, a: alt_count, b: 0 - 1, x: 0 - 1, y: 0 - 1 })
+    return id
+}
+fn node_pat_start(read p: Parser, id: i32) -> usize {
+    let d: PatData = list.get(PatData, p.pt, id as usize)
+    return d.start
+}
+fn node_pat_end(read p: Parser, id: i32) -> usize {
+    let d: PatData = list.get(PatData, p.pt, id as usize)
+    return d.end
+}
+
 // A `let`/`var` statement: `op`=mutbl, `(x,y)`=name span, `(ts,te)`=type span (ts=-1 none),
 // `a`=init ExprId (-1 none).
 fn mk_let(mut p: Parser, start: usize, end: usize, mutbl: i32, ns: usize, ne: usize, ts: i32, te: i32, init: i32) -> i32 {
@@ -509,8 +577,7 @@ fn parse_stmt(mut p: Parser) -> i32 {
         return mk_let(p, start, prev_end(p), mutbl, ns, ne, ts, te, init)
     }
     // Block-led expressions in statement position parse *block-only* (no trailing operator).
-    // `match` joins once the pattern parser lands.
-    if k == 65 or k == 22 or k == 38 {             // `{` / `if` / `unsafe`
+    if k == 65 or k == 22 or k == 21 or k == 38 {  // `{` / `if` / `match` / `unsafe`
         let e: i32 = parse_block_like(p)
         return mk_exprstmt(p, e)
     }
@@ -523,6 +590,7 @@ fn parse_stmt(mut p: Parser) -> i32 {
 fn parse_block_like(mut p: Parser) -> i32 {
     let k: i32 = cur_kind(p)
     if k == 22 { return parse_if(p) }                // `if`
+    if k == 21 { return parse_match(p) }             // `match`
     if k == 38 { return parse_unsafe(p) }            // `unsafe`
     if k == 65 { return parse_block(p) }             // `{`
     return parse_expr(p)
@@ -560,6 +628,204 @@ fn parse_unsafe(mut p: Parser) -> i32 {
     bump(p)                                          // consume `unsafe`
     let b: i32 = parse_block(p)
     return mk_unsafe(p, start, node_end(p, b), b)
+}
+
+// ---- the pattern parser (mirrors parse_pattern / parse_pattern_atom / parse_pat_lit) ----
+
+// A scalar literal used inside a pattern (`0`, `-3`, `'a'`, `true`), returned as an ExprId
+// (or -1 if the cursor isn't on a literal). Floats are intentionally excluded. `-x` becomes
+// a Unary Neg over the inner literal. Mirrors `parse_pat_lit`.
+fn parse_pat_lit(mut p: Parser) -> i32 {
+    let k: i32 = cur_kind(p)
+    if k == 80 {                                   // Minus -> negative literal
+        let mt: tokens.Token = cur_tok(p)
+        bump(p)
+        let rhs: i32 = parse_pat_lit(p)
+        if rhs < 0 { return 0 - 1 }
+        return mk(p, 3, mt.start, node_end(p, rhs), 1, rhs, 0 - 1)   // Unary, op=1 (neg)
+    }
+    if k == 1 {                                    // Int
+        let t: tokens.Token = cur_tok(p)  bump(p)
+        return mk(p, 0, t.start, t.end, 0, 0 - 1, 0 - 1)
+    }
+    if k == 5 {                                    // Char
+        let t: tokens.Token = cur_tok(p)  bump(p)
+        return mk(p, 26, t.start, t.end, 0, 0 - 1, 0 - 1)
+    }
+    if k == 58 {                                   // true
+        let t: tokens.Token = cur_tok(p)  bump(p)
+        return mk(p, 27, t.start, t.end, 1, 0 - 1, 0 - 1)
+    }
+    if k == 59 {                                   // false
+        let t: tokens.Token = cur_tok(p)  bump(p)
+        return mk(p, 27, t.start, t.end, 0, 0 - 1, 0 - 1)
+    }
+    return 0 - 1
+}
+
+// A variant pattern's positional subpattern list `name(subpats)` (cur is `(`). Subpatterns
+// are buffered then appended to `par`.
+fn parse_pat_variant(mut p: Parser, ns: usize, ne: usize) -> i32 {
+    bump(p)                                        // consume `(`
+    var tmp: List(i32) = list.make(i32, p.alloc)
+    var more: bool = true
+    for more {
+        let k: i32 = cur_kind(p)
+        if k == 64 { more = false }                // `)`
+        else if k == 110 { more = false }          // Eof
+        else {
+            let sp: i32 = parse_pattern(p)
+            list.push(i32, tmp, sp)
+            if cur_kind(p) == 69 { bump(p) } else { more = false }   // `,`
+        }
+    }
+    var endp: usize = ne
+    if cur_kind(p) == 64 { let rp: tokens.Token = cur_tok(p)  endp = rp.end  bump(p) }
+    let sub_start: i32 = list.len(i32, p.par) as i32
+    let count: i32 = list.len(i32, tmp) as i32
+    var j: usize = 0
+    for j < list.len(i32, tmp) {
+        list.push(i32, p.par, list.get(i32, tmp, j))
+        j = j + 1
+    }
+    return mk_pat_variant(p, ns, endp, ns, ne, sub_start, count)
+}
+
+// A struct-variant pattern's field list `name{ f: p, g, .., }` (cur is `{`). Each field is a
+// (fname_start, fname_end, subpat) triple; `{ r }` shorthand binds field `r` to an Ident
+// pattern. A leading `..` sets has_rest and ends the list. Buffered then appended to `par`.
+fn parse_pat_struct(mut p: Parser, ns: usize, ne: usize) -> i32 {
+    bump(p)                                        // consume `{`
+    var tmp: List(i32) = list.make(i32, p.alloc)   // triples
+    var has_rest: i32 = 0
+    var more: bool = true
+    for more {
+        let k: i32 = cur_kind(p)
+        if k == 66 { more = false }                // `}`
+        else if k == 110 { more = false }          // Eof
+        else if k == 74 { bump(p)  has_rest = 1  more = false }   // `..` rest
+        else {
+            let ft: tokens.Token = cur_tok(p)
+            if cur_kind(p) == 0 { bump(p) }        // field name ident
+            var subpat: i32 = 0 - 1
+            if cur_kind(p) == 71 { bump(p)  subpat = parse_pattern(p) }   // `: pat`
+            else { subpat = mk_pat(p, 1, ft.start, ft.end) }             // shorthand `{ r }`
+            list.push(i32, tmp, ft.start as i32)
+            list.push(i32, tmp, ft.end as i32)
+            list.push(i32, tmp, subpat)
+            if cur_kind(p) == 69 { bump(p) } else { more = false }        // `,`
+        }
+    }
+    var endp: usize = ne
+    if cur_kind(p) == 66 { let rb: tokens.Token = cur_tok(p)  endp = rb.end  bump(p) }
+    let field_start: i32 = list.len(i32, p.par) as i32
+    let field_count: i32 = (list.len(i32, tmp) / 3) as i32
+    var j: usize = 0
+    for j < list.len(i32, tmp) {
+        list.push(i32, p.par, list.get(i32, tmp, j))
+        j = j + 1
+    }
+    return mk_pat_struct(p, ns, endp, ns, ne, field_start, field_count, has_rest)
+}
+
+// A single (non-`|`) pattern atom: `_`, an identifier binding / variant / struct-variant, a
+// scalar literal or range, or the `..` rest. Mirrors `parse_pattern_atom`.
+fn parse_pattern_atom(mut p: Parser) -> i32 {
+    let k: i32 = cur_kind(p)
+    let tok: tokens.Token = cur_tok(p)
+    if k == 6 { bump(p)  return mk_pat(p, 0, tok.start, tok.end) }   // `_` wildcard
+    if k == 0 {                                    // Ident: binding / variant / struct-variant
+        bump(p)
+        if cur_kind(p) == 65 { return parse_pat_struct(p, tok.start, tok.end) }    // `{`
+        if cur_kind(p) == 63 { return parse_pat_variant(p, tok.start, tok.end) }   // `(`
+        return mk_pat(p, 1, tok.start, tok.end)    // a plain binding (or nullary variant)
+    }
+    if k == 1 or k == 5 or k == 58 or k == 59 or k == 80 {   // Int/Char/true/false/`-` literal
+        let lo: i32 = parse_pat_lit(p)
+        let lo_s: usize = node_start(p, lo)
+        let lo_e: usize = node_end(p, lo)
+        let rk: i32 = cur_kind(p)
+        if rk == 74 or rk == 75 {                  // `..` / `..=` -> range pattern
+            var inclusive: i32 = 0
+            if rk == 75 { inclusive = 1 }
+            bump(p)
+            let hi: i32 = parse_pat_lit(p)
+            if hi < 0 { return mk_pat(p, 8, lo_s, lo_e) }   // Error: no upper bound
+            return mk_pat_range(p, lo_s, node_end(p, hi), inclusive, lo, hi)
+        }
+        return mk_pat_lit(p, lo_s, lo_e, lo)
+    }
+    if k == 74 { bump(p)  return mk_pat(p, 7, tok.start, tok.end) }   // `..` rest
+    bump(p)
+    return mk_pat(p, 8, tok.start, tok.end)        // Error over the offending token
+}
+
+// A full pattern, folding `|`-separated alternatives into an Or. Mirrors `parse_pattern`.
+fn parse_pattern(mut p: Parser) -> i32 {
+    let first: i32 = parse_pattern_atom(p)
+    if cur_kind(p) != 93 { return first }          // no `|`
+    let start: usize = node_pat_start(p, first)
+    var tmp: List(i32) = list.make(i32, p.alloc)
+    list.push(i32, tmp, first)
+    for cur_kind(p) == 93 {                         // `|`
+        bump(p)
+        let alt: i32 = parse_pattern_atom(p)
+        list.push(i32, tmp, alt)
+    }
+    let last: i32 = list.get(i32, tmp, list.len(i32, tmp) - 1)
+    let endp: usize = node_pat_end(p, last)
+    let alt_start: i32 = list.len(i32, p.par) as i32
+    let count: i32 = list.len(i32, tmp) as i32
+    var j: usize = 0
+    for j < list.len(i32, tmp) {
+        list.push(i32, p.par, list.get(i32, tmp, j))
+        j = j + 1
+    }
+    return mk_pat_or(p, start, endp, alt_start, count)
+}
+
+// `match <scrut> { <pat> [if <guard>] => <body>, … }`. The scrutinee parses with `no_struct`
+// so its trailing `{` opens the match body, not a struct literal. Each arm's (pat, guard,
+// body) triple is buffered then appended to `par`. Mirrors `parse_match`.
+fn parse_match(mut p: Parser) -> i32 {
+    let mt: tokens.Token = cur_tok(p)
+    let start: usize = mt.start
+    bump(p)                                        // consume `match`
+    let saved_ns: bool = p.no_struct
+    p.no_struct = true
+    let scrut: i32 = parse_expr(p)
+    p.no_struct = saved_ns
+    if cur_kind(p) == 65 { bump(p) }               // `{`
+    var tmp: List(i32) = list.make(i32, p.alloc)   // (pat, guard, body) triples
+    var more: bool = true
+    for more {
+        let k: i32 = cur_kind(p)
+        if k == 66 { more = false }                // `}`
+        else if k == 110 { more = false }          // Eof
+        else {
+            let before: usize = p.pos
+            let pat: i32 = parse_pattern(p)
+            var guard: i32 = 0 - 1
+            if cur_kind(p) == 22 { bump(p)  guard = parse_expr(p) }   // `if <guard>`
+            if cur_kind(p) == 78 { bump(p) }       // `=>`
+            let body: i32 = parse_expr(p)
+            list.push(i32, tmp, pat)
+            list.push(i32, tmp, guard)
+            list.push(i32, tmp, body)
+            if p.pos == before { bump(p) }          // guarantee progress
+            if cur_kind(p) == 69 { bump(p) } else { more = false }   // `,` between arms
+        }
+    }
+    var endp: usize = start
+    if cur_kind(p) == 66 { let rb: tokens.Token = cur_tok(p)  endp = rb.end  bump(p) }
+    let arm_start: i32 = list.len(i32, p.par) as i32
+    let arm_count: i32 = (list.len(i32, tmp) / 3) as i32
+    var j: usize = 0
+    for j < list.len(i32, tmp) {
+        list.push(i32, p.par, list.get(i32, tmp, j))
+        j = j + 1
+    }
+    return mk_match(p, start, endp, scrut, arm_start, arm_count)
 }
 
 // A leaf or a parenthesized group. `( e )` returns the inner expression unchanged
@@ -611,6 +877,9 @@ fn parse_primary(mut p: Parser) -> i32 {
     }
     if k == 22 {                                   // `if` -> If expression
         return parse_if(p)
+    }
+    if k == 21 {                                   // `match` -> Match expression
+        return parse_match(p)
     }
     if k == 38 {                                   // `unsafe` -> Unsafe block
         return parse_unsafe(p)
@@ -1072,6 +1341,62 @@ fn dump_stmt(read src: str, read p: Parser, sid: i32) {
     print_str(")")
 }
 
+// Dump one pattern. Wildcard/Ident/Rest/Error carry just a span. Variant emits its name
+// span, subpat count, node span, then each subpattern; StructVariant adds has_rest and emits
+// each field as `(patfield <fname span> <subpat>)`. Lit/Range dump their literal `ExprId`s
+// (via the expr `dump`); Or emits its alternative count then each alternative. Mirrors
+// `ref_dump_pat` in the reference.
+fn dump_pat(read src: str, read p: Parser, pid: i32) {
+    let d: PatData = list.get(PatData, p.pt, pid as usize)
+    print_str("(")
+    if d.kind == 0 {
+        print_str("patwild") print_uint(d.start) print_uint(d.end)
+    } else if d.kind == 1 {
+        print_str("patident") print_uint(d.start) print_uint(d.end)
+    } else if d.kind == 2 {
+        print_str("patvariant") print_int(d.x as i64) print_int(d.y as i64) print_int(d.a as i64) print_uint(d.start) print_uint(d.end)
+        var i: i32 = 0
+        for i < d.a {
+            let sp: i32 = list.get(i32, p.par, (d.op + i) as usize)
+            dump_pat(src, p, sp)
+            i = i + 1
+        }
+    } else if d.kind == 3 {
+        print_str("patstruct") print_int(d.x as i64) print_int(d.y as i64) print_int(d.b as i64) print_int(d.a as i64) print_uint(d.start) print_uint(d.end)
+        var i: i32 = 0
+        for i < d.a {
+            let base: i32 = d.op + i * 3
+            let fs: i32 = list.get(i32, p.par, base as usize)
+            let fe: i32 = list.get(i32, p.par, (base + 1) as usize)
+            let sub: i32 = list.get(i32, p.par, (base + 2) as usize)
+            print_str("(") print_str("patfield") print_int(fs as i64) print_int(fe as i64)
+            dump_pat(src, p, sub)
+            print_str(")")
+            i = i + 1
+        }
+    } else if d.kind == 4 {
+        print_str("patlit")
+        dump(src, p, d.a)
+    } else if d.kind == 5 {
+        print_str("patrange") print_int(d.op as i64) print_uint(d.start) print_uint(d.end)
+        dump(src, p, d.a)
+        dump(src, p, d.b)
+    } else if d.kind == 6 {
+        print_str("pator") print_int(d.a as i64) print_uint(d.start) print_uint(d.end)
+        var i: i32 = 0
+        for i < d.a {
+            let ap: i32 = list.get(i32, p.par, (d.op + i) as usize)
+            dump_pat(src, p, ap)
+            i = i + 1
+        }
+    } else if d.kind == 7 {
+        print_str("patrest") print_uint(d.start) print_uint(d.end)
+    } else {
+        print_str("paterr") print_uint(d.start) print_uint(d.end)
+    }
+    print_str(")")
+}
+
 // Emit a flattened S-expression: `(`, the head atoms (kind label, operator/aux, start,
 // end), then each child's dump in order, then `)` — one atom per line.
 fn dump(read src: str, read p: Parser, id: i32) {
@@ -1206,6 +1531,24 @@ fn dump(read src: str, read p: Parser, id: i32) {
         // Unsafe: just its block.
         print_str("unsafe") print_uint(d.start) print_uint(d.end)
         dump(src, p, d.a)
+    } else if d.kind == 28 {
+        // Match: arm count, span, the scrutinee, then each arm as `(arm <pat> <guard-opt>
+        // <body>)` (the arm triples live at the end of the pattern child arena).
+        print_str("match") print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
+        dump(src, p, d.a)
+        var i: i32 = 0
+        for i < d.y {
+            let base: i32 = d.x + i * 3
+            let pat: i32 = list.get(i32, p.par, base as usize)
+            let guard: i32 = list.get(i32, p.par, (base + 1) as usize)
+            let body: i32 = list.get(i32, p.par, (base + 2) as usize)
+            print_str("(") print_str("arm")
+            dump_pat(src, p, pat)
+            dump_opt(src, p, guard)
+            dump(src, p, body)
+            print_str(")")
+            i = i + 1
+        }
     } else {
         print_str("error") print_uint(d.start) print_uint(d.end)
     }
@@ -1216,7 +1559,7 @@ fn dump(read src: str, read p: Parser, id: i32) {
 fn parse_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Allocator) {
     var tk: List(tokens.Token) = tokens.tokenize(src, it, kwcount, a)
     let n: usize = list.len(tokens.Token, tk)
-    var p: Parser = Parser{ toks: tk, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
+    var p: Parser = Parser{ toks: tk, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), pt: list.make(PatData, a), par: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
     let root: i32 = parse_expr(p)
     dump(src, p, root)
 }
