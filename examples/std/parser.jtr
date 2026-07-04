@@ -44,18 +44,25 @@ import "tokens"
 // 25=Unsafe 26=Char 27=Bool 28=Match. `a`/`b` are child `ExprId`s: unary/postfix use `a` for the
 // operand/base, binary uses `a`=lhs `b`=rhs, index uses `a`=base `b`=index, call/cast use
 // `a`=callee/expr. `x`/`y` are auxiliary integers: Field stores its name's source span
-// `(x, y)`; Call stores `(arg_start, arg_count)` into the arg arena; Cast stores its
-// type's source span `(x, y)`; the variable-arity literals (Call/ArrayLit/StructLit/
-// GenStructLit) store `(start, count)` slices into the arg arena. Unused aux fields are -1.
+// `(x, y)`; Call stores `(arg_start, arg_count)` into the arg arena; Cast stores its target
+// type's `TypeId` in `x`; the variable-arity literals (Call/ArrayLit/StructLit/GenStructLit)
+// store `(start, count)` slices into the arg arena. Unused aux fields are -1.
 struct ExprData { kind: i32, start: usize, end: usize, op: i32, a: i32, b: i32, x: i32, y: i32 }
 
 // A binary-operator lookup: whether `k` is an infix operator, its left/right binding
 // powers (precedence climbing), and its `BinOp` code. Mirrors `bin_op` in the reference.
 struct BinInfo { ok: bool, lbp: i32, rbp: i32, code: i32 }
 
-// A parsed type's source span (this slice only needs the span, not a structural type
-// node — the cast dump verifies the type by its `[start, end)` bytes).
-struct TySpan { start: usize, end: usize }
+// One type arena node (`TypeId` = index into `ty`). `kind`: 0=Name 1=TypeKw 2=Ptr 3=Slice
+// 4=Array 5=GenRef 6=RegionRef 7=App 8=Path 9=Fn 10=Dyn 11=Error.
+//   Name/TypeKw/Error: span only. Dyn: `(x,y)`=trait-name span.
+//   Ptr: `op`=mutbl (0=default,1=mut,2=const), `a`=inner. Slice/GenRef: `a`=inner.
+//   Array: `a`=elem, `b`=len `ExprId`. RegionRef: `(x,y)`=region span, `a`=inner.
+//   App `Ctor(args)`: `(x,y)`=ctor span, `(op,a)`=(arg_start, arg_count) of `TypeId`s in `tar`.
+//   Path `mod.Type(args)`: `(x,y)`=module span, `(z,w)`=type-name span, `(op,a)`=arg slice.
+//   Fn `fn(conv T,…) -> conv R`: `(op,a)`=(param_start, param_count) of (conv, `TypeId`) pairs
+//     in `tar`; `b`=ret_conv; `x`=ret `TypeId` (-1 if none).
+struct TypeData { kind: i32, start: usize, end: usize, op: i32, a: i32, b: i32, x: i32, y: i32, z: i32, w: i32 }
 
 // The whole parser state, threaded `mut` through the recursive descent:
 //   toks  — the token vector (read-only input)
@@ -70,11 +77,11 @@ struct TySpan { start: usize, end: usize }
 // parse; it is threaded now so those headers only need to flip it.
 // One statement arena node (`StmtId` = index into `st`). `kind`: 0=Let 1=Return 2=Expr.
 //   Let:    `op`=mutbl (0=`let`, 1=`var`); `a`=init `ExprId` (-1 if none); `(x, y)`=the
-//           variable name's source span; `(ts, te)`=the type annotation's source span
-//           (`ts`=-1 when there is no `: T`). `start`/`end` = the whole statement span.
+//           variable name's source span; `ty`=the annotation's `TypeId` (-1 if no `: T`).
+//           `start`/`end` = the whole statement span.
 //   Return: `a`=value `ExprId` (-1 if bare). `start`/`end` = the statement span.
 //   Expr:   `a`=the expression `ExprId`. (No own span — the dump uses the expr's.)
-struct StmtData { kind: i32, start: usize, end: usize, op: i32, a: i32, x: i32, y: i32, ts: i32, te: i32 }
+struct StmtData { kind: i32, start: usize, end: usize, op: i32, a: i32, x: i32, y: i32, ty: i32 }
 
 // One pattern arena node (`PatId` = index into `pt`). `kind`: 0=Wildcard 1=Ident 2=Variant
 // 3=StructVariant 4=Lit 5=Range 6=Or 7=Rest 8=Error.
@@ -90,9 +97,11 @@ struct PatData { kind: i32, start: usize, end: usize, op: i32, a: i32, b: i32, x
 
 // `st` is the statement arena; `sar` the statement-id child arena a Block slices. `pt` is
 // the pattern arena; `par` a shared i32 child arena for pattern children (variant subpats,
-// or-alternatives, struct-variant field triples) *and* match-arm triples (pat, guard, body)
-// — all buffered-then-appended so nested parses don't scatter an enclosing slice.
-struct Parser { toks: List(tokens.Token), ex: List(ExprData), ar: List(i32), st: List(StmtData), sar: List(i32), pt: List(PatData), par: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool, no_struct: bool }
+// or-alternatives, struct-variant field triples) *and* match-arm triples (pat, guard, body).
+// `ty` is the type arena; `tar` a type-child arena for App/Path type args and Fn (conv, ty)
+// param pairs. All child arenas are buffered-then-appended so nested parses don't scatter an
+// enclosing slice.
+struct Parser { toks: List(tokens.Token), ex: List(ExprData), ar: List(i32), st: List(StmtData), sar: List(i32), pt: List(PatData), par: List(i32), ty: List(TypeData), tar: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool, no_struct: bool }
 
 // The result of parsing a `{ field, …, ..spread }` initializer body: the field-init nodes'
 // slice into the arg arena, the optional spread expr (-1 if none), and the `}` end offset.
@@ -158,10 +167,10 @@ fn mk_call(mut p: Parser, start: usize, end: usize, callee: i32, arg_start: i32,
     list.push(ExprData, p.ex, ExprData{ kind: 10, start: start, end: end, op: 0, a: callee, b: 0 - 1, x: arg_start, y: arg_count })
     return id
 }
-// A Cast node `expr as T`: `a` is the expr, `(x, y)` the type's source span.
-fn mk_cast(mut p: Parser, start: usize, end: usize, expr: i32, ty_start: usize, ty_end: usize) -> i32 {
+// A Cast node `expr as T`: `a` is the expr, `x` the target type's `TypeId`.
+fn mk_cast(mut p: Parser, start: usize, end: usize, expr: i32, tyid: i32) -> i32 {
     let id: i32 = list.len(ExprData, p.ex) as i32
-    list.push(ExprData, p.ex, ExprData{ kind: 11, start: start, end: end, op: 0, a: expr, b: 0 - 1, x: ty_start as i32, y: ty_end as i32 })
+    list.push(ExprData, p.ex, ExprData{ kind: 11, start: start, end: end, op: 0, a: expr, b: 0 - 1, x: tyid, y: 0 - 1 })
     return id
 }
 // An Assign node `target op= value`: `op` is the AssignOp code, `a`=target, `b`=value.
@@ -291,23 +300,99 @@ fn node_pat_end(read p: Parser, id: i32) -> usize {
     return d.end
 }
 
-// A `let`/`var` statement: `op`=mutbl, `(x,y)`=name span, `(ts,te)`=type span (ts=-1 none),
+// ---- type arena constructors ----
+// A span-only type node (Name=0, TypeKw=1, Error=11).
+fn mk_ty(mut p: Parser, kind: i32, start: usize, end: usize) -> i32 {
+    let id: i32 = list.len(TypeData, p.ty) as i32
+    list.push(TypeData, p.ty, TypeData{ kind: kind, start: start, end: end, op: 0 - 1, a: 0 - 1, b: 0 - 1, x: 0 - 1, y: 0 - 1, z: 0 - 1, w: 0 - 1 })
+    return id
+}
+// A pointer type `*T` / `*mut T` / `*const T`: `op`=mutbl, `a`=inner.
+fn mk_ty_ptr(mut p: Parser, start: usize, end: usize, mutbl: i32, inner: i32) -> i32 {
+    let id: i32 = list.len(TypeData, p.ty) as i32
+    list.push(TypeData, p.ty, TypeData{ kind: 2, start: start, end: end, op: mutbl, a: inner, b: 0 - 1, x: 0 - 1, y: 0 - 1, z: 0 - 1, w: 0 - 1 })
+    return id
+}
+// A single-inner type (Slice=3, GenRef=5): `a`=inner.
+fn mk_ty_wrap(mut p: Parser, kind: i32, start: usize, end: usize, inner: i32) -> i32 {
+    let id: i32 = list.len(TypeData, p.ty) as i32
+    list.push(TypeData, p.ty, TypeData{ kind: kind, start: start, end: end, op: 0 - 1, a: inner, b: 0 - 1, x: 0 - 1, y: 0 - 1, z: 0 - 1, w: 0 - 1 })
+    return id
+}
+// An array type `[N]T`: `a`=elem, `b`=len ExprId.
+fn mk_ty_array(mut p: Parser, start: usize, end: usize, elem: i32, len: i32) -> i32 {
+    let id: i32 = list.len(TypeData, p.ty) as i32
+    list.push(TypeData, p.ty, TypeData{ kind: 4, start: start, end: end, op: 0 - 1, a: elem, b: len, x: 0 - 1, y: 0 - 1, z: 0 - 1, w: 0 - 1 })
+    return id
+}
+// A region reference `&[r]T`: `(x,y)`=region span, `a`=inner.
+fn mk_ty_regionref(mut p: Parser, start: usize, end: usize, rs: usize, re: usize, inner: i32) -> i32 {
+    let id: i32 = list.len(TypeData, p.ty) as i32
+    list.push(TypeData, p.ty, TypeData{ kind: 6, start: start, end: end, op: 0 - 1, a: inner, b: 0 - 1, x: rs as i32, y: re as i32, z: 0 - 1, w: 0 - 1 })
+    return id
+}
+// A generic application `Ctor(args)`: `(x,y)`=ctor span, `(op,a)`=(arg_start, arg_count).
+fn mk_ty_app(mut p: Parser, start: usize, end: usize, cs: usize, ce: usize, arg_start: i32, arg_count: i32) -> i32 {
+    let id: i32 = list.len(TypeData, p.ty) as i32
+    list.push(TypeData, p.ty, TypeData{ kind: 7, start: start, end: end, op: arg_start, a: arg_count, b: 0 - 1, x: cs as i32, y: ce as i32, z: 0 - 1, w: 0 - 1 })
+    return id
+}
+// A module-qualified path `mod.Type(args)`: `(x,y)`=module span, `(z,w)`=name span,
+// `(op,a)`=(arg_start, arg_count).
+fn mk_ty_path(mut p: Parser, start: usize, end: usize, ms: usize, me: usize, ns: usize, ne: usize, arg_start: i32, arg_count: i32) -> i32 {
+    let id: i32 = list.len(TypeData, p.ty) as i32
+    list.push(TypeData, p.ty, TypeData{ kind: 8, start: start, end: end, op: arg_start, a: arg_count, b: 0 - 1, x: ms as i32, y: me as i32, z: ns as i32, w: ne as i32 })
+    return id
+}
+// A function-pointer type `fn(conv T,…) -> conv R`: `(op,a)`=(param_start, param_count) of
+// (conv, TypeId) pairs, `b`=ret_conv, `x`=ret TypeId (-1 if none).
+fn mk_ty_fn(mut p: Parser, start: usize, end: usize, param_start: i32, param_count: i32, ret_conv: i32, ret: i32) -> i32 {
+    let id: i32 = list.len(TypeData, p.ty) as i32
+    list.push(TypeData, p.ty, TypeData{ kind: 9, start: start, end: end, op: param_start, a: param_count, b: ret_conv, x: ret, y: 0 - 1, z: 0 - 1, w: 0 - 1 })
+    return id
+}
+// A `dyn Trait` type: `(x,y)`=trait-name span.
+fn mk_ty_dyn(mut p: Parser, start: usize, end: usize, ns: usize, ne: usize) -> i32 {
+    let id: i32 = list.len(TypeData, p.ty) as i32
+    list.push(TypeData, p.ty, TypeData{ kind: 10, start: start, end: end, op: 0 - 1, a: 0 - 1, b: 0 - 1, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1 })
+    return id
+}
+fn node_ty_start(read p: Parser, id: i32) -> usize {
+    let d: TypeData = list.get(TypeData, p.ty, id as usize)
+    return d.start
+}
+fn node_ty_end(read p: Parser, id: i32) -> usize {
+    let d: TypeData = list.get(TypeData, p.ty, id as usize)
+    return d.end
+}
+// The passing convention on the current token (0=default 1=read 2=mut 3=take 4=out),
+// consumed if present. Mirrors `parse_conv`.
+fn parse_conv(mut p: Parser) -> i32 {
+    let k: i32 = cur_kind(p)
+    if k == 54 { bump(p)  return 1 }               // read
+    if k == 55 { bump(p)  return 2 }               // mut
+    if k == 56 { bump(p)  return 3 }               // take
+    if k == 57 { bump(p)  return 4 }               // out
+    return 0
+}
+
+// A `let`/`var` statement: `op`=mutbl, `(x,y)`=name span, `ty`=type TypeId (-1 none),
 // `a`=init ExprId (-1 none).
-fn mk_let(mut p: Parser, start: usize, end: usize, mutbl: i32, ns: usize, ne: usize, ts: i32, te: i32, init: i32) -> i32 {
+fn mk_let(mut p: Parser, start: usize, end: usize, mutbl: i32, ns: usize, ne: usize, tyid: i32, init: i32) -> i32 {
     let id: i32 = list.len(StmtData, p.st) as i32
-    list.push(StmtData, p.st, StmtData{ kind: 0, start: start, end: end, op: mutbl, a: init, x: ns as i32, y: ne as i32, ts: ts, te: te })
+    list.push(StmtData, p.st, StmtData{ kind: 0, start: start, end: end, op: mutbl, a: init, x: ns as i32, y: ne as i32, ty: tyid })
     return id
 }
 // A `return [expr]` statement: `a`=value ExprId (-1 if bare).
 fn mk_return(mut p: Parser, start: usize, end: usize, value: i32) -> i32 {
     let id: i32 = list.len(StmtData, p.st) as i32
-    list.push(StmtData, p.st, StmtData{ kind: 1, start: start, end: end, op: 0, a: value, x: 0 - 1, y: 0 - 1, ts: 0 - 1, te: 0 - 1 })
+    list.push(StmtData, p.st, StmtData{ kind: 1, start: start, end: end, op: 0, a: value, x: 0 - 1, y: 0 - 1, ty: 0 - 1 })
     return id
 }
 // An expression statement: `a`=the expression (its own span drives the dump).
 fn mk_exprstmt(mut p: Parser, e: i32) -> i32 {
     let id: i32 = list.len(StmtData, p.st) as i32
-    list.push(StmtData, p.st, StmtData{ kind: 2, start: 0, end: 0, op: 0, a: e, x: 0 - 1, y: 0 - 1, ts: 0 - 1, te: 0 - 1 })
+    list.push(StmtData, p.st, StmtData{ kind: 2, start: 0, end: 0, op: 0, a: e, x: 0 - 1, y: 0 - 1, ty: 0 - 1 })
     return id
 }
 fn node_start(read p: Parser, id: i32) -> usize {
@@ -564,17 +649,14 @@ fn parse_stmt(mut p: Parser) -> i32 {
         var ns: usize = start                      // the variable name's span
         var ne: usize = start
         if cur_kind(p) == 0 { let nt: tokens.Token = cur_tok(p)  ns = nt.start  ne = nt.end  bump(p) }
-        var ts: i32 = 0 - 1                        // optional `: T` type annotation
-        var te: i32 = 0 - 1
+        var tyid: i32 = 0 - 1                       // optional `: T` type annotation
         if cur_kind(p) == 71 {                      // `:`
             bump(p)
-            let ty: TySpan = parse_type(p)
-            ts = ty.start as i32
-            te = ty.end as i32
+            tyid = parse_type(p)
         }
         var init: i32 = 0 - 1                       // optional `= expr` initializer
         if cur_kind(p) == 84 { bump(p)  init = parse_expr(p) }   // `=`
-        return mk_let(p, start, prev_end(p), mutbl, ns, ne, ts, te, init)
+        return mk_let(p, start, prev_end(p), mutbl, ns, ne, tyid, init)
     }
     // Block-led expressions in statement position parse *block-only* (no trailing operator).
     if k == 65 or k == 22 or k == 21 or k == 38 {  // `{` / `if` / `match` / `unsafe`
@@ -973,28 +1055,154 @@ fn parse_primary(mut p: Parser) -> i32 {
     return mk(p, 9, 0, 0, 0, 0 - 1, 0 - 1)
 }
 
-// Consume a type and return its source span. Handles the forms that appear after `as` in
-// the corpus: a pointer prefix `*` (optionally `mut`/`const`) wrapping a type, or a bare
-// type name. (The full structural type parser is a later slice; the cast dump only needs
-// the span, and this consumes exactly the tokens the reference `parse_type` does for these
-// forms, so the spans agree.)
-fn parse_type(mut p: Parser) -> TySpan {
+// Parse a type, building a structural `TypeData` node and returning its `TypeId`. Mirrors
+// `parse_type`: pointers `*[mut|const]T`, `indirect T` (sugar for `*T`), the `type` keyword,
+// slices `[]T`, arrays `[N]T`, references `&T` / `&[r]T`, module paths `mod.Type(args)`,
+// applications `Ctor(args)`, `dyn Trait`, function pointers `fn(conv T,…) -> conv R`, and
+// bare names (incl. `Self`). Type-arg / fn-param child lists are buffered then appended to
+// `tar` so a nested type's own children don't scatter the slice.
+fn parse_type(mut p: Parser) -> i32 {
     let k: i32 = cur_kind(p)
-    if k == 81 {                                   // '*' -> pointer
-        let st: tokens.Token = cur_tok(p)
+    let tok: tokens.Token = cur_tok(p)
+    let start: usize = tok.start
+    if k == 81 {                                   // `*` -> pointer
         bump(p)
-        let k2: i32 = cur_kind(p)
-        if k2 == 55 { bump(p) }                    // 'mut'
-        else if k2 == 10 { bump(p) }               // 'const'
-        let inner: TySpan = parse_type(p)
-        return TySpan{ start: st.start, end: inner.end }
+        var mutbl: i32 = 0
+        if cur_kind(p) == 55 { bump(p)  mutbl = 1 }        // `mut`
+        else if cur_kind(p) == 10 { bump(p)  mutbl = 2 }   // `const`
+        let inner: i32 = parse_type(p)
+        return mk_ty_ptr(p, start, node_ty_end(p, inner), mutbl, inner)
     }
-    if p.pos < p.n {                               // a type name (or, best-effort, one token)
-        let t: tokens.Token = cur_tok(p)
+    if k == 17 {                                   // the `type` keyword
         bump(p)
-        return TySpan{ start: t.start, end: t.end }
+        return mk_ty(p, 1, tok.start, tok.end)
     }
-    return TySpan{ start: 0, end: 0 }
+    if k == 19 {                                   // `indirect T` -> sugar for `*T`
+        bump(p)
+        let inner: i32 = parse_type(p)
+        return mk_ty_ptr(p, start, node_ty_end(p, inner), 0, inner)
+    }
+    if k == 67 {                                   // `[` -> slice `[]T` or array `[N]T`
+        bump(p)
+        if cur_kind(p) == 68 {                     // `]` -> slice
+            bump(p)
+            let inner: i32 = parse_type(p)
+            return mk_ty_wrap(p, 3, start, node_ty_end(p, inner), inner)
+        }
+        let len: i32 = parse_expr(p)               // `[N]T`
+        if cur_kind(p) == 68 { bump(p) }           // `]`
+        let elem: i32 = parse_type(p)
+        return mk_ty_array(p, start, node_ty_end(p, elem), elem, len)
+    }
+    if k == 91 {                                   // `&` -> reference `&T` / `&[r]T`
+        bump(p)
+        if cur_kind(p) == 67 {                     // `[r]` region tag
+            bump(p)
+            var rs: usize = start  var re: usize = start
+            if cur_kind(p) == 0 { let rt: tokens.Token = cur_tok(p)  rs = rt.start  re = rt.end  bump(p) }
+            if cur_kind(p) == 68 { bump(p) }       // `]`
+            let inner: i32 = parse_type(p)
+            return mk_ty_regionref(p, start, node_ty_end(p, inner), rs, re, inner)
+        }
+        let inner: i32 = parse_type(p)             // `&T`
+        return mk_ty_wrap(p, 5, start, node_ty_end(p, inner), inner)
+    }
+    if k == 0 {                                    // Ident -> Name / App / Path
+        bump(p)
+        if cur_kind(p) == 73 {                     // `.` -> module path `mod.Type(args)`
+            bump(p)
+            var ns: usize = tok.end  var ne: usize = tok.end
+            if cur_kind(p) == 0 { let nt: tokens.Token = cur_tok(p)  ns = nt.start  ne = nt.end  bump(p) }
+            var arg_start: i32 = list.len(i32, p.tar) as i32
+            var arg_count: i32 = 0
+            if cur_kind(p) == 63 {                 // `(args)`
+                arg_start = parse_type_args(p)
+                arg_count = (list.len(i32, p.tar) as i32) - arg_start
+            }
+            return mk_ty_path(p, tok.start, prev_end(p), tok.start, tok.end, ns, ne, arg_start, arg_count)
+        }
+        if cur_kind(p) == 63 {                     // `(args)` -> application `Ctor(args)`
+            let arg_start: i32 = parse_type_args(p)
+            let arg_count: i32 = (list.len(i32, p.tar) as i32) - arg_start
+            return mk_ty_app(p, tok.start, prev_end(p), tok.start, tok.end, arg_start, arg_count)
+        }
+        return mk_ty(p, 0, tok.start, tok.end)     // a bare Name
+    }
+    if k == 62 {                                   // `Self` -> a Name type
+        bump(p)
+        return mk_ty(p, 0, tok.start, tok.end)
+    }
+    if k == 52 {                                   // `dyn Trait`
+        bump(p)
+        var ns: usize = tok.end  var ne: usize = tok.end
+        if cur_kind(p) == 0 { let nt: tokens.Token = cur_tok(p)  ns = nt.start  ne = nt.end  bump(p) }
+        return mk_ty_dyn(p, start, prev_end(p), ns, ne)
+    }
+    if k == 7 {                                    // `fn(…) -> R` function-pointer type
+        bump(p)
+        if cur_kind(p) == 63 { bump(p) }           // `(`
+        var tmp: List(i32) = list.make(i32, p.alloc)   // (conv, ty) pairs
+        var more: bool = true
+        for more {
+            let pk: i32 = cur_kind(p)
+            if pk == 64 { more = false }           // `)`
+            else if pk == 110 { more = false }     // Eof
+            else {
+                let before: usize = p.pos
+                let conv: i32 = parse_conv(p)
+                let pty: i32 = parse_type(p)
+                list.push(i32, tmp, conv)
+                list.push(i32, tmp, pty)
+                if p.pos == before { bump(p) }
+                if cur_kind(p) == 69 { bump(p) } else { more = false }   // `,`
+            }
+        }
+        if cur_kind(p) == 64 { bump(p) }           // `)`
+        var ret_conv: i32 = 0
+        var ret: i32 = 0 - 1
+        if cur_kind(p) == 77 {                      // `->`
+            bump(p)
+            ret_conv = parse_conv(p)
+            ret = parse_type(p)
+        }
+        let param_start: i32 = list.len(i32, p.tar) as i32
+        let param_count: i32 = (list.len(i32, tmp) / 2) as i32
+        var j: usize = 0
+        for j < list.len(i32, tmp) {
+            list.push(i32, p.tar, list.get(i32, tmp, j))
+            j = j + 1
+        }
+        return mk_ty_fn(p, start, prev_end(p), param_start, param_count, ret_conv, ret)
+    }
+    bump(p)                                        // unrecognized -> Error over one token
+    return mk_ty(p, 11, tok.start, tok.end)
+}
+
+// Parse `(t0, t1, …)` type arguments (cur is `(`), append them contiguously to `tar`, and
+// return their `arg_start`. The caller reads `arg_count = len(tar) - arg_start`. Args are
+// buffered first so a nested App/Path/Fn's own args don't scatter this slice.
+fn parse_type_args(mut p: Parser) -> i32 {
+    bump(p)                                        // consume `(`
+    var tmp: List(i32) = list.make(i32, p.alloc)
+    var more: bool = true
+    for more {
+        let k: i32 = cur_kind(p)
+        if k == 64 { more = false }                // `)`
+        else if k == 110 { more = false }          // Eof
+        else {
+            let a: i32 = parse_type(p)
+            list.push(i32, tmp, a)
+            if cur_kind(p) == 69 { bump(p) } else { more = false }   // `,`
+        }
+    }
+    if cur_kind(p) == 64 { bump(p) }               // `)`
+    let arg_start: i32 = list.len(i32, p.tar) as i32
+    var j: usize = 0
+    for j < list.len(i32, tmp) {
+        list.push(i32, p.tar, list.get(i32, tmp, j))
+        j = j + 1
+    }
+    return arg_start
 }
 
 // Postfix chain: a primary followed by any run of `.field`, `[index]`, `.*` (deref), `?`
@@ -1105,9 +1313,9 @@ fn parse_cast(mut p: Parser) -> i32 {
             if !descend(p) { go = false }
             else {
                 bump(p)
-                let ts: TySpan = parse_type(p)
+                let tid: i32 = parse_type(p)
                 let s: usize = node_start(p, e)
-                e = mk_cast(p, s, ts.end, e, ts.start, ts.end)
+                e = mk_cast(p, s, node_ty_end(p, tid), e, tid)
             }
         } else {
             go = false
@@ -1320,16 +1528,80 @@ fn dump_fstring(read src: str, start: usize, end: usize) {
     }
 }
 
-// Dump one statement. `let`: mutbl flag, name span, statement span, an optional `(type s e)`
-// (or `(none)`), then the optional initializer. `return`: statement span then the optional
-// value. `exprstmt`: just the wrapped expression. Mirrors `ref_dump_stmt` in the reference.
+// Dump one type structurally. Names/`type`/errors carry a span; pointers/slices/refs recurse
+// into their inner type; App/Path emit their name spans + arg count + each arg type; Fn emits
+// each `(tyfnparam <conv> <ty>)` and an optional return type. Mirrors `ref_dump_type`.
+fn dump_type(read src: str, read p: Parser, tid: i32) {
+    let d: TypeData = list.get(TypeData, p.ty, tid as usize)
+    print_str("(")
+    if d.kind == 0 {
+        print_str("tyname") print_uint(d.start) print_uint(d.end)
+    } else if d.kind == 1 {
+        print_str("tykw") print_uint(d.start) print_uint(d.end)
+    } else if d.kind == 2 {
+        print_str("typtr") print_int(d.op as i64) print_uint(d.start) print_uint(d.end)
+        dump_type(src, p, d.a)
+    } else if d.kind == 3 {
+        print_str("tyslice") print_uint(d.start) print_uint(d.end)
+        dump_type(src, p, d.a)
+    } else if d.kind == 4 {
+        print_str("tyarray") print_uint(d.start) print_uint(d.end)
+        dump(src, p, d.b)                          // the length expression
+        dump_type(src, p, d.a)                     // the element type
+    } else if d.kind == 5 {
+        print_str("tygenref") print_uint(d.start) print_uint(d.end)
+        dump_type(src, p, d.a)
+    } else if d.kind == 6 {
+        print_str("tyregionref") print_int(d.x as i64) print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
+        dump_type(src, p, d.a)
+    } else if d.kind == 7 {
+        print_str("tyapp") print_int(d.x as i64) print_int(d.y as i64) print_int(d.a as i64) print_uint(d.start) print_uint(d.end)
+        var i: i32 = 0
+        for i < d.a {
+            let arg: i32 = list.get(i32, p.tar, (d.op + i) as usize)
+            dump_type(src, p, arg)
+            i = i + 1
+        }
+    } else if d.kind == 8 {
+        print_str("typath") print_int(d.x as i64) print_int(d.y as i64) print_int(d.z as i64) print_int(d.w as i64) print_int(d.a as i64) print_uint(d.start) print_uint(d.end)
+        var i: i32 = 0
+        for i < d.a {
+            let arg: i32 = list.get(i32, p.tar, (d.op + i) as usize)
+            dump_type(src, p, arg)
+            i = i + 1
+        }
+    } else if d.kind == 9 {
+        print_str("tyfn") print_int(d.a as i64) print_int(d.b as i64) print_uint(d.start) print_uint(d.end)
+        var i: i32 = 0
+        for i < d.a {
+            let base: i32 = d.op + i * 2
+            let conv: i32 = list.get(i32, p.tar, base as usize)
+            let pty: i32 = list.get(i32, p.tar, (base + 1) as usize)
+            print_str("(") print_str("tyfnparam") print_int(conv as i64)
+            dump_type(src, p, pty)
+            print_str(")")
+            i = i + 1
+        }
+        if d.x < 0 { print_str("(") print_str("none") print_str(")") }
+        else { dump_type(src, p, d.x) }
+    } else if d.kind == 10 {
+        print_str("tydyn") print_int(d.x as i64) print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
+    } else {
+        print_str("tyerr") print_uint(d.start) print_uint(d.end)
+    }
+    print_str(")")
+}
+
+// Dump one statement. `let`: mutbl flag, name span, statement span, an optional structural
+// type (or `(none)`), then the optional initializer. `return`: statement span then the
+// optional value. `exprstmt`: just the wrapped expression. Mirrors `ref_dump_stmt`.
 fn dump_stmt(read src: str, read p: Parser, sid: i32) {
     let s: StmtData = list.get(StmtData, p.st, sid as usize)
     print_str("(")
     if s.kind == 0 {
         print_str("let") print_int(s.op as i64) print_int(s.x as i64) print_int(s.y as i64) print_uint(s.start) print_uint(s.end)
-        if s.ts < 0 { print_str("(") print_str("none") print_str(")") }
-        else { print_str("(") print_str("type") print_int(s.ts as i64) print_int(s.te as i64) print_str(")") }
+        if s.ty < 0 { print_str("(") print_str("none") print_str(")") }
+        else { dump_type(src, p, s.ty) }
         dump_opt(src, p, s.a)
     } else if s.kind == 1 {
         print_str("return") print_uint(s.start) print_uint(s.end)
@@ -1445,9 +1717,10 @@ fn dump(read src: str, read p: Parser, id: i32) {
             i = i + 1
         }
     } else if d.kind == 11 {
-        // Cast: the target type's source span (x, y), then the operand.
-        print_str("cast") print_int(d.x as i64) print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
+        // Cast: the operand, then the target type (structural, `x`=TypeId).
+        print_str("cast") print_uint(d.start) print_uint(d.end)
         dump(src, p, d.a)
+        dump_type(src, p, d.x)
     } else if d.kind == 12 {
         print_str("assign") assign_label(d.op) print_uint(d.start) print_uint(d.end)
         dump(src, p, d.a)
@@ -1559,7 +1832,7 @@ fn dump(read src: str, read p: Parser, id: i32) {
 fn parse_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Allocator) {
     var tk: List(tokens.Token) = tokens.tokenize(src, it, kwcount, a)
     let n: usize = list.len(tokens.Token, tk)
-    var p: Parser = Parser{ toks: tk, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), pt: list.make(PatData, a), par: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
+    var p: Parser = Parser{ toks: tk, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), pt: list.make(PatData, a), par: list.make(i32, a), ty: list.make(TypeData, a), tar: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
     let root: i32 = parse_expr(p)
     dump(src, p, root)
 }

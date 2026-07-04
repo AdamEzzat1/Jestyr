@@ -5850,14 +5850,7 @@ mod c_oracle {
                 out.push(span.start.to_string());
                 out.push(span.end.to_string());
                 match ty {
-                    Some(tid) => {
-                        let tsp = ast.type_at(*tid).span;
-                        out.push("(".to_string());
-                        out.push("type".to_string());
-                        out.push(tsp.start.to_string());
-                        out.push(tsp.end.to_string());
-                        out.push(")".to_string());
-                    }
+                    Some(tid) => ref_dump_type(ast, *tid, out),
                     None => {
                         out.push("(".to_string());
                         out.push("none".to_string());
@@ -5898,6 +5891,138 @@ mod c_oracle {
     fn ref_dump_block(ast: &crate::ast::Ast, b: &crate::ast::Block, out: &mut Vec<String>) {
         out.push("(".to_string());
         ref_dump_block_body(ast, b, out);
+        out.push(")".to_string());
+    }
+
+    fn ref_conv_code(c: crate::ast::Conv) -> i32 {
+        use crate::ast::Conv;
+        match c {
+            Conv::Default => 0,
+            Conv::Read => 1,
+            Conv::Mut => 2,
+            Conv::Take => 3,
+            Conv::Out => 4,
+        }
+    }
+
+    /// Dump one type structurally (matching the Jestyr `dump_type`). Names/`type`/errors carry
+    /// a span; pointers/slices/refs recurse into their inner; App/Path emit their name spans +
+    /// arg count + args; Fn emits `(tyfnparam <conv> <ty>)` params and an optional return type.
+    fn ref_dump_type(ast: &crate::ast::Ast, tid: crate::ast::TypeId, out: &mut Vec<String>) {
+        use crate::ast::{PtrMut, TypeKind};
+        let t = ast.type_at(tid);
+        let s = t.span.start.to_string();
+        let en = t.span.end.to_string();
+        out.push("(".to_string());
+        match &t.kind {
+            TypeKind::Name(_) => {
+                out.push("tyname".to_string());
+                out.push(s);
+                out.push(en);
+            }
+            TypeKind::TypeKw => {
+                out.push("tykw".to_string());
+                out.push(s);
+                out.push(en);
+            }
+            TypeKind::Ptr { mutbl, inner } => {
+                let m = match mutbl {
+                    PtrMut::Default => 0,
+                    PtrMut::Mut => 1,
+                    PtrMut::Const => 2,
+                };
+                out.push("typtr".to_string());
+                out.push(m.to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_type(ast, *inner, out);
+            }
+            TypeKind::Slice(inner) => {
+                out.push("tyslice".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_type(ast, *inner, out);
+            }
+            TypeKind::Array { len, elem } => {
+                out.push("tyarray".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *len, out);
+                ref_dump_type(ast, *elem, out);
+            }
+            TypeKind::GenRef(inner) => {
+                out.push("tygenref".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_type(ast, *inner, out);
+            }
+            TypeKind::RegionRef { region, inner } => {
+                out.push("tyregionref".to_string());
+                out.push(region.span.start.to_string());
+                out.push(region.span.end.to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_type(ast, *inner, out);
+            }
+            TypeKind::App { ctor, args } => {
+                out.push("tyapp".to_string());
+                out.push(ctor.span.start.to_string());
+                out.push(ctor.span.end.to_string());
+                out.push(args.len().to_string());
+                out.push(s);
+                out.push(en);
+                for a in args {
+                    ref_dump_type(ast, *a, out);
+                }
+            }
+            TypeKind::Path { module, name, args } => {
+                out.push("typath".to_string());
+                out.push(module.span.start.to_string());
+                out.push(module.span.end.to_string());
+                out.push(name.span.start.to_string());
+                out.push(name.span.end.to_string());
+                out.push(args.len().to_string());
+                out.push(s);
+                out.push(en);
+                for a in args {
+                    ref_dump_type(ast, *a, out);
+                }
+            }
+            TypeKind::Fn { params, ret_conv, ret } => {
+                out.push("tyfn".to_string());
+                out.push(params.len().to_string());
+                out.push(ref_conv_code(*ret_conv).to_string());
+                out.push(s);
+                out.push(en);
+                for pm in params {
+                    out.push("(".to_string());
+                    out.push("tyfnparam".to_string());
+                    out.push(ref_conv_code(pm.conv).to_string());
+                    ref_dump_type(ast, pm.ty, out);
+                    out.push(")".to_string());
+                }
+                match ret {
+                    Some(r) => ref_dump_type(ast, *r, out),
+                    None => {
+                        out.push("(".to_string());
+                        out.push("none".to_string());
+                        out.push(")".to_string());
+                    }
+                }
+            }
+            TypeKind::Dyn(name) => {
+                out.push("tydyn".to_string());
+                out.push(name.span.start.to_string());
+                out.push(name.span.end.to_string());
+                out.push(s);
+                out.push(en);
+            }
+            TypeKind::Error => {
+                out.push("tyerr".to_string());
+                out.push(s);
+                out.push(en);
+            }
+        }
         out.push(")".to_string());
     }
 
@@ -6079,16 +6204,13 @@ mod c_oracle {
                     ref_dump_expr(ast, *arg, out);
                 }
             }
-            // Cast: the target type's source span (matching the Jestyr parser, which
-            // dumps the type by span rather than structure this slice), then the operand.
+            // Cast: the operand, then the target type (structural).
             ExprKind::Cast { expr, ty } => {
-                let tsp = ast.type_at(*ty).span;
                 out.push("cast".to_string());
-                out.push(tsp.start.to_string());
-                out.push(tsp.end.to_string());
                 out.push(s);
                 out.push(en);
                 ref_dump_expr(ast, *expr, out);
+                ref_dump_type(ast, *ty, out);
             }
             // Assign: the compound operator, then target and value.
             ExprKind::Assign { op, target, value } => {
@@ -6453,6 +6575,24 @@ mod c_oracle {
             "match v { pair(a, ..) => a }", // `..` rest as the last variant field
             "match x { 'a' => 1, 'z' => 2, _ => 0 }", // char-literal patterns
             "match b { true => 1, false => 0 }", // bool-literal patterns
+            // structural types (via casts and let annotations)
+            "x as *mut u8",              // pointer, mut
+            "x as *const T",             // pointer, const
+            "x as List(i32)",            // generic application
+            "x as Map(K, V)",            // several type args
+            "x as []u8",                 // slice
+            "x as [16]u8",               // fixed-size array (const length)
+            "x as &T",                   // generational reference
+            "x as &[r]T",                // region reference
+            "x as dyn Show",             // dyn trait
+            "x as mem.Alloc",            // module-qualified path (no args)
+            "x as mod.Vec(i32)",         // module path with type args
+            "x as fn(i32) -> i32",       // function-pointer type
+            "x as fn(read i32, mut u8)", // fn params with conventions, no return
+            "x as *mut List(i32)",       // nested: pointer to an application
+            "{ let p: *mut u8 = q  p }", // pointer type in a let annotation
+            "{ let xs: []i32 = ys  xs }", // slice type in a let annotation
+            "{ let m: Map(K, V) = n  m }", // generic type in a let annotation
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");
