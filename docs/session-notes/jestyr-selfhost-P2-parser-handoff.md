@@ -133,12 +133,12 @@ both dumps:
 - **impl bracket generics** `impl[T] Drop for Vec(T)` — `parse_generics` again, before the trait
   name (parse_impl 459). **extern abi** — dump the `"abi"` string text (already parsed, just add
   to the dump; ItemData has no free slot for extern → add a field or a small `ear`-style side).
-- **Attributes** `@packed`, `@align(8)`, `@section("data")` — `parse_attrs` runs **first** in
-  `parse_item` (before `pub`), and also on struct/impl **methods** and struct **fields**. Each is
-  name + args (ExprIds). **Gotcha (do this first):** attr args can be strings — `parse_primary`
-  does not yet handle `Str` (kind 3) or `Null` (60); **add those two leaves before attributes**
-  or a `@section("data")` arg becomes an `Error` node and diverges. Then thread an attr list
-  through the item dumps (fn/const/struct/field/method).
+- ~~**`Str`/`Null` leaves**~~ ✅ done (kinds 29/30) — the prerequisite for string attr args.
+- ~~**Item attributes** on fn/const/struct~~ ✅ done — `parse_attrs` runs first in `parse_item`,
+  attaching to fn/const/struct (the kinds that store attrs; others parse+discard); attr arena
+  `aar`, `ItemData.(u,v)` = the attr slice, dumped as `(attr <name text> <argcount> <args…>)`.
+  **Still to do:** attributes on struct/impl **methods** (`@inline fn`) and struct **fields**
+  (`@volatile`, after the `:`) — the reference parses these too.
 
 Once all the above land: **the whole-corpus golden** — add `parse_module` (loop `parse_item`
 until Eof, collect item ids) on the Jestyr side + a matching reference entry, then diff the
