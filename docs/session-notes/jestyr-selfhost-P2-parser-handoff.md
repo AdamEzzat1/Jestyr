@@ -5,11 +5,14 @@
 > `src/parser.rs` / `src/ast.rs` (the reference this port mirrors), and
 > `examples/std/parser.jtr` (the Jestyr parser being grown).
 >
-> **State:** the front end (lex + classify) is done and cross-checked; the **P2 expression
-> parser** is well underway — a working Pratt parser in Jestyr with a byte-exact AST-dump
-> golden against the Rust reference over a curated corpus (~75 snippets). This note captures
-> exactly what's built, the recipe for adding the next construct, the gotchas waiting in the
-> remaining forms, and the road past P2.
+> **State:** the front end (lex + classify), the **whole P2 expression parser**, the
+> **statement + block-led** layer (blocks, `if`/`else`, `unsafe`, `match`), the **type
+> parser**, the **pattern parser**, and the **item layer's infrastructure + first three item
+> kinds** (`import`/`distinct`/`const`) are all done and cross-checked with three byte-exact
+> AST-dump goldens against the Rust reference. What remains in P2: the rest of the item kinds
+> (`fn`/`struct`/`record`/`union`/`enum`/`trait`/`impl`/`extern` + attributes/contracts), then
+> the **whole-corpus** item golden over all ~122 files. This note captures what's built, the
+> recipe for adding a construct, the fn design already worked out, and the road past P2.
 
 ---
 
@@ -31,44 +34,58 @@
   bare `impl_index` lookup so a user `struct T` no longer collides with a blanket `impl[T] Drop
   for List(T)` and skips its drop glue. (`examples/std/drop_named_type_param.jtr`.)
 
-### 1b. The P2 expression parser (`examples/std/parser.jtr`)
-A Pratt (precedence-climbing) parser built on the **`Parser` struct** — threaded `mut`
-through the descent, bundling: `toks: List(tokens.Token)`, `ex: List(ExprData)` (the expr
-arena, `ExprId` = index), `ar: List(i32)` (a shared child arena for variable-arity nodes),
-`alloc: Allocator`, `pos`/`n` (cursor), `depth`/`over` (the nesting guard), `no_struct`.
-(Nesting arenas in a struct works thanks to the cgen ordering fix — it dogfoods it.)
+### 1b. The P2 parser (`examples/std/parser.jtr`)
+A recursive-descent + Pratt parser on the **`Parser` struct**, threaded `mut`, bundling
+**multiple parallel arenas** (each `List(...)`, id = index) and their i32 **child-slice
+pools**: `ex`/`ar` (expressions), `st`/`sar` (statements), `pt`/`par` (patterns; `par` also
+holds match-arm triples), `ty`/`tar` (types), `it` (items). Plus `alloc`, `pos`/`n`,
+`depth`/`over` (the nesting guard), `no_struct`. (Nesting arenas in a struct works thanks to
+the cgen ordering fix — it dogfoods it.) `src` is **not** stored (the escape checker forbids
+storing a borrowed `str` in a struct — "second-class borrow may not outlive its call"), so
+`dump*` take `read src: str` as a param; text-bearing dumps (f-strings, import paths) slice it.
 
 **Constructs handled** (each landed with its golden slice, teeth-verified):
-- Leaves: int / float / name.
+- Leaves: int / float / name / **char / bool**.
 - Prefix unary `-` `!`/`not` `~` `&`; full binary precedence table (`bin_op`); `( … )` grouping.
 - Postfix: `.field`, `[index]`, `.*` (deref), `?` (try), `(args)` (call).
-- `as` casts (named + pointer types; a minimal `parse_type` consuming exactly the reference's
-  tokens so the type's dumped **span** agrees).
-- Assignment (`=` `+=` … `^=`) — the outermost, right-associative `parse_expr` layer.
-- Ranges `..` / `..=` (infix, optional upper bound gated by `starts_expr`).
-- Array literals `[e0, …]` and `[value; count]`.
-- **Struct literals** `Path{ name: value, …, ..spread }` (fields are `FieldInit` arena nodes).
+- `as` casts (now **structural** — see the type parser below).
+- Assignment (`=` `+=` … `^=`); ranges `..` / `..=`; array literals `[e0, …]` / `[value; count]`.
+- Struct literals `Path{ …, ..spread }` and **generic struct literals** `Ctor(T…){ … }`.
+- `self` / `Self` (and `Self{ … }`); `@attr` callables; **f-strings** `f"… {x} …"` (text dump).
+- **Statements** (`let`/`var` with `: T` + `= init`, `return`, expr-stmt) and `{ … }` **blocks**.
+- **Block-led** `if`/`else`/`else if`, `unsafe { … }`, and **`match`** with a full **pattern
+  parser** (wildcard, ident binding, variant `n(subpats)`, struct-variant `n{ f, .. }`,
+  or-`a|b`, ranges, guards, `..` rest, char/bool/int/neg literals).
+- **Structural type parser** (`ty`/`tar`): Name, `type`, Ptr (`*`/`*mut`/`*const`, `indirect`),
+  Slice `[]T`, Array `[N]T`, GenRef `&T`, RegionRef `&[r]T`, App `Ctor(args)`, Path
+  `mod.Type(args)`, Fn `fn(conv T,…) -> conv R`, Dyn `dyn Trait`, Error. Cast + `let: T` carry a
+  structural `TypeId` (not a span); their dumps upgraded to full structure.
+- **Item layer** (`it`) — infra + `import "p" [as a] [= "hash"]`, `distinct N = T`,
+  `const N [: T] = v`. Selected by a 2nd CLI arg (`parser_exe <file> item`).
 
-**Variable-arity representation:** calls, array elements, and struct fields all store their
-children as a contiguous `(start, count)` slice into `ar`. The hazard: while parsing one
-node's children, a *nested* call/array/struct pushes into `ar` and scatters the slice — so
-each such node **buffers its children in a per-call temp `List(i32)` and appends them
-contiguously to `ar` after parsing**. Always use this pattern for a new variable-arity node.
+**Variable-arity representation:** every list-shaped node (call args, array/struct fields,
+type args, block statements, variant subpats, or-alts, match arms, …) stores a contiguous
+`(start, count)` slice into the relevant child pool. The hazard: a *nested* parse pushes into
+the same pool and scatters the slice — so each node **buffers its children in a per-call temp
+`List(i32)` and appends them contiguously after parsing**. Always use this pattern.
 
-**Depth guard** (§3.1, matches `MAX_EXPR_DEPTH = 256`): `descend`/`Cur.depth`/`over` bound AST
-*height* at both the recursive entry points (`parse_binary`/`parse_unary`/`parse_expr`) and the
-iterative folds/chains (`parse_binary` loop, `parse_postfix` loop). `descend` respects the
-latched `over`, so adversarial nesting bails cleanly (bounded output) instead of overflowing
-the parser — or the recursive `dump` — stack (`jestyr_parser_bounds_deep_nesting`).
+**Depth guard** (matches `MAX_EXPR_DEPTH = 256`): `descend`/`depth`/`over` bound AST *height*
+at the recursive entry points and the iterative folds/chains, so adversarial nesting bails
+cleanly instead of overflowing the parser — or the recursive `dump` — stack
+(`jestyr_parser_bounds_deep_nesting`). (Blocks nested via `parse_block_like` are *not* guarded,
+matching the reference; not in the corpus.)
 
-**The golden** (`src/proptests.rs`, `--features c-oracle`):
-- `jestyr_parser_expr_dump_matches_reference` — for each curated snippet, diffs the Jestyr
-  parser's dump vs `rust_expr_dump` (= `Parser::parse_single_expr` + `ref_dump_expr`).
-- The dump is a **flattened S-expression, one atom per line** (kind label + operator/aux +
-  exact span + children in order) — a *pure function of the arena*. Both impls emit the
-  identical stream. `ExprData` node kinds: 0 Int, 1 Float, 2 Name, 3 Unary, 4 Binary, 5 Field,
-  6 Index, 7 Deref, 8 Try, 9 Error, 10 Call, 11 Cast, 12 Assign, 13 Range, 14 ArrayLit,
-  15 ArrayRepeat, 16 StructLit, 18 FieldInit.
+**The goldens** (`src/proptests.rs`, `--features c-oracle`) — three now:
+- `jestyr_parser_expr_dump_matches_reference` (`parse_single_expr` + `ref_dump_expr`) — the
+  expression/statement/type/pattern corpus (~130 snippets).
+- `jestyr_parser_item_dump_matches_reference` (`parse_single_item` + `ref_dump_item`) — the
+  item corpus; runs the exe in **item mode** (2nd arg).
+- `jestyr_parser_bounds_deep_nesting` — the depth guard.
+- The dump is a **flattened S-expression, one atom per line** — a *pure function of the arena*;
+  both impls emit the identical stream. Node kinds are enumerated in the `ExprData` header
+  comment in `parser.jtr` (0 Int … 22 FString 23 Block 24 If 25 Unsafe 26 Char 27 Bool
+  28 Match); `PatData` / `TypeData` / `StmtData` / `ItemData` have their own kind tables in
+  their struct-header comments.
 
 ---
 
@@ -93,28 +110,42 @@ the parser — or the recursive `dump` — stack (`jestyr_parser_bounds_deep_nes
 
 ---
 
-## 3. Immediate next: the remaining expression forms (with gotchas)
+## 3. Immediate next: the remaining item kinds
 
-- **Generic struct literals** `List(i32){ … }` — *small.* In `parse_postfix`, after a `(args)`
-  call whose callee is a `Name` and next is `{` (and `!no_struct`), reinterpret: the call args
-  become `type_args`, then `parse_fields`. Node needs ctor + a **type-arg list** *and* a
-  **field list** (two `(start,count)` slices in `ar` — use `a`=ctor, `x`/`op`=type-arg
-  start/count, `b`/`y`=field start/count). Reference: `parse_gen_struct_lit`.
-- **F-strings** `f"a {x} b"` — *medium, needs a different dump.* The lexer already emits one
-  `FStr` token; `parse_fstring` splits the body into literal `parts: Vec<String>` and
-  interpolation `exprs` (bare-ident `Name` nodes). **Gotcha:** every interpolation `Name` gets
-  the *whole f-string's span* (see `parser.rs` ~line 1282), and `parts` are **content strings,
-  not spans** — so the span-only dump can't distinguish `{x}` from `{y}`. Either dump the
-  **text** for this node (part content + interpolation name text) on both sides, or extend the
-  Name dump to carry its lexeme. Decide the canonical form before coding.
-- **Self value/type** `self` / `Self` (and `Self{ … }`) — *small.* `parse_primary` cases; `Self`
-  can start a struct literal.
-- **`@attr`** callable attributes (`@address(0x…)`) — *small.* `parse_primary` `At` case.
-- **Block-led forms** `{ … }`, `if … {} else {}`, `match … { arms }`, `unsafe {}` — **these need
-  block/statement parsing (step 5 territory).** A `Block` holds `stmts` + an optional tail
-  expr; `if`/`match`/`unsafe` set `no_struct = true` for their header then parse a block.
-  Recommend doing these *after* (or together with) the statement parser, not as isolated
-  expression forms. `match` also needs the **pattern parser** (step 4) for its arms.
+The item infra is up (`it: List(ItemData)`, `parse_item` dispatching on an optional `pub`,
+`dump_item`, `parse_single_item` on the reference, the `jestyr_parser_item_dump_matches_reference`
+golden). Add the remaining kinds one per green increment. **`fn` is next** (the design is
+already worked out below); then the aggregates, then attributes, then the whole-corpus golden.
+
+- **`fn`** — *the big one.* Reference `parse_fn`/`parse_params`/`parse_param`/`parse_generics`/
+  `parse_error_set` (parser.rs 326–582). `FnDecl` = is_pub, generics (`[T: Bound]`, each a
+  name + optional bound), attrs, name, params, ret_conv/ret_ty, errors (`!{ Names }`), requires/
+  ensures contracts, body. **Plan:** widen `ItemData` (it has only `a,b,x,y,z,w` + `is_pub` — add
+  an `op` field; fn needs name span + param slice + ret_conv + ret_ty + body = 7 aux). Add an
+  item-child arena `iar: List(i32)`; store each **param as a fixed 7-tuple** (comptime, conv,
+  name_start, name_end, is_self, ty|-1, refine|-1). Suggest **fn-core first** (name, params
+  incl. `self`/`comptime`/conv/`: T`/`in refine`, `-> conv ret`, body) — dump `(fn <is_pub>
+  <name span> <paramcount> <params…> <ret_conv> <ret-opt> <body>)`, each param `(param
+  <comptime> <conv> <is_self> <name span> <ty-opt> <refine-opt>)` — testing fns with **no**
+  generics/errors/contracts/attrs (the reference gets them empty; simplest to just omit those
+  fields from the dump until implemented, exactly as cast was span-only pre-type-parser). Then
+  **fn-generics** (`[T: Add]`), **fn-errors** (`!{ … }`), **fn-contracts** (`requires`/`ensures`
+  — set `no_struct` for each condition), each extending the dump.
+- **`struct` / `record` / `union`** — `parse_named_struct`/`parse_struct_body`. Shared field
+  grammar: `StructMember` is a Field (name, ty, `@volatile`, `= default`, `pub`, `: bits`) or a
+  Method (a nested `FnDecl` — reuses the fn parser). `is_record`/`is_union` are just the keyword.
+- **`enum`** — `parse_enum`. `EnumDecl` = name, type_params `(T)`, variants (each name + fields
+  `(Ident, TypeId)` + optional `= discriminant`).
+- **`trait` / `impl`** — `parse_trait`/`parse_trait_method`/`parse_impl`. Trait = methods
+  (signatures, optional default body). Impl = generics, trait_name, target ty, methods (FnDecls).
+- **`extern`** — `parse_extern`: `extern "c" fn name(...) -> T` (bodyless).
+- **Attributes** (`@packed`, `@align(8)`, `@section("data")`) — `parse_attrs` runs *first* in
+  `parse_item` (before `pub`). Each is name + args (ExprIds). **Gotcha:** attr args can be
+  strings (`@section("data")`) — `parse_primary` does **not** yet handle `Str` (kind 3) or
+  `Null`; add those leaves before/with attrs, or the arg becomes an `Error` node and diverges.
+- **Whole-corpus golden** — once all kinds parse: `parse_module` over each of the ~122 example
+  files, dump every item, diff. This is the P2 acceptance test; expect it to surface gaps (rare
+  type forms, contract spellings, `error` sets) to fill in.
 
 ---
 
@@ -122,14 +153,13 @@ the parser — or the recursive `dump` — stack (`jestyr_parser_bounds_deep_nes
 
 Ordered, each gated by a cross-implementation golden on the shared corpus (see the master plan):
 
-1. **Finish P2 expressions:** the forms in §3.
-2. **Type parser + pattern parser** (§3.5 step 4). The type parser also **upgrades the cast dump
-   from a span to full structure**, and unblocks `match` arms. Represent types/pats as their own
-   arenas (`List(TypeData)` / `List(PatData)`), same discipline as `ExprData`.
-3. **Statement parser** (step 5): `let`/`var`/`return`/expr-stmt/blocks/`if`/`match`/loops →
-   enables the block-led expression forms.
-4. **Item parser** (step 6): `fn`/`struct`/`record`/`union`/`enum`/`trait`/`impl`/`const`/
-   `distinct`/`import`/attributes/contracts → then the **whole-corpus AST-dump golden**.
+1. ✅ **P2 expressions** — done (all forms).
+2. ✅ **Type parser + pattern parser** — done (cast/`let` dumps upgraded to structure).
+3. ✅ **Statement parser + block-led forms** — done (`let`/`var`/`return`/expr, blocks,
+   `if`/`else`, `unsafe`, `match`).
+4. **Item parser** (in progress): infra + `import`/`distinct`/`const` done; remaining
+   `fn`/`struct`/`record`/`union`/`enum`/`trait`/`impl`/`extern`/attributes/contracts → then the
+   **whole-corpus AST-dump golden** (§3).
 5. **P3 typeck** → resolved-type-dump golden. **P4 escape** → diagnostic-set golden. **P5 cgen**
    → byte-identical-C golden (construct by construct). **R2 fixpoint** (`--features
    selfhost-fixpoint`): jc1→jc2→jc3, assert `jc2 ≡ jc3`, stood up early on a subset.
@@ -153,14 +183,14 @@ each with its golden slice.
 |---|---|
 | Jestyr parser | `examples/std/parser.jtr` (kinds/arenas/`dump`) |
 | Shared tokenizer | `examples/std/tokens.jtr` |
-| Reference parser / AST | `src/parser.rs`, `src/ast.rs` (`ExprKind`, `FieldInit`, `Span::to`) |
-| Reference dump + golden | `src/proptests.rs` `mod c_oracle`: `ref_dump_expr`, `rust_expr_dump`, `jestyr_expr_dump`, `jestyr_parser_expr_dump_matches_reference`, `jestyr_parser_bounds_deep_nesting`, `Parser::parse_single_expr` (parser.rs, `#[allow(dead_code)]`) |
-| Token kinds | `src/token.rs` (`TokenKind` discriminant order = the integer tags) |
+| Reference parser / AST | `src/parser.rs`, `src/ast.rs` (`ExprKind`/`PatKind`/`TypeKind`/`Item`, `Span::to`) |
+| Reference dump + goldens | `src/proptests.rs` `mod c_oracle`: `ref_dump_{expr,type,pat,item,stmt,block}`, `rust_{expr,item}_dump`, `jestyr_{expr,item}_dump`, `jestyr_parser_{expr,item}_dump_matches_reference`, `jestyr_parser_bounds_deep_nesting`, `Parser::parse_single_{expr,item}` (parser.rs, `#[allow(dead_code)]`) |
+| Token kinds | `src/token.rs` (`TokenKind` discriminant order = the integer tags; e.g. Let=8 Const=10 Struct=11 Enum=13 Distinct=18 Match=21 If=22 Else=23 Return=28 Trait=15 Impl=16 Fn=7 Import=41 Pub=42 As=48 unsafe=38) |
 | Master plan | `docs/session-notes/jestyr-selfhost-port-P2-P5-R2.md` |
 
 ## One-line summary
-Front end done + P2 expression parser well underway (literals, unary, binary, grouping,
-postfix incl. calls, casts, assignment, ranges, array & struct literals) with a byte-exact
-AST-dump golden and a depth guard. **Next:** generic struct literals + f-strings (text-dump
-gotcha) + self/attr, then the block-led forms *with* the statement parser; then the type &
-pattern parsers → statements → items → whole-corpus AST golden → P3/P4/P5 → R2 fixpoint.
+Front end + **all P2 expressions** + statements/blocks + `if`/`unsafe`/`match` (with the full
+pattern parser) + the **structural type parser** + **item infra & `import`/`distinct`/`const`**
+are done, across three byte-exact AST-dump goldens (expr, item, depth). **Next:** `fn` (design
+in §3), then `struct`/`enum`/`trait`/`impl`/`extern` + attributes, then the whole-corpus item
+golden → P3/P4/P5 → R2 fixpoint.
