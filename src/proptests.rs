@@ -6026,6 +6026,76 @@ mod c_oracle {
         out.push(")".to_string());
     }
 
+    /// Dump one top-level item (matching the Jestyr `dump_item`). `import`: the path text,
+    /// an alias name span or `(none)`, a pinned-hash text or `(none)`. `distinct`: is_pub,
+    /// name span, base type. `const`: is_pub, name span, an optional type, the value.
+    fn ref_dump_item(ast: &crate::ast::Ast, item: &crate::ast::Item, out: &mut Vec<String>) {
+        use crate::ast::Item;
+        out.push("(".to_string());
+        match item {
+            Item::Import(imp) => {
+                out.push("import".to_string());
+                out.push("(".to_string());
+                out.push("path".to_string());
+                out.push(imp.path.clone());
+                out.push(")".to_string());
+                match &imp.alias {
+                    Some(a) => {
+                        out.push("(".to_string());
+                        out.push("alias".to_string());
+                        out.push(a.span.start.to_string());
+                        out.push(a.span.end.to_string());
+                        out.push(")".to_string());
+                    }
+                    None => {
+                        out.push("(".to_string());
+                        out.push("none".to_string());
+                        out.push(")".to_string());
+                    }
+                }
+                match &imp.expected_hash {
+                    Some(h) => {
+                        out.push("(".to_string());
+                        out.push("hash".to_string());
+                        out.push(h.clone());
+                        out.push(")".to_string());
+                    }
+                    None => {
+                        out.push("(".to_string());
+                        out.push("none".to_string());
+                        out.push(")".to_string());
+                    }
+                }
+            }
+            Item::Distinct(d) => {
+                out.push("distinct".to_string());
+                out.push(if d.is_pub { "1" } else { "0" }.to_string());
+                out.push(d.name.span.start.to_string());
+                out.push(d.name.span.end.to_string());
+                ref_dump_type(ast, d.base, out);
+            }
+            Item::Const(c) => {
+                out.push("const".to_string());
+                out.push(if c.is_pub { "1" } else { "0" }.to_string());
+                out.push(c.name.span.start.to_string());
+                out.push(c.name.span.end.to_string());
+                match c.ty {
+                    Some(t) => ref_dump_type(ast, t, out),
+                    None => {
+                        out.push("(".to_string());
+                        out.push("none".to_string());
+                        out.push(")".to_string());
+                    }
+                }
+                ref_dump_expr(ast, c.value, out);
+            }
+            // Other item kinds (fn/struct/enum/trait/impl/extern) land in later slices; the
+            // item corpus is curated to the handled kinds.
+            _ => out.push("itemerr".to_string()),
+        }
+        out.push(")".to_string());
+    }
+
     /// Dump one pattern (matching the Jestyr `dump_pat`): `patwild`/`patident`/`patrest`/
     /// `paterr` carry a span; `patvariant` its name span + subpat count + span + subpatterns;
     /// `patstruct` adds has_rest and `(patfield <fname span> <subpat>)` fields; `patlit` /
@@ -6600,6 +6670,55 @@ mod c_oracle {
             let got = jestyr_expr_dump(&parser, probe.to_str().unwrap());
             let want = rust_expr_dump(src);
             assert_eq!(got, want, "expression AST dump diverged on `{src}`");
+        }
+    }
+
+    /// The reference item-dump for `src`: lex, parse a single item, dump it.
+    fn rust_item_dump(src: &str) -> Vec<String> {
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (ast, item, _diags) = crate::parser::Parser::new(src, tokens).parse_single_item();
+        let mut out = Vec::new();
+        match item {
+            Some(it) => ref_dump_item(&ast, &it, &mut out),
+            None => out.push("(none)".to_string()),
+        }
+        out
+    }
+
+    /// Run the Jestyr parser in **item mode** (a second CLI arg selects it) on `file`.
+    fn jestyr_item_dump(parser_exe: &std::path::Path, file: &str) -> Vec<String> {
+        let out = Command::new(parser_exe).arg(file).arg("item").output().unwrap();
+        assert!(out.status.success(), "jestyr parser (item mode) failed on {file}");
+        String::from_utf8(out.stdout).unwrap().lines().map(|s| s.to_string()).collect()
+    }
+
+    /// **P2 item-parser cross-implementation golden.** The Jestyr-written item parser must
+    /// build the same item AST as the reference on a curated corpus — verified by diffing
+    /// the canonical item dump atom-for-atom. Grows as the item parser gains kinds.
+    #[test]
+    fn jestyr_parser_item_dump_matches_reference() {
+        let parser = build_exe("examples/std/parser.jtr");
+        let snippets = [
+            // imports: bare, aliased, hash-pinned
+            "import \"std/mem\"",           // a bare import
+            "import \"list\" as lst",       // an aliased import
+            "import \"core\" = \"abc123def\"", // a hash-pinned import
+            // distinct nominal wrappers
+            "distinct UserId = u64",        // a distinct over a primitive
+            "pub distinct Meters = f64",    // a public distinct
+            "distinct Handle = *mut u8",    // a distinct over a pointer type
+            // consts: with/without a type annotation, public, structured value/type
+            "const MAX = 100",              // an untyped const
+            "pub const PI: f64 = 3.14",     // a public typed const
+            "const ORIGIN: Point = Point{ x: 0, y: 0 }", // a struct-literal value
+            "const SIZES: [3]i32 = [1, 2, 4]", // an array type + array literal
+        ];
+        for src in snippets {
+            let probe = std::env::temp_dir().join("jestyr_item_probe.jtr");
+            std::fs::write(&probe, src).unwrap();
+            let got = jestyr_item_dump(&parser, probe.to_str().unwrap());
+            let want = rust_item_dump(src);
+            assert_eq!(got, want, "item AST dump diverged on `{src}`");
         }
     }
 

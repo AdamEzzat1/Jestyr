@@ -86,6 +86,14 @@ impl<'src> Parser<'src> {
         (self.ast, e, self.diagnostics)
     }
 
+    /// Parse one top-level item — the item-dump golden's entry, mirroring the Jestyr
+    /// `parse_item_and_dump`. Returns the item (or `None` on an unrecognized keyword).
+    #[allow(dead_code)] // used by the `c-oracle` P2 item-parser golden
+    pub fn parse_single_item(mut self) -> (Ast, Option<Item>, Vec<Diagnostic>) {
+        let item = self.parse_item();
+        (self.ast, item, self.diagnostics)
+    }
+
     /// Parse one file's items, returning them *separately* from the shared arena
     /// (rather than pushing into `ast.items`) so the loader can tag each item
     /// with its owning module before inserting it into the program.
