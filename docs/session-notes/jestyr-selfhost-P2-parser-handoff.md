@@ -12,11 +12,11 @@
 > `@volatile`/bit-fields/defaults + methods), enum, trait, impl (blanket generics), const,
 > distinct, import, extern (abi) — are done, cross-checked by **four** byte-exact goldens (expr,
 > item, **whole-corpus module**, depth). The whole-corpus module golden runs `parse_module` over
-> all ~125 example files: every file parses without crashing, and **91 are item-for-item
+> all ~125 example files: every file parses without crashing, and **97 are item-for-item
 > identical** to the reference (was 76 — the **unified `for` loop** + break/continue/invariant/
-> variant landed since, clearing loops/arrays/list/strings/lexer/intern/…). The 34 still on the
-> denylist each use an *expression* form the parser hasn't grown yet (§3). This note captures
-> what's built, the recipe, and the road past P2.
+> variant and the **`struct { … }` value** form landed since, clearing loops/arrays/list/strings/
+> lexer/intern/vec/genlist/methods/…). The 28 still on the denylist each use an *expression* form
+> the parser hasn't grown yet (§3). This note captures what's built, the recipe, and the road past P2.
 
 ---
 
@@ -126,7 +126,7 @@ Nothing item-level is deferred anymore.
 
 **What's left is a batch of `parse_primary` EXPRESSION forms** the curated expr corpus avoided.
 The **whole-corpus module golden** (`jestyr_parser_module_dump_matches_reference`) runs
-`parse_module` over all ~125 files — **91 pass, 34 are denylisted** (`MODULE_GOLDEN_DENYLIST` in
+`parse_module` over all ~125 files — **97 pass, 28 are denylisted** (`MODULE_GOLDEN_DENYLIST` in
 `proptests.rs`, grouped by the form they need). The test reports **all** diverging files at once
 (and, with `DUMP_DIVERGE=1` in the env, prints the first-differing atom window per file — the
 fast way to see *which* form a file is tripping on). Land each form (recipe §2, but the golden is
@@ -138,13 +138,13 @@ a file with: run the built parser `parse_module` mode (`parser_exe <file> x modu
   three head shapes (infinite / conditional / iterating w/ binds+sources+step), label, `region`,
   loop-`else`; header spilled into the new `lar` arena (see `mk_for`); `peek_kind` lookahead added.
   Cleared arrays/list/strings/lexer/intern/loops*/codepoints/binned/tests_demo/…
-- **`struct { … }` as a value** — the next unblocker (`StructType`/`parse_struct_body` in expr
-  position, parser.rs ~1368; `Struct` arm in `parse_primary`). Needed by the 7 files that diverge
-  on `return struct { … }`: **fn_ptr, genlist, genmethods, list, methods, vec, vec_generic**. The
-  struct *item* body parser already exists — reuse its field-parsing for the value form.
-- **Closures** `|x| body` / `|| body` — `parse_closure` (1408 area); `Pipe`/`PipePipe` in
-  `parse_primary`. `ClosureParam` = name + optional `: T`. (closures, closure_run, gen_vtable,
-  args, core, parser, tokens.)
+- ✅ **`struct { … }` as a value** — DONE (kind 36). Shared `parse_struct_members`/`dump_members`
+  (+ `ref_dump_members`) extracted so the struct *item* parser and the value form share the
+  10-tuple member loop; `parse_struct_type` dispatches from `parse_primary` on `struct`. Cleared
+  genlist/genmethods/list/methods/vec/vec_generic. (fn_ptr *also* needs a closure — see below.)
+- **Closures** `|x| body` / `|| body` — the next unblocker. `parse_closure` (1408 area);
+  `Pipe`/`PipePipe` in `parse_primary`. `ClosureParam` = name + optional `: T`. (closures,
+  closure_run, gen_vtable, args, core, **fn_ptr**, parser, tokens.)
 - **Concurrency** `concurrent { }`, `spawn <call>`, `await <e>`, `select { recv(c) => bind { } }`,
   `par for … reduce(r) { }` — `parse_concurrent`/`parse_spawn`/`parse_await`/`parse_select`/
   `parse_par_for`. (atomics, await, channel, concurrent, deterministic, dynamic_spawn, mutex,
@@ -153,7 +153,7 @@ a file with: run the built parser `parse_module` mode (`parser_exe <file> x modu
   region_string, loops_advanced.) NB: `for … region r { }` (region as a loop clause) is already
   handled by the loop parser; this is the standalone `region r { }` expression.
 
-Each is an `ExprData` kind ≥ 36 with a `dump`/`ref_dump_expr` arm; closures/concurrency/region
+Each is an `ExprData` kind ≥ 37 with a `dump`/`ref_dump_expr` arm; closures/concurrency/region
 carry blocks (reuse `parse_block`) and some carry patterns (reuse the pattern parser). After a
 form lands, the module golden auto-checks any newly-passing file you remove from the denylist.
 
@@ -168,9 +168,9 @@ Ordered, each gated by a cross-implementation golden on the shared corpus (see t
 3. ✅ **Statement parser + block-led forms** — done (`let`/`var`/`return`/expr, blocks,
    `if`/`else`, `unsafe`, `match`).
 4. **Item parser** (in progress): all nine item kinds fully featured; the whole-corpus module
-   golden passes **91/125** files. **Loops done** (§3). Remaining: the **expression forms** (§3 —
-   `struct { … }` value, closures, concurrency, standalone `region`) to clear the last 34 files →
-   then P2 is complete.
+   golden passes **97/125** files. **Loops + `struct { … }` value done** (§3). Remaining: the
+   **expression forms** (§3 — closures, concurrency, standalone `region`) to clear the last 28
+   files → then P2 is complete.
 5. **P3 typeck** → resolved-type-dump golden. **P4 escape** → diagnostic-set golden. **P5 cgen**
    → byte-identical-C golden (construct by construct). **R2 fixpoint** (`--features
    selfhost-fixpoint`): jc1→jc2→jc3, assert `jc2 ≡ jc3`, stood up early on a subset.
@@ -204,8 +204,9 @@ each with its golden slice.
 Front end + **all P2 expressions** + statements/blocks + `if`/`unsafe`/`match` + structural
 **type parser** + **all nine item kinds fully featured** (generics, attrs incl. method/field,
 error sets, contracts, `@volatile`/bit-fields, extern abi) + the **unified `for` loop**
-(+ break/continue/invariant/variant) are done, across **four** byte-exact goldens (expr, item,
-whole-corpus module, depth). The whole-corpus module golden passes **91 of 125** files. **Next:**
-the remaining `parse_primary` expression forms — **`struct { … }` value** (7 files, next up),
-**closures** `|x|…`, **concurrency** (`spawn`/`await`/`select`/`concurrent`/`par for`), standalone
-**`region`** — each clears more denylisted files → P2 done → P3/P4/P5 → R2 fixpoint.
+(+ break/continue/invariant/variant) + the **`struct { … }` value** form are done, across **four**
+byte-exact goldens (expr, item, whole-corpus module, depth). The whole-corpus module golden passes
+**97 of 125** files. **Next:** the remaining `parse_primary` expression forms — **closures**
+`|x|…` (next up, 8 files incl. fn_ptr), **concurrency** (`spawn`/`await`/`select`/`concurrent`/
+`par for`), standalone **`region`** — each clears more denylisted files → P2 done → P3/P4/P5 →
+R2 fixpoint.
