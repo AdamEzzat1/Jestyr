@@ -5835,6 +5835,25 @@ mod c_oracle {
         }
     }
 
+    /// Dump an optional loop identifier (a `for` label or `region` name), matching the Jestyr
+    /// `dump_loopname`: `(loopname <s> <e>)` when present, else `(none)`.
+    fn ref_dump_loopname(opt: &Option<crate::ast::Ident>, out: &mut Vec<String>) {
+        match opt {
+            Some(id) => {
+                out.push("(".to_string());
+                out.push("loopname".to_string());
+                out.push(id.span.start.to_string());
+                out.push(id.span.end.to_string());
+                out.push(")".to_string());
+            }
+            None => {
+                out.push("(".to_string());
+                out.push("none".to_string());
+                out.push(")".to_string());
+            }
+        }
+    }
+
     /// Dump one statement (matching the Jestyr `dump_stmt`): `(let <mutbl> <name span>
     /// <stmt span> <type-opt> <init-opt>)`, `(return <stmt span> <value-opt>)`, or
     /// `(exprstmt <expr>)`.
@@ -6740,6 +6759,82 @@ mod c_oracle {
                     out.push(")".to_string());
                 }
             }
+            // For: label, head (infinite / conditional / iterating), region, body block, and
+            // the optional `else` block. The head's iterating form emits its bind count, source
+            // count, each `(bind <conv> <name span>)`, each source, then the optional step.
+            ExprKind::For { label, head, region, body, els } => {
+                use crate::ast::ForHead;
+                out.push("for".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_loopname(label, out);
+                match head {
+                    ForHead::Infinite => {
+                        out.push("(".to_string());
+                        out.push("headinf".to_string());
+                        out.push(")".to_string());
+                    }
+                    ForHead::While(cond) => {
+                        out.push("(".to_string());
+                        out.push("headwhile".to_string());
+                        ref_dump_expr(ast, *cond, out);
+                        out.push(")".to_string());
+                    }
+                    ForHead::Iter { binds, sources, step } => {
+                        out.push("(".to_string());
+                        out.push("headiter".to_string());
+                        out.push(binds.len().to_string());
+                        out.push(sources.len().to_string());
+                        for b in binds {
+                            out.push("(".to_string());
+                            out.push("bind".to_string());
+                            out.push(ref_conv_code(b.conv).to_string());
+                            out.push(b.name.span.start.to_string());
+                            out.push(b.name.span.end.to_string());
+                            out.push(")".to_string());
+                        }
+                        for src in sources {
+                            ref_dump_expr(ast, *src, out);
+                        }
+                        ref_dump_opt(ast, *step, out);
+                        out.push(")".to_string());
+                    }
+                }
+                ref_dump_loopname(region, out);
+                ref_dump_block(ast, body, out);
+                match els {
+                    Some(b) => ref_dump_block(ast, b, out),
+                    None => {
+                        out.push("(".to_string());
+                        out.push("none".to_string());
+                        out.push(")".to_string());
+                    }
+                }
+            }
+            ExprKind::Break(l) => {
+                out.push("break".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_loopname(l, out);
+            }
+            ExprKind::Continue(l) => {
+                out.push("continue".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_loopname(l, out);
+            }
+            ExprKind::Invariant(e) => {
+                out.push("invariant".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *e, out);
+            }
+            ExprKind::Variant(e) => {
+                out.push("variant".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *e, out);
+            }
             // Any construct the P2 slice does not yet build dumps as `error`; the golden
             // corpus is curated to the handled constructs, so this arm stays unexercised.
             _ => {
@@ -6964,6 +7059,27 @@ mod c_oracle {
             "f(\"a\", \"b\")",           // string args in a call
             "x == null",                 // null as a binary operand
             "[\"one\", \"two\"]",        // strings in an array literal
+            // loops: the unified `for` (infinite / conditional / iterating), labels, region,
+            // else, step, zip/element+index binds, conv keywords; break/continue; invariant/variant
+            "for { x }",                 // infinite loop
+            "for i < n { i = i + 1 }",   // conditional (the "while" job); no_struct in the header
+            "for x in xs { f(x) }",      // simple iteration over a slice
+            "for i in 0..n { g(i) }",    // iteration over a range source
+            "for i in 0..n step 2 { g(i) }", // a range with an explicit `step`
+            "for x, i in xs { h(x, i) }", // element + index (two binds, one source)
+            "for a, b in xs, ys { z(a, b) }", // lockstep zip (two binds, two sources)
+            "for mut x in xs { x = 0 }",  // a `mut` iteration convention on the bind
+            "for read x in xs { f(x) }",  // an explicit `read` convention
+            "for _ in xs { tick() }",     // a wildcard bind
+            "for outer: x in xs { break outer }", // a loop label + labeled break
+            "for x in xs { continue }",   // a bare continue
+            "for x in xs { if x { break } }", // break nested in the body
+            "for x in xs { f(x) } else { g() }", // loop-`else` (runs if no break)
+            "for i < n { i = i + 1 } else { done() }", // conditional loop with else
+            "for region r { alloc(r) }",  // an infinite loop with a `region` scratch arena
+            "for x in xs region r { use(r, x) }", // iterating loop with a region
+            "for { invariant x > 0  variant n }", // invariant + variant inside a loop body
+            "for x in 0..n { for y in 0..m { p(x, y) } }", // a nested `for` in the body
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");
@@ -7111,16 +7227,19 @@ mod c_oracle {
     /// `spawn`/`await`/`select`/`concurrent`, and `region`). As each form lands, its files move
     /// off this list. (Basename match; there are no basename collisions across the corpus.)
     const MODULE_GOLDEN_DENYLIST: &[&str] = &[
-        "array_lit.jtr", "arrays.jtr", "atomics.jtr", "closure_run.jtr", "closures.jtr",
-        "codepoints.jtr", "concurrent.jtr", "fn_ptr.jtr", "gen_vtable.jtr", "genlist.jtr",
-        "genmethods.jtr", "loops.jtr", "loops_advanced.jtr", "loops_else.jtr", "methods.jtr",
-        "region.jtr", "region_escape.jtr", "region_string.jtr", "args.jtr", "await.jtr",
-        "binned.jtr", "channel.jtr", "core.jtr", "deterministic.jtr", "dynamic_spawn.jtr",
-        "intern.jtr", "intern_demo.jtr", "lexer.jtr", "list.jtr", "mutex.jtr",
-        "numerics_canary.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr",
-        "par_reduce_int.jtr", "par_soac.jtr", "parallel.jtr", "parser.jtr", "select.jtr",
-        "strmap.jtr", "strmap_demo.jtr", "sync.jtr", "tokens.jtr", "str_iter.jtr",
-        "strings.jtr", "tests_demo.jtr", "vec.jtr", "vec_alloc.jtr", "vec_generic.jtr",
+        // `struct { … }` as a *value* expression (an anonymous struct type in expr position).
+        "fn_ptr.jtr", "genlist.jtr", "genmethods.jtr", "list.jtr", "methods.jtr", "vec.jtr",
+        "vec_generic.jtr",
+        // closures `|x| …` / `|| …`.
+        "closure_run.jtr", "closures.jtr", "gen_vtable.jtr", "args.jtr", "core.jtr",
+        "parser.jtr", "tokens.jtr",
+        // concurrency (`spawn`/`await`/`select`/`concurrent`) and `par for … reduce`.
+        "atomics.jtr", "await.jtr", "channel.jtr", "concurrent.jtr", "deterministic.jtr",
+        "dynamic_spawn.jtr", "mutex.jtr", "select.jtr", "sync.jtr", "numerics_canary.jtr",
+        "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr",
+        "parallel.jtr",
+        // `region r { … }`.
+        "region.jtr", "region_escape.jtr", "region_string.jtr", "loops_advanced.jtr",
     ];
 
     /// **P2 whole-corpus module golden** — the acceptance test for the item parser. For every
@@ -7145,6 +7264,7 @@ mod c_oracle {
         files.sort();
         assert!(files.len() > 100, "expected the whole corpus, found {}", files.len());
         let mut checked = 0;
+        let mut diverged: Vec<String> = Vec::new();
         for p in &files {
             let f = p.to_str().unwrap();
             let base = p.file_name().and_then(|s| s.to_str()).unwrap();
@@ -7154,9 +7274,20 @@ mod c_oracle {
                 continue;
             }
             let want = rust_module_dump(&src);
-            assert_eq!(got, want, "Jestyr module dump diverged from the reference on {f}");
-            checked += 1;
+            if got != want {
+                diverged.push(f.to_string());
+                if std::env::var("DUMP_DIVERGE").is_ok() {
+                    let first = got.iter().zip(want.iter()).position(|(a, b)| a != b).unwrap_or(0);
+                    let lo = first.saturating_sub(4);
+                    eprintln!("=== {f} (first diff at atom {first}) ===");
+                    eprintln!("GOT : {:?}", &got[lo..(lo + 20).min(got.len())]);
+                    eprintln!("WANT: {:?}", &want[lo..(lo + 20).min(want.len())]);
+                }
+            } else {
+                checked += 1;
+            }
         }
+        assert!(diverged.is_empty(), "Jestyr module dump diverged from the reference on: {diverged:?}");
         eprintln!("whole-corpus module golden: {checked} files item-for-item identical");
     }
 
