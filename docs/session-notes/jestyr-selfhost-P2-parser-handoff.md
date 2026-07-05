@@ -5,18 +5,16 @@
 > `src/parser.rs` / `src/ast.rs` (the reference this port mirrors), and
 > `examples/std/parser.jtr` (the Jestyr parser being grown).
 >
-> **State:** the front end, the **whole P2 expression parser** (incl. char/bool/str/null
-> leaves), the **statement + block-led** layer (blocks, `if`/`else`, `unsafe`, `match`), the
-> **type parser**, the **pattern parser**, and **all nine item kinds, fully-featured** — fn
-> (generics, attrs, error sets, `requires`/`ensures`), struct/record/union (fields with
+> **State: P2 is COMPLETE.** The front end, the **whole P2 expression parser** (every form —
+> incl. loops, closures, concurrency, region; see §3), the **statement + block-led** layer, the
+> **structural type parser**, the **pattern parser**, and **all nine item kinds, fully-featured**
+> — fn (generics, attrs, error sets, `requires`/`ensures`), struct/record/union (fields with
 > `@volatile`/bit-fields/defaults + methods), enum, trait, impl (blanket generics), const,
 > distinct, import, extern (abi) — are done, cross-checked by **four** byte-exact goldens (expr,
 > item, **whole-corpus module**, depth). The whole-corpus module golden runs `parse_module` over
-> all ~125 example files: every file parses without crashing, and **97 are item-for-item
-> identical** to the reference (was 76 — the **unified `for` loop** + break/continue/invariant/
-> variant and the **`struct { … }` value** form landed since, clearing loops/arrays/list/strings/
-> lexer/intern/vec/genlist/methods/…). The 28 still on the denylist each use an *expression* form
-> the parser hasn't grown yet (§3). This note captures what's built, the recipe, and the road past P2.
+> **all 125 example files and every one is item-for-item identical** to the Rust reference — the
+> `MODULE_GOLDEN_DENYLIST` is now empty. This note captures what's built, the recipe, and the road
+> **past P2 → P3 typeck** (§4).
 
 ---
 
@@ -124,38 +122,32 @@ sub-lists; `aar` attribute args+4-tuples; `gar` generic 4-tuples; `far` fn error
 Import 1 Distinct 2 Const 3 Fn 4 Struct(op=0/1/2) 5 Enum 6 Trait 7 Impl 8 Extern 99 Error.
 Nothing item-level is deferred anymore.
 
-**What's left is a batch of `parse_primary` EXPRESSION forms** the curated expr corpus avoided.
-The **whole-corpus module golden** (`jestyr_parser_module_dump_matches_reference`) runs
-`parse_module` over all ~125 files — **97 pass, 28 are denylisted** (`MODULE_GOLDEN_DENYLIST` in
-`proptests.rs`, grouped by the form they need). The test reports **all** diverging files at once
-(and, with `DUMP_DIVERGE=1` in the env, prints the first-differing atom window per file — the
-fast way to see *which* form a file is tripping on). Land each form (recipe §2, but the golden is
-the *module* one), delete the now-passing files from the denylist, and coverage climbs. Diagnose
-a file with: run the built parser `parse_module` mode (`parser_exe <file> x module`) vs
-`rust_module_dump`, or eyeball a snippet in item mode. Reference `parse_*` in `src/parser.rs`:
+**All `parse_primary` EXPRESSION forms are now built** — the `MODULE_GOLDEN_DENYLIST` is empty and
+the **whole-corpus module golden** (`jestyr_parser_module_dump_matches_reference`) passes **125/125
+files item-for-item**. The test reports **all** diverging files at once (and, with `DUMP_DIVERGE=1`
+in the env, prints the first-differing atom window per file — the fast way to see *which* form a
+file is tripping on; keep it for the P3+ goldens). The expression forms landed this pass:
 
-- ✅ **Loops** — DONE (kinds 31=For 32=Break 33=Continue 34=Invariant 35=Variant). `for` in all
-  three head shapes (infinite / conditional / iterating w/ binds+sources+step), label, `region`,
-  loop-`else`; header spilled into the new `lar` arena (see `mk_for`); `peek_kind` lookahead added.
-  Cleared arrays/list/strings/lexer/intern/loops*/codepoints/binned/tests_demo/…
-- ✅ **`struct { … }` as a value** — DONE (kind 36). Shared `parse_struct_members`/`dump_members`
+- ✅ **Loops** (kinds 31=For 32=Break 33=Continue 34=Invariant 35=Variant). `for` in all three head
+  shapes (infinite / conditional / iterating w/ binds+sources+step), label, `region`, loop-`else`;
+  header spilled into the `lar` arena (see `mk_for`); `peek_kind` lookahead added.
+- ✅ **`struct { … }` value** (kind 36). Shared `parse_struct_members`/`dump_members`
   (+ `ref_dump_members`) extracted so the struct *item* parser and the value form share the
-  10-tuple member loop; `parse_struct_type` dispatches from `parse_primary` on `struct`. Cleared
-  genlist/genmethods/list/methods/vec/vec_generic. (fn_ptr *also* needs a closure — see below.)
-- **Closures** `|x| body` / `|| body` — the next unblocker. `parse_closure` (1408 area);
-  `Pipe`/`PipePipe` in `parse_primary`. `ClosureParam` = name + optional `: T`. (closures,
-  closure_run, gen_vtable, args, core, **fn_ptr**, parser, tokens.)
-- **Concurrency** `concurrent { }`, `spawn <call>`, `await <e>`, `select { recv(c) => bind { } }`,
-  `par for … reduce(r) { }` — `parse_concurrent`/`parse_spawn`/`parse_await`/`parse_select`/
-  `parse_par_for`. (atomics, await, channel, concurrent, deterministic, dynamic_spawn, mutex,
-  select, sync, numerics_canary, par_*, parallel.)
-- **`region r { }`** as an EXPRESSION — `parse_region` (1560 area). (region, region_escape,
-  region_string, loops_advanced.) NB: `for … region r { }` (region as a loop clause) is already
-  handled by the loop parser; this is the standalone `region r { }` expression.
+  10-tuple member loop; `parse_struct_type` dispatches from `parse_primary` on `struct`.
+- ✅ **Closures** `|x| body` / `|| body` (kind 37). Param 3-tuples (name span, type or -1) in the
+  `clar` arena, appended before the body. `Pipe`/`PipePipe` in `parse_primary`.
+- ✅ **Concurrency** (kinds 38=Concurrent 39=Spawn 40=Await 41=ParFor 42=Select). `spawn` parses at
+  the unary level, `await` at postfix (binds tighter than `as`/binary). `select` arm 4-tuples in
+  `par`. **Contextual-keyword note:** `recv`/`reduce`/`step` are positionally unambiguous, but
+  `par` is NOT (a plain ident before `for` also occurs, e.g. `var i = lo` then `for …`), so the
+  text must really be "par". The parser can't store the borrowed `src` (escape checker forbids it),
+  so the driver precomputes a **`parw[i]` mask** (token i is an ident with text "par") and stores
+  that `List(bool)` in the `Parser` — the pattern to reuse if P3+ ever needs another text test.
+- ✅ **`region r { }`** as an expression (kind 43) — `parse_region`, block-led. (`for … region r`
+  as a loop *clause* was already handled by the loop parser.)
 
-Each is an `ExprData` kind ≥ 37 with a `dump`/`ref_dump_expr` arm; closures/concurrency/region
-carry blocks (reuse `parse_block`) and some carry patterns (reuse the pattern parser). After a
-form lands, the module golden auto-checks any newly-passing file you remove from the denylist.
+Every form is an `ExprData` kind with a `dump`/`ref_dump_expr` arm; the buffer-then-append (or
+append-before-body) discipline keeps each variable-arity slice contiguous under nesting.
 
 ---
 
@@ -167,13 +159,14 @@ Ordered, each gated by a cross-implementation golden on the shared corpus (see t
 2. ✅ **Type parser + pattern parser** — done (cast/`let` dumps upgraded to structure).
 3. ✅ **Statement parser + block-led forms** — done (`let`/`var`/`return`/expr, blocks,
    `if`/`else`, `unsafe`, `match`).
-4. **Item parser** (in progress): all nine item kinds fully featured; the whole-corpus module
-   golden passes **97/125** files. **Loops + `struct { … }` value done** (§3). Remaining: the
-   **expression forms** (§3 — closures, concurrency, standalone `region`) to clear the last 28
-   files → then P2 is complete.
-5. **P3 typeck** → resolved-type-dump golden. **P4 escape** → diagnostic-set golden. **P5 cgen**
-   → byte-identical-C golden (construct by construct). **R2 fixpoint** (`--features
-   selfhost-fixpoint`): jc1→jc2→jc3, assert `jc2 ≡ jc3`, stood up early on a subset.
+4. ✅ **Item parser + all expression forms** — DONE. All nine item kinds fully featured; every
+   expression form (§3) built; the whole-corpus module golden passes **125/125** files. **P2 is
+   complete.**
+5. **P3 typeck** (NEXT) → resolved-type-dump golden. **P4 escape** → diagnostic-set golden.
+   **P5 cgen** → byte-identical-C golden (construct by construct). **R2 fixpoint** (`--features
+   selfhost-fixpoint`): jc1→jc2→jc3, assert `jc2 ≡ jc3`, stood up early on a subset. The parser's
+   arena + flattened-S-expression-dump + cross-impl-golden toolkit (`build_exe`, the four
+   `jestyr_parser_*` goldens, `DUMP_DIVERGE`) is the template each later pass reuses.
 
 **cgen notes for later:** the emitted C, module content-hashing, and `attest` make "same input ⇒
 same output" a hash compare; lean on them for P5 and R2. Two cgen gaps this session are fixed
@@ -201,12 +194,10 @@ each with its golden slice.
 | Master plan | `docs/session-notes/jestyr-selfhost-port-P2-P5-R2.md` |
 
 ## One-line summary
-Front end + **all P2 expressions** + statements/blocks + `if`/`unsafe`/`match` + structural
-**type parser** + **all nine item kinds fully featured** (generics, attrs incl. method/field,
-error sets, contracts, `@volatile`/bit-fields, extern abi) + the **unified `for` loop**
-(+ break/continue/invariant/variant) + the **`struct { … }` value** form are done, across **four**
-byte-exact goldens (expr, item, whole-corpus module, depth). The whole-corpus module golden passes
-**97 of 125** files. **Next:** the remaining `parse_primary` expression forms — **closures**
-`|x|…` (next up, 8 files incl. fn_ptr), **concurrency** (`spawn`/`await`/`select`/`concurrent`/
-`par for`), standalone **`region`** — each clears more denylisted files → P2 done → P3/P4/P5 →
-R2 fixpoint.
+**P2 is COMPLETE.** The Jestyr-written parser (`examples/std/parser.jtr`) builds the same item
+stream as the Rust reference for **all 125 corpus files** (module golden 125/125, empty denylist):
+every expression form (loops, `struct{}` value, closures, concurrency — concurrent/spawn/await/
+par-for/select, region), statements/blocks, `if`/`unsafe`/`match`, the structural type & pattern
+parsers, and all nine item kinds — across **four** byte-exact goldens (expr, item, whole-corpus
+module, depth). **Next: P3 typeck** (resolved-type-dump golden) → P4 escape → P5 cgen → R2 fixpoint,
+reusing the parser's arena + S-expression-dump + cross-impl-golden toolkit.
