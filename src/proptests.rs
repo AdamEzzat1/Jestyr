@@ -6163,6 +6163,53 @@ mod c_oracle {
         ref_dump_block(ast, &f.body, out);
     }
 
+    /// Dump a struct/record/union member list (matching the Jestyr `dump_members`): each member
+    /// is a method (the fn dump) or a field `(sfield <is_pub> <volatile> <name span> <type>
+    /// <bits-opt> <default-opt>)`. Shared by the struct *item* dump and the `struct { … }` value.
+    fn ref_dump_members(ast: &crate::ast::Ast, members: &[crate::ast::StructMember], out: &mut Vec<String>) {
+        use crate::ast::StructMember;
+        for m in members {
+            match m {
+                StructMember::Field { name, ty, is_pub, default, volatile, bits, .. } => {
+                    out.push("(".to_string());
+                    out.push("sfield".to_string());
+                    out.push(if *is_pub { "1" } else { "0" }.to_string());
+                    out.push(if *volatile { "1" } else { "0" }.to_string());
+                    out.push(name.span.start.to_string());
+                    out.push(name.span.end.to_string());
+                    ref_dump_type(ast, *ty, out);
+                    match bits {
+                        Some(b) => {
+                            out.push("(".to_string());
+                            out.push("bits".to_string());
+                            out.push(b.to_string());
+                            out.push(")".to_string());
+                        }
+                        None => {
+                            out.push("(".to_string());
+                            out.push("none".to_string());
+                            out.push(")".to_string());
+                        }
+                    }
+                    match default {
+                        Some(e) => ref_dump_expr(ast, *e, out),
+                        None => {
+                            out.push("(".to_string());
+                            out.push("none".to_string());
+                            out.push(")".to_string());
+                        }
+                    }
+                    out.push(")".to_string());
+                }
+                StructMember::Method(f) => {
+                    out.push("(".to_string());
+                    ref_dump_fn(ast, f, out);
+                    out.push(")".to_string());
+                }
+            }
+        }
+    }
+
     /// Dump one top-level item (matching the Jestyr `dump_item`). `import`: the path text,
     /// an alias name span or `(none)`, a pinned-hash text or `(none)`. `distinct`: is_pub,
     /// name span, base type. `const`: is_pub, name span, an optional type, the value.
@@ -6235,7 +6282,6 @@ mod c_oracle {
             // each member — a field `(sfield <is_pub> <name span> <type> <default-opt>)` or a
             // method fn dump. (Field `@volatile`/`: bits` are omitted until parsed.)
             Item::Struct { is_pub, is_record, is_union, name, body, attrs, .. } => {
-                use crate::ast::StructMember;
                 let kindcode = if *is_record { 1 } else if *is_union { 2 } else { 0 };
                 out.push("struct".to_string());
                 ref_dump_attrs(ast, attrs, out);
@@ -6244,46 +6290,7 @@ mod c_oracle {
                 out.push(name.span.start.to_string());
                 out.push(name.span.end.to_string());
                 out.push(body.members.len().to_string());
-                for m in &body.members {
-                    match m {
-                        StructMember::Field { name, ty, is_pub, default, volatile, bits, .. } => {
-                            out.push("(".to_string());
-                            out.push("sfield".to_string());
-                            out.push(if *is_pub { "1" } else { "0" }.to_string());
-                            out.push(if *volatile { "1" } else { "0" }.to_string());
-                            out.push(name.span.start.to_string());
-                            out.push(name.span.end.to_string());
-                            ref_dump_type(ast, *ty, out);
-                            match bits {
-                                Some(b) => {
-                                    out.push("(".to_string());
-                                    out.push("bits".to_string());
-                                    out.push(b.to_string());
-                                    out.push(")".to_string());
-                                }
-                                None => {
-                                    out.push("(".to_string());
-                                    out.push("none".to_string());
-                                    out.push(")".to_string());
-                                }
-                            }
-                            match default {
-                                Some(e) => ref_dump_expr(ast, *e, out),
-                                None => {
-                                    out.push("(".to_string());
-                                    out.push("none".to_string());
-                                    out.push(")".to_string());
-                                }
-                            }
-                            out.push(")".to_string());
-                        }
-                        StructMember::Method(f) => {
-                            out.push("(".to_string());
-                            ref_dump_fn(ast, f, out);
-                            out.push(")".to_string());
-                        }
-                    }
-                }
+                ref_dump_members(ast, &body.members, out);
             }
             // enum: is_pub, name span, tparam count, `(tparam <span>)`s, variant count, then
             // each `(variant <name span> <fieldcount> <(vfield <fname span> <type>)>s
@@ -6835,6 +6842,15 @@ mod c_oracle {
                 out.push(en);
                 ref_dump_expr(ast, *e, out);
             }
+            // StructType: an anonymous `struct { … }` value — member count, span, then the
+            // shared member dump (same `(sfield …)`/fn format as a struct item).
+            ExprKind::StructType(body) => {
+                out.push("structtype".to_string());
+                out.push(body.members.len().to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_members(ast, &body.members, out);
+            }
             // Any construct the P2 slice does not yet build dumps as `error`; the golden
             // corpus is curated to the handled constructs, so this arm stays unexercised.
             _ => {
@@ -7080,6 +7096,20 @@ mod c_oracle {
             "for x in xs region r { use(r, x) }", // iterating loop with a region
             "for { invariant x > 0  variant n }", // invariant + variant inside a loop body
             "for x in 0..n { for y in 0..m { p(x, y) } }", // a nested `for` in the body
+            // `struct { … }` value — an anonymous struct type in expression position
+            "struct { }",                // empty struct value
+            "struct { x: i32 }",         // one field
+            "struct { x: i32, y: i32 }", // two fields, comma-separated
+            "struct { ptr: *mut T, len: usize, cap: usize, a: Allocator }", // the List/Vec shape
+            "struct { xs: []u8 }",       // a slice field type
+            "struct { m: Map(K, V) }",   // a generic field type
+            "struct { pub x: i32 }",     // a `pub` field
+            "struct { x: i32 = 0 }",     // a field default
+            "struct { d: i32 = 0, e: i32 = 1 }", // multiple defaults
+            "struct { flags: @volatile u8 }",    // a `@volatile` field attribute
+            "struct { bits: u8 : 3 }",   // a bit-field width
+            "struct { fn area(self) -> i32 { 0 } }", // a method member
+            "struct { x: i32  fn get(self) -> i32 { self.x } }", // a field + a method
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");
@@ -7227,12 +7257,9 @@ mod c_oracle {
     /// `spawn`/`await`/`select`/`concurrent`, and `region`). As each form lands, its files move
     /// off this list. (Basename match; there are no basename collisions across the corpus.)
     const MODULE_GOLDEN_DENYLIST: &[&str] = &[
-        // `struct { … }` as a *value* expression (an anonymous struct type in expr position).
-        "fn_ptr.jtr", "genlist.jtr", "genmethods.jtr", "list.jtr", "methods.jtr", "vec.jtr",
-        "vec_generic.jtr",
         // closures `|x| …` / `|| …`.
         "closure_run.jtr", "closures.jtr", "gen_vtable.jtr", "args.jtr", "core.jtr",
-        "parser.jtr", "tokens.jtr",
+        "fn_ptr.jtr", "parser.jtr", "tokens.jtr",
         // concurrency (`spawn`/`await`/`select`/`concurrent`) and `par for … reduce`.
         "atomics.jtr", "await.jtr", "channel.jtr", "concurrent.jtr", "deterministic.jtr",
         "dynamic_spawn.jtr", "mutex.jtr", "select.jtr", "sync.jtr", "numerics_canary.jtr",

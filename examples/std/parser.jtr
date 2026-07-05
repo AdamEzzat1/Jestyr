@@ -42,7 +42,7 @@ import "tokens"
 // 8=Try 9=Error 10=Call 11=Cast 12=Assign 13=Range 14=ArrayLit 15=ArrayRepeat 16=StructLit
 // 17=GenStructLit 18=FieldInit 19=SelfValue 20=SelfType 21=Attr 22=FString 23=Block 24=If
 // 25=Unsafe 26=Char 27=Bool 28=Match 29=Str 30=Null 31=For 32=Break 33=Continue 34=Invariant
-// 35=Variant. `a`/`b` are child `ExprId`s: unary/postfix use `a` for the
+// 35=Variant 36=StructType. `a`/`b` are child `ExprId`s: unary/postfix use `a` for the
 // operand/base, binary uses `a`=lhs `b`=rhs, index uses `a`=base `b`=index, call/cast use
 // `a`=callee/expr. `x`/`y` are auxiliary integers: Field stores its name's source span
 // `(x, y)`; Call stores `(arg_start, arg_count)` into the arg arena; Cast stores its target
@@ -124,6 +124,11 @@ struct Parser { toks: List(tokens.Token), ex: List(ExprData), ar: List(i32), st:
 // The result of parsing a `{ field, …, ..spread }` initializer body: the field-init nodes'
 // slice into the arg arena, the optional spread expr (-1 if none), and the `}` end offset.
 struct FieldsResult { field_start: i32, field_count: i32, spread: i32, endp: usize }
+
+// The result of parsing a struct/record/union `{ members }` body: the member 10-tuples' slice
+// into `mar` and the `}` end offset. Shared by the struct *item* parser and the `struct { … }`
+// value expression.
+struct MembersResult { mem_start: i32, mem_count: i32, endp: usize }
 
 // ---- cursor helpers ----
 
@@ -304,6 +309,14 @@ fn mk_loopjump(mut p: Parser, kind: i32, start: usize, end: usize, ls: i32, le: 
 fn mk_loopword(mut p: Parser, kind: i32, start: usize, end: usize, e: i32) -> i32 {
     let id: i32 = list.len(ExprData, p.ex) as i32
     list.push(ExprData, p.ex, ExprData{ kind: kind, start: start, end: end, op: 0, a: e, b: 0 - 1, x: 0 - 1, y: 0 - 1 })
+    return id
+}
+// A `struct { … }` value expression (kind 36): an anonymous struct type in expression position.
+// `(x, y)`=(member_start, member_count) of 10-tuples in `mar` (the same layout the struct *item*
+// parser uses). Mirrors `ExprKind::StructType(StructBody)`.
+fn mk_structtype(mut p: Parser, start: usize, end: usize, mem_start: i32, mem_count: i32) -> i32 {
+    let id: i32 = list.len(ExprData, p.ex) as i32
+    list.push(ExprData, p.ex, ExprData{ kind: 36, start: start, end: end, op: 0, a: 0 - 1, b: 0 - 1, x: mem_start, y: mem_count })
     return id
 }
 // ---- pattern arena constructors ----
@@ -1408,8 +1421,29 @@ fn parse_struct(mut p: Parser, is_pub: i32, kindcode: i32, attr_start: i32, attr
     bump(p)                                        // consume `struct`/`record`/`union`
     var ns: usize = start  var ne: usize = start
     if cur_kind(p) == 0 { let nt: tokens.Token = cur_tok(p)  ns = nt.start  ne = nt.end  bump(p) }
+    let mr: MembersResult = parse_struct_members(p, ne)
+    return mk_item_struct(p, start, mr.endp, is_pub, kindcode, ns, ne, mr.mem_start, mr.mem_count, attr_start, attr_count)
+}
+
+// `struct { … }` as a *value* — an anonymous struct type in expression position (e.g.
+// `return struct { ptr: *mut T, len: usize }`). Reuses the shared member-body parser. The span
+// runs from the `struct` keyword to the closing `}`. Mirrors the `Struct` arm of `parse_primary`.
+fn parse_struct_type(mut p: Parser) -> i32 {
+    let st: tokens.Token = cur_tok(p)
+    let start: usize = st.start
+    bump(p)                                        // consume `struct`
+    let mr: MembersResult = parse_struct_members(p, start)
+    return mk_structtype(p, start, mr.endp, mr.mem_start, mr.mem_count)
+}
+
+// Parse a struct/record/union body `{ members }` starting at the `{`, appending each member's
+// 10-tuple to `mar`. A member is a method (`[@attrs] fn …`, reusing parse_fn — tag 1, id, 8
+// pads) or a field `[pub] name : [@volatile] T [: bits] [= default]` (tag 0 + its 9 aux ints).
+// `fallback` seeds the missing-name / missing-`}` offsets (never used on valid input). Shared by
+// the struct *item* parser and the `struct { … }` value expression. Mirrors `parse_struct_body`.
+fn parse_struct_members(mut p: Parser, fallback: usize) -> MembersResult {
     if cur_kind(p) == 65 { bump(p) }               // `{`
-    var tmp: List(i32) = list.make(i32, p.alloc)   // member 6-tuples
+    var tmp: List(i32) = list.make(i32, p.alloc)   // member 10-tuples
     var more: bool = true
     for more {
         let k: i32 = cur_kind(p)
@@ -1426,7 +1460,7 @@ fn parse_struct(mut p: Parser, is_pub: i32, kindcode: i32, attr_start: i32, attr
         } else {                                    // `[pub] name : [@volatile] T [: bits] [= default]`
             var fpub: i32 = 0
             if cur_kind(p) == 42 { bump(p)  fpub = 1 }   // `pub`
-            var fns: usize = start  var fne: usize = start
+            var fns: usize = fallback  var fne: usize = fallback
             if cur_kind(p) == 0 { let nt: tokens.Token = cur_tok(p)  fns = nt.start  fne = nt.end  bump(p) }
             if cur_kind(p) == 71 { bump(p) }        // `:`
             let fattr_start: i32 = parse_attrs(p)   // field attributes (`@volatile`)
@@ -1452,7 +1486,7 @@ fn parse_struct(mut p: Parser, is_pub: i32, kindcode: i32, attr_start: i32, attr
             if cur_kind(p) == 69 { bump(p) }        // optional `,`
         }
     }
-    var endp: usize = ne
+    var endp: usize = fallback
     if cur_kind(p) == 66 { let rb: tokens.Token = cur_tok(p)  endp = rb.end  bump(p) }
     let mem_start: i32 = list.len(i32, p.mar) as i32
     let mem_count: i32 = (list.len(i32, tmp) / 10) as i32
@@ -1461,7 +1495,7 @@ fn parse_struct(mut p: Parser, is_pub: i32, kindcode: i32, attr_start: i32, attr
         list.push(i32, p.mar, list.get(i32, tmp, j))
         j = j + 1
     }
-    return mk_item_struct(p, start, endp, is_pub, kindcode, ns, ne, mem_start, mem_count, attr_start, attr_count)
+    return MembersResult{ mem_start: mem_start, mem_count: mem_count, endp: endp }
 }
 
 // `enum Name(tparams) { V, W(f: T), X = 1, … }`. Optional generic `(T, E)` type params; each
@@ -1757,6 +1791,9 @@ fn parse_primary(mut p: Parser) -> i32 {
     }
     if k == 38 {                                   // `unsafe` -> Unsafe block
         return parse_unsafe(p)
+    }
+    if k == 11 {                                   // `struct { … }` -> anonymous struct value
+        return parse_struct_type(p)
     }
     if k == 24 {                                   // `for` -> loop
         return parse_for(p)
@@ -2536,6 +2573,38 @@ fn dump_attrs(read src: str, read p: Parser, attr_start: i32, attr_count: i32) {
     }
 }
 
+// Dump a struct/record/union member slice (`mar` 10-tuples): each member is a method (tag 1 —
+// the fn dump) or a field `(sfield <is_pub> <volatile> <name span> <type> <bits-opt>
+// <default-opt>)`. Shared by the struct *item* dump and the `struct { … }` value dump. Mirrors
+// `ref_dump_members`.
+fn dump_members(read src: str, read p: Parser, mem_start: i32, mem_count: i32) {
+    var i: i32 = 0
+    for i < mem_count {
+        let base: i32 = mem_start + i * 10
+        let tag: i32 = list.get(i32, p.mar, base as usize)
+        if tag == 1 {
+            let fid: i32 = list.get(i32, p.mar, (base + 1) as usize)
+            dump_item(src, p, fid)
+        } else {
+            let fpub: i32 = list.get(i32, p.mar, (base + 1) as usize)
+            let fns: i32 = list.get(i32, p.mar, (base + 2) as usize)
+            let fne: i32 = list.get(i32, p.mar, (base + 3) as usize)
+            let fty: i32 = list.get(i32, p.mar, (base + 4) as usize)
+            let default: i32 = list.get(i32, p.mar, (base + 5) as usize)
+            let fattr_start: i32 = list.get(i32, p.mar, (base + 6) as usize)
+            let fattr_count: i32 = list.get(i32, p.mar, (base + 7) as usize)
+            let bs: i32 = list.get(i32, p.mar, (base + 8) as usize)
+            let be: i32 = list.get(i32, p.mar, (base + 9) as usize)
+            print_str("(") print_str("sfield") print_int(fpub as i64) print_int(attrs_has_volatile(src, p, fattr_start, fattr_count) as i64) print_int(fns as i64) print_int(fne as i64)
+            dump_type(src, p, fty)
+            if bs < 0 { print_str("(") print_str("none") print_str(")") } else { print_str("(") print_str("bits") print_str(src[bs as usize .. be as usize]) print_str(")") }
+            if default < 0 { print_str("(") print_str("none") print_str(")") } else { dump(src, p, default) }
+            print_str(")")
+        }
+        i = i + 1
+    }
+}
+
 // Dump one top-level item. `import`: the path text, an alias name span or `(none)`, and a
 // pinned-hash text or `(none)`. `distinct`: is_pub, name span, base type. `const`: is_pub,
 // name span, an optional type, the value. Mirrors `ref_dump_item`.
@@ -2570,31 +2639,7 @@ fn dump_item(read src: str, read p: Parser, iid: i32) {
         // struct/record/union: kind code, is_pub, name span, member count, then each member —
         // a field `(sfield <is_pub> <name span> <type> <default-opt>)` or a method fn dump.
         print_str("struct") dump_attrs(src, p, d.u, d.v) print_int(d.op as i64) print_int(d.is_pub as i64) print_int(d.x as i64) print_int(d.y as i64) print_int(d.b as i64)
-        var i: i32 = 0
-        for i < d.b {
-            let base: i32 = d.a + i * 10
-            let tag: i32 = list.get(i32, p.mar, base as usize)
-            if tag == 1 {
-                let fid: i32 = list.get(i32, p.mar, (base + 1) as usize)
-                dump_item(src, p, fid)
-            } else {
-                let fpub: i32 = list.get(i32, p.mar, (base + 1) as usize)
-                let fns: i32 = list.get(i32, p.mar, (base + 2) as usize)
-                let fne: i32 = list.get(i32, p.mar, (base + 3) as usize)
-                let fty: i32 = list.get(i32, p.mar, (base + 4) as usize)
-                let default: i32 = list.get(i32, p.mar, (base + 5) as usize)
-                let fattr_start: i32 = list.get(i32, p.mar, (base + 6) as usize)
-                let fattr_count: i32 = list.get(i32, p.mar, (base + 7) as usize)
-                let bs: i32 = list.get(i32, p.mar, (base + 8) as usize)
-                let be: i32 = list.get(i32, p.mar, (base + 9) as usize)
-                print_str("(") print_str("sfield") print_int(fpub as i64) print_int(attrs_has_volatile(src, p, fattr_start, fattr_count) as i64) print_int(fns as i64) print_int(fne as i64)
-                dump_type(src, p, fty)
-                if bs < 0 { print_str("(") print_str("none") print_str(")") } else { print_str("(") print_str("bits") print_str(src[bs as usize .. be as usize]) print_str(")") }
-                if default < 0 { print_str("(") print_str("none") print_str(")") } else { dump(src, p, default) }
-                print_str(")")
-            }
-            i = i + 1
-        }
+        dump_members(src, p, d.a, d.b)
     } else if d.kind == 5 {
         // enum: is_pub, name span, tparam count, `(tparam <span>)`s, variant count, then each
         // `(variant <name span> <fieldcount> <(vfield <fname span> <type>)>s <disc-opt>)`.
@@ -2964,6 +3009,10 @@ fn dump(read src: str, read p: Parser, id: i32) {
     } else if d.kind == 35 {
         print_str("variant") print_uint(d.start) print_uint(d.end)
         dump(src, p, d.a)
+    } else if d.kind == 36 {
+        // StructType: member count, span, then each member (the shared `(sfield …)`/fn dump).
+        print_str("structtype") print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
+        dump_members(src, p, d.x, d.y)
     } else {
         print_str("error") print_uint(d.start) print_uint(d.end)
     }
