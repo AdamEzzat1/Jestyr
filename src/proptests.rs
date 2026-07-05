@@ -6026,6 +6026,53 @@ mod c_oracle {
         out.push(")".to_string());
     }
 
+    /// Dump a function declaration's atoms (no surrounding parens) — shared by the `Item::Fn`
+    /// arm and struct-method members: `fn`, is_pub, name span, param count, each `(param …)`,
+    /// then ret_conv, ret-opt, and the body block.
+    fn ref_dump_fn(ast: &crate::ast::Ast, f: &crate::ast::FnDecl, out: &mut Vec<String>) {
+        out.push("fn".to_string());
+        out.push(if f.is_pub { "1" } else { "0" }.to_string());
+        out.push(f.name.span.start.to_string());
+        out.push(f.name.span.end.to_string());
+        out.push(f.params.len().to_string());
+        for pm in &f.params {
+            out.push("(".to_string());
+            out.push("param".to_string());
+            out.push(if pm.comptime { "1" } else { "0" }.to_string());
+            out.push(ref_conv_code(pm.conv).to_string());
+            out.push(if pm.is_self { "1" } else { "0" }.to_string());
+            out.push(pm.name.span.start.to_string());
+            out.push(pm.name.span.end.to_string());
+            match pm.ty {
+                Some(t) => ref_dump_type(ast, t, out),
+                None => {
+                    out.push("(".to_string());
+                    out.push("none".to_string());
+                    out.push(")".to_string());
+                }
+            }
+            match pm.refine {
+                Some(e) => ref_dump_expr(ast, e, out),
+                None => {
+                    out.push("(".to_string());
+                    out.push("none".to_string());
+                    out.push(")".to_string());
+                }
+            }
+            out.push(")".to_string());
+        }
+        out.push(ref_conv_code(f.ret_conv).to_string());
+        match f.ret_ty {
+            Some(t) => ref_dump_type(ast, t, out),
+            None => {
+                out.push("(".to_string());
+                out.push("none".to_string());
+                out.push(")".to_string());
+            }
+        }
+        ref_dump_block(ast, &f.body, out);
+    }
+
     /// Dump one top-level item (matching the Jestyr `dump_item`). `import`: the path text,
     /// an alias name span or `(none)`, a pinned-hash text or `(none)`. `distinct`: is_pub,
     /// name span, base type. `const`: is_pub, name span, an optional type, the value.
@@ -6089,55 +6136,51 @@ mod c_oracle {
                 }
                 ref_dump_expr(ast, c.value, out);
             }
-            // fn: is_pub, name span, param count, each `(param <comptime> <conv> <is_self>
-            // <name span> <ty-opt> <refine-opt>)`, then ret_conv, ret-opt, and the body block.
-            // (Generics/attrs/errors/contracts are omitted until the parser handles them —
-            // the fn-core corpus has none, so they'd be empty anyway.)
-            Item::Fn(f) => {
-                out.push("fn".to_string());
-                out.push(if f.is_pub { "1" } else { "0" }.to_string());
-                out.push(f.name.span.start.to_string());
-                out.push(f.name.span.end.to_string());
-                out.push(f.params.len().to_string());
-                for pm in &f.params {
-                    out.push("(".to_string());
-                    out.push("param".to_string());
-                    out.push(if pm.comptime { "1" } else { "0" }.to_string());
-                    out.push(ref_conv_code(pm.conv).to_string());
-                    out.push(if pm.is_self { "1" } else { "0" }.to_string());
-                    out.push(pm.name.span.start.to_string());
-                    out.push(pm.name.span.end.to_string());
-                    match pm.ty {
-                        Some(t) => ref_dump_type(ast, t, out),
-                        None => {
+            // fn: is_pub, name span, param count, each `(param …)`, then ret_conv, ret-opt,
+            // and the body. (Generics/attrs/errors/contracts are omitted until the parser
+            // handles them — the fn-core corpus has none, so they'd be empty anyway.)
+            Item::Fn(f) => ref_dump_fn(ast, f, out),
+            // struct/record/union: kind code (0/1/2), is_pub, name span, member count, then
+            // each member — a field `(sfield <is_pub> <name span> <type> <default-opt>)` or a
+            // method fn dump. (Field `@volatile`/`: bits` are omitted until parsed.)
+            Item::Struct { is_pub, is_record, is_union, name, body, .. } => {
+                use crate::ast::StructMember;
+                let kindcode = if *is_record { 1 } else if *is_union { 2 } else { 0 };
+                out.push("struct".to_string());
+                out.push(kindcode.to_string());
+                out.push(if *is_pub { "1" } else { "0" }.to_string());
+                out.push(name.span.start.to_string());
+                out.push(name.span.end.to_string());
+                out.push(body.members.len().to_string());
+                for m in &body.members {
+                    match m {
+                        StructMember::Field { name, ty, is_pub, default, .. } => {
                             out.push("(".to_string());
-                            out.push("none".to_string());
+                            out.push("sfield".to_string());
+                            out.push(if *is_pub { "1" } else { "0" }.to_string());
+                            out.push(name.span.start.to_string());
+                            out.push(name.span.end.to_string());
+                            ref_dump_type(ast, *ty, out);
+                            match default {
+                                Some(e) => ref_dump_expr(ast, *e, out),
+                                None => {
+                                    out.push("(".to_string());
+                                    out.push("none".to_string());
+                                    out.push(")".to_string());
+                                }
+                            }
+                            out.push(")".to_string());
+                        }
+                        StructMember::Method(f) => {
+                            out.push("(".to_string());
+                            ref_dump_fn(ast, f, out);
                             out.push(")".to_string());
                         }
                     }
-                    match pm.refine {
-                        Some(e) => ref_dump_expr(ast, e, out),
-                        None => {
-                            out.push("(".to_string());
-                            out.push("none".to_string());
-                            out.push(")".to_string());
-                        }
-                    }
-                    out.push(")".to_string());
                 }
-                out.push(ref_conv_code(f.ret_conv).to_string());
-                match f.ret_ty {
-                    Some(t) => ref_dump_type(ast, t, out),
-                    None => {
-                        out.push("(".to_string());
-                        out.push("none".to_string());
-                        out.push(")".to_string());
-                    }
-                }
-                ref_dump_block(ast, &f.body, out);
             }
-            // Other item kinds (struct/enum/trait/impl/extern) land in later slices; the
-            // item corpus is curated to the handled kinds.
+            // Other item kinds (enum/trait/impl/extern) land in later slices; the item corpus
+            // is curated to the handled kinds.
             _ => out.push("itemerr".to_string()),
         }
         out.push(")".to_string());
@@ -6769,6 +6812,15 @@ mod c_oracle {
             "fn clamp(i: usize in 0..n) -> usize { i }", // a param refinement (`in <expr>`)
             "fn out_param(out result: i32) { }", // an `out` convention param
             "fn body_stmts() { let x = 1  x }", // a body with a let + tail expression
+            // struct / record / union (struct-core: no @volatile/bit-fields)
+            "struct Point { x: i32, y: i32 }", // a plain struct with two fields
+            "pub record Rgb { r: u8, g: u8, b: u8 }", // a public record, three fields
+            "union Bits { i: i32, f: f32 }", // an untagged union
+            "struct Empty { }",             // no members
+            "struct Node { value: i32, next: *mut Node }", // a self-referential field type
+            "struct Config { retries: i32 = 3 }", // a field default
+            "struct WithMethod { n: i32  fn get(read self) -> i32 { self.n } }", // a field + method
+            "pub struct Vec2 { pub x: f64, pub y: f64 }", // public fields
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_item_probe.jtr");
