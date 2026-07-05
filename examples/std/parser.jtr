@@ -430,6 +430,13 @@ fn mk_item_enum(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize,
     list.push(ItemData, p.it, ItemData{ kind: 5, start: start, end: end, is_pub: is_pub, op: tparam_start, a: tparam_count, b: variant_start, x: ns as i32, y: ne as i32, z: variant_count, w: 0 - 1 })
     return id
 }
+// A `trait Name { methods }` item (kind 6): `(x,y)`=name span, `(a,b)`=(method_start,
+// method_count) of trait-method 7-tuples in `mar`.
+fn mk_item_trait(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, method_start: i32, method_count: i32) -> i32 {
+    let id: i32 = list.len(ItemData, p.it) as i32
+    list.push(ItemData, p.it, ItemData{ kind: 6, start: start, end: end, is_pub: is_pub, op: 0 - 1, a: method_start, b: method_count, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1 })
+    return id
+}
 // An unrecognized item -> Error (kind 99), spanning the offending token.
 fn mk_item_err(mut p: Parser, start: usize, end: usize) -> i32 {
     let id: i32 = list.len(ItemData, p.it) as i32
@@ -1020,19 +1027,13 @@ fn parse_const(mut p: Parser, is_pub: i32) -> i32 {
     return mk_item_const(p, start, node_end(p, value), is_pub, ns, ne, tyid, value)
 }
 
-// `fn Name(params) [-> conv R] { body }`. Each param may carry `comptime`, a passing
-// convention, and either `self` or `name [: T [in refine]]`. Params are buffered as 7-tuples
-// (comptime, conv, name_start, name_end, is_self, ty|-1, refine|-1) then appended to `iar`.
-// (Generics `[T: B]`, error sets `!{ … }`, and `requires`/`ensures` contracts are later
-// slices — fn-core.) Mirrors `parse_fn` / `parse_params` / `parse_param`.
-fn parse_fn(mut p: Parser, is_pub: i32) -> i32 {
-    let ft: tokens.Token = cur_tok(p)
-    let start: usize = ft.start
-    bump(p)                                        // consume `fn`
-    var ns: usize = start  var ne: usize = start
-    if cur_kind(p) == 0 { let nt: tokens.Token = cur_tok(p)  ns = nt.start  ne = nt.end  bump(p) }
-    if cur_kind(p) == 63 { bump(p) }               // `(`
-    var tmp: List(i32) = list.make(i32, p.alloc)   // param 7-tuples
+// Parse a parameter list `p0, p1, …` (cur is the first param or `)`) directly into `iar` as
+// 7-tuples (comptime, conv, name_start, name_end, is_self, ty|-1, refine|-1) and return their
+// `param_start`; the caller reads `param_count = (len(iar) - start) / 7`. Direct-append is
+// safe: a param's type/refine parse touches `ty`/`ex`, never `iar`, so the slice stays
+// contiguous. Shared by `parse_fn`, trait methods, `impl` methods, and `extern`.
+fn parse_params_into_iar(mut p: Parser) -> i32 {
+    let param_start: i32 = list.len(i32, p.iar) as i32
     var more: bool = true
     for more {
         let k: i32 = cur_kind(p)
@@ -1043,7 +1044,7 @@ fn parse_fn(mut p: Parser, is_pub: i32) -> i32 {
             if cur_kind(p) == 31 { bump(p)  comp = 1 }       // `comptime`
             let conv: i32 = parse_conv(p)
             var is_self: i32 = 0
-            var pns: usize = start  var pne: usize = start
+            var pns: usize = 0  var pne: usize = 0
             var pty: i32 = 0 - 1  var refine: i32 = 0 - 1
             if cur_kind(p) == 61 {                 // `self` receiver
                 let st: tokens.Token = cur_tok(p)  pns = st.start  pne = st.end  is_self = 1  bump(p)
@@ -1055,16 +1056,30 @@ fn parse_fn(mut p: Parser, is_pub: i32) -> i32 {
                     if cur_kind(p) == 25 { bump(p)  refine = parse_expr(p) }   // `in <refine>`
                 }
             }
-            list.push(i32, tmp, comp)
-            list.push(i32, tmp, conv)
-            list.push(i32, tmp, pns as i32)
-            list.push(i32, tmp, pne as i32)
-            list.push(i32, tmp, is_self)
-            list.push(i32, tmp, pty)
-            list.push(i32, tmp, refine)
+            list.push(i32, p.iar, comp)
+            list.push(i32, p.iar, conv)
+            list.push(i32, p.iar, pns as i32)
+            list.push(i32, p.iar, pne as i32)
+            list.push(i32, p.iar, is_self)
+            list.push(i32, p.iar, pty)
+            list.push(i32, p.iar, refine)
             if cur_kind(p) == 69 { bump(p) } else { more = false }   // `,`
         }
     }
+    return param_start
+}
+
+// `fn Name(params) [-> conv R] { body }`. (Generics `[T: B]`, error sets `!{ … }`, and
+// `requires`/`ensures` contracts are later slices — fn-core.) Mirrors `parse_fn`.
+fn parse_fn(mut p: Parser, is_pub: i32) -> i32 {
+    let ft: tokens.Token = cur_tok(p)
+    let start: usize = ft.start
+    bump(p)                                        // consume `fn`
+    var ns: usize = start  var ne: usize = start
+    if cur_kind(p) == 0 { let nt: tokens.Token = cur_tok(p)  ns = nt.start  ne = nt.end  bump(p) }
+    if cur_kind(p) == 63 { bump(p) }               // `(`
+    let param_start: i32 = parse_params_into_iar(p)
+    let param_count: i32 = ((list.len(i32, p.iar) as i32) - param_start) / 7
     if cur_kind(p) == 64 { bump(p) }               // `)`
     var ret_conv: i32 = 0
     var ret_ty: i32 = 0 - 1
@@ -1074,13 +1089,6 @@ fn parse_fn(mut p: Parser, is_pub: i32) -> i32 {
         ret_ty = parse_type(p)
     }
     let body: i32 = parse_block(p)
-    let param_start: i32 = list.len(i32, p.iar) as i32
-    let param_count: i32 = (list.len(i32, tmp) / 7) as i32
-    var j: usize = 0
-    for j < list.len(i32, tmp) {
-        list.push(i32, p.iar, list.get(i32, tmp, j))
-        j = j + 1
-    }
     return mk_item_fn(p, start, node_end(p, body), is_pub, ns, ne, param_start, param_count, ret_conv, ret_ty, body)
 }
 
@@ -1228,9 +1236,61 @@ fn parse_enum(mut p: Parser, is_pub: i32) -> i32 {
     return mk_item_enum(p, start, endp, is_pub, ns, ne, tparam_start, tparam_count, variant_start, variant_count)
 }
 
+// `trait Name { fn m(self) -> T  fn n(self) { <default> } }`. Each method is a signature
+// (name, params, ret) with an optional `{ … }` default body (else an optional `;`). Methods
+// are buffered as 7-tuples (name span, param_start, param_count, ret_conv, ret_ty, body|-1)
+// then appended to `mar`. Mirrors `parse_trait` / `parse_trait_method`.
+fn parse_trait(mut p: Parser, is_pub: i32) -> i32 {
+    let tt: tokens.Token = cur_tok(p)
+    let start: usize = tt.start
+    bump(p)                                        // consume `trait`
+    var ns: usize = start  var ne: usize = start
+    if cur_kind(p) == 0 { let nt: tokens.Token = cur_tok(p)  ns = nt.start  ne = nt.end  bump(p) }
+    if cur_kind(p) == 65 { bump(p) }               // `{`
+    var mt: List(i32) = list.make(i32, p.alloc)    // trait-method 7-tuples
+    var more: bool = true
+    for more {
+        let k: i32 = cur_kind(p)
+        if k == 66 { more = false }                // `}`
+        else if k == 110 { more = false }          // Eof
+        else if k == 7 {                            // `fn` -> a method signature
+            bump(p)                                // `fn`
+            var mns: usize = start  var mne: usize = start
+            if cur_kind(p) == 0 { let nt: tokens.Token = cur_tok(p)  mns = nt.start  mne = nt.end  bump(p) }
+            if cur_kind(p) == 63 { bump(p) }       // `(`
+            let param_start: i32 = parse_params_into_iar(p)
+            let param_count: i32 = ((list.len(i32, p.iar) as i32) - param_start) / 7
+            if cur_kind(p) == 64 { bump(p) }       // `)`
+            var ret_conv: i32 = 0
+            var ret_ty: i32 = 0 - 1
+            if cur_kind(p) == 77 { bump(p)  ret_conv = parse_conv(p)  ret_ty = parse_type(p) }   // `-> conv R`
+            var body: i32 = 0 - 1
+            if cur_kind(p) == 65 { body = parse_block(p) }   // `{ default }`
+            else if cur_kind(p) == 70 { bump(p) }            // optional `;`
+            list.push(i32, mt, mns as i32)
+            list.push(i32, mt, mne as i32)
+            list.push(i32, mt, param_start)
+            list.push(i32, mt, param_count)
+            list.push(i32, mt, ret_conv)
+            list.push(i32, mt, ret_ty)
+            list.push(i32, mt, body)
+        } else { bump(p) }                          // error recovery
+    }
+    var endp: usize = ne
+    if cur_kind(p) == 66 { let rb: tokens.Token = cur_tok(p)  endp = rb.end  bump(p) }
+    let method_start: i32 = list.len(i32, p.mar) as i32
+    let method_count: i32 = (list.len(i32, mt) / 7) as i32
+    var j: usize = 0
+    for j < list.len(i32, mt) {
+        list.push(i32, p.mar, list.get(i32, mt, j))
+        j = j + 1
+    }
+    return mk_item_trait(p, start, endp, is_pub, ns, ne, method_start, method_count)
+}
+
 // Parse one top-level item. Consumes an optional `pub` prefix, then dispatches on the item
-// keyword. Attribute (`@…`) and the remaining item kinds (trait/impl/extern) are later
-// slices. Mirrors `parse_item`.
+// keyword. Attribute (`@…`) and the remaining item kinds (impl/extern) are later slices.
+// Mirrors `parse_item`.
 fn parse_item(mut p: Parser) -> i32 {
     var is_pub: i32 = 0
     if cur_kind(p) == 42 { bump(p)  is_pub = 1 }   // `pub`
@@ -1243,6 +1303,7 @@ fn parse_item(mut p: Parser) -> i32 {
     if k == 12 { return parse_struct(p, is_pub, 1) } // `record`
     if k == 14 { return parse_struct(p, is_pub, 2) } // `union`
     if k == 13 { return parse_enum(p, is_pub) }    // `enum`
+    if k == 15 { return parse_trait(p, is_pub) }   // `trait`
     let t: tokens.Token = cur_tok(p)
     bump(p)                                        // unrecognized: error over one token
     return mk_item_err(p, t.start, t.end)
@@ -1930,6 +1991,28 @@ fn dump_type(read src: str, read p: Parser, tid: i32) {
     print_str(")")
 }
 
+// Dump a parameter slice (the `param_count` 7-tuples at `iar[param_start…]`) as a run of
+// `(param <comptime> <conv> <is_self> <name span> <ty-opt> <refine-opt>)`. Shared by the fn
+// item and trait-method dumps.
+fn dump_params(read src: str, read p: Parser, param_start: i32, param_count: i32) {
+    var i: i32 = 0
+    for i < param_count {
+        let base: i32 = param_start + i * 7
+        let comp: i32 = list.get(i32, p.iar, base as usize)
+        let conv: i32 = list.get(i32, p.iar, (base + 1) as usize)
+        let pns: i32 = list.get(i32, p.iar, (base + 2) as usize)
+        let pne: i32 = list.get(i32, p.iar, (base + 3) as usize)
+        let is_self: i32 = list.get(i32, p.iar, (base + 4) as usize)
+        let pty: i32 = list.get(i32, p.iar, (base + 5) as usize)
+        let refine: i32 = list.get(i32, p.iar, (base + 6) as usize)
+        print_str("(") print_str("param") print_int(comp as i64) print_int(conv as i64) print_int(is_self as i64) print_int(pns as i64) print_int(pne as i64)
+        if pty < 0 { print_str("(") print_str("none") print_str(")") } else { dump_type(src, p, pty) }
+        if refine < 0 { print_str("(") print_str("none") print_str(")") } else { dump(src, p, refine) }
+        print_str(")")
+        i = i + 1
+    }
+}
+
 // Dump one top-level item. `import`: the path text, an alias name span or `(none)`, and a
 // pinned-hash text or `(none)`. `distinct`: is_pub, name span, base type. `const`: is_pub,
 // name span, an optional type, the value. Mirrors `ref_dump_item`.
@@ -1955,22 +2038,7 @@ fn dump_item(read src: str, read p: Parser, iid: i32) {
         // fn: is_pub, name span, param count, each `(param <comptime> <conv> <is_self>
         // <name span> <ty-opt> <refine-opt>)`, then ret_conv, ret-opt, and the body block.
         print_str("fn") print_int(d.is_pub as i64) print_int(d.x as i64) print_int(d.y as i64) print_int(d.b as i64)
-        var i: i32 = 0
-        for i < d.b {
-            let base: i32 = d.a + i * 7
-            let comp: i32 = list.get(i32, p.iar, base as usize)
-            let conv: i32 = list.get(i32, p.iar, (base + 1) as usize)
-            let pns: i32 = list.get(i32, p.iar, (base + 2) as usize)
-            let pne: i32 = list.get(i32, p.iar, (base + 3) as usize)
-            let is_self: i32 = list.get(i32, p.iar, (base + 4) as usize)
-            let pty: i32 = list.get(i32, p.iar, (base + 5) as usize)
-            let refine: i32 = list.get(i32, p.iar, (base + 6) as usize)
-            print_str("(") print_str("param") print_int(comp as i64) print_int(conv as i64) print_int(is_self as i64) print_int(pns as i64) print_int(pne as i64)
-            if pty < 0 { print_str("(") print_str("none") print_str(")") } else { dump_type(src, p, pty) }
-            if refine < 0 { print_str("(") print_str("none") print_str(")") } else { dump(src, p, refine) }
-            print_str(")")
-            i = i + 1
-        }
+        dump_params(src, p, d.a, d.b)
         print_int(d.op as i64)                     // ret_conv
         if d.z < 0 { print_str("(") print_str("none") print_str(")") } else { dump_type(src, p, d.z) }
         dump(src, p, d.w)                          // the body block
@@ -2032,6 +2100,28 @@ fn dump_item(read src: str, read p: Parser, iid: i32) {
             if disc < 0 { print_str("(") print_str("none") print_str(")") } else { dump(src, p, disc) }
             print_str(")")
             v = v + 1
+        }
+    } else if d.kind == 6 {
+        // trait: is_pub, name span, method count, then each `(tmethod <name span>
+        // <paramcount> <(param …)>s <ret_conv> <ret-opt> <default-body-opt>)`.
+        print_str("trait") print_int(d.is_pub as i64) print_int(d.x as i64) print_int(d.y as i64) print_int(d.b as i64)
+        var m: i32 = 0
+        for m < d.b {
+            let mb: i32 = d.a + m * 7
+            let mns: i32 = list.get(i32, p.mar, mb as usize)
+            let mne: i32 = list.get(i32, p.mar, (mb + 1) as usize)
+            let param_start: i32 = list.get(i32, p.mar, (mb + 2) as usize)
+            let param_count: i32 = list.get(i32, p.mar, (mb + 3) as usize)
+            let ret_conv: i32 = list.get(i32, p.mar, (mb + 4) as usize)
+            let ret_ty: i32 = list.get(i32, p.mar, (mb + 5) as usize)
+            let body: i32 = list.get(i32, p.mar, (mb + 6) as usize)
+            print_str("(") print_str("tmethod") print_int(mns as i64) print_int(mne as i64) print_int(param_count as i64)
+            dump_params(src, p, param_start, param_count)
+            print_int(ret_conv as i64)
+            if ret_ty < 0 { print_str("(") print_str("none") print_str(")") } else { dump_type(src, p, ret_ty) }
+            if body < 0 { print_str("(") print_str("none") print_str(")") } else { dump(src, p, body) }
+            print_str(")")
+            m = m + 1
         }
     } else {
         print_str("itemerr") print_uint(d.start) print_uint(d.end)

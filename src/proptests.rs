@@ -6026,16 +6026,10 @@ mod c_oracle {
         out.push(")".to_string());
     }
 
-    /// Dump a function declaration's atoms (no surrounding parens) — shared by the `Item::Fn`
-    /// arm and struct-method members: `fn`, is_pub, name span, param count, each `(param …)`,
-    /// then ret_conv, ret-opt, and the body block.
-    fn ref_dump_fn(ast: &crate::ast::Ast, f: &crate::ast::FnDecl, out: &mut Vec<String>) {
-        out.push("fn".to_string());
-        out.push(if f.is_pub { "1" } else { "0" }.to_string());
-        out.push(f.name.span.start.to_string());
-        out.push(f.name.span.end.to_string());
-        out.push(f.params.len().to_string());
-        for pm in &f.params {
+    /// Dump a parameter slice as a run of `(param <comptime> <conv> <is_self> <name span>
+    /// <ty-opt> <refine-opt>)`. Shared by the fn item and trait-method dumps.
+    fn ref_dump_params(ast: &crate::ast::Ast, params: &[crate::ast::Param], out: &mut Vec<String>) {
+        for pm in params {
             out.push("(".to_string());
             out.push("param".to_string());
             out.push(if pm.comptime { "1" } else { "0" }.to_string());
@@ -6061,6 +6055,18 @@ mod c_oracle {
             }
             out.push(")".to_string());
         }
+    }
+
+    /// Dump a function declaration's atoms (no surrounding parens) — shared by the `Item::Fn`
+    /// arm and struct-method members: `fn`, is_pub, name span, param count, each `(param …)`,
+    /// then ret_conv, ret-opt, and the body block.
+    fn ref_dump_fn(ast: &crate::ast::Ast, f: &crate::ast::FnDecl, out: &mut Vec<String>) {
+        out.push("fn".to_string());
+        out.push(if f.is_pub { "1" } else { "0" }.to_string());
+        out.push(f.name.span.start.to_string());
+        out.push(f.name.span.end.to_string());
+        out.push(f.params.len().to_string());
+        ref_dump_params(ast, &f.params, out);
         out.push(ref_conv_code(f.ret_conv).to_string());
         match f.ret_ty {
             Some(t) => ref_dump_type(ast, t, out),
@@ -6221,8 +6227,43 @@ mod c_oracle {
                     out.push(")".to_string());
                 }
             }
-            // Other item kinds (trait/impl/extern) land in later slices; the item corpus is
-            // curated to the handled kinds.
+            // trait: is_pub, name span, method count, then each `(tmethod <name span>
+            // <paramcount> <(param …)>s <ret_conv> <ret-opt> <default-body-opt>)`.
+            Item::Trait(t) => {
+                out.push("trait".to_string());
+                out.push(if t.is_pub { "1" } else { "0" }.to_string());
+                out.push(t.name.span.start.to_string());
+                out.push(t.name.span.end.to_string());
+                out.push(t.methods.len().to_string());
+                for m in &t.methods {
+                    out.push("(".to_string());
+                    out.push("tmethod".to_string());
+                    out.push(m.name.span.start.to_string());
+                    out.push(m.name.span.end.to_string());
+                    out.push(m.params.len().to_string());
+                    ref_dump_params(ast, &m.params, out);
+                    out.push(ref_conv_code(m.ret_conv).to_string());
+                    match m.ret_ty {
+                        Some(t) => ref_dump_type(ast, t, out),
+                        None => {
+                            out.push("(".to_string());
+                            out.push("none".to_string());
+                            out.push(")".to_string());
+                        }
+                    }
+                    match &m.default_body {
+                        Some(b) => ref_dump_block(ast, b, out),
+                        None => {
+                            out.push("(".to_string());
+                            out.push("none".to_string());
+                            out.push(")".to_string());
+                        }
+                    }
+                    out.push(")".to_string());
+                }
+            }
+            // Other item kinds (impl/extern) land in later slices; the item corpus is curated
+            // to the handled kinds.
             _ => out.push("itemerr".to_string()),
         }
         out.push(")".to_string());
@@ -6871,6 +6912,12 @@ mod c_oracle {
             "enum Status { ok = 0, err = 1 }", // explicit discriminants
             "enum Empty { }",               // no variants
             "enum Mixed { a, b(x: i32), c = 5 }", // nullary + payload + discriminant
+            // traits: required signatures + default methods
+            "trait Show { fn show(read self) -> str }", // one required method
+            "trait Zero { fn zero() -> Self }",         // a static (no-self) method
+            "pub trait Eq { fn eq(read self, read other: Self) -> bool }", // public, a param
+            "trait Greet { fn hi(read self) { } }",     // a default-body method
+            "trait Empty { }",                          // no methods
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_item_probe.jtr");
