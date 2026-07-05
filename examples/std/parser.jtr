@@ -42,8 +42,8 @@ import "tokens"
 // 8=Try 9=Error 10=Call 11=Cast 12=Assign 13=Range 14=ArrayLit 15=ArrayRepeat 16=StructLit
 // 17=GenStructLit 18=FieldInit 19=SelfValue 20=SelfType 21=Attr 22=FString 23=Block 24=If
 // 25=Unsafe 26=Char 27=Bool 28=Match 29=Str 30=Null 31=For 32=Break 33=Continue 34=Invariant
-// 35=Variant 36=StructType 37=Closure 38=Concurrent 39=Spawn 40=Await 41=ParFor 42=Select.
-// `a`/`b` are child `ExprId`s: unary/postfix use `a` for the
+// 35=Variant 36=StructType 37=Closure 38=Concurrent 39=Spawn 40=Await 41=ParFor 42=Select
+// 43=Region. `a`/`b` are child `ExprId`s: unary/postfix use `a` for the
 // operand/base, binary uses `a`=lhs `b`=rhs, index uses `a`=base `b`=index, call/cast use
 // `a`=callee/expr. `x`/`y` are auxiliary integers: Field stores its name's source span
 // `(x, y)`; Call stores `(arg_start, arg_count)` into the arg arena; Cast stores its target
@@ -382,6 +382,13 @@ fn mk_parfor(mut p: Parser, start: usize, end: usize, vs: i32, ve: i32, iter: i3
 fn mk_select(mut p: Parser, start: usize, end: usize, arm_start: i32, arm_count: i32) -> i32 {
     let id: i32 = list.len(ExprData, p.ex) as i32
     list.push(ExprData, p.ex, ExprData{ kind: 42, start: start, end: end, op: 0, a: 0 - 1, b: 0 - 1, x: arm_start, y: arm_count })
+    return id
+}
+// `region r { … }` (kind 43): an arena scope. `(x, y)`=region name span; `a`=body Block
+// `ExprId`. Mirrors `ExprKind::Region { name, body }`.
+fn mk_region(mut p: Parser, start: usize, end: usize, ns: i32, ne: i32, body: i32) -> i32 {
+    let id: i32 = list.len(ExprData, p.ex) as i32
+    list.push(ExprData, p.ex, ExprData{ kind: 43, start: start, end: end, op: 0, a: body, b: 0 - 1, x: ns, y: ne })
     return id
 }
 // ---- pattern arena constructors ----
@@ -860,7 +867,7 @@ fn parse_stmt(mut p: Parser) -> i32 {
         return mk_let(p, start, prev_end(p), mutbl, ns, ne, tyid, init)
     }
     // Block-led expressions in statement position parse *block-only* (no trailing operator).
-    if k == 65 or k == 22 or k == 21 or k == 38 or k == 24 or k == 34 or k == 37 {  // `{`/`if`/`match`/`unsafe`/`for`/`concurrent`/`select`
+    if k == 65 or k == 22 or k == 21 or k == 38 or k == 24 or k == 34 or k == 37 or k == 32 {  // `{`/`if`/`match`/`unsafe`/`for`/`concurrent`/`select`/`region`
         let e: i32 = parse_block_like(p)
         return mk_exprstmt(p, e)
     }
@@ -878,6 +885,7 @@ fn parse_block_like(mut p: Parser) -> i32 {
     if k == 24 { return parse_for(p) }               // `for`
     if k == 34 { return parse_concurrent(p) }        // `concurrent`
     if k == 37 { return parse_select(p) }            // `select`
+    if k == 32 { return parse_region(p) }            // `region`
     if k == 65 { return parse_block(p) }             // `{`
     return parse_expr(p)
 }
@@ -1542,6 +1550,19 @@ fn parse_closure(mut p: Parser) -> i32 {
     return mk_closure(p, start, node_end(p, body), pstart, pcount, body)
 }
 
+// `region r { … }` — an arena scope; `&[r]T` references into it are freed at the closing brace.
+// Span runs from `region` to the block's `}`. Mirrors `parse_region`. (The `region` *clause* of a
+// `for` loop is consumed by `parse_for`; this is the standalone expression form.)
+fn parse_region(mut p: Parser) -> i32 {
+    let rt: tokens.Token = cur_tok(p)
+    let start: usize = rt.start
+    bump(p)                                        // consume `region`
+    var ns: i32 = start as i32  var ne: i32 = start as i32
+    if cur_kind(p) == 0 { let nt: tokens.Token = cur_tok(p)  ns = nt.start as i32  ne = nt.end as i32  bump(p) }
+    let body: i32 = parse_block(p)
+    return mk_region(p, start, node_end(p, body), ns, ne, body)
+}
+
 // `concurrent { … }` — a structured-concurrency scope. Span runs to the block's `}`. Mirrors
 // `parse_concurrent`.
 fn parse_concurrent(mut p: Parser) -> i32 {
@@ -2019,6 +2040,7 @@ fn parse_primary(mut p: Parser) -> i32 {
     if k == 35 { return parse_spawn(p) }           // `spawn`
     if k == 36 { return parse_await(p) }           // `await`
     if k == 37 { return parse_select(p) }          // `select`
+    if k == 32 { return parse_region(p) }          // `region r { … }`
     if k == 24 {                                   // `for` -> loop
         return parse_for(p)
     }
@@ -3284,6 +3306,10 @@ fn dump(read src: str, read p: Parser, id: i32) {
             print_str(")")
             ai = ai + 1
         }
+    } else if d.kind == 43 {
+        // Region: the region name span, span, then the body block.
+        print_str("region") print_int(d.x as i64) print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
+        dump(src, p, d.a)
     } else {
         print_str("error") print_uint(d.start) print_uint(d.end)
     }

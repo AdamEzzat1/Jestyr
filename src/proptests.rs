@@ -6920,6 +6920,15 @@ mod c_oracle {
                     out.push(")".to_string());
                 }
             }
+            // Region: the region name span, span, then the body block.
+            ExprKind::Region { name, body } => {
+                out.push("region".to_string());
+                out.push(name.span.start.to_string());
+                out.push(name.span.end.to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_block(ast, body, out);
+            }
             // Any construct the P2 slice does not yet build dumps as `error`; the golden
             // corpus is curated to the handled constructs, so this arm stays unexercised.
             _ => {
@@ -7202,6 +7211,10 @@ mod c_oracle {
             "par for i in 0..n reduce(sum) { i * 2 }", // par-for over a range, mapping body
             "select { recv(c) => v { use(v) } }", // a one-arm select
             "select { recv(a) => x { f(x) }  recv(b) => y { g(y) } }", // two select arms
+            // standalone `region r { … }` — an arena scope
+            "region r { alloc(r) }",     // a region scope with a body
+            "region scratch { let p = make(scratch)  use(p) }", // region with statements
+            "for x in xs { region r { f(r, x) } }", // a region nested in a loop body
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");
@@ -7349,9 +7362,7 @@ mod c_oracle {
     /// `spawn`/`await`/`select`/`concurrent`, and `region`). As each form lands, its files move
     /// off this list. (Basename match; there are no basename collisions across the corpus.)
     const MODULE_GOLDEN_DENYLIST: &[&str] = &[
-        // standalone `region r { … }` (some also use closures / concurrency / `par for`).
-        "core.jtr", "parser.jtr", "tokens.jtr", "parallel.jtr",
-        "region.jtr", "region_escape.jtr", "region_string.jtr", "loops_advanced.jtr",
+        // (empty) — the P2 parser now covers every expression form in the corpus.
     ];
 
     /// **P2 whole-corpus module golden** — the acceptance test for the item parser. For every
