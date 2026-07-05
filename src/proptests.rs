@@ -6119,6 +6119,28 @@ mod c_oracle {
                 out.push(")".to_string());
             }
         }
+        // fn extras: error-set names, then requires, then ensures.
+        match &f.errors {
+            Some(es) => {
+                out.push(es.names.len().to_string());
+                for n in &es.names {
+                    out.push("(".to_string());
+                    out.push("errname".to_string());
+                    out.push(n.span.start.to_string());
+                    out.push(n.span.end.to_string());
+                    out.push(")".to_string());
+                }
+            }
+            None => out.push("0".to_string()),
+        }
+        out.push(f.requires.len().to_string());
+        for r in &f.requires {
+            ref_dump_expr(ast, *r, out);
+        }
+        out.push(f.ensures.len().to_string());
+        for e in &f.ensures {
+            ref_dump_expr(ast, *e, out);
+        }
         ref_dump_block(ast, &f.body, out);
     }
 
@@ -7051,6 +7073,10 @@ mod c_oracle {
             "impl[T] Drop for Vec(T) { fn drop(mut self) { } }", // a blanket impl generic
             "pub fn map[T: Show](x: T) { }",             // pub + a bounded generic
             "extern \"stdcall\" fn WinApi(h: i32) -> i32", // a non-default extern abi
+            // fn error sets + contracts
+            "fn load() -> i32 !{ NotFound, Timeout } { 0 }", // an error set
+            "fn div(a: i32, b: i32) -> i32 requires b != 0 ensures result > 0 { a }", // contracts
+            "fn one() -> i32 !{ Bad } requires true { 1 }", // error set + a require
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_item_probe.jtr");
