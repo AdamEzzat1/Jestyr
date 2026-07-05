@@ -1171,8 +1171,10 @@ fn parse_struct(mut p: Parser, is_pub: i32, kindcode: i32, attr_start: i32, attr
         let k: i32 = cur_kind(p)
         if k == 66 { more = false }                // `}`
         else if k == 110 { more = false }          // Eof
-        else if k == 7 {                            // `fn` -> a method (is_pub follows struct)
-            let fid: i32 = parse_fn(p, 0, 0 - 1, 0)
+        else if cur_kind(p) == 7 or cur_kind(p) == 101 {   // `@`-led or bare `fn` -> a method
+            let mattr_start: i32 = parse_attrs(p)  // `@inline fn …` method attributes
+            let mattr_count: i32 = ((list.len(i32, p.aar) as i32) - mattr_start) / 4
+            let fid: i32 = parse_fn(p, 0, mattr_start, mattr_count)
             list.push(i32, tmp, 1)                  // tag 1 = method
             list.push(i32, tmp, fid)
             list.push(i32, tmp, 0 - 1)
@@ -1368,7 +1370,12 @@ fn parse_impl(mut p: Parser) -> i32 {
         let k: i32 = cur_kind(p)
         if k == 66 { more = false }                // `}`
         else if k == 110 { more = false }          // Eof
-        else if k == 7 { let fid: i32 = parse_fn(p, 0, 0 - 1, 0)  list.push(i32, mt, fid) }   // `fn`
+        else if k == 7 or k == 101 {                // `@`-led or bare `fn` method
+            let mattr_start: i32 = parse_attrs(p)
+            let mattr_count: i32 = ((list.len(i32, p.aar) as i32) - mattr_start) / 4
+            let fid: i32 = parse_fn(p, 0, mattr_start, mattr_count)
+            list.push(i32, mt, fid)
+        }
         else { bump(p) }                            // error recovery
     }
     var endp: usize = tne

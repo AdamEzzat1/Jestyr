@@ -6995,6 +6995,9 @@ mod c_oracle {
             "@align(16) @packed struct Aligned { x: i64 }", // two attrs, one with an int arg
             "@section(\"data\") const BUF: i32 = 0",    // an attribute with a string argument
             "@deprecated(\"use bar\") pub fn foo() { }", // attr + pub, string arg
+            // method attributes (on struct + impl methods)
+            "struct S { n: i32  @inline fn get(read self) -> i32 { self.n } }", // struct method attr
+            "impl T for U { @cold fn slow(read self) { } }", // impl method attr
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_item_probe.jtr");
