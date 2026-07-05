@@ -6415,6 +6415,16 @@ mod c_oracle {
                 out.push(s);
                 out.push(en);
             }
+            ExprKind::Str(_) => {
+                out.push("str".to_string());
+                out.push(s);
+                out.push(en);
+            }
+            ExprKind::Null => {
+                out.push("null".to_string());
+                out.push(s);
+                out.push(en);
+            }
             ExprKind::Bool(b) => {
                 out.push("bool".to_string());
                 out.push(if *b { "1" } else { "0" }.to_string());
@@ -6865,6 +6875,12 @@ mod c_oracle {
             "{ let p: *mut u8 = q  p }", // pointer type in a let annotation
             "{ let xs: []i32 = ys  xs }", // slice type in a let annotation
             "{ let m: Map(K, V) = n  m }", // generic type in a let annotation
+            // string and null literal leaves
+            "\"hello\"",                 // a string literal
+            "null",                      // the null literal
+            "f(\"a\", \"b\")",           // string args in a call
+            "x == null",                 // null as a binary operand
+            "[\"one\", \"two\"]",        // strings in an array literal
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");
