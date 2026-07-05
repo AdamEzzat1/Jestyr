@@ -42,7 +42,8 @@ import "tokens"
 // 8=Try 9=Error 10=Call 11=Cast 12=Assign 13=Range 14=ArrayLit 15=ArrayRepeat 16=StructLit
 // 17=GenStructLit 18=FieldInit 19=SelfValue 20=SelfType 21=Attr 22=FString 23=Block 24=If
 // 25=Unsafe 26=Char 27=Bool 28=Match 29=Str 30=Null 31=For 32=Break 33=Continue 34=Invariant
-// 35=Variant 36=StructType 37=Closure. `a`/`b` are child `ExprId`s: unary/postfix use `a` for the
+// 35=Variant 36=StructType 37=Closure 38=Concurrent 39=Spawn 40=Await 41=ParFor 42=Select.
+// `a`/`b` are child `ExprId`s: unary/postfix use `a` for the
 // operand/base, binary uses `a`=lhs `b`=rhs, index uses `a`=base `b`=index, call/cast use
 // `a`=callee/expr. `x`/`y` are auxiliary integers: Field stores its name's source span
 // `(x, y)`; Call stores `(arg_start, arg_count)` into the arg arena; Cast stores its target
@@ -119,8 +120,11 @@ struct ItemData { kind: i32, start: usize, end: usize, is_pub: i32, op: i32, a: 
 // generic-param 4-tuples; `lar` holds a `for` loop's spilled header (label span, region span,
 // head payload — see `mk_for`); `clar` holds closure param 3-tuples (name span, type `TypeId` or
 // -1). All child arenas are buffered-then-appended (or appended-before-body) so nested parses
-// don't scatter an enclosing slice.
-struct Parser { toks: List(tokens.Token), ex: List(ExprData), ar: List(i32), st: List(StmtData), sar: List(i32), pt: List(PatData), par: List(i32), ty: List(TypeData), tar: List(i32), it: List(ItemData), iar: List(i32), mar: List(i32), ear: List(i32), aar: List(i32), gar: List(i32), far: List(i32), lar: List(i32), clar: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool, no_struct: bool }
+// don't scatter an enclosing slice. `parw[i]` marks token `i` as the contextual keyword `par`
+// (an ident whose text is "par"): the escape checker forbids storing the borrowed `src` in the
+// struct, so the driver — which *has* `src` — precomputes this one text test (the only contextual
+// keyword that isn't positionally unambiguous, since `<expr-ending-in-ident> for` also occurs).
+struct Parser { toks: List(tokens.Token), parw: List(bool), ex: List(ExprData), ar: List(i32), st: List(StmtData), sar: List(i32), pt: List(PatData), par: List(i32), ty: List(TypeData), tar: List(i32), it: List(ItemData), iar: List(i32), mar: List(i32), ear: List(i32), aar: List(i32), gar: List(i32), far: List(i32), lar: List(i32), clar: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool, no_struct: bool }
 
 // The result of parsing a `{ field, …, ..spread }` initializer body: the field-init nodes'
 // slice into the arg arena, the optional spread expr (-1 if none), and the `}` end offset.
@@ -151,6 +155,37 @@ fn peek_kind(read p: Parser, ahead: usize) -> i32 {
     return t.kind
 }
 fn bump(mut p: Parser) { p.pos = p.pos + 1 }
+
+// Precompute the `par` contextual-keyword mask: `parw[i]` is true iff token `i` is an ident
+// (`kind 0`) whose source text is exactly "par". The parser can't read `src` (it's a borrow the
+// escape checker won't let it store), so the driver builds this once from `src` + the tokens.
+fn build_parw(read src: str, read tk: List(tokens.Token), read a: Allocator) -> List(bool) {
+    var pw: List(bool) = list.make(bool, a)
+    let n: usize = list.len(tokens.Token, tk)
+    var i: usize = 0
+    for i < n {
+        let t: tokens.Token = list.get(tokens.Token, tk, i)
+        var is_par: bool = false
+        if t.kind == 0 {
+            if t.end - t.start == 3 {
+                if (src[t.start] as i32) == 112 {          // 'p'
+                    if (src[t.start + 1] as i32) == 97 {   // 'a'
+                        if (src[t.start + 2] as i32) == 114 { is_par = true }   // 'r'
+                    }
+                }
+            }
+        }
+        list.push(bool, pw, is_par)
+        i = i + 1
+    }
+    return pw
+}
+
+// Is the token at `pos` the contextual keyword `par`?
+fn tok_is_par(read p: Parser, pos: usize) -> bool {
+    if pos >= p.n { return false }
+    return list.get(bool, p.parw, pos)
+}
 
 // The end offset of the previously consumed token (the reference's `prev_span().end`), used
 // for a statement span that runs to its last token.
@@ -326,6 +361,27 @@ fn mk_structtype(mut p: Parser, start: usize, end: usize, mem_start: i32, mem_co
 fn mk_closure(mut p: Parser, start: usize, end: usize, param_start: i32, param_count: i32, body: i32) -> i32 {
     let id: i32 = list.len(ExprData, p.ex) as i32
     list.push(ExprData, p.ex, ExprData{ kind: 37, start: start, end: end, op: 0, a: body, b: 0 - 1, x: param_start, y: param_count })
+    return id
+}
+// `concurrent { … }` (kind 38): `a`=body Block `ExprId`. Mirrors `ExprKind::Concurrent(Block)`.
+// `spawn <e>` (39) and `await <e>` (40): `a`=the inner `ExprId`. Mirrors `ExprKind::Spawn`/`Await`.
+fn mk_conc1(mut p: Parser, kind: i32, start: usize, end: usize, a: i32) -> i32 {
+    let id: i32 = list.len(ExprData, p.ex) as i32
+    list.push(ExprData, p.ex, ExprData{ kind: kind, start: start, end: end, op: 0, a: a, b: 0 - 1, x: 0 - 1, y: 0 - 1 })
+    return id
+}
+// `par for <var> in <iter> reduce(<reduction>) { <body> }` (kind 41): `(x,y)`=var name span;
+// `a`=iter `ExprId`; `b`=reduction `ExprId`; `op`=body `ExprId`. Mirrors `ExprKind::ParFor`.
+fn mk_parfor(mut p: Parser, start: usize, end: usize, vs: i32, ve: i32, iter: i32, reduction: i32, body: i32) -> i32 {
+    let id: i32 = list.len(ExprData, p.ex) as i32
+    list.push(ExprData, p.ex, ExprData{ kind: 41, start: start, end: end, op: body, a: iter, b: reduction, x: vs, y: ve })
+    return id
+}
+// `select { recv(c) => bind { … } … }` (kind 42): `(x,y)`=(arm_start, arm_count) of 4-tuples in
+// `par` (chan `ExprId`, bind name span, body Block `ExprId`). Mirrors `ExprKind::Select`.
+fn mk_select(mut p: Parser, start: usize, end: usize, arm_start: i32, arm_count: i32) -> i32 {
+    let id: i32 = list.len(ExprData, p.ex) as i32
+    list.push(ExprData, p.ex, ExprData{ kind: 42, start: start, end: end, op: 0, a: 0 - 1, b: 0 - 1, x: arm_start, y: arm_count })
     return id
 }
 // ---- pattern arena constructors ----
@@ -804,7 +860,7 @@ fn parse_stmt(mut p: Parser) -> i32 {
         return mk_let(p, start, prev_end(p), mutbl, ns, ne, tyid, init)
     }
     // Block-led expressions in statement position parse *block-only* (no trailing operator).
-    if k == 65 or k == 22 or k == 21 or k == 38 or k == 24 {  // `{` / `if` / `match` / `unsafe` / `for`
+    if k == 65 or k == 22 or k == 21 or k == 38 or k == 24 or k == 34 or k == 37 {  // `{`/`if`/`match`/`unsafe`/`for`/`concurrent`/`select`
         let e: i32 = parse_block_like(p)
         return mk_exprstmt(p, e)
     }
@@ -820,6 +876,8 @@ fn parse_block_like(mut p: Parser) -> i32 {
     if k == 21 { return parse_match(p) }             // `match`
     if k == 38 { return parse_unsafe(p) }            // `unsafe`
     if k == 24 { return parse_for(p) }               // `for`
+    if k == 34 { return parse_concurrent(p) }        // `concurrent`
+    if k == 37 { return parse_select(p) }            // `select`
     if k == 65 { return parse_block(p) }             // `{`
     return parse_expr(p)
 }
@@ -1484,6 +1542,112 @@ fn parse_closure(mut p: Parser) -> i32 {
     return mk_closure(p, start, node_end(p, body), pstart, pcount, body)
 }
 
+// `concurrent { … }` — a structured-concurrency scope. Span runs to the block's `}`. Mirrors
+// `parse_concurrent`.
+fn parse_concurrent(mut p: Parser) -> i32 {
+    let ct: tokens.Token = cur_tok(p)
+    let start: usize = ct.start
+    bump(p)                                        // consume `concurrent`
+    let b: i32 = parse_block(p)
+    return mk_conc1(p, 38, start, node_end(p, b), b)
+}
+
+// `spawn <call>` — launch a task; the operand parses at the *unary* level (a call is the usual
+// form). Mirrors `parse_spawn`.
+fn parse_spawn(mut p: Parser) -> i32 {
+    let st: tokens.Token = cur_tok(p)
+    let start: usize = st.start
+    bump(p)                                        // consume `spawn`
+    let inner: i32 = parse_unary(p)
+    return mk_conc1(p, 39, start, node_end(p, inner), inner)
+}
+
+// `await <task>` — join a task handle. The operand parses at the *postfix* level, so `await`
+// binds tighter than `as`/binary operators (`await a + await b` = `(await a) + (await b)`).
+// Mirrors `parse_await`.
+fn parse_await(mut p: Parser) -> i32 {
+    let at: tokens.Token = cur_tok(p)
+    let start: usize = at.start
+    bump(p)                                        // consume `await`
+    let inner: i32 = parse_postfix(p)
+    return mk_conc1(p, 40, start, node_end(p, inner), inner)
+}
+
+// `par for <var> in <iter> reduce(<reduction>) { <body> }` — a deterministic parallel reduction.
+// Entered when an ident (`par`) is immediately followed by `for` (contextual — on valid input
+// that ident is always "par", which the reference matches by text). `reduce` is likewise a
+// contextual keyword: after the iterable only `reduce` is legal, so the ident there is `reduce`.
+// The iterable and reduction parse with `no_struct` so a trailing `reduce`/`{` opens the clause.
+// Mirrors `parse_par_for`.
+fn parse_par_for(mut p: Parser) -> i32 {
+    let pt: tokens.Token = cur_tok(p)
+    let start: usize = pt.start
+    bump(p)                                        // consume the contextual `par`
+    if cur_kind(p) == 24 { bump(p) }               // `for`
+    var vs: i32 = start as i32  var ve: i32 = start as i32
+    if cur_kind(p) == 0 { let nt: tokens.Token = cur_tok(p)  vs = nt.start as i32  ve = nt.end as i32  bump(p) }
+    if cur_kind(p) == 25 { bump(p) }               // `in`
+    let saved: bool = p.no_struct
+    p.no_struct = true
+    let iter: i32 = parse_expr(p)
+    p.no_struct = saved
+    if cur_kind(p) == 0 { bump(p) }                // the contextual `reduce`
+    if cur_kind(p) == 63 { bump(p) }               // `(`
+    let reduction: i32 = parse_expr(p)
+    if cur_kind(p) == 64 { bump(p) }               // `)`
+    if cur_kind(p) == 65 { bump(p) }               // `{`
+    let body: i32 = parse_expr(p)
+    var endp: usize = node_end(p, body)
+    if cur_kind(p) == 66 { let rb: tokens.Token = cur_tok(p)  endp = rb.end  bump(p) }   // `}`
+    return mk_parfor(p, start, endp, vs, ve, iter, reduction, body)
+}
+
+// `select { recv(<chan>) => <bind> { <body> } … }` — wait on several channels, run the arm of
+// whichever is ready. Each arm starts with the contextual `recv` (positionally the only legal
+// ident inside the braces). Arm 4-tuples (chan `ExprId`, bind span, body Block) buffer in a temp
+// then append to `par` so a nested `select` in an arm body can't scatter the slice. Mirrors
+// `parse_select`.
+fn parse_select(mut p: Parser) -> i32 {
+    let st: tokens.Token = cur_tok(p)
+    let start: usize = st.start
+    bump(p)                                        // consume `select`
+    if cur_kind(p) == 65 { bump(p) }               // `{`
+    var tmp: List(i32) = list.make(i32, p.alloc)   // arm 4-tuples
+    var count: i32 = 0
+    var more: bool = true
+    for more {
+        let k: i32 = cur_kind(p)
+        if k == 66 { more = false }                // `}`
+        else if k == 110 { more = false }          // Eof
+        else {
+            let before: usize = p.pos
+            if cur_kind(p) == 0 { bump(p) }        // the contextual `recv`
+            if cur_kind(p) == 63 { bump(p) }       // `(`
+            let saved: bool = p.no_struct
+            p.no_struct = false
+            let chan: i32 = parse_expr(p)
+            p.no_struct = saved
+            if cur_kind(p) == 64 { bump(p) }       // `)`
+            if cur_kind(p) == 78 { bump(p) }       // `=>`
+            var bs: i32 = start as i32  var be: i32 = start as i32
+            if cur_kind(p) == 0 { let nt: tokens.Token = cur_tok(p)  bs = nt.start as i32  be = nt.end as i32  bump(p) }
+            let body: i32 = parse_block(p)
+            list.push(i32, tmp, chan)
+            list.push(i32, tmp, bs)
+            list.push(i32, tmp, be)
+            list.push(i32, tmp, body)
+            count = count + 1
+            if p.pos == before { bump(p) }         // guarantee progress
+        }
+    }
+    var endp: usize = start
+    if cur_kind(p) == 66 { let rb: tokens.Token = cur_tok(p)  endp = rb.end  bump(p) }   // `}`
+    let arm_start: i32 = list.len(i32, p.par) as i32
+    var j: usize = 0
+    for j < list.len(i32, tmp) { list.push(i32, p.par, list.get(i32, tmp, j))  j = j + 1 }
+    return mk_select(p, start, endp, arm_start, count)
+}
+
 // Parse a struct/record/union body `{ members }` starting at the `{`, appending each member's
 // 10-tuple to `mar`. A member is a method (`[@attrs] fn …`, reusing parse_fn — tag 1, id, 8
 // pads) or a field `[pub] name : [@volatile] T [: bits] [= default]` (tag 0 + its 9 aux ints).
@@ -1814,7 +1978,12 @@ fn parse_primary(mut p: Parser) -> i32 {
         bump(p)
         return mk(p, 30, t.start, t.end, 0, 0 - 1, 0 - 1)
     }
-    if k == 0 {                                    // Ident -> Name, or a struct literal
+    if k == 0 {                                    // Ident -> Name, `par for`, or a struct literal
+        // `par for …` — the contextual keyword `par` (an ident with text "par", flagged in
+        // `parw`) immediately followed by `for` is a parallel-reduction loop. The `parw` gate is
+        // essential: a plain ident before `for` also occurs (e.g. `var i = lo` then `for …`), so
+        // the text really must be "par" — matching the reference's `text(..) == "par"` check.
+        if tok_is_par(p, p.pos) { if peek_kind(p, 1) == 24 { return parse_par_for(p) } }
         let t: tokens.Token = cur_tok(p)
         bump(p)
         let nm: i32 = mk(p, 2, t.start, t.end, 0, 0 - 1, 0 - 1)
@@ -1846,6 +2015,10 @@ fn parse_primary(mut p: Parser) -> i32 {
     if k == 93 or k == 94 {                        // `|` / `||` -> closure
         return parse_closure(p)
     }
+    if k == 34 { return parse_concurrent(p) }      // `concurrent`
+    if k == 35 { return parse_spawn(p) }           // `spawn`
+    if k == 36 { return parse_await(p) }           // `await`
+    if k == 37 { return parse_select(p) }          // `select`
     if k == 24 {                                   // `for` -> loop
         return parse_for(p)
     }
@@ -3079,6 +3252,38 @@ fn dump(read src: str, read p: Parser, id: i32) {
             ci = ci + 1
         }
         dump(src, p, d.a)
+    } else if d.kind == 38 {
+        print_str("concurrent") print_uint(d.start) print_uint(d.end)
+        dump(src, p, d.a)                          // the block
+    } else if d.kind == 39 {
+        print_str("spawn") print_uint(d.start) print_uint(d.end)
+        dump(src, p, d.a)
+    } else if d.kind == 40 {
+        print_str("await") print_uint(d.start) print_uint(d.end)
+        dump(src, p, d.a)
+    } else if d.kind == 41 {
+        // ParFor: the loop-var name span, span, then the iterable, reduction, and body.
+        print_str("parfor") print_int(d.x as i64) print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
+        dump(src, p, d.a)                          // iter
+        dump(src, p, d.b)                          // reduction
+        dump(src, p, d.op)                         // body
+    } else if d.kind == 42 {
+        // Select: arm count, span, then each `(selectarm <chan> <bind span> <body block>)`.
+        print_str("select") print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
+        var ai: i32 = 0
+        for ai < d.y {
+            let base: i32 = d.x + ai * 4
+            let chan: i32 = list.get(i32, p.par, base as usize)
+            let bs: i32 = list.get(i32, p.par, (base + 1) as usize)
+            let be: i32 = list.get(i32, p.par, (base + 2) as usize)
+            let body: i32 = list.get(i32, p.par, (base + 3) as usize)
+            print_str("(") print_str("selectarm")
+            dump(src, p, chan)
+            print_int(bs as i64) print_int(be as i64)
+            dump(src, p, body)
+            print_str(")")
+            ai = ai + 1
+        }
     } else {
         print_str("error") print_uint(d.start) print_uint(d.end)
     }
@@ -3089,7 +3294,8 @@ fn dump(read src: str, read p: Parser, id: i32) {
 fn parse_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Allocator) {
     var tk: List(tokens.Token) = tokens.tokenize(src, it, kwcount, a)
     let n: usize = list.len(tokens.Token, tk)
-    var p: Parser = Parser{ toks: tk, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), pt: list.make(PatData, a), par: list.make(i32, a), ty: list.make(TypeData, a), tar: list.make(i32, a), it: list.make(ItemData, a), iar: list.make(i32, a), mar: list.make(i32, a), ear: list.make(i32, a), aar: list.make(i32, a), gar: list.make(i32, a), far: list.make(i32, a), lar: list.make(i32, a), clar: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
+    var pw: List(bool) = build_parw(src, tk, a)
+    var p: Parser = Parser{ toks: tk, parw: pw, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), pt: list.make(PatData, a), par: list.make(i32, a), ty: list.make(TypeData, a), tar: list.make(i32, a), it: list.make(ItemData, a), iar: list.make(i32, a), mar: list.make(i32, a), ear: list.make(i32, a), aar: list.make(i32, a), gar: list.make(i32, a), far: list.make(i32, a), lar: list.make(i32, a), clar: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
     let root: i32 = parse_expr(p)
     dump(src, p, root)
 }
@@ -3098,7 +3304,8 @@ fn parse_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Allocat
 fn parse_item_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Allocator) {
     var tk: List(tokens.Token) = tokens.tokenize(src, it, kwcount, a)
     let n: usize = list.len(tokens.Token, tk)
-    var p: Parser = Parser{ toks: tk, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), pt: list.make(PatData, a), par: list.make(i32, a), ty: list.make(TypeData, a), tar: list.make(i32, a), it: list.make(ItemData, a), iar: list.make(i32, a), mar: list.make(i32, a), ear: list.make(i32, a), aar: list.make(i32, a), gar: list.make(i32, a), far: list.make(i32, a), lar: list.make(i32, a), clar: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
+    var pw: List(bool) = build_parw(src, tk, a)
+    var p: Parser = Parser{ toks: tk, parw: pw, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), pt: list.make(PatData, a), par: list.make(i32, a), ty: list.make(TypeData, a), tar: list.make(i32, a), it: list.make(ItemData, a), iar: list.make(i32, a), mar: list.make(i32, a), ear: list.make(i32, a), aar: list.make(i32, a), gar: list.make(i32, a), far: list.make(i32, a), lar: list.make(i32, a), clar: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
     let iid: i32 = parse_item(p)
     dump_item(src, p, iid)
 }
@@ -3108,7 +3315,8 @@ fn parse_item_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Al
 fn parse_module_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Allocator) {
     var tk: List(tokens.Token) = tokens.tokenize(src, it, kwcount, a)
     let n: usize = list.len(tokens.Token, tk)
-    var p: Parser = Parser{ toks: tk, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), pt: list.make(PatData, a), par: list.make(i32, a), ty: list.make(TypeData, a), tar: list.make(i32, a), it: list.make(ItemData, a), iar: list.make(i32, a), mar: list.make(i32, a), ear: list.make(i32, a), aar: list.make(i32, a), gar: list.make(i32, a), far: list.make(i32, a), lar: list.make(i32, a), clar: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
+    var pw: List(bool) = build_parw(src, tk, a)
+    var p: Parser = Parser{ toks: tk, parw: pw, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), pt: list.make(PatData, a), par: list.make(i32, a), ty: list.make(TypeData, a), tar: list.make(i32, a), it: list.make(ItemData, a), iar: list.make(i32, a), mar: list.make(i32, a), ear: list.make(i32, a), aar: list.make(i32, a), gar: list.make(i32, a), far: list.make(i32, a), lar: list.make(i32, a), clar: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
     var ids: List(i32) = list.make(i32, a)
     for cur_kind(p) != 110 {                        // until Eof
         let before: usize = p.pos

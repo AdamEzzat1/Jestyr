@@ -6874,6 +6874,52 @@ mod c_oracle {
                 }
                 ref_dump_expr(ast, *body, out);
             }
+            // Concurrency: `concurrent { block }`, `spawn <e>`, `await <e>`.
+            ExprKind::Concurrent(b) => {
+                out.push("concurrent".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_block(ast, b, out);
+            }
+            ExprKind::Spawn(e) => {
+                out.push("spawn".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *e, out);
+            }
+            ExprKind::Await(e) => {
+                out.push("await".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *e, out);
+            }
+            // ParFor: the loop-var name span, span, then the iterable, reduction, and body.
+            ExprKind::ParFor { var, iter, reduction, body } => {
+                out.push("parfor".to_string());
+                out.push(var.span.start.to_string());
+                out.push(var.span.end.to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *iter, out);
+                ref_dump_expr(ast, *reduction, out);
+                ref_dump_expr(ast, *body, out);
+            }
+            // Select: arm count, span, then each `(selectarm <chan> <bind span> <body block>)`.
+            ExprKind::Select(arms) => {
+                out.push("select".to_string());
+                out.push(arms.len().to_string());
+                out.push(s);
+                out.push(en);
+                for arm in arms {
+                    out.push("(".to_string());
+                    out.push("selectarm".to_string());
+                    ref_dump_expr(ast, arm.chan, out);
+                    out.push(arm.bind.span.start.to_string());
+                    out.push(arm.bind.span.end.to_string());
+                    ref_dump_block(ast, &arm.body, out);
+                    out.push(")".to_string());
+                }
+            }
             // Any construct the P2 slice does not yet build dumps as `error`; the golden
             // corpus is curated to the handled constructs, so this arm stays unexercised.
             _ => {
@@ -7144,6 +7190,18 @@ mod c_oracle {
             "f(|n| n + 1)",              // a closure as a call argument
             "xs.map(|x| x * 2)",         // method-call with a closure argument
             "|x| |y| x + y",             // a closure returning a closure (nested)
+            // concurrency: concurrent / spawn / await / par for / select
+            "spawn f(x)",                // launch a task (operand at the unary level)
+            "spawn compute(a, b)",       // a multi-arg spawned call
+            "await t",                   // join a task handle
+            "await a + await b",         // await binds tighter than `+`: (await a)+(await b)
+            "await t as i32",            // await binds tighter than `as`: (await t) as i32
+            "concurrent { spawn f() }",  // a concurrent scope with a spawn
+            "concurrent { let h = spawn f(x)  await h }", // spawn a handle, await it
+            "par for x in xs reduce(add) { x }", // a deterministic parallel reduction
+            "par for i in 0..n reduce(sum) { i * 2 }", // par-for over a range, mapping body
+            "select { recv(c) => v { use(v) } }", // a one-arm select
+            "select { recv(a) => x { f(x) }  recv(b) => y { g(y) } }", // two select arms
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");
@@ -7291,14 +7349,8 @@ mod c_oracle {
     /// `spawn`/`await`/`select`/`concurrent`, and `region`). As each form lands, its files move
     /// off this list. (Basename match; there are no basename collisions across the corpus.)
     const MODULE_GOLDEN_DENYLIST: &[&str] = &[
-        // closures `|x| …` / `|| …` — these three also need concurrency / `par for` / region.
-        "core.jtr", "parser.jtr", "tokens.jtr",
-        // concurrency (`spawn`/`await`/`select`/`concurrent`) and `par for … reduce`.
-        "atomics.jtr", "await.jtr", "channel.jtr", "concurrent.jtr", "deterministic.jtr",
-        "dynamic_spawn.jtr", "mutex.jtr", "select.jtr", "sync.jtr", "numerics_canary.jtr",
-        "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr",
-        "parallel.jtr",
-        // `region r { … }`.
+        // standalone `region r { … }` (some also use closures / concurrency / `par for`).
+        "core.jtr", "parser.jtr", "tokens.jtr", "parallel.jtr",
         "region.jtr", "region_escape.jtr", "region_string.jtr", "loops_advanced.jtr",
     ];
 
