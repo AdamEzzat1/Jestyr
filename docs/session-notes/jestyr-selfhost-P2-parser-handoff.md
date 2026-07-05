@@ -7,12 +7,13 @@
 >
 > **State:** the front end (lex + classify), the **whole P2 expression parser**, the
 > **statement + block-led** layer (blocks, `if`/`else`, `unsafe`, `match`), the **type
-> parser**, the **pattern parser**, and the **item layer's infrastructure + first three item
-> kinds** (`import`/`distinct`/`const`) are all done and cross-checked with three byte-exact
-> AST-dump goldens against the Rust reference. What remains in P2: the rest of the item kinds
-> (`fn`/`struct`/`record`/`union`/`enum`/`trait`/`impl`/`extern` + attributes/contracts), then
-> the **whole-corpus** item golden over all ~122 files. This note captures what's built, the
-> recipe for adding a construct, the fn design already worked out, and the road past P2.
+> parser**, the **pattern parser**, and **all nine item kinds** (`import`/`distinct`/`const`/
+> `fn`/`struct`/`record`/`union`/`enum`/`trait`/`impl`/`extern`) are done and cross-checked with
+> three byte-exact AST-dump goldens against the Rust reference. What remains in P2: the
+> **deferred item sub-features** (§3) + **attributes** (needs `Str` leaves first), then the
+> **whole-corpus** item golden over all ~122 files — which will only pass once those deferred
+> features land, since the real files use them. This note captures what's built, the recipe,
+> the deferred list, and the road past P2.
 
 ---
 
@@ -110,42 +111,41 @@ matching the reference; not in the corpus.)
 
 ---
 
-## 3. Immediate next: the remaining item kinds
+## 3. Immediate next: the deferred item sub-features, then the whole-corpus golden
 
-The item infra is up (`it: List(ItemData)`, `parse_item` dispatching on an optional `pub`,
-`dump_item`, `parse_single_item` on the reference, the `jestyr_parser_item_dump_matches_reference`
-golden). Add the remaining kinds one per green increment. **`fn` is next** (the design is
-already worked out below); then the aggregates, then attributes, then the whole-corpus golden.
+All nine item kinds parse and dump (item arena `it: List(ItemData)` + child arenas `iar`
+fn/method param 7-tuples, `mar` struct-member 6-tuples / trait-method 7-tuples / impl-method
+fn-ids, `ear` enum sub-lists; shared `parse_params_into_iar` / `dump_params` / `ref_dump_params`).
+ItemData kinds: 0 Import, 1 Distinct, 2 Const, 3 Fn, 4 Struct(op=0/1/2 struct/record/union),
+5 Enum, 6 Trait, 7 Impl, 8 Extern, 99 Error. **But each was landed "-core":** the rarer
+sub-features were *omitted from the dump* (both sides), exactly as cast was span-only before the
+type parser. The whole-corpus golden needs them, so land each as its own increment, extending
+both dumps:
 
-- **`fn`** — *the big one.* Reference `parse_fn`/`parse_params`/`parse_param`/`parse_generics`/
-  `parse_error_set` (parser.rs 326–582). `FnDecl` = is_pub, generics (`[T: Bound]`, each a
-  name + optional bound), attrs, name, params, ret_conv/ret_ty, errors (`!{ Names }`), requires/
-  ensures contracts, body. **Plan:** widen `ItemData` (it has only `a,b,x,y,z,w` + `is_pub` — add
-  an `op` field; fn needs name span + param slice + ret_conv + ret_ty + body = 7 aux). Add an
-  item-child arena `iar: List(i32)`; store each **param as a fixed 7-tuple** (comptime, conv,
-  name_start, name_end, is_self, ty|-1, refine|-1). Suggest **fn-core first** (name, params
-  incl. `self`/`comptime`/conv/`: T`/`in refine`, `-> conv ret`, body) — dump `(fn <is_pub>
-  <name span> <paramcount> <params…> <ret_conv> <ret-opt> <body>)`, each param `(param
-  <comptime> <conv> <is_self> <name span> <ty-opt> <refine-opt>)` — testing fns with **no**
-  generics/errors/contracts/attrs (the reference gets them empty; simplest to just omit those
-  fields from the dump until implemented, exactly as cast was span-only pre-type-parser). Then
-  **fn-generics** (`[T: Add]`), **fn-errors** (`!{ … }`), **fn-contracts** (`requires`/`ensures`
-  — set `no_struct` for each condition), each extending the dump.
-- **`struct` / `record` / `union`** — `parse_named_struct`/`parse_struct_body`. Shared field
-  grammar: `StructMember` is a Field (name, ty, `@volatile`, `= default`, `pub`, `: bits`) or a
-  Method (a nested `FnDecl` — reuses the fn parser). `is_record`/`is_union` are just the keyword.
-- **`enum`** — `parse_enum`. `EnumDecl` = name, type_params `(T)`, variants (each name + fields
-  `(Ident, TypeId)` + optional `= discriminant`).
-- **`trait` / `impl`** — `parse_trait`/`parse_trait_method`/`parse_impl`. Trait = methods
-  (signatures, optional default body). Impl = generics, trait_name, target ty, methods (FnDecls).
-- **`extern`** — `parse_extern`: `extern "c" fn name(...) -> T` (bodyless).
-- **Attributes** (`@packed`, `@align(8)`, `@section("data")`) — `parse_attrs` runs *first* in
-  `parse_item` (before `pub`). Each is name + args (ExprIds). **Gotcha:** attr args can be
-  strings (`@section("data")`) — `parse_primary` does **not** yet handle `Str` (kind 3) or
-  `Null`; add those leaves before/with attrs, or the arg becomes an `Error` node and diverges.
-- **Whole-corpus golden** — once all kinds parse: `parse_module` over each of the ~122 example
-  files, dump every item, diff. This is the P2 acceptance test; expect it to surface gaps (rare
-  type forms, contract spellings, `error` sets) to fill in.
+- **fn (and trait/impl-method) generics** `[T: Add, U]` — `parse_generics` (parser.rs 377). A
+  name + optional `: Bound`. Store as a list; dump `(generic <name span> <bound-opt>)`.
+- **fn error sets** `!{ NotFound, Timeout }` — `parse_error_set` (565); a `!` `{` names `}` after
+  the return. Dump the name spans. (Watch for a possible bare `!Name` spelling in the corpus.)
+- **fn contracts** `requires <e>` / `ensures <e>` — loop between the signature and body, `no_struct`
+  set for each condition (parse_fn 344–364). Dump two expr lists.
+- **struct field `@volatile` + `: bits`** — field attrs after the `:`, then an optional `: <int>`
+  bit width (parse_struct_body 767–790). Needs attribute parsing (below) for `@volatile`.
+- **impl bracket generics** `impl[T] Drop for Vec(T)` — `parse_generics` again, before the trait
+  name (parse_impl 459). **extern abi** — dump the `"abi"` string text (already parsed, just add
+  to the dump; ItemData has no free slot for extern → add a field or a small `ear`-style side).
+- **Attributes** `@packed`, `@align(8)`, `@section("data")` — `parse_attrs` runs **first** in
+  `parse_item` (before `pub`), and also on struct/impl **methods** and struct **fields**. Each is
+  name + args (ExprIds). **Gotcha (do this first):** attr args can be strings — `parse_primary`
+  does not yet handle `Str` (kind 3) or `Null` (60); **add those two leaves before attributes**
+  or a `@section("data")` arg becomes an `Error` node and diverges. Then thread an attr list
+  through the item dumps (fn/const/struct/field/method).
+
+Once all the above land: **the whole-corpus golden** — add `parse_module` (loop `parse_item`
+until Eof, collect item ids) on the Jestyr side + a matching reference entry, then diff the
+dumped item stream over each of the ~122 `examples/**/*.jtr` files. This is the P2 acceptance
+test; expect it to surface a few more gaps (rare type forms, `error` keyword sets, `where`
+clauses, closures `|x| …`, loops `for`/`while`, `spawn`/`await`/`select`/`region` — several of
+these are *expression* forms still unimplemented too, since the curated expr corpus avoided them).
 
 ---
 
@@ -157,9 +157,8 @@ Ordered, each gated by a cross-implementation golden on the shared corpus (see t
 2. ✅ **Type parser + pattern parser** — done (cast/`let` dumps upgraded to structure).
 3. ✅ **Statement parser + block-led forms** — done (`let`/`var`/`return`/expr, blocks,
    `if`/`else`, `unsafe`, `match`).
-4. **Item parser** (in progress): infra + `import`/`distinct`/`const` done; remaining
-   `fn`/`struct`/`record`/`union`/`enum`/`trait`/`impl`/`extern`/attributes/contracts → then the
-   **whole-corpus AST-dump golden** (§3).
+4. **Item parser** (in progress): all nine item kinds parse and dump ("-core"); remaining are
+   the **deferred sub-features + attributes** (§3) → then the **whole-corpus AST-dump golden**.
 5. **P3 typeck** → resolved-type-dump golden. **P4 escape** → diagnostic-set golden. **P5 cgen**
    → byte-identical-C golden (construct by construct). **R2 fixpoint** (`--features
    selfhost-fixpoint`): jc1→jc2→jc3, assert `jc2 ≡ jc3`, stood up early on a subset.
@@ -189,8 +188,9 @@ each with its golden slice.
 | Master plan | `docs/session-notes/jestyr-selfhost-port-P2-P5-R2.md` |
 
 ## One-line summary
-Front end + **all P2 expressions** + statements/blocks + `if`/`unsafe`/`match` (with the full
-pattern parser) + the **structural type parser** + **item infra & `import`/`distinct`/`const`**
-are done, across three byte-exact AST-dump goldens (expr, item, depth). **Next:** `fn` (design
-in §3), then `struct`/`enum`/`trait`/`impl`/`extern` + attributes, then the whole-corpus item
-golden → P3/P4/P5 → R2 fixpoint.
+Front end + **all P2 expressions** + statements/blocks + `if`/`unsafe`/`match` (full pattern
+parser) + the **structural type parser** + **all nine item kinds** (import/distinct/const/fn/
+struct/record/union/enum/trait/impl/extern, each "-core") are done, across three byte-exact
+AST-dump goldens (expr, item, depth). **Next:** the deferred item sub-features (fn generics/
+errors/contracts, struct `@volatile`/bits, impl generics, extern abi) + **attributes** (add
+`Str`/`Null` leaves first), then the **whole-corpus** item golden → P3/P4/P5 → R2 fixpoint.
