@@ -5,15 +5,16 @@
 > `src/parser.rs` / `src/ast.rs` (the reference this port mirrors), and
 > `examples/std/parser.jtr` (the Jestyr parser being grown).
 >
-> **State:** the front end (lex + classify), the **whole P2 expression parser**, the
-> **statement + block-led** layer (blocks, `if`/`else`, `unsafe`, `match`), the **type
-> parser**, the **pattern parser**, and **all nine item kinds** (`import`/`distinct`/`const`/
-> `fn`/`struct`/`record`/`union`/`enum`/`trait`/`impl`/`extern`) are done and cross-checked with
-> three byte-exact AST-dump goldens against the Rust reference. What remains in P2: the
-> **deferred item sub-features** (§3) + **attributes** (needs `Str` leaves first), then the
-> **whole-corpus** item golden over all ~122 files — which will only pass once those deferred
-> features land, since the real files use them. This note captures what's built, the recipe,
-> the deferred list, and the road past P2.
+> **State:** the front end, the **whole P2 expression parser** (incl. char/bool/str/null
+> leaves), the **statement + block-led** layer (blocks, `if`/`else`, `unsafe`, `match`), the
+> **type parser**, the **pattern parser**, and **all nine item kinds, fully-featured** — fn
+> (generics, attrs, error sets, `requires`/`ensures`), struct/record/union (fields with
+> `@volatile`/bit-fields/defaults + methods), enum, trait, impl (blanket generics), const,
+> distinct, import, extern (abi) — are done, cross-checked by **four** byte-exact goldens (expr,
+> item, **whole-corpus module**, depth). The whole-corpus module golden runs `parse_module` over
+> all ~125 example files: every file parses without crashing, and **76 are item-for-item
+> identical** to the reference. The 49 still on the denylist each use an *expression* form the
+> parser hasn't grown yet (§3). This note captures what's built, the recipe, and the road past P2.
 
 ---
 
@@ -111,41 +112,41 @@ matching the reference; not in the corpus.)
 
 ---
 
-## 3. Immediate next: the deferred item sub-features, then the whole-corpus golden
+## 3. Immediate next: the remaining EXPRESSION forms (to clear the 49 denylisted files)
 
-All nine item kinds parse and dump (item arena `it: List(ItemData)` + child arenas `iar`
-fn/method param 7-tuples, `mar` struct-member 6-tuples / trait-method 7-tuples / impl-method
-fn-ids, `ear` enum sub-lists; shared `parse_params_into_iar` / `dump_params` / `ref_dump_params`).
-ItemData kinds: 0 Import, 1 Distinct, 2 Const, 3 Fn, 4 Struct(op=0/1/2 struct/record/union),
-5 Enum, 6 Trait, 7 Impl, 8 Extern, 99 Error. **But each was landed "-core":** the rarer
-sub-features were *omitted from the dump* (both sides), exactly as cast was span-only before the
-type parser. The whole-corpus golden needs them, so land each as its own increment, extending
-both dumps:
+All nine item kinds are **fully featured** now (arenas: `it` items; `iar` fn/method param
+7-tuples; `mar` struct-member 10-tuples / trait-method 7-tuples / impl-method fn-ids; `ear` enum
+sub-lists; `aar` attribute args+4-tuples; `gar` generic 4-tuples; `far` fn error/require/ensure
+"extras"; shared helpers `parse_params_into_iar`/`parse_generics`/`parse_attrs` +
+`dump_params`/`dump_generics`/`dump_attrs`/`dump_fn_extras`/`ref_dump_*`). ItemData kinds: 0
+Import 1 Distinct 2 Const 3 Fn 4 Struct(op=0/1/2) 5 Enum 6 Trait 7 Impl 8 Extern 99 Error.
+Nothing item-level is deferred anymore.
 
-- **fn (and trait/impl-method) generics** `[T: Add, U]` — `parse_generics` (parser.rs 377). A
-  name + optional `: Bound`. Store as a list; dump `(generic <name span> <bound-opt>)`.
-- **fn error sets** `!{ NotFound, Timeout }` — `parse_error_set` (565); a `!` `{` names `}` after
-  the return. Dump the name spans. (Watch for a possible bare `!Name` spelling in the corpus.)
-- **fn contracts** `requires <e>` / `ensures <e>` — loop between the signature and body, `no_struct`
-  set for each condition (parse_fn 344–364). Dump two expr lists.
-- **struct field `@volatile` + `: bits`** — field attrs after the `:`, then an optional `: <int>`
-  bit width (parse_struct_body 767–790). Needs attribute parsing (below) for `@volatile`.
-- **impl bracket generics** `impl[T] Drop for Vec(T)` — `parse_generics` again, before the trait
-  name (parse_impl 459). **extern abi** — dump the `"abi"` string text (already parsed, just add
-  to the dump; ItemData has no free slot for extern → add a field or a small `ear`-style side).
-- ~~**`Str`/`Null` leaves**~~ ✅ done (kinds 29/30) — the prerequisite for string attr args.
-- ~~**Item attributes** on fn/const/struct~~ ✅ done — `parse_attrs` runs first in `parse_item`,
-  attaching to fn/const/struct (the kinds that store attrs; others parse+discard); attr arena
-  `aar`, `ItemData.(u,v)` = the attr slice, dumped as `(attr <name text> <argcount> <args…>)`.
-  **Still to do:** attributes on struct/impl **methods** (`@inline fn`) and struct **fields**
-  (`@volatile`, after the `:`) — the reference parses these too.
+**What's left is a batch of `parse_primary` EXPRESSION forms** the curated expr corpus avoided.
+The **whole-corpus module golden** (`jestyr_parser_module_dump_matches_reference`) runs
+`parse_module` over all ~125 files — 76 pass, 49 are denylisted (`MODULE_GOLDEN_DENYLIST` in
+`proptests.rs`, grouped by the form they need). Land each form (recipe §2, but the golden is the
+*module* one), delete the now-passing files from the denylist, and coverage climbs. Diagnose a
+file with: run the built parser `parse_module` mode (`parser_exe <file> x module`) vs
+`rust_module_dump`, or eyeball a snippet in item mode. Reference `parse_*` in `src/parser.rs`:
 
-Once all the above land: **the whole-corpus golden** — add `parse_module` (loop `parse_item`
-until Eof, collect item ids) on the Jestyr side + a matching reference entry, then diff the
-dumped item stream over each of the ~122 `examples/**/*.jtr` files. This is the P2 acceptance
-test; expect it to surface a few more gaps (rare type forms, `error` keyword sets, `where`
-clauses, closures `|x| …`, loops `for`/`while`, `spawn`/`await`/`select`/`region` — several of
-these are *expression* forms still unimplemented too, since the curated expr corpus avoided them).
+- **Loops** `for … { }` / `while` / `loop` — the biggest unblocker (arrays/list/vec/strings/core/
+  loops*). `parse_for` (parser.rs ~1540) + `parse_reserved_loop`; `ForHead` = Infinite / While /
+  Iter{binds, sources, step}, plus optional label `for outer:`, `region r`, and loop-`else`.
+  Also `break`/`continue`/`invariant`/`variant` (all in `parse_primary`, small).
+- **Closures** `|x| body` / `|| body` — `parse_closure` (1408 area); `Pipe`/`PipePipe` in
+  `parse_primary`. `ClosureParam` = name + optional `: T`. (closures*, fn_ptr, genlist, vec*.)
+- **Concurrency** `concurrent { }`, `spawn <call>`, `await <e>`, `select { recv(c) => bind { } }`,
+  `par for … reduce(r) { }` — `parse_concurrent`/`parse_spawn`/`parse_await`/`parse_select`/
+  `parse_par_for`. (concurrent, channel, mutex, sync, await, par_*, dynamic_spawn, deterministic,
+  select, atomics.)
+- **`region r { }`** — `parse_region` (1560 area). (region*, args, os_str.)
+- **`struct { … }` as a value** (`StructType`/`parse_struct_body` in expr position, parser.rs
+  1368) and a couple of rare type forms — surface these last by re-running the coverage diff.
+
+Each is an `ExprData` kind ≥ 31 with a `dump`/`ref_dump_expr` arm; loops/closures/concurrency
+carry blocks (reuse `parse_block`) and some carry patterns (reuse the pattern parser). After a
+form lands, the module golden auto-checks any newly-passing file you remove from the denylist.
 
 ---
 
@@ -157,8 +158,9 @@ Ordered, each gated by a cross-implementation golden on the shared corpus (see t
 2. ✅ **Type parser + pattern parser** — done (cast/`let` dumps upgraded to structure).
 3. ✅ **Statement parser + block-led forms** — done (`let`/`var`/`return`/expr, blocks,
    `if`/`else`, `unsafe`, `match`).
-4. **Item parser** (in progress): all nine item kinds parse and dump ("-core"); remaining are
-   the **deferred sub-features + attributes** (§3) → then the **whole-corpus AST-dump golden**.
+4. **Item parser** (in progress): all nine item kinds fully featured; the whole-corpus module
+   golden passes 76/125 files. Remaining: the **expression forms** (§3 — loops, closures,
+   concurrency, region) to clear the last 49 files → then P2 is complete.
 5. **P3 typeck** → resolved-type-dump golden. **P4 escape** → diagnostic-set golden. **P5 cgen**
    → byte-identical-C golden (construct by construct). **R2 fixpoint** (`--features
    selfhost-fixpoint`): jc1→jc2→jc3, assert `jc2 ≡ jc3`, stood up early on a subset.
@@ -183,14 +185,16 @@ each with its golden slice.
 | Jestyr parser | `examples/std/parser.jtr` (kinds/arenas/`dump`) |
 | Shared tokenizer | `examples/std/tokens.jtr` |
 | Reference parser / AST | `src/parser.rs`, `src/ast.rs` (`ExprKind`/`PatKind`/`TypeKind`/`Item`, `Span::to`) |
-| Reference dump + goldens | `src/proptests.rs` `mod c_oracle`: `ref_dump_{expr,type,pat,item,stmt,block}`, `rust_{expr,item}_dump`, `jestyr_{expr,item}_dump`, `jestyr_parser_{expr,item}_dump_matches_reference`, `jestyr_parser_bounds_deep_nesting`, `Parser::parse_single_{expr,item}` (parser.rs, `#[allow(dead_code)]`) |
+| Reference dump + goldens | `src/proptests.rs` `mod c_oracle`: `ref_dump_{expr,type,pat,item,stmt,block,fn,params,generics,attrs}`, `rust_{expr,item,module}_dump`, `jestyr_{expr,item,module}_dump`, `jestyr_parser_{expr,item,module}_dump_matches_reference` (+ `MODULE_GOLDEN_DENYLIST`), `jestyr_parser_bounds_deep_nesting`, `Parser::parse_single_{expr,item}` / `parse_module` |
+| Jestyr driver modes | `parser_exe <file>` = expr · `<file> item` = one item · `<file> x module` = whole module |
 | Token kinds | `src/token.rs` (`TokenKind` discriminant order = the integer tags; e.g. Let=8 Const=10 Struct=11 Enum=13 Distinct=18 Match=21 If=22 Else=23 Return=28 Trait=15 Impl=16 Fn=7 Import=41 Pub=42 As=48 unsafe=38) |
 | Master plan | `docs/session-notes/jestyr-selfhost-port-P2-P5-R2.md` |
 
 ## One-line summary
-Front end + **all P2 expressions** + statements/blocks + `if`/`unsafe`/`match` (full pattern
-parser) + the **structural type parser** + **all nine item kinds** (import/distinct/const/fn/
-struct/record/union/enum/trait/impl/extern, each "-core") are done, across three byte-exact
-AST-dump goldens (expr, item, depth). **Next:** the deferred item sub-features (fn generics/
-errors/contracts, struct `@volatile`/bits, impl generics, extern abi) + **attributes** (add
-`Str`/`Null` leaves first), then the **whole-corpus** item golden → P3/P4/P5 → R2 fixpoint.
+Front end + **all P2 expressions** + statements/blocks + `if`/`unsafe`/`match` + structural
+**type parser** + **all nine item kinds fully featured** (generics, attrs incl. method/field,
+error sets, contracts, `@volatile`/bit-fields, extern abi) are done, across **four** byte-exact
+goldens (expr, item, whole-corpus module, depth). The whole-corpus module golden passes **76 of
+125** files. **Next:** the remaining `parse_primary` expression forms — **loops** (`for`/`while`,
+biggest unblocker), **closures** `|x|…`, **concurrency** (`spawn`/`await`/`select`/`concurrent`/
+`par for`), **`region`** — each clears more denylisted files → P2 done → P3/P4/P5 → R2 fixpoint.
