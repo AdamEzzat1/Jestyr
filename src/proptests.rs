@@ -6026,6 +6026,21 @@ mod c_oracle {
         out.push(")".to_string());
     }
 
+    /// Dump an attribute slice: the count, then each `(attr <name text> <argcount> <args…>)`.
+    fn ref_dump_attrs(ast: &crate::ast::Ast, attrs: &[crate::ast::Attribute], out: &mut Vec<String>) {
+        out.push(attrs.len().to_string());
+        for a in attrs {
+            out.push("(".to_string());
+            out.push("attr".to_string());
+            out.push(a.name.clone());
+            out.push(a.args.len().to_string());
+            for arg in &a.args {
+                ref_dump_expr(ast, *arg, out);
+            }
+            out.push(")".to_string());
+        }
+    }
+
     /// Dump a parameter slice as a run of `(param <comptime> <conv> <is_self> <name span>
     /// <ty-opt> <refine-opt>)`. Shared by the fn item and trait-method dumps.
     fn ref_dump_params(ast: &crate::ast::Ast, params: &[crate::ast::Param], out: &mut Vec<String>) {
@@ -6062,6 +6077,7 @@ mod c_oracle {
     /// then ret_conv, ret-opt, and the body block.
     fn ref_dump_fn(ast: &crate::ast::Ast, f: &crate::ast::FnDecl, out: &mut Vec<String>) {
         out.push("fn".to_string());
+        ref_dump_attrs(ast, &f.attrs, out);
         out.push(if f.is_pub { "1" } else { "0" }.to_string());
         out.push(f.name.span.start.to_string());
         out.push(f.name.span.end.to_string());
@@ -6129,6 +6145,7 @@ mod c_oracle {
             }
             Item::Const(c) => {
                 out.push("const".to_string());
+                ref_dump_attrs(ast, &c.attrs, out);
                 out.push(if c.is_pub { "1" } else { "0" }.to_string());
                 out.push(c.name.span.start.to_string());
                 out.push(c.name.span.end.to_string());
@@ -6149,10 +6166,11 @@ mod c_oracle {
             // struct/record/union: kind code (0/1/2), is_pub, name span, member count, then
             // each member — a field `(sfield <is_pub> <name span> <type> <default-opt>)` or a
             // method fn dump. (Field `@volatile`/`: bits` are omitted until parsed.)
-            Item::Struct { is_pub, is_record, is_union, name, body, .. } => {
+            Item::Struct { is_pub, is_record, is_union, name, body, attrs, .. } => {
                 use crate::ast::StructMember;
                 let kindcode = if *is_record { 1 } else if *is_union { 2 } else { 0 };
                 out.push("struct".to_string());
+                ref_dump_attrs(ast, attrs, out);
                 out.push(kindcode.to_string());
                 out.push(if *is_pub { "1" } else { "0" }.to_string());
                 out.push(name.span.start.to_string());
@@ -6970,6 +6988,13 @@ mod c_oracle {
             "extern \"c\" fn malloc(size: usize) -> *mut u8", // an extern with an abi
             "extern fn puts(s: *const u8) -> i32",      // an extern without an abi
             "pub extern \"c\" fn free(p: *mut u8)",     // a public extern, no return
+            // attributes on fn / const / struct (incl. string args, enabled by Str leaves)
+            "@inline fn fast() { }",                    // a bare attribute on a fn
+            "@no_mangle const VERSION = 1",             // an attribute on a const
+            "@packed struct Header { tag: u8 }",        // an attribute on a struct
+            "@align(16) @packed struct Aligned { x: i64 }", // two attrs, one with an int arg
+            "@section(\"data\") const BUF: i32 = 0",    // an attribute with a string argument
+            "@deprecated(\"use bar\") pub fn foo() { }", // attr + pub, string arg
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_item_probe.jtr");
