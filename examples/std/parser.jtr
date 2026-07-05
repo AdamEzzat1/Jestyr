@@ -451,9 +451,9 @@ fn mk_item_impl(mut p: Parser, start: usize, end: usize, tns: usize, tne: usize,
 // An `extern ["abi"] fn Name(params) [-> conv R]` item (kind 8): `(x,y)`=name span,
 // `(a,b)`=(param_start, param_count) in `iar`, `op`=ret_conv, `z`=ret TypeId (-1 none). The
 // abi string is consumed but not dumped (deferred, like fn generics) — extern-core.
-fn mk_item_extern(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, param_start: i32, param_count: i32, ret_conv: i32, ret_ty: i32) -> i32 {
+fn mk_item_extern(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, param_start: i32, param_count: i32, ret_conv: i32, ret_ty: i32, abis: i32, abie: i32) -> i32 {
     let id: i32 = list.len(ItemData, p.it) as i32
-    list.push(ItemData, p.it, ItemData{ kind: 8, start: start, end: end, is_pub: is_pub, op: ret_conv, a: param_start, b: param_count, x: ns as i32, y: ne as i32, z: ret_ty, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1 })
+    list.push(ItemData, p.it, ItemData{ kind: 8, start: start, end: end, is_pub: is_pub, op: ret_conv, a: param_start, b: param_count, x: ns as i32, y: ne as i32, z: ret_ty, w: abis, u: abie, v: 0 - 1, g: 0 - 1, h: 0 - 1 })
     return id
 }
 // An unrecognized item -> Error (kind 99), spanning the offending token.
@@ -1438,12 +1438,13 @@ fn parse_impl(mut p: Parser) -> i32 {
 }
 
 // `extern ["abi"] fn Name(params) [-> conv R]` — a bodyless foreign declaration. The abi
-// string is consumed but not dumped (deferred — extern-core). Mirrors `parse_extern`.
+// string's inner span is captured (defaults to text "c" when absent). Mirrors `parse_extern`.
 fn parse_extern(mut p: Parser, is_pub: i32) -> i32 {
     let et: tokens.Token = cur_tok(p)
     let start: usize = et.start
     bump(p)                                        // consume `extern`
-    if cur_kind(p) == 3 { bump(p) }                // optional "abi" string
+    var abis: i32 = 0 - 1  var abie: i32 = 0 - 1   // abi inner span (-1 => default "c")
+    if cur_kind(p) == 3 { let at: tokens.Token = cur_tok(p)  abis = (at.start + 1) as i32  abie = (at.end - 1) as i32  bump(p) }
     if cur_kind(p) == 7 { bump(p) }                // `fn`
     var ns: usize = start  var ne: usize = start
     if cur_kind(p) == 0 { let nt: tokens.Token = cur_tok(p)  ns = nt.start  ne = nt.end  bump(p) }
@@ -1454,7 +1455,7 @@ fn parse_extern(mut p: Parser, is_pub: i32) -> i32 {
     var ret_conv: i32 = 0
     var ret_ty: i32 = 0 - 1
     if cur_kind(p) == 77 { bump(p)  ret_conv = parse_conv(p)  ret_ty = parse_type(p) }   // `-> conv R`
-    return mk_item_extern(p, start, prev_end(p), is_pub, ns, ne, param_start, param_count, ret_conv, ret_ty)
+    return mk_item_extern(p, start, prev_end(p), is_pub, ns, ne, param_start, param_count, ret_conv, ret_ty, abis, abie)
 }
 
 // Parse one top-level item: leading `@…` attributes, then an optional `pub`, then dispatch on
@@ -2392,8 +2393,11 @@ fn dump_item(read src: str, read p: Parser, iid: i32) {
             m = m + 1
         }
     } else if d.kind == 8 {
-        // extern: is_pub, name span, param count, each `(param …)`, ret_conv, ret-opt.
-        print_str("extern") print_int(d.is_pub as i64) print_int(d.x as i64) print_int(d.y as i64) print_int(d.b as i64)
+        // extern: abi text (default "c"), is_pub, name span, param count, each `(param …)`,
+        // ret_conv, ret-opt.
+        print_str("extern")
+        if d.w < 0 { print_str("c") } else { print_str(src[d.w as usize .. d.u as usize]) }
+        print_int(d.is_pub as i64) print_int(d.x as i64) print_int(d.y as i64) print_int(d.b as i64)
         dump_params(src, p, d.a, d.b)
         print_int(d.op as i64)
         if d.z < 0 { print_str("(") print_str("none") print_str(")") } else { dump_type(src, p, d.z) }

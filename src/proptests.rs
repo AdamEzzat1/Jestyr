@@ -6339,6 +6339,7 @@ mod c_oracle {
             // (The abi string is omitted, deferred like fn generics — extern-core.)
             Item::Extern(e) => {
                 out.push("extern".to_string());
+                out.push(e.abi.clone());
                 out.push(if e.is_pub { "1" } else { "0" }.to_string());
                 out.push(e.name.span.start.to_string());
                 out.push(e.name.span.end.to_string());
@@ -7049,6 +7050,7 @@ mod c_oracle {
             "fn sum[T: Add, U](x: T) -> T { x }",        // a bounded + an unbounded generic
             "impl[T] Drop for Vec(T) { fn drop(mut self) { } }", // a blanket impl generic
             "pub fn map[T: Show](x: T) { }",             // pub + a bounded generic
+            "extern \"stdcall\" fn WinApi(h: i32) -> i32", // a non-default extern abi
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_item_probe.jtr");
