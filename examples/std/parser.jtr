@@ -2734,6 +2734,27 @@ fn parse_item_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Al
     dump_item(src, p, iid)
 }
 
+// Tokenize `src`, parse every top-level item until Eof, dump the count then each item (the
+// whole-corpus module golden entry). Mirrors the reference `parse_module`.
+fn parse_module_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Allocator) {
+    var tk: List(tokens.Token) = tokens.tokenize(src, it, kwcount, a)
+    let n: usize = list.len(tokens.Token, tk)
+    var p: Parser = Parser{ toks: tk, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), pt: list.make(PatData, a), par: list.make(i32, a), ty: list.make(TypeData, a), tar: list.make(i32, a), it: list.make(ItemData, a), iar: list.make(i32, a), mar: list.make(i32, a), ear: list.make(i32, a), aar: list.make(i32, a), gar: list.make(i32, a), far: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
+    var ids: List(i32) = list.make(i32, a)
+    for cur_kind(p) != 110 {                        // until Eof
+        let before: usize = p.pos
+        let iid: i32 = parse_item(p)
+        list.push(i32, ids, iid)
+        if p.pos == before { bump(p) }             // guarantee progress
+    }
+    print_int(list.len(i32, ids) as i64)
+    var i: usize = 0
+    for i < list.len(i32, ids) {
+        dump_item(src, p, list.get(i32, ids, i))
+        i = i + 1
+    }
+}
+
 fn main() -> i32 {
     var a: Allocator = mem.system_allocator()
     var it: Interner = intern.make(a)
@@ -2741,7 +2762,8 @@ fn main() -> i32 {
 
     if env.argc() > 1 {
         var src: String = fs.read_text(env.argv(1))
-        if env.argc() > 2 { parse_item_and_dump(string_view(src), it, kwcount, a) }   // item mode
+        if env.argc() > 3 { parse_module_and_dump(string_view(src), it, kwcount, a) }  // module mode
+        else if env.argc() > 2 { parse_item_and_dump(string_view(src), it, kwcount, a) }   // item mode
         else { parse_and_dump(string_view(src), it, kwcount, a) }
         string_free(src)
     } else {

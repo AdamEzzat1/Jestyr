@@ -7087,6 +7087,79 @@ mod c_oracle {
         }
     }
 
+    /// The reference module-dump for `src`: lex, parse every item, dump count + each item.
+    fn rust_module_dump(src: &str) -> Vec<String> {
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (ast, items, _diags) = crate::parser::Parser::new(src, tokens).parse_module();
+        let mut out = Vec::new();
+        out.push(items.len().to_string());
+        for it in &items {
+            ref_dump_item(&ast, it, &mut out);
+        }
+        out
+    }
+
+    /// Run the Jestyr parser in **module mode** (two extra CLI args) on `file`.
+    fn jestyr_module_dump(parser_exe: &std::path::Path, file: &str) -> Vec<String> {
+        let out = Command::new(parser_exe).arg(file).arg("x").arg("module").output().unwrap();
+        assert!(out.status.success(), "jestyr parser (module mode) failed on {file}");
+        String::from_utf8(out.stdout).unwrap().lines().map(|s| s.to_string()).collect()
+    }
+
+    /// Files still failing the whole-corpus module golden — each uses an *expression* form the
+    /// P2 parser hasn't grown yet (loops `for`/`while`, closures `|x| …`, the concurrency forms
+    /// `spawn`/`await`/`select`/`concurrent`, and `region`). As each form lands, its files move
+    /// off this list. (Basename match; there are no basename collisions across the corpus.)
+    const MODULE_GOLDEN_DENYLIST: &[&str] = &[
+        "array_lit.jtr", "arrays.jtr", "atomics.jtr", "closure_run.jtr", "closures.jtr",
+        "codepoints.jtr", "concurrent.jtr", "fn_ptr.jtr", "gen_vtable.jtr", "genlist.jtr",
+        "genmethods.jtr", "loops.jtr", "loops_advanced.jtr", "loops_else.jtr", "methods.jtr",
+        "region.jtr", "region_escape.jtr", "region_string.jtr", "args.jtr", "await.jtr",
+        "binned.jtr", "channel.jtr", "core.jtr", "deterministic.jtr", "dynamic_spawn.jtr",
+        "intern.jtr", "intern_demo.jtr", "lexer.jtr", "list.jtr", "mutex.jtr",
+        "numerics_canary.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr",
+        "par_reduce_int.jtr", "par_soac.jtr", "parallel.jtr", "parser.jtr", "select.jtr",
+        "strmap.jtr", "strmap_demo.jtr", "sync.jtr", "tokens.jtr", "str_iter.jtr",
+        "strings.jtr", "tests_demo.jtr", "vec.jtr", "vec_alloc.jtr", "vec_generic.jtr",
+    ];
+
+    /// **P2 whole-corpus module golden** — the acceptance test for the item parser. For every
+    /// real `.jtr` file *not* on the denylist, the Jestyr `parse_module` must build the same
+    /// item stream as the reference. Currently 76 of the 125 corpus files (the rest await the
+    /// remaining expression forms). Also asserts the denylisted files still *run* (parse to
+    /// completion without crashing), so a form landing can only add coverage, never regress it.
+    #[test]
+    fn jestyr_parser_module_dump_matches_reference() {
+        let parser = build_exe("examples/std/parser.jtr");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for dir in ["examples", "examples/std"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("jtr") {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+        files.sort();
+        assert!(files.len() > 100, "expected the whole corpus, found {}", files.len());
+        let mut checked = 0;
+        for p in &files {
+            let f = p.to_str().unwrap();
+            let base = p.file_name().and_then(|s| s.to_str()).unwrap();
+            let src = std::fs::read_to_string(p).unwrap();
+            let got = jestyr_module_dump(&parser, f); // must not crash on any file
+            if MODULE_GOLDEN_DENYLIST.contains(&base) {
+                continue;
+            }
+            let want = rust_module_dump(&src);
+            assert_eq!(got, want, "Jestyr module dump diverged from the reference on {f}");
+            checked += 1;
+        }
+        eprintln!("whole-corpus module golden: {checked} files item-for-item identical");
+    }
+
     /// **P2 depth guard.** The Jestyr parser bounds AST *height* at `MAX_EXPR_DEPTH`
     /// (like the reference), so adversarially-deep input terminates with a bounded tree
     /// instead of overflowing. Two shapes stress different stacks: a left-deep fold
