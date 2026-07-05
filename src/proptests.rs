@@ -6179,8 +6179,50 @@ mod c_oracle {
                     }
                 }
             }
-            // Other item kinds (enum/trait/impl/extern) land in later slices; the item corpus
-            // is curated to the handled kinds.
+            // enum: is_pub, name span, tparam count, `(tparam <span>)`s, variant count, then
+            // each `(variant <name span> <fieldcount> <(vfield <fname span> <type>)>s
+            // <disc-opt>)`.
+            Item::Enum(e) => {
+                out.push("enum".to_string());
+                out.push(if e.is_pub { "1" } else { "0" }.to_string());
+                out.push(e.name.span.start.to_string());
+                out.push(e.name.span.end.to_string());
+                out.push(e.type_params.len().to_string());
+                for tp in &e.type_params {
+                    out.push("(".to_string());
+                    out.push("tparam".to_string());
+                    out.push(tp.span.start.to_string());
+                    out.push(tp.span.end.to_string());
+                    out.push(")".to_string());
+                }
+                out.push(e.variants.len().to_string());
+                for v in &e.variants {
+                    out.push("(".to_string());
+                    out.push("variant".to_string());
+                    out.push(v.name.span.start.to_string());
+                    out.push(v.name.span.end.to_string());
+                    out.push(v.fields.len().to_string());
+                    for (fname, fty) in &v.fields {
+                        out.push("(".to_string());
+                        out.push("vfield".to_string());
+                        out.push(fname.span.start.to_string());
+                        out.push(fname.span.end.to_string());
+                        ref_dump_type(ast, *fty, out);
+                        out.push(")".to_string());
+                    }
+                    match &v.discriminant {
+                        Some(d) => ref_dump_expr(ast, *d, out),
+                        None => {
+                            out.push("(".to_string());
+                            out.push("none".to_string());
+                            out.push(")".to_string());
+                        }
+                    }
+                    out.push(")".to_string());
+                }
+            }
+            // Other item kinds (trait/impl/extern) land in later slices; the item corpus is
+            // curated to the handled kinds.
             _ => out.push("itemerr".to_string()),
         }
         out.push(")".to_string());
@@ -6821,6 +6863,14 @@ mod c_oracle {
             "struct Config { retries: i32 = 3 }", // a field default
             "struct WithMethod { n: i32  fn get(read self) -> i32 { self.n } }", // a field + method
             "pub struct Vec2 { pub x: f64, pub y: f64 }", // public fields
+            // enums: C-like, payload variants, generic, discriminants
+            "enum Color { red, green, blue }", // nullary variants
+            "enum Shape { circle(r: f64), rect(w: f64, h: f64) }", // named-field payloads
+            "pub enum Option(T) { none, some(value: T) }", // a generic enum
+            "enum Either(L, R) { left(v: L), right(v: R) }", // two type params
+            "enum Status { ok = 0, err = 1 }", // explicit discriminants
+            "enum Empty { }",               // no variants
+            "enum Mixed { a, b(x: i32), c = 5 }", // nullary + payload + discriminant
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_item_probe.jtr");
