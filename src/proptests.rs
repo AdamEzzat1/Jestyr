@@ -6026,6 +6026,32 @@ mod c_oracle {
         out.push(")".to_string());
     }
 
+    /// Dump a generic-parameter slice: the count, then each `(generic <name span> <bound-opt>)`.
+    fn ref_dump_generics(generics: &[crate::ast::GenericParam], out: &mut Vec<String>) {
+        out.push(generics.len().to_string());
+        for g in generics {
+            out.push("(".to_string());
+            out.push("generic".to_string());
+            out.push(g.name.span.start.to_string());
+            out.push(g.name.span.end.to_string());
+            match &g.bound {
+                Some(b) => {
+                    out.push("(".to_string());
+                    out.push("bound".to_string());
+                    out.push(b.span.start.to_string());
+                    out.push(b.span.end.to_string());
+                    out.push(")".to_string());
+                }
+                None => {
+                    out.push("(".to_string());
+                    out.push("none".to_string());
+                    out.push(")".to_string());
+                }
+            }
+            out.push(")".to_string());
+        }
+    }
+
     /// Dump an attribute slice: the count, then each `(attr <name text> <argcount> <args…>)`.
     fn ref_dump_attrs(ast: &crate::ast::Ast, attrs: &[crate::ast::Attribute], out: &mut Vec<String>) {
         out.push(attrs.len().to_string());
@@ -6078,6 +6104,7 @@ mod c_oracle {
     fn ref_dump_fn(ast: &crate::ast::Ast, f: &crate::ast::FnDecl, out: &mut Vec<String>) {
         out.push("fn".to_string());
         ref_dump_attrs(ast, &f.attrs, out);
+        ref_dump_generics(&f.generics, out);
         out.push(if f.is_pub { "1" } else { "0" }.to_string());
         out.push(f.name.span.start.to_string());
         out.push(f.name.span.end.to_string());
@@ -6297,6 +6324,7 @@ mod c_oracle {
             // impl: trait-name span, target type, method count, then each method fn dump.
             Item::Impl(im) => {
                 out.push("impl".to_string());
+                ref_dump_generics(&im.generics, out);
                 out.push(im.trait_name.span.start.to_string());
                 out.push(im.trait_name.span.end.to_string());
                 ref_dump_type(ast, im.ty, out);
@@ -7016,6 +7044,11 @@ mod c_oracle {
             "struct Mmio { status: @volatile u32 }",    // a volatile field
             "struct Flags { a: u8 : 3, b: u8 : 5 }",     // bit-field widths
             "struct Mixed { x: i32, ctrl: @volatile u16 : 4 }", // volatile + bits together
+            // generics on fn + impl
+            "fn id[T](x: T) -> T { x }",                 // one unbounded generic
+            "fn sum[T: Add, U](x: T) -> T { x }",        // a bounded + an unbounded generic
+            "impl[T] Drop for Vec(T) { fn drop(mut self) { } }", // a blanket impl generic
+            "pub fn map[T: Show](x: T) { }",             // pub + a bounded generic
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_item_probe.jtr");
