@@ -6089,7 +6089,54 @@ mod c_oracle {
                 }
                 ref_dump_expr(ast, c.value, out);
             }
-            // Other item kinds (fn/struct/enum/trait/impl/extern) land in later slices; the
+            // fn: is_pub, name span, param count, each `(param <comptime> <conv> <is_self>
+            // <name span> <ty-opt> <refine-opt>)`, then ret_conv, ret-opt, and the body block.
+            // (Generics/attrs/errors/contracts are omitted until the parser handles them —
+            // the fn-core corpus has none, so they'd be empty anyway.)
+            Item::Fn(f) => {
+                out.push("fn".to_string());
+                out.push(if f.is_pub { "1" } else { "0" }.to_string());
+                out.push(f.name.span.start.to_string());
+                out.push(f.name.span.end.to_string());
+                out.push(f.params.len().to_string());
+                for pm in &f.params {
+                    out.push("(".to_string());
+                    out.push("param".to_string());
+                    out.push(if pm.comptime { "1" } else { "0" }.to_string());
+                    out.push(ref_conv_code(pm.conv).to_string());
+                    out.push(if pm.is_self { "1" } else { "0" }.to_string());
+                    out.push(pm.name.span.start.to_string());
+                    out.push(pm.name.span.end.to_string());
+                    match pm.ty {
+                        Some(t) => ref_dump_type(ast, t, out),
+                        None => {
+                            out.push("(".to_string());
+                            out.push("none".to_string());
+                            out.push(")".to_string());
+                        }
+                    }
+                    match pm.refine {
+                        Some(e) => ref_dump_expr(ast, e, out),
+                        None => {
+                            out.push("(".to_string());
+                            out.push("none".to_string());
+                            out.push(")".to_string());
+                        }
+                    }
+                    out.push(")".to_string());
+                }
+                out.push(ref_conv_code(f.ret_conv).to_string());
+                match f.ret_ty {
+                    Some(t) => ref_dump_type(ast, t, out),
+                    None => {
+                        out.push("(".to_string());
+                        out.push("none".to_string());
+                        out.push(")".to_string());
+                    }
+                }
+                ref_dump_block(ast, &f.body, out);
+            }
+            // Other item kinds (struct/enum/trait/impl/extern) land in later slices; the
             // item corpus is curated to the handled kinds.
             _ => out.push("itemerr".to_string()),
         }
@@ -6712,6 +6759,16 @@ mod c_oracle {
             "pub const PI: f64 = 3.14",     // a public typed const
             "const ORIGIN: Point = Point{ x: 0, y: 0 }", // a struct-literal value
             "const SIZES: [3]i32 = [1, 2, 4]", // an array type + array literal
+            // functions (fn-core: no generics/errors/contracts/attrs)
+            "fn f() { }",                   // no params, no return, empty body
+            "fn add(x: i32, y: i32) -> i32 { return x + y }", // typed params + return + body
+            "pub fn get(read self) -> i32 { self.x }", // public, `self` receiver, convention
+            "fn store(mut self, v: i32) { }", // a `mut self` receiver + a value param
+            "fn g(comptime T: type, buf: []u8) { }", // a comptime param + a slice-typed param
+            "fn h(take owned: List(i32)) { }", // a `take` convention + generic-type param
+            "fn clamp(i: usize in 0..n) -> usize { i }", // a param refinement (`in <expr>`)
+            "fn out_param(out result: i32) { }", // an `out` convention param
+            "fn body_stmts() { let x = 1  x }", // a body with a let + tail expression
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_item_probe.jtr");
