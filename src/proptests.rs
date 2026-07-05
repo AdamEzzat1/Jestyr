@@ -6262,9 +6262,38 @@ mod c_oracle {
                     out.push(")".to_string());
                 }
             }
-            // Other item kinds (impl/extern) land in later slices; the item corpus is curated
-            // to the handled kinds.
-            _ => out.push("itemerr".to_string()),
+            // impl: trait-name span, target type, method count, then each method fn dump.
+            Item::Impl(im) => {
+                out.push("impl".to_string());
+                out.push(im.trait_name.span.start.to_string());
+                out.push(im.trait_name.span.end.to_string());
+                ref_dump_type(ast, im.ty, out);
+                out.push(im.methods.len().to_string());
+                for f in &im.methods {
+                    out.push("(".to_string());
+                    ref_dump_fn(ast, f, out);
+                    out.push(")".to_string());
+                }
+            }
+            // extern: is_pub, name span, param count, each `(param …)`, ret_conv, ret-opt.
+            // (The abi string is omitted, deferred like fn generics — extern-core.)
+            Item::Extern(e) => {
+                out.push("extern".to_string());
+                out.push(if e.is_pub { "1" } else { "0" }.to_string());
+                out.push(e.name.span.start.to_string());
+                out.push(e.name.span.end.to_string());
+                out.push(e.params.len().to_string());
+                ref_dump_params(ast, &e.params, out);
+                out.push(ref_conv_code(e.ret_conv).to_string());
+                match e.ret_ty {
+                    Some(t) => ref_dump_type(ast, t, out),
+                    None => {
+                        out.push("(".to_string());
+                        out.push("none".to_string());
+                        out.push(")".to_string());
+                    }
+                }
+            }
         }
         out.push(")".to_string());
     }
@@ -6918,6 +6947,13 @@ mod c_oracle {
             "pub trait Eq { fn eq(read self, read other: Self) -> bool }", // public, a param
             "trait Greet { fn hi(read self) { } }",     // a default-body method
             "trait Empty { }",                          // no methods
+            // impls and externs
+            "impl Show for Point { fn show(read self) -> str { self.name } }", // impl with a method
+            "impl Zero for i32 { fn zero() -> i32 { 0 } }", // impl on a primitive
+            "impl Drop for Buf { }",                    // an impl with no methods
+            "extern \"c\" fn malloc(size: usize) -> *mut u8", // an extern with an abi
+            "extern fn puts(s: *const u8) -> i32",      // an extern without an abi
+            "pub extern \"c\" fn free(p: *mut u8)",     // a public extern, no return
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_item_probe.jtr");
