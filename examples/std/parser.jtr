@@ -1177,17 +1177,22 @@ fn parse_struct(mut p: Parser, is_pub: i32, kindcode: i32, attr_start: i32, attr
             let fid: i32 = parse_fn(p, 0, mattr_start, mattr_count)
             list.push(i32, tmp, 1)                  // tag 1 = method
             list.push(i32, tmp, fid)
-            list.push(i32, tmp, 0 - 1)
-            list.push(i32, tmp, 0 - 1)
-            list.push(i32, tmp, 0 - 1)
-            list.push(i32, tmp, 0 - 1)
-        } else {                                    // a field `[pub] name : T [= default]`
+            var mp: i32 = 0
+            for mp < 8 { list.push(i32, tmp, 0 - 1)  mp = mp + 1 }   // pad to a 10-tuple
+        } else {                                    // `[pub] name : [@volatile] T [: bits] [= default]`
             var fpub: i32 = 0
             if cur_kind(p) == 42 { bump(p)  fpub = 1 }   // `pub`
             var fns: usize = start  var fne: usize = start
             if cur_kind(p) == 0 { let nt: tokens.Token = cur_tok(p)  fns = nt.start  fne = nt.end  bump(p) }
             if cur_kind(p) == 71 { bump(p) }        // `:`
+            let fattr_start: i32 = parse_attrs(p)   // field attributes (`@volatile`)
+            let fattr_count: i32 = ((list.len(i32, p.aar) as i32) - fattr_start) / 4
             let fty: i32 = parse_type(p)
+            var bs: i32 = 0 - 1  var be: i32 = 0 - 1
+            if cur_kind(p) == 71 {                  // `: bits` bit-field width
+                bump(p)
+                if cur_kind(p) == 1 { let bt: tokens.Token = cur_tok(p)  bs = bt.start as i32  be = bt.end as i32  bump(p) }
+            }
             var default: i32 = 0 - 1
             if cur_kind(p) == 84 { bump(p)  default = parse_expr(p) }   // `= default`
             list.push(i32, tmp, 0)                  // tag 0 = field
@@ -1196,13 +1201,17 @@ fn parse_struct(mut p: Parser, is_pub: i32, kindcode: i32, attr_start: i32, attr
             list.push(i32, tmp, fne as i32)
             list.push(i32, tmp, fty)
             list.push(i32, tmp, default)
+            list.push(i32, tmp, fattr_start)
+            list.push(i32, tmp, fattr_count)
+            list.push(i32, tmp, bs)
+            list.push(i32, tmp, be)
             if cur_kind(p) == 69 { bump(p) }        // optional `,`
         }
     }
     var endp: usize = ne
     if cur_kind(p) == 66 { let rb: tokens.Token = cur_tok(p)  endp = rb.end  bump(p) }
     let mem_start: i32 = list.len(i32, p.mar) as i32
-    let mem_count: i32 = (list.len(i32, tmp) / 6) as i32
+    let mem_count: i32 = (list.len(i32, tmp) / 10) as i32
     var j: usize = 0
     for j < list.len(i32, tmp) {
         list.push(i32, p.mar, list.get(i32, tmp, j))
@@ -2150,6 +2159,34 @@ fn dump_params(read src: str, read p: Parser, param_start: i32, param_count: i32
     }
 }
 
+// Is `src[s..e]` the literal `volatile`? (A field's `@volatile` attribute lowers to a bool in
+// the reference; we recompute it from the field's attr slice at dump time.)
+fn name_is_volatile(read src: str, s: usize, e: usize) -> bool {
+    if e - s != 8 { return false }
+    if (src[s] as i32) != 118 { return false }         // v
+    if (src[s + 1] as i32) != 111 { return false }     // o
+    if (src[s + 2] as i32) != 108 { return false }     // l
+    if (src[s + 3] as i32) != 97 { return false }      // a
+    if (src[s + 4] as i32) != 116 { return false }     // t
+    if (src[s + 5] as i32) != 105 { return false }     // i
+    if (src[s + 6] as i32) != 108 { return false }     // l
+    if (src[s + 7] as i32) != 101 { return false }     // e
+    return true
+}
+// Does the attribute slice `aar[attr_start…]` contain a `@volatile`? Mirrors the reference's
+// `fattrs.iter().any(|a| a.name == "volatile")` field-level check.
+fn attrs_has_volatile(read src: str, read p: Parser, attr_start: i32, attr_count: i32) -> i32 {
+    var i: i32 = 0
+    for i < attr_count {
+        let base: i32 = attr_start + i * 4
+        let ns: usize = list.get(i32, p.aar, base as usize) as usize
+        let ne: usize = list.get(i32, p.aar, (base + 1) as usize) as usize
+        if name_is_volatile(src, ns, ne) { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
 // Dump an attribute slice: the count, then each `(attr <name text> <argcount> <args…>)`. The
 // name is sliced from src as text (the reference stores it as a `String`, not a span).
 fn dump_attrs(read src: str, read p: Parser, attr_start: i32, attr_count: i32) {
@@ -2208,7 +2245,7 @@ fn dump_item(read src: str, read p: Parser, iid: i32) {
         print_str("struct") dump_attrs(src, p, d.u, d.v) print_int(d.op as i64) print_int(d.is_pub as i64) print_int(d.x as i64) print_int(d.y as i64) print_int(d.b as i64)
         var i: i32 = 0
         for i < d.b {
-            let base: i32 = d.a + i * 6
+            let base: i32 = d.a + i * 10
             let tag: i32 = list.get(i32, p.mar, base as usize)
             if tag == 1 {
                 let fid: i32 = list.get(i32, p.mar, (base + 1) as usize)
@@ -2219,8 +2256,13 @@ fn dump_item(read src: str, read p: Parser, iid: i32) {
                 let fne: i32 = list.get(i32, p.mar, (base + 3) as usize)
                 let fty: i32 = list.get(i32, p.mar, (base + 4) as usize)
                 let default: i32 = list.get(i32, p.mar, (base + 5) as usize)
-                print_str("(") print_str("sfield") print_int(fpub as i64) print_int(fns as i64) print_int(fne as i64)
+                let fattr_start: i32 = list.get(i32, p.mar, (base + 6) as usize)
+                let fattr_count: i32 = list.get(i32, p.mar, (base + 7) as usize)
+                let bs: i32 = list.get(i32, p.mar, (base + 8) as usize)
+                let be: i32 = list.get(i32, p.mar, (base + 9) as usize)
+                print_str("(") print_str("sfield") print_int(fpub as i64) print_int(attrs_has_volatile(src, p, fattr_start, fattr_count) as i64) print_int(fns as i64) print_int(fne as i64)
                 dump_type(src, p, fty)
+                if bs < 0 { print_str("(") print_str("none") print_str(")") } else { print_str("(") print_str("bits") print_str(src[bs as usize .. be as usize]) print_str(")") }
                 if default < 0 { print_str("(") print_str("none") print_str(")") } else { dump(src, p, default) }
                 print_str(")")
             }

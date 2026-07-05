@@ -6178,13 +6178,27 @@ mod c_oracle {
                 out.push(body.members.len().to_string());
                 for m in &body.members {
                     match m {
-                        StructMember::Field { name, ty, is_pub, default, .. } => {
+                        StructMember::Field { name, ty, is_pub, default, volatile, bits, .. } => {
                             out.push("(".to_string());
                             out.push("sfield".to_string());
                             out.push(if *is_pub { "1" } else { "0" }.to_string());
+                            out.push(if *volatile { "1" } else { "0" }.to_string());
                             out.push(name.span.start.to_string());
                             out.push(name.span.end.to_string());
                             ref_dump_type(ast, *ty, out);
+                            match bits {
+                                Some(b) => {
+                                    out.push("(".to_string());
+                                    out.push("bits".to_string());
+                                    out.push(b.to_string());
+                                    out.push(")".to_string());
+                                }
+                                None => {
+                                    out.push("(".to_string());
+                                    out.push("none".to_string());
+                                    out.push(")".to_string());
+                                }
+                            }
                             match default {
                                 Some(e) => ref_dump_expr(ast, *e, out),
                                 None => {
@@ -6998,6 +7012,10 @@ mod c_oracle {
             // method attributes (on struct + impl methods)
             "struct S { n: i32  @inline fn get(read self) -> i32 { self.n } }", // struct method attr
             "impl T for U { @cold fn slow(read self) { } }", // impl method attr
+            // field-level: @volatile and bit-fields
+            "struct Mmio { status: @volatile u32 }",    // a volatile field
+            "struct Flags { a: u8 : 3, b: u8 : 5 }",     // bit-field widths
+            "struct Mixed { x: i32, ctrl: @volatile u16 : 4 }", // volatile + bits together
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_item_probe.jtr");
