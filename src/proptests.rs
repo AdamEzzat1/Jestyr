@@ -6851,6 +6851,29 @@ mod c_oracle {
                 out.push(en);
                 ref_dump_members(ast, &body.members, out);
             }
+            // Closure: param count, span, each `(cparam <name span> <type-opt>)`, then the body.
+            ExprKind::Closure { params, body } => {
+                out.push("closure".to_string());
+                out.push(params.len().to_string());
+                out.push(s);
+                out.push(en);
+                for cp in params {
+                    out.push("(".to_string());
+                    out.push("cparam".to_string());
+                    out.push(cp.name.span.start.to_string());
+                    out.push(cp.name.span.end.to_string());
+                    match cp.ty {
+                        Some(t) => ref_dump_type(ast, t, out),
+                        None => {
+                            out.push("(".to_string());
+                            out.push("none".to_string());
+                            out.push(")".to_string());
+                        }
+                    }
+                    out.push(")".to_string());
+                }
+                ref_dump_expr(ast, *body, out);
+            }
             // Any construct the P2 slice does not yet build dumps as `error`; the golden
             // corpus is curated to the handled constructs, so this arm stays unexercised.
             _ => {
@@ -7110,6 +7133,17 @@ mod c_oracle {
             "struct { bits: u8 : 3 }",   // a bit-field width
             "struct { fn area(self) -> i32 { 0 } }", // a method member
             "struct { x: i32  fn get(self) -> i32 { self.x } }", // a field + a method
+            // closures: `|params| body` / `|| body`, params with optional `: T`, block bodies
+            "|| 0",                      // no-parameter closure
+            "|x| x",                     // one parameter, expression body
+            "|n| n - 1",                 // the fn_ptr.jtr shape
+            "|a, b| a + b",              // two parameters
+            "|x: i32| x + 1",            // a typed parameter
+            "|x: i32, y: i32| x * y",    // two typed parameters
+            "|x| { let y = x  y }",      // a block body with statements
+            "f(|n| n + 1)",              // a closure as a call argument
+            "xs.map(|x| x * 2)",         // method-call with a closure argument
+            "|x| |y| x + y",             // a closure returning a closure (nested)
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");
@@ -7257,9 +7291,8 @@ mod c_oracle {
     /// `spawn`/`await`/`select`/`concurrent`, and `region`). As each form lands, its files move
     /// off this list. (Basename match; there are no basename collisions across the corpus.)
     const MODULE_GOLDEN_DENYLIST: &[&str] = &[
-        // closures `|x| …` / `|| …`.
-        "closure_run.jtr", "closures.jtr", "gen_vtable.jtr", "args.jtr", "core.jtr",
-        "fn_ptr.jtr", "parser.jtr", "tokens.jtr",
+        // closures `|x| …` / `|| …` — these three also need concurrency / `par for` / region.
+        "core.jtr", "parser.jtr", "tokens.jtr",
         // concurrency (`spawn`/`await`/`select`/`concurrent`) and `par for … reduce`.
         "atomics.jtr", "await.jtr", "channel.jtr", "concurrent.jtr", "deterministic.jtr",
         "dynamic_spawn.jtr", "mutex.jtr", "select.jtr", "sync.jtr", "numerics_canary.jtr",
