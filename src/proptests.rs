@@ -7417,7 +7417,7 @@ mod c_oracle {
     /// `examples/std/typeck.jtr` — the two MUST agree so the golden compares the same expression
     /// subset on both sides. Grow both together, one increment at a time.
     fn typeck_dump_kind(k: &crate::ast::ExprKind) -> bool {
-        use crate::ast::ExprKind;
+        use crate::ast::{BinOp, ExprKind, UnOp};
         matches!(
             k,
             ExprKind::Int(_)
@@ -7426,6 +7426,18 @@ mod c_oracle {
                 | ExprKind::Char(_)
                 | ExprKind::Bool(_)
                 | ExprKind::Null
+                | ExprKind::Unary { op: UnOp::Not, .. }
+                | ExprKind::Binary {
+                    op: BinOp::Eq
+                        | BinOp::Ne
+                        | BinOp::Lt
+                        | BinOp::Le
+                        | BinOp::Gt
+                        | BinOp::Ge
+                        | BinOp::And
+                        | BinOp::Or,
+                    ..
+                }
         )
     }
 

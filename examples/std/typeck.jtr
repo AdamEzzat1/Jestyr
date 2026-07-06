@@ -32,15 +32,16 @@ import "parser"
 // is populated). `mut` so `mark` can set flags.
 struct Checker { reached: List(bool) }
 
-// Does this pass resolve a type for expression kind `k` yet? (Kind integers are the `ExprData`
-// tags in `parser.jtr`.) Must agree with `typeck_dump_kind` in proptests.rs. Grows per increment.
-fn typed_kind(k: i32) -> bool {
-    if k == 0 { return true }    // Int   -> i32
-    if k == 1 { return true }    // Float -> f64
-    if k == 26 { return true }   // Char  -> char
-    if k == 27 { return true }   // Bool  -> bool
-    if k == 29 { return true }   // Str   -> str
-    if k == 30 { return true }   // Null  -> *?
+// Does this pass resolve a type for expression `d` yet? Keyed on `(kind, op)` — Unary/Binary
+// share a kind, so the operator selects. Must agree with `typeck_dump_kind` in proptests.rs.
+// Grows per increment.
+fn is_typed(read d: parser.ExprData) -> bool {
+    let k: i32 = d.kind
+    if k == 0 or k == 1 or k == 26 or k == 27 or k == 29 or k == 30 { return true }   // literals
+    if k == 3 { if d.op == 2 { return true } }   // Unary `not` -> bool
+    if k == 4 {                                  // Binary comparison/logical -> bool (op 6..13)
+        if d.op >= 6 { if d.op <= 13 { return true } }
+    }
     return false
 }
 
@@ -202,15 +203,18 @@ fn walk_items(mut c: Checker, read p: parser.Parser) {
 
 // ---- the resolved-type dump ----
 
-// Emit the canonical `Ty` string (one line) for a reached literal expr `d`, matching
-// `Ty::display`. Called only for `typed_kind` exprs that were reached; unreached ones print `?`.
-fn print_lit_ty(kind: i32) {
-    if kind == 0 { print_str("i32") }
-    else if kind == 1 { print_str("f64") }
-    else if kind == 26 { print_str("char") }
-    else if kind == 27 { print_str("bool") }
-    else if kind == 29 { print_str("str") }
-    else if kind == 30 { print_str("*?") }          // Ptr{Default, Unknown}
+// Emit the canonical `Ty` string (one line) for a reached typed expr `d`, matching `Ty::display`.
+// Called only for `is_typed` exprs that were reached; unreached ones print `?`.
+fn print_expr_ty(read d: parser.ExprData) {
+    let k: i32 = d.kind
+    if k == 0 { print_str("i32") }
+    else if k == 1 { print_str("f64") }
+    else if k == 26 { print_str("char") }
+    else if k == 27 { print_str("bool") }
+    else if k == 29 { print_str("str") }
+    else if k == 30 { print_str("*?") }             // Ptr{Default, Unknown}
+    else if k == 3 { print_str("bool") }            // Unary `not`
+    else if k == 4 { print_str("bool") }            // Binary comparison / logical
     else { print_str("?") }
 }
 
@@ -221,8 +225,8 @@ fn dump_types(read c: Checker, read p: parser.Parser) {
     var i: usize = 0
     for i < n {
         let d: parser.ExprData = list.get(parser.ExprData, p.ex, i)
-        if typed_kind(d.kind) {
-            if list.get(bool, c.reached, i) { print_lit_ty(d.kind) }
+        if is_typed(d) {
+            if list.get(bool, c.reached, i) { print_expr_ty(d) }
             else { print_str("?") }
         }
         i = i + 1
