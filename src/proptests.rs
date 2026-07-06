@@ -6967,7 +6967,7 @@ mod c_oracle {
     /// slice; the corpus grows as the parser gains constructs.
     #[test]
     fn jestyr_parser_expr_dump_matches_reference() {
-        let parser = build_exe("examples/std/parser.jtr");
+        let parser = build_exe("examples/std/parser_cli.jtr");
         let snippets = [
             "1 + 2 * 3",       // multiplicative binds tighter than additive
             "1 * 2 + 3",       // …either side
@@ -7249,7 +7249,7 @@ mod c_oracle {
     /// the canonical item dump atom-for-atom. Grows as the item parser gains kinds.
     #[test]
     fn jestyr_parser_item_dump_matches_reference() {
-        let parser = build_exe("examples/std/parser.jtr");
+        let parser = build_exe("examples/std/parser_cli.jtr");
         let snippets = [
             // imports: bare, aliased, hash-pinned
             "import \"std/mem\"",           // a bare import
@@ -7357,13 +7357,10 @@ mod c_oracle {
         String::from_utf8(out.stdout).unwrap().lines().map(|s| s.to_string()).collect()
     }
 
-    /// Files still failing the whole-corpus module golden — each uses an *expression* form the
-    /// P2 parser hasn't grown yet (loops `for`/`while`, closures `|x| …`, the concurrency forms
-    /// `spawn`/`await`/`select`/`concurrent`, and `region`). As each form lands, its files move
-    /// off this list. (Basename match; there are no basename collisions across the corpus.)
-    const MODULE_GOLDEN_DENYLIST: &[&str] = &[
-        // (empty) — the P2 parser now covers every expression form in the corpus.
-    ];
+    /// Files excluded from the whole-corpus module golden. **Empty** — the P2 parser is complete
+    /// and covers every expression form in the corpus (all 125 files match item-for-item). Kept
+    /// as a hook in case a future corpus file needs staging. (Basename match.)
+    const MODULE_GOLDEN_DENYLIST: &[&str] = &[];
 
     /// **P2 whole-corpus module golden** — the acceptance test for the item parser. For every
     /// real `.jtr` file *not* on the denylist, the Jestyr `parse_module` must build the same
@@ -7372,7 +7369,7 @@ mod c_oracle {
     /// completion without crashing), so a form landing can only add coverage, never regress it.
     #[test]
     fn jestyr_parser_module_dump_matches_reference() {
-        let parser = build_exe("examples/std/parser.jtr");
+        let parser = build_exe("examples/std/parser_cli.jtr");
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         for dir in ["examples", "examples/std"] {
             if let Ok(rd) = std::fs::read_dir(dir) {
@@ -7414,6 +7411,113 @@ mod c_oracle {
         eprintln!("whole-corpus module golden: {checked} files item-for-item identical");
     }
 
+    // ---- P3 typeck: the resolved-type dump golden ----
+
+    /// Does the P3 typeck pass resolve a type for this expr kind yet? Mirrors `typed_kind` in
+    /// `examples/std/typeck.jtr` — the two MUST agree so the golden compares the same expression
+    /// subset on both sides. Grow both together, one increment at a time.
+    fn typeck_dump_kind(k: &crate::ast::ExprKind) -> bool {
+        use crate::ast::ExprKind;
+        matches!(
+            k,
+            ExprKind::Int(_)
+                | ExprKind::Float(_)
+                | ExprKind::Str(_)
+                | ExprKind::Char(_)
+                | ExprKind::Bool(_)
+                | ExprKind::Null
+        )
+    }
+
+    /// The reference resolved-type dump for `src`: parse the single file, type-check it
+    /// (single-module `check`), then emit `Ty::display` for every expression whose kind the P3
+    /// pass types — in ExprId order. The Jestyr `typeck.jtr` emits the identical stream.
+    fn rust_typeck_dump(src: &str) -> Vec<String> {
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        // `parse()` populates `ast.items` (which `check` iterates); `parse_module` returns items
+        // in a separate vec, leaving `ast.items` empty ⇒ nothing inferred.
+        let (ast, _diags) = crate::parser::Parser::new(src, tokens).parse();
+        let (info, _d) = crate::typeck::check(&ast);
+        let mut out = Vec::new();
+        for (id, ed) in ast.exprs.iter().enumerate() {
+            if typeck_dump_kind(&ed.kind) {
+                out.push(info.expr_types[id].display(&info.table));
+            }
+        }
+        out
+    }
+
+    /// Run the Jestyr typeck exe on `file` and return its stdout lines (the resolved-type dump).
+    fn jestyr_typeck_dump(exe: &std::path::Path, file: &str) -> Vec<String> {
+        let out = Command::new(exe).arg(file).output().unwrap();
+        assert!(out.status.success(), "jestyr typeck failed on {file}");
+        String::from_utf8(out.stdout).unwrap().lines().map(|s| s.to_string()).collect()
+    }
+
+    /// Files excluded from the whole-corpus typeck golden. Each contains a literal in a position
+    /// the reference's `infer` never visits — so the reference leaves it `Unknown` (`?`) while the
+    /// current Jestyr pass (a context-free literal sweep) types it concretely. Those positions are
+    /// *const-eval* slots (array sizes `[N]T`, enum discriminants `= 1`, attribute args, bit-field
+    /// widths) and *impl/trait method bodies* (which `check_items` doesn't infer). The next
+    /// increment adds the body-reachability walk that mirrors `infer`'s traversal, which types
+    /// only body-reachable exprs and clears this list. (Basename match.)
+    const TYPECK_GOLDEN_DENYLIST: &[&str] = &[
+        "array_lit.jtr", "arrays.jtr", "attributes.jtr", "bound_method.jtr", "contracts.jtr",
+        "defaults.jtr", "discriminants.jtr", "docs.jtr", "dyn_dispatch.jtr", "exhaustive_check.jtr",
+        "layout.jtr", "loops_advanced.jtr", "nested_match.jtr", "orpat.jtr", "ranges.jtr",
+        "refine.jtr", "binned.jtr", "core.jtr", "numerics_canary.jtr", "traits_static.jtr",
+        "vec.jtr", "vec_alloc.jtr", "vec_generic.jtr",
+    ];
+
+    /// **P3 whole-corpus resolved-type golden.** For every corpus `.jtr` file, the Jestyr typeck
+    /// (`examples/std/typeck.jtr`) must resolve the *same* `Ty` for every expression whose kind
+    /// the pass types as the Rust reference (`typeck::check` + `Ty::display`). Staged by kind via
+    /// `typed_kind`/`typeck_dump_kind`: as the pass grows, more expression kinds enter the compared
+    /// subset. Currently: the literal leaves (Int/Float/Str/Char/Bool/Null).
+    #[test]
+    fn jestyr_typeck_dump_matches_reference() {
+        let tc = build_exe("examples/std/typeck.jtr");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for dir in ["examples", "examples/std"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("jtr") {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+        files.sort();
+        assert!(files.len() > 100, "expected the whole corpus, found {}", files.len());
+        let mut checked = 0;
+        let mut diverged: Vec<String> = Vec::new();
+        for p in &files {
+            let f = p.to_str().unwrap();
+            let base = p.file_name().and_then(|s| s.to_str()).unwrap();
+            if TYPECK_GOLDEN_DENYLIST.contains(&base) {
+                continue;
+            }
+            let src = std::fs::read_to_string(p).unwrap();
+            let got = jestyr_typeck_dump(&tc, f);
+            let want = rust_typeck_dump(&src);
+            if got != want {
+                diverged.push(f.to_string());
+                if std::env::var("DUMP_DIVERGE").is_ok() {
+                    let first = got.iter().zip(want.iter()).position(|(a, b)| a != b).unwrap_or(0);
+                    let lo = first.saturating_sub(4);
+                    eprintln!("=== {f} (first diff at line {first}) ===");
+                    eprintln!("GOT : {:?}", &got[lo..(lo + 20).min(got.len())]);
+                    eprintln!("WANT: {:?}", &want[lo..(lo + 20).min(want.len())]);
+                }
+            } else {
+                checked += 1;
+            }
+        }
+        assert!(diverged.is_empty(), "Jestyr typeck dump diverged from the reference on: {diverged:?}");
+        eprintln!("whole-corpus typeck golden: {checked} files' typed-expr streams identical");
+    }
+
     /// **P2 depth guard.** The Jestyr parser bounds AST *height* at `MAX_EXPR_DEPTH`
     /// (like the reference), so adversarially-deep input terminates with a bounded tree
     /// instead of overflowing. Two shapes stress different stacks: a left-deep fold
@@ -7422,7 +7526,7 @@ mod c_oracle {
     /// Building/running to completion (bounded output, no crash) is the check.
     #[test]
     fn jestyr_parser_bounds_deep_nesting() {
-        let parser = build_exe("examples/std/parser.jtr");
+        let parser = build_exe("examples/std/parser_cli.jtr");
         let deep_fold = "1+".repeat(20_000) + "1";
         let deep_parens = format!("{}x{}", "(".repeat(20_000), ")".repeat(20_000));
         for src in [deep_fold, deep_parens] {

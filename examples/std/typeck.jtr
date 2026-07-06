@@ -1,0 +1,70 @@
+// examples/std/typeck.jtr — the P3 type-checker, written *in Jestyr*. It imports the P2 parser
+// (`parser.jtr`, a pure library) to build the AST arena, then resolves a `Ty` for each
+// expression, mirroring the Rust reference (`src/typeck.rs`, `src/types.rs`). Verification is a
+// **resolved-type dump**: for each expression whose kind this pass types (`typed_kind`), emit its
+// canonical `Ty` string (matching `Ty::display`), in ExprId order. The Rust reference emits the
+// identical stream via `check(&ast)` + `Ty::display`; `jestyr_typeck_dump_matches_reference`
+// (proptests.rs, `--features c-oracle`) diffs them over the whole corpus. Grown construct by
+// construct like the parser: each increment adds expr kinds to `typed_kind` + the typing logic,
+// and the golden auto-covers them corpus-wide.
+//
+// **Current coverage:** the literal leaves — Int (`i32`), Float (`f64`), Str (`str`), Char
+// (`char`), Bool (`bool`), Null (`*?`). Everything else is not yet typed (skipped by both dumps).
+import "mem"
+import "intern"
+import "fs"
+import "env"
+import "list"
+import "tokens"
+import "parser"
+
+// Does this pass resolve a type for expression kind `k` yet? (The kind integers are the
+// `ExprData` tags defined in `parser.jtr`.) Grows one increment at a time; both this and the
+// reference's `typed_kind_ref` must agree so the golden compares the same expression subset.
+fn typed_kind(k: i32) -> bool {
+    if k == 0 { return true }    // Int   -> i32
+    if k == 1 { return true }    // Float -> f64
+    if k == 26 { return true }   // Char  -> char
+    if k == 27 { return true }   // Bool  -> bool
+    if k == 29 { return true }   // Str   -> str
+    if k == 30 { return true }   // Null  -> *?
+    return false
+}
+
+// Emit the canonical `Ty` string for expression `id` (one line), matching `Ty::display`.
+fn print_ty(read p: parser.Parser, id: i32) {
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
+    if d.kind == 0 { print_str("i32") }
+    else if d.kind == 1 { print_str("f64") }
+    else if d.kind == 26 { print_str("char") }
+    else if d.kind == 27 { print_str("bool") }
+    else if d.kind == 29 { print_str("str") }
+    else if d.kind == 30 { print_str("*?") }   // Ptr{Default, Unknown}
+    else { print_str("?") }                     // Unknown (not yet typed)
+}
+
+// Walk the expression arena in ExprId order, emitting a canonical type line for every expr this
+// pass types. ExprId order matches the reference (both parsers create leaf/inner nodes in the
+// same recursive-descent order), so the emitted subsequence aligns atom-for-atom.
+fn dump_types(read p: parser.Parser) {
+    let n: usize = list.len(parser.ExprData, p.ex)
+    var i: usize = 0
+    for i < n {
+        let d: parser.ExprData = list.get(parser.ExprData, p.ex, i)
+        if typed_kind(d.kind) { print_ty(p, i as i32) }
+        i = i + 1
+    }
+}
+
+fn main() -> i32 {
+    var a: Allocator = mem.system_allocator()
+    var it: Interner = intern.make(a)
+    let kwcount: i64 = tokens.intern_keywords(it)
+    if env.argc() > 1 {
+        var src: String = fs.read_text(env.argv(1))
+        var p: parser.Parser = parser.parse_source(string_view(src), it, kwcount, a)
+        dump_types(p)
+        string_free(src)
+    }
+    return 0
+}

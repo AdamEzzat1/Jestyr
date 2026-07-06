@@ -49,7 +49,7 @@ import "tokens"
 // `(x, y)`; Call stores `(arg_start, arg_count)` into the arg arena; Cast stores its target
 // type's `TypeId` in `x`; the variable-arity literals (Call/ArrayLit/StructLit/GenStructLit)
 // store `(start, count)` slices into the arg arena. Unused aux fields are -1.
-struct ExprData { kind: i32, start: usize, end: usize, op: i32, a: i32, b: i32, x: i32, y: i32 }
+pub struct ExprData { pub kind: i32, pub start: usize, pub end: usize, pub op: i32, pub a: i32, pub b: i32, pub x: i32, pub y: i32 }
 
 // A binary-operator lookup: whether `k` is an infix operator, its left/right binding
 // powers (precedence climbing), and its `BinOp` code. Mirrors `bin_op` in the reference.
@@ -124,7 +124,7 @@ struct ItemData { kind: i32, start: usize, end: usize, is_pub: i32, op: i32, a: 
 // (an ident whose text is "par"): the escape checker forbids storing the borrowed `src` in the
 // struct, so the driver — which *has* `src` — precomputes this one text test (the only contextual
 // keyword that isn't positionally unambiguous, since `<expr-ending-in-ident> for` also occurs).
-struct Parser { toks: List(tokens.Token), parw: List(bool), ex: List(ExprData), ar: List(i32), st: List(StmtData), sar: List(i32), pt: List(PatData), par: List(i32), ty: List(TypeData), tar: List(i32), it: List(ItemData), iar: List(i32), mar: List(i32), ear: List(i32), aar: List(i32), gar: List(i32), far: List(i32), lar: List(i32), clar: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool, no_struct: bool }
+pub struct Parser { toks: List(tokens.Token), parw: List(bool), pub ex: List(ExprData), ar: List(i32), st: List(StmtData), sar: List(i32), pt: List(PatData), par: List(i32), ty: List(TypeData), tar: List(i32), pub it: List(ItemData), iar: List(i32), mar: List(i32), ear: List(i32), aar: List(i32), gar: List(i32), far: List(i32), lar: List(i32), clar: List(i32), pub roots: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool, no_struct: bool }
 
 // The result of parsing a `{ field, …, ..spread }` initializer body: the field-init nodes'
 // slice into the arg arena, the optional spread expr (-1 if none), and the `}` end offset.
@@ -3321,7 +3321,7 @@ fn parse_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Allocat
     var tk: List(tokens.Token) = tokens.tokenize(src, it, kwcount, a)
     let n: usize = list.len(tokens.Token, tk)
     var pw: List(bool) = build_parw(src, tk, a)
-    var p: Parser = Parser{ toks: tk, parw: pw, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), pt: list.make(PatData, a), par: list.make(i32, a), ty: list.make(TypeData, a), tar: list.make(i32, a), it: list.make(ItemData, a), iar: list.make(i32, a), mar: list.make(i32, a), ear: list.make(i32, a), aar: list.make(i32, a), gar: list.make(i32, a), far: list.make(i32, a), lar: list.make(i32, a), clar: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
+    var p: Parser = Parser{ toks: tk, parw: pw, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), pt: list.make(PatData, a), par: list.make(i32, a), ty: list.make(TypeData, a), tar: list.make(i32, a), it: list.make(ItemData, a), iar: list.make(i32, a), mar: list.make(i32, a), ear: list.make(i32, a), aar: list.make(i32, a), gar: list.make(i32, a), far: list.make(i32, a), lar: list.make(i32, a), clar: list.make(i32, a), roots: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
     let root: i32 = parse_expr(p)
     dump(src, p, root)
 }
@@ -3331,7 +3331,7 @@ fn parse_item_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Al
     var tk: List(tokens.Token) = tokens.tokenize(src, it, kwcount, a)
     let n: usize = list.len(tokens.Token, tk)
     var pw: List(bool) = build_parw(src, tk, a)
-    var p: Parser = Parser{ toks: tk, parw: pw, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), pt: list.make(PatData, a), par: list.make(i32, a), ty: list.make(TypeData, a), tar: list.make(i32, a), it: list.make(ItemData, a), iar: list.make(i32, a), mar: list.make(i32, a), ear: list.make(i32, a), aar: list.make(i32, a), gar: list.make(i32, a), far: list.make(i32, a), lar: list.make(i32, a), clar: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
+    var p: Parser = Parser{ toks: tk, parw: pw, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), pt: list.make(PatData, a), par: list.make(i32, a), ty: list.make(TypeData, a), tar: list.make(i32, a), it: list.make(ItemData, a), iar: list.make(i32, a), mar: list.make(i32, a), ear: list.make(i32, a), aar: list.make(i32, a), gar: list.make(i32, a), far: list.make(i32, a), lar: list.make(i32, a), clar: list.make(i32, a), roots: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
     let iid: i32 = parse_item(p)
     dump_item(src, p, iid)
 }
@@ -3342,7 +3342,7 @@ fn parse_module_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: 
     var tk: List(tokens.Token) = tokens.tokenize(src, it, kwcount, a)
     let n: usize = list.len(tokens.Token, tk)
     var pw: List(bool) = build_parw(src, tk, a)
-    var p: Parser = Parser{ toks: tk, parw: pw, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), pt: list.make(PatData, a), par: list.make(i32, a), ty: list.make(TypeData, a), tar: list.make(i32, a), it: list.make(ItemData, a), iar: list.make(i32, a), mar: list.make(i32, a), ear: list.make(i32, a), aar: list.make(i32, a), gar: list.make(i32, a), far: list.make(i32, a), lar: list.make(i32, a), clar: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
+    var p: Parser = Parser{ toks: tk, parw: pw, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), pt: list.make(PatData, a), par: list.make(i32, a), ty: list.make(TypeData, a), tar: list.make(i32, a), it: list.make(ItemData, a), iar: list.make(i32, a), mar: list.make(i32, a), ear: list.make(i32, a), aar: list.make(i32, a), gar: list.make(i32, a), far: list.make(i32, a), lar: list.make(i32, a), clar: list.make(i32, a), roots: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
     var ids: List(i32) = list.make(i32, a)
     for cur_kind(p) != 110 {                        // until Eof
         let before: usize = p.pos
@@ -3358,7 +3358,10 @@ fn parse_module_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: 
     }
 }
 
-fn main() -> i32 {
+// The CLI driver for the standalone parser program (the thin `parser_cli.jtr` calls this). It
+// is `pub` and reads argc/argv itself so the parser module has NO `main` — that lets other
+// modules (e.g. `typeck.jtr`) `import "parser"` without a duplicate-`main` link conflict.
+pub fn run() -> i32 {
     var a: Allocator = mem.system_allocator()
     var it: Interner = intern.make(a)
     let kwcount: i64 = tokens.intern_keywords(it)
@@ -3374,4 +3377,20 @@ fn main() -> i32 {
         parse_and_dump(sample, it, kwcount, a)
     }
     return 0
+}
+
+// Parse a whole source string into a `Parser` (all top-level items), returning the populated
+// arenas for a consumer pass (typeck). The top-level item ids are collected in `p.roots`.
+pub fn parse_source(read src: str, mut it: Interner, kwcount: i64, read a: Allocator) -> Parser {
+    var tk: List(tokens.Token) = tokens.tokenize(src, it, kwcount, a)
+    let n: usize = list.len(tokens.Token, tk)
+    var pw: List(bool) = build_parw(src, tk, a)
+    var p: Parser = Parser{ toks: tk, parw: pw, ex: list.make(ExprData, a), ar: list.make(i32, a), st: list.make(StmtData, a), sar: list.make(i32, a), pt: list.make(PatData, a), par: list.make(i32, a), ty: list.make(TypeData, a), tar: list.make(i32, a), it: list.make(ItemData, a), iar: list.make(i32, a), mar: list.make(i32, a), ear: list.make(i32, a), aar: list.make(i32, a), gar: list.make(i32, a), far: list.make(i32, a), lar: list.make(i32, a), clar: list.make(i32, a), roots: list.make(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
+    for cur_kind(p) != 110 {                        // until Eof
+        let before: usize = p.pos
+        let iid: i32 = parse_item(p)
+        list.push(i32, p.roots, iid)
+        if p.pos == before { bump(p) }
+    }
+    return p
 }

@@ -1,0 +1,8 @@
+// Thin CLI driver for the parser. `parser.jtr` is a pure library (no `main`) so other passes
+// (`typeck.jtr`) can `import "parser"` without a duplicate-`main` link conflict; this driver
+// supplies the entry point the parser goldens build and run. All logic lives in `parser.run`.
+import "parser"
+
+fn main() -> i32 {
+    return parser.run()
+}
