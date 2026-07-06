@@ -7461,13 +7461,7 @@ mod c_oracle {
     /// widths) and *impl/trait method bodies* (which `check_items` doesn't infer). The next
     /// increment adds the body-reachability walk that mirrors `infer`'s traversal, which types
     /// only body-reachable exprs and clears this list. (Basename match.)
-    const TYPECK_GOLDEN_DENYLIST: &[&str] = &[
-        "array_lit.jtr", "arrays.jtr", "attributes.jtr", "bound_method.jtr", "contracts.jtr",
-        "defaults.jtr", "discriminants.jtr", "docs.jtr", "dyn_dispatch.jtr", "exhaustive_check.jtr",
-        "layout.jtr", "loops_advanced.jtr", "nested_match.jtr", "orpat.jtr", "ranges.jtr",
-        "refine.jtr", "binned.jtr", "core.jtr", "numerics_canary.jtr", "traits_static.jtr",
-        "vec.jtr", "vec_alloc.jtr", "vec_generic.jtr",
-    ];
+    const TYPECK_GOLDEN_DENYLIST: &[&str] = &[];
 
     /// **P3 whole-corpus resolved-type golden.** For every corpus `.jtr` file, the Jestyr typeck
     /// (`examples/std/typeck.jtr`) must resolve the *same* `Ty` for every expression whose kind

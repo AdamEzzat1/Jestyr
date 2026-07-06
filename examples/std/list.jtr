@@ -46,6 +46,12 @@ pub fn get(comptime T: type, l: List(T), i: usize) -> T {
     unsafe { (l.ptr + i).* }
 }
 
+// Overwrite the element at `i` (caller-checked; `i` must be `< len`). Random-access update to
+// complement `get`.
+pub fn set(comptime T: type, mut l: List(T), i: usize, x: T) {
+    unsafe { (l.ptr + i).* = x }
+}
+
 pub fn len(comptime T: type, l: List(T)) -> usize {
     return l.len
 }

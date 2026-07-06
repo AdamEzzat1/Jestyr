@@ -83,7 +83,7 @@ struct TypeData { kind: i32, start: usize, end: usize, op: i32, a: i32, b: i32, 
 //           `start`/`end` = the whole statement span.
 //   Return: `a`=value `ExprId` (-1 if bare). `start`/`end` = the statement span.
 //   Expr:   `a`=the expression `ExprId`. (No own span — the dump uses the expr's.)
-struct StmtData { kind: i32, start: usize, end: usize, op: i32, a: i32, x: i32, y: i32, ty: i32 }
+pub struct StmtData { pub kind: i32, pub start: usize, pub end: usize, pub op: i32, pub a: i32, pub x: i32, pub y: i32, pub ty: i32 }
 
 // One pattern arena node (`PatId` = index into `pt`). `kind`: 0=Wildcard 1=Ident 2=Variant
 // 3=StructVariant 4=Lit 5=Range 6=Or 7=Rest 8=Error.
@@ -108,7 +108,7 @@ struct PatData { kind: i32, start: usize, end: usize, op: i32, a: i32, b: i32, x
 // `(u,v)` = an optional leading-attribute slice `(attr_start, attr_count)` of 4-tuples in
 // `aar` (Fn/Const/Struct only; -1 elsewhere). `(g,h)` = an optional generic-parameter slice
 // `(gen_start, gen_count)` of 4-tuples in `gar` (Fn/Impl only; -1 elsewhere).
-struct ItemData { kind: i32, start: usize, end: usize, is_pub: i32, op: i32, a: i32, b: i32, x: i32, y: i32, z: i32, w: i32, u: i32, v: i32, g: i32, h: i32, e: i32 }
+pub struct ItemData { pub kind: i32, pub start: usize, pub end: usize, pub is_pub: i32, pub op: i32, pub a: i32, pub b: i32, pub x: i32, pub y: i32, pub z: i32, pub w: i32, pub u: i32, pub v: i32, pub g: i32, pub h: i32, pub e: i32 }
 
 // `st` is the statement arena; `sar` the statement-id child arena a Block slices. `pt` is
 // the pattern arena; `par` a shared i32 child arena for pattern children (variant subpats,
@@ -124,7 +124,7 @@ struct ItemData { kind: i32, start: usize, end: usize, is_pub: i32, op: i32, a: 
 // (an ident whose text is "par"): the escape checker forbids storing the borrowed `src` in the
 // struct, so the driver — which *has* `src` — precomputes this one text test (the only contextual
 // keyword that isn't positionally unambiguous, since `<expr-ending-in-ident> for` also occurs).
-pub struct Parser { toks: List(tokens.Token), parw: List(bool), pub ex: List(ExprData), ar: List(i32), st: List(StmtData), sar: List(i32), pt: List(PatData), par: List(i32), ty: List(TypeData), tar: List(i32), pub it: List(ItemData), iar: List(i32), mar: List(i32), ear: List(i32), aar: List(i32), gar: List(i32), far: List(i32), lar: List(i32), clar: List(i32), pub roots: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool, no_struct: bool }
+pub struct Parser { toks: List(tokens.Token), parw: List(bool), pub ex: List(ExprData), pub ar: List(i32), pub st: List(StmtData), pub sar: List(i32), pt: List(PatData), pub par: List(i32), ty: List(TypeData), tar: List(i32), pub it: List(ItemData), iar: List(i32), pub mar: List(i32), ear: List(i32), aar: List(i32), gar: List(i32), far: List(i32), pub lar: List(i32), clar: List(i32), pub roots: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool, no_struct: bool }
 
 // The result of parsing a `{ field, …, ..spread }` initializer body: the field-init nodes'
 // slice into the arg arena, the optional spread expr (-1 if none), and the `}` end offset.

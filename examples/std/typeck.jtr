@@ -1,15 +1,24 @@
 // examples/std/typeck.jtr — the P3 type-checker, written *in Jestyr*. It imports the P2 parser
 // (`parser.jtr`, a pure library) to build the AST arena, then resolves a `Ty` for each
-// expression, mirroring the Rust reference (`src/typeck.rs`, `src/types.rs`). Verification is a
-// **resolved-type dump**: for each expression whose kind this pass types (`typed_kind`), emit its
-// canonical `Ty` string (matching `Ty::display`), in ExprId order. The Rust reference emits the
-// identical stream via `check(&ast)` + `Ty::display`; `jestyr_typeck_dump_matches_reference`
-// (proptests.rs, `--features c-oracle`) diffs them over the whole corpus. Grown construct by
-// construct like the parser: each increment adds expr kinds to `typed_kind` + the typing logic,
-// and the golden auto-covers them corpus-wide.
+// *body-reachable* expression, mirroring the Rust reference (`src/typeck.rs`, `src/types.rs`).
+//
+// **Reachability.** The reference populates `expr_types[id]` only for expressions its `infer`
+// visits — i.e. those reachable from a function/const/struct-method **body** via expression-child
+// edges. It never visits *const-eval* positions (array sizes `[N]T`, enum discriminants, attribute
+// args, bit-field widths — all in the type / item arenas), match-pattern literals, struct-field
+// defaults, or impl/trait method bodies (`check_items` skips those). So this pass performs the
+// same body walk: `mark` follows only expression children, starting from the same roots
+// `check_items` uses, and records which exprs are "reached". A literal that is reached gets its
+// concrete type; one that is not (a const-position / pattern / impl-body literal) stays `Unknown`
+// (`?`) — exactly like the reference.
+//
+// **Verification.** A resolved-type dump: for each expression whose kind this pass types
+// (`typed_kind`), emit its canonical `Ty` string (matching `Ty::display`), in ExprId order.
+// `jestyr_typeck_dump_matches_reference` (proptests.rs, `--features c-oracle`) diffs it against
+// `typeck::check` + `Ty::display` over the whole corpus. Grown construct by construct.
 //
 // **Current coverage:** the literal leaves — Int (`i32`), Float (`f64`), Str (`str`), Char
-// (`char`), Bool (`bool`), Null (`*?`). Everything else is not yet typed (skipped by both dumps).
+// (`char`), Bool (`bool`), Null (`*?`) — typed at their reached/unreached sites.
 import "mem"
 import "intern"
 import "fs"
@@ -18,9 +27,13 @@ import "list"
 import "tokens"
 import "parser"
 
-// Does this pass resolve a type for expression kind `k` yet? (The kind integers are the
-// `ExprData` tags defined in `parser.jtr`.) Grows one increment at a time; both this and the
-// reference's `typed_kind_ref` must agree so the golden compares the same expression subset.
+// The type-checker state: the parsed AST (borrowed via `p`) plus a per-ExprId "reached" flag
+// marking the expressions the body walk visits (⇔ the reference's `infer` visits ⇔ `expr_types`
+// is populated). `mut` so `mark` can set flags.
+struct Checker { reached: List(bool) }
+
+// Does this pass resolve a type for expression kind `k` yet? (Kind integers are the `ExprData`
+// tags in `parser.jtr`.) Must agree with `typeck_dump_kind` in proptests.rs. Grows per increment.
 fn typed_kind(k: i32) -> bool {
     if k == 0 { return true }    // Int   -> i32
     if k == 1 { return true }    // Float -> f64
@@ -31,27 +44,187 @@ fn typed_kind(k: i32) -> bool {
     return false
 }
 
-// Emit the canonical `Ty` string for expression `id` (one line), matching `Ty::display`.
-fn print_ty(read p: parser.Parser, id: i32) {
-    let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
-    if d.kind == 0 { print_str("i32") }
-    else if d.kind == 1 { print_str("f64") }
-    else if d.kind == 26 { print_str("char") }
-    else if d.kind == 27 { print_str("bool") }
-    else if d.kind == 29 { print_str("str") }
-    else if d.kind == 30 { print_str("*?") }   // Ptr{Default, Unknown}
-    else { print_str("?") }                     // Unknown (not yet typed)
+// ---- the body-reachability walk (mirrors `infer`'s expression traversal) ----
+
+// Walk an optional child expr id (a `-1` slot is absent).
+fn mark_opt(mut c: Checker, read p: parser.Parser, id: i32) {
+    if id >= 0 { mark(c, p, id) }
 }
 
-// Walk the expression arena in ExprId order, emitting a canonical type line for every expr this
-// pass types. ExprId order matches the reference (both parsers create leaf/inner nodes in the
-// same recursive-descent order), so the emitted subsequence aligns atom-for-atom.
-fn dump_types(read p: parser.Parser) {
+// Mark expression `id` reached, then recurse into its expression children (only — never into
+// type annotations, patterns, discriminants, attribute args, or bit-field widths). The child
+// edges mirror the parser's `dump` and the reference's `infer`.
+fn mark(mut c: Checker, read p: parser.Parser, id: i32) {
+    if id < 0 { return }
+    list.set(bool, c.reached, id as usize, true)
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
+    let k: i32 = d.kind
+    if k == 3 or k == 5 or k == 7 or k == 8 or k == 34 or k == 35 or k == 39 or k == 40 or k == 37 {
+        mark(c, p, d.a)                              // unary/field/deref/try/invariant/variant/spawn/await/closure-body
+    } else if k == 4 or k == 6 or k == 12 {
+        mark(c, p, d.a)  mark(c, p, d.b)             // binary / index / assign
+    } else if k == 13 {
+        mark_opt(c, p, d.a)  mark_opt(c, p, d.b)     // range (optional bounds)
+    } else if k == 11 {
+        mark(c, p, d.a)                              // cast (x is a TypeId — skip)
+    } else if k == 10 {
+        mark(c, p, d.a)                              // call: callee, then args
+        mark_slice(c, p, d.x, d.y)
+    } else if k == 14 {
+        mark_slice(c, p, d.x, d.y)                   // array literal elements
+    } else if k == 15 {
+        mark(c, p, d.a)                              // array repeat: value only (count is const-eval'd, not inferred)
+    } else if k == 16 {
+        mark(c, p, d.a)  mark_opt(c, p, d.b)  mark_slice(c, p, d.x, d.y)   // structlit: path, spread, fields
+    } else if k == 17 {
+        mark(c, p, d.a)  mark_slice(c, p, d.b, d.y)  // genstructlit: ctor, then field inits (type-args are types)
+    } else if k == 18 {
+        mark(c, p, d.a)                              // fieldinit value
+    } else if k == 23 {
+        mark_block(c, p, id)                         // block: this node carries the stmt slice
+    } else if k == 25 or k == 38 or k == 43 {
+        mark(c, p, d.a)                              // unsafe / concurrent / region: body block is in `a`
+    } else if k == 24 {
+        mark(c, p, d.a)  mark(c, p, d.b)  mark_opt(c, p, d.op)   // if: cond, then-block, else
+    } else if k == 28 {
+        mark(c, p, d.a)                              // match: scrutinee, then each arm's guard+body
+        var i: i32 = 0
+        for i < d.y {
+            let base: i32 = d.x + i * 3
+            mark_opt(c, p, list.get(i32, p.par, (base + 1) as usize))   // guard
+            mark(c, p, list.get(i32, p.par, (base + 2) as usize))       // body (pat at +0 is a PatId — skip)
+            i = i + 1
+        }
+    } else if k == 31 {
+        mark_for(c, p, id)                           // for loop (head exprs + body + else)
+    } else if k == 36 {
+        mark_methods(c, p, d.x, d.y)                 // struct-value: infer each method body (not defaults)
+    } else if k == 41 {
+        mark(c, p, d.a)  mark(c, p, d.b)  mark(c, p, d.op)   // par-for: iter, reduction, body
+    } else if k == 42 {
+        var i: i32 = 0                               // select: each arm's channel + body
+        for i < d.y {
+            let base: i32 = d.x + i * 4
+            mark(c, p, list.get(i32, p.par, base as usize))            // channel
+            mark(c, p, list.get(i32, p.par, (base + 3) as usize))      // body block
+            i = i + 1
+        }
+    }
+    // else: a leaf (Int/Float/Name/…/StructType) — nothing more to reach.
+}
+
+// Mark a contiguous slice of child ExprIds in `ar`.
+fn mark_slice(mut c: Checker, read p: parser.Parser, start: i32, count: i32) {
+    var i: i32 = 0
+    for i < count {
+        mark(c, p, list.get(i32, p.ar, (start + i) as usize))
+        i = i + 1
+    }
+}
+
+// Mark the statements of a Block expr (kind 23/25/38 all carry a `(x,y)` stmt slice into `sar`).
+fn mark_block(mut c: Checker, read p: parser.Parser, id: i32) {
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
+    list.set(bool, c.reached, id as usize, true)
+    var i: i32 = 0
+    for i < d.y {
+        let sid: i32 = list.get(i32, p.sar, (d.x + i) as usize)
+        mark_stmt(c, p, sid)
+        i = i + 1
+    }
+}
+
+// Mark a statement's expression children: a `let`/`var` initializer, a `return` value, or an
+// expression statement — never the `let`'s type annotation (`ty`), which lives in the type arena.
+fn mark_stmt(mut c: Checker, read p: parser.Parser, sid: i32) {
+    let s: parser.StmtData = list.get(parser.StmtData, p.st, sid as usize)
+    mark_opt(c, p, s.a)                              // Let init / Return value / Expr — all in `a`
+}
+
+// Mark a `for` loop's reachable exprs: the head (while-condition or iterate sources+step), the
+// body block, and the optional `else` block. Header layout (see `mk_for` in parser.jtr): the node
+// `op`=head kind (0 infinite / 1 while / 2 iterate), `a`=base into `lar`, `b`=body, `x`=else.
+fn mark_for(mut c: Checker, read p: parser.Parser, id: i32) {
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
+    let base: i32 = d.a
+    if d.op == 1 {
+        mark(c, p, list.get(i32, p.lar, (base + 4) as usize))          // while condition
+    } else if d.op == 2 {
+        let bc: i32 = list.get(i32, p.lar, (base + 4) as usize)        // bind count
+        let sc: i32 = list.get(i32, p.lar, (base + 5) as usize)        // source count
+        var i: i32 = 0
+        for i < sc {
+            mark(c, p, list.get(i32, p.lar, (base + 7 + bc * 3 + i) as usize))   // each source
+            i = i + 1
+        }
+        // NB: the range `step` expr is NOT inferred by the reference (`ForHead::Iter { .. }`
+        // ignores it), so it stays Unknown — do not mark it.
+    }
+    mark(c, p, d.b)                                  // body block
+    mark_opt(c, p, d.x)                              // optional else block
+}
+
+// Mark the bodies of a struct/struct-value's methods (member 10-tuples in `mar`; a tag-1 tuple
+// holds the method fn's `ItemId` at +1, whose `w` slot is its body block). Shared by the struct
+// *item* walk and the `struct { … }` *value* expr (both infer method bodies, not field defaults).
+fn mark_methods(mut c: Checker, read p: parser.Parser, mem_start: i32, mem_count: i32) {
+    var i: i32 = 0
+    for i < mem_count {
+        let mbase: i32 = mem_start + i * 10
+        if list.get(i32, p.mar, mbase as usize) == 1 {         // tag 1 = method
+            let fid: i32 = list.get(i32, p.mar, (mbase + 1) as usize)
+            let f: parser.ItemData = list.get(parser.ItemData, p.it, fid as usize)
+            mark_opt(c, p, f.w)                      // the method fn's body block
+        }
+        i = i + 1
+    }
+}
+
+// Walk the top-level items exactly as `check_items` does: infer function bodies, const values,
+// and struct-method bodies; skip enum/distinct/extern/import and (crucially) impl/trait bodies.
+// (Methods on a *generic* struct returned by a comptime `fn … -> type { return struct { … } }`
+// are reached instead through that fn body's `StructType` value — see `mark`, kind 36.)
+fn walk_items(mut c: Checker, read p: parser.Parser) {
+    var r: usize = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 3 {                            // Fn -> body block `w`
+            mark_opt(c, p, it.w)
+        } else if it.kind == 2 {                     // Const -> value `b`
+            mark_opt(c, p, it.b)
+        } else if it.kind == 4 {                     // Struct -> each method's body
+            mark_methods(c, p, it.a, it.b)
+        }
+        r = r + 1
+    }
+}
+
+// ---- the resolved-type dump ----
+
+// Emit the canonical `Ty` string (one line) for a reached literal expr `d`, matching
+// `Ty::display`. Called only for `typed_kind` exprs that were reached; unreached ones print `?`.
+fn print_lit_ty(kind: i32) {
+    if kind == 0 { print_str("i32") }
+    else if kind == 1 { print_str("f64") }
+    else if kind == 26 { print_str("char") }
+    else if kind == 27 { print_str("bool") }
+    else if kind == 29 { print_str("str") }
+    else if kind == 30 { print_str("*?") }          // Ptr{Default, Unknown}
+    else { print_str("?") }
+}
+
+// Walk the expression arena in ExprId order, emitting a type line for every expr this pass types:
+// its concrete type if the body walk reached it, else `?` (Unknown) — matching the reference.
+fn dump_types(read c: Checker, read p: parser.Parser) {
     let n: usize = list.len(parser.ExprData, p.ex)
     var i: usize = 0
     for i < n {
         let d: parser.ExprData = list.get(parser.ExprData, p.ex, i)
-        if typed_kind(d.kind) { print_ty(p, i as i32) }
+        if typed_kind(d.kind) {
+            if list.get(bool, c.reached, i) { print_lit_ty(d.kind) }
+            else { print_str("?") }
+        }
         i = i + 1
     }
 }
@@ -63,7 +236,13 @@ fn main() -> i32 {
     if env.argc() > 1 {
         var src: String = fs.read_text(env.argv(1))
         var p: parser.Parser = parser.parse_source(string_view(src), it, kwcount, a)
-        dump_types(p)
+        let n: usize = list.len(parser.ExprData, p.ex)
+        var reached: List(bool) = list.make(bool, a)
+        var j: usize = 0
+        for j < n { list.push(bool, reached, false)  j = j + 1 }
+        var c: Checker = Checker{ reached: reached }
+        walk_items(c, p)
+        dump_types(c, p)
         string_free(src)
     }
     return 0
