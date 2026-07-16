@@ -52,6 +52,12 @@ pub fn set(comptime T: type, mut l: List(T), i: usize, x: T) {
     unsafe { (l.ptr + i).* = x }
 }
 
+// Shrink the list to `n` elements (a no-op if already `<= n`). The buffer is kept; dropped
+// elements are simply forgotten — callers use this for stack-like scope pops of plain data.
+pub fn truncate(comptime T: type, mut l: List(T), n: usize) {
+    if n < l.len { l.len = n }
+}
+
 pub fn len(comptime T: type, l: List(T)) -> usize {
     return l.len
 }
