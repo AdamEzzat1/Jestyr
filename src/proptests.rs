@@ -7426,6 +7426,7 @@ mod c_oracle {
                 | ExprKind::Char(_)
                 | ExprKind::Bool(_)
                 | ExprKind::Null
+                | ExprKind::Cast { .. }
                 | ExprKind::Unary { op: UnOp::Not, .. }
                 | ExprKind::Binary {
                     op: BinOp::Eq

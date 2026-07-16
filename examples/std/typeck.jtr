@@ -1,24 +1,39 @@
-// examples/std/typeck.jtr — the P3 type-checker, written *in Jestyr*. It imports the P2 parser
+// examples/std/typeck.jtr - the P3 type-checker, written *in Jestyr*. It imports the P2 parser
 // (`parser.jtr`, a pure library) to build the AST arena, then resolves a `Ty` for each
 // *body-reachable* expression, mirroring the Rust reference (`src/typeck.rs`, `src/types.rs`).
 //
-// **Reachability.** The reference populates `expr_types[id]` only for expressions its `infer`
-// visits — i.e. those reachable from a function/const/struct-method **body** via expression-child
-// edges. It never visits *const-eval* positions (array sizes `[N]T`, enum discriminants, attribute
-// args, bit-field widths — all in the type / item arenas), match-pattern literals, struct-field
-// defaults, or impl/trait method bodies (`check_items` skips those). So this pass performs the
-// same body walk: `mark` follows only expression children, starting from the same roots
-// `check_items` uses, and records which exprs are "reached". A literal that is reached gets its
-// concrete type; one that is not (a const-position / pattern / impl-body literal) stays `Unknown`
-// (`?`) — exactly like the reference.
+// **The `Ty` representation.** Mirrors the reference's `Ty` enum as an arena (`List(TyData)` +
+// integer `TyId`s - the same dodge the parser uses for the AST): recursive forms hold child
+// `TyId`s, variable-arity forms (generic args, fn params) hold `(start, count)` slices into the
+// `tya` child arena (buffered-then-appended, the parser's discipline). `TyData.kind`:
+//   0=Unknown 1=Unit 2=Prim(x=prim code) 3=Ptr(a=inner, b=mutbl 0/1/2) 4=Opaque(x,y=name span)
+//   5=Result(a=ok) 6=GenStruct/App(x,y=ctor span; a=arg_start, b=arg_count in `tya`)
+//   8=Slice(a) 9=Array(a=elem, b=len) 10=GenRef(a) 11=RegionRef(a)
+//   12=Fn(a=pair_start, b=pair_count of (conv, TyId) in `tya`; x=ret TyId; y=ret_conv)
+//   13=Task(a) 14=TypeKw 15=Named(later) 16=Error 17=DynOpaque(x,y=trait span, "dyn <name>")
+// Well-known instances are created once at init so their ids are constants: 0=Unknown 1=Unit
+// 2=i32 3=f64 4=bool 5=char 6=str 7=*? (null's Ptr{Default, Unknown}).
+// `ty_str` renders a `TyId` exactly like the reference's `Ty::display` - the golden's
+// canonical form. (For display, `Named(i)` and `Opaque(name)` are indistinguishable - both print
+// the bare name - so unresolved named types stay `Opaque` until the global table lands.)
 //
-// **Verification.** A resolved-type dump: for each expression whose kind this pass types
-// (`typed_kind`), emit its canonical `Ty` string (matching `Ty::display`), in ExprId order.
-// `jestyr_typeck_dump_matches_reference` (proptests.rs, `--features c-oracle`) diffs it against
+// **Reachability.** The reference populates `expr_types[id]` only for expressions its `infer`
+// visits - those reachable from a function/const/struct-method **body** via expression-child
+// edges. It never visits *const-eval* positions (array sizes `[N]T`, enum discriminants,
+// attribute args, bit-field widths), match-pattern literals, struct-field defaults, loop `step`,
+// array-repeat `count`, or impl/trait method bodies. `infer` here walks exactly those edges;
+// `et[id]` starts as Unknown and is overwritten iff visited - so an unreached expr dumps `?`
+// exactly like the reference.
+//
+// **Verification.** A resolved-type dump: for each expression in the compared subset
+// (`is_typed`, mirrored by `typeck_dump_kind` in proptests.rs), emit `ty_str(et[id])` in
+// ExprId order. `jestyr_typeck_dump_matches_reference` (`--features c-oracle`) diffs it against
 // `typeck::check` + `Ty::display` over the whole corpus. Grown construct by construct.
 //
-// **Current coverage:** the literal leaves — Int (`i32`), Float (`f64`), Str (`str`), Char
-// (`char`), Bool (`bool`), Null (`*?`) — typed at their reached/unreached sites.
+// **Current coverage:** literal leaves (Int/Float/Str/Char/Bool/Null), boolean operators
+// (`not`, comparisons, `and`/`or`), and **casts** - `x as T` types from its annotation via
+// `lower_type` (structural: prims, pointers, slices, arrays, refs, generic apps, fn pointers,
+// dyn, paths), independent of operand resolution.
 import "mem"
 import "intern"
 import "fs"
@@ -27,155 +42,497 @@ import "list"
 import "tokens"
 import "parser"
 
-// The type-checker state: the parsed AST (borrowed via `p`) plus a per-ExprId "reached" flag
-// marking the expressions the body walk visits (⇔ the reference's `infer` visits ⇔ `expr_types`
-// is populated). `mut` so `mark` can set flags.
-struct Checker { reached: List(bool) }
+// The type-checker state: the `Ty` arena (`tys` + child slices `tya`), the per-ExprId
+// resolved-type table `et` (TyId; initialized to Unknown = id 0, overwritten iff `infer`
+// visits), and the allocator its temp lists are built from.
+struct Checker { tys: List(TyData), tya: List(i32), et: List(i32), alloc: Allocator }
 
-// Does this pass resolve a type for expression `d` yet? Keyed on `(kind, op)` — Unary/Binary
-// share a kind, so the operator selects. Must agree with `typeck_dump_kind` in proptests.rs.
-// Grows per increment.
-fn is_typed(read d: parser.ExprData) -> bool {
-    let k: i32 = d.kind
-    if k == 0 or k == 1 or k == 26 or k == 27 or k == 29 or k == 30 { return true }   // literals
-    if k == 3 { if d.op == 2 { return true } }   // Unary `not` -> bool
-    if k == 4 {                                  // Binary comparison/logical -> bool (op 6..13)
-        if d.op >= 6 { if d.op <= 13 { return true } }
+// One `Ty` arena node - kinds in the header comment. `a`/`b` are child TyIds or slice fields;
+// `x`/`y` are aux ints (prim code, name span, ret TyId/conv).
+struct TyData { kind: i32, a: i32, b: i32, x: i32, y: i32 }
+
+// ---- well-known TyIds (creation order in `make_checker` pins these) ----
+fn t_unknown() -> i32 { return 0 }
+fn t_unit() -> i32 { return 1 }
+fn t_i32() -> i32 { return 2 }
+fn t_f64() -> i32 { return 3 }
+fn t_bool() -> i32 { return 4 }
+fn t_char() -> i32 { return 5 }
+fn t_str() -> i32 { return 6 }
+fn t_nullptr() -> i32 { return 7 }
+
+// Append a `Ty` node, returning its id.
+fn mk_ty(mut c: Checker, kind: i32, a: i32, b: i32, x: i32, y: i32) -> i32 {
+    let id: i32 = list.len(TyData, c.tys) as i32
+    list.push(TyData, c.tys, TyData{ kind: kind, a: a, b: b, x: x, y: y })
+    return id
+}
+
+// The checker with the well-known instances pre-created (ids 0..7) and `et` sized to the
+// expression arena, all-Unknown.
+fn make_checker(read p: parser.Parser, read a: Allocator) -> Checker {
+    var c: Checker = Checker{ tys: list.make(TyData, a), tya: list.make(i32, a), et: list.make(i32, a), alloc: a }
+    mk_ty(c, 0, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 0 Unknown
+    mk_ty(c, 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 1 Unit
+    mk_ty(c, 2, 0 - 1, 0 - 1, 2, 0 - 1)            // 2 Prim i32   (code 2)
+    mk_ty(c, 2, 0 - 1, 0 - 1, 11, 0 - 1)           // 3 Prim f64   (code 11)
+    mk_ty(c, 2, 0 - 1, 0 - 1, 12, 0 - 1)           // 4 Prim bool  (code 12)
+    mk_ty(c, 2, 0 - 1, 0 - 1, 13, 0 - 1)           // 5 Prim char  (code 13)
+    mk_ty(c, 2, 0 - 1, 0 - 1, 14, 0 - 1)           // 6 Prim str   (code 14)
+    mk_ty(c, 3, 0, 0, 0 - 1, 0 - 1)                // 7 Ptr{Default, Unknown} - null's `*?`
+    let n: usize = list.len(parser.ExprData, p.ex)
+    var j: usize = 0
+    for j < n { list.push(i32, c.et, 0)  j = j + 1 }
+    return c
+}
+
+// ---- primitives (mirror `prim_ty` / `is_numeric` in src/types.rs) ----
+// Codes: 0 i8, 1 i16, 2 i32, 3 i64, 4 isize, 5 u8, 6 u16, 7 u32, 8 u64, 9 usize, 10 f32,
+// 11 f64, 12 bool, 13 char, 14 str, 15 cstr, 16 os_str, 17 String, 18 Builder, 19 Cow.
+// `is_numeric` <=> code <= 11.
+
+// The prim code for name text `t`, or -1 if it is not a primitive name.
+fn prim_code(t: str) -> i32 {
+    if str_eq(t, "i8") { return 0 }
+    if str_eq(t, "i16") { return 1 }
+    if str_eq(t, "i32") { return 2 }
+    if str_eq(t, "i64") { return 3 }
+    if str_eq(t, "isize") { return 4 }
+    if str_eq(t, "u8") { return 5 }
+    if str_eq(t, "u16") { return 6 }
+    if str_eq(t, "u32") { return 7 }
+    if str_eq(t, "u64") { return 8 }
+    if str_eq(t, "usize") { return 9 }
+    if str_eq(t, "f32") { return 10 }
+    if str_eq(t, "f64") { return 11 }
+    if str_eq(t, "bool") { return 12 }
+    if str_eq(t, "char") { return 13 }
+    if str_eq(t, "str") { return 14 }
+    if str_eq(t, "cstr") { return 15 }
+    if str_eq(t, "os_str") { return 16 }
+    if str_eq(t, "String") { return 17 }
+    if str_eq(t, "Builder") { return 18 }
+    if str_eq(t, "Cow") { return 19 }
+    return 0 - 1
+}
+
+// The canonical spelling for prim code `pc` (= its source spelling; `prim_ty` is identity).
+fn prim_name(pc: i32) -> str {
+    if pc == 0 { return "i8" }
+    if pc == 1 { return "i16" }
+    if pc == 2 { return "i32" }
+    if pc == 3 { return "i64" }
+    if pc == 4 { return "isize" }
+    if pc == 5 { return "u8" }
+    if pc == 6 { return "u16" }
+    if pc == 7 { return "u32" }
+    if pc == 8 { return "u64" }
+    if pc == 9 { return "usize" }
+    if pc == 10 { return "f32" }
+    if pc == 11 { return "f64" }
+    if pc == 12 { return "bool" }
+    if pc == 13 { return "char" }
+    if pc == 14 { return "str" }
+    if pc == 15 { return "cstr" }
+    if pc == 16 { return "os_str" }
+    if pc == 17 { return "String" }
+    if pc == 18 { return "Builder" }
+    return "Cow"                                   // 19
+}
+
+// A parameter-passing convention's display label (mirrors `Conv::label`).
+// Codes: 0 Default (empty), 1 read, 2 mut, 3 take, 4 out.
+fn conv_label(code: i32) -> str {
+    if code == 1 { return "read" }
+    if code == 2 { return "mut" }
+    if code == 3 { return "take" }
+    if code == 4 { return "out" }
+    return ""                                      // 0 Default
+}
+
+// ---- `lower_type`: parser `TypeData` -> `Ty` (mirrors `TypeChecker::lower_type`) ----
+
+// Evaluate a `[N]T` array length to a constant: an integer literal (decimal / `0x` / `0b`,
+// `_` ignored); anything else resolves to 0 - mirroring `eval_array_len` (a const-name
+// fallback lands with the global table).
+fn eval_array_len(read p: parser.Parser, read src: str, eid: i32) -> i32 {
+    if eid < 0 { return 0 }
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
+    if e.kind != 0 { return 0 }                    // not an Int literal
+    var i: usize = e.start
+    var base: i64 = 10
+    if e.end - e.start > 2 {
+        if (src[i] as i32) == 48 {                 // '0'
+            let d: i32 = src[i + 1] as i32
+            if d == 120 { base = 16  i = i + 2 }   // 'x'
+            else if d == 98 { base = 2  i = i + 2 } // 'b'
+        }
     }
-    return false
+    var v: i64 = 0
+    for i < e.end {
+        let ch: i32 = src[i] as i32
+        if ch == 95 { i = i + 1 }                  // '_' separator
+        else {
+            var d: i64 = 0 - 1
+            if ch >= 48 { if ch <= 57 { d = (ch - 48) as i64 } }        // '0'..'9'
+            if ch >= 97 { if ch <= 102 { d = (ch - 87) as i64 } }       // 'a'..'f'
+            if ch >= 65 { if ch <= 70 { d = (ch - 55) as i64 } }        // 'A'..'F'
+            if d < 0 { return 0 }                  // malformed: mirror unwrap_or(0)
+            v = v * base + d
+            i = i + 1
+        }
+    }
+    return v as i32
 }
 
-// ---- the body-reachability walk (mirrors `infer`'s expression traversal) ----
-
-// Walk an optional child expr id (a `-1` slot is absent).
-fn mark_opt(mut c: Checker, read p: parser.Parser, id: i32) {
-    if id >= 0 { mark(c, p, id) }
+// Lower a parser type node to a `Ty`, structurally. Name -> prim or Opaque (a user/unknown/
+// generic-param name - display-identical to Named until the global table lands). App/Path with
+// args -> GenStruct (GenEnum is display-identical; split when `is_generic_enum` lands). Child
+// lists buffer in a temp then append to `tya` so nested lowers don't scatter the slice.
+fn lower_type(mut c: Checker, read p: parser.Parser, read src: str, tid: i32) -> i32 {
+    if tid < 0 { return t_unknown() }
+    let d: parser.TypeData = list.get(parser.TypeData, p.ty, tid as usize)
+    let k: i32 = d.kind
+    if k == 0 {                                    // Name
+        let pc: i32 = prim_code(src[d.start .. d.end])
+        if pc >= 0 { return mk_ty(c, 2, 0 - 1, 0 - 1, pc, 0 - 1) }
+        return mk_ty(c, 4, 0 - 1, 0 - 1, d.start as i32, d.end as i32)   // Opaque
+    }
+    if k == 1 { return mk_ty(c, 14, 0 - 1, 0 - 1, 0 - 1, 0 - 1) }        // TypeKw
+    if k == 2 {                                    // Ptr: op=mutbl, a=inner
+        let inner: i32 = lower_type(c, p, src, d.a)
+        return mk_ty(c, 3, inner, d.op, 0 - 1, 0 - 1)
+    }
+    if k == 3 {                                    // Slice
+        let inner: i32 = lower_type(c, p, src, d.a)
+        return mk_ty(c, 8, inner, 0 - 1, 0 - 1, 0 - 1)
+    }
+    if k == 4 {                                    // Array: a=elem, b=len ExprId
+        let elem: i32 = lower_type(c, p, src, d.a)
+        let len: i32 = eval_array_len(p, src, d.b)
+        return mk_ty(c, 9, elem, len, 0 - 1, 0 - 1)
+    }
+    if k == 5 {                                    // GenRef
+        let inner: i32 = lower_type(c, p, src, d.a)
+        return mk_ty(c, 10, inner, 0 - 1, 0 - 1, 0 - 1)
+    }
+    if k == 6 {                                    // RegionRef (region tag not part of the Ty)
+        let inner: i32 = lower_type(c, p, src, d.a)
+        return mk_ty(c, 11, inner, 0 - 1, 0 - 1, 0 - 1)
+    }
+    if k == 7 {                                    // App `Ctor(args)`: (x,y)=ctor span, op/a=args
+        var tmp: List(i32) = list.make(i32, c.alloc)
+        var i: i32 = 0
+        for i < d.a {
+            let arg: i32 = list.get(i32, p.tar, (d.op + i) as usize)
+            list.push(i32, tmp, lower_type(c, p, src, arg))
+            i = i + 1
+        }
+        let start: i32 = append_tya(c, tmp)
+        return mk_ty(c, 6, start, d.a, d.x, d.y)
+    }
+    if k == 8 {                                    // Path `mod.Type(args)`: (z,w)=name span
+        if d.a == 0 {                              // no args: prim or Opaque on the type name
+            let pc: i32 = prim_code(src[d.z as usize .. d.w as usize])
+            if pc >= 0 { return mk_ty(c, 2, 0 - 1, 0 - 1, pc, 0 - 1) }
+            return mk_ty(c, 4, 0 - 1, 0 - 1, d.z, d.w)
+        }
+        var tmp: List(i32) = list.make(i32, c.alloc)
+        var i: i32 = 0
+        for i < d.a {
+            let arg: i32 = list.get(i32, p.tar, (d.op + i) as usize)
+            list.push(i32, tmp, lower_type(c, p, src, arg))
+            i = i + 1
+        }
+        let start: i32 = append_tya(c, tmp)
+        return mk_ty(c, 6, start, d.a, d.z, d.w)   // GenStruct on the bare type name
+    }
+    if k == 9 {                                    // Fn: op/a=(conv,TyId) pairs, b=ret_conv, x=ret
+        var tmp: List(i32) = list.make(i32, c.alloc)
+        var i: i32 = 0
+        for i < d.a {
+            let base: i32 = d.op + i * 2
+            let conv: i32 = list.get(i32, p.tar, base as usize)
+            let pty: i32 = list.get(i32, p.tar, (base + 1) as usize)
+            list.push(i32, tmp, conv)
+            list.push(i32, tmp, lower_type(c, p, src, pty))
+            i = i + 1
+        }
+        let start: i32 = append_tya(c, tmp)
+        var ret: i32 = t_unit()
+        if d.x >= 0 { ret = lower_type(c, p, src, d.x) }
+        return mk_ty(c, 12, start, d.a, ret, d.b)
+    }
+    if k == 10 { return mk_ty(c, 17, 0 - 1, 0 - 1, d.x, d.y) }           // Dyn -> "dyn <name>"
+    return mk_ty(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1)                      // Error
 }
 
-// Mark expression `id` reached, then recurse into its expression children (only — never into
-// type annotations, patterns, discriminants, attribute args, or bit-field widths). The child
-// edges mirror the parser's `dump` and the reference's `infer`.
-fn mark(mut c: Checker, read p: parser.Parser, id: i32) {
-    if id < 0 { return }
-    list.set(bool, c.reached, id as usize, true)
+// Append a buffered child list to `tya` contiguously, returning the slice start.
+fn append_tya(mut c: Checker, read tmp: List(i32)) -> i32 {
+    let start: i32 = list.len(i32, c.tya) as i32
+    var j: usize = 0
+    for j < list.len(i32, tmp) { list.push(i32, c.tya, list.get(i32, tmp, j))  j = j + 1 }
+    return start
+}
+
+// ---- `ty_str`: render a TyId exactly like the reference's `Ty::display` ----
+
+// Append the decimal digits of `v` (an array length).
+fn push_uint(mut sb: String, v: i64) {
+    if v >= 10 { push_uint(sb, v / 10) }
+    let d: i64 = v % 10
+    if d == 0 { string_push(sb, "0") }
+    else if d == 1 { string_push(sb, "1") }
+    else if d == 2 { string_push(sb, "2") }
+    else if d == 3 { string_push(sb, "3") }
+    else if d == 4 { string_push(sb, "4") }
+    else if d == 5 { string_push(sb, "5") }
+    else if d == 6 { string_push(sb, "6") }
+    else if d == 7 { string_push(sb, "7") }
+    else if d == 8 { string_push(sb, "8") }
+    else { string_push(sb, "9") }
+}
+
+// Append the canonical display of TyId `id` to `sb` - field-for-field `Ty::display`.
+fn ty_str(read src: str, read c: Checker, id: i32, mut sb: String) {
+    let d: TyData = list.get(TyData, c.tys, id as usize)
+    let k: i32 = d.kind
+    if k == 0 { string_push(sb, "?") }
+    else if k == 1 { string_push(sb, "()") }
+    else if k == 2 { string_push(sb, prim_name(d.x)) }
+    else if k == 3 {                               // Ptr: "*" / "*mut " / "*const " + inner
+        if d.b == 1 { string_push(sb, "*mut ") }
+        else if d.b == 2 { string_push(sb, "*const ") }
+        else { string_push(sb, "*") }
+        ty_str(src, c, d.a, sb)
+    } else if k == 4 {                             // Opaque: the name text
+        string_push(sb, src[d.x as usize .. d.y as usize])
+    } else if k == 5 {                             // Result: "T!"
+        ty_str(src, c, d.a, sb)
+        string_push(sb, "!")
+    } else if k == 6 {                             // GenStruct/GenEnum: "Ctor(a, b)"
+        string_push(sb, src[d.x as usize .. d.y as usize])
+        string_push(sb, "(")
+        var i: i32 = 0
+        for i < d.b {
+            if i > 0 { string_push(sb, ", ") }
+            ty_str(src, c, list.get(i32, c.tya, (d.a + i) as usize), sb)
+            i = i + 1
+        }
+        string_push(sb, ")")
+    } else if k == 8 {                             // Slice: "[]T"
+        string_push(sb, "[]")
+        ty_str(src, c, d.a, sb)
+    } else if k == 9 {                             // Array: "[N]T"
+        string_push(sb, "[")
+        push_uint(sb, d.b as i64)
+        string_push(sb, "]")
+        ty_str(src, c, d.a, sb)
+    } else if k == 10 {                            // GenRef: "&T"
+        string_push(sb, "&")
+        ty_str(src, c, d.a, sb)
+    } else if k == 11 {                            // RegionRef: "&[r]T" (literal "[r]")
+        string_push(sb, "&[r]")
+        ty_str(src, c, d.a, sb)
+    } else if k == 12 {                            // Fn: "fn(conv T, ...) -> conv R"
+        string_push(sb, "fn(")
+        var i: i32 = 0
+        for i < d.b {
+            if i > 0 { string_push(sb, ", ") }
+            let base: i32 = d.a + i * 2
+            let conv: i32 = list.get(i32, c.tya, base as usize)
+            if conv != 0 { string_push(sb, conv_label(conv))  string_push(sb, " ") }
+            ty_str(src, c, list.get(i32, c.tya, (base + 1) as usize), sb)
+            i = i + 1
+        }
+        string_push(sb, ") -> ")
+        if d.y != 0 { string_push(sb, conv_label(d.y))  string_push(sb, " ") }
+        ty_str(src, c, d.x, sb)
+    } else if k == 13 {                            // Task: "Task(T)"
+        string_push(sb, "Task(")
+        ty_str(src, c, d.a, sb)
+        string_push(sb, ")")
+    } else if k == 14 { string_push(sb, "type") }
+    else if k == 17 {                              // DynOpaque: "dyn <name>"
+        string_push(sb, "dyn ")
+        string_push(sb, src[d.x as usize .. d.y as usize])
+    } else { string_push(sb, "<error>") }          // 16 Error (15 Named lands with the table)
+}
+
+// ---- `infer`: the body walk (mirrors the reference's `infer` traversal + result types) ----
+
+// Infer an optional child (a `-1` slot is absent). Returns Unknown for the absent case.
+fn infer_opt(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
+    if id >= 0 { return infer(c, p, src, id) }
+    return t_unknown()
+}
+
+// Resolve expression `id`: recurse into its expression children exactly as the reference's
+// `infer` does (never into type annotations, patterns, discriminants, attribute args, or
+// bit-field widths), compute this node's `Ty`, store it in `et`, and return it. Kinds whose
+// result this pass doesn't compute yet resolve to Unknown (visited-but-unknown - same as the
+// reference wherever its own inference gives up).
+fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
+    if id < 0 { return t_unknown() }
     let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
     let k: i32 = d.kind
-    if k == 3 or k == 5 or k == 7 or k == 8 or k == 34 or k == 35 or k == 39 or k == 40 or k == 37 {
-        mark(c, p, d.a)                              // unary/field/deref/try/invariant/variant/spawn/await/closure-body
-    } else if k == 4 or k == 6 or k == 12 {
-        mark(c, p, d.a)  mark(c, p, d.b)             // binary / index / assign
-    } else if k == 13 {
-        mark_opt(c, p, d.a)  mark_opt(c, p, d.b)     // range (optional bounds)
-    } else if k == 11 {
-        mark(c, p, d.a)                              // cast (x is a TypeId — skip)
-    } else if k == 10 {
-        mark(c, p, d.a)                              // call: callee, then args
-        mark_slice(c, p, d.x, d.y)
-    } else if k == 14 {
-        mark_slice(c, p, d.x, d.y)                   // array literal elements
-    } else if k == 15 {
-        mark(c, p, d.a)                              // array repeat: value only (count is const-eval'd, not inferred)
-    } else if k == 16 {
-        mark(c, p, d.a)  mark_opt(c, p, d.b)  mark_slice(c, p, d.x, d.y)   // structlit: path, spread, fields
-    } else if k == 17 {
-        mark(c, p, d.a)  mark_slice(c, p, d.b, d.y)  // genstructlit: ctor, then field inits (type-args are types)
-    } else if k == 18 {
-        mark(c, p, d.a)                              // fieldinit value
-    } else if k == 23 {
-        mark_block(c, p, id)                         // block: this node carries the stmt slice
-    } else if k == 25 or k == 38 or k == 43 {
-        mark(c, p, d.a)                              // unsafe / concurrent / region: body block is in `a`
-    } else if k == 24 {
-        mark(c, p, d.a)  mark(c, p, d.b)  mark_opt(c, p, d.op)   // if: cond, then-block, else
-    } else if k == 28 {
-        mark(c, p, d.a)                              // match: scrutinee, then each arm's guard+body
+    var r: i32 = t_unknown()
+    if k == 0 { r = t_i32() }                      // Int
+    else if k == 1 { r = t_f64() }                 // Float
+    else if k == 26 { r = t_char() }               // Char
+    else if k == 27 { r = t_bool() }               // Bool
+    else if k == 29 { r = t_str() }                // Str
+    else if k == 30 { r = t_nullptr() }            // Null -> Ptr{Default, Unknown}
+    else if k == 3 {                               // Unary: not -> bool; neg/bitnot -> rt; & -> ?
+        let rt: i32 = infer(c, p, src, d.a)
+        if d.op == 2 { r = t_bool() }
+        else if d.op == 1 or d.op == 3 { r = rt }
+        else { r = t_unknown() }                   // Ref
+    } else if k == 4 {                             // Binary: cmp/logical -> bool; else numeric side
+        let lt: i32 = infer(c, p, src, d.a)
+        let rt: i32 = infer(c, p, src, d.b)
+        if d.op >= 6 {
+            if d.op <= 13 { r = t_bool() }
+            else { r = pick_numeric(c, lt, rt) }
+        } else { r = pick_numeric(c, lt, rt) }
+    } else if k == 5 or k == 7 {                   // field / deref: operand only (result later)
+        infer(c, p, src, d.a)
+    } else if k == 8 {                             // try `e?`: Result(ok) -> ok, else Unknown
+        let bt: i32 = infer(c, p, src, d.a)
+        let bd: TyData = list.get(TyData, c.tys, bt as usize)
+        if bd.kind == 5 { r = bd.a }
+    } else if k == 6 or k == 12 {                  // index / assign: both children
+        infer(c, p, src, d.a)
+        infer(c, p, src, d.b)
+    } else if k == 13 {                            // range: optional bounds
+        infer_opt(c, p, src, d.a)
+        infer_opt(c, p, src, d.b)
+    } else if k == 11 {                            // cast: operand, then the target type
+        infer(c, p, src, d.a)
+        r = lower_type(c, p, src, d.x)
+    } else if k == 10 {                            // call: callee, then args
+        infer(c, p, src, d.a)
+        infer_slice(c, p, src, d.x, d.y)
+    } else if k == 14 {                            // array literal elements
+        infer_slice(c, p, src, d.x, d.y)
+    } else if k == 15 {                            // array repeat: value only (count is const-eval'd)
+        infer(c, p, src, d.a)
+    } else if k == 16 {                            // structlit: path, spread, fields
+        infer(c, p, src, d.a)
+        infer_opt(c, p, src, d.b)
+        infer_slice(c, p, src, d.x, d.y)
+    } else if k == 17 {                            // genstructlit: ctor + field inits (targs are types)
+        infer(c, p, src, d.a)
+        infer_slice(c, p, src, d.b, d.y)
+    } else if k == 18 {                            // fieldinit value
+        infer(c, p, src, d.a)
+    } else if k == 23 {                            // block: its statements
+        infer_block(c, p, src, id)
+    } else if k == 25 or k == 38 or k == 43 {      // unsafe / concurrent / region: body block in `a`
+        infer(c, p, src, d.a)
+    } else if k == 24 {                            // if: cond, then-block, else
+        infer(c, p, src, d.a)
+        infer(c, p, src, d.b)
+        infer_opt(c, p, src, d.op)
+    } else if k == 28 {                            // match: scrutinee, then each arm's guard+body
+        infer(c, p, src, d.a)
         var i: i32 = 0
         for i < d.y {
             let base: i32 = d.x + i * 3
-            mark_opt(c, p, list.get(i32, p.par, (base + 1) as usize))   // guard
-            mark(c, p, list.get(i32, p.par, (base + 2) as usize))       // body (pat at +0 is a PatId — skip)
+            infer_opt(c, p, src, list.get(i32, p.par, (base + 1) as usize))   // guard
+            infer(c, p, src, list.get(i32, p.par, (base + 2) as usize))       // body (pat skipped)
             i = i + 1
         }
-    } else if k == 31 {
-        mark_for(c, p, id)                           // for loop (head exprs + body + else)
-    } else if k == 36 {
-        mark_methods(c, p, d.x, d.y)                 // struct-value: infer each method body (not defaults)
-    } else if k == 41 {
-        mark(c, p, d.a)  mark(c, p, d.b)  mark(c, p, d.op)   // par-for: iter, reduction, body
-    } else if k == 42 {
-        var i: i32 = 0                               // select: each arm's channel + body
+    } else if k == 31 {                            // for loop: head exprs + body + else
+        infer_for(c, p, src, id)
+    } else if k == 34 or k == 35 or k == 39 or k == 40 or k == 37 {
+        infer(c, p, src, d.a)                      // invariant/variant/spawn/await/closure-body
+    } else if k == 36 {                            // struct-value: each method body (not defaults)
+        infer_methods(c, p, src, d.x, d.y)
+    } else if k == 41 {                            // par-for: iter, reduction, body
+        infer(c, p, src, d.a)
+        infer(c, p, src, d.b)
+        infer(c, p, src, d.op)
+    } else if k == 42 {                            // select: each arm's channel + body
+        var i: i32 = 0
         for i < d.y {
             let base: i32 = d.x + i * 4
-            mark(c, p, list.get(i32, p.par, base as usize))            // channel
-            mark(c, p, list.get(i32, p.par, (base + 3) as usize))      // body block
+            infer(c, p, src, list.get(i32, p.par, base as usize))
+            infer(c, p, src, list.get(i32, p.par, (base + 3) as usize))
             i = i + 1
         }
     }
-    // else: a leaf (Int/Float/Name/…/StructType) — nothing more to reach.
+    // else: a leaf with no children (Name/self/Self/attr/fstring/...) - Unknown for now.
+    list.set(i32, c.et, id as usize, r)
+    return r
 }
 
-// Mark a contiguous slice of child ExprIds in `ar`.
-fn mark_slice(mut c: Checker, read p: parser.Parser, start: i32, count: i32) {
+// The reference's non-comparison Binary fallback: the numeric side wins, else Unknown.
+fn pick_numeric(read c: Checker, lt: i32, rt: i32) -> i32 {
+    if ty_is_numeric(c, lt) { return lt }
+    if ty_is_numeric(c, rt) { return rt }
+    return t_unknown()
+}
+
+// Is `id` a numeric primitive (i*/u*/f*)? Mirrors `is_numeric` (prim codes 0..=11).
+fn ty_is_numeric(read c: Checker, id: i32) -> bool {
+    let d: TyData = list.get(TyData, c.tys, id as usize)
+    if d.kind != 2 { return false }
+    return d.x <= 11
+}
+
+// Infer a contiguous slice of child ExprIds in `ar`.
+fn infer_slice(mut c: Checker, read p: parser.Parser, read src: str, start: i32, count: i32) {
     var i: i32 = 0
     for i < count {
-        mark(c, p, list.get(i32, p.ar, (start + i) as usize))
+        infer(c, p, src, list.get(i32, p.ar, (start + i) as usize))
         i = i + 1
     }
 }
 
-// Mark the statements of a Block expr (kind 23/25/38 all carry a `(x,y)` stmt slice into `sar`).
-fn mark_block(mut c: Checker, read p: parser.Parser, id: i32) {
+// Infer the statements of a Block expr: a `let`/`var` initializer, a `return` value, or an
+// expression statement - never the `let`'s type annotation (in the type arena).
+fn infer_block(mut c: Checker, read p: parser.Parser, read src: str, id: i32) {
     let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
-    list.set(bool, c.reached, id as usize, true)
     var i: i32 = 0
     for i < d.y {
         let sid: i32 = list.get(i32, p.sar, (d.x + i) as usize)
-        mark_stmt(c, p, sid)
+        let s: parser.StmtData = list.get(parser.StmtData, p.st, sid as usize)
+        infer_opt(c, p, src, s.a)                  // Let init / Return value / Expr - all in `a`
         i = i + 1
     }
 }
 
-// Mark a statement's expression children: a `let`/`var` initializer, a `return` value, or an
-// expression statement — never the `let`'s type annotation (`ty`), which lives in the type arena.
-fn mark_stmt(mut c: Checker, read p: parser.Parser, sid: i32) {
-    let s: parser.StmtData = list.get(parser.StmtData, p.st, sid as usize)
-    mark_opt(c, p, s.a)                              // Let init / Return value / Expr — all in `a`
-}
-
-// Mark a `for` loop's reachable exprs: the head (while-condition or iterate sources+step), the
-// body block, and the optional `else` block. Header layout (see `mk_for` in parser.jtr): the node
-// `op`=head kind (0 infinite / 1 while / 2 iterate), `a`=base into `lar`, `b`=body, `x`=else.
-fn mark_for(mut c: Checker, read p: parser.Parser, id: i32) {
+// Infer a `for` loop's reachable exprs: the head (while-condition or iterate sources - NOT the
+// `step`, which the reference ignores), the body block, and the optional `else` block.
+fn infer_for(mut c: Checker, read p: parser.Parser, read src: str, id: i32) {
     let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
     let base: i32 = d.a
     if d.op == 1 {
-        mark(c, p, list.get(i32, p.lar, (base + 4) as usize))          // while condition
+        infer(c, p, src, list.get(i32, p.lar, (base + 4) as usize))    // while condition
     } else if d.op == 2 {
         let bc: i32 = list.get(i32, p.lar, (base + 4) as usize)        // bind count
         let sc: i32 = list.get(i32, p.lar, (base + 5) as usize)        // source count
         var i: i32 = 0
         for i < sc {
-            mark(c, p, list.get(i32, p.lar, (base + 7 + bc * 3 + i) as usize))   // each source
+            infer(c, p, src, list.get(i32, p.lar, (base + 7 + bc * 3 + i) as usize))
             i = i + 1
         }
-        // NB: the range `step` expr is NOT inferred by the reference (`ForHead::Iter { .. }`
-        // ignores it), so it stays Unknown — do not mark it.
     }
-    mark(c, p, d.b)                                  // body block
-    mark_opt(c, p, d.x)                              // optional else block
+    infer(c, p, src, d.b)                          // body block
+    infer_opt(c, p, src, d.x)                      // optional else block
 }
 
-// Mark the bodies of a struct/struct-value's methods (member 10-tuples in `mar`; a tag-1 tuple
-// holds the method fn's `ItemId` at +1, whose `w` slot is its body block). Shared by the struct
-// *item* walk and the `struct { … }` *value* expr (both infer method bodies, not field defaults).
-fn mark_methods(mut c: Checker, read p: parser.Parser, mem_start: i32, mem_count: i32) {
+// Infer the bodies of a struct/struct-value's methods (member 10-tuples in `mar`). Shared by
+// the struct *item* walk and the `struct { ... }` *value* expr.
+fn infer_methods(mut c: Checker, read p: parser.Parser, read src: str, mem_start: i32, mem_count: i32) {
     var i: i32 = 0
     for i < mem_count {
         let mbase: i32 = mem_start + i * 10
         if list.get(i32, p.mar, mbase as usize) == 1 {         // tag 1 = method
             let fid: i32 = list.get(i32, p.mar, (mbase + 1) as usize)
             let f: parser.ItemData = list.get(parser.ItemData, p.it, fid as usize)
-            mark_opt(c, p, f.w)                      // the method fn's body block
+            infer_opt(c, p, src, f.w)              // the method fn's body block
         }
         i = i + 1
     }
@@ -183,19 +540,17 @@ fn mark_methods(mut c: Checker, read p: parser.Parser, mem_start: i32, mem_count
 
 // Walk the top-level items exactly as `check_items` does: infer function bodies, const values,
 // and struct-method bodies; skip enum/distinct/extern/import and (crucially) impl/trait bodies.
-// (Methods on a *generic* struct returned by a comptime `fn … -> type { return struct { … } }`
-// are reached instead through that fn body's `StructType` value — see `mark`, kind 36.)
-fn walk_items(mut c: Checker, read p: parser.Parser) {
+fn walk_items(mut c: Checker, read p: parser.Parser, read src: str) {
     var r: usize = 0
     for r < list.len(i32, p.roots) {
         let iid: i32 = list.get(i32, p.roots, r)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
-        if it.kind == 3 {                            // Fn -> body block `w`
-            mark_opt(c, p, it.w)
-        } else if it.kind == 2 {                     // Const -> value `b`
-            mark_opt(c, p, it.b)
-        } else if it.kind == 4 {                     // Struct -> each method's body
-            mark_methods(c, p, it.a, it.b)
+        if it.kind == 3 {                          // Fn -> body block `w`
+            infer_opt(c, p, src, it.w)
+        } else if it.kind == 2 {                   // Const -> value `b`
+            infer_opt(c, p, src, it.b)
+        } else if it.kind == 4 {                   // Struct -> each method's body
+            infer_methods(c, p, src, it.a, it.b)
         }
         r = r + 1
     }
@@ -203,31 +558,31 @@ fn walk_items(mut c: Checker, read p: parser.Parser) {
 
 // ---- the resolved-type dump ----
 
-// Emit the canonical `Ty` string (one line) for a reached typed expr `d`, matching `Ty::display`.
-// Called only for `is_typed` exprs that were reached; unreached ones print `?`.
-fn print_expr_ty(read d: parser.ExprData) {
+// Is this expression in the compared subset? Keyed on `(kind, op)`. Must agree with
+// `typeck_dump_kind` in proptests.rs - grow both together, one increment at a time.
+fn is_typed(read d: parser.ExprData) -> bool {
     let k: i32 = d.kind
-    if k == 0 { print_str("i32") }
-    else if k == 1 { print_str("f64") }
-    else if k == 26 { print_str("char") }
-    else if k == 27 { print_str("bool") }
-    else if k == 29 { print_str("str") }
-    else if k == 30 { print_str("*?") }             // Ptr{Default, Unknown}
-    else if k == 3 { print_str("bool") }            // Unary `not`
-    else if k == 4 { print_str("bool") }            // Binary comparison / logical
-    else { print_str("?") }
+    if k == 0 or k == 1 or k == 26 or k == 27 or k == 29 or k == 30 { return true }   // literals
+    if k == 11 { return true }                     // cast (typed from its annotation)
+    if k == 3 { if d.op == 2 { return true } }     // Unary `not` -> bool
+    if k == 4 {                                    // Binary comparison/logical -> bool (op 6..13)
+        if d.op >= 6 { if d.op <= 13 { return true } }
+    }
+    return false
 }
 
-// Walk the expression arena in ExprId order, emitting a type line for every expr this pass types:
-// its concrete type if the body walk reached it, else `?` (Unknown) — matching the reference.
-fn dump_types(read c: Checker, read p: parser.Parser) {
+// Walk the expression arena in ExprId order, emitting `ty_str(et[id])` (one line) for every
+// expr in the compared subset - `?` where the body walk never reached it, like the reference.
+fn dump_types(read src: str, read c: Checker, read p: parser.Parser) {
     let n: usize = list.len(parser.ExprData, p.ex)
     var i: usize = 0
     for i < n {
         let d: parser.ExprData = list.get(parser.ExprData, p.ex, i)
         if is_typed(d) {
-            if list.get(bool, c.reached, i) { print_expr_ty(d) }
-            else { print_str("?") }
+            var sb: String = string_new()
+            ty_str(src, c, list.get(i32, c.et, i), sb)
+            print_str(string_view(sb))
+            string_free(sb)
         }
         i = i + 1
     }
@@ -240,13 +595,9 @@ fn main() -> i32 {
     if env.argc() > 1 {
         var src: String = fs.read_text(env.argv(1))
         var p: parser.Parser = parser.parse_source(string_view(src), it, kwcount, a)
-        let n: usize = list.len(parser.ExprData, p.ex)
-        var reached: List(bool) = list.make(bool, a)
-        var j: usize = 0
-        for j < n { list.push(bool, reached, false)  j = j + 1 }
-        var c: Checker = Checker{ reached: reached }
-        walk_items(c, p)
-        dump_types(c, p)
+        var c: Checker = make_checker(p, a)
+        walk_items(c, p, string_view(src))
+        dump_types(string_view(src), c, p)
         string_free(src)
     }
     return 0

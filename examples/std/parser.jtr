@@ -64,7 +64,7 @@ struct BinInfo { ok: bool, lbp: i32, rbp: i32, code: i32 }
 //   Path `mod.Type(args)`: `(x,y)`=module span, `(z,w)`=type-name span, `(op,a)`=arg slice.
 //   Fn `fn(conv T,…) -> conv R`: `(op,a)`=(param_start, param_count) of (conv, `TypeId`) pairs
 //     in `tar`; `b`=ret_conv; `x`=ret `TypeId` (-1 if none).
-struct TypeData { kind: i32, start: usize, end: usize, op: i32, a: i32, b: i32, x: i32, y: i32, z: i32, w: i32 }
+pub struct TypeData { pub kind: i32, pub start: usize, pub end: usize, pub op: i32, pub a: i32, pub b: i32, pub x: i32, pub y: i32, pub z: i32, pub w: i32 }
 
 // The whole parser state, threaded `mut` through the recursive descent:
 //   toks  — the token vector (read-only input)
@@ -124,7 +124,7 @@ pub struct ItemData { pub kind: i32, pub start: usize, pub end: usize, pub is_pu
 // (an ident whose text is "par"): the escape checker forbids storing the borrowed `src` in the
 // struct, so the driver — which *has* `src` — precomputes this one text test (the only contextual
 // keyword that isn't positionally unambiguous, since `<expr-ending-in-ident> for` also occurs).
-pub struct Parser { toks: List(tokens.Token), parw: List(bool), pub ex: List(ExprData), pub ar: List(i32), pub st: List(StmtData), pub sar: List(i32), pt: List(PatData), pub par: List(i32), ty: List(TypeData), tar: List(i32), pub it: List(ItemData), iar: List(i32), pub mar: List(i32), ear: List(i32), aar: List(i32), gar: List(i32), far: List(i32), pub lar: List(i32), clar: List(i32), pub roots: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool, no_struct: bool }
+pub struct Parser { toks: List(tokens.Token), parw: List(bool), pub ex: List(ExprData), pub ar: List(i32), pub st: List(StmtData), pub sar: List(i32), pt: List(PatData), pub par: List(i32), pub ty: List(TypeData), pub tar: List(i32), pub it: List(ItemData), iar: List(i32), pub mar: List(i32), ear: List(i32), aar: List(i32), gar: List(i32), far: List(i32), pub lar: List(i32), clar: List(i32), pub roots: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool, no_struct: bool }
 
 // The result of parsing a `{ field, …, ..spread }` initializer body: the field-init nodes'
 // slice into the arg arena, the optional spread expr (-1 if none), and the `}` end offset.
