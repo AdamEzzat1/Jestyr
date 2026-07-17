@@ -12,6 +12,54 @@
 
 ---
 
+## Progress log
+
+### Increment 1 — `hello.jtr` byte-identical (commit `eb50eac`, branch `claude/jestyr-p5-cgen-r2-ac4439`)
+
+`examples/std/cgen.jtr` (a leaf consumer with `main`, built directly by the golden — no `_cli`
+driver needed) + golden `jestyr_cgen_matches_reference` (`--features c-oracle`). Emits
+`examples/hello.jtr`'s C byte-identical. **Findings the next session should NOT re-derive:**
+
+- **cgen emits string literals VERBATIM.** `ExprKind::Str(l) => JSTR({l})` where `l = src[span]`
+  (raw source text *with* quotes, no decode/re-encode). So the escape model composes trivially:
+  a Jestyr source `"\\n"` → C `JSTR("\\n")` → gcc → literal backslash-n (2 bytes) in the *output*
+  C; a Jestyr `"\n"` → a real C-source line break. **Jestyr and Rust share escape conventions**,
+  so the prelude's `self.raw("…")` strings transcribe to `string_push(sb, "…")` ~1:1. (Earlier
+  confusion was a bash heredoc mangling backslashes — always author `.jtr` with the Write tool.)
+- **`out` is a reserved word in `.jtr`** → the string builder is named `sb`. (Same trap the P4
+  session hit with `out`/`comptime`.)
+- **The golden target has NO `#line` directives.** `rust_cgen_dump` uses the single-file
+  `parse` + `typeck::check` path (not `module::load`), so `TypeInfo::debug` is empty and
+  `mark_line` is a no-op. Don't port `#line` for the golden; it only appears via `module::load`
+  (the `emit-c` CLI). `str::lines()` also strips trailing `\r`, so the Windows exe's CRLF stdout
+  compares equal — no newline-mode fighting.
+- **The empty-program section skeleton (blank-line bookkeeping), fully reconciled against the
+  golden.** After `prelude` (ends `…arg}\n\n`), only these emit bytes for a program with no
+  aggregates, in this order: `forward_types`→`\n`; `result_defs`→`JestyrResult_str` typedef+`\n`
+  (the typedef is emitted UNCONDITIONALLY — it's `try_from_utf8`'s result type); `closure_types`
+  →`\n`; `fn_protos`→proto+`\n`; `method_protos`→`\n`; `consts`→`\n`; `fn_defs`→sig+body+`\n`;
+  `main_wrapper`. Every other section (`gen_forward_types`, `fn_type_typedefs`, struct/enum/slice/
+  array/genref defs, `flush_def_capture`, `dyn_typedefs`, `extern_protos`, `impl_protos`,
+  `dyn_vtables`, `spawn_runtime`, `closure_fns`, `method_defs`, `impl_defs`) is a guarded no-op
+  there. `forward_types`/`closure_types`/`method_protos`/`consts` emit their trailing `\n`
+  UNCONDITIONALLY — that's the 2/2/3/1 blank-gap pattern. cgen.jtr elides the guarded no-ops and
+  hardcodes those bare `\n`s with a comment naming each reference section (generalize as needed).
+- **Output mechanism:** accumulate into one `String sb`; at the end print `sb[0 .. len-1]` via
+  `print_str` (which re-adds the one trailing `\n`) so stdout equals `cgen::emit`'s String exactly.
+- **AST decode cheat-sheet (Jestyr flat arenas, from `parser.jtr`):** item kind 3 = Fn
+  (`x,y`=name span, `a,b`=param slice in `iar`, `z`=ret `TypeId` (-1=unit), `w`=body Block ExprId);
+  expr kinds 0=Int 2=Name 10=Call (`a`=callee, `x,y`=arg slice in `ar`) 23=Block (`x,y`=stmt slice
+  in `sar`) 29=Str; stmt kinds 0=Let 1=Return (`a`=value, -1=bare) 2=Expr (`a`=expr). Iterate
+  top-level items via `p.roots` → `p.it[iid]`.
+
+**NEXT increments (grow the allowlist):** function parameters + `params_str` (drop the `(void)`
+stub) → locals/`let` (`emit_stmt` kind 0) → int/bool literals + names as values → binops
+(`emit_expr` kind 4, operator-trait dispatch deferred) → `if`/`return` variants. Pick corpus
+files that use only the ported constructs and add them to `CGEN_GOLDEN_ALLOWLIST`; run with
+`DUMP_DIVERGE=1` to converge each. See `c_type`/`params_str`/`emit_expr` in `cgen.rs`.
+
+---
+
 ## 0. Discipline (unchanged — every increment)
 
 - `cargo test`-green (685 default) + warning-clean; cross-impl goldens behind `--features
