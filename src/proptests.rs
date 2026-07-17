@@ -7416,31 +7416,9 @@ mod c_oracle {
     /// Does the P3 typeck pass resolve a type for this expr kind yet? Mirrors `typed_kind` in
     /// `examples/std/typeck.jtr` — the two MUST agree so the golden compares the same expression
     /// subset on both sides. Grow both together, one increment at a time.
-    fn typeck_dump_kind(k: &crate::ast::ExprKind) -> bool {
-        use crate::ast::{BinOp, ExprKind, UnOp};
-        matches!(
-            k,
-            ExprKind::Int(_)
-                | ExprKind::Float(_)
-                | ExprKind::Str(_)
-                | ExprKind::Char(_)
-                | ExprKind::Bool(_)
-                | ExprKind::Null
-                | ExprKind::Name(_)
-                | ExprKind::Cast { .. }
-                | ExprKind::Unary { op: UnOp::Not, .. }
-                | ExprKind::Binary {
-                    op: BinOp::Eq
-                        | BinOp::Ne
-                        | BinOp::Lt
-                        | BinOp::Le
-                        | BinOp::Gt
-                        | BinOp::Ge
-                        | BinOp::And
-                        | BinOp::Or,
-                    ..
-                }
-        )
+    fn typeck_dump_kind(_k: &crate::ast::ExprKind) -> bool {
+        // THE FULL STREAM: every expression is compared (mirrors `is_typed` in typeck.jtr).
+        true
     }
 
     /// The reference resolved-type dump for `src`: parse the single file, type-check it
@@ -7547,6 +7525,36 @@ mod c_oracle {
                     eprintln!("=== {f} (first diff at line {first}) ===");
                     eprintln!("GOT : {:?}", &got[lo..(lo + 20).min(got.len())]);
                     eprintln!("WANT: {:?}", &want[lo..(lo + 20).min(want.len())]);
+                }
+                // Deep-dive one file: TYPECK_FILE=<basename> prints the reference's compared
+                // stream with each entry's ExprKind discriminant + span, to align against GOT.
+                if std::env::var("TYPECK_FILE").map(|v| f.ends_with(&v)).unwrap_or(false) {
+                    let (tokens, _) = crate::lexer::Lexer::new(&src).tokenize();
+                    let (ast, _diags) = crate::parser::Parser::new(&src, tokens).parse();
+                    let (info, _d) = crate::typeck::check(&ast);
+                    let mut skip = vec![false; ast.exprs.len()];
+                    for ed in &ast.exprs {
+                        if let crate::ast::ExprKind::FString { exprs, .. } = &ed.kind {
+                            for e in exprs {
+                                skip[e.0 as usize] = true;
+                            }
+                        }
+                    }
+                    let mut k = 0usize;
+                    for (id, ed) in ast.exprs.iter().enumerate() {
+                        if typeck_dump_kind(&ed.kind) && !skip[id] {
+                            let kindname = format!("{:?}", ed.kind);
+                            let kindshort = kindname.split(['(', ' ', '{']).next().unwrap_or("?");
+                            let g = got.get(k).map(String::as_str).unwrap_or("<end>");
+                            let w = info.expr_types[id].display(&info.table);
+                            let mark = if g == w { " " } else { "*" };
+                            eprintln!(
+                                "{mark} [{k:3}] id={id:3} {kindshort:12} span={}..{} want={w} got={g}",
+                                ed.span.start, ed.span.end
+                            );
+                            k += 1;
+                        }
+                    }
                 }
             } else {
                 checked += 1;

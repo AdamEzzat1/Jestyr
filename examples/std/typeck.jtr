@@ -68,7 +68,12 @@ import "parser"
 // (a `let` annotation, a call's declared param, a struct-lit field's declared type, the fn
 // return at the tail) — read by nullary-variant adoption, closure->fn-pointer coercion, and
 // array-literal element adoption. Save/restored EXACTLY where the reference does.
-struct Checker { tys: List(TyData), tya: List(i32), et: List(i32), scn: List(i32), scst: List(i32), tdecl: List(i32), tch: List(i32), fns: List(i32), cst: List(i32), vmap: List(i32), selfty: i32, expected: i32, curret: i32, scfloor: i32, alloc: Allocator }
+// `tra` holds trait rows (4-tuples: name span, method_start, method_count — methods are
+// 3-tuples in `tch`: name span + declared-ret TyId, `Self` left Opaque). `imp` holds impl rows
+// (5-tuples: trait-name span, target TyId, method_start, method_count — method rets have
+// `Self` -> target substituted at registration). `(gbs, gbc)` is the enclosing fn's bracket-
+// generic slice in the parser's `gar` (4-tuples: name span + bound span), for bound dispatch.
+struct Checker { tys: List(TyData), tya: List(i32), et: List(i32), scn: List(i32), scst: List(i32), tdecl: List(i32), tch: List(i32), fns: List(i32), cst: List(i32), vmap: List(i32), tra: List(i32), imp: List(i32), selfty: i32, expected: i32, curret: i32, scfloor: i32, gbs: i32, gbc: i32, alloc: Allocator }
 
 // One `Ty` arena node - kinds in the header comment. `a`/`b` are child TyIds or slice fields;
 // `x`/`y` are aux ints (prim code, name span, ret TyId/conv).
@@ -96,7 +101,7 @@ fn mk_ty(mut c: Checker, kind: i32, a: i32, b: i32, x: i32, y: i32) -> i32 {
 // The checker with the well-known instances pre-created (ids 0..7) and `et` sized to the
 // expression arena, all-Unknown.
 fn make_checker(read p: parser.Parser, read a: Allocator) -> Checker {
-    var c: Checker = Checker{ tys: list.make(TyData, a), tya: list.make(i32, a), et: list.make(i32, a), scn: list.make(i32, a), scst: list.make(i32, a), tdecl: list.make(i32, a), tch: list.make(i32, a), fns: list.make(i32, a), cst: list.make(i32, a), vmap: list.make(i32, a), selfty: 1, expected: 0 - 1, curret: 0 - 1, scfloor: 0, alloc: a }
+    var c: Checker = Checker{ tys: list.make(TyData, a), tya: list.make(i32, a), et: list.make(i32, a), scn: list.make(i32, a), scst: list.make(i32, a), tdecl: list.make(i32, a), tch: list.make(i32, a), fns: list.make(i32, a), cst: list.make(i32, a), vmap: list.make(i32, a), tra: list.make(i32, a), imp: list.make(i32, a), selfty: 1, expected: 0 - 1, curret: 0 - 1, scfloor: 0, gbs: 0 - 1, gbc: 0, alloc: a }
     mk_ty(c, 0, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 0 Unknown
     mk_ty(c, 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 1 Unit
     mk_ty(c, 2, 0 - 1, 0 - 1, 2, 0 - 1)            // 2 Prim i32   (code 2)
@@ -603,6 +608,45 @@ fn build_table(mut c: Checker, read p: parser.Parser, read src: str) {
             var ret: i32 = t_unit()
             if it.z >= 0 { ret = lower_type(c, p, src, it.z) }
             push_fn(c, it.x, it.y, ret, 0, 0 - 1, 0, 1, 0 - 1, 0, iid, 0 - 1, 0)
+        } else if it.kind == 6 {                   // trait: name + method sigs (Self kept Opaque)
+            var mt: List(i32) = list.make(i32, c.alloc)
+            var mi: i32 = 0
+            for mi < it.b {                        // method 7-tuples in mar
+                let mb: i32 = it.a + mi * 7
+                let rt: i32 = list.get(i32, p.mar, (mb + 5) as usize)
+                var ret: i32 = t_unit()
+                if rt >= 0 { ret = lower_type(c, p, src, rt) }
+                list.push(i32, mt, list.get(i32, p.mar, mb as usize))          // name span
+                list.push(i32, mt, list.get(i32, p.mar, (mb + 1) as usize))
+                list.push(i32, mt, ret)
+                mi = mi + 1
+            }
+            let ms: i32 = append_tch(c, mt)
+            list.push(i32, c.tra, it.x)
+            list.push(i32, c.tra, it.y)
+            list.push(i32, c.tra, ms)
+            list.push(i32, c.tra, it.b)
+        } else if it.kind == 7 {                   // impl: target + method rets (Self -> target)
+            let target: i32 = lower_type(c, p, src, it.a)
+            var mt: List(i32) = list.make(i32, c.alloc)
+            var mi: i32 = 0
+            for mi < it.z {                        // method fn-ItemIds in mar
+                let fid: i32 = list.get(i32, p.mar, (it.b + mi) as usize)
+                let f: parser.ItemData = list.get(parser.ItemData, p.it, fid as usize)
+                var ret: i32 = t_unit()
+                if f.z >= 0 { ret = lower_type(c, p, src, f.z) }
+                ret = subst_self(c, src, ret, target)
+                list.push(i32, mt, f.x)
+                list.push(i32, mt, f.y)
+                list.push(i32, mt, ret)
+                mi = mi + 1
+            }
+            let ms: i32 = append_tch(c, mt)
+            list.push(i32, c.imp, it.x)            // the trait name span
+            list.push(i32, c.imp, it.y)
+            list.push(i32, c.imp, target)
+            list.push(i32, c.imp, ms)
+            list.push(i32, c.imp, it.z)
         }
         r2 = r2 + 1
     }
@@ -706,6 +750,35 @@ fn fn_call_ret(mut c: Checker, read p: parser.Parser, read src: str, fr: i32, as
             j = j + 1
         }
         ret = subst_fn_ret(c, src, ret, ctps, ctpc, subst)
+    }
+    // Bracket generics `f[T](x: T)`: infer each `T` by unifying the declared param types
+    // against the actual argument types (the second half of `monomorphize_ret`).
+    let iid: i32 = list.get(i32, c.fns, (base + 9) as usize)
+    let fdecl: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+    if fdecl.g >= 0 {
+        if fdecl.h > 0 {
+            var tpn: List(i32) = list.make(i32, c.alloc)
+            var gi: i32 = 0
+            for gi < fdecl.h {
+                list.push(i32, tpn, list.get(i32, p.gar, (fdecl.g + gi * 4) as usize))
+                list.push(i32, tpn, list.get(i32, p.gar, (fdecl.g + gi * 4 + 1) as usize))
+                gi = gi + 1
+            }
+            var subst: List(i32) = list.make(i32, c.alloc)
+            var si: i32 = 0
+            for si < fdecl.h { list.push(i32, subst, 0 - 1)  si = si + 1 }
+            let pts: i32 = list.get(i32, c.fns, (base + 10) as usize)
+            let ptc: i32 = list.get(i32, c.fns, (base + 11) as usize)
+            var pi: i32 = 0
+            for pi < ptc {
+                if pi < acount {
+                    let ae: i32 = list.get(i32, p.ar, (astart + pi) as usize)
+                    unify_names(c, src, list.get(i32, c.tch, (pts + pi) as usize), list.get(i32, c.et, ae as usize), tpn, subst)
+                }
+                pi = pi + 1
+            }
+            ret = subst_by_names(c, src, ret, tpn, subst)
+        }
     }
     if list.get(i32, c.fns, (base + 3) as usize) == 1 {
         return mk_ty(c, 5, ret, 0 - 1, 0 - 1, 0 - 1)           // fallible: T!
@@ -1003,6 +1076,331 @@ fn subst_ctp_args(mut c: Checker, read src: str, ty: i32, ctps: i32, ctpc: i32, 
     return subst_fn_ret(c, src, ty, ctps, ctpc, subst)
 }
 
+// The type-parameter NAME spans of fns row `fr`: its comptime `T: type` params plus its
+// bracket generics `[T: Bound]` — the set `monomorphize_ret` unifies over. Pairs (ns, ne).
+fn fn_tp_names(read c: Checker, read p: parser.Parser, fr: i32) -> List(i32) {
+    var tpn: List(i32) = list.make(i32, c.alloc)
+    let ctps: i32 = list.get(i32, c.fns, (fr * 12 + 7) as usize)
+    let ctpc: i32 = list.get(i32, c.fns, (fr * 12 + 8) as usize)
+    var i: i32 = 0
+    for i < ctpc {
+        list.push(i32, tpn, list.get(i32, c.tch, (ctps + i * 3) as usize))
+        list.push(i32, tpn, list.get(i32, c.tch, (ctps + i * 3 + 1) as usize))
+        i = i + 1
+    }
+    let iid: i32 = list.get(i32, c.fns, (fr * 12 + 9) as usize)
+    let f: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+    if f.g >= 0 {
+        var j: i32 = 0
+        for j < f.h {                              // gar 4-tuples: name span + bound span
+            list.push(i32, tpn, list.get(i32, p.gar, (f.g + j * 4) as usize))
+            list.push(i32, tpn, list.get(i32, p.gar, (f.g + j * 4 + 1) as usize))
+            j = j + 1
+        }
+    }
+    return tpn
+}
+
+// Unify a DECLARED type against an ACTUAL: an Opaque whose text matches a tp name binds it
+// (first bind wins); matching structural forms recurse. Mirrors `unify_tp`.
+fn unify_names(mut c: Checker, read src: str, tmpl: i32, actual: i32, read tpn: List(i32), mut subst: List(i32)) {
+    let d: TyData = list.get(TyData, c.tys, tmpl as usize)
+    if d.kind == 4 {
+        let n: i32 = (list.len(i32, tpn) / 2) as i32
+        var i: i32 = 0
+        for i < n {
+            let tns: i32 = list.get(i32, tpn, (i * 2) as usize)
+            let tne: i32 = list.get(i32, tpn, (i * 2 + 1) as usize)
+            if str_eq(src[d.x as usize .. d.y as usize], src[tns as usize .. tne as usize]) {
+                if list.get(i32, subst, i as usize) < 0 { list.set(i32, subst, i as usize, actual) }
+                return
+            }
+            i = i + 1
+        }
+        return
+    }
+    let a: TyData = list.get(TyData, c.tys, actual as usize)
+    if d.kind != a.kind { return }
+    if d.kind == 3 or d.kind == 5 or d.kind == 8 or d.kind == 10 or d.kind == 11 {
+        unify_names(c, src, d.a, a.a, tpn, subst)    // Ptr/Result/Slice/GenRef/RegionRef inner
+    } else if d.kind == 6 {                        // GenStruct/GenEnum: same ctor -> args pairwise
+        if str_eq(src[d.x as usize .. d.y as usize], src[a.x as usize .. a.y as usize]) {
+            var i: i32 = 0
+            var n: i32 = d.b
+            if a.b < n { n = a.b }
+            for i < n {
+                unify_names(c, src, list.get(i32, c.tya, (d.a + i) as usize), list.get(i32, c.tya, (a.a + i) as usize), tpn, subst)
+                i = i + 1
+            }
+        }
+    }
+}
+
+// Apply a name-keyed substitution (parallel to `tpn`) throughout `ty` — the by-name companion
+// to `subst_fn_ret` (mirrors `subst_ty`). An unbound name (-1) stays as-is.
+fn subst_by_names(mut c: Checker, read src: str, ty: i32, read tpn: List(i32), read subst: List(i32)) -> i32 {
+    let d: TyData = list.get(TyData, c.tys, ty as usize)
+    if d.kind == 4 {
+        let n: i32 = (list.len(i32, tpn) / 2) as i32
+        var i: i32 = 0
+        for i < n {
+            let tns: i32 = list.get(i32, tpn, (i * 2) as usize)
+            let tne: i32 = list.get(i32, tpn, (i * 2 + 1) as usize)
+            if str_eq(src[d.x as usize .. d.y as usize], src[tns as usize .. tne as usize]) {
+                let s: i32 = list.get(i32, subst, i as usize)
+                if s >= 0 { return s }
+                return ty
+            }
+            i = i + 1
+        }
+        return ty
+    }
+    if d.kind == 3 or d.kind == 5 or d.kind == 8 or d.kind == 10 or d.kind == 11 {
+        let inner: i32 = subst_by_names(c, src, d.a, tpn, subst)
+        if inner == d.a { return ty }
+        return mk_ty(c, d.kind, inner, d.b, d.x, d.y)
+    }
+    if d.kind == 9 {
+        let inner: i32 = subst_by_names(c, src, d.a, tpn, subst)
+        if inner == d.a { return ty }
+        return mk_ty(c, 9, inner, d.b, 0 - 1, 0 - 1)
+    }
+    if d.kind == 6 {
+        var tmp: List(i32) = list.make(i32, c.alloc)
+        var i: i32 = 0
+        for i < d.b {
+            list.push(i32, tmp, subst_by_names(c, src, list.get(i32, c.tya, (d.a + i) as usize), tpn, subst))
+            i = i + 1
+        }
+        let astart: i32 = append_tya(c, tmp)
+        return mk_ty(c, 6, astart, d.b, d.x, d.y)
+    }
+    if d.kind == 12 {
+        var tmp: List(i32) = list.make(i32, c.alloc)
+        var i: i32 = 0
+        for i < d.b {
+            list.push(i32, tmp, list.get(i32, c.tya, (d.a + i * 2) as usize))
+            list.push(i32, tmp, subst_by_names(c, src, list.get(i32, c.tya, (d.a + i * 2 + 1) as usize), tpn, subst))
+            i = i + 1
+        }
+        let pstart: i32 = append_tya(c, tmp)
+        let ret: i32 = subst_by_names(c, src, d.x, tpn, subst)
+        return mk_ty(c, 12, pstart, d.b, ret, d.y)
+    }
+    return ty
+}
+
+// Substitute `Self` (an Opaque whose text is "Self") with `target` inside `ty` — used when
+// registering impl-method returns and resolving trait-method returns (mirrors `subst_ty` with
+// the {Self -> target} map).
+fn subst_self(mut c: Checker, read src: str, ty: i32, target: i32) -> i32 {
+    let d: TyData = list.get(TyData, c.tys, ty as usize)
+    if d.kind == 4 {
+        if str_eq(src[d.x as usize .. d.y as usize], "Self") { return target }
+        return ty
+    }
+    if d.kind == 3 or d.kind == 5 or d.kind == 8 or d.kind == 10 or d.kind == 11 {
+        let inner: i32 = subst_self(c, src, d.a, target)
+        if inner == d.a { return ty }
+        return mk_ty(c, d.kind, inner, d.b, d.x, d.y)
+    }
+    if d.kind == 9 {
+        let inner: i32 = subst_self(c, src, d.a, target)
+        if inner == d.a { return ty }
+        return mk_ty(c, 9, inner, d.b, 0 - 1, 0 - 1)
+    }
+    if d.kind == 6 {
+        var tmp: List(i32) = list.make(i32, c.alloc)
+        var i: i32 = 0
+        for i < d.b {
+            list.push(i32, tmp, subst_self(c, src, list.get(i32, c.tya, (d.a + i) as usize), target))
+            i = i + 1
+        }
+        let astart: i32 = append_tya(c, tmp)
+        return mk_ty(c, 6, astart, d.b, d.x, d.y)
+    }
+    if d.kind == 12 {
+        var tmp: List(i32) = list.make(i32, c.alloc)
+        var i: i32 = 0
+        for i < d.b {
+            list.push(i32, tmp, list.get(i32, c.tya, (d.a + i * 2) as usize))
+            list.push(i32, tmp, subst_self(c, src, list.get(i32, c.tya, (d.a + i * 2 + 1) as usize), target))
+            i = i + 1
+        }
+        let pstart: i32 = append_tya(c, tmp)
+        let ret: i32 = subst_self(c, src, d.x, target)
+        return mk_ty(c, 12, pstart, d.b, ret, d.y)
+    }
+    return ty
+}
+
+// Do two types render to the same canonical string? Mirrors the reference's `ty_key`, which
+// keys impls by the type's display form (Prim/Named -> the bare name, others -> display).
+fn ty_key_eq(read src: str, read c: Checker, a: i32, b: i32) -> bool {
+    var sa: String = string_new()
+    ty_str(src, c, a, sa)
+    var sb: String = string_new()
+    ty_str(src, c, b, sb)
+    let r: bool = str_eq(string_view(sa), string_view(sb))
+    string_free(sa)
+    string_free(sb)
+    return r
+}
+
+// The trait row (4-tuples in `tra`) named `src[ns..ne]`, or -1.
+fn find_trait(read c: Checker, read src: str, ns: usize, ne: usize) -> i32 {
+    let n: i32 = (list.len(i32, c.tra) / 4) as i32
+    var i: i32 = 0
+    for i < n {
+        let base: i32 = i * 4
+        let bns: i32 = list.get(i32, c.tra, base as usize)
+        let bne: i32 = list.get(i32, c.tra, (base + 1) as usize)
+        if str_eq(src[ns .. ne], src[bns as usize .. bne as usize]) { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Trait row `trow`'s method `src[ms..me]`: its declared return with `Self` -> `recv`, or -1
+// when the trait has no such method (mirrors `trait_method_ret`).
+fn trait_method_ret(mut c: Checker, read src: str, trow: i32, ms: usize, me: usize, recv: i32) -> i32 {
+    let mstart: i32 = list.get(i32, c.tra, (trow * 4 + 2) as usize)
+    let mcount: i32 = list.get(i32, c.tra, (trow * 4 + 3) as usize)
+    var j: i32 = 0
+    for j < mcount {
+        let mb: i32 = mstart + j * 3
+        let mns: i32 = list.get(i32, c.tch, mb as usize)
+        let mne: i32 = list.get(i32, c.tch, (mb + 1) as usize)
+        if str_eq(src[ms .. me], src[mns as usize .. mne as usize]) {
+            return subst_self(c, src, list.get(i32, c.tch, (mb + 2) as usize), recv)
+        }
+        j = j + 1
+    }
+    return 0 - 1
+}
+
+// `recv.m(args)` through an `impl Trait for <recv>`: the first impl whose target's canonical
+// key equals the receiver's AND that provides the method — its registered return (already
+// Self-substituted). -1 when none (try the next resolution). Mirrors `resolve_impl_method`.
+fn resolve_impl_method(mut c: Checker, read src: str, recv: i32, ms: usize, me: usize) -> i32 {
+    let n: i32 = (list.len(i32, c.imp) / 5) as i32
+    var i: i32 = 0
+    for i < n {
+        let base: i32 = i * 5
+        if ty_key_eq(src, c, list.get(i32, c.imp, (base + 2) as usize), recv) {
+            let mstart: i32 = list.get(i32, c.imp, (base + 3) as usize)
+            let mcount: i32 = list.get(i32, c.imp, (base + 4) as usize)
+            var j: i32 = 0
+            for j < mcount {
+                let mb: i32 = mstart + j * 3
+                let mns: i32 = list.get(i32, c.tch, mb as usize)
+                let mne: i32 = list.get(i32, c.tch, (mb + 1) as usize)
+                if str_eq(src[ms .. me], src[mns as usize .. mne as usize]) {
+                    return list.get(i32, c.tch, (mb + 2) as usize)
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// `x.m(args)` where `x: T` is a bracket type parameter of the enclosing fn (the "Zig fix"):
+// resolve through the bound trait. Unbounded param / bound without the method -> Error. -1 when
+// the receiver isn't a type parameter at all. Mirrors `resolve_bound_method`.
+fn resolve_bound_method(mut c: Checker, read p: parser.Parser, read src: str, recv: i32, ms: usize, me: usize) -> i32 {
+    let rd: TyData = list.get(TyData, c.tys, recv as usize)
+    if rd.kind != 4 { return 0 - 1 }               // only an Opaque can be a type param
+    var i: i32 = 0
+    for i < c.gbc {
+        let gb: i32 = c.gbs + i * 4
+        let gns: i32 = list.get(i32, p.gar, gb as usize)
+        let gne: i32 = list.get(i32, p.gar, (gb + 1) as usize)
+        if str_eq(src[rd.x as usize .. rd.y as usize], src[gns as usize .. gne as usize]) {
+            let bs: i32 = list.get(i32, p.gar, (gb + 2) as usize)
+            let be: i32 = list.get(i32, p.gar, (gb + 3) as usize)
+            if bs >= 0 {
+                let trow: i32 = find_trait(c, src, bs as usize, be as usize)
+                if trow >= 0 {
+                    let ret: i32 = trait_method_ret(c, src, trow, ms, me, recv)
+                    if ret >= 0 { return ret }
+                }
+            }
+            return mk_ty(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1)    // unbounded / not in the bound
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// `d.m(args)` where `d: dyn Trait` — dynamic dispatch, typed by the trait method's declared
+// return. Not a trait method -> Error. -1 when the receiver isn't `dyn`. Mirrors
+// `resolve_dyn_method`.
+fn resolve_dyn_method(mut c: Checker, read src: str, recv: i32, ms: usize, me: usize) -> i32 {
+    let rd: TyData = list.get(TyData, c.tys, recv as usize)
+    if rd.kind != 17 { return 0 - 1 }
+    let trow: i32 = find_trait(c, src, rd.x as usize, rd.y as usize)
+    if trow >= 0 {
+        let ret: i32 = trait_method_ret(c, src, trow, ms, me, recv)
+        if ret >= 0 { return ret }
+    }
+    return mk_ty(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1)
+}
+
+// The operator trait / method for binary op code `op` (`op_trait_method`): Add/Sub/Mul/Div for
+// arithmetic, Eq.eq for ==/!=, Ord.lt for comparisons. Empty = not overloadable.
+fn op_trait_name(op: i32) -> str {
+    if op == 1 { return "Add" }
+    if op == 2 { return "Sub" }
+    if op == 3 { return "Mul" }
+    if op == 4 { return "Div" }
+    if op == 6 or op == 7 { return "Eq" }
+    if op >= 8 { if op <= 11 { return "Ord" } }
+    return ""
+}
+fn op_method_name(op: i32) -> str {
+    if op == 1 { return "add" }
+    if op == 2 { return "sub" }
+    if op == 3 { return "mul" }
+    if op == 4 { return "div" }
+    if op == 6 or op == 7 { return "eq" }
+    return "lt"
+}
+
+// `a OP b` on a user type (Named / GenStruct lhs) dispatches through the op's trait impl:
+// the impl method's registered return, or Error when the type lacks the impl. Mirrors
+// `resolve_operator_trait` (which the reference consults before native semantics).
+fn resolve_operator(mut c: Checker, read src: str, op: i32, lt: i32) -> i32 {
+    let tn: str = op_trait_name(op)
+    let mn: str = op_method_name(op)
+    let n: i32 = (list.len(i32, c.imp) / 5) as i32
+    var i: i32 = 0
+    for i < n {
+        let base: i32 = i * 5
+        let trns: i32 = list.get(i32, c.imp, base as usize)
+        let trne: i32 = list.get(i32, c.imp, (base + 1) as usize)
+        if str_eq(src[trns as usize .. trne as usize], tn) {
+            if ty_key_eq(src, c, list.get(i32, c.imp, (base + 2) as usize), lt) {
+                let mstart: i32 = list.get(i32, c.imp, (base + 3) as usize)
+                let mcount: i32 = list.get(i32, c.imp, (base + 4) as usize)
+                var j: i32 = 0
+                for j < mcount {
+                    let mb: i32 = mstart + j * 3
+                    let mns: i32 = list.get(i32, c.tch, mb as usize)
+                    let mne: i32 = list.get(i32, c.tch, (mb + 1) as usize)
+                    if str_eq(src[mns as usize .. mne as usize], mn) {
+                        return list.get(i32, c.tch, (mb + 2) as usize)
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return mk_ty(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1)    // no impl -> Error (like the reference)
+}
+
 // The return type of a string/file-IO/atomic INTRINSIC (not a declared fn), or -1 (mirrors
 // `string_intrinsic_ret` / `io_intrinsic_ret` / `atomic_intrinsic_ret`).
 fn intrinsic_ret(mut c: Checker, t: str) -> i32 {
@@ -1119,7 +1517,8 @@ fn infer_call(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> 
         }
         let fty: i32 = field_probe_fn(c, p, src, recv, cal.x as usize, cal.y as usize)
         if fty >= 0 {                              // indirect call through a fn-pointer field
-            let fd: TyData = list.get(TyData, c.tys, fty as usize)
+            list.set(i32, c.et, d.a as usize, fty) // record the callee Field's fn type (like
+            let fd: TyData = list.get(TyData, c.tys, fty as usize)   // the reference's set())
             return fd.x
         }
         let fr: i32 = find_fn(c, src, cal.x as usize, cal.y as usize)
@@ -1129,7 +1528,33 @@ fn infer_call(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> 
                 let p0: i32 = list.get(i32, c.fns, (base + 4) as usize)
                 if p0 >= 0 {
                     if head_match(c, src, p0, recv) {
-                        let ret: i32 = list.get(i32, c.fns, (base + 2) as usize)
+                        // Recover the type arguments by UNIFYING declared params against the
+                        // receiver + argument actuals, then substitute the return (mirrors
+                        // `resolve_free_method`'s unify_tp/subst_ty).
+                        var tpn: List(i32) = fn_tp_names(c, p, fr)
+                        var subst: List(i32) = list.make(i32, c.alloc)
+                        var si: i32 = 0
+                        for si < (list.len(i32, tpn) / 2) as i32 { list.push(i32, subst, 0 - 1)  si = si + 1 }
+                        let iid: i32 = list.get(i32, c.fns, (base + 9) as usize)
+                        let fdecl: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+                        let pts: i32 = list.get(i32, c.fns, (base + 10) as usize)
+                        let ptc: i32 = list.get(i32, c.fns, (base + 11) as usize)
+                        var rti: i32 = 0                       // runtime-param counter
+                        var pi: i32 = 0
+                        for pi < ptc {
+                            let isct: i32 = list.get(i32, p.iar, (fdecl.a + pi * 7) as usize)
+                            if isct == 0 {                     // a runtime param
+                                let pt: i32 = list.get(i32, c.tch, (pts + pi) as usize)
+                                if rti == 0 { unify_names(c, src, pt, recv, tpn, subst) }
+                                else if rti - 1 < list.len(i32, argt) as i32 {
+                                    unify_names(c, src, pt, list.get(i32, argt, (rti - 1) as usize), tpn, subst)
+                                }
+                                rti = rti + 1
+                            }
+                            pi = pi + 1
+                        }
+                        var ret: i32 = list.get(i32, c.fns, (base + 2) as usize)
+                        ret = subst_by_names(c, src, ret, tpn, subst)
                         if list.get(i32, c.fns, (base + 3) as usize) == 1 {
                             return mk_ty(c, 5, ret, 0 - 1, 0 - 1, 0 - 1)   // fallible: T!
                         }
@@ -1153,6 +1578,14 @@ fn infer_call(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> 
             let ret: i32 = gen_method_ret(c, p, src, rd.x as usize, rd.y as usize, rd.a, rd.b, cal.x as usize, cal.y as usize)
             if ret >= 0 { return ret }
         }
+        // Trait dispatch, in the reference's fallback order: impl method -> bracket-bound
+        // method (the "Zig fix") -> dyn method.
+        let ir: i32 = resolve_impl_method(c, src, recv, cal.x as usize, cal.y as usize)
+        if ir >= 0 { return ir }
+        let br: i32 = resolve_bound_method(c, p, src, recv, cal.x as usize, cal.y as usize)
+        if br >= 0 { return br }
+        let dr: i32 = resolve_dyn_method(c, src, recv, cal.x as usize, cal.y as usize)
+        if dr >= 0 { return dr }
         return t_unknown()
     }
     infer(c, p, src, d.a)                          // the callee itself
@@ -1348,13 +1781,26 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
         if d.op == 2 { r = t_bool() }
         else if d.op == 1 or d.op == 3 { r = rt }
         else { r = t_unknown() }                   // Ref
-    } else if k == 4 {                             // Binary: cmp/logical -> bool; else numeric side
+    } else if k == 4 {                             // Binary: operator traits, then native rules
         let lt: i32 = infer(c, p, src, d.a)
         let rt: i32 = infer(c, p, src, d.b)
-        if d.op >= 6 {
-            if d.op <= 13 { r = t_bool() }
-            else { r = pick_numeric(c, lt, rt) }
-        } else { r = pick_numeric(c, lt, rt) }
+        // A user type (Named/GenStruct lhs) with a MAPPED op dispatches through the operator
+        // trait (Add/Sub/Mul/Div/Eq/Ord): the impl method's return, or Error without an impl.
+        // The reference consults this BEFORE native semantics.
+        var handled: bool = false
+        let ld: TyData = list.get(TyData, c.tys, lt as usize)
+        if ld.kind == 15 or ld.kind == 6 {
+            if !str_eq(op_trait_name(d.op), "") {
+                r = resolve_operator(c, src, d.op, lt)
+                handled = true
+            }
+        }
+        if !handled {
+            if d.op >= 6 {
+                if d.op <= 13 { r = t_bool() }
+                else { r = pick_numeric(c, lt, rt) }
+            } else { r = pick_numeric(c, lt, rt) }
+        }
     } else if k == 5 {                             // field access: the declared field type
         let bt: i32 = infer(c, p, src, d.a)
         r = field_type(c, p, src, bt, d.x as usize, d.y as usize)
@@ -1377,9 +1823,10 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
                 if ix.kind == 13 { r = t_str() } else { r = mk_ty(c, 2, 0 - 1, 0 - 1, 5, 0 - 1) }
             }
         }
-    } else if k == 12 {                            // assign: both children
+    } else if k == 12 {                            // assign: both children; the statement is Unit
         infer(c, p, src, d.a)
         infer(c, p, src, d.b)
+        r = t_unit()
     } else if k == 13 {                            // range: optional bounds
         infer_opt(c, p, src, d.a)
         infer_opt(c, p, src, d.b)
@@ -1847,7 +2294,16 @@ fn check_fn_item(mut c: Checker, read p: parser.Parser, read src: str, read f: p
     if f.z >= 0 { rt = lower_type(c, p, src, f.z) }
     c.curret = rt
     c.expected = rt
+    // The fn's bracket generics `[T: Bound]` (gar 4-tuples at (g,h)) are in force for the
+    // body — bound-method dispatch reads them (the reference's `cur_type_param_bounds`).
+    let saved_gbs: i32 = c.gbs
+    let saved_gbc: i32 = c.gbc
+    c.gbs = f.g
+    c.gbc = 0
+    if f.g >= 0 { c.gbc = f.h }
     infer_opt(c, p, src, f.w)                      // the body block
+    c.gbs = saved_gbs
+    c.gbc = saved_gbc
     c.expected = saved_exp
     c.curret = saved_ret
     c.scfloor = saved_floor
@@ -1900,15 +2356,9 @@ fn walk_items(mut c: Checker, read p: parser.Parser, read src: str) {
 // Is this expression in the compared subset? Keyed on `(kind, op)`. Must agree with
 // `typeck_dump_kind` in proptests.rs - grow both together, one increment at a time.
 fn is_typed(read d: parser.ExprData) -> bool {
-    let k: i32 = d.kind
-    if k == 0 or k == 1 or k == 26 or k == 27 or k == 29 or k == 30 { return true }   // literals
-    if k == 2 { return true }                      // Name (the lexical scope)
-    if k == 11 { return true }                     // cast (typed from its annotation)
-    if k == 3 { if d.op == 2 { return true } }     // Unary `not` -> bool
-    if k == 4 {                                    // Binary comparison/logical -> bool (op 6..13)
-        if d.op >= 6 { if d.op <= 13 { return true } }
-    }
-    return false
+    // THE FULL STREAM: every expression is compared (P3's expression coverage endgame). The
+    // predicate stays as a hook for staging a future construct, but nothing is excluded now.
+    return true
 }
 
 // Walk the expression arena in ExprId order, emitting `ty_str(et[id])` (one line) for every
@@ -1930,10 +2380,51 @@ fn dump_types(read src: str, read c: Checker, read p: parser.Parser, read a: All
         if d.kind == 16 {                          // structlit path (an Ident in the reference)
             if d.a >= 0 { list.set(bool, skip, d.a as usize, true) }
         }
+        if d.kind == 18 {                          // FieldInit wrapper: reference stores struct-lit
+            list.set(bool, skip, m, true)          // fields as (Ident, ExprId) pairs - no expr node
+        }
         // NB: a GENERIC struct literal's ctor Name (kind 17's `a`) is NOT skipped - the
         // reference parser also leaves an orphaned, never-inferred ctor Name expr in its
         // arena (it parses `Ctor(args)` as a call before seeing `{`), so both sides emit `?`.
+        //
+        // **Block shim.** The reference stores most blocks as embedded `Block` STRUCTS (not
+        // arena exprs): fn bodies, if-THEN, unsafe/concurrent/region bodies, for body+else,
+        // select arm bodies. Only block-EXPRESSIONS (a bare `{ }` statement, an `else { }`)
+        // are `ExprKind::Block` arena nodes. This parser materializes every block as a kind-23
+        // node, so skip the struct-position ones to compare the same stream.
+        if d.kind == 24 {                          // if: the THEN block (els stays - a real expr)
+            if d.b >= 0 { list.set(bool, skip, d.b as usize, true) }
+        } else if d.kind == 25 or d.kind == 38 or d.kind == 43 {   // unsafe/concurrent/region body
+            if d.a >= 0 { list.set(bool, skip, d.a as usize, true) }
+        } else if d.kind == 31 {                   // for: body AND else are Block structs
+            if d.b >= 0 { list.set(bool, skip, d.b as usize, true) }
+            if d.x >= 0 { list.set(bool, skip, d.x as usize, true) }
+        } else if d.kind == 42 {                   // select: each arm's body block
+            var ai: i32 = 0
+            for ai < d.y {
+                let body: i32 = list.get(i32, p.par, (d.x + ai * 4 + 3) as usize)
+                if body >= 0 { list.set(bool, skip, body as usize, true) }
+                ai = ai + 1
+            }
+        }
         m = m + 1
+    }
+    // Fn BODIES (top-level fns, struct/impl methods - every kind-3 fn item) and trait default
+    // bodies are Block structs in the reference too.
+    var q: usize = 0
+    for q < list.len(parser.ItemData, p.it) {
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, q)
+        if it.kind == 3 {
+            if it.w >= 0 { list.set(bool, skip, it.w as usize, true) }
+        } else if it.kind == 6 {                   // trait: method 7-tuples, body at +6
+            var mi: i32 = 0
+            for mi < it.b {
+                let body: i32 = list.get(i32, p.mar, (it.a + mi * 7 + 6) as usize)
+                if body >= 0 { list.set(bool, skip, body as usize, true) }
+                mi = mi + 1
+            }
+        }
+        q = q + 1
     }
     var i: usize = 0
     for i < n {
