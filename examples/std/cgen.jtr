@@ -150,6 +150,44 @@ fn emit_c_ty(mut sb: String, read p: parser.Parser, read src: str, tyid: i32) {
     string_push(sb, "void")                            // TODO: str / slice / ptr / App / etc.
 }
 
+// A primitive type CODE (typeck's `prim_name` numbering) rendered as its C type. Used by
+// `emit_ty_c` when the Checker gives an inferred primitive type.
+fn prim_code_c(mut sb: String, code: i32) {
+    if code == 0 { string_push(sb, "int8_t")  return }
+    if code == 1 { string_push(sb, "int16_t")  return }
+    if code == 2 { string_push(sb, "int32_t")  return }
+    if code == 3 { string_push(sb, "int64_t")  return }
+    if code == 4 { string_push(sb, "intptr_t")  return }
+    if code == 5 { string_push(sb, "uint8_t")  return }
+    if code == 6 { string_push(sb, "uint16_t")  return }
+    if code == 7 { string_push(sb, "uint32_t")  return }
+    if code == 8 { string_push(sb, "uint64_t")  return }
+    if code == 9 { string_push(sb, "size_t")  return }
+    if code == 10 { string_push(sb, "float")  return }
+    if code == 11 { string_push(sb, "double")  return }
+    if code == 12 { string_push(sb, "bool")  return }
+    string_push(sb, "void")                            // TODO: char / str / cstr
+}
+
+// A Checker per-expr type (a `TyId` into `c.tys`) rendered as its C type, mirroring `cgen::c_type`.
+// Used for inferred-`let` locals (`let x = …` with no annotation). Covers Unit, primitives, and
+// Named aggregates (`Jestyr_<name>`, name span in the `tdecl` row `d.x`: cols 0/1). Other TyData
+// kinds (Ptr/Slice/GenStruct/Fn/…) are added when a corpus file's inference needs them.
+fn emit_ty_c(mut sb: String, read src: str, read c: typeck.Checker, tyid: i32) {
+    if tyid < 0 { string_push(sb, "void")  return }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tyid as usize)
+    if d.kind == 1 { string_push(sb, "void")  return }         // Unit
+    if d.kind == 2 { prim_code_c(sb, d.x)  return }            // Prim
+    if d.kind == 15 {                                          // Named: Jestyr_<name>
+        let ns: i32 = list.get(i32, c.tdecl, (d.x * 10 + 0) as usize)
+        let ne: i32 = list.get(i32, c.tdecl, (d.x * 10 + 1) as usize)
+        string_push(sb, "Jestyr_")
+        string_push(sb, src[ns as usize .. ne as usize])
+        return
+    }
+    string_push(sb, "void")                                    // TODO: other TyData kinds
+}
+
 // A binary-operator code (`ExprData.op` for a Binary node) rendered as its C operator. Mirrors
 // `binop_c`; codes come from the parser's `bin_op` (1=add … 18=shr).
 fn binop_c(code: i32) -> str {
@@ -200,6 +238,32 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, eid: i32) {
         string_push(sb, " ")
         emit_expr(sb, p, src, e.b)
         string_push(sb, ")")
+        return
+    }
+    if e.kind == 5 {                                  // Field access: <base>.j_<name>. (x,y) = name span
+        emit_expr(sb, p, src, e.a)
+        string_push(sb, ".j_")
+        string_push(sb, src[e.x as usize .. e.y as usize])
+        return
+    }
+    if e.kind == 16 {                                 // StructLit: (Jestyr_X){ .j_f = v, … }
+        let path: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)   // a = path Name expr
+        string_push(sb, "(Jestyr_")
+        string_push(sb, src[path.start .. path.end])
+        string_push(sb, "){ ")
+        var i: i32 = 0
+        for i < e.y {                                 // (x,y) = FieldInit slice into ar
+            if i > 0 { string_push(sb, ", ") }
+            let fid: i32 = list.get(i32, p.ar, (e.x + i) as usize)
+            let fi: parser.ExprData = list.get(parser.ExprData, p.ex, fid as usize)   // FieldInit (kind 18)
+            string_push(sb, ".j_")
+            string_push(sb, src[fi.x as usize .. fi.y as usize])   // field name span
+            string_push(sb, " = ")
+            emit_expr(sb, p, src, fi.a)               // a = value
+            i = i + 1
+        }
+        // TODO: fill omitted fields that declare a `= default`; spread `..base`.
+        string_push(sb, " }")
         return
     }
     if e.kind == 11 {                                 // Cast: (TargetType)(inner). x = target TypeId
@@ -287,29 +351,31 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
     string_push(sb, "\n")
 }
 
-fn emit_return(mut sb: String, read p: parser.Parser, read src: str, val: i32, depth: i32) {
+// The statement group threads `read c: typeck.Checker` so an inferred `let x = …` (no annotation)
+// can render its C type from the Checker's per-expr type. (`emit_expr` itself needs no `c` yet.)
+fn emit_return(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, val: i32, depth: i32) {
     if val < 0 {
         line_at(sb, depth, "return;")
         return
     }
     // A control-flow value return dispatches to its block form (`return if …` becomes a C `if`).
     let v: parser.ExprData = list.get(parser.ExprData, p.ex, val as usize)
-    if v.kind == 24 { emit_if(sb, p, src, val, true, depth)  return }   // If
+    if v.kind == 24 { emit_if(sb, p, src, c, val, true, depth)  return }   // If
     indent(sb, depth)
     string_push(sb, "return ")
     emit_expr(sb, p, src, val)
     string_push(sb, ";\n")
 }
 
-fn emit_stmt(mut sb: String, read p: parser.Parser, read src: str, sid: i32, depth: i32) {
+fn emit_stmt(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, sid: i32, depth: i32) {
     let s: parser.StmtData = list.get(parser.StmtData, p.st, sid as usize)
     if s.kind == 1 {                                  // Return
-        emit_return(sb, p, src, s.a, depth)
+        emit_return(sb, p, src, c, s.a, depth)
         return
     }
     if s.kind == 2 {                                  // Expr statement
         let e: parser.ExprData = list.get(parser.ExprData, p.ex, s.a as usize)
-        if e.kind == 24 { emit_if(sb, p, src, s.a, false, depth)  return }   // If as a statement
+        if e.kind == 24 { emit_if(sb, p, src, c, s.a, false, depth)  return }   // If as a statement
         indent(sb, depth)
         emit_expr(sb, p, src, s.a)
         string_push(sb, ";\n")
@@ -317,9 +383,15 @@ fn emit_stmt(mut sb: String, read p: parser.Parser, read src: str, sid: i32, dep
     }
     if s.kind == 0 {                                  // Let / var: `<cty> j_<name> [= <init>];`
         indent(sb, depth)
-        // Annotated type only (an inferred `let x = …` needs the Checker's per-expr type — added
-        // when a corpus file needs it). `(x,y)` = name span; `ty` = annotation TypeId; `a` = init.
-        emit_c_ty(sb, p, src, s.ty)
+        // Annotated type (`ty` >= 0) renders from the annotation; an inferred `let x = <init>` reads
+        // the Checker's per-expr type `c.et[init]`. `(x,y)` = name span; `ty` = annotation; `a` = init.
+        if s.ty >= 0 {
+            emit_c_ty(sb, p, src, s.ty)
+        } else if s.a >= 0 {
+            emit_ty_c(sb, src, c, list.get(i32, c.et, s.a as usize))
+        } else {
+            string_push(sb, "int")                    // no annotation, no init (mirrors the reference)
+        }
         string_push(sb, " j_")
         string_push(sb, src[s.x as usize .. s.y as usize])
         if s.a >= 0 {
@@ -335,7 +407,7 @@ fn emit_stmt(mut sb: String, read p: parser.Parser, read src: str, sid: i32, dep
 // the tail statement is emitted as a `return` (an Expr tail becomes `return <expr>`, a Return tail
 // stays `return <value>`). Mirrors `Cgen::emit_body`. (Drop-scope glue is added when Drop types
 // appear — a no-op for the programs ported so far, so output stays byte-identical.)
-fn emit_body(mut sb: String, read p: parser.Parser, read src: str, block_eid: i32, ret: bool, depth: i32) {
+fn emit_body(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, block_eid: i32, ret: bool, depth: i32) {
     line_at(sb, depth, "{")
     let blk: parser.ExprData = list.get(parser.ExprData, p.ex, block_eid as usize)   // Block (kind 23)
     let n: i32 = blk.y                                // y = stmt_count
@@ -345,11 +417,11 @@ fn emit_body(mut sb: String, read p: parser.Parser, read src: str, block_eid: i3
         let last: bool = i + 1 == n
         if last and ret {
             let s: parser.StmtData = list.get(parser.StmtData, p.st, sid as usize)
-            if s.kind == 1 { emit_return(sb, p, src, s.a, depth + 1) }
-            else if s.kind == 2 { emit_return(sb, p, src, s.a, depth + 1) }
-            else { emit_stmt(sb, p, src, sid, depth + 1) }
+            if s.kind == 1 { emit_return(sb, p, src, c, s.a, depth + 1) }
+            else if s.kind == 2 { emit_return(sb, p, src, c, s.a, depth + 1) }
+            else { emit_stmt(sb, p, src, c, sid, depth + 1) }
         } else {
-            emit_stmt(sb, p, src, sid, depth + 1)
+            emit_stmt(sb, p, src, c, sid, depth + 1)
         }
         i = i + 1
     }
@@ -359,18 +431,18 @@ fn emit_body(mut sb: String, read p: parser.Parser, read src: str, block_eid: i3
 // An `if (cond) { … } [else …]`. The If node (kind 24): `a`=cond, `b`=then Block, `op`=else
 // (-1 none, else an `if` chain or a Block). The condition gets its own paren pair on top of any the
 // expression itself adds (so `if n < 2` renders `if ((j_n < 2))`, matching the reference).
-fn emit_if(mut sb: String, read p: parser.Parser, read src: str, eid: i32, ret: bool, depth: i32) {
+fn emit_if(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, eid: i32, ret: bool, depth: i32) {
     let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
     indent(sb, depth)
     string_push(sb, "if (")
     emit_expr(sb, p, src, e.a)
     string_push(sb, ")\n")
-    emit_body(sb, p, src, e.b, ret, depth)
+    emit_body(sb, p, src, c, e.b, ret, depth)
     if e.op >= 0 {
         line_at(sb, depth, "else")
         let els: parser.ExprData = list.get(parser.ExprData, p.ex, e.op as usize)
-        if els.kind == 24 { emit_if(sb, p, src, e.op, ret, depth) }        // else if
-        else { emit_body(sb, p, src, e.op, ret, depth) }                   // else block
+        if els.kind == 24 { emit_if(sb, p, src, c, e.op, ret, depth) }     // else if
+        else { emit_body(sb, p, src, c, e.op, ret, depth) }               // else block
     }
 }
 
@@ -427,10 +499,54 @@ fn emit_forward_types(mut sb: String, read p: parser.Parser, read src: str) {
             string_push(sb, src[it.x .. it.y])
             string_push(sb, ";\n")
         }
-        // TODO: struct (kind 4) / enum (kind 5) forward typedefs.
+        if it.kind == 4 {                             // struct/record/union: forward typedef
+            string_push(sb, "typedef ")
+            if it.op == 2 { string_push(sb, "union ") } else { string_push(sb, "struct ") }   // op 2 = union
+            string_push(sb, "Jestyr_")
+            string_push(sb, src[it.x .. it.y])
+            string_push(sb, " Jestyr_")
+            string_push(sb, src[it.x .. it.y])
+            string_push(sb, ";\n")
+        }
+        // TODO: enum (kind 5) forward typedefs.
         r = r + 1
     }
     string_push(sb, "\n")
+}
+
+// Struct/record/union definitions (mirrors Cgen::struct_defs). Members are 10-tuples in `mar`
+// at `it.a`, count `it.b`: [tag(0=field,1=method), pub, name_start, name_end, type_id, default,
+// attr_start, attr_count, bits_start, bits_end]. Only fields are emitted (methods live in fn_defs);
+// each struct ends with `};\n\n` (the trailing blank). `@packed`/`@align` attrs are still TODO.
+fn emit_struct_defs(mut sb: String, read p: parser.Parser, read src: str) {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 4 {
+            if it.op == 2 { string_push(sb, "union Jestyr_") } else { string_push(sb, "struct Jestyr_") }
+            string_push(sb, src[it.x .. it.y])
+            string_push(sb, " {\n")
+            var m: i32 = 0
+            for m < it.b {
+                let base: i32 = it.a + m * 10
+                let tag: i32 = list.get(i32, p.mar, base as usize)
+                if tag == 0 {                         // a field (not a method)
+                    string_push(sb, "    ")
+                    let fty: i32 = list.get(i32, p.mar, (base + 4) as usize)
+                    emit_c_ty(sb, p, src, fty)
+                    string_push(sb, " j_")
+                    let fns: i32 = list.get(i32, p.mar, (base + 2) as usize)
+                    let fne: i32 = list.get(i32, p.mar, (base + 3) as usize)
+                    string_push(sb, src[fns as usize .. fne as usize])
+                    string_push(sb, ";\n")
+                }
+                m = m + 1
+            }
+            string_push(sb, "};\n\n")
+        }
+        r = r + 1
+    }
 }
 
 // Result-struct typedefs. `JestyrResult_str` (the `try_from_utf8` intrinsic's result) is emitted
@@ -457,7 +573,7 @@ fn emit_fn_protos(mut sb: String, read p: parser.Parser, read src: str) {
 }
 
 // Function definitions: `<sig>\n<body>\n` each. (Mirrors Cgen::fn_defs -> emit_fn.)
-fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str) {
+fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker) {
     var r: i32 = 0
     for r < list.len(i32, p.roots) {
         let iid: i32 = list.get(i32, p.roots, r)
@@ -466,7 +582,7 @@ fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str) {
             emit_fn_sig(sb, p, src, it)
             string_push(sb, "\n")
             let returns_value: bool = it.z >= 0
-            emit_body(sb, p, src, it.w, returns_value, 0)   // w = body Block ExprId; fn body at depth 0
+            emit_body(sb, p, src, c, it.w, returns_value, 0)   // w = body Block ExprId; fn body at depth 0
             string_push(sb, "\n")
         }
         r = r + 1
@@ -499,16 +615,18 @@ fn emit_main_wrapper(mut sb: String, read p: parser.Parser, read src: str) {
 fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, read src: str) {
     emit_prelude(sb)
     emit_forward_types(sb, p, src)
-    // gen_forward_types / fn_type_typedefs / struct-enum-slice-array-genref defs: empty for hello.
+    // gen_forward_types / fn_type_typedefs: empty until generics/fn-pointers are ported.
+    emit_struct_defs(sb, p, src)                     // captured-region aggregate defs (struct first)
+    // enum / gen-struct / gen-enum / slice / array / genref defs: empty until those are ported.
     emit_result_defs(sb, p, src)
-    // flush_def_capture / dyn_typedefs / extern_protos: empty for hello.
+    // flush_def_capture / dyn_typedefs / extern_protos: no-ops here (no by-value dep reorder needed).
     string_push(sb, "\n")                            // closure_types: unconditional trailing blank
     emit_fn_protos(sb, p, src)
     string_push(sb, "\n")                            // method_protos: unconditional trailing blank
     // impl_protos / dyn_vtables / spawn_runtime: empty for hello.
     string_push(sb, "\n")                            // consts: unconditional trailing blank
     // closure_fns: empty for hello.
-    emit_fn_defs(sb, p, src)
+    emit_fn_defs(sb, p, src, c)
     // method_defs / impl_defs: empty for hello.
     emit_main_wrapper(sb, p, src)
 }
