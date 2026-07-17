@@ -17,7 +17,7 @@
 |---|---|---|
 | P1 lexemes / P2a kinds | `src/lexer.rs`, `src/token.rs` | ✅ DONE (token-for-token, whole corpus) |
 | **P2 parser** | `src/parser.rs`, `src/ast.rs` (~2.6K) | ✅ **COMPLETE** — module golden 125/125, denylist empty |
-| **P3 typeck** | `src/typeck.rs`, `src/types.rs` (~4.5K) | 🟡 **STARTED** — resolved-type golden 127/127 for the *typed subset so far* (literals + boolean ops) |
+| **P3 typeck** | `src/typeck.rs`, `src/types.rs` (~4.5K) | 🟡 **~40%** — Ty arena + `ty_str` display, casts (`lower_type`), scopes + ALL binder forms + **Name resolution**; golden **99/127** full-stream (28 denylisted awaiting the global table) |
 | P4 escape | `src/escape.rs` (~1.5K) | ⬜ not started |
 | P5 cgen | `src/cgen.rs` (~10.8K) | ⬜ not started (the giant) |
 | R2 fixpoint | `--features selfhost-fixpoint` | ⬜ not started (acceptance criterion) |
@@ -41,27 +41,27 @@ Roughly **~16.8K reference lines still to port** (typeck ~4.5K remaining-ish, es
 
 ## P3 typeck — remaining increments (in order)
 
-1. **A Jestyr `Ty` representation + `ty_display`.** Mirror `Ty` (`src/types.rs`): an arena (or
-   compact code+payload) for the recursive forms (`Ptr`, `Slice`, `Array`, `GenRef`, `RegionRef`,
-   `GenStruct`/`GenEnum{args}`, `Fn`, `Result`, `Task`, `Named`, `Opaque`; prims + `Unit`/`TypeKw`/
-   `Unknown`/`Error` trivial). `ty_display` MUST equal `Ty::display` (the golden's canonical form).
-   Fold the current `mark` reachability walk into an `infer` that *returns* a `Ty` and stores it
-   per ExprId; dump `ty_display` for the typed subset. **This is the representation unlock.**
-2. **Arithmetic / bitwise / shift binaries + `-`/`~`/`&` unaries** — result = operand type (numeric)
-   / `GenRef(t)` for `&`. Needs (1). Watch: operator-trait dispatch (`Add`/`Sub`/`Mul`/`Div` on
-   user types → the trait method's return) vs primitive native semantics — see `infer`'s Binary arm
-   (`resolve_operator_trait`).
-3. **`Name` resolution (the bulk).** A lexical `Scope` (name→Ty stack) with locals from
-   `let`/params/loop-binds/match-binds, plus the global table (`build_table`: consts, fns, variants,
-   types). Mirror `infer`'s `Name` arm. Leniency: unknown named type → `Opaque`, generic param →
-   `Opaque` (both non-`Copy`), give-up → `Unknown`. Cross-module qualified access (`mod.x`) needs
-   the import map — but the single-file `check` used by the golden resolves imports as
-   `Modules::single`, so imported names stay `Opaque`/`Unknown` (match that).
-4. **Remaining `infer` arms**, one per increment, each with its golden slice: field access, index,
-   deref, `try`/`?`, call (fn / method / variant-ctor / intrinsic return types), cast, struct &
-   array literals + `..spread`, `if`/`match`/`block`/`unsafe` result types, ranges, closures
-   (`Fn`), `await`/`spawn` (`Task`), `concurrent`/`region`/`select`/`par for`, f-strings, `self`/
-   `Self`, attrs. Then P3's golden covers the whole expression set corpus-wide.
+1. ✅ **Ty representation + `ty_str`** (`786269a`) — the TyData arena (+ `tya` child slices,
+   well-known ids 0–9), `ty_str` field-for-field vs `Ty::display`, `lower_type` (all structural
+   forms; array lens const-eval'd dec/0x/0b), **casts** compared corpus-wide. Key display insight:
+   `Named(i)` ≡ `Opaque(name)` in display, so unresolved named types stay Opaque until the table.
+2. ✅ **Name/scope resolution — the locals half** (`391d24b`) — flat-arena scopes
+   (`scn`/`scst` + `list.truncate`), ALL binder forms (params, let/var, for-iter binds via
+   `iter_elem_type`, match binds via `bind_pattern_types`, closure params, select/par-for binds),
+   block tail types, array/struct/gen-struct literal + fstring/spawn/await/unsafe/if result types.
+   **Name is in the compared subset**: 99/127 full-stream. Two representation shims (structlit-path
+   Names skipped Jestyr-side; fstring-interp Names skipped reference-side).
+3. **The GLOBAL TABLE (`build_table`) — the second half, clears most of the 28-file denylist.**
+   Scan `p.roots` pre-walk into: `type_index` (struct/enum/distinct names → Named display),
+   fn signatures (name → ret `Ty` — types call-bound lets), consts (name → `Ty`), generic enums +
+   `variants` (variant name → enum, payload field types — match binds, bare variant Names,
+   `variant_ctor_type`), struct field types (field access + StructLit-path upgrade + method
+   returns). Also intrinsic return types (`intrinsic_ret` table in typeck.rs: print_*/str ops/
+   string_*/builder_*/fs/env/…). Then: the Call/Field/Index/Deref/Try result arms.
+4. **Leftovers**: expected-type adoption (`cur_expected`: annotated-let → array elem types,
+   closure→fn-pointer coercion), arithmetic joins the compared subset (needs operator-trait
+   returns), the 2-file comptime-generic misalignment (genlist/genmethods — diagnose with
+   DUMP_DIVERGE), `self`/`Self`/attr leaves. Then P3's golden covers the whole corpus stream.
 
 ## P4 escape (after P3) — `src/escape.rs` ~1.5K, smallest pass
 
