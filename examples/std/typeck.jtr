@@ -63,7 +63,12 @@ import "parser"
 //   vmap  — variant names, 3-tuples: (vname span, tdecl row of the owning enum).
 // `selfty` is the enclosing method's `self` type (`Named(struct)` in a struct-item method,
 // Opaque("Self") in a struct-value method, Unit in a plain fn) — save/restored per body.
-struct Checker { tys: List(TyData), tya: List(i32), et: List(i32), scn: List(i32), scst: List(i32), tdecl: List(i32), tch: List(i32), fns: List(i32), cst: List(i32), vmap: List(i32), selfty: i32, alloc: Allocator }
+// `expected`/`curret` mirror the reference's `cur_expected`/`cur_ret` (TyId, -1 = none):
+// `curret` is the enclosing fn's declared return; `expected` is the type the context wants
+// (a `let` annotation, a call's declared param, a struct-lit field's declared type, the fn
+// return at the tail) — read by nullary-variant adoption, closure->fn-pointer coercion, and
+// array-literal element adoption. Save/restored EXACTLY where the reference does.
+struct Checker { tys: List(TyData), tya: List(i32), et: List(i32), scn: List(i32), scst: List(i32), tdecl: List(i32), tch: List(i32), fns: List(i32), cst: List(i32), vmap: List(i32), selfty: i32, expected: i32, curret: i32, scfloor: i32, alloc: Allocator }
 
 // One `Ty` arena node - kinds in the header comment. `a`/`b` are child TyIds or slice fields;
 // `x`/`y` are aux ints (prim code, name span, ret TyId/conv).
@@ -91,7 +96,7 @@ fn mk_ty(mut c: Checker, kind: i32, a: i32, b: i32, x: i32, y: i32) -> i32 {
 // The checker with the well-known instances pre-created (ids 0..7) and `et` sized to the
 // expression arena, all-Unknown.
 fn make_checker(read p: parser.Parser, read a: Allocator) -> Checker {
-    var c: Checker = Checker{ tys: list.make(TyData, a), tya: list.make(i32, a), et: list.make(i32, a), scn: list.make(i32, a), scst: list.make(i32, a), tdecl: list.make(i32, a), tch: list.make(i32, a), fns: list.make(i32, a), cst: list.make(i32, a), vmap: list.make(i32, a), selfty: 1, alloc: a }
+    var c: Checker = Checker{ tys: list.make(TyData, a), tya: list.make(i32, a), et: list.make(i32, a), scn: list.make(i32, a), scst: list.make(i32, a), tdecl: list.make(i32, a), tch: list.make(i32, a), fns: list.make(i32, a), cst: list.make(i32, a), vmap: list.make(i32, a), selfty: 1, expected: 0 - 1, curret: 0 - 1, scfloor: 0, alloc: a }
     mk_ty(c, 0, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 0 Unknown
     mk_ty(c, 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 1 Unit
     mk_ty(c, 2, 0 - 1, 0 - 1, 2, 0 - 1)            // 2 Prim i32   (code 2)
@@ -132,10 +137,13 @@ fn scope_insert(mut c: Checker, ns: i32, ne: i32, ty: i32) {
 }
 
 // Look `src[ns..ne]` up, newest binding first (innermost scope + shadowing win, matching the
-// reference's per-level HashMap walk). Returns the TyId or -1.
+// reference's per-level HashMap walk). Stops at `scfloor`: each fn body gets a FRESH scope
+// stack in the reference (`check_fn` makes a new vec), so a nested fn (a struct-value method
+// inside a comptime type-fn) must NOT see the enclosing fn's bindings. Closures DO capture
+// lexically (they push plain scopes above the floor). Returns the TyId or -1.
 fn scope_lookup(read c: Checker, read src: str, ns: usize, ne: usize) -> i32 {
     var i: i32 = (list.len(i32, c.scn) / 3) as i32
-    for i > 0 {
+    for i > c.scfloor {
         i = i - 1
         let base: i32 = i * 3
         let bns: i32 = list.get(i32, c.scn, base as usize)
@@ -366,12 +374,14 @@ fn find_type(read c: Checker, read src: str, ns: usize, ne: usize) -> i32 {
     return 0 - 1
 }
 
-// The fns row (9-tuples) whose name is `src[ns..ne]`, or -1.
+// The fns row (12-tuples) whose name is `src[ns..ne]`, or -1. Slots: 0/1 name span, 2 ret,
+// 3 fallible, 4 first-runtime-param ty, 5 has_runtime, 6 is_extern, 7/8 comptime-tp slice
+// (3-tuples in `tch`), 9 the fn's ItemId, 10/11 all-params type slice (TyIds in `tch`).
 fn find_fn(read c: Checker, read src: str, ns: usize, ne: usize) -> i32 {
-    let n: i32 = (list.len(i32, c.fns) / 9) as i32
+    let n: i32 = (list.len(i32, c.fns) / 12) as i32
     var i: i32 = 0
     for i < n {
-        let base: i32 = i * 9
+        let base: i32 = i * 12
         let bns: i32 = list.get(i32, c.fns, base as usize)
         let bne: i32 = list.get(i32, c.fns, (base + 1) as usize)
         if str_eq(src[ns .. ne], src[bns as usize .. bne as usize]) { return i }
@@ -560,11 +570,15 @@ fn build_table(mut c: Checker, read p: parser.Parser, read src: str) {
             var hasrt: i32 = 0
             if p0 >= 0 { hasrt = 1 }
             var ctps: List(i32) = list.make(i32, c.alloc)      // comptime `T: type` params
+            var pts: List(i32) = list.make(i32, c.alloc)       // every param's lowered type
             var pi: i32 = 0
             for pi < it.b {
                 let pbase: i32 = it.a + pi * 7
+                let pty: i32 = list.get(i32, p.iar, (pbase + 5) as usize)
+                var pt: i32 = t_unknown()
+                if pty >= 0 { pt = lower_type(c, p, src, pty) }
+                list.push(i32, pts, pt)
                 if list.get(i32, p.iar, pbase as usize) == 1 { // comptime
-                    let pty: i32 = list.get(i32, p.iar, (pbase + 5) as usize)
                     if pty >= 0 {
                         let ptd: parser.TypeData = list.get(parser.TypeData, p.ty, pty as usize)
                         if ptd.kind == 1 {                     // annotated `: type`
@@ -577,7 +591,8 @@ fn build_table(mut c: Checker, read p: parser.Parser, read src: str) {
                 pi = pi + 1
             }
             let cstart: i32 = append_tch(c, ctps)
-            push_fn(c, it.x, it.y, ret, fal, p0, hasrt, 0, cstart, (list.len(i32, ctps) / 3) as i32)
+            let pstart: i32 = append_tch(c, pts)
+            push_fn(c, it.x, it.y, ret, fal, p0, hasrt, 0, cstart, (list.len(i32, ctps) / 3) as i32, iid, pstart, it.b)
         } else if it.kind == 2 {                   // const: the ANNOTATION's type (else Unknown)
             var t: i32 = t_unknown()
             if it.a >= 0 { t = lower_type(c, p, src, it.a) }
@@ -587,7 +602,7 @@ fn build_table(mut c: Checker, read p: parser.Parser, read src: str) {
         } else if it.kind == 8 {                   // extern fn signature
             var ret: i32 = t_unit()
             if it.z >= 0 { ret = lower_type(c, p, src, it.z) }
-            push_fn(c, it.x, it.y, ret, 0, 0 - 1, 0, 1, 0 - 1, 0)
+            push_fn(c, it.x, it.y, ret, 0, 0 - 1, 0, 1, 0 - 1, 0, iid, 0 - 1, 0)
         }
         r2 = r2 + 1
     }
@@ -604,9 +619,8 @@ fn push_tdecl(mut c: Checker, ns: i32, ne: i32, kind: i32) -> i32 {
     return row
 }
 
-// Push a fns row (9-tuple): name span, ret, fallible, first-runtime-param ty, has_runtime,
-// is_extern, and the comptime type-param slice (3-tuples in `tch`: name span + param index).
-fn push_fn(mut c: Checker, ns: i32, ne: i32, ret: i32, fal: i32, p0: i32, hasrt: i32, ext: i32, ctp_start: i32, ctp_count: i32) {
+// Push a fns row (12-tuple; slot layout in `find_fn`'s doc).
+fn push_fn(mut c: Checker, ns: i32, ne: i32, ret: i32, fal: i32, p0: i32, hasrt: i32, ext: i32, ctp_start: i32, ctp_count: i32, item_id: i32, pt_start: i32, pt_count: i32) {
     list.push(i32, c.fns, ns)
     list.push(i32, c.fns, ne)
     list.push(i32, c.fns, ret)
@@ -616,6 +630,9 @@ fn push_fn(mut c: Checker, ns: i32, ne: i32, ret: i32, fal: i32, p0: i32, hasrt:
     list.push(i32, c.fns, ext)
     list.push(i32, c.fns, ctp_start)
     list.push(i32, c.fns, ctp_count)
+    list.push(i32, c.fns, item_id)
+    list.push(i32, c.fns, pt_start)
+    list.push(i32, c.fns, pt_count)
 }
 
 // Substitute a generic fn's comptime type params (3-tuples in `tch`: span + index) with the
@@ -655,6 +672,18 @@ fn subst_fn_ret(mut c: Checker, read src: str, ty: i32, ctp_start: i32, ctp_coun
         let astart: i32 = append_tya(c, tmp)
         return mk_ty(c, 6, astart, d.b, d.x, d.y)
     }
+    if d.kind == 12 {                              // Fn: substitute inside params and return
+        var tmp: List(i32) = list.make(i32, c.alloc)
+        var i: i32 = 0
+        for i < d.b {
+            list.push(i32, tmp, list.get(i32, c.tya, (d.a + i * 2) as usize))          // conv
+            list.push(i32, tmp, subst_fn_ret(c, src, list.get(i32, c.tya, (d.a + i * 2 + 1) as usize), ctp_start, ctp_count, subst))
+            i = i + 1
+        }
+        let pstart: i32 = append_tya(c, tmp)
+        let ret: i32 = subst_fn_ret(c, src, d.x, ctp_start, ctp_count, subst)
+        return mk_ty(c, 12, pstart, d.b, ret, d.y)
+    }
     return ty
 }
 
@@ -662,7 +691,7 @@ fn subst_fn_ret(mut c: Checker, read src: str, ty: i32, ctp_start: i32, ctp_coun
 // each comptime type param takes `eval_type_expr` of its positional argument; the declared
 // return substitutes them; a fallible signature wraps in `T !E`.
 fn fn_call_ret(mut c: Checker, read p: parser.Parser, read src: str, fr: i32, astart: i32, acount: i32) -> i32 {
-    let base: i32 = fr * 9
+    let base: i32 = fr * 12
     var ret: i32 = list.get(i32, c.fns, (base + 2) as usize)
     let ctpc: i32 = list.get(i32, c.fns, (base + 8) as usize)
     if ctpc > 0 {
@@ -762,6 +791,25 @@ fn variant_ctor_type(mut c: Checker, read p: parser.Parser, read src: str, erow:
             i = i + 1
         }
     }
+    var complete: bool = true
+    var k0: i32 = 0
+    for k0 < tpc { if list.get(i32, subst, k0 as usize) < 0 { complete = false }  k0 = k0 + 1 }
+    if !complete {
+        // Not fully recovered (a nullary variant like `none`): adopt the EXPECTED instantiation
+        // when it is the same generic enum (mirrors the reference's `cur_expected` adoption).
+        if c.expected >= 0 {
+            let ed: TyData = list.get(TyData, c.tys, c.expected as usize)
+            if ed.kind == 6 {
+                if str_eq(src[ed.x as usize .. ed.y as usize], src[td(c, erow, 0) as usize .. td(c, erow, 1) as usize]) {
+                    var eargs: List(i32) = list.make(i32, c.alloc)
+                    var m: i32 = 0
+                    for m < ed.b { list.push(i32, eargs, list.get(i32, c.tya, (ed.a + m) as usize))  m = m + 1 }
+                    let estart: i32 = append_tya(c, eargs)
+                    return mk_ty(c, 6, estart, ed.b, td(c, erow, 0), td(c, erow, 1))
+                }
+            }
+        }
+    }
     var args: List(i32) = list.make(i32, c.alloc)
     var k: i32 = 0
     for k < tpc {
@@ -778,8 +826,13 @@ fn variant_ctor_type(mut c: Checker, read p: parser.Parser, read src: str, erow:
 // slices expose `len`/`ptr`, `str` exposes `len`/`ptr`/`cstr`, `String` exposes `len`; a Named
 // struct projects the declared field type (no such field -> Error); enums/distincts project
 // nothing (Unknown). Generic-struct field projection lands with substitution.
-fn field_type(mut c: Checker, read src: str, bt: i32, fs: usize, fe: usize) -> i32 {
+fn field_type(mut c: Checker, read p: parser.Parser, read src: str, bt: i32, fs: usize, fe: usize) -> i32 {
     let bd: TyData = list.get(TyData, c.tys, bt as usize)
+    if bd.kind == 6 {                              // GenStruct: the substituted declared field
+        let t: i32 = gen_field_decl_ty(c, p, src, bd.x as usize, bd.y as usize, bd.a, bd.b, fs, fe)
+        if t >= 0 { return t }
+        return mk_ty(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // no such field -> Error
+    }
     if bd.kind == 9 {                              // Array: .len only
         if str_eq(src[fs .. fe], "len") { return t_usize() }
         return t_unknown()
@@ -835,6 +888,121 @@ fn find_struct_method(read c: Checker, read src: str, srow: i32, ms: usize, me: 
     return 0 - 1
 }
 
+// The declared type of field `src[fs..fe]` on the Named struct at tdecl row `row`, or -1 (a
+// no-error lookup for expected-type propagation; mirrors `struct_field_decl_ty`).
+fn struct_field_ty_opt(read c: Checker, read src: str, row: i32, fs: usize, fe: usize) -> i32 {
+    if td(c, row, 2) != 0 { return 0 - 1 }         // not a struct
+    let fstart: i32 = td(c, row, 3)
+    let fcount: i32 = td(c, row, 4)
+    var i: i32 = 0
+    for i < fcount {
+        let base: i32 = fstart + i * 3
+        let bns: i32 = list.get(i32, c.tch, base as usize)
+        let bne: i32 = list.get(i32, c.tch, (base + 1) as usize)
+        if str_eq(src[fs .. fe], src[bns as usize .. bne as usize]) {
+            return list.get(i32, c.tch, (base + 2) as usize)
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// The `struct { ... }` value expr returned by the comptime type-fn named `src[ns..ne]` (the
+// generic-struct declaration `fn List(comptime T: type) -> type { return struct {...} }`), or
+// -1. Digs the fn's body block for a top-level `return <struct-value>`.
+fn find_gen_struct_node(read c: Checker, read p: parser.Parser, read src: str, ns: usize, ne: usize) -> i32 {
+    let fr: i32 = find_fn(c, src, ns, ne)
+    if fr < 0 { return 0 - 1 }
+    let iid: i32 = list.get(i32, c.fns, (fr * 12 + 9) as usize)
+    let f: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+    if f.w < 0 { return 0 - 1 }
+    let b: parser.ExprData = list.get(parser.ExprData, p.ex, f.w as usize)
+    var i: i32 = 0
+    for i < b.y {
+        let sid: i32 = list.get(i32, p.sar, (b.x + i) as usize)
+        let s: parser.StmtData = list.get(parser.StmtData, p.st, sid as usize)
+        if s.kind == 1 {                           // return
+            if s.a >= 0 {
+                let v: parser.ExprData = list.get(parser.ExprData, p.ex, s.a as usize)
+                if v.kind == 36 { return s.a }
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// The declared type of field `src[fs..fe]` on the generic struct `ctor(args)` — the comptime
+// fn's struct-value field, lowered then substituted under the ctor's comptime type params →
+// the instance's args (TyIds at `tya[args_start..]`). -1 when the ctor/field can't be found.
+// (Mirrors `gen_struct_field_decl_ty`.)
+fn gen_field_decl_ty(mut c: Checker, read p: parser.Parser, read src: str, cns: usize, cne: usize, args_start: i32, args_count: i32, fs: usize, fe: usize) -> i32 {
+    let sv: i32 = find_gen_struct_node(c, p, src, cns, cne)
+    if sv < 0 { return 0 - 1 }
+    let fr: i32 = find_fn(c, src, cns, cne)
+    let ctps: i32 = list.get(i32, c.fns, (fr * 12 + 7) as usize)
+    let ctpc: i32 = list.get(i32, c.fns, (fr * 12 + 8) as usize)
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, sv as usize)
+    var i: i32 = 0
+    for i < d.y {                                  // member 10-tuples in `mar`
+        let mbase: i32 = d.x + i * 10
+        if list.get(i32, p.mar, mbase as usize) == 0 {         // field
+            let bns: i32 = list.get(i32, p.mar, (mbase + 2) as usize)
+            let bne: i32 = list.get(i32, p.mar, (mbase + 3) as usize)
+            if str_eq(src[fs .. fe], src[bns as usize .. bne as usize]) {
+                let fty: i32 = lower_type(c, p, src, list.get(i32, p.mar, (mbase + 4) as usize))
+                return subst_ctp_args(c, src, fty, ctps, ctpc, args_start, args_count)
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// The declared return of the generic struct `ctor(args)`'s method `src[ms..me]`, substituted
+// under the receiver's type args (fallible wraps in `T !E`), or -1. (Mirrors
+// `resolve_struct_method`'s GenStruct path.)
+fn gen_method_ret(mut c: Checker, read p: parser.Parser, read src: str, cns: usize, cne: usize, args_start: i32, args_count: i32, ms: usize, me: usize) -> i32 {
+    let sv: i32 = find_gen_struct_node(c, p, src, cns, cne)
+    if sv < 0 { return 0 - 1 }
+    let fr: i32 = find_fn(c, src, cns, cne)
+    let ctps: i32 = list.get(i32, c.fns, (fr * 12 + 7) as usize)
+    let ctpc: i32 = list.get(i32, c.fns, (fr * 12 + 8) as usize)
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, sv as usize)
+    var i: i32 = 0
+    for i < d.y {
+        let mbase: i32 = d.x + i * 10
+        if list.get(i32, p.mar, mbase as usize) == 1 {         // method
+            let fid: i32 = list.get(i32, p.mar, (mbase + 1) as usize)
+            let f: parser.ItemData = list.get(parser.ItemData, p.it, fid as usize)
+            if str_eq(src[ms .. me], src[f.x as usize .. f.y as usize]) {
+                var ret: i32 = t_unit()
+                if f.z >= 0 { ret = lower_type(c, p, src, f.z) }
+                ret = subst_ctp_args(c, src, ret, ctps, ctpc, args_start, args_count)
+                if fn_is_fallible(p, f.e) { return mk_ty(c, 5, ret, 0 - 1, 0 - 1, 0 - 1) }
+                return ret
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Substitute comptime type-params (3-tuples at `tch[ctps..]`) with the instance's args (TyIds
+// at `tya[args_start..]`, positionally) inside `ty` — the `find_gen_struct_node` companion.
+fn subst_ctp_args(mut c: Checker, read src: str, ty: i32, ctps: i32, ctpc: i32, args_start: i32, args_count: i32) -> i32 {
+    if ctpc <= 0 { return ty }
+    var subst: List(i32) = list.make(i32, c.alloc)
+    var j: i32 = 0
+    for j < ctpc {
+        var a: i32 = t_unknown()
+        if j < args_count { a = list.get(i32, c.tya, (args_start + j) as usize) }
+        list.push(i32, subst, a)
+        j = j + 1
+    }
+    return subst_fn_ret(c, src, ty, ctps, ctpc, subst)
+}
+
 // The return type of a string/file-IO/atomic INTRINSIC (not a declared fn), or -1 (mirrors
 // `string_intrinsic_ret` / `io_intrinsic_ret` / `atomic_intrinsic_ret`).
 fn intrinsic_ret(mut c: Checker, t: str) -> i32 {
@@ -862,8 +1030,16 @@ fn intrinsic_ret(mut c: Checker, t: str) -> i32 {
 
 // If `recv` is a Named struct with a *function-pointer* field `src[fs..fe]`, that Fn TyId —
 // else -1 (mirrors `fn_ptr_field`, the diagnostic-free probe ahead of method resolution).
-fn field_probe_fn(read c: Checker, read src: str, recv: i32, fs: usize, fe: usize) -> i32 {
+fn field_probe_fn(mut c: Checker, read p: parser.Parser, read src: str, recv: i32, fs: usize, fe: usize) -> i32 {
     let rd: TyData = list.get(TyData, c.tys, recv as usize)
+    if rd.kind == 6 {                              // GenStruct: probe the substituted decl field
+        let t: i32 = gen_field_decl_ty(c, p, src, rd.x as usize, rd.y as usize, rd.a, rd.b, fs, fe)
+        if t >= 0 {
+            let fd: TyData = list.get(TyData, c.tys, t as usize)
+            if fd.kind == 12 { return t }
+        }
+        return 0 - 1
+    }
     if rd.kind != 15 { return 0 - 1 }
     if td(c, rd.x, 2) != 0 { return 0 - 1 }        // not a struct
     let fstart: i32 = td(c, rd.x, 3)
@@ -941,14 +1117,14 @@ fn infer_call(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> 
             list.push(i32, argt, infer(c, p, src, list.get(i32, p.ar, (d.x + i) as usize)))
             i = i + 1
         }
-        let fty: i32 = field_probe_fn(c, src, recv, cal.x as usize, cal.y as usize)
+        let fty: i32 = field_probe_fn(c, p, src, recv, cal.x as usize, cal.y as usize)
         if fty >= 0 {                              // indirect call through a fn-pointer field
             let fd: TyData = list.get(TyData, c.tys, fty as usize)
             return fd.x
         }
         let fr: i32 = find_fn(c, src, cal.x as usize, cal.y as usize)
         if fr >= 0 {                               // free method: f(recv, args)
-            let base: i32 = fr * 9
+            let base: i32 = fr * 12
             if list.get(i32, c.fns, (base + 6) as usize) == 0 {        // not extern
                 let p0: i32 = list.get(i32, c.fns, (base + 4) as usize)
                 if p0 >= 0 {
@@ -963,7 +1139,7 @@ fn infer_call(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> 
             }
         }
         let rd: TyData = list.get(TyData, c.tys, recv as usize)
-        if rd.kind == 15 {                         // struct method
+        if rd.kind == 15 {                         // struct method (a struct item's)
             let mb: i32 = find_struct_method(c, src, rd.x, cal.x as usize, cal.y as usize)
             if mb >= 0 {
                 let ret: i32 = list.get(i32, c.tch, (mb + 2) as usize)
@@ -972,6 +1148,10 @@ fn infer_call(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> 
                 }
                 return ret
             }
+        }
+        if rd.kind == 6 {                          // generic-struct method, under the recv's args
+            let ret: i32 = gen_method_ret(c, p, src, rd.x as usize, rd.y as usize, rd.a, rd.b, cal.x as usize, cal.y as usize)
+            if ret >= 0 { return ret }
         }
         return t_unknown()
     }
@@ -982,14 +1162,28 @@ fn infer_call(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> 
         infer_slice(c, p, src, d.x, d.y)
         return ctd.x
     }
+    // Each argument is inferred with its declared parameter type as the EXPECTED type (so a
+    // nullary generic variant resolves and a closure argument coerces), like the reference.
+    var fr: i32 = 0 - 1
+    if cal.kind == 2 { fr = find_fn(c, src, cal.start, cal.end) }
+    var pts: i32 = 0 - 1
+    var ptc: i32 = 0
+    if fr >= 0 {
+        pts = list.get(i32, c.fns, (fr * 12 + 10) as usize)
+        ptc = list.get(i32, c.fns, (fr * 12 + 11) as usize)
+    }
     var argt: List(i32) = list.make(i32, c.alloc)
     var i: i32 = 0
     for i < d.y {
+        var exp: i32 = 0 - 1
+        if pts >= 0 { if i < ptc { exp = list.get(i32, c.tch, (pts + i) as usize) } }
+        let savede: i32 = c.expected
+        c.expected = exp
         list.push(i32, argt, infer(c, p, src, list.get(i32, p.ar, (d.x + i) as usize)))
+        c.expected = savede
         i = i + 1
     }
     if cal.kind == 2 {                             // Name callee
-        let fr: i32 = find_fn(c, src, cal.start, cal.end)
         if fr >= 0 { return fn_call_ret(c, p, src, fr, d.x, d.y) }
         let erow: i32 = find_variant(c, src, cal.start, cal.end)
         if erow >= 0 { return variant_ctor_type(c, p, src, erow, cal.start, cal.end, argt) }
@@ -1163,7 +1357,7 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
         } else { r = pick_numeric(c, lt, rt) }
     } else if k == 5 {                             // field access: the declared field type
         let bt: i32 = infer(c, p, src, d.a)
-        r = field_type(c, src, bt, d.x as usize, d.y as usize)
+        r = field_type(c, p, src, bt, d.x as usize, d.y as usize)
     } else if k == 7 {                             // deref: `p.*` unwraps a pointer/reference
         let bt: i32 = infer(c, p, src, d.a)
         let bd: TyData = list.get(TyData, c.tys, bt as usize)
@@ -1194,45 +1388,83 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
         r = lower_type(c, p, src, d.x)
     } else if k == 10 {                            // call: the resolution chain
         r = infer_call(c, p, src, id)
-    } else if k == 14 {                            // array literal: [e0, ...] -> [N]<first elem's ty>
-        var elem: i32 = t_unknown()
+    } else if k == 14 {                            // array literal: [e0, ...]
+        // Adopt an EXPECTED element type (`var t: [N]u64 = [a, b]`) so an i32-by-default
+        // element takes the annotated element type; each element infers against it.
+        var exp_elem: i32 = 0 - 1
+        if c.expected >= 0 {
+            let ed: TyData = list.get(TyData, c.tys, c.expected as usize)
+            if ed.kind == 9 { exp_elem = ed.a }
+        }
+        var elem: i32 = exp_elem
         var i: i32 = 0
         for i < d.y {
+            let savede: i32 = c.expected
+            c.expected = exp_elem
             let t: i32 = infer(c, p, src, list.get(i32, p.ar, (d.x + i) as usize))
-            if i == 0 { elem = t }
+            c.expected = savede
+            if elem < 0 { elem = t }
             i = i + 1
         }
+        if elem < 0 { elem = t_unknown() }
         r = mk_ty(c, 9, elem, d.y, 0 - 1, 0 - 1)
-    } else if k == 15 {                            // array repeat: [v; n] -> [n]<v's ty> (count const-eval'd)
+    } else if k == 15 {                            // array repeat: [v; n] (count const-eval'd)
+        var exp_elem: i32 = 0 - 1
+        if c.expected >= 0 {
+            let ed: TyData = list.get(TyData, c.tys, c.expected as usize)
+            if ed.kind == 9 { exp_elem = ed.a }
+        }
+        let savede: i32 = c.expected
+        c.expected = exp_elem
         let vt: i32 = infer(c, p, src, d.a)
-        r = mk_ty(c, 9, vt, eval_array_len(p, src, d.b), 0 - 1, 0 - 1)
+        c.expected = savede
+        var elem: i32 = vt
+        if exp_elem >= 0 { elem = exp_elem }
+        r = mk_ty(c, 9, elem, eval_array_len(p, src, d.b), 0 - 1, 0 - 1)
     } else if k == 16 {                            // structlit: fields + spread; the path is an
-        infer_slice(c, p, src, d.x, d.y)           // Ident in the reference (never inferred)
-        infer_opt(c, p, src, d.b)
+        // Ident in the reference (never inferred). Resolve the named struct FIRST so each
+        // field value infers against its DECLARED type (what lets a fn-pointer field accept
+        // a coercing closure literal - `Allocator{ alloc_fn: |n| ... }`).
         let path: parser.ExprData = list.get(parser.ExprData, p.ex, d.a as usize)
-        if str_eq(src[path.start .. path.end], "Self") {
+        let is_self: bool = str_eq(src[path.start .. path.end], "Self")
+        var erow: i32 = 0 - 1
+        if !is_self { erow = find_variant(c, src, path.start, path.end) }
+        var named_row: i32 = 0 - 1
+        if !is_self { if erow < 0 { named_row = find_type(c, src, path.start, path.end) } }
+        var fi: i32 = 0
+        for fi < d.y {
+            let fid: i32 = list.get(i32, p.ar, (d.x + fi) as usize)
+            let fd: parser.ExprData = list.get(parser.ExprData, p.ex, fid as usize)
+            var exp: i32 = 0 - 1
+            if named_row >= 0 { exp = struct_field_ty_opt(c, src, named_row, fd.x as usize, fd.y as usize) }
+            let savede: i32 = c.expected
+            c.expected = exp
+            infer(c, p, src, fid)
+            c.expected = savede
+            fi = fi + 1
+        }
+        infer_opt(c, p, src, d.b)                  // spread
+        if is_self {
             r = c.selfty                           // `Self { ... }` -> the enclosing method's type
-        } else {
-            let erow: i32 = find_variant(c, src, path.start, path.end)
-            if erow >= 0 {                         // a struct-variant construction, e.g. `rect { w, h }`
-                var argt: List(i32) = list.make(i32, c.alloc)
-                var fi: i32 = 0
-                for fi < d.y {                     // positional: field-init value types in order
-                    let fid: i32 = list.get(i32, p.ar, (d.x + fi) as usize)
-                    let fd: parser.ExprData = list.get(parser.ExprData, p.ex, fid as usize)
-                    list.push(i32, argt, list.get(i32, c.et, fd.a as usize))
-                    fi = fi + 1
-                }
-                r = variant_ctor_type(c, p, src, erow, path.start, path.end, argt)
-            } else {
-                let row: i32 = find_type(c, src, path.start, path.end)
-                if row >= 0 { r = mk_ty(c, 15, 0 - 1, 0 - 1, row, 0 - 1) }        // Named
-                else { r = mk_ty(c, 4, 0 - 1, 0 - 1, path.start as i32, path.end as i32) }   // Opaque
+        } else if erow >= 0 {                      // a struct-variant construction, e.g. `rect { w, h }`
+            var argt: List(i32) = list.make(i32, c.alloc)
+            var vi: i32 = 0
+            for vi < d.y {                         // positional: field-init value types in order
+                let fid: i32 = list.get(i32, p.ar, (d.x + vi) as usize)
+                let fd: parser.ExprData = list.get(parser.ExprData, p.ex, fid as usize)
+                list.push(i32, argt, list.get(i32, c.et, fd.a as usize))
+                vi = vi + 1
             }
+            r = variant_ctor_type(c, p, src, erow, path.start, path.end, argt)
+        } else if named_row >= 0 {
+            r = mk_ty(c, 15, 0 - 1, 0 - 1, named_row, 0 - 1)   // Named
+        } else {
+            r = mk_ty(c, 4, 0 - 1, 0 - 1, path.start as i32, path.end as i32)   // Opaque
         }
     } else if k == 17 {                            // genstructlit: Ctor(targs){fields} -> GenStruct
-        infer_slice(c, p, src, d.b, d.y)           // field inits (the ctor Ident is never inferred;
-        // the targ exprs go through eval_type_expr, NOT infer - they stay Unknown in `et`)
+        // Type arguments FIRST, so each field infers against its declared type UNDER the
+        // substitution (a closure coerces in a generic vtable's fn-pointer field). The targ
+        // exprs go through eval_type_expr, NOT infer - they stay Unknown in `et`.
         var tmp: List(i32) = list.make(i32, c.alloc)
         var i: i32 = 0
         for i < d.x {
@@ -1242,6 +1474,17 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
         }
         let astart: i32 = append_tya(c, tmp)
         let ctor: parser.ExprData = list.get(parser.ExprData, p.ex, d.a as usize)
+        var fi: i32 = 0
+        for fi < d.y {
+            let fid: i32 = list.get(i32, p.ar, (d.b + fi) as usize)
+            let fd: parser.ExprData = list.get(parser.ExprData, p.ex, fid as usize)
+            let exp: i32 = gen_field_decl_ty(c, p, src, ctor.start, ctor.end, astart, d.x, fd.x as usize, fd.y as usize)
+            let savede: i32 = c.expected
+            c.expected = exp
+            infer(c, p, src, fid)
+            c.expected = savede
+            fi = fi + 1
+        }
         r = mk_ty(c, 6, astart, d.x, ctor.start as i32, ctor.end as i32)
     } else if k == 18 {                            // fieldinit value
         infer(c, p, src, d.a)
@@ -1277,6 +1520,15 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
         infer(c, p, src, d.a)
         r = t_unit()
     } else if k == 37 {                            // closure: params in scope for the body
+        // If a *function-pointer* type is EXPECTED here (an annotated let / call argument /
+        // struct-lit field / return), this is a closure->fn-pointer coercion: unannotated
+        // params take the expected param types, the body infers against the expected return,
+        // and the closure GETS that `Fn` type. Otherwise it stays Opaque("closure").
+        var expfn: i32 = 0 - 1
+        if c.expected >= 0 {
+            let ed: TyData = list.get(TyData, c.tys, c.expected as usize)
+            if ed.kind == 12 { expfn = c.expected }
+        }
         push_scope(c)
         var i: i32 = 0
         for i < d.y {
@@ -1286,12 +1538,21 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
             let pty: i32 = list.get(i32, p.clar, (base + 2) as usize)
             var t: i32 = t_unknown()
             if pty >= 0 { t = lower_type(c, p, src, pty) }
+            else if expfn >= 0 {
+                let fd: TyData = list.get(TyData, c.tys, expfn as usize)
+                if i < fd.b { t = list.get(i32, c.tya, (fd.a + i * 2 + 1) as usize) }
+            }
             scope_insert(c, ns, ne, t)
             i = i + 1
         }
+        let savede: i32 = c.expected
+        if expfn >= 0 { let fd: TyData = list.get(TyData, c.tys, expfn as usize)  c.expected = fd.x }
+        else { c.expected = 0 - 1 }
         infer(c, p, src, d.a)
+        c.expected = savede
         pop_scope(c)
-        r = mk_ty(c, 18, 0 - 1, 0 - 1, 0, 0 - 1)   // Opaque("closure") - the un-coerced form
+        if expfn >= 0 { r = expfn }                // coerced: the expected fn-pointer type
+        else { r = mk_ty(c, 18, 0 - 1, 0 - 1, 0, 0 - 1) }   // Opaque("closure")
     } else if k == 39 {                            // spawn: Task(<the call's type>)
         let t: i32 = infer(c, p, src, d.a)
         r = mk_ty(c, 13, t, 0 - 1, 0 - 1, 0 - 1)
@@ -1476,15 +1737,23 @@ fn infer_block(mut c: Checker, read p: parser.Parser, read src: str, id: i32) ->
         if s.kind == 0 {                           // let / var
             var expected: i32 = 0 - 1
             if s.ty >= 0 { expected = lower_type(c, p, src, s.ty) }
+            // The annotation (or none) is the EXPECTED type for the initializer, saved and
+            // restored so the block's tail keeps the enclosing seed (the fn return).
             var inferred: i32 = 0 - 1
+            let savede: i32 = c.expected
+            c.expected = expected
             if s.a >= 0 { inferred = infer(c, p, src, s.a) }
+            c.expected = savede
             var bind: i32 = t_unknown()
             if expected >= 0 { bind = expected }
             else if inferred >= 0 { bind = inferred }
             scope_insert(c, s.x, s.y, bind)
             result = t_unit()
         } else if s.kind == 1 {                    // return
+            let savede: i32 = c.expected
+            c.expected = c.curret                  // the fn's declared return is expected here
             infer_opt(c, p, src, s.a)
+            c.expected = savede
             result = t_unit()
         } else {                                   // expression statement
             let t: i32 = infer(c, p, src, s.a)
@@ -1552,6 +1821,10 @@ fn check_fn_item(mut c: Checker, read p: parser.Parser, read src: str, read f: p
     let saved_self: i32 = c.selfty
     c.selfty = selfty
     push_scope(c)
+    // Each fn body starts a FRESH scope stack (the reference's `check_fn` makes a new vec):
+    // raise the lookup floor so a nested fn can't see the enclosing fn's bindings.
+    let saved_floor: i32 = c.scfloor
+    c.scfloor = (list.len(i32, c.scn) / 3) as i32
     var i: i32 = 0
     for i < f.b {
         let base: i32 = f.a + i * 7
@@ -1565,7 +1838,19 @@ fn check_fn_item(mut c: Checker, read p: parser.Parser, read src: str, read f: p
         }
         i = i + 1
     }
+    // The (ok) return annotation is `cur_ret` AND the seeded expected type for the body's tail
+    // (an implicit return), so a tail `match`/`if` propagates it into its arms (mirrors
+    // `check_fn`'s cur_ret/cur_expected seeding). Non-tail let/return save/restore around it.
+    let saved_ret: i32 = c.curret
+    let saved_exp: i32 = c.expected
+    var rt: i32 = 0 - 1
+    if f.z >= 0 { rt = lower_type(c, p, src, f.z) }
+    c.curret = rt
+    c.expected = rt
     infer_opt(c, p, src, f.w)                      // the body block
+    c.expected = saved_exp
+    c.curret = saved_ret
+    c.scfloor = saved_floor
     pop_scope(c)
     c.selfty = saved_self
 }

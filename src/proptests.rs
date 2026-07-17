@@ -7505,8 +7505,7 @@ mod c_oracle {
     /// - GENERIC METHOD returns (struct-value methods under the receiver's type args —
     ///   `resolve_struct_method`'s substitution — and bracket-generic unification in
     ///   `monomorphize_ret`): genmethods, core.
-    const TYPECK_GOLDEN_DENYLIST: &[&str] =
-        &["fn_ptr.jtr", "gen_vtable.jtr", "genmethods.jtr", "guards.jtr", "option.jtr", "core.jtr"];
+    const TYPECK_GOLDEN_DENYLIST: &[&str] = &[];
 
     /// **P3 whole-corpus resolved-type golden.** For every corpus `.jtr` file, the Jestyr typeck
     /// (`examples/std/typeck.jtr`) must resolve the *same* `Ty` for every expression whose kind
