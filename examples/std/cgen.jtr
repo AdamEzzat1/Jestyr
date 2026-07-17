@@ -129,6 +129,13 @@ fn c_prim(read name: str) -> str {
     if str_eq(name, "f32") { return "float" }
     if str_eq(name, "f64") { return "double" }
     if str_eq(name, "bool") { return "bool" }
+    if str_eq(name, "char") { return "uint32_t" }
+    if str_eq(name, "str") { return "JestyrStr" }
+    if str_eq(name, "os_str") { return "JestyrStr" }
+    if str_eq(name, "cstr") { return "const char*" }
+    if str_eq(name, "String") { return "JestyrString" }
+    if str_eq(name, "Builder") { return "JestyrBuilder" }
+    if str_eq(name, "Cow") { return "JestyrCow" }
     return ""                                          // not a primitive
 }
 
@@ -166,7 +173,10 @@ fn prim_code_c(mut sb: String, code: i32) {
     if code == 10 { string_push(sb, "float")  return }
     if code == 11 { string_push(sb, "double")  return }
     if code == 12 { string_push(sb, "bool")  return }
-    string_push(sb, "void")                            // TODO: char / str / cstr
+    if code == 13 { string_push(sb, "uint32_t")  return }   // char
+    if code == 14 { string_push(sb, "JestyrStr")  return }  // str
+    if code == 15 { string_push(sb, "const char*")  return } // cstr
+    string_push(sb, "void")
 }
 
 // A Checker per-expr type (a `TyId` into `c.tys`) rendered as its C type, mirroring `cgen::c_type`.
@@ -212,8 +222,18 @@ fn binop_c(code: i32) -> str {
     return "?"
 }
 
+// Is the Checker's type of expr `eid` the primitive `str`? (TyData kind 2 Prim, code 14.)
+fn expr_is_str(read c: typeck.Checker, eid: i32) -> bool {
+    let tid: i32 = list.get(i32, c.et, eid as usize)
+    if tid < 0 { return false }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+    return d.kind == 2 and d.x == 14
+}
+
 // ---- expressions (mirrors the relevant arms of Cgen::emit_expr) ----
-fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, eid: i32) {
+// Threads `read c: typeck.Checker` — Field/Index are type-directed (`.len` on a `str` is a real C
+// field; `s[lo..hi]` on a `str` is a `jestyr_rt_substr` sub-view).
+fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, eid: i32) {
     let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
     if e.kind == 29 {                                 // Str: emit the literal verbatim inside JSTR
         string_push(sb, "JSTR(")
@@ -221,8 +241,30 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, eid: i32) {
         string_push(sb, ")")
         return
     }
-    if e.kind == 0 {                                  // Int: underscores stripped (c_int_literal)
+    if e.kind == 0 or e.kind == 1 {                   // Int / Float: underscores stripped
         emit_int_literal(sb, src[e.start .. e.end])
+        return
+    }
+    if e.kind == 26 {                                 // Char: the literal verbatim
+        string_push(sb, src[e.start .. e.end])
+        return
+    }
+    if e.kind == 27 {                                 // Bool: op 1 = true, 0 = false
+        if e.op == 1 { string_push(sb, "true") } else { string_push(sb, "false") }
+        return
+    }
+    if e.kind == 30 {                                 // Null
+        string_push(sb, "NULL")
+        return
+    }
+    if e.kind == 3 {                                  // Unary: (OPrhs). op 1=neg 2=not 3=bitnot 4=ref
+        string_push(sb, "(")
+        if e.op == 1 { string_push(sb, "-") }
+        else if e.op == 2 { string_push(sb, "!") }
+        else if e.op == 3 { string_push(sb, "~") }
+        else if e.op == 4 { string_push(sb, "&") }
+        emit_expr(sb, p, src, c,e.a)
+        string_push(sb, ")")
         return
     }
     if e.kind == 2 {                                  // Name (value position): a `j_`-prefixed local/param
@@ -232,18 +274,53 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, eid: i32) {
     }
     if e.kind == 4 {                                  // Binary: (lhs OP rhs)
         string_push(sb, "(")
-        emit_expr(sb, p, src, e.a)
+        emit_expr(sb, p, src, c,e.a)
         string_push(sb, " ")
         string_push(sb, binop_c(e.op))
         string_push(sb, " ")
-        emit_expr(sb, p, src, e.b)
+        emit_expr(sb, p, src, c,e.b)
         string_push(sb, ")")
         return
     }
-    if e.kind == 5 {                                  // Field access: <base>.j_<name>. (x,y) = name span
-        emit_expr(sb, p, src, e.a)
+    if e.kind == 5 {                                  // Field access. (x,y) = name span
+        let fname: str = src[e.x as usize .. e.y as usize]
+        emit_expr(sb, p, src, c, e.a)
+        // A string view's `len`/`ptr`/`cstr` are real C fields (not `j_`-prefixed).
+        if expr_is_str(c, e.a) {
+            if str_eq(fname, "len") { string_push(sb, ".len")  return }
+            if str_eq(fname, "ptr") or str_eq(fname, "cstr") { string_push(sb, ".ptr")  return }
+        }
         string_push(sb, ".j_")
-        string_push(sb, src[e.x as usize .. e.y as usize])
+        string_push(sb, fname)
+        return
+    }
+    if e.kind == 6 {                                  // Index. `s[lo..hi]` on a str -> substr sub-view
+        if expr_is_str(c, e.a) {
+            let ix: parser.ExprData = list.get(parser.ExprData, p.ex, e.b as usize)
+            if ix.kind == 13 {                        // Range: op=inclusive, a=lo (-1 none), b=hi (-1 none)
+                string_push(sb, "jestyr_rt_substr(")
+                emit_expr(sb, p, src, c, e.a)
+                string_push(sb, ", ")
+                if ix.a >= 0 { emit_expr(sb, p, src, c, ix.a) } else { string_push(sb, "0") }
+                string_push(sb, ", ")
+                if ix.b >= 0 {
+                    if ix.op == 1 {                   // inclusive `..=hi` -> ((hi) + 1)
+                        string_push(sb, "((")
+                        emit_expr(sb, p, src, c, ix.b)
+                        string_push(sb, ") + 1)")
+                    } else {
+                        emit_expr(sb, p, src, c, ix.b)
+                    }
+                } else {                              // open end -> ({base}).len
+                    string_push(sb, "(")
+                    emit_expr(sb, p, src, c, e.a)
+                    string_push(sb, ").len")
+                }
+                string_push(sb, ")")
+                return
+            }
+        }
+        // TODO: slice/array indexing (bounds-checked statement-expr).
         return
     }
     if e.kind == 16 {                                 // StructLit: (Jestyr_X){ .j_f = v, … }
@@ -259,7 +336,7 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, eid: i32) {
             string_push(sb, ".j_")
             string_push(sb, src[fi.x as usize .. fi.y as usize])   // field name span
             string_push(sb, " = ")
-            emit_expr(sb, p, src, fi.a)               // a = value
+            emit_expr(sb, p, src, c,fi.a)               // a = value
             i = i + 1
         }
         // TODO: fill omitted fields that declare a `= default`; spread `..base`.
@@ -270,12 +347,12 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, eid: i32) {
         string_push(sb, "(")
         emit_c_ty(sb, p, src, e.x)
         string_push(sb, ")(")
-        emit_expr(sb, p, src, e.a)
+        emit_expr(sb, p, src, c,e.a)
         string_push(sb, ")")
         return
     }
     if e.kind == 10 {                                 // Call
-        emit_call(sb, p, src, e)
+        emit_call(sb, p, src, c, e)
         return
     }
 }
@@ -302,37 +379,59 @@ fn intrinsic_helper(read nm: str) -> str {
     if str_eq(nm, "print_float") { return "jestyr_rt_print_float" }
     if str_eq(nm, "str_eq") { return "jestyr_rt_str_eq" }
     if str_eq(nm, "eq_fold") { return "jestyr_rt_eq_fold" }
+    if str_eq(nm, "starts_with") { return "jestyr_rt_starts_with" }
+    if str_eq(nm, "ends_with") { return "jestyr_rt_ends_with" }
+    if str_eq(nm, "contains") { return "jestyr_rt_contains" }
+    if str_eq(nm, "find") { return "jestyr_rt_find" }
+    if str_eq(nm, "trim") { return "jestyr_rt_trim" }
+    if str_eq(nm, "substr") { return "jestyr_rt_substr" }
+    if str_eq(nm, "count_cp") { return "jestyr_rt_count_cp" }
+    if str_eq(nm, "count_graphemes") { return "jestyr_rt_count_graphemes" }
     return ""
 }
 
-// A call. Intrinsics (see `intrinsic_helper`) lower to `<helper>(<args>)`; a plain named call to a
-// user function lowers to `jestyr_<name>(<args>)`. Method sugar and mangled/collision names later.
-fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read e: parser.ExprData) {
+// A call. Intrinsics (see `intrinsic_helper`) lower to `<helper>(<args>)`; `size_of(T)` lowers to
+// C `sizeof(<cty>)`; a plain named call to a user function lowers to `jestyr_<name>(<args>)`.
+// Method sugar and mangled/collision names later.
+fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, read e: parser.ExprData) {
     let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
     if callee.kind == 2 {
         let nm: str = src[callee.start .. callee.end]
+        if str_eq(nm, "size_of") {                    // size_of(T) -> sizeof(<cty>)
+            string_push(sb, "sizeof(")
+            let a0: i32 = list.get(i32, p.ar, e.x as usize)
+            let arg: parser.ExprData = list.get(parser.ExprData, p.ex, a0 as usize)
+            if arg.kind == 2 {                        // the type argument is a bare Name
+                let tn: str = src[arg.start .. arg.end]
+                let pc: str = c_prim(tn)
+                if !str_eq(pc, "") { string_push(sb, pc) }
+                else { string_push(sb, "Jestyr_")  string_push(sb, tn) }
+            }
+            string_push(sb, ")")
+            return
+        }
         let helper: str = intrinsic_helper(nm)
         if !str_eq(helper, "") {
             string_push(sb, helper)
-            emit_arg_list(sb, p, src, e)
+            emit_arg_list(sb, p, src, c, e)
             return
         }
         // Plain user function: mangle to `jestyr_<name>` and emit the argument list.
         string_push(sb, "jestyr_")
         string_push(sb, nm)
-        emit_arg_list(sb, p, src, e)
+        emit_arg_list(sb, p, src, c, e)
         return
     }
 }
 
 // The `(a0, a1, …)` argument list of a Call node (`(x,y)` = arg slice into `ar`).
-fn emit_arg_list(mut sb: String, read p: parser.Parser, read src: str, read e: parser.ExprData) {
+fn emit_arg_list(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, read e: parser.ExprData) {
     string_push(sb, "(")
     var i: i32 = 0
     for i < e.y {                                     // y = arg_count
         if i > 0 { string_push(sb, ", ") }
         let aid: i32 = list.get(i32, p.ar, (e.x + i) as usize)
-        emit_expr(sb, p, src, aid)
+        emit_expr(sb, p, src, c, aid)
         i = i + 1
     }
     string_push(sb, ")")
@@ -363,7 +462,7 @@ fn emit_return(mut sb: String, read p: parser.Parser, read src: str, read c: typ
     if v.kind == 24 { emit_if(sb, p, src, c, val, true, depth)  return }   // If
     indent(sb, depth)
     string_push(sb, "return ")
-    emit_expr(sb, p, src, val)
+    emit_expr(sb, p, src, c,val)
     string_push(sb, ";\n")
 }
 
@@ -377,7 +476,7 @@ fn emit_stmt(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         let e: parser.ExprData = list.get(parser.ExprData, p.ex, s.a as usize)
         if e.kind == 24 { emit_if(sb, p, src, c, s.a, false, depth)  return }   // If as a statement
         indent(sb, depth)
-        emit_expr(sb, p, src, s.a)
+        emit_expr(sb, p, src, c,s.a)
         string_push(sb, ";\n")
         return
     }
@@ -396,7 +495,7 @@ fn emit_stmt(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         string_push(sb, src[s.x as usize .. s.y as usize])
         if s.a >= 0 {
             string_push(sb, " = ")
-            emit_expr(sb, p, src, s.a)
+            emit_expr(sb, p, src, c,s.a)
         }
         string_push(sb, ";\n")
         return
@@ -435,7 +534,7 @@ fn emit_if(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.
     let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
     indent(sb, depth)
     string_push(sb, "if (")
-    emit_expr(sb, p, src, e.a)
+    emit_expr(sb, p, src, c,e.a)
     string_push(sb, ")\n")
     emit_body(sb, p, src, c, e.b, ret, depth)
     if e.op >= 0 {
