@@ -17,7 +17,7 @@
 |---|---|---|
 | P1 lexemes / P2a kinds | `src/lexer.rs`, `src/token.rs` | ✅ DONE (token-for-token, whole corpus) |
 | **P2 parser** | `src/parser.rs`, `src/ast.rs` (~2.6K) | ✅ **COMPLETE** — module golden 125/125, denylist empty |
-| **P3 typeck** | `src/typeck.rs`, `src/types.rs` (~4.5K) | 🟡 **~65%** — Ty arena + display, casts, scopes + all binders + Name resolution + **the GLOBAL TABLE** (fields/methods/variants/fns w/ comptime monomorphization/consts/intrinsics, calls/fields/index/deref); golden **121/127** full-stream (6 denylisted: cur_expected + generic method rets) |
+| **P3 typeck** | `src/typeck.rs`, `src/types.rs` (~4.5K) | 🟢 **expression coverage COMPLETE** — the FULL-STREAM resolved-type golden (every expression, `is_typed`=true) passes **all 127 files, denylist EMPTY**. Remaining P3-adjacent: the aux resolution maps cgen reads (method_calls/impl_calls/dyn_coercions/call_sym), diagnostics parity, multi-module — fold into P5 prep as needed |
 | P4 escape | `src/escape.rs` (~1.5K) | ⬜ not started |
 | P5 cgen | `src/cgen.rs` (~10.8K) | ⬜ not started (the giant) |
 | R2 fixpoint | `--features selfhost-fixpoint` | ⬜ not started (acceptance criterion) |
@@ -57,13 +57,23 @@ Roughly **~16.8K reference lines still to port** (typeck ~4.5K remaining-ish, es
    Call (method sugar: fn-ptr field / free method / struct method), Field/Index/Deref/Try,
    `self`/`Self{..}` via `selfty`, variant ctors w/ payload unification. **121/127.**
    Shim: a generic lit's ctor Name is NOT skipped (the reference leaves the same orphan).
-4. **The last 6 files** (see TYPECK_GOLDEN_DENYLIST): `cur_expected` propagation (nullary
-   variant adoption `var m: Option(i32) = none`, closure→fn-pointer coercion from
-   annotated lets / call-arg param types) — fn_ptr, gen_vtable, guards, option; generic
-   METHOD return substitution (struct-value methods under receiver args; bracket-generic
-   `monomorphize_ret` unification) — genmethods, core. Then: arithmetic joins the compared
-   subset (operator-trait returns), expected array-elem adoption (array_lit passed already?
-   re-check), remaining leaves. Then P3's golden covers the whole corpus stream → P4.
+4. ✅ **cur_expected/cur_ret + generic-decl substitution** (`adad164`) — expected-type
+   propagation at every reference site (fn-ret seed → tail arms, let annotations, call args
+   vs declared params — fns rows 9→12 w/ full param-type slice, struct-lit/gen-lit fields,
+   array elem adoption); nullary-variant adoption; closure→fn-pointer coercion; generic
+   struct-value field/method lookup (`find_gen_struct_node` + `subst_ctp_args`, Fn arm in
+   `subst_fn_ret`); **fresh scope stack per fn body** (`scfloor` — a struct-value method must
+   not see the enclosing comptime type-fn's bindings).
+5. ✅ **THE FULL STREAM** (`f6bd996`) — `is_typed`/`typeck_dump_kind` = true: EVERY expression
+   compared, all 127 files, denylist empty. Landed: the TRAIT system (trait/impl tables,
+   `subst_self`, impl/bound/dyn method dispatch in the reference's fallback order, operator
+   traits Add/Sub/Mul/Div/Eq/Ord before native semantics, Error on missing impls),
+   monomorphization by UNIFICATION (`unify_names`/`subst_by_names`/`fn_tp_names` — free-method
+   receiver+arg unification, plain-call bracket generics), and the block/FieldInit
+   representation shims (the reference embeds fn/then/loop/select-arm blocks as structs, only
+   bare-`{}` and `else` blocks are arena exprs). Deep-dive harness: `TYPECK_FILE=<basename>`
+   prints the aligned per-expr id/kind/span/want/got stream.
+   **→ P3's defined golden is COMPLETE. Next: P4 escape.**
 
 ## P4 escape (after P3) — `src/escape.rs` ~1.5K, smallest pass
 
@@ -104,7 +114,9 @@ Roughly **~16.8K reference lines still to port** (typeck ~4.5K remaining-ish, es
   golden.
 
 ## One-line
-P2 done. P3 typeck started (127/127 for literals + bool ops via a body-reachability walk on an
-importable parser library). Remaining: P3 (Ty representation → arithmetic → Name/scope → rest of
-`infer`) → P4 escape (diagnostic-set golden) → P5 cgen (byte-identical-C golden) → R2 fixpoint
+P2 done. **P3 expression coverage done** — the FULL-STREAM resolved-type golden (every
+expression: names/scopes, global table, calls/methods/fields, traits/impls/dyn/bounds, operator
+traits, generics via comptime monomorphization + bracket unification, expected-type propagation,
+closures) passes **all 127 corpus files with an empty denylist**. Next: **P4 escape**
+(diagnostic-set golden over `escape::check`) → P5 cgen (byte-identical-C golden) → R2 fixpoint
 (jc2≡jc3). All committed + pushed to `origin/master`.
