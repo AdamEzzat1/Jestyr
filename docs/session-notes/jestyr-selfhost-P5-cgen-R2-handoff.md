@@ -114,14 +114,24 @@ gcc builds it (skip library modules — no `int main(` → no link), and the exe
 `cargo test --features selfhost-fixpoint selfhost_fixpoint_subset`. The full jc2≡jc3 fixed point
 reuses this scaffold once cgen.jtr can compile the compiler sources themselves.
 
-### NEXT increments — everything still remaining (the session-7+ worklist)
+### Increment 7 — assign + break/continue + the for family (`7564a6d`, allowlist 11)
 
-Allowlist is 10/130; grow it file-by-file (`DUMP_DIVERGE=1` to converge; probe the whole corpus
+Assign (kind 12, `assign_c` codes 1..9), plain break/continue, and `for` via a new threaded
+`struct Cg { tmp }` (the reference's never-reset global temp counter, created once in
+`emit_program` and threaded `mut` through the stmt group): infinite→`for (;;)`, conditional→
+`while (cond)`, range→`<cty> _hi{n} = hi;` + `for (<cty> j_i = lo; j_i </<= _hi{n}; j_i++)`
+(index cty = hi's numeric prim via `c.et`, else `size_t`; `_` binds `_i{n}`). lar header decode:
+[4]=cond/bindcount, [5]=srccount, [6]=step, binds (conv,ns,ne) at +7, sources after.
++`tests_demo.jtr`. TODO in emit_for: zip/slice/str/array iteration, `step`, labels, loop-`else`.
+
+### NEXT increments — everything still remaining (the session-8+ worklist)
+
+Allowlist is 11/130 (+tests_demo); grow it file-by-file (`DUMP_DIVERGE=1` to converge; probe the whole corpus
 after each construct — files unlock in clusters). Expr kinds handled so far: 0 Int, 1 Float,
 2 Name, 3 Unary, 4 Binary, 5 Field, 6 Index (str-range only), 10 Call, 11 Cast, 16 StructLit,
 24 If, 26 Char, 27 Bool, 29 Str, 30 Null. Still remaining, roughly in order of leverage:
 
-- **Assign (12) + compound ops** (`assign_c`), **Deref (7)**, **slice/array Index** (the
+- ~~Assign~~/~~break/continue~~/~~for-range/while/infinite~~ DONE (incr 7). **Deref (7)**, **slice/array Index** (the
   bounds-checked statement-expr, `_s{n}`/`_ix{n}` temps, refinement elision), **ArrayLit (14)/
   ArrayRepeat (15)**, **Range (13) outside str-index**, **FString (22)** (statement-expr
   `_fs{n}` push chain — see the fstring.jtr near-miss diff), **Try (8) `?`**, **Block/Unsafe
