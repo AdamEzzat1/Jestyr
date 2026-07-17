@@ -17,7 +17,7 @@
 |---|---|---|
 | P1 lexemes / P2a kinds | `src/lexer.rs`, `src/token.rs` | ✅ DONE (token-for-token, whole corpus) |
 | **P2 parser** | `src/parser.rs`, `src/ast.rs` (~2.6K) | ✅ **COMPLETE** — module golden 125/125, denylist empty |
-| **P3 typeck** | `src/typeck.rs`, `src/types.rs` (~4.5K) | 🟡 **~40%** — Ty arena + `ty_str` display, casts (`lower_type`), scopes + ALL binder forms + **Name resolution**; golden **99/127** full-stream (28 denylisted awaiting the global table) |
+| **P3 typeck** | `src/typeck.rs`, `src/types.rs` (~4.5K) | 🟡 **~65%** — Ty arena + display, casts, scopes + all binders + Name resolution + **the GLOBAL TABLE** (fields/methods/variants/fns w/ comptime monomorphization/consts/intrinsics, calls/fields/index/deref); golden **121/127** full-stream (6 denylisted: cur_expected + generic method rets) |
 | P4 escape | `src/escape.rs` (~1.5K) | ⬜ not started |
 | P5 cgen | `src/cgen.rs` (~10.8K) | ⬜ not started (the giant) |
 | R2 fixpoint | `--features selfhost-fixpoint` | ⬜ not started (acceptance criterion) |
@@ -51,17 +51,19 @@ Roughly **~16.8K reference lines still to port** (typeck ~4.5K remaining-ish, es
    block tail types, array/struct/gen-struct literal + fstring/spawn/await/unsafe/if result types.
    **Name is in the compared subset**: 99/127 full-stream. Two representation shims (structlit-path
    Names skipped Jestyr-side; fstring-interp Names skipped reference-side).
-3. **The GLOBAL TABLE (`build_table`) — the second half, clears most of the 28-file denylist.**
-   Scan `p.roots` pre-walk into: `type_index` (struct/enum/distinct names → Named display),
-   fn signatures (name → ret `Ty` — types call-bound lets), consts (name → `Ty`), generic enums +
-   `variants` (variant name → enum, payload field types — match binds, bare variant Names,
-   `variant_ctor_type`), struct field types (field access + StructLit-path upgrade + method
-   returns). Also intrinsic return types (`intrinsic_ret` table in typeck.rs: print_*/str ops/
-   string_*/builder_*/fs/env/…). Then: the Call/Field/Index/Deref/Try result arms.
-4. **Leftovers**: expected-type adoption (`cur_expected`: annotated-let → array elem types,
-   closure→fn-pointer coercion), arithmetic joins the compared subset (needs operator-trait
-   returns), the 2-file comptime-generic misalignment (genlist/genmethods — diagnose with
-   DUMP_DIVERGE), `self`/`Self`/attr leaves. Then P3's golden covers the whole corpus stream.
+3. ✅ **The GLOBAL TABLE** (`72b8a3b`) — two-phase `build_table` (tdecl/tch/fns/cst/vmap flat
+   arenas): Named types + struct fields/method sigs + enum variants w/ payload projection +
+   fn sigs (fallible → `T !E`, comptime-return monomorphization) + consts + intrinsic tables;
+   Call (method sugar: fn-ptr field / free method / struct method), Field/Index/Deref/Try,
+   `self`/`Self{..}` via `selfty`, variant ctors w/ payload unification. **121/127.**
+   Shim: a generic lit's ctor Name is NOT skipped (the reference leaves the same orphan).
+4. **The last 6 files** (see TYPECK_GOLDEN_DENYLIST): `cur_expected` propagation (nullary
+   variant adoption `var m: Option(i32) = none`, closure→fn-pointer coercion from
+   annotated lets / call-arg param types) — fn_ptr, gen_vtable, guards, option; generic
+   METHOD return substitution (struct-value methods under receiver args; bracket-generic
+   `monomorphize_ret` unification) — genmethods, core. Then: arithmetic joins the compared
+   subset (operator-trait returns), expected array-elem adoption (array_lit passed already?
+   re-check), remaining leaves. Then P3's golden covers the whole corpus stream → P4.
 
 ## P4 escape (after P3) — `src/escape.rs` ~1.5K, smallest pass
 
