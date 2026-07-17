@@ -216,32 +216,38 @@ fn emit_int_literal(mut sb: String, read lex: str) {
     }
 }
 
-// A call. Handles the print intrinsics (`print_X` -> `jestyr_rt_print_X`) and plain named calls to
-// user functions (`f(args)` -> `jestyr_f(args)`; args comma-separated, each parenthesized by its
-// own emit). Method sugar, mangled/collision names, and non-print intrinsics come later.
+// The C runtime helper an intrinsic call lowers to (`""` = not a runtime intrinsic). The print
+// intrinsics and the byte-level string ops all lower to `<helper>(<args>)`, which is exactly what
+// `emit_arg_list` produces (and what the reference's `emit_str_binop`/print arms emit for the
+// argument counts these are called with). Grown as corpus files introduce more intrinsics.
+fn intrinsic_helper(read nm: str) -> str {
+    if str_eq(nm, "print_str") { return "jestyr_rt_print_str" }
+    if str_eq(nm, "print_int") { return "jestyr_rt_print_int" }
+    if str_eq(nm, "print_bool") { return "jestyr_rt_print_bool" }
+    if str_eq(nm, "print_float") { return "jestyr_rt_print_float" }
+    if str_eq(nm, "str_eq") { return "jestyr_rt_str_eq" }
+    if str_eq(nm, "eq_fold") { return "jestyr_rt_eq_fold" }
+    return ""
+}
+
+// A call. Intrinsics (see `intrinsic_helper`) lower to `<helper>(<args>)`; a plain named call to a
+// user function lowers to `jestyr_<name>(<args>)`. Method sugar and mangled/collision names later.
 fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read e: parser.ExprData) {
     let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
     if callee.kind == 2 {
         let nm: str = src[callee.start .. callee.end]
-        if str_eq(nm, "print_str") { emit_intrinsic_call(sb, p, src, e, "jestyr_rt_print_str")  return }
-        if str_eq(nm, "print_int") { emit_intrinsic_call(sb, p, src, e, "jestyr_rt_print_int")  return }
-        if str_eq(nm, "print_bool") { emit_intrinsic_call(sb, p, src, e, "jestyr_rt_print_bool")  return }
-        if str_eq(nm, "print_float") { emit_intrinsic_call(sb, p, src, e, "jestyr_rt_print_float")  return }
+        let helper: str = intrinsic_helper(nm)
+        if !str_eq(helper, "") {
+            string_push(sb, helper)
+            emit_arg_list(sb, p, src, e)
+            return
+        }
         // Plain user function: mangle to `jestyr_<name>` and emit the argument list.
         string_push(sb, "jestyr_")
         string_push(sb, nm)
         emit_arg_list(sb, p, src, e)
         return
     }
-}
-
-// A single-argument intrinsic call `<cfn>(<arg0>)`.
-fn emit_intrinsic_call(mut sb: String, read p: parser.Parser, read src: str, read e: parser.ExprData, read cfn: str) {
-    string_push(sb, cfn)
-    string_push(sb, "(")
-    let a0: i32 = list.get(i32, p.ar, e.x as usize)   // x = arg_start
-    emit_expr(sb, p, src, a0)
-    string_push(sb, ")")
 }
 
 // The `(a0, a1, …)` argument list of a Call node (`(x,y)` = arg slice into `ar`).
