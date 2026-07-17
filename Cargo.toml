@@ -28,6 +28,11 @@ dharht-experiment = []
 # a C compiler on PATH, so it is opt-in — default `cargo test` stays toolchain-free.
 # Run with: `cargo test --features c-oracle`.
 c-oracle = []
+# R2 self-hosting fixpoint (workstream P): the Jestyr-written compiler (jc1) compiles a
+# program subset; the milestone asserts jc1's C builds and runs identically to the Rust
+# compiler's, growing toward the full jc2 == jc3 fixed point once cgen.jtr can compile the
+# compiler sources themselves. Run with: `cargo test --features c-oracle,selfhost-fixpoint`.
+selfhost-fixpoint = ["c-oracle"]
 
 [profile.dev]
 opt-level = 0

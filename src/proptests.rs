@@ -7712,6 +7712,59 @@ mod c_oracle {
         eprintln!("cgen golden: {checked} file(s)' emitted C byte-identical");
     }
 
+    /// **R2 fixpoint — the subset milestone.** `jc1` = the Rust compiler builds the
+    /// Jestyr-written back end (`cgen.jtr`, which imports the Jestyr parser + typeck) into a
+    /// native exe. For every allowlisted subset program P, `jc1` compiles P → C; that C must
+    /// gcc-build and **run to exactly the stdout/exit of the Rust-compiled P**. The cgen golden
+    /// already pins jc1's C byte-identical to the reference's; this closes the loop through gcc
+    /// and execution. The full `jc2 ≡ jc3` fixed point (jc1 compiling the compiler *sources*,
+    /// then the result recompiling them to identical C) lands when cgen.jtr's construct
+    /// coverage reaches the compiler itself; this harness is the scaffold it grows on.
+    #[cfg(feature = "selfhost-fixpoint")]
+    #[test]
+    fn selfhost_fixpoint_subset() {
+        let jc1 = build_exe("examples/std/cgen.jtr");
+        let cc = crate::find_c_compiler().expect("the fixpoint needs a C compiler on PATH");
+        let mut checked = 0;
+        for base in CGEN_GOLDEN_ALLOWLIST {
+            // A subset file lives in examples/ or examples/std/.
+            let path = ["examples", "examples/std"]
+                .iter()
+                .map(|d| format!("{d}/{base}"))
+                .find(|p| std::path::Path::new(p).exists())
+                .unwrap_or_else(|| panic!("allowlisted {base} not found"));
+            // jc1 (the Jestyr-written compiler) lowers P to C.
+            let out = Command::new(&jc1).arg(&path).output().unwrap();
+            assert!(out.status.success(), "jc1 failed on {path}");
+            let c_src = String::from_utf8(out.stdout).unwrap().replace("\r\n", "\n");
+            // A library module (no `main`) golden-compares but can't link into an exe.
+            if !c_src.contains("int main(") {
+                continue;
+            }
+            // gcc builds jc1's C.
+            let dir = std::env::temp_dir();
+            let stem: String = base.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+            let cfile = dir.join(format!("jestyr_fix_{stem}.c"));
+            let exe = dir.join(format!("jestyr_fix_{stem}{}", std::env::consts::EXE_SUFFIX));
+            std::fs::write(&cfile, &c_src).unwrap();
+            let mut cmd = Command::new(&cc);
+            cmd.args(crate::CC_FLAGS);
+            assert!(
+                cmd.arg("-o").arg(&exe).arg(&cfile).status().unwrap().success(),
+                "gcc failed on jc1's C for {path}"
+            );
+            let got = Command::new(&exe).output().unwrap();
+            // The Rust reference compiles + runs the same P.
+            let want_exe = build_exe(&path);
+            let want = Command::new(&want_exe).output().unwrap();
+            assert_eq!(got.stdout, want.stdout, "runtime output diverged for {path}");
+            assert_eq!(got.status.code(), want.status.code(), "exit code diverged for {path}");
+            checked += 1;
+        }
+        assert!(checked >= 5, "expected several subset programs, ran {checked}");
+        eprintln!("selfhost fixpoint subset: jc1's C built + ran identical for {checked} program(s)");
+    }
+
     /// **P2 depth guard.** The Jestyr parser bounds AST *height* at `MAX_EXPR_DEPTH`
     /// (like the reference), so adversarially-deep input terminates with a bounded tree
     /// instead of overflowing. Two shapes stress different stacks: a left-deep fold
