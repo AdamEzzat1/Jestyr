@@ -1,0 +1,8 @@
+// Thin CLI driver for the type checker. `typeck.jtr` is a pure library (no `main`) so the
+// escape checker (and later cgen) can `import "typeck"`; this driver supplies the entry point
+// the P3 resolved-type golden builds and runs. All logic lives in `typeck.run`.
+import "typeck"
+
+fn main() -> i32 {
+    return typeck.run()
+}

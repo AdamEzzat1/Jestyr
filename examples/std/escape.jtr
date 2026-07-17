@@ -1,0 +1,1038 @@
+// examples/std/escape.jtr — the P4 ownership / escape checker, written *in Jestyr*. It imports
+// the P2 parser (AST) and the P3 typeck (per-expr types + resolution records), then enforces the
+// single rule the language rests on (design §4.3): a *second-class borrow* (`read`/`mut`/`out`
+// parameter, or the default convention) may be passed further DOWN the call stack but must never
+// ESCAPE its frame. Mirrors the Rust reference `src/escape.rs` route for route.
+//
+// **Escape routes flagged** (each only when the escaping value is non-`Copy`):
+//   1. return   — a borrow place returned by value (not a `read`/`mut`/`out` return).
+//   2. capture  — a borrow place stored as a struct-literal field.
+//   3. store    — assigning a borrow place into borrowed storage.
+//   4. give-away — passing a borrow to a `take` parameter of a known function.
+// Plus: region-value escape (return / assign-to-outer), loop mutation (iterator invalidation),
+// `@no_alloc` / `@deterministic` contract violations, manual `drop`, and shared-mut-slice spawn.
+//
+// **Verification.** A diagnostic-set dump: each diagnostic as three lines — span start, span end,
+// message — in the reference's walk (emission) order. `jestyr_escape_dump_matches_reference`
+// (`--features c-oracle`) diffs it against `escape::check` over the whole corpus.
+import "mem"
+import "intern"
+import "fs"
+import "env"
+import "list"
+import "tokens"
+import "parser"
+import "typeck"
+
+// Per-run escape state, threaded `mut`. Scopes are flat arenas (like typeck's): `scn` holds
+// binding 3-tuples (name_start, name_end, is_borrow) and `scst` the per-scope start marks; `rgn`
+// holds region-tainted name 2-tuples with `rgst` marks. `frozen` is a stack of iterated-
+// collection name 2-tuples; `rdepth` the scope depth at each active `region` block entry.
+// `no_alloc`/`deterministic` are the current fn's contract flags. `ret_is_borrow` = the current
+// fn returns by borrow (so a returned borrow is allowed).
+struct Esc { scn: List(i32), scst: List(i32), rgn: List(i32), rgst: List(i32), frozen: List(i32), rdepth: List(i32), no_alloc: bool, deterministic: bool, ret_is_borrow: bool, self_borrow: i32, alloc: Allocator }
+
+// ---- scope helpers (flat arenas, mirroring typeck's) ----
+
+fn e_push(mut e: Esc) {
+    list.push(i32, e.scst, (list.len(i32, e.scn) / 3) as i32)
+    list.push(i32, e.rgst, (list.len(i32, e.rgn) / 2) as i32)
+}
+fn e_pop(mut e: Esc) {
+    let d: usize = list.len(i32, e.scst)
+    if d == 0 { return }
+    let m: i32 = list.get(i32, e.scst, d - 1)
+    list.truncate(i32, e.scn, (m * 3) as usize)
+    list.truncate(i32, e.scst, d - 1)
+    let dr: usize = list.len(i32, e.rgst)
+    let mr: i32 = list.get(i32, e.rgst, dr - 1)
+    list.truncate(i32, e.rgn, (mr * 2) as usize)
+    list.truncate(i32, e.rgst, dr - 1)
+}
+// Bind `src[ns..ne]` with borrow-ness `isb` (1/0) in the innermost scope.
+fn e_bind(mut e: Esc, ns: i32, ne: i32, isb: i32) {
+    list.push(i32, e.scn, ns)
+    list.push(i32, e.scn, ne)
+    list.push(i32, e.scn, isb)
+}
+// Innermost-first lookup: 1 = borrow, 0 = owned, -1 = not found.
+fn e_lookup(read e: Esc, read src: str, ns: usize, ne: usize) -> i32 {
+    var i: i32 = (list.len(i32, e.scn) / 3) as i32
+    for i > 0 {
+        i = i - 1
+        let b: i32 = i * 3
+        let bns: i32 = list.get(i32, e.scn, b as usize)
+        let bne: i32 = list.get(i32, e.scn, (b + 1) as usize)
+        if str_eq(src[ns .. ne], src[bns as usize .. bne as usize]) {
+            return list.get(i32, e.scn, (b + 2) as usize)
+        }
+    }
+    return 0 - 1
+}
+// The scope index where `src[ns..ne]` is bound (innermost), or -1 — for region-depth compare.
+fn e_scope_depth_of(read e: Esc, read src: str, ns: usize, ne: usize) -> i32 {
+    let nscopes: i32 = list.len(i32, e.scst) as i32
+    var s: i32 = nscopes
+    for s > 0 {
+        s = s - 1
+        let lo: i32 = list.get(i32, e.scst, s as usize)
+        var hi: i32 = (list.len(i32, e.scn) / 3) as i32
+        if s + 1 < nscopes { hi = list.get(i32, e.scst, (s + 1) as usize) }
+        var i: i32 = hi
+        for i > lo {
+            i = i - 1
+            let bns: i32 = list.get(i32, e.scn, (i * 3) as usize)
+            let bne: i32 = list.get(i32, e.scn, (i * 3 + 1) as usize)
+            if str_eq(src[ns .. ne], src[bns as usize .. bne as usize]) { return s }
+        }
+    }
+    return 0 - 1
+}
+// Mark `src[ns..ne]` region-tainted in the innermost region scope.
+fn e_bind_region(mut e: Esc, ns: i32, ne: i32) {
+    list.push(i32, e.rgn, ns)
+    list.push(i32, e.rgn, ne)
+}
+fn e_is_region(read e: Esc, read src: str, ns: usize, ne: usize) -> bool {
+    var i: i32 = (list.len(i32, e.rgn) / 2) as i32
+    for i > 0 {
+        i = i - 1
+        let bns: i32 = list.get(i32, e.rgn, (i * 2) as usize)
+        let bne: i32 = list.get(i32, e.rgn, (i * 2 + 1) as usize)
+        if str_eq(src[ns .. ne], src[bns as usize .. bne as usize]) { return true }
+    }
+    return false
+}
+
+// ---- diagnostic emission (immediate, in walk order = the reference's push order) ----
+// One diagnostic = three lines: span start, span end, the built message.
+fn emit(start: usize, end: usize, read msg: str) {
+    print_int(start as i64)
+    print_int(end as i64)
+    print_str(msg)
+}
+
+// ---- borrow-place / escape predicates (mirror is_borrow_place / escapes_as / root_name) ----
+
+// Does `id` name borrowed storage (a borrow binding or a projection of one), or a closure that
+// captures a borrow? Kinds: 2 Name, 19 SelfValue, 5 Field, 6 Index, 7 Deref, 37 Closure.
+fn is_borrow_place(read e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str, id: i32) -> bool {
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
+    if d.kind == 2 { return e_lookup(e, src, d.start, d.end) == 1 }
+    if d.kind == 19 { return e.self_borrow == 1 }                  // `self`
+    if d.kind == 5 or d.kind == 6 { return is_borrow_place(e, p, c, src, d.a) }
+    if d.kind == 7 { return is_borrow_place(e, p, c, src, d.a) }
+    if d.kind == 37 { return captured_borrow(e, p, c, src, id) >= 0 }
+    return false
+}
+
+// The root binding name span of a place (or a captured borrow), as (start<<0)|... — we return
+// it by writing into out-params via a small pair. Jestyr single-return: return the packed
+// start; callers that need the text re-derive via root_place. Instead we expose root_place that
+// prints the name, and root_name_span for building messages.
+// root_place: walk to the leaf Name/self and return its ExprId (or the closure's captured name
+// carrier). -1 for a non-place.
+fn root_place(read e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str, id: i32) -> i32 {
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
+    if d.kind == 2 or d.kind == 19 { return id }
+    if d.kind == 5 or d.kind == 6 or d.kind == 7 { return root_place(e, p, c, src, d.a) }
+    return id
+}
+
+// Push the root-name text of place `id` into `sb` (mirrors `root_name`): the leaf Name/self, or
+// a closure's captured-borrow name, else "<borrow>".
+fn push_root_name(mut sb: String, read e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str, id: i32) {
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
+    if d.kind == 2 { string_push(sb, src[d.start .. d.end])  return }
+    if d.kind == 19 { string_push(sb, "self")  return }
+    if d.kind == 5 or d.kind == 6 or d.kind == 7 { push_root_name(sb, e, p, c, src, d.a)  return }
+    if d.kind == 37 {
+        let cap: i32 = captured_borrow(e, p, c, src, id)
+        if cap >= 0 {
+            let cd: parser.ExprData = list.get(parser.ExprData, p.ex, cap as usize)
+            if cd.kind == 19 { string_push(sb, "self") } else { string_push(sb, src[cd.start .. cd.end]) }
+        } else { string_push(sb, "<closure>") }
+        return
+    }
+    string_push(sb, "<borrow>")
+}
+
+// Is `et[id]` non-Copy (so moving it out is a real escape, not a duplication)?
+fn is_non_copy(read c: typeck.Checker, id: i32) -> bool {
+    let t: i32 = list.get(i32, c.et, id as usize)
+    return !typeck.ty_is_copy(c, t)
+}
+
+// Would moving `id` out be an escape? A closure capturing a borrow always is; otherwise a borrow
+// place whose type is non-Copy. Mirrors `escapes_as`.
+fn escapes_as(read e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str, id: i32) -> bool {
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
+    if d.kind == 37 { return is_borrow_place(e, p, c, src, id) }
+    return is_borrow_place(e, p, c, src, id) and is_non_copy(c, id)
+}
+
+// ---- region-value predicates (mirror is_region_value / carries_arena_ref) ----
+
+fn is_region_value(read e: Esc, read p: parser.Parser, read src: str, id: i32) -> bool {
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
+    if d.kind == 10 {                              // Call: a region_* intrinsic callee?
+        let cal: parser.ExprData = list.get(parser.ExprData, p.ex, d.a as usize)
+        if cal.kind == 2 {
+            let nm: str = src[cal.start .. cal.end]
+            if str_eq(nm, "region_str") { return true }
+            if str_eq(nm, "region_alloc") { return true }
+            if str_eq(nm, "region_concat") { return true }
+        }
+        return false
+    }
+    if d.kind == 2 { return e_is_region(e, src, d.start, d.end) }
+    if d.kind == 5 or d.kind == 6 or d.kind == 7 { return is_region_value(e, p, src, d.a) }
+    return false
+}
+
+// Does `id`'s type carry a pointer INTO the arena (str/os_str/Ptr/Slice/RegionRef/Unknown)?
+fn carries_arena_ref(read c: typeck.Checker, id: i32) -> bool {
+    let t: i32 = list.get(i32, c.et, id as usize)
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, t as usize)
+    if d.kind == 0 { return true }                 // Unknown
+    if d.kind == 3 { return true }                 // Ptr
+    if d.kind == 8 { return true }                 // Slice
+    if d.kind == 11 { return true }                // RegionRef
+    if d.kind == 2 {                               // Prim: str / os_str
+        if d.x == 14 { return true }
+        if d.x == 16 { return true }
+    }
+    return false
+}
+
+// ---- captured-borrow analysis for closures (mirror captured_borrow_name / collect_names) ----
+
+// The ExprId of the first free Name/self in the closure body that (a) is not a closure param and
+// (b) is a non-Copy borrow in scope — the captured borrow. -1 if none.
+fn captured_borrow(read e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str, closure_id: i32) -> i32 {
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, closure_id as usize)
+    var names: List(i32) = list.make(i32, e.alloc)       // each entry an ExprId of a Name/self
+    collect_names(p, d.a, names)
+    var i: usize = 0
+    for i < list.len(i32, names) {
+        let nid: i32 = list.get(i32, names, i)
+        let nd: parser.ExprData = list.get(parser.ExprData, p.ex, nid as usize)
+        var is_param: bool = false
+        if nd.kind == 2 {
+            var k: i32 = 0
+            for k < d.y {                          // closure params (clar 3-tuples)
+                let cb: i32 = d.x + k * 3
+                let pns: i32 = list.get(i32, p.clar, cb as usize)
+                let pne: i32 = list.get(i32, p.clar, (cb + 1) as usize)
+                if str_eq(src[nd.start .. nd.end], src[pns as usize .. pne as usize]) { is_param = true }
+                k = k + 1
+            }
+        }
+        if !is_param {
+            var isb: i32 = 0 - 1
+            if nd.kind == 2 { isb = e_lookup(e, src, nd.start, nd.end) }
+            else if nd.kind == 19 { isb = e.self_borrow }
+            if isb == 1 {
+                if is_non_copy(c, nid) { return nid }
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Gather every value-name / `self` ExprId in a subtree (mirrors `collect_names`), following the
+// same edges. Struct-lit paths / gen-lit ctors are not values; type args are types.
+fn collect_names(read p: parser.Parser, id: i32, mut acc: List(i32)) {
+    if id < 0 { return }
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
+    let k: i32 = d.kind
+    if k == 2 or k == 19 { list.push(i32, acc, id)  return }
+    if k == 3 or k == 5 or k == 7 or k == 8 or k == 11 { collect_names(p, d.a, acc)  return }  // unary/field/deref/try/cast
+    if k == 4 or k == 6 or k == 12 { collect_names(p, d.a, acc)  collect_names(p, d.b, acc)  return }  // binary/index/assign
+    if k == 13 { collect_names(p, d.a, acc)  collect_names(p, d.b, acc)  return }               // range
+    if k == 10 {                                   // call: callee + args
+        collect_names(p, d.a, acc)
+        var i: i32 = 0
+        for i < d.y { collect_names(p, list.get(i32, p.ar, (d.x + i) as usize), acc)  i = i + 1 }
+        return
+    }
+    if k == 16 {                                   // structlit: field-init values + spread
+        collect_names_fieldinits(p, d.x, d.y, acc)
+        if d.b >= 0 { collect_names(p, d.b, acc) }
+        return
+    }
+    if k == 17 { collect_names_fieldinits(p, d.b, d.y, acc)  return }   // genstructlit: field values
+    if k == 18 { collect_names(p, d.a, acc)  return }                    // fieldinit value
+    if k == 24 {                                   // if: cond + then-block + else
+        collect_names(p, d.a, acc)
+        collect_block_names(p, d.b, acc)
+        if d.op >= 0 { collect_names(p, d.op, acc) }
+        return
+    }
+    if k == 28 {                                   // match: scrut + each arm guard/body
+        collect_names(p, d.a, acc)
+        var i: i32 = 0
+        for i < d.y {
+            let base: i32 = d.x + i * 3
+            let g: i32 = list.get(i32, p.par, (base + 1) as usize)
+            if g >= 0 { collect_names(p, g, acc) }
+            collect_names(p, list.get(i32, p.par, (base + 2) as usize), acc)
+            i = i + 1
+        }
+        return
+    }
+    if k == 23 or k == 25 { collect_block_names(p, id, acc)  return }    // block / unsafe
+    if k == 37 { collect_names(p, d.a, acc)  return }                     // closure body
+}
+fn collect_names_fieldinits(read p: parser.Parser, start: i32, count: i32, mut acc: List(i32)) {
+    var i: i32 = 0
+    for i < count {
+        let fid: i32 = list.get(i32, p.ar, (start + i) as usize)
+        let fd: parser.ExprData = list.get(parser.ExprData, p.ex, fid as usize)
+        collect_names(p, fd.a, acc)                // FieldInit value
+        i = i + 1
+    }
+}
+fn collect_block_names(read p: parser.Parser, blk: i32, mut acc: List(i32)) {
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, blk as usize)
+    var i: i32 = 0
+    for i < d.y {
+        let sid: i32 = list.get(i32, p.sar, (d.x + i) as usize)
+        let s: parser.StmtData = list.get(parser.StmtData, p.st, sid as usize)
+        if s.a >= 0 { collect_names(p, s.a, acc) }
+        i = i + 1
+    }
+}
+
+// ---- the frozen-collection stack (iterator invalidation) ----
+
+fn frozen_contains(read e: Esc, read src: str, ns: usize, ne: usize) -> bool {
+    var i: i32 = (list.len(i32, e.frozen) / 2) as i32
+    for i > 0 {
+        i = i - 1
+        let bns: i32 = list.get(i32, e.frozen, (i * 2) as usize)
+        let bne: i32 = list.get(i32, e.frozen, (i * 2 + 1) as usize)
+        if str_eq(src[ns .. ne], src[bns as usize .. bne as usize]) { return true }
+    }
+    return false
+}
+
+// ---- alloc / deterministic intrinsic name tests ----
+
+fn is_alloc_intrinsic(read src: str, ns: usize, ne: usize) -> bool {
+    let n: str = src[ns .. ne]
+    if str_eq(n, "alloc") { return true }
+    if str_eq(n, "alloc_i32") { return true }
+    if str_eq(n, "realloc") { return true }
+    if str_eq(n, "realloc_i32") { return true }
+    if str_eq(n, "arena_open") { return true }
+    if str_eq(n, "arena_alloc") { return true }
+    if str_eq(n, "region_alloc") { return true }
+    if str_eq(n, "region_str") { return true }
+    if str_eq(n, "region_concat") { return true }
+    if str_eq(n, "gen_new") { return true }
+    return false
+}
+fn is_atomic_op(read src: str, ns: usize, ne: usize) -> bool {
+    let n: str = src[ns .. ne]
+    if str_eq(n, "atomic_store") { return true }
+    if str_eq(n, "atomic_load") { return true }
+    if str_eq(n, "atomic_add") { return true }
+    if str_eq(n, "atomic_sub") { return true }
+    if str_eq(n, "atomic_xchg") { return true }
+    return false
+}
+
+// ---- the call-check rules (mirror check_give_away / _loop_mutation / _no_alloc / _det / _drop /
+//       _spawn_no_shared_mut_slice). Each takes the Call expr `id`, its callee, and its args. ----
+
+// The fns row for a call's callee: the mcalls record (method sugar -> a free fn), else a bare
+// Name lookup. Returns (row, is_method): row=-1 if unknown. Packed: row in return, method-ness
+// via a second call. We split into two helpers for clarity.
+fn mcall_row(read c: typeck.Checker, id: i32) -> i32 {
+    var i: i32 = 0
+    let n: i32 = (list.len(i32, c.mcalls) / 2) as i32
+    for i < n {
+        if list.get(i32, c.mcalls, (i * 2) as usize) == id { return list.get(i32, c.mcalls, (i * 2 + 1) as usize) }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Give-away (route 4): passing a borrow to a `take` parameter. Method sugar maps receiver ->
+// runtime[0], args -> runtime[1..]; a bare/qualified call maps args positionally onto ALL params.
+fn check_give_away(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str, id: i32, callee: i32, astart: i32, acount: i32) {
+    let mr: i32 = mcall_row(c, id)
+    if mr >= 0 {                                   // method sugar
+        let cal: parser.ExprData = list.get(parser.ExprData, p.ex, callee as usize)
+        if cal.kind != 5 { return }
+        let iid: i32 = list.get(i32, c.fns, (mr * 12 + 9) as usize)
+        let f: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        var rti: i32 = 0                           // runtime-param index
+        var pi: i32 = 0
+        for pi < f.b {
+            let pbase: i32 = f.a + pi * 7
+            if list.get(i32, p.iar, pbase as usize) == 0 {        // not comptime -> a runtime param
+                let conv: i32 = list.get(i32, p.iar, (pbase + 1) as usize)
+                if conv == 3 {                     // take
+                    if rti == 0 {                  // receiver
+                        if escapes_as(e, p, c, src, cal.a) { give_away_err(e, p, c, src, cal.a, pbase, iid, p) }
+                    } else {
+                        let ai: i32 = rti - 1
+                        if ai < acount {
+                            let arg: i32 = list.get(i32, p.ar, (astart + ai) as usize)
+                            if escapes_as(e, p, c, src, arg) { give_away_err(e, p, c, src, arg, pbase, iid, p) }
+                        }
+                    }
+                }
+                rti = rti + 1
+            }
+            pi = pi + 1
+        }
+        return
+    }
+    // Bare Name call (qualified `mod.f` resolution deferred): match args to params positionally.
+    let cal: parser.ExprData = list.get(parser.ExprData, p.ex, callee as usize)
+    if cal.kind != 2 { return }
+    let fr: i32 = fn_row_by_span(c, src, cal.start, cal.end)
+    if fr < 0 { return }
+    let iid: i32 = list.get(i32, c.fns, (fr * 12 + 9) as usize)
+    let f: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+    var pi: i32 = 0
+    for pi < f.b {
+        let pbase: i32 = f.a + pi * 7
+        if list.get(i32, p.iar, (pbase + 1) as usize) == 3 {      // conv == take
+            if pi < acount {
+                let arg: i32 = list.get(i32, p.ar, (astart + pi) as usize)
+                if escapes_as(e, p, c, src, arg) { give_away_err(e, p, c, src, arg, pbase, iid, p) }
+            }
+        }
+        pi = pi + 1
+    }
+}
+
+// The fns row whose name is `src[ns..ne]` (a top-level fn or extern), or -1.
+fn fn_row_by_span(read c: typeck.Checker, read src: str, ns: usize, ne: usize) -> i32 {
+    let n: i32 = (list.len(i32, c.fns) / 12) as i32
+    var i: i32 = 0
+    for i < n {
+        let bns: i32 = list.get(i32, c.fns, (i * 12) as usize)
+        let bne: i32 = list.get(i32, c.fns, (i * 12 + 1) as usize)
+        if str_eq(src[ns .. ne], src[bns as usize .. bne as usize]) { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn give_away_err(mut e: Esc, read p2: parser.Parser, read c: typeck.Checker, read src: str, arg: i32, pbase: i32, iid: i32, read p: parser.Parser) {
+    let ad: parser.ExprData = list.get(parser.ExprData, p.ex, arg as usize)
+    let f: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+    var sb: String = string_new()
+    string_push(sb, "cannot give borrow `")
+    push_root_name(sb, e, p, c, src, arg)
+    string_push(sb, "` to owning parameter `")
+    string_push(sb, src[list.get(i32, p.iar, (pbase + 2) as usize) as usize .. list.get(i32, p.iar, (pbase + 3) as usize) as usize])
+    string_push(sb, "` of `")
+    string_push(sb, src[f.x as usize .. f.y as usize])
+    string_push(sb, "`: `take` consumes ownership, which a second-class borrow cannot provide")
+    emit(ad.start, ad.end, string_view(sb))
+    string_free(sb)
+}
+
+// Manual `drop` (an impl call resolved to Drop::drop). `icalls` 5-tuples: (call, trait span,
+// method span).
+fn check_manual_drop(mut e: Esc, read c: typeck.Checker, read src: str, id: i32, span_s: usize, span_e: usize) {
+    var i: i32 = 0
+    let n: i32 = (list.len(i32, c.icalls) / 5) as i32
+    for i < n {
+        let base: i32 = i * 5
+        if list.get(i32, c.icalls, base as usize) == id {
+            let tns: i32 = list.get(i32, c.icalls, (base + 1) as usize)
+            let tne: i32 = list.get(i32, c.icalls, (base + 2) as usize)
+            let mns: i32 = list.get(i32, c.icalls, (base + 3) as usize)
+            let mne: i32 = list.get(i32, c.icalls, (base + 4) as usize)
+            if str_eq(src[tns as usize .. tne as usize], "Drop") {
+                if str_eq(src[mns as usize .. mne as usize], "drop") {
+                    emit(span_s, span_e, "cannot call `drop` manually — it runs automatically at scope exit (see `--show-drops`)")
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// In `@no_alloc`: reject an allocation-intrinsic call (bare or `mod.f` -> its bare field name).
+fn check_no_alloc_call(mut e: Esc, read p: parser.Parser, read src: str, callee: i32, span_s: usize, span_e: usize) {
+    if !e.no_alloc { return }
+    let cal: parser.ExprData = list.get(parser.ExprData, p.ex, callee as usize)
+    var ns: usize = 0  var ne: usize = 0  var ok: bool = false
+    if cal.kind == 2 { ns = cal.start  ne = cal.end  ok = true }
+    else if cal.kind == 5 { ns = cal.x as usize  ne = cal.y as usize  ok = true }   // mod.name -> name
+    if !ok { return }
+    if is_alloc_intrinsic(src, ns, ne) {
+        var sb: String = string_new()
+        string_push(sb, "`")
+        string_push(sb, src[ns .. ne])
+        string_push(sb, "` allocates — forbidden in a `@no_alloc` function (the proven-allocation-free contract)")
+        emit(span_s, span_e, string_view(sb))
+        string_free(sb)
+    }
+}
+
+// In `@deterministic`: reject an `atomic_*` op call.
+fn check_det_call(mut e: Esc, read p: parser.Parser, read src: str, callee: i32, span_s: usize, span_e: usize) {
+    if !e.deterministic { return }
+    let cal: parser.ExprData = list.get(parser.ExprData, p.ex, callee as usize)
+    var ns: usize = 0  var ne: usize = 0  var ok: bool = false
+    if cal.kind == 2 { ns = cal.start  ne = cal.end  ok = true }
+    else if cal.kind == 5 { ns = cal.x as usize  ne = cal.y as usize  ok = true }
+    if !ok { return }
+    if is_atomic_op(src, ns, ne) {
+        var sb: String = string_new()
+        string_push(sb, "`")
+        string_push(sb, src[ns .. ne])
+        string_push(sb, "` is an atomic op whose result can depend on the thread schedule — forbidden in a `@deterministic` function. Use `par for … reduce(r)` for schedule-independent parallelism.")
+        emit(span_s, span_e, string_view(sb))
+        string_free(sb)
+    }
+}
+
+// Loop-mutation: passing a currently-iterated collection to a mutating (`mut`/`out`/`take`)
+// parameter. Method sugar: receiver -> runtime[0], args -> runtime[1..]; free call: positional.
+fn check_loop_mutation(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str, id: i32, callee: i32, astart: i32, acount: i32) {
+    if list.len(i32, e.frozen) == 0 { return }
+    let mr: i32 = mcall_row(c, id)
+    if mr >= 0 {
+        let cal: parser.ExprData = list.get(parser.ExprData, p.ex, callee as usize)
+        if cal.kind != 5 { return }
+        let iid: i32 = list.get(i32, c.fns, (mr * 12 + 9) as usize)
+        let f: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        var rti: i32 = 0
+        var pi: i32 = 0
+        for pi < f.b {
+            let pbase: i32 = f.a + pi * 7
+            if list.get(i32, p.iar, pbase as usize) == 0 {
+                let conv: i32 = list.get(i32, p.iar, (pbase + 1) as usize)
+                if conv == 2 or conv == 4 or conv == 3 {
+                    if rti == 0 { flag_frozen(e, p, c, src, cal.a) }
+                    else {
+                        let ai: i32 = rti - 1
+                        if ai < acount { flag_frozen(e, p, c, src, list.get(i32, p.ar, (astart + ai) as usize)) }
+                    }
+                }
+                rti = rti + 1
+            }
+            pi = pi + 1
+        }
+        return
+    }
+    let cal: parser.ExprData = list.get(parser.ExprData, p.ex, callee as usize)
+    if cal.kind != 2 { return }
+    let fr: i32 = fn_row_by_span(c, src, cal.start, cal.end)
+    if fr < 0 { return }
+    let iid: i32 = list.get(i32, c.fns, (fr * 12 + 9) as usize)
+    let f: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+    var pi: i32 = 0
+    for pi < f.b {
+        let conv: i32 = list.get(i32, p.iar, (f.a + pi * 7 + 1) as usize)
+        if conv == 2 or conv == 4 or conv == 3 {
+            if pi < acount { flag_frozen(e, p, c, src, list.get(i32, p.ar, (astart + pi) as usize)) }
+        }
+        pi = pi + 1
+    }
+}
+fn flag_frozen(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str, arg: i32) {
+    let rp: i32 = root_place(e, p, c, src, arg)
+    let rd: parser.ExprData = list.get(parser.ExprData, p.ex, rp as usize)
+    var ns: usize = rd.start  var ne: usize = rd.end
+    if rd.kind == 19 { ns = rd.start  ne = rd.end }
+    if frozen_contains(e, src, ns, ne) {
+        let ad: parser.ExprData = list.get(parser.ExprData, p.ex, arg as usize)
+        var sb: String = string_new()
+        string_push(sb, "cannot mutate `")
+        push_root_name(sb, e, p, c, src, arg)
+        string_push(sb, "` while iterating it: the `for` loop holds a borrow of it")
+        emit(ad.start, ad.end, string_view(sb))
+        string_free(sb)
+    }
+}
+
+// A `spawn` target taking a `mut`/`out` SLICE parameter races — reject it.
+fn check_spawn_slice(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str, call: i32) {
+    let cd: parser.ExprData = list.get(parser.ExprData, p.ex, call as usize)
+    if cd.kind != 10 { return }
+    let cal: parser.ExprData = list.get(parser.ExprData, p.ex, cd.a as usize)
+    if cal.kind != 2 { return }
+    let fr: i32 = fn_row_by_span(c, src, cal.start, cal.end)
+    if fr < 0 { return }
+    let iid: i32 = list.get(i32, c.fns, (fr * 12 + 9) as usize)
+    let f: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+    var pi: i32 = 0
+    for pi < f.b {
+        let pbase: i32 = f.a + pi * 7
+        let conv: i32 = list.get(i32, p.iar, (pbase + 1) as usize)
+        if conv == 2 or conv == 4 {
+            let tyid: i32 = list.get(i32, p.iar, (pbase + 5) as usize)
+            var is_slice: bool = false
+            if tyid >= 0 {
+                let ptd: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
+                if ptd.kind == 3 { is_slice = true }              // Slice `[]T`
+            }
+            if is_slice {
+                let pns: i32 = list.get(i32, p.iar, (pbase + 2) as usize)
+                let pne: i32 = list.get(i32, p.iar, (pbase + 3) as usize)
+                var sb: String = string_new()
+                string_push(sb, "`spawn`: `")
+                string_push(sb, src[cal.start .. cal.end])
+                string_push(sb, "` takes a `mut` slice `")
+                string_push(sb, src[pns as usize .. pne as usize])
+                string_push(sb, "` — a shared mutable slice can race across parallel tasks. Share mutable state through a raw `*mut T` in `unsafe` (each task a disjoint region, as `par_binned_sum` does), or pass it `read`.")
+                emit(cd.start, cd.end, string_view(sb))
+                string_free(sb)
+                return
+            }
+        }
+        pi = pi + 1
+    }
+}
+
+// ---- the body walk ----
+
+// Bind the names of pattern `pid` with borrow-ness `isb` (mirrors `bind_pattern`).
+fn bind_pattern(mut e: Esc, read p: parser.Parser, read src: str, pid: i32, isb: i32) {
+    let d: parser.PatData = list.get(parser.PatData, p.pt, pid as usize)
+    let k: i32 = d.kind
+    if k == 1 { e_bind(e, d.start as i32, d.end as i32, isb)  return }          // Ident
+    if k == 2 {                                    // Variant subpats (op=start, a=count in par)
+        var i: i32 = 0
+        for i < d.a { bind_pattern(e, p, src, list.get(i32, p.par, (d.op + i) as usize), isb)  i = i + 1 }
+        return
+    }
+    if k == 3 {                                    // StructVariant field 3-tuples: subpat at +2
+        var i: i32 = 0
+        for i < d.a { bind_pattern(e, p, src, list.get(i32, p.par, (d.op + i * 3 + 2) as usize), isb)  i = i + 1 }
+        return
+    }
+    if k == 6 {                                    // Or alternatives
+        var i: i32 = 0
+        for i < d.a { bind_pattern(e, p, src, list.get(i32, p.par, (d.op + i) as usize), isb)  i = i + 1 }
+        return
+    }
+}
+
+// Check a block's statements, then (when `tail`) the block's tail expression is in return
+// position. Mirrors `check_block`.
+fn check_block(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str, blk: i32, tail: bool) {
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, blk as usize)
+    e_push(e)
+    var i: i32 = 0
+    for i < d.y {
+        let sid: i32 = list.get(i32, p.sar, (d.x + i) as usize)
+        let s: parser.StmtData = list.get(parser.StmtData, p.st, sid as usize)
+        let is_last: bool = (i + 1) == d.y
+        if s.kind == 0 {                           // let / var
+            var isb: i32 = 0
+            if s.a >= 0 {
+                walk_expr(e, p, c, src, s.a, false)
+                if is_region_value(e, p, src, s.a) { e_bind_region(e, s.x, s.y) }
+                if is_borrow_place(e, p, c, src, s.a) { isb = 1 }
+            }
+            e_bind(e, s.x, s.y, isb)
+        } else if s.kind == 1 {                    // return
+            if s.a >= 0 { walk_expr(e, p, c, src, s.a, true) }
+        } else {                                   // expr statement: tail iff last && tail
+            var t: bool = false
+            if is_last { if tail { t = true } }
+            walk_expr(e, p, c, src, s.a, t)
+        }
+        i = i + 1
+    }
+    e_pop(e)
+}
+
+// Walk expression `id`. Reports capture/store escapes everywhere and (when `tail`) return
+// escapes at the leaves. Mirrors `walk_expr` arm for arm.
+fn walk_expr(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str, id: i32, tail: bool) {
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
+    let k: i32 = d.kind
+    if k == 24 {                                   // if
+        walk_expr(e, p, c, src, d.a, false)
+        check_block(e, p, c, src, d.b, tail)
+        if d.op >= 0 { walk_expr(e, p, c, src, d.op, tail) }
+        return
+    }
+    if k == 28 {                                   // match
+        let scrut_borrow: bool = is_borrow_place(e, p, c, src, d.a)
+        walk_expr(e, p, c, src, d.a, false)
+        var i: i32 = 0
+        for i < d.y {
+            let base: i32 = d.x + i * 3
+            e_push(e)
+            var sb: i32 = 0
+            if scrut_borrow { sb = 1 }
+            bind_pattern(e, p, src, list.get(i32, p.par, base as usize), sb)
+            let g: i32 = list.get(i32, p.par, (base + 1) as usize)
+            if g >= 0 { walk_expr(e, p, c, src, g, false) }
+            walk_expr(e, p, c, src, list.get(i32, p.par, (base + 2) as usize), tail)
+            e_pop(e)
+            i = i + 1
+        }
+        return
+    }
+    if k == 23 { check_block(e, p, c, src, id, tail)  return }             // block
+    if k == 25 { check_block(e, p, c, src, d.a, tail)  return }            // unsafe { block }
+    if k == 36 {                                   // struct-value: check its methods independently
+        walk_methods(e, p, c, src, d.x, d.y)
+        return
+    }
+    if k == 22 {                                   // f-string: walk interpolations (none stored)
+        return
+    }
+    if k == 16 {                                   // structlit: fields (capture), spread
+        walk_lit_fields(e, p, c, src, d.x, d.y, d.a, false)
+        if d.b >= 0 { walk_expr(e, p, c, src, d.b, false) }
+        return
+    }
+    if k == 17 {                                   // genstructlit: fields (capture)
+        walk_lit_fields(e, p, c, src, d.b, d.y, d.a, true)
+        return
+    }
+    if k == 12 {                                   // assign
+        walk_expr(e, p, c, src, d.a, false)
+        walk_expr(e, p, c, src, d.b, false)
+        if is_borrow_place(e, p, c, src, d.a) {
+            if escapes_as(e, p, c, src, d.b) {
+                var sb: String = string_new()
+                string_push(sb, "cannot store borrow `")
+                push_root_name(sb, e, p, c, src, d.b)
+                string_push(sb, "` into borrowed storage: it would outlive its call")
+                emit(d.start, d.end, string_view(sb))
+                string_free(sb)
+            }
+        }
+        // region assign-to-outer
+        if list.len(i32, e.rdepth) > 0 {
+            let rdep: i32 = list.get(i32, e.rdepth, (list.len(i32, e.rdepth) - 1))
+            if is_region_value(e, p, src, d.b) {
+                if carries_arena_ref(c, d.b) {
+                    let tgt: parser.ExprData = list.get(parser.ExprData, p.ex, d.a as usize)
+                    if tgt.kind == 2 {
+                        let dep: i32 = e_scope_depth_of(e, src, tgt.start, tgt.end)
+                        if dep >= 0 and dep < rdep {
+                            var sb: String = string_new()
+                            string_push(sb, "cannot store region-allocated value into `")
+                            string_push(sb, src[tgt.start .. tgt.end])
+                            string_push(sb, "`: it is declared outside the `region` block and would outlive the arena (copy it into an owned `String`)")
+                            emit(d.start, d.end, string_view(sb))
+                            string_free(sb)
+                        } else { e_bind_region(e, tgt.start as i32, tgt.end as i32) }
+                    }
+                }
+            }
+        }
+        // loop-mutation via direct assignment to a frozen collection
+        let rp: i32 = root_place(e, p, c, src, d.a)
+        let rd: parser.ExprData = list.get(parser.ExprData, p.ex, rp as usize)
+        if frozen_contains(e, src, rd.start, rd.end) {
+            var sb: String = string_new()
+            string_push(sb, "cannot mutate `")
+            push_root_name(sb, e, p, c, src, d.a)
+            string_push(sb, "` while iterating it: the `for` loop holds a borrow of it")
+            emit(d.start, d.end, string_view(sb))
+            string_free(sb)
+        }
+        return
+    }
+    if k == 10 {                                   // call
+        walk_expr(e, p, c, src, d.a, false)
+        var i: i32 = 0
+        for i < d.y { walk_expr(e, p, c, src, list.get(i32, p.ar, (d.x + i) as usize), false)  i = i + 1 }
+        check_give_away(e, p, c, src, id, d.a, d.x, d.y)
+        check_loop_mutation(e, p, c, src, id, d.a, d.x, d.y)
+        check_no_alloc_call(e, p, src, d.a, d.start, d.end)
+        check_det_call(e, p, src, d.a, d.start, d.end)
+        check_manual_drop(e, c, src, id, d.start, d.end)
+        return
+    }
+    if k == 4 { walk_expr(e, p, c, src, d.a, false)  walk_expr(e, p, c, src, d.b, false) }        // binary
+    else if k == 3 or k == 34 or k == 35 { walk_expr(e, p, c, src, d.a, false)  return }          // unary/invariant/variant
+    else if k == 13 { if d.a >= 0 { walk_expr(e, p, c, src, d.a, false) }  if d.b >= 0 { walk_expr(e, p, c, src, d.b, false) } }  // range
+    else if k == 5 { walk_expr(e, p, c, src, d.a, false) }                                        // field
+    else if k == 6 { walk_expr(e, p, c, src, d.a, false)  walk_expr(e, p, c, src, d.b, false) }   // index
+    else if k == 15 { walk_expr(e, p, c, src, d.a, false)  walk_expr(e, p, c, src, d.b, false) }  // array repeat
+    else if k == 14 {                              // array literal
+        var i: i32 = 0
+        for i < d.y { walk_expr(e, p, c, src, list.get(i32, p.ar, (d.x + i) as usize), false)  i = i + 1 }
+    }
+    else if k == 7 or k == 8 or k == 11 { walk_expr(e, p, c, src, d.a, false) }                   // deref/try/cast
+    else if k == 37 {                              // closure: params shadow; body checked, no escape
+        e_push(e)
+        var i: i32 = 0
+        for i < d.y {
+            let cb: i32 = d.x + i * 3
+            e_bind(e, list.get(i32, p.clar, cb as usize), list.get(i32, p.clar, (cb + 1) as usize), 0)
+            i = i + 1
+        }
+        walk_expr(e, p, c, src, d.a, false)
+        e_pop(e)
+    }
+    else if k == 38 {                              // concurrent
+        if e.deterministic {
+            emit(d.start, d.end, "raw `concurrent` is forbidden in a `@deterministic` function — its result can depend on the thread schedule. Use `par for … reduce(r)` (a checked deterministic reduction) for schedule-independent parallelism.")
+        }
+        check_block(e, p, c, src, d.a, false)
+        return
+    }
+    else if k == 39 { check_spawn_slice(e, p, c, src, d.a)  walk_expr(e, p, c, src, d.a, false)  return }  // spawn
+    else if k == 40 { walk_expr(e, p, c, src, d.a, false)  return }                               // await
+    else if k == 43 {                              // region
+        if e.no_alloc { emit(d.start, d.end, "a `region` block allocates an arena — forbidden in a `@no_alloc` function") }
+        list.push(i32, e.rdepth, list.len(i32, e.scst) as i32)
+        check_block(e, p, c, src, d.a, false)
+        list.truncate(i32, e.rdepth, list.len(i32, e.rdepth) - 1)
+        return
+    }
+    else if k == 41 {                              // par for
+        walk_expr(e, p, c, src, d.a, false)        // iter
+        walk_expr(e, p, c, src, d.b, false)        // reduction
+        e_push(e)
+        e_bind(e, d.x, d.y, 0)                      // var: fresh i64
+        walk_expr(e, p, c, src, d.op, false)       // body
+        e_pop(e)
+        return
+    }
+    else if k == 42 {                              // select
+        var i: i32 = 0
+        for i < d.y {
+            let base: i32 = d.x + i * 4
+            walk_expr(e, p, c, src, list.get(i32, p.par, base as usize), false)   // channel
+            e_push(e)
+            e_bind(e, list.get(i32, p.par, (base + 1) as usize), list.get(i32, p.par, (base + 2) as usize), 0)   // bind: owned i64
+            check_block(e, p, c, src, list.get(i32, p.par, (base + 3) as usize), false)
+            e_pop(e)
+            i = i + 1
+        }
+        if e.deterministic {
+            emit(d.start, d.end, "`select` waits on channels — its choice depends on the schedule; forbidden in a `@deterministic` function.")
+        }
+        return
+    }
+    else if k == 31 { walk_for(e, p, c, src, id)  return }
+
+    // tail: region-value return
+    if tail {
+        if is_region_value(e, p, src, id) {
+            if carries_arena_ref(c, id) {
+                var sb: String = string_new()
+                string_push(sb, "cannot return region-allocated value `")
+                push_root_name(sb, e, p, c, src, id)
+                string_push(sb, "`: it is owned by its `region` arena and does not outlive it (copy it into an owned `String` to return it)")
+                emit(d.start, d.end, string_view(sb))
+                string_free(sb)
+            }
+        }
+    }
+    // tail: return-position leaf escape
+    if tail {
+        if !e.ret_is_borrow {
+            if escapes_as(e, p, c, src, id) {
+                var sb: String = string_new()
+                if d.kind == 37 {
+                    string_push(sb, "cannot return a closure capturing borrow `")
+                    push_root_name(sb, e, p, c, src, id)
+                    string_push(sb, "`: the borrow would outlive its call")
+                } else {
+                    string_push(sb, "cannot return borrow `")
+                    push_root_name(sb, e, p, c, src, id)
+                    string_push(sb, "`: a second-class `read`/`mut`/`out` borrow may not outlive its call (pass it further down, or declare the return as `read`/`mut`/`out`)")
+                }
+                emit(d.start, d.end, string_view(sb))
+                string_free(sb)
+            }
+        }
+    }
+}
+
+// Walk struct-lit / gen-lit field-init values, flagging a stored borrow (capture, route 2).
+fn walk_lit_fields(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str, start: i32, count: i32, path: i32, gen: bool) {
+    let pd: parser.ExprData = list.get(parser.ExprData, p.ex, path as usize)
+    var i: i32 = 0
+    for i < count {
+        let fid: i32 = list.get(i32, p.ar, (start + i) as usize)
+        let fd: parser.ExprData = list.get(parser.ExprData, p.ex, fid as usize)
+        walk_expr(e, p, c, src, fd.a, false)
+        if escapes_as(e, p, c, src, fd.a) {
+            let vd: parser.ExprData = list.get(parser.ExprData, p.ex, fd.a as usize)
+            var sb: String = string_new()
+            string_push(sb, "cannot store borrow `")
+            push_root_name(sb, e, p, c, src, fd.a)
+            string_push(sb, "` in struct `")
+            string_push(sb, src[pd.start .. pd.end])
+            string_push(sb, "`: a second-class borrow may not outlive its call")
+            emit(vd.start, vd.end, string_view(sb))
+            string_free(sb)
+        }
+        i = i + 1
+    }
+}
+
+// The `for` loop: freeze iterated collections (element binds are borrows into them), bind loop
+// vars, check the body (never return position), then the `else` block. Mirrors the For arm.
+fn walk_for(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str, id: i32) {
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
+    let base: i32 = d.a
+    // region-scoped loop under @no_alloc: region span is at lar[base+2,3]
+    if e.no_alloc {
+        if list.get(i32, p.lar, (base + 2) as usize) >= 0 {
+            emit(d.start, d.end, "a region-scoped loop allocates a scratch arena — forbidden in a `@no_alloc` function")
+        }
+    }
+    e_push(e)
+    var froze: i32 = 0
+    if d.op == 1 { walk_expr(e, p, c, src, list.get(i32, p.lar, (base + 4) as usize), false) }   // while cond
+    else if d.op == 2 {                            // iterate
+        let bc: i32 = list.get(i32, p.lar, (base + 4) as usize)
+        let sc: i32 = list.get(i32, p.lar, (base + 5) as usize)
+        let src0: i32 = base + 7 + bc * 3
+        var si: i32 = 0
+        for si < sc { walk_expr(e, p, c, src, list.get(i32, p.lar, (src0 + si) as usize), false)  si = si + 1 }
+        if sc <= 1 {
+            var elem_borrow: bool = false
+            if sc == 1 {
+                let s0: i32 = list.get(i32, p.lar, src0 as usize)
+                let sd: parser.ExprData = list.get(parser.ExprData, p.ex, s0 as usize)
+                if sd.kind != 13 { elem_borrow = true }            // not a Range -> a slice element borrow
+            }
+            if bc >= 1 {
+                let bns: i32 = list.get(i32, p.lar, (base + 8) as usize)
+                let bne: i32 = list.get(i32, p.lar, (base + 9) as usize)
+                if !is_underscore(src, bns as usize, bne as usize) {
+                    var isb: i32 = 0
+                    if elem_borrow { isb = 1 }
+                    e_bind(e, bns, bne, isb)
+                }
+            }
+            if bc >= 2 {
+                let bns: i32 = list.get(i32, p.lar, (base + 11) as usize)
+                let bne: i32 = list.get(i32, p.lar, (base + 12) as usize)
+                if !is_underscore(src, bns as usize, bne as usize) { e_bind(e, bns, bne, 0) }   // index
+            }
+            if elem_borrow {
+                let s0: i32 = list.get(i32, p.lar, src0 as usize)
+                let sd: parser.ExprData = list.get(parser.ExprData, p.ex, s0 as usize)
+                if sd.kind == 2 { list.push(i32, e.frozen, sd.start as i32)  list.push(i32, e.frozen, sd.end as i32)  froze = froze + 1 }
+            }
+        } else {
+            var bi: i32 = 0
+            for bi < bc {
+                let bns: i32 = list.get(i32, p.lar, (base + 7 + bi * 3 + 1) as usize)
+                let bne: i32 = list.get(i32, p.lar, (base + 7 + bi * 3 + 2) as usize)
+                if !is_underscore(src, bns as usize, bne as usize) { e_bind(e, bns, bne, 1) }
+                bi = bi + 1
+            }
+            var sj: i32 = 0
+            for sj < sc {
+                let s0: i32 = list.get(i32, p.lar, (src0 + sj) as usize)
+                let sd: parser.ExprData = list.get(parser.ExprData, p.ex, s0 as usize)
+                if sd.kind == 2 { list.push(i32, e.frozen, sd.start as i32)  list.push(i32, e.frozen, sd.end as i32)  froze = froze + 1 }
+                sj = sj + 1
+            }
+        }
+    }
+    check_block(e, p, c, src, d.b, false)          // body — never return position
+    var f: i32 = 0
+    for f < froze { list.truncate(i32, e.frozen, list.len(i32, e.frozen) - 2)  f = f + 1 }
+    e_pop(e)
+    if d.x >= 0 { check_block(e, p, c, src, d.x, false) }   // else, in enclosing scope
+}
+
+fn is_underscore(read src: str, ns: usize, ne: usize) -> bool {
+    if ne - ns != 1 { return false }
+    return (src[ns] as i32) == 95
+}
+
+// ---- item walk ----
+
+fn walk_methods(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str, mem_start: i32, mem_count: i32) {
+    var i: i32 = 0
+    for i < mem_count {
+        let mbase: i32 = mem_start + i * 10
+        if list.get(i32, p.mar, mbase as usize) == 1 {
+            let fid: i32 = list.get(i32, p.mar, (mbase + 1) as usize)
+            let f: parser.ItemData = list.get(parser.ItemData, p.it, fid as usize)
+            check_fn(e, p, c, src, f)
+        }
+        i = i + 1
+    }
+}
+
+// Does fn `f` carry attribute `name`? (aar 4-tuples at (u,v).)
+fn fn_has_attr(read p: parser.Parser, read src: str, read f: parser.ItemData, read name: str) -> bool {
+    if f.u < 0 { return false }
+    var i: i32 = 0
+    for i < f.v {
+        let ns: i32 = list.get(i32, p.aar, (f.u + i * 4) as usize)
+        let ne: i32 = list.get(i32, p.aar, (f.u + i * 4 + 1) as usize)
+        if str_eq(src[ns as usize .. ne as usize], name) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn check_fn(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str, read f: parser.ItemData) {
+    let saved_na: bool = e.no_alloc
+    let saved_det: bool = e.deterministic
+    let saved_rb: bool = e.ret_is_borrow
+    let saved_sb: i32 = e.self_borrow
+    e.no_alloc = fn_has_attr(p, src, f, "no_alloc")
+    e.deterministic = fn_has_attr(p, src, f, "deterministic")
+    let rc: i32 = f.op                             // ret_conv
+    e.ret_is_borrow = (rc == 1 or rc == 2 or rc == 4)
+    e.self_borrow = 0
+    e_push(e)
+    var i: i32 = 0
+    for i < f.b {
+        let pbase: i32 = f.a + i * 7
+        let is_ct: i32 = list.get(i32, p.iar, pbase as usize)
+        let conv: i32 = list.get(i32, p.iar, (pbase + 1) as usize)
+        let is_self: i32 = list.get(i32, p.iar, (pbase + 4) as usize)
+        var isb: i32 = 0
+        if is_ct == 0 { if conv != 3 { isb = 1 } }     // borrow unless comptime or take
+        if is_self == 1 { e.self_borrow = isb }
+        else { e_bind(e, list.get(i32, p.iar, (pbase + 2) as usize), list.get(i32, p.iar, (pbase + 3) as usize), isb) }
+        i = i + 1
+    }
+    if f.w >= 0 { check_block(e, p, c, src, f.w, true) }   // body is in return position
+    e_pop(e)
+    e.no_alloc = saved_na
+    e.deterministic = saved_det
+    e.ret_is_borrow = saved_rb
+    e.self_borrow = saved_sb
+}
+
+fn check_items(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str) {
+    var r: usize = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 3 { check_fn(e, p, c, src, it) }                    // Fn
+        else if it.kind == 4 { walk_methods(e, p, c, src, it.a, it.b) }   // Struct methods
+        r = r + 1
+    }
+}
+
+fn main() -> i32 {
+    var a: Allocator = mem.system_allocator()
+    var it: Interner = intern.make(a)
+    let kwcount: i64 = tokens.intern_keywords(it)
+    if env.argc() > 1 {
+        var src: String = fs.read_text(env.argv(1))
+        var p: parser.Parser = parser.parse_source(string_view(src), it, kwcount, a)
+        var c: typeck.Checker = typeck.check_parsed(p, string_view(src), a)
+        var e: Esc = Esc{ scn: list.make(i32, a), scst: list.make(i32, a), rgn: list.make(i32, a), rgst: list.make(i32, a), frozen: list.make(i32, a), rdepth: list.make(i32, a), no_alloc: false, deterministic: false, ret_is_borrow: false, self_borrow: 0, alloc: a }
+        check_items(e, p, c, string_view(src))
+        string_free(src)
+    }
+    return 0
+}

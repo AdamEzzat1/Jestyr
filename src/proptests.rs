@@ -7492,7 +7492,7 @@ mod c_oracle {
     /// subset. Currently: the literal leaves (Int/Float/Str/Char/Bool/Null).
     #[test]
     fn jestyr_typeck_dump_matches_reference() {
-        let tc = build_exe("examples/std/typeck.jtr");
+        let tc = build_exe("examples/std/typeck_cli.jtr");
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         for dir in ["examples", "examples/std"] {
             if let Ok(rd) = std::fs::read_dir(dir) {
@@ -7562,6 +7562,82 @@ mod c_oracle {
         }
         assert!(diverged.is_empty(), "Jestyr typeck dump diverged from the reference on: {diverged:?}");
         eprintln!("whole-corpus typeck golden: {checked} files' typed-expr streams identical");
+    }
+
+    // ---- P4 escape: the diagnostic-set dump golden ----
+
+    /// The reference escape-diagnostic dump for `src`: parse, type-check, run `escape::check`,
+    /// then emit each diagnostic as three lines — span start, span end, message — in emission
+    /// order. The Jestyr `escape.jtr` emits the identical stream.
+    fn rust_escape_dump(src: &str) -> Vec<String> {
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (ast, _diags) = crate::parser::Parser::new(src, tokens).parse();
+        let (info, _d) = crate::typeck::check(&ast);
+        let diags = crate::escape::check(&ast, &info);
+        let mut out = Vec::new();
+        for d in &diags {
+            out.push(d.span.start.to_string());
+            out.push(d.span.end.to_string());
+            out.push(d.message.clone());
+        }
+        out
+    }
+
+    /// Run the Jestyr escape checker on `file` and return its stdout lines.
+    fn jestyr_escape_dump(exe: &std::path::Path, file: &str) -> Vec<String> {
+        let out = Command::new(exe).arg(file).output().unwrap();
+        assert!(out.status.success(), "jestyr escape checker failed on {file}");
+        String::from_utf8(out.stdout).unwrap().lines().map(|s| s.to_string()).collect()
+    }
+
+    const ESCAPE_GOLDEN_DENYLIST: &[&str] = &[];
+
+    /// **P4 whole-corpus escape golden.** For every corpus `.jtr` file, the Jestyr escape checker
+    /// (`examples/std/escape.jtr`) must produce the *same set of diagnostics* (span + message, in
+    /// emission order) as the Rust reference (`escape::check`). Most files are valid ⇒ empty; the
+    /// escape example files carry the real diagnostics.
+    #[test]
+    fn jestyr_escape_dump_matches_reference() {
+        let exe = build_exe("examples/std/escape.jtr");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for dir in ["examples", "examples/std"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("jtr") {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+        files.sort();
+        assert!(files.len() > 100, "expected the whole corpus, found {}", files.len());
+        let mut checked = 0;
+        let mut diverged: Vec<String> = Vec::new();
+        for p in &files {
+            let f = p.to_str().unwrap();
+            let base = p.file_name().and_then(|s| s.to_str()).unwrap();
+            if ESCAPE_GOLDEN_DENYLIST.contains(&base) {
+                continue;
+            }
+            let src = std::fs::read_to_string(p).unwrap();
+            let got = jestyr_escape_dump(&exe, f);
+            let want = rust_escape_dump(&src);
+            if got != want {
+                diverged.push(f.to_string());
+                if std::env::var("DUMP_DIVERGE").is_ok() {
+                    let first = got.iter().zip(want.iter()).position(|(a, b)| a != b).unwrap_or(0);
+                    let lo = first.saturating_sub(2);
+                    eprintln!("=== {f} (first diff at line {first}) ===");
+                    eprintln!("GOT : {:?}", &got[lo..(lo + 12).min(got.len())]);
+                    eprintln!("WANT: {:?}", &want[lo..(lo + 12).min(want.len())]);
+                }
+            } else {
+                checked += 1;
+            }
+        }
+        assert!(diverged.is_empty(), "Jestyr escape dump diverged from the reference on: {diverged:?}");
+        eprintln!("whole-corpus escape golden: {checked} files' diagnostic sets identical");
     }
 
     /// **P2 depth guard.** The Jestyr parser bounds AST *height* at `MAX_EXPR_DEPTH`
