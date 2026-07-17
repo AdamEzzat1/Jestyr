@@ -7498,14 +7498,15 @@ mod c_oracle {
     ///   flows onto the literal): array_lit.
     /// - comptime-generic files with a stream misalignment still to diagnose: genlist,
     ///   genmethods.
-    const TYPECK_GOLDEN_DENYLIST: &[&str] = &[
-        "array_lit.jtr", "compute.jtr", "container.jtr", "copy_optin.jtr", "discriminants.jtr",
-        "drop_nested.jtr", "errors.jtr", "fn_ptr.jtr", "gen_vtable.jtr", "genlist.jtr",
-        "genmethods.jtr", "guards.jtr", "methods.jtr", "nested_match.jtr", "niche.jtr",
-        "option.jtr", "orpat.jtr", "recursion.jtr", "rest_pat.jtr", "shapes.jtr", "await.jtr",
-        "core.jtr", "list.jtr", "sync.jtr", "struct_variant.jtr", "try_utf8.jtr", "vec.jtr",
-        "vec_generic.jtr",
-    ];
+    /// Files whose typed streams still diverge — the remaining P3 machinery, by cause:
+    /// - EXPECTED-TYPE propagation (`cur_expected`): a nullary generic variant adopts the
+    ///   annotation's instantiation (`var m: Option(i32) = none`), and a closure adopts an
+    ///   expected fn-pointer's param types: fn_ptr, gen_vtable, guards, option.
+    /// - GENERIC METHOD returns (struct-value methods under the receiver's type args —
+    ///   `resolve_struct_method`'s substitution — and bracket-generic unification in
+    ///   `monomorphize_ret`): genmethods, core.
+    const TYPECK_GOLDEN_DENYLIST: &[&str] =
+        &["fn_ptr.jtr", "gen_vtable.jtr", "genmethods.jtr", "guards.jtr", "option.jtr", "core.jtr"];
 
     /// **P3 whole-corpus resolved-type golden.** For every corpus `.jtr` file, the Jestyr typeck
     /// (`examples/std/typeck.jtr`) must resolve the *same* `Ty` for every expression whose kind
