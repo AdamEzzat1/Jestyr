@@ -91,16 +91,79 @@ spread still TODO), **Field access** (kind 5 → `<base>.j_<name>`), and **infer
 `emit_ty_c(sb, src, c, tyid)` reading `c.et[init]` → `c.tys` TyData (Unit/Prim via `prim_code_c`/
 Named → `Jestyr_<name>` from the `c.tdecl` row cols 0/1). `emit_expr` stays Checker-free.
 
-### NEXT increments — the plan
+### Increment 6 — literals + unary + the str family + size_of (`fa48b4f`, allowlist 10)
 
-Grow the allowlist file-by-file (`DUMP_DIVERGE=1` to converge). Likely order:
-- **field-typed lets + more `emit_c_ty`/`emit_ty_c` kinds**: `str` → `JestyrStr`, pointers `*T`/
-  `*mut T`, slices `[]T` → `JestyrSlice_<T>` (also needs slice-instance collection + typedefs).
-- **`union` + `size_of`** (`union.jtr`): `size_of(T)` is compile-time-evaluated to an integer
-  (layout: union = max field size) — needs a layout pass; non-trivial, defer if it balloons.
-- **enums + `match`** (the big family — tagged-union first, niche later), **closures**
-  (lambda-lifted to top-level fns), **concurrency** (pthread lowering). See `emit_match`/
-  `collect_closures`/`emit_concurrent` in `cgen.rs`.
+New in `cgen.jtr`: Float/Char/Bool/Null literals, Unary (op 1=neg `-`, 2=not `!`, 3=bitnot `~`,
+4=ref `&`; Bool stores `op`=1/0 for true/false), the full prim C-type table (char→`uint32_t`,
+str/os_str→`JestyrStr`, cstr→`const char*`, String/Builder/Cow→`Jestyr*`), and — the structural
+change — **`emit_expr` now threads the Checker** for type-directed lowering: `expr_is_str(c,eid)`
+(TyData kind 2, code 14) drives Field (`.len`/`.ptr`/`.cstr` are real C fields on a `str`) and
+Index (`s[lo..hi]` → `jestyr_rt_substr(b, lo, hi)`; absent lo→`0`, open hi→`({b}).len`, inclusive
+→`((hi) + 1)`). Intrinsics added: starts_with/ends_with/contains/find/trim/substr/count_cp/
+count_graphemes (all `<helper>(<args>)`), and `size_of(T)` → `sizeof(<cty>)` (bare-Name type arg).
+Allowlist 6→10: +`io.jtr` (str params), `str_ops.jtr`, `substr.jtr`, `union.jtr` (union defs
+already worked via the kind-4 `op`==2 path; only size_of was missing).
+
+### R2 fixpoint harness — STANDS (`5ba8f43`)
+
+`Cargo.toml` gained `selfhost-fixpoint = ["c-oracle"]`. `selfhost_fixpoint_subset` (in
+`mod c_oracle`, additionally `#[cfg(feature = "selfhost-fixpoint")]`): **jc1** = `build_exe`
+of `cgen.jtr`; for every `CGEN_GOLDEN_ALLOWLIST` program, jc1 compiles it → C (CRLF-normalized),
+gcc builds it (skip library modules — no `int main(` → no link), and the exe must produce
+**exactly** the Rust-compiled program's stdout + exit code. 9 runnable programs green. Run:
+`cargo test --features selfhost-fixpoint selfhost_fixpoint_subset`. The full jc2≡jc3 fixed point
+reuses this scaffold once cgen.jtr can compile the compiler sources themselves.
+
+### NEXT increments — everything still remaining (the session-7+ worklist)
+
+Allowlist is 10/130; grow it file-by-file (`DUMP_DIVERGE=1` to converge; probe the whole corpus
+after each construct — files unlock in clusters). Expr kinds handled so far: 0 Int, 1 Float,
+2 Name, 3 Unary, 4 Binary, 5 Field, 6 Index (str-range only), 10 Call, 11 Cast, 16 StructLit,
+24 If, 26 Char, 27 Bool, 29 Str, 30 Null. Still remaining, roughly in order of leverage:
+
+- **Assign (12) + compound ops** (`assign_c`), **Deref (7)**, **slice/array Index** (the
+  bounds-checked statement-expr, `_s{n}`/`_ix{n}` temps, refinement elision), **ArrayLit (14)/
+  ArrayRepeat (15)**, **Range (13) outside str-index**, **FString (22)** (statement-expr
+  `_fs{n}` push chain — see the fstring.jtr near-miss diff), **Try (8) `?`**, **Block/Unsafe
+  (23/25) in stmt/value position**.
+- **Loops** (For 31, Break 32, Continue 33, Invariant 34, Variant 35): the unified `for` family
+  — heads (infinite/conditional/iterating), `else`, `step`, labels, `emit_for` in cgen.rs.
+  Medium; unlocks many files (loops.jtr, loops_else.jtr, …).
+- **Types in `emit_c_ty`/`emit_ty_c`**: pointers `*T`, slices `[]T` → `JestyrSlice_<T>` (needs
+  **slice-instance collection** + typedefs — the first instance-collection machinery), arrays
+  `[N]T` → `JestyrArr_<T>_<N>`, genrefs, fn-pointer typedefs.
+- **Error sets**: fallible fns → per-ok-type result structs in `result_defs`, `ok`/`err`/
+  `unwrap`/`is_err`/`?` lowering (errors.jtr).
+- **Enums + `match`** (LARGE): enum defs (tag enum + struct+union payload — see the shapes.jtr
+  near-miss diff for the exact shape), variant construction, discriminants, `emit_scalar_match`/
+  tagged-union match first, niche/nested/guarded later.
+- **Traits/impls/`dyn`** (LARGE): methods (`self`), impl dispatch, operator traits (needs
+  typeck.jtr to expose `impl_calls` per-expr — port the reference's `TypeInfo.impl_calls` into
+  the Checker as a flat arena FIRST), dyn vtables/fat pointers.
+- **Generics/monomorphization** (LARGE, the hardest infra): `collect_all_instances` whole-program
+  walk → per-instance fn/struct/enum emission + `mangle` (`Jestyr_<name>__<types>`).
+- **RAII drop glue** (medium-large): `needs_drop`/`emit_all_drops`/`emit_drop_place` +
+  `collect_moved` move analysis — currently a deliberate no-op in cgen.jtr's `emit_body`.
+- **Closures** (lambda-lifting: `collect_closures`, `JestyrEnv_<id>`/`JestyrClosure_<id>`/
+  `jestyr_lam_<id>`), **Concurrency** (Concurrent 38/Spawn 39/Await 40/ParFor 41/Select 42 →
+  pthread; `spawn_runtime`, `collect_spawns`), **Regions (43)** (arena prelude block is gated on
+  use — remember to emit it when `uses_arena`), **consts section**, **extern "c"**, **contracts**
+  (`requires`/`ensures` asserts), **@-attributes** (fn attr prefix, struct attr), **def-capture
+  topological ordering** (only needed when a by-value field dep forces a reorder), **test mode**
+  (`emit_tests`, the `jestyrc test` harness main).
+- **typeck side-tables to expose as needed** (add `pub` flat arenas to typeck.jtr right before
+  the construct that reads them, like P4 did): `impl_calls`(exists: `icalls`)/`method_calls`
+  (exists: `mcalls`)/`dyn_coercions`/`call_sym`/`qualified` (module-qualified consts)/closure
+  index/niche info.
+- **R2 full fixpoint**: grow `selfhost_fixpoint_subset` alongside the allowlist (it consumes it
+  automatically). The jc2≡jc3 step needs cgen.jtr to compile parser.jtr+typeck.jtr+escape.jtr+
+  cgen.jtr — i.e. most of the list above (imports/modules are the extra wrinkle: the golden path
+  is single-file; the compiler sources are multi-module, so R2-full also needs the module-merge
+  behavior or a concatenated-source build).
+
+**Known non-targets for the golden:** `typeerr.jtr`-style files (the reference CLI emits nothing
+on type errors, but `rust_cgen_dump` calls `emit` unconditionally — if a divergence appears there,
+check error handling first); `demo.jtr`/driver files with modules (single-file golden path).
 
 Reference for the plan that produced increment 5 (kept for the pattern):
 
