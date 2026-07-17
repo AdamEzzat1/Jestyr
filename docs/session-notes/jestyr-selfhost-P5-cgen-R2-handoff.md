@@ -78,7 +78,33 @@ What's ported in `cgen.jtr` now:
 Whole-corpus probe: only the 4 allowlisted files match; **no free wins** — each next file needs
 new constructs.
 
-### NEXT increment — **structs** (target `compute.jtr`), the plan
+### Increment 5 — structs — DONE (`f442299`, allowlist now 6 files)
+
+Implemented exactly the plan below; `compute.jtr` byte-identical and `copy_optin.jtr` fell out as
+a **free win** (structs + Copy opt-in need nothing more). Landed in `cgen.jtr`: struct/union
+**forward typedefs** (kind 4, `it.op` 0/1=struct 2=union), **`emit_struct_defs`** (mar 10-tuples
+`[tag,pub,ns,ne,tyid,default,attr_s,attr_c,bits_s,bits_e]`, `};\n\n`; called before
+`emit_result_defs` — matches capture/flush order with no by-value dep), **StructLit** (kind 16 →
+`(Jestyr_X){ .j_f = v, … }`, source order; FieldInit kind 18 `(x,y)`=name `a`=value; defaults/
+spread still TODO), **Field access** (kind 5 → `<base>.j_<name>`), and **inferred-`let` types**:
+`read c: typeck.Checker` threaded through `emit_body`/`emit_stmt`/`emit_return`/`emit_if`, plus
+`emit_ty_c(sb, src, c, tyid)` reading `c.et[init]` → `c.tys` TyData (Unit/Prim via `prim_code_c`/
+Named → `Jestyr_<name>` from the `c.tdecl` row cols 0/1). `emit_expr` stays Checker-free.
+
+### NEXT increments — the plan
+
+Grow the allowlist file-by-file (`DUMP_DIVERGE=1` to converge). Likely order:
+- **field-typed lets + more `emit_c_ty`/`emit_ty_c` kinds**: `str` → `JestyrStr`, pointers `*T`/
+  `*mut T`, slices `[]T` → `JestyrSlice_<T>` (also needs slice-instance collection + typedefs).
+- **`union` + `size_of`** (`union.jtr`): `size_of(T)` is compile-time-evaluated to an integer
+  (layout: union = max field size) — needs a layout pass; non-trivial, defer if it balloons.
+- **enums + `match`** (the big family — tagged-union first, niche later), **closures**
+  (lambda-lifted to top-level fns), **concurrency** (pthread lowering). See `emit_match`/
+  `collect_closures`/`emit_concurrent` in `cgen.rs`.
+
+Reference for the plan that produced increment 5 (kept for the pattern):
+
+#### structs plan (as executed)
 
 The reference target (`emit-c compute.jtr | grep -v '^#line'`) shows exactly what's needed:
 1. **struct forward typedef** in `emit_forward_types` (item kind **4**): `typedef struct
