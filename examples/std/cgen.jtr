@@ -1,0 +1,354 @@
+// examples/std/cgen.jtr — the P5 C backend, written *in Jestyr*. It imports the P2 parser (AST)
+// and the P3 typeck (per-expr types + resolution records), then lowers the program to C —
+// aiming to be **byte-identical** to the Rust reference `src/cgen.rs` (`cgen::emit`). This is the
+// last and largest pass of the self-hosting port (ROADMAP workstream P); it is grown
+// construct-by-construct, starting from `examples/hello.jtr`, mirroring `emit_program`'s exact
+// section order (the emission ORDER is load-bearing for byte-identity).
+//
+// **Verification.** `jestyr_cgen_matches_reference` (`--features c-oracle`) builds this program,
+// runs it on each corpus `.jtr` file, and diffs its stdout (the emitted C) line-for-line against
+// `cgen::emit(&ast, &info)` — where `info` comes from the single-file `typeck::check`, so the
+// reference's `#line` debug directives are empty (the unit-test path), and the target is the
+// pure C text. A `CGEN_GOLDEN_DENYLIST` holds the files not yet covered; it shrinks per construct.
+//
+// Increment 1 (this file's current reach): `hello.jtr` — the prelude, one `fn main -> i32`, a
+// `print_str("…")` intrinsic call, a string literal, and `return 0`. Everything else is denylisted.
+import "mem"
+import "intern"
+import "fs"
+import "env"
+import "list"
+import "tokens"
+import "parser"
+import "typeck"
+
+// ---- the fixed C prelude (mirrors Cgen::prelude) ----
+// A FIXED header block: includes + the `jestyr_rt_*` runtime + the JestyrStr/String/Cow/Builder
+// value types + the print/file-IO/argv intrinsics. Transcribed byte-for-byte from `cgen.rs`
+// (Jestyr and Rust share the same string-escape conventions, so `"\\n"` here is a literal
+// backslash-n in the emitted C, and `"\n"` is a real C-source line break — the double-transpile
+// composes). The pthread/time/try_read/arena conditional blocks are only emitted when used;
+// `hello` uses none, so they are elided (added back per construct as later files need them).
+fn emit_prelude(mut sb: String) {
+    string_push(sb, "#include <stdint.h>\n#include <stdbool.h>\n#include <stddef.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <assert.h>\n")
+    string_push(sb, "\n")
+    string_push(sb, "/* Jestyr string view — a length-carrying `{ptr, len}` (a borrowed UTF-8 view,\n")
+    string_push(sb, "   like Zig `[]const u8` / Rust `&str`). `.len` is O(1); no `strlen`. A bare\n")
+    string_push(sb, "   `cstr` (null-terminated `const char*`) is the distinct C-interop type. */\n")
+    string_push(sb, "typedef struct { const char* ptr; size_t len; } JestyrStr;\n")
+    string_push(sb, "#define JSTR(s) ((JestyrStr){ (s), sizeof(s) - 1 })\n")
+    string_push(sb, "/* O(n) codepoint count (vs O(1) `.len`): a UTF-8 leading byte is one whose top two bits aren't 10. */\n")
+    string_push(sb, "static size_t jestyr_rt_count_cp(JestyrStr s) { size_t n = 0; for (size_t k = 0; k < s.len; k++) if (((uint8_t)s.ptr[k] & 0xC0u) != 0x80u) n++; return n; }\n")
+    string_push(sb, "/* Simplified grapheme segmentation: a cluster is a base codepoint plus following combining marks (é = e + U+0301). ZWJ emoji sequences are not merged — full UAX#29 needs Unicode tables. */\n")
+    string_push(sb, "static bool jestyr_rt_is_combining(uint32_t cp) { return (cp >= 0x0300u && cp <= 0x036Fu) || (cp >= 0x1AB0u && cp <= 0x1AFFu) || (cp >= 0x1DC0u && cp <= 0x1DFFu) || (cp >= 0x20D0u && cp <= 0x20FFu) || (cp >= 0xFE20u && cp <= 0xFE2Fu); }\n")
+    string_push(sb, "/* Decode the UTF-8 codepoint at *k, advancing *k past it (replacement char on a bad lead byte). */\n")
+    string_push(sb, "static uint32_t jestyr_rt_decode_cp(const char* p, size_t len, size_t* k) { size_t i = *k; uint8_t b = (uint8_t)p[i]; uint32_t cp; size_t n; if (b < 0x80u) { cp = b; n = 1; } else if ((b & 0xE0u) == 0xC0u) { cp = b & 0x1Fu; n = 2; } else if ((b & 0xF0u) == 0xE0u) { cp = b & 0x0Fu; n = 3; } else if ((b & 0xF8u) == 0xF0u) { cp = b & 0x07u; n = 4; } else { *k = i + 1; return 0xFFFDu; } for (size_t j = 1; j < n && i + j < len; j++) cp = (cp << 6) | ((uint8_t)p[i + j] & 0x3Fu); *k = i + n; return cp; }\n")
+    string_push(sb, "/* O(n) grapheme-cluster count: base codepoints (combining marks attach to the preceding base). */\n")
+    string_push(sb, "static size_t jestyr_rt_count_graphemes(JestyrStr s) { size_t k = 0, n = 0; while (k < s.len) { uint32_t cp = jestyr_rt_decode_cp(s.ptr, s.len, &k); if (!jestyr_rt_is_combining(cp)) n++; } return n; }\n")
+    string_push(sb, "/* Validate a byte range as UTF-8 (used at the bytes->str boundary). */\n")
+    string_push(sb, "static bool jestyr_rt_valid_utf8(const char* p, size_t len) { size_t k = 0; while (k < len) { uint8_t b = (uint8_t)p[k]; size_t n; if (b < 0x80u) n = 1; else if ((b & 0xE0u) == 0xC0u) n = 2; else if ((b & 0xF0u) == 0xE0u) n = 3; else if ((b & 0xF8u) == 0xF0u) n = 4; else return false; if (k + n > len) return false; for (size_t j = 1; j < n; j++) if (((uint8_t)p[k + j] & 0xC0u) != 0x80u) return false; k += n; } return true; }\n")
+    string_push(sb, "/* A boundary-checked sub-view (Rust discipline): start<=end<=len, and both on UTF-8 char boundaries. Zero-copy. */\n")
+    string_push(sb, "static bool jestyr_rt_is_boundary(JestyrStr s, size_t i) { return i == s.len || ((uint8_t)s.ptr[i] & 0xC0u) != 0x80u; }\n")
+    string_push(sb, "static JestyrStr jestyr_rt_substr(JestyrStr s, size_t start, size_t end) { assert(start <= end && end <= s.len); assert(jestyr_rt_is_boundary(s, start) && jestyr_rt_is_boundary(s, end)); return (JestyrStr){ s.ptr + start, end - start }; }\n")
+    string_push(sb, "/* Byte-level string operations: equality, prefix/suffix, search, trim. All view-based (find/trim are zero-copy). */\n")
+    string_push(sb, "static bool jestyr_rt_str_eq(JestyrStr a, JestyrStr b) { return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0; }\n")
+    string_push(sb, "static bool jestyr_rt_starts_with(JestyrStr s, JestyrStr p) { return s.len >= p.len && memcmp(s.ptr, p.ptr, p.len) == 0; }\n")
+    string_push(sb, "static bool jestyr_rt_ends_with(JestyrStr s, JestyrStr p) { return s.len >= p.len && memcmp(s.ptr + (s.len - p.len), p.ptr, p.len) == 0; }\n")
+    string_push(sb, "static int64_t jestyr_rt_find(JestyrStr s, JestyrStr n) { if (n.len == 0) return 0; if (n.len > s.len) return -1; for (size_t i = 0; i + n.len <= s.len; i++) if (memcmp(s.ptr + i, n.ptr, n.len) == 0) return (int64_t)i; return -1; }\n")
+    string_push(sb, "static bool jestyr_rt_contains(JestyrStr s, JestyrStr n) { return jestyr_rt_find(s, n) >= 0; }\n")
+    string_push(sb, "static JestyrStr jestyr_rt_trim(JestyrStr s) { size_t a = 0, b = s.len; while (a < b) { char c = s.ptr[a]; if (c==' '||c=='\\t'||c=='\\n'||c=='\\r') a++; else break; } while (b > a) { char c = s.ptr[b-1]; if (c==' '||c=='\\t'||c=='\\n'||c=='\\r') b--; else break; } return (JestyrStr){ s.ptr + a, b - a }; }\n")
+    string_push(sb, "/* ASCII case-insensitive equality — the opt-in normalization-aware compare. Full Unicode case-folding / NFC normalization needs the Unicode tables (deferred). */\n")
+    string_push(sb, "static char jestyr_rt_ascii_lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }\n")
+    string_push(sb, "static bool jestyr_rt_eq_fold(JestyrStr a, JestyrStr b) { if (a.len != b.len) return false; for (size_t i = 0; i < a.len; i++) if (jestyr_rt_ascii_lower(a.ptr[i]) != jestyr_rt_ascii_lower(b.ptr[i])) return false; return true; }\n\n")
+    string_push(sb, "/* Jestyr owned String — a heap-owned, growable buffer (the owned half of the\n")
+    string_push(sb, "   owned/view split). `string_view` borrows it as a `str` view; no copy. */\n")
+    string_push(sb, "typedef struct { char* ptr; size_t len; size_t cap; } JestyrString;\n")
+    string_push(sb, "static JestyrString jestyr_rt_str_new(void) { JestyrString s; s.ptr = NULL; s.len = 0; s.cap = 0; return s; }\n")
+    string_push(sb, "static JestyrString jestyr_rt_str_from(JestyrStr v) { JestyrString s; s.cap = v.len ? v.len : 1; s.ptr = (char*)malloc(s.cap); memcpy(s.ptr, v.ptr, v.len); s.len = v.len; return s; }\n")
+    string_push(sb, "static void jestyr_rt_str_push(JestyrString* s, JestyrStr v) { if (s->len + v.len > s->cap) { size_t nc = s->cap ? s->cap * 2 : 8; while (nc < s->len + v.len) nc *= 2; s->ptr = (char*)realloc(s->ptr, nc); s->cap = nc; } memcpy(s->ptr + s->len, v.ptr, v.len); s->len += v.len; }\n")
+    string_push(sb, "static JestyrStr jestyr_rt_str_view(JestyrString* s) { return (JestyrStr){ s->ptr, s->len }; }\n")
+    string_push(sb, "static void jestyr_rt_str_free(JestyrString* s) { free(s->ptr); s->ptr = NULL; s->len = 0; s->cap = 0; }\n")
+    string_push(sb, "/* Append an integer's decimal digits (for f-string interpolation; copies). */\n")
+    string_push(sb, "static void jestyr_rt_str_push_i64(JestyrString* s, int64_t v) { char b[24]; int n = snprintf(b, sizeof(b), \"%lld\", (long long)v); if (n < 0) n = 0; jestyr_rt_str_push(s, (JestyrStr){ b, (size_t)n }); }\n")
+    string_push(sb, "/* Lossily decode unvalidated platform text (os_str) into a proven UTF-8 String, replacing each ill-formed byte with U+FFFD. */\n")
+    string_push(sb, "/* Cow<str>: borrowed-or-owned, visible. cap==0 means borrowed (no allocation, free is a no-op); cap>0 means owned. cow_to_mut is the copy-on-write point. */\n")
+    string_push(sb, "typedef struct { char* ptr; size_t len; size_t cap; } JestyrCow;\n")
+    string_push(sb, "static JestyrCow jestyr_rt_cow_borrow(JestyrStr v) { JestyrCow c; c.ptr = (char*)v.ptr; c.len = v.len; c.cap = 0; return c; }\n")
+    string_push(sb, "static bool jestyr_rt_cow_is_owned(JestyrCow c) { return c.cap > 0; }\n")
+    string_push(sb, "static JestyrStr jestyr_rt_cow_view(JestyrCow c) { return (JestyrStr){ c.ptr, c.len }; }\n")
+    string_push(sb, "static JestyrCow jestyr_rt_cow_to_mut(JestyrCow c) { if (c.cap > 0) return c; JestyrCow o; o.cap = c.len ? c.len : 1; o.ptr = (char*)malloc(o.cap); memcpy(o.ptr, c.ptr, c.len); o.len = c.len; return o; }\n")
+    string_push(sb, "static void jestyr_rt_cow_free(JestyrCow* c) { if (c->cap > 0) free(c->ptr); c->ptr = NULL; c->len = 0; c->cap = 0; }\n")
+    string_push(sb, "static JestyrString jestyr_rt_to_str_lossy(JestyrStr os) { JestyrString out = jestyr_rt_str_new(); size_t k = 0; while (k < os.len) { uint8_t b = (uint8_t)os.ptr[k]; size_t n; bool ok = true; if (b < 0x80u) n = 1; else if ((b & 0xE0u) == 0xC0u) n = 2; else if ((b & 0xF0u) == 0xE0u) n = 3; else if ((b & 0xF8u) == 0xF0u) n = 4; else { ok = false; n = 1; } if (ok && k + n <= os.len) { for (size_t j = 1; j < n; j++) if (((uint8_t)os.ptr[k + j] & 0xC0u) != 0x80u) { ok = false; break; } } else if (n > 1) ok = false; if (ok) { jestyr_rt_str_push(&out, (JestyrStr){ os.ptr + k, n }); k += n; } else { jestyr_rt_str_push(&out, (JestyrStr){ \"\\xEF\\xBF\\xBD\", 3 }); k += 1; } } return out; }\n\n")
+    string_push(sb, "/* Jestyr Builder — an iolist: a list of `str` *fragments* collected with no\n")
+    string_push(sb, "   copying; `builder_build` sums the lengths, allocates once, and flattens in a\n")
+    string_push(sb, "   single pass (Erlang iodata). Fragments must outlive the build. */\n")
+    string_push(sb, "typedef struct { JestyrStr* frags; size_t n; size_t cap; } JestyrBuilder;\n")
+    string_push(sb, "static JestyrBuilder jestyr_rt_b_new(void) { JestyrBuilder b; b.frags = NULL; b.n = 0; b.cap = 0; return b; }\n")
+    string_push(sb, "static void jestyr_rt_b_push(JestyrBuilder* b, JestyrStr v) { if (b->n == b->cap) { size_t nc = b->cap ? b->cap * 2 : 8; b->frags = (JestyrStr*)realloc(b->frags, nc * sizeof(JestyrStr)); b->cap = nc; } b->frags[b->n++] = v; }\n")
+    string_push(sb, "static JestyrString jestyr_rt_b_build(JestyrBuilder* b) { size_t total = 0; for (size_t i = 0; i < b->n; i++) total += b->frags[i].len; JestyrString s; s.cap = total ? total : 1; s.ptr = (char*)malloc(s.cap); s.len = total; size_t off = 0; for (size_t i = 0; i < b->n; i++) { memcpy(s.ptr + off, b->frags[i].ptr, b->frags[i].len); off += b->frags[i].len; } return s; }\n")
+    string_push(sb, "static void jestyr_rt_b_free(JestyrBuilder* b) { free(b->frags); b->frags = NULL; b->n = 0; b->cap = 0; }\n\n")
+    string_push(sb, "/* Jestyr runtime prelude — temporary print intrinsics (stand-in for a stdlib). */\n")
+    string_push(sb, "static void jestyr_rt_print_int(int64_t x) { printf(\"%lld\\n\", (long long) x); }\n")
+    string_push(sb, "static void jestyr_rt_print_float(double x) { printf(\"%g\\n\", x); }\n")
+    string_push(sb, "static void jestyr_rt_print_str(JestyrStr s) { printf(\"%.*s\\n\", (int) s.len, s.ptr); }\n")
+    string_push(sb, "static void jestyr_rt_print_bool(bool b) { printf(\"%s\\n\", b ? \"true\" : \"false\"); }\n\n")
+    string_push(sb, "/* Jestyr file I/O (self-hosting plumbing): whole-file read/write. A `str` path\n")
+    string_push(sb, "   is a {ptr,len} view (not NUL-terminated), so each call copies it into a\n")
+    string_push(sb, "   NUL-terminated temporary for libc. Binary mode + whole-file-at-once = no\n")
+    string_push(sb, "   buffering or newline-translation surprises (deterministic across platforms). */\n")
+    string_push(sb, "static char* jestyr_rt_cpath(JestyrStr p) { char* c = (char*)malloc(p.len + 1); memcpy(c, p.ptr, p.len); c[p.len] = '\\0'; return c; }\n")
+    string_push(sb, "static JestyrString jestyr_rt_read_file(JestyrStr path) { char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, \"rb\"); free(cp); JestyrString s = jestyr_rt_str_new(); if (!f) return s; if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return s; } long sz = ftell(f); if (sz < 0) { fclose(f); return s; } rewind(f); size_t cap = (size_t)sz ? (size_t)sz : 1; s.ptr = (char*)malloc(cap); s.cap = cap; s.len = fread(s.ptr, 1, (size_t)sz, f); fclose(f); return s; }\n")
+    string_push(sb, "static bool jestyr_rt_write_file(JestyrStr path, JestyrStr data) { char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, \"wb\"); free(cp); if (!f) return false; size_t put = data.len ? fwrite(data.ptr, 1, data.len, f) : 0; int rc = fclose(f); return rc == 0 && put == data.len; }\n")
+    string_push(sb, "static bool jestyr_rt_file_exists(JestyrStr path) { char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, \"rb\"); free(cp); if (f) { fclose(f); return true; } return false; }\n")
+    string_push(sb, "static bool jestyr_rt_remove_file(JestyrStr path) { char* cp = jestyr_rt_cpath(path); int rc = remove(cp); free(cp); return rc == 0; }\n")
+    string_push(sb, "\n")
+    string_push(sb, "/* Command-line arguments (self-hosting plumbing): argv is captured in main()\n")
+    string_push(sb, "   into file-scope globals, exposed to Jestyr as arg_count() -> i32 and\n")
+    string_push(sb, "   arg(i) -> str (a zero-copy view into argv[i]; out-of-range yields empty).\n")
+    string_push(sb, "   arg(0) is the program path. argv strings are NUL-terminated, OS-owned. */\n")
+    string_push(sb, "static int jestyr_rt_argc = 0;\n")
+    string_push(sb, "static char** jestyr_rt_argv = NULL;\n")
+    string_push(sb, "static int64_t jestyr_rt_arg_count(void) { return (int64_t)jestyr_rt_argc; }\n")
+    string_push(sb, "static JestyrStr jestyr_rt_arg(int64_t i) { if (i < 0 || i >= (int64_t)jestyr_rt_argc) return (JestyrStr){ \"\", 0 }; const char* a = jestyr_rt_argv[i]; size_t n = 0; while (a[n]) n++; return (JestyrStr){ a, n }; }\n\n")
+}
+
+// ---- primitive type -> C type (mirrors the prim arm of Cgen::c_type) ----
+// Increment 1 covers the integer/float/bool/unit prims. Structural types (str, slices, pointers,
+// named aggregates) are added as later files need them.
+fn c_prim(read name: str) -> str {
+    if str_eq(name, "i8") { return "int8_t" }
+    if str_eq(name, "i16") { return "int16_t" }
+    if str_eq(name, "i32") { return "int32_t" }
+    if str_eq(name, "i64") { return "int64_t" }
+    if str_eq(name, "u8") { return "uint8_t" }
+    if str_eq(name, "u16") { return "uint16_t" }
+    if str_eq(name, "u32") { return "uint32_t" }
+    if str_eq(name, "u64") { return "uint64_t" }
+    if str_eq(name, "usize") { return "size_t" }
+    if str_eq(name, "isize") { return "intptr_t" }
+    if str_eq(name, "f32") { return "float" }
+    if str_eq(name, "f64") { return "double" }
+    if str_eq(name, "bool") { return "bool" }
+    return "void"
+}
+
+// The C return type of a function item (`it.z` = ret TypeId, -1 = unit -> void).
+fn ret_c_type(read p: parser.Parser, read src: str, read it: parser.ItemData) -> str {
+    if it.z < 0 { return "void" }
+    let t: parser.TypeData = list.get(parser.TypeData, p.ty, it.z as usize)
+    if t.kind == 0 { return c_prim(src[t.start .. t.end]) }   // Name
+    return "void"
+}
+
+// ---- expressions (mirrors the relevant arms of Cgen::emit_expr) ----
+fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, eid: i32) {
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
+    if e.kind == 29 {                                 // Str: emit the literal verbatim inside JSTR
+        string_push(sb, "JSTR(")
+        string_push(sb, src[e.start .. e.end])
+        string_push(sb, ")")
+        return
+    }
+    if e.kind == 0 {                                  // Int: source text verbatim
+        string_push(sb, src[e.start .. e.end])
+        return
+    }
+    if e.kind == 2 {                                  // Name: source text
+        string_push(sb, src[e.start .. e.end])
+        return
+    }
+    if e.kind == 10 {                                 // Call
+        emit_call(sb, p, src, e)
+        return
+    }
+}
+
+// A call. Increment 1 handles the print intrinsics (`print_str` -> `jestyr_rt_print_str`).
+// General named/mangled calls and method sugar come in later increments.
+fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read e: parser.ExprData) {
+    let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+    if callee.kind == 2 {
+        let nm: str = src[callee.start .. callee.end]
+        if str_eq(nm, "print_str") {
+            string_push(sb, "jestyr_rt_print_str(")
+            let a0: i32 = list.get(i32, p.ar, e.x as usize)   // x = arg_start
+            emit_expr(sb, p, src, a0)
+            string_push(sb, ")")
+            return
+        }
+    }
+}
+
+// ---- statements / body (mirrors Cgen::emit_fn_body / emit_stmt / emit_return) ----
+fn indent(mut sb: String, depth: i32) {
+    var i: i32 = 0
+    for i < depth { string_push(sb, "    ")  i = i + 1 }
+}
+
+fn emit_return(mut sb: String, read p: parser.Parser, read src: str, val: i32, depth: i32) {
+    indent(sb, depth)
+    if val < 0 {
+        string_push(sb, "return;\n")
+    } else {
+        string_push(sb, "return ")
+        emit_expr(sb, p, src, val)
+        string_push(sb, ";\n")
+    }
+}
+
+fn emit_stmt(mut sb: String, read p: parser.Parser, read src: str, sid: i32, depth: i32) {
+    let s: parser.StmtData = list.get(parser.StmtData, p.st, sid as usize)
+    if s.kind == 2 {                                  // Expr statement
+        indent(sb, depth)
+        emit_expr(sb, p, src, s.a)
+        string_push(sb, ";\n")
+        return
+    }
+    if s.kind == 1 {                                  // Return
+        emit_return(sb, p, src, s.a, depth)
+        return
+    }
+    // TODO: Let (kind 0)
+}
+
+// A function body block. When `ret` (the fn returns a value), the tail statement is emitted as a
+// `return` — an Expr tail becomes `return <expr>`, a Return tail stays `return <value>`.
+fn emit_fn_body(mut sb: String, read p: parser.Parser, read src: str, block_eid: i32, ret: bool) {
+    string_push(sb, "{\n")
+    let blk: parser.ExprData = list.get(parser.ExprData, p.ex, block_eid as usize)   // Block (kind 23)
+    let n: i32 = blk.y                                // y = stmt_count
+    var i: i32 = 0
+    for i < n {
+        let sid: i32 = list.get(i32, p.sar, (blk.x + i) as usize)   // x = stmt_start into sar
+        let last: bool = i + 1 == n
+        if last and ret {
+            let s: parser.StmtData = list.get(parser.StmtData, p.st, sid as usize)
+            if s.kind == 2 { emit_return(sb, p, src, s.a, 1) }
+            else if s.kind == 1 { emit_return(sb, p, src, s.a, 1) }
+            else { emit_stmt(sb, p, src, sid, 1) }
+        } else {
+            emit_stmt(sb, p, src, sid, 1)
+        }
+        i = i + 1
+    }
+    string_push(sb, "}\n")
+}
+
+// The `<ret> jestyr_<name>(<params>)` signature (no trailing newline). Increment 1: no-parameter
+// functions render `(void)`; real parameter lists arrive with the next increment.
+fn emit_fn_sig(mut sb: String, read p: parser.Parser, read src: str, read it: parser.ItemData) {
+    string_push(sb, ret_c_type(p, src, it))
+    string_push(sb, " jestyr_")
+    string_push(sb, src[it.x .. it.y])
+    string_push(sb, "(void)")
+}
+
+// ---- top-level sections (mirrors emit_program's order) ----
+
+// Forward typedefs for struct/distinct/enum aggregates. None in `hello`, so just the trailing
+// blank line the reference always emits.
+fn emit_forward_types(mut sb: String, read p: parser.Parser, read src: str) {
+    // TODO: walk items for struct (kind 4) / distinct (kind 1) / enum (kind 5) forward typedefs.
+    string_push(sb, "\n")
+}
+
+// Result-struct typedefs. `JestyrResult_str` (the `try_from_utf8` intrinsic's result) is emitted
+// unconditionally up front; fallible user functions add their own (none in `hello`).
+fn emit_result_defs(mut sb: String, read p: parser.Parser, read src: str) {
+    string_push(sb, "typedef struct { bool is_err; JestyrStr ok; int err; } JestyrResult_str;\n")
+    // TODO: one typedef per distinct fallible-fn ok type.
+    string_push(sb, "\n")
+}
+
+// Function prototypes: one `<sig>;` per non-generic, backend-supported function, then a blank.
+fn emit_fn_protos(mut sb: String, read p: parser.Parser, read src: str) {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 3 {                             // Fn
+            emit_fn_sig(sb, p, src, it)
+            string_push(sb, ";\n")
+        }
+        r = r + 1
+    }
+    string_push(sb, "\n")
+}
+
+// Function definitions: `<sig>\n<body>\n` each. (Mirrors Cgen::fn_defs -> emit_fn.)
+fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str) {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 3 {                             // Fn
+            emit_fn_sig(sb, p, src, it)
+            string_push(sb, "\n")
+            let returns_value: bool = it.z >= 0
+            emit_fn_body(sb, p, src, it.w, returns_value)   // w = body Block ExprId
+            string_push(sb, "\n")
+        }
+        r = r + 1
+    }
+}
+
+// The C `main` wrapper: captures argc/argv into the argv globals, then calls `jestyr_main`.
+fn emit_main_wrapper(mut sb: String, read p: parser.Parser, read src: str) {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 3 {
+            if str_eq(src[it.x .. it.y], "main") {
+                if it.z >= 0 {
+                    string_push(sb, "int main(int argc, char** argv) { jestyr_rt_argc = argc; jestyr_rt_argv = argv; return (int) jestyr_main(); }\n")
+                } else {
+                    string_push(sb, "int main(int argc, char** argv) { jestyr_rt_argc = argc; jestyr_rt_argv = argv; jestyr_main(); return 0; }\n")
+                }
+                return
+            }
+        }
+        r = r + 1
+    }
+}
+
+// Lower the whole program to C. The section ORDER mirrors `emit_program` exactly — the five bare
+// `"\n"` pushes stand in for the reference's unconditionally-blank sections that are empty for a
+// program with no aggregates (closure_types, method_protos, consts) plus the guarded no-ops.
+fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, read src: str) {
+    emit_prelude(sb)
+    emit_forward_types(sb, p, src)
+    // gen_forward_types / fn_type_typedefs / struct-enum-slice-array-genref defs: empty for hello.
+    emit_result_defs(sb, p, src)
+    // flush_def_capture / dyn_typedefs / extern_protos: empty for hello.
+    string_push(sb, "\n")                            // closure_types: unconditional trailing blank
+    emit_fn_protos(sb, p, src)
+    string_push(sb, "\n")                            // method_protos: unconditional trailing blank
+    // impl_protos / dyn_vtables / spawn_runtime: empty for hello.
+    string_push(sb, "\n")                            // consts: unconditional trailing blank
+    // closure_fns: empty for hello.
+    emit_fn_defs(sb, p, src)
+    // method_defs / impl_defs: empty for hello.
+    emit_main_wrapper(sb, p, src)
+}
+
+fn main() -> i32 {
+    var a: Allocator = mem.system_allocator()
+    var it: Interner = intern.make(a)
+    let kwcount: i64 = tokens.intern_keywords(it)
+    if env.argc() > 1 {
+        var src: String = fs.read_text(env.argv(1))
+        var p: parser.Parser = parser.parse_source(string_view(src), it, kwcount, a)
+        var c: typeck.Checker = typeck.check_parsed(p, string_view(src), a)
+        var sb: String = string_new()
+        emit_program(sb, p, c, string_view(src))
+        let v: str = string_view(sb)
+        // The emitted C ends in a trailing '\n'; print_str appends one, so drop the last byte to
+        // keep stdout byte-identical to `cgen::emit`'s String (the golden compares line-for-line).
+        if v.len > 0 {
+            print_str(v[0 .. v.len - 1])
+        }
+        string_free(src)
+    }
+    return 0
+}

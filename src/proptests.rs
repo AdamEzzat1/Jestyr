@@ -7640,6 +7640,78 @@ mod c_oracle {
         eprintln!("whole-corpus escape golden: {checked} files' diagnostic sets identical");
     }
 
+    /// The Rust *reference* C for `src`, as lines. Uses the single-file `parse` + `typeck::check`
+    /// path (not `module::load`), so `TypeInfo::debug` is empty and no `#line` directives are
+    /// emitted — the target is the pure C text. `str::lines()` drops each line's trailing `\r`,
+    /// so a Windows exe's CRLF stdout compares equal to this LF text.
+    fn rust_cgen_dump(src: &str) -> Vec<String> {
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (ast, _diags) = crate::parser::Parser::new(src, tokens).parse();
+        let (info, _d) = crate::typeck::check(&ast);
+        let (c, _cd) = crate::cgen::emit(&ast, &info);
+        c.lines().map(|s| s.to_string()).collect()
+    }
+
+    /// Run the Jestyr C backend on `file` and return its stdout (the emitted C) as lines.
+    fn jestyr_cgen_dump(exe: &std::path::Path, file: &str) -> Vec<String> {
+        let out = Command::new(exe).arg(file).output().unwrap();
+        assert!(out.status.success(), "jestyr cgen failed on {file}");
+        String::from_utf8(out.stdout).unwrap().lines().map(|s| s.to_string()).collect()
+    }
+
+    /// Files the Jestyr C backend (`examples/std/cgen.jtr`) already lowers **byte-identically** to
+    /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
+    /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
+    /// the P2/P3/P4 goldens converged to an empty denylist.
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr"];
+
+    /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
+    /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
+    /// target). This is the acceptance bar the R2 fixpoint ultimately rests on. `DUMP_DIVERGE=1`
+    /// prints the first differing line for the deep-dive fix loop.
+    #[test]
+    fn jestyr_cgen_matches_reference() {
+        let exe = build_exe("examples/std/cgen.jtr");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for dir in ["examples", "examples/std"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("jtr") {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+        files.sort();
+        let mut checked = 0;
+        let mut diverged: Vec<String> = Vec::new();
+        for p in &files {
+            let f = p.to_str().unwrap();
+            let base = p.file_name().and_then(|s| s.to_str()).unwrap();
+            if !CGEN_GOLDEN_ALLOWLIST.contains(&base) {
+                continue;
+            }
+            let src = std::fs::read_to_string(p).unwrap();
+            let got = jestyr_cgen_dump(&exe, f);
+            let want = rust_cgen_dump(&src);
+            if got != want {
+                diverged.push(f.to_string());
+                if std::env::var("DUMP_DIVERGE").is_ok() {
+                    let first = got.iter().zip(want.iter()).position(|(a, b)| a != b).unwrap_or(0);
+                    let lo = first.saturating_sub(2);
+                    eprintln!("=== {f} (first diff at line {first}) ===");
+                    eprintln!("GOT : {:?}", &got[lo..(lo + 12).min(got.len())]);
+                    eprintln!("WANT: {:?}", &want[lo..(lo + 12).min(want.len())]);
+                }
+            } else {
+                checked += 1;
+            }
+        }
+        assert!(diverged.is_empty(), "Jestyr cgen diverged from the reference on: {diverged:?}");
+        eprintln!("cgen golden: {checked} file(s)' emitted C byte-identical");
+    }
+
     /// **P2 depth guard.** The Jestyr parser bounds AST *height* at `MAX_EXPR_DEPTH`
     /// (like the reference), so adversarially-deep input terminates with a bounded tree
     /// instead of overflowing. Two shapes stress different stacks: a left-deep fold
