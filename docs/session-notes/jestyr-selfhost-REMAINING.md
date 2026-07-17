@@ -2,7 +2,8 @@
 
 > One-page map of everything left to self-host the compiler (ROADMAP workstream P), so no context
 > is lost between sessions. Pairs with the detailed handoffs:
-> - `docs/session-notes/jestyr-selfhost-P3-typeck-handoff.md` (current pass, authoritative)
+> - **`docs/session-notes/jestyr-selfhost-P5-cgen-R2-handoff.md` (P5 cgen + R2 — the remaining work, authoritative)**
+> - `docs/session-notes/jestyr-selfhost-P3-typeck-handoff.md` (P3, done)
 > - `docs/session-notes/jestyr-selfhost-P2-parser-handoff.md` (P2, done)
 > - `docs/session-notes/jestyr-selfhost-port-P2-P5-R2.md` (master plan)
 >
@@ -86,21 +87,18 @@ Checker; `typeck.ty_is_copy`; `mcalls`/`icalls` resolution records; `@copy` -> t
 thin `typeck_cli.jtr` drives the P3 golden. Pattern to copy for cgen: `import "typeck"`,
 `check_parsed`, walk.
 
-## P5 cgen (the giant) — `src/cgen.rs` ~10.8K
+## P5 cgen + R2 fixpoint — the remaining work
 
-- New `examples/std/cgen.jtr` lowering AST + types to C.
-- **Golden = BYTE-IDENTICAL C** to the reference, construct by construct. After each construct the
-  corpus subset using only ported constructs must match byte-for-byte.
-- **Lean on module content-hashing + `attest`** (already in the Rust impl): "same input ⇒ same
-  output" is a hash compare, not a full text diff. If the C matches, the gcc build + run behavior
-  is identical for free.
-
-## R2 fixpoint — the acceptance criterion
-
-- Gate behind `--features selfhost-fixpoint` (outside the toolchain-free default suite).
-- 3-stage: **jc1** (Rust builds the Jestyr compiler) → **jc2** (jc1 rebuilds it) → **jc3** (jc2
-  rebuilds it); assert **jc2 ≡ jc3** (byte-identical). Stand it up **early on a subset** once P5
-  emits C for a small self-contained program, then grow.
+**See `jestyr-selfhost-P5-cgen-R2-handoff.md` for the full, concrete plan** (emit-program order,
+the construct-by-construct increment list, the instance-collection/mangling/match/drop machinery,
+what to `pub`-expose from typeck, and how to stand R2 up early). In brief:
+- **P5:** `examples/std/cgen.jtr` (`import parser`+`typeck` → `check_parsed` → walk items emitting
+  C). Golden = **byte-identical C** vs `cgen::emit`, staged construct-by-construct from `hello.jtr`
+  outward; lean on the `attest` C-SHA-256 so equality is a hash compare. Build a
+  `CGEN_FILE=<basename>` deep-dive printer first.
+- **R2:** gate `--features selfhost-fixpoint` (add to Cargo.toml). Stand up jc1→jc2→jc3 **early on
+  a subset** (`hello.jtr` first); assert **jc2 ≡ jc3** (byte-identical C = the fixed point = the
+  proof).
 
 ## Known constraints / lessons (carry forward)
 
