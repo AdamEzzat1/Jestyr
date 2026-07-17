@@ -132,12 +132,43 @@ fn c_prim(read name: str) -> str {
     return "void"
 }
 
-// The C return type of a function item (`it.z` = ret TypeId, -1 = unit -> void).
-fn ret_c_type(read p: parser.Parser, read src: str, read it: parser.ItemData) -> str {
-    if it.z < 0 { return "void" }
-    let t: parser.TypeData = list.get(parser.TypeData, p.ty, it.z as usize)
+// A type node (`TypeId`) rendered as its C type. Increment 2 covers the primitive Name types
+// (structural forms — str, slices, pointers, named aggregates — are added as later files need
+// them). `tyid` < 0 is the unit type (`void`).
+fn c_ty(read p: parser.Parser, read src: str, tyid: i32) -> str {
+    if tyid < 0 { return "void" }
+    let t: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
     if t.kind == 0 { return c_prim(src[t.start .. t.end]) }   // Name
     return "void"
+}
+
+// The C return type of a function item (`it.z` = ret TypeId, -1 = unit -> void).
+fn ret_c_type(read p: parser.Parser, read src: str, read it: parser.ItemData) -> str {
+    return c_ty(p, src, it.z)
+}
+
+// A binary-operator code (`ExprData.op` for a Binary node) rendered as its C operator. Mirrors
+// `binop_c`; codes come from the parser's `bin_op` (1=add … 18=shr).
+fn binop_c(code: i32) -> str {
+    if code == 1 { return "+" }
+    if code == 2 { return "-" }
+    if code == 3 { return "*" }
+    if code == 4 { return "/" }
+    if code == 5 { return "%" }
+    if code == 6 { return "==" }
+    if code == 7 { return "!=" }
+    if code == 8 { return "<" }
+    if code == 9 { return "<=" }
+    if code == 10 { return ">" }
+    if code == 11 { return ">=" }
+    if code == 12 { return "&&" }
+    if code == 13 { return "||" }
+    if code == 14 { return "&" }
+    if code == 15 { return "|" }
+    if code == 16 { return "^" }
+    if code == 17 { return "<<" }
+    if code == 18 { return ">>" }
+    return "?"
 }
 
 // ---- expressions (mirrors the relevant arms of Cgen::emit_expr) ----
@@ -149,12 +180,23 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, eid: i32) {
         string_push(sb, ")")
         return
     }
-    if e.kind == 0 {                                  // Int: source text verbatim
+    if e.kind == 0 {                                  // Int: underscores stripped (c_int_literal)
+        emit_int_literal(sb, src[e.start .. e.end])
+        return
+    }
+    if e.kind == 2 {                                  // Name (value position): a `j_`-prefixed local/param
+        string_push(sb, "j_")
         string_push(sb, src[e.start .. e.end])
         return
     }
-    if e.kind == 2 {                                  // Name: source text
-        string_push(sb, src[e.start .. e.end])
+    if e.kind == 4 {                                  // Binary: (lhs OP rhs)
+        string_push(sb, "(")
+        emit_expr(sb, p, src, e.a)
+        string_push(sb, " ")
+        string_push(sb, binop_c(e.op))
+        string_push(sb, " ")
+        emit_expr(sb, p, src, e.b)
+        string_push(sb, ")")
         return
     }
     if e.kind == 10 {                                 // Call
@@ -163,58 +205,108 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, eid: i32) {
     }
 }
 
-// A call. Increment 1 handles the print intrinsics (`print_str` -> `jestyr_rt_print_str`).
-// General named/mangled calls and method sugar come in later increments.
+// An integer literal with `_` digit separators removed (mirrors `c_int_literal`; the `0b` binary
+// -> decimal rewrite is added when a corpus file needs it — decimal/`0x` are already valid C).
+fn emit_int_literal(mut sb: String, read lex: str) {
+    var i: usize = 0
+    for i < lex.len {
+        let c: str = lex[i .. i + 1]
+        if !str_eq(c, "_") { string_push(sb, c) }
+        i = i + 1
+    }
+}
+
+// A call. Handles the print intrinsics (`print_X` -> `jestyr_rt_print_X`) and plain named calls to
+// user functions (`f(args)` -> `jestyr_f(args)`; args comma-separated, each parenthesized by its
+// own emit). Method sugar, mangled/collision names, and non-print intrinsics come later.
 fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read e: parser.ExprData) {
     let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
     if callee.kind == 2 {
         let nm: str = src[callee.start .. callee.end]
-        if str_eq(nm, "print_str") {
-            string_push(sb, "jestyr_rt_print_str(")
-            let a0: i32 = list.get(i32, p.ar, e.x as usize)   // x = arg_start
-            emit_expr(sb, p, src, a0)
-            string_push(sb, ")")
-            return
-        }
+        if str_eq(nm, "print_str") { emit_intrinsic_call(sb, p, src, e, "jestyr_rt_print_str")  return }
+        if str_eq(nm, "print_int") { emit_intrinsic_call(sb, p, src, e, "jestyr_rt_print_int")  return }
+        if str_eq(nm, "print_bool") { emit_intrinsic_call(sb, p, src, e, "jestyr_rt_print_bool")  return }
+        if str_eq(nm, "print_float") { emit_intrinsic_call(sb, p, src, e, "jestyr_rt_print_float")  return }
+        // Plain user function: mangle to `jestyr_<name>` and emit the argument list.
+        string_push(sb, "jestyr_")
+        string_push(sb, nm)
+        emit_arg_list(sb, p, src, e)
+        return
     }
 }
 
-// ---- statements / body (mirrors Cgen::emit_fn_body / emit_stmt / emit_return) ----
+// A single-argument intrinsic call `<cfn>(<arg0>)`.
+fn emit_intrinsic_call(mut sb: String, read p: parser.Parser, read src: str, read e: parser.ExprData, read cfn: str) {
+    string_push(sb, cfn)
+    string_push(sb, "(")
+    let a0: i32 = list.get(i32, p.ar, e.x as usize)   // x = arg_start
+    emit_expr(sb, p, src, a0)
+    string_push(sb, ")")
+}
+
+// The `(a0, a1, …)` argument list of a Call node (`(x,y)` = arg slice into `ar`).
+fn emit_arg_list(mut sb: String, read p: parser.Parser, read src: str, read e: parser.ExprData) {
+    string_push(sb, "(")
+    var i: i32 = 0
+    for i < e.y {                                     // y = arg_count
+        if i > 0 { string_push(sb, ", ") }
+        let aid: i32 = list.get(i32, p.ar, (e.x + i) as usize)
+        emit_expr(sb, p, src, aid)
+        i = i + 1
+    }
+    string_push(sb, ")")
+}
+
+// ---- statements / body (mirrors Cgen::emit_body / emit_stmt / emit_return / emit_if) ----
 fn indent(mut sb: String, depth: i32) {
     var i: i32 = 0
     for i < depth { string_push(sb, "    ")  i = i + 1 }
 }
 
-fn emit_return(mut sb: String, read p: parser.Parser, read src: str, val: i32, depth: i32) {
+// A whole `<indent>text\n` line at `depth`.
+fn line_at(mut sb: String, depth: i32, read text: str) {
     indent(sb, depth)
+    string_push(sb, text)
+    string_push(sb, "\n")
+}
+
+fn emit_return(mut sb: String, read p: parser.Parser, read src: str, val: i32, depth: i32) {
     if val < 0 {
-        string_push(sb, "return;\n")
-    } else {
-        string_push(sb, "return ")
-        emit_expr(sb, p, src, val)
-        string_push(sb, ";\n")
+        line_at(sb, depth, "return;")
+        return
     }
+    // A control-flow value return dispatches to its block form (`return if …` becomes a C `if`).
+    let v: parser.ExprData = list.get(parser.ExprData, p.ex, val as usize)
+    if v.kind == 24 { emit_if(sb, p, src, val, true, depth)  return }   // If
+    indent(sb, depth)
+    string_push(sb, "return ")
+    emit_expr(sb, p, src, val)
+    string_push(sb, ";\n")
 }
 
 fn emit_stmt(mut sb: String, read p: parser.Parser, read src: str, sid: i32, depth: i32) {
     let s: parser.StmtData = list.get(parser.StmtData, p.st, sid as usize)
+    if s.kind == 1 {                                  // Return
+        emit_return(sb, p, src, s.a, depth)
+        return
+    }
     if s.kind == 2 {                                  // Expr statement
+        let e: parser.ExprData = list.get(parser.ExprData, p.ex, s.a as usize)
+        if e.kind == 24 { emit_if(sb, p, src, s.a, false, depth)  return }   // If as a statement
         indent(sb, depth)
         emit_expr(sb, p, src, s.a)
         string_push(sb, ";\n")
         return
     }
-    if s.kind == 1 {                                  // Return
-        emit_return(sb, p, src, s.a, depth)
-        return
-    }
     // TODO: Let (kind 0)
 }
 
-// A function body block. When `ret` (the fn returns a value), the tail statement is emitted as a
-// `return` — an Expr tail becomes `return <expr>`, a Return tail stays `return <value>`.
-fn emit_fn_body(mut sb: String, read p: parser.Parser, read src: str, block_eid: i32, ret: bool) {
-    string_push(sb, "{\n")
+// A `{ … }` block: brace at `depth`, statements at `depth+1`, closing brace at `depth`. When `ret`,
+// the tail statement is emitted as a `return` (an Expr tail becomes `return <expr>`, a Return tail
+// stays `return <value>`). Mirrors `Cgen::emit_body`. (Drop-scope glue is added when Drop types
+// appear — a no-op for the programs ported so far, so output stays byte-identical.)
+fn emit_body(mut sb: String, read p: parser.Parser, read src: str, block_eid: i32, ret: bool, depth: i32) {
+    line_at(sb, depth, "{")
     let blk: parser.ExprData = list.get(parser.ExprData, p.ex, block_eid as usize)   // Block (kind 23)
     let n: i32 = blk.y                                // y = stmt_count
     var i: i32 = 0
@@ -223,24 +315,70 @@ fn emit_fn_body(mut sb: String, read p: parser.Parser, read src: str, block_eid:
         let last: bool = i + 1 == n
         if last and ret {
             let s: parser.StmtData = list.get(parser.StmtData, p.st, sid as usize)
-            if s.kind == 2 { emit_return(sb, p, src, s.a, 1) }
-            else if s.kind == 1 { emit_return(sb, p, src, s.a, 1) }
-            else { emit_stmt(sb, p, src, sid, 1) }
+            if s.kind == 1 { emit_return(sb, p, src, s.a, depth + 1) }
+            else if s.kind == 2 { emit_return(sb, p, src, s.a, depth + 1) }
+            else { emit_stmt(sb, p, src, sid, depth + 1) }
         } else {
-            emit_stmt(sb, p, src, sid, 1)
+            emit_stmt(sb, p, src, sid, depth + 1)
         }
         i = i + 1
     }
-    string_push(sb, "}\n")
+    line_at(sb, depth, "}")
 }
 
-// The `<ret> jestyr_<name>(<params>)` signature (no trailing newline). Increment 1: no-parameter
-// functions render `(void)`; real parameter lists arrive with the next increment.
+// An `if (cond) { … } [else …]`. The If node (kind 24): `a`=cond, `b`=then Block, `op`=else
+// (-1 none, else an `if` chain or a Block). The condition gets its own paren pair on top of any the
+// expression itself adds (so `if n < 2` renders `if ((j_n < 2))`, matching the reference).
+fn emit_if(mut sb: String, read p: parser.Parser, read src: str, eid: i32, ret: bool, depth: i32) {
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
+    indent(sb, depth)
+    string_push(sb, "if (")
+    emit_expr(sb, p, src, e.a)
+    string_push(sb, ")\n")
+    emit_body(sb, p, src, e.b, ret, depth)
+    if e.op >= 0 {
+        line_at(sb, depth, "else")
+        let els: parser.ExprData = list.get(parser.ExprData, p.ex, e.op as usize)
+        if els.kind == 24 { emit_if(sb, p, src, e.op, ret, depth) }        // else if
+        else { emit_body(sb, p, src, e.op, ret, depth) }                   // else block
+    }
+}
+
+// The `<ret> jestyr_<name>(<params>)` signature (no trailing newline). Mirrors `fn_signature`.
 fn emit_fn_sig(mut sb: String, read p: parser.Parser, read src: str, read it: parser.ItemData) {
     string_push(sb, ret_c_type(p, src, it))
     string_push(sb, " jestyr_")
     string_push(sb, src[it.x .. it.y])
-    string_push(sb, "(void)")
+    emit_params(sb, p, src, it)
+}
+
+// The `(<params>)` list of a function (mirrors `params_str`). `self` and `comptime` params are
+// erased; `mut`/`out` params arrive by pointer. Empty -> `(void)`. Params are 7-tuples in `iar`
+// at `it.a`, count `it.b`: [comptime, conv, name_start, name_end, is_self, type_id, refine].
+fn emit_params(mut sb: String, read p: parser.Parser, read src: str, read it: parser.ItemData) {
+    string_push(sb, "(")
+    var emitted: i32 = 0
+    var i: i32 = 0
+    for i < it.b {
+        let base: i32 = it.a + i * 7
+        let comp: i32 = list.get(i32, p.iar, base as usize)
+        let is_self: i32 = list.get(i32, p.iar, (base + 4) as usize)
+        if comp == 0 and is_self == 0 {
+            if emitted > 0 { string_push(sb, ", ") }
+            let conv: i32 = list.get(i32, p.iar, (base + 1) as usize)
+            let pty: i32 = list.get(i32, p.iar, (base + 5) as usize)
+            string_push(sb, c_ty(p, src, pty))
+            if conv == 2 or conv == 4 { string_push(sb, "*") }   // mut / out -> by pointer
+            string_push(sb, " j_")
+            let pns: i32 = list.get(i32, p.iar, (base + 2) as usize)
+            let pne: i32 = list.get(i32, p.iar, (base + 3) as usize)
+            string_push(sb, src[pns as usize .. pne as usize])
+            emitted = emitted + 1
+        }
+        i = i + 1
+    }
+    if emitted == 0 { string_push(sb, "void") }
+    string_push(sb, ")")
 }
 
 // ---- top-level sections (mirrors emit_program's order) ----
@@ -285,7 +423,7 @@ fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str) {
             emit_fn_sig(sb, p, src, it)
             string_push(sb, "\n")
             let returns_value: bool = it.z >= 0
-            emit_fn_body(sb, p, src, it.w, returns_value)   // w = body Block ExprId
+            emit_body(sb, p, src, it.w, returns_value, 0)   // w = body Block ExprId; fn body at depth 0
             string_push(sb, "\n")
         }
         r = r + 1
