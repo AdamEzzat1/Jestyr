@@ -129,22 +129,25 @@ fn c_prim(read name: str) -> str {
     if str_eq(name, "f32") { return "float" }
     if str_eq(name, "f64") { return "double" }
     if str_eq(name, "bool") { return "bool" }
-    return "void"
+    return ""                                          // not a primitive
 }
 
-// A type node (`TypeId`) rendered as its C type. Increment 2 covers the primitive Name types
-// (structural forms — str, slices, pointers, named aggregates — are added as later files need
-// them). `tyid` < 0 is the unit type (`void`).
-fn c_ty(read p: parser.Parser, read src: str, tyid: i32) -> str {
-    if tyid < 0 { return "void" }
+// A type node (`TypeId`) rendered as its C type, pushed onto `sb` (a user type needs the runtime
+// `Jestyr_<name>` concatenation, so this writes rather than returns). Increment 4 covers primitive
+// Name types and user Name types (distinct/struct/enum -> `Jestyr_<name>`). Structural forms
+// (str, slices, pointers, App/Path) are added as later files need them. `tyid` < 0 is unit (void).
+fn emit_c_ty(mut sb: String, read p: parser.Parser, read src: str, tyid: i32) {
+    if tyid < 0 { string_push(sb, "void")  return }
     let t: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
-    if t.kind == 0 { return c_prim(src[t.start .. t.end]) }   // Name
-    return "void"
-}
-
-// The C return type of a function item (`it.z` = ret TypeId, -1 = unit -> void).
-fn ret_c_type(read p: parser.Parser, read src: str, read it: parser.ItemData) -> str {
-    return c_ty(p, src, it.z)
+    if t.kind == 0 {                                   // Name
+        let nm: str = src[t.start .. t.end]
+        let pc: str = c_prim(nm)
+        if !str_eq(pc, "") { string_push(sb, pc)  return }
+        string_push(sb, "Jestyr_")                     // a user type: its Jestyr_<name> C symbol
+        string_push(sb, nm)
+        return
+    }
+    string_push(sb, "void")                            // TODO: str / slice / ptr / App / etc.
 }
 
 // A binary-operator code (`ExprData.op` for a Binary node) rendered as its C operator. Mirrors
@@ -196,6 +199,14 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, eid: i32) {
         string_push(sb, binop_c(e.op))
         string_push(sb, " ")
         emit_expr(sb, p, src, e.b)
+        string_push(sb, ")")
+        return
+    }
+    if e.kind == 11 {                                 // Cast: (TargetType)(inner). x = target TypeId
+        string_push(sb, "(")
+        emit_c_ty(sb, p, src, e.x)
+        string_push(sb, ")(")
+        emit_expr(sb, p, src, e.a)
         string_push(sb, ")")
         return
     }
@@ -304,7 +315,20 @@ fn emit_stmt(mut sb: String, read p: parser.Parser, read src: str, sid: i32, dep
         string_push(sb, ";\n")
         return
     }
-    // TODO: Let (kind 0)
+    if s.kind == 0 {                                  // Let / var: `<cty> j_<name> [= <init>];`
+        indent(sb, depth)
+        // Annotated type only (an inferred `let x = …` needs the Checker's per-expr type — added
+        // when a corpus file needs it). `(x,y)` = name span; `ty` = annotation TypeId; `a` = init.
+        emit_c_ty(sb, p, src, s.ty)
+        string_push(sb, " j_")
+        string_push(sb, src[s.x as usize .. s.y as usize])
+        if s.a >= 0 {
+            string_push(sb, " = ")
+            emit_expr(sb, p, src, s.a)
+        }
+        string_push(sb, ";\n")
+        return
+    }
 }
 
 // A `{ … }` block: brace at `depth`, statements at `depth+1`, closing brace at `depth`. When `ret`,
@@ -352,7 +376,7 @@ fn emit_if(mut sb: String, read p: parser.Parser, read src: str, eid: i32, ret: 
 
 // The `<ret> jestyr_<name>(<params>)` signature (no trailing newline). Mirrors `fn_signature`.
 fn emit_fn_sig(mut sb: String, read p: parser.Parser, read src: str, read it: parser.ItemData) {
-    string_push(sb, ret_c_type(p, src, it))
+    emit_c_ty(sb, p, src, it.z)                       // return type (it.z = ret TypeId, -1 = void)
     string_push(sb, " jestyr_")
     string_push(sb, src[it.x .. it.y])
     emit_params(sb, p, src, it)
@@ -373,7 +397,7 @@ fn emit_params(mut sb: String, read p: parser.Parser, read src: str, read it: pa
             if emitted > 0 { string_push(sb, ", ") }
             let conv: i32 = list.get(i32, p.iar, (base + 1) as usize)
             let pty: i32 = list.get(i32, p.iar, (base + 5) as usize)
-            string_push(sb, c_ty(p, src, pty))
+            emit_c_ty(sb, p, src, pty)
             if conv == 2 or conv == 4 { string_push(sb, "*") }   // mut / out -> by pointer
             string_push(sb, " j_")
             let pns: i32 = list.get(i32, p.iar, (base + 2) as usize)
@@ -392,7 +416,20 @@ fn emit_params(mut sb: String, read p: parser.Parser, read src: str, read it: pa
 // Forward typedefs for struct/distinct/enum aggregates. None in `hello`, so just the trailing
 // blank line the reference always emits.
 fn emit_forward_types(mut sb: String, read p: parser.Parser, read src: str) {
-    // TODO: walk items for struct (kind 4) / distinct (kind 1) / enum (kind 5) forward typedefs.
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 1 {                             // distinct: `typedef <base> Jestyr_<name>;`
+            string_push(sb, "typedef ")
+            emit_c_ty(sb, p, src, it.a)               // a = base TypeId
+            string_push(sb, " Jestyr_")
+            string_push(sb, src[it.x .. it.y])
+            string_push(sb, ";\n")
+        }
+        // TODO: struct (kind 4) / enum (kind 5) forward typedefs.
+        r = r + 1
+    }
     string_push(sb, "\n")
 }
 
