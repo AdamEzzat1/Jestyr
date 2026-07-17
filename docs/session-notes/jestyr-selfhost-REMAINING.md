@@ -18,8 +18,8 @@
 | P1 lexemes / P2a kinds | `src/lexer.rs`, `src/token.rs` | ✅ DONE (token-for-token, whole corpus) |
 | **P2 parser** | `src/parser.rs`, `src/ast.rs` (~2.6K) | ✅ **COMPLETE** — module golden 125/125, denylist empty |
 | **P3 typeck** | `src/typeck.rs`, `src/types.rs` (~4.5K) | 🟢 **expression coverage COMPLETE** — the FULL-STREAM resolved-type golden (every expression, `is_typed`=true) passes **all 127 files, denylist EMPTY**. Remaining P3-adjacent: the aux resolution maps cgen reads (method_calls/impl_calls/dyn_coercions/call_sym), diagnostics parity, multi-module — fold into P5 prep as needed |
-| P4 escape | `src/escape.rs` (~1.5K) | ⬜ not started |
-| P5 cgen | `src/cgen.rs` (~10.8K) | ⬜ not started (the giant) |
+| **P4 escape** | `src/escape.rs` (~1.5K) | 🟢 **COMPLETE** — `escape.jtr`; diagnostic-set golden (span + message byte-exact) passes **all 129 files**, empty denylist |
+| P5 cgen | `src/cgen.rs` (~10.8K) | ⬜ not started (the giant) — NEXT |
 | R2 fixpoint | `--features selfhost-fixpoint` | ⬜ not started (acceptance criterion) |
 
 Roughly **~16.8K reference lines still to port** (typeck ~4.5K remaining-ish, escape 1.5K, cgen
@@ -75,13 +75,16 @@ Roughly **~16.8K reference lines still to port** (typeck ~4.5K remaining-ish, es
    prints the aligned per-expr id/kind/span/want/got stream.
    **→ P3's defined golden is COMPLETE. Next: P4 escape.**
 
-## P4 escape (after P3) — `src/escape.rs` ~1.5K, smallest pass
+## P4 escape — ✅ DONE (`ce9416b`)
 
-- New `examples/std/escape.jtr` consuming the parser AST (+ the P3 types it needs).
-- **Golden = the diagnostic SET** (message + span) equal to the reference `escape::check` on the
-  corpus. The escape examples (`examples/escapes.jtr`, `examples/region_escape.jtr`) already pin
-  expected error counts — reuse them.
-- Same importable-AST + cross-impl-golden toolkit.
+`examples/std/escape.jtr` imports the parser + the typeck LIBRARY; the diagnostic-set golden
+(`jestyr_escape_dump_matches_reference`, span + full message byte-exact, emission order) matches
+the reference on all 129 files. All routes ported (return/capture/store/give-away, region escape,
+loop mutation, `@no_alloc`/`@deterministic`, manual drop, shared-mut-slice spawn) + closure
+capture analysis. **Enabler:** typeck.jtr is now a library (`typeck.check_parsed` returns the
+Checker; `typeck.ty_is_copy`; `mcalls`/`icalls` resolution records; `@copy` -> tdecl slot 9);
+thin `typeck_cli.jtr` drives the P3 golden. Pattern to copy for cgen: `import "typeck"`,
+`check_parsed`, walk.
 
 ## P5 cgen (the giant) — `src/cgen.rs` ~10.8K
 
@@ -114,9 +117,8 @@ Roughly **~16.8K reference lines still to port** (typeck ~4.5K remaining-ish, es
   golden.
 
 ## One-line
-P2 done. **P3 expression coverage done** — the FULL-STREAM resolved-type golden (every
-expression: names/scopes, global table, calls/methods/fields, traits/impls/dyn/bounds, operator
-traits, generics via comptime monomorphization + bracket unification, expected-type propagation,
-closures) passes **all 127 corpus files with an empty denylist**. Next: **P4 escape**
-(diagnostic-set golden over `escape::check`) → P5 cgen (byte-identical-C golden) → R2 fixpoint
-(jc2≡jc3). All committed + pushed to `origin/master`.
+P2 + **P3 (full-stream resolved-type golden)** + **P4 (diagnostic-set escape golden)** all pass
+the whole corpus with empty denylists. Parser, typeck, and escape checker are written in Jestyr,
+cross-checked byte-for-byte against the Rust reference. **Next: P5 cgen** — `examples/std/cgen.jtr`
+lowering AST + types to C, golden = byte-identical C (lean on module content-hashing + `attest`),
+construct by construct → then R2 fixpoint (jc2≡jc3). All committed + pushed to `origin/master`.
