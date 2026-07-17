@@ -52,11 +52,60 @@ driver needed) + golden `jestyr_cgen_matches_reference` (`--features c-oracle`).
   in `sar`) 29=Str; stmt kinds 0=Let 1=Return (`a`=value, -1=bare) 2=Expr (`a`=expr). Iterate
   top-level items via `p.roots` → `p.it[iid]`.
 
-**NEXT increments (grow the allowlist):** function parameters + `params_str` (drop the `(void)`
-stub) → locals/`let` (`emit_stmt` kind 0) → int/bool literals + names as values → binops
-(`emit_expr` kind 4, operator-trait dispatch deferred) → `if`/`return` variants. Pick corpus
-files that use only the ported constructs and add them to `CGEN_GOLDEN_ALLOWLIST`; run with
-`DUMP_DIVERGE=1` to converge each. See `c_type`/`params_str`/`emit_expr` in `cgen.rs`.
+### Increments 2–4 — a real function, string intrinsics, distinct types
+
+Allowlist is now `{hello, bench_fib, eq_fold, distinct}`, all byte-identical (commits `2913bbc`
+params/if/binops/calls, `1e9aefa` string intrinsics, `238c79e` let/var + casts + distinct).
+What's ported in `cgen.jtr` now:
+- **params** (`emit_params`, mirrors `params_str`): 7-tuples in `iar` at `it.a`, count `it.b`,
+  layout `[comptime, conv, name_start, name_end, is_self, type_id, refine]`; conv 0=default 1=read
+  2=mut 3=take 4=out (mut/out → `*`); self/comptime erased; empty → `void`.
+- **binops** (`emit_expr` kind 4 → `(lhs OP rhs)`, `binop_c` codes 1..18) + **value-position
+  names** (kind 2 → `j_<name>`) + **int literals** (`_`-stripped; `0b`→decimal still TODO).
+- **calls** (`emit_call`): `intrinsic_helper(name)` maps print_*/str_eq/eq_fold → `jestyr_rt_*`,
+  emitted as `<helper>(<args>)` via `emit_arg_list` (byte-identical to the reference's print arms
+  + `emit_str_binop` for these arg counts); a plain user call → `jestyr_<name>(<args>)`.
+- **depth-aware body/stmt/if** (`emit_body`/`emit_stmt`/`emit_return`/`emit_if`): brace at depth,
+  stmts at depth+1, tail-as-return; `if` in stmt/return position → block form `if ((cond)) { … }
+  [else …]`. **Drop-scope glue is still a no-op** (add when Drop types land — keeps output
+  byte-identical until then).
+- **`let`/`var`** (kind 0, **annotated only** — `<cty> j_<name> = <init>;`), **`as` casts**
+  (kind 11 → `(Target)(inner)`), **distinct forward typedefs** (kind 1 → `typedef <base>
+  Jestyr_<name>;` in `emit_forward_types`), and the **push-based type renderer `emit_c_ty`**
+  (primitive + user Name types → `Jestyr_<name>`; `c_prim` returns `""` for non-prims so a user
+  type is detected). Structural types (str/slice/ptr/App) are still TODO in `emit_c_ty`.
+
+Whole-corpus probe: only the 4 allowlisted files match; **no free wins** — each next file needs
+new constructs.
+
+### NEXT increment — **structs** (target `compute.jtr`), the plan
+
+The reference target (`emit-c compute.jtr | grep -v '^#line'`) shows exactly what's needed:
+1. **struct forward typedef** in `emit_forward_types` (item kind **4**): `typedef struct
+   Jestyr_<name> Jestyr_<name>;` (union → `typedef union …`). Add alongside the distinct arm.
+2. **struct def** (a new `emit_struct_defs`, emitted *before* `emit_result_defs` — for a program
+   with no by-value field deps that matches the capture/flush order): per struct,
+   `<kw><attr> Jestyr_<name> {\n` then per field `    <cty> j_<field>;\n` then `};\n\n` (note the
+   **double** newline — the trailing blank). Members are **10-tuples in `mar`**; get the exact
+   layout from `parse_struct_members`/`mk_structtype` (kind 36 stores `(x,y)`=member slice) and
+   how typeck lowers struct fields (typeck.jtr phase 2). `struct_attr` (`@packed`/`@align`) can be
+   deferred.
+3. **StructLit** (`emit_expr` kind 16, and generic kind 17): `(Jestyr_<name>){ .j_<f> = <v>, … }`
+   — designated initializers, field name prefixed `j_`. FieldInit children are kind 18. Get the
+   field-init encoding from the parser (`FieldsResult`, the arg-arena slice).
+4. **Field access** (`emit_expr` kind 5): `<base>.j_<name>` (the field name span is Field's `(x,y)`).
+5. **Inferred-`let` types** (`let p = Vec2{…}`, annotation `ty == -1`): read the **Checker's
+   per-expr type** — `c.et[init_exprid]` → `TyId` into `c.tys` (a `TyData{kind,a,b,x,y}` arena),
+   then a NEW `emit_ty_c(sb, src, c, tyid)` mirroring `cgen::c_type`: kind 2 Prim (`prim_name(d.x)`
+   → `c_prim`), kind 15 Named (`Jestyr_<name>`, name at `td(c,d.x,0)..td(c,d.x,1)`), kind 1 Unit →
+   `void`; defer the rest. **This requires threading `read c: typeck.Checker` through the statement
+   group only** (`emit_body`/`emit_stmt`/`emit_return`/`emit_if` — `emit_expr` does NOT need `c`
+   for structs). See `ty_str` in typeck.jtr for the TyData kind table (0=?,1=(),2=Prim,3=Ptr,
+   4=Opaque,5=Result,6=GenStruct,8=Slice,9=Array,10=GenRef,11=RegionRef,12=Fn,13=Task,15=Named,
+   17=DynOpaque,18=OpaqueLit,16=Error).
+
+After structs: field-typed lets, `str`/slice types in `emit_c_ty`, then the `union`+`size_of`
+family, enums/match, closures, concurrency — grow the allowlist file-by-file with `DUMP_DIVERGE=1`.
 
 ---
 
