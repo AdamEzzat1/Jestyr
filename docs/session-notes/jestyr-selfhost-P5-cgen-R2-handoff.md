@@ -124,24 +124,41 @@ Assign (kind 12, `assign_c` codes 1..9), plain break/continue, and `for` via a n
 [4]=cond/bindcount, [5]=srccount, [6]=step, binds (conv,ns,ne) at +7, sources after.
 +`tests_demo.jtr`. TODO in emit_for: zip/slice/str/array iteration, `step`, labels, loop-`else`.
 
-### NEXT increments — everything still remaining (the session-8+ worklist)
+### Increment 8 — the slice/pointer machinery (`82e651d`, allowlist 13)
 
-Allowlist is 11/130 (+tests_demo); grow it file-by-file (`DUMP_DIVERGE=1` to converge; probe the whole corpus
-after each construct — files unlock in clusters). Expr kinds handled so far: 0 Int, 1 Float,
-2 Name, 3 Unary, 4 Binary, 5 Field, 6 Index (str-range only), 10 Call, 11 Cast, 16 StructLit,
-24 If, 26 Char, 27 Bool, 29 Str, 30 Null. Still remaining, roughly in order of leverage:
++`loops.jtr` +`slices.jtr`. Slice typedefs (`collect_slices` analogue: `[]T` annotations +
+`slice(T,…)` calls, deduped by a `|mangle|` marker string), slice indexing (bounds-check spill
+`({ S _s{n}=…; assert(_ix{n} < .len); … })` + **refinement elision** — an exposed exclusive
+`for i in 0..s.len` pushes `(ns,ne,rangeExprId)` onto `Cg.rf`; `index_in_range` mirrors the
+reference), slice `for` iteration (`_s{n}` snapshot; `read` binds by value, `mut` binds a pointer
+and joins `Cg.pp`), `.len`/`.ptr` bare fields, Ptr types `T*`, Deref `(*x)`, `unsafe{…}`/bare
+`{…}` block statements, `invariant`→assert, the alloc/slice/free intrinsics, and `mut`/`out` args
+by address (`&(arg)` — `emit_user_args` looks up the callee Fn item's param convs). `Cg` grew
+`pp` (by-pointer name spans) + `rf` (refinement stack); per-fn `mut`/`out` params registered in
+`emit_fn_defs`. Note: a `_hi{n}`/`_s{n}` temp is consumed even when elided-vs-not, so the global
+counter must match the reference exactly — an off-by-one there desyncs every later temp.
 
-- ~~Assign~~/~~break/continue~~/~~for-range/while/infinite~~ DONE (incr 7). **Deref (7)**, **slice/array Index** (the
-  bounds-checked statement-expr, `_s{n}`/`_ix{n}` temps, refinement elision), **ArrayLit (14)/
-  ArrayRepeat (15)**, **Range (13) outside str-index**, **FString (22)** (statement-expr
-  `_fs{n}` push chain — see the fstring.jtr near-miss diff), **Try (8) `?`**, **Block/Unsafe
-  (23/25) in stmt/value position**.
-- **Loops** (For 31, Break 32, Continue 33, Invariant 34, Variant 35): the unified `for` family
-  — heads (infinite/conditional/iterating), `else`, `step`, labels, `emit_for` in cgen.rs.
-  Medium; unlocks many files (loops.jtr, loops_else.jtr, …).
-- **Types in `emit_c_ty`/`emit_ty_c`**: pointers `*T`, slices `[]T` → `JestyrSlice_<T>` (needs
-  **slice-instance collection** + typedefs — the first instance-collection machinery), arrays
-  `[N]T` → `JestyrArr_<T>_<N>`, genrefs, fn-pointer typedefs.
+### NEXT increments — everything still remaining (the session-9+ worklist)
+
+Allowlist is 13/130 (hello, bench_fib, eq_fold, distinct, compute, copy_optin, io, str_ops,
+substr, union, tests_demo, loops, slices); grow it file-by-file (`DUMP_DIVERGE=1` to converge;
+probe the whole corpus after each construct — files unlock in clusters). Expr kinds handled so
+far: 0 Int, 1 Float, 2 Name, 3 Unary, 4 Binary, 5 Field, 6 Index (str-range + slice), 7 Deref,
+10 Call, 11 Cast, 12 Assign, 13 Range (str-index), 16 StructLit, 23 Block, 24 If, 25 Unsafe,
+26 Char, 27 Bool, 29 Str, 30 Null, 31 For (range/while/infinite/slice), 32 Break, 33 Continue,
+34 Invariant. Still remaining, roughly in order of leverage:
+
+- ~~Deref~~/~~slice Index~~/~~unsafe~~/~~alloc-slice-free~~ DONE (incr 8). **ArrayLit (14)/
+  ArrayRepeat (15)** + array types `[N]T` → `JestyrArr_<mangle>_<N>` (the next target,
+  `array_lit.jtr`). **WATCH the ghost typedef:** array_lit emits `JestyrArr_i32_5` *and*
+  `JestyrArr_i64_5` — the `[2,3,5,7,11]` literal's own type is `[5]i32` (pre-element-adoption)
+  while the `const … [5]i64` annotation is `[5]i64`, so `collect_arrays` scans the **Checker's
+  `expr_types` (`c.et`→TyData kind 9 Array: a=elem, b=len)** as well as annotations — the array
+  literal statement-expr form is `({ T _al{n}; _al{n}.a[0]=(v0); … _al{n}; })`, const arrays use
+  a brace init `{ { … } }` in the consts section, array index is `({ const A* _a{n} = &(base);
+  … _a{n}->a[_ix]; })`, array `.len` → `((size_t)N)`.
+- **Range (13) outside str-index**, **FString (22)** (statement-expr `_fs{n}` push chain — see
+  the fstring.jtr near-miss diff), **Try (8) `?`**.
 - **Error sets**: fallible fns → per-ok-type result structs in `result_defs`, `ok`/`err`/
   `unwrap`/`is_err`/`?` lowering (errors.jtr).
 - **Enums + `match`** (LARGE): enum defs (tag enum + struct+union payload — see the shapes.jtr
