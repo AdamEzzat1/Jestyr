@@ -164,7 +164,22 @@ fn emit_c_ty(mut sb: String, read p: parser.Parser, read src: str, tyid: i32) {
         push_ast_mangle(sb, p, src, t.a)
         return
     }
-    string_push(sb, "void")                            // TODO: array / App / Path / Fn / dyn
+    if t.kind == 4 {                                   // Array `[N]T`: `JestyrArr_<mangle>_<N>`
+        string_push(sb, "JestyrArr_")
+        push_ast_mangle(sb, p, src, t.a)               // a = elem
+        string_push(sb, "_")
+        push_array_len(sb, p, src, t.b)                // b = len ExprId
+        return
+    }
+    string_push(sb, "void")                            // TODO: App / Path / Fn / dyn
+}
+
+// An array length expression rendered as its literal digits (`[5]T` -> `5`). Array lengths are
+// constant expressions; an integer literal is the case the backend supports.
+fn push_array_len(mut sb: String, read p: parser.Parser, read src: str, len_eid: i32) {
+    if len_eid < 0 { string_push(sb, "0")  return }
+    let l: parser.ExprData = list.get(parser.ExprData, p.ex, len_eid as usize)
+    emit_int_literal(sb, src[l.start .. l.end])
 }
 
 // The mangle suffix of an AST type node (mirrors `ty_mangle` for the forms handled so far:
@@ -175,6 +190,13 @@ fn push_ast_mangle(mut sb: String, read p: parser.Parser, read src: str, tyid: i
     if t.kind == 0 { string_push(sb, src[t.start .. t.end])  return }
     if t.kind == 2 { string_push(sb, "ptr_")  push_ast_mangle(sb, p, src, t.a)  return }
     if t.kind == 3 { string_push(sb, "slice_")  push_ast_mangle(sb, p, src, t.a)  return }
+    if t.kind == 4 {                                   // Array: `arr_<elem>_<len>`
+        string_push(sb, "arr_")
+        push_ast_mangle(sb, p, src, t.a)
+        string_push(sb, "_")
+        push_array_len(sb, p, src, t.b)
+        return
+    }
     string_push(sb, "?")
 }
 
@@ -226,6 +248,13 @@ fn emit_ty_c(mut sb: String, read src: str, read c: typeck.Checker, tyid: i32) {
         push_ty_mangle(sb, src, c, d.a)
         return
     }
+    if d.kind == 9 {                                           // Array: `JestyrArr_<mangle>_<N>`
+        string_push(sb, "JestyrArr_")
+        push_ty_mangle(sb, src, c, d.a)                        // a = elem
+        string_push(sb, "_")
+        push_uint(sb, d.b as i64)                              // b = length
+        return
+    }
     string_push(sb, "void")                                    // TODO: other TyData kinds
 }
 
@@ -243,6 +272,13 @@ fn push_ty_mangle(mut sb: String, read src: str, read c: typeck.Checker, tyid: i
     }
     if d.kind == 3 { string_push(sb, "ptr_")  push_ty_mangle(sb, src, c, d.a)  return }
     if d.kind == 8 { string_push(sb, "slice_")  push_ty_mangle(sb, src, c, d.a)  return }
+    if d.kind == 9 {                                           // Array: `arr_<elem>_<len>`
+        string_push(sb, "arr_")
+        push_ty_mangle(sb, src, c, d.a)
+        string_push(sb, "_")
+        push_uint(sb, d.b as i64)
+        return
+    }
     string_push(sb, "?")
 }
 
@@ -397,6 +433,18 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
     }
     if e.kind == 5 {                                  // Field access. (x,y) = name span
         let fname: str = src[e.x as usize .. e.y as usize]
+        // A fixed-size array's `.len` is its CONSTANT length, not a struct field — the base is a
+        // place expression, so not emitting it loses no side effect (mirrors the reference).
+        let bt: i32 = list.get(i32, c.et, e.a as usize)
+        if bt >= 0 {
+            let bd: typeck.TyData = list.get(typeck.TyData, c.tys, bt as usize)
+            if bd.kind == 9 and str_eq(fname, "len") {
+                string_push(sb, "((size_t)")
+                push_uint(sb, bd.b as i64)
+                string_push(sb, ")")
+                return
+            }
+        }
         emit_expr(sb, p, src, c, g, e.a)
         // A string view's `len`/`ptr`/`cstr` are real C fields (not `j_`-prefixed).
         if expr_is_str(c, e.a) {
@@ -474,12 +522,64 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_push(sb, "]; })")
             return
         }
-        // TODO: array indexing; a non-slice base falls back to raw C indexing.
+        let bt: i32 = list.get(i32, c.et, e.a as usize)
+        if bt >= 0 {
+            let bd: typeck.TyData = list.get(typeck.TyData, c.tys, bt as usize)
+            if bd.kind == 9 {                         // array indexing: spill the address, assert, index
+                let n: i32 = g.tmp
+                g.tmp = g.tmp + 1
+                string_push(sb, "({ const ")
+                emit_ty_c(sb, src, c, bt)
+                string_push(sb, "* _a")
+                push_uint(sb, n as i64)
+                string_push(sb, " = &(")
+                emit_expr(sb, p, src, c, g, e.a)
+                string_push(sb, "); size_t _ix")
+                push_uint(sb, n as i64)
+                string_push(sb, " = (size_t)(")
+                emit_expr(sb, p, src, c, g, e.b)
+                string_push(sb, "); assert(_ix")
+                push_uint(sb, n as i64)
+                string_push(sb, " < ")
+                push_uint(sb, bd.b as i64)
+                string_push(sb, "); _a")
+                push_uint(sb, n as i64)
+                string_push(sb, "->a[_ix")
+                push_uint(sb, n as i64)
+                string_push(sb, "]; })")
+                return
+            }
+        }
+        // A non-slice, non-array base falls back to raw C indexing.
         string_push(sb, "(")
         emit_expr(sb, p, src, c, g, e.a)
         string_push(sb, ")[")
         emit_expr(sb, p, src, c, g, e.b)
         string_push(sb, "]")
+        return
+    }
+    if e.kind == 14 {                                 // ArrayLit: ({ A _al{n}; _al{n}.a[i] = (v); … _al{n}; })
+        let n: i32 = g.tmp
+        g.tmp = g.tmp + 1
+        string_push(sb, "({ ")
+        emit_ty_c(sb, src, c, list.get(i32, c.et, eid as usize))
+        string_push(sb, " _al")
+        push_uint(sb, n as i64)
+        string_push(sb, ";")
+        var i: i32 = 0
+        for i < e.y {                                 // (x,y) = elem slice into ar
+            string_push(sb, " _al")
+            push_uint(sb, n as i64)
+            string_push(sb, ".a[")
+            push_uint(sb, i as i64)
+            string_push(sb, "] = (")
+            emit_expr(sb, p, src, c, g, list.get(i32, p.ar, (e.x + i) as usize))
+            string_push(sb, ");")
+            i = i + 1
+        }
+        string_push(sb, " _al")
+        push_uint(sb, n as i64)
+        string_push(sb, "; })")
         return
     }
     if e.kind == 16 {                                 // StructLit: (Jestyr_X){ .j_f = v, … }
@@ -878,6 +978,14 @@ fn emit_for(mut sb: String, read p: parser.Parser, read src: str, read c: typeck
             emit_slice_for(sb, p, src, c, g, e, src0, bc, depth)
             return
         }
+        let sty: i32 = list.get(i32, c.et, src0 as usize)
+        if sty >= 0 {
+            let sd2: typeck.TyData = list.get(typeck.TyData, c.tys, sty as usize)
+            if sd2.kind == 9 {                        // array source: iterate in place by address
+                emit_array_for(sb, p, src, c, g, e, src0, bc, sty, depth)
+                return
+            }
+        }
     }
     // TODO: str/array/zip iteration, `step`.
 }
@@ -947,6 +1055,80 @@ fn emit_slice_for(mut sb: String, read p: parser.Parser, read src: str, read c: 
             string_push(sb, ".ptr[_k")
             push_uint(sb, n as i64)
             string_push(sb, "];\n")
+        }
+    }
+    let blk: parser.ExprData = list.get(parser.ExprData, p.ex, e.b as usize)
+    var i: i32 = 0
+    for i < blk.y {
+        emit_stmt(sb, p, src, c, g, list.get(i32, p.sar, (blk.x + i) as usize), depth + 1)
+        i = i + 1
+    }
+    if added_ptr { list.truncate(i32, g.pp, list.len(i32, g.pp) - 2) }
+    line_at(sb, depth, "}")
+}
+
+// `for x in arr` over a fixed-size array (mirrors `emit_array_for`): take the array's ADDRESS
+// (`_a{n}`, so no whole-array copy), count to its constant length, bind the element by value
+// (`read`) or by pointer (`mut`, which joins the by-pointer name set for the body).
+fn emit_array_for(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, src0: i32, bc: i32, sty: i32, depth: i32) {
+    let conv: i32 = list.get(i32, p.lar, (e.a + 7) as usize)
+    let bns: i32 = list.get(i32, p.lar, (e.a + 8) as usize)
+    let bne: i32 = list.get(i32, p.lar, (e.a + 9) as usize)
+    let bname: str = src[bns as usize .. bne as usize]
+    let ad: typeck.TyData = list.get(typeck.TyData, c.tys, sty as usize)   // Array: a = elem, b = len
+    let n: i32 = g.tmp
+    g.tmp = g.tmp + 1
+    indent(sb, depth)
+    emit_ty_c(sb, src, c, sty)
+    string_push(sb, "* _a")
+    push_uint(sb, n as i64)
+    string_push(sb, " = &(")
+    emit_expr(sb, p, src, c, g, src0)
+    string_push(sb, ");\n")
+    indent(sb, depth)
+    string_push(sb, "for (size_t _k")
+    push_uint(sb, n as i64)
+    string_push(sb, " = 0; _k")
+    push_uint(sb, n as i64)
+    string_push(sb, " < ")
+    push_uint(sb, ad.b as i64)
+    string_push(sb, "; _k")
+    push_uint(sb, n as i64)
+    string_push(sb, "++)\n")
+    line_at(sb, depth, "{")
+    if bc >= 2 {                                      // optional index binding
+        let ins: i32 = list.get(i32, p.lar, (e.a + 11) as usize)
+        let ine: i32 = list.get(i32, p.lar, (e.a + 12) as usize)
+        if !str_eq(src[ins as usize .. ine as usize], "_") {
+            indent(sb, depth + 1)
+            string_push(sb, "size_t j_")
+            string_push(sb, src[ins as usize .. ine as usize])
+            string_push(sb, " = _k")
+            push_uint(sb, n as i64)
+            string_push(sb, ";\n")
+        }
+    }
+    var added_ptr: bool = false
+    if !str_eq(bname, "_") {
+        indent(sb, depth + 1)
+        emit_ty_c(sb, src, c, ad.a)
+        if conv == 2 {                                // mut: bind a pointer into the array
+            string_push(sb, "* j_")
+            string_push(sb, bname)
+            string_push(sb, " = &_a")
+        } else {
+            string_push(sb, " j_")
+            string_push(sb, bname)
+            string_push(sb, " = _a")
+        }
+        push_uint(sb, n as i64)
+        string_push(sb, "->a[_k")
+        push_uint(sb, n as i64)
+        string_push(sb, "];\n")
+        if conv == 2 {
+            list.push(i32, g.pp, bns)
+            list.push(i32, g.pp, bne)
+            added_ptr = true
         }
     }
     let blk: parser.ExprData = list.get(parser.ExprData, p.ex, e.b as usize)
@@ -1192,6 +1374,135 @@ fn is_declared_type(read c: typeck.Checker, read src: str, read nm: str) -> bool
     return false
 }
 
+// Top-level `const`s: `static const <cty> j_<name> = <value>;` each, then the unconditional
+// trailing blank. An array-literal value takes a BRACE initializer (`{ { … } }`) rather than the
+// statement-expression `emit_expr` would give — a `static const` can't be initialized by a GNU
+// statement-expression. (`@no_mangle` consts + `@section` are still TODO.)
+fn emit_consts(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg) {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 2 {                             // Const: (x,y)=name span, a=type, b=value
+            string_push(sb, "static const ")
+            if it.a >= 0 { emit_c_ty(sb, p, src, it.a) }
+            else { emit_ty_c(sb, src, c, list.get(i32, c.et, it.b as usize)) }
+            string_push(sb, " j_")
+            string_push(sb, src[it.x .. it.y])
+            string_push(sb, " = ")
+            let v: parser.ExprData = list.get(parser.ExprData, p.ex, it.b as usize)
+            if v.kind == 14 {                         // array literal -> brace initializer
+                string_push(sb, "{ { ")
+                var i: i32 = 0
+                for i < v.y {
+                    if i > 0 { string_push(sb, ", ") }
+                    emit_expr(sb, p, src, c, g, list.get(i32, p.ar, (v.x + i) as usize))
+                    i = i + 1
+                }
+                string_push(sb, " } }")
+            } else {
+                emit_expr(sb, p, src, c, g, it.b)
+            }
+            string_push(sb, ";\n")
+        }
+        r = r + 1
+    }
+    string_push(sb, "\n")
+}
+
+// Array typedefs: one `typedef struct { <ecty> a[N]; } JestyrArr_<m>_<N>;` per distinct concrete
+// array instance. Mirrors `collect_arrays`' scan ORDER — the Checker's per-expr types FIRST (in
+// expr-arena order), then function signature annotations. The expr scan is load-bearing: a
+// `const T: [5]i64 = [2,3,…]` literal infers its OWN `[5]i32` (the const's value is inferred with
+// no expected type), so BOTH `JestyrArr_i32_5` and `JestyrArr_i64_5` are emitted, in that order.
+fn emit_array_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker) {
+    var seen: String = string_new()
+    var any: bool = false
+    var i: usize = 0
+    for i < list.len(i32, c.et) {                     // per-expr types, in expr-arena order
+        any = emit_one_array_def(sb, src, c, list.get(i32, c.et, i), seen) or any
+    	i = i + 1
+    }
+    var r: i32 = 0                                    // then fn signature annotations
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 3 {
+            var pi: i32 = 0
+            for pi < it.b {
+                any = emit_one_array_def_ast(sb, p, src, c, list.get(i32, p.iar, (it.a + pi * 7 + 5) as usize), seen) or any
+                pi = pi + 1
+            }
+            any = emit_one_array_def_ast(sb, p, src, c, it.z, seen) or any
+        }
+        r = r + 1
+    }
+    if any { string_push(sb, "\n") }
+    string_free(seen)
+}
+
+// One array typedef from a Checker TyId (only an Array, kind 9, contributes).
+fn emit_one_array_def(mut sb: String, read src: str, read c: typeck.Checker, tyid: i32, mut seen: String) -> bool {
+    if tyid < 0 { return false }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tyid as usize)
+    if d.kind != 9 { return false }
+    var m: String = string_new()                      // the instance key = its full mangle
+    push_ty_mangle(m, src, c, d.a)
+    string_push(m, "_")
+    push_uint(m, d.b as i64)
+    let ok: bool = push_array_typedef(sb, string_view(m), seen, src, c, d.a, 0 - 1, d.b)
+    string_free(m)
+    return ok
+}
+
+// One array typedef from an AST TypeId (a `[N]T` annotation).
+fn emit_one_array_def_ast(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, tyid: i32, mut seen: String) -> bool {
+    if tyid < 0 { return false }
+    let t: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
+    if t.kind != 4 { return false }
+    var m: String = string_new()
+    push_ast_mangle(m, p, src, t.a)
+    string_push(m, "_")
+    push_array_len(m, p, src, t.b)
+    var ec: String = string_new()
+    emit_c_ty(ec, p, src, t.a)
+    var ln: String = string_new()
+    push_array_len(ln, p, src, t.b)
+    let ok: bool = push_array_typedef_raw(sb, string_view(m), seen, string_view(ec), string_view(ln))
+    string_free(m)  string_free(ec)  string_free(ln)
+    return ok
+}
+
+// Emit `typedef struct { <ecty> a[<len>]; } JestyrArr_<key>;` unless `key` was already emitted.
+fn push_array_typedef(mut sb: String, read key: str, mut seen: String, read src: str, read c: typeck.Checker, elem: i32, unused: i32, len: i32) -> bool {
+    var ec: String = string_new()
+    emit_ty_c(ec, src, c, elem)
+    var ln: String = string_new()
+    push_uint(ln, len as i64)
+    let ok: bool = push_array_typedef_raw(sb, key, seen, string_view(ec), string_view(ln))
+    string_free(ec)  string_free(ln)
+    return ok
+}
+
+// The dedup + emit core: `key` is the instance's mangle (`<elem>_<len>`).
+fn push_array_typedef_raw(mut sb: String, read key: str, mut seen: String, read ecty: str, read len: str) -> bool {
+    var probe: String = string_new()
+    string_push(probe, "|")
+    string_push(probe, key)
+    string_push(probe, "|")
+    if contains(string_view(seen), string_view(probe)) { string_free(probe)  return false }
+    string_push(seen, string_view(probe))
+    string_free(probe)
+    string_push(sb, "typedef struct { ")
+    string_push(sb, ecty)
+    string_push(sb, " a[")
+    string_push(sb, len)
+    string_push(sb, "]; } JestyrArr_")
+    string_push(sb, key)
+    string_push(sb, ";\n")
+    return true
+}
+
 // Result-struct typedefs. `JestyrResult_str` (the `try_from_utf8` intrinsic's result) is emitted
 // unconditionally up front; fallible user functions add their own (none in `hello`).
 fn emit_result_defs(mut sb: String, read p: parser.Parser, read src: str) {
@@ -1275,6 +1586,7 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
     // gen_forward_types / fn_type_typedefs: empty until generics/fn-pointers are ported.
     emit_struct_defs(sb, p, src)                     // captured-region aggregate defs (struct first)
     emit_slice_defs(sb, p, src, c)                   // slice typedefs (after aggregates)
+    emit_array_defs(sb, p, src, c)                   // array typedefs (after slices)
     // enum / gen-struct / gen-enum / array / genref defs: empty until those are ported.
     emit_result_defs(sb, p, src)
     // flush_def_capture / dyn_typedefs / extern_protos: no-ops here (no by-value dep reorder needed).
@@ -1282,7 +1594,7 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
     emit_fn_protos(sb, p, src)
     string_push(sb, "\n")                            // method_protos: unconditional trailing blank
     // impl_protos / dyn_vtables / spawn_runtime: empty for hello.
-    string_push(sb, "\n")                            // consts: unconditional trailing blank
+    emit_consts(sb, p, src, c, g)                    // consts + its unconditional trailing blank
     // closure_fns: empty for hello.
     emit_fn_defs(sb, p, src, c, g)
     // method_defs / impl_defs: empty for hello.
