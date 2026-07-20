@@ -138,25 +138,33 @@ by address (`&(arg)` — `emit_user_args` looks up the callee Fn item's param co
 `emit_fn_defs`. Note: a `_hi{n}`/`_s{n}` temp is consumed even when elided-vs-not, so the global
 counter must match the reference exactly — an off-by-one there desyncs every later temp.
 
-### NEXT increments — everything still remaining (the session-9+ worklist)
+### Increment 9 — arrays + consts (`5b143d7`, allowlist 14)
 
-Allowlist is 13/130 (hello, bench_fib, eq_fold, distinct, compute, copy_optin, io, str_ops,
-substr, union, tests_demo, loops, slices); grow it file-by-file (`DUMP_DIVERGE=1` to converge;
++`array_lit.jtr`. Array types `[N]T` → `JestyrArr_<mangle>_<N>` (both renderers + mangles).
+`emit_array_defs` mirrors `collect_arrays`' scan ORDER — the Checker's `c.et` per-expr types
+first (expr-arena order), then fn-sig annotations, deduped by a `|key|` marker. **The expr scan is
+load-bearing:** `walk_items` infers a `const`'s value with NO expected type, so `const P: [5]i64 =
+[2,3,5,7,11]` gives the literal its own `[5]i32` → both `JestyrArr_i32_5` and `JestyrArr_i64_5`
+emit (the ghost typedef). ArrayLit (14) → `({ A _al{n}; _al{n}.a[i]=(v); … _al{n}; })`, array
+index → `({ const A* _a{n}=&(base); assert(_ix<N); _a{n}->a[_ix]; })`, array `.len` →
+`((size_t)N)` (base NOT emitted — it's a place), array `for` iterates in place by address. The
+**consts section** is now real (`static const <cty> j_<name> = <value>;`), with an array-literal
+value taking a brace init `{ { … } }` (a `static const` can't use a GNU statement-expression).
+TODO consts: `@no_mangle` consts, `@section`, ArrayRepeat-valued consts.
+
+### NEXT increments — everything still remaining (the session-10+ worklist)
+
+Allowlist is 14/130 (hello, bench_fib, eq_fold, distinct, compute, copy_optin, io, str_ops,
+substr, union, tests_demo, loops, slices, array_lit); grow it file-by-file (`DUMP_DIVERGE=1` to converge;
 probe the whole corpus after each construct — files unlock in clusters). Expr kinds handled so
 far: 0 Int, 1 Float, 2 Name, 3 Unary, 4 Binary, 5 Field, 6 Index (str-range + slice), 7 Deref,
 10 Call, 11 Cast, 12 Assign, 13 Range (str-index), 16 StructLit, 23 Block, 24 If, 25 Unsafe,
 26 Char, 27 Bool, 29 Str, 30 Null, 31 For (range/while/infinite/slice), 32 Break, 33 Continue,
 34 Invariant. Still remaining, roughly in order of leverage:
 
-- ~~Deref~~/~~slice Index~~/~~unsafe~~/~~alloc-slice-free~~ DONE (incr 8). **ArrayLit (14)/
-  ArrayRepeat (15)** + array types `[N]T` → `JestyrArr_<mangle>_<N>` (the next target,
-  `array_lit.jtr`). **WATCH the ghost typedef:** array_lit emits `JestyrArr_i32_5` *and*
-  `JestyrArr_i64_5` — the `[2,3,5,7,11]` literal's own type is `[5]i32` (pre-element-adoption)
-  while the `const … [5]i64` annotation is `[5]i64`, so `collect_arrays` scans the **Checker's
-  `expr_types` (`c.et`→TyData kind 9 Array: a=elem, b=len)** as well as annotations — the array
-  literal statement-expr form is `({ T _al{n}; _al{n}.a[0]=(v0); … _al{n}; })`, const arrays use
-  a brace init `{ { … } }` in the consts section, array index is `({ const A* _a{n} = &(base);
-  … _a{n}->a[_ix]; })`, array `.len` → `((size_t)N)`.
+- ~~Deref/slice-Index/unsafe/alloc-slice-free~~ (incr 8), ~~ArrayLit (14) + arrays + consts~~
+  (incr 9) DONE. Still to do: **ArrayRepeat (15)** `[v; N]` (`({ A _ar{n}; E _v{n}=(v); for(…)
+  _ar{n}.a[_k]=_v{n}; _ar{n}; })`).
 - **Range (13) outside str-index**, **FString (22)** (statement-expr `_fs{n}` push chain — see
   the fstring.jtr near-miss diff), **Try (8) `?`**.
 - **Error sets**: fallible fns → per-ok-type result structs in `result_defs`, `ok`/`err`/
