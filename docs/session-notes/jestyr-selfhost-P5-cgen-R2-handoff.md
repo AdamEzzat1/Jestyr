@@ -152,10 +152,25 @@ index → `({ const A* _a{n}=&(base); assert(_ix<N); _a{n}->a[_ix]; })`, array `
 value taking a brace init `{ { … } }` (a `static const` can't use a GNU statement-expression).
 TODO consts: `@no_mangle` consts, `@section`, ArrayRepeat-valued consts.
 
-### NEXT increments — everything still remaining (the session-10+ worklist)
+### Increment 10 — error sets (`63a02e2`, allowlist 15)
 
-Allowlist is 14/130 (hello, bench_fib, eq_fold, distinct, compute, copy_optin, io, str_ops,
-substr, union, tests_demo, loops, slices, array_lit); grow it file-by-file (`DUMP_DIVERGE=1` to converge;
++`errors.jtr`. Result type `T!` (Checker TyData **kind 5**, a=ok) → `JestyrResult_<mangle(ok)>` in
+both renderers + mangles. `result_defs` emits one typedef per distinct fallible-fn ok type
+(`typedef struct { bool is_err; <okcty> ok; int err; } JestyrResult_<m>;`, deduped, `str`
+pre-seeded; a unit ok omits the `ok` field). **Fallible detection:** `it.e >= 0 && far[it.e] > 0`
+(the `far` extras block at `it.e` is `[err_count, (ns,ne)…, req_count, …, ens_count, …]`).
+`emit_fn_sig` returns the result struct when fallible (and such a fn always "returns a value").
+**Whole-program error-tag map** `build_error_tags` → `Cg.etags` (src-span pairs, tag = idx+1,
+first-seen order across all fns); `error_tag_of` linear-scans. `ok(v)`/`err(E)`/`unwrap(e)`/
+`is_err(e)` intrinsics + the `?` Try (kind 8) stmt-expr `({ R _q{n}=base; if(_q{n}.is_err) return
+(cur){.is_err=true,.err=_q{n}.err}; _q{n}.ok; })` — temp type = base's own Result type (`c.et`),
+re-wrap = the current fn's result via `Cg.res_ok` (the live fallible-fn ok TypeId; **-2** sentinel
+= not fallible, since -1 = unit is a valid ok type).
+
+### NEXT increments — everything still remaining (the session-11+ worklist)
+
+Allowlist is 15/130 (hello, bench_fib, eq_fold, distinct, compute, copy_optin, io, str_ops,
+substr, union, tests_demo, loops, slices, array_lit, errors); grow it file-by-file (`DUMP_DIVERGE=1` to converge;
 probe the whole corpus after each construct — files unlock in clusters). Expr kinds handled so
 far: 0 Int, 1 Float, 2 Name, 3 Unary, 4 Binary, 5 Field, 6 Index (str-range + slice), 7 Deref,
 10 Call, 11 Cast, 12 Assign, 13 Range (str-index), 16 StructLit, 23 Block, 24 If, 25 Unsafe,
@@ -166,8 +181,8 @@ far: 0 Int, 1 Float, 2 Name, 3 Unary, 4 Binary, 5 Field, 6 Index (str-range + sl
   (incr 9) DONE. Still to do: **ArrayRepeat (15)** `[v; N]` (`({ A _ar{n}; E _v{n}=(v); for(…)
   _ar{n}.a[_k]=_v{n}; _ar{n}; })`).
 - **Range (13) outside str-index**, **FString (22)** (statement-expr `_fs{n}` push chain — see
-  the fstring.jtr near-miss diff), **Try (8) `?`**.
-- **Error sets**: fallible fns → per-ok-type result structs in `result_defs`, `ok`/`err`/
+  the fstring.jtr near-miss diff). ~~Try (8) `?`~~ + ~~error sets~~ DONE (incr 10).
+- ~~Error sets~~ DONE (incr 10). (Original note kept for reference:) fallible fns → per-ok-type result structs in `result_defs`, `ok`/`err`/
   `unwrap`/`is_err`/`?` lowering (errors.jtr).
 - **Enums + `match`** (LARGE): enum defs (tag enum + struct+union payload — see the shapes.jtr
   near-miss diff for the exact shape), variant construction, discriminants, `emit_scalar_match`/
