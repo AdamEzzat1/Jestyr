@@ -255,6 +255,11 @@ fn emit_ty_c(mut sb: String, read src: str, read c: typeck.Checker, tyid: i32) {
         push_uint(sb, d.b as i64)                              // b = length
         return
     }
+    if d.kind == 5 {                                           // Result `T!`: `JestyrResult_<mangle(ok)>`
+        string_push(sb, "JestyrResult_")
+        push_ty_mangle(sb, src, c, d.a)                        // a = ok type
+        return
+    }
     string_push(sb, "void")                                    // TODO: other TyData kinds
 }
 
@@ -279,6 +284,7 @@ fn push_ty_mangle(mut sb: String, read src: str, read c: typeck.Checker, tyid: i
         push_uint(sb, d.b as i64)
         return
     }
+    if d.kind == 5 { string_push(sb, "result_")  push_ty_mangle(sb, src, c, d.a)  return }   // Result ok
     string_push(sb, "?")
 }
 
@@ -632,6 +638,26 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         string_push(sb, ")")
         return
     }
+    if e.kind == 8 {                                  // Try `e?`: early-return-on-error statement-expr
+        let n: i32 = g.tmp
+        g.tmp = g.tmp + 1
+        string_push(sb, "({ ")
+        emit_ty_c(sb, src, c, list.get(i32, c.et, e.a as usize))   // the base's own Result type
+        string_push(sb, " _q")
+        push_uint(sb, n as i64)
+        string_push(sb, " = ")
+        emit_expr(sb, p, src, c, g, e.a)
+        string_push(sb, "; if (_q")
+        push_uint(sb, n as i64)
+        string_push(sb, ".is_err) return (")
+        emit_result_name(sb, p, src, g.res_ok)                     // re-wrap in the CURRENT fn's result
+        string_push(sb, "){ .is_err = true, .err = _q")
+        push_uint(sb, n as i64)
+        string_push(sb, ".err }; _q")
+        push_uint(sb, n as i64)
+        string_push(sb, ".ok; })")
+        return
+    }
     if e.kind == 10 {                                 // Call
         emit_call(sb, p, src, c, g, e)
         return
@@ -728,6 +754,35 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_push(sb, ") }")
             return
         }
+        if str_eq(nm, "ok") {                         // ok(v) -> (<cur_result>){ .is_err = false, .ok = (v) }
+            string_push(sb, "(")
+            emit_result_name(sb, p, src, g.res_ok)
+            string_push(sb, "){ .is_err = false, .ok = (")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            string_push(sb, ") }")
+            return
+        }
+        if str_eq(nm, "err") {                        // err(E) -> (<cur_result>){ .is_err = true, .err = <tag> }
+            string_push(sb, "(")
+            emit_result_name(sb, p, src, g.res_ok)
+            string_push(sb, "){ .is_err = true, .err = ")
+            let en: parser.ExprData = list.get(parser.ExprData, p.ex, arg_at(p, e, 0) as usize)
+            push_uint(sb, error_tag_of(g, src, en.start, en.end) as i64)
+            string_push(sb, " }")
+            return
+        }
+        if str_eq(nm, "unwrap") {                     // unwrap(e) -> ((e).ok)
+            string_push(sb, "((")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            string_push(sb, ").ok)")
+            return
+        }
+        if str_eq(nm, "is_err") {                     // is_err(e) -> ((e).is_err)
+            string_push(sb, "((")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            string_push(sb, ").is_err)")
+            return
+        }
         let helper: str = intrinsic_helper(nm)
         if !str_eq(helper, "") {
             string_push(sb, helper)
@@ -820,7 +875,59 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // `(*j_<name>)`; a `for mut x in xs` binding joins temporarily. `rf` is the refinement stack:
 // (ns, ne, range `ExprId`) triples for each enclosing exclusive `for i in 0..s.len` loop, so a
 // provably-in-range `s[i]` elides its bounds check (mirrors `cur_refines`/`index_in_range`).
-struct Cg { tmp: i32, pp: List(i32), rf: List(i32) }
+struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32) }
+
+// The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
+// (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
+// Mirrors the reference's `error_tags` (built in `emit_program`). 0 = unknown.
+fn error_tag_of(read g: Cg, read src: str, ns: usize, ne: usize) -> i32 {
+    var i: usize = 0
+    for i < list.len(i32, g.etags) {
+        let es: i32 = list.get(i32, g.etags, i)
+        let ee: i32 = list.get(i32, g.etags, i + 1)
+        if str_eq(src[ns .. ne], src[es as usize .. ee as usize]) { return (i / 2 + 1) as i32 }
+        i = i + 2
+    }
+    return 0
+}
+
+// Is the top-level Fn item `it` fallible (has a non-empty `!{…}` error set)? The `far` extras
+// block at `it.e` starts with the error count.
+fn fn_is_fallible(read p: parser.Parser, read it: parser.ItemData) -> bool {
+    if it.e < 0 { return false }
+    return list.get(i32, p.far, it.e as usize) > 0
+}
+
+// Emit a fallible fn's C result type name `JestyrResult_<mangle(ok)>` (ok = `it.z`, -1 = unit).
+fn emit_result_name(mut sb: String, read p: parser.Parser, read src: str, ok_ty: i32) {
+    string_push(sb, "JestyrResult_")
+    if ok_ty < 0 { string_push(sb, "unit") } else { push_ast_mangle(sb, p, src, ok_ty) }
+}
+
+// Assign every error name (across all fns' `!{…}` sets, in item then declaration order) a distinct
+// 1-based tag, recorded as (start,end) span pairs in `g.etags` (first-seen wins). Mirrors the
+// reference's `error_tags` pass in `emit_program`.
+fn build_error_tags(mut g: Cg, read p: parser.Parser, read src: str) {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 3 and it.e >= 0 {
+            let ecount: i32 = list.get(i32, p.far, it.e as usize)
+            var k: i32 = 0
+            for k < ecount {
+                let ns: i32 = list.get(i32, p.far, (it.e + 1 + k * 2) as usize)
+                let ne: i32 = list.get(i32, p.far, (it.e + 2 + k * 2) as usize)
+                if error_tag_of(g, src, ns as usize, ne as usize) == 0 {
+                    list.push(i32, g.etags, ns)
+                    list.push(i32, g.etags, ne)
+                }
+                k = k + 1
+            }
+        }
+        r = r + 1
+    }
+}
 
 // Is `src[ns..ne]` currently a by-pointer name (a `mut`/`out` param or a `for mut x` binding)?
 fn is_ptr_name(read g: Cg, read src: str, ns: usize, ne: usize) -> bool {
@@ -1197,7 +1304,9 @@ fn emit_range_for(mut sb: String, read p: parser.Parser, read src: str, read c: 
 
 // The `<ret> jestyr_<name>(<params>)` signature (no trailing newline). Mirrors `fn_signature`.
 fn emit_fn_sig(mut sb: String, read p: parser.Parser, read src: str, read it: parser.ItemData) {
-    emit_c_ty(sb, p, src, it.z)                       // return type (it.z = ret TypeId, -1 = void)
+    // A fallible fn returns its result struct; otherwise its ok type (`it.z`, -1 = void).
+    if fn_is_fallible(p, it) { emit_result_name(sb, p, src, it.z) }
+    else { emit_c_ty(sb, p, src, it.z) }
     string_push(sb, " jestyr_")
     string_push(sb, src[it.x .. it.y])
     emit_params(sb, p, src, it)
@@ -1507,7 +1616,33 @@ fn push_array_typedef_raw(mut sb: String, read key: str, mut seen: String, read 
 // unconditionally up front; fallible user functions add their own (none in `hello`).
 fn emit_result_defs(mut sb: String, read p: parser.Parser, read src: str) {
     string_push(sb, "typedef struct { bool is_err; JestyrStr ok; int err; } JestyrResult_str;\n")
-    // TODO: one typedef per distinct fallible-fn ok type.
+    var seen: String = string_new()
+    string_push(seen, "|str|")                        // `try_from_utf8`'s result is pre-seeded
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 3 and fn_is_fallible(p, it) {
+            var m: String = string_new()              // ok-type mangle = the dedup key
+            if it.z < 0 { string_push(m, "unit") } else { push_ast_mangle(m, p, src, it.z) }
+            var probe: String = string_new()
+            string_push(probe, "|")  string_push(probe, string_view(m))  string_push(probe, "|")
+            if !contains(string_view(seen), string_view(probe)) {
+                string_push(seen, string_view(probe))
+                string_push(sb, "typedef struct { bool is_err; ")
+                if it.z >= 0 {                        // a unit ok type omits the `ok` field
+                    emit_c_ty(sb, p, src, it.z)
+                    string_push(sb, " ok; ")
+                }
+                string_push(sb, "int err; } JestyrResult_")
+                string_push(sb, string_view(m))
+                string_push(sb, ";\n")
+            }
+            string_free(m)  string_free(probe)
+        }
+        r = r + 1
+    }
+    string_free(seen)
     string_push(sb, "\n")
 }
 
@@ -1547,8 +1682,13 @@ fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str, read c: ty
                 }
                 pi = pi + 1
             }
-            let returns_value: bool = it.z >= 0
+            // A fallible fn's result-ok TypeId is live for its body (ok/err/? read it); -2 = not
+            // fallible. It always "returns a value" (the result struct), even for a unit ok type.
+            let fallible: bool = fn_is_fallible(p, it)
+            if fallible { g.res_ok = it.z } else { g.res_ok = 0 - 2 }
+            let returns_value: bool = it.z >= 0 or fallible
             emit_body(sb, p, src, c, g, it.w, returns_value, 0)   // w = body Block ExprId; fn body at depth 0
+            g.res_ok = 0 - 2
             list.truncate(i32, g.pp, 0)
             string_push(sb, "\n")
         }
@@ -1580,7 +1720,8 @@ fn emit_main_wrapper(mut sb: String, read p: parser.Parser, read src: str) {
 // `"\n"` pushes stand in for the reference's unconditionally-blank sections that are empty for a
 // program with no aggregates (closure_types, method_protos, consts) plus the guarded no-ops.
 fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator) {
-    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a) }
+    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a) }
+    build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     emit_prelude(sb)
     emit_forward_types(sb, p, src)
     // gen_forward_types / fn_type_typedefs: empty until generics/fn-pointers are ported.
