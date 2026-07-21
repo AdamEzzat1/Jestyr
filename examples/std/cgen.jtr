@@ -616,12 +616,43 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
     }
     if e.kind == 16 {                                 // StructLit: (Jestyr_X){ .j_f = v, … }
         let path: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)   // a = path Name expr
+        // `Point { x: 9, ..p }` — functional update: copy the spread base, assign listed fields.
+        if e.b >= 0 {
+            let n: i32 = g.tmp
+            g.tmp = g.tmp + 1
+            string_push(sb, "({ Jestyr_")
+            string_push(sb, src[path.start .. path.end])
+            string_push(sb, " jss_")
+            push_uint(sb, n as i64)
+            string_push(sb, " = ")
+            emit_expr(sb, p, src, c, g, e.b)
+            string_push(sb, "; ")
+            var si: i32 = 0
+            for si < e.y {
+                let sfid: i32 = list.get(i32, p.ar, (e.x + si) as usize)
+                let sfi: parser.ExprData = list.get(parser.ExprData, p.ex, sfid as usize)
+                string_push(sb, "jss_")
+                push_uint(sb, n as i64)
+                string_push(sb, ".j_")
+                string_push(sb, src[sfi.x as usize .. sfi.y as usize])
+                string_push(sb, " = ")
+                emit_expr(sb, p, src, c, g, sfi.a)
+                string_push(sb, "; ")
+                si = si + 1
+            }
+            string_push(sb, "jss_")
+            push_uint(sb, n as i64)
+            string_push(sb, "; })")
+            return
+        }
         string_push(sb, "(Jestyr_")
         string_push(sb, src[path.start .. path.end])
         string_push(sb, "){ ")
+        var first: bool = true
         var i: i32 = 0
         for i < e.y {                                 // (x,y) = FieldInit slice into ar
-            if i > 0 { string_push(sb, ", ") }
+            if !first { string_push(sb, ", ") }
+            first = false
             let fid: i32 = list.get(i32, p.ar, (e.x + i) as usize)
             let fi: parser.ExprData = list.get(parser.ExprData, p.ex, fid as usize)   // FieldInit (kind 18)
             string_push(sb, ".j_")
@@ -630,7 +661,29 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             emit_expr(sb, p, src, c, g, fi.a)               // a = value
             i = i + 1
         }
-        // TODO: fill omitted fields that declare a `= default`; spread `..base`.
+        // Fill any omitted field that declares a `= <default>` (declaration order).
+        let sit: i32 = find_struct_item(p, src, path.start, path.end)
+        if sit >= 0 {
+            let sd: parser.ItemData = list.get(parser.ItemData, p.it, sit as usize)
+            var m: i32 = 0
+            for m < sd.b {
+                let mb: i32 = sd.a + m * 10
+                let dflt: i32 = list.get(i32, p.mar, (mb + 5) as usize)
+                if list.get(i32, p.mar, mb as usize) == 0 and dflt >= 0 {   // a field with a default
+                    let fns2: i32 = list.get(i32, p.mar, (mb + 2) as usize)
+                    let fne2: i32 = list.get(i32, p.mar, (mb + 3) as usize)
+                    if !structlit_has_field(p, src, e, fns2 as usize, fne2 as usize) {
+                        if !first { string_push(sb, ", ") }
+                        first = false
+                        string_push(sb, ".j_")
+                        string_push(sb, src[fns2 as usize .. fne2 as usize])
+                        string_push(sb, " = ")
+                        emit_expr(sb, p, src, c, g, dflt)
+                    }
+                }
+                m = m + 1
+            }
+        }
         string_push(sb, " }")
         return
     }
@@ -1209,6 +1262,66 @@ fn emit_variant_bindings(mut sb: String, read p: parser.Parser, read src: str, r
     }
 }
 
+// Layout attrs on a struct item: `@packed` -> `packed`, `@align(n)` -> `aligned(n)`, joined into
+// one ` __attribute__((…))` clause (mirrors `struct_attr`; unknown attrs are ignored). Attrs are
+// 4-tuples in `aar` at `(u,v)`: [name_start, name_end, arg_start, arg_count]; args are ExprIds.
+fn emit_struct_attr(mut sb: String, read p: parser.Parser, read src: str, read it: parser.ItemData) {
+    if it.u < 0 { return }
+    var wrote: bool = false
+    var a: i32 = 0
+    for a < it.v {
+        let ab: i32 = it.u + a * 4
+        let ns: i32 = list.get(i32, p.aar, ab as usize)
+        let ne: i32 = list.get(i32, p.aar, (ab + 1) as usize)
+        let nm: str = src[ns as usize .. ne as usize]
+        if str_eq(nm, "packed") {
+            if !wrote { string_push(sb, " __attribute__((") } else { string_push(sb, ", ") }
+            wrote = true
+            string_push(sb, "packed")
+        } else if str_eq(nm, "align") {
+            if list.get(i32, p.aar, (ab + 3) as usize) >= 1 {
+                let arg: i32 = list.get(i32, p.aar, (ab + 2) as usize)
+                let ax: parser.ExprData = list.get(parser.ExprData, p.ex, list.get(i32, p.aar, arg as usize) as usize)
+                if ax.kind == 0 {
+                    if !wrote { string_push(sb, " __attribute__((") } else { string_push(sb, ", ") }
+                    wrote = true
+                    string_push(sb, "aligned(")
+                    emit_int_literal(sb, src[ax.start .. ax.end])
+                    string_push(sb, ")")
+                }
+            }
+        }
+        a = a + 1
+    }
+    if wrote { string_push(sb, "))") }
+}
+
+// The item id of a struct/record/union named `src[ns..ne]`, or -1.
+fn find_struct_item(read p: parser.Parser, read src: str, ns: usize, ne: usize) -> i32 {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 4 {
+            if str_eq(src[ns .. ne], src[it.x .. it.y]) { return iid }
+        }
+        r = r + 1
+    }
+    return 0 - 1
+}
+
+// Does StructLit `e` list a field named `src[ns..ne]`?
+fn structlit_has_field(read p: parser.Parser, read src: str, read e: parser.ExprData, ns: usize, ne: usize) -> bool {
+    var i: i32 = 0
+    for i < e.y {
+        let fid: i32 = list.get(i32, p.ar, (e.x + i) as usize)
+        let fi: parser.ExprData = list.get(parser.ExprData, p.ex, fid as usize)
+        if str_eq(src[ns .. ne], src[fi.x as usize .. fi.y as usize]) { return true }
+        i = i + 1
+    }
+    return false
+}
+
 // The item id of a non-generic enum named `src[ns..ne]`, or -1.
 fn find_enum_item(read p: parser.Parser, read src: str, ns: usize, ne: usize) -> i32 {
     var r: i32 = 0
@@ -1623,7 +1736,9 @@ fn emit_struct_defs(mut sb: String, read p: parser.Parser, read src: str) {
         let iid: i32 = list.get(i32, p.roots, r)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 4 {
-            if it.op == 2 { string_push(sb, "union Jestyr_") } else { string_push(sb, "struct Jestyr_") }
+            if it.op == 2 { string_push(sb, "union") } else { string_push(sb, "struct") }
+            emit_struct_attr(sb, p, src, it)          // `@packed`/`@align(n)` -> __attribute__((…))
+            string_push(sb, " Jestyr_")
             string_push(sb, src[it.x .. it.y])
             string_push(sb, " {\n")
             var m: i32 = 0
@@ -1996,6 +2111,20 @@ fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str, read c: ty
                 }
                 pi = pi + 1
             }
+            // A refined param (`i: usize in 0..s.len`) seeds the refinement stack for the whole
+            // body, so `s[i]` elides its bounds check (mirrors `cur_refines` seeding in emit_fn).
+            let rfloor: usize = list.len(i32, g.rf)
+            var ri: i32 = 0
+            for ri < it.b {
+                let rbase: i32 = it.a + ri * 7
+                let refine: i32 = list.get(i32, p.iar, (rbase + 6) as usize)
+                if refine >= 0 {
+                    list.push(i32, g.rf, list.get(i32, p.iar, (rbase + 2) as usize))
+                    list.push(i32, g.rf, list.get(i32, p.iar, (rbase + 3) as usize))
+                    list.push(i32, g.rf, refine)
+                }
+                ri = ri + 1
+            }
             // A fallible fn's result-ok TypeId is live for its body (ok/err/? read it); -2 = not
             // fallible. It always "returns a value" (the result struct), even for a unit ok type.
             let fallible: bool = fn_is_fallible(p, it)
@@ -2004,6 +2133,7 @@ fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str, read c: ty
             emit_body(sb, p, src, c, g, it.w, returns_value, 0)   // w = body Block ExprId; fn body at depth 0
             g.res_ok = 0 - 2
             list.truncate(i32, g.pp, 0)
+            list.truncate(i32, g.rf, rfloor)
             string_push(sb, "\n")
         }
         r = r + 1
