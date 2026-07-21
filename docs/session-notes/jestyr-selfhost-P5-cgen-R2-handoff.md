@@ -167,7 +167,24 @@ first-seen order across all fns); `error_tag_of` linear-scans. `ok(v)`/`err(E)`/
 re-wrap = the current fn's result via `Cg.res_ok` (the live fallible-fn ok TypeId; **-2** sentinel
 = not fallible, since -1 = unit is a valid ok type).
 
-### NEXT increments — everything still remaining (the session-11+ worklist)
+### Increment 11 — enums + flat match (`3a11126`, allowlist 19)
+
++`discriminants` +`shapes` +`recursion` +`rest_pat`. Enum forward typedefs + `emit_enum_defs`
+(tag enum with `= discriminant` values, then `struct { tag; union { struct{…} v; } u; }` — the
+union only when some variant has fields), variant construction (bare nullary Name — checked
+BEFORE the local-name path — and payload Call `circle(2.0)` — checked before intrinsics),
+enum→int casts `(T)((e).tag)`, and the flat tagged `switch (jm_{n}.tag)` match: case labels one
+level in from the switch brace, payload Ident subpats project `<fcty> j_<b> = jm_{n}.u.<v>.j_<f>;`
+(wildcard/`..` skip), binding-catch-all + `_` → `default:`, non-ret arms `break;`, exhaustive
+ret-position closes `__builtin_unreachable();`. Infra: `find_variant_enum`/`variant_tuple` (the
+reference's `variants` map as an `ear` 5-tuple scan), `expr_enum_row` (Named TyData → tdecl kind 1),
+`emit_arm_body`. **Deferred match forms:** guarded (`emit_guarded_match` ordered if-chain — a C
+switch can't stack same-tag cases), nested (`emit_nested_match` decision tree), niche (`Option(*T)`
+null test), scalar scrutinee (int/char/bool ordered if-chain), or-patterns (stacked case labels),
+struct-variant patterns, generic-enum instances. Targets: guards.jtr, nested_match.jtr,
+match_check.jtr, exhaustive_check.jtr.
+
+### NEXT increments — everything still remaining (the session-12+ worklist)
 
 Allowlist is 15/130 (hello, bench_fib, eq_fold, distinct, compute, copy_optin, io, str_ops,
 substr, union, tests_demo, loops, slices, array_lit, errors); grow it file-by-file (`DUMP_DIVERGE=1` to converge;
