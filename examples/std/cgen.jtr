@@ -801,6 +801,14 @@ fn intrinsic_helper(read nm: str) -> str {
 // Method sugar and mangled/collision names later.
 fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData) {
     let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+    if callee.kind == 21 {                            // `@address(0x…)` — a fixed-address pointer (MMIO)
+        if str_eq(src[callee.x as usize .. callee.y as usize], "address") {
+            string_push(sb, "((void*)(")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            string_push(sb, "))")
+            return
+        }
+    }
     if callee.kind == 2 {
         let nm: str = src[callee.start .. callee.end]
         // A payload-bearing variant construction `circle(2.0)` -> the tagged-union struct literal.
@@ -842,6 +850,37 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_push(sb, "free(")
             emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
             string_push(sb, ")")
+            return
+        }
+        if str_eq(nm, "realloc_i32") {                // ((int32_t*) realloc(<p>, (size_t)(<n>) * sizeof(int32_t)))
+            string_push(sb, "((int32_t*) realloc(")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            string_push(sb, ", (size_t)(")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 1))
+            string_push(sb, ") * sizeof(int32_t)))")
+            return
+        }
+        if str_eq(nm, "bytes") {                      // str -> []u8 view: ({ JestyrStr _bv{n} = s; (JestyrSlice_u8){ … }; })
+            let n: i32 = g.tmp
+            g.tmp = g.tmp + 1
+            string_push(sb, "({ JestyrStr _bv")
+            push_uint(sb, n as i64)
+            string_push(sb, " = ")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            string_push(sb, "; (JestyrSlice_u8){ (uint8_t*)_bv")
+            push_uint(sb, n as i64)
+            string_push(sb, ".ptr, _bv")
+            push_uint(sb, n as i64)
+            string_push(sb, ".len }; })")
+            return
+        }
+        if str_eq(nm, "try_from_utf8") {              // validate-at-boundary: []u8 -> str !Utf8Error
+            let a0: i32 = arg_at(p, e, 0)
+            string_push(sb, "({ ")
+            emit_ty_c(sb, src, c, list.get(i32, c.et, a0 as usize))
+            string_push(sb, " _u = ")
+            emit_expr(sb, p, src, c, g, a0)
+            string_push(sb, "; jestyr_rt_valid_utf8((const char*)_u.ptr, _u.len) ? (JestyrResult_str){ .is_err = false, .ok = (JestyrStr){ (const char*)_u.ptr, _u.len } } : (JestyrResult_str){ .is_err = true, .err = 1 }; })")
             return
         }
         if str_eq(nm, "slice") {                      // slice(T, ptr, n) -> (JestyrSlice_<T>){ ptr, (size_t)(n) }
@@ -890,6 +929,14 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             emit_arg_list(sb, p, src, c, g, e)
             return
         }
+        // An `extern "c"` callee is invoked by its BARE name (resolved by the linker);
+        // `mut`/`out` params still take the argument by address.
+        let xit: i32 = find_extern_item(p, src, nm)
+        if xit >= 0 {
+            string_push(sb, nm)
+            emit_args_for_item(sb, p, src, c, g, e, xit)
+            return
+        }
         // Plain user function: mangle to `jestyr_<name>`. A `mut`/`out` parameter takes the
         // argument by address (`&(arg)`), so look up the callee's param conventions.
         string_push(sb, "jestyr_")
@@ -897,6 +944,77 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         emit_user_args(sb, p, src, c, g, e, nm)
         return
     }
+}
+
+// One C prototype per `extern "c"` declaration (bare name, linker-resolved), + a blank iff any.
+// Params render `<cty>[*] j_<name>` with NO `restrict` (a foreign fn makes no aliasing promise).
+fn emit_extern_protos(mut sb: String, read p: parser.Parser, read src: str) {
+    var any: bool = false
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 8 {
+            any = true
+            emit_c_ty(sb, p, src, it.z)               // ret type (-1 = void)
+            string_push(sb, " ")
+            string_push(sb, src[it.x .. it.y])
+            string_push(sb, "(")
+            var emitted: i32 = 0
+            var i: i32 = 0
+            for i < it.b {
+                let base: i32 = it.a + i * 7
+                if list.get(i32, p.iar, base as usize) == 0 and list.get(i32, p.iar, (base + 4) as usize) == 0 {
+                    if emitted > 0 { string_push(sb, ", ") }
+                    let conv: i32 = list.get(i32, p.iar, (base + 1) as usize)
+                    emit_c_ty(sb, p, src, list.get(i32, p.iar, (base + 5) as usize))
+                    if conv == 2 or conv == 4 { string_push(sb, "*") }
+                    string_push(sb, " j_")
+                    string_push(sb, src[list.get(i32, p.iar, (base + 2) as usize) as usize .. list.get(i32, p.iar, (base + 3) as usize) as usize])
+                    emitted = emitted + 1
+                }
+                i = i + 1
+            }
+            if emitted == 0 { string_push(sb, "void") }
+            string_push(sb, ");\n")
+        }
+        r = r + 1
+    }
+    if any { string_push(sb, "\n") }
+}
+
+// The item id of an `extern "c"` fn named `src[ns..ne]`… by name, or -1.
+fn find_extern_item(read p: parser.Parser, read src: str, read nm: str) -> i32 {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 8 {
+            if str_eq(src[it.x .. it.y], nm) { return iid }
+        }
+        r = r + 1
+    }
+    return 0 - 1
+}
+
+// The `(args)` list for a call whose callee item id is known (mut/out params by `&()`).
+fn emit_args_for_item(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, fit: i32) {
+    let it: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
+    string_push(sb, "(")
+    var i: i32 = 0
+    for i < e.y {
+        if i > 0 { string_push(sb, ", ") }
+        var byref: bool = false
+        if i < it.b {
+            let conv: i32 = list.get(i32, p.iar, (it.a + i * 7 + 1) as usize)
+            if conv == 2 or conv == 4 { byref = true }
+        }
+        if byref { string_push(sb, "&(") }
+        emit_expr(sb, p, src, c, g, arg_at(p, e, i))
+        if byref { string_push(sb, ")") }
+        i = i + 1
+    }
+    string_push(sb, ")")
 }
 
 // The `ExprId` of a Call node's `i`th argument (`(x,y)` = arg slice into `ar`).
@@ -1053,6 +1171,8 @@ fn emit_return(mut sb: String, read p: parser.Parser, read src: str, read c: typ
     let v: parser.ExprData = list.get(parser.ExprData, p.ex, val as usize)
     if v.kind == 24 { emit_if(sb, p, src, c, g, val, true, depth)  return }      // If
     if v.kind == 28 { emit_match(sb, p, src, c, g, val, true, depth)  return }   // match
+    if v.kind == 25 { emit_body(sb, p, src, c, g, v.a, true, depth)  return }    // return unsafe { … }
+    if v.kind == 23 { emit_body(sb, p, src, c, g, val, true, depth)  return }    // return { … }
     indent(sb, depth)
     string_push(sb, "return ")
     emit_expr(sb, p, src, c, g, val)
@@ -1260,6 +1380,23 @@ fn emit_variant_bindings(mut sb: String, read p: parser.Parser, read src: str, r
         }
         i = i + 1
     }
+}
+
+// Does the struct member at 10-tuple `base` carry a field attr named `want`? Member slots 6/7 are
+// its attr 4-tuple slice in `aar`.
+fn field_has_attr(read p: parser.Parser, read src: str, base: i32, read want: str) -> bool {
+    let astart: i32 = list.get(i32, p.mar, (base + 6) as usize)
+    let acount: i32 = list.get(i32, p.mar, (base + 7) as usize)
+    if astart < 0 { return false }
+    var a: i32 = 0
+    for a < acount {
+        let ab: i32 = astart + a * 4
+        let ns: i32 = list.get(i32, p.aar, ab as usize)
+        let ne: i32 = list.get(i32, p.aar, (ab + 1) as usize)
+        if str_eq(src[ns as usize .. ne as usize], want) { return true }
+        a = a + 1
+    }
+    return false
 }
 
 // Layout attrs on a struct item: `@packed` -> `packed`, `@align(n)` -> `aligned(n)`, joined into
@@ -1747,6 +1884,7 @@ fn emit_struct_defs(mut sb: String, read p: parser.Parser, read src: str) {
                 let tag: i32 = list.get(i32, p.mar, base as usize)
                 if tag == 0 {                         // a field (not a method)
                     string_push(sb, "    ")
+                    if field_has_attr(p, src, base, "volatile") { string_push(sb, "volatile ") }
                     let fty: i32 = list.get(i32, p.mar, (base + 4) as usize)
                     emit_c_ty(sb, p, src, fty)
                     string_push(sb, " j_")
@@ -2175,7 +2313,8 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
     emit_array_defs(sb, p, src, c)                   // array typedefs (after slices)
     // enum / gen-struct / gen-enum / array / genref defs: empty until those are ported.
     emit_result_defs(sb, p, src)
-    // flush_def_capture / dyn_typedefs / extern_protos: no-ops here (no by-value dep reorder needed).
+    // flush_def_capture / dyn_typedefs: no-ops here (no by-value dep reorder needed).
+    emit_extern_protos(sb, p, src)                   // `extern "c"` prototypes (bare names)
     string_push(sb, "\n")                            // closure_types: unconditional trailing blank
     emit_fn_protos(sb, p, src)
     string_push(sb, "\n")                            // method_protos: unconditional trailing blank
