@@ -348,6 +348,21 @@ fn expr_is_slice(read c: typeck.Checker, eid: i32) -> bool {
     return d.kind == 8
 }
 
+// The tdecl row of expr `eid`'s type if it is a Named ENUM (tdecl kind 1), else -1. The `Jestyr_<E>`
+// tag prefix and payload C types come from this row's name.
+fn expr_enum_row(read c: typeck.Checker, eid: i32) -> i32 {
+    let tid: i32 = list.get(i32, c.et, eid as usize)
+    if tid < 0 { return 0 - 1 }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+    if d.kind != 15 { return 0 - 1 }                          // Named
+    if list.get(i32, c.tdecl, (d.x * 10 + 2) as usize) != 1 { return 0 - 1 }   // kind 1 = enum
+    return d.x
+}
+
+fn expr_is_enum(read c: typeck.Checker, eid: i32) -> bool {
+    return expr_enum_row(c, eid) >= 0
+}
+
 // Does an enclosing exclusive `for i in 0..s.len` prove `base[index]` in range? Mirrors
 // `index_in_range`: base + index are bare Names, the index name has an active refinement whose
 // Range hi is `<base>.len` (a Field named `len` whose base Name matches `base`'s text).
@@ -416,7 +431,18 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         string_push(sb, ")")
         return
     }
-    if e.kind == 2 {                                  // Name (value position): a `j_`-prefixed local/param
+    if e.kind == 2 {                                  // Name (value position)
+        // A bare *nullary* enum variant (e.g. `none`, `red`) constructs its enum value. A
+        // payload-bearing variant referenced bare is not a construction (it would be called).
+        let venum: i32 = find_variant_enum(p, src, e.start, e.end)
+        if venum >= 0 {
+            let vb: i32 = variant_tuple(p, src, venum, e.start, e.end)
+            if list.get(i32, p.ear, (vb + 3) as usize) == 0 {   // field_count == 0: nullary
+                emit_variant_head(sb, p, src, venum, src[e.start .. e.end])
+                string_push(sb, " }")
+                return
+            }
+        }
         if is_ptr_name(g, src, e.start, e.end) {      // a by-pointer name dereferences on use
             string_push(sb, "(*j_")
             string_push(sb, src[e.start .. e.end])
@@ -611,6 +637,12 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
     if e.kind == 11 {                                 // Cast: (TargetType)(inner). x = target TypeId
         string_push(sb, "(")
         emit_c_ty(sb, p, src, e.x)
+        if expr_is_enum(c, e.a) {                     // enum -> int reads its discriminant: (T)((e).tag)
+            string_push(sb, ")((")
+            emit_expr(sb, p, src, c, g, e.a)
+            string_push(sb, ").tag)")
+            return
+        }
         string_push(sb, ")(")
         emit_expr(sb, p, src, c, g, e.a)
         string_push(sb, ")")
@@ -718,6 +750,22 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
     let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
     if callee.kind == 2 {
         let nm: str = src[callee.start .. callee.end]
+        // A payload-bearing variant construction `circle(2.0)` -> the tagged-union struct literal.
+        let venum: i32 = find_variant_enum(p, src, callee.start, callee.end)
+        if venum >= 0 {
+            emit_variant_head(sb, p, src, venum, nm)
+            string_push(sb, ", .u.")
+            string_push(sb, nm)
+            string_push(sb, " = { ")
+            var vi: i32 = 0
+            for vi < e.y {
+                if vi > 0 { string_push(sb, ", ") }
+                emit_expr(sb, p, src, c, g, arg_at(p, e, vi))
+                vi = vi + 1
+            }
+            string_push(sb, " } }")
+            return
+        }
         if str_eq(nm, "size_of") {                    // size_of(T) -> sizeof(<cty>)
             string_push(sb, "sizeof(")
             let a0: i32 = list.get(i32, p.ar, e.x as usize)
@@ -950,7 +998,8 @@ fn emit_return(mut sb: String, read p: parser.Parser, read src: str, read c: typ
     }
     // A control-flow value return dispatches to its block form (`return if …` becomes a C `if`).
     let v: parser.ExprData = list.get(parser.ExprData, p.ex, val as usize)
-    if v.kind == 24 { emit_if(sb, p, src, c, g, val, true, depth)  return }   // If
+    if v.kind == 24 { emit_if(sb, p, src, c, g, val, true, depth)  return }      // If
+    if v.kind == 28 { emit_match(sb, p, src, c, g, val, true, depth)  return }   // match
     indent(sb, depth)
     string_push(sb, "return ")
     emit_expr(sb, p, src, c, g, val)
@@ -966,6 +1015,7 @@ fn emit_stmt(mut sb: String, read p: parser.Parser, read src: str, read c: typec
     if s.kind == 2 {                                  // Expr statement
         let e: parser.ExprData = list.get(parser.ExprData, p.ex, s.a as usize)
         if e.kind == 24 { emit_if(sb, p, src, c, g, s.a, false, depth)  return }   // If as a statement
+        if e.kind == 28 { emit_match(sb, p, src, c, g, s.a, false, depth)  return } // match as a statement
         if e.kind == 31 { emit_for(sb, p, src, c, g, s.a, depth)  return }         // For as a statement
         if e.kind == 25 { emit_body(sb, p, src, c, g, e.a, false, depth)  return } // unsafe { … } block
         if e.kind == 23 { emit_body(sb, p, src, c, g, s.a, false, depth)  return } // bare { … } block
@@ -1037,6 +1087,140 @@ fn emit_if(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.
         if els.kind == 24 { emit_if(sb, p, src, c, g, e.op, ret, depth) }     // else if
         else { emit_body(sb, p, src, c, g, e.op, ret, depth) }               // else block
     }
+}
+
+// The body of a `match` arm: a `return <e>;` in return position, else the expression as a
+// statement (with block/if forms recursing). Mirrors `emit_arm_body`.
+fn emit_arm_body(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, body: i32, ret: bool, depth: i32) {
+    let bd: parser.ExprData = list.get(parser.ExprData, p.ex, body as usize)
+    if ret {
+        if bd.kind == 24 { emit_if(sb, p, src, c, g, body, true, depth)  return }
+        if bd.kind == 28 { emit_match(sb, p, src, c, g, body, true, depth)  return }
+        if bd.kind == 23 { emit_body(sb, p, src, c, g, body, true, depth)  return }
+        emit_return(sb, p, src, c, g, body, depth)
+        return
+    }
+    if bd.kind == 24 { emit_if(sb, p, src, c, g, body, false, depth)  return }
+    if bd.kind == 28 { emit_match(sb, p, src, c, g, body, false, depth)  return }
+    if bd.kind == 23 { emit_body(sb, p, src, c, g, body, false, depth)  return }
+    indent(sb, depth)
+    emit_expr(sb, p, src, c, g, body)
+    string_push(sb, ";\n")
+}
+
+// A `match` on a tagged enum -> `<cty> jm_{n} = <scrut>; switch (jm_{n}.tag) { case … }`. Each arm
+// binds any payload fields (`<fcty> j_<b> = jm_{n}.u.<v>.j_<field>;`) then runs its body; a non-
+// return arm ends with `break;`. An exhaustive return-position match closes with
+// `__builtin_unreachable();`. Mirrors `emit_match` (flat, unguarded path). Guards/nesting/niche and
+// scalar (int/char/bool) scrutinees are deferred (added when a corpus file needs them).
+fn emit_match(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, eid: i32, ret: bool, depth: i32) {
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
+    let scrut: i32 = e.a
+    let row: i32 = expr_enum_row(c, scrut)
+    let ens: i32 = list.get(i32, c.tdecl, (row * 10 + 0) as usize)
+    let ene: i32 = list.get(i32, c.tdecl, (row * 10 + 1) as usize)
+    let en: str = src[ens as usize .. ene as usize]
+    let enum_iid: i32 = find_enum_item(p, src, ens as usize, ene as usize)
+    let n: i32 = g.tmp
+    g.tmp = g.tmp + 1
+    indent(sb, depth)
+    string_push(sb, "Jestyr_")  string_push(sb, en)  string_push(sb, " jm_")
+    push_uint(sb, n as i64)
+    string_push(sb, " = ")
+    emit_expr(sb, p, src, c, g, scrut)
+    string_push(sb, ";\n")
+    indent(sb, depth)
+    string_push(sb, "switch (jm_")  push_uint(sb, n as i64)  string_push(sb, ".tag)\n")
+    line_at(sb, depth, "{")
+    let cd: i32 = depth + 1                            // case labels sit one level in from the switch
+    var has_default: bool = false
+    var k: i32 = 0
+    for k < e.y {                                     // e.x = arm_start, e.y = arm_count (triples in par)
+        let ab: i32 = e.x + k * 3
+        let pat: i32 = list.get(i32, p.par, ab as usize)
+        let body: i32 = list.get(i32, p.par, (ab + 2) as usize)
+        let pd: parser.PatData = list.get(parser.PatData, p.pt, pat as usize)
+        if pd.kind == 2 {                             // Variant `v(subpats)`
+            let vname: str = src[pd.x as usize .. pd.y as usize]
+            indent(sb, cd)
+            string_push(sb, "case Jestyr_")  string_push(sb, en)  string_push(sb, "_")  string_push(sb, vname)  string_push(sb, ":\n")
+            line_at(sb, cd, "{")
+            emit_variant_bindings(sb, p, src, c, enum_iid, n, vname, pd, cd + 1)
+            emit_arm_body(sb, p, src, c, g, body, ret, cd + 1)
+            if !ret { line_at(sb, cd + 1, "break;") }
+            line_at(sb, cd, "}")
+        } else if pd.kind == 1 and find_variant_enum(p, src, pd.start, pd.end) >= 0 {   // nullary variant
+            let vname: str = src[pd.start .. pd.end]
+            indent(sb, cd)
+            string_push(sb, "case Jestyr_")  string_push(sb, en)  string_push(sb, "_")  string_push(sb, vname)  string_push(sb, ":\n")
+            line_at(sb, cd, "{")
+            emit_arm_body(sb, p, src, c, g, body, ret, cd + 1)
+            if !ret { line_at(sb, cd + 1, "break;") }
+            line_at(sb, cd, "}")
+        } else if pd.kind == 1 {                      // binding catch-all (binds whole scrutinee)
+            has_default = true
+            line_at(sb, cd, "default:")
+            line_at(sb, cd, "{")
+            indent(sb, cd + 1)
+            string_push(sb, "Jestyr_")  string_push(sb, en)  string_push(sb, " j_")  string_push(sb, src[pd.start .. pd.end])
+            string_push(sb, " = jm_")  push_uint(sb, n as i64)  string_push(sb, ";\n")
+            emit_arm_body(sb, p, src, c, g, body, ret, cd + 1)
+            if !ret { line_at(sb, cd + 1, "break;") }
+            line_at(sb, cd, "}")
+        } else if pd.kind == 0 {                      // wildcard `_`
+            has_default = true
+            line_at(sb, cd, "default:")
+            line_at(sb, cd, "{")
+            emit_arm_body(sb, p, src, c, g, body, ret, cd + 1)
+            if !ret { line_at(sb, cd + 1, "break;") }
+            line_at(sb, cd, "}")
+        }
+        k = k + 1
+    }
+    line_at(sb, depth, "}")
+    if ret and !has_default { line_at(sb, depth, "__builtin_unreachable();") }
+}
+
+// Emit a Variant pattern's payload bindings: for each Ident subpat, project the matching field
+// `<fcty> j_<bind> = jm_{n}.u.<vname>.j_<fieldname>;`. Wildcard/rest subpats project nothing.
+fn emit_variant_bindings(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, enum_iid: i32, n: i32, read vname: str, read pd: parser.PatData, depth: i32) {
+    let vb: i32 = variant_tuple(p, src, enum_iid, pd.x as usize, pd.y as usize)
+    if vb < 0 { return }
+    let fstart: i32 = list.get(i32, p.ear, (vb + 2) as usize)   // field 3-tuple base
+    var i: i32 = 0
+    for i < pd.a {                                    // (op,a) = subpat slice in par
+        let sp: i32 = list.get(i32, p.par, (pd.op + i) as usize)
+        let spd: parser.PatData = list.get(parser.PatData, p.pt, sp as usize)
+        if spd.kind == 1 {                            // an Ident binding projects field i
+            let fb: i32 = fstart + i * 3
+            indent(sb, depth)
+            emit_c_ty(sb, p, src, list.get(i32, p.ear, (fb + 2) as usize))   // field type
+            string_push(sb, " j_")
+            string_push(sb, src[spd.start .. spd.end])   // binding name
+            string_push(sb, " = jm_")
+            push_uint(sb, n as i64)
+            string_push(sb, ".u.")
+            string_push(sb, vname)
+            string_push(sb, ".j_")
+            string_push(sb, src[list.get(i32, p.ear, fb as usize) as usize .. list.get(i32, p.ear, (fb + 1) as usize) as usize])   // field name
+            string_push(sb, ";\n")
+        }
+        i = i + 1
+    }
+}
+
+// The item id of a non-generic enum named `src[ns..ne]`, or -1.
+fn find_enum_item(read p: parser.Parser, read src: str, ns: usize, ne: usize) -> i32 {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 5 {
+            if str_eq(src[ns .. ne], src[it.x .. it.y]) { return iid }
+        }
+        r = r + 1
+    }
+    return 0 - 1
 }
 
 // Decimal digits of a non-negative integer (for `_hi{n}` temp names).
@@ -1366,10 +1550,67 @@ fn emit_forward_types(mut sb: String, read p: parser.Parser, read src: str) {
             string_push(sb, src[it.x .. it.y])
             string_push(sb, ";\n")
         }
-        // TODO: enum (kind 5) forward typedefs.
+        if it.kind == 5 and it.a == 0 {               // non-generic enum: `typedef struct Jestyr_<E> Jestyr_<E>;`
+            string_push(sb, "typedef struct Jestyr_")
+            string_push(sb, src[it.x .. it.y])
+            string_push(sb, " Jestyr_")
+            string_push(sb, src[it.x .. it.y])
+            string_push(sb, ";\n")
+        }
         r = r + 1
     }
     string_push(sb, "\n")
+}
+
+// ---- enum / variant lookup (the reference's `variants` map, computed by AST scan) ----
+
+// The item id of the enum that declares a variant named `src[ns..ne]`, or -1. Variants are
+// 5-tuples in `ear` at `it.b`, count `it.z`: [name_start, name_end, field_start, field_count, disc].
+fn find_variant_enum(read p: parser.Parser, read src: str, ns: usize, ne: usize) -> i32 {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 5 {
+            var k: i32 = 0
+            for k < it.z {
+                let vb: i32 = it.b + k * 5
+                let vns: i32 = list.get(i32, p.ear, vb as usize)
+                let vne: i32 = list.get(i32, p.ear, (vb + 1) as usize)
+                if str_eq(src[ns .. ne], src[vns as usize .. vne as usize]) { return iid }
+                k = k + 1
+            }
+        }
+        r = r + 1
+    }
+    return 0 - 1
+}
+
+// The variant 5-tuple base (into `ear`) of variant `src[ns..ne]` within enum item `enum_iid`, or -1.
+fn variant_tuple(read p: parser.Parser, read src: str, enum_iid: i32, ns: usize, ne: usize) -> i32 {
+    let it: parser.ItemData = list.get(parser.ItemData, p.it, enum_iid as usize)
+    var k: i32 = 0
+    for k < it.z {
+        let vb: i32 = it.b + k * 5
+        let vns: i32 = list.get(i32, p.ear, vb as usize)
+        let vne: i32 = list.get(i32, p.ear, (vb + 1) as usize)
+        if str_eq(src[ns .. ne], src[vns as usize .. vne as usize]) { return vb }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+// Emit the leading `(Jestyr_<E>){ .tag = Jestyr_<E>_<v>` of a variant construction (caller adds
+// the optional `.u.<v> = { … }` payload and the closing ` }`).
+fn emit_variant_head(mut sb: String, read p: parser.Parser, read src: str, enum_iid: i32, read vname: str) {
+    let it: parser.ItemData = list.get(parser.ItemData, p.it, enum_iid as usize)
+    let en: str = src[it.x .. it.y]
+    string_push(sb, "(Jestyr_")
+    string_push(sb, en)
+    string_push(sb, "){ .tag = Jestyr_")
+    string_push(sb, en)
+    string_push(sb, "_")
+    string_push(sb, vname)
 }
 
 // Struct/record/union definitions (mirrors Cgen::struct_defs). Members are 10-tuples in `mar`
@@ -1400,6 +1641,79 @@ fn emit_struct_defs(mut sb: String, read p: parser.Parser, read src: str) {
                     string_push(sb, ";\n")
                 }
                 m = m + 1
+            }
+            string_push(sb, "};\n\n")
+        }
+        r = r + 1
+    }
+}
+
+// Enum definitions (mirrors Cgen::enum_defs): a tag enum `enum Jestyr_<E>_tag { … };` (variant
+// discriminants set explicit values) then `struct Jestyr_<E> { enum … tag; [union { … } u;] };`.
+// The payload union appears only if some variant has fields. Non-generic enums only (a generic
+// enum is a template; niche-opt is deferred). Each ends `};\n\n`.
+fn emit_enum_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg) {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 5 and it.a == 0 {               // non-generic enum (a == tparam count)
+            let en: str = src[it.x .. it.y]
+            string_push(sb, "enum Jestyr_")
+            string_push(sb, en)
+            string_push(sb, "_tag {\n")
+            var any_payload: bool = false
+            var k: i32 = 0
+            for k < it.z {
+                let vb: i32 = it.b + k * 5
+                let vns: i32 = list.get(i32, p.ear, vb as usize)
+                let vne: i32 = list.get(i32, p.ear, (vb + 1) as usize)
+                let disc: i32 = list.get(i32, p.ear, (vb + 4) as usize)
+                if list.get(i32, p.ear, (vb + 3) as usize) > 0 { any_payload = true }
+                string_push(sb, "    Jestyr_")
+                string_push(sb, en)
+                string_push(sb, "_")
+                string_push(sb, src[vns as usize .. vne as usize])
+                if disc >= 0 {
+                    string_push(sb, " = ")
+                    emit_expr(sb, p, src, c, g, disc)
+                }
+                string_push(sb, ",\n")
+                k = k + 1
+            }
+            string_push(sb, "};\n")
+            string_push(sb, "struct Jestyr_")
+            string_push(sb, en)
+            string_push(sb, " {\n    enum Jestyr_")
+            string_push(sb, en)
+            string_push(sb, "_tag tag;\n")
+            if any_payload {
+                string_push(sb, "    union {\n")
+                var k2: i32 = 0
+                for k2 < it.z {
+                    let vb: i32 = it.b + k2 * 5
+                    let fc: i32 = list.get(i32, p.ear, (vb + 3) as usize)
+                    if fc > 0 {
+                        let vns: i32 = list.get(i32, p.ear, vb as usize)
+                        let vne: i32 = list.get(i32, p.ear, (vb + 1) as usize)
+                        let fs: i32 = list.get(i32, p.ear, (vb + 2) as usize)   // field 3-tuple base
+                        string_push(sb, "        struct { ")
+                        var fi: i32 = 0
+                        for fi < fc {
+                            let fb: i32 = fs + fi * 3
+                            emit_c_ty(sb, p, src, list.get(i32, p.ear, (fb + 2) as usize))   // field type
+                            string_push(sb, " j_")
+                            string_push(sb, src[list.get(i32, p.ear, fb as usize) as usize .. list.get(i32, p.ear, (fb + 1) as usize) as usize])
+                            string_push(sb, "; ")
+                            fi = fi + 1
+                        }
+                        string_push(sb, "} ")
+                        string_push(sb, src[vns as usize .. vne as usize])
+                        string_push(sb, ";\n")
+                    }
+                    k2 = k2 + 1
+                }
+                string_push(sb, "    } u;\n")
             }
             string_push(sb, "};\n\n")
         }
@@ -1726,6 +2040,7 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
     emit_forward_types(sb, p, src)
     // gen_forward_types / fn_type_typedefs: empty until generics/fn-pointers are ported.
     emit_struct_defs(sb, p, src)                     // captured-region aggregate defs (struct first)
+    emit_enum_defs(sb, p, src, c, g)                 // enum tag+struct defs (after structs)
     emit_slice_defs(sb, p, src, c)                   // slice typedefs (after aggregates)
     emit_array_defs(sb, p, src, c)                   // array typedefs (after slices)
     // enum / gen-struct / gen-enum / array / genref defs: empty until those are ported.
