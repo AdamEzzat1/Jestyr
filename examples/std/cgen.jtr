@@ -840,6 +840,21 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_push(sb, ")")
             return
         }
+        if str_eq(nm, "align_of") {                   // align_of(T) -> _Alignof(<cty>)
+            string_push(sb, "_Alignof(")
+            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            string_push(sb, ")")
+            return
+        }
+        if str_eq(nm, "offset_of") {                  // offset_of(T, f) -> offsetof(<cty>, j_<f>)
+            string_push(sb, "offsetof(")
+            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            string_push(sb, ", j_")
+            let fa: parser.ExprData = list.get(parser.ExprData, p.ex, arg_at(p, e, 1) as usize)
+            string_push(sb, src[fa.start .. fa.end])
+            string_push(sb, ")")
+            return
+        }
         if str_eq(nm, "alloc_i32") {                  // ((int32_t*) malloc((size_t)(<n>) * sizeof(int32_t)))
             string_push(sb, "((int32_t*) malloc((size_t)(")
             emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
@@ -1022,6 +1037,17 @@ fn arg_at(read p: parser.Parser, read e: parser.ExprData, i: i32) -> i32 {
     return list.get(i32, p.ar, (e.x + i) as usize)
 }
 
+// A bare-Name *type argument* (`size_of(T)`-style) rendered as its C type.
+fn emit_type_arg_cty(mut sb: String, read p: parser.Parser, read src: str, aid: i32) {
+    let arg: parser.ExprData = list.get(parser.ExprData, p.ex, aid as usize)
+    if arg.kind == 2 {
+        let tn: str = src[arg.start .. arg.end]
+        let pc: str = c_prim(tn)
+        if !str_eq(pc, "") { string_push(sb, pc) }
+        else { string_push(sb, "Jestyr_")  string_push(sb, tn) }
+    }
+}
+
 // Emit a user call's `(arg0, arg1, …)` list, taking each `mut`/`out` parameter by address. The
 // callee's param conventions come from its Fn item (found by name); an unknown callee (or a
 // variadic mismatch) falls back to by-value, which is correct for all-default signatures.
@@ -1094,7 +1120,7 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // `(*j_<name>)`; a `for mut x in xs` binding joins temporarily. `rf` is the refinement stack:
 // (ns, ne, range `ExprId`) triples for each enclosing exclusive `for i in 0..s.len` loop, so a
 // provably-in-range `s[i]` elides its bounds check (mirrors `cur_refines`/`index_in_range`).
-struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32) }
+struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32 }
 
 // The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
 // (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
@@ -1173,6 +1199,25 @@ fn emit_return(mut sb: String, read p: parser.Parser, read src: str, read c: typ
     if v.kind == 28 { emit_match(sb, p, src, c, g, val, true, depth)  return }   // match
     if v.kind == 25 { emit_body(sb, p, src, c, g, v.a, true, depth)  return }    // return unsafe { … }
     if v.kind == 23 { emit_body(sb, p, src, c, g, val, true, depth)  return }    // return { … }
+    // `ensures` postconditions: spill the value to `j_result`, assert each (with `result` bound
+    // to it), then return the spill. Mirrors `emit_value_return`.
+    if list.len(i32, g.ens) > 0 {
+        indent(sb, depth)
+        if g.res_ok >= 0 - 1 { emit_result_name(sb, p, src, g.res_ok) } else { emit_c_ty(sb, p, src, g.retty) }
+        string_push(sb, " j_result = ")
+        emit_expr(sb, p, src, c, g, val)
+        string_push(sb, ";\n")
+        var ei: usize = 0
+        for ei < list.len(i32, g.ens) {
+            indent(sb, depth)
+            string_push(sb, "assert(")
+            emit_expr(sb, p, src, c, g, list.get(i32, g.ens, ei))
+            string_push(sb, ");\n")
+            ei = ei + 1
+        }
+        line_at(sb, depth, "return j_result;")
+        return
+    }
     indent(sb, depth)
     string_push(sb, "return ")
     emit_expr(sb, p, src, c, g, val)
@@ -1225,6 +1270,19 @@ fn emit_stmt(mut sb: String, read p: parser.Parser, read src: str, read c: typec
 // appear — a no-op for the programs ported so far, so output stays byte-identical.)
 fn emit_body(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, block_eid: i32, ret: bool, depth: i32) {
     line_at(sb, depth, "{")
+    // Pending `requires` preconditions (armed per fn by emit_fn_defs) fire as asserts at the top
+    // of the FN body only — consumed here so nested blocks don't re-emit them.
+    if list.len(i32, g.req) > 0 {
+        var qi: usize = 0
+        for qi < list.len(i32, g.req) {
+            indent(sb, depth + 1)
+            string_push(sb, "assert(")
+            emit_expr(sb, p, src, c, g, list.get(i32, g.req, qi))
+            string_push(sb, ");\n")
+            qi = qi + 1
+        }
+        list.truncate(i32, g.req, 0)
+    }
     let blk: parser.ExprData = list.get(parser.ExprData, p.ex, block_eid as usize)   // Block (kind 23)
     let n: i32 = blk.y                                // y = stmt_count
     var i: i32 = 0
@@ -1891,6 +1949,11 @@ fn emit_struct_defs(mut sb: String, read p: parser.Parser, read src: str) {
                     let fns: i32 = list.get(i32, p.mar, (base + 2) as usize)
                     let fne: i32 = list.get(i32, p.mar, (base + 3) as usize)
                     string_push(sb, src[fns as usize .. fne as usize])
+                    let bs: i32 = list.get(i32, p.mar, (base + 8) as usize)   // `: bits` width span
+                    if bs >= 0 {
+                        string_push(sb, " : ")
+                        string_push(sb, src[bs as usize .. list.get(i32, p.mar, (base + 9) as usize) as usize])
+                    }
                     string_push(sb, ";\n")
                 }
                 m = m + 1
@@ -2263,6 +2326,22 @@ fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str, read c: ty
                 }
                 ri = ri + 1
             }
+            // `requires`/`ensures` contract exprs from the `far` extras block:
+            // [err_count, err span pairs…, req_count, req ExprIds…, ens_count, ens ExprIds…].
+            list.truncate(i32, g.req, 0)
+            list.truncate(i32, g.ens, 0)
+            if it.e >= 0 {
+                let ecount: i32 = list.get(i32, p.far, it.e as usize)
+                let rq: i32 = it.e + 1 + ecount * 2               // req_count slot
+                let rqc: i32 = list.get(i32, p.far, rq as usize)
+                var qi: i32 = 0
+                for qi < rqc { list.push(i32, g.req, list.get(i32, p.far, (rq + 1 + qi) as usize))  qi = qi + 1 }
+                let enp: i32 = rq + 1 + rqc                        // ens_count slot
+                let enc: i32 = list.get(i32, p.far, enp as usize)
+                var ei: i32 = 0
+                for ei < enc { list.push(i32, g.ens, list.get(i32, p.far, (enp + 1 + ei) as usize))  ei = ei + 1 }
+            }
+            g.retty = it.z
             // A fallible fn's result-ok TypeId is live for its body (ok/err/? read it); -2 = not
             // fallible. It always "returns a value" (the result struct), even for a unit ok type.
             let fallible: bool = fn_is_fallible(p, it)
@@ -2272,6 +2351,7 @@ fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str, read c: ty
             g.res_ok = 0 - 2
             list.truncate(i32, g.pp, 0)
             list.truncate(i32, g.rf, rfloor)
+            list.truncate(i32, g.ens, 0)
             string_push(sb, "\n")
         }
         r = r + 1
@@ -2302,7 +2382,7 @@ fn emit_main_wrapper(mut sb: String, read p: parser.Parser, read src: str) {
 // `"\n"` pushes stand in for the reference's unconditionally-blank sections that are empty for a
 // program with no aggregates (closure_types, method_protos, consts) plus the guarded no-ops.
 fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator) {
-    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a) }
+    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1 }
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     emit_prelude(sb)
     emit_forward_types(sb, p, src)
