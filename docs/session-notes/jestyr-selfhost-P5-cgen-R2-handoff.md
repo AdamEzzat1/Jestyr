@@ -184,7 +184,30 @@ null test), scalar scrutinee (int/char/bool ordered if-chain), or-patterns (stac
 struct-variant patterns, generic-enum instances. Targets: guards.jtr, nested_match.jtr,
 match_check.jtr, exhaustive_check.jtr.
 
-### NEXT increments — everything still remaining (the session-12+ worklist)
+### Increments 12–14 — near-miss sweeps (`0d37d28`/`32b5246`/`64f7ce4`, allowlist 30)
+
+The diff-ranked probe (rank every non-matching file by `Compare-Object` line count) is the
+increment picker now — files unlock in small clusters:
+- **12** (+refine, spread, layout, defaults): refined PARAMS seed the refinement stack
+  (iar slot 6) so `s[i]` elides its check; struct-lit spread → `({ Jestyr_X jss_{n} = base;
+  jss_{n}.j_f = v; … jss_{n}; })`; `@packed`/`@align(n)` → ` __attribute__((…))` between
+  keyword and name; struct-lit fills omitted defaulted fields (member slot 5) in decl order.
+- **13** (+mmio, try_utf8, container, extern_c): `extern "c"` protos section (bare names, no
+  `restrict`) + bare-name calls w/ `&()` for mut/out (item kind 8); `@volatile` field prefix +
+  `@address(0x…)` → `((void*)(addr))` (Attr callee, expr kind 21); `bytes(s)` `_bv{n}` stmt-expr
+  + `try_from_utf8` `_u` conditional (fixed `_u`, no counter); `realloc_i32`; return-position
+  `unsafe{…}`/`{…}` blocks.
+- **14** (+bitfields, reflect, contracts): `: N` bit widths (member slots 8/9 span);
+  `align_of`→`_Alignof`, `offset_of`→`offsetof(cty, j_f)`; `requires` asserts at fn-body top
+  (armed per fn, consumed by the FIRST emit_body — nested blocks see an empty list), `ensures`
+  → `j_result` spill + asserts + `return j_result;`. Cg now: tmp/pp/rf/res_ok/etags/req/ens/retty.
+
+**Deferred with reasons:** FString needs the parser to give interps real sub-exprs (parser.jtr
+kind 22 is span-only; typeck golden shims skip interp Names — a parser+typeck+cgen change);
+records.jtr = struct METHODS (protos/defs + `p.m()` sugar via typeck `mcalls`) — the next
+medium chunk; guards.jtr = guarded match + GENERIC-ENUM instances (Option(i32) mono).
+
+### NEXT increments — everything still remaining (the session-15+ worklist)
 
 Allowlist is 15/130 (hello, bench_fib, eq_fold, distinct, compute, copy_optin, io, str_ops,
 substr, union, tests_demo, loops, slices, array_lit, errors); grow it file-by-file (`DUMP_DIVERGE=1` to converge;
