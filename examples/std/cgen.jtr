@@ -363,6 +363,93 @@ fn expr_is_enum(read c: typeck.Checker, eid: i32) -> bool {
     return expr_enum_row(c, eid) >= 0
 }
 
+// The tdecl row of expr `eid`'s type if it is a Named STRUCT (tdecl kind 0), else -1.
+fn expr_struct_row(read c: typeck.Checker, eid: i32) -> i32 {
+    let tid: i32 = list.get(i32, c.et, eid as usize)
+    if tid < 0 { return 0 - 1 }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+    if d.kind != 15 { return 0 - 1 }                          // Named
+    if list.get(i32, c.tdecl, (d.x * 10 + 2) as usize) != 0 { return 0 - 1 }   // kind 0 = struct
+    return d.x
+}
+
+// The Fn ITEM id of struct `sit`'s method named `src[ns..ne]`, or -1. A method member in `mar` is
+// the 10-tuple [1, fn_item_id, -1 …]; the fn item (kind 3, not in roots) carries the signature.
+fn find_struct_method(read p: parser.Parser, read src: str, sit: i32, ns: usize, ne: usize) -> i32 {
+    let it: parser.ItemData = list.get(parser.ItemData, p.it, sit as usize)
+    var m: i32 = 0
+    for m < it.b {
+        let base: i32 = it.a + m * 10
+        if list.get(i32, p.mar, base as usize) == 1 {         // tag 1 = method
+            let fid: i32 = list.get(i32, p.mar, (base + 1) as usize)
+            let fd: parser.ItemData = list.get(parser.ItemData, p.it, fid as usize)
+            if str_eq(src[ns .. ne], src[fd.x .. fd.y]) { return fid }
+        }
+        m = m + 1
+    }
+    return 0 - 1
+}
+
+// The struct item + method fn item of a method-sugar call `recv.m(…)`, or -1: the callee must be
+// a Field whose base types as a Named struct that declares a method of that name. Packs the pair
+// as `sit * 1000000 + fid` (item ids are far smaller); -1 = not a struct-method call.
+fn resolve_method_call(read p: parser.Parser, read src: str, read c: typeck.Checker, read callee: parser.ExprData) -> i32 {
+    let row: i32 = expr_struct_row(c, callee.a)
+    if row < 0 { return 0 - 1 }
+    let sns: i32 = list.get(i32, c.tdecl, (row * 10 + 0) as usize)
+    let sne: i32 = list.get(i32, c.tdecl, (row * 10 + 1) as usize)
+    let sit: i32 = find_struct_item(p, src, sns as usize, sne as usize)
+    if sit < 0 { return 0 - 1 }
+    let fid: i32 = find_struct_method(p, src, sit, callee.x as usize, callee.y as usize)
+    if fid < 0 { return 0 - 1 }
+    return sit * 1000000 + fid
+}
+
+// The `conv` code of a method's `self` parameter (0 read-ish default; 2/4 = by pointer), or 0.
+fn method_self_conv(read p: parser.Parser, fid: i32) -> i32 {
+    let fd: parser.ItemData = list.get(parser.ItemData, p.it, fid as usize)
+    var i: i32 = 0
+    for i < fd.b {
+        let pbase: i32 = fd.a + i * 7
+        if list.get(i32, p.iar, (pbase + 4) as usize) == 1 {  // is_self
+            return list.get(i32, p.iar, (pbase + 1) as usize)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Collect every (struct item, method fn item) a method-sugar call instantiates, first-seen order,
+// as pairs in `g.mi` — the reference's `method_instances` (non-generic receivers: empty type args).
+// The expr arena is scanned in creation order, which tracks body order for a single file.
+fn collect_method_instances(mut g: Cg, read p: parser.Parser, read src: str, read c: typeck.Checker) {
+    var i: usize = 0
+    for i < list.len(parser.ExprData, p.ex) {
+        let e: parser.ExprData = list.get(parser.ExprData, p.ex, i)
+        if e.kind == 10 {
+            let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+            if callee.kind == 5 {
+                let packed: i32 = resolve_method_call(p, src, c, callee)
+                if packed >= 0 {
+                    var seen: bool = false
+                    var k: usize = 0
+                    for k < list.len(i32, g.mi) {
+                        if list.get(i32, g.mi, k) == packed / 1000000 {
+                            if list.get(i32, g.mi, k + 1) == packed % 1000000 { seen = true }
+                        }
+                        k = k + 2
+                    }
+                    if !seen {
+                        list.push(i32, g.mi, packed / 1000000)
+                        list.push(i32, g.mi, packed % 1000000)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
 // Does an enclosing exclusive `for i in 0..s.len` prove `base[index]` in range? Mirrors
 // `index_in_range`: base + index are bare Names, the index name has an active refinement whose
 // Range hi is `<base>.len` (a Field named `len` whose base Name matches `base`'s text).
@@ -429,6 +516,10 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         else if e.op == 4 { string_push(sb, "&") }
         emit_expr(sb, p, src, c, g, e.a)
         string_push(sb, ")")
+        return
+    }
+    if e.kind == 19 {                                 // SelfValue: j_self ((*j_self) for mut/out self)
+        if g.self_ptr { string_push(sb, "(*j_self)") } else { string_push(sb, "j_self") }
         return
     }
     if e.kind == 2 {                                  // Name (value position)
@@ -801,6 +892,45 @@ fn intrinsic_helper(read nm: str) -> str {
 // Method sugar and mangled/collision names later.
 fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData) {
     let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+    if callee.kind == 5 {                             // method sugar `recv.m(args)`
+        let packed: i32 = resolve_method_call(p, src, c, callee)
+        if packed >= 0 {
+            let sit: i32 = packed / 1000000
+            let fid: i32 = packed % 1000000
+            let sd: parser.ItemData = list.get(parser.ItemData, p.it, sit as usize)
+            string_push(sb, "jestyr_")
+            string_push(sb, src[sd.x .. sd.y])
+            string_push(sb, "_")
+            string_push(sb, src[callee.x as usize .. callee.y as usize])
+            string_push(sb, "(")
+            // The receiver is the first C argument: by address for a `mut`/`out self`.
+            let sconv: i32 = method_self_conv(p, fid)
+            if sconv == 2 or sconv == 4 {
+                string_push(sb, "&(")
+                emit_expr(sb, p, src, c, g, callee.a)
+                string_push(sb, ")")
+            } else {
+                emit_expr(sb, p, src, c, g, callee.a)
+            }
+            // Then the call args, honouring the method's own param conventions (param 0 = self).
+            let fd: parser.ItemData = list.get(parser.ItemData, p.it, fid as usize)
+            var ai: i32 = 0
+            for ai < e.y {
+                string_push(sb, ", ")
+                var byref: bool = false
+                if ai + 1 < fd.b {
+                    let pconv: i32 = list.get(i32, p.iar, (fd.a + (ai + 1) * 7 + 1) as usize)
+                    if pconv == 2 or pconv == 4 { byref = true }
+                }
+                if byref { string_push(sb, "&(") }
+                emit_expr(sb, p, src, c, g, arg_at(p, e, ai))
+                if byref { string_push(sb, ")") }
+                ai = ai + 1
+            }
+            string_push(sb, ")")
+            return
+        }
+    }
     if callee.kind == 21 {                            // `@address(0x…)` — a fixed-address pointer (MMIO)
         if str_eq(src[callee.x as usize .. callee.y as usize], "address") {
             string_push(sb, "((void*)(")
@@ -1120,7 +1250,7 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // `(*j_<name>)`; a `for mut x in xs` binding joins temporarily. `rf` is the refinement stack:
 // (ns, ne, range `ExprId`) triples for each enclosing exclusive `for i in 0..s.len` loop, so a
 // provably-in-range `s[i]` elides its bounds check (mirrors `cur_refines`/`index_in_range`).
-struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32 }
+struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool }
 
 // The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
 // (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
@@ -1833,6 +1963,91 @@ fn emit_params(mut sb: String, read p: parser.Parser, read src: str, read it: pa
     string_push(sb, ")")
 }
 
+// A method's signature `<ret> jestyr_<S>_<m>(<params>)` — like `emit_fn_sig` but `self` renders
+// as a real first parameter `Jestyr_<S>[* restrict] j_self` (pointer for `mut`/`out self`).
+// Mirrors `emit_method_decl`'s sig + `method_params_str`.
+fn emit_method_sig(mut sb: String, read p: parser.Parser, read src: str, read sd: parser.ItemData, read fd: parser.ItemData) {
+    emit_c_ty(sb, p, src, fd.z)
+    string_push(sb, " jestyr_")
+    string_push(sb, src[sd.x .. sd.y])
+    string_push(sb, "_")
+    string_push(sb, src[fd.x .. fd.y])
+    string_push(sb, "(")
+    var emitted: i32 = 0
+    var i: i32 = 0
+    for i < fd.b {
+        let base: i32 = fd.a + i * 7
+        if list.get(i32, p.iar, base as usize) == 0 {          // not comptime
+            if emitted > 0 { string_push(sb, ", ") }
+            let conv: i32 = list.get(i32, p.iar, (base + 1) as usize)
+            if list.get(i32, p.iar, (base + 4) as usize) == 1 {   // self
+                string_push(sb, "Jestyr_")
+                string_push(sb, src[sd.x .. sd.y])
+                if conv == 2 or conv == 4 { string_push(sb, "* restrict") }
+                string_push(sb, " j_self")
+            } else {
+                emit_c_ty(sb, p, src, list.get(i32, p.iar, (base + 5) as usize))
+                if conv == 2 or conv == 4 { string_push(sb, "* restrict") }
+                string_push(sb, " j_")
+                string_push(sb, src[list.get(i32, p.iar, (base + 2) as usize) as usize .. list.get(i32, p.iar, (base + 3) as usize) as usize])
+            }
+            emitted = emitted + 1
+        }
+        i = i + 1
+    }
+    if emitted == 0 { string_push(sb, "void") }
+    string_push(sb, ")")
+}
+
+// Method prototypes (mirrors `method_protos`): one `<sig>;` per collected (struct, method)
+// instance, then the section's unconditional trailing blank.
+fn emit_method_protos(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg) {
+    var k: usize = 0
+    for k < list.len(i32, g.mi) {
+        let sd: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, g.mi, k) as usize)
+        let fd: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, g.mi, k + 1) as usize)
+        emit_method_sig(sb, p, src, sd, fd)
+        string_push(sb, ";\n")
+        k = k + 2
+    }
+    string_push(sb, "\n")
+}
+
+// Method definitions (mirrors `method_defs` -> `emit_method_decl(body=true)`): sig + body + blank.
+// The body runs with `self_ptr` set for a `mut`/`out self` (SelfValue then renders `(*j_self)`),
+// the method's `mut`/`out` value params in the by-pointer set, and the method's own return type.
+fn emit_method_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg) {
+    var k: usize = 0
+    for k < list.len(i32, g.mi) {
+        let sit: i32 = list.get(i32, g.mi, k)
+        let fid: i32 = list.get(i32, g.mi, k + 1)
+        let sd: parser.ItemData = list.get(parser.ItemData, p.it, sit as usize)
+        let fd: parser.ItemData = list.get(parser.ItemData, p.it, fid as usize)
+        emit_method_sig(sb, p, src, sd, fd)
+        string_push(sb, "\n")
+        list.truncate(i32, g.pp, 0)
+        var pi: i32 = 0
+        for pi < fd.b {
+            let pbase: i32 = fd.a + pi * 7
+            let pconv: i32 = list.get(i32, p.iar, (pbase + 1) as usize)
+            if list.get(i32, p.iar, (pbase + 4) as usize) == 0 and (pconv == 2 or pconv == 4) {
+                list.push(i32, g.pp, list.get(i32, p.iar, (pbase + 2) as usize))
+                list.push(i32, g.pp, list.get(i32, p.iar, (pbase + 3) as usize))
+            }
+            pi = pi + 1
+        }
+        let sconv: i32 = method_self_conv(p, fid)
+        g.self_ptr = sconv == 2 or sconv == 4
+        g.retty = fd.z
+        emit_body(sb, p, src, c, g, fd.w, fd.z >= 0, 0)
+        g.self_ptr = false
+        g.retty = 0 - 1
+        list.truncate(i32, g.pp, 0)
+        string_push(sb, "\n")
+        k = k + 2
+    }
+}
+
 // ---- top-level sections (mirrors emit_program's order) ----
 
 // Forward typedefs for struct/distinct/enum aggregates. None in `hello`, so just the trailing
@@ -2382,8 +2597,9 @@ fn emit_main_wrapper(mut sb: String, read p: parser.Parser, read src: str) {
 // `"\n"` pushes stand in for the reference's unconditionally-blank sections that are empty for a
 // program with no aggregates (closure_types, method_protos, consts) plus the guarded no-ops.
 fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator) {
-    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1 }
+    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false }
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
+    collect_method_instances(g, p, src, c)           // (struct item, method fn item) pairs, first-seen
     emit_prelude(sb)
     emit_forward_types(sb, p, src)
     // gen_forward_types / fn_type_typedefs: empty until generics/fn-pointers are ported.
@@ -2397,12 +2613,13 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
     emit_extern_protos(sb, p, src)                   // `extern "c"` prototypes (bare names)
     string_push(sb, "\n")                            // closure_types: unconditional trailing blank
     emit_fn_protos(sb, p, src)
-    string_push(sb, "\n")                            // method_protos: unconditional trailing blank
+    emit_method_protos(sb, p, src, c, g)             // method protos + unconditional trailing blank
     // impl_protos / dyn_vtables / spawn_runtime: empty for hello.
     emit_consts(sb, p, src, c, g)                    // consts + its unconditional trailing blank
     // closure_fns: empty for hello.
     emit_fn_defs(sb, p, src, c, g)
-    // method_defs / impl_defs: empty for hello.
+    emit_method_defs(sb, p, src, c, g)               // method bodies after the free fns
+    // impl_defs: empty until traits land.
     emit_main_wrapper(sb, p, src)
 }
 
