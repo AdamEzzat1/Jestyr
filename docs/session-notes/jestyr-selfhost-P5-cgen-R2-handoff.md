@@ -207,7 +207,35 @@ kind 22 is span-only; typeck golden shims skip interp Names — a parser+typeck+
 records.jtr = struct METHODS (protos/defs + `p.m()` sugar via typeck `mcalls`) — the next
 medium chunk; guards.jtr = guarded match + GENERIC-ENUM instances (Option(i32) mono).
 
-### NEXT increments — everything still remaining (the session-15+ worklist)
+### Increments 15–16 — struct methods; guarded match + generic-enum instances (`a53fc00`, `9ec6abe`, allowlist 33)
+
+**15 — struct methods** (+`records`, `docs`). Resolution is structural: a Call whose callee is a
+Field types the receiver via the Checker (`expr_struct_row`: Named TyData → tdecl kind 0), finds
+the struct item, and scans its `mar` **tag-1** members for the method's fn item. Instances collect
+into `Cg.mi` as (struct item, method fn item) pairs by expr-arena scan (creation order ≈ body
+order in one file). Sections: protos in the `method_protos` slot, defs after the free fns;
+`emit_method_sig` renders `self` as a real first param (`Jestyr_<S>[* restrict] j_self`). Bodies
+set `Cg.self_ptr` so SelfValue (kind 19) → `j_self` / `(*j_self)`. Call sites emit
+`jestyr_<S>_<m>(recv, args)` with `&(recv)` for a `mut`/`out self` and **param 0 = self** offsetting
+the arg-convention lookup.
+
+**16 — guarded match + generic-enum instances** (+`guards`). The first monomorphization step:
+`collect_genum_instances` scans the Checker's per-expr types for kind-6 TyData whose ctor names an
+enum item with all-concrete args (deduped by rendered C name, expression order — mirroring
+`collect_enum_instances`' `expr_types` pass; the reference's follow-up fn-signature pass is
+deferred). Kind 6 renders `Jestyr_<ctor>__<arg mangles>` in **both** renderers, and AST App (kind 7)
+matches so annotations and values agree. `emit_gen_forward_types` emits a **conditional** trailing
+blank (unlike `forward_types`'). `emit_gen_enum_defs` substitutes payload field types through the
+enum's tparam→arg map (`emit_field_ty_subst`). Variant construction picks the instance name from
+the construct expression's own type (`emit_gvariant_head`). For the match: `emit_match` resolves a
+shared `pfx` (plain `Jestyr_<E>` or the instance name) used as both the scrutinee C type and the
+tag prefix, and dispatches to `emit_guarded_match` when **any** arm has a guard — an ordered
+if-chain that re-tests the tag per arm so a false guard falls through to the next arm; statement
+position `goto`s a shared `jm_end_{n+1}`, return position closes `__builtin_unreachable()` unless
+an unguarded catch-all exists. **It consumes TWO temps** (scrutinee + end label) exactly like the
+reference — the global counter must stay in lockstep or every later temp desyncs.
+
+### NEXT increments — everything still remaining (the session-17+ worklist)
 
 Allowlist is 15/130 (hello, bench_fib, eq_fold, distinct, compute, copy_optin, io, str_ops,
 substr, union, tests_demo, loops, slices, array_lit, errors); grow it file-by-file (`DUMP_DIVERGE=1` to converge;
