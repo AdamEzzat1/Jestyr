@@ -961,6 +961,10 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         string_push(sb, ".ok; })")
         return
     }
+    if e.kind == 22 {                                 // FString: the _fs{n} push chain
+        emit_fstring(sb, p, src, c, g, e)
+        return
+    }
     if e.kind == 10 {                                 // Call
         emit_call(sb, p, src, c, g, e, eid)
         return
@@ -1031,6 +1035,153 @@ fn intrinsic_helper_byref(read nm: str) -> str {
     if str_eq(nm, "builder_build") { return "jestyr_rt_b_build" }
     if str_eq(nm, "builder_free") { return "jestyr_rt_b_free" }
     return ""
+}
+
+
+// An f-string (a single lexer token; the node is span-only) lowers to the reference's
+// statement-expression push chain: `({ JestyrString _fs{n} = jestyr_rt_str_new(); …; _fs{n}; })`.
+// The token text is re-scanned from src (like the parser dump does): literal runs push
+// `JSTR("…")` verbatim; a `{name}` interp pushes by the name's TYPE — str directly, String via
+// str_view, bool via a ternary, anything else as decimal via str_push_i64. Interp names resolve
+// against the CURRENT fn's params and (annotated or inferred) lets — corpus interps are bare
+// names; general sub-expressions would need parser support (kind-22 is span-only).
+fn emit_fstring(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData) {
+    let n: i32 = g.tmp
+    g.tmp = g.tmp + 1
+    string_push(sb, "({ JestyrString _fs")
+    push_uint(sb, n as i64)
+    string_push(sb, " = jestyr_rt_str_new(); ")
+    var i: usize = e.start + 2                        // skip `f"`
+    var part_start: usize = i
+    for i < e.end - 1 {
+        if str_eq(src[i .. i + 1], "{") {
+            if i > part_start {                       // flush the literal run before the interp
+                string_push(sb, "jestyr_rt_str_push(&_fs")
+                push_uint(sb, n as i64)
+                string_push(sb, ", JSTR(\"")
+                string_push(sb, src[part_start .. i])
+                string_push(sb, "\")); ")
+            }
+            var j: usize = i + 1
+            for j < e.end - 1 {
+                if str_eq(src[j .. j + 1], "}") { break }
+                j = j + 1
+            }
+            emit_fstring_interp(sb, p, src, c, g, n, i + 1, j)
+            i = j + 1
+            part_start = i
+        } else {
+            i = i + 1
+        }
+    }
+    if i > part_start {                               // the trailing literal run
+        string_push(sb, "jestyr_rt_str_push(&_fs")
+        push_uint(sb, n as i64)
+        string_push(sb, ", JSTR(\"")
+        string_push(sb, src[part_start .. i])
+        string_push(sb, "\")); ")
+    }
+    string_push(sb, "_fs")
+    push_uint(sb, n as i64)
+    string_push(sb, "; })")
+}
+
+// One `{name}` interpolation: emit the push matching the name's type category.
+fn emit_fstring_interp(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, n: i32, ns: usize, ne: usize) {
+    let cat: i32 = fstring_cat(p, src, c, g, ns, ne)
+    if cat == 0 {                                     // str: push the view directly
+        string_push(sb, "jestyr_rt_str_push(&_fs")
+        push_uint(sb, n as i64)
+        string_push(sb, ", ")
+        emit_fstring_name(sb, src, g, ns, ne)
+        string_push(sb, "); ")
+        return
+    }
+    if cat == 1 {                                     // String: borrow as a view first
+        string_push(sb, "jestyr_rt_str_push(&_fs")
+        push_uint(sb, n as i64)
+        string_push(sb, ", jestyr_rt_str_view(&")
+        emit_fstring_name(sb, src, g, ns, ne)
+        string_push(sb, ")); ")
+        return
+    }
+    if cat == 2 {                                     // bool: a true/false ternary
+        string_push(sb, "jestyr_rt_str_push(&_fs")
+        push_uint(sb, n as i64)
+        string_push(sb, ", (")
+        emit_fstring_name(sb, src, g, ns, ne)
+        string_push(sb, ") ? JSTR(\"true\") : JSTR(\"false\")); ")
+        return
+    }
+    string_push(sb, "jestyr_rt_str_push_i64(&_fs")    // integers (and the fallback): decimal
+    push_uint(sb, n as i64)
+    string_push(sb, ", (int64_t)(")
+    emit_fstring_name(sb, src, g, ns, ne)
+    string_push(sb, ")); ")
+}
+
+// An interp name as a C value (`j_<name>`, `(*j_<name>)` for a by-pointer param).
+fn emit_fstring_name(mut sb: String, read src: str, read g: Cg, ns: usize, ne: usize) {
+    if is_ptr_name(g, src, ns, ne) {
+        string_push(sb, "(*j_")
+        string_push(sb, src[ns .. ne])
+        string_push(sb, ")")
+        return
+    }
+    string_push(sb, "j_")
+    string_push(sb, src[ns .. ne])
+}
+
+// The type CATEGORY of interp name `src[ns..ne]` in the current fn: 0 str, 1 String, 2 bool,
+// 3 other (decimal). Params first, then `let`/`var` statements whose span lies inside the fn
+// (annotation text, else the init's Checker prim: 14 str, 17 String, 12 bool).
+fn fstring_cat(read p: parser.Parser, read src: str, read c: typeck.Checker, read g: Cg, ns: usize, ne: usize) -> i32 {
+    if g.curfn < 0 { return 3 }
+    let fd: parser.ItemData = list.get(parser.ItemData, p.it, g.curfn as usize)
+    var i: i32 = 0
+    for i < fd.b {
+        let base: i32 = fd.a + i * 7
+        let pns: i32 = list.get(i32, p.iar, (base + 2) as usize)
+        let pne: i32 = list.get(i32, p.iar, (base + 3) as usize)
+        if str_eq(src[ns .. ne], src[pns as usize .. pne as usize]) {
+            return ast_ty_cat(p, src, list.get(i32, p.iar, (base + 5) as usize))
+        }
+        i = i + 1
+    }
+    var si: usize = 0
+    for si < list.len(parser.StmtData, p.st) {
+        let sd: parser.StmtData = list.get(parser.StmtData, p.st, si)
+        if sd.kind == 0 and sd.start >= fd.start and sd.end <= fd.end {
+            if str_eq(src[ns .. ne], src[sd.x as usize .. sd.y as usize]) {
+                if sd.ty >= 0 { return ast_ty_cat(p, src, sd.ty) }
+                if sd.a >= 0 {
+                    let tid: i32 = list.get(i32, c.et, sd.a as usize)
+                    if tid >= 0 {
+                        let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+                        if d.kind == 2 {
+                            if d.x == 14 { return 0 }
+                            if d.x == 17 { return 1 }
+                            if d.x == 12 { return 2 }
+                        }
+                    }
+                }
+                return 3
+            }
+        }
+        si = si + 1
+    }
+    return 3
+}
+
+// The interp category of an AST type annotation (a bare Name node's text).
+fn ast_ty_cat(read p: parser.Parser, read src: str, tyid: i32) -> i32 {
+    if tyid < 0 { return 3 }
+    let t: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
+    if t.kind != 0 { return 3 }
+    if str_eq(src[t.start .. t.end], "str") { return 0 }
+    if str_eq(src[t.start .. t.end], "String") { return 1 }
+    if str_eq(src[t.start .. t.end], "bool") { return 2 }
+    return 3
 }
 
 // A call. Intrinsics (see `intrinsic_helper`) lower to `<helper>(<args>)`; `size_of(T)` lowers to
@@ -1481,7 +1632,7 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // `(*j_<name>)`; a `for mut x in xs` binding joins temporarily. `rf` is the refinement stack:
 // (ns, ne, range `ExprId`) triples for each enclosing exclusive `for i in 0..s.len` loop, so a
 // provably-in-range `s[i]` elides its bounds check (mirrors `cur_refines`/`index_in_range`).
-struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32) }
+struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32 }
 
 // The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
 // (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
@@ -2455,6 +2606,7 @@ fn emit_method_defs(mut sb: String, read p: parser.Parser, read src: str, read c
         let sconv: i32 = method_self_conv(p, fid)
         g.self_ptr = sconv == 2 or sconv == 4
         g.retty = fd.z
+        g.curfn = fid
         emit_body(sb, p, src, c, g, fd.w, fd.z >= 0, 0)
         g.self_ptr = false
         g.retty = 0 - 1
@@ -3073,6 +3225,7 @@ fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str, read c: ty
             // fallible. It always "returns a value" (the result struct), even for a unit ok type.
             let fallible: bool = fn_is_fallible(p, it)
             if fallible { g.res_ok = it.z } else { g.res_ok = 0 - 2 }
+            g.curfn = iid
             let returns_value: bool = it.z >= 0 or fallible
             emit_body(sb, p, src, c, g, it.w, returns_value, 0)   // w = body Block ExprId; fn body at depth 0
             g.res_ok = 0 - 2
@@ -3109,7 +3262,7 @@ fn emit_main_wrapper(mut sb: String, read p: parser.Parser, read src: str) {
 // `"\n"` pushes stand in for the reference's unconditionally-blank sections that are empty for a
 // program with no aggregates (closure_types, method_protos, consts) plus the guarded no-ops.
 fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator) {
-    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a) }
+    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1 }
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     collect_method_instances(g, p, src, c)           // (struct item, method fn item) pairs, first-seen
     collect_genum_instances(g, p, src, c)            // generic-enum instance TyIds, expr order
