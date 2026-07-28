@@ -1795,6 +1795,16 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         }
         // Plain user function: mangle to `jestyr_<name>`. A `mut`/`out` parameter takes the
         // argument by address (`&(arg)`), so look up the callee's param conventions.
+        // A call to a generic template monomorphizes: `jestyr_<name>__<mangles>` with the
+        // comptime type args erased (mirrors `emit_generic_call`).
+        let ufit: i32 = find_fn_item(p, src, nm)
+        if ufit >= 0 {
+            let uf: parser.ItemData = list.get(parser.ItemData, p.it, ufit as usize)
+            if fn_is_gen(p, uf) {
+                emit_generic_call(sb, p, src, c, g, e, ufit)
+                return
+            }
+        }
         string_push(sb, "jestyr_")
         string_push(sb, nm)
         emit_user_args(sb, p, src, c, g, e, nm)
@@ -1976,7 +1986,10 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // current loop's hoisted `variant`-tracker (ExprId, temp) pairs with `vtf` the active loop's
 // floor (the reference REPLACES `variant_trackers` per loop; the floor models that on a flat
 // list, and inner loops save/restore both).
-struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32 }
+// `gfi` holds the collected generic-fn instance records ([fn item, argc, (kind,a,b) targ
+// triples…], variable length — walk with a cursor); `su` is the ACTIVE instance's
+// type-parameter substitution (5-tuples: tparam span + arg triple), read by `emit_su_ty`.
+struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32) }
 
 // The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
 // (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
@@ -2057,6 +2070,454 @@ fn is_ptr_name(read g: Cg, read src: str, ns: usize, ne: usize) -> bool {
         i = i + 2
     }
     return false
+}
+
+// ---- generic-FUNCTION monomorphization (mirrors collect_all_instances / mangle / make_subst /
+// emit_generic_call — slice 1: free-fn instances found in NON-template bodies; walking instance
+// bodies for nested generic calls, structural unification, and generic-struct methods are later
+// increments) ----
+
+// Is Fn item `it` a monomorphizable generic template — bracket `[T]` generics or a `comptime
+// T: type` parameter? (A comptime VALUE param also suppresses direct emission — fn_is_template —
+// but such a fn is never instantiated; mirrors the reference's `generics` set.)
+fn fn_is_gen(read p: parser.Parser, read it: parser.ItemData) -> bool {
+    if it.h > 0 { return true }
+    var i: i32 = 0
+    for i < it.b {
+        let base: i32 = it.a + i * 7
+        if list.get(i32, p.iar, base as usize) == 1 {
+            let pty: i32 = list.get(i32, p.iar, (base + 5) as usize)
+            if pty >= 0 {
+                let t: parser.TypeData = list.get(parser.TypeData, p.ty, pty as usize)
+                if t.kind == 1 { return true }        // `comptime T: type`
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// One instance type argument as a (kind, a, b) triple: kind 0 = an explicit bare-Name comptime
+// type arg (a,b = its source span), kind 1 = an inferred Checker TyId (a), kind 2 = unresolved
+// (mangles `x`, like the reference's Ty::Unknown).
+fn push_targ_mangle(mut sb: String, read src: str, read c: typeck.Checker, kind: i32, a: i32, b: i32) {
+    if kind == 0 { string_push(sb, src[a as usize .. b as usize])  return }
+    if kind == 1 { push_ty_mangle(sb, src, c, a)  return }
+    string_push(sb, "x")
+}
+fn emit_targ_cty(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, kind: i32, a: i32, b: i32) {
+    if kind == 0 {
+        let tn: str = src[a as usize .. b as usize]
+        let pc: str = c_prim(tn)
+        if !str_eq(pc, "") { string_push(sb, pc) } else { string_push(sb, "Jestyr_")  string_push(sb, tn) }
+        return
+    }
+    if kind == 1 { emit_ty_c(sb, src, c, a)  return }
+    string_push(sb, "int")
+}
+
+// Like `emit_c_ty`, but a bare Name matching the active type-parameter substitution (`g.su`
+// 5-tuples: tparam span, then the arg triple) renders the instance's concrete C type. Used for
+// instance SIGNATURES; template-body lets under subst are a later increment.
+fn emit_su_ty(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, read g: Cg, tyid: i32) {
+    if tyid >= 0 {
+        let t: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
+        if t.kind == 0 {
+            var i: usize = 0
+            for i < list.len(i32, g.su) {
+                let ns: i32 = list.get(i32, g.su, i)
+                let ne: i32 = list.get(i32, g.su, i + 1)
+                if str_eq(src[t.start .. t.end], src[ns as usize .. ne as usize]) {
+                    emit_targ_cty(sb, p, src, c, list.get(i32, g.su, i + 2), list.get(i32, g.su, i + 3), list.get(i32, g.su, i + 4))
+                    return
+                }
+                i = i + 5
+            }
+        }
+    }
+    emit_c_ty(sb, p, src, tyid)
+}
+
+// A generic CALL's type arguments in instance order — explicit comptime type args (bare-Name
+// exprs at the comptime-type param positions) first, then each bracket param inferred by
+// unifying the params' bare-Name annotations against the args' Checker types (first bind wins;
+// structural unification through slices/pointers is a later increment). Appends (kind, a, b)
+// triples to `dst`; returns the count. Mirrors `emit_generic_call`'s targ assembly +
+// `infer_bracket_args`.
+fn gcall_targs(mut dst: List(i32), read p: parser.Parser, read src: str, read c: typeck.Checker, fit: i32, read e: parser.ExprData) -> i32 {
+    let f: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
+    var count: i32 = 0
+    var i: i32 = 0
+    for i < f.b {
+        let base: i32 = f.a + i * 7
+        if list.get(i32, p.iar, base as usize) == 1 {
+            let pty: i32 = list.get(i32, p.iar, (base + 5) as usize)
+            if pty >= 0 {
+                let t: parser.TypeData = list.get(parser.TypeData, p.ty, pty as usize)
+                if t.kind == 1 and i < e.y {
+                    let ax: parser.ExprData = list.get(parser.ExprData, p.ex, arg_at(p, e, i) as usize)
+                    if ax.kind == 2 {
+                        list.push(i32, dst, 0)
+                        list.push(i32, dst, ax.start as i32)
+                        list.push(i32, dst, ax.end as i32)
+                    } else {
+                        list.push(i32, dst, 2)
+                        list.push(i32, dst, 0 - 1)
+                        list.push(i32, dst, 0 - 1)
+                    }
+                    count = count + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    var gk: i32 = 0
+    for gk < f.h {                                    // bracket params, declaration order
+        let gb: i32 = f.g + gk * 4
+        let gns: i32 = list.get(i32, p.gar, gb as usize)
+        let gne: i32 = list.get(i32, p.gar, (gb + 1) as usize)
+        var bkind: i32 = 2
+        var ba: i32 = 0 - 1
+        var pi: i32 = 0
+        for pi < f.b {
+            let pb: i32 = f.a + pi * 7
+            let pty: i32 = list.get(i32, p.iar, (pb + 5) as usize)
+            if bkind == 2 and pty >= 0 and pi < e.y and list.get(i32, p.iar, pb as usize) == 0 {
+                let t: parser.TypeData = list.get(parser.TypeData, p.ty, pty as usize)
+                if t.kind == 0 {
+                    if str_eq(src[t.start .. t.end], src[gns as usize .. gne as usize]) {
+                        let atid: i32 = list.get(i32, c.et, arg_at(p, e, pi) as usize)
+                        if atid >= 0 { bkind = 1  ba = atid }
+                    }
+                }
+            }
+            pi = pi + 1
+        }
+        list.push(i32, dst, bkind)
+        list.push(i32, dst, ba)
+        list.push(i32, dst, 0 - 1)
+        count = count + 1
+        gk = gk + 1
+    }
+    return count
+}
+
+// The mangled C name `jestyr_<name>__<m0>_<m1>…` of the instance record at `lst[rb..]`
+// ([fn item, argc, (kind,a,b)…] — the shared shape of the worklist and `g.gfi`).
+fn push_gfn_name(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, read lst: List(i32), rb: i32) {
+    let fit: i32 = list.get(i32, lst, rb as usize)
+    let f: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
+    string_push(sb, "jestyr_")
+    string_push(sb, src[f.x .. f.y])
+    string_push(sb, "__")
+    let argc: i32 = list.get(i32, lst, (rb + 1) as usize)
+    var i: i32 = 0
+    for i < argc {
+        if i > 0 { string_push(sb, "_") }
+        let ab: i32 = rb + 2 + i * 3
+        push_targ_mangle(sb, src, c, list.get(i32, lst, ab as usize), list.get(i32, lst, (ab + 1) as usize), list.get(i32, lst, (ab + 2) as usize))
+        i = i + 1
+    }
+}
+
+// If Call `e` targets a generic template, append its instance record to the worklist.
+fn gfind_call_check(mut wk: List(i32), mut wks: List(i32), read p: parser.Parser, read src: str, read c: typeck.Checker, read e: parser.ExprData) {
+    let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+    if callee.kind != 2 { return }
+    let fit: i32 = find_fn_item(p, src, src[callee.start .. callee.end])
+    if fit < 0 { return }
+    let f: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
+    if !fn_is_gen(p, f) { return }
+    let rb: i32 = list.len(i32, wk) as i32
+    list.push(i32, wk, fit)
+    list.push(i32, wk, 0)
+    let argc: i32 = gcall_targs(wk, p, src, c, fit, e)
+    list.set(i32, wk, (rb + 1) as usize, argc)
+    list.push(i32, wks, rb)
+}
+
+fn gfind_expr(mut wk: List(i32), mut wks: List(i32), read p: parser.Parser, read src: str, read c: typeck.Checker, eid: i32) {
+    if eid < 0 { return }
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
+    if e.kind == 10 {                                 // Call: recurse callee + args FIRST, then check
+        gfind_expr(wk, wks, p, src, c, e.a)
+        var i: i32 = 0
+        for i < e.y {
+            gfind_expr(wk, wks, p, src, c, list.get(i32, p.ar, (e.x + i) as usize))
+            i = i + 1
+        }
+        gfind_call_check(wk, wks, p, src, c, e)
+        return
+    }
+    if e.kind == 4 or e.kind == 6 or e.kind == 12 {   // Binary / Index / Assign
+        gfind_expr(wk, wks, p, src, c, e.a)
+        gfind_expr(wk, wks, p, src, c, e.b)
+        return
+    }
+    if e.kind == 3 or e.kind == 5 or e.kind == 7 or e.kind == 8 or e.kind == 11 or e.kind == 34 or e.kind == 35 {
+        gfind_expr(wk, wks, p, src, c, e.a)
+        return
+    }
+    if e.kind == 13 {
+        if e.a >= 0 { gfind_expr(wk, wks, p, src, c, e.a) }
+        if e.b >= 0 { gfind_expr(wk, wks, p, src, c, e.b) }
+        return
+    }
+    if e.kind == 16 {                                 // StructLit fields + spread
+        var i: i32 = 0
+        for i < e.y {
+            let fi_: parser.ExprData = list.get(parser.ExprData, p.ex, list.get(i32, p.ar, (e.x + i) as usize) as usize)
+            gfind_expr(wk, wks, p, src, c, fi_.a)
+            i = i + 1
+        }
+        if e.b >= 0 { gfind_expr(wk, wks, p, src, c, e.b) }
+        return
+    }
+    if e.kind == 17 {                                 // GenStructLit fields
+        var i: i32 = 0
+        for i < e.y {
+            let fi_: parser.ExprData = list.get(parser.ExprData, p.ex, list.get(i32, p.ar, (e.b + i) as usize) as usize)
+            gfind_expr(wk, wks, p, src, c, fi_.a)
+            i = i + 1
+        }
+        return
+    }
+    if e.kind == 24 {                                 // If
+        gfind_expr(wk, wks, p, src, c, e.a)
+        gfind_block(wk, wks, p, src, c, e.b)
+        if e.op >= 0 { gfind_expr(wk, wks, p, src, c, e.op) }
+        return
+    }
+    if e.kind == 23 { gfind_block(wk, wks, p, src, c, eid)  return }
+    if e.kind == 25 or e.kind == 43 { gfind_block(wk, wks, p, src, c, e.a)  return }   // Unsafe / Region
+    if e.kind == 28 {                                 // Match
+        gfind_expr(wk, wks, p, src, c, e.a)
+        var k: i32 = 0
+        for k < e.y {
+            let ab: i32 = e.x + k * 3
+            let guard: i32 = list.get(i32, p.par, (ab + 1) as usize)
+            if guard >= 0 { gfind_expr(wk, wks, p, src, c, guard) }
+            gfind_expr(wk, wks, p, src, c, list.get(i32, p.par, (ab + 2) as usize))
+            k = k + 1
+        }
+        return
+    }
+    if e.kind == 31 {                                 // For
+        if e.op == 1 { gfind_expr(wk, wks, p, src, c, list.get(i32, p.lar, (e.a + 4) as usize)) }
+        if e.op >= 2 {
+            let bc: i32 = list.get(i32, p.lar, (e.a + 4) as usize)
+            let sc: i32 = list.get(i32, p.lar, (e.a + 5) as usize)
+            var si: i32 = 0
+            for si < sc {
+                gfind_expr(wk, wks, p, src, c, list.get(i32, p.lar, (e.a + 7 + bc * 3 + si) as usize))
+                si = si + 1
+            }
+        }
+        gfind_block(wk, wks, p, src, c, e.b)
+        if e.x >= 0 { gfind_block(wk, wks, p, src, c, e.x) }
+        return
+    }
+}
+
+fn gfind_block(mut wk: List(i32), mut wks: List(i32), read p: parser.Parser, read src: str, read c: typeck.Checker, beid: i32) {
+    let blk: parser.ExprData = list.get(parser.ExprData, p.ex, beid as usize)
+    var i: i32 = 0
+    for i < blk.y {
+        let s: parser.StmtData = list.get(parser.StmtData, p.st, list.get(i32, p.sar, (blk.x + i) as usize) as usize)
+        if s.a >= 0 { gfind_expr(wk, wks, p, src, c, s.a) }
+        i = i + 1
+    }
+}
+
+// Collect every generic-function instance: scan each non-template fn body + concrete
+// impl-method body for template calls (expression order), then drain the worklist LIFO — the
+// reference pops a STACK, so instances land in REVERSE discovery order — deduping on the
+// mangled name into `g.gfi`.
+fn collect_gfn_instances(mut g: Cg, read p: parser.Parser, read src: str, read c: typeck.Checker, read a: Allocator) {
+    var wk: List(i32) = list.make(i32, a)
+    var wks: List(i32) = list.make(i32, a)
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 3 and !fn_is_template(p, it) { gfind_block(wk, wks, p, src, c, it.w) }
+        if it.kind == 7 and it.h <= 0 {
+            var k: i32 = 0
+            for k < it.z {
+                let fd: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, p.mar, (it.b + k) as usize) as usize)
+                gfind_block(wk, wks, p, src, c, fd.w)
+                k = k + 1
+            }
+        }
+        r = r + 1
+    }
+    var seen: String = string_new()
+    for list.len(i32, wks) > 0 {
+        let rb: i32 = list.get(i32, wks, list.len(i32, wks) - 1)
+        list.truncate(i32, wks, list.len(i32, wks) - 1)
+        var probe: String = string_new()
+        string_push(probe, "|")
+        push_gfn_name(probe, p, src, c, wk, rb)
+        string_push(probe, "|")
+        if !contains(string_view(seen), string_view(probe)) {
+            string_push(seen, string_view(probe))
+            let argc: i32 = list.get(i32, wk, (rb + 1) as usize)
+            var t: i32 = 0
+            for t < 2 + argc * 3 {
+                list.push(i32, g.gfi, list.get(i32, wk, (rb + t) as usize))
+                t = t + 1
+            }
+        }
+        string_free(probe)
+    }
+    string_free(seen)
+}
+
+// The instance's signature `<ret> jestyr_<name>__<mangles>(<params>)` under its substitution:
+// arms `g.su` (tparam spans in instance order — comptime-type names, then brackets — zipped
+// with the record's arg triples) and leaves it set for the body; the caller clears it.
+fn emit_gfn_sig(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, rb: i32) {
+    let fit: i32 = list.get(i32, g.gfi, rb as usize)
+    let f: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
+    list.truncate(i32, g.su, 0)
+    var ai: i32 = 0
+    var i: i32 = 0
+    for i < f.b {                                     // comptime-type param names first
+        let base: i32 = f.a + i * 7
+        if list.get(i32, p.iar, base as usize) == 1 {
+            let pty: i32 = list.get(i32, p.iar, (base + 5) as usize)
+            if pty >= 0 {
+                let t: parser.TypeData = list.get(parser.TypeData, p.ty, pty as usize)
+                if t.kind == 1 {
+                    let ab: i32 = rb + 2 + ai * 3
+                    list.push(i32, g.su, list.get(i32, p.iar, (base + 2) as usize))
+                    list.push(i32, g.su, list.get(i32, p.iar, (base + 3) as usize))
+                    list.push(i32, g.su, list.get(i32, g.gfi, ab as usize))
+                    list.push(i32, g.su, list.get(i32, g.gfi, (ab + 1) as usize))
+                    list.push(i32, g.su, list.get(i32, g.gfi, (ab + 2) as usize))
+                    ai = ai + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    var gk: i32 = 0
+    for gk < f.h {                                    // then the bracket params
+        let gb: i32 = f.g + gk * 4
+        let ab: i32 = rb + 2 + ai * 3
+        list.push(i32, g.su, list.get(i32, p.gar, gb as usize))
+        list.push(i32, g.su, list.get(i32, p.gar, (gb + 1) as usize))
+        list.push(i32, g.su, list.get(i32, g.gfi, ab as usize))
+        list.push(i32, g.su, list.get(i32, g.gfi, (ab + 1) as usize))
+        list.push(i32, g.su, list.get(i32, g.gfi, (ab + 2) as usize))
+        ai = ai + 1
+        gk = gk + 1
+    }
+    emit_su_ty(sb, p, src, c, g, f.z)
+    string_push(sb, " ")
+    push_gfn_name(sb, p, src, c, g.gfi, rb)
+    string_push(sb, "(")
+    var emitted: i32 = 0
+    var pi: i32 = 0
+    for pi < f.b {
+        let base: i32 = f.a + pi * 7
+        if list.get(i32, p.iar, base as usize) == 0 and list.get(i32, p.iar, (base + 4) as usize) == 0 {
+            if emitted > 0 { string_push(sb, ", ") }
+            let conv: i32 = list.get(i32, p.iar, (base + 1) as usize)
+            emit_su_ty(sb, p, src, c, g, list.get(i32, p.iar, (base + 5) as usize))
+            if conv == 2 or conv == 4 { string_push(sb, "* restrict") }
+            string_push(sb, " j_")
+            string_push(sb, src[list.get(i32, p.iar, (base + 2) as usize) as usize .. list.get(i32, p.iar, (base + 3) as usize) as usize])
+            emitted = emitted + 1
+        }
+        pi = pi + 1
+    }
+    if emitted == 0 { string_push(sb, "void") }
+    string_push(sb, ")")
+}
+
+// A generic call site: `jestyr_<name>__<mangles>(<args sans comptime-type args>)`, `mut`/`out`
+// args by address. The mangle recomputation must agree with `gcall_targs` exactly.
+fn emit_generic_call(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, fit: i32) {
+    let f: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
+    string_push(sb, "jestyr_")
+    string_push(sb, src[f.x .. f.y])
+    string_push(sb, "__")
+    var emitted: i32 = 0
+    var i: i32 = 0
+    for i < f.b {                                     // explicit comptime type args
+        let base: i32 = f.a + i * 7
+        if list.get(i32, p.iar, base as usize) == 1 {
+            let pty: i32 = list.get(i32, p.iar, (base + 5) as usize)
+            if pty >= 0 {
+                let t: parser.TypeData = list.get(parser.TypeData, p.ty, pty as usize)
+                if t.kind == 1 and i < e.y {
+                    if emitted > 0 { string_push(sb, "_") }
+                    let ax: parser.ExprData = list.get(parser.ExprData, p.ex, arg_at(p, e, i) as usize)
+                    if ax.kind == 2 { string_push(sb, src[ax.start .. ax.end]) } else { string_push(sb, "x") }
+                    emitted = emitted + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    var gk: i32 = 0
+    for gk < f.h {                                    // inferred bracket args
+        let gb: i32 = f.g + gk * 4
+        let gns: i32 = list.get(i32, p.gar, gb as usize)
+        let gne: i32 = list.get(i32, p.gar, (gb + 1) as usize)
+        var bound: i32 = 0 - 1
+        var pi: i32 = 0
+        for pi < f.b {
+            let pb: i32 = f.a + pi * 7
+            let pty: i32 = list.get(i32, p.iar, (pb + 5) as usize)
+            if bound < 0 and pty >= 0 and pi < e.y and list.get(i32, p.iar, pb as usize) == 0 {
+                let t: parser.TypeData = list.get(parser.TypeData, p.ty, pty as usize)
+                if t.kind == 0 {
+                    if str_eq(src[t.start .. t.end], src[gns as usize .. gne as usize]) {
+                        let atid: i32 = list.get(i32, c.et, arg_at(p, e, pi) as usize)
+                        if atid >= 0 { bound = atid }
+                    }
+                }
+            }
+            pi = pi + 1
+        }
+        if emitted > 0 { string_push(sb, "_") }
+        if bound >= 0 { push_ty_mangle(sb, src, c, bound) } else { string_push(sb, "x") }
+        emitted = emitted + 1
+        gk = gk + 1
+    }
+    string_push(sb, "(")
+    var wrote: i32 = 0
+    var aidx: i32 = 0
+    for aidx < e.y {
+        var is_targ: bool = false
+        if aidx < f.b {
+            let pb: i32 = f.a + aidx * 7
+            if list.get(i32, p.iar, pb as usize) == 1 {
+                let pty: i32 = list.get(i32, p.iar, (pb + 5) as usize)
+                if pty >= 0 {
+                    let t: parser.TypeData = list.get(parser.TypeData, p.ty, pty as usize)
+                    if t.kind == 1 { is_targ = true }  // a type argument — erased
+                }
+            }
+        }
+        if !is_targ {
+            if wrote > 0 { string_push(sb, ", ") }
+            var conv: i32 = 0
+            if aidx < f.b { conv = list.get(i32, p.iar, (f.a + aidx * 7 + 1) as usize) }
+            if conv == 2 or conv == 4 {
+                string_push(sb, "&(")
+                emit_expr(sb, p, src, c, g, arg_at(p, e, aidx))
+                string_push(sb, ")")
+            } else {
+                emit_expr(sb, p, src, c, g, arg_at(p, e, aidx))
+            }
+            wrote = wrote + 1
+        }
+        aidx = aidx + 1
+    }
+    string_push(sb, ")")
 }
 
 // ---- RAII drop glue (mirrors needs_drop / emit_drop_place / emit_all_drops / collect_moved) ----
@@ -4661,8 +5122,9 @@ fn emit_result_defs(mut sb: String, read p: parser.Parser, read src: str) {
     string_push(sb, "\n")
 }
 
-// Function prototypes: one `<sig>;` per non-generic, backend-supported function, then a blank.
-fn emit_fn_protos(mut sb: String, read p: parser.Parser, read src: str) {
+// Function prototypes: one `<sig>;` per non-generic, backend-supported function, then one per
+// monomorphized generic instance (subst-aware sig), then the unconditional blank.
+fn emit_fn_protos(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg) {
     var r: i32 = 0
     for r < list.len(i32, p.roots) {
         let iid: i32 = list.get(i32, p.roots, r)
@@ -4672,6 +5134,13 @@ fn emit_fn_protos(mut sb: String, read p: parser.Parser, read src: str) {
             string_push(sb, ";\n")
         }
         r = r + 1
+    }
+    var gi: i32 = 0
+    for (gi as usize) < list.len(i32, g.gfi) {
+        emit_gfn_sig(sb, p, src, c, g, gi)
+        string_push(sb, ";\n")
+        list.truncate(i32, g.su, 0)
+        gi = gi + 2 + list.get(i32, g.gfi, (gi + 1) as usize) * 3
     }
     string_push(sb, "\n")
 }
@@ -4747,6 +5216,66 @@ fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str, read c: ty
         }
         r = r + 1
     }
+    // Monomorphized generic-fn instance definitions, after the regular fns (mirrors the
+    // instance loop at the end of `fn_defs`): sig under the instance substitution + body.
+    var gi: i32 = 0
+    for (gi as usize) < list.len(i32, g.gfi) {
+        let fit: i32 = list.get(i32, g.gfi, gi as usize)
+        let fd: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
+        emit_gfn_sig(sb, p, src, c, g, gi)            // arms g.su for the body too
+        string_push(sb, "\n")
+        list.truncate(i32, g.pp, 0)
+        var pi: i32 = 0
+        for pi < fd.b {
+            let pbase: i32 = fd.a + pi * 7
+            let pconv: i32 = list.get(i32, p.iar, (pbase + 1) as usize)
+            if list.get(i32, p.iar, pbase as usize) == 0 and (pconv == 2 or pconv == 4) {
+                list.push(i32, g.pp, list.get(i32, p.iar, (pbase + 2) as usize))
+                list.push(i32, g.pp, list.get(i32, p.iar, (pbase + 3) as usize))
+            }
+            pi = pi + 1
+        }
+        let rfloor: usize = list.len(i32, g.rf)
+        var ri: i32 = 0
+        for ri < fd.b {
+            let rbase: i32 = fd.a + ri * 7
+            let refine: i32 = list.get(i32, p.iar, (rbase + 6) as usize)
+            if refine >= 0 {
+                list.push(i32, g.rf, list.get(i32, p.iar, (rbase + 2) as usize))
+                list.push(i32, g.rf, list.get(i32, p.iar, (rbase + 3) as usize))
+                list.push(i32, g.rf, refine)
+            }
+            ri = ri + 1
+        }
+        list.truncate(i32, g.req, 0)
+        list.truncate(i32, g.ens, 0)
+        if fd.e >= 0 {
+            let ecount: i32 = list.get(i32, p.far, fd.e as usize)
+            let rq: i32 = fd.e + 1 + ecount * 2
+            let rqc: i32 = list.get(i32, p.far, rq as usize)
+            var qi: i32 = 0
+            for qi < rqc { list.push(i32, g.req, list.get(i32, p.far, (rq + 1 + qi) as usize))  qi = qi + 1 }
+            let enp: i32 = rq + 1 + rqc
+            let enc: i32 = list.get(i32, p.far, enp as usize)
+            var ei: i32 = 0
+            for ei < enc { list.push(i32, g.ens, list.get(i32, p.far, (enp + 1 + ei) as usize))  ei = ei + 1 }
+        }
+        g.retty = fd.z
+        let gfallible: bool = fn_is_fallible(p, fd)
+        if gfallible { g.res_ok = fd.z } else { g.res_ok = 0 - 2 }
+        g.curfn = fit
+        list.truncate(i32, g.mv, 0)
+        collect_moved_block(g, p, src, fd.w)          // instances collect moved (mirrors emit_fn)
+        emit_body(sb, p, src, c, g, fd.w, fd.z >= 0 or gfallible, 0)
+        g.res_ok = 0 - 2
+        list.truncate(i32, g.pp, 0)
+        list.truncate(i32, g.rf, rfloor)
+        list.truncate(i32, g.ens, 0)
+        list.truncate(i32, g.mv, 0)
+        list.truncate(i32, g.su, 0)
+        string_push(sb, "\n")
+        gi = gi + 2 + list.get(i32, g.gfi, (gi + 1) as usize) * 3
+    }
 }
 
 // The C `main` wrapper: captures argc/argv into the argv globals, then calls `jestyr_main`.
@@ -4773,10 +5302,11 @@ fn emit_main_wrapper(mut sb: String, read p: parser.Parser, read src: str) {
 // `"\n"` pushes stand in for the reference's unconditionally-blank sections that are empty for a
 // program with no aggregates (closure_types, method_protos, consts) plus the guarded no-ops.
 fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator) {
-    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: list.make(i32, a), vtf: 0 }
+    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: list.make(i32, a), vtf: 0, gfi: list.make(i32, a), su: list.make(i32, a) }
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     collect_method_instances(g, p, src, c)           // (struct item, method fn item) pairs, first-seen
     collect_genum_instances(g, p, src, c)            // generic-enum instance TyIds, expr order
+    collect_gfn_instances(g, p, src, c, a)           // generic-fn instances, LIFO worklist order
     emit_prelude(sb, p, src)
     emit_forward_types(sb, p, src)
     emit_gen_forward_types(sb, p, src, c, g)         // monomorphized generic-enum instance fwd typedefs
@@ -4792,7 +5322,7 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
     // flush_def_capture / dyn_typedefs: no-ops here (no by-value dep reorder needed).
     emit_extern_protos(sb, p, src)                   // `extern "c"` prototypes (bare names)
     string_push(sb, "\n")                            // closure_types: unconditional trailing blank
-    emit_fn_protos(sb, p, src)
+    emit_fn_protos(sb, p, src, c, g)
     emit_method_protos(sb, p, src, c, g)             // method protos + unconditional trailing blank
     emit_impl_protos(sb, p, src)                     // trait-impl protos + CONDITIONAL trailing blank
     // dyn_vtables / spawn_runtime: empty until dyn/concurrency land.
