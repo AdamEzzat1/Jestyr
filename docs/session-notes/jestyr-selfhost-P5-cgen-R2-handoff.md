@@ -346,6 +346,27 @@ the hardest infra — `collect_all_instances` worklist, `mangle`, `make_subst`,
 `emit_generic_call`, monomorphized sigs feeding slice/array instances), then nested/niche
 match, closures, traits/dyn, concurrency, fn-ptr types, test mode.
 
+### Increment 27 — generic-fn monomorphization SLICE 1 (`108075c`, allowlist 54)
+
+**+`bracket_generic`, +`generic` (free win).** The first cut of cluster 6. What's in:
+`fn_is_gen` (brackets OR comptime-TYPE params — mirrors the reference's `generics` set;
+comptime-VALUE templates never instantiate), instance records as (kind,a,b) type-arg triples
+(0 = explicit bare-Name comptime arg span / 1 = inferred Checker TyId / 2 = unresolved → `x`),
+`collect_gfn_instances` (scan non-template fn + concrete impl-method bodies, **LIFO drain — the
+reference pops a stack, instances land in REVERSE discovery order**, mangle-dedup),
+`gcall_targs` (comptime targs first, then brackets unified from bare-Name param annotations vs
+arg Checker types, first bind wins), `emit_su_ty` + `Cg.su` (subst-aware Name rendering — SIG
+use only), instance protos inside `fn_protos` / defs at the end of `fn_defs` (full emit_fn
+wiring incl. collect_moved), and `emit_generic_call` (comptime args erased, mut/out by `&`).
+**Deferred (needed for `generics.jtr` at 99 diff lines, vec_alloc, list/tokens):** walking
+INSTANCE bodies for nested generic calls (a generic calling a generic), structural unification
+(`[]T`/`*T` patterns), template-body `let`s under subst (`emit_c_ty`/`emit_ty_c` are not
+subst-aware inside bodies — the reference threads `self.subst` through `c_ty_ast`/`c_type`),
+monomorphized sigs contributing slice/array instances, generic-struct METHODS (`Work::Method`),
+`qualified`/`call_sym` resolution. Trap fixed en route: a `for k < n` loop missing its
+`k = k + 1` hung on every impl file — Jestyr `for` is while-form; the corpus probe catches
+it as a timeout.
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
