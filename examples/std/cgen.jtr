@@ -945,8 +945,38 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         string_push(sb, ")")
         return
     }
-    if e.kind == 32 { string_push(sb, "break")  return }      // Break (plain; labels later)
-    if e.kind == 33 { string_push(sb, "continue")  return }   // Continue
+    if e.kind == 32 {                                 // Break: labeled -> goto; plain reroutes past an `else`
+        if e.x >= 0 {
+            string_push(sb, "goto ")
+            string_push(sb, src[e.x as usize .. e.y as usize])
+            string_push(sb, "__break")
+            return
+        }
+        if g.bl_fe >= 0 {
+            string_push(sb, "goto _fe")
+            push_uint(sb, g.bl_fe as i64)
+            string_push(sb, "__break")
+            return
+        }
+        if g.bl_ns >= 0 {
+            string_push(sb, "goto ")
+            string_push(sb, src[g.bl_ns as usize .. g.bl_ne as usize])
+            string_push(sb, "__break")
+            return
+        }
+        string_push(sb, "break")
+        return
+    }
+    if e.kind == 33 {                                 // Continue: labeled -> goto its target
+        if e.x >= 0 {
+            string_push(sb, "goto ")
+            string_push(sb, src[e.x as usize .. e.y as usize])
+            string_push(sb, "__continue")
+            return
+        }
+        string_push(sb, "continue")
+        return
+    }
     if e.kind == 7 {                                  // Deref
         let btid: i32 = list.get(i32, c.et, e.a as usize)
         if btid >= 0 {
@@ -1730,7 +1760,12 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // flattened drop-scope stack: 4-int entries (local ns, ne, type-name ns, ne) of live droppable
 // locals; `dsb` holds each open scope's start offset into `ds`. `autoret` marks a method/impl body
 // (the reference's empty `cur_ret_cty`) so a spilled return uses `__auto_type`.
-struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool }
+// `bl_*` is the innermost loop-with-`else` break label a plain `break` must `goto` (the
+// reference's `break_label`): a user label span (`bl_ns`,`bl_ne`) or a synthesized `_fe<bl_fe>`;
+// all -1 when the nearest loop has no `else` (plain C `break` is right). `cl_*` is an armed
+// labeled-loop continue-target span (the reference's `cont_label`), consumed — `.take()` — by
+// the FIRST loop body that closes after arming.
+struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32 }
 
 // The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
 // (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
@@ -2213,7 +2248,7 @@ fn collect_moved_expr(mut g: Cg, read p: parser.Parser, read src: str, eid: i32)
         }
         return
     }
-    if e.kind == 31 {                                 // For: head sources/cond + body
+    if e.kind == 31 {                                 // For: head sources/cond + body + else
         if e.op == 1 { collect_moved_expr(g, p, src, list.get(i32, p.lar, (e.a + 4) as usize)) }
         if e.op >= 2 {
             let bc: i32 = list.get(i32, p.lar, (e.a + 4) as usize)
@@ -2225,6 +2260,7 @@ fn collect_moved_expr(mut g: Cg, read p: parser.Parser, read src: str, eid: i32)
             }
         }
         collect_moved_block(g, p, src, e.b)
+        if e.x >= 0 { collect_moved_block(g, p, src, e.x) }    // the else block
         return
     }
 }
@@ -2878,16 +2914,100 @@ fn push_uint(mut sb: String, v: i64) {
     else if d == 8 { string_push(sb, "8") } else { string_push(sb, "9") }
 }
 
-// A `for` loop statement (kind 31; mirrors `emit_for`/`emit_for_inner`). `op`=head kind:
-// 0=infinite -> `for (;;)`, 1=while -> `while (cond)`, 2=iterate. The `lar` header at `e.a`:
-// [4]=slot A (while: cond; iterate: bind count), [5]=slot B (iterate: source count),
-// [6]=slot C (iterate: step ExprId or -1); iterate binds are (conv, ns, ne) triples at +7,
-// sources follow. Labels / `region` / loop-`else` / zip / slice-str-array iteration are TODO.
+// A loop body (mirrors `emit_loop_body`): like `emit_body(ret=false)` — drop scope included —
+// plus the armed labeled-continue target `<label>__continue: ;` at the bottom (after the drops,
+// before the closing brace), consumed here exactly like the reference's `cont_label.take()`.
+fn emit_loop_body(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, block_eid: i32, depth: i32) {
+    line_at(sb, depth, "{")
+    drop_scope_enter(g)
+    let blk: parser.ExprData = list.get(parser.ExprData, p.ex, block_eid as usize)
+    let n: i32 = blk.y
+    var i: i32 = 0
+    for i < n {
+        emit_stmt(sb, p, src, c, g, list.get(i32, p.sar, (blk.x + i) as usize), depth + 1)
+        i = i + 1
+    }
+    var dv: bool = false
+    if n > 0 {
+        let lsid: i32 = list.get(i32, p.sar, (blk.x + n - 1) as usize)
+        let ls: parser.StmtData = list.get(parser.StmtData, p.st, lsid as usize)
+        if ls.kind == 1 { dv = true }
+    }
+    if dv { drop_scope_exit_discard(g) } else { drop_scope_exit_emit(sb, p, src, g, depth + 1) }
+    emit_cont_target(sb, src, g, depth + 1)
+    line_at(sb, depth, "}")
+}
+
+// Emit + consume the armed labeled-continue target, if any (shared by every loop-body shape).
+fn emit_cont_target(mut sb: String, read src: str, mut g: Cg, depth: i32) {
+    if g.cl_ns >= 0 {
+        indent(sb, depth)
+        string_push(sb, src[g.cl_ns as usize .. g.cl_ne as usize])
+        string_push(sb, "__continue: ;\n")
+        g.cl_ns = 0 - 1
+        g.cl_ne = 0 - 1
+    }
+}
+
+// A `for` loop statement (kind 31; mirrors `emit_for`). The `lar` header at `e.a`:
+// [0,1]=label span (-1 none), [2,3]=region span, [4]=slot A (while: cond; iterate: bind count),
+// [5]=slot B (iterate: source count), [6]=slot C (iterate: step ExprId or -1); iterate binds are
+// (conv, ns, ne) triples at +7, sources follow; `x`=else Block ExprId (-1 none). A labeled loop
+// arms the continue target; a loop with an `else` synthesizes `_fe{n}` (ONE temp, before the
+// head) and reroutes plain `break`s past the `else`; the `<label>__break: ;` target lands after
+// the `else` (or right after the body for a label-only loop). `region` / zip / `step` are TODO.
 fn emit_for(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, eid: i32, depth: i32) {
     let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
+    let lls: i32 = list.get(i32, p.lar, e.a as usize)          // label span
+    let lle: i32 = list.get(i32, p.lar, (e.a + 1) as usize)
+    let els: i32 = e.x                                         // else Block ExprId
+    if lls >= 0 { g.cl_ns = lls  g.cl_ne = lle }               // arm the continue target
+    var fe: i32 = 0 - 1                                        // synthesized else-break label id
+    if lls < 0 and els >= 0 { fe = g.tmp  g.tmp = g.tmp + 1 }
+    // Arm plain-`break` rerouting only for a loop that HAS an `else`; save/restore models
+    // "the nearest loop" across nesting (mirrors `break_label`).
+    let sbl_ns: i32 = g.bl_ns
+    let sbl_ne: i32 = g.bl_ne
+    let sbl_fe: i32 = g.bl_fe
+    g.bl_ns = 0 - 1
+    g.bl_ne = 0 - 1
+    g.bl_fe = 0 - 1
+    if els >= 0 {
+        if lls >= 0 { g.bl_ns = lls  g.bl_ne = lle } else { g.bl_fe = fe }
+    }
+    emit_for_inner(sb, p, src, c, g, e, depth)
+    g.bl_ns = sbl_ns
+    g.bl_ne = sbl_ne
+    g.bl_fe = sbl_fe
+    // The `else` runs on normal completion: between the loop and the break target, so falling
+    // out runs it while a (rerouted) `break` jumps past it. No new drop scope (reference parity).
+    if els >= 0 {
+        line_at(sb, depth, "{")
+        let eb: parser.ExprData = list.get(parser.ExprData, p.ex, els as usize)
+        var i: i32 = 0
+        for i < eb.y {
+            emit_stmt(sb, p, src, c, g, list.get(i32, p.sar, (eb.x + i) as usize), depth + 1)
+            i = i + 1
+        }
+        line_at(sb, depth, "}")
+    }
+    if lls >= 0 {                                              // labeled- and/or else-break target
+        indent(sb, depth)
+        string_push(sb, src[lls as usize .. lle as usize])
+        string_push(sb, "__break: ;\n")
+    } else if fe >= 0 {
+        indent(sb, depth)
+        string_push(sb, "_fe")
+        push_uint(sb, fe as i64)
+        string_push(sb, "__break: ;\n")
+    }
+}
+
+// The head-shape dispatch (mirrors `emit_for_inner`).
+fn emit_for_inner(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, depth: i32) {
     if e.op == 0 {                                    // infinite
         line_at(sb, depth, "for (;;)")
-        emit_body(sb, p, src, c, g, e.b, false, depth)
+        emit_loop_body(sb, p, src, c, g, e.b, depth)
         return
     }
     if e.op == 1 {                                    // conditional -> C while
@@ -2895,7 +3015,7 @@ fn emit_for(mut sb: String, read p: parser.Parser, read src: str, read c: typeck
         string_push(sb, "while (")
         emit_expr(sb, p, src, c, g, list.get(i32, p.lar, (e.a + 4) as usize))
         string_push(sb, ")\n")
-        emit_body(sb, p, src, c, g, e.b, false, depth)
+        emit_loop_body(sb, p, src, c, g, e.b, depth)
         return
     }
     // iterate: only the single-Range-source, no-step form so far.
@@ -3003,6 +3123,7 @@ fn emit_slice_for(mut sb: String, read p: parser.Parser, read src: str, read c: 
         i = i + 1
     }
     if added_ptr { list.truncate(i32, g.pp, list.len(i32, g.pp) - 2) }
+    emit_cont_target(sb, src, g, depth + 1)
     line_at(sb, depth, "}")
 }
 
@@ -3059,6 +3180,7 @@ fn emit_str_for(mut sb: String, read p: parser.Parser, read src: str, read c: ty
         emit_stmt(sb, p, src, c, g, list.get(i32, p.sar, (blk.x + i) as usize), depth + 1)
         i = i + 1
     }
+    emit_cont_target(sb, src, g, depth + 1)
     line_at(sb, depth, "}")
 }
 
@@ -3133,6 +3255,7 @@ fn emit_array_for(mut sb: String, read p: parser.Parser, read src: str, read c: 
         i = i + 1
     }
     if added_ptr { list.truncate(i32, g.pp, list.len(i32, g.pp) - 2) }
+    emit_cont_target(sb, src, g, depth + 1)
     line_at(sb, depth, "}")
 }
 
@@ -3186,7 +3309,7 @@ fn emit_range_for(mut sb: String, read p: parser.Parser, read src: str, read c: 
         list.push(i32, g.rf, src0)
         refined = true
     }
-    emit_body(sb, p, src, c, g, e.b, false, depth)
+    emit_loop_body(sb, p, src, c, g, e.b, depth)
     if refined { list.truncate(i32, g.rf, list.len(i32, g.rf) - 3) }
 }
 
@@ -4146,7 +4269,7 @@ fn emit_main_wrapper(mut sb: String, read p: parser.Parser, read src: str) {
 // `"\n"` pushes stand in for the reference's unconditionally-blank sections that are empty for a
 // program with no aggregates (closure_types, method_protos, consts) plus the guarded no-ops.
 fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator) {
-    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false }
+    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1 }
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     collect_method_instances(g, p, src, c)           // (struct item, method fn item) pairs, first-seen
     collect_genum_instances(g, p, src, c)            // generic-enum instance TyIds, expr order
