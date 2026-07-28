@@ -14,10 +14,10 @@
 
 ## Horizon 1 — Self-hosting: exactly what remains
 
-### Where P5 stands (increment 21, master `7f052bc`)
+### Where P5 stands (increment 22, master `ebe1745`)
 
-`examples/std/cgen.jtr` (~3.7K lines vs the ~10.8K-line Rust reference) emits
-byte-identical C for 44 of 130 corpus files. **Done:** the prelude + section
+`examples/std/cgen.jtr` (~4.2K lines vs the ~10.8K-line Rust reference) emits
+byte-identical C for **46 of 130** corpus files. **Done:** the prelude + section
 skeleton, params/binops/calls, let (annotated + inferred), casts, distinct types,
 structs + struct methods, the whole flat **match** family (tagged switch, guarded
 if-chain, scalar if-chain, or-patterns), **generic-enum instances** (the first
@@ -25,14 +25,18 @@ monomorphization), slices (typedefs + bounds-check spill + refinement elision),
 arrays (incl. the ghost pre-adoption typedef), error sets + `?`, the full `for`
 family (range/while/infinite/slice/array/str), owned String/Cow/Builder, the
 alloc/utf8 boundary, f-strings (token re-scan), consts, extern "c", contracts,
-attributes, and template-fn suppression. R2's subset harness is green (every
-allowlisted runnable program: jc1-compiled C ≡ Rust-compiled behavior).
+attributes, template-fn suppression, **RAII drop glue** (cluster 1 — increment
+22: `needs_drop`/`emit_drop_place` field+payload recursion, the flattened
+drop-scope stack, `collect_moved`, spilled returns), and **concrete trait-impl
+sections** (`emit_impl_protos`/`emit_impl_defs`, a first slice of cluster 9).
+R2's subset harness is green (every allowlisted runnable program: jc1-compiled
+C ≡ Rust-compiled behavior — the drop files run through gcc + execution too).
 
 ### The remaining construct clusters (in leverage order)
 
 | # | Cluster | Target files (last-measured diff) | Reference machinery | Size |
 |---|---------|-----------------------------------|---------------------|------|
-| 1 | **RAII drop glue** | `drop.jtr` (13) | `needs_drop`/`emit_all_drops`/`emit_drop_place`/`collect_moved` — scope-exit drops in reverse decl order, move-out suppression, field/payload recursion | M–L |
+| 1 | ~~**RAII drop glue**~~ **DONE (incr 22)** — `drop.jtr` + `drop_nested.jtr` byte-identical; blanket generic `Drop` impls + take-self method moves deferred to the generics cluster | | | |
 | 2 | **Genrefs `&T`** | `genref.jtr` (14) | `JestyrRef_<T>` typedefs, `gen_new`/`gen_free`, checked deref (`assert(((uint64_t*)_r{n}.ptr)[-1] == _r{n}.gen)`) | S–M |
 | 3 | **Loop-else + labels** | `loops_else.jtr` (16) | `break_label`/`cont_label`, `<label>__break:`/`__continue:` targets, labeled break/continue | M |
 | 4 | **Regions / arenas** | `region.jtr`, `region_string.jtr` (17) | arena prelude block (gated on `uses_arena`), `region` blocks, `region_alloc`/`region_str`/`region_concat`, scratch reset | M |

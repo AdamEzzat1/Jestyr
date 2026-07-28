@@ -271,6 +271,40 @@ longer leaks a bogus `void jestyr_Vec(void)`.
 alternatives; an everything-matching alternative makes the arm unconditional; wildcard/binding =
 none). Or-patterns of nullary variants in the unguarded tag switch → stacked `case` labels.
 
+### Increment 22 — RAII drop glue + concrete trait-impl sections (`ebe1745`, allowlist 46)
+
+**+`drop`, `drop_nested`** (cluster 1 of the consolidated worklist). What landed, and the
+findings the next session should NOT re-derive:
+
+- **The drop model is name-driven in the port.** The reference walks `Ty` values; cgen.jtr
+  canonicalizes every droppable to its *type-name span* (annotation Name span, or the Checker's
+  kind-15 `tdecl` row name) and recurses by AST item lookup (`find_named_item`). Sound because
+  only concrete Named types can need drop in the current corpus (blanket generic `Drop` impls —
+  vec_alloc/strmap/intern — wait for the generics cluster). The `is_copy` short-circuit is
+  omitted as inert: a `@copy` aggregate can't own droppables.
+- **`emit_drop_place` emits FLAT at statement depth** — the reference's `self.line` never changes
+  depth inside the walker, so the enum-payload `switch`/`case`/`break;`/`}` lines all share the
+  enclosing statement's indentation. Struct fields recurse in reverse decl order; unions never
+  auto-drop; indirection (Ptr/GenRef/RegionRef) is never followed.
+- **`cur_moved` lifecycle:** ONLY `emit_fn` collects the move set (2003 clears it) — struct-method
+  and concrete-impl bodies run with it EMPTY in the reference, so the port collects in
+  `emit_fn_defs` alone. `collect_moved` marks bare-name let-inits/returns/tails, `take`-conv args
+  of resolvable *free* calls (comptime-type param slots skipped), struct-lit field values, and
+  assign values. Take-`self` receiver moves via icalls/mcalls are deferred (no droppable+take-self
+  file yet).
+- **Spilled returns:** `return <v>` with ensures OR live drops spills `<retcty> j_result = v;`,
+  asserts, drops, `return j_result;`. In a method/impl body the reference's `cur_ret_cty` is unset
+  → `__auto_type` — ported as `Cg.autoret`. A bare `return;` runs `emit_all_drops` first.
+  `block_diverges` = ret-position tail or trailing explicit Return → scope discarded, else the
+  fall-through scope-exit emits drops (reverse decl order) before the closing brace.
+- **Impl sections:** `emit_impl_protos` (after method_protos; **CONDITIONAL** trailing blank —
+  unlike method_protos') and `emit_impl_defs` (after method_defs) lower each concrete
+  (`it.h <= 0`) impl method as `jestyr_impl_<Trait>__<TypeKey>__<method>` with `self` as a real
+  first param (`* restrict` for `mut`/`out self`); a Name target's text IS the type key.
+  Fallible impl methods emit nothing (reference parity). Impl item decode: kind 7, `(x,y)`=trait
+  span, `a`=target TypeId, `(b,z)`=method fn-ItemId slice in `mar`, `h`=gen_count.
+- Drop glue consumes NO temps — the counter stays in lockstep for free.
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
