@@ -988,6 +988,22 @@ fn assign_c(code: i32) -> str {
 // An integer literal with `_` digit separators removed (mirrors `c_int_literal`; the `0b` binary
 // -> decimal rewrite is added when a corpus file needs it — decimal/`0x` are already valid C).
 fn emit_int_literal(mut sb: String, read lex: str) {
+    // A `0b`/`0B` binary literal is not valid C: convert to decimal (mirrors `c_int_literal`).
+    // Decimal and `0x…` pass through with `_` separators stripped.
+    if lex.len > 2 {
+        if str_eq(lex[0 .. 2], "0b") or str_eq(lex[0 .. 2], "0B") {
+            var v: i64 = 0
+            var k: usize = 2
+            for k < lex.len {
+                let ch: str = lex[k .. k + 1]
+                if str_eq(ch, "1") { v = v * 2 + 1 }
+                else if str_eq(ch, "0") { v = v * 2 }
+                k = k + 1                             // `_` separators just skip
+            }
+            push_uint(sb, v)
+            return
+        }
+    }
     var i: usize = 0
     for i < lex.len {
         let c: str = lex[i .. i + 1]
@@ -1646,6 +1662,23 @@ fn error_tag_of(read g: Cg, read src: str, ns: usize, ne: usize) -> i32 {
         i = i + 2
     }
     return 0
+}
+
+// Is Fn item `it` a monomorphization template — a bracket-form `[T: Bound]` generic (`it.h` > 0)
+// or a `comptime T: type` parameter (comp==1, type = TypeKw)? Templates are never emitted
+// directly (mirrors `is_generic_ast`). A comptime VALUE param also suppresses emission
+// (`fn_supported_ast`'s other half) — both are "skip this fn" here.
+fn fn_is_template(read p: parser.Parser, read it: parser.ItemData) -> bool {
+    if it.h > 0 { return true }                       // bracket generics
+    var i: i32 = 0
+    for i < it.b {
+        let base: i32 = it.a + i * 7
+        if list.get(i32, p.iar, base as usize) == 1 { // a comptime param (type OR value)
+            return true
+        }
+        i = i + 1
+    }
+    return false
 }
 
 // Is the top-level Fn item `it` fallible (has a non-empty `!{…}` error set)? The `far` extras
@@ -3161,7 +3194,7 @@ fn emit_fn_protos(mut sb: String, read p: parser.Parser, read src: str) {
     for r < list.len(i32, p.roots) {
         let iid: i32 = list.get(i32, p.roots, r)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
-        if it.kind == 3 {                             // Fn
+        if it.kind == 3 and !fn_is_template(p, it) {  // Fn (templates are never emitted directly)
             emit_fn_sig(sb, p, src, it)
             string_push(sb, ";\n")
         }
@@ -3176,7 +3209,7 @@ fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str, read c: ty
     for r < list.len(i32, p.roots) {
         let iid: i32 = list.get(i32, p.roots, r)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
-        if it.kind == 3 {                             // Fn
+        if it.kind == 3 and !fn_is_template(p, it) {  // Fn (templates are never emitted directly)
             emit_fn_sig(sb, p, src, it)
             string_push(sb, "\n")
             // Register the fn's by-pointer (`mut`/`out`) params so body uses render `(*j_x)`.
