@@ -3337,6 +3337,15 @@ fn emit_for_inner(mut sb: String, read p: parser.Parser, read src: str, read c: 
             emit_range_for(sb, p, src, c, g, e, sx, src0, step, depth)
             return
         }
+        if sx.kind == 10 and sx.y == 1 {              // `codepoints(s)` marker: the decode loop
+            let cal: parser.ExprData = list.get(parser.ExprData, p.ex, sx.a as usize)
+            if cal.kind == 2 {
+                if str_eq(src[cal.start .. cal.end], "codepoints") {
+                    emit_codepoints_for(sb, p, src, c, g, e, arg_at(p, sx, 0), bc, depth)
+                    return
+                }
+            }
+        }
         if step < 0 {
             if expr_is_slice(c, src0) {               // slice source: snapshot + counted for
                 emit_slice_for(sb, p, src, c, g, e, src0, bc, depth)
@@ -3357,6 +3366,70 @@ fn emit_for_inner(mut sb: String, read p: parser.Parser, read src: str, read c: 
         }
     }
     // TODO: codepoints/graphemes/split iteration.
+}
+
+// `for cp in codepoints(s)` — decode UTF-8 one codepoint at a time (mirrors
+// `emit_codepoints_for`): `_str{n}` snapshot, a manual `_k{n}` cursor the decode advances by
+// the codepoint's byte width, each `cp` a `u32`. An optional second binding is the codepoint's
+// byte offset — `_k` BEFORE the decode (Go's range-over-string). ONE temp.
+fn emit_codepoints_for(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, s_arg: i32, bc: i32, depth: i32) {
+    let bns: i32 = list.get(i32, p.lar, (e.a + 8) as usize)
+    let bne: i32 = list.get(i32, p.lar, (e.a + 9) as usize)
+    let bname: str = src[bns as usize .. bne as usize]
+    let n: i32 = g.tmp
+    g.tmp = g.tmp + 1
+    indent(sb, depth)
+    string_push(sb, "JestyrStr _str")
+    push_uint(sb, n as i64)
+    string_push(sb, " = ")
+    emit_expr(sb, p, src, c, g, s_arg)
+    string_push(sb, ";\n")
+    indent(sb, depth)
+    string_push(sb, "size_t _k")
+    push_uint(sb, n as i64)
+    string_push(sb, " = 0;\n")
+    indent(sb, depth)
+    string_push(sb, "while (_k")
+    push_uint(sb, n as i64)
+    string_push(sb, " < _str")
+    push_uint(sb, n as i64)
+    string_push(sb, ".len)\n")
+    line_at(sb, depth, "{")
+    emit_scratch_reset(sb, src, g, depth + 1)
+    if bc >= 2 {                                      // optional byte-offset binding
+        let ins: i32 = list.get(i32, p.lar, (e.a + 11) as usize)
+        let ine: i32 = list.get(i32, p.lar, (e.a + 12) as usize)
+        if !str_eq(src[ins as usize .. ine as usize], "_") {
+            indent(sb, depth + 1)
+            string_push(sb, "size_t j_")
+            string_push(sb, src[ins as usize .. ine as usize])
+            string_push(sb, " = _k")
+            push_uint(sb, n as i64)
+            string_push(sb, ";\n")
+        }
+    }
+    indent(sb, depth + 1)
+    if !str_eq(bname, "_") {
+        string_push(sb, "uint32_t j_")
+        string_push(sb, bname)
+        string_push(sb, " = jestyr_rt_decode_cp(_str")
+    } else {
+        string_push(sb, "(void) jestyr_rt_decode_cp(_str")
+    }
+    push_uint(sb, n as i64)
+    string_push(sb, ".ptr, _str")
+    push_uint(sb, n as i64)
+    string_push(sb, ".len, &_k")
+    push_uint(sb, n as i64)
+    string_push(sb, ");\n")
+    let blk: parser.ExprData = list.get(parser.ExprData, p.ex, e.b as usize)
+    var i: i32 = 0
+    for i < blk.y {
+        emit_stmt(sb, p, src, c, g, list.get(i32, p.sar, (blk.x + i) as usize), depth + 1)
+        i = i + 1
+    }
+    emit_cont_target(sb, src, g, depth + 1)
+    line_at(sb, depth, "}")
 }
 
 // `for a, b in xs, ys` — lockstep zip over slices (mirrors `emit_zip_for`): snapshot each
