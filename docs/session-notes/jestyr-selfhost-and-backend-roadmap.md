@@ -14,10 +14,13 @@
 
 ## Horizon 1 — Self-hosting: exactly what remains
 
-### Where P5 stands (increment 22, master `ebe1745`)
+### Where P5 stands (increment 26, master `505f8c7`)
 
-`examples/std/cgen.jtr` (~4.2K lines vs the ~10.8K-line Rust reference) emits
-byte-identical C for **46 of 130** corpus files. **Done:** the prelude + section
+`examples/std/cgen.jtr` (~5K lines vs the ~10.8K-line Rust reference) emits
+byte-identical C for **52 of 130** corpus files. Clusters 1–5 are all done
+(increments 22–26): drop glue, impl sections, genrefs, loop-else/labels,
+regions/arenas (+zip/step/variant), codepoints. **Next: cluster 6, generic
+functions — the hardest infra.** **Done:** the prelude + section
 skeleton, params/binops/calls, let (annotated + inferred), casts, distinct types,
 structs + struct methods, the whole flat **match** family (tagged switch, guarded
 if-chain, scalar if-chain, or-patterns), **generic-enum instances** (the first
@@ -36,11 +39,11 @@ C ≡ Rust-compiled behavior — the drop files run through gcc + execution too)
 
 | # | Cluster | Target files (last-measured diff) | Reference machinery | Size |
 |---|---------|-----------------------------------|---------------------|------|
-| 1 | ~~**RAII drop glue**~~ **DONE (incr 22)** — `drop.jtr` + `drop_nested.jtr` byte-identical; blanket generic `Drop` impls + take-self method moves deferred to the generics cluster | | | |
-| 2 | **Genrefs `&T`** | `genref.jtr` (14) | `JestyrRef_<T>` typedefs, `gen_new`/`gen_free`, checked deref (`assert(((uint64_t*)_r{n}.ptr)[-1] == _r{n}.gen)`) | S–M |
-| 3 | **Loop-else + labels** | `loops_else.jtr` (16) | `break_label`/`cont_label`, `<label>__break:`/`__continue:` targets, labeled break/continue | M |
-| 4 | **Regions / arenas** | `region.jtr`, `region_string.jtr` (17) | arena prelude block (gated on `uses_arena`), `region` blocks, `region_alloc`/`region_str`/`region_concat`, scratch reset | M |
-| 5 | **Codepoint iteration** | `codepoints.jtr` (17) | `codepoints(s)` for-position marker → the decode loop | S |
+| 1 | ~~**RAII drop glue**~~ **DONE (incr 22)** — `drop.jtr` + `drop_nested.jtr`; blanket generic `Drop` impls + take-self method moves deferred to the generics cluster | | | |
+| 2 | ~~**Genrefs `&T`**~~ **DONE (incr 23)** — `genref.jtr` | | | |
+| 3 | ~~**Loop-else + labels**~~ **DONE (incr 24)** — `loops_else.jtr` | | | |
+| 4 | ~~**Regions / arenas**~~ **DONE (incr 25)** — `region.jtr` + `region_string.jtr` + `loops_advanced.jtr` (incl. zip/step/`variant` trackers) | | | |
+| 5 | ~~**Codepoint iteration**~~ **DONE (incr 26)** — `codepoints.jtr` | | | |
 | 6 | **Generic FUNCTIONS** | `bracket_generic.jtr` (18), `generics.jtr` | `collect_all_instances` worklist (fns + methods pull each other in), `mangle` (`jestyr_<name>__<types>`), `make_subst`, `emit_generic_call` with erased comptime args, monomorphized sigs contributing slice/array instances | **L — the hardest infra** |
 | 7 | **Nested match + niche enums** | `nested_match.jtr`, `exhaustive_check.jtr`, `niche.jtr` | `pat_needs_nesting` → `emit_nested_match` decision tree; `NicheInfo` (Option(*T) ≡ bare pointer, NULL = none) — niche changes *type rendering*, construction, and match | L |
 | 8 | **Closures** | `closures.jtr`, `closure_run.jtr` | `collect_closures` lambda-lifting: `JestyrEnv_<id>`/`JestyrClosure_<id>`/`jestyr_lam_<id>`, capture sets, fn-ptr coercion for capture-free closures | M–L |

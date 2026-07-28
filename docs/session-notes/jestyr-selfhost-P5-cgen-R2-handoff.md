@@ -305,6 +305,47 @@ findings the next session should NOT re-derive:
   span, `a`=target TypeId, `(b,z)`=method fn-ItemId slice in `mar`, `h`=gen_count.
 - Drop glue consumes NO temps — the counter stays in lockstep for free.
 
+### Increments 23–26 — genrefs; loop-else/labels; regions + zip/step/variant; codepoints (allowlist 52)
+
+**23 — genrefs** (`6e93671`, +`genref`): GenRef arms in BOTH renderers (AST kind 5 / Checker
+kind 10 → `JestyrRef_<elem>`, nested mangle `ref_<elem>`); `emit_genref_defs` mirrors
+`collect_genrefs` (type-arena `&T` pass in arena order, then `gen_new` calls in expr order,
+deduped, CONDITIONAL blank) between array typedefs and result defs; `gen_new`/`gen_free`
+(ONE temp each); checked deref (`assert(((uint64_t*)_r{n}.ptr)[-1] == _r{n}.gen)`, ONE temp).
+
+**24 — loop-else + labels** (`c1a7af6`, +`loops_else`): `emit_for` is now the wrapper/inner
+split. Label span = `lar[0,1]`, else Block = `e.x`. A labeled loop arms `Cg.cl_*` (the
+continue target), consumed by the FIRST loop body that closes — the reference `.take()` quirk,
+mirrored. An unlabeled loop with an else takes `_fe{n}` (ONE temp, BEFORE the head). Plain
+`break`s reroute via `Cg.bl_*` ONLY when an else exists (saved/restored per loop). Else block
+= stmts at depth+1 with NO new drop scope; `<label>__break: ;` lands after it (a label-only
+loop still gets its target). `emit_loop_body` (drop scope + `__continue`) backs
+infinite/while/range; slice/str/array consume the cont target inline.
+
+**25 — regions/arenas + zip/step/variant** (`f2070e6`, +`region`, `region_string`,
+`loops_advanced`): arena prelude gated on `uses_arena` (region blocks / region-loops /
+`arena_*` calls); `emit_region` (arena open, body, **DISCARDED** drop scope — region bulk
+drop — arena free); a region-scoped `for` wraps loop+else+break-target in an arena scope at
+depth+1 and arms `Cg.sr_*` (the scratch reset, consumed at the next body top — wired into all
+FIVE body shapes). `&[r]T` = plain pointer in both renderers. Intrinsics: `region_alloc`/
+`region_str`/`region_concat`/`arena_open`/`arena_close` (ONE temp each), `arena_alloc` (none).
+Zip: `emit_zip_for`, ONE shared temp, `_z{n}_{i}` snapshots + length assert; binds take their
+own source's elem. Stepped ranges: negative-literal step → `int64_t` + flipped compare, `+=`
+increment, NO refinement. `variant`: per-loop hoisted `int64_t _vt{n} = INT64_MAX;` (ONE temp
+each, hoisted AFTER region open and BEFORE the `_fe` temp — order is load-bearing) on a
+floor-masked flat list (`Cg.vt`/`vtf` models the reference's per-loop map REPLACE), and the
+checked-decrease stmt-expr.
+
+**26 — codepoints** (`505f8c7`, +`codepoints`): the `codepoints(s)` Call marker is recognized
+right after the Range check (dispatch order matters); `_str{n}` + manual `_k{n}` cursor +
+`while` + `jestyr_rt_decode_cp` (ONE temp), `(void)`-discarded for `_`, optional byte-offset
+second binding (= `_k` BEFORE the decode).
+
+**Roadmap clusters 1–5 are DONE.** Next up (leverage order): **generic FUNCTIONS** (cluster 6,
+the hardest infra — `collect_all_instances` worklist, `mangle`, `make_subst`,
+`emit_generic_call`, monomorphized sigs feeding slice/array instances), then nested/niche
+match, closures, traits/dyn, concurrency, fn-ptr types, test mode.
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
