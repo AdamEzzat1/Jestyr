@@ -731,6 +731,13 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
                 string_push(sb, ")")
                 return
             }
+            // A scalar index reads the byte at that offset: `((uint8_t)(<s>).ptr[(<i>)])`.
+            string_push(sb, "((uint8_t)(")
+            emit_expr(sb, p, src, c, g, e.a)
+            string_push(sb, ").ptr[(")
+            emit_expr(sb, p, src, c, g, e.b)
+            string_push(sb, ")])")
+            return
         }
         if expr_is_slice(c, e.a) {                    // slice indexing
             if index_in_range(g, p, src, e.a, e.b) {  // refinement proved i < s.len: raw access
@@ -1126,6 +1133,62 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_push(sb, ", j_")
             let fa: parser.ExprData = list.get(parser.ExprData, p.ex, arg_at(p, e, 1) as usize)
             string_push(sb, src[fa.start .. fa.end])
+            string_push(sb, ")")
+            return
+        }
+        if str_eq(nm, "alloc") {                      // alloc(T, n) -> ((T*) malloc((size_t)(n) * sizeof(T)))
+            string_push(sb, "((")
+            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            string_push(sb, "*) malloc((size_t)(")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 1))
+            string_push(sb, ") * sizeof(")
+            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            string_push(sb, ")))")
+            return
+        }
+        if str_eq(nm, "realloc") {                    // realloc(T, p, n)
+            string_push(sb, "((")
+            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            string_push(sb, "*) realloc(")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 1))
+            string_push(sb, ", (size_t)(")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 2))
+            string_push(sb, ") * sizeof(")
+            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            string_push(sb, ")))")
+            return
+        }
+        // The bytes<->str boundary: `is_utf8` checks, `from_utf8` asserts then views. Both spill
+        // the byte slice into `_u` (a FIXED name — neither consumes the temp counter).
+        if str_eq(nm, "is_utf8") or str_eq(nm, "from_utf8") {
+            string_push(sb, "({ ")
+            emit_ty_c(sb, src, c, list.get(i32, c.et, arg_at(p, e, 0) as usize))
+            string_push(sb, " _u = ")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            if str_eq(nm, "is_utf8") {
+                string_push(sb, "; jestyr_rt_valid_utf8((const char*)_u.ptr, _u.len); })")
+            } else {
+                string_push(sb, "; assert(jestyr_rt_valid_utf8((const char*)_u.ptr, _u.len)); (JestyrStr){ (const char*)_u.ptr, _u.len }; })")
+            }
+            return
+        }
+        if str_eq(nm, "bytes") {                      // str -> []u8 view (consumes a temp)
+            let nb: i32 = g.tmp
+            g.tmp = g.tmp + 1
+            string_push(sb, "({ JestyrStr _bv")
+            push_uint(sb, nb as i64)
+            string_push(sb, " = ")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            string_push(sb, "; (JestyrSlice_u8){ (uint8_t*)_bv")
+            push_uint(sb, nb as i64)
+            string_push(sb, ".ptr, _bv")
+            push_uint(sb, nb as i64)
+            string_push(sb, ".len }; })")
+            return
+        }
+        if str_eq(nm, "count_codepoints") {           // O(n) codepoint count
+            string_push(sb, "jestyr_rt_count_cp(")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
             string_push(sb, ")")
             return
         }
@@ -2000,6 +2063,10 @@ fn emit_for(mut sb: String, read p: parser.Parser, read src: str, read c: typeck
             emit_slice_for(sb, p, src, c, g, e, src0, bc, depth)
             return
         }
+        if expr_is_str(c, src0) {                     // str source: iterate the bytes
+            emit_str_for(sb, p, src, c, g, e, src0, bc, depth)
+            return
+        }
         let sty: i32 = list.get(i32, c.et, src0 as usize)
         if sty >= 0 {
             let sd2: typeck.TyData = list.get(typeck.TyData, c.tys, sty as usize)
@@ -2086,6 +2153,62 @@ fn emit_slice_for(mut sb: String, read p: parser.Parser, read src: str, read c: 
         i = i + 1
     }
     if added_ptr { list.truncate(i32, g.pp, list.len(i32, g.pp) - 2) }
+    line_at(sb, depth, "}")
+}
+
+// `for b in s` over a str: snapshot `_str{n}`, count `_k{n}`, bind each BYTE as
+// `uint8_t j_b = (uint8_t)_str{n}.ptr[_k{n}];` (mirrors `emit_str_for`). Optional index binding.
+fn emit_str_for(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, src0: i32, bc: i32, depth: i32) {
+    let bns: i32 = list.get(i32, p.lar, (e.a + 8) as usize)
+    let bne: i32 = list.get(i32, p.lar, (e.a + 9) as usize)
+    let bname: str = src[bns as usize .. bne as usize]
+    let n: i32 = g.tmp
+    g.tmp = g.tmp + 1
+    indent(sb, depth)
+    string_push(sb, "JestyrStr _str")
+    push_uint(sb, n as i64)
+    string_push(sb, " = ")
+    emit_expr(sb, p, src, c, g, src0)
+    string_push(sb, ";\n")
+    indent(sb, depth)
+    string_push(sb, "for (size_t _k")
+    push_uint(sb, n as i64)
+    string_push(sb, " = 0; _k")
+    push_uint(sb, n as i64)
+    string_push(sb, " < _str")
+    push_uint(sb, n as i64)
+    string_push(sb, ".len; _k")
+    push_uint(sb, n as i64)
+    string_push(sb, "++)\n")
+    line_at(sb, depth, "{")
+    if bc >= 2 {                                      // optional index binding (second triple)
+        let ins: i32 = list.get(i32, p.lar, (e.a + 11) as usize)
+        let ine: i32 = list.get(i32, p.lar, (e.a + 12) as usize)
+        if !str_eq(src[ins as usize .. ine as usize], "_") {
+            indent(sb, depth + 1)
+            string_push(sb, "size_t j_")
+            string_push(sb, src[ins as usize .. ine as usize])
+            string_push(sb, " = _k")
+            push_uint(sb, n as i64)
+            string_push(sb, ";\n")
+        }
+    }
+    if !str_eq(bname, "_") {
+        indent(sb, depth + 1)
+        string_push(sb, "uint8_t j_")
+        string_push(sb, bname)
+        string_push(sb, " = (uint8_t)_str")
+        push_uint(sb, n as i64)
+        string_push(sb, ".ptr[_k")
+        push_uint(sb, n as i64)
+        string_push(sb, "];\n")
+    }
+    let blk: parser.ExprData = list.get(parser.ExprData, p.ex, e.b as usize)
+    var i: i32 = 0
+    for i < blk.y {
+        emit_stmt(sb, p, src, c, g, list.get(i32, p.sar, (blk.x + i) as usize), depth + 1)
+        i = i + 1
+    }
     line_at(sb, depth, "}")
 }
 
