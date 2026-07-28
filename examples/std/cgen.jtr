@@ -29,7 +29,31 @@ import "typeck"
 // backslash-n in the emitted C, and `"\n"` is a real C-source line break — the double-transpile
 // composes). The pthread/time/try_read/arena conditional blocks are only emitted when used;
 // `hello` uses none, so they are elided (added back per construct as later files need them).
-fn emit_prelude(mut sb: String) {
+// Does the program use the bump-arena runtime — a `region` block, a region-scoped loop, or a
+// value-level arena intrinsic? Gates the arena prelude block (mirrors `uses_arena`).
+fn uses_arena(read p: parser.Parser, read src: str) -> bool {
+    var i: usize = 0
+    for i < list.len(parser.ExprData, p.ex) {
+        let e: parser.ExprData = list.get(parser.ExprData, p.ex, i)
+        if e.kind == 43 { return true }               // a `region r { … }` block
+        if e.kind == 31 {                             // a region-scoped scratch loop
+            if list.get(i32, p.lar, (e.a + 2) as usize) >= 0 { return true }
+        }
+        if e.kind == 10 {
+            let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+            if callee.kind == 2 {
+                let nm: str = src[callee.start .. callee.end]
+                if str_eq(nm, "arena_open") or str_eq(nm, "arena_alloc") or str_eq(nm, "arena_close") {
+                    return true
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn emit_prelude(mut sb: String, read p: parser.Parser, read src: str) {
     string_push(sb, "#include <stdint.h>\n#include <stdbool.h>\n#include <stddef.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <assert.h>\n")
     string_push(sb, "\n")
     string_push(sb, "/* Jestyr string view — a length-carrying `{ptr, len}` (a borrowed UTF-8 view,\n")
@@ -110,6 +134,13 @@ fn emit_prelude(mut sb: String) {
     string_push(sb, "static char** jestyr_rt_argv = NULL;\n")
     string_push(sb, "static int64_t jestyr_rt_arg_count(void) { return (int64_t)jestyr_rt_argc; }\n")
     string_push(sb, "static JestyrStr jestyr_rt_arg(int64_t i) { if (i < 0 || i >= (int64_t)jestyr_rt_argc) return (JestyrStr){ \"\", 0 }; const char* a = jestyr_rt_argv[i]; size_t n = 0; while (a[n]) n++; return (JestyrStr){ a, n }; }\n\n")
+    if uses_arena(p, src) {
+        string_push(sb, "/* Jestyr bump arena — backs region refs (`&[r]T`) and the std arena allocator. */\n")
+        string_push(sb, "typedef struct { char* buf; size_t off; size_t cap; } JestyrArena;\n")
+        string_push(sb, "static JestyrArena jestyr_arena_new(size_t cap) { JestyrArena a; a.buf = (char*)malloc(cap); a.off = 0; a.cap = cap; return a; }\n")
+        string_push(sb, "static void* jestyr_arena_alloc(JestyrArena* a, size_t n) { size_t al = (n + 7u) & ~(size_t)7u; void* p = a->buf + a->off; a->off += al; return p; }\n")
+        string_push(sb, "static void jestyr_arena_free(JestyrArena* a) { free(a->buf); }\n\n")
+    }
 }
 
 // ---- primitive type -> C type (mirrors the prim arm of Cgen::c_type) ----
@@ -174,6 +205,11 @@ fn emit_c_ty(mut sb: String, read p: parser.Parser, read src: str, tyid: i32) {
     if t.kind == 5 {                                   // GenRef `&T`: `JestyrRef_<elem mangle>`
         string_push(sb, "JestyrRef_")
         push_ast_mangle(sb, p, src, t.a)
+        return
+    }
+    if t.kind == 6 {                                   // RegionRef `&[r]T`: zero-cost plain pointer
+        emit_c_ty(sb, p, src, t.a)
+        string_push(sb, "*")
         return
     }
     if t.kind == 7 {                                   // App `Ctor(args)`: `Jestyr_<ctor>__<args>`
@@ -281,6 +317,11 @@ fn emit_ty_c(mut sb: String, read src: str, read c: typeck.Checker, tyid: i32) {
     if d.kind == 10 {                                          // GenRef `&T`: `JestyrRef_<elem mangle>`
         string_push(sb, "JestyrRef_")
         push_ty_mangle(sb, src, c, d.a)
+        return
+    }
+    if d.kind == 11 {                                          // RegionRef `&[r]T`: plain pointer
+        emit_ty_c(sb, src, c, d.a)
+        string_push(sb, "*")
         return
     }
     if d.kind == 6 {                                           // GenStruct/GenEnum instance: `Jestyr_<ctor>__<args>`
@@ -945,6 +986,36 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         string_push(sb, ")")
         return
     }
+    if e.kind == 35 {                                 // Variant: strictly-decreasing termination measure
+        var t: i32 = 0 - 1
+        var vi: usize = g.vtf as usize
+        for vi < list.len(i32, g.vt) {                // only the CURRENT loop's hoisted trackers
+            if list.get(i32, g.vt, vi) == eid { t = list.get(i32, g.vt, vi + 1) }
+            vi = vi + 2
+        }
+        if t >= 0 {
+            string_push(sb, "({ int64_t _vv")
+            push_uint(sb, t as i64)
+            string_push(sb, " = (int64_t)(")
+            emit_expr(sb, p, src, c, g, e.a)
+            string_push(sb, "); assert(_vv")
+            push_uint(sb, t as i64)
+            string_push(sb, " >= 0); assert(_vv")
+            push_uint(sb, t as i64)
+            string_push(sb, " < _vt")
+            push_uint(sb, t as i64)
+            string_push(sb, "); _vt")
+            push_uint(sb, t as i64)
+            string_push(sb, " = _vv")
+            push_uint(sb, t as i64)
+            string_push(sb, "; })")
+        } else {
+            string_push(sb, "assert((int64_t)(")
+            emit_expr(sb, p, src, c, g, e.a)
+            string_push(sb, ") >= 0)")
+        }
+        return
+    }
     if e.kind == 32 {                                 // Break: labeled -> goto; plain reroutes past an `else`
         if e.x >= 0 {
             string_push(sb, "goto ")
@@ -1490,6 +1561,141 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_push(sb, "; jestyr_rt_valid_utf8((const char*)_u.ptr, _u.len) ? (JestyrResult_str){ .is_err = false, .ok = (JestyrStr){ (const char*)_u.ptr, _u.len } } : (JestyrResult_str){ .is_err = true, .err = 1 }; })")
             return
         }
+        if str_eq(nm, "region_alloc") {               // region_alloc(r, T, v): bump-alloc + init, plain ptr. ONE temp.
+            let n: i32 = g.tmp
+            g.tmp = g.tmp + 1
+            let r0: parser.ExprData = list.get(parser.ExprData, p.ex, arg_at(p, e, 0) as usize)
+            string_push(sb, "({ ")
+            emit_type_arg_cty(sb, p, src, arg_at(p, e, 1))
+            string_push(sb, "* _p")
+            push_uint(sb, n as i64)
+            string_push(sb, " = (")
+            emit_type_arg_cty(sb, p, src, arg_at(p, e, 1))
+            string_push(sb, "*)jestyr_arena_alloc(&j_")
+            string_push(sb, src[r0.start .. r0.end])
+            string_push(sb, ", sizeof(")
+            emit_type_arg_cty(sb, p, src, arg_at(p, e, 1))
+            string_push(sb, ")); *_p")
+            push_uint(sb, n as i64)
+            string_push(sb, " = (")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 2))
+            string_push(sb, "); _p")
+            push_uint(sb, n as i64)
+            string_push(sb, "; })")
+            return
+        }
+        if str_eq(nm, "region_str") {                 // region_str(r, s): copy a str into the arena. ONE temp.
+            let n: i32 = g.tmp
+            g.tmp = g.tmp + 1
+            let r0: parser.ExprData = list.get(parser.ExprData, p.ex, arg_at(p, e, 0) as usize)
+            string_push(sb, "({ JestyrStr _sv")
+            push_uint(sb, n as i64)
+            string_push(sb, " = ")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 1))
+            string_push(sb, "; char* _p")
+            push_uint(sb, n as i64)
+            string_push(sb, " = (char*)jestyr_arena_alloc(&j_")
+            string_push(sb, src[r0.start .. r0.end])
+            string_push(sb, ", _sv")
+            push_uint(sb, n as i64)
+            string_push(sb, ".len); memcpy(_p")
+            push_uint(sb, n as i64)
+            string_push(sb, ", _sv")
+            push_uint(sb, n as i64)
+            string_push(sb, ".ptr, _sv")
+            push_uint(sb, n as i64)
+            string_push(sb, ".len); (JestyrStr){ _p")
+            push_uint(sb, n as i64)
+            string_push(sb, ", _sv")
+            push_uint(sb, n as i64)
+            string_push(sb, ".len }; })")
+            return
+        }
+        if str_eq(nm, "region_concat") {              // region_concat(r, a, b): join two strs in the arena. ONE temp.
+            let n: i32 = g.tmp
+            g.tmp = g.tmp + 1
+            let r0: parser.ExprData = list.get(parser.ExprData, p.ex, arg_at(p, e, 0) as usize)
+            string_push(sb, "({ JestyrStr _a")
+            push_uint(sb, n as i64)
+            string_push(sb, " = ")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 1))
+            string_push(sb, "; JestyrStr _b")
+            push_uint(sb, n as i64)
+            string_push(sb, " = ")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 2))
+            string_push(sb, "; size_t _t")
+            push_uint(sb, n as i64)
+            string_push(sb, " = _a")
+            push_uint(sb, n as i64)
+            string_push(sb, ".len + _b")
+            push_uint(sb, n as i64)
+            string_push(sb, ".len; char* _p")
+            push_uint(sb, n as i64)
+            string_push(sb, " = (char*)jestyr_arena_alloc(&j_")
+            string_push(sb, src[r0.start .. r0.end])
+            string_push(sb, ", _t")
+            push_uint(sb, n as i64)
+            string_push(sb, "); memcpy(_p")
+            push_uint(sb, n as i64)
+            string_push(sb, ", _a")
+            push_uint(sb, n as i64)
+            string_push(sb, ".ptr, _a")
+            push_uint(sb, n as i64)
+            string_push(sb, ".len); memcpy(_p")
+            push_uint(sb, n as i64)
+            string_push(sb, " + _a")
+            push_uint(sb, n as i64)
+            string_push(sb, ".len, _b")
+            push_uint(sb, n as i64)
+            string_push(sb, ".ptr, _b")
+            push_uint(sb, n as i64)
+            string_push(sb, ".len); (JestyrStr){ _p")
+            push_uint(sb, n as i64)
+            string_push(sb, ", _t")
+            push_uint(sb, n as i64)
+            string_push(sb, " }; })")
+            return
+        }
+        if str_eq(nm, "arena_open") {                 // arena_open(cap): heap arena, opaque handle. ONE temp.
+            let n: i32 = g.tmp
+            g.tmp = g.tmp + 1
+            string_push(sb, "({ JestyrArena* _a")
+            push_uint(sb, n as i64)
+            string_push(sb, " = (JestyrArena*)malloc(sizeof(JestyrArena)); *_a")
+            push_uint(sb, n as i64)
+            string_push(sb, " = jestyr_arena_new((size_t)(")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            string_push(sb, ")); (uint8_t*)_a")
+            push_uint(sb, n as i64)
+            string_push(sb, "; })")
+            return
+        }
+        if str_eq(nm, "arena_alloc") {                // arena_alloc(h, T, n): bump n T's. NO temp.
+            string_push(sb, "((")
+            emit_type_arg_cty(sb, p, src, arg_at(p, e, 1))
+            string_push(sb, "*) jestyr_arena_alloc((JestyrArena*)(")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            string_push(sb, "), (size_t)(")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 2))
+            string_push(sb, ") * sizeof(")
+            emit_type_arg_cty(sb, p, src, arg_at(p, e, 1))
+            string_push(sb, ")))")
+            return
+        }
+        if str_eq(nm, "arena_close") {                // arena_close(h): free the whole arena. ONE temp.
+            let n: i32 = g.tmp
+            g.tmp = g.tmp + 1
+            string_push(sb, "({ JestyrArena* _a")
+            push_uint(sb, n as i64)
+            string_push(sb, " = (JestyrArena*)(")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            string_push(sb, "); jestyr_arena_free(_a")
+            push_uint(sb, n as i64)
+            string_push(sb, "); free(_a")
+            push_uint(sb, n as i64)
+            string_push(sb, "); })")
+            return
+        }
         if str_eq(nm, "gen_new") {                    // gen_new(T, v): allocate [gen | T], init, {ptr, gen}. ONE temp.
             let n: i32 = g.tmp
             g.tmp = g.tmp + 1
@@ -1765,7 +1971,12 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // all -1 when the nearest loop has no `else` (plain C `break` is right). `cl_*` is an armed
 // labeled-loop continue-target span (the reference's `cont_label`), consumed — `.take()` — by
 // the FIRST loop body that closes after arming.
-struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32 }
+// `sr_*` is a region-scoped loop's armed scratch-arena name span (the reference's
+// `scratch_reset`), consumed — `.take()` — at the top of the next loop body. `vt` holds the
+// current loop's hoisted `variant`-tracker (ExprId, temp) pairs with `vtf` the active loop's
+// floor (the reference REPLACES `variant_trackers` per loop; the floor models that on a flat
+// list, and inner loops save/restore both).
+struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32 }
 
 // The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
 // (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
@@ -2219,10 +2430,11 @@ fn collect_moved_expr(mut g: Cg, read p: parser.Parser, read src: str, eid: i32)
         collect_moved_expr(g, p, src, e.b)
         return
     }
-    if e.kind == 3 or e.kind == 5 or e.kind == 7 or e.kind == 8 or e.kind == 11 or e.kind == 34 {
-        collect_moved_expr(g, p, src, e.a)            // Unary/Field/Deref/Try/Cast/Invariant
+    if e.kind == 3 or e.kind == 5 or e.kind == 7 or e.kind == 8 or e.kind == 11 or e.kind == 34 or e.kind == 35 {
+        collect_moved_expr(g, p, src, e.a)            // Unary/Field/Deref/Try/Cast/Invariant/Variant
         return
     }
+    if e.kind == 43 { collect_moved_block(g, p, src, e.a)  return }   // Region block
     if e.kind == 13 {                                 // Range
         if e.a >= 0 { collect_moved_expr(g, p, src, e.a) }
         if e.b >= 0 { collect_moved_expr(g, p, src, e.b) }
@@ -2346,6 +2558,7 @@ fn emit_stmt(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         if e.kind == 31 { emit_for(sb, p, src, c, g, s.a, depth)  return }         // For as a statement
         if e.kind == 25 { emit_body(sb, p, src, c, g, e.a, false, depth)  return } // unsafe { … } block
         if e.kind == 23 { emit_body(sb, p, src, c, g, s.a, false, depth)  return } // bare { … } block
+        if e.kind == 43 { emit_region(sb, p, src, c, g, s.a, depth)  return }      // region r { … }
         indent(sb, depth)
         emit_expr(sb, p, src, c, g, s.a)
         string_push(sb, ";\n")
@@ -2920,6 +3133,7 @@ fn push_uint(mut sb: String, v: i64) {
 fn emit_loop_body(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, block_eid: i32, depth: i32) {
     line_at(sb, depth, "{")
     drop_scope_enter(g)
+    emit_scratch_reset(sb, src, g, depth + 1)
     let blk: parser.ExprData = list.get(parser.ExprData, p.ex, block_eid as usize)
     let n: i32 = blk.y
     var i: i32 = 0
@@ -2949,6 +3163,46 @@ fn emit_cont_target(mut sb: String, read src: str, mut g: Cg, depth: i32) {
     }
 }
 
+// Emit + consume a region-scoped loop's armed per-iteration scratch reset `j_<r>.off = 0;`
+// (the reference's `scratch_reset.take()`, at the top of the next loop body).
+fn emit_scratch_reset(mut sb: String, read src: str, mut g: Cg, depth: i32) {
+    if g.sr_ns >= 0 {
+        indent(sb, depth)
+        string_push(sb, "j_")
+        string_push(sb, src[g.sr_ns as usize .. g.sr_ne as usize])
+        string_push(sb, ".off = 0;\n")
+        g.sr_ns = 0 - 1
+        g.sr_ne = 0 - 1
+    }
+}
+
+// A `region r { … }` block (kind 43; mirrors `emit_region`): open a bump arena, run the body
+// (its `region_alloc(r, …)` calls hand out zero-cost `&[r]T` pointers into it), free the whole
+// arena at the brace. The region's drop scope is DISCARDED, not emitted — the arena reclaims
+// everything at once (region-integrated bulk drop; the allocator determines the drop strategy).
+fn emit_region(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, eid: i32, depth: i32) {
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
+    let rname: str = src[e.x as usize .. e.y as usize]
+    line_at(sb, depth, "{")
+    drop_scope_enter(g)
+    indent(sb, depth + 1)
+    string_push(sb, "JestyrArena j_")
+    string_push(sb, rname)
+    string_push(sb, " = jestyr_arena_new(1u << 20);\n")
+    let blk: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)   // a = body Block
+    var i: i32 = 0
+    for i < blk.y {
+        emit_stmt(sb, p, src, c, g, list.get(i32, p.sar, (blk.x + i) as usize), depth + 1)
+        i = i + 1
+    }
+    drop_scope_exit_discard(g)
+    indent(sb, depth + 1)
+    string_push(sb, "jestyr_arena_free(&j_")
+    string_push(sb, rname)
+    string_push(sb, ");\n")
+    line_at(sb, depth, "}")
+}
+
 // A `for` loop statement (kind 31; mirrors `emit_for`). The `lar` header at `e.a`:
 // [0,1]=label span (-1 none), [2,3]=region span, [4]=slot A (while: cond; iterate: bind count),
 // [5]=slot B (iterate: source count), [6]=slot C (iterate: step ExprId or -1); iterate binds are
@@ -2960,7 +3214,48 @@ fn emit_for(mut sb: String, read p: parser.Parser, read src: str, read c: typeck
     let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
     let lls: i32 = list.get(i32, p.lar, e.a as usize)          // label span
     let lle: i32 = list.get(i32, p.lar, (e.a + 1) as usize)
+    let rns: i32 = list.get(i32, p.lar, (e.a + 2) as usize)    // region span
+    let rne: i32 = list.get(i32, p.lar, (e.a + 3) as usize)
     let els: i32 = e.x                                         // else Block ExprId
+    // A region-scoped loop wraps everything (loop, else, break target) in an arena scope and
+    // arms the per-iteration scratch reset (consumed at the top of the loop body).
+    var d: i32 = depth
+    if rns >= 0 {
+        line_at(sb, depth, "{")
+        d = depth + 1
+        indent(sb, d)
+        string_push(sb, "JestyrArena j_")
+        string_push(sb, src[rns as usize .. rne as usize])
+        string_push(sb, " = jestyr_arena_new(1u << 20);\n")
+        g.sr_ns = rns
+        g.sr_ne = rne
+    }
+    // Hoist a `int64_t _vt{n} = INT64_MAX;` tracker before the loop for each top-level `variant`
+    // statement in the body (ONE temp each; mirrors `hoist_variant_trackers` + the per-loop
+    // REPLACE of `variant_trackers` — the floor hides any outer loop's entries).
+    let vt_len: i32 = list.len(i32, g.vt) as i32
+    let vt_floor: i32 = g.vtf
+    g.vtf = vt_len
+    let hb: parser.ExprData = list.get(parser.ExprData, p.ex, e.b as usize)
+    var hv: i32 = 0
+    for hv < hb.y {
+        let hsid: i32 = list.get(i32, p.sar, (hb.x + hv) as usize)
+        let hs: parser.StmtData = list.get(parser.StmtData, p.st, hsid as usize)
+        if hs.kind == 2 {
+            let hse: parser.ExprData = list.get(parser.ExprData, p.ex, hs.a as usize)
+            if hse.kind == 35 {                                // a `variant <expr>` statement
+                let tn: i32 = g.tmp
+                g.tmp = g.tmp + 1
+                list.push(i32, g.vt, hs.a)
+                list.push(i32, g.vt, tn)
+                indent(sb, d)
+                string_push(sb, "int64_t _vt")
+                push_uint(sb, tn as i64)
+                string_push(sb, " = INT64_MAX;\n")
+            }
+        }
+        hv = hv + 1
+    }
     if lls >= 0 { g.cl_ns = lls  g.cl_ne = lle }               // arm the continue target
     var fe: i32 = 0 - 1                                        // synthesized else-break label id
     if lls < 0 and els >= 0 { fe = g.tmp  g.tmp = g.tmp + 1 }
@@ -2975,31 +3270,40 @@ fn emit_for(mut sb: String, read p: parser.Parser, read src: str, read c: typeck
     if els >= 0 {
         if lls >= 0 { g.bl_ns = lls  g.bl_ne = lle } else { g.bl_fe = fe }
     }
-    emit_for_inner(sb, p, src, c, g, e, depth)
+    emit_for_inner(sb, p, src, c, g, e, d)
     g.bl_ns = sbl_ns
     g.bl_ne = sbl_ne
     g.bl_fe = sbl_fe
     // The `else` runs on normal completion: between the loop and the break target, so falling
     // out runs it while a (rerouted) `break` jumps past it. No new drop scope (reference parity).
     if els >= 0 {
-        line_at(sb, depth, "{")
+        line_at(sb, d, "{")
         let eb: parser.ExprData = list.get(parser.ExprData, p.ex, els as usize)
         var i: i32 = 0
         for i < eb.y {
-            emit_stmt(sb, p, src, c, g, list.get(i32, p.sar, (eb.x + i) as usize), depth + 1)
+            emit_stmt(sb, p, src, c, g, list.get(i32, p.sar, (eb.x + i) as usize), d + 1)
             i = i + 1
         }
-        line_at(sb, depth, "}")
+        line_at(sb, d, "}")
     }
     if lls >= 0 {                                              // labeled- and/or else-break target
-        indent(sb, depth)
+        indent(sb, d)
         string_push(sb, src[lls as usize .. lle as usize])
         string_push(sb, "__break: ;\n")
     } else if fe >= 0 {
-        indent(sb, depth)
+        indent(sb, d)
         string_push(sb, "_fe")
         push_uint(sb, fe as i64)
         string_push(sb, "__break: ;\n")
+    }
+    list.truncate(i32, g.vt, vt_len as usize)                  // restore the outer loop's trackers
+    g.vtf = vt_floor
+    if rns >= 0 {                                              // close the region scope
+        indent(sb, d)
+        string_push(sb, "jestyr_arena_free(&j_")
+        string_push(sb, src[rns as usize .. rne as usize])
+        string_push(sb, ");\n")
+        line_at(sb, depth, "}")
     }
 }
 
@@ -3018,35 +3322,138 @@ fn emit_for_inner(mut sb: String, read p: parser.Parser, read src: str, read c: 
         emit_loop_body(sb, p, src, c, g, e.b, depth)
         return
     }
-    // iterate: only the single-Range-source, no-step form so far.
+    // iterate
     let bc: i32 = list.get(i32, p.lar, (e.a + 4) as usize)
     let sc: i32 = list.get(i32, p.lar, (e.a + 5) as usize)
     let step: i32 = list.get(i32, p.lar, (e.a + 6) as usize)
-    if sc == 1 and step < 0 {
+    if sc >= 2 {                                      // lockstep zip (length-checked)
+        emit_zip_for(sb, p, src, c, g, e, bc, sc, depth)
+        return
+    }
+    if sc == 1 {
         let src0: i32 = list.get(i32, p.lar, (e.a + 7 + bc * 3) as usize)
         let sx: parser.ExprData = list.get(parser.ExprData, p.ex, src0 as usize)
-        if sx.kind == 13 {                            // Range source: the counted C for
-            emit_range_for(sb, p, src, c, g, e, sx, src0, depth)
+        if sx.kind == 13 {                            // Range source: the counted C for (+ step)
+            emit_range_for(sb, p, src, c, g, e, sx, src0, step, depth)
             return
         }
-        if expr_is_slice(c, src0) {                   // slice source: snapshot + counted for
-            emit_slice_for(sb, p, src, c, g, e, src0, bc, depth)
-            return
-        }
-        if expr_is_str(c, src0) {                     // str source: iterate the bytes
-            emit_str_for(sb, p, src, c, g, e, src0, bc, depth)
-            return
-        }
-        let sty: i32 = list.get(i32, c.et, src0 as usize)
-        if sty >= 0 {
-            let sd2: typeck.TyData = list.get(typeck.TyData, c.tys, sty as usize)
-            if sd2.kind == 9 {                        // array source: iterate in place by address
-                emit_array_for(sb, p, src, c, g, e, src0, bc, sty, depth)
+        if step < 0 {
+            if expr_is_slice(c, src0) {               // slice source: snapshot + counted for
+                emit_slice_for(sb, p, src, c, g, e, src0, bc, depth)
                 return
+            }
+            if expr_is_str(c, src0) {                 // str source: iterate the bytes
+                emit_str_for(sb, p, src, c, g, e, src0, bc, depth)
+                return
+            }
+            let sty: i32 = list.get(i32, c.et, src0 as usize)
+            if sty >= 0 {
+                let sd2: typeck.TyData = list.get(typeck.TyData, c.tys, sty as usize)
+                if sd2.kind == 9 {                    // array source: iterate in place by address
+                    emit_array_for(sb, p, src, c, g, e, src0, bc, sty, depth)
+                    return
+                }
             }
         }
     }
-    // TODO: str/array/zip iteration, `step`.
+    // TODO: codepoints/graphemes/split iteration.
+}
+
+// `for a, b in xs, ys` — lockstep zip over slices (mirrors `emit_zip_for`): snapshot each
+// source (`_z{n}_{i}`, ONE shared temp), assert equal lengths, one counted loop; each bind
+// takes its own source's element (by pointer for `mut`, joining the by-pointer set).
+fn emit_zip_for(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, bc: i32, sc: i32, depth: i32) {
+    let n: i32 = g.tmp
+    g.tmp = g.tmp + 1
+    var k: i32 = sc
+    if bc < k { k = bc }
+    var i: i32 = 0
+    for i < k {                                       // snapshot each source slice
+        let s0: i32 = list.get(i32, p.lar, (e.a + 7 + bc * 3 + i) as usize)
+        indent(sb, depth)
+        emit_ty_c(sb, src, c, list.get(i32, c.et, s0 as usize))
+        string_push(sb, " _z")
+        push_uint(sb, n as i64)
+        string_push(sb, "_")
+        push_uint(sb, i as i64)
+        string_push(sb, " = ")
+        emit_expr(sb, p, src, c, g, s0)
+        string_push(sb, ";\n")
+        i = i + 1
+    }
+    if k > 1 {                                        // all lengths must match
+        indent(sb, depth)
+        string_push(sb, "assert(")
+        var j: i32 = 1
+        for j < k {
+            if j > 1 { string_push(sb, " && ") }
+            string_push(sb, "_z")
+            push_uint(sb, n as i64)
+            string_push(sb, "_0.len == _z")
+            push_uint(sb, n as i64)
+            string_push(sb, "_")
+            push_uint(sb, j as i64)
+            string_push(sb, ".len")
+            j = j + 1
+        }
+        string_push(sb, ");\n")
+    }
+    indent(sb, depth)
+    string_push(sb, "for (size_t _k")
+    push_uint(sb, n as i64)
+    string_push(sb, " = 0; _k")
+    push_uint(sb, n as i64)
+    string_push(sb, " < _z")
+    push_uint(sb, n as i64)
+    string_push(sb, "_0.len; _k")
+    push_uint(sb, n as i64)
+    string_push(sb, "++)\n")
+    line_at(sb, depth, "{")
+    emit_scratch_reset(sb, src, g, depth + 1)
+    var added: i32 = 0
+    var b: i32 = 0
+    for b < k {                                       // each bind takes its source's element
+        let conv: i32 = list.get(i32, p.lar, (e.a + 7 + b * 3) as usize)
+        let bns: i32 = list.get(i32, p.lar, (e.a + 8 + b * 3) as usize)
+        let bne: i32 = list.get(i32, p.lar, (e.a + 9 + b * 3) as usize)
+        let bname: str = src[bns as usize .. bne as usize]
+        if !str_eq(bname, "_") {
+            let s0: i32 = list.get(i32, p.lar, (e.a + 7 + bc * 3 + b) as usize)
+            let sd: typeck.TyData = list.get(typeck.TyData, c.tys, list.get(i32, c.et, s0 as usize) as usize)
+            indent(sb, depth + 1)
+            emit_ty_c(sb, src, c, sd.a)               // Slice: a = elem
+            if conv == 2 {                            // mut: bind a pointer into the slice
+                string_push(sb, "* j_")
+                string_push(sb, bname)
+                string_push(sb, " = &_z")
+            } else {
+                string_push(sb, " j_")
+                string_push(sb, bname)
+                string_push(sb, " = _z")
+            }
+            push_uint(sb, n as i64)
+            string_push(sb, "_")
+            push_uint(sb, b as i64)
+            string_push(sb, ".ptr[_k")
+            push_uint(sb, n as i64)
+            string_push(sb, "];\n")
+            if conv == 2 {
+                list.push(i32, g.pp, bns)
+                list.push(i32, g.pp, bne)
+                added = added + 1
+            }
+        }
+        b = b + 1
+    }
+    let blk: parser.ExprData = list.get(parser.ExprData, p.ex, e.b as usize)
+    var si: i32 = 0
+    for si < blk.y {
+        emit_stmt(sb, p, src, c, g, list.get(i32, p.sar, (blk.x + si) as usize), depth + 1)
+        si = si + 1
+    }
+    if added > 0 { list.truncate(i32, g.pp, list.len(i32, g.pp) - (added * 2) as usize) }
+    emit_cont_target(sb, src, g, depth + 1)
+    line_at(sb, depth, "}")
 }
 
 // `for x in xs` / `for mut x in xs` / `for x, i in xs` over a slice (mirrors `emit_slice_for`):
@@ -3079,6 +3486,7 @@ fn emit_slice_for(mut sb: String, read p: parser.Parser, read src: str, read c: 
     push_uint(sb, n as i64)
     string_push(sb, "++)\n")
     line_at(sb, depth, "{")
+    emit_scratch_reset(sb, src, g, depth + 1)
     if bc >= 2 {                                      // optional index binding (second triple)
         let ins: i32 = list.get(i32, p.lar, (e.a + 11) as usize)
         let ine: i32 = list.get(i32, p.lar, (e.a + 12) as usize)
@@ -3152,6 +3560,7 @@ fn emit_str_for(mut sb: String, read p: parser.Parser, read src: str, read c: ty
     push_uint(sb, n as i64)
     string_push(sb, "++)\n")
     line_at(sb, depth, "{")
+    emit_scratch_reset(sb, src, g, depth + 1)
     if bc >= 2 {                                      // optional index binding (second triple)
         let ins: i32 = list.get(i32, p.lar, (e.a + 11) as usize)
         let ine: i32 = list.get(i32, p.lar, (e.a + 12) as usize)
@@ -3213,6 +3622,7 @@ fn emit_array_for(mut sb: String, read p: parser.Parser, read src: str, read c: 
     push_uint(sb, n as i64)
     string_push(sb, "++)\n")
     line_at(sb, depth, "{")
+    emit_scratch_reset(sb, src, g, depth + 1)
     if bc >= 2 {                                      // optional index binding
         let ins: i32 = list.get(i32, p.lar, (e.a + 11) as usize)
         let ine: i32 = list.get(i32, p.lar, (e.a + 12) as usize)
@@ -3261,13 +3671,20 @@ fn emit_array_for(mut sb: String, read p: parser.Parser, read src: str, read c: 
 
 // `for i in lo..hi { B }` -> `<cty> _hi{n} = <hi>; for (<cty> j_i = <lo>; j_i </<= _hi{n}; j_i++)`.
 // `cty` is `hi`'s numeric type (via the Checker) or `size_t`; `_` binds an internal `_i{n}`.
-fn emit_range_for(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, read sx: parser.ExprData, src0: i32, depth: i32) {
+fn emit_range_for(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, read sx: parser.ExprData, src0: i32, step: i32, depth: i32) {
     let n: i32 = g.tmp
     g.tmp = g.tmp + 1
     let bns: i32 = list.get(i32, p.lar, (e.a + 8) as usize)   // bind triple: (conv, ns, ne)
     let bne: i32 = list.get(i32, p.lar, (e.a + 9) as usize)
     let bname: str = src[bns as usize .. bne as usize]
-    // The loop-index C type: hi's numeric prim (TyData kind 2, codes 0..11), else size_t.
+    // A negative *literal* step descends: compare with `>`/`>=` and use a signed index (so
+    // `size_t` underflow can't run the loop forever). Mirrors `descending` in the reference.
+    var descending: bool = false
+    if step >= 0 {
+        let sp: parser.ExprData = list.get(parser.ExprData, p.ex, step as usize)
+        if sp.kind == 3 and sp.op == 1 { descending = true }  // Unary neg
+    }
+    // The loop-index C type: int64_t when descending, else hi's numeric prim, else size_t.
     var numeric: i32 = 0 - 1
     if sx.b >= 0 {
         let tid: i32 = list.get(i32, c.et, sx.b as usize)
@@ -3277,7 +3694,9 @@ fn emit_range_for(mut sb: String, read p: parser.Parser, read src: str, read c: 
         }
     }
     indent(sb, depth)
-    if numeric >= 0 { prim_code_c(sb, numeric) } else { string_push(sb, "size_t") }
+    if descending { string_push(sb, "int64_t") }
+    else if numeric >= 0 { prim_code_c(sb, numeric) }
+    else { string_push(sb, "size_t") }
     string_push(sb, " _hi")
     push_uint(sb, n as i64)
     string_push(sb, " = ")
@@ -3285,7 +3704,9 @@ fn emit_range_for(mut sb: String, read p: parser.Parser, read src: str, read c: 
     string_push(sb, ";\n")
     indent(sb, depth)
     string_push(sb, "for (")
-    if numeric >= 0 { prim_code_c(sb, numeric) } else { string_push(sb, "size_t") }
+    if descending { string_push(sb, "int64_t") }
+    else if numeric >= 0 { prim_code_c(sb, numeric) }
+    else { string_push(sb, "size_t") }
     string_push(sb, " ")
     if str_eq(bname, "_") { string_push(sb, "_i")  push_uint(sb, n as i64) }
     else { string_push(sb, "j_")  string_push(sb, bname) }
@@ -3294,16 +3715,26 @@ fn emit_range_for(mut sb: String, read p: parser.Parser, read src: str, read c: 
     string_push(sb, "; ")
     if str_eq(bname, "_") { string_push(sb, "_i")  push_uint(sb, n as i64) }
     else { string_push(sb, "j_")  string_push(sb, bname) }
-    if sx.op == 1 { string_push(sb, " <= _hi") } else { string_push(sb, " < _hi") }
+    if descending {
+        if sx.op == 1 { string_push(sb, " >= _hi") } else { string_push(sb, " > _hi") }
+    } else {
+        if sx.op == 1 { string_push(sb, " <= _hi") } else { string_push(sb, " < _hi") }
+    }
     push_uint(sb, n as i64)
     string_push(sb, "; ")
     if str_eq(bname, "_") { string_push(sb, "_i")  push_uint(sb, n as i64) }
     else { string_push(sb, "j_")  string_push(sb, bname) }
-    string_push(sb, "++)\n")
-    // An exposed, exclusive `for i in lo..hi` registers a refinement for the body, so a `s[i]`
-    // whose range hi is `s.len` elides its bounds check (mirrors `cur_refines`/`index_in_range`).
+    if step >= 0 {                                    // stepped: `<i> += (<step>)`
+        string_push(sb, " += (")
+        emit_expr(sb, p, src, c, g, step)
+        string_push(sb, "))\n")
+    } else {
+        string_push(sb, "++)\n")
+    }
+    // An exposed, exclusive, unstepped `for i in lo..hi` registers a refinement for the body, so
+    // a `s[i]` whose range hi is `s.len` elides its bounds check (mirrors `cur_refines`).
     var refined: bool = false
-    if !str_eq(bname, "_") and sx.op == 0 {
+    if !str_eq(bname, "_") and sx.op == 0 and step < 0 {
         list.push(i32, g.rf, bns)
         list.push(i32, g.rf, bne)
         list.push(i32, g.rf, src0)
@@ -4269,11 +4700,11 @@ fn emit_main_wrapper(mut sb: String, read p: parser.Parser, read src: str) {
 // `"\n"` pushes stand in for the reference's unconditionally-blank sections that are empty for a
 // program with no aggregates (closure_types, method_protos, consts) plus the guarded no-ops.
 fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator) {
-    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1 }
+    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: list.make(i32, a), vtf: 0 }
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     collect_method_instances(g, p, src, c)           // (struct item, method fn item) pairs, first-seen
     collect_genum_instances(g, p, src, c)            // generic-enum instance TyIds, expr order
-    emit_prelude(sb)
+    emit_prelude(sb, p, src)
     emit_forward_types(sb, p, src)
     emit_gen_forward_types(sb, p, src, c, g)         // monomorphized generic-enum instance fwd typedefs
     // fn_type_typedefs: empty until fn-pointer types are ported.
