@@ -258,7 +258,20 @@ name's type — str push / String via `str_view(&…)` / bool ternary / decimal 
 names resolved against the current fn's params + lets (`Cg.curfn`, set around each fn/method
 body). Bare-name interps only; a general sub-expression interp still needs parser support.
 
-### NEXT increments — everything still remaining (the session-20+ worklist)
+### Increments 20–21 — vec fixes; scalar match + or-patterns (allowlist 44)
+
+**20** (+`vec`): `0b`/`0B` binary literals convert to decimal in `emit_int_literal` (C has no
+binary literals); `fn_is_template` (bracket generics via `it.h`, or ANY comptime param) now gates
+`emit_fn_protos`/`emit_fn_defs` so a comptime type-fn (`fn Vec(comptime T: type) -> type`) no
+longer leaks a bogus `void jestyr_Vec(void)`.
+
+**21** (+`orpat`, `ranges`): `emit_scalar_match` — an int/char/bool scrutinee (Checker prim code
+≤9, 12, 13) dispatches on the VALUE via an ordered if-chain sharing `emit_guarded_arm`, TWO temps.
+`scalar_pat_cond` writes the test (lit equality, range bounds, or-pattern ORs parenthesized
+alternatives; an everything-matching alternative makes the arm unconditional; wildcard/binding =
+none). Or-patterns of nullary variants in the unguarded tag switch → stacked `case` labels.
+
+### NEXT increments — everything still remaining (the session-22+ worklist)
 
 Allowlist is 15/130 (hello, bench_fib, eq_fold, distinct, compute, copy_optin, io, str_ops,
 substr, union, tests_demo, loops, slices, array_lit, errors); grow it file-by-file (`DUMP_DIVERGE=1` to converge;
