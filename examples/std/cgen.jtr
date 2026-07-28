@@ -375,6 +375,15 @@ fn expr_is_str(read c: typeck.Checker, eid: i32) -> bool {
     return d.kind == 2 and d.x == 14
 }
 
+// Is the Checker's type of expr `eid` the primitive with code `pc`? (TyData kind 2; codes per
+// typeck's `prim_name`: 14 str, 15 cstr, 16 os_str, 17 String, 18 Builder, 19 Cow.)
+fn expr_is_prim(read c: typeck.Checker, eid: i32, pc: i32) -> bool {
+    let tid: i32 = list.get(i32, c.et, eid as usize)
+    if tid < 0 { return false }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+    return d.kind == 2 and d.x == pc
+}
+
 // Is the Checker's type of expr `eid` a slice `[]T`? (TyData kind 8.)
 fn expr_is_slice(read c: typeck.Checker, eid: i32) -> bool {
     let tid: i32 = list.get(i32, c.et, eid as usize)
@@ -689,6 +698,10 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
                 return
             }
         }
+        // An owned `String`'s byte length is its real C field (O(1)).
+        if expr_is_prim(c, e.a, 17) {                 // prim code 17 = String
+            if str_eq(fname, "len") { string_push(sb, ".len")  return }
+        }
         string_push(sb, ".j_")
         string_push(sb, fname)
         return
@@ -991,6 +1004,25 @@ fn intrinsic_helper(read nm: str) -> str {
     if str_eq(nm, "substr") { return "jestyr_rt_substr" }
     if str_eq(nm, "count_cp") { return "jestyr_rt_count_cp" }
     if str_eq(nm, "count_graphemes") { return "jestyr_rt_count_graphemes" }
+    if str_eq(nm, "to_str_lossy") { return "jestyr_rt_to_str_lossy" }
+    if str_eq(nm, "string_from") { return "jestyr_rt_str_from" }
+    if str_eq(nm, "cow_borrow") { return "jestyr_rt_cow_borrow" }
+    if str_eq(nm, "cow_to_mut") { return "jestyr_rt_cow_to_mut" }
+    if str_eq(nm, "cow_view") { return "jestyr_rt_cow_view" }
+    if str_eq(nm, "cow_is_owned") { return "jestyr_rt_cow_is_owned" }
+    return ""
+}
+
+// Intrinsics that take their FIRST argument by address (`<helper>(&<a0>[, rest])`) — the mutating
+// owned-buffer operations. "" = not one of them.
+fn intrinsic_helper_byref(read nm: str) -> str {
+    if str_eq(nm, "string_push") { return "jestyr_rt_str_push" }
+    if str_eq(nm, "string_view") { return "jestyr_rt_str_view" }
+    if str_eq(nm, "string_free") { return "jestyr_rt_str_free" }
+    if str_eq(nm, "cow_free") { return "jestyr_rt_cow_free" }
+    if str_eq(nm, "builder_push") { return "jestyr_rt_b_push" }
+    if str_eq(nm, "builder_build") { return "jestyr_rt_b_build" }
+    if str_eq(nm, "builder_free") { return "jestyr_rt_b_free" }
     return ""
 }
 
@@ -1094,6 +1126,30 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_push(sb, ", j_")
             let fa: parser.ExprData = list.get(parser.ExprData, p.ex, arg_at(p, e, 1) as usize)
             string_push(sb, src[fa.start .. fa.end])
+            string_push(sb, ")")
+            return
+        }
+        if str_eq(nm, "string_new") { string_push(sb, "jestyr_rt_str_new()")  return }
+        if str_eq(nm, "builder_new") { string_push(sb, "jestyr_rt_b_new()")  return }
+        if str_eq(nm, "os_from_bytes") {              // reinterpret a byte slice as an os_str view
+            string_push(sb, "({ __typeof__(")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            string_push(sb, ") _ob = ")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            string_push(sb, "; (JestyrStr){ (const char*)_ob.ptr, _ob.len }; })")
+            return
+        }
+        let bref: str = intrinsic_helper_byref(nm)    // `<helper>(&<a0>[, rest])`
+        if !str_eq(bref, "") {
+            string_push(sb, bref)
+            string_push(sb, "(&")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            var bi: i32 = 1
+            for bi < e.y {
+                string_push(sb, ", ")
+                emit_expr(sb, p, src, c, g, arg_at(p, e, bi))
+                bi = bi + 1
+            }
             string_push(sb, ")")
             return
         }
