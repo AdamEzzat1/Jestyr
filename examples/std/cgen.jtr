@@ -171,6 +171,11 @@ fn emit_c_ty(mut sb: String, read p: parser.Parser, read src: str, tyid: i32) {
         push_array_len(sb, p, src, t.b)                // b = len ExprId
         return
     }
+    if t.kind == 5 {                                   // GenRef `&T`: `JestyrRef_<elem mangle>`
+        string_push(sb, "JestyrRef_")
+        push_ast_mangle(sb, p, src, t.a)
+        return
+    }
     if t.kind == 7 {                                   // App `Ctor(args)`: `Jestyr_<ctor>__<args>`
         string_push(sb, "Jestyr_")
         string_push(sb, src[t.x as usize .. t.y as usize])
@@ -202,6 +207,7 @@ fn push_ast_mangle(mut sb: String, read p: parser.Parser, read src: str, tyid: i
     if t.kind == 0 { string_push(sb, src[t.start .. t.end])  return }
     if t.kind == 2 { string_push(sb, "ptr_")  push_ast_mangle(sb, p, src, t.a)  return }
     if t.kind == 3 { string_push(sb, "slice_")  push_ast_mangle(sb, p, src, t.a)  return }
+    if t.kind == 5 { string_push(sb, "ref_")  push_ast_mangle(sb, p, src, t.a)  return }   // GenRef
     if t.kind == 4 {                                   // Array: `arr_<elem>_<len>`
         string_push(sb, "arr_")
         push_ast_mangle(sb, p, src, t.a)
@@ -272,6 +278,11 @@ fn emit_ty_c(mut sb: String, read src: str, read c: typeck.Checker, tyid: i32) {
         push_ty_mangle(sb, src, c, d.a)                        // a = ok type
         return
     }
+    if d.kind == 10 {                                          // GenRef `&T`: `JestyrRef_<elem mangle>`
+        string_push(sb, "JestyrRef_")
+        push_ty_mangle(sb, src, c, d.a)
+        return
+    }
     if d.kind == 6 {                                           // GenStruct/GenEnum instance: `Jestyr_<ctor>__<args>`
         string_push(sb, "Jestyr_")
         string_push(sb, src[d.x as usize .. d.y as usize])
@@ -301,6 +312,7 @@ fn push_ty_mangle(mut sb: String, read src: str, read c: typeck.Checker, tyid: i
     }
     if d.kind == 3 { string_push(sb, "ptr_")  push_ty_mangle(sb, src, c, d.a)  return }
     if d.kind == 8 { string_push(sb, "slice_")  push_ty_mangle(sb, src, c, d.a)  return }
+    if d.kind == 10 { string_push(sb, "ref_")  push_ty_mangle(sb, src, c, d.a)  return }   // GenRef
     if d.kind == 9 {                                           // Array: `arr_<elem>_<len>`
         string_push(sb, "arr_")
         push_ty_mangle(sb, src, c, d.a)
@@ -935,8 +947,30 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
     }
     if e.kind == 32 { string_push(sb, "break")  return }      // Break (plain; labels later)
     if e.kind == 33 { string_push(sb, "continue")  return }   // Continue
-    if e.kind == 7 {                                  // Deref: (*<base>). (genref deref deferred)
-        string_push(sb, "(*")
+    if e.kind == 7 {                                  // Deref
+        let btid: i32 = list.get(i32, c.et, e.a as usize)
+        if btid >= 0 {
+            let bd: typeck.TyData = list.get(typeck.TyData, c.tys, btid as usize)
+            if bd.kind == 10 {                        // genref deref: generation check, ONE temp
+                let n: i32 = g.tmp
+                g.tmp = g.tmp + 1
+                string_push(sb, "({ ")
+                emit_ty_c(sb, src, c, btid)
+                string_push(sb, " _r")
+                push_uint(sb, n as i64)
+                string_push(sb, " = (")
+                emit_expr(sb, p, src, c, g, e.a)
+                string_push(sb, "); assert(((uint64_t*)_r")
+                push_uint(sb, n as i64)
+                string_push(sb, ".ptr)[-1] == _r")
+                push_uint(sb, n as i64)
+                string_push(sb, ".gen); *_r")
+                push_uint(sb, n as i64)
+                string_push(sb, ".ptr; })")
+                return
+            }
+        }
+        string_push(sb, "(*")                         // plain pointer deref
         emit_expr(sb, p, src, c, g, e.a)
         string_push(sb, ")")
         return
@@ -1424,6 +1458,49 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_push(sb, " _u = ")
             emit_expr(sb, p, src, c, g, a0)
             string_push(sb, "; jestyr_rt_valid_utf8((const char*)_u.ptr, _u.len) ? (JestyrResult_str){ .is_err = false, .ok = (JestyrStr){ (const char*)_u.ptr, _u.len } } : (JestyrResult_str){ .is_err = true, .err = 1 }; })")
+            return
+        }
+        if str_eq(nm, "gen_new") {                    // gen_new(T, v): allocate [gen | T], init, {ptr, gen}. ONE temp.
+            let n: i32 = g.tmp
+            g.tmp = g.tmp + 1
+            let ty0: parser.ExprData = list.get(parser.ExprData, p.ex, arg_at(p, e, 0) as usize)
+            string_push(sb, "({ void* _b")
+            push_uint(sb, n as i64)
+            string_push(sb, " = malloc(8 + sizeof(")
+            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            string_push(sb, ")); *(uint64_t*)_b")
+            push_uint(sb, n as i64)
+            string_push(sb, " = 1; ")
+            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            string_push(sb, "* _p")
+            push_uint(sb, n as i64)
+            string_push(sb, " = (")
+            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            string_push(sb, "*)((char*)_b")
+            push_uint(sb, n as i64)
+            string_push(sb, " + 8); *_p")
+            push_uint(sb, n as i64)
+            string_push(sb, " = (")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 1))
+            string_push(sb, "); (JestyrRef_")
+            string_push(sb, src[ty0.start .. ty0.end])   // elem type name = its own mangle
+            string_push(sb, "){ _p")
+            push_uint(sb, n as i64)
+            string_push(sb, ", 1 }; })")
+            return
+        }
+        if str_eq(nm, "gen_free") {                   // gen_free(r): bump the generation. ONE temp.
+            let n: i32 = g.tmp
+            g.tmp = g.tmp + 1
+            string_push(sb, "({ ")
+            emit_ty_c(sb, src, c, list.get(i32, c.et, arg_at(p, e, 0) as usize))
+            string_push(sb, " _r")
+            push_uint(sb, n as i64)
+            string_push(sb, " = (")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            string_push(sb, "); ((uint64_t*)_r")
+            push_uint(sb, n as i64)
+            string_push(sb, ".ptr)[-1]++; })")
             return
         }
         if str_eq(nm, "slice") {                      // slice(T, ptr, n) -> (JestyrSlice_<T>){ ptr, (size_t)(n) }
@@ -3860,6 +3937,69 @@ fn push_array_typedef_raw(mut sb: String, read key: str, mut seen: String, read 
     return true
 }
 
+// One `typedef struct { <E>* ptr; uint64_t gen; } JestyrRef_<m>;`, deduped by elem mangle.
+fn push_genref_typedef(mut sb: String, mut seen: String, read m: str, read ecty: str) -> bool {
+    var probe: String = string_new()
+    string_push(probe, "|")
+    string_push(probe, m)
+    string_push(probe, "|")
+    if contains(string_view(seen), string_view(probe)) { string_free(probe)  return false }
+    string_push(seen, string_view(probe))
+    string_free(probe)
+    string_push(sb, "typedef struct { ")
+    string_push(sb, ecty)
+    string_push(sb, "* ptr; uint64_t gen; } JestyrRef_")
+    string_push(sb, m)
+    string_push(sb, ";\n")
+    return true
+}
+
+// Generational-reference typedefs (mirrors `collect_genrefs` + `genref_struct_defs`): every
+// distinct `&T` element — the type arena's GenRef annotations first (arena order), then
+// `gen_new(T, …)` constructions (expr order) — one `JestyrRef_<T>` each, + a CONDITIONAL
+// trailing blank. `{ E* ptr; gen }` embeds E only through a pointer, so no by-value dep.
+fn emit_genref_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker) {
+    var any: bool = false
+    var seen: String = string_new()
+    var ti: usize = 0
+    for ti < list.len(parser.TypeData, p.ty) {
+        let t: parser.TypeData = list.get(parser.TypeData, p.ty, ti)
+        if t.kind == 5 {                              // a `&T` annotation
+            var m: String = string_new()
+            push_ast_mangle(m, p, src, t.a)
+            var ec: String = string_new()
+            emit_c_ty(ec, p, src, t.a)
+            any = push_genref_typedef(sb, seen, string_view(m), string_view(ec)) or any
+            string_free(m)
+            string_free(ec)
+        }
+        ti = ti + 1
+    }
+    var e2: usize = 0
+    for e2 < list.len(parser.ExprData, p.ex) {
+        let e: parser.ExprData = list.get(parser.ExprData, p.ex, e2)
+        if e.kind == 10 {
+            let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+            if callee.kind == 2 {
+                if str_eq(src[callee.start .. callee.end], "gen_new") {
+                    if e.y >= 1 {
+                        let ax: parser.ExprData = list.get(parser.ExprData, p.ex, arg_at(p, e, 0) as usize)
+                        if ax.kind == 2 {             // the bare-Name type arg is its own mangle
+                            var ec: String = string_new()
+                            emit_type_arg_cty(ec, p, src, arg_at(p, e, 0))
+                            any = push_genref_typedef(sb, seen, src[ax.start .. ax.end], string_view(ec)) or any
+                            string_free(ec)
+                        }
+                    }
+                }
+            }
+        }
+        e2 = e2 + 1
+    }
+    if any { string_push(sb, "\n") }
+    string_free(seen)
+}
+
 // Result-struct typedefs. `JestyrResult_str` (the `try_from_utf8` intrinsic's result) is emitted
 // unconditionally up front; fallible user functions add their own (none in `hello`).
 fn emit_result_defs(mut sb: String, read p: parser.Parser, read src: str) {
@@ -4019,7 +4159,8 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
     emit_gen_enum_defs(sb, p, src, c, g)             // generic-enum instance defs (after plain enums)
     emit_slice_defs(sb, p, src, c)                   // slice typedefs (after aggregates)
     emit_array_defs(sb, p, src, c)                   // array typedefs (after slices)
-    // gen-struct / genref defs: empty until those are ported.
+    emit_genref_defs(sb, p, src, c)                  // genref typedefs (after arrays)
+    // gen-struct defs: empty until comptime-ctor structs are ported.
     emit_result_defs(sb, p, src)
     // flush_def_capture / dyn_typedefs: no-ops here (no by-value dep reorder needed).
     emit_extern_protos(sb, p, src)                   // `extern "c"` prototypes (bare names)
