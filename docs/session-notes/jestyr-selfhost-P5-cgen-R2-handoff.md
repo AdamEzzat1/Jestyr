@@ -273,8 +273,14 @@ none). Or-patterns of nullary variants in the unguarded tag switch → stacked `
 
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
-Allowlist is 15/130 (hello, bench_fib, eq_fold, distinct, compute, copy_optin, io, str_ops,
-substr, union, tests_demo, loops, slices, array_lit, errors); grow it file-by-file (`DUMP_DIVERGE=1` to converge;
+> **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
+> 44/130) lives in `jestyr-selfhost-and-backend-roadmap.md` Horizon 1 — use that first; the
+> list below is kept for its per-construct reference pointers. Done since it was written:
+> ArrayRepeat still pending, but FString, Try, error sets, enums + flat/guarded/scalar match,
+> or-patterns, struct methods, generic-enum instances, String/Cow/Builder, alloc/utf8,
+> template suppression all landed (increments 9–21).
+
+Grow the allowlist file-by-file (`DUMP_DIVERGE=1` to converge;
 probe the whole corpus after each construct — files unlock in clusters). Expr kinds handled so
 far: 0 Int, 1 Float, 2 Name, 3 Unary, 4 Binary, 5 Field, 6 Index (str-range + slice), 7 Deref,
 10 Call, 11 Cast, 12 Assign, 13 Range (str-index), 16 StructLit, 23 Block, 24 If, 25 Unsafe,
