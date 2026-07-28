@@ -235,7 +235,30 @@ position `goto`s a shared `jm_end_{n+1}`, return position closes `__builtin_unre
 an unguarded catch-all exists. **It consumes TWO temps** (scrutinee + end label) exactly like the
 reference — the global counter must stay in lockstep or every later temp desyncs.
 
-### NEXT increments — everything still remaining (the session-17+ worklist)
+### Increments 17–19 — owned strings; alloc/utf8/str-bytes; f-strings (allowlist 41)
+
+**17 — String/Cow/Builder intrinsics** (+`builder`, `cow`, `os_str`, `owned_string`). A second
+intrinsic table `intrinsic_helper_byref` for the mutating owned-buffer ops that take arg 0 by
+address (`string_push/view/free`, `cow_free`, `builder_push/build/free` → `<helper>(&<a0>, …)`);
+by-value additions `to_str_lossy`/`string_from`/`cow_borrow`/`cow_to_mut`/`cow_view`/
+`cow_is_owned`; zero-arg `string_new`/`builder_new`; `os_from_bytes` (the `__typeof__` stmt-expr,
+consumes NO temp). String `.len` is a bare C field via `expr_is_prim` — **String is prim code 17**
+(14 str, 15 cstr, 16 os_str, 18 Builder, 19 Cow).
+
+**18 — alloc/utf8 + str bytes** (+`strings`, `utf8_validate`, `slice_utf8`). `alloc(T,n)`/
+`realloc(T,p,n)` via the type-arg renderer; `is_utf8`/`from_utf8` spill into a FIXED `_u` (no temp
+consumed) — check vs assert-then-view; `bytes(s)` → `JestyrSlice_u8` view (consumes `_bv{n}`);
+`count_codepoints`; scalar str index `s[i]` → `((uint8_t)(<s>).ptr[(<i>)])`; `for b in s` byte
+iteration (`emit_str_for`: `JestyrStr _str{n}` snapshot, `uint8_t j_b = (uint8_t)_str{n}.ptr[_k{n}];`).
+
+**19 — f-strings WITHOUT a parser change** (+`fstring`). The kind-22 node is span-only, so
+`emit_fstring` re-scans the token text from src (the parser-dump trick) into the reference's
+`({ JestyrString _fs{n} = jestyr_rt_str_new(); …; _fs{n}; })` push chain. Interp dispatch by the
+name's type — str push / String via `str_view(&…)` / bool ternary / decimal `str_push_i64` — with
+names resolved against the current fn's params + lets (`Cg.curfn`, set around each fn/method
+body). Bare-name interps only; a general sub-expression interp still needs parser support.
+
+### NEXT increments — everything still remaining (the session-20+ worklist)
 
 Allowlist is 15/130 (hello, bench_fib, eq_fold, distinct, compute, copy_optin, io, str_ops,
 substr, union, tests_demo, loops, slices, array_lit, errors); grow it file-by-file (`DUMP_DIVERGE=1` to converge;
