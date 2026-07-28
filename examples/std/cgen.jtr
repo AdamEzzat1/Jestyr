@@ -1895,6 +1895,13 @@ fn emit_match(mut sb: String, read p: parser.Parser, read src: str, read c: type
     // Resolve the scrutinee's enum: a plain Named enum or a generic-enum instance. `pfx` is the
     // shared C name — both the scrutinee's C type and the tag/case prefix.
     let stid: i32 = list.get(i32, c.et, scrut as usize)
+    if stid >= 0 {
+        let sd0: typeck.TyData = list.get(typeck.TyData, c.tys, stid as usize)
+        if sd0.kind == 2 and (sd0.x <= 9 or sd0.x == 12 or sd0.x == 13) {   // int/bool/char scrutinee
+            emit_scalar_match(sb, p, src, c, g, e, stid, ret, depth)
+            return
+        }
+    }
     var inst: i32 = 0 - 1
     var enum_iid: i32 = 0 - 1
     let row: i32 = expr_enum_row(c, scrut)
@@ -1977,12 +1984,130 @@ fn emit_match(mut sb: String, read p: parser.Parser, read src: str, read c: type
             emit_arm_body(sb, p, src, c, g, body, ret, cd + 1)
             if !ret { line_at(sb, cd + 1, "break;") }
             line_at(sb, cd, "}")
+        } else if pd.kind == 6 {                      // or-pattern of nullary variants: stacked cases
+            var oi: i32 = 0
+            for oi < pd.a {                           // (op,a) = alternative PatIds in par
+                let alt: i32 = list.get(i32, p.par, (pd.op + oi) as usize)
+                let ad: parser.PatData = list.get(parser.PatData, p.pt, alt as usize)
+                indent(sb, cd)
+                string_push(sb, "case ")  string_push(sb, string_view(pfx))  string_push(sb, "_")
+                string_push(sb, src[ad.start .. ad.end])
+                string_push(sb, ":\n")
+                oi = oi + 1
+            }
+            line_at(sb, cd, "{")
+            emit_arm_body(sb, p, src, c, g, body, ret, cd + 1)
+            if !ret { line_at(sb, cd + 1, "break;") }
+            line_at(sb, cd, "}")
         }
         k = k + 1
     }
     line_at(sb, depth, "}")
     if ret and !has_default { line_at(sb, depth, "__builtin_unreachable();") }
     string_free(pfx)
+}
+
+// A `match` on a scalar (int/char/bool) scrutinee -> an ordered if-chain on the VALUE (there is
+// no tag to switch on); mirrors `emit_scalar_match`. Each arm: `if (<cond>) { [bind;] body }`
+// with the guard machinery shared with the enum chain; consumes TWO temps (value + end label).
+fn emit_scalar_match(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, stid: i32, ret: bool, depth: i32) {
+    let n: i32 = g.tmp
+    g.tmp = g.tmp + 1
+    let nend: i32 = g.tmp
+    g.tmp = g.tmp + 1
+    indent(sb, depth)
+    emit_ty_c(sb, src, c, stid)
+    string_push(sb, " jm_")
+    push_uint(sb, n as i64)
+    string_push(sb, " = ")
+    emit_expr(sb, p, src, c, g, e.a)
+    string_push(sb, ";\n")
+    var has_uncond_default: bool = false
+    var k: i32 = 0
+    for k < e.y {
+        let ab: i32 = e.x + k * 3
+        let pat: i32 = list.get(i32, p.par, ab as usize)
+        let guard: i32 = list.get(i32, p.par, (ab + 1) as usize)
+        let body: i32 = list.get(i32, p.par, (ab + 2) as usize)
+        let pd: parser.PatData = list.get(parser.PatData, p.pt, pat as usize)
+        var cond: String = string_new()
+        let has_cond: bool = scalar_pat_cond(cond, p, src, c, g, pat, n)
+        if !has_cond and guard < 0 { has_uncond_default = true }
+        if has_cond {
+            indent(sb, depth)
+            string_push(sb, "if (")
+            string_push(sb, string_view(cond))
+            string_push(sb, ")\n")
+        }
+        line_at(sb, depth, "{")
+        if pd.kind == 1 {                             // a bare name binds the scrutinee value
+            indent(sb, depth + 1)
+            emit_ty_c(sb, src, c, stid)
+            string_push(sb, " j_")
+            string_push(sb, src[pd.start .. pd.end])
+            string_push(sb, " = jm_")
+            push_uint(sb, n as i64)
+            string_push(sb, ";\n")
+        }
+        emit_guarded_arm(sb, p, src, c, g, body, guard, ret, nend, depth + 1)
+        line_at(sb, depth, "}")
+        string_free(cond)
+        k = k + 1
+    }
+    if !ret {
+        indent(sb, depth)
+        string_push(sb, "jm_end_")
+        push_uint(sb, nend as i64)
+        string_push(sb, ": ;\n")
+    } else if !has_uncond_default {
+        line_at(sb, depth, "__builtin_unreachable();")
+    }
+}
+
+// The C value test of a scalar pattern against `jm_{n}`, written into `cond`; false = the
+// pattern matches everything (wildcard/binding). Mirrors `scalar_pat_cond`: a literal tests
+// equality, a range tests bounds, an or-pattern ORs its alternatives (each parenthesized;
+// an alternative that matches everything makes the whole pattern unconditional).
+fn scalar_pat_cond(mut cond: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, pat: i32, n: i32) -> bool {
+    let pd: parser.PatData = list.get(parser.PatData, p.pt, pat as usize)
+    if pd.kind == 4 {                                 // Lit: a = the literal ExprId
+        string_push(cond, "jm_")
+        push_uint(cond, n as i64)
+        string_push(cond, " == (")
+        emit_expr(cond, p, src, c, g, pd.a)
+        string_push(cond, ")")
+        return true
+    }
+    if pd.kind == 5 {                                 // Range: a=lo, b=hi, op=inclusive
+        string_push(cond, "jm_")
+        push_uint(cond, n as i64)
+        string_push(cond, " >= (")
+        emit_expr(cond, p, src, c, g, pd.a)
+        string_push(cond, ") && jm_")
+        push_uint(cond, n as i64)
+        if pd.op == 1 { string_push(cond, " <= (") } else { string_push(cond, " < (") }
+        emit_expr(cond, p, src, c, g, pd.b)
+        string_push(cond, ")")
+        return true
+    }
+    if pd.kind == 6 {                                 // Or: (op,a) = alternative PatIds in par
+        var i: i32 = 0
+        for i < pd.a {
+            var alt: String = string_new()
+            if !scalar_pat_cond(alt, p, src, c, g, list.get(i32, p.par, (pd.op + i) as usize), n) {
+                string_free(alt)
+                return false                          // an alternative matches everything
+            }
+            if i > 0 { string_push(cond, " || ") }
+            string_push(cond, "(")
+            string_push(cond, string_view(alt))
+            string_push(cond, ")")
+            string_free(alt)
+            i = i + 1
+        }
+        return true
+    }
+    return false                                      // wildcard / binding catch-all
 }
 
 // A `match` with at least one guarded arm -> an ordered if-chain (mirrors `emit_guarded_match`):
