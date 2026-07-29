@@ -1089,6 +1089,42 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
     }
     if e.kind == 16 {                                 // StructLit: (Jestyr_X){ .j_f = v, … }
         let path: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)   // a = path Name expr
+        // `circle { r: 2.0 }` — a struct-VARIANT construction: the path is an enum variant.
+        let svenum: i32 = find_variant_enum(p, src, path.start, path.end)
+        if svenum >= 0 {
+            let own: i32 = list.get(i32, c.et, eid as usize)
+            let nvb: i32 = niche_of_tyid(p, src, c, own)     // niche: `some { p }` IS the pointer
+            if nvb >= 0 {
+                if e.y > 0 {
+                    let fi0: parser.ExprData = list.get(parser.ExprData, p.ex, list.get(i32, p.ar, e.x as usize) as usize)
+                    emit_expr(sb, p, src, c, g, fi0.a)
+                } else { string_push(sb, "0") }
+                return
+            }
+            if genum_item_of(p, src, c, own) >= 0 {
+                emit_gvariant_head(sb, p, src, c, own, src[path.start .. path.end])
+            } else {
+                emit_variant_head(sb, p, src, svenum, src[path.start .. path.end])
+            }
+            if e.y > 0 {
+                string_push(sb, ", .u.")
+                string_push(sb, src[path.start .. path.end])
+                string_push(sb, " = { ")
+                var svi: i32 = 0
+                for svi < e.y {
+                    if svi > 0 { string_push(sb, ", ") }
+                    let fi_: parser.ExprData = list.get(parser.ExprData, p.ex, list.get(i32, p.ar, (e.x + svi) as usize) as usize)
+                    string_push(sb, ".j_")
+                    string_push(sb, src[fi_.x as usize .. fi_.y as usize])
+                    string_push(sb, " = ")
+                    emit_expr(sb, p, src, c, g, fi_.a)
+                    svi = svi + 1
+                }
+                string_push(sb, " }")
+            }
+            string_push(sb, " }")
+            return
+        }
         // `Point { x: 9, ..p }` — functional update: copy the spread base, assign listed fields.
         if e.b >= 0 {
             let n: i32 = g.tmp
@@ -4049,6 +4085,9 @@ fn niche_app_pay(read p: parser.Parser, read src: str, read t: parser.TypeData) 
 // Ident naming the nullary variant), and a wildcard/binding catch-all. Mirrors
 // `emit_niche_match` (the guarded counterpart is a later increment).
 fn emit_niche_match(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, stid: i32, some_vb: i32, ret: bool, depth: i32) {
+    // the scrutinee emits FIRST (its own temps number before the match temp — reference order)
+    var scr: String = string_new()
+    emit_expr(scr, p, src, c, g, e.a)
     let n: i32 = g.tmp
     g.tmp = g.tmp + 1
     var pay: String = string_new()
@@ -4075,8 +4114,9 @@ fn emit_niche_match(mut sb: String, read p: parser.Parser, read src: str, read c
     string_push(sb, " jm_")
     push_uint(sb, n as i64)
     string_push(sb, " = ")
-    emit_expr(sb, p, src, c, g, e.a)
+    string_push(sb, string_view(scr))
     string_push(sb, ";\n")
+    string_free(scr)
     // classify the arms
     var some_body: i32 = 0 - 1
     var some_bns: i32 = 0 - 1
@@ -4153,6 +4193,273 @@ fn emit_niche_match(mut sb: String, read p: parser.Parser, read src: str, read c
     string_free(pay)
 }
 
+// ---- nested / struct-variant match (mirrors `pat_needs_nesting`/`pat_test`/
+// `emit_nested_match`): a constructor inside a variant's fields — or any struct-variant
+// pattern — needs the recursive decision-tree lowering (an ordered if-chain of pattern
+// tests, auto-dereferencing pointer fields to look through `indirect` recursion). ----
+
+// Is this pattern a constructor (something that TESTS rather than just binds)?
+fn pat_is_ctor(read p: parser.Parser, read src: str, pat: i32) -> bool {
+    let pd: parser.PatData = list.get(parser.PatData, p.pt, pat as usize)
+    if pd.kind == 2 or pd.kind == 3 or pd.kind == 4 or pd.kind == 5 { return true }
+    if pd.kind == 1 { return find_variant_enum(p, src, pd.start, pd.end) >= 0 }
+    if pd.kind == 6 {
+        var i: i32 = 0
+        for i < pd.a {
+            if pat_is_ctor(p, src, list.get(i32, p.par, (pd.op + i) as usize)) { return true }
+            i = i + 1
+        }
+    }
+    return false
+}
+
+fn is_flat_subpat(read p: parser.Parser, read src: str, sp: i32) -> bool {
+    let pd: parser.PatData = list.get(parser.PatData, p.pt, sp as usize)
+    if pd.kind == 0 or pd.kind == 7 { return true }   // wildcard / rest
+    if pd.kind == 1 { return find_variant_enum(p, src, pd.start, pd.end) < 0 }   // a binding
+    return false
+}
+
+fn pat_needs_nesting(read p: parser.Parser, read src: str, pat: i32) -> bool {
+    let pd: parser.PatData = list.get(parser.PatData, p.pt, pat as usize)
+    if pd.kind == 2 {                                 // Variant: any non-flat subpat
+        var i: i32 = 0
+        for i < pd.a {
+            if !is_flat_subpat(p, src, list.get(i32, p.par, (pd.op + i) as usize)) { return true }
+            i = i + 1
+        }
+        return false
+    }
+    if pd.kind == 3 { return true }                   // a struct-variant pattern is always recursive
+    if pd.kind == 6 {
+        var i: i32 = 0
+        for i < pd.a {
+            if pat_needs_nesting(p, src, list.get(i32, p.par, (pd.op + i) as usize)) { return true }
+            i = i + 1
+        }
+    }
+    return false
+}
+
+// The recursive pattern test: appends the C boolean for `pat` against `subject` (C type
+// `scty`, enum item `eit` or -1) to `tst` ("1" = irrefutable) and any binding declarations
+// (unindented `;\n`-terminated lines) to `bnd`. Mirrors `pat_test`.
+fn pat_test(mut tst: String, mut bnd: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read subject: str, read scty: str, eit: i32, pat: i32) {
+    let pd: parser.PatData = list.get(parser.PatData, p.pt, pat as usize)
+    if pd.kind == 0 or pd.kind == 7 or pd.kind == 8 { string_push(tst, "1")  return }
+    if pd.kind == 1 {
+        if find_variant_enum(p, src, pd.start, pd.end) >= 0 {   // a nullary variant: tag test
+            let enn: parser.ItemData = list.get(parser.ItemData, p.it, eit as usize)
+            string_push(tst, subject)
+            string_push(tst, ".tag == Jestyr_")
+            string_push(tst, src[enn.x .. enn.y])
+            string_push(tst, "_")
+            string_push(tst, src[pd.start .. pd.end])
+            return
+        }
+        string_push(tst, "1")                         // a binding
+        string_push(bnd, scty)
+        string_push(bnd, " j_")
+        string_push(bnd, src[pd.start .. pd.end])
+        string_push(bnd, " = ")
+        string_push(bnd, subject)
+        string_push(bnd, ";\n")
+        return
+    }
+    if pd.kind == 4 {                                 // literal
+        string_push(tst, subject)
+        string_push(tst, " == (")
+        emit_expr(tst, p, src, c, g, pd.a)
+        string_push(tst, ")")
+        return
+    }
+    if pd.kind == 5 {                                 // range
+        string_push(tst, subject)
+        string_push(tst, " >= (")
+        emit_expr(tst, p, src, c, g, pd.a)
+        string_push(tst, ") && ")
+        string_push(tst, subject)
+        if pd.op == 1 { string_push(tst, " <= (") } else { string_push(tst, " < (") }
+        emit_expr(tst, p, src, c, g, pd.b)
+        string_push(tst, ")")
+        return
+    }
+    if pd.kind == 6 {                                 // or-pattern: OR of alternatives (no binds)
+        var i: i32 = 0
+        for i < pd.a {
+            if i > 0 { string_push(tst, " || ") }
+            string_push(tst, "(")
+            var dummy: String = string_new()
+            pat_test(tst, dummy, p, src, c, g, subject, scty, eit, list.get(i32, p.par, (pd.op + i) as usize))
+            string_free(dummy)
+            string_push(tst, ")")
+            i = i + 1
+        }
+        return
+    }
+    if pd.kind == 2 or pd.kind == 3 {                 // variant / struct-variant
+        let vname: str = src[pd.x as usize .. pd.y as usize]
+        let enn: parser.ItemData = list.get(parser.ItemData, p.it, eit as usize)
+        string_push(tst, subject)
+        string_push(tst, ".tag == Jestyr_")
+        string_push(tst, src[enn.x .. enn.y])
+        string_push(tst, "_")
+        string_push(tst, vname)
+        let vb: i32 = variant_tuple(p, src, eit, pd.x as usize, pd.y as usize)
+        if vb < 0 { return }
+        let fstart: i32 = list.get(i32, p.ear, (vb + 2) as usize)
+        let fcount: i32 = list.get(i32, p.ear, (vb + 3) as usize)
+        var i: i32 = 0
+        for i < pd.a {
+            var sub: i32 = 0 - 1
+            var fb: i32 = 0 - 1
+            if pd.kind == 2 {                         // positional: field i
+                sub = list.get(i32, p.par, (pd.op + i) as usize)
+                let spd0: parser.PatData = list.get(parser.PatData, p.pt, sub as usize)
+                if spd0.kind == 7 { i = pd.a  continue }   // trailing `..` stops the walk
+                fb = fstart + i * 3
+            } else {                                  // by NAME: find the decl field
+                let pfns: i32 = list.get(i32, p.par, (pd.op + i * 3) as usize)
+                let pfne: i32 = list.get(i32, p.par, (pd.op + i * 3 + 1) as usize)
+                sub = list.get(i32, p.par, (pd.op + i * 3 + 2) as usize)
+                var f2: i32 = 0
+                for f2 < fcount {
+                    let dfns: i32 = list.get(i32, p.ear, (fstart + f2 * 3) as usize)
+                    let dfne: i32 = list.get(i32, p.ear, (fstart + f2 * 3 + 1) as usize)
+                    if str_eq(src[pfns as usize .. pfne as usize], src[dfns as usize .. dfne as usize]) { fb = fstart + f2 * 3 }
+                    f2 = f2 + 1
+                }
+            }
+            if fb >= 0 and (pd.kind == 3 or i < fcount) {
+                let fns: i32 = list.get(i32, p.ear, fb as usize)
+                let fne: i32 = list.get(i32, p.ear, (fb + 1) as usize)
+                var fty: i32 = list.get(i32, p.ear, (fb + 2) as usize)
+                var fpath: String = string_new()
+                string_push(fpath, subject)
+                string_push(fpath, ".u.")
+                string_push(fpath, vname)
+                string_push(fpath, ".j_")
+                string_push(fpath, src[fns as usize .. fne as usize])
+                // auto-deref: a constructor pattern against a pointer field looks THROUGH it
+                var deref: bool = false
+                if pat_is_ctor(p, src, sub) and fty >= 0 {
+                    let ftd: parser.TypeData = list.get(parser.TypeData, p.ty, fty as usize)
+                    if ftd.kind == 2 or ftd.kind == 6 { deref = true  fty = ftd.a }
+                }
+                var subj2: String = string_new()
+                if deref {
+                    string_push(subj2, "(*")
+                    string_push(subj2, string_view(fpath))
+                    string_push(subj2, ")")
+                } else {
+                    string_push(subj2, string_view(fpath))
+                }
+                var scty2: String = string_new()
+                emit_c_ty(scty2, p, src, fty)
+                var eit2: i32 = 0 - 1
+                if fty >= 0 {
+                    let ftd2: parser.TypeData = list.get(parser.TypeData, p.ty, fty as usize)
+                    if ftd2.kind == 0 { eit2 = find_enum_item(p, src, ftd2.start, ftd2.end) }
+                }
+                var sub_t: String = string_new()
+                pat_test(sub_t, bnd, p, src, c, g, string_view(subj2), string_view(scty2), eit2, sub)
+                if !str_eq(string_view(sub_t), "1") {
+                    string_push(tst, " && ")
+                    string_push(tst, string_view(sub_t))
+                }
+                string_free(sub_t)
+                string_free(scty2)
+                string_free(subj2)
+                string_free(fpath)
+            }
+            i = i + 1
+        }
+        return
+    }
+}
+
+// A `match` with nested / struct-variant patterns: an ordered if-chain of recursive tests
+// (TWO temps: scrutinee + end label — the scrutinee expr emits FIRST, so its own temps
+// number before them). Mirrors `emit_nested_match`.
+fn emit_nested_match(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, stid: i32, ret: bool, depth: i32) {
+    var scrut: String = string_new()
+    emit_expr(scrut, p, src, c, g, e.a)
+    let n: i32 = g.tmp
+    g.tmp = g.tmp + 1
+    let nend: i32 = g.tmp
+    g.tmp = g.tmp + 1
+    var scty: String = string_new()
+    emit_ty_c(scty, p, src, c, stid)
+    var eit: i32 = 0 - 1
+    let row: i32 = expr_enum_row(c, e.a)
+    if row >= 0 {
+        let ens: i32 = list.get(i32, c.tdecl, (row * 10 + 0) as usize)
+        let ene: i32 = list.get(i32, c.tdecl, (row * 10 + 1) as usize)
+        eit = find_enum_item(p, src, ens as usize, ene as usize)
+    }
+    var subj: String = string_new()
+    string_push(subj, "jm_")
+    push_uint(subj, n as i64)
+    indent(sb, depth)
+    string_push(sb, string_view(scty))
+    string_push(sb, " ")
+    string_push(sb, string_view(subj))
+    string_push(sb, " = ")
+    string_push(sb, string_view(scrut))
+    string_push(sb, ";\n")
+    var has_uncond: bool = false
+    var k: i32 = 0
+    for k < e.y {
+        let ab: i32 = e.x + k * 3
+        let pat: i32 = list.get(i32, p.par, ab as usize)
+        let guard: i32 = list.get(i32, p.par, (ab + 1) as usize)
+        let body: i32 = list.get(i32, p.par, (ab + 2) as usize)
+        var tst: String = string_new()
+        var bnd: String = string_new()
+        pat_test(tst, bnd, p, src, c, g, string_view(subj), string_view(scty), eit, pat)
+        let uncond: bool = str_eq(string_view(tst), "1")
+        if uncond and guard < 0 { has_uncond = true }
+        if uncond {
+            line_at(sb, depth, "{")
+        } else {
+            indent(sb, depth)
+            string_push(sb, "if (")
+            string_push(sb, string_view(tst))
+            string_push(sb, ")\n")
+            line_at(sb, depth, "{")
+        }
+        // binding lines, each at depth+1
+        var bi: usize = 0
+        let bv: str = string_view(bnd)
+        var lstart: usize = 0
+        for bi < bv.len {
+            if (bv[bi] as i32) == 10 {                // '\n' — one binding line per newline
+                indent(sb, depth + 1)
+                string_push(sb, bv[lstart .. bi])
+                string_push(sb, "\n")
+                lstart = bi + 1
+            }
+            bi = bi + 1
+        }
+        emit_guarded_arm(sb, p, src, c, g, body, guard, ret, nend, depth + 1)
+        line_at(sb, depth, "}")
+        string_free(tst)
+        string_free(bnd)
+        k = k + 1
+    }
+    if !ret {
+        indent(sb, depth)
+        string_push(sb, "jm_end_")
+        push_uint(sb, nend as i64)
+        string_push(sb, ": ;\n")
+    } else if !has_uncond {
+        line_at(sb, depth, "__builtin_unreachable();")
+    }
+    string_free(subj)
+    string_free(scty)
+    string_free(scrut)
+}
+
 fn emit_match(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, eid: i32, ret: bool, depth: i32) {
     let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
     let scrut: i32 = e.a
@@ -4160,6 +4467,17 @@ fn emit_match(mut sb: String, read p: parser.Parser, read src: str, read c: type
     // shared C name — both the scrutinee's C type and the tag/case prefix.
     let stid: i32 = list.get(i32, c.et, scrut as usize)
     if stid >= 0 {
+        // A nested sub-pattern (or struct-variant pattern) needs the recursive decision tree.
+        var needs_nest: bool = false
+        var kn: i32 = 0
+        for kn < e.y {
+            if pat_needs_nesting(p, src, list.get(i32, p.par, (e.x + kn * 3) as usize)) { needs_nest = true }
+            kn = kn + 1
+        }
+        if needs_nest {
+            emit_nested_match(sb, p, src, c, g, e, stid, ret, depth)
+            return
+        }
         // A niche-optimized enum (plain or a generic instance) matches on a null test.
         let nvb: i32 = niche_of_tyid(p, src, c, stid)
         if nvb >= 0 {
