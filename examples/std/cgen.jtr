@@ -1072,7 +1072,7 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
     }
     if e.kind == 17 {                                 // GenStructLit: (Jestyr_<ctor>__<args>){ .j_f = v, … }
         string_push(sb, "(")
-        emit_ty_c(sb, p, src, c, list.get(i32, c.et, eid as usize))   // the instance's own type
+        emit_su_tyid(sb, p, src, c, g, list.get(i32, c.et, eid as usize))   // own type, under the subst
         string_push(sb, "){ ")
         var gi: i32 = 0
         for gi < e.y {
@@ -1198,7 +1198,7 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
     }
     if e.kind == 11 {                                 // Cast: (TargetType)(inner). x = target TypeId
         string_push(sb, "(")
-        emit_c_ty(sb, p, src, e.x)
+        emit_su_ty(sb, p, src, c, g, e.x)             // subst-aware: `as *mut T` in an instance body
         if expr_is_enum(c, e.a) {                     // enum -> int reads its discriminant: (T)((e).tag)
             string_push(sb, ")((")
             emit_expr(sb, p, src, c, g, e.a)
@@ -2142,6 +2142,12 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             let a0: i32 = list.get(i32, p.ar, e.x as usize)
             let arg: parser.ExprData = list.get(parser.ExprData, p.ex, a0 as usize)
             if arg.kind == 2 {                        // the type argument is a bare Name
+                let sl: i32 = su_slot(src, g, arg.start, arg.end)
+                if sl >= 0 {                          // a tparam under the active substitution
+                    emit_targ_cty(sb, p, src, c, list.get(i32, g.su, (sl + 2) as usize), list.get(i32, g.su, (sl + 3) as usize), list.get(i32, g.su, (sl + 4) as usize))
+                    string_push(sb, ")")
+                    return
+                }
                 let tn: str = src[arg.start .. arg.end]
                 let pc: str = c_prim(tn)
                 if !str_eq(pc, "") { string_push(sb, pc) }
@@ -2161,13 +2167,13 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         }
         if str_eq(nm, "align_of") {                   // align_of(T) -> _Alignof(<cty>)
             string_push(sb, "_Alignof(")
-            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            emit_type_arg_cty(sb, p, src, c, g, arg_at(p, e, 0))
             string_push(sb, ")")
             return
         }
         if str_eq(nm, "offset_of") {                  // offset_of(T, f) -> offsetof(<cty>, j_<f>)
             string_push(sb, "offsetof(")
-            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            emit_type_arg_cty(sb, p, src, c, g, arg_at(p, e, 0))
             string_push(sb, ", j_")
             let fa: parser.ExprData = list.get(parser.ExprData, p.ex, arg_at(p, e, 1) as usize)
             string_push(sb, src[fa.start .. fa.end])
@@ -2176,23 +2182,23 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         }
         if str_eq(nm, "alloc") {                      // alloc(T, n) -> ((T*) malloc((size_t)(n) * sizeof(T)))
             string_push(sb, "((")
-            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            emit_type_arg_cty(sb, p, src, c, g, arg_at(p, e, 0))
             string_push(sb, "*) malloc((size_t)(")
             emit_expr(sb, p, src, c, g, arg_at(p, e, 1))
             string_push(sb, ") * sizeof(")
-            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            emit_type_arg_cty(sb, p, src, c, g, arg_at(p, e, 0))
             string_push(sb, ")))")
             return
         }
         if str_eq(nm, "realloc") {                    // realloc(T, p, n)
             string_push(sb, "((")
-            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            emit_type_arg_cty(sb, p, src, c, g, arg_at(p, e, 0))
             string_push(sb, "*) realloc(")
             emit_expr(sb, p, src, c, g, arg_at(p, e, 1))
             string_push(sb, ", (size_t)(")
             emit_expr(sb, p, src, c, g, arg_at(p, e, 2))
             string_push(sb, ") * sizeof(")
-            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            emit_type_arg_cty(sb, p, src, c, g, arg_at(p, e, 0))
             string_push(sb, ")))")
             return
         }
@@ -2318,15 +2324,15 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             g.tmp = g.tmp + 1
             let r0: parser.ExprData = list.get(parser.ExprData, p.ex, arg_at(p, e, 0) as usize)
             string_push(sb, "({ ")
-            emit_type_arg_cty(sb, p, src, arg_at(p, e, 1))
+            emit_type_arg_cty(sb, p, src, c, g, arg_at(p, e, 1))
             string_push(sb, "* _p")
             push_uint(sb, n as i64)
             string_push(sb, " = (")
-            emit_type_arg_cty(sb, p, src, arg_at(p, e, 1))
+            emit_type_arg_cty(sb, p, src, c, g, arg_at(p, e, 1))
             string_push(sb, "*)jestyr_arena_alloc(&j_")
             string_push(sb, src[r0.start .. r0.end])
             string_push(sb, ", sizeof(")
-            emit_type_arg_cty(sb, p, src, arg_at(p, e, 1))
+            emit_type_arg_cty(sb, p, src, c, g, arg_at(p, e, 1))
             string_push(sb, ")); *_p")
             push_uint(sb, n as i64)
             string_push(sb, " = (")
@@ -2424,13 +2430,13 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         }
         if str_eq(nm, "arena_alloc") {                // arena_alloc(h, T, n): bump n T's. NO temp.
             string_push(sb, "((")
-            emit_type_arg_cty(sb, p, src, arg_at(p, e, 1))
+            emit_type_arg_cty(sb, p, src, c, g, arg_at(p, e, 1))
             string_push(sb, "*) jestyr_arena_alloc((JestyrArena*)(")
             emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
             string_push(sb, "), (size_t)(")
             emit_expr(sb, p, src, c, g, arg_at(p, e, 2))
             string_push(sb, ") * sizeof(")
-            emit_type_arg_cty(sb, p, src, arg_at(p, e, 1))
+            emit_type_arg_cty(sb, p, src, c, g, arg_at(p, e, 1))
             string_push(sb, ")))")
             return
         }
@@ -2455,15 +2461,15 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_push(sb, "({ void* _b")
             push_uint(sb, n as i64)
             string_push(sb, " = malloc(8 + sizeof(")
-            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            emit_type_arg_cty(sb, p, src, c, g, arg_at(p, e, 0))
             string_push(sb, ")); *(uint64_t*)_b")
             push_uint(sb, n as i64)
             string_push(sb, " = 1; ")
-            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            emit_type_arg_cty(sb, p, src, c, g, arg_at(p, e, 0))
             string_push(sb, "* _p")
             push_uint(sb, n as i64)
             string_push(sb, " = (")
-            emit_type_arg_cty(sb, p, src, arg_at(p, e, 0))
+            emit_type_arg_cty(sb, p, src, c, g, arg_at(p, e, 0))
             string_push(sb, "*)((char*)_b")
             push_uint(sb, n as i64)
             string_push(sb, " + 8); *_p")
@@ -2655,9 +2661,25 @@ fn arg_at(read p: parser.Parser, read e: parser.ExprData, i: i32) -> i32 {
 }
 
 // A bare-Name *type argument* (`size_of(T)`-style) rendered as its C type.
-fn emit_type_arg_cty(mut sb: String, read p: parser.Parser, read src: str, aid: i32) {
+// The substitution-free form, for section-level collection sites that carry no `Cg`.
+fn emit_type_arg_cty_plain(mut sb: String, read p: parser.Parser, read src: str, aid: i32) {
     let arg: parser.ExprData = list.get(parser.ExprData, p.ex, aid as usize)
     if arg.kind == 2 {
+        let tn: str = src[arg.start .. arg.end]
+        let pc: str = c_prim(tn)
+        if !str_eq(pc, "") { string_push(sb, pc) }
+        else { string_push(sb, "Jestyr_")  string_push(sb, tn) }
+    }
+}
+
+fn emit_type_arg_cty(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, read g: Cg, aid: i32) {
+    let arg: parser.ExprData = list.get(parser.ExprData, p.ex, aid as usize)
+    if arg.kind == 2 {
+        let sl: i32 = su_slot(src, g, arg.start, arg.end)
+        if sl >= 0 {                                  // a tparam under the active substitution
+            emit_targ_cty(sb, p, src, c, list.get(i32, g.su, (sl + 2) as usize), list.get(i32, g.su, (sl + 3) as usize), list.get(i32, g.su, (sl + 4) as usize))
+            return
+        }
         let tn: str = src[arg.start .. arg.end]
         let pc: str = c_prim(tn)
         if !str_eq(pc, "") { string_push(sb, pc) }
@@ -2885,23 +2907,155 @@ fn emit_targ_cty(mut sb: String, read p: parser.Parser, read src: str, read c: t
 // Like `emit_c_ty`, but a bare Name matching the active type-parameter substitution (`g.su`
 // 5-tuples: tparam span, then the arg triple) renders the instance's concrete C type. Used for
 // instance SIGNATURES; template-body lets under subst are a later increment.
+// The active-substitution slot index in `g.su` for tparam name `src[ns..ne]`, or -1.
+fn su_slot(read src: str, read g: Cg, ns: usize, ne: usize) -> i32 {
+    var i: usize = 0
+    for i < list.len(i32, g.su) {
+        let sns: i32 = list.get(i32, g.su, i)
+        let sne: i32 = list.get(i32, g.su, i + 1)
+        if str_eq(src[ns .. ne], src[sns as usize .. sne as usize]) { return i as i32 }
+        i = i + 5
+    }
+    return 0 - 1
+}
+
+// The AST-type mangle under the ACTIVE substitution (a tparam Name mangles as its bound
+// arg's mangle; everything else mirrors `push_ast_mangle`).
+fn push_su_mangle(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, read g: Cg, tyid: i32) {
+    if tyid < 0 { string_push(sb, "unit")  return }
+    let t: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
+    if t.kind == 0 {
+        let sl: i32 = su_slot(src, g, t.start, t.end)
+        if sl >= 0 {
+            push_targ_mangle(sb, src, c, list.get(i32, g.su, (sl + 2) as usize), list.get(i32, g.su, (sl + 3) as usize), list.get(i32, g.su, (sl + 4) as usize))
+            return
+        }
+        string_push(sb, src[t.start .. t.end])
+        return
+    }
+    if t.kind == 2 { string_push(sb, "ptr_")  push_su_mangle(sb, p, src, c, g, t.a)  return }
+    if t.kind == 3 { string_push(sb, "slice_")  push_su_mangle(sb, p, src, c, g, t.a)  return }
+    if t.kind == 5 { string_push(sb, "ref_")  push_su_mangle(sb, p, src, c, g, t.a)  return }
+    if t.kind == 9 {
+        string_push(sb, "fn_")
+        var i: i32 = 0
+        for i < t.a {
+            if i > 0 { string_push(sb, "_") }
+            push_conv_tag(sb, list.get(i32, p.tar, (t.op + i * 2) as usize))
+            push_su_mangle(sb, p, src, c, g, list.get(i32, p.tar, (t.op + i * 2 + 1) as usize))
+            i = i + 1
+        }
+        string_push(sb, "_ret_")
+        if t.x >= 0 { push_su_mangle(sb, p, src, c, g, t.x) } else { string_push(sb, "unit") }
+        return
+    }
+    if t.kind == 4 {
+        string_push(sb, "arr_")
+        push_su_mangle(sb, p, src, c, g, t.a)
+        string_push(sb, "_")
+        push_array_len(sb, p, src, t.b)
+        return
+    }
+    push_ast_mangle(sb, p, src, tyid)
+}
+
 fn emit_su_ty(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, read g: Cg, tyid: i32) {
     if tyid >= 0 {
         let t: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
         if t.kind == 0 {
-            var i: usize = 0
-            for i < list.len(i32, g.su) {
-                let ns: i32 = list.get(i32, g.su, i)
-                let ne: i32 = list.get(i32, g.su, i + 1)
-                if str_eq(src[t.start .. t.end], src[ns as usize .. ne as usize]) {
-                    emit_targ_cty(sb, p, src, c, list.get(i32, g.su, i + 2), list.get(i32, g.su, i + 3), list.get(i32, g.su, i + 4))
-                    return
+            let sl: i32 = su_slot(src, g, t.start, t.end)
+            if sl >= 0 {
+                emit_targ_cty(sb, p, src, c, list.get(i32, g.su, (sl + 2) as usize), list.get(i32, g.su, (sl + 3) as usize), list.get(i32, g.su, (sl + 4) as usize))
+                return
+            }
+        }
+        if list.len(i32, g.su) > 0 {                  // structural forms substitute inward
+            if t.kind == 2 or t.kind == 6 {
+                emit_su_ty(sb, p, src, c, g, t.a)
+                string_push(sb, "*")
+                return
+            }
+            if t.kind == 7 {                          // App under subst: Jestyr_<ctor>__<su-mangles>
+                string_push(sb, "Jestyr_")
+                string_push(sb, src[t.x as usize .. t.y as usize])
+                string_push(sb, "__")
+                var i: i32 = 0
+                for i < t.a {
+                    if i > 0 { string_push(sb, "_") }
+                    push_su_mangle(sb, p, src, c, g, list.get(i32, p.tar, (t.op + i) as usize))
+                    i = i + 1
                 }
-                i = i + 5
+                return
+            }
+            if t.kind == 9 {
+                string_push(sb, "JestyrFn_")
+                push_su_mangle(sb, p, src, c, g, tyid)
+                return
+            }
+            if t.kind == 3 {
+                string_push(sb, "JestyrSlice_")
+                push_su_mangle(sb, p, src, c, g, t.a)
+                return
+            }
+            if t.kind == 5 {
+                string_push(sb, "JestyrRef_")
+                push_su_mangle(sb, p, src, c, g, t.a)
+                return
+            }
+            if t.kind == 4 {
+                string_push(sb, "JestyrArr_")
+                push_su_mangle(sb, p, src, c, g, t.a)
+                string_push(sb, "_")
+                push_array_len(sb, p, src, t.b)
+                return
             }
         }
     }
     emit_c_ty(sb, p, src, tyid)
+}
+
+// A CHECKER type rendered under the active substitution: an Opaque tparam takes its bound
+// arg; a kind-6 instance with Opaque args renders each through the substitution (the
+// template-body `Vec(T){…}` type inside a monomorphized instance). Falls to `emit_ty_c`.
+fn emit_su_tyid(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, read g: Cg, tid: i32) {
+    if tid >= 0 and list.len(i32, g.su) > 0 {
+        let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+        if d.kind == 4 {                              // Opaque tparam
+            let sl: i32 = su_slot(src, g, d.x as usize, d.y as usize)
+            if sl >= 0 {
+                emit_targ_cty(sb, p, src, c, list.get(i32, g.su, (sl + 2) as usize), list.get(i32, g.su, (sl + 3) as usize), list.get(i32, g.su, (sl + 4) as usize))
+                return
+            }
+        }
+        if d.kind == 6 {
+            string_push(sb, "Jestyr_")
+            string_push(sb, src[d.x as usize .. d.y as usize])
+            string_push(sb, "__")
+            var i: i32 = 0
+            for i < d.b {
+                if i > 0 { string_push(sb, "_") }
+                let arg: i32 = list.get(i32, c.tya, (d.a + i) as usize)
+                let ad: typeck.TyData = list.get(typeck.TyData, c.tys, arg as usize)
+                var done: bool = false
+                if ad.kind == 4 {
+                    let sl2: i32 = su_slot(src, g, ad.x as usize, ad.y as usize)
+                    if sl2 >= 0 {
+                        push_targ_mangle(sb, src, c, list.get(i32, g.su, (sl2 + 2) as usize), list.get(i32, g.su, (sl2 + 3) as usize), list.get(i32, g.su, (sl2 + 4) as usize))
+                        done = true
+                    }
+                }
+                if !done { push_ty_mangle(sb, src, c, arg) }
+                i = i + 1
+            }
+            return
+        }
+        if d.kind == 3 {                              // Ptr of an Opaque tparam
+            emit_su_tyid(sb, p, src, c, g, d.a)
+            string_push(sb, "*")
+            return
+        }
+    }
+    emit_ty_c(sb, p, src, c, tid)
 }
 
 // A generic CALL's type arguments in instance order — explicit comptime type args (bare-Name
@@ -3133,16 +3287,97 @@ fn collect_gfn_instances(mut g: Cg, read p: parser.Parser, read src: str, read c
                 list.push(i32, g.gfi, list.get(i32, wk, (rb + t) as usize))
                 t = t + 1
             }
+            // A generic calling a generic: walk THIS instance's template body for nested
+            // template calls, then resolve each new record's tparam-typed args through this
+            // record's bindings (the reference's subst-aware `collect_all_instances` worklist;
+            // dedup-on-pop bounds recursion).
+            let f2: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, wk, rb as usize) as usize)
+            if f2.w >= 0 {
+                let before: usize = list.len(i32, wks)
+                gfind_block(wk, wks, p, src, c, f2.w)
+                var nw: usize = before
+                for nw < list.len(i32, wks) {
+                    remap_targs(wk, p, src, c, rb, list.get(i32, wks, nw))
+                    nw = nw + 1
+                }
+            }
         }
         string_free(probe)
     }
     string_free(seen)
 }
 
+// The index of tparam `src[ns..ne]` in fn `f`'s INSTANCE type-arg order (comptime-type params
+// first, then bracket params), or -1.
+fn tparam_index_of(read p: parser.Parser, read src: str, read f: parser.ItemData, ns: usize, ne: usize) -> i32 {
+    var idx: i32 = 0
+    var i: i32 = 0
+    for i < f.b {
+        let base: i32 = f.a + i * 7
+        if list.get(i32, p.iar, base as usize) == 1 {
+            let pty: i32 = list.get(i32, p.iar, (base + 5) as usize)
+            if pty >= 0 {
+                let t: parser.TypeData = list.get(parser.TypeData, p.ty, pty as usize)
+                if t.kind == 1 {
+                    let pns: i32 = list.get(i32, p.iar, (base + 2) as usize)
+                    let pne: i32 = list.get(i32, p.iar, (base + 3) as usize)
+                    if str_eq(src[pns as usize .. pne as usize], src[ns .. ne]) { return idx }
+                    idx = idx + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    var gk: i32 = 0
+    for gk < f.h {
+        let gb: i32 = f.g + gk * 4
+        let gns: i32 = list.get(i32, p.gar, gb as usize)
+        let gne: i32 = list.get(i32, p.gar, (gb + 1) as usize)
+        if str_eq(src[gns as usize .. gne as usize], src[ns .. ne]) { return idx }
+        idx = idx + 1
+        gk = gk + 1
+    }
+    return 0 - 1
+}
+
+// Rewrite the type-arg triples of a record discovered INSIDE an instance body: a kind-0 span
+// (or a kind-1 Opaque) naming one of the ENCLOSING record's tparams takes that record's
+// binding triple — so `load_cell(T, …)` inside `chan_recv__i64` records as `load_cell__i64`.
+fn remap_targs(mut wk: List(i32), read p: parser.Parser, read src: str, read c: typeck.Checker, outer_rb: i32, new_rb: i32) {
+    let of_: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, wk, outer_rb as usize) as usize)
+    let argc: i32 = list.get(i32, wk, (new_rb + 1) as usize)
+    var t: i32 = 0
+    for t < argc {
+        let tb: i32 = new_rb + 2 + t * 3
+        let kind: i32 = list.get(i32, wk, tb as usize)
+        var ns: i32 = 0 - 1
+        var ne: i32 = 0 - 1
+        if kind == 0 {
+            ns = list.get(i32, wk, (tb + 1) as usize)
+            ne = list.get(i32, wk, (tb + 2) as usize)
+        } else if kind == 1 {
+            let d: typeck.TyData = list.get(typeck.TyData, c.tys, list.get(i32, wk, (tb + 1) as usize) as usize)
+            if d.kind == 4 { ns = d.x  ne = d.y }     // an Opaque tparam type
+        }
+        if ns >= 0 {
+            let idx: i32 = tparam_index_of(p, src, of_, ns as usize, ne as usize)
+            if idx >= 0 {
+                let ob: i32 = outer_rb + 2 + idx * 3
+                list.set(i32, wk, tb as usize, list.get(i32, wk, ob as usize))
+                list.set(i32, wk, (tb + 1) as usize, list.get(i32, wk, (ob + 1) as usize))
+                list.set(i32, wk, (tb + 2) as usize, list.get(i32, wk, (ob + 2) as usize))
+            }
+        }
+        t = t + 1
+    }
+}
+
 // The instance's signature `<ret> jestyr_<name>__<mangles>(<params>)` under its substitution:
 // arms `g.su` (tparam spans in instance order — comptime-type names, then brackets — zipped
 // with the record's arg triples) and leaves it set for the body; the caller clears it.
-fn emit_gfn_sig(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, rb: i32) {
+// Arm `g.su` from instance record `rb`: tparam name spans in instance order (comptime-type
+// names, then brackets) zipped with the record's arg triples. The caller clears it.
+fn arm_record_su(mut g: Cg, read p: parser.Parser, rb: i32) {
     let fit: i32 = list.get(i32, g.gfi, rb as usize)
     let f: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
     list.truncate(i32, g.su, 0)
@@ -3179,6 +3414,12 @@ fn emit_gfn_sig(mut sb: String, read p: parser.Parser, read src: str, read c: ty
         ai = ai + 1
         gk = gk + 1
     }
+}
+
+fn emit_gfn_sig(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, rb: i32) {
+    let fit: i32 = list.get(i32, g.gfi, rb as usize)
+    let f: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
+    arm_record_su(g, p, rb)
     emit_su_ty(sb, p, src, c, g, f.z)
     string_push(sb, " ")
     push_gfn_name(sb, p, src, c, g.gfi, rb)
@@ -3220,7 +3461,13 @@ fn emit_generic_call(mut sb: String, read p: parser.Parser, read src: str, read 
                 if t.kind == 1 and i < e.y {
                     if emitted > 0 { string_push(sb, "_") }
                     let ax: parser.ExprData = list.get(parser.ExprData, p.ex, arg_at(p, e, i) as usize)
-                    if ax.kind == 2 { string_push(sb, src[ax.start .. ax.end]) } else { string_push(sb, "x") }
+                    if ax.kind == 2 {
+                        // a tparam passed onward inside an instance body resolves through the
+                        // ACTIVE substitution (`load_cell(T, …)` under T=i64 -> `__i64`)
+                        let sl: i32 = su_slot(src, g, ax.start, ax.end)
+                        if sl >= 0 { push_targ_mangle(sb, src, c, list.get(i32, g.su, (sl + 2) as usize), list.get(i32, g.su, (sl + 3) as usize), list.get(i32, g.su, (sl + 4) as usize)) }
+                        else { string_push(sb, src[ax.start .. ax.end]) }
+                    } else { string_push(sb, "x") }
                     emitted = emitted + 1
                 }
             }
@@ -3249,7 +3496,18 @@ fn emit_generic_call(mut sb: String, read p: parser.Parser, read src: str, read 
             pi = pi + 1
         }
         if emitted > 0 { string_push(sb, "_") }
-        if bound >= 0 { push_ty_mangle(sb, src, c, bound) } else { string_push(sb, "x") }
+        if bound >= 0 {
+            let bd: typeck.TyData = list.get(typeck.TyData, c.tys, bound as usize)
+            var done: bool = false
+            if bd.kind == 4 {                          // an Opaque tparam: resolve through g.su
+                let sl2: i32 = su_slot(src, g, bd.x as usize, bd.y as usize)
+                if sl2 >= 0 {
+                    push_targ_mangle(sb, src, c, list.get(i32, g.su, (sl2 + 2) as usize), list.get(i32, g.su, (sl2 + 3) as usize), list.get(i32, g.su, (sl2 + 4) as usize))
+                    done = true
+                }
+            }
+            if !done { push_ty_mangle(sb, src, c, bound) }
+        } else { string_push(sb, "x") }
         emitted = emitted + 1
         gk = gk + 1
     }
@@ -3471,22 +3729,34 @@ fn drop_scope_enter(mut g: Cg) {
 }
 
 // Emit one registered local's drop glue: `j_<name>` of its recorded type.
-fn emit_local_drop(mut sb: String, read p: parser.Parser, read src: str, read g: Cg, base: i32, depth: i32) {
+fn emit_local_drop(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, read g: Cg, base: i32, depth: i32) {
     var place: String = string_new()
     string_push(place, "j_")
     string_push(place, src[list.get(i32, g.ds, base as usize) as usize .. list.get(i32, g.ds, (base + 1) as usize) as usize])
-    emit_drop_place(sb, p, src, string_view(place), list.get(i32, g.ds, (base + 2) as usize), list.get(i32, g.ds, (base + 3) as usize), depth)
+    let tns: i32 = list.get(i32, g.ds, (base + 2) as usize)
+    if tns < 0 - 1 {                                  // a GENERIC-STRUCT instance (encoded -2 - TyId):
+        let tid: i32 = 0 - 2 - tns                    // drop via its monomorphized blanket impl
+        indent(sb, depth)
+        string_push(sb, "jestyr_impl_Drop__")
+        push_ty_key_safe(sb, src, c, tid)
+        string_push(sb, "__drop(&")
+        string_push(sb, string_view(place))
+        string_push(sb, ");\n")
+        string_free(place)
+        return
+    }
+    emit_drop_place(sb, p, src, string_view(place), tns, list.get(i32, g.ds, (base + 3) as usize), depth)
     string_free(place)
 }
 
 // Close the innermost drop scope, dropping its locals in reverse declaration order (the normal
 // fall-through path).
-fn drop_scope_exit_emit(mut sb: String, read p: parser.Parser, read src: str, mut g: Cg, depth: i32) {
+fn drop_scope_exit_emit(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, depth: i32) {
     let floor: i32 = list.get(i32, g.dsb, list.len(i32, g.dsb) - 1)
     list.truncate(i32, g.dsb, list.len(i32, g.dsb) - 1)
     var i: i32 = list.len(i32, g.ds) as i32 - 4
     for i >= floor {
-        emit_local_drop(sb, p, src, g, i, depth)
+        emit_local_drop(sb, p, src, c, g, i, depth)
         i = i - 4
     }
     list.truncate(i32, g.ds, floor as usize)
@@ -3502,10 +3772,10 @@ fn drop_scope_exit_discard(mut g: Cg) {
 
 // Drop every live local across all open scopes, innermost first — the cleanup run *before* a
 // `return`. Does not pop: the C locals stay in scope until the `return` that follows.
-fn emit_all_drops(mut sb: String, read p: parser.Parser, read src: str, read g: Cg, depth: i32) {
+fn emit_all_drops(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, read g: Cg, depth: i32) {
     var i: i32 = list.len(i32, g.ds) as i32 - 4
     for i >= 0 {
-        emit_local_drop(sb, p, src, g, i, depth)
+        emit_local_drop(sb, p, src, c, g, i, depth)
         i = i - 4
     }
 }
@@ -3544,6 +3814,19 @@ fn register_drop_local(mut g: Cg, read p: parser.Parser, read src: str, read c: 
             if d.kind == 15 {                         // Named: the tdecl row carries the name span
                 tns = list.get(i32, c.tdecl, (d.x * 10 + 0) as usize)
                 tne = list.get(i32, c.tdecl, (d.x * 10 + 1) as usize)
+            }
+            if d.kind == 6 {                          // a generic-struct instance: droppable iff a
+                if tyid_concrete(c, tid) {            // blanket `impl[T] Drop` covers its ctor
+                    if generic_drop_impl_of(p, src, d.x as usize, d.y as usize) >= 0 {
+                        if !is_moved_name(g, src, s.x, s.y) {
+                            list.push(i32, g.ds, s.x)
+                            list.push(i32, g.ds, s.y)
+                            list.push(i32, g.ds, 0 - 2 - tid)   // encoded instance TyId
+                            list.push(i32, g.ds, 0 - 1)
+                        }
+                        return
+                    }
+                }
             }
         }
     }
@@ -3733,7 +4016,7 @@ fn collect_moved_block(mut g: Cg, read p: parser.Parser, read src: str, beid: i3
 // lowering) and `mut g: Cg` (the temp counter). (`emit_expr` needs neither mutability nor `g` yet.)
 fn emit_return(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, val: i32, depth: i32) {
     if val < 0 {
-        emit_all_drops(sb, p, src, g, depth)          // drop every live local before returning
+        emit_all_drops(sb, p, src, c, g, depth)          // drop every live local before returning
         line_at(sb, depth, "return;")
         return
     }
@@ -3743,6 +4026,8 @@ fn emit_return(mut sb: String, read p: parser.Parser, read src: str, read c: typ
     if v.kind == 28 { emit_match(sb, p, src, c, g, val, true, depth)  return }   // match
     if v.kind == 25 { emit_body(sb, p, src, c, g, v.a, true, depth)  return }    // return unsafe { … }
     if v.kind == 23 { emit_body(sb, p, src, c, g, val, true, depth)  return }    // return { … }
+    if v.kind == 31 { emit_for(sb, p, src, c, g, val, depth)  return }           // a loop has no value:
+                                                                                 // emit as a statement
     // `ensures` postconditions or live drops: spill the value to `j_result` *before* running
     // asserts/drops (so the value can't read a local we're about to drop), then return the spill.
     // Mirrors `emit_value_return`; a method body (`autoret`) has no tracked ret cty -> `__auto_type`.
@@ -3762,7 +4047,7 @@ fn emit_return(mut sb: String, read p: parser.Parser, read src: str, read c: typ
             string_push(sb, ");\n")
             ei = ei + 1
         }
-        emit_all_drops(sb, p, src, g, depth)
+        emit_all_drops(sb, p, src, c, g, depth)
         line_at(sb, depth, "return j_result;")
         return
     }
@@ -3801,7 +4086,7 @@ fn emit_stmt(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         // Annotated type (`ty` >= 0) renders from the annotation; an inferred `let x = <init>` reads
         // the Checker's per-expr type `c.et[init]`. `(x,y)` = name span; `ty` = annotation; `a` = init.
         if s.ty >= 0 {
-            emit_c_ty(sb, p, src, s.ty)
+            emit_su_ty(sb, p, src, c, g, s.ty)        // subst-aware: `var np: *mut T` in an instance
         } else if s.a >= 0 {
             // a closure-bound local takes the closure's concrete `{call, env}` struct type
             let ie: parser.ExprData = list.get(parser.ExprData, p.ex, s.a as usize)
@@ -3809,7 +4094,7 @@ fn emit_stmt(mut sb: String, read p: parser.Parser, read src: str, read c: typec
                 string_push(sb, "JestyrClosure_")
                 push_uint(sb, ref_expr_id(p, s.a) as i64)
             } else {
-                emit_ty_c(sb, p, src, c, list.get(i32, c.et, s.a as usize))
+                emit_su_tyid(sb, p, src, c, g, list.get(i32, c.et, s.a as usize))
             }
         } else {
             string_push(sb, "int")                    // no annotation, no init (mirrors the reference)
@@ -3872,7 +4157,7 @@ fn emit_body(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         let ls: parser.StmtData = list.get(parser.StmtData, p.st, lsid as usize)
         if ls.kind == 1 { dv = true }
     }
-    if dv { drop_scope_exit_discard(g) } else { drop_scope_exit_emit(sb, p, src, g, depth + 1) }
+    if dv { drop_scope_exit_discard(g) } else { drop_scope_exit_emit(sb, p, src, c, g, depth + 1) }
     line_at(sb, depth, "}")
 }
 
@@ -4945,7 +5230,7 @@ fn emit_loop_body(mut sb: String, read p: parser.Parser, read src: str, read c: 
         let ls: parser.StmtData = list.get(parser.StmtData, p.st, lsid as usize)
         if ls.kind == 1 { dv = true }
     }
-    if dv { drop_scope_exit_discard(g) } else { drop_scope_exit_emit(sb, p, src, g, depth + 1) }
+    if dv { drop_scope_exit_discard(g) } else { drop_scope_exit_emit(sb, p, src, c, g, depth + 1) }
     emit_cont_target(sb, src, g, depth + 1)
     line_at(sb, depth, "}")
 }
@@ -5968,7 +6253,89 @@ fn emit_impl_sig(mut sb: String, read p: parser.Parser, read src: str, read im: 
 // then a CONDITIONAL trailing blank (only if any emitted — unlike method_protos'). Blanket
 // generic impls are monomorphized per instance separately (a later increment); a fallible impl
 // method is unsupported by the reference backend, which emits nothing for it.
-fn emit_impl_protos(mut sb: String, read p: parser.Parser, read src: str) {
+// The blanket `impl[T] Drop for <Ctor>(T)` item covering generic-struct ctor `src[cns..cne]`,
+// or -1. Mirrors `generic_drop_impl` (detection by constructor name).
+fn generic_drop_impl_of(read p: parser.Parser, read src: str, cns: usize, cne: usize) -> i32 {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 7 and it.h > 0 {
+            if str_eq(src[it.x as usize .. it.y as usize], "Drop") {
+                if it.a >= 0 {
+                    let t: parser.TypeData = list.get(parser.TypeData, p.ty, it.a as usize)
+                    if t.kind == 7 {
+                        if str_eq(src[t.x as usize .. t.y as usize], src[cns .. cne]) { return iid }
+                    }
+                }
+            }
+        }
+        r = r + 1
+    }
+    return 0 - 1
+}
+
+// The impl's `drop` method fn item, or -1.
+fn impl_drop_method(read p: parser.Parser, read src: str, im: i32) -> i32 {
+    let it: parser.ItemData = list.get(parser.ItemData, p.it, im as usize)
+    var k: i32 = 0
+    for k < it.z {
+        let mid: i32 = list.get(i32, p.mar, (it.b + k) as usize)
+        let fd: parser.ItemData = list.get(parser.ItemData, p.it, mid as usize)
+        if str_eq(src[fd.x .. fd.y], "drop") { return mid }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+// A Checker type's SANITIZED impl key (`Vec(i32)` -> `Vec_i32_`): the reference keys impl
+// instances by the type's display form with every non-alphanumeric byte mapped to `_`
+// (`ty_key` + `impl_method_c_name`). Prim = jname; Named = its name; kind 6 = `ctor(a, b)`
+// with `(`/`)` -> `_` and `, ` -> `__`; Ptr = `*mut inner` -> `_mut_inner`.
+fn push_ty_key_safe(mut sb: String, read src: str, read c: typeck.Checker, tid: i32) {
+    if tid < 0 { string_push(sb, "_")  return }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+    if d.kind == 2 { string_push(sb, prim_jname(d.x))  return }
+    if d.kind == 15 {
+        let ns: i32 = list.get(i32, c.tdecl, (d.x * 10 + 0) as usize)
+        let ne: i32 = list.get(i32, c.tdecl, (d.x * 10 + 1) as usize)
+        string_push(sb, src[ns as usize .. ne as usize])
+        return
+    }
+    if d.kind == 6 {
+        string_push(sb, src[d.x as usize .. d.y as usize])
+        string_push(sb, "_")
+        var i: i32 = 0
+        for i < d.b {
+            if i > 0 { string_push(sb, "__") }
+            push_ty_key_safe(sb, src, c, list.get(i32, c.tya, (d.a + i) as usize))
+            i = i + 1
+        }
+        string_push(sb, "_")
+        return
+    }
+    if d.kind == 3 {
+        string_push(sb, "_mut_")
+        push_ty_key_safe(sb, src, c, d.a)
+        return
+    }
+    string_push(sb, "_")
+}
+
+// The signature of one monomorphized blanket-Drop instance:
+// `void jestyr_impl_Drop__<key>__drop(<instance cty>[* restrict] j_self)`.
+fn emit_gdrop_sig(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, tid: i32, im: i32) {
+    let mid: i32 = impl_drop_method(p, src, im)
+    string_push(sb, "void jestyr_impl_Drop__")
+    push_ty_key_safe(sb, src, c, tid)
+    string_push(sb, "__drop(")
+    emit_ty_c(sb, p, src, c, tid)
+    let sconv: i32 = method_self_conv(p, mid)
+    if sconv == 2 or sconv == 4 { string_push(sb, "* restrict") }
+    string_push(sb, " j_self)")
+}
+
+fn emit_impl_protos(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg) {
     var any: bool = false
     var r: i32 = 0
     for r < list.len(i32, p.roots) {
@@ -5988,6 +6355,20 @@ fn emit_impl_protos(mut sb: String, read p: parser.Parser, read src: str) {
             }
         }
         r = r + 1
+    }
+    // Each generic-struct instance covered by a blanket `impl[T] Drop` gets its own
+    // monomorphized proto (mirrors `emit_generic_drop_methods(false)`, sharing the blank).
+    var gk: usize = 0
+    for gk < list.len(i32, g.gsi) {
+        let tid: i32 = list.get(i32, g.gsi, gk)
+        let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+        let im: i32 = generic_drop_impl_of(p, src, d.x as usize, d.y as usize)
+        if im >= 0 {
+            emit_gdrop_sig(sb, p, src, c, tid, im)
+            string_push(sb, ";\n")
+            any = true
+        }
+        gk = gk + 1
     }
     if any { string_push(sb, "\n") }
 }
@@ -6036,6 +6417,43 @@ fn emit_impl_defs(mut sb: String, read p: parser.Parser, read src: str, read c: 
             }
         }
         r = r + 1
+    }
+    // Monomorphized blanket-Drop instances LAST (mirrors `impl_defs` ending with
+    // `emit_generic_drop_methods(true)`): the body runs under the impl's tparam -> the
+    // instance's first type-arg substitution, `self` per the drop method's convention.
+    var gk: usize = 0
+    for gk < list.len(i32, g.gsi) {
+        let tid: i32 = list.get(i32, g.gsi, gk)
+        let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+        let im: i32 = generic_drop_impl_of(p, src, d.x as usize, d.y as usize)
+        if im >= 0 {
+            let mid: i32 = impl_drop_method(p, src, im)
+            let fd: parser.ItemData = list.get(parser.ItemData, p.it, mid as usize)
+            emit_gdrop_sig(sb, p, src, c, tid, im)
+            string_push(sb, "\n")
+            let it2: parser.ItemData = list.get(parser.ItemData, p.it, im as usize)
+            list.truncate(i32, g.su, 0)
+            if it2.h > 0 and d.b > 0 {
+                list.push(i32, g.su, list.get(i32, p.gar, it2.g as usize))
+                list.push(i32, g.su, list.get(i32, p.gar, (it2.g + 1) as usize))
+                list.push(i32, g.su, 1)
+                list.push(i32, g.su, list.get(i32, c.tya, d.a as usize))
+                list.push(i32, g.su, 0 - 1)
+            }
+            list.truncate(i32, g.pp, 0)
+            let sconv: i32 = method_self_conv(p, mid)
+            g.self_ptr = sconv == 2 or sconv == 4
+            g.retty = fd.z
+            g.curfn = mid
+            g.autoret = true
+            emit_body(sb, p, src, c, g, fd.w, false, 0)
+            g.self_ptr = false
+            g.retty = 0 - 1
+            g.autoret = false
+            list.truncate(i32, g.su, 0)
+            string_push(sb, "\n")
+        }
+        gk = gk + 1
     }
 }
 
@@ -6719,23 +7137,212 @@ fn emit_gs_ty(mut sb: String, read p: parser.Parser, read src: str, read c: type
 // is a comptime struct ctor, expression order, deduped by rendered C name (mirrors
 // `collect_struct_instances`; the reference's fn-signature/annotation pass is deferred, like
 // the enum collection's was).
+// Record one rendered instance key: reject a non-concrete render (`?`), dedup, then resolve
+// the key to a concrete Checker TyId (the arena's first kind-6 struct instance rendering
+// identically) — the gsi consumers are all TyId-based.
+fn gsi_add_key(mut g: Cg, read p: parser.Parser, read src: str, read c: typeck.Checker, read key: str, mut seen: String) {
+    var probe: String = string_new()
+    string_push(probe, "|")
+    string_push(probe, key)
+    string_push(probe, "|")
+    if !contains(key, "?") and !contains(string_view(seen), string_view(probe)) {
+        var t: usize = 0
+        var found: bool = false
+        for t < list.len(typeck.TyData, c.tys) {
+            if !found {
+                let d: typeck.TyData = list.get(typeck.TyData, c.tys, t)
+                if d.kind == 6 {
+                    if tyid_concrete(c, t as i32) and gstruct_ctor_fn(p, src, c, t as i32) >= 0 {
+                        var r: String = string_new()
+                        emit_ty_c(r, p, src, c, t as i32)
+                        if str_eq(string_view(r), key) {
+                            string_push(seen, string_view(probe))
+                            list.push(i32, g.gsi, t as i32)
+                            found = true
+                        }
+                        string_free(r)
+                    }
+                }
+            }
+            t = t + 1
+        }
+    }
+    string_free(probe)
+}
+
+// The generic-struct mentions of an AST type: a `Ctor(args)` App whose ctor is a comptime
+// type-fn names an instance (rendered under the ACTIVE substitution — plain when `g.su` is
+// empty); structural forms recurse. Mirrors `collect_gen_struct` over `ast_type_to_ty`.
+fn gsw_type(mut g: Cg, read p: parser.Parser, read src: str, read c: typeck.Checker, mut seen: String, tyid: i32) {
+    if tyid < 0 { return }
+    let t: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
+    if t.kind == 7 {
+        if ctor_struct_node(p, find_fn_item(p, src, src[t.x as usize .. t.y as usize])) >= 0 {
+            var key: String = string_new()
+            emit_su_ty(key, p, src, c, g, tyid)
+            gsi_add_key(g, p, src, c, string_view(key), seen)
+            string_free(key)
+        }
+        return
+    }
+    if t.kind == 2 or t.kind == 3 or t.kind == 4 or t.kind == 5 or t.kind == 6 {
+        gsw_type(g, p, src, c, seen, t.a)
+        return
+    }
+    if t.kind == 9 {
+        var i: i32 = 0
+        for i < t.a {
+            gsw_type(g, p, src, c, seen, list.get(i32, p.tar, (t.op + i * 2 + 1) as usize))
+            i = i + 1
+        }
+        gsw_type(g, p, src, c, seen, t.x)
+        return
+    }
+}
+
+fn gsw_expr(mut g: Cg, read p: parser.Parser, read src: str, read c: typeck.Checker, mut seen: String, eid: i32) {
+    if eid < 0 { return }
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
+    if e.kind == 17 {                                 // GenStructLit: the instance itself, then fields
+        var key: String = string_new()
+        emit_su_tyid(key, p, src, c, g, list.get(i32, c.et, eid as usize))
+        gsi_add_key(g, p, src, c, string_view(key), seen)
+        string_free(key)
+        var i: i32 = 0
+        for i < e.y {
+            let fi_: parser.ExprData = list.get(parser.ExprData, p.ex, list.get(i32, p.ar, (e.b + i) as usize) as usize)
+            gsw_expr(g, p, src, c, seen, fi_.a)
+            i = i + 1
+        }
+        return
+    }
+    if e.kind == 11 {                                 // Cast: target type, then operand
+        gsw_type(g, p, src, c, seen, e.x)
+        gsw_expr(g, p, src, c, seen, e.a)
+        return
+    }
+    if e.kind == 10 {
+        gsw_expr(g, p, src, c, seen, e.a)
+        var i: i32 = 0
+        for i < e.y {
+            gsw_expr(g, p, src, c, seen, list.get(i32, p.ar, (e.x + i) as usize))
+            i = i + 1
+        }
+        return
+    }
+    if e.kind == 4 or e.kind == 6 or e.kind == 12 {
+        gsw_expr(g, p, src, c, seen, e.a)
+        gsw_expr(g, p, src, c, seen, e.b)
+        return
+    }
+    if e.kind == 3 or e.kind == 5 or e.kind == 7 or e.kind == 8 or e.kind == 34 or e.kind == 35 or e.kind == 37 {
+        gsw_expr(g, p, src, c, seen, e.a)
+        return
+    }
+    if e.kind == 16 {
+        var i: i32 = 0
+        for i < e.y {
+            let fi_: parser.ExprData = list.get(parser.ExprData, p.ex, list.get(i32, p.ar, (e.x + i) as usize) as usize)
+            gsw_expr(g, p, src, c, seen, fi_.a)
+            i = i + 1
+        }
+        if e.b >= 0 { gsw_expr(g, p, src, c, seen, e.b) }
+        return
+    }
+    if e.kind == 24 {
+        gsw_expr(g, p, src, c, seen, e.a)
+        gsw_block(g, p, src, c, seen, e.b)
+        if e.op >= 0 { gsw_expr(g, p, src, c, seen, e.op) }
+        return
+    }
+    if e.kind == 23 { gsw_block(g, p, src, c, seen, eid)  return }
+    if e.kind == 25 { gsw_block(g, p, src, c, seen, e.a)  return }
+    if e.kind == 28 {
+        gsw_expr(g, p, src, c, seen, e.a)
+        var k: i32 = 0
+        for k < e.y {
+            let ab: i32 = e.x + k * 3
+            let guard: i32 = list.get(i32, p.par, (ab + 1) as usize)
+            if guard >= 0 { gsw_expr(g, p, src, c, seen, guard) }
+            gsw_expr(g, p, src, c, seen, list.get(i32, p.par, (ab + 2) as usize))
+            k = k + 1
+        }
+        return
+    }
+    if e.kind == 31 {
+        if e.op == 1 { gsw_expr(g, p, src, c, seen, list.get(i32, p.lar, (e.a + 4) as usize)) }
+        if e.op >= 2 {
+            let bc: i32 = list.get(i32, p.lar, (e.a + 4) as usize)
+            let sc: i32 = list.get(i32, p.lar, (e.a + 5) as usize)
+            var si: i32 = 0
+            for si < sc {
+                gsw_expr(g, p, src, c, seen, list.get(i32, p.lar, (e.a + 7 + bc * 3 + si) as usize))
+                si = si + 1
+            }
+        }
+        gsw_block(g, p, src, c, seen, e.b)
+        if e.x >= 0 { gsw_block(g, p, src, c, seen, e.x) }
+        return
+    }
+}
+
+fn gsw_block(mut g: Cg, read p: parser.Parser, read src: str, read c: typeck.Checker, mut seen: String, beid: i32) {
+    let blk: parser.ExprData = list.get(parser.ExprData, p.ex, beid as usize)
+    var i: i32 = 0
+    for i < blk.y {
+        let s: parser.StmtData = list.get(parser.StmtData, p.st, list.get(i32, p.sar, (blk.x + i) as usize) as usize)
+        if s.kind == 0 and s.ty >= 0 { gsw_type(g, p, src, c, seen, s.ty) }   // let annotation first
+        if s.a >= 0 { gsw_expr(g, p, src, c, seen, s.a) }
+        i = i + 1
+    }
+}
+
+// One fn's contribution: param annotations, return type, then the body (mirrors
+// `collect_structs_in_fn`'s order).
+fn gsw_fn(mut g: Cg, read p: parser.Parser, read src: str, read c: typeck.Checker, mut seen: String, read f: parser.ItemData) {
+    var i: i32 = 0
+    for i < f.b {
+        let base: i32 = f.a + i * 7
+        gsw_type(g, p, src, c, seen, list.get(i32, p.iar, (base + 5) as usize))
+        i = i + 1
+    }
+    gsw_type(g, p, src, c, seen, f.z)
+    if f.w >= 0 { gsw_block(g, p, src, c, seen, f.w) }
+}
+
+// Every generic-STRUCT instance, in the REFERENCE's collection order: (a) SYNTAX mentions
+// (GenStructLits, annotations, casts) in non-generic fn bodies + impl-method bodies, item
+// order — an inferred call type alone contributes nothing, exactly like the reference; then
+// (b) each generic-fn instance's signature + body under its substitution, record order (the
+// LIFO-drained instance order — `List(f64)` lands before `List(i32)` when the f64 instance
+// drained first). Mirrors `collect_struct_instances` (the receiver/method pass waits for
+// generic-struct methods). MUST run after `collect_gfn_instances`.
 fn collect_gstruct_instances(mut g: Cg, read p: parser.Parser, read src: str, read c: typeck.Checker) {
     var seen: String = string_new()
-    var i: usize = 0
-    for i < list.len(i32, c.et) {
-        let tid: i32 = list.get(i32, c.et, i)
-        if gstruct_ctor_fn(p, src, c, tid) >= 0 {
-            var probe: String = string_new()
-            string_push(probe, "|")
-            emit_ty_c(probe, p, src, c, tid)
-            string_push(probe, "|")
-            if !contains(string_view(seen), string_view(probe)) {
-                string_push(seen, string_view(probe))
-                list.push(i32, g.gsi, tid)
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 3 and !fn_is_gen(p, it) { gsw_fn(g, p, src, c, seen, it) }
+        if it.kind == 7 {
+            var k: i32 = 0
+            for k < it.z {
+                let fd: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, p.mar, (it.b + k) as usize) as usize)
+                gsw_fn(g, p, src, c, seen, fd)
+                k = k + 1
             }
-            string_free(probe)
         }
-        i = i + 1
+        r = r + 1
+    }
+    var rb: i32 = 0
+    for rb < list.len(i32, g.gfi) as i32 {
+        arm_record_su(g, p, rb)
+        let fit: i32 = list.get(i32, g.gfi, rb as usize)
+        let f: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
+        gsw_fn(g, p, src, c, seen, f)
+        list.truncate(i32, g.su, 0)
+        let argc: i32 = list.get(i32, g.gfi, (rb + 1) as usize)
+        rb = rb + 2 + argc * 3
     }
     string_free(seen)
 }
@@ -6929,7 +7536,7 @@ fn emit_genref_defs(mut sb: String, read p: parser.Parser, read src: str, read c
                         let ax: parser.ExprData = list.get(parser.ExprData, p.ex, arg_at(p, e, 0) as usize)
                         if ax.kind == 2 {             // the bare-Name type arg is its own mangle
                             var ec: String = string_new()
-                            emit_type_arg_cty(ec, p, src, arg_at(p, e, 0))
+                            emit_type_arg_cty_plain(ec, p, src, arg_at(p, e, 0))
                             any = push_genref_typedef(sb, seen, src[ax.start .. ax.end], string_view(ec)) or any
                             string_free(ec)
                         }
@@ -8416,9 +9023,9 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
     collect_spawns(g, p, src)                        // spawn sites (gates the pthread prelude)
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     collect_method_instances(g, p, src, c)           // (struct item, method fn item) pairs, first-seen
-    collect_gstruct_instances(g, p, src, c)          // generic-STRUCT instance TyIds, expr order
-    collect_genum_instances(g, p, src, c)            // generic-enum instance TyIds, expr order
     collect_gfn_instances(g, p, src, c, a)           // generic-fn instances, LIFO worklist order
+    collect_gstruct_instances(g, p, src, c)          // generic-STRUCT instances (reads gfi — after!)
+    collect_genum_instances(g, p, src, c)            // generic-enum instance TyIds, expr order
     collect_closures(g, p, src, a)                   // closures + captures, discovery order (LAST, like the reference)
     emit_prelude(sb, p, src, g)
     emit_forward_types(sb, p, src)
@@ -8438,7 +9045,7 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
     emit_closure_types(sb, p, src, c, g)             // env + {call, env} typedefs + unconditional blank
     emit_fn_protos(sb, p, src, c, g)
     emit_method_protos(sb, p, src, c, g)             // method protos + unconditional trailing blank
-    emit_impl_protos(sb, p, src)                     // trait-impl protos + CONDITIONAL trailing blank
+    emit_impl_protos(sb, p, src, c, g)                   // trait-impl protos + CONDITIONAL trailing blank
     emit_dyn_vtables(sb, p, src)                     // vtable shims + static instances
     emit_spawn_runtime(sb, p, src, c, g)             // spawn arg-pack structs + trampolines
     emit_consts(sb, p, src, c, g)                    // consts + its unconditional trailing blank
