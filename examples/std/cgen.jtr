@@ -1355,6 +1355,36 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         string_push(sb, " }")
         return
     }
+    if e.kind == 40 {                                 // await h: join-once + yield the task box's ret
+        let t: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+        if t.kind == 2 {
+            var ti: usize = g.thf as usize
+            for ti < list.len(i32, g.th) {
+                let hns: i32 = list.get(i32, g.th, ti)
+                let hne: i32 = list.get(i32, g.th, ti + 1)
+                if str_eq(src[t.start .. t.end], src[hns as usize .. hne as usize]) {
+                    let h: i32 = list.get(i32, g.th, ti + 2)
+                    string_push(sb, "({ if (!_jd")
+                    push_uint(sb, h as i64)
+                    string_push(sb, ") { pthread_join(_jt")
+                    push_uint(sb, h as i64)
+                    string_push(sb, ", NULL); _jd")
+                    push_uint(sb, h as i64)
+                    string_push(sb, " = 1; }")
+                    if list.get(i32, g.th, ti + 3) == 1 {
+                        string_push(sb, " _ja")
+                        push_uint(sb, h as i64)
+                        string_push(sb, ".ret;")
+                    }
+                    string_push(sb, " })")
+                    return
+                }
+                ti = ti + 4
+            }
+        }
+        string_push(sb, "0")                          // unresolved handle: the diag case
+        return
+    }
     if e.kind == 22 {                                 // FString: the _fs{n} push chain
         emit_fstring(sb, p, src, c, g, e)
         return
@@ -2373,6 +2403,18 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         emit_user_args(sb, p, src, c, g, e, nm)
         return
     }
+    // Default: any other callee form emits plainly — callee expr, then plain args. (The
+    // single-file golden's DEGENERATE module-qualified call `env.argc()` -> `j_env.j_argc()`
+    // lands here, matching the reference's final fallback byte-for-byte.)
+    emit_expr(sb, p, src, c, g, e.a)
+    string_push(sb, "(")
+    var di: i32 = 0
+    for di < e.y {
+        if di > 0 { string_push(sb, ", ") }
+        emit_expr(sb, p, src, c, g, arg_at(p, e, di))
+        di = di + 1
+    }
+    string_push(sb, ")")
 }
 
 // One C prototype per `extern "c"` declaration (bare name, linker-resolved), + a blank iff any.
@@ -2552,7 +2594,7 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // `gfi` holds the collected generic-fn instance records ([fn item, argc, (kind,a,b) targ
 // triples…], variable length — walk with a cursor); `su` is the ACTIVE instance's
 // type-parameter substitution (5-tuples: tparam span + arg triple), read by `emit_su_ty`.
-struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool }
+struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32 }
 
 // The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
 // (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
@@ -7003,14 +7045,35 @@ fn emit_dyn_spawn(mut sb: String, read p: parser.Parser, read src: str, read c: 
     string_free(vals)
 }
 
+// Does the spawn's target fn return a value (so its task box carries a `ret` field)?
+// Mirrors `task_ret_cty(...).is_some()`: the RENDERED ret type is compared to "void".
+fn spawn_target_has_ret(read p: parser.Parser, read src: str, call: i32) -> bool {
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, call as usize)
+    let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+    let fit: i32 = find_fn_item(p, src, src[callee.start .. callee.end])
+    if fit < 0 { return false }
+    let fd: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
+    if fd.z < 0 { return false }
+    var rets: String = string_new()
+    emit_c_ty(rets, p, src, fd.z)
+    let r: bool = !str_eq(string_view(rets), "void")
+    string_free(rets)
+    return r
+}
+
 // A `concurrent { … }` nursery: fixed top-level spawns get numbered handles joined at the
-// brace; a spawn nested in a loop/if is dynamic-N via the growable array. Let-bound task
-// handles (`let h = spawn …` + `await`) are a later increment. No drop scope — mirrors
-// `emit_concurrent`'s plain braces.
+// brace; `let h = spawn …` binds an awaitable handle with a `_jd` joined-flag (so an `await`
+// and the brace's safety-net join don't double-join); a spawn nested in a loop/if is
+// dynamic-N via the growable array. The handle map is scoped per block (the reference
+// `mem::take`s it — an inner nursery does NOT see the outer's handles; `g.thf` is that
+// floor). No drop scope — mirrors `emit_concurrent`'s plain braces.
 fn emit_concurrent(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, eid: i32, depth: i32) {
     let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
     let blk: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
     let saved_dyn: bool = g.dspawn
+    let saved_floor: i32 = g.thf
+    let saved_len: usize = list.len(i32, g.th)
+    g.thf = saved_len as i32
     line_at(sb, depth, "{")
     var needs_dyn: bool = false
     var si: i32 = 0
@@ -7022,20 +7085,42 @@ fn emit_concurrent(mut sb: String, read p: parser.Parser, read src: str, read c:
         line_at(sb, depth + 1, "pthread_t* _dt = NULL; void** _da = NULL; size_t _dn = 0, _dc = 0;")
     }
     g.dspawn = needs_dyn
-    var handles: i32 = 0                              // fixed handle indices, bare joins only so far
+    var handles: i32 = 0
     var i: i32 = 0
     for i < blk.y {
         let sid: i32 = list.get(i32, p.sar, (blk.x + i) as usize)
         let s: parser.StmtData = list.get(parser.StmtData, p.st, sid as usize)
         var handled: bool = false
-        if s.kind == 2 and s.a >= 0 {                 // bare `spawn f(args)` at top level
+        if s.kind == 0 and s.a >= 0 {                 // `let h = spawn f(args)` -> awaitable handle
             let se: parser.ExprData = list.get(parser.ExprData, p.ex, s.a as usize)
             if se.kind == 39 {
                 let call: i32 = spawn_call_of(p, se.a)
                 if call >= 0 {
                     emit_spawn_create(sb, p, src, c, g, call, handles, depth + 1)
+                    indent(sb, depth + 1)
+                    string_push(sb, "int _jd")
+                    push_uint(sb, handles as i64)
+                    string_push(sb, " = 0;\n")
+                    list.push(i32, g.th, s.x)         // handle-name span -> (idx, has_ret)
+                    list.push(i32, g.th, s.y)
+                    list.push(i32, g.th, handles)
+                    if spawn_target_has_ret(p, src, call) { list.push(i32, g.th, 1) }
+                    else { list.push(i32, g.th, 0) }
                     handles = handles + 1
-                    handled = true
+                }
+                handled = true                        // (a non-call spawn is the diag case)
+            }
+        }
+        if !handled {
+            if s.kind == 2 and s.a >= 0 {             // bare `spawn f(args)` -> fire-and-forget
+                let se: parser.ExprData = list.get(parser.ExprData, p.ex, s.a as usize)
+                if se.kind == 39 {
+                    let call: i32 = spawn_call_of(p, se.a)
+                    if call >= 0 {
+                        emit_spawn_create(sb, p, src, c, g, call, handles, depth + 1)
+                        handles = handles + 1
+                        handled = true
+                    }
                 }
             }
         }
@@ -7044,8 +7129,21 @@ fn emit_concurrent(mut sb: String, read p: parser.Parser, read src: str, read c:
     }
     var h: i32 = 0
     for h < handles {                                 // structured join at the brace
+        // a let-bound handle guards its join with the `_jd` flag (an await may have joined)
+        var guarded: bool = false
+        var tj: usize = saved_len
+        for tj < list.len(i32, g.th) {
+            if list.get(i32, g.th, tj + 2) == h { guarded = true }
+            tj = tj + 4
+        }
         indent(sb, depth + 1)
-        string_push(sb, "pthread_join(_jt")
+        if guarded {
+            string_push(sb, "if (!_jd")
+            push_uint(sb, h as i64)
+            string_push(sb, ") pthread_join(_jt")
+        } else {
+            string_push(sb, "pthread_join(_jt")
+        }
         push_uint(sb, h as i64)
         string_push(sb, ", NULL);\n")
         h = h + 1
@@ -7055,6 +7153,8 @@ fn emit_concurrent(mut sb: String, read p: parser.Parser, read src: str, read c:
         line_at(sb, depth + 1, "free(_dt); free(_da);")
     }
     line_at(sb, depth, "}")
+    list.truncate(i32, g.th, saved_len)
+    g.thf = saved_floor
     g.dspawn = saved_dyn
 }
 
@@ -7252,7 +7352,7 @@ fn emit_main_wrapper(mut sb: String, read p: parser.Parser, read src: str) {
 // `"\n"` pushes stand in for the reference's unconditionally-blank sections that are empty for a
 // program with no aggregates (closure_types, method_protos, consts) plus the guarded no-ops.
 fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator) {
-    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: list.make(i32, a), vtf: 0, gfi: list.make(i32, a), su: list.make(i32, a), cls: list.make(i32, a), ccx: list.make(i32, a), cca: list.make(i32, a), caps: list.make(i32, a), gsi: list.make(i32, a), sps: list.make(i32, a), dspawn: false }
+    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: list.make(i32, a), vtf: 0, gfi: list.make(i32, a), su: list.make(i32, a), cls: list.make(i32, a), ccx: list.make(i32, a), cca: list.make(i32, a), caps: list.make(i32, a), gsi: list.make(i32, a), sps: list.make(i32, a), dspawn: false, th: list.make(i32, a), thf: 0 }
     collect_spawns(g, p, src)                        // spawn sites (gates the pthread prelude)
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     collect_method_instances(g, p, src, c)           // (struct item, method fn item) pairs, first-seen
