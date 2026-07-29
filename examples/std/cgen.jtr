@@ -31,6 +31,23 @@ import "typeck"
 // `hello` uses none, so they are elided (added back per construct as later files need them).
 // Does the program use the bump-arena runtime — a `region` block, a region-scoped loop, or a
 // value-level arena intrinsic? Gates the arena prelude block (mirrors `uses_arena`).
+// Does the program call `try_read_file`? Gates its runtime helper + `JestyrResult_String`
+// typedef so unrelated programs stay byte-identical (mirrors `uses_try_read`).
+fn uses_try_read(read p: parser.Parser, read src: str) -> bool {
+    var i: usize = 0
+    for i < list.len(parser.ExprData, p.ex) {
+        let e: parser.ExprData = list.get(parser.ExprData, p.ex, i)
+        if e.kind == 10 {
+            let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+            if callee.kind == 2 {
+                if str_eq(src[callee.start .. callee.end], "try_read_file") { return true }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
 fn uses_arena(read p: parser.Parser, read src: str) -> bool {
     var i: usize = 0
     for i < list.len(parser.ExprData, p.ex) {
@@ -125,6 +142,12 @@ fn emit_prelude(mut sb: String, read p: parser.Parser, read src: str) {
     string_push(sb, "static bool jestyr_rt_write_file(JestyrStr path, JestyrStr data) { char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, \"wb\"); free(cp); if (!f) return false; size_t put = data.len ? fwrite(data.ptr, 1, data.len, f) : 0; int rc = fclose(f); return rc == 0 && put == data.len; }\n")
     string_push(sb, "static bool jestyr_rt_file_exists(JestyrStr path) { char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, \"rb\"); free(cp); if (f) { fclose(f); return true; } return false; }\n")
     string_push(sb, "static bool jestyr_rt_remove_file(JestyrStr path) { char* cp = jestyr_rt_cpath(path); int rc = remove(cp); free(cp); return rc == 0; }\n")
+    // Recoverable read (B3): emitted ONLY when `try_read_file` is used, so a program that
+    // doesn't use it stays byte-identical.
+    if uses_try_read(p, src) {
+        string_push(sb, "/* Recoverable whole-file read: false on open/seek failure (the `String !IoError` err branch). */\n")
+        string_push(sb, "static bool jestyr_rt_try_read_file(JestyrStr path, JestyrString* out) { *out = jestyr_rt_str_new(); char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, \"rb\"); free(cp); if (!f) return false; if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; } long sz = ftell(f); if (sz < 0) { fclose(f); return false; } rewind(f); size_t cap = (size_t)sz ? (size_t)sz : 1; out->ptr = (char*)malloc(cap); out->cap = cap; out->len = fread(out->ptr, 1, (size_t)sz, f); fclose(f); return true; }\n")
+    }
     string_push(sb, "\n")
     string_push(sb, "/* Command-line arguments (self-hosting plumbing): argv is captured in main()\n")
     string_push(sb, "   into file-scope globals, exposed to Jestyr as arg_count() -> i32 and\n")
@@ -713,7 +736,17 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         string_push(sb, src[e.start .. e.end])
         return
     }
-    if e.kind == 4 {                                  // Binary: (lhs OP rhs)
+    if e.kind == 4 {                                  // Binary: operator-trait dispatch, else (lhs OP rhs)
+        var ob: i32 = 0 - 1
+        var oi: usize = 0
+        for oi < list.len(i32, c.icalls) {            // an icalls record on a BINARY id = an op impl
+            if list.get(i32, c.icalls, oi) == eid { ob = oi as i32 }
+            oi = oi + 5
+        }
+        if ob >= 0 {
+            emit_operator_call(sb, p, src, c, g, e, ob)
+            return
+        }
         string_push(sb, "(")
         emit_expr(sb, p, src, c, g, e.a)
         string_push(sb, " ")
@@ -1173,6 +1206,10 @@ fn intrinsic_helper(read nm: str) -> str {
     if str_eq(nm, "contains") { return "jestyr_rt_contains" }
     if str_eq(nm, "find") { return "jestyr_rt_find" }
     if str_eq(nm, "trim") { return "jestyr_rt_trim" }
+    if str_eq(nm, "read_file") { return "jestyr_rt_read_file" }
+    if str_eq(nm, "write_file") { return "jestyr_rt_write_file" }
+    if str_eq(nm, "file_exists") { return "jestyr_rt_file_exists" }
+    if str_eq(nm, "remove_file") { return "jestyr_rt_remove_file" }
     if str_eq(nm, "substr") { return "jestyr_rt_substr" }
     if str_eq(nm, "count_cp") { return "jestyr_rt_count_cp" }
     if str_eq(nm, "count_graphemes") { return "jestyr_rt_count_graphemes" }
@@ -1359,15 +1396,9 @@ fn push_key_of_tyid(mut sb: String, read src: str, read c: typeck.Checker, tid: 
     if d.kind == 2 { string_push(sb, prim_jname(d.x)) }
 }
 
-// The impl-dispatch lowering shared by icalls (concrete receiver) and bcalls (bound receiver,
-// key resolved through the ACTIVE substitution): a direct call of
-// `jestyr_impl_<Trait>__<key>__<method>`, the receiver first (by `&` for a `mut`/`out self`),
-// args honouring the resolved impl method's conventions (param 0 = self). The method name is
-// the callee Field's span. Mirrors `emit_impl_call`.
-fn emit_impl_dispatch(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, read callee: parser.ExprData, tns: i32, tne: i32, read key: str) {
-    let mns: i32 = callee.x
-    let mne: i32 = callee.y
-    // Find the impl method's fn item (for the self/arg conventions).
+// The fn item of `impl <src[tns..tne]> for <key>`'s method named `src[mns..mne]`, or -1
+// (used for the self/arg conventions of impl and operator dispatch).
+fn find_impl_method_item(read p: parser.Parser, read src: str, tns: i32, tne: i32, read key: str, mns: i32, mne: i32) -> i32 {
     var mid: i32 = 0 - 1
     var r: i32 = 0
     for r < list.len(i32, p.roots) {
@@ -1391,6 +1422,77 @@ fn emit_impl_dispatch(mut sb: String, read p: parser.Parser, read src: str, read
         }
         r = r + 1
     }
+    return mid
+}
+
+// An operator-trait binary op (`a + b` on a user type, icalls-recorded on the Binary id):
+// `jestyr_impl_<Trait>__<key>__<m>(a, b)`. The four base ops call directly; the DERIVED
+// comparisons reuse a base with a swap and/or negate: `!=` -> !eq(a,b), `>` -> lt(b,a),
+// `<=` -> !lt(b,a), `>=` -> !lt(a,b). Mirrors `emit_operator_call`.
+fn emit_operator_call(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, ob: i32) {
+    let tns: i32 = list.get(i32, c.icalls, (ob + 1) as usize)
+    let tne: i32 = list.get(i32, c.icalls, (ob + 2) as usize)
+    let mns: i32 = list.get(i32, c.icalls, (ob + 3) as usize)
+    let mne: i32 = list.get(i32, c.icalls, (ob + 4) as usize)
+    let swap: bool = e.op == 10 or e.op == 9          // `>` and `<=` compare via b < a
+    let negate: bool = e.op == 7 or e.op == 9 or e.op == 11   // !=, <=, >= negate their base
+    var key: String = string_new()
+    push_key_of_tyid(key, src, c, list.get(i32, c.et, e.a as usize))
+    let mid: i32 = find_impl_method_item(p, src, tns, tne, string_view(key), mns, mne)
+    var sconv: i32 = 0
+    var rconv: i32 = 0
+    if mid >= 0 {
+        sconv = method_self_conv(p, mid)
+        let fd: parser.ItemData = list.get(parser.ItemData, p.it, mid as usize)
+        var pi: i32 = 0
+        for pi < fd.b {                               // the first non-self, non-comptime param
+            let pb: i32 = fd.a + pi * 7
+            if rconv == 0 and list.get(i32, p.iar, pb as usize) == 0 and list.get(i32, p.iar, (pb + 4) as usize) == 0 {
+                rconv = list.get(i32, p.iar, (pb + 1) as usize)
+            }
+            pi = pi + 1
+        }
+    }
+    var recv_id: i32 = e.a
+    var arg_id: i32 = e.b
+    if swap { recv_id = e.b  arg_id = e.a }
+    if negate { string_push(sb, "(!") }
+    string_push(sb, "jestyr_impl_")
+    string_push(sb, src[tns as usize .. tne as usize])
+    string_push(sb, "__")
+    string_push(sb, string_view(key))
+    string_push(sb, "__")
+    string_push(sb, src[mns as usize .. mne as usize])
+    string_push(sb, "(")
+    string_free(key)
+    if sconv == 2 or sconv == 4 {
+        string_push(sb, "&(")
+        emit_expr(sb, p, src, c, g, recv_id)
+        string_push(sb, ")")
+    } else {
+        emit_expr(sb, p, src, c, g, recv_id)
+    }
+    string_push(sb, ", ")
+    if rconv == 2 or rconv == 4 {
+        string_push(sb, "&(")
+        emit_expr(sb, p, src, c, g, arg_id)
+        string_push(sb, ")")
+    } else {
+        emit_expr(sb, p, src, c, g, arg_id)
+    }
+    string_push(sb, ")")
+    if negate { string_push(sb, ")") }
+}
+
+// The impl-dispatch lowering shared by icalls (concrete receiver) and bcalls (bound receiver,
+// key resolved through the ACTIVE substitution): a direct call of
+// `jestyr_impl_<Trait>__<key>__<method>`, the receiver first (by `&` for a `mut`/`out self`),
+// args honouring the resolved impl method's conventions (param 0 = self). The method name is
+// the callee Field's span. Mirrors `emit_impl_call`.
+fn emit_impl_dispatch(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, read callee: parser.ExprData, tns: i32, tne: i32, read key: str) {
+    let mns: i32 = callee.x
+    let mne: i32 = callee.y
+    let mid: i32 = find_impl_method_item(p, src, tns, tne, key, mns, mne)
     string_push(sb, "jestyr_impl_")
     string_push(sb, src[tns as usize .. tne as usize])
     string_push(sb, "__")
@@ -1697,6 +1799,12 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_push(sb, " _u = ")
             emit_expr(sb, p, src, c, g, a0)
             string_push(sb, "; jestyr_rt_valid_utf8((const char*)_u.ptr, _u.len) ? (JestyrResult_str){ .is_err = false, .ok = (JestyrStr){ (const char*)_u.ptr, _u.len } } : (JestyrResult_str){ .is_err = true, .err = 1 }; })")
+            return
+        }
+        if str_eq(nm, "try_read_file") {              // B3 recoverable read: FIXED temps _s/_ok (no counter)
+            string_push(sb, "({ JestyrString _s; bool _ok = jestyr_rt_try_read_file(")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            string_push(sb, ", &_s); _ok ? (JestyrResult_String){ .is_err = false, .ok = _s } : (JestyrResult_String){ .is_err = true, .err = 1 }; })")
             return
         }
         if str_eq(nm, "arg_count") {                  // arg_count() -> the argv-count runtime global
@@ -3955,6 +4063,15 @@ fn emit_for_inner(mut sb: String, read p: parser.Parser, read src: str, read c: 
                 }
             }
         }
+        if sx.kind == 10 and sx.y == 2 {              // `split(s, sep)` marker: separator scan loop
+            let cal: parser.ExprData = list.get(parser.ExprData, p.ex, sx.a as usize)
+            if cal.kind == 2 {
+                if str_eq(src[cal.start .. cal.end], "split") {
+                    emit_split_for(sb, p, src, c, g, e, arg_at(p, sx, 0), arg_at(p, sx, 1), depth)
+                    return
+                }
+            }
+        }
         if step < 0 {
             if expr_is_slice(c, src0) {               // slice source: snapshot + counted for
                 emit_slice_for(sb, p, src, c, g, e, src0, bc, depth)
@@ -4031,6 +4148,106 @@ fn emit_codepoints_for(mut sb: String, read p: parser.Parser, read src: str, rea
     string_push(sb, ".len, &_k")
     push_uint(sb, n as i64)
     string_push(sb, ");\n")
+    let blk: parser.ExprData = list.get(parser.ExprData, p.ex, e.b as usize)
+    var i: i32 = 0
+    for i < blk.y {
+        emit_stmt(sb, p, src, c, g, list.get(i32, p.sar, (blk.x + i) as usize), depth + 1)
+        i = i + 1
+    }
+    emit_cont_target(sb, src, g, depth + 1)
+    line_at(sb, depth, "}")
+}
+
+// `for part in split(s, sep)` — yield each `str` view between separators (zero-copy; the last
+// part is the remainder; an empty `sep` yields the whole string once). ONE temp; the source and
+// separator exprs are emitted FIRST (their own temps consume before `n`), mirroring
+// `emit_split_for`'s ordering exactly.
+fn emit_split_for(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, s_arg: i32, sep_arg: i32, depth: i32) {
+    let bns: i32 = list.get(i32, p.lar, (e.a + 8) as usize)
+    let bne: i32 = list.get(i32, p.lar, (e.a + 9) as usize)
+    let bname: str = src[bns as usize .. bne as usize]
+    var sbuf: String = string_new()
+    emit_expr(sbuf, p, src, c, g, s_arg)
+    var pbuf: String = string_new()
+    emit_expr(pbuf, p, src, c, g, sep_arg)
+    let n: i32 = g.tmp
+    g.tmp = g.tmp + 1
+    indent(sb, depth)
+    string_push(sb, "JestyrStr _ss")
+    push_uint(sb, n as i64)
+    string_push(sb, " = ")
+    string_push(sb, string_view(sbuf))
+    string_push(sb, ";\n")
+    indent(sb, depth)
+    string_push(sb, "JestyrStr _sep")
+    push_uint(sb, n as i64)
+    string_push(sb, " = ")
+    string_push(sb, string_view(pbuf))
+    string_push(sb, ";\n")
+    string_free(sbuf)
+    string_free(pbuf)
+    indent(sb, depth)
+    string_push(sb, "size_t _start")
+    push_uint(sb, n as i64)
+    string_push(sb, " = 0;\n")
+    indent(sb, depth)
+    string_push(sb, "int _go")
+    push_uint(sb, n as i64)
+    string_push(sb, " = 1;\n")
+    indent(sb, depth)
+    string_push(sb, "while (_go")
+    push_uint(sb, n as i64)
+    string_push(sb, ")\n")
+    line_at(sb, depth, "{")
+    emit_scratch_reset(sb, src, g, depth + 1)
+    indent(sb, depth + 1)
+    string_push(sb, "JestyrStr _rest")
+    push_uint(sb, n as i64)
+    string_push(sb, " = (JestyrStr){ _ss")
+    push_uint(sb, n as i64)
+    string_push(sb, ".ptr + _start")
+    push_uint(sb, n as i64)
+    string_push(sb, ", _ss")
+    push_uint(sb, n as i64)
+    string_push(sb, ".len - _start")
+    push_uint(sb, n as i64)
+    string_push(sb, " };\n")
+    indent(sb, depth + 1)
+    string_push(sb, "int64_t _hit")
+    push_uint(sb, n as i64)
+    string_push(sb, " = _sep")
+    push_uint(sb, n as i64)
+    string_push(sb, ".len ? jestyr_rt_find(_rest")
+    push_uint(sb, n as i64)
+    string_push(sb, ", _sep")
+    push_uint(sb, n as i64)
+    string_push(sb, ") : -1;\n")
+    if !str_eq(bname, "_") {
+        indent(sb, depth + 1)
+        string_push(sb, "JestyrStr j_")
+        string_push(sb, bname)
+        string_push(sb, " = (_hit")
+        push_uint(sb, n as i64)
+        string_push(sb, " < 0) ? _rest")
+        push_uint(sb, n as i64)
+        string_push(sb, " : (JestyrStr){ _rest")
+        push_uint(sb, n as i64)
+        string_push(sb, ".ptr, (size_t)_hit")
+        push_uint(sb, n as i64)
+        string_push(sb, " };\n")
+    }
+    indent(sb, depth + 1)
+    string_push(sb, "if (_hit")
+    push_uint(sb, n as i64)
+    string_push(sb, " < 0) _go")
+    push_uint(sb, n as i64)
+    string_push(sb, " = 0; else _start")
+    push_uint(sb, n as i64)
+    string_push(sb, " += (size_t)_hit")
+    push_uint(sb, n as i64)
+    string_push(sb, " + _sep")
+    push_uint(sb, n as i64)
+    string_push(sb, ".len;\n")
     let blk: parser.ExprData = list.get(parser.ExprData, p.ex, e.b as usize)
     var i: i32 = 0
     for i < blk.y {
@@ -5242,6 +5459,12 @@ fn emit_result_defs(mut sb: String, read p: parser.Parser, read src: str) {
     string_push(sb, "typedef struct { bool is_err; JestyrStr ok; int err; } JestyrResult_str;\n")
     var seen: String = string_new()
     string_push(seen, "|str|")                        // `try_from_utf8`'s result is pre-seeded
+    // `try_read_file`'s result type isn't discovered from a fn signature — emit it (only when
+    // used) and seed `seen` so a user `String !E` fn doesn't duplicate the typedef (B3).
+    if uses_try_read(p, src) {
+        string_push(sb, "typedef struct { bool is_err; JestyrString ok; int err; } JestyrResult_String;\n")
+        string_push(seen, "|String|")
+    }
     var r: i32 = 0
     for r < list.len(i32, p.roots) {
         let iid: i32 = list.get(i32, p.roots, r)

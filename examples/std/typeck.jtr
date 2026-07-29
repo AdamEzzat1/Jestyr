@@ -1403,7 +1403,10 @@ fn op_method_name(op: i32) -> str {
 // `a OP b` on a user type (Named / GenStruct lhs) dispatches through the op's trait impl:
 // the impl method's registered return, or Error when the type lacks the impl. Mirrors
 // `resolve_operator_trait` (which the reference consults before native semantics).
-fn resolve_operator(mut c: Checker, read src: str, op: i32, lt: i32) -> i32 {
+// A successful resolution is recorded in `icalls` keyed on the BINARY ExprId (the impl
+// declaration's own trait/method-name spans spell "Add"/"add" etc.), so the backend lowers the
+// op to the impl call — the reference records these in `impl_calls` the same way.
+fn resolve_operator(mut c: Checker, read src: str, id: i32, op: i32, lt: i32) -> i32 {
     let tn: str = op_trait_name(op)
     let mn: str = op_method_name(op)
     let n: i32 = (list.len(i32, c.imp) / 5) as i32
@@ -1422,6 +1425,11 @@ fn resolve_operator(mut c: Checker, read src: str, op: i32, lt: i32) -> i32 {
                     let mns: i32 = list.get(i32, c.tch, mb as usize)
                     let mne: i32 = list.get(i32, c.tch, (mb + 1) as usize)
                     if str_eq(src[mns as usize .. mne as usize], mn) {
+                        list.push(i32, c.icalls, id)   // record: the op lowers to this impl call
+                        list.push(i32, c.icalls, trns)
+                        list.push(i32, c.icalls, trne)
+                        list.push(i32, c.icalls, mns)
+                        list.push(i32, c.icalls, mne)
                         return list.get(i32, c.tch, (mb + 2) as usize)
                     }
                     j = j + 1
@@ -1825,7 +1833,7 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
         let ld: TyData = list.get(TyData, c.tys, lt as usize)
         if ld.kind == 15 or ld.kind == 6 {
             if !str_eq(op_trait_name(d.op), "") {
-                r = resolve_operator(c, src, d.op, lt)
+                r = resolve_operator(c, src, id, d.op, lt)
                 handled = true
             }
         }
