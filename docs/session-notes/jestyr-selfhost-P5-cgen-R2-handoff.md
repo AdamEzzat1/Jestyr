@@ -367,6 +367,45 @@ monomorphized sigs contributing slice/array instances, generic-struct METHODS (`
 `k = k + 1` hung on every impl file — Jestyr `for` is while-form; the corpus probe catches
 it as a timeout.
 
+### Increments 28–30 — near-miss sweeps: dispatch records, I/O, arrays (allowlist 62)
+
+**A correction first: `generics.jtr` does NOT exist** — the roadmap's cluster-6 target list was
+speculative; the **diff-ranked probe is the real worklist** (rank every import-free non-matching
+file by `diff | wc -l`; import-driver files like `try_read.jtr`/`demo.jtr` are golden
+non-targets — the single-file path degenerates their module-qualified calls on BOTH sides).
+
+**28** (`69dcbdb`, +`unsafe_init`, `env`, `bound_method`, `traits_static`): VALUE-position
+`unsafe { E }`/`{ E }` = the single tail expr (B4); `arg_count`/`arg` intrinsics (the `arg`
+form casts `(int64_t)(…)`); **impl-method CALL dispatch** — an `icalls`-recorded `recv.m(args)`
+lowers to `jestyr_impl_<Trait>__<Key>__<method>(recv, …)`, key from the receiver's Checker type
+(Named name / prim jname); **bound dispatch** — typeck.jtr's `resolve_bound_method` now records
+into a new `pub bcalls` arena (5-tuples: call id, bound span, tparam span), and cgen resolves
+the key through the ACTIVE substitution (`g.su`), so a template's `x.show()` dispatches per
+instance.
+
+**29** (`4f9a4f1`, +`operators`, `fs`, `str_iter`): **operator-trait dispatch** — typeck.jtr's
+`resolve_operator` records into `icalls` keyed on the BINARY ExprId (the impl decl's own
+trait/method spans spell "Add"/"add"); cgen's Binary arm calls `emit_operator_call` (swap for
+`>`/`<=`, negate for `!=`/`<=`/`>=`; `find_impl_method_item` factored + shared). File I/O:
+`read_file`/`write_file`/`file_exists`/`remove_file` helper-table entries; `try_read_file` =
+the B3 stmt-expr (FIXED `_s`/`_ok`, no counter) + prelude helper + `JestyrResult_String`
+typedef gated on `uses_try_read` (seeds result_defs' dedup). Split iteration:
+`emit_split_for` (ONE temp; `_ss`/`_sep`/`_start`/`_go` scan loop).
+
+**30** (`92826a5`, +`arrays`): ArrayRepeat `[v; N]` fill stmt-expr; array-index ASSIGN folds
+into its own stmt-expr (non-const ptr). **Temp-order trap (recurring!): the reference emits
+subexpressions (base/index/VALUE) BEFORE taking the enclosing form's temp** — `xs[i] = xs[i]+1`
+numbers the READ first. Port such forms by buffering subexpr emission into Strings, then taking
+the temp (split/repeat/index-write do this; the older emitters take the temp first and only
+match because their sources are temp-free so far — fix each when a file exposes it).
+
+**Next up (ranked):** fn-pointer types (cluster 11 — unlocks `vec_alloc` 22, `alloc_vtable`
+26, `gen_vtable` 29, `fn_ptr` 55), closures (`closure_run` 28), concurrency (`dynamic_spawn`
+22, `concurrent` 33, `await` 36, `atomics` 41), `mem.jtr` 33, `attributes.jtr` 38 (fn attr
+prefixes + @no_mangle bare names), `option` 39/`niche` 59, `nested_match` 47,
+`struct_variant` 49; then the generics chain `genlist` 70 → `vec_generic` 82 → `list.jtr` 95
+(the first compiler-source dependency, needs nested-generic instance walking + body substs).
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
