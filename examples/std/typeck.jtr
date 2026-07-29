@@ -77,7 +77,7 @@ import "parser"
 // row) and `icalls` each impl-dispatched call (5-tuples: call ExprId, trait name span, method
 // name span) — the downstream passes' `method_calls`/`impl_calls` (the escape checker's
 // give-away and manual-drop rules read them).
-pub struct Checker { pub tys: List(TyData), pub tya: List(i32), pub et: List(i32), scn: List(i32), scst: List(i32), pub tdecl: List(i32), pub tch: List(i32), pub fns: List(i32), cst: List(i32), vmap: List(i32), tra: List(i32), imp: List(i32), pub mcalls: List(i32), pub icalls: List(i32), selfty: i32, expected: i32, curret: i32, scfloor: i32, gbs: i32, gbc: i32, alloc: Allocator }
+pub struct Checker { pub tys: List(TyData), pub tya: List(i32), pub et: List(i32), scn: List(i32), scst: List(i32), pub tdecl: List(i32), pub tch: List(i32), pub fns: List(i32), cst: List(i32), vmap: List(i32), tra: List(i32), imp: List(i32), pub mcalls: List(i32), pub icalls: List(i32), pub bcalls: List(i32), selfty: i32, expected: i32, curret: i32, scfloor: i32, gbs: i32, gbc: i32, alloc: Allocator }
 
 // One `Ty` arena node - kinds in the header comment. `a`/`b` are child TyIds or slice fields;
 // `x`/`y` are aux ints (prim code, name span, ret TyId/conv).
@@ -105,7 +105,7 @@ fn mk_ty(mut c: Checker, kind: i32, a: i32, b: i32, x: i32, y: i32) -> i32 {
 // The checker with the well-known instances pre-created (ids 0..7) and `et` sized to the
 // expression arena, all-Unknown.
 fn make_checker(read p: parser.Parser, read a: Allocator) -> Checker {
-    var c: Checker = Checker{ tys: list.make(TyData, a), tya: list.make(i32, a), et: list.make(i32, a), scn: list.make(i32, a), scst: list.make(i32, a), tdecl: list.make(i32, a), tch: list.make(i32, a), fns: list.make(i32, a), cst: list.make(i32, a), vmap: list.make(i32, a), tra: list.make(i32, a), imp: list.make(i32, a), mcalls: list.make(i32, a), icalls: list.make(i32, a), selfty: 1, expected: 0 - 1, curret: 0 - 1, scfloor: 0, gbs: 0 - 1, gbc: 0, alloc: a }
+    var c: Checker = Checker{ tys: list.make(TyData, a), tya: list.make(i32, a), et: list.make(i32, a), scn: list.make(i32, a), scst: list.make(i32, a), tdecl: list.make(i32, a), tch: list.make(i32, a), fns: list.make(i32, a), cst: list.make(i32, a), vmap: list.make(i32, a), tra: list.make(i32, a), imp: list.make(i32, a), mcalls: list.make(i32, a), icalls: list.make(i32, a), bcalls: list.make(i32, a), selfty: 1, expected: 0 - 1, curret: 0 - 1, scfloor: 0, gbs: 0 - 1, gbc: 0, alloc: a }
     mk_ty(c, 0, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 0 Unknown
     mk_ty(c, 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 1 Unit
     mk_ty(c, 2, 0 - 1, 0 - 1, 2, 0 - 1)            // 2 Prim i32   (code 2)
@@ -1330,8 +1330,11 @@ fn resolve_impl_method(mut c: Checker, read src: str, call_id: i32, recv: i32, m
 
 // `x.m(args)` where `x: T` is a bracket type parameter of the enclosing fn (the "Zig fix"):
 // resolve through the bound trait. Unbounded param / bound without the method -> Error. -1 when
-// the receiver isn't a type parameter at all. Mirrors `resolve_bound_method`.
-fn resolve_bound_method(mut c: Checker, read p: parser.Parser, read src: str, recv: i32, ms: usize, me: usize) -> i32 {
+// the receiver isn't a type parameter at all. A successful resolution is recorded in `bcalls`
+// (5-tuples: call ExprId, bound-trait span, type-param span — the reference's
+// `bound_method_calls`) so the backend dispatches to the concrete impl per monomorphized
+// instance. Mirrors `resolve_bound_method`.
+fn resolve_bound_method(mut c: Checker, read p: parser.Parser, read src: str, id: i32, recv: i32, ms: usize, me: usize) -> i32 {
     let rd: TyData = list.get(TyData, c.tys, recv as usize)
     if rd.kind != 4 { return 0 - 1 }               // only an Opaque can be a type param
     var i: i32 = 0
@@ -1346,7 +1349,14 @@ fn resolve_bound_method(mut c: Checker, read p: parser.Parser, read src: str, re
                 let trow: i32 = find_trait(c, src, bs as usize, be as usize)
                 if trow >= 0 {
                     let ret: i32 = trait_method_ret(c, src, trow, ms, me, recv)
-                    if ret >= 0 { return ret }
+                    if ret >= 0 {
+                        list.push(i32, c.bcalls, id)
+                        list.push(i32, c.bcalls, bs)
+                        list.push(i32, c.bcalls, be)
+                        list.push(i32, c.bcalls, gns)
+                        list.push(i32, c.bcalls, gne)
+                        return ret
+                    }
                 }
             }
             return mk_ty(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1)    // unbounded / not in the bound
@@ -1606,7 +1616,7 @@ fn infer_call(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> 
         // method (the "Zig fix") -> dyn method.
         let ir: i32 = resolve_impl_method(c, src, id, recv, cal.x as usize, cal.y as usize)
         if ir >= 0 { return ir }
-        let br: i32 = resolve_bound_method(c, p, src, recv, cal.x as usize, cal.y as usize)
+        let br: i32 = resolve_bound_method(c, p, src, id, recv, cal.x as usize, cal.y as usize)
         if br >= 0 { return br }
         let dr: i32 = resolve_dyn_method(c, src, recv, cal.x as usize, cal.y as usize)
         if dr >= 0 { return dr }

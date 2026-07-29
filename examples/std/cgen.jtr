@@ -986,6 +986,16 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         string_push(sb, ")")
         return
     }
+    if e.kind == 25 or e.kind == 23 {                 // VALUE-position unsafe { E } / { E } (B4):
+        var beid: i32 = eid                           // yields the single tail expression's value
+        if e.kind == 25 { beid = e.a }
+        let blk: parser.ExprData = list.get(parser.ExprData, p.ex, beid as usize)
+        if blk.y == 1 {
+            let s: parser.StmtData = list.get(parser.StmtData, p.st, list.get(i32, p.sar, blk.x as usize) as usize)
+            if s.kind == 2 { emit_expr(sb, p, src, c, g, s.a) }
+        }
+        return
+    }
     if e.kind == 35 {                                 // Variant: strictly-decreasing termination measure
         var t: i32 = 0 - 1
         var vi: usize = g.vtf as usize
@@ -1335,6 +1345,87 @@ fn ast_ty_cat(read p: parser.Parser, read src: str, tyid: i32) -> i32 {
     return 3
 }
 
+// The TYPE KEY of a Checker type: a Named type's name, a prim's Jestyr name (both already C
+// identifiers — the reference sanitises only exotic keys these can't produce).
+fn push_key_of_tyid(mut sb: String, read src: str, read c: typeck.Checker, tid: i32) {
+    if tid < 0 { return }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+    if d.kind == 15 {
+        let kns: i32 = list.get(i32, c.tdecl, (d.x * 10 + 0) as usize)
+        let kne: i32 = list.get(i32, c.tdecl, (d.x * 10 + 1) as usize)
+        string_push(sb, src[kns as usize .. kne as usize])
+        return
+    }
+    if d.kind == 2 { string_push(sb, prim_jname(d.x)) }
+}
+
+// The impl-dispatch lowering shared by icalls (concrete receiver) and bcalls (bound receiver,
+// key resolved through the ACTIVE substitution): a direct call of
+// `jestyr_impl_<Trait>__<key>__<method>`, the receiver first (by `&` for a `mut`/`out self`),
+// args honouring the resolved impl method's conventions (param 0 = self). The method name is
+// the callee Field's span. Mirrors `emit_impl_call`.
+fn emit_impl_dispatch(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, read callee: parser.ExprData, tns: i32, tne: i32, read key: str) {
+    let mns: i32 = callee.x
+    let mne: i32 = callee.y
+    // Find the impl method's fn item (for the self/arg conventions).
+    var mid: i32 = 0 - 1
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 7 and it.h <= 0 {
+            if str_eq(src[it.x .. it.y], src[tns as usize .. tne as usize]) {
+                let tt: parser.TypeData = list.get(parser.TypeData, p.ty, it.a as usize)
+                if tt.kind == 0 {
+                    if str_eq(src[tt.start .. tt.end], key) {
+                        var k: i32 = 0
+                        for k < it.z {
+                            let cand: i32 = list.get(i32, p.mar, (it.b + k) as usize)
+                            let fd0: parser.ItemData = list.get(parser.ItemData, p.it, cand as usize)
+                            if str_eq(src[fd0.x .. fd0.y], src[mns as usize .. mne as usize]) { mid = cand }
+                            k = k + 1
+                        }
+                    }
+                }
+            }
+        }
+        r = r + 1
+    }
+    string_push(sb, "jestyr_impl_")
+    string_push(sb, src[tns as usize .. tne as usize])
+    string_push(sb, "__")
+    string_push(sb, key)
+    string_push(sb, "__")
+    string_push(sb, src[mns as usize .. mne as usize])
+    string_push(sb, "(")
+    var sconv: i32 = 0
+    if mid >= 0 { sconv = method_self_conv(p, mid) }
+    if sconv == 2 or sconv == 4 {
+        string_push(sb, "&(")
+        emit_expr(sb, p, src, c, g, callee.a)
+        string_push(sb, ")")
+    } else {
+        emit_expr(sb, p, src, c, g, callee.a)
+    }
+    var ai: i32 = 0
+    for ai < e.y {
+        string_push(sb, ", ")
+        var byref: bool = false
+        if mid >= 0 {
+            let fd: parser.ItemData = list.get(parser.ItemData, p.it, mid as usize)
+            if ai + 1 < fd.b {
+                let pconv: i32 = list.get(i32, p.iar, (fd.a + (ai + 1) * 7 + 1) as usize)
+                if pconv == 2 or pconv == 4 { byref = true }
+            }
+        }
+        if byref { string_push(sb, "&(") }
+        emit_expr(sb, p, src, c, g, arg_at(p, e, ai))
+        if byref { string_push(sb, ")") }
+        ai = ai + 1
+    }
+    string_push(sb, ")")
+}
+
 // A call. Intrinsics (see `intrinsic_helper`) lower to `<helper>(<args>)`; `size_of(T)` lowers to
 // C `sizeof(<cty>)`; a plain named call to a user function lowers to `jestyr_<name>(<args>)`.
 // Method sugar and mangled/collision names later.
@@ -1376,6 +1467,53 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
                 ai = ai + 1
             }
             string_push(sb, ")")
+            return
+        }
+        // An impl-dispatched call (recorded in the Checker's `icalls` 5-tuples): a DIRECT,
+        // statically-dispatched call of `jestyr_impl_<Trait>__<TypeKey>__<method>`, the key
+        // from the receiver's concrete Checker type. Mirrors the `impl_calls` arm.
+        var ib: i32 = 0 - 1
+        var ii: usize = 0
+        for ii < list.len(i32, c.icalls) {
+            if list.get(i32, c.icalls, ii) == eid { ib = ii as i32 }
+            ii = ii + 5
+        }
+        if ib >= 0 {
+            var key: String = string_new()
+            push_key_of_tyid(key, src, c, list.get(i32, c.et, callee.a as usize))
+            emit_impl_dispatch(sb, p, src, c, g, e, callee, list.get(i32, c.icalls, (ib + 1) as usize), list.get(i32, c.icalls, (ib + 2) as usize), string_view(key))
+            string_free(key)
+            return
+        }
+        // A bound-dispatched call inside a bracket-generic body (the Checker's `bcalls`): the
+        // concrete receiver is the type param's binding in the CURRENT monomorphization — the
+        // active substitution — dispatching to `impl <bound> for <that type>` (mirrors the
+        // `bound_method_calls` arm).
+        var bb: i32 = 0 - 1
+        var bi: usize = 0
+        for bi < list.len(i32, c.bcalls) {
+            if list.get(i32, c.bcalls, bi) == eid { bb = bi as i32 }
+            bi = bi + 5
+        }
+        if bb >= 0 {
+            let pns: i32 = list.get(i32, c.bcalls, (bb + 3) as usize)
+            let pne: i32 = list.get(i32, c.bcalls, (bb + 4) as usize)
+            var key: String = string_new()
+            var si: usize = 0
+            for si < list.len(i32, g.su) {             // the tparam's binding in g.su
+                let sns: i32 = list.get(i32, g.su, si)
+                let sne: i32 = list.get(i32, g.su, si + 1)
+                if str_eq(src[pns as usize .. pne as usize], src[sns as usize .. sne as usize]) {
+                    let akind: i32 = list.get(i32, g.su, si + 2)
+                    let aa: i32 = list.get(i32, g.su, si + 3)
+                    let ab2: i32 = list.get(i32, g.su, si + 4)
+                    if akind == 0 { string_push(key, src[aa as usize .. ab2 as usize]) }
+                    else if akind == 1 { push_key_of_tyid(key, src, c, aa) }
+                }
+                si = si + 5
+            }
+            emit_impl_dispatch(sb, p, src, c, g, e, callee, list.get(i32, c.bcalls, (bb + 1) as usize), list.get(i32, c.bcalls, (bb + 2) as usize), string_view(key))
+            string_free(key)
             return
         }
     }
@@ -1559,6 +1697,16 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_push(sb, " _u = ")
             emit_expr(sb, p, src, c, g, a0)
             string_push(sb, "; jestyr_rt_valid_utf8((const char*)_u.ptr, _u.len) ? (JestyrResult_str){ .is_err = false, .ok = (JestyrStr){ (const char*)_u.ptr, _u.len } } : (JestyrResult_str){ .is_err = true, .err = 1 }; })")
+            return
+        }
+        if str_eq(nm, "arg_count") {                  // arg_count() -> the argv-count runtime global
+            string_push(sb, "jestyr_rt_arg_count()")
+            return
+        }
+        if str_eq(nm, "arg") {                        // arg(i) -> jestyr_rt_arg((int64_t)(<i>))
+            string_push(sb, "jestyr_rt_arg((int64_t)(")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            string_push(sb, "))")
             return
         }
         if str_eq(nm, "region_alloc") {               // region_alloc(r, T, v): bump-alloc + init, plain ptr. ONE temp.
