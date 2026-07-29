@@ -70,8 +70,11 @@ fn uses_arena(read p: parser.Parser, read src: str) -> bool {
     return false
 }
 
-fn emit_prelude(mut sb: String, read p: parser.Parser, read src: str) {
+fn emit_prelude(mut sb: String, read p: parser.Parser, read src: str, read g: Cg) {
     string_push(sb, "#include <stdint.h>\n#include <stdbool.h>\n#include <stddef.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <assert.h>\n")
+    if list.len(i32, g.sps) > 0 {                     // any spawn site -> the pthread runtime
+        string_push(sb, "#include <pthread.h>\n")
+    }
     string_push(sb, "\n")
     string_push(sb, "/* Jestyr string view — a length-carrying `{ptr, len}` (a borrowed UTF-8 view,\n")
     string_push(sb, "   like Zig `[]const u8` / Rust `&str`). `.len` is O(1); no `strlen`. A bare\n")
@@ -986,6 +989,23 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         string_push(sb, " _al")
         push_uint(sb, n as i64)
         string_push(sb, "; })")
+        return
+    }
+    if e.kind == 17 {                                 // GenStructLit: (Jestyr_<ctor>__<args>){ .j_f = v, … }
+        string_push(sb, "(")
+        emit_ty_c(sb, src, c, list.get(i32, c.et, eid as usize))   // the instance's own type
+        string_push(sb, "){ ")
+        var gi: i32 = 0
+        for gi < e.y {
+            if gi > 0 { string_push(sb, ", ") }
+            let fi_: parser.ExprData = list.get(parser.ExprData, p.ex, list.get(i32, p.ar, (e.b + gi) as usize) as usize)
+            string_push(sb, ".j_")
+            string_push(sb, src[fi_.x as usize .. fi_.y as usize])
+            string_push(sb, " = ")
+            emit_expr(sb, p, src, c, g, fi_.a)
+            gi = gi + 1
+        }
+        string_push(sb, " }")
         return
     }
     if e.kind == 16 {                                 // StructLit: (Jestyr_X){ .j_f = v, … }
@@ -1918,6 +1938,25 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_push(sb, " } }")
             return
         }
+        // The `__atomic_*` builtins (no <stdatomic.h>, no special type): pointer + value cast
+        // to int64_t, SEQ_CST. Mirrors the atomic_store/load/add/sub/xchg arms.
+        if str_eq(nm, "atomic_store") or str_eq(nm, "atomic_add") or str_eq(nm, "atomic_sub") or str_eq(nm, "atomic_xchg") {
+            if str_eq(nm, "atomic_store") { string_push(sb, "__atomic_store_n((int64_t*)(") }
+            else if str_eq(nm, "atomic_add") { string_push(sb, "__atomic_fetch_add((int64_t*)(") }
+            else if str_eq(nm, "atomic_sub") { string_push(sb, "__atomic_fetch_sub((int64_t*)(") }
+            else { string_push(sb, "__atomic_exchange_n((int64_t*)(") }
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            string_push(sb, "), (int64_t)(")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 1))
+            string_push(sb, "), __ATOMIC_SEQ_CST)")
+            return
+        }
+        if str_eq(nm, "atomic_load") {
+            string_push(sb, "__atomic_load_n((int64_t*)(")
+            emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+            string_push(sb, "), __ATOMIC_SEQ_CST)")
+            return
+        }
         if str_eq(nm, "size_of") {                    // size_of(T) -> sizeof(<cty>)
             string_push(sb, "sizeof(")
             let a0: i32 = list.get(i32, p.ar, e.x as usize)
@@ -2513,7 +2552,7 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // `gfi` holds the collected generic-fn instance records ([fn item, argc, (kind,a,b) targ
 // triples…], variable length — walk with a cursor); `su` is the ACTIVE instance's
 // type-parameter substitution (5-tuples: tparam span + arg triple), read by `emit_su_ty`.
-struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32) }
+struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool }
 
 // The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
 // (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
@@ -3544,6 +3583,11 @@ fn emit_stmt(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         if e.kind == 25 { emit_body(sb, p, src, c, g, e.a, false, depth)  return } // unsafe { … } block
         if e.kind == 23 { emit_body(sb, p, src, c, g, s.a, false, depth)  return } // bare { … } block
         if e.kind == 43 { emit_region(sb, p, src, c, g, s.a, depth)  return }      // region r { … }
+        if e.kind == 38 { emit_concurrent(sb, p, src, c, g, s.a, depth)  return }  // concurrent { … }
+        if e.kind == 39 and g.dspawn {                                             // spawn in a loop:
+            emit_dyn_spawn(sb, p, src, c, g, e.a, depth)                           // dynamic-N push
+            return
+        }
         indent(sb, depth)
         emit_expr(sb, p, src, c, g, s.a)
         string_push(sb, ";\n")
@@ -5380,6 +5424,17 @@ fn emit_enum_defs(mut sb: String, read p: parser.Parser, read src: str, read c: 
 // forward_types'). Generic-STRUCT instances join when comptime-ctor structs are ported.
 fn emit_gen_forward_types(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg) {
     var any: bool = false
+    var sk: usize = 0
+    for sk < list.len(i32, g.gsi) {                   // struct instances first (reference order)
+        let stid: i32 = list.get(i32, g.gsi, sk)
+        string_push(sb, "typedef struct ")
+        emit_ty_c(sb, src, c, stid)
+        string_push(sb, " ")
+        emit_ty_c(sb, src, c, stid)
+        string_push(sb, ";\n")
+        any = true
+        sk = sk + 1
+    }
     var k: usize = 0
     for k < list.len(i32, g.gei) {
         let tid: i32 = list.get(i32, g.gei, k)
@@ -5689,13 +5744,233 @@ fn push_genref_typedef(mut sb: String, mut seen: String, read m: str, read ecty:
 // so every later use is a plain `JestyrFn_<sig> j_x`. A `mut`/`out` param lowers to `T*` (no
 // `restrict` — matching a real Jestyr fn's ABI so a pointer can hold `&some_fn`). Generic
 // placeholders and monomorphized-signature contributions are a later increment.
-fn emit_fn_type_defs(mut sb: String, read p: parser.Parser, read src: str) {
+// ---- generic STRUCTS via comptime type-fns (mirrors `collect_struct_instances`/
+// `gen_struct_defs`/`emit_struct_instance` + the struct-instance pass of `collect_fn_types`).
+// A `fn Box(comptime T: type) -> type { return struct { … } }` ctor monomorphizes per concrete
+// instance the Checker typed (TyData kind 6 whose ctor names such a fn). ----
+
+// The `return struct { … }` StructType expr (kind 36) of a comptime struct ctor, or -1.
+// Mirrors `ctor_struct_body`.
+fn ctor_struct_node(read p: parser.Parser, fit: i32) -> i32 {
+    if fit < 0 { return 0 - 1 }
+    let it: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
+    if it.w < 0 { return 0 - 1 }
+    let blk: parser.ExprData = list.get(parser.ExprData, p.ex, it.w as usize)
+    var i: i32 = 0
+    for i < blk.y {
+        let s: parser.StmtData = list.get(parser.StmtData, p.st, list.get(i32, p.sar, (blk.x + i) as usize) as usize)
+        if s.kind == 1 and s.a >= 0 {
+            let v: parser.ExprData = list.get(parser.ExprData, p.ex, s.a as usize)
+            if v.kind == 36 { return s.a }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// A kind-6 instance whose ctor is a comptime type-fn returning `struct { … }`: the ctor's fn
+// item, or -1. (A generic-ENUM instance is also kind 6 — those resolve via `genum_item_of`,
+// and an enum name is never a fn item, so the two never collide.)
+fn gstruct_ctor_fn(read p: parser.Parser, read src: str, read c: typeck.Checker, tid: i32) -> i32 {
+    if tid < 0 { return 0 - 1 }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+    if d.kind != 6 { return 0 - 1 }
+    let fit: i32 = find_fn_item(p, src, src[d.x as usize .. d.y as usize])
+    if fit < 0 { return 0 - 1 }
+    if ctor_struct_node(p, fit) < 0 { return 0 - 1 }
+    return fit
+}
+
+// The instance type-arg TyId bound to tparam `src[ns..ne]` of ctor fn `fit` under instance
+// `tid`, or -1: the fn's `comptime X: type` params in declaration order zip with the
+// instance's args (mirrors `type_param_names` + the subst map).
+fn gs_tparam_arg(read p: parser.Parser, read src: str, read c: typeck.Checker, fit: i32, tid: i32, ns: usize, ne: usize) -> i32 {
+    let it: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+    var k: i32 = 0
+    var i: i32 = 0
+    for i < it.b {
+        let base: i32 = it.a + i * 7
+        if list.get(i32, p.iar, base as usize) == 1 {
+            let pty: i32 = list.get(i32, p.iar, (base + 5) as usize)
+            if pty >= 0 {
+                let t: parser.TypeData = list.get(parser.TypeData, p.ty, pty as usize)
+                if t.kind == 1 {
+                    let pns: i32 = list.get(i32, p.iar, (base + 2) as usize)
+                    let pne: i32 = list.get(i32, p.iar, (base + 3) as usize)
+                    if str_eq(src[ns .. ne], src[pns as usize .. pne as usize]) {
+                        if k < d.b { return list.get(i32, c.tya, (d.a + k) as usize) }
+                        return 0 - 1
+                    }
+                    k = k + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// The mangle of an AST type under a struct instance's tparam->arg substitution (a substituted
+// Name mangles as its ARG's Checker mangle; everything else mirrors `push_ast_mangle`).
+fn push_gs_mangle(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, tyid: i32, fit: i32, tid: i32) {
+    if tyid < 0 { string_push(sb, "unit")  return }
+    let t: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
+    if t.kind == 0 {
+        let arg: i32 = gs_tparam_arg(p, src, c, fit, tid, t.start, t.end)
+        if arg >= 0 { push_ty_mangle(sb, src, c, arg)  return }
+        string_push(sb, src[t.start .. t.end])
+        return
+    }
+    if t.kind == 2 { string_push(sb, "ptr_")  push_gs_mangle(sb, p, src, c, t.a, fit, tid)  return }
+    if t.kind == 3 { string_push(sb, "slice_")  push_gs_mangle(sb, p, src, c, t.a, fit, tid)  return }
+    if t.kind == 5 { string_push(sb, "ref_")  push_gs_mangle(sb, p, src, c, t.a, fit, tid)  return }
+    if t.kind == 9 {
+        string_push(sb, "fn_")
+        var i: i32 = 0
+        for i < t.a {
+            if i > 0 { string_push(sb, "_") }
+            push_conv_tag(sb, list.get(i32, p.tar, (t.op + i * 2) as usize))
+            push_gs_mangle(sb, p, src, c, list.get(i32, p.tar, (t.op + i * 2 + 1) as usize), fit, tid)
+            i = i + 1
+        }
+        string_push(sb, "_ret_")
+        if t.x >= 0 { push_gs_mangle(sb, p, src, c, t.x, fit, tid) } else { string_push(sb, "unit") }
+        return
+    }
+    push_ast_mangle(sb, p, src, tyid)
+}
+
+// An AST type rendered as C under a struct instance's substitution (a substituted Name
+// renders its ARG's Checker C type; a Fn type names its SUBSTITUTED typedef).
+fn emit_gs_ty(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, tyid: i32, fit: i32, tid: i32) {
+    if tyid < 0 { string_push(sb, "void")  return }
+    let t: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
+    if t.kind == 0 {
+        let arg: i32 = gs_tparam_arg(p, src, c, fit, tid, t.start, t.end)
+        if arg >= 0 { emit_ty_c(sb, src, c, arg)  return }
+        emit_c_ty(sb, p, src, tyid)
+        return
+    }
+    if t.kind == 2 or t.kind == 6 {
+        emit_gs_ty(sb, p, src, c, t.a, fit, tid)
+        string_push(sb, "*")
+        return
+    }
+    if t.kind == 3 {
+        string_push(sb, "JestyrSlice_")
+        push_gs_mangle(sb, p, src, c, t.a, fit, tid)
+        return
+    }
+    if t.kind == 5 {
+        string_push(sb, "JestyrRef_")
+        push_gs_mangle(sb, p, src, c, t.a, fit, tid)
+        return
+    }
+    if t.kind == 9 {
+        string_push(sb, "JestyrFn_")
+        push_gs_mangle(sb, p, src, c, tyid, fit, tid)
+        return
+    }
+    emit_c_ty(sb, p, src, tyid)
+}
+
+// Collect every generic-STRUCT instance the Checker typed: kind-6 per-expr types whose ctor
+// is a comptime struct ctor, expression order, deduped by rendered C name (mirrors
+// `collect_struct_instances`; the reference's fn-signature/annotation pass is deferred, like
+// the enum collection's was).
+fn collect_gstruct_instances(mut g: Cg, read p: parser.Parser, read src: str, read c: typeck.Checker) {
+    var seen: String = string_new()
+    var i: usize = 0
+    for i < list.len(i32, c.et) {
+        let tid: i32 = list.get(i32, c.et, i)
+        if gstruct_ctor_fn(p, src, c, tid) >= 0 {
+            var probe: String = string_new()
+            string_push(probe, "|")
+            emit_ty_c(probe, src, c, tid)
+            string_push(probe, "|")
+            if !contains(string_view(seen), string_view(probe)) {
+                string_push(seen, string_view(probe))
+                list.push(i32, g.gsi, tid)
+            }
+            string_free(probe)
+        }
+        i = i + 1
+    }
+    string_free(seen)
+}
+
+// Generic-struct instance definitions (mirrors `gen_struct_defs`/`emit_struct_instance`):
+// `struct Jestyr_<ctor>__<args> { <substituted field> j_<name>; … };` + trailing blank each.
+// Field members only (tag 0); emitted between the plain enum defs and the gen-enum defs.
+fn emit_gen_struct_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg) {
+    var k: usize = 0
+    for k < list.len(i32, g.gsi) {
+        let tid: i32 = list.get(i32, g.gsi, k)
+        let fit: i32 = gstruct_ctor_fn(p, src, c, tid)
+        let node: i32 = ctor_struct_node(p, fit)
+        let sx: parser.ExprData = list.get(parser.ExprData, p.ex, node as usize)
+        string_push(sb, "struct ")
+        emit_ty_c(sb, src, c, tid)
+        string_push(sb, " {\n")
+        var m: i32 = 0
+        for m < sx.y {
+            let mb: i32 = sx.x + m * 10
+            if list.get(i32, p.mar, mb as usize) == 0 {    // tag 0 = field
+                string_push(sb, "    ")
+                emit_gs_ty(sb, p, src, c, list.get(i32, p.mar, (mb + 4) as usize), fit, tid)
+                string_push(sb, " j_")
+                let ns: i32 = list.get(i32, p.mar, (mb + 2) as usize)
+                let ne: i32 = list.get(i32, p.mar, (mb + 3) as usize)
+                string_push(sb, src[ns as usize .. ne as usize])
+                string_push(sb, ";\n")
+            }
+            m = m + 1
+        }
+        string_push(sb, "};\n\n")
+        k = k + 1
+    }
+}
+
+// Is an AST type fully concrete — every Name a prim or a DECLARED type (a template's bare
+// tparam like the `T` in `fn(T) -> T` is neither)? Only concrete fn types get typedefs from
+// the textual scan; the instances contribute their substituted forms. Mirrors `is_concrete`.
+fn ast_ty_concrete(read p: parser.Parser, read src: str, tyid: i32) -> bool {
+    if tyid < 0 { return true }
+    let t: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
+    if t.kind == 0 {
+        let nm: str = src[t.start .. t.end]
+        if !str_eq(c_prim(nm), "") { return true }
+        return find_named_item(p, src, t.start as i32, t.end as i32) >= 0
+    }
+    if t.kind == 2 or t.kind == 3 or t.kind == 5 or t.kind == 6 { return ast_ty_concrete(p, src, t.a) }
+    if t.kind == 4 { return ast_ty_concrete(p, src, t.a) }
+    if t.kind == 9 {
+        var i: i32 = 0
+        for i < t.a {
+            if !ast_ty_concrete(p, src, list.get(i32, p.tar, (t.op + i * 2 + 1) as usize)) { return false }
+            i = i + 1
+        }
+        return ast_ty_concrete(p, src, t.x)
+    }
+    if t.kind == 7 {
+        var i: i32 = 0
+        for i < t.a {
+            if !ast_ty_concrete(p, src, list.get(i32, p.tar, (t.op + i) as usize)) { return false }
+            i = i + 1
+        }
+        return true
+    }
+    return true
+}
+
+fn emit_fn_type_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg) {
     var any: bool = false
     var seen: String = string_new()
     var ti: usize = 0
     for ti < list.len(parser.TypeData, p.ty) {
         let t: parser.TypeData = list.get(parser.TypeData, p.ty, ti)
-        if t.kind == 9 {
+        if t.kind == 9 and ast_ty_concrete(p, src, ti as i32) {
             var m: String = string_new()
             push_ast_mangle(m, p, src, ti as i32)
             var probe: String = string_new()
@@ -5725,6 +6000,58 @@ fn emit_fn_type_defs(mut sb: String, read p: parser.Parser, read src: str) {
             string_free(probe)
         }
         ti = ti + 1
+    }
+    // A monomorphized generic struct contributes the CONCRETE fn-pointer type of each
+    // fn-pointer field under its substitution (`Box(i32)`'s `op: fn(T) -> T` yields
+    // `fn(i32) -> i32`) — instance order, member order, same dedup. Mirrors the
+    // struct-instance pass of `collect_fn_types`.
+    var gk: usize = 0
+    for gk < list.len(i32, g.gsi) {
+        let tid: i32 = list.get(i32, g.gsi, gk)
+        let fit: i32 = gstruct_ctor_fn(p, src, c, tid)
+        let node: i32 = ctor_struct_node(p, fit)
+        let sx: parser.ExprData = list.get(parser.ExprData, p.ex, node as usize)
+        var mi: i32 = 0
+        for mi < sx.y {
+            let mb: i32 = sx.x + mi * 10
+            if list.get(i32, p.mar, mb as usize) == 0 {
+                let fty: i32 = list.get(i32, p.mar, (mb + 4) as usize)
+                if fty >= 0 {
+                    let ft: parser.TypeData = list.get(parser.TypeData, p.ty, fty as usize)
+                    if ft.kind == 9 {
+                        var m2: String = string_new()
+                        push_gs_mangle(m2, p, src, c, fty, fit, tid)
+                        var probe2: String = string_new()
+                        string_push(probe2, "|")
+                        string_push(probe2, string_view(m2))
+                        string_push(probe2, "|")
+                        if !contains(string_view(seen), string_view(probe2)) {
+                            string_push(seen, string_view(probe2))
+                            string_push(sb, "typedef ")
+                            emit_gs_ty(sb, p, src, c, ft.x, fit, tid)
+                            string_push(sb, " (*JestyrFn_")
+                            string_push(sb, string_view(m2))
+                            string_push(sb, ")(")
+                            if ft.a == 0 { string_push(sb, "void") }
+                            var i2: i32 = 0
+                            for i2 < ft.a {
+                                if i2 > 0 { string_push(sb, ", ") }
+                                let conv2: i32 = list.get(i32, p.tar, (ft.op + i2 * 2) as usize)
+                                emit_gs_ty(sb, p, src, c, list.get(i32, p.tar, (ft.op + i2 * 2 + 1) as usize), fit, tid)
+                                if conv2 == 2 or conv2 == 4 { string_push(sb, "*") }
+                                i2 = i2 + 1
+                            }
+                            string_push(sb, ");\n")
+                            any = true
+                        }
+                        string_free(m2)
+                        string_free(probe2)
+                    }
+                }
+            }
+            mi = mi + 1
+        }
+        gk = gk + 1
     }
     if any { string_push(sb, "\n") }
     string_free(seen)
@@ -6188,9 +6515,11 @@ fn ref_expr_id(read p: parser.Parser, eid: i32) -> i32 {
             if e.x >= 0 and e.x < eid { off = off + 1 }
         } else if e.kind == 25 or e.kind == 38 or e.kind == 43 {   // unsafe / concurrent / region
             if e.a >= 0 and e.a < eid { off = off + 1 }
-        } else if e.kind == 16 or e.kind == 17 {      // struct-lit path / gen-lit ctor: Idents in Rust,
-            if e.a >= 0 and e.a < eid { off = off + 1 }   // Name expr nodes here
-        }
+        } else if e.kind == 16 {                      // struct-lit path: an Ident in Rust, a Name node
+            if e.a >= 0 and e.a < eid { off = off + 1 }   // here. (A GenStructLit's ctor is NOT counted:
+        }                                             // the Rust parser reaches `Name(args){` through the
+                                                      // call-postfix path, so it allocates-and-abandons
+                                                      // the same orphan Name this parser does.)
         j = j + 1
     }
     return eid - off
@@ -6388,6 +6717,347 @@ fn emit_fat_closure_c(mut sb: String, read p: parser.Parser, read src: str, read
     string_free(rets)
 }
 
+// ---- concurrency: spawn/concurrent (mirrors `collect_spawns`/`spawn_runtime`/
+// `emit_concurrent`/`emit_spawn_create`/`emit_dyn_spawn`). A spawn site is the INNER call
+// expr of `spawn f(args)`; its REFERENCE ExprId names the arg-pack struct `_jsp_<id>` and
+// the `void*` trampoline `jestyr_task_<id>`. ----
+
+// Is the spawn's inner expr a direct call of a named fn? (`spawn_site` returns the call.)
+fn spawn_call_of(read p: parser.Parser, inner: i32) -> i32 {
+    if inner < 0 { return 0 - 1 }
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, inner as usize)
+    if e.kind != 10 { return 0 - 1 }
+    let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+    if callee.kind != 2 { return 0 - 1 }
+    return inner
+}
+
+fn sfind_expr(mut sites: List(i32), read p: parser.Parser, eid: i32) {
+    if eid < 0 { return }
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
+    if e.kind == 38 { sfind_block(sites, p, e.a)  return }        // concurrent { … }
+    if e.kind == 23 { sfind_block(sites, p, eid)  return }
+    if e.kind == 25 { sfind_block(sites, p, e.a)  return }
+    if e.kind == 39 {                                             // spawn: record the inner call
+        let call: i32 = spawn_call_of(p, e.a)
+        if call >= 0 { list.push(i32, sites, call) }
+        return
+    }
+    if e.kind == 24 {
+        sfind_expr(sites, p, e.a)
+        sfind_block(sites, p, e.b)
+        if e.op >= 0 { sfind_expr(sites, p, e.op) }
+        return
+    }
+    if e.kind == 28 {
+        sfind_expr(sites, p, e.a)
+        var k: i32 = 0
+        for k < e.y {
+            let ab: i32 = e.x + k * 3
+            let guard: i32 = list.get(i32, p.par, (ab + 1) as usize)
+            if guard >= 0 { sfind_expr(sites, p, guard) }
+            sfind_expr(sites, p, list.get(i32, p.par, (ab + 2) as usize))
+            k = k + 1
+        }
+        return
+    }
+    if e.kind == 31 {                                             // For: body + else only
+        sfind_block(sites, p, e.b)
+        if e.x >= 0 { sfind_block(sites, p, e.x) }
+        return
+    }
+}
+
+fn sfind_block(mut sites: List(i32), read p: parser.Parser, beid: i32) {
+    let blk: parser.ExprData = list.get(parser.ExprData, p.ex, beid as usize)
+    var i: i32 = 0
+    for i < blk.y {
+        let s: parser.StmtData = list.get(parser.StmtData, p.st, list.get(i32, p.sar, (blk.x + i) as usize) as usize)
+        if s.a >= 0 { sfind_expr(sites, p, s.a) }
+        i = i + 1
+    }
+}
+
+// Every spawn site in a non-generic fn body or struct-method body (item order). Mirrors
+// `collect_spawns` (methods are walked WITHOUT a generic filter, like the reference).
+fn collect_spawns(mut g: Cg, read p: parser.Parser, read src: str) {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 3 and !fn_is_gen(p, it) { sfind_block(g.sps, p, it.w) }
+        if it.kind == 4 {
+            var m: i32 = 0
+            for m < it.b {
+                let mb: i32 = it.a + m * 10
+                if list.get(i32, p.mar, mb as usize) == 1 {
+                    let fd: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, p.mar, (mb + 1) as usize) as usize)
+                    sfind_block(g.sps, p, fd.w)
+                }
+                m = m + 1
+            }
+        }
+        r = r + 1
+    }
+}
+
+// The `spawn_runtime` section: per spawn site, the arg-pack struct (runtime params, plus a
+// `ret` field for a result-bearing target) and the `void*` trampoline that unpacks it and
+// calls the target. Trailing blank iff any site exists.
+fn emit_spawn_runtime(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg) {
+    var k: usize = 0
+    for k < list.len(i32, g.sps) {
+        let call: i32 = list.get(i32, g.sps, k)
+        let e: parser.ExprData = list.get(parser.ExprData, p.ex, call as usize)
+        let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+        let fit: i32 = find_fn_item(p, src, src[callee.start .. callee.end])
+        if fit >= 0 {
+            let fd: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
+            let rid: i32 = ref_expr_id(p, call)
+            // `ret` field only for a non-void target (rendered C type != void)
+            var rets: String = string_new()
+            if fd.z >= 0 { emit_c_ty(rets, p, src, fd.z) }
+            else { string_push(rets, "void") }
+            let has_ret: bool = !str_eq(string_view(rets), "void")
+            string_push(sb, "struct _jsp_")
+            push_uint(sb, rid as i64)
+            string_push(sb, " { ")
+            var np: i32 = 0                            // runtime (non-comptime, non-self) params
+            var i: i32 = 0
+            for i < fd.b {
+                let base: i32 = fd.a + i * 7
+                if list.get(i32, p.iar, base as usize) == 0 and list.get(i32, p.iar, (base + 4) as usize) == 0 {
+                    let pty: i32 = list.get(i32, p.iar, (base + 5) as usize)
+                    if pty >= 0 { emit_c_ty(sb, p, src, pty) } else { string_push(sb, "int") }
+                    string_push(sb, " a")
+                    push_uint(sb, np as i64)
+                    string_push(sb, "; ")
+                    np = np + 1
+                }
+                i = i + 1
+            }
+            if np == 0 and !has_ret { string_push(sb, "char _unused; ") }
+            if has_ret {
+                string_push(sb, string_view(rets))
+                string_push(sb, " ret; ")
+            }
+            string_push(sb, "};\n")
+            string_push(sb, "static void* jestyr_task_")
+            push_uint(sb, rid as i64)
+            string_push(sb, "(void* _vp) { struct _jsp_")
+            push_uint(sb, rid as i64)
+            string_push(sb, "* _a = (struct _jsp_")
+            push_uint(sb, rid as i64)
+            string_push(sb, "*)_vp; ")
+            if has_ret { string_push(sb, "_a->ret = ") }
+            string_push(sb, "jestyr_")
+            string_push(sb, src[callee.start .. callee.end])
+            string_push(sb, "(")
+            var ai: i32 = 0
+            for ai < np {
+                if ai > 0 { string_push(sb, ", ") }
+                string_push(sb, "_a->a")
+                push_uint(sb, ai as i64)
+                ai = ai + 1
+            }
+            string_push(sb, "); return NULL; }\n")
+            string_free(rets)
+        }
+        k = k + 1
+    }
+    if list.len(i32, g.sps) > 0 { string_push(sb, "\n") }
+}
+
+// Does this subtree contain a spawn anywhere (used for the dynamic-N test)?
+fn expr_has_spawn(read p: parser.Parser, eid: i32) -> bool {
+    if eid < 0 { return false }
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
+    if e.kind == 39 { return true }
+    if e.kind == 38 or e.kind == 25 { return block_has_spawn(p, e.a) }
+    if e.kind == 23 { return block_has_spawn(p, eid) }
+    if e.kind == 24 {
+        if expr_has_spawn(p, e.a) { return true }
+        if block_has_spawn(p, e.b) { return true }
+        if e.op >= 0 { return expr_has_spawn(p, e.op) }
+        return false
+    }
+    if e.kind == 28 {
+        if expr_has_spawn(p, e.a) { return true }
+        var k: i32 = 0
+        for k < e.y {
+            let ab: i32 = e.x + k * 3
+            let guard: i32 = list.get(i32, p.par, (ab + 1) as usize)
+            if guard >= 0 { if expr_has_spawn(p, guard) { return true } }
+            if expr_has_spawn(p, list.get(i32, p.par, (ab + 2) as usize)) { return true }
+            k = k + 1
+        }
+        return false
+    }
+    if e.kind == 31 {
+        if block_has_spawn(p, e.b) { return true }
+        if e.x >= 0 { return block_has_spawn(p, e.x) }
+        return false
+    }
+    return false
+}
+
+fn block_has_spawn(read p: parser.Parser, beid: i32) -> bool {
+    let blk: parser.ExprData = list.get(parser.ExprData, p.ex, beid as usize)
+    var i: i32 = 0
+    for i < blk.y {
+        let s: parser.StmtData = list.get(parser.StmtData, p.st, list.get(i32, p.sar, (blk.x + i) as usize) as usize)
+        if s.a >= 0 { if expr_has_spawn(p, s.a) { return true } }
+        i = i + 1
+    }
+    return false
+}
+
+// A spawn NOT at the concurrent block's top level (nested in a loop/if) — the dynamic-N
+// test. A top-level bare/let spawn is a fixed numbered handle. Mirrors `stmt_has_nested_spawn`.
+fn stmt_has_nested_spawn(read p: parser.Parser, sid: i32) -> bool {
+    let s: parser.StmtData = list.get(parser.StmtData, p.st, sid as usize)
+    if s.kind != 0 and s.kind != 2 { return false }
+    if s.a < 0 { return false }
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, s.a as usize)
+    if e.kind == 39 { return false }
+    return expr_has_spawn(p, s.a)
+}
+
+// The fixed-handle thread-creation triple for one top-level spawn (handle index `h`):
+// `pthread_t _jt<h>;` + the arg box + `pthread_create`. Args buffer FIRST (temp order).
+fn emit_spawn_create(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, call: i32, h: i32, depth: i32) {
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, call as usize)
+    let rid: i32 = ref_expr_id(p, call)
+    var vals: String = string_new()
+    var ai: i32 = 0
+    for ai < e.y {
+        if ai > 0 { string_push(vals, ", ") }
+        emit_expr(vals, p, src, c, g, arg_at(p, e, ai))
+        ai = ai + 1
+    }
+    indent(sb, depth)
+    string_push(sb, "pthread_t _jt")
+    push_uint(sb, h as i64)
+    string_push(sb, ";\n")
+    indent(sb, depth)
+    string_push(sb, "struct _jsp_")
+    push_uint(sb, rid as i64)
+    string_push(sb, " _ja")
+    push_uint(sb, h as i64)
+    string_push(sb, " = ")
+    if e.y == 0 { string_push(sb, "{0}") }
+    else {
+        string_push(sb, "{ ")
+        string_push(sb, string_view(vals))
+        string_push(sb, " }")
+    }
+    string_push(sb, ";\n")
+    indent(sb, depth)
+    string_push(sb, "pthread_create(&_jt")
+    push_uint(sb, h as i64)
+    string_push(sb, ", NULL, jestyr_task_")
+    push_uint(sb, rid as i64)
+    string_push(sb, ", &_ja")
+    push_uint(sb, h as i64)
+    string_push(sb, ");\n")
+    string_free(vals)
+}
+
+// One dynamic-N spawn pushed onto the growable handle array `_dt`/`_da` (declared by
+// `emit_concurrent`): grow-on-full, a heap arg box (stable address — the arrays may
+// realloc-move, the boxes don't), create, count. Mirrors `emit_dyn_spawn`.
+fn emit_dyn_spawn(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, inner: i32, depth: i32) {
+    let call: i32 = spawn_call_of(p, inner)
+    if call < 0 { return }
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, call as usize)
+    let rid: i32 = ref_expr_id(p, call)
+    var vals: String = string_new()
+    var ai: i32 = 0
+    for ai < e.y {
+        if ai > 0 { string_push(vals, ", ") }
+        emit_expr(vals, p, src, c, g, arg_at(p, e, ai))
+        ai = ai + 1
+    }
+    line_at(sb, depth, "if (_dn == _dc) { _dc = _dc ? _dc * 2 : 8; _dt = (pthread_t*)realloc(_dt, _dc * sizeof(pthread_t)); _da = (void**)realloc(_da, _dc * sizeof(void*)); }")
+    indent(sb, depth)
+    string_push(sb, "struct _jsp_")
+    push_uint(sb, rid as i64)
+    string_push(sb, "* _dap = (struct _jsp_")
+    push_uint(sb, rid as i64)
+    string_push(sb, "*)malloc(sizeof(struct _jsp_")
+    push_uint(sb, rid as i64)
+    string_push(sb, ")); *_dap = (struct _jsp_")
+    push_uint(sb, rid as i64)
+    string_push(sb, ")")
+    if e.y == 0 { string_push(sb, "{0}") }
+    else {
+        string_push(sb, "{ ")
+        string_push(sb, string_view(vals))
+        string_push(sb, " }")
+    }
+    string_push(sb, ";\n")
+    indent(sb, depth)
+    string_push(sb, "_da[_dn] = _dap; pthread_create(&_dt[_dn], NULL, jestyr_task_")
+    push_uint(sb, rid as i64)
+    string_push(sb, ", _dap); _dn++;\n")
+    string_free(vals)
+}
+
+// A `concurrent { … }` nursery: fixed top-level spawns get numbered handles joined at the
+// brace; a spawn nested in a loop/if is dynamic-N via the growable array. Let-bound task
+// handles (`let h = spawn …` + `await`) are a later increment. No drop scope — mirrors
+// `emit_concurrent`'s plain braces.
+fn emit_concurrent(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, eid: i32, depth: i32) {
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
+    let blk: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+    let saved_dyn: bool = g.dspawn
+    line_at(sb, depth, "{")
+    var needs_dyn: bool = false
+    var si: i32 = 0
+    for si < blk.y {
+        if stmt_has_nested_spawn(p, list.get(i32, p.sar, (blk.x + si) as usize)) { needs_dyn = true }
+        si = si + 1
+    }
+    if needs_dyn {
+        line_at(sb, depth + 1, "pthread_t* _dt = NULL; void** _da = NULL; size_t _dn = 0, _dc = 0;")
+    }
+    g.dspawn = needs_dyn
+    var handles: i32 = 0                              // fixed handle indices, bare joins only so far
+    var i: i32 = 0
+    for i < blk.y {
+        let sid: i32 = list.get(i32, p.sar, (blk.x + i) as usize)
+        let s: parser.StmtData = list.get(parser.StmtData, p.st, sid as usize)
+        var handled: bool = false
+        if s.kind == 2 and s.a >= 0 {                 // bare `spawn f(args)` at top level
+            let se: parser.ExprData = list.get(parser.ExprData, p.ex, s.a as usize)
+            if se.kind == 39 {
+                let call: i32 = spawn_call_of(p, se.a)
+                if call >= 0 {
+                    emit_spawn_create(sb, p, src, c, g, call, handles, depth + 1)
+                    handles = handles + 1
+                    handled = true
+                }
+            }
+        }
+        if !handled { emit_stmt(sb, p, src, c, g, sid, depth + 1) }
+        i = i + 1
+    }
+    var h: i32 = 0
+    for h < handles {                                 // structured join at the brace
+        indent(sb, depth + 1)
+        string_push(sb, "pthread_join(_jt")
+        push_uint(sb, h as i64)
+        string_push(sb, ", NULL);\n")
+        h = h + 1
+    }
+    if needs_dyn {
+        line_at(sb, depth + 1, "for (size_t _dk = 0; _dk < _dn; _dk++) { pthread_join(_dt[_dk], NULL); free(_da[_dk]); }")
+        line_at(sb, depth + 1, "free(_dt); free(_da);")
+    }
+    line_at(sb, depth, "}")
+    g.dspawn = saved_dyn
+}
+
 // The `closure_fns` section: one top-level `static` function per collected closure (a thin
 // coerced closure only when capture-free — a capturing one is the reference's diag case and
 // emits nothing).
@@ -6582,23 +7252,25 @@ fn emit_main_wrapper(mut sb: String, read p: parser.Parser, read src: str) {
 // `"\n"` pushes stand in for the reference's unconditionally-blank sections that are empty for a
 // program with no aggregates (closure_types, method_protos, consts) plus the guarded no-ops.
 fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator) {
-    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: list.make(i32, a), vtf: 0, gfi: list.make(i32, a), su: list.make(i32, a), cls: list.make(i32, a), ccx: list.make(i32, a), cca: list.make(i32, a), caps: list.make(i32, a) }
+    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: list.make(i32, a), vtf: 0, gfi: list.make(i32, a), su: list.make(i32, a), cls: list.make(i32, a), ccx: list.make(i32, a), cca: list.make(i32, a), caps: list.make(i32, a), gsi: list.make(i32, a), sps: list.make(i32, a), dspawn: false }
+    collect_spawns(g, p, src)                        // spawn sites (gates the pthread prelude)
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     collect_method_instances(g, p, src, c)           // (struct item, method fn item) pairs, first-seen
+    collect_gstruct_instances(g, p, src, c)          // generic-STRUCT instance TyIds, expr order
     collect_genum_instances(g, p, src, c)            // generic-enum instance TyIds, expr order
     collect_gfn_instances(g, p, src, c, a)           // generic-fn instances, LIFO worklist order
     collect_closures(g, p, src, a)                   // closures + captures, discovery order (LAST, like the reference)
-    emit_prelude(sb, p, src)
+    emit_prelude(sb, p, src, g)
     emit_forward_types(sb, p, src)
     emit_gen_forward_types(sb, p, src, c, g)         // monomorphized generic-enum instance fwd typedefs
-    emit_fn_type_defs(sb, p, src)                    // fn-pointer typedefs (before aggregate defs)
+    emit_fn_type_defs(sb, p, src, c, g)              // fn-pointer typedefs (before aggregate defs)
     emit_struct_defs(sb, p, src)                     // captured-region aggregate defs (struct first)
     emit_enum_defs(sb, p, src, c, g)                 // enum tag+struct defs (after structs)
+    emit_gen_struct_defs(sb, p, src, c, g)           // generic-STRUCT instance defs (before gen enums)
     emit_gen_enum_defs(sb, p, src, c, g)             // generic-enum instance defs (after plain enums)
     emit_slice_defs(sb, p, src, c)                   // slice typedefs (after aggregates)
     emit_array_defs(sb, p, src, c)                   // array typedefs (after slices)
     emit_genref_defs(sb, p, src, c)                  // genref typedefs (after arrays)
-    // gen-struct defs: empty until comptime-ctor structs are ported.
     emit_result_defs(sb, p, src)
     // flush_def_capture / dyn_typedefs: no-ops here (no by-value dep reorder needed).
     emit_extern_protos(sb, p, src)                   // `extern "c"` prototypes (bare names)
@@ -6606,7 +7278,8 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
     emit_fn_protos(sb, p, src, c, g)
     emit_method_protos(sb, p, src, c, g)             // method protos + unconditional trailing blank
     emit_impl_protos(sb, p, src)                     // trait-impl protos + CONDITIONAL trailing blank
-    // dyn_vtables / spawn_runtime: empty until dyn/concurrency land.
+    // dyn_vtables: empty until dyn lands.
+    emit_spawn_runtime(sb, p, src, c, g)             // spawn arg-pack structs + trampolines
     emit_consts(sb, p, src, c, g)                    // consts + its unconditional trailing blank
     emit_closure_fns(sb, p, src, c, g)               // lifted `jestyr_lam_<id>` fns before the free fns
     emit_fn_defs(sb, p, src, c, g)
