@@ -207,6 +207,12 @@ fn emit_c_ty(mut sb: String, read p: parser.Parser, read src: str, tyid: i32) {
         let nm: str = src[t.start .. t.end]
         let pc: str = c_prim(nm)
         if !str_eq(pc, "") { string_push(sb, pc)  return }
+        // a niche-optimized enum lowers to its bare pointer payload
+        let nvb: i32 = niche_named_some(p, find_enum_item(p, src, t.start, t.end))
+        if nvb >= 0 {
+            emit_c_ty(sb, p, src, list.get(i32, p.ear, (list.get(i32, p.ear, (nvb + 2) as usize) + 2) as usize))
+            return
+        }
         string_push(sb, "Jestyr_")                     // a user type: its Jestyr_<name> C symbol
         string_push(sb, nm)
         return
@@ -249,6 +255,11 @@ fn emit_c_ty(mut sb: String, read p: parser.Parser, read src: str, tyid: i32) {
         return
     }
     if t.kind == 7 {                                   // App `Ctor(args)`: `Jestyr_<ctor>__<args>`
+        let apay: i32 = niche_app_pay(p, src, t)       // `Option(*T)` written as an annotation
+        if apay >= 0 {
+            emit_c_ty(sb, p, src, apay)
+            return
+        }
         string_push(sb, "Jestyr_")
         string_push(sb, src[t.x as usize .. t.y as usize])
         string_push(sb, "__")
@@ -339,7 +350,7 @@ fn prim_code_c(mut sb: String, code: i32) {
 // Used for inferred-`let` locals (`let x = …` with no annotation). Covers Unit, primitives, and
 // Named aggregates (`Jestyr_<name>`, name span in the `tdecl` row `d.x`: cols 0/1). Other TyData
 // kinds (Ptr/Slice/GenStruct/Fn/…) are added when a corpus file's inference needs them.
-fn emit_ty_c(mut sb: String, read src: str, read c: typeck.Checker, tyid: i32) {
+fn emit_ty_c(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, tyid: i32) {
     if tyid < 0 { string_push(sb, "void")  return }
     let d: typeck.TyData = list.get(typeck.TyData, c.tys, tyid as usize)
     if d.kind == 1 { string_push(sb, "void")  return }         // Unit
@@ -347,12 +358,18 @@ fn emit_ty_c(mut sb: String, read src: str, read c: typeck.Checker, tyid: i32) {
     if d.kind == 15 {                                          // Named: Jestyr_<name>
         let ns: i32 = list.get(i32, c.tdecl, (d.x * 10 + 0) as usize)
         let ne: i32 = list.get(i32, c.tdecl, (d.x * 10 + 1) as usize)
+        // a niche-optimized enum IS its bare pointer payload
+        let nvb: i32 = niche_named_some(p, find_enum_item(p, src, ns as usize, ne as usize))
+        if nvb >= 0 {
+            emit_c_ty(sb, p, src, list.get(i32, p.ear, (list.get(i32, p.ear, (nvb + 2) as usize) + 2) as usize))
+            return
+        }
         string_push(sb, "Jestyr_")
         string_push(sb, src[ns as usize .. ne as usize])
         return
     }
     if d.kind == 3 {                                           // Ptr: `<inner>*`
-        emit_ty_c(sb, src, c, d.a)
+        emit_ty_c(sb, p, src, c, d.a)
         string_push(sb, "*")
         return
     }
@@ -379,7 +396,7 @@ fn emit_ty_c(mut sb: String, read src: str, read c: typeck.Checker, tyid: i32) {
         return
     }
     if d.kind == 11 {                                          // RegionRef `&[r]T`: plain pointer
-        emit_ty_c(sb, src, c, d.a)
+        emit_ty_c(sb, p, src, c, d.a)
         string_push(sb, "*")
         return
     }
@@ -394,6 +411,11 @@ fn emit_ty_c(mut sb: String, read src: str, read c: typeck.Checker, tyid: i32) {
         return
     }
     if d.kind == 6 {                                           // GenStruct/GenEnum instance: `Jestyr_<ctor>__<args>`
+        let nvb6: i32 = niche_inst_some(p, src, c, tyid)       // a niche instance IS its pointer
+        if nvb6 >= 0 {
+            emit_ty_c(sb, p, src, c, niche_inst_pay(p, src, c, tyid, nvb6))
+            return
+        }
         string_push(sb, "Jestyr_")
         string_push(sb, src[d.x as usize .. d.y as usize])
         string_push(sb, "__")
@@ -632,6 +654,34 @@ fn collect_method_instances(mut g: Cg, read p: parser.Parser, read src: str, rea
 // Is Checker type `tid` a generic-ENUM instance (TyData kind 6 whose ctor names an enum item)
 // with all-concrete args? Returns the enum ITEM id, or -1. (Kind 6 also covers comptime-fn
 // generic-struct ctors, which don't name an enum item — excluded here.)
+// Is Checker type `tid` fully concrete (no Unknown/Opaque/Error anywhere)? Mirrors
+// `is_concrete`: structural forms recurse; only an unresolved leaf disqualifies.
+fn tyid_concrete(read c: typeck.Checker, tid: i32) -> bool {
+    if tid < 0 { return true }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+    if d.kind == 0 or d.kind == 4 or d.kind == 16 or d.kind == 18 { return false }   // Unknown/Opaque/Error/OpaqueLit
+    if d.kind == 3 or d.kind == 5 or d.kind == 8 or d.kind == 10 or d.kind == 11 or d.kind == 9 {
+        return tyid_concrete(c, d.a)                  // Ptr/Result/Slice/GenRef/RegionRef/Array -> inner
+    }
+    if d.kind == 6 {                                  // GenStruct/GenEnum -> all args
+        var i: i32 = 0
+        for i < d.b {
+            if !tyid_concrete(c, list.get(i32, c.tya, (d.a + i) as usize)) { return false }
+            i = i + 1
+        }
+        return true
+    }
+    if d.kind == 12 {                                 // Fn -> params + ret
+        var i: i32 = 0
+        for i < d.b {
+            if !tyid_concrete(c, list.get(i32, c.tya, (d.a + i * 2 + 1) as usize)) { return false }
+            i = i + 1
+        }
+        return tyid_concrete(c, d.x)
+    }
+    return true
+}
+
 fn genum_item_of(read p: parser.Parser, read src: str, read c: typeck.Checker, tid: i32) -> i32 {
     if tid < 0 { return 0 - 1 }
     let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
@@ -639,9 +689,8 @@ fn genum_item_of(read p: parser.Parser, read src: str, read c: typeck.Checker, t
     let eit: i32 = find_enum_item(p, src, d.x as usize, d.y as usize)
     if eit < 0 { return 0 - 1 }
     var i: i32 = 0
-    for i < d.b {                                     // every arg must be concrete (prim or Named)
-        let ad: typeck.TyData = list.get(typeck.TyData, c.tys, list.get(i32, c.tya, (d.a + i) as usize) as usize)
-        if ad.kind != 2 and ad.kind != 15 { return 0 - 1 }
+    for i < d.b {                                     // every arg must be CONCRETE (a pointer is!)
+        if !tyid_concrete(c, list.get(i32, c.tya, (d.a + i) as usize)) { return 0 - 1 }
         i = i + 1
     }
     return eit
@@ -658,7 +707,7 @@ fn collect_genum_instances(mut g: Cg, read p: parser.Parser, read src: str, read
         let tid: i32 = list.get(i32, c.et, i)
         if genum_item_of(p, src, c, tid) >= 0 {
             var nm: String = string_new()
-            emit_ty_c(nm, src, c, tid)
+            emit_ty_c(nm, p, src, c, tid)
             var probe: String = string_new()
             string_push(probe, "|")  string_push(probe, string_view(nm))  string_push(probe, "|")
             if !contains(string_view(seen), string_view(probe)) {
@@ -686,7 +735,7 @@ fn emit_field_ty_subst(mut sb: String, read p: parser.Parser, read src: str, rea
                 let tpe: i32 = list.get(i32, p.ear, (it.op + k * 2 + 1) as usize)
                 if str_eq(src[t.start .. t.end], src[tps as usize .. tpe as usize]) {
                     let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
-                    emit_ty_c(sb, src, c, list.get(i32, c.tya, (d.a + k) as usize))
+                    emit_ty_c(sb, p, src, c, list.get(i32, c.tya, (d.a + k) as usize))
                     return
                 }
                 k = k + 1
@@ -813,8 +862,15 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             let vb: i32 = variant_tuple(p, src, venum, e.start, e.end)
             if list.get(i32, p.ear, (vb + 3) as usize) == 0 {   // field_count == 0: nullary
                 let own: i32 = list.get(i32, c.et, eid as usize)
+                let nvb: i32 = niche_of_tyid(p, src, c, own)     // niche: `none` IS the null pointer
+                if nvb >= 0 {
+                    string_push(sb, "((")
+                    emit_niche_pay_c(sb, p, src, c, own, nvb)
+                    string_push(sb, ")0)")
+                    return
+                }
                 if genum_item_of(p, src, c, own) >= 0 {          // a generic-enum instance value
-                    emit_gvariant_head(sb, src, c, own, src[e.start .. e.end])
+                    emit_gvariant_head(sb, p, src, c, own, src[e.start .. e.end])
                 } else {
                     emit_variant_head(sb, p, src, venum, src[e.start .. e.end])
                 }
@@ -934,7 +990,7 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             let n: i32 = g.tmp
             g.tmp = g.tmp + 1
             string_push(sb, "({ ")
-            emit_ty_c(sb, src, c, list.get(i32, c.et, e.a as usize))
+            emit_ty_c(sb, p, src, c, list.get(i32, c.et, e.a as usize))
             string_push(sb, " _s")
             push_uint(sb, n as i64)
             string_push(sb, " = (")
@@ -961,7 +1017,7 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
                 let n: i32 = g.tmp
                 g.tmp = g.tmp + 1
                 string_push(sb, "({ const ")
-                emit_ty_c(sb, src, c, bt)
+                emit_ty_c(sb, p, src, c, bt)
                 string_push(sb, "* _a")
                 push_uint(sb, n as i64)
                 string_push(sb, " = &(")
@@ -994,7 +1050,7 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         let n: i32 = g.tmp
         g.tmp = g.tmp + 1
         string_push(sb, "({ ")
-        emit_ty_c(sb, src, c, list.get(i32, c.et, eid as usize))
+        emit_ty_c(sb, p, src, c, list.get(i32, c.et, eid as usize))
         string_push(sb, " _al")
         push_uint(sb, n as i64)
         string_push(sb, ";")
@@ -1016,7 +1072,7 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
     }
     if e.kind == 17 {                                 // GenStructLit: (Jestyr_<ctor>__<args>){ .j_f = v, … }
         string_push(sb, "(")
-        emit_ty_c(sb, src, c, list.get(i32, c.et, eid as usize))   // the instance's own type
+        emit_ty_c(sb, p, src, c, list.get(i32, c.et, eid as usize))   // the instance's own type
         string_push(sb, "){ ")
         var gi: i32 = 0
         for gi < e.y {
@@ -1134,7 +1190,7 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
                     let n: i32 = g.tmp                // (non-const pointer; ONE temp)
                     g.tmp = g.tmp + 1
                     string_push(sb, "({ ")
-                    emit_ty_c(sb, src, c, btid)
+                    emit_ty_c(sb, p, src, c, btid)
                     string_push(sb, "* _a")
                     push_uint(sb, n as i64)
                     string_push(sb, " = &(")
@@ -1178,11 +1234,11 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         let n: i32 = g.tmp
         g.tmp = g.tmp + 1
         string_push(sb, "({ ")
-        emit_ty_c(sb, src, c, atid)
+        emit_ty_c(sb, p, src, c, atid)
         string_push(sb, " _ar")
         push_uint(sb, n as i64)
         string_push(sb, "; ")
-        emit_ty_c(sb, src, c, ad.a)
+        emit_ty_c(sb, p, src, c, ad.a)
         string_push(sb, " _v")
         push_uint(sb, n as i64)
         string_push(sb, " = (")
@@ -1293,7 +1349,7 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
                 let n: i32 = g.tmp
                 g.tmp = g.tmp + 1
                 string_push(sb, "({ ")
-                emit_ty_c(sb, src, c, btid)
+                emit_ty_c(sb, p, src, c, btid)
                 string_push(sb, " _r")
                 push_uint(sb, n as i64)
                 string_push(sb, " = (")
@@ -1317,7 +1373,7 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         let n: i32 = g.tmp
         g.tmp = g.tmp + 1
         string_push(sb, "({ ")
-        emit_ty_c(sb, src, c, list.get(i32, c.et, e.a as usize))   // the base's own Result type
+        emit_ty_c(sb, p, src, c, list.get(i32, c.et, e.a as usize))   // the base's own Result type
         string_push(sb, " _q")
         push_uint(sb, n as i64)
         string_push(sb, " = ")
@@ -2004,8 +2060,13 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         let venum: i32 = find_variant_enum(p, src, callee.start, callee.end)
         if venum >= 0 {
             let own: i32 = list.get(i32, c.et, eid as usize)
+            // niche: `some(p)` IS the pointer — the value emits bare
+            if niche_of_tyid(p, src, c, own) >= 0 {
+                emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
+                return
+            }
             if genum_item_of(p, src, c, own) >= 0 {   // a generic-enum instance value
-                emit_gvariant_head(sb, src, c, own, nm)
+                emit_gvariant_head(sb, p, src, c, own, nm)
             } else {
                 emit_variant_head(sb, p, src, venum, nm)
             }
@@ -2048,7 +2109,16 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
                 let tn: str = src[arg.start .. arg.end]
                 let pc: str = c_prim(tn)
                 if !str_eq(pc, "") { string_push(sb, pc) }
-                else { string_push(sb, "Jestyr_")  string_push(sb, tn) }
+                else {
+                    // a niche enum's size IS its pointer payload's
+                    let nvb: i32 = niche_named_some(p, find_enum_item(p, src, arg.start, arg.end))
+                    if nvb >= 0 {
+                        emit_c_ty(sb, p, src, list.get(i32, p.ear, (list.get(i32, p.ear, (nvb + 2) as usize) + 2) as usize))
+                    } else {
+                        string_push(sb, "Jestyr_")
+                        string_push(sb, tn)
+                    }
+                }
             }
             string_push(sb, ")")
             return
@@ -2094,7 +2164,7 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         // the byte slice into `_u` (a FIXED name — neither consumes the temp counter).
         if str_eq(nm, "is_utf8") or str_eq(nm, "from_utf8") {
             string_push(sb, "({ ")
-            emit_ty_c(sb, src, c, list.get(i32, c.et, arg_at(p, e, 0) as usize))
+            emit_ty_c(sb, p, src, c, list.get(i32, c.et, arg_at(p, e, 0) as usize))
             string_push(sb, " _u = ")
             emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
             if str_eq(nm, "is_utf8") {
@@ -2185,7 +2255,7 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         if str_eq(nm, "try_from_utf8") {              // validate-at-boundary: []u8 -> str !Utf8Error
             let a0: i32 = arg_at(p, e, 0)
             string_push(sb, "({ ")
-            emit_ty_c(sb, src, c, list.get(i32, c.et, a0 as usize))
+            emit_ty_c(sb, p, src, c, list.get(i32, c.et, a0 as usize))
             string_push(sb, " _u = ")
             emit_expr(sb, p, src, c, g, a0)
             string_push(sb, "; jestyr_rt_valid_utf8((const char*)_u.ptr, _u.len) ? (JestyrResult_str){ .is_err = false, .ok = (JestyrStr){ (const char*)_u.ptr, _u.len } } : (JestyrResult_str){ .is_err = true, .err = 1 }; })")
@@ -2375,7 +2445,7 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             let n: i32 = g.tmp
             g.tmp = g.tmp + 1
             string_push(sb, "({ ")
-            emit_ty_c(sb, src, c, list.get(i32, c.et, arg_at(p, e, 0) as usize))
+            emit_ty_c(sb, p, src, c, list.get(i32, c.et, arg_at(p, e, 0) as usize))
             string_push(sb, " _r")
             push_uint(sb, n as i64)
             string_push(sb, " = (")
@@ -2444,14 +2514,16 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         // A call to a generic template monomorphizes: `jestyr_<name>__<mangles>` with the
         // comptime type args erased (mirrors `emit_generic_call`).
         let ufit: i32 = find_fn_item(p, src, nm)
+        var bare: bool = false
         if ufit >= 0 {
             let uf: parser.ItemData = list.get(parser.ItemData, p.it, ufit as usize)
             if fn_is_gen(p, uf) {
                 emit_generic_call(sb, p, src, c, g, e, ufit)
                 return
             }
+            if item_has_attr(p, src, uf, "no_mangle") { bare = true }   // `@no_mangle` target
         }
-        string_push(sb, "jestyr_")
+        if !bare { string_push(sb, "jestyr_") }
         string_push(sb, nm)
         emit_user_args(sb, p, src, c, g, e, nm)
         return
@@ -2770,7 +2842,7 @@ fn emit_targ_cty(mut sb: String, read p: parser.Parser, read src: str, read c: t
         if !str_eq(pc, "") { string_push(sb, pc) } else { string_push(sb, "Jestyr_")  string_push(sb, tn) }
         return
     }
-    if kind == 1 { emit_ty_c(sb, src, c, a)  return }
+    if kind == 1 { emit_ty_c(sb, p, src, c, a)  return }
     string_push(sb, "int")
 }
 
@@ -3701,7 +3773,7 @@ fn emit_stmt(mut sb: String, read p: parser.Parser, read src: str, read c: typec
                 string_push(sb, "JestyrClosure_")
                 push_uint(sb, ref_expr_id(p, s.a) as i64)
             } else {
-                emit_ty_c(sb, src, c, list.get(i32, c.et, s.a as usize))
+                emit_ty_c(sb, p, src, c, list.get(i32, c.et, s.a as usize))
             }
         } else {
             string_push(sb, "int")                    // no annotation, no init (mirrors the reference)
@@ -3810,6 +3882,277 @@ fn emit_arm_body(mut sb: String, read p: parser.Parser, read src: str, read c: t
 // return arm ends with `break;`. An exhaustive return-position match closes with
 // `__builtin_unreachable();`. Mirrors `emit_match` (flat, unguarded path). Guards/nesting/niche and
 // scalar (int/char/bool) scrutinees are deferred (added when a corpus file needs them).
+// ---- the niche optimization (mirrors `NicheInfo`/`niche_enum_at`/`niche_enum_instance`/
+// `emit_niche_match`): an enum with exactly one nullary variant and one single THIN-pointer
+// variant (`*T` / `&[r]T` — a fat `&T` or slice does NOT qualify) is represented as JUST that
+// pointer; the nullary variant is NULL. Zero tag, zero padding. ----
+
+// The some-variant 5-tuple base of NON-generic enum item `eit` iff niche-shaped (its payload
+// field written as a plain pointer type in the AST), else -1. Mirrors `niche_enum_at`.
+fn niche_named_some(read p: parser.Parser, eit: i32) -> i32 {
+    if eit < 0 { return 0 - 1 }
+    let it: parser.ItemData = list.get(parser.ItemData, p.it, eit as usize)
+    if it.kind != 5 { return 0 - 1 }
+    if it.a != 0 { return 0 - 1 }
+    if it.z != 2 { return 0 - 1 }
+    var none_seen: bool = false
+    var some_vb: i32 = 0 - 1
+    var k: i32 = 0
+    for k < 2 {
+        let vb: i32 = it.b + k * 5
+        let fc: i32 = list.get(i32, p.ear, (vb + 3) as usize)
+        if fc == 0 { none_seen = true }
+        else if fc == 1 {
+            let fty: i32 = list.get(i32, p.ear, (list.get(i32, p.ear, (vb + 2) as usize) + 2) as usize)
+            if fty >= 0 {
+                let t: parser.TypeData = list.get(parser.TypeData, p.ty, fty as usize)
+                if t.kind == 2 or t.kind == 6 { some_vb = vb }
+            }
+        }
+        k = k + 1
+    }
+    if !none_seen { return 0 - 1 }
+    return some_vb
+}
+
+// The SUBSTITUTED payload TyId of instance `tid`'s 1-field variant at `vb` iff a plain
+// pointer (Checker kind 3 Ptr / 11 RegionRef), else -1. (Corpus shape: the field is a bare
+// tparam Name — `some(v: T)` with `T = *i32`; a structural `*T` field is a later increment.)
+fn niche_inst_pay(read p: parser.Parser, read src: str, read c: typeck.Checker, tid: i32, vb: i32) -> i32 {
+    let eit: i32 = genum_item_of(p, src, c, tid)
+    if eit < 0 { return 0 - 1 }
+    let it: parser.ItemData = list.get(parser.ItemData, p.it, eit as usize)
+    let fty: i32 = list.get(i32, p.ear, (list.get(i32, p.ear, (vb + 2) as usize) + 2) as usize)
+    if fty < 0 { return 0 - 1 }
+    let t: parser.TypeData = list.get(parser.TypeData, p.ty, fty as usize)
+    if t.kind != 0 { return 0 - 1 }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+    var k: i32 = 0
+    for k < it.a {                                    // tparam name-span pairs in ear at it.op
+        let tps: i32 = list.get(i32, p.ear, (it.op + k * 2) as usize)
+        let tpe: i32 = list.get(i32, p.ear, (it.op + k * 2 + 1) as usize)
+        if str_eq(src[t.start .. t.end], src[tps as usize .. tpe as usize]) {
+            if k < d.b {
+                let arg: i32 = list.get(i32, c.tya, (d.a + k) as usize)
+                let ad: typeck.TyData = list.get(typeck.TyData, c.tys, arg as usize)
+                if ad.kind == 3 or ad.kind == 11 { return arg }
+            }
+            return 0 - 1
+        }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+// The some-variant 5-tuple base of a kind-6 generic-enum instance iff niche, else -1.
+// Mirrors `niche_enum_instance` (`Option(*T)` inherits the optimization automatically).
+fn niche_inst_some(read p: parser.Parser, read src: str, read c: typeck.Checker, tid: i32) -> i32 {
+    let eit: i32 = genum_item_of(p, src, c, tid)
+    if eit < 0 { return 0 - 1 }
+    let it: parser.ItemData = list.get(parser.ItemData, p.it, eit as usize)
+    if it.z != 2 { return 0 - 1 }
+    var none_seen: bool = false
+    var some_vb: i32 = 0 - 1
+    var k: i32 = 0
+    for k < 2 {
+        let vb: i32 = it.b + k * 5
+        let fc: i32 = list.get(i32, p.ear, (vb + 3) as usize)
+        if fc == 0 { none_seen = true }
+        else if fc == 1 {
+            if niche_inst_pay(p, src, c, tid, vb) >= 0 { some_vb = vb }
+        }
+        k = k + 1
+    }
+    if !none_seen { return 0 - 1 }
+    return some_vb
+}
+
+// Niche info for a Checker type: the some-variant tuple base, or -1 (kind 15 Named by its own
+// AST shape; kind 6 by the instance's substitution). Mirrors `niche_of_ty`.
+fn niche_of_tyid(read p: parser.Parser, read src: str, read c: typeck.Checker, tid: i32) -> i32 {
+    if tid < 0 { return 0 - 1 }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+    if d.kind == 15 {
+        let ns: i32 = list.get(i32, c.tdecl, (d.x * 10 + 0) as usize)
+        let ne: i32 = list.get(i32, c.tdecl, (d.x * 10 + 1) as usize)
+        return niche_named_some(p, find_enum_item(p, src, ns as usize, ne as usize))
+    }
+    if d.kind == 6 { return niche_inst_some(p, src, c, tid) }
+    return 0 - 1
+}
+
+// The niche payload C type of `tid` (named -> the AST field type; instance -> the
+// substituted arg's Checker type).
+fn emit_niche_pay_c(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, tid: i32, some_vb: i32) {
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+    if d.kind == 15 {
+        let fty: i32 = list.get(i32, p.ear, (list.get(i32, p.ear, (some_vb + 2) as usize) + 2) as usize)
+        emit_c_ty(sb, p, src, fty)
+        return
+    }
+    emit_ty_c(sb, p, src, c, niche_inst_pay(p, src, c, tid, some_vb))
+}
+
+// The AST payload TypeId of a niche `Ctor(args)` APPLICATION type (`Option(*mut i32)` as an
+// annotation), or -1: the enum's 1-field variant is a bare tparam Name and the matching App
+// arg is a plain-pointer AST type.
+fn niche_app_pay(read p: parser.Parser, read src: str, read t: parser.TypeData) -> i32 {
+    var eit: i32 = 0 - 1
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let cand: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if cand.kind == 5 and cand.a > 0 {
+            if str_eq(src[cand.x .. cand.y], src[t.x as usize .. t.y as usize]) { eit = iid }
+        }
+        r = r + 1
+    }
+    if eit < 0 { return 0 - 1 }
+    let it: parser.ItemData = list.get(parser.ItemData, p.it, eit as usize)
+    if it.z != 2 { return 0 - 1 }
+    var none_seen: bool = false
+    var pay: i32 = 0 - 1
+    var k: i32 = 0
+    for k < 2 {
+        let vb: i32 = it.b + k * 5
+        let fc: i32 = list.get(i32, p.ear, (vb + 3) as usize)
+        if fc == 0 { none_seen = true }
+        else if fc == 1 {
+            let fty: i32 = list.get(i32, p.ear, (list.get(i32, p.ear, (vb + 2) as usize) + 2) as usize)
+            if fty >= 0 {
+                let ft: parser.TypeData = list.get(parser.TypeData, p.ty, fty as usize)
+                if ft.kind == 0 {
+                    var tp: i32 = 0
+                    for tp < it.a {
+                        let tps: i32 = list.get(i32, p.ear, (it.op + tp * 2) as usize)
+                        let tpe: i32 = list.get(i32, p.ear, (it.op + tp * 2 + 1) as usize)
+                        if str_eq(src[ft.start .. ft.end], src[tps as usize .. tpe as usize]) {
+                            if tp < t.a {
+                                let arg: i32 = list.get(i32, p.tar, (t.op + tp) as usize)
+                                let at: parser.TypeData = list.get(parser.TypeData, p.ty, arg as usize)
+                                if at.kind == 2 or at.kind == 6 { pay = arg }
+                            }
+                        }
+                        tp = tp + 1
+                    }
+                }
+            }
+        }
+        k = k + 1
+    }
+    if !none_seen { return 0 - 1 }
+    return pay
+}
+
+// A `match` on a niche enum: a null test, not a tag switch (ONE temp). Arms classify into
+// some (variant pat naming the some variant, optional Ident subpat binding), none (a bare
+// Ident naming the nullary variant), and a wildcard/binding catch-all. Mirrors
+// `emit_niche_match` (the guarded counterpart is a later increment).
+fn emit_niche_match(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, stid: i32, some_vb: i32, ret: bool, depth: i32) {
+    let n: i32 = g.tmp
+    g.tmp = g.tmp + 1
+    var pay: String = string_new()
+    emit_niche_pay_c(pay, p, src, c, stid, some_vb)
+    let sns: i32 = list.get(i32, p.ear, some_vb as usize)
+    let sne: i32 = list.get(i32, p.ear, (some_vb + 1) as usize)
+    // the none variant is the some variant's sibling (a niche enum has exactly two)
+    var neit: i32 = 0 - 1
+    let sd9: typeck.TyData = list.get(typeck.TyData, c.tys, stid as usize)
+    if sd9.kind == 15 {
+        let ens9: i32 = list.get(i32, c.tdecl, (sd9.x * 10 + 0) as usize)
+        let ene9: i32 = list.get(i32, c.tdecl, (sd9.x * 10 + 1) as usize)
+        neit = find_enum_item(p, src, ens9 as usize, ene9 as usize)
+    } else {
+        neit = genum_item_of(p, src, c, stid)
+    }
+    let nit9: parser.ItemData = list.get(parser.ItemData, p.it, neit as usize)
+    var none_vb: i32 = nit9.b
+    if none_vb == some_vb { none_vb = nit9.b + 5 }
+    let nns: i32 = list.get(i32, p.ear, none_vb as usize)
+    let nne: i32 = list.get(i32, p.ear, (none_vb + 1) as usize)
+    indent(sb, depth)
+    string_push(sb, string_view(pay))
+    string_push(sb, " jm_")
+    push_uint(sb, n as i64)
+    string_push(sb, " = ")
+    emit_expr(sb, p, src, c, g, e.a)
+    string_push(sb, ";\n")
+    // classify the arms
+    var some_body: i32 = 0 - 1
+    var some_bns: i32 = 0 - 1
+    var some_bne: i32 = 0 - 1
+    var none_body: i32 = 0 - 1
+    var def_body: i32 = 0 - 1
+    var def_bns: i32 = 0 - 1
+    var def_bne: i32 = 0 - 1
+    var k: i32 = 0
+    for k < e.y {
+        let ab: i32 = e.x + k * 3
+        let pat: i32 = list.get(i32, p.par, ab as usize)
+        let body: i32 = list.get(i32, p.par, (ab + 2) as usize)
+        let pd: parser.PatData = list.get(parser.PatData, p.pt, pat as usize)
+        if pd.kind == 2 and str_eq(src[pd.x as usize .. pd.y as usize], src[sns as usize .. sne as usize]) {
+            some_body = body
+            if pd.a > 0 {
+                let sp: i32 = list.get(i32, p.par, pd.op as usize)
+                let spd: parser.PatData = list.get(parser.PatData, p.pt, sp as usize)
+                if spd.kind == 1 { some_bns = spd.start as i32  some_bne = spd.end as i32 }
+            }
+        } else if pd.kind == 1 {
+            // a bare Ident naming the NONE variant is the none arm; any other Ident binds
+            if str_eq(src[pd.start .. pd.end], src[nns as usize .. nne as usize]) { none_body = body }
+            else { def_body = body  def_bns = pd.start as i32  def_bne = pd.end as i32 }
+        } else if pd.kind == 0 {
+            def_body = body
+            def_bns = 0 - 1
+            def_bne = 0 - 1
+        }
+        k = k + 1
+    }
+    indent(sb, depth)
+    string_push(sb, "if (jm_")
+    push_uint(sb, n as i64)
+    string_push(sb, " != ((")
+    string_push(sb, string_view(pay))
+    string_push(sb, ")0))\n")
+    line_at(sb, depth, "{")
+    var sb2: i32 = some_body
+    var bns: i32 = some_bns
+    var bne: i32 = some_bne
+    if sb2 < 0 { sb2 = def_body  bns = def_bns  bne = def_bne }
+    if sb2 >= 0 {
+        if bns >= 0 {
+            indent(sb, depth + 1)
+            string_push(sb, string_view(pay))
+            string_push(sb, " j_")
+            string_push(sb, src[bns as usize .. bne as usize])
+            string_push(sb, " = jm_")
+            push_uint(sb, n as i64)
+            string_push(sb, ";\n")
+        }
+        emit_arm_body(sb, p, src, c, g, sb2, ret, depth + 1)
+    }
+    line_at(sb, depth, "}")
+    line_at(sb, depth, "else")
+    line_at(sb, depth, "{")
+    if none_body >= 0 {
+        emit_arm_body(sb, p, src, c, g, none_body, ret, depth + 1)
+    } else if def_body >= 0 {
+        if def_bns >= 0 {
+            indent(sb, depth + 1)
+            string_push(sb, string_view(pay))
+            string_push(sb, " j_")
+            string_push(sb, src[def_bns as usize .. def_bne as usize])
+            string_push(sb, " = jm_")
+            push_uint(sb, n as i64)
+            string_push(sb, ";\n")
+        }
+        emit_arm_body(sb, p, src, c, g, def_body, ret, depth + 1)
+    }
+    line_at(sb, depth, "}")
+    string_free(pay)
+}
+
 fn emit_match(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, eid: i32, ret: bool, depth: i32) {
     let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
     let scrut: i32 = e.a
@@ -3817,6 +4160,12 @@ fn emit_match(mut sb: String, read p: parser.Parser, read src: str, read c: type
     // shared C name — both the scrutinee's C type and the tag/case prefix.
     let stid: i32 = list.get(i32, c.et, scrut as usize)
     if stid >= 0 {
+        // A niche-optimized enum (plain or a generic instance) matches on a null test.
+        let nvb: i32 = niche_of_tyid(p, src, c, stid)
+        if nvb >= 0 {
+            emit_niche_match(sb, p, src, c, g, e, stid, nvb, ret, depth)
+            return
+        }
         let sd0: typeck.TyData = list.get(typeck.TyData, c.tys, stid as usize)
         if sd0.kind == 2 and (sd0.x <= 9 or sd0.x == 12 or sd0.x == 13) {   // int/bool/char scrutinee
             emit_scalar_match(sb, p, src, c, g, e, stid, ret, depth)
@@ -3836,7 +4185,7 @@ fn emit_match(mut sb: String, read p: parser.Parser, read src: str, read c: type
     } else {
         enum_iid = genum_item_of(p, src, c, stid)
         inst = stid
-        emit_ty_c(pfx, src, c, stid)
+        emit_ty_c(pfx, p, src, c, stid)
     }
     // Any guarded arm forces the ordered-if-chain lowering (a C switch cannot stack two cases on
     // one tag nor fall through on a false guard).
@@ -3937,7 +4286,7 @@ fn emit_scalar_match(mut sb: String, read p: parser.Parser, read src: str, read 
     let nend: i32 = g.tmp
     g.tmp = g.tmp + 1
     indent(sb, depth)
-    emit_ty_c(sb, src, c, stid)
+    emit_ty_c(sb, p, src, c, stid)
     string_push(sb, " jm_")
     push_uint(sb, n as i64)
     string_push(sb, " = ")
@@ -3963,7 +4312,7 @@ fn emit_scalar_match(mut sb: String, read p: parser.Parser, read src: str, read 
         line_at(sb, depth, "{")
         if pd.kind == 1 {                             // a bare name binds the scrutinee value
             indent(sb, depth + 1)
-            emit_ty_c(sb, src, c, stid)
+            emit_ty_c(sb, p, src, c, stid)
             string_push(sb, " j_")
             string_push(sb, src[pd.start .. pd.end])
             string_push(sb, " = jm_")
@@ -4684,7 +5033,7 @@ fn emit_zip_for(mut sb: String, read p: parser.Parser, read src: str, read c: ty
     for i < k {                                       // snapshot each source slice
         let s0: i32 = list.get(i32, p.lar, (e.a + 7 + bc * 3 + i) as usize)
         indent(sb, depth)
-        emit_ty_c(sb, src, c, list.get(i32, c.et, s0 as usize))
+        emit_ty_c(sb, p, src, c, list.get(i32, c.et, s0 as usize))
         string_push(sb, " _z")
         push_uint(sb, n as i64)
         string_push(sb, "_")
@@ -4734,7 +5083,7 @@ fn emit_zip_for(mut sb: String, read p: parser.Parser, read src: str, read c: ty
             let s0: i32 = list.get(i32, p.lar, (e.a + 7 + bc * 3 + b) as usize)
             let sd: typeck.TyData = list.get(typeck.TyData, c.tys, list.get(i32, c.et, s0 as usize) as usize)
             indent(sb, depth + 1)
-            emit_ty_c(sb, src, c, sd.a)               // Slice: a = elem
+            emit_ty_c(sb, p, src, c, sd.a)               // Slice: a = elem
             if conv == 2 {                            // mut: bind a pointer into the slice
                 string_push(sb, "* j_")
                 string_push(sb, bname)
@@ -4782,7 +5131,7 @@ fn emit_slice_for(mut sb: String, read p: parser.Parser, read src: str, read c: 
     let n: i32 = g.tmp
     g.tmp = g.tmp + 1
     indent(sb, depth)
-    emit_ty_c(sb, src, c, stid)
+    emit_ty_c(sb, p, src, c, stid)
     string_push(sb, " _s")
     push_uint(sb, n as i64)
     string_push(sb, " = ")
@@ -4815,7 +5164,7 @@ fn emit_slice_for(mut sb: String, read p: parser.Parser, read src: str, read c: 
     var added_ptr: bool = false
     if !str_eq(bname, "_") {
         indent(sb, depth + 1)
-        emit_ty_c(sb, src, c, sd.a)
+        emit_ty_c(sb, p, src, c, sd.a)
         if conv == 2 {                                // mut: bind a pointer into the slice
             string_push(sb, "* j_")
             string_push(sb, bname)
@@ -4918,7 +5267,7 @@ fn emit_array_for(mut sb: String, read p: parser.Parser, read src: str, read c: 
     let n: i32 = g.tmp
     g.tmp = g.tmp + 1
     indent(sb, depth)
-    emit_ty_c(sb, src, c, sty)
+    emit_ty_c(sb, p, src, c, sty)
     string_push(sb, "* _a")
     push_uint(sb, n as i64)
     string_push(sb, " = &(")
@@ -4951,7 +5300,7 @@ fn emit_array_for(mut sb: String, read p: parser.Parser, read src: str, read c: 
     var added_ptr: bool = false
     if !str_eq(bname, "_") {
         indent(sb, depth + 1)
-        emit_ty_c(sb, src, c, ad.a)
+        emit_ty_c(sb, p, src, c, ad.a)
         if conv == 2 {                                // mut: bind a pointer into the array
             string_push(sb, "* j_")
             string_push(sb, bname)
@@ -5058,11 +5407,84 @@ fn emit_range_for(mut sb: String, read p: parser.Parser, read src: str, read c: 
 }
 
 // The `<ret> jestyr_<name>(<params>)` signature (no trailing newline). Mirrors `fn_signature`.
+// Does this item carry attribute `@<want>`? (attrs are 4-tuples in `aar` at (u,v)).
+fn item_has_attr(read p: parser.Parser, read src: str, read it: parser.ItemData, read want: str) -> bool {
+    var i: i32 = 0
+    for i < it.v {
+        let ab: i32 = it.u + i * 4
+        let ns: i32 = list.get(i32, p.aar, ab as usize)
+        let ne: i32 = list.get(i32, p.aar, (ab + 1) as usize)
+        if str_eq(src[ns as usize .. ne as usize], want) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// A fn's optimization/ABI/tooling attributes as its leading declaration clause: a storage
+// prefix (`@inline` -> `static inline`, internal linkage dodging C's inline-linkage pitfall)
+// plus one GNU `__attribute__((…))` group. Pure hints — never semantics. Mirrors
+// `fn_attr_prefix`.
+fn emit_fn_attr_prefix(mut sb: String, read p: parser.Parser, read src: str, read it: parser.ItemData) {
+    var storage: bool = false
+    var gnu: String = string_new()
+    var any: bool = false
+    var i: i32 = 0
+    for i < it.v {
+        let ab: i32 = it.u + i * 4
+        let ns: i32 = list.get(i32, p.aar, ab as usize)
+        let ne: i32 = list.get(i32, p.aar, (ab + 1) as usize)
+        let nm: str = src[ns as usize .. ne as usize]
+        var clause: str = ""
+        if str_eq(nm, "inline") { storage = true  clause = "always_inline" }
+        else if str_eq(nm, "no_inline") { clause = "noinline" }
+        else if str_eq(nm, "hot") { clause = "hot" }
+        else if str_eq(nm, "cold") { clause = "cold" }
+        else if str_eq(nm, "must_use") { clause = "warn_unused_result" }
+        if !str_eq(clause, "") {
+            if any { string_push(gnu, ", ") }
+            string_push(gnu, clause)
+            any = true
+        }
+        // `section(<str>)` / `deprecated[(<str>)]`: the literal keeps its quotes VERBATIM,
+        // so the source text is a ready-made C clause.
+        if str_eq(nm, "section") or str_eq(nm, "deprecated") {
+            let ac: i32 = list.get(i32, p.aar, (ab + 3) as usize)
+            var lit: i32 = 0 - 1
+            if ac > 0 {
+                let a0: i32 = list.get(i32, p.aar, list.get(i32, p.aar, (ab + 2) as usize) as usize)
+                let ax: parser.ExprData = list.get(parser.ExprData, p.ex, a0 as usize)
+                if ax.kind == 29 { lit = a0 }
+            }
+            if str_eq(nm, "section") and lit < 0 { i = i + 1  continue }
+            if any { string_push(gnu, ", ") }
+            string_push(gnu, nm)
+            if lit >= 0 {
+                let lx: parser.ExprData = list.get(parser.ExprData, p.ex, lit as usize)
+                string_push(gnu, "(")
+                string_push(gnu, src[lx.start .. lx.end])
+                string_push(gnu, ")")
+            }
+            any = true
+        }
+        i = i + 1
+    }
+    if storage { string_push(sb, "static inline ") }
+    if any {
+        string_push(sb, "__attribute__((")
+        string_push(sb, string_view(gnu))
+        string_push(sb, ")) ")
+    }
+    string_free(gnu)
+}
+
 fn emit_fn_sig(mut sb: String, read p: parser.Parser, read src: str, read it: parser.ItemData) {
+    emit_fn_attr_prefix(sb, p, src, it)
     // A fallible fn returns its result struct; otherwise its ok type (`it.z`, -1 = void).
     if fn_is_fallible(p, it) { emit_result_name(sb, p, src, it.z) }
     else { emit_c_ty(sb, p, src, it.z) }
-    string_push(sb, " jestyr_")
+    string_push(sb, " ")
+    // `@no_mangle` publishes the BARE name (C interop); everything else is `jestyr_<name>`.
+    if !item_has_attr(p, src, it, "no_mangle") { string_push(sb, "jestyr_") }
     string_push(sb, src[it.x .. it.y])
     emit_params(sb, p, src, it)
 }
@@ -5325,11 +5747,13 @@ fn emit_forward_types(mut sb: String, read p: parser.Parser, read src: str) {
             string_push(sb, ";\n")
         }
         if it.kind == 5 and it.a == 0 {               // non-generic enum: `typedef struct Jestyr_<E> Jestyr_<E>;`
-            string_push(sb, "typedef struct Jestyr_")
-            string_push(sb, src[it.x .. it.y])
-            string_push(sb, " Jestyr_")
-            string_push(sb, src[it.x .. it.y])
-            string_push(sb, ";\n")
+            if niche_named_some(p, iid) < 0 {         // a niche enum IS its pointer — no typedef
+                string_push(sb, "typedef struct Jestyr_")
+                string_push(sb, src[it.x .. it.y])
+                string_push(sb, " Jestyr_")
+                string_push(sb, src[it.x .. it.y])
+                string_push(sb, ";\n")
+            }
         }
         r = r + 1
     }
@@ -5389,11 +5813,11 @@ fn emit_variant_head(mut sb: String, read p: parser.Parser, read src: str, enum_
 
 // Like `emit_variant_head`, but for a generic-enum INSTANCE (the construct expr's Checker type
 // `tid`, kind 6): `(<N>){ .tag = <N>_<v>` where N = `Jestyr_<ctor>__<args>`.
-fn emit_gvariant_head(mut sb: String, read src: str, read c: typeck.Checker, tid: i32, read vname: str) {
+fn emit_gvariant_head(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, tid: i32, read vname: str) {
     string_push(sb, "(")
-    emit_ty_c(sb, src, c, tid)
+    emit_ty_c(sb, p, src, c, tid)
     string_push(sb, "){ .tag = ")
-    emit_ty_c(sb, src, c, tid)
+    emit_ty_c(sb, p, src, c, tid)
     string_push(sb, "_")
     string_push(sb, vname)
 }
@@ -5450,7 +5874,7 @@ fn emit_enum_defs(mut sb: String, read p: parser.Parser, read src: str, read c: 
     for r < list.len(i32, p.roots) {
         let iid: i32 = list.get(i32, p.roots, r)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
-        if it.kind == 5 and it.a == 0 {               // non-generic enum (a == tparam count)
+        if it.kind == 5 and it.a == 0 and niche_named_some(p, iid) < 0 {   // non-generic, non-niche enum
             let en: str = src[it.x .. it.y]
             string_push(sb, "enum Jestyr_")
             string_push(sb, en)
@@ -5523,9 +5947,9 @@ fn emit_gen_forward_types(mut sb: String, read p: parser.Parser, read src: str, 
     for sk < list.len(i32, g.gsi) {                   // struct instances first (reference order)
         let stid: i32 = list.get(i32, g.gsi, sk)
         string_push(sb, "typedef struct ")
-        emit_ty_c(sb, src, c, stid)
+        emit_ty_c(sb, p, src, c, stid)
         string_push(sb, " ")
-        emit_ty_c(sb, src, c, stid)
+        emit_ty_c(sb, p, src, c, stid)
         string_push(sb, ";\n")
         any = true
         sk = sk + 1
@@ -5533,12 +5957,14 @@ fn emit_gen_forward_types(mut sb: String, read p: parser.Parser, read src: str, 
     var k: usize = 0
     for k < list.len(i32, g.gei) {
         let tid: i32 = list.get(i32, g.gei, k)
-        string_push(sb, "typedef struct ")
-        emit_ty_c(sb, src, c, tid)
-        string_push(sb, " ")
-        emit_ty_c(sb, src, c, tid)
-        string_push(sb, ";\n")
-        any = true
+        if niche_inst_some(p, src, c, tid) < 0 {      // a niche instance IS its pointer — no typedef
+            string_push(sb, "typedef struct ")
+            emit_ty_c(sb, p, src, c, tid)
+            string_push(sb, " ")
+            emit_ty_c(sb, p, src, c, tid)
+            string_push(sb, ";\n")
+            any = true
+        }
         k = k + 1
     }
     if any { string_push(sb, "\n") }
@@ -5551,10 +5977,11 @@ fn emit_gen_enum_defs(mut sb: String, read p: parser.Parser, read src: str, read
     var k: usize = 0
     for k < list.len(i32, g.gei) {
         let tid: i32 = list.get(i32, g.gei, k)
+        if niche_inst_some(p, src, c, tid) >= 0 { k = k + 1  continue }   // niche: no tag/union def
         let eit: i32 = genum_item_of(p, src, c, tid)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, eit as usize)
         string_push(sb, "enum ")
-        emit_ty_c(sb, src, c, tid)
+        emit_ty_c(sb, p, src, c, tid)
         string_push(sb, "_tag {\n")
         var any_payload: bool = false
         var v: i32 = 0
@@ -5562,7 +5989,7 @@ fn emit_gen_enum_defs(mut sb: String, read p: parser.Parser, read src: str, read
             let vb: i32 = it.b + v * 5
             if list.get(i32, p.ear, (vb + 3) as usize) > 0 { any_payload = true }
             string_push(sb, "    ")
-            emit_ty_c(sb, src, c, tid)
+            emit_ty_c(sb, p, src, c, tid)
             string_push(sb, "_")
             string_push(sb, src[list.get(i32, p.ear, vb as usize) as usize .. list.get(i32, p.ear, (vb + 1) as usize) as usize])
             let disc: i32 = list.get(i32, p.ear, (vb + 4) as usize)
@@ -5575,9 +6002,9 @@ fn emit_gen_enum_defs(mut sb: String, read p: parser.Parser, read src: str, read
         }
         string_push(sb, "};\n")
         string_push(sb, "struct ")
-        emit_ty_c(sb, src, c, tid)
+        emit_ty_c(sb, p, src, c, tid)
         string_push(sb, " {\n    enum ")
-        emit_ty_c(sb, src, c, tid)
+        emit_ty_c(sb, p, src, c, tid)
         string_push(sb, "_tag tag;\n")
         if any_payload {
             string_push(sb, "    union {\n")
@@ -5698,7 +6125,7 @@ fn emit_consts(mut sb: String, read p: parser.Parser, read src: str, read c: typ
         if it.kind == 2 {                             // Const: (x,y)=name span, a=type, b=value
             string_push(sb, "static const ")
             if it.a >= 0 { emit_c_ty(sb, p, src, it.a) }
-            else { emit_ty_c(sb, src, c, list.get(i32, c.et, it.b as usize)) }
+            else { emit_ty_c(sb, p, src, c, list.get(i32, c.et, it.b as usize)) }
             string_push(sb, " j_")
             string_push(sb, src[it.x .. it.y])
             string_push(sb, " = ")
@@ -5732,7 +6159,7 @@ fn emit_array_defs(mut sb: String, read p: parser.Parser, read src: str, read c:
     var any: bool = false
     var i: usize = 0
     for i < list.len(i32, c.et) {                     // per-expr types, in expr-arena order
-        any = emit_one_array_def(sb, src, c, list.get(i32, c.et, i), seen) or any
+        any = emit_one_array_def(sb, p, src, c, list.get(i32, c.et, i), seen) or any
     	i = i + 1
     }
     var r: i32 = 0                                    // then fn signature annotations
@@ -5754,7 +6181,7 @@ fn emit_array_defs(mut sb: String, read p: parser.Parser, read src: str, read c:
 }
 
 // One array typedef from a Checker TyId (only an Array, kind 9, contributes).
-fn emit_one_array_def(mut sb: String, read src: str, read c: typeck.Checker, tyid: i32, mut seen: String) -> bool {
+fn emit_one_array_def(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, tyid: i32, mut seen: String) -> bool {
     if tyid < 0 { return false }
     let d: typeck.TyData = list.get(typeck.TyData, c.tys, tyid as usize)
     if d.kind != 9 { return false }
@@ -5762,7 +6189,7 @@ fn emit_one_array_def(mut sb: String, read src: str, read c: typeck.Checker, tyi
     push_ty_mangle(m, src, c, d.a)
     string_push(m, "_")
     push_uint(m, d.b as i64)
-    let ok: bool = push_array_typedef(sb, string_view(m), seen, src, c, d.a, 0 - 1, d.b)
+    let ok: bool = push_array_typedef(sb, string_view(m), seen, p, src, c, d.a, 0 - 1, d.b)
     string_free(m)
     return ok
 }
@@ -5786,9 +6213,9 @@ fn emit_one_array_def_ast(mut sb: String, read p: parser.Parser, read src: str, 
 }
 
 // Emit `typedef struct { <ecty> a[<len>]; } JestyrArr_<key>;` unless `key` was already emitted.
-fn push_array_typedef(mut sb: String, read key: str, mut seen: String, read src: str, read c: typeck.Checker, elem: i32, unused: i32, len: i32) -> bool {
+fn push_array_typedef(mut sb: String, read key: str, mut seen: String, read p: parser.Parser, read src: str, read c: typeck.Checker, elem: i32, unused: i32, len: i32) -> bool {
     var ec: String = string_new()
-    emit_ty_c(ec, src, c, elem)
+    emit_ty_c(ec, p, src, c, elem)
     var ln: String = string_new()
     push_uint(ln, len as i64)
     let ok: bool = push_array_typedef_raw(sb, key, seen, string_view(ec), string_view(ln))
@@ -5943,7 +6370,7 @@ fn emit_gs_ty(mut sb: String, read p: parser.Parser, read src: str, read c: type
     let t: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
     if t.kind == 0 {
         let arg: i32 = gs_tparam_arg(p, src, c, fit, tid, t.start, t.end)
-        if arg >= 0 { emit_ty_c(sb, src, c, arg)  return }
+        if arg >= 0 { emit_ty_c(sb, p, src, c, arg)  return }
         emit_c_ty(sb, p, src, tyid)
         return
     }
@@ -5982,7 +6409,7 @@ fn collect_gstruct_instances(mut g: Cg, read p: parser.Parser, read src: str, re
         if gstruct_ctor_fn(p, src, c, tid) >= 0 {
             var probe: String = string_new()
             string_push(probe, "|")
-            emit_ty_c(probe, src, c, tid)
+            emit_ty_c(probe, p, src, c, tid)
             string_push(probe, "|")
             if !contains(string_view(seen), string_view(probe)) {
                 string_push(seen, string_view(probe))
@@ -6006,7 +6433,7 @@ fn emit_gen_struct_defs(mut sb: String, read p: parser.Parser, read src: str, re
         let node: i32 = ctor_struct_node(p, fit)
         let sx: parser.ExprData = list.get(parser.ExprData, p.ex, node as usize)
         string_push(sb, "struct ")
-        emit_ty_c(sb, src, c, tid)
+        emit_ty_c(sb, p, src, c, tid)
         string_push(sb, " {\n")
         var m: i32 = 0
         for m < sx.y {
@@ -6659,7 +7086,7 @@ fn emit_closure_types(mut sb: String, read p: parser.Parser, read src: str, read
                 let ns: i32 = list.get(i32, g.cca, b as usize)
                 let ne: i32 = list.get(i32, g.cca, (b + 1) as usize)
                 let rid: i32 = list.get(i32, g.cca, (b + 2) as usize)
-                emit_ty_c(sb, src, c, list.get(i32, c.et, rid as usize))
+                emit_ty_c(sb, p, src, c, list.get(i32, c.et, rid as usize))
                 string_push(sb, " j_")
                 string_push(sb, src[ns as usize .. ne as usize])
                 string_push(sb, "; ")
@@ -6669,7 +7096,7 @@ fn emit_closure_types(mut sb: String, read p: parser.Parser, read src: str, read
             push_uint(sb, rn as i64)
             string_push(sb, ";\n")
             string_push(sb, "typedef struct { ")
-            emit_ty_c(sb, src, c, list.get(i32, c.et, e.a as usize))   // ret = the body's type
+            emit_ty_c(sb, p, src, c, list.get(i32, c.et, e.a as usize))   // ret = the body's type
             string_push(sb, " (*call)(JestyrEnv_")
             push_uint(sb, rn as i64)
             string_push(sb, "*")
@@ -6727,7 +7154,7 @@ fn emit_thin_closure_c(mut sb: String, read p: parser.Parser, read src: str, rea
     list.truncate(i32, g.caps, 0)
     g.res_ok = 0 - 2
     var rets: String = string_new()
-    emit_ty_c(rets, src, c, ctd.x)
+    emit_ty_c(rets, p, src, c, ctd.x)
     string_push(sb, "static ")
     string_push(sb, string_view(rets))
     string_push(sb, " jestyr_lam_")
@@ -6738,7 +7165,7 @@ fn emit_thin_closure_c(mut sb: String, read p: parser.Parser, read src: str, rea
     for pi < ctd.b {
         if pi > 0 { string_push(sb, ", ") }
         let conv: i32 = list.get(i32, c.tya, (ctd.a + pi * 2) as usize)
-        emit_ty_c(sb, src, c, list.get(i32, c.tya, (ctd.a + pi * 2 + 1) as usize))
+        emit_ty_c(sb, p, src, c, list.get(i32, c.tya, (ctd.a + pi * 2 + 1) as usize))
         if conv == 2 or conv == 4 { string_push(sb, "*") }
         string_push(sb, " j_")
         if pi < e.y {
@@ -6784,7 +7211,7 @@ fn emit_fat_closure_c(mut sb: String, read p: parser.Parser, read src: str, read
         ci = ci + 1
     }
     var rets: String = string_new()
-    emit_ty_c(rets, src, c, list.get(i32, c.et, e.a as usize))
+    emit_ty_c(rets, p, src, c, list.get(i32, c.et, e.a as usize))
     let rn: i32 = ref_expr_id(p, cid)
     string_push(sb, "static ")
     string_push(sb, string_view(rets))
@@ -7057,7 +7484,7 @@ fn emit_dyn_coercion(mut sb: String, read p: parser.Parser, read src: str, read 
     string_push(sb, "){ ")
     if scalar {
         string_push(sb, "&((")
-        emit_ty_c(sb, src, c, at)
+        emit_ty_c(sb, p, src, c, at)
         string_push(sb, "){ ")
         string_push(sb, string_view(inner))
         string_push(sb, " })")
