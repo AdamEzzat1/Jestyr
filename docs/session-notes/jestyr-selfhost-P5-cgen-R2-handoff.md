@@ -424,6 +424,57 @@ placeholders (`fn(T)->T`) + monomorphized-signature typedef contributions.
 `fn_ptr.jtr` (10 lines) and `gen_vtable.jtr` (24) now wait ONLY on closures (capture-free
 `jestyr_lam_<id>` + fn-ptr coercion) and generic-struct instance defs.
 
+### Increment 32 — closures, thin + fat (allowlist 67)
+
+**+`fn_ptr` (thin coerced closure) and `closure_run` (fat lambda-lifted closures).** The full
+`collect_closures`/`closure_types`/`closure_fns`/`emit_closure_literal`/`emit_closure_invoke`
+family, PLUS the discovery this increment forced — record it, it's load-bearing forever:
+
+- **The two parsers' ExprIds do NOT match, and the reference's C embeds ITS ids** in every
+  lifted name (`jestyr_lam_<id>`, `JestyrEnv_<id>`, `JestyrClosure_<id>`, and the inline-invoke
+  spill's struct name). The Rust AST stores fn/method/impl **bodies**, if-**then** blocks, for
+  **body/else** blocks, unsafe/concurrent/region **inner** blocks as `Block` STRUCTS (no
+  ExprId), `FieldInit`s as plain structs, and struct-lit **path** / gen-lit **ctor** as
+  `Ident`s — the Jestyr flat-arena parser allocates a real expr node for each, so every such
+  node shifts all later Jestyr ids +1. `ref_expr_id(p, eid)` maps back by counting Jestyr-only
+  nodes below `eid` (O(arena) per call; closures are rare). The P2 parser golden never saw this
+  — it compares structure, not indices. **Known future liabilities** (documented in the
+  mapper's comment, none co-occur with closures in today's corpus): f-string interps are
+  RUST-only nodes (offset would go the other way), select-arm blocks, and whatever orphan the
+  `Box(i32){…}` ctor parse leaves.
+- **Thin vs fat is the Checker's call:** typeck.jtr already stamps a closure used where a
+  `fn(…)` is expected with that Fn type (TyData kind 12); otherwise Opaque("closure") (kind
+  18, x=0). `closure_is_thin` just reads the stamp. Thin → bare `static` fn whose sig comes
+  from the **fn TYPE** (`emit_thin_closure_c`: params from `c.tya` conv/ty pairs, names from
+  the closure's `clar` triples else `_p{i}`, mut/out → `T*` + registered in `g.pp`) and the
+  literal is `(&jestyr_lam_<id>)`. Fat → env struct (`char _unused;` when capture-free) +
+  `{call, env}` typedefs in the **closure_types** slot (thin closures SKIPPED, trailing blank
+  UNCONDITIONAL), lifted fn taking `JestyrEnv_<id>* j__env` in the **closure_fns** slot
+  (between consts and fn_defs).
+- **Captures = free-name walk with deliberate holes.** `crefs_expr` mirrors `collect_refs`
+  EXACTLY — no Cast/Range/Region arms (names appearing only there are never captured; porting
+  the holes is part of byte-identity). Filter: closure's own params (by text), then
+  `is_global_cname` (fn items, named types, variants, consts, the full `is_intrinsic` name
+  set as a marker string), dedup by text, first-ref order; the capture's env-field C type is
+  the FIRST referencing expr's Checker type (`c.et[rid]`). Discovery walk (`cfind_expr`) is
+  preorder — a closure pushes itself, then its body walks — over non-generic fn bodies, const
+  values, and non-generic struct-method bodies (impl-method bodies deliberately NOT walked,
+  like the reference).
+- **Body emission:** Block/Unsafe body → `emit_body` at depth 0; any other body wraps in
+  `{`/`}` with `emit_return` (or If/Match/bare-stmt when the C ret is `void` — compare the
+  RENDERED ret string, not the TyData kind). Captured names render `(j__env->j_<name>)` via
+  the ACTIVE `g.caps` span set, checked FIRST in the Name arm. Per-lam state reset mirrors the
+  reference: su/pp/req/ens cleared, res_ok=-2, caps armed (thin also clears caps, sets pp).
+- **Invoke:** callee's Checker type kind 18/x=0 → closure invoke, checked BEFORE the kind-12
+  fn-ptr invoke. Args buffer FIRST (temp order!), then a Name callee →
+  `j_f.call(&j_f.env, args)`; any other callee spills `({ JestyrClosure_<id> _f{n} = <lit>;
+  _f{n}.call(&_f{n}.env, args); })` — ONE temp. A closure-inited inferred `let` types as
+  `JestyrClosure_<id>` (reference emit_stmt special case).
+- `gen_vtable.jtr` (22 diff lines) now waits ONLY on generic-struct instance defs (the
+  comptime-ctor `Box(i32)` chain). Pre-existing, NOT from this increment: the port segfaults
+  on `numbers.jtr`/`numerics_canary.jtr` (never targets — verified against the increment-31
+  build).
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
