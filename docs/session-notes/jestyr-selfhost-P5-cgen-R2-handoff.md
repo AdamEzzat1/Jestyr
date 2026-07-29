@@ -588,6 +588,48 @@ increment's shape: typeck arena first, then the cgen sections.
 - **Dyn call**: in the Field-callee block after bcalls — `d.vtable->m(d.data, args)`, the
   receiver emitted ONCE into a buffer and reused.
 
+### Increment 37 — fn attributes + @no_mangle; the NICHE optimization (allowlist 78)
+
+**+`attributes`, `+niche`, `+option`.** Attr prefixes (`item_has_attr`/`emit_fn_attr_prefix`
+in `emit_fn_sig`: inline→`static inline `+always_inline, no_inline/hot/cold/must_use,
+section/deprecated with the string literal VERBATIM — its quotes make a ready C clause);
+`@no_mangle` → bare names at protos/defs/call sites. The niche machinery: named enums by AST
+shape (`niche_named_some`), generic instances by substitution (`niche_inst_some`/`_pay` —
+bare-tparam fields only, structural `*T` fields deferred), App ANNOTATIONS by arg lookup
+(`niche_app_pay`); both renderers short-circuit (**`emit_ty_c` now threads the Parser** — a
+mechanical 49-site signature change); forward/def sections skip niche enums; `some(p)`
+emits bare / `none` emits `((cty)0)`; `emit_niche_match` = the null-test if/else (ONE temp;
+none-arm classified by EXACT none-variant name). **Root-cause find:** `genum_item_of`'s
+concreteness filter only admitted prim/Named args — the reference's `is_concrete` admits
+pointers (now `tyid_concrete`, fully recursive). That filter was silently blocking
+`Option(*mut i32)` from being an instance ANYWHERE.
+
+### Increment 38 — nested + struct-variant match (allowlist 80)
+
+**+`nested_match`, `+struct_variant`.** `pat_needs_nesting` (any non-flat Variant subpat, any
+StructVariant pat, Or recursion) dispatches FIRST in `emit_match` (before niche/scalar/flat —
+reference order). `pat_test` compiles a pattern to (C boolean, binding lines) recursively:
+tag tests, literal `==`, range bounds, or-alternatives (no binds), Variant positional fields
+(a trailing `..` STOPS the walk), StructVariant fields matched BY NAME against the decl;
+`pat_is_ctor` + a pointer field (AST Ptr/RegionRef — `indirect` already desugars to `*T` in
+the parser) auto-derefs `(*path)` to look through recursion. `emit_nested_match` = the
+ordered if-chain: TWO temps (scrutinee + end label), scrutinee expr buffered BEFORE the temps
+(reference order — `emit_niche_match` got the same fix), unconditional arms open a bare `{`,
+`emit_guarded_arm` shares the goto-end plumbing, `jm_end_<n>: ;` in stmt position /
+`__builtin_unreachable();` in ret position without an unconditional default. Struct-variant
+CONSTRUCTION (`circle { r: 2.0 }`): a kind-16 StructLit whose path is a VARIANT dispatches
+before the spread/plain paths — variant head + `, .u.<v> = { .j_<f> = <val>, … } }` (named
+inits), with the niche/genum short-circuits mirrored.
+
+**Next:** `sync.jtr` (55) is NOT a quick win — `Jestyr_Mutex__?` in the current diff means
+unresolved tparams leak into struct-instance collection, and its fns need INSTANCE-body
+emission (nested generic calls like `jestyr_load_cell__i64` from inside `channel_recv__i64`).
+That is the generics-completion cluster (with vec_generic 61, genlist 72, core 76, methods
+102, genmethods 103): instance-body walking in `collect_gfn_instances`, subst-aware body
+`let`s (`emit_c_ty`/`emit_ty_c` under `g.su`), generic-struct METHODS (`Work::Method`), and
+suppressing template struct-instances with unresolved args. The biggest remaining infra
+piece before the compiler sources themselves.
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
