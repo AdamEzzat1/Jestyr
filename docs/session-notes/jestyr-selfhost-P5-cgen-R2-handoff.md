@@ -528,6 +528,37 @@ compiler-adjacent std module), **+`atomics`** (a 5-intrinsic rider). The concurr
 - **Atomics rider:** `atomic_store/load/add/sub/xchg` → `__atomic_*_n`/`__atomic_fetch_*`
   with the `(int64_t*)(p), (int64_t)(v), __ATOMIC_SEQ_CST` cast pattern (no stdatomic.h).
 
+### Increment 35 — await + task handles; args + the call fallback (allowlist 74)
+
+**+`await.jtr`, +`args.jtr`.** Two findings worth their weight:
+
+- **Task handles** (`Cg.th` 4-tuples: name span, handle idx, has_ret; `Cg.thf` the floor):
+  `let h = spawn f(args)` inside `concurrent` emits NO C variable at all — just the fixed
+  spawn triple + `int _jd<h> = 0;` and a map entry. The map is scoped per nursery exactly
+  like the reference's `mem::take` (an inner `concurrent` does NOT see the outer's handles —
+  the floor models that). `await h` (kind 40) lowers to
+  `({ if (!_jd<h>) { pthread_join(_jt<h>, NULL); _jd<h> = 1; } _ja<h>.ret; })` (`.ret;`
+  only when the target returns a value — the RENDERED ret cty vs "void", same test as the
+  arg-pack's `ret` field). The brace's safety-net join is GUARDED (`if (!_jd<h>) …`) for
+  let-bound handles, plain for bare spawns.
+- **`args.jtr` is a GOLDEN target after all — the import-file rule is subtler than
+  recorded.** The single-file golden path degenerates `env.argc()` on BOTH sides to the
+  DEFAULT call fallback `j_env.j_argc(args)` (callee expr emitted plainly, then plain
+  args) — the port was missing that final fallback arm in `emit_call` entirely (it emitted
+  nothing). One arm later, the whole file is byte-identical. **The probe caveat:** the
+  `emit-c`-based corpus probe is the WRONG oracle for import files (emit-c resolves
+  modules; the golden does not) — rank import files by the GOLDEN, not the probe. The
+  fixpoint now explicitly SKIPS import-bearing files (their degenerate C references
+  unresolved names and cannot build; the module path owns their runtime).
+
+**Probed and deferred:** `dyn_dispatch.jtr` (35) needs the full `dyn Trait` machinery —
+`JestyrVtable_<Trait>`/`JestyrDyn_<Trait>` typedefs, per-impl vtshims + static vtables,
+dyn-typed sigs, `s.vtable->show(s.data)` calls, and the COERCION records
+(`(JestyrDyn_Show){ &(v), &jestyr_vt_Show__T }` at call sites/lets) — which require
+exposing the Checker's `dyn_coercions` side table from typeck.jtr first (the P4 pattern:
+add the `pub` flat arena right before the construct that reads it). That is the next
+increment's shape: typeck arena first, then the cgen sections.
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
