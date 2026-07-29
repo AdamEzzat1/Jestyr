@@ -1006,11 +1006,92 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         return
     }
     if e.kind == 12 {                                 // Assign: `<target> <aop> <value>` (stmt adds `;`)
+        let tgt: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+        if tgt.kind == 6 {
+            let btid: i32 = list.get(i32, c.et, tgt.a as usize)
+            if btid >= 0 {
+                let bd: typeck.TyData = list.get(typeck.TyData, c.tys, btid as usize)
+                if bd.kind == 9 {                     // array-index WRITE: fold into the stmt-expr
+                    var bbuf: String = string_new()   // base/index/VALUE emit before the temp
+                    emit_expr(bbuf, p, src, c, g, tgt.a)
+                    var ibuf: String = string_new()
+                    emit_expr(ibuf, p, src, c, g, tgt.b)
+                    var vbuf2: String = string_new()
+                    emit_expr(vbuf2, p, src, c, g, e.b)
+                    let n: i32 = g.tmp                // (non-const pointer; ONE temp)
+                    g.tmp = g.tmp + 1
+                    string_push(sb, "({ ")
+                    emit_ty_c(sb, src, c, btid)
+                    string_push(sb, "* _a")
+                    push_uint(sb, n as i64)
+                    string_push(sb, " = &(")
+                    string_push(sb, string_view(bbuf))
+                    string_push(sb, "); size_t _ix")
+                    push_uint(sb, n as i64)
+                    string_push(sb, " = (size_t)(")
+                    string_push(sb, string_view(ibuf))
+                    string_push(sb, "); assert(_ix")
+                    push_uint(sb, n as i64)
+                    string_push(sb, " < ")
+                    push_uint(sb, bd.b as i64)
+                    string_push(sb, "); _a")
+                    push_uint(sb, n as i64)
+                    string_push(sb, "->a[_ix")
+                    push_uint(sb, n as i64)
+                    string_push(sb, "] ")
+                    string_push(sb, assign_c(e.op))
+                    string_push(sb, " ")
+                    string_push(sb, string_view(vbuf2))
+                    string_push(sb, "; })")
+                    string_free(bbuf)
+                    string_free(ibuf)
+                    string_free(vbuf2)
+                    return
+                }
+            }
+        }
         emit_expr(sb, p, src, c, g, e.a)
         string_push(sb, " ")
         string_push(sb, assign_c(e.op))
         string_push(sb, " ")
         emit_expr(sb, p, src, c, g, e.b)
+        return
+    }
+    if e.kind == 15 {                                 // ArrayRepeat `[v; N]`: fill via a temp. ONE temp.
+        let atid: i32 = list.get(i32, c.et, eid as usize)
+        let ad: typeck.TyData = list.get(typeck.TyData, c.tys, atid as usize)   // Array: a=elem, b=len
+        var vbuf: String = string_new()               // the value emits FIRST (reference order)
+        emit_expr(vbuf, p, src, c, g, e.a)
+        let n: i32 = g.tmp
+        g.tmp = g.tmp + 1
+        string_push(sb, "({ ")
+        emit_ty_c(sb, src, c, atid)
+        string_push(sb, " _ar")
+        push_uint(sb, n as i64)
+        string_push(sb, "; ")
+        emit_ty_c(sb, src, c, ad.a)
+        string_push(sb, " _v")
+        push_uint(sb, n as i64)
+        string_push(sb, " = (")
+        string_push(sb, string_view(vbuf))
+        string_push(sb, "); for (size_t _k")
+        push_uint(sb, n as i64)
+        string_push(sb, " = 0; _k")
+        push_uint(sb, n as i64)
+        string_push(sb, " < ")
+        push_uint(sb, ad.b as i64)
+        string_push(sb, "; _k")
+        push_uint(sb, n as i64)
+        string_push(sb, "++) _ar")
+        push_uint(sb, n as i64)
+        string_push(sb, ".a[_k")
+        push_uint(sb, n as i64)
+        string_push(sb, "] = _v")
+        push_uint(sb, n as i64)
+        string_push(sb, "; _ar")
+        push_uint(sb, n as i64)
+        string_push(sb, "; })")
+        string_free(vbuf)
         return
     }
     if e.kind == 34 {                                 // Invariant: assert(<cond>) (stmt adds `;`)
