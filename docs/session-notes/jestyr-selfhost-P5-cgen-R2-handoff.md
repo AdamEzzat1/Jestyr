@@ -475,6 +475,59 @@ family, PLUS the discovery this increment forced — record it, it's load-bearin
   on `numbers.jtr`/`numerics_canary.jtr` (never targets — verified against the increment-31
   build).
 
+### Increment 33 — generic-STRUCT instances (allowlist 68)
+
+**+`gen_vtable`** (the Main-Objective generic-vtable shape: `fn Box(comptime T: type) -> type
+{ return struct { op: fn(T) -> T } }`). What landed:
+
+- **`ref_expr_id` correction:** a GenStructLit's ctor is NOT a Jestyr-only node — the Rust
+  parser reaches `Name(args){` through the call-postfix path, so it allocates-and-ABANDONS the
+  same orphan `Name` this parser does (unlike a plain StructLit's path, which stays an Ident).
+  Only kind 16 subtracts.
+- **Instance collection** (`collect_gstruct_instances` → `g.gsi`): kind-6 per-expr Checker
+  types whose ctor is a comptime struct ctor (`gstruct_ctor_fn`: a fn item whose body has
+  `return struct {…}` — `ctor_struct_node` finds the kind-36 StructType expr), expr order,
+  dedup by rendered C name. The reference's annotation/signature pass is deferred (as the
+  enum collection's was).
+- **Substitution machinery**: `gs_tparam_arg` zips the ctor fn's `comptime X: type` params
+  (declaration order) with the instance's `tya` args; `emit_gs_ty`/`push_gs_mangle` render an
+  AST type under that substitution (a substituted Name renders/mangles its ARG's Checker
+  form; Fn types name their SUBSTITUTED typedef).
+- **Sections**: `gen_forward_types` emits struct instances BEFORE enum instances;
+  `emit_gen_struct_defs` (fields only, tag 0) lands between plain-enum defs and gen-enum
+  defs; `emit_fn_type_defs` (now takes c+g) gained BOTH halves of `collect_fn_types` parity —
+  the textual scan skips NON-CONCRETE fn types (`ast_ty_concrete`: every Name a prim or
+  declared type — a template's bare `T` is neither), and each struct instance contributes the
+  substituted fn-pointer typedef of its fn-typed fields (instance order, member order, same
+  dedup, shared trailing blank).
+- **GenStructLit (kind 17)** emits `(Jestyr_<ctor>__<args>){ .j_f = v, … }` — the type name
+  from the expr's OWN Checker type, fields in source order (no spread/defaults, like the
+  reference arm).
+
+### Increment 34 — spawn runtime + atomics (allowlist 72)
+
+**+`dynamic_spawn`, and `concurrent.jtr` + `parallel.jtr` as FREE WINS** (parallel.jtr is a
+compiler-adjacent std module), **+`atomics`** (a 5-intrinsic rider). The concurrency core:
+
+- **`collect_spawns`** (`g.sps` = inner-call ExprIds): non-generic fn bodies + ALL struct
+  methods (the reference applies no generic filter to methods), narrow arm walk
+  (Concurrent/Block/Unsafe/Spawn/If/Match/For; Select deferred). Gates the prelude's
+  `#include <pthread.h>` (after assert.h, inside the include run).
+- **`spawn_runtime` section** (between impl_protos and consts): per site
+  `struct _jsp_<id> { <cty> a<i>; … [<ret> ret;] };` + the `void*` trampoline
+  `jestyr_task_<id>` unpacking and calling `jestyr_<target>` (`_a->ret =` for a non-void
+  target; `char _unused;` when empty). **`<id>` is the inner call's REFERENCE ExprId** —
+  `ref_expr_id` again.
+- **`emit_concurrent`** (stmt kind 38): plain braces (NO drop scope), fixed top-level bare
+  spawns get numbered handles (`pthread_t _jt<h>;` + arg box + create, args buffered FIRST)
+  joined at the brace; `stmt_has_nested_spawn` (a spawn NOT at top level) arms the dynamic-N
+  path: the growable `_dt/_da/_dn/_dc` array decl, `g.dspawn` making a Spawn STATEMENT lower
+  via `emit_dyn_spawn` (grow-on-full, heap arg box — a stable address across array reallocs —
+  create, count), and the brace's join-all + frees. **Deferred:** `let h = spawn …` handles +
+  `await` (await.jtr is at 27 diff lines), `select`.
+- **Atomics rider:** `atomic_store/load/add/sub/xchg` → `__atomic_*_n`/`__atomic_fetch_*`
+  with the `(int64_t*)(p), (int64_t)(v), __ATOMIC_SEQ_CST` cast pattern (no stdatomic.h).
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
