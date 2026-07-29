@@ -14,13 +14,35 @@
 
 ## Horizon 1 — Self-hosting: exactly what remains
 
-### Where P5 stands (increment 26, master `505f8c7`)
+### Where P5 stands (increment 31, master `4df4411`)
 
-`examples/std/cgen.jtr` (~5K lines vs the ~10.8K-line Rust reference) emits
-byte-identical C for **52 of 130** corpus files. Clusters 1–5 are all done
-(increments 22–26): drop glue, impl sections, genrefs, loop-else/labels,
-regions/arenas (+zip/step/variant), codepoints. **Next: cluster 6, generic
-functions — the hardest infra.** **Done:** the prelude + section
+`examples/std/cgen.jtr` (~6.3K lines vs the ~10.8K-line Rust reference) emits
+byte-identical C for **65 of 130** corpus files (50% by file count; ~65% by
+construct machinery). Done since increment 21: clusters 1–5 complete (drop
+glue + impl sections, genrefs, loop-else/labels, regions/arenas + zip/step/
+variant, codepoints), generics SLICE 1 (LIFO instance worklist, bracket
+inference, subst-aware sigs, erased comptime args), impl/BOUND/operator
+dispatch (new typeck `bcalls` arena; operator resolutions recorded in
+`icalls` on Binary ids), file I/O + gated try_read, split iteration,
+ArrayRepeat + array-index writes, and **fn-pointer types** (cluster 11 core —
+`JestyrFn_<sig>` typedefs, indirect calls by callee type, `&fn` values).
+**Corrections:** `generics.jtr` does not exist — the diff-ranked probe IS the
+worklist; module-importing drivers (`try_read`, `demo`) are permanent golden
+non-targets (single-file path degenerates both sides).
+
+**Remaining, ranked by leverage:** closures (unlocks `fn_ptr` 10-line diff,
+`gen_vtable`, `closure_run`, `files`); niche + nested match (cluster 7:
+`option`, `niche`, `nested_match`, `struct_variant`, `exhaustive_check`);
+`attributes` (fn attr prefix + `@no_mangle` bare names); concurrency (cluster
+10: `dynamic_spawn` → `atomics` → `concurrent`/`await` → `sync`/`select`/
+`parallel`/`mutex`/`channel`/`par_*`); the generics completion (nested
+instances in template bodies, structural unify, body-let substs,
+generic-struct methods → `genlist` 70, `vec_generic` 82, **`list.jtr` 95 —
+the first compiler-source dependency**, `strmap`, `intern`); **test mode**
+(cluster 12 — most ~2000-line diffs are `@test` files whose whole harness
+main differs; `emit_tests`/`test_main` unlocks them in one stroke); then the
+compiler sources themselves (`tokens` 614 → `lexer` 1439 → `parser` 4028 →
+`typeck`/`escape`/`cgen`) and R2-full. **Done:** the prelude + section
 skeleton, params/binops/calls, let (annotated + inferred), casts, distinct types,
 structs + struct methods, the whole flat **match** family (tagged switch, guarded
 if-chain, scalar if-chain, or-patterns), **generic-enum instances** (the first

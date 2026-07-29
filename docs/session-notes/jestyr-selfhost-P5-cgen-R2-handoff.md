@@ -406,6 +406,24 @@ prefixes + @no_mangle bare names), `option` 39/`niche` 59, `nested_match` 47,
 `struct_variant` 49; then the generics chain `genlist` 70 → `vec_generic` 82 → `list.jtr` 95
 (the first compiler-source dependency, needs nested-generic instance walking + body substs).
 
+### Increment 31 — fn-pointer types (`4df4411`, allowlist 65)
+
+**+`vec_alloc`, `alloc_vtable`, and `mem.jtr` as a FREE WIN** (the arena-allocator std module —
+a compiler-source dependency). Cluster 11's core: Fn types render as `JestyrFn_<sig>` in BOTH
+renderers (AST kind 9: `(op,a)`=(conv,TypeId) pairs in `tar`, `b`=ret_conv, `x`=ret; Checker
+kind 12: `(a,b)`=(conv,TyId) pairs in `tya`, `x`=ret) with the conv-tagged mangle
+`fn_<tag><ty>_…_ret_<ty>` (tags d/r/m/t/o via the shared `push_conv_tag`). `emit_fn_type_defs`
+scans the type arena in order (nested fn types have smaller ids → inner typedefs first),
+deduped, emitted between gen-forward-types and struct defs; a `mut`/`out` param renders `T*`
+(NO restrict — a real fn's ABI, so a pointer can hold `&some_fn`); empty params → `void`.
+`&some_fn` (Unary ref of a Name that resolves to a fn item) → `(&jestyr_<name>)`. A call whose
+callee's CHECKER type is kind 12 is an INDIRECT call — the disambiguate-by-field-type rule:
+callee emitted plainly, args by `&` for the fn TYPE's `mut`/`out` params — placed by TYPE
+before the Name/intrinsic dispatch, exactly like `emit_fn_ptr_invoke`. Deferred: generic
+placeholders (`fn(T)->T`) + monomorphized-signature typedef contributions.
+`fn_ptr.jtr` (10 lines) and `gen_vtable.jtr` (24) now wait ONLY on closures (capture-free
+`jestyr_lam_<id>` + fn-ptr coercion) and generic-struct instance defs.
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
