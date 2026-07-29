@@ -559,6 +559,35 @@ exposing the Checker's `dyn_coercions` side table from typeck.jtr first (the P4 
 add the `pub` flat arena right before the construct that reads it). That is the next
 increment's shape: typeck arena first, then the cgen sections.
 
+### Increment 36 — `dyn Trait` dispatch (allowlist 75)
+
+**+`dyn_dispatch.jtr`** — the first increment needing NEW typeck.jtr side-tables since bcalls
+(the P4 pattern: expose the `pub` flat arena right before the construct that reads it):
+
+- **typeck.jtr**: `pub dcalls` (3-tuples: call ExprId, method span — recorded in
+  `resolve_dyn_method`, which now takes the call id) and `pub dcoerce` (3-tuples: expr id,
+  trait span — `record_dcoerce` fires at the THREE expected-type sites: annotated-let init,
+  return-into-dyn-ret, call arg into a `dyn T` param; pass-through when the value is already
+  dyn/Unknown/Error; the does-not-implement error stays the reference's job).
+- **cgen.jtr sections**: `emit_dyn_typedefs` (dyn-USED traits — `trait_is_dyn` scans the type
+  arena for a written `dyn T` — SORTED BY NAME, selection sort + a new `str_lt`; per trait the
+  vtable struct of `void* self`-first fn-pointer slots in decl order + the
+  `{ void* data; const vtable* }` fat-pointer typedef; between result_defs and extern_protos)
+  and `emit_dyn_vtables` (per impl of a dyn trait, item order: a `void*`-erased shim per impl
+  method — receiver deref'd for by-value self, kept a pointer for `mut`/`out` self — calling
+  `jestyr_impl_<Trait>__<Key>__<m>`, then the `static const` vtable instance wired in
+  TRAIT-method order; after impl_protos, before spawn_runtime).
+- **Renderers**: AST TypeData kind 10 and Checker TyData kind 17 both render
+  `JestyrDyn_<Trait>` — dyn-typed params/lets fall out of the existing sig/let paths.
+- **Coercion wrap**: the FIRST check in `emit_expr` (before any kind dispatch) — a recorded
+  site emits `(JestyrDyn_T){ <data>, &jestyr_vt_T__<key> }`, key via the existing
+  `push_key_of_tyid`; a SCALAR value (prim except str/String/Builder, or a pointer — the
+  `is_scalar_ty` mirror) takes its address through a compound literal `&((cty){ v })`.
+  `Cg.dg` is the single-slot re-entrancy guard (save/restore) standing in for the
+  reference's `dyn_guard` set.
+- **Dyn call**: in the Field-callee block after bcalls — `d.vtable->m(d.data, args)`, the
+  receiver emitted ONCE into a buffer and reused.
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
