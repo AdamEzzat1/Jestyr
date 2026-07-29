@@ -243,6 +243,11 @@ fn emit_c_ty(mut sb: String, read p: parser.Parser, read src: str, tyid: i32) {
         push_ast_mangle(sb, p, src, tyid)
         return
     }
+    if t.kind == 10 {                                  // `dyn Trait`: the fat-pointer typedef
+        string_push(sb, "JestyrDyn_")
+        string_push(sb, src[t.x as usize .. t.y as usize])
+        return
+    }
     if t.kind == 7 {                                   // App `Ctor(args)`: `Jestyr_<ctor>__<args>`
         string_push(sb, "Jestyr_")
         string_push(sb, src[t.x as usize .. t.y as usize])
@@ -381,6 +386,11 @@ fn emit_ty_c(mut sb: String, read src: str, read c: typeck.Checker, tyid: i32) {
     if d.kind == 12 {                                          // Fn: its `JestyrFn_<sig>` typedef name
         string_push(sb, "JestyrFn_")
         push_ty_mangle(sb, src, c, tyid)
+        return
+    }
+    if d.kind == 17 {                                          // DynOpaque: `JestyrDyn_<Trait>`
+        string_push(sb, "JestyrDyn_")
+        string_push(sb, src[d.x as usize .. d.y as usize])
         return
     }
     if d.kind == 6 {                                           // GenStruct/GenEnum instance: `Jestyr_<ctor>__<args>`
@@ -721,6 +731,19 @@ fn index_in_range(read g: Cg, read p: parser.Parser, read src: str, base: i32, i
 // Threads `read c: typeck.Checker` — Field/Index are type-directed (`.len` on a `str` is a real C
 // field; `s[lo..hi]` on a `str` is a `jestyr_rt_substr` sub-view).
 fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, eid: i32) {
+    // A value the Checker recorded as coercing to `dyn Trait` wraps into the `{ data, vtable }`
+    // fat pointer FIRST — before any kind dispatch. `g.dg` guards the re-entrant emission of
+    // the underlying concrete value (mirrors the reference's `dyn_guard`).
+    if g.dg != eid {
+        var dci: usize = 0
+        for dci < list.len(i32, c.dcoerce) {
+            if list.get(i32, c.dcoerce, dci) == eid {
+                emit_dyn_coercion(sb, p, src, c, g, eid, list.get(i32, c.dcoerce, dci + 1), list.get(i32, c.dcoerce, dci + 2))
+                return
+            }
+            dci = dci + 3
+        }
+    }
     let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
     if e.kind == 29 {                                 // Str: emit the literal verbatim inside JSTR
         string_push(sb, "JSTR(")
@@ -1864,6 +1887,36 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_free(key)
             return
         }
+        // `d.m(args)` on a `dyn Trait` receiver (the Checker's `dcalls` records): a DYNAMIC
+        // call through the vtable slot — `d.vtable->m(d.data, args)`. The receiver emits
+        // ONCE into a buffer, reused for both `.vtable` and `.data`.
+        var dcb: i32 = 0 - 1
+        var dqi: usize = 0
+        for dqi < list.len(i32, c.dcalls) {
+            if list.get(i32, c.dcalls, dqi) == eid { dcb = dqi as i32 }
+            dqi = dqi + 3
+        }
+        if dcb >= 0 {
+            var recv: String = string_new()
+            emit_expr(recv, p, src, c, g, callee.a)
+            string_push(sb, string_view(recv))
+            string_push(sb, ".vtable->")
+            let dms: i32 = list.get(i32, c.dcalls, (dcb + 1) as usize)
+            let dme: i32 = list.get(i32, c.dcalls, (dcb + 2) as usize)
+            string_push(sb, src[dms as usize .. dme as usize])
+            string_push(sb, "(")
+            string_push(sb, string_view(recv))
+            string_push(sb, ".data")
+            var dai: i32 = 0
+            for dai < e.y {
+                string_push(sb, ", ")
+                emit_expr(sb, p, src, c, g, arg_at(p, e, dai))
+                dai = dai + 1
+            }
+            string_push(sb, ")")
+            string_free(recv)
+            return
+        }
     }
     // Invoking a *thin fn-pointer* VALUE — a local/param/field whose CHECKER type is `fn(…)`
     // (the "disambiguate by field type" rule: `a.alloc_fn(x)` is a pointer call because the
@@ -2594,7 +2647,7 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // `gfi` holds the collected generic-fn instance records ([fn item, argc, (kind,a,b) targ
 // triples…], variable length — walk with a cursor); `su` is the ACTIVE instance's
 // type-parameter substitution (5-tuples: tparam span + arg triple), read by `emit_su_ty`.
-struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32 }
+struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32, dg: i32 }
 
 // The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
 // (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
@@ -6759,6 +6812,268 @@ fn emit_fat_closure_c(mut sb: String, read p: parser.Parser, read src: str, read
     string_free(rets)
 }
 
+// ---- `dyn Trait` dispatch (mirrors `dyn_typedefs`/`dyn_vtables`/`emit_dyn_coercion` + the
+// `dyn_calls` lowering). A trait is dyn-USED iff some `dyn T` type is written anywhere; each
+// impl of such a trait gets `void*`-erased shims + a static vtable instance, and every value
+// the Checker recorded as coercing wraps into the `{ data, vtable }` fat pointer. ----
+
+fn trait_is_dyn(read p: parser.Parser, read src: str, ns: usize, ne: usize) -> bool {
+    var ti: usize = 0
+    for ti < list.len(parser.TypeData, p.ty) {
+        let t: parser.TypeData = list.get(parser.TypeData, p.ty, ti)
+        if t.kind == 10 {
+            if str_eq(src[t.x as usize .. t.y as usize], src[ns .. ne]) { return true }
+        }
+        ti = ti + 1
+    }
+    return false
+}
+
+// Lexicographic byte order on source text (the trait-typedef sort key).
+fn str_lt(read a: str, read b: str) -> bool {
+    var i: usize = 0
+    for i < a.len {
+        if i >= b.len { return false }
+        let ca: u8 = a[i]
+        let cb: u8 = b[i]
+        if ca < cb { return true }
+        if ca > cb { return false }
+        i = i + 1
+    }
+    return a.len < b.len
+}
+
+// A trait method's non-self, non-comptime params as `, <cty>[* restrict] j_<name>` (the shim
+// and vtable-slot signatures share this; mirrors `borrow_ptr_cty`).
+fn emit_dyn_params(mut sb: String, read p: parser.Parser, read src: str, pstart: i32, pcount: i32) {
+    var i: i32 = 0
+    for i < pcount {
+        let base: i32 = pstart + i * 7
+        if list.get(i32, p.iar, base as usize) == 0 and list.get(i32, p.iar, (base + 4) as usize) == 0 {
+            string_push(sb, ", ")
+            let pty: i32 = list.get(i32, p.iar, (base + 5) as usize)
+            if pty >= 0 { emit_c_ty(sb, p, src, pty) } else { string_push(sb, "int") }
+            let conv: i32 = list.get(i32, p.iar, (base + 1) as usize)
+            if conv == 2 or conv == 4 { string_push(sb, "* restrict") }
+            string_push(sb, " j_")
+            let ns: i32 = list.get(i32, p.iar, (base + 2) as usize)
+            let ne: i32 = list.get(i32, p.iar, (base + 3) as usize)
+            string_push(sb, src[ns as usize .. ne as usize])
+        }
+        i = i + 1
+    }
+}
+
+// The `dyn_typedefs` section: per dyn-used trait (SORTED BY NAME — the reference sorts), the
+// vtable struct (one `void* self`-first fn-pointer slot per trait method, decl order) and the
+// `{ void* data; const vtable* }` fat-pointer typedef; trailing blank iff any.
+fn emit_dyn_typedefs(mut sb: String, read p: parser.Parser, read src: str, read a: Allocator) {
+    var trs: List(i32) = list.make(i32, a)
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 6 {
+            if trait_is_dyn(p, src, it.x, it.y) { list.push(i32, trs, iid) }
+        }
+        r = r + 1
+    }
+    var i: usize = 0
+    for i < list.len(i32, trs) {                      // selection sort by name (the set is tiny)
+        var m: usize = i
+        var j: usize = i + 1
+        for j < list.len(i32, trs) {
+            let ta: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, trs, j) as usize)
+            let tb: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, trs, m) as usize)
+            if str_lt(src[ta.x .. ta.y], src[tb.x .. tb.y]) { m = j }
+            j = j + 1
+        }
+        if m != i {
+            let tmp: i32 = list.get(i32, trs, i)
+            list.set(i32, trs, i, list.get(i32, trs, m))
+            list.set(i32, trs, m, tmp)
+        }
+        i = i + 1
+    }
+    var k: usize = 0
+    for k < list.len(i32, trs) {
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, trs, k) as usize)
+        string_push(sb, "typedef struct {\n")
+        var mi2: i32 = 0
+        for mi2 < it.b {
+            let mb: i32 = it.a + mi2 * 7
+            string_push(sb, "    ")
+            let rty: i32 = list.get(i32, p.mar, (mb + 5) as usize)
+            if rty >= 0 { emit_c_ty(sb, p, src, rty) } else { string_push(sb, "void") }
+            string_push(sb, " (*")
+            let mns: i32 = list.get(i32, p.mar, mb as usize)
+            let mne: i32 = list.get(i32, p.mar, (mb + 1) as usize)
+            string_push(sb, src[mns as usize .. mne as usize])
+            string_push(sb, ")(void* self")
+            emit_dyn_params(sb, p, src, list.get(i32, p.mar, (mb + 2) as usize), list.get(i32, p.mar, (mb + 3) as usize))
+            string_push(sb, ");\n")
+            mi2 = mi2 + 1
+        }
+        string_push(sb, "} JestyrVtable_")
+        string_push(sb, src[it.x .. it.y])
+        string_push(sb, ";\n")
+        string_push(sb, "typedef struct { void* data; const JestyrVtable_")
+        string_push(sb, src[it.x .. it.y])
+        string_push(sb, "* vtable; } JestyrDyn_")
+        string_push(sb, src[it.x .. it.y])
+        string_push(sb, ";\n")
+        k = k + 1
+    }
+    if list.len(i32, trs) > 0 { string_push(sb, "\n") }
+    list.free(i32, trs)
+}
+
+// The `dyn_vtables` section: per impl of a dyn-used trait (item order), a `void*`-erased shim
+// per impl method (deref'd receiver for a by-value self, pointer for `mut`/`out` self) and a
+// `static const` vtable instance wired to the shims in TRAIT-method order.
+fn emit_dyn_vtables(mut sb: String, read p: parser.Parser, read src: str) {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let im: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if im.kind == 7 {
+            if trait_is_dyn(p, src, im.x as usize, im.y as usize) {
+                let tt: parser.TypeData = list.get(parser.TypeData, p.ty, im.a as usize)
+                let key: str = src[tt.start .. tt.end]     // a Name target's text IS the type key
+                var k: i32 = 0
+                for k < im.z {
+                    let fd: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, p.mar, (im.b + k) as usize) as usize)
+                    string_push(sb, "static ")
+                    if fd.z >= 0 { emit_c_ty(sb, p, src, fd.z) } else { string_push(sb, "void") }
+                    string_push(sb, " jestyr_vtshim_")
+                    string_push(sb, src[im.x as usize .. im.y as usize])
+                    string_push(sb, "__")
+                    string_push(sb, key)
+                    string_push(sb, "__")
+                    string_push(sb, src[fd.x .. fd.y])
+                    string_push(sb, "(void* self")
+                    emit_dyn_params(sb, p, src, fd.a, fd.b)
+                    string_push(sb, ") { ")
+                    var isret: bool = false
+                    if fd.z >= 0 {
+                        var rc: String = string_new()
+                        emit_c_ty(rc, p, src, fd.z)
+                        if !str_eq(string_view(rc), "void") { isret = true }
+                        string_free(rc)
+                    }
+                    if isret { string_push(sb, "return ") }
+                    string_push(sb, "jestyr_impl_")
+                    string_push(sb, src[im.x as usize .. im.y as usize])
+                    string_push(sb, "__")
+                    string_push(sb, key)
+                    string_push(sb, "__")
+                    string_push(sb, src[fd.x .. fd.y])
+                    string_push(sb, "(")
+                    // `void* self` back to the concrete receiver: deref for by-value self
+                    var self_ptr: bool = false
+                    if fd.b > 0 {
+                        if list.get(i32, p.iar, (fd.a + 4) as usize) == 1 {
+                            let sconv: i32 = list.get(i32, p.iar, (fd.a + 1) as usize)
+                            if sconv == 2 or sconv == 4 { self_ptr = true }
+                        }
+                    }
+                    if self_ptr { string_push(sb, "(") } else { string_push(sb, "*(") }
+                    emit_c_ty(sb, p, src, im.a)
+                    string_push(sb, "*)self")
+                    var pi: i32 = 0
+                    for pi < fd.b {
+                        let pb: i32 = fd.a + pi * 7
+                        if list.get(i32, p.iar, pb as usize) == 0 and list.get(i32, p.iar, (pb + 4) as usize) == 0 {
+                            string_push(sb, ", j_")
+                            let pns: i32 = list.get(i32, p.iar, (pb + 2) as usize)
+                            let pne: i32 = list.get(i32, p.iar, (pb + 3) as usize)
+                            string_push(sb, src[pns as usize .. pne as usize])
+                        }
+                        pi = pi + 1
+                    }
+                    string_push(sb, "); }\n")
+                    k = k + 1
+                }
+                // the vtable instance, fields in TRAIT-method order
+                string_push(sb, "static const JestyrVtable_")
+                string_push(sb, src[im.x as usize .. im.y as usize])
+                string_push(sb, " jestyr_vt_")
+                string_push(sb, src[im.x as usize .. im.y as usize])
+                string_push(sb, "__")
+                string_push(sb, key)
+                string_push(sb, " = { ")
+                var tr: i32 = 0
+                var tit: i32 = 0 - 1
+                for tr < list.len(i32, p.roots) {
+                    let tid2: i32 = list.get(i32, p.roots, tr)
+                    let t2: parser.ItemData = list.get(parser.ItemData, p.it, tid2 as usize)
+                    if t2.kind == 6 {
+                        if str_eq(src[t2.x .. t2.y], src[im.x as usize .. im.y as usize]) { tit = tid2 }
+                    }
+                    tr = tr + 1
+                }
+                if tit >= 0 {
+                    let t2: parser.ItemData = list.get(parser.ItemData, p.it, tit as usize)
+                    var tm: i32 = 0
+                    for tm < t2.b {
+                        if tm > 0 { string_push(sb, ", ") }
+                        let mb2: i32 = t2.a + tm * 7
+                        string_push(sb, "jestyr_vtshim_")
+                        string_push(sb, src[im.x as usize .. im.y as usize])
+                        string_push(sb, "__")
+                        string_push(sb, key)
+                        string_push(sb, "__")
+                        let m2s: i32 = list.get(i32, p.mar, mb2 as usize)
+                        let m2e: i32 = list.get(i32, p.mar, (mb2 + 1) as usize)
+                        string_push(sb, src[m2s as usize .. m2e as usize])
+                        tm = tm + 1
+                    }
+                }
+                string_push(sb, " };\n")
+            }
+        }
+        r = r + 1
+    }
+}
+
+// A recorded coercion site: wrap the concrete value into the trait's fat pointer. A SCALAR
+// value (prim except str/String/Builder, or a pointer — mirrors `is_scalar_ty`) has no
+// address, so it wraps through a compound literal.
+fn emit_dyn_coercion(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, eid: i32, tns: i32, tne: i32) {
+    let at: i32 = list.get(i32, c.et, eid as usize)
+    let ad: typeck.TyData = list.get(typeck.TyData, c.tys, at as usize)
+    var scalar: bool = false
+    if ad.kind == 2 {
+        if ad.x != 14 and ad.x != 17 and ad.x != 18 { scalar = true }
+    }
+    if ad.kind == 3 { scalar = true }
+    let saved: i32 = g.dg
+    g.dg = eid
+    var inner: String = string_new()
+    emit_expr(inner, p, src, c, g, eid)
+    g.dg = saved
+    string_push(sb, "(JestyrDyn_")
+    string_push(sb, src[tns as usize .. tne as usize])
+    string_push(sb, "){ ")
+    if scalar {
+        string_push(sb, "&((")
+        emit_ty_c(sb, src, c, at)
+        string_push(sb, "){ ")
+        string_push(sb, string_view(inner))
+        string_push(sb, " })")
+    } else {
+        string_push(sb, "&(")
+        string_push(sb, string_view(inner))
+        string_push(sb, ")")
+    }
+    string_push(sb, ", &jestyr_vt_")
+    string_push(sb, src[tns as usize .. tne as usize])
+    string_push(sb, "__")
+    push_key_of_tyid(sb, src, c, at)
+    string_push(sb, " }")
+    string_free(inner)
+}
+
 // ---- concurrency: spawn/concurrent (mirrors `collect_spawns`/`spawn_runtime`/
 // `emit_concurrent`/`emit_spawn_create`/`emit_dyn_spawn`). A spawn site is the INNER call
 // expr of `spawn f(args)`; its REFERENCE ExprId names the arg-pack struct `_jsp_<id>` and
@@ -7352,7 +7667,7 @@ fn emit_main_wrapper(mut sb: String, read p: parser.Parser, read src: str) {
 // `"\n"` pushes stand in for the reference's unconditionally-blank sections that are empty for a
 // program with no aggregates (closure_types, method_protos, consts) plus the guarded no-ops.
 fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator) {
-    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: list.make(i32, a), vtf: 0, gfi: list.make(i32, a), su: list.make(i32, a), cls: list.make(i32, a), ccx: list.make(i32, a), cca: list.make(i32, a), caps: list.make(i32, a), gsi: list.make(i32, a), sps: list.make(i32, a), dspawn: false, th: list.make(i32, a), thf: 0 }
+    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: list.make(i32, a), vtf: 0, gfi: list.make(i32, a), su: list.make(i32, a), cls: list.make(i32, a), ccx: list.make(i32, a), cca: list.make(i32, a), caps: list.make(i32, a), gsi: list.make(i32, a), sps: list.make(i32, a), dspawn: false, th: list.make(i32, a), thf: 0, dg: 0 - 1 }
     collect_spawns(g, p, src)                        // spawn sites (gates the pthread prelude)
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     collect_method_instances(g, p, src, c)           // (struct item, method fn item) pairs, first-seen
@@ -7372,13 +7687,14 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
     emit_array_defs(sb, p, src, c)                   // array typedefs (after slices)
     emit_genref_defs(sb, p, src, c)                  // genref typedefs (after arrays)
     emit_result_defs(sb, p, src)
-    // flush_def_capture / dyn_typedefs: no-ops here (no by-value dep reorder needed).
+    // flush_def_capture: a no-op here (no by-value dep reorder needed).
+    emit_dyn_typedefs(sb, p, src, a)                 // dyn-trait vtable + fat-pointer typedefs
     emit_extern_protos(sb, p, src)                   // `extern "c"` prototypes (bare names)
     emit_closure_types(sb, p, src, c, g)             // env + {call, env} typedefs + unconditional blank
     emit_fn_protos(sb, p, src, c, g)
     emit_method_protos(sb, p, src, c, g)             // method protos + unconditional trailing blank
     emit_impl_protos(sb, p, src)                     // trait-impl protos + CONDITIONAL trailing blank
-    // dyn_vtables: empty until dyn lands.
+    emit_dyn_vtables(sb, p, src)                     // vtable shims + static instances
     emit_spawn_runtime(sb, p, src, c, g)             // spawn arg-pack structs + trampolines
     emit_consts(sb, p, src, c, g)                    // consts + its unconditional trailing blank
     emit_closure_fns(sb, p, src, c, g)               // lifted `jestyr_lam_<id>` fns before the free fns
