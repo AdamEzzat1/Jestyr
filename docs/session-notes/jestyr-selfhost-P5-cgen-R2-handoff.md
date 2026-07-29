@@ -630,6 +630,48 @@ That is the generics-completion cluster (with vec_generic 61, genlist 72, core 7
 suppressing template struct-instances with unresolved args. The biggest remaining infra
 piece before the compiler sources themselves.
 
+### Increment 39 — GENERICS COMPLETION: instance bodies + subst-aware everything (allowlist 83)
+
+**+`vec_generic`, `genlist`, `sync` — the cluster wall is broken.** The four deferred cluster-6
+pieces, plus blanket-Drop monomorphization:
+
+- **Instance-BODY walking** (`collect_gfn_instances`): when a drained record survives dedup,
+  its template body is walked for nested template calls, and each NEW record's tparam-typed
+  args are REWRITTEN through the enclosing record's bindings (`remap_targs` +
+  `tparam_index_of`): a kind-0 span or kind-1 Opaque naming an outer tparam takes the outer
+  binding triple — `load_cell(T, …)` inside `chan_recv__i64` records as `load_cell__i64`.
+  Dedup-on-pop bounds recursion; LIFO gives depth-first drain like the reference stack.
+- **Call-site mangles under `g.su`** (`emit_generic_call`): a comptime targ that is a tparam
+  Name, or a bracket binding whose Checker type is Opaque, resolves through the ACTIVE
+  substitution before mangling — so the template body's call names the resolved instance.
+- **Subst-aware body types**: `emit_type_arg_cty` (alloc/realloc/size_of type args) got c+g
+  and the su_slot check (`sizeof(T)` under T=i32 -> `sizeof(int32_t)`); Cast targets and
+  GenStructLit types were already su-routed (`emit_su_ty`/`emit_su_tyid` from the earlier part
+  of this increment); `emit_return` gained the For arm (a loop in return position emits as a
+  statement — sync's spin-loop `chan_recv` body). A `_plain` variant keeps the one
+  section-level genref call site Cg-free.
+- **`collect_gstruct_instances` REWRITTEN to reference order** (and moved AFTER
+  collect_gfn_instances — it reads `g.gfi`): (a) SYNTAX mentions only (GenStructLits, let
+  annotations, cast targets, param/ret Apps) in non-generic fns + ALL impl methods, item
+  order — an inferred call type contributes NOTHING (the old c.et scan over-collected and
+  got genlist's f64/i32 order wrong); then (b) each gfn instance's sig+body under its armed
+  substitution (record order = LIFO drain order — that's why `List(f64)` lands before
+  `List(i32)`). Keys are su-rendered names, `?`-rejected, resolved back to concrete Checker
+  TyIds (`gsi_add_key`) since every gsi consumer is TyId-based. `arm_record_su` factored out
+  of emit_gfn_sig for the collector to reuse.
+- **Blanket `impl[T] Drop for Ctor(T)`** (mirrors `emit_generic_drop_methods`): per gsi
+  instance with a matching generic Drop impl — proto in impl_protos (shared conditional
+  blank), def LAST in impl_defs (reference order), sig
+  `void jestyr_impl_Drop__<key>__drop(<cty>* restrict j_self)` where `<key>` is the SANITIZED
+  ty_key display (`Vec(i32)` -> `Vec_i32_`, `push_ty_key_safe`; `(`/`)` -> `_`, `, ` -> `__`).
+  Body under (impl tparam -> instance first arg). Drop REGISTRATION: a kind-6 local with a
+  covering blanket impl encodes `-2 - TyId` in the ds type-span slot; `emit_local_drop`
+  decodes the sentinel into the direct impl call. `c` threaded through
+  emit_local_drop/drop_scope_exit_emit/emit_all_drops for the key render.
+- gsi concreteness gate (`tyid_concrete`) kills the `Jestyr_Vec__?` template ghost.
+- **Remaining in the cluster:** generic-struct METHODS (`Work::Method` — genmethods 64,
+  methods 66), then core.jtr 76 and list.jtr 95 (the first compiler-source dependency).
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
