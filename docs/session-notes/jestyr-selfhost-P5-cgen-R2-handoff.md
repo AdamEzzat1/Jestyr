@@ -806,6 +806,48 @@ What landed:
   in-language multi-module (imports/`#line`/module merge inside cgen.jtr) is now optional
   polish — the fixed point does not need it.
 
+### Increment 43 — TEST MODE: `jestyrc test` parity — WORKSTREAM P IS COMPLETE
+
+**The last P item.** cgen.jtr now emits the reference's full test surface, corpus-wide
+byte-identical on the first run (the mode's reference surface is compact — increment-by-
+transcription, no convergence loop needed):
+
+- **The mode in the port**: `Cg.tmode` gates the prelude's `#include <time.h>` (after the
+  pthread gate, before the blank) and swaps `emit_main_wrapper` for `emit_test_main` — the
+  transcribed `test_main`: count + `running N test(s)`, per-`@test`
+  `printf("test <t> ... "); fflush(stdout);` + the ok/FAILED tally, per-`@bench` the
+  `clock_t` timing block, the `\nresult: %d passed; %d failed` tail, exit `_failed == 0 ?
+  0 : 1`. Tests then benches, two passes, source order each — a fn with BOTH attrs lands in
+  both (reference parity). `runnable` ≡ `!fn_is_template` for roots-level fns (no `self` at
+  top level, so the port's template test covers both reference predicate halves);
+  `@no_mangle` call names stay bare (`push_test_call`).
+- **Name filtering at CODEGEN** (the `jestyrc test <substr>` half): `test_name_passes`
+  (empty filter = everything, `contains` otherwise) applied in the count AND the runner
+  loops, so the baked `running N test(s)` equals the runner count — an empty filter is
+  byte-for-byte the unfiltered harness, exactly `emit_tests_filtered`.
+- **`--list` parity** (`list_tests`): `emit_test_list` — one `test <name>`/`bench <name>`
+  line per runnable item in SOURCE order interleaved (a single pass, unlike the harness's
+  tests-then-benches split), filter-narrowed. The reference's empty-list stderr note is not
+  ported (the golden compares stdout).
+- **CLI**: `jc1 <file>` normal C; `jc1 <file> test [substr]` harness C; `jc1 <file> list
+  [substr]` the list. (The reference CLI spells these `jestyrc test [--list] <file>
+  [substr]` — the port's flat argv keeps the driver trivial; the GOLDEN is emission parity,
+  not argv parsing.)
+- **Golden** `jestyr_cgen_test_mode_matches_reference` (c-oracle): all 130 corpus files'
+  TEST-mode C byte-identical vs `emit_tests` (a no-test file still emits the
+  `running 0 test(s)` harness, so the mode is pinned corpus-wide); plus, on
+  `tests_demo.jtr`: the FILTERED harness (`test add` vs `emit_tests_filtered(Some("add"))`),
+  `--list` vs `cgen::list_tests`, and the harness RUN end-to-end through gcc (2 passed,
+  bench line, exit 0). `selfhost_fixpoint_full` gained a test-mode probe: jc2 ≡ jc1 on
+  `tests_demo.jtr test` too — the self-compiled compiler carries the whole test surface.
+- The concat golden re-converged untouched at 25,931 lines (the compiler now compiles its
+  own test-mode emitter through itself).
+
+**WORKSTREAM P IS COMPLETE.** Everything the roadmap scoped — lexer, parser, typeck,
+escape, cgen (all modes), and the self-hosting fixed point — is byte-exact and green.
+Optional follow-ons only: in-language multi-module (K polish), `emit-c --show-drops`
+parity, and attest/manifest tooling in the ported compiler (O).
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
