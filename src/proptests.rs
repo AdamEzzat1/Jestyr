@@ -8122,6 +8122,44 @@ mod c_oracle {
         );
     }
 
+    /// **Bootstrap seed.** `bootstrap/jestyr_seed.c` is the committed self-emitted C of the
+    /// flattened compiler (`bootstrap/jestyr_flat.jtr`): building Jestyr from scratch then
+    /// needs only a C compiler, never Rust — gcc builds the seed into `jc`, and `jc
+    /// bootstrap/jestyr_flat.jtr` must reproduce the seed byte-for-byte (the committed
+    /// fixed point; see bootstrap/README.md). This test is the DRIFT GUARD: it regenerates
+    /// both artifacts from the live sources and asserts the committed copies are current.
+    /// Run with `REFRESH_SEED=1` to rewrite them after a compiler change.
+    #[cfg(feature = "selfhost-fixpoint")]
+    #[test]
+    fn bootstrap_seed_is_current() {
+        // LF-normalized up front: the flatten carries the checked-out sources' line endings
+        // (CRLF under autocrlf), but the committed pair must be self-consistent — the seed
+        // is generated FROM the normalized flat, exactly what a from-scratch bootstrapper
+        // feeds back through `jc`.
+        let concat = flatten_selfhost_concat().replace("\r\n", "\n");
+        let jc1 = build_exe("examples/std/cgen.jtr");
+        let path = std::env::temp_dir().join("jestyr_seed_src.jtr");
+        std::fs::write(&path, &concat).unwrap();
+        let out = Command::new(&jc1).arg(&path).output().unwrap();
+        assert!(out.status.success(), "jc1 failed on the flattened compiler");
+        let c1 = String::from_utf8(out.stdout).unwrap().replace("\r\n", "\n");
+        if std::env::var("REFRESH_SEED").is_ok() {
+            std::fs::create_dir_all("bootstrap").unwrap();
+            std::fs::write("bootstrap/jestyr_flat.jtr", &concat).unwrap();
+            std::fs::write("bootstrap/jestyr_seed.c", &c1).unwrap();
+            eprintln!("bootstrap seed REFRESHED ({} lines of C)", c1.lines().count());
+        }
+        let flat = std::fs::read_to_string("bootstrap/jestyr_flat.jtr")
+            .expect("bootstrap/jestyr_flat.jtr missing — run with REFRESH_SEED=1")
+            .replace("\r\n", "\n");
+        let seed = std::fs::read_to_string("bootstrap/jestyr_seed.c")
+            .expect("bootstrap/jestyr_seed.c missing — run with REFRESH_SEED=1")
+            .replace("\r\n", "\n");
+        assert!(flat == concat, "bootstrap/jestyr_flat.jtr is STALE — rerun with REFRESH_SEED=1");
+        assert!(seed == c1, "bootstrap/jestyr_seed.c is STALE — rerun with REFRESH_SEED=1");
+        eprintln!("bootstrap seed is current ({} lines of C)", c1.lines().count());
+    }
+
     /// **R2 fixpoint — the subset milestone.** `jc1` = the Rust compiler builds the
     /// Jestyr-written back end (`cgen.jtr`, which imports the Jestyr parser + typeck) into a
     /// native exe. For every allowlisted subset program P, `jc1` compiles P → C; that C must
