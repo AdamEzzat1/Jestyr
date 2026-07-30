@@ -7718,6 +7718,248 @@ mod c_oracle {
         eprintln!("cgen golden: {checked} file(s)' emitted C byte-identical");
     }
 
+    /// The self-hosting module closure, in the loader's DFS item order for
+    /// `examples/std/cgen.jtr` (each module's imports precede it, diamonds memoized —
+    /// exactly the order `module::load` merges their items in).
+    const SELFHOST_MODULES: &[&str] =
+        &["mem", "intern", "fs", "env", "list", "tokens", "parser", "typeck", "cgen"];
+
+    /// Flatten the multi-module Jestyr compiler into ONE single-file program — the
+    /// R2-full "concatenated-source build". The loader already compiles a program as a
+    /// single translation unit (one shared arena, one concatenated source buffer;
+    /// escape + cgen never learn there was more than one file), so a faithful flatten
+    /// is the module semantics minus typeck's visibility checks — vacuous for a
+    /// program that already typechecks. The transform, token-level (comments and
+    /// strings are untouched because the lexer skips/atomizes them):
+    ///  1. drop every `import` declaration;
+    ///  2. erase module qualifiers: `binding.x` → `x` (an `Ident` in this module's
+    ///     import-binding set, followed by `.`, not itself preceded by `.`);
+    ///  3. rename top-level names defined in more than one module to `name__<module>`
+    ///     — at the definition, at bare uses in the defining module, and at qualified
+    ///     uses everywhere (via step 2's rewrite).
+    fn flatten_selfhost_concat() -> String {
+        use crate::ast::Item;
+        use crate::token::TokenKind;
+        use std::collections::HashMap;
+        // Pass 1: each module's source + its top-level definition names (real parser —
+        // struct methods and impl fns are not top-level and can't collide).
+        let mut srcs: Vec<String> = Vec::new();
+        let mut defs: Vec<Vec<String>> = Vec::new();
+        for m in SELFHOST_MODULES {
+            let src = std::fs::read_to_string(format!("examples/std/{m}.jtr")).unwrap();
+            let (tokens, ld) = crate::lexer::Lexer::new(&src).tokenize();
+            assert!(ld.is_empty(), "lex errors in {m}.jtr");
+            let (ast, _pd) = crate::parser::Parser::new(&src, tokens).parse();
+            let names: Vec<String> = ast
+                .items
+                .iter()
+                .filter_map(|it| match it {
+                    Item::Fn(f) => Some(f.name.name.clone()),
+                    Item::Enum(e) => Some(e.name.name.clone()),
+                    Item::Const(c) => Some(c.name.name.clone()),
+                    Item::Distinct(d) => Some(d.name.name.clone()),
+                    Item::Trait(t) => Some(t.name.name.clone()),
+                    Item::Extern(e) => Some(e.name.name.clone()),
+                    Item::Struct { name, .. } => Some(name.name.clone()),
+                    Item::Impl(_) | Item::Import(_) => None,
+                })
+                .collect();
+            srcs.push(src);
+            defs.push(names);
+        }
+        // Cross-module collisions → per-module rename map (module name, item name) → new name.
+        let mut seen_in: HashMap<&str, usize> = HashMap::new();
+        for names in &defs {
+            for n in names {
+                *seen_in.entry(n.as_str()).or_insert(0) += 1;
+            }
+        }
+        let mut renames: HashMap<(String, String), String> = HashMap::new();
+        for (mi, m) in SELFHOST_MODULES.iter().enumerate() {
+            for n in &defs[mi] {
+                if seen_in[n.as_str()] > 1 {
+                    renames.insert(((*m).to_string(), n.clone()), format!("{n}__{m}"));
+                }
+            }
+        }
+        // Pass 2: rewrite each module and concatenate (loader order = merged item order).
+        let mut out = String::new();
+        for (mi, m) in SELFHOST_MODULES.iter().enumerate() {
+            let src = &srcs[mi];
+            let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+            let toks: Vec<_> = tokens.iter().filter(|t| t.kind != TokenKind::Eof).collect();
+            // (start, end, replacement) edits, collected in source order.
+            let mut edits: Vec<(usize, usize, String)> = Vec::new();
+            let mut bindings: HashMap<String, String> = HashMap::new();
+            let mut i = 0;
+            while i < toks.len() {
+                let t = toks[i];
+                if t.kind == TokenKind::Import {
+                    // `import "path"` [`as` alias] [`= "hash"`] — record the binding, drop the decl.
+                    assert_eq!(toks[i + 1].kind, TokenKind::Str, "import path in {m}.jtr");
+                    let seg = src[toks[i + 1].span.range()]
+                        .trim_matches('"')
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap()
+                        .to_string();
+                    let mut j = i + 2;
+                    let mut binding = seg.clone();
+                    if j < toks.len() && toks[j].kind == TokenKind::As {
+                        binding = src[toks[j + 1].span.range()].to_string();
+                        j += 2;
+                    }
+                    if j < toks.len() && toks[j].kind == TokenKind::Eq {
+                        j += 2; // pinned hash: `= "<sha256>"`
+                    }
+                    assert!(
+                        SELFHOST_MODULES.contains(&seg.as_str()),
+                        "{m}.jtr imports `{seg}` which is outside the self-host closure"
+                    );
+                    let mut end = toks[j - 1].span.end as usize;
+                    if src.as_bytes().get(end) == Some(&b'\n') {
+                        end += 1; // take the decl's own line break with it
+                    }
+                    edits.push((t.span.start as usize, end, String::new()));
+                    bindings.insert(binding, seg);
+                    i = j;
+                    continue;
+                }
+                if t.kind == TokenKind::Ident {
+                    let text = &src[t.span.range()];
+                    let prev_dot = i > 0 && toks[i - 1].kind == TokenKind::Dot;
+                    let next_dot = i + 1 < toks.len() && toks[i + 1].kind == TokenKind::Dot;
+                    if !prev_dot && next_dot && bindings.contains_key(text) {
+                        // `binding.x` — erase the qualifier; rename x if its definition collided.
+                        // Unambiguous in this closure: no local named like a binding is ever
+                        // field-accessed (the only shared name, `fs`, binds scalar ints).
+                        let x = toks[i + 2];
+                        assert_eq!(x.kind, TokenKind::Ident, "qualified member in {m}.jtr");
+                        let target = bindings[text].clone();
+                        let xt = src[x.span.range()].to_string();
+                        edits.push((t.span.start as usize, x.span.start as usize, String::new()));
+                        if let Some(nn) = renames.get(&(target, xt)) {
+                            edits.push((x.span.start as usize, x.span.end as usize, nn.clone()));
+                        }
+                        i += 3;
+                        continue;
+                    }
+                    if !prev_dot {
+                        if let Some(nn) = renames.get(&((*m).to_string(), text.to_string())) {
+                            edits.push((t.span.start as usize, t.span.end as usize, nn.clone()));
+                        }
+                    }
+                }
+                i += 1;
+            }
+            let mut rewritten = String::with_capacity(src.len());
+            let mut cursor = 0usize;
+            for (s, e, rep) in edits {
+                rewritten.push_str(&src[cursor..s]);
+                rewritten.push_str(&rep);
+                cursor = e;
+            }
+            rewritten.push_str(&src[cursor..]);
+            out.push_str(&rewritten);
+            out.push('\n'); // keep regions disjoint, like the loader
+        }
+        out
+    }
+
+    /// **R2-full golden.** The flattened single-file compiler (see
+    /// [`flatten_selfhost_concat`]) must (a) be a diagnostic-free program under the
+    /// Rust reference — validating the flatten transform itself — and (b) lower
+    /// through the Jestyr-written back end to C **byte-identical** to the
+    /// reference's. This is the concat program the jc2≡jc3 fixed point runs on.
+    #[test]
+    fn jestyr_cgen_concat_matches_reference() {
+        let concat = flatten_selfhost_concat();
+        let path = std::env::temp_dir().join("jestyr_selfhost_concat.jtr");
+        std::fs::write(&path, &concat).unwrap();
+        // (a) the concat is a valid program by the reference's own front end.
+        let (tokens, ld) = crate::lexer::Lexer::new(&concat).tokenize();
+        assert!(ld.is_empty(), "lex errors in the flattened compiler");
+        let (ast, pd) = crate::parser::Parser::new(&concat, tokens).parse();
+        assert!(
+            !pd.iter().any(|d| d.is_error()),
+            "parse errors in the flattened compiler: {:?}",
+            pd.iter().filter(|d| d.is_error()).take(3).collect::<Vec<_>>()
+        );
+        let (info, td) = crate::typeck::check(&ast);
+        assert!(
+            !td.iter().any(|d| d.is_error()),
+            "typeck errors in the flattened compiler: {:?}",
+            td.iter().filter(|d| d.is_error()).take(3).collect::<Vec<_>>()
+        );
+        assert!(
+            !crate::escape::check(&ast, &info).iter().any(|d| d.is_error()),
+            "escape errors in the flattened compiler"
+        );
+        // (b) byte-identical lowering through the Jestyr back end.
+        let exe = build_exe("examples/std/cgen.jtr");
+        let got = jestyr_cgen_dump(&exe, path.to_str().unwrap());
+        let want = rust_cgen_dump(&concat);
+        if got != want && std::env::var("DUMP_DIVERGE").is_ok() {
+            let first = got.iter().zip(want.iter()).position(|(a, b)| a != b).unwrap_or(0);
+            let lo = first.saturating_sub(2);
+            eprintln!("=== concat (first diff at line {first}) ===");
+            eprintln!("GOT : {:?}", &got[lo..(lo + 12).min(got.len())]);
+            eprintln!("WANT: {:?}", &want[lo..(lo + 12).min(want.len())]);
+        }
+        assert!(got == want, "Jestyr cgen diverged from the reference on the flattened compiler");
+        eprintln!("concat golden: {} lines of C byte-identical", got.len());
+    }
+
+    /// **R2 fixpoint — FULL.** The self-hosting proof. `jc1` = the Rust compiler
+    /// builds the Jestyr-written compiler (multi-module). `C1` = jc1 lowering its own
+    /// flattened source (`flatten_selfhost_concat` — semantically the same program).
+    /// `jc2` = gcc builds C1. `C2` = jc2 lowering the same source. **`C1 ≡ C2`
+    /// byte-for-byte is the fixed point**: the compiler, compiled by itself,
+    /// reproduces its own compilation exactly — so jc3 ≡ jc2 by induction.
+    #[cfg(feature = "selfhost-fixpoint")]
+    #[test]
+    fn selfhost_fixpoint_full() {
+        let concat = flatten_selfhost_concat();
+        let dir = std::env::temp_dir();
+        let path = dir.join("jestyr_selfhost_concat.jtr");
+        std::fs::write(&path, &concat).unwrap();
+        let jc1 = build_exe("examples/std/cgen.jtr");
+        // C1 = jc1(concat).
+        let out = Command::new(&jc1).arg(&path).output().unwrap();
+        assert!(out.status.success(), "jc1 failed on the flattened compiler");
+        let c1 = String::from_utf8(out.stdout).unwrap().replace("\r\n", "\n");
+        // jc2 = gcc(C1), with the same recursion headroom jc1 got.
+        let cc = crate::find_c_compiler().expect("the fixpoint needs a C compiler on PATH");
+        let cfile = dir.join("jestyr_selfhost_jc2.c");
+        let jc2 = dir.join(format!("jestyr_selfhost_jc2{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&cfile, &c1).unwrap();
+        let mut cmd = Command::new(&cc);
+        cmd.args(crate::CC_FLAGS);
+        #[cfg(windows)]
+        cmd.arg("-Wl,--stack,67108864");
+        if c1.contains("pthread") {
+            cmd.arg("-pthread");
+        }
+        assert!(
+            cmd.arg("-o").arg(&jc2).arg(&cfile).status().unwrap().success(),
+            "gcc failed on jc1's C for the flattened compiler"
+        );
+        // C2 = jc2(concat). The fixed point: C2 ≡ C1.
+        let out2 = Command::new(&jc2).arg(&path).output().unwrap();
+        assert!(out2.status.success(), "jc2 failed on the flattened compiler");
+        let c2 = String::from_utf8(out2.stdout).unwrap().replace("\r\n", "\n");
+        assert!(c1 == c2, "FIXED POINT BROKEN: jc2's C for the compiler differs from jc1's");
+        // jc2 must also BE jc1 on unrelated input (same compiler, not just a quine).
+        let probe = "examples/hello.jtr";
+        let a = Command::new(&jc1).arg(probe).output().unwrap();
+        let b = Command::new(&jc2).arg(probe).output().unwrap();
+        assert_eq!(a.stdout, b.stdout, "jc1 and jc2 disagree on {probe}");
+        eprintln!(
+            "SELF-HOSTING FIXED POINT: jc2 ≡ jc1 on the compiler's own {} lines of C",
+            c1.lines().count()
+        );
+    }
+
     /// **R2 fixpoint — the subset milestone.** `jc1` = the Rust compiler builds the
     /// Jestyr-written back end (`cgen.jtr`, which imports the Jestyr parser + typeck) into a
     /// native exe. For every allowlisted subset program P, `jc1` compiles P → C; that C must

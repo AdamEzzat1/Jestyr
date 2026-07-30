@@ -4098,13 +4098,48 @@ fn needs_drop_name(read p: parser.Parser, read src: str, ns: i32, ne: i32) -> bo
     return false
 }
 
-// `needs_drop` for an AST type annotation: only a bare Name type can be droppable (pointers,
-// slices, arrays, refs are indirection or non-owning — the reference reaches the same `false`).
+// `needs_drop` for an AST type annotation: a bare Name type, or a generic application
+// `Ctor(args)` covered by a blanket `impl[T] Drop for Ctor(T)` (pointers, slices, arrays, refs
+// are indirection or non-owning — the reference reaches the same `false`).
 fn needs_drop_ast_ty(read p: parser.Parser, read src: str, tyid: i32) -> bool {
     if tyid < 0 { return false }
     let t: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
     if t.kind == 0 { return needs_drop_name(p, src, t.start as i32, t.end as i32) }
+    if t.kind == 7 { return generic_drop_impl_of(p, src, t.x as usize, t.y as usize) >= 0 }
     return false
+}
+
+// The sanitized `ty_key` display of an AST-written type (the annotation-side mirror of
+// `push_ty_key_safe`): a Name is already a C identifier; `Ctor(a, b)` -> `Ctor_a__b_`.
+fn push_ast_key_safe(mut sb: String, read p: parser.Parser, read src: str, tyid: i32) {
+    if tyid < 0 { string_push(sb, "_")  return }
+    let t: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
+    if t.kind == 0 { string_push(sb, src[t.start .. t.end])  return }
+    if t.kind == 7 {
+        string_push(sb, src[t.x as usize .. t.y as usize])
+        string_push(sb, "_")
+        var i: i32 = 0
+        for i < t.a {
+            if i > 0 { string_push(sb, "__") }
+            push_ast_key_safe(sb, p, src, list.get(i32, p.tar, (t.op + i) as usize))
+            i = i + 1
+        }
+        string_push(sb, "_")
+        return
+    }
+    string_push(sb, "_")
+}
+
+// Emit the drop call for a field/payload whose AST type is a generic application: its
+// monomorphized blanket impl IS the drop (the reference's GenStruct arm of `emit_drop_place` —
+// no field recursion, `aggregate_drop_fields` is Named-only).
+fn emit_app_drop(mut sb: String, read p: parser.Parser, read src: str, read place: str, tyid: i32, depth: i32) {
+    indent(sb, depth)
+    string_push(sb, "jestyr_impl_Drop__")
+    push_ast_key_safe(sb, p, src, tyid)
+    string_push(sb, "__drop(&")
+    string_push(sb, place)
+    string_push(sb, ");\n")
 }
 
 // Emit drop glue for the value at C lvalue `place` of the named type `src[tns..tne]`: its own
@@ -4136,7 +4171,11 @@ fn emit_drop_place(mut sb: String, read p: parser.Parser, read src: str, read pl
                     string_push(cp, place)
                     string_push(cp, ".j_")
                     string_push(cp, src[list.get(i32, p.mar, (mb + 2) as usize) as usize .. list.get(i32, p.mar, (mb + 3) as usize) as usize])
-                    emit_drop_place(sb, p, src, string_view(cp), ftd.start as i32, ftd.end as i32, depth)
+                    if ftd.kind == 7 {
+                        emit_app_drop(sb, p, src, string_view(cp), fty, depth)
+                    } else {
+                        emit_drop_place(sb, p, src, string_view(cp), ftd.start as i32, ftd.end as i32, depth)
+                    }
                     string_free(cp)
                 }
             }
@@ -4182,7 +4221,11 @@ fn emit_drop_place(mut sb: String, read p: parser.Parser, read src: str, read pl
                         string_push(cp, vname)
                         string_push(cp, ".j_")
                         string_push(cp, src[list.get(i32, p.ear, fb as usize) as usize .. list.get(i32, p.ear, (fb + 1) as usize) as usize])
-                        emit_drop_place(sb, p, src, string_view(cp), ftd.start as i32, ftd.end as i32, depth)
+                        if ftd.kind == 7 {
+                            emit_app_drop(sb, p, src, string_view(cp), pfty, depth)
+                        } else {
+                            emit_drop_place(sb, p, src, string_view(cp), ftd.start as i32, ftd.end as i32, depth)
+                        }
                         string_free(cp)
                     }
                     fi = fi - 1
@@ -4281,7 +4324,10 @@ fn register_drop_local(mut g: Cg, read p: parser.Parser, read src: str, read c: 
     if s.ty >= 0 {
         let t: parser.TypeData = list.get(parser.TypeData, p.ty, s.ty as usize)
         if t.kind == 0 { tns = t.start as i32  tne = t.end as i32 }
-    } else if s.a >= 0 {
+    }
+    if tns < 0 and s.a >= 0 {                         // no bare-Name annotation: the Checker's
+        // inferred initializer type (an App-annotated `x: List(i32)` local registers here too —
+        // the reference keys drops on the local's resolved Ty, not the annotation's spelling)
         let tid: i32 = list.get(i32, c.et, s.a as usize)
         if tid >= 0 {
             let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
@@ -7159,12 +7205,216 @@ fn emit_gvariant_head(mut sb: String, read p: parser.Parser, read src: str, read
 // at `it.a`, count `it.b`: [tag(0=field,1=method), pub, name_start, name_end, type_id, default,
 // attr_start, attr_count, bits_start, bits_end]. Only fields are emitted (methods live in fn_defs);
 // each struct ends with `};\n\n` (the trailing blank). `@packed`/`@align` attrs are still TODO.
-fn emit_struct_defs(mut sb: String, read p: parser.Parser, read src: str) {
+// ---- aggregate-definition capture + topological flush (mirrors `def_cap`/`DefCapture`/
+// `flush_def_capture`). The eight aggregate-def sections emit into a CAPTURE buffer; each
+// definition registers as a named segment with its by-value type deps (section blanks and other
+// glue become anonymous segments pinned in place), and the flush re-emits every segment in a
+// stable post-order DFS so a struct embedding another aggregate BY VALUE (e.g. a `List(E)`
+// field) follows that aggregate's definition. A program with no forward by-value dependency
+// flushes in the original order — byte-identical, which is why this was a no-op until a plain
+// struct first held a generic-instance field. Names + deps live in one append-only buffer `nb`
+// as `|`-delimited tokens addressed by (start, end) ranges — the port's usual stand-in for the
+// reference's `String` collections. ----
+struct Dc {
+    nb: String,        // names + dep tokens (each dep region is `` or `|A|B|…|`)
+    segs: List(i32),   // 6-tuples: (buf_s, buf_e, name_s, name_e, dep_s, dep_e); name_s==name_e = glue
+    last: i32,         // end offset (into the capture buffer) of the last finalized segment
+    pns: i32,          // the open unit's name/dep ranges + start (pstart -1 = none pending)
+    pne: i32,
+    pds: i32,
+    pde: i32,
+    pstart: i32,
+}
+
+fn dc_len(mut d: Dc) -> i32 {
+    let v: str = string_view(d.nb)
+    return v.len as i32
+}
+
+fn sb_len(mut sb: String) -> i32 {
+    let v: str = string_view(sb)
+    return v.len as i32
+}
+
+// Finalize any glue text written since the last segment (kept in place, unnamed).
+fn dc_glue(mut d: Dc, cap_len: i32) {
+    if cap_len > d.last {
+        list.push(i32, d.segs, d.last)
+        list.push(i32, d.segs, cap_len)
+        list.push(i32, d.segs, 0)
+        list.push(i32, d.segs, 0)
+        list.push(i32, d.segs, 0)
+        list.push(i32, d.segs, 0)
+        d.last = cap_len
+    }
+}
+
+// Open a definition segment: name range [ns, ne) and dep range [ds, de) into `d.nb`.
+fn dc_begin(mut d: Dc, cap_len: i32, ns: i32, ne: i32, ds: i32, de: i32) {
+    dc_glue(d, cap_len)
+    d.pns = ns
+    d.pne = ne
+    d.pds = ds
+    d.pde = de
+    d.pstart = cap_len
+}
+
+// Close the current definition segment.
+fn dc_end(mut d: Dc, cap_len: i32) {
+    list.push(i32, d.segs, d.pstart)
+    list.push(i32, d.segs, cap_len)
+    list.push(i32, d.segs, d.pns)
+    list.push(i32, d.segs, d.pne)
+    list.push(i32, d.segs, d.pds)
+    list.push(i32, d.segs, d.pde)
+    d.last = cap_len
+    d.pstart = 0 - 1
+}
+
+// Add one by-value dep to the open collection region starting at `ds` (mirrors `dep_of_cty` +
+// `add_dep`): a pointer type needs only a forward declaration — skipped; otherwise the rendered
+// C type name, deduped within this definition's region. Primitive names are collected too (the
+// reference does) — they match no segment, so they are harmless DFS no-ops.
+fn dc_dep(mut d: Dc, ds: i32, read cty: str) {
+    if contains(cty, "*") { return }
+    var probe: String = string_new()
+    string_push(probe, "|")
+    string_push(probe, cty)
+    string_push(probe, "|")
+    var have: bool = false
+    {
+        let cur: str = string_view(d.nb)
+        have = contains(cur[ds as usize .. cur.len], string_view(probe))
+    }
+    if !have {
+        let start_empty: bool = dc_len(d) == ds
+        if start_empty { string_push(d.nb, "|") }
+        string_push(d.nb, cty)
+        string_push(d.nb, "|")
+    }
+    string_free(probe)
+}
+
+// Resolve the `di`-th dep of region [ds, de) to a segment index: the LAST segment whose name
+// matches (mirrors `by_name`'s insert-overwrite), -1 if no segment defines it, -2 if `di` is
+// past the region's last dep.
+fn dc_find_dep(mut d: Dc, ds: i32, de: i32, di: i32, n: i32) -> i32 {
+    if de <= ds { return 0 - 2 }
+    let nb: str = string_view(d.nb)
+    var idx: i32 = 0
+    var ts: i32 = ds + 1
+    var fs: i32 = 0 - 1
+    var fe: i32 = 0 - 1
+    var i: i32 = ds + 1
+    for i < de {
+        if (nb[i as usize] as i32) == 124 {           // '|'
+            if idx == di {
+                fs = ts
+                fe = i
+            }
+            idx = idx + 1
+            ts = i + 1
+        }
+        i = i + 1
+    }
+    if fs < 0 { return 0 - 2 }
+    var best: i32 = 0 - 1
+    var s: i32 = 0
+    for s < n {
+        let b6: i32 = s * 6
+        let ns: i32 = list.get(i32, d.segs, (b6 + 2) as usize)
+        let ne: i32 = list.get(i32, d.segs, (b6 + 3) as usize)
+        if ne > ns {
+            if str_eq(nb[ns as usize .. ne as usize], nb[fs as usize .. fe as usize]) { best = s }
+        }
+        s = s + 1
+    }
+    return best
+}
+
+// End the capture window and emit the collected segments in a topological order — an iterative
+// post-order DFS (deps before dependents), stable in segment order, exactly the reference's.
+fn dc_flush(mut sb: String, mut d: Dc, read cap: str, read a: Allocator) {
+    dc_glue(d, cap.len as i32)                        // trailing text after the last segment
+    let n: i32 = (list.len(i32, d.segs) / 6) as i32
+    var state: List(i32) = list.make(i32, a)          // 0 = unvisited, 1 = on stack, 2 = done
+    var i: i32 = 0
+    for i < n {
+        list.push(i32, state, 0)
+        i = i + 1
+    }
+    var order: List(i32) = list.make(i32, a)
+    var stack: List(i32) = list.make(i32, a)          // (node, next-dep-index) pairs
+    var root: i32 = 0
+    for root < n {
+        if list.get(i32, state, root as usize) != 0 {
+            root = root + 1
+            continue
+        }
+        list.set(i32, state, root as usize, 1)
+        list.truncate(i32, stack, 0)
+        list.push(i32, stack, root)
+        list.push(i32, stack, 0)
+        for list.len(i32, stack) > 0 {
+            let top: usize = list.len(i32, stack) - 2
+            let node: i32 = list.get(i32, stack, top)
+            let di: i32 = list.get(i32, stack, top + 1)
+            let b6: i32 = node * 6
+            let dep_s: i32 = list.get(i32, d.segs, (b6 + 4) as usize)
+            let dep_e: i32 = list.get(i32, d.segs, (b6 + 5) as usize)
+            let j: i32 = dc_find_dep(d, dep_s, dep_e, di, n)
+            if j == 0 - 2 {                           // deps exhausted: emit, pop
+                list.push(i32, order, node)
+                list.set(i32, state, node as usize, 2)
+                list.truncate(i32, stack, top)
+            } else {
+                list.set(i32, stack, top + 1, di + 1)
+                if j >= 0 {
+                    if list.get(i32, state, j as usize) == 0 {
+                        list.set(i32, state, j as usize, 1)
+                        list.push(i32, stack, j)
+                        list.push(i32, stack, 0)
+                    }
+                }
+            }
+        }
+        root = root + 1
+    }
+    var oi: usize = 0
+    for oi < list.len(i32, order) {
+        let b6: i32 = list.get(i32, order, oi) * 6
+        let bs: i32 = list.get(i32, d.segs, b6 as usize)
+        let be: i32 = list.get(i32, d.segs, (b6 + 1) as usize)
+        string_push(sb, cap[bs as usize .. be as usize])
+        oi = oi + 1
+    }
+    list.free(i32, state)
+    list.free(i32, order)
+    list.free(i32, stack)
+}
+
+fn emit_struct_defs(mut sb: String, read p: parser.Parser, read src: str, mut d: Dc) {
     var r: i32 = 0
     for r < list.len(i32, p.roots) {
         let iid: i32 = list.get(i32, p.roots, r)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 4 {
+            let ns: i32 = dc_len(d)                   // segment name: Jestyr_<name>
+            string_push(d.nb, "Jestyr_")
+            string_push(d.nb, src[it.x .. it.y])
+            let ne: i32 = dc_len(d)
+            var m0: i32 = 0                           // by-value field deps (unions too — the
+            for m0 < it.b {                           // reference collects them the same)
+                let b0: i32 = it.a + m0 * 10
+                if list.get(i32, p.mar, b0 as usize) == 0 {
+                    var fc0: String = string_new()
+                    emit_c_ty(fc0, p, src, list.get(i32, p.mar, (b0 + 4) as usize))
+                    dc_dep(d, ne, string_view(fc0))
+                    string_free(fc0)
+                }
+                m0 = m0 + 1
+            }
+            dc_begin(d, sb_len(sb), ns, ne, ne, dc_len(d))
             if it.op == 2 { string_push(sb, "union") } else { string_push(sb, "struct") }
             emit_struct_attr(sb, p, src, it)          // `@packed`/`@align(n)` -> __attribute__((…))
             string_push(sb, " Jestyr_")
@@ -7193,6 +7443,7 @@ fn emit_struct_defs(mut sb: String, read p: parser.Parser, read src: str) {
                 m = m + 1
             }
             string_push(sb, "};\n\n")
+            dc_end(d, sb_len(sb))
         }
         r = r + 1
     }
@@ -7202,13 +7453,33 @@ fn emit_struct_defs(mut sb: String, read p: parser.Parser, read src: str) {
 // discriminants set explicit values) then `struct Jestyr_<E> { enum … tag; [union { … } u;] };`.
 // The payload union appears only if some variant has fields. Non-generic enums only (a generic
 // enum is a template; niche-opt is deferred). Each ends `};\n\n`.
-fn emit_enum_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg) {
+fn emit_enum_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, mut d: Dc) {
     var r: i32 = 0
     for r < list.len(i32, p.roots) {
         let iid: i32 = list.get(i32, p.roots, r)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 5 and it.a == 0 and niche_named_some(p, iid) < 0 {   // non-generic, non-niche enum
             let en: str = src[it.x .. it.y]
+            let ns: i32 = dc_len(d)                   // segment name: Jestyr_<E>
+            string_push(d.nb, "Jestyr_")
+            string_push(d.nb, en)
+            let ne: i32 = dc_len(d)
+            var k0: i32 = 0                           // by-value payload field deps, all variants
+            for k0 < it.z {
+                let vb0: i32 = it.b + k0 * 5
+                let fc0: i32 = list.get(i32, p.ear, (vb0 + 3) as usize)
+                let fs0: i32 = list.get(i32, p.ear, (vb0 + 2) as usize)
+                var fi0: i32 = 0
+                for fi0 < fc0 {
+                    var ft0: String = string_new()
+                    emit_c_ty(ft0, p, src, list.get(i32, p.ear, (fs0 + fi0 * 3 + 2) as usize))
+                    dc_dep(d, ne, string_view(ft0))
+                    string_free(ft0)
+                    fi0 = fi0 + 1
+                }
+                k0 = k0 + 1
+            }
+            dc_begin(d, sb_len(sb), ns, ne, ne, dc_len(d))
             string_push(sb, "enum Jestyr_")
             string_push(sb, en)
             string_push(sb, "_tag {\n")
@@ -7266,6 +7537,7 @@ fn emit_enum_defs(mut sb: String, read p: parser.Parser, read src: str, read c: 
                 string_push(sb, "    } u;\n")
             }
             string_push(sb, "};\n\n")
+            dc_end(d, sb_len(sb))
         }
         r = r + 1
     }
@@ -7306,13 +7578,32 @@ fn emit_gen_forward_types(mut sb: String, read p: parser.Parser, read src: str, 
 // Generic-enum instance definitions (mirrors `gen_enum_defs`/`emit_enum_instance`): per collected
 // instance, the tag enum + tagged-union struct under the instance name, with each payload field
 // type run through the tparam->arg substitution.
-fn emit_gen_enum_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg) {
+fn emit_gen_enum_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, mut d: Dc) {
     var k: usize = 0
     for k < list.len(i32, g.gei) {
         let tid: i32 = list.get(i32, g.gei, k)
         if niche_inst_some(p, src, c, tid) >= 0 { k = k + 1  continue }   // niche: no tag/union def
         let eit: i32 = genum_item_of(p, src, c, tid)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, eit as usize)
+        let ns: i32 = dc_len(d)                       // segment name: the instance's C name
+        emit_ty_c(d.nb, p, src, c, tid)
+        let ne: i32 = dc_len(d)
+        var k0: i32 = 0                               // substituted payload field deps
+        for k0 < it.z {
+            let vb0: i32 = it.b + k0 * 5
+            let fc0: i32 = list.get(i32, p.ear, (vb0 + 3) as usize)
+            let fs0: i32 = list.get(i32, p.ear, (vb0 + 2) as usize)
+            var fi0: i32 = 0
+            for fi0 < fc0 {
+                var ft0: String = string_new()
+                emit_field_ty_subst(ft0, p, src, c, list.get(i32, p.ear, (fs0 + fi0 * 3 + 2) as usize), eit, tid)
+                dc_dep(d, ne, string_view(ft0))
+                string_free(ft0)
+                fi0 = fi0 + 1
+            }
+            k0 = k0 + 1
+        }
+        dc_begin(d, sb_len(sb), ns, ne, ne, dc_len(d))
         string_push(sb, "enum ")
         emit_ty_c(sb, p, src, c, tid)
         string_push(sb, "_tag {\n")
@@ -7366,6 +7657,7 @@ fn emit_gen_enum_defs(mut sb: String, read p: parser.Parser, read src: str, read
             string_push(sb, "    } u;\n")
         }
         string_push(sb, "};\n\n")
+        dc_end(d, sb_len(sb))
         k = k + 1
     }
 }
@@ -7374,13 +7666,13 @@ fn emit_gen_enum_defs(mut sb: String, read p: parser.Parser, read src: str, read
 // concrete element type, discovered like `collect_slices` — the type arena's `[]T` annotations
 // first, then `slice(T, …)` construction calls — deduped by mangle, + a trailing blank if any.
 // (Monomorphized-generic contributions arrive with generics.)
-fn emit_slice_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker) {
+fn emit_slice_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut d: Dc) {
     var seen: String = string_new()
     var any: bool = false
     var i: usize = 0
     for i < list.len(parser.TypeData, p.ty) {
         let t: parser.TypeData = list.get(parser.TypeData, p.ty, i)
-        if t.kind == 3 { any = emit_one_slice_def(sb, p, src, c, t.a, seen) or any }
+        if t.kind == 3 { any = emit_one_slice_def(sb, p, src, c, t.a, seen, d) or any }
         i = i + 1
     }
     var e2: usize = 0
@@ -7393,7 +7685,7 @@ fn emit_slice_defs(mut sb: String, read p: parser.Parser, read src: str, read c:
                     if e.y >= 1 {
                         let a0: i32 = list.get(i32, p.ar, e.x as usize)
                         let ax: parser.ExprData = list.get(parser.ExprData, p.ex, a0 as usize)
-                        if ax.kind == 2 { any = emit_one_slice_name(sb, src, c, src[ax.start .. ax.end], seen) or any }
+                        if ax.kind == 2 { any = emit_one_slice_name(sb, src, c, src[ax.start .. ax.end], seen, d) or any }
                     }
                 }
             }
@@ -7406,15 +7698,15 @@ fn emit_slice_defs(mut sb: String, read p: parser.Parser, read src: str, read c:
 
 // One slice typedef from an AST element-type node (a concrete Name only, for now). Returns
 // whether a typedef was emitted; `seen` accumulates `|mangle|` markers for dedup.
-fn emit_one_slice_def(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, elem_ty: i32, mut seen: String) -> bool {
+fn emit_one_slice_def(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, elem_ty: i32, mut seen: String, mut d: Dc) -> bool {
     let t: parser.TypeData = list.get(parser.TypeData, p.ty, elem_ty as usize)
     if t.kind != 0 { return false }                   // structural elems arrive later
-    return emit_one_slice_name(sb, src, c, src[t.start .. t.end], seen)
+    return emit_one_slice_name(sb, src, c, src[t.start .. t.end], seen, d)
 }
 
 // One slice typedef for element-name `nm` (a prim or a declared type; anything else — e.g. a
 // generic `T` — is an opaque template, skipped like the reference's `is_concrete`).
-fn emit_one_slice_name(mut sb: String, read src: str, read c: typeck.Checker, read nm: str, mut seen: String) -> bool {
+fn emit_one_slice_name(mut sb: String, read src: str, read c: typeck.Checker, read nm: str, mut seen: String, mut d: Dc) -> bool {
     let pc: str = c_prim(nm)
     if str_eq(pc, "") {
         if !is_declared_type(c, src, nm) { return false }
@@ -7487,12 +7779,12 @@ fn emit_consts(mut sb: String, read p: parser.Parser, read src: str, read c: typ
 // expr-arena order), then function signature annotations. The expr scan is load-bearing: a
 // `const T: [5]i64 = [2,3,…]` literal infers its OWN `[5]i32` (the const's value is inferred with
 // no expected type), so BOTH `JestyrArr_i32_5` and `JestyrArr_i64_5` are emitted, in that order.
-fn emit_array_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker) {
+fn emit_array_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut d: Dc) {
     var seen: String = string_new()
     var any: bool = false
     var i: usize = 0
     for i < list.len(i32, c.et) {                     // per-expr types, in expr-arena order
-        any = emit_one_array_def(sb, p, src, c, list.get(i32, c.et, i), seen) or any
+        any = emit_one_array_def(sb, p, src, c, list.get(i32, c.et, i), seen, d) or any
     	i = i + 1
     }
     var r: i32 = 0                                    // then fn signature annotations
@@ -7502,10 +7794,10 @@ fn emit_array_defs(mut sb: String, read p: parser.Parser, read src: str, read c:
         if it.kind == 3 {
             var pi: i32 = 0
             for pi < it.b {
-                any = emit_one_array_def_ast(sb, p, src, c, list.get(i32, p.iar, (it.a + pi * 7 + 5) as usize), seen) or any
+                any = emit_one_array_def_ast(sb, p, src, c, list.get(i32, p.iar, (it.a + pi * 7 + 5) as usize), seen, d) or any
                 pi = pi + 1
             }
-            any = emit_one_array_def_ast(sb, p, src, c, it.z, seen) or any
+            any = emit_one_array_def_ast(sb, p, src, c, it.z, seen, d) or any
         }
         r = r + 1
     }
@@ -7514,21 +7806,21 @@ fn emit_array_defs(mut sb: String, read p: parser.Parser, read src: str, read c:
 }
 
 // One array typedef from a Checker TyId (only an Array, kind 9, contributes).
-fn emit_one_array_def(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, tyid: i32, mut seen: String) -> bool {
+fn emit_one_array_def(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, tyid: i32, mut seen: String, mut d: Dc) -> bool {
     if tyid < 0 { return false }
-    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tyid as usize)
-    if d.kind != 9 { return false }
+    let td: typeck.TyData = list.get(typeck.TyData, c.tys, tyid as usize)
+    if td.kind != 9 { return false }
     var m: String = string_new()                      // the instance key = its full mangle
-    push_ty_mangle(m, src, c, d.a)
+    push_ty_mangle(m, src, c, td.a)
     string_push(m, "_")
-    push_uint(m, d.b as i64)
-    let ok: bool = push_array_typedef(sb, string_view(m), seen, p, src, c, d.a, 0 - 1, d.b)
+    push_uint(m, td.b as i64)
+    let ok: bool = push_array_typedef(sb, string_view(m), seen, p, src, c, td.a, 0 - 1, td.b, d)
     string_free(m)
     return ok
 }
 
 // One array typedef from an AST TypeId (a `[N]T` annotation).
-fn emit_one_array_def_ast(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, tyid: i32, mut seen: String) -> bool {
+fn emit_one_array_def_ast(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, tyid: i32, mut seen: String, mut d: Dc) -> bool {
     if tyid < 0 { return false }
     let t: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
     if t.kind != 4 { return false }
@@ -7540,24 +7832,24 @@ fn emit_one_array_def_ast(mut sb: String, read p: parser.Parser, read src: str, 
     emit_c_ty(ec, p, src, t.a)
     var ln: String = string_new()
     push_array_len(ln, p, src, t.b)
-    let ok: bool = push_array_typedef_raw(sb, string_view(m), seen, string_view(ec), string_view(ln))
+    let ok: bool = push_array_typedef_raw(sb, string_view(m), seen, string_view(ec), string_view(ln), d)
     string_free(m)  string_free(ec)  string_free(ln)
     return ok
 }
 
 // Emit `typedef struct { <ecty> a[<len>]; } JestyrArr_<key>;` unless `key` was already emitted.
-fn push_array_typedef(mut sb: String, read key: str, mut seen: String, read p: parser.Parser, read src: str, read c: typeck.Checker, elem: i32, unused: i32, len: i32) -> bool {
+fn push_array_typedef(mut sb: String, read key: str, mut seen: String, read p: parser.Parser, read src: str, read c: typeck.Checker, elem: i32, unused: i32, len: i32, mut d: Dc) -> bool {
     var ec: String = string_new()
     emit_ty_c(ec, p, src, c, elem)
     var ln: String = string_new()
     push_uint(ln, len as i64)
-    let ok: bool = push_array_typedef_raw(sb, key, seen, string_view(ec), string_view(ln))
+    let ok: bool = push_array_typedef_raw(sb, key, seen, string_view(ec), string_view(ln), d)
     string_free(ec)  string_free(ln)
     return ok
 }
 
 // The dedup + emit core: `key` is the instance's mangle (`<elem>_<len>`).
-fn push_array_typedef_raw(mut sb: String, read key: str, mut seen: String, read ecty: str, read len: str) -> bool {
+fn push_array_typedef_raw(mut sb: String, read key: str, mut seen: String, read ecty: str, read len: str, mut d: Dc) -> bool {
     var probe: String = string_new()
     string_push(probe, "|")
     string_push(probe, key)
@@ -7565,6 +7857,12 @@ fn push_array_typedef_raw(mut sb: String, read key: str, mut seen: String, read 
     if contains(string_view(seen), string_view(probe)) { string_free(probe)  return false }
     string_push(seen, string_view(probe))
     string_free(probe)
+    let ns: i32 = dc_len(d)                           // segment name: JestyrArr_<key>; the
+    string_push(d.nb, "JestyrArr_")                   // element is embedded BY VALUE — one dep
+    string_push(d.nb, key)
+    let ne: i32 = dc_len(d)
+    dc_dep(d, ne, ecty)
+    dc_begin(d, sb_len(sb), ns, ne, ne, dc_len(d))
     string_push(sb, "typedef struct { ")
     string_push(sb, ecty)
     string_push(sb, " a[")
@@ -7576,7 +7874,7 @@ fn push_array_typedef_raw(mut sb: String, read key: str, mut seen: String, read 
 }
 
 // One `typedef struct { <E>* ptr; uint64_t gen; } JestyrRef_<m>;`, deduped by elem mangle.
-fn push_genref_typedef(mut sb: String, mut seen: String, read m: str, read ecty: str) -> bool {
+fn push_genref_typedef(mut sb: String, mut seen: String, read m: str, read ecty: str, mut d: Dc) -> bool {
     var probe: String = string_new()
     string_push(probe, "|")
     string_push(probe, m)
@@ -8001,7 +8299,7 @@ fn collect_gstruct_instances(mut g: Cg, read p: parser.Parser, read src: str, re
 // Generic-struct instance definitions (mirrors `gen_struct_defs`/`emit_struct_instance`):
 // `struct Jestyr_<ctor>__<args> { <substituted field> j_<name>; … };` + trailing blank each.
 // Field members only (tag 0); emitted between the plain enum defs and the gen-enum defs.
-fn emit_gen_struct_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg) {
+fn emit_gen_struct_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, mut d: Dc) {
     var k: usize = 0
     for k < list.len(i32, g.gsi) {
         let tid: i32 = list.get(i32, g.gsi, k)
@@ -8012,6 +8310,21 @@ fn emit_gen_struct_defs(mut sb: String, read p: parser.Parser, read src: str, re
             continue                                  // `emit_struct_instance` bails on find_fn)
         }
         let sx: parser.ExprData = list.get(parser.ExprData, p.ex, node as usize)
+        let ns: i32 = dc_len(d)                       // segment name: the instance's C name
+        emit_ty_c(d.nb, p, src, c, tid)
+        let ne: i32 = dc_len(d)
+        var m0: i32 = 0                               // substituted by-value field deps
+        for m0 < sx.y {
+            let mb0: i32 = sx.x + m0 * 10
+            if list.get(i32, p.mar, mb0 as usize) == 0 {
+                var ft0: String = string_new()
+                emit_gs_ty(ft0, p, src, c, list.get(i32, p.mar, (mb0 + 4) as usize), fit, tid)
+                dc_dep(d, ne, string_view(ft0))
+                string_free(ft0)
+            }
+            m0 = m0 + 1
+        }
+        dc_begin(d, sb_len(sb), ns, ne, ne, dc_len(d))
         string_push(sb, "struct ")
         emit_ty_c(sb, p, src, c, tid)
         string_push(sb, " {\n")
@@ -8030,6 +8343,7 @@ fn emit_gen_struct_defs(mut sb: String, read p: parser.Parser, read src: str, re
             m = m + 1
         }
         string_push(sb, "};\n\n")
+        dc_end(d, sb_len(sb))
         k = k + 1
     }
 }
@@ -8167,7 +8481,7 @@ fn emit_fn_type_defs(mut sb: String, read p: parser.Parser, read src: str, read 
 // distinct `&T` element — the type arena's GenRef annotations first (arena order), then
 // `gen_new(T, …)` constructions (expr order) — one `JestyrRef_<T>` each, + a CONDITIONAL
 // trailing blank. `{ E* ptr; gen }` embeds E only through a pointer, so no by-value dep.
-fn emit_genref_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker) {
+fn emit_genref_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut d: Dc) {
     var any: bool = false
     var seen: String = string_new()
     var ti: usize = 0
@@ -8178,7 +8492,7 @@ fn emit_genref_defs(mut sb: String, read p: parser.Parser, read src: str, read c
             push_ast_mangle(m, p, src, t.a)
             var ec: String = string_new()
             emit_c_ty(ec, p, src, t.a)
-            any = push_genref_typedef(sb, seen, string_view(m), string_view(ec)) or any
+            any = push_genref_typedef(sb, seen, string_view(m), string_view(ec), d) or any
             string_free(m)
             string_free(ec)
         }
@@ -8196,7 +8510,7 @@ fn emit_genref_defs(mut sb: String, read p: parser.Parser, read src: str, read c
                         if ax.kind == 2 {             // the bare-Name type arg is its own mangle
                             var ec: String = string_new()
                             emit_type_arg_cty_plain(ec, p, src, arg_at(p, e, 0))
-                            any = push_genref_typedef(sb, seen, src[ax.start .. ax.end], string_view(ec)) or any
+                            any = push_genref_typedef(sb, seen, src[ax.start .. ax.end], string_view(ec), d) or any
                             string_free(ec)
                         }
                     }
@@ -8211,14 +8525,24 @@ fn emit_genref_defs(mut sb: String, read p: parser.Parser, read src: str, read c
 
 // Result-struct typedefs. `JestyrResult_str` (the `try_from_utf8` intrinsic's result) is emitted
 // unconditionally up front; fallible user functions add their own (none in `hello`).
-fn emit_result_defs(mut sb: String, read p: parser.Parser, read src: str) {
+fn emit_result_defs(mut sb: String, read p: parser.Parser, read src: str, mut d: Dc) {
+    let sn: i32 = dc_len(d)                           // JestyrResult_str: a no-dep segment
+    string_push(d.nb, "JestyrResult_str")
+    let se: i32 = dc_len(d)
+    dc_begin(d, sb_len(sb), sn, se, se, se)
     string_push(sb, "typedef struct { bool is_err; JestyrStr ok; int err; } JestyrResult_str;\n")
+    dc_end(d, sb_len(sb))
     var seen: String = string_new()
     string_push(seen, "|str|")                        // `try_from_utf8`'s result is pre-seeded
     // `try_read_file`'s result type isn't discovered from a fn signature — emit it (only when
     // used) and seed `seen` so a user `String !E` fn doesn't duplicate the typedef (B3).
     if uses_try_read(p, src) {
+        let tn: i32 = dc_len(d)
+        string_push(d.nb, "JestyrResult_String")
+        let te: i32 = dc_len(d)
+        dc_begin(d, sb_len(sb), tn, te, te, te)
         string_push(sb, "typedef struct { bool is_err; JestyrString ok; int err; } JestyrResult_String;\n")
+        dc_end(d, sb_len(sb))
         string_push(seen, "|String|")
     }
     var r: i32 = 0
@@ -8232,6 +8556,17 @@ fn emit_result_defs(mut sb: String, read p: parser.Parser, read src: str) {
             string_push(probe, "|")  string_push(probe, string_view(m))  string_push(probe, "|")
             if !contains(string_view(seen), string_view(probe)) {
                 string_push(seen, string_view(probe))
+                let ns: i32 = dc_len(d)               // JestyrResult_<m>; the ok type is
+                string_push(d.nb, "JestyrResult_")    // embedded BY VALUE (unless unit)
+                string_push(d.nb, string_view(m))
+                let ne: i32 = dc_len(d)
+                if it.z >= 0 {
+                    var oc0: String = string_new()
+                    emit_c_ty(oc0, p, src, it.z)
+                    dc_dep(d, ne, string_view(oc0))
+                    string_free(oc0)
+                }
+                dc_begin(d, sb_len(sb), ns, ne, ne, dc_len(d))
                 string_push(sb, "typedef struct { bool is_err; ")
                 if it.z >= 0 {                        // a unit ok type omits the `ok` field
                     emit_c_ty(sb, p, src, it.z)
@@ -8240,6 +8575,7 @@ fn emit_result_defs(mut sb: String, read p: parser.Parser, read src: str) {
                 string_push(sb, "int err; } JestyrResult_")
                 string_push(sb, string_view(m))
                 string_push(sb, ";\n")
+                dc_end(d, sb_len(sb))
             }
             string_free(m)  string_free(probe)
         }
@@ -9741,15 +10077,22 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
     emit_forward_types(sb, p, src)
     emit_gen_forward_types(sb, p, src, c, g)         // monomorphized generic-enum instance fwd typedefs
     emit_fn_type_defs(sb, p, src, c, g)              // fn-pointer typedefs (before aggregate defs)
-    emit_struct_defs(sb, p, src)                     // captured-region aggregate defs (struct first)
-    emit_enum_defs(sb, p, src, c, g)                 // enum tag+struct defs (after structs)
-    emit_gen_struct_defs(sb, p, src, c, g)           // generic-STRUCT instance defs (before gen enums)
-    emit_gen_enum_defs(sb, p, src, c, g)             // generic-enum instance defs (after plain enums)
-    emit_slice_defs(sb, p, src, c)                   // slice typedefs (after aggregates)
-    emit_array_defs(sb, p, src, c)                   // array typedefs (after slices)
-    emit_genref_defs(sb, p, src, c)                  // genref typedefs (after arrays)
-    emit_result_defs(sb, p, src)
-    // flush_def_capture: a no-op here (no by-value dep reorder needed).
+    // The aggregate-def window emits into a CAPTURE buffer; `dc_flush` re-emits its segments
+    // topologically so a by-value embedding (a struct holding a `List(E)` field) is defined
+    // after its dependency — a stable no-op when no forward dep exists (byte-identical).
+    var cap: String = string_new()
+    var d: Dc = Dc{ nb: string_new(), segs: list.make(i32, a), last: 0, pns: 0, pne: 0, pds: 0, pde: 0, pstart: 0 - 1 }
+    emit_struct_defs(cap, p, src, d)                 // captured-region aggregate defs (struct first)
+    emit_enum_defs(cap, p, src, c, g, d)             // enum tag+struct defs (after structs)
+    emit_gen_struct_defs(cap, p, src, c, g, d)       // generic-STRUCT instance defs (before gen enums)
+    emit_gen_enum_defs(cap, p, src, c, g, d)         // generic-enum instance defs (after plain enums)
+    emit_slice_defs(cap, p, src, c, d)               // slice typedefs (after aggregates)
+    emit_array_defs(cap, p, src, c, d)               // array typedefs (after slices)
+    emit_genref_defs(cap, p, src, c, d)              // genref typedefs (after arrays)
+    emit_result_defs(cap, p, src, d)
+    dc_flush(sb, d, string_view(cap), a)             // the topological re-emit (`flush_def_capture`)
+    string_free(cap)
+    string_free(d.nb)
     emit_dyn_typedefs(sb, p, src, a)                 // dyn-trait vtable + fat-pointer typedefs
     emit_extern_protos(sb, p, src)                   // `extern "c"` prototypes (bare names)
     emit_closure_types(sb, p, src, c, g)             // env + {call, env} typedefs + unconditional blank
