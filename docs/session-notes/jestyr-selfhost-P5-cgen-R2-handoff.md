@@ -708,6 +708,46 @@ compiler-source path is open. Three sub-pieces:
   typeerr/match_check (diag non-targets), and the big-file tail (mvs 122, collection 131,
   region_escape 137, then the @test-heavy ~2000-line diffs → TEST MODE).
 
+### Increment 41 — FULL CORPUS CONVERGENCE: 130/130 byte-identical
+
+**The P5 cgen golden is DONE — every corpus file, including the compiler sources
+(tokens/lexer/parser/typeck/escape/cgen ITSELF), emits byte-identical C through the
+Jestyr-written backend.** What this increment actually was: an ORACLE sweep plus five small
+construct/degenerate fixes plus one real bug hunt.
+
+- **The probe oracle had been hiding finished work.** `emit-c` diffs are meaningless for
+  import files (module-loaded reference vs single-file golden) AND for error files (`emit-c`
+  refuses; `rust_cgen_dump` skips escape and emits). Adding candidates directly to the GOLDEN
+  showed mvs/collection/alloc_demo/region_escape/typeerr/match_check/exhaustive_check were
+  ALREADY byte-identical, and batch-adding the rest left only 8 real divergers.
+- **THE pre-existing segfault trio (numbers/numerics_canary/format_float) was ONE unguarded
+  negative index:** `variant_tuple` read `p.it[enum_iid as usize]` with `enum_iid = -1` on a
+  match over an IMPORT-DEGENERATE enum (`Result(i64, ParseIntError)`) — `(-1) as usize` = an
+  OOB arena read whose fate depended on ASLR layout (gdb's disabled ASLR made it a heisenbug;
+  identical binaries crashed or survived by luck). Guarded there + `emit_field_ty_subst`.
+  **Debug lesson: deterministic-per-binary + survives-under-gdb + survives-with-protector =
+  wild READ, and bisecting the INPUT (the truncated-file probe) found it in minutes after
+  binary-level comparisons (hashes always differ — PE timestamps!) went nowhere.**
+- **Degenerate-form parity**: match on an unresolvable enum emits NOTHING (the reference's
+  diag arm — empty fn bodies in numbers/format_float/parse_float); Checker
+  Unknown/Opaque/Error/OpaqueLit render `int`; AST Path types (kind 8) render
+  `Jestyr_<name>__<mangles>` with args / local-or-`int` without; `ok`/`err` OUTSIDE a fallible
+  fn degenerate to the bare arg / `0`.
+- **Instance machinery for import-degenerate ctors**: gsw admits Apps whose ctor is neither a
+  local fn nor a local enum, and kind-8 Paths with args; `gsi_row_ok` replaces the
+  too-strict concreteness gate (Opaque args mangle by NAME — `push_ty_mangle` kind 4;
+  `push_ast_mangle` kind 8 = the name segment; Unknown still `?`-rejects); defs/fn-typedefs
+  skip unresolved ctors (typedef-only, mirroring `emit_struct_instance`'s bail).
+- **Two constructs**: `par for … reduce` (kind 41 — the map + `jestyr_par_reduce` stmt-expr,
+  ONE temp) and `select` (kind 42 — hoisted `_sel{i}` channels + the `_seldone` spin with the
+  else-if chain over `channel_len_i64`/`channel_recv_i64`).
+- **Harness stack**: `build_exe` links with `-Wl,--stack,67108864` on Windows (the deep
+  per-expression recursion needs the headroom the Rust reference's 8MB thread stacks give;
+  the locked `CC_FLAGS`/attest command is untouched).
+- **REMAINING for R2-full**: the golden's single-file path is now fully converged; the
+  jc2 ≡ jc3 fixed point needs the MULTI-MODULE story (cgen.jtr compiling the multi-file
+  compiler sources — imports/`#line`/module merge) + test mode for `jestyrc test` parity.
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
