@@ -848,6 +848,42 @@ escape, cgen (all modes), and the self-hosting fixed point — is byte-exact and
 Optional follow-ons only: in-language multi-module (K polish), `emit-c --show-drops`
 parity, and attest/manifest tooling in the ported compiler (O).
 
+### Increments 44–46 — PRODUCTIZATION: the self-hosted compiler as a daily tool
+
+The post-P "retire the Rust bootstrap" arc — the ported compiler stops being a C dump
+and becomes a driver:
+
+- **44 — `run_command` + `eprint_str` intrinsics, BOTH sides** (`a9d5b6b`): the driver's
+  plumbing. `run_command(cmd) -> i32` = system() on a NUL-terminated copy (reuses
+  `jestyr_rt_cpath`); `eprint_str(s)` = `print_str`'s shape on stderr, so compiler stdout
+  stays clean C. Four-point seams (prelude fn GATED on use → non-users byte-identical;
+  emit arm; `is_intrinsic`; `io_intrinsic_ret` i32/Unit) mirrored in the port (gate
+  helpers + prelude lines + helper-table + closure marker names in cgen.jtr; return arms
+  in typeck.jtr). `@deterministic` deliberately does NOT ban `run_command` — the contract
+  covers schedule nondeterminism (atomics), not I/O, matching `read_file`.
+  `examples/proc_demo.jtr` (`exit 0` is a builtin on both cmd.exe and POSIX sh —
+  platform-deterministic stdout) + the gcc-oracle stream-split test; allowlist 131.
+- **45 — escape.jtr is a LIBRARY** (`7ae7434`): `emit()` (immediate print) → `ediag(e,…)`
+  buffering spans into `Esc.dsp` + newline-terminated single-line messages into
+  `Esc.dmsg`, walk order preserved; `pub struct Esc` + `pub fn check_program(p,c,src,a)
+  -> Esc`; the P4 golden's dump moved to the new thin `escape_cli.jtr` (the
+  parser_cli/typeck_cli split), output unchanged corpus-wide. Allowlist 132.
+- **46 — the DRIVER**: cgen.jtr `import "escape"` + `jc <file> build` / `jc <file> run`.
+  The raw `jc <file>` dump (and `test`/`list`) stays the golden's ungated plumbing mode —
+  error files must keep emitting degenerately for the byte-compare; `build`/`run` are the
+  PRODUCT: run the ported escape checker, on any diagnostic render
+  `path:line:col: error: <msg>` per line to stderr (1-based line/col scanned from the
+  span) and refuse with exit 1 writing NOTHING; else write `<stem>.c`, drive gcc with the
+  locked flag set (+ `-pthread` when the C needs it) via `run_command`, and for `run`
+  execute the binary forwarding its exit code. `SELFHOST_MODULES` grew `escape` (its
+  name collisions with typeck/cgen auto-renamed by the flatten). Test
+  `jestyr_driver_builds_and_runs`: hello builds through the JESTYR-drive gcc and runs
+  byte-identical to the Rust-built exe; `run` forwards stdout; `region_escape.jtr` is
+  REFUSED with rendered stderr and no C on disk. **Known v1 limits (each a follow-up):
+  parse/typeck refusal (those ported passes surface no message diagnostics yet), import-
+  bearing inputs (need in-language modules), no `-Wl,--stack` in driver builds, exe named
+  `<stem>.exe` on every OS, and `run` paths quoted for cmd.exe (backslashes safest).**
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
