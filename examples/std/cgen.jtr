@@ -75,6 +75,9 @@ fn emit_prelude(mut sb: String, read p: parser.Parser, read src: str, read g: Cg
     if list.len(i32, g.sps) > 0 {                     // any spawn site -> the pthread runtime
         string_push(sb, "#include <pthread.h>\n")
     }
+    if g.tmode {                                      // `@bench` timing via clock()
+        string_push(sb, "#include <time.h>\n")
+    }
     string_push(sb, "\n")
     string_push(sb, "/* Jestyr string view — a length-carrying `{ptr, len}` (a borrowed UTF-8 view,\n")
     string_push(sb, "   like Zig `[]const u8` / Rust `&str`). `.len` is O(1); no `strlen`. A bare\n")
@@ -3069,7 +3072,7 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // `gfi` holds the collected generic-fn instance records ([fn item, argc, (kind,a,b) targ
 // triples…], variable length — walk with a cursor); `su` is the ACTIVE instance's
 // type-parameter substitution (5-tuples: tparam span + arg triple), read by `emit_su_ty`.
-struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32, dg: i32, gmi: List(i32) }
+struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32, dg: i32, gmi: List(i32), tmode: bool }
 
 // The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
 // (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
@@ -10042,6 +10045,100 @@ fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str, read c: ty
 }
 
 // The C `main` wrapper: captures argc/argv into the argv globals, then calls `jestyr_main`.
+// Does the Fn item's name pass the optional `jestyrc test <substr>` name filter?
+// (Empty filter = no filter = everything, mirroring the reference's `Option<&str>`.)
+fn test_name_passes(read src: str, read it: parser.ItemData, read tf: str) -> bool {
+    if tf.len == 0 { return true }
+    return contains(src[it.x .. it.y], tf)
+}
+
+// A runnable harness entry: a top-level Fn with the wanted attr, non-generic and
+// backend-supported (a roots-level fn has no `self`, so `!fn_is_template` covers both halves
+// of the reference's `runnable` predicate), passing the name filter.
+fn test_runnable(read p: parser.Parser, read src: str, read it: parser.ItemData, read want: str, read tf: str) -> bool {
+    if it.kind != 3 { return false }
+    if !item_has_attr(p, src, it, want) { return false }
+    if fn_is_template(p, it) { return false }
+    return test_name_passes(src, it, tf)
+}
+
+// The Fn's C call name: `@no_mangle` publishes the BARE name, else `jestyr_<name>`.
+fn push_test_call(mut sb: String, read p: parser.Parser, read src: str, read it: parser.ItemData) {
+    if !item_has_attr(p, src, it, "no_mangle") { string_push(sb, "jestyr_") }
+    string_push(sb, src[it.x .. it.y])
+}
+
+// The `jestyrc test` harness main (mirrors `test_main`): run each runnable `@test` (a no-arg
+// fn returning `bool`, `true` = pass) tallying pass/fail, then time each `@bench` with
+// `clock()`; exit non-zero iff any test failed. User `main` is IGNORED in test mode. `tf` is
+// the optional name filter, applied at CODEGEN (not runtime) so the baked `running N test(s)`
+// count equals the emitted-runner count — an empty filter is byte-for-byte the unfiltered
+// harness.
+fn emit_test_main(mut sb: String, read p: parser.Parser, read src: str, read tf: str) {
+    var n: i32 = 0
+    var r0: i32 = 0
+    for r0 < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r0)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if test_runnable(p, src, it, "test", tf) { n = n + 1 }
+        r0 = r0 + 1
+    }
+    string_push(sb, "int main(void) {\n")
+    string_push(sb, "    int _passed = 0, _failed = 0;\n    printf(\"running ")
+    push_uint(sb, n as i64)
+    string_push(sb, " test(s)\\n\");\n")
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {                  // every `@test`, source order
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if test_runnable(p, src, it, "test", tf) {
+            string_push(sb, "    printf(\"test ")
+            string_push(sb, src[it.x .. it.y])
+            string_push(sb, " ... \"); fflush(stdout);\n")
+            string_push(sb, "    if (")
+            push_test_call(sb, p, src, it)
+            string_push(sb, "()) { printf(\"ok\\n\"); _passed++; } else { printf(\"FAILED\\n\"); _failed++; }\n")
+        }
+        r = r + 1
+    }
+    var r2: i32 = 0
+    for r2 < list.len(i32, p.roots) {                 // then every `@bench`, source order
+        let iid: i32 = list.get(i32, p.roots, r2)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if test_runnable(p, src, it, "bench", tf) {
+            string_push(sb, "    { clock_t _s = clock(); ")
+            push_test_call(sb, p, src, it)
+            string_push(sb, "(); clock_t _e = clock(); printf(\"bench ")
+            string_push(sb, src[it.x .. it.y])
+            string_push(sb, " ... %.3f ms\\n\", (double)(_e - _s) * 1000.0 / CLOCKS_PER_SEC); }\n")
+        }
+        r2 = r2 + 1
+    }
+    string_push(sb, "    printf(\"\\nresult: %d passed; %d failed\\n\", _passed, _failed);\n    return _failed == 0 ? 0 : 1;\n}\n")
+}
+
+// `jestyrc test --list` (mirrors `list_tests` + the CLI's filter): one `test <name>` /
+// `bench <name>` line per runnable item, SOURCE order interleaved (a single pass — unlike the
+// harness's tests-then-benches split), narrowed by the filter. Built into a String the caller
+// prints; the reference's empty-list stderr note is not ported (the golden compares stdout).
+fn emit_test_list(mut sb: String, read p: parser.Parser, read src: str, read tf: str) {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if test_runnable(p, src, it, "test", tf) {
+            string_push(sb, "test ")
+            string_push(sb, src[it.x .. it.y])
+            string_push(sb, "\n")
+        } else if test_runnable(p, src, it, "bench", tf) {
+            string_push(sb, "bench ")
+            string_push(sb, src[it.x .. it.y])
+            string_push(sb, "\n")
+        }
+        r = r + 1
+    }
+}
+
 fn emit_main_wrapper(mut sb: String, read p: parser.Parser, read src: str) {
     var r: i32 = 0
     for r < list.len(i32, p.roots) {
@@ -10064,8 +10161,8 @@ fn emit_main_wrapper(mut sb: String, read p: parser.Parser, read src: str) {
 // Lower the whole program to C. The section ORDER mirrors `emit_program` exactly — the five bare
 // `"\n"` pushes stand in for the reference's unconditionally-blank sections that are empty for a
 // program with no aggregates (closure_types, method_protos, consts) plus the guarded no-ops.
-fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator) {
-    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: list.make(i32, a), vtf: 0, gfi: list.make(i32, a), su: list.make(i32, a), cls: list.make(i32, a), ccx: list.make(i32, a), cca: list.make(i32, a), caps: list.make(i32, a), gsi: list.make(i32, a), sps: list.make(i32, a), dspawn: false, th: list.make(i32, a), thf: 0, dg: 0 - 1, gmi: list.make(i32, a) }
+fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator, tmode: bool, read tf: str) {
+    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: list.make(i32, a), vtf: 0, gfi: list.make(i32, a), su: list.make(i32, a), cls: list.make(i32, a), ccx: list.make(i32, a), cca: list.make(i32, a), caps: list.make(i32, a), gsi: list.make(i32, a), sps: list.make(i32, a), dspawn: false, th: list.make(i32, a), thf: 0, dg: 0 - 1, gmi: list.make(i32, a), tmode: tmode }
     collect_spawns(g, p, src)                        // spawn sites (gates the pthread prelude)
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     collect_method_instances(g, p, src, c)           // (struct item, method fn item) pairs, first-seen
@@ -10106,7 +10203,11 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
     emit_fn_defs(sb, p, src, c, g)
     emit_method_defs(sb, p, src, c, g)               // method bodies after the free fns
     emit_impl_defs(sb, p, src, c, g)                 // trait-impl bodies last
-    emit_main_wrapper(sb, p, src)
+    if g.tmode {                                     // the `jestyrc test` harness main replaces
+        emit_test_main(sb, p, src, tf)               // the user-main wrapper in test mode
+    } else {
+        emit_main_wrapper(sb, p, src)
+    }
 }
 
 fn main() -> i32 {
@@ -10118,7 +10219,26 @@ fn main() -> i32 {
         var p: parser.Parser = parser.parse_source(string_view(src), it, kwcount, a)
         var c: typeck.Checker = typeck.check_parsed(p, string_view(src), a)
         var sb: String = string_new()
-        emit_program(sb, p, c, string_view(src), a)
+        // CLI modes: `<file>` -> normal C; `<file> test [substr]` -> the `jestyrc test`
+        // harness C (optionally name-filtered); `<file> list [substr]` -> the runnable
+        // `@test`/`@bench` list (`jestyrc test --list`).
+        var tmode: bool = false
+        var lmode: bool = false
+        if env.argc() > 2 {
+            if str_eq(env.argv(2), "test") { tmode = true }
+            if str_eq(env.argv(2), "list") { lmode = true }
+        }
+        if lmode {
+            if env.argc() > 3 {
+                emit_test_list(sb, p, string_view(src), env.argv(3))
+            } else {
+                emit_test_list(sb, p, string_view(src), "")
+            }
+        } else if tmode and env.argc() > 3 {
+            emit_program(sb, p, c, string_view(src), a, true, env.argv(3))
+        } else {
+            emit_program(sb, p, c, string_view(src), a, tmode, "")
+        }
         let v: str = string_view(sb)
         // The emitted C ends in a trailing '\n'; print_str appends one, so drop the last byte to
         // keep stdout byte-identical to `cgen::emit`'s String (the golden compares line-for-line).

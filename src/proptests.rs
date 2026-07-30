@@ -7665,6 +7665,23 @@ mod c_oracle {
         String::from_utf8(out.stdout).unwrap().lines().map(|s| s.to_string()).collect()
     }
 
+    /// The reference's TEST-mode C for `src`: `cgen::emit_tests` — the `jestyrc test` harness
+    /// (`time.h` in the prelude, a pass/fail + bench-timing `main` instead of the user wrapper).
+    fn rust_cgen_test_dump(src: &str, filter: Option<&str>) -> Vec<String> {
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (ast, _diags) = crate::parser::Parser::new(src, tokens).parse();
+        let (info, _d) = crate::typeck::check(&ast);
+        let (c, _cd) = crate::cgen::emit_tests_filtered(&ast, &info, filter);
+        c.lines().map(|s| s.to_string()).collect()
+    }
+
+    /// Run the Jestyr C backend with extra CLI args (`test` / `list` modes) and return stdout lines.
+    fn jestyr_cgen_dump_args(exe: &std::path::Path, file: &str, extra: &[&str]) -> Vec<String> {
+        let out = Command::new(exe).arg(file).args(extra).output().unwrap();
+        assert!(out.status.success(), "jestyr cgen failed on {file} {extra:?}");
+        String::from_utf8(out.stdout).unwrap().lines().map(|s| s.to_string()).collect()
+    }
+
     /// Files the Jestyr C backend (`examples/std/cgen.jtr`) already lowers **byte-identically** to
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
@@ -7716,6 +7733,99 @@ mod c_oracle {
         }
         assert!(diverged.is_empty(), "Jestyr cgen diverged from the reference on: {diverged:?}");
         eprintln!("cgen golden: {checked} file(s)' emitted C byte-identical");
+    }
+
+    /// **Test-mode golden (`jestyrc test` parity).** For every allowlisted corpus file, the
+    /// Jestyr backend's TEST-mode C (`jc1 <file> test`) must be byte-identical to
+    /// `cgen::emit_tests` — a file with no `@test`s still emits a `running 0 test(s)` harness,
+    /// so this pins the mode corpus-wide, not just on test-bearing files. On `tests_demo.jtr`
+    /// it additionally pins the FILTERED harness (`test add` vs `emit_tests_filtered`), the
+    /// `--list` output, and the harness's actual runtime behavior through gcc.
+    #[test]
+    fn jestyr_cgen_test_mode_matches_reference() {
+        let exe = build_exe("examples/std/cgen.jtr");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for dir in ["examples", "examples/std"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("jtr") {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+        files.sort();
+        let mut checked = 0;
+        let mut diverged: Vec<String> = Vec::new();
+        for p in &files {
+            let f = p.to_str().unwrap();
+            let base = p.file_name().and_then(|s| s.to_str()).unwrap();
+            if !CGEN_GOLDEN_ALLOWLIST.contains(&base) {
+                continue;
+            }
+            let src = std::fs::read_to_string(p).unwrap();
+            let got = jestyr_cgen_dump_args(&exe, f, &["test"]);
+            let want = rust_cgen_test_dump(&src, None);
+            if got != want {
+                diverged.push(f.to_string());
+                if std::env::var("DUMP_DIVERGE").is_ok() {
+                    let first = got.iter().zip(want.iter()).position(|(a, b)| a != b).unwrap_or(0);
+                    let lo = first.saturating_sub(2);
+                    eprintln!("=== {f} [test mode] (first diff at line {first}) ===");
+                    eprintln!("GOT : {:?}", &got[lo..(lo + 12).min(got.len())]);
+                    eprintln!("WANT: {:?}", &want[lo..(lo + 12).min(want.len())]);
+                }
+            } else {
+                checked += 1;
+            }
+        }
+        assert!(diverged.is_empty(), "Jestyr TEST-mode cgen diverged from the reference on: {diverged:?}");
+
+        // tests_demo.jtr: the filtered harness (codegen-side filtering — the baked
+        // `running N test(s)` count equals the runner count), and `--list` parity.
+        let demo = "examples/tests_demo.jtr";
+        let demo_src = std::fs::read_to_string(demo).unwrap();
+        assert_eq!(
+            jestyr_cgen_dump_args(&exe, demo, &["test", "add"]),
+            rust_cgen_test_dump(&demo_src, Some("add")),
+            "filtered test harness diverged"
+        );
+        {
+            let (tokens, _) = crate::lexer::Lexer::new(&demo_src).tokenize();
+            let (ast, _) = crate::parser::Parser::new(&demo_src, tokens).parse();
+            let want_list: Vec<String> = crate::cgen::list_tests(&ast)
+                .into_iter()
+                .map(|(name, kind)| {
+                    let tag = match kind {
+                        crate::cgen::TestKind::Test => "test",
+                        crate::cgen::TestKind::Bench => "bench",
+                    };
+                    format!("{tag} {name}")
+                })
+                .collect();
+            assert_eq!(jestyr_cgen_dump_args(&exe, demo, &["list"]), want_list, "--list diverged");
+        }
+
+        // The harness must actually RUN: gcc-build jc1's test-mode C for tests_demo and check
+        // the pass/fail protocol end-to-end (2 tests pass, bench line present, exit 0).
+        let c_src = jestyr_cgen_dump_args(&exe, demo, &["test"]).join("\n") + "\n";
+        let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
+        let dir = std::env::temp_dir();
+        let cfile = dir.join("jestyr_testmode_demo.c");
+        let texe = dir.join(format!("jestyr_testmode_demo{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&cfile, &c_src).unwrap();
+        let mut cmd = Command::new(&cc);
+        cmd.args(crate::CC_FLAGS);
+        assert!(cmd.arg("-o").arg(&texe).arg(&cfile).status().unwrap().success(), "gcc failed on the test harness");
+        let out = Command::new(&texe).output().unwrap();
+        assert!(out.status.success(), "test harness exited non-zero");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(stdout.contains("running 2 test(s)"), "harness header wrong: {stdout}");
+        assert!(stdout.contains("test add_is_commutative ... ok"), "test line wrong: {stdout}");
+        assert!(stdout.contains("bench sum_to_1000 ... "), "bench line missing: {stdout}");
+        assert!(stdout.contains("result: 2 passed; 0 failed"), "tally wrong: {stdout}");
+        eprintln!("test-mode golden: {checked} file(s)' harness C byte-identical; demo harness ran green");
     }
 
     /// The self-hosting module closure, in the loader's DFS item order for
@@ -7949,11 +8059,16 @@ mod c_oracle {
         assert!(out2.status.success(), "jc2 failed on the flattened compiler");
         let c2 = String::from_utf8(out2.stdout).unwrap().replace("\r\n", "\n");
         assert!(c1 == c2, "FIXED POINT BROKEN: jc2's C for the compiler differs from jc1's");
-        // jc2 must also BE jc1 on unrelated input (same compiler, not just a quine).
+        // jc2 must also BE jc1 on unrelated input (same compiler, not just a quine) —
+        // in normal AND test mode.
         let probe = "examples/hello.jtr";
         let a = Command::new(&jc1).arg(probe).output().unwrap();
         let b = Command::new(&jc2).arg(probe).output().unwrap();
         assert_eq!(a.stdout, b.stdout, "jc1 and jc2 disagree on {probe}");
+        let tprobe = "examples/tests_demo.jtr";
+        let ta = Command::new(&jc1).args([tprobe, "test"]).output().unwrap();
+        let tb = Command::new(&jc2).args([tprobe, "test"]).output().unwrap();
+        assert_eq!(ta.stdout, tb.stdout, "jc1 and jc2 disagree on {tprobe} in test mode");
         eprintln!(
             "SELF-HOSTING FIXED POINT: jc2 ≡ jc1 on the compiler's own {} lines of C",
             c1.lines().count()
