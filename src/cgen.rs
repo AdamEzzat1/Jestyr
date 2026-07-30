@@ -220,6 +220,20 @@ fn emit_program(
                 false
             }
         }),
+        uses_run_command: ast.exprs.iter().any(|e| {
+            if let ExprKind::Call { callee, .. } = &e.kind {
+                matches!(&ast.expr_at(*callee).kind, ExprKind::Name(n) if n.name == "run_command")
+            } else {
+                false
+            }
+        }),
+        uses_eprint: ast.exprs.iter().any(|e| {
+            if let ExprKind::Call { callee, .. } = &e.kind {
+                matches!(&ast.expr_at(*callee).kind, ExprKind::Name(n) if n.name == "eprint_str")
+            } else {
+                false
+            }
+        }),
         task_handles: HashMap::new(),
         dyn_spawn_active: false,
         slice_instances: Vec::new(),
@@ -484,6 +498,11 @@ struct Cgen<'a> {
     /// the `JestyrResult_String` typedef are emitted *only when used* — keeping the
     /// C for every program that doesn't use it byte-identical.
     uses_try_read: bool,
+    /// `run_command(cmd) -> i32` (the self-hosted driver's gcc step) is used —
+    /// gate its runtime helper so unrelated programs stay byte-identical.
+    uses_run_command: bool,
+    /// `eprint_str(s)` (stderr diagnostics for the self-hosted driver) is used.
+    uses_eprint: bool,
     /// task handles (`let h = spawn …`) live in the current `concurrent` scope,
     /// keyed by binding name — consumed by `await`. Saved/restored across nesting.
     task_handles: HashMap<String, TaskHandle>,
@@ -751,6 +770,10 @@ impl<'a> Cgen<'a> {
         self.raw("static void jestyr_rt_print_float(double x) { printf(\"%g\\n\", x); }\n");
         self.raw("static void jestyr_rt_print_str(JestyrStr s) { printf(\"%.*s\\n\", (int) s.len, s.ptr); }\n");
         self.raw("static void jestyr_rt_print_bool(bool b) { printf(\"%s\\n\", b ? \"true\" : \"false\"); }\n\n");
+        if self.uses_eprint {
+            self.raw("/* Stderr line print (driver diagnostics) — same shape as print_str, other stream. */\n");
+            self.raw("static void jestyr_rt_eprint_str(JestyrStr s) { fprintf(stderr, \"%.*s\\n\", (int) s.len, s.ptr); }\n\n");
+        }
         self.raw("/* Jestyr file I/O (self-hosting plumbing): whole-file read/write. A `str` path\n");
         self.raw("   is a {ptr,len} view (not NUL-terminated), so each call copies it into a\n");
         self.raw("   NUL-terminated temporary for libc. Binary mode + whole-file-at-once = no\n");
@@ -768,6 +791,12 @@ impl<'a> Cgen<'a> {
         if self.uses_try_read {
             self.raw("/* Recoverable whole-file read: false on open/seek failure (the `String !IoError` err branch). */\n");
             self.raw("static bool jestyr_rt_try_read_file(JestyrStr path, JestyrString* out) { *out = jestyr_rt_str_new(); char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, \"rb\"); free(cp); if (!f) return false; if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; } long sz = ftell(f); if (sz < 0) { fclose(f); return false; } rewind(f); size_t cap = (size_t)sz ? (size_t)sz : 1; out->ptr = (char*)malloc(cap); out->cap = cap; out->len = fread(out->ptr, 1, (size_t)sz, f); fclose(f); return true; }\n");
+        }
+        // Driving an external command (the self-hosted driver's gcc invocation).
+        // Emitted only on use; reuses the NUL-terminating `jestyr_rt_cpath`.
+        if self.uses_run_command {
+            self.raw("/* Run an external command via system(): the self-hosted driver's compile step. */\n");
+            self.raw("static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); return (int32_t)rc; }\n");
         }
         self.raw("\n");
         self.raw("/* Command-line arguments (self-hosting plumbing): argv is captured in main()\n");
@@ -4675,6 +4704,14 @@ impl<'a> Cgen<'a> {
                              : ({rname}){{ .is_err = true, .err = 1 }}; }})"
                     );
                 }
+                "run_command" => {
+                    let c = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    return format!("jestyr_rt_run_command({c})");
+                }
+                "eprint_str" => {
+                    let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    return format!("jestyr_rt_eprint_str({s})");
+                }
                 "write_file" => {
                     let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
                     let d = args.get(1).map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
@@ -8231,6 +8268,7 @@ fn is_intrinsic(name: &str) -> bool {
             | "gen_new" | "gen_free" | "region_alloc" | "ok" | "err" | "is_err" | "unwrap"
             | "arena_open" | "arena_alloc" | "arena_close"
             | "read_file" | "try_read_file" | "write_file" | "file_exists" | "remove_file"
+            | "run_command" | "eprint_str"
             | "arg_count" | "arg"
     )
 }

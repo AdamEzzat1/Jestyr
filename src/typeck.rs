@@ -3276,6 +3276,9 @@ fn io_intrinsic_ret(name: &str) -> Option<Ty> {
         "read_file" => Ty::Prim("String"),
         "try_read_file" => Ty::Result(Box::new(Ty::Prim("String"))),
         "write_file" | "file_exists" | "remove_file" => Ty::Prim("bool"),
+        // The self-hosted driver's plumbing: drive gcc, print diagnostics to stderr.
+        "run_command" => Ty::Prim("i32"),
+        "eprint_str" => Ty::Unit,
         "arg_count" => Ty::Prim("i32"),
         "arg" => Ty::Prim("str"),
         _ => return None,

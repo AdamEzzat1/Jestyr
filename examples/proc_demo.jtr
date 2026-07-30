@@ -1,0 +1,16 @@
+// examples/proc_demo.jtr — the self-hosted driver's plumbing intrinsics.
+//
+// `run_command(cmd) -> i32` drives an external command via the C runtime's
+// system() (the driver's gcc step); `eprint_str(s)` prints a line to STDERR
+// (driver diagnostics), so compiler output on stdout stays clean C.
+//
+// `exit 0` is a shell builtin on both cmd.exe and POSIX sh, so the exit code
+// is 0 everywhere — the demo's stdout is platform-deterministic.
+
+fn main() -> i32 {
+    eprint_str("proc_demo: probing the shell (stderr only)")
+    let rc: i32 = run_command("exit 0")
+    print_int(rc as i64)
+    print_str("done")
+    return 0
+}

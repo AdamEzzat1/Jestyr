@@ -1483,6 +1483,8 @@ fn intrinsic_ret(mut c: Checker, t: str) -> i32 {
     if str_eq(t, "starts_with") or str_eq(t, "ends_with") or str_eq(t, "contains") { return t_bool() }
     if str_eq(t, "cow_is_owned") { return t_bool() }
     if str_eq(t, "write_file") or str_eq(t, "file_exists") or str_eq(t, "remove_file") { return t_bool() }
+    if str_eq(t, "run_command") { return t_i32() }
+    if str_eq(t, "eprint_str") { return t_unit() }
     if str_eq(t, "arg_count") { return t_i32() }
     if str_eq(t, "arg") { return t_str() }
     if str_eq(t, "atomic_load") or str_eq(t, "atomic_add") or str_eq(t, "atomic_sub") or str_eq(t, "atomic_xchg") { return t_i64() }
