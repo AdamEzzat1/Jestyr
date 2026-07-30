@@ -748,6 +748,64 @@ construct/degenerate fixes plus one real bug hunt.
   jc2 ≡ jc3 fixed point needs the MULTI-MODULE story (cgen.jtr compiling the multi-file
   compiler sources — imports/`#line`/module merge) + test mode for `jestyrc test` parity.
 
+### Increment 42 — R2-FULL: THE SELF-HOSTING FIXED POINT (jc2 ≡ jc1, 25,771 lines of C)
+
+**`selfhost_fixpoint_full` is GREEN: the Jestyr compiler, compiled by itself, reproduces its
+own compilation byte-for-byte** (`C1 = jc1(compiler source)`; `jc2 = gcc(C1)`;
+`C2 = jc2(same source)`; `C1 ≡ C2`, and jc1/jc2 agree on unrelated input). Route: the
+handoff's sanctioned **concatenated-source build**, NOT a module.rs port — the loader's own
+model ("parse every file into one shared arena, concatenate sources into one buffer;
+escape + cgen never learn there was more than one file") means a faithful flatten IS the
+module semantics minus typeck's visibility checks, vacuous for an already-checking program.
+What landed:
+
+- **`flatten_selfhost_concat()`** (proptests, c-oracle): merges the 9-module closure in the
+  loader's DFS item order (`mem, intern, fs, env, list, tokens, parser, typeck, cgen`) with a
+  token-level transform (real Lexer, so comments/strings are untouched): `import` decls
+  dropped; `binding.x` → `x` (an Ident in the module's import-binding set, followed by Dot,
+  not preceded by Dot); the SEVEN cross-module top-level collisions renamed `name__<module>`
+  (`make` list/intern — the only one used qualified — plus `mk_ty`/`run` parser/typeck and
+  `find_struct_method`/`first_runtime_param_ty`/`fn_is_fallible`/`push_uint` typeck/cgen).
+  Pre-verified safety facts: no colliding name is used via method-sugar or as a field; `fs`
+  doubles as a local-scalar name but locals are never field-accessed (the `B` before-Dot rule
+  can't misfire); no extern blocks; **the closure contains NO closures/f-strings/spawns, so
+  the `ref_expr_id` id-embedding liability is moot for the concat**. The flatten is validated
+  by the Rust front end (lex/parse/typeck/escape diag-free) inside the golden.
+- **Def-capture topological ordering** — the long-deferred `flush_def_capture` is REAL now
+  (first program to need it: `Parser`'s by-value `List(Token)`/`List(i32)` fields must follow
+  those instances' definitions). `struct Dc` + `dc_begin`/`dc_end`/`dc_dep`/`dc_find_dep`/
+  `dc_flush` in cgen.jtr: the eight aggregate-def sections emit into a capture String and
+  register each definition as a named segment with its by-value deps (rendered field ctys;
+  `*`-containing skipped, prims collected-but-inert, `|`-token dedup per definition); section
+  blanks land as anonymous glue pinned in place; the flush is the reference's stable
+  iterative post-order DFS, with LAST-match name resolution mirroring `by_name`'s
+  insert-overwrite. Deps use each section's own field renderer (`emit_c_ty` plain,
+  `emit_gs_ty` struct instances, `emit_field_ty_subst` enum instances, ok-cty for results).
+  **Provably a no-op without forward deps — the 130-file corpus golden stayed byte-identical
+  unchanged.**
+- **Blanket-drop completion** (the concat's `List(…)` locals + fields): (1)
+  `register_drop_local` now falls through to the Checker's init type whenever the annotation
+  is NOT a bare Name — an App-annotated `var tmp: List(i32) = …` registers via the kind-6
+  sentinel path (the reference keys drops on the local's resolved Ty, not the annotation's
+  spelling); (2) `needs_drop_ast_ty` gained the kind-7 App arm (droppable iff
+  `generic_drop_impl_of(ctor)` hits); (3) both `emit_drop_place` recursion arms dispatch an
+  App-typed field/payload to the new `emit_app_drop` — the direct
+  `jestyr_impl_Drop__<key>__drop(&place);` call with NO recursion into the instance
+  (the reference's `aggregate_drop_fields` is Named-only); (4) `push_ast_key_safe`, the
+  annotation-side ty-key sanitizer (`List(i32)` → `List_i32_`). This makes a `Parser`-typed
+  local's scope-exit glue emit the reverse-decl-order chain of monomorphized drops.
+- **Rust-side subset trap** (do not re-derive): `string_view(x).len` CHAINED is not typed
+  `str` by the checker — it lowers to `j_len` and breaks gcc. Bind `let v: str =
+  string_view(x)` first (all existing corpus code already does).
+- **Tests**: `jestyr_cgen_concat_matches_reference` (c-oracle) — flatten validity + the
+  concat's C byte-identical through jc1 (25,771 lines); `selfhost_fixpoint_full`
+  (selfhost-fixpoint) — the fixed point itself, jc2 linked with the same
+  `-Wl,--stack,67108864` headroom. The concat is written to
+  `%TEMP%/jestyr_selfhost_concat.jtr` for hand-debugging.
+- **REMAINING in workstream P**: test mode (`jestyrc test` harness parity) only. True
+  in-language multi-module (imports/`#line`/module merge inside cgen.jtr) is now optional
+  polish — the fixed point does not need it.
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
