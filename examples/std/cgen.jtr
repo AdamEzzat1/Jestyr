@@ -213,8 +213,15 @@ fn emit_c_ty(mut sb: String, read p: parser.Parser, read src: str, tyid: i32) {
             emit_c_ty(sb, p, src, list.get(i32, p.ear, (list.get(i32, p.ear, (nvb + 2) as usize) + 2) as usize))
             return
         }
-        string_push(sb, "Jestyr_")                     // a user type: its Jestyr_<name> C symbol
-        string_push(sb, nm)
+        // a DECLARED user type lowers to its `Jestyr_<name>` typedef; an unresolved name
+        // (an import's type in the single-file golden path) degenerates to `int`, exactly
+        // like the reference's external-type diag arm.
+        if find_named_item(p, src, t.start as i32, t.end as i32) >= 0 {
+            string_push(sb, "Jestyr_")
+            string_push(sb, nm)
+            return
+        }
+        string_push(sb, "int")
         return
     }
     if t.kind == 2 {                                   // Ptr: `<inner>*`
@@ -1216,6 +1223,54 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             let btid: i32 = list.get(i32, c.et, tgt.a as usize)
             if btid >= 0 {
                 let bd: typeck.TyData = list.get(typeck.TyData, c.tys, btid as usize)
+                if bd.kind == 8 {                     // slice-index WRITE: fold into the stmt-expr
+                    var sbb: String = string_new()    // base/index/VALUE emit before the temp
+                    emit_expr(sbb, p, src, c, g, tgt.a)
+                    var sib: String = string_new()
+                    emit_expr(sib, p, src, c, g, tgt.b)
+                    var svb: String = string_new()
+                    emit_expr(svb, p, src, c, g, e.b)
+                    if index_in_range(g, p, src, tgt.a, tgt.b) {   // a refinement proves the bound
+                        string_push(sb, "(")
+                        string_push(sb, string_view(sbb))
+                        string_push(sb, ").ptr[(")
+                        string_push(sb, string_view(sib))
+                        string_push(sb, ")] ")
+                        string_push(sb, assign_c(e.op))
+                        string_push(sb, " ")
+                        string_push(sb, string_view(svb))
+                    } else {
+                        let n2: i32 = g.tmp
+                        g.tmp = g.tmp + 1
+                        string_push(sb, "({ ")
+                        emit_ty_c(sb, p, src, c, btid)
+                        string_push(sb, " _s")
+                        push_uint(sb, n2 as i64)
+                        string_push(sb, " = (")
+                        string_push(sb, string_view(sbb))
+                        string_push(sb, "); size_t _ix")
+                        push_uint(sb, n2 as i64)
+                        string_push(sb, " = (size_t)(")
+                        string_push(sb, string_view(sib))
+                        string_push(sb, "); assert(_ix")
+                        push_uint(sb, n2 as i64)
+                        string_push(sb, " < _s")
+                        push_uint(sb, n2 as i64)
+                        string_push(sb, ".len); _s")
+                        push_uint(sb, n2 as i64)
+                        string_push(sb, ".ptr[_ix")
+                        push_uint(sb, n2 as i64)
+                        string_push(sb, "] ")
+                        string_push(sb, assign_c(e.op))
+                        string_push(sb, " ")
+                        string_push(sb, string_view(svb))
+                        string_push(sb, "; })")
+                    }
+                    string_free(sbb)
+                    string_free(sib)
+                    string_free(svb)
+                    return
+                }
                 if bd.kind == 9 {                     // array-index WRITE: fold into the stmt-expr
                     var bbuf: String = string_new()   // base/index/VALUE emit before the temp
                     emit_expr(bbuf, p, src, c, g, tgt.a)
@@ -1931,6 +1986,157 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             }
             string_push(sb, ")")
             return
+        }
+        // A FREE-fn method-sugar call (`mcalls`): `xs.push(10)` lowers to the free fn with the
+        // receiver as the first argument — a generic target names its instance with targs
+        // RECOVERED from the receiver (su-resolved), a plain target calls directly. Free
+        // resolution outranks a struct-node method, mirroring typeck's order.
+        let mcf: i32 = mcall_of(c, eid)
+        if mcf >= 0 {
+            let mfd: parser.ItemData = list.get(parser.ItemData, p.it, mcf as usize)
+            string_push(sb, "jestyr_")
+            string_push(sb, src[mfd.x .. mfd.y])
+            if fn_is_gen(p, mfd) {
+                string_push(sb, "__")
+                let rtid2: i32 = list.get(i32, c.et, callee.a as usize)
+                var mt: i32 = 0
+                var mpi: i32 = 0
+                let mrp: i32 = first_runtime_param_ty(p, mcf)
+                for mpi < mfd.b {
+                    let mbase: i32 = mfd.a + mpi * 7
+                    if list.get(i32, p.iar, mbase as usize) == 1 {
+                        let mpty: i32 = list.get(i32, p.iar, (mbase + 5) as usize)
+                        if mpty >= 0 {
+                            let mtd: parser.TypeData = list.get(parser.TypeData, p.ty, mpty as usize)
+                            if mtd.kind == 1 {
+                                if mt > 0 { string_push(sb, "_") }
+                                let midx: i32 = app_targ_index(p, src, mrp, list.get(i32, p.iar, (mbase + 2) as usize) as usize, list.get(i32, p.iar, (mbase + 3) as usize) as usize)
+                                var mdone: bool = false
+                                if midx >= 0 and rtid2 >= 0 {
+                                    let mrd: typeck.TyData = list.get(typeck.TyData, c.tys, rtid2 as usize)
+                                    if mrd.kind == 6 and midx < mrd.b {
+                                        let marg: i32 = list.get(i32, c.tya, (mrd.a + midx) as usize)
+                                        let mad: typeck.TyData = list.get(typeck.TyData, c.tys, marg as usize)
+                                        if mad.kind == 4 {   // Opaque tparam: resolve via g.su
+                                            let msl: i32 = su_slot(src, g, mad.x as usize, mad.y as usize)
+                                            if msl >= 0 {
+                                                push_targ_mangle(sb, src, c, list.get(i32, g.su, (msl + 2) as usize), list.get(i32, g.su, (msl + 3) as usize), list.get(i32, g.su, (msl + 4) as usize))
+                                                mdone = true
+                                            }
+                                        }
+                                        if !mdone { push_ty_mangle(sb, src, c, marg)  mdone = true }
+                                    }
+                                }
+                                if !mdone { string_push(sb, "x") }
+                                mt = mt + 1
+                            }
+                        }
+                    }
+                    mpi = mpi + 1
+                }
+            }
+            string_push(sb, "(")
+            // the receiver takes the FIRST runtime param's convention…
+            var mrconv: i32 = 0
+            var mfirst: i32 = 0 - 1
+            var mj: i32 = 0
+            for mj < mfd.b {
+                let mb2: i32 = mfd.a + mj * 7
+                if mfirst < 0 and list.get(i32, p.iar, mb2 as usize) == 0 {
+                    mfirst = mj
+                    mrconv = list.get(i32, p.iar, (mb2 + 1) as usize)
+                }
+                mj = mj + 1
+            }
+            if mrconv == 2 or mrconv == 4 {
+                string_push(sb, "&(")
+                emit_expr(sb, p, src, c, g, callee.a)
+                string_push(sb, ")")
+            } else {
+                emit_expr(sb, p, src, c, g, callee.a)
+            }
+            // …and each call arg the convention of the runtime param AFTER it.
+            var mai: i32 = 0
+            for mai < e.y {
+                string_push(sb, ", ")
+                var mbyref: bool = false
+                let mpidx: i32 = mfirst + 1 + mai
+                if mpidx < mfd.b {
+                    let mb3: i32 = mfd.a + mpidx * 7
+                    if list.get(i32, p.iar, mb3 as usize) == 0 {
+                        let mpc: i32 = list.get(i32, p.iar, (mb3 + 1) as usize)
+                        if mpc == 2 or mpc == 4 { mbyref = true }
+                    }
+                }
+                if mbyref { string_push(sb, "&(") }
+                emit_expr(sb, p, src, c, g, arg_at(p, e, mai))
+                if mbyref { string_push(sb, ")") }
+                mai = mai + 1
+            }
+            string_push(sb, ")")
+            return
+        }
+        // A GENERIC-struct method call: the receiver's kind-6 instance type (su-resolved
+        // inside template bodies) names the monomorphized `jestyr_<Ctor>__<mangles>_<method>`;
+        // the receiver passes by `&` for a `mut`/`out self`, args honour the method's convs
+        // (the method must live in the ctor's struct node — an impl method never hijacks).
+        let grt: i32 = list.get(i32, c.et, callee.a as usize)
+        if grt >= 0 {
+            let grd: typeck.TyData = list.get(typeck.TyData, c.tys, grt as usize)
+            if grd.kind == 6 {
+                let cfit: i32 = gstruct_ctor_fn(p, src, c, grt)
+                if cfit >= 0 {
+                    let mfit: i32 = gnode_method(p, src, cfit, callee.x as usize, callee.y as usize)
+                    if mfit >= 0 {
+                        string_push(sb, "jestyr_")
+                        string_push(sb, src[grd.x as usize .. grd.y as usize])
+                        string_push(sb, "__")
+                        var gi2: i32 = 0
+                        for gi2 < grd.b {
+                            if gi2 > 0 { string_push(sb, "_") }
+                            let garg: i32 = list.get(i32, c.tya, (grd.a + gi2) as usize)
+                            let gad: typeck.TyData = list.get(typeck.TyData, c.tys, garg as usize)
+                            var gdone: bool = false
+                            if gad.kind == 4 {         // an Opaque tparam arg: resolve via g.su
+                                let gsl: i32 = su_slot(src, g, gad.x as usize, gad.y as usize)
+                                if gsl >= 0 {
+                                    push_targ_mangle(sb, src, c, list.get(i32, g.su, (gsl + 2) as usize), list.get(i32, g.su, (gsl + 3) as usize), list.get(i32, g.su, (gsl + 4) as usize))
+                                    gdone = true
+                                }
+                            }
+                            if !gdone { push_ty_mangle(sb, src, c, garg) }
+                            gi2 = gi2 + 1
+                        }
+                        string_push(sb, "_")
+                        string_push(sb, src[callee.x as usize .. callee.y as usize])
+                        string_push(sb, "(")
+                        let gsconv: i32 = method_self_conv(p, mfit)
+                        if gsconv == 2 or gsconv == 4 {
+                            string_push(sb, "&(")
+                            emit_expr(sb, p, src, c, g, callee.a)
+                            string_push(sb, ")")
+                        } else {
+                            emit_expr(sb, p, src, c, g, callee.a)
+                        }
+                        let gfd: parser.ItemData = list.get(parser.ItemData, p.it, mfit as usize)
+                        var gai: i32 = 0
+                        for gai < e.y {
+                            string_push(sb, ", ")
+                            var gbyref: bool = false
+                            if gai + 1 < gfd.b {
+                                let gpconv: i32 = list.get(i32, p.iar, (gfd.a + (gai + 1) * 7 + 1) as usize)
+                                if gpconv == 2 or gpconv == 4 { gbyref = true }
+                            }
+                            if gbyref { string_push(sb, "&(") }
+                            emit_expr(sb, p, src, c, g, arg_at(p, e, gai))
+                            if gbyref { string_push(sb, ")") }
+                            gai = gai + 1
+                        }
+                        string_push(sb, ")")
+                        return
+                    }
+                }
+            }
         }
         // An impl-dispatched call (recorded in the Checker's `icalls` 5-tuples): a DIRECT,
         // statically-dispatched call of `jestyr_impl_<Trait>__<TypeKey>__<method>`, the key
@@ -2777,7 +2983,7 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // `gfi` holds the collected generic-fn instance records ([fn item, argc, (kind,a,b) targ
 // triples…], variable length — walk with a cursor); `su` is the ACTIVE instance's
 // type-parameter substitution (5-tuples: tparam span + arg triple), read by `emit_su_ty`.
-struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32, dg: i32 }
+struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32, dg: i32, gmi: List(i32) }
 
 // The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
 // (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
@@ -3154,6 +3360,159 @@ fn gfind_call_check(mut wk: List(i32), mut wks: List(i32), read p: parser.Parser
     let argc: i32 = gcall_targs(wk, p, src, c, fit, e)
     list.set(i32, wk, (rb + 1) as usize, argc)
     list.push(i32, wks, rb)
+    list.push(i32, wks, 0)                            // tag 0 = a generic FN record
+}
+
+// The method fn item named `src[ns..ne]` among a comptime struct ctor's tag-1 members, or -1.
+fn gnode_method(read p: parser.Parser, read src: str, cfit: i32, ns: usize, ne: usize) -> i32 {
+    let node: i32 = ctor_struct_node(p, cfit)
+    if node < 0 { return 0 - 1 }
+    let sx: parser.ExprData = list.get(parser.ExprData, p.ex, node as usize)
+    var m: i32 = 0
+    for m < sx.y {
+        let mb: i32 = sx.x + m * 10
+        if list.get(i32, p.mar, mb as usize) == 1 {
+            let mid: i32 = list.get(i32, p.mar, (mb + 1) as usize)
+            let fd: parser.ItemData = list.get(parser.ItemData, p.it, mid as usize)
+            if str_eq(src[fd.x .. fd.y], src[ns .. ne]) { return mid }
+        }
+        m = m + 1
+    }
+    return 0 - 1
+}
+
+// The `mcalls` record for call `eid` (a method-sugar call typeck resolved to a FREE fn), or -1.
+fn mcall_of(read c: typeck.Checker, eid: i32) -> i32 {
+    var i: usize = 0
+    for i < list.len(i32, c.mcalls) {
+        if list.get(i32, c.mcalls, i) == eid { return list.get(i32, c.mcalls, i + 1) }
+        i = i + 2
+    }
+    return 0 - 1
+}
+
+// The first non-comptime param's annotation TypeId of fn `fit` (the free method's RECEIVER
+// param), or -1.
+fn first_runtime_param_ty(read p: parser.Parser, fit: i32) -> i32 {
+    let f: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
+    var i: i32 = 0
+    for i < f.b {
+        let base: i32 = f.a + i * 7
+        if list.get(i32, p.iar, base as usize) == 0 {
+            return list.get(i32, p.iar, (base + 5) as usize)
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// The index of the App type-arg that is exactly the bare Name `src[ns..ne]`, or -1
+// (`List(T)` -> index of `T`). Recovers a comptime targ position from the receiver param.
+fn app_targ_index(read p: parser.Parser, read src: str, appty: i32, ns: usize, ne: usize) -> i32 {
+    if appty < 0 { return 0 - 1 }
+    let t: parser.TypeData = list.get(parser.TypeData, p.ty, appty as usize)
+    if t.kind != 7 { return 0 - 1 }
+    var i: i32 = 0
+    for i < t.a {
+        let at: parser.TypeData = list.get(parser.TypeData, p.ty, list.get(i32, p.tar, (t.op + i) as usize) as usize)
+        if at.kind == 0 {
+            if str_eq(src[at.start .. at.end], src[ns .. ne]) { return i }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// A free-method sugar call (`xs.push(10)` -> `push(i32, xs, 10)`, recorded in `mcalls`): each
+// comptime-TYPE targ is RECOVERED from the receiver — the tparam's position in the receiver
+// param's `Ctor(T…)` annotation indexes the receiver's kind-6 instance args. Appends (kind,a,b)
+// triples; returns the count. Mirrors MethodRes.type_args.
+fn gmcall_targs(mut dst: List(i32), read p: parser.Parser, read src: str, read c: typeck.Checker, fit: i32, recv_tid: i32) -> i32 {
+    let f: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
+    let rp: i32 = first_runtime_param_ty(p, fit)
+    var count: i32 = 0
+    var i: i32 = 0
+    for i < f.b {
+        let base: i32 = f.a + i * 7
+        if list.get(i32, p.iar, base as usize) == 1 {
+            let pty: i32 = list.get(i32, p.iar, (base + 5) as usize)
+            if pty >= 0 {
+                let t: parser.TypeData = list.get(parser.TypeData, p.ty, pty as usize)
+                if t.kind == 1 {
+                    let pns: i32 = list.get(i32, p.iar, (base + 2) as usize)
+                    let pne: i32 = list.get(i32, p.iar, (base + 3) as usize)
+                    let idx: i32 = app_targ_index(p, src, rp, pns as usize, pne as usize)
+                    var done: bool = false
+                    if idx >= 0 and recv_tid >= 0 {
+                        let d: typeck.TyData = list.get(typeck.TyData, c.tys, recv_tid as usize)
+                        if d.kind == 6 and idx < d.b {
+                            list.push(i32, dst, 1)
+                            list.push(i32, dst, list.get(i32, c.tya, (d.a + idx) as usize))
+                            list.push(i32, dst, 0 - 1)
+                            done = true
+                        }
+                    }
+                    if !done {
+                        list.push(i32, dst, 2)        // unresolved -> `x`
+                        list.push(i32, dst, 0 - 1)
+                        list.push(i32, dst, 0 - 1)
+                    }
+                    count = count + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// A free-method sugar call to a GENERIC free fn pushes a plain Fn record with the recovered
+// targs (mirrors Work::Fn from a MethodRes with no recv_ctor).
+fn gmcall_check(mut wk: List(i32), mut wks: List(i32), read p: parser.Parser, read src: str, read c: typeck.Checker, read e: parser.ExprData, eid: i32) {
+    let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+    if callee.kind != 5 { return }
+    let fit: i32 = mcall_of(c, eid)
+    if fit < 0 { return }
+    let f: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
+    if !fn_is_gen(p, f) { return }
+    let rb: i32 = list.len(i32, wk) as i32
+    list.push(i32, wk, fit)
+    list.push(i32, wk, 0)
+    let argc: i32 = gmcall_targs(wk, p, src, c, fit, list.get(i32, c.et, callee.a as usize))
+    list.set(i32, wk, (rb + 1) as usize, argc)
+    list.push(i32, wks, rb)
+    list.push(i32, wks, 0)                            // an ordinary Fn record
+}
+
+// A method-sugar call whose receiver's Checker type is a generic-struct instance (kind 6,
+// comptime struct ctor) pushes a METHOD record: [method fn item, argc, (kind,a,b)×argc from
+// the RECEIVER's instance args, ctor fn item]. Mirrors `Work::Method` — the receiver's type
+// args ARE the instance's (an Opaque arg inside a template body remaps like any other).
+fn gmethod_check(mut wk: List(i32), mut wks: List(i32), read p: parser.Parser, read src: str, read c: typeck.Checker, read e: parser.ExprData, eid: i32) {
+    if mcall_of(c, eid) >= 0 { return }               // a FREE method resolved first (typeck order)
+    let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+    if callee.kind != 5 { return }
+    let rtid: i32 = list.get(i32, c.et, callee.a as usize)
+    if rtid < 0 { return }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, rtid as usize)
+    if d.kind != 6 { return }
+    let cfit: i32 = gstruct_ctor_fn(p, src, c, rtid)
+    if cfit < 0 { return }
+    let mfit: i32 = gnode_method(p, src, cfit, callee.x as usize, callee.y as usize)
+    if mfit < 0 { return }
+    let rb: i32 = list.len(i32, wk) as i32
+    list.push(i32, wk, mfit)
+    list.push(i32, wk, d.b)
+    var i: i32 = 0
+    for i < d.b {
+        list.push(i32, wk, 1)                         // kind 1 = a Checker TyId arg
+        list.push(i32, wk, list.get(i32, c.tya, (d.a + i) as usize))
+        list.push(i32, wk, 0 - 1)
+        i = i + 1
+    }
+    list.push(i32, wk, cfit)                          // trailing ctor item
+    list.push(i32, wks, rb)
+    list.push(i32, wks, 1)                            // tag 1 = a METHOD record
 }
 
 fn gfind_expr(mut wk: List(i32), mut wks: List(i32), read p: parser.Parser, read src: str, read c: typeck.Checker, eid: i32) {
@@ -3167,6 +3526,8 @@ fn gfind_expr(mut wk: List(i32), mut wks: List(i32), read p: parser.Parser, read
             i = i + 1
         }
         gfind_call_check(wk, wks, p, src, c, e)
+        gmcall_check(wk, wks, p, src, c, e, eid)      // free-method sugar first (typeck's order)
+        gmethod_check(wk, wks, p, src, c, e, eid)
         return
     }
     if e.kind == 4 or e.kind == 6 or e.kind == 12 {   // Binary / Index / Assign
@@ -3272,39 +3633,66 @@ fn collect_gfn_instances(mut g: Cg, read p: parser.Parser, read src: str, read c
         r = r + 1
     }
     var seen: String = string_new()
-    for list.len(i32, wks) > 0 {
-        let rb: i32 = list.get(i32, wks, list.len(i32, wks) - 1)
-        list.truncate(i32, wks, list.len(i32, wks) - 1)
+    for list.len(i32, wks) > 0 {                      // (rb, tag) pairs; tag 1 = a METHOD record
+        let tag: i32 = list.get(i32, wks, list.len(i32, wks) - 1)
+        let rb: i32 = list.get(i32, wks, list.len(i32, wks) - 2)
+        list.truncate(i32, wks, list.len(i32, wks) - 2)
         var probe: String = string_new()
         string_push(probe, "|")
-        push_gfn_name(probe, p, src, c, wk, rb)
+        if tag == 1 { string_push(probe, "m:")  push_gmi_name(probe, p, src, c, wk, rb) }
+        else { push_gfn_name(probe, p, src, c, wk, rb) }
         string_push(probe, "|")
         if !contains(string_view(seen), string_view(probe)) {
             string_push(seen, string_view(probe))
             let argc: i32 = list.get(i32, wk, (rb + 1) as usize)
+            var reclen: i32 = 2 + argc * 3
+            if tag == 1 { reclen = reclen + 1 }       // + the trailing ctor item
             var t: i32 = 0
-            for t < 2 + argc * 3 {
-                list.push(i32, g.gfi, list.get(i32, wk, (rb + t) as usize))
+            for t < reclen {
+                if tag == 1 { list.push(i32, g.gmi, list.get(i32, wk, (rb + t) as usize)) }
+                else { list.push(i32, g.gfi, list.get(i32, wk, (rb + t) as usize)) }
                 t = t + 1
             }
-            // A generic calling a generic: walk THIS instance's template body for nested
-            // template calls, then resolve each new record's tparam-typed args through this
-            // record's bindings (the reference's subst-aware `collect_all_instances` worklist;
-            // dedup-on-pop bounds recursion).
+            // A generic calling a generic: walk THIS instance's template/method body for
+            // nested template calls, then resolve each new record's tparam-typed args through
+            // this record's bindings (the reference's subst-aware `collect_all_instances`
+            // worklist; dedup-on-pop bounds recursion). A METHOD's tparams are its CTOR's.
+            var ctx: i32 = list.get(i32, wk, rb as usize)
+            if tag == 1 { ctx = list.get(i32, wk, (rb + 2 + argc * 3) as usize) }
             let f2: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, wk, rb as usize) as usize)
             if f2.w >= 0 {
                 let before: usize = list.len(i32, wks)
                 gfind_block(wk, wks, p, src, c, f2.w)
                 var nw: usize = before
                 for nw < list.len(i32, wks) {
-                    remap_targs(wk, p, src, c, rb, list.get(i32, wks, nw))
-                    nw = nw + 1
+                    remap_targs(wk, p, src, c, ctx, rb, list.get(i32, wks, nw))
+                    nw = nw + 2
                 }
             }
         }
         string_free(probe)
     }
     string_free(seen)
+}
+
+// The C name of a monomorphized generic-struct method, `jestyr_<Ctor>__<mangles>_<method>`
+// (mirrors `method_c_name`). Record layout: [method fn item, argc, triples…, ctor fn item].
+fn push_gmi_name(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, read lst: List(i32), rb: i32) {
+    let argc: i32 = list.get(i32, lst, (rb + 1) as usize)
+    let cf: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, lst, (rb + 2 + argc * 3) as usize) as usize)
+    let mf: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, lst, rb as usize) as usize)
+    string_push(sb, "jestyr_")
+    string_push(sb, src[cf.x .. cf.y])
+    string_push(sb, "__")
+    var t: i32 = 0
+    for t < argc {
+        if t > 0 { string_push(sb, "_") }
+        let tb: i32 = rb + 2 + t * 3
+        push_targ_mangle(sb, src, c, list.get(i32, lst, tb as usize), list.get(i32, lst, (tb + 1) as usize), list.get(i32, lst, (tb + 2) as usize))
+        t = t + 1
+    }
+    string_push(sb, "_")
+    string_push(sb, src[mf.x .. mf.y])
 }
 
 // The index of tparam `src[ns..ne]` in fn `f`'s INSTANCE type-arg order (comptime-type params
@@ -3343,8 +3731,8 @@ fn tparam_index_of(read p: parser.Parser, read src: str, read f: parser.ItemData
 // Rewrite the type-arg triples of a record discovered INSIDE an instance body: a kind-0 span
 // (or a kind-1 Opaque) naming one of the ENCLOSING record's tparams takes that record's
 // binding triple — so `load_cell(T, …)` inside `chan_recv__i64` records as `load_cell__i64`.
-fn remap_targs(mut wk: List(i32), read p: parser.Parser, read src: str, read c: typeck.Checker, outer_rb: i32, new_rb: i32) {
-    let of_: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, wk, outer_rb as usize) as usize)
+fn remap_targs(mut wk: List(i32), read p: parser.Parser, read src: str, read c: typeck.Checker, ctx_fit: i32, outer_rb: i32, new_rb: i32) {
+    let of_: parser.ItemData = list.get(parser.ItemData, p.it, ctx_fit as usize)
     let argc: i32 = list.get(i32, wk, (new_rb + 1) as usize)
     var t: i32 = 0
     for t < argc {
@@ -6159,6 +6547,83 @@ fn emit_method_sig(mut sb: String, read p: parser.Parser, read src: str, read sd
 
 // Method prototypes (mirrors `method_protos`): one `<sig>;` per collected (struct, method)
 // instance, then the section's unconditional trailing blank.
+// Arm `g.su` from generic-method record `rb` in `g.gmi`: the CTOR's `comptime X: type` param
+// names (declaration order) zip with the record's receiver-arg triples. The caller clears it.
+fn arm_gmi_su(mut g: Cg, read p: parser.Parser, rb: i32) {
+    let argc: i32 = list.get(i32, g.gmi, (rb + 1) as usize)
+    let cf: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, g.gmi, (rb + 2 + argc * 3) as usize) as usize)
+    list.truncate(i32, g.su, 0)
+    var ai: i32 = 0
+    var i: i32 = 0
+    for i < cf.b {
+        let base: i32 = cf.a + i * 7
+        if list.get(i32, p.iar, base as usize) == 1 {
+            let pty: i32 = list.get(i32, p.iar, (base + 5) as usize)
+            if pty >= 0 {
+                let t: parser.TypeData = list.get(parser.TypeData, p.ty, pty as usize)
+                if t.kind == 1 and ai < argc {
+                    let ab: i32 = rb + 2 + ai * 3
+                    list.push(i32, g.su, list.get(i32, p.iar, (base + 2) as usize))
+                    list.push(i32, g.su, list.get(i32, p.iar, (base + 3) as usize))
+                    list.push(i32, g.su, list.get(i32, g.gmi, ab as usize))
+                    list.push(i32, g.su, list.get(i32, g.gmi, (ab + 1) as usize))
+                    list.push(i32, g.su, list.get(i32, g.gmi, (ab + 2) as usize))
+                    ai = ai + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// The monomorphized method's signature `<ret> jestyr_<Ctor>__<mangles>_<method>(<self>, …)` —
+// `self` as the instance struct (by `* restrict` for `mut`/`out self`), other params under the
+// substitution. Arms `g.su` and leaves it set for the body (mirrors `emit_method_decl`).
+fn emit_gmi_sig(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, rb: i32) {
+    let mfit: i32 = list.get(i32, g.gmi, rb as usize)
+    let mf: parser.ItemData = list.get(parser.ItemData, p.it, mfit as usize)
+    let argc: i32 = list.get(i32, g.gmi, (rb + 1) as usize)
+    let cf: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, g.gmi, (rb + 2 + argc * 3) as usize) as usize)
+    arm_gmi_su(g, p, rb)
+    emit_su_ty(sb, p, src, c, g, mf.z)
+    string_push(sb, " ")
+    push_gmi_name(sb, p, src, c, g.gmi, rb)
+    string_push(sb, "(")
+    var emitted: i32 = 0
+    var pi: i32 = 0
+    for pi < mf.b {
+        let base: i32 = mf.a + pi * 7
+        if list.get(i32, p.iar, (base + 4) as usize) == 1 {   // self: the instance struct
+            if emitted > 0 { string_push(sb, ", ") }
+            string_push(sb, "Jestyr_")
+            string_push(sb, src[cf.x .. cf.y])
+            string_push(sb, "__")
+            var t: i32 = 0
+            for t < argc {
+                if t > 0 { string_push(sb, "_") }
+                let tb: i32 = rb + 2 + t * 3
+                push_targ_mangle(sb, src, c, list.get(i32, g.gmi, tb as usize), list.get(i32, g.gmi, (tb + 1) as usize), list.get(i32, g.gmi, (tb + 2) as usize))
+                t = t + 1
+            }
+            let sconv: i32 = list.get(i32, p.iar, (base + 1) as usize)
+            if sconv == 2 or sconv == 4 { string_push(sb, "* restrict") }
+            string_push(sb, " j_self")
+            emitted = emitted + 1
+        } else if list.get(i32, p.iar, base as usize) == 0 {
+            if emitted > 0 { string_push(sb, ", ") }
+            let conv: i32 = list.get(i32, p.iar, (base + 1) as usize)
+            emit_su_ty(sb, p, src, c, g, list.get(i32, p.iar, (base + 5) as usize))
+            if conv == 2 or conv == 4 { string_push(sb, "* restrict") }
+            string_push(sb, " j_")
+            string_push(sb, src[list.get(i32, p.iar, (base + 2) as usize) as usize .. list.get(i32, p.iar, (base + 3) as usize) as usize])
+            emitted = emitted + 1
+        }
+        pi = pi + 1
+    }
+    if emitted == 0 { string_push(sb, "void") }
+    string_push(sb, ")")
+}
+
 fn emit_method_protos(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg) {
     var k: usize = 0
     for k < list.len(i32, g.mi) {
@@ -6167,6 +6632,14 @@ fn emit_method_protos(mut sb: String, read p: parser.Parser, read src: str, read
         emit_method_sig(sb, p, src, sd, fd)
         string_push(sb, ";\n")
         k = k + 2
+    }
+    var rb: i32 = 0                                   // monomorphized generic-struct methods
+    for rb < list.len(i32, g.gmi) as i32 {
+        emit_gmi_sig(sb, p, src, c, g, rb)
+        string_push(sb, ";\n")
+        list.truncate(i32, g.su, 0)
+        let argc: i32 = list.get(i32, g.gmi, (rb + 1) as usize)
+        rb = rb + 3 + argc * 3
     }
     string_push(sb, "\n")
 }
@@ -6206,6 +6679,38 @@ fn emit_method_defs(mut sb: String, read p: parser.Parser, read src: str, read c
         list.truncate(i32, g.pp, 0)
         string_push(sb, "\n")
         k = k + 2
+    }
+    var rb: i32 = 0                                   // monomorphized generic-struct method bodies
+    for rb < list.len(i32, g.gmi) as i32 {
+        let mfit: i32 = list.get(i32, g.gmi, rb as usize)
+        let mf: parser.ItemData = list.get(parser.ItemData, p.it, mfit as usize)
+        emit_gmi_sig(sb, p, src, c, g, rb)            // arms g.su; the body runs under it
+        string_push(sb, "\n")
+        list.truncate(i32, g.pp, 0)
+        var pi: i32 = 0
+        for pi < mf.b {
+            let pbase: i32 = mf.a + pi * 7
+            let pconv: i32 = list.get(i32, p.iar, (pbase + 1) as usize)
+            if list.get(i32, p.iar, (pbase + 4) as usize) == 0 and (pconv == 2 or pconv == 4) {
+                list.push(i32, g.pp, list.get(i32, p.iar, (pbase + 2) as usize))
+                list.push(i32, g.pp, list.get(i32, p.iar, (pbase + 3) as usize))
+            }
+            pi = pi + 1
+        }
+        let sconv: i32 = method_self_conv(p, mfit)
+        g.self_ptr = sconv == 2 or sconv == 4
+        g.retty = mf.z
+        g.curfn = mfit
+        g.autoret = true
+        emit_body(sb, p, src, c, g, mf.w, mf.z >= 0, 0)
+        g.self_ptr = false
+        g.retty = 0 - 1
+        g.autoret = false
+        list.truncate(i32, g.pp, 0)
+        list.truncate(i32, g.su, 0)
+        string_push(sb, "\n")
+        let argc: i32 = list.get(i32, g.gmi, (rb + 1) as usize)
+        rb = rb + 3 + argc * 3
     }
 }
 
@@ -7343,6 +7848,31 @@ fn collect_gstruct_instances(mut g: Cg, read p: parser.Parser, read src: str, re
         list.truncate(i32, g.su, 0)
         let argc: i32 = list.get(i32, g.gfi, (rb + 1) as usize)
         rb = rb + 2 + argc * 3
+    }
+    // (c) each generic-struct METHOD instance: its receiver struct, then the method's
+    // sig+body under the ctor substitution (mirrors the reference's method_instances pass).
+    var mb: i32 = 0
+    for mb < list.len(i32, g.gmi) as i32 {
+        let argc2: i32 = list.get(i32, g.gmi, (mb + 1) as usize)
+        let cf: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, g.gmi, (mb + 2 + argc2 * 3) as usize) as usize)
+        var key: String = string_new()
+        string_push(key, "Jestyr_")
+        string_push(key, src[cf.x .. cf.y])
+        string_push(key, "__")
+        var t2: i32 = 0
+        for t2 < argc2 {
+            if t2 > 0 { string_push(key, "_") }
+            let tb2: i32 = mb + 2 + t2 * 3
+            push_targ_mangle(key, src, c, list.get(i32, g.gmi, tb2 as usize), list.get(i32, g.gmi, (tb2 + 1) as usize), list.get(i32, g.gmi, (tb2 + 2) as usize))
+            t2 = t2 + 1
+        }
+        gsi_add_key(g, p, src, c, string_view(key), seen)
+        string_free(key)
+        arm_gmi_su(g, p, mb)
+        let mf: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, g.gmi, mb as usize) as usize)
+        gsw_fn(g, p, src, c, seen, mf)
+        list.truncate(i32, g.su, 0)
+        mb = mb + 3 + argc2 * 3
     }
     string_free(seen)
 }
@@ -9019,7 +9549,7 @@ fn emit_main_wrapper(mut sb: String, read p: parser.Parser, read src: str) {
 // `"\n"` pushes stand in for the reference's unconditionally-blank sections that are empty for a
 // program with no aggregates (closure_types, method_protos, consts) plus the guarded no-ops.
 fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator) {
-    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: list.make(i32, a), vtf: 0, gfi: list.make(i32, a), su: list.make(i32, a), cls: list.make(i32, a), ccx: list.make(i32, a), cca: list.make(i32, a), caps: list.make(i32, a), gsi: list.make(i32, a), sps: list.make(i32, a), dspawn: false, th: list.make(i32, a), thf: 0, dg: 0 - 1 }
+    var g: Cg = Cg{ tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: list.make(i32, a), vtf: 0, gfi: list.make(i32, a), su: list.make(i32, a), cls: list.make(i32, a), ccx: list.make(i32, a), cca: list.make(i32, a), caps: list.make(i32, a), gsi: list.make(i32, a), sps: list.make(i32, a), dspawn: false, th: list.make(i32, a), thf: 0, dg: 0 - 1, gmi: list.make(i32, a) }
     collect_spawns(g, p, src)                        // spawn sites (gates the pthread prelude)
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     collect_method_instances(g, p, src, c)           // (struct item, method fn item) pairs, first-seen
