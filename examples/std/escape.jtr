@@ -30,7 +30,7 @@ import "typeck"
 // collection name 2-tuples; `rdepth` the scope depth at each active `region` block entry.
 // `no_alloc`/`deterministic` are the current fn's contract flags. `ret_is_borrow` = the current
 // fn returns by borrow (so a returned borrow is allowed).
-struct Esc { scn: List(i32), scst: List(i32), rgn: List(i32), rgst: List(i32), frozen: List(i32), rdepth: List(i32), no_alloc: bool, deterministic: bool, ret_is_borrow: bool, self_borrow: i32, alloc: Allocator }
+pub struct Esc { scn: List(i32), scst: List(i32), rgn: List(i32), rgst: List(i32), frozen: List(i32), rdepth: List(i32), no_alloc: bool, deterministic: bool, ret_is_borrow: bool, self_borrow: i32, alloc: Allocator, pub dsp: List(i32), pub dmsg: String }
 
 // ---- scope helpers (flat arenas, mirroring typeck's) ----
 
@@ -104,12 +104,15 @@ fn e_is_region(read e: Esc, read src: str, ns: usize, ne: usize) -> bool {
     return false
 }
 
-// ---- diagnostic emission (immediate, in walk order = the reference's push order) ----
-// One diagnostic = three lines: span start, span end, the built message.
-fn emit(start: usize, end: usize, read msg: str) {
-    print_int(start as i64)
-    print_int(end as i64)
-    print_str(msg)
+// ---- diagnostic emission (buffered, in walk order = the reference's push order) ----
+// One diagnostic = a span pair in `e.dsp` + one newline-terminated message line in `e.dmsg`
+// (messages are single-line by construction). Buffering instead of printing makes the checker
+// an importable LIBRARY: the driver reads the diagnostics, the CLI dumps them (P4 golden).
+fn ediag(mut e: Esc, start: usize, end: usize, read msg: str) {
+    list.push(i32, e.dsp, start as i32)
+    list.push(i32, e.dsp, end as i32)
+    string_push(e.dmsg, msg)
+    string_push(e.dmsg, "\n")
 }
 
 // ---- borrow-place / escape predicates (mirror is_borrow_place / escapes_as / root_name) ----
@@ -436,7 +439,7 @@ fn give_away_err(mut e: Esc, read p2: parser.Parser, read c: typeck.Checker, rea
     string_push(sb, "` of `")
     string_push(sb, src[f.x as usize .. f.y as usize])
     string_push(sb, "`: `take` consumes ownership, which a second-class borrow cannot provide")
-    emit(ad.start, ad.end, string_view(sb))
+    ediag(e, ad.start, ad.end, string_view(sb))
     string_free(sb)
 }
 
@@ -454,7 +457,7 @@ fn check_manual_drop(mut e: Esc, read c: typeck.Checker, read src: str, id: i32,
             let mne: i32 = list.get(i32, c.icalls, (base + 4) as usize)
             if str_eq(src[tns as usize .. tne as usize], "Drop") {
                 if str_eq(src[mns as usize .. mne as usize], "drop") {
-                    emit(span_s, span_e, "cannot call `drop` manually — it runs automatically at scope exit (see `--show-drops`)")
+                    ediag(e, span_s, span_e, "cannot call `drop` manually — it runs automatically at scope exit (see `--show-drops`)")
                 }
             }
         }
@@ -475,7 +478,7 @@ fn check_no_alloc_call(mut e: Esc, read p: parser.Parser, read src: str, callee:
         string_push(sb, "`")
         string_push(sb, src[ns .. ne])
         string_push(sb, "` allocates — forbidden in a `@no_alloc` function (the proven-allocation-free contract)")
-        emit(span_s, span_e, string_view(sb))
+        ediag(e, span_s, span_e, string_view(sb))
         string_free(sb)
     }
 }
@@ -493,7 +496,7 @@ fn check_det_call(mut e: Esc, read p: parser.Parser, read src: str, callee: i32,
         string_push(sb, "`")
         string_push(sb, src[ns .. ne])
         string_push(sb, "` is an atomic op whose result can depend on the thread schedule — forbidden in a `@deterministic` function. Use `par for … reduce(r)` for schedule-independent parallelism.")
-        emit(span_s, span_e, string_view(sb))
+        ediag(e, span_s, span_e, string_view(sb))
         string_free(sb)
     }
 }
@@ -553,7 +556,7 @@ fn flag_frozen(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read s
         string_push(sb, "cannot mutate `")
         push_root_name(sb, e, p, c, src, arg)
         string_push(sb, "` while iterating it: the `for` loop holds a borrow of it")
-        emit(ad.start, ad.end, string_view(sb))
+        ediag(e, ad.start, ad.end, string_view(sb))
         string_free(sb)
     }
 }
@@ -588,7 +591,7 @@ fn check_spawn_slice(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, 
                 string_push(sb, "` takes a `mut` slice `")
                 string_push(sb, src[pns as usize .. pne as usize])
                 string_push(sb, "` — a shared mutable slice can race across parallel tasks. Share mutable state through a raw `*mut T` in `unsafe` (each task a disjoint region, as `par_binned_sum` does), or pass it `read`.")
-                emit(cd.start, cd.end, string_view(sb))
+                ediag(e, cd.start, cd.end, string_view(sb))
                 string_free(sb)
                 return
             }
@@ -707,7 +710,7 @@ fn walk_expr(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src
                 string_push(sb, "cannot store borrow `")
                 push_root_name(sb, e, p, c, src, d.b)
                 string_push(sb, "` into borrowed storage: it would outlive its call")
-                emit(d.start, d.end, string_view(sb))
+                ediag(e, d.start, d.end, string_view(sb))
                 string_free(sb)
             }
         }
@@ -724,7 +727,7 @@ fn walk_expr(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src
                             string_push(sb, "cannot store region-allocated value into `")
                             string_push(sb, src[tgt.start .. tgt.end])
                             string_push(sb, "`: it is declared outside the `region` block and would outlive the arena (copy it into an owned `String`)")
-                            emit(d.start, d.end, string_view(sb))
+                            ediag(e, d.start, d.end, string_view(sb))
                             string_free(sb)
                         } else { e_bind_region(e, tgt.start as i32, tgt.end as i32) }
                     }
@@ -739,7 +742,7 @@ fn walk_expr(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src
             string_push(sb, "cannot mutate `")
             push_root_name(sb, e, p, c, src, d.a)
             string_push(sb, "` while iterating it: the `for` loop holds a borrow of it")
-            emit(d.start, d.end, string_view(sb))
+            ediag(e, d.start, d.end, string_view(sb))
             string_free(sb)
         }
         return
@@ -779,7 +782,7 @@ fn walk_expr(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src
     }
     else if k == 38 {                              // concurrent
         if e.deterministic {
-            emit(d.start, d.end, "raw `concurrent` is forbidden in a `@deterministic` function — its result can depend on the thread schedule. Use `par for … reduce(r)` (a checked deterministic reduction) for schedule-independent parallelism.")
+            ediag(e, d.start, d.end, "raw `concurrent` is forbidden in a `@deterministic` function — its result can depend on the thread schedule. Use `par for … reduce(r)` (a checked deterministic reduction) for schedule-independent parallelism.")
         }
         check_block(e, p, c, src, d.a, false)
         return
@@ -787,7 +790,7 @@ fn walk_expr(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src
     else if k == 39 { check_spawn_slice(e, p, c, src, d.a)  walk_expr(e, p, c, src, d.a, false)  return }  // spawn
     else if k == 40 { walk_expr(e, p, c, src, d.a, false)  return }                               // await
     else if k == 43 {                              // region
-        if e.no_alloc { emit(d.start, d.end, "a `region` block allocates an arena — forbidden in a `@no_alloc` function") }
+        if e.no_alloc { ediag(e, d.start, d.end, "a `region` block allocates an arena — forbidden in a `@no_alloc` function") }
         list.push(i32, e.rdepth, list.len(i32, e.scst) as i32)
         check_block(e, p, c, src, d.a, false)
         list.truncate(i32, e.rdepth, list.len(i32, e.rdepth) - 1)
@@ -814,7 +817,7 @@ fn walk_expr(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src
             i = i + 1
         }
         if e.deterministic {
-            emit(d.start, d.end, "`select` waits on channels — its choice depends on the schedule; forbidden in a `@deterministic` function.")
+            ediag(e, d.start, d.end, "`select` waits on channels — its choice depends on the schedule; forbidden in a `@deterministic` function.")
         }
         return
     }
@@ -828,7 +831,7 @@ fn walk_expr(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src
                 string_push(sb, "cannot return region-allocated value `")
                 push_root_name(sb, e, p, c, src, id)
                 string_push(sb, "`: it is owned by its `region` arena and does not outlive it (copy it into an owned `String` to return it)")
-                emit(d.start, d.end, string_view(sb))
+                ediag(e, d.start, d.end, string_view(sb))
                 string_free(sb)
             }
         }
@@ -847,7 +850,7 @@ fn walk_expr(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src
                     push_root_name(sb, e, p, c, src, id)
                     string_push(sb, "`: a second-class `read`/`mut`/`out` borrow may not outlive its call (pass it further down, or declare the return as `read`/`mut`/`out`)")
                 }
-                emit(d.start, d.end, string_view(sb))
+                ediag(e, d.start, d.end, string_view(sb))
                 string_free(sb)
             }
         }
@@ -870,7 +873,7 @@ fn walk_lit_fields(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, re
             string_push(sb, "` in struct `")
             string_push(sb, src[pd.start .. pd.end])
             string_push(sb, "`: a second-class borrow may not outlive its call")
-            emit(vd.start, vd.end, string_view(sb))
+            ediag(e, vd.start, vd.end, string_view(sb))
             string_free(sb)
         }
         i = i + 1
@@ -885,7 +888,7 @@ fn walk_for(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src:
     // region-scoped loop under @no_alloc: region span is at lar[base+2,3]
     if e.no_alloc {
         if list.get(i32, p.lar, (base + 2) as usize) >= 0 {
-            emit(d.start, d.end, "a region-scoped loop allocates a scratch arena — forbidden in a `@no_alloc` function")
+            ediag(e, d.start, d.end, "a region-scoped loop allocates a scratch arena — forbidden in a `@no_alloc` function")
         }
     }
     e_push(e)
@@ -1022,17 +1025,11 @@ fn check_items(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read s
     }
 }
 
-fn main() -> i32 {
-    var a: Allocator = mem.system_allocator()
-    var it: Interner = intern.make(a)
-    let kwcount: i64 = tokens.intern_keywords(it)
-    if env.argc() > 1 {
-        var src: String = fs.read_text(env.argv(1))
-        var p: parser.Parser = parser.parse_source(string_view(src), it, kwcount, a)
-        var c: typeck.Checker = typeck.check_parsed(p, string_view(src), a)
-        var e: Esc = Esc{ scn: list.make(i32, a), scst: list.make(i32, a), rgn: list.make(i32, a), rgst: list.make(i32, a), frozen: list.make(i32, a), rdepth: list.make(i32, a), no_alloc: false, deterministic: false, ret_is_borrow: false, self_borrow: 0, alloc: a }
-        check_items(e, p, c, string_view(src))
-        string_free(src)
-    }
-    return 0
+// Run the whole escape check over a parsed + typechecked program and return the checker with
+// its buffered diagnostics (`dsp` span pairs + `dmsg` newline-separated messages, walk order).
+// The library entry the self-hosted driver imports; `escape_cli.jtr` dumps it for the P4 golden.
+pub fn check_program(read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator) -> Esc {
+    var e: Esc = Esc{ scn: list.make(i32, a), scst: list.make(i32, a), rgn: list.make(i32, a), rgst: list.make(i32, a), frozen: list.make(i32, a), rdepth: list.make(i32, a), no_alloc: false, deterministic: false, ret_is_borrow: false, self_borrow: 0, alloc: a, dsp: list.make(i32, a), dmsg: string_new() }
+    check_items(e, p, c, src)
+    return e
 }

@@ -1,0 +1,43 @@
+// examples/std/escape_cli.jtr — the thin CLI driver for the P4 escape-checker library
+// (a module with `main` can't be imported, so the dump entry lives here — the same split
+// as parser_cli / typeck_cli). Parses + typechecks the file, runs `escape.check_program`,
+// and dumps the buffered diagnostic set in walk order as the golden's three lines per
+// diagnostic: span start, span end, message.
+
+import "mem"
+import "intern"
+import "fs"
+import "env"
+import "list"
+import "tokens"
+import "parser"
+import "typeck"
+import "escape"
+
+fn main() -> i32 {
+    var a: Allocator = mem.system_allocator()
+    var it: Interner = intern.make(a)
+    let kwcount: i64 = tokens.intern_keywords(it)
+    if env.argc() > 1 {
+        var src: String = fs.read_text(env.argv(1))
+        var p: parser.Parser = parser.parse_source(string_view(src), it, kwcount, a)
+        var c: typeck.Checker = typeck.check_parsed(p, string_view(src), a)
+        var e: escape.Esc = escape.check_program(p, c, string_view(src), a)
+        let dm: str = string_view(e.dmsg)
+        var di: usize = 0                             // diagnostic index (span-pair cursor)
+        var ls: usize = 0                             // current message line start
+        var k: usize = 0
+        for k < dm.len {
+            if (dm[k] as i32) == 10 {                 // '\n' closes one diagnostic's message
+                print_int(list.get(i32, e.dsp, di * 2) as i64)
+                print_int(list.get(i32, e.dsp, di * 2 + 1) as i64)
+                print_str(dm[ls .. k])
+                di = di + 1
+                ls = k + 1
+            }
+            k = k + 1
+        }
+        string_free(src)
+    }
+    return 0
+}
