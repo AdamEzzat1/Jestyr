@@ -21,6 +21,7 @@ import "list"
 import "tokens"
 import "parser"
 import "typeck"
+import "escape"
 
 // ---- the fixed C prelude (mirrors Cgen::prelude) ----
 // A FIXED header block: includes + the `jestyr_rt_*` runtime + the JestyrStr/String/Cow/Builder
@@ -10253,6 +10254,101 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
     }
 }
 
+// ---- the product driver (`build` / `run`) — the self-hosted compiler as a daily tool ----
+// Unlike the raw `jc <file>` dump (the golden's plumbing mode, mirroring `cgen::emit`
+// unconditionally), the product modes GATE on the escape checker's buffered diagnostics,
+// render them `path:line:col: error: <msg>` on stderr, write `<stem>.c`, drive gcc with
+// the locked flag set via `run_command`, and (for `run`) execute the produced binary,
+// forwarding its exit code. Parse/typeck refusal is a follow-up (those ported passes do
+// not surface message diagnostics yet); imports still need the module story.
+
+// One diagnostic line on stderr: 1-based line/col scanned from the span start.
+fn eprint_diag(read path: str, read src: str, start: usize, read msg: str) {
+    var line: i64 = 1
+    var col: i64 = 1
+    var i: usize = 0
+    for i < start {
+        if (src[i] as i32) == 10 {
+            line = line + 1
+            col = 1
+        } else {
+            col = col + 1
+        }
+        i = i + 1
+    }
+    var b: String = string_new()
+    string_push(b, path)
+    string_push(b, ":")
+    push_uint(b, line)
+    string_push(b, ":")
+    push_uint(b, col)
+    string_push(b, ": error: ")
+    string_push(b, msg)
+    eprint_str(string_view(b))
+    string_free(b)
+}
+
+// The `build`/`run` modes: 1 on diagnostics or a write failure, gcc's code on a failed
+// compile, the program's own exit code for `run`, else 0.
+fn driver_build(read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator, read path: str, do_run: bool) -> i32 {
+    var e: escape.Esc = escape.check_program(p, c, src, a)
+    if list.len(i32, e.dsp) > 0 {                     // refuse to emit on escape diagnostics
+        let dm: str = string_view(e.dmsg)
+        var di: usize = 0
+        var ls: usize = 0
+        var k: usize = 0
+        for k < dm.len {
+            if (dm[k] as i32) == 10 {
+                eprint_diag(path, src, list.get(i32, e.dsp, di * 2) as usize, dm[ls .. k])
+                di = di + 1
+                ls = k + 1
+            }
+            k = k + 1
+        }
+        return 1
+    }
+    var sb: String = string_new()
+    emit_program(sb, p, c, src, a, false, "")
+    var stem: String = string_new()                   // `<file minus .jtr>`
+    if ends_with(path, ".jtr") {
+        string_push(stem, path[0 .. path.len - 4])
+    } else {
+        string_push(stem, path)
+    }
+    var cpath: String = string_new()
+    string_push(cpath, string_view(stem))
+    string_push(cpath, ".c")
+    var xpath: String = string_new()
+    string_push(xpath, string_view(stem))
+    string_push(xpath, ".exe")
+    if !write_file(string_view(cpath), string_view(sb)) {
+        eprint_str("error: cannot write the generated C")
+        return 1
+    }
+    var cmd: String = string_new()                    // the locked flag set (mirrors CC_FLAGS)
+    string_push(cmd, "gcc -O2 -std=c11 -ffp-contract=off -fno-fast-math")
+    if contains(string_view(sb), "pthread") { string_push(cmd, " -pthread") }
+    string_push(cmd, " -o \"")
+    string_push(cmd, string_view(xpath))
+    string_push(cmd, "\" \"")
+    string_push(cmd, string_view(cpath))
+    string_push(cmd, "\"")
+    let rc: i32 = run_command(string_view(cmd))
+    if rc != 0 {
+        eprint_str("error: the C compiler failed on the generated C")
+        return rc
+    }
+    if do_run {
+        var rcmd: String = string_new()
+        string_push(rcmd, "\"")
+        string_push(rcmd, string_view(xpath))
+        string_push(rcmd, "\"")
+        let prc: i32 = run_command(string_view(rcmd))
+        return prc
+    }
+    return 0
+}
+
 fn main() -> i32 {
     var a: Allocator = mem.system_allocator()
     var it: Interner = intern.make(a)
@@ -10264,12 +10360,22 @@ fn main() -> i32 {
         var sb: String = string_new()
         // CLI modes: `<file>` -> normal C; `<file> test [substr]` -> the `jestyrc test`
         // harness C (optionally name-filtered); `<file> list [substr]` -> the runnable
-        // `@test`/`@bench` list (`jestyrc test --list`).
+        // `@test`/`@bench` list (`jestyrc test --list`); `<file> build` / `<file> run` ->
+        // the gated product driver (compile via gcc; `run` also executes).
         var tmode: bool = false
         var lmode: bool = false
+        var bmode: bool = false
+        var rmode: bool = false
         if env.argc() > 2 {
             if str_eq(env.argv(2), "test") { tmode = true }
             if str_eq(env.argv(2), "list") { lmode = true }
+            if str_eq(env.argv(2), "build") { bmode = true }
+            if str_eq(env.argv(2), "run") { rmode = true }
+        }
+        if bmode or rmode {
+            let drc: i32 = driver_build(p, c, string_view(src), a, env.argv(1), rmode)
+            string_free(src)
+            return drc
         }
         if lmode {
             if env.argc() > 3 {

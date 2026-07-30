@@ -7673,6 +7673,45 @@ mod c_oracle {
         assert_eq!(build_and_run("examples/proc_demo.jtr").replace("\r\n", "\n"), "0\ndone\n");
     }
 
+    /// **The self-hosted DRIVER.** `jc <file> build` must gate on the ported escape checker
+    /// (refusing with `path:line:col: error:` diagnostics on stderr and writing nothing),
+    /// and on a clean file must write `<stem>.c`, drive gcc itself via `run_command`, and
+    /// produce a runnable exe; `jc <file> run` additionally executes it, forwarding the
+    /// program's exit code and stdout. The first end-to-end "daily-drive" check of the
+    /// Jestyr-written compiler as a TOOL rather than a dump.
+    #[test]
+    fn jestyr_driver_builds_and_runs() {
+        let jc = build_exe("examples/std/cgen.jtr");
+        let dir = std::env::temp_dir().join("jestyr_driver_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 1. A clean program builds and runs.
+        let hello = dir.join("hello.jtr");
+        std::fs::copy("examples/hello.jtr", &hello).unwrap();
+        let out = Command::new(&jc).args([hello.to_str().unwrap(), "build"]).output().unwrap();
+        assert!(out.status.success(), "driver build failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(dir.join("hello.c").exists(), "driver wrote no C");
+        let exe = dir.join("hello.exe");
+        assert!(exe.exists(), "driver produced no exe");
+        let prog = Command::new(&exe).output().unwrap();
+        let want = build_and_run("examples/hello.jtr");
+        assert_eq!(String::from_utf8_lossy(&prog.stdout), want, "driver-built exe output diverged");
+        // 2. `run` executes and forwards stdout + exit code.
+        let out = Command::new(&jc).args([hello.to_str().unwrap(), "run"]).output().unwrap();
+        assert!(out.status.success(), "driver run failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "driver run stdout diverged");
+        // 3. An escape-diagnostic file is REFUSED: non-zero exit, rendered stderr, no C written.
+        let bad = dir.join("bad.jtr");
+        std::fs::copy("examples/region_escape.jtr", &bad).unwrap();
+        let out = Command::new(&jc).args([bad.to_str().unwrap(), "build"]).output().unwrap();
+        assert!(!out.status.success(), "driver must refuse a file with escape diagnostics");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(": error: "), "diagnostics not rendered: {stderr}");
+        assert!(stderr.contains("bad.jtr:"), "diagnostic path missing: {stderr}");
+        assert!(!dir.join("bad.c").exists(), "driver must not emit C for a refused file");
+        eprintln!("driver: build + run + refusal all green");
+    }
+
     /// The reference's TEST-mode C for `src`: `cgen::emit_tests` — the `jestyrc test` harness
     /// (`time.h` in the prelude, a pass/fail + bench-timing `main` instead of the user wrapper).
     fn rust_cgen_test_dump(src: &str, filter: Option<&str>) -> Vec<String> {
@@ -7840,7 +7879,7 @@ mod c_oracle {
     /// `examples/std/cgen.jtr` (each module's imports precede it, diamonds memoized —
     /// exactly the order `module::load` merges their items in).
     const SELFHOST_MODULES: &[&str] =
-        &["mem", "intern", "fs", "env", "list", "tokens", "parser", "typeck", "cgen"];
+        &["mem", "intern", "fs", "env", "list", "tokens", "parser", "typeck", "escape", "cgen"];
 
     /// Flatten the multi-module Jestyr compiler into ONE single-file program — the
     /// R2-full "concatenated-source build". The loader already compiles a program as a
