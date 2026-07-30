@@ -672,6 +672,42 @@ pieces, plus blanket-Drop monomorphization:
 - **Remaining in the cluster:** generic-struct METHODS (`Work::Method` — genmethods 64,
   methods 66), then core.jtr 76 and list.jtr 95 (the first compiler-source dependency).
 
+### Increment 40 — generic-struct METHODS + list.jtr, the first compiler-source dep (allowlist 87)
+
+**+`genmethods`, `methods`, `core`, and `list.jtr`** — the generics cluster is DONE and the
+compiler-source path is open. Three sub-pieces:
+
+- **Struct-node methods** (`xs.push(10)` on a `List(T)`-returned struct with methods INSIDE):
+  the shared LIFO worklist gained tagged records — `wks` is now (rb, tag) pairs; a METHOD
+  record is `[method fn item, argc, receiver-arg triples, ctor fn item]` (`gmethod_check`:
+  receiver's kind-6 Checker type + `gnode_method` in the ctor's struct node). The drain
+  dedups on `push_gmi_name` (`jestyr_<Ctor>__<mangles>_<method>`, mirrors `method_c_name`),
+  records into `g.gmi`, and walks the method body with `remap_targs` through the CTOR's
+  tparams (`remap_targs` now takes the context item explicitly — a method's tparams are its
+  ctor's). Emission: `emit_gmi_sig` (self = the instance struct, `* restrict` for `mut self`;
+  other params under `arm_gmi_su`) in the method_protos/method_defs slots after the concrete
+  loops; the call site lowers via the receiver's su-resolved instance stem. gsi gained the
+  method pass (receiver struct + method sig/body under su, mirroring the reference's
+  method_instances pass).
+- **Free-method sugar** (`methods.jtr`: `xs.push(10)` -> `push(i32, xs, 10)`): cgen now
+  CONSUMES typeck's `mcalls` (call ExprId -> fn ItemId 2-tuples, recorded when the free
+  resolution wins). Targs are RECOVERED from the receiver: the tparam's index in the receiver
+  param's `Ctor(T…)` annotation indexes the receiver's kind-6 args (`gmcall_targs` /
+  `app_targ_index` / `first_runtime_param_ty`). Collector: `gmcall_check` pushes a plain Fn
+  record (before `gmethod_check`, mirroring typeck's free-first order; `gmethod_check` bails
+  on an mcalls hit). Call site: `jestyr_push__i32(&(j_xs), 10)` — receiver takes the FIRST
+  runtime param's conv, args the convs after it; su-resolved mangles for template bodies.
+- **Two rider fixes**: slice-index WRITES fold into the bounds-checked stmt-expr
+  (`_s{n}.ptr[_ix{n}] = v; })` — base/index/VALUE before the temp; refinement-proven writes
+  emit the bare lvalue, NO temp) — that alone was all of core.jtr's 76 diff lines; and
+  emit_c_ty's Name arm renders **`int` for an UNRESOLVED name** (the reference's external-type
+  diag arm) — which is exactly how `import "mem"`-using list.jtr degenerates in the
+  single-file golden path. The probe oracle remains wrong for import files; the GOLDEN is the
+  judge (list.jtr passes it).
+- **Remaining near-misses are no longer construct gaps**: import files (golden-covered),
+  typeerr/match_check (diag non-targets), and the big-file tail (mvs 122, collection 131,
+  region_escape 137, then the @test-heavy ~2000-line diffs → TEST MODE).
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
