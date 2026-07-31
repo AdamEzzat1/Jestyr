@@ -895,6 +895,40 @@ and becomes a driver:
 bootstrap seed ✅ (47). Remaining: in-language multi-module (the one real feature gap),
 parse/typeck message-diagnostic surfaces for driver refusal, O-tooling in-language.**
 
+### Increment 48 — IN-LANGUAGE MODULES: the driver flattens its own import closure
+
+**The last real feature gap is closed — and the crown test passes: `jc` compiles ITSELF
+from its real multi-file sources through its own loader and its own gcc driver, and the
+result is the same compiler (byte-identical C on a probe), with no Rust and no harness
+anywhere in the loop** (`jestyr_driver_builds_itself`, selfhost-fixpoint).
+
+- **The `ml_*` loader in cgen.jtr** (~300 lines): `jc <file> build|run` loads the import
+  closure DFS deps-first (memoized `vis` path markers — the reference loader's merge
+  order), then flattens token-level via `tokens.tokenize` — `import` decls dropped
+  (`as`-alias + pinned-hash aware), `binding.x` → `x` with cross-module target renames,
+  and any top-level name declared in >1 module renamed `name__<stem>` (phase-2 scan:
+  brace-depth-0 decl keywords, next-token must be identifier-headed so `fn(i32)` TYPES
+  never register; first decls in `seen` as `|name=stem|`, collisions in `ren` as
+  `|stem:name|` — renamed form always derivable). The merged source then flows through
+  the ORDINARY single-file pipeline. This is the R2 harness flatten, ported into the
+  product — sound because the reference loader itself compiles a program as one
+  translation unit.
+- **Tests**: `jestyr_driver_builds_multi_module` (c-oracle) — a 3-module fixture with a
+  cross-module collision (`mag` in two libs) AND a diamond import, run output equal to
+  the Rust reference's real module build; plus the self-build above. Corpus (132) +
+  concat goldens re-verified; the bootstrap seed refreshed (28,362 lines — the seed now
+  contains the module loader, so the from-scratch compiler handles imports too).
+- **Two `.jtr` subset traps re-hit, RECORD THEM**: (1) a `for` CONDITION may not start
+  with `(` — `for (x[i] as i32) != 124 {` parses as the zip-binding head `for (a, b)`;
+  use `for i < n { if … { break } }`. (2) a bare `{` block after a call-initializer
+  parses as the `Name(args){…}` GENERIC-STRUCT-LITERAL ctor form — don't use bare
+  blocks for view scoping, write flat. (And for the third time: never chain
+  `string_view(x).len` — bind `let v: str` first.)
+- **v1 limits**: diagnostics render against the MERGED buffer (per-file span attribution
+  = the `#line` analogue is the follow-up); `extern "c"` collisions undetected (none in
+  std); a module-local variable shadowing an import binding AND field-accessed would
+  mis-rewrite (none exists; documented).
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
