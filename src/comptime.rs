@@ -1,0 +1,719 @@
+//! Compile-time expression evaluation (roadmap workstream G).
+//!
+//! A small, **total** interpreter over the AST: it folds integer/bool/string
+//! expressions at check time, including calls of pure functions. It is the engine
+//! behind every place the language needs a *value* rather than an emitted
+//! expression — today `[N]T` array lengths and `[v; N]` repeat counts, later
+//! `comptime` blocks/consts and reflection.
+//!
+//! ## Why an interpreter rather than "fold what C would fold"
+//! Codegen can hand most constant expressions to the C compiler and let it fold
+//! them. It cannot do that where the *compiler itself* needs the number — an array
+//! length becomes part of a C type name (`JestyrArr_i32_4`) and of Jestyr's own
+//! type (`Ty::Array { len }`), so it must be known during checking. Before this
+//! module those sites accepted only an integer literal and silently fell back to
+//! `0`, which turned `[SIZE]i32` into a zero-length array and emitted C that
+//! asserted on every access. Evaluation replaces that silent wrong answer with
+//! either the right one or a diagnostic.
+//!
+//! ## Totality
+//! A comptime interpreter is a place a compiler can hang or blow its stack on
+//! perfectly ordinary-looking input (`const A = B` / `const B = A`, or a deep
+//! recursion). Three bounds keep evaluation total, so a bad program gets a
+//! diagnostic rather than a hung build:
+//!  * a **step budget** ([`FUEL`]) decremented on every expression,
+//!  * a **call-depth cap** ([`MAX_DEPTH`]),
+//!  * **cycle detection** across `const` references.
+//!
+//! Anything this module cannot evaluate — a float, a struct, an intrinsic, an
+//! effectful call — is an [`EvalError`], never a guess. Callers decide whether
+//! that is a hard error (an array length) or simply "not a constant" (a fold that
+//! was only an optimization).
+
+use std::collections::{HashMap, HashSet};
+
+use crate::ast::*;
+use crate::span::Span;
+
+/// The total number of expression evaluations one top-level `eval` may perform.
+/// Generous for real constant folding, small enough that a pathological input
+/// fails in microseconds.
+const FUEL: u32 = 100_000;
+
+/// The maximum nesting of comptime function calls.
+const MAX_DEPTH: u32 = 64;
+
+/// A comptime value. Deliberately small: the value domain grows one increment at
+/// a time, and everything outside it is a clean error rather than a coercion.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Value {
+    Int(i64),
+    Bool(bool),
+    Str(String),
+    /// No value — a statement-position `if` with no `else`, or a block that ends
+    /// in a binding. Kept as a real value (rather than an error) so the *consumer*
+    /// decides whether a missing value is a problem.
+    Unit,
+}
+
+impl Value {
+    /// A non-negative integer as a `usize` — the array-length shape.
+    pub fn as_usize(&self) -> Option<usize> {
+        match self {
+            Value::Int(i) if *i >= 0 => Some(*i as usize),
+            _ => None,
+        }
+    }
+
+    /// The name used in diagnostics ("expected an integer, found a bool").
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::Int(_) => "an integer",
+            Value::Bool(_) => "a bool",
+            Value::Str(_) => "a string",
+            Value::Unit => "no value",
+        }
+    }
+}
+
+/// Why an expression could not be evaluated at compile time. `span` points at the
+/// sub-expression that failed, not the whole constant, so a caller's diagnostic
+/// lands on the actual culprit.
+#[derive(Clone, Debug)]
+pub struct EvalError {
+    pub message: String,
+    pub span: Span,
+}
+
+impl EvalError {
+    fn new(message: impl Into<String>, span: Span) -> EvalError {
+        EvalError { message: message.into(), span }
+    }
+}
+
+type EvalResult = Result<Value, EvalError>;
+
+/// One lexical scope's bindings, innermost last.
+type Env = Vec<Vec<(String, Value)>>;
+
+/// The comptime interpreter over one program's AST.
+pub struct Interp<'a> {
+    ast: &'a Ast,
+    /// Top-level `const` initializers, by name.
+    consts: HashMap<String, ExprId>,
+    /// Top-level functions with a body, by name — the callable surface.
+    fns: HashMap<String, &'a FnDecl>,
+    /// Consts currently being evaluated, so a cycle is reported rather than looped.
+    in_progress: HashSet<String>,
+    /// Set when a `return` fires, and carried up through every enclosing block
+    /// until the call that owns it consumes it. Saved and restored across calls,
+    /// so a callee's `return` can never escape into its caller.
+    returning: Option<Value>,
+    fuel: u32,
+    depth: u32,
+}
+
+impl<'a> Interp<'a> {
+    /// Build an interpreter over `ast`'s top-level items. Cheap: it indexes the
+    /// consts and functions once and evaluates nothing.
+    pub fn new(ast: &'a Ast) -> Interp<'a> {
+        let mut consts = HashMap::new();
+        let mut fns = HashMap::new();
+        for item in &ast.items {
+            match item {
+                Item::Const(c) => {
+                    consts.insert(c.name.name.clone(), c.value);
+                }
+                Item::Fn(f) => {
+                    fns.insert(f.name.name.clone(), f);
+                }
+                _ => {}
+            }
+        }
+        Interp { ast, consts, fns, in_progress: HashSet::new(), returning: None, fuel: FUEL, depth: 0 }
+    }
+
+    /// Evaluate one expression to a comptime value. Each call gets a fresh step
+    /// budget, so evaluating many constants can't exhaust a shared one.
+    pub fn eval(&mut self, id: ExprId) -> EvalResult {
+        self.fuel = FUEL;
+        self.depth = 0;
+        self.in_progress.clear();
+        self.returning = None;
+        let mut env: Env = vec![Vec::new()];
+        self.eval_expr(id, &mut env)
+    }
+
+    /// Evaluate to a non-negative integer — the array-length / repeat-count shape.
+    pub fn eval_usize(&mut self, id: ExprId) -> Result<usize, EvalError> {
+        let span = self.ast.expr_at(id).span;
+        let v = self.eval(id)?;
+        match v.as_usize() {
+            Some(n) => Ok(n),
+            None => Err(EvalError::new(
+                format!("expected a non-negative integer, found {}", v.type_name()),
+                span,
+            )),
+        }
+    }
+
+    fn spend(&mut self, span: Span) -> Result<(), EvalError> {
+        match self.fuel.checked_sub(1) {
+            Some(f) => {
+                self.fuel = f;
+                Ok(())
+            }
+            None => Err(EvalError::new(
+                "compile-time evaluation exceeded its step budget (is it non-terminating?)",
+                span,
+            )),
+        }
+    }
+
+    fn eval_expr(&mut self, id: ExprId, env: &mut Env) -> EvalResult {
+        let e = self.ast.expr_at(id);
+        let span = e.span;
+        self.spend(span)?;
+        match &e.kind {
+            ExprKind::Int(text) => match parse_int_literal(text) {
+                Some(v) => Ok(Value::Int(v)),
+                None => Err(EvalError::new("integer literal is out of range", span)),
+            },
+            ExprKind::Bool(b) => Ok(Value::Bool(*b)),
+            ExprKind::Str(lit) => Ok(Value::Str(unescape_str(lit))),
+            ExprKind::Char(lit) => match char_value(lit) {
+                Some(c) => Ok(Value::Int(c as i64)),
+                None => Err(EvalError::new("malformed character literal", span)),
+            },
+            ExprKind::Name(n) => self.eval_name(&n.name, span, env),
+            ExprKind::Unary { op, rhs } => {
+                let v = self.eval_expr(*rhs, env)?;
+                self.eval_unary(*op, v, span)
+            }
+            ExprKind::Binary { op, lhs, rhs } => self.eval_binary(*op, *lhs, *rhs, span, env),
+            ExprKind::Cast { expr, ty } => {
+                // Integer-to-integer casts pass the value through; the defined
+                // narrowing/overflow semantics are workstream J's, not this one's,
+                // so anything else is refused rather than guessed.
+                let v = self.eval_expr(*expr, env)?;
+                match (&v, &self.ast.type_at(*ty).kind) {
+                    (Value::Int(_), TypeKind::Name(n)) if is_int_type(&n.name) => Ok(v),
+                    _ => Err(EvalError::new(
+                        "this cast is not supported at compile time",
+                        span,
+                    )),
+                }
+            }
+            ExprKind::If { cond, then, els } => {
+                let c = self.eval_expr(*cond, env)?;
+                match c {
+                    // An `if` with no `else` is a statement: it runs its block for
+                    // effect (which may `return`) and yields no value of its own.
+                    Value::Bool(true) => {
+                        let v = self.eval_block(then, env)?;
+                        Ok(if els.is_some() { v } else { Value::Unit })
+                    }
+                    Value::Bool(false) => match els {
+                        Some(e) => self.eval_expr(*e, env),
+                        None => Ok(Value::Unit),
+                    },
+                    other => Err(EvalError::new(
+                        format!("`if` condition must be a bool, found {}", other.type_name()),
+                        span,
+                    )),
+                }
+            }
+            ExprKind::Block(b) => self.eval_block(b, env),
+            ExprKind::Call { callee, args } => self.eval_call(*callee, args, span, env),
+            _ => Err(EvalError::new("this expression is not a compile-time constant", span)),
+        }
+    }
+
+    fn eval_name(&mut self, name: &str, span: Span, env: &mut Env) -> EvalResult {
+        for scope in env.iter().rev() {
+            if let Some((_, v)) = scope.iter().rev().find(|(n, _)| n == name) {
+                return Ok(v.clone());
+            }
+        }
+        let Some(&init) = self.consts.get(name) else {
+            return Err(EvalError::new(
+                format!("`{name}` is not a compile-time constant"),
+                span,
+            ));
+        };
+        if !self.in_progress.insert(name.to_string()) {
+            return Err(EvalError::new(
+                format!("constant `{name}` is defined in terms of itself"),
+                span,
+            ));
+        }
+        // A const initializer is evaluated in its own (empty) scope: it cannot see
+        // the locals of whatever expression referred to it.
+        let mut fresh: Env = vec![Vec::new()];
+        let out = self.eval_expr(init, &mut fresh);
+        self.in_progress.remove(name);
+        out
+    }
+
+    fn eval_unary(&mut self, op: UnOp, v: Value, span: Span) -> EvalResult {
+        match (op, &v) {
+            (UnOp::Neg, Value::Int(i)) => match i.checked_neg() {
+                Some(n) => Ok(Value::Int(n)),
+                None => Err(EvalError::new("negation overflowed at compile time", span)),
+            },
+            (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
+            (UnOp::BitNot, Value::Int(i)) => Ok(Value::Int(!i)),
+            _ => Err(EvalError::new(
+                format!("this operator does not apply to {} at compile time", v.type_name()),
+                span,
+            )),
+        }
+    }
+
+    fn eval_binary(&mut self, op: BinOp, lhs: ExprId, rhs: ExprId, span: Span, env: &mut Env) -> EvalResult {
+        // `and`/`or` short-circuit, so the right side is evaluated only if needed —
+        // which also means `false and <not-constant>` is still a constant.
+        if matches!(op, BinOp::And | BinOp::Or) {
+            let l = self.eval_expr(lhs, env)?;
+            let Value::Bool(lb) = l else {
+                return Err(EvalError::new(
+                    format!("`{}` needs a bool, found {}", op_text(op), l.type_name()),
+                    span,
+                ));
+            };
+            if (op == BinOp::And && !lb) || (op == BinOp::Or && lb) {
+                return Ok(Value::Bool(lb));
+            }
+            let r = self.eval_expr(rhs, env)?;
+            return match r {
+                Value::Bool(rb) => Ok(Value::Bool(rb)),
+                other => Err(EvalError::new(
+                    format!("`{}` needs a bool, found {}", op_text(op), other.type_name()),
+                    span,
+                )),
+            };
+        }
+
+        let l = self.eval_expr(lhs, env)?;
+        let r = self.eval_expr(rhs, env)?;
+        match (&l, &r) {
+            (Value::Int(a), Value::Int(b)) => self.int_binop(op, *a, *b, span),
+            (Value::Str(a), Value::Str(b)) => match op {
+                BinOp::Add => Ok(Value::Str(format!("{a}{b}"))),
+                BinOp::Eq => Ok(Value::Bool(a == b)),
+                BinOp::Ne => Ok(Value::Bool(a != b)),
+                BinOp::Lt => Ok(Value::Bool(a < b)),
+                BinOp::Le => Ok(Value::Bool(a <= b)),
+                BinOp::Gt => Ok(Value::Bool(a > b)),
+                BinOp::Ge => Ok(Value::Bool(a >= b)),
+                _ => Err(EvalError::new(
+                    format!("`{}` does not apply to strings", op_text(op)),
+                    span,
+                )),
+            },
+            (Value::Bool(a), Value::Bool(b)) => match op {
+                BinOp::Eq => Ok(Value::Bool(a == b)),
+                BinOp::Ne => Ok(Value::Bool(a != b)),
+                _ => Err(EvalError::new(
+                    format!("`{}` does not apply to bools", op_text(op)),
+                    span,
+                )),
+            },
+            _ => Err(EvalError::new(
+                format!(
+                    "cannot apply `{}` to {} and {} at compile time",
+                    op_text(op),
+                    l.type_name(),
+                    r.type_name()
+                ),
+                span,
+            )),
+        }
+    }
+
+    /// Integer arithmetic. Every operation is *checked*: a comptime overflow is a
+    /// compile error, never a silent wrap. (Runtime overflow semantics are
+    /// workstream J's; a constant the compiler folds must simply be right.)
+    fn int_binop(&mut self, op: BinOp, a: i64, b: i64, span: Span) -> EvalResult {
+        let arith = |o: Option<i64>| match o {
+            Some(v) => Ok(Value::Int(v)),
+            None => Err(EvalError::new("this arithmetic overflowed at compile time", span)),
+        };
+        match op {
+            BinOp::Add => arith(a.checked_add(b)),
+            BinOp::Sub => arith(a.checked_sub(b)),
+            BinOp::Mul => arith(a.checked_mul(b)),
+            BinOp::Div => {
+                if b == 0 {
+                    Err(EvalError::new("division by zero at compile time", span))
+                } else {
+                    arith(a.checked_div(b))
+                }
+            }
+            BinOp::Rem => {
+                if b == 0 {
+                    Err(EvalError::new("remainder by zero at compile time", span))
+                } else {
+                    arith(a.checked_rem(b))
+                }
+            }
+            BinOp::Shl | BinOp::Shr => {
+                let Ok(sh) = u32::try_from(b) else {
+                    return Err(EvalError::new("shift amount is negative", span));
+                };
+                let r = if op == BinOp::Shl { a.checked_shl(sh) } else { a.checked_shr(sh) };
+                match r {
+                    Some(v) => Ok(Value::Int(v)),
+                    None => Err(EvalError::new("shift amount is too large", span)),
+                }
+            }
+            BinOp::BitAnd => Ok(Value::Int(a & b)),
+            BinOp::BitOr => Ok(Value::Int(a | b)),
+            BinOp::BitXor => Ok(Value::Int(a ^ b)),
+            BinOp::Eq => Ok(Value::Bool(a == b)),
+            BinOp::Ne => Ok(Value::Bool(a != b)),
+            BinOp::Lt => Ok(Value::Bool(a < b)),
+            BinOp::Le => Ok(Value::Bool(a <= b)),
+            BinOp::Gt => Ok(Value::Bool(a > b)),
+            BinOp::Ge => Ok(Value::Bool(a >= b)),
+            BinOp::And | BinOp::Or => unreachable!("short-circuited above"),
+        }
+    }
+
+    /// A block's value is its tail expression (otherwise [`Value::Unit`]); `let`
+    /// bindings scope to the block. A `return` anywhere inside sets `returning`,
+    /// which stops evaluation here and propagates to the enclosing call.
+    fn eval_block(&mut self, b: &Block, env: &mut Env) -> EvalResult {
+        env.push(Vec::new());
+        let out = self.eval_stmts(b, env);
+        env.pop();
+        out
+    }
+
+    fn eval_stmts(&mut self, b: &Block, env: &mut Env) -> EvalResult {
+        let mut tail = Value::Unit;
+        for (i, st) in b.stmts.iter().enumerate() {
+            match st {
+                Stmt::Let { name, init, span, .. } => {
+                    let Some(init) = init else {
+                        return Err(EvalError::new("a compile-time `let` needs an initializer", *span));
+                    };
+                    let v = self.eval_expr(*init, env)?;
+                    env.last_mut().expect("a scope is always open").push((name.name.clone(), v));
+                    tail = Value::Unit;
+                }
+                Stmt::Return { value, span } => {
+                    let v = match value {
+                        Some(value) => self.eval_expr(*value, env)?,
+                        None => Value::Unit,
+                    };
+                    if self.returning.is_none() {
+                        self.returning = Some(v.clone());
+                    }
+                    let _ = span;
+                    return Ok(v);
+                }
+                Stmt::Expr(e) => {
+                    let v = self.eval_expr(*e, env)?;
+                    // Only a trailing expression is the block's value.
+                    tail = if i + 1 == b.stmts.len() { v } else { Value::Unit };
+                }
+            }
+            if self.returning.is_some() {
+                // A nested `return` already fixed this call's result.
+                return Ok(self.returning.clone().expect("just checked"));
+            }
+        }
+        Ok(tail)
+    }
+
+    fn eval_call(&mut self, callee: ExprId, args: &[ExprId], span: Span, env: &mut Env) -> EvalResult {
+        let ExprKind::Name(n) = &self.ast.expr_at(callee).kind else {
+            return Err(EvalError::new("only a named function can be called at compile time", span));
+        };
+        let Some(f) = self.fns.get(n.name.as_str()).copied() else {
+            return Err(EvalError::new(
+                format!("`{}` is not a function that can run at compile time", n.name),
+                span,
+            ));
+        };
+        // Parameters that erase (`self`, `comptime`) have no runtime argument, so a
+        // method or a type-level generic is out of scope for this increment.
+        if f.params.iter().any(|p| p.is_self || p.comptime) {
+            return Err(EvalError::new(
+                format!("`{}` cannot be called at compile time", n.name),
+                span,
+            ));
+        }
+        if f.params.len() != args.len() {
+            return Err(EvalError::new(
+                format!(
+                    "`{}` takes {} argument(s) but {} were given",
+                    n.name,
+                    f.params.len(),
+                    args.len()
+                ),
+                span,
+            ));
+        }
+        if self.depth >= MAX_DEPTH {
+            return Err(EvalError::new(
+                "compile-time call nesting is too deep (is the recursion unbounded?)",
+                span,
+            ));
+        }
+
+        let mut bound = Vec::with_capacity(args.len());
+        for (p, a) in f.params.iter().zip(args) {
+            bound.push((p.name.name.clone(), self.eval_expr(*a, env)?));
+        }
+        // A call body sees only its parameters — never the caller's locals — and its
+        // `return` belongs to this frame alone, so the caller's signal is saved across.
+        let mut callee_env: Env = vec![bound];
+        let outer_return = self.returning.take();
+        self.depth += 1;
+        let out = self.eval_block(&f.body, &mut callee_env);
+        self.depth -= 1;
+        let returned = self.returning.take();
+        self.returning = outer_return;
+        let v = out?;
+        Ok(returned.unwrap_or(v))
+    }
+}
+
+/// Is `name` an integer primitive? (The set a comptime cast may pass through.)
+fn is_int_type(name: &str) -> bool {
+    matches!(
+        name,
+        "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
+    )
+}
+
+fn op_text(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Rem => "%",
+        BinOp::Eq => "==",
+        BinOp::Ne => "!=",
+        BinOp::Lt => "<",
+        BinOp::Le => "<=",
+        BinOp::Gt => ">",
+        BinOp::Ge => ">=",
+        BinOp::And => "and",
+        BinOp::Or => "or",
+        BinOp::BitAnd => "&",
+        BinOp::BitOr => "|",
+        BinOp::BitXor => "^",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
+    }
+}
+
+/// Parse an integer literal's source text: decimal, `0x`/`0X` hex, or `0b`/`0B`
+/// binary, with `_` separators ignored. `None` on overflow or malformed text.
+pub fn parse_int_literal(text: &str) -> Option<i64> {
+    let t: String = text.chars().filter(|c| *c != '_').collect();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()
+    } else if let Some(bin) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+        i64::from_str_radix(bin, 2).ok()
+    } else {
+        t.parse::<i64>().ok()
+    }
+}
+
+/// Decode a string literal's source text (quotes included) to its value.
+fn unescape_str(lit: &str) -> String {
+    let inner = lit.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(lit);
+    unescape(inner)
+}
+
+/// Decode a char literal's source text (quotes included) to its code point.
+fn char_value(lit: &str) -> Option<char> {
+    let inner = lit.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')).unwrap_or(lit);
+    let decoded = unescape(inner);
+    let mut cs = decoded.chars();
+    let c = cs.next()?;
+    cs.next().is_none().then_some(c)
+}
+
+/// Resolve the escape sequences Jestyr's lexer accepts. An unknown escape keeps
+/// its char, matching the lexer's own tolerance.
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut cs = s.chars();
+    while let Some(c) = cs.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match cs.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('0') => out.push('\0'),
+            Some('\\') => out.push('\\'),
+            Some('\'') => out.push('\''),
+            Some('"') => out.push('"'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+
+    /// Parse `src` and evaluate the initializer of its LAST `const`.
+    fn eval_last_const(src: &str) -> Result<Value, EvalError> {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, diags) = Parser::new(src, tokens).parse();
+        assert!(diags.iter().all(|d| !d.is_error()), "fixture must parse: {diags:?}");
+        let last = ast
+            .items
+            .iter()
+            .rev()
+            .find_map(|i| match i {
+                Item::Const(c) => Some(c.value),
+                _ => None,
+            })
+            .expect("fixture needs a const");
+        Interp::new(&ast).eval(last)
+    }
+
+    fn int_of(src: &str) -> i64 {
+        match eval_last_const(src).expect("should evaluate") {
+            Value::Int(i) => i,
+            other => panic!("expected an integer, got {other:?}"),
+        }
+    }
+
+    fn err_of(src: &str) -> String {
+        eval_last_const(src).expect_err("should fail to evaluate").message
+    }
+
+    #[test]
+    fn folds_arithmetic_with_correct_precedence() {
+        assert_eq!(int_of("const A: i64 = 2 + 3 * 4\n"), 14);
+        assert_eq!(int_of("const A: i64 = (2 + 3) * 4\n"), 20);
+        assert_eq!(int_of("const A: i64 = 17 % 5\n"), 2);
+        assert_eq!(int_of("const A: i64 = 0 - 7 / 2\n"), -3);
+    }
+
+    #[test]
+    fn folds_every_literal_base_and_separators() {
+        assert_eq!(int_of("const A: i64 = 0xFF\n"), 255);
+        assert_eq!(int_of("const A: i64 = 0b1010\n"), 10);
+        assert_eq!(int_of("const A: i64 = 1_000_000\n"), 1_000_000);
+    }
+
+    #[test]
+    fn folds_bitwise_and_shifts() {
+        assert_eq!(int_of("const A: i64 = 1 << 10\n"), 1024);
+        assert_eq!(int_of("const A: i64 = 0xF0 | 0x0F\n"), 255);
+        assert_eq!(int_of("const A: i64 = 0xFF ^ 0x0F\n"), 240);
+        assert_eq!(int_of("const A: i64 = ~0\n"), -1);
+    }
+
+    #[test]
+    fn resolves_const_references_transitively() {
+        let src = "const A: i64 = 4\nconst B: i64 = A * 2\nconst C: i64 = A + B\n";
+        assert_eq!(int_of(src), 12);
+    }
+
+    #[test]
+    fn evaluates_comparisons_and_short_circuits() {
+        assert_eq!(eval_last_const("const A: bool = 3 < 4\n").unwrap(), Value::Bool(true));
+        // The right operand of a short-circuited `and` is never evaluated, so a
+        // non-constant there does not make the whole expression non-constant.
+        assert_eq!(
+            eval_last_const("fn f() -> i32 { return 0 }\nconst A: bool = false and f() == 0\n")
+                .unwrap(),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn evaluates_if_expressions() {
+        assert_eq!(int_of("const A: i64 = if 2 > 1 { 10 } else { 20 }\n"), 10);
+        assert_eq!(int_of("const A: i64 = if 2 < 1 { 10 } else { 20 }\n"), 20);
+    }
+
+    #[test]
+    fn calls_pure_functions_including_recursion() {
+        let src = "fn double(x: i64) -> i64 { return x * 2 }\nconst A: i64 = double(21)\n";
+        assert_eq!(int_of(src), 42);
+        let fact = "fn fact(n: i64) -> i64 {\n    if n <= 1 { return 1 }\n    return n * fact(n - 1)\n}\nconst A: i64 = fact(10)\n";
+        assert_eq!(int_of(fact), 3_628_800);
+    }
+
+    #[test]
+    fn binds_let_inside_a_called_body() {
+        let src = "fn area(w: i64, h: i64) -> i64 {\n    let a = w * h\n    return a + 1\n}\nconst A: i64 = area(3, 4)\n";
+        assert_eq!(int_of(src), 13);
+    }
+
+    #[test]
+    fn folds_strings_and_chars() {
+        assert_eq!(
+            eval_last_const("const A: str = \"ab\" + \"cd\"\n").unwrap(),
+            Value::Str("abcd".to_string())
+        );
+        // `\n` in the source is an escape, so the value is one byte, not two.
+        assert_eq!(eval_last_const("const A: str = \"a\\nb\"\n").unwrap(), Value::Str("a\nb".into()));
+        assert_eq!(int_of("const A: i64 = 'A'\n"), 65);
+    }
+
+    // --- totality: every bound produces a diagnostic, never a hang ---
+
+    #[test]
+    fn a_self_referential_constant_is_reported_not_looped() {
+        let e = err_of("const A: i64 = B\nconst B: i64 = A\n");
+        assert!(e.contains("defined in terms of itself"), "{e}");
+    }
+
+    #[test]
+    fn unbounded_recursion_hits_the_depth_cap() {
+        let e = err_of("fn f(n: i64) -> i64 { return f(n + 1) }\nconst A: i64 = f(0)\n");
+        assert!(e.contains("too deep") || e.contains("step budget"), "{e}");
+    }
+
+    #[test]
+    fn overflow_and_division_by_zero_are_errors_not_wraps() {
+        assert!(err_of("const A: i64 = 9223372036854775807 + 1\n").contains("overflowed"));
+        assert!(err_of("const A: i64 = 1 / 0\n").contains("division by zero"));
+        assert!(err_of("const A: i64 = 1 % 0\n").contains("remainder by zero"));
+    }
+
+    #[test]
+    fn non_constant_expressions_are_refused_with_a_reason() {
+        assert!(err_of("const A: i64 = read_file(\"x\").len as i64\n").len() > 0);
+        let e = err_of("const A: i64 = MISSING\n");
+        assert!(e.contains("not a compile-time constant"), "{e}");
+        let e2 = err_of("const A: i64 = 1.5 as i64\n");
+        assert!(!e2.is_empty(), "a float must not silently evaluate");
+    }
+
+    #[test]
+    fn a_type_mismatch_is_an_error_rather_than_a_coercion() {
+        let e = err_of("const A: i64 = 1 + true\n");
+        assert!(e.contains("cannot apply"), "{e}");
+    }
+
+    #[test]
+    fn eval_usize_rejects_a_negative_length() {
+        let src = "const A: i64 = 0 - 1\n";
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
+        let Item::Const(c) = &ast.items[0] else { panic!("expected a const") };
+        let e = Interp::new(&ast).eval_usize(c.value).expect_err("negative is not a length");
+        assert!(e.message.contains("non-negative"), "{}", e.message);
+    }
+}

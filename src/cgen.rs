@@ -1189,8 +1189,13 @@ impl<'a> Cgen<'a> {
         format!("JestyrArr_{}_{len}", self.ty_mangle(elem))
     }
 
-    /// Evaluate a `[N]T` length expression to a `usize` (integer literal — the
-    /// common case; the typeck side validates the same way).
+    /// Evaluate a `[N]T` length expression to a `usize`. An integer literal is the
+    /// common case and is parsed directly (identical result, no interpreter setup);
+    /// anything else is folded by the comptime interpreter, which is the same
+    /// evaluation typeck performed — so the C type name and Jestyr's own
+    /// `Ty::Array { len }` can never disagree. Typeck has already rejected a length
+    /// it could not evaluate, so the 0 fallback here is unreachable for a checked
+    /// program (it keeps codegen total for the error path).
     fn array_len(&self, id: ExprId) -> usize {
         match &self.ast.expr_at(id).kind {
             ExprKind::Int(text) => {
@@ -1203,7 +1208,7 @@ impl<'a> Cgen<'a> {
                     t.parse::<usize>().unwrap_or(0)
                 }
             }
-            _ => 0,
+            _ => crate::comptime::Interp::new(self.ast).eval_usize(id).unwrap_or(0),
         }
     }
 

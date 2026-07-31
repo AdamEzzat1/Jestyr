@@ -31,6 +31,7 @@ mod ast;
 mod attest;
 mod attrs;
 mod cgen;
+mod comptime;
 mod diag;
 #[cfg(feature = "dharht-experiment")]
 mod dharht;

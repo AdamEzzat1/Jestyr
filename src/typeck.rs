@@ -997,10 +997,62 @@ impl<'a> TypeChecker<'a> {
     /// literal (decimal/`0x`/`0b`, `_` separators ignored) — the common case; a
     /// `const`-name fallback can follow. Non-constant lengths resolve to 0 (and are
     /// caught downstream), rather than panicking the type-checker.
+    /// Evaluate a `[N]T` length. A literal is the common case and is parsed
+    /// directly; anything else — a `const`, an arithmetic expression, a call of a
+    /// pure function — goes through the comptime interpreter. An unevaluable
+    /// length still yields 0 here so lowering stays total; `audit_type_id` is what
+    /// turns that into a diagnostic.
     fn eval_array_len(&self, id: ExprId) -> usize {
         match &self.ast.expr_at(id).kind {
             ExprKind::Int(text) => parse_int_literal_usize(text).unwrap_or(0),
-            _ => 0,
+            _ => crate::comptime::Interp::new(self.ast).eval_usize(id).unwrap_or(0),
+        }
+    }
+
+    /// Check every array length written inside a type annotation. `audit_type_id`
+    /// covers item signatures; local `let`/`var` annotations are lowered during
+    /// inference and never reach it, so they come through here. Deliberately narrow
+    /// — it validates lengths only, and does not repeat the module-path audit.
+    fn check_type_array_lens(&mut self, id: TypeId) {
+        match self.ast.type_at(id).kind.clone() {
+            TypeKind::Array { elem, len } => {
+                self.check_array_len(len);
+                self.check_type_array_lens(elem);
+            }
+            TypeKind::Ptr { inner, .. }
+            | TypeKind::Slice(inner)
+            | TypeKind::GenRef(inner)
+            | TypeKind::RegionRef { inner, .. } => self.check_type_array_lens(inner),
+            TypeKind::App { args, .. } | TypeKind::Path { args, .. } => {
+                for a in args {
+                    self.check_type_array_lens(a);
+                }
+            }
+            TypeKind::Fn { params, ret, .. } => {
+                for p in params {
+                    self.check_type_array_lens(p.ty);
+                }
+                if let Some(r) = ret {
+                    self.check_type_array_lens(r);
+                }
+            }
+            TypeKind::Name(_) | TypeKind::TypeKw | TypeKind::Dyn(_) | TypeKind::Error => {}
+        }
+    }
+
+    /// Report a length that isn't a compile-time constant. Kept separate from
+    /// `eval_array_len` so lowering stays `&self` and total: it always produces a
+    /// number, and this is the one place that turns "no number" into a diagnostic.
+    fn check_array_len(&mut self, id: ExprId) {
+        if matches!(&self.ast.expr_at(id).kind, ExprKind::Int(_)) {
+            return; // the literal path never fails
+        }
+        let outcome = crate::comptime::Interp::new(self.ast).eval_usize(id);
+        if let Err(e) = outcome {
+            self.error(
+                e.span,
+                format!("array length must be a compile-time constant: {}", e.message),
+            );
         }
     }
 
@@ -1514,7 +1566,13 @@ impl<'a> TypeChecker<'a> {
             | TypeKind::Slice(inner)
             | TypeKind::GenRef(inner)
             | TypeKind::RegionRef { inner, .. } => self.audit_type_id(inner),
-            TypeKind::Array { elem, .. } => self.audit_type_id(elem),
+            TypeKind::Array { elem, len } => {
+                // The length must be a compile-time constant: it becomes part of the
+                // type (`[4]i32`) and of the emitted C type name, so a value the
+                // compiler cannot compute is an error rather than a silent zero.
+                self.check_array_len(len);
+                self.audit_type_id(elem)
+            }
             TypeKind::App { args, .. } => {
                 for a in args {
                     self.audit_type_id(a);
@@ -1662,6 +1720,9 @@ impl<'a> TypeChecker<'a> {
                 Stmt::Let { name, ty, init, .. } => {
                     // A type annotation is the expected type for the initializer
                     // (so `var m: Option(i32) = none` resolves `none`'s instantiation).
+                    if let Some(t) = ty {
+                        self.check_type_array_lens(*t);
+                    }
                     let expected = ty.map(|t| self.lower_type(typ, t));
                     let prev = self.cur_expected.take();
                     self.cur_expected = expected.clone();
@@ -2053,6 +2114,7 @@ impl<'a> TypeChecker<'a> {
                 let inferred = self.infer(scope, typ, self_ty, *value);
                 self.cur_expected = prev;
                 let elem = exp_elem.unwrap_or(inferred);
+                self.check_array_len(*count);
                 Ty::Array { elem: Box::new(elem), len: self.eval_array_len(*count) }
             }
             ExprKind::ArrayLit { elems } => {

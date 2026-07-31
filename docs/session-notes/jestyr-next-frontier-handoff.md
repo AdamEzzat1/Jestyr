@@ -158,13 +158,35 @@ increment chain (same two-sided tax). Recommended order: **G → L → Q** (G un
 most; L wants G's comptime for layout queries; Q builds on both).
 
 ### G. CTFE + reflection (~10% — the biggest unlock)
-**What exists:** generics/type-param substitution; const-expr DISCRIMINANTS evaluate.
+**What exists:** generics/type-param substitution; const-expr DISCRIMINANTS evaluate;
+**the comptime interpreter (increment 1 — DONE)**.
 **Build (increment chain):**
-1. A comptime **interpreter over the AST** (`src/comptime.rs`): int/bool/str values,
-   arithmetic/comparison, `if`, `let`, calls of pure fns — evaluated at check time.
-   Seed it on `const` initializers (today they emit as C expressions; a folded const
-   must NOT change emitted C for existing corpus files — fold behind a new context
-   (comptime blocks) first, not under existing consts, to preserve byte-identity).
+1. ~~A comptime **interpreter over the AST** (`src/comptime.rs`)~~ — **DONE.**
+   `Interp::{eval, eval_usize}` over `Value::{Int, Bool, Str, Unit}`: literals (all
+   bases, `_` separators, escapes), unary, checked arithmetic, comparisons,
+   short-circuiting `and`/`or`, bitwise/shifts, string concat + compare, `if`/`else`,
+   blocks with `let`, `const` references, int-to-int casts, and calls of pure fns with
+   recursion. **Totality is the design point** — a compiler that hangs on
+   `const A = B; const B = A` is worse than one that errors: a step budget (`FUEL`), a
+   call-depth cap, and const-cycle detection make every input terminate with a
+   diagnostic. Anything outside the value domain (floats, structs, intrinsics) is a
+   clean `EvalError`, never a guess.
+   **Its first consumer closed a real silent-miscompile bug:** `typeck::eval_array_len`
+   and `cgen::array_len` accepted only an integer LITERAL and silently returned `0`
+   otherwise, so `[SIZE]i32` emitted a zero-length array, a type-mismatched
+   initialization and `assert(_ix < 0)` on every access — with no diagnostic. Both now
+   evaluate, and a length that cannot be evaluated is an error
+   (`check_array_len` from `audit_type_id` for signatures, from the `Stmt::Let` arm via
+   `check_type_array_lens` for locals — item audits never visit local annotations, which
+   is what the first draft got wrong). Zero emission change: a literal folds to the same
+   number, so all 134 corpus goldens, the concat (31,658 lines) and the seed are
+   untouched, and **no port mirror is needed yet**. Tests:
+   `comptime::tests::*` (15, incl. every totality bound) plus
+   `comptime_folds_array_lengths_end_to_end` (const / arithmetic / pure-fn-call lengths
+   through gcc) and `comptime_rejects_a_non_constant_array_length`.
+   **Port note for later:** the moment a corpus `.jtr` uses a non-literal array length,
+   the port's `typeck.jtr`/`cgen.jtr` must fold it too (the P3 typeck golden compares
+   `[N]T` renderings) — keep such files out of `examples/` until that mirror lands.
 2. `comptime { … }` blocks + `comptime` consts (design §8) — new syntax, new golden
    corpus files.
 3. Reflection as comptime calls over type values (`@type_of`, field iteration) — the

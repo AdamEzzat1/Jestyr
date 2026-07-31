@@ -7785,6 +7785,85 @@ mod c_oracle {
         }
     }
 
+    /// **CTFE (workstream G, increment 1).** An array length is part of the type — of
+    /// Jestyr's `Ty::Array { len }` and of the emitted C type name — so it must be known
+    /// while checking, not left for the C compiler to fold. Before the comptime
+    /// interpreter, only an integer *literal* was accepted and everything else silently
+    /// became `0`: `[SIZE]i32` emitted a zero-length array, a type-mismatched
+    /// initialization, and `assert(_ix < 0)` on every access, with no diagnostic. This
+    /// pins the fix end-to-end through a real C compiler, for a const, an arithmetic
+    /// expression, and a call of a pure function.
+    #[test]
+    fn comptime_folds_array_lengths_end_to_end() {
+        let dir = std::env::temp_dir().join("jestyr_ctfe_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "\
+const SIZE: usize = 4
+const DOUBLE: usize = SIZE * 2
+
+fn width() -> usize { return 3 }
+
+fn main() -> i32 {
+    var a: [SIZE]i32 = [1, 2, 3, 4]
+    var b: [SIZE + 1]i32 = [0; SIZE + 1]
+    var c: [DOUBLE]i32 = [0; DOUBLE]
+    var d: [width()]i32 = [7; width()]
+    print_int(a[3] as i64)
+    print_int(b.len as i64)
+    print_int(c.len as i64)
+    print_int(d[2] as i64)
+    return 0
+}
+";
+        let f = dir.join("lens.jtr");
+        std::fs::write(&f, src).unwrap();
+        let rel = f.to_str().unwrap();
+
+        // No diagnostics, and the types carry the folded lengths.
+        let prog = crate::module::load(rel);
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "load: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(!td.iter().any(|d| d.is_error()), "typeck rejected folded lengths: {td:?}");
+        let (c_src, _) = crate::cgen::emit(&prog.ast, &info);
+        for want in ["JestyrArr_i32_4", "JestyrArr_i32_5", "JestyrArr_i32_8", "JestyrArr_i32_3"] {
+            assert!(c_src.contains(want), "missing {want} in emitted C");
+        }
+        assert!(!c_src.contains("JestyrArr_i32_0"), "a zero-length ghost array survived:\n{c_src}");
+
+        // And it runs: the C compiler agrees the types line up and the values are right.
+        let exe = build_exe(rel);
+        let out = Command::new(&exe).output().unwrap();
+        assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"), "4\n5\n8\n7\n");
+    }
+
+    /// A length the compiler cannot evaluate is now a diagnostic rather than a silent
+    /// zero — including the two ways an interpreter could otherwise fail to terminate.
+    #[test]
+    fn comptime_rejects_a_non_constant_array_length() {
+        let dir = std::env::temp_dir().join("jestyr_ctfe_bad_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cases: [(&str, &str); 4] = [
+            ("runtime value", "fn main() -> i32 {\n    var n: usize = 4\n    var xs: [n]i32 = [0; 4]\n    return 0\n}\n"),
+            ("cyclic const", "const A: usize = B\nconst B: usize = A\nfn main() -> i32 {\n    var xs: [A]i32 = [0; 1]\n    return 0\n}\n"),
+            ("unbounded recursion", "fn f(n: usize) -> usize { return f(n + 1) }\nfn main() -> i32 {\n    var xs: [f(0)]i32 = [0; 1]\n    return 0\n}\n"),
+            ("division by zero", "const Z: usize = 0\nfn main() -> i32 {\n    var xs: [4 / Z]i32 = [0; 1]\n    return 0\n}\n"),
+        ];
+        for (label, src) in cases {
+            let f = dir.join(format!("{}.jtr", label.replace(' ', "_")));
+            std::fs::write(&f, src).unwrap();
+            let prog = crate::module::load(f.to_str().unwrap());
+            let (_info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+            let msgs: Vec<&str> = td.iter().map(|d| d.message.as_str()).collect();
+            assert!(
+                msgs.iter().any(|m| m.contains("array length must be a compile-time constant")),
+                "{label}: expected a length diagnostic, got {msgs:?}"
+            );
+        }
+    }
+
     /// **Doc-comment trivia in-language.** `tokens.collect_docs` recovers exactly the
     /// reference lexer's `tokenize_with_docs` third result — kind, block-ness, the whole
     /// comment span, and the text span — over the whole corpus. It finds comments by
