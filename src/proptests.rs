@@ -2887,6 +2887,53 @@ mod comptime_props {
             }
         }
 
+        /// **A loop-built table equals the same table written out.** The tier-7 claim is
+        /// that computing a table's *shape* changes nothing about its contents — so a
+        /// `for` filling a `var` must agree, element for element, with the literal it
+        /// replaces.
+        #[test]
+        fn ctfe_loop_built_tables_match_the_literal(n in 1usize..12, k in -50i64..50) {
+            let looped = format!(
+                "const A: [{n}]i64 = comptime {{\n    var t = [0; {n}]\n    \
+                 for i in 0..{n} {{ t[i] = i * {k} }}\n    t\n}}\n"
+            );
+            let lit: String =
+                (0..n).map(|i| (i as i64 * k).to_string()).collect::<Vec<_>>().join(", ");
+            let written = format!("const A: [{n}]i64 = comptime {{ [{lit}] }}\n");
+            prop_assert_eq!(eval_block(&looped), eval_block(&written));
+        }
+
+        /// **Every loop terminates.** Any bound, any step, any direction: the result is
+        /// a value or a diagnostic, never a hang. Teeth: dropping the per-iteration
+        /// `spend` makes this run forever instead of failing.
+        #[test]
+        fn ctfe_loops_always_terminate(lo in -1000i64..1000, hi in -1000i64..1000, step in -8i64..8) {
+            let src = format!(
+                "const A: i64 = comptime {{\n    var s = 0\n    \
+                 for i in {lo}..{hi} step {step} {{ s += 1 }}\n    s\n}}\n"
+            );
+            match eval_block(&src) {
+                Ok(Value::Int(count)) => {
+                    // A run that finished must have counted exactly the elements the
+                    // range contains.
+                    let want = if step > 0 && hi > lo {
+                        ((hi - lo) as f64 / step as f64).ceil() as i64
+                    } else if step < 0 && lo > hi {
+                        ((lo - hi) as f64 / (-step) as f64).ceil() as i64
+                    } else {
+                        0
+                    };
+                    prop_assert_eq!(count, want, "lo={} hi={} step={}", lo, hi, step);
+                }
+                Ok(other) => prop_assert!(false, "unexpected {:?}", other),
+                // A zero step never advances, and an over-long run runs out of budget.
+                Err(e) => prop_assert!(
+                    e.contains("never advances") || e.contains("step budget"),
+                    "{}", e
+                ),
+            }
+        }
+
         /// **Totality on nonsense.** An arbitrary body is refused with a diagnostic or
         /// folded — never a panic and never a hang. The three bounds (fuel, call depth,
         /// const-cycle detection) are what make this true for *every* input, not just
@@ -8460,6 +8507,151 @@ fn main() -> i32 {
         let out = Command::new(&exe).output().unwrap();
         assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"), "13\n8\n0\n22\n3\n");
+    }
+
+    /// **CTFE (workstream G, increment 7) — a loop-built table end-to-end.** Tier 6 made
+    /// a table's *values* computable; tier 7 makes its **shape** computable too. Before
+    /// this, a table meant writing `[f(0), f(1), …]` by hand — which does not scale to
+    /// the 256-entry lookup tables real code wants.
+    ///
+    /// What reaches C is still just the numbers: the loop, the mutation and the
+    /// recursion all happen in the compiler.
+    #[test]
+    fn a_comptime_loop_builds_a_real_static_table() {
+        let dir = std::env::temp_dir().join("jestyr_ctfe_loop_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A CRC-32 style table: 256 entries, each the result of eight rounds. Nobody
+        // would write this out by hand, which is the point.
+        let src = "\
+fn crc_entry(n: i64) -> i64 {
+    var c = n
+    for k in 0..8 {
+        if c % 2 == 1 {
+            c = 3988292384 ^ (c / 2)
+        } else {
+            c = c / 2
+        }
+    }
+    return c
+}
+
+const CRC: [256]i64 = comptime {
+    var t = [0; 256]
+    for i in 0..256 {
+        t[i] = crc_entry(i)
+    }
+    t
+}
+
+const SUM: i64 = comptime {
+    var s = 0
+    for v in CRC { s += v }
+    s
+}
+
+fn main() -> i32 {
+    print_int(CRC[0])
+    print_int(CRC[1])
+    print_int(CRC[255])
+    print_int(CRC.len as i64)
+    print_int(SUM)
+    return 0
+}
+";
+        let f = dir.join("crc.jtr");
+        std::fs::write(&f, src).unwrap();
+        let rel = f.to_str().unwrap();
+
+        let prog = crate::module::load(rel);
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "load: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(!td.iter().any(|d| d.is_error()), "typeck rejected a loop-built table: {td:?}");
+        let (c_src, _) = crate::cgen::emit(&prog.ast, &info);
+
+        // The loop ran in the compiler: what reaches C is a plain static of numbers,
+        // with no trace of the iteration that produced them. (A `const` takes the
+        // value prefix `j_`, not the function prefix `jestyr_`.)
+        let crc_line = c_src
+            .lines()
+            .find(|l| l.contains("j_CRC ="))
+            .expect("the table is missing from the C");
+        assert!(
+            crc_line.contains("{ { 0, 1996959894, 3993919788,"),
+            "the CRC table did not fold to its values: {}",
+            &crc_line[..crc_line.len().min(160)]
+        );
+        assert!(!crc_line.contains("for ("), "a comptime loop leaked into the C");
+        assert!(c_src.contains("j_SUM = 549755813760"), "the folded sum is missing");
+
+        let exe = build_exe(rel);
+        let out = Command::new(&exe).output().unwrap();
+        assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
+        // These are the standard CRC-32 table's entries, verified against an
+        // independent implementation of the same polynomial — so this pins the
+        // interpreter's arithmetic, not merely its self-consistency.
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"),
+            "0\n1996959894\n755167117\n256\n549755813760\n"
+        );
+    }
+
+    /// **Field iteration, end to end — tier 3's blocker, cleared by tier 7.** Reflection
+    /// could always answer `@field_name(T, i)` for a constant `i`; the walk was what it
+    /// could not express, because the natural way to write one is a helper function
+    /// whose parameter is not a constant.
+    ///
+    /// A comptime `for` binding is not a function parameter, so the loop form folds
+    /// where the function form could not — and because typeck never descends into a
+    /// comptime body, the reflection call inside it is the interpreter's alone. This is
+    /// design §8's "iterate fields, read type info, generate serializers", in ordinary
+    /// Jestyr, with no macro language: what reaches C is a string constant.
+    #[test]
+    fn a_comptime_loop_iterates_struct_fields_end_to_end() {
+        let dir = std::env::temp_dir().join("jestyr_ctfe_fields_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "\
+struct Point { x: i32, y: f64, label: str }
+
+const SHAPE: str = comptime {
+    var acc = \"\"
+    for i in 0..@field_count(Point) {
+        acc += @field_name(Point, i)
+        acc += \": \"
+        acc += @field_type(Point, i)
+        if i + 1 < @field_count(Point) { acc += \", \" }
+    }
+    acc
+}
+
+fn main() -> i32 {
+    print_str(SHAPE)
+    return 0
+}
+";
+        let f = dir.join("fields.jtr");
+        std::fs::write(&f, src).unwrap();
+        let rel = f.to_str().unwrap();
+
+        let prog = crate::module::load(rel);
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "load: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(!td.iter().any(|d| d.is_error()), "typeck rejected field iteration: {td:?}");
+        let (c_src, _) = crate::cgen::emit(&prog.ast, &info);
+        // The walk happened in the compiler: C sees one finished string.
+        assert!(
+            c_src.contains(r#"JSTR("x: i32, y: f64, label: str")"#),
+            "the field walk did not fold to a string constant"
+        );
+
+        let exe = build_exe(rel);
+        let out = Command::new(&exe).output().unwrap();
+        assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"),
+            "x: i32, y: f64, label: str\n"
+        );
     }
 
     /// **Doc-comment trivia in-language.** `tokens.collect_docs` recovers exactly the

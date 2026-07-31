@@ -122,8 +122,31 @@ pub struct Interp<'a> {
     /// until the call that owns it consumes it. Saved and restored across calls,
     /// so a callee's `return` can never escape into its caller.
     returning: Option<Value>,
+    /// Set when a `break`/`continue` fires, and carried up through every enclosing
+    /// block until the loop that owns it consumes it — the loop analogue of
+    /// `returning`. A *labelled* transfer keeps propagating past any loop whose label
+    /// does not match, which is how `break outer` reaches the right loop.
+    loop_ctl: Option<LoopCtl>,
     fuel: u32,
     depth: u32,
+}
+
+/// A pending loop-control transfer (tier 7).
+#[derive(Clone, Debug, PartialEq)]
+enum LoopCtl {
+    Break(Option<String>),
+    Continue(Option<String>),
+}
+
+impl LoopCtl {
+    /// Does this transfer belong to a loop labelled `label`? An unlabelled
+    /// `break`/`continue` belongs to the innermost loop, so it always matches.
+    fn targets(&self, label: Option<&str>) -> bool {
+        match self {
+            LoopCtl::Break(None) | LoopCtl::Continue(None) => true,
+            LoopCtl::Break(Some(l)) | LoopCtl::Continue(Some(l)) => Some(l.as_str()) == label,
+        }
+    }
 }
 
 impl<'a> Interp<'a> {
@@ -156,6 +179,7 @@ impl<'a> Interp<'a> {
             structs,
             in_progress: HashSet::new(),
             returning: None,
+            loop_ctl: None,
             fuel: FUEL,
             depth: 0,
         }
@@ -168,6 +192,7 @@ impl<'a> Interp<'a> {
         self.depth = 0;
         self.in_progress.clear();
         self.returning = None;
+        self.loop_ctl = None;
         let mut env: Env = vec![Vec::new()];
         self.eval_expr(id, &mut env)
     }
@@ -219,6 +244,7 @@ impl<'a> Interp<'a> {
         self.depth = 0;
         self.in_progress.clear();
         self.returning = None;
+        self.loop_ctl = None;
         let bound: Vec<(String, Value)> =
             f.params.iter().zip(args).map(|(p, v)| (p.name.name.clone(), v.clone())).collect();
         let mut env: Env = vec![bound];
@@ -326,6 +352,22 @@ impl<'a> Interp<'a> {
                         span,
                     )),
                 }
+            }
+            // --- loops and mutation (tier 7) ---
+            ExprKind::For { label, head, body, els, .. } => {
+                self.eval_for(label.as_ref().map(|l| l.name.as_str()), head, body, els, span, env)
+            }
+            ExprKind::Break(l) => {
+                self.loop_ctl = Some(LoopCtl::Break(l.as_ref().map(|i| i.name.clone())));
+                Ok(Value::Unit)
+            }
+            ExprKind::Continue(l) => {
+                self.loop_ctl = Some(LoopCtl::Continue(l.as_ref().map(|i| i.name.clone())));
+                Ok(Value::Unit)
+            }
+            ExprKind::Assign { op, target, value } => {
+                let v = self.eval_expr(*value, env)?;
+                self.eval_assign(*op, *target, v, span, env)
             }
             ExprKind::Unary { op, rhs } => {
                 let v = self.eval_expr(*rhs, env)?;
@@ -579,8 +621,329 @@ impl<'a> Interp<'a> {
                 // A nested `return` already fixed this call's result.
                 return Ok(self.returning.clone().expect("just checked"));
             }
+            // A pending `break`/`continue` stops this block too, and keeps travelling
+            // until the loop that owns it consumes it (tier 7).
+            if self.loop_ctl.is_some() {
+                return Ok(Value::Unit);
+            }
         }
         Ok(tail)
+    }
+
+    /// A comptime `for` (tier 7). Loops are *statements* in Jestyr, so this yields
+    /// [`Value::Unit`]; a loop earns its keep by mutating a `var`, which is what makes
+    /// `var t = [0; n]  for i in 0..n { t[i] = f(i) }  t` the way to build a table.
+    ///
+    /// **Fuel is spent per iteration.** Nothing else would: `for i in 0..1_000_000_000
+    /// { }` has an empty body, so no sub-expression is evaluated and no step is charged.
+    /// This one `spend` is the difference between a bounded evaluator and a hung build.
+    fn eval_for(
+        &mut self,
+        label: Option<&str>,
+        head: &ForHead,
+        body: &Block,
+        els: &Option<Block>,
+        span: Span,
+        env: &mut Env,
+    ) -> EvalResult {
+        // Each iteration's binding lives in its own scope, so a `for` body cannot leak
+        // its loop variable, exactly as at runtime.
+        let mut broke = false;
+        match head {
+            ForHead::Infinite => loop {
+                self.spend(span)?;
+                if self.run_loop_body(body, label, env, &mut broke)? {
+                    break;
+                }
+            },
+            ForHead::While(cond) => loop {
+                self.spend(span)?;
+                match self.eval_expr(*cond, env)? {
+                    Value::Bool(true) => {}
+                    Value::Bool(false) => break,
+                    other => {
+                        return Err(EvalError::new(
+                            format!("a `for` condition must be a bool, found {}", other.type_name()),
+                            span,
+                        ))
+                    }
+                }
+                if self.run_loop_body(body, label, env, &mut broke)? {
+                    break;
+                }
+            },
+            ForHead::Iter { binds, sources, step } => {
+                let items = self.iter_items(binds, sources, step, span, env)?;
+                for (i, v) in items.into_iter().enumerate() {
+                    self.spend(span)?;
+                    env.push(Vec::new());
+                    // 1 bind = the element; 2 binds = element then index (the
+                    // element+index form). A `_` bind is still bound — harmlessly, and
+                    // it keeps the arity rule one line long.
+                    if let Some(b) = binds.first() {
+                        env.last_mut().expect("just pushed").push((b.name.name.clone(), v));
+                    }
+                    if let Some(b) = binds.get(1) {
+                        env.last_mut()
+                            .expect("just pushed")
+                            .push((b.name.name.clone(), Value::Int(i as i64)));
+                    }
+                    let out = self.run_loop_body(body, label, env, &mut broke);
+                    env.pop();
+                    if out? {
+                        break;
+                    }
+                }
+            }
+        }
+        // `for … else { … }` runs exactly once iff the loop completed WITHOUT a break —
+        // the search-or-default idiom. A `break` is precisely what suppresses it.
+        if !broke {
+            if let Some(e) = els {
+                self.eval_block(e, env)?;
+            }
+        }
+        Ok(Value::Unit)
+    }
+
+    /// Run one loop-body iteration. Returns `true` when the loop should stop —
+    /// because it broke, returned, or a *labelled* transfer is still travelling
+    /// outward to a loop further out.
+    fn run_loop_body(
+        &mut self,
+        body: &Block,
+        label: Option<&str>,
+        env: &mut Env,
+        broke: &mut bool,
+    ) -> Result<bool, EvalError> {
+        self.eval_block(body, env)?;
+        if self.returning.is_some() {
+            return Ok(true);
+        }
+        let Some(ctl) = self.loop_ctl.clone() else { return Ok(false) };
+        if !ctl.targets(label) {
+            // Aimed at an enclosing loop: leave it set so it keeps propagating.
+            return Ok(true);
+        }
+        self.loop_ctl = None;
+        match ctl {
+            LoopCtl::Break(_) => {
+                *broke = true;
+                Ok(true)
+            }
+            LoopCtl::Continue(_) => Ok(false),
+        }
+    }
+
+    /// The values a `for … in …` head iterates. A range yields its integers; a list
+    /// yields its elements. Anything else is refused rather than guessed at.
+    fn iter_items(
+        &mut self,
+        binds: &[LoopBind],
+        sources: &[ExprId],
+        step: &Option<ExprId>,
+        span: Span,
+        env: &mut Env,
+    ) -> Result<Vec<Value>, EvalError> {
+        if binds.is_empty() || binds.len() > 2 || sources.len() != 1 {
+            return Err(EvalError::new(
+                "this `for` shape is not supported at compile time (one or two bindings \
+                 over one source)",
+                span,
+            ));
+        }
+        let src = sources[0];
+        let stride = match step {
+            Some(s) => match self.eval_expr(*s, env)? {
+                Value::Int(0) => return Err(EvalError::new("a `step` of 0 never advances", span)),
+                Value::Int(i) => i,
+                other => {
+                    return Err(EvalError::new(
+                        format!("a `step` must be an integer, found {}", other.type_name()),
+                        span,
+                    ))
+                }
+            },
+            None => 1,
+        };
+
+        // A range is a *header* form, not a value: it is read from the AST rather than
+        // evaluated, because there is no range value in the comptime domain.
+        if let ExprKind::Range { lo, hi, inclusive } = &self.ast.expr_at(src).kind {
+            let (lo, hi, inclusive) = (*lo, *hi, *inclusive);
+            let (Some(lo), Some(hi)) = (lo, hi) else {
+                return Err(EvalError::new("an open-ended range cannot be iterated at compile time", span));
+            };
+            let a = self.eval_int(lo, env)?;
+            let b = self.eval_int(hi, env)?;
+            let mut out = Vec::new();
+            let mut i = a;
+            // Each produced element costs a step, so a range nobody meant to write is a
+            // diagnostic rather than an allocation — the `[v; n]` rule again.
+            if stride > 0 {
+                while if inclusive { i <= b } else { i < b } {
+                    self.spend(span)?;
+                    out.push(Value::Int(i));
+                    i = i.checked_add(stride).ok_or_else(|| {
+                        EvalError::new("this range overflowed at compile time", span)
+                    })?;
+                }
+            } else {
+                while if inclusive { i >= b } else { i > b } {
+                    self.spend(span)?;
+                    out.push(Value::Int(i));
+                    i = i.checked_add(stride).ok_or_else(|| {
+                        EvalError::new("this range overflowed at compile time", span)
+                    })?;
+                }
+            }
+            return Ok(out);
+        }
+
+        match self.eval_expr(src, env)? {
+            Value::List(items) => Ok(items),
+            other => Err(EvalError::new(
+                format!("cannot iterate {} at compile time", other.type_name()),
+                span,
+            )),
+        }
+    }
+
+    fn eval_int(&mut self, id: ExprId, env: &mut Env) -> Result<i64, EvalError> {
+        let span = self.ast.expr_at(id).span;
+        match self.eval_expr(id, env)? {
+            Value::Int(i) => Ok(i),
+            other => Err(EvalError::new(
+                format!("expected an integer, found {}", other.type_name()),
+                span,
+            )),
+        }
+    }
+
+    /// Assign to a comptime place (tier 7) — a local, or an element reached through
+    /// any number of indices.
+    ///
+    /// The place is resolved to a **path** (a name plus a list of indices) rather than
+    /// to a `&mut`, which keeps index expressions evaluable — they may themselves read
+    /// the environment — without holding a borrow of it across the evaluation.
+    fn eval_assign(
+        &mut self,
+        op: AssignOp,
+        target: ExprId,
+        value: Value,
+        span: Span,
+        env: &mut Env,
+    ) -> EvalResult {
+        let (name, path) = self.place_path(target, env)?;
+        let cur = Self::read_path(env, &name, &path, span)?;
+        // A compound assignment is the binary operator applied to the current value —
+        // the same checked arithmetic as everywhere else, so `x += 1` can overflow into
+        // a diagnostic rather than wrapping.
+        let new = match op {
+            AssignOp::Assign => value,
+            _ => {
+                let bin = match op {
+                    AssignOp::Add => BinOp::Add,
+                    AssignOp::Sub => BinOp::Sub,
+                    AssignOp::Mul => BinOp::Mul,
+                    AssignOp::Div => BinOp::Div,
+                    AssignOp::Rem => BinOp::Rem,
+                    AssignOp::BitAnd => BinOp::BitAnd,
+                    AssignOp::BitOr => BinOp::BitOr,
+                    AssignOp::BitXor => BinOp::BitXor,
+                    AssignOp::Assign => unreachable!("handled above"),
+                };
+                match (&cur, &value) {
+                    (Value::Int(a), Value::Int(b)) => self.int_binop(bin, *a, *b, span)?,
+                    (Value::Str(a), Value::Str(b)) if bin == BinOp::Add => {
+                        Value::Str(format!("{a}{b}"))
+                    }
+                    _ => {
+                        return Err(EvalError::new(
+                            format!(
+                                "cannot apply `{}=` to {} and {} at compile time",
+                                op_text(bin),
+                                cur.type_name(),
+                                value.type_name()
+                            ),
+                            span,
+                        ))
+                    }
+                }
+            }
+        };
+        Self::write_path(env, &name, &path, new, span)?;
+        // An assignment is a statement: it yields nothing.
+        Ok(Value::Unit)
+    }
+
+    /// Resolve an assignment target to `(binding name, index path)`.
+    fn place_path(&mut self, target: ExprId, env: &mut Env) -> Result<(String, Vec<usize>), EvalError> {
+        let span = self.ast.expr_at(target).span;
+        match &self.ast.expr_at(target).kind {
+            ExprKind::Name(n) => Ok((n.name.clone(), Vec::new())),
+            ExprKind::Index { base, index } => {
+                let (base, index) = (*base, *index);
+                let (name, mut path) = self.place_path(base, env)?;
+                let ispan = self.ast.expr_at(index).span;
+                let v = self.eval_expr(index, env)?;
+                let ix = v.as_usize().ok_or_else(|| {
+                    EvalError::new(
+                        format!("an index must be a non-negative integer, found {}", v.type_name()),
+                        ispan,
+                    )
+                })?;
+                path.push(ix);
+                Ok((name, path))
+            }
+            _ => Err(EvalError::new("this is not something a compile-time assignment can write", span)),
+        }
+    }
+
+    fn find_binding<'e>(env: &'e mut Env, name: &str, span: Span) -> Result<&'e mut Value, EvalError> {
+        for scope in env.iter_mut().rev() {
+            if let Some((_, v)) = scope.iter_mut().rev().find(|(n, _)| n == name) {
+                return Ok(v);
+            }
+        }
+        Err(EvalError::new(format!("`{name}` is not a compile-time binding"), span))
+    }
+
+    fn walk_path<'e>(
+        mut slot: &'e mut Value,
+        path: &[usize],
+        span: Span,
+    ) -> Result<&'e mut Value, EvalError> {
+        for &ix in path {
+            let Value::List(items) = slot else {
+                return Err(EvalError::new(
+                    format!("cannot index {} at compile time", slot.type_name()),
+                    span,
+                ));
+            };
+            let len = items.len();
+            slot = items.get_mut(ix).ok_or_else(|| {
+                EvalError::new(format!("index {ix} is out of range for a list of {len}"), span)
+            })?;
+        }
+        Ok(slot)
+    }
+
+    fn read_path(env: &mut Env, name: &str, path: &[usize], span: Span) -> EvalResult {
+        let slot = Self::find_binding(env, name, span)?;
+        Ok(Self::walk_path(slot, path, span)?.clone())
+    }
+
+    fn write_path(
+        env: &mut Env,
+        name: &str,
+        path: &[usize],
+        new: Value,
+        span: Span,
+    ) -> Result<(), EvalError> {
+        let slot = Self::find_binding(env, name, span)?;
+        *Self::walk_path(slot, path, span)? = new;
+        Ok(())
     }
 
     fn eval_call(&mut self, callee: ExprId, args: &[ExprId], span: Span, env: &mut Env) -> EvalResult {
@@ -1045,6 +1408,239 @@ mod tests {
             let id = found.expect("fixture needs a comptime block");
             assert!(Interp::new(&ast).eval(id).is_err(), "should be refused: {src}");
         }
+    }
+
+    // --- tier 7: comptime `for` and mutation ---
+
+    /// The point of the whole tier: a table whose **shape** is computed, not spelled
+    /// out. Before this, building one meant writing `[f(0), f(1), …]` by hand.
+    #[test]
+    fn a_loop_can_build_a_table() {
+        let src = "\
+fn fib(n: i64) -> i64 {
+    if n < 2 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+const FIB: [10]i64 = comptime {
+    var t = [0; 10]
+    for i in 0..10 {
+        t[i] = fib(i)
+    }
+    t
+}
+";
+        assert_eq!(
+            list_of(src),
+            vec![0, 1, 1, 2, 3, 5, 8, 13, 21, 34].into_iter().map(Value::Int).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mutation_works_on_locals_and_elements() {
+        // A plain accumulator.
+        assert_eq!(
+            int_of("const A: i64 = comptime {\n    var s = 0\n    for i in 1..5 { s = s + i }\n    s\n}\n"),
+            10
+        );
+        // Compound assignment, with the same checked arithmetic as everywhere else.
+        assert_eq!(
+            int_of("const A: i64 = comptime {\n    var s = 1\n    for i in 1..5 { s *= i }\n    s\n}\n"),
+            24
+        );
+        // Nested places.
+        let nested = "const A: i64 = comptime {\n    var g = [[0; 2]; 2]\n    g[1][0] = 7\n    g[1][0]\n}\n";
+        assert_eq!(int_of(nested), 7);
+        // A string accumulator. (`out` is a reserved word — the parameter convention —
+        // so a comptime accumulator cannot be named that either.)
+        let s = "const A: str = comptime {\n    var acc = \"\"\n    for i in 0..3 { acc += \"x\" }\n    acc\n}\n";
+        assert_eq!(eval_last_const(s).unwrap(), Value::Str("xxx".into()));
+    }
+
+    #[test]
+    fn every_loop_head_shape_runs() {
+        // Inclusive range and a step.
+        assert_eq!(
+            int_of("const A: i64 = comptime {\n    var s = 0\n    for i in 0..=4 { s += i }\n    s\n}\n"),
+            10
+        );
+        assert_eq!(
+            int_of("const A: i64 = comptime {\n    var s = 0\n    for i in 0..10 step 2 { s += i }\n    s\n}\n"),
+            20
+        );
+        // Descending.
+        assert_eq!(
+            int_of("const A: i64 = comptime {\n    var s = 0\n    for i in 5..0 step 0 - 1 { s += i }\n    s\n}\n"),
+            15
+        );
+        // Condition-headed (the `while` job).
+        assert_eq!(
+            int_of("const A: i64 = comptime {\n    var n = 0\n    for n < 5 { n += 1 }\n    n\n}\n"),
+            5
+        );
+        // Infinite, exited by `break`.
+        assert_eq!(
+            int_of("const A: i64 = comptime {\n    var n = 0\n    for { n += 1\n if n > 3 { break } }\n    n\n}\n"),
+            4
+        );
+        // Iterating a list, and the element+index form.
+        assert_eq!(
+            int_of("const A: i64 = comptime {\n    var s = 0\n    for v in [10, 20, 30] { s += v }\n    s\n}\n"),
+            60
+        );
+        assert_eq!(
+            int_of("const A: i64 = comptime {\n    var s = 0\n    for v, i in [5, 5, 5] { s += v * i }\n    s\n}\n"),
+            15
+        );
+    }
+
+    #[test]
+    fn break_and_continue_reach_the_right_loop() {
+        // `continue` skips the rest of an iteration.
+        assert_eq!(
+            int_of("const A: i64 = comptime {\n    var s = 0\n    for i in 0..10 { if i % 2 == 0 { continue }\n s += i }\n    s\n}\n"),
+            25
+        );
+        // A LABELLED break travels past the inner loop to the outer one.
+        let labelled = "\
+const A: i64 = comptime {
+    var s = 0
+    for outer: i in 0..5 {
+        for j in 0..5 {
+            if j == 2 { break outer }
+            s += 1
+        }
+    }
+    s
+}
+";
+        assert_eq!(int_of(labelled), 2);
+        // An unlabelled break stops only the inner loop, so the outer one runs on.
+        let inner = "\
+const A: i64 = comptime {
+    var s = 0
+    for i in 0..5 {
+        for j in 0..5 {
+            if j == 2 { break }
+            s += 1
+        }
+    }
+    s
+}
+";
+        assert_eq!(int_of(inner), 10);
+    }
+
+    /// `for … else { … }` runs exactly once iff the loop finished without a `break` —
+    /// the search-or-default idiom, and the one place `broke` is observable.
+    #[test]
+    fn a_loop_else_runs_only_when_nothing_broke() {
+        let found = "const A: i64 = comptime {\n    var r = 0\n    for i in 0..5 { if i == 3 { r = i\n break } } else { r = 0 - 1 }\n    r\n}\n";
+        assert_eq!(int_of(found), 3);
+        let missing = "const A: i64 = comptime {\n    var r = 0\n    for i in 0..5 { if i == 99 { r = i\n break } } else { r = 0 - 1 }\n    r\n}\n";
+        assert_eq!(int_of(missing), -1);
+    }
+
+    /// **Totality over loops.** An empty body evaluates no sub-expression, so nothing
+    /// else would charge the budget — this is the same lesson `[v; n]` taught, in a new
+    /// shape. Without the per-iteration `spend` these tests hang the suite forever.
+    #[test]
+    fn a_runaway_loop_is_bounded_not_hung() {
+        // An empty body: the trap case.
+        let e = err_of("const A: i64 = comptime {\n    for i in 0..1000000000 { }\n    0\n}\n");
+        assert!(e.contains("step budget"), "{e}");
+        // A condition that never becomes false.
+        let e2 = err_of("const A: i64 = comptime {\n    for true { }\n    0\n}\n");
+        assert!(e2.contains("step budget"), "{e2}");
+        // An infinite loop with no `break`.
+        let e3 = err_of("const A: i64 = comptime {\n    for { }\n    0\n}\n");
+        assert!(e3.contains("step budget"), "{e3}");
+        // A step that never advances is refused outright rather than spun on.
+        let e4 = err_of("const A: i64 = comptime {\n    for i in 0..5 step 0 { }\n    0\n}\n");
+        assert!(e4.contains("never advances"), "{e4}");
+    }
+
+    #[test]
+    fn a_bad_loop_or_assignment_is_refused_with_a_reason() {
+        // Iterating something that is not iterable.
+        let e = err_of("const A: i64 = comptime {\n    for x in 5 { }\n    0\n}\n");
+        assert!(e.contains("cannot iterate"), "{e}");
+        // A non-bool condition.
+        let e2 = err_of("const A: i64 = comptime {\n    for 5 { }\n    0\n}\n");
+        assert!(e2.contains("must be a bool"), "{e2}");
+        // Writing to a binding that does not exist.
+        let e3 = err_of("const A: i64 = comptime {\n    nope = 1\n    0\n}\n");
+        assert!(e3.contains("not a compile-time binding"), "{e3}");
+        // Writing past the end of a list.
+        let e4 = err_of("const A: i64 = comptime {\n    var t = [0; 2]\n    t[9] = 1\n    0\n}\n");
+        assert!(e4.contains("out of range"), "{e4}");
+        // A compound assignment still uses checked arithmetic.
+        let e5 = err_of("const A: i64 = comptime {\n    var s = 9223372036854775807\n    s += 1\n    s\n}\n");
+        assert!(e5.contains("overflowed"), "{e5}");
+    }
+
+    /// A loop variable belongs to its iteration, and a `for` yields no value — both
+    /// the same as at runtime, so comptime code reads like ordinary code.
+    #[test]
+    fn loop_scoping_and_value_match_runtime_rules() {
+        let e = err_of("const A: i64 = comptime {\n    for i in 0..3 { }\n    i\n}\n");
+        assert!(e.contains("not a compile-time constant"), "{e}");
+        // A block whose tail is a `for` produces nothing, which typeck refuses.
+        assert_eq!(
+            eval_last_const("const A: i64 = comptime {\n    for i in 0..3 { }\n}\n").unwrap(),
+            Value::Unit
+        );
+    }
+
+    /// **Field iteration — the thing tier 3 could not reach.** Reflection could always
+    /// answer `@field_name(T, i)` for a *constant* `i`; what it could not do was walk
+    /// the fields, because the obvious way to write the walk is a helper function whose
+    /// parameter `i` is not a constant.
+    ///
+    /// A comptime `for` binding is not a function parameter — it lives in the
+    /// interpreter's own environment — so the loop form folds where the function form
+    /// could not. This is design §8's "iterate fields, read type info, generate
+    /// serializers", in ordinary Jestyr, with no macro language.
+    #[test]
+    fn a_comptime_loop_can_iterate_a_structs_fields() {
+        let src = "\
+struct Point { x: i32, y: f64, label: str }
+const SHAPE: str = comptime {
+    var acc = \"\"
+    for i in 0..@field_count(Point) {
+        acc += @field_name(Point, i)
+        acc += \": \"
+        acc += @field_type(Point, i)
+        if i + 1 < @field_count(Point) { acc += \", \" }
+    }
+    acc
+}
+";
+        assert_eq!(
+            eval_last_const(src).unwrap(),
+            Value::Str("x: i32, y: f64, label: str".to_string())
+        );
+    }
+
+    /// The same walk as a *list* rather than a string — the shape a generated
+    /// descriptor table wants.
+    #[test]
+    fn field_metadata_can_be_collected_into_a_table() {
+        let src = "\
+struct Rec { a: i32, b: i32, c: i32 }
+const NAMES: [3]str = comptime {
+    var t = [\"\"; @field_count(Rec)]
+    for i in 0..@field_count(Rec) { t[i] = @field_name(Rec, i) }
+    t
+}
+";
+        assert_eq!(
+            eval_last_const(src).unwrap(),
+            Value::List(vec![
+                Value::Str("a".into()),
+                Value::Str("b".into()),
+                Value::Str("c".into())
+            ])
+        );
     }
 
     // --- tier 6: aggregate comptime values ---

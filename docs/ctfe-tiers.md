@@ -19,6 +19,7 @@ or mutate the compiler's own state destroys all three at once.
 | 4 | `build.jestyr` — the build described in Jestyr | **done in the Rust reference** — G4 (`jestyrc plan`) |
 | 5 | Bounded, attestable artifact generation | **done in the Rust reference** — G5 (`--emit`) |
 | 6 | Aggregate values — comptime **tables** | **done in the Rust reference** — G6 (`Value::List`) |
+| 7 | Comptime `for` + mutation — computed table *shape* | **done in the Rust reference** — G7 |
 
 ---
 
@@ -147,15 +148,38 @@ numbers, it asks the C compiler. Making them comptime *values* requires the comp
 own layout pass. Tier 3 therefore reflects what the compiler already knows without it
 — the declared shape.
 
-**Arguments must be compile-time constants.** The evaluator can already walk a struct
-by recursion (`if i >= @field_count(T) …; return @field_name(T, i) + f(i + 1)`), and
-that works *inside the interpreter*. It is not usable end-to-end yet, and the reason
-is not the layout pass: a top-level `fn` is also emitted as ordinary runtime code, and
-there the index is a parameter rather than a constant, so the query cannot fold.
-Closing that gap needs **comptime-only functions** — a body instantiated at comptime
-and never emitted — which is the natural next slice. (A comptime `for` and aggregate
-comptime values would be the alternative route; both stay bounded by the existing fuel
-budget, so neither threatens totality.)
+**Field iteration — resolved by tier 7, not by comptime-only functions.** Arguments to
+a reflection query must be compile-time constants, and originally that made the *walk*
+inexpressible: the natural way to write one is a helper `fn`, but a top-level `fn` is
+also emitted as ordinary runtime code, and there the index is a parameter rather than a
+constant, so the query cannot fold. That looked like it needed **comptime-only
+functions**.
+
+It did not. A comptime `for` binding is not a function parameter — it lives in the
+interpreter's own environment — so the loop form folds where the function form could
+not, and because typeck never descends into a `comptime` body, the query inside one is
+the interpreter's alone:
+
+```jestyr
+struct Point { x: i32, y: f64, label: str }
+
+const SHAPE: str = comptime {
+    var acc = ""
+    for i in 0..@field_count(Point) {
+        acc += @field_name(Point, i)
+        acc += ": "
+        acc += @field_type(Point, i)
+        if i + 1 < @field_count(Point) { acc += ", " }
+    }
+    acc
+}
+```
+
+That reaches C as `JSTR("x: i32, y: f64, label: str")` — design §8's "iterate fields,
+read type info, generate serializers", in ordinary Jestyr, with no macro language.
+Collecting the metadata into a table (`var t = [""; @field_count(Rec)]`) works the same
+way. Comptime-only functions remain a reasonable convenience later, but they are no
+longer a blocker for anything.
 
 ## Tier 4 — `build.jestyr`
 
@@ -319,10 +343,53 @@ inventing rules is what this evaluator does not do. Indexing out of range is an 
 never a clamp; a nested aggregate with no annotation to say what it is is an error,
 never a guess.
 
-**What this still does not give you:** a comptime `for`. Building a table today means
-writing `[f(0), f(1), …]` — the values are computed, but the *shape* is spelled out.
-A comptime `for` (or comptime-only functions, per tier 3) is what removes that, and
-both stay bounded by the same fuel budget.
+Tier 6 makes a table's *values* computable. **Tier 7** below makes its *shape*
+computable too.
+
+## Tier 7 — comptime `for`, and mutation
+
+Loops and `var` assignment run at compile time, so a table is *built* rather than
+written out:
+
+```jestyr
+fn crc_entry(n: i64) -> i64 {
+    var c = n
+    for k in 0..8 {
+        if c % 2 == 1 { c = 3988292384 ^ (c / 2) } else { c = c / 2 }
+    }
+    return c
+}
+
+const CRC: [256]i64 = comptime {
+    var t = [0; 256]
+    for i in 0..256 { t[i] = crc_entry(i) }
+    t
+}
+```
+
+That emits a 256-entry `static const JestyrArr_i64_256 j_CRC = { { 0, 1996959894, … } };`
+— the loop, the mutation and the recursion all happened in the compiler, and nothing
+of them reaches C. Before tier 7 this table had to be typed out by hand, which is why
+tier 6 alone was not enough.
+
+**Loops are statements, so mutation comes with them.** A `for` yields no value in
+Jestyr, at compile time exactly as at runtime — so a loop earns its keep by writing to
+a `var`, and tier 7 is really "loops *and* assignment" rather than either alone.
+Supported: all three loop heads (`for {}`, `for <cond> {}`, `for … in …`), ranges
+(exclusive, inclusive, `step`, descending), iterating a list, the element+index form,
+`break`/`continue` including **labelled** ones, and `for … else` (which runs iff
+nothing broke). Assignment reaches locals and elements at any depth (`g[1][0] = 7`),
+and compound assignment (`s += i`) uses the same **checked** arithmetic as everything
+else — so a comptime `+=` overflows into a diagnostic rather than wrapping.
+
+**Totality, a third time.** Fuel is spent **per iteration**, and this is the case where
+nothing else would charge anything at all: `for i in 0..1_000_000_000 { }` has an empty
+body, so no sub-expression is evaluated. A `step` of `0` is refused outright rather
+than spun on. Four unit tests and a property test exist purely to hang the suite if
+that per-iteration `spend` is ever removed.
+
+Scoping matches runtime: a loop variable belongs to its iteration and is not visible
+after the loop.
 
 ---
 

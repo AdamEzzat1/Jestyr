@@ -28,6 +28,7 @@
 
 | Increment | Commit | What |
 |---|---|---|
+| **G7** comptime `for` + mutation | *(this run)* | **Also cleared tier 3's field-iteration blocker** — see below. Loops and `var` assignment run at compile time, so a table's **shape** is computed, not spelled out: a 256-entry CRC-32 table is built by `for i in 0..256 { t[i] = crc_entry(i) }` and emitted as a plain static (values verified against an independent implementation, not just self-consistency). All three loop heads, ranges (inclusive/`step`/descending), list iteration, element+index, `break`/`continue` incl. **labelled**, and `for … else`. Assignment reaches locals and elements at any depth; compound assignment uses the same **checked** arithmetic, so `+=` overflows into a diagnostic. Fuel per **iteration** — the trap here is that an empty body evaluates nothing, so nothing else charges the budget at all. |
 | **G6** aggregate values | *(this run)* | `Value::List` — CTFE goes from "compute a number" to "compute a **table**". Array literals/repeats evaluate; `[i]` and `.len` read. A `const` initialised by a comptime block yielding a list becomes an ordinary **static** (`static const JestyrArr_i64_8 jestyr_FIB = { { 0, 1, 1, 2, 3, 5, 8, 13 } };`) — the C compiler gets the answers, not the recursion. Emission detail with teeth: a static **must** be a brace initializer, since it cannot be initialised by the GNU statement-expression an expression-position aggregate uses; both paths exist and the test asserts no `({` reaches a static. Fuel is spent **per element**, so `[0; 10_000_000_000]` (and the nested `[[0; 100000]; 100000]`, where the *product* blows up) is a diagnostic in microseconds. |
 | **G5** bounded generation | *(this run)* | `jestyrc plan … --emit`. A build script **computes the bytes of a file**; the plan records it by SHA-256, and the driver writes it only on explicit `--emit`. The evaluator gained no new power — it computed a string — so generation is a pure function whose result the *user* places, never an effect a script performs. Reproducible, attestable (hash in the plan), and bounded literally: size-capped, and an absolute or `..` path is **refused, not normalised**. A generated file can be named as a build target, so a program can be computed and compiled in one invocation. |
 | **G4** `build.jestyr` | `29bd2bd` | `src/buildscript.rs` + `jestyrc plan <script> [--build]`. The build described in Jestyr and **evaluated, never run**. The plan is a *pure function of an index* (`const targets` + `fn source(i)`/`fn output(i)`) rather than the imperative `exe(…)`/`test(…)` shape, because that shape needs comptime **effects** — the one thing the ladder exists to forbid. Closes K's last leftover. `Interp::{eval_const, call_fn}` added. `examples/build.jestyr` is the canonical demo (a `.jestyr` extension, so no golden sweeps it). |
@@ -51,16 +52,30 @@ when the reference re-sorts its output by content (§2, O1).
    **DONE (G6).** It cost no totality, as predicted, *provided* fuel is spent per
    element — that one line is what separates a bounded evaluator from one that tries
    to allocate ten billion values. What it delivered: comptime **tables** as real
-   statics. What it did *not* deliver on its own: tier-3 field iteration still needs
-   comptime-only functions (finding 2), and building a table still means spelling out
-   `[f(0), f(1), …]` because there is no comptime `for` yet — the *values* are
-   computed, the *shape* is not.
-2. **Field iteration is emission-blocked, not L-blocked.** The evaluator can already
-   walk a struct by recursion (`if i >= @field_count(T) …`), and that works *inside*
-   the interpreter. What stops it end-to-end is that a top-level `fn` is also emitted
-   as ordinary runtime code, where the index is a parameter and the query cannot fold.
-   The fix is **comptime-only functions** (a body instantiated at comptime, never
-   emitted) — not the layout pass. Worth knowing before anyone waits on L for it.
+   statics. What it did *not* deliver on its own: building a table still meant spelling
+   out `[f(0), f(1), …]` — the *values* were computed, the *shape* was not. ~~And
+   tier-3 field iteration still needs comptime-only functions.~~ — **both closed by G7.**
+2. ~~**Field iteration is emission-blocked, not L-blocked.**~~ — **DONE (G7), and the
+   predicted fix was the wrong one.** The diagnosis was right: a top-level `fn` is also
+   emitted as ordinary runtime code, where the index is a parameter and the query cannot
+   fold. The prescription — **comptime-only functions** — was not needed. A comptime
+   `for` binding is not a function parameter; it lives in the interpreter's own
+   environment, and typeck never descends into a `comptime` body, so the loop form folds
+   where the function form could not:
+
+   ```jestyr
+   const SHAPE: str = comptime {
+       var acc = ""
+       for i in 0..@field_count(Point) { acc += @field_name(Point, i) … }
+       acc
+   }
+   ```
+
+   That reaches C as one `JSTR(…)` constant (`a_comptime_loop_iterates_struct_fields_end_to_end`).
+   **The transferable lesson:** when a feature is blocked because a value "is a
+   parameter, not a constant", check whether some *other* binding form is already
+   constant before building a new function kind. Comptime-only functions remain a
+   reasonable convenience, but they block nothing now.
 3. **`size_of`/`align_of`/`offset_of` are C-deferred**, lowering to `sizeof`/
    `_Alignof`/`offsetof`. This compiler never learns the numbers, so exposing them as
    comptime *values* genuinely does require **L**. That is the real L dependency; the
@@ -366,12 +381,14 @@ memory + `PARALLELISM-HANDOFF.md`).
 **Done:** ~~O1 records~~ (51–52) → ~~O2 doc~~ (53–54) → **workstream O complete** →
 ~~G1 the comptime interpreter~~ (`ebf8397`) → ~~G2 `comptime` blocks~~ (`b063ca4`) →
 ~~G3 reflection~~ (`4a85bc6`) → ~~G4 `build.jestyr`~~ (`29bd2bd`) → ~~G5 bounded
-generation~~ (`bce5456`) → ~~G6 aggregate values / comptime tables~~ — **the CTFE tier
-ladder (0–6) is done on the reference side**, and documented in `docs/ctfe-tiers.md`.
+generation~~ (`bce5456`) → ~~G6 aggregate values / comptime tables~~ → ~~G7 comptime
+`for` + mutation~~ — **the CTFE tier ladder (0–7) is done on the reference side**, and
+documented in `docs/ctfe-tiers.md`.
 
-**Next:** a comptime `for` (so a table's *shape* can be computed, not just its values)
-→ comptime-only functions → the **G2/G3/G6 port mirrors** → L layout 1–3 (opt-in,
-byte-identity preserved) → Q SIMD. `@size_of` as a comptime *value* comes after L.
+**Next:** the **G2/G3/G6/G7 port mirrors** → L layout 1–3 (opt-in, byte-identity
+preserved) → Q SIMD. `@size_of` as a comptime *value* comes after L.
+Comptime-only functions are now a *convenience*, not a blocker (finding 2) — take them
+whenever a caller wants a named comptime helper, not to unblock anything.
 
 `#line` (§1) is an independent, optional increment — take it whenever the port's `build`
 C needs to match the reference's, not before. Keep every increment two-sided-green:
@@ -387,16 +404,20 @@ and its Rust-only tests first, then the mirror, then the corpus file, in that or
 
 ## One-line
 Self-hosting is finished and productized, **workstream O is complete in-language**, and
-**the CTFE tier ladder (0–6) is now done on the reference side** — a total comptime
+**the CTFE tier ladder (0–7) is now done on the reference side** — a total comptime
 interpreter that closed a silent zero-length-array miscompile, `comptime { … }` in user
 syntax, reflection over the declared shape in the collision-proof `@` namespace, a
-`build.jestyr` that is *evaluated, never run*, bounded artifact generation, and
-aggregate values that make a computed lookup table an ordinary static. The through-line
-is that **purity was never traded away to get power**: each tier added a capability
-without giving the evaluator an effect, so determinism and reproducibility stayed
-properties of the design rather than conventions to police. The ladder is documented in
-`docs/ctfe-tiers.md`. What's left is a comptime `for` (so a table's shape can be
-computed too), comptime-only functions, the **G2/G3/G6 port mirrors**, opt-in memory
+`build.jestyr` that is *evaluated, never run*, bounded artifact generation, aggregate
+values that make a computed lookup table an ordinary static, and a comptime `for` that
+computes a table's **shape** as well as its values — a 256-entry CRC-32 table now
+emerges from `for i in 0..256 { t[i] = crc_entry(i) }` as a plain C static, and the same
+loop walks a struct's fields to generate a descriptor, which is what tier 3 had been
+waiting on. The through-line is that **purity was never traded away to get power**: each
+tier added a capability without giving the evaluator an effect, so determinism and
+reproducibility stayed properties of the design rather than conventions to police — and
+each tier's cost was one line of fuel accounting in a new place (per expression, per
+element, per iteration). The ladder is documented in `docs/ctfe-tiers.md`. What's left is
+the **G2/G3/G6/G7 port mirrors**, opt-in memory
 layout, SIMD, and the optional `#line` port — each landed
 increment-by-increment under the two-sided golden discipline with the bootstrap seed
 refreshed at every `examples/std` change.
