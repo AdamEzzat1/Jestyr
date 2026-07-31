@@ -993,14 +993,51 @@ reference surface is compact enough to transcribe rather than converge:
   `c-sha256`. Nothing else in the two-sided gate can see it (every golden uses
   debug-free ASTs). Full writeup + the plan in the next-frontier handoff §1.
 
-> **THIS DOCUMENT'S STORY IS COMPLETE.** Increments 1–52 delivered the whole self-hosting
+### Increments 53–54 — O2 `doc`: WORKSTREAM O IS COMPLETE IN-LANGUAGE
+
+`jc <file> doc` renders the Markdown API page byte-for-byte identical to
+`doc::generate(src, stem, html=false)` over all 134 corpus files.
+
+- **53 — the trivia pass, without touching the token stream.** The recorded blocker was
+  "the ported lexer skips comments". Cleared by `tokens.jtr`'s `pub struct RawDoc` +
+  `pub fn collect_docs`: a SECOND pass that finds comments by scanning the **gaps between
+  tokens**. Trivia lives only there by construction, so the pass needs none of the
+  string/char-literal handling `tokenize` carries — and `tokenize` stays byte-identical,
+  which is the whole point. The case that proves it: `"/// not a doc /* nor this */"`
+  inside a string literal is never in a gap. Golden
+  `jestyr_doc_trivia_matches_reference` pins kind / block-ness / comment span / text span
+  against `Lexer::tokenize_with_docs` corpus-wide, plus a fixture for both demotions
+  (`////`, `/***`), the empty `/**/`, nested plain comments, a trailing doc, and the
+  string-literal case. `examples/std/doc_cli.jtr` is its dumper (the library/`_cli` split
+  again) and joins the cgen allowlist → **corpus is now 134**.
+- **54 — the generator** (`dc_*` in cgen.jtr, beside attest): block grouping (contiguous
+  `///` runs merge, a blank line splits, block comments stand alone), marker/margin
+  cleaning (Javadoc `*` honoured, else verbatim so indented examples survive), the
+  summary + `#`-section split with fences held verbatim, target collection for all eight
+  kinds, the attach rule (first target at-or-after the block's end; nearest wins,
+  displaced ones dangle), and the Markdown render. **The sharing is real, not nominal:
+  `at_guarantee_phrases` is now the ONE guarantee extractor** — attest wraps it as
+  `  guarantee:` lines, doc as `- ` bullets — so the attested behavioral ABI can never
+  drift from the rendered docs, which is exactly the property the reference is built
+  around. New for doc: `at_struct_sig`/`at_enum_sig` (the reference prints `struct` for
+  a `record`/`union` too, and lists fields only, never methods).
+- **Deliberately not ported** (recorded): `--html`; the fenced-`Example` extraction (the
+  reference collects it for future doctests but never renders it in Markdown — the fence
+  STATE is ported, since a `#` inside a fence must not open a section); the reference's
+  snippet decoration on the dangling-doc warning (message text + `file:line:col` are
+  ported, the `|`-gutter excerpt is not); non-ASCII whitespace trims differently.
+- **Trap, cost real time:** a struct member's tag-1 (method) tuple holds its fn `ItemId`
+  in slot **1**; slot 2 is a *field's* name-span start. Reading slot 2 indexes the item
+  arena with a source offset — an out-of-bounds read whose only symptom is a bare
+  `Assertion failed!` from the generated C.
+
+> **THIS DOCUMENT'S STORY IS COMPLETE.** Increments 1–54 delivered the whole self-hosting
 > arc: golden convergence, the fixed point, test mode, the driver, in-language modules,
-> per-file diagnostics, refusal gates, the full attest manifest + diff gate, and the
-> bootstrap seed. **The successor handoff is
-> `docs/session-notes/jestyr-next-frontier-handoff.md`** — the O-tooling remainder (`doc`
-> only; O1 is done), the optional `#line` port, and the Group-3 workstreams (G CTFE, L
-> memory-layout, Q SIMD), with the two-sided golden discipline and every recorded trap
-> carried forward. Start there.
+> per-file diagnostics, refusal gates, the full attest manifest + diff gate, the doc
+> generator, and the bootstrap seed. **Workstream O is complete in-language too.** The
+> successor handoff is `docs/session-notes/jestyr-next-frontier-handoff.md` — the optional
+> `#line` port and the Group-3 workstreams (G CTFE, L memory-layout, Q SIMD), with the
+> two-sided golden discipline and every recorded trap carried forward. Start there.
 
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
