@@ -28,16 +28,65 @@
 
 | Increment | Commit | What |
 |---|---|---|
+| **G4** `build.jestyr` | *(this run)* | `src/buildscript.rs` + `jestyrc plan <script> [--build]`. The build described in Jestyr and **evaluated, never run**. The plan is a *pure function of an index* (`const targets` + `fn source(i)`/`fn output(i)`) rather than the imperative `exe(…)`/`test(…)` shape, because that shape needs comptime **effects** — the one thing the ladder exists to forbid. `Interp::{eval_const, call_fn}` added. `examples/build.jestyr` is the canonical demo (a `.jestyr` extension, so no golden sweeps it). |
+| **G3** reflection | `4a85bc6` | `@type_name` / `@field_count` / `@field_name` / `@field_type` over the **declared shape**, answered by this compiler and folded to literals. |
+| **G2** comptime blocks | `b063ca4` | `comptime { … }` in user syntax, reusing the existing keyword. Typed as and emitted as the literal it folds to; **the body belongs to the interpreter alone**, so non-users are byte-identical with no gating flag. |
+| *(chore)* seed refresh | `458911a` | `bootstrap_seed_is_current` was **already failing on master** — the committed flat was missing the ten import-placeholder blank lines. `jestyr_seed.c` was byte-identical, so it was cosmetic; the gcc-only bootstrap was never broken, only its drift guard. |
 | **G1** CTFE interpreter | `ebf8397` | `src/comptime.rs` — a TOTAL comptime interpreter (step budget, call-depth cap, const-cycle detection, checked arithmetic). First consumer closed a silent miscompile: `[SIZE]i32` had been emitting a **zero-length** array with `assert(_ix < 0)` and no diagnostic. Zero emission change → no port mirror yet. |
 | **54** `doc` renderer | `1a5ad67` | `jc <file> doc` byte-identical to `doc::generate` over 134 files; `at_guarantee_phrases` became the ONE guarantee extractor shared with attest. |
 | **53** doc trivia | `1a5ad67` | `tokens.collect_docs` — finds comments by scanning the **gaps between tokens**, so the golden-pinned `tokenize` is untouched. `examples/std/doc_cli.jtr` added → corpus 134. |
 | **52** attest diff/verify | `094bd6e` | `jc <old> attest-diff <new>` / `jc <file> attest-verify <manifest>` reproduce `attest::diff(…).render()` byte-for-byte, exit code included. Surfaced the `#line` divergence (§1). |
 | **51** attest records | `e3c5fbe` | `jc <file> attest` emits the FULL manifest; ported `doc::{ty_str, fn_sig, extern_sig, const_sig, fn_guarantees}`. |
 
-**Two findings from that run worth carrying forward**, both recorded in place below:
+**Two findings from the O run worth carrying forward**, both recorded in place below:
 the `#line` emission gap (§1 — invisible to every golden, so it hid for 50 increments),
 and the fact that a map-free port of an ordered-container algorithm can still be exact
 when the reference re-sorts its output by content (§2, O1).
+
+### Findings from the G2–G4 run (read these before continuing CTFE)
+
+1. **`Value::List` — aggregate comptime values — is the single next unlock.** Three
+   separate things want it and nothing else: tier-3 field *iteration*, a tier-4 plan
+   expressed as a target list rather than an index function, and any tier-5 generated
+   data table. It is bounded by the existing fuel budget, so it costs no totality.
+   **Build this before starting tier 5.**
+2. **Field iteration is emission-blocked, not L-blocked.** The evaluator can already
+   walk a struct by recursion (`if i >= @field_count(T) …`), and that works *inside*
+   the interpreter. What stops it end-to-end is that a top-level `fn` is also emitted
+   as ordinary runtime code, where the index is a parameter and the query cannot fold.
+   The fix is **comptime-only functions** (a body instantiated at comptime, never
+   emitted) — not the layout pass. Worth knowing before anyone waits on L for it.
+3. **`size_of`/`align_of`/`offset_of` are C-deferred**, lowering to `sizeof`/
+   `_Alignof`/`offsetof`. This compiler never learns the numbers, so exposing them as
+   comptime *values* genuinely does require **L**. That is the real L dependency; the
+   declared shape (names, field types, order) needed none of it.
+4. **Bare-name intrinsics are a live hazard, and the compiler's own source proves it.**
+   G3's first draft put reflection beside `size_of` as ordinary identifiers — but
+   `examples/std/typeck.jtr:919` declares `fn field_type(…)`, which a bare-name
+   `field_type` intrinsic silently hijacks, breaking the self-hosted build. Reflection
+   moved to the **`@` namespace** (`@field_type`), which was already a callable form
+   (`@address(0x…)`) and cannot collide. `size_of` and friends carry the same latent
+   hazard; prefer `@` for anything new.
+5. **Do not add names to cgen's `is_intrinsic` list casually.** That list stops a *bare
+   value reference* being read as a closure capture — and the self-hosted compiler has
+   several locals named `field_count`. Adding reflection there would have broken real
+   code while buying nothing (reflection is only ever called). A comment now says so
+   in place.
+6. **`comptime` inherited the block-led statement rule for free**, which will look like
+   a bug to the next reader: `comptime { comptime { 3 } + 1 }` is a parse error for the
+   same reason `unsafe { unsafe { 3 } + 1 }` is — at statement position a block-led form
+   parses as the block alone so a trailing operator cannot extend it. Nest in *value*
+   position instead. Pinned in `comptime::tests`.
+7. **A computed string needs real C escaping.** A source literal is passed through
+   verbatim (Jestyr's escapes are C's), but a comptime-*computed* string has no source
+   text. Two C rules bite: hex escapes are maximal-munch (`"\x41" "1"` → `\x411`), so
+   non-printables use fixed-width three-digit octal; and `-std=c11` still honours
+   trigraphs, so a literal `?` must be escaped. `c_string_literal` in cgen.rs, round-
+   tripped through gcc. Note the NUL case can only be checked by *length* —
+   `printf("%.*s")` stops at a NUL whatever precision it is given.
+8. **Unit tests in the binary crate have no `CARGO_BIN_EXE_*`.** That is an
+   integration-test variable. To invoke `jestyrc` as a subprocess from `proptests.rs`,
+   walk up from `std::env::current_exe()` (`target/<profile>/deps/` → `../`).
 
 ---
 
@@ -225,12 +274,52 @@ most; L wants G's comptime for layout queries; Q builds on both).
    **Port note for later:** the moment a corpus `.jtr` uses a non-literal array length,
    the port's `typeck.jtr`/`cgen.jtr` must fold it too (the P3 typeck golden compares
    `[N]T` renderings) — keep such files out of `examples/` until that mirror lands.
-2. `comptime { … }` blocks + `comptime` consts (design §8) — new syntax, new golden
-   corpus files.
-3. Reflection as comptime calls over type values (`@type_of`, field iteration) — the
-   IR-builder ergonomics MOTLEY needs.
-4. **The executable `build.jestyr`** — closes K's last leftover; the driver gains a
-   `jc build.jestyr` mode that evaluates the build description comptime.
+2. ~~`comptime { … }` blocks~~ — **DONE (G2, `b063ca4`)**, reference side. Reuses the
+   existing `comptime` keyword (it could never start an expression, so no new reserved
+   word and no changed parse). Typed as and emitted as the literal it folds to. **No
+   `comptime const`** — top-level `const` is already comptime-evaluated, and a second
+   way to say it violates §8. The design point: *the body belongs to the interpreter
+   alone* — cgen/escape/attrs/dharht never descend into it, which is why non-users are
+   byte-identical with no gating flag and why "typechecks" cannot disagree with
+   "evaluates". **No corpus file yet, deliberately** (see the port-mirror trigger below).
+3. ~~Reflection~~ — **DONE (G3, `4a85bc6`)**, reference side, *declared shape only*:
+   `@type_name(T)`, `@field_count(T)`, `@field_name(T, i)`, `@field_type(T, i)`.
+   Answered by this compiler and folded to literals; field types render through
+   `doc::ty_str`, so reflection cannot drift from the docs. Arguments must be
+   compile-time constants — see findings 2–4 above for what that excludes and why.
+4. ~~**The executable `build.jestyr`**~~ — **DONE (G4)**, closes K's last leftover.
+   `jestyrc plan <script> [--build]`. The plan is a **pure function of an index**
+   (`const targets` + `fn source(i)`/`fn output(i)`), not the imperative
+   `exe(…)`/`test(…)` shape, because that needs comptime effects. Determinism is
+   structural: a non-deterministic build script cannot be *written*, since the
+   evaluator has no arm for a clock or an environment read. `examples/build.jestyr` is
+   the demo; a `.jestyr` extension means no golden sweeps it.
+5. **Tier 5 — bounded generation. NOT STARTED, and blocked on `Value::List`** (finding
+   1). Build aggregate comptime values first; then a generated *data table* emitted as
+   a C static array is the smallest real tier-5 increment. Explicitly not arbitrary
+   source-string injection.
+
+**The outstanding CTFE work, in the order it should be done:**
+
+| # | Work | Notes |
+|---|---|---|
+| 1 | `Value::List` — aggregate comptime values | unblocks three separate things at once (finding 1) |
+| 2 | Comptime-only functions | unblocks field *iteration* end-to-end (finding 2) |
+| 3 | **Port mirrors for G2/G3/G4** | the big one — see below |
+| 4 | Tier 5 bounded generation | after 1 |
+| 5 | `@size_of`/`@align_of`/`@offset_of` as comptime values | after **L** (finding 3) |
+
+**On the port mirrors (item 3).** Nothing is broken today: G2–G4 changed no emitted C
+for any existing program, so all 134 corpus goldens, the concat, test mode, the
+fixpoint, the self-build and the seed are green *without* a mirror. The trigger is
+unchanged and still the thing to respect — **the first `comptime`/reflection corpus
+`.jtr` file drags in `parser.jtr` + `typeck.jtr` + `cgen.jtr` mirrors and a seed
+refresh**, because the P2/P3 goldens sweep every `examples/**.jtr` with no allowlist.
+The mirror is genuinely large: it means writing a total comptime interpreter in the
+`.jtr` subset (G1's ~700 lines of Rust, plus the tier-2/3 surface) and threading a new
+expression kind through the port's integer-tagged AST. Land it as its own increment
+chain, and only when a corpus file needs it. `.jestyr` build scripts are exempt — the
+goldens key on the `jtr` extension.
 **Port impact:** each comptime construct that changes emitted C needs its cgen.jtr
 mirror + golden growth; constructs that only FOLD at check time still need typeck.jtr
 parity (the P3 golden compares every expression's resolved type).
@@ -266,26 +355,36 @@ memory + `PARALLELISM-HANDOFF.md`).
 ## 4. Sequencing (the one-line plan)
 
 **Done:** ~~O1 records~~ (51–52) → ~~O2 doc~~ (53–54) → **workstream O complete** →
-~~G1 the comptime interpreter~~ (`ebf8397`).
-**Next:** **G2** `comptime` blocks + consts → G3 reflection → G4 the executable
-`build.jestyr` (which closes K's last leftover) → L layout 1–3 (opt-in, byte-identity
-preserved) → Q SIMD.
+~~G1 the comptime interpreter~~ (`ebf8397`) → ~~G2 `comptime` blocks~~ (`b063ca4`) →
+~~G3 reflection~~ (`4a85bc6`) → ~~G4 `build.jestyr`~~ — **CTFE tiers 0–4 are done on the
+reference side**, and the tier ladder is documented in `docs/ctfe-tiers.md`.
+
+**Next:** `Value::List` (aggregate comptime values — unblocks three things at once) →
+comptime-only functions → the **G2–G4 port mirrors** → tier 5 bounded generation →
+L layout 1–3 (opt-in, byte-identity preserved) → Q SIMD. `@size_of` as a comptime
+*value* comes after L.
 
 `#line` (§1) is an independent, optional increment — take it whenever the port's `build`
 C needs to match the reference's, not before. Keep every increment two-sided-green:
 corpus 134 + concat + test-mode + fixpoint + self-build + refreshed seed.
 
-**The port-mirror trigger to watch from here on:** G1 needed no mirror because it changed
-no emitted C. G2 onward introduces *syntax*, so the first `comptime` corpus file drags in
-`parser.jtr` + `typeck.jtr` + `cgen.jtr` mirrors and a seed refresh. Land the reference
-side and its Rust-only tests first, then the mirror, then add the corpus file — adding it
-early breaks the P2/P3 goldens, which sweep every `examples/**.jtr` with no allowlist.
+**The port-mirror trigger, restated because it is the thing that will bite:** G2–G4 need
+no mirror *yet* only because they added no corpus file and changed no emitted C for any
+existing program. The moment a `comptime`/reflection `.jtr` lands in `examples/`, the
+P2/P3 goldens sweep it with no allowlist and the port must parse, check and emit it —
+which means a comptime interpreter written in the `.jtr` subset. Land the reference side
+and its Rust-only tests first, then the mirror, then the corpus file, in that order.
+(`.jestyr` build scripts are exempt: the goldens key on the `jtr` extension.)
 
 ## One-line
-Self-hosting is finished and productized, **workstream O is complete in-language** (full
-attestation manifest, breaking-change diff/verify, and documentation page, each
-byte-for-byte identical to the reference), and **CTFE has begun** — a total comptime
-interpreter that already closed a silent zero-length-array miscompile; what's left is
-G2–G4 (comptime syntax, reflection, `build.jestyr`), opt-in memory layout, SIMD, and the
-optional `#line` port — each landed increment-by-increment under the two-sided golden
-discipline with the bootstrap seed refreshed at every `examples/std` change.
+Self-hosting is finished and productized, **workstream O is complete in-language**, and
+**CTFE tiers 0–4 are now done on the reference side** — a total comptime interpreter
+that closed a silent zero-length-array miscompile, `comptime { … }` in user syntax,
+reflection over the declared shape in the collision-proof `@` namespace, and a
+`build.jestyr` that is *evaluated, never run* (its plan a pure function of an index, so
+determinism is a property rather than a convention). The ladder is documented in
+`docs/ctfe-tiers.md`. What's left is aggregate comptime values (which unblocks three
+things at once), comptime-only functions, the **G2–G4 port mirrors**, tier-5 bounded
+generation, opt-in memory layout, SIMD, and the optional `#line` port — each landed
+increment-by-increment under the two-sided golden discipline with the bootstrap seed
+refreshed at every `examples/std` change.

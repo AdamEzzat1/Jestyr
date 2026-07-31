@@ -8187,6 +8187,102 @@ fn main() -> i32 {
         );
     }
 
+    /// **CTFE (workstream G, increment 4) — `build.jestyr` end-to-end.** A build
+    /// description written in Jestyr, *evaluated* by the comptime interpreter into a
+    /// plan, and then actually built: `jestyrc plan <script> --build` produces the
+    /// named executables and they run.
+    ///
+    /// The plan is deliberately a pure function of an index rather than the imperative
+    /// `exe(…)`/`test(…)` shape build systems usually take, because that shape needs
+    /// compile-time *effects* — which is exactly what the tier ladder forbids. This
+    /// checks both halves of the payoff: the plan is reproducible, and it builds.
+    #[test]
+    fn build_script_plans_and_builds_a_fixture_project() {
+        let dir = std::env::temp_dir().join("jestyr_ctfe_build_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("greet.jtr"),
+            "fn main() -> i32 { print_str(\"greetings\")\n return 0 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("count.jtr"),
+            "fn main() -> i32 { print_int(7)\n return 0 }\n",
+        )
+        .unwrap();
+        // The build description. Note `source`/`output` are *computed*, not literal
+        // tables — the whole point of describing a build in Jestyr.
+        std::fs::write(
+            dir.join("build.jestyr"),
+            "// The build, described in Jestyr and evaluated at compile time.\n\
+             const targets: i64 = 2\n\
+             fn stem(i: i64) -> str {\n\
+             \x20   if i == 0 { return \"greet\" }\n\
+             \x20   return \"count\"\n\
+             }\n\
+             fn source(i: i64) -> str { return stem(i) + \".jtr\" }\n\
+             fn output(i: i64) -> str { return \"built_\" + stem(i) }\n",
+        )
+        .unwrap();
+
+        // These tests live in the binary crate, so cargo does not set
+        // `CARGO_BIN_EXE_*` (that is an integration-test variable). The test
+        // executable sits in `target/<profile>/deps/`, so the compiler it was built
+        // alongside is two directories up.
+        let jestyrc = {
+            let t = std::env::current_exe().unwrap();
+            let profile_dir = t.parent().unwrap().parent().unwrap();
+            let p = profile_dir.join(format!("jestyrc{}", std::env::consts::EXE_SUFFIX));
+            assert!(p.exists(), "jestyrc binary not found at {}", p.display());
+            p
+        };
+
+        // 1. The plan is what the script describes, and it is stable across runs.
+        let plan_of = || {
+            let out = Command::new(&jestyrc)
+                .args(["plan", "build.jestyr"])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "plan failed: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().replace("\r\n", "\n")
+        };
+        let plan = plan_of();
+        assert_eq!(
+            plan,
+            "build-plan v1\ntargets 2\ntarget greet.jtr -> built_greet\ntarget count.jtr -> built_count\n"
+        );
+        for _ in 0..3 {
+            assert_eq!(plan_of(), plan, "the same script must always plan the same build");
+        }
+
+        // 2. `--build` produces the named executables, and they run.
+        let out = Command::new(&jestyrc)
+            .args(["plan", "build.jestyr", "--build"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "build failed: {}", String::from_utf8_lossy(&out.stderr));
+        for (name, want) in [("built_greet", "greetings\n"), ("built_count", "7\n")] {
+            let exe = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            assert!(exe.exists(), "{name} was not produced");
+            let r = Command::new(&exe).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&r.stdout).replace("\r\n", "\n"), want);
+        }
+
+        // 3. A malformed script is refused, and says so in the script's own vocabulary.
+        std::fs::write(dir.join("bad.jestyr"), "const targets: str = \"two\"\n").unwrap();
+        let out = Command::new(&jestyrc)
+            .args(["plan", "bad.jestyr"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "a malformed script must fail");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("targets"), "diagnostic should name `targets`: {err}");
+    }
+
     /// **Doc-comment trivia in-language.** `tokens.collect_docs` recovers exactly the
     /// reference lexer's `tokenize_with_docs` third result — kind, block-ness, the whole
     /// comment span, and the text span — over the whole corpus. It finds comments by

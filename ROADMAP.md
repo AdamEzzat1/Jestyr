@@ -90,7 +90,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | D | Attributes | ~50% | MED | S | ✓ | ✓ (provenance hooks) |
 | E | Real strings / text | ~25% | HIGH | L | ✓✓ | ✓✓ (self-host) |
 | F | Traits / `dyn` | 0% | HIGH | L | ✓✓ | ✓✓ (pass interfaces) |
-| G | CTFE + reflection | ~35% | HIGH | L | ✓ | ✓✓ (IR builder) |
+| G | CTFE + reflection | ~60% | HIGH | L | ✓ | ✓✓ (IR builder) |
 | H | Function-pointer types | 0% | HIGH | M | ✓ | ✓ (vtables) |
 | I | Error-handling polish | ~70% | MED | S | ✓ | — |
 | J | Numeric / operator completeness | ~70% | MED | S–M | ✓ | ✓ (determinism) |
@@ -174,21 +174,27 @@ generics, `dyn` trait objects (vtables — pairs with H). **Motley:** pass/analy
 interfaces are traits; the real dynamic `Allocator` vtable needs this. The biggest
 single language gap.
 
-### G. CTFE + reflection — ~35% (HIGH conflict; files: `comptime.rs` + parser/typeck/cgen)
+### G. CTFE + reflection — ~60% (HIGH conflict; files: `comptime.rs` + parser/typeck/cgen)
 **Design §8; the tier ladder is `docs/ctfe-tiers.md`.** **Done:** the generics slice
 (type-parameter substitution); **tier 1** — the comptime interpreter over the AST
 (`src/comptime.rs`, total: fuel + depth cap + const-cycle detection), which closed a
-silent zero-length-array miscompile; **tier 2** — `comptime { … }` blocks *in the Rust
-reference* (reusing the existing `comptime` keyword; typed as and emitted as the
-literal they fold to; the body is the interpreter's alone, so non-users stay
-byte-identical). **Left:** the tier-2 **port mirror** (`examples/std/{parser,typeck,
-cgen}.jtr` + a seed refresh) — only required once a corpus file uses the syntax;
-**tier 3** reflection; **tier 4** `build.jestyr`; **tier 5** bounded codegen.
+silent zero-length-array miscompile; **tier 2** — `comptime { … }` blocks (reusing the
+existing `comptime` keyword; typed as and emitted as the literal they fold to; the body
+is the interpreter's alone, so non-users stay byte-identical); **tier 3** — reflection
+over the **declared shape** (`@type_name`/`@field_count`/`@field_name`/`@field_type`,
+in the collision-proof `@` namespace); **tier 4** — **`build.jestyr`** (`jestyrc plan
+<script> [--build]`, `src/buildscript.rs`), which also closes K's last leftover. All
+four are **Rust-reference side**.
+**Left:** aggregate comptime values (`Value::List` — the single next unlock, wanted by
+three separate things); **comptime-only functions** (what actually blocks field
+*iteration* end-to-end — not L); the **tier 2–4 port mirrors** (`examples/std/{parser,
+typeck,cgen}.jtr` + a seed refresh), required only once a corpus `.jtr` uses the
+syntax; **tier 5** bounded codegen (after `Value::List`).
 **Recorded dependency:** `size_of`/`align_of`/`offset_of` exist today only as
 *C-deferred* intrinsics (`sizeof`/`_Alignof`/`offsetof`), so exposing them as comptime
-*values* is blocked on **L**; tier 3 can still reflect the declared shape (names,
-field types, declaration order) from the AST. **Motley:** the IR-builder ergonomics
-and compile-time pass configuration lean on this.
+*values* is genuinely blocked on **L**. That is the *only* real L dependency here —
+the declared shape needed none of it. **Motley:** the IR-builder ergonomics and
+compile-time pass configuration lean on this.
 
 ### H. Function-pointer types — 0% (HIGH conflict; files: ast, parser, types, typeck, cgen)
 **Left:** a `fn(T1, T2) -> R` *type*, fn values, indirect calls. **High leverage,
@@ -258,9 +264,12 @@ collisions** (increment 7) — two modules may each define the same `enum Box(T)
 to distinct `Jestyr_Box__m<a>__i32` / `__m<b>__i32` (a shared canon-aware finder
 resolves a collided generic enum by its canon key; a misclassified bare instance is
 filtered out of struct-instance collection). No-op + byte-identical for the
-non-colliding generics (`core`'s `Option`/`Result`). **Left:** the *executable*
-`build.jestyr` half (deferred: needs CTFE; lockfile/vendored-deps/effects —
-ecosystem-premature). **Also deferred:** *generic-struct* collisions (the
+non-colliding generics (`core`'s `Option`/`Result`). **The *executable* `build.jestyr`
+half is now DONE** (G tier 4 — `jestyrc plan <script> [--build]`, `src/buildscript.rs`):
+it was waiting on CTFE, which now exists. The plan is a *pure function of an index*
+rather than an imperative `exe(…)` DSL, because that would need comptime effects; the
+lockfile/vendored-deps side stays deferred as ecosystem-premature.
+**Also deferred:** *generic-struct* collisions (the
 comptime-fn-form ctor lives in the function namespace; its instance mangling would
 need the `dup_fns` canon — same pattern, no blocker).
 **Motley:** the DAG already enables the parallel/incremental-compilation story;

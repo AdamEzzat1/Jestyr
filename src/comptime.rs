@@ -175,6 +175,48 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Look up a top-level `const` by name and evaluate it.
+    pub fn eval_const(&mut self, name: &str) -> EvalResult {
+        match self.consts.get(name).copied() {
+            Some(init) => self.eval(init),
+            None => Err(EvalError::new(format!("no `const {name}` in this file"), Span::new(0, 0))),
+        }
+    }
+
+    /// Call a top-level pure function with already-computed arguments (roadmap G
+    /// tier 4). The build driver needs this: it must evaluate `source(0)`,
+    /// `source(1)`, … where the indices come from the *driver*, not from the source
+    /// text, and synthesising call expressions into the AST to do that would be a
+    /// worse answer than a small entry point.
+    ///
+    /// Identical in every other respect to a call the interpreter makes itself: a
+    /// fresh budget, the same depth cap, and a frame that sees only its parameters.
+    pub fn call_fn(&mut self, name: &str, args: &[Value]) -> EvalResult {
+        let zero = Span::new(0, 0);
+        let Some(f) = self.fns.get(name).copied() else {
+            return Err(EvalError::new(format!("no `fn {name}` in this file"), zero));
+        };
+        if f.params.iter().any(|p| p.is_self || p.comptime) {
+            return Err(EvalError::new(format!("`{name}` cannot be called at compile time"), f.name.span));
+        }
+        if f.params.len() != args.len() {
+            return Err(EvalError::new(
+                format!("`{name}` takes {} argument(s) but {} were given", f.params.len(), args.len()),
+                f.name.span,
+            ));
+        }
+        self.fuel = FUEL;
+        self.depth = 0;
+        self.in_progress.clear();
+        self.returning = None;
+        let bound: Vec<(String, Value)> =
+            f.params.iter().zip(args).map(|(p, v)| (p.name.name.clone(), v.clone())).collect();
+        let mut env: Env = vec![bound];
+        let out = self.eval_block(&f.body, &mut env);
+        let returned = self.returning.take();
+        Ok(returned.unwrap_or(out?))
+    }
+
     fn spend(&mut self, span: Span) -> Result<(), EvalError> {
         match self.fuel.checked_sub(1) {
             Some(f) => {

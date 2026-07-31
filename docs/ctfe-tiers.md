@@ -16,7 +16,7 @@ or mutate the compiler's own state destroys all three at once.
 | 1 | Pure comptime expressions where the *compiler* needs a number — array lengths, repeat counts | **done** — G1, `ebf8397` |
 | 2 | `comptime { … }` blocks in user syntax | **done in the Rust reference** — G2; port mirror outstanding |
 | 3 | Type reflection over the declared shape | **done in the Rust reference** — G3 (sizes/offsets wait on **L**) |
-| 4 | `build.jestyr` — the build described in Jestyr | not started |
+| 4 | `build.jestyr` — the build described in Jestyr | **done in the Rust reference** — G4 (`jestyrc plan`) |
 | 5 | Bounded, attestable code/artifact generation | not started |
 
 ---
@@ -156,12 +156,69 @@ and never emitted — which is the natural next slice. (A comptime `for` and agg
 comptime values would be the alternative route; both stay bounded by the existing fuel
 budget, so neither threatens totality.)
 
-## Tier 4 — `build.jestyr` *(not started)*
+## Tier 4 — `build.jestyr`
 
-The build described in Jestyr itself, evaluated by the same interpreter. Must stay
-deterministic: no wall-clock, no unmodelled environment reads, and the resulting plan
-must be reproducible and attestable. Wants tier 3's aggregate values first, so a plan
-can be a *list* of targets rather than a single string.
+The build described in Jestyr itself (design §11), **evaluated, never run**:
+
+```jestyr
+// build.jestyr
+const targets: i64 = 2
+
+fn stem(i: i64) -> str {
+    if i == 0 { return "greet" }
+    return "count"
+}
+
+fn source(i: i64) -> str { return stem(i) + ".jtr" }
+fn output(i: i64) -> str { return "built_" + stem(i) }
+```
+
+```bash
+jestyrc plan build.jestyr
+```
+
+prints a deterministic, diffable plan:
+
+```text
+build-plan v1
+targets 2
+target greet.jtr -> built_greet
+target count.jtr -> built_count
+```
+
+and `jestyrc plan build.jestyr --build` compiles each target to the executable it
+names. An explicit subcommand rather than magic on the filename: nothing changes
+meaning because a file happens to be called `build.jestyr`.
+
+### Why a pure description, not a build DSL
+
+The shape every build system reaches for is imperative:
+
+```text
+pub fn build() { exe("app", "src/main.jtr"); test("tests/main.jtr") }
+```
+
+That needs compile-time **effects** — `exe(…)` has to record something — and an
+effectful comptime evaluator is exactly what this ladder exists to prevent. Allowing
+it would mean a build script could read the clock or the environment, and
+reproducibility would become a convention rather than a property.
+
+So the plan is a **pure function of an index** instead: the script says how many
+targets there are and answers two questions about each. This costs the evaluator no
+new powers — no effects, no aggregate values, no comptime `for` — and keeps every
+guarantee the ladder makes. Note that `source`/`output` are *computed*, not a literal
+table; deriving them with the full comptime language is the whole point of describing
+a build in Jestyr rather than in a data format.
+
+Determinism is structural, not policed: a script that tries to be non-deterministic
+cannot be *written*, because the interpreter has no arm for a clock or an environment
+read. Totality reaches here too — a non-terminating script is a diagnostic, not a hung
+build — and a target count is bounded, so a typo'd `const targets: i64 = 100000000`
+is an error rather than an apparent hang.
+
+**Next slice:** once the evaluator grows aggregate comptime values, a target list
+becomes expressible directly (`const targets = [Target{…}, …]`). The driver contract
+does not need to change for that.
 
 ## Tier 5 — bounded generation *(not started)*
 

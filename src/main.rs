@@ -30,6 +30,7 @@
 mod ast;
 mod attest;
 mod attrs;
+mod buildscript;
 mod cgen;
 mod comptime;
 mod diag;
@@ -377,6 +378,18 @@ fn run() -> ExitCode {
             let filter = nonflags.next().cloned();
             (Mode::Test { list, filter }, path.clone())
         }
+        Some("plan") => {
+            // `plan <build.jestyr> [--build]` — evaluate a build description and print
+            // its plan; `--build` additionally compiles each target it names.
+            let build = args[2..].iter().any(|a| a == "--build");
+            match args[2..].iter().find(|a| !a.starts_with("--")) {
+                Some(p) => return run_plan(p, build),
+                None => {
+                    eprintln!("error: `plan` needs a build-script file argument");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         Some("attest") => {
             // `attest --diff <old> <new>` compares two manifest files; plain
             // `attest <file>` emits one. The file args are the non-flag arguments.
@@ -567,6 +580,116 @@ fn run() -> ExitCode {
 /// entry point; a library file (no `main`) is a `check`-only artifact.
 fn program_has_main(ast: &ast::Ast) -> bool {
     ast.items.iter().any(|it| matches!(it, ast::Item::Fn(f) if f.name.name == "main"))
+}
+
+/// `jestyrc plan <build.jestyr> [--build]`: evaluate a build script and print the
+/// build plan it describes; with `--build`, compile each target it names.
+///
+/// The build description is a Jestyr file that is **evaluated, never run** — see
+/// `src/buildscript.rs` for why the plan is a pure function of an index rather than
+/// the imperative `exe(…)`/`test(…)` shape build systems usually reach for.
+///
+/// An explicit subcommand rather than magic on the filename: `jestyrc plan foo.jestyr`
+/// says what it does, and nothing changes meaning because a file happens to be called
+/// `build.jestyr`.
+fn run_plan(path: &str, build: bool) -> ExitCode {
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read `{path}`: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (tokens, ld) = Lexer::new(&src).tokenize();
+    let (ast, pd) = Parser::new(&src, tokens).parse();
+    let mut failed = false;
+    for d in ld.iter().chain(pd.iter()).filter(|d| d.is_error()) {
+        let lc = line_col(&src, d.span.start);
+        eprintln!("{path}:{}:{}: error: {}", lc.line, lc.col, d.message);
+        failed = true;
+    }
+    if failed {
+        return ExitCode::FAILURE;
+    }
+
+    let plan = match buildscript::evaluate(&ast) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: `{path}` is not a valid build script: {e}");
+            eprintln!("note: a build script declares `const targets: i64` plus");
+            eprintln!("      `fn source(i: i64) -> str` and `fn output(i: i64) -> str`");
+            return ExitCode::FAILURE;
+        }
+    };
+    print!("{}", plan.render());
+    if !build {
+        return ExitCode::SUCCESS;
+    }
+    for t in &plan.targets {
+        eprintln!("building {} -> {}", t.source, t.output);
+        if build_one(&t.source, &t.output) != ExitCode::SUCCESS {
+            eprintln!("error: build failed for `{}`", t.source);
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Compile one target of a build plan to a named executable.
+///
+/// Deliberately a small, self-contained path rather than a refactor of the `build`
+/// subcommand: the two differ in exactly one way — a plan target names its output,
+/// where `jestyrc build` derives it from the source stem — and the whole
+/// self-hosting golden family runs through that existing path.
+fn build_one(source: &str, output: &str) -> ExitCode {
+    let prog = module::load(source);
+    if !prog.diags.is_empty() {
+        return report_program(&prog.modules, &prog.diags);
+    }
+    let (info, type_diags) = typeck::check_program(&prog.ast, &prog.modules);
+    let mut diags = type_diags;
+    diags.extend(escape::check(&prog.ast, &info));
+    if diags.iter().any(|d| d.is_error()) {
+        return report_program(&prog.modules, &diags);
+    }
+    if !program_has_main(&prog.ast) {
+        eprintln!("error: `{source}` has no `main` function — a build target needs an entry point");
+        return ExitCode::FAILURE;
+    }
+    let (c_src, cgen_diags) = cgen::emit(&prog.ast, &info);
+    if !cgen_diags.is_empty() {
+        return report_program(&prog.modules, &cgen_diags);
+    }
+
+    let mut c_file = std::env::temp_dir();
+    c_file.push(format!("jestyr_plan_{output}.c"));
+    if let Err(e) = std::fs::write(&c_file, &c_src) {
+        eprintln!("error: cannot write `{}`: {e}", c_file.display());
+        return ExitCode::FAILURE;
+    }
+    let Some(cc) = find_c_compiler() else {
+        eprintln!("note: no C compiler (cc/gcc/clang) found on PATH; wrote C to {}", c_file.display());
+        return ExitCode::FAILURE;
+    };
+    // The plan names the output, so it lands where the build was invoked — the one
+    // thing a build system is expected to do that `jestyrc build` does not.
+    let exe = format!("{output}{}", std::env::consts::EXE_SUFFIX);
+    let mut cmd = Command::new(&cc);
+    cmd.args(cc_base_flags());
+    if c_src.contains("pthread") {
+        cmd.arg("-pthread");
+    }
+    match cmd.arg("-o").arg(&exe).arg(&c_file).status() {
+        Ok(s) if s.success() => ExitCode::SUCCESS,
+        Ok(s) => {
+            eprintln!("error: {cc} failed to compile `{source}` (exit {:?})", s.code());
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("error: cannot run {cc}: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `jestyrc attest --diff <old> <new>`: read two manifest files, classify every
@@ -786,6 +909,9 @@ fn print_usage() {
     eprintln!("    jestyrc attest --diff <old> <new>");
     eprintln!("                               classify contract changes between two manifests");
     eprintln!("                               as breaking/compatible (exit 1 if any breaking)");
+    eprintln!("    jestyrc plan   <build.jestyr>");
+    eprintln!("                               evaluate a build script and print its build plan");
+    eprintln!("                               (add --build to compile each target it names)");
 }
 
 fn dump_tokens(src: &str, path: &str, tokens: &[token::Token]) {

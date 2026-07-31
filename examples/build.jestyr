@@ -1,0 +1,37 @@
+// examples/build.jestyr — the build, described in Jestyr itself (CTFE tier 4).
+//
+// Run from the repository root:
+//     jestyrc plan examples/build.jestyr            # print the plan
+//     jestyrc plan examples/build.jestyr --build    # and compile each target
+//
+// This file is *evaluated, never run*. The comptime interpreter reads it and
+// produces a build plan; nothing here is compiled, and nothing here can perform an
+// effect — no clock, no environment, no file access. Reproducibility is therefore a
+// property of the design rather than a convention: a non-deterministic build script
+// cannot be written, because the evaluator has no arm for one.
+//
+// The plan is a pure function of an index rather than the imperative
+// `exe(...)`/`test(...)` shape build systems usually take, because that shape needs
+// compile-time *effects*. See docs/ctfe-tiers.md for the reasoning.
+//
+// Paths are relative to the directory the build is invoked from.
+
+const targets: i64 = 2
+
+/// The short name of target `i` — the one place a target is named.
+fn stem(i: i64) -> str {
+    if i == 0 { return "hello" }
+    return "shapes"
+}
+
+/// Where target `i`'s source lives. Note this is *computed*, not a literal table:
+/// deriving paths with the full comptime language is the point of describing a
+/// build in Jestyr rather than in a data format.
+fn source(i: i64) -> str {
+    return "examples/" + stem(i) + ".jtr"
+}
+
+/// The executable target `i` produces.
+fn output(i: i64) -> str {
+    return "jestyr_demo_" + stem(i)
+}
