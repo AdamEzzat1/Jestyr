@@ -64,13 +64,31 @@
   `-Wl,--stack` in driver gcc invocations; exe suffix fixed `.exe`; cmd.exe wants
   backslash paths for `run`; some item-level parse malformations recover Error-node-free
   and degrade to gcc; refusal messages are generic (location exact).
+- **`#line` — the one KNOWN C-emission divergence** (surfaced by increment 52's
+  `attest-verify`, recorded here because nothing else exposes it): the reference's
+  module path (`module::load` → `TypeInfo::debug` → `mark_line`) emits `#line <n>
+  "<file>"` directives, and **the port emits none**. No existing golden sees it — all
+  133 corpus goldens, the concat, and the fixpoint use debug-free single-file/merged
+  ASTs — but it means `jestyrc attest <f>` and `jc <f> attest` disagree on `c-sha256`
+  (the reference hashes the `#line`-bearing C; `examples/api_v1.jtr`-shaped files show
+  27 such lines), and port-built binaries carry no source-line mapping. `jc attest` /
+  `attest-verify` are self-consistent, so the drift gate works — it's only cross-tool
+  hash comparison that can't match. **Its own increment when wanted:** the port already
+  has the input it needs (the `Ml.map` checkpoint pairs give per-file line/col), but
+  there is NO golden for the module path's C today — build that first (`jestyrc emit-c`
+  vs `jc <file> build`'s `.c` over a multi-module fixture), then port `mark_line`'s
+  placement + dedup, then refresh the seed (the seed's C would gain the directives).
 
 ## 2. O-tooling remainder (SMALL — do these first, they finish the tool story)
 
-### O1. Attest manifest RECORDS + `verify`
-`jc <file> attest` emits the header (version/source/c-sha256/cc-flags) byte-equal to
-`attest::manifest` lines 0..4 (golden: `jestyr_driver_attest_header_matches_reference`).
-The remaining half is the per-item records:
+### O1. Attest manifest RECORDS + `verify` — **DONE (increments 51–52)**
+`jc <file> attest` now emits the FULL manifest — header plus per-item records — byte-equal
+to `attest::manifest` (golden `jestyr_driver_attest_manifest_matches_reference`, 10 corpus
+files), via the ported `doc::{fn_sig, fn_guarantees, const_sig, extern_sig, ty_str}` family
+(`at_*` in cgen.jtr). And `jc <old> attest-diff <new>` / `jc <file> attest-verify
+<manifest>` reproduce `attest::diff(…).render()` byte-for-byte, exit code included
+(golden `jestyr_driver_attest_diff_matches_reference`, every verdict branch). What follows
+is the original plan, kept for its reference pointers:
 
 ```
 <kind> <name>
@@ -92,6 +110,15 @@ The remaining half is the per-item records:
 - **Golden**: full-manifest byte-compare vs `attest::manifest` over a handful of corpus
   files (contracts.jtr — requires/ensures; records.jtr — methods; errors.jtr — error
   sets), grown file-by-file like every other golden.
+- **As built (notes for the next reader):** `collect_records` covers fn/const/enum/
+  struct-record-union/extern only — trait/impl/distinct/import are NOT records (the C
+  hash attests them), and struct METHODS never get their own record. Sorting is a
+  selection sort by (kind, name) emitting each record as its slot settles. The differ
+  keeps the manifest text owned by the caller and models `ParsedItem` as spans
+  (`struct Am`); the `BTreeSet`/`BTreeMap` fields are re-derived from the guarantee
+  lines on demand rather than stored, and set ORDER never matters because the change
+  list gets the reference's total `(item, verdict, detail)` re-sort at the end — that
+  one observation is what makes a map-free port exact.
 
 ### O2. `doc` in-language
 `jestyrc doc <file>` renders doc comments + the Guarantees block (`src/doc.rs`,
@@ -161,14 +188,17 @@ memory + `PARALLELISM-HANDOFF.md`).
 
 ## 4. Sequencing (the one-line plan)
 
-**O1 records → O2 doc (small, finish the tool) → G CTFE increments 1–4 (biggest
-unlock; closes K via build.jestyr) → L layout 1–3 (opt-in, byte-identity preserved) →
-Q SIMD.** Keep every increment two-sided-green: corpus 133 + concat + test-mode +
-fixpoint + self-build + refreshed seed.
+**~~O1 records~~ (DONE, 51–52) → O2 doc (small, finishes the tool) → G CTFE increments
+1–4 (biggest unlock; closes K via build.jestyr) → L layout 1–3 (opt-in, byte-identity
+preserved) → Q SIMD.** `#line` (§1) is an independent, optional increment — take it
+whenever the port's `build` C needs to match the reference's, not before. Keep every
+increment two-sided-green: corpus 133 + concat + test-mode + fixpoint + self-build +
+refreshed seed.
 
 ## One-line
-Self-hosting is finished and productized; what's left is two small O-tooling ports
-(attest records via a Jestyr sig-renderer; doc via a trivia-collecting lex pass) and
-then the three reference-side workstreams — CTFE, opt-in memory layout, SIMD — each
-landed increment-by-increment under the two-sided golden discipline with the bootstrap
-seed refreshed at every `examples/std` change.
+Self-hosting is finished and productized, and O1 is done — the ported compiler now emits
+the FULL attestation manifest and the breaking-change diff byte-for-byte; what's left is
+`doc` (needs a trivia-collecting lex pass), the optional `#line` port, and then the three
+reference-side workstreams — CTFE, opt-in memory layout, SIMD — each landed
+increment-by-increment under the two-sided golden discipline with the bootstrap seed
+refreshed at every `examples/std` change.

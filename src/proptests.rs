@@ -7785,6 +7785,177 @@ mod c_oracle {
         }
     }
 
+    /// The two sides of the attest-diff fixture: one API surface, evolved so that every
+    /// classifier branch fires — removal (pub and internal), addition, a signature change,
+    /// `@no_panic` lost and gained, an error added, `requires` dropped, `ensures` dropped, a
+    /// refinement removed / newly added / widened / narrowed, and a visibility demotion.
+    const ATTEST_API_V1: &str = "\
+pub fn stays(a: i32) -> i32 { return a }
+pub fn goes_private(a: i32) -> i32 { return a }
+pub fn removed_pub(a: i32) -> i32 { return a }
+fn removed_priv(a: i32) -> i32 { return a }
+pub fn sig_change(a: i32) -> i32 { return a }
+@no_panic pub fn loses_np(a: i32) -> i32 { return a }
+pub fn gains_np(a: i32) -> i32 { return a }
+pub fn errs(a: i32, b: i32) -> i32 !{ Zero } {
+    if b == 0 { return err(Zero) }
+    return ok(a / b)
+}
+pub fn reqs(b: i32) -> i32
+    requires b != 0
+{
+    return b
+}
+pub fn enss(x: i32) -> i32
+    ensures result >= 0
+{
+    if x < 0 { return 0 - x }
+    return x
+}
+pub fn drops_refine(i: usize in 0..8) -> i32 { return i as i32 }
+pub fn gains_refine(i: usize) -> i32 { return i as i32 }
+pub fn widen(i: usize in 0..10) -> i32 { return i as i32 }
+pub fn narrow(i: usize in 0..100) -> i32 { return i as i32 }
+pub const LIMIT: i32 = 10
+pub struct Pair { pub x: i32, pub y: i32 }
+fn main() -> i32 {
+    print_int(stays(1) as i64)
+    return 0
+}
+";
+
+    const ATTEST_API_V2: &str = "\
+pub fn stays(a: i32) -> i32 { return a }
+fn goes_private(a: i32) -> i32 { return a }
+pub fn added_new(a: i32) -> i32 { return a }
+pub fn sig_change(a: i64) -> i64 { return a }
+pub fn loses_np(a: i32) -> i32 { return a }
+@no_panic pub fn gains_np(a: i32) -> i32 { return a }
+pub fn errs(a: i32, b: i32) -> i32 !{ Zero, Negative } {
+    if b == 0 { return err(Zero) }
+    if b < 0 { return err(Negative) }
+    return ok(a / b)
+}
+pub fn reqs(b: i32) -> i32 { return b }
+pub fn enss(x: i32) -> i32 {
+    if x < 0 { return 0 - x }
+    return x
+}
+pub fn drops_refine(i: usize) -> i32 { return i as i32 }
+pub fn gains_refine(i: usize in 0..4) -> i32 { return i as i32 }
+pub fn widen(i: usize in 0..20) -> i32 { return i as i32 }
+pub fn narrow(i: usize in 0..50) -> i32 { return i as i32 }
+pub const LIMIT: i32 = 20
+pub struct Pair { pub x: i32, pub y: i32 }
+fn main() -> i32 {
+    print_int(stays(1) as i64)
+    return 0
+}
+";
+
+    /// Render a manifest through the reference, single-file path (no `#line` debug info — the
+    /// same shape the port's loader produces for an importless file).
+    #[cfg(feature = "c-oracle")]
+    fn attest_manifest_of(source_id: &str, src: &str) -> String {
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (ast, _) = crate::parser::Parser::new(src, tokens).parse();
+        let (info, _) = crate::typeck::check(&ast);
+        crate::attest::manifest(source_id, src, &ast, &info)
+    }
+
+    /// **In-language `attest --diff`.** The ported differ — manifest parse-back, `sig_core`
+    /// subtraction, the four structured contract sets, integer-range widening, and the total
+    /// `(item, verdict, detail)` order — reproduces `attest::diff(…).render()` byte-for-byte,
+    /// exit code included (breaking changes fail the gate). Also covers `attest-verify`, which
+    /// re-renders the current manifest and diffs it against the recorded one: unchanged source
+    /// reports no drift at all, and a changed source reproduces the same report as the
+    /// two-manifest diff — proving the freshly-rendered manifest is byte-equal to the recorded
+    /// one, C hash included.
+    #[test]
+    fn jestyr_driver_attest_diff_matches_reference() {
+        let jc = build_exe("examples/std/cgen.jtr");
+        let dir = std::env::temp_dir().join("jestyr_attest_diff_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let v1_src = dir.join("api_v1.jtr");
+        let v2_src = dir.join("api_v2.jtr");
+        std::fs::write(&v1_src, ATTEST_API_V1).unwrap();
+        std::fs::write(&v2_src, ATTEST_API_V2).unwrap();
+        let (id1, id2) = (v1_src.to_str().unwrap(), v2_src.to_str().unwrap());
+        let (m1, m2) = (attest_manifest_of(id1, ATTEST_API_V1), attest_manifest_of(id2, ATTEST_API_V2));
+        let (p1, p2) = (dir.join("v1.manifest"), dir.join("v2.manifest"));
+        std::fs::write(&p1, &m1).unwrap();
+        std::fs::write(&p2, &m2).unwrap();
+
+        let render = |old: &str, new: &str| -> String {
+            let o = crate::attest::parse_manifest(old).unwrap();
+            let n = crate::attest::parse_manifest(new).unwrap();
+            crate::attest::diff(&o, &n).render()
+        };
+        let run = |args: [&str; 3]| -> (String, bool) {
+            let out = Command::new(&jc).args(args).output().unwrap();
+            (String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"), out.status.success())
+        };
+
+        // The evolved surface: every verdict branch, in the reference's total order.
+        let want = render(&m1, &m2);
+        let (got, ok) = run([p1.to_str().unwrap(), "attest-diff", p2.to_str().unwrap()]);
+        assert_eq!(got, want, "attest-diff report diverged from the reference");
+        assert!(!ok, "a breaking diff must fail the gate");
+        assert!(want.contains("9 breaking, 6 compatible"), "fixture lost coverage: {want}");
+        for phrase in [
+            "removed (was pub)",
+            "removed (internal)",
+            "added",
+            "no longer `pub`",
+            "signature changed:",
+            "lost `@no_panic`",
+            "gained `@no_panic`",
+            "error added `Negative`",
+            "`requires b != 0` removed",
+            "`ensures result >= 0` removed",
+            "constraint removed",
+            "newly constrained to `0..4`",
+            "widened `0..10` → `0..20`",
+            "narrowed `0..100` → `0..50`",
+        ] {
+            assert!(want.contains(phrase), "fixture no longer covers {phrase:?}");
+        }
+
+        // An unchanged surface: no note line, no changes, and the gate passes.
+        let want_same = render(&m1, &m1);
+        let (got_same, ok_same) = run([p1.to_str().unwrap(), "attest-diff", p1.to_str().unwrap()]);
+        assert_eq!(got_same, want_same, "self-diff report diverged from the reference");
+        assert!(ok_same, "an empty diff must pass the gate");
+        assert!(got_same.contains("no API changes"), "self-diff should be empty: {got_same}");
+
+        // `attest-verify`: re-render the CURRENT manifest and diff the recorded one against it.
+        // Against its own source that is a total no-op — including the C hash, so the
+        // "emitted C differs" note must NOT appear.
+        let (got_v, ok_v) = run([id1, "attest-verify", p1.to_str().unwrap()]);
+        assert!(ok_v, "verifying an unchanged source must pass: {got_v}");
+        assert!(got_v.contains("no API changes"), "unchanged source reported drift: {got_v}");
+        assert!(!got_v.contains("note:"), "freshly-rendered manifest drifted from the recorded one: {got_v}");
+
+        // Against the evolved source it must reproduce the two-manifest report exactly.
+        let (got_v2, ok_v2) = run([id2, "attest-verify", p1.to_str().unwrap()]);
+        assert_eq!(got_v2, want, "attest-verify report diverged from the two-manifest diff");
+        assert!(!ok_v2, "a breaking verify must fail the gate");
+
+        // A non-manifest input fails fast rather than diffing as empty.
+        let out = Command::new(&jc)
+            .args([v1_src.to_str().unwrap(), "attest-diff", p2.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "a non-manifest input must be refused");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("not a valid attest manifest"),
+            "refusal not rendered: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        eprintln!("attest diff/verify: byte-equal to the reference across every verdict branch");
+    }
+
     /// **In-language modules.** `jc <file> build|run` flattens the import closure itself
     /// (the driver's `ml_*` loader: DFS deps-first, imports dropped, `binding.x` -> `x`,
     /// cross-module top-level collisions renamed) — multi-file programs compile through

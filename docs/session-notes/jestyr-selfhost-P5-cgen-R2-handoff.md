@@ -962,11 +962,43 @@ anywhere in the loop** (`jestyr_driver_builds_itself`, selfhost-fixpoint).
   Remaining O items: the manifest records + verify, `doc` (needs a comment-preserving
   lex mode — the tokenizer skips comments).
 
-> **THIS DOCUMENT'S STORY IS COMPLETE.** Increments 1–50 delivered the whole self-hosting
+### Increments 51–52 — O1 COMPLETE: the full manifest, then the breaking-change gate
+
+The attest story finished in-language. Both landed byte-exact on the first run — the
+reference surface is compact enough to transcribe rather than converge:
+
+- **51 — manifest RECORDS**: the `at_*` family in cgen.jtr ports
+  `doc::{ty_str, params_str, fn_sig, extern_sig, const_sig, fn_guarantees}` plus
+  `attest::collect_records` — Jestyr-surface signatures RECONSTRUCTED from the AST (not
+  span slices), sorted by (kind, name) via a selection sort that emits each record as its
+  slot settles. `jc <file> attest` now emits header + records byte-equal to
+  `attest::manifest` (golden `jestyr_driver_attest_manifest_matches_reference` over 10
+  corpus files: contracts/errors/refine/records/docs/extern_c/loops_advanced/shapes/
+  array_lit/hello — requires+ensures, error sets, refinements, `@no_panic`, methods,
+  externs, enums, consts, slice/ptr/array param types). **Record scope, easy to get
+  wrong:** trait/impl/distinct/import are NOT records (the C hash attests them) and
+  struct METHODS never get their own record.
+- **52 — `attest --diff`**: `jc <old> attest-diff <new>` and `jc <file> attest-verify
+  <manifest>` reproduce `attest::diff(…).render()` byte-for-byte, exit code included
+  (golden `jestyr_driver_attest_diff_matches_reference`, a v1→v2 fixture firing every
+  verdict branch: pub/internal removal, addition, sig change, `@no_panic` ±, error added,
+  `requires`/`ensures` dropped, refinement removed/added/widened/narrowed, vis demotion —
+  9 breaking, 6 compatible). **The observation that makes a map-free port exact:** the
+  reference re-sorts the whole change list by (item, verdict, detail) at the end, so the
+  iteration order of its `BTreeSet`/`BTreeMap` fields never reaches the output — `struct
+  Am` can therefore keep the manifest text caller-owned and re-derive every structured
+  set from the guarantee lines on demand (spans, dedup on push, no ordering).
+- **The `#line` divergence this surfaced** — the port emits NO `#line` directives while
+  the reference's module path does, so `jestyrc attest` and `jc attest` disagree on
+  `c-sha256`. Nothing else in the two-sided gate can see it (every golden uses
+  debug-free ASTs). Full writeup + the plan in the next-frontier handoff §1.
+
+> **THIS DOCUMENT'S STORY IS COMPLETE.** Increments 1–52 delivered the whole self-hosting
 > arc: golden convergence, the fixed point, test mode, the driver, in-language modules,
-> per-file diagnostics, refusal gates, attest, and the bootstrap seed. **The successor
-> handoff is `docs/session-notes/jestyr-next-frontier-handoff.md`** — the O-tooling
-> remainder (attest records + verify, doc) and the Group-3 workstreams (G CTFE, L
+> per-file diagnostics, refusal gates, the full attest manifest + diff gate, and the
+> bootstrap seed. **The successor handoff is
+> `docs/session-notes/jestyr-next-frontier-handoff.md`** — the O-tooling remainder (`doc`
+> only; O1 is done), the optional `#line` port, and the Group-3 workstreams (G CTFE, L
 > memory-layout, Q SIMD), with the two-sided golden discipline and every recorded trap
 > carried forward. Start there.
 

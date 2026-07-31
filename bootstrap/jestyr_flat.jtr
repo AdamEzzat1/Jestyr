@@ -8038,16 +8038,6 @@ pub fn push_sha256_hex(mut sb: String, read data: str) {
 // Increment 1 (this file's current reach): `hello.jtr` — the prelude, one `fn main -> i32`, a
 // `print_str("…")` intrinsic call, a string literal, and `return 0`. Everything else is denylisted.
 
-
-
-
-
-
-
-
-
-
-
 // ---- the fixed C prelude (mirrors Cgen::prelude) ----
 // A FIXED header block: includes + the `jestyr_rt_*` runtime + the JestyrStr/String/Cow/Builder
 // value types + the print/file-IO/argv intrinsics. Transcribed byte-for-byte from `cgen.rs`
@@ -19154,6 +19144,716 @@ fn at_records(mut ob: String, read p: Parser, read src: str, read a: Allocator) 
     }
 }
 
+// The full attestation manifest for a checked program (`attest::manifest`): the header —
+// version, source id, the SHA-256 of exactly the C `build` would emit, and the locked
+// compile command — then the per-item records.
+fn at_manifest(mut ob: String, read p: Parser, read c: Checker, read src: str, read a: Allocator, read srcid: str) {
+    var cbuf: String = string_new()
+    emit_program(cbuf, p, c, src, a, false, "")
+    string_push(ob, "jestyr-attest/v1\nsource ")
+    string_push(ob, srcid)
+    string_push(ob, "\nc-sha256 ")
+    push_sha256_hex(ob, string_view(cbuf))
+    string_push(ob, "\ncc-flags -O2 -std=c11 -ffp-contract=off -fno-fast-math\n")
+    at_records(ob, p, src, a)
+    string_free(cbuf)
+}
+
+// ---- attest --diff: the sound breaking-change gate, in-language ----
+// A manifest parsed back into structured contracts (`attest::ParsedManifest`). The text stays
+// owned by the caller; everything here is spans into it. `items` holds a 7-tuple per item —
+// [key_s, key_e, is_pub, sig_s, sig_e, g_start, g_count] — whose key is the raw `<kind> <name>`
+// line (the stable identity the diff matches on, not the signature), and `g_*` slices `gs`, the
+// guarantee-line span pairs. The reference's `BTreeSet`/`BTreeMap` fields are derived on demand
+// from those lines (`absorb_guarantee`'s inverse) rather than stored.
+struct Am { ok: bool, src_s: i32, src_e: i32, hash_s: i32, hash_e: i32, items: List(i32), gs: List(i32) }
+
+// Parse a manifest's text (`attest::parse_manifest`): line 0 is the format tag, header lines run
+// to the first blank, then a non-indented `<kind> <name>` line opens an item block that indented
+// lines fill. Unknown lines are ignored (forward compatibility); a first line that isn't the
+// format tag clears `ok`, so a non-manifest file fails fast rather than diffing as empty.
+fn am_parse(read t: str, read a: Allocator) -> Am {
+    var m: Am = Am{ ok: true, src_s: 0, src_e: 0, hash_s: 0, hash_e: 0, items: make__list(i32, a), gs: make__list(i32, a) }
+    var phase: i32 = 0                                 // 0 = version line, 1 = header, 2 = items
+    var cur: i32 = 0 - 1                               // the open item's tuple base in `items`
+    var ls: usize = 0
+    for ls < t.len {
+        var le: usize = ls                             // the line's `\n` (or end of text)
+        for le < t.len {
+            if (t[le] as i32) == 10 { break }
+            le = le + 1
+        }
+        var ce: usize = le                             // content end, a trailing `\r` dropped
+        if ce > ls {
+            if (t[ce - 1] as i32) == 13 { ce = ce - 1 }
+        }
+        let line: str = t[ls .. ce]
+        if phase == 0 {
+            if !starts_with(line, "jestyr-attest/") {
+                m.ok = false
+                return m
+            }
+            phase = 1
+        } else if phase == 1 {
+            if line.len == 0 {
+                phase = 2
+            } else if starts_with(line, "source ") {
+                m.src_s = (ls + 7) as i32
+                m.src_e = ce as i32
+            } else if starts_with(line, "c-sha256 ") {
+                m.hash_s = (ls + 9) as i32
+                m.hash_e = ce as i32
+            }
+        } else if line.len == 0 {
+            cur = 0 - 1
+        } else if starts_with(line, "  ") {
+            if cur >= 0 {
+                let body: str = t[ls + 2 .. ce]
+                if starts_with(body, "vis: ") {
+                    if str_eq(trim(t[ls + 7 .. ce]), "pub") { set(i32, m.items, (cur + 2) as usize, 1) }
+                } else if starts_with(body, "sig: ") {
+                    set(i32, m.items, (cur + 3) as usize, (ls + 7) as i32)
+                    set(i32, m.items, (cur + 4) as usize, ce as i32)
+                } else if starts_with(body, "guarantee: ") {
+                    push(i32, m.gs, (ls + 13) as i32)
+                    push(i32, m.gs, ce as i32)
+                    set(i32, m.items, (cur + 6) as usize, get(i32, m.items, (cur + 6) as usize) + 1)
+                }
+            }
+        } else {
+            cur = len(i32, m.items) as i32
+            push(i32, m.items, ls as i32)
+            push(i32, m.items, ce as i32)
+            push(i32, m.items, 0)                 // is_pub
+            push(i32, m.items, 0)                 // sig span (empty until a `sig:` line)
+            push(i32, m.items, 0)
+            push(i32, m.items, (len(i32, m.gs) / 2) as i32)
+            push(i32, m.items, 0)                 // guarantee count
+        }
+        ls = le + 1
+    }
+    return m
+}
+
+// The tuple base of the item keyed `key`, or -1. Scans to the LAST match: the reference keys a
+// `BTreeMap` by `<kind> <name>`, so a repeated key overwrites (a well-formed manifest has none).
+fn am_find(read m: Am, read t: str, read key: str) -> i32 {
+    var found: i32 = 0 - 1
+    var i: usize = 0
+    for i < len(i32, m.items) / 7 {
+        let ib: i32 = (i * 7) as i32
+        if str_eq(t[get(i32, m.items, ib as usize) as usize .. get(i32, m.items, (ib + 1) as usize) as usize], key) { found = ib }
+        i = i + 1
+    }
+    return found
+}
+
+fn am_g_count(read m: Am, ib: i32) -> i32 { return get(i32, m.items, (ib + 6) as usize) }
+fn am_g_s(read m: Am, ib: i32, k: i32) -> usize {
+    return get(i32, m.gs, ((get(i32, m.items, (ib + 5) as usize) + k) * 2) as usize) as usize
+}
+fn am_g_e(read m: Am, ib: i32, k: i32) -> usize {
+    return get(i32, m.gs, ((get(i32, m.items, (ib + 5) as usize) + k) * 2 + 1) as usize) as usize
+}
+
+// Does the item carry the `@no_panic` guarantee?
+fn am_np(read t: str, read m: Am, ib: i32) -> bool {
+    var k: i32 = 0
+    for k < am_g_count(m, ib) {
+        if starts_with(t[am_g_s(m, ib, k) .. am_g_e(m, ib, k)], "`@no_panic`") { return true }
+        k = k + 1
+    }
+    return false
+}
+
+// Append (start, end) unless an equal element is already present — the `BTreeSet` dedup.
+fn am_push_elem(mut dst: List(i32), read t: str, s: usize, e: usize) {
+    var i: usize = 0
+    for i < len(i32, dst) / 2 {
+        if str_eq(t[get(i32, dst, i * 2) as usize .. get(i32, dst, i * 2 + 1) as usize], t[s .. e]) { return }
+        i = i + 1
+    }
+    push(i32, dst, s as i32)
+    push(i32, dst, e as i32)
+}
+
+// `` `requires <e>` `` / `` `ensures <e>` `` -> the inner text as an element span
+// (`strip_prefix` then `trim_end_matches('`')`).
+fn am_take_quoted(mut dst: List(i32), read t: str, gs2: usize, ge: usize, read pfx: str) {
+    if !starts_with(t[gs2 .. ge], pfx) { return }
+    let s2: usize = gs2 + pfx.len
+    var e2: usize = ge
+    for e2 > s2 {
+        if (t[e2 - 1] as i32) != 96 { break }
+        e2 = e2 - 1
+    }
+    am_push_elem(dst, t, s2, e2)
+}
+
+// Collect an item's guarantee-derived set elements as (start, end) span pairs, deduped:
+// 0 = `requires`, 1 = `ensures`, 2 = the error set (`may fail with `!{ A, B }``, split on `,`).
+// Order is irrelevant — the change list is re-sorted by content at the end, exactly like the
+// reference's final `sort_by`.
+fn am_elems(mut dst: List(i32), read t: str, read m: Am, ib: i32, cls: i32) {
+    var k: i32 = 0
+    for k < am_g_count(m, ib) {
+        let gs2: usize = am_g_s(m, ib, k)
+        let ge: usize = am_g_e(m, ib, k)
+        if cls == 0 { am_take_quoted(dst, t, gs2, ge, "`requires ") }
+        if cls == 1 { am_take_quoted(dst, t, gs2, ge, "`ensures ") }
+        if cls == 2 {
+            if starts_with(t[gs2 .. ge], "may fail with `!{ ") {
+                let s2: usize = gs2 + 18
+                var e2: usize = ge
+                for e2 > s2 {
+                    if (t[e2 - 1] as i32) != 96 { break }
+                    e2 = e2 - 1
+                }
+                for e2 > s2 {
+                    if (t[e2 - 1] as i32) != 125 { break }
+                    e2 = e2 - 1
+                }
+                var b0: usize = s2
+                for b0 <= e2 {
+                    var b1: usize = b0
+                    for b1 < e2 {
+                        if (t[b1] as i32) == 44 { break }
+                        b1 = b1 + 1
+                    }
+                    var q0: usize = b0
+                    var q1: usize = b1
+                    for q0 < q1 {
+                        if (t[q0] as i32) != 32 { break }
+                        q0 = q0 + 1
+                    }
+                    for q1 > q0 {
+                        if (t[q1 - 1] as i32) != 32 { break }
+                        q1 = q1 - 1
+                    }
+                    if q1 > q0 { am_push_elem(dst, t, q0, q1) }
+                    b0 = b1 + 1
+                }
+            }
+        }
+        k = k + 1
+    }
+}
+
+// Is `x` an element of the set `v` (spans into `t`)?
+fn am_has(read v: List(i32), read t: str, read x: str) -> bool {
+    var i: usize = 0
+    for i < len(i32, v) / 2 {
+        if str_eq(t[get(i32, v, i * 2) as usize .. get(i32, v, i * 2 + 1) as usize], x) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// An item's refinement map as (name_s, name_e, range_s, range_e) quadruples — the inverse of
+// ``parameter `i` is constrained to `0..n``` (`parse_refine_phrase`).
+fn am_refines(mut dst: List(i32), read t: str, read m: Am, ib: i32) {
+    var k: i32 = 0
+    for k < am_g_count(m, ib) {
+        let gs2: usize = am_g_s(m, ib, k)
+        let ge: usize = am_g_e(m, ib, k)
+        if starts_with(t[gs2 .. ge], "parameter `") {
+            let ns: usize = gs2 + 11
+            var ne: usize = ns
+            for ne < ge {
+                if (t[ne] as i32) == 96 { break }
+                ne = ne + 1
+            }
+            if ne < ge {
+                if starts_with(t[ne .. ge], "` is constrained to `") {
+                    let rs: usize = ne + 21
+                    if ge > rs {
+                        if (t[ge - 1] as i32) == 96 {
+                            push(i32, dst, ns as i32)
+                            push(i32, dst, ne as i32)
+                            push(i32, dst, rs as i32)
+                            push(i32, dst, (ge - 1) as i32)
+                        }
+                    }
+                }
+            }
+        }
+        k = k + 1
+    }
+}
+
+// The quad base of the refinement for param `name`, or -1 (LAST match — map overwrite).
+fn am_ref_find(read rf: List(i32), read t: str, read name: str) -> i32 {
+    var found: i32 = 0 - 1
+    var i: usize = 0
+    for i < len(i32, rf) / 4 {
+        let qb: i32 = (i * 4) as i32
+        if str_eq(t[get(i32, rf, qb as usize) as usize .. get(i32, rf, (qb + 1) as usize) as usize], name) { found = qb }
+        i = i + 1
+    }
+    return found
+}
+
+// Copy `hay` into `dst` with every occurrence of `needle` dropped (`str::replace(n, "")`).
+fn push_without(mut dst: String, read hay: str, read needle: str) {
+    if needle.len == 0 {
+        string_push(dst, hay)
+        return
+    }
+    var i: usize = 0
+    for i < hay.len {
+        var hit: bool = false
+        if i + needle.len <= hay.len {
+            if str_eq(hay[i .. i + needle.len], needle) { hit = true }
+        }
+        if hit {
+            i = i + needle.len
+        } else {
+            string_push(dst, hay[i .. i + 1])
+            i = i + 1
+        }
+    }
+}
+
+// Copy `hay` into `dst` with every occurrence of ANY needle (spans into `nb`) dropped. One
+// left-to-right pass stands in for the reference's per-needle `replace` passes: the needles are
+// the distinct ` in <range>` clauses of one signature, so the results agree.
+fn push_without_any(mut dst: String, read hay: str, read nb: str, read spans: List(i32)) {
+    var i: usize = 0
+    for i < hay.len {
+        var skip: usize = 0
+        var q: usize = 0
+        for q < len(i32, spans) / 2 {
+            let ns: usize = get(i32, spans, q * 2) as usize
+            let ne: usize = get(i32, spans, q * 2 + 1) as usize
+            if skip == 0 and ne > ns {
+                if i + (ne - ns) <= hay.len {
+                    if str_eq(hay[i .. i + (ne - ns)], nb[ns .. ne]) { skip = ne - ns }
+                }
+            }
+            q = q + 1
+        }
+        if skip > 0 {
+            i = i + skip
+        } else {
+            string_push(dst, hay[i .. i + 1])
+            i = i + 1
+        }
+    }
+}
+
+// `ParsedItem::sig_core` — the *type* signature only: `@no_panic `, a leading `pub `, the
+// ` !{…}` error set, and every ` in <range>` refinement removed, since those are compared
+// structurally. What's left is the part a change to which is an unconditional ABI break.
+fn am_sig_core(mut dst: String, read t: str, read m: Am, ib: i32, read a: Allocator) {
+    let sig: str = t[get(i32, m.items, (ib + 3) as usize) as usize .. get(i32, m.items, (ib + 4) as usize) as usize]
+    var s1: String = string_new()
+    push_without(s1, sig, "@no_panic ")
+    let v1: str = string_view(s1)
+    var b0: usize = 0
+    if starts_with(v1, "pub ") { b0 = 4 }
+    let base: str = v1[b0 .. v1.len]
+    var s2: String = string_new()
+    let hit: isize = find(base, " !{")
+    var done: bool = false
+    if hit >= 0 {
+        let tail: str = base[hit as usize .. base.len]
+        let rel: isize = find(tail, "}")
+        if rel >= 0 {
+            string_push(s2, base[0 .. hit as usize])
+            string_push(s2, base[(hit as usize) + (rel as usize) + 1 .. base.len])
+            done = true
+        }
+    }
+    if !done { string_push(s2, base) }
+    var rf: List(i32) = make__list(i32, a)
+    am_refines(rf, t, m, ib)
+    var nb2: String = string_new()
+    var nsp: List(i32) = make__list(i32, a)
+    var i: usize = 0
+    for i < len(i32, rf) / 4 {
+        let sofar: i32 = sb_len(nb2)
+        string_push(nb2, " in ")
+        string_push(nb2, t[get(i32, rf, i * 4 + 2) as usize .. get(i32, rf, i * 4 + 3) as usize])
+        push(i32, nsp, sofar)
+        push(i32, nsp, sb_len(nb2))
+        i = i + 1
+    }
+    var s3: String = string_new()
+    push_without_any(s3, string_view(s2), string_view(nb2), nsp)
+    string_push(dst, trim(string_view(s3)))
+    string_free(s3)
+    string_free(nb2)
+    string_free(s2)
+    string_free(s1)
+}
+
+// Record one classified change: the item key, the verdict (0 = breaking, 1 = compatible —
+// `Verdict as u8`), and the detail text, all as spans into the change buffer `cb`.
+fn am_change(mut cb: String, mut cl: List(i32), read item: str, breaking: bool, read detail: str) {
+    let s0: i32 = sb_len(cb)
+    string_push(cb, item)
+    let s1: i32 = sb_len(cb)
+    string_push(cb, detail)
+    let s2: i32 = sb_len(cb)
+    push(i32, cl, s0)
+    push(i32, cl, s1)
+    if breaking { push(i32, cl, 0) } else { push(i32, cl, 1) }
+    push(i32, cl, s1)
+    push(i32, cl, s2)
+}
+
+// One change per element of `av` absent from `bv`, rendered `<pre><element><post>`.
+fn am_set_diff(mut cb: String, mut cl: List(i32), read key: str, breaking: bool, read pre: str, read post: str, read at2: str, read av: List(i32), read bt: str, read bv: List(i32)) {
+    var q: usize = 0
+    for q < len(i32, av) / 2 {
+        let x: str = at2[get(i32, av, q * 2) as usize .. get(i32, av, q * 2 + 1) as usize]
+        if !am_has(bv, bt, x) {
+            var d: String = string_new()
+            string_push(d, pre)
+            string_push(d, x)
+            string_push(d, post)
+            am_change(cb, cl, key, breaking, string_view(d))
+            string_free(d)
+        }
+        q = q + 1
+    }
+}
+
+// `lo..hi` / `lo..=hi` over integer literals, or `ok = false` for anything non-literal — so the
+// caller stays conservative (`parse_int_range`).
+struct Rg { ok: bool, lo: i64, hi: i64, inc: bool }
+// One parsed integer (`str::parse::<i64>`): `ok` false for an empty or non-digit string.
+struct Iv { ok: bool, v: i64 }
+
+fn am_int(read s: str) -> Iv {
+    var i: usize = 0
+    var neg: bool = false
+    if s.len == 0 { return Iv{ ok: false, v: 0 } }
+    if (s[0] as i32) == 45 {
+        neg = true
+        i = 1
+    } else if (s[0] as i32) == 43 {
+        i = 1
+    }
+    if i >= s.len { return Iv{ ok: false, v: 0 } }
+    var acc: i64 = 0
+    for i < s.len {
+        let ch: i32 = s[i] as i32
+        if ch < 48 { return Iv{ ok: false, v: 0 } }
+        if ch > 57 { return Iv{ ok: false, v: 0 } }
+        acc = acc * 10 + ((ch - 48) as i64)
+        i = i + 1
+    }
+    if neg { acc = 0 - acc }
+    return Iv{ ok: true, v: acc }
+}
+
+fn am_range(read s: str) -> Rg {
+    var r: Rg = Rg{ ok: false, lo: 0, hi: 0, inc: false }
+    var at: isize = find(s, "..=")
+    var w: usize = 3
+    if at < 0 {
+        at = find(s, "..")
+        w = 2
+    } else {
+        r.inc = true
+    }
+    if at < 0 { return r }
+    let lo: Iv = am_int(trim(s[0 .. at as usize]))
+    let hi: Iv = am_int(trim(s[(at as usize) + w .. s.len]))
+    if !lo.ok or !hi.ok { return r }
+    r.lo = lo.v
+    r.hi = hi.v
+    r.ok = true
+    return r
+}
+
+// Is `n` a provable *superset* of `o` — both integer-literal ranges of the same inclusivity?
+// Only then is a refinement change a widening (compatible); anything incomparable is false.
+fn am_widened(read o: str, read n: str) -> bool {
+    let ro: Rg = am_range(o)
+    let rn: Rg = am_range(n)
+    if !ro.ok or !rn.ok { return false }
+    if ro.inc != rn.inc { return false }
+    return rn.lo <= ro.lo and rn.hi >= ro.hi
+}
+
+// Classify the changes within one item present in both manifests (`attest::diff_item`), under
+// behavioral subtyping: strengthening a precondition or weakening a postcondition breaks.
+fn am_diff_item(mut cb: String, mut cl: List(i32), read ot: str, read o: Am, ob: i32, read nt: str, read n: Am, nbs: i32, read key: str, read a: Allocator) {
+    // Visibility: leaving the public API is breaking; entering it is compatible.
+    let opub: bool = get(i32, o.items, (ob + 2) as usize) != 0
+    let npub: bool = get(i32, n.items, (nbs + 2) as usize) != 0
+    if opub and !npub { am_change(cb, cl, key, true, "no longer `pub`") }
+    if !opub and npub { am_change(cb, cl, key, false, "now `pub`") }
+
+    // The type signature, with the structurally-compared bits removed.
+    var oc: String = string_new()
+    var nc: String = string_new()
+    am_sig_core(oc, ot, o, ob, a)
+    am_sig_core(nc, nt, n, nbs, a)
+    let ocv: str = string_view(oc)
+    let ncv: str = string_view(nc)
+    if !str_eq(ocv, ncv) {
+        var d: String = string_new()
+        string_push(d, "signature changed: `")
+        string_push(d, ocv)
+        string_push(d, "` → `")
+        string_push(d, ncv)
+        string_push(d, "`")
+        am_change(cb, cl, key, true, string_view(d))
+        string_free(d)
+    }
+
+    // `@no_panic` is a postcondition: losing it is breaking, gaining it compatible.
+    let onp: bool = am_np(ot, o, ob)
+    let nnp: bool = am_np(nt, n, nbs)
+    if onp and !nnp { am_change(cb, cl, key, true, "lost `@no_panic`") }
+    if !onp and nnp { am_change(cb, cl, key, false, "gained `@no_panic`") }
+
+    // Error set: a new error a caller must handle is breaking; a removed one frees them.
+    var oe: List(i32) = make__list(i32, a)
+    var nev: List(i32) = make__list(i32, a)
+    am_elems(oe, ot, o, ob, 2)
+    am_elems(nev, nt, n, nbs, 2)
+    am_set_diff(cb, cl, key, true, "error added `", "`", nt, nev, ot, oe)
+    am_set_diff(cb, cl, key, false, "error removed `", "`", ot, oe, nt, nev)
+
+    // Precondition `requires`: a new demand on the caller is breaking; dropping one frees them.
+    var orq: List(i32) = make__list(i32, a)
+    var nrq: List(i32) = make__list(i32, a)
+    am_elems(orq, ot, o, ob, 0)
+    am_elems(nrq, nt, n, nbs, 0)
+    am_set_diff(cb, cl, key, true, "`requires ", "` added", nt, nrq, ot, orq)
+    am_set_diff(cb, cl, key, false, "`requires ", "` removed", ot, orq, nt, nrq)
+
+    // Postcondition `ensures`: a new promise is compatible; dropping one a caller relied on breaks.
+    var oen: List(i32) = make__list(i32, a)
+    var nen: List(i32) = make__list(i32, a)
+    am_elems(oen, ot, o, ob, 1)
+    am_elems(nen, nt, n, nbs, 1)
+    am_set_diff(cb, cl, key, false, "`ensures ", "` added", nt, nen, ot, oen)
+    am_set_diff(cb, cl, key, true, "`ensures ", "` removed", ot, oen, nt, nen)
+
+    // Refinements: narrowing a param's accepted set strengthens a precondition (breaking);
+    // widening it relaxes one (compatible). A change not *provably* a widening is breaking.
+    var orf: List(i32) = make__list(i32, a)
+    var nrf: List(i32) = make__list(i32, a)
+    am_refines(orf, ot, o, ob)
+    am_refines(nrf, nt, n, nbs)
+    var i: usize = 0
+    for i < len(i32, orf) / 4 {
+        let qb: i32 = (i * 4) as i32
+        let pn: str = ot[get(i32, orf, qb as usize) as usize .. get(i32, orf, (qb + 1) as usize) as usize]
+        if am_ref_find(orf, ot, pn) == qb {
+            let ro: str = ot[get(i32, orf, (qb + 2) as usize) as usize .. get(i32, orf, (qb + 3) as usize) as usize]
+            let mb: i32 = am_ref_find(nrf, nt, pn)
+            var d: String = string_new()
+            if mb < 0 {
+                string_push(d, "param `")
+                string_push(d, pn)
+                string_push(d, "` constraint removed")
+                am_change(cb, cl, key, false, string_view(d))
+            } else {
+                let rn: str = nt[get(i32, nrf, (mb + 2) as usize) as usize .. get(i32, nrf, (mb + 3) as usize) as usize]
+                if !str_eq(ro, rn) {
+                    let wide: bool = am_widened(ro, rn)
+                    string_push(d, "param `")
+                    string_push(d, pn)
+                    if wide { string_push(d, "` widened `") } else { string_push(d, "` narrowed `") }
+                    string_push(d, ro)
+                    string_push(d, "` → `")
+                    string_push(d, rn)
+                    string_push(d, "`")
+                    am_change(cb, cl, key, !wide, string_view(d))
+                }
+            }
+            string_free(d)
+        }
+        i = i + 1
+    }
+    var j: usize = 0
+    for j < len(i32, nrf) / 4 {
+        let qb: i32 = (j * 4) as i32
+        let pn: str = nt[get(i32, nrf, qb as usize) as usize .. get(i32, nrf, (qb + 1) as usize) as usize]
+        if am_ref_find(nrf, nt, pn) == qb {
+            if am_ref_find(orf, ot, pn) < 0 {
+                let rn: str = nt[get(i32, nrf, (qb + 2) as usize) as usize .. get(i32, nrf, (qb + 3) as usize) as usize]
+                var d: String = string_new()
+                string_push(d, "param `")
+                string_push(d, pn)
+                string_push(d, "` newly constrained to `")
+                string_push(d, rn)
+                string_push(d, "`")
+                am_change(cb, cl, key, true, string_view(d))
+                string_free(d)
+            }
+        }
+        j = j + 1
+    }
+    string_free(nc)
+    string_free(oc)
+}
+
+// Order two recorded changes by (item, verdict, detail) — the reference's total, content-based
+// sort, so no iteration order leaks into the report.
+fn am_chg_lt(read cb: str, read cl: List(i32), i: usize, j: usize) -> bool {
+    let ia: str = cb[get(i32, cl, i * 5) as usize .. get(i32, cl, i * 5 + 1) as usize]
+    let ja: str = cb[get(i32, cl, j * 5) as usize .. get(i32, cl, j * 5 + 1) as usize]
+    if !str_eq(ia, ja) { return str_lt(ia, ja) }
+    let vi: i32 = get(i32, cl, i * 5 + 2)
+    let vj: i32 = get(i32, cl, j * 5 + 2)
+    if vi != vj { return vi < vj }
+    let di: str = cb[get(i32, cl, i * 5 + 3) as usize .. get(i32, cl, i * 5 + 4) as usize]
+    let dj: str = cb[get(i32, cl, j * 5 + 3) as usize .. get(i32, cl, j * 5 + 4) as usize]
+    return str_lt(di, dj)
+}
+
+// The first 12 hex of a digest, ellipsized when truncated (`attest::short`).
+fn am_short(mut dst: String, read h: str) {
+    if h.len > 12 {
+        string_push(dst, h[0 .. 12])
+        string_push(dst, "…")
+    } else {
+        string_push(dst, h)
+    }
+}
+
+// Classify every per-item change between two manifests and render the report (`attest::diff` +
+// `DiffReport::render`). Returns the breaking count — the CI gate's exit code.
+fn am_diff(mut rep: String, read ot: str, read o: Am, read nt: str, read n: Am, read a: Allocator) -> i32 {
+    var cb: String = string_new()
+    var cl: List(i32) = make__list(i32, a)
+    // Old items: matched (classified) or removed (only a public item's removal breaks).
+    var i: usize = 0
+    for i < len(i32, o.items) / 7 {
+        let ib: i32 = (i * 7) as i32
+        let key: str = ot[get(i32, o.items, ib as usize) as usize .. get(i32, o.items, (ib + 1) as usize) as usize]
+        if am_find(o, ot, key) == ib {
+            let mb: i32 = am_find(n, nt, key)
+            if mb < 0 {
+                if get(i32, o.items, (ib + 2) as usize) != 0 {
+                    am_change(cb, cl, key, true, "removed (was pub)")
+                } else {
+                    am_change(cb, cl, key, false, "removed (internal)")
+                }
+            } else {
+                am_diff_item(cb, cl, ot, o, ib, nt, n, mb, key, a)
+            }
+        }
+        i = i + 1
+    }
+    // New items with no old counterpart: an addition never breaks an existing caller.
+    var j: usize = 0
+    for j < len(i32, n.items) / 7 {
+        let jb: i32 = (j * 7) as i32
+        let key: str = nt[get(i32, n.items, jb as usize) as usize .. get(i32, n.items, (jb + 1) as usize) as usize]
+        if am_find(n, nt, key) == jb {
+            if am_find(o, ot, key) < 0 { am_change(cb, cl, key, false, "added") }
+        }
+        j = j + 1
+    }
+
+    let cbv: str = string_view(cb)
+    let cnt: usize = len(i32, cl) / 5
+    var s: usize = 0
+    for s < cnt {
+        var lo: usize = s
+        var u: usize = s + 1
+        for u < cnt {
+            if am_chg_lt(cbv, cl, u, lo) { lo = u }
+            u = u + 1
+        }
+        if lo != s {
+            var f: usize = 0
+            for f < 5 {
+                let tmp: i32 = get(i32, cl, s * 5 + f)
+                set(i32, cl, s * 5 + f, get(i32, cl, lo * 5 + f))
+                set(i32, cl, lo * 5 + f, tmp)
+                f = f + 1
+            }
+        }
+        s = s + 1
+    }
+
+    var breaking: i64 = 0
+    var compat: i64 = 0
+    var c0: usize = 0
+    for c0 < cnt {
+        if get(i32, cl, c0 * 5 + 2) == 0 { breaking = breaking + 1 } else { compat = compat + 1 }
+        c0 = c0 + 1
+    }
+
+    string_push(rep, "jestyr-attest diff\nold: ")
+    string_push(rep, ot[o.src_s as usize .. o.src_e as usize])
+    string_push(rep, " (c-sha256 ")
+    am_short(rep, ot[o.hash_s as usize .. o.hash_e as usize])
+    string_push(rep, ")\nnew: ")
+    string_push(rep, nt[n.src_s as usize .. n.src_e as usize])
+    string_push(rep, " (c-sha256 ")
+    am_short(rep, nt[n.hash_s as usize .. n.hash_e as usize])
+    string_push(rep, ")\n")
+    if !str_eq(ot[o.hash_s as usize .. o.hash_e as usize], nt[n.hash_s as usize .. n.hash_e as usize]) {
+        string_push(rep, "note: emitted C differs (a rebuild); per-item ABI verdicts below\n")
+    }
+    string_push(rep, "\n")
+    if cnt == 0 {
+        string_push(rep, "no API changes\n")
+    } else {
+        var r0: usize = 0
+        for r0 < cnt {
+            if get(i32, cl, r0 * 5 + 2) == 0 { string_push(rep, "BREAKING  ") } else { string_push(rep, "compatible") }
+            string_push(rep, "  ")
+            string_push(rep, cbv[get(i32, cl, r0 * 5) as usize .. get(i32, cl, r0 * 5 + 1) as usize])
+            string_push(rep, "  ")
+            string_push(rep, cbv[get(i32, cl, r0 * 5 + 3) as usize .. get(i32, cl, r0 * 5 + 4) as usize])
+            string_push(rep, "\n")
+            r0 = r0 + 1
+        }
+        string_push(rep, "\n")
+        push_uint__cgen(rep, breaking)
+        string_push(rep, " breaking, ")
+        push_uint__cgen(rep, compat)
+        string_push(rep, " compatible\n")
+    }
+    string_free(cb)
+    return breaking as i32
+}
+
+// Diff two manifest texts and print the report; returns the process exit code (breaking
+// changes fail the gate, a compatible-only or empty diff passes).
+fn am_run_diff(read ot: str, read nt: str, read opath: str, read npath: str, read a: Allocator) -> i32 {
+    var om: Am = am_parse(ot, a)
+    var nm: Am = am_parse(nt, a)
+    if !om.ok {
+        var e1: String = string_new()
+        string_push(e1, "error: `")
+        string_push(e1, opath)
+        string_push(e1, "` is not a valid attest manifest")
+        eprint_str(string_view(e1))
+        eprint_str("note: pass files produced by `jc <file.jtr> attest`")
+        string_free(e1)
+        return 1
+    }
+    if !nm.ok {
+        var e2: String = string_new()
+        string_push(e2, "error: `")
+        string_push(e2, npath)
+        string_push(e2, "` is not a valid attest manifest")
+        eprint_str(string_view(e2))
+        eprint_str("note: pass files produced by `jc <file.jtr> attest`")
+        string_free(e2)
+        return 1
+    }
+    var rep: String = string_new()
+    let br: i32 = am_diff(rep, ot, om, nt, nm, a)
+    let rv: str = string_view(rep)
+    if rv.len > 0 { print_str(rv[0 .. rv.len - 1]) }
+    string_free(rep)
+    if br > 0 { return 1 }
+    return 0
+}
+
 fn main() -> i32 {
     var a: Allocator = system_allocator()
     var it: Interner = make__intern(a)
@@ -19168,14 +19868,32 @@ fn main() -> i32 {
         var bmode: bool = false
         var rmode: bool = false
         var amode: bool = false
+        var vmode: bool = false
+        var dmode: bool = false
         if argc() > 2 {
             if str_eq(argv(2), "test") { tmode = true }
             if str_eq(argv(2), "list") { lmode = true }
             if str_eq(argv(2), "build") { bmode = true }
             if str_eq(argv(2), "run") { rmode = true }
             if str_eq(argv(2), "attest") { amode = true }
+            if str_eq(argv(2), "attest-verify") { vmode = true }
+            if str_eq(argv(2), "attest-diff") { dmode = true }
         }
-        if bmode or rmode or amode {
+        if dmode {
+            // `jc <old> attest-diff <new>` — both arguments are MANIFESTS (no source is
+            // compiled), mirroring the reference's `jestyrc attest --diff <old> <new>`.
+            if argc() < 4 {
+                eprint_str("error: `attest-diff` needs two manifest files: <old> <new>")
+                return 1
+            }
+            var otx: String = read_text(argv(1))
+            var ntx: String = read_text(argv(3))
+            let drc2: i32 = am_run_diff(string_view(otx), string_view(ntx), argv(1), argv(3), a)
+            string_free(ntx)
+            string_free(otx)
+            return drc2
+        }
+        if bmode or rmode or amode or vmode {
             // The product modes go through the module loader: the import closure flattens
             // into one single-file program (the loader's own one-translation-unit model),
             // then the ordinary pipeline runs on the merged source. An importless file
@@ -19190,27 +19908,35 @@ fn main() -> i32 {
             }
             var p2: Parser = parse_source(mv, it, kwcount, a)
             var c2: Checker = check_parsed(p2, mv, a)
-            if amode {
+            if amode or vmode {
                 // `jc <file> attest` — the FULL manifest, byte-equal to the reference
                 // `attest::manifest`: the header (version, source, the sha256 of exactly
                 // the C `build` would emit, and the locked compile flags) plus the
                 // per-item records (kind/name, vis, reconstructed signature, guarantees).
-                var cbuf: String = string_new()
-                emit_program(cbuf, p2, c2, mv, a, false, "")
+                // `jc <file> attest-verify <manifest>` diffs the RECORDED manifest (old)
+                // against that freshly-rendered one (new) — the drift gate.
                 var ob: String = string_new()
-                string_push(ob, "jestyr-attest/v1\nsource ")
-                string_push(ob, argv(1))
-                string_push(ob, "\nc-sha256 ")
-                push_sha256_hex(ob, string_view(cbuf))
-                string_push(ob, "\ncc-flags -O2 -std=c11 -ffp-contract=off -fno-fast-math\n")
-                at_records(ob, p2, mv, a)
-                // The manifest ends in '\n'; print_str re-adds one, so drop the last byte.
-                let ov: str = string_view(ob)
-                if ov.len > 0 { print_str(ov[0 .. ov.len - 1]) }
+                at_manifest(ob, p2, c2, mv, a, argv(1))
+                if amode {
+                    // The manifest ends in '\n'; print_str re-adds one, so drop the last byte.
+                    let ov: str = string_view(ob)
+                    if ov.len > 0 { print_str(ov[0 .. ov.len - 1]) }
+                    string_free(ob)
+                    string_free(merged)
+                    return 0
+                }
+                if argc() < 4 {
+                    eprint_str("error: `attest-verify` needs the recorded manifest: <file> attest-verify <manifest>")
+                    string_free(ob)
+                    string_free(merged)
+                    return 1
+                }
+                var otx2: String = read_text(argv(3))
+                let vrc: i32 = am_run_diff(string_view(otx2), string_view(ob), argv(3), argv(1), a)
+                string_free(otx2)
                 string_free(ob)
-                string_free(cbuf)
                 string_free(merged)
-                return 0
+                return vrc
             }
             let drc: i32 = driver_build(m, p2, c2, mv, a, argv(1), rmode)
             string_free(merged)

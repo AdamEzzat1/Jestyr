@@ -26,6 +26,11 @@ gcc -O2 -std=c11 -ffp-contract=off -fno-fast-math -Wl,--stack,67108864 -o jc.exe
 - `jc file.jtr` — emit C on stdout
 - `jc file.jtr build` / `jc file.jtr run` — compile via gcc (escape-checked, diagnostics on stderr)
 - `jc file.jtr test [substr]` / `jc file.jtr list [substr]` — the `@test`/`@bench` harness
+- `jc file.jtr attest` — the attestation manifest (the C's SHA-256, the locked compile
+  command, and every item's signature + machine-checked guarantees)
+- `jc old.manifest attest-diff new.manifest` — classify each API change breaking or
+  compatible; `jc file.jtr attest-verify old.manifest` does the same against a fresh
+  render. Either exits non-zero when something breaks, so both drop into CI as a gate.
 
 On Windows, pass the file with backslashes (`jc examples\hello.jtr run`) — `run` hands
 the produced exe path to `cmd.exe`, which rejects forward slashes in command position.
