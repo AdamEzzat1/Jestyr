@@ -18,6 +18,7 @@ or mutate the compiler's own state destroys all three at once.
 | 3 | Type reflection over the declared shape | **done in the Rust reference** — G3 (sizes/offsets wait on **L**) |
 | 4 | `build.jestyr` — the build described in Jestyr | **done in the Rust reference** — G4 (`jestyrc plan`) |
 | 5 | Bounded, attestable artifact generation | **done in the Rust reference** — G5 (`--emit`) |
+| 6 | Aggregate values — comptime **tables** | **done in the Rust reference** — G6 (`Value::List`) |
 
 ---
 
@@ -34,7 +35,7 @@ is part of `Ty::Array { len }` and part of the emitted C type name
 (`JestyrArr_i32_4`), so `[SIZE]i32` cannot be lowered without knowing `SIZE`.
 
 Tier 1 is `src/comptime.rs` — `Interp::{eval, eval_usize}` over
-`Value::{Int, Bool, Str, Unit}`, covering literals in every base, unary and checked
+`Value::{Int, Bool, Str, List, Unit}`, covering literals in every base, unary and checked
 binary arithmetic, comparisons, short-circuiting `and`/`or`, bitwise ops and shifts,
 string concatenation and comparison, `if`/`else`, blocks with `let`, references to
 other `const`s, integer casts, and calls of pure functions including recursion.
@@ -269,10 +270,59 @@ This is deliberately *artifact* generation, not source-string injection into the
 program being compiled: what a script produces is a file the user can read, diff and
 hash before anything acts on it.
 
-**Next slice:** aggregate comptime values (`Value::List`) turn this into real table
-generation — emitting a `[N]T` static directly rather than through a generated source
-file. That single evaluator extension is also what tier 3's field iteration and a
-richer tier-4 plan want, so it is the highest-leverage next piece of CTFE work.
+See also **tier 6** below, which makes the *direct* form available: a `[N]T` static
+computed in place, with no generated source file in between.
+
+## Tier 6 — aggregate values, and comptime tables
+
+`Value::List` turns CTFE from "compute a number" into "compute a **table**". Array
+literals and repeats evaluate at compile time, and lists are read with `[i]` and
+`.len`:
+
+```jestyr
+fn fib(n: i64) -> i64 {
+    if n < 2 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+
+const FIB: [8]i64 = comptime { [fib(0), fib(1), fib(2), fib(3), fib(4), fib(5), fib(6), fib(7)] }
+const ZEROS: [4]i64 = comptime { [0; 4] }
+```
+
+emits, as ordinary statics:
+
+```c
+static const JestyrArr_i64_8 jestyr_FIB = { { 0, 1, 1, 2, 3, 5, 8, 13 } };
+static const JestyrArr_i64_4 jestyr_ZEROS = { { 0, 0, 0, 0 } };
+```
+
+The C compiler is handed the *answers*, not the recursion that produced them — and
+the result is indistinguishable from a table typed out by hand. A comptime aggregate
+types as `Ty::Array { elem, len }`, the same type a written `[a, b, c]` produces, so
+every later pass sees an ordinary array.
+
+**The emission detail with teeth.** A `const` must be a **brace initializer**: a C
+static cannot be initialised by a GNU statement-expression, which is the shape an
+expression-position aggregate uses. Both paths exist, and the end-to-end test asserts
+no `({` appears in a static's initializer — if the `const` path ever fell through to
+the expression path, gcc would reject the output.
+
+**Totality over aggregates.** Producing an element spends a step from the fuel budget,
+so `[0; 10_000_000_000]` is a diagnostic in microseconds rather than an attempt to
+allocate ten billion values — including the nested case (`[[0; 100000]; 100000]`),
+where it is the *product* that would blow up. Without the per-element spend the test
+suite hangs, which is exactly why the property test exists.
+
+Lists compare with `==`/`!=` structurally. They deliberately do **not** order: a rule
+for comparing aggregates would have to be invented (lexicographic? by length?), and
+inventing rules is what this evaluator does not do. Indexing out of range is an error,
+never a clamp; a nested aggregate with no annotation to say what it is is an error,
+never a guess.
+
+**What this still does not give you:** a comptime `for`. Building a table today means
+writing `[f(0), f(1), …]` — the values are computed, but the *shape* is spelled out.
+A comptime `for` (or comptime-only functions, per tier 3) is what removes that, and
+both stay bounded by the same fuel budget.
 
 ---
 

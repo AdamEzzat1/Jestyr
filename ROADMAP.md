@@ -90,7 +90,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | D | Attributes | ~50% | MED | S | ✓ | ✓ (provenance hooks) |
 | E | Real strings / text | ~25% | HIGH | L | ✓✓ | ✓✓ (self-host) |
 | F | Traits / `dyn` | 0% | HIGH | L | ✓✓ | ✓✓ (pass interfaces) |
-| G | CTFE + reflection | ~75% | HIGH | L | ✓ | ✓✓ (IR builder) |
+| G | CTFE + reflection | ~85% | HIGH | L | ✓ | ✓✓ (IR builder) |
 | H | Function-pointer types | 0% | HIGH | M | ✓ | ✓ (vtables) |
 | I | Error-handling polish | ~70% | MED | S | ✓ | — |
 | J | Numeric / operator completeness | ~70% | MED | S–M | ✓ | ✓ (determinism) |
@@ -174,7 +174,7 @@ generics, `dyn` trait objects (vtables — pairs with H). **Motley:** pass/analy
 interfaces are traits; the real dynamic `Allocator` vtable needs this. The biggest
 single language gap.
 
-### G. CTFE + reflection — ~75% (HIGH conflict; files: `comptime.rs` + parser/typeck/cgen)
+### G. CTFE + reflection — ~85% (HIGH conflict; files: `comptime.rs` + parser/typeck/cgen)
 **Design §8; the tier ladder is `docs/ctfe-tiers.md`.** **Done:** the generics slice
 (type-parameter substitution); **tier 1** — the comptime interpreter over the AST
 (`src/comptime.rs`, total: fuel + depth cap + const-cycle detection), which closed a
@@ -187,12 +187,15 @@ in the collision-proof `@` namespace); **tier 4** — **`build.jestyr`** (`jesty
 **tier 5** — **bounded artifact generation** (`--emit`: a script computes a file's
 bytes, the plan records it by SHA-256, the driver writes it only on demand — the
 *evaluator* gains no effect, so generation stays a pure function the user chooses to
-apply). All five are **Rust-reference side**; the whole tier ladder is now done there.
-**Left:** aggregate comptime values (`Value::List` — the single next unlock, wanted by
-three separate things); **comptime-only functions** (what actually blocks field
-*iteration* end-to-end — not L); the **tier 2–4 port mirrors** (`examples/std/{parser,
-typeck,cgen}.jtr` + a seed refresh), required only once a corpus `.jtr` uses the
-syntax.
+apply); **tier 6** — **aggregate values** (`Value::List`): array literals/repeats
+evaluate, `[i]`/`.len` read, and a `const` initialised by a comptime block yielding a
+list becomes an ordinary **static lookup table** — the C compiler gets the answers, not
+the recursion. All six are **Rust-reference side**; the whole tier ladder is done there.
+**Left:** a **comptime `for`** (today a table's *values* are computed but its *shape*
+is spelled out, `[f(0), f(1), …]`); **comptime-only functions** (what actually blocks
+field *iteration* end-to-end — not L); the **tier 2/3/6 port mirrors**
+(`examples/std/{parser,typeck,cgen}.jtr` + a seed refresh), required only once a corpus
+`.jtr` uses the syntax.
 **Recorded dependency:** `size_of`/`align_of`/`offset_of` exist today only as
 *C-deferred* intrinsics (`sizeof`/`_Alignof`/`offsetof`), so exposing them as comptime
 *values* is genuinely blocked on **L**. That is the *only* real L dependency here —

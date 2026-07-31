@@ -1936,7 +1936,20 @@ impl<'a> Cgen<'a> {
                         }
                         _ => None,
                     };
-                let v = if let Some((elems, repeat)) = arr_init {
+                // A `comptime` block that produced an AGGREGATE needs the same brace
+                // form, for the same reason — and this is the payoff of tier 6: a
+                // lookup table *computed* by the compiler becomes an ordinary static,
+                // indistinguishable from one typed out by hand.
+                let comptime_table = match &ast.expr_at(c.value).kind {
+                    ExprKind::Comptime(_) => match comptime::Interp::new(ast).eval(c.value) {
+                        Ok(comptime::Value::List(items)) => Some(c_comptime_brace(&items)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let v = if let Some(table) = comptime_table {
+                    table
+                } else if let Some((elems, repeat)) = arr_init {
                     let parts: Vec<String> = if let Some(count) = repeat {
                         let one = self.emit_expr(elems[0]);
                         vec![one; self.array_len(count)]
@@ -4083,10 +4096,27 @@ impl<'a> Cgen<'a> {
             // Total, like every cgen path: typeck has already reported an unevaluable
             // block, so this cannot be the first place a user hears about it.
             ExprKind::Comptime(_) => match crate::comptime::Interp::new(ast).eval(id) {
-                Ok(comptime::Value::Int(i)) => i.to_string(),
-                Ok(comptime::Value::Bool(b)) => if b { "true" } else { "false" }.to_string(),
-                Ok(comptime::Value::Str(s)) => format!("JSTR({})", c_string_literal(&s)),
-                Ok(comptime::Value::Unit) | Err(_) => "0".to_string(),
+                // An aggregate fills a fresh array value, exactly as a written
+                // `[a, b, …]` does — the two are indistinguishable in the output.
+                // (At a `const` initializer this path is bypassed for the brace form;
+                // see `consts`, which is what a large lookup table needs.)
+                Ok(comptime::Value::List(items)) => {
+                    let ty = apply_subst(&self.info.type_of(id).clone(), &self.subst);
+                    let aty = match &ty {
+                        Ty::Array { .. } => self.c_type(&ty),
+                        _ => "int".to_string(),
+                    };
+                    let n = self.tmp;
+                    self.tmp += 1;
+                    let mut s = format!("({{ {aty} _cl{n};");
+                    for (i, it) in items.iter().enumerate() {
+                        let _ = write!(s, " _cl{n}.a[{i}] = ({});", c_comptime_scalar(it));
+                    }
+                    let _ = write!(s, " _cl{n}; }})");
+                    s
+                }
+                Ok(v) => c_comptime_scalar(&v),
+                Err(_) => "0".to_string(),
             },
             ExprKind::Float(l) => l.chars().filter(|c| *c != '_').collect(),
             // A string literal is a length-carrying view; `JSTR` snapshots its
@@ -8341,6 +8371,38 @@ fn apply_subst(t: &Ty, subst: &HashMap<String, Ty>) -> Ty {
 }
 
 /// Re-render a Jestyr integer literal as valid C (strip `_`, convert binary).
+/// A scalar comptime value as a C expression.
+///
+/// `Unit` and a nested `List` both render as `0`: neither can appear here in a
+/// well-formed program (typeck refuses a unit-valued block, and a nested aggregate
+/// needs an annotation it cannot have in this position), and cgen stays total rather
+/// than panicking on a program that was already rejected.
+fn c_comptime_scalar(v: &comptime::Value) -> String {
+    match v {
+        comptime::Value::Int(i) => i.to_string(),
+        comptime::Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        comptime::Value::Str(s) => format!("JSTR({})", c_string_literal(s)),
+        comptime::Value::List(_) | comptime::Value::Unit => "0".to_string(),
+    }
+}
+
+/// A comptime aggregate as a C **brace initializer** — `{ { 1, 2, 3 } }`, the outer
+/// pair for the array-wrapper struct and the inner for its `a[]` member.
+///
+/// This is the form a `const` needs: a static initializer may not contain a
+/// statement-expression, so the `({ … })` shape [`c_comptime_scalar`]'s caller builds
+/// for an expression position would be invalid C at file scope.
+fn c_comptime_brace(items: &[comptime::Value]) -> String {
+    let parts: Vec<String> = items
+        .iter()
+        .map(|v| match v {
+            comptime::Value::List(inner) => c_comptime_brace(inner),
+            other => c_comptime_scalar(other),
+        })
+        .collect();
+    format!("{{ {{ {} }} }}", parts.join(", "))
+}
+
 /// Encode a comptime-produced string as a C string literal.
 ///
 /// A `Str` literal written in source is passed through verbatim (`JSTR({l})`) — its

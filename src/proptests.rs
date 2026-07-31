@@ -2855,6 +2855,38 @@ mod comptime_props {
             prop_assert_eq!(eval_block(&cnt), Ok(Value::Int(n as i64)));
         }
 
+        /// **Aggregates round-trip.** For any generated list, `.len` is its length and
+        /// `xs[i]` is the i-th element written — the two operations that make a
+        /// comptime table useful must agree with construction for every shape and size.
+        #[test]
+        fn ctfe_aggregates_round_trip(vals in proptest::collection::vec(-9999i64..9999, 1..12)) {
+            let lit: String =
+                vals.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
+            let n = vals.len();
+            let len_src = format!("const A: i64 = comptime {{ [{lit}].len }}\n");
+            prop_assert_eq!(eval_block(&len_src), Ok(Value::Int(n as i64)));
+            for (i, want) in vals.iter().enumerate() {
+                let src = format!("const A: i64 = comptime {{ [{lit}][{i}] }}\n");
+                prop_assert_eq!(eval_block(&src), Ok(Value::Int(*want)));
+            }
+            // One past the end is an error, never a wrap or a zero.
+            let oob = format!("const A: i64 = comptime {{ [{lit}][{n}] }}\n");
+            prop_assert!(eval_block(&oob).is_err());
+        }
+
+        /// **A repeat count can never outrun the budget.** The fuel is spent per
+        /// element, so any count is either produced or diagnosed — never allocated
+        /// speculatively. Teeth: removing the per-element `spend` hangs this test.
+        #[test]
+        fn ctfe_repeat_counts_are_bounded(n in 0i64..50_000_000) {
+            let src = format!("const A: i64 = comptime {{ [7; {n}].len }}\n");
+            match eval_block(&src) {
+                Ok(Value::Int(got)) => prop_assert_eq!(got, n),
+                Ok(other) => prop_assert!(false, "unexpected {:?}", other),
+                Err(e) => prop_assert!(e.contains("step budget"), "{}", e),
+            }
+        }
+
         /// **Totality on nonsense.** An arbitrary body is refused with a diagnostic or
         /// folded — never a panic and never a hang. The three bounds (fuel, call depth,
         /// const-cycle detection) are what make this true for *every* input, not just
@@ -8367,6 +8399,67 @@ fn main() -> i32 {
         assert!(exe.exists(), "the generated program was not built");
         let r = Command::new(&exe).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&r.stdout).replace("\r\n", "\n"), "10\n10\n10\n");
+    }
+
+    /// **CTFE (workstream G, increment 6) — comptime tables end-to-end.** Aggregate
+    /// comptime values turn CTFE from "compute a number" into "compute a *table*": a
+    /// `const` initialised by a comptime block that yields a list becomes an ordinary
+    /// static lookup table, indistinguishable in the output from one typed out by hand.
+    ///
+    /// The emission detail with teeth: a `const` must be a **brace initializer**, since
+    /// a C static cannot be initialised by a GNU statement-expression — which is the
+    /// shape an expression-position aggregate uses. Both paths are checked here.
+    #[test]
+    fn comptime_tables_become_real_statics() {
+        let dir = std::env::temp_dir().join("jestyr_ctfe_table_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "\
+fn fib(n: i64) -> i64 {
+    if n < 2 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+
+const FIB: [8]i64 = comptime { [fib(0), fib(1), fib(2), fib(3), fib(4), fib(5), fib(6), fib(7)] }
+const ZEROS: [4]i64 = comptime { [0; 4] }
+
+fn main() -> i32 {
+    print_int(FIB[7])
+    print_int(FIB.len as i64)
+    print_int(ZEROS[3])
+    let xs = comptime { [11, 22, 33] }
+    print_int(xs[1] as i64)
+    print_int(comptime { [1, 2, 3][2] } as i64)
+    return 0
+}
+";
+        let f = dir.join("table.jtr");
+        std::fs::write(&f, src).unwrap();
+        let rel = f.to_str().unwrap();
+
+        let prog = crate::module::load(rel);
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "load: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(!td.iter().any(|d| d.is_error()), "typeck rejected a comptime table: {td:?}");
+        let (c_src, _) = crate::cgen::emit(&prog.ast, &info);
+
+        // The table was computed by *this* compiler and is a plain static: the C
+        // compiler is handed the answers, not the recursion that produced them.
+        assert!(
+            c_src.contains("{ { 0, 1, 1, 2, 3, 5, 8, 13 } }"),
+            "the fib table is not a brace initializer:\n{c_src}"
+        );
+        assert!(c_src.contains("{ { 0, 0, 0, 0 } }"), "the repeat table did not fold:\n{c_src}");
+        // A static initializer may not be a statement-expression — if the const path
+        // fell through to `emit_expr`, this would be `({ … })` and gcc would reject it.
+        for line in c_src.lines().filter(|l| l.contains("jestyr_FIB")) {
+            assert!(!line.contains("({"), "a static was initialized by a statement-expression: {line}");
+        }
+
+        let exe = build_exe(rel);
+        let out = Command::new(&exe).output().unwrap();
+        assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"), "13\n8\n0\n22\n3\n");
     }
 
     /// **Doc-comment trivia in-language.** `tokens.collect_docs` recovers exactly the

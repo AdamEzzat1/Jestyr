@@ -1071,6 +1071,34 @@ impl<'a> TypeChecker<'a> {
             Ok(comptime::Value::Int(_)) => Ty::Prim("i32"),
             Ok(comptime::Value::Bool(_)) => Ty::Prim("bool"),
             Ok(comptime::Value::Str(_)) => Ty::Prim("str"),
+            // An aggregate becomes a fixed-size array — the same `Ty` a written
+            // `[a, b, c]` produces, so a comptime table is indistinguishable from a
+            // hand-written one to every later pass.
+            Ok(comptime::Value::List(items)) => {
+                // An annotation wins for the ELEMENT type, exactly as it does for a
+                // written array literal (`var t: [N]u64 = [0; N]` makes the `0` a u64
+                // rather than the default i32). Without one, the first element decides.
+                let elem = match &self.cur_expected {
+                    Some(Ty::Array { elem, .. }) => (**elem).clone(),
+                    _ => match items.first() {
+                        Some(comptime::Value::Int(_)) => Ty::Prim("i32"),
+                        Some(comptime::Value::Bool(_)) => Ty::Prim("bool"),
+                        Some(comptime::Value::Str(_)) => Ty::Prim("str"),
+                        // A nested list, or an empty one with nothing to annotate it:
+                        // there is no rule that would not be a guess.
+                        _ => {
+                            self.error(
+                                span,
+                                "a `comptime` block producing this aggregate needs a type \
+                                 annotation to say what it is"
+                                    .to_string(),
+                            );
+                            return Ty::Error;
+                        }
+                    },
+                };
+                Ty::Array { elem: Box::new(elem), len: items.len() }
+            }
             // A block ending in a binding, or an empty one. Refused rather than typed
             // as unit: a `comptime` block exists to produce a value, and a pure one
             // that produces none is dead code the author did not mean to write.

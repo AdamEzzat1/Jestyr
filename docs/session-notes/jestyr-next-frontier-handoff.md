@@ -28,6 +28,7 @@
 
 | Increment | Commit | What |
 |---|---|---|
+| **G6** aggregate values | *(this run)* | `Value::List` — CTFE goes from "compute a number" to "compute a **table**". Array literals/repeats evaluate; `[i]` and `.len` read. A `const` initialised by a comptime block yielding a list becomes an ordinary **static** (`static const JestyrArr_i64_8 jestyr_FIB = { { 0, 1, 1, 2, 3, 5, 8, 13 } };`) — the C compiler gets the answers, not the recursion. Emission detail with teeth: a static **must** be a brace initializer, since it cannot be initialised by the GNU statement-expression an expression-position aggregate uses; both paths exist and the test asserts no `({` reaches a static. Fuel is spent **per element**, so `[0; 10_000_000_000]` (and the nested `[[0; 100000]; 100000]`, where the *product* blows up) is a diagnostic in microseconds. |
 | **G5** bounded generation | *(this run)* | `jestyrc plan … --emit`. A build script **computes the bytes of a file**; the plan records it by SHA-256, and the driver writes it only on explicit `--emit`. The evaluator gained no new power — it computed a string — so generation is a pure function whose result the *user* places, never an effect a script performs. Reproducible, attestable (hash in the plan), and bounded literally: size-capped, and an absolute or `..` path is **refused, not normalised**. A generated file can be named as a build target, so a program can be computed and compiled in one invocation. |
 | **G4** `build.jestyr` | `29bd2bd` | `src/buildscript.rs` + `jestyrc plan <script> [--build]`. The build described in Jestyr and **evaluated, never run**. The plan is a *pure function of an index* (`const targets` + `fn source(i)`/`fn output(i)`) rather than the imperative `exe(…)`/`test(…)` shape, because that shape needs comptime **effects** — the one thing the ladder exists to forbid. Closes K's last leftover. `Interp::{eval_const, call_fn}` added. `examples/build.jestyr` is the canonical demo (a `.jestyr` extension, so no golden sweeps it). |
 | **G3** reflection | `4a85bc6` | `@type_name` / `@field_count` / `@field_name` / `@field_type` over the **declared shape**, answered by this compiler and folded to literals. |
@@ -46,11 +47,14 @@ when the reference re-sorts its output by content (§2, O1).
 
 ### Findings from the G2–G4 run (read these before continuing CTFE)
 
-1. **`Value::List` — aggregate comptime values — is the single next unlock.** Three
-   separate things want it and nothing else: tier-3 field *iteration*, a tier-4 plan
-   expressed as a target list rather than an index function, and any tier-5 generated
-   data table. It is bounded by the existing fuel budget, so it costs no totality.
-   **Build this before starting tier 5.**
+1. ~~**`Value::List` — aggregate comptime values — is the single next unlock.**~~ —
+   **DONE (G6).** It cost no totality, as predicted, *provided* fuel is spent per
+   element — that one line is what separates a bounded evaluator from one that tries
+   to allocate ten billion values. What it delivered: comptime **tables** as real
+   statics. What it did *not* deliver on its own: tier-3 field iteration still needs
+   comptime-only functions (finding 2), and building a table still means spelling out
+   `[f(0), f(1), …]` because there is no comptime `for` yet — the *values* are
+   computed, the *shape* is not.
 2. **Field iteration is emission-blocked, not L-blocked.** The evaluator can already
    walk a struct by recursion (`if i >= @field_count(T) …`), and that works *inside*
    the interpreter. What stops it end-to-end is that a top-level `fn` is also emitted
@@ -309,9 +313,9 @@ most; L wants G's comptime for layout queries; Q builds on both).
 
 | # | Work | Notes |
 |---|---|---|
-| 1 | `Value::List` — aggregate comptime values | unblocks three separate things at once (finding 1); turns tier 5 into real *table* generation (a `[N]T` static) rather than generation via a source file |
-| 2 | Comptime-only functions | unblocks field *iteration* end-to-end (finding 2) |
-| 3 | **Port mirrors for G2/G3** | the big one — see below |
+| 1 | **Comptime `for`** | the natural partner to G6: today a table's *values* are computed but its *shape* is spelled out (`[f(0), f(1), …]`). Bounded by the same fuel budget — spend per iteration, exactly as `ArrayRepeat` now does |
+| 2 | **Comptime-only functions** | unblocks tier-3 field *iteration* end-to-end (finding 2). Either this or (1) closes the "walk a struct's fields" story |
+| 3 | **Port mirrors for G2/G3/G6** | the big one — see below |
 | 4 | `@size_of`/`@align_of`/`@offset_of` as comptime values | after **L** (finding 3) |
 
 **On the port mirrors (item 3).** Nothing is broken today: G2–G4 changed no emitted C
@@ -362,11 +366,11 @@ memory + `PARALLELISM-HANDOFF.md`).
 **Done:** ~~O1 records~~ (51–52) → ~~O2 doc~~ (53–54) → **workstream O complete** →
 ~~G1 the comptime interpreter~~ (`ebf8397`) → ~~G2 `comptime` blocks~~ (`b063ca4`) →
 ~~G3 reflection~~ (`4a85bc6`) → ~~G4 `build.jestyr`~~ (`29bd2bd`) → ~~G5 bounded
-generation~~ — **the whole CTFE tier ladder (0–5) is done on the reference side**, and
-documented in `docs/ctfe-tiers.md`.
+generation~~ (`bce5456`) → ~~G6 aggregate values / comptime tables~~ — **the CTFE tier
+ladder (0–6) is done on the reference side**, and documented in `docs/ctfe-tiers.md`.
 
-**Next:** `Value::List` (aggregate comptime values — unblocks three things at once) →
-comptime-only functions → the **G2/G3 port mirrors** → L layout 1–3 (opt-in,
+**Next:** a comptime `for` (so a table's *shape* can be computed, not just its values)
+→ comptime-only functions → the **G2/G3/G6 port mirrors** → L layout 1–3 (opt-in,
 byte-identity preserved) → Q SIMD. `@size_of` as a comptime *value* comes after L.
 
 `#line` (§1) is an independent, optional increment — take it whenever the port's `build`
@@ -383,15 +387,16 @@ and its Rust-only tests first, then the mirror, then the corpus file, in that or
 
 ## One-line
 Self-hosting is finished and productized, **workstream O is complete in-language**, and
-**the whole CTFE tier ladder (0–5) is now done on the reference side** — a total
-comptime interpreter that closed a silent zero-length-array miscompile, `comptime { … }`
-in user syntax, reflection over the declared shape in the collision-proof `@`
-namespace, a `build.jestyr` that is *evaluated, never run*, and bounded artifact
-generation. The through-line is that **purity was never traded away to get power**:
-each tier added a capability without giving the evaluator an effect, so determinism and
-reproducibility stayed properties of the design rather than conventions to police. The
-ladder is documented in `docs/ctfe-tiers.md`. What's left is aggregate comptime values
-(which unblocks three things at once), comptime-only functions, the **G2/G3 port
-mirrors**, opt-in memory layout, SIMD, and the optional `#line` port — each landed
+**the CTFE tier ladder (0–6) is now done on the reference side** — a total comptime
+interpreter that closed a silent zero-length-array miscompile, `comptime { … }` in user
+syntax, reflection over the declared shape in the collision-proof `@` namespace, a
+`build.jestyr` that is *evaluated, never run*, bounded artifact generation, and
+aggregate values that make a computed lookup table an ordinary static. The through-line
+is that **purity was never traded away to get power**: each tier added a capability
+without giving the evaluator an effect, so determinism and reproducibility stayed
+properties of the design rather than conventions to police. The ladder is documented in
+`docs/ctfe-tiers.md`. What's left is a comptime `for` (so a table's shape can be
+computed too), comptime-only functions, the **G2/G3/G6 port mirrors**, opt-in memory
+layout, SIMD, and the optional `#line` port — each landed
 increment-by-increment under the two-sided golden discipline with the bootstrap seed
 refreshed at every `examples/std` change.

@@ -50,6 +50,15 @@ pub enum Value {
     Int(i64),
     Bool(bool),
     Str(String),
+    /// An **aggregate** — the value of `[a, b, c]` or `[v; n]` at compile time
+    /// (roadmap G tier 6). This is what turns comptime from "compute a number" into
+    /// "compute a *table*": a `const` initialised by a comptime block yielding a list
+    /// becomes a static lookup table the C compiler never had to be told about.
+    ///
+    /// Bounded like everything else here: producing an element spends a step from the
+    /// fuel budget, so `[0; 10_000_000_000]` is a diagnostic rather than an attempt to
+    /// allocate ten billion values.
+    List(Vec<Value>),
     /// No value — a statement-position `if` with no `else`, or a block that ends
     /// in a binding. Kept as a real value (rather than an error) so the *consumer*
     /// decides whether a missing value is a problem.
@@ -71,6 +80,7 @@ impl Value {
             Value::Int(_) => "an integer",
             Value::Bool(_) => "a bool",
             Value::Str(_) => "a string",
+            Value::List(_) => "a list",
             Value::Unit => "no value",
         }
     }
@@ -217,6 +227,20 @@ impl<'a> Interp<'a> {
         Ok(returned.unwrap_or(out?))
     }
 
+    /// Evaluate a repeat count / length sub-expression to a non-negative integer.
+    /// Unlike [`Self::eval_usize`] this keeps the *current* budget rather than
+    /// starting a fresh one — it runs inside an evaluation already in progress.
+    fn eval_len(&mut self, id: ExprId, env: &mut Env) -> Result<usize, EvalError> {
+        let span = self.ast.expr_at(id).span;
+        let v = self.eval_expr(id, env)?;
+        v.as_usize().ok_or_else(|| {
+            EvalError::new(
+                format!("a repeat count must be a non-negative integer, found {}", v.type_name()),
+                span,
+            )
+        })
+    }
+
     fn spend(&mut self, span: Span) -> Result<(), EvalError> {
         match self.fuel.checked_sub(1) {
             Some(f) => {
@@ -246,6 +270,63 @@ impl<'a> Interp<'a> {
                 None => Err(EvalError::new("malformed character literal", span)),
             },
             ExprKind::Name(n) => self.eval_name(&n.name, span, env),
+            // --- aggregates (tier 6) ---
+            ExprKind::ArrayLit { elems } => {
+                let mut out = Vec::with_capacity(elems.len());
+                for e in elems {
+                    out.push(self.eval_expr(*e, env)?);
+                }
+                Ok(Value::List(out))
+            }
+            ExprKind::ArrayRepeat { value, count } => {
+                let n = self.eval_len(*count, env)?;
+                let v = self.eval_expr(*value, env)?;
+                let mut out = Vec::new();
+                for _ in 0..n {
+                    // A step per element: the fuel budget is what stops a repeat count
+                    // the author did not mean from becoming an allocation.
+                    self.spend(span)?;
+                    out.push(v.clone());
+                }
+                Ok(Value::List(out))
+            }
+            ExprKind::Index { base, index } => {
+                let b = self.eval_expr(*base, env)?;
+                let ispan = self.ast.expr_at(*index).span;
+                let i = self.eval_expr(*index, env)?;
+                let Value::List(items) = b else {
+                    return Err(EvalError::new(
+                        format!("cannot index {} at compile time", b.type_name()),
+                        span,
+                    ));
+                };
+                let Some(ix) = i.as_usize() else {
+                    return Err(EvalError::new(
+                        format!("an index must be a non-negative integer, found {}", i.type_name()),
+                        ispan,
+                    ));
+                };
+                // Out of range is an error, never a clamp or a zero — the same rule as
+                // every other comptime query.
+                items.get(ix).cloned().ok_or_else(|| {
+                    EvalError::new(
+                        format!("index {ix} is out of range for a list of {}", items.len()),
+                        ispan,
+                    )
+                })
+            }
+            // `.len` is the one field a comptime aggregate has. Anything else is a
+            // struct field, which is outside the value domain.
+            ExprKind::Field { base, name } if name.name == "len" => {
+                match self.eval_expr(*base, env)? {
+                    Value::List(items) => Ok(Value::Int(items.len() as i64)),
+                    Value::Str(s) => Ok(Value::Int(s.len() as i64)),
+                    other => Err(EvalError::new(
+                        format!("{} has no `.len` at compile time", other.type_name()),
+                        span,
+                    )),
+                }
+            }
             ExprKind::Unary { op, rhs } => {
                 let v = self.eval_expr(*rhs, env)?;
                 self.eval_unary(*op, v, span)
@@ -362,6 +443,17 @@ impl<'a> Interp<'a> {
         let r = self.eval_expr(rhs, env)?;
         match (&l, &r) {
             (Value::Int(a), Value::Int(b)) => self.int_binop(op, *a, *b, span),
+            // Lists compare structurally. Only equality: an ORDERING on aggregates
+            // would have to invent a rule (lexicographic? by length?), and inventing
+            // a rule is exactly what this evaluator does not do.
+            (Value::List(a), Value::List(b)) => match op {
+                BinOp::Eq => Ok(Value::Bool(a == b)),
+                BinOp::Ne => Ok(Value::Bool(a != b)),
+                _ => Err(EvalError::new(
+                    format!("`{}` does not apply to lists", op_text(op)),
+                    span,
+                )),
+            },
             (Value::Str(a), Value::Str(b)) => match op {
                 BinOp::Add => Ok(Value::Str(format!("{a}{b}"))),
                 BinOp::Eq => Ok(Value::Bool(a == b)),
@@ -953,6 +1045,100 @@ mod tests {
             let id = found.expect("fixture needs a comptime block");
             assert!(Interp::new(&ast).eval(id).is_err(), "should be refused: {src}");
         }
+    }
+
+    // --- tier 6: aggregate comptime values ---
+
+    fn list_of(src: &str) -> Vec<Value> {
+        match eval_last_const(src).expect("should evaluate") {
+            Value::List(v) => v,
+            other => panic!("expected a list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builds_lists_from_both_array_forms() {
+        assert_eq!(
+            list_of("const A: [3]i64 = [1, 2, 3]\n"),
+            vec![Value::Int(1), Value::Int(2), Value::Int(3)]
+        );
+        assert_eq!(list_of("const A: [3]i64 = [7; 3]\n"), vec![Value::Int(7); 3]);
+        // The repeat count is an ordinary comptime expression.
+        assert_eq!(list_of("const N: i64 = 2\nconst A: [2]i64 = [0; N]\n"), vec![Value::Int(0); 2]);
+        // Elements are computed, not just transcribed.
+        assert_eq!(
+            list_of("fn sq(x: i64) -> i64 { return x * x }\nconst A: [3]i64 = [sq(2), sq(3), sq(4)]\n"),
+            vec![Value::Int(4), Value::Int(9), Value::Int(16)]
+        );
+        assert_eq!(list_of("const A: [0]i64 = [1; 0]\n"), vec![]);
+    }
+
+    #[test]
+    fn reads_a_list_by_index_and_length() {
+        let s = "const T: [4]i64 = [10, 20, 30, 40]\n";
+        assert_eq!(int_of(&format!("{s}const A: i64 = T[2]\n")), 30);
+        assert_eq!(int_of(&format!("{s}const A: i64 = T.len\n")), 4);
+        // The index is itself a comptime expression.
+        assert_eq!(int_of(&format!("{s}const I: i64 = 1\nconst A: i64 = T[I + 1]\n")), 30);
+        // Nesting works, because a list is just another value.
+        assert_eq!(int_of("const A: i64 = [[1, 2], [3, 4]][1][0]\n"), 3);
+        // A string has a length too — its bytes.
+        assert_eq!(int_of("const A: i64 = \"abcd\".len\n"), 4);
+    }
+
+    /// The tier-6 payoff: a table *computed* by a comptime function, then read back.
+    #[test]
+    fn a_table_can_be_computed_and_then_indexed() {
+        let src = "\
+fn fib(n: i64) -> i64 {
+    if n < 2 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+const TABLE: [6]i64 = comptime { [fib(0), fib(1), fib(2), fib(3), fib(4), fib(5)] }
+const A: i64 = comptime { TABLE[5] + TABLE.len }
+";
+        assert_eq!(int_of(src), 11); // fib(5) == 5, len == 6
+    }
+
+    #[test]
+    fn lists_compare_structurally_but_do_not_order() {
+        assert_eq!(eval_last_const("const A: bool = [1, 2] == [1, 2]\n").unwrap(), Value::Bool(true));
+        assert_eq!(eval_last_const("const A: bool = [1, 2] == [1, 3]\n").unwrap(), Value::Bool(false));
+        assert_eq!(eval_last_const("const A: bool = [1] != [1, 1]\n").unwrap(), Value::Bool(true));
+        // Ordering would have to invent a rule, so it is refused instead.
+        let e = err_of("const A: bool = [1] < [2]\n");
+        assert!(e.contains("does not apply to lists"), "{e}");
+    }
+
+    #[test]
+    fn an_aggregate_misuse_is_an_error_not_a_default() {
+        // Out of range is not a clamp and not a zero.
+        let e = err_of("const T: [2]i64 = [1, 2]\nconst A: i64 = T[5]\n");
+        assert!(e.contains("out of range"), "{e}");
+        // Indexing a scalar.
+        let e2 = err_of("const A: i64 = 5[0]\n");
+        assert!(e2.contains("cannot index"), "{e2}");
+        // A negative index does not wrap.
+        let e3 = err_of("const T: [2]i64 = [1, 2]\nconst A: i64 = T[0 - 1]\n");
+        assert!(e3.contains("non-negative"), "{e3}");
+        // `.len` is the only field an aggregate has.
+        let e4 = err_of("const T: [2]i64 = [1, 2]\nconst A: i64 = T.nope\n");
+        assert!(!e4.is_empty(), "a bogus field must not evaluate");
+        // A repeat count that is not a count.
+        let e5 = err_of("const A: [2]i64 = [1; true]\n");
+        assert!(e5.contains("repeat count"), "{e5}");
+    }
+
+    /// **Totality over aggregates.** The fuel budget is spent per element, so a repeat
+    /// count nobody meant to write is a diagnostic in microseconds rather than an
+    /// attempt to allocate. Without the per-element `spend` this test hangs the suite.
+    #[test]
+    fn an_enormous_repeat_count_is_bounded_not_allocated() {
+        let e = err_of("const A: [1]i64 = [0; 10000000000]\n");
+        assert!(e.contains("step budget"), "{e}");
+        // And a nested one, where the product is what would blow up.
+        let e2 = err_of("const A: [1]i64 = [[0; 100000]; 100000]\n");
+        assert!(e2.contains("step budget"), "{e2}");
     }
 
     // --- tier 3: reflection over the declared shape ---
