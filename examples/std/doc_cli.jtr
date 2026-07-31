@@ -1,0 +1,62 @@
+// examples/std/doc_cli.jtr — the thin CLI driver for the doc-comment trivia pass (the same
+// library/`_cli` split as parser_cli / typeck_cli / escape_cli). Tokenizes the file, runs
+// `tokens.collect_docs`, and dumps one doc comment per line as the golden's six numbers:
+// kind (0 = outer, 1 = inner), block (0/1), the comment's whole span, then its text span.
+// Spans rather than text keep the dump line-oriented even for multi-line block comments —
+// and pin the exact offsets, which the text alone would not.
+
+import "mem"
+import "intern"
+import "fs"
+import "env"
+import "list"
+import "tokens"
+
+fn main() -> i32 {
+    var a: Allocator = mem.system_allocator()
+    var it: Interner = intern.make(a)
+    let kwcount: i64 = tokens.intern_keywords(it)
+    if env.argc() > 1 {
+        var src: String = fs.read_text(env.argv(1))
+        let sv: str = string_view(src)
+        var toks: List(tokens.Token) = tokens.tokenize(sv, it, kwcount, a)
+        var docs: List(tokens.RawDoc) = tokens.collect_docs(sv, toks, a)
+        var i: usize = 0
+        for i < list.len(tokens.RawDoc, docs) {
+            let d: tokens.RawDoc = list.get(tokens.RawDoc, docs, i)
+            var line: String = string_new()
+            push_num(line, d.kind as i64)
+            string_push(line, " ")
+            if d.block { push_num(line, 1) } else { push_num(line, 0) }
+            string_push(line, " ")
+            push_num(line, d.ss as i64)
+            string_push(line, " ")
+            push_num(line, d.se as i64)
+            string_push(line, " ")
+            push_num(line, d.ts as i64)
+            string_push(line, " ")
+            push_num(line, d.te as i64)
+            print_str(string_view(line))
+            string_free(line)
+            i = i + 1
+        }
+        string_free(src)
+    }
+    return 0
+}
+
+// Append `v`'s decimal digits (non-negative — every value dumped here is an offset or a tag).
+fn push_num(mut sb: String, v: i64) {
+    if v >= 10 { push_num(sb, v / 10) }
+    let d: i64 = v % 10
+    if d == 0 { string_push(sb, "0") }
+    if d == 1 { string_push(sb, "1") }
+    if d == 2 { string_push(sb, "2") }
+    if d == 3 { string_push(sb, "3") }
+    if d == 4 { string_push(sb, "4") }
+    if d == 5 { string_push(sb, "5") }
+    if d == 6 { string_push(sb, "6") }
+    if d == 7 { string_push(sb, "7") }
+    if d == 8 { string_push(sb, "8") }
+    if d == 9 { string_push(sb, "9") }
+}

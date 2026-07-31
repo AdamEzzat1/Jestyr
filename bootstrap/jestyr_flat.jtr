@@ -778,6 +778,123 @@ fn classify_op(read src: str, n: usize, i: usize) -> OpTok {
     return OpTok{ kind: 111, width: 1 }                 // Unknown
 }
 
+// ---- doc-comment trivia (the `jc <file> doc` input) ----
+//
+// One doc comment, mirroring the reference lexer's `RawDoc`. `kind` 0 = OUTER (`///`,
+// `/** … */` — documents the item that FOLLOWS), 1 = INNER (`//!`, `/*! … */` — documents
+// the enclosing module). `(ss, se)` spans the whole comment, marker included — that is what
+// decides which item an outer doc sits immediately above; `(ts, te)` is its text with the
+// 3-byte marker (and, for a terminated block, the closing `*/`) stripped.
+pub struct RawDoc { pub kind: i32, pub block: bool, pub ss: usize, pub se: usize, pub ts: usize, pub te: usize }
+
+// Does `src` carry exactly `lit` at `i`?
+fn starts_at(read src: str, n: usize, i: usize, read lit: str) -> bool {
+    if i + lit.len > n { return false }
+    return str_eq(src[i .. i + lit.len], lit)
+}
+
+// Scan one trivia gap `[from, to)` for doc comments, appending each. The gap holds only
+// whitespace and comments, so this needs none of the string/char-literal handling the
+// tokenizer does. Marker tests are bounded by the whole source (`n`), matching the
+// reference's `rest.starts_with(…)` over `src[pos..end]`.
+fn scan_doc_gap(read src: str, mut out2: List(RawDoc), n: usize, from: usize, to: usize) {
+    var i: usize = from
+    for i < to {
+        if (src[i] as i32) != 47 {                     // not '/': whitespace
+            i = i + 1
+        } else if i + 1 >= to {
+            return
+        } else if (src[i + 1] as i32) == 47 {          // a `//` line comment
+            let start: usize = i
+            var kind: i32 = 0 - 1
+            if starts_at(src, n, i, "//!") {
+                kind = 1
+            } else if starts_at(src, n, i, "///") {
+                if !starts_at(src, n, i, "////") { kind = 0 }   // `////` demotes to plain
+            }
+            var pfx: usize = 2
+            if kind >= 0 { pfx = 3 }
+            i = i + pfx
+            let cs: usize = i
+            for i < to {
+                if (src[i] as i32) == 10 { break }
+                i = i + 1
+            }
+            if kind >= 0 { push(RawDoc, out2, RawDoc{ kind: kind, block: false, ss: start, se: i, ts: cs, te: i }) }
+        } else if (src[i + 1] as i32) == 42 {          // a `/* … */` block comment (nested)
+            let start: usize = i
+            var kind: i32 = 0 - 1
+            if starts_at(src, n, i, "/*!") {
+                kind = 1
+            } else if starts_at(src, n, i, "/**") {
+                if !starts_at(src, n, i, "/**/") {
+                    if !starts_at(src, n, i, "/***") { kind = 0 }   // neither the empty nor `/***`
+                }
+            }
+            i = i + 2
+            var depth: i32 = 1
+            var term: bool = false
+            for i < to {
+                if depth == 0 { break }
+                let e: i32 = src[i] as i32
+                if e == 47 {
+                    if i + 1 < to {
+                        if (src[i + 1] as i32) == 42 { depth = depth + 1  i = i + 2 } else { i = i + 1 }
+                    } else { i = i + 1 }
+                } else if e == 42 {
+                    if i + 1 < to {
+                        if (src[i + 1] as i32) == 47 {
+                            depth = depth - 1
+                            i = i + 2
+                            if depth == 0 { term = true }
+                        } else { i = i + 1 }
+                    } else { i = i + 1 }
+                } else {
+                    i = i + 1
+                }
+            }
+            if kind >= 0 {
+                var ts: usize = start + 3              // past the 3-byte marker
+                if ts > i { ts = i }
+                var te: usize = i
+                if term {
+                    if te >= 2 { te = te - 2 } else { te = 0 }   // back off the closing `*/`
+                }
+                if te < ts { te = ts }
+                push(RawDoc, out2, RawDoc{ kind: kind, block: true, ss: start, se: i, ts: ts, te: te })
+            }
+        } else {
+            return                                     // a real '/' token — never in a gap
+        }
+    }
+}
+
+// Collect `src`'s doc comments, in source order (the reference's
+// `Lexer::tokenize_with_docs` third result). Comments never reach the parser, so they are
+// found by scanning the GAPS between tokens — trivia by construction. That is what lets
+// this be a second, ADDITIVE pass: the golden-pinned `tokenize` stream is untouched.
+pub fn collect_docs(read src: str, read toks: List(Token), read a: Allocator) -> List(RawDoc) {
+    var out2: List(RawDoc) = make__list(RawDoc, a)
+    let n: usize = src.len
+    let tn: usize = len(Token, toks)
+    var pos: usize = 0
+    var k: usize = 0
+    for k <= tn {
+        var gap_end: usize = n                         // past the last token: to end of source
+        if k < tn {
+            let t: Token = get(Token, toks, k)
+            gap_end = t.start
+        }
+        if gap_end > pos { scan_doc_gap(src, out2, n, pos, gap_end) }
+        if k < tn {
+            let t2: Token = get(Token, toks, k)
+            pos = t2.end
+        }
+        k = k + 1
+    }
+    return out2
+}
+
 // Scan `src` into a `List(Token)` — the in-process, random-access token feed the parser
 // consumes. Each token carries its `TokenKind` discriminant and half-open source span;
 // the interner `it` is filled along the way (identifiers, including the lone `_`, are
@@ -19012,11 +19129,17 @@ fn at_const_sig(mut sb: String, read p: Parser, read src: str, read it: ItemData
     at_expr_src(sb, p, src, it.b)
 }
 
-// `doc::fn_guarantees` as direct `  guarantee: …\n` lines, in the reference's fixed
-// order: `@no_panic`, `requires`, `ensures`, param refinements, the error set.
-fn at_guarantees(mut ob: String, read p: Parser, read src: str, read it: ItemData) {
+// `doc::fn_guarantees` — the machine-checked guarantees of `it`, each appended to `gb` as one
+// phrase with its (start, end) span pushed to `gs`, in the reference's fixed order:
+// `@no_panic`, `requires`, `ensures`, param refinements, the error set. The doc generator's
+// **Guarantees** block and attest's manifest share this ONE extractor, so the attested
+// behavioral ABI can never drift from the rendered documentation.
+fn at_guarantee_phrases(mut gb: String, mut gs: List(i32), read p: Parser, read src: str, read it: ItemData) {
     if item_has_attr(p, src, it, "no_panic") {
-        string_push(ob, "  guarantee: `@no_panic` — proven free of faulting operations\n")
+        let q0: i32 = sb_len(gb)
+        string_push(gb, "`@no_panic` — proven free of faulting operations")
+        push(i32, gs, q0)
+        push(i32, gs, sb_len(gb))
     }
     if it.e >= 0 {
         let ec: i32 = get(i32, p.far, it.e as usize)
@@ -19025,9 +19148,12 @@ fn at_guarantees(mut ob: String, read p: Parser, read src: str, read it: ItemDat
         idx = idx + 1
         var i: i32 = 0
         for i < rc {
-            string_push(ob, "  guarantee: `requires ")
-            at_expr_src(ob, p, src, get(i32, p.far, idx as usize))
-            string_push(ob, "`\n")
+            let q1: i32 = sb_len(gb)
+            string_push(gb, "`requires ")
+            at_expr_src(gb, p, src, get(i32, p.far, idx as usize))
+            string_push(gb, "`")
+            push(i32, gs, q1)
+            push(i32, gs, sb_len(gb))
             idx = idx + 1
             i = i + 1
         }
@@ -19035,9 +19161,12 @@ fn at_guarantees(mut ob: String, read p: Parser, read src: str, read it: ItemDat
         idx = idx + 1
         var j: i32 = 0
         for j < sc {
-            string_push(ob, "  guarantee: `ensures ")
-            at_expr_src(ob, p, src, get(i32, p.far, idx as usize))
-            string_push(ob, "`\n")
+            let q2: i32 = sb_len(gb)
+            string_push(gb, "`ensures ")
+            at_expr_src(gb, p, src, get(i32, p.far, idx as usize))
+            string_push(gb, "`")
+            push(i32, gs, q2)
+            push(i32, gs, sb_len(gb))
             idx = idx + 1
             j = j + 1
         }
@@ -19047,21 +19176,43 @@ fn at_guarantees(mut ob: String, read p: Parser, read src: str, read it: ItemDat
         let base: i32 = it.a + k * 7
         let rf: i32 = get(i32, p.iar, (base + 6) as usize)
         if rf >= 0 {
-            string_push(ob, "  guarantee: parameter `")
+            let q3: i32 = sb_len(gb)
+            string_push(gb, "parameter `")
             let ns: i32 = get(i32, p.iar, (base + 2) as usize)
             let ne: i32 = get(i32, p.iar, (base + 3) as usize)
-            string_push(ob, src[ns as usize .. ne as usize])
-            string_push(ob, "` is constrained to `")
-            at_expr_src(ob, p, src, rf)
-            string_push(ob, "`\n")
+            string_push(gb, src[ns as usize .. ne as usize])
+            string_push(gb, "` is constrained to `")
+            at_expr_src(gb, p, src, rf)
+            string_push(gb, "`")
+            push(i32, gs, q3)
+            push(i32, gs, sb_len(gb))
         }
         k = k + 1
     }
     if fn_is_fallible__cgen(p, it) {
-        string_push(ob, "  guarantee: may fail with `!{ ")
-        at_errnames(ob, p, src, it.e)
-        string_push(ob, " }`\n")
+        let q4: i32 = sb_len(gb)
+        string_push(gb, "may fail with `!{ ")
+        at_errnames(gb, p, src, it.e)
+        string_push(gb, " }`")
+        push(i32, gs, q4)
+        push(i32, gs, sb_len(gb))
     }
+}
+
+// The manifest's rendering of those phrases: one `  guarantee: <phrase>\n` line each.
+fn at_guarantees(mut ob: String, read p: Parser, read src: str, read it: ItemData, read a: Allocator) {
+    var gb: String = string_new()
+    var gs: List(i32) = make__list(i32, a)
+    at_guarantee_phrases(gb, gs, p, src, it)
+    let gv: str = string_view(gb)
+    var i: usize = 0
+    for i < len(i32, gs) / 2 {
+        string_push(ob, "  guarantee: ")
+        string_push(ob, gv[get(i32, gs, i * 2) as usize .. get(i32, gs, i * 2 + 1) as usize])
+        string_push(ob, "\n")
+        i = i + 1
+    }
+    string_free(gb)
 }
 
 // The manifest kind tag of a top-level item, or "" if it isn't attested (trait/impl/
@@ -19139,7 +19290,719 @@ fn at_records(mut ob: String, read p: Parser, read src: str, read a: Allocator) 
             string_push(ob, src[it.x as usize .. it.y as usize])
         }
         string_push(ob, "\n")
-        if it.kind == 3 { at_guarantees(ob, p, src, it) }
+        if it.kind == 3 { at_guarantees(ob, p, src, it, a) }
+        i = i + 1
+    }
+}
+
+// ---- `jc <file> doc` — the documentation generator ----
+//
+// Mirrors `src/doc.rs`. Three stages: group the raw `///` / `/** */` trivia into BLOCKS
+// (consecutive line docs merge; each block comment stands alone), collect the documentable
+// TARGETS from the AST — reusing the `at_*` signature and guarantee renderers attest uses, so
+// the prose and the proven facts can never drift apart — then attach each block to the item it
+// sits above and render Markdown. The design rule the output enforces: a `///` line is PROSE,
+// an `ensures` clause is a GUARANTEE the compiler proved; they are rendered side by side and
+// labelled, never mixed.
+
+// `doc::struct_sig` — the surface form, one field per line. NOTE the reference prints the word
+// `struct` for a `record`/`union` too (it does not re-derive the keyword), and shows only
+// fields, never methods.
+fn at_struct_sig(mut sb: String, read p: Parser, read src: str, read it: ItemData) {
+    if it.is_pub != 0 { string_push(sb, "pub ") }
+    string_push(sb, "struct ")
+    string_push(sb, src[it.x as usize .. it.y as usize])
+    var cnt: i32 = 0
+    var m: i32 = 0
+    for m < it.b {
+        if get(i32, p.mar, (it.a + m * 10) as usize) == 0 { cnt = cnt + 1 }
+        m = m + 1
+    }
+    if cnt == 0 {
+        string_push(sb, " {}")
+        return
+    }
+    string_push(sb, " {\n")
+    var done: i32 = 0
+    var k: i32 = 0
+    for k < it.b {
+        let base: i32 = it.a + k * 10
+        if get(i32, p.mar, base as usize) == 0 {          // tag 0 = a field
+            if done > 0 { string_push(sb, ",\n") }
+            string_push(sb, "    ")
+            string_push(sb, src[get(i32, p.mar, (base + 2) as usize) as usize .. get(i32, p.mar, (base + 3) as usize) as usize])
+            string_push(sb, ": ")
+            if field_has_attr(p, src, base, "volatile") { string_push(sb, "@volatile ") }
+            at_ty(sb, p, src, get(i32, p.mar, (base + 4) as usize))
+            done = done + 1
+        }
+        k = k + 1
+    }
+    string_push(sb, "\n}")
+}
+
+// `doc::enum_sig` — one variant per line, each with its named payload fields.
+fn at_enum_sig(mut sb: String, read p: Parser, read src: str, read it: ItemData) {
+    if it.is_pub != 0 { string_push(sb, "pub ") }
+    string_push(sb, "enum ")
+    string_push(sb, src[it.x as usize .. it.y as usize])
+    if it.z == 0 {
+        string_push(sb, " {}")
+        return
+    }
+    string_push(sb, " {\n")
+    var k: i32 = 0
+    for k < it.z {
+        if k > 0 { string_push(sb, ",\n") }
+        let vb: i32 = it.b + k * 5
+        string_push(sb, "    ")
+        string_push(sb, src[get(i32, p.ear, vb as usize) as usize .. get(i32, p.ear, (vb + 1) as usize) as usize])
+        let fc: i32 = get(i32, p.ear, (vb + 3) as usize)
+        if fc > 0 {
+            let fs: i32 = get(i32, p.ear, (vb + 2) as usize)
+            string_push(sb, "(")
+            var f: i32 = 0
+            for f < fc {
+                if f > 0 { string_push(sb, ", ") }
+                let fb: i32 = fs + f * 3
+                string_push(sb, src[get(i32, p.ear, fb as usize) as usize .. get(i32, p.ear, (fb + 1) as usize) as usize])
+                string_push(sb, ": ")
+                at_ty(sb, p, src, get(i32, p.ear, (fb + 2) as usize))
+                f = f + 1
+            }
+            string_push(sb, ")")
+        }
+        k = k + 1
+    }
+    string_push(sb, "\n}")
+}
+
+// ASCII whitespace (the reference trims `char::is_whitespace`; doc prose outside the ASCII
+// range would differ, which no corpus file exercises).
+fn dc_is_ws(c: i32) -> bool {
+    if c == 32 { return true }
+    if c == 9 { return true }
+    if c == 10 { return true }
+    if c == 13 { return true }
+    if c == 11 { return true }
+    if c == 12 { return true }
+    return false
+}
+// The end offset of `s` with trailing whitespace removed (`trim_end`).
+fn dc_tend(read s: str) -> usize {
+    var e: usize = s.len
+    for e > 0 {
+        if !dc_is_ws(s[e - 1] as i32) { break }
+        e = e - 1
+    }
+    return e
+}
+// The start offset of `s` with leading whitespace removed (`trim_start`).
+fn dc_tstart(read s: str) -> usize {
+    var b: usize = 0
+    for b < s.len {
+        if !dc_is_ws(s[b] as i32) { break }
+        b = b + 1
+    }
+    return b
+}
+fn dc_blank(read s: str) -> bool { return dc_tstart(s) >= dc_tend(s) }
+
+// Cleaned doc text. `buf` holds the content lines back to back and `ln` their (start, end)
+// spans; `bl` carries one 4-tuple per block — [line_start, line_count, span_start, span_end],
+// the spans being SOURCE offsets, which is what decides the item a block sits above.
+struct Db { buf: String, ln: List(i32), bl: List(i32) }
+
+fn db_line(mut d: Db, read s: str) {
+    let s0: i32 = sb_len(d.buf)
+    string_push(d.buf, s)
+    push(i32, d.ln, s0)
+    push(i32, d.ln, sb_len(d.buf))
+}
+
+// Append `rd`'s content lines with markers and margins stripped (`clean_lines`), returning how
+// many were added. A line doc yields exactly one; a block doc yields one per source line,
+// honouring a Javadoc `*` margin — otherwise the line is kept verbatim so indented example
+// code survives — with leading and trailing blank lines dropped.
+fn db_clean(mut d: Db, read src: str, read rd: RawDoc, read a: Allocator) -> i32 {
+    let text: str = src[rd.ts .. rd.te]
+    if !rd.block {
+        let e: usize = dc_tend(text)
+        var b: usize = 0
+        if e > 0 {
+            if (text[0] as i32) == 32 { b = 1 }                // strip_one_space
+        }
+        db_line(d, text[b .. e])
+        return 1
+    }
+    var t: Db = Db{ buf: string_new(), ln: make__list(i32, a), bl: make__list(i32, a) }
+    var ls: usize = 0
+    for ls <= text.len {
+        var le: usize = ls
+        for le < text.len {
+            if (text[le] as i32) == 10 { break }
+            le = le + 1
+        }
+        let line: str = text[ls .. le]
+        let e2: usize = dc_tend(line)
+        let b2: usize = dc_tstart(line)
+        var margin: bool = false
+        if b2 < e2 {
+            if (line[b2] as i32) == 42 {                       // a `*` margin
+                var rb: usize = b2 + 1
+                if rb < e2 {
+                    if (line[rb] as i32) == 32 { rb = rb + 1 }
+                }
+                db_line(t, line[rb .. e2])
+                margin = true
+            }
+        }
+        if !margin { db_line(t, line[0 .. e2]) }
+        if le >= text.len { break }
+        ls = le + 1
+    }
+    let tv: str = string_view(t.buf)
+    var first: usize = 0
+    var last: usize = len(i32, t.ln) / 2
+    for first < last {
+        if !dc_blank(tv[get(i32, t.ln, first * 2) as usize .. get(i32, t.ln, first * 2 + 1) as usize]) { break }
+        first = first + 1
+    }
+    for last > first {
+        if !dc_blank(tv[get(i32, t.ln, (last - 1) * 2) as usize .. get(i32, t.ln, (last - 1) * 2 + 1) as usize]) { break }
+        last = last - 1
+    }
+    var i: usize = first
+    for i < last {
+        db_line(d, tv[get(i32, t.ln, i * 2) as usize .. get(i32, t.ln, i * 2 + 1) as usize])
+        i = i + 1
+    }
+    string_free(t.buf)
+    return (last - first) as i32
+}
+
+// Two line docs belong to one block when only whitespace — and at most one newline —
+// separates them, so a blank line starts a fresh block (`contiguous`).
+fn dc_contiguous(read src: str, lo: usize, hi: usize) -> bool {
+    if hi < lo { return false }
+    var nl: i32 = 0
+    var i: usize = lo
+    for i < hi {
+        let c: i32 = src[i] as i32
+        if !dc_is_ws(c) { return false }
+        if c == 10 { nl = nl + 1 }
+        i = i + 1
+    }
+    return nl <= 1
+}
+
+fn db_push_block(mut d: Db, lstart: i32, lcount: i32, ss: i32, se: i32) {
+    push(i32, d.bl, lstart)
+    push(i32, d.bl, lcount)
+    push(i32, d.bl, ss)
+    push(i32, d.bl, se)
+}
+
+// Group the doc comments of one kind (0 = outer, 1 = inner) into blocks, in source order
+// (`doc::group`).
+fn db_group(mut d: Db, read src: str, read docs: List(RawDoc), want: i32, read a: Allocator) {
+    var open: bool = false
+    var lstart: i32 = 0
+    var lcount: i32 = 0
+    var ss: i32 = 0
+    var se: i32 = 0
+    var i: usize = 0
+    for i < len(RawDoc, docs) {
+        let rd: RawDoc = get(RawDoc, docs, i)
+        if rd.kind == want {
+            if rd.block {
+                if open {
+                    db_push_block(d, lstart, lcount, ss, se)
+                    open = false
+                }
+                let s0: i32 = (len(i32, d.ln) / 2) as i32
+                let k: i32 = db_clean(d, src, rd, a)
+                db_push_block(d, s0, k, rd.ss as i32, rd.se as i32)
+            } else {
+                var merge: bool = false
+                if open {
+                    if dc_contiguous(src, se as usize, rd.ss) { merge = true }
+                }
+                if merge {
+                    lcount = lcount + db_clean(d, src, rd, a)
+                    se = rd.se as i32
+                } else {
+                    if open { db_push_block(d, lstart, lcount, ss, se) }
+                    lstart = (len(i32, d.ln) / 2) as i32
+                    lcount = db_clean(d, src, rd, a)
+                    ss = rd.ss as i32
+                    se = rd.se as i32
+                    open = true
+                }
+            }
+        }
+        i = i + 1
+    }
+    if open { db_push_block(d, lstart, lcount, ss, se) }
+}
+
+// Documentable targets (`doc::collect_targets`). `tg` holds one 11-tuple per target:
+// [span_start, kind, name_s, name_e, sig_s, sig_e, parent_s, parent_e, docblk, g_start,
+// g_count] — `kind` 0 fn, 1 extern, 2 enum, 3 const, 4 struct, 5 method, 6 distinct, 7 trait;
+// `sig_*` index `sigbuf`; `parent_*` is the owning struct's NAME span (-1 for a top-level
+// item, matching the reference's by-name method grouping); `docblk` the attached outer block
+// (-1 for none); `g_*` slice `gsp`, whose pairs span `gbuf`.
+struct Tg { sigbuf: String, gbuf: String, tg: List(i32), gsp: List(i32) }
+
+fn tg_push(mut t: Tg, start: i32, kind: i32, ns: i32, ne: i32, ss: i32, se: i32, ps: i32, pe: i32, g0: i32, gc: i32) {
+    push(i32, t.tg, start)
+    push(i32, t.tg, kind)
+    push(i32, t.tg, ns)
+    push(i32, t.tg, ne)
+    push(i32, t.tg, ss)
+    push(i32, t.tg, se)
+    push(i32, t.tg, ps)
+    push(i32, t.tg, pe)
+    push(i32, t.tg, 0 - 1)                                // docblk, filled by the attach pass
+    push(i32, t.tg, g0)
+    push(i32, t.tg, gc)
+}
+
+// A fn or struct-method target: the reconstructed signature plus the proven guarantees.
+fn tg_add_fn(mut t: Tg, read p: Parser, read src: str, read it: ItemData, kind: i32, ps: i32, pe: i32) {
+    let s0: i32 = sb_len(t.sigbuf)
+    at_fn_sig(t.sigbuf, p, src, it)
+    let s1: i32 = sb_len(t.sigbuf)
+    let g0: i32 = (len(i32, t.gsp) / 2) as i32
+    at_guarantee_phrases(t.gbuf, t.gsp, p, src, it)
+    let g1: i32 = (len(i32, t.gsp) / 2) as i32
+    tg_push(t, it.start as i32, kind, it.x, it.y, s0, s1, ps, pe, g0, g1 - g0)
+}
+
+fn dc_targets(mut t: Tg, read p: Parser, read src: str) {
+    var r: i32 = 0
+    for r < len(i32, p.roots) {
+        let iid: i32 = get(i32, p.roots, r)
+        let it: ItemData = get(ItemData, p.it, iid as usize)
+        if it.kind == 3 {
+            tg_add_fn(t, p, src, it, 0, 0 - 1, 0 - 1)
+        } else if it.kind == 8 {
+            let s0: i32 = sb_len(t.sigbuf)
+            at_extern_sig(t.sigbuf, p, src, it)
+            tg_push(t, it.start as i32, 1, it.x, it.y, s0, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+        } else if it.kind == 5 {
+            let s1: i32 = sb_len(t.sigbuf)
+            at_enum_sig(t.sigbuf, p, src, it)
+            tg_push(t, it.start as i32, 2, it.x, it.y, s1, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+        } else if it.kind == 2 {
+            let s2: i32 = sb_len(t.sigbuf)
+            at_const_sig(t.sigbuf, p, src, it)
+            tg_push(t, it.start as i32, 3, it.x, it.y, s2, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+        } else if it.kind == 4 {
+            let s3: i32 = sb_len(t.sigbuf)
+            at_struct_sig(t.sigbuf, p, src, it)
+            tg_push(t, it.start as i32, 4, it.x, it.y, s3, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+            var m: i32 = 0
+            for m < it.b {
+                let base: i32 = it.a + m * 10
+                if get(i32, p.mar, base as usize) == 1 {  // tag 1 = a method
+                    let mid: i32 = get(i32, p.mar, (base + 1) as usize)
+                    let mi: ItemData = get(ItemData, p.it, mid as usize)
+                    tg_add_fn(t, p, src, mi, 5, it.x, it.y)
+                }
+                m = m + 1
+            }
+        } else if it.kind == 1 {
+            let s4: i32 = sb_len(t.sigbuf)
+            if it.is_pub != 0 { string_push(t.sigbuf, "pub ") }
+            string_push(t.sigbuf, "distinct ")
+            string_push(t.sigbuf, src[it.x as usize .. it.y as usize])
+            string_push(t.sigbuf, " = ")
+            at_ty(t.sigbuf, p, src, it.a)
+            tg_push(t, it.start as i32, 6, it.x, it.y, s4, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+        } else if it.kind == 6 {
+            let s5: i32 = sb_len(t.sigbuf)
+            if it.is_pub != 0 { string_push(t.sigbuf, "pub ") }
+            string_push(t.sigbuf, "trait ")
+            string_push(t.sigbuf, src[it.x as usize .. it.y as usize])
+            tg_push(t, it.start as i32, 7, it.x, it.y, s5, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
+        }
+        r = r + 1
+    }
+}
+
+// A parsed doc comment (`ParsedDoc`): `sum` holds the lead summary's line spans and `sec` one
+// 4-tuple per `#`-headed section — [head_s, head_e into `hbuf`, line_start, line_count into
+// `sln`]. Fenced examples are extracted by the reference for future doctests but never
+// rendered, so they are not modelled here; the fence STATE is, because a `#` inside a fence
+// must not open a section.
+struct Pd { sum: List(i32), hbuf: String, sec: List(i32), sln: List(i32) }
+
+// An ATX heading (`# Title` … `###### Title`): a `#` run of 1–6, a space, then non-empty text.
+// Appends the title to `hbuf` and returns true.
+fn dc_heading(mut hbuf: String, read t2: str) -> bool {
+    var h: usize = 0
+    for h < t2.len {
+        if (t2[h] as i32) != 35 { break }
+        h = h + 1
+    }
+    if h < 1 { return false }
+    if h > 6 { return false }
+    if h >= t2.len { return false }
+    if (t2[h] as i32) != 32 { return false }
+    let rest: str = t2[h .. t2.len]
+    let b: usize = dc_tstart(rest)
+    let e: usize = dc_tend(rest)
+    if b >= e { return false }
+    string_push(hbuf, rest[b .. e])
+    return true
+}
+
+fn pd_push_line(mut d: Pd, cur: i32, s: i32, e: i32) {
+    if cur < 0 {
+        push(i32, d.sum, s)
+        push(i32, d.sum, e)
+    } else {
+        push(i32, d.sln, s)
+        push(i32, d.sln, e)
+        set(i32, d.sec, (cur * 4 + 3) as usize, get(i32, d.sec, (cur * 4 + 3) as usize) + 1)
+    }
+}
+
+// Drop leading and trailing blank lines from a span-pair list (`trim_blank`).
+fn pd_trim(mut v: List(i32), read buf: str, from: usize, upto: usize) -> i32 {
+    var first: usize = from
+    var last: usize = upto
+    for first < last {
+        if !dc_blank(buf[get(i32, v, first * 2) as usize .. get(i32, v, first * 2 + 1) as usize]) { break }
+        first = first + 1
+    }
+    for last > first {
+        if !dc_blank(buf[get(i32, v, (last - 1) * 2) as usize .. get(i32, v, (last - 1) * 2 + 1) as usize]) { break }
+        last = last - 1
+    }
+    // Compact the surviving range down to `from` so the caller's slice stays contiguous.
+    var w: usize = from
+    var i: usize = first
+    for i < last {
+        set(i32, v, w * 2, get(i32, v, i * 2))
+        set(i32, v, w * 2 + 1, get(i32, v, i * 2 + 1))
+        w = w + 1
+        i = i + 1
+    }
+    return (w - from) as i32
+}
+
+// Parse one block's lines into a summary plus `#`-headed sections (`parse_doc`).
+fn dc_parse_doc(mut d: Pd, read dbuf: str, read ln: List(i32), lstart: i32, lcount: i32) {
+    var cur: i32 = 0 - 1
+    var fence: bool = false
+    var i: i32 = 0
+    for i < lcount {
+        let s: i32 = get(i32, ln, ((lstart + i) * 2) as usize)
+        let e: i32 = get(i32, ln, ((lstart + i) * 2 + 1) as usize)
+        let line: str = dbuf[s as usize .. e as usize]
+        let b: usize = dc_tstart(line)
+        let tl: str = line[b .. line.len]
+        if starts_with(tl, "```") {
+            if fence { fence = false } else { fence = true }
+            pd_push_line(d, cur, s, e)
+        } else if fence {
+            pd_push_line(d, cur, s, e)
+        } else {
+            let h0: i32 = sb_len(d.hbuf)
+            if dc_heading(d.hbuf, tl) {
+                push(i32, d.sec, h0)
+                push(i32, d.sec, sb_len(d.hbuf))
+                push(i32, d.sec, (len(i32, d.sln) / 2) as i32)
+                push(i32, d.sec, 0)
+                cur = ((len(i32, d.sec) / 4) - 1) as i32
+            } else {
+                pd_push_line(d, cur, s, e)
+            }
+        }
+        i = i + 1
+    }
+    let n: i32 = pd_trim(d.sum, dbuf, 0, len(i32, d.sum) / 2)
+    truncate(i32, d.sum, (n * 2) as usize)
+    var k: i32 = 0
+    for k < (len(i32, d.sec) / 4) as i32 {
+        let ls2: i32 = get(i32, d.sec, (k * 4 + 2) as usize)
+        let lc2: i32 = get(i32, d.sec, (k * 4 + 3) as usize)
+        // Sections are filled in order, so trimming one only shifts its own tail: rewrite the
+        // count and pull the following sections' starts back by the same amount.
+        let kept: i32 = pd_trim(d.sln, dbuf, ls2 as usize, (ls2 + lc2) as usize)
+        set(i32, d.sec, (k * 4 + 3) as usize, kept)
+        let drop2: i32 = lc2 - kept
+        if drop2 > 0 {
+            var j: usize = ((ls2 + kept) * 2) as usize
+            let end2: usize = len(i32, d.sln)
+            for j + (drop2 * 2) as usize < end2 {
+                set(i32, d.sln, j, get(i32, d.sln, j + (drop2 * 2) as usize))
+                j = j + 1
+            }
+            truncate(i32, d.sln, end2 - (drop2 * 2) as usize)
+            var q: i32 = k + 1
+            for q < (len(i32, d.sec) / 4) as i32 {
+                set(i32, d.sec, (q * 4 + 2) as usize, get(i32, d.sec, (q * 4 + 2) as usize) - drop2)
+                q = q + 1
+            }
+        }
+        k = k + 1
+    }
+}
+
+// Render a parsed doc's prose (`emit_doc_md`): the summary, then each section's bold heading
+// and lines, every group joined by newlines and closed by a blank line.
+fn dc_emit_doc(mut sb: String, read d: Pd, read dbuf: str) {
+    let sn: usize = len(i32, d.sum) / 2
+    if sn > 0 {
+        var i: usize = 0
+        for i < sn {
+            if i > 0 { string_push(sb, "\n") }
+            string_push(sb, dbuf[get(i32, d.sum, i * 2) as usize .. get(i32, d.sum, i * 2 + 1) as usize])
+            i = i + 1
+        }
+        string_push(sb, "\n\n")
+    }
+    let hv: str = string_view(d.hbuf)
+    var k: usize = 0
+    for k < len(i32, d.sec) / 4 {
+        string_push(sb, "**")
+        string_push(sb, hv[get(i32, d.sec, k * 4) as usize .. get(i32, d.sec, k * 4 + 1) as usize])
+        string_push(sb, "**\n\n")
+        let ls2: i32 = get(i32, d.sec, k * 4 + 2)
+        let lc2: i32 = get(i32, d.sec, k * 4 + 3)
+        if lc2 > 0 {
+            var j: i32 = 0
+            for j < lc2 {
+                if j > 0 { string_push(sb, "\n") }
+                string_push(sb, dbuf[get(i32, d.sln, ((ls2 + j) * 2) as usize) as usize .. get(i32, d.sln, ((ls2 + j) * 2 + 1) as usize) as usize])
+                j = j + 1
+            }
+            string_push(sb, "\n\n")
+        }
+        k = k + 1
+    }
+}
+
+// One target's Markdown (`emit_target_md`): the `#`-level name, its fenced signature, the
+// prose, then the Guarantees block — labelled so proven facts are never mistaken for prose.
+fn dc_emit_target(mut sb: String, read t: Tg, tb: i32, level: i32, read src: str, read d: Db, read a: Allocator) {
+    var h: i32 = 0
+    for h < level {
+        string_push(sb, "#")
+        h = h + 1
+    }
+    string_push(sb, " `")
+    string_push(sb, src[get(i32, t.tg, (tb + 2) as usize) as usize .. get(i32, t.tg, (tb + 3) as usize) as usize])
+    string_push(sb, "`\n\n```jestyr\n")
+    let sv: str = string_view(t.sigbuf)
+    string_push(sb, sv[get(i32, t.tg, (tb + 4) as usize) as usize .. get(i32, t.tg, (tb + 5) as usize) as usize])
+    string_push(sb, "\n```\n\n")
+    let blk: i32 = get(i32, t.tg, (tb + 8) as usize)
+    if blk >= 0 {
+        var pd: Pd = Pd{ sum: make__list(i32, a), hbuf: string_new(), sec: make__list(i32, a), sln: make__list(i32, a) }
+        dc_parse_doc(pd, string_view(d.buf), d.ln, get(i32, d.bl, (blk * 4) as usize), get(i32, d.bl, (blk * 4 + 1) as usize))
+        dc_emit_doc(sb, pd, string_view(d.buf))
+        string_free(pd.hbuf)
+    }
+    let gc: i32 = get(i32, t.tg, (tb + 10) as usize)
+    if gc > 0 {
+        string_push(sb, "**Guarantees** *(checked by the compiler)*\n\n")
+        let g0: i32 = get(i32, t.tg, (tb + 9) as usize)
+        let gv: str = string_view(t.gbuf)
+        var j: i32 = 0
+        for j < gc {
+            string_push(sb, "- ")
+            string_push(sb, gv[get(i32, t.gsp, ((g0 + j) * 2) as usize) as usize .. get(i32, t.gsp, ((g0 + j) * 2 + 1) as usize) as usize])
+            string_push(sb, "\n")
+            j = j + 1
+        }
+        string_push(sb, "\n")
+    }
+}
+
+// Generate the Markdown page for `src` (`doc::generate` + `render_markdown`). Dangling outer
+// docs — a `///` attached to nothing — are reported on stderr as the lightweight lint the
+// reference also emits; the page itself still renders.
+fn dc_generate(mut sb: String, read p: Parser, read src: str, read docs: List(RawDoc), read title: str, read path: str, read a: Allocator) {
+    var outer: Db = Db{ buf: string_new(), ln: make__list(i32, a), bl: make__list(i32, a) }
+    var inner: Db = Db{ buf: string_new(), ln: make__list(i32, a), bl: make__list(i32, a) }
+    db_group(outer, src, docs, 0, a)
+    db_group(inner, src, docs, 1, a)
+
+    var t: Tg = Tg{ sigbuf: string_new(), gbuf: string_new(), tg: make__list(i32, a), gsp: make__list(i32, a) }
+    dc_targets(t, p, src)
+    let tn: usize = len(i32, t.tg) / 11
+    // Targets in source order (`sort_by_key(span.start)`); collection is already ascending, so
+    // this insertion sort is normally a no-op — it keeps the order guaranteed, not assumed.
+    var i: usize = 1
+    for i < tn {
+        var j: usize = i
+        for j > 0 {
+            if get(i32, t.tg, (j * 11) as usize) >= get(i32, t.tg, ((j - 1) * 11) as usize) { break }
+            var f: usize = 0
+            for f < 11 {
+                let tmp: i32 = get(i32, t.tg, j * 11 + f)
+                set(i32, t.tg, j * 11 + f, get(i32, t.tg, (j - 1) * 11 + f))
+                set(i32, t.tg, (j - 1) * 11 + f, tmp)
+                f = f + 1
+            }
+            j = j - 1
+        }
+        i = i + 1
+    }
+
+    // Attach each outer block to the first target beginning at or after the block's end. When
+    // several land on one target the nearest (largest end) wins — and since blocks come in
+    // source order, that is simply the last one to claim it; the displaced ones dangle.
+    var dangle: List(i32) = make__list(i32, a)
+    var bi: usize = 0
+    for bi < len(i32, outer.bl) / 4 {
+        let bend: i32 = get(i32, outer.bl, bi * 4 + 3)
+        var hit: i32 = 0 - 1
+        var k: usize = 0
+        for k < tn {
+            if get(i32, t.tg, (k * 11) as usize) >= bend {
+                hit = k as i32
+                break
+            }
+            k = k + 1
+        }
+        if hit < 0 {
+            push(i32, dangle, bi as i32)
+        } else {
+            let prev: i32 = get(i32, t.tg, (hit * 11 + 8) as usize)
+            if prev >= 0 { push(i32, dangle, prev) }
+            set(i32, t.tg, (hit * 11 + 8) as usize, bi as i32)
+        }
+        bi = bi + 1
+    }
+
+    string_push(sb, "# ")
+    string_push(sb, title)
+    string_push(sb, "\n\n*Generated by `jestyrc doc`. Signatures and the **Guarantees** blocks are extracted from the source and machine-checked; prose comes from `///` doc comments.*\n\n")
+
+    // The module doc is every inner block, joined by a blank line.
+    if len(i32, inner.bl) > 0 {
+        var mln: List(i32) = make__list(i32, a)
+        var q: usize = 0
+        for q < len(i32, inner.bl) / 4 {
+            if q > 0 {
+                let z: i32 = sb_len(inner.buf)                 // a blank separator line
+                push(i32, mln, z)
+                push(i32, mln, z)
+            }
+            let ls3: i32 = get(i32, inner.bl, q * 4)
+            let lc3: i32 = get(i32, inner.bl, q * 4 + 1)
+            var w: i32 = 0
+            for w < lc3 {
+                push(i32, mln, get(i32, inner.ln, ((ls3 + w) * 2) as usize))
+                push(i32, mln, get(i32, inner.ln, ((ls3 + w) * 2 + 1) as usize))
+                w = w + 1
+            }
+            q = q + 1
+        }
+        var mpd: Pd = Pd{ sum: make__list(i32, a), hbuf: string_new(), sec: make__list(i32, a), sln: make__list(i32, a) }
+        dc_parse_doc(mpd, string_view(inner.buf), mln, 0, (len(i32, mln) / 2) as i32)
+        dc_emit_doc(sb, mpd, string_view(inner.buf))
+        string_free(mpd.hbuf)
+        string_push(sb, "\n---\n\n")
+    }
+
+    var tops: i32 = 0
+    var c0: usize = 0
+    for c0 < tn {
+        if get(i32, t.tg, (c0 * 11 + 6) as usize) < 0 { tops = tops + 1 }
+        c0 = c0 + 1
+    }
+    if tops == 0 {
+        string_push(sb, "*(No documentable items.)*\n")
+        dc_warn_dangling(outer, dangle, src, path)
+        return
+    }
+    string_push(sb, "## API\n\n")
+    var r: usize = 0
+    for r < tn {
+        let tb: i32 = (r * 11) as i32
+        if get(i32, t.tg, (tb + 6) as usize) < 0 {
+            dc_emit_target(sb, t, tb, 3, src, outer, a)
+            if get(i32, t.tg, (tb + 1) as usize) == 4 {   // a struct: gather its methods
+                let nm: str = src[get(i32, t.tg, (tb + 2) as usize) as usize .. get(i32, t.tg, (tb + 3) as usize) as usize]
+                var any: bool = false
+                var m2: usize = 0
+                for m2 < tn {
+                    let mb: i32 = (m2 * 11) as i32
+                    let ps: i32 = get(i32, t.tg, (mb + 6) as usize)
+                    if ps >= 0 {
+                        if str_eq(src[ps as usize .. get(i32, t.tg, (mb + 7) as usize) as usize], nm) { any = true }
+                    }
+                    m2 = m2 + 1
+                }
+                if any {
+                    string_push(sb, "#### Methods of `")
+                    string_push(sb, nm)
+                    string_push(sb, "`\n\n")
+                    var m3: usize = 0
+                    for m3 < tn {
+                        let mb2: i32 = (m3 * 11) as i32
+                        let ps2: i32 = get(i32, t.tg, (mb2 + 6) as usize)
+                        if ps2 >= 0 {
+                            if str_eq(src[ps2 as usize .. get(i32, t.tg, (mb2 + 7) as usize) as usize], nm) {
+                                dc_emit_target(sb, t, mb2, 5, src, outer, a)
+                            }
+                        }
+                        m3 = m3 + 1
+                    }
+                }
+            }
+        }
+        r = r + 1
+    }
+    dc_warn_dangling(outer, dangle, src, path)
+}
+
+// The dangling-doc lint: a `///` attached to nothing, reported at its own location. Advisory —
+// the page still renders and the command still succeeds. (The reference's full diagnostic
+// decoration is not reproduced; the message text and location are.)
+fn dc_warn_dangling(read outer: Db, mut dangle: List(i32), read src: str, read path: str) {
+    var i: usize = 0
+    for i < len(i32, dangle) {
+        var lo: usize = i                                      // selection sort: block order
+        var j: usize = i + 1
+        for j < len(i32, dangle) {
+            if get(i32, dangle, j) < get(i32, dangle, lo) { lo = j }
+            j = j + 1
+        }
+        if lo != i {
+            let tmp: i32 = get(i32, dangle, i)
+            set(i32, dangle, i, get(i32, dangle, lo))
+            set(i32, dangle, lo, tmp)
+        }
+        let bidx: i32 = get(i32, dangle, i)
+        let start: usize = get(i32, outer.bl, (bidx * 4 + 2) as usize) as usize
+        var line: i64 = 1
+        var col: i64 = 1
+        var k: usize = 0
+        for k < start {
+            if (src[k] as i32) == 10 {
+                line = line + 1
+                col = 1
+            } else {
+                col = col + 1
+            }
+            k = k + 1
+        }
+        var b: String = string_new()
+        string_push(b, path)
+        string_push(b, ":")
+        push_uint__cgen(b, line)
+        string_push(b, ":")
+        push_uint__cgen(b, col)
+        string_push(b, ": warning: doc comment (`///`) is not attached to an item")
+        eprint_str(string_view(b))
+        string_free(b)
         i = i + 1
     }
 }
@@ -19870,6 +20733,7 @@ fn main() -> i32 {
         var amode: bool = false
         var vmode: bool = false
         var dmode: bool = false
+        var gmode: bool = false
         if argc() > 2 {
             if str_eq(argv(2), "test") { tmode = true }
             if str_eq(argv(2), "list") { lmode = true }
@@ -19878,6 +20742,7 @@ fn main() -> i32 {
             if str_eq(argv(2), "attest") { amode = true }
             if str_eq(argv(2), "attest-verify") { vmode = true }
             if str_eq(argv(2), "attest-diff") { dmode = true }
+            if str_eq(argv(2), "doc") { gmode = true }
         }
         if dmode {
             // `jc <old> attest-diff <new>` — both arguments are MANIFESTS (no source is
@@ -19944,6 +20809,28 @@ fn main() -> i32 {
         }
         var src: String = read_text(argv(1))
         var p: Parser = parse_source(string_view(src), it, kwcount, a)
+        if gmode {
+            // `jc <file> doc` — the Markdown API page. Single-file like the reference's
+            // `doc::generate` (which re-lexes for the trivia side table), and typeck-free:
+            // every signature and guarantee is reconstructed from the AST alone.
+            let dv: str = string_view(src)
+            var dtoks: List(Token) = tokenize(dv, it, kwcount, a)
+            var ddocs: List(RawDoc) = collect_docs(dv, dtoks, a)
+            let ap: str = argv(1)
+            let dl: usize = path_dir_len(ap)               // the title is the file stem
+            var te: usize = ap.len
+            if te >= 4 {
+                if str_eq(ap[te - 4 .. te], ".jtr") { te = te - 4 }
+            }
+            var dsb: String = string_new()
+            dc_generate(dsb, p, dv, ddocs, ap[dl .. te], ap, a)
+            let dvv: str = string_view(dsb)
+            // The page ends in '\n'; print_str re-adds one, so drop the last byte.
+            if dvv.len > 0 { print_str(dvv[0 .. dvv.len - 1]) }
+            string_free(dsb)
+            string_free(src)
+            return 0
+        }
         var c: Checker = check_parsed(p, string_view(src), a)
         var sb: String = string_new()
         if lmode {

@@ -7785,6 +7785,198 @@ mod c_oracle {
         }
     }
 
+    /// **Doc-comment trivia in-language.** `tokens.collect_docs` recovers exactly the
+    /// reference lexer's `tokenize_with_docs` third result — kind, block-ness, the whole
+    /// comment span, and the text span — over the whole corpus. It finds comments by
+    /// scanning the GAPS between tokens (trivia by construction), which is what lets it be
+    /// a second, additive pass leaving the golden-pinned token stream untouched.
+    #[test]
+    fn jestyr_doc_trivia_matches_reference() {
+        let exe = build_exe("examples/std/doc_cli.jtr");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for dir in ["examples", "examples/std"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("jtr") {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+        files.sort();
+
+        // The corpus is all `///` line docs, so a fixture carries the edge cases: the block
+        // forms, both demotions (`////`, `/***`), the empty `/**/`, a nested plain comment,
+        // a trailing doc with no item after it — and, the load-bearing one for a pass that
+        // scans between tokens, comment markers INSIDE a string literal, which must not be
+        // collected at all.
+        let dir = std::env::temp_dir().join("jestyr_doc_trivia_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture = dir.join("trivia.jtr");
+        std::fs::write(
+            &fixture,
+            r#"//! module doc one
+//! module doc two
+
+/// outer doc for f
+//// demoted: not a doc
+// plain comment
+fn f() -> i32 { return 0 }
+
+/** an outer BLOCK doc
+ * with a javadoc margin
+ */
+fn g() -> i32 { return 1 }
+
+/*! an inner block doc */
+
+/*** demoted block */
+/**/
+/* plain /* nested */ still plain */
+fn h() -> str { return "/// not a doc /* nor this */" }
+
+/// trailing outer doc, attached to nothing
+"#,
+        )
+        .unwrap();
+        files.push(fixture);
+
+        let (mut checked, mut docs_seen, mut blocks_seen) = (0usize, 0usize, 0usize);
+        for p in &files {
+            let f = p.to_str().unwrap();
+            let src = std::fs::read_to_string(p).unwrap();
+            let (_toks, _diags, want) = crate::lexer::Lexer::new(&src).tokenize_with_docs();
+            let out = Command::new(&exe).arg(f).output().unwrap();
+            assert!(out.status.success(), "doc_cli failed on {f}");
+            let got: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .replace("\r\n", "\n")
+                .lines()
+                .map(|s| s.to_string())
+                .collect();
+            assert_eq!(got.len(), want.len(), "{f}: doc-comment COUNT diverged");
+            for (i, w) in want.iter().enumerate() {
+                let n: Vec<usize> = got[i].split(' ').map(|x| x.parse().unwrap()).collect();
+                let kind = if w.kind == crate::doc::DocKind::Inner { 1 } else { 0 };
+                assert_eq!(
+                    (n[0], n[1], n[2], n[3]),
+                    (kind, w.block as usize, w.span.start as usize, w.span.end as usize),
+                    "{f}: doc {i} kind/block/span diverged"
+                );
+                // The reference's `text` IS a slice of the source, so comparing it against
+                // the port's text SPAN pins the content and the exact offsets at once.
+                assert_eq!(&src[n[4]..n[5]], w.text, "{f}: doc {i} text span diverged");
+                docs_seen += 1;
+                blocks_seen += w.block as usize;
+            }
+            // Pin the fixture's shape so it can't silently stop covering the edge cases.
+            if f.ends_with("trivia.jtr") {
+                let kinds: Vec<(usize, bool)> =
+                    want.iter().map(|d| (d.kind == crate::doc::DocKind::Inner) as usize).zip(want.iter().map(|d| d.block)).collect();
+                assert_eq!(
+                    kinds,
+                    vec![(1, false), (1, false), (0, false), (0, true), (1, true), (0, false)],
+                    "fixture no longer covers the demotions / block forms / string-literal case"
+                );
+                assert!(
+                    want.iter().all(|d| !d.text.contains("not a doc")),
+                    "a comment marker inside a string literal was collected as a doc comment"
+                );
+            }
+            checked += 1;
+        }
+        assert!(docs_seen > 40, "corpus should exercise real doc comments, saw {docs_seen}");
+        eprintln!("doc trivia golden: {checked} file(s), {docs_seen} doc comment(s) ({blocks_seen} block form) identical");
+    }
+
+    /// **In-language `doc`.** `jc <file> doc` reproduces `doc::generate(.., html=false)`
+    /// byte-for-byte over the whole corpus: the trivia grouping (contiguous `///` runs merge,
+    /// a blank line splits them, block comments stand alone), the margin/marker cleaning, the
+    /// summary + `#`-section split with fenced code held verbatim, the reconstructed
+    /// signatures for all eight target kinds, struct-method grouping, and the Guarantees
+    /// block — which comes from the SAME extractor attest uses, so prose and proven facts
+    /// cannot drift apart.
+    #[test]
+    fn jestyr_doc_matches_reference() {
+        let jc = build_exe("examples/std/cgen.jtr");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for dir in ["examples", "examples/std"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("jtr") {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+        files.sort();
+        let mut diverged: Vec<String> = Vec::new();
+        let mut with_docs = 0usize;
+        for p in &files {
+            let f = p.to_str().unwrap();
+            let src = std::fs::read_to_string(p).unwrap();
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap();
+            let (want, _notices) = crate::doc::generate(&src, stem, false);
+            let out = Command::new(&jc).args([f, "doc"]).output().unwrap();
+            assert!(out.status.success(), "jc doc failed on {f}");
+            let got = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+            if got != want {
+                let (gl, wl): (Vec<&str>, Vec<&str>) = (got.lines().collect(), want.lines().collect());
+                let at = gl.iter().zip(wl.iter()).position(|(a, b)| a != b);
+                diverged.push(format!(
+                    "{f}: first diff at line {:?}\n  want: {:?}\n  got:  {:?}",
+                    at.map(|i| i + 1),
+                    at.and_then(|i| wl.get(i)),
+                    at.and_then(|i| gl.get(i))
+                ));
+            }
+            if want.contains("### `") {
+                with_docs += 1;
+            }
+        }
+        assert!(diverged.is_empty(), "doc output diverged:\n{}", diverged.join("\n"));
+        assert!(with_docs > 100, "corpus should render real API pages, saw {with_docs}");
+
+        // The dangling-doc lint: a `///` displaced by a nearer block, and one attached to
+        // nothing, are both reported at their own location. (The message text and location are
+        // ported; the reference's snippet decoration is not.)
+        let dir = std::env::temp_dir().join("jestyr_doc_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dangle = dir.join("dangle.jtr");
+        std::fs::write(
+            &dangle,
+            "/// documents f\nfn f() -> i32 { return 0 }\n\n\
+             /// displaced by the nearer block below\n\n\
+             /// the nearest block wins\nfn g() -> i32 { return 1 }\n\n\
+             /// attached to nothing at all\n",
+        )
+        .unwrap();
+        let src = std::fs::read_to_string(&dangle).unwrap();
+        let (want, notices) = crate::doc::generate(&src, "dangle", false);
+        assert_eq!(notices.len(), 2, "fixture should produce exactly two dangling docs");
+        let out = Command::new(&jc).args([dangle.to_str().unwrap(), "doc"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"), want, "dangle page diverged");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let lints: Vec<&str> = stderr.lines().filter(|l| l.contains("not attached to an item")).collect();
+        assert_eq!(lints.len(), 2, "expected two dangling-doc warnings, got: {stderr}");
+        // Each warning must sit at exactly the location the reference diagnostic reports.
+        for (lint, want_d) in lints.iter().zip(notices.iter()) {
+            let upto = &src[..want_d.span.start as usize];
+            let (line, col) = (upto.matches('\n').count() + 1, upto.len() - upto.rfind('\n').map_or(0, |i| i + 1) + 1);
+            assert!(
+                lint.contains(&format!("dangle.jtr:{line}:{col}:")),
+                "warning location diverged (want {line}:{col}): {lint}"
+            );
+        }
+        // The nearest block won, so the displaced one's text must not appear on the page.
+        assert!(want.contains("the nearest block wins"), "nearest block should be attached");
+        assert!(!want.contains("displaced by the nearer block"), "displaced block should not render");
+        eprintln!("doc golden: {} file(s) byte-identical; dangling lint located exactly", files.len());
+    }
+
     /// The two sides of the attest-diff fixture: one API surface, evolved so that every
     /// classifier branch fires — removal (pub and internal), addition, a signature change,
     /// `@no_panic` lost and gained, an error added, `requires` dropped, `ensures` dropped, a
@@ -8072,7 +8264,7 @@ fn main() -> i32 {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr"];
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr"];
 
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free

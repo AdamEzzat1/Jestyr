@@ -120,19 +120,36 @@ is the original plan, kept for its reference pointers:
   list gets the reference's total `(item, verdict, detail)` re-sort at the end — that
   one observation is what makes a map-free port exact.
 
-### O2. `doc` in-language
-`jestyrc doc <file>` renders doc comments + the Guarantees block (`src/doc.rs`,
-`doc::generate(src, title, html)`).
+### O2. `doc` in-language — **DONE (increments 53–54)**
+`jc <file> doc` renders the Markdown API page byte-for-byte identical to
+`doc::generate(src, stem, html=false)` over all 134 corpus files (golden
+`jestyr_doc_matches_reference`), with the dangling-doc lint located exactly.
 
-- **Blocker to clear first: the ported lexer SKIPS comments** (`tokens.jtr`). The Rust
-  lexer gathers `///` / `//!` / `/** */` / `/*! */` as TRIVIA attached to items. Port
-  plan: a comment-COLLECTING pass in `tokens.jtr` (a second `pub fn`, e.g.
-  `collect_doc_comments(src) -> List(Span)+kinds`, so the golden-pinned `tokenize`
-  stays byte-identical — do NOT change the existing token stream), then a `doc.jtr`
-  that pairs trivia with the following item by span order.
-- Reuses O1's `sig`/`guarantees` renderers (build O1 first).
-- **Golden**: text-mode output parity vs `doc::generate` on `docs.jtr` (the corpus file
-  built for exactly this), then the corpus files with doc comments.
+- **The blocker was cleared without touching the token stream.** `tokens.jtr` gained
+  `pub struct RawDoc` + `pub fn collect_docs`, a SECOND pass that finds comments by
+  scanning the **gaps between tokens** — trivia by construction, so it needs none of the
+  string/char-literal handling the tokenizer has, and `tokenize` stays byte-identical.
+  (The load-bearing case: `"/// not a doc /* nor this */"` inside a string literal is
+  never in a gap.) Golden `jestyr_doc_trivia_matches_reference` pins kind, block-ness,
+  the comment span and the text span against `Lexer::tokenize_with_docs` corpus-wide,
+  plus a fixture for both demotions (`////`, `/***`), `/**/`, nested plain comments and
+  a trailing doc. `examples/std/doc_cli.jtr` is its dumper (the `_cli` split again).
+- The renderer lives in cgen.jtr beside attest (`dc_*` + the `at_*` sig renderers),
+  which is what makes the sharing real: **`at_guarantee_phrases` is now the ONE
+  extractor** — attest wraps it as `  guarantee:` lines, doc as the `- ` bullets — so
+  the attested ABI can never drift from the rendered docs, exactly the reference's
+  design. Added for doc: `at_struct_sig` / `at_enum_sig` (note the reference prints
+  `struct` for a `record`/`union` too, and lists fields only, never methods).
+- **Not ported** (deliberate, recorded): `--html` mode; the fenced-`Example` extraction
+  (collected by the reference for future doctests, never rendered in Markdown — the
+  fence STATE is ported, since a `#` inside a fence must not open a section); and the
+  reference's snippet decoration on the dangling-doc warning (its message text and
+  `file:line:col` are ported, the `|`-gutter source excerpt is not). Doc prose using
+  non-ASCII whitespace would trim differently (`char::is_whitespace` vs ASCII).
+- **The trap this increment cost time on:** a struct member's tag-1 (method) tuple holds
+  its fn `ItemId` in slot **1**, not slot 2 (slot 2 is a field's name-span start). Reading
+  the wrong slot indexes the item arena with a source offset — an out-of-bounds read that
+  surfaces only as a bare `Assertion failed!` from the generated C.
 
 ## 3. Group 3 — the three Rust-side workstreams (each multi-week; nothing blocks on them)
 
@@ -188,17 +205,17 @@ memory + `PARALLELISM-HANDOFF.md`).
 
 ## 4. Sequencing (the one-line plan)
 
-**~~O1 records~~ (DONE, 51–52) → O2 doc (small, finishes the tool) → G CTFE increments
-1–4 (biggest unlock; closes K via build.jestyr) → L layout 1–3 (opt-in, byte-identity
-preserved) → Q SIMD.** `#line` (§1) is an independent, optional increment — take it
-whenever the port's `build` C needs to match the reference's, not before. Keep every
-increment two-sided-green: corpus 133 + concat + test-mode + fixpoint + self-build +
+**~~O1 records~~ (DONE, 51–52) → ~~O2 doc~~ (DONE, 53–54) → WORKSTREAM O IS COMPLETE →
+G CTFE increments 1–4 (biggest unlock; closes K via build.jestyr) → L layout 1–3 (opt-in,
+byte-identity preserved) → Q SIMD.** `#line` (§1) is an independent, optional increment —
+take it whenever the port's `build` C needs to match the reference's, not before. Keep
+every increment two-sided-green: corpus 134 + concat + test-mode + fixpoint + self-build +
 refreshed seed.
 
 ## One-line
-Self-hosting is finished and productized, and O1 is done — the ported compiler now emits
-the FULL attestation manifest and the breaking-change diff byte-for-byte; what's left is
-`doc` (needs a trivia-collecting lex pass), the optional `#line` port, and then the three
-reference-side workstreams — CTFE, opt-in memory layout, SIMD — each landed
-increment-by-increment under the two-sided golden discipline with the bootstrap seed
-refreshed at every `examples/std` change.
+Self-hosting is finished and productized and **workstream O is now COMPLETE in-language** —
+the ported compiler emits the full attestation manifest, the breaking-change diff, and the
+documentation page, each byte-for-byte identical to the reference; what's left is the
+optional `#line` port and the three reference-side workstreams — CTFE, opt-in memory
+layout, SIMD — each landed increment-by-increment under the two-sided golden discipline
+with the bootstrap seed refreshed at every `examples/std` change.

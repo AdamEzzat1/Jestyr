@@ -340,6 +340,123 @@ fn classify_op(read src: str, n: usize, i: usize) -> OpTok {
     return OpTok{ kind: 111, width: 1 }                 // Unknown
 }
 
+// ---- doc-comment trivia (the `jc <file> doc` input) ----
+//
+// One doc comment, mirroring the reference lexer's `RawDoc`. `kind` 0 = OUTER (`///`,
+// `/** … */` — documents the item that FOLLOWS), 1 = INNER (`//!`, `/*! … */` — documents
+// the enclosing module). `(ss, se)` spans the whole comment, marker included — that is what
+// decides which item an outer doc sits immediately above; `(ts, te)` is its text with the
+// 3-byte marker (and, for a terminated block, the closing `*/`) stripped.
+pub struct RawDoc { pub kind: i32, pub block: bool, pub ss: usize, pub se: usize, pub ts: usize, pub te: usize }
+
+// Does `src` carry exactly `lit` at `i`?
+fn starts_at(read src: str, n: usize, i: usize, read lit: str) -> bool {
+    if i + lit.len > n { return false }
+    return str_eq(src[i .. i + lit.len], lit)
+}
+
+// Scan one trivia gap `[from, to)` for doc comments, appending each. The gap holds only
+// whitespace and comments, so this needs none of the string/char-literal handling the
+// tokenizer does. Marker tests are bounded by the whole source (`n`), matching the
+// reference's `rest.starts_with(…)` over `src[pos..end]`.
+fn scan_doc_gap(read src: str, mut out2: List(RawDoc), n: usize, from: usize, to: usize) {
+    var i: usize = from
+    for i < to {
+        if (src[i] as i32) != 47 {                     // not '/': whitespace
+            i = i + 1
+        } else if i + 1 >= to {
+            return
+        } else if (src[i + 1] as i32) == 47 {          // a `//` line comment
+            let start: usize = i
+            var kind: i32 = 0 - 1
+            if starts_at(src, n, i, "//!") {
+                kind = 1
+            } else if starts_at(src, n, i, "///") {
+                if !starts_at(src, n, i, "////") { kind = 0 }   // `////` demotes to plain
+            }
+            var pfx: usize = 2
+            if kind >= 0 { pfx = 3 }
+            i = i + pfx
+            let cs: usize = i
+            for i < to {
+                if (src[i] as i32) == 10 { break }
+                i = i + 1
+            }
+            if kind >= 0 { list.push(RawDoc, out2, RawDoc{ kind: kind, block: false, ss: start, se: i, ts: cs, te: i }) }
+        } else if (src[i + 1] as i32) == 42 {          // a `/* … */` block comment (nested)
+            let start: usize = i
+            var kind: i32 = 0 - 1
+            if starts_at(src, n, i, "/*!") {
+                kind = 1
+            } else if starts_at(src, n, i, "/**") {
+                if !starts_at(src, n, i, "/**/") {
+                    if !starts_at(src, n, i, "/***") { kind = 0 }   // neither the empty nor `/***`
+                }
+            }
+            i = i + 2
+            var depth: i32 = 1
+            var term: bool = false
+            for i < to {
+                if depth == 0 { break }
+                let e: i32 = src[i] as i32
+                if e == 47 {
+                    if i + 1 < to {
+                        if (src[i + 1] as i32) == 42 { depth = depth + 1  i = i + 2 } else { i = i + 1 }
+                    } else { i = i + 1 }
+                } else if e == 42 {
+                    if i + 1 < to {
+                        if (src[i + 1] as i32) == 47 {
+                            depth = depth - 1
+                            i = i + 2
+                            if depth == 0 { term = true }
+                        } else { i = i + 1 }
+                    } else { i = i + 1 }
+                } else {
+                    i = i + 1
+                }
+            }
+            if kind >= 0 {
+                var ts: usize = start + 3              // past the 3-byte marker
+                if ts > i { ts = i }
+                var te: usize = i
+                if term {
+                    if te >= 2 { te = te - 2 } else { te = 0 }   // back off the closing `*/`
+                }
+                if te < ts { te = ts }
+                list.push(RawDoc, out2, RawDoc{ kind: kind, block: true, ss: start, se: i, ts: ts, te: te })
+            }
+        } else {
+            return                                     // a real '/' token — never in a gap
+        }
+    }
+}
+
+// Collect `src`'s doc comments, in source order (the reference's
+// `Lexer::tokenize_with_docs` third result). Comments never reach the parser, so they are
+// found by scanning the GAPS between tokens — trivia by construction. That is what lets
+// this be a second, ADDITIVE pass: the golden-pinned `tokenize` stream is untouched.
+pub fn collect_docs(read src: str, read toks: List(Token), read a: Allocator) -> List(RawDoc) {
+    var out2: List(RawDoc) = list.make(RawDoc, a)
+    let n: usize = src.len
+    let tn: usize = list.len(Token, toks)
+    var pos: usize = 0
+    var k: usize = 0
+    for k <= tn {
+        var gap_end: usize = n                         // past the last token: to end of source
+        if k < tn {
+            let t: Token = list.get(Token, toks, k)
+            gap_end = t.start
+        }
+        if gap_end > pos { scan_doc_gap(src, out2, n, pos, gap_end) }
+        if k < tn {
+            let t2: Token = list.get(Token, toks, k)
+            pos = t2.end
+        }
+        k = k + 1
+    }
+    return out2
+}
+
 // Scan `src` into a `List(Token)` — the in-process, random-access token feed the parser
 // consumes. Each token carries its `TokenKind` discriminant and half-open source span;
 // the interner `it` is filled along the way (identifiers, including the lone `_`, are

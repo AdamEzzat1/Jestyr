@@ -98,7 +98,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
 | N | Concurrency polish | ~100% | MED | M | ✓ | — |
-| O | Tooling (fmt / test / doc / LSP) | test-runner ✅, attest ✅, attest --diff ✅ (all three also SELF-HOSTED ✅); `doc` port open; LSP/fmt deferred | LOW | M | ✓✓ | ✓ |
+| O | Tooling (fmt / test / doc / LSP) | test-runner ✅, doc ✅, attest ✅, attest --diff ✅ — **all four also SELF-HOSTED ✅**; LSP/fmt deferred | LOW | M | ✓✓ | ✓ |
 | P | Self-hosting | ✅ COMPLETE — fixed point, driver, in-language modules, bootstrap seed | — | XL | ✓✓ | ✓✓ (the gate) |
 | Q | Parallelism (data-parallel) | ~45% (SOACs + `par for` surface + `@span` cost model ✅) | MED | L | ✓✓ | ✓✓ (cost model) |
 

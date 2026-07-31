@@ -26,6 +26,8 @@ gcc -O2 -std=c11 -ffp-contract=off -fno-fast-math -Wl,--stack,67108864 -o jc.exe
 - `jc file.jtr` — emit C on stdout
 - `jc file.jtr build` / `jc file.jtr run` — compile via gcc (escape-checked, diagnostics on stderr)
 - `jc file.jtr test [substr]` / `jc file.jtr list [substr]` — the `@test`/`@bench` harness
+- `jc file.jtr doc` — the Markdown API page: signatures, `///` prose, and a **Guarantees**
+  block reconstructed from the contracts the compiler proved
 - `jc file.jtr attest` — the attestation manifest (the C's SHA-256, the locked compile
   command, and every item's signature + machine-checked guarantees)
 - `jc old.manifest attest-diff new.manifest` — classify each API change breaking or
