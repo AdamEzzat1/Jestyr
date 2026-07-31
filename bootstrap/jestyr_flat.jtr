@@ -7890,6 +7890,124 @@ pub fn check_program(read p: Parser, read c: Checker, read src: str, read a: All
     return e
 }
 
+// examples/std/sha256.jtr — a dependency-free SHA-256 (FIPS 180-4), written in Jestyr.
+//
+// The in-language half of `jestyr attest`'s hash: `jc <file> attest` commits to the
+// emitted C by this digest, exactly as the Rust reference's `src/sha256.rs` does (the
+// attest header golden pins the two byte-for-byte). Words are carried in `i64` and
+// masked to 32 bits after every add/rotate — identical arithmetic to `u32` wrapping,
+// with no unsigned subtleties. Zero imports; the padded message is read VIRTUALLY
+// (no buffer): byte j is the source byte, the 0x80 terminator, a zero, or one of the
+// eight big-endian bit-length bytes.
+
+const SHA_K: [64]i64 = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+]
+
+fn mask32(x: i64) -> i64 {
+    return x & 4294967295
+}
+
+fn rotr32(x: i64, n: i64) -> i64 {
+    return mask32((x >> n) | (x << (32 - n)))
+}
+
+// Byte `j` of the virtually-padded message (source, 0x80, zeros, 8-byte BE bit length).
+fn pad_byte(read data: str, j: usize, padded: usize) -> i64 {
+    if j < data.len { return data[j] as i64 }
+    if j == data.len { return 128 }
+    if j >= padded - 8 {
+        let bits: i64 = (data.len as i64) * 8
+        let sh: i64 = ((padded - 1 - j) as i64) * 8
+        return (bits >> sh) & 255
+    }
+    return 0
+}
+
+fn push_hex8(mut sb: String, x: i64) {
+    let digits: str = "0123456789abcdef"
+    var sh: i64 = 28
+    for sh >= 0 {
+        let d: i64 = (x >> sh) & 15
+        string_push(sb, digits[d as usize .. (d + 1) as usize])
+        sh = sh - 4
+    }
+}
+
+// Append the lowercase-hex SHA-256 digest of `data` (64 ASCII chars) to `sb`.
+pub fn push_sha256_hex(mut sb: String, read data: str) {
+    var h: [8]i64 = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
+    let rem: usize = (data.len + 1) % 64
+    var pad: usize = 0
+    if rem <= 56 { pad = 56 - rem } else { pad = 120 - rem }
+    let padded: usize = data.len + 1 + pad + 8
+    var w: [64]i64 = [0; 64]
+    var blk: usize = 0
+    for blk < padded / 64 {
+        let base: usize = blk * 64
+        var i: usize = 0
+        for i < 16 {
+            let o: usize = base + i * 4
+            w[i] = (pad_byte(data, o, padded) << 24) | (pad_byte(data, o + 1, padded) << 16) | (pad_byte(data, o + 2, padded) << 8) | pad_byte(data, o + 3, padded)
+            i = i + 1
+        }
+        var i2: usize = 16
+        for i2 < 64 {
+            let s0: i64 = rotr32(w[i2 - 15], 7) ^ rotr32(w[i2 - 15], 18) ^ (w[i2 - 15] >> 3)
+            let s1: i64 = rotr32(w[i2 - 2], 17) ^ rotr32(w[i2 - 2], 19) ^ (w[i2 - 2] >> 10)
+            w[i2] = mask32(w[i2 - 16] + s0 + w[i2 - 7] + s1)
+            i2 = i2 + 1
+        }
+        var a: i64 = h[0]
+        var b: i64 = h[1]
+        var c: i64 = h[2]
+        var d: i64 = h[3]
+        var e: i64 = h[4]
+        var f: i64 = h[5]
+        var g: i64 = h[6]
+        var hh: i64 = h[7]
+        var r: usize = 0
+        for r < 64 {
+            let bs1: i64 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)
+            let ch: i64 = (e & f) ^ (mask32(~e) & g)
+            let t1: i64 = mask32(hh + bs1 + ch + SHA_K[r] + w[r])
+            let bs0: i64 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)
+            let mj: i64 = (a & b) ^ (a & c) ^ (b & c)
+            let t2: i64 = mask32(bs0 + mj)
+            hh = g
+            g = f
+            f = e
+            e = mask32(d + t1)
+            d = c
+            c = b
+            b = a
+            a = mask32(t1 + t2)
+            r = r + 1
+        }
+        h[0] = mask32(h[0] + a)
+        h[1] = mask32(h[1] + b)
+        h[2] = mask32(h[2] + c)
+        h[3] = mask32(h[3] + d)
+        h[4] = mask32(h[4] + e)
+        h[5] = mask32(h[5] + f)
+        h[6] = mask32(h[6] + g)
+        h[7] = mask32(h[7] + hh)
+        blk = blk + 1
+    }
+    var k: usize = 0
+    for k < 8 {
+        push_hex8(sb, h[k])
+        k = k + 1
+    }
+}
+
 // examples/std/cgen.jtr — the P5 C backend, written *in Jestyr*. It imports the P2 parser (AST)
 // and the P3 typeck (per-expr types + resolution records), then lowers the program to C —
 // aiming to be **byte-identical** to the Rust reference `src/cgen.rs` (`cgen::emit`). This is the
@@ -18154,7 +18272,7 @@ fn emit_program(mut sb: String, read p: Parser, read c: Checker, read src: str, 
 // stem_s, stem_e, path_s, path_e into `nb`; src_s, src_e into `allsrc`); `vis` marks resolved
 // paths (memoization + cycle guard); `seen` records first declarations as `|name=stem|`;
 // `ren` records collisions as `|stem:name|` (the renamed form is always `name__stem`).
-struct Ml { allsrc: String, nb: String, mods: List(i32), vis: String, seen: String, ren: String, err: bool }
+struct Ml { allsrc: String, nb: String, mods: List(i32), vis: String, seen: String, ren: String, map: List(i32), err: bool }
 
 // The directory prefix length of `path` (through the last '/' or '\\'), 0 for a bare name.
 fn path_dir_len(read path: str) -> usize {
@@ -18398,7 +18516,12 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
         i = i + 1
     }
     let stem: str = string_view(stemb)
+    let src_s: usize = get(i32, m.mods, b + 4) as usize
     var cur: usize = 0                                // source cursor: copy gaps, apply edits
+    // (merged_pos, allsrc_pos) checkpoints: between edits the text is copied verbatim, so a
+    // merged span maps back EXACTLY to its original file offset — the `#line` analogue.
+    push(i32, m.map, sb_len(sb2))
+    push(i32, m.map, src_s as i32)
     i = 0
     for i < n {
         let t: Token = get(Token, tk, i)
@@ -18425,6 +18548,8 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
                 if (src[skip] as i32) == 10 { skip = skip + 1 }
             }
             cur = skip
+            push(i32, m.map, sb_len(sb2))
+            push(i32, m.map, (src_s + cur) as i32)
             i = last + 1
             continue
         }
@@ -18466,6 +18591,8 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
                         string_push(sb2, string_view(tstem))
                     }
                     cur = x.end
+                    push(i32, m.map, sb_len(sb2))
+                    push(i32, m.map, (src_s + cur) as i32)
                     string_free(tstem)
                     i = i + 3
                     continue
@@ -18478,6 +18605,8 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
                     string_push(sb2, "__")
                     string_push(sb2, stem)
                     cur = t.end
+                    push(i32, m.map, sb_len(sb2))
+                    push(i32, m.map, (src_s + cur) as i32)
                 }
             }
         }
@@ -18494,8 +18623,7 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
 
 // Load + flatten the import closure rooted at `root` into one single-file program. Returns
 // the merged source; empty on a load failure (already reported to stderr).
-fn ml_flatten(read root: str, mut it: Interner, kwcount: i64, read a: Allocator) -> String {
-    var m: Ml = Ml{ allsrc: string_new(), nb: string_new(), mods: make__list(i32, a), vis: string_new(), seen: string_new(), ren: string_new(), err: false }
+fn ml_flatten(mut m: Ml, read root: str, mut it: Interner, kwcount: i64, read a: Allocator) -> String {
     ml_load(m, root, it, kwcount, a)
     var merged: String = string_new()
     if !m.err {
@@ -18511,11 +18639,8 @@ fn ml_flatten(read root: str, mut it: Interner, kwcount: i64, read a: Allocator)
             mj = mj + 1
         }
     }
-    string_free(m.allsrc)
-    string_free(m.nb)
-    string_free(m.vis)
-    string_free(m.seen)
-    string_free(m.ren)
+    string_free(m.vis)                                // allsrc/nb/mods/map stay alive: the
+    string_free(m.seen)                               // driver renders diagnostics through them
     return merged
 }
 
@@ -18524,25 +18649,63 @@ fn ml_flatten(read root: str, mut it: Interner, kwcount: i64, read a: Allocator)
 // unconditionally), the product modes GATE on the escape checker's buffered diagnostics,
 // render them `path:line:col: error: <msg>` on stderr, write `<stem>.c`, drive gcc with
 // the locked flag set via `run_command`, and (for `run`) execute the produced binary,
-// forwarding its exit code. Parse/typeck refusal is a follow-up (those ported passes do
-// not surface message diagnostics yet); imports still need the module story.
+// forwarding its exit code. Parse and typeck refusal use the recovery artifacts (Error
+// nodes / Error types) with generic v1 messages at exact mapped locations; the reference's
+// expected/found message text is a follow-up.
 
-// One diagnostic line on stderr: 1-based line/col scanned from the span start.
-fn eprint_diag(read path: str, read src: str, start: usize, read msg: str) {
+// One diagnostic on stderr, attributed to its OWNING FILE — the `#line` analogue. A merged
+// span maps back through the rewrite checkpoints (last checkpoint at or before the span;
+// verbatim in between), then the owning module is found by its `allsrc` range and 1-based
+// line/col are counted in that module's ORIGINAL source.
+fn eprint_diag(mut m: Ml, start: usize, read msg: str) {
+    var cm: i32 = 0 - 1                               // best checkpoint (merged, allsrc)
+    var co: i32 = 0 - 1
+    var i: usize = 0
+    for i < len(i32, m.map) / 2 {
+        let mp: i32 = get(i32, m.map, i * 2)
+        if mp as usize <= start {
+            cm = mp
+            co = get(i32, m.map, i * 2 + 1)
+        }
+        i = i + 1
+    }
+    var b: String = string_new()
+    if cm < 0 {                                       // no mapping (shouldn't happen): raw offset
+        string_push(b, "<merged>:")
+        push_uint__cgen(b, start as i64)
+        string_push(b, ": error: ")
+        string_push(b, msg)
+        eprint_str(string_view(b))
+        string_free(b)
+        return
+    }
+    let orig: usize = (co as usize) + (start - (cm as usize))
+    var found: i32 = 0 - 1                            // the module owning `orig`
+    var mi: usize = 0
+    for mi < len(i32, m.mods) / 6 {
+        let ss: i32 = get(i32, m.mods, mi * 6 + 4)
+        let se: i32 = get(i32, m.mods, mi * 6 + 5)
+        if orig >= ss as usize and orig <= se as usize { found = mi as i32 }
+        mi = mi + 1
+    }
+    if found < 0 { found = 0 }
+    let mb: usize = (found as usize) * 6
+    let all: str = string_view(m.allsrc)
+    let ss2: usize = get(i32, m.mods, mb + 4) as usize
     var line: i64 = 1
     var col: i64 = 1
-    var i: usize = 0
-    for i < start {
-        if (src[i] as i32) == 10 {
+    var k: usize = ss2
+    for k < orig {
+        if (all[k] as i32) == 10 {
             line = line + 1
             col = 1
         } else {
             col = col + 1
         }
-        i = i + 1
+        k = k + 1
     }
-    var b: String = string_new()
-    string_push(b, path)
+    let nbv: str = string_view(m.nb)
+    string_push(b, nbv[get(i32, m.mods, mb + 2) as usize .. get(i32, m.mods, mb + 3) as usize])
     string_push(b, ":")
     push_uint__cgen(b, line)
     string_push(b, ":")
@@ -18555,7 +18718,43 @@ fn eprint_diag(read path: str, read src: str, start: usize, read msg: str) {
 
 // The `build`/`run` modes: 1 on diagnostics or a write failure, gcc's code on a failed
 // compile, the program's own exit code for `run`, else 0.
-fn driver_build(read p: Parser, read c: Checker, read src: str, read a: Allocator, read path: str, do_run: bool) -> i32 {
+fn driver_build(mut m: Ml, read p: Parser, read c: Checker, read src: str, read a: Allocator, read path: str, do_run: bool) -> i32 {
+    // Parse refusal: any Error expr (kind 9) or Error item (kind 99) — the ported parser's
+    // recovery artifacts. v1 messages are generic (the reference's expected/found text is a
+    // follow-up); the LOCATION is exact via the checkpoint mapper.
+    var pi2: usize = 0
+    for pi2 < len(ExprData, p.ex) {
+        let pe: ExprData = get(ExprData, p.ex, pi2)
+        if pe.kind == 9 {
+            eprint_diag(m, pe.start, "syntax error (unexpected or malformed input)")
+            return 1
+        }
+        pi2 = pi2 + 1
+    }
+    var pj: usize = 0
+    for pj < len(ItemData, p.it) {
+        let itd: ItemData = get(ItemData, p.it, pj)
+        if itd.kind == 99 {
+            eprint_diag(m, itd.start, "syntax error: expected an item")
+            return 1
+        }
+        pj = pj + 1
+    }
+    // Type refusal: any expression the checker resolved to the Error type (kind 16 — a real
+    // mismatch, e.g. an operator with no impl; degenerate Unknowns never refuse).
+    var ti2: usize = 0
+    for ti2 < len(i32, c.et) {
+        let tid2: i32 = get(i32, c.et, ti2)
+        if tid2 >= 0 {
+            let td2: TyData = get(TyData, c.tys, tid2 as usize)
+            if td2.kind == 16 {
+                let ed2: ExprData = get(ExprData, p.ex, ti2)
+                eprint_diag(m, ed2.start, "type error at this expression")
+                return 1
+            }
+        }
+        ti2 = ti2 + 1
+    }
     var e: Esc = check_program(p, c, src, a)
     if len(i32, e.dsp) > 0 {                     // refuse to emit on escape diagnostics
         let dm: str = string_view(e.dmsg)
@@ -18564,7 +18763,7 @@ fn driver_build(read p: Parser, read c: Checker, read src: str, read a: Allocato
         var k: usize = 0
         for k < dm.len {
             if (dm[k] as i32) == 10 {
-                eprint_diag(path, src, get(i32, e.dsp, di * 2) as usize, dm[ls .. k])
+                eprint_diag(m, get(i32, e.dsp, di * 2) as usize, dm[ls .. k])
                 di = di + 1
                 ls = k + 1
             }
@@ -18627,19 +18826,22 @@ fn main() -> i32 {
         var lmode: bool = false
         var bmode: bool = false
         var rmode: bool = false
+        var amode: bool = false
         if argc() > 2 {
             if str_eq(argv(2), "test") { tmode = true }
             if str_eq(argv(2), "list") { lmode = true }
             if str_eq(argv(2), "build") { bmode = true }
             if str_eq(argv(2), "run") { rmode = true }
+            if str_eq(argv(2), "attest") { amode = true }
         }
-        if bmode or rmode {
+        if bmode or rmode or amode {
             // The product modes go through the module loader: the import closure flattens
             // into one single-file program (the loader's own one-translation-unit model),
             // then the ordinary pipeline runs on the merged source. An importless file
             // merges to itself. NOTE: diagnostics currently render against the MERGED
             // buffer (per-file attribution is a follow-up).
-            var merged: String = ml_flatten(argv(1), it, kwcount, a)
+            var m: Ml = Ml{ allsrc: string_new(), nb: string_new(), mods: make__list(i32, a), vis: string_new(), seen: string_new(), ren: string_new(), map: make__list(i32, a), err: false }
+            var merged: String = ml_flatten(m, argv(1), it, kwcount, a)
             let mv: str = string_view(merged)
             if mv.len == 0 {
                 string_free(merged)
@@ -18647,7 +18849,26 @@ fn main() -> i32 {
             }
             var p2: Parser = parse_source(mv, it, kwcount, a)
             var c2: Checker = check_parsed(p2, mv, a)
-            let drc: i32 = driver_build(p2, c2, mv, a, argv(1), rmode)
+            if amode {
+                // `jc <file> attest` — the manifest HEADER (version, source, the sha256 of
+                // exactly the C `build` would emit, and the locked compile flags), byte-equal
+                // to the reference `attest::manifest`'s first four lines. The per-item
+                // records section is a follow-up (it needs the printer's signature render).
+                var cbuf: String = string_new()
+                emit_program(cbuf, p2, c2, mv, a, false, "")
+                var ob: String = string_new()
+                string_push(ob, "jestyr-attest/v1\nsource ")
+                string_push(ob, argv(1))
+                string_push(ob, "\nc-sha256 ")
+                push_sha256_hex(ob, string_view(cbuf))
+                string_push(ob, "\ncc-flags -O2 -std=c11 -ffp-contract=off -fno-fast-math")
+                print_str(string_view(ob))
+                string_free(ob)
+                string_free(cbuf)
+                string_free(merged)
+                return 0
+            }
+            let drc: i32 = driver_build(m, p2, c2, mv, a, argv(1), rmode)
             string_free(merged)
             return drc
         }

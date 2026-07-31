@@ -22,6 +22,7 @@ import "tokens"
 import "parser"
 import "typeck"
 import "escape"
+import "sha256"
 
 // ---- the fixed C prelude (mirrors Cgen::prelude) ----
 // A FIXED header block: includes + the `jestyr_rt_*` runtime + the JestyrStr/String/Cow/Builder
@@ -10271,7 +10272,7 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
 // stem_s, stem_e, path_s, path_e into `nb`; src_s, src_e into `allsrc`); `vis` marks resolved
 // paths (memoization + cycle guard); `seen` records first declarations as `|name=stem|`;
 // `ren` records collisions as `|stem:name|` (the renamed form is always `name__stem`).
-struct Ml { allsrc: String, nb: String, mods: List(i32), vis: String, seen: String, ren: String, err: bool }
+struct Ml { allsrc: String, nb: String, mods: List(i32), vis: String, seen: String, ren: String, map: List(i32), err: bool }
 
 // The directory prefix length of `path` (through the last '/' or '\\'), 0 for a bare name.
 fn path_dir_len(read path: str) -> usize {
@@ -10515,7 +10516,12 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
         i = i + 1
     }
     let stem: str = string_view(stemb)
+    let src_s: usize = list.get(i32, m.mods, b + 4) as usize
     var cur: usize = 0                                // source cursor: copy gaps, apply edits
+    // (merged_pos, allsrc_pos) checkpoints: between edits the text is copied verbatim, so a
+    // merged span maps back EXACTLY to its original file offset — the `#line` analogue.
+    list.push(i32, m.map, sb_len(sb2))
+    list.push(i32, m.map, src_s as i32)
     i = 0
     for i < n {
         let t: tokens.Token = list.get(tokens.Token, tk, i)
@@ -10542,6 +10548,8 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
                 if (src[skip] as i32) == 10 { skip = skip + 1 }
             }
             cur = skip
+            list.push(i32, m.map, sb_len(sb2))
+            list.push(i32, m.map, (src_s + cur) as i32)
             i = last + 1
             continue
         }
@@ -10583,6 +10591,8 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
                         string_push(sb2, string_view(tstem))
                     }
                     cur = x.end
+                    list.push(i32, m.map, sb_len(sb2))
+                    list.push(i32, m.map, (src_s + cur) as i32)
                     string_free(tstem)
                     i = i + 3
                     continue
@@ -10595,6 +10605,8 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
                     string_push(sb2, "__")
                     string_push(sb2, stem)
                     cur = t.end
+                    list.push(i32, m.map, sb_len(sb2))
+                    list.push(i32, m.map, (src_s + cur) as i32)
                 }
             }
         }
@@ -10611,8 +10623,7 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
 
 // Load + flatten the import closure rooted at `root` into one single-file program. Returns
 // the merged source; empty on a load failure (already reported to stderr).
-fn ml_flatten(read root: str, mut it: Interner, kwcount: i64, read a: Allocator) -> String {
-    var m: Ml = Ml{ allsrc: string_new(), nb: string_new(), mods: list.make(i32, a), vis: string_new(), seen: string_new(), ren: string_new(), err: false }
+fn ml_flatten(mut m: Ml, read root: str, mut it: Interner, kwcount: i64, read a: Allocator) -> String {
     ml_load(m, root, it, kwcount, a)
     var merged: String = string_new()
     if !m.err {
@@ -10628,11 +10639,8 @@ fn ml_flatten(read root: str, mut it: Interner, kwcount: i64, read a: Allocator)
             mj = mj + 1
         }
     }
-    string_free(m.allsrc)
-    string_free(m.nb)
-    string_free(m.vis)
-    string_free(m.seen)
-    string_free(m.ren)
+    string_free(m.vis)                                // allsrc/nb/mods/map stay alive: the
+    string_free(m.seen)                               // driver renders diagnostics through them
     return merged
 }
 
@@ -10641,25 +10649,63 @@ fn ml_flatten(read root: str, mut it: Interner, kwcount: i64, read a: Allocator)
 // unconditionally), the product modes GATE on the escape checker's buffered diagnostics,
 // render them `path:line:col: error: <msg>` on stderr, write `<stem>.c`, drive gcc with
 // the locked flag set via `run_command`, and (for `run`) execute the produced binary,
-// forwarding its exit code. Parse/typeck refusal is a follow-up (those ported passes do
-// not surface message diagnostics yet); imports still need the module story.
+// forwarding its exit code. Parse and typeck refusal use the recovery artifacts (Error
+// nodes / Error types) with generic v1 messages at exact mapped locations; the reference's
+// expected/found message text is a follow-up.
 
-// One diagnostic line on stderr: 1-based line/col scanned from the span start.
-fn eprint_diag(read path: str, read src: str, start: usize, read msg: str) {
+// One diagnostic on stderr, attributed to its OWNING FILE — the `#line` analogue. A merged
+// span maps back through the rewrite checkpoints (last checkpoint at or before the span;
+// verbatim in between), then the owning module is found by its `allsrc` range and 1-based
+// line/col are counted in that module's ORIGINAL source.
+fn eprint_diag(mut m: Ml, start: usize, read msg: str) {
+    var cm: i32 = 0 - 1                               // best checkpoint (merged, allsrc)
+    var co: i32 = 0 - 1
+    var i: usize = 0
+    for i < list.len(i32, m.map) / 2 {
+        let mp: i32 = list.get(i32, m.map, i * 2)
+        if mp as usize <= start {
+            cm = mp
+            co = list.get(i32, m.map, i * 2 + 1)
+        }
+        i = i + 1
+    }
+    var b: String = string_new()
+    if cm < 0 {                                       // no mapping (shouldn't happen): raw offset
+        string_push(b, "<merged>:")
+        push_uint(b, start as i64)
+        string_push(b, ": error: ")
+        string_push(b, msg)
+        eprint_str(string_view(b))
+        string_free(b)
+        return
+    }
+    let orig: usize = (co as usize) + (start - (cm as usize))
+    var found: i32 = 0 - 1                            // the module owning `orig`
+    var mi: usize = 0
+    for mi < list.len(i32, m.mods) / 6 {
+        let ss: i32 = list.get(i32, m.mods, mi * 6 + 4)
+        let se: i32 = list.get(i32, m.mods, mi * 6 + 5)
+        if orig >= ss as usize and orig <= se as usize { found = mi as i32 }
+        mi = mi + 1
+    }
+    if found < 0 { found = 0 }
+    let mb: usize = (found as usize) * 6
+    let all: str = string_view(m.allsrc)
+    let ss2: usize = list.get(i32, m.mods, mb + 4) as usize
     var line: i64 = 1
     var col: i64 = 1
-    var i: usize = 0
-    for i < start {
-        if (src[i] as i32) == 10 {
+    var k: usize = ss2
+    for k < orig {
+        if (all[k] as i32) == 10 {
             line = line + 1
             col = 1
         } else {
             col = col + 1
         }
-        i = i + 1
+        k = k + 1
     }
-    var b: String = string_new()
-    string_push(b, path)
+    let nbv: str = string_view(m.nb)
+    string_push(b, nbv[list.get(i32, m.mods, mb + 2) as usize .. list.get(i32, m.mods, mb + 3) as usize])
     string_push(b, ":")
     push_uint(b, line)
     string_push(b, ":")
@@ -10672,7 +10718,43 @@ fn eprint_diag(read path: str, read src: str, start: usize, read msg: str) {
 
 // The `build`/`run` modes: 1 on diagnostics or a write failure, gcc's code on a failed
 // compile, the program's own exit code for `run`, else 0.
-fn driver_build(read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator, read path: str, do_run: bool) -> i32 {
+fn driver_build(mut m: Ml, read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator, read path: str, do_run: bool) -> i32 {
+    // Parse refusal: any Error expr (kind 9) or Error item (kind 99) — the ported parser's
+    // recovery artifacts. v1 messages are generic (the reference's expected/found text is a
+    // follow-up); the LOCATION is exact via the checkpoint mapper.
+    var pi2: usize = 0
+    for pi2 < list.len(parser.ExprData, p.ex) {
+        let pe: parser.ExprData = list.get(parser.ExprData, p.ex, pi2)
+        if pe.kind == 9 {
+            eprint_diag(m, pe.start, "syntax error (unexpected or malformed input)")
+            return 1
+        }
+        pi2 = pi2 + 1
+    }
+    var pj: usize = 0
+    for pj < list.len(parser.ItemData, p.it) {
+        let itd: parser.ItemData = list.get(parser.ItemData, p.it, pj)
+        if itd.kind == 99 {
+            eprint_diag(m, itd.start, "syntax error: expected an item")
+            return 1
+        }
+        pj = pj + 1
+    }
+    // Type refusal: any expression the checker resolved to the Error type (kind 16 — a real
+    // mismatch, e.g. an operator with no impl; degenerate Unknowns never refuse).
+    var ti2: usize = 0
+    for ti2 < list.len(i32, c.et) {
+        let tid2: i32 = list.get(i32, c.et, ti2)
+        if tid2 >= 0 {
+            let td2: typeck.TyData = list.get(typeck.TyData, c.tys, tid2 as usize)
+            if td2.kind == 16 {
+                let ed2: parser.ExprData = list.get(parser.ExprData, p.ex, ti2)
+                eprint_diag(m, ed2.start, "type error at this expression")
+                return 1
+            }
+        }
+        ti2 = ti2 + 1
+    }
     var e: escape.Esc = escape.check_program(p, c, src, a)
     if list.len(i32, e.dsp) > 0 {                     // refuse to emit on escape diagnostics
         let dm: str = string_view(e.dmsg)
@@ -10681,7 +10763,7 @@ fn driver_build(read p: parser.Parser, read c: typeck.Checker, read src: str, re
         var k: usize = 0
         for k < dm.len {
             if (dm[k] as i32) == 10 {
-                eprint_diag(path, src, list.get(i32, e.dsp, di * 2) as usize, dm[ls .. k])
+                eprint_diag(m, list.get(i32, e.dsp, di * 2) as usize, dm[ls .. k])
                 di = di + 1
                 ls = k + 1
             }
@@ -10744,19 +10826,22 @@ fn main() -> i32 {
         var lmode: bool = false
         var bmode: bool = false
         var rmode: bool = false
+        var amode: bool = false
         if env.argc() > 2 {
             if str_eq(env.argv(2), "test") { tmode = true }
             if str_eq(env.argv(2), "list") { lmode = true }
             if str_eq(env.argv(2), "build") { bmode = true }
             if str_eq(env.argv(2), "run") { rmode = true }
+            if str_eq(env.argv(2), "attest") { amode = true }
         }
-        if bmode or rmode {
+        if bmode or rmode or amode {
             // The product modes go through the module loader: the import closure flattens
             // into one single-file program (the loader's own one-translation-unit model),
             // then the ordinary pipeline runs on the merged source. An importless file
             // merges to itself. NOTE: diagnostics currently render against the MERGED
             // buffer (per-file attribution is a follow-up).
-            var merged: String = ml_flatten(env.argv(1), it, kwcount, a)
+            var m: Ml = Ml{ allsrc: string_new(), nb: string_new(), mods: list.make(i32, a), vis: string_new(), seen: string_new(), ren: string_new(), map: list.make(i32, a), err: false }
+            var merged: String = ml_flatten(m, env.argv(1), it, kwcount, a)
             let mv: str = string_view(merged)
             if mv.len == 0 {
                 string_free(merged)
@@ -10764,7 +10849,26 @@ fn main() -> i32 {
             }
             var p2: parser.Parser = parser.parse_source(mv, it, kwcount, a)
             var c2: typeck.Checker = typeck.check_parsed(p2, mv, a)
-            let drc: i32 = driver_build(p2, c2, mv, a, env.argv(1), rmode)
+            if amode {
+                // `jc <file> attest` — the manifest HEADER (version, source, the sha256 of
+                // exactly the C `build` would emit, and the locked compile flags), byte-equal
+                // to the reference `attest::manifest`'s first four lines. The per-item
+                // records section is a follow-up (it needs the printer's signature render).
+                var cbuf: String = string_new()
+                emit_program(cbuf, p2, c2, mv, a, false, "")
+                var ob: String = string_new()
+                string_push(ob, "jestyr-attest/v1\nsource ")
+                string_push(ob, env.argv(1))
+                string_push(ob, "\nc-sha256 ")
+                sha256.push_sha256_hex(ob, string_view(cbuf))
+                string_push(ob, "\ncc-flags -O2 -std=c11 -ffp-contract=off -fno-fast-math")
+                print_str(string_view(ob))
+                string_free(ob)
+                string_free(cbuf)
+                string_free(merged)
+                return 0
+            }
+            let drc: i32 = driver_build(m, p2, c2, mv, a, env.argv(1), rmode)
             string_free(merged)
             return drc
         }

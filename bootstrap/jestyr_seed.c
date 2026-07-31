@@ -127,10 +127,10 @@ typedef struct Jestyr_Ml Jestyr_Ml;
 typedef struct Jestyr_List__Token Jestyr_List__Token;
 typedef struct Jestyr_List__bool Jestyr_List__bool;
 typedef struct Jestyr_List__i32 Jestyr_List__i32;
-typedef struct Jestyr_List__ItemData Jestyr_List__ItemData;
 typedef struct Jestyr_List__ExprData Jestyr_List__ExprData;
-typedef struct Jestyr_List__StmtData Jestyr_List__StmtData;
 typedef struct Jestyr_List__TyData Jestyr_List__TyData;
+typedef struct Jestyr_List__ItemData Jestyr_List__ItemData;
+typedef struct Jestyr_List__StmtData Jestyr_List__StmtData;
 typedef struct Jestyr_List__TypeData Jestyr_List__TypeData;
 typedef struct Jestyr_List__PatData Jestyr_List__PatData;
 
@@ -466,10 +466,15 @@ struct Jestyr_Ml {
     JestyrString j_vis;
     JestyrString j_seen;
     JestyrString j_ren;
+    Jestyr_List__i32 j_map;
     bool j_err;
 };
 
 typedef struct { uint8_t* ptr; size_t len; } JestyrSlice_u8;
+
+typedef struct { int32_t a[64]; } JestyrArr_i32_64;
+typedef struct { int64_t a[8]; } JestyrArr_i64_8;
+typedef struct { int64_t a[64]; } JestyrArr_i64_64;
 
 typedef struct { bool is_err; JestyrStr ok; int err; } JestyrResult_str;
 typedef struct { bool is_err; JestyrString ok; int err; } JestyrResult_String;
@@ -799,6 +804,11 @@ bool jestyr_fn_has_attr(Jestyr_Parser j_p, JestyrStr j_src, Jestyr_ItemData j_f,
 void jestyr_check_fn(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, Jestyr_ItemData j_f);
 void jestyr_check_items(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src);
 Jestyr_Esc jestyr_check_program(Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, Jestyr_Allocator j_a);
+int64_t jestyr_mask32(int64_t j_x);
+int64_t jestyr_rotr32(int64_t j_x, int64_t j_n);
+int64_t jestyr_pad_byte(JestyrStr j_data, size_t j_j, size_t j_padded);
+void jestyr_push_hex8(JestyrString* restrict j_sb, int64_t j_x);
+void jestyr_push_sha256_hex(JestyrString* restrict j_sb, JestyrStr j_data);
 bool jestyr_uses_try_read(Jestyr_Parser j_p, JestyrStr j_src);
 bool jestyr_uses_run_command(Jestyr_Parser j_p, JestyrStr j_src);
 bool jestyr_uses_eprint(Jestyr_Parser j_p, JestyrStr j_src);
@@ -1064,36 +1074,36 @@ void jestyr_ml_register(Jestyr_Ml* restrict j_m, JestyrStr j_name, JestyrStr j_s
 bool jestyr_ml_ident_head(JestyrStr j_s);
 void jestyr_ml_scan_decls(Jestyr_Ml* restrict j_m, size_t j_mi, Jestyr_Interner* restrict j_it, int64_t j_kwcount, Jestyr_Allocator j_a);
 void jestyr_ml_rewrite(Jestyr_Ml* restrict j_m, size_t j_mi, JestyrString* restrict j_sb2, Jestyr_Interner* restrict j_it, int64_t j_kwcount, Jestyr_Allocator j_a);
-JestyrString jestyr_ml_flatten(JestyrStr j_root, Jestyr_Interner* restrict j_it, int64_t j_kwcount, Jestyr_Allocator j_a);
-void jestyr_eprint_diag(JestyrStr j_path, JestyrStr j_src, size_t j_start, JestyrStr j_msg);
-int32_t jestyr_driver_build(Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, Jestyr_Allocator j_a, JestyrStr j_path, bool j_do_run);
+JestyrString jestyr_ml_flatten(Jestyr_Ml* restrict j_m, JestyrStr j_root, Jestyr_Interner* restrict j_it, int64_t j_kwcount, Jestyr_Allocator j_a);
+void jestyr_eprint_diag(Jestyr_Ml* restrict j_m, size_t j_start, JestyrStr j_msg);
+int32_t jestyr_driver_build(Jestyr_Ml* restrict j_m, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, Jestyr_Allocator j_a, JestyrStr j_path, bool j_do_run);
 int32_t jestyr_main(void);
+Jestyr_List__i32 jestyr_make__list__i32(Jestyr_Allocator j_a);
 int32_t jestyr_get__i32(Jestyr_List__i32 j_l, size_t j_i);
 size_t jestyr_len__i32(Jestyr_List__i32 j_l);
-Jestyr_List__i32 jestyr_make__list__i32(Jestyr_Allocator j_a);
+Jestyr_ExprData jestyr_get__ExprData(Jestyr_List__ExprData j_l, size_t j_i);
+Jestyr_TyData jestyr_get__TyData(Jestyr_List__TyData j_l, size_t j_i);
+Jestyr_ItemData jestyr_get__ItemData(Jestyr_List__ItemData j_l, size_t j_i);
+size_t jestyr_len__ItemData(Jestyr_List__ItemData j_l);
+size_t jestyr_len__ExprData(Jestyr_List__ExprData j_l);
 void jestyr_free__Token(Jestyr_List__Token* restrict j_l);
 void jestyr_release__Token(Jestyr_Allocator j_a, Jestyr_Token* j_p);
-Jestyr_Token jestyr_get__Token(Jestyr_List__Token j_l, size_t j_i);
-size_t jestyr_len__Token(Jestyr_List__Token j_l);
 void jestyr_push__i32(Jestyr_List__i32* restrict j_l, int32_t j_x);
 void jestyr_release__i32(Jestyr_Allocator j_a, int32_t* j_p);
 int32_t* jestyr_allocate__i32(Jestyr_Allocator j_a, size_t j_n);
-Jestyr_ItemData jestyr_get__ItemData(Jestyr_List__ItemData j_l, size_t j_i);
+Jestyr_Token jestyr_get__Token(Jestyr_List__Token j_l, size_t j_i);
+size_t jestyr_len__Token(Jestyr_List__Token j_l);
 void jestyr_truncate__i32(Jestyr_List__i32* restrict j_l, size_t j_n);
-Jestyr_ExprData jestyr_get__ExprData(Jestyr_List__ExprData j_l, size_t j_i);
 Jestyr_StmtData jestyr_get__StmtData(Jestyr_List__StmtData j_l, size_t j_i);
-Jestyr_TyData jestyr_get__TyData(Jestyr_List__TyData j_l, size_t j_i);
 Jestyr_TypeData jestyr_get__TypeData(Jestyr_List__TypeData j_l, size_t j_i);
 void jestyr_free__i32(Jestyr_List__i32* restrict j_l);
 void jestyr_set__i32(Jestyr_List__i32* restrict j_l, size_t j_i, int32_t j_x);
 size_t jestyr_len__TypeData(Jestyr_List__TypeData j_l);
-size_t jestyr_len__ExprData(Jestyr_List__ExprData j_l);
 size_t jestyr_len__TyData(Jestyr_List__TyData j_l);
 Jestyr_PatData jestyr_get__PatData(Jestyr_List__PatData j_l, size_t j_i);
 size_t jestyr_len__StmtData(Jestyr_List__StmtData j_l);
 bool jestyr_get__bool(Jestyr_List__bool j_l, size_t j_i);
 void jestyr_set__bool(Jestyr_List__bool* restrict j_l, size_t j_i, bool j_x);
-size_t jestyr_len__ItemData(Jestyr_List__ItemData j_l);
 void jestyr_push__bool(Jestyr_List__bool* restrict j_l, bool j_x);
 void jestyr_release__bool(Jestyr_Allocator j_a, bool* j_p);
 bool* jestyr_allocate__bool(Jestyr_Allocator j_a, size_t j_n);
@@ -1135,13 +1145,14 @@ void jestyr_impl_Drop__Interner__drop(Jestyr_Interner* restrict j_self);
 void jestyr_impl_Drop__List_Token___drop(Jestyr_List__Token* restrict j_self);
 void jestyr_impl_Drop__List_bool___drop(Jestyr_List__bool* restrict j_self);
 void jestyr_impl_Drop__List_i32___drop(Jestyr_List__i32* restrict j_self);
-void jestyr_impl_Drop__List_ItemData___drop(Jestyr_List__ItemData* restrict j_self);
 void jestyr_impl_Drop__List_ExprData___drop(Jestyr_List__ExprData* restrict j_self);
-void jestyr_impl_Drop__List_StmtData___drop(Jestyr_List__StmtData* restrict j_self);
 void jestyr_impl_Drop__List_TyData___drop(Jestyr_List__TyData* restrict j_self);
+void jestyr_impl_Drop__List_ItemData___drop(Jestyr_List__ItemData* restrict j_self);
+void jestyr_impl_Drop__List_StmtData___drop(Jestyr_List__StmtData* restrict j_self);
 void jestyr_impl_Drop__List_TypeData___drop(Jestyr_List__TypeData* restrict j_self);
 void jestyr_impl_Drop__List_PatData___drop(Jestyr_List__PatData* restrict j_self);
 
+static const JestyrArr_i64_64 j_SHA_K = { { 0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2 } };
 
 uint8_t* jestyr_alloc_bytes(Jestyr_Allocator j_a, size_t j_n)
 {
@@ -13400,6 +13411,126 @@ Jestyr_Esc jestyr_check_program(Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr
     Jestyr_Esc j_e = (Jestyr_Esc){ .j_scn = jestyr_make__list__i32(j_a), .j_scst = jestyr_make__list__i32(j_a), .j_rgn = jestyr_make__list__i32(j_a), .j_rgst = jestyr_make__list__i32(j_a), .j_frozen = jestyr_make__list__i32(j_a), .j_rdepth = jestyr_make__list__i32(j_a), .j_no_alloc = false, .j_deterministic = false, .j_ret_is_borrow = false, .j_self_borrow = 0, .j_alloc = j_a, .j_dsp = jestyr_make__list__i32(j_a), .j_dmsg = jestyr_rt_str_new() };
     jestyr_check_items(&(j_e), j_p, j_c, j_src);
     return j_e;
+}
+
+int64_t jestyr_mask32(int64_t j_x)
+{
+    return (j_x & 4294967295);
+}
+
+int64_t jestyr_rotr32(int64_t j_x, int64_t j_n)
+{
+    return jestyr_mask32(((j_x >> j_n) | (j_x << (32 - j_n))));
+}
+
+int64_t jestyr_pad_byte(JestyrStr j_data, size_t j_j, size_t j_padded)
+{
+    if ((j_j < j_data.len))
+    {
+        return (int64_t)(((uint8_t)(j_data).ptr[(j_j)]));
+    }
+    if ((j_j == j_data.len))
+    {
+        return 128;
+    }
+    if ((j_j >= (j_padded - 8)))
+    {
+        int64_t j_bits = ((int64_t)(j_data.len) * 8);
+        int64_t j_sh = ((int64_t)(((j_padded - 1) - j_j)) * 8);
+        return ((j_bits >> j_sh) & 255);
+    }
+    return 0;
+}
+
+void jestyr_push_hex8(JestyrString* restrict j_sb, int64_t j_x)
+{
+    JestyrStr j_digits = JSTR("0123456789abcdef");
+    int64_t j_sh = 28;
+    while ((j_sh >= 0))
+    {
+        int64_t j_d = ((j_x >> j_sh) & 15);
+        jestyr_rt_str_push(&(*j_sb), jestyr_rt_substr(j_digits, (size_t)(j_d), (size_t)((j_d + 1))));
+        j_sh = (j_sh - 4);
+    }
+}
+
+void jestyr_push_sha256_hex(JestyrString* restrict j_sb, JestyrStr j_data)
+{
+    JestyrArr_i64_8 j_h = ({ JestyrArr_i64_8 _al2; _al2.a[0] = (0x6a09e667); _al2.a[1] = (0xbb67ae85); _al2.a[2] = (0x3c6ef372); _al2.a[3] = (0xa54ff53a); _al2.a[4] = (0x510e527f); _al2.a[5] = (0x9b05688c); _al2.a[6] = (0x1f83d9ab); _al2.a[7] = (0x5be0cd19); _al2; });
+    size_t j_rem = ((j_data.len + 1) % 64);
+    size_t j_pad = 0;
+    if ((j_rem <= 56))
+    {
+        j_pad = (56 - j_rem);
+    }
+    else
+    {
+        j_pad = (120 - j_rem);
+    }
+    size_t j_padded = (((j_data.len + 1) + j_pad) + 8);
+    JestyrArr_i64_64 j_w = ({ JestyrArr_i64_64 _ar3; int64_t _v3 = (0); for (size_t _k3 = 0; _k3 < 64; _k3++) _ar3.a[_k3] = _v3; _ar3; });
+    size_t j_blk = 0;
+    while ((j_blk < (j_padded / 64)))
+    {
+        size_t j_base = (j_blk * 64);
+        size_t j_i = 0;
+        while ((j_i < 16))
+        {
+            size_t j_o = (j_base + (j_i * 4));
+            ({ JestyrArr_i64_64* _a4 = &(j_w); size_t _ix4 = (size_t)(j_i); assert(_ix4 < 64); _a4->a[_ix4] = ((((jestyr_pad_byte(j_data, j_o, j_padded) << 24) | (jestyr_pad_byte(j_data, (j_o + 1), j_padded) << 16)) | (jestyr_pad_byte(j_data, (j_o + 2), j_padded) << 8)) | jestyr_pad_byte(j_data, (j_o + 3), j_padded)); });
+            j_i = (j_i + 1);
+        }
+        size_t j_i2 = 16;
+        while ((j_i2 < 64))
+        {
+            int64_t j_s0 = ((jestyr_rotr32(({ const JestyrArr_i64_64* _a5 = &(j_w); size_t _ix5 = (size_t)((j_i2 - 15)); assert(_ix5 < 64); _a5->a[_ix5]; }), 7) ^ jestyr_rotr32(({ const JestyrArr_i64_64* _a6 = &(j_w); size_t _ix6 = (size_t)((j_i2 - 15)); assert(_ix6 < 64); _a6->a[_ix6]; }), 18)) ^ (({ const JestyrArr_i64_64* _a7 = &(j_w); size_t _ix7 = (size_t)((j_i2 - 15)); assert(_ix7 < 64); _a7->a[_ix7]; }) >> 3));
+            int64_t j_s1 = ((jestyr_rotr32(({ const JestyrArr_i64_64* _a8 = &(j_w); size_t _ix8 = (size_t)((j_i2 - 2)); assert(_ix8 < 64); _a8->a[_ix8]; }), 17) ^ jestyr_rotr32(({ const JestyrArr_i64_64* _a9 = &(j_w); size_t _ix9 = (size_t)((j_i2 - 2)); assert(_ix9 < 64); _a9->a[_ix9]; }), 19)) ^ (({ const JestyrArr_i64_64* _a10 = &(j_w); size_t _ix10 = (size_t)((j_i2 - 2)); assert(_ix10 < 64); _a10->a[_ix10]; }) >> 10));
+            ({ JestyrArr_i64_64* _a13 = &(j_w); size_t _ix13 = (size_t)(j_i2); assert(_ix13 < 64); _a13->a[_ix13] = jestyr_mask32((((({ const JestyrArr_i64_64* _a11 = &(j_w); size_t _ix11 = (size_t)((j_i2 - 16)); assert(_ix11 < 64); _a11->a[_ix11]; }) + j_s0) + ({ const JestyrArr_i64_64* _a12 = &(j_w); size_t _ix12 = (size_t)((j_i2 - 7)); assert(_ix12 < 64); _a12->a[_ix12]; })) + j_s1)); });
+            j_i2 = (j_i2 + 1);
+        }
+        int64_t j_a = ({ const JestyrArr_i64_8* _a14 = &(j_h); size_t _ix14 = (size_t)(0); assert(_ix14 < 8); _a14->a[_ix14]; });
+        int64_t j_b = ({ const JestyrArr_i64_8* _a15 = &(j_h); size_t _ix15 = (size_t)(1); assert(_ix15 < 8); _a15->a[_ix15]; });
+        int64_t j_c = ({ const JestyrArr_i64_8* _a16 = &(j_h); size_t _ix16 = (size_t)(2); assert(_ix16 < 8); _a16->a[_ix16]; });
+        int64_t j_d = ({ const JestyrArr_i64_8* _a17 = &(j_h); size_t _ix17 = (size_t)(3); assert(_ix17 < 8); _a17->a[_ix17]; });
+        int64_t j_e = ({ const JestyrArr_i64_8* _a18 = &(j_h); size_t _ix18 = (size_t)(4); assert(_ix18 < 8); _a18->a[_ix18]; });
+        int64_t j_f = ({ const JestyrArr_i64_8* _a19 = &(j_h); size_t _ix19 = (size_t)(5); assert(_ix19 < 8); _a19->a[_ix19]; });
+        int64_t j_g = ({ const JestyrArr_i64_8* _a20 = &(j_h); size_t _ix20 = (size_t)(6); assert(_ix20 < 8); _a20->a[_ix20]; });
+        int64_t j_hh = ({ const JestyrArr_i64_8* _a21 = &(j_h); size_t _ix21 = (size_t)(7); assert(_ix21 < 8); _a21->a[_ix21]; });
+        size_t j_r = 0;
+        while ((j_r < 64))
+        {
+            int64_t j_bs1 = ((jestyr_rotr32(j_e, 6) ^ jestyr_rotr32(j_e, 11)) ^ jestyr_rotr32(j_e, 25));
+            int64_t j_ch = ((j_e & j_f) ^ (jestyr_mask32((~j_e)) & j_g));
+            int64_t j_t1 = jestyr_mask32(((((j_hh + j_bs1) + j_ch) + ({ const JestyrArr_i64_64* _a22 = &(j_SHA_K); size_t _ix22 = (size_t)(j_r); assert(_ix22 < 64); _a22->a[_ix22]; })) + ({ const JestyrArr_i64_64* _a23 = &(j_w); size_t _ix23 = (size_t)(j_r); assert(_ix23 < 64); _a23->a[_ix23]; })));
+            int64_t j_bs0 = ((jestyr_rotr32(j_a, 2) ^ jestyr_rotr32(j_a, 13)) ^ jestyr_rotr32(j_a, 22));
+            int64_t j_mj = (((j_a & j_b) ^ (j_a & j_c)) ^ (j_b & j_c));
+            int64_t j_t2 = jestyr_mask32((j_bs0 + j_mj));
+            j_hh = j_g;
+            j_g = j_f;
+            j_f = j_e;
+            j_e = jestyr_mask32((j_d + j_t1));
+            j_d = j_c;
+            j_c = j_b;
+            j_b = j_a;
+            j_a = jestyr_mask32((j_t1 + j_t2));
+            j_r = (j_r + 1);
+        }
+        ({ JestyrArr_i64_8* _a25 = &(j_h); size_t _ix25 = (size_t)(0); assert(_ix25 < 8); _a25->a[_ix25] = jestyr_mask32((({ const JestyrArr_i64_8* _a24 = &(j_h); size_t _ix24 = (size_t)(0); assert(_ix24 < 8); _a24->a[_ix24]; }) + j_a)); });
+        ({ JestyrArr_i64_8* _a27 = &(j_h); size_t _ix27 = (size_t)(1); assert(_ix27 < 8); _a27->a[_ix27] = jestyr_mask32((({ const JestyrArr_i64_8* _a26 = &(j_h); size_t _ix26 = (size_t)(1); assert(_ix26 < 8); _a26->a[_ix26]; }) + j_b)); });
+        ({ JestyrArr_i64_8* _a29 = &(j_h); size_t _ix29 = (size_t)(2); assert(_ix29 < 8); _a29->a[_ix29] = jestyr_mask32((({ const JestyrArr_i64_8* _a28 = &(j_h); size_t _ix28 = (size_t)(2); assert(_ix28 < 8); _a28->a[_ix28]; }) + j_c)); });
+        ({ JestyrArr_i64_8* _a31 = &(j_h); size_t _ix31 = (size_t)(3); assert(_ix31 < 8); _a31->a[_ix31] = jestyr_mask32((({ const JestyrArr_i64_8* _a30 = &(j_h); size_t _ix30 = (size_t)(3); assert(_ix30 < 8); _a30->a[_ix30]; }) + j_d)); });
+        ({ JestyrArr_i64_8* _a33 = &(j_h); size_t _ix33 = (size_t)(4); assert(_ix33 < 8); _a33->a[_ix33] = jestyr_mask32((({ const JestyrArr_i64_8* _a32 = &(j_h); size_t _ix32 = (size_t)(4); assert(_ix32 < 8); _a32->a[_ix32]; }) + j_e)); });
+        ({ JestyrArr_i64_8* _a35 = &(j_h); size_t _ix35 = (size_t)(5); assert(_ix35 < 8); _a35->a[_ix35] = jestyr_mask32((({ const JestyrArr_i64_8* _a34 = &(j_h); size_t _ix34 = (size_t)(5); assert(_ix34 < 8); _a34->a[_ix34]; }) + j_f)); });
+        ({ JestyrArr_i64_8* _a37 = &(j_h); size_t _ix37 = (size_t)(6); assert(_ix37 < 8); _a37->a[_ix37] = jestyr_mask32((({ const JestyrArr_i64_8* _a36 = &(j_h); size_t _ix36 = (size_t)(6); assert(_ix36 < 8); _a36->a[_ix36]; }) + j_g)); });
+        ({ JestyrArr_i64_8* _a39 = &(j_h); size_t _ix39 = (size_t)(7); assert(_ix39 < 8); _a39->a[_ix39] = jestyr_mask32((({ const JestyrArr_i64_8* _a38 = &(j_h); size_t _ix38 = (size_t)(7); assert(_ix38 < 8); _a38->a[_ix38]; }) + j_hh)); });
+        j_blk = (j_blk + 1);
+    }
+    size_t j_k = 0;
+    while ((j_k < 8))
+    {
+        jestyr_push_hex8(&((*j_sb)), ({ const JestyrArr_i64_8* _a40 = &(j_h); size_t _ix40 = (size_t)(j_k); assert(_ix40 < 8); _a40->a[_ix40]; }));
+        j_k = (j_k + 1);
+    }
 }
 
 bool jestyr_uses_try_read(Jestyr_Parser j_p, JestyrStr j_src)
@@ -27283,7 +27414,10 @@ void jestyr_ml_rewrite(Jestyr_Ml* restrict j_m, size_t j_mi, JestyrString* restr
         j_i = (j_i + 1);
     }
     JestyrStr j_stem = jestyr_rt_str_view(&j_stemb);
+    size_t j_src_s = (size_t)(jestyr_get__i32((*j_m).j_mods, (j_b + 4)));
     size_t j_cur = 0;
+    jestyr_push__i32(&((*j_m).j_map), jestyr_sb_len(&((*j_sb2))));
+    jestyr_push__i32(&((*j_m).j_map), (int32_t)(j_src_s));
     j_i = 0;
     while ((j_i < j_n))
     {
@@ -27330,6 +27464,8 @@ void jestyr_ml_rewrite(Jestyr_Ml* restrict j_m, size_t j_mi, JestyrString* restr
                 }
             }
             j_cur = j_skip;
+            jestyr_push__i32(&((*j_m).j_map), jestyr_sb_len(&((*j_sb2))));
+            jestyr_push__i32(&((*j_m).j_map), (int32_t)((j_src_s + j_cur)));
             j_i = (j_last + 1);
             continue;
         }
@@ -27381,6 +27517,8 @@ void jestyr_ml_rewrite(Jestyr_Ml* restrict j_m, size_t j_mi, JestyrString* restr
                         jestyr_rt_str_push(&(*j_sb2), jestyr_rt_str_view(&j_tstem));
                     }
                     j_cur = j_x.j_end;
+                    jestyr_push__i32(&((*j_m).j_map), jestyr_sb_len(&((*j_sb2))));
+                    jestyr_push__i32(&((*j_m).j_map), (int32_t)((j_src_s + j_cur)));
                     jestyr_rt_str_free(&j_tstem);
                     j_i = (j_i + 3);
                     continue;
@@ -27395,6 +27533,8 @@ void jestyr_ml_rewrite(Jestyr_Ml* restrict j_m, size_t j_mi, JestyrString* restr
                     jestyr_rt_str_push(&(*j_sb2), JSTR("__"));
                     jestyr_rt_str_push(&(*j_sb2), j_stem);
                     j_cur = j_t.j_end;
+                    jestyr_push__i32(&((*j_m).j_map), jestyr_sb_len(&((*j_sb2))));
+                    jestyr_push__i32(&((*j_m).j_map), (int32_t)((j_src_s + j_cur)));
                 }
             }
         }
@@ -27410,45 +27550,83 @@ void jestyr_ml_rewrite(Jestyr_Ml* restrict j_m, size_t j_mi, JestyrString* restr
     jestyr_impl_Drop__List_Token___drop(&j_tk);
 }
 
-JestyrString jestyr_ml_flatten(JestyrStr j_root, Jestyr_Interner* restrict j_it, int64_t j_kwcount, Jestyr_Allocator j_a)
+JestyrString jestyr_ml_flatten(Jestyr_Ml* restrict j_m, JestyrStr j_root, Jestyr_Interner* restrict j_it, int64_t j_kwcount, Jestyr_Allocator j_a)
 {
-    Jestyr_Ml j_m = (Jestyr_Ml){ .j_allsrc = jestyr_rt_str_new(), .j_nb = jestyr_rt_str_new(), .j_mods = jestyr_make__list__i32(j_a), .j_vis = jestyr_rt_str_new(), .j_seen = jestyr_rt_str_new(), .j_ren = jestyr_rt_str_new(), .j_err = false };
-    jestyr_ml_load(&(j_m), j_root, &((*j_it)), j_kwcount, j_a);
+    jestyr_ml_load(&((*j_m)), j_root, &((*j_it)), j_kwcount, j_a);
     JestyrString j_merged = jestyr_rt_str_new();
-    if ((!j_m.j_err))
+    if ((!(*j_m).j_err))
     {
-        size_t j_count = (jestyr_len__i32(j_m.j_mods) / 6);
+        size_t j_count = (jestyr_len__i32((*j_m).j_mods) / 6);
         size_t j_mi = 0;
         while ((j_mi < j_count))
         {
-            jestyr_ml_scan_decls(&(j_m), j_mi, &((*j_it)), j_kwcount, j_a);
+            jestyr_ml_scan_decls(&((*j_m)), j_mi, &((*j_it)), j_kwcount, j_a);
             j_mi = (j_mi + 1);
         }
         size_t j_mj = 0;
         while ((j_mj < j_count))
         {
-            jestyr_ml_rewrite(&(j_m), j_mj, &(j_merged), &((*j_it)), j_kwcount, j_a);
+            jestyr_ml_rewrite(&((*j_m)), j_mj, &(j_merged), &((*j_it)), j_kwcount, j_a);
             j_mj = (j_mj + 1);
         }
     }
-    jestyr_rt_str_free(&j_m.j_allsrc);
-    jestyr_rt_str_free(&j_m.j_nb);
-    jestyr_rt_str_free(&j_m.j_vis);
-    jestyr_rt_str_free(&j_m.j_seen);
-    jestyr_rt_str_free(&j_m.j_ren);
-    JestyrString j_result = j_merged;
-    jestyr_impl_Drop__List_i32___drop(&j_m.j_mods);
-    return j_result;
+    jestyr_rt_str_free(&(*j_m).j_vis);
+    jestyr_rt_str_free(&(*j_m).j_seen);
+    return j_merged;
 }
 
-void jestyr_eprint_diag(JestyrStr j_path, JestyrStr j_src, size_t j_start, JestyrStr j_msg)
+void jestyr_eprint_diag(Jestyr_Ml* restrict j_m, size_t j_start, JestyrStr j_msg)
 {
+    int32_t j_cm = (0 - 1);
+    int32_t j_co = (0 - 1);
+    size_t j_i = 0;
+    while ((j_i < (jestyr_len__i32((*j_m).j_map) / 2)))
+    {
+        int32_t j_mp = jestyr_get__i32((*j_m).j_map, (j_i * 2));
+        if (((size_t)(j_mp) <= j_start))
+        {
+            j_cm = j_mp;
+            j_co = jestyr_get__i32((*j_m).j_map, ((j_i * 2) + 1));
+        }
+        j_i = (j_i + 1);
+    }
+    JestyrString j_b = jestyr_rt_str_new();
+    if ((j_cm < 0))
+    {
+        jestyr_rt_str_push(&j_b, JSTR("<merged>:"));
+        jestyr_push_uint__cgen(&(j_b), (int64_t)(j_start));
+        jestyr_rt_str_push(&j_b, JSTR(": error: "));
+        jestyr_rt_str_push(&j_b, j_msg);
+        jestyr_rt_eprint_str(jestyr_rt_str_view(&j_b));
+        jestyr_rt_str_free(&j_b);
+        return;
+    }
+    size_t j_orig = ((size_t)(j_co) + (j_start - (size_t)(j_cm)));
+    int32_t j_found = (0 - 1);
+    size_t j_mi = 0;
+    while ((j_mi < (jestyr_len__i32((*j_m).j_mods) / 6)))
+    {
+        int32_t j_ss = jestyr_get__i32((*j_m).j_mods, ((j_mi * 6) + 4));
+        int32_t j_se = jestyr_get__i32((*j_m).j_mods, ((j_mi * 6) + 5));
+        if (((j_orig >= (size_t)(j_ss)) && (j_orig <= (size_t)(j_se))))
+        {
+            j_found = (int32_t)(j_mi);
+        }
+        j_mi = (j_mi + 1);
+    }
+    if ((j_found < 0))
+    {
+        j_found = 0;
+    }
+    size_t j_mb = ((size_t)(j_found) * 6);
+    JestyrStr j_all = jestyr_rt_str_view(&(*j_m).j_allsrc);
+    size_t j_ss2 = (size_t)(jestyr_get__i32((*j_m).j_mods, (j_mb + 4)));
     int64_t j_line = 1;
     int64_t j_col = 1;
-    size_t j_i = 0;
-    while ((j_i < j_start))
+    size_t j_k = j_ss2;
+    while ((j_k < j_orig))
     {
-        if (((int32_t)(((uint8_t)(j_src).ptr[(j_i)])) == 10))
+        if (((int32_t)(((uint8_t)(j_all).ptr[(j_k)])) == 10))
         {
             j_line = (j_line + 1);
             j_col = 1;
@@ -27457,10 +27635,10 @@ void jestyr_eprint_diag(JestyrStr j_path, JestyrStr j_src, size_t j_start, Jesty
         {
             j_col = (j_col + 1);
         }
-        j_i = (j_i + 1);
+        j_k = (j_k + 1);
     }
-    JestyrString j_b = jestyr_rt_str_new();
-    jestyr_rt_str_push(&j_b, j_path);
+    JestyrStr j_nbv = jestyr_rt_str_view(&(*j_m).j_nb);
+    jestyr_rt_str_push(&j_b, jestyr_rt_substr(j_nbv, (size_t)(jestyr_get__i32((*j_m).j_mods, (j_mb + 2))), (size_t)(jestyr_get__i32((*j_m).j_mods, (j_mb + 3)))));
     jestyr_rt_str_push(&j_b, JSTR(":"));
     jestyr_push_uint__cgen(&(j_b), j_line);
     jestyr_rt_str_push(&j_b, JSTR(":"));
@@ -27471,8 +27649,46 @@ void jestyr_eprint_diag(JestyrStr j_path, JestyrStr j_src, size_t j_start, Jesty
     jestyr_rt_str_free(&j_b);
 }
 
-int32_t jestyr_driver_build(Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, Jestyr_Allocator j_a, JestyrStr j_path, bool j_do_run)
+int32_t jestyr_driver_build(Jestyr_Ml* restrict j_m, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, Jestyr_Allocator j_a, JestyrStr j_path, bool j_do_run)
 {
+    size_t j_pi2 = 0;
+    while ((j_pi2 < jestyr_len__ExprData(j_p.j_ex)))
+    {
+        Jestyr_ExprData j_pe = jestyr_get__ExprData(j_p.j_ex, j_pi2);
+        if ((j_pe.j_kind == 9))
+        {
+            jestyr_eprint_diag(&((*j_m)), j_pe.j_start, JSTR("syntax error (unexpected or malformed input)"));
+            return 1;
+        }
+        j_pi2 = (j_pi2 + 1);
+    }
+    size_t j_pj = 0;
+    while ((j_pj < jestyr_len__ItemData(j_p.j_it)))
+    {
+        Jestyr_ItemData j_itd = jestyr_get__ItemData(j_p.j_it, j_pj);
+        if ((j_itd.j_kind == 99))
+        {
+            jestyr_eprint_diag(&((*j_m)), j_itd.j_start, JSTR("syntax error: expected an item"));
+            return 1;
+        }
+        j_pj = (j_pj + 1);
+    }
+    size_t j_ti2 = 0;
+    while ((j_ti2 < jestyr_len__i32(j_c.j_et)))
+    {
+        int32_t j_tid2 = jestyr_get__i32(j_c.j_et, j_ti2);
+        if ((j_tid2 >= 0))
+        {
+            Jestyr_TyData j_td2 = jestyr_get__TyData(j_c.j_tys, (size_t)(j_tid2));
+            if ((j_td2.j_kind == 16))
+            {
+                Jestyr_ExprData j_ed2 = jestyr_get__ExprData(j_p.j_ex, j_ti2);
+                jestyr_eprint_diag(&((*j_m)), j_ed2.j_start, JSTR("type error at this expression"));
+                return 1;
+            }
+        }
+        j_ti2 = (j_ti2 + 1);
+    }
     Jestyr_Esc j_e = jestyr_check_program(j_p, j_c, j_src, j_a);
     if ((jestyr_len__i32(j_e.j_dsp) > 0))
     {
@@ -27484,7 +27700,7 @@ int32_t jestyr_driver_build(Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_s
         {
             if (((int32_t)(((uint8_t)(j_dm).ptr[(j_k)])) == 10))
             {
-                jestyr_eprint_diag(j_path, j_src, (size_t)(jestyr_get__i32(j_e.j_dsp, (j_di * 2))), jestyr_rt_substr(j_dm, j_ls, j_k));
+                jestyr_eprint_diag(&((*j_m)), (size_t)(jestyr_get__i32(j_e.j_dsp, (j_di * 2))), jestyr_rt_substr(j_dm, j_ls, j_k));
                 j_di = (j_di + 1);
                 j_ls = (j_k + 1);
             }
@@ -27594,6 +27810,7 @@ int32_t jestyr_main(void)
         bool j_lmode = false;
         bool j_bmode = false;
         bool j_rmode = false;
+        bool j_amode = false;
         if ((jestyr_argc() > 2))
         {
             if (jestyr_rt_str_eq(jestyr_argv(2), JSTR("test")))
@@ -27612,21 +27829,85 @@ int32_t jestyr_main(void)
             {
                 j_rmode = true;
             }
+            if (jestyr_rt_str_eq(jestyr_argv(2), JSTR("attest")))
+            {
+                j_amode = true;
+            }
         }
-        if ((j_bmode || j_rmode))
+        if (((j_bmode || j_rmode) || j_amode))
         {
-            JestyrString j_merged = jestyr_ml_flatten(jestyr_argv(1), &(j_it), j_kwcount, j_a);
+            Jestyr_Ml j_m = (Jestyr_Ml){ .j_allsrc = jestyr_rt_str_new(), .j_nb = jestyr_rt_str_new(), .j_mods = jestyr_make__list__i32(j_a), .j_vis = jestyr_rt_str_new(), .j_seen = jestyr_rt_str_new(), .j_ren = jestyr_rt_str_new(), .j_map = jestyr_make__list__i32(j_a), .j_err = false };
+            JestyrString j_merged = jestyr_ml_flatten(&(j_m), jestyr_argv(1), &(j_it), j_kwcount, j_a);
             JestyrStr j_mv = jestyr_rt_str_view(&j_merged);
             if ((j_mv.len == 0))
             {
                 jestyr_rt_str_free(&j_merged);
                 int32_t j_result = 1;
+                jestyr_impl_Drop__List_i32___drop(&j_m.j_map);
+                jestyr_impl_Drop__List_i32___drop(&j_m.j_mods);
                 jestyr_impl_Drop__Interner__drop(&j_it);
                 return j_result;
             }
             Jestyr_Parser j_p2 = jestyr_parse_source(j_mv, &(j_it), j_kwcount, j_a);
             Jestyr_Checker j_c2 = jestyr_check_parsed(j_p2, j_mv, j_a);
-            int32_t j_drc = jestyr_driver_build(j_p2, j_c2, j_mv, j_a, jestyr_argv(1), j_rmode);
+            if (j_amode)
+            {
+                JestyrString j_cbuf = jestyr_rt_str_new();
+                jestyr_emit_program(&(j_cbuf), j_p2, j_c2, j_mv, j_a, false, JSTR(""));
+                JestyrString j_ob = jestyr_rt_str_new();
+                jestyr_rt_str_push(&j_ob, JSTR("jestyr-attest/v1\nsource "));
+                jestyr_rt_str_push(&j_ob, jestyr_argv(1));
+                jestyr_rt_str_push(&j_ob, JSTR("\nc-sha256 "));
+                jestyr_push_sha256_hex(&(j_ob), jestyr_rt_str_view(&j_cbuf));
+                jestyr_rt_str_push(&j_ob, JSTR("\ncc-flags -O2 -std=c11 -ffp-contract=off -fno-fast-math"));
+                jestyr_rt_print_str(jestyr_rt_str_view(&j_ob));
+                jestyr_rt_str_free(&j_ob);
+                jestyr_rt_str_free(&j_cbuf);
+                jestyr_rt_str_free(&j_merged);
+                int32_t j_result = 0;
+                jestyr_impl_Drop__List_i32___drop(&j_c2.j_dcoerce);
+                jestyr_impl_Drop__List_i32___drop(&j_c2.j_dcalls);
+                jestyr_impl_Drop__List_i32___drop(&j_c2.j_bcalls);
+                jestyr_impl_Drop__List_i32___drop(&j_c2.j_icalls);
+                jestyr_impl_Drop__List_i32___drop(&j_c2.j_mcalls);
+                jestyr_impl_Drop__List_i32___drop(&j_c2.j_imp);
+                jestyr_impl_Drop__List_i32___drop(&j_c2.j_tra);
+                jestyr_impl_Drop__List_i32___drop(&j_c2.j_vmap);
+                jestyr_impl_Drop__List_i32___drop(&j_c2.j_cst);
+                jestyr_impl_Drop__List_i32___drop(&j_c2.j_fns);
+                jestyr_impl_Drop__List_i32___drop(&j_c2.j_tch);
+                jestyr_impl_Drop__List_i32___drop(&j_c2.j_tdecl);
+                jestyr_impl_Drop__List_i32___drop(&j_c2.j_scst);
+                jestyr_impl_Drop__List_i32___drop(&j_c2.j_scn);
+                jestyr_impl_Drop__List_i32___drop(&j_c2.j_et);
+                jestyr_impl_Drop__List_i32___drop(&j_c2.j_tya);
+                jestyr_impl_Drop__List_TyData___drop(&j_c2.j_tys);
+                jestyr_impl_Drop__List_i32___drop(&j_p2.j_roots);
+                jestyr_impl_Drop__List_i32___drop(&j_p2.j_clar);
+                jestyr_impl_Drop__List_i32___drop(&j_p2.j_lar);
+                jestyr_impl_Drop__List_i32___drop(&j_p2.j_far);
+                jestyr_impl_Drop__List_i32___drop(&j_p2.j_gar);
+                jestyr_impl_Drop__List_i32___drop(&j_p2.j_aar);
+                jestyr_impl_Drop__List_i32___drop(&j_p2.j_ear);
+                jestyr_impl_Drop__List_i32___drop(&j_p2.j_mar);
+                jestyr_impl_Drop__List_i32___drop(&j_p2.j_iar);
+                jestyr_impl_Drop__List_ItemData___drop(&j_p2.j_it);
+                jestyr_impl_Drop__List_i32___drop(&j_p2.j_tar);
+                jestyr_impl_Drop__List_TypeData___drop(&j_p2.j_ty);
+                jestyr_impl_Drop__List_i32___drop(&j_p2.j_par);
+                jestyr_impl_Drop__List_PatData___drop(&j_p2.j_pt);
+                jestyr_impl_Drop__List_i32___drop(&j_p2.j_sar);
+                jestyr_impl_Drop__List_StmtData___drop(&j_p2.j_st);
+                jestyr_impl_Drop__List_i32___drop(&j_p2.j_ar);
+                jestyr_impl_Drop__List_ExprData___drop(&j_p2.j_ex);
+                jestyr_impl_Drop__List_bool___drop(&j_p2.j_parw);
+                jestyr_impl_Drop__List_Token___drop(&j_p2.j_toks);
+                jestyr_impl_Drop__List_i32___drop(&j_m.j_map);
+                jestyr_impl_Drop__List_i32___drop(&j_m.j_mods);
+                jestyr_impl_Drop__Interner__drop(&j_it);
+                return j_result;
+            }
+            int32_t j_drc = jestyr_driver_build(&(j_m), j_p2, j_c2, j_mv, j_a, jestyr_argv(1), j_rmode);
             jestyr_rt_str_free(&j_merged);
             int32_t j_result = j_drc;
             jestyr_impl_Drop__List_i32___drop(&j_c2.j_dcoerce);
@@ -27666,6 +27947,8 @@ int32_t jestyr_main(void)
             jestyr_impl_Drop__List_ExprData___drop(&j_p2.j_ex);
             jestyr_impl_Drop__List_bool___drop(&j_p2.j_parw);
             jestyr_impl_Drop__List_Token___drop(&j_p2.j_toks);
+            jestyr_impl_Drop__List_i32___drop(&j_m.j_map);
+            jestyr_impl_Drop__List_i32___drop(&j_m.j_mods);
             jestyr_impl_Drop__Interner__drop(&j_it);
             return j_result;
         }
@@ -27742,6 +28025,11 @@ int32_t jestyr_main(void)
     return j_result;
 }
 
+Jestyr_List__i32 jestyr_make__list__i32(Jestyr_Allocator j_a)
+{
+    return (Jestyr_List__i32){ .j_ptr = NULL, .j_len = 0, .j_cap = 0, .j_a = j_a };
+}
+
 int32_t jestyr_get__i32(Jestyr_List__i32 j_l, size_t j_i)
 {
     {
@@ -27754,9 +28042,35 @@ size_t jestyr_len__i32(Jestyr_List__i32 j_l)
     return j_l.j_len;
 }
 
-Jestyr_List__i32 jestyr_make__list__i32(Jestyr_Allocator j_a)
+Jestyr_ExprData jestyr_get__ExprData(Jestyr_List__ExprData j_l, size_t j_i)
 {
-    return (Jestyr_List__i32){ .j_ptr = NULL, .j_len = 0, .j_cap = 0, .j_a = j_a };
+    {
+        return (*(j_l.j_ptr + j_i));
+    }
+}
+
+Jestyr_TyData jestyr_get__TyData(Jestyr_List__TyData j_l, size_t j_i)
+{
+    {
+        return (*(j_l.j_ptr + j_i));
+    }
+}
+
+Jestyr_ItemData jestyr_get__ItemData(Jestyr_List__ItemData j_l, size_t j_i)
+{
+    {
+        return (*(j_l.j_ptr + j_i));
+    }
+}
+
+size_t jestyr_len__ItemData(Jestyr_List__ItemData j_l)
+{
+    return j_l.j_len;
+}
+
+size_t jestyr_len__ExprData(Jestyr_List__ExprData j_l)
+{
+    return j_l.j_len;
 }
 
 void jestyr_free__Token(Jestyr_List__Token* restrict j_l)
@@ -27775,18 +28089,6 @@ void jestyr_release__Token(Jestyr_Allocator j_a, Jestyr_Token* j_p)
     jestyr_free_bytes(j_a, (uint8_t*)(j_p));
 }
 
-Jestyr_Token jestyr_get__Token(Jestyr_List__Token j_l, size_t j_i)
-{
-    {
-        return (*(j_l.j_ptr + j_i));
-    }
-}
-
-size_t jestyr_len__Token(Jestyr_List__Token j_l)
-{
-    return j_l.j_len;
-}
-
 void jestyr_push__i32(Jestyr_List__i32* restrict j_l, int32_t j_x)
 {
     if (((*j_l).j_len == (*j_l).j_cap))
@@ -27797,8 +28099,8 @@ void jestyr_push__i32(Jestyr_List__i32* restrict j_l, int32_t j_x)
             j_newcap = ((*j_l).j_cap * 2);
         }
         int32_t* j_np = jestyr_allocate__i32((*j_l).j_a, j_newcap);
-        size_t _hi2 = (*j_l).j_len;
-        for (size_t j_i = 0; j_i < _hi2; j_i++)
+        size_t _hi41 = (*j_l).j_len;
+        for (size_t j_i = 0; j_i < _hi41; j_i++)
         {
             {
                 (*(j_np + j_i)) = (*((*j_l).j_ptr + j_i));
@@ -27827,11 +28129,16 @@ int32_t* jestyr_allocate__i32(Jestyr_Allocator j_a, size_t j_n)
     return (int32_t*)(jestyr_alloc_bytes(j_a, (j_n * sizeof(int32_t))));
 }
 
-Jestyr_ItemData jestyr_get__ItemData(Jestyr_List__ItemData j_l, size_t j_i)
+Jestyr_Token jestyr_get__Token(Jestyr_List__Token j_l, size_t j_i)
 {
     {
         return (*(j_l.j_ptr + j_i));
     }
+}
+
+size_t jestyr_len__Token(Jestyr_List__Token j_l)
+{
+    return j_l.j_len;
 }
 
 void jestyr_truncate__i32(Jestyr_List__i32* restrict j_l, size_t j_n)
@@ -27842,21 +28149,7 @@ void jestyr_truncate__i32(Jestyr_List__i32* restrict j_l, size_t j_n)
     }
 }
 
-Jestyr_ExprData jestyr_get__ExprData(Jestyr_List__ExprData j_l, size_t j_i)
-{
-    {
-        return (*(j_l.j_ptr + j_i));
-    }
-}
-
 Jestyr_StmtData jestyr_get__StmtData(Jestyr_List__StmtData j_l, size_t j_i)
-{
-    {
-        return (*(j_l.j_ptr + j_i));
-    }
-}
-
-Jestyr_TyData jestyr_get__TyData(Jestyr_List__TyData j_l, size_t j_i)
 {
     {
         return (*(j_l.j_ptr + j_i));
@@ -27893,11 +28186,6 @@ size_t jestyr_len__TypeData(Jestyr_List__TypeData j_l)
     return j_l.j_len;
 }
 
-size_t jestyr_len__ExprData(Jestyr_List__ExprData j_l)
-{
-    return j_l.j_len;
-}
-
 size_t jestyr_len__TyData(Jestyr_List__TyData j_l)
 {
     return j_l.j_len;
@@ -27929,11 +28217,6 @@ void jestyr_set__bool(Jestyr_List__bool* restrict j_l, size_t j_i, bool j_x)
     }
 }
 
-size_t jestyr_len__ItemData(Jestyr_List__ItemData j_l)
-{
-    return j_l.j_len;
-}
-
 void jestyr_push__bool(Jestyr_List__bool* restrict j_l, bool j_x)
 {
     if (((*j_l).j_len == (*j_l).j_cap))
@@ -27944,8 +28227,8 @@ void jestyr_push__bool(Jestyr_List__bool* restrict j_l, bool j_x)
             j_newcap = ((*j_l).j_cap * 2);
         }
         bool* j_np = jestyr_allocate__bool((*j_l).j_a, j_newcap);
-        size_t _hi3 = (*j_l).j_len;
-        for (size_t j_i = 0; j_i < _hi3; j_i++)
+        size_t _hi42 = (*j_l).j_len;
+        for (size_t j_i = 0; j_i < _hi42; j_i++)
         {
             {
                 (*(j_np + j_i)) = (*((*j_l).j_ptr + j_i));
@@ -27994,8 +28277,8 @@ void jestyr_push__TyData(Jestyr_List__TyData* restrict j_l, Jestyr_TyData j_x)
             j_newcap = ((*j_l).j_cap * 2);
         }
         Jestyr_TyData* j_np = jestyr_allocate__TyData((*j_l).j_a, j_newcap);
-        size_t _hi4 = (*j_l).j_len;
-        for (size_t j_i = 0; j_i < _hi4; j_i++)
+        size_t _hi43 = (*j_l).j_len;
+        for (size_t j_i = 0; j_i < _hi43; j_i++)
         {
             {
                 (*(j_np + j_i)) = (*((*j_l).j_ptr + j_i));
@@ -28059,8 +28342,8 @@ void jestyr_push__StmtData(Jestyr_List__StmtData* restrict j_l, Jestyr_StmtData 
             j_newcap = ((*j_l).j_cap * 2);
         }
         Jestyr_StmtData* j_np = jestyr_allocate__StmtData((*j_l).j_a, j_newcap);
-        size_t _hi5 = (*j_l).j_len;
-        for (size_t j_i = 0; j_i < _hi5; j_i++)
+        size_t _hi44 = (*j_l).j_len;
+        for (size_t j_i = 0; j_i < _hi44; j_i++)
         {
             {
                 (*(j_np + j_i)) = (*((*j_l).j_ptr + j_i));
@@ -28099,8 +28382,8 @@ void jestyr_push__ItemData(Jestyr_List__ItemData* restrict j_l, Jestyr_ItemData 
             j_newcap = ((*j_l).j_cap * 2);
         }
         Jestyr_ItemData* j_np = jestyr_allocate__ItemData((*j_l).j_a, j_newcap);
-        size_t _hi6 = (*j_l).j_len;
-        for (size_t j_i = 0; j_i < _hi6; j_i++)
+        size_t _hi45 = (*j_l).j_len;
+        for (size_t j_i = 0; j_i < _hi45; j_i++)
         {
             {
                 (*(j_np + j_i)) = (*((*j_l).j_ptr + j_i));
@@ -28139,8 +28422,8 @@ void jestyr_push__TypeData(Jestyr_List__TypeData* restrict j_l, Jestyr_TypeData 
             j_newcap = ((*j_l).j_cap * 2);
         }
         Jestyr_TypeData* j_np = jestyr_allocate__TypeData((*j_l).j_a, j_newcap);
-        size_t _hi7 = (*j_l).j_len;
-        for (size_t j_i = 0; j_i < _hi7; j_i++)
+        size_t _hi46 = (*j_l).j_len;
+        for (size_t j_i = 0; j_i < _hi46; j_i++)
         {
             {
                 (*(j_np + j_i)) = (*((*j_l).j_ptr + j_i));
@@ -28179,8 +28462,8 @@ void jestyr_push__PatData(Jestyr_List__PatData* restrict j_l, Jestyr_PatData j_x
             j_newcap = ((*j_l).j_cap * 2);
         }
         Jestyr_PatData* j_np = jestyr_allocate__PatData((*j_l).j_a, j_newcap);
-        size_t _hi8 = (*j_l).j_len;
-        for (size_t j_i = 0; j_i < _hi8; j_i++)
+        size_t _hi47 = (*j_l).j_len;
+        for (size_t j_i = 0; j_i < _hi47; j_i++)
         {
             {
                 (*(j_np + j_i)) = (*((*j_l).j_ptr + j_i));
@@ -28224,8 +28507,8 @@ void jestyr_push__ExprData(Jestyr_List__ExprData* restrict j_l, Jestyr_ExprData 
             j_newcap = ((*j_l).j_cap * 2);
         }
         Jestyr_ExprData* j_np = jestyr_allocate__ExprData((*j_l).j_a, j_newcap);
-        size_t _hi9 = (*j_l).j_len;
-        for (size_t j_i = 0; j_i < _hi9; j_i++)
+        size_t _hi48 = (*j_l).j_len;
+        for (size_t j_i = 0; j_i < _hi48; j_i++)
         {
             {
                 (*(j_np + j_i)) = (*((*j_l).j_ptr + j_i));
@@ -28264,8 +28547,8 @@ void jestyr_push__Token(Jestyr_List__Token* restrict j_l, Jestyr_Token j_x)
             j_newcap = ((*j_l).j_cap * 2);
         }
         Jestyr_Token* j_np = jestyr_allocate__Token((*j_l).j_a, j_newcap);
-        size_t _hi10 = (*j_l).j_len;
-        for (size_t j_i = 0; j_i < _hi10; j_i++)
+        size_t _hi49 = (*j_l).j_len;
+        for (size_t j_i = 0; j_i < _hi49; j_i++)
         {
             {
                 (*(j_np + j_i)) = (*((*j_l).j_ptr + j_i));
@@ -28329,22 +28612,22 @@ void jestyr_impl_Drop__List_i32___drop(Jestyr_List__i32* restrict j_self)
     jestyr_release_buf((*j_self).j_a, (uint8_t*)((*j_self).j_ptr), (*j_self).j_cap);
 }
 
-void jestyr_impl_Drop__List_ItemData___drop(Jestyr_List__ItemData* restrict j_self)
-{
-    jestyr_release_buf((*j_self).j_a, (uint8_t*)((*j_self).j_ptr), (*j_self).j_cap);
-}
-
 void jestyr_impl_Drop__List_ExprData___drop(Jestyr_List__ExprData* restrict j_self)
 {
     jestyr_release_buf((*j_self).j_a, (uint8_t*)((*j_self).j_ptr), (*j_self).j_cap);
 }
 
-void jestyr_impl_Drop__List_StmtData___drop(Jestyr_List__StmtData* restrict j_self)
+void jestyr_impl_Drop__List_TyData___drop(Jestyr_List__TyData* restrict j_self)
 {
     jestyr_release_buf((*j_self).j_a, (uint8_t*)((*j_self).j_ptr), (*j_self).j_cap);
 }
 
-void jestyr_impl_Drop__List_TyData___drop(Jestyr_List__TyData* restrict j_self)
+void jestyr_impl_Drop__List_ItemData___drop(Jestyr_List__ItemData* restrict j_self)
+{
+    jestyr_release_buf((*j_self).j_a, (uint8_t*)((*j_self).j_ptr), (*j_self).j_cap);
+}
+
+void jestyr_impl_Drop__List_StmtData___drop(Jestyr_List__StmtData* restrict j_self)
 {
     jestyr_release_buf((*j_self).j_a, (uint8_t*)((*j_self).j_ptr), (*j_self).j_cap);
 }

@@ -7709,7 +7709,57 @@ mod c_oracle {
         assert!(stderr.contains(": error: "), "diagnostics not rendered: {stderr}");
         assert!(stderr.contains("bad.jtr:"), "diagnostic path missing: {stderr}");
         assert!(!dir.join("bad.c").exists(), "driver must not emit C for a refused file");
-        eprintln!("driver: build + run + refusal all green");
+        // 4. A PARSE error refuses with a located syntax diagnostic (generic v1 message).
+        // The scan keys on the parser's RECOVERY artifacts (Error nodes), which expression-
+        // position breakage reliably produces; some item-level malformations recover into
+        // plausible-but-broken items and still degrade to gcc (documented v1 partiality).
+        let synbad = dir.join("synbad.jtr");
+        std::fs::write(&synbad, "fn main() -> i32 { return 0 }\nfn broken() -> i32 { return ) }\n").unwrap();
+        let out = Command::new(&jc).args([synbad.to_str().unwrap(), "build"]).output().unwrap();
+        assert!(!out.status.success(), "driver must refuse a parse-error file");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("syntax error"), "parse refusal not rendered: {stderr}");
+        assert!(stderr.contains("synbad.jtr:2:"), "parse diagnostic location wrong: {stderr}");
+        assert!(!dir.join("synbad.c").exists(), "driver must not emit C for a parse-error file");
+        // 5. A TYPE error (an unknown field -> the Error type, typeerr.jtr's shape) refuses
+        // likewise. (Prim-operator misuse recovers to the operand type, not Error — v1
+        // catches what the checker actually marks Error.)
+        let tybad = dir.join("tybad.jtr");
+        std::fs::write(
+            &tybad,
+            "struct P { x: i32 }\nfn main() -> i32 {\n    let p: P = P { x: 1 }\n    return p.z\n}\n",
+        )
+        .unwrap();
+        let out = Command::new(&jc).args([tybad.to_str().unwrap(), "build"]).output().unwrap();
+        assert!(!out.status.success(), "driver must refuse a type-error file");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("type error"), "type refusal not rendered: {stderr}");
+        assert!(stderr.contains("tybad.jtr:4:"), "type diagnostic location wrong: {stderr}");
+        eprintln!("driver: build + run + escape/parse/type refusal all green");
+    }
+
+    /// **In-language attest.** `jc <file> attest` emits the manifest HEADER — version,
+    /// source id, the sha256 of exactly the C `build` would emit (the Jestyr-written
+    /// SHA-256 in `examples/std/sha256.jtr`), and the locked compile flags — byte-equal
+    /// to the reference `attest::manifest`'s first four lines. The per-item records
+    /// section is a documented follow-up (it needs the printer's signature render).
+    #[test]
+    fn jestyr_driver_attest_header_matches_reference() {
+        let jc = build_exe("examples/std/cgen.jtr");
+        let file = "examples/hello.jtr";
+        let out = Command::new(&jc).args([file, "attest"]).output().unwrap();
+        assert!(out.status.success(), "jc attest failed: {}", String::from_utf8_lossy(&out.stderr));
+        let got: Vec<String> =
+            String::from_utf8(out.stdout).unwrap().lines().map(|s| s.to_string()).collect();
+        let src = std::fs::read_to_string(file).unwrap();
+        let (tokens, _) = crate::lexer::Lexer::new(&src).tokenize();
+        let (ast, _) = crate::parser::Parser::new(&src, tokens).parse();
+        let (info, _) = crate::typeck::check(&ast);
+        let want_full = crate::attest::manifest(file, &src, &ast, &info);
+        let want: Vec<String> = want_full.lines().take(4).map(|s| s.to_string()).collect();
+        assert_eq!(got, want, "attest header diverged from the reference manifest");
+        assert!(got[2].starts_with("c-sha256 "), "hash line malformed");
+        eprintln!("attest header: byte-equal to the reference (incl. the Jestyr-written sha256)");
     }
 
     /// **In-language modules.** `jc <file> build|run` flattens the import closure itself
@@ -7746,7 +7796,34 @@ mod c_oracle {
         let want = String::from_utf8_lossy(&want_out.stdout).replace("\r\n", "\n");
         assert_eq!(got, want, "multi-module output diverged from the reference module build");
         assert_eq!(want, "42\n30\n", "fixture sanity");
-        eprintln!("driver modules: multi-file + collision + diamond all green");
+
+        // Per-FILE diagnostic attribution (the `#line` analogue): an escape error inside an
+        // imported module must render against THAT file's original line:col, and an error in
+        // the importing file must render at its ORIGINAL line — i.e. unshifted by the removed
+        // `import` line above it (the checkpoint mapper's job).
+        std::fs::write(
+            dir.join("bad_lib.jtr"),
+            "// a library whose third line returns a borrow\n// padding line\npub fn leak(read s: String) -> String { return s }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("app2.jtr"),
+            "import \"bad_lib\"\n// padding line\npub fn leak2(read s: String) -> String { return s }\nfn main() -> i32 { return 0 }\n",
+        )
+        .unwrap();
+        let app2 = dir.join("app2.jtr");
+        let out = Command::new(&jc).args([app2.to_str().unwrap(), "build"]).output().unwrap();
+        assert!(!out.status.success(), "driver must refuse the bad multi-module program");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("bad_lib.jtr:3:48: error: cannot return borrow"),
+            "imported module's diagnostic not attributed to its file: {stderr}"
+        );
+        assert!(
+            stderr.contains("app2.jtr:3:"),
+            "importer's diagnostic line not corrected for the removed import: {stderr}"
+        );
+        eprintln!("driver modules: multi-file + collision + diamond + per-file attribution all green");
     }
 
     /// **The self-build.** The ported compiler compiles ITSELF from its real multi-file
@@ -7801,7 +7878,7 @@ mod c_oracle {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr"];
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr"];
 
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
@@ -7947,7 +8024,7 @@ mod c_oracle {
     /// `examples/std/cgen.jtr` (each module's imports precede it, diamonds memoized —
     /// exactly the order `module::load` merges their items in).
     const SELFHOST_MODULES: &[&str] =
-        &["mem", "intern", "fs", "env", "list", "tokens", "parser", "typeck", "escape", "cgen"];
+        &["mem", "intern", "fs", "env", "list", "tokens", "parser", "typeck", "escape", "sha256", "cgen"];
 
     /// Flatten the multi-module Jestyr compiler into ONE single-file program — the
     /// R2-full "concatenated-source build". The loader already compiles a program as a
