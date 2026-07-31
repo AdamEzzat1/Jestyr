@@ -8283,6 +8283,92 @@ fn main() -> i32 {
         assert!(err.contains("targets"), "diagnostic should name `targets`: {err}");
     }
 
+    /// **CTFE (workstream G, increment 5) — bounded artifact generation end-to-end.**
+    /// The tier-5 foundation: a build script *computes* the bytes of a generated file,
+    /// the plan records the artifact by its **SHA-256** rather than its content, and
+    /// `--emit` writes it.
+    ///
+    /// Note where the boundary sits, because it is the whole design: the evaluator
+    /// gained no new power — it computed a string, exactly as it computes any other
+    /// comptime value — and the *driver* places the file, only under an explicit
+    /// `--emit`. Generation is a pure function whose result the user chooses to write,
+    /// never an effect a script can perform. This checks reproducibility (same script →
+    /// same digest), that `--emit` is required, and that the generated program is
+    /// itself real Jestyr the compiler will accept.
+    #[test]
+    fn generated_artifacts_are_reproducible_and_written_only_on_demand() {
+        let dir = std::env::temp_dir().join("jestyr_ctfe_gen_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The script generates a Jestyr source file — a table of accessors derived at
+        // compile time — and then names that generated file as a build target.
+        std::fs::write(
+            dir.join("build.jestyr"),
+            "const targets: i64 = 1\n\
+             fn source(i: i64) -> str { return \"gen/table.jtr\" }\n\
+             fn output(i: i64) -> str { return \"gen_table\" }\n\
+             \n\
+             const artifacts: i64 = 1\n\
+             fn artifact_path(i: i64) -> str { return \"gen/table.jtr\" }\n\
+             fn rows(i: i64) -> str {\n\
+             \x20   if i >= 3 { return \"\" }\n\
+             \x20   return \"    print_int(\" + \"10\" + \")\\n\" + rows(i + 1)\n\
+             }\n\
+             fn artifact_text(i: i64) -> str {\n\
+             \x20   return \"// generated at compile time -- do not edit\\n\" +\n\
+             \x20          \"fn main() -> i32 {\\n\" + rows(0) + \"    return 0\\n}\\n\"\n\
+             }\n",
+        )
+        .unwrap();
+
+        let jestyrc = {
+            let t = std::env::current_exe().unwrap();
+            t.parent().unwrap().parent().unwrap().join(format!("jestyrc{}", std::env::consts::EXE_SUFFIX))
+        };
+        let plan_run = |extra: &[&str]| {
+            let mut a = vec!["plan", "build.jestyr"];
+            a.extend_from_slice(extra);
+            Command::new(&jestyrc).args(a).current_dir(&dir).output().unwrap()
+        };
+
+        // 1. Planning alone does NOT write the artifact — and says so.
+        let out = plan_run(&[]);
+        assert!(out.status.success(), "plan failed: {}", String::from_utf8_lossy(&out.stderr));
+        let plan = String::from_utf8(out.stdout).unwrap().replace("\r\n", "\n");
+        assert!(!dir.join("gen/table.jtr").exists(), "an artifact was written without --emit");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--emit"),
+            "should say how to write it"
+        );
+
+        // 2. The plan records the artifact by hash, and the hash is reproducible.
+        // The line is `artifact <path> <bytes> sha256 <hex>`.
+        let art_line = plan
+            .lines()
+            .find(|l| l.starts_with("artifact gen/table.jtr "))
+            .expect("an artifact line")
+            .to_string();
+        assert!(art_line.contains(" sha256 "), "{plan}");
+        let digest = art_line.rsplit(' ').next().expect("a digest").to_string();
+        for _ in 0..3 {
+            let again = String::from_utf8(plan_run(&[]).stdout).unwrap().replace("\r\n", "\n");
+            assert_eq!(again, plan, "the same script must generate byte-identical artifacts");
+        }
+
+        // 3. `--emit --build` writes it, and what was generated is real Jestyr: the
+        //    compiler accepts the generated file and the program runs.
+        let out = plan_run(&["--emit", "--build"]);
+        assert!(out.status.success(), "emit+build failed: {}", String::from_utf8_lossy(&out.stderr));
+        let written = std::fs::read_to_string(dir.join("gen/table.jtr")).unwrap();
+        assert!(written.starts_with("// generated at compile time"), "{written}");
+        assert_eq!(crate::sha256::hex(written.as_bytes()), digest, "the plan's hash must be the bytes on disk");
+
+        let exe = dir.join(format!("gen_table{}", std::env::consts::EXE_SUFFIX));
+        assert!(exe.exists(), "the generated program was not built");
+        let r = Command::new(&exe).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&r.stdout).replace("\r\n", "\n"), "10\n10\n10\n");
+    }
+
     /// **Doc-comment trivia in-language.** `tokens.collect_docs` recovers exactly the
     /// reference lexer's `tokenize_with_docs` third result — kind, block-ness, the whole
     /// comment span, and the text span — over the whole corpus. It finds comments by

@@ -17,7 +17,7 @@ or mutate the compiler's own state destroys all three at once.
 | 2 | `comptime { … }` blocks in user syntax | **done in the Rust reference** — G2; port mirror outstanding |
 | 3 | Type reflection over the declared shape | **done in the Rust reference** — G3 (sizes/offsets wait on **L**) |
 | 4 | `build.jestyr` — the build described in Jestyr | **done in the Rust reference** — G4 (`jestyrc plan`) |
-| 5 | Bounded, attestable code/artifact generation | not started |
+| 5 | Bounded, attestable artifact generation | **done in the Rust reference** — G5 (`--emit`) |
 
 ---
 
@@ -220,10 +220,59 @@ is an error rather than an apparent hang.
 becomes expressible directly (`const targets = [Target{…}, …]`). The driver contract
 does not need to change for that.
 
-## Tier 5 — bounded generation *(not started)*
+## Tier 5 — bounded artifact generation
 
-Deterministic, attestable artifact generation — the foundation a future IR builder
-(MOTLEY) would sit on. Explicitly **not** arbitrary source-string injection.
+A build script may *compute the bytes of a file*. The plan records each artifact by
+its **SHA-256**, and `--emit` writes it:
+
+```jestyr
+const artifacts: i64 = 1
+fn artifact_path(i: i64) -> str { return "gen/table.jtr" }
+
+fn rows(i: i64) -> str {
+    if i >= 3 { return "" }
+    return "    print_int(10)\n" + rows(i + 1)
+}
+fn artifact_text(i: i64) -> str {
+    return "// generated at compile time -- do not edit\n" +
+           "fn main() -> i32 {\n" + rows(0) + "    return 0\n}\n"
+}
+```
+
+```text
+artifacts 1
+artifact gen/table.jtr 132 sha256 33135a25f790…
+```
+
+A generated file can then be named as a build target, so a program can be computed
+at compile time and compiled in the same invocation.
+
+**Where the boundary sits — this is the whole design.** The evaluator gained *no new
+power*: it computed a string, exactly as it computes any other comptime value, and it
+still cannot touch a file. The **driver** places the file, and only under an explicit
+`--emit`. Generation is a pure function whose result the user chooses to write, never
+an effect a script can perform.
+
+Three properties follow:
+
+- **Reproducible.** Same script, same bytes, same digest — the artifact is a pure
+  function of the source.
+- **Attestable.** The plan carries the hash, not the content, so a generated file can
+  be pinned and drift-checked in CI exactly the way `attest`'s manifest pins the
+  emitted C — and a plan diff shows *that* an artifact changed without drowning the
+  reviewer in the change.
+- **Bounded, literally.** Artifacts are size-capped, and a path that is absolute or
+  contains `..` is **refused rather than normalised** — a script that wants to write
+  outside the project is not a script whose intent should be guessed at.
+
+This is deliberately *artifact* generation, not source-string injection into the
+program being compiled: what a script produces is a file the user can read, diff and
+hash before anything acts on it.
+
+**Next slice:** aggregate comptime values (`Value::List`) turn this into real table
+generation — emitting a `[N]T` static directly rather than through a generated source
+file. That single evaluator extension is also what tier 3's field iteration and a
+richer tier-4 plan want, so it is the highest-leverage next piece of CTFE work.
 
 ---
 

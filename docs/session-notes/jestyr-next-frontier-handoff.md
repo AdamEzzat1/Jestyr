@@ -28,7 +28,8 @@
 
 | Increment | Commit | What |
 |---|---|---|
-| **G4** `build.jestyr` | *(this run)* | `src/buildscript.rs` + `jestyrc plan <script> [--build]`. The build described in Jestyr and **evaluated, never run**. The plan is a *pure function of an index* (`const targets` + `fn source(i)`/`fn output(i)`) rather than the imperative `exe(…)`/`test(…)` shape, because that shape needs comptime **effects** — the one thing the ladder exists to forbid. `Interp::{eval_const, call_fn}` added. `examples/build.jestyr` is the canonical demo (a `.jestyr` extension, so no golden sweeps it). |
+| **G5** bounded generation | *(this run)* | `jestyrc plan … --emit`. A build script **computes the bytes of a file**; the plan records it by SHA-256, and the driver writes it only on explicit `--emit`. The evaluator gained no new power — it computed a string — so generation is a pure function whose result the *user* places, never an effect a script performs. Reproducible, attestable (hash in the plan), and bounded literally: size-capped, and an absolute or `..` path is **refused, not normalised**. A generated file can be named as a build target, so a program can be computed and compiled in one invocation. |
+| **G4** `build.jestyr` | `29bd2bd` | `src/buildscript.rs` + `jestyrc plan <script> [--build]`. The build described in Jestyr and **evaluated, never run**. The plan is a *pure function of an index* (`const targets` + `fn source(i)`/`fn output(i)`) rather than the imperative `exe(…)`/`test(…)` shape, because that shape needs comptime **effects** — the one thing the ladder exists to forbid. Closes K's last leftover. `Interp::{eval_const, call_fn}` added. `examples/build.jestyr` is the canonical demo (a `.jestyr` extension, so no golden sweeps it). |
 | **G3** reflection | `4a85bc6` | `@type_name` / `@field_count` / `@field_name` / `@field_type` over the **declared shape**, answered by this compiler and folded to literals. |
 | **G2** comptime blocks | `b063ca4` | `comptime { … }` in user syntax, reusing the existing keyword. Typed as and emitted as the literal it folds to; **the body belongs to the interpreter alone**, so non-users are byte-identical with no gating flag. |
 | *(chore)* seed refresh | `458911a` | `bootstrap_seed_is_current` was **already failing on master** — the committed flat was missing the ten import-placeholder blank lines. `jestyr_seed.c` was byte-identical, so it was cosmetic; the gcc-only bootstrap was never broken, only its drift guard. |
@@ -294,20 +295,24 @@ most; L wants G's comptime for layout queries; Q builds on both).
    structural: a non-deterministic build script cannot be *written*, since the
    evaluator has no arm for a clock or an environment read. `examples/build.jestyr` is
    the demo; a `.jestyr` extension means no golden sweeps it.
-5. **Tier 5 — bounded generation. NOT STARTED, and blocked on `Value::List`** (finding
-   1). Build aggregate comptime values first; then a generated *data table* emitted as
-   a C static array is the smallest real tier-5 increment. Explicitly not arbitrary
-   source-string injection.
+5. ~~**Tier 5 — bounded generation**~~ — **DONE (G5)**, foundation laid.
+   `jestyrc plan … --emit`: a script *computes* an artifact's bytes, the plan records
+   it by SHA-256, the driver writes it only on demand. The design point is where the
+   boundary sits — **the evaluator gained no new power**; it computed a string, and the
+   *driver* places the file. So generation is a pure function the user chooses to
+   apply, not an effect a script can perform. Reproducible, attestable, and bounded
+   literally (size cap; an absolute or `..` path is refused rather than normalised).
+   Deliberately *artifact* generation, not source-string injection: what a script
+   produces is a file you can read, diff and hash before anything acts on it.
 
 **The outstanding CTFE work, in the order it should be done:**
 
 | # | Work | Notes |
 |---|---|---|
-| 1 | `Value::List` — aggregate comptime values | unblocks three separate things at once (finding 1) |
+| 1 | `Value::List` — aggregate comptime values | unblocks three separate things at once (finding 1); turns tier 5 into real *table* generation (a `[N]T` static) rather than generation via a source file |
 | 2 | Comptime-only functions | unblocks field *iteration* end-to-end (finding 2) |
-| 3 | **Port mirrors for G2/G3/G4** | the big one — see below |
-| 4 | Tier 5 bounded generation | after 1 |
-| 5 | `@size_of`/`@align_of`/`@offset_of` as comptime values | after **L** (finding 3) |
+| 3 | **Port mirrors for G2/G3** | the big one — see below |
+| 4 | `@size_of`/`@align_of`/`@offset_of` as comptime values | after **L** (finding 3) |
 
 **On the port mirrors (item 3).** Nothing is broken today: G2–G4 changed no emitted C
 for any existing program, so all 134 corpus goldens, the concat, test mode, the
@@ -356,13 +361,13 @@ memory + `PARALLELISM-HANDOFF.md`).
 
 **Done:** ~~O1 records~~ (51–52) → ~~O2 doc~~ (53–54) → **workstream O complete** →
 ~~G1 the comptime interpreter~~ (`ebf8397`) → ~~G2 `comptime` blocks~~ (`b063ca4`) →
-~~G3 reflection~~ (`4a85bc6`) → ~~G4 `build.jestyr`~~ — **CTFE tiers 0–4 are done on the
-reference side**, and the tier ladder is documented in `docs/ctfe-tiers.md`.
+~~G3 reflection~~ (`4a85bc6`) → ~~G4 `build.jestyr`~~ (`29bd2bd`) → ~~G5 bounded
+generation~~ — **the whole CTFE tier ladder (0–5) is done on the reference side**, and
+documented in `docs/ctfe-tiers.md`.
 
 **Next:** `Value::List` (aggregate comptime values — unblocks three things at once) →
-comptime-only functions → the **G2–G4 port mirrors** → tier 5 bounded generation →
-L layout 1–3 (opt-in, byte-identity preserved) → Q SIMD. `@size_of` as a comptime
-*value* comes after L.
+comptime-only functions → the **G2/G3 port mirrors** → L layout 1–3 (opt-in,
+byte-identity preserved) → Q SIMD. `@size_of` as a comptime *value* comes after L.
 
 `#line` (§1) is an independent, optional increment — take it whenever the port's `build`
 C needs to match the reference's, not before. Keep every increment two-sided-green:
@@ -378,13 +383,15 @@ and its Rust-only tests first, then the mirror, then the corpus file, in that or
 
 ## One-line
 Self-hosting is finished and productized, **workstream O is complete in-language**, and
-**CTFE tiers 0–4 are now done on the reference side** — a total comptime interpreter
-that closed a silent zero-length-array miscompile, `comptime { … }` in user syntax,
-reflection over the declared shape in the collision-proof `@` namespace, and a
-`build.jestyr` that is *evaluated, never run* (its plan a pure function of an index, so
-determinism is a property rather than a convention). The ladder is documented in
-`docs/ctfe-tiers.md`. What's left is aggregate comptime values (which unblocks three
-things at once), comptime-only functions, the **G2–G4 port mirrors**, tier-5 bounded
-generation, opt-in memory layout, SIMD, and the optional `#line` port — each landed
+**the whole CTFE tier ladder (0–5) is now done on the reference side** — a total
+comptime interpreter that closed a silent zero-length-array miscompile, `comptime { … }`
+in user syntax, reflection over the declared shape in the collision-proof `@`
+namespace, a `build.jestyr` that is *evaluated, never run*, and bounded artifact
+generation. The through-line is that **purity was never traded away to get power**:
+each tier added a capability without giving the evaluator an effect, so determinism and
+reproducibility stayed properties of the design rather than conventions to police. The
+ladder is documented in `docs/ctfe-tiers.md`. What's left is aggregate comptime values
+(which unblocks three things at once), comptime-only functions, the **G2/G3 port
+mirrors**, opt-in memory layout, SIMD, and the optional `#line` port — each landed
 increment-by-increment under the two-sided golden discipline with the bootstrap seed
 refreshed at every `examples/std` change.

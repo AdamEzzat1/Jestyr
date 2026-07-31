@@ -382,8 +382,9 @@ fn run() -> ExitCode {
             // `plan <build.jestyr> [--build]` — evaluate a build description and print
             // its plan; `--build` additionally compiles each target it names.
             let build = args[2..].iter().any(|a| a == "--build");
+            let emit = args[2..].iter().any(|a| a == "--emit");
             match args[2..].iter().find(|a| !a.starts_with("--")) {
-                Some(p) => return run_plan(p, build),
+                Some(p) => return run_plan(p, build, emit),
                 None => {
                     eprintln!("error: `plan` needs a build-script file argument");
                     return ExitCode::FAILURE;
@@ -592,7 +593,7 @@ fn program_has_main(ast: &ast::Ast) -> bool {
 /// An explicit subcommand rather than magic on the filename: `jestyrc plan foo.jestyr`
 /// says what it does, and nothing changes meaning because a file happens to be called
 /// `build.jestyr`.
-fn run_plan(path: &str, build: bool) -> ExitCode {
+fn run_plan(path: &str, build: bool, emit: bool) -> ExitCode {
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -622,6 +623,34 @@ fn run_plan(path: &str, build: bool) -> ExitCode {
         }
     };
     print!("{}", plan.render());
+
+    // `--emit` writes the generated artifacts (roadmap G tier 5). The evaluator never
+    // touched a file to produce these — it computed strings, exactly as it computes
+    // any other comptime value — so writing them is an explicit act by the *user*,
+    // not an effect a build script was able to perform.
+    if emit {
+        for a in &plan.artifacts {
+            if let Some(parent) = Path::new(&a.path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        eprintln!("error: cannot create `{}`: {e}", parent.display());
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            if let Err(e) = std::fs::write(&a.path, &a.content) {
+                eprintln!("error: cannot write `{}`: {e}", a.path);
+                return ExitCode::FAILURE;
+            }
+            eprintln!("emitted {} ({} bytes, sha256 {})", a.path, a.content.len(), a.sha256());
+        }
+    } else if !plan.artifacts.is_empty() {
+        eprintln!(
+            "note: {} generated artifact(s) not written; pass --emit to write them",
+            plan.artifacts.len()
+        );
+    }
+
     if !build {
         return ExitCode::SUCCESS;
     }
@@ -911,7 +940,8 @@ fn print_usage() {
     eprintln!("                               as breaking/compatible (exit 1 if any breaking)");
     eprintln!("    jestyrc plan   <build.jestyr>");
     eprintln!("                               evaluate a build script and print its build plan");
-    eprintln!("                               (add --build to compile each target it names)");
+    eprintln!("                               (--build compiles each target it names;");
+    eprintln!("                                --emit writes its comptime-generated artifacts)");
 }
 
 fn dump_tokens(src: &str, path: &str, tokens: &[token::Token]) {
