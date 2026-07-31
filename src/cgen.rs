@@ -4639,6 +4639,20 @@ impl<'a> Cgen<'a> {
                 let addr = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".to_string());
                 return format!("((void*)({addr}))");
             }
+            // Compile-time reflection (roadmap G tier 3) — `@type_name(T)`,
+            // `@field_count(T)`, `@field_name(T, i)`, `@field_type(T, i)`. Unlike
+            // `size_of`/`align_of`/`offset_of`, these are answered by *this* compiler
+            // rather than deferred to C, so they reach the output as a literal.
+            //
+            // Total, and never the first place a user hears about a bad query:
+            // `check_reflect_call` has already diagnosed it during checking.
+            if comptime::is_reflect_intrinsic(&n.name) {
+                return match comptime::Interp::new(ast).eval(call_id) {
+                    Ok(comptime::Value::Int(i)) => i.to_string(),
+                    Ok(comptime::Value::Str(s)) => format!("JSTR({})", c_string_literal(&s)),
+                    _ => "0".to_string(),
+                };
+            }
         }
         if let ExprKind::Name(n) = &ast.expr_at(callee).kind {
             // enum-variant constructor with a payload, e.g. `circle(2.0)`
@@ -8276,6 +8290,12 @@ fn is_intrinsic(name: &str) -> bool {
         name,
         "print_int" | "print_float" | "print_str" | "print_bool"
             | "alloc" | "alloc_i32" | "realloc" | "realloc_i32" | "free_ptr" | "size_of" | "slice"
+            // NOTE: the tier-3 reflection intrinsics are deliberately NOT listed here.
+            // This list keeps a *bare value reference* to an intrinsic from being read
+            // as a closure capture; reflection is only ever **called**, never referenced
+            // as a value, so listing it would buy nothing — and would actively break any
+            // program with a local named `field_count`, which the self-hosted compiler
+            // itself has several of.
             | "align_of" | "offset_of" | "count_codepoints" | "codepoints" | "from_utf8" | "is_utf8"
             | "substr" | "str_eq" | "starts_with" | "ends_with" | "contains" | "find" | "trim"
             | "count_graphemes" | "graphemes" | "split" | "try_from_utf8" | "eq_fold"

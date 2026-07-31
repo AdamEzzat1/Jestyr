@@ -103,6 +103,9 @@ pub struct Interp<'a> {
     consts: HashMap<String, ExprId>,
     /// Top-level functions with a body, by name — the callable surface.
     fns: HashMap<String, &'a FnDecl>,
+    /// Top-level `struct`/`record`/`union` bodies, by name — the surface the
+    /// reflection intrinsics read (tier 3).
+    structs: HashMap<String, &'a StructBody>,
     /// Consts currently being evaluated, so a cycle is reported rather than looped.
     in_progress: HashSet<String>,
     /// Set when a `return` fires, and carried up through every enclosing block
@@ -119,6 +122,7 @@ impl<'a> Interp<'a> {
     pub fn new(ast: &'a Ast) -> Interp<'a> {
         let mut consts = HashMap::new();
         let mut fns = HashMap::new();
+        let mut structs = HashMap::new();
         for item in &ast.items {
             match item {
                 Item::Const(c) => {
@@ -127,10 +131,24 @@ impl<'a> Interp<'a> {
                 Item::Fn(f) => {
                     fns.insert(f.name.name.clone(), f);
                 }
+                // `record` and `union` share the `Struct` item and the field grammar,
+                // so all three reflect identically.
+                Item::Struct { name, body, .. } => {
+                    structs.insert(name.name.clone(), body);
+                }
                 _ => {}
             }
         }
-        Interp { ast, consts, fns, in_progress: HashSet::new(), returning: None, fuel: FUEL, depth: 0 }
+        Interp {
+            ast,
+            consts,
+            fns,
+            structs,
+            in_progress: HashSet::new(),
+            returning: None,
+            fuel: FUEL,
+            depth: 0,
+        }
     }
 
     /// Evaluate one expression to a comptime value. Each call gets a fresh step
@@ -432,6 +450,19 @@ impl<'a> Interp<'a> {
     }
 
     fn eval_call(&mut self, callee: ExprId, args: &[ExprId], span: Span, env: &mut Env) -> EvalResult {
+        // `@name(…)` — a compiler query, not a call. Reflection lives in this
+        // `@`-prefixed space rather than beside `size_of`/`align_of`/`offset_of`
+        // precisely because those use ordinary identifiers and can therefore be
+        // shadowed by a user function of the same name: the self-hosted compiler
+        // itself declares `fn field_type(…)` in `examples/std/typeck.jtr`, which a
+        // bare-name `field_type` intrinsic would silently have hijacked.
+        if let ExprKind::Attr(n) = &self.ast.expr_at(callee).kind {
+            let name = n.name.clone();
+            if is_reflect_intrinsic(&name) {
+                return self.eval_reflect(&name, args, span, env);
+            }
+            return Err(EvalError::new(format!("`@{name}` is not a compile-time query"), span));
+        }
         let ExprKind::Name(n) = &self.ast.expr_at(callee).kind else {
             return Err(EvalError::new("only a named function can be called at compile time", span));
         };
@@ -482,6 +513,100 @@ impl<'a> Interp<'a> {
         self.returning = outer_return;
         let v = out?;
         Ok(returned.unwrap_or(v))
+    }
+}
+
+/// The compile-time reflection intrinsics (roadmap G tier 3).
+///
+/// Plain-call syntax with a *type* as the first argument, matching the convention
+/// the language already uses for `size_of(T)`, `align_of(T)` and
+/// `offset_of(T, field)` — reflection is not a new syntactic category, so it needs
+/// no new grammar.
+///
+/// **What is deliberately absent: sizes, alignments and offsets.** Those three
+/// intrinsics exist today only as *C-deferred* ones — they lower to `sizeof`,
+/// `_Alignof` and `offsetof`, so the Jestyr compiler never learns the numbers; it
+/// asks the C compiler. Turning them into comptime *values* needs the compiler's own
+/// layout pass (workstream L). What this tier reflects is what the compiler already
+/// knows without it: the **declared shape**.
+pub fn is_reflect_intrinsic(name: &str) -> bool {
+    matches!(name, "type_name" | "field_count" | "field_name" | "field_type")
+}
+
+impl<'a> Interp<'a> {
+    /// Evaluate a reflection intrinsic. Field order is **declaration order** — the
+    /// order written in the source — which is what makes repeated queries and
+    /// generated output stable. (A future `@layout(auto)` from workstream L may
+    /// reorder *storage*; it will not reorder this.)
+    fn eval_reflect(&mut self, name: &str, args: &[ExprId], span: Span, env: &mut Env) -> EvalResult {
+        // The first argument is a TYPE, named directly — it is not evaluated as a
+        // value, exactly as `offset_of(Point, y)`'s second argument is a bare field
+        // name rather than an expression.
+        let Some(&first) = args.first() else {
+            return Err(EvalError::new(format!("`{name}` needs a type as its first argument"), span));
+        };
+        let ExprKind::Name(tn) = &self.ast.expr_at(first).kind else {
+            return Err(EvalError::new(
+                format!("`{name}`'s first argument must be a named type"),
+                self.ast.expr_at(first).span,
+            ));
+        };
+        let tname = tn.name.clone();
+
+        if name == "type_name" {
+            // Answerable for any named type, including primitives: it reports what the
+            // author wrote, and needs no declaration to do so.
+            return Ok(Value::Str(tname));
+        }
+
+        let Some(body) = self.structs.get(tname.as_str()).copied() else {
+            return Err(EvalError::new(
+                format!("`{tname}` is not a struct this compiler can reflect over"),
+                self.ast.expr_at(first).span,
+            ));
+        };
+        // Methods are not fields; only the declared data shape is reflected.
+        let fields: Vec<(&Ident, TypeId)> = body
+            .members
+            .iter()
+            .filter_map(|m| match m {
+                StructMember::Field { name, ty, .. } => Some((name, *ty)),
+                _ => None,
+            })
+            .collect();
+
+        if name == "field_count" {
+            return Ok(Value::Int(fields.len() as i64));
+        }
+
+        // The remaining two are indexed. The index is an ordinary comptime expression,
+        // so `@field_name(P, I)` for a `const I` works — but it must *evaluate*, and an
+        // out-of-range one is an error rather than a clamp or an empty string.
+        let Some(&idx_expr) = args.get(1) else {
+            return Err(EvalError::new(format!("`{name}` needs a field index as its second argument"), span));
+        };
+        let idx_span = self.ast.expr_at(idx_expr).span;
+        let idx = match self.eval_expr(idx_expr, env)? {
+            Value::Int(i) if i >= 0 => i as usize,
+            other => {
+                return Err(EvalError::new(
+                    format!("a field index must be a non-negative integer, found {}", other.type_name()),
+                    idx_span,
+                ))
+            }
+        };
+        let Some(&(fname, fty)) = fields.get(idx) else {
+            return Err(EvalError::new(
+                format!("`{tname}` has {} field(s); there is no field {idx}", fields.len()),
+                idx_span,
+            ));
+        };
+        match name {
+            "field_name" => Ok(Value::Str(fname.name.clone())),
+            // Rendered by the same function the documentation generator uses, so a
+            // reflected type name can never disagree with the documented one.
+            _ => Ok(Value::Str(crate::doc::ty_str(self.ast, fty))),
+        }
     }
 }
 
@@ -786,6 +911,108 @@ mod tests {
             let id = found.expect("fixture needs a comptime block");
             assert!(Interp::new(&ast).eval(id).is_err(), "should be refused: {src}");
         }
+    }
+
+    // --- tier 3: reflection over the declared shape ---
+
+    #[test]
+    fn reflects_a_structs_declared_shape() {
+        let s = "struct Point { x: i32, y: f64, tag: str }\n";
+        assert_eq!(int_of(&format!("{s}const A: i64 = @field_count(Point)\n")), 3);
+        assert_eq!(
+            eval_last_const(&format!("{s}const A: str = @type_name(Point)\n")).unwrap(),
+            Value::Str("Point".into())
+        );
+        // Declaration order, not any storage order — index 1 is what was written second.
+        assert_eq!(
+            eval_last_const(&format!("{s}const A: str = @field_name(Point, 1)\n")).unwrap(),
+            Value::Str("y".into())
+        );
+        assert_eq!(
+            eval_last_const(&format!("{s}const A: str = @field_type(Point, 1)\n")).unwrap(),
+            Value::Str("f64".into())
+        );
+        // `@type_name` answers for a primitive too — it reports what was written, and
+        // needs no declaration to do so.
+        assert_eq!(
+            eval_last_const("const A: str = @type_name(i32)\n").unwrap(),
+            Value::Str("i32".into())
+        );
+    }
+
+    #[test]
+    fn reflection_composes_with_the_rest_of_comptime() {
+        let s = "struct Pair { a: i32, b: i32 }\n";
+        // The index is an ordinary comptime expression, so a `const` works there.
+        assert_eq!(
+            eval_last_const(&format!("{s}const I: i64 = 1\nconst A: str = @field_name(Pair, I)\n"))
+                .unwrap(),
+            Value::Str("b".into())
+        );
+        // And a reflection query composes inside a `comptime` block like any other value.
+        assert_eq!(
+            int_of(&format!("{s}const A: i64 = comptime {{ @field_count(Pair) * 10 }}\n")),
+            20
+        );
+        // Recursion + string concat is enough to walk every field, so field ITERATION
+        // needs no comptime `for` loop *in the evaluator*.
+        //
+        // It is not yet usable end-to-end, though, and the reason is worth recording:
+        // `names` is a top-level `fn`, so cgen emits it as ordinary runtime code too,
+        // and there `i` is a parameter rather than a constant — so the query cannot
+        // fold and typeck reports it. What closes the gap is **comptime-only
+        // functions** (a body instantiated at comptime and never emitted), not the
+        // layout pass. Until then, reflection is usable with constant arguments.
+        let walk = format!(
+            "{s}fn names(i: i64) -> str {{\n\
+             \x20   if i >= @field_count(Pair) {{ return \"\" }}\n\
+             \x20   return @field_name(Pair, i) + \";\" + names(i + 1)\n\
+             }}\n\
+             const A: str = comptime {{ names(0) }}\n"
+        );
+        assert_eq!(eval_last_const(&walk).unwrap(), Value::Str("a;b;".into()));
+    }
+
+    /// **Why reflection lives in the `@` namespace.** The obvious design was to sit
+    /// beside `size_of`/`align_of`/`offset_of` as ordinary identifiers — but those can
+    /// be shadowed by a user function of the same name, and the self-hosted compiler
+    /// *already declares* `fn field_type(…)` in `examples/std/typeck.jtr`. A bare-name
+    /// intrinsic would have silently hijacked it and broken the compiler's own build.
+    /// `@field_type` cannot collide, because no user can declare one.
+    #[test]
+    fn a_user_function_may_share_a_reflection_intrinsics_name() {
+        let src = "struct P { x: i32 }\n\
+                   fn field_type(a: i64, b: i64) -> i64 { return a + b }\n\
+                   const A: i64 = field_type(20, 22)\n";
+        assert_eq!(int_of(src), 42, "the user's function must win for the bare name");
+        // And the `@` form still reaches the compiler's query, not that function.
+        let src2 = "struct P { x: i32 }\n\
+                    fn field_type(a: i64, b: i64) -> i64 { return a + b }\n\
+                    const A: str = @field_type(P, 0)\n";
+        assert_eq!(eval_last_const(src2).unwrap(), Value::Str("i32".into()));
+    }
+
+    #[test]
+    fn methods_are_not_fields() {
+        let s = "struct Counter { n: i32, fn bump(mut self) { self.n = self.n + 1 } }\n";
+        assert_eq!(int_of(&format!("{s}const A: i64 = @field_count(Counter)\n")), 1);
+    }
+
+    #[test]
+    fn an_unanswerable_reflection_query_is_an_error_not_a_default() {
+        let s = "struct P { x: i32 }\n";
+        // Out of range — not clamped, not an empty string.
+        let e = err_of(&format!("{s}const A: str = @field_name(P, 5)\n"));
+        assert!(e.contains("no field 5"), "{e}");
+        // A type with no declared shape to read.
+        let e2 = err_of("const A: i64 = @field_count(i32)\n");
+        assert!(e2.contains("not a struct"), "{e2}");
+        // A negative index is not a wrap-around.
+        let e3 = err_of(&format!("{s}const A: str = @field_name(P, 0 - 1)\n"));
+        assert!(e3.contains("non-negative"), "{e3}");
+        // A missing type argument.
+        let e4 = err_of(&format!("{s}const A: i64 = @field_count()\n"));
+        assert!(e4.contains("needs a type"), "{e4}");
     }
 
     #[test]

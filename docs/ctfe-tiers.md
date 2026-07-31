@@ -15,7 +15,7 @@ or mutate the compiler's own state destroys all three at once.
 | 0 | `const` values, enum discriminants | **done** (predates workstream G) |
 | 1 | Pure comptime expressions where the *compiler* needs a number — array lengths, repeat counts | **done** — G1, `ebf8397` |
 | 2 | `comptime { … }` blocks in user syntax | **done in the Rust reference** — G2; port mirror outstanding |
-| 3 | Type reflection | not started |
+| 3 | Type reflection over the declared shape | **done in the Rust reference** — G3 (sizes/offsets wait on **L**) |
 | 4 | `build.jestyr` — the build described in Jestyr | not started |
 | 5 | Bounded, attestable code/artifact generation | not started |
 
@@ -88,25 +88,73 @@ position it parses as the block alone, so a trailing operator cannot extend it.
 `unsafe { unsafe { 3 } + 1 }` is; write the nested block in value position instead
 (`comptime { 1 + comptime { 3 } }`).
 
-## Tier 3 — reflection *(not started)*
+## Tier 3 — reflection over the declared shape
 
-Reflection over type values: `@type_of`, field iteration, and the metadata an IR
-builder needs.
+Four intrinsics let a program ask the compiler what a type *is*:
 
-**A dependency worth recording before anyone plans this.** `size_of`, `align_of` and
-`offset_of` already exist in Jestyr — but as **C-deferred** intrinsics, lowering to
-`sizeof()`, `_Alignof()` and `offsetof()`. The Jestyr compiler never learns the
-numbers; it asks the C compiler. So exposing them as *comptime values* is blocked on
-**workstream L** (the memory-layout pass), which is where the compiler first computes
-size/align/offset itself.
+```jestyr
+struct Point { x: i32, y: f64, label: str }
 
-What tier 3 can deliver without L is reflection over what the compiler already knows
-— the **declared shape**: type names, field names, field types, and declaration order,
-all readable from the AST. Offsets and sizes wait for L.
+fn main() -> i32 {
+    print_str(@type_name(Point))              // "Point"
+    print_int(@field_count(Point))            // 3
+    print_str(@field_name(Point, 2))          // "label"
+    print_str(comptime { @field_type(Point, 0) })  // "i32"
+    return 0
+}
+```
 
-Iterating fields also needs two evaluator extensions that do not exist yet: aggregate
-comptime values (`Value::List`) and a comptime `for`. Both are bounded by the existing
-fuel budget, so neither threatens totality.
+| Intrinsic | Result |
+|---|---|
+| `@type_name(T)` | the type's declared name (works for primitives too) |
+| `@field_count(T)` | number of declared fields |
+| `@field_name(T, i)` | the i-th field's name, in **declaration order** |
+| `@field_type(T, i)` | the i-th field's type, rendered in Jestyr syntax |
+
+The first argument is a **type**, named directly — it is not evaluated as a value,
+the same way `offset_of(Point, y)`'s second argument is a bare field name. `record`
+and `union` share the struct item and reflect identically; methods are not fields.
+Field types are rendered by the same `doc::ty_str` the documentation generator uses,
+so a reflected type name cannot disagree with the documented one.
+
+These are answered by the *Jestyr* compiler and reach C as literals — unlike
+`size_of`/`align_of`/`offset_of`, which are handed to the C compiler. An unanswerable
+query is a diagnostic, never a default: an out-of-range index is not clamped, a
+non-struct is not silently zero.
+
+### Why `@`, when `size_of` has no sigil
+
+The first design put reflection beside `size_of(T)` as ordinary identifiers, for
+consistency. That was wrong, and the compiler's own source proved it: `examples/std/
+typeck.jtr` declares `fn field_type(…)`, so a bare-name `field_type` intrinsic would
+have silently hijacked a real function and broken the self-hosted build. Any
+bare-name intrinsic carries that hazard; `size_of` and friends simply have not been
+unlucky yet.
+
+`@name(…)` was already a callable form in the grammar (`@address(0x…)`), so the `@`
+namespace costs no new syntax — and nothing in it can ever collide, because a user
+cannot declare `fn @field_type`. It also makes "this is a compiler query, not a
+call" visible at the use site, which is the same instinct as the rest of the
+language: no hidden anything.
+
+### What tier 3 does *not* yet do, and why
+
+**Sizes, alignments and offsets are absent — blocked on workstream L.** `size_of`,
+`align_of` and `offset_of` exist today only as **C-deferred** intrinsics: they lower
+to `sizeof()`, `_Alignof()` and `offsetof()`, so the Jestyr compiler never learns the
+numbers, it asks the C compiler. Making them comptime *values* requires the compiler's
+own layout pass. Tier 3 therefore reflects what the compiler already knows without it
+— the declared shape.
+
+**Arguments must be compile-time constants.** The evaluator can already walk a struct
+by recursion (`if i >= @field_count(T) …; return @field_name(T, i) + f(i + 1)`), and
+that works *inside the interpreter*. It is not usable end-to-end yet, and the reason
+is not the layout pass: a top-level `fn` is also emitted as ordinary runtime code, and
+there the index is a parameter rather than a constant, so the query cannot fold.
+Closing that gap needs **comptime-only functions** — a body instantiated at comptime
+and never emitted — which is the natural next slice. (A comptime `for` and aggregate
+comptime values would be the alternative route; both stay bounded by the existing fuel
+budget, so neither threatens totality.)
 
 ## Tier 4 — `build.jestyr` *(not started)*
 
@@ -165,7 +213,7 @@ a `comptime` block must produce a value
 |---|---|---|
 | Unit — evaluator | `src/comptime.rs::tests` | every value kind, every totality bound, the effect refusals |
 | Unit — checking | `src/typeck.rs::tests` | folded typing, array-length acceptance, refusal quality, determinism |
-| Properties | `proptests::comptime_props` | arithmetic vs a checked-`i64` oracle, determinism, trivia-insensitivity, no-panic |
+| Properties | `proptests::comptime_props` | arithmetic vs a checked-`i64` oracle, determinism, trivia-insensitivity, reflection order, no-panic |
 | Fuzz | `proptests::comptime_props::fuzz_comptime_eval` | arbitrary comptime bodies through parse → typeck → cgen |
 | End-to-end (C) | `proptests::c_oracle` | folded values through a real C compiler, incl. C string re-encoding |
 

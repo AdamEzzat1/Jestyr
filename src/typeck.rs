@@ -1085,6 +1085,18 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Report a reflection query the compiler cannot answer (roadmap G tier 3).
+    ///
+    /// The same shape as [`Self::check_array_len`], and for the same reason: the value
+    /// is *required* — a reflection call becomes a literal in the emitted C, so there
+    /// is no runtime fallback to degrade to. Unanswerable means diagnosed, never
+    /// guessed.
+    fn check_reflect_call(&mut self, id: ExprId) {
+        if let Err(e) = comptime::Interp::new(self.ast).eval(id) {
+            self.error(e.span, format!("compile-time reflection: {}", e.message));
+        }
+    }
+
     fn lower_type(&self, ty_params: &HashSet<String>, id: TypeId) -> Ty {
         match &self.ast.type_at(id).kind {
             TypeKind::Name(n) => {
@@ -1926,6 +1938,19 @@ impl<'a> TypeChecker<'a> {
                 Ty::Unknown
             }
             ExprKind::Call { callee, args } => {
+                // `@name(…)` — a compile-time reflection query (roadmap G tier 3).
+                // Handled first, and without inferring the arguments: the first one is a
+                // *type*, not a value, so running inference over it would report a
+                // non-existent binding. Typed as the literal it folds to, and checked
+                // here because a reflection call becomes that literal in the emitted C —
+                // there is no runtime fallback to degrade to.
+                if let ExprKind::Attr(a) = &ast.expr_at(*callee).kind {
+                    if let Some(t) = reflect_intrinsic_ret(&a.name) {
+                        self.check_reflect_call(id);
+                        self.expr_types[id.0 as usize] = t.clone();
+                        return t;
+                    }
+                }
                 // Method-call sugar: `base.name(args)` resolves either to a free
                 // function whose first parameter is the receiver (item A), or to a
                 // method defined inside the receiver's struct (item C).
@@ -3389,6 +3414,17 @@ fn io_intrinsic_ret(name: &str) -> Option<Ty> {
 fn atomic_intrinsic_ret(name: &str) -> Option<Ty> {
     Some(match name {
         "atomic_load" | "atomic_add" | "atomic_sub" | "atomic_xchg" => Ty::Prim("i64"),
+        _ => return None,
+    })
+}
+
+/// The return type of a compile-time **reflection** intrinsic (roadmap G tier 3).
+/// These always fold to a literal before C sees them, so their type is simply the
+/// type of the literal they become.
+fn reflect_intrinsic_ret(name: &str) -> Option<Ty> {
+    Some(match name {
+        "field_count" => Ty::Prim("i64"),
+        "type_name" | "field_name" | "field_type" => Ty::Prim("str"),
         _ => return None,
     })
 }

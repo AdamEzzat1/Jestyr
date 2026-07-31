@@ -2832,6 +2832,29 @@ mod comptime_props {
             prop_assert_eq!(format!("{:?}", eval_block(&plain)), format!("{:?}", eval_block(&noisy)));
         }
 
+        /// **Reflection order is deterministic and is declaration order.** Generated
+        /// output (a serializer, a table) is only reproducible if the compiler answers
+        /// "what are this type's fields" the same way every time — so this builds a
+        /// struct from a generated field list and checks the answer back, repeatedly.
+        /// A `HashMap` anywhere in the reflection path would fail it.
+        #[test]
+        fn reflection_order_is_deterministic(n in 1usize..8) {
+            let names: Vec<String> = (0..n).map(|i| format!("f{i}")).collect();
+            let decl: String =
+                names.iter().map(|f| format!("{f}: i32")).collect::<Vec<_>>().join(", ");
+            for i in 0..n {
+                let src = format!(
+                    "struct S {{ {decl} }}\nconst A: str = comptime {{ @field_name(S, {i}) }}\n"
+                );
+                // Same query, several runs: same answer, and it is the i-th DECLARED field.
+                for _ in 0..3 {
+                    prop_assert_eq!(eval_block(&src), Ok(Value::Str(names[i].clone())));
+                }
+            }
+            let cnt = format!("struct S {{ {decl} }}\nconst A: i64 = comptime {{ @field_count(S) }}\n");
+            prop_assert_eq!(eval_block(&cnt), Ok(Value::Int(n as i64)));
+        }
+
         /// **Totality on nonsense.** An arbitrary body is refused with a diagnostic or
         /// folded — never a panic and never a hang. The three bounds (fuel, call depth,
         /// const-cycle detection) are what make this true for *every* input, not just
@@ -8100,6 +8123,67 @@ fn main() -> i32 {
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"),
             "q\"qb\\b\nt\tt??/\n5\n"
+        );
+    }
+
+    /// **CTFE (workstream G, increment 3) — reflection end-to-end.** Tier 3 reflects the
+    /// *declared shape* of a type: its name, how many fields it has, and each field's
+    /// name and type, in declaration order. Every query is answered by the Jestyr
+    /// compiler itself and reaches C as a literal — unlike `size_of`/`align_of`/
+    /// `offset_of` beside it, which are deferred to the C compiler.
+    ///
+    /// Arguments must be **compile-time constants**, which is what this fixture uses.
+    /// The evaluator can already walk a struct by recursion (see
+    /// `comptime::tests::reflection_composes_with_the_rest_of_comptime`), but a helper
+    /// that indexes by a *parameter* is not yet usable end-to-end: a top-level `fn` is
+    /// also emitted as ordinary runtime code, where the parameter is not constant and
+    /// the query cannot fold. Closing that needs comptime-only functions — the next
+    /// slice — not the layout pass.
+    #[test]
+    fn comptime_reflection_folds_end_to_end() {
+        let dir = std::env::temp_dir().join("jestyr_ctfe_reflect_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "\
+const LAST: i64 = 2
+
+struct Point {
+    x: i32,
+    y: f64,
+    label: str,
+    fn shift(mut self) { self.x = self.x + 1 }
+}
+
+fn main() -> i32 {
+    print_str(@type_name(Point))
+    print_int(@field_count(Point))
+    print_str(@field_name(Point, LAST))
+    print_str(comptime { @field_name(Point, 0) + \":\" + @field_type(Point, 0) })
+    print_int(comptime { @field_count(Point) * 10 })
+    return 0
+}
+";
+        let f = dir.join("reflect.jtr");
+        std::fs::write(&f, src).unwrap();
+        let rel = f.to_str().unwrap();
+
+        let prog = crate::module::load(rel);
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "load: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(!td.iter().any(|d| d.is_error()), "typeck rejected reflection: {td:?}");
+        let (c_src, _) = crate::cgen::emit(&prog.ast, &info);
+
+        // Answered by this compiler: the queries are literals in the C, not calls.
+        assert!(c_src.contains(r#"JSTR("Point")"#), "type_name did not fold:\n{c_src}");
+        assert!(!c_src.contains("@field_count("), "a reflection call leaked into the C");
+
+        let exe = build_exe(rel);
+        let out = Command::new(&exe).output().unwrap();
+        assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
+        // A method is not a field, so the count is 3 — and the order is the order written.
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"),
+            "Point\n3\nlabel\nx:i32\n30\n"
         );
     }
 
