@@ -929,6 +929,39 @@ anywhere in the loop** (`jestyr_driver_builds_itself`, selfhost-fixpoint).
   std); a module-local variable shadowing an import binding AND field-accessed would
   mis-rewrite (none exists; documented).
 
+### Increments 49–50 — attribution, parse/typeck refusal, and in-language attest
+
+- **49a — PER-FILE diagnostic attribution (the `#line` analogue)**: `Ml.map` records
+  (merged, allsrc) CHECKPOINT pairs at the module start and after every rewrite edit —
+  between edits text is verbatim, so a merged span maps back EXACTLY: last checkpoint ≤
+  span, then owning module by `allsrc` range, then 1-based line/col counted in that
+  module's ORIGINAL source. `ml_flatten` now takes the caller's `Ml` and keeps
+  allsrc/nb/mods/map alive for the driver; `eprint_diag(m, start, msg)` renders
+  `<file>:<line>:<col>: error: <msg>`. Test: an escape error INSIDE an imported module
+  renders `bad_lib.jtr:3:48` exactly, and an importer's error after its `import` line
+  renders at its ORIGINAL line (unshifted).
+- **49b — parse/typeck refusal**: `driver_build` scans the recovery artifacts BEFORE
+  escape — Error exprs (kind 9) / Error items (kind 99) → "syntax error", any expr the
+  checker resolved to the Error type (kind 16, e.g. an unknown field — typeerr.jtr's
+  shape) → "type error" — each at its exact mapped location, refusing with exit 1 and no
+  C written. **Honest partiality, recorded**: some item-level malformations recover into
+  plausible-but-broken items with NO Error node (e.g. `fn broken( {` becomes a
+  void-param fn) and still degrade to gcc; prim-operator misuse recovers to the operand
+  type, not Error. The reference's expected/found message TEXT is the remaining
+  follow-up. The self-build stays green — the compiler doesn't trip its own gates.
+- **50 — in-language ATTEST (O-tooling)**: `examples/std/sha256.jtr` — a zero-import
+  FIPS 180-4 SHA-256 written in Jestyr (i64 words masked to 32 bits ≡ u32 wrapping; the
+  padded message read VIRTUALLY, no buffer; all three NIST vectors exact first try).
+  `jc <file> attest` emits the manifest HEADER (version, source, `c-sha256` of exactly
+  the C `build` would emit, locked cc-flags) — **byte-equal to the reference
+  `attest::manifest`'s first four lines** (`jestyr_driver_attest_header_matches_reference`),
+  which simultaneously pins the Jestyr sha256 against the Rust one over identical C.
+  The per-item records section (vis/sig/guarantees) is the follow-up — it needs the
+  printer's signature render. `SELFHOST_MODULES` and the allowlist grew `sha256` (11
+  modules; the seed now carries the hasher — the from-scratch compiler can attest).
+  Remaining O items: the manifest records + verify, `doc` (needs a comment-preserving
+  lex mode — the tokenizer skips comments).
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
