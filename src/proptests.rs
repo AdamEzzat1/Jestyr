@@ -7712,6 +7712,74 @@ mod c_oracle {
         eprintln!("driver: build + run + refusal all green");
     }
 
+    /// **In-language modules.** `jc <file> build|run` flattens the import closure itself
+    /// (the driver's `ml_*` loader: DFS deps-first, imports dropped, `binding.x` -> `x`,
+    /// cross-module top-level collisions renamed) — multi-file programs compile through
+    /// the ported compiler with no Rust anywhere in the loop. Checked against the Rust
+    /// reference's module build, collisions included.
+    #[test]
+    fn jestyr_driver_builds_multi_module() {
+        let jc = build_exe("examples/std/cgen.jtr");
+        let dir = std::env::temp_dir().join("jestyr_ml_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two libs sharing a top-level name (`mag`) — the collision-rename path — plus a
+        // diamond (`app` and `vec2` both import `util`).
+        std::fs::write(dir.join("util.jtr"), "pub fn mag(x: i32) -> i32 { return x * 10 }\n").unwrap();
+        std::fs::write(
+            dir.join("vec2.jtr"),
+            "import \"util\"\npub struct V2 { pub x: i32, pub y: i32 }\npub fn make(x: i32, y: i32) -> V2 { return V2 { x: x, y: y } }\npub fn mag(v: V2) -> i32 { return util.mag(v.x) + v.y }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("app.jtr"),
+            "import \"util\"\nimport \"vec2\"\nfn main() -> i32 {\n    let v: vec2.V2 = vec2.make(4, 2)\n    print_int(vec2.mag(v) as i64)\n    print_int(util.mag(3) as i64)\n    return 0\n}\n",
+        )
+        .unwrap();
+        let app = dir.join("app.jtr");
+        let out = Command::new(&jc).args([app.to_str().unwrap(), "run"]).output().unwrap();
+        assert!(out.status.success(), "driver multi-module run failed: {}", String::from_utf8_lossy(&out.stderr));
+        let got = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+        // The Rust reference builds the same program through its real module loader.
+        let want_exe = build_exe(app.to_str().unwrap());
+        let want_out = Command::new(&want_exe).output().unwrap();
+        let want = String::from_utf8_lossy(&want_out.stdout).replace("\r\n", "\n");
+        assert_eq!(got, want, "multi-module output diverged from the reference module build");
+        assert_eq!(want, "42\n30\n", "fixture sanity");
+        eprintln!("driver modules: multi-file + collision + diamond all green");
+    }
+
+    /// **The self-build.** The ported compiler compiles ITSELF from its real multi-file
+    /// sources (`examples/std/cgen.jtr` + its 9 imports) through its own module loader and
+    /// its own gcc driver — and the result is the same compiler: byte-identical C on a
+    /// probe file. No Rust and no harness flatten anywhere in the loop.
+    #[cfg(feature = "selfhost-fixpoint")]
+    #[test]
+    fn jestyr_driver_builds_itself() {
+        let jc = build_exe("examples/std/cgen.jtr");
+        let dir = std::env::temp_dir().join("jestyr_selfbuild_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for m in SELFHOST_MODULES {
+            std::fs::copy(format!("examples/std/{m}.jtr"), dir.join(format!("{m}.jtr"))).unwrap();
+        }
+        let root = dir.join("cgen.jtr");
+        let out = Command::new(&jc).args([root.to_str().unwrap(), "build"]).output().unwrap();
+        assert!(out.status.success(), "self-build failed: {}", String::from_utf8_lossy(&out.stderr));
+        let jc2 = dir.join("cgen.exe");
+        assert!(jc2.exists(), "self-build produced no exe");
+        let probe = "examples/hello.jtr";
+        let a = Command::new(&jc).arg(probe).output().unwrap();
+        let b = Command::new(&jc2).arg(probe).output().unwrap();
+        assert!(b.status.success(), "self-built compiler failed on {probe}");
+        assert_eq!(
+            String::from_utf8_lossy(&a.stdout),
+            String::from_utf8_lossy(&b.stdout),
+            "the self-built compiler emits different C"
+        );
+        eprintln!("SELF-BUILD: jc compiled itself from its multi-file sources via its own loader + driver");
+    }
+
     /// The reference's TEST-mode C for `src`: `cgen::emit_tests` — the `jestyrc test` harness
     /// (`time.h` in the prelude, a pass/fail + bench-timing `main` instead of the user wrapper).
     fn rust_cgen_test_dump(src: &str, filter: Option<&str>) -> Vec<String> {

@@ -18137,6 +18137,388 @@ fn emit_program(mut sb: String, read p: Parser, read c: Checker, read src: str, 
     }
 }
 
+// ---- in-language modules: the driver's flatten loader ----
+// The reference loader already compiles a multi-file program as ONE translation unit (one
+// shared arena, one concatenated buffer; escape + cgen never learn there was more than one
+// file), so the driver implements modules the same way the R2 harness proved sound: load the
+// import closure depth-first (deps before importers — the loader's merge order), then flatten
+// token-level into a single source: `import` decls dropped, `binding.x` -> `x`, and any
+// top-level name defined in more than one module renamed `name__<module>`. The merged source
+// then flows through the ordinary single-file pipeline. v1 limits: diagnostics render against
+// the MERGED buffer (per-file `#line`-style attribution is a follow-up), `extern "c"` block
+// collisions are not detected (none exist in std), and a module-local variable that shadows an
+// import binding AND is field-accessed would mis-rewrite (none exists; the std `fs` locals are
+// scalar ints).
+
+// Loader state. Sources concatenate into `allsrc` (module slices recorded in `mods` 6-tuples:
+// stem_s, stem_e, path_s, path_e into `nb`; src_s, src_e into `allsrc`); `vis` marks resolved
+// paths (memoization + cycle guard); `seen` records first declarations as `|name=stem|`;
+// `ren` records collisions as `|stem:name|` (the renamed form is always `name__stem`).
+struct Ml { allsrc: String, nb: String, mods: List(i32), vis: String, seen: String, ren: String, err: bool }
+
+// The directory prefix length of `path` (through the last '/' or '\\'), 0 for a bare name.
+fn path_dir_len(read path: str) -> usize {
+    var i: usize = path.len
+    for i > 0 {
+        let ch: i32 = path[i - 1] as i32
+        if ch == 47 or ch == 92 { return i }
+        i = i - 1
+    }
+    return 0
+}
+
+// The stem of a resolved path: the last segment, minus a trailing `.jtr`.
+fn ml_push_stem(mut sb: String, read path: str) {
+    let dl: usize = path_dir_len(path)
+    var e: usize = path.len
+    if ends_with(path, ".jtr") { e = e - 4 }
+    string_push(sb, path[dl .. e])
+}
+
+// Has `path` been visited (loaded or in progress)?
+fn ml_seen(mut m: Ml, read path: str) -> bool {
+    var probe: String = string_new()
+    string_push(probe, "|")
+    string_push(probe, path)
+    string_push(probe, "|")
+    let hit: bool = contains(string_view(m.vis), string_view(probe))
+    string_free(probe)
+    return hit
+}
+
+// Load `path` and (depth-first) its imports, appending each module's raw source to `allsrc`
+// AFTER its dependencies — the reference loader's merge order.
+fn ml_load(mut m: Ml, read path: str, mut it: Interner, kwcount: i64, read a: Allocator) {
+    if ml_seen(m, path) { return }                    // diamond import (or a cycle: merged once)
+    string_push(m.vis, "|")
+    string_push(m.vis, path)
+    string_push(m.vis, "|")
+    var srcb: String = read_text(path)
+    let src: str = string_view(srcb)
+    if src.len == 0 {
+        var msg: String = string_new()
+        string_push(msg, "error: cannot read module `")
+        string_push(msg, path)
+        string_push(msg, "`")
+        eprint_str(string_view(msg))
+        string_free(msg)
+        m.err = true
+        string_free(srcb)
+        return
+    }
+    let dl: usize = path_dir_len(path)
+    var tk: List(Token) = tokenize(src, it, kwcount, a)
+    var i: usize = 0
+    for i < len(Token, tk) {
+        let t: Token = get(Token, tk, i)
+        if str_eq(src[t.start .. t.end], "import") {  // keyword: an ident can never be `import`
+            let ps: Token = get(Token, tk, i + 1)
+            var dep: String = string_new()            // resolve relative to the importing file
+            string_push(dep, path[0 .. dl])
+            string_push(dep, src[ps.start + 1 .. ps.end - 1])
+            string_push(dep, ".jtr")
+            ml_load(m, string_view(dep), it, kwcount, a)
+            string_free(dep)
+        }
+        i = i + 1
+    }
+    free(Token, tk)
+    let ss: i32 = sb_len(m.allsrc)
+    string_push(m.allsrc, src)
+    let se: i32 = sb_len(m.allsrc)
+    string_push(m.allsrc, "\n")                       // keep regions disjoint, like the loader
+    let ns: i32 = sb_len(m.nb)
+    ml_push_stem(m.nb, path)
+    let ne: i32 = sb_len(m.nb)
+    string_push(m.nb, path)
+    let pe: i32 = sb_len(m.nb)
+    push(i32, m.mods, ns)
+    push(i32, m.mods, ne)
+    push(i32, m.mods, ne)                        // path_s (the path follows the stem)
+    push(i32, m.mods, pe)
+    push(i32, m.mods, ss)
+    push(i32, m.mods, se)
+    string_free(srcb)
+}
+
+// Mark `stem:name` as colliding (idempotent).
+fn ml_mark_collision(mut m: Ml, read stem: str, read name: str) {
+    var probe: String = string_new()
+    string_push(probe, "|")
+    string_push(probe, stem)
+    string_push(probe, ":")
+    string_push(probe, name)
+    string_push(probe, "|")
+    if !contains(string_view(m.ren), string_view(probe)) {
+        string_push(m.ren, string_view(probe))
+    }
+    string_free(probe)
+}
+
+// Is `stem:name` a recorded collision?
+fn ml_is_collision(read ren: str, read stem: str, read name: str) -> bool {
+    var probe: String = string_new()
+    string_push(probe, "|")
+    string_push(probe, stem)
+    string_push(probe, ":")
+    string_push(probe, name)
+    string_push(probe, "|")
+    let hit: bool = contains(ren, string_view(probe))
+    string_free(probe)
+    return hit
+}
+
+// Register one top-level declaration: first sighting records `|name=stem|`; a second sighting
+// from a DIFFERENT module marks both as collisions (renamed `name__<stem>` at rewrite).
+fn ml_register(mut m: Ml, read name: str, read stem: str) {
+    var probe: String = string_new()
+    string_push(probe, "|")
+    string_push(probe, name)
+    string_push(probe, "=")
+    let pv: str = string_view(probe)
+    let plen: usize = pv.len
+    let at: isize = find(string_view(m.seen), string_view(probe))
+    if at < 0 {
+        string_push(m.seen, string_view(probe))
+        string_push(m.seen, stem)
+        string_push(m.seen, "|")
+        string_free(probe)
+        return
+    }
+    string_free(probe)
+    var firstb: String = string_new()                 // copy the first-decl stem out of `seen`
+    let sv: str = string_view(m.seen)
+    var k: usize = (at as usize) + plen
+    var e: usize = k
+    for e < sv.len {                                  // '|' terminates the stem
+        if (sv[e] as i32) == 124 { break }
+        e = e + 1
+    }
+    string_push(firstb, sv[k .. e])
+    if !str_eq(string_view(firstb), stem) {
+        ml_mark_collision(m, string_view(firstb), name)
+        ml_mark_collision(m, stem, name)
+    }
+    string_free(firstb)
+}
+
+// Is the first byte of `s` an identifier head (letter or `_`)? Filters `fn(`-type tokens.
+fn ml_ident_head(read s: str) -> bool {
+    if s.len == 0 { return false }
+    let c: i32 = s[0] as i32
+    if c >= 97 and c <= 122 { return true }
+    if c >= 65 and c <= 90 { return true }
+    return c == 95
+}
+
+// Phase 2: scan one module's TOP-LEVEL declaration names (brace depth 0; the token after a
+// decl keyword must look like an identifier, so a `fn(i32)` TYPE never registers).
+fn ml_scan_decls(mut m: Ml, mi: usize, mut it: Interner, kwcount: i64, read a: Allocator) {
+    let b: usize = mi * 6
+    var stemb: String = string_new()                  // copies: no `allsrc`/`nb` views live
+    var srcb: String = string_new()                   // across the mut `ml_register` calls
+    let nb0: str = string_view(m.nb)
+    string_push(stemb, nb0[get(i32, m.mods, b) as usize .. get(i32, m.mods, b + 1) as usize])
+    let all0: str = string_view(m.allsrc)
+    string_push(srcb, all0[get(i32, m.mods, b + 4) as usize .. get(i32, m.mods, b + 5) as usize])
+    let src: str = string_view(srcb)
+    var tk: List(Token) = tokenize(src, it, kwcount, a)
+    var depth: i32 = 0
+    var i: usize = 0
+    for i < len(Token, tk) {
+        let t: Token = get(Token, tk, i)
+        let tx: str = src[t.start .. t.end]
+        if str_eq(tx, "{") { depth = depth + 1 }
+        else if str_eq(tx, "}") { depth = depth - 1 }
+        else if depth == 0 {
+            if str_eq(tx, "fn") or str_eq(tx, "struct") or str_eq(tx, "record") or str_eq(tx, "union") or str_eq(tx, "enum") or str_eq(tx, "const") or str_eq(tx, "distinct") or str_eq(tx, "trait") {
+                if i + 1 < len(Token, tk) {
+                    let nm: Token = get(Token, tk, i + 1)
+                    if ml_ident_head(src[nm.start .. nm.end]) {
+                        ml_register(m, src[nm.start .. nm.end], string_view(stemb))
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    free(Token, tk)
+    string_free(stemb)
+    string_free(srcb)
+}
+
+// Phase 3: rewrite one module into `sb2` — drop `import` decls, erase `binding.x` qualifiers
+// (renaming the member when the target declares it collidingly), rename this module's own
+// colliding top-level names at bare (non-`.`-preceded) uses.
+fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: i64, read a: Allocator) {
+    let b: usize = mi * 6
+    var stemb: String = string_new()
+    var srcb: String = string_new()
+    var renb: String = string_new()
+    let nb0: str = string_view(m.nb)
+    string_push(stemb, nb0[get(i32, m.mods, b) as usize .. get(i32, m.mods, b + 1) as usize])
+    let all0: str = string_view(m.allsrc)
+    string_push(srcb, all0[get(i32, m.mods, b + 4) as usize .. get(i32, m.mods, b + 5) as usize])
+    string_push(renb, string_view(m.ren))
+    let src: str = string_view(srcb)
+    let ren: str = string_view(renb)
+    var tk: List(Token) = tokenize(src, it, kwcount, a)
+    let n: usize = len(Token, tk)
+    var binds: String = string_new()                  // this module's `|binding=stem|` entries
+    var i: usize = 0
+    for i < n {
+        let t: Token = get(Token, tk, i)
+        if str_eq(src[t.start .. t.end], "import") {
+            let ps: Token = get(Token, tk, i + 1)
+            var stem2: String = string_new()
+            var full: String = string_new()
+            string_push(full, src[ps.start + 1 .. ps.end - 1])
+            string_push(full, ".jtr")
+            ml_push_stem(stem2, string_view(full))
+            var j: usize = i + 2
+            string_push(binds, "|")
+            if j < n {
+                let asq: Token = get(Token, tk, j)
+                if str_eq(src[asq.start .. asq.end], "as") {
+                    let al: Token = get(Token, tk, j + 1)
+                    string_push(binds, src[al.start .. al.end])
+                    j = j + 2
+                } else {
+                    string_push(binds, string_view(stem2))
+                }
+            } else {
+                string_push(binds, string_view(stem2))
+            }
+            string_push(binds, "=")
+            string_push(binds, string_view(stem2))
+            string_push(binds, "|")
+            string_free(stem2)
+            string_free(full)
+        }
+        i = i + 1
+    }
+    let stem: str = string_view(stemb)
+    var cur: usize = 0                                // source cursor: copy gaps, apply edits
+    i = 0
+    for i < n {
+        let t: Token = get(Token, tk, i)
+        let tx: str = src[t.start .. t.end]
+        if str_eq(tx, "import") {
+            var j: usize = i + 1                      // path Str [+ `as` ident] [+ `=` Str]
+            var last: usize = j
+            j = j + 1
+            if j < n {
+                let a2: Token = get(Token, tk, j)
+                if str_eq(src[a2.start .. a2.end], "as") { last = j + 1  j = j + 2 }
+            }
+            if j < n {
+                let e2: Token = get(Token, tk, j)
+                if str_eq(src[e2.start .. e2.end], "=") { last = j + 1  j = j + 2 }
+            }
+            let lt: Token = get(Token, tk, last)
+            string_push(sb2, src[cur .. t.start])
+            var skip: usize = lt.end                  // also take the decl's own line break
+            if skip < src.len {
+                if (src[skip] as i32) == 13 { skip = skip + 1 }
+            }
+            if skip < src.len {
+                if (src[skip] as i32) == 10 { skip = skip + 1 }
+            }
+            cur = skip
+            i = last + 1
+            continue
+        }
+        if ml_ident_head(tx) {
+            var prev_dot: bool = false
+            if i > 0 {
+                let pt: Token = get(Token, tk, i - 1)
+                prev_dot = str_eq(src[pt.start .. pt.end], ".")
+            }
+            var next_dot: bool = false
+            if i + 1 < n {
+                let nt: Token = get(Token, tk, i + 1)
+                next_dot = str_eq(src[nt.start .. nt.end], ".")
+            }
+            if !prev_dot and next_dot {
+                var probe: String = string_new()      // is this ident an import binding?
+                string_push(probe, "|")
+                string_push(probe, tx)
+                string_push(probe, "=")
+                let pv: str = string_view(probe)
+                let plen: usize = pv.len
+                let at: isize = find(string_view(binds), string_view(probe))
+                string_free(probe)
+                if at >= 0 {
+                    var tstem: String = string_new()  // the bound module's stem
+                    let bv: str = string_view(binds)
+                    var k2: usize = (at as usize) + plen
+                    var e3: usize = k2
+                    for e3 < bv.len {
+                        if (bv[e3] as i32) == 124 { break }
+                        e3 = e3 + 1
+                    }
+                    string_push(tstem, bv[k2 .. e3])
+                    let x: Token = get(Token, tk, i + 2)
+                    string_push(sb2, src[cur .. t.start])
+                    string_push(sb2, src[x.start .. x.end])
+                    if ml_is_collision(ren, string_view(tstem), src[x.start .. x.end]) {
+                        string_push(sb2, "__")
+                        string_push(sb2, string_view(tstem))
+                    }
+                    cur = x.end
+                    string_free(tstem)
+                    i = i + 3
+                    continue
+                }
+            }
+            if !prev_dot {
+                if ml_is_collision(ren, stem, tx) {   // an own colliding name at a bare use
+                    string_push(sb2, src[cur .. t.start])
+                    string_push(sb2, tx)
+                    string_push(sb2, "__")
+                    string_push(sb2, stem)
+                    cur = t.end
+                }
+            }
+        }
+        i = i + 1
+    }
+    string_push(sb2, src[cur .. src.len])
+    string_push(sb2, "\n")
+    free(Token, tk)
+    string_free(binds)
+    string_free(stemb)
+    string_free(srcb)
+    string_free(renb)
+}
+
+// Load + flatten the import closure rooted at `root` into one single-file program. Returns
+// the merged source; empty on a load failure (already reported to stderr).
+fn ml_flatten(read root: str, mut it: Interner, kwcount: i64, read a: Allocator) -> String {
+    var m: Ml = Ml{ allsrc: string_new(), nb: string_new(), mods: make__list(i32, a), vis: string_new(), seen: string_new(), ren: string_new(), err: false }
+    ml_load(m, root, it, kwcount, a)
+    var merged: String = string_new()
+    if !m.err {
+        let count: usize = len(i32, m.mods) / 6
+        var mi: usize = 0
+        for mi < count {
+            ml_scan_decls(m, mi, it, kwcount, a)
+            mi = mi + 1
+        }
+        var mj: usize = 0
+        for mj < count {
+            ml_rewrite(m, mj, merged, it, kwcount, a)
+            mj = mj + 1
+        }
+    }
+    string_free(m.allsrc)
+    string_free(m.nb)
+    string_free(m.vis)
+    string_free(m.seen)
+    string_free(m.ren)
+    return merged
+}
+
 // ---- the product driver (`build` / `run`) — the self-hosted compiler as a daily tool ----
 // Unlike the raw `jc <file>` dump (the golden's plumbing mode, mirroring `cgen::emit`
 // unconditionally), the product modes GATE on the escape checker's buffered diagnostics,
@@ -18237,10 +18619,6 @@ fn main() -> i32 {
     var it: Interner = make__intern(a)
     let kwcount: i64 = intern_keywords(it)
     if argc() > 1 {
-        var src: String = read_text(argv(1))
-        var p: Parser = parse_source(string_view(src), it, kwcount, a)
-        var c: Checker = check_parsed(p, string_view(src), a)
-        var sb: String = string_new()
         // CLI modes: `<file>` -> normal C; `<file> test [substr]` -> the `jestyrc test`
         // harness C (optionally name-filtered); `<file> list [substr]` -> the runnable
         // `@test`/`@bench` list (`jestyrc test --list`); `<file> build` / `<file> run` ->
@@ -18256,10 +18634,27 @@ fn main() -> i32 {
             if str_eq(argv(2), "run") { rmode = true }
         }
         if bmode or rmode {
-            let drc: i32 = driver_build(p, c, string_view(src), a, argv(1), rmode)
-            string_free(src)
+            // The product modes go through the module loader: the import closure flattens
+            // into one single-file program (the loader's own one-translation-unit model),
+            // then the ordinary pipeline runs on the merged source. An importless file
+            // merges to itself. NOTE: diagnostics currently render against the MERGED
+            // buffer (per-file attribution is a follow-up).
+            var merged: String = ml_flatten(argv(1), it, kwcount, a)
+            let mv: str = string_view(merged)
+            if mv.len == 0 {
+                string_free(merged)
+                return 1
+            }
+            var p2: Parser = parse_source(mv, it, kwcount, a)
+            var c2: Checker = check_parsed(p2, mv, a)
+            let drc: i32 = driver_build(p2, c2, mv, a, argv(1), rmode)
+            string_free(merged)
             return drc
         }
+        var src: String = read_text(argv(1))
+        var p: Parser = parse_source(string_view(src), it, kwcount, a)
+        var c: Checker = check_parsed(p, string_view(src), a)
+        var sb: String = string_new()
         if lmode {
             if argc() > 3 {
                 emit_test_list(sb, p, string_view(src), argv(3))
