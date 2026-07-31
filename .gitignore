@@ -4,3 +4,9 @@
 # Editor / OS noise
 *.swp
 .DS_Store
+
+# Self-hosted driver outputs (`jc <file> build` writes next to the source).
+examples/*.c
+examples/*.exe
+examples/std/*.c
+examples/std/*.exe

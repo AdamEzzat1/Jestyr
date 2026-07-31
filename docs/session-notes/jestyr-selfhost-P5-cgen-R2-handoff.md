@@ -962,6 +962,14 @@ anywhere in the loop** (`jestyr_driver_builds_itself`, selfhost-fixpoint).
   Remaining O items: the manifest records + verify, `doc` (needs a comment-preserving
   lex mode — the tokenizer skips comments).
 
+> **THIS DOCUMENT'S STORY IS COMPLETE.** Increments 1–50 delivered the whole self-hosting
+> arc: golden convergence, the fixed point, test mode, the driver, in-language modules,
+> per-file diagnostics, refusal gates, attest, and the bootstrap seed. **The successor
+> handoff is `docs/session-notes/jestyr-next-frontier-handoff.md`** — the O-tooling
+> remainder (attest records + verify, doc) and the Group-3 workstreams (G CTFE, L
+> memory-layout, Q SIMD), with the two-sided golden discipline and every recorded trap
+> carried forward. Start there.
+
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
 > **Superseded summary:** the CURRENT consolidated worklist (post-increment-21, allowlist
