@@ -223,7 +223,11 @@ impl<'a> Interp<'a> {
                     )),
                 }
             }
-            ExprKind::Block(b) => self.eval_block(b, env),
+            // `comptime { … }` is *already* being evaluated at compile time, so it is
+            // simply its block. Handling it here rather than only at the call site is
+            // what makes a nested one (`comptime { comptime { 1 } + 1 }`) work, and
+            // what lets a comptime block appear inside a `const` initializer.
+            ExprKind::Comptime(b) | ExprKind::Block(b) => self.eval_block(b, env),
             ExprKind::Call { callee, args } => self.eval_call(*callee, args, span, env),
             _ => Err(EvalError::new("this expression is not a compile-time constant", span)),
         }
@@ -705,6 +709,83 @@ mod tests {
     fn a_type_mismatch_is_an_error_rather_than_a_coercion() {
         let e = err_of("const A: i64 = 1 + true\n");
         assert!(e.contains("cannot apply"), "{e}");
+    }
+
+    // --- tier 2: `comptime { … }` blocks ---
+
+    #[test]
+    fn evaluates_a_comptime_block_like_the_block_it_wraps() {
+        assert_eq!(int_of("const A: i64 = comptime { 2 + 2 }\n"), 4);
+        // `let` scoping inside the block, then a tail expression.
+        assert_eq!(int_of("const A: i64 = comptime { let x = 4\n x * 2 }\n"), 8);
+    }
+
+    #[test]
+    fn a_comptime_block_nests_and_composes_with_the_rest_of_the_language() {
+        // Nesting works because `Comptime` is evaluated by the same arm as `Block` —
+        // an inner block is not a special case, it is simply already comptime.
+        //
+        // Note the shape: the inner block is in *value* position. Written the other way
+        // round (`comptime { comptime { 3 } + 1 }`) it is a parse error, because Jestyr
+        // parses a block-led form at STATEMENT position as the block alone so that a
+        // trailing operator cannot extend it — `unsafe` behaves identically. `comptime`
+        // inherits that rule rather than inventing one.
+        assert_eq!(int_of("const A: i64 = comptime { 1 + comptime { 3 } }\n"), 4);
+        // A block may call a pure function and read another `const`.
+        let src = "const N: i64 = 5\nfn sq(x: i64) -> i64 { return x * x }\n\
+                   const A: i64 = comptime { sq(N) + 1 }\n";
+        assert_eq!(int_of(src), 26);
+        // And an ordinary expression may contain one.
+        assert_eq!(int_of("const A: i64 = 1 + comptime { 2 * 3 }\n"), 7);
+    }
+
+    #[test]
+    fn a_comptime_block_yields_bools_strings_and_unit_too() {
+        assert_eq!(eval_last_const("const A: bool = comptime { 3 > 2 }\n").unwrap(), Value::Bool(true));
+        assert_eq!(
+            eval_last_const("const A: str = comptime { \"ab\" + \"cd\" }\n").unwrap(),
+            Value::Str("abcd".to_string())
+        );
+        // A block ending in a binding produces nothing. The interpreter reports that
+        // faithfully as `Unit`; refusing it is the *consumer's* call (typeck does).
+        assert_eq!(eval_last_const("const A: i64 = comptime { let x = 1 }\n").unwrap(), Value::Unit);
+    }
+
+    #[test]
+    fn the_totality_bounds_still_hold_inside_a_comptime_block() {
+        // Wrapping an expression in `comptime { … }` must not buy it an escape from
+        // any of the three bounds — the block is not a separate evaluation mode.
+        assert!(err_of("const A: i64 = comptime { 1 / 0 }\n").contains("division by zero"));
+        assert!(err_of("const A: i64 = comptime { 9223372036854775807 + 1 }\n").contains("overflowed"));
+        let e = err_of("fn f(n: i64) -> i64 { return f(n + 1) }\nconst A: i64 = comptime { f(0) }\n");
+        assert!(e.contains("too deep") || e.contains("step budget"), "{e}");
+        let e2 = err_of("const A: i64 = comptime { B }\nconst B: i64 = comptime { A }\n");
+        assert!(e2.contains("defined in terms of itself"), "{e2}");
+    }
+
+    #[test]
+    fn a_comptime_block_cannot_reach_runtime_state() {
+        // The effect policy is *structural*: nothing effectful is in the value domain,
+        // so each of these is refused by the same rule that refuses a float — there is
+        // no arm for it. No allowlist to keep in sync, and no way to bypass it.
+        for src in [
+            "fn main() -> i32 { var n: i64 = 1\n let a = comptime { n }\n return 0 }\n",
+            "const A: i64 = comptime { read_file(\"x\").len as i64 }\n",
+            "const A: i64 = comptime { unsafe { 1 } }\n",
+            "const A: i64 = comptime { 1.5 as i64 }\n",
+        ] {
+            let (tokens, _) = Lexer::new(src).tokenize();
+            let (ast, _) = Parser::new(src, tokens).parse();
+            let mut found = None;
+            for i in 0..ast.exprs.len() {
+                if matches!(ast.exprs[i].kind, ExprKind::Comptime(_)) {
+                    found = Some(ExprId(i as u32));
+                    break;
+                }
+            }
+            let id = found.expect("fixture needs a comptime block");
+            assert!(Interp::new(&ast).eval(id).is_err(), "should be refused: {src}");
+        }
     }
 
     #[test]

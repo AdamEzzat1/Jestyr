@@ -2729,6 +2729,136 @@ mod sync_props {
     }
 }
 
+/// **CTFE properties (workstream G).** A comptime interpreter has three obligations
+/// a unit test cannot really pin: it must be *total* (no panic, no hang on any
+/// input), *deterministic* (a compiler that folds differently between runs breaks
+/// reproducible builds and every attest hash), and *correct* (the folded number is
+/// the number the arithmetic says). These check all three against an oracle.
+#[cfg(test)]
+mod comptime_props {
+    use super::*;
+    use crate::comptime::{Interp, Value};
+    use proptest::prelude::*;
+
+    /// Evaluate the first `comptime { … }` block in `src`.
+    fn eval_block(src: &str) -> Result<Value, String> {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
+        let id = ast
+            .exprs
+            .iter()
+            .position(|e| matches!(e.kind, crate::ast::ExprKind::Comptime(_)))
+            .map(|i| crate::ast::ExprId(i as u32))
+            .ok_or_else(|| "no comptime block".to_string())?;
+        Interp::new(&ast).eval(id).map_err(|e| e.message)
+    }
+
+    /// A left-folded, fully parenthesised integer expression plus its Rust oracle.
+    /// Parenthesising every step removes precedence from the equation, so a
+    /// divergence can only mean the *arithmetic* disagrees. `None` means the oracle
+    /// says this expression has no value (overflow or division by zero) — which the
+    /// interpreter must report as an error rather than wrap or crash.
+    fn build(ops: &[(u8, i64)]) -> (String, Option<i64>) {
+        let mut text = String::from("7");
+        let mut oracle = Some(7i64);
+        for &(op, v) in ops {
+            let sym = match op % 4 {
+                0 => "+",
+                1 => "-",
+                2 => "*",
+                _ => "/",
+            };
+            text = format!("({text} {sym} {v})");
+            oracle = oracle.and_then(|a| match op % 4 {
+                0 => a.checked_add(v),
+                1 => a.checked_sub(v),
+                2 => a.checked_mul(v),
+                _ => {
+                    if v == 0 {
+                        None
+                    } else {
+                        a.checked_div(v)
+                    }
+                }
+            });
+        }
+        (text, oracle)
+    }
+
+    fn arb_ops() -> impl Strategy<Value = Vec<(u8, i64)>> {
+        proptest::collection::vec((0u8..4u8, 0i64..1_000_000i64), 0..14)
+    }
+
+    proptest! {
+        /// **Correctness against an oracle.** Whatever the interpreter folds is what
+        /// checked `i64` arithmetic says — and where the arithmetic has no answer
+        /// (overflow, division by zero) the interpreter says so rather than wrapping.
+        /// Teeth: swapping any `checked_*` in `int_binop` for a wrapping op fails here.
+        #[test]
+        fn ctfe_arithmetic_matches_a_checked_oracle(ops in arb_ops()) {
+            let (text, oracle) = build(&ops);
+            let src = format!("const A: i64 = comptime {{ {text} }}\n");
+            match (eval_block(&src), oracle) {
+                (Ok(Value::Int(got)), Some(want)) => prop_assert_eq!(got, want, "{}", text),
+                (Err(_), None) => {}
+                (got, want) => prop_assert!(false, "{text}: got {got:?}, oracle {want:?}"),
+            }
+        }
+
+        /// **Determinism.** The same source folds to the same value — or fails with
+        /// the same message — every time. Any iteration-order or cross-run state leak
+        /// in the interpreter shows up here, and it would corrupt every attest hash.
+        #[test]
+        fn ctfe_expr_is_deterministic(ops in arb_ops()) {
+            let (text, _) = build(&ops);
+            let src = format!("const A: i64 = comptime {{ {text} }}\n");
+            let first = eval_block(&src);
+            for _ in 0..4 {
+                prop_assert_eq!(format!("{:?}", eval_block(&src)), format!("{first:?}"));
+            }
+        }
+
+        /// **Trivia cannot change a folded value.** Comments and whitespace are not
+        /// part of the value domain; if they were, formatting a file would change the
+        /// program it compiles to.
+        #[test]
+        fn ctfe_ignores_whitespace_and_comments(ops in arb_ops()) {
+            let (text, _) = build(&ops);
+            let plain = format!("const A: i64 = comptime {{ {text} }}\n");
+            let noisy = format!(
+                "const A: i64 = comptime {{\n  // a line comment\n  /* and a block one */ {}\n}}\n",
+                text.replace(" + ", "  +  ")
+            );
+            prop_assert_eq!(format!("{:?}", eval_block(&plain)), format!("{:?}", eval_block(&noisy)));
+        }
+
+        /// **Totality on nonsense.** An arbitrary body is refused with a diagnostic or
+        /// folded — never a panic and never a hang. The three bounds (fuel, call depth,
+        /// const-cycle detection) are what make this true for *every* input, not just
+        /// the well-formed ones.
+        #[test]
+        fn ctfe_invalid_programs_refuse_not_panic(body in ".{0,64}") {
+            let src = format!("const A: i64 = comptime {{ {body} }}\n");
+            let _ = eval_block(&src);
+        }
+    }
+
+    /// Coverage-guided fuzzing of the comptime surface: arbitrary text inside a
+    /// `comptime` block, driven through the *whole* pipeline (parse → typeck → cgen),
+    /// so a body that survives folding still cannot panic emission. Replays the corpus
+    /// under `cargo test`; a real campaign is `cargo bolero test fuzz_comptime_eval`.
+    #[test]
+    fn fuzz_comptime_eval() {
+        bolero::check!().with_type::<String>().for_each(|s: &String| {
+            let src = format!("fn main() -> i32 {{ let a = comptime {{ {s} }}\n return 0 }}");
+            let (tokens, _) = Lexer::new(&src).tokenize();
+            let (ast, _) = Parser::new(&src, tokens).parse();
+            let (info, _td) = typeck::check(&ast);
+            let _ = cgen::emit(&ast, &info);
+        });
+    }
+}
+
 mod fuzz {
     use super::*;
 
@@ -7862,6 +7992,115 @@ fn main() -> i32 {
                 "{label}: expected a length diagnostic, got {msgs:?}"
             );
         }
+    }
+
+    /// **CTFE (workstream G, increment 2) — `comptime { … }` end-to-end.** The tier-2
+    /// contract is that a comptime block is indistinguishable from the literal it folds
+    /// to: same type, same emitted C, same runtime behaviour. This drives a real C
+    /// compiler over every value kind the interpreter produces (int, bool, string),
+    /// over the two places a *constant* is structurally required (an array length and a
+    /// repeat count, where the number becomes part of the C type name), and over a
+    /// comptime block that calls a pure recursive function.
+    #[test]
+    fn comptime_blocks_fold_end_to_end() {
+        let dir = std::env::temp_dir().join("jestyr_ctfe_block_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "\
+const N: usize = 3
+
+fn tri(n: i64) -> i64 {
+    if n <= 0 { return 0 }
+    return n + tri(n - 1)
+}
+
+fn main() -> i32 {
+    let a = comptime { 2 + 2 }
+    let b = comptime { tri(4) }
+    let flag = comptime { 10 > 3 }
+    let s = comptime { \"ab\" + \"cd\" }
+    var xs: [comptime { N * 2 }]i32 = [0; comptime { N * 2 }]
+    print_int(a as i64)
+    print_int(b)
+    print_bool(flag)
+    print_str(s)
+    print_int(xs.len as i64)
+    return 0
+}
+";
+        let f = dir.join("blocks.jtr");
+        std::fs::write(&f, src).unwrap();
+        let rel = f.to_str().unwrap();
+
+        let prog = crate::module::load(rel);
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "load: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(!td.iter().any(|d| d.is_error()), "typeck rejected comptime blocks: {td:?}");
+        let (c_src, _) = crate::cgen::emit(&prog.ast, &info);
+
+        // What reaches C is the VALUE — the keyword and the block are gone entirely.
+        assert!(!c_src.contains("comptime"), "a comptime block leaked into the C:\n{c_src}");
+        assert!(c_src.contains("JestyrArr_i32_6"), "the folded length is not in the C type name");
+        assert!(c_src.contains("JSTR(\"abcd\")"), "the folded string is not emitted");
+
+        let exe = build_exe(rel);
+        let out = Command::new(&exe).output().unwrap();
+        assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"),
+            "4\n10\ntrue\nabcd\n6\n"
+        );
+    }
+
+    /// A *computed* string has no source text to pass through, so it is re-encoded —
+    /// and C has two rules that make the obvious encoder wrong. A hex escape is
+    /// maximal-munch (`\x41` before a `1` swallows it), and `-std=c11` still honours
+    /// trigraphs (`??/` means a backslash). This round-trips the awkward bytes through
+    /// a real C compiler: what the interpreter computed is what the program prints.
+    #[test]
+    fn a_comptime_string_survives_c_escaping() {
+        let dir = std::env::temp_dir().join("jestyr_ctfe_str_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Quote, backslash, tab, a trigraph-shaped `??/`, and — the maximal-munch case
+        // — a NUL immediately followed by digits, which a hex escape would swallow but
+        // fixed-width octal cannot. Each is *concatenated* at comptime, so none of it
+        // can be served by the source-literal passthrough path.
+        let src = "\
+fn main() -> i32 {
+    print_str(comptime { \"q\\\"q\" + \"b\\\\b\" })
+    print_str(comptime { \"t\\tt\" + \"??/\" })
+    let z = comptime { \"\\0\" + \"1234\" }
+    print_int(z.len as i64)
+    return 0
+}
+";
+        let f = dir.join("cstr.jtr");
+        std::fs::write(&f, src).unwrap();
+        let rel = f.to_str().unwrap();
+        let prog = crate::module::load(rel);
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "load: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(!td.iter().any(|d| d.is_error()), "typeck: {td:?}");
+
+        // The escapes are in the C exactly as intended: `?` neutralised so `??/` cannot
+        // become a backslash, and the NUL written as fixed-width octal.
+        let (c_src, _) = crate::cgen::emit(&prog.ast, &info);
+        assert!(c_src.contains(r#"JSTR("t\tt\?\?/")"#), "trigraph guard missing:\n{c_src}");
+        assert!(c_src.contains(r#"JSTR("\0001234")"#), "NUL is not three-digit octal:\n{c_src}");
+
+        let exe = build_exe(rel);
+        let out = Command::new(&exe).output().unwrap();
+        assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
+        // The NUL case is checked by LENGTH, not by printing: `printf("%.*s")` stops at a
+        // NUL whatever precision it is given, so only the compile-time length
+        // (`sizeof(lit) - 1`) can show the four digits survived as their own bytes. Had
+        // the encoder used a hex escape, `\x00` would have munched `1234` into one
+        // (overlong) escape and the length would not be 5.
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"),
+            "q\"qb\\b\nt\tt??/\n5\n"
+        );
     }
 
     /// **Doc-comment trivia in-language.** `tokens.collect_docs` recovers exactly the

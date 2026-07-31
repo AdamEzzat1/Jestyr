@@ -251,6 +251,13 @@ impl<'a> Printer<'a> {
                 self.line(d, "unsafe");
                 self.block(d + 1, b);
             }
+            // The AST dump is the parser's golden, so it prints the block as WRITTEN.
+            // Folding is a later phase's business; showing the value here would hide
+            // whether the parse was right.
+            ExprKind::Comptime(b) => {
+                self.line(d, "comptime");
+                self.block(d + 1, b);
+            }
             ExprKind::If { cond, then, els } => {
                 let head = format!("if {}", self.expr_inline(*cond));
                 self.line(d, &head);
@@ -365,6 +372,7 @@ impl<'a> Printer<'a> {
             // at statement position they are rendered as a tree by `expr`.
             ExprKind::Block(_) => "{ ... }".to_string(),
             ExprKind::Unsafe(_) => "unsafe { ... }".to_string(),
+            ExprKind::Comptime(_) => "comptime { ... }".to_string(),
             ExprKind::If { .. } => "if ...".to_string(),
             ExprKind::Match { .. } => "match ...".to_string(),
             ExprKind::StructType(_) => "struct { ... }".to_string(),

@@ -22,6 +22,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
+use crate::comptime;
 use crate::diag::Diagnostic;
 use crate::module::{ModId, Modules};
 use crate::span::Span;
@@ -1056,6 +1057,34 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Evaluate a `comptime { … }` block and give it the type of the value it
+    /// produced (roadmap G tier 2). Every failure path is a diagnostic — a comptime
+    /// block that cannot be evaluated is never quietly treated as runtime code,
+    /// because there is no runtime code for it to become.
+    ///
+    /// The body is deliberately *not* inferred. The interpreter is the only checker
+    /// comptime code has, which is what keeps "it typechecks" and "it evaluates" from
+    /// ever disagreeing; running inference over the body as well would mean two
+    /// checkers with two opinions and no rule for which wins.
+    fn fold_comptime(&mut self, id: ExprId, span: Span) -> Ty {
+        match crate::comptime::Interp::new(self.ast).eval(id) {
+            Ok(comptime::Value::Int(_)) => Ty::Prim("i32"),
+            Ok(comptime::Value::Bool(_)) => Ty::Prim("bool"),
+            Ok(comptime::Value::Str(_)) => Ty::Prim("str"),
+            // A block ending in a binding, or an empty one. Refused rather than typed
+            // as unit: a `comptime` block exists to produce a value, and a pure one
+            // that produces none is dead code the author did not mean to write.
+            Ok(comptime::Value::Unit) => {
+                self.error(span, "a `comptime` block must produce a value".to_string());
+                Ty::Error
+            }
+            Err(e) => {
+                self.error(e.span, format!("`comptime` block: {}", e.message));
+                Ty::Error
+            }
+        }
+    }
+
     fn lower_type(&self, ty_params: &HashSet<String>, id: TypeId) -> Ty {
         match &self.ast.type_at(id).kind {
             TypeKind::Name(n) => {
@@ -1796,6 +1825,11 @@ impl<'a> TypeChecker<'a> {
         let span = data.span;
         let ty = match &data.kind {
             ExprKind::Int(_) => Ty::Prim("i32"),
+            // `comptime { … }` types as *the literal it folds to* — not as whatever
+            // its body would infer to. That equivalence is the whole contract: cgen
+            // emits the folded literal, so anything else here could disagree with what
+            // is actually compiled. The body is not inferred; see `fold_comptime`.
+            ExprKind::Comptime(_) => self.fold_comptime(id, span),
             ExprKind::Float(_) => Ty::Prim("f64"),
             ExprKind::Str(_) => Ty::Prim("str"),
             ExprKind::Char(_) => Ty::Prim("char"),
@@ -4567,6 +4601,83 @@ mod tests {
         assert_eq!(mr.fn_name, "get");
         assert_eq!(mr.recv_ctor.as_deref(), Some("List"), "resolved to a struct method");
         assert_eq!(mr.type_args, vec![Ty::Prim("i32")]);
+    }
+
+    // --- CTFE tier 2: `comptime { … }` ---
+
+    /// A comptime block is typed as *the literal it folds to*, so it is
+    /// indistinguishable from having written that literal — which is exactly what
+    /// reaches C.
+    #[test]
+    fn a_comptime_block_types_as_the_value_it_folds_to() {
+        for (src, want) in [
+            ("fn main() -> i32 { let a = comptime { 2 + 2 } return a }", Ty::Prim("i32")),
+            ("fn main() -> i32 { let a = comptime { 3 > 2 } return 0 }", Ty::Prim("bool")),
+            ("fn main() -> i32 { let a = comptime { \"x\" + \"y\" } return 0 }", Ty::Prim("str")),
+        ] {
+            let (ast, info) = analyze_full(src);
+            let id = ast
+                .exprs
+                .iter()
+                .position(|e| matches!(e.kind, ExprKind::Comptime(_)))
+                .map(|i| ExprId(i as u32))
+                .expect("fixture needs a comptime block");
+            assert_eq!(*info.type_of(id), want, "{src}");
+        }
+    }
+
+    /// A comptime block folds anywhere a constant is needed — including an array
+    /// length, where the number becomes part of the type itself.
+    #[test]
+    fn a_comptime_block_is_accepted_as_an_array_length() {
+        let (_info, d) =
+            analyze("fn main() -> i32 {\n    var xs: [comptime { 2 + 2 }]i32 = [0; 4]\n    return 0\n}\n");
+        assert!(!d.iter().any(|x| x.is_error()), "{d:?}");
+    }
+
+    /// Refusal quality: every way a comptime block can fail names the reason and
+    /// points at the culprit. None of these may be silently treated as runtime code.
+    #[test]
+    fn an_unevaluable_comptime_block_is_a_diagnostic_never_a_guess() {
+        let cases: [(&str, &str); 6] = [
+            ("runtime value", "fn main() -> i32 { var n: i32 = 1\n let a = comptime { n }\n return 0 }"),
+            ("division by zero", "fn main() -> i32 { let a = comptime { 1 / 0 }\n return 0 }"),
+            ("overflow", "fn main() -> i32 { let a = comptime { 9223372036854775807 + 1 }\n return 0 }"),
+            (
+                "unbounded recursion",
+                "fn f(n: i64) -> i64 { return f(n + 1) }\nfn main() -> i32 { let a = comptime { f(0) }\n return 0 }",
+            ),
+            ("float", "fn main() -> i32 { let a = comptime { 1.5 as i64 }\n return 0 }"),
+            // Produces no value — refused rather than typed as unit, because a pure
+            // block that yields nothing is dead code the author did not mean to write.
+            ("no value", "fn main() -> i32 { let a = comptime { let x = 1 }\n return 0 }"),
+        ];
+        for (label, src) in cases {
+            let (_info, d) = analyze(src);
+            let msgs: Vec<&str> = d.iter().filter(|x| x.is_error()).map(|x| x.message.as_str()).collect();
+            assert!(!msgs.is_empty(), "{label}: expected a diagnostic, got none");
+            assert!(
+                msgs.iter().any(|m| m.contains("comptime")),
+                "{label}: diagnostic should name `comptime`: {msgs:?}"
+            );
+        }
+    }
+
+    /// Determinism: the same source yields the same folded type and the same
+    /// diagnostics, every time. The interpreter holds no cross-run state, and this
+    /// pins that it stays that way.
+    #[test]
+    fn comptime_folding_is_deterministic() {
+        let src = "const N: i64 = 6\nfn tri(n: i64) -> i64 { if n <= 0 { return 0 }\n return n + tri(n - 1) }\n\
+                   fn main() -> i32 { let a = comptime { tri(N) * 2 } return 0 }";
+        let first = analyze(src);
+        for _ in 0..8 {
+            let (_i, d) = analyze(src);
+            assert_eq!(
+                d.iter().map(|x| x.message.clone()).collect::<Vec<_>>(),
+                first.1.iter().map(|x| x.message.clone()).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

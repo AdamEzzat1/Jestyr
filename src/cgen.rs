@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use crate::ast::*;
+use crate::comptime;
 use crate::diag::Diagnostic;
 use crate::module::ModId;
 use crate::span::Span;
@@ -4074,6 +4075,19 @@ impl<'a> Cgen<'a> {
         let span = data.span;
         match &data.kind {
             ExprKind::Int(l) => c_int_literal(l),
+            // A `comptime` block reaches C as its VALUE. Re-evaluating here rather
+            // than reading a side table set by typeck is the same choice `array_len`
+            // already makes: the interpreter is pure and total, so a second run is
+            // guaranteed to agree with the first, and no phase has to carry state.
+            //
+            // Total, like every cgen path: typeck has already reported an unevaluable
+            // block, so this cannot be the first place a user hears about it.
+            ExprKind::Comptime(_) => match crate::comptime::Interp::new(ast).eval(id) {
+                Ok(comptime::Value::Int(i)) => i.to_string(),
+                Ok(comptime::Value::Bool(b)) => if b { "true" } else { "false" }.to_string(),
+                Ok(comptime::Value::Str(s)) => format!("JSTR({})", c_string_literal(&s)),
+                Ok(comptime::Value::Unit) | Err(_) => "0".to_string(),
+            },
             ExprKind::Float(l) => l.chars().filter(|c| *c != '_').collect(),
             // A string literal is a length-carrying view; `JSTR` snapshots its
             // compile-time byte length via `sizeof(lit) - 1`.
@@ -8307,6 +8321,39 @@ fn apply_subst(t: &Ty, subst: &HashMap<String, Ty>) -> Ty {
 }
 
 /// Re-render a Jestyr integer literal as valid C (strip `_`, convert binary).
+/// Encode a comptime-produced string as a C string literal.
+///
+/// A `Str` literal written in source is passed through verbatim (`JSTR({l})`) — its
+/// escapes are already C's. A *computed* string has no source text, so it has to be
+/// re-encoded, and two C rules make the naive encoder wrong:
+///  * a hex escape is **maximal-munch** (`"\x41" "1"` reads as `\x411`), so
+///    non-printables use three-digit octal, which has a fixed width;
+///  * `-std=c11` still honours **trigraphs**, so a literal `?` is escaped rather
+///    than left to turn `??/` into a backslash.
+///
+/// Bytes, not chars: a non-ASCII scalar emits its UTF-8 bytes, which is what `JSTR`'s
+/// `sizeof(lit) - 1` length counts.
+fn c_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for b in s.bytes() {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            b'?' => out.push_str("\\?"),
+            0x20..=0x7E => out.push(b as char),
+            _ => {
+                let _ = write!(out, "\\{b:03o}");
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn c_int_literal(lex: &str) -> String {
     let t: String = lex.chars().filter(|c| *c != '_').collect();
     if let Some(rest) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {

@@ -256,6 +256,18 @@ pub enum ExprKind {
     /// interpolations, with `parts.len() == exprs.len() + 1`. Builds an owned `String`.
     FString { parts: Vec<String>, exprs: Vec<ExprId> },
     Unsafe(Block),
+    /// `comptime { … }` — a block the compiler *evaluates* rather than compiles
+    /// (design §8, roadmap G tier 2). The expression's value is the block's value,
+    /// computed by [`crate::comptime::Interp`] at check time, and what reaches C is
+    /// the resulting literal — never the block.
+    ///
+    /// That "never the block" is the load-bearing part: **the body belongs to the
+    /// interpreter alone.** No runtime-semantics pass (cgen, escape, attrs, dharht)
+    /// descends into it, because there is no runtime code in there to reason about.
+    /// Two properties fall out for free — a program that uses no `comptime` block
+    /// emits byte-identical C, and "it typechecks" can never disagree with "it
+    /// evaluates", since exactly one checker sees comptime code.
+    Comptime(Block),
     Closure { params: Vec<ClosureParam>, body: ExprId },
 
     /// A structured-concurrency nursery (design §10.2): each `spawn` inside runs

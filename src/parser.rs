@@ -1015,9 +1015,8 @@ impl<'src> Parser<'src> {
             }
             // Block-led expressions in statement position: parse only the block
             // form so a trailing operator cannot extend them.
-            If | Match | Unsafe | Concurrent | Select | Region | For | While | Loop | LBrace => {
-                Stmt::Expr(self.parse_block_like())
-            }
+            If | Match | Unsafe | Comptime | Concurrent | Select | Region | For | While | Loop
+            | LBrace => Stmt::Expr(self.parse_block_like()),
             _ => Stmt::Expr(self.parse_expr()),
         }
     }
@@ -1027,6 +1026,7 @@ impl<'src> Parser<'src> {
             If => self.parse_if(),
             Match => self.parse_match(),
             Unsafe => self.parse_unsafe(),
+            Comptime => self.parse_comptime(),
             Concurrent => self.parse_concurrent(),
             Select => self.parse_select(),
             Region => self.parse_region(),
@@ -1382,6 +1382,7 @@ impl<'src> Parser<'src> {
             If => self.parse_if(),
             Match => self.parse_match(),
             Unsafe => self.parse_unsafe(),
+            Comptime => self.parse_comptime(),
             Concurrent => self.parse_concurrent(),
             Spawn => self.parse_spawn(),
             Await => self.parse_await(),
@@ -1514,6 +1515,18 @@ impl<'src> Parser<'src> {
         let b = self.parse_block();
         let span = start.to(b.span);
         self.ast.expr(ExprKind::Unsafe(b), span)
+    }
+
+    /// `comptime { … }` — a block evaluated at check time (roadmap G tier 2).
+    /// Shares `comptime`'s existing keyword: the token was previously legal only in
+    /// a parameter list (`comptime T: type`), so no expression it could have started
+    /// before is now parsed differently.
+    fn parse_comptime(&mut self) -> ExprId {
+        let start = self.cur().span;
+        self.expect(Comptime, "`comptime`");
+        let b = self.parse_block();
+        let span = start.to(b.span);
+        self.ast.expr(ExprKind::Comptime(b), span)
     }
 
     /// `concurrent { spawn f(..); spawn g(..); }` — a structured-concurrency
@@ -1994,8 +2007,8 @@ impl<'src> Parser<'src> {
         matches!(
             self.cur().kind,
             Int | Float | Str | Char | True | False | Null | TokenKind::Ident | Underscore | SelfValue
-                | SelfType | LParen | At | If | Match | Unsafe | LBrace | Struct | Minus | Not
-                | Bang | Tilde | Amp | Pipe | PipePipe
+                | SelfType | LParen | At | If | Match | Unsafe | Comptime | LBrace | Struct | Minus
+                | Not | Bang | Tilde | Amp | Pipe | PipePipe
         )
     }
 }

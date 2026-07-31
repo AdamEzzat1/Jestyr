@@ -257,6 +257,10 @@ impl<'a> Checker<'a> {
                 self.check_block(ctx, b, tail);
                 return;
             }
+            // A `comptime` block never becomes runtime code — it becomes a literal —
+            // so it owns nothing, borrows nothing, and cannot make anything escape.
+            // Descending would analyse dataflow that will not exist in the binary.
+            ExprKind::Comptime(_) => return,
             ExprKind::StructType(body) => {
                 // A struct-type literal is a *type definition*, not part of this
                 // function's value dataflow. Check its methods independently.

@@ -90,7 +90,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | D | Attributes | ~50% | MED | S | ✓ | ✓ (provenance hooks) |
 | E | Real strings / text | ~25% | HIGH | L | ✓✓ | ✓✓ (self-host) |
 | F | Traits / `dyn` | 0% | HIGH | L | ✓✓ | ✓✓ (pass interfaces) |
-| G | CTFE + reflection | ~10% | HIGH | L | ✓ | ✓✓ (IR builder) |
+| G | CTFE + reflection | ~35% | HIGH | L | ✓ | ✓✓ (IR builder) |
 | H | Function-pointer types | 0% | HIGH | M | ✓ | ✓ (vtables) |
 | I | Error-handling polish | ~70% | MED | S | ✓ | — |
 | J | Numeric / operator completeness | ~70% | MED | S–M | ✓ | ✓ (determinism) |
@@ -174,11 +174,21 @@ generics, `dyn` trait objects (vtables — pairs with H). **Motley:** pass/analy
 interfaces are traits; the real dynamic `Allocator` vtable needs this. The biggest
 single language gap.
 
-### G. CTFE + reflection — ~10% (HIGH conflict; files: a new comptime interpreter + typeck/cgen)
-**Design §8.** Only the generics slice (type-parameter substitution) exists. **Left:**
-a small **comptime interpreter** over the AST; `comptime` blocks/consts; reflection
-as comptime calls over type values; comptime codegen. **Motley:** the IR-builder
-ergonomics and compile-time pass configuration lean on this.
+### G. CTFE + reflection — ~35% (HIGH conflict; files: `comptime.rs` + parser/typeck/cgen)
+**Design §8; the tier ladder is `docs/ctfe-tiers.md`.** **Done:** the generics slice
+(type-parameter substitution); **tier 1** — the comptime interpreter over the AST
+(`src/comptime.rs`, total: fuel + depth cap + const-cycle detection), which closed a
+silent zero-length-array miscompile; **tier 2** — `comptime { … }` blocks *in the Rust
+reference* (reusing the existing `comptime` keyword; typed as and emitted as the
+literal they fold to; the body is the interpreter's alone, so non-users stay
+byte-identical). **Left:** the tier-2 **port mirror** (`examples/std/{parser,typeck,
+cgen}.jtr` + a seed refresh) — only required once a corpus file uses the syntax;
+**tier 3** reflection; **tier 4** `build.jestyr`; **tier 5** bounded codegen.
+**Recorded dependency:** `size_of`/`align_of`/`offset_of` exist today only as
+*C-deferred* intrinsics (`sizeof`/`_Alignof`/`offsetof`), so exposing them as comptime
+*values* is blocked on **L**; tier 3 can still reflect the declared shape (names,
+field types, declaration order) from the AST. **Motley:** the IR-builder ergonomics
+and compile-time pass configuration lean on this.
 
 ### H. Function-pointer types — 0% (HIGH conflict; files: ast, parser, types, typeck, cgen)
 **Left:** a `fn(T1, T2) -> R` *type*, fn values, indirect calls. **High leverage,
