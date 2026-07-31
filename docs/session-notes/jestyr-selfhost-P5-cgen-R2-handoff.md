@@ -883,6 +883,17 @@ and becomes a driver:
   parse/typeck refusal (those ported passes surface no message diagnostics yet), import-
   bearing inputs (need in-language modules), no `-Wl,--stack` in driver builds, exe named
   `<stem>.exe` on every OS, and `run` paths quoted for cmd.exe (backslashes safest).**
+- **47 — the BOOTSTRAP SEED** (`4e659d9`): `bootstrap/{jestyr_flat.jtr, jestyr_seed.c}` —
+  the flattened compiler + its OWN 27,870-line C, committed. **Building Jestyr from
+  scratch now needs only a C compiler**: verified live with gcc alone (no Rust) — the
+  seeded `jc` re-emits the seed byte-for-byte from `jestyr_flat.jtr` and compiles + runs
+  hello through its own driver. `bootstrap_seed_is_current` (selfhost-fixpoint) is the
+  drift guard (regenerates from live sources, LF-normalized both ways for autocrlf;
+  `REFRESH_SEED=1` rewrites after a compiler change). `bootstrap/README.md` documents it.
+
+**Group-2 productization status: driver ✅ (44–46), escape-gated diagnostics ✅ (45–46),
+bootstrap seed ✅ (47). Remaining: in-language multi-module (the one real feature gap),
+parse/typeck message-diagnostic surfaces for driver refusal, O-tooling in-language.**
 
 ### NEXT increments — everything still remaining (the session-22+ worklist)
 
