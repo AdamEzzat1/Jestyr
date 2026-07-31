@@ -1,33 +1,58 @@
-# Jestyr — next-frontier handoff (post-self-hosting): O-remainder + G/L/Q
+# Jestyr — next-frontier handoff (post-self-hosting): G/L/Q
 
-> **Cold-start orientation.** Self-hosting (workstream P) and its productization arc are
-> COMPLETE on `master` (`b928c4f`, 737 tests green): the fixed point (jc2 ≡ jc1 on the
-> compiler's own C, all modes), the driver (`jc <file> build|run|test|list|attest`),
-> in-language modules (the `ml_*` flatten loader — **jc compiles itself from its real
-> multi-file sources**), exact per-file diagnostics, parse/typeck/escape refusal gates,
-> the in-language SHA-256 + attest header, and the committed **bootstrap seed**
-> (`bootstrap/` — building Jestyr from scratch needs only a C compiler, never Rust).
-> This note scopes what remains: two small O-tooling items, then the three big Rust-side
-> workstreams (G CTFE, L memory-layout, Q SIMD).
+> **Cold-start orientation.** Two whole workstreams are finished and on `master`
+> (`ebf8397`, **757 tests green** with `--features selfhost-fixpoint`, 700 in the
+> toolchain-free default suite):
+>
+> * **P (self-hosting) + its productization arc** — the fixed point (jc2 ≡ jc1 on the
+>   compiler's own C, all modes), the driver, in-language modules (the `ml_*` flatten
+>   loader — **jc compiles itself from its real multi-file sources**), exact per-file
+>   diagnostics, parse/typeck/escape refusal gates, and the committed **bootstrap seed**
+>   (`bootstrap/` — building Jestyr from scratch needs only a C compiler, never Rust).
+> * **O (tooling) — now COMPLETE IN-LANGUAGE**: the ported compiler emits the full
+>   attestation manifest, the breaking-change diff/verify gate, and the documentation
+>   page, each byte-for-byte identical to the Rust reference.
+>
+> **What this note now scopes is only Group 3** — the three Rust-side workstreams
+> (G CTFE, L memory-layout, Q SIMD), of which **G increment 1 is done**. Section 2 is
+> kept as a record of how O was closed; §3 is the live worklist.
 >
 > **Read alongside:** `docs/session-notes/jestyr-selfhost-P5-cgen-R2-handoff.md`
-> (increments 1–50, the authoritative history + every recorded trap), `ROADMAP.md`
-> workstreams G/L/O/Q (percentages there are stale for F/H — both are DONE — but the
+> (increments 1–54, the authoritative history + every recorded trap), `ROADMAP.md`
+> workstreams G/L/Q (percentages there are stale for F/H — both are DONE — but the
 > open-item descriptions are accurate), `MOTLEY.md` (the long game).
+
+---
+
+## Progress ledger (newest first — what landed since this note was written)
+
+| Increment | Commit | What |
+|---|---|---|
+| **G1** CTFE interpreter | `ebf8397` | `src/comptime.rs` — a TOTAL comptime interpreter (step budget, call-depth cap, const-cycle detection, checked arithmetic). First consumer closed a silent miscompile: `[SIZE]i32` had been emitting a **zero-length** array with `assert(_ix < 0)` and no diagnostic. Zero emission change → no port mirror yet. |
+| **54** `doc` renderer | `1a5ad67` | `jc <file> doc` byte-identical to `doc::generate` over 134 files; `at_guarantee_phrases` became the ONE guarantee extractor shared with attest. |
+| **53** doc trivia | `1a5ad67` | `tokens.collect_docs` — finds comments by scanning the **gaps between tokens**, so the golden-pinned `tokenize` is untouched. `examples/std/doc_cli.jtr` added → corpus 134. |
+| **52** attest diff/verify | `094bd6e` | `jc <old> attest-diff <new>` / `jc <file> attest-verify <manifest>` reproduce `attest::diff(…).render()` byte-for-byte, exit code included. Surfaced the `#line` divergence (§1). |
+| **51** attest records | `e3c5fbe` | `jc <file> attest` emits the FULL manifest; ported `doc::{ty_str, fn_sig, extern_sig, const_sig, fn_guarantees}`. |
+
+**Two findings from that run worth carrying forward**, both recorded in place below:
+the `#line` emission gap (§1 — invisible to every golden, so it hid for 50 increments),
+and the fact that a map-free port of an ordered-container algorithm can still be exact
+when the reference re-sorts its output by content (§2, O1).
 
 ---
 
 ## 0. Discipline (unchanged — every increment)
 
-- `cargo test` green (685 default) + warning-clean; cross-impl goldens behind
-  `--features c-oracle`; the fixpoint/self-build/seed family behind
-  `--features selfhost-fixpoint`. **Auto-commit each green increment to `master` +
-  `git push origin master`** (`git commit -F <file>`, Co-Authored-By trailer).
+- `cargo test` green (**700 default**, 757 with `--features selfhost-fixpoint`) +
+  warning-clean; cross-impl goldens behind `--features c-oracle`; the
+  fixpoint/self-build/seed family behind `--features selfhost-fixpoint`.
+  **Auto-commit each green increment to `master` + `git push origin master`**
+  (`git commit -F <file>`, Co-Authored-By trailer).
 - One construct per increment with its golden slice. Never a big drop.
 - **THE TWO-SIDED TAX (new since self-hosting — this is the thing that silently breaks):**
   any change to emitted C, an intrinsic, or a pass now has TWO implementations — the Rust
   reference (`src/*.rs`) and the port (`examples/std/*.jtr`). The full gate is:
-  1. `jestyr_cgen_matches_reference` — 133 corpus files byte-identical;
+  1. `jestyr_cgen_matches_reference` — **134** corpus files byte-identical;
   2. `jestyr_cgen_concat_matches_reference` + `jestyr_cgen_test_mode_matches_reference`;
   3. `selfhost_fixpoint_full` + `jestyr_driver_builds_itself` (the compiler must still
      compile ITSELF and must not trip its own refusal gates);
@@ -50,16 +75,25 @@
 
 ## 1. Current state (what exists, so you don't rebuild it)
 
-- **The self-hosted compiler** `examples/std/cgen.jtr` (~11.5K lines) + its 10 imports
-  (`mem, intern, fs, env, list, tokens, parser, typeck, escape, sha256`). CLI:
-  `jc <file>` (raw C dump — the UNGATED golden mode; error files must keep emitting
-  degenerately), `test [substr]` / `list [substr]`, `build` / `run` (module-loading,
-  refusal-gated, gcc-driving product modes), `attest` (manifest header).
+- **The self-hosted compiler** `examples/std/cgen.jtr` (**~12.7K lines**) + its 10 imports
+  (`mem, intern, fs, env, list, tokens, parser, typeck, escape, sha256`). Full CLI:
+  * `jc <file>` — raw C dump, the UNGATED golden mode (error files must keep emitting
+    degenerately, so **never** add a refusal gate here);
+  * `test [substr]` / `list [substr]` — the `@test`/`@bench` harness and its listing;
+  * `build` / `run` — module-loading, refusal-gated, gcc-driving product modes;
+  * `attest` — the FULL manifest (header + per-item records);
+  * `<old> attest-diff <new>` / `<file> attest-verify <manifest>` — the breaking-change
+    gate, exit 1 on a breaking change;
+  * `doc` — the Markdown API page (single-file, typeck-free).
 - **In-language modules**: the `ml_*` flatten loader (DFS deps-first, token-level
   rewrite, cross-module collision renames `name__<stem>`, `(merged, allsrc)` checkpoint
   map for exact per-file diagnostics).
-- **Bootstrap**: `bootstrap/jestyr_flat.jtr` + `jestyr_seed.c` (28,645 lines) + README;
-  gcc-only build verified live, seed self-reproduces byte-for-byte.
+- **The `_cli` split**: a module with `main` cannot be imported, so every pass that needs
+  both a library and a dump driver has one — `parser_cli`, `typeck_cli`, `escape_cli`,
+  `doc_cli`. Reach for it rather than adding a dump mode to `cgen.jtr`.
+- **Bootstrap**: `bootstrap/jestyr_flat.jtr` (20,857 lines) + `jestyr_seed.c`
+  (**31,658 lines**) + README; gcc-only build verified live, seed self-reproduces
+  byte-for-byte.
 - **Driver v1 limits already recorded** (P5 handoff, increments 44–50): no
   `-Wl,--stack` in driver gcc invocations; exe suffix fixed `.exe`; cmd.exe wants
   backslash paths for `run`; some item-level parse malformations recover Error-node-free
@@ -68,7 +102,7 @@
   `attest-verify`, recorded here because nothing else exposes it): the reference's
   module path (`module::load` → `TypeInfo::debug` → `mark_line`) emits `#line <n>
   "<file>"` directives, and **the port emits none**. No existing golden sees it — all
-  133 corpus goldens, the concat, and the fixpoint use debug-free single-file/merged
+  134 corpus goldens, the concat, and the fixpoint use debug-free single-file/merged
   ASTs — but it means `jestyrc attest <f>` and `jc <f> attest` disagree on `c-sha256`
   (the reference hashes the `#line`-bearing C; `examples/api_v1.jtr`-shaped files show
   27 such lines), and port-built binaries carry no source-line mapping. `jc attest` /
@@ -79,7 +113,11 @@
   vs `jc <file> build`'s `.c` over a multi-module fixture), then port `mark_line`'s
   placement + dedup, then refresh the seed (the seed's C would gain the directives).
 
-## 2. O-tooling remainder (SMALL — do these first, they finish the tool story)
+## 2. O-tooling — ✅ COMPLETE (kept as the record of how, not as a worklist)
+
+> Nothing here is outstanding. It stays because the *how* is reusable: both items were
+> ports of a Rust pass into `.jtr` under the two-sided tax, and the notes below name the
+> arena layouts, the sharing invariant, and the traps that cost time.
 
 ### O1. Attest manifest RECORDS + `verify` — **DONE (increments 51–52)**
 `jc <file> attest` now emits the FULL manifest — header plus per-item records — byte-equal
@@ -201,7 +239,7 @@ parity (the P3 golden compares every expression's resolved type).
 size/align computation, **field reordering**, **enum niche-packing**, and
 pass-large-aggregates-by-`const*` (today `read` params copy).
 **The byte-identity constraint is the whole game here:** reordering fields changes the
-emitted C for every existing program, which would invalidate 133 golden files, the
+emitted C for every existing program, which would invalidate 134 golden files, the
 concat, the seed, and attest hashes at once. Land it OPT-IN:
 1. A pure ANALYSIS pass (`src/layout.rs`) computing size/align/waste + a report mode
    (`jestyrc layout <file>`) — zero emission change, easy first increment.
@@ -227,17 +265,27 @@ memory + `PARALLELISM-HANDOFF.md`).
 
 ## 4. Sequencing (the one-line plan)
 
-**~~O1 records~~ (DONE, 51–52) → ~~O2 doc~~ (DONE, 53–54) → WORKSTREAM O IS COMPLETE →
-G CTFE increments 1–4 (biggest unlock; closes K via build.jestyr) → L layout 1–3 (opt-in,
-byte-identity preserved) → Q SIMD.** `#line` (§1) is an independent, optional increment —
-take it whenever the port's `build` C needs to match the reference's, not before. Keep
-every increment two-sided-green: corpus 134 + concat + test-mode + fixpoint + self-build +
-refreshed seed.
+**Done:** ~~O1 records~~ (51–52) → ~~O2 doc~~ (53–54) → **workstream O complete** →
+~~G1 the comptime interpreter~~ (`ebf8397`).
+**Next:** **G2** `comptime` blocks + consts → G3 reflection → G4 the executable
+`build.jestyr` (which closes K's last leftover) → L layout 1–3 (opt-in, byte-identity
+preserved) → Q SIMD.
+
+`#line` (§1) is an independent, optional increment — take it whenever the port's `build`
+C needs to match the reference's, not before. Keep every increment two-sided-green:
+corpus 134 + concat + test-mode + fixpoint + self-build + refreshed seed.
+
+**The port-mirror trigger to watch from here on:** G1 needed no mirror because it changed
+no emitted C. G2 onward introduces *syntax*, so the first `comptime` corpus file drags in
+`parser.jtr` + `typeck.jtr` + `cgen.jtr` mirrors and a seed refresh. Land the reference
+side and its Rust-only tests first, then the mirror, then add the corpus file — adding it
+early breaks the P2/P3 goldens, which sweep every `examples/**.jtr` with no allowlist.
 
 ## One-line
-Self-hosting is finished and productized and **workstream O is now COMPLETE in-language** —
-the ported compiler emits the full attestation manifest, the breaking-change diff, and the
-documentation page, each byte-for-byte identical to the reference; what's left is the
-optional `#line` port and the three reference-side workstreams — CTFE, opt-in memory
-layout, SIMD — each landed increment-by-increment under the two-sided golden discipline
-with the bootstrap seed refreshed at every `examples/std` change.
+Self-hosting is finished and productized, **workstream O is complete in-language** (full
+attestation manifest, breaking-change diff/verify, and documentation page, each
+byte-for-byte identical to the reference), and **CTFE has begun** — a total comptime
+interpreter that already closed a silent zero-length-array miscompile; what's left is
+G2–G4 (comptime syntax, reflection, `build.jestyr`), opt-in memory layout, SIMD, and the
+optional `#line` port — each landed increment-by-increment under the two-sided golden
+discipline with the bootstrap seed refreshed at every `examples/std` change.
