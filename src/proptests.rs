@@ -7738,28 +7738,51 @@ mod c_oracle {
         eprintln!("driver: build + run + escape/parse/type refusal all green");
     }
 
-    /// **In-language attest.** `jc <file> attest` emits the manifest HEADER — version,
-    /// source id, the sha256 of exactly the C `build` would emit (the Jestyr-written
-    /// SHA-256 in `examples/std/sha256.jtr`), and the locked compile flags — byte-equal
-    /// to the reference `attest::manifest`'s first four lines. The per-item records
-    /// section is a documented follow-up (it needs the printer's signature render).
+    /// **In-language attest.** `jc <file> attest` emits the FULL attestation manifest —
+    /// the header (version, source id, the sha256 of exactly the C `build` would emit
+    /// via the Jestyr-written SHA-256, the locked compile flags) plus the per-item
+    /// records (kind/name, vis, reconstructed Jestyr-surface signature, machine-checked
+    /// guarantees) — byte-equal to the reference `attest::manifest`. Pins the ported
+    /// `doc::{fn_sig, fn_guarantees, const_sig, extern_sig, ty_str}` family across
+    /// contracts, error sets, refinements, `@no_panic`, records/methods, externs,
+    /// enums, consts, and slice/ptr/array param types.
     #[test]
-    fn jestyr_driver_attest_header_matches_reference() {
+    fn jestyr_driver_attest_manifest_matches_reference() {
         let jc = build_exe("examples/std/cgen.jtr");
-        let file = "examples/hello.jtr";
-        let out = Command::new(&jc).args([file, "attest"]).output().unwrap();
-        assert!(out.status.success(), "jc attest failed: {}", String::from_utf8_lossy(&out.stderr));
-        let got: Vec<String> =
-            String::from_utf8(out.stdout).unwrap().lines().map(|s| s.to_string()).collect();
-        let src = std::fs::read_to_string(file).unwrap();
-        let (tokens, _) = crate::lexer::Lexer::new(&src).tokenize();
-        let (ast, _) = crate::parser::Parser::new(&src, tokens).parse();
-        let (info, _) = crate::typeck::check(&ast);
-        let want_full = crate::attest::manifest(file, &src, &ast, &info);
-        let want: Vec<String> = want_full.lines().take(4).map(|s| s.to_string()).collect();
-        assert_eq!(got, want, "attest header diverged from the reference manifest");
-        assert!(got[2].starts_with("c-sha256 "), "hash line malformed");
-        eprintln!("attest header: byte-equal to the reference (incl. the Jestyr-written sha256)");
+        for file in [
+            "examples/hello.jtr",
+            "examples/contracts.jtr",
+            "examples/errors.jtr",
+            "examples/refine.jtr",
+            "examples/records.jtr",
+            "examples/docs.jtr",
+            "examples/extern_c.jtr",
+            "examples/loops_advanced.jtr",
+            "examples/shapes.jtr",
+            "examples/array_lit.jtr",
+        ] {
+            let out = Command::new(&jc).args([file, "attest"]).output().unwrap();
+            assert!(
+                out.status.success(),
+                "jc attest failed on {file}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let got: Vec<String> =
+                String::from_utf8(out.stdout).unwrap().lines().map(|s| s.to_string()).collect();
+            let src = std::fs::read_to_string(file).unwrap();
+            let (tokens, _) = crate::lexer::Lexer::new(&src).tokenize();
+            let (ast, _) = crate::parser::Parser::new(&src, tokens).parse();
+            let (info, _) = crate::typeck::check(&ast);
+            let want_full = crate::attest::manifest(file, &src, &ast, &info);
+            let want: Vec<String> = want_full.lines().map(|s| s.to_string()).collect();
+            if got != want {
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert_eq!(g, w, "{file}: manifest line {} diverged", i + 1);
+                }
+                panic!("{file}: manifest line count diverged: got {} want {}", got.len(), want.len());
+            }
+            eprintln!("attest manifest: {file} byte-equal to the reference");
+        }
     }
 
     /// **In-language modules.** `jc <file> build|run` flattens the import closure itself

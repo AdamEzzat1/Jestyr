@@ -937,6 +937,12 @@ pub fn intern_keywords(mut it: Interner) -> i64 {
 // `Error` node) instead of overflowing the parser — or the recursive `dump` — stack
 // (`jestyr_parser_bounds_deep_nesting`).
 
+
+
+
+
+
+
 // One arena node. `kind`: 0=Int 1=Float 2=Name 3=Unary 4=Binary 5=Field 6=Index 7=Deref
 // 8=Try 9=Error 10=Call 11=Cast 12=Assign 13=Range 14=ArrayLit 15=ArrayRepeat 16=StructLit
 // 17=GenStructLit 18=FieldInit 19=SelfValue 20=SelfType 21=Attr 22=FString 23=Block 24=If
@@ -6880,6 +6886,14 @@ pub fn run__typeck() -> i32 {
 // message — in the reference's walk (emission) order. `jestyr_escape_dump_matches_reference`
 // (`--features c-oracle`) diffs it against `escape::check` over the whole corpus.
 
+
+
+
+
+
+
+
+
 // Per-run escape state, threaded `mut`. Scopes are flat arenas (like typeck's): `scn` holds
 // binding 3-tuples (name_start, name_end, is_borrow) and `scst` the per-scope start marks; `rgn`
 // holds region-tainted name 2-tuples with `rgst` marks. `frozen` is a stack of iterated-
@@ -8023,6 +8037,16 @@ pub fn push_sha256_hex(mut sb: String, read data: str) {
 //
 // Increment 1 (this file's current reach): `hello.jtr` — the prelude, one `fn main -> i32`, a
 // `print_str("…")` intrinsic call, a string literal, and `return 0`. Everything else is denylisted.
+
+
+
+
+
+
+
+
+
+
 
 // ---- the fixed C prelude (mirrors Cgen::prelude) ----
 // A FIXED header block: includes + the `jestyr_rt_*` runtime + the JestyrStr/String/Cow/Builder
@@ -18813,6 +18837,323 @@ fn driver_build(mut m: Ml, read p: Parser, read c: Checker, read src: str, read 
     return 0
 }
 
+// ---- attest records (`jc <file> attest`) ----
+// The per-item section of the attestation manifest, mirroring `attest::collect_records`
+// plus the `doc::{fn_sig, fn_guarantees, const_sig, extern_sig, ty_str}` reconstructors:
+// faithful Jestyr-surface signatures re-printed from the AST (not span slices), sorted
+// by (kind, name), each fn carrying its machine-checked guarantees.
+
+// The surface label of a parameter convention (`Conv::label`; 0=default renders empty).
+fn at_conv_label(conv: i32) -> str {
+    if conv == 1 { return "read" }
+    if conv == 2 { return "mut" }
+    if conv == 3 { return "take" }
+    if conv == 4 { return "out" }
+    return ""
+}
+
+// The exact source text of an expression, trimmed (`doc::expr_src`).
+fn at_expr_src(mut sb: String, read p: Parser, read src: str, eid: i32) {
+    let d: ExprData = get(ExprData, p.ex, eid as usize)
+    string_push(sb, trim(src[d.start .. d.end]))
+}
+
+// Render a type in Jestyr surface syntax (`doc::ty_str`), recursing through the AST
+// type arena. Kinds: 0 Name 1 TypeKw 2 Ptr 3 Slice 4 Array 5 GenRef 6 RegionRef
+// 7 App 8 Path 9 Fn 10 Dyn 11 Error.
+fn at_ty(mut sb: String, read p: Parser, read src: str, tyid: i32) {
+    let d: TypeData = get(TypeData, p.ty, tyid as usize)
+    if d.kind == 0 { string_push(sb, src[d.start .. d.end]) return }
+    if d.kind == 1 { string_push(sb, "type") return }
+    if d.kind == 2 {
+        if d.op == 1 { string_push(sb, "*mut ") } else if d.op == 2 { string_push(sb, "*const ") } else { string_push(sb, "*") }
+        at_ty(sb, p, src, d.a)
+        return
+    }
+    if d.kind == 3 { string_push(sb, "[]") at_ty(sb, p, src, d.a) return }
+    if d.kind == 4 {
+        string_push(sb, "[")
+        let le: ExprData = get(ExprData, p.ex, d.b as usize)
+        if le.kind == 0 { string_push(sb, src[le.start .. le.end]) } else { string_push(sb, "_") }
+        string_push(sb, "]")
+        at_ty(sb, p, src, d.a)
+        return
+    }
+    if d.kind == 5 { string_push(sb, "&") at_ty(sb, p, src, d.a) return }
+    if d.kind == 6 {
+        string_push(sb, "&[")
+        string_push(sb, src[d.x as usize .. d.y as usize])
+        string_push(sb, "]")
+        at_ty(sb, p, src, d.a)
+        return
+    }
+    if d.kind == 7 or d.kind == 8 {
+        string_push(sb, src[d.x as usize .. d.y as usize])
+        if d.kind == 8 {
+            string_push(sb, ".")
+            string_push(sb, src[d.z as usize .. d.w as usize])
+        }
+        // App always parenthesizes; a Path only when it has args.
+        if d.kind == 7 or d.a > 0 {
+            string_push(sb, "(")
+            var i: i32 = 0
+            for i < d.a {
+                if i > 0 { string_push(sb, ", ") }
+                at_ty(sb, p, src, get(i32, p.tar, (d.op + i) as usize))
+                i = i + 1
+            }
+            string_push(sb, ")")
+        }
+        return
+    }
+    if d.kind == 9 {
+        string_push(sb, "fn(")
+        var i: i32 = 0
+        for i < d.a {
+            if i > 0 { string_push(sb, ", ") }
+            let pc: i32 = get(i32, p.tar, (d.op + i * 2) as usize)
+            if pc != 0 { string_push(sb, at_conv_label(pc)) string_push(sb, " ") }
+            at_ty(sb, p, src, get(i32, p.tar, (d.op + i * 2 + 1) as usize))
+            i = i + 1
+        }
+        string_push(sb, ")")
+        if d.x >= 0 {
+            string_push(sb, " -> ")
+            if d.b != 0 { string_push(sb, at_conv_label(d.b)) string_push(sb, " ") }
+            at_ty(sb, p, src, d.x)
+        }
+        return
+    }
+    if d.kind == 10 {
+        string_push(sb, "dyn ")
+        string_push(sb, src[d.x as usize .. d.y as usize])
+        return
+    }
+    string_push(sb, "<error-type>")
+}
+
+// Render a fn/extern param list in surface syntax (`doc::params_str`): `iar` 7-tuples
+// [comptime, conv, name_s, name_e, is_self, type_id, refine], comma-joined.
+fn at_params(mut sb: String, read p: Parser, read src: str, pstart: i32, pcount: i32) {
+    var i: i32 = 0
+    for i < pcount {
+        if i > 0 { string_push(sb, ", ") }
+        let base: i32 = pstart + i * 7
+        let cm: i32 = get(i32, p.iar, base as usize)
+        let cv: i32 = get(i32, p.iar, (base + 1) as usize)
+        let ns: i32 = get(i32, p.iar, (base + 2) as usize)
+        let ne: i32 = get(i32, p.iar, (base + 3) as usize)
+        let slf: i32 = get(i32, p.iar, (base + 4) as usize)
+        let pty: i32 = get(i32, p.iar, (base + 5) as usize)
+        let rf: i32 = get(i32, p.iar, (base + 6) as usize)
+        if slf != 0 {
+            if cv != 0 { string_push(sb, at_conv_label(cv)) string_push(sb, " ") }
+            string_push(sb, "self")
+        } else {
+            if cm != 0 { string_push(sb, "comptime ") }
+            if cv != 0 { string_push(sb, at_conv_label(cv)) string_push(sb, " ") }
+            string_push(sb, src[ns as usize .. ne as usize])
+            if pty >= 0 { string_push(sb, ": ") at_ty(sb, p, src, pty) }
+            if rf >= 0 { string_push(sb, " in ") at_expr_src(sb, p, src, rf) }
+        }
+        i = i + 1
+    }
+}
+
+// Push a fn's `!{…}` error-set names comma-joined, from its `far` extras at `e`.
+fn at_errnames(mut sb: String, read p: Parser, read src: str, e: i32) {
+    let ec: i32 = get(i32, p.far, e as usize)
+    var k: i32 = 0
+    for k < ec {
+        if k > 0 { string_push(sb, ", ") }
+        let ns: i32 = get(i32, p.far, (e + 1 + k * 2) as usize)
+        let ne: i32 = get(i32, p.far, (e + 2 + k * 2) as usize)
+        string_push(sb, src[ns as usize .. ne as usize])
+        k = k + 1
+    }
+}
+
+// `doc::fn_sig`: `[pub ][@no_panic ]fn name(params)[ -> [conv ]R][ !{ A, B }]`.
+fn at_fn_sig(mut sb: String, read p: Parser, read src: str, read it: ItemData) {
+    if it.is_pub != 0 { string_push(sb, "pub ") }
+    if item_has_attr(p, src, it, "no_panic") { string_push(sb, "@no_panic ") }
+    string_push(sb, "fn ")
+    string_push(sb, src[it.x as usize .. it.y as usize])
+    string_push(sb, "(")
+    at_params(sb, p, src, it.a, it.b)
+    string_push(sb, ")")
+    if it.z >= 0 {
+        string_push(sb, " -> ")
+        if it.op != 0 { string_push(sb, at_conv_label(it.op)) string_push(sb, " ") }
+        at_ty(sb, p, src, it.z)
+    }
+    if fn_is_fallible__cgen(p, it) {
+        string_push(sb, " !{ ")
+        at_errnames(sb, p, src, it.e)
+        string_push(sb, " }")
+    }
+}
+
+// `doc::extern_sig`: `[pub ]extern "abi" fn name(params)[ -> [conv ]R]` (absent abi
+// string defaults to "c", mirroring the reference parser's default).
+fn at_extern_sig(mut sb: String, read p: Parser, read src: str, read it: ItemData) {
+    if it.is_pub != 0 { string_push(sb, "pub ") }
+    string_push(sb, "extern \"")
+    if it.w >= 0 { string_push(sb, src[it.w as usize .. it.u as usize]) } else { string_push(sb, "c") }
+    string_push(sb, "\" fn ")
+    string_push(sb, src[it.x as usize .. it.y as usize])
+    string_push(sb, "(")
+    at_params(sb, p, src, it.a, it.b)
+    string_push(sb, ")")
+    if it.z >= 0 {
+        string_push(sb, " -> ")
+        if it.op != 0 { string_push(sb, at_conv_label(it.op)) string_push(sb, " ") }
+        at_ty(sb, p, src, it.z)
+    }
+}
+
+// `doc::const_sig`: `[pub ]const NAME[: T] = <value source text>`.
+fn at_const_sig(mut sb: String, read p: Parser, read src: str, read it: ItemData) {
+    if it.is_pub != 0 { string_push(sb, "pub ") }
+    string_push(sb, "const ")
+    string_push(sb, src[it.x as usize .. it.y as usize])
+    if it.a >= 0 { string_push(sb, ": ") at_ty(sb, p, src, it.a) }
+    string_push(sb, " = ")
+    at_expr_src(sb, p, src, it.b)
+}
+
+// `doc::fn_guarantees` as direct `  guarantee: …\n` lines, in the reference's fixed
+// order: `@no_panic`, `requires`, `ensures`, param refinements, the error set.
+fn at_guarantees(mut ob: String, read p: Parser, read src: str, read it: ItemData) {
+    if item_has_attr(p, src, it, "no_panic") {
+        string_push(ob, "  guarantee: `@no_panic` — proven free of faulting operations\n")
+    }
+    if it.e >= 0 {
+        let ec: i32 = get(i32, p.far, it.e as usize)
+        var idx: i32 = it.e + 1 + ec * 2
+        let rc: i32 = get(i32, p.far, idx as usize)
+        idx = idx + 1
+        var i: i32 = 0
+        for i < rc {
+            string_push(ob, "  guarantee: `requires ")
+            at_expr_src(ob, p, src, get(i32, p.far, idx as usize))
+            string_push(ob, "`\n")
+            idx = idx + 1
+            i = i + 1
+        }
+        let sc: i32 = get(i32, p.far, idx as usize)
+        idx = idx + 1
+        var j: i32 = 0
+        for j < sc {
+            string_push(ob, "  guarantee: `ensures ")
+            at_expr_src(ob, p, src, get(i32, p.far, idx as usize))
+            string_push(ob, "`\n")
+            idx = idx + 1
+            j = j + 1
+        }
+    }
+    var k: i32 = 0
+    for k < it.b {
+        let base: i32 = it.a + k * 7
+        let rf: i32 = get(i32, p.iar, (base + 6) as usize)
+        if rf >= 0 {
+            string_push(ob, "  guarantee: parameter `")
+            let ns: i32 = get(i32, p.iar, (base + 2) as usize)
+            let ne: i32 = get(i32, p.iar, (base + 3) as usize)
+            string_push(ob, src[ns as usize .. ne as usize])
+            string_push(ob, "` is constrained to `")
+            at_expr_src(ob, p, src, rf)
+            string_push(ob, "`\n")
+        }
+        k = k + 1
+    }
+    if fn_is_fallible__cgen(p, it) {
+        string_push(ob, "  guarantee: may fail with `!{ ")
+        at_errnames(ob, p, src, it.e)
+        string_push(ob, " }`\n")
+    }
+}
+
+// The manifest kind tag of a top-level item, or "" if it isn't attested (trait/impl/
+// distinct/import are not standalone C items — the C hash captures their effect).
+fn at_kind_str(read it: ItemData) -> str {
+    if it.kind == 3 { return "fn" }
+    if it.kind == 2 { return "const" }
+    if it.kind == 5 { return "enum" }
+    if it.kind == 8 { return "extern" }
+    if it.kind == 4 {
+        if it.op == 2 { return "union" }
+        if it.op == 1 { return "record" }
+        return "struct"
+    }
+    return ""
+}
+
+// Order records by (kind, name) — the reference's sort key. Names are unique per
+// kind in a well-formed program, so this is a total order (stability irrelevant).
+fn at_lt(read p: Parser, read src: str, ia: i32, ib: i32) -> bool {
+    let da: ItemData = get(ItemData, p.it, ia as usize)
+    let db: ItemData = get(ItemData, p.it, ib as usize)
+    let ka: str = at_kind_str(da)
+    let kb: str = at_kind_str(db)
+    if str_eq(ka, kb) {
+        return str_lt(src[da.x as usize .. da.y as usize], src[db.x as usize .. db.y as usize])
+    }
+    return str_lt(ka, kb)
+}
+
+// The per-item records section (`attest::collect_records` + the emit loop in
+// `attest::manifest`): one block per attested top-level item, each opened by a
+// blank line — `<kind> <name>` / `  vis:` / `  sig:` / `  guarantee:`*.
+fn at_records(mut ob: String, read p: Parser, read src: str, read a: Allocator) {
+    var ids: List(i32) = make__list(i32, a)
+    var r: i32 = 0
+    for r < len(i32, p.roots) {
+        let iid: i32 = get(i32, p.roots, r)
+        let it: ItemData = get(ItemData, p.it, iid as usize)
+        let ks: str = at_kind_str(it)
+        if ks.len > 0 { push(i32, ids, iid) }
+        r = r + 1
+    }
+    // Selection sort by (kind, name), emitting each record as its slot settles.
+    var i: i32 = 0
+    for i < len(i32, ids) {
+        var m: i32 = i
+        var j: i32 = i + 1
+        for j < len(i32, ids) {
+            if at_lt(p, src, get(i32, ids, j as usize), get(i32, ids, m as usize)) { m = j }
+            j = j + 1
+        }
+        if m != i {
+            let t: i32 = get(i32, ids, i as usize)
+            set(i32, ids, i as usize, get(i32, ids, m as usize))
+            set(i32, ids, m as usize, t)
+        }
+        let iid: i32 = get(i32, ids, i as usize)
+        let it: ItemData = get(ItemData, p.it, iid as usize)
+        string_push(ob, "\n")
+        let ks: str = at_kind_str(it)
+        string_push(ob, ks)
+        string_push(ob, " ")
+        string_push(ob, src[it.x as usize .. it.y as usize])
+        string_push(ob, "\n")
+        if it.is_pub != 0 { string_push(ob, "  vis: pub\n") } else { string_push(ob, "  vis: priv\n") }
+        string_push(ob, "  sig: ")
+        if it.kind == 3 { at_fn_sig(ob, p, src, it) }
+        if it.kind == 2 { at_const_sig(ob, p, src, it) }
+        if it.kind == 8 { at_extern_sig(ob, p, src, it) }
+        if it.kind == 4 or it.kind == 5 {
+            // struct/record/union/enum sigs are just `<kind> <name>` (no `pub` prefix).
+            string_push(ob, ks)
+            string_push(ob, " ")
+            string_push(ob, src[it.x as usize .. it.y as usize])
+        }
+        string_push(ob, "\n")
+        if it.kind == 3 { at_guarantees(ob, p, src, it) }
+        i = i + 1
+    }
+}
+
 fn main() -> i32 {
     var a: Allocator = system_allocator()
     var it: Interner = make__intern(a)
@@ -18850,10 +19191,10 @@ fn main() -> i32 {
             var p2: Parser = parse_source(mv, it, kwcount, a)
             var c2: Checker = check_parsed(p2, mv, a)
             if amode {
-                // `jc <file> attest` — the manifest HEADER (version, source, the sha256 of
-                // exactly the C `build` would emit, and the locked compile flags), byte-equal
-                // to the reference `attest::manifest`'s first four lines. The per-item
-                // records section is a follow-up (it needs the printer's signature render).
+                // `jc <file> attest` — the FULL manifest, byte-equal to the reference
+                // `attest::manifest`: the header (version, source, the sha256 of exactly
+                // the C `build` would emit, and the locked compile flags) plus the
+                // per-item records (kind/name, vis, reconstructed signature, guarantees).
                 var cbuf: String = string_new()
                 emit_program(cbuf, p2, c2, mv, a, false, "")
                 var ob: String = string_new()
@@ -18861,8 +19202,11 @@ fn main() -> i32 {
                 string_push(ob, argv(1))
                 string_push(ob, "\nc-sha256 ")
                 push_sha256_hex(ob, string_view(cbuf))
-                string_push(ob, "\ncc-flags -O2 -std=c11 -ffp-contract=off -fno-fast-math")
-                print_str(string_view(ob))
+                string_push(ob, "\ncc-flags -O2 -std=c11 -ffp-contract=off -fno-fast-math\n")
+                at_records(ob, p2, mv, a)
+                // The manifest ends in '\n'; print_str re-adds one, so drop the last byte.
+                let ov: str = string_view(ob)
+                if ov.len > 0 { print_str(ov[0 .. ov.len - 1]) }
                 string_free(ob)
                 string_free(cbuf)
                 string_free(merged)
