@@ -94,6 +94,7 @@ pub fn arena_allocator(cap: usize) -> Allocator {
 // input order (the Motley spine). A parallel `byid` array gives O(1) id→string.
 
 
+
 // One table entry: owns the key bytes (`kptr`/`klen`) and records the assigned `id`.
 // `hash` is cached so a grow re-places without re-hashing and a probe skips the
 // byte-compare on a hash mismatch.
