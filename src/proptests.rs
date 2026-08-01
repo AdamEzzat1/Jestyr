@@ -6987,6 +6987,14 @@ mod c_oracle {
                 out.push(en);
                 ref_dump_block(ast, b, out);
             }
+            // Comptime: the block as WRITTEN. The dump is the parser's golden, so it
+            // must show the parse, not the folded value.
+            ExprKind::Comptime(b) => {
+                out.push("comptime".to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_block(ast, b, out);
+            }
             // Match: arm count, span, the scrutinee, then each arm as `(arm <pat> <guard-opt>
             // <body>)`.
             ExprKind::Match { scrut, arms } => {
@@ -7344,6 +7352,15 @@ mod c_oracle {
             "if f(x) { g() }",           // a call condition, a call in the then-block
             "unsafe { p.* }",            // an unsafe block with a deref tail
             "unsafe { let v = q  v }",   // unsafe block with statements
+            // comptime blocks (CTFE tier 2) — the same block-led shape as `unsafe`, so
+            // the parse must agree on spans and nesting even though the block is later
+            // evaluated rather than compiled.
+            "comptime { 2 + 2 }",              // the minimal form
+            "comptime { let x = 4  x * 2 }",   // statements then a tail expression
+            "1 + comptime { 2 * 3 }",          // in value position inside a binary
+            "comptime { 1 + comptime { 3 } }", // nested (inner in VALUE position)
+            "comptime { if a { 1 } else { 2 } }", // a block-led form inside one
+            "comptime { var t = [0; 4]  for i in 0..4 { t[i] = i }  t }", // tier 7
             "{ if a { 1 } else { 2 } }", // an if as a block statement (block-only position)
             "if a { let x = 1  x } else { 0 }", // then-block with statements + tail
             // char and bool literal leaves

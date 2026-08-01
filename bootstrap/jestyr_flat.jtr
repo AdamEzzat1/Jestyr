@@ -1065,7 +1065,7 @@ pub fn intern_keywords(mut it: Interner) -> i64 {
 // 17=GenStructLit 18=FieldInit 19=SelfValue 20=SelfType 21=Attr 22=FString 23=Block 24=If
 // 25=Unsafe 26=Char 27=Bool 28=Match 29=Str 30=Null 31=For 32=Break 33=Continue 34=Invariant
 // 35=Variant 36=StructType 37=Closure 38=Concurrent 39=Spawn 40=Await 41=ParFor 42=Select
-// 43=Region. `a`/`b` are child `ExprId`s: unary/postfix use `a` for the
+// 43=Region 44=Comptime. `a`/`b` are child `ExprId`s: unary/postfix use `a` for the
 // operand/base, binary uses `a`=lhs `b`=rhs, index uses `a`=base `b`=index, call/cast use
 // `a`=callee/expr. `x`/`y` are auxiliary integers: Field stores its name's source span
 // `(x, y)`; Call stores `(arg_start, arg_count)` into the arg arena; Cast stores its target
@@ -1334,6 +1334,14 @@ fn mk_if(mut p: Parser, start: usize, end: usize, cond: i32, then: i32, els: i32
 fn mk_unsafe(mut p: Parser, start: usize, end: usize, body: i32) -> i32 {
     let id: i32 = len(ExprData, p.ex) as i32
     push(ExprData, p.ex, ExprData{ kind: 25, start: start, end: end, op: 0, a: body, b: 0 - 1, x: 0 - 1, y: 0 - 1 })
+    return id
+}
+// A `comptime { … }` expression (kind 44): `a`=the Block node. Same shape as Unsafe —
+// a keyword and a block — but the block is EVALUATED rather than compiled, so nothing
+// downstream of typeck ever walks it. Mirrors `ExprKind::Comptime`.
+fn mk_comptime(mut p: Parser, start: usize, end: usize, body: i32) -> i32 {
+    let id: i32 = len(ExprData, p.ex) as i32
+    push(ExprData, p.ex, ExprData{ kind: 44, start: start, end: end, op: 0, a: body, b: 0 - 1, x: 0 - 1, y: 0 - 1 })
     return id
 }
 // A `match` expression (kind 28): `a`=scrutinee `ExprId`; `(x, y)`=(arm_start, arm_count)
@@ -1889,7 +1897,7 @@ fn parse_stmt(mut p: Parser) -> i32 {
         return mk_let(p, start, prev_end(p), mutbl, ns, ne, tyid, init)
     }
     // Block-led expressions in statement position parse *block-only* (no trailing operator).
-    if k == 65 or k == 22 or k == 21 or k == 38 or k == 24 or k == 34 or k == 37 or k == 32 {  // `{`/`if`/`match`/`unsafe`/`for`/`concurrent`/`select`/`region`
+    if k == 65 or k == 22 or k == 21 or k == 38 or k == 31 or k == 24 or k == 34 or k == 37 or k == 32 {  // `{`/`if`/`match`/`unsafe`/`comptime`/`for`/`concurrent`/`select`/`region`
         let e: i32 = parse_block_like(p)
         return mk_exprstmt(p, e)
     }
@@ -1904,6 +1912,7 @@ fn parse_block_like(mut p: Parser) -> i32 {
     if k == 22 { return parse_if(p) }                // `if`
     if k == 21 { return parse_match(p) }             // `match`
     if k == 38 { return parse_unsafe(p) }            // `unsafe`
+    if k == 31 { return parse_comptime(p) }          // `comptime`
     if k == 24 { return parse_for(p) }               // `for`
     if k == 34 { return parse_concurrent(p) }        // `concurrent`
     if k == 37 { return parse_select(p) }            // `select`
@@ -1944,6 +1953,18 @@ fn parse_unsafe(mut p: Parser) -> i32 {
     bump(p)                                          // consume `unsafe`
     let b: i32 = parse_block(p)
     return mk_unsafe(p, start, node_end(p, b), b)
+}
+
+// `comptime { … }` — a block the compiler evaluates rather than compiles. Shares the
+// `comptime` keyword with the generic-parameter marker (`fn Box(comptime T: type)`);
+// that use is only ever inside a parameter list, so the token never started an
+// expression before and no existing parse changes. Mirrors `parse_comptime`.
+fn parse_comptime(mut p: Parser) -> i32 {
+    let ct: Token = cur_tok(p)
+    let start: usize = ct.start
+    bump(p)                                          // consume `comptime`
+    let b: i32 = parse_block(p)
+    return mk_comptime(p, start, node_end(p, b), b)
 }
 
 // The unified `for` loop. Optional label (`for outer: …`), a head (infinite / conditional /
@@ -3051,6 +3072,9 @@ fn parse_primary(mut p: Parser) -> i32 {
     }
     if k == 38 {                                   // `unsafe` -> Unsafe block
         return parse_unsafe(p)
+    }
+    if k == 31 {                                   // `comptime` -> Comptime block
+        return parse_comptime(p)
     }
     if k == 11 {                                   // `struct { … }` -> anonymous struct value
         return parse_struct_type(p)
@@ -4206,6 +4230,11 @@ fn dump(read src: str, read p: Parser, id: i32) {
     } else if d.kind == 25 {
         // Unsafe: just its block.
         print_str("unsafe") print_uint(d.start) print_uint(d.end)
+        dump(src, p, d.a)
+    } else if d.kind == 44 {
+        // Comptime: just its block. The dump shows the block as WRITTEN — folding is a
+        // later phase's business, and printing the value here would hide the parse.
+        print_str("comptime") print_uint(d.start) print_uint(d.end)
         dump(src, p, d.a)
     } else if d.kind == 28 {
         // Match: arm count, span, the scrutinee, then each arm as `(arm <pat> <guard-opt>

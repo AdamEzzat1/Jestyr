@@ -623,6 +623,7 @@ int32_t jestyr_mk_attr(Jestyr_Parser* restrict j_p, size_t j_start, size_t j_end
 int32_t jestyr_mk_block(Jestyr_Parser* restrict j_p, size_t j_start, size_t j_end, int32_t j_stmt_start, int32_t j_stmt_count);
 int32_t jestyr_mk_if(Jestyr_Parser* restrict j_p, size_t j_start, size_t j_end, int32_t j_cond, int32_t j_then, int32_t j_els);
 int32_t jestyr_mk_unsafe(Jestyr_Parser* restrict j_p, size_t j_start, size_t j_end, int32_t j_body);
+int32_t jestyr_mk_comptime(Jestyr_Parser* restrict j_p, size_t j_start, size_t j_end, int32_t j_body);
 int32_t jestyr_mk_match(Jestyr_Parser* restrict j_p, size_t j_start, size_t j_end, int32_t j_scrut, int32_t j_arm_start, int32_t j_arm_count);
 int32_t jestyr_mk_for(Jestyr_Parser* restrict j_p, size_t j_start, size_t j_end, int32_t j_head_kind, int32_t j_lar_base, int32_t j_body, int32_t j_els);
 int32_t jestyr_mk_loopjump(Jestyr_Parser* restrict j_p, int32_t j_kind, size_t j_start, size_t j_end, int32_t j_ls, int32_t j_le);
@@ -682,6 +683,7 @@ int32_t jestyr_parse_stmt(Jestyr_Parser* restrict j_p);
 int32_t jestyr_parse_block_like(Jestyr_Parser* restrict j_p);
 int32_t jestyr_parse_if(Jestyr_Parser* restrict j_p);
 int32_t jestyr_parse_unsafe(Jestyr_Parser* restrict j_p);
+int32_t jestyr_parse_comptime(Jestyr_Parser* restrict j_p);
 int32_t jestyr_parse_for(Jestyr_Parser* restrict j_p);
 int32_t jestyr_parse_loop_conv(Jestyr_Parser* restrict j_p);
 int32_t jestyr_parse_pat_lit(Jestyr_Parser* restrict j_p);
@@ -2864,6 +2866,13 @@ int32_t jestyr_mk_unsafe(Jestyr_Parser* restrict j_p, size_t j_start, size_t j_e
     return j_id;
 }
 
+int32_t jestyr_mk_comptime(Jestyr_Parser* restrict j_p, size_t j_start, size_t j_end, int32_t j_body)
+{
+    int32_t j_id = (int32_t)(jestyr_len__ExprData((*j_p).j_ex));
+    jestyr_push__ExprData(&((*j_p).j_ex), (Jestyr_ExprData){ .j_kind = 44, .j_start = j_start, .j_end = j_end, .j_op = 0, .j_a = j_body, .j_b = (0 - 1), .j_x = (0 - 1), .j_y = (0 - 1) });
+    return j_id;
+}
+
 int32_t jestyr_mk_match(Jestyr_Parser* restrict j_p, size_t j_start, size_t j_end, int32_t j_scrut, int32_t j_arm_start, int32_t j_arm_count)
 {
     int32_t j_id = (int32_t)(jestyr_len__ExprData((*j_p).j_ex));
@@ -3653,7 +3662,7 @@ int32_t jestyr_parse_stmt(Jestyr_Parser* restrict j_p)
         }
         return jestyr_mk_let(&((*j_p)), j_start, jestyr_prev_end((*j_p)), j_mutbl, j_ns, j_ne, j_tyid, j_init);
     }
-    if (((((((((j_k == 65) || (j_k == 22)) || (j_k == 21)) || (j_k == 38)) || (j_k == 24)) || (j_k == 34)) || (j_k == 37)) || (j_k == 32)))
+    if ((((((((((j_k == 65) || (j_k == 22)) || (j_k == 21)) || (j_k == 38)) || (j_k == 31)) || (j_k == 24)) || (j_k == 34)) || (j_k == 37)) || (j_k == 32)))
     {
         int32_t j_e = jestyr_parse_block_like(&((*j_p)));
         return jestyr_mk_exprstmt(&((*j_p)), j_e);
@@ -3676,6 +3685,10 @@ int32_t jestyr_parse_block_like(Jestyr_Parser* restrict j_p)
     if ((j_k == 38))
     {
         return jestyr_parse_unsafe(&((*j_p)));
+    }
+    if ((j_k == 31))
+    {
+        return jestyr_parse_comptime(&((*j_p)));
     }
     if ((j_k == 24))
     {
@@ -3738,6 +3751,15 @@ int32_t jestyr_parse_unsafe(Jestyr_Parser* restrict j_p)
     jestyr_bump(&((*j_p)));
     int32_t j_b = jestyr_parse_block(&((*j_p)));
     return jestyr_mk_unsafe(&((*j_p)), j_start, jestyr_node_end((*j_p), j_b), j_b);
+}
+
+int32_t jestyr_parse_comptime(Jestyr_Parser* restrict j_p)
+{
+    Jestyr_Token j_ct = jestyr_cur_tok((*j_p));
+    size_t j_start = j_ct.j_start;
+    jestyr_bump(&((*j_p)));
+    int32_t j_b = jestyr_parse_block(&((*j_p)));
+    return jestyr_mk_comptime(&((*j_p)), j_start, jestyr_node_end((*j_p), j_b), j_b);
 }
 
 int32_t jestyr_parse_for(Jestyr_Parser* restrict j_p)
@@ -5686,6 +5708,10 @@ int32_t jestyr_parse_primary(Jestyr_Parser* restrict j_p)
     if ((j_k == 38))
     {
         return jestyr_parse_unsafe(&((*j_p)));
+    }
+    if ((j_k == 31))
+    {
+        return jestyr_parse_comptime(&((*j_p)));
     }
     if ((j_k == 11))
     {
@@ -7892,6 +7918,14 @@ void jestyr_dump(JestyrStr j_src, Jestyr_Parser j_p, int32_t j_id)
     if ((j_d.j_kind == 25))
     {
         jestyr_rt_print_str(JSTR("unsafe"));
+        jestyr_print_uint(j_d.j_start);
+        jestyr_print_uint(j_d.j_end);
+        jestyr_dump(j_src, j_p, j_d.j_a);
+    }
+    else
+    if ((j_d.j_kind == 44))
+    {
+        jestyr_rt_print_str(JSTR("comptime"));
         jestyr_print_uint(j_d.j_start);
         jestyr_print_uint(j_d.j_end);
         jestyr_dump(j_src, j_p, j_d.j_a);
