@@ -28,6 +28,7 @@
 
 | Increment | Commit | What |
 |---|---|---|
+| **Q-S1** the checked `@simd` legality pass | *(this run)* | The SIMD frontier opens where L1 opened the layout one: **analysis first, zero emission change.** `src/simd.rs` decides whether a `par for` body may be evaluated a lane at a time — a total, elementwise integer expression — and `@simd` is the *checked declaration* that it can be, in `@span`'s shape rather than a `#pragma`'s: it emits nothing, so a refactor that slips a call, a division or a float into a hot body is a diagnostic instead of a silent fall off the vector path. Nothing SIMD-shaped existed on master beforehand, so this is increment 1 of the workstream, not a duplicate. The determinism argument is two claims, and only the second was open: the four declared reductions are exactly associative on machine integers (so a lane tree of ANY width equals the serial fold — which is why float is *excluded* rather than discouraged; `-ffp-contract=off` constrains contraction, not order), and the body must be total. **gcc is the authority, as it is for layout**: `simd_lanes_match_scalar_bit_for_bit` evaluates every certified body scalar-wise and through GCC vector extensions at widths 2, 4 and 8, reduced four ways, and requires identical bits. It earned its keep immediately by catching a real miscompile in its own harness — the scalar tail of a vector loop needs the *scalar* lowering of a select, the bug Q-S2 is now forewarned about. |
 | **M5** def-order dependency registration | *(this run)* | Closes the divergence M4 recorded: the port emitted `JestyrSlice_<T>` **after** the struct whose field embeds it, where the reference emits it before. The sorter was never the bug — the port's slice and genref typedefs never called `dc_begin`/`dc_end` at all, and the array typedef opened a segment it **never closed**, so all three were absorbed as anonymous *glue*. Glue is pinned in place and invisible to `dc_find_dep`, so the struct's (correctly recorded) dep resolved to nothing. Registering all three as named segments — no deps for slice/genref, which reach `E` through a pointer; one dep for the array, which embeds `E` by value — makes the port's segment graph structurally identical to the reference's. `examples/def_order.jtr` is the new corpus file (**136 → 137**) and pins all three at once; the slice half is also pinned in place by restoring the field `comptime_reflect.jtr` had to omit. **Zero emission change on the other 136 files.** The unclosed `dc_begin` is the failure mode worth remembering: it loses the name without losing any text, so it is a silent divergence rather than a crash or a corrupt buffer. |
 | **M4** G3 reflection port mirror | `b292426` | **Tier 3 closed on both sides.** `@type_name`/`@field_count`/`@field_name`/`@field_type` in the self-hosted compiler; `examples/comptime_reflect.jtr` is corpus **136**, byte-identical. The structural decision: `@field_type` needs a Jestyr-syntax type renderer, and one already existed in cgen.jtr for attest + doc — so `at_ty` **MOVED DOWN** into `ctfe.jtr` (below cgen, above parser, depends only on the type arena) and cgen keeps a three-line wrapper, leaving its 16 call sites unchanged. ONE renderer, two consumers: a reflected type name cannot drift from the documented or attested one, the same invariant `at_guarantee_phrases` gives the guarantee text. typeck types a query from a STATIC table (`field_count`→i64, the rest→str) and does **not** infer the arguments — the first is a *type*, so inference would report a binding that does not exist; only emission evaluates. **The `@` sigil justified itself in reverse:** the first cgen arm keyed on the Attr node KIND and broke two passing corpus files, because `@address(0x…)` in mmio.jtr is also `@name(…)` and must still emit normally. `@name` is a family; the guard belongs on the intrinsic NAME. Nine reflection fixtures added to the ctfe golden (incl. a primitive, a `record`, methods-are-not-fields, a const index, composition inside `comptime {}`, and three refusals) — all passed first run. |
 | **G8** plan-as-list | *(this run)* | `const targets` now selects the build script's form **by its type**: an integer is a count (the tier-4 index form), a list is the targets themselves — `[[source, output], …]`, buildable by a comptime `for`. A pair is a two-element list because the value domain has no struct; two parallel lists would read better and can disagree in length. Artifacts take the same two forms. Fully backwards compatible, and the two forms render byte-identical plans (pinned by planning one build both ways). `examples/build_list.jestyr` is the worked example. |
@@ -433,18 +434,171 @@ concat, the seed, and attest hashes at once. Land it OPT-IN:
 **Port impact:** every opt-in construct mirrors into cgen.jtr when its corpus file
 lands; the seed refreshes.
 
-### Q. SIMD → GPU (from ~45%)
-`par_map`/`par_scan` (`std/parallel.jtr`), the `par for … reduce(r)` surface, and
-`@span` (the checked work-span cost model) exist. **Check master before building ANY
-parallelism feature — Q has twice discarded duplicate builds** (see the parallelism
-memory + `PARALLELISM-HANDOFF.md`).
-1. SIMD lowering first: a `@simd`-gated `par for` body → GCC vector extensions
-   (`__attribute__((vector_size)))` or plain auto-vectorizable loops with `#pragma omp
-   simd`-free portable C — keep the locked `CC_FLAGS` untouched; determinism requires
-   the FP seam rules (no reassociation → integer/bitwise SIMD first, FP SIMD only
-   where `-ffp-contract=off` semantics hold).
-2. SOAC-library growth on `@span` (the CJC thermal/energy hookup is the differentiator).
-3. GPU is after SIMD proves the model.
+### Q. SIMD → GPU (increment 1 DONE — the deterministic-acceleration frontier)
+
+**Check master before building ANY parallelism feature — Q has twice discarded
+duplicate builds** (the parallelism memory + `PARALLELISM-HANDOFF.md`). What is
+already there, confirmed in-tree this run, so nobody rebuilds it a third time:
+`par_map`/`par_scan` (`examples/std/parallel.jtr`), `par_reduce`, the
+`par for … reduce(r)` surface (`ExprKind::ParFor`, the four-arm typeck check against
+`DETERMINISTIC_REDUCTIONS`), dynamic-N spawn, `@deterministic`, the `par for` SHA
+canary, and **`@span`** — the checked work-span model in `attrs.rs` (a `Cost { k, j }`
+lattice over the AST's loop structure; a sequential loop multiplies by `n`, a
+`par for` contributes `log n`, so serializing a reduction is a compile error).
+
+**What did NOT exist before this run: anything SIMD-shaped at all.** No `@simd`, no
+vector lowering, no thermal facet. (`dharht.rs`'s `simd_tier()` is an unrelated
+blueprint string behind `--features dharht-experiment`.) So the frontier starts at
+increment 1, and the mission is *not* to reinvent data parallelism — it is to make
+SIMD deterministic first, then use the proven SIMD contract as the gate to GPU.
+
+#### The promise being extended
+Today: **bit-identical across thread counts and chunk sizes**. This workstream adds
+**lane widths**, and eventually **legal GPU tile schedules**, to that list — without
+loosening the FP contract (`-ffp-contract=off -fno-fast-math`, `CC_FLAGS`, locked by
+`fp_contract_tests`) by a single flag.
+
+#### Q-S1 — the checked `@simd` legality pass ✅ **DONE (this run)**
+`src/simd.rs` + the `@simd` attribute + `jestyrc simd <file>`. **Zero emission change**,
+which is the whole reason it is first: a vector lowering rewrites the emitted C of
+every vectorized program at once, invalidating the corpus, the concat, the seed and
+every attested hash in one commit. So this increment decides *what is legal*, proves
+that decision against the real vector backend, and a later one lowers only what is
+already certified. Exactly L1's route (measure the layout, verified by the C compiler,
+before reordering a field).
+
+The determinism argument splits cleanly in two, and only the second half was open:
+
+1. **The reduction is lane-count independent** — `par for` already admits only
+   `sum`/`min`/`max`/`xor` over `i64`, exactly associative *and* commutative on machine
+   integers. A lane tree of any width equals the serial fold, bit for bit. This is why
+   float is *excluded* rather than discouraged: `-ffp-contract=off` constrains
+   contraction, not order, and a horizontal float add reassociates.
+2. **The body is a total, elementwise integer expression** — what `simd::classify`
+   decides, via a deliberately small whitelist: literals, names, `+ - * & | ^ ~ ! <<
+   >>`, comparisons, `and`/`or`, `if`/`else`, blocks with `let`. Everything else is
+   rejected with its **own** named cause (`Call`, `Memory`, `Float`, `Trapping`,
+   `ShiftAmount`, `LaneWidth`, `Control`, `Unsupported`) at the **innermost** offending
+   span, so the diagnostic points at the division and not at the loop.
+
+`@simd` is a **contract, not a switch** — the `@span` shape, not a `#pragma`: it
+changes no C, and a refactor that slips a call, a division or a float into a hot body
+becomes a diagnostic instead of a silent fall-off-the-vector-path. `@simd` on a
+function with no `par for` is an *error*: an attribute that quietly means nothing reads
+like a guarantee.
+
+**Tests (21 new; 785 default green, warning-clean).** `simd::tests` (15) cover each
+accept and each distinct rejection; `proptests::simd_legality` (6) cover the attribute,
+its diagnostics, that `@simd` emits byte-identical C, and that the shipped
+`examples/std/par_for.jtr` is certified — a positive corpus case **without a new corpus
+file**. The soundness half is `simd_lanes_match_scalar_bit_for_bit`
+(`--features c-oracle`): every certified body is evaluated scalar-wise and through GCC
+vector extensions at widths **2, 4 and 8**, reduced by all four declared reductions,
+and every answer must be identical. **gcc is the authority**, the same way
+`layout_matches_c_sizeof` makes it the authority on layout.
+
+#### Findings from Q-S1 (read before Q-S2 — each cost real time or nearly did)
+
+1. **The scalar tail of a vectorized loop needs the *scalar* lowering of a select.**
+   The oracle shares ONE `#define F(x)` between the scalar and vector runs so there is
+   no transcription risk — but a select cannot be shared, because a GNU vector
+   comparison yields all-ones/all-zeros per lane while a scalar comparison yields `1`,
+   and `?:` is not defined on vectors at all. The first draft flipped `SEL` to the mask
+   blend for the whole vector section, tail included, and the tail (1003 elements, not
+   a multiple of any width) silently computed garbage. **The lowering increment will
+   have exactly this bug available to it**: `Q-S2` must emit the scalar select for the
+   remainder loop, and `N % W != 0` must be in its first test, not its last. That the
+   oracle *caught* it unprompted, with a precise message, is the teeth-verification
+   this increment would otherwise have had to stage.
+2. **`and`/`or` are legal only because the sublanguage is total.** A lane blend
+   evaluates both sides; scalar short-circuits. That is value-preserving *only* because
+   every faulting form (`/`, `%`, indexing, calls) is already excluded. **Admit one
+   partial operation and the short-circuit operators stop being safe in the same
+   motion** — the two rules are a single invariant wearing two hats. Same argument
+   licenses `if`/`else` as a select.
+3. **Division is the rule with teeth, and the reason is not the obvious one.** A vector
+   computes every lane, so a divisor that is zero in a lane the scalar run would have
+   skipped becomes a real SIGFPE — plus `INT64_MIN / -1`. `if x != 0 { 100 / x } else
+   { 0 }` looks guarded and is not.
+4. **A syntactic pass is sufficient here, and the argument for why is load-bearing.**
+   Attributes are validated in the *parser*, before types exist (the constraint `@span`
+   already works under), so `@simd` cannot consult `TypeInfo`. That is sound anyway:
+   the loop variable is `i64`, and the only two routes from an integer to a float — a
+   cast and a call — are both rejected, so **no float can depend on the loop variable**,
+   and any float that could survive into a certified body is loop-invariant, broadcast,
+   never reduced. `no_float_can_depend_on_the_loop_variable` pins both routes. **If
+   either is ever admitted, the float exclusion needs types to stay sound.**
+5. **Span containment beats a bespoke walker.** `sites_in_span` finds a function's
+   `par for` loops by filtering the flat expression arena on span nesting, so no walker
+   needs maintaining as new expression forms land — and a form that *contains* a
+   `par for` cannot hide one from the check.
+6. **ONE classifier, two consumers** — `@simd` and `jestyrc simd` both call
+   `simd::classify`, so the report can never certify a loop the attribute rejects. The
+   same rule that keeps M4's reflected/documented/attested type renderings from
+   drifting (`at_ty`).
+7. **The pass is conservative, never optimistic**, and only one direction is a
+   soundness claim. A rejected body may well vectorize; nothing depends on that, and it
+   is not tested. Say this out loud in any diagnostic-tuning increment.
+
+#### Q-S2 — deterministic SIMD lowering (next; the first emission change)
+`@simd` flips from *contract* to *contract + opt-in lowering*, for certified loops
+only. Non-annotated programs stay byte-identical, so the corpus moves only for files
+that opt in — the `@layout(auto)` discipline.
+
+- Emit GCC vector extensions (`__attribute__((vector_size(N)))`), **not** `#pragma omp
+  simd`, no `-march` change, no new `CC_FLAGS`. The lowering must be *chosen*, not
+  begged for, or determinism is at the optimizer's discretion.
+- Shape: vector head + lane fold + **scalar remainder** (finding 1). Lane width is a
+  fixed, recorded constant, not a host probe — a host-dependent width would make the
+  emitted C depend on the build machine, which the attest hash would (rightly) flag.
+- **Two-sided tax applies in full** for the first time in this workstream: an annotated
+  corpus file drags in `parser.jtr` (attribute already generic), `typeck.jtr` and
+  `cgen.jtr` mirrors plus `REFRESH_SEED=1`. Keep the first annotated file out of
+  `examples/` until the mirror lands — the same trigger the CTFE M-series demonstrated.
+- The determinism test already exists in the form it will need: extend
+  `simd_lanes_match_scalar_bit_for_bit` to compare **`jestyrc run` of the annotated
+  program against the unannotated one**, and add the annotated demo to the c-oracle SHA
+  canary's demo set so lane width joins thread count and chunk size in the pinned digest.
+
+#### Q-S3 — the `@span` thermal/energy facet (CJC CANA/PINN inheritance)
+**Adapt, do not reinvent** (`MOTLEY.md` Part III; CJC `crates/cjc-cana`).
+
+- Feed a `PhysicalCostQuery`-shaped record — flops, bytes read/written, allocation and
+  working set, threads/**lanes**, batch/tile shape, and **float-op density**
+  (`float_ops/flops`, PINN v2's dominant feature, corr ≈ +0.95) — into the closed-form
+  v1 model (`heat = norm(flops)·(1+thread_amp·Δthreads)·(1+batch_amp·Δbatch)`, then
+  `thermal = clamp01(heat·(1−cooling_rate))`, `cooling_rate = 0.05`, **no FMA, every
+  product named**).
+- `simd::Verdict::Legal { ops }` already carries the lane-op count *because* this is
+  coming: it is the `flops` input, computed once, by the same classifier.
+- **Deterministic or it does not ship**: no profiling, no clocks, no host probes, no
+  `Date`/`rand` anywhere in the model. Container/cgroup/TDP inputs are future-facing and
+  must be *explicit and recorded* — a normal build may not become host-dependent.
+- **Ranking authority only, never legalization.** The facet may rank or diagnose legal
+  lowerings ("this vectorization is thermally worse — here is the number"); it may never
+  make a nondeterministic one legal. That veto split is CJC's own (`legality.rs` holds
+  the veto; `pass_ranker.rs` only scores), and it is the line that keeps a *model* from
+  quietly becoming a *policy*.
+- Carry CJC's known debt forward rather than rediscovering it: the model is
+  **hardware-generic** (per-window heat accumulation, not watts), and the energy
+  residual is nonlinear — a linear head caps near R² 0.82.
+
+#### Q-S4 — the GPU contract (design now, implement after Q-S2 is proven)
+Write the deterministic contract while SIMD is fresh; build nothing GPU-facing until
+the SIMD contract has tests behind it. The contract to state: **bit-identical across
+every *legal* tile schedule**, by the same two-part argument — an exactly-associative
+reduction plus a total elementwise body — with the tile/block shape occupying the role
+lane width has here. `simd::classify`'s whitelist is the natural seed for the kernel
+subset; a gather (`Reason::Memory`) is the first rule GPU will want to relax, and it
+must be relaxed *with* its determinism argument, not before it.
+
+#### Non-negotiables for every increment in this workstream
+No fast-math, no reassociation, no FMA-dependent behaviour, no schedule-dependent float
+results. No OpenMP pragmas, no work-stealing runtime, no hidden scheduler, no
+nondeterministic reduction (not even opt-in — `PARALLELISM-HANDOFF.md` §"What NOT to
+build" is still binding). Every user-visible feature ships with a determinism test that
+proves scalar and accelerated paths are bit-identical. Emission changes bring goldens,
+port mirrors and a seed refresh with them, in the same commit.
 
 ## 4. Sequencing (the one-line plan)
 
@@ -475,7 +629,13 @@ and the bootstrap seed both contain a comptime evaluator and the shared type ren
    L1's offsets are *verified against the C compiler* rather than believed. Opt-in per
    struct, so non-annotated types stay byte-identical; the corpus grows annotated files.
    Then L3 (niche packing, by-`const*` `read` params).
-3. **Q SIMD → GPU** — deliberately untouched this run; the user has a separate plan.
+3. **Q-S2 deterministic SIMD lowering** — `@simd` flips from contract to contract +
+   opt-in lowering for the loops Q-S1 already certifies. The second increment in this
+   workstream that changes emission, and it inherits a ready-made first test case: the
+   scalar remainder (`N % W != 0`) needs the *scalar* select, the bug Q-S1's oracle
+   caught in its own harness. Then Q-S3 (the `@span` thermal/energy facet — ranking
+   authority only, never legalization) and Q-S4 (the GPU contract, written now,
+   implemented after Q-S2 is proven).
 
 `@size_of`/`@align_of`/`@offset_of` as comptime *values* come after L (L1 unblocked the
 computation; exposing it is its own slice). Comptime-only functions are a *convenience*,
@@ -521,8 +681,18 @@ waiting on. The through-line is that **purity was never traded away to get power
 tier added a capability without giving the evaluator an effect, so determinism and
 reproducibility stayed properties of the design rather than conventions to police — and
 each tier's cost was one line of fuel accounting in a new place (per expression, per
-element, per iteration). The ladder is documented in `docs/ctfe-tiers.md`. What's left is
-the **G3/G6/G7 port mirrors** (tier 2 is closed on both sides), opt-in memory
-layout, SIMD, and the optional `#line` port — each landed
-increment-by-increment under the two-sided golden discipline with the bootstrap seed
-refreshed at every `examples/std` change.
+element, per iteration). The ladder is documented in `docs/ctfe-tiers.md`. **Group 3's
+other two workstreams have now opened the same way — by measuring before changing
+anything**: L1 reports what your types cost with gcc as the authority on layout, and
+**Q-S1 decides which `par for` loops may run a SIMD lane at a time, with gcc as the
+authority on vectorization** (scalar ≡ 2 ≡ 4 ≡ 8 lanes, bit for bit, across all four
+declared reductions) — `@simd` being a *checked contract* in `@span`'s shape, not a
+`#pragma`, so it emits nothing and a body that stops vectorizing becomes a diagnostic
+rather than a silent performance cliff. That the analysis-first ordering is not merely
+cautious is now demonstrated twice over: L1's report is the thing reordering will
+justify itself against, and Q-S1's oracle caught a real select-lowering miscompile in
+its own harness before any lowering existed to be wrong. What's left is the **G6/G7
+port mirrors** (tiers 2 and 3 are closed on both sides), **L2** opt-in layout, **Q-S2**
+opt-in SIMD lowering → the thermal facet → the GPU contract, and the optional `#line`
+port — each landed increment-by-increment under the two-sided golden discipline with
+the bootstrap seed refreshed at every `examples/std` change.

@@ -225,6 +225,16 @@ contract is something no one has built — and it is squarely the Motley thesis.
    regression. Then layer CJC's thermal/energy estimate.
 6. **Research / far:** typed **SIMD** (`uniform`/`varying` + bit-identical lane reductions —
    real backend work), then **GPU SOACs** (Futhark-style). Big lifts; sequence last.
+   **Increment 6 has now STARTED — do not restart it.** `src/simd.rs` + the `@simd`
+   attribute + `jestyrc simd <file>` (increment **Q-S1**, on master) decide which
+   `par for` bodies may be evaluated a lane at a time, and prove the verdict sound
+   against GCC vector extensions at widths 2/4/8 (`simd_lanes_match_scalar_bit_for_bit`,
+   `--features c-oracle`). It changes **no emitted C** — `@simd` is a *checked contract*
+   in `@span`'s shape, not a lowering switch — so the lowering (Q-S2), the CJC
+   thermal/energy facet (Q-S3) and the GPU contract (Q-S4) are what remain. The full
+   plan, the seven findings, and the non-negotiables live in
+   **`docs/session-notes/jestyr-next-frontier-handoff.md` § "Q. SIMD → GPU"**; read
+   that before touching this workstream.
 
 ---
 

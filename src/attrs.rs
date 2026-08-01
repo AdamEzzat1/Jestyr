@@ -145,6 +145,21 @@ const SPECS: &[Spec] = &[
         args: Args::Word,
         status: Status::Active,
     },
+    // `@simd` (Workstream Q — the SIMD frontier) — a **checked** declaration that
+    // every `par for` in this function may be evaluated a SIMD lane at a time without
+    // changing a bit of the answer. The compiler decides legality itself
+    // (`crate::simd`) and rejects a body that is not a total, elementwise integer
+    // expression, naming the cause. Like `@span`, it is a *contract*, not a switch:
+    // it changes no emitted C, so a refactor that quietly makes a hot loop
+    // unvectorizable — a call slipped into the body, a division, a float — becomes a
+    // diagnostic instead of a silent performance cliff. The lowering increment will
+    // vectorize exactly what this attribute already certifies.
+    Spec {
+        name: "simd",
+        targets: &[Target::Fn, Target::Method],
+        args: Args::None,
+        status: Status::Active,
+    },
     // ── optimization intent (functions) ────────────────────────────────────
     Spec {
         name: "inline",
@@ -335,6 +350,49 @@ pub fn validate_fn(ast: &Ast, f: &FnDecl, is_method: bool, diags: &mut Vec<Diagn
     // `@span(<class>)` — the checked work-span (depth) contract (Workstream Q).
     if let Some(a) = f.attr("span") {
         check_span_contract(ast, f, a, diags);
+    }
+    // `@simd` — the checked SIMD-legality contract (Workstream Q).
+    if let Some(a) = f.attr("simd") {
+        check_simd_contract(ast, f, a, diags);
+    }
+}
+
+/// Check `@simd`: every `par for` in this function must be vectorizable, and there
+/// must be one to vectorize.
+///
+/// The verdicts come from [`crate::simd`], the *single* classifier `jestyrc simd`
+/// also reports through — so the attribute and the report can never disagree about a
+/// loop. The empty case is an error rather than a silent success for the same reason
+/// `@span` is worth having: an attribute that quietly means nothing is worse than no
+/// attribute, because it reads like a guarantee.
+fn check_simd_contract(ast: &Ast, f: &FnDecl, a: &Attribute, diags: &mut Vec<Diagnostic>) {
+    let sites = crate::simd::sites_in_span(ast, f.body.span);
+    if sites.is_empty() {
+        diags.push(
+            Diagnostic::new(
+                "`@simd` is declared but this function has no `par for` loop".to_string(),
+                a.span,
+            )
+            .with_help(
+                "`@simd` certifies that every `par for … reduce(r)` in the body may be evaluated a lane at a time; with no such loop it promises nothing",
+            ),
+        );
+        return;
+    }
+    for s in sites {
+        let crate::simd::Verdict::Illegal { reason, at } = s.verdict else { continue };
+        diags.push(
+            Diagnostic::new(
+                format!(
+                    "`@simd` is violated: this `par for` cannot be evaluated a lane at a time because {}",
+                    reason.describe()
+                ),
+                at,
+            )
+            .with_help(
+                "a vectorizable body is a total, elementwise integer expression over the loop variable — no calls, no memory access, no division, no floats; `jestyrc simd <file>` reports every loop's verdict",
+            ),
+        );
     }
 }
 

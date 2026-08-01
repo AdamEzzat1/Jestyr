@@ -100,7 +100,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | N | Concurrency polish | ~100% | MED | M | ✓ | — |
 | O | Tooling (fmt / test / doc / LSP) | test-runner ✅, doc ✅, attest ✅, attest --diff ✅ — **all four also SELF-HOSTED ✅**; LSP/fmt deferred | LOW | M | ✓✓ | ✓ |
 | P | Self-hosting | ✅ COMPLETE — fixed point, driver, in-language modules, bootstrap seed | — | XL | ✓✓ | ✓✓ (the gate) |
-| Q | Parallelism (data-parallel) | ~45% (SOACs + `par for` surface + `@span` cost model ✅) | MED | L | ✓✓ | ✓✓ (cost model) |
+| Q | Parallelism (data-parallel) | ~50% (SOACs + `par for` surface + `@span` cost model + `@simd` legality ✅) | MED | L | ✓✓ | ✓✓ (cost model) |
 
 ---
 
@@ -650,9 +650,27 @@ declared class (`constant`/`log`/`linear`/`linearithmic`/`quadratic`). So serial
 reduction (`par for` → `for`, span `log n → n`) is a **compile error, not a silent
 regression** — the Cilk/NESL work-span idea as a contract. Intraprocedural v1 (a call is
 O(1)); in `attrs.rs` (no new pass — `main.rs` owns the driver). Demo `par_cost.jtr`; tests
-`cost_model::*` (rejection-soundness stars) + `c_oracle::par_cost_demo`. **Next (non-
-overlapping):** layer CJC **thermal/energy** onto `@span`; the `with schedule(...)` split (now
-mostly enabled by N's dynamic-N spawn); far-tier SIMD + GPU SOACs.
+`cost_model::*` (rejection-soundness stars) + `c_oracle::par_cost_demo`.
+
+**Built (tier 6 — SIMD legality, increment Q-S1):** **`@simd`** — a *checked* declaration
+that every `par for` in a function may be evaluated a SIMD **lane at a time** without
+changing a bit. `src/simd.rs` classifies the body against a deliberately small whitelist (a
+total, elementwise integer expression: no calls, no memory access, no division, no floats,
+no non-uniform control flow), each rejection naming its own cause at the innermost offending
+span; `jestyrc simd <file>` reports every loop's verdict from the **same** classifier, so the
+attribute and the report cannot disagree. Like `@span` it is a **contract, not a switch** —
+**zero emission change**, so the corpus, the concat and the bootstrap seed are untouched and
+a body that quietly stops vectorizing is a diagnostic rather than a silent performance cliff.
+The determinism claim is proven, not asserted: `c_oracle::simd_lanes_match_scalar_bit_for_bit`
+evaluates every certified body scalar-wise **and through GCC vector extensions at widths 2, 4
+and 8**, reduced by all four declared reductions with an uneven tail, and requires identical
+bits — gcc as the authority on vectorization, exactly as `layout_matches_c_sizeof` makes it
+the authority on layout. Tests `simd::tests` (15) + `proptests::simd_legality` (6).
+**Next (non-overlapping):** the opt-in SIMD *lowering* (Q-S2, the first emission change —
+GCC vector extensions, scalar remainder, no OpenMP and no `CC_FLAGS` change); then layer CJC
+**thermal/energy** onto `@span` as a ranking-only facet (Q-S3); then the GPU tile-schedule
+contract (Q-S4). The `with schedule(...)` split is now mostly enabled by N's dynamic-N spawn.
+Full plan + findings: `docs/session-notes/jestyr-next-frontier-handoff.md` § "Q. SIMD → GPU".
 
 ---
 

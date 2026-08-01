@@ -4530,6 +4530,115 @@ mod cost_model {
     }
 }
 
+/// **Workstream Q — SIMD legality (`@simd`).** The compiler decides whether a
+/// `par for` body may be evaluated a SIMD lane at a time without changing a bit, and
+/// `@simd` is the *checked declaration* that it can be. Like `@span`, the check runs
+/// in the parser (`attrs::validate_fn` → `simd::classify`), so these assert over parse
+/// diagnostics and stay toolchain-free. The soundness half — that a certified body
+/// really does compute the same bits at every lane width — is
+/// `simd_lanes_match_scalar_bit_for_bit` under `--features c-oracle`.
+#[cfg(test)]
+mod simd_legality {
+    use super::*;
+
+    fn simd_diags(src: &str) -> Vec<String> {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (_ast, pd) = Parser::new(src, tokens).parse();
+        pd.iter().map(|d| d.message.clone()).collect()
+    }
+    fn violated(src: &str) -> bool {
+        simd_diags(src).iter().any(|m| m.contains("`@simd` is violated"))
+    }
+    fn clean(src: &str) -> bool {
+        simd_diags(src).iter().all(|m| !m.contains("@simd"))
+    }
+
+    /// The headline: an integer/bitwise body is certified, and the *same reduction*
+    /// with a division in it is rejected — the guard that keeps a body from silently
+    /// falling off the vector path.
+    #[test]
+    fn simd_accepts_integer_bodies_rejects_faulting_ones() {
+        assert!(
+            clean("@simd fn f(s: []i64) -> i64 { par for x in s reduce(red()) { x * x + (x & 7) } }"),
+            "a total elementwise integer body vectorizes"
+        );
+        assert!(
+            violated("@simd fn f(s: []i64) -> i64 { par for x in s reduce(red()) { x / 2 } }"),
+            "a division can fault in a lane a scalar run would have skipped"
+        );
+    }
+
+    /// Each rejection names its own cause, so the message says what to change. A call
+    /// is not a lane operation; indexing is a gather; a cast changes the lane width.
+    #[test]
+    fn simd_rejections_name_their_cause() {
+        let of = |body: &str| {
+            simd_diags(&format!("@simd fn f(s: []i64) -> i64 {{ par for x in s reduce(red()) {{ {body} }} }}"))
+                .join(" | ")
+        };
+        assert!(of("g(x)").contains("calls a function"), "{}", of("g(x)"));
+        assert!(of("s[0]").contains("accesses memory"), "{}", of("s[0]"));
+        assert!(of("x as i32 as i64").contains("lane count"), "{}", of("x as i32 as i64"));
+        assert!(of("if 1.5 > 0.0 { x } else { 0 }").contains("floating point"));
+    }
+
+    /// A lane select is legal (both arms are blended), and short-circuit `and` is legal
+    /// *because* nothing reachable in the subset can fault — the invariant the whole
+    /// whitelist exists to maintain. Pinned so a later relaxation has to face it.
+    #[test]
+    fn simd_admits_selects_and_short_circuits() {
+        assert!(clean(
+            "@simd fn f(s: []i64) -> i64 { par for x in s reduce(red()) { if x > 0 and x < 9 { x * x } else { 0 } } }"
+        ));
+    }
+
+    /// An attribute that quietly means nothing is worse than no attribute: `@simd` on a
+    /// function with no `par for` is an error, not a silent pass.
+    #[test]
+    fn simd_on_a_function_with_no_par_for_is_an_error() {
+        assert!(
+            simd_diags("@simd fn f() -> i64 { return 1 }")
+                .iter()
+                .any(|m| m.contains("no `par for` loop")),
+            "an empty promise is refused"
+        );
+    }
+
+    /// `@simd` is a *contract*, not a lowering switch: it must change no emitted C at
+    /// all. This is the property that keeps the increment off the two-sided tax — the
+    /// corpus, the concatenated build and the bootstrap seed cannot move if the
+    /// attribute is invisible to the backend.
+    #[test]
+    fn simd_changes_no_emitted_c() {
+        let body = "fn r() -> i64 { return 0 }\nfn f(read s: []i64) -> i64 {\n    return par for x in s reduce(core.sum_reduction()) { x * x }\n}\nfn main() -> i32 { return 0 }\n";
+        let plain = emit_c(body);
+        let annotated = emit_c(&format!("@simd {body}"));
+        assert_eq!(plain, annotated, "`@simd` must be invisible to the backend");
+    }
+
+    fn emit_c(src: &str) -> String {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
+        let (info, _) = crate::typeck::check(&ast);
+        crate::cgen::emit(&ast, &info).0
+    }
+
+    /// The shipped `par for` demo, run through the report: its bodies (`x * x` and the
+    /// identity) are exactly the subset this pass certifies, so the corpus itself
+    /// carries a positive case without a new file.
+    #[test]
+    fn the_par_for_demo_is_vectorizable() {
+        let src = std::fs::read_to_string("examples/std/par_for.jtr").unwrap();
+        let (tokens, _) = Lexer::new(&src).tokenize();
+        let (ast, _) = Parser::new(&src, tokens).parse();
+        let sites = crate::simd::analyze(&ast);
+        assert_eq!(sites.len(), 2, "the demo has two `par for` loops");
+        assert!(sites.iter().all(|s| s.verdict.is_legal()), "{sites:?}");
+        let report = crate::simd::render(&src, &sites);
+        assert!(report.contains("par-for 2 vectorizable 2"), "{report}");
+    }
+}
+
 /// Array *list* literals `[e0, e1, …]` — the lookup-table enabler (TESTING.md §5,
 /// per-feature unit layer). The repeat form `[v; N]` already existed; these pin the
 /// list form, in particular that a `const` table lowers to a C **brace initializer**
@@ -9026,6 +9135,168 @@ fn main() -> i32 {
                 );
             }
             eprintln!("layout: {file} — {} values match the C compiler", expect.len());
+        }
+    }
+
+    /// **Workstream Q — the SIMD legality pass is *sound*: a certified body computes
+    /// the same bits at every lane width.**
+    ///
+    /// `src/simd.rs` decides which `par for` bodies may be evaluated a lane at a time.
+    /// That is a claim about a machine, so — exactly as `layout_matches_c_sizeof` makes
+    /// gcc the authority on layout — this makes gcc the authority on vectorization: for
+    /// every body the pass **certifies**, the same expression is evaluated scalar-wise
+    /// and through GCC vector extensions at widths **2, 4 and 8**, reduced by all four
+    /// declared deterministic reductions (sum, xor, min, max), and every answer must be
+    /// bit-identical.
+    ///
+    /// Two design points make it a real test rather than a ritual:
+    ///
+    /// * **One expression, not two.** Scalar and vector share a single `#define F(x)`,
+    ///   so there is no transcription between them; the only variable under test is
+    ///   GCC's vector lowering. Only the *select* primitive is written twice (`?:` for
+    ///   scalar, a mask blend for vectors) — which is precisely the lowering difference
+    ///   the whitelist licenses, so writing it twice is the point, not a workaround.
+    /// * **The element count is deliberately not a multiple of any width** (1003), so
+    ///   every run exercises an uneven tail — where a lane-width dependence would first
+    ///   appear if the reduction were not exactly associative.
+    ///
+    /// The direction being proved is the one that is a soundness claim. The pass is
+    /// conservative: bodies it rejects may well vectorize, and that is not tested,
+    /// because nothing depends on it.
+    #[test]
+    fn simd_lanes_match_scalar_bit_for_bit() {
+        // (Jestyr body — must be certified by the pass, C twin — one shared expression)
+        let cases: [(&str, &str); 5] = [
+            ("x", "(x)"),
+            ("x * x", "((x)*(x))"),
+            ("(x & 7) | (x << 3)", "(((x) & 7) | ((x) << 3))"),
+            ("~x + x * x", "((~(x)) + (x)*(x))"),
+            ("if x > 0 { x * x } else { 0 - x }", "SEL((x) > 0, (x)*(x), (0 - (x)))"),
+        ];
+
+        // Half of the test: the pass must actually certify each body. A case it
+        // rejected would make the C half prove nothing about this pass.
+        for (jbody, _) in &cases {
+            let src = format!(
+                "fn f(read s: []i64) -> i64 {{\n    return par for x in s reduce(core.sum_reduction()) {{ {jbody} }}\n}}\n"
+            );
+            let (tokens, _) = crate::lexer::Lexer::new(&src).tokenize();
+            let (ast, d) = crate::parser::Parser::new(&src, tokens).parse();
+            assert!(d.iter().all(|x| !x.is_error()), "fixture must parse: {jbody}");
+            let sites = crate::simd::analyze(&ast);
+            assert_eq!(sites.len(), 1);
+            assert!(
+                sites[0].verdict.is_legal(),
+                "the pass must certify `{jbody}`, else the lane check proves nothing: {:?}",
+                sites[0].verdict
+            );
+        }
+
+        let mut c = String::new();
+        c.push_str(
+            "#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n\
+             typedef int64_t v2 __attribute__((vector_size(16)));\n\
+             typedef int64_t v4 __attribute__((vector_size(32)));\n\
+             typedef int64_t v8 __attribute__((vector_size(64)));\n\
+             /* Not a multiple of 2, 4 or 8: every width runs an uneven tail. */\n\
+             #define N 1003\n\
+             static int64_t a[N];\n\
+             /* Deterministic input — no clock, no rand, no host dependence. */\n\
+             static void fill(void){ for (int i=0;i<N;i++) a[i] = ((int64_t)i * 7919) % 10007 - 5003; }\n\
+             #define SHOW(s,x,mn,mx) printf(\"%lld %lld %lld %lld\\n\", (long long)(s), (long long)(x), (long long)(mn), (long long)(mx))\n\
+             /* One scalar reduction, all four declared deterministic operators. */\n\
+             #define SCALAR(FN) { int64_t s=0, xr=0, mn=INT64_MAX, mx=INT64_MIN; \\\n\
+               for (int i=0;i<N;i++){ int64_t v = FN(a[i]); s+=v; xr^=v; \\\n\
+                 if (v<mn) mn=v; if (v>mx) mx=v; } SHOW(s,xr,mn,mx); }\n\
+             /* The same four, W lanes at a time, then a lane fold and a scalar tail. */\n\
+             #define VEC_HEAD(VT, W, FN) VT va, vv, m; \\\n\
+               VT vs = (VT){0}, vx = (VT){0}; \\\n\
+               VT vmn = (VT){0} + INT64_MAX, vmx = (VT){0} + INT64_MIN; \\\n\
+               int i = 0; \\\n\
+               for (; i + (W) <= N; i += (W)) { \\\n\
+                 memcpy(&va, &a[i], sizeof(VT)); \\\n\
+                 vv = FN(va); \\\n\
+                 vs = vs + vv; vx = vx ^ vv; \\\n\
+                 m = vv < vmn; vmn = (vv & m) | (vmn & ~m); \\\n\
+                 m = vv > vmx; vmx = (vv & m) | (vmx & ~m); } \\\n\
+               int64_t s=0, xr=0, mn=INT64_MAX, mx=INT64_MIN; \\\n\
+               for (int j=0;j<(W);j++){ s+=vs[j]; xr^=vx[j]; \\\n\
+                 if (vmn[j]<mn) mn=vmn[j]; if (vmx[j]>mx) mx=vmx[j]; }\n\
+             /* The leftover elements are SCALAR code, so they need the scalar lowering\n\
+                of a select — a separate macro precisely so `SEL` can be flipped back\n\
+                between the two. Sharing one macro across both silently miscompiled the\n\
+                tail on the first run of this test. */\n\
+             #define VEC_TAIL(FN) for (; i<N; i++){ int64_t v = FN(a[i]); s+=v; xr^=v; \\\n\
+                 if (v<mn) mn=v; if (v>mx) mx=v; } SHOW(s,xr,mn,mx);\n",
+        );
+        for (i, (_, cexpr)) in cases.iter().enumerate() {
+            c.push_str(&format!("#define F{i}(x) {cexpr}\n"));
+        }
+        // A select lowers differently in the two forms — `?:` for scalars, a mask blend
+        // per lane (a GNU vector comparison yields all-ones/all-zeros, and `?:` is not
+        // defined on vectors). Flipping this ONE primitive around each section is what
+        // lets the body itself stay single-sourced; the tail flips it back because the
+        // tail is scalar code.
+        let scalar_sel = "#undef SEL\n#define SEL(c,t,f) ((c) ? (t) : (f))\n";
+        let vector_sel = "#undef SEL\n#define SEL(c,t,f) (((t) & (c)) | ((f) & ~(c)))\n";
+        c.push_str("int main(void){ fill();\n");
+        for i in 0..cases.len() {
+            c.push_str(scalar_sel);
+            c.push_str(&format!("  SCALAR(F{i})\n"));
+            for (vt, w) in [("v2", 2), ("v4", 4), ("v8", 8)] {
+                c.push_str("  {\n");
+                c.push_str(vector_sel);
+                c.push_str(&format!("  VEC_HEAD({vt}, {w}, F{i})\n"));
+                c.push_str(scalar_sel);
+                c.push_str(&format!("  VEC_TAIL(F{i})\n"));
+                c.push_str("  }\n");
+            }
+        }
+        c.push_str("  return 0;\n}\n");
+
+        let dir = std::env::temp_dir().join("jestyr_simd_oracle");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfile = dir.join("lanes.c");
+        let exe = dir.join(format!("lanes{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&cfile, &c).unwrap();
+
+        // The locked FP/codegen flags — the same ones every `jestyrc` build uses.
+        let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
+        let out = Command::new(&cc)
+            .args(crate::CC_FLAGS)
+            .arg(&cfile)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "the lane probe did not compile: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let run = Command::new(&exe).output().unwrap();
+        assert!(run.status.success(), "the lane probe did not run");
+        let lines: Vec<String> = String::from_utf8_lossy(&run.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(lines.len(), cases.len() * 4, "four results per body");
+
+        for (i, (jbody, _)) in cases.iter().enumerate() {
+            let scalar = &lines[i * 4];
+            for (k, w) in [2usize, 4, 8].iter().enumerate() {
+                assert_eq!(
+                    &lines[i * 4 + 1 + k],
+                    scalar,
+                    "`{jbody}`: {w}-wide lanes gave `{}` but scalar gave `{scalar}` \
+                     (sum xor min max) — the legality pass certified a body whose value \
+                     depends on the lane width",
+                    lines[i * 4 + 1 + k]
+                );
+            }
+            eprintln!("simd: `{jbody}` — scalar == 2 == 4 == 8 lanes ({scalar})");
         }
     }
 
