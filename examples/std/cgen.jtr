@@ -2104,6 +2104,24 @@ fn emit_impl_dispatch(mut sb: String, read p: parser.Parser, read src: str, read
 // Method sugar and mangled/collision names later.
 fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, eid: i32) {
     let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+    // `@name(…)` is a whole FAMILY of forms, only some of which are compile-time
+    // queries — `@address(0x…)` in an MMIO declaration is a call this backend still has
+    // to emit normally. So the guard is on the intrinsic NAME, not on the `@` sigil.
+    if callee.kind == 21 and ctfe.is_reflect(src[callee.x as usize .. callee.y as usize]) {
+        // Unlike `size_of`/`align_of`/`offset_of`, these are answered by THIS compiler
+        // rather than deferred to C, so they reach the output as a literal. Total, and
+        // never the first place a user hears about a bad query: typeck's fold ran first.
+        var rci: ctfe.Interp = ctfe.make(g.alloc)
+        let rv: ctfe.Value = ctfe.eval(rci, p, src, eid)
+        if rci.failed { string_push(sb, "0") }
+        else if rv.tag == 0 { push_i64(sb, rv.i) }
+        else if rv.tag == 2 {
+            string_push(sb, "JSTR(")
+            push_c_string(sb, ctfe.str_of(rci, rv))
+            string_push(sb, ")")
+        } else { string_push(sb, "0") }
+        return
+    }
     if callee.kind == 5 {                             // method sugar `recv.m(args)`
         let packed: i32 = resolve_method_call(p, src, c, callee)
         if packed >= 0 {
@@ -10922,78 +10940,13 @@ fn at_expr_src(mut sb: String, read p: parser.Parser, read src: str, eid: i32) {
     string_push(sb, trim(src[d.start .. d.end]))
 }
 
-// Render a type in Jestyr surface syntax (`doc::ty_str`), recursing through the AST
-// type arena. Kinds: 0 Name 1 TypeKw 2 Ptr 3 Slice 4 Array 5 GenRef 6 RegionRef
-// 7 App 8 Path 9 Fn 10 Dyn 11 Error.
+// Render a type in Jestyr surface syntax (`doc::ty_str`). The IMPLEMENTATION lives in
+// `ctfe.jtr`, because compile-time reflection (`@field_type`) needs the same renderer and
+// sits below this module. Kept as a thin wrapper so the sixteen call sites here read
+// unchanged -- and so there is exactly ONE renderer, which is what stops a reflected type
+// name from ever disagreeing with the documented or attested one.
 fn at_ty(mut sb: String, read p: parser.Parser, read src: str, tyid: i32) {
-    let d: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
-    if d.kind == 0 { string_push(sb, src[d.start .. d.end]) return }
-    if d.kind == 1 { string_push(sb, "type") return }
-    if d.kind == 2 {
-        if d.op == 1 { string_push(sb, "*mut ") } else if d.op == 2 { string_push(sb, "*const ") } else { string_push(sb, "*") }
-        at_ty(sb, p, src, d.a)
-        return
-    }
-    if d.kind == 3 { string_push(sb, "[]") at_ty(sb, p, src, d.a) return }
-    if d.kind == 4 {
-        string_push(sb, "[")
-        let le: parser.ExprData = list.get(parser.ExprData, p.ex, d.b as usize)
-        if le.kind == 0 { string_push(sb, src[le.start .. le.end]) } else { string_push(sb, "_") }
-        string_push(sb, "]")
-        at_ty(sb, p, src, d.a)
-        return
-    }
-    if d.kind == 5 { string_push(sb, "&") at_ty(sb, p, src, d.a) return }
-    if d.kind == 6 {
-        string_push(sb, "&[")
-        string_push(sb, src[d.x as usize .. d.y as usize])
-        string_push(sb, "]")
-        at_ty(sb, p, src, d.a)
-        return
-    }
-    if d.kind == 7 or d.kind == 8 {
-        string_push(sb, src[d.x as usize .. d.y as usize])
-        if d.kind == 8 {
-            string_push(sb, ".")
-            string_push(sb, src[d.z as usize .. d.w as usize])
-        }
-        // App always parenthesizes; a Path only when it has args.
-        if d.kind == 7 or d.a > 0 {
-            string_push(sb, "(")
-            var i: i32 = 0
-            for i < d.a {
-                if i > 0 { string_push(sb, ", ") }
-                at_ty(sb, p, src, list.get(i32, p.tar, (d.op + i) as usize))
-                i = i + 1
-            }
-            string_push(sb, ")")
-        }
-        return
-    }
-    if d.kind == 9 {
-        string_push(sb, "fn(")
-        var i: i32 = 0
-        for i < d.a {
-            if i > 0 { string_push(sb, ", ") }
-            let pc: i32 = list.get(i32, p.tar, (d.op + i * 2) as usize)
-            if pc != 0 { string_push(sb, at_conv_label(pc)) string_push(sb, " ") }
-            at_ty(sb, p, src, list.get(i32, p.tar, (d.op + i * 2 + 1) as usize))
-            i = i + 1
-        }
-        string_push(sb, ")")
-        if d.x >= 0 {
-            string_push(sb, " -> ")
-            if d.b != 0 { string_push(sb, at_conv_label(d.b)) string_push(sb, " ") }
-            at_ty(sb, p, src, d.x)
-        }
-        return
-    }
-    if d.kind == 10 {
-        string_push(sb, "dyn ")
-        string_push(sb, src[d.x as usize .. d.y as usize])
-        return
-    }
-    string_push(sb, "<error-type>")
+    ctfe.at_ty(sb, p, src, tyid)
 }
 
 // Render a fn/extern param list in surface syntax (`doc::params_str`): `iar` 7-tuples

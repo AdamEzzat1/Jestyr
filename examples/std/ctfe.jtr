@@ -661,6 +661,18 @@ fn ev_stmts(mut it: Interp, read p: parser.Parser, read src: str, start: i32, co
 
 fn ev_call(mut it: Interp, read p: parser.Parser, read src: str, read d: parser.ExprData) -> Value {
     let ce: parser.ExprData = list.get(parser.ExprData, p.ex, d.a as usize)
+    // `@name(…)` (Attr, kind 21) is a compiler QUERY, not a call. Reflection lives in
+    // this `@`-prefixed space rather than beside `size_of`/`align_of`/`offset_of`
+    // precisely because those are ordinary identifiers and can be shadowed by a user
+    // function of the same name — this very compiler declares `fn field_type(…)` in
+    // typeck.jtr, which a bare-name intrinsic would silently have hijacked.
+    if ce.kind == 21 {
+        // The Attr node keeps its NAME span in `(x, y)` separately from the whole
+        // `@name` span, so the sigil never has to be sliced off by hand.
+        let nm: str = src[ce.x as usize .. ce.y as usize]
+        if is_reflect(nm) { return ev_reflect(it, p, src, nm, d) }
+        return fail(it, "this is not a compile-time query", d.start, d.end)
+    }
     if ce.kind != 2 {
         return fail(it, "only a named function can be called at compile time", d.start, d.end)
     }
@@ -742,6 +754,201 @@ fn push_escaped(mut dst: String, s: str) {
         else { string_push(dst, s[i .. i + 1]) }
         i = i + 1
     }
+}
+
+// ---- tier 3: reflection over the declared shape ----
+
+// Is `n` one of the four compile-time reflection queries? Mirrors
+// `is_reflect_intrinsic`.
+pub fn is_reflect(n: str) -> bool {
+    if str_eq(n, "type_name") { return true }
+    if str_eq(n, "field_count") { return true }
+    if str_eq(n, "field_name") { return true }
+    if str_eq(n, "field_type") { return true }
+    return false
+}
+
+// The `ItemId` of the struct/record/union named `src[ns..ne]`, or -1. All three share
+// the struct item and the field grammar, so all three reflect identically.
+fn struct_item(read p: parser.Parser, read src: str, ns: usize, ne: usize) -> i32 {
+    let n: usize = list.len(parser.ItemData, p.it)
+    var i: usize = 0
+    for i < n {
+        let d: parser.ItemData = list.get(parser.ItemData, p.it, i)
+        if d.kind == 4 {
+            if str_eq(src[ns .. ne], src[d.x as usize .. d.y as usize]) { return i as i32 }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// The `mar` base index of the struct's `i`-th FIELD, skipping methods (tag 1), or -1.
+// Methods are not fields: only the declared data shape is reflected.
+fn nth_field(read p: parser.Parser, read d: parser.ItemData, want: i32) -> i32 {
+    var seen: i32 = 0
+    var k: i32 = 0
+    for k < d.b {
+        let base: i32 = d.a + k * 10
+        if list.get(i32, p.mar, base as usize) != 1 {
+            if seen == want { return base }
+            seen = seen + 1
+        }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+fn field_total(read p: parser.Parser, read d: parser.ItemData) -> i32 {
+    var seen: i32 = 0
+    var k: i32 = 0
+    for k < d.b {
+        if list.get(i32, p.mar, (d.a + k * 10) as usize) != 1 { seen = seen + 1 }
+        k = k + 1
+    }
+    return seen
+}
+
+// Evaluate a reflection query. Field order is DECLARATION order — what the author
+// wrote — which is what makes repeated queries and generated output stable. (A future
+// `@layout(auto)` may reorder *storage*; it will not reorder this.)
+fn ev_reflect(mut it: Interp, read p: parser.Parser, read src: str, nm: str, read d: parser.ExprData) -> Value {
+    // The first argument is a TYPE, named directly — it is not evaluated as a value,
+    // exactly as `offset_of(Point, y)`'s second argument is a bare field name.
+    if d.y < 1 { return fail(it, "this query needs a type as its first argument", d.start, d.end) }
+    let aid: i32 = list.get(i32, p.ar, d.x as usize)
+    let a0: parser.ExprData = list.get(parser.ExprData, p.ex, aid as usize)
+    if a0.kind != 2 {
+        return fail(it, "this query's first argument must be a named type", a0.start, a0.end)
+    }
+
+    // Answerable for any named type, including a primitive: it reports what the author
+    // wrote, and needs no declaration to do so.
+    if str_eq(nm, "type_name") { return v_str(it, src[a0.start .. a0.end]) }
+
+    let sid: i32 = struct_item(p, src, a0.start, a0.end)
+    if sid < 0 {
+        return fail(it, "this is not a struct this compiler can reflect over", a0.start, a0.end)
+    }
+    let sd: parser.ItemData = list.get(parser.ItemData, p.it, sid as usize)
+    if str_eq(nm, "field_count") { return v_int(field_total(p, sd) as i64) }
+
+    // The remaining two are indexed. The index is an ordinary comptime expression, so
+    // `@field_name(P, I)` for a `const I` works — but it must EVALUATE, and an
+    // out-of-range one is an error rather than a clamp or an empty string.
+    if d.y < 2 { return fail(it, "this query needs a field index as its second argument", d.start, d.end) }
+    let iid: i32 = list.get(i32, p.ar, (d.x + 1) as usize)
+    let iv: Value = ev(it, p, src, iid)
+    if it.failed { return v_unit() }
+    let ie: parser.ExprData = list.get(parser.ExprData, p.ex, iid as usize)
+    if iv.tag != 0 { return fail(it, "a field index must be a non-negative integer", ie.start, ie.end) }
+    if iv.i < 0 { return fail(it, "a field index must be a non-negative integer", ie.start, ie.end) }
+    let base: i32 = nth_field(p, sd, iv.i as i32)
+    if base < 0 { return fail(it, "there is no field at this index", ie.start, ie.end) }
+
+    if str_eq(nm, "field_name") {
+        let fns: i32 = list.get(i32, p.mar, (base + 2) as usize)
+        let fne: i32 = list.get(i32, p.mar, (base + 3) as usize)
+        return v_str(it, src[fns as usize .. fne as usize])
+    }
+    // Rendered by the same `at_ty` the documentation page and the attestation manifest
+    // use, so a reflected type name cannot disagree with the documented one.
+    var tmp: String = string_new()
+    at_ty(tmp, p, src, list.get(i32, p.mar, (base + 4) as usize))
+    let view: str = string_view(tmp)
+    return v_str(it, view)
+}
+
+// A passing convention's surface keyword (`doc`'s `conv_label`).
+pub fn at_conv_label(conv: i32) -> str {
+    if conv == 1 { return "read" }
+    if conv == 2 { return "mut" }
+    if conv == 3 { return "take" }
+    if conv == 4 { return "out" }
+    return ""
+}
+
+// ---- the shared type renderer (tier 3 needs it, doc/attest already did) ----
+//
+// Render a type in Jestyr surface syntax (`doc::ty_str`), recursing through the AST
+// type arena. Kinds: 0 Name 1 TypeKw 2 Ptr 3 Slice 4 Array 5 GenRef 6 RegionRef
+// 7 App 8 Path 9 Fn 10 Dyn 11 Error.
+//
+// It lives HERE rather than in cgen.jtr (which is where it was written, for the
+// attestation manifest and the documentation page) because `@field_type` needs the very
+// same rendering and this module sits below that one. cgen.jtr keeps a thin wrapper, so
+// there is exactly ONE renderer: a reflected type name cannot disagree with the
+// documented or attested one, which is the same invariant `at_guarantee_phrases` gives
+// the guarantee text.
+pub fn at_ty(mut sb: String, read p: parser.Parser, read src: str, tyid: i32) {
+    let d: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
+    if d.kind == 0 { string_push(sb, src[d.start .. d.end]) return }
+    if d.kind == 1 { string_push(sb, "type") return }
+    if d.kind == 2 {
+        if d.op == 1 { string_push(sb, "*mut ") } else if d.op == 2 { string_push(sb, "*const ") } else { string_push(sb, "*") }
+        at_ty(sb, p, src, d.a)
+        return
+    }
+    if d.kind == 3 { string_push(sb, "[]") at_ty(sb, p, src, d.a) return }
+    if d.kind == 4 {
+        string_push(sb, "[")
+        let le: parser.ExprData = list.get(parser.ExprData, p.ex, d.b as usize)
+        if le.kind == 0 { string_push(sb, src[le.start .. le.end]) } else { string_push(sb, "_") }
+        string_push(sb, "]")
+        at_ty(sb, p, src, d.a)
+        return
+    }
+    if d.kind == 5 { string_push(sb, "&") at_ty(sb, p, src, d.a) return }
+    if d.kind == 6 {
+        string_push(sb, "&[")
+        string_push(sb, src[d.x as usize .. d.y as usize])
+        string_push(sb, "]")
+        at_ty(sb, p, src, d.a)
+        return
+    }
+    if d.kind == 7 or d.kind == 8 {
+        string_push(sb, src[d.x as usize .. d.y as usize])
+        if d.kind == 8 {
+            string_push(sb, ".")
+            string_push(sb, src[d.z as usize .. d.w as usize])
+        }
+        // App always parenthesizes; a Path only when it has args.
+        if d.kind == 7 or d.a > 0 {
+            string_push(sb, "(")
+            var i: i32 = 0
+            for i < d.a {
+                if i > 0 { string_push(sb, ", ") }
+                at_ty(sb, p, src, list.get(i32, p.tar, (d.op + i) as usize))
+                i = i + 1
+            }
+            string_push(sb, ")")
+        }
+        return
+    }
+    if d.kind == 9 {
+        string_push(sb, "fn(")
+        var i: i32 = 0
+        for i < d.a {
+            if i > 0 { string_push(sb, ", ") }
+            let pc: i32 = list.get(i32, p.tar, (d.op + i * 2) as usize)
+            if pc != 0 { string_push(sb, at_conv_label(pc)) string_push(sb, " ") }
+            at_ty(sb, p, src, list.get(i32, p.tar, (d.op + i * 2 + 1) as usize))
+            i = i + 1
+        }
+        string_push(sb, ")")
+        if d.x >= 0 {
+            string_push(sb, " -> ")
+            if d.b != 0 { string_push(sb, at_conv_label(d.b)) string_push(sb, " ") }
+            at_ty(sb, p, src, d.x)
+        }
+        return
+    }
+    if d.kind == 10 {
+        string_push(sb, "dyn ")
+        string_push(sb, src[d.x as usize .. d.y as usize])
+        return
+    }
+    string_push(sb, "<error-type>")
 }
 
 // ---- the dump driver (mirrors `typeck.run`'s shape) ----

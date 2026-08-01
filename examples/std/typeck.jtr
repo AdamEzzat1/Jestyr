@@ -1579,9 +1579,27 @@ fn subst_tp_ty(mut c: Checker, read src: str, ty: i32, tp_start: i32, tp_count: 
 // method; a plain callee tries an indirect fn-pointer call, the fns table (fallible -> `T !E`),
 // a variant constructor, `unwrap`/`is_err`, the intrinsic tables, and `slice(T, ...)`.
 // (Generic-return monomorphization and expected-type propagation land later.)
+// A reflection query's STATIC result type, or -1 if `n` is not one. The type does not
+// depend on what the query answers, so typing it needs no evaluation — only emission
+// does. Mirrors `reflect_intrinsic_ret`.
+fn reflect_ret(n: str) -> i32 {
+    if str_eq(n, "field_count") { return t_i64() }
+    if str_eq(n, "type_name") { return t_str() }
+    if str_eq(n, "field_name") { return t_str() }
+    if str_eq(n, "field_type") { return t_str() }
+    return 0 - 1
+}
+
 fn infer_call(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
     let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
     let cal: parser.ExprData = list.get(parser.ExprData, p.ex, d.a as usize)
+    // `@name(…)` — a compile-time reflection query (tier 3). Handled FIRST and WITHOUT
+    // inferring the arguments: the first one is a *type*, not a value, so running
+    // inference over it would report a binding that does not exist.
+    if cal.kind == 21 {
+        let rr: i32 = reflect_ret(src[cal.x as usize .. cal.y as usize])
+        if rr >= 0 { return rr }
+    }
     if cal.kind == 5 {                             // method sugar (the callee Field is not inferred)
         let recv: i32 = infer(c, p, src, cal.a)
         var argt: List(i32) = list.make(i32, c.alloc)

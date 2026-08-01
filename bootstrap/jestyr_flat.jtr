@@ -5102,6 +5102,18 @@ fn ev_stmts(mut it: Interp, read p: Parser, read src: str, start: i32, count: i3
 
 fn ev_call(mut it: Interp, read p: Parser, read src: str, read d: ExprData) -> Value {
     let ce: ExprData = get(ExprData, p.ex, d.a as usize)
+    // `@name(…)` (Attr, kind 21) is a compiler QUERY, not a call. Reflection lives in
+    // this `@`-prefixed space rather than beside `size_of`/`align_of`/`offset_of`
+    // precisely because those are ordinary identifiers and can be shadowed by a user
+    // function of the same name — this very compiler declares `fn field_type(…)` in
+    // typeck.jtr, which a bare-name intrinsic would silently have hijacked.
+    if ce.kind == 21 {
+        // The Attr node keeps its NAME span in `(x, y)` separately from the whole
+        // `@name` span, so the sigil never has to be sliced off by hand.
+        let nm: str = src[ce.x as usize .. ce.y as usize]
+        if is_reflect(nm) { return ev_reflect(it, p, src, nm, d) }
+        return fail(it, "this is not a compile-time query", d.start, d.end)
+    }
     if ce.kind != 2 {
         return fail(it, "only a named function can be called at compile time", d.start, d.end)
     }
@@ -5183,6 +5195,201 @@ fn push_escaped(mut dst: String, s: str) {
         else { string_push(dst, s[i .. i + 1]) }
         i = i + 1
     }
+}
+
+// ---- tier 3: reflection over the declared shape ----
+
+// Is `n` one of the four compile-time reflection queries? Mirrors
+// `is_reflect_intrinsic`.
+pub fn is_reflect(n: str) -> bool {
+    if str_eq(n, "type_name") { return true }
+    if str_eq(n, "field_count") { return true }
+    if str_eq(n, "field_name") { return true }
+    if str_eq(n, "field_type") { return true }
+    return false
+}
+
+// The `ItemId` of the struct/record/union named `src[ns..ne]`, or -1. All three share
+// the struct item and the field grammar, so all three reflect identically.
+fn struct_item(read p: Parser, read src: str, ns: usize, ne: usize) -> i32 {
+    let n: usize = len(ItemData, p.it)
+    var i: usize = 0
+    for i < n {
+        let d: ItemData = get(ItemData, p.it, i)
+        if d.kind == 4 {
+            if str_eq(src[ns .. ne], src[d.x as usize .. d.y as usize]) { return i as i32 }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// The `mar` base index of the struct's `i`-th FIELD, skipping methods (tag 1), or -1.
+// Methods are not fields: only the declared data shape is reflected.
+fn nth_field(read p: Parser, read d: ItemData, want: i32) -> i32 {
+    var seen: i32 = 0
+    var k: i32 = 0
+    for k < d.b {
+        let base: i32 = d.a + k * 10
+        if get(i32, p.mar, base as usize) != 1 {
+            if seen == want { return base }
+            seen = seen + 1
+        }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+fn field_total(read p: Parser, read d: ItemData) -> i32 {
+    var seen: i32 = 0
+    var k: i32 = 0
+    for k < d.b {
+        if get(i32, p.mar, (d.a + k * 10) as usize) != 1 { seen = seen + 1 }
+        k = k + 1
+    }
+    return seen
+}
+
+// Evaluate a reflection query. Field order is DECLARATION order — what the author
+// wrote — which is what makes repeated queries and generated output stable. (A future
+// `@layout(auto)` may reorder *storage*; it will not reorder this.)
+fn ev_reflect(mut it: Interp, read p: Parser, read src: str, nm: str, read d: ExprData) -> Value {
+    // The first argument is a TYPE, named directly — it is not evaluated as a value,
+    // exactly as `offset_of(Point, y)`'s second argument is a bare field name.
+    if d.y < 1 { return fail(it, "this query needs a type as its first argument", d.start, d.end) }
+    let aid: i32 = get(i32, p.ar, d.x as usize)
+    let a0: ExprData = get(ExprData, p.ex, aid as usize)
+    if a0.kind != 2 {
+        return fail(it, "this query's first argument must be a named type", a0.start, a0.end)
+    }
+
+    // Answerable for any named type, including a primitive: it reports what the author
+    // wrote, and needs no declaration to do so.
+    if str_eq(nm, "type_name") { return v_str(it, src[a0.start .. a0.end]) }
+
+    let sid: i32 = struct_item(p, src, a0.start, a0.end)
+    if sid < 0 {
+        return fail(it, "this is not a struct this compiler can reflect over", a0.start, a0.end)
+    }
+    let sd: ItemData = get(ItemData, p.it, sid as usize)
+    if str_eq(nm, "field_count") { return v_int(field_total(p, sd) as i64) }
+
+    // The remaining two are indexed. The index is an ordinary comptime expression, so
+    // `@field_name(P, I)` for a `const I` works — but it must EVALUATE, and an
+    // out-of-range one is an error rather than a clamp or an empty string.
+    if d.y < 2 { return fail(it, "this query needs a field index as its second argument", d.start, d.end) }
+    let iid: i32 = get(i32, p.ar, (d.x + 1) as usize)
+    let iv: Value = ev(it, p, src, iid)
+    if it.failed { return v_unit() }
+    let ie: ExprData = get(ExprData, p.ex, iid as usize)
+    if iv.tag != 0 { return fail(it, "a field index must be a non-negative integer", ie.start, ie.end) }
+    if iv.i < 0 { return fail(it, "a field index must be a non-negative integer", ie.start, ie.end) }
+    let base: i32 = nth_field(p, sd, iv.i as i32)
+    if base < 0 { return fail(it, "there is no field at this index", ie.start, ie.end) }
+
+    if str_eq(nm, "field_name") {
+        let fns: i32 = get(i32, p.mar, (base + 2) as usize)
+        let fne: i32 = get(i32, p.mar, (base + 3) as usize)
+        return v_str(it, src[fns as usize .. fne as usize])
+    }
+    // Rendered by the same `at_ty` the documentation page and the attestation manifest
+    // use, so a reflected type name cannot disagree with the documented one.
+    var tmp: String = string_new()
+    at_ty__ctfe(tmp, p, src, get(i32, p.mar, (base + 4) as usize))
+    let view: str = string_view(tmp)
+    return v_str(it, view)
+}
+
+// A passing convention's surface keyword (`doc`'s `conv_label`).
+pub fn at_conv_label__ctfe(conv: i32) -> str {
+    if conv == 1 { return "read" }
+    if conv == 2 { return "mut" }
+    if conv == 3 { return "take" }
+    if conv == 4 { return "out" }
+    return ""
+}
+
+// ---- the shared type renderer (tier 3 needs it, doc/attest already did) ----
+//
+// Render a type in Jestyr surface syntax (`doc::ty_str`), recursing through the AST
+// type arena. Kinds: 0 Name 1 TypeKw 2 Ptr 3 Slice 4 Array 5 GenRef 6 RegionRef
+// 7 App 8 Path 9 Fn 10 Dyn 11 Error.
+//
+// It lives HERE rather than in cgen.jtr (which is where it was written, for the
+// attestation manifest and the documentation page) because `@field_type` needs the very
+// same rendering and this module sits below that one. cgen.jtr keeps a thin wrapper, so
+// there is exactly ONE renderer: a reflected type name cannot disagree with the
+// documented or attested one, which is the same invariant `at_guarantee_phrases` gives
+// the guarantee text.
+pub fn at_ty__ctfe(mut sb: String, read p: Parser, read src: str, tyid: i32) {
+    let d: TypeData = get(TypeData, p.ty, tyid as usize)
+    if d.kind == 0 { string_push(sb, src[d.start .. d.end]) return }
+    if d.kind == 1 { string_push(sb, "type") return }
+    if d.kind == 2 {
+        if d.op == 1 { string_push(sb, "*mut ") } else if d.op == 2 { string_push(sb, "*const ") } else { string_push(sb, "*") }
+        at_ty__ctfe(sb, p, src, d.a)
+        return
+    }
+    if d.kind == 3 { string_push(sb, "[]") at_ty__ctfe(sb, p, src, d.a) return }
+    if d.kind == 4 {
+        string_push(sb, "[")
+        let le: ExprData = get(ExprData, p.ex, d.b as usize)
+        if le.kind == 0 { string_push(sb, src[le.start .. le.end]) } else { string_push(sb, "_") }
+        string_push(sb, "]")
+        at_ty__ctfe(sb, p, src, d.a)
+        return
+    }
+    if d.kind == 5 { string_push(sb, "&") at_ty__ctfe(sb, p, src, d.a) return }
+    if d.kind == 6 {
+        string_push(sb, "&[")
+        string_push(sb, src[d.x as usize .. d.y as usize])
+        string_push(sb, "]")
+        at_ty__ctfe(sb, p, src, d.a)
+        return
+    }
+    if d.kind == 7 or d.kind == 8 {
+        string_push(sb, src[d.x as usize .. d.y as usize])
+        if d.kind == 8 {
+            string_push(sb, ".")
+            string_push(sb, src[d.z as usize .. d.w as usize])
+        }
+        // App always parenthesizes; a Path only when it has args.
+        if d.kind == 7 or d.a > 0 {
+            string_push(sb, "(")
+            var i: i32 = 0
+            for i < d.a {
+                if i > 0 { string_push(sb, ", ") }
+                at_ty__ctfe(sb, p, src, get(i32, p.tar, (d.op + i) as usize))
+                i = i + 1
+            }
+            string_push(sb, ")")
+        }
+        return
+    }
+    if d.kind == 9 {
+        string_push(sb, "fn(")
+        var i: i32 = 0
+        for i < d.a {
+            if i > 0 { string_push(sb, ", ") }
+            let pc: i32 = get(i32, p.tar, (d.op + i * 2) as usize)
+            if pc != 0 { string_push(sb, at_conv_label__ctfe(pc)) string_push(sb, " ") }
+            at_ty__ctfe(sb, p, src, get(i32, p.tar, (d.op + i * 2 + 1) as usize))
+            i = i + 1
+        }
+        string_push(sb, ")")
+        if d.x >= 0 {
+            string_push(sb, " -> ")
+            if d.b != 0 { string_push(sb, at_conv_label__ctfe(d.b)) string_push(sb, " ") }
+            at_ty__ctfe(sb, p, src, d.x)
+        }
+        return
+    }
+    if d.kind == 10 {
+        string_push(sb, "dyn ")
+        string_push(sb, src[d.x as usize .. d.y as usize])
+        return
+    }
+    string_push(sb, "<error-type>")
 }
 
 // ---- the dump driver (mirrors `typeck.run`'s shape) ----
@@ -6820,9 +7027,27 @@ fn subst_tp_ty(mut c: Checker, read src: str, ty: i32, tp_start: i32, tp_count: 
 // method; a plain callee tries an indirect fn-pointer call, the fns table (fallible -> `T !E`),
 // a variant constructor, `unwrap`/`is_err`, the intrinsic tables, and `slice(T, ...)`.
 // (Generic-return monomorphization and expected-type propagation land later.)
+// A reflection query's STATIC result type, or -1 if `n` is not one. The type does not
+// depend on what the query answers, so typing it needs no evaluation — only emission
+// does. Mirrors `reflect_intrinsic_ret`.
+fn reflect_ret(n: str) -> i32 {
+    if str_eq(n, "field_count") { return t_i64() }
+    if str_eq(n, "type_name") { return t_str() }
+    if str_eq(n, "field_name") { return t_str() }
+    if str_eq(n, "field_type") { return t_str() }
+    return 0 - 1
+}
+
 fn infer_call(mut c: Checker, read p: Parser, read src: str, id: i32) -> i32 {
     let d: ExprData = get(ExprData, p.ex, id as usize)
     let cal: ExprData = get(ExprData, p.ex, d.a as usize)
+    // `@name(…)` — a compile-time reflection query (tier 3). Handled FIRST and WITHOUT
+    // inferring the arguments: the first one is a *type*, not a value, so running
+    // inference over it would report a binding that does not exist.
+    if cal.kind == 21 {
+        let rr: i32 = reflect_ret(src[cal.x as usize .. cal.y as usize])
+        if rr >= 0 { return rr }
+    }
     if cal.kind == 5 {                             // method sugar (the callee Field is not inferred)
         let recv: i32 = infer(c, p, src, cal.a)
         var argt: List(i32) = make__list(i32, c.alloc)
@@ -9003,6 +9228,17 @@ pub fn push_sha256_hex(mut sb: String, read data: str) {
 // Increment 1 (this file's current reach): `hello.jtr` — the prelude, one `fn main -> i32`, a
 // `print_str("…")` intrinsic call, a string literal, and `return 0`. Everything else is denylisted.
 
+
+
+
+
+
+
+
+
+
+
+
 // ---- the fixed C prelude (mirrors Cgen::prelude) ----
 // A FIXED header block: includes + the `jestyr_rt_*` runtime + the JestyrStr/String/Cow/Builder
 // value types + the print/file-IO/argv intrinsics. Transcribed byte-for-byte from `cgen.rs`
@@ -11082,6 +11318,24 @@ fn emit_impl_dispatch(mut sb: String, read p: Parser, read src: str, read c: Che
 // Method sugar and mangled/collision names later.
 fn emit_call(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg, read e: ExprData, eid: i32) {
     let callee: ExprData = get(ExprData, p.ex, e.a as usize)
+    // `@name(…)` is a whole FAMILY of forms, only some of which are compile-time
+    // queries — `@address(0x…)` in an MMIO declaration is a call this backend still has
+    // to emit normally. So the guard is on the intrinsic NAME, not on the `@` sigil.
+    if callee.kind == 21 and is_reflect(src[callee.x as usize .. callee.y as usize]) {
+        // Unlike `size_of`/`align_of`/`offset_of`, these are answered by THIS compiler
+        // rather than deferred to C, so they reach the output as a literal. Total, and
+        // never the first place a user hears about a bad query: typeck's fold ran first.
+        var rci: Interp = make__ctfe(g.alloc)
+        let rv: Value = eval(rci, p, src, eid)
+        if rci.failed { string_push(sb, "0") }
+        else if rv.tag == 0 { push_i64(sb, rv.i) }
+        else if rv.tag == 2 {
+            string_push(sb, "JSTR(")
+            push_c_string(sb, str_of(rci, rv))
+            string_push(sb, ")")
+        } else { string_push(sb, "0") }
+        return
+    }
     if callee.kind == 5 {                             // method sugar `recv.m(args)`
         let packed: i32 = resolve_method_call(p, src, c, callee)
         if packed >= 0 {
@@ -19886,7 +20140,7 @@ fn driver_build(mut m: Ml, read p: Parser, read c: Checker, read src: str, read 
 // by (kind, name), each fn carrying its machine-checked guarantees.
 
 // The surface label of a parameter convention (`Conv::label`; 0=default renders empty).
-fn at_conv_label(conv: i32) -> str {
+fn at_conv_label__cgen(conv: i32) -> str {
     if conv == 1 { return "read" }
     if conv == 2 { return "mut" }
     if conv == 3 { return "take" }
@@ -19900,78 +20154,13 @@ fn at_expr_src(mut sb: String, read p: Parser, read src: str, eid: i32) {
     string_push(sb, trim(src[d.start .. d.end]))
 }
 
-// Render a type in Jestyr surface syntax (`doc::ty_str`), recursing through the AST
-// type arena. Kinds: 0 Name 1 TypeKw 2 Ptr 3 Slice 4 Array 5 GenRef 6 RegionRef
-// 7 App 8 Path 9 Fn 10 Dyn 11 Error.
-fn at_ty(mut sb: String, read p: Parser, read src: str, tyid: i32) {
-    let d: TypeData = get(TypeData, p.ty, tyid as usize)
-    if d.kind == 0 { string_push(sb, src[d.start .. d.end]) return }
-    if d.kind == 1 { string_push(sb, "type") return }
-    if d.kind == 2 {
-        if d.op == 1 { string_push(sb, "*mut ") } else if d.op == 2 { string_push(sb, "*const ") } else { string_push(sb, "*") }
-        at_ty(sb, p, src, d.a)
-        return
-    }
-    if d.kind == 3 { string_push(sb, "[]") at_ty(sb, p, src, d.a) return }
-    if d.kind == 4 {
-        string_push(sb, "[")
-        let le: ExprData = get(ExprData, p.ex, d.b as usize)
-        if le.kind == 0 { string_push(sb, src[le.start .. le.end]) } else { string_push(sb, "_") }
-        string_push(sb, "]")
-        at_ty(sb, p, src, d.a)
-        return
-    }
-    if d.kind == 5 { string_push(sb, "&") at_ty(sb, p, src, d.a) return }
-    if d.kind == 6 {
-        string_push(sb, "&[")
-        string_push(sb, src[d.x as usize .. d.y as usize])
-        string_push(sb, "]")
-        at_ty(sb, p, src, d.a)
-        return
-    }
-    if d.kind == 7 or d.kind == 8 {
-        string_push(sb, src[d.x as usize .. d.y as usize])
-        if d.kind == 8 {
-            string_push(sb, ".")
-            string_push(sb, src[d.z as usize .. d.w as usize])
-        }
-        // App always parenthesizes; a Path only when it has args.
-        if d.kind == 7 or d.a > 0 {
-            string_push(sb, "(")
-            var i: i32 = 0
-            for i < d.a {
-                if i > 0 { string_push(sb, ", ") }
-                at_ty(sb, p, src, get(i32, p.tar, (d.op + i) as usize))
-                i = i + 1
-            }
-            string_push(sb, ")")
-        }
-        return
-    }
-    if d.kind == 9 {
-        string_push(sb, "fn(")
-        var i: i32 = 0
-        for i < d.a {
-            if i > 0 { string_push(sb, ", ") }
-            let pc: i32 = get(i32, p.tar, (d.op + i * 2) as usize)
-            if pc != 0 { string_push(sb, at_conv_label(pc)) string_push(sb, " ") }
-            at_ty(sb, p, src, get(i32, p.tar, (d.op + i * 2 + 1) as usize))
-            i = i + 1
-        }
-        string_push(sb, ")")
-        if d.x >= 0 {
-            string_push(sb, " -> ")
-            if d.b != 0 { string_push(sb, at_conv_label(d.b)) string_push(sb, " ") }
-            at_ty(sb, p, src, d.x)
-        }
-        return
-    }
-    if d.kind == 10 {
-        string_push(sb, "dyn ")
-        string_push(sb, src[d.x as usize .. d.y as usize])
-        return
-    }
-    string_push(sb, "<error-type>")
+// Render a type in Jestyr surface syntax (`doc::ty_str`). The IMPLEMENTATION lives in
+// `ctfe.jtr`, because compile-time reflection (`@field_type`) needs the same renderer and
+// sits below this module. Kept as a thin wrapper so the sixteen call sites here read
+// unchanged -- and so there is exactly ONE renderer, which is what stops a reflected type
+// name from ever disagreeing with the documented or attested one.
+fn at_ty__cgen(mut sb: String, read p: Parser, read src: str, tyid: i32) {
+    at_ty__ctfe(sb, p, src, tyid)
 }
 
 // Render a fn/extern param list in surface syntax (`doc::params_str`): `iar` 7-tuples
@@ -19989,13 +20178,13 @@ fn at_params(mut sb: String, read p: Parser, read src: str, pstart: i32, pcount:
         let pty: i32 = get(i32, p.iar, (base + 5) as usize)
         let rf: i32 = get(i32, p.iar, (base + 6) as usize)
         if slf != 0 {
-            if cv != 0 { string_push(sb, at_conv_label(cv)) string_push(sb, " ") }
+            if cv != 0 { string_push(sb, at_conv_label__cgen(cv)) string_push(sb, " ") }
             string_push(sb, "self")
         } else {
             if cm != 0 { string_push(sb, "comptime ") }
-            if cv != 0 { string_push(sb, at_conv_label(cv)) string_push(sb, " ") }
+            if cv != 0 { string_push(sb, at_conv_label__cgen(cv)) string_push(sb, " ") }
             string_push(sb, src[ns as usize .. ne as usize])
-            if pty >= 0 { string_push(sb, ": ") at_ty(sb, p, src, pty) }
+            if pty >= 0 { string_push(sb, ": ") at_ty__cgen(sb, p, src, pty) }
             if rf >= 0 { string_push(sb, " in ") at_expr_src(sb, p, src, rf) }
         }
         i = i + 1
@@ -20026,8 +20215,8 @@ fn at_fn_sig(mut sb: String, read p: Parser, read src: str, read it: ItemData) {
     string_push(sb, ")")
     if it.z >= 0 {
         string_push(sb, " -> ")
-        if it.op != 0 { string_push(sb, at_conv_label(it.op)) string_push(sb, " ") }
-        at_ty(sb, p, src, it.z)
+        if it.op != 0 { string_push(sb, at_conv_label__cgen(it.op)) string_push(sb, " ") }
+        at_ty__cgen(sb, p, src, it.z)
     }
     if fn_is_fallible__cgen(p, it) {
         string_push(sb, " !{ ")
@@ -20049,8 +20238,8 @@ fn at_extern_sig(mut sb: String, read p: Parser, read src: str, read it: ItemDat
     string_push(sb, ")")
     if it.z >= 0 {
         string_push(sb, " -> ")
-        if it.op != 0 { string_push(sb, at_conv_label(it.op)) string_push(sb, " ") }
-        at_ty(sb, p, src, it.z)
+        if it.op != 0 { string_push(sb, at_conv_label__cgen(it.op)) string_push(sb, " ") }
+        at_ty__cgen(sb, p, src, it.z)
     }
 }
 
@@ -20059,7 +20248,7 @@ fn at_const_sig(mut sb: String, read p: Parser, read src: str, read it: ItemData
     if it.is_pub != 0 { string_push(sb, "pub ") }
     string_push(sb, "const ")
     string_push(sb, src[it.x as usize .. it.y as usize])
-    if it.a >= 0 { string_push(sb, ": ") at_ty(sb, p, src, it.a) }
+    if it.a >= 0 { string_push(sb, ": ") at_ty__cgen(sb, p, src, it.a) }
     string_push(sb, " = ")
     at_expr_src(sb, p, src, it.b)
 }
@@ -20268,7 +20457,7 @@ fn at_struct_sig(mut sb: String, read p: Parser, read src: str, read it: ItemDat
             string_push(sb, src[get(i32, p.mar, (base + 2) as usize) as usize .. get(i32, p.mar, (base + 3) as usize) as usize])
             string_push(sb, ": ")
             if field_has_attr(p, src, base, "volatile") { string_push(sb, "@volatile ") }
-            at_ty(sb, p, src, get(i32, p.mar, (base + 4) as usize))
+            at_ty__cgen(sb, p, src, get(i32, p.mar, (base + 4) as usize))
             done = done + 1
         }
         k = k + 1
@@ -20302,7 +20491,7 @@ fn at_enum_sig(mut sb: String, read p: Parser, read src: str, read it: ItemData)
                 let fb: i32 = fs + f * 3
                 string_push(sb, src[get(i32, p.ear, fb as usize) as usize .. get(i32, p.ear, (fb + 1) as usize) as usize])
                 string_push(sb, ": ")
-                at_ty(sb, p, src, get(i32, p.ear, (fb + 2) as usize))
+                at_ty__cgen(sb, p, src, get(i32, p.ear, (fb + 2) as usize))
                 f = f + 1
             }
             string_push(sb, ")")
@@ -20553,7 +20742,7 @@ fn dc_targets(mut t: Tg, read p: Parser, read src: str) {
             string_push(t.sigbuf, "distinct ")
             string_push(t.sigbuf, src[it.x as usize .. it.y as usize])
             string_push(t.sigbuf, " = ")
-            at_ty(t.sigbuf, p, src, it.a)
+            at_ty__cgen(t.sigbuf, p, src, it.a)
             tg_push(t, it.start as i32, 6, it.x, it.y, s4, sb_len(t.sigbuf), 0 - 1, 0 - 1, 0, 0)
         } else if it.kind == 6 {
             let s5: i32 = sb_len(t.sigbuf)

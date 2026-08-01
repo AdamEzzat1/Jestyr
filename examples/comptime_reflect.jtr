@@ -1,0 +1,72 @@
+// comptime_reflect.jtr — asking the compiler what a type IS (CTFE tier 3).
+//
+// Four `@`-namespaced queries answer, at compile time, what the source declared. They
+// are answered by the *Jestyr* compiler and reach C as literals — unlike `size_of` /
+// `align_of` / `offset_of` (see `reflect.jtr`), which are handed to the C compiler and
+// whose values this compiler never learns.
+//
+// Why the `@` sigil, when `size_of` has none: a bare-name intrinsic can be shadowed by
+// a user function of the same name, and this compiler's own source declares
+// `fn field_type(…)` in `examples/std/typeck.jtr` — a bare `field_type` intrinsic
+// would have silently hijacked it. `@name(…)` was already a callable form in the
+// grammar, and nothing in it can collide, because nobody can declare `fn @field_type`.
+
+struct Point {
+    x: i32,
+    y: f64,
+    label: str,
+
+    // A method is not a field: only the declared data shape is reflected.
+    fn dim(read self) -> i32 { return 2 }
+}
+
+// `record` shares the struct item and the field grammar, so it reflects identically.
+record Pair { a: u8, b: u64 }
+
+// Compound field types are rendered by the same function the documentation page and
+// the attestation manifest use, so a reflected type can never disagree with the
+// documented one.
+// (An array-typed field is deliberately absent: a struct that declares `[4]i64` but is
+// never *constructed* gets no `JestyrArr_i64_4` typedef emitted, because the array
+// typedef collector keys off values rather than declarations. A pre-existing cgen gap,
+// unrelated to reflection — reflection reads the declaration and never needs the C type.)
+// (A SLICE-typed field is deliberately absent too, for a different reason: the port's
+// definition sorter emits `JestyrSlice_i32` *after* the struct that uses it, while the
+// reference emits it before. A pre-existing ordering divergence this file would be the
+// first to trigger — also unrelated to reflection, which reads the declaration.
+// Slice/array/pointer rendering is covered at the interpreter level by the `reflect_tys`
+// fixture in `jestyr_ctfe_folding_matches_reference`.)
+struct Shapes { p: *mut u8 }
+
+const WHICH: i64 = 1
+
+fn main() -> i32 {
+    // The name the author wrote — answerable for a primitive too, since it needs no
+    // declaration to report.
+    print_str(@type_name(Point))
+    print_str(@type_name(i32))
+
+    // Field count, and names in DECLARATION order — the order in the source, which is
+    // what makes repeated queries and generated output stable.
+    print_int(@field_count(Point))
+    print_str(@field_name(Point, 0))
+    print_str(@field_name(Point, 2))
+
+    // The index is an ordinary comptime expression, not just a literal.
+    print_str(@field_name(Point, WHICH))
+    print_str(@field_type(Point, WHICH))
+
+    // A `record` reflects like a `struct`.
+    print_int(@field_count(Pair))
+    print_str(@field_name(Pair, 1))
+
+    // A compound type renders in Jestyr surface syntax.
+    print_str(@field_type(Shapes, 0))
+
+
+    // Reflection composes with the rest of comptime: a query is just a value.
+    print_str(comptime { @field_name(Point, 0) + "/" + @field_name(Point, 1) })
+    print_bool(comptime { @field_count(Point) == 3 })
+
+    return 0
+}
