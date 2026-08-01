@@ -1,0 +1,63 @@
+// comptime_block.jtr — compile-time evaluation in user syntax (CTFE tier 2).
+//
+// A `comptime { … }` block is evaluated by the compiler and replaced by its VALUE.
+// Everything below is computed while checking; the emitted C contains only the
+// answers, with no trace of the arithmetic, the calls, or the recursion.
+//
+// This is the first corpus file to use comptime syntax, so it is deliberately the
+// SCALAR surface — integers, bools and strings. Aggregate values and the comptime
+// `for` (tiers 6–7) exist in the Rust reference and arrive here with their own file
+// once the self-hosted interpreter grows a mutable list.
+
+const SIZE: i64 = 8
+const LIMIT: i64 = SIZE * 4
+
+fn square(x: i64) -> i64 {
+    return x * x
+}
+
+// Recursion is allowed, and bounded: the evaluator has a step budget and a call-depth
+// cap, so a runaway definition is a diagnostic rather than a hung build.
+fn fact(n: i64) -> i64 {
+    if n <= 1 { return 1 }
+    return n * fact(n - 1)
+}
+
+fn main() -> i32 {
+    // The minimal form: arithmetic the compiler does.
+    let a: i64 = comptime { 2 + 2 }
+
+    // Statements and a tail expression — a comptime block is a real block.
+    let b: i64 = comptime {
+        let half: i64 = SIZE / 2
+        half * 10
+    }
+
+    // Calls of pure functions, including recursion.
+    let c: i64 = comptime { square(SIZE) }
+    let d: i64 = comptime { fact(10) }
+
+    // A block in value position inside a larger expression, and a nested one.
+    let e: i64 = 1 + comptime { 2 * 3 }
+    let f: i64 = comptime { 1 + comptime { LIMIT } }
+
+    // Bools and strings fold too.
+    let big: bool = comptime { LIMIT > SIZE }
+    let name: str = comptime { "jes" + "tyr" }
+
+    // Where the *compiler* needs the number: an array length is part of the type, so
+    // it cannot be left for the C compiler to fold.
+    var xs: [comptime { SIZE / 2 }]i64 = [7; 4]
+
+    print_int(a)
+    print_int(b)
+    print_int(c)
+    print_int(d)
+    print_int(e)
+    print_int(f)
+    print_bool(big)
+    print_str(name)
+    print_int(xs.len as i64)
+    print_int(xs[3])
+    return 0
+}

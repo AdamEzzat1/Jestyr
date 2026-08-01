@@ -29,6 +29,7 @@
 | Increment | Commit | What |
 |---|---|---|
 | **G8** plan-as-list | *(this run)* | `const targets` now selects the build script's form **by its type**: an integer is a count (the tier-4 index form), a list is the targets themselves — `[[source, output], …]`, buildable by a comptime `for`. A pair is a two-element list because the value domain has no struct; two parallel lists would read better and can disagree in length. Artifacts take the same two forms. Fully backwards compatible, and the two forms render byte-identical plans (pinned by planning one build both ways). `examples/build_list.jestyr` is the worked example. |
+| **M3** typeck fold + cgen emission, **first corpus file** | *(this run)* | `examples/comptime_block.jtr` — **corpus 134 → 135**, and the first `.jtr` in the tree to use comptime syntax. typeck.jtr folds a kind-44 node to its value's type (i32/bool/str, Error on failure); cgen.jtr emits the folded literal (`push_i64`, `push_c_string` with the octal + trigraph rules mirrored from `c_string_literal`); `eval_array_len`/`push_array_len` now go through the interpreter instead of accepting only a literal — the port's own G1. Emitted C byte-identical across all 135. **Two shims the next mirror will hit as well** — see findings 8 and 9. |
 | **M2** the CTFE interpreter in `.jtr` | *(this run)* | `examples/std/ctfe.jtr` + `ctfe_cli.jtr` — the self-hosted comptime evaluator, scalars (Int/Bool/Str). Golden `jestyr_ctfe_folding_matches_reference` drives both implementations over 23 fixtures and requires agreement on **what folds** and **what is refused**: arithmetic, every literal base, bitwise/shifts, const chains, comparisons, short-circuit, `if`/`else`, calls, recursion, `let`, strings (concat/escapes/ordering), chars, casts, `comptime` blocks incl. nesting, and 8 refusal cases. **Named `ctfe`, not `comptime`** — see the finding below. Message-TEXT parity is deliberately not claimed (the `.jtr` subset has no `format!`; same concession the P-series made for the refusal gates). |
 | **M1** the port parses `comptime` | `63ba3fa` | `parser.jtr` expr kind 44 + the three dispatch sites + dump arm; verified by the P2 expression golden on a temp probe file (6 snippets incl. the tier-7 shape), so it lands without touching a corpus golden. |
 | **G7** comptime `for` + mutation | *(this run)* | **Also cleared tier 3's field-iteration blocker** — see below. Loops and `var` assignment run at compile time, so a table's **shape** is computed, not spelled out: a 256-entry CRC-32 table is built by `for i in 0..256 { t[i] = crc_entry(i) }` and emitted as a plain static (values verified against an independent implementation, not just self-consistency). All three loop heads, ranges (inclusive/`step`/descending), list iteration, element+index, `break`/`continue` incl. **labelled**, and `for … else`. Assignment reaches locals and elements at any depth; compound assignment uses the same **checked** arithmetic, so `+=` overflows into a diagnostic. Fuel per **iteration** — the trap here is that an empty body evaluates nothing, so nothing else charges the budget at all. |
@@ -128,6 +129,21 @@ when the reference re-sorts its output by content (§2, O1).
 8. **Unit tests in the binary crate have no `CARGO_BIN_EXE_*`.** That is an
    integration-test variable. To invoke `jestyrc` as a subprocess from `proptests.rs`,
    walk up from `std::env::current_exe()` (`target/<profile>/deps/` → `../`).
+9. **Every new block-led form needs its `dump_types` BLOCK-SHIM entry** (M3, and this
+   will recur). The reference stores most blocks as embedded `Block` **structs** — fn
+   bodies, if-THEN, `unsafe`/`concurrent`/`region` bodies, `for` body+else, select arms —
+   while the port's parser materializes *every* block as a kind-23 arena node. The P3
+   typeck golden compares the FULL expression stream in ExprId order, so `dump_types`
+   skips the struct-position blocks to keep the two streams aligned. Adding `comptime`
+   without adding kind 44 to that skip list shifted every subsequent type by one node per
+   comptime block, which reads as a wall of unrelated type mismatches. **The diagnostic
+   signature is an accumulating drift**: if the divergence count grows with the number of
+   occurrences of the new construct, suspect the shim, not the typing.
+10. **A new construct in a corpus file drags in the port's `eval_array_len` too.** A
+   `comptime` block is legal as an array length, and the port's `eval_array_len` /
+   `push_array_len` accepted only an integer *literal* — the exact pre-G1 reference
+   behaviour, silently yielding `[0]T`. Both now route through the interpreter. Anything
+   that can appear in a length position has to be folded on both sides.
 
 ---
 
@@ -413,15 +429,30 @@ whenever a caller wants a named comptime helper, not to unblock anything.
 
 `#line` (§1) is an independent, optional increment — take it whenever the port's `build`
 C needs to match the reference's, not before. Keep every increment two-sided-green:
-corpus 134 + concat + test-mode + fixpoint + self-build + refreshed seed.
+corpus 135 + concat + test-mode + fixpoint + self-build + refreshed seed.
 
-**The port-mirror trigger, restated because it is the thing that will bite:** G2–G4 need
-no mirror *yet* only because they added no corpus file and changed no emitted C for any
-existing program. The moment a `comptime`/reflection `.jtr` lands in `examples/`, the
-P2/P3 goldens sweep it with no allowlist and the port must parse, check and emit it —
-which means a comptime interpreter written in the `.jtr` subset. Land the reference side
-and its Rust-only tests first, then the mirror, then the corpus file, in that order.
-(`.jestyr` build scripts are exempt: the goldens key on the `jtr` extension.)
+**The port-mirror trigger — now DEMONSTRATED, not just predicted.** It said: the moment a
+`comptime` `.jtr` lands in `examples/`, the P2/P3 goldens sweep it with no allowlist and
+the port must parse, check and emit it. That is exactly what M1–M3 did, and the predicted
+order (reference side + Rust-only tests → mirror → corpus file) held. **Tier 2 is now
+closed on both sides**: `examples/std/ctfe.jtr` is the self-hosted interpreter, `ctfe` is
+the 12th module of the self-host closure, `examples/comptime_block.jtr` is corpus file
+**135**, and the bootstrap seed carries a comptime evaluator.
+
+What the next mirror should expect, in the order it will hit them: the parser needs its
+`ref_dump_expr` arm in the harness (finding 6-adjacent — a missing one reads as a
+divergent port); a block-led form needs its `dump_types` **block-shim** entry (finding 9,
+whose signature is an *accumulating* drift); anything legal in an array-length position
+needs `eval_array_len`/`push_array_len` folding on both sides (finding 10); and a new
+`import` in `typeck.jtr`/`cgen.jtr` must be added to `SELFHOST_MODULES` in dependency
+order or the concat build fails immediately (fast, not a divergence — a build error).
+(`.jestyr` build scripts stay exempt: the goldens key on the `jtr` extension.)
+
+**Tiers 6/7 in the port are a REPRESENTATION change, not more of the same.** `ctfe.jtr`'s
+`Value` is a tag plus one `i64`, deliberately Copy and allocator-free; a string payload is
+an index into an *immutable* arena, which is what makes it safe. Aggregates and the
+comptime `for` need a MUTABLE list, which aliases under an arena — that is the real work
+of the next slice, and it lands with the corpus file that exercises it.
 
 ## One-line
 Self-hosting is finished and productized, **workstream O is complete in-language**, and
@@ -438,7 +469,7 @@ tier added a capability without giving the evaluator an effect, so determinism a
 reproducibility stayed properties of the design rather than conventions to police — and
 each tier's cost was one line of fuel accounting in a new place (per expression, per
 element, per iteration). The ladder is documented in `docs/ctfe-tiers.md`. What's left is
-the **G2/G3/G6/G7 port mirrors**, opt-in memory
+the **G3/G6/G7 port mirrors** (tier 2 is closed on both sides), opt-in memory
 layout, SIMD, and the optional `#line` port — each landed
 increment-by-increment under the two-sided golden discipline with the bootstrap seed
 refreshed at every `examples/std` change.

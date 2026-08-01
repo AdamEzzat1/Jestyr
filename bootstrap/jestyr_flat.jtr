@@ -266,7 +266,7 @@ pub fn intern(mut it: Interner, read s: str) -> i64 {
 }
 
 // The string an id names, as a zero-copy view into the interner's storage.
-pub fn lookup(read it: Interner, id: i64) -> str {
+pub fn lookup__intern(read it: Interner, id: i64) -> str {
     let r: ISlot = slot_at(it.byid, id as usize)
     let vs: []u8 = slice(u8, r.kptr, r.klen)
     return from_utf8(vs)
@@ -1221,7 +1221,7 @@ fn prev_end(read p: Parser) -> usize {
 // matching the reference's `MAX_EXPR_DEPTH`. Bounds AST *height* — so a left-deep fold
 // (`1+1+…`) or postfix chain (`a.b.c.…`), which parse iteratively, still can't build a
 // tree taller than this for a later recursive walk (or `dump`) to overflow on.
-fn max_depth() -> i32 { return 256 }
+fn max_depth__parser() -> i32 { return 256 }
 
 // Record one more level of nesting; returns true while there is room, false once past the
 // cap (latching `over`). Callers restore `depth` on the way out, so it measures the
@@ -1231,7 +1231,7 @@ fn descend(mut p: Parser) -> bool {
                                        // stops cleanly instead of churning the surplus
                                        // tokens (a postfix `(`/`[`/`.` run) into nodes.
     p.depth = p.depth + 1
-    if p.depth > max_depth() { p.over = true  return false }
+    if p.depth > max_depth__parser() { p.over = true  return false }
     return true
 }
 
@@ -4446,6 +4446,799 @@ pub fn parse_source(read src: str, mut it: Interner, kwcount: i64, read a: Alloc
     return p
 }
 
+// std/ctfe.jtr — the compile-time interpreter, in Jestyr. The port mirror of
+// `src/comptime.rs` (roadmap workstream G, tiers 1–2).
+//
+// ─── Why `ctfe` and not `comptime` ──────────────────────────────────────────────
+// The reference module is `comptime.rs`, and the obvious mirror name is taken — by
+// Jestyr itself. Once `comptime { … }` became an expression form, a module named
+// `comptime` could not be USED: `comptime.run()` parses as a comptime block whose body
+// is missing its `{`. The reference gets away with the name only because `comptime` is
+// not a Rust keyword. This is the same hazard the `@` reflection sigil exists for (a
+// bare-name intrinsic would have hijacked the compiler's own `fn field_type`), in a new
+// place: a module PATH competes for tokens with the language's keywords.
+//
+// A small, TOTAL interpreter over the parser's arenas: it folds integer/bool/string
+// expressions at check time, including calls of pure functions. It is what makes
+// `comptime { … }` a value rather than a block the backend has to compile, and what
+// lets a `[N]T` length be an expression rather than only a literal.
+//
+// ─── Totality ───────────────────────────────────────────────────────────────────
+// A comptime interpreter is a place a compiler can hang on perfectly ordinary-looking
+// input (`const A = B` / `const B = A`, or an unbounded recursion). Three bounds keep
+// evaluation total, so a bad program gets a diagnostic rather than a hung build:
+//   * a step budget (`FUEL`) spent on every expression,
+//   * a call-depth cap (`MAX_DEPTH`),
+//   * cycle detection across `const` references.
+// Anything outside the value domain — a float, a struct, an intrinsic, an effectful
+// call — fails cleanly rather than being guessed at. The effect policy is STRUCTURAL:
+// there is simply no arm for an effect, so there is no allowlist to keep in sync and
+// no way to bypass it.
+//
+// ─── Scope of this slice ────────────────────────────────────────────────────────
+// Scalars only: Int, Bool and Str. The reference additionally has aggregate values
+// (tier 6) and a comptime `for` with mutation (tier 7); those need a mutable list
+// representation, which aliases badly in an arena, and they land with the corpus file
+// that exercises them. Everything here is refusal-compatible with the reference: this
+// evaluator never accepts something the reference rejects, so a corpus file that
+// folds under one folds identically under the other.
+//
+// ─── Representation ─────────────────────────────────────────────────────────────
+// A `Value` is a tag plus one `i64`, so it is Copy and needs no allocator. A string
+// value's payload is an INDEX into `sidx`, a list of (start, len) pairs into the
+// single growable `sbuf` — so string values are cheap to copy and are never aliased,
+// because comptime strings are immutable.
+
+
+// The total number of expression evaluations one top-level `eval` may perform.
+// Generous for real constant folding, small enough that a pathological input fails in
+// microseconds.
+fn fuel_budget() -> i32 { return 100000 }
+
+// The maximum nesting of comptime function calls.
+fn max_depth__ctfe() -> i32 { return 64 }
+
+// A comptime value. `tag`: 0=Int 1=Bool 2=Str 3=Unit.
+// `i` carries the payload: the integer, 0/1 for a bool, or a slot index into `sidx`
+// for a string. A `Unit` value is a real value (a block ending in a binding produces
+// one), so the CONSUMER decides whether a missing value is a problem.
+pub struct Value { pub tag: i32, pub i: i64 }
+
+pub fn is_int(read v: Value) -> bool { return v.tag == 0 }
+pub fn is_bool(read v: Value) -> bool { return v.tag == 1 }
+pub fn is_str(read v: Value) -> bool { return v.tag == 2 }
+pub fn is_unit(read v: Value) -> bool { return v.tag == 3 }
+
+// The name used in diagnostics ("expected an integer, found a bool").
+pub fn type_name(read v: Value) -> str {
+    if v.tag == 0 { return "an integer" }
+    if v.tag == 1 { return "a bool" }
+    if v.tag == 2 { return "a string" }
+    return "no value"
+}
+
+// The interpreter's state for one program.
+//
+// `envn` holds (name_start, name_end, tag) triples and `envv` the parallel `i64`
+// payloads — two lists rather than one list of a Binding struct, because the port's
+// generic `List` is instantiated per element type and `i32`/`i64` lists already exist
+// everywhere else in the compiler. `marks` records where each scope began, so leaving
+// a scope is a truncate.
+pub struct Interp {
+    sbuf: String,        // every comptime-produced string byte, concatenated
+    sidx: List(i32),     // (start, len) pairs into `sbuf`; a Str value's `i` is the PAIR index
+    envn: List(i32),     // (name_start, name_end, tag) triples
+    envv: List(i64),     // parallel payloads
+    marks: List(i32),    // scope starts, counted in triples
+    prog: List(i32),     // (ns, ne) of consts being evaluated — the cycle guard
+    fuel: i32,
+    depth: i32,
+    pub failed: bool,    // set by the first failure; every caller then unwinds
+    pub es: usize,       // the failing sub-expression's span, for the diagnostic
+    pub ee: usize,
+    pub emsg: String,
+    returning: bool,     // a `return` is in flight, consumed by the owning call
+    rtag: i32,
+    ri: i64,
+    a: Allocator,        // kept so a call frame can build its argument buffers
+}
+
+// The result of reading an integer literal: the value, and whether the text was
+// well-formed. A struct rather than a `mut` out-parameter, because a scalar `mut`
+// parameter is not the port's idiom.
+struct IntLit { ok: bool, v: i64 }
+
+// A fresh interpreter bound to allocator `a`. Cheap: it allocates nothing until the
+// first evaluation.
+pub fn make__ctfe(read a: Allocator) -> Interp {
+    return Interp{
+        sbuf: string_new(),
+        sidx: make__list(i32, a),
+        envn: make__list(i32, a),
+        envv: make__list(i64, a),
+        marks: make__list(i32, a),
+        prog: make__list(i32, a),
+        fuel: 100000,
+        depth: 0,
+        failed: false,
+        es: 0,
+        ee: 0,
+        emsg: string_new(),
+        returning: false,
+        rtag: 3,
+        ri: 0,
+        a: a,
+    }
+}
+
+// ---- value constructors ----
+
+fn v_int(n: i64) -> Value { return Value{ tag: 0, i: n } }
+fn v_bool(b: bool) -> Value { var n: i64 = 0  if b { n = 1 }  return Value{ tag: 1, i: n } }
+fn v_unit() -> Value { return Value{ tag: 3, i: 0 } }
+
+// Intern `s` into the string arena and return a Str value naming it.
+fn v_str(mut it: Interp, s: str) -> Value {
+    let before: str = string_view(it.sbuf)
+    let start: i32 = before.len as i32
+    string_push(it.sbuf, s)
+    let slot: i32 = (len(i32, it.sidx) / 2) as i32
+    push(i32, it.sidx, start)
+    push(i32, it.sidx, s.len as i32)
+    return Value{ tag: 2, i: slot as i64 }
+}
+
+// The bytes of a Str value. (Bind the view first — chaining `string_view(x).len` is a
+// recorded `.jtr` subset trap.)
+pub fn str_of(read it: Interp, read v: Value) -> str {
+    let all: str = string_view(it.sbuf)
+    let base: usize = (v.i * 2) as usize
+    let start: i32 = get(i32, it.sidx, base)
+    let n: i32 = get(i32, it.sidx, base + 1)
+    return all[start as usize .. (start + n) as usize]
+}
+
+// ---- failure ----
+
+// Record the first failure and return a placeholder. Later failures do not overwrite
+// it, so the diagnostic names the ORIGINAL cause rather than whatever unwound last.
+fn fail(mut it: Interp, msg: str, s: usize, e: usize) -> Value {
+    if it.failed == false {
+        it.failed = true
+        it.es = s
+        it.ee = e
+        string_push(it.emsg, msg)
+    }
+    return v_unit()
+}
+
+// Spend one step. Running out is a diagnostic, never a hang.
+fn spend(mut it: Interp, s: usize, e: usize) -> bool {
+    if it.fuel <= 0 {
+        let ignored: Value = fail(it, "compile-time evaluation exceeded its step budget (is it non-terminating?)", s, e)
+        return false
+    }
+    it.fuel = it.fuel - 1
+    return true
+}
+
+// ---- scopes ----
+
+fn scope_push(mut it: Interp) {
+    let n: i32 = (len(i32, it.envn) / 3) as i32
+    push(i32, it.marks, n)
+}
+
+fn scope_pop(mut it: Interp) {
+    let m: usize = len(i32, it.marks)
+    if m == 0 { return }
+    let n: i32 = get(i32, it.marks, m - 1)
+    truncate(i32, it.marks, m - 1)
+    truncate(i32, it.envn, (n * 3) as usize)
+    truncate(i64, it.envv, n as usize)
+}
+
+fn bind(mut it: Interp, ns: i32, ne: i32, read v: Value) {
+    push(i32, it.envn, ns)
+    push(i32, it.envn, ne)
+    push(i32, it.envn, v.tag)
+    push(i64, it.envv, v.i)
+}
+
+// Look up `src[ns..ne]`, newest binding first so shadowing works.
+// Returns tag -1 when unbound.
+fn lookup__ctfe(read it: Interp, read src: str, ns: usize, ne: usize) -> Value {
+    var i: i32 = (len(i32, it.envn) / 3) as i32
+    for i > 0 {
+        i = i - 1
+        let base: usize = (i * 3) as usize
+        let bns: i32 = get(i32, it.envn, base)
+        let bne: i32 = get(i32, it.envn, base + 1)
+        if str_eq(src[ns .. ne], src[bns as usize .. bne as usize]) {
+            let tag: i32 = get(i32, it.envn, base + 2)
+            let payload: i64 = get(i64, it.envv, i as usize)
+            return Value{ tag: tag, i: payload }
+        }
+    }
+    return Value{ tag: 0 - 1, i: 0 }
+}
+
+// ---- top-level item lookup ----
+
+// The value `ExprId` of `const <src[ns..ne]>`, or -1.
+fn const_init(read p: Parser, read src: str, ns: usize, ne: usize) -> i32 {
+    let n: usize = len(ItemData, p.it)
+    var i: usize = 0
+    for i < n {
+        let d: ItemData = get(ItemData, p.it, i)
+        if d.kind == 2 {
+            if str_eq(src[ns .. ne], src[d.x as usize .. d.y as usize]) { return d.b }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// The `ItemId` of `fn <src[ns..ne]>`, or -1.
+fn fn_item(read p: Parser, read src: str, ns: usize, ne: usize) -> i32 {
+    let n: usize = len(ItemData, p.it)
+    var i: usize = 0
+    for i < n {
+        let d: ItemData = get(ItemData, p.it, i)
+        if d.kind == 3 {
+            if str_eq(src[ns .. ne], src[d.x as usize .. d.y as usize]) { return i as i32 }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ---- literals ----
+
+// Parse an integer literal's source text: decimal, `0x`/`0X` hex, `0b`/`0B` binary,
+// with `_` separators ignored. Returns false on malformed text.
+fn parse_int_lit(read src: str, s: usize, e: usize) -> IntLit {
+    var i: usize = s
+    var base: i64 = 10
+    if e - s > 2 {
+        if (src[i] as i32) == 48 {
+            let d: i32 = src[i + 1] as i32
+            if d == 120 { base = 16  i = i + 2 }
+            else if d == 88 { base = 16  i = i + 2 }
+            else if d == 98 { base = 2  i = i + 2 }
+            else if d == 66 { base = 2  i = i + 2 }
+        }
+    }
+    var v: i64 = 0
+    for i < e {
+        let ch: i32 = src[i] as i32
+        if ch == 95 { i = i + 1 }
+        else {
+            var d: i64 = 0 - 1
+            if ch >= 48 { if ch <= 57 { d = (ch - 48) as i64 } }
+            if ch >= 97 { if ch <= 102 { d = (ch - 87) as i64 } }
+            if ch >= 65 { if ch <= 70 { d = (ch - 55) as i64 } }
+            if d < 0 { return IntLit{ ok: false, v: 0 } }
+            if d >= base { return IntLit{ ok: false, v: 0 } }
+            v = v * base + d
+            i = i + 1
+        }
+    }
+    return IntLit{ ok: true, v: v }
+}
+
+// Decode the escapes the lexer accepts, appending to `dst`. An unknown escape keeps
+// its character, matching the lexer's own tolerance.
+fn push_unescaped(mut dst: String, read src: str, s: usize, e: usize) {
+    var i: usize = s
+    for i < e {
+        let c: i32 = src[i] as i32
+        if c == 92 {
+            if i + 1 < e {
+                let n: i32 = src[i + 1] as i32
+                if n == 110 { string_push(dst, "\n") }
+                else if n == 116 { string_push(dst, "\t") }
+                else if n == 114 { string_push(dst, "\r") }
+                else if n == 48 { string_push(dst, "\0") }
+                else { string_push(dst, src[i + 1 .. i + 2]) }
+                i = i + 2
+            } else {
+                string_push(dst, "\\")
+                i = i + 1
+            }
+        } else {
+            string_push(dst, src[i .. i + 1])
+            i = i + 1
+        }
+    }
+}
+
+// ---- evaluation ----
+
+// Evaluate one expression to a comptime value. Each call gets a fresh step budget, so
+// evaluating many constants cannot exhaust a shared one. Check `it.failed` afterwards.
+pub fn eval(mut it: Interp, read p: Parser, read src: str, eid: i32) -> Value {
+    it.fuel = 100000
+    it.depth = 0
+    it.failed = false
+    it.returning = false
+    truncate(i32, it.envn, 0)
+    truncate(i64, it.envv, 0)
+    truncate(i32, it.marks, 0)
+    truncate(i32, it.prog, 0)
+    scope_push(it)
+    return ev(it, p, src, eid)
+}
+
+// Evaluate to a non-negative integer — the array-length / repeat-count shape.
+// Returns -1 on any failure (the caller decides whether that is an error).
+pub fn eval_usize(mut it: Interp, read p: Parser, read src: str, eid: i32) -> i64 {
+    let v: Value = eval(it, p, src, eid)
+    if it.failed { return 0 - 1 }
+    if v.tag != 0 { return 0 - 1 }
+    if v.i < 0 { return 0 - 1 }
+    return v.i
+}
+
+fn ev(mut it: Interp, read p: Parser, read src: str, eid: i32) -> Value {
+    if it.failed { return v_unit() }
+    if eid < 0 { return v_unit() }
+    let d: ExprData = get(ExprData, p.ex, eid as usize)
+    if spend(it, d.start, d.end) == false { return v_unit() }
+
+    if d.kind == 0 {                                  // Int
+        let lit: IntLit = parse_int_lit(src, d.start, d.end)
+        if lit.ok == false { return fail(it, "integer literal is out of range", d.start, d.end) }
+        return v_int(lit.v)
+    }
+    if d.kind == 27 {                                 // Bool
+        return v_bool(str_eq(src[d.start .. d.end], "true"))
+    }
+    if d.kind == 29 {                                 // Str — strip the quotes, unescape
+        var tmp: String = string_new()
+        push_unescaped(tmp, src, d.start + 1, d.end - 1)
+        let view: str = string_view(tmp)
+        return v_str(it, view)
+    }
+    if d.kind == 26 {                                 // Char — its code point
+        var tmp: String = string_new()
+        push_unescaped(tmp, src, d.start + 1, d.end - 1)
+        let view: str = string_view(tmp)
+        if view.len == 0 { return fail(it, "malformed character literal", d.start, d.end) }
+        return v_int(view[0] as i64)
+    }
+    if d.kind == 2 { return ev_name(it, p, src, d) }  // Name
+    if d.kind == 3 {                                  // Unary
+        let v: Value = ev(it, p, src, d.a)
+        if it.failed { return v_unit() }
+        return ev_unary(it, d.op, v, d.start, d.end)
+    }
+    if d.kind == 4 { return ev_binary(it, p, src, d) } // Binary
+    if d.kind == 11 {                                 // Cast — int-to-int passes through
+        let v: Value = ev(it, p, src, d.a)
+        if it.failed { return v_unit() }
+        if v.tag == 0 {
+            if is_int_type(p, src, d.x) { return v }
+        }
+        return fail(it, "this cast is not supported at compile time", d.start, d.end)
+    }
+    if d.kind == 24 {                                 // If
+        let c: Value = ev(it, p, src, d.a)
+        if it.failed { return v_unit() }
+        if c.tag != 1 { return fail(it, "`if` condition must be a bool", d.start, d.end) }
+        if c.i == 1 {
+            let v: Value = ev_block(it, p, src, d.b)
+            // An `if` with no `else` is a statement: it runs its block for effect and
+            // yields no value of its own.
+            if d.op < 0 { return v_unit() }
+            return v
+        }
+        if d.op < 0 { return v_unit() }
+        return ev(it, p, src, d.op)
+    }
+    // A `comptime { … }` block is ALREADY being evaluated at compile time, so it is
+    // simply its block — which is what makes a nested one work for free.
+    if d.kind == 23 { return ev_block(it, p, src, eid) }   // Block
+    if d.kind == 44 { return ev_block(it, p, src, d.a) }   // Comptime
+    if d.kind == 10 { return ev_call(it, p, src, d) }      // Call
+
+    return fail(it, "this expression is not a compile-time constant", d.start, d.end)
+}
+
+// Is `tyid` an integer primitive? (The set a comptime cast may pass through.)
+fn is_int_type(read p: Parser, read src: str, tyid: i32) -> bool {
+    if tyid < 0 { return false }
+    let t: TypeData = get(TypeData, p.ty, tyid as usize)
+    if t.kind != 0 { return false }
+    let n: str = src[t.start .. t.end]
+    if str_eq(n, "i8") { return true }
+    if str_eq(n, "i16") { return true }
+    if str_eq(n, "i32") { return true }
+    if str_eq(n, "i64") { return true }
+    if str_eq(n, "isize") { return true }
+    if str_eq(n, "u8") { return true }
+    if str_eq(n, "u16") { return true }
+    if str_eq(n, "u32") { return true }
+    if str_eq(n, "u64") { return true }
+    if str_eq(n, "usize") { return true }
+    return false
+}
+
+// A name: a local binding first, then a top-level `const`.
+fn ev_name(mut it: Interp, read p: Parser, read src: str, read d: ExprData) -> Value {
+    let local: Value = lookup__ctfe(it, src, d.start, d.end)
+    if local.tag >= 0 { return local }
+
+    let init: i32 = const_init(p, src, d.start, d.end)
+    if init < 0 { return fail(it, "this is not a compile-time constant", d.start, d.end) }
+
+    // Cycle detection: a const already being evaluated is defined in terms of itself.
+    let np: usize = len(i32, it.prog)
+    var k: usize = 0
+    for k < np {
+        let ns: i32 = get(i32, it.prog, k)
+        let ne: i32 = get(i32, it.prog, k + 1)
+        if str_eq(src[d.start .. d.end], src[ns as usize .. ne as usize]) {
+            return fail(it, "this constant is defined in terms of itself", d.start, d.end)
+        }
+        k = k + 2
+    }
+    push(i32, it.prog, d.start as i32)
+    push(i32, it.prog, d.end as i32)
+
+    // A const initializer is evaluated in its own scope: it cannot see the locals of
+    // whatever expression referred to it.
+    let saved: usize = len(i32, it.envn)
+    let savedv: usize = len(i64, it.envv)
+    scope_push(it)
+    let res: Value = ev(it, p, src, init)
+    scope_pop(it)
+    truncate(i32, it.envn, saved)
+    truncate(i64, it.envv, savedv)
+    truncate(i32, it.prog, np)
+    return res
+}
+
+fn ev_unary(mut it: Interp, op: i32, read v: Value, s: usize, e: usize) -> Value {
+    if op == 1 {                                      // neg
+        if v.tag != 0 { return fail(it, "this operator does not apply here at compile time", s, e) }
+        if v.i == 0 - 9223372036854775807 - 1 { return fail(it, "negation overflowed at compile time", s, e) }
+        return v_int(0 - v.i)
+    }
+    if op == 2 {                                      // not
+        if v.tag != 1 { return fail(it, "this operator does not apply here at compile time", s, e) }
+        return v_bool(v.i == 0)
+    }
+    if op == 3 {                                      // bitnot
+        if v.tag != 0 { return fail(it, "this operator does not apply here at compile time", s, e) }
+        return v_int(0 - v.i - 1)
+    }
+    return fail(it, "this operator does not apply here at compile time", s, e)
+}
+
+fn ev_binary(mut it: Interp, read p: Parser, read src: str, read d: ExprData) -> Value {
+    // `and`/`or` short-circuit, so the right side is evaluated only if needed — which
+    // also means `false and <not-constant>` is still a constant.
+    if d.op == 12 {                                   // and
+        let l: Value = ev(it, p, src, d.a)
+        if it.failed { return v_unit() }
+        if l.tag != 1 { return fail(it, "`and` needs a bool", d.start, d.end) }
+        if l.i == 0 { return v_bool(false) }
+        let r: Value = ev(it, p, src, d.b)
+        if it.failed { return v_unit() }
+        if r.tag != 1 { return fail(it, "`and` needs a bool", d.start, d.end) }
+        return v_bool(r.i == 1)
+    }
+    if d.op == 13 {                                   // or
+        let l: Value = ev(it, p, src, d.a)
+        if it.failed { return v_unit() }
+        if l.tag != 1 { return fail(it, "`or` needs a bool", d.start, d.end) }
+        if l.i == 1 { return v_bool(true) }
+        let r: Value = ev(it, p, src, d.b)
+        if it.failed { return v_unit() }
+        if r.tag != 1 { return fail(it, "`or` needs a bool", d.start, d.end) }
+        return v_bool(r.i == 1)
+    }
+
+    let l: Value = ev(it, p, src, d.a)
+    if it.failed { return v_unit() }
+    let r: Value = ev(it, p, src, d.b)
+    if it.failed { return v_unit() }
+
+    if l.tag == 0 { if r.tag == 0 { return int_binop(it, d.op, l.i, r.i, d.start, d.end) } }
+    if l.tag == 2 { if r.tag == 2 { return str_binop(it, d.op, l, r, d.start, d.end) } }
+    if l.tag == 1 {
+        if r.tag == 1 {
+            if d.op == 6 { return v_bool(l.i == r.i) }
+            if d.op == 7 { return v_bool(l.i != r.i) }
+            return fail(it, "this operator does not apply to bools", d.start, d.end)
+        }
+    }
+    return fail(it, "these operands do not combine at compile time", d.start, d.end)
+}
+
+// Integer arithmetic. Every operation is CHECKED: a comptime overflow is a compile
+// error, never a silent wrap. (Runtime overflow semantics are a separate workstream's;
+// a constant the compiler folds must simply be right.)
+fn int_binop(mut it: Interp, op: i32, a: i64, b: i64, s: usize, e: usize) -> Value {
+    if op == 1 {
+        if b > 0 { if a > 9223372036854775807 - b { return fail(it, "this arithmetic overflowed at compile time", s, e) } }
+        if b < 0 { if a < (0 - 9223372036854775807 - 1) - b { return fail(it, "this arithmetic overflowed at compile time", s, e) } }
+        return v_int(a + b)
+    }
+    if op == 2 {
+        if b < 0 { if a > 9223372036854775807 + b { return fail(it, "this arithmetic overflowed at compile time", s, e) } }
+        if b > 0 { if a < (0 - 9223372036854775807 - 1) + b { return fail(it, "this arithmetic overflowed at compile time", s, e) } }
+        return v_int(a - b)
+    }
+    if op == 3 {
+        if a != 0 {
+            let r: i64 = a * b
+            if r / a != b { return fail(it, "this arithmetic overflowed at compile time", s, e) }
+            return v_int(r)
+        }
+        return v_int(0)
+    }
+    if op == 4 {
+        if b == 0 { return fail(it, "division by zero at compile time", s, e) }
+        if b == 0 - 1 { if a == 0 - 9223372036854775807 - 1 { return fail(it, "this arithmetic overflowed at compile time", s, e) } }
+        return v_int(a / b)
+    }
+    if op == 5 {
+        if b == 0 { return fail(it, "remainder by zero at compile time", s, e) }
+        if b == 0 - 1 { if a == 0 - 9223372036854775807 - 1 { return fail(it, "this arithmetic overflowed at compile time", s, e) } }
+        return v_int(a % b)
+    }
+    if op == 6 { return v_bool(a == b) }
+    if op == 7 { return v_bool(a != b) }
+    if op == 8 { return v_bool(a < b) }
+    if op == 9 { return v_bool(a <= b) }
+    if op == 10 { return v_bool(a > b) }
+    if op == 11 { return v_bool(a >= b) }
+    if op == 14 { return v_int(a & b) }
+    if op == 15 { return v_int(a | b) }
+    if op == 16 { return v_int(a ^ b) }
+    if op == 17 {
+        if b < 0 { return fail(it, "shift amount is negative", s, e) }
+        if b > 63 { return fail(it, "shift amount is too large", s, e) }
+        return v_int(a << b)
+    }
+    if op == 18 {
+        if b < 0 { return fail(it, "shift amount is negative", s, e) }
+        if b > 63 { return fail(it, "shift amount is too large", s, e) }
+        return v_int(a >> b)
+    }
+    return fail(it, "this operator does not apply to integers", s, e)
+}
+
+fn str_binop(mut it: Interp, op: i32, read l: Value, read r: Value, s: usize, e: usize) -> Value {
+    if op == 1 {                                      // concatenation
+        var tmp: String = string_new()
+        let a: str = str_of(it, l)
+        string_push(tmp, a)
+        let b: str = str_of(it, r)
+        string_push(tmp, b)
+        let view: str = string_view(tmp)
+        return v_str(it, view)
+    }
+    let a: str = str_of(it, l)
+    let b: str = str_of(it, r)
+    if op == 6 { return v_bool(str_eq(a, b)) }
+    if op == 7 { return v_bool(str_eq(a, b) == false) }
+    let c: i32 = str_cmp(a, b)
+    if op == 8 { return v_bool(c < 0) }
+    if op == 9 { return v_bool(c <= 0) }
+    if op == 10 { return v_bool(c > 0) }
+    if op == 11 { return v_bool(c >= 0) }
+    return fail(it, "this operator does not apply to strings", s, e)
+}
+
+// Lexicographic byte comparison, mirroring Rust's `str` ordering (which is byte-wise
+// on UTF-8, so this agrees for every input the lexer can produce).
+fn str_cmp(a: str, b: str) -> i32 {
+    var i: usize = 0
+    for i < a.len {
+        if i >= b.len { return 1 }
+        let x: i32 = a[i] as i32
+        let y: i32 = b[i] as i32
+        if x < y { return 0 - 1 }
+        if x > y { return 1 }
+        i = i + 1
+    }
+    if b.len > a.len { return 0 - 1 }
+    return 0
+}
+
+// A block's value is its tail expression (otherwise Unit); `let` bindings scope to the
+// block. A `return` anywhere inside sets `returning`, which stops evaluation here and
+// propagates to the enclosing call.
+fn ev_block(mut it: Interp, read p: Parser, read src: str, eid: i32) -> Value {
+    if eid < 0 { return v_unit() }
+    let d: ExprData = get(ExprData, p.ex, eid as usize)
+    if d.kind != 23 { return ev(it, p, src, eid) }
+    scope_push(it)
+    let res: Value = ev_stmts(it, p, src, d.x, d.y)
+    scope_pop(it)
+    return res
+}
+
+fn ev_stmts(mut it: Interp, read p: Parser, read src: str, start: i32, count: i32) -> Value {
+    var tail: Value = v_unit()
+    var k: i32 = 0
+    for k < count {
+        if it.failed { return v_unit() }
+        let sid: i32 = get(i32, p.sar, (start + k) as usize)
+        let s: StmtData = get(StmtData, p.st, sid as usize)
+        if s.kind == 0 {                              // Let
+            if s.a < 0 { return fail(it, "a compile-time `let` needs an initializer", s.start, s.end) }
+            let v: Value = ev(it, p, src, s.a)
+            if it.failed { return v_unit() }
+            bind(it, s.x, s.y, v)
+            tail = v_unit()
+        } else if s.kind == 1 {                       // Return
+            var v: Value = v_unit()
+            if s.a >= 0 { v = ev(it, p, src, s.a) }
+            if it.failed { return v_unit() }
+            if it.returning == false {
+                it.returning = true
+                it.rtag = v.tag
+                it.ri = v.i
+            }
+            return v
+        } else {                                      // Expr
+            let v: Value = ev(it, p, src, s.a)
+            if it.failed { return v_unit() }
+            // Only a trailing expression is the block's value.
+            if k + 1 == count { tail = v } else { tail = v_unit() }
+        }
+        if it.returning {
+            // A nested `return` already fixed this call's result.
+            return Value{ tag: it.rtag, i: it.ri }
+        }
+        k = k + 1
+    }
+    return tail
+}
+
+fn ev_call(mut it: Interp, read p: Parser, read src: str, read d: ExprData) -> Value {
+    let ce: ExprData = get(ExprData, p.ex, d.a as usize)
+    if ce.kind != 2 {
+        return fail(it, "only a named function can be called at compile time", d.start, d.end)
+    }
+    let fid: i32 = fn_item(p, src, ce.start, ce.end)
+    if fid < 0 {
+        return fail(it, "this is not a function that can run at compile time", d.start, d.end)
+    }
+    let f: ItemData = get(ItemData, p.it, fid as usize)
+    if f.w < 0 { return fail(it, "this function has no body to evaluate", d.start, d.end) }
+    if f.b != d.y {
+        return fail(it, "this call has the wrong number of arguments", d.start, d.end)
+    }
+    if it.depth >= 64 {
+        return fail(it, "compile-time call nesting is too deep (is the recursion unbounded?)", d.start, d.end)
+    }
+
+    // Evaluate the arguments in the CALLER's scope, then bind them in a fresh one: a
+    // call body sees only its parameters, never the caller's locals.
+    var argn: List(i32) = make__list(i32, it.a)
+    var argv: List(i64) = make__list(i64, it.a)
+    var k: i32 = 0
+    for k < d.y {
+        let base: usize = (f.a + k * 7) as usize
+        let comp: i32 = get(i32, p.iar, base)
+        let is_self: i32 = get(i32, p.iar, base + 4)
+        if comp != 0 { return fail(it, "this function cannot be called at compile time", d.start, d.end) }
+        if is_self != 0 { return fail(it, "this function cannot be called at compile time", d.start, d.end) }
+        let aid: i32 = get(i32, p.ar, (d.x + k) as usize)
+        let v: Value = ev(it, p, src, aid)
+        if it.failed { return v_unit() }
+        push(i32, argn, get(i32, p.iar, base + 2))
+        push(i32, argn, get(i32, p.iar, base + 3))
+        push(i32, argn, v.tag)
+        push(i64, argv, v.i)
+        k = k + 1
+    }
+
+    // The callee's frame: a fresh scope holding only the parameters. `returning` is
+    // saved across the call so a callee's `return` can never escape into its caller.
+    let outer_ret: bool = it.returning
+    let outer_tag: i32 = it.rtag
+    let outer_i: i64 = it.ri
+    it.returning = false
+
+    scope_push(it)
+    var j: i32 = 0
+    for j < d.y {
+        let b2: usize = (j * 3) as usize
+        let ns: i32 = get(i32, argn, b2)
+        let ne: i32 = get(i32, argn, b2 + 1)
+        let tg: i32 = get(i32, argn, b2 + 2)
+        let pv: i64 = get(i64, argv, j as usize)
+        bind(it, ns, ne, Value{ tag: tg, i: pv })
+        j = j + 1
+    }
+    it.depth = it.depth + 1
+    var res: Value = ev_block(it, p, src, f.w)
+    it.depth = it.depth - 1
+    scope_pop(it)
+
+    if it.returning { res = Value{ tag: it.rtag, i: it.ri } }
+    it.returning = outer_ret
+    it.rtag = outer_tag
+    it.ri = outer_i
+    return res
+}
+
+// Re-escape a string value for the dump. The dump is line-oriented, so a value
+// containing a newline would otherwise split into two records and read as a
+// divergence when the two implementations actually agree.
+fn push_escaped(mut dst: String, s: str) {
+    var i: usize = 0
+    for i < s.len {
+        let c: i32 = s[i] as i32
+        if c == 92 { string_push(dst, "\\\\") }
+        else if c == 10 { string_push(dst, "\\n") }
+        else if c == 9 { string_push(dst, "\\t") }
+        else if c == 13 { string_push(dst, "\\r") }
+        else { string_push(dst, s[i .. i + 1]) }
+        i = i + 1
+    }
+}
+
+// ---- the dump driver (mirrors `typeck.run`'s shape) ----
+
+// Evaluate the initializer of every top-level `const` in the file named by argv[1], in
+// declaration order, printing one record each:
+//
+//     <name> int <value>            <name> str <text>
+//     <name> bool true|false        <name> unit
+//     <name> error <message>
+//
+// The error TEXT is printed, not merely the fact of failure: refusal quality is part
+// of what the two implementations have to agree on, so a golden that only compared
+// success/failure would let the diagnostics drift apart.
+pub fn run__ctfe() -> i32 {
+    var a: Allocator = system_allocator()
+    var itn: Interner = make__intern(a)
+    let kwcount: i64 = intern_keywords(itn)
+    if argc() > 1 {
+        var srcs: String = read_text(argv(1))
+        var p: Parser = parse_source(string_view(srcs), itn, kwcount, a)
+        let src: str = string_view(srcs)
+        var ci: Interp = make__ctfe(a)
+        let n: usize = len(ItemData, p.it)
+        var i: usize = 0
+        for i < n {
+            let d: ItemData = get(ItemData, p.it, i)
+            if d.kind == 2 {
+                print_str(src[d.x as usize .. d.y as usize])
+                let v: Value = eval(ci, p, src, d.b)
+                if ci.failed {
+                    print_str("error")
+                    print_str(string_view(ci.emsg))
+                } else if v.tag == 0 {
+                    print_str("int")
+                    print_int(v.i)
+                } else if v.tag == 1 {
+                    print_str("bool")
+                    if v.i == 1 { print_str("true") } else { print_str("false") }
+                } else if v.tag == 2 {
+                    print_str("str")
+                    var esc: String = string_new()
+                    push_escaped(esc, str_of(ci, v))
+                    print_str(string_view(esc))
+                    string_free(esc)
+                } else {
+                    print_str("unit")
+                }
+            }
+            i = i + 1
+        }
+        string_free(srcs)
+    }
+    return 0
+}
+
 // examples/std/typeck.jtr - the P3 type-checker, written *in Jestyr*. It imports the P2 parser
 // (`parser.jtr`, a pure library) to build the AST arena, then resolves a `Ty` for each
 // *body-reachable* expression, mirroring the Rust reference (`src/typeck.rs`, `src/types.rs`).
@@ -4482,6 +5275,7 @@ pub fn parse_source(read src: str, mut it: Interner, kwcount: i64, read a: Alloc
 // (`not`, comparisons, `and`/`or`), and **casts** - `x as T` types from its annotation via
 // `lower_type` (structural: prims, pointers, slices, arrays, refs, generic apps, fn pointers,
 // dyn, paths), independent of operand resolution.
+
 
 
 
@@ -4684,7 +5478,16 @@ fn conv_label(code: i32) -> str {
 fn eval_array_len(read p: Parser, read src: str, eid: i32) -> i32 {
     if eid < 0 { return 0 }
     let e: ExprData = get(ExprData, p.ex, eid as usize)
-    if e.kind != 0 { return 0 }                    // not an Int literal
+    if e.kind != 0 {
+        // Not a literal: a `const`, an arithmetic expression, a `comptime` block, a call
+        // of a pure function — the comptime interpreter answers all of them. An
+        // unevaluable length still yields 0 so lowering stays total, exactly as the
+        // reference does (`unwrap_or(0)`); the diagnostic is the checker's job.
+        var lci: Interp = make__ctfe(system_allocator())
+        let n: i64 = eval_usize(lci, p, src, eid)
+        if n < 0 { return 0 }
+        return n as i32
+    }
     var i: usize = e.start
     var base: i64 = 10
     if e.end - e.start > 2 {
@@ -6277,6 +7080,19 @@ fn infer(mut c: Checker, read p: Parser, read src: str, id: i32) -> i32 {
     else if k == 27 { r = t_bool() }               // Bool
     else if k == 29 { r = t_str() }                // Str
     else if k == 30 { r = t_nullptr() }            // Null -> Ptr{Default, Unknown}
+    else if k == 44 {                              // Comptime: the type of the value it FOLDS to
+        // Not the type its body would infer to — the folded literal's. That equivalence
+        // is the contract: cgen emits the literal, so anything else here could disagree
+        // with what is actually compiled. The body is never inferred; the interpreter is
+        // the only checker comptime code has. Mirrors `fold_comptime`.
+        var ci: Interp = make__ctfe(c.alloc)
+        let v: Value = eval(ci, p, src, id)
+        if ci.failed { r = mk_ty__typeck(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1) }   // Error
+        else if v.tag == 0 { r = t_i32() }
+        else if v.tag == 1 { r = t_bool() }
+        else if v.tag == 2 { r = t_str() }
+        else { r = mk_ty__typeck(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1) }           // produced no value
+    }
     else if k == 2 {                               // Name: scope -> const -> variant ctor -> ?
         let hit: i32 = scope_lookup(c, src, d.start, d.end)
         if hit >= 0 { r = hit }
@@ -6913,7 +7729,10 @@ fn dump_types(read src: str, read c: Checker, read p: Parser, read a: Allocator)
         // node, so skip the struct-position ones to compare the same stream.
         if d.kind == 24 {                          // if: the THEN block (els stays - a real expr)
             if d.b >= 0 { set(bool, skip, d.b as usize, true) }
-        } else if d.kind == 25 or d.kind == 38 or d.kind == 43 {   // unsafe/concurrent/region body
+        } else if d.kind == 25 or d.kind == 38 or d.kind == 43 or d.kind == 44 {
+            // unsafe/concurrent/region body, and a `comptime` block's body — all four
+            // hold an embedded `Block` struct in the reference, so the node this parser
+            // materializes for them is not part of the compared stream.
             if d.a >= 0 { set(bool, skip, d.a as usize, true) }
         } else if d.kind == 31 {                   // for: body AND else are Block structs
             if d.b >= 0 { set(bool, skip, d.b as usize, true) }
@@ -8184,16 +9003,6 @@ pub fn push_sha256_hex(mut sb: String, read data: str) {
 // Increment 1 (this file's current reach): `hello.jtr` — the prelude, one `fn main -> i32`, a
 // `print_str("…")` intrinsic call, a string literal, and `return 0`. Everything else is denylisted.
 
-
-
-
-
-
-
-
-
-
-
 // ---- the fixed C prelude (mirrors Cgen::prelude) ----
 // A FIXED header block: includes + the `jestyr_rt_*` runtime + the JestyrStr/String/Cow/Builder
 // value types + the print/file-IO/argv intrinsics. Transcribed byte-for-byte from `cgen.rs`
@@ -8523,6 +9332,16 @@ fn emit_c_ty(mut sb: String, read p: Parser, read src: str, tyid: i32) {
 fn push_array_len(mut sb: String, read p: Parser, read src: str, len_eid: i32) {
     if len_eid < 0 { string_push(sb, "0")  return }
     let l: ExprData = get(ExprData, p.ex, len_eid as usize)
+    if l.kind != 0 {
+        // The length is part of the emitted C TYPE NAME (`JestyrArr_i32_4`), so it has to
+        // be a number here — the C compiler never sees the expression. Anything that is
+        // not a literal goes through the comptime interpreter, and an unevaluable length
+        // still yields 0 so emission stays total (typeck has already reported it).
+        var lci: Interp = make__ctfe(system_allocator())
+        let n: i64 = eval_usize(lci, p, src, len_eid)
+        if n < 0 { string_push(sb, "0") } else { push_uint__cgen(sb, n) }
+        return
+    }
     emit_int_literal(sb, src[l.start .. l.end])
 }
 
@@ -9064,6 +9883,24 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
     }
     if e.kind == 30 {                                 // Null
         string_push(sb, "NULL")
+        return
+    }
+    if e.kind == 44 {                                 // Comptime: emit the VALUE, never the block
+        // Re-evaluating here rather than reading a table typeck filled is the reference's
+        // choice too: the interpreter is pure and total, so a second run must agree with
+        // the first, and no phase has to carry state. Total, like every cgen path — typeck
+        // has already reported an unevaluable block, so this is never the first news of it.
+        var ci: Interp = make__ctfe(g.alloc)
+        let v: Value = eval(ci, p, src, eid)
+        if ci.failed { string_push(sb, "0") }
+        else if v.tag == 0 { push_i64(sb, v.i) }
+        else if v.tag == 1 {
+            if v.i == 1 { string_push(sb, "true") } else { string_push(sb, "false") }
+        } else if v.tag == 2 {
+            string_push(sb, "JSTR(")
+            push_c_string(sb, str_of(ci, v))
+            string_push(sb, ")")
+        } else { string_push(sb, "0") }
         return
     }
     if e.kind == 3 {                                  // Unary: (OPrhs). op 1=neg 2=not 3=bitnot 4=ref
@@ -11287,7 +12124,7 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // `gfi` holds the collected generic-fn instance records ([fn item, argc, (kind,a,b) targ
 // triples…], variable length — walk with a cursor); `su` is the ACTIVE instance's
 // type-parameter substitution (5-tuples: tparam span + arg triple), read by `emit_su_ty`.
-struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32, dg: i32, gmi: List(i32), tmode: bool }
+struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32, dg: i32, gmi: List(i32), tmode: bool, alloc: Allocator }
 
 // The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
 // (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
@@ -13943,6 +14780,65 @@ fn find_enum_item(read p: Parser, read src: str, ns: usize, ne: usize) -> i32 {
 }
 
 // Decimal digits of a non-negative integer (for `_hi{n}` temp names).
+// A signed decimal — a comptime fold can produce a negative number, which `push_uint`
+// cannot render. (`i64::MIN` has no positive counterpart, so it is spelled out rather
+// than negated.)
+fn push_i64(mut sb: String, v: i64) {
+    if v < 0 {
+        if v == 0 - 9223372036854775807 - 1 {
+            string_push(sb, "(-9223372036854775807LL - 1)")
+            return
+        }
+        string_push(sb, "-")
+        push_uint__cgen(sb, 0 - v)
+        return
+    }
+    push_uint__cgen(sb, v)
+}
+
+// Encode a comptime-produced string as a C string literal. A `Str` written in source is
+// passed through verbatim (its escapes are already C's); a COMPUTED string has no source
+// text, so it must be re-encoded — and two C rules make the naive encoder wrong:
+//   * a hex escape is maximal-munch (`"\x41" "1"` reads as `\x411`), so non-printables
+//     use three-digit octal, which has a fixed width;
+//   * `-std=c11` still honours trigraphs, so a literal `?` is escaped rather than left to
+//     turn `??/` into a backslash.
+// Bytes, not chars: a non-ASCII scalar emits its UTF-8 bytes, which is what `JSTR`'s
+// `sizeof(lit) - 1` counts. Mirrors `c_string_literal`.
+fn push_c_string(mut sb: String, s: str) {
+    string_push(sb, "\"")
+    var i: usize = 0
+    for i < s.len {
+        let b: i32 = s[i] as i32
+        if b == 34 { string_push(sb, "\\\"") }
+        else if b == 92 { string_push(sb, "\\\\") }
+        else if b == 10 { string_push(sb, "\\n") }
+        else if b == 13 { string_push(sb, "\\r") }
+        else if b == 9 { string_push(sb, "\\t") }
+        else if b == 63 { string_push(sb, "\\?") }
+        else if b >= 32 { if b <= 126 { string_push(sb, s[i .. i + 1]) } }
+        if b < 32 { push_octal3(sb, b) }
+        if b > 126 { push_octal3(sb, b) }
+        i = i + 1
+    }
+    string_push(sb, "\"")
+}
+
+// A byte as exactly three octal digits, so the escape cannot swallow a following digit.
+fn push_octal3(mut sb: String, b: i32) {
+    string_push(sb, "\\")
+    push_octal_digit(sb, (b / 64) % 8)
+    push_octal_digit(sb, (b / 8) % 8)
+    push_octal_digit(sb, b % 8)
+}
+
+fn push_octal_digit(mut sb: String, d: i32) {
+    if d == 0 { string_push(sb, "0") } else if d == 1 { string_push(sb, "1") }
+    else if d == 2 { string_push(sb, "2") } else if d == 3 { string_push(sb, "3") }
+    else if d == 4 { string_push(sb, "4") } else if d == 5 { string_push(sb, "5") }
+    else if d == 6 { string_push(sb, "6") } else { string_push(sb, "7") }
+}
+
 fn push_uint__cgen(mut sb: String, v: i64) {
     if v >= 10 { push_uint__cgen(sb, v / 10) }
     let d: i64 = v % 10
@@ -18377,7 +19273,7 @@ fn emit_main_wrapper(mut sb: String, read p: Parser, read src: str) {
 // `"\n"` pushes stand in for the reference's unconditionally-blank sections that are empty for a
 // program with no aggregates (closure_types, method_protos, consts) plus the guarded no-ops.
 fn emit_program(mut sb: String, read p: Parser, read c: Checker, read src: str, read a: Allocator, tmode: bool, read tf: str) {
-    var g: Cg = Cg{ tmp: 0, pp: make__list(i32, a), rf: make__list(i32, a), res_ok: 0 - 2, etags: make__list(i32, a), req: make__list(i32, a), ens: make__list(i32, a), retty: 0 - 1, mi: make__list(i32, a), self_ptr: false, gei: make__list(i32, a), curfn: 0 - 1, mv: make__list(i32, a), ds: make__list(i32, a), dsb: make__list(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: make__list(i32, a), vtf: 0, gfi: make__list(i32, a), su: make__list(i32, a), cls: make__list(i32, a), ccx: make__list(i32, a), cca: make__list(i32, a), caps: make__list(i32, a), gsi: make__list(i32, a), sps: make__list(i32, a), dspawn: false, th: make__list(i32, a), thf: 0, dg: 0 - 1, gmi: make__list(i32, a), tmode: tmode }
+    var g: Cg = Cg{ tmp: 0, pp: make__list(i32, a), rf: make__list(i32, a), res_ok: 0 - 2, etags: make__list(i32, a), req: make__list(i32, a), ens: make__list(i32, a), retty: 0 - 1, mi: make__list(i32, a), self_ptr: false, gei: make__list(i32, a), curfn: 0 - 1, mv: make__list(i32, a), ds: make__list(i32, a), dsb: make__list(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: make__list(i32, a), vtf: 0, gfi: make__list(i32, a), su: make__list(i32, a), cls: make__list(i32, a), ccx: make__list(i32, a), cca: make__list(i32, a), caps: make__list(i32, a), gsi: make__list(i32, a), sps: make__list(i32, a), dspawn: false, th: make__list(i32, a), thf: 0, dg: 0 - 1, gmi: make__list(i32, a), tmode: tmode, alloc: a }
     collect_spawns(g, p, src)                        // spawn sites (gates the pthread prelude)
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     collect_method_instances(g, p, src, c)           // (struct item, method fn item) pairs, first-seen

@@ -41,6 +41,7 @@ import "env"
 import "list"
 import "tokens"
 import "parser"
+import "ctfe"
 
 // The type-checker state: the `Ty` arena (`tys` + child slices `tya`), the per-ExprId
 // resolved-type table `et` (TyId; initialized to Unknown = id 0, overwritten iff `infer`
@@ -236,7 +237,16 @@ fn conv_label(code: i32) -> str {
 fn eval_array_len(read p: parser.Parser, read src: str, eid: i32) -> i32 {
     if eid < 0 { return 0 }
     let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
-    if e.kind != 0 { return 0 }                    // not an Int literal
+    if e.kind != 0 {
+        // Not a literal: a `const`, an arithmetic expression, a `comptime` block, a call
+        // of a pure function — the comptime interpreter answers all of them. An
+        // unevaluable length still yields 0 so lowering stays total, exactly as the
+        // reference does (`unwrap_or(0)`); the diagnostic is the checker's job.
+        var lci: ctfe.Interp = ctfe.make(mem.system_allocator())
+        let n: i64 = ctfe.eval_usize(lci, p, src, eid)
+        if n < 0 { return 0 }
+        return n as i32
+    }
     var i: usize = e.start
     var base: i64 = 10
     if e.end - e.start > 2 {
@@ -1829,6 +1839,19 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
     else if k == 27 { r = t_bool() }               // Bool
     else if k == 29 { r = t_str() }                // Str
     else if k == 30 { r = t_nullptr() }            // Null -> Ptr{Default, Unknown}
+    else if k == 44 {                              // Comptime: the type of the value it FOLDS to
+        // Not the type its body would infer to — the folded literal's. That equivalence
+        // is the contract: cgen emits the literal, so anything else here could disagree
+        // with what is actually compiled. The body is never inferred; the interpreter is
+        // the only checker comptime code has. Mirrors `fold_comptime`.
+        var ci: ctfe.Interp = ctfe.make(c.alloc)
+        let v: ctfe.Value = ctfe.eval(ci, p, src, id)
+        if ci.failed { r = mk_ty(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1) }   // Error
+        else if v.tag == 0 { r = t_i32() }
+        else if v.tag == 1 { r = t_bool() }
+        else if v.tag == 2 { r = t_str() }
+        else { r = mk_ty(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1) }           // produced no value
+    }
     else if k == 2 {                               // Name: scope -> const -> variant ctor -> ?
         let hit: i32 = scope_lookup(c, src, d.start, d.end)
         if hit >= 0 { r = hit }
@@ -2465,7 +2488,10 @@ fn dump_types(read src: str, read c: Checker, read p: parser.Parser, read a: All
         // node, so skip the struct-position ones to compare the same stream.
         if d.kind == 24 {                          // if: the THEN block (els stays - a real expr)
             if d.b >= 0 { list.set(bool, skip, d.b as usize, true) }
-        } else if d.kind == 25 or d.kind == 38 or d.kind == 43 {   // unsafe/concurrent/region body
+        } else if d.kind == 25 or d.kind == 38 or d.kind == 43 or d.kind == 44 {
+            // unsafe/concurrent/region body, and a `comptime` block's body — all four
+            // hold an embedded `Block` struct in the reference, so the node this parser
+            // materializes for them is not part of the compared stream.
             if d.a >= 0 { list.set(bool, skip, d.a as usize, true) }
         } else if d.kind == 31 {                   // for: body AND else are Block structs
             if d.b >= 0 { list.set(bool, skip, d.b as usize, true) }
