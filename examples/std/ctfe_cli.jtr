@@ -1,0 +1,11 @@
+// std/ctfe_cli.jtr — the dump driver for the comptime interpreter.
+//
+// The `_cli` split again (a module with `main` cannot be imported): `ctfe.jtr` is the
+// library, this is the executable a golden test runs to compare the port's folding
+// against the Rust reference's.
+
+import "ctfe"
+
+fn main() -> i32 {
+    return ctfe.run()
+}

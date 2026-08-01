@@ -8777,6 +8777,134 @@ fn main() -> i32 {
         );
     }
 
+    /// **CTFE port mirror (M2) — the interpreter agrees with the reference.**
+    /// `examples/std/ctfe.jtr` is the self-hosted comptime evaluator. This drives both
+    /// implementations over the same fixtures and requires that they agree on *what a
+    /// program folds to* and on *which programs are refused*.
+    ///
+    /// What is compared: for every top-level `const`, the folded value byte-for-byte,
+    /// and the accept/refuse verdict. What is deliberately **not** compared: the error
+    /// message text. The reference interpolates names into its diagnostics
+    /// (``constant `A` is defined in terms of itself``) and the `.jtr` subset has no
+    /// `format!`; the same concession the P-series made for the parse/typeck refusal
+    /// gates, recorded there as "message-TEXT parity is the only follow-up". Both sides
+    /// must still *have* a message, so a silent refusal cannot pass.
+    #[test]
+    fn jestyr_ctfe_folding_matches_reference() {
+        let exe = build_exe("examples/std/ctfe_cli.jtr");
+        let dir = std::env::temp_dir().join("jestyr_ctfe_mirror_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let fixtures: &[(&str, &str)] = &[
+            ("arith", "const A: i64 = 2 + 3 * 4\nconst B: i64 = (2 + 3) * 4\nconst C: i64 = 17 % 5\nconst D: i64 = 0 - 7 / 2\n"),
+            ("bases", "const A: i64 = 0xFF\nconst B: i64 = 0b1010\nconst C: i64 = 1_000_000\n"),
+            ("bitwise", "const A: i64 = 1 << 10\nconst B: i64 = 0xF0 | 0x0F\nconst C: i64 = 0xFF ^ 0x0F\nconst D: i64 = ~0\nconst E: i64 = 255 >> 4\n"),
+            ("consts", "const A: i64 = 4\nconst B: i64 = A * 2\nconst C: i64 = A + B\n"),
+            ("cmp", "const A: bool = 3 < 4\nconst B: bool = 3 >= 4\nconst C: bool = 5 == 5\nconst D: bool = 5 != 5\n"),
+            ("shortcircuit", "fn f() -> i64 { return 0 }\nconst A: bool = false and f() == 0\nconst B: bool = true or f() == 1\n"),
+            ("ifelse", "const A: i64 = if 2 > 1 { 10 } else { 20 }\nconst B: i64 = if 2 < 1 { 10 } else { 20 }\n"),
+            ("calls", "fn double(x: i64) -> i64 { return x * 2 }\nconst A: i64 = double(21)\n"),
+            ("recursion", "fn fact(n: i64) -> i64 {\n    if n <= 1 { return 1 }\n    return n * fact(n - 1)\n}\nconst A: i64 = fact(10)\n"),
+            ("letbind", "fn area(w: i64, h: i64) -> i64 {\n    let a = w * h\n    return a + 1\n}\nconst A: i64 = area(3, 4)\n"),
+            ("strings", "const A: str = \"ab\" + \"cd\"\nconst B: str = \"a\\nb\"\nconst C: bool = \"abc\" < \"abd\"\nconst D: bool = \"x\" == \"x\"\n"),
+            ("chars", "const A: i64 = 'A'\nconst B: i64 = '0'\n"),
+            ("casts", "const A: i64 = 65 as u8 as i64\n"),
+            // comptime blocks — the tier-2 surface the port now parses
+            ("blocks", "const A: i64 = comptime { 2 + 2 }\nconst B: i64 = comptime { let x = 4\n x * 2 }\nconst C: i64 = 1 + comptime { 2 * 3 }\nconst D: i64 = comptime { 1 + comptime { 3 } }\n"),
+            ("blockcalls", "fn sq(x: i64) -> i64 { return x * x }\nconst N: i64 = 5\nconst A: i64 = comptime { sq(N) + 1 }\n"),
+            // refusals: each must be rejected by BOTH, with a reason
+            ("bad_cycle", "const A: i64 = B\nconst B: i64 = A\n"),
+            ("bad_recursion", "fn f(n: i64) -> i64 { return f(n + 1) }\nconst A: i64 = f(0)\n"),
+            ("bad_divzero", "const A: i64 = 1 / 0\n"),
+            ("bad_remzero", "const A: i64 = 1 % 0\n"),
+            ("bad_overflow", "const A: i64 = 9223372036854775807 + 1\n"),
+            ("bad_missing", "const A: i64 = MISSING\n"),
+            ("bad_mixed", "const A: i64 = 1 + true\n"),
+            ("bad_float", "const A: i64 = 1.5 as i64\n"),
+        ];
+
+        for (name, src) in fixtures {
+            let f = dir.join(format!("{name}.jtr"));
+            std::fs::write(&f, src).unwrap();
+            let out = Command::new(&exe).arg(f.to_str().unwrap()).output().unwrap();
+            assert!(out.status.success(), "ctfe_cli failed on {name}");
+            let got: Vec<String> =
+                String::from_utf8_lossy(&out.stdout).lines().map(|s| s.trim_end().to_string()).collect();
+
+            // The reference's view of the same file, rendered in the port's format.
+            let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+            let (ast, _) = crate::parser::Parser::new(src, tokens).parse();
+            let mut want: Vec<String> = Vec::new();
+            let mut want_err: Vec<bool> = Vec::new();
+            for item in &ast.items {
+                let crate::ast::Item::Const(c) = item else { continue };
+                want.push(c.name.name.clone());
+                match crate::comptime::Interp::new(&ast).eval(c.value) {
+                    Ok(crate::comptime::Value::Int(i)) => {
+                        want.push("int".into());
+                        want.push(i.to_string());
+                        want_err.push(false);
+                    }
+                    Ok(crate::comptime::Value::Bool(b)) => {
+                        want.push("bool".into());
+                        want.push(b.to_string());
+                        want_err.push(false);
+                    }
+                    Ok(crate::comptime::Value::Str(s)) => {
+                        want.push("str".into());
+                        // The dump is line-oriented, so the port re-escapes; match it,
+                        // or a value containing a newline would split into two records
+                        // and read as a divergence where the two actually agree.
+                        want.push(
+                            s.replace('\\', "\\\\")
+                                .replace('\n', "\\n")
+                                .replace('\t', "\\t")
+                                .replace('\r', "\\r"),
+                        );
+                        want_err.push(false);
+                    }
+                    Ok(_) => {
+                        want.push("unit".into());
+                        want_err.push(false);
+                    }
+                    Err(_) => {
+                        want.push("error".into());
+                        want_err.push(true);
+                    }
+                }
+            }
+
+            // Walk both records in step. Values must match exactly; an error must be an
+            // error on both sides, and the port must say something about it.
+            let (mut gi, mut wi, mut ei) = (0usize, 0usize, 0usize);
+            while wi < want.len() {
+                assert!(gi < got.len(), "{name}: port output ended early\ngot={got:?}\nwant={want:?}");
+                assert_eq!(got[gi], want[wi], "{name}: const name diverged");
+                let kind = &want[wi + 1];
+                assert_eq!(&got[gi + 1], kind, "{name}: outcome kind diverged for `{}`", want[wi]);
+                if want_err[ei] {
+                    assert!(
+                        got.get(gi + 2).map(|m| !m.is_empty()).unwrap_or(false),
+                        "{name}: the port refused `{}` without a reason",
+                        want[wi]
+                    );
+                    gi += 3; // name, "error", message
+                    wi += 2; // name, "error"
+                } else if kind == "unit" {
+                    gi += 2;
+                    wi += 2;
+                } else {
+                    assert_eq!(got[gi + 2], want[wi + 2], "{name}: value diverged for `{}`", want[wi]);
+                    gi += 3;
+                    wi += 3;
+                }
+                ei += 1;
+            }
+            assert_eq!(gi, got.len(), "{name}: the port emitted trailing output: {:?}", &got[gi..]);
+        }
+    }
+
     /// **Doc-comment trivia in-language.** `tokens.collect_docs` recovers exactly the
     /// reference lexer's `tokenize_with_docs` third result — kind, block-ness, the whole
     /// comment span, and the text span — over the whole corpus. It finds comments by
