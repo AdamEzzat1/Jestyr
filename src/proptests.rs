@@ -8362,6 +8362,112 @@ fn main() -> i32 {
         assert!(err.contains("targets"), "diagnostic should name `targets`: {err}");
     }
 
+    /// **CTFE (workstream G, increment 8) — a build plan as DATA, end-to-end.** Tier 4
+    /// described a build by answering questions about an index (`source(i)`,
+    /// `output(i)`), because before a comptime `for` a target *list* still had to be
+    /// spelled out entry by entry and so bought nothing.
+    ///
+    /// With tier 7 the list can be **built**, so a description of many targets is not
+    /// many branches. Both forms stay supported and `const targets` selects between
+    /// them by its type — which this pins by planning the same build both ways and
+    /// requiring byte-identical output.
+    #[test]
+    fn a_build_plan_may_be_a_computed_list() {
+        let dir = std::env::temp_dir().join("jestyr_ctfe_planlist_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (f, body) in [
+            ("greet.jtr", "fn main() -> i32 { print_str(\"greetings\")\n return 0 }\n"),
+            ("count.jtr", "fn main() -> i32 { print_int(7)\n return 0 }\n"),
+        ] {
+            std::fs::write(dir.join(f), body).unwrap();
+        }
+        // The plan is a list of `[source, output]` pairs, built by a loop over the one
+        // place a target is named.
+        std::fs::write(
+            dir.join("build.jestyr"),
+            "const names: [2]str = [\"greet\", \"count\"]\n\
+             const targets = comptime {\n\
+             \x20   var t = [[\"\", \"\"]; 2]\n\
+             \x20   for i in 0..2 {\n\
+             \x20       t[i][0] = names[i] + \".jtr\"\n\
+             \x20       t[i][1] = \"built_\" + names[i]\n\
+             \x20   }\n\
+             \x20   t\n\
+             }\n",
+        )
+        .unwrap();
+        // The same build, written the tier-4 way.
+        std::fs::write(
+            dir.join("indexed.jestyr"),
+            "const targets: i64 = 2\n\
+             fn stem(i: i64) -> str {\n\
+             \x20   if i == 0 { return \"greet\" }\n\
+             \x20   return \"count\"\n\
+             }\n\
+             fn source(i: i64) -> str { return stem(i) + \".jtr\" }\n\
+             fn output(i: i64) -> str { return \"built_\" + stem(i) }\n",
+        )
+        .unwrap();
+
+        let jestyrc = {
+            let t = std::env::current_exe().unwrap();
+            let profile_dir = t.parent().unwrap().parent().unwrap();
+            let p = profile_dir.join(format!("jestyrc{}", std::env::consts::EXE_SUFFIX));
+            assert!(p.exists(), "jestyrc binary not found at {}", p.display());
+            p
+        };
+        let plan_of = |script: &str| {
+            let out = Command::new(&jestyrc)
+                .args(["plan", script])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "plan {script} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().replace("\r\n", "\n")
+        };
+
+        let plan = plan_of("build.jestyr");
+        assert_eq!(
+            plan,
+            "build-plan v1\ntargets 2\ntarget greet.jtr -> built_greet\ntarget count.jtr -> built_count\n"
+        );
+        // The two forms are two ways of writing one build, so they must plan identically.
+        assert_eq!(plan, plan_of("indexed.jestyr"), "the two plan forms disagreed");
+        for _ in 0..3 {
+            assert_eq!(plan_of("build.jestyr"), plan, "a computed plan must be reproducible");
+        }
+
+        // And it builds.
+        let out = Command::new(&jestyrc)
+            .args(["plan", "build.jestyr", "--build"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "build failed: {}", String::from_utf8_lossy(&out.stderr));
+        for (name, want) in [("built_greet", "greetings\n"), ("built_count", "7\n")] {
+            let exe = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            assert!(exe.exists(), "{name} was not produced");
+            let r = Command::new(&exe).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&r.stdout).replace("\r\n", "\n"), want);
+        }
+
+        // A malformed entry is refused by index, in the script's own vocabulary.
+        std::fs::write(dir.join("bad.jestyr"), "const targets = comptime { [[\"a\"]] }\n").unwrap();
+        let out = Command::new(&jestyrc)
+            .args(["plan", "bad.jestyr"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "a malformed list must fail");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("targets[0]"), "diagnostic should name the entry: {err}");
+    }
+
     /// **CTFE (workstream G, increment 5) — bounded artifact generation end-to-end.**
     /// The tier-5 foundation: a build script *computes* the bytes of a generated file,
     /// the plan records the artifact by its **SHA-256** rather than its content, and

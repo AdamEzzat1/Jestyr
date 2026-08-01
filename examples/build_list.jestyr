@@ -1,0 +1,34 @@
+// examples/build_list.jestyr — a build plan written as DATA (CTFE tiers 4 + 7).
+//
+// Run from the repository root:
+//     jestyrc plan examples/build_list.jestyr            # print the plan
+//     jestyrc plan examples/build_list.jestyr --build    # and compile each target
+//
+// Like every build script this file is *evaluated, never run*: nothing here is
+// compiled, and nothing here can perform an effect — no clock, no environment, no
+// file access. A non-deterministic build script cannot be written, because the
+// evaluator has no arm for one.
+//
+// The difference from examples/build.jestyr is the SHAPE. That file answers questions
+// about an index (`source(i)`, `output(i)`); this one hands over the target list
+// itself. Both are supported and `const targets` picks between them by its type — an
+// integer is a count, a list is the targets.
+//
+// The list form only became worth having with a comptime `for` (tier 7). Without one,
+// a list still had to be spelled out entry by entry, which bought nothing over the
+// index form. With one, a description of twenty targets is not twenty branches.
+
+/// The one place a target is named. Adding a target means adding a name here.
+const names: [3]str = ["hello", "shapes", "array_lit"]
+
+/// The plan, built by a loop. A target is a two-element `[source, output]` list —
+/// the comptime value domain has no struct, so a pair is a list of two. (Two
+/// parallel lists would read better and would be worse: they can disagree in length.)
+const targets = comptime {
+    var t = [["", ""]; 3]
+    for i in 0..3 {
+        t[i][0] = "examples/" + names[i] + ".jtr"
+        t[i][1] = "jestyr_demo_" + names[i]
+    }
+    t
+}

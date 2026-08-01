@@ -20,8 +20,36 @@
 //! clock or the environment, and reproducibility would become a convention rather
 //! than a property.
 //!
-//! So the plan is a *pure function of an index* instead. The script declares how many
-//! targets there are and answers two questions about each:
+//! So the plan is **data the evaluator produced**, not a sequence of calls it made.
+//! There are two ways to write it, and `const targets` selects between them by its
+//! *type*.
+//!
+//! ## The list form (preferred)
+//! `const targets` is a list of `[source, output]` pairs. With a comptime `for`
+//! (tier 7) the list can be *computed*, so a build description scales without
+//! repeating itself:
+//!
+//! ```jestyr
+//! const names: [3]str = ["parser", "typeck", "cgen"]
+//!
+//! const targets = comptime {
+//!     var t = [["", ""]; 3]
+//!     for i in 0..3 {
+//!         t[i][0] = "src/" + names[i] + ".jtr"
+//!         t[i][1] = names[i]
+//!     }
+//!     t
+//! }
+//! ```
+//!
+//! A pair is a two-element list because the comptime value domain has no struct — the
+//! honest representation rather than a chosen one. Two parallel lists (`sources` and
+//! `outputs`) would read better and would be worse: they can disagree in length.
+//!
+//! ## The index form (still supported)
+//! Before tier 7 there was no way to *build* a list, so spelling one out bought
+//! nothing over answering questions about an index — and the index form is what tier 4
+//! shipped:
 //!
 //! ```jestyr
 //! const targets: i64 = 2
@@ -37,11 +65,15 @@
 //! }
 //! ```
 //!
-//! This costs the evaluator no new powers — no effects, no aggregate values, no
-//! comptime `for` — and it keeps every property the ladder promises: the same script
-//! always yields the same plan, and the plan is a value the compiler *derived*, so it
-//! can be attested like anything else. (Once tier 3 grows aggregate comptime values,
-//! a target list becomes expressible directly; the driver contract need not change.)
+//! It stays supported, and stays the right shape when a target's fields are genuinely
+//! computed per index rather than listed. Neither form costs the evaluator a new
+//! power: both keep the properties the ladder promises — the same script always yields
+//! the same plan, and the plan is a value the compiler *derived*, so it can be
+//! attested like anything else.
+//!
+//! Generated artifacts (tier 5) take the same two forms: `const artifacts` is either a
+//! list of `[path, text]` pairs or an integer count paired with `artifact_path(i)` /
+//! `artifact_text(i)`.
 //!
 //! ## Determinism
 //! The script is evaluated by the same total interpreter as every other comptime
@@ -147,37 +179,63 @@ const MAX_ARTIFACT_BYTES: usize = 4 << 20;
 pub fn evaluate(ast: &Ast) -> Result<Plan, String> {
     let mut interp = Interp::new(ast);
 
-    let n = match interp.eval_const(COUNT_CONST) {
-        Ok(Value::Int(n)) => n,
+    // `const targets` decides the script's *form* by its type: an integer is a count
+    // (the index form), a list is the targets themselves. See the module docs.
+    let targets = match interp.eval_const(COUNT_CONST) {
+        Ok(Value::List(items)) => pairs(&items, COUNT_CONST, "target")?
+            .into_iter()
+            .map(|(source, output)| Target { source, output })
+            .collect(),
+        Ok(Value::Int(n)) => {
+            if n < 0 {
+                return Err(format!("`const {COUNT_CONST}` is negative ({n})"));
+            }
+            if n > MAX_TARGETS {
+                return Err(format!("`const {COUNT_CONST}` is {n}; the limit is {MAX_TARGETS}"));
+            }
+            let mut targets = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                let source = string_at(&mut interp, SOURCE_FN, i)?;
+                let output = string_at(&mut interp, OUTPUT_FN, i)?;
+                if source.is_empty() {
+                    return Err(format!("`{SOURCE_FN}({i})` is empty"));
+                }
+                if output.is_empty() {
+                    return Err(format!("`{OUTPUT_FN}({i})` is empty"));
+                }
+                targets.push(Target { source, output });
+            }
+            targets
+        }
         Ok(other) => {
-            return Err(format!("`const {COUNT_CONST}` must be an integer, found {}", other.type_name()))
+            return Err(format!(
+                "`const {COUNT_CONST}` must be a list of targets or an integer count, found {}",
+                other.type_name()
+            ))
         }
         Err(e) => return Err(format!("`const {COUNT_CONST}`: {}", e.message)),
     };
-    if n < 0 {
-        return Err(format!("`const {COUNT_CONST}` is negative ({n})"));
-    }
-    if n > MAX_TARGETS {
-        return Err(format!("`const {COUNT_CONST}` is {n}; the limit is {MAX_TARGETS}"));
-    }
-
-    let mut targets = Vec::with_capacity(n as usize);
-    for i in 0..n {
-        let source = string_at(&mut interp, SOURCE_FN, i)?;
-        let output = string_at(&mut interp, OUTPUT_FN, i)?;
-        if source.is_empty() {
-            return Err(format!("`{SOURCE_FN}({i})` is empty"));
-        }
-        if output.is_empty() {
-            return Err(format!("`{OUTPUT_FN}({i})` is empty"));
-        }
-        targets.push(Target { source, output });
-    }
 
     // Generated artifacts are OPTIONAL: a script with no `const artifacts` declares
     // none, so every build description written before tier 5 keeps working unchanged.
     let artifacts = match interp.eval_const(ARTIFACT_COUNT_CONST) {
         Err(_) => Vec::new(),
+        Ok(Value::List(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, (path, content)) in
+                pairs(&items, ARTIFACT_COUNT_CONST, "artifact")?.into_iter().enumerate()
+            {
+                check_artifact_path(&path, i as i64)?;
+                if content.len() > MAX_ARTIFACT_BYTES {
+                    return Err(format!(
+                        "`{ARTIFACT_COUNT_CONST}[{i}]` produced {} bytes; the limit is {MAX_ARTIFACT_BYTES}",
+                        content.len()
+                    ));
+                }
+                out.push(Artifact { path, content });
+            }
+            out
+        }
         Ok(Value::Int(n)) => {
             if n < 0 {
                 return Err(format!("`const {ARTIFACT_COUNT_CONST}` is negative ({n})"));
@@ -202,7 +260,8 @@ pub fn evaluate(ast: &Ast) -> Result<Plan, String> {
         }
         Ok(other) => {
             return Err(format!(
-                "`const {ARTIFACT_COUNT_CONST}` must be an integer, found {}",
+                "`const {ARTIFACT_COUNT_CONST}` must be a list of artifacts or an integer count, \
+                 found {}",
                 other.type_name()
             ))
         }
@@ -226,6 +285,51 @@ fn check_artifact_path(path: &str, i: i64) -> Result<(), String> {
         return Err(format!("`{ARTIFACT_PATH_FN}({i})` escapes the project (`{path}`)"));
     }
     Ok(())
+}
+
+/// Read a list-valued plan entry: a list of `[a, b]` string pairs.
+///
+/// A pair is a two-element list because the comptime value domain has no struct —
+/// so this is the honest representation rather than a chosen one. Two parallel lists
+/// would read better and would be wrong: they can disagree in length, and a pair
+/// cannot.
+///
+/// Every diagnostic names the entry by index and says what was found, so a build-file
+/// author never has to read an evaluator error to understand the mistake.
+fn pairs(items: &[Value], konst: &str, what: &str) -> Result<Vec<(String, String)>, String> {
+    if items.len() as i64 > MAX_TARGETS {
+        return Err(format!("`const {konst}` has {} entries; the limit is {MAX_TARGETS}", items.len()));
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for (i, it) in items.iter().enumerate() {
+        let Value::List(pair) = it else {
+            return Err(format!(
+                "`{konst}[{i}]` must be a two-element {what} `[a, b]`, found {}",
+                it.type_name()
+            ));
+        };
+        if pair.len() != 2 {
+            return Err(format!(
+                "`{konst}[{i}]` must be a two-element {what} `[a, b]`, found {} element(s)",
+                pair.len()
+            ));
+        }
+        let mut got = Vec::with_capacity(2);
+        for (k, v) in pair.iter().enumerate() {
+            match v {
+                Value::Str(s) if !s.is_empty() => got.push(s.clone()),
+                Value::Str(_) => return Err(format!("`{konst}[{i}][{k}]` is empty")),
+                other => {
+                    return Err(format!(
+                        "`{konst}[{i}][{k}]` must be a string, found {}",
+                        other.type_name()
+                    ))
+                }
+            }
+        }
+        out.push((got[0].clone(), got[1].clone()));
+    }
+    Ok(out)
 }
 
 fn string_at(interp: &mut Interp, f: &str, i: i64) -> Result<String, String> {
@@ -296,6 +400,89 @@ fn output(i: i64) -> str { return \"out_\" + stem(i) }
         let p = plan_of(src).expect("should evaluate");
         assert_eq!(p.targets.len(), 3);
         assert_eq!(p.targets[2], Target { source: "examples/c.jtr".into(), output: "out_c".into() });
+    }
+
+    // --- the list form (tier 7 made it worth having) ---
+
+    /// A plan written as data rather than as answers about an index. Before a comptime
+    /// `for` existed this bought nothing — the list still had to be spelled out — so
+    /// tier 4 shipped the index form alone.
+    #[test]
+    fn a_plan_may_be_a_list_of_pairs() {
+        let src = "\
+const targets = comptime {
+    [[\"examples/hello.jtr\", \"hello\"], [\"examples/shapes.jtr\", \"shapes\"]]
+}
+";
+        let p = plan_of(src).expect("should evaluate");
+        assert_eq!(
+            p.targets,
+            vec![
+                Target { source: "examples/hello.jtr".into(), output: "hello".into() },
+                Target { source: "examples/shapes.jtr".into(), output: "shapes".into() },
+            ]
+        );
+        // Both forms describe the same build, so both render the same plan.
+        assert_eq!(p.render(), plan_of(TWO).expect("should evaluate").render());
+    }
+
+    /// The point of the list form: a `for` **builds** the plan, so a description of
+    /// twenty targets is not twenty lines of `if i == n`.
+    #[test]
+    fn a_loop_can_build_the_target_list() {
+        let src = "\
+const names: [3]str = [\"parser\", \"typeck\", \"cgen\"]
+const targets = comptime {
+    var t = [[\"\", \"\"]; 3]
+    for i in 0..3 {
+        t[i][0] = \"src/\" + names[i] + \".jtr\"
+        t[i][1] = names[i]
+    }
+    t
+}
+";
+        let p = plan_of(src).expect("should evaluate");
+        assert_eq!(p.targets.len(), 3);
+        assert_eq!(p.targets[0], Target { source: "src/parser.jtr".into(), output: "parser".into() });
+        assert_eq!(p.targets[2], Target { source: "src/cgen.jtr".into(), output: "cgen".into() });
+    }
+
+    /// Artifacts (tier 5) take the list form too, and keep every tier-5 rule — the
+    /// path is still confined to the tree, and the plan still records a hash.
+    #[test]
+    fn artifacts_may_be_a_list_of_pairs() {
+        let src = "\
+const targets = comptime { [[\"a.jtr\", \"a\"]] }
+const artifacts = comptime {
+    var t = [[\"\", \"\"]; 2]
+    for i in 0..2 {
+        t[i][0] = \"gen/table\" + \"\" + @field_name(Marker, i) + \".txt\"
+        t[i][1] = \"row \" + @field_name(Marker, i)
+    }
+    t
+}
+struct Marker { a: i32, b: i32 }
+";
+        let p = plan_of(src).expect("should evaluate");
+        assert_eq!(p.artifacts.len(), 2);
+        assert_eq!(p.artifacts[0].path, "gen/tablea.txt");
+        assert_eq!(p.artifacts[1].content, "row b");
+        assert!(p.render().contains("artifact gen/tablea.txt 5 sha256 "));
+    }
+
+    /// A malformed list is refused entry by entry, in the script's own vocabulary.
+    #[test]
+    fn a_malformed_target_list_is_refused_with_a_reason() {
+        let cases: [(&str, &str); 4] = [
+            ("entry is not a pair", "const targets = comptime { [\"just-a-string\"] }\n"),
+            ("wrong arity", "const targets = comptime { [[\"a\", \"b\", \"c\"]] }\n"),
+            ("non-string element", "const targets = comptime { [[\"a\", 7]] }\n"),
+            ("empty element", "const targets = comptime { [[\"a\", \"\"]] }\n"),
+        ];
+        for (label, src) in cases {
+            let e = plan_of(src).expect_err(label);
+            assert!(e.contains("targets["), "{label}: should name the entry, got {e}");
+        }
     }
 
     #[test]

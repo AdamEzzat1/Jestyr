@@ -28,6 +28,7 @@
 
 | Increment | Commit | What |
 |---|---|---|
+| **G8** plan-as-list | *(this run)* | `const targets` now selects the build script's form **by its type**: an integer is a count (the tier-4 index form), a list is the targets themselves — `[[source, output], …]`, buildable by a comptime `for`. A pair is a two-element list because the value domain has no struct; two parallel lists would read better and can disagree in length. Artifacts take the same two forms. Fully backwards compatible, and the two forms render byte-identical plans (pinned by planning one build both ways). `examples/build_list.jestyr` is the worked example. |
 | **G7** comptime `for` + mutation | *(this run)* | **Also cleared tier 3's field-iteration blocker** — see below. Loops and `var` assignment run at compile time, so a table's **shape** is computed, not spelled out: a 256-entry CRC-32 table is built by `for i in 0..256 { t[i] = crc_entry(i) }` and emitted as a plain static (values verified against an independent implementation, not just self-consistency). All three loop heads, ranges (inclusive/`step`/descending), list iteration, element+index, `break`/`continue` incl. **labelled**, and `for … else`. Assignment reaches locals and elements at any depth; compound assignment uses the same **checked** arithmetic, so `+=` overflows into a diagnostic. Fuel per **iteration** — the trap here is that an empty body evaluates nothing, so nothing else charges the budget at all. |
 | **G6** aggregate values | *(this run)* | `Value::List` — CTFE goes from "compute a number" to "compute a **table**". Array literals/repeats evaluate; `[i]` and `.len` read. A `const` initialised by a comptime block yielding a list becomes an ordinary **static** (`static const JestyrArr_i64_8 jestyr_FIB = { { 0, 1, 1, 2, 3, 5, 8, 13 } };`) — the C compiler gets the answers, not the recursion. Emission detail with teeth: a static **must** be a brace initializer, since it cannot be initialised by the GNU statement-expression an expression-position aggregate uses; both paths exist and the test asserts no `({` reaches a static. Fuel is spent **per element**, so `[0; 10_000_000_000]` (and the nested `[[0; 100000]; 100000]`, where the *product* blows up) is a diagnostic in microseconds. |
 | **G5** bounded generation | *(this run)* | `jestyrc plan … --emit`. A build script **computes the bytes of a file**; the plan records it by SHA-256, and the driver writes it only on explicit `--emit`. The evaluator gained no new power — it computed a string — so generation is a pure function whose result the *user* places, never an effect a script performs. Reproducible, attestable (hash in the plan), and bounded literally: size-capped, and an absolute or `..` path is **refused, not normalised**. A generated file can be named as a build target, so a program can be computed and compiled in one invocation. |
@@ -76,6 +77,15 @@ when the reference re-sorts its output by content (§2, O1).
    parameter, not a constant", check whether some *other* binding form is already
    constant before building a new function kind. Comptime-only functions remain a
    reasonable convenience, but they block nothing now.
+2b. **A design decision can be *unmade* by a later tier, and the docs must say so.**
+   Tier 4 chose index functions (`source(i)`/`output(i)`) over a target list on the
+   explicit ground that a list "costs the evaluator no new powers — no effects, no
+   aggregate values, no comptime `for`". Two of those three arrived (G6, G7), so the
+   ground was gone and the module docs were still asserting it. G8 added the list form
+   *beside* the index form — `const targets` dispatches on its value's type, which made
+   the change free of any migration — and rewrote the rationale rather than leaving a
+   stale one. Worth a sweep after every tier: the ladder's earlier rungs contain
+   "we can't do X yet, so Y" reasoning that expires silently.
 3. **`size_of`/`align_of`/`offset_of` are C-deferred**, lowering to `sizeof`/
    `_Alignof`/`offsetof`. This compiler never learns the numbers, so exposing them as
    comptime *values* genuinely does require **L**. That is the real L dependency; the
@@ -385,7 +395,7 @@ generation~~ (`bce5456`) → ~~G6 aggregate values / comptime tables~~ → ~~G7 
 `for` + mutation~~ — **the CTFE tier ladder (0–7) is done on the reference side**, and
 documented in `docs/ctfe-tiers.md`.
 
-**Next:** the **G2/G3/G6/G7 port mirrors** → L layout 1–3 (opt-in, byte-identity
+**Next:** the **G2/G3/G6/G7/G8 port mirrors** → L layout 1–3 (opt-in, byte-identity
 preserved) → Q SIMD. `@size_of` as a comptime *value* comes after L.
 Comptime-only functions are now a *convenience*, not a blocker (finding 2) — take them
 whenever a caller wants a named comptime helper, not to unblock anything.

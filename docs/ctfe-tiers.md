@@ -228,12 +228,7 @@ effectful comptime evaluator is exactly what this ladder exists to prevent. Allo
 it would mean a build script could read the clock or the environment, and
 reproducibility would become a convention rather than a property.
 
-So the plan is a **pure function of an index** instead: the script says how many
-targets there are and answers two questions about each. This costs the evaluator no
-new powers — no effects, no aggregate values, no comptime `for` — and keeps every
-guarantee the ladder makes. Note that `source`/`output` are *computed*, not a literal
-table; deriving them with the full comptime language is the whole point of describing
-a build in Jestyr rather than in a data format.
+So the plan is **data the evaluator produced**, not a sequence of calls it made.
 
 Determinism is structural, not policed: a script that tries to be non-deterministic
 cannot be *written*, because the interpreter has no arm for a clock or an environment
@@ -241,9 +236,41 @@ read. Totality reaches here too — a non-terminating script is a diagnostic, no
 build — and a target count is bounded, so a typo'd `const targets: i64 = 100000000`
 is an error rather than an apparent hang.
 
-**Next slice:** once the evaluator grows aggregate comptime values, a target list
-becomes expressible directly (`const targets = [Target{…}, …]`). The driver contract
-does not need to change for that.
+### Two forms, selected by type
+
+`const targets` decides the script's shape by *its own type*: an integer is a count
+(answer questions about an index), a list is the targets themselves.
+
+The **index form** above is what tier 4 shipped, and it shipped alone for a reason —
+before a comptime `for` there was no way to *build* a list, so writing one out entry by
+entry bought nothing over answering questions about an index.
+
+Tier 7 changed that, so the **list form** is now generally the one to reach for
+(`examples/build_list.jestyr`):
+
+```jestyr
+const names: [3]str = ["hello", "shapes", "array_lit"]
+
+const targets = comptime {
+    var t = [["", ""]; 3]
+    for i in 0..3 {
+        t[i][0] = "examples/" + names[i] + ".jtr"
+        t[i][1] = "jestyr_demo_" + names[i]
+    }
+    t
+}
+```
+
+A target is a two-element `[source, output]` list because the comptime value domain has
+no struct — the honest representation rather than a chosen one. (Two parallel lists,
+`sources` and `outputs`, would read better and would be worse: they can disagree in
+length. A pair cannot.)
+
+The index form stays supported, and stays the better shape when a target's fields are
+genuinely *derived* per index rather than listed. Both describe the same builds and
+render byte-identical plans. Artifacts (tier 5) take the same two forms: `const
+artifacts` is either a list of `[path, text]` pairs or an integer count paired with
+`artifact_path(i)` / `artifact_text(i)`.
 
 ## Tier 5 — bounded artifact generation
 
