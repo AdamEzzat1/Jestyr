@@ -30,13 +30,12 @@ record Pair { a: u8, b: u64 }
 // never *constructed* gets no `JestyrArr_i64_4` typedef emitted, because the array
 // typedef collector keys off values rather than declarations. A pre-existing cgen gap,
 // unrelated to reflection — reflection reads the declaration and never needs the C type.)
-// (A SLICE-typed field is deliberately absent too, for a different reason: the port's
-// definition sorter emits `JestyrSlice_i32` *after* the struct that uses it, while the
-// reference emits it before. A pre-existing ordering divergence this file would be the
-// first to trigger — also unrelated to reflection, which reads the declaration.
-// Slice/array/pointer rendering is covered at the interpreter level by the `reflect_tys`
-// fixture in `jestyr_ctfe_folding_matches_reference`.)
-struct Shapes { p: *mut u8 }
+// A slice-typed field is present on purpose: it also pins the definition sorter on both
+// sides. `Shapes` embeds `JestyrSlice_i32` BY VALUE, so the typedef must be emitted
+// before the struct even though the slice-typedef phase runs after the aggregate phase.
+// Nothing here ever constructs a slice, so the field DECLARATION is the only thing that
+// puts that dependency edge there.
+struct Shapes { xs: []i32, p: *mut u8 }
 
 const WHICH: i64 = 1
 
@@ -62,6 +61,7 @@ fn main() -> i32 {
 
     // A compound type renders in Jestyr surface syntax.
     print_str(@field_type(Shapes, 0))
+    print_str(@field_type(Shapes, 1))
 
 
     // Reflection composes with the rest of comptime: a query is just a value.

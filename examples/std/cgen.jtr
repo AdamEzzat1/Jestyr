@@ -7859,7 +7859,10 @@ fn emit_one_slice_def(mut sb: String, read p: parser.Parser, read src: str, read
 }
 
 // One slice typedef for element-name `nm` (a prim or a declared type; anything else — e.g. a
-// generic `T` — is an opaque template, skipped like the reference's `is_concrete`).
+// generic `T` — is an opaque template, skipped like the reference's `is_concrete`). Emitted as a
+// NAMED segment: this phase runs AFTER the aggregate phase, so a struct with a slice-typed field
+// (which embeds `JestyrSlice_<nm>` by value) can only be reordered behind it if the typedef is a
+// segment the sorter can see — glue text is pinned and invisible to `dc_find_dep`.
 fn emit_one_slice_name(mut sb: String, read src: str, read c: typeck.Checker, read nm: str, mut seen: String, mut d: Dc) -> bool {
     let pc: str = c_prim(nm)
     if str_eq(pc, "") {
@@ -7872,11 +7875,17 @@ fn emit_one_slice_name(mut sb: String, read src: str, read c: typeck.Checker, re
     if contains(string_view(seen), string_view(probe)) { string_free(probe)  return false }
     string_push(seen, string_view(probe))
     string_free(probe)
+    let ns: i32 = dc_len(d)                           // segment name: JestyrSlice_<nm>. A slice is
+    string_push(d.nb, "JestyrSlice_")                 // `{ E* ptr; len }` — it embeds E only through
+    string_push(d.nb, nm)                             // a POINTER, so it has NO by-value dep (an
+    let ne: i32 = dc_len(d)                           // empty dep region: ds == de == ne).
+    dc_begin(d, sb_len(sb), ns, ne, ne, ne)
     string_push(sb, "typedef struct { ")
     if str_eq(pc, "") { string_push(sb, "Jestyr_")  string_push(sb, nm) } else { string_push(sb, pc) }
     string_push(sb, "* ptr; size_t len; } JestyrSlice_")
     string_push(sb, nm)
     string_push(sb, ";\n")
+    dc_end(d, sb_len(sb))
     return true
 }
 
@@ -8002,7 +8011,9 @@ fn push_array_typedef(mut sb: String, read key: str, mut seen: String, read p: p
     return ok
 }
 
-// The dedup + emit core: `key` is the instance's mangle (`<elem>_<len>`).
+// The dedup + emit core: `key` is the instance's mangle (`<elem>_<len>`). A NAMED segment, opened
+// AND closed — an unclosed `dc_begin` is silently absorbed as glue by the next one's `dc_glue`,
+// which loses the name without losing any text (a divergence, not a corruption).
 fn push_array_typedef_raw(mut sb: String, read key: str, mut seen: String, read ecty: str, read len: str, mut d: Dc) -> bool {
     var probe: String = string_new()
     string_push(probe, "|")
@@ -8024,10 +8035,12 @@ fn push_array_typedef_raw(mut sb: String, read key: str, mut seen: String, read 
     string_push(sb, "]; } JestyrArr_")
     string_push(sb, key)
     string_push(sb, ";\n")
+    dc_end(d, sb_len(sb))
     return true
 }
 
-// One `typedef struct { <E>* ptr; uint64_t gen; } JestyrRef_<m>;`, deduped by elem mangle.
+// One `typedef struct { <E>* ptr; uint64_t gen; } JestyrRef_<m>;`, deduped by elem mangle, as a
+// NAMED segment so a struct embedding it by value can depend on it (`genref_struct_defs`).
 fn push_genref_typedef(mut sb: String, mut seen: String, read m: str, read ecty: str, mut d: Dc) -> bool {
     var probe: String = string_new()
     string_push(probe, "|")
@@ -8036,11 +8049,17 @@ fn push_genref_typedef(mut sb: String, mut seen: String, read m: str, read ecty:
     if contains(string_view(seen), string_view(probe)) { string_free(probe)  return false }
     string_push(seen, string_view(probe))
     string_free(probe)
+    let ns: i32 = dc_len(d)                           // segment name: JestyrRef_<m>; like a slice it
+    string_push(d.nb, "JestyrRef_")                   // holds E through a POINTER — no by-value dep
+    string_push(d.nb, m)
+    let ne: i32 = dc_len(d)
+    dc_begin(d, sb_len(sb), ns, ne, ne, ne)
     string_push(sb, "typedef struct { ")
     string_push(sb, ecty)
     string_push(sb, "* ptr; uint64_t gen; } JestyrRef_")
     string_push(sb, m)
     string_push(sb, ";\n")
+    dc_end(d, sb_len(sb))
     return true
 }
 

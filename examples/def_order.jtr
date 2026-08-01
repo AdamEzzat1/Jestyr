@@ -1,0 +1,43 @@
+// def_order.jtr — a struct is emitted AFTER the typedefs its fields embed by value.
+//
+// C has no forward reference for a by-value member: `struct Holder { JestyrSlice_i32 xs; }`
+// needs `JestyrSlice_i32` to be a COMPLETE type at that point, not merely declared. But the
+// backend emits aggregates in phases — structs and enums first, then the synthesized slice,
+// genref and array typedefs — so the natural emission order is exactly backwards for a
+// struct that holds one of them.
+//
+// The fix is not to reshuffle the phases (their order is load-bearing elsewhere); it is that
+// the whole aggregate window emits into a capture buffer whose segments are re-emitted in
+// dependency order. Each definition registers the names it embeds BY VALUE, and a stable
+// post-order DFS puts dependencies first. A program with no forward dependency comes out in
+// the original order, so the reordering is invisible unless it is needed.
+//
+// The dependency rule is one line of C semantics: a rendered field type containing `*` needs
+// only a forward declaration, so it contributes no edge. That is why `p` below creates no
+// dependency at all, and why the three typedefs themselves depend on nothing — a slice is
+// `{ E* ptr; len }` and a genref is `{ E* ptr; gen }`, both of which reach `E` through a
+// pointer. Only the array typedef embeds its element by value, and so depends on it.
+//
+// Nothing here ever CONSTRUCTS a slice or a genref: the field declarations alone are what put
+// the edges there. That is the case worth pinning, because a backend that discovered its
+// typedef dependencies from values rather than declarations would pass every other test in
+// the corpus and emit C that does not compile for this one.
+struct Holder {
+    xs: []i32,      // by value -> depends on JestyrSlice_i32
+    r: &i64,        // by value -> depends on JestyrRef_i64
+    a: [4]i64,      // by value -> depends on JestyrArr_i64_4
+    p: *mut u8,     // a POINTER -> no dependency; a forward declaration suffices
+}
+
+fn main() -> i32 {
+    // The array typedef is collected from VALUES rather than declarations, so `Holder.a`
+    // alone would not bring `JestyrArr_i64_4` into existence. This literal is what does.
+    let v: [4]i64 = [1, 2, 3, 4]
+    print_int(v[0])
+
+    // Asking C for the size proves the ordering held: `sizeof` on an incomplete member type
+    // is not a warning, it is a compile error — so if the typedefs landed after the struct,
+    // this file would not build at all.
+    print_int(size_of(Holder) as i64)
+    return 0
+}

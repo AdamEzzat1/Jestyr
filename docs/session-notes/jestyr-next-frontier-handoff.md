@@ -28,6 +28,7 @@
 
 | Increment | Commit | What |
 |---|---|---|
+| **M5** def-order dependency registration | *(this run)* | Closes the divergence M4 recorded: the port emitted `JestyrSlice_<T>` **after** the struct whose field embeds it, where the reference emits it before. The sorter was never the bug — the port's slice and genref typedefs never called `dc_begin`/`dc_end` at all, and the array typedef opened a segment it **never closed**, so all three were absorbed as anonymous *glue*. Glue is pinned in place and invisible to `dc_find_dep`, so the struct's (correctly recorded) dep resolved to nothing. Registering all three as named segments — no deps for slice/genref, which reach `E` through a pointer; one dep for the array, which embeds `E` by value — makes the port's segment graph structurally identical to the reference's. `examples/def_order.jtr` is the new corpus file (**136 → 137**) and pins all three at once; the slice half is also pinned in place by restoring the field `comptime_reflect.jtr` had to omit. **Zero emission change on the other 136 files.** The unclosed `dc_begin` is the failure mode worth remembering: it loses the name without losing any text, so it is a silent divergence rather than a crash or a corrupt buffer. |
 | **G8** plan-as-list | *(this run)* | `const targets` now selects the build script's form **by its type**: an integer is a count (the tier-4 index form), a list is the targets themselves — `[[source, output], …]`, buildable by a comptime `for`. A pair is a two-element list because the value domain has no struct; two parallel lists would read better and can disagree in length. Artifacts take the same two forms. Fully backwards compatible, and the two forms render byte-identical plans (pinned by planning one build both ways). `examples/build_list.jestyr` is the worked example. |
 | **L1** layout analysis | *(this run)* | `src/layout.rs` + `jestyrc layout <file>` — size, alignment, field offsets and **padding waste** for every declared type. **Zero emission change**, so no port mirror and no seed refresh; L's later increments are opt-in *because* this one is not. Verified rather than asserted: `layout_matches_c_sizeof` generates a probe `main` printing real `sizeof`/`_Alignof`/`offsetof` and diffs 19 values across the corpus shapes against the model — **the C compiler is the authority, and now says so in CI**. Two honest gaps, both stated in the report as `(incomplete)` rather than guessed: generic/opaque components, and **bit-fields** (implementation-defined in C — the model would otherwise report 4 bytes for a struct that occupies 1). Unblocks `@size_of`/`@align_of`/`@offset_of` as comptime *values*, the gap tier 3 records. |
 | **M3** typeck fold + cgen emission, **first corpus file** | *(this run)* | `examples/comptime_block.jtr` — **corpus 134 → 135**, and the first `.jtr` in the tree to use comptime syntax. typeck.jtr folds a kind-44 node to its value's type (i32/bool/str, Error on failure); cgen.jtr emits the folded literal (`push_i64`, `push_c_string` with the octal + trigraph rules mirrored from `c_string_literal`); `eval_array_len`/`push_array_len` now go through the interpreter instead of accepting only a literal — the port's own G1. Emitted C byte-identical across all 135. **Two shims the next mirror will hit as well** — see findings 8 and 9. |
@@ -146,6 +147,24 @@ when the reference re-sorts its output by content (§2, O1).
    behaviour, silently yielding `[0]T`. Both now route through the interpreter. Anything
    that can appear in a length position has to be folded on both sides.
 
+11. **An unclosed capture segment is a SILENT divergence, not a crash.** `dc_begin`
+   without a matching `dc_end` is absorbed by the next `dc_begin`'s `dc_glue`: the text
+   is still emitted, at the right offset, with correct buffer coverage — it just loses
+   its *name*, becoming anonymous glue that is pinned in place and invisible to
+   `dc_find_dep`. That is how the port's slice/genref/array typedefs sat unregistered
+   for the whole P5 series (M5). When auditing the port's `Dc` sites, check `dc_end`
+   pairing, not just `dc_begin` presence — and remember the reference's `dep_of_cty`
+   rule that makes the deps correct: a rendered type containing `*` contributes no edge,
+   so a slice/genref typedef has no deps while a *field* of that type does.
+
+12. **Still open (a both-sides gap, not a divergence): a struct declaring an ARRAY field
+   whose instance is never constructed gets no `JestyrArr_<T>_<N>` typedef at all**, so
+   the emitted C does not compile. `collect_arrays` keys off values (`info.expr_types`,
+   fn signatures, monomorphized instances) and never walks struct field *declarations* —
+   unlike `collect_slices`, which does scan the type arena. Both implementations agree,
+   so every golden is green; `examples/def_order.jtr` sidesteps it by constructing a
+   `[4]i64`. The fix is a field-declaration walk in `collect_arrays` + its port mirror.
+
 ---
 
 ## 0. Discipline (unchanged — every increment)
@@ -159,7 +178,7 @@ when the reference re-sorts its output by content (§2, O1).
 - **THE TWO-SIDED TAX (new since self-hosting — this is the thing that silently breaks):**
   any change to emitted C, an intrinsic, or a pass now has TWO implementations — the Rust
   reference (`src/*.rs`) and the port (`examples/std/*.jtr`). The full gate is:
-  1. `jestyr_cgen_matches_reference` — **134** corpus files byte-identical;
+  1. `jestyr_cgen_matches_reference` — **137** corpus files byte-identical;
   2. `jestyr_cgen_concat_matches_reference` + `jestyr_cgen_test_mode_matches_reference`;
   3. `selfhost_fixpoint_full` + `jestyr_driver_builds_itself` (the compiler must still
      compile ITSELF and must not trip its own refusal gates);

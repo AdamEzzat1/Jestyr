@@ -26105,6 +26105,11 @@ bool jestyr_emit_one_slice_name(JestyrString* restrict j_sb, JestyrStr j_src, Je
     }
     jestyr_rt_str_push(&(*j_seen), jestyr_rt_str_view(&j_probe));
     jestyr_rt_str_free(&j_probe);
+    int32_t j_ns = jestyr_dc_len(&((*j_d)));
+    jestyr_rt_str_push(&(*j_d).j_nb, JSTR("JestyrSlice_"));
+    jestyr_rt_str_push(&(*j_d).j_nb, j_nm);
+    int32_t j_ne = jestyr_dc_len(&((*j_d)));
+    jestyr_dc_begin(&((*j_d)), jestyr_sb_len(&((*j_sb))), j_ns, j_ne, j_ne, j_ne);
     jestyr_rt_str_push(&(*j_sb), JSTR("typedef struct { "));
     if (jestyr_rt_str_eq(j_pc, JSTR("")))
     {
@@ -26118,6 +26123,7 @@ bool jestyr_emit_one_slice_name(JestyrString* restrict j_sb, JestyrStr j_src, Je
     jestyr_rt_str_push(&(*j_sb), JSTR("* ptr; size_t len; } JestyrSlice_"));
     jestyr_rt_str_push(&(*j_sb), j_nm);
     jestyr_rt_str_push(&(*j_sb), JSTR(";\n"));
+    jestyr_dc_end(&((*j_d)), jestyr_sb_len(&((*j_sb))));
     return true;
 }
 
@@ -26303,6 +26309,7 @@ bool jestyr_push_array_typedef_raw(JestyrString* restrict j_sb, JestyrStr j_key,
     jestyr_rt_str_push(&(*j_sb), JSTR("]; } JestyrArr_"));
     jestyr_rt_str_push(&(*j_sb), j_key);
     jestyr_rt_str_push(&(*j_sb), JSTR(";\n"));
+    jestyr_dc_end(&((*j_d)), jestyr_sb_len(&((*j_sb))));
     return true;
 }
 
@@ -26319,11 +26326,17 @@ bool jestyr_push_genref_typedef(JestyrString* restrict j_sb, JestyrString* restr
     }
     jestyr_rt_str_push(&(*j_seen), jestyr_rt_str_view(&j_probe));
     jestyr_rt_str_free(&j_probe);
+    int32_t j_ns = jestyr_dc_len(&((*j_d)));
+    jestyr_rt_str_push(&(*j_d).j_nb, JSTR("JestyrRef_"));
+    jestyr_rt_str_push(&(*j_d).j_nb, j_m);
+    int32_t j_ne = jestyr_dc_len(&((*j_d)));
+    jestyr_dc_begin(&((*j_d)), jestyr_sb_len(&((*j_sb))), j_ns, j_ne, j_ne, j_ne);
     jestyr_rt_str_push(&(*j_sb), JSTR("typedef struct { "));
     jestyr_rt_str_push(&(*j_sb), j_ecty);
     jestyr_rt_str_push(&(*j_sb), JSTR("* ptr; uint64_t gen; } JestyrRef_"));
     jestyr_rt_str_push(&(*j_sb), j_m);
     jestyr_rt_str_push(&(*j_sb), JSTR(";\n"));
+    jestyr_dc_end(&((*j_d)), jestyr_sb_len(&((*j_sb))));
     return true;
 }
 
