@@ -15,7 +15,7 @@ or mutate the compiler's own state destroys all three at once.
 | 0 | `const` values, enum discriminants | **done** (predates workstream G) |
 | 1 | Pure comptime expressions where the *compiler* needs a number — array lengths, repeat counts | **done** — G1, `ebf8397` |
 | 2 | `comptime { … }` blocks in user syntax | **done on BOTH sides** — G2 (reference); M1–M3 (port: parse, fold, emit). `examples/comptime_block.jtr` is in the corpus and byte-identical across both compilers |
-| 3 | Type reflection over the declared shape | **done in the Rust reference** — G3 (sizes/offsets wait on **L**) |
+| 3 | Type reflection over the declared shape | **done on BOTH sides** — G3 (reference), M4 (port). Sizes/offsets still wait on **L** |
 | 4 | `build.jestyr` — the build described in Jestyr | **done in the Rust reference** — G4 (`jestyrc plan`) |
 | 5 | Bounded, attestable artifact generation | **done in the Rust reference** — G5 (`--emit`) |
 | 6 | Aggregate values — comptime **tables** | **done in the Rust reference** — G6 (`Value::List`) |

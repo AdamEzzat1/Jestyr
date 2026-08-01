@@ -29,6 +29,7 @@
 | Increment | Commit | What |
 |---|---|---|
 | **M5** def-order dependency registration | *(this run)* | Closes the divergence M4 recorded: the port emitted `JestyrSlice_<T>` **after** the struct whose field embeds it, where the reference emits it before. The sorter was never the bug — the port's slice and genref typedefs never called `dc_begin`/`dc_end` at all, and the array typedef opened a segment it **never closed**, so all three were absorbed as anonymous *glue*. Glue is pinned in place and invisible to `dc_find_dep`, so the struct's (correctly recorded) dep resolved to nothing. Registering all three as named segments — no deps for slice/genref, which reach `E` through a pointer; one dep for the array, which embeds `E` by value — makes the port's segment graph structurally identical to the reference's. `examples/def_order.jtr` is the new corpus file (**136 → 137**) and pins all three at once; the slice half is also pinned in place by restoring the field `comptime_reflect.jtr` had to omit. **Zero emission change on the other 136 files.** The unclosed `dc_begin` is the failure mode worth remembering: it loses the name without losing any text, so it is a silent divergence rather than a crash or a corrupt buffer. |
+| **M4** G3 reflection port mirror | `b292426` | **Tier 3 closed on both sides.** `@type_name`/`@field_count`/`@field_name`/`@field_type` in the self-hosted compiler; `examples/comptime_reflect.jtr` is corpus **136**, byte-identical. The structural decision: `@field_type` needs a Jestyr-syntax type renderer, and one already existed in cgen.jtr for attest + doc — so `at_ty` **MOVED DOWN** into `ctfe.jtr` (below cgen, above parser, depends only on the type arena) and cgen keeps a three-line wrapper, leaving its 16 call sites unchanged. ONE renderer, two consumers: a reflected type name cannot drift from the documented or attested one, the same invariant `at_guarantee_phrases` gives the guarantee text. typeck types a query from a STATIC table (`field_count`→i64, the rest→str) and does **not** infer the arguments — the first is a *type*, so inference would report a binding that does not exist; only emission evaluates. **The `@` sigil justified itself in reverse:** the first cgen arm keyed on the Attr node KIND and broke two passing corpus files, because `@address(0x…)` in mmio.jtr is also `@name(…)` and must still emit normally. `@name` is a family; the guard belongs on the intrinsic NAME. Nine reflection fixtures added to the ctfe golden (incl. a primitive, a `record`, methods-are-not-fields, a const index, composition inside `comptime {}`, and three refusals) — all passed first run. |
 | **G8** plan-as-list | *(this run)* | `const targets` now selects the build script's form **by its type**: an integer is a count (the tier-4 index form), a list is the targets themselves — `[[source, output], …]`, buildable by a comptime `for`. A pair is a two-element list because the value domain has no struct; two parallel lists would read better and can disagree in length. Artifacts take the same two forms. Fully backwards compatible, and the two forms render byte-identical plans (pinned by planning one build both ways). `examples/build_list.jestyr` is the worked example. |
 | **L1** layout analysis | *(this run)* | `src/layout.rs` + `jestyrc layout <file>` — size, alignment, field offsets and **padding waste** for every declared type. **Zero emission change**, so no port mirror and no seed refresh; L's later increments are opt-in *because* this one is not. Verified rather than asserted: `layout_matches_c_sizeof` generates a probe `main` printing real `sizeof`/`_Alignof`/`offsetof` and diffs 19 values across the corpus shapes against the model — **the C compiler is the authority, and now says so in CI**. Two honest gaps, both stated in the report as `(incomplete)` rather than guessed: generic/opaque components, and **bit-fields** (implementation-defined in C — the model would otherwise report 4 bytes for a struct that occupies 1). Unblocks `@size_of`/`@align_of`/`@offset_of` as comptime *values*, the gap tier 3 records. |
 | **M3** typeck fold + cgen emission, **first corpus file** | *(this run)* | `examples/comptime_block.jtr` — **corpus 134 → 135**, and the first `.jtr` in the tree to use comptime syntax. typeck.jtr folds a kind-44 node to its value's type (i32/bool/str, Error on failure); cgen.jtr emits the folded literal (`push_i64`, `push_c_string` with the octal + trigraph rules mirrored from `c_string_literal`); `eval_array_len`/`push_array_len` now go through the interpreter instead of accepting only a literal — the port's own G1. Emitted C byte-identical across all 135. **Two shims the next mirror will hit as well** — see findings 8 and 9. |
@@ -454,14 +455,34 @@ generation~~ (`bce5456`) → ~~G6 aggregate values / comptime tables~~ → ~~G7 
 `for` + mutation~~ — **the CTFE tier ladder (0–7) is done on the reference side**, and
 documented in `docs/ctfe-tiers.md`.
 
-**Next:** the **G2/G3/G6/G7/G8 port mirrors** → L layout 1–3 (opt-in, byte-identity
-preserved) → Q SIMD. `@size_of` as a comptime *value* comes after L.
-Comptime-only functions are now a *convenience*, not a blocker (finding 2) — take them
-whenever a caller wants a named comptime helper, not to unblock anything.
+**Port-mirror state: tiers 2 and 3 are CLOSED on both sides** (M1 parse → M2 the
+interpreter → M3 fold + emission → M4 reflection; M5 fixed the def-order divergence M4
+surfaced). `ctfe` is the 12th module of the self-host closure, so the flattened compiler
+and the bootstrap seed both contain a comptime evaluator and the shared type renderer.
 
-`#line` (§1) is an independent, optional increment — take it whenever the port's `build`
-C needs to match the reference's, not before. Keep every increment two-sided-green:
-corpus 135 + concat + test-mode + fixpoint + self-build + refreshed seed.
+**Next, in order:**
+
+1. **The G6/G7 port mirror — the last CTFE piece, and a REPRESENTATION change rather
+   than more of the same.** `ctfe.jtr`'s `Value` is a tag plus one `i64`: Copy,
+   allocator-free, with a string payload that indexes an **immutable** arena — which is
+   exactly what makes copying it safe. Tier 6 (aggregates) and tier 7 (comptime `for` +
+   mutation) need a **mutable list**, which aliases under an arena. Designing that
+   representation *is* the increment; the evaluation logic is already specified by the
+   reference and by the ported scalar core. It lands with the corpus file that exercises
+   it. Nothing is broken meanwhile: the port refuses what it cannot fold rather than
+   guessing, so the two implementations stay refusal-compatible.
+2. **L2 `@layout(auto)`** — the first increment that actually changes emission, now that
+   L1's offsets are *verified against the C compiler* rather than believed. Opt-in per
+   struct, so non-annotated types stay byte-identical; the corpus grows annotated files.
+   Then L3 (niche packing, by-`const*` `read` params).
+3. **Q SIMD → GPU** — deliberately untouched this run; the user has a separate plan.
+
+`@size_of`/`@align_of`/`@offset_of` as comptime *values* come after L (L1 unblocked the
+computation; exposing it is its own slice). Comptime-only functions are a *convenience*,
+not a blocker (finding 2). `#line` (§1) stays an independent, optional increment.
+
+Keep every increment two-sided-green:
+**corpus 137** + concat + test-mode + fixpoint + self-build + refreshed seed.
 
 **The port-mirror trigger — now DEMONSTRATED, not just predicted.** It said: the moment a
 `comptime` `.jtr` lands in `examples/`, the P2/P3 goldens sweep it with no allowlist and
