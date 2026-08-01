@@ -8905,6 +8905,116 @@ fn main() -> i32 {
         }
     }
 
+    /// **Layout (workstream L, increment 1) — the model agrees with the compiler that
+    /// decides.** `src/layout.rs` reproduces the C ABI rules for the types Jestyr emits.
+    /// A layout model that silently disagreed with reality would be worse than none, so
+    /// this does not assert the numbers — it *checks* them: for every corpus type, emit
+    /// the program's real C, append a `main` that prints `sizeof`, `_Alignof` and
+    /// `offsetof` for each struct and its fields, compile it with the locked `CC_FLAGS`,
+    /// and compare what the C compiler reports against what the pass computed.
+    ///
+    /// This is what makes the later opt-in increments (field reordering, niche packing)
+    /// safe to build: they will be reasoning about offsets, and the offsets are now
+    /// known to be true rather than believed.
+    #[test]
+    fn layout_matches_c_sizeof() {
+        let dir = std::env::temp_dir().join("jestyr_layout_oracle");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Files chosen to cover the shapes the model has rules for: plain structs,
+        // records, padding-heavy field orders, arrays, `distinct`, and enums.
+        for file in [
+            "examples/records.jtr",
+            "examples/shapes.jtr",
+            "examples/layout.jtr",
+            "examples/distinct.jtr",
+            "examples/arrays.jtr",
+            "examples/option.jtr",
+            "examples/mmio.jtr",
+            "examples/bitfields.jtr",
+        ] {
+            let src = std::fs::read_to_string(file).unwrap();
+            let (tokens, _) = crate::lexer::Lexer::new(&src).tokenize();
+            let (ast, _) = crate::parser::Parser::new(&src, tokens).parse();
+            let (info, _) = crate::typeck::check(&ast);
+            let layouts = crate::layout::compute(&ast, &info);
+            let (c_src, _) = crate::cgen::emit(&ast, &info);
+
+            // A probe `main` that prints the C compiler's own answers. Structs only:
+            // an enum's C shape is a tagged union whose member names are cgen's business,
+            // while a struct's field names are the user's and so are stable to name here.
+            let mut probe = String::new();
+            let mut expect: Vec<(String, u64)> = Vec::new();
+            probe.push_str("\nint main(void){\n");
+            for t in &layouts {
+                if t.incomplete || t.fields.is_empty() {
+                    continue;
+                }
+                let cname = format!("Jestyr_{}", t.name);
+                // cgen emits `struct Jestyr_X { … };` (with a forward typedef above it).
+                if !c_src.contains(&format!("struct {cname} {{")) {
+                    continue; // the type was not emitted (unused / a generic instance)
+                }
+                probe.push_str(&format!("  printf(\"%zu\\n\", sizeof({cname}));\n"));
+                expect.push((format!("{} size", t.name), t.size));
+                probe.push_str(&format!("  printf(\"%zu\\n\", _Alignof({cname}));\n"));
+                expect.push((format!("{} align", t.name), t.align));
+                for f in &t.fields {
+                    probe.push_str(&format!(
+                        "  printf(\"%zu\\n\", offsetof({cname}, j_{}));\n",
+                        f.name
+                    ));
+                    expect.push((format!("{}.{} offset", t.name, f.name), f.offset));
+                }
+            }
+            probe.push_str("  return 0;\n}\n");
+            if expect.is_empty() {
+                continue;
+            }
+
+            // The emitted program already has its own `main`; rename it so the probe's
+            // can take over without touching cgen. Matched on the opening `int main(`
+            // rather than a full signature, because cgen emits `(void)` or
+            // `(int argc, char** argv)` depending on whether the program reads args.
+            let body = c_src.replacen("\nint main(", "\nint jestyr_unused_main(", 1);
+            let full = format!("#include <stddef.h>\n#include <stdio.h>\n{body}{probe}");
+            let stem: String = file.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+            let cfile = dir.join(format!("{stem}.c"));
+            let exe = dir.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX));
+            std::fs::write(&cfile, &full).unwrap();
+
+            let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
+            let out = Command::new(&cc)
+                .args(crate::CC_FLAGS)
+                .arg(&cfile)
+                .arg("-o")
+                .arg(&exe)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "layout probe for {file} did not compile: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let run = Command::new(&exe).output().unwrap();
+            assert!(run.status.success(), "layout probe for {file} did not run");
+            let got: Vec<u64> = String::from_utf8_lossy(&run.stdout)
+                .lines()
+                .map(|l| l.trim().parse::<u64>().expect("probe prints numbers"))
+                .collect();
+            assert_eq!(got.len(), expect.len(), "{file}: probe output count");
+            for (i, (what, want)) in expect.iter().enumerate() {
+                assert_eq!(
+                    got[i], *want,
+                    "{file}: {what} — the C compiler says {}, the layout pass says {}",
+                    got[i], want
+                );
+            }
+            eprintln!("layout: {file} — {} values match the C compiler", expect.len());
+        }
+    }
+
     /// **Doc-comment trivia in-language.** `tokens.collect_docs` recovers exactly the
     /// reference lexer's `tokenize_with_docs` third result — kind, block-ness, the whole
     /// comment span, and the text span — over the whole corpus. It finds comments by

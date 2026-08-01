@@ -29,6 +29,7 @@
 | Increment | Commit | What |
 |---|---|---|
 | **G8** plan-as-list | *(this run)* | `const targets` now selects the build script's form **by its type**: an integer is a count (the tier-4 index form), a list is the targets themselves — `[[source, output], …]`, buildable by a comptime `for`. A pair is a two-element list because the value domain has no struct; two parallel lists would read better and can disagree in length. Artifacts take the same two forms. Fully backwards compatible, and the two forms render byte-identical plans (pinned by planning one build both ways). `examples/build_list.jestyr` is the worked example. |
+| **L1** layout analysis | *(this run)* | `src/layout.rs` + `jestyrc layout <file>` — size, alignment, field offsets and **padding waste** for every declared type. **Zero emission change**, so no port mirror and no seed refresh; L's later increments are opt-in *because* this one is not. Verified rather than asserted: `layout_matches_c_sizeof` generates a probe `main` printing real `sizeof`/`_Alignof`/`offsetof` and diffs 19 values across the corpus shapes against the model — **the C compiler is the authority, and now says so in CI**. Two honest gaps, both stated in the report as `(incomplete)` rather than guessed: generic/opaque components, and **bit-fields** (implementation-defined in C — the model would otherwise report 4 bytes for a struct that occupies 1). Unblocks `@size_of`/`@align_of`/`@offset_of` as comptime *values*, the gap tier 3 records. |
 | **M3** typeck fold + cgen emission, **first corpus file** | *(this run)* | `examples/comptime_block.jtr` — **corpus 134 → 135**, and the first `.jtr` in the tree to use comptime syntax. typeck.jtr folds a kind-44 node to its value's type (i32/bool/str, Error on failure); cgen.jtr emits the folded literal (`push_i64`, `push_c_string` with the octal + trigraph rules mirrored from `c_string_literal`); `eval_array_len`/`push_array_len` now go through the interpreter instead of accepting only a literal — the port's own G1. Emitted C byte-identical across all 135. **Two shims the next mirror will hit as well** — see findings 8 and 9. |
 | **M2** the CTFE interpreter in `.jtr` | *(this run)* | `examples/std/ctfe.jtr` + `ctfe_cli.jtr` — the self-hosted comptime evaluator, scalars (Int/Bool/Str). Golden `jestyr_ctfe_folding_matches_reference` drives both implementations over 23 fixtures and requires agreement on **what folds** and **what is refused**: arithmetic, every literal base, bitwise/shifts, const chains, comparisons, short-circuit, `if`/`else`, calls, recursion, `let`, strings (concat/escapes/ordering), chars, casts, `comptime` blocks incl. nesting, and 8 refusal cases. **Named `ctfe`, not `comptime`** — see the finding below. Message-TEXT parity is deliberately not claimed (the `.jtr` subset has no `format!`; same concession the P-series made for the refusal gates). |
 | **M1** the port parses `comptime` | `63ba3fa` | `parser.jtr` expr kind 44 + the three dispatch sites + dump arm; verified by the P2 expression golden on a temp probe file (6 snippets incl. the tier-7 shape), so it lands without touching a corpus golden. |
@@ -385,14 +386,26 @@ goldens key on the `jtr` extension.
 mirror + golden growth; constructs that only FOLD at check time still need typeck.jtr
 parity (the P3 golden compares every expression's resolved type).
 
-### L. Memory-layout pass (0% — where systems performance lives)
+### L. Memory-layout pass (increment 1 DONE — where systems performance lives)
 size/align computation, **field reordering**, **enum niche-packing**, and
 pass-large-aggregates-by-`const*` (today `read` params copy).
 **The byte-identity constraint is the whole game here:** reordering fields changes the
-emitted C for every existing program, which would invalidate 134 golden files, the
+emitted C for every existing program, which would invalidate 135 golden files, the
 concat, the seed, and attest hashes at once. Land it OPT-IN:
-1. A pure ANALYSIS pass (`src/layout.rs`) computing size/align/waste + a report mode
-   (`jestyrc layout <file>`) — zero emission change, easy first increment.
+1. ~~A pure ANALYSIS pass (`src/layout.rs`) computing size/align/waste + a report mode
+   (`jestyrc layout <file>`)~~ — **DONE (L1).** Zero emission change, as predicted.
+   Two things the next increment should inherit rather than rediscover:
+   * **The C compiler is the authority, and the test says so.** `layout_matches_c_sizeof`
+     emits the program's real C, appends a probe `main` printing `sizeof`/`_Alignof`/
+     `offsetof`, compiles it with the locked `CC_FLAGS` and diffs against the model. The
+     reordering increment will be *reasoning about offsets*, so it needs them to be
+     known-true rather than believed. Extend that test's file list with each new shape.
+   * **Two gaps are admitted, not guessed** — a record says `(incomplete)` when a
+     component is generic/opaque, and when the struct has **bit-fields**, whose packing
+     is implementation-defined in C (the model would otherwise report 4 bytes for
+     `struct Packed { a: u8 : 1, … }`, which really occupies 1). `compute` takes the AST
+     as well as the table precisely because bit widths are syntax, not type — the same
+     hook `@layout(auto)` will need.
 2. `@layout(auto)` opt-in per struct → reordered emission for annotated types only
    (non-users byte-identical; golden corpus grows annotated files).
 3. Niche-packing behind the same attribute; by-`const*` `read` params behind

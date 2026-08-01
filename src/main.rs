@@ -18,6 +18,8 @@
 //!                               `test <file> <substr>` runs only matching names,
 //!                               `test <file> --list` lists them (no compile)
 //!   jestyrc tokens <file.jtr>   stop after lexing and dump the token stream
+//!   jestyrc layout <file.jtr>   report every type's size, alignment, field offsets
+//!                               and padding waste (analysis only — emits nothing)
 //!   jestyrc doc    <file.jtr>   render the file's API docs as Markdown (--html for HTML)
 //!   jestyrc attest <file.jtr>   emit the reproducible-build + guarantee manifest
 //!                               (sha256 of the emitted C, the locked CC flags, and
@@ -38,6 +40,7 @@ mod diag;
 mod dharht;
 mod doc;
 mod escape;
+mod layout;
 mod lexer;
 mod module;
 mod parser;
@@ -378,6 +381,18 @@ fn run() -> ExitCode {
             let filter = nonflags.next().cloned();
             (Mode::Test { list, filter }, path.clone())
         }
+        Some("layout") => {
+            // `layout <file>` — report every declared type's size, alignment, field
+            // offsets and padding waste. Pure analysis: it compiles nothing and emits
+            // nothing, so it can be run on a file that would not even build.
+            match args[2..].iter().find(|a| !a.starts_with("--")) {
+                Some(p) => return run_layout(p),
+                None => {
+                    eprintln!("error: `layout` needs a source file argument");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         Some("plan") => {
             // `plan <build.jestyr> [--build]` — evaluate a build description and print
             // its plan; `--build` additionally compiles each target it names.
@@ -593,6 +608,36 @@ fn program_has_main(ast: &ast::Ast) -> bool {
 /// An explicit subcommand rather than magic on the filename: `jestyrc plan foo.jestyr`
 /// says what it does, and nothing changes meaning because a file happens to be called
 /// `build.jestyr`.
+/// `jestyrc layout <file>` — the memory-layout report (workstream L, increment 1).
+///
+/// Type-checking is enough: layout is a property of *declarations*, so this never
+/// reaches escape analysis or the backend and emits nothing at all.
+fn run_layout(path: &str) -> ExitCode {
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read `{path}`: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (tokens, ld) = Lexer::new(&src).tokenize();
+    let (ast, pd) = Parser::new(&src, tokens).parse();
+    let mut failed = false;
+    for d in ld.iter().chain(pd.iter()).filter(|d| d.is_error()) {
+        let lc = line_col(&src, d.span.start);
+        eprintln!("{path}:{}:{}: error: {}", lc.line, lc.col, d.message);
+        failed = true;
+    }
+    if failed {
+        return ExitCode::FAILURE;
+    }
+    // Type errors are NOT fatal here: a half-finished file still has declarations, and
+    // "what does this struct cost?" is a question worth answering while editing it.
+    let (info, _diags) = typeck::check(&ast);
+    print!("{}", layout::render(&layout::compute(&ast, &info)));
+    ExitCode::SUCCESS
+}
+
 fn run_plan(path: &str, build: bool, emit: bool) -> ExitCode {
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
