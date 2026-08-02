@@ -9378,6 +9378,148 @@ fn main() -> i32 {
             "examples/bitfields.jtr",
         ] {
             let src = std::fs::read_to_string(file).unwrap();
+            check_layout_against_c(file, &src, &dir);
+        }
+    }
+
+    /// **`@layout(auto)` (increment L2) — the *reordered* offsets are the C compiler's
+    /// too.** Reordering only pays if the model and the backend agree about where the
+    /// fields landed; this asks gcc, which is the same authority `layout_matches_c_sizeof`
+    /// established, now pointed at the one case where the emitted order is chosen rather
+    /// than inherited.
+    ///
+    /// Deliberately driven by **inline** sources rather than a corpus file: an annotated
+    /// `.jtr` in `examples/` is swept by the P2/P3/cgen goldens with no allowlist, so it
+    /// would drag the port mirror in with it. Reference-side proof first, corpus file
+    /// with the mirror — the Q-S2a ordering.
+    #[test]
+    fn reordered_layout_matches_c_offsetof() {
+        let dir = std::env::temp_dir().join("jestyr_layout_auto_oracle");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cases: [(&str, &str); 4] = [
+            // The classic padding trap, and the shape the report's example uses.
+            ("mixed", "@layout(auto) struct T { a: u8, b: u64, c: u8, d: i32 }"),
+            // Fat pointers and floats: 16/8 and 4/4 next to single bytes.
+            ("fat", "@layout(auto) struct T { flag: bool, name: str, ratio: f32, id: u16 }"),
+            // Every field the same alignment — the permutation is the identity, so this
+            // checks the tie path emits something gcc still agrees with.
+            ("uniform", "@layout(auto) struct T { a: i32, b: i32, c: i32 }"),
+            // A reordered struct EMBEDDED in a plain one: the outer offsets depend on
+            // the inner size having actually shrunk, which is the propagation path.
+            (
+                "nested",
+                "@layout(auto) struct Inner { a: u8, b: u64, c: u8 }\n\
+                 struct Outer { i: Inner, tag: u8 }",
+            ),
+        ];
+        for (name, decls) in cases {
+            // A `main` that touches the type, so cgen emits it at all.
+            let src = format!("{decls}\nfn main() -> i32 {{ print_int(size_of(T2)) return 0 }}\nstruct T2 {{ x: i32 }}\n");
+            check_layout_against_c(name, &src, &dir);
+        }
+    }
+
+    /// **`@layout(auto)` changes the bytes and nothing else.** The offsets being right
+    /// (above) is only half the claim; the other half is that a program cannot *tell*.
+    /// So the same source is compiled and run twice — once annotated, once not — and
+    /// every value it prints must be identical, while `size_of` must differ, which is
+    /// what proves the two runs really were different layouts rather than the attribute
+    /// having been quietly dropped.
+    ///
+    /// The cases are chosen to touch each way a struct's storage is reachable: field
+    /// read and write, a nested struct, functional update (`..base`), passing by value
+    /// through a function boundary, and an array of the struct — where a wrong size
+    /// would corrupt every element after the first.
+    #[test]
+    fn a_reordered_struct_computes_the_same_answers() {
+        let cases: [(&str, &str); 4] = [
+            (
+                "read/write",
+                "fn main() -> i32 { var t = T { a: 1, b: 2, c: 3, d: 4 } t.b = 20 t.a = 10 \
+                 print_int(t.a as i64) print_int(t.b as i64) print_int(t.c as i64) print_int(t.d as i64) return 0 }",
+            ),
+            (
+                "spread + by-value call",
+                "fn total(read t: T) -> i64 { return t.a as i64 + t.b as i64 + t.c as i64 + t.d as i64 } \
+                 fn main() -> i32 { let base = T { a: 1, b: 2, c: 3, d: 4 } let u = T { b: 20, ..base } \
+                 print_int(total(base)) print_int(total(u)) return 0 }",
+            ),
+            // An array of the struct: the element *stride* is its size, so a wrong size
+            // corrupts every element after the first. (Read-only: `xs[i].f = v` is a
+            // separate, pre-existing cgen gap — the index lowers to a statement
+            // expression, which is not an lvalue.)
+            (
+                "array of the struct",
+                "fn main() -> i32 { let xs: [3]T = [T { a: 1, b: 7, c: 3, d: 4 }, T { a: 2, b: 8, c: 3, d: 4 }, T { a: 3, b: 9, c: 3, d: 4 }] \
+                 print_int(xs[0].b as i64) print_int(xs[1].b as i64) print_int(xs[2].b as i64) print_int(xs[2].a as i64) return 0 }",
+            ),
+            (
+                "nested",
+                "fn main() -> i32 { let n = N { inner: T { a: 1, b: 2, c: 3, d: 4 }, tag: 7 } \
+                 print_int(n.inner.b as i64) print_int(n.tag as i64) return 0 }",
+            ),
+        ];
+        let decls = "struct N { inner: T, tag: u8 }\n";
+        for (what, body) in cases {
+            let plain = format!("struct T {{ a: u8, b: u64, c: u8, d: i32 }}\n{decls}{body}\n");
+            let auto = format!("@layout(auto) {plain}");
+            let (a, b) = (run_inline(what, &plain), run_inline(what, &auto));
+            assert_eq!(a, b, "`@layout(auto)` changed an observable value in the `{what}` case");
+        }
+        // The layouts really were different — otherwise every comparison above is
+        // vacuous. `size_of` is C's own `sizeof`, so this is the C compiler answering.
+        let sz = "fn main() -> i32 { print_int(size_of(T)) return 0 }";
+        let plain = format!("struct T {{ a: u8, b: u64, c: u8, d: i32 }}\n{sz}\n");
+        assert_eq!(run_inline("size", &plain), vec!["24"]);
+        assert_eq!(run_inline("size", &format!("@layout(auto) {plain}")), vec!["16"]);
+    }
+
+    /// Compile an inline Jestyr source through the real backend, run it, and return its
+    /// whitespace-separated output. Single-file only (no module loader), which is what
+    /// keeps these cases out of `examples/` and therefore out of the goldens.
+    fn run_inline(label: &str, src: &str) -> Vec<String> {
+        let (tokens, ld) = crate::lexer::Lexer::new(src).tokenize();
+        let (ast, pd) = crate::parser::Parser::new(src, tokens).parse();
+        assert!(
+            !ld.iter().chain(pd.iter()).any(|d| d.is_error()),
+            "{label}: fixture must parse: {:?}",
+            pd
+        );
+        let (info, td) = crate::typeck::check(&ast);
+        assert!(!td.iter().any(|d| d.is_error()), "{label}: typeck errors: {td:?}");
+        let (c_src, cd) = crate::cgen::emit(&ast, &info);
+        assert!(!cd.iter().any(|d| d.is_error()), "{label}: cgen errors: {cd:?}");
+
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let cfile = dir.join(format!("jestyr_inline_{uniq}.c"));
+        let exe = dir.join(format!("jestyr_inline_{uniq}{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&cfile, &c_src).unwrap();
+        let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
+        let st = Command::new(&cc)
+            .args(crate::CC_FLAGS)
+            .arg("-o")
+            .arg(&exe)
+            .arg(&cfile)
+            .output()
+            .unwrap();
+        assert!(st.status.success(), "{label}: gcc failed: {}", String::from_utf8_lossy(&st.stderr));
+        let out = Command::new(&exe).output().unwrap();
+        assert!(out.status.success(), "{label}: the program did not run");
+        String::from_utf8_lossy(&out.stdout).split_whitespace().map(|s| s.to_string()).collect()
+    }
+
+    /// Emit `src`'s real C, append a `main` printing the C compiler's own
+    /// `sizeof`/`_Alignof`/`offsetof` for every emitted struct, and require every number
+    /// to match `layout::compute`. Shared by the declaration-order and reordered oracles
+    /// so the two cannot drift into checking different things.
+    fn check_layout_against_c(label: &str, src: &str, dir: &std::path::Path) {
+        {
+            let file = label;
+            let src = src.to_string();
             let (tokens, _) = crate::lexer::Lexer::new(&src).tokenize();
             let (ast, _) = crate::parser::Parser::new(&src, tokens).parse();
             let (info, _) = crate::typeck::check(&ast);
@@ -9413,7 +9555,7 @@ fn main() -> i32 {
             }
             probe.push_str("  return 0;\n}\n");
             if expect.is_empty() {
-                continue;
+                return;
             }
 
             // The emitted program already has its own `main`; rename it so the probe's

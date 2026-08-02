@@ -1807,7 +1807,10 @@ impl<'a> Cgen<'a> {
                 let deps = self.aggregate_field_deps_ast(body);
                 self.def_begin(format!("Jestyr_{c}"), deps);
                 self.raw(format!("{kw}{attr} Jestyr_{c} {{\n"));
-                for m in &body.members {
+                // `@layout(auto)` reorders the *declaration*; everything else — every
+                // read, write and construction — is by name, so this is the only place
+                // in the backend the choice is visible. See `struct_field_order`.
+                for m in self.struct_field_order(&name.name, body, attrs) {
                     if let StructMember::Field { name: fname, ty, volatile, bits, .. } = m {
                         let cty = self.c_ty_ast(*ty);
                         let vol = if *volatile { "volatile " } else { "" };
@@ -1825,10 +1828,66 @@ impl<'a> Cgen<'a> {
         }
     }
 
+    /// The members of a struct in **emission order**.
+    ///
+    /// Declaration order for everything, except a struct that asked for
+    /// `@layout(auto)`, whose *fields* are permuted by `layout::field_order` — one
+    /// function, shared with the `jestyrc layout` report, so the report can never
+    /// describe an order the backend does not emit (the `at_ty` / `simd::classify`
+    /// rule).
+    ///
+    /// ## Why reordering the declaration is safe here and nowhere else
+    /// cgen constructs a struct with **designated initializers** (`(Jestyr_P){ .j_x =
+    /// 1, .j_y = 2 }`) and reads it by name (`p.j_x`). Both are order-independent in C,
+    /// so permuting the declaration changes the *storage* and nothing else — no
+    /// initializer needs rewriting, no access site needs to know. `@offset_of` and
+    /// `size_of` lower to C's own `offsetof`/`sizeof`, so they follow the new order for
+    /// free rather than needing to be taught about it.
+    ///
+    /// Non-field members (methods) are returned untouched and in place: they are not
+    /// emitted here at all, and filtering them would be a second thing to keep in sync.
+    fn struct_field_order<'b>(
+        &self,
+        name: &str,
+        body: &'b StructBody,
+        attrs: &[Attribute],
+    ) -> Vec<&'b StructMember> {
+        let members: Vec<&StructMember> = body.members.iter().collect();
+        let Some(perm) = crate::layout::field_order(self.ast, self.info, name, attrs) else {
+            return members;
+        };
+        // `perm` indexes the *fields* in declaration order, while `members` also holds
+        // methods. Map through the field positions so the two agree.
+        let fields: Vec<usize> = members
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m, StructMember::Field { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        // A permutation that does not cover the declared fields would silently drop or
+        // duplicate one; fall back to declaration order rather than emit a wrong struct.
+        if perm.len() != fields.len() {
+            return members;
+        }
+        let mut out = Vec::with_capacity(members.len());
+        let mut slot = 0usize;
+        for (i, m) in members.iter().enumerate() {
+            if fields.contains(&i) {
+                out.push(members[fields[perm[slot]]]);
+                slot += 1;
+            } else {
+                out.push(m);
+            }
+        }
+        out
+    }
+
     /// Translate item attributes that affect struct layout into a GNU
     /// `__attribute__((…))` clause: `@packed` → `packed`, `@align(n)` →
-    /// `aligned(n)`. `@layout(c)` is the default C layout (a no-op marker until
-    /// field reordering lands); unknown attributes are ignored.
+    /// `aligned(n)`. `@layout(c)` is the default C layout, and `@layout(auto)` is
+    /// handled by [`Self::struct_field_order`] rather than by an attribute clause —
+    /// the order is *chosen*, not delegated to the C compiler, so the emitted struct
+    /// is the same bytes under any conforming compiler. Unknown attributes are ignored.
     fn struct_attr(&self, attrs: &[Attribute]) -> String {
         let mut parts = Vec::new();
         for a in attrs {
@@ -10095,6 +10154,51 @@ mod tests {
         assert!(c.contains("struct __attribute__((packed)) Jestyr_P"), "packed: {c}");
         assert!(c.contains("struct __attribute__((aligned(16))) Jestyr_O"), "aligned: {c}");
         assert!(c.contains("sizeof(Jestyr_P)"), "size_of → sizeof: {c}");
+    }
+
+    /// `@layout(auto)` permutes the **declaration** and nothing else.
+    ///
+    /// The second half is the load-bearing one: construction stays a designated
+    /// initializer in *source* order and every read stays by name, which is exactly why
+    /// reordering the storage is safe. If cgen ever emitted a positional brace
+    /// initializer, this assertion is what would catch it.
+    #[test]
+    fn layout_auto_reorders_the_declaration_only() {
+        let src = "@layout(auto) struct T { a: u8, b: u64, c: i32 } \
+                   fn main() -> i32 { let t = T { a: 1, b: 2, c: 3 } print_int(t.b as i64) return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        let body = c.split("struct Jestyr_T {").nth(1).expect("struct T emitted").split("};").next().unwrap();
+        let order: Vec<&str> = ["j_a", "j_b", "j_c"]
+            .iter()
+            .map(|f| (f, body.find(f).unwrap_or(usize::MAX)))
+            .filter(|(_, p)| *p != usize::MAX)
+            .map(|(f, _)| *f)
+            .collect();
+        let mut by_pos = order.clone();
+        by_pos.sort_by_key(|f| body.find(*f).unwrap());
+        assert_eq!(by_pos, ["j_b", "j_c", "j_a"], "descending alignment: {body}");
+        // Construction and access are by NAME, so neither moved.
+        assert!(c.contains(".j_a = 1"), "designated initializer in source order: {c}");
+        assert!(c.contains(".j_b = 2"), "designated initializer in source order: {c}");
+        assert!(c.contains("j_t.j_b"), "field read unchanged: {c}");
+    }
+
+    /// The default is byte-identical. `@layout(c)` and no attribute at all must emit the
+    /// same C as each other **and** as the compiler did before this feature existed —
+    /// which is what lets the 140-file golden corpus, the concatenated build and the
+    /// bootstrap seed stay untouched by an emission-changing increment.
+    #[test]
+    fn layout_c_is_byte_identical_to_no_attribute() {
+        let base = "struct S { a: u8, b: u64, c: i32 } \
+                    fn main() -> i32 { let s = S { a: 1, b: 2, c: 3 } print_int(s.b as i64) return 0 }";
+        let (plain, _) = gen(base);
+        let (explicit, _) = gen(&format!("@layout(c) {base}"));
+        assert_eq!(plain, explicit, "`@layout(c)` must change nothing");
+        // …and the annotated one really is different, so the comparison above is not
+        // vacuously true because the attribute was dropped on the floor somewhere.
+        let (auto, _) = gen(&format!("@layout(auto) {base}"));
+        assert_ne!(plain, auto, "`@layout(auto)` must actually change the emission");
     }
 
     #[test]

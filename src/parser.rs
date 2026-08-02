@@ -700,7 +700,12 @@ impl<'src> Parser<'src> {
             }
         }
         let span = start.to(body.span);
-        Item::Struct { is_pub, is_record, is_union, name, body, attrs, span }
+        let item = Item::Struct { is_pub, is_record, is_union, name, body, attrs, span };
+        // The shape-dependent attribute checks (`@layout(auto)` against unions, `@packed`
+        // and bit-fields) can only run now: the generic run happened at the `struct`
+        // keyword, before there was a body to inspect.
+        attrs::validate_struct(&self.ast, &item, &mut self.diagnostics);
+        item
     }
 
     /// Parse a run of leading `@name` / `@name(args)` item attributes.

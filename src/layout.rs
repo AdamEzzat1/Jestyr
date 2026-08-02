@@ -36,7 +36,7 @@ use std::fmt::Write;
 
 use std::collections::HashSet;
 
-use crate::ast::{Ast, Item, StructMember};
+use crate::ast::{Ast, Attribute, ExprKind, Item, StructMember};
 use crate::types::{Ty, TypeInfo, TypeKindG};
 
 /// The target's pointer/`usize` width. Jestyr targets LP64 through its C backend; a
@@ -87,6 +87,10 @@ pub struct TypeLayout {
     /// Set when some component's layout is not knowable here (an unresolved generic,
     /// an opaque type). The whole record is then advisory, and says so.
     pub incomplete: bool,
+    /// Set when `@layout(auto)` applies, so `fields` is in **emission** order rather
+    /// than declaration order. Rendered, because a reader comparing this report against
+    /// their source needs to know why the field list is shuffled.
+    pub reordered: bool,
 }
 
 /// Round `n` up to a multiple of `align`.
@@ -116,9 +120,31 @@ fn prim_layout(name: &str) -> Option<Layout> {
     })
 }
 
+/// The names of the structs that opted into `@layout(auto)`.
+///
+/// Collected once and threaded through the whole size computation, because reordering
+/// is **not** a local property: a reordered struct is usually smaller, so a struct that
+/// embeds one must see the smaller number or every offset after it would be wrong. This
+/// is the reason `layout_of` takes the set rather than each caller checking attributes
+/// at the top level.
+pub fn auto_types(ast: &Ast, info: &TypeInfo) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for item in &ast.items {
+        if let Item::Struct { name, attrs, .. } = item {
+            if field_order(ast, info, &name.name, attrs).is_some() {
+                out.insert(name.name.clone());
+            }
+        }
+    }
+    out
+}
+
 /// The layout of an arbitrary `Ty`. `None` when it cannot be known from the declared
 /// shape alone — an unresolved generic parameter, or an opaque/erroneous type.
-pub fn layout_of(info: &TypeInfo, ty: &Ty) -> Option<Layout> {
+///
+/// `auto` names the structs whose fields are reordered (see [`auto_types`]); pass an
+/// empty set for the plain declaration-order model.
+pub fn layout_of(info: &TypeInfo, auto: &HashSet<String>, ty: &Ty) -> Option<Layout> {
     Some(match ty {
         Ty::Unit => Layout::new(0, 1),
         Ty::Prim(p) => prim_layout(p)?,
@@ -129,13 +155,13 @@ pub fn layout_of(info: &TypeInfo, ty: &Ty) -> Option<Layout> {
         // A value array lowers to `struct { T a[N]; }`: N elements, the element's
         // alignment, and no padding beyond what the element already carries.
         Ty::Array { elem, len } => {
-            let e = layout_of(info, elem)?;
+            let e = layout_of(info, auto, elem)?;
             Layout::new(e.size * (*len as u64), e.align)
         }
-        Ty::Named(i) => named_layout(info, *i)?,
+        Ty::Named(i) => named_layout(info, auto, *i)?,
         // A `T !E` result carries an ok-value, a tag and an error code.
         Ty::Result(inner) => {
-            let ok = layout_of(info, inner)?;
+            let ok = layout_of(info, auto, inner)?;
             aggregate(&[Layout::scalar(1), ok, Layout::scalar(4)]).0
         }
         // Generic instances, opaque names, type-valued and task types: not knowable
@@ -151,13 +177,19 @@ pub fn layout_of(info: &TypeInfo, ty: &Ty) -> Option<Layout> {
 }
 
 /// The layout of a declared type by table index.
-fn named_layout(info: &TypeInfo, idx: usize) -> Option<Layout> {
+fn named_layout(info: &TypeInfo, auto: &HashSet<String>, idx: usize) -> Option<Layout> {
     let decl = info.table.types.get(idx)?;
     match &decl.kind {
         TypeKindG::Struct { fields } => {
             let mut ls = Vec::with_capacity(fields.len());
             for (_, t) in fields {
-                ls.push(layout_of(info, t)?);
+                ls.push(layout_of(info, auto, t)?);
+            }
+            // A reordered struct is laid out in the order the backend will emit it,
+            // which is the only reason its size can differ from the declared one.
+            if auto.contains(&decl.name) {
+                let aligns: Vec<u64> = ls.iter().map(|l| l.align).collect();
+                ls = auto_order(&aligns).into_iter().map(|k| ls[k]).collect();
             }
             Some(aggregate(&ls).0)
         }
@@ -168,7 +200,7 @@ fn named_layout(info: &TypeInfo, idx: usize) -> Option<Layout> {
             for (_, ts) in variants {
                 let mut ls = Vec::with_capacity(ts.len());
                 for t in ts {
-                    ls.push(layout_of(info, t)?);
+                    ls.push(layout_of(info, auto, t)?);
                 }
                 let (l, _) = aggregate(&ls);
                 payload.size = payload.size.max(l.size);
@@ -177,7 +209,7 @@ fn named_layout(info: &TypeInfo, idx: usize) -> Option<Layout> {
             Some(aggregate(&[Layout::scalar(4), payload]).0)
         }
         // `distinct` is a zero-cost nominal wrapper: the base's layout exactly.
-        TypeKindG::Distinct { base } => layout_of(info, base),
+        TypeKindG::Distinct { base } => layout_of(info, auto, base),
     }
 }
 
@@ -196,6 +228,110 @@ fn aggregate(fields: &[Layout]) -> (Layout, Vec<u64>) {
     // Tail padding: an aggregate's size is a multiple of its alignment, so that
     // `arr[i]` stays aligned for every `i`.
     (Layout::new(align_to(offset, align), align), offsets)
+}
+
+// ── `@layout(auto)` — opt-in field reordering (increment L2) ────────────────────
+
+/// Does this struct opt into automatic field ordering (`@layout(auto)`)?
+///
+/// The default — no attribute at all, or the explicit `@layout(c)` — is declaration
+/// order, which is what every program emitted before this increment got and what every
+/// program still gets unless it asks otherwise. That is the whole reason the feature is
+/// an attribute: reordering unconditionally would rewrite the emitted C of every
+/// existing program at once, invalidating the golden corpus, the concatenated build,
+/// the bootstrap seed and every attested hash in a single commit.
+pub fn wants_auto(ast: &Ast, attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|a| a.name == "layout" && layout_word(ast, a).as_deref() == Some("auto"))
+}
+
+/// The identifier argument of a `@layout(<word>)` attribute, if it has one.
+///
+/// Shared with the validator in `attrs.rs` so the vocabulary the compiler *accepts*
+/// and the vocabulary it *acts on* cannot drift — the `at_ty` / `simd::classify` rule
+/// that has kept the reflected, documented and attested type renderings in agreement.
+pub fn layout_word(ast: &Ast, a: &Attribute) -> Option<&'static str> {
+    // Attribute arguments are expressions; `@layout`'s is validated as a single bare
+    // identifier, so this reads that one shape and yields nothing for anything else.
+    let ExprKind::Name(n) = &ast.expr_at(*a.args.first()?).kind else {
+        return None;
+    };
+    // Returned as a `&'static str` from the closed vocabulary rather than as the user's
+    // own string: a caller then cannot compare against a spelling the validator would
+    // have rejected.
+    LAYOUT_WORDS.iter().find(|w| **w == n.name).copied()
+}
+
+/// The complete vocabulary of `@layout(<word>)`.
+///
+/// * `c` — the default. Fields are emitted in declaration order, which is what C
+///   guarantees and what an FFI struct needs.
+/// * `auto` — the compiler picks the order that minimises padding (see [`auto_order`]).
+///
+/// Closed on purpose. `@layout(packd)` used to validate clean and do nothing, because
+/// the argument was checked for *being* an identifier and never for *which* one — and
+/// an attribute that quietly means nothing reads exactly like a guarantee. The same
+/// argument that makes `@simd` on a function with no `par for` an error.
+pub const LAYOUT_WORDS: &[&str] = &["c", "auto"];
+
+/// The order `@layout(auto)` emits a struct's fields in: **descending alignment**,
+/// with declaration order breaking ties (a stable sort).
+///
+/// ## Why this is minimal, not merely tighter
+/// Every layout this model produces satisfies `size % align == 0` — scalars are square,
+/// an array is `n` elements of a type that already obeys the rule, and `aggregate`
+/// tail-pads to the alignment. Alignments are powers of two. Together those give the
+/// result: place the fields in non-increasing alignment and each field's offset is the
+/// sum of the sizes before it, every one of which is a multiple of an alignment *at
+/// least as strict* as this field's — so every offset is already aligned and **no
+/// interior padding is inserted at all**. The total is then `align_to(Σ sizes, max
+/// align)`, which no ordering can beat, since Σ sizes is a lower bound and the
+/// aggregate must be a multiple of its alignment regardless.
+///
+/// So this is not a packing heuristic with a good average case; it is the optimum under
+/// a stated invariant, and `auto_ordering_leaves_no_interior_padding` checks the
+/// invariant rather than trusting it.
+///
+/// Ties break by declaration order because the ordering must be **deterministic and
+/// stable**: it feeds the emitted C, which feeds the attest hash. A sort that depended
+/// on hash iteration order would make a build unreproducible.
+pub fn auto_order(aligns: &[u64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..aligns.len()).collect();
+    // `sort_by_key` is stable, so equal alignments keep their declaration order.
+    order.sort_by_key(|&i| std::cmp::Reverse(aligns[i]));
+    order
+}
+
+/// The field emission order for a declared struct: `Some(perm)` when it asked for
+/// `@layout(auto)` and the request can be honoured, `None` for declaration order.
+///
+/// Returns `None` — silently, because the *loud* refusals are the validator's job in
+/// `attrs.rs` — when some field's layout is not knowable here. Reordering by an
+/// alignment the compiler had to guess would be worse than not reordering: the model
+/// would then disagree with the C compiler about the very offsets it claims to improve.
+pub fn field_order(
+    ast: &Ast,
+    info: &TypeInfo,
+    name: &str,
+    attrs: &[Attribute],
+) -> Option<Vec<usize>> {
+    if !wants_auto(ast, attrs) {
+        return None;
+    }
+    let idx = *info.table.type_index.get(name)?;
+    let TypeKindG::Struct { fields } = &info.table.types.get(idx)?.kind else {
+        return None;
+    };
+    // The ordering needs only each field's ALIGNMENT, and alignment is
+    // order-invariant — an aggregate's alignment is the max over its components, which
+    // no permutation changes. So this may ask for layouts under the empty auto-set
+    // without first knowing which structs are reordered, which is what breaks the
+    // circularity between `auto_types` and `field_order`.
+    let none = HashSet::new();
+    let mut aligns = Vec::with_capacity(fields.len());
+    for (_, t) in fields {
+        aligns.push(layout_of(info, &none, t)?.align);
+    }
+    Some(auto_order(&aligns))
 }
 
 /// Names of structs declaring at least one **bit-field** (`flags: u8 : 3`).
@@ -225,9 +361,14 @@ fn bitfield_types(ast: &Ast) -> HashSet<String> {
 /// Compute a layout record for every declared type, in declaration order.
 ///
 /// Takes the AST as well as the checked table because two things layout depends on are
-/// syntax, not type: bit-field widths, and (later) opt-in layout attributes.
+/// syntax, not type: bit-field widths, and the opt-in `@layout(auto)` attribute.
+///
+/// A reordered struct's **fields are listed in emission order**, not declaration order.
+/// The report exists to describe the bytes the backend actually produces, and a report
+/// that described the source order would be describing a struct that no longer exists.
 pub fn compute(ast: &Ast, info: &TypeInfo) -> Vec<TypeLayout> {
     let bitfields = bitfield_types(ast);
+    let auto = auto_types(ast, info);
     let mut out = Vec::new();
     for (i, decl) in info.table.types.iter().enumerate() {
         // A generic template has no layout until it is instantiated.
@@ -245,10 +386,12 @@ pub fn compute(ast: &Ast, info: &TypeInfo) -> Vec<TypeLayout> {
         // is advisory from the start rather than after the fact.
         let mut incomplete = bitfields.contains(&decl.name);
 
+        let reordered = auto.contains(&decl.name);
+
         if let TypeKindG::Struct { fields: fs } = &decl.kind {
             let mut ls = Vec::with_capacity(fs.len());
             for (_, t) in fs {
-                match layout_of(info, t) {
+                match layout_of(info, &auto, t) {
                     Some(l) => ls.push(l),
                     None => {
                         incomplete = true;
@@ -256,22 +399,32 @@ pub fn compute(ast: &Ast, info: &TypeInfo) -> Vec<TypeLayout> {
                     }
                 }
             }
-            let (_, offsets) = aggregate(&ls);
+            // Emission order: the permutation for a reordered struct, the identity for
+            // every other one. Offsets are then computed over that order, so the numbers
+            // below describe the emitted C in both cases.
+            let order: Vec<usize> = if reordered {
+                auto_order(&ls.iter().map(|l| l.align).collect::<Vec<_>>())
+            } else {
+                (0..fs.len()).collect()
+            };
+            let placed: Vec<Layout> = order.iter().map(|&k| ls[k]).collect();
+            let (_, offsets) = aggregate(&placed);
             let mut prev_end = 0u64;
-            for (k, (name, t)) in fs.iter().enumerate() {
+            for (slot, &k) in order.iter().enumerate() {
+                let (name, t) = &fs[k];
                 fields.push(FieldLayout {
                     name: name.clone(),
                     ty: t.display(&info.table),
-                    offset: offsets[k],
+                    offset: offsets[slot],
                     size: ls[k].size,
                     align: ls[k].align,
-                    pad_before: offsets[k] - prev_end,
+                    pad_before: offsets[slot] - prev_end,
                 });
-                prev_end = offsets[k] + ls[k].size;
+                prev_end = offsets[slot] + ls[k].size;
             }
         }
 
-        let (size, align) = match named_layout(info, i) {
+        let (size, align) = match named_layout(info, &auto, i) {
             Some(l) => (l.size, l.align),
             None => {
                 incomplete = true;
@@ -298,6 +451,7 @@ pub fn compute(ast: &Ast, info: &TypeInfo) -> Vec<TypeLayout> {
             waste,
             fields,
             incomplete,
+            reordered,
         });
     }
     out
@@ -312,6 +466,11 @@ pub fn render(layouts: &[TypeLayout]) -> String {
     out.push_str(&format!("types {}\n", layouts.len()));
     for t in layouts {
         let _ = write!(out, "{} {} size {} align {} waste {}", t.kind, t.name, t.size, t.align, t.waste);
+        if t.reordered {
+            // Said out loud: the field list below is emission order, so it will not
+            // match the source, and the numbers describe the shuffled struct.
+            out.push_str(" (reordered)");
+        }
         if t.incomplete {
             // Said out loud rather than silently approximated: a record whose
             // components are generic cannot be trusted as a number.
@@ -451,6 +610,99 @@ mod tests {
         let plain = layouts_of("struct Wide { a: u8, b: u8, mode: u8, rest: u8 }\n");
         assert!(!by_name(&plain, "Wide").incomplete);
         assert_eq!(by_name(&plain, "Wide").size, 4);
+    }
+
+    // ── `@layout(auto)` (increment L2) ──────────────────────────────────────────
+
+    /// **The invariant the optimality argument rests on.** `auto_order` claims to be
+    /// minimal, not merely tighter, and the proof needs every layout to satisfy
+    /// `size % align == 0` — otherwise a field could start at an unaligned offset even
+    /// in descending-alignment order and interior padding would reappear.
+    ///
+    /// Checked over the shapes the model has rules for rather than argued, because the
+    /// claim silently stops holding the moment a future type breaks the pattern.
+    #[test]
+    fn every_layout_size_is_a_multiple_of_its_alignment() {
+        let ls = layouts_of(
+            "struct S { a: u8, b: u64, c: u8 }\n\
+             struct N { s: S, f: f32 }\n\
+             struct A { xs: [3]i32, t: str }\n\
+             enum E { none, some(v: i64) }\n\
+             distinct D = u16\n\
+             struct W { d: D, e: E, p: *mut i32 }\n",
+        );
+        for t in &ls {
+            assert_eq!(t.size % t.align, 0, "{} is {} bytes at align {}", t.name, t.size, t.align);
+            for f in &t.fields {
+                assert_eq!(f.size % f.align, 0, "field {}.{} breaks the invariant", t.name, f.name);
+            }
+        }
+    }
+
+    /// Descending alignment leaves **no interior padding at all** — the whole claim.
+    /// Every byte of slack is tail padding, which no ordering can remove (only a
+    /// smaller alignment can), so `waste == align_to(Σ sizes, align) - Σ sizes`.
+    #[test]
+    fn auto_ordering_leaves_no_interior_padding() {
+        let ls = layouts_of(
+            "@layout(auto) struct T { a: u8, b: u64, c: u8, d: i32, e: u16 }\n",
+        );
+        let t = by_name(&ls, "T");
+        assert!(t.reordered);
+        assert!(
+            t.fields.iter().all(|f| f.pad_before == 0),
+            "descending alignment must insert no interior padding: {:?}",
+            t.fields
+        );
+        let used: u64 = t.fields.iter().map(|f| f.size).sum();
+        assert_eq!(t.size, align_to(used, t.align), "only tail padding may remain");
+        // Declaration order would have cost more — the point of taking the option.
+        let plain = layouts_of("struct T { a: u8, b: u64, c: u8, d: i32, e: u16 }\n");
+        assert!(by_name(&plain, "T").size > t.size, "reordering must actually save bytes");
+    }
+
+    /// Ties keep declaration order, and the whole ordering is stable across runs. The
+    /// emitted C feeds the attest hash, so an ordering that depended on hash iteration
+    /// order would make a build unreproducible.
+    #[test]
+    fn auto_ordering_is_stable_and_deterministic() {
+        assert_eq!(auto_order(&[1, 8, 1, 4, 1]), vec![1, 3, 0, 2, 4]);
+        // Four fields of equal alignment: the identity, not an arbitrary shuffle.
+        assert_eq!(auto_order(&[4, 4, 4, 4]), vec![0, 1, 2, 3]);
+        let src = "@layout(auto) struct S { a: u8, b: u64, c: u8, d: u64 }\n";
+        let first = render(&layouts_of(src));
+        for _ in 0..5 {
+            assert_eq!(render(&layouts_of(src)), first);
+        }
+        assert!(first.contains("(reordered)"), "the report must say the order changed");
+    }
+
+    /// Reordering is **not** a local property: a smaller inner struct moves every
+    /// offset after it in the outer one. If the model failed to propagate, the report
+    /// (and later the comptime `@offset_of`) would disagree with the emitted C.
+    #[test]
+    fn reordering_propagates_into_an_embedding_struct() {
+        let src = "@layout(auto) struct Inner { a: u8, b: u64, c: u8 }\n\
+                   struct Outer { i: Inner, tag: u8 }\n";
+        let ls = layouts_of(src);
+        // Inner: 8 + 1 + 1 → 16 (vs 24 in declaration order).
+        assert_eq!(by_name(&ls, "Inner").size, 16);
+        // Outer must see 16, not the 24 it would have seen without propagation.
+        let o = by_name(&ls, "Outer");
+        assert_eq!(o.fields[0].size, 16, "the embedding struct must see the reordered size");
+        assert_eq!(o.size, 24);
+        // Outer itself is untouched: the attribute is per-struct, not contagious.
+        assert!(!o.reordered);
+    }
+
+    /// The default is unchanged, and `@layout(c)` is exactly the default said out loud.
+    #[test]
+    fn the_c_policy_is_the_untouched_default() {
+        let plain = layouts_of("struct S { a: u8, b: u64, c: u8 }\n");
+        let explicit = layouts_of("@layout(c) struct S { a: u8, b: u64, c: u8 }\n");
+        assert_eq!(render(&plain), render(&explicit));
+        assert!(!by_name(&explicit, "S").reordered);
+        assert!(!render(&plain).contains("(reordered)"));
     }
 
     #[test]

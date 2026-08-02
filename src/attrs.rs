@@ -18,7 +18,7 @@
 //! hand, before enums/consts/externs discard theirs) and feeds the ordinary
 //! diagnostic stream. See [`validate`] and [`validate_fn`].
 
-use crate::ast::{Ast, Attribute, ExprKind, FnDecl, TypeKind};
+use crate::ast::{Ast, Attribute, ExprKind, FnDecl, Item, StructMember, TypeKind};
 use crate::diag::Diagnostic;
 
 /// Where an attribute is written — used to reject misplaced attributes with a
@@ -289,6 +289,75 @@ pub fn validate(ast: &Ast, attrs: &[Attribute], target: Target, diags: &mut Vec<
     }
     check_duplicates(attrs, diags);
     check_conflicts(attrs, diags);
+}
+
+/// Validate the attributes of a struct/record/union whose **body has been parsed**.
+///
+/// Split from [`validate`] because these checks need the declaration's shape, and the
+/// generic run happens at the item keyword, before the body exists. Everything here
+/// concerns `@layout(auto)`, whose contract is "the compiler may choose this struct's
+/// field order" — a promise that is either meaningless or actively wrong in three
+/// declarations, each refused with its own cause rather than silently ignored.
+pub fn validate_struct(ast: &Ast, item: &Item, diags: &mut Vec<Diagnostic>) {
+    let Item::Struct { body, attrs, is_union, .. } = item else {
+        return;
+    };
+    for a in attrs.iter().filter(|a| a.name == "layout") {
+        // The vocabulary is closed (`c` | `auto`). Checking only that the argument *is*
+        // an identifier — which is all `Args::Word` does — let `@layout(packd)` validate
+        // clean and do nothing, and an attribute that quietly means nothing reads like a
+        // guarantee. Same argument as `@simd` on a function with no `par for`.
+        let word = match a.args.first().map(|id| &ast.expr_at(*id).kind) {
+            Some(ExprKind::Name(n)) => n.name.clone(),
+            // A malformed argument was already reported by `check_args`.
+            _ => continue,
+        };
+        if !crate::layout::LAYOUT_WORDS.contains(&word.as_str()) {
+            diags.push(
+                Diagnostic::new(format!("unknown layout policy `{word}` in `@layout`"), a.span)
+                    .with_help(
+                        "expected `c` (declaration order, the default) or `auto` (the compiler minimises padding)",
+                    ),
+            );
+            continue;
+        }
+        if word != "auto" {
+            continue;
+        }
+        if *is_union {
+            diags.push(
+                Diagnostic::new(
+                    "`@layout(auto)` cannot be applied to a union".to_string(),
+                    a.span,
+                )
+                .with_help(
+                    "a union's members all start at offset 0, so there is no order to improve — and C treats the first member as the initially-active one, which makes the declared order meaningful",
+                ),
+            );
+        }
+        if attrs.iter().any(|o| o.name == "packed") {
+            diags.push(
+                Diagnostic::new(
+                    "`@layout(auto)` conflicts with `@packed`".to_string(),
+                    a.span,
+                )
+                .with_help(
+                    "`@packed` means the byte layout you wrote is the byte layout emitted; `@layout(auto)` means the compiler may choose it — pick one",
+                ),
+            );
+        }
+        if body.members.iter().any(|m| matches!(m, StructMember::Field { bits: Some(_), .. })) {
+            diags.push(
+                Diagnostic::new(
+                    "`@layout(auto)` cannot be applied to a struct with bit-fields".to_string(),
+                    a.span,
+                )
+                .with_help(
+                    "bit-field packing is implementation-defined in C, so the compiler cannot compute the layout it would be improving — and moving a field between storage units is observable",
+                ),
+            );
+        }
+    }
 }
 
 /// Validate a function's (or method's) attributes: the generic checks in
@@ -763,6 +832,41 @@ mod tests {
     fn struct_layout_attrs_still_validate_clean() {
         let d = diags_of("@packed @align(8) struct S { x: i32 }");
         assert!(d.is_empty(), "expected no diagnostics, got {d:?}");
+    }
+
+    /// The two policies `@layout` accepts, and nothing else.
+    ///
+    /// The third case is the one with teeth: before this check, `Args::Word` verified
+    /// only that the argument *was* an identifier, so a typo validated clean and did
+    /// nothing at all — the failure mode where a user believes they opted into a
+    /// guarantee they never got.
+    #[test]
+    fn layout_accepts_only_its_two_policies() {
+        assert!(diags_of("@layout(c) struct S { x: i32 }").is_empty());
+        assert!(diags_of("@layout(auto) struct S { a: u8, b: u64 }").is_empty());
+        let d = diags_of("@layout(packd) struct S { x: i32 }");
+        assert!(has_msg(&d, "unknown layout policy `packd`"), "{d:?}");
+    }
+
+    /// `@layout(auto)` is refused where the promise "the compiler may choose the field
+    /// order" is either vacuous or wrong. Each cause is named separately, because
+    /// "cannot reorder" tells the user nothing about which of their three declarations
+    /// is the problem.
+    #[test]
+    fn layout_auto_is_refused_where_it_could_not_mean_what_it_says() {
+        // A union: every member is at offset 0, and C's first-member rule makes the
+        // declared order observable.
+        let d = diags_of("@layout(auto) union U { a: u8, b: u64 }");
+        assert!(has_msg(&d, "cannot be applied to a union"), "{d:?}");
+        // `@packed` is the exact opposite promise.
+        let d = diags_of("@packed @layout(auto) struct S { a: u8, b: u64 }");
+        assert!(has_msg(&d, "conflicts with `@packed`"), "{d:?}");
+        // Bit-fields: implementation-defined packing, so the model cannot compute the
+        // layout it claims to improve — the same gap `layout::bitfield_types` admits.
+        let d = diags_of("@layout(auto) struct S { a: u8 : 1, b: u8 : 3 }");
+        assert!(has_msg(&d, "bit-fields"), "{d:?}");
+        // …and `@align(n)` is orthogonal: a forced alignment says nothing about order.
+        assert!(diags_of("@align(16) @layout(auto) struct S { a: u8, b: u64 }").is_empty());
     }
 
     #[test]
