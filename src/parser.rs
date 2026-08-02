@@ -70,8 +70,12 @@ impl<'src> Parser<'src> {
     }
 
     pub fn parse(self) -> (Ast, Vec<Diagnostic>) {
-        let (mut ast, items, diags) = self.parse_module();
+        let (mut ast, items, mut diags) = self.parse_module();
         ast.items = items; // a fresh single-file parse: these are the only items
+        // Attribute checks that need the *whole* program — `@abi(ref)` has to know
+        // whether the function's address is taken anywhere, and a use may come from a
+        // later item than the declaration, so this cannot run at the declaration.
+        attrs::validate_program(&ast, &mut diags);
         (ast, diags)
     }
 

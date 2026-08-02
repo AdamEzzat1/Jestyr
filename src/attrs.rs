@@ -97,6 +97,24 @@ const SPECS: &[Spec] = &[
     Spec { name: "layout", targets: &[Target::Struct], args: Args::Word, status: Status::Active },
     // opt-in `Copy` for a small aggregate (design §2.8): freely copied, never moves.
     Spec { name: "copy", targets: &[Target::Struct], args: Args::None, status: Status::Active },
+    // `@abi(<word>)` (workstream L, increment 3) — how this function's **large
+    // read-only aggregate parameters** are passed. `value` is the default (a copy,
+    // which is what `read` has always meant physically); `ref` passes them as
+    // `const T*` and dereferences at every use, so a 64-byte record crosses the call
+    // boundary as one machine word.
+    //
+    // It is an *ABI* attribute, not an optimization hint: it changes the emitted C
+    // signature, so the compiler has to be able to see every call. A function whose
+    // address is taken is therefore refused — a `fn(T) -> R` pointer type records no
+    // calling convention, so calling through one would pass a copy to a callee
+    // expecting a pointer, which C would compile without complaint.
+    //
+    // **Free functions only, for now.** A method reaches its callee through more paths
+    // than a direct call — method-call sugar, a bound method value, a trait vtable, a
+    // `dyn` fat pointer — and every one of them would have to agree on the convention.
+    // Until they do, `@abi` on a method is refused by the target list rather than
+    // emitting a signature some call sites do not match.
+    Spec { name: "abi", targets: &[Target::Fn], args: Args::Word, status: Status::Active },
     // ── bare-metal field qualifier (design §16) ────────────────────────────
     Spec { name: "volatile", targets: &[Target::Field], args: Args::None, status: Status::Active },
     // ── safety / verification (functions) ──────────────────────────────────
@@ -380,6 +398,10 @@ pub fn validate_fn(ast: &Ast, f: &FnDecl, is_method: bool, diags: &mut Vec<Diagn
         }
     }
 
+    if let Some(a) = f.attr("abi") {
+        check_abi_contract(ast, f, a, diags);
+    }
+
     if let Some(a) = f.attr("no_mangle") {
         if is_generic(ast, f) {
             diags.push(
@@ -514,6 +536,118 @@ impl Cost {
 }
 
 /// Map a `@span(<word>)` class name to its cost, or `None` if unrecognized.
+/// The calling conventions `@abi(<word>)` accepts.
+///
+/// * `value` — the default. A `read` parameter is physically a copy.
+/// * `ref` — a large read-only aggregate is passed as `const T*` instead.
+pub const ABI_WORDS: &[&str] = &["value", "ref"];
+
+/// Validate `@abi(<word>)`: the vocabulary, and the one rule that keeps it sound.
+///
+/// **The rule:** `@abi(ref)` changes the emitted C signature, so every call has to be
+/// compiled against the same convention. That holds for direct calls, which cgen
+/// resolves by name — and fails for an *indirect* one, because a `fn(T) -> R` pointer
+/// type carries no convention. Taking the function's address and calling through it
+/// would pass a by-value copy to a callee reading a pointer: C compiles it, the program
+/// reads a struct as an address.
+///
+/// So a `@abi(ref)` function whose address is taken is refused. That is checkable
+/// syntactically, and cheaply: a *call* mentions the name as a callee, anything else
+/// that mentions it takes its address.
+///
+/// A generic function is refused for the same family of reason — its parameter types
+/// are not known until instantiation, so "which parameters are large aggregates" is not
+/// a question this pass can answer. (`@no_mangle` is refused on generics too, for the
+/// mangling analogue.)
+fn check_abi_contract(ast: &Ast, f: &FnDecl, a: &Attribute, diags: &mut Vec<Diagnostic>) {
+    let word = match a.args.first().map(|id| &ast.expr_at(*id).kind) {
+        Some(ExprKind::Name(n)) => n.name.clone(),
+        // A malformed argument was already reported by `check_args`.
+        _ => return,
+    };
+    if !ABI_WORDS.contains(&word.as_str()) {
+        diags.push(
+            Diagnostic::new(format!("unknown calling convention `{word}` in `@abi`"), a.span)
+                .with_help("expected `value` (a copy — the default) or `ref` (large read-only aggregates as `const T*`)"),
+        );
+        return;
+    }
+    if word != "ref" {
+        return;
+    }
+    if is_generic(ast, f) {
+        diags.push(
+            Diagnostic::new("`@abi(ref)` cannot be applied to a generic function".to_string(), a.span)
+                .with_help(
+                    "which parameters are large aggregates is not known until the function is instantiated",
+                ),
+        );
+    }
+    // The address-taken rule needs the whole program (a use can come from a later
+    // item than the declaration), so it lives in `validate_program`.
+}
+
+/// Whole-program attribute checks — the ones a single item cannot answer.
+///
+/// Today that is exactly one: an `@abi(ref)` function whose address is taken. The
+/// declaration is validated as it is parsed, when the rest of the file does not exist
+/// yet, so a `let g = f` three items later would slip past. This runs once, over the
+/// finished AST. (The same ordering lesson as `validate_struct`, one scope wider.)
+pub fn validate_program(ast: &Ast, diags: &mut Vec<Diagnostic>) {
+    // Collected once: every expression that is somebody's callee. A call names the
+    // function in *callee* position, so a `Name` that is nobody's callee is an
+    // address-taking mention — no per-form walker to keep in sync.
+    let mut callees = std::collections::HashSet::new();
+    for e in &ast.exprs {
+        if let ExprKind::Call { callee, .. } = &e.kind {
+            callees.insert(*callee);
+        }
+    }
+    for item in &ast.items {
+        let Item::Fn(f) = item else { continue };
+        let Some(a) = f.attr("abi") else { continue };
+        if !matches!(
+            a.args.first().map(|id| &ast.expr_at(*id).kind),
+            Some(ExprKind::Name(n)) if n.name == "ref"
+        ) {
+            continue;
+        }
+        if let Some(span) = fn_address_taken(ast, &f.name.name, &callees) {
+            diags.push(
+                Diagnostic::new(
+                    format!("`@abi(ref)` function `{}` has its address taken here", f.name.name),
+                    span,
+                )
+                .with_help(
+                    "a `fn(…)` pointer type records no calling convention, so an indirect call would pass a copy where a pointer is expected — call it directly, or drop `@abi(ref)`",
+                ),
+            );
+        }
+    }
+}
+
+/// The span where `name` is mentioned as a **value** rather than called, if anywhere.
+///
+/// A call names the function in *callee* position (`ExprKind::Call { callee, .. }`), so
+/// scanning the flat expression arena for a `Name(name)` that is nobody's callee finds
+/// exactly the address-taking mentions — a `let g = f`, an argument `run(f)`, a struct
+/// field holding it. No walker to maintain: a new expression form that can hold a
+/// function value is covered the moment it stores an `ExprId`.
+fn fn_address_taken(
+    ast: &Ast,
+    name: &str,
+    callees: &std::collections::HashSet<crate::ast::ExprId>,
+) -> Option<crate::span::Span> {
+    for (i, e) in ast.exprs.iter().enumerate() {
+        if let ExprKind::Name(n) = &e.kind {
+            if n.name == name && !callees.contains(&crate::ast::ExprId(i as u32)) {
+                return Some(e.span);
+            }
+        }
+    }
+    None
+}
+
 fn span_class(word: &str) -> Option<Cost> {
     Some(match word {
         // `constant`, not `const` — the latter is a reserved keyword, so it cannot
@@ -815,6 +949,17 @@ mod tests {
         diags.iter().any(|d| d.message.contains(needle))
     }
 
+    /// Diagnostics from a **whole-program** parse — `Parser::parse`, which populates
+    /// `ast.items` and therefore runs [`validate_program`]. `diags_of` uses
+    /// `parse_module`, whose items stay separate from the arena, so the cross-item
+    /// checks would find nothing there.
+    fn program_diags_of(src: &str) -> Vec<Diagnostic> {
+        let (tokens, lex) = Lexer::new(src).tokenize();
+        assert!(lex.is_empty(), "lexing failed: {lex:?}");
+        let (_ast, parse) = Parser::new(src, tokens).parse();
+        parse
+    }
+
     #[test]
     fn unknown_attribute_is_rejected_with_a_suggestion() {
         let d = diags_of("@inlien fn f() {}");
@@ -867,6 +1012,64 @@ mod tests {
         assert!(has_msg(&d, "bit-fields"), "{d:?}");
         // …and `@align(n)` is orthogonal: a forced alignment says nothing about order.
         assert!(diags_of("@align(16) @layout(auto) struct S { a: u8, b: u64 }").is_empty());
+    }
+
+    /// `@abi` accepts `value` | `ref` and nothing else, and refuses `ref` in the two
+    /// places it could not be honoured soundly.
+    #[test]
+    fn abi_accepts_its_conventions_and_refuses_the_unsound_uses() {
+        let big = "struct Big { a: i64, b: i64, c: i64 }\n";
+        assert!(diags_of(&format!("{big}@abi(ref) fn f(read v: Big) -> i64 {{ return v.a }}")).is_empty());
+        assert!(diags_of(&format!("{big}@abi(value) fn f(read v: Big) -> i64 {{ return v.a }}")).is_empty());
+        let d = diags_of(&format!("{big}@abi(pointer) fn f(read v: Big) -> i64 {{ return v.a }}"));
+        assert!(has_msg(&d, "unknown calling convention `pointer`"), "{d:?}");
+        // Generic: which parameters are large aggregates is unknown until instantiation.
+        let d = diags_of("@abi(ref) fn f(comptime T: type, read v: T) -> i64 { return 0 }");
+        assert!(has_msg(&d, "cannot be applied to a generic function"), "{d:?}");
+        // A method is refused by the target list: it reaches its callee through paths
+        // (method sugar, a bound value, a vtable, `dyn`) that do not yet agree on the
+        // convention, and a signature some call sites do not match is worse than a
+        // "not yet".
+        let d = diags_of(&format!("{big}struct S {{ x: i64\n  @abi(ref) fn f(read self, read v: Big) -> i64 {{ return v.a }} }}"));
+        assert!(has_msg(&d, "cannot be applied to a method"), "{d:?}");
+    }
+
+    /// **The soundness rule.** A `fn(T) -> R` pointer type records no calling
+    /// convention, so calling an `@abi(ref)` function through one would pass a copy
+    /// where the callee reads a pointer — C compiles that without a word.
+    ///
+    /// The check has to be **whole-program**: the address may be taken from a later
+    /// item than the declaration (or another file entirely), so validating the function
+    /// as it is parsed would see an empty arena. That was the first version, and it
+    /// silently passed the very program it exists to reject.
+    #[test]
+    fn an_abi_ref_function_may_not_have_its_address_taken() {
+        let big = "struct Big { a: i64, b: i64, c: i64 }\n";
+        // Taken by a later item — the ordering that broke the first implementation.
+        let d = program_diags_of(&format!(
+            "{big}@abi(ref) fn total(read v: Big) -> i64 {{ return v.a }}\n\
+             fn main() -> i32 {{ let g: fn(Big) -> i64 = total return 0 }}"
+        ));
+        assert!(has_msg(&d, "has its address taken"), "{d:?}");
+        // Passed as an argument — also an address, not a call.
+        let d = program_diags_of(&format!(
+            "{big}@abi(ref) fn total(read v: Big) -> i64 {{ return v.a }}\n\
+             fn run(g: fn(Big) -> i64) -> i64 {{ return 0 }}\n\
+             fn main() -> i32 {{ run(total) return 0 }}"
+        ));
+        assert!(has_msg(&d, "has its address taken"), "{d:?}");
+        // …but an ordinary direct call is exactly what the attribute is for.
+        let d = program_diags_of(&format!(
+            "{big}@abi(ref) fn total(read v: Big) -> i64 {{ return v.a }}\n\
+             fn main() -> i32 {{ let b = Big {{ a: 1, b: 2, c: 3 }} print_int(total(b)) return 0 }}"
+        ));
+        assert!(d.is_empty(), "a direct call must be fine: {d:?}");
+        // And a function *without* the attribute may still be used as a value.
+        let d = program_diags_of(&format!(
+            "{big}fn total(read v: Big) -> i64 {{ return v.a }}\n\
+             fn main() -> i32 {{ let g: fn(Big) -> i64 = total return 0 }}"
+        ));
+        assert!(d.is_empty(), "{d:?}");
     }
 
     #[test]

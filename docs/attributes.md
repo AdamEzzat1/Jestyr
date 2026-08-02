@@ -80,6 +80,8 @@ Argument shapes are fixed per attribute and enforced:
 | `@align(n)` | struct | power-of-2 int | `__attribute__((aligned(n)))` | force a minimum alignment |
 | `@layout(c)` | struct | identifier | (marker) | C field order — the default |
 | `@layout(auto)` | struct | identifier | reordered declaration | let the compiler minimise padding |
+| `@abi(value)` | fn | identifier | (marker) | large `read` aggregates are copied — the default |
+| `@abi(ref)` | fn | identifier | `const T*` parameter | …passed by reference instead |
 | `@volatile` | field | — | `volatile` qualifier | MMIO — never cache the field |
 | `@no_panic` | fn / method | — | (static check) | every faulting op must be provably safe |
 | `@inline` | fn / method | — | `static inline __attribute__((always_inline))` | force inlining |
@@ -270,6 +272,43 @@ silent no-op, because in each the byte order is already load-bearing:
 offset, and the padding waste. A reordered struct's fields are listed in **emission**
 order and the record is marked `(reordered)`, so the report always describes the bytes
 the backend actually produces. See [`examples/layout_auto.jtr`](../examples/layout_auto.jtr).
+
+### `@abi(ref)` — stop copying large read-only parameters
+
+`read` says a parameter is borrowed and will not be mutated. Physically, though, it has
+always been a **copy**: a 64-byte record crossing a call boundary is 64 bytes of memcpy,
+at every call.
+
+```jestyr
+@abi(ref) fn checksum(read frame: Frame) -> i64 { … }
+```
+
+Now it crosses as one machine word. The compiler emits `const Frame*` and dereferences at
+every use; the `const` is not decoration, it is the C-level statement of what `read`
+already promised, so the C compiler enforces the read-only half rather than trusting it.
+
+**Which parameters change, and which deliberately do not.** Only `read` (or default-borrow)
+parameters whose type is an **aggregate larger than two machine words**. `mut`/`out`
+already pass a pointer; `take` is an ownership transfer whose copy is the point; a scalar
+or a small struct is already one or two registers, and a pointer to it would be *slower*
+plus an indirection at every use — an ABI attribute that pessimized the small cases would
+be a bad attribute. A parameter whose size the compiler cannot know (a generic instance)
+is left by value rather than guessed at.
+
+**It is an ABI change, not a hint**, so every call has to be compiled against the same
+convention. That holds for direct calls, which the compiler resolves by name — and fails
+for indirect ones, because a `fn(T) -> R` pointer type carries no convention:
+
+```jestyr
+let f: fn(Frame) -> i64 = checksum    // error: `@abi(ref)` function has its address taken
+```
+
+That is refused rather than left to C, which would compile the mismatch without a word
+and read a struct as an address. Generic functions are refused too (their parameter types
+are not known until instantiation), and for now so are **methods** — a method reaches its
+callee through method sugar, bound values, trait vtables and `dyn` fat pointers, and until
+all of those agree on the convention, refusing is better than emitting a signature some
+call sites do not match.
 
 ---
 

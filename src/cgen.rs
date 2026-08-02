@@ -2081,12 +2081,18 @@ impl<'a> Cgen<'a> {
     /// instances), and `self.subst` (set by the caller) substitutes type
     /// parameters. `comptime` type parameters are erased from the signature.
     fn emit_fn(&mut self, f: &FnDecl, c_name: &str) {
+        // `mut`/`out` have always been pointers; `@abi(ref)` adds the large read-only
+        // aggregates to the same set. That set is the *only* thing the body needs to
+        // know — a name in it renders as `(*j_x)`, so every field read, every pass-on
+        // and every capture follows without another line of backend change. Reusing the
+        // existing indirection is what makes an ABI change a small increment.
         self.ptr_params = f
             .params
             .iter()
             .filter(|p| !p.comptime && matches!(p.conv, Conv::Mut | Conv::Out))
             .map(|p| p.name.name.clone())
             .collect();
+        self.ptr_params.extend(self.abi_ref_params(f));
         self.cur_result = self.fn_result_type(f);
         self.cur_ensures = f.ensures.clone();
         self.cur_ret_cty = self.ret_type(f);
@@ -2898,6 +2904,7 @@ impl<'a> Cgen<'a> {
     }
 
     fn params_str(&mut self, f: &FnDecl) -> String {
+        let byref = self.abi_ref_params(f);
         let mut parts = Vec::new();
         for p in &f.params {
             // `self` (methods) and `comptime` type parameters are not runtime
@@ -2909,7 +2916,15 @@ impl<'a> Cgen<'a> {
                 Some(t) => self.c_ty_ast(t),
                 None => "int".to_string(),
             };
-            let cty = borrow_ptr_cty(&base, p.conv);
+            // `@abi(ref)`: a large read-only aggregate crosses as `const T*` instead of
+            // being copied. `const` is not decoration — it is the C-level statement of
+            // what `read` already promises, so the compiler enforces the read-only half
+            // of the convention rather than trusting it.
+            let cty = if byref.contains(&p.name.name) {
+                format!("const {base}*")
+            } else {
+                borrow_ptr_cty(&base, p.conv)
+            };
             parts.push(format!("{cty} j_{}", p.name.name));
         }
         if parts.is_empty() {
@@ -2917,6 +2932,109 @@ impl<'a> Cgen<'a> {
         } else {
             parts.join(", ")
         }
+    }
+
+    /// The parameters of `f` that `@abi(ref)` passes by `const T*`.
+    ///
+    /// Empty unless the function carries `@abi(ref)`, which is what keeps every program
+    /// that does not opt in byte-identical.
+    ///
+    /// ## Which parameters qualify, and why not all of them
+    /// A parameter qualifies when it is **read-only** (`read`, or the default borrow —
+    /// `mut`/`out` already pass a pointer, and a `take` parameter is an ownership
+    /// transfer whose copy is the point) and its type is an aggregate **larger than two
+    /// machine words**.
+    ///
+    /// The size threshold matters. Below it, a by-value pass is already one or two
+    /// registers and a pointer would be *slower* plus an indirection at every use — an
+    /// ABI attribute that pessimized the small cases would be a bad attribute. Sixteen
+    /// bytes is where the common C ABIs stop passing aggregates in registers.
+    ///
+    /// The size comes from `layout.rs`, which is the payoff L1 was built for: a
+    /// parameter whose layout is **not knowable** (a generic instance, an opaque type)
+    /// is left by value rather than guessed at, so the convention is never chosen from a
+    /// number the compiler had to invent.
+    fn abi_ref_params(&self, f: &FnDecl) -> HashSet<String> {
+        let mut out = HashSet::new();
+        if !self.wants_abi_ref(f) {
+            return out;
+        }
+        let model = crate::layout::Model::default();
+        for p in &f.params {
+            if p.is_self || p.comptime || matches!(p.conv, Conv::Mut | Conv::Out | Conv::Take) {
+                continue;
+            }
+            let Some(tid) = p.ty else { continue };
+            let ty = self.ast_type_to_ty(tid, &self.subst);
+            // Only an aggregate — a scalar or a pointer is already one word, and
+            // wrapping it in another pointer is pure loss.
+            if !matches!(ty, Ty::Named(_) | Ty::Array { .. }) {
+                continue;
+            }
+            if let Some(l) = crate::layout::layout_of(self.info, &model, &ty) {
+                if l.size > 2 * 8 {
+                    out.insert(p.name.name.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// The **runtime parameter positions** a call to `name` must pass by address
+    /// because the callee carries `@abi(ref)`.
+    ///
+    /// Positions rather than names, because a call site has arguments, not parameters.
+    /// Empty for every function that did not opt in, which is what keeps existing call
+    /// sites byte-identical.
+    fn abi_ref_positions(&self, name: &str) -> HashSet<usize> {
+        let mut out = HashSet::new();
+        let Some(f) = self.find_fn(name) else { return out };
+        if !self.wants_abi_ref(f) {
+            return out;
+        }
+        let byref = self.abi_ref_params(f);
+        for (i, p) in f.params.iter().filter(|p| !p.is_self && !p.comptime).enumerate() {
+            if byref.contains(&p.name.name) {
+                out.insert(i);
+            }
+        }
+        out
+    }
+
+    /// Render `arg` as a `const T*` for an `@abi(ref)` parameter.
+    ///
+    /// ## Why this is two cases and not one
+    /// `&(e)` is only legal when `e` is an lvalue, and a `read` argument may be any
+    /// expression — `f(make_point())` is a call whose result has no address. Taking
+    /// `&` of it does not compile; spilling it into a GNU statement expression and
+    /// returning that address is *worse*, because the temporary dies at the closing
+    /// brace and the callee would read freed stack.
+    ///
+    /// The rvalue case therefore uses a **compound literal of array type**:
+    /// `(const T[1]){ e }` initializes a one-element array from the value and decays to
+    /// `const T*`. Its lifetime is the enclosing block, so it comfortably outlives the
+    /// call, and it is plain C99 rather than a GNU extension.
+    ///
+    /// The lvalue case still takes the address directly, and that matters: it is the
+    /// only path that avoids a copy, which is the entire point of the attribute. An
+    /// implementation that always used the compound literal would be correct and
+    /// completely pointless.
+    fn abi_ref_arg(&mut self, arg: ExprId, rendered: &str) -> String {
+        if is_c_lvalue(self.ast, arg) {
+            return format!("&({rendered})");
+        }
+        let cty = self.c_type(&self.info.type_of(arg).clone());
+        format!("(const {cty}[1]){{ {rendered} }}")
+    }
+
+    /// Does `f` carry `@abi(ref)`? (The vocabulary is validated in `attrs.rs`; this
+    /// only reads the spelling, so the two cannot disagree about what `ref` means.)
+    fn wants_abi_ref(&self, f: &FnDecl) -> bool {
+        let Some(a) = f.attr("abi") else { return false };
+        matches!(
+            a.args.first().map(|id| &self.ast.expr_at(*id).kind),
+            Some(ExprKind::Name(n)) if n.name == "ref"
+        )
     }
 
     // --- statements ---
@@ -5305,10 +5423,15 @@ impl<'a> Cgen<'a> {
                 .get(&cname)
                 .map(|sig| sig.params.iter().map(|p| p.conv).collect())
                 .unwrap_or_default();
+            let byref = self.abi_ref_positions(&cname);
             let mut parts = Vec::new();
             for (i, a) in args.iter().enumerate() {
                 let e = if matches!(convs.get(i), Some(Conv::Mut) | Some(Conv::Out)) {
                     self.emit_addr_arg(*a)
+                } else if byref.contains(&i) {
+                    // `@abi(ref)`: this parameter is `const T*` in the callee.
+                    let v = self.emit_expr(*a);
+                    self.abi_ref_arg(*a, &v)
                 } else {
                     self.emit_expr(*a)
                 };
@@ -5337,10 +5460,15 @@ impl<'a> Cgen<'a> {
             .get(name)
             .map(|sig| sig.params.iter().map(|p| p.conv).collect())
             .unwrap_or_default();
+        let byref = self.abi_ref_positions(name);
         let mut parts = Vec::new();
         for (i, a) in args.iter().enumerate() {
             let e = if matches!(convs.get(i), Some(Conv::Mut) | Some(Conv::Out)) {
                 self.emit_addr_arg(*a)
+            } else if byref.contains(&i) {
+                // `@abi(ref)`: this parameter is `const T*` in the callee.
+                let v = self.emit_expr(*a);
+                self.abi_ref_arg(*a, &v)
             } else {
                 self.emit_expr(*a)
             };
@@ -8742,6 +8870,33 @@ impl<'a> Cgen<'a> {
     }
 }
 
+/// Does this expression lower to a C **lvalue** — something `&` may be applied to?
+///
+/// ## A Jestyr *place* is not automatically a C lvalue
+/// The obvious rule — "the four place forms are lvalues" — is wrong, and the
+/// `an_abi_ref_function_computes_the_same_answers` oracle rejected it immediately.
+/// `xs[1]` is a place in Jestyr, but cgen lowers a **bounds-checked** index to a GNU
+/// statement expression (`({ … ; _a->a[_i]; })`), which yields a *value*; `&` of it does
+/// not compile. So lvalue-ness has to follow the **emission**, not the source form:
+///
+/// * `Name` — `j_x`, or `(*j_x)` for a pointer parameter. Both lvalues.
+/// * `Field` — an lvalue exactly when its base is one, since it renders as `<base>.j_f`.
+///   `xs[0].a` is therefore *not* one, because the base is that statement expression.
+/// * `Deref` — always. Dereferencing any pointer *value* produces an lvalue in C, so
+///   this holds however the operand was rendered.
+/// * `Index` — never, per the above.
+///
+/// Being wrong toward "not an lvalue" costs one copy through the compound-literal path;
+/// being wrong the other way does not compile at all, which is why the recursion is
+/// worth the few lines.
+fn is_c_lvalue(ast: &Ast, id: ExprId) -> bool {
+    match &ast.expr_at(id).kind {
+        ExprKind::Name(_) | ExprKind::Deref { .. } => true,
+        ExprKind::Field { base, .. } => is_c_lvalue(ast, *base),
+        _ => false,
+    }
+}
+
 /// The C type of a runtime parameter given its passing convention.
 ///
 /// A `mut`/`out` borrow is an *exclusive* (non-aliasing) reference — the same
@@ -10238,6 +10393,68 @@ mod tests {
         assert!(c.contains("sizeof(Jestyr_M)"), "bare size_of still defers to C: {c}");
         assert!(!c.contains("_Alignof"), "@align_of must not have deferred: {c}");
         assert!(!c.contains("offsetof("), "@offset_of must not have deferred: {c}");
+    }
+
+    /// `@abi(ref)` changes the **signature**, and only for the parameters it should.
+    ///
+    /// The three negative assertions carry as much weight as the positive one: a scalar
+    /// and a small aggregate must stay by value (a pointer to them is strictly worse
+    /// than the copy), and a function without the attribute must be untouched — which is
+    /// what keeps every existing program byte-identical.
+    #[test]
+    fn abi_ref_passes_large_read_aggregates_by_const_pointer() {
+        let src = "struct Big { a: i64, b: i64, c: i64, d: i64 } struct Small { x: i64 } \
+                   @abi(ref) fn total(read v: Big, read s: Small, n: i64) -> i64 \
+                   { return v.a + v.d + s.x + n } \
+                   fn plain(read v: Big) -> i64 { return v.a } \
+                   fn main() -> i32 { let b = Big { a: 1, b: 2, c: 3, d: 4 } \
+                   let s = Small { x: 5 } print_int(total(b, s, 6)) print_int(plain(b)) return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        // 32 bytes → by `const*`; 8 bytes and a scalar → unchanged.
+        assert!(
+            c.contains("jestyr_total(const Jestyr_Big* j_v, Jestyr_Small j_s, int64_t j_n)"),
+            "only the large aggregate goes by reference: {c}"
+        );
+        // The body dereferences through the existing `ptr_params` path.
+        assert!(c.contains("(*j_v).j_a"), "field read through the pointer: {c}");
+        // An lvalue argument takes its address — no copy, which is the entire point.
+        assert!(c.contains("jestyr_total(&(j_b), j_s, 6)"), "lvalue arg by address: {c}");
+        // A function that did not opt in is completely unchanged.
+        assert!(c.contains("jestyr_plain(Jestyr_Big j_v)"), "non-users untouched: {c}");
+        assert!(c.contains("jestyr_plain(j_b)"), "non-user call untouched: {c}");
+    }
+
+    /// An **rvalue** argument has no address, so `&(…)` would not compile and a GNU
+    /// statement expression would hand back a dangling one. A compound literal of array
+    /// type gives a `const T*` whose lifetime is the enclosing block.
+    #[test]
+    fn abi_ref_passes_a_temporary_through_a_compound_literal() {
+        let src = "struct Big { a: i64, b: i64, c: i64, d: i64 } \
+                   fn make() -> Big { return Big { a: 1, b: 2, c: 3, d: 4 } } \
+                   @abi(ref) fn total(read v: Big) -> i64 { return v.a + v.d } \
+                   fn main() -> i32 { print_int(total(make())) return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(
+            c.contains("jestyr_total((const Jestyr_Big[1]){ jestyr_make() })"),
+            "a temporary needs a compound literal, not `&`: {c}"
+        );
+        assert!(!c.contains("&(jestyr_make())"), "taking the address of an rvalue: {c}");
+    }
+
+    /// `@abi(value)` is the default said out loud, so it must emit exactly what no
+    /// attribute at all emits — the property that lets the corpus stay byte-identical.
+    #[test]
+    fn abi_value_is_byte_identical_to_no_attribute() {
+        let base = "struct Big { a: i64, b: i64, c: i64, d: i64 } \
+                    fn total(read v: Big) -> i64 { return v.a } \
+                    fn main() -> i32 { let b = Big { a: 1, b: 2, c: 3, d: 4 } print_int(total(b)) return 0 }";
+        let (plain, _) = gen(base);
+        let (explicit, _) = gen(&base.replace("fn total", "@abi(value) fn total"));
+        assert_eq!(plain, explicit, "`@abi(value)` must change nothing");
+        let (byref, _) = gen(&base.replace("fn total", "@abi(ref) fn total"));
+        assert_ne!(plain, byref, "`@abi(ref)` must actually change the emission");
     }
 
     #[test]

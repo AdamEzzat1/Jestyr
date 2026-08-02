@@ -206,6 +206,11 @@ pub fn load(root: &str) -> Program {
             }
         }
     }
+    // Attribute checks that need the whole program rather than one item — today the
+    // `@abi(ref)` address-taken rule. Run here, once every module's items are in the
+    // shared arena, because a function's address may be taken from a *different* file
+    // than the one that declares it.
+    crate::attrs::validate_program(&l.ast, &mut l.diags);
     Program {
         ast: l.ast,
         diags: l.diags,

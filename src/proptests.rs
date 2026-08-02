@@ -9569,6 +9569,55 @@ fn main() -> i32 {
         }
     }
 
+    /// **`@abi(ref)` changes the calling convention and nothing else.**
+    ///
+    /// The same source is compiled and run twice — once with the attribute, once
+    /// without — and every value must be identical. An ABI change is exactly the kind
+    /// that C will compile either way and only misbehave at run time, so the check has
+    /// to be a real execution rather than an inspection of the emitted text.
+    ///
+    /// The cases cover each way an argument can reach a by-reference parameter: a plain
+    /// lvalue (`&(j_b)`, the no-copy path the attribute exists for), a **temporary**
+    /// (the compound-literal path, where `&` would not compile), a field of another
+    /// struct, an array element, a value passed onward to a second `@abi(ref)` callee,
+    /// and a mix of by-ref and by-value parameters in one signature — which is where a
+    /// mismatch between the signature's parameter order and the call site's would show.
+    #[test]
+    fn an_abi_ref_function_computes_the_same_answers() {
+        let decls = "struct Big { a: i64, b: i64, c: i64, d: i64 }\n\
+                     struct Holder { big: Big, tag: i64 }\n\
+                     fn make(n: i64) -> Big { return Big { a: n, b: n + 1, c: n + 2, d: n + 3 } }\n";
+        // `SUM` and `PASS` are the two functions the annotation is applied to.
+        let fns = "fn sum(read v: Big, k: i64, read w: Big) -> i64 \
+                   { return v.a + v.b + v.c + v.d + k + w.a }\n\
+                   fn pass(read v: Big) -> i64 { return sum(v, 100, v) }\n";
+        let body = "fn main() -> i32 {\n\
+              let b = make(1)\n\
+              let h = Holder { big: make(10), tag: 7 }\n\
+              let xs: [2]Big = [make(20), make(30)]\n\
+              print_int(sum(b, 5, b))\n\
+              print_int(sum(make(2), 5, b))\n\
+              print_int(sum(h.big, h.tag, b))\n\
+              print_int(sum(xs[1], 0, xs[0]))\n\
+              print_int(pass(b))\n\
+              return 0\n\
+            }\n";
+        let plain = format!("{decls}{fns}{body}");
+        let annotated = plain.replace("fn sum(", "@abi(ref) fn sum(").replace("fn pass(", "@abi(ref) fn pass(");
+        let a = run_inline("abi value", &plain);
+        let b = run_inline("abi ref", &annotated);
+        assert_eq!(a, b, "`@abi(ref)` changed an observable value");
+        // Pin the values too, so a change that broke *both* runs identically would
+        // still be caught. `make(n)` sums to `4n + 6`, and `sum(v, k, w)` is
+        // `sum(v) + k + w.a`:
+        //   sum(b, 5, b)            = 10  + 5   + 1  = 16    (lvalue arg)
+        //   sum(make(2), 5, b)      = 14  + 5   + 1  = 20    (temporary)
+        //   sum(h.big, h.tag, b)    = 46  + 7   + 1  = 54    (field of a struct)
+        //   sum(xs[1], 0, xs[0])    = 126 + 0   + 20 = 146   (array elements)
+        //   pass(b) = sum(b, 100, b)= 10  + 100 + 1  = 111   (passed onward)
+        assert_eq!(a, ["16", "20", "54", "146", "111"], "unexpected results: {a:?}");
+    }
+
     /// **`@layout(auto)` changes the bytes and nothing else.** The offsets being right
     /// (above) is only half the claim; the other half is that a program cannot *tell*.
     /// So the same source is compiled and run twice — once annotated, once not — and
