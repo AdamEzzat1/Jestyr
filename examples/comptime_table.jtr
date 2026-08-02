@@ -1,0 +1,39 @@
+// examples/comptime_table.jtr — a lookup table the COMPILER computes (roadmap G tier 6).
+//
+// The point of the tier, in one line: `const T = comptime { … }` yielding an aggregate
+// becomes an ordinary C static, so the C compiler gets the answers rather than the work.
+//
+// Why the `comptime` block is load-bearing here. `const SQUARES: [6]i64 = [sq(0), sq(1), …]`
+// does not compile: a `static const` initializer must be a constant expression, and
+// `jestyr_sq(0)` is a function call. Wrapping the same literal in `comptime { … }` moves the
+// calls to *compile time*, and what reaches C is `{ { 0, 1, 4, 9, 16, 25 } }` — a brace
+// initializer, which is the one form a static can take. (An expression-position aggregate
+// uses a GNU statement-expression instead; a static may not, which is why the two paths
+// exist separately in cgen.)
+//
+//   jestyrc run examples/comptime_table.jtr   →   25, 6, 2, 1, 3
+fn sq(x: i64) -> i64 { return x * x }
+
+fn fib(n: i64) -> i64 {
+    if n < 2 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+
+// Values computed by calls the C compiler never sees.
+const SQUARES: [6]i64 = comptime { [sq(0), sq(1), sq(2), sq(3), sq(4), sq(5)] }
+
+// Recursion at compile time — the C compiler gets 3, not the call tree that produced it.
+const FIBS: [5]i64 = comptime { [fib(1), fib(2), fib(3), fib(4), fib(5)] }
+
+// The repeat form. Fuel is spent per ELEMENT, so a count the author did not mean is a
+// diagnostic rather than an attempt to allocate — on both compilers.
+const ZEROS: [4]i64 = comptime { [0; 4] }
+
+fn main() -> i32 {
+    print_int(SQUARES[5])                    // 25 — the table, indexed at runtime
+    print_int(SQUARES.len as i64)            // 6
+    print_int(FIBS[2])                       // 2 — FIBS is [1, 1, 2, 3, 5], so fib(3)
+    print_int(ZEROS[0] + 1)                  // 1 — the repeat form really is all zeros
+    print_int(comptime { 1 + 2 } as i64)     // 3 — a scalar block still folds as before
+    return 0
+}

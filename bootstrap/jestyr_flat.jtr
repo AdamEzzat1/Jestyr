@@ -4672,6 +4672,19 @@ pub fn list_len(read it: Interp, read v: Value) -> i64 {
     return get(i32, it.lidx, (v.i * 2 + 1) as usize) as i64
 }
 
+// The first element of a non-empty List value — what decides an unannotated table's
+// element type. Public because typeck needs it and has no business walking the arenas.
+pub fn list_first(read it: Interp, read v: Value) -> Value {
+    return list_at(it, v, 0)
+}
+
+// Element `ix`, for cgen's benefit. Range-checked by the caller, which in cgen's case is a
+// loop over `list_len` — the arenas stay private so the emitter cannot grow its own opinion
+// about the representation.
+pub fn list_get(read it: Interp, read v: Value, ix: i64) -> Value {
+    return list_at(it, v, ix)
+}
+
 // Element `ix` of a List value. The caller has already range-checked it.
 fn list_at(read it: Interp, read v: Value, ix: i64) -> Value {
     let start: i32 = get(i32, it.lidx, (v.i * 2) as usize)
@@ -7590,6 +7603,31 @@ fn infer(mut c: Checker, read p: Parser, read src: str, id: i32) -> i32 {
         else if v.tag == 0 { r = t_i32() }
         else if v.tag == 1 { r = t_bool() }
         else if v.tag == 2 { r = t_str() }
+        else if v.tag == 4 {
+            // An aggregate becomes a fixed-size array — the same type a WRITTEN
+            // `[a, b, c]` produces, so a computed table is indistinguishable from a
+            // hand-written one to every later pass. An annotation wins for the ELEMENT
+            // type exactly as it does for a written literal (`const T: [4]i64 = …`
+            // makes the elements i64, not the default i32); without one the first
+            // element decides, and a nested or empty list has no rule that would not
+            // be a guess, so it is refused.
+            let n: i64 = list_len(ci, v)
+            var elem: i32 = 0 - 1
+            if c.expected >= 0 {
+                let ed: TyData = get(TyData, c.tys, c.expected as usize)
+                if ed.kind == 9 { elem = ed.a }
+            }
+            if elem < 0 {
+                if n > 0 {
+                    let first: Value = list_first(ci, v)
+                    if first.tag == 0 { elem = t_i32() }
+                    else if first.tag == 1 { elem = t_bool() }
+                    else if first.tag == 2 { elem = t_str() }
+                }
+            }
+            if elem < 0 { r = mk_ty__typeck(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1) }  // Error
+            else { r = mk_ty__typeck(c, 9, elem, n as i32, 0 - 1, 0 - 1) }
+        }
         else { r = mk_ty__typeck(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1) }           // produced no value
     }
     else if k == 2 {                               // Name: scope -> const -> variant ctor -> ?
@@ -10403,6 +10441,37 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
         var ci: Interp = make__ctfe(g.alloc)
         let v: Value = eval(ci, p, src, eid)
         if ci.failed { string_push(sb, "0") }
+        else if v.tag == 4 {
+            // An aggregate fills a fresh array value, exactly as a written `[a, b, …]`
+            // does — the two are indistinguishable in the output. (At a `const`
+            // initializer this path is bypassed for the brace form; see `emit_consts`,
+            // which is what a large lookup table actually needs.)
+            let ety: i32 = get(i32, c.et, eid as usize)
+            let n: i32 = g.tmp
+            g.tmp = g.tmp + 1
+            string_push(sb, "({ ")
+            let td: TyData = get(TyData, c.tys, ety as usize)
+            if td.kind == 9 { emit_ty_c(sb, p, src, c, ety) } else { string_push(sb, "int") }
+            string_push(sb, " _cl")
+            push_i64(sb, n as i64)
+            string_push(sb, ";")
+            let cnt: i64 = list_len(ci, v)
+            var k: i64 = 0
+            for k < cnt {
+                string_push(sb, " _cl")
+                push_i64(sb, n as i64)
+                string_push(sb, ".a[")
+                push_i64(sb, k)
+                string_push(sb, "] = (")
+                let e: Value = list_get(ci, v, k)
+                push_ctfe_scalar(sb, ci, e)
+                string_push(sb, ");")
+                k = k + 1
+            }
+            string_push(sb, " _cl")
+            push_i64(sb, n as i64)
+            string_push(sb, "; })")
+        }
         else if v.tag == 0 { push_i64(sb, v.i) }
         else if v.tag == 1 {
             if v.i == 1 { string_push(sb, "true") } else { string_push(sb, "false") }
@@ -17389,6 +17458,42 @@ fn is_declared_type(read c: Checker, read src: str, read nm: str) -> bool {
     return false
 }
 
+// One comptime SCALAR as its C text. A nested list and a unit both render as `0`: neither
+// can reach here in a well-formed program (typeck refuses a unit-valued block, and a nested
+// aggregate needs an annotation it cannot have in this position), and cgen stays total
+// rather than faulting on a program that was already rejected. Mirrors `c_comptime_scalar`.
+fn push_ctfe_scalar(mut sb: String, read ci: Interp, read v: Value) {
+    if v.tag == 0 { push_i64(sb, v.i)  return }
+    if v.tag == 1 {
+        if v.i == 1 { string_push(sb, "true") } else { string_push(sb, "false") }
+        return
+    }
+    if v.tag == 2 {
+        string_push(sb, "JSTR(")
+        push_c_string(sb, str_of(ci, v))
+        string_push(sb, ")")
+        return
+    }
+    string_push(sb, "0")
+}
+
+// A comptime aggregate as a C BRACE initializer — `{ { 1, 2, 3 } }`, the outer pair for the
+// array-wrapper struct and the inner for its `a[]` member. This is the form a `const` needs:
+// a static initializer may not contain a statement-expression, so the `({ … })` shape the
+// expression path builds would be invalid C at file scope. Mirrors `c_comptime_brace`.
+fn push_ctfe_brace(mut sb: String, read ci: Interp, read v: Value) {
+    string_push(sb, "{ { ")
+    let n: i64 = list_len(ci, v)
+    var k: i64 = 0
+    for k < n {
+        if k > 0 { string_push(sb, ", ") }
+        let e: Value = list_get(ci, v, k)
+        if e.tag == 4 { push_ctfe_brace(sb, ci, e) } else { push_ctfe_scalar(sb, ci, e) }
+        k = k + 1
+    }
+    string_push(sb, " } }")
+}
+
 // Top-level `const`s: `static const <cty> j_<name> = <value>;` each, then the unconditional
 // trailing blank. An array-literal value takes a BRACE initializer (`{ { … } }`) rather than the
 // statement-expression `emit_expr` would give — a `static const` can't be initialized by a GNU
@@ -17406,17 +17511,34 @@ fn emit_consts(mut sb: String, read p: Parser, read src: str, read c: Checker, m
             string_push(sb, src[it.x .. it.y])
             string_push(sb, " = ")
             let v: ExprData = get(ExprData, p.ex, it.b as usize)
-            if v.kind == 14 {                         // array literal -> brace initializer
-                string_push(sb, "{ { ")
-                var i: i32 = 0
-                for i < v.y {
-                    if i > 0 { string_push(sb, ", ") }
-                    emit_expr(sb, p, src, c, g, get(i32, p.ar, (v.x + i) as usize))
-                    i = i + 1
+            var done: bool = false
+            if v.kind == 44 {                         // comptime block -> maybe a TABLE
+                // The payoff of tier 6: a lookup table COMPUTED by the compiler becomes
+                // an ordinary static, indistinguishable from one typed out by hand. It
+                // needs the brace form for the same reason an array literal does, so
+                // this arm sits beside that one rather than inside `emit_expr`.
+                var ci: Interp = make__ctfe(g.alloc)
+                let cv: Value = eval(ci, p, src, it.b)
+                if ci.failed == false {
+                    if cv.tag == 4 {
+                        push_ctfe_brace(sb, ci, cv)
+                        done = true
+                    }
                 }
-                string_push(sb, " } }")
-            } else {
-                emit_expr(sb, p, src, c, g, it.b)
+            }
+            if done == false {
+                if v.kind == 14 {                     // array literal -> brace initializer
+                    string_push(sb, "{ { ")
+                    var i: i32 = 0
+                    for i < v.y {
+                        if i > 0 { string_push(sb, ", ") }
+                        emit_expr(sb, p, src, c, g, get(i32, p.ar, (v.x + i) as usize))
+                        i = i + 1
+                    }
+                    string_push(sb, " } }")
+                } else {
+                    emit_expr(sb, p, src, c, g, it.b)
+                }
             }
             string_push(sb, ";\n")
         }

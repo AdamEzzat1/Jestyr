@@ -201,11 +201,13 @@ emit, `examples/comptime_block.jtr`), M4 (reflection, `examples/comptime_reflect
 M5 (the def-order fix M4 surfaced), M6 (aggregate *values*: a list is a pair index
 naming a run of cells in flat arenas — elements staged before storage so a nested
 literal cannot interleave, and sharing left unclosed only because tier 6 cannot observe
-it). **Left:** the **tier 7 mirror** (the comptime `for` + mutation, which owes the deep
-copy tier 6 could defer, at the two points the reference clones), and **tier 6
-emission** in the port (an aggregate `const` as a C static — a brace initializer, since
-a static cannot take the GNU statement-expression the expression path uses), which is
-what will actually grow the corpus.
+it), M8 (aggregate *emission* — the brace form for a static, the statement-expression
+form for an expression position; `examples/comptime_table.jtr` is corpus **138**).
+**Left:** the **tier 7 mirror** (the comptime `for` + mutation, which owes the deep copy
+tier 6 could defer, at the two points the reference clones). It is also the gate on the
+tier's best dogfood: replacing the self-hosted lexer's `is_alpha`/`is_digit`/`is_hex`
+branch chains with a computed 256-entry class table needs the table's *shape* computed,
+which is tier 7 — tier 6 alone would mean 256 spelled-out literals.
 **Recorded dependency:** `size_of`/`align_of`/`offset_of` exist today only as
 *C-deferred* intrinsics (`sizeof`/`_Alignof`/`offsetof`), so exposing them as comptime
 *values* is genuinely blocked on **L**. That is the *only* real L dependency here —

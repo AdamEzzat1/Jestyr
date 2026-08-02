@@ -224,6 +224,19 @@ pub fn list_len(read it: Interp, read v: Value) -> i64 {
     return list.get(i32, it.lidx, (v.i * 2 + 1) as usize) as i64
 }
 
+// The first element of a non-empty List value — what decides an unannotated table's
+// element type. Public because typeck needs it and has no business walking the arenas.
+pub fn list_first(read it: Interp, read v: Value) -> Value {
+    return list_at(it, v, 0)
+}
+
+// Element `ix`, for cgen's benefit. Range-checked by the caller, which in cgen's case is a
+// loop over `list_len` — the arenas stay private so the emitter cannot grow its own opinion
+// about the representation.
+pub fn list_get(read it: Interp, read v: Value, ix: i64) -> Value {
+    return list_at(it, v, ix)
+}
+
 // Element `ix` of a List value. The caller has already range-checked it.
 fn list_at(read it: Interp, read v: Value, ix: i64) -> Value {
     let start: i32 = list.get(i32, it.lidx, (v.i * 2) as usize)

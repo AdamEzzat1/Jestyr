@@ -1868,6 +1868,31 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
         else if v.tag == 0 { r = t_i32() }
         else if v.tag == 1 { r = t_bool() }
         else if v.tag == 2 { r = t_str() }
+        else if v.tag == 4 {
+            // An aggregate becomes a fixed-size array — the same type a WRITTEN
+            // `[a, b, c]` produces, so a computed table is indistinguishable from a
+            // hand-written one to every later pass. An annotation wins for the ELEMENT
+            // type exactly as it does for a written literal (`const T: [4]i64 = …`
+            // makes the elements i64, not the default i32); without one the first
+            // element decides, and a nested or empty list has no rule that would not
+            // be a guess, so it is refused.
+            let n: i64 = ctfe.list_len(ci, v)
+            var elem: i32 = 0 - 1
+            if c.expected >= 0 {
+                let ed: TyData = list.get(TyData, c.tys, c.expected as usize)
+                if ed.kind == 9 { elem = ed.a }
+            }
+            if elem < 0 {
+                if n > 0 {
+                    let first: ctfe.Value = ctfe.list_first(ci, v)
+                    if first.tag == 0 { elem = t_i32() }
+                    else if first.tag == 1 { elem = t_bool() }
+                    else if first.tag == 2 { elem = t_str() }
+                }
+            }
+            if elem < 0 { r = mk_ty(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1) }  // Error
+            else { r = mk_ty(c, 9, elem, n as i32, 0 - 1, 0 - 1) }
+        }
         else { r = mk_ty(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1) }           // produced no value
     }
     else if k == 2 {                               // Name: scope -> const -> variant ctor -> ?
