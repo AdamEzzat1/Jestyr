@@ -95,7 +95,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | I | Error-handling polish | ~70% | MED | S | ✓ | — |
 | J | Numeric / operator completeness | ~70% | MED | S–M | ✓ | ✓ (determinism) |
 | K | Module system v2 | ~98% | MED | M | ✓ | ✓✓ (build/incremental) |
-| L | Memory-layout pass | ~55% | MED | M | ✓ | ✓✓ (mem-efficiency) |
+| L | Memory-layout pass | ✅ ~100% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
 | N | Concurrency polish | ~100% | MED | M | ✓ | — |
 | O | Tooling (fmt / test / doc / LSP) | test-runner ✅, doc ✅, attest ✅, attest --diff ✅ — **all four also SELF-HOSTED ✅**; LSP/fmt deferred | LOW | M | ✓✓ | ✓ |
@@ -301,7 +301,7 @@ no `#line` ⇒ byte-identical there; only the loader path emits). `-g` is separa
 `CC_FLAGS` determinism/attest seam. Full test rigor + teeth. See `jestyr-debuginfo.md`.
 **Next systems items (untouched):** cross-compile (`--target` via `zig cc`), then L, then M.
 
-### L. Memory-layout pass — ~55% (MED conflict; files: `layout.rs`, attrs, cgen + port)
+### L. Memory-layout pass — ✅ **~100%** (files: `layout.rs`, attrs, cgen + port)
 **Design §16 / a Motley principle. Directly serves Motley's "memory efficiency at every
 layer."**
 
@@ -325,11 +325,28 @@ refused with its own named cause on a union, with `@packed`, and on a bit-field 
 Port mirror in `examples/std/cgen.jtr` (`la_*`), corpus **141**
 (`examples/layout_auto.jtr`), seed refreshed.
 
-**Left:** **L3** — enum **niche-packing** behind the same attribute, and
-pass-large-aggregates-by-`const*` (today `read` params copy) behind `@abi(ref)`; each
-opt-in, each its own increment + port mirror. Then `@size_of`/`@align_of`/`@offset_of` as
-comptime **values** (L1 unblocked the computation; exposing it is its own slice, and closes
-the gap `docs/ctfe-tiers.md` records against tier 3).
+**L3 — `@abi(ref)` ✅.** `read` says "borrowed, not mutated" but was physically a **copy**;
+`@abi(ref)` passes a large one as `const T*`. Small because the mechanism existed —
+`mut`/`out` already use a `ptr_params` set that renders `(*j_x)`, so adding the qualifying
+`read` params to it is the whole body change. Applies to `read`/default-borrow aggregate
+params **larger than two machine words** (below that a pointer is slower than the copy);
+the size comes from `layout.rs`, and an unknowable one is left by value. **It is an ABI
+change, so it is checked**: taking the function's address is an error (a `fn(T) -> R` type
+records no convention, and C would compile the mismatch silently), as are generics and —
+for now — methods, whose vtable/`dyn`/sugar call paths would all have to agree.
+
+**Niche packing needed no work** — it already existed on master, *automatic* rather than
+attribute-gated, which is right: the optimization is provably free, so an opt-in would ask
+users to request something that costs nothing. Only the layout *model* was unaware, which
+mattered the moment `@size_of` folded from it.
+
+**`@size_of`/`@align_of`/`@offset_of` as comptime values ✅** — closes the gap
+`docs/ctfe-tiers.md` recorded against tier 3. The bare names still lower to C's
+`sizeof`/`_Alignof`/`offsetof` (so existing programs are byte-identical); the `@` twins are
+values this compiler computes, usable in a `const` or an array length.
+
+**Left (optional, none blocking):** `@abi(ref)` on methods; bit-fields remain
+admitted-unmodellable (closing that means committing the model to a specific C ABI).
 
 ### M. `@verified` (SMT) — 0% (HIGH conflict; XL; files: a new verifier + typeck)
 **Design §7 ceiling (ATS/Ada).** Turn `requires`/`ensures`/`invariant`/`variant`

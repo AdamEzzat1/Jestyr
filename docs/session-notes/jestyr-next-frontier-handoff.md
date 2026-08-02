@@ -30,6 +30,10 @@
 |---|---|---|
 | **X2** the by-ADDRESS half — `mut`/`out` receivers and arguments | *(this run)* | **Closes the sibling gap X1 left open, and it was the one-line mechanism X1 predicted.** A `mut`/`out` parameter and a `mut`/`out self` receiver are passed by address, so `cs[i].bump()` emitted `&({ …; _a->a[_ix]; })` — "lvalue required as unary `&` operand", the *same* defect as `xs[i].f = v` at a different call site. One helper, `emit_addr_arg` = `&(` + `emit_place(id, true)` + `)`, and every conveyance site routes through it: **11 in the reference** (six argument loops, the monomorphized-call loop, the inherent-method and impl-call receivers, and the operator-trait receiver + rhs) and **14 in the port**, which splits its dispatch more finely. Byte-identity is again by construction — `emit_place` falls through to `emit_expr` for anything not reached through a checked index, and `read`/by-value conveyances never take an address at all, which is what a dedicated test now pins. `examples/nested_place.jtr` grew the by-address half rather than spawning a corpus 142: the three call lowerings (inherent `mut self`, trait impl, `mut` parameter) each mutate the same element in sequence — `15, 115, 116` — and the file re-reads **element 0** afterwards, so a lowering that handed over a temporary would print `10, 10, 10` and leave the neighbour check unmoved. **Two things worth carrying:** the port's shape count is not the reference's (14 vs 11) and that is fine — what the mirror contract fixes is the emitted *text* and the temp *numbering*, not the number of arms; and `fn take(…)` in a test fixture cost a cascade of 14 parse errors, because `take` is a **conveyance keyword** — the diagnostic says "expected function name, found `take`", which reads like a parser bug (finding 4's hazard, now recorded with its actual error text). **Still deliberately out of scope, and now the only remaining site of this class:** `emit_dyn_coercion`'s `&({inner})` (cgen.rs, mirrored at cgen.jtr) — coercing `xs[i]` to a `dyn Trait` takes the address of a statement expression the same way. It is a *different* construct (the fat pointer's data pointer, with its own lifetime question about pointing into an array), so it wants its own increment rather than a reflex fix. |
 | **X1** places through a checked index — `xs[i].f = v`, `m[i][j]`, **corpus 141** | *(this run)* | **A real miscompile, and the class it belongs to.** A bounds-checked index lowers to a GNU statement expression, which yields a **value** — fine for a read, and wrong in all three *place* positions: the left of `=`, the operand of `&`, and the base of another index. So `xs[i].b = 9` emitted `({ …; _a->a[_ix]; }).j_b = 9` and gcc said "lvalue required as left operand of assignment". The probe found the defect is **wider than the write path**: `m[i][j]` fails to *read* as well, because an array index takes `&base` and `&({ … })` is "lvalue required as unary `&` operand" — and the spilled pointer was `const` on a path that writes. The fix is a second emitter, `emit_place`, agreeing with `emit_expr` everywhere except a checked index, where it yields the element's ADDRESS and derefs it (`(*({ …; &elem; }))`) so a projection chain can continue through it; `write` picks the qualifier, since a read of a `static const` table must keep `const` and a store must not. **Byte-identity is by construction, not by luck** — `emit_place` falls through to `emit_expr` for every non-index form, and a *directly* indexed target (`xs[i] = v`) deliberately keeps its existing lvalue lowering, so all 137 allowlisted files were unchanged on the first run. `examples/nested_place.jtr` is corpus **141**, and it is written so a write that lands in a *copy* still fails: it reads back a **neighbour** (`xs[0]` right after writing `xs[1]`), which is the only way to tell "wrote the array" from "wrote a copy of one element" — both print `9` for the element itself. **The mirror surfaced a dormant divergence worth remembering:** the reference emits an array index's base and index into temps *before* allocating its own `_a{n}`, while the port allocated `n` first. Those orders agree only while no base or index allocates a temp — true of every corpus file until `m[i][j]` existed. The port's array-read branch had to be restructured to buffer-first; the same latent ordering is still present in the port's *slice*-read branch (unreachable today, recorded in §3 as the next trivial increment). **Known remaining gap, same root cause, different call site:** a `mut`/`out` receiver or argument is emitted as `&({e})`, so `cs[i].method()` with a `mut self` is still "lvalue required as unary `&` operand" — the ready-made fix is to route those through `emit_place(a, true)`; left out to keep this increment to one construct. **— CLOSED by X2 (the row above), which found 11 such sites in the reference, not nine.** **One deliberate non-mirror**, so nobody reads it as a missed one: the reference's `emit_place` Field arm also excludes `info.qualified` (a `mem.PAGE` module const), and the port has no counterpart because it has no `qualified` map at all — the in-language loader rewrites module paths at flatten time. The guard is unreachable on both sides (a module const's base is a module *name*, never an index), so it is structural, not a divergence. |
+| **L3** `@abi(ref)` — large `read` aggregates stop being copies | `98f5cd1` | **Workstream L is complete.** `read` has always said "borrowed, not mutated" while physically being a **copy**; `@abi(ref)` makes a large one cross as `const T*`. Opt-in per function, so corpus 141 / concat / fixpoint / seed are untouched. **The increment was small because the mechanism already existed:** `mut`/`out` have always been pointers via a `ptr_params` set whose members render `(*j_x)`, so adding the qualifying `read` params to that set is the *entire* body change — every field read, pass-on and capture follows for free. Finding the existing indirection was worth more than any code written. **Which params change:** `read`/default-borrow only, aggregate only, **larger than two machine words** — below that a by-value pass is already one or two registers and a pointer would be *slower*, and an ABI attribute that pessimized the small cases would be a bad attribute. The size comes from `layout.rs` (L1's payoff); an unknowable size is left by value rather than guessed. **Two things the tests caught that reasoning had not:** (1) **a Jestyr place is not automatically a C lvalue** — `xs[1]` is a place, but a *bounds-checked* index lowers to a GNU statement expression, which yields a value, so `&` of it does not compile. Lvalue-ness must follow the EMISSION: `Field` is one iff its base is (so `xs[0].a` is not), `Deref` always is, `Index` never is. (2) **the address-taken check had to be whole-program** — first written per-item in `validate_fn`, where it silently passed the exact program it exists to reject, because the function is validated as it is parsed and a `let g = f` in a later item sees an empty arena. Now `attrs::validate_program`, called from `Parser::parse` *and* `module::load`. **The soundness rule:** an indirect call cannot be compiled against the convention (a `fn(T) -> R` type carries none), so taking the address is refused — detected cheaply, since a call names its function in *callee* position, so a `Name` that is nobody's callee is an address-taking mention. Generics refused (param types unknown until instantiation); **methods refused by the target list**, deliberately — a method reaches its callee through method sugar, bound values, vtables and `dyn`, and a signature some call sites do not match is worse than a "not yet". A temporary argument uses a **compound literal of array type** (`(const T[1]){ e }` — block lifetime, plain C99); the GNU statement-expression alternative returns a pointer to a temporary that dies at the closing brace. The lvalue path is the one that avoids the copy, which is the whole point. **On L3's other half — niche packing already exists on master**, automatic rather than gated, and correctly so: the optimization is provably free, so an opt-in would ask users to request something that costs nothing. |
+| **L (CTFE)** `@size_of`/`@align_of`/`@offset_of` as comptime VALUES + two real model bugs | `4d763e5` | Closes the gap `docs/ctfe-tiers.md` recorded against tier 3. **Both spellings remain and mean different things:** bare `size_of(T)` still lowers to C's `sizeof` (untouched, so every existing program is byte-identical), while `@size_of(T)` is a number *this* compiler computed and can therefore appear in a `const`, an array length, or folding arithmetic. The `@` namespace decision from tier 3 paid off a second time — had reflection taken the bare names, there'd have been no room to say this. **The architectural problem:** `Interp::new(ast)` takes the AST *alone* (it answers array lengths, so it runs during type checking, before the table exists), so layout needed an AST-side front end. Only the **traversal** is duplicated; every rule (`prim_layout`, `aggregate`, `align_to`, `auto_order`) is one copy, and `the_two_layout_models_agree` pins them across the corpus. **That test found a real bug on its first run:** unions were laid out **sequentially** — `TypeKindG` has no union arm, so `union Bits { i: i32, f: f32 }` was reported as 8 bytes with `f` at offset 4 (it is 4, both at 0). Fixed by threading the declaration form through a new `Model` context. **Then a second bug it could NOT catch:** niche-optimized enums were reported as tag+payload when the backend has always emitted them as a bare pointer — `@size_of(Maybe)` would have folded to 16 while `size_of(Maybe)` gave 8, *a disagreement inside one program*. **The lesson worth carrying: cross-checking two implementations finds divergence, never shared blindness.** Only an external authority does that — here `a_folded_layout_query_equals_the_c_compilers_answer`, which prints `@size_of(T)` beside `size_of(T)` in one running program over 13 shapes and pins the values as well as the agreement. Every unknowable case is an **error, never a zero** (the G1 `[0]T` failure mode). |
+| **L2b** the `@layout(auto)` port mirror — **corpus 141**, byte-identical first run | `7d38e7b` | The self-hosted compiler reorders fields exactly as the reference does; the gcc-only seed carries the ordering model. **The mirror is alignment-only, by design:** `la_align` reproduces `layout_of`'s alignment column and nothing else, because the ordering needs nothing else — an aggregate's alignment is the max over its components, which no permutation changes, so it can be computed without first knowing which structs are reordered. `-1` is the port's `Option::None` (both sides must agree on *which* structs are reordered or their C diverges). **The sort is four passes, not a sort:** `la_emit_fields` walks levels 8/4/2/1 emitting matching fields in declaration order — exactly `sort_by_key(Reverse(align))`'s stable semantics with no list, no comparator, no allocation, and equivalent *only* because the model's alignments are drawn from those four values, which `la_reorderable` **checks** rather than assumes. `examples/layout_auto.jtr` is the corpus file, written so the load-bearing assertion is an `Outer` embedding a reordered `Tidy` **by value** — 24 bytes only if the inner really shrank; a model that failed to propagate would print 40 and pass everything else. |
+| **L2a** `@layout(auto)` reorders fields — opt-in, and provably minimal | `d7ddb65` | L's first emission change, landed the way L1 predicted: opt-in per struct, so non-annotated output is byte-identical and no port mirror was due (the Q-S2a ordering). **The enabling fact, verified before a line was written:** cgen constructs structs with C **designated initializers** and reads them by name, so permuting the declaration changes *storage* and nothing else — no initializer rewritten, no access site taught anything, and `size_of`/`@offset_of` follow for free. **The order is minimal, not merely tighter:** every layout in the model satisfies `size % align == 0` and every alignment is a power of two, so descending alignment leaves **zero interior padding** and the total is `align_to(Σ sizes, align)`, which no ordering can beat. `every_layout_size_is_a_multiple_of_its_alignment` checks the invariant rather than trusting it. Ties keep declaration order — the result feeds the attest hash, so a hash-iteration-dependent sort would make builds unreproducible. **Reordering is not local:** a smaller inner struct moves every offset after it, so the auto-set is threaded through the whole size computation; the circularity that implies is broken by the observation that alignment is order-invariant. **The vocabulary is now closed** (`c` \| `auto`) — `Args::Word` checked only that the argument *was* an identifier, so `@layout(packd)` validated clean and did nothing, which reads exactly like a guarantee. `auto` is refused with its own named cause on a union, with `@packed`, and on a bit-field struct. |
 | **Q-S2b/c/d** SIMD lowering COMPLETE — both sides, **corpus 140**, lane width in the canary | *(this run)* | **Workstream Q's SIMD arc is closed.** (b) The classify/cgen disagreement is gone, fixed on the **backend** side: cgen now lowers a value-position `if`/`else` whose arms are single tail expressions to C's conditional operator. No temporary, no spilling, no drop question — which is why this was not the deferred "statement-expression with drop-safe spilling" case. It reaches well past SIMD: `let a = if c { x } else { y }` and else-if chains work generally now, and it could not disturb byte-identity because every program it newly accepts used to be a compile error. (d) resolved the **opposite** way, deliberately: a multi-statement block stays refused, and `classify` was NARROWED to match, because there the backend's refusal is principled (spilling a block into value position genuinely needs drop safety) rather than incidental. **The rule that fell out: fix the backend when its refusal is incidental; narrow the pass when it is not** — which is what keeps "conservative, never optimistic" true rather than aspirational. (c) The port mirror: `sd_classify`/`sd_emit`/`sd_emit_par_for`/`sd_vector_defs` in cgen.jtr reproduce the whitelist and the vector lowering, **byte-identical on the first run**; only the accept/reject verdict is mirrored, not the rejection reasons, since what must agree is *which sites vectorize*. `examples/std/par_for_simd.jtr` is corpus **140** — 11 elements over 8 `i32` lanes, so every run crosses the scalar remainder, with both loops checked against serial references in-program. And **lane width is now PINNED, not merely tested**: `numerics_canary.jtr` carries two `@simd` loops whose realized values enter the locked cross-OS digest exactly as the thread-count and chunk-size results do (re-locked to `4389bf83…`). **Two port bugs the gate caught, both worth knowing:** the vector typedef was deduped by **TyId**, but the checker allocates a fresh `TyData` row per occurrence, so two `[]i32` sites carry different ids — it agreed in normal mode and emitted the typedef twice in TEST mode, where the harness's extra code shifts the arena. Dedup by the mangled NAME. And `sd_emit_par_for` took its own temp when the caller had already taken one, numbering the port's temps a step ahead of the reference's. |
 | **Q-S2a** `@simd` LOWERS — the first vector instructions | `4339d72` | **Jestyr emits SIMD.** A `par for` inside an `@simd` function whose body `simd::classify` certifies now lowers to a vector head plus a scalar remainder, using GCC vector extensions (`typedef int32_t JestyrVec_i32 __attribute__((vector_size(32)));`) — **not** an OpenMP pragma, no `-march` change, no new `CC_FLAGS`. The lowering is *chosen*, not begged for, or determinism sits at the optimizer's discretion. **Opt-in per function**, so no corpus file writes `@simd` and all 139 stay byte-identical — no port mirror, no seed refresh, the Q-W1 boundary again. **Lane count comes from the element type**, which is what Q-W1 bought: 4 for `i64`, 8 for `i32`, 32 for `u8`, from one fixed recorded `SIMD_VECTOR_BYTES = 32` (never a host probe — a width read from the build machine would make the emitted C depend on where it was compiled, which attestation would rightly flag). Results are stored **lane by lane** rather than converted as a vector, which keeps the widening to `int64_t` exact at every element width without reaching for `__builtin_convertvector`. **The headline test is end-to-end**: `simd_lowering_matches_the_scalar_path_bit_for_bit` compiles the corpus demo twice — as shipped and with `@simd` on `main` — and requires identical tokens from both binaries, over **9** elements, deliberately not a multiple of 8, 4 or 32, so every run exercises the scalar remainder. 12 unit tests + that oracle. |
 | **Q-W2** the width port mirror, **corpus 139** | `9a463d8` | Closes Q-W1 on both sides and clears Q-S2's last prerequisite. `typeck.jtr` binds the loop variable with the element's own type (`ty_is_int`, prim codes 0..=9) and `cgen.jtr` emits the element's slice type and C type with the contribution cast omitted when the body is already `i64` — so the `i64` path stays byte-identical while a narrower source keeps its width. `examples/std/par_for_width.jtr` is corpus **139**: an `i32` sum-of-squares over 9 elements (an uneven last worker chunk) checked against the serial fold, an identity max, and a `u8` sum. **The guarantee is verified where it could actually break** — `c_oracle::par_for_width_demo` runs it on real OS threads 8× and requires identical tokens each time, so "the reduction domain is `i64` while the loop iterates `i32`" is tested, not argued. Byte-identical on the first run, both for the mirror and for the new file; seed refreshed. One thing worth knowing for the next mirror: `par_elem_ty` returns `9` for its fallback and tests `ed.x > 9` two lines apart, and those are **different nines** — the first is the well-known TyId of `i64`, the second the largest integer PRIM CODE (i64's own code is 3). |
@@ -452,7 +456,7 @@ goldens key on the `jtr` extension.
 mirror + golden growth; constructs that only FOLD at check time still need typeck.jtr
 parity (the P3 golden compares every expression's resolved type).
 
-### L. Memory-layout pass (increment 1 DONE — where systems performance lives)
+### L. Memory-layout pass — ✅ **COMPLETE** (kept as the record of how)
 size/align computation, **field reordering**, **enum niche-packing**, and
 pass-large-aggregates-by-`const*` (today `read` params copy).
 **The byte-identity constraint is the whole game here:** reordering fields changes the
@@ -472,10 +476,31 @@ concat, the seed, and attest hashes at once. Land it OPT-IN:
      `struct Packed { a: u8 : 1, … }`, which really occupies 1). `compute` takes the AST
      as well as the table precisely because bit widths are syntax, not type — the same
      hook `@layout(auto)` will need.
-2. `@layout(auto)` opt-in per struct → reordered emission for annotated types only
-   (non-users byte-identical; golden corpus grows annotated files).
-3. Niche-packing behind the same attribute; by-`const*` `read` params behind
-   `@abi(ref)` or a whole-program flag — each its own increment + port mirror.
+2. ~~`@layout(auto)` opt-in per struct~~ — **DONE (L2a `d7ddb65` + L2b `7d38e7b`, both
+   sides, corpus 141).** See the ledger.
+3. ~~Niche-packing behind the same attribute; by-`const*` `read` params behind
+   `@abi(ref)`~~ — **DONE (`98f5cd1`), and one half of it turned out not to need
+   building.** `@abi(ref)` is the real increment. **Niche packing already existed on
+   master**, automatic rather than attribute-gated — which is the right design, because
+   the optimization is *provably free* (a pointer's null bit-pattern is unused), and
+   gating a free win behind an opt-in asks users to request something that costs
+   nothing. What was actually missing was the **layout model** knowing about it; fixed
+   in `4d763e5`. **This is the third time in this repo a "build X" item has turned out
+   to be "X exists, check master first"** (Q discarded two duplicate parallelism builds).
+4. ~~`@size_of`/`@align_of`/`@offset_of` as comptime values~~ — **DONE (`4d763e5`).**
+
+**Workstream L is therefore complete.** What is left is genuinely optional polish, not a
+blocked increment:
+   * **`@abi(ref)` on methods** — refused today by the target list. Needs method-call
+     sugar, bound method values, trait vtables and `dyn` fat pointers to all agree on
+     the convention. That is the whole indirect-call surface, so it is its own increment.
+   * **The `@layout(auto)` / `@abi(ref)` port mirrors for `@abi`** — `@layout(auto)` is
+     mirrored; `@abi(ref)` is not, and does not need to be until a corpus `.jtr` uses it
+     (the standing trigger rule).
+   * **Bit-fields** remain admitted-unmodellable in both the report and `@offset_of`.
+     Closing that means picking a C ABI to model, which makes the model
+     target-specific — worth doing only with a reason.
+
 **Port impact:** every opt-in construct mirrors into cgen.jtr when its corpus file
 lands; the seed refreshes.
 
@@ -758,10 +783,26 @@ what will actually grow the corpus.
    the serial fold, an identity max, and a `u8` sum, run on real OS threads 8× with
    identical tokens. Nothing here is outstanding; Q-S2 can start.
 
-3. **L2 `@layout(auto)`** — the first increment that actually changes emission, now that
-   L1's offsets are *verified against the C compiler* rather than believed. Opt-in per
-   struct, so non-annotated types stay byte-identical; the corpus grows annotated files.
-   Then L3 (niche packing, by-`const*` `read` params).
+3. ~~**L2 `@layout(auto)`** … then L3 (niche packing, by-`const*` `read` params).~~ —
+   ✅ **COMPLETE, both sides. WORKSTREAM L IS DONE.** L2a/L2b landed the opt-in field
+   reordering (corpus **141**), `@abi(ref)` landed the by-`const*` `read` params, and
+   `@size_of`/`@align_of`/`@offset_of` became comptime values. Niche packing needed no
+   building — it already existed, automatically, and only the *model* was unaware of it.
+   See the L section and the ledger for the findings; the three worth carrying into any
+   workstream are:
+
+   * **Cross-checking two implementations finds divergence, never shared blindness.**
+     `the_two_layout_models_agree` caught the union bug on its first run and could not
+     have caught the niche one, because both models were wrong together. Only an
+     external authority (gcc) closes that class — the same argument
+     `layout_matches_c_sizeof` was built on, now generalized.
+   * **A Jestyr *place* is not automatically a C lvalue.** A bounds-checked index lowers
+     to a GNU statement expression, which yields a value. Anything that wants to take an
+     address must reason about the **emission**, not the source form.
+   * **An attribute check that needs context beyond its item must run later.** Struct-body
+     checks after the body parses (`validate_struct`); whole-program checks after the
+     program does (`validate_program`). Written at the declaration, both silently pass
+     the very programs they exist to reject.
 4. ~~**Q-S2 deterministic SIMD lowering**~~ — ✅ **COMPLETE, both sides.** `@simd` lowers
    certified `par for` loops to GCC vector extensions (vector head + scalar remainder),
    the port mirrors it byte-identically, `examples/std/par_for_simd.jtr` is corpus **140**,
@@ -825,6 +866,62 @@ handle. Tier 7 makes it observable and therefore owes a deep copy at the two poi
 reference clones — binding a list, and reading one out of the environment — while
 getting an easier write path in exchange, since walking an index path over a flat arena
 is an address computation rather than a chain of `&mut` borrows.
+
+## 5. V1 tier status — **verified against the tree**, not inherited
+
+A status table circulating with an earlier handoff marked several finished things as
+`NOT DONE`. That is the most expensive kind of stale note in this repo — Q discarded two
+duplicate parallelism builds for exactly this reason — so the corrections are recorded
+here with what actually exists. **Check this table, then check master, before building
+anything below.**
+
+| Row as previously reported | Reality |
+|---|---|
+| Cost Visibility tier 2 *layout report* — NOT DONE | **DONE.** `src/layout.rs` + `jestyrc layout <file>`, verified against gcc. |
+| Cost Visibility tier 3 *`@layout(auto)`* — NOT DONE | **DONE, both sides** (`d7ddb65`, `7d38e7b`), corpus 141. |
+| Cost Visibility tier 4 *`@abi(ref)`* — NOT DONE | **DONE for free functions** (`98f5cd1`); methods refused by the target list, and that is the follow-up. |
+| Cost Visibility tier 5 *SIMD* — NOT DONE | **DONE** (`4339d72`, `8f0e948`) — `@simd` lowers to GCC vector extensions, both sides, lane width pinned in the cross-OS canary. |
+| Allocation tier 5 *`no_alloc`* — transitive NOT DONE | Direct/intraprocedural is enforced; **transitive is genuinely open.** |
+
+**So the Cost Visibility ladder (tiers 0–5) is COMPLETE**, and workstream L with it.
+
+### What is genuinely still open, in the order it is worth doing
+
+These are the rows that survive the correction above. Each is its own increment chain
+under the standing two-sided tax, and **none blocks any other**:
+
+1. **Error handling tier 3 — `catch` / recovery blocks.** `catch` is already a reserved
+   word, and `?` propagation + typed error sets are done, so this is a surface on
+   finished machinery rather than new semantics. The natural first increment is
+   parse + typeck + a cgen lowering that is *provably* equivalent to the explicit
+   `match`, pinned by a property test comparing the two.
+2. **Allocation — transitive `@no_alloc`.** Today a `@no_alloc` function calling an
+   allocating one is accepted. The check is a call-graph closure over the escape
+   checker's existing per-body allocation facts; the interesting design question is
+   what to do at a call to an *unannotated* function (assume-allocates is sound and
+   noisy; infer-per-body is precise and needs a fixpoint).
+3. **Diagnostics tier 5 — machine-readable JSON.** Mechanical, self-contained, and
+   independently useful for editor integration; the diagnostic type already carries
+   everything (message, span, help, severity).
+4. **Diagnostics tiers 2–3 — suggested rewrites.** Highest *user-visible* value per
+   line of the lot, and it needs no new machinery: borrow escapes → suggest
+   region/genref/take, non-comptime array length → suggest `const`/`comptime`
+   (the diagnostic G1 added is the hook), missing match arm → name the variant.
+5. **Error handling tier 4 — debug error traces.**
+6. **Correctness tier 5 — `@verified`.** The planning slice first (obligation
+   extraction + a `jestyrc obligations <file>` report), *not* an SMT backend. That
+   report is useful on its own and is the honest way to size the real thing.
+7. **Unsafe/provenance v2.** Start as documentation plus lints, per the design note —
+   a written contract for raw-pointer validity, aliasing, and the C interop boundary,
+   with diagnostics that enforce the parts that are checkable today.
+8. **The `#line` port** (§1) — independent, optional, and needs a module-path C golden
+   built *first*.
+
+**One standing caution for all of them:** anything that changes emitted C, an intrinsic,
+or a pass owes the port mirror **and** a seed refresh in the same commit (§0). Anything
+that only adds a refusal, a report, or an opt-in attribute nobody in `examples/` uses
+does not — that boundary is what let all four L increments land without touching the
+seed until the corpus file did.
 
 ## One-line
 Self-hosting is finished and productized, **workstream O is complete in-language**, and
