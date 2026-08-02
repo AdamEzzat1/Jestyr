@@ -4476,18 +4476,48 @@ pub fn parse_source(read src: str, mut it: Interner, kwcount: i64, read a: Alloc
 // no way to bypass it.
 //
 // ─── Scope of this slice ────────────────────────────────────────────────────────
-// Scalars only: Int, Bool and Str. The reference additionally has aggregate values
-// (tier 6) and a comptime `for` with mutation (tier 7); those need a mutable list
-// representation, which aliases badly in an arena, and they land with the corpus file
-// that exercises them. Everything here is refusal-compatible with the reference: this
-// evaluator never accepts something the reference rejects, so a corpus file that
-// folds under one folds identically under the other.
+// Scalars — Int, Bool, Str — plus **aggregates** (tier 6): `[a, b, c]`, `[v; n]`,
+// indexing and `.len`. That is what turns comptime from "compute a number" into
+// "compute a *table*". The comptime `for` and assignment (tier 7) are not here yet;
+// they land with the corpus file that exercises them. Everything here is
+// refusal-compatible with the reference: this evaluator never accepts something the
+// reference rejects, so a corpus file that folds under one folds identically under
+// the other.
 //
 // ─── Representation ─────────────────────────────────────────────────────────────
 // A `Value` is a tag plus one `i64`, so it is Copy and needs no allocator. A string
 // value's payload is an INDEX into `sidx`, a list of (start, len) pairs into the
 // single growable `sbuf` — so string values are cheap to copy and are never aliased,
 // because comptime strings are immutable.
+//
+// A LIST value works the same way one level up: its payload is a pair index into
+// `lidx`, whose (start, len) names a contiguous run of CELLS in the parallel `ltag` /
+// `lval` arenas. A cell is itself a tag+payload, so a cell tagged 4 names another run
+// — a tree living in flat arenas. The reference's `Vec<Value>` is an owned tree it
+// `.clone()`s on the way out of the environment; this is the same tree with the
+// ownership expressed as an index.
+//
+// Two consequences worth stating, because the next tier turns on them:
+//
+//   * **Elements are staged before they are stored.** Evaluating `[[1, 2], 3]` builds
+//     the inner list *while* the outer one is mid-construction, so appending each
+//     element to the arena as it is evaluated would interleave the two runs. Elements
+//     therefore land on a stack (`stag`/`sval`) and are moved into the arena as one
+//     contiguous run when the literal closes. Nested literals complete first, so the
+//     stack discipline falls out for free.
+//   * **Runs are ALREADY shared here, and that is invisible only until tier 7.**
+//     Copying a list Value copies a handle, so two bindings can name one run — but the
+//     sharing does not wait for a second binding. `[v; n]` evaluates `v` once and
+//     stages the same handle `n` times, so `[[0; 2]; 3]` is three cells naming ONE
+//     inner run where the reference holds three independently-cloned `Vec`s. Nothing
+//     in tier 6 can tell the difference: reading, indexing, `.len` and structural
+//     equality all give the same answers, and there is no way to write through a
+//     handle. Tier 7 adds assignment and the difference becomes observable
+//     immediately, so it owes a deep copy at the two places the reference clones —
+//     binding a list, and reading one back out of the environment. The flat arena is
+//     what makes the write path itself easy in exchange: walking an index path is an
+//     address computation, where the reference needs a chain of `&mut` borrows the
+//     `.jtr` subset could not express anyway.
 
 
 
@@ -4505,22 +4535,25 @@ fn fuel_budget() -> i32 { return 100000 }
 // The maximum nesting of comptime function calls.
 fn max_depth__ctfe() -> i32 { return 64 }
 
-// A comptime value. `tag`: 0=Int 1=Bool 2=Str 3=Unit.
-// `i` carries the payload: the integer, 0/1 for a bool, or a slot index into `sidx`
-// for a string. A `Unit` value is a real value (a block ending in a binding produces
-// one), so the CONSUMER decides whether a missing value is a problem.
+// A comptime value. `tag`: 0=Int 1=Bool 2=Str 3=Unit 4=List.
+// `i` carries the payload: the integer, 0/1 for a bool, a slot index into `sidx` for a
+// string, or a pair index into `lidx` for a list. A `Unit` value is a real value (a
+// block ending in a binding produces one), so the CONSUMER decides whether a missing
+// value is a problem.
 pub struct Value { pub tag: i32, pub i: i64 }
 
 pub fn is_int(read v: Value) -> bool { return v.tag == 0 }
 pub fn is_bool(read v: Value) -> bool { return v.tag == 1 }
 pub fn is_str(read v: Value) -> bool { return v.tag == 2 }
 pub fn is_unit(read v: Value) -> bool { return v.tag == 3 }
+pub fn is_list(read v: Value) -> bool { return v.tag == 4 }
 
 // The name used in diagnostics ("expected an integer, found a bool").
 pub fn type_name(read v: Value) -> str {
     if v.tag == 0 { return "an integer" }
     if v.tag == 1 { return "a bool" }
     if v.tag == 2 { return "a string" }
+    if v.tag == 4 { return "a list" }
     return "no value"
 }
 
@@ -4534,6 +4567,11 @@ pub fn type_name(read v: Value) -> str {
 pub struct Interp {
     sbuf: String,        // every comptime-produced string byte, concatenated
     sidx: List(i32),     // (start, len) pairs into `sbuf`; a Str value's `i` is the PAIR index
+    ltag: List(i32),     // list CELLS: the tag of each element, in run order
+    lval: List(i64),     // parallel element payloads
+    lidx: List(i32),     // (start, len) pairs into the cells; a List value's `i` is the PAIR index
+    stag: List(i32),     // the staging stack an in-progress literal pushes onto
+    sval: List(i64),
     envn: List(i32),     // (name_start, name_end, tag) triples
     envv: List(i64),     // parallel payloads
     marks: List(i32),    // scope starts, counted in triples
@@ -4561,6 +4599,11 @@ pub fn make__ctfe(read a: Allocator) -> Interp {
     return Interp{
         sbuf: string_new(),
         sidx: make__list(i32, a),
+        ltag: make__list(i32, a),
+        lval: make__list(i64, a),
+        lidx: make__list(i32, a),
+        stag: make__list(i32, a),
+        sval: make__list(i64, a),
         envn: make__list(i32, a),
         envv: make__list(i64, a),
         marks: make__list(i32, a),
@@ -4593,6 +4636,69 @@ fn v_str(mut it: Interp, s: str) -> Value {
     push(i32, it.sidx, start)
     push(i32, it.sidx, s.len as i32)
     return Value{ tag: 2, i: slot as i64 }
+}
+
+// ---- lists (tier 6) ----
+
+// Push one evaluated element onto the staging stack. The stack, rather than the arena
+// itself, is what keeps a nested literal's cells from interleaving with the run being
+// built around it.
+fn stage(mut it: Interp, read v: Value) {
+    push(i32, it.stag, v.tag)
+    push(i64, it.sval, v.i)
+}
+
+// Close a literal: move every staged element from `base` upward into the cell arenas as
+// one contiguous run, and return the List value naming it.
+fn list_close(mut it: Interp, base: usize) -> Value {
+    let start: i32 = len(i32, it.ltag) as i32
+    let n: usize = len(i32, it.stag)
+    var k: usize = base
+    for k < n {
+        push(i32, it.ltag, get(i32, it.stag, k))
+        push(i64, it.lval, get(i64, it.sval, k))
+        k = k + 1
+    }
+    truncate(i32, it.stag, base)
+    truncate(i64, it.sval, base)
+    let slot: i32 = (len(i32, it.lidx) / 2) as i32
+    push(i32, it.lidx, start)
+    push(i32, it.lidx, (n - base) as i32)
+    return Value{ tag: 4, i: slot as i64 }
+}
+
+// The element count of a List value.
+pub fn list_len(read it: Interp, read v: Value) -> i64 {
+    return get(i32, it.lidx, (v.i * 2 + 1) as usize) as i64
+}
+
+// Element `ix` of a List value. The caller has already range-checked it.
+fn list_at(read it: Interp, read v: Value, ix: i64) -> Value {
+    let start: i32 = get(i32, it.lidx, (v.i * 2) as usize)
+    let cell: usize = (start as i64 + ix) as usize
+    return Value{ tag: get(i32, it.ltag, cell), i: get(i64, it.lval, cell) }
+}
+
+// Structural equality. Lists compare element-wise and recursively; the reference offers
+// equality only, because an ORDERING on aggregates would have to invent a rule
+// (lexicographic? by length?) and inventing rules is the one thing this evaluator does
+// not do.
+fn val_eq(read it: Interp, read a: Value, read b: Value) -> bool {
+    if a.tag != b.tag { return false }
+    if a.tag == 2 { return str_eq(str_of(it, a), str_of(it, b)) }
+    if a.tag == 4 {
+        let n: i64 = list_len(it, a)
+        if n != list_len(it, b) { return false }
+        var k: i64 = 0
+        for k < n {
+            let x: Value = list_at(it, a, k)
+            let y: Value = list_at(it, b, k)
+            if val_eq(it, x, y) == false { return false }
+            k = k + 1
+        }
+        return true
+    }
+    return a.i == b.i
 }
 
 // The bytes of a Str value. (Bind the view first — chaining `string_view(x).len` is a
@@ -4849,7 +4955,90 @@ fn ev(mut it: Interp, read p: Parser, read src: str, eid: i32) -> Value {
     if d.kind == 44 { return ev_block(it, p, src, d.a) }   // Comptime
     if d.kind == 10 { return ev_call(it, p, src, d) }      // Call
 
+    // --- aggregates (tier 6) ---
+    if d.kind == 14 {                                 // ArrayLit — `(x, y)` into `p.ar`
+        let base: usize = len(i32, it.stag)
+        var k: i32 = 0
+        for k < d.y {
+            let elem: i32 = get(i32, p.ar, (d.x + k) as usize)
+            let v: Value = ev(it, p, src, elem)
+            if it.failed { truncate(i32, it.stag, base)  truncate(i64, it.sval, base)  return v_unit() }
+            stage(it, v)
+            k = k + 1
+        }
+        return list_close(it, base)
+    }
+    if d.kind == 15 {                                 // ArrayRepeat — `[value; count]`
+        let n: i64 = ev_len(it, p, src, d.b)
+        if it.failed { return v_unit() }
+        let v: Value = ev(it, p, src, d.a)
+        if it.failed { return v_unit() }
+        let base: usize = len(i32, it.stag)
+        var k: i64 = 0
+        for k < n {
+            // A step per ELEMENT: the fuel budget is what stops a repeat count the
+            // author did not mean from becoming an allocation. Spending it per
+            // expression instead would let `[0; 10_000_000_000]` through.
+            if spend(it, d.start, d.end) == false {
+                truncate(i32, it.stag, base)
+                truncate(i64, it.sval, base)
+                return v_unit()
+            }
+            stage(it, v)
+            k = k + 1
+        }
+        return list_close(it, base)
+    }
+    if d.kind == 6 {                                  // Index
+        let b: Value = ev(it, p, src, d.a)
+        if it.failed { return v_unit() }
+        let ie: ExprData = get(ExprData, p.ex, d.b as usize)
+        let i: Value = ev(it, p, src, d.b)
+        if it.failed { return v_unit() }
+        if b.tag != 4 {
+            return fail(it, "cannot index this at compile time", d.start, d.end)
+        }
+        if i.tag != 0 {
+            return fail(it, "an index must be a non-negative integer", ie.start, ie.end)
+        }
+        // Out of range is an error, never a clamp or a zero — the same rule as every
+        // other comptime query.
+        if i.i < 0 { return fail(it, "an index must be a non-negative integer", ie.start, ie.end) }
+        if i.i >= list_len(it, b) { return fail(it, "this index is out of range for the list", ie.start, ie.end) }
+        return list_at(it, b, i.i)
+    }
+    if d.kind == 5 {                                  // Field — `.len` is the only one
+        if str_eq(src[d.x as usize .. d.y as usize], "len") {
+            let b: Value = ev(it, p, src, d.a)
+            if it.failed { return v_unit() }
+            if b.tag == 4 { return v_int(list_len(it, b)) }
+            if b.tag == 2 {
+                let s: str = str_of(it, b)
+                return v_int(s.len as i64)
+            }
+            return fail(it, "this has no `.len` at compile time", d.start, d.end)
+        }
+        return fail(it, "this expression is not a compile-time constant", d.start, d.end)
+    }
+
     return fail(it, "this expression is not a compile-time constant", d.start, d.end)
+}
+
+// Evaluate a repeat count: a non-negative integer, in the interpreter's own failure
+// channel (unlike `eval_usize`, which is the public entry point and resets state).
+fn ev_len(mut it: Interp, read p: Parser, read src: str, eid: i32) -> i64 {
+    let d: ExprData = get(ExprData, p.ex, eid as usize)
+    let v: Value = ev(it, p, src, eid)
+    if it.failed { return 0 }
+    if v.tag != 0 {
+        let ignored: Value = fail(it, "a repeat count must be a non-negative integer", d.start, d.end)
+        return 0
+    }
+    if v.i < 0 {
+        let ignored2: Value = fail(it, "a repeat count must be a non-negative integer", d.start, d.end)
+        return 0
+    }
+    return v.i
 }
 
 // Is `tyid` an integer primitive? (The set a comptime cast may pass through.)
@@ -4954,6 +5143,14 @@ fn ev_binary(mut it: Interp, read p: Parser, read src: str, read d: ExprData) ->
 
     if l.tag == 0 { if r.tag == 0 { return int_binop(it, d.op, l.i, r.i, d.start, d.end) } }
     if l.tag == 2 { if r.tag == 2 { return str_binop(it, d.op, l, r, d.start, d.end) } }
+    if l.tag == 4 {
+        if r.tag == 4 {
+            // Equality only — see `val_eq`. An ordering on aggregates would be invented.
+            if d.op == 6 { return v_bool(val_eq(it, l, r)) }
+            if d.op == 7 { return v_bool(val_eq(it, l, r) == false) }
+            return fail(it, "this operator does not apply to lists", d.start, d.end)
+        }
+    }
     if l.tag == 1 {
         if r.tag == 1 {
             if d.op == 6 { return v_bool(l.i == r.i) }
@@ -5411,6 +5608,70 @@ pub fn at_ty__ctfe(mut sb: String, read p: Parser, read src: str, tyid: i32) {
 // The error TEXT is printed, not merely the fact of failure: refusal quality is part
 // of what the two implementations have to agree on, so a golden that only compared
 // success/failure would let the diagnostics drift apart.
+// Plain decimal into a String. Built digit-by-digit from the ABSOLUTE value accumulated
+// as a NEGATIVE number, because `0 - i64::MIN` does not exist — the one integer that
+// makes the obvious version wrong.
+fn push_dec(mut sb: String, v: i64) {
+    if v == 0 { string_push(sb, "0")  return }
+    var neg: bool = false
+    var n: i64 = v
+    if n > 0 { n = 0 - n } else { neg = true }
+    var digits: String = string_new()
+    for n < 0 {
+        let d: i64 = 0 - (n % 10)
+        n = n / 10
+        if d == 0 { string_push(digits, "0") }
+        if d == 1 { string_push(digits, "1") }
+        if d == 2 { string_push(digits, "2") }
+        if d == 3 { string_push(digits, "3") }
+        if d == 4 { string_push(digits, "4") }
+        if d == 5 { string_push(digits, "5") }
+        if d == 6 { string_push(digits, "6") }
+        if d == 7 { string_push(digits, "7") }
+        if d == 8 { string_push(digits, "8") }
+        if d == 9 { string_push(digits, "9") }
+    }
+    if neg { string_push(sb, "-") }
+    let rev: str = string_view(digits)
+    var k: usize = rev.len
+    for k > 0 {
+        k = k - 1
+        string_push(sb, rev[k .. k + 1])
+    }
+    string_free(digits)
+}
+
+// Render a value for the dump, one line, nesting included: `[1, 2, [3]]`. Strings are
+// escaped exactly as the scalar `str` record is, so a value containing a newline stays
+// on one line and cannot read as two records.
+fn render_value(read it: Interp, mut sb: String, read v: Value) {
+    if v.tag == 0 { push_dec(sb, v.i)  return }
+    if v.tag == 1 {
+        if v.i == 1 { string_push(sb, "true") } else { string_push(sb, "false") }
+        return
+    }
+    if v.tag == 2 {
+        string_push(sb, "\"")
+        push_escaped(sb, str_of(it, v))
+        string_push(sb, "\"")
+        return
+    }
+    if v.tag == 4 {
+        string_push(sb, "[")
+        let n: i64 = list_len(it, v)
+        var k: i64 = 0
+        for k < n {
+            if k > 0 { string_push(sb, ", ") }
+            let e: Value = list_at(it, v, k)
+            render_value(it, sb, e)
+            k = k + 1
+        }
+        string_push(sb, "]")
+        return
+    }
+    string_push(sb, "()")
+}
+
 pub fn run__ctfe() -> i32 {
     var a: Allocator = system_allocator()
     var itn: Interner = make__intern(a)
@@ -5442,6 +5703,12 @@ pub fn run__ctfe() -> i32 {
                     push_escaped(esc, str_of(ci, v))
                     print_str(string_view(esc))
                     string_free(esc)
+                } else if v.tag == 4 {
+                    print_str("list")
+                    var rend: String = string_new()
+                    render_value(ci, rend, v)
+                    print_str(string_view(rend))
+                    string_free(rend)
                 } else {
                     print_str("unit")
                 }

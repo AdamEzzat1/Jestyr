@@ -190,12 +190,22 @@ bytes, the plan records it by SHA-256, the driver writes it only on demand — t
 apply); **tier 6** — **aggregate values** (`Value::List`): array literals/repeats
 evaluate, `[i]`/`.len` read, and a `const` initialised by a comptime block yielding a
 list becomes an ordinary **static lookup table** — the C compiler gets the answers, not
-the recursion. All six are **Rust-reference side**; the whole tier ladder is done there.
-**Left:** a **comptime `for`** (today a table's *values* are computed but its *shape*
-is spelled out, `[f(0), f(1), …]`); **comptime-only functions** (what actually blocks
-field *iteration* end-to-end — not L); the **tier 2/3/6 port mirrors**
-(`examples/std/{parser,typeck,cgen}.jtr` + a seed refresh), required only once a corpus
-`.jtr` uses the syntax.
+the recursion; **tier 7** — a **comptime `for`** with mutation (G7), so a table's
+*shape* is computed and not spelled out: a 256-entry CRC-32 table emerges from
+`for i in 0..256 { t[i] = crc_entry(i) }` as a plain static, and the same loop walks a
+struct's fields — which is what tier 3 had been waiting on, and it needed no
+comptime-only functions (a loop binding is already constant where a fn parameter is
+not). **The whole ladder 0–7 is done on the Rust-reference side.**
+**Port mirrors: tiers 2, 3 and 6 are closed on both sides** — M1–M3 (parse → fold →
+emit, `examples/comptime_block.jtr`), M4 (reflection, `examples/comptime_reflect.jtr`),
+M5 (the def-order fix M4 surfaced), M6 (aggregate *values*: a list is a pair index
+naming a run of cells in flat arenas — elements staged before storage so a nested
+literal cannot interleave, and sharing left unclosed only because tier 6 cannot observe
+it). **Left:** the **tier 7 mirror** (the comptime `for` + mutation, which owes the deep
+copy tier 6 could defer, at the two points the reference clones), and **tier 6
+emission** in the port (an aggregate `const` as a C static — a brace initializer, since
+a static cannot take the GNU statement-expression the expression path uses), which is
+what will actually grow the corpus.
 **Recorded dependency:** `size_of`/`align_of`/`offset_of` exist today only as
 *C-deferred* intrinsics (`sizeof`/`_Alignof`/`offsetof`), so exposing them as comptime
 *values* is genuinely blocked on **L**. That is the *only* real L dependency here —

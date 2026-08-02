@@ -28,7 +28,8 @@
 
 | Increment | Commit | What |
 |---|---|---|
-| **Q-S1** the checked `@simd` legality pass | *(this run)* | The SIMD frontier opens where L1 opened the layout one: **analysis first, zero emission change.** `src/simd.rs` decides whether a `par for` body may be evaluated a lane at a time — a total, elementwise integer expression — and `@simd` is the *checked declaration* that it can be, in `@span`'s shape rather than a `#pragma`'s: it emits nothing, so a refactor that slips a call, a division or a float into a hot body is a diagnostic instead of a silent fall off the vector path. Nothing SIMD-shaped existed on master beforehand, so this is increment 1 of the workstream, not a duplicate. The determinism argument is two claims, and only the second was open: the four declared reductions are exactly associative on machine integers (so a lane tree of ANY width equals the serial fold — which is why float is *excluded* rather than discouraged; `-ffp-contract=off` constrains contraction, not order), and the body must be total. **gcc is the authority, as it is for layout**: `simd_lanes_match_scalar_bit_for_bit` evaluates every certified body scalar-wise and through GCC vector extensions at widths 2, 4 and 8, reduced four ways, and requires identical bits. It earned its keep immediately by catching a real miscompile in its own harness — the scalar tail of a vector loop needs the *scalar* lowering of a select, the bug Q-S2 is now forewarned about. |
+| **M6** aggregate values in the port | *(this run)* | **Tier 6 closed on both sides — and it was the REPRESENTATION change this note predicted, not more of the same.** `ctfe.jtr`'s `Value` stays a tag plus one `i64`; a list's payload is a pair index into `lidx`, whose (start, len) names a contiguous run of CELLS in the parallel `ltag`/`lval` arenas, and a cell tagged 4 names another run — the reference's owned `Vec<Value>` tree, with the ownership expressed as an index. Two things fell out that the design had to answer rather than assume. **(a) Elements must be STAGED before they are stored:** `[[1, 2], 3]` builds the inner list while the outer one is mid-construction, so appending to the arena as each element evaluates would interleave the two runs; elements land on a stack and move into the arena as one run when the literal closes, and nested literals complete first so the stack discipline is free. **(b) Runs are already SHARED, before any binding exists** — `[v; n]` evaluates `v` once and stages one handle `n` times, so `[[0; 2]; 3]` is three cells naming ONE inner run where the reference holds three cloned `Vec`s. Nothing in tier 6 can observe it (no way to write through a handle), which is precisely why the deep-copy obligation belongs to **M7** and is recorded in the module docs at the two places the reference clones. Arms added: ArrayLit (14), ArrayRepeat (15), Index (6), Field `.len` (5), and structural `==`/`!=` (equality only — an ordering on aggregates would have to be invented). Fuel is spent **per element**, so `[0; 10000000000]` and the nested `[[0; 100000]; 100000]` are diagnostics in microseconds on both sides. 19 new golden fixtures (9 accepts + 10 refusals) in `jestyr_ctfe_folding_matches_reference`, which grew a one-line list rendering shared by `render_ctfe_value` (reference) and `render_value` (port). Seed refreshed — the gcc-only bootstrap now carries an aggregate evaluator. Two small traps: the **recorded** reserved-word list bit again (a parameter named `out` — a whole-file parse cascade, ~40 diagnostics, all from one identifier), and decimal rendering has to accumulate the digits as a NEGATIVE number because `0 - i64::MIN` does not exist. |
+| **Q-S1** the checked `@simd` legality pass | `c77f6d2` | The SIMD frontier opens where L1 opened the layout one: **analysis first, zero emission change.** `src/simd.rs` decides whether a `par for` body may be evaluated a lane at a time — a total, elementwise integer expression — and `@simd` is the *checked declaration* that it can be, in `@span`'s shape rather than a `#pragma`'s: it emits nothing, so a refactor that slips a call, a division or a float into a hot body is a diagnostic instead of a silent fall off the vector path. Nothing SIMD-shaped existed on master beforehand, so this is increment 1 of the workstream, not a duplicate. The determinism argument is two claims, and only the second was open: the four declared reductions are exactly associative on machine integers (so a lane tree of ANY width equals the serial fold — which is why float is *excluded* rather than discouraged; `-ffp-contract=off` constrains contraction, not order), and the body must be total. **gcc is the authority, as it is for layout**: `simd_lanes_match_scalar_bit_for_bit` evaluates every certified body scalar-wise and through GCC vector extensions at widths 2, 4 and 8, reduced four ways, and requires identical bits. It earned its keep immediately by catching a real miscompile in its own harness — the scalar tail of a vector loop needs the *scalar* lowering of a select, the bug Q-S2 is now forewarned about. |
 | **M5** def-order dependency registration | *(this run)* | Closes the divergence M4 recorded: the port emitted `JestyrSlice_<T>` **after** the struct whose field embeds it, where the reference emits it before. The sorter was never the bug — the port's slice and genref typedefs never called `dc_begin`/`dc_end` at all, and the array typedef opened a segment it **never closed**, so all three were absorbed as anonymous *glue*. Glue is pinned in place and invisible to `dc_find_dep`, so the struct's (correctly recorded) dep resolved to nothing. Registering all three as named segments — no deps for slice/genref, which reach `E` through a pointer; one dep for the array, which embeds `E` by value — makes the port's segment graph structurally identical to the reference's. `examples/def_order.jtr` is the new corpus file (**136 → 137**) and pins all three at once; the slice half is also pinned in place by restoring the field `comptime_reflect.jtr` had to omit. **Zero emission change on the other 136 files.** The unclosed `dc_begin` is the failure mode worth remembering: it loses the name without losing any text, so it is a silent divergence rather than a crash or a corrupt buffer. |
 | **M4** G3 reflection port mirror | `b292426` | **Tier 3 closed on both sides.** `@type_name`/`@field_count`/`@field_name`/`@field_type` in the self-hosted compiler; `examples/comptime_reflect.jtr` is corpus **136**, byte-identical. The structural decision: `@field_type` needs a Jestyr-syntax type renderer, and one already existed in cgen.jtr for attest + doc — so `at_ty` **MOVED DOWN** into `ctfe.jtr` (below cgen, above parser, depends only on the type arena) and cgen keeps a three-line wrapper, leaving its 16 call sites unchanged. ONE renderer, two consumers: a reflected type name cannot drift from the documented or attested one, the same invariant `at_guarantee_phrases` gives the guarantee text. typeck types a query from a STATIC table (`field_count`→i64, the rest→str) and does **not** infer the arguments — the first is a *type*, so inference would report a binding that does not exist; only emission evaluates. **The `@` sigil justified itself in reverse:** the first cgen arm keyed on the Attr node KIND and broke two passing corpus files, because `@address(0x…)` in mmio.jtr is also `@name(…)` and must still emit normally. `@name` is a family; the guard belongs on the intrinsic NAME. Nine reflection fixtures added to the ctfe golden (incl. a primitive, a `record`, methods-are-not-fields, a const index, composition inside `comptime {}`, and three refusals) — all passed first run. |
 | **G8** plan-as-list | *(this run)* | `const targets` now selects the build script's form **by its type**: an integer is a count (the tier-4 index form), a list is the targets themselves — `[[source, output], …]`, buildable by a comptime `for`. A pair is a two-element list because the value domain has no struct; two parallel lists would read better and can disagree in length. Artifacts take the same two forms. Fully backwards compatible, and the two forms render byte-identical plans (pinned by planning one build both ways). `examples/build_list.jestyr` is the worked example. |
@@ -166,6 +167,18 @@ when the reference re-sorts its output by content (§2, O1).
    unlike `collect_slices`, which does scan the type arena. Both implementations agree,
    so every golden is green; `examples/def_order.jtr` sidesteps it by constructing a
    `[4]i64`. The fix is a field-declaration walk in `collect_arrays` + its port mirror.
+
+13. **FUEL ACCOUNTING is part of the mirror contract, not an implementation detail**
+   (M6). The budget decides *whether a program folds*, so if the two evaluators spend
+   at different rates a borderline input folds under one and is refused by the other —
+   a divergence no fixture would find unless it sat exactly at the boundary. The
+   invariant that makes them agree is narrow and worth stating: **both spend one step on
+   entry to the expression evaluator** (`Interp::eval_expr` / `ev`), and any additional
+   per-element or per-iteration spend must be mirrored at the same place. Checked for
+   tier 6: ArrayLit costs `1 + n` on both, ArrayRepeat `1 + 1 (count) + 1 (value) + n`
+   on both, Index and `.len` `1 + children`. Tier 7 spends per *iteration*, so the
+   mirror must too — and the recorded trap there is that an empty loop body evaluates
+   nothing, so the per-iteration spend is the only thing charging the budget at all.
 
 ---
 
@@ -609,22 +622,47 @@ generation~~ (`bce5456`) → ~~G6 aggregate values / comptime tables~~ → ~~G7 
 `for` + mutation~~ — **the CTFE tier ladder (0–7) is done on the reference side**, and
 documented in `docs/ctfe-tiers.md`.
 
-**Port-mirror state: tiers 2 and 3 are CLOSED on both sides** (M1 parse → M2 the
+**Port-mirror state: tiers 2, 3 and 6 are CLOSED on both sides** (M1 parse → M2 the
 interpreter → M3 fold + emission → M4 reflection; M5 fixed the def-order divergence M4
-surfaced). `ctfe` is the 12th module of the self-host closure, so the flattened compiler
-and the bootstrap seed both contain a comptime evaluator and the shared type renderer.
+surfaced; **M6 aggregates**). `ctfe` is the 12th module of the self-host closure, so the
+flattened compiler and the bootstrap seed both contain a comptime evaluator — one that
+now computes tables, not only numbers — and the shared type renderer. Tier 7 (the
+comptime `for` + mutation) is the one interpreter tier still reference-only; tier 6's
+*emission* (an aggregate `const` as a C static) is likewise still reference-only, and is
+what will actually grow the corpus.
 
 **Next, in order:**
 
-1. **The G6/G7 port mirror — the last CTFE piece, and a REPRESENTATION change rather
-   than more of the same.** `ctfe.jtr`'s `Value` is a tag plus one `i64`: Copy,
-   allocator-free, with a string payload that indexes an **immutable** arena — which is
-   exactly what makes copying it safe. Tier 6 (aggregates) and tier 7 (comptime `for` +
-   mutation) need a **mutable list**, which aliases under an arena. Designing that
-   representation *is* the increment; the evaluation logic is already specified by the
-   reference and by the ported scalar core. It lands with the corpus file that exercises
-   it. Nothing is broken meanwhile: the port refuses what it cannot fold rather than
-   guessing, so the two implementations stay refusal-compatible.
+1. ~~**The G6 port mirror — the representation change.**~~ — **DONE (M6).** The
+   prediction held exactly: designing the representation *was* the increment, and the
+   evaluation logic followed from the reference. The answer is a pair index into `lidx`
+   naming a run of cells in `ltag`/`lval` — a tree in flat arenas, `Value` still a tag
+   plus one `i64`. What the design had to decide rather than inherit was **staging**
+   (elements go on a stack and move into the arena as one run when the literal closes,
+   because a nested literal would otherwise interleave its cells with the run being
+   built around it) and **when sharing becomes observable** (it is already present at
+   `[v; n]`, and tier 6 simply has no way to detect it).
+
+   **G7 — the comptime `for` + mutation — is what remains, and it inherits one stated
+   obligation.** Assignment makes the sharing above observable, so M7 owes a deep copy
+   at exactly the two places the reference `.clone()`s: binding a list, and reading one
+   back out of the environment. In exchange the flat arena makes the write path
+   *easier* than the reference's: `walk_path` is an address computation (follow the
+   index path to a cell position, write the tag and payload) where the reference needs
+   a chain of `&mut` borrows the `.jtr` subset cannot express at all. The loop surface
+   itself is the larger half — three heads, ranges (inclusive/`step`/descending), list
+   iteration, element+index, `break`/`continue` incl. labelled, and `for … else` — and
+   fuel is spent per ITERATION, where the recorded trap is that an empty body evaluates
+   nothing, so nothing else charges the budget.
+
+   **Then M8: cgen emission + the first aggregate corpus file.** A `const` initialised
+   by a comptime block yielding a list becomes an ordinary static, and the emission
+   detail with teeth is that a static **must** be a brace initializer — it cannot be
+   initialised by the GNU statement-expression the expression-position aggregate path
+   uses. That is the M3-shaped increment (typeck fold + cgen + the corpus file), and it
+   is what actually grows the corpus. Nothing is broken meanwhile: the port refuses what
+   it cannot fold rather than guessing, so the two implementations stay
+   refusal-compatible.
 2. **L2 `@layout(auto)`** — the first increment that actually changes emission, now that
    L1's offsets are *verified against the C compiler* rather than believed. Opt-in per
    struct, so non-annotated types stay byte-identical; the corpus grows annotated files.
@@ -661,11 +699,18 @@ needs `eval_array_len`/`push_array_len` folding on both sides (finding 10); and 
 order or the concat build fails immediately (fast, not a divergence — a build error).
 (`.jestyr` build scripts stay exempt: the goldens key on the `jtr` extension.)
 
-**Tiers 6/7 in the port are a REPRESENTATION change, not more of the same.** `ctfe.jtr`'s
-`Value` is a tag plus one `i64`, deliberately Copy and allocator-free; a string payload is
-an index into an *immutable* arena, which is what makes it safe. Aggregates and the
-comptime `for` need a MUTABLE list, which aliases under an arena — that is the real work
-of the next slice, and it lands with the corpus file that exercises it.
+**Tier 6 in the port was a REPRESENTATION change, and it is now done (M6).** `ctfe.jtr`'s
+`Value` is still a tag plus one `i64`, Copy and allocator-free; a list payload is a pair
+index into `lidx`, naming a run of cells in `ltag`/`lval`, and a cell tagged 4 names
+another run — the reference's owned tree with ownership expressed as an index. The two
+decisions that were not inherited from the reference: elements are **staged** on a stack
+and moved into the arena as one contiguous run when the literal closes (otherwise a
+nested literal interleaves its cells with the run being built around it), and **sharing
+is already present at `[v; n]`** but is unobservable while nothing can write through a
+handle. Tier 7 makes it observable and therefore owes a deep copy at the two points the
+reference clones — binding a list, and reading one out of the environment — while
+getting an easier write path in exchange, since walking an index path over a flat arena
+is an address computation rather than a chain of `&mut` borrows.
 
 ## One-line
 Self-hosting is finished and productized, **workstream O is complete in-language**, and
@@ -691,8 +736,13 @@ declared reductions) — `@simd` being a *checked contract* in `@span`'s shape, 
 rather than a silent performance cliff. That the analysis-first ordering is not merely
 cautious is now demonstrated twice over: L1's report is the thing reordering will
 justify itself against, and Q-S1's oracle caught a real select-lowering miscompile in
-its own harness before any lowering existed to be wrong. What's left is the **G6/G7
-port mirrors** (tiers 2 and 3 are closed on both sides), **L2** opt-in layout, **Q-S2**
-opt-in SIMD lowering → the thermal facet → the GPU contract, and the optional `#line`
-port — each landed increment-by-increment under the two-sided golden discipline with
-the bootstrap seed refreshed at every `examples/std` change.
+its own harness before any lowering existed to be wrong. **Tier 6 is now closed in the
+port too (M6)** — the self-hosted evaluator computes tables, not only numbers, and the
+gcc-only bootstrap seed carries it; the representation question the note had flagged as
+"the real work" turned out to be exactly that, answered by staging elements before
+storing them and by naming precisely when a shared run becomes observable. What's left
+is the **G7 port mirror** (the comptime `for` + mutation, which owes the deep copy tier
+6 could defer) and **M8** (aggregate emission + the first corpus file), **L2** opt-in
+layout, **Q-S2** opt-in SIMD lowering → the thermal facet → the GPU contract, and the
+optional `#line` port — each landed increment-by-increment under the two-sided golden
+discipline with the bootstrap seed refreshed at every `examples/std` change.

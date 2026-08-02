@@ -8898,6 +8898,26 @@ fn main() -> i32 {
     /// `format!`; the same concession the P-series made for the parse/typeck refusal
     /// gates, recorded there as "message-TEXT parity is the only follow-up". Both sides
     /// must still *have* a message, so a silent refusal cannot pass.
+    /// The reference's half of the one-line value rendering the CTFE dump uses for
+    /// aggregates. Mirrored by `render_value` in `examples/std/ctfe.jtr`; the two are a
+    /// format, so they are written to be read side by side.
+    fn render_ctfe_value(v: &crate::comptime::Value) -> String {
+        use crate::comptime::Value;
+        match v {
+            Value::Int(i) => i.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Str(s) => format!(
+                "\"{}\"",
+                s.replace('\\', "\\\\").replace('\n', "\\n").replace('\t', "\\t").replace('\r', "\\r")
+            ),
+            Value::List(items) => {
+                let inner: Vec<String> = items.iter().map(render_ctfe_value).collect();
+                format!("[{}]", inner.join(", "))
+            }
+            Value::Unit => "()".to_string(),
+        }
+    }
+
     #[test]
     fn jestyr_ctfe_folding_matches_reference() {
         let exe = build_exe("examples/std/ctfe_cli.jtr");
@@ -8934,6 +8954,29 @@ fn main() -> i32 {
             // nested/compound field types render through the shared `at_ty`
             ("reflect_tys", "struct Q { a: []i32, b: *mut u8, c: [4]i64 }\nconst A: str = @field_type(Q, 0)\nconst B: str = @field_type(Q, 1)\nconst C: str = @field_type(Q, 2)\n"),
             // refusals: each must be rejected by BOTH, with a reason
+            // tier 6 — aggregates. The point of the tier: a comptime TABLE, not just a
+            // number. Element order, nesting, `[v; n]`, indexing and `.len` all agree.
+            ("agg_lit", "const A = [1, 2, 3]\nconst B = [true, false]\nconst C = [\"a\", \"b\"]\n"),
+            ("agg_repeat", "const A = [0; 5]\nconst B = [7; 0]\n"),
+            ("agg_nested", "const A = [[1, 2], [3]]\nconst B = [[0; 2]; 3]\n"),
+            ("agg_index", "const T = [10, 20, 30]\nconst A: i64 = T[0]\nconst B: i64 = T[2]\nconst C: i64 = T[1 + 1]\n"),
+            ("agg_len", "const T = [1, 2, 3, 4]\nconst A: i64 = T.len\nconst B: i64 = \"hello\".len\nconst C: i64 = [0; 9].len\n"),
+            ("agg_nested_index", "const T = [[1, 2], [3, 4]]\nconst A: i64 = T[1][0]\nconst B: i64 = T[0].len\n"),
+            ("agg_computed", "fn sq(x: i64) -> i64 { return x * x }\nconst T = [sq(1), sq(2), sq(3)]\nconst A: i64 = T[2]\n"),
+            ("agg_in_block", "const A = comptime { let t = [1, 2, 3]\n t[1] }\nconst B = comptime { [1, 2] }\n"),
+            ("agg_eq", "const A: bool = [1, 2] == [1, 2]\nconst B: bool = [1, 2] == [1, 3]\nconst C: bool = [1, 2] != [1]\nconst D: bool = [[1]] == [[1]]\n"),
+            // aggregate refusals — each rejected by BOTH, with a reason
+            ("bad_agg_oob", "const T = [1, 2]\nconst A: i64 = T[5]\n"),
+            ("bad_agg_neg", "const T = [1, 2]\nconst A: i64 = T[0 - 1]\n"),
+            ("bad_agg_index_scalar", "const A: i64 = 5[0]\n"),
+            ("bad_agg_index_type", "const T = [1]\nconst A: i64 = T[\"x\"]\n"),
+            ("bad_agg_len_scalar", "const A: i64 = (1).len\n"),
+            ("bad_agg_order", "const A: bool = [1] < [2]\n"),
+            // the fuel budget is what makes a runaway repeat a diagnostic, not an
+            // allocation — and the nested form is the one where the PRODUCT blows up
+            ("bad_agg_huge", "const A = [0; 10000000000]\n"),
+            ("bad_agg_huge_nested", "const A = [[0; 100000]; 100000]\n"),
+            ("bad_agg_repeat_count", "const A = [0; 0 - 1]\n"),
             ("bad_reflect_oob", "struct P { x: i32 }\nconst A: str = @field_name(P, 9)\n"),
             ("bad_reflect_nonstruct", "const A: i64 = @field_count(i32)\n"),
             ("bad_reflect_unknown", "struct P { x: i32 }\nconst A: i64 = @nonsense(P)\n"),
@@ -8985,6 +9028,14 @@ fn main() -> i32 {
                                 .replace('\t', "\\t")
                                 .replace('\r', "\\r"),
                         );
+                        want_err.push(false);
+                    }
+                    // Aggregates (tier 6): rendered on ONE line so a list never splits
+                    // into several records. `render_ctfe_value` is the reference's half
+                    // of a format the port's `render_value` must match exactly.
+                    Ok(v @ crate::comptime::Value::List(_)) => {
+                        want.push("list".into());
+                        want.push(render_ctfe_value(&v));
                         want_err.push(false);
                     }
                     Ok(_) => {
