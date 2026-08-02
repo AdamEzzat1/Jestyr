@@ -27,14 +27,15 @@
 // there is simply no arm for an effect, so there is no allowlist to keep in sync and
 // no way to bypass it.
 //
-// ─── Scope of this slice ────────────────────────────────────────────────────────
-// Scalars — Int, Bool, Str — plus **aggregates** (tier 6): `[a, b, c]`, `[v; n]`,
-// indexing and `.len`. That is what turns comptime from "compute a number" into
-// "compute a *table*". The comptime `for` and assignment (tier 7) are not here yet;
-// they land with the corpus file that exercises them. Everything here is
-// refusal-compatible with the reference: this evaluator never accepts something the
-// reference rejects, so a corpus file that folds under one folds identically under
-// the other.
+// ─── Scope ──────────────────────────────────────────────────────────────────────
+// The whole ladder the reference has: scalars (Int, Bool, Str), **aggregates** —
+// `[a, b, c]`, `[v; n]`, indexing, `.len` (tier 6) — and the comptime **`for` with
+// mutation** (tier 7). Tier 6 turns comptime from "compute a number" into "compute a
+// *table*"; tier 7 computes the table's SHAPE rather than spelling it out, which is
+// what makes `var t = [0; n]  for i in 0..n { t[i] = f(i) }  t` the way to build one.
+// Everything here is refusal-compatible with the reference: this evaluator never
+// accepts something the reference rejects, so a file that folds under one folds
+// identically under the other.
 //
 // ─── Representation ─────────────────────────────────────────────────────────────
 // A `Value` is a tag plus one `i64`, so it is Copy and needs no allocator. A string
@@ -57,19 +58,21 @@
 //     therefore land on a stack (`stag`/`sval`) and are moved into the arena as one
 //     contiguous run when the literal closes. Nested literals complete first, so the
 //     stack discipline falls out for free.
-//   * **Runs are ALREADY shared here, and that is invisible only until tier 7.**
-//     Copying a list Value copies a handle, so two bindings can name one run — but the
-//     sharing does not wait for a second binding. `[v; n]` evaluates `v` once and
-//     stages the same handle `n` times, so `[[0; 2]; 3]` is three cells naming ONE
-//     inner run where the reference holds three independently-cloned `Vec`s. Nothing
-//     in tier 6 can tell the difference: reading, indexing, `.len` and structural
-//     equality all give the same answers, and there is no way to write through a
-//     handle. Tier 7 adds assignment and the difference becomes observable
-//     immediately, so it owes a deep copy at the two places the reference clones —
-//     binding a list, and reading one back out of the environment. The flat arena is
-//     what makes the write path itself easy in exchange: walking an index path is an
-//     address computation, where the reference needs a chain of `&mut` borrows the
-//     `.jtr` subset could not express anyway.
+//   * **A handle copies for free, so the copies the reference gets from ownership have
+//     to be written down.** `deep_copy` runs at exactly three points, each marked in
+//     place: reading a value out of a binding, reading an element out of a list, and
+//     producing each element of `[v; n]`. The third is the one that is invisible while
+//     nothing can write — `[v; n]` evaluates `v` once, so without it `[[0; 2]; 3]` is
+//     three cells naming ONE run and `m[0][1] = 5` writes through all three rows. Tier
+//     6 could not observe that; tier 7 can, immediately.
+//
+//     The flat arena pays for itself on the other side of the same trade: an
+//     assignment target is a `Place` — an env row or a cell index — so walking an
+//     index path is an address computation, where the reference needs `find_binding`
+//     to hand out a `&mut Value` and `walk_path` to re-borrow through each index, a
+//     chain the `.jtr` subset cannot express at all. Assignment resolution therefore
+//     reads through `place_read_raw`, which deliberately does NOT copy: copying there
+//     would resolve `t[0]` against a duplicate and drop the write on the floor.
 
 import "mem"
 import "fs"
@@ -137,6 +140,9 @@ pub struct Interp {
     returning: bool,     // a `return` is in flight, consumed by the owning call
     rtag: i32,
     ri: i64,
+    lctl: i32,           // a loop transfer in flight: 0 none, 1 break, 2 continue
+    lls: i32,            // its label's name span, or -1 for an unlabelled transfer
+    lle: i32,
     a: Allocator,        // kept so a call frame can build its argument buffers
 }
 
@@ -169,6 +175,9 @@ pub fn make(read a: Allocator) -> Interp {
         returning: false,
         rtag: 3,
         ri: 0,
+        lctl: 0,
+        lls: 0 - 1,
+        lle: 0 - 1,
         a: a,
     }
 }
@@ -222,6 +231,79 @@ fn list_close(mut it: Interp, base: usize) -> Value {
 // The element count of a List value.
 pub fn list_len(read it: Interp, read v: Value) -> i64 {
     return list.get(i32, it.lidx, (v.i * 2 + 1) as usize) as i64
+}
+
+// An INDEPENDENT copy of `v` — the obligation tier 6 was allowed to defer.
+//
+// The reference's `Vec<Value>` is owned, so `.clone()` on the way out of the
+// environment is what stops two bindings sharing one table. A handle copies for free,
+// so the port has to do the copy explicitly, at exactly the points the reference
+// clones: reading a value out of a binding, reading an element out of a list, and
+// producing each element of `[v; n]`. Miss the last one and `[[0; 2]; 3]` is three
+// cells naming ONE run, so `m[0][1] = 5` writes through all three rows.
+//
+// Scalars are already independent (the payload is the value, and a string's arena is
+// immutable), so this is a no-op for everything but a list.
+fn deep_copy(mut it: Interp, read v: Value) -> Value {
+    // Rebuilt rather than returned: `v` is a second-class `read` borrow, which the
+    // escape checker will not let outlive the call.
+    if v.tag != 4 { return Value{ tag: v.tag, i: v.i } }
+    let n: i64 = list_len(it, v)
+    let base: usize = list.len(i32, it.stag)
+    var k: i64 = 0
+    for k < n {
+        let e: Value = list_at(it, v, k)
+        // Recursion goes through the same staging stack. It closes its own run before
+        // returning, so the stack is back where it started and the outer run stays
+        // contiguous — the same discipline nested literals rely on.
+        let c: Value = deep_copy(it, e)
+        stage(it, c)
+        k = k + 1
+    }
+    return list_close(it, base)
+}
+
+// Where an assignment writes. Either an environment ROW (`x = …`) or a list CELL
+// (`t[i] = …`, at any depth).
+//
+// This is the flat arena paying off: the reference needs `find_binding` to hand out a
+// `&mut Value` and `walk_path` to re-borrow through each index, a chain the `.jtr`
+// subset cannot express at all. Here a place is an integer, and walking a path is an
+// address computation.
+struct Place { ok: bool, row: i32, cell: i32 }
+
+// The env row bound to `src[ns..ne]`, newest first, or -1.
+fn env_row(read it: Interp, read src: str, ns: usize, ne: usize) -> i32 {
+    var i: i32 = (list.len(i32, it.envn) / 3) as i32
+    for i > 0 {
+        i = i - 1
+        let base: usize = (i * 3) as usize
+        let bns: i32 = list.get(i32, it.envn, base)
+        let bne: i32 = list.get(i32, it.envn, base + 1)
+        if str_eq(src[ns .. ne], src[bns as usize .. bne as usize]) { return i }
+    }
+    return 0 - 1
+}
+
+// Read a place WITHOUT copying — the stored value itself, handle and all. Assignment
+// resolution must use this: copying here would resolve `t[0]` against a duplicate and
+// the write would land in the duplicate.
+fn place_read_raw(read it: Interp, read pl: Place) -> Value {
+    if pl.cell >= 0 {
+        return Value{ tag: list.get(i32, it.ltag, pl.cell as usize), i: list.get(i64, it.lval, pl.cell as usize) }
+    }
+    let tag: i32 = list.get(i32, it.envn, (pl.row * 3 + 2) as usize)
+    return Value{ tag: tag, i: list.get(i64, it.envv, pl.row as usize) }
+}
+
+fn place_write(mut it: Interp, read pl: Place, read v: Value) {
+    if pl.cell >= 0 {
+        list.set(i32, it.ltag, pl.cell as usize, v.tag)
+        list.set(i64, it.lval, pl.cell as usize, v.i)
+        return
+    }
+    list.set(i32, it.envn, (pl.row * 3 + 2) as usize, v.tag)
+    list.set(i64, it.envv, pl.row as usize, v.i)
 }
 
 // The first element of a non-empty List value — what decides an unannotated table's
@@ -440,6 +522,14 @@ pub fn eval(mut it: Interp, read p: parser.Parser, read src: str, eid: i32) -> V
     it.depth = 0
     it.failed = false
     it.returning = false
+    it.lctl = 0
+    it.lls = 0 - 1
+    it.lle = 0 - 1
+    // The message buffer is reset with everything else. It was not, before tier 7 gave
+    // the dump enough refusal fixtures to notice: `failed` cleared but `emsg` did not,
+    // so a second failing `const` reported the CONCATENATION of every message so far.
+    string_free(it.emsg)
+    it.emsg = string_new()
     list.truncate(i32, it.envn, 0)
     list.truncate(i64, it.envv, 0)
     list.truncate(i32, it.marks, 0)
@@ -549,7 +639,12 @@ fn ev(mut it: Interp, read p: parser.Parser, read src: str, eid: i32) -> Value {
                 list.truncate(i64, it.sval, base)
                 return v_unit()
             }
-            stage(it, v)
+            // COPY POINT 3 of 3: each repeated element, matching the reference's
+            // `out.push(v.clone())`. This is the one that is invisible until tier 7 and
+            // then instantly wrong: without it `[[0; 2]; 3]` is three cells naming ONE
+            // run, so `m[0][1] = 5` writes through all three rows.
+            let ec: Value = deep_copy(it, v)
+            stage(it, ec)
             k = k + 1
         }
         return list_close(it, base)
@@ -570,7 +665,24 @@ fn ev(mut it: Interp, read p: parser.Parser, read src: str, eid: i32) -> Value {
         // other comptime query.
         if i.i < 0 { return fail(it, "an index must be a non-negative integer", ie.start, ie.end) }
         if i.i >= list_len(it, b) { return fail(it, "this index is out of range for the list", ie.start, ie.end) }
-        return list_at(it, b, i.i)
+        // COPY POINT 2 of 3: reading an element out of a list (`items.get(ix).cloned()`).
+        let e: Value = list_at(it, b, i.i)
+        return deep_copy(it, e)
+    }
+    // --- loops and mutation (tier 7) ---
+    if d.kind == 31 { return ev_for(it, p, src, d) }       // For
+    if d.kind == 12 { return ev_assign(it, p, src, d) }    // Assign
+    if d.kind == 32 {                                      // Break — `(x, y)` = label span
+        it.lctl = 1
+        it.lls = d.x
+        it.lle = d.y
+        return v_unit()
+    }
+    if d.kind == 33 {                                      // Continue
+        it.lctl = 2
+        it.lls = d.x
+        it.lle = d.y
+        return v_unit()
     }
     if d.kind == 5 {                                  // Field — `.len` is the only one
         if str_eq(src[d.x as usize .. d.y as usize], "len") {
@@ -587,6 +699,250 @@ fn ev(mut it: Interp, read p: parser.Parser, read src: str, eid: i32) -> Value {
     }
 
     return fail(it, "this expression is not a compile-time constant", d.start, d.end)
+}
+
+// ---- assignment and loops (tier 7) ----
+
+// Resolve an assignment target to the place it names. A name is an env row; an index
+// walks one level further into the run its base names, at any depth.
+fn place_of(mut it: Interp, read p: parser.Parser, read src: str, target: i32) -> Place {
+    let d: parser.ExprData = list.get(parser.ExprData, p.ex, target as usize)
+    if d.kind == 2 {                                  // Name
+        let row: i32 = env_row(it, src, d.start, d.end)
+        if row < 0 {
+            let ignored: Value = fail(it, "this is not a compile-time binding", d.start, d.end)
+            return Place{ ok: false, row: 0 - 1, cell: 0 - 1 }
+        }
+        return Place{ ok: true, row: row, cell: 0 - 1 }
+    }
+    if d.kind == 6 {                                  // Index
+        let base: Place = place_of(it, p, src, d.a)
+        if base.ok == false { return base }
+        let bv: Value = place_read_raw(it, base)
+        let ie: parser.ExprData = list.get(parser.ExprData, p.ex, d.b as usize)
+        let iv: Value = ev(it, p, src, d.b)
+        if it.failed { return Place{ ok: false, row: 0 - 1, cell: 0 - 1 } }
+        if bv.tag != 4 {
+            let ignored: Value = fail(it, "cannot index this at compile time", d.start, d.end)
+            return Place{ ok: false, row: 0 - 1, cell: 0 - 1 }
+        }
+        if iv.tag != 0 or iv.i < 0 {
+            let ignored2: Value = fail(it, "an index must be a non-negative integer", ie.start, ie.end)
+            return Place{ ok: false, row: 0 - 1, cell: 0 - 1 }
+        }
+        if iv.i >= list_len(it, bv) {
+            let ignored3: Value = fail(it, "this index is out of range for the list", ie.start, ie.end)
+            return Place{ ok: false, row: 0 - 1, cell: 0 - 1 }
+        }
+        let start: i32 = list.get(i32, it.lidx, (bv.i * 2) as usize)
+        return Place{ ok: true, row: 0 - 1, cell: (start as i64 + iv.i) as i32 }
+    }
+    let ignored4: Value = fail(it, "this is not something a compile-time assignment can write", d.start, d.end)
+    return Place{ ok: false, row: 0 - 1, cell: 0 - 1 }
+}
+
+// `target op= value`. A compound assignment is the binary operator applied to the
+// current value, through the SAME checked arithmetic as everywhere else — so `x += 1`
+// overflows into a diagnostic rather than wrapping.
+fn ev_assign(mut it: Interp, read p: parser.Parser, read src: str, read d: parser.ExprData) -> Value {
+    let v: Value = ev(it, p, src, d.b)
+    if it.failed { return v_unit() }
+    let pl: Place = place_of(it, p, src, d.a)
+    if pl.ok == false { return v_unit() }
+    if d.op == 1 {                                    // `=`
+        place_write(it, pl, v)
+        return v_unit()
+    }
+    let cur: Value = place_read_raw(it, pl)
+    // AssignOp 2..9 map onto BinOp add/sub/mul/div/rem/bitand/bitor/bitxor.
+    var bin: i32 = 0
+    if d.op == 2 { bin = 1 }
+    if d.op == 3 { bin = 2 }
+    if d.op == 4 { bin = 3 }
+    if d.op == 5 { bin = 4 }
+    if d.op == 6 { bin = 5 }
+    if d.op == 7 { bin = 14 }
+    if d.op == 8 { bin = 15 }
+    if d.op == 9 { bin = 16 }
+    if cur.tag == 0 {
+        if v.tag == 0 {
+            let nv: Value = int_binop(it, bin, cur.i, v.i, d.start, d.end)
+            if it.failed { return v_unit() }
+            place_write(it, pl, nv)
+            return v_unit()
+        }
+    }
+    if cur.tag == 2 {
+        if v.tag == 2 {
+            if bin == 1 {
+                let nv2: Value = str_binop(it, bin, cur, v, d.start, d.end)
+                if it.failed { return v_unit() }
+                place_write(it, pl, nv2)
+                return v_unit()
+            }
+        }
+    }
+    return fail(it, "this compound assignment does not apply at compile time", d.start, d.end)
+}
+
+// Does the transfer in flight belong to a loop labelled `src[ls..le]`? An unlabelled
+// `break`/`continue` belongs to the innermost loop, so it always matches.
+fn ctl_targets(read it: Interp, read src: str, ls: i32, le: i32) -> bool {
+    if it.lls < 0 { return true }
+    if ls < 0 { return false }
+    return str_eq(src[it.lls as usize .. it.lle as usize], src[ls as usize .. le as usize])
+}
+
+// Run one loop-body iteration. Returns true when the loop should stop — because it
+// broke, returned, or a LABELLED transfer is still travelling outward.
+fn run_loop_body(mut it: Interp, read p: parser.Parser, read src: str, body: i32, ls: i32, le: i32, mut broke: List(i32)) -> bool {
+    let ignored: Value = ev_block(it, p, src, body)
+    if it.failed { return true }
+    if it.returning { return true }
+    if it.lctl == 0 { return false }
+    if ctl_targets(it, src, ls, le) == false { return true }   // aimed further out: keep propagating
+    let was: i32 = it.lctl
+    it.lctl = 0
+    it.lls = 0 - 1
+    it.lle = 0 - 1
+    if was == 1 {
+        list.set(i32, broke, 0, 1)
+        return true
+    }
+    return false
+}
+
+// The values a `for … in …` head iterates, built as a comptime LIST — the same
+// representation everything else uses, so iteration needs no second container.
+fn iter_items(mut it: Interp, read p: parser.Parser, read src: str, read d: parser.ExprData, nbind: i32, nsrc: i32, stepe: i32) -> Value {
+    if nbind < 1 or nbind > 2 or nsrc != 1 {
+        return fail(it, "this `for` shape is not supported at compile time (one or two bindings over one source)", d.start, d.end)
+    }
+    var stride: i64 = 1
+    if stepe >= 0 {
+        let sv: Value = ev(it, p, src, stepe)
+        if it.failed { return v_unit() }
+        if sv.tag != 0 { return fail(it, "a `step` must be an integer", d.start, d.end) }
+        if sv.i == 0 { return fail(it, "a `step` of 0 never advances", d.start, d.end) }
+        stride = sv.i
+    }
+    let srce: i32 = list.get(i32, p.lar, (d.a + 7 + nbind * 3) as usize)
+    let sd: parser.ExprData = list.get(parser.ExprData, p.ex, srce as usize)
+    if sd.kind == 13 {                                // Range — a HEADER form, not a value
+        // There is no range value in the comptime domain, so the bounds are read from
+        // the AST rather than evaluated as one thing.
+        if sd.a < 0 or sd.b < 0 {
+            return fail(it, "an open-ended range cannot be iterated at compile time", d.start, d.end)
+        }
+        let lo: Value = ev(it, p, src, sd.a)
+        if it.failed { return v_unit() }
+        let hi: Value = ev(it, p, src, sd.b)
+        if it.failed { return v_unit() }
+        if lo.tag != 0 or hi.tag != 0 { return fail(it, "a range bound must be an integer", d.start, d.end) }
+        let inclusive: bool = sd.op == 1
+        let base: usize = list.len(i32, it.stag)
+        var i: i64 = lo.i
+        var go: bool = true
+        for go {
+            if stride > 0 {
+                if inclusive { go = i <= hi.i } else { go = i < hi.i }
+            } else {
+                if inclusive { go = i >= hi.i } else { go = i > hi.i }
+            }
+            if go == false { break }
+            // Each produced element costs a step, so a range nobody meant to write is a
+            // diagnostic rather than an allocation — the `[v; n]` rule again.
+            if spend(it, d.start, d.end) == false {
+                list.truncate(i32, it.stag, base)
+                list.truncate(i64, it.sval, base)
+                return v_unit()
+            }
+            stage(it, v_int(i))
+            let next: i64 = i + stride
+            if stride > 0 { if next < i { return fail(it, "this range overflowed at compile time", d.start, d.end) } }
+            else { if next > i { return fail(it, "this range overflowed at compile time", d.start, d.end) } }
+            i = next
+        }
+        return list_close(it, base)
+    }
+    let sv2: Value = ev(it, p, src, srce)
+    if it.failed { return v_unit() }
+    if sv2.tag != 4 { return fail(it, "cannot iterate this at compile time", d.start, d.end) }
+    return sv2
+}
+
+// A comptime `for` (tier 7). Loops are STATEMENTS in Jestyr, so this yields no value; a
+// loop earns its keep by mutating a `var`, which is what makes
+// `var t = [0; n]  for i in 0..n { t[i] = f(i) }  t` the way to build a table.
+//
+// Fuel is spent per ITERATION. Nothing else would: `for i in 0..1000000000 { }` has an
+// empty body, so no sub-expression is evaluated and no step is charged. That one
+// `spend` is the difference between a bounded evaluator and a hung build.
+fn ev_for(mut it: Interp, read p: parser.Parser, read src: str, read d: parser.ExprData) -> Value {
+    let ls: i32 = list.get(i32, p.lar, d.a as usize)
+    let le: i32 = list.get(i32, p.lar, (d.a + 1) as usize)
+    var broke: List(i32) = list.make(i32, it.a)
+    list.push(i32, broke, 0)
+    if d.op == 0 {                                    // infinite
+        var go: bool = true
+        for go {
+            if spend(it, d.start, d.end) == false { return v_unit() }
+            if run_loop_body(it, p, src, d.b, ls, le, broke) { go = false }
+            if it.failed { return v_unit() }
+        }
+    } else if d.op == 1 {                             // conditional
+        let cond: i32 = list.get(i32, p.lar, (d.a + 4) as usize)
+        var go2: bool = true
+        for go2 {
+            if spend(it, d.start, d.end) == false { return v_unit() }
+            let c: Value = ev(it, p, src, cond)
+            if it.failed { return v_unit() }
+            if c.tag != 1 { return fail(it, "a `for` condition must be a bool", d.start, d.end) }
+            if c.i == 0 { go2 = false }
+            else {
+                if run_loop_body(it, p, src, d.b, ls, le, broke) { go2 = false }
+                if it.failed { return v_unit() }
+            }
+        }
+    } else {                                          // iterating
+        let nbind: i32 = list.get(i32, p.lar, (d.a + 4) as usize)
+        let nsrc: i32 = list.get(i32, p.lar, (d.a + 5) as usize)
+        let stepe: i32 = list.get(i32, p.lar, (d.a + 6) as usize)
+        let items: Value = iter_items(it, p, src, d, nbind, nsrc, stepe)
+        if it.failed { return v_unit() }
+        let n: i64 = list_len(it, items)
+        var k: i64 = 0
+        for k < n {
+            if spend(it, d.start, d.end) == false { return v_unit() }
+            // Each iteration's binding lives in its own scope, so a `for` body cannot
+            // leak its loop variable — exactly as at runtime.
+            scope_push(it)
+            let e: Value = list_at(it, items, k)
+            let ec: Value = deep_copy(it, e)
+            let b0s: i32 = list.get(i32, p.lar, (d.a + 7 + 1) as usize)
+            let b0e: i32 = list.get(i32, p.lar, (d.a + 7 + 2) as usize)
+            bind(it, b0s, b0e, ec)
+            if nbind == 2 {
+                let b1s: i32 = list.get(i32, p.lar, (d.a + 7 + 4) as usize)
+                let b1e: i32 = list.get(i32, p.lar, (d.a + 7 + 5) as usize)
+                bind(it, b1s, b1e, v_int(k))
+            }
+            let stop: bool = run_loop_body(it, p, src, d.b, ls, le, broke)
+            scope_pop(it)
+            if it.failed { return v_unit() }
+            if stop { break }
+            k = k + 1
+        }
+    }
+    // `for … else { … }` runs exactly once iff the loop completed WITHOUT a break — the
+    // search-or-default idiom. A `break` is precisely what suppresses it.
+    if list.get(i32, broke, 0) == 0 {
+        if d.x >= 0 {
+            let ignored: Value = ev_block(it, p, src, d.x)
+            if it.failed { return v_unit() }
+        }
+    }
+    return v_unit()
 }
 
 // Evaluate a repeat count: a non-negative integer, in the interpreter's own failure
@@ -628,7 +984,9 @@ fn is_int_type(read p: parser.Parser, read src: str, tyid: i32) -> bool {
 // A name: a local binding first, then a top-level `const`.
 fn ev_name(mut it: Interp, read p: parser.Parser, read src: str, read d: parser.ExprData) -> Value {
     let local: Value = lookup(it, src, d.start, d.end)
-    if local.tag >= 0 { return local }
+    // COPY POINT 1 of 3 (see `deep_copy`): reading a value out of a binding. The
+    // reference clones here; a handle would let `let a = t` alias `t`'s run.
+    if local.tag >= 0 { return deep_copy(it, local) }
 
     let init: i32 = const_init(p, src, d.start, d.end)
     if init < 0 { return fail(it, "this is not a compile-time constant", d.start, d.end) }
@@ -864,6 +1222,9 @@ fn ev_stmts(mut it: Interp, read p: parser.Parser, read src: str, start: i32, co
             // A nested `return` already fixed this call's result.
             return Value{ tag: it.rtag, i: it.ri }
         }
+        // A pending `break`/`continue` stops this block too, and keeps travelling until
+        // the loop that owns it consumes it (tier 7).
+        if it.lctl != 0 { return v_unit() }
         k = k + 1
     }
     return tail

@@ -8965,6 +8965,25 @@ fn main() -> i32 {
             ("agg_computed", "fn sq(x: i64) -> i64 { return x * x }\nconst T = [sq(1), sq(2), sq(3)]\nconst A: i64 = T[2]\n"),
             ("agg_in_block", "const A = comptime { let t = [1, 2, 3]\n t[1] }\nconst B = comptime { [1, 2] }\n"),
             ("agg_eq", "const A: bool = [1, 2] == [1, 2]\nconst B: bool = [1, 2] == [1, 3]\nconst C: bool = [1, 2] != [1]\nconst D: bool = [[1]] == [[1]]\n"),
+            // tier 7 — the comptime `for` + mutation. The point of the tier: a table's
+            // SHAPE is computed, not spelled out.
+            ("for_table", "fn f(i: i64) -> i64 { return i * i }\nconst T = comptime { var t = [0; 6]\n for i in 0..6 { t[i] = f(i) }\n t }\n"),
+            ("for_range_forms", "const A = comptime { var t = [0; 3]\n var k = 0\n for i in 0..=2 { t[k] = i\n k += 1 }\n t }\nconst B = comptime { var s = 0\n for i in 0..10 step 2 { s += i }\n s }\nconst C = comptime { var s = 0\n for i in 5..0 step 0 - 1 { s += i }\n s }\n"),
+            ("for_over_list", "const SRC = [3, 5, 7]\nconst A = comptime { var s = 0\n for x in SRC { s += x }\n s }\nconst B = comptime { var t = [0; 3]\n for x, i in SRC { t[i] = x * 2 }\n t }\n"),
+            ("for_cond_and_infinite", "const A = comptime { var n = 0\n for n < 5 { n += 1 }\n n }\nconst B = comptime { var n = 0\n for { n += 1\n if n == 4 { break } }\n n }\n"),
+            ("for_break_continue", "const A = comptime { var s = 0\n for i in 0..10 { if i == 5 { break }\n s += i }\n s }\nconst B = comptime { var s = 0\n for i in 0..6 { if i % 2 == 0 { continue }\n s += i }\n s }\n"),
+            ("for_labelled", "const A = comptime { var s = 0\n for outer: i in 0..4 { for j in 0..4 { if j == 2 { continue outer }\n if i == 3 { break outer }\n s += 1 } }\n s }\n"),
+            ("for_else", "const A = comptime { var s = 0\n for i in 0..3 { s += i } else { s += 100 }\n s }\nconst B = comptime { var s = 0\n for i in 0..3 { break } else { s += 100 }\n s }\n"),
+            ("for_nested_write", "const A = comptime { var m = [[0; 2]; 3]\n m[0][1] = 5\n m }\n"),
+            ("assign_compound", "const A = comptime { var x = 10\n x += 5\n x -= 2\n x *= 3\n x /= 2\n x %= 7\n x }\nconst B = comptime { var b = 12\n b &= 10\n b |= 1\n b ^= 3\n b }\nconst C = comptime { var s = \"a\"\n s += \"b\"\n s }\n"),
+            // tier 7 refusals
+            ("bad_for_overflow_add", "const A = comptime { var x = 9223372036854775807\n x += 1\n x }\n"),
+            ("bad_for_fuel", "const A = comptime { var n = 0\n for i in 0..1000000000 { }\n n }\n"),
+            ("bad_for_cond_type", "const A = comptime { for 1 { }\n 0 }\n"),
+            ("bad_for_step_zero", "const A = comptime { var s = 0\n for i in 0..4 step 0 { s += i }\n s }\n"),
+            ("bad_for_iter_scalar", "const A = comptime { var s = 0\n for x in 7 { s += x }\n s }\n"),
+            ("bad_assign_unbound", "const A = comptime { nope = 1\n 0 }\n"),
+            ("bad_assign_oob", "const A = comptime { var t = [0; 2]\n t[5] = 1\n t }\n"),
             // aggregate refusals — each rejected by BOTH, with a reason
             ("bad_agg_oob", "const T = [1, 2]\nconst A: i64 = T[5]\n"),
             ("bad_agg_neg", "const T = [1, 2]\nconst A: i64 = T[0 - 1]\n"),

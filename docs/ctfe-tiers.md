@@ -19,7 +19,7 @@ or mutate the compiler's own state destroys all three at once.
 | 4 | `build.jestyr` — the build described in Jestyr | **done in the Rust reference** — G4 (`jestyrc plan`) |
 | 5 | Bounded, attestable artifact generation | **done in the Rust reference** — G5 (`--emit`) |
 | 6 | Aggregate values — comptime **tables** | **done on BOTH sides** — G6 (reference, `Value::List`), M6 (port: a run of cells named by a pair index), M8 (port: emission — the brace form for a static, the statement-expression form for an expression position). `examples/comptime_table.jtr` is in the corpus and byte-identical across both compilers |
-| 7 | Comptime `for` + mutation — computed table *shape* | **done in the Rust reference** — G7 |
+| 7 | Comptime `for` + mutation — computed table *shape* | **done on BOTH sides** — G7 (reference), M7 (port: a `Place` is an env row or a cell index, so the write path is an address computation; the deep copy the handle representation owes is taken at the three points the reference clones) |
 
 ---
 
