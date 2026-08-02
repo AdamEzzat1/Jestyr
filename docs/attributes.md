@@ -78,7 +78,8 @@ Argument shapes are fixed per attribute and enforced:
 |---|---|---|---|---|
 | `@packed` | struct | — | `__attribute__((packed))` | remove inter-field padding |
 | `@align(n)` | struct | power-of-2 int | `__attribute__((aligned(n)))` | force a minimum alignment |
-| `@layout(c)` | struct | identifier | (marker) | C field order (the default today) |
+| `@layout(c)` | struct | identifier | (marker) | C field order — the default |
+| `@layout(auto)` | struct | identifier | reordered declaration | let the compiler minimise padding |
 | `@volatile` | field | — | `volatile` qualifier | MMIO — never cache the field |
 | `@no_panic` | fn / method | — | (static check) | every faulting op must be provably safe |
 | `@inline` | fn / method | — | `static inline __attribute__((always_inline))` | force inlining |
@@ -227,6 +228,47 @@ struct Uart { @volatile status: u32, @volatile data: u32 }   // MMIO registers
 `@align(n)` requires a positive power of two — `@align(3)` is rejected by Jestyr
 (with a clear message) rather than deferred to a confusing C error.
 
+### `@layout(auto)` — let the compiler choose the field order
+
+C lays a struct out in the order you wrote it, padding before every field that needs a
+stricter alignment than the running offset happens to have. That is a promise worth
+keeping when a struct crosses an FFI boundary or maps hardware, and pure cost when it
+does not.
+
+```jestyr
+struct Wasteful { a: u8, b: u64, c: u8, d: i32, e: u16 }               // 32 bytes
+@layout(auto) struct Tidy { a: u8, b: u64, c: u8, d: i32, e: u16 }     // 16 bytes
+```
+
+The compiler emits an annotated struct's fields in **descending alignment**, which
+leaves no interior padding at all — every offset is then a sum of sizes that are already
+multiples of alignments at least as strict as the next field's. Only tail padding
+remains, and no ordering can remove that.
+
+Nothing else about the program changes. A struct is constructed by field name
+(`Tidy { a: 1, … }` lowers to a C designated initializer) and read by field name, so
+reordering the *storage* is invisible to the code that uses it — which is exactly why
+the compiler is allowed to do it. `size_of` and `@offset_of` lower to C's own
+`sizeof`/`offsetof`, so they report the new layout without being taught about it.
+
+It is **opt-in per struct**: nothing you did not annotate moves a byte. And the
+annotation is **checked** rather than advisory — each of these is a compile error, not a
+silent no-op, because in each the byte order is already load-bearing:
+
+| Refused | Why |
+|---|---|
+| `@layout(auto)` on a `union` | every member starts at offset 0, and C treats the first member as the initially-active one |
+| `@layout(auto)` with `@packed` | `@packed` promises the layout you wrote; `@layout(auto)` says the compiler may choose it |
+| `@layout(auto)` with bit-fields | bit-field packing is implementation-defined in C, so the compiler cannot compute the layout it would be improving |
+| `@layout(other)` | the vocabulary is closed: `c` or `auto` |
+
+`@align(n)` composes fine — a forced alignment says nothing about field order.
+
+`jestyrc layout <file>` reports what a struct costs today: size, alignment, every field
+offset, and the padding waste. A reordered struct's fields are listed in **emission**
+order and the record is marked `(reordered)`, so the report always describes the bytes
+the backend actually produces. See [`examples/layout_auto.jtr`](../examples/layout_auto.jtr).
+
 ---
 
 ## 7. Validation
@@ -243,6 +285,8 @@ Every attribute is checked at parse time; problems are **errors**:
 | duplicate | `@inline @inline fn f() {}` | `duplicate attribute @inline` |
 | conflict | `@hot @cold fn f() {}` | `conflicting attributes @hot and @cold` |
 | reserved | `@verified fn f() {}` | `@verified is reserved and not implemented yet` |
+| unknown policy | `@layout(packd) struct S {…}` | `unknown layout policy packd` (`expected c or auto`) |
+| meaningless promise | `@packed @layout(auto) struct S {…}` | `@layout(auto) conflicts with @packed` |
 
 The "did you mean" suggestion uses an edit-distance match against the known set,
 so typos point straight at the intended attribute.

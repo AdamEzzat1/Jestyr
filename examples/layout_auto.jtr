@@ -1,0 +1,75 @@
+// examples/layout_auto.jtr — `@layout(auto)`: the compiler picks the field order.
+//
+// C lays a struct out in the order you wrote it, padding before each field that needs
+// a stricter alignment than the running offset happens to have. That is a promise
+// worth keeping when a struct crosses an FFI boundary or maps hardware — and pure cost
+// when it does not, which is most structs.
+//
+// `@layout(auto)` opts one struct out of that promise. The compiler emits its fields in
+// **descending alignment**, which leaves no interior padding at all: every offset is
+// then a sum of sizes that are already multiples of alignments at least as strict as
+// the next field's. Only tail padding remains, and no ordering can remove that.
+//
+// It is opt-in per struct, so nothing you did not annotate moves a byte — and the
+// annotation is *checked*: `@layout(auto)` on a union, on a `@packed` struct, or on a
+// struct with bit-fields is a compile error rather than a silent no-op, because each of
+// those is a declaration whose byte order is already load-bearing.
+//
+// Nothing else in the program changes. Construction is by field name and so is every
+// read, so reordering the storage is invisible to the code that uses it — which is
+// exactly why the compiler is allowed to do it.
+//
+// Run:  jestyrc run examples/layout_auto.jtr   →  32, 16, 1, 2, 3, 4, 24, 16
+// See:  jestyrc layout examples/layout_auto.jtr   (offsets, padding, and `(reordered)`)
+
+// A byte, a word, a byte, a half — the classic padding trap. Declaration order pays
+// 7 bytes before `b`, 1 before `d`, and 4 of tail padding: 32 bytes for 15 of data.
+struct Wasteful {
+    a: u8,
+    b: u64,
+    c: u8,
+    d: i32,
+    e: u16,
+}
+
+// The same five fields, same names, same types — the compiler reorders the storage to
+// b, d, e, a, c and the padding disappears. 16 bytes, of which 1 is tail padding.
+@layout(auto) struct Tidy {
+    a: u8,
+    b: u64,
+    c: u8,
+    d: i32,
+    e: u16,
+}
+
+// Reordering is not a local win: `Tidy` shrinking moves everything after it in a struct
+// that embeds one by value. `Outer` is 24 bytes because its inner is 16, not 32.
+struct Outer {
+    inner: Tidy,
+    tag: u8,
+}
+
+// The annotation composes with `@align(n)` — a forced alignment says nothing about
+// which order the fields go in — and applies to a `record` just as it does to a struct.
+@layout(auto) record Reading {
+    ok: bool,
+    value: f64,
+    unit: u16,
+}
+
+fn main() -> i32 {
+    print_int(size_of(Wasteful))          // 32 — declaration order, padded
+    print_int(size_of(Tidy))              // 16 — descending alignment, no interior padding
+
+    // The fields still answer to their own names, in any order, with their own values.
+    let t = Tidy { a: 1, b: 2, c: 3, d: 4, e: 5 }
+    print_int(t.a as i64)                 // 1
+    print_int(t.b as i64)                 // 2
+    print_int(t.c as i64)                 // 3
+    print_int(t.d as i64)                 // 4
+
+    print_int(size_of(Outer))             // 24 — the embedding struct sees the smaller inner
+    print_int(size_of(Reading))           // 16 — f64, u16, bool
+
+    return 0
+}

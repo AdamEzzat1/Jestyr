@@ -7592,6 +7592,209 @@ fn emit_gvariant_head(mut sb: String, read p: parser.Parser, read src: str, read
     string_push(sb, vname)
 }
 
+// ---- `@layout(auto)` field ordering (mirrors `src/layout.rs`, increment L2) --------------
+// Opt-in per struct: a struct that does NOT carry `@layout(auto)` emits its fields in
+// declaration order, exactly as before, which is why all 140 corpus files stay byte-identical.
+//
+// Only ALIGNMENT is mirrored here, never size. The ordering needs nothing else, and the reason
+// is worth stating because it is also what makes the model non-circular: an aggregate's
+// alignment is the max over its components, which no permutation changes, so an alignment can
+// be computed without first knowing which structs are reordered.
+//
+// -1 means "not knowable from the declared shape" — a generic instance, an unresolved name, a
+// `dyn` fat pointer. It is the port's spelling of the reference's `Option::None`, and it makes
+// the CALLER decline to reorder: reordering by an alignment the compiler had to guess would put
+// the two implementations' emitted C at risk of disagreeing, which is the one thing the golden
+// exists to prevent.
+
+// The alignment of a primitive by name, or 0 if the name is not one (mirrors `prim_layout`'s
+// alignment column). `str`/`String`/`Builder`/`Cow` are multi-word views and buffers, so they
+// carry a pointer's alignment rather than their own size.
+fn la_prim_align(read name: str) -> i32 {
+    if str_eq(name, "i8") { return 1 }
+    if str_eq(name, "u8") { return 1 }
+    if str_eq(name, "bool") { return 1 }
+    if str_eq(name, "i16") { return 2 }
+    if str_eq(name, "u16") { return 2 }
+    if str_eq(name, "i32") { return 4 }
+    if str_eq(name, "u32") { return 4 }
+    if str_eq(name, "f32") { return 4 }
+    if str_eq(name, "char") { return 4 }
+    if str_eq(name, "i64") { return 8 }
+    if str_eq(name, "u64") { return 8 }
+    if str_eq(name, "f64") { return 8 }
+    if str_eq(name, "isize") { return 8 }
+    if str_eq(name, "usize") { return 8 }
+    if str_eq(name, "str") { return 8 }
+    if str_eq(name, "os_str") { return 8 }
+    if str_eq(name, "cstr") { return 8 }
+    if str_eq(name, "String") { return 8 }
+    if str_eq(name, "Builder") { return 8 }
+    if str_eq(name, "Cow") { return 8 }
+    return 0
+}
+
+// The alignment of an AST type node, or -1 when unknowable (mirrors `layout::layout_of`'s
+// alignment half). `depth` is a totality bound: a struct cannot contain itself by value in a
+// well-typed program, but a malformed one could, and a compiler that hangs is worse than one
+// that declines.
+fn la_align(read p: parser.Parser, read src: str, tyid: i32, depth: i32) -> i32 {
+    if depth <= 0 { return 0 - 1 }
+    if tyid < 0 { return 1 }                            // unit
+    let t: parser.TypeData = list.get(parser.TypeData, p.ty, tyid as usize)
+    if t.kind == 0 {                                    // Name: primitive, else a declared type
+        let pa: i32 = la_prim_align(src[t.start .. t.end])
+        if pa > 0 { return pa }
+        let iid: i32 = find_named_item(p, src, t.start as i32, t.end as i32)
+        if iid < 0 { return 0 - 1 }                     // unresolved -> unknowable
+        return la_item_align(p, src, iid, depth - 1)
+    }
+    if t.kind == 2 { return 8 }                         // Ptr
+    if t.kind == 3 { return 8 }                         // Slice `{ ptr, len }`
+    if t.kind == 4 { return la_align(p, src, t.a, depth - 1) }   // Array: the element's own
+    if t.kind == 5 { return 8 }                         // GenRef `{ ptr, gen }`
+    if t.kind == 6 { return 8 }                         // RegionRef -> a plain pointer
+    if t.kind == 9 { return 8 }                         // Fn pointer
+    return 0 - 1                                        // App/Path/Dyn/TypeKw/Error: unknowable
+}
+
+// The alignment of a declared item (mirrors `named_layout`'s alignment half): a `distinct` is
+// its base exactly, a struct is the max over its fields, and a tagged enum is the max of its
+// 4-byte tag and every payload field.
+fn la_item_align(read p: parser.Parser, read src: str, iid: i32, depth: i32) -> i32 {
+    let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+    if it.kind == 1 { return la_align(p, src, it.a, depth) }     // distinct: `a` = base TypeId
+    if it.kind == 4 {
+        var best: i32 = 1
+        var m: i32 = 0
+        for m < it.b {
+            let base: i32 = it.a + m * 10
+            if list.get(i32, p.mar, base as usize) == 0 {        // a field, not a method
+                let fa: i32 = la_align(p, src, list.get(i32, p.mar, (base + 4) as usize), depth)
+                if fa < 0 { return 0 - 1 }
+                if fa > best { best = fa }
+            }
+            m = m + 1
+        }
+        return best
+    }
+    if it.kind == 5 {
+        var best2: i32 = 4                                       // the tag
+        var k: i32 = 0
+        for k < it.z {
+            let vb: i32 = it.b + k * 5
+            let fs: i32 = list.get(i32, p.ear, (vb + 2) as usize)
+            let fc: i32 = list.get(i32, p.ear, (vb + 3) as usize)
+            var fi: i32 = 0
+            for fi < fc {
+                let fa2: i32 = la_align(p, src, list.get(i32, p.ear, (fs + fi * 3 + 2) as usize), depth)
+                if fa2 < 0 { return 0 - 1 }
+                if fa2 > best2 { best2 = fa2 }
+                fi = fi + 1
+            }
+            k = k + 1
+        }
+        return best2
+    }
+    return 0 - 1
+}
+
+// Does this item carry `@layout(auto)`? (mirrors `layout::wants_auto`). Attrs are 4-tuples in
+// `aar` at `(it.u, it.v)`: [name_start, name_end, arg_start, arg_count]; the argument ExprId
+// lives in `aar` at `arg_start`. Only the exact word `auto` counts — `@layout(c)` is the
+// default said out loud, and the reference refuses any other spelling outright.
+fn la_auto(read p: parser.Parser, read src: str, read it: parser.ItemData) -> bool {
+    if it.u < 0 { return false }
+    var a: i32 = 0
+    for a < it.v {
+        let ab: i32 = it.u + a * 4
+        let ns: i32 = list.get(i32, p.aar, ab as usize)
+        let ne: i32 = list.get(i32, p.aar, (ab + 1) as usize)
+        if str_eq(src[ns as usize .. ne as usize], "layout") {
+            if list.get(i32, p.aar, (ab + 3) as usize) >= 1 {
+                let arg: i32 = list.get(i32, p.aar, (ab + 2) as usize)
+                let aid: i32 = list.get(i32, p.aar, arg as usize)
+                let ax: parser.ExprData = list.get(parser.ExprData, p.ex, aid as usize)
+                if ax.kind == 2 {                                // a bare Name argument
+                    if str_eq(src[ax.start .. ax.end], "auto") { return true }
+                }
+            }
+        }
+        a = a + 1
+    }
+    return false
+}
+
+// May this struct's fields be reordered? Every field's alignment must be knowable AND be one of
+// 1/2/4/8 — the complete set the model produces, and the set `la_emit_fields` walks. A width
+// outside it would be silently dropped from the emission, so it declines instead.
+fn la_reorderable(read p: parser.Parser, read src: str, read it: parser.ItemData) -> bool {
+    if !la_auto(p, src, it) { return false }
+    var m: i32 = 0
+    for m < it.b {
+        let base: i32 = it.a + m * 10
+        if list.get(i32, p.mar, base as usize) == 0 {
+            let fa: i32 = la_align(p, src, list.get(i32, p.mar, (base + 4) as usize), 32)
+            if fa != 1 and fa != 2 and fa != 4 and fa != 8 { return false }
+        }
+        m = m + 1
+    }
+    return true
+}
+
+// One field's declaration line (factored out so declaration order and reordered order emit
+// through the same code and cannot drift).
+fn la_emit_field(mut sb: String, read p: parser.Parser, read src: str, base: i32) {
+    string_push(sb, "    ")
+    if field_has_attr(p, src, base, "volatile") { string_push(sb, "volatile ") }
+    emit_c_ty(sb, p, src, list.get(i32, p.mar, (base + 4) as usize))
+    string_push(sb, " j_")
+    let fns: i32 = list.get(i32, p.mar, (base + 2) as usize)
+    let fne: i32 = list.get(i32, p.mar, (base + 3) as usize)
+    string_push(sb, src[fns as usize .. fne as usize])
+    let bs: i32 = list.get(i32, p.mar, (base + 8) as usize)      // `: bits` width span
+    if bs >= 0 {
+        string_push(sb, " : ")
+        string_push(sb, src[bs as usize .. list.get(i32, p.mar, (base + 9) as usize) as usize])
+    }
+    string_push(sb, ";\n")
+}
+
+// Emit a struct's fields in EMISSION order: descending alignment when `@layout(auto)` applies,
+// declaration order otherwise.
+//
+// The reordered pass walks the four alignment levels 8, 4, 2, 1 and within each emits the
+// matching fields in declaration order. That is exactly a stable sort by descending alignment —
+// the reference's `sort_by_key(Reverse(align))` — but it needs no list and no comparison sort,
+// so it is allocation-free and obviously stable. It is only equivalent because the model's
+// alignments are drawn from precisely those four values, which is what `la_reorderable` checks
+// rather than assumes.
+fn la_emit_fields(mut sb: String, read p: parser.Parser, read src: str, read it: parser.ItemData) {
+    if !la_reorderable(p, src, it) {
+        var m0: i32 = 0
+        for m0 < it.b {
+            let b0: i32 = it.a + m0 * 10
+            if list.get(i32, p.mar, b0 as usize) == 0 { la_emit_field(sb, p, src, b0) }
+            m0 = m0 + 1
+        }
+        return
+    }
+    var lvl: i32 = 8
+    for lvl >= 1 {
+        var m: i32 = 0
+        for m < it.b {
+            let base: i32 = it.a + m * 10
+            if list.get(i32, p.mar, base as usize) == 0 {
+                if la_align(p, src, list.get(i32, p.mar, (base + 4) as usize), 32) == lvl {
+                    la_emit_field(sb, p, src, base)
+                }
+            }
+            m = m + 1
+        }
+        lvl = lvl / 2
+    }
+}
+
 // Struct/record/union definitions (mirrors Cgen::struct_defs). Members are 10-tuples in `mar`
 // at `it.a`, count `it.b`: [tag(0=field,1=method), pub, name_start, name_end, type_id, default,
 // attr_start, attr_count, bits_start, bits_end]. Only fields are emitted (methods live in fn_defs);
@@ -7811,28 +8014,7 @@ fn emit_struct_defs(mut sb: String, read p: parser.Parser, read src: str, mut d:
             string_push(sb, " Jestyr_")
             string_push(sb, src[it.x .. it.y])
             string_push(sb, " {\n")
-            var m: i32 = 0
-            for m < it.b {
-                let base: i32 = it.a + m * 10
-                let tag: i32 = list.get(i32, p.mar, base as usize)
-                if tag == 0 {                         // a field (not a method)
-                    string_push(sb, "    ")
-                    if field_has_attr(p, src, base, "volatile") { string_push(sb, "volatile ") }
-                    let fty: i32 = list.get(i32, p.mar, (base + 4) as usize)
-                    emit_c_ty(sb, p, src, fty)
-                    string_push(sb, " j_")
-                    let fns: i32 = list.get(i32, p.mar, (base + 2) as usize)
-                    let fne: i32 = list.get(i32, p.mar, (base + 3) as usize)
-                    string_push(sb, src[fns as usize .. fne as usize])
-                    let bs: i32 = list.get(i32, p.mar, (base + 8) as usize)   // `: bits` width span
-                    if bs >= 0 {
-                        string_push(sb, " : ")
-                        string_push(sb, src[bs as usize .. list.get(i32, p.mar, (base + 9) as usize) as usize])
-                    }
-                    string_push(sb, ";\n")
-                }
-                m = m + 1
-            }
+            la_emit_fields(sb, p, src, it)            // declaration order, or `@layout(auto)`'s
             string_push(sb, "};\n\n")
             dc_end(d, sb_len(sb))
         }

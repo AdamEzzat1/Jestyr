@@ -95,7 +95,7 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | I | Error-handling polish | ~70% | MED | S | ✓ | — |
 | J | Numeric / operator completeness | ~70% | MED | S–M | ✓ | ✓ (determinism) |
 | K | Module system v2 | ~98% | MED | M | ✓ | ✓✓ (build/incremental) |
-| L | Memory-layout pass | 0% | MED | M | ✓ | ✓✓ (mem-efficiency) |
+| L | Memory-layout pass | ~55% | MED | M | ✓ | ✓✓ (mem-efficiency) |
 | M | `@verified` (SMT) | 0% | HIGH | XL | ✓ | ✓✓ (verify passes) |
 | N | Concurrency polish | ~100% | MED | M | ✓ | — |
 | O | Tooling (fmt / test / doc / LSP) | test-runner ✅, doc ✅, attest ✅, attest --diff ✅ — **all four also SELF-HOSTED ✅**; LSP/fmt deferred | LOW | M | ✓✓ | ✓ |
@@ -301,11 +301,35 @@ no `#line` ⇒ byte-identical there; only the loader path emits). `-g` is separa
 `CC_FLAGS` determinism/attest seam. Full test rigor + teeth. See `jestyr-debuginfo.md`.
 **Next systems items (untouched):** cross-compile (`--target` via `zig cc`), then L, then M.
 
-### L. Memory-layout pass — 0% (MED conflict; files: a new analysis + cgen)
-**Design §16 / a Motley principle.** **Left:** a layout pass computing size/align,
-**field reordering**, **enum niche-packing**, pass-large-aggregates-by-`const*`
-(today `read` params copy). **Directly serves Motley's "memory efficiency at every
-layer."** Mostly a new pass + cgen tweaks → reasonably isolated.
+### L. Memory-layout pass — ~55% (MED conflict; files: `layout.rs`, attrs, cgen + port)
+**Design §16 / a Motley principle. Directly serves Motley's "memory efficiency at every
+layer."**
+
+**L1 — the analysis pass ✅.** `src/layout.rs` + `jestyrc layout <file>`: size, alignment,
+field offsets and **padding waste** for every declared type. Zero emission change, on
+purpose — that is what made the later increments safe to build. **gcc is the authority,
+and CI says so**: `layout_matches_c_sizeof` emits a probe `main` printing the real
+`sizeof`/`_Alignof`/`offsetof` and diffs it against the model. Two gaps are *admitted*
+rather than guessed (`(incomplete)`): generic/opaque components, and **bit-fields**, whose
+packing is implementation-defined in C.
+
+**L2 — `@layout(auto)` ✅ (both sides).** Opt-in per struct: annotated structs emit their
+fields in **descending alignment**, which is *minimal* rather than merely tighter — every
+layout in the model satisfies `size % align == 0` and every alignment is a power of two,
+so descending order leaves **zero interior padding** and the total is `align_to(Σ sizes,
+align)`, which no ordering can beat. Safe because cgen constructs with designated
+initializers and reads by name, so only *storage* moves. Reordering propagates into
+embedding structs (a smaller inner moves every offset after it). The vocabulary is closed
+(`c` | `auto` — `@layout(packd)` used to validate clean and do nothing), and `auto` is
+refused with its own named cause on a union, with `@packed`, and on a bit-field struct.
+Port mirror in `examples/std/cgen.jtr` (`la_*`), corpus **141**
+(`examples/layout_auto.jtr`), seed refreshed.
+
+**Left:** **L3** — enum **niche-packing** behind the same attribute, and
+pass-large-aggregates-by-`const*` (today `read` params copy) behind `@abi(ref)`; each
+opt-in, each its own increment + port mirror. Then `@size_of`/`@align_of`/`@offset_of` as
+comptime **values** (L1 unblocked the computation; exposing it is its own slice, and closes
+the gap `docs/ctfe-tiers.md` records against tier 3).
 
 ### M. `@verified` (SMT) — 0% (HIGH conflict; XL; files: a new verifier + typeck)
 **Design §7 ceiling (ATS/Ada).** Turn `requires`/`ensures`/`invariant`/`variant`
