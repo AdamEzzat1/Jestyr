@@ -475,42 +475,51 @@ pub struct Token { pub kind: i32, pub start: usize, pub end: usize }
 // pair so `tokenize` can both classify and advance in one step. Internal to this module.
 struct OpTok { kind: i32, width: usize }
 
-fn is_space(x: i32) -> bool {
-    if x == 32 { return true }   // space
-    if x == 9 { return true }    // tab
-    if x == 10 { return true }   // newline
-    if x == 13 { return true }   // carriage return
-    return false
+// The lexer's character classes, as one table the COMPILER computes (roadmap G tier 7).
+//
+// This is the compiler's own source using its own compile-time evaluator: the loop below
+// runs at compile time and what reaches C is a plain 256-entry static, so the *shape* of
+// the table is computed rather than spelled out. Written as literals it would be 256
+// hand-maintained entries, which is exactly the thing nobody keeps correct; written as
+// the branch chains it replaces, the classification rules were spread across six
+// functions and `is_hex` had to call `is_digit` to avoid repeating one of them.
+//
+// One bit per class, so a byte's full classification is a single load:
+//   1 = alpha (A-Z a-z _)   2 = digit (0-9)   4 = hex letter (A-F a-f)
+//   8 = space (SP TAB LF CR)                 16 = `_` on its own
+// `_` carries BOTH bit 0 and bit 4: it is an identifier character, and it is separately
+// the digit separator in `1_000`, and those two facts are not the same question.
+//
+// Every input is `src[i]`, a byte, so the index is always in range.
+const TOK_CLASS: [256]i64 = comptime {
+    var t = [0; 256]
+    for c in 0..256 {
+        var m = 0
+        if c >= 65 { if c <= 90 { m = m | 1 } }      // A-Z
+        if c >= 97 { if c <= 122 { m = m | 1 } }     // a-z
+        if c == 95 { m = m | 1 }                     // _ is an identifier character
+        if c >= 48 { if c <= 57 { m = m | 2 } }      // 0-9
+        if c >= 65 { if c <= 70 { m = m | 4 } }      // A-F
+        if c >= 97 { if c <= 102 { m = m | 4 } }     // a-f
+        if c == 32 { m = m | 8 }                     // space
+        if c == 9 { m = m | 8 }                      // tab
+        if c == 10 { m = m | 8 }                     // newline
+        if c == 13 { m = m | 8 }                     // carriage return
+        if c == 95 { m = m | 16 }                    // _ as the digit separator
+        t[c] = m
+    }
+    t
 }
-fn is_alpha(c: u8) -> bool {
-    let x: i32 = c as i32
-    if x >= 65 { if x <= 90 { return true } }    // A-Z
-    if x >= 97 { if x <= 122 { return true } }   // a-z
-    if x == 95 { return true }                   // _
-    return false
-}
-fn is_digit(c: u8) -> bool {
-    let x: i32 = c as i32
-    if x >= 48 { if x <= 57 { return true } }    // 0-9
-    return false
-}
-fn is_alnum(c: u8) -> bool {
-    if is_alpha(c) { return true }
-    return is_digit(c)
-}
-fn is_hex(c: u8) -> bool {
-    if is_digit(c) { return true }
-    let x: i32 = c as i32
-    if x >= 65 { if x <= 70 { return true } }    // A-F
-    if x >= 97 { if x <= 102 { return true } }   // a-f
-    return false
-}
+
+fn is_space(x: i32) -> bool { return (TOK_CLASS[x as usize] & 8) != 0 }
+fn is_alpha(c: u8) -> bool { return (TOK_CLASS[c as usize] & 1) != 0 }
+fn is_digit(c: u8) -> bool { return (TOK_CLASS[c as usize] & 2) != 0 }
+// `_` is alpha, so it is alnum too — the same rule the branch chain had by calling
+// `is_alpha` first.
+fn is_alnum(c: u8) -> bool { return (TOK_CLASS[c as usize] & 3) != 0 }
+fn is_hex(c: u8) -> bool { return (TOK_CLASS[c as usize] & 6) != 0 }
 // A digit or the `_` digit separator (`1_000`, `0xC000_0000`).
-fn is_digit_us(c: u8) -> bool {
-    if is_digit(c) { return true }
-    if (c as i32) == 95 { return true }
-    return false
-}
+fn is_digit_us(c: u8) -> bool { return (TOK_CLASS[c as usize] & 18) != 0 }
 
 // Is the already-scanned number `src[from..to]` a float (vs an integer)? Matches
 // the reference's Int/Float split: radix literals (`0x`/`0b`) are always integers;
