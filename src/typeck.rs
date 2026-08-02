@@ -2409,28 +2409,55 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             ExprKind::ParFor { var, iter, reduction, body } => {
-                // The deterministic parallel reduction loop. Today the engine reduces
-                // `[]i64`, so require an `[]i64` iterable, an `i64`-valued body (each
-                // element's contribution), and a *declared deterministic* reduction.
+                // The deterministic parallel reduction loop. The *reduction* is `i64`
+                // (the declared deterministic operators are exactly associative on
+                // machine integers, which is what makes any schedule give the same
+                // bits), but the loop does not have to iterate `i64`.
+                //
+                // The engine never sees the source slice: `emit_par_for` materializes
+                // an `i64` map buffer by running the body per element and reduces
+                // *that*. So the element type is free, and widening it costs the
+                // determinism argument nothing — the reduction domain is unchanged.
+                // It buys real width for a later SIMD lowering, where a body over
+                // `i32` fills twice the lanes of one over `i64` (and `u8`, eight
+                // times), so this is workstream Q's prerequisite as much as an
+                // ergonomic one.
                 let elem = self.iter_elem_type(scope, typ, self_ty, *iter);
-                if !matches!(elem, Ty::Prim("i64") | Ty::Unknown | Ty::Error) {
+                let elem_ok = match &elem {
+                    Ty::Prim(p) => is_integer_prim(p),
+                    Ty::Unknown | Ty::Error => true,
+                    _ => false,
+                };
+                if !elem_ok {
                     self.error(
                         span,
                         format!(
-                            "`par for` reduces over `[]i64`; found element type `{}`",
+                            "`par for` reduces over a slice of any integer type; found element type `{}`",
                             elem.display(&self.table)
                         ),
                     );
                 }
+                // The loop variable has the element's OWN type, so the body computes in
+                // that width rather than in a silently-widened one.
+                let bind_ty = if elem_ok { elem.clone() } else { Ty::Prim("i64") };
                 scope.push(HashMap::new());
-                scope.last_mut().unwrap().insert(var.name.clone(), Ty::Prim("i64"));
+                scope.last_mut().unwrap().insert(var.name.clone(), bind_ty);
                 let body_ty = self.infer(scope, typ, self_ty, *body);
                 scope.pop();
-                if !matches!(body_ty, Ty::Prim("i64") | Ty::Unknown | Ty::Error) {
+                // Any integer contribution is accepted and widened to `i64` once per
+                // element. A non-integer is refused rather than coerced: the reduction
+                // is defined on integers, and inventing a conversion is what this
+                // compiler does not do.
+                let body_ok = match &body_ty {
+                    Ty::Prim(p) => is_integer_prim(p),
+                    Ty::Unknown | Ty::Error => true,
+                    _ => false,
+                };
+                if !body_ok {
                     self.error(
                         span,
                         format!(
-                            "a `par for` body must produce `i64` (the per-element contribution); found `{}`",
+                            "a `par for` body must produce an integer (the per-element contribution, widened to `i64` for the reduction); found `{}`",
                             body_ty.display(&self.table)
                         ),
                     );
@@ -3465,6 +3492,16 @@ fn reflect_intrinsic_ret(name: &str) -> Option<Ty> {
 /// user-declared reductions is future work; today the trusted set is these.)
 const DETERMINISTIC_REDUCTIONS: [&str; 4] =
     ["sum_reduction", "min_reduction", "max_reduction", "xor_reduction"];
+
+/// Is `p` one of the integer primitives? The element and contribution types a
+/// `par for` accepts — the reduction itself stays `i64`, so this is the set that
+/// widens to it losslessly.
+fn is_integer_prim(p: &str) -> bool {
+    matches!(
+        p,
+        "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
+    )
+}
 
 /// Does the parameter type's head constructor match the receiver's? Confirms
 /// that `base.name(...)` really is a method on `base`'s type (and not a typo

@@ -4530,6 +4530,119 @@ mod cost_model {
     }
 }
 
+/// **Workstream Q — `par for` over any integer width.**
+///
+/// The reduction stays `i64` (the declared deterministic operators are exactly
+/// associative there, which is the whole determinism argument), but the loop no longer
+/// has to *iterate* `i64`. That is possible because `emit_par_for` is map-then-reduce:
+/// it fills an `int64_t` buffer by running the body per element and hands only that to
+/// `core.par_reduce`, so the engine never sees the source slice and needs no generic
+/// `spawn` — the constraint the handoff had assumed was blocking.
+///
+/// Why it matters beyond ergonomics: a later SIMD lowering fills lanes with the
+/// *element* type, so a body over `i32` gets twice the lanes of one over `i64` and `u8`
+/// eight times. This is Q-S2's prerequisite.
+///
+/// These are reference-side: type-level accept/reject plus the emitted shape. The
+/// end-to-end gcc run arrives with the corpus file, which is also what triggers the
+/// port mirror — the same ordering G1 and Q-S1 used.
+#[cfg(test)]
+mod par_for_width {
+    use super::*;
+
+    /// A whole program with a locally-declared reduction (the check is on the callee's
+    /// NAME, so this satisfies it without pulling in `core`).
+    fn prog(elem: &str, body: &str) -> String {
+        format!(
+            "fn sum_reduction() -> i64 {{ return 0 }}\n\
+             fn f(read s: []{elem}) -> i64 {{\n    return par for x in s reduce(sum_reduction()) {{ {body} }}\n}}\n"
+        )
+    }
+
+    fn errors(src: &str) -> Vec<String> {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
+        let (_info, d) = crate::typeck::check(&ast);
+        d.iter().filter(|x| x.is_error()).map(|x| x.message.clone()).collect()
+    }
+
+    fn emitted(src: &str) -> String {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
+        let (info, _) = crate::typeck::check(&ast);
+        crate::cgen::emit(&ast, &info).0
+    }
+
+    /// Every integer width is accepted as the element type.
+    #[test]
+    fn every_integer_element_type_is_accepted() {
+        for t in ["i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize"] {
+            let e = errors(&prog(t, "x as i64"));
+            assert!(e.is_empty(), "`[]{t}` should be iterable by `par for`: {e:?}");
+        }
+    }
+
+    /// The loop variable carries the ELEMENT's type, so the body computes in that width
+    /// — which is exactly what gives a later lowering its lane count.
+    #[test]
+    fn the_loop_variable_has_the_element_type() {
+        let c = emitted(&prog("i32", "x * x"));
+        assert!(c.contains("int32_t j_x = _pf0.ptr[_pi0];"), "loop var should be int32_t:\n{c}");
+        // …and the contribution is widened exactly once, on the way into the buffer.
+        assert!(c.contains("_pm0[_pi0] = (int64_t)((j_x * j_x));"), "contribution should widen once:\n{c}");
+    }
+
+    /// The `i64` case must emit what it always did — that byte-identity is what keeps
+    /// this increment off the corpus, the concat, the seed and every attested hash.
+    #[test]
+    fn the_i64_lowering_is_unchanged() {
+        let c = emitted(&prog("i64", "x * x"));
+        assert!(c.contains("int64_t j_x = _pf0.ptr[_pi0];"), "{c}");
+        // No cast: the body is already the reduction's type.
+        assert!(c.contains("_pm0[_pi0] = (j_x * j_x);"), "an i64 body must not gain a cast:\n{c}");
+        assert!(!c.contains("(int64_t)((j_x * j_x))"), "the i64 path must be byte-identical:\n{c}");
+    }
+
+    /// The source slice keeps its own type while the reduce call takes the `i64` buffer
+    /// — two different slice types in one lowering, which is the thing that makes the
+    /// widening free.
+    #[test]
+    fn the_source_and_the_reduced_buffer_have_different_slice_types() {
+        let c = emitted(&prog("u8", "x as i64"));
+        assert!(c.contains("JestyrSlice_u8 _pf0 = "), "source keeps its element type:\n{c}");
+        assert!(c.contains("(JestyrSlice_i64){ _pm0, _pf0.len }"), "the engine still takes []i64:\n{c}");
+    }
+
+    /// A non-integer element or contribution is refused, not coerced. The reduction is
+    /// defined on integers; inventing a conversion is what this compiler does not do —
+    /// and a float would take the determinism argument with it.
+    #[test]
+    fn non_integer_elements_and_bodies_are_refused() {
+        let e = errors(&prog("f64", "x as i64"));
+        assert!(
+            e.iter().any(|m| m.contains("slice of any integer type")),
+            "a float element type must be refused: {e:?}"
+        );
+        let e2 = errors(&prog("i32", "\"nope\""));
+        assert!(
+            e2.iter().any(|m| m.contains("must produce an integer")),
+            "a non-integer contribution must be refused: {e2:?}"
+        );
+    }
+
+    /// Widening the element type does not widen what may reduce: the declared
+    /// deterministic set is still the only thing accepted.
+    #[test]
+    fn a_non_declared_reduction_is_still_rejected() {
+        let src = "fn my_reduction() -> i64 { return 0 }\n\
+                   fn f(read s: []i32) -> i64 { return par for x in s reduce(my_reduction()) { x as i64 } }\n";
+        assert!(
+            errors(src).iter().any(|m| m.contains("declared deterministic reduction")),
+            "the checked guarantee must survive the widening"
+        );
+    }
+}
+
 /// **Workstream Q — SIMD legality (`@simd`).** The compiler decides whether a
 /// `par for` body may be evaluated a SIMD lane at a time without changing a bit, and
 /// `@simd` is the *checked declaration* that it can be. Like `@span`, the check runs

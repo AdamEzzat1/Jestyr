@@ -6572,21 +6572,52 @@ impl<'a> Cgen<'a> {
     /// element-wise (always deterministic); the parallel, reassociation-sensitive part
     /// is `par_reduce`, whose reduction was already checked deterministic by typeck.
     /// Requires `import "core"` (the reduction value comes from there, so it always is).
+    /// Lower `par for x in xs reduce(r) { … }`.
+    ///
+    /// The shape is map-then-reduce: run the body once per element into an `int64_t`
+    /// buffer, then hand *that* to the deterministic engine. Which is why the SOURCE
+    /// element type is free — `core.par_reduce` never sees the source slice — while the
+    /// reduction stays `i64`, where the declared operators are exactly associative.
+    ///
+    /// The loop variable is declared with the element's own C type, so a body over
+    /// `i32` computes in `i32`; only the per-element contribution is widened, once, on
+    /// the way into the buffer. An `i64` source emits exactly what it always did, so
+    /// every existing program's C is byte-identical.
     fn emit_par_for(&mut self, var: &Ident, iter: ExprId, reduction: ExprId, body: ExprId) -> String {
         let n = self.tmp;
         self.tmp += 1;
-        let sl = self.slice_c_name(&Ty::Prim("i64"));
+        let elem = match apply_subst(&self.info.type_of(iter).clone(), &self.subst) {
+            Ty::Slice(e) => (*e).clone(),
+            Ty::Array { elem, .. } => (*elem).clone(),
+            _ => Ty::Prim("i64"),
+        };
+        let elem = if matches!(&elem, Ty::Prim(p) if is_integer_c_prim(p)) {
+            elem
+        } else {
+            Ty::Prim("i64")
+        };
+        let sl = self.slice_c_name(&elem);
+        let i64sl = self.slice_c_name(&Ty::Prim("i64"));
+        let ecty = self.c_type(&elem);
         let src = self.emit_expr(iter);
         let red = self.emit_expr(reduction);
         let vname = format!("j_{}", var.name);
         let bodyc = self.emit_expr(body); // references the loop var as `j_<var>`
+        // The contribution cast is omitted when the body is already `i64`, so the
+        // pre-existing lowering is reproduced character for character.
+        let body_ty = apply_subst(&self.info.type_of(body).clone(), &self.subst);
+        let contrib = if matches!(&body_ty, Ty::Prim("i64")) {
+            bodyc
+        } else {
+            format!("(int64_t)({bodyc})")
+        };
         let prc = self.c_fn_name("par_reduce");
         format!(
             "({{ {sl} _pf{n} = {src}; \
              int64_t* _pm{n} = (int64_t*)malloc(_pf{n}.len * sizeof(int64_t)); \
              for (size_t _pi{n} = 0; _pi{n} < _pf{n}.len; _pi{n}++) {{ \
-             int64_t {vname} = _pf{n}.ptr[_pi{n}]; _pm{n}[_pi{n}] = {bodyc}; }} \
-             int64_t _pr{n} = {prc}(({sl}){{ _pm{n}, _pf{n}.len }}, {red}); \
+             {ecty} {vname} = _pf{n}.ptr[_pi{n}]; _pm{n}[_pi{n}] = {contrib}; }} \
+             int64_t _pr{n} = {prc}(({i64sl}){{ _pm{n}, _pf{n}.len }}, {red}); \
              free(_pm{n}); _pr{n}; }})"
         )
     }
@@ -10988,4 +11019,13 @@ mod tests {
         let fat = gen("enum E { none, some(p: &i32) }").0;
         assert!(fat.contains("struct Jestyr_E {"), "fat &T → tagged union: {fat}");
     }
+}
+
+/// Is `p` an integer primitive — the element types `par for` may iterate? Mirrors
+/// `typeck::is_integer_prim`; kept local so cgen does not depend on typeck's privates.
+fn is_integer_c_prim(p: &str) -> bool {
+    matches!(
+        p,
+        "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
+    )
 }
