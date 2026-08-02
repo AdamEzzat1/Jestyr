@@ -1,0 +1,66 @@
+// examples/std/par_for_width.jtr — `par for` over a narrower element type (workstream Q).
+//
+// The *reduction* is `i64` — the declared deterministic operators (sum/min/max/xor) are
+// exactly associative on machine integers, which is what makes the answer identical for
+// every thread schedule. The *loop* does not have to iterate `i64`, and that is not a
+// concession: `par for` lowers to map-then-reduce, filling an `int64_t` buffer by running
+// the body once per element, so `core.par_reduce` never sees the source slice at all.
+//
+// So the loop variable carries the element's own type — `x` below is an `i32`, and
+// `x * x` is `i32` arithmetic — and only the per-element contribution is widened, once,
+// on the way into the buffer.
+//
+// Why the width matters beyond ergonomics: a SIMD lowering fills lanes with the ELEMENT
+// type. Over `i64` a 256-bit register holds 4; over `i32`, 8. Iterating the narrow type
+// is what makes those lanes available, so this is the shape the vector path will want.
+//
+//   jestyrc run examples/std/par_for_width.jtr   →   285, 1, 9, 30
+import "core"
+import "io"
+
+fn seti32(p: *mut i32, i: usize, v: i32) { unsafe { (p + i).* = v } }
+fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
+
+// The serial reference, left to right, in the same widths the parallel form uses.
+fn serial_sum_sq(read s: []i32) -> i64 {
+    var acc: i64 = 0
+    for x in s { acc = acc + ((x * x) as i64) }
+    return acc
+}
+
+fn main() -> i32 {
+    // 9 elements — not a multiple of the worker count, so the last chunk is uneven.
+    var a: *mut i32 = alloc(i32, 9)
+    var i: usize = 0
+    for i < 9 {
+        seti32(a, i, (i as i32) + 1)         // 1, 2, …, 9
+        i = i + 1
+    }
+    let s: []i32 = slice(i32, a, 9)
+
+    // `x` is an i32 and `x * x` is i32 arithmetic; the contribution widens once.
+    let sq: i64 = par for x in s reduce(core.sum_reduction()) { x * x }
+    io.print_i32(sq as i32)                              // 285 = Σ k² for k in 1..=9
+
+    // The guarantee, demonstrated: bit-identical to the serial fold.
+    io.print_i32(b2i(sq == serial_sum_sq(s)))            // 1
+
+    // The identity map still reduces in i64, over an i32 source.
+    let mx: i64 = par for x in s reduce(core.max_reduction()) { x }
+    io.print_i32(mx as i32)                              // 9
+
+    // A `u8` source: the same loop over the narrowest width there is.
+    var b: *mut u8 = alloc(u8, 4)
+    var k: usize = 0
+    for k < 4 {
+        unsafe { (b + k).* = (k as u8) + 6 }             // 6, 7, 8, 9
+        k = k + 1
+    }
+    let t: []u8 = slice(u8, b, 4)
+    let bs: i64 = par for y in t reduce(core.sum_reduction()) { y }
+    io.print_i32(bs as i32)                              // 30
+
+    free_ptr(b)
+    free_ptr(a)
+    return 0
+}

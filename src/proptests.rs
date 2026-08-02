@@ -4630,6 +4630,18 @@ mod par_for_width {
         );
     }
 
+    /// The shipped demo type-checks and passes the escape checker — the narrow-width
+    /// `par for` in a real multi-module program, not a fixture string.
+    #[test]
+    fn par_for_width_example_compiles_clean() {
+        let prog = crate::module::load("examples/std/par_for_width.jtr");
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "load errors: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(!td.iter().any(|d| d.is_error()), "typeck errors: {:?}", td);
+        let ed = crate::escape::check(&prog.ast, &info);
+        assert!(!ed.iter().any(|d| d.is_error()), "escape errors: {:?}", ed);
+    }
+
     /// Widening the element type does not widen what may reduce: the declared
     /// deterministic set is still the only thing accepted.
     #[test]
@@ -10605,6 +10617,24 @@ fn main() -> i32 {
             ["153", "1", "17", "1", "1", "1", "1", "1"]
         );
     }
+    #[test]
+    /// **`par for` over a narrower element type, on real OS threads.** The reduction
+    /// domain is `i64` while the loop iterates `i32` (and `u8`), so this is where the
+    /// widening either preserves the guarantee or does not: the parallel sum-of-squares
+    /// must equal the serial fold bit-for-bit (the `1`), over 9 elements so the last
+    /// worker chunk is uneven. Repeated to shake out any thread race — every token must
+    /// be identical each run.
+    #[test]
+    fn par_for_width_demo() {
+        for _ in 0..8 {
+            assert_eq!(
+                toks("examples/std/par_for_width.jtr"),
+                ["285", "1", "9", "30"],
+                "a narrow-width `par for` diverged from serial"
+            );
+        }
+    }
+
     #[test]
     fn par_soac_demo() {
         // Workstream Q tier 1: par_map + par_scan on real OS threads. Two maps and two

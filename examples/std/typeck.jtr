@@ -2151,10 +2151,17 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
         let sv: i32 = mk_ty(c, 18, 0 - 1, 0 - 1, 1, 0 - 1)     // self = Opaque("Self")
         infer_methods(c, p, src, d.x, d.y, sv)
         r = mk_ty(c, 14, 0 - 1, 0 - 1, 0 - 1, 0 - 1)   // TypeKw
-    } else if k == 41 {                            // par-for: elem, var bound to i64, body, reduction
-        iter_elem_type(c, p, src, d.a)             // infers the iterable
+    } else if k == 41 {                            // par-for: elem, var bound to the ELEMENT type
+        // The reduction is i64 (the declared operators are exactly associative there),
+        // but the loop iterates any integer width: `emit_par_for` is map-then-reduce, so
+        // `par_reduce` only ever sees the mapped i64 buffer and never the source slice.
+        // The loop variable carries the element's OWN type, so a body over i32 computes
+        // in i32 — which is what gives a later SIMD lowering its lane count.
+        let et: i32 = iter_elem_type(c, p, src, d.a)
         push_scope(c)
-        if !is_underscore(src, d.x as usize, d.y as usize) { scope_insert(c, d.x, d.y, t_i64()) }
+        var bt: i32 = t_i64()
+        if ty_is_int(c, et) { bt = et }
+        if !is_underscore(src, d.x as usize, d.y as usize) { scope_insert(c, d.x, d.y, bt) }
         infer(c, p, src, d.op)                     // body
         pop_scope(c)
         infer(c, p, src, d.b)                      // reduction
@@ -2285,6 +2292,16 @@ fn pick_numeric(read c: Checker, lt: i32, rt: i32) -> i32 {
     if ty_is_numeric(c, lt) { return lt }
     if ty_is_numeric(c, rt) { return rt }
     return t_unknown()
+}
+
+// Is `id` an INTEGER primitive (prim codes 0..=9)? The element and contribution types a
+// `par for` accepts — the reduction stays i64, so this is the set that widens to it
+// losslessly. Mirrors `is_integer_prim`.
+fn ty_is_int(read c: Checker, id: i32) -> bool {
+    if id < 0 { return false }
+    let d: TyData = list.get(TyData, c.tys, id as usize)
+    if d.kind != 2 { return false }
+    return d.x <= 9
 }
 
 // Is `id` a numeric primitive (i*/u*/f*)? Mirrors `is_numeric` (prim codes 0..=11).

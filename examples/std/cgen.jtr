@@ -1693,7 +1693,14 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         // taken FIRST; iter/reduction/body emit in that order. Mirrors `emit_par_for`.
         let pfn: i32 = g.tmp
         g.tmp = g.tmp + 1
-        string_push(sb, "({ JestyrSlice_i64 _pf")
+        // The SOURCE keeps its own element type while the engine still takes []i64 — two
+        // different slice types in one lowering, which is exactly what makes iterating a
+        // narrower width free. An i64 source reproduces the previous C character for
+        // character. Mirrors `emit_par_for`.
+        let ety: i32 = par_elem_ty(c, e.a)
+        string_push(sb, "({ JestyrSlice_")
+        push_ty_mangle(sb, src, c, ety)
+        string_push(sb, " _pf")
         push_uint(sb, pfn as i64)
         string_push(sb, " = ")
         emit_expr(sb, p, src, c, g, e.a)              // iter
@@ -1709,7 +1716,9 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         push_uint(sb, pfn as i64)
         string_push(sb, ".len; _pi")
         push_uint(sb, pfn as i64)
-        string_push(sb, "++) { int64_t j_")
+        string_push(sb, "++) { ")
+        emit_ty_c(sb, p, src, c, ety)                 // the loop var has the ELEMENT's type
+        string_push(sb, " j_")
         string_push(sb, src[e.x as usize .. e.y as usize])
         string_push(sb, " = _pf")
         push_uint(sb, pfn as i64)
@@ -1722,7 +1731,13 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         string_push(sb, "] = ")
         var prd: String = string_new()                // reduction BEFORE body (reference order)
         emit_expr(prd, p, src, c, g, e.b)
+        // The contribution is widened once per element — and the cast is OMITTED when the
+        // body is already i64, so the pre-existing lowering is reproduced exactly.
+        let bty: i32 = list.get(i32, c.et, e.op as usize)
+        let widen: bool = ty_is_i64(c, bty) == false
+        if widen { string_push(sb, "(int64_t)(") }
         emit_expr(sb, p, src, c, g, e.op)             // body (references j_<var>)
+        if widen { string_push(sb, ")") }
         string_push(sb, "; } int64_t _pr")
         push_uint(sb, pfn as i64)
         string_push(sb, " = jestyr_par_reduce((JestyrSlice_i64){ _pm")
@@ -7930,6 +7945,35 @@ fn is_declared_type(read c: typeck.Checker, read src: str, read nm: str) -> bool
         r = r + 1
     }
     return false
+}
+
+// The element TyId a `par for` iterates: the iterable's element if it is an integer
+// primitive, else i64 (the fallback keeps cgen total on a program typeck already
+// rejected). Slice is TyData kind 8, array kind 9 — both carry their element in `a`.
+//
+// Two nines that are NOT the same nine, since they sit two lines apart: the returned `9`
+// is the well-known TyId of `i64`, while the `ed.x > 9` test is on the PRIM CODE, whose
+// integer range is 0..=9. i64's prim code is 3.
+fn par_elem_ty(read c: typeck.Checker, iter: i32) -> i32 {
+    let tid: i32 = list.get(i32, c.et, iter as usize)
+    if tid < 0 { return 9 }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+    var et: i32 = 0 - 1
+    if d.kind == 8 { et = d.a }
+    if d.kind == 9 { et = d.a }
+    if et < 0 { return 9 }
+    let ed: typeck.TyData = list.get(typeck.TyData, c.tys, et as usize)
+    if ed.kind != 2 { return 9 }
+    if ed.x > 9 { return 9 }
+    return et
+}
+
+// Is `id` exactly `i64`? (Prim code 3 — the reduction's own type.)
+fn ty_is_i64(read c: typeck.Checker, id: i32) -> bool {
+    if id < 0 { return false }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, id as usize)
+    if d.kind != 2 { return false }
+    return d.x == 3
 }
 
 // One comptime SCALAR as its C text. A nested list and a unit both render as `0`: neither
