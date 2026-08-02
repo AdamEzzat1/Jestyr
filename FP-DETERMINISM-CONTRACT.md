@@ -55,7 +55,11 @@ digest. CJC handled this as a *runtime* policy; Jestyr must do it at *codegen* t
    binned superaccumulator, parse/format) but prints **only** `print_i32` integers and
    `format_float` strings — *nothing* through `printf("%g")`. Results are pinned by
    their `format_float` value, not bare 0/1 flags, so the canary stays sensitive.
-   Locked to `886d1b6aa0d4e57af37763903f34bcaff000fcc06929f07d3a4d031cc92af7e3`.
+   Locked to `4389bf8328ae7e018ebf0fb6ca4f94dd95f65eb7fb24568e55b1170b809868bc`.
+   **Since Q-S2 the digest also pins LANE WIDTH**: the demo carries two `@simd` loops
+   (8 `i32` lanes over 23 elements, so a 7-element scalar remainder), and their realized
+   values enter the hash exactly as the thread-count and chunk-size results do. A vector
+   lowering that stopped agreeing with the scalar path flips the canary.
    (The seven per-demo regression tests still run the readable `print_f64` demos as a
    single-platform sanity check; they're just no longer part of the hashed digest.)
 
@@ -70,7 +74,7 @@ determinism proven."
 1. **The canary digest is single-platform.** It was computed once on Windows/gcc. The
    whole point is cross-OS identity, which is **unverified**. → **Run `cargo test
    --features c-oracle` on Linux and macOS (and ideally clang).** If the digest
-   (`886d1b6a…`) matches, the contract is *actually* locked — update this note to say
+   (`4389bf83…`) matches, the contract is *actually* locked — update this note to say
    so. If it differs now, it is a **genuine** determinism break (the libc-formatting
    false-alarm risk was removed in #2), so triage the numerics, don't just re-lock.
    *This is now the only blocker to proof.*
@@ -83,7 +87,7 @@ determinism proven."
    the canary now hashes **only** that demo, which prints solely integers and
    `format_float` strings (our own deterministic, locale-free, correctly-rounded
    formatter) — zero `printf`-rendered floats. A digest diff can now *only* mean a
-   genuine determinism break. Re-locked to `886d1b6a…`; mutation-verified (changing one
+   genuine determinism break. Re-locked to `4389bf83…`; mutation-verified (changing one
    parsed value moves the digest *and* trips the token-assert `numerics_canary_demo`).
    (Also fixed a latent temp-file race in `build_and_run` — two tests building the same
    demo concurrently now get uniquely-named `.c`/`.exe`, disjoint by construction.)
@@ -105,11 +109,11 @@ determinism proven."
 ## Recommended order to *finish* locking it
 
 1. ~~**Purify the canary** (#2)~~ — ✅ **DONE** (this session). Hashed input is now
-   `numerics_canary.jtr` (integers + `format_float` only); re-locked to `886d1b6a…`.
+   `numerics_canary.jtr` (integers + `format_float` only); re-locked to `4389bf83…`.
    The libc false-alarm risk is gone, so the cross-platform run below is now meaningful.
 2. **Verify cross-platform** (#1) — **← the next step, and the only blocker to proof.**
    Run `cargo test --features c-oracle` on Linux (and macOS if available). Same digest
-   (`886d1b6a…`) ⇒ the contract is *proven*; record the platforms + compiler versions
+   (`4389bf83…`) ⇒ the contract is *proven*; record the platforms + compiler versions
    here. A *different* digest now means a real break (not formatting), so triage it.
 3. **Wire it into CI** — a matrix (linux/macos/windows × gcc/clang) running
    `cargo test --features c-oracle`. The canary failing on any cell is then a genuine
@@ -135,6 +139,6 @@ determinism proven."
 
 Flags locked + tested; primitives deterministic by construction + tested; canary
 mechanism built, **purified** (hashes integer + `format_float` output only — no
-`printf`), and locked **on one platform** (`886d1b6a…`). The only step left to turn
+`printf`), and locked **on one platform** (`4389bf83…`). The only step left to turn
 "deterministic" into "proven deterministic": run `cargo test --features c-oracle` on a
 second OS/compiler and confirm the digest is identical.

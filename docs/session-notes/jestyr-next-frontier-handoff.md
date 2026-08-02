@@ -28,7 +28,8 @@
 
 | Increment | Commit | What |
 |---|---|---|
-| **Q-S2a** `@simd` LOWERS — the first vector instructions | *(this run)* | **Jestyr emits SIMD.** A `par for` inside an `@simd` function whose body `simd::classify` certifies now lowers to a vector head plus a scalar remainder, using GCC vector extensions (`typedef int32_t JestyrVec_i32 __attribute__((vector_size(32)));`) — **not** an OpenMP pragma, no `-march` change, no new `CC_FLAGS`. The lowering is *chosen*, not begged for, or determinism sits at the optimizer's discretion. **Opt-in per function**, so no corpus file writes `@simd` and all 139 stay byte-identical — no port mirror, no seed refresh, the Q-W1 boundary again. **Lane count comes from the element type**, which is what Q-W1 bought: 4 for `i64`, 8 for `i32`, 32 for `u8`, from one fixed recorded `SIMD_VECTOR_BYTES = 32` (never a host probe — a width read from the build machine would make the emitted C depend on where it was compiled, which attestation would rightly flag). Results are stored **lane by lane** rather than converted as a vector, which keeps the widening to `int64_t` exact at every element width without reaching for `__builtin_convertvector`. **The headline test is end-to-end**: `simd_lowering_matches_the_scalar_path_bit_for_bit` compiles the corpus demo twice — as shipped and with `@simd` on `main` — and requires identical tokens from both binaries, over **9** elements, deliberately not a multiple of 8, 4 or 32, so every run exercises the scalar remainder. 12 unit tests + that oracle. |
+| **Q-S2b/c/d** SIMD lowering COMPLETE — both sides, **corpus 140**, lane width in the canary | *(this run)* | **Workstream Q's SIMD arc is closed.** (b) The classify/cgen disagreement is gone, fixed on the **backend** side: cgen now lowers a value-position `if`/`else` whose arms are single tail expressions to C's conditional operator. No temporary, no spilling, no drop question — which is why this was not the deferred "statement-expression with drop-safe spilling" case. It reaches well past SIMD: `let a = if c { x } else { y }` and else-if chains work generally now, and it could not disturb byte-identity because every program it newly accepts used to be a compile error. (d) resolved the **opposite** way, deliberately: a multi-statement block stays refused, and `classify` was NARROWED to match, because there the backend's refusal is principled (spilling a block into value position genuinely needs drop safety) rather than incidental. **The rule that fell out: fix the backend when its refusal is incidental; narrow the pass when it is not** — which is what keeps "conservative, never optimistic" true rather than aspirational. (c) The port mirror: `sd_classify`/`sd_emit`/`sd_emit_par_for`/`sd_vector_defs` in cgen.jtr reproduce the whitelist and the vector lowering, **byte-identical on the first run**; only the accept/reject verdict is mirrored, not the rejection reasons, since what must agree is *which sites vectorize*. `examples/std/par_for_simd.jtr` is corpus **140** — 11 elements over 8 `i32` lanes, so every run crosses the scalar remainder, with both loops checked against serial references in-program. And **lane width is now PINNED, not merely tested**: `numerics_canary.jtr` carries two `@simd` loops whose realized values enter the locked cross-OS digest exactly as the thread-count and chunk-size results do (re-locked to `4389bf83…`). **Two port bugs the gate caught, both worth knowing:** the vector typedef was deduped by **TyId**, but the checker allocates a fresh `TyData` row per occurrence, so two `[]i32` sites carry different ids — it agreed in normal mode and emitted the typedef twice in TEST mode, where the harness's extra code shifts the arena. Dedup by the mangled NAME. And `sd_emit_par_for` took its own temp when the caller had already taken one, numbering the port's temps a step ahead of the reference's. |
+| **Q-S2a** `@simd` LOWERS — the first vector instructions | `4339d72` | **Jestyr emits SIMD.** A `par for` inside an `@simd` function whose body `simd::classify` certifies now lowers to a vector head plus a scalar remainder, using GCC vector extensions (`typedef int32_t JestyrVec_i32 __attribute__((vector_size(32)));`) — **not** an OpenMP pragma, no `-march` change, no new `CC_FLAGS`. The lowering is *chosen*, not begged for, or determinism sits at the optimizer's discretion. **Opt-in per function**, so no corpus file writes `@simd` and all 139 stay byte-identical — no port mirror, no seed refresh, the Q-W1 boundary again. **Lane count comes from the element type**, which is what Q-W1 bought: 4 for `i64`, 8 for `i32`, 32 for `u8`, from one fixed recorded `SIMD_VECTOR_BYTES = 32` (never a host probe — a width read from the build machine would make the emitted C depend on where it was compiled, which attestation would rightly flag). Results are stored **lane by lane** rather than converted as a vector, which keeps the widening to `int64_t` exact at every element width without reaching for `__builtin_convertvector`. **The headline test is end-to-end**: `simd_lowering_matches_the_scalar_path_bit_for_bit` compiles the corpus demo twice — as shipped and with `@simd` on `main` — and requires identical tokens from both binaries, over **9** elements, deliberately not a multiple of 8, 4 or 32, so every run exercises the scalar remainder. 12 unit tests + that oracle. |
 | **Q-W2** the width port mirror, **corpus 139** | `9a463d8` | Closes Q-W1 on both sides and clears Q-S2's last prerequisite. `typeck.jtr` binds the loop variable with the element's own type (`ty_is_int`, prim codes 0..=9) and `cgen.jtr` emits the element's slice type and C type with the contribution cast omitted when the body is already `i64` — so the `i64` path stays byte-identical while a narrower source keeps its width. `examples/std/par_for_width.jtr` is corpus **139**: an `i32` sum-of-squares over 9 elements (an uneven last worker chunk) checked against the serial fold, an identity max, and a `u8` sum. **The guarantee is verified where it could actually break** — `c_oracle::par_for_width_demo` runs it on real OS threads 8× and requires identical tokens each time, so "the reduction domain is `i64` while the loop iterates `i32`" is tested, not argued. Byte-identical on the first run, both for the mirror and for the new file; seed refreshed. One thing worth knowing for the next mirror: `par_elem_ty` returns `9` for its fallback and tests `ed.x > 9` two lines apart, and those are **different nines** — the first is the well-known TyId of `i64`, the second the largest integer PRIM CODE (i64's own code is 3). |
 | **Q-W1** `par for` over any integer width | `86d9e60` | **Q-S2's prerequisite, and it did NOT need the generic `spawn` this note assumed was blocking.** `emit_par_for` is map-then-reduce: it fills an `int64_t` buffer by running the body per element and hands only *that* to `core.par_reduce`, so the engine never sees the source slice. The `[]i64` restriction was therefore a **typeck rule, not an engine limitation** — `par_reduce` stays exactly as it is, i64-only and untouched. `par for` now iterates any integer element type; the loop variable carries the element's **own** type, so a body over `i32` computes in `i32`, and only the per-element contribution is widened, once, on the way into the buffer. The determinism argument does not move at all: the reduction domain is still `i64`, where the declared operators are exactly associative. **Why it is the SIMD prerequisite:** a lowering fills lanes with the *element* type, so `i32` gets twice the lanes of `i64` and `u8` eight times — building Q-S2 first would have shipped the 4-lane version of the feature. **Zero emission change**: the `i64` path reproduces its previous C character for character (no cast is added when the body is already `i64`), so all 138 corpus files, the concat, the fixpoint and the seed are untouched and no port mirror is due yet. 6 tests: every width accepted, the loop variable's C type, the two *different* slice types in one lowering (source keeps its own, the engine still takes `[]i64`), byte-identity of the `i64` path, refusal of a float element or contribution, and — the one that matters — the checked non-deterministic-reduction guarantee surviving the widening. |
 | **M9** the lexer dogfood — the compiler's own source uses tier 7 | `5e24ce1` | **The first real USE of the CTFE ladder inside the compiler, and the increment that answers whether it was worth building.** `examples/std/tokens.jtr`'s six classifier functions (`is_space`/`is_alpha`/`is_digit`/`is_alnum`/`is_hex`/`is_digit_us`, ~30 lines of branch chains with `is_hex` calling `is_digit` to avoid restating a rule) become one comptime-computed 256-entry table plus six one-line predicates. One bit per class, so a byte's full classification is a single load; `_` carries both the alpha bit and a separate separator bit, because "is an identifier character" and "is the `1_000` separator" are not the same question and the branch chains had been conflating them by call order. **The crown result: `selfhost_fixpoint_full` still holds — `jc` now lexes its own 25K lines using a table its own compile-time evaluator computed, and still reproduces itself byte-for-byte.** The token stream is unchanged corpus-wide (all six P1 lexer goldens green), so the conversion is behaviour-preserving by test, not by argument. **The honest verdict on the feature, measured rather than asserted:** emitted C shows each classification is now a bounds-checked load (`assert(_ix < 256)`) where it used to be register comparisons — a real per-call cost — but timing both self-hosted compilers over a 12.7K-line file gives medians of ~163 ms (branches) and ~170 ms (table) with a 148–191 ms spread in **both**, i.e. indistinguishable, because lexing is a small fraction of a full compile. So the win is expressiveness and maintainability, and the cost is real but invisible at this granularity; resolving it either way needs a lexer-only benchmark the repo does not have. |
@@ -199,7 +200,7 @@ when the reference re-sorts its output by content (§2, O1).
 - **THE TWO-SIDED TAX (new since self-hosting — this is the thing that silently breaks):**
   any change to emitted C, an intrinsic, or a pass now has TWO implementations — the Rust
   reference (`src/*.rs`) and the port (`examples/std/*.jtr`). The full gate is:
-  1. `jestyr_cgen_matches_reference` — **139** corpus files byte-identical;
+  1. `jestyr_cgen_matches_reference` — **140** corpus files byte-identical;
   2. `jestyr_cgen_concat_matches_reference` + `jestyr_cgen_test_mode_matches_reference`;
   3. `selfhost_fixpoint_full` + `jestyr_driver_builds_itself` (the compiler must still
      compile ITSELF and must not trip its own refusal gates);
@@ -211,6 +212,10 @@ when the reference re-sorts its output by content (§2, O1).
   helper + prelude line in cgen.jtr, helper-table entry, closure marker-name string,
   typeck.jtr return arm).
 - **`.jtr` subset traps (all hit in real sessions — do not re-derive):** a `for`
+  **dedup a per-type artifact by its MANGLED NAME, never by `TyId`** — the checker
+  allocates a fresh `TyData` row per occurrence, so two `[]i32` sites hold different ids
+  for one type; an id-keyed `seen` can agree in normal mode and double-emit in TEST mode,
+  where the harness's extra code shifts the arena (Q-S2c); a `for`
   CONDITION may not start with `(` (parses as the zip-binding head — use
   `for i < n { if … { break } }`); a bare `{` block after a call-initializer parses as
   the `Name(args){…}` generic-ctor form (write flat, no scoping blocks); **a statement
@@ -741,50 +746,39 @@ what will actually grow the corpus.
    L1's offsets are *verified against the C compiler* rather than believed. Opt-in per
    struct, so non-annotated types stay byte-identical; the corpus grows annotated files.
    Then L3 (niche packing, by-`const*` `read` params).
-4. ~~**Q-S2 deterministic SIMD lowering**~~ — **STARTED (Q-S2a): Jestyr now emits vector
-   instructions.** GCC vector extensions behind `@simd`, vector head + scalar remainder,
-   lane count from the element type, opt-in so the corpus is byte-identical. Proven
-   end-to-end: the demo compiled with and without `@simd` prints identical tokens over a
-   9-element input that always hits the remainder.
+4. ~~**Q-S2 deterministic SIMD lowering**~~ — ✅ **COMPLETE, both sides.** `@simd` lowers
+   certified `par for` loops to GCC vector extensions (vector head + scalar remainder),
+   the port mirrors it byte-identically, `examples/std/par_for_simd.jtr` is corpus **140**,
+   and **lane width is pinned in the cross-OS SHA canary** alongside thread count and
+   chunk size. The classify/cgen disagreement is closed — see the ledger for why the
+   select was fixed in the backend while the multi-statement block narrowed the pass.
 
-   **What Q-S2 still needs, in order — start here in a fresh session:**
-
-   a. **Close the classify/cgen disagreement — this is the top item and it is NOT a
-      miscompile.** `simd::classify` certifies `if c { a } else { b }` (correctly: the
-      vector half becomes a mask blend, and the lowering for it is written and tested).
-      But the scalar remainder cannot be emitted, because cgen refuses a **value-position
-      `if`/`else`** — "this control-flow expression is only supported in statement or
-      return position". cgen *diagnoses* it, so nothing is silent; `emit-c` merely prints
-      its total-path `0` placeholder without surfacing cgen diagnostics, which is what
-      made it look like a miscompile at first. Pinned by
-      `a_value_position_if_is_certified_but_not_yet_lowerable`. **Two ways to close it:**
-      teach cgen value-position control flow (a GNU statement-expression, exactly as the
-      comptime-aggregate path already does) — which also fixes `let a = if c {…} else {…}`
-      generally and is the more valuable fix — or make `classify` refuse what the backend
-      cannot lower, which keeps the pass honest about being conservative. **Until one
-      lands, `@simd` on a select-bodied loop produces a diagnostic, not a wrong answer.**
-   b. **A corpus file + the port mirror.** The moment an `examples/**.jtr` writes `@simd`,
-      the P2/P3/cgen goldens sweep it and `typeck.jtr`/`cgen.jtr` must mirror the vector
-      lowering, plus `REFRESH_SEED=1`. Keep it out of `examples/` until the mirror is
-      ready — the trigger the CTFE M-series demonstrated four times.
-   c. **Add the annotated demo to the c-oracle SHA canary's demo set**, so lane width joins
-      thread count and chunk size in the pinned cross-OS digest. That is the point at which
-      "bit-identical across lane widths" becomes a *pinned* property rather than a test.
-   d. **`emit_block_simd` handles only a tail expression.** A certified body containing a
-      `let` falls through to `"0"` in the vector half — currently unreachable because such
-      a body also needs value-position block support (same root cause as (a)), but it must
-      be closed with (a) rather than left implicit.
-
-   Then **Q-S3** (the `@span` thermal/energy facet — `PhysicalCostQuery` shape,
-   deterministic, **ranking-only, never legalizing**) and **Q-S4** (the GPU tile-schedule
-   contract, written now, implemented after Q-S2 is proven).
+   **What remains in Q, and it is all deliberately deferred, not blocked:**
+   * **Q-S3 — the CJC CANA/PINN thermal/energy facet on `@span`.** Feed a
+     `PhysicalCostQuery`-shaped record (flops, bytes r/w, alloc, working set,
+     threads/**lanes**, tile shape, float-op density) into the closed-form v1 model.
+     `simd::Verdict::Legal { ops }` already carries the `flops` input, computed by the
+     same classifier. **Deterministic or it does not ship** — no profiling, no clocks, no
+     host probes. **Ranking authority only, never legalization**: the facet may say a
+     lowering is thermally worse, never that a nondeterministic one is allowed. That veto
+     split is CJC's own (`legality.rs` holds the veto, `pass_ranker.rs` only scores).
+   * **Q-S4 — the GPU tile-schedule contract.** State it while SIMD is fresh:
+     bit-identical across every *legal* tile schedule, by the same two-part argument
+     (exactly-associative reduction + total elementwise body), with tile shape playing
+     lane width's role. `simd::classify`'s whitelist is the kernel subset's seed; a gather
+     (`Reason::Memory`) is the first rule GPU will want to relax, and it must be relaxed
+     *with* its determinism argument, not before it. Jestyr emits C, so a GPU target is a
+     genuinely new backend (OpenCL C / SPIR-V) — a months-scale lift, not an increment.
+   * **Smaller, opportunistic:** SIMD over `u8`/`i16` bodies exists but has no corpus file;
+     SOAC growth (`par_filter`, fused `par_map_reduce`); the `with schedule(…)` split,
+     mostly enabled by N's dynamic-N spawn.
 
 `@size_of`/`@align_of`/`@offset_of` as comptime *values* come after L (L1 unblocked the
 computation; exposing it is its own slice). Comptime-only functions are a *convenience*,
 not a blocker (finding 2). `#line` (§1) stays an independent, optional increment.
 
 Keep every increment two-sided-green:
-**corpus 139** + concat + test-mode + fixpoint + self-build + refreshed seed.
+**corpus 140** + concat + test-mode + fixpoint + self-build + refreshed seed.
 
 **The port-mirror trigger — now DEMONSTRATED, not just predicted.** It said: the moment a
 `comptime` `.jtr` lands in `examples/`, the P2/P3 goldens sweep it with no allowlist and

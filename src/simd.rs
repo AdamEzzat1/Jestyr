@@ -277,19 +277,28 @@ fn classify_expr(ast: &Ast, id: ExprId) -> Result<usize, (Reason, Span)> {
     }
 }
 
-/// A block is legal when every statement is. A `let` binds a lane value; a `return`
-/// is a per-lane exit, which does not exist.
+/// A block is legal when it is a **single tail expression**.
+///
+/// A `let` would vectorize perfectly well — the vector half can bind a lane temporary
+/// inside a statement-expression, and the certified subset has nothing to drop. But a
+/// `par for` also needs a **scalar remainder**, and cgen genuinely cannot lower a
+/// multi-statement block in value position: that needs drop-safe spilling, which is why
+/// it was deferred rather than overlooked.
+///
+/// So this narrows rather than asking the backend to move — the opposite resolution from
+/// the value-position `if`, and deliberately so. There the refusal was *incidental* (`?:`
+/// lowers a select with no drop question, so cgen was fixed); here it is *principled*.
+/// **Fix the backend when its refusal is incidental; narrow the pass when it is not** —
+/// which is what keeps "conservative, never optimistic" true rather than aspirational.
 fn classify_block(ast: &Ast, b: &Block) -> Result<usize, (Reason, Span)> {
-    let mut ops = 0;
-    for s in &b.stmts {
-        ops += match s {
-            Stmt::Let { init: Some(e), .. } => classify_expr(ast, *e)?,
-            Stmt::Let { .. } => 0,
-            Stmt::Expr(e) => classify_expr(ast, *e)?,
-            Stmt::Return { .. } => return Err((Reason::Control, b.span)),
-        };
+    match b.stmts.as_slice() {
+        [Stmt::Expr(e)] => classify_expr(ast, *e),
+        [] => Err((Reason::Unsupported("an empty block"), b.span)),
+        _ => Err((
+            Reason::Unsupported("a block with statements (the scalar remainder cannot lower one)"),
+            b.span,
+        )),
     }
-    Ok(ops)
 }
 
 /// Is `id` an integer literal in `0..=63` — a shift amount that is defined for `i64`
@@ -410,8 +419,16 @@ mod tests {
     }
 
     #[test]
-    fn a_block_with_lets_vectorizes() {
-        assert!(verdict_of("{ let y: i64 = x * x\n y + 1 }").is_legal());
+    /// A block is legal only as a single tail expression. A `let` is refused — and the
+    /// reason is the **scalar remainder**, not the vector half, which could bind a lane
+    /// temporary perfectly well. See `classify_block` for why the pass narrows here while
+    /// the value-position `if` was fixed in the backend instead.
+    fn a_block_with_statements_is_refused_but_a_tail_is_fine() {
+        assert!(verdict_of("{ x * x }").is_legal());
+        assert_eq!(
+            reason_of("{ let y: i64 = x * x\n y + 1 }"),
+            Reason::Unsupported("a block with statements (the scalar remainder cannot lower one)")
+        );
     }
 
     #[test]
@@ -459,7 +476,9 @@ mod tests {
     #[test]
     fn non_uniform_control_flow_is_rejected() {
         assert_eq!(reason_of("if x > 0 { x }"), Reason::Control);
-        assert_eq!(reason_of("{ return x }"), Reason::Control);
+        // A `return` is refused at the block level now — the block-shape rule catches it
+        // before the per-statement rule does, and either way it is not lane-uniform.
+        assert!(!verdict_of("{ return x }").is_legal());
     }
 
     #[test]

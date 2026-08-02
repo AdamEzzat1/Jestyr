@@ -1,0 +1,68 @@
+// examples/std/par_for_simd.jtr — `@simd`: a deterministic SIMD lowering (workstream Q).
+//
+// `@simd` is a *checked declaration*, not a request. The compiler decides for itself
+// whether each `par for` body may be evaluated a lane at a time — a total, elementwise
+// integer expression — and refuses the attribute if one may not. What it emits for a
+// certified loop is a **vector head plus a scalar remainder**, through GCC vector
+// extensions: no OpenMP pragma, no `-march` change, no altered `CC_FLAGS`. The lowering
+// is chosen, not begged for, or determinism would sit at the optimizer's discretion.
+//
+// The guarantee is unchanged by any of it. The reduction domain is `i64`, where the
+// declared sum/min/max/xor are exactly associative on machine integers, so the answer is
+// the same for every thread count, chunk size — and now lane width.
+//
+// Two details this file is built to exercise:
+//   * the element count is **11**, deliberately not a multiple of 8 (the `i32` lane
+//     count), so every run goes through the scalar remainder as well as the vector head;
+//   * `absum` has an `if`/`else` body, which lowers as a **mask blend** in the vector
+//     half and as an ordinary conditional in the remainder — two different lowerings of
+//     one source expression, because a lane comparison yields all-ones rather than 1 and
+//     the conditional operator is not defined on vectors at all.
+//
+//   jestyrc run examples/std/par_for_simd.jtr   →   30, 0, 110, 0
+import "core"
+import "io"
+
+fn seti32(p: *mut i32, i: usize, v: i32) { unsafe { (p + i).* = v } }
+
+// Sum of absolute values — the select body.
+@simd fn absum(read s: []i32) -> i64 {
+    return par for x in s reduce(core.sum_reduction()) { if x > 0 { x } else { 0 - x } }
+}
+
+// Sum of squares — plain arithmetic, the simplest thing a lane can do.
+@simd fn sumsq(read s: []i32) -> i64 {
+    return par for x in s reduce(core.sum_reduction()) { x * x }
+}
+
+// The serial references, in the same widths.
+fn serial_absum(read s: []i32) -> i64 {
+    var a: i64 = 0
+    for x in s {
+        if x > 0 { a = a + (x as i64) } else { a = a - (x as i64) }
+    }
+    return a
+}
+fn serial_sumsq(read s: []i32) -> i64 {
+    var a: i64 = 0
+    for x in s { a = a + ((x * x) as i64) }
+    return a
+}
+
+fn main() -> i32 {
+    var p: *mut i32 = alloc(i32, 11)
+    var i: usize = 0
+    for i < 11 {
+        seti32(p, i, (i as i32) - 5)          // -5, -4, …, 0, …, 4, 5
+        i = i + 1
+    }
+    let s: []i32 = slice(i32, p, 11)
+
+    io.print_i32(absum(s) as i32)                      // 30
+    io.print_i32((absum(s) - serial_absum(s)) as i32)  // 0 — the mask blend agrees
+    io.print_i32(sumsq(s) as i32)                      // 110 = sum of x^2 over -5..5
+    io.print_i32((sumsq(s) - serial_sumsq(s)) as i32)  // 0
+
+    free_ptr(p)
+    return 0
+}

@@ -11416,6 +11416,28 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
         }
         return
     }
+    if e.kind == 24 {                                 // VALUE-position if/else (Q-S2b)
+        // Lowered to C's conditional operator when both arms are a single tail
+        // expression — it evaluates exactly one side, so it matches `if` semantics, needs
+        // no temporary, and raises no drop question. An arm carrying statements is left
+        // to the statement/return path (the reference diagnoses it there).
+        let t: i32 = sd_tail_of(p, e.b)
+        var f: i32 = 0 - 1
+        if e.op >= 0 { f = sd_tail_of_expr(p, e.op) }
+        if t >= 0 {
+            if f >= 0 {
+                string_push(sb, "((")
+                emit_expr(sb, p, src, c, g, e.a)
+                string_push(sb, ") ? (")
+                emit_expr(sb, p, src, c, g, t)
+                string_push(sb, ") : (")
+                emit_expr(sb, p, src, c, g, f)
+                string_push(sb, "))")
+                return
+            }
+        }
+        return
+    }
     if e.kind == 35 {                                 // Variant: strictly-decreasing termination measure
         var t: i32 = 0 - 1
         var vi: usize = g.vtf as usize
@@ -11611,6 +11633,10 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
         // narrower width free. An i64 source reproduces the previous C character for
         // character. Mirrors `emit_par_for`.
         let ety: i32 = par_elem_ty(c, e.a)
+        if sd_is_site(g, eid) {
+            sd_emit_par_for(sb, p, src, c, g, e, eid, ety, pfn)
+            return
+        }
         string_push(sb, "({ JestyrSlice_")
         push_ty_mangle(sb, src, c, ety)
         string_push(sb, " _pf")
@@ -13123,7 +13149,7 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // `gfi` holds the collected generic-fn instance records ([fn item, argc, (kind,a,b) targ
 // triples…], variable length — walk with a cursor); `su` is the ACTIVE instance's
 // type-parameter substitution (5-tuples: tparam span + arg triple), read by `emit_su_ty`.
-struct Cg { tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32, dg: i32, gmi: List(i32), tmode: bool, alloc: Allocator }
+struct Cg { sds: List(i32), tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32, dg: i32, gmi: List(i32), tmode: bool, alloc: Allocator }
 
 // The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
 // (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
@@ -17860,6 +17886,429 @@ fn is_declared_type(read c: Checker, read src: str, read nm: str) -> bool {
     return false
 }
 
+// ---- @simd: the vector lowering (workstream Q, Q-S2) ----
+//
+// The port mirror of `src/simd.rs`'s classifier plus `emit_par_for`'s vector path. Only
+// the ACCEPT/REJECT verdict is mirrored, not the rejection reasons: the port emits no
+// diagnostics for `@simd`, so what has to agree byte-for-byte is which sites vectorize.
+//
+// The whitelist is the reference's, item for item: literals, names, unary neg/not/bitnot,
+// binary arithmetic/bitwise/compare/short-circuit, a shift by a literal in 0..=63, an
+// `if`/`else`, and a block that is a single tail expression. Division and remainder are
+// out because a vector evaluates EVERY lane, so a divisor that is zero in a lane the
+// scalar run would have skipped becomes a real fault.
+
+// The single tail expression of a block used as a value, or -1 if it carries statements.
+// Mirrors `Cgen::value_tail_of_block`.
+fn sd_tail_of(read p: Parser, eid: i32) -> i32 {
+    if eid < 0 { return 0 - 1 }
+    let d: ExprData = get(ExprData, p.ex, eid as usize)
+    if d.kind != 23 { return eid }
+    if d.y != 1 { return 0 - 1 }
+    let st: StmtData = get(StmtData, p.st, get(i32, p.sar, d.x as usize) as usize)
+    if st.kind != 2 { return 0 - 1 }
+    return st.a
+}
+
+// The same for an `else` operand. A nested `If` is returned whole so an else-if chain
+// lowers as nested conditionals; a chain whose arms are not expression-shaped is refused.
+fn sd_tail_of_expr(read p: Parser, eid: i32) -> i32 {
+    if eid < 0 { return 0 - 1 }
+    let d: ExprData = get(ExprData, p.ex, eid as usize)
+    if d.kind == 23 { return sd_tail_of(p, eid) }
+    if d.kind == 24 {
+        if sd_tail_of(p, d.b) < 0 { return 0 - 1 }
+        if d.op < 0 { return 0 - 1 }
+        if sd_tail_of_expr(p, d.op) < 0 { return 0 - 1 }
+        return eid
+    }
+    return eid
+}
+
+// Is `eid` a certified vectorizable body? Mirrors `simd::classify`.
+fn sd_classify(read p: Parser, read src: str, eid: i32) -> bool {
+    if eid < 0 { return false }
+    let d: ExprData = get(ExprData, p.ex, eid as usize)
+    if d.kind == 0 { return true }                     // Int
+    if d.kind == 27 { return true }                    // Bool
+    if d.kind == 2 { return true }                     // Name: loop var or loop-invariant
+    if d.kind == 3 {                                   // Unary
+        if d.op == 4 { return false }                  // `&` is memory
+        return sd_classify(p, src, d.a)
+    }
+    if d.kind == 4 {                                   // Binary
+        if d.op == 4 { return false }                  // `/` can fault
+        if d.op == 5 { return false }                  // `%` can fault
+        if d.op == 17 or d.op == 18 {                  // shifts: literal amount only
+            if sd_small_shift(p, src, d.b) == false { return false }
+            return sd_classify(p, src, d.a)
+        }
+        if sd_classify(p, src, d.a) == false { return false }
+        return sd_classify(p, src, d.b)
+    }
+    if d.kind == 24 {                                  // If: an `else` is required
+        if d.op < 0 { return false }
+        if sd_classify(p, src, d.a) == false { return false }
+        if sd_classify(p, src, d.b) == false { return false }
+        return sd_classify(p, src, d.op)
+    }
+    if d.kind == 23 {                                  // Block: a single tail expression
+        if d.y != 1 { return false }
+        let sid: i32 = get(i32, p.sar, d.x as usize)
+        let st: StmtData = get(StmtData, p.st, sid as usize)
+        if st.kind == 0 { return false }               // Let
+        if st.kind == 1 { return false }               // Return
+        return sd_classify(p, src, st.a)
+    }
+    return false
+}
+
+// A shift amount that is defined in both the scalar and the lane form: a decimal literal
+// below 64. Anything else is refused rather than guessed at.
+fn sd_small_shift(read p: Parser, read src: str, eid: i32) -> bool {
+    if eid < 0 { return false }
+    let d: ExprData = get(ExprData, p.ex, eid as usize)
+    if d.kind != 0 { return false }
+    let t: str = src[d.start .. d.end]
+    var v: i64 = 0
+    var i: usize = 0
+    for i < t.len {
+        let c: i32 = t[i] as i32
+        if c == 95 { i = i + 1 } else {
+            if c < 48 { return false }
+            if c > 57 { return false }
+            v = v * 10 + ((c - 48) as i64)
+            if v > 63 { return false }
+            i = i + 1
+        }
+    }
+    return v < 64
+}
+
+// Record every `par for` an `@simd` function declares AND the classifier certifies.
+// Span containment finds them, exactly as `sites_in_span` does on the reference side:
+// the expression arena is flat and spans nest, so no walker needs maintaining.
+fn sd_collect(mut g: Cg, read p: Parser, read src: str) {
+    let ne: usize = len(ExprData, p.ex)
+    var r: i32 = 0
+    for r < len(i32, p.roots) {
+        let iid: i32 = get(i32, p.roots, r)
+        let it: ItemData = get(ItemData, p.it, iid as usize)
+        if it.kind == 3 {
+            if item_has_attr(p, src, it, "simd") {
+                if it.w >= 0 {
+                    let bd: ExprData = get(ExprData, p.ex, it.w as usize)
+                    var e: usize = 0
+                    for e < ne {
+                        let d: ExprData = get(ExprData, p.ex, e)
+                        if d.kind == 41 {
+                            if d.start >= bd.start {
+                                if d.end <= bd.end {
+                                    if sd_classify(p, src, d.op) { push(i32, g.sds, e as i32) }
+                                }
+                            }
+                        }
+                        e = e + 1
+                    }
+                }
+            }
+        }
+        r = r + 1
+    }
+}
+
+fn sd_is_site(read g: Cg, eid: i32) -> bool {
+    var i: usize = 0
+    for i < len(i32, g.sds) {
+        if get(i32, g.sds, i) == eid { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// How many lanes of the element type fit in the fixed 32-byte vector.
+fn sd_lanes(read c: Checker, ety: i32) -> i32 {
+    let d: TyData = get(TyData, c.tys, ety as usize)
+    if d.x == 0 { return 32 }                          // i8
+    if d.x == 5 { return 32 }                          // u8
+    if d.x == 1 { return 16 }                          // i16
+    if d.x == 6 { return 16 }                          // u16
+    if d.x == 2 { return 8 }                           // i32
+    if d.x == 7 { return 8 }                           // u32
+    return 4
+}
+
+// The certified body with the loop variable bound to a VECTOR. Mirrors `emit_expr_simd`.
+// A comparison yields an all-ones lane mask rather than 0/1, so `and`/`or` are bitwise,
+// and the conditional operator does not exist on vectors, so an `if` is a mask blend.
+fn sd_emit(mut sb: String, read p: Parser, read src: str, eid: i32, read vt: str, read lv: str, read vv: str) {
+    let d: ExprData = get(ExprData, p.ex, eid as usize)
+    if d.kind == 0 {                                   // Int literal, `_` separators dropped
+        var i: usize = d.start
+        for i < d.end {
+            if (src[i] as i32) != 95 { string_push(sb, src[i .. i + 1]) }
+            i = i + 1
+        }
+        return
+    }
+    if d.kind == 27 {                                  // Bool: built as a lane mask
+        if str_eq(src[d.start .. d.end], "true") {
+            string_push(sb, "((")  string_push(sb, vt)  string_push(sb, "){0} == (")
+            string_push(sb, vt)  string_push(sb, "){0})")
+        } else {
+            string_push(sb, "((")  string_push(sb, vt)  string_push(sb, "){0} != (")
+            string_push(sb, vt)  string_push(sb, "){0})")
+        }
+        return
+    }
+    if d.kind == 2 {                                   // Name
+        if str_eq(src[d.start .. d.end], lv) { string_push(sb, vv) }
+        else {
+            string_push(sb, "j_")
+            string_push(sb, src[d.start .. d.end])
+        }
+        return
+    }
+    if d.kind == 3 {                                   // Unary: `not` is a complement here
+        string_push(sb, "(")
+        if d.op == 1 { string_push(sb, "-") } else { string_push(sb, "~") }
+        sd_emit(sb, p, src, d.a, vt, lv, vv)
+        string_push(sb, ")")
+        return
+    }
+    if d.kind == 4 {                                   // Binary
+        string_push(sb, "(")
+        sd_emit(sb, p, src, d.a, vt, lv, vv)
+        string_push(sb, " ")
+        string_push(sb, sd_op(d.op))
+        string_push(sb, " ")
+        sd_emit(sb, p, src, d.b, vt, lv, vv)
+        string_push(sb, ")")
+        return
+    }
+    if d.kind == 24 {                                  // If -> mask blend
+        string_push(sb, "(((")
+        sd_emit(sb, p, src, d.b, vt, lv, vv)           // then
+        string_push(sb, ") & (")
+        sd_emit(sb, p, src, d.a, vt, lv, vv)           // cond
+        string_push(sb, ")) | ((")
+        sd_emit(sb, p, src, d.op, vt, lv, vv)          // else
+        string_push(sb, ") & ~(")
+        sd_emit(sb, p, src, d.a, vt, lv, vv)
+        string_push(sb, ")))")
+        return
+    }
+    if d.kind == 23 {                                  // Block: its single tail expression
+        let sid: i32 = get(i32, p.sar, d.x as usize)
+        let st: StmtData = get(StmtData, p.st, sid as usize)
+        sd_emit(sb, p, src, st.a, vt, lv, vv)
+        return
+    }
+    string_push(sb, "0")
+}
+
+// A BinOp code as its vector-C spelling. Short-circuit becomes a blend, which is
+// value-preserving only because the certified subset is total.
+fn sd_op(op: i32) -> str {
+    if op == 1 { return "+" }
+    if op == 2 { return "-" }
+    if op == 3 { return "*" }
+    if op == 6 { return "==" }
+    if op == 7 { return "!=" }
+    if op == 8 { return "<" }
+    if op == 9 { return "<=" }
+    if op == 10 { return ">" }
+    if op == 11 { return ">=" }
+    if op == 12 { return "&" }
+    if op == 13 { return "|" }
+    if op == 14 { return "&" }
+    if op == 15 { return "|" }
+    if op == 16 { return "^" }
+    if op == 17 { return "<<" }
+    if op == 18 { return ">>" }
+    return "+"
+}
+
+// The vector lowering for one certified site: a lane-at-a-time head, then the SCALAR
+// remainder. The remainder genuinely must be scalar — a mask blend is not a conditional
+// and a lane comparison is not 0/1 — which is the bug Q-S1's oracle caught in its own
+// harness. Mirrors the vector branch of `emit_par_for`.
+// `pfn` is the temp the CALLER already took — taking another here would number the
+// port's temps one ahead of the reference's, which is how this first showed up.
+fn sd_emit_par_for(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg, read e: ExprData, eid: i32, ety: i32, pfn: i32) {
+    let w: i32 = sd_lanes(c, ety)
+    var vt: String = string_new()
+    string_push(vt, "JestyrVec_")
+    push_ty_mangle(vt, src, c, ety)
+    let vts: str = string_view(vt)
+    var vv: String = string_new()
+    string_push(vv, "_pv")
+    push_uint__cgen(vv, pfn as i64)
+    let vvs: str = string_view(vv)
+
+    string_push(sb, "({ JestyrSlice_")
+    push_ty_mangle(sb, src, c, ety)
+    string_push(sb, " _pf")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, " = ")
+    emit_expr(sb, p, src, c, g, e.a)                  // iter
+    string_push(sb, "; int64_t* _pm")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, " = (int64_t*)malloc(_pf")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, ".len * sizeof(int64_t)); size_t _pi")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, " = 0; for (; _pi")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, " + ")
+    push_uint__cgen(sb, w as i64)
+    string_push(sb, " <= _pf")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, ".len; _pi")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, " += ")
+    push_uint__cgen(sb, w as i64)
+    string_push(sb, ") { ")
+    string_push(sb, vts)
+    string_push(sb, " ")
+    string_push(sb, vvs)
+    string_push(sb, "; memcpy(&")
+    string_push(sb, vvs)
+    string_push(sb, ", _pf")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, ".ptr + _pi")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, ", sizeof(")
+    string_push(sb, vts)
+    string_push(sb, ")); ")
+    string_push(sb, vts)
+    string_push(sb, " _pw")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, " = ((")
+    string_push(sb, vts)
+    string_push(sb, "){0}) + (")
+    // The reduction is emitted BEFORE the body on the reference side (temp ordering).
+    var prd: String = string_new()
+    emit_expr(prd, p, src, c, g, e.b)
+    sd_emit(sb, p, src, e.op, vts, src[e.x as usize .. e.y as usize], vvs)
+    string_push(sb, "); for (size_t _pk")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, " = 0; _pk")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, " < ")
+    push_uint__cgen(sb, w as i64)
+    string_push(sb, "; _pk")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, "++) _pm")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, "[_pi")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, " + _pk")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, "] = (int64_t)_pw")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, "[_pk")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, "]; } for (; _pi")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, " < _pf")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, ".len; _pi")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, "++) { ")
+    emit_ty_c(sb, p, src, c, ety)
+    string_push(sb, " j_")
+    string_push(sb, src[e.x as usize .. e.y as usize])
+    string_push(sb, " = _pf")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, ".ptr[_pi")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, "]; _pm")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, "[_pi")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, "] = ")
+    let bty: i32 = get(i32, c.et, e.op as usize)
+    let widen: bool = ty_is_i64(c, bty) == false
+    if widen { string_push(sb, "(int64_t)(") }
+    emit_expr(sb, p, src, c, g, e.op)
+    if widen { string_push(sb, ")") }
+    string_push(sb, "; } int64_t _pr")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, " = jestyr_par_reduce((JestyrSlice_i64){ _pm")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, ", _pf")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, ".len }, ")
+    string_push(sb, string_view(prd))
+    string_push(sb, "); free(_pm")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, "); _pr")
+    push_uint__cgen(sb, pfn as i64)
+    string_push(sb, "; })")
+    string_free(prd)
+    string_free(vt)
+    string_free(vv)
+}
+
+// One `typedef E JestyrVec_E __attribute__((vector_size(32)));` per element type a
+// vectorized `par for` iterates, in the sites' first-seen order.
+//
+// Dedup is by the MANGLED NAME, not the TyId — the trap this cost a gate run to find.
+// The checker allocates a fresh `TyData` row per occurrence, so two `[]i32` sites carry
+// two different ids for the same type, and an id-keyed `seen` emits the typedef twice.
+// It happened to agree in normal mode (where both sites landed on one row) and diverged
+// only in TEST mode, where the harness's extra code shifts the arena — a reminder that
+// "the ids matched" is not the same as "the types are the same".
+fn sd_vector_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, read g: Cg, read a: Allocator) {
+    var seen: String = string_new()
+    var any: bool = false
+    var i: usize = 0
+    for i < len(i32, g.sds) {
+        let eid: i32 = get(i32, g.sds, i)
+        let e: ExprData = get(ExprData, p.ex, eid as usize)
+        let ety: i32 = par_elem_ty(c, e.a)
+        var key: String = string_new()
+        string_push(key, "|")
+        push_ty_mangle(key, src, c, ety)
+        string_push(key, "|")
+        let ks: str = string_view(key)
+        let ss: str = string_view(seen)
+        if str_contains(ss, ks) == false {
+            string_push(seen, ks)
+            string_push(sb, "typedef ")
+            emit_ty_c(sb, p, src, c, ety)
+            string_push(sb, " JestyrVec_")
+            push_ty_mangle(sb, src, c, ety)
+            string_push(sb, " __attribute__((vector_size(32)));\n")
+            any = true
+        }
+        string_free(key)
+        i = i + 1
+    }
+    if any { string_push(sb, "\n") }
+    string_free(seen)
+}
+
+// Does `hay` contain `needle`? A local scan — the port has no substring search, and this
+// is only ever used on the short delimited key above.
+fn str_contains(read hay: str, read needle: str) -> bool {
+    if needle.len == 0 { return true }
+    if hay.len < needle.len { return false }
+    var i: usize = 0
+    for i + needle.len <= hay.len {
+        var j: usize = 0
+        var same: bool = true
+        for j < needle.len {
+            if (hay[i + j] as i32) != (needle[j] as i32) { same = false  break }
+            j = j + 1
+        }
+        if same { return true }
+        i = i + 1
+    }
+    return false
+}
+
 // The element TyId a `par for` iterates: the iterable's element if it is an integer
 // primitive, else i64 (the fallback keeps cgen total on a program typeck already
 // rejected). Slice is TyData kind 8, array kind 9 — both carry their element in `a`.
@@ -20373,7 +20822,7 @@ fn emit_main_wrapper(mut sb: String, read p: Parser, read src: str) {
 // `"\n"` pushes stand in for the reference's unconditionally-blank sections that are empty for a
 // program with no aggregates (closure_types, method_protos, consts) plus the guarded no-ops.
 fn emit_program(mut sb: String, read p: Parser, read c: Checker, read src: str, read a: Allocator, tmode: bool, read tf: str) {
-    var g: Cg = Cg{ tmp: 0, pp: make__list(i32, a), rf: make__list(i32, a), res_ok: 0 - 2, etags: make__list(i32, a), req: make__list(i32, a), ens: make__list(i32, a), retty: 0 - 1, mi: make__list(i32, a), self_ptr: false, gei: make__list(i32, a), curfn: 0 - 1, mv: make__list(i32, a), ds: make__list(i32, a), dsb: make__list(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: make__list(i32, a), vtf: 0, gfi: make__list(i32, a), su: make__list(i32, a), cls: make__list(i32, a), ccx: make__list(i32, a), cca: make__list(i32, a), caps: make__list(i32, a), gsi: make__list(i32, a), sps: make__list(i32, a), dspawn: false, th: make__list(i32, a), thf: 0, dg: 0 - 1, gmi: make__list(i32, a), tmode: tmode, alloc: a }
+    var g: Cg = Cg{ sds: make__list(i32, a), tmp: 0, pp: make__list(i32, a), rf: make__list(i32, a), res_ok: 0 - 2, etags: make__list(i32, a), req: make__list(i32, a), ens: make__list(i32, a), retty: 0 - 1, mi: make__list(i32, a), self_ptr: false, gei: make__list(i32, a), curfn: 0 - 1, mv: make__list(i32, a), ds: make__list(i32, a), dsb: make__list(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: make__list(i32, a), vtf: 0, gfi: make__list(i32, a), su: make__list(i32, a), cls: make__list(i32, a), ccx: make__list(i32, a), cca: make__list(i32, a), caps: make__list(i32, a), gsi: make__list(i32, a), sps: make__list(i32, a), dspawn: false, th: make__list(i32, a), thf: 0, dg: 0 - 1, gmi: make__list(i32, a), tmode: tmode, alloc: a }
     collect_spawns(g, p, src)                        // spawn sites (gates the pthread prelude)
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     collect_method_instances(g, p, src, c)           // (struct item, method fn item) pairs, first-seen
@@ -20381,6 +20830,7 @@ fn emit_program(mut sb: String, read p: Parser, read c: Checker, read src: str, 
     collect_gstruct_instances(g, p, src, c)          // generic-STRUCT instances (reads gfi — after!)
     collect_genum_instances(g, p, src, c)            // generic-enum instance TyIds, expr order
     collect_closures(g, p, src, a)                   // closures + captures, discovery order (LAST, like the reference)
+    sd_collect(g, p, src)                            // @simd sites to vectorize (Q-S2)
     emit_prelude(sb, p, src, g)
     emit_forward_types(sb, p, src)
     emit_gen_forward_types(sb, p, src, c, g)         // monomorphized generic-enum instance fwd typedefs
@@ -20395,6 +20845,7 @@ fn emit_program(mut sb: String, read p: Parser, read c: Checker, read src: str, 
     emit_gen_struct_defs(cap, p, src, c, g, d)       // generic-STRUCT instance defs (before gen enums)
     emit_gen_enum_defs(cap, p, src, c, g, d)         // generic-enum instance defs (after plain enums)
     emit_slice_defs(cap, p, src, c, d)               // slice typedefs (after aggregates)
+    sd_vector_defs(cap, p, src, c, g, a)             // @simd vector typedefs (Q-S2)
     emit_array_defs(cap, p, src, c, d)               // array typedefs (after slices)
     emit_genref_defs(cap, p, src, c, d)              // genref typedefs (after arrays)
     emit_result_defs(cap, p, src, d)

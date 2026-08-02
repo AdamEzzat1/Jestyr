@@ -27,6 +27,17 @@ fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
 fn setf(p: *mut f64, i: usize, v: f64) { unsafe { (p + i).* = v } }
 fn seti(p: *mut i64, i: usize, v: i64) { unsafe { (p + i).* = v } }
 
+// The `@simd` canary loops: certified bodies over `i32`, so they lower to 8-lane vector
+// code plus a scalar remainder while the reduction stays `i64`. `absum`'s `if`/`else`
+// becomes a mask blend in the vector half and an ordinary conditional in the remainder —
+// one source expression, two lowerings, and the digest pins that they agree.
+@simd fn simd_absum(read s: []i32) -> i64 {
+    return par for x in s reduce(core.sum_reduction()) { if x > 0 { x } else { 0 - x } }
+}
+@simd fn simd_sumsq(read s: []i32) -> i64 {
+    return par for x in s reduce(core.sum_reduction()) { x * x }
+}
+
 // Serial reference folds for the `par for` canary section (the oracles a parallel
 // reduction must match bit-for-bit, for any schedule).
 fn serial_sum(read s: []i64) -> i64 {
@@ -176,6 +187,25 @@ fn main() -> i32 {
     io.print_i32(pmax as i32)                                    // 15
     io.print_i32(pmin as i32)                                    // -7
     io.print_i32(pxor as i32)                                    // (pinned by value)
+    // ── `@simd`: the same guarantee across LANE WIDTH, pinned ──
+    // These loops are vectorized (8 `i32` lanes) while the reduction stays `i64`, so
+    // their realized values enter the locked digest exactly as the thread-count and
+    // chunk-size results above do. That is what makes lane width a *pinned* property
+    // rather than a tested one: a vector lowering that stopped agreeing with the scalar
+    // path would flip the canary. 23 elements over 8 lanes leaves a 7-element scalar
+    // remainder, which is where such a break would first appear.
+    var vb: *mut i32 = alloc(i32, 23)
+    var vi: usize = 0
+    for vi < 23 {
+        unsafe { (vb + vi).* = (vi as i32) - 7 }  // -7, -6, …, 15
+        vi = vi + 1
+    }
+    let vs: []i32 = slice(i32, vb, 23)
+    io.print_i32(simd_absum(vs) as i32)                          // 148
+    io.print_i32(simd_sumsq(vs) as i32)                          // 1380
+    io.print_i32(b2i(simd_sumsq(vs) == pssq))                    // 1 (lanes == the i64 fold)
+    free_ptr(vb)
+
     // The determinism guarantee, demonstrated: bit-identical to the serial folds.
     io.print_i32(b2i(psum == serial_sum(qs)))                    // 1
     io.print_i32(b2i(pssq == serial_sumsq(qs)))                  // 1

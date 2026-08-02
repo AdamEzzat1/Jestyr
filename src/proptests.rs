@@ -4688,36 +4688,69 @@ mod par_for_width {
 {c}");
     }
 
-    /// **A KNOWN GAP, pinned so it cannot be forgotten: the legality pass certifies a
-    /// body cgen cannot lower.**
+    /// **The pass and the backend now agree about the select — Q-S2b.**
     ///
-    /// `simd::classify` accepts `if c { a } else { b }` — correctly, for the *vector*
-    /// half, where it becomes a mask blend. But a `par for` needs a **scalar remainder**,
-    /// and cgen refuses a value-position `if`/`else` outright ("this control-flow
-    /// expression is only supported in statement or return position"). So the vector head
-    /// compiles and the remainder does not: the pass and the backend disagree about
-    /// exactly one form, and it is the interesting one.
+    /// `simd::classify` certifies `if c { a } else { b }`, and until this increment cgen
+    /// refused it in value position, so the vector head compiled and the scalar remainder
+    /// did not. That made the pass *optimistic relative to the backend* in exactly one
+    /// place, contradicting its own documented "conservative, never optimistic" claim.
     ///
-    /// This is NOT a silent miscompile — cgen diagnoses it (`emit-c` merely prints its
-    /// total-path `0` placeholder without surfacing cgen's diagnostics). Two ways to
-    /// close it, and the next increment picks one: teach cgen value-position control flow
-    /// (a GNU statement-expression, exactly as the comptime-aggregate path does), or make
-    /// `classify` refuse what the backend cannot lower — which keeps the pass honest
-    /// about being conservative.
+    /// Closed the better way: cgen now lowers a value-position `if` whose arms are single
+    /// tail expressions to C's conditional operator. The two halves therefore agree, and
+    /// the fix reaches well past SIMD — `let a = if c { x } else { y }` works generally.
     #[test]
-    fn a_value_position_if_is_certified_but_not_yet_lowerable() {
+    fn a_value_position_if_now_lowers_in_both_halves() {
         let src = "fn sum_reduction() -> i64 { return 0 }\n\
-                   fn f(read s: []i32) -> i64 { return par for x in s reduce(sum_reduction()) { if x > 0 { x } else { 0 - x } } }\n";
+                   @simd fn f(read s: []i32) -> i64 { return par for x in s reduce(sum_reduction()) { if x > 0 { x } else { 0 - x } } }\n";
         let (tokens, _) = Lexer::new(src).tokenize();
         let (ast, _) = Parser::new(src, tokens).parse();
-        // The pass says yes…
         assert!(crate::simd::analyze(&ast)[0].verdict.is_legal(), "classify certifies a select");
-        // …and cgen says no, with a diagnostic rather than silence.
+        let (info, _) = crate::typeck::check(&ast);
+        let (c, cd) = crate::cgen::emit(&ast, &info);
+        assert!(
+            !cd.iter().any(|d| d.is_error()),
+            "cgen must now lower it: {:?}",
+            cd.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        );
+        // The vector half blends on a mask; the scalar remainder uses the conditional.
+        assert!(c.contains("& ((_pv0 > 0))"), "vector half must blend:\n{c}");
+        assert!(c.contains("((j_x > 0)) ? (j_x) : ((0 - j_x))"), "remainder must use `?:`:\n{c}");
+    }
+
+    /// The general win that came with it: an `if` used as a value outside any `par for`,
+    /// including an else-if chain, which lowers as nested conditionals.
+    #[test]
+    fn a_value_position_if_works_outside_simd_too() {
+        let src = "fn g(x: i32) -> i32 { let a: i32 = if x > 0 { x } else { 0 - x }\n return a }\n\
+                   fn h(x: i32) -> i32 { let b: i32 = if x > 10 { 1 } else if x > 5 { 2 } else { 3 }\n return b }\n";
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
+        let (info, _) = crate::typeck::check(&ast);
+        let (c, cd) = crate::cgen::emit(&ast, &info);
+        assert!(!cd.iter().any(|d| d.is_error()), "{:?}", cd);
+        assert!(
+            c.contains("int32_t j_a = ") && c.contains("? (j_x) : ((0 - j_x))"),
+            "a value-position if must lower:\n{c}"
+        );
+        assert!(
+            c.contains("? (1) : (") && c.contains("? (2) : (3)"),
+            "an else-if chain nests as conditionals:\n{c}"
+        );
+    }
+
+    /// An arm carrying statements still gets the old diagnostic — that is the case the
+    /// deferred "statement-expression with drop-safe spilling" is for, and pretending
+    /// otherwise would be the unsafe half of the fix.
+    #[test]
+    fn an_arm_with_statements_is_still_refused() {
+        let src = "fn g(x: i32) -> i32 { let a: i32 = if x > 0 { let t: i32 = x * 2\n t } else { 0 }\n return a }\n";
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
         let (info, _) = crate::typeck::check(&ast);
         let (_c, cd) = crate::cgen::emit(&ast, &info);
         assert!(
             cd.iter().any(|d| d.message.contains("only supported in statement or return position")),
-            "cgen must DIAGNOSE the value-position `if`, not emit silently: {:?}",
+            "a multi-statement arm must still be diagnosed: {:?}",
             cd.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
         );
     }
@@ -10740,6 +10773,23 @@ fn main() -> i32 {
         );
     }
 
+    /// **The shipped `@simd` demo, on real OS threads.** Both loops are vectorized (8
+    /// `i32` lanes) over **11** elements, so every run goes through the scalar remainder
+    /// too, and each is checked against its serial reference in-program — the two `0`s.
+    /// `absum`'s `if`/`else` body is the interesting one: a mask blend in the vector half,
+    /// an ordinary conditional in the remainder, one source expression. Repeated to shake
+    /// out any thread race.
+    #[test]
+    fn par_for_simd_demo() {
+        for _ in 0..8 {
+            assert_eq!(
+                toks("examples/std/par_for_simd.jtr"),
+                ["30", "0", "110", "0"],
+                "a vectorized `par for` diverged from serial"
+            );
+        }
+    }
+
     /// **`par for` over a narrower element type, on real OS threads.** The reduction
     /// domain is `i64` while the loop iterates `i32` (and `u8`), so this is where the
     /// widening either preserves the guarantee or does not: the parallel sum-of-squares
@@ -11102,7 +11152,10 @@ fn main() -> i32 {
                 "1e2", "1",
                 // `par for … reduce(r)`: sum (92), sum-of-squares (1380), max (15),
                 // min (-7), xor (-8), then the two `== serial` determinism flags
-                "92", "1380", "15", "-7", "-8", "1", "1",
+                "92", "1380", "15", "-7", "-8",
+                // the `@simd` section: absum, sumsq, and lanes == the i64 fold (Q-S2)
+                "148", "1380", "1",
+                "1", "1",
                 // parse_float round-trips (parse then format_float)
                 "1e-1", "3.0000000000000004e-1", "1.234567890123456e15", "1e10",
                 "3.14159265358979e0", "9.007199254740992e15", "5e-324",
@@ -11133,7 +11186,7 @@ fn main() -> i32 {
         }
         let digest = sha256::hex(all.as_bytes());
         assert_eq!(
-            digest, "3e0cc5c80a6812902812566c8d13ae4720d1c85f04e3058b8a66f5baeeb2d399",
+            digest, "4389bf8328ae7e018ebf0fb6ca4f94dd95f65eb7fb24568e55b1170b809868bc",
             "numerics output changed — if intentional, re-lock; output was:\n{all}"
         );
     }

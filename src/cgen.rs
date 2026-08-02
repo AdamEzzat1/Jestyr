@@ -4526,10 +4526,32 @@ impl<'a> Cgen<'a> {
                     "0".to_string()
                 }
             }
-            ExprKind::If { .. } => {
-                self.diag(span, "this control-flow expression is only supported in statement or return position");
-                "0".to_string()
-            }
+            // An `if`/`else` used as a VALUE. When both arms reduce to a single tail
+            // expression it lowers to C's conditional operator — which evaluates exactly
+            // one side, so it matches `if` semantics precisely, needs no temporary, and
+            // raises no drop question at all.
+            //
+            // That last part is why this is not the "statement-expression with drop-safe
+            // spilling" the multi-statement case still waits for: there is nothing to
+            // spill. An arm carrying statements keeps the old diagnostic.
+            //
+            // It cannot disturb byte-identity either: every program this newly accepts
+            // used to be a compile error, so no corpus file can contain one.
+            ExprKind::If { cond, then, els } => match (
+                Self::value_tail_of_block(then),
+                els.and_then(|e| self.value_tail_of_expr(e)),
+            ) {
+                (Some(t), Some(f)) => {
+                    let c = self.emit_expr(*cond);
+                    let a = self.emit_expr(t);
+                    let b = self.emit_expr(f);
+                    format!("(({c}) ? ({a}) : ({b}))")
+                }
+                _ => {
+                    self.diag(span, "this control-flow expression is only supported in statement or return position");
+                    "0".to_string()
+                }
+            },
             ExprKind::Closure { .. } => self.emit_closure_literal(id),
             ExprKind::Concurrent(_) => {
                 self.diag(span, "`concurrent` is only supported in statement position");
@@ -7693,6 +7715,34 @@ impl<'a> Cgen<'a> {
     }
 
 
+
+    /// The single tail expression of a block used as a value, or `None` if it carries
+    /// statements. The same rule the value-position `Block` arm already enforces — kept in
+    /// one place so the `if`-as-a-value lowering cannot drift from it.
+    fn value_tail_of_block(b: &Block) -> Option<ExprId> {
+        match b.stmts.as_slice() {
+            [Stmt::Expr(e)] => Some(*e),
+            _ => None,
+        }
+    }
+
+    /// The same, for an `else` operand — which the parser stores as an expression. A
+    /// plain `else { … }` is a block; `else if …` is another `If`, and recursing makes a
+    /// whole else-if chain lower as nested conditionals for free.
+    fn value_tail_of_expr(&self, e: ExprId) -> Option<ExprId> {
+        match &self.ast.expr_at(e).kind {
+            ExprKind::Block(b) => Self::value_tail_of_block(b),
+            ExprKind::If { then, els, .. } => {
+                // Only if the whole chain is expression-shaped; otherwise the caller
+                // falls back to the diagnostic rather than emitting half a lowering.
+                Self::value_tail_of_block(then)?;
+                els.and_then(|x| self.value_tail_of_expr(x))?;
+                Some(e)
+            }
+            _ => Some(e),
+        }
+    }
+
     /// The `par for` sites this run lowers to vector code: those inside a function that
     /// **declares** `@simd` and whose body `simd::classify` **certifies**.
     ///
@@ -7844,13 +7894,15 @@ impl<'a> Cgen<'a> {
         }
     }
 
-    /// A certified block in vector position — its tail expression. A `let` would need
-    /// statement context a value-position vector expression does not have, so a block
-    /// carrying one is not vectorized (it is simply not in this function's reach; the
-    /// site falls back to the scalar lowering).
+    /// A certified block in vector position — its single tail expression.
+    ///
+    /// `simd::classify` certifies only that shape, precisely because the **scalar
+    /// remainder** cannot lower a multi-statement block in value position (that needs
+    /// drop-safe spilling). So the `_ => "0"` arm is unreachable in a certified program
+    /// and exists only to keep cgen total, like every other path here.
     fn emit_block_simd(&mut self, b: &Block, vt: &str, loopvar: &str, vecvar: &str) -> String {
-        match b.stmts.last() {
-            Some(Stmt::Expr(e)) => self.emit_expr_simd(*e, vt, loopvar, vecvar),
+        match b.stmts.as_slice() {
+            [Stmt::Expr(e)] => self.emit_expr_simd(*e, vt, loopvar, vecvar),
             _ => "0".to_string(),
         }
     }
