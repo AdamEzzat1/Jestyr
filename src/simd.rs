@@ -151,6 +151,9 @@ impl Verdict {
 /// One `par for` site and what this pass concluded about it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Site {
+    /// The `par for` expression itself — how a consumer (cgen) keys a verdict to the
+    /// node it must lower.
+    pub id: ExprId,
     /// The loop variable's name (what the report calls the loop by).
     pub var: String,
     /// The whole `par for` expression's span.
@@ -168,6 +171,7 @@ pub fn analyze(ast: &Ast) -> Vec<Site> {
     for (i, e) in ast.exprs.iter().enumerate() {
         if let ExprKind::ParFor { var, body, .. } = &e.kind {
             out.push(Site {
+                id: ExprId(i as u32),
                 var: var.name.clone(),
                 span: ast.exprs[i].span,
                 verdict: classify(ast, *body),

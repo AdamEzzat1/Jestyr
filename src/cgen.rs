@@ -238,6 +238,7 @@ fn emit_program(
         task_handles: HashMap::new(),
         dyn_spawn_active: false,
         slice_instances: Vec::new(),
+        simd_sites: std::collections::HashMap::new(),
         array_instances: Vec::new(),
         genref_instances: Vec::new(),
         fn_type_instances: Vec::new(),
@@ -283,6 +284,7 @@ fn emit_program(
     // signatures, so a `[]T` parameter of a generic combinator contributes its
     // concrete `JestyrSlice_<T>` typedef even when the caller never writes a
     // `slice(T, …)` literal locally.
+    g.simd_sites = g.collect_simd_sites();
     g.slice_instances = g.collect_slices();
     g.array_instances = g.collect_arrays();
     g.struct_instances = g.collect_struct_instances();
@@ -316,6 +318,7 @@ fn emit_program(
     g.gen_struct_defs();
     g.gen_enum_defs();
     g.slice_struct_defs();
+    g.simd_vector_defs();
     g.array_struct_defs();
     g.genref_struct_defs();
     g.result_defs();
@@ -513,6 +516,10 @@ struct Cgen<'a> {
     dyn_spawn_active: bool,
     /// distinct slice element types, for emitting one `JestyrSlice_<T>` per type.
     slice_instances: Vec<Ty>,
+    /// The `par for` sites an `@simd` function declares AND `simd::classify` certifies —
+    /// the loops this run lowers to vectors. Keyed by the `ParFor` node so `emit_par_for`
+    /// needs no enclosing-function context.
+    simd_sites: std::collections::HashMap<ExprId, Ty>,
     /// Every distinct fixed-size array type `[N]T` the program uses (one
     /// `JestyrArr_<T>_<N>` typedef each). Each is a `Ty::Array`.
     array_instances: Vec<Ty>,
@@ -4559,7 +4566,7 @@ impl<'a> Cgen<'a> {
                 }
             }
             ExprKind::ParFor { var, iter, reduction, body } => {
-                self.emit_par_for(var, *iter, *reduction, *body)
+                self.emit_par_for(id, var, *iter, *reduction, *body)
             }
             ExprKind::Select(_) => {
                 self.diag(span, "`select` is only supported in statement position");
@@ -6583,7 +6590,7 @@ impl<'a> Cgen<'a> {
     /// `i32` computes in `i32`; only the per-element contribution is widened, once, on
     /// the way into the buffer. An `i64` source emits exactly what it always did, so
     /// every existing program's C is byte-identical.
-    fn emit_par_for(&mut self, var: &Ident, iter: ExprId, reduction: ExprId, body: ExprId) -> String {
+    fn emit_par_for(&mut self, site: ExprId, var: &Ident, iter: ExprId, reduction: ExprId, body: ExprId) -> String {
         let n = self.tmp;
         self.tmp += 1;
         let elem = match apply_subst(&self.info.type_of(iter).clone(), &self.subst) {
@@ -6612,6 +6619,33 @@ impl<'a> Cgen<'a> {
             format!("(int64_t)({bodyc})")
         };
         let prc = self.c_fn_name("par_reduce");
+
+        // The vector path, for a site an `@simd` function declared and the legality pass
+        // certified. Shape: a lane-at-a-time head, then the SCALAR remainder — and the
+        // remainder genuinely must be scalar, because a mask blend is not a conditional
+        // and a lane comparison is not `0`/`1`. Results are stored lane by lane rather
+        // than converted as a vector, which keeps the widening to `int64_t` exact for
+        // every element width without reaching for `__builtin_convertvector`.
+        if let Some(elem_v) = self.simd_sites.get(&site).cloned() {
+            let vt = self.simd_vec_name(&elem_v);
+            let w = simd_lanes(&elem_v);
+            let vbody = self.emit_expr_simd(body, &vt, &var.name, &format!("_pv{n}"));
+            return format!(
+                "({{ {sl} _pf{n} = {src}; \
+                 int64_t* _pm{n} = (int64_t*)malloc(_pf{n}.len * sizeof(int64_t)); \
+                 size_t _pi{n} = 0; \
+                 for (; _pi{n} + {w} <= _pf{n}.len; _pi{n} += {w}) {{ \
+                 {vt} _pv{n}; memcpy(&_pv{n}, _pf{n}.ptr + _pi{n}, sizeof({vt})); \
+                 {vt} _pw{n} = (({vt}){{0}}) + ({vbody}); \
+                 for (size_t _pk{n} = 0; _pk{n} < {w}; _pk{n}++) \
+                 _pm{n}[_pi{n} + _pk{n}] = (int64_t)_pw{n}[_pk{n}]; }} \
+                 for (; _pi{n} < _pf{n}.len; _pi{n}++) {{ \
+                 {ecty} {vname} = _pf{n}.ptr[_pi{n}]; _pm{n}[_pi{n}] = {contrib}; }} \
+                 int64_t _pr{n} = {prc}(({i64sl}){{ _pm{n}, _pf{n}.len }}, {red}); \
+                 free(_pm{n}); _pr{n}; }})"
+            );
+        }
+
         format!(
             "({{ {sl} _pf{n} = {src}; \
              int64_t* _pm{n} = (int64_t*)malloc(_pf{n}.len * sizeof(int64_t)); \
@@ -7656,6 +7690,169 @@ impl<'a> Cgen<'a> {
             }
         }
         out
+    }
+
+
+    /// The `par for` sites this run lowers to vector code: those inside a function that
+    /// **declares** `@simd` and whose body `simd::classify` **certifies**.
+    ///
+    /// Opt-in per function, so a program that writes no `@simd` emits byte-identical C —
+    /// the `@layout(auto)` discipline, and what keeps this increment off the corpus, the
+    /// concatenated build, the seed and every attested hash.
+    ///
+    /// The verdict comes from the same `simd::classify` the attribute check uses, so a
+    /// loop cgen vectorizes can never be one the compiler refused to certify.
+    fn collect_simd_sites(&self) -> std::collections::HashMap<ExprId, Ty> {
+        let mut out = std::collections::HashMap::new();
+        for item in &self.ast.items {
+            let Item::Fn(f) = item else { continue };
+            if f.attr("simd").is_none() {
+                continue;
+            }
+            for site in crate::simd::sites_in_span(self.ast, f.body.span) {
+                if !site.verdict.is_legal() {
+                    continue;
+                }
+                let ExprKind::ParFor { iter, .. } = &self.ast.expr_at(site.id).kind else { continue };
+                let elem = match self.info.type_of(*iter).clone() {
+                    Ty::Slice(e) => (*e).clone(),
+                    Ty::Array { elem, .. } => (*elem).clone(),
+                    _ => continue,
+                };
+                // Only an integer element has a vector form here; anything else was
+                // already refused by the legality pass or by typeck.
+                if !matches!(&elem, Ty::Prim(p) if is_integer_c_prim(p)) {
+                    continue;
+                }
+                out.insert(site.id, elem);
+            }
+        }
+        out
+    }
+
+    /// Emit one `typedef E JestyrVec_E __attribute__((vector_size(N)));` per element type
+    /// a vectorized `par for` iterates.
+    ///
+    /// GCC vector extensions rather than an OpenMP pragma or an `-march` bump: the
+    /// lowering has to be *chosen*, not begged for, or determinism sits at the
+    /// optimizer's discretion. `CC_FLAGS` is untouched.
+    fn simd_vector_defs(&mut self) {
+        let mut elems: Vec<Ty> = self.simd_sites.values().cloned().collect();
+        elems.sort_by_key(|e| self.ty_mangle(e));
+        elems.dedup_by_key(|e| self.ty_mangle(e));
+        let any = !elems.is_empty();
+        for elem in elems {
+            let name = self.simd_vec_name(&elem);
+            let ecty = self.c_type(&elem);
+            let bytes = SIMD_VECTOR_BYTES;
+            self.def_begin(name.clone(), Vec::new());
+            self.raw(format!("typedef {ecty} {name} __attribute__((vector_size({bytes})));\n"));
+            self.def_end();
+        }
+        if any {
+            self.raw("\n");
+        }
+    }
+
+    fn simd_vec_name(&self, elem: &Ty) -> String {
+        format!("JestyrVec_{}", self.ty_mangle(elem))
+    }
+
+    /// Emit the certified body with the loop variable bound to a **vector**.
+    ///
+    /// Only the forms `simd::classify` certifies reach here, which is what lets this be a
+    /// small, total function. Two lowerings differ from the scalar one, and both are
+    /// forced by GNU vector semantics rather than chosen:
+    ///
+    /// * a comparison yields an all-ones/all-zeros **mask** per lane, not `0`/`1`, so
+    ///   `and`/`or` become bitwise `and`/`or`;
+    /// * the conditional operator is not defined on vectors at all, so `if c { a } else
+    ///   { b }` becomes a mask blend.
+    ///
+    /// The scalar remainder loop must therefore keep the **scalar** forms — the bug
+    /// Q-S1's oracle caught in its own harness, which is why an element count that is not
+    /// a multiple of the lane width is this increment's first test.
+    fn emit_expr_simd(&mut self, id: ExprId, vt: &str, loopvar: &str, vecvar: &str) -> String {
+        let e = self.ast.expr_at(id);
+        match &e.kind {
+            ExprKind::Int(t) => t.replace('_', ""),
+            // A bool literal has no scalar spelling that is a lane mask, so it is built
+            // as one rather than written.
+            ExprKind::Bool(b) => {
+                if *b {
+                    format!("(({vt}){{0}} == ({vt}){{0}})")
+                } else {
+                    format!("(({vt}){{0}} != ({vt}){{0}})")
+                }
+            }
+            ExprKind::Name(n) => {
+                if n.name == loopvar {
+                    vecvar.to_string()
+                } else {
+                    // Loop-invariant: GCC broadcasts a scalar against a vector operand.
+                    format!("j_{}", n.name)
+                }
+            }
+            ExprKind::Unary { op, rhs } => {
+                let r = self.emit_expr_simd(*rhs, vt, loopvar, vecvar);
+                match op {
+                    UnOp::Neg => format!("(-{r})"),
+                    // `not` on a lane mask is a bitwise complement; scalar `!` is not
+                    // defined on a vector.
+                    UnOp::BitNot | UnOp::Not => format!("(~{r})"),
+                    UnOp::Ref => "0".to_string(),
+                }
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                let l = self.emit_expr_simd(*lhs, vt, loopvar, vecvar);
+                let r = self.emit_expr_simd(*rhs, vt, loopvar, vecvar);
+                let o = match op {
+                    BinOp::Add => "+",
+                    BinOp::Sub => "-",
+                    BinOp::Mul => "*",
+                    BinOp::Eq => "==",
+                    BinOp::Ne => "!=",
+                    BinOp::Lt => "<",
+                    BinOp::Le => "<=",
+                    BinOp::Gt => ">",
+                    BinOp::Ge => ">=",
+                    // Short-circuit becomes a blend: both sides are evaluated, which is
+                    // value-preserving only because the certified subset is total.
+                    BinOp::And | BinOp::BitAnd => "&",
+                    BinOp::Or | BinOp::BitOr => "|",
+                    BinOp::BitXor => "^",
+                    BinOp::Shl => "<<",
+                    BinOp::Shr => ">>",
+                    // Never certified (`Reason::Trapping`), so unreachable in a real
+                    // program; cgen stays total rather than panicking on one already
+                    // rejected.
+                    BinOp::Div | BinOp::Rem => "+",
+                };
+                format!("({l} {o} {r})")
+            }
+            ExprKind::If { cond, then, els } => {
+                let c = self.emit_expr_simd(*cond, vt, loopvar, vecvar);
+                let t = self.emit_block_simd(then, vt, loopvar, vecvar);
+                let f = match els {
+                    Some(e) => self.emit_expr_simd(*e, vt, loopvar, vecvar),
+                    None => "0".to_string(),
+                };
+                format!("((({t}) & ({c})) | (({f}) & ~({c})))")
+            }
+            ExprKind::Block(b) => self.emit_block_simd(b, vt, loopvar, vecvar),
+            _ => "0".to_string(),
+        }
+    }
+
+    /// A certified block in vector position — its tail expression. A `let` would need
+    /// statement context a value-position vector expression does not have, so a block
+    /// carrying one is not vectorized (it is simply not in this function's reach; the
+    /// site falls back to the scalar lowering).
+    fn emit_block_simd(&mut self, b: &Block, vt: &str, loopvar: &str, vecvar: &str) -> String {
+        match b.stmts.last() {
+            Some(Stmt::Expr(e)) => self.emit_expr_simd(*e, vt, loopvar, vecvar),
+            _ => "0".to_string(),
+        }
     }
 
     /// Emit `typedef struct { T* ptr; size_t len; } JestyrSlice_<T>;` per element.
@@ -11023,6 +11220,23 @@ mod tests {
 
 /// Is `p` an integer primitive — the element types `par for` may iterate? Mirrors
 /// `typeck::is_integer_prim`; kept local so cgen does not depend on typeck's privates.
+/// The vector width every `@simd` lowering uses, in bytes. 256 bits — AVX2-shaped, and a
+/// plain `vector_size` request that GCC lowers on any target. **Fixed and recorded rather
+/// than probed**: a host-dependent width would make the emitted C depend on the build
+/// machine, which the attestation hash would rightly flag as a different program.
+const SIMD_VECTOR_BYTES: usize = 32;
+
+/// How many lanes of `elem` fit in that width.
+fn simd_lanes(elem: &Ty) -> usize {
+    let sz = match elem {
+        Ty::Prim("i8") | Ty::Prim("u8") => 1,
+        Ty::Prim("i16") | Ty::Prim("u16") => 2,
+        Ty::Prim("i32") | Ty::Prim("u32") => 4,
+        _ => 8,
+    };
+    SIMD_VECTOR_BYTES / sz
+}
+
 fn is_integer_c_prim(p: &str) -> bool {
     matches!(
         p,

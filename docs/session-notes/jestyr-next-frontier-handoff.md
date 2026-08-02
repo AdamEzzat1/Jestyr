@@ -28,7 +28,8 @@
 
 | Increment | Commit | What |
 |---|---|---|
-| **Q-W2** the width port mirror, **corpus 139** | *(this run)* | Closes Q-W1 on both sides and clears Q-S2's last prerequisite. `typeck.jtr` binds the loop variable with the element's own type (`ty_is_int`, prim codes 0..=9) and `cgen.jtr` emits the element's slice type and C type with the contribution cast omitted when the body is already `i64` — so the `i64` path stays byte-identical while a narrower source keeps its width. `examples/std/par_for_width.jtr` is corpus **139**: an `i32` sum-of-squares over 9 elements (an uneven last worker chunk) checked against the serial fold, an identity max, and a `u8` sum. **The guarantee is verified where it could actually break** — `c_oracle::par_for_width_demo` runs it on real OS threads 8× and requires identical tokens each time, so "the reduction domain is `i64` while the loop iterates `i32`" is tested, not argued. Byte-identical on the first run, both for the mirror and for the new file; seed refreshed. One thing worth knowing for the next mirror: `par_elem_ty` returns `9` for its fallback and tests `ed.x > 9` two lines apart, and those are **different nines** — the first is the well-known TyId of `i64`, the second the largest integer PRIM CODE (i64's own code is 3). |
+| **Q-S2a** `@simd` LOWERS — the first vector instructions | *(this run)* | **Jestyr emits SIMD.** A `par for` inside an `@simd` function whose body `simd::classify` certifies now lowers to a vector head plus a scalar remainder, using GCC vector extensions (`typedef int32_t JestyrVec_i32 __attribute__((vector_size(32)));`) — **not** an OpenMP pragma, no `-march` change, no new `CC_FLAGS`. The lowering is *chosen*, not begged for, or determinism sits at the optimizer's discretion. **Opt-in per function**, so no corpus file writes `@simd` and all 139 stay byte-identical — no port mirror, no seed refresh, the Q-W1 boundary again. **Lane count comes from the element type**, which is what Q-W1 bought: 4 for `i64`, 8 for `i32`, 32 for `u8`, from one fixed recorded `SIMD_VECTOR_BYTES = 32` (never a host probe — a width read from the build machine would make the emitted C depend on where it was compiled, which attestation would rightly flag). Results are stored **lane by lane** rather than converted as a vector, which keeps the widening to `int64_t` exact at every element width without reaching for `__builtin_convertvector`. **The headline test is end-to-end**: `simd_lowering_matches_the_scalar_path_bit_for_bit` compiles the corpus demo twice — as shipped and with `@simd` on `main` — and requires identical tokens from both binaries, over **9** elements, deliberately not a multiple of 8, 4 or 32, so every run exercises the scalar remainder. 12 unit tests + that oracle. |
+| **Q-W2** the width port mirror, **corpus 139** | `9a463d8` | Closes Q-W1 on both sides and clears Q-S2's last prerequisite. `typeck.jtr` binds the loop variable with the element's own type (`ty_is_int`, prim codes 0..=9) and `cgen.jtr` emits the element's slice type and C type with the contribution cast omitted when the body is already `i64` — so the `i64` path stays byte-identical while a narrower source keeps its width. `examples/std/par_for_width.jtr` is corpus **139**: an `i32` sum-of-squares over 9 elements (an uneven last worker chunk) checked against the serial fold, an identity max, and a `u8` sum. **The guarantee is verified where it could actually break** — `c_oracle::par_for_width_demo` runs it on real OS threads 8× and requires identical tokens each time, so "the reduction domain is `i64` while the loop iterates `i32`" is tested, not argued. Byte-identical on the first run, both for the mirror and for the new file; seed refreshed. One thing worth knowing for the next mirror: `par_elem_ty` returns `9` for its fallback and tests `ed.x > 9` two lines apart, and those are **different nines** — the first is the well-known TyId of `i64`, the second the largest integer PRIM CODE (i64's own code is 3). |
 | **Q-W1** `par for` over any integer width | `86d9e60` | **Q-S2's prerequisite, and it did NOT need the generic `spawn` this note assumed was blocking.** `emit_par_for` is map-then-reduce: it fills an `int64_t` buffer by running the body per element and hands only *that* to `core.par_reduce`, so the engine never sees the source slice. The `[]i64` restriction was therefore a **typeck rule, not an engine limitation** — `par_reduce` stays exactly as it is, i64-only and untouched. `par for` now iterates any integer element type; the loop variable carries the element's **own** type, so a body over `i32` computes in `i32`, and only the per-element contribution is widened, once, on the way into the buffer. The determinism argument does not move at all: the reduction domain is still `i64`, where the declared operators are exactly associative. **Why it is the SIMD prerequisite:** a lowering fills lanes with the *element* type, so `i32` gets twice the lanes of `i64` and `u8` eight times — building Q-S2 first would have shipped the 4-lane version of the feature. **Zero emission change**: the `i64` path reproduces its previous C character for character (no cast is added when the body is already `i64`), so all 138 corpus files, the concat, the fixpoint and the seed are untouched and no port mirror is due yet. 6 tests: every width accepted, the loop variable's C type, the two *different* slice types in one lowering (source keeps its own, the engine still takes `[]i64`), byte-identity of the `i64` path, refusal of a float element or contribution, and — the one that matters — the checked non-deterministic-reduction guarantee surviving the widening. |
 | **M9** the lexer dogfood — the compiler's own source uses tier 7 | `5e24ce1` | **The first real USE of the CTFE ladder inside the compiler, and the increment that answers whether it was worth building.** `examples/std/tokens.jtr`'s six classifier functions (`is_space`/`is_alpha`/`is_digit`/`is_alnum`/`is_hex`/`is_digit_us`, ~30 lines of branch chains with `is_hex` calling `is_digit` to avoid restating a rule) become one comptime-computed 256-entry table plus six one-line predicates. One bit per class, so a byte's full classification is a single load; `_` carries both the alpha bit and a separate separator bit, because "is an identifier character" and "is the `1_000` separator" are not the same question and the branch chains had been conflating them by call order. **The crown result: `selfhost_fixpoint_full` still holds — `jc` now lexes its own 25K lines using a table its own compile-time evaluator computed, and still reproduces itself byte-for-byte.** The token stream is unchanged corpus-wide (all six P1 lexer goldens green), so the conversion is behaviour-preserving by test, not by argument. **The honest verdict on the feature, measured rather than asserted:** emitted C shows each classification is now a bounds-checked load (`assert(_ix < 256)`) where it used to be register comparisons — a real per-call cost — but timing both self-hosted compilers over a 12.7K-line file gives medians of ~163 ms (branches) and ~170 ms (table) with a 148–191 ms spread in **both**, i.e. indistinguishable, because lexing is a small fraction of a full compile. So the win is expressiveness and maintainability, and the cost is real but invisible at this granularity; resolving it either way needs a lexer-only benchmark the repo does not have. |
 | **M7** the comptime `for` + mutation in the port | `270f947` | **The CTFE ladder (0–7) is now closed on BOTH sides.** Loops and `var` assignment run at compile time in the self-hosted compiler: all three heads, ranges (inclusive / `step` / descending), list iteration, element+index, `break`/`continue` incl. **labelled**, `for … else`, and compound assignment through the same **checked** arithmetic (so `x += 1` overflows into a diagnostic). Fuel per **iteration** — the recorded trap holds, an empty body evaluates nothing so nothing else charges the budget. **The increment is where M6's deferred obligation comes due, and the shape of the debt was exactly as predicted:** a handle copies for free, so the copies the reference gets from ownership have to be written down, at three points now marked in place — reading out of a binding, reading an element, and **each element of `[v; n]`**. The third is the one that is invisible until it isn't: `[[0; 2]; 3]` without it is three cells naming ONE run, so `m[0][1] = 5` writes through all three rows. Verified directly, not just via the golden. **The flat arena paid for itself on the other side of the trade**, also as predicted: an assignment target is a `Place` — an env row or a cell index — so walking an index path is an address computation, where the reference needs `find_binding` to hand out a `&mut Value` and `walk_path` to re-borrow through each index, a chain the `.jtr` subset cannot express at all. Assignment resolution reads through `place_read_raw`, which deliberately does **not** copy: copying there would resolve `t[0]` against a duplicate and drop the write. 16 new golden fixtures (9 accepts + 7 refusals). Two side findings: the escape checker refuses `return v` for a `read` parameter (rebuild the value instead), and a real dump bug surfaced only once there were enough refusal fixtures to see it — `eval` cleared `failed` but not `emsg`, so a second failing `const` reported the concatenation of every message so far. |
@@ -559,14 +560,45 @@ and every answer must be identical. **gcc is the authority**, the same way
    `simd::classify`, so the report can never certify a loop the attribute rejects. The
    same rule that keeps M4's reflected/documented/attested type renderings from
    drifting (`at_ty`).
-7. **The pass is conservative, never optimistic**, and only one direction is a
+7. **The pass certifies a body cgen cannot lower — one form, and it is the interesting
+   one** (found by Q-S2a). `classify` accepts `if c { a } else { b }`, and the *vector*
+   half really does lower (a mask blend, written and tested). The **scalar remainder**
+   cannot: cgen refuses a value-position `if`/`else` with "this control-flow expression is
+   only supported in statement or return position". **It is diagnosed, not silent** —
+   `emit-c` prints cgen's total-path `0` placeholder without surfacing cgen diagnostics,
+   which is what made it read as a miscompile on first sight. So the legality pass is
+   *optimistic relative to the backend* in exactly one place, which contradicts finding 8
+   below until one of them moves. Fix by teaching cgen value-position control flow (the
+   comptime-aggregate path already shows the shape) — that also fixes
+   `let a = if c {…} else {…}` generally — or by narrowing `classify`.
+8. **The pass is conservative, never optimistic**, and only one direction is a
    soundness claim. A rejected body may well vectorize; nothing depends on that, and it
    is not tested. Say this out loud in any diagnostic-tuning increment.
 
-#### Q-S2 — deterministic SIMD lowering (next; the first emission change)
-`@simd` flips from *contract* to *contract + opt-in lowering*, for certified loops
-only. Non-annotated programs stay byte-identical, so the corpus moves only for files
-that opt in — the `@layout(auto)` discipline.
+#### Q-S2 — deterministic SIMD lowering (**STARTED — Q-S2a has landed**)
+`@simd` has flipped from *contract* to *contract + opt-in lowering*, for certified loops
+only. Non-annotated programs stay byte-identical, so the corpus moves only for files that
+opt in — the `@layout(auto)` discipline. **What Q-S2a emits**, for a certified site:
+
+```c
+size_t _pi0 = 0;
+for (; _pi0 + 8 <= _pf0.len; _pi0 += 8) {                       /* vector head */
+  JestyrVec_i32 _pv0; memcpy(&_pv0, _pf0.ptr + _pi0, sizeof(JestyrVec_i32));
+  JestyrVec_i32 _pw0 = ((JestyrVec_i32){0}) + (<body over _pv0>);
+  for (size_t _pk0 = 0; _pk0 < 8; _pk0++)
+    _pm0[_pi0 + _pk0] = (int64_t)_pw0[_pk0];                    /* lane-by-lane widen */
+}
+for (; _pi0 < _pf0.len; _pi0++) {                               /* SCALAR remainder */
+  int32_t j_x = _pf0.ptr[_pi0]; _pm0[_pi0] = (int64_t)(<body>);
+}
+```
+
+Three decisions worth not re-deriving. The `((VT){0}) + (…)` wrapper **forces vector-ness**,
+so a body that is a bare literal still yields a vector to subscript. Results are stored
+**lane by lane** rather than converted as a vector, which keeps the `int64_t` widening exact
+at every element width with no `__builtin_convertvector` dependency. And the remainder is
+scalar *code* using scalar *forms* — a mask blend is not a conditional and a lane comparison
+is not `0`/`1`, which is exactly the bug Q-S1's oracle caught in its own harness.
 
 - Emit GCC vector extensions (`__attribute__((vector_size(N)))`), **not** `#pragma omp
   simd`, no `-march` change, no new `CC_FLAGS`. The lowering must be *chosen*, not
@@ -709,13 +741,43 @@ what will actually grow the corpus.
    L1's offsets are *verified against the C compiler* rather than believed. Opt-in per
    struct, so non-annotated types stay byte-identical; the corpus grows annotated files.
    Then L3 (niche packing, by-`const*` `read` params).
-4. **Q-S2 deterministic SIMD lowering** — `@simd` flips from contract to contract +
-   opt-in lowering for the loops Q-S1 already certifies. The second increment in this
-   workstream that changes emission, and it inherits a ready-made first test case: the
-   scalar remainder (`N % W != 0`) needs the *scalar* select, the bug Q-S1's oracle
-   caught in its own harness. Then Q-S3 (the `@span` thermal/energy facet — ranking
-   authority only, never legalization) and Q-S4 (the GPU contract, written now,
-   implemented after Q-S2 is proven).
+4. ~~**Q-S2 deterministic SIMD lowering**~~ — **STARTED (Q-S2a): Jestyr now emits vector
+   instructions.** GCC vector extensions behind `@simd`, vector head + scalar remainder,
+   lane count from the element type, opt-in so the corpus is byte-identical. Proven
+   end-to-end: the demo compiled with and without `@simd` prints identical tokens over a
+   9-element input that always hits the remainder.
+
+   **What Q-S2 still needs, in order — start here in a fresh session:**
+
+   a. **Close the classify/cgen disagreement — this is the top item and it is NOT a
+      miscompile.** `simd::classify` certifies `if c { a } else { b }` (correctly: the
+      vector half becomes a mask blend, and the lowering for it is written and tested).
+      But the scalar remainder cannot be emitted, because cgen refuses a **value-position
+      `if`/`else`** — "this control-flow expression is only supported in statement or
+      return position". cgen *diagnoses* it, so nothing is silent; `emit-c` merely prints
+      its total-path `0` placeholder without surfacing cgen diagnostics, which is what
+      made it look like a miscompile at first. Pinned by
+      `a_value_position_if_is_certified_but_not_yet_lowerable`. **Two ways to close it:**
+      teach cgen value-position control flow (a GNU statement-expression, exactly as the
+      comptime-aggregate path already does) — which also fixes `let a = if c {…} else {…}`
+      generally and is the more valuable fix — or make `classify` refuse what the backend
+      cannot lower, which keeps the pass honest about being conservative. **Until one
+      lands, `@simd` on a select-bodied loop produces a diagnostic, not a wrong answer.**
+   b. **A corpus file + the port mirror.** The moment an `examples/**.jtr` writes `@simd`,
+      the P2/P3/cgen goldens sweep it and `typeck.jtr`/`cgen.jtr` must mirror the vector
+      lowering, plus `REFRESH_SEED=1`. Keep it out of `examples/` until the mirror is
+      ready — the trigger the CTFE M-series demonstrated four times.
+   c. **Add the annotated demo to the c-oracle SHA canary's demo set**, so lane width joins
+      thread count and chunk size in the pinned cross-OS digest. That is the point at which
+      "bit-identical across lane widths" becomes a *pinned* property rather than a test.
+   d. **`emit_block_simd` handles only a tail expression.** A certified body containing a
+      `let` falls through to `"0"` in the vector half — currently unreachable because such
+      a body also needs value-position block support (same root cause as (a)), but it must
+      be closed with (a) rather than left implicit.
+
+   Then **Q-S3** (the `@span` thermal/energy facet — `PhysicalCostQuery` shape,
+   deterministic, **ranking-only, never legalizing**) and **Q-S4** (the GPU tile-schedule
+   contract, written now, implemented after Q-S2 is proven).
 
 `@size_of`/`@align_of`/`@offset_of` as comptime *values* come after L (L1 unblocked the
 computation; exposing it is its own slice). Comptime-only functions are a *convenience*,

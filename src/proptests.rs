@@ -4630,6 +4630,98 @@ mod par_for_width {
         );
     }
 
+    /// **Q-S2: `@simd` now LOWERS.** A certified `par for` inside an `@simd` function
+    /// emits a vector head plus a scalar remainder; everything else is untouched.
+    #[test]
+    fn simd_lowering_emits_a_vector_head_and_a_scalar_remainder() {
+        let src = "fn sum_reduction() -> i64 { return 0 }\n\
+                   @simd fn f(read s: []i32) -> i64 { return par for x in s reduce(sum_reduction()) { x * x } }\n";
+        let c = emitted(src);
+        assert!(
+            c.contains("typedef int32_t JestyrVec_i32 __attribute__((vector_size(32)));"),
+            "a vector typedef must be emitted:\n{c}"
+        );
+        // 32 bytes / 4 = 8 lanes for i32 — the width Q-W1 unlocked.
+        assert!(c.contains("_pi0 + 8 <= _pf0.len"), "i32 should give 8 lanes:\n{c}");
+        assert!(c.contains("memcpy(&_pv0, _pf0.ptr + _pi0, sizeof(JestyrVec_i32))"), "{c}");
+        // The remainder is SCALAR — the whole point of Q-S1's harness bug.
+        assert!(
+            c.contains("for (; _pi0 < _pf0.len; _pi0++) { int32_t j_x = _pf0.ptr[_pi0];"),
+            "the remainder must stay scalar:\n{c}"
+        );
+    }
+
+    /// Opt-in: without `@simd` the C is exactly what it was, which is what keeps this
+    /// increment off the corpus, the concat, the seed and every attested hash.
+    #[test]
+    fn without_the_attribute_nothing_changes() {
+        let base = "fn sum_reduction() -> i64 { return 0 }\n\
+                    fn f(read s: []i32) -> i64 { return par for x in s reduce(sum_reduction()) { x * x } }\n";
+        let c = emitted(base);
+        assert!(!c.contains("JestyrVec_"), "an unannotated program must emit no vectors:\n{c}");
+        assert!(!c.contains("memcpy(&_pv0"), "{c}");
+    }
+
+    /// A lane width per element type — 4 for `i64`, 8 for `i32`, 32 for `u8`. This is
+    /// what Q-W1 was for.
+    #[test]
+    fn lane_count_follows_the_element_type() {
+        for (t, w) in [("i64", 4), ("i32", 8), ("u8", 32)] {
+            let src = format!(
+                "fn sum_reduction() -> i64 {{ return 0 }}\n\
+                 @simd fn f(read s: []{t}) -> i64 {{ return par for x in s reduce(sum_reduction()) {{ x }} }}\n"
+            );
+            let c = emitted(&src);
+            assert!(c.contains(&format!("_pi0 + {w} <= _pf0.len")), "`{t}` should give {w} lanes:\n{c}");
+        }
+    }
+
+    /// A select DOES lower to a mask blend in the vector half — the form GNU vector
+    /// semantics force, since `?:` is not defined on vectors.
+    #[test]
+    fn a_select_becomes_a_mask_blend_in_the_vector_half() {
+        let src = "fn sum_reduction() -> i64 { return 0 }\n\
+                   @simd fn f(read s: []i32) -> i64 { return par for x in s reduce(sum_reduction()) { if x > 0 { x } else { 0 - x } } }\n";
+        let c = emitted(src);
+        assert!(c.contains("& ((_pv0 > 0))"), "the vector half must blend on a mask:\n{c}");
+        assert!(c.contains("~((_pv0 > 0))"), "the else side must be masked by the complement:
+{c}");
+    }
+
+    /// **A KNOWN GAP, pinned so it cannot be forgotten: the legality pass certifies a
+    /// body cgen cannot lower.**
+    ///
+    /// `simd::classify` accepts `if c { a } else { b }` — correctly, for the *vector*
+    /// half, where it becomes a mask blend. But a `par for` needs a **scalar remainder**,
+    /// and cgen refuses a value-position `if`/`else` outright ("this control-flow
+    /// expression is only supported in statement or return position"). So the vector head
+    /// compiles and the remainder does not: the pass and the backend disagree about
+    /// exactly one form, and it is the interesting one.
+    ///
+    /// This is NOT a silent miscompile — cgen diagnoses it (`emit-c` merely prints its
+    /// total-path `0` placeholder without surfacing cgen's diagnostics). Two ways to
+    /// close it, and the next increment picks one: teach cgen value-position control flow
+    /// (a GNU statement-expression, exactly as the comptime-aggregate path does), or make
+    /// `classify` refuse what the backend cannot lower — which keeps the pass honest
+    /// about being conservative.
+    #[test]
+    fn a_value_position_if_is_certified_but_not_yet_lowerable() {
+        let src = "fn sum_reduction() -> i64 { return 0 }\n\
+                   fn f(read s: []i32) -> i64 { return par for x in s reduce(sum_reduction()) { if x > 0 { x } else { 0 - x } } }\n";
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
+        // The pass says yes…
+        assert!(crate::simd::analyze(&ast)[0].verdict.is_legal(), "classify certifies a select");
+        // …and cgen says no, with a diagnostic rather than silence.
+        let (info, _) = crate::typeck::check(&ast);
+        let (_c, cd) = crate::cgen::emit(&ast, &info);
+        assert!(
+            cd.iter().any(|d| d.message.contains("only supported in statement or return position")),
+            "cgen must DIAGNOSE the value-position `if`, not emit silently: {:?}",
+            cd.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        );
+    }
+
     /// The shipped demo type-checks and passes the escape checker — the narrow-width
     /// `par for` in a real multi-module program, not a fixture string.
     #[test]
@@ -10617,7 +10709,37 @@ fn main() -> i32 {
             ["153", "1", "17", "1", "1", "1", "1", "1"]
         );
     }
+    /// **Q-S2's headline: the vector lowering computes the same bits as the scalar one.**
+    ///
+    /// The demo's `par for` loops are compiled twice — once as shipped, once with `@simd`
+    /// spliced onto every function — and both binaries must print identical tokens.
+    /// Nothing else in the program changes, so any difference is the vector path.
+    ///
+    /// The element count is **9**, deliberately not a multiple of the 8-lane `i32` width
+    /// (nor of 4, nor of 32): every run exercises the scalar remainder, which is where
+    /// Q-S1's oracle found the select-lowering bug in its own harness.
     #[test]
+    fn simd_lowering_matches_the_scalar_path_bit_for_bit() {
+        let plain = std::fs::read_to_string("examples/std/par_for_width.jtr").unwrap();
+        // Annotate only `main` — it holds the `par for` loops, and `@simd` on a function
+        // with none is (correctly) an error, as Q-S1 made it.
+        let annotated = plain.replace("\nfn main()", "\n@simd fn main()");
+        let dir = std::env::temp_dir().join("jestyr_simd_lower");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Beside the real module directory, so `import "core"` still resolves.
+        let f = std::path::Path::new("examples/std").join("_simd_annotated_tmp.jtr");
+        std::fs::write(&f, &annotated).unwrap();
+        let got = std::panic::catch_unwind(|| toks("examples/std/_simd_annotated_tmp.jtr"));
+        let _ = std::fs::remove_file(&f);
+        let got = got.expect("the annotated program must build and run");
+        assert_eq!(
+            got,
+            ["285", "1", "9", "30"],
+            "the vector lowering diverged from the scalar one"
+        );
+    }
+
     /// **`par for` over a narrower element type, on real OS threads.** The reduction
     /// domain is `i64` while the loop iterates `i32` (and `u8`), so this is where the
     /// widening either preserves the guarantee or does not: the parallel sum-of-squares
