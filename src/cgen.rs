@@ -4782,7 +4782,12 @@ impl<'a> Cgen<'a> {
             //
             // Total, and never the first place a user hears about a bad query:
             // `check_reflect_call` has already diagnosed it during checking.
-            if comptime::is_reflect_intrinsic(&n.name) {
+            // …and the three layout queries (workstream L), which are the same idea
+            // applied to sizes rather than shapes: `@size_of(T)` is answered *here*
+            // from `layout.rs`, while the bare `size_of(T)` below still lowers to C's
+            // `sizeof`. That split is what lets this land byte-identically — every
+            // existing program uses the bare name and emits exactly the C it did before.
+            if comptime::is_reflect_intrinsic(&n.name) || comptime::is_layout_intrinsic(&n.name) {
                 return match comptime::Interp::new(ast).eval(call_id) {
                     Ok(comptime::Value::Int(i)) => i.to_string(),
                     Ok(comptime::Value::Str(s)) => format!("JSTR({})", c_string_literal(&s)),
@@ -10209,6 +10214,30 @@ mod tests {
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("_Alignof(Jestyr_M)"), "align_of → _Alignof: {c}");
         assert!(c.contains("offsetof(Jestyr_M, j_b)"), "offset_of → offsetof with j_ field: {c}");
+    }
+
+    /// **The two spellings emit different things, and that is the whole design.**
+    ///
+    /// `size_of(T)` is *C-deferred* — it lowers to `sizeof(Jestyr_T)` and the C compiler
+    /// answers it. `@size_of(T)` is answered by **this** compiler from `layout.rs` and
+    /// reaches the output as a literal. So the `@` forms can appear where a C expression
+    /// cannot (a `const`, an array length), while every program written before them emits
+    /// byte-identical C — which is what let this land without touching the 141-file
+    /// corpus, the concat, the fixpoint or the seed.
+    #[test]
+    fn layout_queries_fold_while_the_bare_names_still_defer_to_c() {
+        let src = "struct M { a: u8, b: i32, c: u8 } \
+                   fn main() -> i32 { print_int(@size_of(M)) print_int(size_of(M)) \
+                   print_int(@align_of(M)) print_int(@offset_of(M, b)) return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        // The `@` forms are literals: 12 bytes, align 4, `b` at offset 4.
+        assert!(c.contains("jestyr_rt_print_int(12)"), "@size_of folds: {c}");
+        assert!(c.contains("jestyr_rt_print_int(4)"), "@align_of / @offset_of fold: {c}");
+        // …and the bare name is untouched.
+        assert!(c.contains("sizeof(Jestyr_M)"), "bare size_of still defers to C: {c}");
+        assert!(!c.contains("_Alignof"), "@align_of must not have deferred: {c}");
+        assert!(!c.contains("offsetof("), "@offset_of must not have deferred: {c}");
     }
 
     #[test]

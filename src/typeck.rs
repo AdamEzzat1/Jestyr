@@ -1978,6 +1978,16 @@ impl<'a> TypeChecker<'a> {
                         self.expr_types[id.0 as usize] = t.clone();
                         return t;
                     }
+                    // `@size_of(T)` / `@align_of(T)` / `@offset_of(T, f)` — the same
+                    // shape and for the same reason: the first argument is a type, so
+                    // the arguments must not be inferred, and the query becomes a
+                    // literal in the emitted C with no runtime fallback to degrade to.
+                    if comptime::is_layout_intrinsic(&a.name) {
+                        self.check_reflect_call(id);
+                        let t = Ty::Prim("i64");
+                        self.expr_types[id.0 as usize] = t.clone();
+                        return t;
+                    }
                 }
                 // Method-call sugar: `base.name(args)` resolves either to a free
                 // function whose first parameter is the receiver (item A), or to a

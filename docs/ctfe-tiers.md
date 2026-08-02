@@ -119,10 +119,12 @@ and `union` share the struct item and reflect identically; methods are not field
 Field types are rendered by the same `doc::ty_str` the documentation generator uses,
 so a reflected type name cannot disagree with the documented one.
 
-These are answered by the *Jestyr* compiler and reach C as literals — unlike
-`size_of`/`align_of`/`offset_of`, which are handed to the C compiler. An unanswerable
-query is a diagnostic, never a default: an out-of-range index is not clamped, a
-non-struct is not silently zero.
+These are answered by the *Jestyr* compiler and reach C as literals — unlike the bare
+`size_of`/`align_of`/`offset_of`, which are handed to the C compiler. (Their `@` twins
+`@size_of`/`@align_of`/`@offset_of` now exist too and *are* answered here; see the
+layout section below. The two spellings coexist deliberately.) An unanswerable query is
+a diagnostic, never a default: an out-of-range index is not clamped, a non-struct is not
+silently zero.
 
 ### Why `@`, when `size_of` has no sigil
 
@@ -133,20 +135,64 @@ have silently hijacked a real function and broken the self-hosted build. Any
 bare-name intrinsic carries that hazard; `size_of` and friends simply have not been
 unlucky yet.
 
+That reasoning then paid off a second time. When the layout queries became comptime
+values, they did **not** replace `size_of(T)` — they arrived as `@size_of(T)` beside it.
+Two things fell out of putting them in the `@` namespace: the collision hazard above is
+avoided again, and the sigil carries the real distinction, since the two forms genuinely
+do different things (`size_of` asks C at compile time of the *C* program; `@size_of` is a
+number this compiler already knows). Had reflection taken the bare names, there would
+have been no room left to say that.
+
 `@name(…)` was already a callable form in the grammar (`@address(0x…)`), so the `@`
 namespace costs no new syntax — and nothing in it can ever collide, because a user
 cannot declare `fn @field_type`. It also makes "this is a compiler query, not a
 call" visible at the use site, which is the same instinct as the rest of the
 language: no hidden anything.
 
-### What tier 3 does *not* yet do, and why
+### Sizes, alignments and offsets — ✅ closed by workstream L
 
-**Sizes, alignments and offsets are absent — blocked on workstream L.** `size_of`,
-`align_of` and `offset_of` exist today only as **C-deferred** intrinsics: they lower
-to `sizeof()`, `_Alignof()` and `offsetof()`, so the Jestyr compiler never learns the
-numbers, it asks the C compiler. Making them comptime *values* requires the compiler's
-own layout pass. Tier 3 therefore reflects what the compiler already knows without it
-— the declared shape.
+This section used to record a gap: `size_of`, `align_of` and `offset_of` existed only as
+**C-deferred** intrinsics, lowering to `sizeof()`, `_Alignof()` and `offsetof()`, so the
+Jestyr compiler never learned the numbers — it asked the C compiler. Tier 3 therefore
+reflected only the *declared shape*, and making the numbers comptime **values** needed
+the compiler's own layout pass.
+
+`src/layout.rs` (workstream L) is that pass, so the three queries now exist in the `@`
+namespace and fold to literals:
+
+```jestyr
+const SLOT: i64 = @size_of(Header) + @size_of(Payload)   // C's sizeof cannot appear here
+var buf: [@size_of(Frame)]u8 = [0; @size_of(Frame)]      // …nor here
+```
+
+**Both spellings remain, and mean different things.** The bare `size_of(T)` still lowers
+to C's `sizeof` — untouched, so every program written before this emits byte-identical
+C. The `@` form is a value *this* compiler computed, and can therefore appear where a C
+expression cannot: a `const`, an array length, arithmetic that must fold, a `comptime`
+block. The split is the honest one — the bare name means **ask C**, the `@` name means
+**the compiler knows** — and it is what let the feature land without disturbing the
+corpus, the concat, the fixpoint or the bootstrap seed.
+
+`@offset_of` reports where a field **actually is**, which for a `@layout(auto)` struct is
+not where it was written. Anything else would be worse than useless: the query exists to
+be handed to something that will index memory with it.
+
+Every unknowable case is an **error, never a zero** — a generic template, an undeclared
+name, a bit-field struct (implementation-defined packing), a missing field. A `@size_of`
+that quietly answered `0` would produce a program that compiles, links and corrupts
+memory, which is exactly the failure G1 closed when a non-literal array length was
+silently becoming `[0]T`.
+
+Two tests keep the numbers honest, and they check different halves.
+`the_two_layout_models_agree` pins the AST-side model (what the comptime queries use,
+because `Interp::new(ast)` runs during type checking and cannot depend on the table being
+built) against the table-side one (what the report and backend use) across every corpus
+file — it found a real union-layout bug the first time it ran. And
+`a_folded_layout_query_equals_the_c_compilers_answer` prints `@size_of(T)` beside
+`size_of(T)` in one running program and requires every pair to match, so the constant
+this compiler folded and the layout gcc emitted cannot part company.
+
+### What tier 3 does *not* yet do, and why
 
 **Field iteration — resolved by tier 7, not by comptime-only functions.** Arguments to
 a reflection query must be compile-time constants, and originally that made the *walk*

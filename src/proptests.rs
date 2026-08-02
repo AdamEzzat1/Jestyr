@@ -6197,6 +6197,73 @@ mod dragon {
     }
 }
 
+/// **The two layout models must agree, over the whole corpus.**
+///
+/// `layout.rs` answers "what does this type cost?" twice, from two different front ends:
+/// `layout_of` reads a resolved `Ty` from the checked table (what `jestyrc layout` and
+/// the backend use), and `ast_layout_of` walks the AST directly (what the **comptime**
+/// `@size_of`/`@align_of`/`@offset_of` use, because `Interp::new(ast)` runs during type
+/// checking and so cannot depend on the table being built).
+///
+/// The *rules* are shared — `prim_layout`, `aggregate`, `align_to`, `auto_order` are one
+/// copy each — but the traversals are not, and a rule added to one traversal and
+/// forgotten in the other would make `@size_of(T)` and `size_of(T)` disagree **inside a
+/// single program**. That is a silent-miscompile shape: the constant folds to one number
+/// while the C compiler lays out another.
+///
+/// So this pins them against each other across every corpus file. A type the AST model
+/// declines on (a generic instance, an imported type) is skipped rather than failed —
+/// declining is a legitimate answer there, and `@size_of` reports it as an error. What
+/// is *not* allowed is answering, and answering differently.
+#[test]
+fn the_two_layout_models_agree() {
+    let mut compared = 0usize;
+    for dir in ["examples", "examples/std"] {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("jtr") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&p).unwrap();
+            let (tokens, _) = crate::lexer::Lexer::new(&src).tokenize();
+            let (ast, _) = crate::parser::Parser::new(&src, tokens).parse();
+            let (info, _) = crate::typeck::check(&ast);
+            for t in crate::layout::compute(&ast, &info) {
+                if t.incomplete {
+                    continue; // the table model itself declined
+                }
+                let Some(l) = crate::layout::ast_layout_by_name(&ast, &t.name) else {
+                    continue; // the AST model declined — a legitimate answer
+                };
+                assert_eq!(
+                    (l.size, l.align),
+                    (t.size, t.align),
+                    "{}: `{}` — the AST layout model says {:?}, the table model says {:?}",
+                    p.display(),
+                    t.name,
+                    (l.size, l.align),
+                    (t.size, t.align)
+                );
+                // …and the field offsets, which is what `@offset_of` returns.
+                for f in &t.fields {
+                    if let Some(off) = crate::layout::ast_offset_of(&ast, &t.name, &f.name) {
+                        assert_eq!(
+                            off, f.offset,
+                            "{}: `{}.{}` — offset {} vs {}",
+                            p.display(), t.name, f.name, off, f.offset
+                        );
+                    }
+                }
+                compared += 1;
+            }
+        }
+    }
+    // A guard against the comparison quietly becoming vacuous: if a refactor made the
+    // AST model decline on everything, every assertion above would pass.
+    assert!(compared > 50, "only {compared} types compared — the models are not being exercised");
+}
+
 /// SHA-256 now lives in the shared, non-test `crate::sha256` module — both this
 /// numerics-determinism canary and `jestyrc attest` hash with the same code, so the
 /// vectors that vouch for one vouch for the other. Re-exported here so the existing
@@ -9379,6 +9446,11 @@ fn main() -> i32 {
             // The `@layout(auto)` demo: now that an annotated file is in the corpus, the
             // *reordered* offsets are checked by the same authority as every other one.
             "examples/layout_auto.jtr",
+            // Unions. Absent from this list, the model reported `union Bits { i: i32,
+            // f: f32 }` as 8 bytes with `f` at offset 4 — members laid out sequentially,
+            // because the checked table stores a union as an ordinary aggregate. gcc
+            // would have said so on day one.
+            "examples/union.jtr",
         ] {
             let src = std::fs::read_to_string(file).unwrap();
             check_layout_against_c(file, &src, &dir);
@@ -9420,6 +9492,80 @@ fn main() -> i32 {
             // A `main` that touches the type, so cgen emits it at all.
             let src = format!("{decls}\nfn main() -> i32 {{ print_int(size_of(T2)) return 0 }}\nstruct T2 {{ x: i32 }}\n");
             check_layout_against_c(name, &src, &dir);
+        }
+    }
+
+    /// **A folded `@size_of` equals the C compiler's `sizeof`, in the same program.**
+    ///
+    /// This is the assertion that makes the layout queries safe to use. `@size_of(T)` is
+    /// a literal this compiler computed; `size_of(T)` is `sizeof(Jestyr_T)`, which gcc
+    /// computes from the struct cgen actually emitted. If they ever disagree, a program
+    /// can size a buffer with one and index it with the other — so the test simply runs
+    /// both, side by side, and requires each pair to be equal.
+    ///
+    /// Note what this is *not*: it is not `layout_matches_c_sizeof` again. That one
+    /// checks the table-side model through a synthetic probe. This checks the **AST-side**
+    /// model, through the value a user's own program prints, on a `@layout(auto)` struct
+    /// where the two could most easily part company.
+    #[test]
+    fn a_folded_layout_query_equals_the_c_compilers_answer() {
+        let decls = "struct Header { magic: u8, length: u64, flags: u8 }\n\
+                     @layout(auto) struct Tidy { a: u8, b: u64, c: i32, d: u16 }\n\
+                     struct Nested { t: Tidy, tag: u8 }\n\
+                     union Bits { i: i32, f: f32 }\n\
+                     enum Tagged { none, some(v: i64) }\n\
+                     enum Maybe { nil, at(p: *mut i32) }\n\
+                     distinct Id = u16\n";
+        // Each pair is (this compiler's answer, gcc's answer) printed adjacently.
+        let body = "fn main() -> i32 { \
+            print_int(@size_of(Header)) print_int(size_of(Header)) \
+            print_int(@size_of(Tidy)) print_int(size_of(Tidy)) \
+            print_int(@size_of(Nested)) print_int(size_of(Nested)) \
+            print_int(@size_of(Bits)) print_int(size_of(Bits)) \
+            print_int(@size_of(Tagged)) print_int(size_of(Tagged)) \
+            print_int(@size_of(Maybe)) print_int(size_of(Maybe)) \
+            print_int(@size_of(Id)) print_int(size_of(Id)) \
+            print_int(@align_of(Header)) print_int(align_of(Header)) \
+            print_int(@align_of(Tidy)) print_int(align_of(Tidy)) \
+            print_int(@offset_of(Header, length)) print_int(offset_of(Header, length)) \
+            print_int(@offset_of(Tidy, a)) print_int(offset_of(Tidy, a)) \
+            print_int(@offset_of(Tidy, b)) print_int(offset_of(Tidy, b)) \
+            print_int(@offset_of(Nested, tag)) print_int(offset_of(Nested, tag)) \
+            return 0 }";
+        let out = run_inline("layout queries", &format!("{decls}{body}"));
+        assert_eq!(out.len(), 26, "expected 13 pairs, got {out:?}");
+        for pair in out.chunks(2) {
+            assert_eq!(
+                pair[0], pair[1],
+                "a folded layout query disagreed with the C compiler: {out:?}"
+            );
+        }
+        // Agreement alone is not enough: every pair would also match if nothing were
+        // reordered and no niche applied, because both sides would then be wrong
+        // together. So the values are pinned too, in the order printed above.
+        let want = [
+            ("size Header", "24"),
+            // Declaration order is 32 with `a` first; emission order is
+            // b(0), c(8), d(12), a(14) — 16 bytes, `a` last.
+            ("size Tidy — reordered", "16"),
+            ("size Nested — embeds the reordered Tidy", "24"),
+            ("size Bits — a union, members overlap", "4"),
+            ("size Tagged — tag + payload", "16"),
+            // The one that would otherwise have shipped wrong: a niche enum IS the
+            // pointer, not a tag plus one. Every other pair matched while the model
+            // still said 16 — it took a value the program prints to catch it.
+            ("size Maybe — niche: just the pointer", "8"),
+            ("size Id — distinct: its base exactly", "2"),
+            ("align Header", "8"),
+            ("align Tidy", "8"),
+            ("offset Header.length", "8"),
+            ("offset Tidy.a — reordered to last", "14"),
+            ("offset Tidy.b — reordered to first", "0"),
+            ("offset Nested.tag", "16"),
+        ];
+        assert_eq!(want.len() * 2, out.len(), "the expectation list is out of step");
+        for (i, (what, expect)) in want.iter().enumerate() {
+            assert_eq!(&out[i * 2], expect, "{what}: got {out:?}");
         }
     }
 

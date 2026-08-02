@@ -36,7 +36,8 @@ use std::fmt::Write;
 
 use std::collections::HashSet;
 
-use crate::ast::{Ast, Attribute, ExprKind, Item, StructMember};
+use crate::ast::{Ast, Attribute, ExprKind, Item, StructMember, TypeId, TypeKind};
+use crate::comptime::Interp;
 use crate::types::{Ty, TypeInfo, TypeKindG};
 
 /// The target's pointer/`usize` width. Jestyr targets LP64 through its C backend; a
@@ -120,23 +121,74 @@ fn prim_layout(name: &str) -> Option<Layout> {
     })
 }
 
-/// The names of the structs that opted into `@layout(auto)`.
+/// Is this variant list **niche-optimized** — exactly two variants, one nullary and one
+/// carrying a single *thin-pointer* payload?
 ///
-/// Collected once and threaded through the whole size computation, because reordering
-/// is **not** a local property: a reordered struct is usually smaller, so a struct that
-/// embeds one must see the smaller number or every offset after it would be wrong. This
-/// is the reason `layout_of` takes the set rather than each caller checking attributes
-/// at the top level.
-pub fn auto_types(ast: &Ast, info: &TypeInfo) -> HashSet<String> {
-    let mut out = HashSet::new();
-    for item in &ast.items {
-        if let Item::Struct { name, attrs, .. } = item {
-            if field_order(ast, info, &name.name, attrs).is_some() {
-                out.insert(name.name.clone());
-            }
+/// Such an enum is represented as just that pointer: `none` is `NULL`, `some(p)` is `p`.
+/// No tag, no union, no padding — `size_of(Maybe) == size_of(*mut i32) == 8`, where a
+/// tagged representation would be 16.
+///
+/// Mirrors `cgen::Cgen::niche_enum_at`, and it has to: the backend already emits these
+/// as a bare pointer, so a model that computed tag-plus-payload would report **16 for a
+/// type that occupies 8**. It did exactly that until this was added — and the failure was
+/// worse than a wrong report, because `@size_of(Maybe)` folds from this model while
+/// `size_of(Maybe)` is C's `sizeof` over the emitted struct: the two would have
+/// disagreed *inside a single program*.
+///
+/// A fat `&T` (`{ptr, gen}`) or a slice (`{ptr, len}`) has no null niche, so only raw
+/// pointers and zero-cost region references qualify.
+fn is_niche_enum(variants: &[(String, Vec<Ty>)]) -> bool {
+    if variants.len() != 2 {
+        return false;
+    }
+    let mut nullary = false;
+    let mut pointer = false;
+    for (_, fields) in variants {
+        match fields.as_slice() {
+            [] => nullary = true,
+            [Ty::Ptr { .. } | Ty::RegionRef(_)] => pointer = true,
+            _ => return false,
         }
     }
-    out
+    nullary && pointer
+}
+
+/// The facts a layout depends on that the **checked type table does not carry**, because
+/// they are properties of the declaration rather than of the type.
+///
+/// Collected once from the AST and threaded through the whole computation, because
+/// neither is a *local* property:
+///
+/// * `auto` — a reordered struct is usually smaller, so a struct that embeds one must
+///   see the smaller number or every offset after it is wrong.
+/// * `unions` — the table records a `union` as an ordinary aggregate (`TypeKindG` has no
+///   union arm), so without this set the model lays a union's members out *sequentially*
+///   and reports `union Bits { i: i32, f: f32 }` as 8 bytes with `f` at offset 4. It is
+///   4 bytes with both members at 0. That was a real L1 bug, found by
+///   `the_two_layout_models_agree` the first time it ran, because the AST-side model
+///   reads `is_union` directly and could not make the same mistake.
+#[derive(Default)]
+pub struct Model {
+    auto: HashSet<String>,
+    unions: HashSet<String>,
+}
+
+impl Model {
+    /// Collect both sets from a program's declarations.
+    pub fn of(ast: &Ast, info: &TypeInfo) -> Model {
+        let mut m = Model::default();
+        for item in &ast.items {
+            if let Item::Struct { name, attrs, is_union, .. } = item {
+                if *is_union {
+                    m.unions.insert(name.name.clone());
+                }
+                if field_order(ast, info, &name.name, attrs).is_some() {
+                    m.auto.insert(name.name.clone());
+                }
+            }
+        }
+        m
+    }
 }
 
 /// The layout of an arbitrary `Ty`. `None` when it cannot be known from the declared
@@ -144,7 +196,7 @@ pub fn auto_types(ast: &Ast, info: &TypeInfo) -> HashSet<String> {
 ///
 /// `auto` names the structs whose fields are reordered (see [`auto_types`]); pass an
 /// empty set for the plain declaration-order model.
-pub fn layout_of(info: &TypeInfo, auto: &HashSet<String>, ty: &Ty) -> Option<Layout> {
+pub fn layout_of(info: &TypeInfo, m: &Model, ty: &Ty) -> Option<Layout> {
     Some(match ty {
         Ty::Unit => Layout::new(0, 1),
         Ty::Prim(p) => prim_layout(p)?,
@@ -155,13 +207,13 @@ pub fn layout_of(info: &TypeInfo, auto: &HashSet<String>, ty: &Ty) -> Option<Lay
         // A value array lowers to `struct { T a[N]; }`: N elements, the element's
         // alignment, and no padding beyond what the element already carries.
         Ty::Array { elem, len } => {
-            let e = layout_of(info, auto, elem)?;
+            let e = layout_of(info, m, elem)?;
             Layout::new(e.size * (*len as u64), e.align)
         }
-        Ty::Named(i) => named_layout(info, auto, *i)?,
+        Ty::Named(i) => named_layout(info, m, *i)?,
         // A `T !E` result carries an ok-value, a tag and an error code.
         Ty::Result(inner) => {
-            let ok = layout_of(info, auto, inner)?;
+            let ok = layout_of(info, m, inner)?;
             aggregate(&[Layout::scalar(1), ok, Layout::scalar(4)]).0
         }
         // Generic instances, opaque names, type-valued and task types: not knowable
@@ -177,17 +229,29 @@ pub fn layout_of(info: &TypeInfo, auto: &HashSet<String>, ty: &Ty) -> Option<Lay
 }
 
 /// The layout of a declared type by table index.
-fn named_layout(info: &TypeInfo, auto: &HashSet<String>, idx: usize) -> Option<Layout> {
+fn named_layout(info: &TypeInfo, m: &Model, idx: usize) -> Option<Layout> {
     let decl = info.table.types.get(idx)?;
     match &decl.kind {
         TypeKindG::Struct { fields } => {
             let mut ls = Vec::with_capacity(fields.len());
             for (_, t) in fields {
-                ls.push(layout_of(info, auto, t)?);
+                ls.push(layout_of(info, m, t)?);
+            }
+            // A union's members OVERLAP: they all start at offset 0, so its size is the
+            // widest member (padded to the strictest alignment), never their sum. The
+            // table cannot tell one from a struct — `TypeKindG` has no union arm — so
+            // this is the one place the declaration form has to be consulted.
+            if m.unions.contains(&decl.name) {
+                let mut u = Layout::new(0, 1);
+                for l in &ls {
+                    u.size = u.size.max(l.size);
+                    u.align = u.align.max(l.align);
+                }
+                return Some(Layout::new(align_to(u.size, u.align), u.align));
             }
             // A reordered struct is laid out in the order the backend will emit it,
             // which is the only reason its size can differ from the declared one.
-            if auto.contains(&decl.name) {
+            if m.auto.contains(&decl.name) {
                 let aligns: Vec<u64> = ls.iter().map(|l| l.align).collect();
                 ls = auto_order(&aligns).into_iter().map(|k| ls[k]).collect();
             }
@@ -196,11 +260,16 @@ fn named_layout(info: &TypeInfo, auto: &HashSet<String>, idx: usize) -> Option<L
         // A tagged enum is `{ tag; union { payloads } }`: the union takes the widest
         // payload and the strictest alignment, and the whole thing is padded to that.
         TypeKindG::Enum { variants } => {
+            // …unless it is **niche-optimized**, in which case there is no tag and no
+            // union at all — the enum *is* the pointer. See `is_niche_enum`.
+            if is_niche_enum(variants) {
+                return Some(Layout::scalar(PTR));
+            }
             let mut payload = Layout::new(0, 1);
             for (_, ts) in variants {
                 let mut ls = Vec::with_capacity(ts.len());
                 for t in ts {
-                    ls.push(layout_of(info, auto, t)?);
+                    ls.push(layout_of(info, m, t)?);
                 }
                 let (l, _) = aggregate(&ls);
                 payload.size = payload.size.max(l.size);
@@ -209,7 +278,7 @@ fn named_layout(info: &TypeInfo, auto: &HashSet<String>, idx: usize) -> Option<L
             Some(aggregate(&[Layout::scalar(4), payload]).0)
         }
         // `distinct` is a zero-cost nominal wrapper: the base's layout exactly.
-        TypeKindG::Distinct { base } => layout_of(info, auto, base),
+        TypeKindG::Distinct { base } => layout_of(info, m, base),
     }
 }
 
@@ -323,15 +392,211 @@ pub fn field_order(
     };
     // The ordering needs only each field's ALIGNMENT, and alignment is
     // order-invariant — an aggregate's alignment is the max over its components, which
-    // no permutation changes. So this may ask for layouts under the empty auto-set
-    // without first knowing which structs are reordered, which is what breaks the
-    // circularity between `auto_types` and `field_order`.
-    let none = HashSet::new();
+    // neither a permutation nor a union's overlap changes. So this may ask for layouts
+    // under an EMPTY model, without first knowing which structs are reordered, which is
+    // what breaks the circularity between `Model::of` and `field_order`.
+    let none = Model::default();
     let mut aligns = Vec::with_capacity(fields.len());
     for (_, t) in fields {
         aligns.push(layout_of(info, &none, t)?.align);
     }
     Some(auto_order(&aligns))
+}
+
+// ── The AST-side model — the same rules, resolved without a checked type table ──
+
+/// How deep a component chain may nest before the model gives up.
+///
+/// A totality bound, not a capacity limit. A struct cannot contain itself by value in a
+/// well-typed program, but the comptime interpreter runs on an AST that has not been
+/// type-checked yet, so it can be handed one that does — and a compiler that hangs is
+/// worse than one that declines.
+const AST_DEPTH: u32 = 32;
+
+/// The layout of an AST type node, or `None` when it is not knowable from the declared
+/// shape — a generic instance, an unresolved name, a `dyn` fat pointer.
+///
+/// ## Why this exists beside [`layout_of`]
+/// The comptime interpreter is constructed from the **AST alone** (`Interp::new(ast)`),
+/// because it runs during type checking — it answers array lengths, so it cannot depend
+/// on the table type checking is still building. `layout_of` reads a resolved [`Ty`] and
+/// therefore cannot serve it.
+///
+/// What is duplicated here is only the **traversal**: name resolution walks the AST's
+/// items instead of the table's rows. Every actual *rule* — the primitive widths
+/// (`prim_layout`), sequential placement at natural alignment (`aggregate`), tail
+/// padding (`align_to`), and the `@layout(auto)` permutation (`auto_order`) — is the
+/// same code. And the two front ends are pinned against each other by
+/// `the_two_layout_models_agree`, so a rule added to one and forgotten in the other is a
+/// test failure rather than a compiler that answers `@size_of(T)` and `sizeof(T)`
+/// differently.
+pub fn ast_layout_of(ast: &Ast, tyid: TypeId, depth: u32) -> Option<Layout> {
+    if depth == 0 {
+        return None;
+    }
+    Some(match &ast.type_at(tyid).kind {
+        TypeKind::Name(n) => match prim_layout(&n.name) {
+            Some(l) => l,
+            None => ast_named_layout(ast, &n.name, depth - 1)?,
+        },
+        TypeKind::Ptr { .. } | TypeKind::RegionRef { .. } | TypeKind::Fn { .. } => {
+            Layout::scalar(PTR)
+        }
+        TypeKind::Slice(_) | TypeKind::GenRef(_) => Layout::new(2 * PTR, PTR),
+        TypeKind::Array { len, elem } => {
+            let e = ast_layout_of(ast, *elem, depth - 1)?;
+            // The length is an ordinary comptime expression, so it goes through the same
+            // interpreter every other array length does.
+            let n = Interp::new(ast).eval_usize(*len).ok()? as u64;
+            Layout::new(e.size * n, e.align)
+        }
+        // A generic instance, a module-qualified type, `dyn`, `type`, or an error node:
+        // not knowable from this file's declarations alone. Reported as unknown rather
+        // than guessed — the caller then refuses, which is the only answer that keeps
+        // `@size_of` honest.
+        TypeKind::App { .. }
+        | TypeKind::Path { .. }
+        | TypeKind::Dyn(_)
+        | TypeKind::TypeKw
+        | TypeKind::Error => return None,
+    })
+}
+
+/// The layout of a type named directly in source — a primitive, or a type declared in
+/// this file. The entry point `@size_of(T)` / `@align_of(T)` use, so that a primitive
+/// answers without needing a declaration, exactly as `@type_name` does.
+pub fn ast_layout_by_name(ast: &Ast, name: &str) -> Option<Layout> {
+    prim_layout(name).or_else(|| ast_named_layout(ast, name, AST_DEPTH))
+}
+
+/// The layout of a type *declared in this file*, by name.
+pub fn ast_named_layout(ast: &Ast, name: &str, depth: u32) -> Option<Layout> {
+    if depth == 0 {
+        return None;
+    }
+    for item in &ast.items {
+        match item {
+            Item::Struct { name: n, body, attrs, is_union, .. } if n.name == name => {
+                // A union's members overlap: its size is the widest and its alignment
+                // the strictest, with tail padding to that.
+                let fields = ast_struct_fields(ast, body, attrs, *is_union, depth)?;
+                if *is_union {
+                    let mut l = Layout::new(0, 1);
+                    for (_, f) in &fields {
+                        l.size = l.size.max(f.size);
+                        l.align = l.align.max(f.align);
+                    }
+                    return Some(Layout::new(align_to(l.size, l.align), l.align));
+                }
+                let ls: Vec<Layout> = fields.iter().map(|(_, l)| *l).collect();
+                return Some(aggregate(&ls).0);
+            }
+            Item::Enum(e) if e.name.name == name => {
+                // A generic template is not a type until it is instantiated.
+                if !e.type_params.is_empty() {
+                    return None;
+                }
+                // The niche shape, read off the AST rather than the table — the same
+                // two-variant / one-nullary / one-thin-pointer rule `is_niche_enum`
+                // applies, and it must agree or `@size_of` and `sizeof` diverge.
+                if e.variants.len() == 2 {
+                    let mut nullary = false;
+                    let mut pointer = false;
+                    for v in &e.variants {
+                        match v.fields.as_slice() {
+                            [] => nullary = true,
+                            [(_, fty)] => {
+                                pointer = matches!(
+                                    ast.type_at(*fty).kind,
+                                    TypeKind::Ptr { .. } | TypeKind::RegionRef { .. }
+                                )
+                            }
+                            _ => {}
+                        }
+                    }
+                    if nullary && pointer {
+                        return Some(Layout::scalar(PTR));
+                    }
+                }
+                let mut payload = Layout::new(0, 1);
+                for v in &e.variants {
+                    let mut ls = Vec::new();
+                    for (_, fty) in &v.fields {
+                        ls.push(ast_layout_of(ast, *fty, depth - 1)?);
+                    }
+                    let (l, _) = aggregate(&ls);
+                    payload.size = payload.size.max(l.size);
+                    payload.align = payload.align.max(l.align);
+                }
+                return Some(aggregate(&[Layout::scalar(4), payload]).0);
+            }
+            Item::Distinct(d) if d.name.name == name => {
+                return ast_layout_of(ast, d.base, depth - 1);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A struct's fields in **emission order**, each with its layout — the input both the
+/// size computation and `@offset_of` need.
+///
+/// `None` when any field's layout is unknowable, or when the struct declares bit-fields:
+/// their packing is implementation-defined in C, so the model refuses to state an offset
+/// rather than stating a wrong one. That is the same admitted gap `bitfield_types`
+/// records, arriving here as a refusal instead of an `(incomplete)` marker because a
+/// *value* has nowhere to carry the caveat.
+fn ast_struct_fields(
+    ast: &Ast,
+    body: &crate::ast::StructBody,
+    attrs: &[Attribute],
+    is_union: bool,
+    depth: u32,
+) -> Option<Vec<(String, Layout)>> {
+    let mut out = Vec::new();
+    for m in &body.members {
+        if let StructMember::Field { name, ty, bits, .. } = m {
+            if bits.is_some() {
+                return None;
+            }
+            out.push((name.name.clone(), ast_layout_of(ast, *ty, depth - 1)?));
+        }
+    }
+    // A union has no order to choose, and `@layout(auto)` on one is already a compile
+    // error — so the permutation applies to structs only.
+    if !is_union && wants_auto(ast, attrs) {
+        let aligns: Vec<u64> = out.iter().map(|(_, l)| l.align).collect();
+        out = auto_order(&aligns).into_iter().map(|k| out[k].clone()).collect();
+    }
+    Some(out)
+}
+
+/// The byte offset of `field` within struct `name`, or `None` if either is unknown.
+///
+/// Offsets are computed over **emission** order, so a `@layout(auto)` struct reports
+/// where the field really is. That is not a nicety: `@offset_of` exists to be handed to
+/// something that will index memory with it.
+pub fn ast_offset_of(ast: &Ast, name: &str, field: &str) -> Option<u64> {
+    for item in &ast.items {
+        if let Item::Struct { name: n, body, attrs, is_union, .. } = item {
+            if n.name != name {
+                continue;
+            }
+            let fields = ast_struct_fields(ast, body, attrs, *is_union, AST_DEPTH)?;
+            // Every member of a union starts at offset 0.
+            if *is_union {
+                return fields.iter().find(|(f, _)| f == field).map(|_| 0);
+            }
+            let ls: Vec<Layout> = fields.iter().map(|(_, l)| *l).collect();
+            let (_, offsets) = aggregate(&ls);
+            return fields
+                .iter()
+                .position(|(f, _)| f == field)
+                .map(|k| offsets[k]);
+        }
+    }
+    None
 }
 
 /// Names of structs declaring at least one **bit-field** (`flags: u8 : 3`).
@@ -368,14 +633,18 @@ fn bitfield_types(ast: &Ast) -> HashSet<String> {
 /// that described the source order would be describing a struct that no longer exists.
 pub fn compute(ast: &Ast, info: &TypeInfo) -> Vec<TypeLayout> {
     let bitfields = bitfield_types(ast);
-    let auto = auto_types(ast, info);
+    let m = Model::of(ast, info);
     let mut out = Vec::new();
     for (i, decl) in info.table.types.iter().enumerate() {
         // A generic template has no layout until it is instantiated.
         if !decl.type_params.is_empty() {
             continue;
         }
+        let is_union = m.unions.contains(&decl.name);
         let kind = match &decl.kind {
+            // A union is stored as an ordinary aggregate in the table, so its
+            // declaration form comes from the AST like its layout does.
+            TypeKindG::Struct { .. } if is_union => "union",
             TypeKindG::Struct { .. } if decl.is_record => "record",
             TypeKindG::Struct { .. } => "struct",
             TypeKindG::Enum { .. } => "enum",
@@ -386,12 +655,12 @@ pub fn compute(ast: &Ast, info: &TypeInfo) -> Vec<TypeLayout> {
         // is advisory from the start rather than after the fact.
         let mut incomplete = bitfields.contains(&decl.name);
 
-        let reordered = auto.contains(&decl.name);
+        let reordered = m.auto.contains(&decl.name);
 
         if let TypeKindG::Struct { fields: fs } = &decl.kind {
             let mut ls = Vec::with_capacity(fs.len());
             for (_, t) in fs {
-                match layout_of(info, &auto, t) {
+                match layout_of(info, &m, t) {
                     Some(l) => ls.push(l),
                     None => {
                         incomplete = true;
@@ -412,19 +681,21 @@ pub fn compute(ast: &Ast, info: &TypeInfo) -> Vec<TypeLayout> {
             let mut prev_end = 0u64;
             for (slot, &k) in order.iter().enumerate() {
                 let (name, t) = &fs[k];
+                // Every member of a union lives at offset 0 and none pads another.
+                let offset = if is_union { 0 } else { offsets[slot] };
                 fields.push(FieldLayout {
                     name: name.clone(),
                     ty: t.display(&info.table),
-                    offset: offsets[slot],
+                    offset,
                     size: ls[k].size,
                     align: ls[k].align,
-                    pad_before: offsets[slot] - prev_end,
+                    pad_before: if is_union { 0 } else { offsets[slot] - prev_end },
                 });
-                prev_end = offsets[slot] + ls[k].size;
+                prev_end = offset + ls[k].size;
             }
         }
 
-        let (size, align) = match named_layout(info, &auto, i) {
+        let (size, align) = match named_layout(info, &m, i) {
             Some(l) => (l.size, l.align),
             None => {
                 incomplete = true;
@@ -436,7 +707,13 @@ pub fn compute(ast: &Ast, info: &TypeInfo) -> Vec<TypeLayout> {
         // `distinct` is by definition its base (nothing is lost), and an enum's slack
         // belongs to the union rather than to any one variant, so neither reports a
         // number here rather than reporting a misleading one.
-        let waste = if matches!(decl.kind, TypeKindG::Struct { .. }) {
+        // A union's members overlap, so the sum of their sizes is not "bytes used" and
+        // subtracting it would report a nonsense (often saturated-to-zero) number. Its
+        // only slack is the tail padding past its widest member.
+        let waste = if is_union {
+            let widest: u64 = fields.iter().map(|f| f.size).max().unwrap_or(0);
+            size.saturating_sub(widest)
+        } else if matches!(decl.kind, TypeKindG::Struct { .. }) {
             let used: u64 = fields.iter().map(|f| f.size).sum();
             size.saturating_sub(used)
         } else {
@@ -578,6 +855,48 @@ mod tests {
         let e = by_name(&ls, "E");
         // tag(4) + pad(4) + widest payload(8) = 16, aligned to 8.
         assert_eq!((e.size, e.align), (16, 8));
+    }
+
+    /// A **niche-optimized** enum is the pointer, not a tag plus the pointer. The model
+    /// has to know, because the backend already emits it that way: reporting 16 for a
+    /// type that occupies 8 would make `@size_of` disagree with `sizeof` in one program.
+    #[test]
+    fn a_niche_optimized_enum_is_just_its_pointer() {
+        let ls = layouts_of("enum Maybe { none, some(p: *mut i32) }\n");
+        assert_eq!((by_name(&ls, "Maybe").size, by_name(&ls, "Maybe").align), (8, 8));
+        // A zero-cost region reference has the same null niche.
+        let r = layouts_of("enum R { nil, at(p: &[r]i32) }\n");
+        assert_eq!(by_name(&r, "R").size, 8);
+        // …but a FAT handle has no spare null: `&T` is `{ptr, gen}` and `[]T` is
+        // `{ptr, len}`, so these stay tagged (4 tag + 4 pad + 16 payload = 24).
+        let fat = layouts_of("enum F { none, some(s: []i32) }\n");
+        assert_eq!(by_name(&fat, "F").size, 24);
+        // Three variants disqualify it however pointer-shaped the payloads are.
+        let three = layouts_of("enum T3 { a, b(p: *mut i32), c(q: *mut i32) }\n");
+        assert_eq!(by_name(&three, "T3").size, 16);
+        // …and so does a non-pointer payload beside the nullary variant.
+        let ints = layouts_of("enum I { none, some(v: i64) }\n");
+        assert_eq!(by_name(&ints, "I").size, 16);
+    }
+
+    /// A `union`'s members overlap — its size is the widest, not their sum, and every
+    /// member is at offset 0. The table stores a union as an ordinary aggregate, so
+    /// without the declaration form the model laid its members out sequentially and
+    /// reported `union Bits { i: i32, f: f32 }` as 8 bytes with `f` at offset 4.
+    #[test]
+    fn a_union_overlaps_its_members_rather_than_summing_them() {
+        let ls = layouts_of("union Bits { i: i32, f: f32 }\n");
+        let b = by_name(&ls, "Bits");
+        assert_eq!((b.size, b.align), (4, 4));
+        assert!(b.fields.iter().all(|f| f.offset == 0), "every member starts at 0");
+        assert_eq!(b.kind, "union", "the report must name the declaration form");
+        assert_eq!(b.waste, 0);
+        // Mixed widths: the widest member decides, then tail padding to the alignment.
+        let m = layouts_of("union M { a: u8, b: u64, c: i32 }\n");
+        assert_eq!((by_name(&m, "M").size, by_name(&m, "M").align), (8, 8));
+        // …and a struct EMBEDDING a union sees the overlapped size, not the sum.
+        let e = layouts_of("union M { a: u8, b: u64, c: i32 }\nstruct S { m: M, tag: u8 }\n");
+        assert_eq!(by_name(&e, "S").size, 16);
     }
 
     #[test]

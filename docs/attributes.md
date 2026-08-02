@@ -248,8 +248,10 @@ remains, and no ordering can remove that.
 Nothing else about the program changes. A struct is constructed by field name
 (`Tidy { a: 1, … }` lowers to a C designated initializer) and read by field name, so
 reordering the *storage* is invisible to the code that uses it — which is exactly why
-the compiler is allowed to do it. `size_of` and `@offset_of` lower to C's own
-`sizeof`/`offsetof`, so they report the new layout without being taught about it.
+the compiler is allowed to do it. `size_of`/`offset_of` lower to C's own
+`sizeof`/`offsetof`, so they report the new layout without being taught about it, and
+their comptime twins `@size_of`/`@offset_of` compute it from the same model — so a
+folded constant and a C expression cannot disagree about where a field is.
 
 It is **opt-in per struct**: nothing you did not annotate moves a byte. And the
 annotation is **checked** rather than advisory — each of these is a compile error, not a

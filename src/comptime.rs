@@ -958,6 +958,9 @@ impl<'a> Interp<'a> {
             if is_reflect_intrinsic(&name) {
                 return self.eval_reflect(&name, args, span, env);
             }
+            if is_layout_intrinsic(&name) {
+                return self.eval_layout(&name, args, span, env);
+            }
             return Err(EvalError::new(format!("`@{name}` is not a compile-time query"), span));
         }
         let ExprKind::Name(n) = &self.ast.expr_at(callee).kind else {
@@ -1104,6 +1107,94 @@ impl<'a> Interp<'a> {
             // reflected type name can never disagree with the documented one.
             _ => Ok(Value::Str(crate::doc::ty_str(self.ast, fty))),
         }
+    }
+}
+
+/// The three layout queries: `@size_of(T)`, `@align_of(T)`, `@offset_of(T, field)`.
+///
+/// ## Why these are `@`-prefixed and the bare names still exist
+/// `size_of(T)`, `align_of(T)` and `offset_of(T, f)` already exist as **C-deferred**
+/// intrinsics: they lower to `sizeof`, `_Alignof` and `offsetof`, so the C compiler
+/// answers them and this one never learns the numbers. Those are untouched — every
+/// program that uses them emits exactly the C it emitted before, which is what keeps the
+/// corpus, the concat, the seed and every attested hash byte-identical.
+///
+/// The `@` forms are a genuinely different thing: a **value this compiler computes**,
+/// available where C's `sizeof` cannot go — in a `const`, in an array length, in a
+/// `comptime` block, in arithmetic that must fold before C ever sees it:
+///
+/// ```jestyr
+/// const SLOT: i64 = @size_of(Header) + @size_of(Payload)
+/// var buf: [@size_of(Frame)]u8 = [0; @size_of(Frame)]
+/// ```
+///
+/// So the two spellings are not redundant, and the split is the honest one: the bare
+/// name means *ask C*, the `@` name means *the compiler knows*. (The `@` namespace is
+/// also collision-proof, which is why tier 3's reflection lives there — see
+/// `is_reflect_intrinsic`.)
+///
+/// This is the gap `docs/ctfe-tiers.md` recorded against tier 3, and it needed
+/// workstream **L** to close: the numbers come from `layout.rs`, so a comptime
+/// `@size_of` and a runtime `sizeof` cannot disagree unless the layout model itself is
+/// wrong — which `layout_matches_c_sizeof` makes gcc the judge of.
+pub fn is_layout_intrinsic(name: &str) -> bool {
+    matches!(name, "size_of" | "align_of" | "offset_of")
+}
+
+impl<'a> Interp<'a> {
+    /// Evaluate a layout query against the compiler's own model.
+    ///
+    /// Every unknowable case is an **error, not a zero**. A `@size_of` that quietly
+    /// answered 0 for a generic instance would produce a program that compiles, links,
+    /// and corrupts memory — the exact failure mode G1 closed when a non-literal array
+    /// length was silently becoming `[0]T`.
+    fn eval_layout(&mut self, name: &str, args: &[ExprId], span: Span, env: &mut Env) -> EvalResult {
+        // The first argument is a TYPE named directly, exactly as it is for reflection
+        // and for the bare `size_of(T)` this shadows.
+        let Some(&first) = args.first() else {
+            return Err(EvalError::new(format!("`@{name}` needs a type as its first argument"), span));
+        };
+        let ExprKind::Name(tn) = &self.ast.expr_at(first).kind else {
+            return Err(EvalError::new(
+                format!("`@{name}`'s first argument must be a named type"),
+                self.ast.expr_at(first).span,
+            ));
+        };
+        let tname = tn.name.clone();
+        let tspan = self.ast.expr_at(first).span;
+
+        if name == "offset_of" {
+            // The second argument is a bare FIELD NAME, not an expression — the same
+            // shape the C-deferred `offset_of(Point, y)` takes.
+            let Some(&f) = args.get(1) else {
+                return Err(EvalError::new("`@offset_of` needs a field name as its second argument", span));
+            };
+            let ExprKind::Name(fnm) = &self.ast.expr_at(f).kind else {
+                return Err(EvalError::new(
+                    "`@offset_of`'s second argument must be a field name",
+                    self.ast.expr_at(f).span,
+                ));
+            };
+            return match crate::layout::ast_offset_of(self.ast, &tname, &fnm.name) {
+                Some(off) => Ok(Value::Int(off as i64)),
+                None => Err(EvalError::new(
+                    format!("the offset of `{tname}.{}` is not knowable at compile time", fnm.name),
+                    span,
+                )),
+            };
+        }
+
+        // `env` is unused by the two type-only queries, but taking it keeps the
+        // signature uniform with `eval_reflect` and lets an indexed query be added
+        // later without a churn of call sites.
+        let _ = env;
+        let Some(l) = crate::layout::ast_layout_by_name(self.ast, &tname) else {
+            return Err(EvalError::new(
+                format!("the layout of `{tname}` is not knowable at compile time"),
+                tspan,
+            ));
+        };
+        Ok(Value::Int(if name == "size_of" { l.size as i64 } else { l.align as i64 }))
     }
 }
 
@@ -1723,6 +1814,93 @@ const A: i64 = comptime { TABLE[5] + TABLE.len }
         // A repeat count that is not a count.
         let e5 = err_of("const A: [2]i64 = [1; true]\n");
         assert!(e5.contains("repeat count"), "{e5}");
+    }
+
+    // ── the layout queries (workstream L, closing tier 3's recorded gap) ─────────
+
+    /// `@size_of` / `@align_of` / `@offset_of` are answered by **this** compiler, from
+    /// its own layout model, so they are values rather than C expressions.
+    #[test]
+    fn the_layout_queries_fold_to_numbers() {
+        let s = "struct Header { magic: u8, length: u64, flags: u8 }\n";
+        // 1 + 7 pad + 8 + 1 + 7 tail = 24.
+        assert_eq!(int_of(&format!("{s}const A: i64 = @size_of(Header)\n")), 24);
+        assert_eq!(int_of(&format!("{s}const A: i64 = @align_of(Header)\n")), 8);
+        assert_eq!(int_of(&format!("{s}const A: i64 = @offset_of(Header, length)\n")), 8);
+        assert_eq!(int_of(&format!("{s}const A: i64 = @offset_of(Header, flags)\n")), 16);
+        // A primitive answers without any declaration, exactly as `@type_name` does.
+        assert_eq!(int_of("const A: i64 = @size_of(i32)\n"), 4);
+        assert_eq!(int_of("const A: i64 = @size_of(str)\n"), 16);
+        assert_eq!(int_of("const A: i64 = @align_of(bool)\n"), 1);
+        // An enum is its tag plus its widest payload; a `distinct` is its base exactly.
+        assert_eq!(int_of("enum E { none, some(v: i64) }\nconst A: i64 = @size_of(E)\n"), 16);
+        assert_eq!(int_of("distinct Id = u16\nconst A: i64 = @size_of(Id)\n"), 2);
+        // A union's members overlap — the bug the two-model cross-check caught.
+        assert_eq!(int_of("union B { i: i32, f: f32 }\nconst A: i64 = @size_of(B)\n"), 4);
+        assert_eq!(int_of("union B { i: i32, f: f32 }\nconst A: i64 = @offset_of(B, f)\n"), 0);
+    }
+
+    /// **The point of the feature**: these are usable where C's `sizeof` cannot go —
+    /// in a `const`, in arithmetic that must fold, inside a `comptime` block, and as an
+    /// array length. The bare `size_of(T)` lowers to a C expression and so can do none
+    /// of these; that is why both spellings exist rather than one replacing the other.
+    #[test]
+    fn a_layout_query_is_a_real_compile_time_value() {
+        let s = "struct A { x: u8, y: u64 }\nstruct B { p: *mut i32 }\n";
+        assert_eq!(int_of(&format!("{s}const N: i64 = @size_of(A) + @size_of(B)\n")), 24);
+        assert_eq!(
+            int_of(&format!("{s}const N: i64 = comptime {{ @size_of(A) / @align_of(A) }}\n")),
+            2
+        );
+        // Through a const chain, and through a comptime `for`.
+        assert_eq!(
+            int_of(&format!(
+                "{s}const W: i64 = @size_of(A)\nconst N: i64 = comptime {{\n  var t = 0\n  for i in 0..4 {{ t += W }}\n  t\n}}\n"
+            )),
+            64
+        );
+    }
+
+    /// `@offset_of` reports where the field **actually is**, which for a reordered
+    /// struct is not where it was written. Anything else would be worse than useless:
+    /// the query exists to be handed to something that will index memory with it.
+    #[test]
+    fn a_layout_query_follows_the_emitted_order() {
+        let s = "@layout(auto) struct T { a: u8, b: u64, c: i32 }\n";
+        assert_eq!(int_of(&format!("{s}const A: i64 = @size_of(T)\n")), 16);
+        // Emission order is b(0), c(8), a(12) — not the declared a, b, c.
+        assert_eq!(int_of(&format!("{s}const A: i64 = @offset_of(T, b)\n")), 0);
+        assert_eq!(int_of(&format!("{s}const A: i64 = @offset_of(T, c)\n")), 8);
+        assert_eq!(int_of(&format!("{s}const A: i64 = @offset_of(T, a)\n")), 12);
+        // …and a struct embedding it sees the smaller size.
+        let n = "@layout(auto) struct T { a: u8, b: u64, c: i32 }\nstruct N { t: T, tag: u8 }\n";
+        assert_eq!(int_of(&format!("{n}const A: i64 = @size_of(N)\n")), 24);
+    }
+
+    /// **Every unknowable case is an error, never a zero.** A `@size_of` that quietly
+    /// answered 0 for a generic instance would produce a program that compiles, links,
+    /// and corrupts memory — the exact failure G1 closed when a non-literal array length
+    /// was silently becoming `[0]T`.
+    #[test]
+    fn an_unknowable_layout_is_refused_not_guessed() {
+        // A generic template: not a type at all until it is instantiated.
+        let e = err_of("enum Opt(T) { none, some(v: T) }\nconst A: i64 = @size_of(Opt)\n");
+        assert!(e.contains("not knowable"), "{e}");
+        // A name that is not declared anywhere.
+        let e2 = err_of("const A: i64 = @size_of(Nope)\n");
+        assert!(e2.contains("not knowable"), "{e2}");
+        // Bit-fields: implementation-defined packing, so no offset may be stated.
+        let e3 = err_of("struct P { a: u8 : 1, b: u8 : 3 }\nconst A: i64 = @offset_of(P, b)\n");
+        assert!(e3.contains("not knowable"), "{e3}");
+        // A field that does not exist.
+        let e4 = err_of("struct S { a: u8 }\nconst A: i64 = @offset_of(S, nope)\n");
+        assert!(e4.contains("not knowable"), "{e4}");
+        // The argument must be a type name, not a value expression.
+        let e5 = err_of("const A: i64 = @size_of(1 + 1)\n");
+        assert!(e5.contains("named type"), "{e5}");
+        // …and `@offset_of` needs a bare field name as its second argument.
+        let e6 = err_of("struct S { a: u8 }\nconst A: i64 = @offset_of(S)\n");
+        assert!(e6.contains("field name"), "{e6}");
     }
 
     /// **Totality over aggregates.** The fuel budget is spent per element, so a repeat
