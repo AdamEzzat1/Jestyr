@@ -116,9 +116,136 @@ impl Diagnostic {
     }
 }
 
+/// Escape a string as a JSON string **body** (without the surrounding quotes).
+///
+/// Hand-written because the compiler has zero runtime dependencies, and correct
+/// because the input is not ours: a diagnostic message quotes user identifiers and
+/// source text, so it can contain quotes, backslashes, newlines and control bytes.
+/// Anything that escapes unescaped produces malformed JSON, which is worse than no
+/// JSON at all — a consumer would fail to parse the whole report rather than one
+/// message.
+///
+/// Non-ASCII passes through: JSON is UTF-8 by definition, and Rust `str` is already
+/// valid UTF-8, so `\u` encoding it would only make the output larger and less
+/// readable. `DEL` (0x7F) is *not* a JSON control character and is left alone.
+fn json_escape(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // The remaining C0 controls have no short form and MUST be escaped —
+            // a raw one inside a JSON string is a parse error.
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+/// One diagnostic as a JSON object, already resolved to a file and a position.
+///
+/// Positions are **1-based line/column**, matching what the human renderer prints and
+/// what every editor expects. `end_line`/`end_col` describe the span's end, so a
+/// consumer can underline exactly what the caret renderer underlines.
+pub fn to_json(
+    d: &Diagnostic,
+    path: &str,
+    src: &str,
+    severity: Severity,
+    out: &mut String,
+) {
+    let start = line_col(src, d.span.start);
+    let end = line_col(src, d.span.end);
+    out.push_str("{\"severity\":\"");
+    out.push_str(severity.label());
+    out.push_str("\",\"message\":\"");
+    json_escape(&d.message, out);
+    out.push_str("\",\"file\":\"");
+    // Normalized to forward slashes so a report is identical on every platform —
+    // the same normalization `#line` emission does, and for the same reason: this
+    // output is compared, hashed and checked into CI.
+    json_escape(&path.replace('\\', "/"), out);
+    out.push_str(&format!(
+        "\",\"line\":{},\"col\":{},\"endLine\":{},\"endCol\":{}",
+        start.line, start.col, end.line, end.col
+    ));
+    match d.code {
+        Some(c) => {
+            out.push_str(",\"code\":\"");
+            json_escape(c, out);
+            out.push('"');
+        }
+        // Explicit `null` rather than an absent key: a consumer can then read the
+        // field unconditionally, and the object shape is the same for every entry.
+        None => out.push_str(",\"code\":null"),
+    }
+    match &d.help {
+        Some(h) => {
+            out.push_str(",\"help\":\"");
+            json_escape(h, out);
+            out.push('"');
+        }
+        None => out.push_str(",\"help\":null"),
+    }
+    out.push('}');
+}
+
+/// The schema version of the JSON diagnostic report.
+///
+/// Emitted in every report so a consumer can refuse a format it does not understand.
+/// Bump it for any change that is not purely additive.
+pub const JSON_SCHEMA_VERSION: u32 = 1;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_escapes_everything_that_would_break_a_parser() {
+        let mut s = String::new();
+        json_escape("a\"b\\c\nd\te\rf\u{1}g", &mut s);
+        assert_eq!(s, "a\\\"b\\\\c\\nd\\te\\rf\\u0001g");
+        // Non-ASCII is valid JSON as-is and stays readable.
+        let mut u = String::new();
+        json_escape("héllo → 世界", &mut u);
+        assert_eq!(u, "héllo → 世界");
+        // …and nothing that must be escaped survives unescaped.
+        let mut all = String::new();
+        json_escape(&(0u32..0x20).filter_map(char::from_u32).collect::<String>(), &mut all);
+        assert!(!all.chars().any(|c| (c as u32) < 0x20), "a raw control byte survived: {all:?}");
+    }
+
+    #[test]
+    fn a_json_diagnostic_carries_position_and_optional_fields() {
+        let src = "fn f() {\n    p.z\n}";
+        let d = Diagnostic::new("no field `z`", Span::new(13, 16));
+        let mut out = String::new();
+        to_json(&d, "t.jtr", src, Severity::Error, &mut out);
+        assert!(out.contains("\"severity\":\"error\""), "{out}");
+        assert!(out.contains("\"line\":2,\"col\":5,\"endLine\":2,\"endCol\":8"), "{out}");
+        // Absent optionals are explicit nulls, so the object shape never varies.
+        assert!(out.contains("\"code\":null"), "{out}");
+        assert!(out.contains("\"help\":null"), "{out}");
+
+        let d = d.with_code("E0001").with_help("did you mean `x`?");
+        let mut out = String::new();
+        to_json(&d, "t.jtr", src, Severity::Error, &mut out);
+        assert!(out.contains("\"code\":\"E0001\""), "{out}");
+        assert!(out.contains("\"help\":\"did you mean `x`?\""), "{out}");
+    }
+
+    /// A Windows path must not leak backslashes into the report — they would both
+    /// need escaping and make the output host-dependent.
+    #[test]
+    fn json_paths_are_normalized() {
+        let mut out = String::new();
+        to_json(&Diagnostic::new("x", Span::new(0, 1)), "a\\b\\c.jtr", "x", Severity::Error, &mut out);
+        assert!(out.contains("\"file\":\"a/b/c.jtr\""), "{out}");
+    }
 
     #[test]
     fn renders_a_caret_under_the_span() {

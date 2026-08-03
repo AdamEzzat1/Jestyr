@@ -328,6 +328,11 @@ fn run() -> ExitCode {
     // with a `/* drop … */` comment, so the implicit RAII glue is inspectable.
     let show_drops = args.iter().any(|a| a == "--show-drops");
 
+    // `check <file> --json` emits one machine-readable diagnostic report on stdout
+    // instead of the human caret rendering — for editors, CI and any tool that would
+    // otherwise have to parse `error: …` prose.
+    let json = args.iter().any(|a| a == "--json");
+
     // Subcommands that take a file argument.
     let sub = |name: &str, m: Mode| -> Option<Result<(Mode, String), ()>> {
         if args.get(1).map(String::as_str) == Some(name) {
@@ -509,11 +514,23 @@ fn run() -> ExitCode {
                 let (info, type_diags) = typeck::check_program(&prog.ast, &prog.modules);
                 let mut sema = type_diags;
                 sema.extend(escape::check(&prog.ast, &info));
-                if sema.is_empty() {
-                    println!("ok: no type or ownership errors in {path}");
-                    return ExitCode::SUCCESS;
-                }
                 diags = sema;
+            }
+            // `--json`: one machine-readable report on **stdout**, for editors and CI.
+            // Always emitted, even when the program is clean (an empty `diagnostics`
+            // array), so a consumer never has to distinguish "no output" from "the tool
+            // did not run". The exit code still says whether it succeeded.
+            if json {
+                print!("{}", prog.modules.render_json(&diags));
+                return if diags.iter().any(|d| d.is_error()) {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                };
+            }
+            if diags.is_empty() {
+                println!("ok: no type or ownership errors in {path}");
+                return ExitCode::SUCCESS;
             }
             report_program(&prog.modules, &diags)
         }
@@ -1012,6 +1029,7 @@ fn print_usage() {
     eprintln!("    jestyrc <file.jtr>          parse a file and print its AST   (default)");
     eprintln!("    jestyrc parse  <file.jtr>   same as above, explicitly");
     eprintln!("    jestyrc check  <file.jtr>   resolve, type-check, ownership-check");
+    eprintln!("                               (add --json for a machine-readable report)");
     eprintln!("    jestyrc emit-c <file.jtr>   lower to C and print it");
     eprintln!("    jestyrc build  <file.jtr>   lower to C and compile a native binary");
     eprintln!("    jestyrc run    <file.jtr>   build, then execute the binary");

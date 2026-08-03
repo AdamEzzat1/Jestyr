@@ -174,6 +174,42 @@ impl Modules {
         d.span = local;
         d.render(&self.srcs[r], &self.paths[r], severity)
     }
+
+    /// Render every diagnostic as one **machine-readable JSON report**
+    /// (`jestyrc check <file> --json`).
+    ///
+    /// Same span-to-region translation as [`Modules::render`], so a diagnostic is
+    /// attributed to the file that owns it rather than to the root — the whole point of
+    /// a machine-readable form is that a tool can jump straight to the right file.
+    ///
+    /// The output is a single object, not a bare array, so the format can gain
+    /// top-level fields (a summary, timings) without breaking a consumer, and it carries
+    /// a schema version for the same reason. Diagnostics keep their emission order,
+    /// which is the compiler's deterministic pass order — a tool that wants them sorted
+    /// can sort them, but a tool that wants to know what the compiler saw first cannot
+    /// recover that if we sort here.
+    pub fn render_json(&self, diags: &[Diagnostic]) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "{{\"version\":{},\"diagnostics\":[",
+            crate::diag::JSON_SCHEMA_VERSION
+        ));
+        for (i, d) in diags.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let r = self.region_of(d.span);
+            let base = self.bases[r];
+            let mut local = d.clone();
+            local.span = Span::new(
+                (d.span.start as usize).saturating_sub(base),
+                (d.span.end as usize).saturating_sub(base),
+            );
+            crate::diag::to_json(&local, &self.paths[r], &self.srcs[r], d.severity, &mut out);
+        }
+        out.push_str("]}\n");
+        out
+    }
 }
 
 /// The result of loading a program: the merged AST, the concatenated source, the

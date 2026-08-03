@@ -191,6 +191,98 @@ fn recursive_deep_shapes_report_on_the_worker_stack() {
     });
 }
 
+/// A minimal well-formedness check for a JSON document's **string literals**.
+///
+/// Written by hand because the compiler has no JSON dependency, and aimed at the one
+/// thing that can actually go wrong when emitting JSON without a library: a string body
+/// that was not escaped. It walks the document tracking whether it is inside a string,
+/// and rejects an unterminated string, an illegal escape, or a raw control byte inside
+/// one — each of which makes the whole report unparseable for a consumer.
+///
+/// Returns the offending description, or `Ok(())`.
+fn json_strings_wellformed(s: &str) -> Result<(), String> {
+    let b: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    let mut in_str = false;
+    while i < b.len() {
+        let c = b[i];
+        if !in_str {
+            if c == '"' {
+                in_str = true;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' => in_str = false,
+            '\\' => {
+                let Some(&n) = b.get(i + 1) else {
+                    return Err("trailing backslash inside a string".into());
+                };
+                match n {
+                    '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' => {}
+                    'u' => {
+                        let hex: String = b.iter().skip(i + 2).take(4).collect();
+                        if hex.len() != 4 || !hex.chars().all(|h| h.is_ascii_hexdigit()) {
+                            return Err(format!("bad \\u escape: {hex:?}"));
+                        }
+                        i += 4;
+                    }
+                    other => return Err(format!("illegal escape `\\{other}`")),
+                }
+                i += 1;
+            }
+            c if (c as u32) < 0x20 => {
+                return Err(format!("raw control byte U+{:04X} inside a string", c as u32))
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if in_str {
+        Err("unterminated string".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// **The JSON diagnostic report is well-formed for every corpus program that has
+/// diagnostics.** The escaping is exercised by real messages — which quote user
+/// identifiers, type renderings and source text — rather than by invented ones.
+#[test]
+fn json_diagnostics_are_wellformed_over_the_corpus() {
+    let mut with_diags = 0;
+    for dir in ["examples", "examples/std"] {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("jtr") {
+                continue;
+            }
+            let prog = crate::module::load(p.to_str().unwrap());
+            let mut diags = prog.diags.clone();
+            if diags.is_empty() {
+                let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+                diags = td;
+                diags.extend(crate::escape::check(&prog.ast, &info));
+            }
+            let json = prog.modules.render_json(&diags);
+            json_strings_wellformed(&json)
+                .unwrap_or_else(|e| panic!("{}: malformed JSON report: {e}\n{json}", p.display()));
+            assert!(json.starts_with("{\"version\":1,\"diagnostics\":["), "{}", p.display());
+            assert!(json.ends_with("]}\n"), "{}", p.display());
+            // The report is deterministic — it is meant to be diffed and checked in.
+            assert_eq!(json, prog.modules.render_json(&diags));
+            if !diags.is_empty() {
+                with_diags += 1;
+            }
+        }
+    }
+    // The corpus deliberately contains files that fail to check (`typeerr.jtr`,
+    // `match_check.jtr`, …). If none produced a diagnostic, this test is vacuous.
+    assert!(with_diags >= 3, "only {with_diags} corpus files produced diagnostics");
+}
+
 mod prop {
     use super::*;
     use proptest::prelude::*;
@@ -212,6 +304,29 @@ mod prop {
         #[test]
         fn pipeline_is_total(s in ".{0,400}") {
             run_pipeline(&s);
+        }
+
+        /// **A diagnostic renders to well-formed JSON whatever it says.**
+        ///
+        /// Message and help text are not the compiler's own: they quote user
+        /// identifiers, rendered types and source excerpts, so they can contain
+        /// quotes, backslashes, newlines and control bytes. One unescaped character
+        /// makes the *entire* report unparseable — a consumer loses every diagnostic,
+        /// not one — which is why this is a property over arbitrary strings rather
+        /// than a few hand-picked cases.
+        #[test]
+        fn a_diagnostic_always_renders_valid_json(msg in ".{0,120}", help in ".{0,80}") {
+            let src = "fn f() {}\n";
+            let d = crate::diag::Diagnostic::new(msg, crate::span::Span::new(3, 4))
+                .with_help(help);
+            let mut out = String::new();
+            crate::diag::to_json(&d, "t.jtr", src, crate::diag::Severity::Error, &mut out);
+            prop_assert!(json_strings_wellformed(&out).is_ok(), "malformed: {}", out);
+            // …and the object is still shaped like one. (Bound first: `prop_assert!`
+            // stringifies the expression into a format string, where a literal brace
+            // would be read as a placeholder.)
+            let shaped = out.starts_with('{') && out.ends_with('}');
+            prop_assert!(shaped, "not a JSON object: {}", out);
         }
 
         /// **Deeply-nested expressions error, they don't crash.** For any depth
@@ -10416,6 +10531,173 @@ fn main() -> i32 {
             "the self-built compiler emits different C"
         );
         eprintln!("SELF-BUILD: jc compiled itself from its multi-file sources via its own loader + driver");
+    }
+
+    /// Replace every **offset-derived symbol suffix** with a placeholder, so two builds
+    /// can be compared on everything else.
+    ///
+    /// `concurrent { spawn … }` mints two symbols per task — the thread entry function
+    /// `jestyr_task_<N>` and its argument struct `struct _jsp_<N>` — where `N` is the
+    /// task body's byte offset **in the merged source buffer**. That is a property of
+    /// how the loader concatenated the files, not of the program, so the two loaders
+    /// disagree on it by a constant. See the divergence notes on the golden below.
+    fn normalize_task_names(line: &str) -> String {
+        let mut out = line.to_string();
+        for prefix in ["jestyr_task_", "_jsp_"] {
+            let mut acc = String::new();
+            let mut rest = out.as_str();
+            while let Some(at) = rest.find(prefix) {
+                acc.push_str(&rest[..at + prefix.len()]);
+                rest = &rest[at + prefix.len()..];
+                let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+                acc.push('N');
+                rest = &rest[digits..];
+            }
+            acc.push_str(rest);
+            out = acc;
+        }
+        out
+    }
+
+    /// **The MODULE-path C golden — and the three divergences it turned up.**
+    ///
+    /// Every existing cgen golden compares the *single-file* path (`typeck::check`, whose
+    /// `DebugInfo` is empty), so **nothing has ever checked the C the module loader
+    /// produces** — the path `jestyrc build`, `jestyrc emit-c` and `jc <file> build` all
+    /// actually use. The handoff (§1) names this golden as the prerequisite for porting
+    /// `#line`, on the stated assumption that `#line` is the only difference.
+    ///
+    /// It is not. Building the golden found three, and all three have the same root
+    /// cause — **the two loaders do not produce identical merged buffers**:
+    ///
+    /// 1. **`#line` directives.** The reference emits them (867 for one corpus file); the
+    ///    port emits none. Recorded in §1.
+    /// 2. **Per-type artifact order.** The `JestyrSlice_*` typedefs come out permuted,
+    ///    because the loaders visit imports in different orders. Harmless to the C
+    ///    compiler — they are independent typedefs.
+    /// 3. **Spawn-task symbol names.** `jestyr_task_<N>` and its argument struct
+    ///    `_jsp_<N>` take `N` from the task body's byte offset in the merged buffer, and
+    ///    the two buffers differ by a constant 78 bytes of preamble, so every such name
+    ///    differs. Internally consistent in each build, so both programs run correctly.
+    ///
+    /// None changes behaviour, and each means `jestyrc attest` and `jc attest` hash
+    /// different bytes for the same program — the cross-tool reproducibility gap §1
+    /// already describes for `#line`, now known to be wider than one item.
+    ///
+    /// So this test normalizes (2) and (3) and *asserts* they are still only that, while
+    /// checking everything else exactly. **When the module path is unified, it tightens
+    /// in three steps**: drop the `#line` filter, drop `normalize_task_names`, and set
+    /// `strict_order` for every root. Until then it is a real regression gate on all the
+    /// module-path C that does agree — which is 122 lines for `io` and the whole of
+    /// `par_cost` besides these.
+    ///
+    /// Files are copied to a temp directory because `jc <file> build` writes its `.c` and
+    /// `.exe` beside the source, and a test must not leave artifacts in `examples/`.
+    #[test]
+    fn jestyr_module_cgen_matches_reference_except_line_directives() {
+        let jc = build_exe("examples/std/cgen.jtr");
+        let dir = std::env::temp_dir().join("jestyr_modline");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A root plus its import closure. `io.jtr` is deliberately first: it is the
+        // smallest module-path program in the corpus (8 directives), so a divergence
+        // shows up in a readable diff rather than a wall of them.
+        // `strict_order`: whether the two implementations agree on the *order* of the
+        // emitted C, not merely its content. `io` does. `par_cost` does not — see the
+        // ordering assertion below — so it is checked as a multiset until the loaders
+        // are aligned, at which point this flips to `true`.
+        for (root, deps, strict_order) in [
+            ("io", &["core"][..], true),
+            ("par_cost", &["core", "io", "parallel"][..], false),
+        ] {
+            for m in deps.iter().chain(std::iter::once(&root)) {
+                std::fs::copy(format!("examples/std/{m}.jtr"), dir.join(format!("{m}.jtr"))).unwrap();
+            }
+            let src_path = dir.join(format!("{root}.jtr"));
+
+            // Reference: the real loader path, which is what populates `DebugInfo`.
+            let prog = crate::module::load(src_path.to_str().unwrap());
+            assert!(!prog.diags.iter().any(|d| d.is_error()), "{root}: load errors");
+            let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+            assert!(!td.iter().any(|d| d.is_error()), "{root}: typeck errors");
+            let (want_c, _) = crate::cgen::emit(&prog.ast, &info);
+
+            // Port: `jc <file> build` writes `<stem>.c` beside the source, *then* runs
+            // gcc. The exit code is deliberately not checked — a library module such as
+            // `io.jtr` has no `main`, so the link step fails while the emitted C, which
+            // is the whole subject of this golden, is already correct and on disk. The
+            // artifact is the gate instead: emission failing means no file at all.
+            let out = Command::new(&jc)
+                .args([src_path.to_str().unwrap(), "build"])
+                .output()
+                .unwrap();
+            let got_c = std::fs::read_to_string(dir.join(format!("{root}.c")))
+                .unwrap_or_else(|e| {
+                    panic!("{root}: the port emitted no C ({e}): {}", String::from_utf8_lossy(&out.stderr))
+                });
+
+            let want: Vec<String> = want_c
+                .lines()
+                .filter(|l| !l.starts_with("#line "))
+                .map(normalize_task_names)
+                .collect();
+            let got: Vec<String> = got_c.lines().map(normalize_task_names).collect();
+            let n_directives = want_c.lines().filter(|l| l.starts_with("#line ")).count();
+
+            // Guard both directions, so neither side can make this pass by accident.
+            assert!(n_directives > 0, "{root}: the reference emitted no `#line` — is this the module path?");
+            assert!(
+                !got_c.contains("#line "),
+                "{root}: the port now emits `#line` — delete the filter above and compare outright"
+            );
+
+            // CONTENT must match exactly, always: same lines, same multiplicities. This
+            // is the assertion that catches a real codegen divergence in the module
+            // path, which nothing checked before this golden existed.
+            let (mut sw, mut sg) = (want.clone(), got.clone());
+            sw.sort_unstable();
+            sg.sort_unstable();
+            if sw != sg {
+                let only_want: Vec<&String> = sw.iter().filter(|l| !sg.contains(l)).take(4).collect();
+                let only_got: Vec<&String> = sg.iter().filter(|l| !sw.contains(l)).take(4).collect();
+                panic!(
+                    "{root}: the module-path C differs in CONTENT, not just order\n\
+                     only in the reference: {only_want:?}\nonly in the port: {only_got:?}"
+                );
+            }
+
+            if strict_order {
+                if want != got {
+                    let at = want.iter().zip(got.iter()).position(|(a, b)| a != b).unwrap_or(0);
+                    let lo = at.saturating_sub(2);
+                    panic!(
+                        "{root}: module-path C diverged at line {at}\nWANT: {:?}\nGOT : {:?}",
+                        &want[lo..(lo + 8).min(want.len())],
+                        &got[lo..(lo + 8).min(got.len())]
+                    );
+                }
+                eprintln!(
+                    "module-path C: {root} — {} lines identical in order; {n_directives} `#line` directives are the only gap",
+                    want.len()
+                );
+            } else {
+                // Recorded, not tolerated silently: the two module *loaders* visit
+                // imports in different orders, so per-type artifacts (the
+                // `JestyrSlice_*` typedefs) come out permuted. Harmless to the C
+                // compiler — they are independent typedefs — but it means
+                // `jestyrc attest` and `jc attest` hash different bytes for the same
+                // program, exactly like the `#line` gap. Asserted to still be *only* an
+                // ordering difference, so this cannot quietly widen.
+                assert_ne!(
+                    want, got,
+                    "{root}: the order now agrees — set `strict_order` to true for it"
+                );
+                eprintln!(
+                    "module-path C: {root} — {} lines match as a multiset; order differs (loader visit order) plus {n_directives} `#line` directives",
+                    want.len()
+                );
+            }
+        }
     }
 
     /// The reference's TEST-mode C for `src`: `cgen::emit_tests` — the `jestyrc test` harness
