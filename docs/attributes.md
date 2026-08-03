@@ -84,6 +84,7 @@ Argument shapes are fixed per attribute and enforced:
 | `@abi(ref)` | fn | identifier | `const T*` parameter | …passed by reference instead |
 | `@volatile` | field | — | `volatile` qualifier | MMIO — never cache the field |
 | `@no_panic` | fn / method | — | (static check) | every faulting op must be provably safe |
+| `@no_alloc` | fn / method | — | (static check) | nothing allocates, transitively through calls |
 | `@inline` | fn / method | — | `static inline __attribute__((always_inline))` | force inlining |
 | `@no_inline` | fn / method | — | `__attribute__((noinline))` | forbid inlining |
 | `@hot` | fn / method | — | `__attribute__((hot))` | optimize for the fast path |
@@ -140,6 +141,44 @@ or it is a compile error. Pair it with a range-`for` so the index is proven safe
     return t
 }
 ```
+
+### `@no_alloc` — proven allocation-free, transitively
+
+The real-time / embedded / kernel contract, and `@no_panic`'s analogue: in a
+`@no_alloc` function the escape checker must **prove** nothing allocates. That means
+allocation intrinsics (`alloc`, `realloc`, `arena_*`, `region_*`, `gen_new`), a `region`
+block, and a region-scoped loop — and, since the word is *proven*, **anything those
+reach through a call**:
+
+```jestyr
+fn helper(n: i32) -> *mut i32 { return alloc(i32, n) }
+
+@no_alloc fn f(n: i32) -> i32 {
+    let p = helper(n)    // error: `helper` allocates — forbidden in a `@no_alloc`
+    free_ptr(p)          //        function (`helper` allocates directly)
+    return 0
+}
+```
+
+Hiding an allocation one call away used to launder it past the check. It no longer does,
+and the diagnostic names the **path** and the function that actually allocates — the one
+you have to go change:
+
+```text
+error: `outer` allocates — forbidden in a `@no_alloc` function
+       (via `middle` → `deep`; `deep` allocates directly)
+```
+
+A chain of purely computational calls is of course fine — that is what `@no_alloc` code
+is built from, and a check that flinched at every call would make the attribute unusable.
+The analysis is a least fixpoint, so recursive and mutually-recursive call graphs settle
+rather than loop, and the chain it reports is deterministic.
+
+**What it does not see, stated plainly**: the call graph resolves **free functions by
+name**. A method, a closure, or a call through a `fn(…)` pointer is not in it, so an
+allocation reached only that way is not caught. `@no_alloc` is therefore a strong check
+rather than a total proof today — closing the gap needs call-graph resolution the escape
+checker does not yet have.
 
 ---
 

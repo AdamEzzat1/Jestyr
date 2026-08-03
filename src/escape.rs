@@ -47,6 +47,7 @@ use crate::span::Span;
 use crate::types::{Ty, TypeInfo};
 
 pub fn check(ast: &Ast, info: &TypeInfo) -> Vec<Diagnostic> {
+    let alloc_via = alloc_closure(ast, info);
     let mut ck = Checker {
         ast,
         info,
@@ -55,11 +56,116 @@ pub fn check(ast: &Ast, info: &TypeInfo) -> Vec<Diagnostic> {
         region_depths: Vec::new(),
         no_alloc: false,
         deterministic: false,
+        allocates: false,
+        calls: Vec::new(),
+        alloc_via,
     };
     for item in &ast.items {
         ck.check_item(item);
     }
     ck.diags
+}
+
+/// For every top-level function that allocates **transitively**, the shortest call
+/// chain from it to a function that allocates *directly*.
+///
+/// ## Why this reuses the checker instead of restating "allocates"
+/// The direct rule already exists in three places — an allocation intrinsic, a `region`
+/// block, a region-scoped loop. Writing a second walker that looked for those would be
+/// two definitions of "allocates" that could drift, and the one that drifted would make
+/// `@no_alloc` claim a proof it does not have. So this runs the **real checker** over
+/// each function with the per-op rules recording into `allocates`/`calls`, and reads
+/// those out. One decision point, two consumers — the rule this codebase applies to
+/// `at_ty`, `simd::classify` and `layout::field_order`.
+///
+/// The diagnostics from those probe runs are discarded: they belong to the main pass,
+/// which reports each function once with the right `no_alloc` flag.
+///
+/// ## What it deliberately does not resolve
+/// Only **free functions**, resolved by name. A method, a closure, or a call through a
+/// `fn(…)` pointer is not in the graph, so a `@no_alloc` function that allocates through
+/// one is not caught. That is a real limit, not an oversight — closing it needs
+/// call-graph resolution the escape checker does not have today — and it is recorded in
+/// `docs/attributes.md` rather than left for a user to discover.
+fn alloc_closure(ast: &Ast, info: &TypeInfo) -> HashMap<String, Vec<String>> {
+    // Per function: does it allocate directly, and whom does it call?
+    let mut direct: HashSet<String> = HashSet::new();
+    let mut calls: HashMap<String, Vec<String>> = HashMap::new();
+    for item in &ast.items {
+        let Item::Fn(f) = item else { continue };
+        let mut probe = Checker {
+            ast,
+            info,
+            diags: Vec::new(),
+            frozen: Vec::new(),
+            region_depths: Vec::new(),
+            // `false`, so the probe never reports: it is measuring, not judging.
+            no_alloc: false,
+            deterministic: false,
+            allocates: false,
+            calls: Vec::new(),
+            alloc_via: HashMap::new(),
+        };
+        probe.check_item(item);
+        if probe.allocates {
+            direct.insert(f.name.name.clone());
+        }
+        let mut cs: Vec<String> = probe.calls.into_iter().map(|(n, _)| n).collect();
+        cs.sort();
+        cs.dedup();
+        calls.insert(f.name.name.clone(), cs);
+    }
+
+    // Least fixpoint: a function allocates if it calls one that does. Iterated to
+    // saturation rather than recursed, so a cycle (mutual or self recursion) settles
+    // instead of looping — the same totality instinct the comptime interpreter applies.
+    // A directly-allocating function is reached via an EMPTY chain — it is itself the
+    // culprit. Seeding it with its own name instead would duplicate that name in every
+    // chain that passes through it.
+    let mut via: HashMap<String, Vec<String>> = HashMap::new();
+    for d in &direct {
+        via.insert(d.clone(), Vec::new());
+    }
+    loop {
+        let mut changed = false;
+        // Sorted for determinism: with two chains of equal length the winner must not
+        // depend on hash iteration order, or the diagnostic text would vary per run.
+        let mut names: Vec<&String> = calls.keys().collect();
+        names.sort();
+        for f in names {
+            if direct.contains(f) {
+                continue; // already the shortest possible chain
+            }
+            let mut best: Option<Vec<String>> = via.get(f).cloned();
+            for callee in &calls[f] {
+                let Some(sub) = via.get(callee) else { continue };
+                let mut cand = vec![callee.clone()];
+                cand.extend(sub.iter().cloned());
+                let better = match &best {
+                    None => true,
+                    Some(b) => cand.len() < b.len() || (cand.len() == b.len() && cand < *b),
+                };
+                if better {
+                    best = Some(cand);
+                }
+            }
+            if let Some(b) = best {
+                if via.get(f) != Some(&b) {
+                    via.insert(f.clone(), b);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Directly-allocating functions STAY in the map, with their empty chains. The
+    // direct rule in `check_no_alloc_call` only recognizes allocation *intrinsics*, so
+    // dropping them here would let a one-hop call to a user function that allocates
+    // (`@no_alloc fn f() { g() }` where `g` calls `alloc`) pass unreported — which it
+    // did, until this comment's test caught it.
+    via
 }
 
 struct Checker<'a> {
@@ -77,6 +183,17 @@ struct Checker<'a> {
     /// is permitted only through the *checked* deterministic `par for … reduce(r)`.
     /// The schedule-independence contract. Saved/restored around nested bodies.
     deterministic: bool,
+    /// Set when the function being walked performs an allocation **directly** — an
+    /// allocation intrinsic, a `region` block, or a region-scoped loop. Recorded
+    /// regardless of `no_alloc`, because [`alloc_closure`] measures every function
+    /// before it knows which ones are annotated.
+    allocates: bool,
+    /// Every resolved callee name seen while walking, with its span — the call-graph
+    /// edges [`alloc_closure`] closes over.
+    calls: Vec<(String, Span)>,
+    /// Functions that allocate **transitively**, each mapped to the shortest chain
+    /// reaching a directly-allocating one. Empty during the measuring pass.
+    alloc_via: HashMap<String, Vec<String>>,
     /// Collections currently being iterated (by simple name). A `for … in xs`
     /// loop holds a borrow of `xs` for its body, so mutating `xs` there is
     /// forbidden (iterator invalidation — the borrow contract of a loop). A stack
@@ -458,6 +575,7 @@ impl<'a> Checker<'a> {
             ExprKind::Region { body, .. } => {
                 // A `region` block opens an arena (a heap allocation), so it is
                 // forbidden in a `@no_alloc` function.
+                self.allocates = true;
                 if self.no_alloc {
                     self.error(span, "a `region` block allocates an arena — forbidden in a `@no_alloc` function");
                 }
@@ -504,6 +622,9 @@ impl<'a> Checker<'a> {
             }
             ExprKind::For { head, body, els, region, .. } => {
                 // A region-scoped loop allocates a per-iteration scratch arena.
+                if region.is_some() {
+                    self.allocates = true;
+                }
                 if self.no_alloc && region.is_some() {
                     self.error(span, "a region-scoped loop allocates a scratch arena — forbidden in a `@no_alloc` function");
                 }
@@ -778,9 +899,6 @@ impl<'a> Checker<'a> {
     /// per-op enforcement that mirrors `@no_panic`'s un-elided-index check; the
     /// *transitive* "calls a function that allocates" closure is future work.
     fn check_no_alloc_call(&mut self, call_id: ExprId, callee: ExprId, span: Span) {
-        if !self.no_alloc {
-            return;
-        }
         // A module-qualified call resolves to the underlying bare function name.
         let name = if let Some(q) = self.info.qualified.get(&call_id) {
             q.clone()
@@ -789,11 +907,41 @@ impl<'a> Checker<'a> {
         } else {
             return;
         };
+        // Recorded on EVERY call, `@no_alloc` or not, because the transitive pass
+        // needs this function's callees before it knows whether anyone cares.
+        if is_alloc_intrinsic(&name) {
+            self.allocates = true;
+        }
+        self.calls.push((name.clone(), span));
+        if !self.no_alloc {
+            return;
+        }
         if is_alloc_intrinsic(&name) {
             self.error(
                 span,
                 format!(
                     "`{name}` allocates — forbidden in a `@no_alloc` function (the proven-allocation-free contract)"
+                ),
+            );
+            return;
+        }
+        // …and the TRANSITIVE rule: calling something that allocates, however
+        // indirectly, breaks the same contract. `alloc_via` carries the shortest
+        // chain, so the diagnostic can name the function that actually allocates
+        // rather than only the one that was called.
+        if let Some(chain) = self.alloc_via.get(&name) {
+            let culprit = chain.last().cloned().unwrap_or_else(|| name.clone());
+            // Name the whole path only when there is one worth naming — for a direct
+            // callee the chain is a single hop and "via `f`; `f` allocates" is noise.
+            let detail = if chain.len() > 1 {
+                format!("via `{}`; `{culprit}` allocates directly", chain.join("` → `"))
+            } else {
+                format!("`{culprit}` allocates directly")
+            };
+            self.error(
+                span,
+                format!(
+                    "`{name}` allocates — forbidden in a `@no_alloc` function ({detail})"
                 ),
             );
         }
@@ -1174,6 +1322,106 @@ mod tests {
              fn g() -> i32 { let p = alloc(i32, 4) free_ptr(p) return 0 }",
         );
         assert!(d.is_empty(), "only the annotated fn is constrained: {:?}", d);
+    }
+
+    // --- transitive `@no_alloc` ---
+
+    /// **The contract says *proven* allocation-free, so hiding the allocation one call
+    /// away must not launder it.** Before this, only a direct allocation *intrinsic*
+    /// was caught, so `@no_alloc fn f() { g() }` passed however much `g` allocated.
+    #[test]
+    fn no_alloc_rejects_an_allocation_one_call_away() {
+        let d = escapes(
+            "fn g(n: i32) -> *mut i32 { return alloc(i32, n) } \
+             @no_alloc fn f(n: i32) -> i32 { let p = g(n) free_ptr(p) return 0 }",
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].message.contains("`g` allocates"), "{:?}", d[0].message);
+        // One hop: naming a path would be noise, so it just names the culprit.
+        assert!(!d[0].message.contains("via"), "{:?}", d[0].message);
+    }
+
+    /// A longer chain names the **path** and the function that actually allocates —
+    /// which is the one the user has to go change.
+    #[test]
+    fn no_alloc_names_the_chain_to_the_real_culprit() {
+        let d = escapes(
+            "fn deep(n: i32) -> *mut i32 { return alloc(i32, n) } \
+             fn middle(n: i32) -> *mut i32 { return deep(n) } \
+             fn outer(n: i32) -> *mut i32 { return middle(n) } \
+             @no_alloc fn f(n: i32) -> i32 { let p = outer(n) free_ptr(p) return 0 }",
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        let m = &d[0].message;
+        assert!(m.contains("`outer` allocates"), "{m}");
+        assert!(m.contains("via `middle` → `deep`"), "the chain must be named: {m}");
+        assert!(m.contains("`deep` allocates directly"), "the culprit must be named: {m}");
+        // Each name appears once — a self-chain on the directly-allocating function
+        // used to duplicate the tail (`deep` → `deep`).
+        assert_eq!(m.matches("deep").count(), 2, "one path mention + one culprit: {m}");
+    }
+
+    /// A `region` block and a region-scoped loop are allocations too, so a function
+    /// containing either poisons its callers just as an intrinsic does.
+    #[test]
+    fn no_alloc_transits_regions_as_well_as_intrinsics() {
+        let d = escapes(
+            "fn arena() -> i32 { region r { let x = 1 } return 0 } \
+             @no_alloc fn f() -> i32 { return arena() }",
+        );
+        assert_eq!(d.len(), 1, "a `region` must propagate: {d:?}");
+        assert!(d[0].message.contains("`arena` allocates"), "{:?}", d[0].message);
+    }
+
+    /// **Totality.** The closure is a least fixpoint, so recursion — direct or
+    /// mutual — settles instead of looping. Without that this test hangs the suite.
+    #[test]
+    fn no_alloc_terminates_on_recursive_call_graphs() {
+        let d = escapes(
+            "fn a(n: i32) -> i32 { if n > 0 { return b(n - 1) } return 0 } \
+             fn b(n: i32) -> i32 { return a(n) } \
+             @no_alloc fn f(n: i32) -> i32 { return a(n) }",
+        );
+        assert!(d.is_empty(), "an allocation-free cycle must pass: {d:?}");
+        // …and a cycle that *does* allocate is still caught.
+        let d = escapes(
+            "fn a(n: i32) -> i32 { if n > 0 { return b(n - 1) } let p = alloc(i32, 1) free_ptr(p) return 0 } \
+             fn b(n: i32) -> i32 { return a(n) } \
+             @no_alloc fn f(n: i32) -> i32 { return b(n) }",
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].message.contains("`b` allocates"), "{:?}", d[0].message);
+    }
+
+    /// The check must not become a blanket "any call is suspect": a chain of purely
+    /// computational functions is exactly what `@no_alloc` code is built from, and
+    /// rejecting it would make the attribute unusable.
+    #[test]
+    fn no_alloc_accepts_a_chain_of_allocation_free_calls() {
+        let d = escapes(
+            "fn add(a: i32, b: i32) -> i32 { return a + b } \
+             fn twice(a: i32) -> i32 { return add(a, a) } \
+             fn quad(a: i32) -> i32 { return twice(twice(a)) } \
+             @no_alloc fn f(a: i32) -> i32 { return quad(a) }",
+        );
+        assert!(d.is_empty(), "allocation-free calls must pass: {d:?}");
+    }
+
+    /// The diagnostic text is deterministic: with two chains of equal length the
+    /// winner must not depend on hash iteration order, or the message would vary
+    /// between runs of the same compiler on the same input.
+    #[test]
+    fn no_alloc_chain_selection_is_deterministic() {
+        let src = "fn x(n: i32) -> *mut i32 { return alloc(i32, n) } \
+                   fn y(n: i32) -> *mut i32 { return alloc(i32, n) } \
+                   fn p(n: i32) -> *mut i32 { return x(n) } \
+                   fn q(n: i32) -> *mut i32 { return y(n) } \
+                   fn both(n: i32) -> *mut i32 { if n > 0 { return p(n) } return q(n) } \
+                   @no_alloc fn f(n: i32) -> i32 { let z = both(n) free_ptr(z) return 0 }";
+        let first = escapes(src)[0].message.clone();
+        for _ in 0..5 {
+            assert_eq!(escapes(src)[0].message, first, "the chain choice must be stable");
+        }
     }
 
     // --- the thesis in action: allowed uses ---
