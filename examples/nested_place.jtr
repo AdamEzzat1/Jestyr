@@ -1,6 +1,6 @@
 // examples/nested_place.jtr — assigning THROUGH a bounds-checked index.
 //
-//   jestyrc run examples/nested_place.jtr   →  9, 2, 10, 5, 41, 7, 20
+//   jestyrc run examples/nested_place.jtr   →  9, 2, 10, 15, 115, 116, 2, 5, 41, 7, 20
 //
 // An index is lowered to a bounds-checked statement expression, which yields a
 // *value*. That is exactly what a read wants — but `xs[i].b = 9` needs a
@@ -11,10 +11,35 @@
 //
 // A directly indexed target (`xs[i] = v`) has always had its own lvalue
 // lowering and is unchanged — see `examples/arrays.jtr` and `examples/slices.jtr`.
+//
+// The same place is what a `mut`/`out` parameter needs, because it is passed by
+// ADDRESS: `xs[i].add(5)` on a `mut self` method must hand over the element's own
+// address, or the method mutates a temporary and the write is lost.
+
+trait Bump {
+    fn bump(mut self)
+}
 
 struct Cell {
     a: u8,
     b: u64,
+
+    // A `mut self` receiver reached through an index — the inherent-method path.
+    fn add(mut self, v: u64) {
+        self.b = self.b + v
+    }
+}
+
+// The trait-impl path, which resolves to a different call lowering.
+impl Bump for Cell {
+    fn bump(mut self) {
+        self.b = self.b + 100
+    }
+}
+
+// A `mut` parameter of a plain function — the argument path.
+fn add_one(mut c: Cell) {
+    c.b = c.b + 1
 }
 
 struct Row {
@@ -41,6 +66,16 @@ fn main() -> i32 {
     // Compound assignment names the same place for the read and the write.
     xs[i].b += 1
     print_int(xs[i].b as i64)           // 10
+
+    // Passed BY ADDRESS through the same place — three different call lowerings,
+    // each of which used to take the address of a statement expression.
+    xs[i].add(5)
+    print_int(xs[i].b as i64)           // 15   (inherent `mut self`)
+    xs[i].bump()
+    print_int(xs[i].b as i64)           // 115  (trait impl `mut self`)
+    add_one(xs[i])
+    print_int(xs[i].b as i64)           // 116  (a `mut` parameter)
+    print_int(xs[0].b as i64)           // 2    — element 0 untouched throughout
 
     // A NESTED array: `m[i][j]` is a place on both sides.
     var m: [2][3]i64 = [[0; 3]; 2]

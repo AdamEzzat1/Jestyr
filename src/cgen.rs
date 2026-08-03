@@ -5212,12 +5212,12 @@ impl<'a> Cgen<'a> {
                     .unwrap_or_default();
                 let mut parts = Vec::new();
                 for (i, a) in args.iter().enumerate() {
-                    let e = self.emit_expr(*a);
-                    if matches!(convs.get(i), Some(Conv::Mut) | Some(Conv::Out)) {
-                        parts.push(format!("&({e})"));
+                    let e = if matches!(convs.get(i), Some(Conv::Mut) | Some(Conv::Out)) {
+                        self.emit_addr_arg(*a)
                     } else {
-                        parts.push(e);
-                    }
+                        self.emit_expr(*a)
+                    };
+                    parts.push(e);
                 }
                 return format!("{}({})", n.name, parts.join(", "));
             }
@@ -5243,12 +5243,12 @@ impl<'a> Cgen<'a> {
                 .unwrap_or_default();
             let mut parts = Vec::new();
             for (i, a) in args.iter().enumerate() {
-                let e = self.emit_expr(*a);
-                if matches!(convs.get(i), Some(Conv::Mut) | Some(Conv::Out)) {
-                    parts.push(format!("&({e})"));
+                let e = if matches!(convs.get(i), Some(Conv::Mut) | Some(Conv::Out)) {
+                    self.emit_addr_arg(*a)
                 } else {
-                    parts.push(e);
-                }
+                    self.emit_expr(*a)
+                };
+                parts.push(e);
             }
             return format!("{}({})", self.c_fn_name(&cname), parts.join(", "));
         }
@@ -5275,12 +5275,12 @@ impl<'a> Cgen<'a> {
             .unwrap_or_default();
         let mut parts = Vec::new();
         for (i, a) in args.iter().enumerate() {
-            let e = self.emit_expr(*a);
-            if matches!(convs.get(i), Some(Conv::Mut) | Some(Conv::Out)) {
-                parts.push(format!("&({e})"));
+            let e = if matches!(convs.get(i), Some(Conv::Mut) | Some(Conv::Out)) {
+                self.emit_addr_arg(*a)
             } else {
-                parts.push(e);
-            }
+                self.emit_expr(*a)
+            };
+            parts.push(e);
         }
         if self.extern_fns.contains(name) {
             format!("{}({})", name, parts.join(", "))
@@ -5303,11 +5303,10 @@ impl<'a> Cgen<'a> {
         let subst = self.subst.clone();
         let targs: Vec<Ty> = mr.type_args.iter().map(|t| apply_subst(t, &subst)).collect();
 
-        let recv = self.emit_expr(base);
         let recv = if matches!(mr.recv_conv, Conv::Mut | Conv::Out) {
-            format!("&({recv})")
+            self.emit_addr_arg(base)
         } else {
-            recv
+            self.emit_expr(base)
         };
         let mut parts = vec![recv];
 
@@ -5338,12 +5337,12 @@ impl<'a> Cgen<'a> {
         };
 
         for (i, a) in args.iter().enumerate() {
-            let e = self.emit_expr(*a);
-            if matches!(arg_convs.get(i), Some(Conv::Mut) | Some(Conv::Out)) {
-                parts.push(format!("&({e})"));
+            let e = if matches!(arg_convs.get(i), Some(Conv::Mut) | Some(Conv::Out)) {
+                self.emit_addr_arg(*a)
             } else {
-                parts.push(e);
-            }
+                self.emit_expr(*a)
+            };
+            parts.push(e);
         }
         format!("{name}({})", parts.join(", "))
     }
@@ -5867,12 +5866,12 @@ impl<'a> Cgen<'a> {
         let c = self.emit_expr(callee);
         let mut parts = Vec::new();
         for (i, a) in args.iter().enumerate() {
-            let e = self.emit_expr(*a);
-            if matches!(convs.get(i), Some(Conv::Mut) | Some(Conv::Out)) {
-                parts.push(format!("&({e})"));
+            let e = if matches!(convs.get(i), Some(Conv::Mut) | Some(Conv::Out)) {
+                self.emit_addr_arg(*a)
             } else {
-                parts.push(e);
-            }
+                self.emit_expr(*a)
+            };
+            parts.push(e);
         }
         format!("{c}({})", parts.join(", "))
     }
@@ -6394,20 +6393,19 @@ impl<'a> Cgen<'a> {
             })
             .unwrap_or((Conv::Default, Vec::new()));
 
-        let recv = self.emit_expr(base);
         let recv = if matches!(self_conv, Conv::Mut | Conv::Out) {
-            format!("&({recv})")
+            self.emit_addr_arg(base)
         } else {
-            recv
+            self.emit_expr(base)
         };
         let mut parts = vec![recv];
         for (i, a) in args.iter().enumerate() {
-            let e = self.emit_expr(*a);
-            if matches!(arg_convs.get(i), Some(Conv::Mut) | Some(Conv::Out)) {
-                parts.push(format!("&({e})"));
+            let e = if matches!(arg_convs.get(i), Some(Conv::Mut) | Some(Conv::Out)) {
+                self.emit_addr_arg(*a)
             } else {
-                parts.push(e);
-            }
+                self.emit_expr(*a)
+            };
+            parts.push(e);
         }
         let name = impl_method_c_name(&ic.trait_name, &ic.type_key, &ic.method);
         format!("{name}({})", parts.join(", "))
@@ -6441,10 +6439,16 @@ impl<'a> Cgen<'a> {
             })
             .unwrap_or((Conv::Default, Conv::Default));
         let (recv_id, arg_id) = if swap { (rhs, lhs) } else { (lhs, rhs) };
-        let recv = self.emit_expr(recv_id);
-        let recv = if matches!(self_conv, Conv::Mut | Conv::Out) { format!("&({recv})") } else { recv };
-        let arg = self.emit_expr(arg_id);
-        let arg = if matches!(rhs_conv, Conv::Mut | Conv::Out) { format!("&({arg})") } else { arg };
+        let recv = if matches!(self_conv, Conv::Mut | Conv::Out) {
+            self.emit_addr_arg(recv_id)
+        } else {
+            self.emit_expr(recv_id)
+        };
+        let arg = if matches!(rhs_conv, Conv::Mut | Conv::Out) {
+            self.emit_addr_arg(arg_id)
+        } else {
+            self.emit_expr(arg_id)
+        };
         let name = impl_method_c_name(&ic.trait_name, &ic.type_key, &ic.method);
         let call = format!("{name}({recv}, {arg})");
         if negate {
@@ -8246,6 +8250,17 @@ impl<'a> Cgen<'a> {
         }
     }
 
+    /// Emit `id` as an argument passed **by address** — a `mut`/`out` parameter, or
+    /// a `mut`/`out self` receiver. Such an argument is a *place*, not a value, so
+    /// it goes through [`Self::emit_place`]: `cs[i].bump()` otherwise takes the
+    /// address of a bounds-checked statement expression and gcc reports "lvalue
+    /// required as unary '&' operand". Every argument that is not reached through a
+    /// checked index emits exactly as `&({expr})` always did.
+    fn emit_addr_arg(&mut self, id: ExprId) -> String {
+        let p = self.emit_place(id, true);
+        format!("&({p})")
+    }
+
     fn error_tag_of(&self, id: ExprId) -> Option<i64> {
         match &self.ast.expr_at(id).kind {
             ExprKind::Name(n) => self.error_tags.get(&n.name).copied(),
@@ -8443,13 +8458,13 @@ impl<'a> Cgen<'a> {
             if cpos.contains(&i) {
                 continue; // type argument — erased
             }
-            let e = self.emit_expr(*a);
             let conv = f.params.get(i).map(|p| p.conv).unwrap_or(Conv::Default);
-            if matches!(conv, Conv::Mut | Conv::Out) {
-                parts.push(format!("&({e})"));
+            let e = if matches!(conv, Conv::Mut | Conv::Out) {
+                self.emit_addr_arg(*a)
             } else {
-                parts.push(e);
-            }
+                self.emit_expr(*a)
+            };
+            parts.push(e);
         }
         format!("jestyr_{mangled}({})", parts.join(", "))
     }
@@ -11324,6 +11339,46 @@ mod tests {
         assert!(c.contains("&_a3->a[_ix3]; })) = 5"), "the write assigns through the element address: {c}");
         assert!(c.contains("JestyrArr_i64_3* _a3 = &((*({ JestyrArr_arr_i64_3_2* _a2"), "the write's base is a non-const place: {c}");
         assert!(c.contains("const JestyrArr_i64_3* _a5 = &((*({ const JestyrArr_arr_i64_3_2* _a4"), "the read's base is a const place: {c}");
+    }
+
+    #[test]
+    fn a_mut_receiver_through_an_index_takes_the_elements_own_address() {
+        // `cs[i].bump()` on a `mut self` method is the SAME defect as `xs[i].f = v`
+        // at a different call site: a `mut`/`out` receiver is passed by address, and
+        // `&({ …; _a->a[_ix]; })` is "lvalue required as unary '&' operand". Routing
+        // the receiver through `emit_place` hands over the element's own address, so
+        // the method mutates the array rather than a temporary.
+        let src = "struct C { n: i64, fn bump(mut self) { self.n = self.n + 1 } } \
+                   fn go() { var cs: [2]C = [C { n: 0 }; 2] cs[1].bump() }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("&((*({ JestyrArr_C_2* _a1 = &(j_cs)"), "receiver is the element's address: {c}");
+        assert!(c.contains("&_a1->a[_ix1]; })))"), "through the place form, non-const: {c}");
+    }
+
+    #[test]
+    fn a_mut_argument_through_an_index_takes_the_elements_own_address() {
+        // The argument half of the same rule: a `mut` parameter of a plain function.
+        let src = "struct C { n: i64 } fn inc(mut c: C) { c.n = c.n + 1 } \
+                   fn go() { var cs: [2]C = [C { n: 0 }; 2] inc(cs[1]) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("jestyr_inc(&((*({ JestyrArr_C_2* _a1"), "argument is the element's address: {c}");
+        assert!(c.contains("&_a1->a[_ix1]; })))"), "through the place form: {c}");
+    }
+
+    #[test]
+    fn a_read_receiver_and_a_by_value_argument_are_unchanged() {
+        // Only `mut`/`out` conveyances take an address, so a `read` receiver and a
+        // by-value argument still emit the statement-expression *value* exactly as
+        // before — which is what keeps every existing program byte-identical.
+        let src = "struct C { n: i64, fn get(read self) -> i64 { return self.n } } \
+                   fn by_value(c: C) -> i64 { return c.n } \
+                   fn go() -> i64 { var cs: [2]C = [C { n: 0 }; 2] return cs[1].get() + by_value(cs[0]) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(!c.contains("&_a"), "no address form for read/by-value conveyances: {c}");
+        assert!(c.contains("_a1->a[_ix1]; })"), "the value form is unchanged: {c}");
     }
 
     #[test]

@@ -9927,17 +9927,6 @@ pub fn push_sha256_hex(mut sb: String, read data: str) {
 // Increment 1 (this file's current reach): `hello.jtr` — the prelude, one `fn main -> i32`, a
 // `print_str("…")` intrinsic call, a string literal, and `return 0`. Everything else is denylisted.
 
-
-
-
-
-
-
-
-
-
-
-
 // ---- the fixed C prelude (mirrors Cgen::prelude) ----
 // A FIXED header block: includes + the `jestyr_rt_*` runtime + the JestyrStr/String/Cow/Builder
 // value types + the print/file-IO/argv intrinsics. Transcribed byte-for-byte from `cgen.rs`
@@ -10909,6 +10898,17 @@ fn emit_place(mut sb: String, read p: Parser, read src: str, read c: Checker, mu
         return
     }
     emit_expr(sb, p, src, c, g, eid)
+}
+
+// Emit `eid` as an argument passed BY ADDRESS — a `mut`/`out` parameter, or a `mut`/`out self`
+// receiver. Such an argument is a PLACE, not a value, so it routes through `emit_place`:
+// `cs[i].bump()` otherwise takes the address of a bounds-checked statement expression, which is
+// not an lvalue. Anything not reached through a checked index emits exactly as `&(<expr>)` always
+// did. (Mirrors `Cgen::emit_addr_arg`.)
+fn emit_addr_arg(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg, eid: i32) {
+    string_push(sb, "&(")
+    emit_place(sb, p, src, c, g, eid, true)
+    string_push(sb, ")")
 }
 
 // ---- expressions (mirrors the relevant arms of Cgen::emit_expr) ----
@@ -12176,17 +12176,13 @@ fn emit_operator_call(mut sb: String, read p: Parser, read src: str, read c: Che
     string_push(sb, "(")
     string_free(key)
     if sconv == 2 or sconv == 4 {
-        string_push(sb, "&(")
-        emit_expr(sb, p, src, c, g, recv_id)
-        string_push(sb, ")")
+        emit_addr_arg(sb, p, src, c, g, recv_id)
     } else {
         emit_expr(sb, p, src, c, g, recv_id)
     }
     string_push(sb, ", ")
     if rconv == 2 or rconv == 4 {
-        string_push(sb, "&(")
-        emit_expr(sb, p, src, c, g, arg_id)
-        string_push(sb, ")")
+        emit_addr_arg(sb, p, src, c, g, arg_id)
     } else {
         emit_expr(sb, p, src, c, g, arg_id)
     }
@@ -12213,9 +12209,7 @@ fn emit_impl_dispatch(mut sb: String, read p: Parser, read src: str, read c: Che
     var sconv: i32 = 0
     if mid >= 0 { sconv = method_self_conv(p, mid) }
     if sconv == 2 or sconv == 4 {
-        string_push(sb, "&(")
-        emit_expr(sb, p, src, c, g, callee.a)
-        string_push(sb, ")")
+        emit_addr_arg(sb, p, src, c, g, callee.a)
     } else {
         emit_expr(sb, p, src, c, g, callee.a)
     }
@@ -12230,9 +12224,11 @@ fn emit_impl_dispatch(mut sb: String, read p: Parser, read src: str, read c: Che
                 if pconv == 2 or pconv == 4 { byref = true }
             }
         }
-        if byref { string_push(sb, "&(") }
-        emit_expr(sb, p, src, c, g, arg_at(p, e, ai))
-        if byref { string_push(sb, ")") }
+        if byref {
+            emit_addr_arg(sb, p, src, c, g, arg_at(p, e, ai))
+        } else {
+            emit_expr(sb, p, src, c, g, arg_at(p, e, ai))
+        }
         ai = ai + 1
     }
     string_push(sb, ")")
@@ -12275,9 +12271,7 @@ fn emit_call(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
             // The receiver is the first C argument: by address for a `mut`/`out self`.
             let sconv: i32 = method_self_conv(p, fid)
             if sconv == 2 or sconv == 4 {
-                string_push(sb, "&(")
-                emit_expr(sb, p, src, c, g, callee.a)
-                string_push(sb, ")")
+                emit_addr_arg(sb, p, src, c, g, callee.a)
             } else {
                 emit_expr(sb, p, src, c, g, callee.a)
             }
@@ -12291,9 +12285,11 @@ fn emit_call(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                     let pconv: i32 = get(i32, p.iar, (fd.a + (ai + 1) * 7 + 1) as usize)
                     if pconv == 2 or pconv == 4 { byref = true }
                 }
-                if byref { string_push(sb, "&(") }
-                emit_expr(sb, p, src, c, g, arg_at(p, e, ai))
-                if byref { string_push(sb, ")") }
+                if byref {
+                    emit_addr_arg(sb, p, src, c, g, arg_at(p, e, ai))
+                } else {
+                    emit_expr(sb, p, src, c, g, arg_at(p, e, ai))
+                }
                 ai = ai + 1
             }
             string_push(sb, ")")
@@ -12361,9 +12357,7 @@ fn emit_call(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                 mj = mj + 1
             }
             if mrconv == 2 or mrconv == 4 {
-                string_push(sb, "&(")
-                emit_expr(sb, p, src, c, g, callee.a)
-                string_push(sb, ")")
+                emit_addr_arg(sb, p, src, c, g, callee.a)
             } else {
                 emit_expr(sb, p, src, c, g, callee.a)
             }
@@ -12380,9 +12374,11 @@ fn emit_call(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                         if mpc == 2 or mpc == 4 { mbyref = true }
                     }
                 }
-                if mbyref { string_push(sb, "&(") }
-                emit_expr(sb, p, src, c, g, arg_at(p, e, mai))
-                if mbyref { string_push(sb, ")") }
+                if mbyref {
+                    emit_addr_arg(sb, p, src, c, g, arg_at(p, e, mai))
+                } else {
+                    emit_expr(sb, p, src, c, g, arg_at(p, e, mai))
+                }
                 mai = mai + 1
             }
             string_push(sb, ")")
@@ -12424,9 +12420,7 @@ fn emit_call(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                         string_push(sb, "(")
                         let gsconv: i32 = method_self_conv(p, mfit)
                         if gsconv == 2 or gsconv == 4 {
-                            string_push(sb, "&(")
-                            emit_expr(sb, p, src, c, g, callee.a)
-                            string_push(sb, ")")
+                            emit_addr_arg(sb, p, src, c, g, callee.a)
                         } else {
                             emit_expr(sb, p, src, c, g, callee.a)
                         }
@@ -12439,9 +12433,11 @@ fn emit_call(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                                 let gpconv: i32 = get(i32, p.iar, (gfd.a + (gai + 1) * 7 + 1) as usize)
                                 if gpconv == 2 or gpconv == 4 { gbyref = true }
                             }
-                            if gbyref { string_push(sb, "&(") }
-                            emit_expr(sb, p, src, c, g, arg_at(p, e, gai))
-                            if gbyref { string_push(sb, ")") }
+                            if gbyref {
+                                emit_addr_arg(sb, p, src, c, g, arg_at(p, e, gai))
+                            } else {
+                                emit_expr(sb, p, src, c, g, arg_at(p, e, gai))
+                            }
                             gai = gai + 1
                         }
                         string_push(sb, ")")
@@ -12591,9 +12587,11 @@ fn emit_call(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                     let pconv: i32 = get(i32, c.tya, (ctd.a + ai * 2) as usize)
                     if pconv == 2 or pconv == 4 { byref = true }
                 }
-                if byref { string_push(sb, "&(") }
-                emit_expr(sb, p, src, c, g, arg_at(p, e, ai))
-                if byref { string_push(sb, ")") }
+                if byref {
+                    emit_addr_arg(sb, p, src, c, g, arg_at(p, e, ai))
+                } else {
+                    emit_expr(sb, p, src, c, g, arg_at(p, e, ai))
+                }
                 ai = ai + 1
             }
             string_push(sb, ")")
@@ -13173,9 +13171,11 @@ fn emit_args_for_item(mut sb: String, read p: Parser, read src: str, read c: Che
             let conv: i32 = get(i32, p.iar, (it.a + i * 7 + 1) as usize)
             if conv == 2 or conv == 4 { byref = true }
         }
-        if byref { string_push(sb, "&(") }
-        emit_expr(sb, p, src, c, g, arg_at(p, e, i))
-        if byref { string_push(sb, ")") }
+        if byref {
+            emit_addr_arg(sb, p, src, c, g, arg_at(p, e, i))
+        } else {
+            emit_expr(sb, p, src, c, g, arg_at(p, e, i))
+        }
         i = i + 1
     }
     string_push(sb, ")")
@@ -13230,9 +13230,11 @@ fn emit_user_args(mut sb: String, read p: Parser, read src: str, read c: Checker
                 if conv == 2 or conv == 4 { byref = true }
             }
         }
-        if byref { string_push(sb, "&(") }
-        emit_expr(sb, p, src, c, g, arg_at(p, e, i))
-        if byref { string_push(sb, ")") }
+        if byref {
+            emit_addr_arg(sb, p, src, c, g, arg_at(p, e, i))
+        } else {
+            emit_expr(sb, p, src, c, g, arg_at(p, e, i))
+        }
         i = i + 1
     }
     string_push(sb, ")")
@@ -14239,9 +14241,7 @@ fn emit_generic_call(mut sb: String, read p: Parser, read src: str, read c: Chec
             var conv: i32 = 0
             if aidx < f.b { conv = get(i32, p.iar, (f.a + aidx * 7 + 1) as usize) }
             if conv == 2 or conv == 4 {
-                string_push(sb, "&(")
-                emit_expr(sb, p, src, c, g, arg_at(p, e, aidx))
-                string_push(sb, ")")
+                emit_addr_arg(sb, p, src, c, g, arg_at(p, e, aidx))
             } else {
                 emit_expr(sb, p, src, c, g, arg_at(p, e, aidx))
             }

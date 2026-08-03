@@ -10952,12 +10952,17 @@ fn main() -> i32 {
         // compile at all ("lvalue required as left operand of assignment").
         //
         // The token stream is chosen so a write that lands in a *copy* of the element still
-        // fails: `2` is element 0 read back right after element 1 was written, and `41` is a
+        // fails: each `2` is element 0 read back after element 1 was written, and `41` is a
         // nested read of a cell written through a different chain. A lowering that silently
         // discarded the store would print `2`→`9` or `41`→`36`.
+        //
+        // `15`/`115`/`116` are the by-ADDRESS half — an inherent `mut self` receiver, a trait
+        // impl's, and a `mut` parameter. Those three take `&<place>`, so before the fix they
+        // did not compile; a lowering that handed over a temporary instead would leave the
+        // element at `10` and print `10, 10, 10`.
         assert_eq!(
             toks("examples/nested_place.jtr"),
-            ["9", "2", "10", "5", "41", "7", "20"],
+            ["9", "2", "10", "15", "115", "116", "2", "5", "41", "7", "20"],
             "write through a checked index did not land in the aggregate"
         );
     }
