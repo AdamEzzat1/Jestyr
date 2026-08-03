@@ -907,6 +907,107 @@ impl<'a> TypeChecker<'a> {
         !loose(ann) && !loose(got) && ann != got
     }
 
+    /// Is a value of type `got` assignable to a location of type `want`?
+    ///
+    /// Deliberately **conservative**: it answers `true` whenever it is not
+    /// *certain* the pair is wrong. This pass is lenient by design — `Unknown`
+    /// and `Opaque` stand in for everything it declines to resolve — so a false
+    /// positive here would reject a valid program, which is much worse than the
+    /// false negative it replaces. It therefore judges only *fully-known
+    /// primitives*; every other pair is accepted and left to the backend.
+    ///
+    /// `rhs` is the source expression when the caller has one. Jestyr has no
+    /// integer inference variables (`ExprKind::Int` types as `i32` flat, see
+    /// `infer`), so a *literal* must be allowed to adopt the expected numeric
+    /// type or `let n: i64 = 5` would be an error.
+    fn assignable(&self, want: &Ty, got: &Ty, rhs: Option<ExprId>) -> bool {
+        if want == got {
+            return true;
+        }
+        // Only primitive-vs-primitive is judged. Anything else — named types,
+        // generics, slices, references, fn-pointers, `dyn` coercions — has a
+        // coercion story this pass does not model yet, so it is left alone.
+        let (Ty::Prim(w), Ty::Prim(g)) = (want, got) else {
+            return true;
+        };
+        // Within the text family (`str`/`String`/`cstr`/`os_str`/`Builder`/`Cow`)
+        // there are borrow/own conversions this pass does not model, so it
+        // declines to judge. *Across* families there is no implicit conversion
+        // at all, which is what makes `-> i32 { return "hello" }` reportable.
+        if prim_family(w) != prim_family(g) {
+            return false;
+        }
+        if prim_family(w) == PrimFamily::Text {
+            return true;
+        }
+        // Within the numeric family, only the **integer/floating boundary** is
+        // judged. Width and signedness changes (`i32` → `usize`, `i64` → `i32`)
+        // are conversions C performs silently, and whether Jestyr wants them to
+        // require an explicit `as` is an open language-design question — the
+        // self-hosted sources currently spell it both ways. Reporting them would
+        // be deciding that question here, so they are left alone; see
+        // `docs/structs-enums-design.md` §2.6.
+        if prim_family(w) == PrimFamily::Numeric && integer_prim(w) == integer_prim(g) {
+            return true;
+        }
+        // Only judge when the value's type is trustworthy — see `literal_defaulted`.
+        rhs.is_none_or(|e| self.literal_defaulted(e, w))
+    }
+
+    /// Might `e`'s inferred numeric type be an artifact of *literal defaulting*
+    /// rather than a real type the programmer chose?
+    ///
+    /// Jestyr has no integer inference variables: `ExprKind::Int` types as `i32`
+    /// flat, and binary arithmetic adopts its **left** operand's type. So in
+    /// `let lo: i64 = (0 - hi) - 1` with `hi: i64`, the right-hand side infers
+    /// as `i32` purely because the leftmost leaf is an untyped literal — the
+    /// program is perfectly well-typed. Any untyped literal in an arithmetic
+    /// position can poison the result this way.
+    ///
+    /// The principled fix is real literal inference, but `expr_types` is read by
+    /// `cgen`, whose output the goldens pin byte-for-byte. So instead of
+    /// changing what is inferred, [`assignable`] simply declines to judge an
+    /// expression whose type may have been defaulted. An explicit `as` cast
+    /// pins the type and is therefore *not* defaulted — `y as i64` is trusted.
+    ///
+    /// [`assignable`]: Self::assignable
+    /// `want` is the primitive the value is headed for, because defaulting is
+    /// directional: an integer literal may be written at any numeric type, but a
+    /// *float* literal at an integer type (`let n: i32 = 1.5`) is a genuine
+    /// mistake, not a defaulting artifact.
+    fn literal_defaulted(&self, e: ExprId, want: &str) -> bool {
+        match &self.ast.expr_at(e).kind {
+            ExprKind::Int(_) => true,
+            ExprKind::Float(_) => !integer_prim(want),
+            // A `comptime` block folds to a literal and types as `i32`/`bool`/`str`
+            // regardless of the width its body computed at (see `fold_comptime`).
+            ExprKind::Comptime(_) => true,
+            ExprKind::Unary { op: UnOp::Neg, rhs } => self.literal_defaulted(*rhs, want),
+            ExprKind::Binary { op, lhs, rhs } if !matches!(op, BinOp::And | BinOp::Or) => {
+                self.literal_defaulted(*lhs, want) || self.literal_defaulted(*rhs, want)
+            }
+            _ => false,
+        }
+    }
+
+    /// Report `got` supplied where `want` is required, unless [`assignable`]
+    /// says the pair is fine. `what` names the position for the message.
+    ///
+    /// [`assignable`]: Self::assignable
+    fn check_assignable(&mut self, want: &Ty, got: &Ty, rhs: Option<ExprId>, span: Span, what: &str) {
+        if self.assignable(want, got, rhs) {
+            return;
+        }
+        let (w, g) = (want.display(&self.table), got.display(&self.table));
+        let hint = match (want, got) {
+            (Ty::Prim(w), Ty::Prim(g)) if numeric_prim(w) && numeric_prim(g) => {
+                format!(" — an explicit `as {w}` converts")
+            }
+            _ => String::new(),
+        };
+        self.error(span, format!("{what}: expected `{w}`, found `{g}`{hint}"));
+    }
+
     /// Does the bare type name `name` (resolved from the current module) denote a
     /// generic enum (an `enum Name(T) { … }` template)?
     fn is_generic_enum(&self, name: &str) -> bool {
@@ -1813,6 +1914,19 @@ impl<'a> TypeChecker<'a> {
                                     got.display(&self.table)
                                 ),
                             );
+                        } else {
+                            // General assignability. Disjoint from the `distinct`
+                            // arm above (that one fires only on `Ty::Named`, this
+                            // one only on `Ty::Prim`), so a mismatch is reported
+                            // once with the more specific message.
+                            let (ann, got) = (ann.clone(), got.clone());
+                            self.check_assignable(
+                                &ann,
+                                &got,
+                                *init,
+                                name.span,
+                                &format!("`{}`", name.name),
+                            );
                         }
                     }
                     let bind = expected.unwrap_or_else(|| inferred.unwrap_or(Ty::Unknown));
@@ -1823,11 +1937,15 @@ impl<'a> TypeChecker<'a> {
                     if let Some(v) = value {
                         let prev = self.cur_expected.take();
                         self.cur_expected = self.cur_ret.clone();
-                        self.infer(scope, typ, self_ty, *v);
+                        let got = self.infer(scope, typ, self_ty, *v);
                         self.cur_expected = prev;
                         // `fn f() -> dyn Trait { return concrete }` coerces (Stage F).
                         if let Some(ret) = self.cur_ret.clone() {
                             self.record_dyn_coercion(*v, &ret);
+                            // `cur_ret` is the *ok* type of a fallible fn, so a
+                            // `return <T>` in a `-> T !E` compares against `T`.
+                            let span = self.ast.expr_at(*v).span;
+                            self.check_assignable(&ret, &got, Some(*v), span, "return");
                         }
                     }
                     result = Ty::Unit;
@@ -2097,11 +2215,16 @@ impl<'a> TypeChecker<'a> {
                     // backend so the call targets the right C symbol.
                     let key = self.canon_cur(&name);
                     let resolved = if self.owns_local(&name) {
-                        self.table.fns.get(&key).map(|sig| (sig.ret.clone(), sig.fallible, sig.params.len()))
+                        self.table.fns.get(&key).map(|sig| {
+                            let ptys: Vec<(String, Ty)> =
+                                sig.params.iter().map(|p| (p.name.clone(), p.ty.clone())).collect();
+                            (sig.ret.clone(), sig.fallible, ptys)
+                        })
                     } else {
                         None
                     };
-                    if let Some((ret, fallible, want)) = resolved {
+                    if let Some((ret, fallible, ptys)) = resolved {
+                        let want = ptys.len();
                         if key != name {
                             self.call_sym.insert(id, key.clone());
                         }
@@ -2110,6 +2233,23 @@ impl<'a> TypeChecker<'a> {
                                 span,
                                 format!("`{name}` expects {want} argument(s), found {}", args.len()),
                             );
+                        }
+                        // Argument-vs-parameter types. Only when the arity is
+                        // right — otherwise the positions do not correspond and
+                        // every pair would be spurious noise on top of the real
+                        // (arity) error.
+                        if want == args.len() {
+                            for ((pname, pty), a) in ptys.iter().zip(args.iter()) {
+                                let got = self.expr_types[a.0 as usize].clone();
+                                let sp = self.ast.expr_at(*a).span;
+                                self.check_assignable(
+                                    pty,
+                                    &got,
+                                    Some(*a),
+                                    sp,
+                                    &format!("argument `{pname}` of `{name}`"),
+                                );
+                            }
                         }
                         // For a generic call, resolve type parameters in the return.
                         let ret = self.monomorphize_ret(&key, args, typ, ret);
@@ -3335,6 +3475,38 @@ enum ColKind {
     WildOnly,
 }
 
+/// The coarse family a primitive belongs to. Conversions *within* a family may
+/// exist (integer widening, `str` → `String`); conversions *across* one never do
+/// implicitly, so a cross-family pair is the only thing [`TypeChecker::assignable`]
+/// is willing to call an error.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum PrimFamily {
+    Numeric,
+    Bool,
+    Char,
+    Text,
+}
+
+fn prim_family(p: &str) -> PrimFamily {
+    match p {
+        _ if numeric_prim(p) => PrimFamily::Numeric,
+        "bool" => PrimFamily::Bool,
+        "char" => PrimFamily::Char,
+        _ => PrimFamily::Text,
+    }
+}
+
+/// Is `p` one of the fixed-width integer primitives?
+fn integer_prim(p: &str) -> bool {
+    matches!(p, "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize")
+}
+
+/// Is `p` an integer or floating-point primitive? (`bool`/`char` are scalars but
+/// not numeric — they take no implicit numeric literal.)
+fn numeric_prim(p: &str) -> bool {
+    integer_prim(p) || matches!(p, "f32" | "f64")
+}
+
 /// Parse an integer literal's source text to a value (handles `_` separators and
 /// `0x`/`0b`/`0o` radices).
 fn parse_int_lit(text: &str) -> Option<i128> {
@@ -4488,6 +4660,84 @@ mod tests {
         let (_i2, d2) =
             analyze("distinct UserId = i32 fn main() -> i32 { var x: UserId = 5 as UserId return 0 }");
         assert!(d2.is_empty(), "explicit `as` is fine: {:?}", d2);
+    }
+
+    #[test]
+    fn assignability_is_checked_at_all_three_positions() {
+        // The initializer, the argument and the return expression each get the
+        // same treatment. (This is the program from the report that used to exit
+        // 0 with no diagnostics at all.)
+        let (_i, d) = analyze(
+            "fn takes_int(x: i32) -> i32 { return x }\n\
+             fn bad_return() -> i32 { return \"hello\" }\n\
+             fn main() -> i32 { let d: f64 = 1.5 let y: i32 = d let z: i32 = takes_int(d) return 0 }",
+        );
+        let msgs: Vec<&str> = d.iter().map(|m| m.message.as_str()).collect();
+        assert!(msgs.iter().any(|m| m.starts_with("`y`:")), "initializer: {msgs:?}");
+        assert!(msgs.iter().any(|m| m.starts_with("argument `x`")), "argument: {msgs:?}");
+        assert!(msgs.iter().any(|m| m.starts_with("return:")), "return: {msgs:?}");
+    }
+
+    #[test]
+    fn a_wrong_family_is_reported_but_an_explicit_cast_is_accepted() {
+        let (_i, d) = analyze("fn f() -> i32 { let n: i32 = 1.5 return n }");
+        assert!(d.iter().any(|m| m.message.contains("found `f64`")), "{:?}", d);
+        let (_i2, d2) = analyze("fn f() -> i32 { let n: i32 = 1.5 as i32 return n }");
+        assert!(d2.is_empty(), "an explicit `as` pins the type: {:?}", d2);
+    }
+
+    #[test]
+    fn a_literal_adopts_the_expected_numeric_type() {
+        // Jestyr has no integer inference variables — `5` types as `i32` flat — so
+        // the check must not fire on a literal written at another numeric width.
+        for src in [
+            "fn f() -> i64 { let n: i64 = 5 return n }",
+            "fn f() -> f64 { let n: f64 = 1 return n }",
+            "fn f() -> u8 { let n: u8 = -3 + 4 return n }",
+        ] {
+            let (_i, d) = analyze(src);
+            assert!(d.is_empty(), "literal defaulting must be accepted in `{src}`: {:?}", d);
+        }
+    }
+
+    #[test]
+    fn a_literal_operand_makes_the_whole_expression_unjudgeable() {
+        // Binary arithmetic adopts its LEFT operand's type, so `0 - hi` infers as
+        // `i32` even when `hi: i64`. The program is well-typed; the check must
+        // stay out of it rather than report a phantom mismatch.
+        let (_i, d) =
+            analyze("fn f(hi: i64) -> f64 { let lo: f64 = (0 - hi) - 1 return lo }");
+        assert!(d.is_empty(), "a literal-defaulted operand is not judged: {:?}", d);
+    }
+
+    #[test]
+    fn integer_width_changes_are_deliberately_not_reported() {
+        // Whether `i32` -> `usize` needs an explicit `as` is an open language
+        // question (the self-hosted sources spell it both ways), so `assignable`
+        // stays silent on width/signedness. If Jestyr later decides these need a
+        // cast, this test is the one to invert.
+        let (_i, d) = analyze("fn g(i: usize) -> i32 { return 0 }\n\
+                               fn f(r: i32) -> i32 { return g(r) }");
+        assert!(d.is_empty(), "int-to-int width changes are not judged yet: {:?}", d);
+    }
+
+    #[test]
+    fn leniency_is_preserved_where_a_type_is_unknown() {
+        // An unresolved/external type stays `Opaque`, and a generic parameter is
+        // opaque by construction — neither may be judged, or the lenient checker
+        // would start rejecting valid programs.
+        let (_i, d) = analyze("fn f(x: Unknown1) -> i32 { let y: i32 = x return 0 }");
+        assert!(d.is_empty(), "an opaque type is not judged: {:?}", d);
+    }
+
+    #[test]
+    fn a_mismatched_argument_is_not_reported_on_top_of_an_arity_error() {
+        // Wrong arity means the positions do not correspond, so per-argument
+        // types would be noise stacked on the real error.
+        let (_i, d) = analyze("fn g(a: i32, b: i32) -> i32 { return a }\n\
+                               fn f() -> i32 { return g(1.5) }");
+        assert_eq!(d.len(), 1, "only the arity error: {:?}", d);
+        assert!(d[0].message.contains("expects 2 argument(s)"), "{:?}", d);
     }
 
     #[test]

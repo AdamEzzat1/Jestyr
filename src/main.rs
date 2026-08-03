@@ -535,8 +535,8 @@ fn run() -> ExitCode {
                 // a clean run means "the checks below found nothing", not "this program
                 // is well-typed". Keep this list in sync with what the pass reports.
                 println!(
-                    "ok: resolution, arity, visibility, trait-bound, exhaustiveness \
-                     and escape checks passed in {path}"
+                    "ok: resolution, arity, assignability, visibility, trait-bound, \
+                     exhaustiveness and escape checks passed in {path}"
                 );
                 return ExitCode::SUCCESS;
             }

@@ -266,11 +266,12 @@ distinct AccountId = i32
   scoped to *only fire when a distinct type is involved*, so the lenient checker is
   unaffected everywhere else. Demo [`examples/distinct.jtr`](../examples/distinct.jtr)
   (`1001, 42, 7`).
-- **Limitation:** enforcement currently covers `let` annotations (the common case); the
-  lenient checker doesn't yet type-check *call arguments* or *returns*, so passing a
-  distinct where its base is expected at a call isn't rejected yet — it lands when general
-  argument-vs-parameter type-checking does. Pairs well with refinements later
-  (`distinct Percent = u8` + `in 0..=100`).
+- **Limitation:** `distinct` enforcement still covers only `let` annotations. General
+  assignability (`typeck::assignable`) now runs at all three positions — initializer,
+  call argument, `return` expression — but judges *primitives* only, so a `distinct`
+  (a `Ty::Named`) passed where its base is expected at a call is still not rejected.
+  Extending `assignable` to nominal types subsumes this. Pairs well with refinements
+  later (`distinct Percent = u8` + `in 0..=100`).
 
 ### 2.7 Layout reflection  ✅ DONE
 
