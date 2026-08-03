@@ -9927,6 +9927,17 @@ pub fn push_sha256_hex(mut sb: String, read data: str) {
 // Increment 1 (this file's current reach): `hello.jtr` — the prelude, one `fn main -> i32`, a
 // `print_str("…")` intrinsic call, a string literal, and `return 0`. Everything else is denylisted.
 
+
+
+
+
+
+
+
+
+
+
+
 // ---- the fixed C prelude (mirrors Cgen::prelude) ----
 // A FIXED header block: includes + the `jestyr_rt_*` runtime + the JestyrStr/String/Cow/Builder
 // value types + the print/file-IO/argv intrinsics. Transcribed byte-for-byte from `cgen.rs`
