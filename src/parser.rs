@@ -1056,8 +1056,26 @@ impl<'src> Parser<'src> {
         self.parse_assignment()
     }
 
-    fn parse_assignment(&mut self) -> ExprId {
+    /// `base catch fallback` — recovery (design §7).
+    ///
+    /// Precedence sits **between** assignment and the binary operators, so
+    /// `let v = read(p) catch 0` groups as `v = (read(p) catch 0)` — the reading every
+    /// example in the design doc assumes. **Right-associative**, so a chain of
+    /// fallbacks `a catch b catch c` tries `a`, then `b`, then `c`, rather than
+    /// applying `c` to an already-recovered value.
+    fn parse_catch(&mut self) -> ExprId {
         let lhs = self.parse_binary(0);
+        if self.at(Catch) {
+            self.bump();
+            let fallback = self.parse_catch(); // right-associative
+            let span = self.ast.expr_at(lhs).span.to(self.ast.expr_at(fallback).span);
+            return self.ast.expr(ExprKind::Catch { base: lhs, fallback }, span);
+        }
+        lhs
+    }
+
+    fn parse_assignment(&mut self) -> ExprId {
+        let lhs = self.parse_catch();
         if let Some(op) = assign_op(self.cur().kind) {
             self.bump();
             let value = self.parse_assignment(); // right-associative

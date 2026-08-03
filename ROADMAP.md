@@ -221,10 +221,12 @@ smaller than traits:** unblocks callbacks, a real fn-pointer-vtable `Allocator`
 calling a fn-ptr *field* (`a.alloc_fn(...)`) collides with method-call sugar in
 typeck — needs the field-type to disambiguate.
 
-### I. Error-handling polish — ~70% (MED conflict; files: typeck, cgen)
-**Done:** error sets `T !E`, `?`, `ok`/`err`/`is_err`/`unwrap`. **Left:** error return
-**traces** (Zig-style); **`catch`** (keyword reserved); fallible **methods** (overlaps
-B); errors in more positions; richer error payloads.
+### I. Error-handling polish — ~80% (MED conflict; files: typeck, cgen)
+**Done:** error sets `T !E`, `?`, `ok`/`err`/`is_err`/`unwrap`, and **`catch`** — the
+recovery half of the story (`e catch fallback`, reference side; the port mirror and its
+corpus file are the next increment). **Left:** error return **traces** (Zig-style);
+`catch |e|` binding the error value; fallible **methods** (overlaps B); errors in more
+positions; richer error payloads.
 
 ### J. Numeric / operator completeness — ~70% (MED conflict; files: typeck, cgen)
 **Left:** defined integer-overflow semantics (wrap/saturate/checked — **Motley

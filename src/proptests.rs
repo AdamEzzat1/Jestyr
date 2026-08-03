@@ -9825,6 +9825,63 @@ fn main() -> i32 {
         String::from_utf8_lossy(&out.stdout).split_whitespace().map(|s| s.to_string()).collect()
     }
 
+    /// **`catch` recovers, and the fallback runs only when it must.**
+    ///
+    /// The short-circuit is the property worth *running* for: `catch` supplies a
+    /// fallback, not a default argument, so evaluating it on the success path would be
+    /// wasted work — and, for a fallback with side effects, plainly wrong. No amount of
+    /// reading the emitted text proves that; a fallback that prints does.
+    ///
+    /// The chain is the other case inspection would miss. `a catch b catch c` must be
+    /// **right-associative** so it tries each in turn; parsed the other way it would
+    /// apply `c` to an already-recovered value and quietly return the wrong one — and
+    /// both parses compile.
+    #[test]
+    fn catch_recovers_and_short_circuits() {
+        let src = "\
+struct P { x: i32, y: i32 }
+
+fn small(n: i32) -> i32 !{ TooBig } {
+    if n > 100 { return err(TooBig) }
+    return ok(n * 2)
+}
+fn noisy() -> i32 { print_int(999) return -1 }
+fn make() -> P !{ TooBig } { return err(TooBig) }
+
+// `catch` inside a FALLIBLE function: recovering one call must not change the
+// enclosing signature.
+fn inner(n: i32) -> i32 !{ TooBig } {
+    let v: i32 = small(500) catch n
+    return ok(v + 1)
+}
+
+fn main() -> i32 {
+    print_int((small(5) catch 0) as i64)                      // ok path  -> 10
+    print_int((small(500) catch 0) as i64)                    // err path -> 0
+    print_int((small(500) catch small(7) catch 99) as i64)    // -> 14, second wins
+    print_int((small(500) catch small(900) catch 99) as i64)  // -> 99, both fail
+    print_int((small(5) catch noisy()) as i64)                // NO 999 -> 10
+    print_int((small(500) catch noisy()) as i64)              // 999, then -1
+    let p: P = make() catch P { x: 3, y: 4 }
+    print_int(p.x as i64)
+    print_int(unwrap(inner(41)) as i64)
+    return 0
+}
+";
+        assert_eq!(
+            run_inline("catch", src),
+            [
+                "10", "0", // the ok path, then the err path
+                "14", "99", // right-associative chain: second wins; then both fail
+                "10", // the success path must NOT print 999 — the short-circuit
+                "999", "-1", // …and the error path must
+                "3",  // a struct ok-type recovers with a struct fallback
+                "42", // `catch` inside a fallible fn leaves it fallible
+            ],
+            "catch recovered to the wrong value, or evaluated its fallback eagerly"
+        );
+    }
+
     /// Emit `src`'s real C, append a `main` printing the C compiler's own
     /// `sizeof`/`_Alignof`/`offsetof` for every emitted struct, and require every number
     /// to match `layout::compute`. Shared by the declaration-order and reordered oracles

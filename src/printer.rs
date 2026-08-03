@@ -336,6 +336,9 @@ impl<'a> Printer<'a> {
             ExprKind::Deref { base } => format!("{}.*", self.expr_inline(*base)),
             ExprKind::Cast { expr, ty } => format!("{} as {}", self.expr_inline(*expr), self.type_str(*ty)),
             ExprKind::Try { base } => format!("{}?", self.expr_inline(*base)),
+            ExprKind::Catch { base, fallback } => {
+                format!("({} catch {})", self.expr_inline(*base), self.expr_inline(*fallback))
+            }
             ExprKind::Index { base, index } => {
                 format!("{}[{}]", self.expr_inline(*base), self.expr_inline(*index))
             }

@@ -233,6 +233,14 @@ pub enum ExprKind {
     Field { base: ExprId, name: Ident },
     Deref { base: ExprId }, // base.*
     Try { base: ExprId },   // base?
+    /// `base catch fallback` — **recover** from a fallible expression instead of
+    /// propagating it (design §7). Where `base?` returns the error to the caller,
+    /// `catch` supplies a value and carries on, so it is the one error form that is
+    /// legal in an *infallible* function.
+    ///
+    /// The fallback is evaluated **only** on the error path, which is why this lowers
+    /// to C's conditional operator rather than to two evaluated branches.
+    Catch { base: ExprId, fallback: ExprId },
     Index { base: ExprId, index: ExprId },
     Cast { expr: ExprId, ty: TypeId }, // `expr as T` — an explicit conversion
 
