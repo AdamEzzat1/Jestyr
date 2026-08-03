@@ -4823,11 +4823,20 @@ mod par_for_width {
         assert!(!c.contains("memcpy(&_pv0"), "{c}");
     }
 
-    /// A lane width per element type — 4 for `i64`, 8 for `i32`, 32 for `u8`. This is
-    /// what Q-W1 was for.
+    /// A lane width per **compute** element type — 4 for `i64`, 8 for `i32`, and 8 (not
+    /// 32) for `u8`, because an element narrower than `int` is promoted before it is
+    /// vectorized.
+    ///
+    /// This test used to assert `u8 → 32`, and that assertion was the bug. C promotes
+    /// `uint8_t` to `int` in the scalar remainder, so a 32-lane `uint8_t` vector head
+    /// computed in a different width from the remainder of its own loop and the two
+    /// disagreed silently: `x * x` over `[]i8` of `33` gave `65` per lane and `1089` per
+    /// scalar element. `simd_compute_elem` promotes first, which costs exactly the
+    /// density this test was written to celebrate — see that function for why paying it
+    /// is not optional.
     #[test]
-    fn lane_count_follows_the_element_type() {
-        for (t, w) in [("i64", 4), ("i32", 8), ("u8", 32)] {
+    fn lane_count_follows_the_compute_element_type() {
+        for (t, w) in [("i64", 4), ("u64", 4), ("i32", 8), ("u32", 8), ("i8", 8), ("u8", 8), ("i16", 8), ("u16", 8)] {
             let src = format!(
                 "fn sum_reduction() -> i64 {{ return 0 }}\n\
                  @simd fn f(read s: []{t}) -> i64 {{ return par for x in s reduce(sum_reduction()) {{ x }} }}\n"
@@ -4835,6 +4844,41 @@ mod par_for_width {
             let c = emitted(&src);
             assert!(c.contains(&format!("_pi0 + {w} <= _pf0.len")), "`{t}` should give {w} lanes:\n{c}");
         }
+    }
+
+    /// A promoted element is vectorized in `int32_t` lanes and loaded lane by lane; an
+    /// unpromoted one keeps the raw `memcpy` load it always had.
+    ///
+    /// The load matters as much as the width: `memcpy(…, sizeof(JestyrVec_i32))` over a
+    /// `[]i8` would read 32 *bytes* into 8 `int32_t` lanes — four source elements
+    /// reinterpreted per lane. Widening element by element is what makes the vector's
+    /// value equal to the promotion the scalar remainder performs.
+    #[test]
+    fn a_promoted_element_vectorizes_in_int32_lanes_with_a_widening_load() {
+        let narrow = emitted(
+            "fn sum_reduction() -> i64 { return 0 }\n\
+             @simd fn f(read s: []i8) -> i64 { return par for x in s reduce(sum_reduction()) { x * x } }\n",
+        );
+        assert!(
+            narrow.contains("typedef int32_t JestyrVec_i32 __attribute__((vector_size(32)));"),
+            "a `[]i8` body must compute in int32 lanes:\n{narrow}"
+        );
+        assert!(!narrow.contains("JestyrVec_i8"), "no int8 vector may be emitted:\n{narrow}");
+        assert!(
+            narrow.contains("for (size_t _pl0 = 0; _pl0 < 8; _pl0++) _pv0[_pl0] = _pf0.ptr[_pi0 + _pl0];"),
+            "a promoted element must be widened lane by lane, not memcpy'd:\n{narrow}"
+        );
+        // …and the remainder still reads the SOURCE width, which is what it must promote.
+        assert!(narrow.contains("int8_t j_x = _pf0.ptr[_pi0];"), "{narrow}");
+
+        // The unpromoted path is untouched — this is what keeps the corpus, the concat,
+        // the seed and every attested hash byte-identical.
+        let wide = emitted(
+            "fn sum_reduction() -> i64 { return 0 }\n\
+             @simd fn f(read s: []i32) -> i64 { return par for x in s reduce(sum_reduction()) { x * x } }\n",
+        );
+        assert!(wide.contains("memcpy(&_pv0, _pf0.ptr + _pi0, sizeof(JestyrVec_i32))"), "{wide}");
+        assert!(!wide.contains("_pl0"), "an unpromoted element needs no widening load:\n{wide}");
     }
 
     /// A select DOES lower to a mask blend in the vector half — the form GNU vector
@@ -11498,18 +11542,26 @@ fn main() -> i32 {
         );
     }
 
-    /// **The shipped `@simd` demo, on real OS threads.** Both loops are vectorized (8
-    /// `i32` lanes) over **11** elements, so every run goes through the scalar remainder
-    /// too, and each is checked against its serial reference in-program — the two `0`s.
+    /// **The shipped `@simd` demo, on real OS threads.** The `i32` loops are vectorized 8
+    /// lanes wide over **11** elements, so every run goes through the scalar remainder
+    /// too, and each is checked against its serial reference in-program — the `0`s.
     /// `absum`'s `if`/`else` body is the interesting one: a mask blend in the vector half,
     /// an ordinary conditional in the remainder, one source expression. Repeated to shake
     /// out any thread race.
+    ///
+    /// The `108900` is the promoted-element case, and it is the value that was **wrong**
+    /// before `simd_compute_elem`: `i8` lanes wrapped `33 * 33` to `65` while the scalar
+    /// remainder promoted to `int` and got `1089`, so the loop returned `10596` — 96
+    /// wrapped lanes plus a 4-element promoted tail. It is 100 elements precisely because
+    /// an 11-element version passes under the broken lowering too: 11 is below the 32
+    /// lanes an `int8_t` vector would hold, so the head processes nothing and the bug
+    /// hides entirely in the scalar tail.
     #[test]
     fn par_for_simd_demo() {
         for _ in 0..8 {
             assert_eq!(
                 toks("examples/std/par_for_simd.jtr"),
-                ["30", "0", "110", "0"],
+                ["30", "0", "110", "0", "108900", "0"],
                 "a vectorized `par for` diverged from serial"
             );
         }

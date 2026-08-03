@@ -18373,13 +18373,44 @@ fn sd_is_site(read g: Cg, eid: i32) -> bool {
     return false
 }
 
-// How many lanes of the element type fit in the fixed 32-byte vector.
-fn sd_lanes(read c: Checker, ety: i32) -> i32 {
+// Does C's integer promotion widen this element type? Mirrors `simd_compute_elem` on the
+// reference side, and exists for the same reason: a `par for` emits a vector head AND a
+// scalar remainder from one source expression, and in the remainder the loop variable is a
+// real `int8_t`, so C promotes it -- `j_x * j_x` is computed in `int` and only then
+// narrowed. GNU vector arithmetic has no such rule, it is elementwise at the vector's own
+// element type. Lower a `[]i8` body into `int8_t` lanes and the two halves of one loop
+// compute in different widths: `33 * 33` is `1089` in the remainder and `65` in the head.
+//
+// All four narrow types promote to SIGNED `int`, because `int` represents every value of
+// each -- including the unsigned two, which is why `~x` over `[]u8` must give `-34`, not
+// `222`. The cost is density: a `[]i8` body gets 8 lanes, not 32, the same as `i32`. Paying
+// it is not optional while Jestyr's own scalar arithmetic promotes -- `(a * a) as i64` for
+// `a: i8 = 33` is `1089` today, not `65`, whatever the type checker calls the product.
+fn sd_is_promoted(read c: Checker, ety: i32) -> bool {
     let d: TyData = get(TyData, c.tys, ety as usize)
-    if d.x == 0 { return 32 }                          // i8
-    if d.x == 5 { return 32 }                          // u8
-    if d.x == 1 { return 16 }                          // i16
-    if d.x == 6 { return 16 }                          // u16
+    if d.x == 0 { return true }                        // i8
+    if d.x == 5 { return true }                        // u8
+    if d.x == 1 { return true }                        // i16
+    if d.x == 6 { return true }                        // u16
+    return false
+}
+
+// The vector typedef NAME for a site's element: `JestyrVec_i32` for every promoted element,
+// so a `[]i8` site and a `[]i32` site share one typedef exactly as they do on the reference
+// side, and the dedup in `sd_vector_defs` collapses them.
+fn sd_push_vec_name(mut sb: String, read src: str, read c: Checker, ety: i32) {
+    string_push(sb, "JestyrVec_")
+    if sd_is_promoted(c, ety) { string_push(sb, "i32") }
+    else { push_ty_mangle(sb, src, c, ety) }
+}
+
+// How many source elements one vector iteration covers -- the lane count of the COMPUTE
+// element, never the source element's own width. A `[]i8` loop is 8 lanes wide, not 32;
+// reading the lane count straight off the source width is what made a `[]i8` reduction
+// return the wrong answer.
+fn sd_lanes(read c: Checker, ety: i32) -> i32 {
+    if sd_is_promoted(c, ety) { return 8 }             // promoted to int32_t lanes
+    let d: TyData = get(TyData, c.tys, ety as usize)
     if d.x == 2 { return 8 }                           // i32
     if d.x == 7 { return 8 }                           // u32
     return 4
@@ -18484,9 +18515,11 @@ fn sd_op(op: i32) -> str {
 // port's temps one ahead of the reference's, which is how this first showed up.
 fn sd_emit_par_for(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg, read e: ExprData, eid: i32, ety: i32, pfn: i32) {
     let w: i32 = sd_lanes(c, ety)
+    // The vector computes in the element's PROMOTED type, because the scalar remainder
+    // below does -- see `sd_is_promoted`. For an element C does not promote this is the
+    // element itself, so every program that vectorized before emits the same C it did.
     var vt: String = string_new()
-    string_push(vt, "JestyrVec_")
-    push_ty_mangle(vt, src, c, ety)
+    sd_push_vec_name(vt, src, c, ety)
     let vts: str = string_view(vt)
     var vv: String = string_new()
     string_push(vv, "_pv")
@@ -18519,15 +18552,42 @@ fn sd_emit_par_for(mut sb: String, read p: Parser, read src: str, read c: Checke
     string_push(sb, vts)
     string_push(sb, " ")
     string_push(sb, vvs)
-    string_push(sb, "; memcpy(&")
-    string_push(sb, vvs)
-    string_push(sb, ", _pf")
-    push_uint__cgen(sb, pfn as i64)
-    string_push(sb, ".ptr + _pi")
-    push_uint__cgen(sb, pfn as i64)
-    string_push(sb, ", sizeof(")
-    string_push(sb, vts)
-    string_push(sb, ")); ")
+    // The load. A promoted element is widened lane by lane -- the conversion is
+    // value-preserving and is the same one the remainder's promotion performs. An
+    // unpromoted element is copied as raw bytes, the byte-identical status quo. A
+    // `memcpy` of `sizeof(JestyrVec_i32)` over a `[]i8` would read 32 BYTES into 8 lanes,
+    // reinterpreting four source elements per lane, so this branch is not an optimization.
+    if sd_is_promoted(c, ety) {
+        string_push(sb, "; for (size_t _pl")
+        push_uint__cgen(sb, pfn as i64)
+        string_push(sb, " = 0; _pl")
+        push_uint__cgen(sb, pfn as i64)
+        string_push(sb, " < ")
+        push_uint__cgen(sb, w as i64)
+        string_push(sb, "; _pl")
+        push_uint__cgen(sb, pfn as i64)
+        string_push(sb, "++) ")
+        string_push(sb, vvs)
+        string_push(sb, "[_pl")
+        push_uint__cgen(sb, pfn as i64)
+        string_push(sb, "] = _pf")
+        push_uint__cgen(sb, pfn as i64)
+        string_push(sb, ".ptr[_pi")
+        push_uint__cgen(sb, pfn as i64)
+        string_push(sb, " + _pl")
+        push_uint__cgen(sb, pfn as i64)
+        string_push(sb, "]; ")
+    } else {
+        string_push(sb, "; memcpy(&")
+        string_push(sb, vvs)
+        string_push(sb, ", _pf")
+        push_uint__cgen(sb, pfn as i64)
+        string_push(sb, ".ptr + _pi")
+        push_uint__cgen(sb, pfn as i64)
+        string_push(sb, ", sizeof(")
+        string_push(sb, vts)
+        string_push(sb, ")); ")
+    }
     string_push(sb, vts)
     string_push(sb, " _pw")
     push_uint__cgen(sb, pfn as i64)
@@ -18615,18 +18675,21 @@ fn sd_vector_defs(mut sb: String, read p: Parser, read src: str, read c: Checker
         let eid: i32 = get(i32, g.sds, i)
         let e: ExprData = get(ExprData, p.ex, eid as usize)
         let ety: i32 = par_elem_ty(c, e.a)
+        // Keyed on the VECTOR name, not the source element: a `[]i8` site and a `[]i32`
+        // site both ask for `JestyrVec_i32` and must produce one typedef, not two.
         var key: String = string_new()
         string_push(key, "|")
-        push_ty_mangle(key, src, c, ety)
+        sd_push_vec_name(key, src, c, ety)
         string_push(key, "|")
         let ks: str = string_view(key)
         let ss: str = string_view(seen)
         if str_contains(ss, ks) == false {
             string_push(seen, ks)
             string_push(sb, "typedef ")
-            emit_ty_c(sb, p, src, c, ety)
-            string_push(sb, " JestyrVec_")
-            push_ty_mangle(sb, src, c, ety)
+            if sd_is_promoted(c, ety) { string_push(sb, "int32_t") }
+            else { emit_ty_c(sb, p, src, c, ety) }
+            string_push(sb, " ")
+            sd_push_vec_name(sb, src, c, ety)
             string_push(sb, " __attribute__((vector_size(32)));\n")
             any = true
         }

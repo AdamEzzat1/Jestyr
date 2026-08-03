@@ -6889,15 +6889,32 @@ impl<'a> Cgen<'a> {
         // than converted as a vector, which keeps the widening to `int64_t` exact for
         // every element width without reaching for `__builtin_convertvector`.
         if let Some(elem_v) = self.simd_sites.get(&site).cloned() {
-            let vt = self.simd_vec_name(&elem_v);
-            let w = simd_lanes(&elem_v);
+            // The vector computes in the element's PROMOTED type, because the scalar
+            // remainder below does — see `simd_compute_elem`. For an element that C does
+            // not promote this is the element itself, so every program that vectorized
+            // before emits exactly the C it emitted before.
+            let cv = simd_compute_elem(&elem_v);
+            let vt = self.simd_vec_name(&cv);
+            let w = simd_lanes(&cv);
+            // A promoted element is widened lane by lane on the way in; the conversion is
+            // value-preserving and is the same one the remainder's promotion performs. An
+            // unpromoted element is copied as raw bytes, which is both faster and the
+            // byte-identical status quo.
+            let load = if cv == elem_v {
+                format!("memcpy(&_pv{n}, _pf{n}.ptr + _pi{n}, sizeof({vt}));")
+            } else {
+                format!(
+                    "for (size_t _pl{n} = 0; _pl{n} < {w}; _pl{n}++) \
+                     _pv{n}[_pl{n}] = _pf{n}.ptr[_pi{n} + _pl{n}];"
+                )
+            };
             let vbody = self.emit_expr_simd(body, &vt, &var.name, &format!("_pv{n}"));
             return format!(
                 "({{ {sl} _pf{n} = {src}; \
                  int64_t* _pm{n} = (int64_t*)malloc(_pf{n}.len * sizeof(int64_t)); \
                  size_t _pi{n} = 0; \
                  for (; _pi{n} + {w} <= _pf{n}.len; _pi{n} += {w}) {{ \
-                 {vt} _pv{n}; memcpy(&_pv{n}, _pf{n}.ptr + _pi{n}, sizeof({vt})); \
+                 {vt} _pv{n}; {load} \
                  {vt} _pw{n} = (({vt}){{0}}) + ({vbody}); \
                  for (size_t _pk{n} = 0; _pk{n} < {w}; _pk{n}++) \
                  _pm{n}[_pi{n} + _pk{n}] = (int64_t)_pw{n}[_pk{n}]; }} \
@@ -8027,7 +8044,9 @@ impl<'a> Cgen<'a> {
     /// lowering has to be *chosen*, not begged for, or determinism sits at the
     /// optimizer's discretion. `CC_FLAGS` is untouched.
     fn simd_vector_defs(&mut self) {
-        let mut elems: Vec<Ty> = self.simd_sites.values().cloned().collect();
+        // Keyed on the COMPUTE element, so a `[]i8` site and a `[]i32` site ask for the
+        // same `JestyrVec_i32` and the dedup below collapses them into one typedef.
+        let mut elems: Vec<Ty> = self.simd_sites.values().map(simd_compute_elem).collect();
         elems.sort_by_key(|e| self.ty_mangle(e));
         elems.dedup_by_key(|e| self.ty_mangle(e));
         let any = !elems.is_empty();
@@ -11917,11 +11936,45 @@ mod tests {
 /// machine, which the attestation hash would rightly flag as a different program.
 const SIMD_VECTOR_BYTES: usize = 32;
 
-/// How many lanes of `elem` fit in that width.
+/// The element type a vectorized `par for` **computes in** — the source element after C's
+/// integer promotions.
+///
+/// This exists because `simd::classify` reasons in Jestyr's types and the emitted code runs
+/// under C's. A `par for` emits a vector head *and* a scalar remainder from one source
+/// expression, and in the remainder the loop variable is a real `int8_t`, so C promotes it:
+/// `j_x * j_x` is computed in `int` and only then narrowed. GNU vector arithmetic has no
+/// such rule — it is elementwise at the vector's own element type. Lower a `[]i8` body into
+/// `int8_t` lanes and the two halves of the same loop compute in different widths, which is
+/// exactly the silent divergence this function exists to remove: `33 * 33` is `1089` in the
+/// remainder and `65` in the head.
+///
+/// So every element narrower than `int` promotes to `int32_t`, matching the remainder
+/// exactly. All four of `i8`/`u8`/`i16`/`u16` promote to **signed** `int`, because `int` can
+/// represent every value of each — including the unsigned two, which is why `~x` over
+/// `[]u8` must yield `-34` and not `222`.
+///
+/// **The cost is density, and it is not optional.** A `[]i8` body computes in `int32_t`
+/// lanes, so one vector iteration covers 8 elements, not 32 — the same lane count an `i32`
+/// body gets. Narrow element types therefore buy load bandwidth, not lanes. The denser
+/// lowering is only available to a language whose scalar arithmetic already truncates at the
+/// element width, and Jestyr's does not: `(a * a) as i64` for `a: i8 = 33` is `1089` today,
+/// not `65`, even though the type checker calls the product an `i8`. Until that is settled
+/// one way or the other, agreeing with the remainder outranks filling the register — the
+/// whole `@simd` guarantee is that scalar and every lane width compute the same bits.
+fn simd_compute_elem(elem: &Ty) -> Ty {
+    match elem {
+        Ty::Prim("i8") | Ty::Prim("u8") | Ty::Prim("i16") | Ty::Prim("u16") => Ty::Prim("i32"),
+        other => other.clone(),
+    }
+}
+
+/// How many source elements one vector iteration covers.
+///
+/// Always called with a **compute** element ([`simd_compute_elem`]), never a raw source
+/// element — a `[]i8` loop is 8 lanes wide, not 32, and reading a lane count straight off
+/// the source width is the mistake that made a `[]i8` reduction return the wrong answer.
 fn simd_lanes(elem: &Ty) -> usize {
     let sz = match elem {
-        Ty::Prim("i8") | Ty::Prim("u8") => 1,
-        Ty::Prim("i16") | Ty::Prim("u16") => 2,
         Ty::Prim("i32") | Ty::Prim("u32") => 4,
         _ => 8,
     };

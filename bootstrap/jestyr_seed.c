@@ -1215,6 +1215,8 @@ bool jestyr_sd_classify(Jestyr_Parser j_p, JestyrStr j_src, int32_t j_eid);
 bool jestyr_sd_small_shift(Jestyr_Parser j_p, JestyrStr j_src, int32_t j_eid);
 void jestyr_sd_collect(Jestyr_Cg* restrict j_g, Jestyr_Parser j_p, JestyrStr j_src);
 bool jestyr_sd_is_site(Jestyr_Cg j_g, int32_t j_eid);
+bool jestyr_sd_is_promoted(Jestyr_Checker j_c, int32_t j_ety);
+void jestyr_sd_push_vec_name(JestyrString* restrict j_sb, JestyrStr j_src, Jestyr_Checker j_c, int32_t j_ety);
 int32_t jestyr_sd_lanes(Jestyr_Checker j_c, int32_t j_ety);
 void jestyr_sd_emit(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrStr j_src, int32_t j_eid, JestyrStr j_vt, JestyrStr j_lv, JestyrStr j_vv);
 JestyrStr jestyr_sd_op(int32_t j_op);
@@ -27857,25 +27859,48 @@ bool jestyr_sd_is_site(Jestyr_Cg j_g, int32_t j_eid)
     return false;
 }
 
-int32_t jestyr_sd_lanes(Jestyr_Checker j_c, int32_t j_ety)
+bool jestyr_sd_is_promoted(Jestyr_Checker j_c, int32_t j_ety)
 {
     Jestyr_TyData j_d = jestyr_get__TyData(j_c.j_tys, (size_t)(j_ety));
     if ((j_d.j_x == 0))
     {
-        return 32;
+        return true;
     }
     if ((j_d.j_x == 5))
     {
-        return 32;
+        return true;
     }
     if ((j_d.j_x == 1))
     {
-        return 16;
+        return true;
     }
     if ((j_d.j_x == 6))
     {
-        return 16;
+        return true;
     }
+    return false;
+}
+
+void jestyr_sd_push_vec_name(JestyrString* restrict j_sb, JestyrStr j_src, Jestyr_Checker j_c, int32_t j_ety)
+{
+    jestyr_rt_str_push(&(*j_sb), JSTR("JestyrVec_"));
+    if (jestyr_sd_is_promoted(j_c, j_ety))
+    {
+        jestyr_rt_str_push(&(*j_sb), JSTR("i32"));
+    }
+    else
+    {
+        jestyr_push_ty_mangle(&((*j_sb)), j_src, j_c, j_ety);
+    }
+}
+
+int32_t jestyr_sd_lanes(Jestyr_Checker j_c, int32_t j_ety)
+{
+    if (jestyr_sd_is_promoted(j_c, j_ety))
+    {
+        return 8;
+    }
+    Jestyr_TyData j_d = jestyr_get__TyData(j_c.j_tys, (size_t)(j_ety));
     if ((j_d.j_x == 2))
     {
         return 8;
@@ -28058,8 +28083,7 @@ void jestyr_sd_emit_par_for(JestyrString* restrict j_sb, Jestyr_Parser j_p, Jest
 {
     int32_t j_w = jestyr_sd_lanes(j_c, j_ety);
     JestyrString j_vt = jestyr_rt_str_new();
-    jestyr_rt_str_push(&j_vt, JSTR("JestyrVec_"));
-    jestyr_push_ty_mangle(&(j_vt), j_src, j_c, j_ety);
+    jestyr_sd_push_vec_name(&(j_vt), j_src, j_c, j_ety);
     JestyrStr j_vts = jestyr_rt_str_view(&j_vt);
     JestyrString j_vv = jestyr_rt_str_new();
     jestyr_rt_str_push(&j_vv, JSTR("_pv"));
@@ -28091,15 +28115,40 @@ void jestyr_sd_emit_par_for(JestyrString* restrict j_sb, Jestyr_Parser j_p, Jest
     jestyr_rt_str_push(&(*j_sb), j_vts);
     jestyr_rt_str_push(&(*j_sb), JSTR(" "));
     jestyr_rt_str_push(&(*j_sb), j_vvs);
-    jestyr_rt_str_push(&(*j_sb), JSTR("; memcpy(&"));
-    jestyr_rt_str_push(&(*j_sb), j_vvs);
-    jestyr_rt_str_push(&(*j_sb), JSTR(", _pf"));
-    jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_pfn));
-    jestyr_rt_str_push(&(*j_sb), JSTR(".ptr + _pi"));
-    jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_pfn));
-    jestyr_rt_str_push(&(*j_sb), JSTR(", sizeof("));
-    jestyr_rt_str_push(&(*j_sb), j_vts);
-    jestyr_rt_str_push(&(*j_sb), JSTR(")); "));
+    if (jestyr_sd_is_promoted(j_c, j_ety))
+    {
+        jestyr_rt_str_push(&(*j_sb), JSTR("; for (size_t _pl"));
+        jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_pfn));
+        jestyr_rt_str_push(&(*j_sb), JSTR(" = 0; _pl"));
+        jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_pfn));
+        jestyr_rt_str_push(&(*j_sb), JSTR(" < "));
+        jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_w));
+        jestyr_rt_str_push(&(*j_sb), JSTR("; _pl"));
+        jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_pfn));
+        jestyr_rt_str_push(&(*j_sb), JSTR("++) "));
+        jestyr_rt_str_push(&(*j_sb), j_vvs);
+        jestyr_rt_str_push(&(*j_sb), JSTR("[_pl"));
+        jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_pfn));
+        jestyr_rt_str_push(&(*j_sb), JSTR("] = _pf"));
+        jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_pfn));
+        jestyr_rt_str_push(&(*j_sb), JSTR(".ptr[_pi"));
+        jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_pfn));
+        jestyr_rt_str_push(&(*j_sb), JSTR(" + _pl"));
+        jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_pfn));
+        jestyr_rt_str_push(&(*j_sb), JSTR("]; "));
+    }
+    else
+    {
+        jestyr_rt_str_push(&(*j_sb), JSTR("; memcpy(&"));
+        jestyr_rt_str_push(&(*j_sb), j_vvs);
+        jestyr_rt_str_push(&(*j_sb), JSTR(", _pf"));
+        jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_pfn));
+        jestyr_rt_str_push(&(*j_sb), JSTR(".ptr + _pi"));
+        jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_pfn));
+        jestyr_rt_str_push(&(*j_sb), JSTR(", sizeof("));
+        jestyr_rt_str_push(&(*j_sb), j_vts);
+        jestyr_rt_str_push(&(*j_sb), JSTR(")); "));
+    }
     jestyr_rt_str_push(&(*j_sb), j_vts);
     jestyr_rt_str_push(&(*j_sb), JSTR(" _pw"));
     jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_pfn));
@@ -28187,7 +28236,7 @@ void jestyr_sd_vector_defs(JestyrString* restrict j_sb, Jestyr_Parser j_p, Jesty
         int32_t j_ety = jestyr_par_elem_ty(j_c, j_e.j_a);
         JestyrString j_key = jestyr_rt_str_new();
         jestyr_rt_str_push(&j_key, JSTR("|"));
-        jestyr_push_ty_mangle(&(j_key), j_src, j_c, j_ety);
+        jestyr_sd_push_vec_name(&(j_key), j_src, j_c, j_ety);
         jestyr_rt_str_push(&j_key, JSTR("|"));
         JestyrStr j_ks = jestyr_rt_str_view(&j_key);
         JestyrStr j_ss = jestyr_rt_str_view(&j_seen);
@@ -28195,9 +28244,16 @@ void jestyr_sd_vector_defs(JestyrString* restrict j_sb, Jestyr_Parser j_p, Jesty
         {
             jestyr_rt_str_push(&j_seen, j_ks);
             jestyr_rt_str_push(&(*j_sb), JSTR("typedef "));
-            jestyr_emit_ty_c(&((*j_sb)), j_p, j_src, j_c, j_ety);
-            jestyr_rt_str_push(&(*j_sb), JSTR(" JestyrVec_"));
-            jestyr_push_ty_mangle(&((*j_sb)), j_src, j_c, j_ety);
+            if (jestyr_sd_is_promoted(j_c, j_ety))
+            {
+                jestyr_rt_str_push(&(*j_sb), JSTR("int32_t"));
+            }
+            else
+            {
+                jestyr_emit_ty_c(&((*j_sb)), j_p, j_src, j_c, j_ety);
+            }
+            jestyr_rt_str_push(&(*j_sb), JSTR(" "));
+            jestyr_sd_push_vec_name(&((*j_sb)), j_src, j_c, j_ety);
             jestyr_rt_str_push(&(*j_sb), JSTR(" __attribute__((vector_size(32)));\n"));
             j_any = true;
         }
