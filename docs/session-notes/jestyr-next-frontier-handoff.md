@@ -888,25 +888,30 @@ anything below.**
 ### What is genuinely still open, in the order it is worth doing
 
 These are the rows that survive the correction above. Each is its own increment chain
-under the standing two-sided tax, and **none blocks any other**:
+under the standing two-sided tax, and **none blocks any other**. Three have since been
+closed; they are struck through with their commits, so the ordering rationale survives.
 
 1. **Error handling tier 3 — `catch` / recovery blocks.** `catch` is already a reserved
    word, and `?` propagation + typed error sets are done, so this is a surface on
    finished machinery rather than new semantics. The natural first increment is
    parse + typeck + a cgen lowering that is *provably* equivalent to the explicit
-   `match`, pinned by a property test comparing the two.
-2. **Allocation — transitive `@no_alloc`.** Today a `@no_alloc` function calling an
-   allocating one is accepted. The check is a call-graph closure over the escape
-   checker's existing per-body allocation facts; the interesting design question is
-   what to do at a call to an *unannotated* function (assume-allocates is sound and
-   noisy; infer-per-body is precise and needs a fixpoint).
-3. **Diagnostics tier 5 — machine-readable JSON.** Mechanical, self-contained, and
-   independently useful for editor integration; the diagnostic type already carries
-   everything (message, span, help, severity).
-4. **Diagnostics tiers 2–3 — suggested rewrites.** Highest *user-visible* value per
-   line of the lot, and it needs no new machinery: borrow escapes → suggest
-   region/genref/take, non-comptime array length → suggest `const`/`comptime`
-   (the diagnostic G1 added is the hook), missing match arm → name the variant.
+   `match`, pinned by a property test comparing the two. **The largest remaining item,
+   and the one with the most user-visible value.**
+2. ~~**Allocation — transitive `@no_alloc`.**~~ — **DONE (`b9225c2`).** The design
+   question this note flagged (what to do at a call to an unannotated function) resolved
+   as predicted: *infer per body* + a least fixpoint, since assume-allocates would make
+   the attribute unusable. The implementation reuses the **existing** per-op rules by
+   running the real checker as a probe, rather than restating "allocates" in a second
+   walker that could drift. Known boundary, documented: free functions by name only —
+   methods, closures and `fn(…)` pointers are not in the graph.
+3. ~~**Diagnostics tier 5 — machine-readable JSON.**~~ — **DONE (`563781c`).**
+   `jestyrc check <file> --json`. See `docs/diagnostics-json.md` for the contract and the
+   two deliberate non-choices (object not array; emission order not sorted).
+4. **Diagnostics tiers 2–3 — suggested rewrites.** Now the highest *user-visible* value
+   per line remaining, and it needs no new machinery: borrow escapes → suggest
+   region/genref/take, non-comptime array length → suggest `const`/`comptime` (the
+   diagnostic G1 added is the hook). **The missing-match-arm case is already done** —
+   `non_exhaustive_message` names the missing variants — so start from the other two.
 5. **Error handling tier 4 — debug error traces.**
 6. **Correctness tier 5 — `@verified`.** The planning slice first (obligation
    extraction + a `jestyrc obligations <file>` report), *not* an SMT backend. That
@@ -914,8 +919,20 @@ under the standing two-sided tax, and **none blocks any other**:
 7. **Unsafe/provenance v2.** Start as documentation plus lints, per the design note —
    a written contract for raw-pointer validity, aliasing, and the C interop boundary,
    with diagnostics that enforce the parts that are checkable today.
-8. **The `#line` port** (§1) — independent, optional, and needs a module-path C golden
-   built *first*.
+8. **The `#line` port** (§1) — its **prerequisite golden is now built** (`563781c`,
+   `jestyr_module_cgen_matches_reference_except_line_directives`), and building it
+   corrected §1: **`#line` is not the only module-path divergence, there are three.**
+   See the golden's doc comment. The emission port itself is still open, and the golden
+   tightens in three steps as it lands (drop the `#line` filter, drop the task-name
+   normalizer, set `strict_order` for every root).
+
+### Also closed in passing
+
+* **`xs[i].field = v` did not compile** (`2e4c963`) — a bounds-checked index lowers to a
+  statement expression, so writing through one was never a C lvalue. Reads always
+  worked, which is why it survived. The general place lowering also fixed nested-array
+  *reads* (`grid[i][j]`), which failed for the same reason. **Port mirror not due and not
+  done**, so `examples/std/*.jtr` still cannot write through an indexed place.
 
 **One standing caution for all of them:** anything that changes emitted C, an intrinsic,
 or a pass owes the port mirror **and** a seed refresh in the same commit (§0). Anything
