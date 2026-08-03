@@ -10780,6 +10780,137 @@ fn index_in_range(read g: Cg, read p: Parser, read src: str, base: i32, index: i
     return false
 }
 
+// ---- places (mirrors Cgen::{is_checked_index, place_through_checked_index, emit_place}) ----
+
+// Does `emit_expr` lower `eid` to a bounds-checked STATEMENT EXPRESSION — a `({ …; elem; })` that
+// yields a *value*? Legal wherever a value is wanted, illegal in all three place positions: the
+// left of `=`, the operand of `&`, and the base of another index.
+fn is_checked_index(read g: Cg, read p: Parser, read src: str, read c: Checker, eid: i32) -> bool {
+    let e: ExprData = get(ExprData, p.ex, eid as usize)
+    if e.kind != 6 { return false }                   // Index
+    // A slice spills only when the bounds check survives; a refinement-proved index emits
+    // `(b).ptr[(i)]`, which is already an lvalue.
+    if expr_is_slice(c, e.a) { return !index_in_range(g, p, src, e.a, e.b) }
+    let bt: i32 = get(i32, c.et, e.a as usize)
+    if bt < 0 { return false }
+    let bd: TyData = get(TyData, c.tys, bt as usize)
+    return bd.kind == 9                               // a fixed-size array ALWAYS spills through &base
+}
+
+// Is `eid` a place expression that reaches *through* a checked index (`xs[i].f`, `m[i][j]`,
+// `xs[i].f.g`)? Those are exactly the places `emit_expr` cannot produce. A *directly* indexed
+// target (`xs[i] = v`) is deliberately excluded — the Assign arm has its own lvalue lowering for
+// that, and keeping it is what leaves every existing program's emitted C unchanged.
+fn place_through_checked_index(read g: Cg, read p: Parser, read src: str, read c: Checker, eid: i32) -> bool {
+    let e: ExprData = get(ExprData, p.ex, eid as usize)
+    if e.kind != 5 and e.kind != 6 { return false }   // Field / Index
+    if is_checked_index(g, p, src, c, e.a) { return true }
+    return place_through_checked_index(g, p, src, c, e.a)
+}
+
+// Emit `eid` as a C LVALUE — a place, not a value. Identical to `emit_expr` for every form except
+// a checked index, which becomes the address-yielding `(*({ …; &elem; }))`: the statement
+// expression produces a *pointer*, and dereferencing it gives back a place, so a projection chain
+// can continue through it. `wr` selects the qualifier on the spilled base pointer — a read keeps
+// `const` (as `emit_expr` does) so indexing a `static const` table does not discard the qualifier;
+// a write must not, or the store goes through a pointer-to-const.
+fn emit_place(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg, eid: i32, wr: bool) {
+    let e: ExprData = get(ExprData, p.ex, eid as usize)
+    if e.kind == 5 {                                  // Field
+        let bt: i32 = get(i32, c.et, e.a as usize)
+        var barr: bool = false
+        if bt >= 0 {
+            let bd: TyData = get(TyData, c.tys, bt as usize)
+            if bd.kind == 9 { barr = true }
+        }
+        // Only a struct-shaped base projects to an assignable field. A slice's `.ptr`/`.len`, a
+        // `str`'s views and an array's constant `.len` are computed, never places.
+        if barr or expr_is_slice(c, e.a) or expr_is_str(c, e.a) or expr_is_prim(c, e.a, 17) {
+            emit_expr(sb, p, src, c, g, eid)
+            return
+        }
+        emit_place(sb, p, src, c, g, e.a, wr)
+        string_push(sb, ".j_")
+        string_push(sb, src[e.x as usize .. e.y as usize])
+        return
+    }
+    if e.kind == 6 {                                  // Index
+        let bt: i32 = get(i32, c.et, e.a as usize)
+        if bt >= 0 {
+            let bd: TyData = get(TyData, c.tys, bt as usize)
+            if bd.kind == 9 {                         // array: `(*({ A* _a = &(<place>); …; &_a->a[_ix]; }))`
+                // The base is emitted as a place too, so an array of arrays keeps a real chain of
+                // addresses (`&m[i]` is legal because `m[i]` is itself an lvalue here).
+                var abuf: String = string_new()       // base/index emit BEFORE the temp
+                emit_place(abuf, p, src, c, g, e.a, wr)
+                var aibuf: String = string_new()
+                emit_expr(aibuf, p, src, c, g, e.b)
+                let na: i32 = g.tmp
+                g.tmp = g.tmp + 1
+                string_push(sb, "(*({ ")
+                if !wr { string_push(sb, "const ") }
+                emit_ty_c(sb, p, src, c, bt)
+                string_push(sb, "* _a")
+                push_uint__cgen(sb, na as i64)
+                string_push(sb, " = &(")
+                string_push(sb, string_view(abuf))
+                string_push(sb, "); size_t _ix")
+                push_uint__cgen(sb, na as i64)
+                string_push(sb, " = (size_t)(")
+                string_push(sb, string_view(aibuf))
+                string_push(sb, "); assert(_ix")
+                push_uint__cgen(sb, na as i64)
+                string_push(sb, " < ")
+                push_uint__cgen(sb, bd.b as i64)
+                string_push(sb, "); &_a")
+                push_uint__cgen(sb, na as i64)
+                string_push(sb, "->a[_ix")
+                push_uint__cgen(sb, na as i64)
+                string_push(sb, "]; }))")
+                string_free(abuf)
+                string_free(aibuf)
+                return
+            }
+        }
+        if expr_is_slice(c, e.a) and !index_in_range(g, p, src, e.a, e.b) {
+            // The spilled `{ptr,len}` view is a copy, but the address taken points into the
+            // *buffer*, so it outlives the statement expression — a slice copy names the same
+            // elements.
+            var sbuf: String = string_new()           // base/index emit BEFORE the temp
+            emit_expr(sbuf, p, src, c, g, e.a)
+            var sibuf: String = string_new()
+            emit_expr(sibuf, p, src, c, g, e.b)
+            let ns: i32 = g.tmp
+            g.tmp = g.tmp + 1
+            string_push(sb, "(*({ ")
+            emit_ty_c(sb, p, src, c, bt)
+            string_push(sb, " _s")
+            push_uint__cgen(sb, ns as i64)
+            string_push(sb, " = (")
+            string_push(sb, string_view(sbuf))
+            string_push(sb, "); size_t _ix")
+            push_uint__cgen(sb, ns as i64)
+            string_push(sb, " = (size_t)(")
+            string_push(sb, string_view(sibuf))
+            string_push(sb, "); assert(_ix")
+            push_uint__cgen(sb, ns as i64)
+            string_push(sb, " < _s")
+            push_uint__cgen(sb, ns as i64)
+            string_push(sb, ".len); &_s")
+            push_uint__cgen(sb, ns as i64)
+            string_push(sb, ".ptr[_ix")
+            push_uint__cgen(sb, ns as i64)
+            string_push(sb, "]; }))")
+            string_free(sbuf)
+            string_free(sibuf)
+            return
+        }
+        emit_expr(sb, p, src, c, g, eid)
+        return
+    }
+    emit_expr(sb, p, src, c, g, eid)
+}
+
 // ---- expressions (mirrors the relevant arms of Cgen::emit_expr) ----
 // Threads `read c: typeck.Checker` — Field/Index are type-directed (`.len` on a `str` is a real C
 // field; `s[lo..hi]` on a `str` is a `jestyr_rt_substr` sub-view).
@@ -11067,6 +11198,15 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
         if bt >= 0 {
             let bd: TyData = get(TyData, c.tys, bt as usize)
             if bd.kind == 9 {                         // array indexing: spill the address, assert, index
+                // An array index takes `&base`, so the base has to be a PLACE: for `m[i][j]` the
+                // inner `m[i]` is itself a checked index and `&({ … })` is not an lvalue. Every
+                // other base emits exactly as before (`emit_place` falls through to `emit_expr`).
+                // Base and index emit BEFORE the temp is taken — the reference's order, which
+                // only becomes observable once a base can allocate a temp of its own.
+                var rbuf: String = string_new()
+                emit_place(rbuf, p, src, c, g, e.a, false)
+                var ribuf: String = string_new()
+                emit_expr(ribuf, p, src, c, g, e.b)
                 let n: i32 = g.tmp
                 g.tmp = g.tmp + 1
                 string_push(sb, "({ const ")
@@ -11074,11 +11214,11 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                 string_push(sb, "* _a")
                 push_uint__cgen(sb, n as i64)
                 string_push(sb, " = &(")
-                emit_expr(sb, p, src, c, g, e.a)
+                string_push(sb, string_view(rbuf))
                 string_push(sb, "); size_t _ix")
                 push_uint__cgen(sb, n as i64)
                 string_push(sb, " = (size_t)(")
-                emit_expr(sb, p, src, c, g, e.b)
+                string_push(sb, string_view(ribuf))
                 string_push(sb, "); assert(_ix")
                 push_uint__cgen(sb, n as i64)
                 string_push(sb, " < ")
@@ -11088,6 +11228,8 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                 string_push(sb, "->a[_ix")
                 push_uint__cgen(sb, n as i64)
                 string_push(sb, "]; })")
+                string_free(rbuf)
+                string_free(ribuf)
                 return
             }
         }
@@ -11264,6 +11406,18 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
         return
     }
     if e.kind == 12 {                                 // Assign: `<target> <aop> <value>` (stmt adds `;`)
+        // A target that reaches THROUGH a checked index (`xs[i].f = v`, `m[i][j] = v`) is a place
+        // `emit_expr` cannot produce at all — it would yield the statement-expression *value*, and
+        // gcc reports "lvalue required as left operand of assignment". `emit_place` lowers the
+        // whole projection chain through element addresses.
+        if place_through_checked_index(g, p, src, c, e.a) {
+            emit_place(sb, p, src, c, g, e.a, true)
+            string_push(sb, " ")
+            string_push(sb, assign_c(e.op))
+            string_push(sb, " ")
+            emit_expr(sb, p, src, c, g, e.b)
+            return
+        }
         let tgt: ExprData = get(ExprData, p.ex, e.a as usize)
         if tgt.kind == 6 {
             let btid: i32 = get(i32, c.et, tgt.a as usize)

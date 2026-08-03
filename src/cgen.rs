@@ -4210,6 +4210,16 @@ impl<'a> Cgen<'a> {
                 format!("({l} {} {r})", binop_c(*op))
             }
             ExprKind::Assign { op, target, value } => {
+                // A target that reaches *through* a checked index (`xs[i].f = v`,
+                // `m[i][j] = v`) is a place `emit_expr` cannot produce at all — it
+                // would yield the statement-expression *value* and gcc would report
+                // "lvalue required as left operand of assignment". `emit_place`
+                // lowers the whole projection chain through element addresses.
+                if self.place_through_checked_index(*target) {
+                    let t = self.emit_place(*target, true);
+                    let v = self.emit_expr(*value);
+                    return format!("{t} {} {v}", assign_c(*op));
+                }
                 // A slice-index target (`s[i] = v`) needs an *lvalue* — but `emit_expr`
                 // on an `Index` yields the bounds-checked *statement-expression*
                 // (an rvalue). Emit the bounds check then assign through the element
@@ -4310,7 +4320,15 @@ impl<'a> Cgen<'a> {
                     }
                 }
                 let proven = matches!(bt, Ty::Slice(_)) && self.index_in_range(*base, *index);
-                let b = self.emit_expr(*base);
+                // An array index takes `&base`, so the base has to be a *place*: for
+                // `m[i][j]` the inner `m[i]` is itself a checked index and `&({ … })`
+                // is "lvalue required as unary '&' operand". Every other base emits
+                // exactly as before (`emit_place` falls through to `emit_expr`).
+                let b = if matches!(bt, Ty::Array { .. }) {
+                    self.emit_place(*base, false)
+                } else {
+                    self.emit_expr(*base)
+                };
                 let i = self.emit_expr(*index);
                 if matches!(bt, Ty::Prim("str")) {
                     // A string view indexes into its byte buffer.
@@ -8127,6 +8145,107 @@ impl<'a> Cgen<'a> {
             && matches!(&ast.expr_at(*fb).kind, ExprKind::Name(n) if n.name == sname.name)
     }
 
+    /// Does `emit_expr` lower `id` to a bounds-checked *statement expression* —
+    /// a GNU `({ …; elem; })` that yields a **value**? Such a form is legal
+    /// wherever a value is wanted and illegal in all three place positions: the
+    /// left of `=`, the operand of `&`, and the base of another index.
+    fn is_checked_index(&self, id: ExprId) -> bool {
+        let ExprKind::Index { base, index } = &self.ast.expr_at(id).kind else { return false };
+        let bt = apply_subst(&self.info.type_of(*base).clone(), &self.subst);
+        match bt {
+            // A fixed-size array always spills through `&base` and yields `_a->a[_ix]`.
+            Ty::Array { .. } => true,
+            // A slice spills only when the bounds check survives; a refinement-proved
+            // index emits `(b).ptr[(i)]`, which is already an lvalue.
+            Ty::Slice(_) => !self.index_in_range(*base, *index),
+            _ => false,
+        }
+    }
+
+    /// Is `id` a place expression that reaches *through* a checked index — e.g.
+    /// `xs[i].f`, `m[i][j]`, `xs[i].f.g`? Those are exactly the places `emit_expr`
+    /// cannot produce, so they must go through [`Self::emit_place`].
+    ///
+    /// A *directly* indexed target (`xs[i] = v`, `s[i] = v`) is **not** included:
+    /// the `Assign` arm has always had its own lvalue lowering for that, and
+    /// keeping it means the emitted C of every existing program is unchanged.
+    fn place_through_checked_index(&self, id: ExprId) -> bool {
+        match &self.ast.expr_at(id).kind {
+            ExprKind::Field { base, .. } | ExprKind::Index { base, .. } => {
+                self.is_checked_index(*base) || self.place_through_checked_index(*base)
+            }
+            _ => false,
+        }
+    }
+
+    /// Emit `id` as a C **lvalue** — a place, not a value.
+    ///
+    /// Identical to `emit_expr` for every form except a checked index, which
+    /// becomes the address-yielding `(*({ …; &elem; }))`: the statement
+    /// expression produces a *pointer*, and dereferencing it gives back a place.
+    /// That is what lets a projection chain continue through it, so `xs[i].f = v`
+    /// assigns into the array and `m[i][j]` can take `&m[i]` for its own index.
+    ///
+    /// `write` selects the qualifier on the spilled base pointer. A read must keep
+    /// `const` (as `emit_expr` does) so indexing a `static const` table does not
+    /// discard the qualifier; an assignment target must not, or the write is
+    /// through a pointer-to-const.
+    fn emit_place(&mut self, id: ExprId, write: bool) -> String {
+        match &self.ast.expr_at(id).kind {
+            ExprKind::Field { base, name } => {
+                let base = *base;
+                let fname = name.name.clone();
+                let bt = apply_subst(&self.info.type_of(base).clone(), &self.subst);
+                // Only a struct-shaped base projects to an assignable field. A
+                // slice's `.ptr`/`.len`, a `str`'s views and an array's constant
+                // `.len` are computed, never places — leave them to `emit_expr`.
+                let projectable = !matches!(
+                    bt,
+                    Ty::Slice(_) | Ty::Array { .. } | Ty::Prim("str") | Ty::Prim("String")
+                ) && !self.info.qualified.contains_key(&id);
+                if !projectable {
+                    return self.emit_expr(id);
+                }
+                let b = self.emit_place(base, write);
+                format!("{b}.j_{fname}")
+            }
+            ExprKind::Index { base, index } => {
+                let (base, index) = (*base, *index);
+                let bt = apply_subst(&self.info.type_of(base).clone(), &self.subst);
+                if let Ty::Array { len, .. } = &bt {
+                    let nlen = *len;
+                    let aty = self.c_type(&bt);
+                    let qual = if write { "" } else { "const " };
+                    // The base is emitted as a *place* too, so an array of arrays
+                    // keeps a real chain of addresses (`&m[i]` is legal because
+                    // `m[i]` is itself an lvalue here, not a statement expression).
+                    let b = self.emit_place(base, write);
+                    let i = self.emit_expr(index);
+                    let n = self.tmp;
+                    self.tmp += 1;
+                    return format!(
+                        "(*({{ {qual}{aty}* _a{n} = &({b}); size_t _ix{n} = (size_t)({i}); assert(_ix{n} < {nlen}); &_a{n}->a[_ix{n}]; }}))"
+                    );
+                }
+                if matches!(bt, Ty::Slice(_)) && !self.index_in_range(base, index) {
+                    // The spilled `{ptr,len}` view is a copy, but the address taken
+                    // points into the *buffer*, so it outlives the statement
+                    // expression — a slice copy still names the same elements.
+                    let sty = self.c_type(&bt);
+                    let b = self.emit_expr(base);
+                    let i = self.emit_expr(index);
+                    let n = self.tmp;
+                    self.tmp += 1;
+                    return format!(
+                        "(*({{ {sty} _s{n} = ({b}); size_t _ix{n} = (size_t)({i}); assert(_ix{n} < _s{n}.len); &_s{n}.ptr[_ix{n}]; }}))"
+                    );
+                }
+                self.emit_expr(id)
+            }
+            _ => self.emit_expr(id),
+        }
+    }
+
     fn error_tag_of(&self, id: ExprId) -> Option<i64> {
         match &self.ast.expr_at(id).kind {
             ExprKind::Name(n) => self.error_tags.get(&n.name).copied(),
@@ -11160,6 +11279,64 @@ mod tests {
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains(".ptr[_ix0] = j_v"), "lvalue element assignment: {c}");
         assert!(c.contains("assert(_ix0 < "), "with a bounds check: {c}");
+    }
+
+    #[test]
+    fn a_field_through_an_array_index_assigns_through_the_element_address() {
+        // `xs[i].f = v` — the target is a place reached *through* a checked index.
+        // `emit_expr` lowers that index to a statement expression yielding a *value*,
+        // so the old emission was `({ …; _a->a[_ix]; }).j_b = 9` and gcc reported
+        // "lvalue required as left operand of assignment". The place form yields the
+        // element's ADDRESS and derefs it, and the spilled pointer must not be
+        // `const` — this is a write.
+        let src = "struct T { a: u8, b: u64 } fn set() { var xs: [3]T = [T { a: 1, b: 2 }; 3] xs[1].b = 9 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("&_a1->a[_ix1]; })).j_b = 9"), "field assigned through the element address: {c}");
+        assert!(c.contains("assert(_ix1 < 3)"), "with the constant-length bounds check: {c}");
+        assert!(!c.contains("const JestyrArr_T_3* _a1"), "the write path takes a non-const pointer: {c}");
+    }
+
+    #[test]
+    fn a_field_through_a_slice_index_assigns_through_the_element_address() {
+        // The same defect on the slice side: only a refinement-*proved* index emitted
+        // an lvalue (`(s).ptr[(i)]`), so an unproved `s[i].f = v` needed the address
+        // form. The `{ptr,len}` view is still spilled to a temp (so a side-effecting
+        // base is evaluated once) — the address taken points into the buffer, not
+        // into the copy, which is why it outlives the statement expression.
+        let src = "struct T { a: u8, b: u64 } fn set(mut s: []T) { s[1].b = 9 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("&_s0.ptr[_ix0]; })).j_b = 9"), "field assigned through the element address: {c}");
+        assert!(c.contains("assert(_ix0 < _s0.len)"), "with the slice bounds check: {c}");
+    }
+
+    #[test]
+    fn a_nested_array_index_is_a_place_on_both_the_read_and_the_write_path() {
+        // `m[i][j]` — the *base* of the outer index is itself a checked index, and an
+        // array index takes `&base`. So this shape was broken in BOTH directions:
+        // `&({ … })` is "lvalue required as unary '&' operand", which means the read
+        // failed to compile as well as the write. Emitting the base as a place fixes
+        // both, and the read keeps its `const` qualifier while the write drops it.
+        let src = "fn m2() -> i64 { var m: [2][3]i64 = [[0; 3]; 2] m[0][1] = 5 return m[0][1] }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("&_a3->a[_ix3]; })) = 5"), "the write assigns through the element address: {c}");
+        assert!(c.contains("JestyrArr_i64_3* _a3 = &((*({ JestyrArr_arr_i64_3_2* _a2"), "the write's base is a non-const place: {c}");
+        assert!(c.contains("const JestyrArr_i64_3* _a5 = &((*({ const JestyrArr_arr_i64_3_2* _a4"), "the read's base is a const place: {c}");
+    }
+
+    #[test]
+    fn a_directly_indexed_assignment_target_keeps_its_existing_lowering() {
+        // The place form is deliberately NOT used for a target that is *itself* an
+        // index: `xs[i] = v` and `s[i] = v` have had their own lvalue lowering since
+        // the beginning, and reusing it is what keeps the emitted C of every existing
+        // program byte-identical (140 corpus files, the concat, the seed and every
+        // attested hash all key on this text).
+        let (c, d) = gen("fn set() { var xs: [4]i64 = [0; 4] xs[2] = 11 }");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("_a1->a[_ix1] = 11; })"), "the statement-expression form is unchanged: {c}");
+        assert!(!c.contains("&_a1->a[_ix1]"), "no address form for a direct target: {c}");
     }
 
     #[test]

@@ -1,0 +1,65 @@
+// examples/nested_place.jtr — assigning THROUGH a bounds-checked index.
+//
+//   jestyrc run examples/nested_place.jtr   →  9, 2, 10, 5, 41, 7, 20
+//
+// An index is lowered to a bounds-checked statement expression, which yields a
+// *value*. That is exactly what a read wants — but `xs[i].b = 9` needs a
+// **place**, and so does `m[i][j]` on *either* side, because an array index takes
+// the address of its base. Both lower through the element's ADDRESS instead, so
+// the projection chain stays assignable: the bounds check is still emitted, and
+// the write lands in the array rather than in a copy of one element.
+//
+// A directly indexed target (`xs[i] = v`) has always had its own lvalue
+// lowering and is unchanged — see `examples/arrays.jtr` and `examples/slices.jtr`.
+
+struct Cell {
+    a: u8,
+    b: u64,
+}
+
+struct Row {
+    head: Cell,
+    n: i64,
+}
+
+// Through a SLICE index. The `{ptr,len}` view is copied into a temp so a
+// side-effecting base is evaluated once, but the address taken points into the
+// *buffer*, not into the copy — so the caller sees the write.
+fn bump(mut s: []Cell, v: u64) {
+    s[1].b = v
+}
+
+fn main() -> i32 {
+    // A field through an ARRAY index. The index is a variable, so the bounds
+    // check is real rather than folded away.
+    var xs: [3]Cell = [Cell { a: 1, b: 2 }; 3]
+    var i: i64 = 1
+    xs[i].b = 9
+    print_int(xs[i].b as i64)           // 9
+    print_int(xs[0].b as i64)           // 2  — only element 1 was written
+
+    // Compound assignment names the same place for the read and the write.
+    xs[i].b += 1
+    print_int(xs[i].b as i64)           // 10
+
+    // A NESTED array: `m[i][j]` is a place on both sides.
+    var m: [2][3]i64 = [[0; 3]; 2]
+    m[0][1] = 5
+    m[1][2] = m[0][1] + 36
+    print_int(m[0][1])                  // 5
+    print_int(m[1][2])                  // 41
+
+    // A longer chain — a field of a field of an element.
+    var rows: [2]Row = [Row { head: Cell { a: 0, b: 0 }, n: 0 }; 2]
+    rows[1].head.a = 7
+    print_int(rows[1].head.a as i64)    // 7
+
+    var p: *mut Cell = alloc(Cell, 2)
+    var cs: []Cell = slice(Cell, p, 2)
+    cs[0] = Cell { a: 0, b: 0 }
+    cs[1] = Cell { a: 0, b: 0 }
+    bump(cs, 20)
+    print_int(cs[1].b as i64)           // 20
+    free_ptr(p)
+    return 0
+}

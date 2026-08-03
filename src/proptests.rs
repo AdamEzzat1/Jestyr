@@ -10099,7 +10099,7 @@ fn main() -> i32 {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr"];
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr"];
 
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
@@ -10944,6 +10944,22 @@ fn main() -> i32 {
                 "nested drop order/count wrong"
             );
         }
+    }
+    #[test]
+    fn nested_place_demo() {
+        // Assignment THROUGH a bounds-checked index, end to end through real gcc — which is
+        // the authority here, because the defect was not a wrong value but C that did not
+        // compile at all ("lvalue required as left operand of assignment").
+        //
+        // The token stream is chosen so a write that lands in a *copy* of the element still
+        // fails: `2` is element 0 read back right after element 1 was written, and `41` is a
+        // nested read of a cell written through a different chain. A lowering that silently
+        // discarded the store would print `2`→`9` or `41`→`36`.
+        assert_eq!(
+            toks("examples/nested_place.jtr"),
+            ["9", "2", "10", "5", "41", "7", "20"],
+            "write through a checked index did not land in the aggregate"
+        );
     }
     #[test]
     fn drop_glue_for_struct_named_like_generic_param() {
