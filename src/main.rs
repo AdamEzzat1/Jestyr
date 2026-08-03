@@ -529,7 +529,15 @@ fn run() -> ExitCode {
                 };
             }
             if diags.is_empty() {
-                println!("ok: no type or ownership errors in {path}");
+                // Name the checks that actually ran. The old wording ("no type or
+                // ownership errors") claimed a *categorical* guarantee this pass does
+                // not make: `typeck` is deliberately lenient (see its module docs), so
+                // a clean run means "the checks below found nothing", not "this program
+                // is well-typed". Keep this list in sync with what the pass reports.
+                println!(
+                    "ok: resolution, arity, visibility, trait-bound, exhaustiveness \
+                     and escape checks passed in {path}"
+                );
                 return ExitCode::SUCCESS;
             }
             report_program(&prog.modules, &diags)
