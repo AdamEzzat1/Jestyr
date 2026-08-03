@@ -241,7 +241,15 @@ const SPECS: &[Spec] = &[
         name: "verified",
         targets: &[Target::Fn, Target::Method],
         args: Args::None,
-        status: Status::Reserved("static verification via SMT (design §7; see MOTLEY.md)"),
+        // Still reserved — promising proof while not proving would be unsafe — but the
+        // refusal now points somewhere useful. `jestyrc obligations` reports exactly
+        // what this attribute would have to discharge, which is both the honest answer
+        // to "what does it do?" and the measurement the decision to build a solver
+        // rests on.
+        status: Status::Reserved(
+            "static verification via SMT (design §7; see MOTLEY.md) — \
+             run `jestyrc obligations <file>` to see what it would have to prove",
+        ),
     },
     Spec {
         name: "doc_hidden",

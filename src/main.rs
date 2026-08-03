@@ -20,6 +20,8 @@
 //!   jestyrc tokens <file.jtr>   stop after lexing and dump the token stream
 //!   jestyrc layout <file.jtr>   report every type's size, alignment, field offsets
 //!                               and padding waste (analysis only — emits nothing)
+//!   jestyrc obligations <file.jtr>  report what a `@verified` build would have to
+//!                               prove (contracts, invariants, refinements)
 //!   jestyrc simd   <file.jtr>   report which `par for` loops may be evaluated a SIMD
 //!                               lane at a time, and why not (analysis only)
 //!   jestyrc doc    <file.jtr>   render the file's API docs as Markdown (--html for HTML)
@@ -45,6 +47,7 @@ mod escape;
 mod layout;
 mod lexer;
 mod module;
+mod obligations;
 mod parser;
 mod printer;
 mod sha256;
@@ -401,6 +404,19 @@ fn run() -> ExitCode {
                 }
             }
         }
+        Some("obligations") => {
+            // `obligations <file>` — report what a `@verified` build would have to
+            // prove: every declared precondition, postcondition, loop invariant,
+            // termination measure and parameter refinement. Analysis only, like
+            // `layout` and `simd` — it compiles nothing and emits nothing.
+            match args[2..].iter().find(|a| !a.starts_with("--")) {
+                Some(p) => return run_obligations(p),
+                None => {
+                    eprintln!("error: `obligations` needs a source file argument");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         Some("simd") => {
             // `simd <file>` — report which `par for` loops may be evaluated a lane at
             // a time under the determinism contract, and name the cause when one may
@@ -667,6 +683,35 @@ fn run_layout(path: &str) -> ExitCode {
     // "what does this struct cost?" is a question worth answering while editing it.
     let (info, _diags) = typeck::check(&ast);
     print!("{}", layout::render(&layout::compute(&ast, &info)));
+    ExitCode::SUCCESS
+}
+
+/// `jestyrc obligations <file>` — what a `@verified` build would have to prove.
+///
+/// Parsing is enough: an obligation is *declared* syntax, so this runs neither the type
+/// checker nor the backend. Type errors are therefore not fatal — "what does this
+/// function promise?" is a question worth answering while the function is still being
+/// written, the same call `layout` makes.
+fn run_obligations(path: &str) -> ExitCode {
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read `{path}`: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (tokens, ld) = Lexer::new(&src).tokenize();
+    let (ast, pd) = Parser::new(&src, tokens).parse();
+    let mut failed = false;
+    for d in ld.iter().chain(pd.iter()).filter(|d| d.is_error()) {
+        let lc = line_col(&src, d.span.start);
+        eprintln!("{path}:{}:{}: error: {}", lc.line, lc.col, d.message);
+        failed = true;
+    }
+    if failed {
+        return ExitCode::FAILURE;
+    }
+    print!("{}", obligations::render(&obligations::collect(&ast, &src)));
     ExitCode::SUCCESS
 }
 

@@ -191,6 +191,52 @@ fn recursive_deep_shapes_report_on_the_worker_stack() {
     });
 }
 
+/// **The obligation census over the whole corpus — the number the `@verified` sizing
+/// decision rests on.**
+///
+/// Extraction must be *total* (every corpus file, no panic, deterministic), and the
+/// count is worth knowing rather than guessing. It is currently **7 declared
+/// obligations across 144 files**, which is the finding: the corpus barely states any
+/// contracts, so an SMT backend would have almost nothing to discharge today. The
+/// prerequisite for `@verified` is therefore **writing contracts**, not building a
+/// solver — a conclusion available for the price of a report, and not otherwise.
+///
+/// The bound is deliberately an *upper* one rather than an equality: contracts should
+/// grow, and a test that failed when someone wrote a `requires` would be worse than
+/// useless. It fires when the corpus is contract-rich enough to re-open the question.
+#[test]
+fn obligation_extraction_is_total_over_the_corpus() {
+    let mut total = 0usize;
+    let mut files = 0usize;
+    for dir in ["examples", "examples/std"] {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("jtr") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&p).unwrap();
+            let (tokens, _) = crate::lexer::Lexer::new(&src).tokenize();
+            let (ast, _) = crate::parser::Parser::new(&src, tokens).parse();
+            let obs = crate::obligations::collect(&ast, &src);
+            // Deterministic — the report is meant to be pinned in CI.
+            let r = crate::obligations::render(&obs);
+            assert_eq!(r, crate::obligations::render(&crate::obligations::collect(&ast, &src)));
+            assert!(r.starts_with("obligations v1\n"), "{}", p.display());
+            // The omission is stated on every report, not just in the docs.
+            assert!(r.contains("implicit ones (bounds, overflow) are not counted"));
+            total += obs.len();
+            files += 1;
+        }
+    }
+    assert!(files > 100, "the corpus census must actually sweep the corpus ({files} files)");
+    assert!(
+        total < 100,
+        "the corpus now declares {total} obligations — enough to re-open the SMT sizing question"
+    );
+    eprintln!("OBLIGATION CENSUS: {total} declared obligations across {files} corpus files");
+}
+
 /// A minimal well-formedness check for a JSON document's **string literals**.
 ///
 /// Written by hand because the compiler has no JSON dependency, and aimed at the one
