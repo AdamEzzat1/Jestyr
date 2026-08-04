@@ -1947,6 +1947,14 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
         let bt: i32 = infer(c, p, src, d.a)
         let bd: TyData = list.get(TyData, c.tys, bt as usize)
         if bd.kind == 5 { r = bd.a }
+    } else if k == 45 {                            // catch `e catch v`: Result(ok) -> ok
+        // Recovery, not propagation: the fallback is inferred too (it is real code),
+        // and the whole expression has the OK type -- which is what makes `catch`
+        // legal in an infallible fn where `?` is not. Mirrors `ExprKind::Catch`.
+        let bt: i32 = infer(c, p, src, d.a)
+        let bd: TyData = list.get(TyData, c.tys, bt as usize)
+        infer(c, p, src, d.b)
+        if bd.kind == 5 { r = bd.a } else { r = mk_ty(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1) }
     } else if k == 6 {                             // index: slice/array -> elem; str -> u8 (range -> str)
         let bt: i32 = infer(c, p, src, d.a)
         infer(c, p, src, d.b)

@@ -1,0 +1,61 @@
+// examples/error_catch.jtr — `catch`: recovering from an error instead of propagating it.
+//
+// `?` and `catch` are the two halves of the error story, and they differ in *who*
+// handles the failure:
+//
+//     let q = small(n)?          // hand it to my caller — I stay fallible
+//     let q = small(n) catch 0   // handle it here — I do not
+//
+// Which is why `catch` is legal in an INFALLIBLE function (`main` below) where `?` is
+// not: recovering is precisely what turns a fallible call into an ordinary value.
+//
+// Run:  jestyrc run examples/error_catch.jtr   →  10, 0, 14, 99, 7, 3, 42
+
+struct P { x: i32, y: i32 }
+
+fn small(n: i32) -> i32 !{ TooBig } {
+    if n > 100 {
+        return err(TooBig)
+    }
+    return ok(n * 2)
+}
+
+fn make(n: i32) -> P !{ TooBig } {
+    if n > 100 {
+        return err(TooBig)
+    }
+    return ok(P { x: n, y: n })
+}
+
+// `catch` inside a FALLIBLE function: recovering one call does not change the
+// enclosing signature — this one still returns `i32 !{ TooBig }`.
+fn inner(n: i32) -> i32 !{ TooBig } {
+    let v: i32 = small(500) catch n
+    return ok(v + 1)
+}
+
+fn main() -> i32 {
+    // The ok path yields the value; the error path yields the fallback.
+    let a: i32 = small(5) catch 0
+    let b: i32 = small(500) catch 0
+    print_int(a as i64)              // 10
+    print_int(b as i64)              // 0
+
+    // `catch` is RIGHT-associative, so a chain tries each alternative in turn.
+    let c: i32 = small(500) catch small(7) catch 99
+    let d: i32 = small(500) catch small(900) catch 99
+    print_int(c as i64)              // 14 — the second alternative succeeds
+    print_int(d as i64)              // 99 — both fail, so the last fallback wins
+
+    // The fallback is evaluated ONLY on the error path, so a recovered value can be
+    // computed as expensively as it likes without costing the success path anything.
+    let e: i32 = small(3) catch small(50) catch 0
+    print_int(e as i64)              // 6 — `small(3)` succeeds, so neither fallback runs
+
+    // A struct ok-type recovers with a struct fallback.
+    let p: P = make(500) catch P { x: 3, y: 4 }
+    print_int(p.x as i64)            // 3
+
+    print_int(unwrap(inner(41)) as i64)   // 42
+    return 0
+}

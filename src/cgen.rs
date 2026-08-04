@@ -1481,6 +1481,11 @@ impl<'a> Cgen<'a> {
                 self.collect_structs_in_expr(*expr, subst, seen, order);
             }
             ExprKind::Try { base } => self.collect_structs_in_expr(*base, subst, seen, order),
+            // Both children, or a struct used *only* as a fallback gets no typedef.
+            ExprKind::Catch { base, fallback } => {
+                self.collect_structs_in_expr(*base, subst, seen, order);
+                self.collect_structs_in_expr(*fallback, subst, seen, order);
+            }
             ExprKind::StructLit { fields, spread, .. } => {
                 for fi in fields {
                     self.collect_structs_in_expr(fi.value, subst, seen, order);
@@ -2656,6 +2661,10 @@ impl<'a> Cgen<'a> {
             ExprKind::Deref { base } => self.collect_moved_expr(*base, out),
             ExprKind::Cast { expr, .. } => self.collect_moved_expr(*expr, out),
             ExprKind::Try { base } => self.collect_moved_expr(*base, out),
+            ExprKind::Catch { base, fallback } => {
+                self.collect_moved_expr(*base, out);
+                self.collect_moved_expr(*fallback, out);
+            }
             ExprKind::If { cond, then, els } => {
                 self.collect_moved_expr(*cond, out);
                 self.collect_moved(then, out);
@@ -5643,6 +5652,11 @@ impl<'a> Cgen<'a> {
             ExprKind::Deref { base } | ExprKind::Try { base } => {
                 self.find_closures_expr(*base, found, seen)
             }
+            // A closure written as a fallback still has to be lifted.
+            ExprKind::Catch { base, fallback } => {
+                self.find_closures_expr(*base, found, seen);
+                self.find_closures_expr(*fallback, found, seen);
+            }
             ExprKind::StructLit { fields, spread, .. } => {
                 for fi in fields {
                     self.find_closures_expr(fi.value, found, seen);
@@ -5776,6 +5790,10 @@ impl<'a> Cgen<'a> {
                 self.collect_refs(*index, out);
             }
             ExprKind::Deref { base } | ExprKind::Try { base } => self.collect_refs(*base, out),
+            ExprKind::Catch { base, fallback } => {
+                self.collect_refs(*base, out);
+                self.collect_refs(*fallback, out);
+            }
             ExprKind::StructLit { fields, spread, .. } => {
                 for fi in fields {
                     self.collect_refs(fi.value, out);
@@ -8846,6 +8864,12 @@ impl<'a> Cgen<'a> {
             ExprKind::Deref { base } => self.find_calls_expr(*base, subst, work),
             ExprKind::Cast { expr, .. } => self.find_calls_expr(*expr, subst, work),
             ExprKind::Try { base } => self.find_calls_expr(*base, subst, work),
+            // Both children, or a generic instantiated *only* in a fallback is never
+            // monomorphized — a missing symbol at link time rather than a diagnostic.
+            ExprKind::Catch { base, fallback } => {
+                self.find_calls_expr(*base, subst, work);
+                self.find_calls_expr(*fallback, subst, work);
+            }
             ExprKind::StructLit { fields, spread, .. } => {
                 for f in fields {
                     self.find_calls_expr(f.value, subst, work);

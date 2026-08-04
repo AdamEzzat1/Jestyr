@@ -75,10 +75,14 @@ groups as `v = (read(p) catch 0)`, which is the reading every example assumes.
   width and a struct literal gets its expected type. A `distinct` ok-type still needs an
   explicit `as`, exactly as a `let` annotation would.
 
+## Both sides
+
+`catch` is implemented in the Rust reference **and** in the self-hosted compiler
+(`parser.jtr` kind 45, `typeck.jtr`, `cgen.jtr`), byte-identical across the corpus, and
+the bootstrap seed carries it — so the gcc-only from-scratch compiler can build programs
+that recover. `examples/error_catch.jtr` is the worked example.
+
 ## Not yet
 
 * `catch |e| …` — binding the error value. Reserved in the design (§7), not implemented.
 * Error return **traces** (Zig-style).
-* The **port mirror**: `catch` exists in the Rust reference only, so no `examples/**.jtr`
-  may use it until `parser.jtr`/`typeck.jtr`/`cgen.jtr` mirror it and the bootstrap seed
-  is refreshed (the standing two-sided tax).

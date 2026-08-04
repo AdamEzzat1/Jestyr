@@ -16,13 +16,13 @@ still open"). **Five of those have now closed**: transitive `@no_alloc`, diagnos
 
 **What to pick up next, in order:**
 
-1. **The `catch` port mirror** — the smallest well-defined piece, and the one that
-   unblocks a corpus example. `catch` exists in the Rust reference only, so no
-   `examples/**.jtr` may use it until parser.jtr/typeck.jtr/cgen.jtr mirror it and the
-   seed is refreshed. The lowering is one conditional; the parse is one precedence level.
+1. ~~**The `catch` port mirror**~~ — **DONE** *(this session)*: both sides, corpus
+   **145** (`examples/error_catch.jtr`), seed refreshed. See item 1 below for the
+   collector-arm lesson it surfaced.
 2. **Error traces** (Error tier 4) — the largest remaining *feature*.
 3. **Unsafe/provenance v2** — the largest remaining item overall; start as a written
    contract plus lints, not a semantic rewrite.
+4. **`catch |e|`** — the error-binding form, on machinery that now exists on both sides.
 
 **Do NOT start an SMT backend.** The planning slice measured it: **7 declared
 obligations across 144 corpus files**, so a solver would have nothing to discharge. The
@@ -943,10 +943,20 @@ closed; they are struck through with their commits, so the ordering rationale su
    it lowers to C's conditional operator and is checked by *running* a fallback that
    prints. `catch` on an infallible expression is refused rather than accepted as a
    no-op. See `docs/error-handling.md`.
-   **STILL OPEN, and the next increment in this line:** the **port mirror** (`catch` is
-   reference-only, so no `examples/**.jtr` may use it until parser.jtr/typeck.jtr/
-   cgen.jtr mirror it and the seed is refreshed) and **`catch |e|`**, which binds the
-   error value — reserved in the design, not implemented.
+   **The port mirror is now DONE too** *(this session)* — parser.jtr (kind 45,
+   `parse_catch_tail` mirroring the reference's `parse_assignment` → `parse_catch` →
+   `parse_binary` layering), typeck.jtr (Result-unwrap to the ok type), cgen.jtr (the
+   conditional lowering, with base and fallback emitted into buffers **before** the
+   `_ct{n}` temp is allocated — the buffer-first temp-order rule X1 recorded). All
+   byte-identical on the first run; `examples/error_catch.jtr` is corpus **145**; seed
+   refreshed. Two things worth carrying: the reference's expression **collectors**
+   (structs/moves/refs/closures/calls) each needed a `Catch` arm or a struct/closure/
+   generic used *only in a fallback* would be silently dropped — grep `ExprKind::Try`
+   to find every walker a new expression form owes an arm; and the P2 dump harness's
+   catch-all prints `error` for an unhandled kind, so its `catch` arm went in **with**
+   the construct, not after a golden failed.
+   **STILL OPEN in this line:** **`catch |e|`**, which binds the error value — reserved
+   in the design, not implemented.
 2. ~~**Allocation — transitive `@no_alloc`.**~~ — **DONE (`f0e579d`).** The design
    question this note flagged (what to do at a call to an unannotated function) resolved
    as predicted: *infer per body* + a least fixpoint, since assume-allocates would make

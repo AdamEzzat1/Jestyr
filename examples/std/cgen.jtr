@@ -1800,6 +1800,49 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         string_push(sb, ".ok; })")
         return
     }
+    if e.kind == 45 {                                 // Catch `e catch v`: recover, don't propagate
+        // Where `?` early-returns the error, this substitutes a value and carries on --
+        // so it emits no `return` and needs no fallible enclosing fn. The fallback must
+        // be evaluated ONLY on the error path (it is a fallback, not a default
+        // argument), which is why this is C's conditional operator and not two
+        // statements. The base is spilled to a temp because it is read twice.
+        //
+        // BASE AND FALLBACK ARE EMITTED BEFORE `_ct{n}` IS ALLOCATED, matching the
+        // reference's temp order. Emitting them straight into `sb` would number this
+        // node's temp ahead of theirs the moment either allocates one.
+        var sbb: String = string_new()
+        emit_expr(sbb, p, src, c, g, e.a)
+        let n: i32 = g.tmp
+        g.tmp = g.tmp + 1
+        var svb: String = string_new()
+        emit_expr(svb, p, src, c, g, e.b)
+        let bt: i32 = list.get(i32, c.et, e.a as usize)
+        let btd: typeck.TyData = list.get(typeck.TyData, c.tys, bt as usize)
+        string_push(sb, "({ ")
+        emit_ty_c(sb, p, src, c, bt)                  // the base's own Result type
+        string_push(sb, " _ct")
+        push_uint(sb, n as i64)
+        string_push(sb, " = ")
+        string_push(sb, string_view(sbb))
+        if btd.kind == 5 and btd.a == 1 {             // `!E`-only: no `ok` member to read
+            string_push(sb, "; if (_ct")
+            push_uint(sb, n as i64)
+            string_push(sb, ".is_err) { ")
+            string_push(sb, string_view(svb))
+            string_push(sb, "; } })")
+        } else {
+            string_push(sb, "; _ct")
+            push_uint(sb, n as i64)
+            string_push(sb, ".is_err ? (")
+            string_push(sb, string_view(svb))
+            string_push(sb, ") : _ct")
+            push_uint(sb, n as i64)
+            string_push(sb, ".ok; })")
+        }
+        string_free(sbb)
+        string_free(svb)
+        return
+    }
     if e.kind == 37 {                                 // Closure: the lifted value at its creation site
         let k: i32 = closure_index_of(g, eid)
         if k < 0 { string_push(sb, "0")  return }     // uncollected (e.g. in a generic body): the diag case

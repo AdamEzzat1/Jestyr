@@ -246,6 +246,14 @@ fn mk_assign(mut p: Parser, start: usize, end: usize, op: i32, target: i32, valu
     list.push(ExprData, p.ex, ExprData{ kind: 12, start: start, end: end, op: op, a: target, b: value, x: 0 - 1, y: 0 - 1 })
     return id
 }
+// A Catch node `base catch fallback` (kind 45): `a`=base, `b`=fallback. Recovery -- the
+// half of the error story that handles a failure here instead of propagating it, which
+// is why it needs no fallible enclosing fn. Mirrors `ExprKind::Catch`.
+fn mk_catch(mut p: Parser, start: usize, end: usize, base: i32, fallback: i32) -> i32 {
+    let id: i32 = list.len(ExprData, p.ex) as i32
+    list.push(ExprData, p.ex, ExprData{ kind: 45, start: start, end: end, op: 0, a: base, b: fallback, x: 0 - 1, y: 0 - 1 })
+    return id
+}
 // A Range node `lo .. hi` / `lo ..= hi`: `op` is 1 when inclusive, `a`=lo, `b`=hi (either
 // -1 for an absent bound).
 fn mk_range(mut p: Parser, start: usize, end: usize, inclusive: i32, lo: i32, hi: i32) -> i32 {
@@ -2534,13 +2542,31 @@ fn parse_binary(mut p: Parser, min_bp: i32) -> i32 {
     return lhs
 }
 
+// The right operand of `catch`, and of a `catch` chain. Recurses into ITSELF rather than
+// into `parse_expr`, which is what makes the chain right-associative without letting an
+// assignment sneak into a fallback position (`a catch b = c` is not a fallback).
+fn parse_catch_tail(mut p: Parser) -> i32 {
+    let lhs: i32 = parse_binary(p, 0)
+    if cur_kind(p) == 53 {                         // `catch`
+        bump(p)
+        let fb: i32 = parse_catch_tail(p)
+        let s: usize = node_start(p, lhs)
+        let e: usize = node_end(p, fb)
+        return mk_catch(p, s, e, lhs, fb)
+    }
+    return lhs
+}
+
 // The full expression entry: assignment is the outermost, lowest-precedence layer, and is
 // right-associative (`a = b = c` is `a = (b = c)`). Everything else is a binary/unary/
 // postfix/primary chain. Mirrors `parse_expr`/`parse_assignment` in the reference.
 fn parse_expr(mut p: Parser) -> i32 {
     let saved: i32 = p.depth
     if !descend(p) { p.depth = saved  return err_here(p) }
-    let lhs: i32 = parse_binary(p, 0)
+    // `catch` sits BETWEEN assignment and the binary operators, so `let v = read(p)
+    // catch 0` groups as `v = (read(p) catch 0)`. Mirrors the reference's
+    // `parse_assignment` -> `parse_catch` -> `parse_binary` layering exactly.
+    let lhs: i32 = parse_catch_tail(p)
     let ac: i32 = assign_op(cur_kind(p))
     if ac != 0 {
         bump(p)
@@ -3111,6 +3137,11 @@ fn dump(read src: str, read p: Parser, id: i32) {
     } else if d.kind == 8 {
         print_str("try") print_uint(d.start) print_uint(d.end)
         dump(src, p, d.a)
+    } else if d.kind == 45 {
+        // `base catch fallback` -- base then fallback, mirroring `ref_dump_expr`.
+        print_str("catch") print_uint(d.start) print_uint(d.end)
+        dump(src, p, d.a)
+        dump(src, p, d.b)
     } else if d.kind == 10 {
         // Call: arg count, then the callee, then each argument (from the arg arena).
         print_str("call") print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
