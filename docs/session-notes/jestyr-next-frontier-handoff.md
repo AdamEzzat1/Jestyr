@@ -19,7 +19,14 @@ still open"). **Five of those have now closed**: transitive `@no_alloc`, diagnos
 1. ~~**The `catch` port mirror**~~ — **DONE** *(this session)*: both sides, corpus
    **145** (`examples/error_catch.jtr`), seed refreshed. See item 1 below for the
    collector-arm lesson it surfaced.
-2. **Error traces** (Error tier 4) — the largest remaining *feature*.
+2. ~~**Error traces** (Error tier 4)~~ — **DONE** *(this session)*: `--error-traces` on
+   build/run/emit-c. `err` = origin (reset + push), each `?` = hop, unwrap-on-error =
+   the stderr print. Opt-in per invocation → zero emission change for non-users (pinned
+   as an *absence* test — one stray `jestyr_et_` in plain emission is a corpus-wide
+   diff), stdout byte-identical even when a trace fires, no port mirror due. The
+   near-miss worth remembering: the first draft added a brace to the **flag-off** `?`
+   string ("just one redundant brace") — that alone would have diffed every fallible
+   corpus file against the port. See `docs/error-handling.md`.
 3. **Unsafe/provenance v2** — the largest remaining item overall; start as a written
    contract plus lints, not a semantic rewrite.
 4. **`catch |e|`** — the error-binding form, on machinery that now exists on both sides.

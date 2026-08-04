@@ -222,12 +222,14 @@ calling a fn-ptr *field* (`a.alloc_fn(...)`) collides with method-call sugar in
 typeck — needs the field-type to disambiguate.
 
 ### I. Error-handling polish — ~85% (MED conflict; files: typeck, cgen)
-**Done:** error sets `T !E`, `?`, `ok`/`err`/`is_err`/`unwrap`, and **`catch`** — the
+**Done:** error sets `T !E`, `?`, `ok`/`err`/`is_err`/`unwrap`; **`catch`** — the
 recovery half of the story (`e catch fallback`), **on both sides**: the port mirrors it
 byte-identically, `examples/error_catch.jtr` is the corpus example, and the bootstrap
-seed carries it. **Left:** error return **traces** (Zig-style); `catch |e|` binding the
-error value; fallible **methods** (overlaps B); errors in more positions; richer error
-payloads.
+seed carries it; and **error traces** (Zig-style, `--error-traces` — `err` is the
+origin, each `?` a hop, unwrap-on-error prints the path to stderr; opt-in
+per-invocation, so non-users are byte-identical and no port mirror is due). **Left:**
+`catch |e|` binding the error value; fallible **methods** (overlaps B); errors in more
+positions; richer error payloads.
 
 ### J. Numeric / operator completeness — ~70% (MED conflict; files: typeck, cgen)
 **Left:** defined integer-overflow semantics (wrap/saturate/checked — **Motley

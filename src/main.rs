@@ -14,6 +14,8 @@
 //!   jestyrc emit-c <file.jtr>   lower to C and print it
 //!   jestyrc build  <file.jtr>   lower to C and compile a native binary
 //!   jestyrc run    <file.jtr>   build, then execute the binary
+//!                               (build/run/emit-c take --error-traces: instrument
+//!                               err/`?`/unwrap with a Zig-style debug error trace)
 //!   jestyrc test   <file.jtr>   build & run the `@test`/`@bench` harness;
 //!                               `test <file> <substr>` runs only matching names,
 //!                               `test <file> --list` lists them (no compile)
@@ -336,6 +338,11 @@ fn run() -> ExitCode {
     // otherwise have to parse `error: …` prose.
     let json = args.iter().any(|a| a == "--json");
 
+    // `build/run/emit-c <file> --error-traces` — instrument the error paths with a
+    // Zig-style debug trace: `err` records the origin, each `?` a hop, and an
+    // `unwrap` of an error prints the path to stderr (Error-handling tier 4).
+    let error_traces = args.iter().any(|a| a == "--error-traces");
+
     // Subcommands that take a file argument.
     let sub = |name: &str, m: Mode| -> Option<Result<(Mode, String), ()>> {
         if args.get(1).map(String::as_str) == Some(name) {
@@ -612,6 +619,10 @@ fn run() -> ExitCode {
                 }
             } else if show_drops && matches!(mode, Mode::EmitC) {
                 cgen::emit_show_drops(&prog.ast, &info)
+            } else if error_traces {
+                // `--error-traces` (build/run/emit-c): instrument err/`?`/unwrap with
+                // the debug trace. Per-invocation, so nothing golden-shaped sees it.
+                cgen::emit_error_traces(&prog.ast, &info)
             } else {
                 cgen::emit(&prog.ast, &info)
             };

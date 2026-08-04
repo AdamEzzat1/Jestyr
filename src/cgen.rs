@@ -37,7 +37,7 @@ use crate::types::{prim_ty, ImplCall, MethodRes, Ty, TypeInfo, TypeKindG};
 /// Lower a program to C, ending with the ordinary entry-point wrapper around
 /// the user's `main`.
 pub fn emit(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
-    emit_program(ast, info, false, false, None)
+    emit_program(ast, info, false, false, None, false)
 }
 
 /// Like [`emit`], but annotates every inserted scope-exit drop call with a
@@ -45,14 +45,34 @@ pub fn emit(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
 /// the emitted C (drives `jestyrc emit-c --show-drops`). Implicit ≠ hidden: the
 /// "transparent cost" thesis says auto-inserted control flow must be inspectable.
 pub fn emit_show_drops(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
-    emit_program(ast, info, false, true, None)
+    emit_program(ast, info, false, true, None, false)
+}
+
+/// Like [`emit`], but instruments the error paths with a **debug error trace**
+/// (`jestyrc build/run <file> --error-traces` — roadmap Error-handling tier 4,
+/// Zig-style). Three instrumentation points:
+///
+/// * `err(E)` — the **origin**: resets the trace and records where the error was born.
+/// * `e?` — each **propagation** hop records itself before the early return, so the
+///   trace reads as the error's path up the stack.
+/// * `unwrap(e)` on an error — the **surfacing** point: prints the trace to stderr.
+///   (stderr, so the program's *stdout* — the thing the determinism canaries hash —
+///   is untouched even when a trace fires.)
+///
+/// Strictly opt-in and per-invocation: without the flag this function is never
+/// called and the emitted C is byte-identical, which is what keeps all corpus
+/// goldens, the attest hashes, the fixpoint and the seed out of scope. The trace
+/// buffer is a fixed-size ring in the emitted C — no allocation, no dependence on
+/// program state, so instrumentation cannot change program behaviour.
+pub fn emit_error_traces(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
+    emit_program(ast, info, false, false, None, true)
 }
 
 /// Lower a program to C in *test* mode: instead of the `main` wrapper, emit a
 /// harness `main` that runs every `@test` (reporting pass/fail) and times every
 /// `@bench`. Drives `jestyrc test` (roadmap workstream O).
 pub fn emit_tests(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
-    emit_program(ast, info, true, false, None)
+    emit_program(ast, info, true, false, None, false)
 }
 
 /// Like [`emit_tests`], but bakes only the `@test`/`@bench` items whose name
@@ -62,7 +82,7 @@ pub fn emit_tests(ast: &Ast, info: &TypeInfo) -> (String, Vec<Diagnostic>) {
 /// line equal to the *baked* count, so an empty filter is byte-for-byte the
 /// unfiltered harness. (Workstream O.)
 pub fn emit_tests_filtered(ast: &Ast, info: &TypeInfo, filter: Option<&str>) -> (String, Vec<Diagnostic>) {
-    emit_program(ast, info, true, false, filter)
+    emit_program(ast, info, true, false, filter, false)
 }
 
 /// A runnable harness entry: a `@test` (a no-arg `-> bool`, `true` = pass) or a
@@ -117,6 +137,7 @@ fn emit_program(
     test_mode: bool,
     show_drops: bool,
     test_filter: Option<&str>,
+    error_traces: bool,
 ) -> (String, Vec<Diagnostic>) {
     // Index every enum variant by name, so the backend can construct and match
     // on them by finding the owning enum and the variant's payload fields.
@@ -271,6 +292,7 @@ fn emit_program(
         test_mode,
         test_filter: test_filter.map(str::to_string),
         show_drops,
+        error_traces,
         drop_stack: Vec::new(),
         cur_moved: HashSet::new(),
         def_cap: None,
@@ -567,6 +589,10 @@ struct Cgen<'a> {
     /// annotate each inserted drop call with a `/* drop … */` comment so the
     /// implicit drop glue is inspectable (`--show-drops`). Implicit ≠ hidden.
     show_drops: bool,
+    /// instrument the error paths with a debug trace (`--error-traces`): `err` is the
+    /// origin, each `?` a hop, `unwrap`-on-error the surfacing print. Off for every
+    /// golden/corpus emission, so non-users are byte-identical.
+    error_traces: bool,
     /// the live-droppable stack: one entry per open `{ }` block, holding the owned
     /// `Drop`-implementing locals declared in it (in declaration order). A normal
     /// fall-through drops the top entry in reverse; a `return` drops every live
@@ -685,6 +711,28 @@ impl<'a> Cgen<'a> {
     /// indented) and the path is normalized to forward slashes so a Windows path
     /// like `C:\a\b.jtr` does not turn `\a`/`\b` into C string escapes. `#line` is
     /// purely additive: it never changes behavior or the locked FP determinism flags.
+    /// The `jestyr_et_push("<file>", <line>)` call for an error-trace hop at `span` —
+    /// or an empty string when tracing is off, so every instrumentation site can be
+    /// written unconditionally and non-users stay byte-identical by construction.
+    ///
+    /// Location resolution is `mark_line`'s (the module loader's `DebugInfo`, paths
+    /// normalized to forward slashes so the trace is host-independent). On the
+    /// single-file path `DebugInfo` is empty and there is no file to name; `<input>:0`
+    /// is emitted rather than nothing, so a trace still shows its *shape* (origin plus
+    /// hop count) even where the mapping has no names to offer.
+    fn et_push(&mut self, span: Span) -> String {
+        if !self.error_traces {
+            return String::new();
+        }
+        match self.info.debug.span_to_file_line(span) {
+            Some((p, l)) => {
+                let norm = p.replace('\\', "/");
+                format!("jestyr_et_push(\"{norm}\", {l}); ")
+            }
+            None => "jestyr_et_push(\"<input>\", 0); ".to_string(),
+        }
+    }
+
     fn mark_line(&mut self, span: Span) {
         // Resolve to an owned `(path, line)` first, ending the borrow of `self.info`
         // before mutating `self.out`/`self.dbg_last`.
@@ -718,6 +766,29 @@ impl<'a> Cgen<'a> {
             self.raw("#include <time.h>\n"); // `@bench` timing via clock()
         }
         self.raw("\n");
+        if self.error_traces {
+            // The debug error-trace runtime (`--error-traces`). A fixed-size buffer of
+            // (file, line) hops — no allocation, so instrumentation cannot fail or
+            // change program behaviour, and stderr-only, so the program's stdout (the
+            // thing determinism canaries hash) is untouched even when a trace fires.
+            // Overflow keeps the OLDEST hops: the origin is the entry a reader needs
+            // most, and a trace that silently rotated it away would point mid-path.
+            self.raw(
+                "/* --error-traces runtime: origin + propagation hops, printed at unwrap-on-error */\n\
+                 static const char* jestyr_et_file[64];\n\
+                 static int jestyr_et_line[64];\n\
+                 static int jestyr_et_n = 0;\n\
+                 static inline void jestyr_et_reset(void) { jestyr_et_n = 0; }\n\
+                 static inline void jestyr_et_push(const char* f, int l) {\n\
+                 \x20   if (jestyr_et_n < 64) { jestyr_et_file[jestyr_et_n] = f; jestyr_et_line[jestyr_et_n] = l; jestyr_et_n++; }\n\
+                 }\n\
+                 static void jestyr_et_dump(void) {\n\
+                 \x20   fprintf(stderr, \"error trace (origin first):\\n\");\n\
+                 \x20   for (int _i = 0; _i < jestyr_et_n; _i++)\n\
+                 \x20       fprintf(stderr, \"  %s:%d%s\\n\", jestyr_et_file[_i], jestyr_et_line[_i], _i == 0 ? \" (error created here)\" : \"\");\n\
+                 }\n\n",
+            );
+        }
         self.raw("/* Jestyr string view — a length-carrying `{ptr, len}` (a borrowed UTF-8 view,\n");
         self.raw("   like Zig `[]const u8` / Rust `&str`). `.len` is O(1); no `strlen`. A bare\n");
         self.raw("   `cstr` (null-terminated `const char*`) is the distinct C-interop type. */\n");
@@ -4693,6 +4764,18 @@ impl<'a> Cgen<'a> {
                 let cur = self.cur_result.clone();
                 let tmp = format!("_q{}", self.tmp);
                 self.tmp += 1;
+                // `--error-traces`: each `?` records itself as a propagation HOP
+                // before the early return, so the surfaced trace reads as the
+                // error's path up the stack. The flag-off arm is the ORIGINAL string,
+                // character for character — reusing the braced form for both ("just
+                // one redundant brace") would change every fallible program's C and
+                // invalidate the corpus goldens, the port mirror and the seed at once.
+                if self.error_traces {
+                    let hop = self.et_push(span);
+                    return format!(
+                        "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) {{ {hop}return ({cur}){{ .is_err = true, .err = {tmp}.err }}; }} {tmp}.ok; }})"
+                    );
+                }
                 format!(
                     "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) return ({cur}){{ .is_err = true, .err = {tmp}.err }}; {tmp}.ok; }})"
                 )
@@ -4984,6 +5067,17 @@ impl<'a> Cgen<'a> {
                         self.diag(self.ast.expr_at(callee).span, "`err` used outside a fallible function");
                         return "0".to_string();
                     }
+                    // `--error-traces`: `err` is the trace's ORIGIN — reset, then
+                    // record where the error was born. Reset here rather than at the
+                    // surfacing print, so a recovered-then-recreated error never shows
+                    // a stale path from a previous failure.
+                    if self.error_traces {
+                        let push = self.et_push(self.ast.expr_at(callee).span);
+                        return format!(
+                            "({{ jestyr_et_reset(); {push}({}){{ .is_err = true, .err = {tag} }}; }})",
+                            self.cur_result
+                        );
+                    }
                     return format!("({}){{ .is_err = true, .err = {tag} }}", self.cur_result);
                 }
                 "is_err" => {
@@ -4991,6 +5085,23 @@ impl<'a> Cgen<'a> {
                     return format!("(({v}).is_err)");
                 }
                 "unwrap" => {
+                    // `--error-traces`: unwrap-on-error is the SURFACING point — the
+                    // one place the recorded path is printed (to stderr, so hashed
+                    // stdout is untouched). The value is spilled so the operand is
+                    // evaluated once (`.is_err` then `.ok`), and behaviour otherwise
+                    // matches untraced unwrap exactly — same `.ok` read, no abort —
+                    // so the flag can never change what a program computes.
+                    if self.error_traces {
+                        if let Some(a) = args.first() {
+                            let rt = self.c_type(&apply_subst(&self.info.type_of(*a).clone(), &self.subst));
+                            let v = self.emit_expr(*a);
+                            let tmp = format!("_uw{}", self.tmp);
+                            self.tmp += 1;
+                            return format!(
+                                "({{ {rt} {tmp} = {v}; if ({tmp}.is_err) jestyr_et_dump(); {tmp}.ok; }})"
+                            );
+                        }
+                    }
                     let v = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".to_string());
                     return format!("(({v}).ok)");
                 }
@@ -9233,6 +9344,50 @@ mod tests {
         assert!(pd.is_empty(), "parse: {:?}", pd);
         let (info, _td) = crate::typeck::check(&ast);
         emit(&ast, &info)
+    }
+
+    /// Like [`gen`], but through [`emit_error_traces`] (`--error-traces`).
+    fn gen_traced(src: &str) -> String {
+        let (tokens, ld) = Lexer::new(src).tokenize();
+        assert!(ld.is_empty(), "lex: {:?}", ld);
+        let (ast, pd) = Parser::new(src, tokens).parse();
+        assert!(pd.is_empty(), "parse: {:?}", pd);
+        let (info, _td) = crate::typeck::check(&ast);
+        let (c, d) = emit_error_traces(&ast, &info);
+        assert!(d.is_empty(), "{d:?}");
+        c
+    }
+
+    /// A fallible chain used by the error-trace shape tests: an origin, one `?` hop,
+    /// and an unwrap.
+    const TRACE_FIXTURE: &str = "fn deep(n: i32) -> i32 !{ Bad } { if n > 5 { return err(Bad) } return ok(n) } \
+         fn mid(n: i32) -> i32 !{ Bad } { let v = deep(n)? return ok(v + 1) } \
+         fn main() -> i32 { print_int(unwrap(mid(9)) as i64) return 0 }";
+
+    /// **`--error-traces` instruments all three points, and only under the flag.**
+    /// `err` is the origin (reset + push), `?` a propagation hop, unwrap-on-error the
+    /// surfacing print. The flag-off arm is checked as an *absence*: one stray
+    /// `jestyr_et_` in ordinary emission would be a corpus-wide golden diff.
+    #[test]
+    fn error_traces_instrument_err_try_and_unwrap() {
+        let c = gen_traced(TRACE_FIXTURE);
+        // The runtime is present…
+        assert!(c.contains("static void jestyr_et_dump(void)"), "{c}");
+        // …the origin resets then records…
+        assert!(c.contains("jestyr_et_reset(); jestyr_et_push("), "origin: {c}");
+        // …the `?` hop records inside its error branch, before the early return…
+        assert!(c.contains("{ jestyr_et_push(\"<input>\", 0); return ("), "hop: {c}");
+        // …and unwrap prints on error without changing what it yields. (Matched around
+        // the temp number — it depends on how many temps preceded it.)
+        assert!(c.contains(".is_err) jestyr_et_dump(); _uw"), "surface: {c}");
+
+        // Flag off: not a byte of it — the emission is the pre-flag string exactly.
+        let (plain, d) = gen(TRACE_FIXTURE);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(!plain.contains("jestyr_et_"), "flag-off must be untouched: {plain}");
+        // The `?` fast path keeps its original brace-free form: even a redundant
+        // brace would diff every fallible corpus file against the port mirror.
+        assert!(plain.contains(".is_err) return ("), "the untraced `?` string moved: {plain}");
     }
 
     /// Like [`gen`], but lowers in test-harness mode (`jestyrc test`).

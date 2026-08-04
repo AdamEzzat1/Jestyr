@@ -9934,6 +9934,79 @@ fn main() -> i32 {
         String::from_utf8_lossy(&out.stdout).split_whitespace().map(|s| s.to_string()).collect()
     }
 
+    /// **`--error-traces` prints the error's real path, and only then.**
+    ///
+    /// Run through the actual `jestyrc` binary over a real file (not `emit` in-process),
+    /// because the trace's *content* depends on the module loader's `DebugInfo` — the
+    /// in-process single-file path has no file/line mapping, so an in-process test
+    /// would only ever see `<input>:0` and could not catch a wrong line number.
+    ///
+    /// Four claims, each of which reading the emitted C cannot establish:
+    /// the trace appears **only** on the failing unwrap (the successful one before it
+    /// must print nothing); the **origin is first** and marked; the hops follow in
+    /// stack order with their real line numbers; and **stdout is byte-identical** with
+    /// and without the flag — the instrumentation writes to stderr alone, which is
+    /// what keeps it out of every determinism canary's hash.
+    #[test]
+    fn error_traces_print_the_propagation_path() {
+        let jestyrc = {
+            let t = std::env::current_exe().unwrap();
+            let p = t.parent().unwrap().parent().unwrap().join(format!("jestyrc{}", std::env::consts::EXE_SUFFIX));
+            assert!(p.exists(), "jestyrc binary not found at {}", p.display());
+            p
+        };
+        let dir = std::env::temp_dir().join("jestyr_etrace");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "\
+fn deep(n: i32) -> i32 !{ Bad } {
+    if n > 5 { return err(Bad) }
+    return ok(n)
+}
+fn mid(n: i32) -> i32 !{ Bad } {
+    let v = deep(n)?
+    return ok(v + 1)
+}
+fn outer(n: i32) -> i32 !{ Bad } {
+    let v = mid(n)?
+    return ok(v + 1)
+}
+fn main() -> i32 {
+    print_int(unwrap(outer(3)) as i64)
+    print_int(unwrap(outer(9)) as i64)
+    return 0
+}
+";
+        let file = dir.join("trace.jtr");
+        std::fs::write(&file, src).unwrap();
+
+        let traced = Command::new(&jestyrc)
+            .args(["run", file.to_str().unwrap(), "--error-traces"])
+            .output()
+            .unwrap();
+        assert!(traced.status.success(), "{}", String::from_utf8_lossy(&traced.stderr));
+        let err = String::from_utf8_lossy(&traced.stderr).replace('\\', "/");
+
+        // Exactly ONE trace: the first unwrap succeeds and must print nothing.
+        assert_eq!(err.matches("error trace (origin first):").count(), 1, "{err}");
+        // Origin first and marked; hops follow in stack order, with real line numbers:
+        // err(Bad) is on line 2, `deep(n)?` on line 6, `mid(n)?` on line 10.
+        let origin = err.find("trace.jtr:2 (error created here)").expect(&format!("origin: {err}"));
+        let hop1 = err.find("trace.jtr:6").expect(&format!("hop1: {err}"));
+        let hop2 = err.find("trace.jtr:10").expect(&format!("hop2: {err}"));
+        assert!(origin < hop1 && hop1 < hop2, "hops out of stack order: {err}");
+
+        // …and the flag never touches stdout: same bytes with and without it.
+        let plain = Command::new(&jestyrc).args(["run", file.to_str().unwrap()]).output().unwrap();
+        assert!(plain.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&traced.stdout),
+            String::from_utf8_lossy(&plain.stdout),
+            "the trace flag changed program OUTPUT — it may only ever write stderr"
+        );
+        assert!(!String::from_utf8_lossy(&plain.stderr).contains("error trace"), "untraced run printed a trace");
+    }
+
     /// **`catch` recovers, and the fallback runs only when it must.**
     ///
     /// The short-circuit is the property worth *running* for: `catch` supplies a

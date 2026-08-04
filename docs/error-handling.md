@@ -82,7 +82,43 @@ groups as `v = (read(p) catch 0)`, which is the reading every example assumes.
 the bootstrap seed carries it — so the gcc-only from-scratch compiler can build programs
 that recover. `examples/error_catch.jtr` is the worked example.
 
+## Debug error traces — `--error-traces`
+
+Tier 4 of the ladder. `jestyrc build/run/emit-c <file> --error-traces` instruments the
+error paths with a Zig-style trace:
+
+* **`err(E)`** is the *origin* — it resets the trace and records where the error was born
+  (reset at creation, not at print, so a recovered-then-recreated error never shows a
+  stale path).
+* **each `?`** records itself as a *propagation hop* before its early return, so the
+  trace reads as the error's path up the stack.
+* **`unwrap` of an error** is the *surfacing point* — the recorded path prints to stderr:
+
+```text
+error trace (origin first):
+  src/config.jtr:2 (error created here)
+  src/config.jtr:6
+  src/main.jtr:10
+```
+
+Three properties, each tested by running (not by reading emitted C):
+
+* **Opt-in and invisible otherwise.** Without the flag the emitted C is byte-identical —
+  not a byte of the runtime appears — so goldens, attest hashes, the fixpoint and the
+  seed never see it.
+* **stderr only.** stdout is byte-identical with and without the flag, even when a trace
+  fires — which is what keeps the flag compatible with every determinism canary.
+* **Behaviour-preserving.** Traced `unwrap` yields exactly what untraced `unwrap`
+  yields; the fixed-size hop buffer (64 entries, oldest kept — the origin is the entry a
+  reader needs most) never allocates, so instrumentation cannot fail.
+
+`catch` deliberately records nothing: recovery *consumes* the error, and the next
+`err()` resets the buffer anyway.
+
+Not ported to `jc` (the self-hosted driver): the flag is per-invocation debug tooling,
+no corpus file or golden uses it, so no two-sided tax is due. Recorded here rather than
+discovered.
+
 ## Not yet
 
 * `catch |e| …` — binding the error value. Reserved in the design (§7), not implemented.
-* Error return **traces** (Zig-style).
