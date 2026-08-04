@@ -1063,13 +1063,55 @@ impl<'src> Parser<'src> {
     /// example in the design doc assumes. **Right-associative**, so a chain of
     /// fallbacks `a catch b catch c` tries `a`, then `b`, then `c`, rather than
     /// applying `c` to an already-recovered value.
+    ///
+    /// Two extended forms (design §7's second example):
+    /// * `base catch |e| fallback` — bind the error value for the fallback. A `|`
+    ///   right after `catch` is always the binder, never a closure-literal fallback;
+    ///   a closure fallback needs parens (`catch (|x| x)`). Zig's resolution of the
+    ///   same surface, and the binder is overwhelmingly the intended reading.
+    /// * `base catch |e| return e` — explicit propagation. `return` is a statement,
+    ///   so this is a special form rather than an expression fallback, and only the
+    ///   binder may be returned: anything else would be a general statement-position
+    ///   fallback, which is a bigger feature than "re-raise, spelled out".
     fn parse_catch(&mut self) -> ExprId {
         let lhs = self.parse_binary(0);
         if self.at(Catch) {
             self.bump();
+            let binder = if self.at(Pipe) {
+                self.bump();
+                let b = self.eat_ident("error binder");
+                self.expect(Pipe, "`|`");
+                Some(b)
+            } else {
+                None
+            };
+            if self.at(Return) {
+                let rspan = self.cur().span;
+                self.bump();
+                let name = self.eat_ident("the error binder");
+                match &binder {
+                    Some(b) if b.name == name.name => {}
+                    Some(b) => self.error(
+                        name.span,
+                        format!("`catch |{0}| return …` can only return the binder `{0}`", b.name),
+                    ),
+                    None => self.error(
+                        rspan,
+                        "`catch return` needs an error binder: write `catch |e| return e`",
+                    ),
+                }
+                let fb = self.ast.expr(ExprKind::Name(name.clone()), name.span);
+                let span = self.ast.expr_at(lhs).span.to(name.span);
+                return self.ast.expr(
+                    ExprKind::Catch { base: lhs, binder, fallback: fb, rethrow: true },
+                    span,
+                );
+            }
             let fallback = self.parse_catch(); // right-associative
             let span = self.ast.expr_at(lhs).span.to(self.ast.expr_at(fallback).span);
-            return self.ast.expr(ExprKind::Catch { base: lhs, fallback }, span);
+            return self
+                .ast
+                .expr(ExprKind::Catch { base: lhs, binder, fallback, rethrow: false }, span);
         }
         lhs
     }

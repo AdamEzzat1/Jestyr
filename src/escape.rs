@@ -553,7 +553,7 @@ impl<'a> Checker<'a> {
             // `base catch fallback` — the fallback inherits `tail`, because it really
             // is in the enclosing tail position when the error path is taken, so a
             // borrow escaping through it must still be caught.
-            ExprKind::Catch { base, fallback } => {
+            ExprKind::Catch { base, fallback, .. } => {
                 self.walk_expr(ctx, *base, false);
                 self.walk_expr(ctx, *fallback, tail);
             }
@@ -1205,7 +1205,7 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Deref { base } => self.collect_names(*base, out),
             ExprKind::Try { base } => self.collect_names(*base, out),
-            ExprKind::Catch { base, fallback } => {
+            ExprKind::Catch { base, fallback, .. } => {
                 self.collect_names(*base, out);
                 self.collect_names(*fallback, out);
             }

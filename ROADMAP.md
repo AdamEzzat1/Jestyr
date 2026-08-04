@@ -227,9 +227,12 @@ recovery half of the story (`e catch fallback`), **on both sides**: the port mir
 byte-identically, `examples/error_catch.jtr` is the corpus example, and the bootstrap
 seed carries it; and **error traces** (Zig-style, `--error-traces` — `err` is the
 origin, each `?` a hop, unwrap-on-error prints the path to stderr; opt-in
-per-invocation, so non-users are byte-identical and no port mirror is due). **Left:**
-`catch |e|` binding the error value; fallible **methods** (overlaps B); errors in more
-positions; richer error payloads.
+per-invocation, so non-users are byte-identical and no port mirror is due); and
+**`catch |e|`** (reference side) — the binder carries the opaque `error` type (the raw
+tag cannot leak as a success value; `e as i64` is the escape hatch) and
+`catch |e| return e` is `?` spelled out, tag preserved. **Left:** the `catch |e|` port
+mirror (due with its first corpus file); fallible **methods** (overlaps B); errors in
+more positions; richer error payloads.
 
 ### J. Numeric / operator completeness — ~70% (MED conflict; files: typeck, cgen)
 **Left:** defined integer-overflow semantics (wrap/saturate/checked — **Motley

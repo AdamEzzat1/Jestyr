@@ -2406,7 +2406,7 @@ impl<'a> TypeChecker<'a> {
                     _ => Ty::Unknown,
                 }
             }
-            ExprKind::Catch { base, fallback } => {
+            ExprKind::Catch { base, binder, fallback, rethrow } => {
                 // `e catch v` recovers: it unwraps `T !E` to `T`, using `v` when the
                 // error path is taken. Unlike `?` it does **not** need a fallible
                 // enclosing function — recovering is precisely how a fallible call is
@@ -2431,6 +2431,23 @@ impl<'a> TypeChecker<'a> {
                         return Ty::Error;
                     }
                 };
+                // `catch |e| …`: the binder carries the opaque `error` type, in scope
+                // for the FALLBACK alone — a pushed-and-popped scope, exactly a `let`
+                // inside a block. Opaque on purpose: the runtime value is an integer
+                // tag, but typing it `i32` would let `return e` in an `i32`-returning
+                // fallible fn silently return the tag as a SUCCESS value.
+                scope.push(HashMap::new());
+                if let Some(b) = binder {
+                    scope.last_mut().unwrap().insert(b.name.clone(), Ty::Prim("error"));
+                }
+                // The rethrow form (`catch |e| return e`) yields the ok value on the
+                // success path and *returns* on the error path, so the fallback (the
+                // binder name) is inferred only to record its type.
+                if *rethrow {
+                    self.infer(scope, typ, self_ty, *fallback);
+                    scope.pop();
+                    return ok;
+                }
                 // The fallback is inferred **against the ok type** (the `cur_expected`
                 // idiom every other expected-type site uses), so a literal fallback
                 // picks up the right width and a struct/closure literal gets its
@@ -2439,6 +2456,21 @@ impl<'a> TypeChecker<'a> {
                 self.cur_expected = Some(ok.clone());
                 let ft = self.infer(scope, typ, self_ty, *fallback);
                 self.cur_expected = prev;
+                scope.pop();
+                // The binder is OPAQUE: recovering with the raw tag (`catch |e| e`)
+                // would silently turn an error code into a success value — the exact
+                // confusion the `error` type exists to prevent. An explicit cast
+                // remains the escape hatch, as it is for `distinct`.
+                if matches!(ft, Ty::Prim("error")) && !matches!(ok, Ty::Prim("error")) {
+                    self.error(
+                        self.ast.expr_at(*fallback).span,
+                        format!(
+                            "the error binder cannot recover as a value of type `{}` — \
+                             it is an error, not a result; cast explicitly (`e as i64`) if you mean the tag",
+                            ok.display(&self.table)
+                        ),
+                    );
+                }
                 // The one mismatch class this checker reports, applied here too: a
                 // `distinct` type is not interchangeable with its base, so recovering
                 // a `UserId` with a bare `u64` needs an explicit `as`.
@@ -4665,6 +4697,36 @@ mod tests {
             "{:?}",
             d[0].message
         );
+    }
+
+    /// `catch |e| e` would silently turn an error tag into a success value — the exact
+    /// confusion the opaque `error` type exists to prevent. Refused with a cast hint;
+    /// the explicit cast is the escape hatch, exactly as it is for `distinct`.
+    #[test]
+    fn the_error_binder_cannot_leak_as_a_success_value() {
+        let (_i, d) = analyze(
+            "fn f() -> i32 !{ Bad } { return err(Bad) } \
+             fn g() -> i32 { return f() catch |e| e }",
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].message.contains("it is an error, not a result"), "{:?}", d[0].message);
+        // The cast form is the sanctioned way to read the tag.
+        let (_i, d) = analyze(
+            "fn f() -> i32 !{ Bad } { return err(Bad) } \
+             fn g() -> i64 { return f() catch |e| (e as i64) }",
+        );
+        assert!(d.is_empty(), "an explicit cast must pass: {d:?}");
+    }
+
+    /// The rethrow form yields the ok type — on the success path it IS the ok value;
+    /// on the error path control leaves, so there is no second type to reconcile.
+    #[test]
+    fn catch_rethrow_yields_the_ok_type() {
+        let (_i, d) = analyze(
+            "fn f() -> i32 !{ Bad } { return ok(1) } \
+             fn g() -> i32 !{ Bad } { let v: i32 = f() catch |e| return e return ok(v + 1) }",
+        );
+        assert!(d.is_empty(), "{d:?}");
     }
 
     #[test]

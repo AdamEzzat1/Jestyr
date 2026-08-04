@@ -336,8 +336,13 @@ impl<'a> Printer<'a> {
             ExprKind::Deref { base } => format!("{}.*", self.expr_inline(*base)),
             ExprKind::Cast { expr, ty } => format!("{} as {}", self.expr_inline(*expr), self.type_str(*ty)),
             ExprKind::Try { base } => format!("{}?", self.expr_inline(*base)),
-            ExprKind::Catch { base, fallback } => {
-                format!("({} catch {})", self.expr_inline(*base), self.expr_inline(*fallback))
+            ExprKind::Catch { base, binder, fallback, rethrow } => {
+                let b = match binder {
+                    Some(id) => format!("|{}| ", id.name),
+                    None => String::new(),
+                };
+                let kw = if *rethrow { "return " } else { "" };
+                format!("({} catch {b}{kw}{})", self.expr_inline(*base), self.expr_inline(*fallback))
             }
             ExprKind::Index { base, index } => {
                 format!("{}[{}]", self.expr_inline(*base), self.expr_inline(*index))

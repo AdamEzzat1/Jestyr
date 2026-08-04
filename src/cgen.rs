@@ -1553,7 +1553,7 @@ impl<'a> Cgen<'a> {
             }
             ExprKind::Try { base } => self.collect_structs_in_expr(*base, subst, seen, order),
             // Both children, or a struct used *only* as a fallback gets no typedef.
-            ExprKind::Catch { base, fallback } => {
+            ExprKind::Catch { base, fallback, .. } => {
                 self.collect_structs_in_expr(*base, subst, seen, order);
                 self.collect_structs_in_expr(*fallback, subst, seen, order);
             }
@@ -2732,7 +2732,7 @@ impl<'a> Cgen<'a> {
             ExprKind::Deref { base } => self.collect_moved_expr(*base, out),
             ExprKind::Cast { expr, .. } => self.collect_moved_expr(*expr, out),
             ExprKind::Try { base } => self.collect_moved_expr(*base, out),
-            ExprKind::Catch { base, fallback } => {
+            ExprKind::Catch { base, fallback, .. } => {
                 self.collect_moved_expr(*base, out);
                 self.collect_moved_expr(*fallback, out);
             }
@@ -4780,7 +4780,7 @@ impl<'a> Cgen<'a> {
                     "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) return ({cur}){{ .is_err = true, .err = {tmp}.err }}; {tmp}.ok; }})"
                 )
             }
-            ExprKind::Catch { base, fallback } => {
+            ExprKind::Catch { base, binder, fallback, rethrow } => {
                 // `e catch v` — recover. Where `?` early-returns the error, this
                 // substitutes a value and carries on, so it needs no enclosing
                 // fallible function and emits no `return`.
@@ -4795,6 +4795,47 @@ impl<'a> Cgen<'a> {
                 let res_ty = self.c_type(&bt);
                 let tmp = format!("_ct{}", self.tmp);
                 self.tmp += 1;
+
+                // `catch |e| return e` — the explicit-propagate form: exactly `?`'s
+                // lowering (early return, error tag preserved), with the same
+                // requirement, because it returns an error to the caller.
+                if *rethrow {
+                    if self.cur_result.is_empty() {
+                        self.diag(span, "`catch |e| return e` used outside a fallible function");
+                        return format!("(({base_c}).ok)");
+                    }
+                    let cur = self.cur_result.clone();
+                    return format!(
+                        "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) return ({cur}){{ .is_err = true, .err = {tmp}.err }}; {tmp}.ok; }})"
+                    );
+                }
+
+                // `catch |e| fallback` — the binder is a `const int` scoped to the
+                // error branch, so the fallback can read the tag. A `?:` cannot carry
+                // a declaration, so this form lowers as an if/else over a result
+                // variable instead; the binder-less form KEEPS its original `?:`
+                // string, character for character — it predates the binder, and
+                // rewriting it through this shape would diff `error_catch.jtr`
+                // against the port mirror and the seed.
+                if let Some(b) = binder {
+                    let bname = b.name.clone();
+                    let okty = match &bt {
+                        Ty::Result(ok) => self.c_type(ok),
+                        _ => "int".to_string(),
+                    };
+                    let fb = self.emit_expr(*fallback);
+                    let val = format!("_cv{}", self.tmp);
+                    self.tmp += 1;
+                    if matches!(bt, Ty::Result(ref ok) if **ok == Ty::Unit) {
+                        return format!(
+                            "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) {{ const int j_{bname} = {tmp}.err; (void)j_{bname}; {fb}; }} }})"
+                        );
+                    }
+                    return format!(
+                        "({{ {res_ty} {tmp} = {base_c}; {okty} {val}; if ({tmp}.is_err) {{ const int j_{bname} = {tmp}.err; (void)j_{bname}; {val} = ({fb}); }} else {{ {val} = {tmp}.ok; }} {val}; }})"
+                    );
+                }
+
                 // The result is spilled to a temp so `base` is evaluated once: it is
                 // read twice below (`.is_err` and `.ok`), and a call in base position
                 // would otherwise run twice.
@@ -5764,7 +5805,7 @@ impl<'a> Cgen<'a> {
                 self.find_closures_expr(*base, found, seen)
             }
             // A closure written as a fallback still has to be lifted.
-            ExprKind::Catch { base, fallback } => {
+            ExprKind::Catch { base, fallback, .. } => {
                 self.find_closures_expr(*base, found, seen);
                 self.find_closures_expr(*fallback, found, seen);
             }
@@ -5901,7 +5942,7 @@ impl<'a> Cgen<'a> {
                 self.collect_refs(*index, out);
             }
             ExprKind::Deref { base } | ExprKind::Try { base } => self.collect_refs(*base, out),
-            ExprKind::Catch { base, fallback } => {
+            ExprKind::Catch { base, fallback, .. } => {
                 self.collect_refs(*base, out);
                 self.collect_refs(*fallback, out);
             }
@@ -8977,7 +9018,7 @@ impl<'a> Cgen<'a> {
             ExprKind::Try { base } => self.find_calls_expr(*base, subst, work),
             // Both children, or a generic instantiated *only* in a fallback is never
             // monomorphized — a missing symbol at link time rather than a diagnostic.
-            ExprKind::Catch { base, fallback } => {
+            ExprKind::Catch { base, fallback, .. } => {
                 self.find_calls_expr(*base, subst, work);
                 self.find_calls_expr(*fallback, subst, work);
             }
@@ -9281,6 +9322,10 @@ fn prim_c(name: &str) -> Option<&'static str> {
         "String" => "JestyrString",
         "Builder" => "JestyrBuilder",
         "Cow" => "JestyrCow",
+        // The opaque error value a `catch |e|` binder carries. Runtime repr: the
+        // result struct's `int err` tag. Opaque in the surface language, so a tag can
+        // never be returned as a *success* value by accident.
+        "error" => "int",
         _ => return None,
     })
 }
@@ -9546,6 +9591,44 @@ mod tests {
         assert!(
             !c.contains("if (_ct0.is_err) return"),
             "catch must not early-return: {c}"
+        );
+    }
+
+    /// **The three `catch` lowerings, each with its own shape** — and the binder-less
+    /// one unchanged, since `error_catch.jtr` pins it against the port mirror.
+    #[test]
+    fn catch_binder_and_rethrow_lower_to_their_own_shapes() {
+        // Rethrow ≡ `?`: early return, tag preserved.
+        let src = "fn f() -> i32 !{ Bad } { return ok(1) } \
+                   fn g() -> i32 !{ Bad } { let v: i32 = f() catch |e| return e return ok(v + 1) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(
+            c.contains(".is_err) return (JestyrResult_i32){ .is_err = true, .err = _ct"),
+            "rethrow must early-return with the tag preserved: {c}"
+        );
+        // Binder: a `const int j_e` scoped to the error branch; if/else over a result
+        // variable, since `?:` cannot carry a declaration.
+        let src = "fn f() -> i32 !{ Bad } { return ok(1) } \
+                   fn g() -> i64 { return f() catch |e| (e as i64) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(c.contains("const int j_e = _ct"), "the binder must be declared: {c}");
+        assert!(c.contains("(void)j_e;"), "an ignored binder must not warn: {c}");
+        // Binder-less: the ORIGINAL `?:` string — rewriting it through the binder
+        // shape would diff the corpus file against the port and the seed.
+        let src = "fn f() -> i32 !{ Bad } { return ok(1) } \
+                   fn g() -> i32 { return f() catch 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(c.contains(".is_err ? (0) : _ct"), "the binder-less `?:` moved: {c}");
+        // Rethrow outside a fallible fn is `?`'s error, in `catch`'s words.
+        let src = "fn f() -> i32 !{ Bad } { return ok(1) } \
+                   fn g() -> i32 { return f() catch |e| return e }";
+        let (_c, d) = gen(src);
+        assert!(
+            d.iter().any(|x| x.message.contains("`catch |e| return e` used outside a fallible function")),
+            "{d:?}"
         );
     }
 

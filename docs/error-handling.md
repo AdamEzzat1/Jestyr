@@ -119,6 +119,31 @@ Not ported to `jc` (the self-hosted driver): the flag is per-invocation debug to
 no corpus file or golden uses it, so no two-sided tax is due. Recorded here rather than
 discovered.
 
-## Not yet
+## Binding the error — `catch |e|`
 
-* `catch |e| …` — binding the error value. Reserved in the design (§7), not implemented.
+The design's second example (§7), now implemented (reference side):
+
+```jestyr
+let v = small(n) catch |e| (e as i64)      // recover, with the tag in hand
+let v = small(n) catch |e| return e        // explicit propagation — exactly `?`
+```
+
+* **`e` is opaque.** It has the `error` type, not `i32` — `catch |e| e` is refused,
+  because recovering with the raw tag would silently turn an error code into a success
+  value. The explicit cast (`e as i64`) is the sanctioned escape hatch, exactly as it is
+  for `distinct`. Runtime representation: the result struct's `int err` tag.
+* **`catch |e| return e` is `?`, spelled out.** Same lowering, same tag preservation
+  across the hop, same requirement of a fallible enclosing function. Only the binder may
+  be returned — anything else would be a general statement-position fallback, which is a
+  bigger feature than "re-raise, explicitly".
+* **A `|` right after `catch` is always the binder**, never a closure-literal fallback.
+  A closure fallback needs parens: `catch (|x| x)`. (Zig's resolution of the same
+  surface.)
+* **Scoped to the fallback.** The binder is a `const int` in the error branch of the
+  lowering; the success path never sees it.
+
+Not yet mirrored in the port (`jc`): no corpus file uses `|e|`, so the two-sided tax is
+not yet due — the P2 dump harness labels the binder forms distinctly (`catch-bind` /
+`catch-rethrow`), so adding a golden snippet without the port arm fails loudly.
+
+## Not yet

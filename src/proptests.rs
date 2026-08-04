@@ -7458,10 +7458,24 @@ mod c_oracle {
             // to agree, hiding a real node behind a label meaning "unparseable". A
             // missing arm here reads as a divergent port, so it is added with the
             // construct, not after a golden fails.
-            ExprKind::Catch { base, fallback } => {
-                out.push("catch".to_string());
+            ExprKind::Catch { base, binder, fallback, rethrow } => {
+                // The binder-less label stays exactly `catch` — the four P2 golden
+                // snippets pin that against the port. The `|e|` forms get their own
+                // labels; no golden snippet uses them (the port has no binder arm
+                // yet), so a future mirror adds the snippets and the port arm
+                // together, and a mismatch fails loudly rather than comparing a
+                // binder-blind dump.
+                let label = match (binder.is_some(), *rethrow) {
+                    (false, _) => "catch",
+                    (true, false) => "catch-bind",
+                    (true, true) => "catch-rethrow",
+                };
+                out.push(label.to_string());
                 out.push(s);
                 out.push(en);
+                if let Some(b) = binder {
+                    out.push(b.name.clone());
+                }
                 ref_dump_expr(ast, *base, out);
                 ref_dump_expr(ast, *fallback, out);
             }
@@ -10005,6 +10019,41 @@ fn main() -> i32 {
             "the trace flag changed program OUTPUT — it may only ever write stderr"
         );
         assert!(!String::from_utf8_lossy(&plain.stderr).contains("error trace"), "untraced run printed a trace");
+    }
+
+    /// **`catch |e|` binds the tag, and `catch |e| return e` behaves exactly as `?`.**
+    ///
+    /// The binder's value is what only running can prove: two different errors must
+    /// reach the fallback as two different tags (dispatch via the sanctioned
+    /// `e as i64` escape hatch), and the rethrow form must preserve the tag across the
+    /// hop — `is_err` alone would pass a lowering that returned the *wrong* error.
+    #[test]
+    fn catch_binder_carries_the_tag_and_rethrow_propagates_it() {
+        let src = "\
+fn small(n: i32) -> i32 !{ TooBig, TooSmall } {
+    if n > 100 { return err(TooBig) }
+    if n < 0 { return err(TooSmall) }
+    return ok(n * 2)
+}
+// Explicit propagate: must preserve WHICH error, not merely err-ness.
+fn relay(n: i32) -> i32 !{ TooBig, TooSmall } {
+    let v: i32 = small(n) catch |e| return e
+    return ok(v + 1)
+}
+fn main() -> i32 {
+    print_int(small(500) catch |e| (e as i64))   // TooBig  -> tag 1
+    print_int(small(0 - 5) catch |e| (e as i64)) // TooSmall -> tag 2
+    print_int(unwrap(relay(3)) as i64)           // ok path -> 7
+    print_int(relay(500) catch |e| (e as i64))   // rethrown TooBig  -> 1
+    print_int(relay(0 - 5) catch |e| (e as i64)) // rethrown TooSmall -> 2
+    return 0
+}
+";
+        assert_eq!(
+            run_inline("catch-binder", src),
+            ["1", "2", "7", "1", "2"],
+            "the binder read the wrong tag, or rethrow did not preserve which error"
+        );
     }
 
     /// **`catch` recovers, and the fallback runs only when it must.**

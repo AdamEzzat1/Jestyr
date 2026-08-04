@@ -29,7 +29,14 @@ still open"). **Five of those have now closed**: transitive `@no_alloc`, diagnos
    corpus file against the port. See `docs/error-handling.md`.
 3. **Unsafe/provenance v2** — the largest remaining item overall; start as a written
    contract plus lints, not a semantic rewrite.
-4. **`catch |e|`** — the error-binding form, on machinery that now exists on both sides.
+4. ~~**`catch |e|`**~~ — **DONE, reference side** *(this session)*: the binder carries
+   an **opaque `error` type** (typing it `i32` would let `catch |e| e` silently return
+   the tag as a success value — refused, with `e as i64` as the sanctioned escape
+   hatch), and `catch |e| return e` is `?` spelled out (same lowering, tag preserved,
+   fallible-fn requirement). A `|` after `catch` is always the binder; a closure
+   fallback needs parens. Port mirror due with the first `|e|` corpus file — the P2
+   harness labels the binder forms distinctly (`catch-bind`/`catch-rethrow`), so a
+   snippet added without the port arm fails loudly.
 
 **Do NOT start an SMT backend.** The planning slice measured it: **7 declared
 obligations across 144 corpus files**, so a solver would have nothing to discharge. The
@@ -962,8 +969,8 @@ closed; they are struck through with their commits, so the ordering rationale su
    to find every walker a new expression form owes an arm; and the P2 dump harness's
    catch-all prints `error` for an unhandled kind, so its `catch` arm went in **with**
    the construct, not after a golden failed.
-   **STILL OPEN in this line:** **`catch |e|`**, which binds the error value — reserved
-   in the design, not implemented.
+   **`catch |e|` is now DONE on the reference side too** (see the START HERE list);
+   only its port mirror remains, due with the first corpus file that uses it.
 2. ~~**Allocation — transitive `@no_alloc`.**~~ — **DONE (`f0e579d`).** The design
    question this note flagged (what to do at a call to an unannotated function) resolved
    as predicted: *infer per body* + a least fixpoint, since assume-allocates would make

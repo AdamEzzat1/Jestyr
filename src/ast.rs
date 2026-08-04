@@ -240,7 +240,14 @@ pub enum ExprKind {
     ///
     /// The fallback is evaluated **only** on the error path, which is why this lowers
     /// to C's conditional operator rather than to two evaluated branches.
-    Catch { base: ExprId, fallback: ExprId },
+    ///
+    /// `binder` is the `|e|` form: the error value, in scope for the fallback alone,
+    /// with the opaque `error` type. `rethrow` is the design's explicit-propagate
+    /// spelling `base catch |e| return e` — the fallback is then the binder *name*
+    /// (kept for spans), and control returns the error to the caller instead of
+    /// producing a value, which requires a fallible enclosing function exactly as `?`
+    /// does.
+    Catch { base: ExprId, binder: Option<Ident>, fallback: ExprId, rethrow: bool },
     Index { base: ExprId, index: ExprId },
     Cast { expr: ExprId, ty: TypeId }, // `expr as T` — an explicit conversion
 
