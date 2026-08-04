@@ -11,19 +11,25 @@
 // declared sum/min/max/xor are exactly associative on machine integers, so the answer is
 // the same for every thread count, chunk size — and now lane width.
 //
-// Two details this file is built to exercise:
+// Three details this file is built to exercise:
 //   * the element count is **11**, deliberately not a multiple of 8 (the `i32` lane
 //     count), so every run goes through the scalar remainder as well as the vector head;
 //   * `absum` has an `if`/`else` body, which lowers as a **mask blend** in the vector
 //     half and as an ordinary conditional in the remainder — two different lowerings of
 //     one source expression, because a lane comparison yields all-ones rather than 1 and
-//     the conditional operator is not defined on vectors at all.
+//     the conditional operator is not defined on vectors at all;
+//   * `sumsq8` iterates `i8`, an element type C **promotes**. The remainder computes
+//     `x * x` in `int` because that is what C does to an `int8_t`, so the vector head has
+//     to as well — it lowers to `int32_t` lanes with a widening load, not to `int8_t`
+//     lanes with a raw one. That costs density (8 lanes, not 32) and buys the only thing
+//     `@simd` actually promises: the same bits at every width.
 //
-//   jestyrc run examples/std/par_for_simd.jtr   →   30, 0, 110, 0
+//   jestyrc run examples/std/par_for_simd.jtr   →   30, 0, 110, 0, 108900, 0
 import "core"
 import "io"
 
 fn seti32(p: *mut i32, i: usize, v: i32) { unsafe { (p + i).* = v } }
+fn seti8(p: *mut i8, i: usize, v: i8) { unsafe { (p + i).* = v } }
 
 // Sum of absolute values — the select body.
 @simd fn absum(read s: []i32) -> i64 {
@@ -32,6 +38,14 @@ fn seti32(p: *mut i32, i: usize, v: i32) { unsafe { (p + i).* = v } }
 
 // Sum of squares — plain arithmetic, the simplest thing a lane can do.
 @simd fn sumsq(read s: []i32) -> i64 {
+    return par for x in s reduce(core.sum_reduction()) { x * x }
+}
+
+// Sum of squares over a PROMOTED element type. The element count below is 100 —
+// above the lane width both in the correct lowering (8) and in the unsound one it
+// replaced (32), so a regression to source-width lanes cannot hide in the scalar tail.
+// An 11-element version of this passes either way, which is exactly why it isn't one.
+@simd fn sumsq8(read s: []i8) -> i64 {
     return par for x in s reduce(core.sum_reduction()) { x * x }
 }
 
@@ -44,6 +58,11 @@ fn serial_absum(read s: []i32) -> i64 {
     return a
 }
 fn serial_sumsq(read s: []i32) -> i64 {
+    var a: i64 = 0
+    for x in s { a = a + ((x * x) as i64) }
+    return a
+}
+fn serial_sumsq8(read s: []i8) -> i64 {
     var a: i64 = 0
     for x in s { a = a + ((x * x) as i64) }
     return a
@@ -63,6 +82,20 @@ fn main() -> i32 {
     io.print_i32(sumsq(s) as i32)                      // 110 = sum of x^2 over -5..5
     io.print_i32((sumsq(s) - serial_sumsq(s)) as i32)  // 0
 
+    // The promoted element. 33 * 33 = 1089, which does NOT fit in an `i8` — the whole
+    // point: computed in `int8_t` lanes it wraps to 65 and the vector head silently
+    // disagrees with its own remainder, so the head must compute in `int` as C does.
+    var q: *mut i8 = alloc(i8, 100)
+    var k: usize = 0
+    for k < 100 {
+        seti8(q, k, 33)
+        k = k + 1
+    }
+    let t: []i8 = slice(i8, q, 100)
+    io.print_i32(sumsq8(t) as i32)                        // 108900 = 100 * 1089
+    io.print_i32((sumsq8(t) - serial_sumsq8(t)) as i32)   // 0 — lanes agree with scalar
+
+    free_ptr(q)
     free_ptr(p)
     return 0
 }
