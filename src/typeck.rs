@@ -1151,9 +1151,20 @@ impl<'a> TypeChecker<'a> {
         }
         let outcome = crate::comptime::Interp::new(self.ast).eval_usize(id);
         if let Err(e) = outcome {
-            self.error(
-                e.span,
-                format!("array length must be a compile-time constant: {}", e.message),
+            // A suggested rewrite (Diagnostics tier 3). Both remedies are real and
+            // land in different places, so both are named: a `const` when the length
+            // is a fixed number the program can share, a `comptime { … }` block when
+            // it is *computed* — the CTFE ladder exists precisely so a length can be
+            // derived rather than spelled out.
+            self.diags.push(
+                crate::diag::Diagnostic::new(
+                    format!("array length must be a compile-time constant: {}", e.message),
+                    e.span,
+                )
+                .with_help(
+                    "give it a `const N: usize = …`, or compute it in a `comptime { … }` block — \
+                     an array's length is part of its type, so it must be known while checking",
+                ),
             );
         }
     }
@@ -2394,6 +2405,54 @@ impl<'a> TypeChecker<'a> {
                     Ty::Result(ok) => *ok,
                     _ => Ty::Unknown,
                 }
+            }
+            ExprKind::Catch { base, fallback } => {
+                // `e catch v` recovers: it unwraps `T !E` to `T`, using `v` when the
+                // error path is taken. Unlike `?` it does **not** need a fallible
+                // enclosing function — recovering is precisely how a fallible call is
+                // made infallible.
+                let bt = self.infer(scope, typ, self_ty, *base);
+                let ok = match bt {
+                    Ty::Result(ok) => *ok,
+                    // Not fallible: nothing to recover from. Reported rather than
+                    // silently accepted, because `catch` on an infallible expression
+                    // reads as a guarantee that an error was handled.
+                    other => {
+                        if !matches!(other, Ty::Unknown | Ty::Error) {
+                            self.error(
+                                self.ast.expr_at(*base).span,
+                                format!(
+                                    "`catch` needs a fallible expression, but this has type `{}`",
+                                    other.display(&self.table)
+                                ),
+                            );
+                        }
+                        self.infer(scope, typ, self_ty, *fallback);
+                        return Ty::Error;
+                    }
+                };
+                // The fallback is inferred **against the ok type** (the `cur_expected`
+                // idiom every other expected-type site uses), so a literal fallback
+                // picks up the right width and a struct/closure literal gets its
+                // expected type — the same courtesy a `let` annotation gives.
+                let prev = self.cur_expected.take();
+                self.cur_expected = Some(ok.clone());
+                let ft = self.infer(scope, typ, self_ty, *fallback);
+                self.cur_expected = prev;
+                // The one mismatch class this checker reports, applied here too: a
+                // `distinct` type is not interchangeable with its base, so recovering
+                // a `UserId` with a bare `u64` needs an explicit `as`.
+                if self.distinct_mismatch(&ok, &ft) {
+                    self.error(
+                        self.ast.expr_at(*fallback).span,
+                        format!(
+                            "expected `{}`, found `{}` — `distinct` types need an explicit `as`",
+                            ok.display(&self.table),
+                            ft.display(&self.table)
+                        ),
+                    );
+                }
+                ok
             }
             ExprKind::StructLit { path, fields, spread } => {
                 // For a plain named struct, resolve its index *first*, so each field
@@ -4583,6 +4642,70 @@ mod tests {
         // module a private field is freely readable (no false positive).
         let (_i, d) = analyze("struct P { y: i32 } fn f(read p: P) -> i32 { return p.y }");
         assert!(d.is_empty(), "same-module access is free: {:?}", d);
+    }
+
+    /// `e catch v` has the **ok type**, not the result type — recovering is what
+    /// removes the fallibility, and the whole point is that the value flows on
+    /// normally afterwards.
+    /// A non-constant array length has **two** real remedies that land in different
+    /// places, so the suggestion names both: a `const` when the length is a fixed
+    /// number, a `comptime { … }` block when it is *computed*. The CTFE ladder exists
+    /// precisely so a length can be derived rather than spelled out, and a diagnostic
+    /// that mentioned only `const` would hide that.
+    #[test]
+    fn a_non_constant_array_length_suggests_const_or_comptime() {
+        let (_i, d) = analyze("fn f(n: i32) -> i32 { var a: [n]i32 = [0; 3] return a[0] }");
+        assert_eq!(d.len(), 1, "{d:?}");
+        let h = d[0].help.as_deref().expect("must suggest a rewrite");
+        assert!(h.contains("const"), "{h}");
+        assert!(h.contains("comptime"), "{h}");
+        // The message is unchanged — only `help` was added.
+        assert!(
+            d[0].message.starts_with("array length must be a compile-time constant"),
+            "{:?}",
+            d[0].message
+        );
+    }
+
+    #[test]
+    fn catch_unwraps_to_the_ok_type() {
+        let (_i, d) = analyze(
+            "fn f() -> i32 !{ Bad } { return ok(1) } \
+             fn g() -> i32 { let a: i32 = f() catch 0 return a }",
+        );
+        assert!(d.is_empty(), "catch in an infallible fn is the point: {:?}", d);
+    }
+
+    /// `catch` on something that cannot fail is refused rather than accepted as a
+    /// no-op: it reads as a claim that an error was handled, and a claim about
+    /// nothing is worse than a diagnostic.
+    #[test]
+    fn catch_on_an_infallible_expression_is_refused() {
+        let (_i, d) = analyze("fn p(n: i32) -> i32 { return n } fn g() -> i32 { return p(1) catch 0 }");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].message.contains("`catch` needs a fallible expression"), "{:?}", d[0].message);
+        assert!(d[0].message.contains("`i32`"), "the actual type must be named: {:?}", d[0].message);
+    }
+
+    /// The fallback is inferred against the ok type, so the one mismatch class this
+    /// checker reports applies here too — recovering a `distinct` with its bare base
+    /// needs an explicit `as`.
+    #[test]
+    fn catch_checks_the_fallback_against_the_ok_type() {
+        let (_i, d) = analyze(
+            "distinct UserId = i32 \
+             fn f() -> UserId !{ Bad } { return err(Bad) } \
+             fn g() -> UserId { return f() catch 0 }",
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].message.contains("distinct"), "{:?}", d[0].message);
+        // …and the same program with the cast is clean.
+        let (_i, d) = analyze(
+            "distinct UserId = i32 \
+             fn f() -> UserId !{ Bad } { return err(Bad) } \
+             fn g() -> UserId { return f() catch 0 as UserId }",
+        );
+        assert!(d.is_empty(), "an explicit cast must satisfy it: {:?}", d);
     }
 
     #[test]

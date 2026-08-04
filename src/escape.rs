@@ -255,6 +255,32 @@ impl<'a> Checker<'a> {
         self.diags.push(Diagnostic::new(message, span));
     }
 
+    /// An error carrying a **suggested rewrite** (Diagnostics tier 3).
+    ///
+    /// The suggestion goes in `help`, never in the message. Two reasons, and the second
+    /// is load-bearing: a suggestion is advice and a message is a fact, so they should
+    /// render differently; and the P4 escape golden compares the port's diagnostics
+    /// against these by **span + message**, so changing a message would diverge the two
+    /// implementations while adding a help line does not. Suggestions can therefore be
+    /// improved freely on the reference side without owing a port mirror.
+    fn error_help(&mut self, span: Span, message: impl Into<String>, help: impl Into<String>) {
+        self.diags.push(Diagnostic::new(message, span).with_help(help));
+    }
+
+    /// The suggestion for **storing a borrow somewhere that outlives the call** — the
+    /// single most common way to hit the escape rule, and the one where "you may not do
+    /// that" is least actionable on its own.
+    ///
+    /// Jestyr's three answers, in the order a user should try them: give the storage
+    /// ownership (`take`), put the value in an arena whose lifetime is explicit
+    /// (`region`), or store a checked handle instead of a pointer (`genref`). Naming
+    /// all three matters — which one is right depends on whether the value is moved,
+    /// long-lived, or shared, and the compiler cannot know that.
+    const STORE_ESCAPE_HELP: &'static str =
+        "a stored value must outlive the call: pass it as `take` to transfer ownership, \
+         allocate it in a `region` if it must outlive this frame, or store a `genref` handle \
+         instead of a borrow";
+
     fn check_item(&mut self, item: &Item) {
         match item {
             Item::Fn(f) => self.check_fn(f),
@@ -400,12 +426,13 @@ impl<'a> Checker<'a> {
                     self.walk_expr(ctx, fi.value, false);
                     if self.escapes_as(ctx, fi.value) {
                         let name = self.root_name(ctx, fi.value);
-                        self.error(
+                        self.error_help(
                             ast.expr_at(fi.value).span,
                             format!(
                                 "cannot store borrow `{name}` in struct `{}`: a second-class borrow may not outlive its call",
                                 path.name
                             ),
+                            Self::STORE_ESCAPE_HELP,
                         );
                     }
                 }
@@ -419,12 +446,13 @@ impl<'a> Checker<'a> {
                     self.walk_expr(ctx, fi.value, false);
                     if self.escapes_as(ctx, fi.value) {
                         let name = self.root_name(ctx, fi.value);
-                        self.error(
+                        self.error_help(
                             ast.expr_at(fi.value).span,
                             format!(
                                 "cannot store borrow `{name}` in struct `{}`: a second-class borrow may not outlive its call",
                                 ctor.name
                             ),
+                            Self::STORE_ESCAPE_HELP,
                         );
                     }
                 }
@@ -435,11 +463,12 @@ impl<'a> Checker<'a> {
                 self.walk_expr(ctx, *value, false);
                 if self.is_borrow_place(ctx, *target) && self.escapes_as(ctx, *value) {
                     let name = self.root_name(ctx, *value);
-                    self.error(
+                    self.error_help(
                         span,
                         format!(
                             "cannot store borrow `{name}` into borrowed storage: it would outlive its call"
                         ),
+                        Self::STORE_ESCAPE_HELP,
                     );
                 }
                 // Region-safety (assign-to-outer): storing a region-allocated value
@@ -521,6 +550,13 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Deref { base } => self.walk_expr(ctx, *base, false),
             ExprKind::Try { base } => self.walk_expr(ctx, *base, false),
+            // `base catch fallback` — the fallback inherits `tail`, because it really
+            // is in the enclosing tail position when the error path is taken, so a
+            // borrow escaping through it must still be caught.
+            ExprKind::Catch { base, fallback } => {
+                self.walk_expr(ctx, *base, false);
+                self.walk_expr(ctx, *fallback, tail);
+            }
             ExprKind::Cast { expr, .. } => self.walk_expr(ctx, *expr, false),
             ExprKind::Closure { params, body } => {
                 // The closure's own parameters shadow outer borrows; check its
@@ -732,15 +768,29 @@ impl<'a> Checker<'a> {
         // escapes. (A Copy value is duplicated out, not referenced — so it's fine.)
         if tail && !ctx.ret_is_borrow && self.escapes_as(ctx, id) {
             let name = self.root_name(ctx, id);
-            let msg = if matches!(&self.ast.expr_at(id).kind, ExprKind::Closure { .. }) {
-                format!("cannot return a closure capturing borrow `{name}`: the borrow would outlive its call")
+            // A returned *closure* and a returned *borrow* need different advice: the
+            // borrow can often just be declared as one in the signature, while a
+            // closure has to stop capturing by reference.
+            if matches!(&self.ast.expr_at(id).kind, ExprKind::Closure { .. }) {
+                self.error_help(
+                    span,
+                    format!("cannot return a closure capturing borrow `{name}`: the borrow would outlive its call"),
+                    format!(
+                        "capture `{name}` by value instead — pass it in as `take` so the closure owns it, \
+                         or return a plain `fn` pointer that takes `{name}` as a parameter"
+                    ),
+                );
             } else {
-                format!(
-                    "cannot return borrow `{name}`: a second-class `read`/`mut`/`out` borrow may not outlive its call \
-                     (pass it further down, or declare the return as `read`/`mut`/`out`)"
-                )
-            };
-            self.error(span, msg);
+                // This message already carries its own suggestion inline, and the P4
+                // golden compares messages, so it stays exactly as it is.
+                self.error(
+                    span,
+                    format!(
+                        "cannot return borrow `{name}`: a second-class `read`/`mut`/`out` borrow may not outlive its call \
+                         (pass it further down, or declare the return as `read`/`mut`/`out`)"
+                    ),
+                );
+            }
         }
     }
 
@@ -1155,6 +1205,10 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Deref { base } => self.collect_names(*base, out),
             ExprKind::Try { base } => self.collect_names(*base, out),
+            ExprKind::Catch { base, fallback } => {
+                self.collect_names(*base, out);
+                self.collect_names(*fallback, out);
+            }
             ExprKind::Cast { expr, .. } => self.collect_names(*expr, out),
             ExprKind::StructLit { fields, spread, .. } => {
                 for f in fields {
@@ -1322,6 +1376,62 @@ mod tests {
              fn g() -> i32 { let p = alloc(i32, 4) free_ptr(p) return 0 }",
         );
         assert!(d.is_empty(), "only the annotated fn is constrained: {:?}", d);
+    }
+
+    // --- suggested rewrites (Diagnostics tier 3) ---
+
+    /// A store escape is the most common way to hit the ownership rule, and "you may
+    /// not do that" is the least actionable thing to say about it. The suggestion names
+    /// **all three** Jestyr answers, because which one is right depends on whether the
+    /// value is moved, long-lived, or shared — and the compiler cannot know that.
+    #[test]
+    fn a_store_escape_suggests_the_three_real_remedies() {
+        let d = escapes("struct N { v: i32 } struct H { i: i32 } fn f(read p: N) -> H { H{ i: p } }");
+        assert_eq!(d.len(), 1, "{d:?}");
+        let h = d[0].help.as_deref().expect("a store escape must suggest a rewrite");
+        for remedy in ["take", "region", "genref"] {
+            assert!(h.contains(remedy), "the `{remedy}` remedy must be named: {h}");
+        }
+    }
+
+    /// A returned closure gets **different** advice from a returned borrow: a borrow can
+    /// often just be declared as one in the signature, but a closure has to stop
+    /// capturing by reference, and telling it to "declare the return as `read`" would be
+    /// useless.
+    #[test]
+    fn a_returned_closure_gets_its_own_suggestion() {
+        let d = escapes("struct N { v: i32 } fn f(read p: N) -> fn() -> i32 { return || p.v }");
+        assert_eq!(d.len(), 1, "{d:?}");
+        let h = d[0].help.as_deref().expect("a captured borrow must suggest a rewrite");
+        assert!(h.contains("by value"), "{h}");
+        assert!(!h.contains("genref"), "the store-escape advice does not apply here: {h}");
+    }
+
+    /// **The invariant that keeps suggestions free.** The P4 escape golden compares the
+    /// port's diagnostics against these by *span + message*; `help` is a separate field
+    /// the port has no counterpart for. So suggestions may be added and improved on the
+    /// reference side without owing a port mirror — provided no message changes, which
+    /// is what this pins.
+    #[test]
+    fn adding_a_suggestion_does_not_change_any_message() {
+        let d = escapes(
+            "struct N { v: i32 } struct H { i: i32 } \
+             fn a(read p: N) -> N { p } \
+             fn b(read p: N) -> H { H{ i: p } } \
+             fn c(read p: N, mut h: H) { h.i = p }",
+        );
+        assert_eq!(d.len(), 3, "{d:?}");
+        assert!(d[0].message.starts_with("cannot return borrow `p`"), "{:?}", d[0].message);
+        assert!(d[1].message.starts_with("cannot store borrow `p` in struct `H`"), "{:?}", d[1].message);
+        assert!(
+            d[2].message.starts_with("cannot store borrow `p` into borrowed storage"),
+            "{:?}",
+            d[2].message
+        );
+        // The return-escape message already carries its suggestion inline, so it takes
+        // no `help` — duplicating it would print the same advice twice.
+        assert!(d[0].help.is_none(), "no duplicated advice: {:?}", d[0].help);
+        assert!(d[1].help.is_some() && d[2].help.is_some());
     }
 
     // --- transitive `@no_alloc` ---

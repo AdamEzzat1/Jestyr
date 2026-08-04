@@ -4688,6 +4688,32 @@ impl<'a> Cgen<'a> {
                     "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) return ({cur}){{ .is_err = true, .err = {tmp}.err }}; {tmp}.ok; }})"
                 )
             }
+            ExprKind::Catch { base, fallback } => {
+                // `e catch v` — recover. Where `?` early-returns the error, this
+                // substitutes a value and carries on, so it needs no enclosing
+                // fallible function and emits no `return`.
+                //
+                // The fallback must be evaluated **only** on the error path — it is a
+                // fallback, not a default argument, and computing it eagerly would
+                // both cost work and run its side effects on the success path. C's
+                // conditional operator gives exactly that short-circuit, so this is a
+                // `?:` and not two statements.
+                let base_c = self.emit_expr(*base);
+                let bt = apply_subst(&self.info.type_of(*base).clone(), &self.subst);
+                let res_ty = self.c_type(&bt);
+                let tmp = format!("_ct{}", self.tmp);
+                self.tmp += 1;
+                // The result is spilled to a temp so `base` is evaluated once: it is
+                // read twice below (`.is_err` and `.ok`), and a call in base position
+                // would otherwise run twice.
+                let fb = self.emit_expr(*fallback);
+                if matches!(bt, Ty::Result(ref ok) if **ok == Ty::Unit) {
+                    // A `!E`-only result carries no `ok` member to read, so the value
+                    // is the fallback or nothing at all.
+                    return format!("({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) {{ {fb}; }} }})");
+                }
+                format!("({{ {res_ty} {tmp} = {base_c}; {tmp}.is_err ? ({fb}) : {tmp}.ok; }})")
+            }
             ExprKind::Range { .. } => {
                 self.diag(span, "the C backend does not support ranges yet");
                 "0".to_string()
@@ -9304,6 +9330,37 @@ mod tests {
 
     /// Wiring: `try_read_file` lowers to a tagged `JestyrResult_String`, gets its
     /// out-param runtime helper, and its err branch carries the `IoError` tag.
+    /// **`catch` recovers where `?` propagates**, and the difference shows in the C:
+    /// `?` emits an early `return` of the error, `catch` emits a conditional. That is
+    /// why `catch` is legal in an **infallible** function and `?` is not — recovering
+    /// is exactly how a fallible call is made infallible.
+    #[test]
+    fn catch_lowers_to_a_conditional_not_an_early_return() {
+        let src = "fn f(n: i32) -> i32 !{ Bad } { if n > 9 { return err(Bad) } return ok(n) } \
+                   fn main() -> i32 { let a: i32 = f(1) catch 0 print_int(a as i64) return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(
+            c.contains("_ct0.is_err ? (0) : _ct0.ok"),
+            "catch must lower to a conditional: {c}"
+        );
+        // No error is propagated out of `main` — that is `?`'s job, not `catch`'s.
+        assert!(
+            !c.contains("if (_ct0.is_err) return"),
+            "catch must not early-return: {c}"
+        );
+    }
+
+    /// The base is spilled to a temp so it is evaluated **once** — it is read twice
+    /// (`.is_err` then `.ok`), and a call in base position would otherwise run twice.
+    #[test]
+    fn catch_evaluates_its_base_once() {
+        let src = "fn f() -> i32 !{ Bad } { return ok(1) } \
+                   fn main() -> i32 { let a: i32 = f() catch 0 print_int(a as i64) return 0 }";
+        let (c, _) = gen(src);
+        assert_eq!(c.matches("jestyr_f()").count(), 1, "base must be emitted once: {c}");
+    }
+
     #[test]
     fn try_read_file_lowers_to_a_recoverable_result() {
         let src = "fn main() -> i32 { let r = try_read_file(\"x\") if is_err(r) { return 1 } return 0 }";

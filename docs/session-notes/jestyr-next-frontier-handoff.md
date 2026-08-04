@@ -7,14 +7,26 @@ L (layout: report → `@layout(auto)` → comptime `@size_of` → `@abi(ref)`), 
 lowering, both sides, lane width pinned in the cross-OS canary). The place-lowering
 defect class (`xs[i].f = v`, `m[i][j]`, `mut`/`out` receivers) is closed by X1/X2.
 
-**Gate status on `master`:** 839 default tests green, warning-clean; all three cgen
+**Gate status on `master`:** 856 default tests green, warning-clean; all three cgen
 goldens; `selfhost_fixpoint_full`; `jestyr_driver_builds_itself`; seed current.
 
 **The frontier is no longer Group 3 — it is the V1 tier ladders** (§ "What is genuinely
-still open"). Two of those closed this session (transitive `@no_alloc`, diagnostic JSON).
-**The single highest-value item remaining is `catch` / recovery blocks** — Error-handling
-tier 3, the last *language* feature on the V1 list, on machinery that is already
-finished (`?` propagation, typed error sets, and `catch` already reserved).
+still open"). **Five of those have now closed**: transitive `@no_alloc`, diagnostic JSON,
+`catch` (reference side), suggested rewrites, and the `@verified` planning slice.
+
+**What to pick up next, in order:**
+
+1. **The `catch` port mirror** — the smallest well-defined piece, and the one that
+   unblocks a corpus example. `catch` exists in the Rust reference only, so no
+   `examples/**.jtr` may use it until parser.jtr/typeck.jtr/cgen.jtr mirror it and the
+   seed is refreshed. The lowering is one conditional; the parse is one precedence level.
+2. **Error traces** (Error tier 4) — the largest remaining *feature*.
+3. **Unsafe/provenance v2** — the largest remaining item overall; start as a written
+   contract plus lints, not a semantic rewrite.
+
+**Do NOT start an SMT backend.** The planning slice measured it: **7 declared
+obligations across 144 corpus files**, so a solver would have nothing to discharge. The
+prerequisite for `@verified` is writing contracts. (`jestyrc obligations <file>`.)
 
 **Three known gaps to be aware of before you plan anything:**
 
@@ -918,15 +930,22 @@ anything below.**
 ### What is genuinely still open, in the order it is worth doing
 
 These are the rows that survive the correction above. Each is its own increment chain
-under the standing two-sided tax, and **none blocks any other**. Three have since been
+under the standing two-sided tax, and **none blocks any other**. Most have since been
 closed; they are struck through with their commits, so the ordering rationale survives.
 
-1. **Error handling tier 3 — `catch` / recovery blocks.** `catch` is already a reserved
-   word, and `?` propagation + typed error sets are done, so this is a surface on
-   finished machinery rather than new semantics. The natural first increment is
-   parse + typeck + a cgen lowering that is *provably* equivalent to the explicit
-   `match`, pinned by a property test comparing the two. **The largest remaining item,
-   and the one with the most user-visible value.**
+1. ~~**Error handling tier 3 — `catch` / recovery blocks.**~~ — **DONE on the reference
+   side (`b67f2c2`).** `e catch fallback`: recovery, the half of the error story that
+   decides *who* handles a failure, and the reason `catch` is legal in an **infallible**
+   function where `?` is not. Right-associative, so a chain tries each alternative in
+   turn; precedence between assignment and the binary operators. The fallback is
+   evaluated **only** on the error path — a guarantee, not an optimization, which is why
+   it lowers to C's conditional operator and is checked by *running* a fallback that
+   prints. `catch` on an infallible expression is refused rather than accepted as a
+   no-op. See `docs/error-handling.md`.
+   **STILL OPEN, and the next increment in this line:** the **port mirror** (`catch` is
+   reference-only, so no `examples/**.jtr` may use it until parser.jtr/typeck.jtr/
+   cgen.jtr mirror it and the seed is refreshed) and **`catch |e|`**, which binds the
+   error value — reserved in the design, not implemented.
 2. ~~**Allocation — transitive `@no_alloc`.**~~ — **DONE (`f0e579d`).** The design
    question this note flagged (what to do at a call to an unannotated function) resolved
    as predicted: *infer per body* + a least fixpoint, since assume-allocates would make
@@ -937,18 +956,27 @@ closed; they are struck through with their commits, so the ordering rationale su
 3. ~~**Diagnostics tier 5 — machine-readable JSON.**~~ — **DONE (`d6e34ba`).**
    `jestyrc check <file> --json`. See `docs/diagnostics-json.md` for the contract and the
    two deliberate non-choices (object not array; emission order not sorted).
-4. **Diagnostics tiers 2–3 — suggested rewrites.** Now the highest *user-visible* value
-   per line remaining, and it needs no new machinery: borrow escapes → suggest
-   region/genref/take, non-comptime array length → suggest `const`/`comptime` (the
-   diagnostic G1 added is the hook). **The missing-match-arm case is already done** —
-   `non_exhaustive_message` names the missing variants — so start from the other two.
-5. **Error handling tier 4 — debug error traces.**
-6. **Correctness tier 5 — `@verified`.** The planning slice first (obligation
-   extraction + a `jestyrc obligations <file>` report), *not* an SMT backend. That
-   report is useful on its own and is the honest way to size the real thing.
+4. ~~**Diagnostics tiers 2–3 — suggested rewrites.**~~ — **DONE (`b67f2c2`).** A store
+   escape now names all three Jestyr answers (`take` / `region` / `genref`), because
+   which one is right depends on whether the value is moved, long-lived or shared and
+   the compiler cannot know that; a returned *closure* gets different advice; a
+   non-constant array length is told about `const` **and** `comptime { … }`.
+   **The invariant that made it free, and worth reusing:** suggestions go in `help`,
+   never in the message, and the P4 escape golden compares span + **message** — so
+   suggestions can be improved on the reference side forever without owing a port
+   mirror. `adding_a_suggestion_does_not_change_any_message` pins it.
+5. **Error handling tier 4 — debug error traces.** Now the largest remaining *feature*.
+6. ~~**Correctness tier 5 — `@verified`.**~~ — **planning slice DONE (`fb18927`).**
+   `src/obligations.rs` + `jestyrc obligations <file>`, and it produced the number the
+   sizing decision needed: **7 declared obligations across the whole 144-file corpus.**
+   So an SMT backend would have almost nothing to discharge, and the real prerequisite
+   for `@verified` is **writing contracts**, not building a solver. Pinned as an *upper*
+   bound (contracts should grow), firing at 100. See `docs/obligations.md`.
+   **Still open:** the solver itself — now correctly sized as *not yet worth building*.
 7. **Unsafe/provenance v2.** Start as documentation plus lints, per the design note —
    a written contract for raw-pointer validity, aliasing, and the C interop boundary,
-   with diagnostics that enforce the parts that are checkable today.
+   with diagnostics that enforce the parts that are checkable today. **The largest
+   remaining item on this list.**
 8. **The `#line` port** (§1) — its **prerequisite golden is now built** (`d6e34ba`,
    `jestyr_module_cgen_matches_reference_except_line_directives`), and building it
    corrected §1: **`#line` is not the only module-path divergence, there are three.**
