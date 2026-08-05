@@ -142,8 +142,13 @@ let v = small(n) catch |e| return e        // explicit propagation — exactly `
 * **Scoped to the fallback.** The binder is a `const int` in the error branch of the
   lowering; the success path never sees it.
 
-Not yet mirrored in the port (`jc`): no corpus file uses `|e|`, so the two-sided tax is
-not yet due — the P2 dump harness labels the binder forms distinctly (`catch-bind` /
-`catch-rethrow`), so adding a golden snippet without the port arm fails loudly.
+**Mirrored in the port**: `parser.jtr` (the binder's name span + the rethrow flag on
+kind 45), `typeck.jtr` (the opaque `error` prim, code 20, bound in a pushed-and-popped
+scope over the fallback alone), and `cgen.jtr` (all three lowerings, byte-identical).
+`examples/error_catch.jtr` carries the binder forms, and the bootstrap seed carries the
+mirror. The increment also fixed a **reference** bug the P3 golden caught: the typeck
+arm's early `return`s bypassed `set()`, so a `catch`-expression's recorded type stayed
+`Unknown` while the port recorded it faithfully — the rare divergence where the port
+was right and the reference was wrong.
 
 ## Not yet

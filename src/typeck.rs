@@ -2411,9 +2411,13 @@ impl<'a> TypeChecker<'a> {
                 // error path is taken. Unlike `?` it does **not** need a fallible
                 // enclosing function — recovering is precisely how a fallible call is
                 // made infallible.
+                // No early `return` anywhere in this arm: `infer` records the computed
+                // type via `set` at its tail, and a `return` skips that — leaving the
+                // Catch node's recorded type `Unknown`, which the P3 typeck golden
+                // caught as a divergence from the port (which records faithfully).
                 let bt = self.infer(scope, typ, self_ty, *base);
                 let ok = match bt {
-                    Ty::Result(ok) => *ok,
+                    Ty::Result(ok) => Some(*ok),
                     // Not fallible: nothing to recover from. Reported rather than
                     // silently accepted, because `catch` on an infallible expression
                     // reads as a guarantee that an error was handled.
@@ -2427,9 +2431,12 @@ impl<'a> TypeChecker<'a> {
                                 ),
                             );
                         }
-                        self.infer(scope, typ, self_ty, *fallback);
-                        return Ty::Error;
+                        None
                     }
+                };
+                let Some(ok) = ok else {
+                    self.infer(scope, typ, self_ty, *fallback);
+                    return self.set(id, Ty::Error);
                 };
                 // `catch |e| …`: the binder carries the opaque `error` type, in scope
                 // for the FALLBACK alone — a pushed-and-popped scope, exactly a `let`
@@ -2446,7 +2453,7 @@ impl<'a> TypeChecker<'a> {
                 if *rethrow {
                     self.infer(scope, typ, self_ty, *fallback);
                     scope.pop();
-                    return ok;
+                    return self.set(id, ok);
                 }
                 // The fallback is inferred **against the ok type** (the `cur_expected`
                 // idiom every other expected-type site uses), so a literal fallback

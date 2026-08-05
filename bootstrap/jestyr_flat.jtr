@@ -1277,12 +1277,14 @@ fn mk_assign(mut p: Parser, start: usize, end: usize, op: i32, target: i32, valu
     push(ExprData, p.ex, ExprData{ kind: 12, start: start, end: end, op: op, a: target, b: value, x: 0 - 1, y: 0 - 1 })
     return id
 }
-// A Catch node `base catch fallback` (kind 45): `a`=base, `b`=fallback. Recovery -- the
-// half of the error story that handles a failure here instead of propagating it, which
-// is why it needs no fallible enclosing fn. Mirrors `ExprKind::Catch`.
-fn mk_catch(mut p: Parser, start: usize, end: usize, base: i32, fallback: i32) -> i32 {
+// A Catch node `base catch fallback` (kind 45): `a`=base, `b`=fallback; `(x, y)` = the
+// error binder's name span (`catch |e| ...`), -1/-1 when there is none; `op` = 1 for the
+// explicit-propagation form (`catch |e| return e`, where `b` is the binder as a Name
+// node), 0 otherwise. Recovery -- the half of the error story that handles a failure
+// here instead of propagating it. Mirrors `ExprKind::Catch`.
+fn mk_catch(mut p: Parser, start: usize, end: usize, base: i32, fallback: i32, bs: i32, be: i32, rethrow: i32) -> i32 {
     let id: i32 = len(ExprData, p.ex) as i32
-    push(ExprData, p.ex, ExprData{ kind: 45, start: start, end: end, op: 0, a: base, b: fallback, x: 0 - 1, y: 0 - 1 })
+    push(ExprData, p.ex, ExprData{ kind: 45, start: start, end: end, op: rethrow, a: base, b: fallback, x: bs, y: be })
     return id
 }
 // A Range node `lo .. hi` / `lo ..= hi`: `op` is 1 when inclusive, `a`=lo, `b`=hi (either
@@ -3580,10 +3582,28 @@ fn parse_catch_tail(mut p: Parser) -> i32 {
     let lhs: i32 = parse_binary(p, 0)
     if cur_kind(p) == 53 {                         // `catch`
         bump(p)
+        var bs: i32 = 0 - 1                        // binder name span, -1 = no binder
+        var be: i32 = 0 - 1
+        if cur_kind(p) == 93 {                     // `|` right after `catch` is ALWAYS
+            bump(p)                                 // the binder, never a closure fallback
+            let bt2: Token = cur_tok(p)
+            bs = bt2.start as i32
+            be = bt2.end as i32
+            bump(p)                                 // the binder identifier
+            if cur_kind(p) == 93 { bump(p) }        // closing `|`
+        }
+        if cur_kind(p) == 28 {                     // `return <binder>` -- explicit propagation:
+            bump(p)                                 // `?` spelled out; only the binder may follow
+            let nt: Token = cur_tok(p)
+            bump(p)
+            let fb: i32 = mk(p, 2, nt.start, nt.end, 0, 0 - 1, 0 - 1)   // the binder as a Name
+            let s: usize = node_start(p, lhs)
+            return mk_catch(p, s, nt.end, lhs, fb, bs, be, 1)
+        }
         let fb: i32 = parse_catch_tail(p)
         let s: usize = node_start(p, lhs)
         let e: usize = node_end(p, fb)
-        return mk_catch(p, s, e, lhs, fb)
+        return mk_catch(p, s, e, lhs, fb, bs, be, 0)
     }
     return lhs
 }
@@ -4170,7 +4190,14 @@ fn dump(read src: str, read p: Parser, id: i32) {
         dump(src, p, d.a)
     } else if d.kind == 45 {
         // `base catch fallback` -- base then fallback, mirroring `ref_dump_expr`.
-        print_str("catch") print_uint(d.start) print_uint(d.end)
+        // The binder forms carry the binder's name SPAN (the `field` idiom).
+        if d.x >= 0 {
+            if d.op == 1 { print_str("catch-rethrow") } else { print_str("catch-bind") }
+            print_int(d.x as i64) print_int(d.y as i64)
+        } else {
+            print_str("catch")
+        }
+        print_uint(d.start) print_uint(d.end)
         dump(src, p, d.a)
         dump(src, p, d.b)
     } else if d.kind == 10 {
@@ -6352,7 +6379,8 @@ fn prim_name(pc: i32) -> str {
     if pc == 16 { return "os_str" }
     if pc == 17 { return "String" }
     if pc == 18 { return "Builder" }
-    return "Cow"                                   // 19
+    if pc == 19 { return "Cow" }
+    return "error"                                 // 20 -- the opaque error-binder type
 }
 
 // A parameter-passing convention's display label (mirrors `Conv::label`).
@@ -8087,9 +8115,26 @@ fn infer(mut c: Checker, read p: Parser, read src: str, id: i32) -> i32 {
         // Recovery, not propagation: the fallback is inferred too (it is real code),
         // and the whole expression has the OK type -- which is what makes `catch`
         // legal in an infallible fn where `?` is not. Mirrors `ExprKind::Catch`.
+        //
+        // `catch |e| ...`: the binder carries the opaque `error` type (prim 20), in
+        // scope for the FALLBACK alone -- a pushed-and-popped scope, exactly a `let`
+        // inside a block. Opaque so the raw tag cannot leak out as a success value.
+        // The rethrow form (`catch |e| return e`, op == 1) infers the fallback (the
+        // binder name) only to record its type; the non-rethrow fallback is inferred
+        // AGAINST the ok type (the `expected` idiom), the courtesy a `let` gives.
         let bt: i32 = infer(c, p, src, d.a)
         let bd: TyData = get(TyData, c.tys, bt as usize)
-        infer(c, p, src, d.b)
+        push_scope(c)
+        if d.x >= 0 { scope_insert(c, d.x, d.y, mk_ty__typeck(c, 2, 0 - 1, 0 - 1, 20, 0 - 1)) }
+        if d.op == 1 {
+            infer(c, p, src, d.b)
+        } else {
+            let saved: i32 = c.expected
+            if bd.kind == 5 { c.expected = bd.a } else { c.expected = 0 - 1 }
+            infer(c, p, src, d.b)
+            c.expected = saved
+        }
+        pop_scope(c)
         if bd.kind == 5 { r = bd.a } else { r = mk_ty__typeck(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1) }
     } else if k == 6 {                             // index: slice/array -> elem; str -> u8 (range -> str)
         let bt: i32 = infer(c, p, src, d.a)
@@ -11878,10 +11923,94 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
         emit_expr(sbb, p, src, c, g, e.a)
         let n: i32 = g.tmp
         g.tmp = g.tmp + 1
-        var svb: String = string_new()
-        emit_expr(svb, p, src, c, g, e.b)
         let bt: i32 = get(i32, c.et, e.a as usize)
         let btd: TyData = get(TyData, c.tys, bt as usize)
+        // `catch |e| return e` -- explicit propagation: exactly `?`'s lowering (early
+        // return, tag preserved), and the fallback (the binder name) is NEVER emitted.
+        if e.op == 1 {
+            if g.res_ok < 0 {                         // outside a fallible fn: the diag case
+                string_push(sb, "((")
+                string_push(sb, string_view(sbb))
+                string_push(sb, ").ok)")
+                string_free(sbb)
+                return
+            }
+            string_push(sb, "({ ")
+            emit_ty_c(sb, p, src, c, bt)
+            string_push(sb, " _ct")
+            push_uint__cgen(sb, n as i64)
+            string_push(sb, " = ")
+            string_push(sb, string_view(sbb))
+            string_push(sb, "; if (_ct")
+            push_uint__cgen(sb, n as i64)
+            string_push(sb, ".is_err) return (")
+            emit_result_name(sb, p, src, g.res_ok)
+            string_push(sb, "){ .is_err = true, .err = _ct")
+            push_uint__cgen(sb, n as i64)
+            string_push(sb, ".err }; _ct")
+            push_uint__cgen(sb, n as i64)
+            string_push(sb, ".ok; })")
+            string_free(sbb)
+            return
+        }
+        // `catch |e| fallback` -- the binder is a `const int` scoped to the error
+        // branch. A `?:` cannot carry a declaration, so this form lowers as if/else
+        // over a result variable; the binder-less form below KEEPS its original `?:`
+        // string, character for character.
+        if e.x >= 0 {
+            var svb2: String = string_new()
+            emit_expr(svb2, p, src, c, g, e.b)        // fallback BEFORE `_cv` is allocated
+            let m: i32 = g.tmp
+            g.tmp = g.tmp + 1
+            string_push(sb, "({ ")
+            emit_ty_c(sb, p, src, c, bt)
+            string_push(sb, " _ct")
+            push_uint__cgen(sb, n as i64)
+            string_push(sb, " = ")
+            string_push(sb, string_view(sbb))
+            if btd.kind == 5 and btd.a == 1 {         // `!E`-only: no `ok` member
+                string_push(sb, "; if (_ct")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, ".is_err) { const int j_")
+                string_push(sb, src[e.x as usize .. e.y as usize])
+                string_push(sb, " = _ct")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, ".err; (void)j_")
+                string_push(sb, src[e.x as usize .. e.y as usize])
+                string_push(sb, "; ")
+                string_push(sb, string_view(svb2))
+                string_push(sb, "; } })")
+            } else {
+                string_push(sb, "; ")
+                if btd.kind == 5 { emit_ty_c(sb, p, src, c, btd.a) } else { string_push(sb, "int") }
+                string_push(sb, " _cv")
+                push_uint__cgen(sb, m as i64)
+                string_push(sb, "; if (_ct")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, ".is_err) { const int j_")
+                string_push(sb, src[e.x as usize .. e.y as usize])
+                string_push(sb, " = _ct")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, ".err; (void)j_")
+                string_push(sb, src[e.x as usize .. e.y as usize])
+                string_push(sb, "; _cv")
+                push_uint__cgen(sb, m as i64)
+                string_push(sb, " = (")
+                string_push(sb, string_view(svb2))
+                string_push(sb, "); } else { _cv")
+                push_uint__cgen(sb, m as i64)
+                string_push(sb, " = _ct")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, ".ok; } _cv")
+                push_uint__cgen(sb, m as i64)
+                string_push(sb, "; })")
+            }
+            string_free(sbb)
+            string_free(svb2)
+            return
+        }
+        var svb: String = string_new()
+        emit_expr(svb, p, src, c, g, e.b)
         string_push(sb, "({ ")
         emit_ty_c(sb, p, src, c, bt)                  // the base's own Result type
         string_push(sb, " _ct")

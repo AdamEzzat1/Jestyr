@@ -9,7 +9,7 @@
 // Which is why `catch` is legal in an INFALLIBLE function (`main` below) where `?` is
 // not: recovering is precisely what turns a fallible call into an ordinary value.
 //
-// Run:  jestyrc run examples/error_catch.jtr   →  10, 0, 14, 99, 7, 3, 42
+// Run:  jestyrc run examples/error_catch.jtr   →  10, 0, 14, 99, 6, 3, 42, 1, 11, true
 
 struct P { x: i32, y: i32 }
 
@@ -31,6 +31,13 @@ fn make(n: i32) -> P !{ TooBig } {
 // enclosing signature — this one still returns `i32 !{ TooBig }`.
 fn inner(n: i32) -> i32 !{ TooBig } {
     let v: i32 = small(500) catch n
+    return ok(v + 1)
+}
+
+// `catch |e| return e` — explicit propagation: exactly `?`, spelled out. Same
+// requirement of a fallible enclosing fn, same tag preservation across the hop.
+fn relay(n: i32) -> i32 !{ TooBig } {
+    let v: i32 = small(n) catch |e| return e
     return ok(v + 1)
 }
 
@@ -57,5 +64,14 @@ fn main() -> i32 {
     print_int(p.x as i64)            // 3
 
     print_int(unwrap(inner(41)) as i64)   // 42
+
+    // `catch |e|` binds the error for the fallback — OPAQUELY: `e` has the `error`
+    // type, so it cannot leak out as a success value; `e as i64` is the sanctioned
+    // way to mean the tag itself (here `TooBig` is tag 1).
+    print_int(small(500) catch |e| (e as i64))   // 1 — the error's integer tag
+
+    // The explicit-propagation form, both paths.
+    print_int(unwrap(relay(5)) as i64)    // 11 — ok path: small(5)=10, +1
+    print_bool(is_err(relay(500)))        // true — the error re-raised, tag intact
     return 0
 }

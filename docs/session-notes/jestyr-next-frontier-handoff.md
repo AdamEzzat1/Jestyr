@@ -48,14 +48,21 @@ still open"). **Five of those have now closed**: transitive `@no_alloc`, diagnos
      missing one.
    * Comptime bodies are excluded on both sides (the interpreter has no pointers);
      closure bodies are included (runtime code like any other).
-4. ~~**`catch |e|`**~~ — **DONE, reference side** *(this session)*: the binder carries
-   an **opaque `error` type** (typing it `i32` would let `catch |e| e` silently return
-   the tag as a success value — refused, with `e as i64` as the sanctioned escape
-   hatch), and `catch |e| return e` is `?` spelled out (same lowering, tag preserved,
-   fallible-fn requirement). A `|` after `catch` is always the binder; a closure
-   fallback needs parens. Port mirror due with the first `|e|` corpus file — the P2
-   harness labels the binder forms distinctly (`catch-bind`/`catch-rethrow`), so a
-   snippet added without the port arm fails loudly.
+4. ~~**`catch |e|`**~~ — **DONE, BOTH SIDES**: the binder carries an **opaque `error`
+   type** (typing it `i32` would let `catch |e| e` silently return the tag as a
+   success value — refused, with `e as i64` as the sanctioned escape hatch), and
+   `catch |e| return e` is `?` spelled out (same lowering, tag preserved, fallible-fn
+   requirement). A `|` after `catch` is always the binder; a closure fallback needs
+   parens. **The port mirror** landed with the first `|e|` corpus use
+   (`error_catch.jtr`): binder span + rethrow flag on kind 45 in parser.jtr, the
+   `error` prim (code 20) + a pushed-and-popped binder scope in typeck.jtr, and all
+   three lowerings in cgen.jtr — byte-identical on the first P5 run. Two things worth
+   carrying: the P2 dump identifies the binder by its **span**, the `field` idiom
+   (a text push would need a String on one side and a source slice on the other); and
+   the P3 golden caught a **reference** bug — the typeck arm's early `return`s
+   bypassed `set()`, so a `catch` node's recorded type stayed `Unknown` while the port
+   recorded faithfully. The rare divergence where the port was right; the rule it
+   yields: **no early `return` in an `infer` arm — every exit goes through `set`**.
 
 **Do NOT start an SMT backend.** The planning slice measured it: **7 declared
 obligations across 144 corpus files**, so a solver would have nothing to discharge. The
@@ -988,8 +995,8 @@ closed; they are struck through with their commits, so the ordering rationale su
    to find every walker a new expression form owes an arm; and the P2 dump harness's
    catch-all prints `error` for an unhandled kind, so its `catch` arm went in **with**
    the construct, not after a golden failed.
-   **`catch |e|` is now DONE on the reference side too** (see the START HERE list);
-   only its port mirror remains, due with the first corpus file that uses it.
+   **`catch |e|` is now DONE on BOTH sides** (see the START HERE list) — the port
+   mirror landed with the first corpus use, in `error_catch.jtr` itself.
 2. ~~**Allocation — transitive `@no_alloc`.**~~ — **DONE (`f0e579d`).** The design
    question this note flagged (what to do at a call to an unannotated function) resolved
    as predicted: *infer per body* + a least fixpoint, since assume-allocates would make

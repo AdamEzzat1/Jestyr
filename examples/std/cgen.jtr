@@ -1814,10 +1814,94 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         emit_expr(sbb, p, src, c, g, e.a)
         let n: i32 = g.tmp
         g.tmp = g.tmp + 1
-        var svb: String = string_new()
-        emit_expr(svb, p, src, c, g, e.b)
         let bt: i32 = list.get(i32, c.et, e.a as usize)
         let btd: typeck.TyData = list.get(typeck.TyData, c.tys, bt as usize)
+        // `catch |e| return e` -- explicit propagation: exactly `?`'s lowering (early
+        // return, tag preserved), and the fallback (the binder name) is NEVER emitted.
+        if e.op == 1 {
+            if g.res_ok < 0 {                         // outside a fallible fn: the diag case
+                string_push(sb, "((")
+                string_push(sb, string_view(sbb))
+                string_push(sb, ").ok)")
+                string_free(sbb)
+                return
+            }
+            string_push(sb, "({ ")
+            emit_ty_c(sb, p, src, c, bt)
+            string_push(sb, " _ct")
+            push_uint(sb, n as i64)
+            string_push(sb, " = ")
+            string_push(sb, string_view(sbb))
+            string_push(sb, "; if (_ct")
+            push_uint(sb, n as i64)
+            string_push(sb, ".is_err) return (")
+            emit_result_name(sb, p, src, g.res_ok)
+            string_push(sb, "){ .is_err = true, .err = _ct")
+            push_uint(sb, n as i64)
+            string_push(sb, ".err }; _ct")
+            push_uint(sb, n as i64)
+            string_push(sb, ".ok; })")
+            string_free(sbb)
+            return
+        }
+        // `catch |e| fallback` -- the binder is a `const int` scoped to the error
+        // branch. A `?:` cannot carry a declaration, so this form lowers as if/else
+        // over a result variable; the binder-less form below KEEPS its original `?:`
+        // string, character for character.
+        if e.x >= 0 {
+            var svb2: String = string_new()
+            emit_expr(svb2, p, src, c, g, e.b)        // fallback BEFORE `_cv` is allocated
+            let m: i32 = g.tmp
+            g.tmp = g.tmp + 1
+            string_push(sb, "({ ")
+            emit_ty_c(sb, p, src, c, bt)
+            string_push(sb, " _ct")
+            push_uint(sb, n as i64)
+            string_push(sb, " = ")
+            string_push(sb, string_view(sbb))
+            if btd.kind == 5 and btd.a == 1 {         // `!E`-only: no `ok` member
+                string_push(sb, "; if (_ct")
+                push_uint(sb, n as i64)
+                string_push(sb, ".is_err) { const int j_")
+                string_push(sb, src[e.x as usize .. e.y as usize])
+                string_push(sb, " = _ct")
+                push_uint(sb, n as i64)
+                string_push(sb, ".err; (void)j_")
+                string_push(sb, src[e.x as usize .. e.y as usize])
+                string_push(sb, "; ")
+                string_push(sb, string_view(svb2))
+                string_push(sb, "; } })")
+            } else {
+                string_push(sb, "; ")
+                if btd.kind == 5 { emit_ty_c(sb, p, src, c, btd.a) } else { string_push(sb, "int") }
+                string_push(sb, " _cv")
+                push_uint(sb, m as i64)
+                string_push(sb, "; if (_ct")
+                push_uint(sb, n as i64)
+                string_push(sb, ".is_err) { const int j_")
+                string_push(sb, src[e.x as usize .. e.y as usize])
+                string_push(sb, " = _ct")
+                push_uint(sb, n as i64)
+                string_push(sb, ".err; (void)j_")
+                string_push(sb, src[e.x as usize .. e.y as usize])
+                string_push(sb, "; _cv")
+                push_uint(sb, m as i64)
+                string_push(sb, " = (")
+                string_push(sb, string_view(svb2))
+                string_push(sb, "); } else { _cv")
+                push_uint(sb, m as i64)
+                string_push(sb, " = _ct")
+                push_uint(sb, n as i64)
+                string_push(sb, ".ok; } _cv")
+                push_uint(sb, m as i64)
+                string_push(sb, "; })")
+            }
+            string_free(sbb)
+            string_free(svb2)
+            return
+        }
+        var svb: String = string_new()
+        emit_expr(svb, p, src, c, g, e.b)
         string_push(sb, "({ ")
         emit_ty_c(sb, p, src, c, bt)                  // the base's own Result type
         string_push(sb, " _ct")

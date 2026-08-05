@@ -216,7 +216,8 @@ fn prim_name(pc: i32) -> str {
     if pc == 16 { return "os_str" }
     if pc == 17 { return "String" }
     if pc == 18 { return "Builder" }
-    return "Cow"                                   // 19
+    if pc == 19 { return "Cow" }
+    return "error"                                 // 20 -- the opaque error-binder type
 }
 
 // A parameter-passing convention's display label (mirrors `Conv::label`).
@@ -1951,9 +1952,26 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
         // Recovery, not propagation: the fallback is inferred too (it is real code),
         // and the whole expression has the OK type -- which is what makes `catch`
         // legal in an infallible fn where `?` is not. Mirrors `ExprKind::Catch`.
+        //
+        // `catch |e| ...`: the binder carries the opaque `error` type (prim 20), in
+        // scope for the FALLBACK alone -- a pushed-and-popped scope, exactly a `let`
+        // inside a block. Opaque so the raw tag cannot leak out as a success value.
+        // The rethrow form (`catch |e| return e`, op == 1) infers the fallback (the
+        // binder name) only to record its type; the non-rethrow fallback is inferred
+        // AGAINST the ok type (the `expected` idiom), the courtesy a `let` gives.
         let bt: i32 = infer(c, p, src, d.a)
         let bd: TyData = list.get(TyData, c.tys, bt as usize)
-        infer(c, p, src, d.b)
+        push_scope(c)
+        if d.x >= 0 { scope_insert(c, d.x, d.y, mk_ty(c, 2, 0 - 1, 0 - 1, 20, 0 - 1)) }
+        if d.op == 1 {
+            infer(c, p, src, d.b)
+        } else {
+            let saved: i32 = c.expected
+            if bd.kind == 5 { c.expected = bd.a } else { c.expected = 0 - 1 }
+            infer(c, p, src, d.b)
+            c.expected = saved
+        }
+        pop_scope(c)
         if bd.kind == 5 { r = bd.a } else { r = mk_ty(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1) }
     } else if k == 6 {                             // index: slice/array -> elem; str -> u8 (range -> str)
         let bt: i32 = infer(c, p, src, d.a)

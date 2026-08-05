@@ -7520,11 +7520,15 @@ mod c_oracle {
                     (true, true) => "catch-rethrow",
                 };
                 out.push(label.to_string());
+                // The binder is identified by its SPAN, the `field` idiom — spans
+                // name the text and the port dumps them as plain ints, where a text
+                // push would need a source slice on one side and a String on the other.
+                if let Some(b) = binder {
+                    out.push(b.span.start.to_string());
+                    out.push(b.span.end.to_string());
+                }
                 out.push(s);
                 out.push(en);
-                if let Some(b) = binder {
-                    out.push(b.name.clone());
-                }
                 ref_dump_expr(ast, *base, out);
                 ref_dump_expr(ast, *fallback, out);
             }
@@ -7953,6 +7957,8 @@ mod c_oracle {
             "a catch b catch c",     //   RIGHT-associative: catch(a, catch(b, c))
             "x + f() catch 0",       //   looser than `+`: catch(add(x, f()), 0)
             "a[i] catch a.b catch 0", // …and postfix binds tighter on both sides
+            "f() catch |e| 0",        //   the binder form: catch-bind + the name span
+            "f() catch |e| return e", //   explicit propagation: catch-rethrow
             "a.b[c].d",        // mixed field/index/field chain
             "- a.b",           // prefix binds looser than postfix: neg(field(a,b))
             "!a.b",            // …and `not`
