@@ -27,22 +27,27 @@ still open"). **Five of those have now closed**: transitive `@no_alloc`, diagnos
    near-miss worth remembering: the first draft added a brace to the **flag-off** `?`
    string ("just one redundant brace") — that alone would have diffed every fallible
    corpus file against the port. See `docs/error-handling.md`.
-3. **Unsafe/provenance v2** — **slice 1 DONE** *(this session)*: `jestyrc unsafe
-   <file>` (`src/provenance.rs` — every raw deref / pointer-arith / int-to-ptr site
-   and whether an `unsafe` block lexically covers it; a genref deref is deliberately
-   NOT a site — it is the safe alternative) + `docs/unsafe-contract.md` (validity,
-   provenance, aliasing, the C boundary, and what safe code may assume after
-   `unsafe`). **The survey finding that reframed the item: `unsafe` gates NOTHING
-   today** — a raw deref compiles identically outside it. **The census: 156
-   raw-pointer sites in the corpus, 42 uncovered (73% already wrapped voluntarily)**,
-   so enforcement is a ~40-site migration, not a rewrite — the opposite conclusion
-   from the `@verified` census, which is exactly what measuring first is for. Pinned
-   as a *ratcheting upper bound* (≤60) so the migration can't grow unenforced.
-   **Remaining, each its own increment (the plan is in the contract doc):** migrate
-   the ~42 sites (pure `.jtr` churn + seed refresh; `unsafe` emits nothing so no C
-   change expected), then warning-in-`check` (**with the port mirror in the same
-   increment** — warnings are diagnostics and the P4 golden compares them), then
-   error.
+3. ~~**Unsafe/provenance v2**~~ — **THE WHOLE LADDER IS DONE** *(this session, five
+   rungs)*: report → contract → migration → warning → **ERROR**. A raw-pointer deref,
+   pointer arithmetic, or an int-to-pointer cast outside `unsafe` is now a **compile
+   error** on both toolchains (`jc build` refuses on any escape diagnostic, so error
+   is the severity where the drivers agree). `docs/unsafe-contract.md` carries the
+   contract and the completed plan. Facts a successor needs:
+   * The census moved twice before the migration, both times from *classifier*
+     corrections: casts with an untypable operand are NOT int-to-ptr (`alloc(…) as
+     *mut T` reuses provenance), and `spawn`/`await`/f-string operands were unwalked.
+     Final: **171 sites, all covered**, pinned at zero uncovered by
+     `unsafe_census_is_total_over_the_corpus`.
+   * An `unsafe` wrap is **not** always C-invariant (statement position emits a scope
+     block) — the full golden gate ran for the migration, and must for any re-wrap.
+   * The port mirror (`unsafe_boundary` in `escape.jtr`) is a **flat arena scan with
+     span containment**, not a walk mirror; both sides sort by span start, and that
+     shared sort is the equality contract. Its own two-sided probe
+     (`jestyr_escape_unsafe_warnings_match_reference`) exists because the migrated
+     corpus emits zero diagnostics and cannot distinguish a working mirror from a
+     missing one.
+   * Comptime bodies are excluded on both sides (the interpreter has no pointers);
+     closure bodies are included (runtime code like any other).
 4. ~~**`catch |e|`**~~ — **DONE, reference side** *(this session)*: the binder carries
    an **opaque `error` type** (typing it `i32` would let `catch |e| e` silently return
    the tag as a success value — refused, with `e as i64` as the sanctioned escape
