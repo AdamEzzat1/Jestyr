@@ -17,9 +17,14 @@ byte-identical) + concat + test-mode; P2/P3/P4 goldens; `selfhost_fixpoint_full`
 **What remains is post-v1-shaped — design items, not gaps.** In rough value order:
 
 1. **Richer error payloads.** Today an error is an integer tag; the design wants
-   payload-carrying errors. This is a *language design* item first (surface syntax,
-   result-struct layout, `catch |e|` binding semantics) — start with a written design
-   note, not code. Touches: parser/typeck/cgen on both sides + the seed.
+   payload-carrying errors. **The design note is WRITTEN — `docs/error-payloads.md`**
+   — with the three decisions (payload is a property of the NAME, whole-program;
+   one program-wide payload union so `?` hops copy it blind, gated on use;
+   `catch |e| match e { … }` as the only extractor) and the E1–E6 increment chain.
+   **Start at E1: the set-soundness census** — `err(E)`∈set and `?`-inclusion are
+   UNCHECKED today (`Ty::Result` carries no set), and extraction is the first
+   construct a lying set can break, so sets get teeth before any payload lands.
+   Touches: parser/typeck/cgen on both sides + the seed (E5 is the mirror increment).
 2. **Error sets in TRAIT signatures** — unlocks fallible trait-impl methods, which are
    currently refused at check time with the reason (calls are typed by the trait's
    signature, which cannot declare an error set). The refusal sites to lift are marked:

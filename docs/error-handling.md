@@ -190,4 +190,7 @@ generic ones (argc-0 records), and the whole corpus stayed byte-identical.
 ## Not yet (post-v1)
 
 * Error sets in **trait signatures** (which would unlock fallible impls).
-* Errors in more positions; richer error payloads (today an error is a tag).
+* Errors in more positions; richer error payloads (today an error is a tag) —
+  **designed, not built**: `docs/error-payloads.md` carries the decisions (payload
+  is a property of the name, one whole-program payload union, `catch |e| match e`
+  as the extractor, sets made sound first) and the E1–E6 increment chain.
