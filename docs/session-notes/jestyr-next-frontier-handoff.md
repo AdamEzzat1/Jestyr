@@ -16,15 +16,19 @@ byte-identical) + concat + test-mode; P2/P3/P4 goldens; `selfhost_fixpoint_full`
 
 **What remains is post-v1-shaped — design items, not gaps.** In rough value order:
 
-1. **Richer error payloads.** Today an error is an integer tag; the design wants
-   payload-carrying errors. **The design note is WRITTEN — `docs/error-payloads.md`**
-   — with the three decisions (payload is a property of the NAME, whole-program;
-   one program-wide payload union so `?` hops copy it blind, gated on use;
-   `catch |e| match e { … }` as the only extractor) and the E1–E6 increment chain.
-   **Start at E1: the set-soundness census** — `err(E)`∈set and `?`-inclusion are
-   UNCHECKED today (`Ty::Result` carries no set), and extraction is the first
-   construct a lying set can break, so sets get teeth before any payload lands.
-   Touches: parser/typeck/cgen on both sides + the seed (E5 is the mirror increment).
+1. **Richer error payloads.** The design note is `docs/error-payloads.md` — payload
+   is a property of the NAME whole-program; one program-wide payload union so `?`
+   hops copy it blind, gated on use; `catch |e| match e { … }` as the only
+   extractor. **E1 and E2 are DONE on master**: the census (`jestyrc errsets`,
+   zero corpus violations) and typed-and-enforced sets (`Ty::Result(ok, errs)` —
+   carried, never displayed, so every golden stayed green; strict `err`∈set +
+   `?`/rethrow inclusion diagnostics, flowing through bindings). **Next is E3:
+   payload declaration/creation/propagation on the reference side** — `Name(T)` in
+   set syntax, the D1 whole-program agreement check, the gated `JestyrErrPay`
+   union + `.pay` emission, blind-copy hops, and the escape arms (`err(Name(s))`
+   is a return of `s`). Gated on use → zero corpus movement until E5 (the port
+   mirror + first corpus file + seed, all in one increment). Known pre-work for
+   E4: the intrinsic tag-1 wart (note §6).
 2. **Error sets in TRAIT signatures** — unlocks fallible trait-impl methods, which are
    currently refused at check time with the reason (calls are typed by the trait's
    signature, which cannot declare an error set). The refusal sites to lift are marked:
