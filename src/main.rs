@@ -26,6 +26,9 @@
 //!                               prove (contracts, invariants, refinements)
 //!   jestyrc unsafe <file.jtr>   report every raw-pointer operation and whether an
 //!                               `unsafe` block covers it (analysis only)
+//!   jestyrc errsets <file.jtr>  report every error-set obligation site (`err`, `?`,
+//!                               the rethrow `catch`) and whether the declared sets
+//!                               hold — the census before enforcement (analysis only)
 //!   jestyrc simd   <file.jtr>   report which `par for` loops may be evaluated a SIMD
 //!                               lane at a time, and why not (analysis only)
 //!   jestyrc doc    <file.jtr>   render the file's API docs as Markdown (--html for HTML)
@@ -47,6 +50,7 @@ mod diag;
 #[cfg(feature = "dharht-experiment")]
 mod dharht;
 mod doc;
+mod errsets;
 mod escape;
 mod layout;
 mod lexer;
@@ -428,6 +432,19 @@ fn run() -> ExitCode {
                 }
             }
         }
+        Some("errsets") => {
+            // `errsets <file>` — every error-set obligation site (`err(E)`, `?`,
+            // the rethrow `catch`) and whether the declared sets hold. Analysis
+            // only, like `unsafe`/`obligations`: the measurement that precedes
+            // enforcement (error-payloads E1 — docs/error-payloads.md).
+            match args[2..].iter().find(|a| !a.starts_with("--")) {
+                Some(p) => return run_errsets(p),
+                None => {
+                    eprintln!("error: `errsets` needs a source file argument");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         Some("obligations") => {
             // `obligations <file>` — report what a `@verified` build would have to
             // prove: every declared precondition, postcondition, loop invariant,
@@ -778,6 +795,34 @@ fn run_obligations(path: &str) -> ExitCode {
         return ExitCode::FAILURE;
     }
     print!("{}", obligations::render(&obligations::collect(&ast, &src)));
+    ExitCode::SUCCESS
+}
+
+/// `jestyrc errsets <file>` — the error-set soundness census (error-payloads E1).
+///
+/// Parsing is enough: the obligations are between declared sets and syntactic
+/// sites, and resolution is deliberately best-effort by name (see `src/errsets.rs`
+/// — a census that guessed would mis-size the migration it exists to size).
+fn run_errsets(path: &str) -> ExitCode {
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read `{path}`: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (tokens, ld) = Lexer::new(&src).tokenize();
+    let (ast, pd) = Parser::new(&src, tokens).parse();
+    let mut failed = false;
+    for d in ld.iter().chain(pd.iter()).filter(|d| d.is_error()) {
+        let lc = line_col(&src, d.span.start);
+        eprintln!("{path}:{}:{}: error: {}", lc.line, lc.col, d.message);
+        failed = true;
+    }
+    if failed {
+        return ExitCode::FAILURE;
+    }
+    print!("{}", errsets::render(&ast, &errsets::collect(&ast)));
     ExitCode::SUCCESS
 }
 
@@ -1147,6 +1192,8 @@ fn print_usage() {
     eprintln!("    jestyrc test   <file.jtr>   build & run the `@test`/`@bench` harness");
     eprintln!("                               (test [substr] runs matching names; --list lists them)");
     eprintln!("    jestyrc tokens <file.jtr>   stop after lexing and dump tokens");
+    eprintln!("    jestyrc errsets <file.jtr>  report every error-set obligation site and");
+    eprintln!("                               whether the declared sets hold (analysis only)");
     eprintln!("    jestyrc doc    <file.jtr>   render the file's API docs as Markdown");
     eprintln!("                               (add --html for an HTML page)");
     eprintln!("    jestyrc attest <file.jtr>   emit the reproducible-build + guarantee manifest");

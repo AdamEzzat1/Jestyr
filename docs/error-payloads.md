@@ -190,11 +190,28 @@ Payload extraction is the first construct that *discriminates* errors, so it is 
 first construct that can be **wrong** when the static set lies. Before any payload
 lands, sets get teeth, in the census-then-enforce shape the unsafe ladder proved:
 
-1. **Census.** `jestyrc`-side report of every set violation in the corpus:
-   an `err(E)` whose `E` is not in the enclosing declared set; a `?` whose callee's
-   set is not a subset of the enclosing set (both checkable from the resolved call
-   signature — no type-system change needed for the *census*). Expected result: zero
-   or near-zero violations; the report sizes the migration if not.
+1. **Census.** ✅ **DONE** — `src/errsets.rs` + `jestyrc errsets <file>`, pinned by
+   `error_set_census_is_clean_over_the_corpus`. **The result: 10 obligation sites
+   across 146 files, ZERO violations** — so E3's enforcement is a no-migration
+   diagnostic and can land strict from day one (where the unsafe ladder first needed
+   a 40-site migration). Two honest unresolveds, both pinned: `vec.jtr` (a
+   lexer-only fixture calling an undeclared method) and `combinators.jtr` (an `err`
+   variant of the *imported* `core.Result`, which a single-file census refuses to
+   guess at). Three census findings a successor should know:
+   * The first sweep reported 17 violations and **all 17 were census model errors**:
+     `err` is SHADOWED by a user enum variant of that name (the corpus's own
+     `Result(T, E) { ok, err }` — cgen resolves variants before intrinsics), and
+     methods also live inside `struct { … }` EXPRESSIONS (the comptime-generic
+     factory idiom of `vec.jtr`/`method_errors.jtr`), invisible to an item-level
+     scan. E2's typeck-side enforcement inherits both rules.
+   * The rethrow form (`catch |e| return e`) carries exactly `?`'s obligation and
+     must be counted/enforced with it — a `?`-only check under-counts.
+   * **The intrinsic tag-1 wart:** `try_read_file`/`try_from_utf8` hard-code error
+     tag `1`, and user tags also start at 1 — so in any program that declares an
+     error set, the intrinsics' `IoError` aliases the first user-declared name.
+     Unobservable today; observable the day `match e` lands. E3/E4 must either
+     reserve tag space for intrinsic errors or give `IoError` a real entry in
+     `error_tags`.
 2. **Typed sets.** `Ty::Result(ok)` grows the set: `Ty::Result(ok, errs)` where
    `errs` is the sorted name list. **The display does NOT change** — `display()`
    keeps rendering what it renders today, because the P3 typeck golden compares
@@ -277,7 +294,7 @@ caller matches on it), a parameter's or a static's is fine. Concretely:
 
 | # | Increment | Emission change? | Port mirror due? |
 |---|---|---|---|
-| E1 | Set census (`jestyrc` report) + the corpus audit | none | no |
+| E1 | ✅ Set census (`jestyrc errsets`) + the corpus audit — **zero violations, enforcement needs no migration** | none | no |
 | E2 | Typed sets (`Ty::Result(ok, errs)`, display unchanged) + `err`∈set and `?`-inclusion diagnostics | none | not until a corpus file needs the set (E4) — display-dodge holds the P3 golden still |
 | E3 | Payload declaration/creation/propagation, reference side: parser (`Name(T)` in sets), D1 agreement check, the gated union + `.pay` emission, `err(Name(v))`, blind-copy hops, escape arms | **yes, gated on use** — zero corpus files use it, so all goldens stay green | not yet (the standing trigger: no corpus file until the mirror) |
 | E4 | `catch |e| match e { … }` + exhaustiveness, reference side | gated on use | not yet |

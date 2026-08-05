@@ -237,6 +237,68 @@ fn obligation_extraction_is_total_over_the_corpus() {
     eprintln!("OBLIGATION CENSUS: {total} declared obligations across {files} corpus files");
 }
 
+/// **The error-set soundness census over the corpus — error-payloads E1**
+/// (`docs/error-payloads.md` §6, the census-then-enforce ladder).
+///
+/// The number is the finding: **zero violations** — every `err(E)` in the corpus is
+/// in its enclosing declared set, and every `?`/rethrow propagates a subset of the
+/// enclosing set. So E3's enforcement ("`err` must name a declared error, `?` needs
+/// callee ⊆ caller") is a **no-migration diagnostic** — it can land strict from day
+/// one, where the unsafe ladder first needed a 40-site migration. Measured, not
+/// assumed, which is what this test keeps true: a new corpus file that violates its
+/// own declared sets fails here *before* enforcement exists to catch it.
+///
+/// The two permitted unresolved sites are known and honest, not gaps to fix:
+/// `vec.jtr` (a lexer-only fixture calling a `grow` method that is never declared)
+/// and `combinators.jtr` (an `err` variant of the *imported* `core.Result`, which a
+/// single-file census refuses to guess at). The bound is exact so a resolution
+/// regression — the census silently losing the ability to see method or factory
+/// callees — shows up as a count change, in either direction.
+#[test]
+fn error_set_census_is_clean_over_the_corpus() {
+    let (mut sites, mut violations, mut unresolved, mut files) = (0usize, 0usize, 0usize, 0usize);
+    for dir in ["examples", "examples/std"] {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("jtr") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&p).unwrap();
+            let (tokens, _) = crate::lexer::Lexer::new(&src).tokenize();
+            let (ast, _) = crate::parser::Parser::new(&src, tokens).parse();
+            let s = crate::errsets::collect(&ast);
+            // Deterministic — the report is meant to be pinned.
+            assert_eq!(
+                crate::errsets::render(&ast, &s),
+                crate::errsets::render(&ast, &crate::errsets::collect(&ast)),
+                "{}",
+                p.display()
+            );
+            for site in &s {
+                if let crate::errsets::Verdict::Violation(d) = &site.verdict {
+                    eprintln!("ERRSET VIOLATION {}: fn {}: {d}", p.display(), site.function);
+                    violations += 1;
+                }
+                if matches!(site.verdict, crate::errsets::Verdict::Unresolved(_)) {
+                    unresolved += 1;
+                }
+            }
+            sites += s.len();
+            files += 1;
+        }
+    }
+    assert!(files > 100, "the census must sweep the corpus ({files} files)");
+    assert!(sites >= 8, "the fallible corpus has known sites; {sites} smells like a broken walk");
+    assert_eq!(
+        violations, 0,
+        "{violations} error-set violation(s) crept into the corpus — \
+         fix the declared sets now, or E3's enforcement lands with a migration attached"
+    );
+    assert_eq!(unresolved, 2, "the two known unresolved sites (vec.jtr, combinators.jtr) changed");
+    eprintln!("ERRSET CENSUS: {sites} sites, {violations} violations, {unresolved} unresolved, {files} files");
+}
+
 /// **The unsafe-boundary census over the corpus — the number enforcement rests on.**
 ///
 /// Extraction must be total and deterministic, and the number is the finding: at last
