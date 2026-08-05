@@ -111,10 +111,10 @@ pub fn Channel(comptime T: type) -> type {
 pub fn channel_make(comptime T: type, cap: i64) -> Channel(T) {
     var b: *mut T = alloc(T, cap as usize)
     var c: *mut i64 = alloc(i64, 4)
-    atomic_store(c + 0, 0)   // head  — next recv slot
-    atomic_store(c + 1, 0)   // tail  — next send slot
-    atomic_store(c + 2, 0)   // count — buffered items
-    atomic_store(c + 3, 0)   // lock  — unlocked
+    unsafe { atomic_store(c + 0, 0) }   // head  — next recv slot
+    unsafe { atomic_store(c + 1, 0) }   // tail  — next send slot
+    unsafe { atomic_store(c + 2, 0) }   // count — buffered items
+    unsafe { atomic_store(c + 3, 0) }   // lock  — unlocked
     return Channel(T){ buf: b, ctrl: c, cap: cap }
 }
 
@@ -125,16 +125,16 @@ pub fn channel_make(comptime T: type, cap: i64) -> Channel(T) {
 pub fn channel_send(comptime T: type, read ch: Channel(T), take v: T) {
     var sent: bool = false
     for !sent {
-        lock_acquire(ch.ctrl + 3)
-        let count: i64 = atomic_load(ch.ctrl + 2)
+        unsafe { lock_acquire(ch.ctrl + 3) }
+        let count: i64 = unsafe { atomic_load(ch.ctrl + 2) }
         if count < ch.cap {
-            let tail: i64 = atomic_load(ch.ctrl + 1)
+            let tail: i64 = unsafe { atomic_load(ch.ctrl + 1) }
             unsafe { (ch.buf + (tail as usize)).* = v }   // ownership moves into the buffer
-            atomic_store(ch.ctrl + 1, (tail + 1) % ch.cap)
-            atomic_store(ch.ctrl + 2, count + 1)
+            unsafe { atomic_store(ch.ctrl + 1, (tail + 1) % ch.cap) }
+            unsafe { atomic_store(ch.ctrl + 2, count + 1) }
             sent = true
         }
-        lock_release(ch.ctrl + 3)
+        unsafe { lock_release(ch.ctrl + 3) }
     }
 }
 
@@ -143,23 +143,23 @@ pub fn channel_send(comptime T: type, read ch: Channel(T), take v: T) {
 // mid-read) and advances the head. Ownership transfers to the caller.
 pub fn channel_recv(comptime T: type, read ch: Channel(T)) -> T {
     for {
-        lock_acquire(ch.ctrl + 3)
-        let count: i64 = atomic_load(ch.ctrl + 2)
+        unsafe { lock_acquire(ch.ctrl + 3) }
+        let count: i64 = unsafe { atomic_load(ch.ctrl + 2) }
         if count > 0 {
-            let head: i64 = atomic_load(ch.ctrl + 0)
-            let v: T = load_cell(T, ch.buf + (head as usize))
-            atomic_store(ch.ctrl + 0, (head + 1) % ch.cap)
-            atomic_store(ch.ctrl + 2, count - 1)
-            lock_release(ch.ctrl + 3)
+            let head: i64 = unsafe { atomic_load(ch.ctrl + 0) }
+            let v: T = unsafe { load_cell(T, ch.buf + (head as usize)) }
+            unsafe { atomic_store(ch.ctrl + 0, (head + 1) % ch.cap) }
+            unsafe { atomic_store(ch.ctrl + 2, count - 1) }
+            unsafe { lock_release(ch.ctrl + 3) }
             return v
         }
-        lock_release(ch.ctrl + 3)
+        unsafe { lock_release(ch.ctrl + 3) }
     }
 }
 
 // Number of buffered (not-yet-received) items — a snapshot, for draining loops.
 pub fn channel_len(comptime T: type, read ch: Channel(T)) -> i64 {
-    return atomic_load(ch.ctrl + 2)
+    return unsafe { atomic_load(ch.ctrl + 2) }
 }
 
 // Monomorphic `i64` wrappers — the `select` lowering calls these by their stable

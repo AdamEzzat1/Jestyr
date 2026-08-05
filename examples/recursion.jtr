@@ -13,7 +13,7 @@ enum Tree { leaf(v: i32), node(left: indirect Tree, right: indirect Tree) }
 fn sum(t: Tree) -> i32 {
     match t {
         leaf(v)    => v,
-        node(l, r) => sum(l.*) + sum(r.*),   // l, r are pointers — deref to recurse
+        node(l, r) => unsafe { sum(l.*) + sum(r.*) },   // raw derefs — the pointers are ours (leaf_box allocations)
     }
 }
 

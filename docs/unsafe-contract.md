@@ -93,24 +93,35 @@ that no checked value was overwritten through a raw alias. That is the definitio
 *sound* unsafe block, and it is the author's obligation — the point of the block is to
 make the obligation's extent lexical and reviewable.
 
-## Enforcement plan — sized, not promised
+## Enforcement — where it stands
 
-`jestyrc unsafe` over the whole corpus: **156 raw-pointer sites, 42 uncovered** — 73%
-of raw-pointer code is already inside `unsafe` voluntarily. So enforcement is a
-~40-site migration, not a rewrite (contrast: the `@verified` census found 7 declared
-obligations, which is why *that* item is parked).
+The original census: **156 raw-pointer sites, 42 uncovered** (73% already wrapped
+voluntarily) — which is what made enforcement a migration rather than a rewrite
+(contrast: the `@verified` census found 7 declared obligations, which is why *that*
+item is parked). Two classifier corrections then moved the numbers honestly: casts
+whose operand the checker cannot type are **not** int-to-ptr (they were `alloc(…) as
+*mut T`, provenance-reusing), and `spawn`/`await`/f-string operands were being missed.
+Final: **171 sites**.
 
-The steps, each its own increment under the standing gate:
+The steps, and where they stand:
 
-1. ✅ This report + this contract (analysis only, zero emission change).
-2. Migrate the ~42 uncovered corpus sites (mostly `examples/std` — the self-hosted
-   compiler's own allocator plumbing). Pure `.jtr` churn: seed refresh, no C change
-   expected (`unsafe` emits nothing).
-3. Turn the uncovered-site report into a **warning** in `check` (with the port mirror
-   for the P4 golden in the same increment — warnings are diagnostics, and the golden
-   compares them).
-4. Turn the warning into an **error**, closing "when is `unsafe` required" with
-   "whenever you deref, do arithmetic on, or manufacture a raw pointer".
-
-The census test (`unsafe_census_is_total_over_the_corpus`) pins the uncovered count as
-a ratcheting upper bound, so the migration cannot silently grow while unenforced.
+1. ✅ The report + this contract (analysis only, zero emission change).
+2. ✅ **The migration — the corpus is at zero uncovered sites.** Four files carried
+   them all: `recursion.jtr` (tree derefs), `core.jtr` and `parallel.jtr` (chunk-slice
+   construction and disjoint-destination spawn args — the sanctioned pattern, now
+   visibly `unsafe`), `sync.jtr` (channel internals: the atomics and the buffer
+   slots). One expectation corrected in passing: the wrap is *not* always
+   C-invariant — a statement-position `unsafe` emits a scope block — so the full
+   golden gate runs, it is not argued away.
+3. ✅ **The warning.** `escape::check` now warns on every uncovered site — reusing
+   `provenance::collect`, so the report and the warning cannot drift. The port
+   mirrors it (`unsafe_boundary` in `escape.jtr`) by a **flat arena scan with span
+   containment** rather than by reproducing the reference's walk; both sides sort by
+   span start, and that shared sort is what makes two different collection strategies
+   emit identical diagnostics. Verified by a dedicated two-sided probe
+   (`jestyr_escape_unsafe_warnings_match_reference`) carrying every site kind covered
+   and uncovered — necessary because the migrated corpus emits zero warnings and so
+   cannot distinguish a working mirror from a missing one.
+4. **The error** — still ahead. The corpus is ready (zero uncovered, pinned at zero by
+   `unsafe_census_is_total_over_the_corpus`); flipping severity is deliberately left
+   as its own increment so the warning gets real-world time first.

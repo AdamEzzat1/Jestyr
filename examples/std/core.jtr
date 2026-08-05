@@ -782,15 +782,15 @@ pub fn par_binned_sum(read s: []f64) -> f64 {
     let n: usize = s.len
     var raw: *mut i64 = alloc(i64, 8192)            // PAR_WORKERS · 2048
     let q: usize = n / 4
-    let c0: []f64 = slice(f64, s.ptr + 0, q)
-    let c1: []f64 = slice(f64, s.ptr + q, q)
-    let c2: []f64 = slice(f64, s.ptr + (q + q), q)
-    let c3: []f64 = slice(f64, s.ptr + (q + q + q), n - (q + q + q))
+    let c0: []f64 = unsafe { slice(f64, s.ptr + 0, q) }
+    let c1: []f64 = unsafe { slice(f64, s.ptr + q, q) }
+    let c2: []f64 = unsafe { slice(f64, s.ptr + (q + q), q) }
+    let c3: []f64 = unsafe { slice(f64, s.ptr + (q + q + q), n - (q + q + q)) }
     concurrent {
-        spawn par_worker(c0, raw + 0)
-        spawn par_worker(c1, raw + 2048)
-        spawn par_worker(c2, raw + 4096)
-        spawn par_worker(c3, raw + 6144)
+        spawn par_worker(c0, unsafe { raw + 0 })
+        spawn par_worker(c1, unsafe { raw + 2048 })
+        spawn par_worker(c2, unsafe { raw + 4096 })
+        spawn par_worker(c3, unsafe { raw + 6144 })
     }
     // Merge the four regions by elementwise integer add (order-independent), then
     // finalize once through the correctly-rounded serial finalize.
@@ -883,15 +883,15 @@ pub fn par_reduce(read s: []i64, r: Reduction) -> i64 {
     let n: usize = s.len
     var raw: *mut i64 = alloc(i64, 4)
     let q: usize = n / 4
-    let c0: []i64 = slice(i64, s.ptr + 0, q)
-    let c1: []i64 = slice(i64, s.ptr + q, q)
-    let c2: []i64 = slice(i64, s.ptr + (q + q), q)
-    let c3: []i64 = slice(i64, s.ptr + (q + q + q), n - (q + q + q))
+    let c0: []i64 = unsafe { slice(i64, s.ptr + 0, q) }
+    let c1: []i64 = unsafe { slice(i64, s.ptr + q, q) }
+    let c2: []i64 = unsafe { slice(i64, s.ptr + (q + q), q) }
+    let c3: []i64 = unsafe { slice(i64, s.ptr + (q + q + q), n - (q + q + q)) }
     concurrent {
-        spawn par_reduce_worker(c0, raw + 0, r.identity, r.accumulate)
-        spawn par_reduce_worker(c1, raw + 1, r.identity, r.accumulate)
-        spawn par_reduce_worker(c2, raw + 2, r.identity, r.accumulate)
-        spawn par_reduce_worker(c3, raw + 3, r.identity, r.accumulate)
+        spawn par_reduce_worker(c0, unsafe { raw + 0 }, r.identity, r.accumulate)
+        spawn par_reduce_worker(c1, unsafe { raw + 1 }, r.identity, r.accumulate)
+        spawn par_reduce_worker(c2, unsafe { raw + 2 }, r.identity, r.accumulate)
+        spawn par_reduce_worker(c3, unsafe { raw + 3 }, r.identity, r.accumulate)
     }
     // Merge the four slots with the order-independent combine (fixed order, but the
     // result does not depend on it), starting from the identity.

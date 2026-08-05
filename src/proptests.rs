@@ -274,12 +274,16 @@ fn unsafe_census_is_total_over_the_corpus() {
     }
     assert!(files > 100, "the census must sweep the corpus ({files} files)");
     assert!(sites > 50, "the corpus is known raw-pointer-heavy; {sites} smells like a broken walk");
-    assert!(
-        uncovered <= 60,
-        "{uncovered} uncovered raw-pointer sites — the migration budget was ~42; \
-         new raw-pointer code should be written inside `unsafe` (docs/unsafe-contract.md)"
+    // The ratchet reached the floor: the migration is DONE, every raw-pointer site in
+    // the corpus is inside `unsafe`, and the escape checker now warns on uncovered
+    // ones. This bound is what keeps it true — new raw-pointer code is written inside
+    // `unsafe` from the start (docs/unsafe-contract.md).
+    assert_eq!(
+        uncovered, 0,
+        "{uncovered} uncovered raw-pointer site(s) crept into the corpus — \
+         wrap them in `unsafe` (the escape checker is already warning about them)"
     );
-    eprintln!("UNSAFE CENSUS: {sites} raw-pointer sites, {uncovered} uncovered, {files} files");
+    eprintln!("UNSAFE CENSUS: {sites} raw-pointer sites, all covered, {files} files");
 }
 
 /// A minimal well-formedness check for a JSON document's **string literals**.
@@ -8555,6 +8559,56 @@ mod c_oracle {
     }
 
     const ESCAPE_GOLDEN_DENYLIST: &[&str] = &[];
+
+    /// **The unsafe-boundary warnings agree between the two escape checkers.**
+    ///
+    /// The corpus proper cannot verify this — it is fully migrated, so both sides
+    /// emit zero warnings there and the P4 golden would pass with a missing or
+    /// broken mirror. So this probe (a temp file, deliberately NOT in `examples/`)
+    /// carries every site kind in both covered and uncovered forms, plus the two
+    /// exclusions (a comptime body; a closure body under `unsafe`), and requires the
+    /// port's (start, end, message) triples to equal the reference's exactly.
+    ///
+    /// The strategies differ on purpose — the reference walks, the port flat-scans
+    /// with span containment — and the shared span-start sort is what makes them
+    /// emit identically. This test is where that claim is checked rather than
+    /// believed.
+    #[test]
+    fn jestyr_escape_unsafe_warnings_match_reference() {
+        let exe = build_exe("examples/std/escape_cli.jtr");
+        let src = "\
+fn f(p: *mut i32, i: i64) -> i32 {
+    p.* = 1
+    unsafe { p.* = 2 }
+    let q = p + i
+    let r = unsafe { p + i }
+    let m = 0x1000 as *mut u32
+    let ok = unsafe { 0x2000 as *mut u32 }
+    return 0
+}
+fn g(p: *mut i32) -> i32 {
+    let h = || unsafe { p.* }
+    return h()
+}
+";
+        let dir = std::env::temp_dir().join("jestyr_unsafe_probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("probe.jtr");
+        std::fs::write(&file, src).unwrap();
+
+        let want = rust_escape_dump(src);
+        // Sanity on the fixture itself: exactly three uncovered sites, one per kind.
+        let msgs: Vec<&String> = want.iter().skip(2).step_by(3).collect();
+        assert_eq!(
+            msgs.iter().filter(|m| m.contains("unsafe")).count(),
+            3,
+            "fixture must carry one uncovered site per kind: {want:?}"
+        );
+
+        let got = jestyr_escape_dump(&exe, file.to_str().unwrap());
+        assert_eq!(got, want, "the port's unsafe-boundary warnings diverged");
+    }
 
     /// **P4 whole-corpus escape golden.** For every corpus `.jtr` file, the Jestyr escape checker
     /// (`examples/std/escape.jtr`) must produce the *same set of diagnostics* (span + message, in

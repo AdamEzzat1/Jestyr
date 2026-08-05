@@ -63,6 +63,35 @@ pub fn check(ast: &Ast, info: &TypeInfo) -> Vec<Diagnostic> {
     for item in &ast.items {
         ck.check_item(item);
     }
+    // The unsafe-boundary WARNINGS (ownership v2, enforcement step 3 of the plan in
+    // `docs/unsafe-contract.md`): every raw-pointer operation outside an `unsafe`
+    // block. Reuses `provenance::collect` — the same decision point as the
+    // `jestyrc unsafe` report, so the report and the warning cannot drift (the
+    // `at_ty`/`simd::classify` rule). Warnings, not errors, while the ecosystem
+    // migrates; the corpus itself is fully covered, so no corpus file emits one.
+    //
+    // Sorted by span start: the port mirror collects the same sites by a *flat
+    // arena scan with span containment* rather than by mirroring this walk, and the
+    // sort is what makes the two collection strategies emit identically.
+    let mut sites: Vec<crate::provenance::Site> = crate::provenance::collect(ast, info)
+        .into_iter()
+        .filter(|s| !s.covered)
+        .collect();
+    sites.sort_by_key(|s| s.span.start);
+    for s in sites {
+        let msg = match s.op {
+            crate::provenance::Op::Deref => "a raw-pointer deref belongs in an `unsafe` block",
+            crate::provenance::Op::Arith => "raw-pointer arithmetic belongs in an `unsafe` block",
+            crate::provenance::Op::IntToPtr => "an int-to-pointer cast belongs in an `unsafe` block",
+        };
+        ck.diags.push(
+            Diagnostic::warning(msg, s.span).with_help(
+                "the compiler cannot check a raw pointer's validity; `unsafe { … }` marks the \
+                 obligation's extent (docs/unsafe-contract.md) — or use a checked form: genref, \
+                 slice, region",
+            ),
+        );
+    }
     ck.diags
 }
 

@@ -63,15 +63,15 @@ pub fn serial_map(read s: []i64, dst: *mut i64, f: fn(i64) -> i64) {
 pub fn par_map(read s: []i64, dst: *mut i64, f: fn(i64) -> i64) {
     let n: usize = s.len
     let q: usize = n / 4
-    let c0: []i64 = slice(i64, s.ptr + 0, q)
-    let c1: []i64 = slice(i64, s.ptr + q, q)
-    let c2: []i64 = slice(i64, s.ptr + (q + q), q)
-    let c3: []i64 = slice(i64, s.ptr + (q + q + q), n - (q + q + q))
+    let c0: []i64 = unsafe { slice(i64, s.ptr + 0, q) }
+    let c1: []i64 = unsafe { slice(i64, s.ptr + q, q) }
+    let c2: []i64 = unsafe { slice(i64, s.ptr + (q + q), q) }
+    let c3: []i64 = unsafe { slice(i64, s.ptr + (q + q + q), n - (q + q + q)) }
     concurrent {
-        spawn par_map_worker(c0, dst + 0, f)
-        spawn par_map_worker(c1, dst + q, f)
-        spawn par_map_worker(c2, dst + (q + q), f)
-        spawn par_map_worker(c3, dst + (q + q + q), f)
+        spawn par_map_worker(c0, unsafe { dst + 0 }, f)
+        spawn par_map_worker(c1, unsafe { dst + q }, f)
+        spawn par_map_worker(c2, unsafe { dst + (q + q) }, f)
+        spawn par_map_worker(c3, unsafe { dst + (q + q + q) }, f)
     }
 }
 
@@ -120,18 +120,18 @@ pub fn serial_scan(read s: []i64, dst: *mut i64, identity: i64, op: fn(i64, i64)
 pub fn par_scan(read s: []i64, dst: *mut i64, identity: i64, op: fn(i64, i64) -> i64) {
     let n: usize = s.len
     let q: usize = n / 4
-    let c0: []i64 = slice(i64, s.ptr + 0, q)
-    let c1: []i64 = slice(i64, s.ptr + q, q)
-    let c2: []i64 = slice(i64, s.ptr + (q + q), q)
-    let c3: []i64 = slice(i64, s.ptr + (q + q + q), n - (q + q + q))
+    let c0: []i64 = unsafe { slice(i64, s.ptr + 0, q) }
+    let c1: []i64 = unsafe { slice(i64, s.ptr + q, q) }
+    let c2: []i64 = unsafe { slice(i64, s.ptr + (q + q), q) }
+    let c3: []i64 = unsafe { slice(i64, s.ptr + (q + q + q), n - (q + q + q)) }
 
     // Pass 1: per-chunk totals into four disjoint cells.
     var part: *mut i64 = alloc(i64, 4)
     concurrent {
-        spawn scan_total_worker(c0, part + 0, identity, op)
-        spawn scan_total_worker(c1, part + 1, identity, op)
-        spawn scan_total_worker(c2, part + 2, identity, op)
-        spawn scan_total_worker(c3, part + 3, identity, op)
+        spawn scan_total_worker(c0, unsafe { part + 0 }, identity, op)
+        spawn scan_total_worker(c1, unsafe { part + 1 }, identity, op)
+        spawn scan_total_worker(c2, unsafe { part + 2 }, identity, op)
+        spawn scan_total_worker(c3, unsafe { part + 3 }, identity, op)
     }
 
     // Exclusive prefix of the four totals → the seed each chunk starts from. Read the
@@ -151,10 +151,10 @@ pub fn par_scan(read s: []i64, dst: *mut i64, identity: i64, op: fn(i64, i64) ->
 
     // Pass 2: each worker scans its chunk seeded with its prefix, into its own region.
     concurrent {
-        spawn scan_emit_worker(c0, dst + 0, seed0, op)
-        spawn scan_emit_worker(c1, dst + q, seed1, op)
-        spawn scan_emit_worker(c2, dst + (q + q), seed2, op)
-        spawn scan_emit_worker(c3, dst + (q + q + q), seed3, op)
+        spawn scan_emit_worker(c0, unsafe { dst + 0 }, seed0, op)
+        spawn scan_emit_worker(c1, unsafe { dst + q }, seed1, op)
+        spawn scan_emit_worker(c2, unsafe { dst + (q + q) }, seed2, op)
+        spawn scan_emit_worker(c3, unsafe { dst + (q + q + q) }, seed3, op)
     }
     free_ptr(part)
 }

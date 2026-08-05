@@ -154,11 +154,21 @@ fn walk_expr(
         }
         ExprKind::Cast { expr, .. } => {
             // An int-to-pointer cast manufactures provenance: the result type is a
-            // pointer while the operand is not one (a ptr-to-ptr cast reuses
-            // provenance and is a different, milder conversation).
+            // pointer while the operand is a **known integer**. Requiring the operand
+            // to be a known integer — rather than merely "not a pointer" — matters
+            // because an intrinsic's return type can be `Unknown` to the checker, and
+            // `alloc_i32(8) as *mut Tree` is a ptr-to-ptr cast (provenance reused, the
+            // milder conversation), not a manufactured address. A measurement pass
+            // must not overcount: a census with false positives sizes a migration
+            // that does not exist.
             let to_ptr = matches!(info.type_of(id), Ty::Ptr { .. });
-            let from_ptr = is_raw_ptr(info, *expr);
-            if to_ptr && !from_ptr {
+            let from_int = matches!(
+                info.type_of(*expr),
+                Ty::Prim(
+                    "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
+                )
+            );
+            if to_ptr && from_int {
                 out.push(Site { function: name.to_string(), op: Op::IntToPtr, covered: in_unsafe, span });
             }
             walk_expr(ast, info, *expr, name, in_unsafe, out);
@@ -166,6 +176,21 @@ fn walk_expr(
         // Everything else: recurse structurally.
         ExprKind::Block(b) | ExprKind::Concurrent(b) | ExprKind::Region { body: b, .. } => {
             walk_block(ast, info, b, name, in_unsafe, out)
+        }
+        // A `comptime` body is deliberately NOT walked: it runs in the interpreter,
+        // which has no pointers at all, so nothing in it is a runtime raw-pointer op.
+        // (The port's flat-scan mirror excludes comptime spans for the same reason.)
+        ExprKind::Comptime(_) => {}
+        // A closure body is runtime code like any other — a deref inside one is a
+        // site. Coverage does NOT cross the boundary in either direction: an `unsafe`
+        // wrapping the closure *literal* covers the body lexically, which is exactly
+        // what the lexical rule says it should.
+        ExprKind::Closure { body, .. } => walk_expr(ast, info, *body, name, in_unsafe, out),
+        ExprKind::Spawn(e) | ExprKind::Await(e) => walk_expr(ast, info, *e, name, in_unsafe, out),
+        ExprKind::FString { exprs, .. } => {
+            for e in exprs {
+                walk_expr(ast, info, *e, name, in_unsafe, out);
+            }
         }
         ExprKind::If { cond, then, els } => {
             walk_expr(ast, info, *cond, name, in_unsafe, out);
