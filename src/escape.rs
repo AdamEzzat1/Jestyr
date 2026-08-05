@@ -63,12 +63,16 @@ pub fn check(ast: &Ast, info: &TypeInfo) -> Vec<Diagnostic> {
     for item in &ast.items {
         ck.check_item(item);
     }
-    // The unsafe-boundary WARNINGS (ownership v2, enforcement step 3 of the plan in
-    // `docs/unsafe-contract.md`): every raw-pointer operation outside an `unsafe`
-    // block. Reuses `provenance::collect` — the same decision point as the
-    // `jestyrc unsafe` report, so the report and the warning cannot drift (the
-    // `at_ty`/`simd::classify` rule). Warnings, not errors, while the ecosystem
-    // migrates; the corpus itself is fully covered, so no corpus file emits one.
+    // The unsafe boundary, ENFORCED (ownership v2, step 4 — the ladder's last rung):
+    // every raw-pointer operation outside an `unsafe` block is an error. Reuses
+    // `provenance::collect` — the same decision point as the `jestyrc unsafe` report,
+    // so the report and the check cannot drift (the `at_ty`/`simd::classify` rule).
+    // The corpus was migrated to zero uncovered sites first and is pinned there, so
+    // enforcement broke nothing that existed.
+    //
+    // Error rather than warning also ALIGNS the two drivers: the port's `jc build`
+    // refuses on any escape diagnostic (it has no severity model), so as a warning
+    // this was a program `jestyrc` built and `jc` refused.
     //
     // Sorted by span start: the port mirror collects the same sites by a *flat
     // arena scan with span containment* rather than by mirroring this walk, and the
@@ -85,7 +89,7 @@ pub fn check(ast: &Ast, info: &TypeInfo) -> Vec<Diagnostic> {
             crate::provenance::Op::IntToPtr => "an int-to-pointer cast belongs in an `unsafe` block",
         };
         ck.diags.push(
-            Diagnostic::warning(msg, s.span).with_help(
+            Diagnostic::new(msg, s.span).with_help(
                 "the compiler cannot check a raw pointer's validity; `unsafe { … }` marks the \
                  obligation's extent (docs/unsafe-contract.md) — or use a checked form: genref, \
                  slice, region",

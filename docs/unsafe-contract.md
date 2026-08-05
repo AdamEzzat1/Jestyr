@@ -122,6 +122,12 @@ The steps, and where they stand:
    (`jestyr_escape_unsafe_warnings_match_reference`) carrying every site kind covered
    and uncovered — necessary because the migrated corpus emits zero warnings and so
    cannot distinguish a working mirror from a missing one.
-4. **The error** — still ahead. The corpus is ready (zero uncovered, pinned at zero by
-   `unsafe_census_is_total_over_the_corpus`); flipping severity is deliberately left
-   as its own increment so the warning gets real-world time first.
+4. ✅ **The error.** An uncovered raw-pointer operation is now a **compile error** —
+   "when is `unsafe` required" is closed with *whenever you deref, do arithmetic on,
+   or manufacture a raw pointer*. Flipping severity also **aligned the two drivers**:
+   the port's `jc build` refuses on any escape diagnostic (it has no severity model),
+   so as a warning this was a program `jestyrc` built and `jc` refused. The corpus
+   was pinned at zero uncovered before the flip, so enforcement broke nothing that
+   existed — which was the entire point of the staging.
+
+**The ladder is complete.** `unsafe` now means what this contract says it means.

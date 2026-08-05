@@ -299,9 +299,9 @@ pub fn render(sites: &[Site], src: &str) -> String {
             if s.covered { "unsafe" } else { "UNCOVERED" }
         );
     }
-    // The report's purpose said out loud: today `unsafe` gates nothing, so an
-    // uncovered site is a migration item, not (yet) an error.
-    out.push_str("note: `unsafe` is not yet enforced; uncovered sites compile today (see docs/unsafe-contract.md)\n");
+    // Enforcement landed (v2 step 4): an uncovered site is now a compile error from
+    // the escape checker; this report remains the *survey* view of the same facts.
+    out.push_str("note: uncovered sites are compile errors (see docs/unsafe-contract.md)\n");
     out
 }
 
@@ -373,7 +373,7 @@ mod tests {
         let r = render(&collect(&ast, &info), src);
         assert!(r.starts_with("unsafe v1\nsites 1 uncovered 1\n"), "{r}");
         assert!(r.contains("UNCOVERED"), "{r}");
-        assert!(r.contains("not yet enforced"), "the report must not claim a check it doesn't make: {r}");
+        assert!(r.contains("compile errors"), "the report must state the enforcement it now makes: {r}");
         for _ in 0..3 {
             assert_eq!(render(&collect(&ast, &info), src), r);
         }

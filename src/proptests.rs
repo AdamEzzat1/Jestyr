@@ -266,7 +266,7 @@ fn unsafe_census_is_total_over_the_corpus() {
             let s = crate::provenance::collect(&ast, &info);
             let r = crate::provenance::render(&s, &src);
             assert_eq!(r, crate::provenance::render(&crate::provenance::collect(&ast, &info), &src));
-            assert!(r.contains("not yet enforced"), "{}", p.display());
+            assert!(r.contains("compile errors"), "{}", p.display());
             sites += s.len();
             uncovered += s.iter().filter(|x| !x.covered).count();
             files += 1;
