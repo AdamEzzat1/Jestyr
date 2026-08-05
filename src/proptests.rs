@@ -237,6 +237,51 @@ fn obligation_extraction_is_total_over_the_corpus() {
     eprintln!("OBLIGATION CENSUS: {total} declared obligations across {files} corpus files");
 }
 
+/// **The unsafe-boundary census over the corpus — the number enforcement rests on.**
+///
+/// Extraction must be total and deterministic, and the number is the finding: at last
+/// count, **156 raw-pointer sites, 42 uncovered** — 73% of the corpus's raw-pointer
+/// code is already inside `unsafe` voluntarily. So enforcement ("a raw deref requires
+/// `unsafe`") is a ~40-site migration, not a rewrite — *within reach*, where the
+/// `@verified` census concluded the opposite about SMT. That asymmetry is exactly what
+/// measuring first is for.
+///
+/// The uncovered count is pinned as an upper bound so the migration cannot silently
+/// grow while nobody is enforcing; it *shrinks* as files are migrated, and the bound
+/// ratchets down with it.
+#[test]
+fn unsafe_census_is_total_over_the_corpus() {
+    let (mut sites, mut uncovered, mut files) = (0usize, 0usize, 0usize);
+    for dir in ["examples", "examples/std"] {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("jtr") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&p).unwrap();
+            let (tokens, _) = crate::lexer::Lexer::new(&src).tokenize();
+            let (ast, _) = crate::parser::Parser::new(&src, tokens).parse();
+            let (info, _) = crate::typeck::check(&ast);
+            let s = crate::provenance::collect(&ast, &info);
+            let r = crate::provenance::render(&s, &src);
+            assert_eq!(r, crate::provenance::render(&crate::provenance::collect(&ast, &info), &src));
+            assert!(r.contains("not yet enforced"), "{}", p.display());
+            sites += s.len();
+            uncovered += s.iter().filter(|x| !x.covered).count();
+            files += 1;
+        }
+    }
+    assert!(files > 100, "the census must sweep the corpus ({files} files)");
+    assert!(sites > 50, "the corpus is known raw-pointer-heavy; {sites} smells like a broken walk");
+    assert!(
+        uncovered <= 60,
+        "{uncovered} uncovered raw-pointer sites — the migration budget was ~42; \
+         new raw-pointer code should be written inside `unsafe` (docs/unsafe-contract.md)"
+    );
+    eprintln!("UNSAFE CENSUS: {sites} raw-pointer sites, {uncovered} uncovered, {files} files");
+}
+
 /// A minimal well-formedness check for a JSON document's **string literals**.
 ///
 /// Written by hand because the compiler has no JSON dependency, and aimed at the one

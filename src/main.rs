@@ -24,6 +24,8 @@
 //!                               and padding waste (analysis only — emits nothing)
 //!   jestyrc obligations <file.jtr>  report what a `@verified` build would have to
 //!                               prove (contracts, invariants, refinements)
+//!   jestyrc unsafe <file.jtr>   report every raw-pointer operation and whether an
+//!                               `unsafe` block covers it (analysis only)
 //!   jestyrc simd   <file.jtr>   report which `par for` loops may be evaluated a SIMD
 //!                               lane at a time, and why not (analysis only)
 //!   jestyrc doc    <file.jtr>   render the file's API docs as Markdown (--html for HTML)
@@ -52,6 +54,7 @@ mod module;
 mod obligations;
 mod parser;
 mod printer;
+mod provenance;
 mod sha256;
 mod simd;
 mod span;
@@ -411,6 +414,20 @@ fn run() -> ExitCode {
                 }
             }
         }
+        Some("unsafe") => {
+            // `unsafe <file>` — every raw-pointer operation and whether an `unsafe`
+            // block covers it. Analysis only, like `layout`/`simd`/`obligations`:
+            // the measurement that has to precede enforcement, because the corpus
+            // (including the self-hosted compiler) derefs raw pointers in ordinary
+            // code today and enforcement without a migration would break it.
+            match args[2..].iter().find(|a| !a.starts_with("--")) {
+                Some(p) => return run_unsafe_report(p),
+                None => {
+                    eprintln!("error: `unsafe` needs a source file argument");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         Some("obligations") => {
             // `obligations <file>` — report what a `@verified` build would have to
             // prove: every declared precondition, postcondition, loop invariant,
@@ -702,6 +719,36 @@ fn run_layout(path: &str) -> ExitCode {
     // "what does this struct cost?" is a question worth answering while editing it.
     let (info, _diags) = typeck::check(&ast);
     print!("{}", layout::render(&layout::compute(&ast, &info)));
+    ExitCode::SUCCESS
+}
+
+/// `jestyrc unsafe <file>` — the unsafe-boundary report (ownership v2, slice 1).
+///
+/// Needs the type checker (unlike `simd`): "is this a *raw* deref" is a type
+/// question — `g.*` on a genref is generation-checked, and flagging it would teach
+/// people to wrap safe code in `unsafe`. Type errors are not fatal, the same
+/// while-editing courtesy `layout` extends.
+fn run_unsafe_report(path: &str) -> ExitCode {
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read `{path}`: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (tokens, ld) = Lexer::new(&src).tokenize();
+    let (ast, pd) = Parser::new(&src, tokens).parse();
+    let mut failed = false;
+    for d in ld.iter().chain(pd.iter()).filter(|d| d.is_error()) {
+        let lc = line_col(&src, d.span.start);
+        eprintln!("{path}:{}:{}: error: {}", lc.line, lc.col, d.message);
+        failed = true;
+    }
+    if failed {
+        return ExitCode::FAILURE;
+    }
+    let (info, _diags) = typeck::check(&ast);
+    print!("{}", provenance::render(&provenance::collect(&ast, &info), &src));
     ExitCode::SUCCESS
 }
 

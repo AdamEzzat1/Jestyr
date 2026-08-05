@@ -27,8 +27,22 @@ still open"). **Five of those have now closed**: transitive `@no_alloc`, diagnos
    near-miss worth remembering: the first draft added a brace to the **flag-off** `?`
    string ("just one redundant brace") — that alone would have diffed every fallible
    corpus file against the port. See `docs/error-handling.md`.
-3. **Unsafe/provenance v2** — the largest remaining item overall; start as a written
-   contract plus lints, not a semantic rewrite.
+3. **Unsafe/provenance v2** — **slice 1 DONE** *(this session)*: `jestyrc unsafe
+   <file>` (`src/provenance.rs` — every raw deref / pointer-arith / int-to-ptr site
+   and whether an `unsafe` block lexically covers it; a genref deref is deliberately
+   NOT a site — it is the safe alternative) + `docs/unsafe-contract.md` (validity,
+   provenance, aliasing, the C boundary, and what safe code may assume after
+   `unsafe`). **The survey finding that reframed the item: `unsafe` gates NOTHING
+   today** — a raw deref compiles identically outside it. **The census: 156
+   raw-pointer sites in the corpus, 42 uncovered (73% already wrapped voluntarily)**,
+   so enforcement is a ~40-site migration, not a rewrite — the opposite conclusion
+   from the `@verified` census, which is exactly what measuring first is for. Pinned
+   as a *ratcheting upper bound* (≤60) so the migration can't grow unenforced.
+   **Remaining, each its own increment (the plan is in the contract doc):** migrate
+   the ~42 sites (pure `.jtr` churn + seed refresh; `unsafe` emits nothing so no C
+   change expected), then warning-in-`check` (**with the port mirror in the same
+   increment** — warnings are diagnostics and the P4 golden compares them), then
+   error.
 4. ~~**`catch |e|`**~~ — **DONE, reference side** *(this session)*: the binder carries
    an **opaque `error` type** (typing it `i32` would let `catch |e| e` silently return
    the tag as a success value — refused, with `e as i64` as the sanctioned escape
