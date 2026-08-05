@@ -187,6 +187,24 @@ fn emit_program(
                 }
             }
         }
+        // Fallible STRUCT METHODS declare error sets too, and their tags live in the
+        // same whole-program map — an error name means one integer everywhere,
+        // whoever declares it. Scanned in declaration order after the item's own set,
+        // so adding a method never renumbers a free function's tags. (Trait-impl
+        // methods are deliberately absent: a fallible impl is refused — calls are
+        // typed by the trait's signature, which has no error-set syntax.)
+        if let Item::Struct { body, .. } = item {
+            for m in &body.members {
+                if let StructMember::Method(f) = m {
+                    if let Some(es) = &f.errors {
+                        for name in &es.names {
+                            let next = error_tags.len() as i64 + 1;
+                            error_tags.entry(name.name.clone()).or_insert(next);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     let mut g = Cgen {
@@ -1869,7 +1887,45 @@ impl<'a> Cgen<'a> {
                 self.def_end();
             }
         }
+        // Fallible METHODS need their result typedefs too. Walked per *instance*
+        // (`method_instances` is collected before this runs), because a generic
+        // struct's method has one ok type per instantiation — `Box(i32).get` and
+        // `Box(str).get` are two typedefs, exactly as two monomorphized functions
+        // would be. The ok type is the declared return lowered through the
+        // instance's substitution.
+        for (ctor, args, method) in self.method_instances.clone() {
+            let Some(f) = self.find_struct_method_cg(&ctor, &method) else { continue };
+            if f.errors.is_none() {
+                continue;
+            }
+            let (ret_ty, span_subst) = (f.ret_ty, self.method_subst(&ctor, &args));
+            let ok = ret_ty.map(|t| self.ast_type_to_ty(t, &span_subst)).unwrap_or(Ty::Unit);
+            self.emit_result_def(&ok, &mut seen);
+        }
         self.raw("\n");
+    }
+
+    /// Emit one tagged-result typedef for ok type `ok`, deduped through `seen` —
+    /// shared by the free-function scan and the method scans above so the three
+    /// cannot drift on the struct's shape.
+    fn emit_result_def(&mut self, ok: &Ty, seen: &mut HashSet<String>) {
+        let cname = self.result_c_name(ok);
+        if !seen.insert(cname.clone()) {
+            return;
+        }
+        let deps = if *ok != Ty::Unit {
+            Self::dep_of_cty(self.c_type(ok)).into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        self.def_begin(cname.clone(), deps);
+        self.raw("typedef struct { bool is_err; ".to_string());
+        if *ok != Ty::Unit {
+            let okc = self.c_type(ok);
+            self.raw(format!("{okc} ok; "));
+        }
+        self.raw(format!("int err; }} {cname};\n"));
+        self.def_end();
     }
 
     fn struct_defs(&mut self) {
@@ -6357,15 +6413,6 @@ impl<'a> Cgen<'a> {
     /// Emit a monomorphized method as a top-level C function — a forward
     /// prototype (`body = false`) or a full definition (`body = true`).
     fn emit_method_decl(&mut self, ctor: &str, args: &[Ty], f: &FnDecl, body: bool) {
-        if f.errors.is_some() {
-            if body {
-                self.diag(
-                    f.name.span,
-                    "the C backend does not support fallible generic-struct methods yet",
-                );
-            }
-            return;
-        }
         self.subst = self.method_subst(ctor, args);
         self.self_cty = self.method_self_cty(ctor, args);
         let self_conv =
@@ -6377,17 +6424,27 @@ impl<'a> Cgen<'a> {
             .filter(|p| !p.comptime && !p.is_self && matches!(p.conv, Conv::Mut | Conv::Out))
             .map(|p| p.name.name.clone())
             .collect();
-        self.cur_result.clear();
         self.cur_ensures.clear();
         // `@no_panic`/`@inline`/`@cold`/… are honoured on methods too (they emit as
         // free C functions), so the attribute machinery must follow them here.
         self.cur_no_panic = f.no_panic;
 
         let prefix = self.fn_attr_prefix(f);
-        let ret = match f.ret_ty {
-            Some(t) => self.c_ty_ast(t),
-            None => "void".to_string(),
+        // A fallible method returns its tagged result struct, exactly as a fallible
+        // free function does — the ok type is the declared return lowered through
+        // this INSTANCE's substitution, so a generic struct's method gets one result
+        // type per instantiation. Setting `cur_result` is what makes `ok`/`err`/`?`
+        // inside the body Just Work: they only ever consult it.
+        let ret = if f.errors.is_some() {
+            let ok = f.ret_ty.map(|t| self.ast_type_to_ty(t, &self.subst)).unwrap_or(Ty::Unit);
+            self.result_c_name(&ok)
+        } else {
+            match f.ret_ty {
+                Some(t) => self.c_ty_ast(t),
+                None => "void".to_string(),
+            }
         };
+        self.cur_result = if f.errors.is_some() { ret.clone() } else { String::new() };
         let cname = self.method_c_name(ctor, args, &f.name.name);
         let params = self.method_params_str(f);
         if body {
@@ -6403,6 +6460,7 @@ impl<'a> Cgen<'a> {
         self.self_is_ptr = false;
         self.subst.clear();
         self.cur_no_panic = false;
+        self.cur_result.clear();
     }
 
     fn method_protos(&mut self) {
@@ -6458,11 +6516,18 @@ impl<'a> Cgen<'a> {
     /// taken by pointer for a `mut`/`out self`), reusing the struct-method
     /// machinery for `self`.
     fn emit_impl_method_decl(&mut self, im: &ImplDecl, f: &FnDecl, body: bool) {
+        // A fallible impl method stays refused — and the real refusal now lives in
+        // TYPECK, where it can explain itself. The reason is semantic, not an emission
+        // gap: a call through the trait is typed by the TRAIT's signature, which
+        // cannot declare an error set (there is no syntax for it), so a fallible impl
+        // would be silently mistyped as infallible at every call site. This emission
+        // guard is the backstop, kept so a future typeck regression degrades to a
+        // diagnostic rather than to C that reads a result struct as its ok type.
         if f.errors.is_some() {
             if body {
                 self.diag(
                     f.name.span,
-                    "the C backend does not support fallible trait-impl methods yet",
+                    "a trait-impl method cannot be fallible: calls are typed by the trait's signature, which has no error set",
                 );
             }
             return;
@@ -6482,7 +6547,6 @@ impl<'a> Cgen<'a> {
             .filter(|p| !p.comptime && !p.is_self && matches!(p.conv, Conv::Mut | Conv::Out))
             .map(|p| p.name.name.clone())
             .collect();
-        self.cur_result.clear();
         self.cur_ensures.clear();
         self.cur_no_panic = f.no_panic;
 
@@ -6491,6 +6555,7 @@ impl<'a> Cgen<'a> {
             Some(t) => self.c_ty_ast(t),
             None => "void".to_string(),
         };
+        self.cur_result.clear();
         let cname = impl_method_c_name(&im.trait_name.name, &type_key, &f.name.name);
         let params = self.method_params_str(f);
         if body {
@@ -6506,6 +6571,7 @@ impl<'a> Cgen<'a> {
         self.self_is_ptr = false;
         self.subst.clear();
         self.cur_no_panic = false;
+        self.cur_result.clear();
     }
 
     fn impl_protos(&mut self) {
@@ -9573,6 +9639,45 @@ mod tests {
 
     /// Wiring: `try_read_file` lowers to a tagged `JestyrResult_String`, gets its
     /// out-param runtime helper, and its err branch carries the `IoError` tag.
+    /// **A fallible METHOD returns its tagged result struct, exactly as a fallible
+    /// free function does.** The gate that refused this is gone; what replaced it:
+    /// the method's C signature returns `JestyrResult_<ok>`, the typedef is emitted
+    /// per *instance* (a generic struct's method has one ok type per instantiation),
+    /// and `cur_result` is set during the body so `ok`/`err`/`?` inside it work
+    /// unchanged.
+    #[test]
+    fn a_fallible_method_returns_its_result_struct() {
+        let src = "struct A { b: i32 \
+                     fn spend(mut self, n: i32) -> i32 !{ Insufficient } { \
+                       if n > self.b { return err(Insufficient) } \
+                       self.b = self.b - n return ok(self.b) } } \
+                   fn main() -> i32 { var a: A = A { b: 100 } \
+                     let l: i32 = a.spend(30) catch 0 - 1 print_int(l as i64) return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(c.contains("typedef struct { bool is_err; int32_t ok; int err; } JestyrResult_i32;"), "{c}");
+        assert!(c.contains("JestyrResult_i32 jestyr_A_spend("), "the method returns the result struct: {c}");
+        // The body's `ok`/`err` construct THIS result type — cur_result was set.
+        assert!(c.contains("(JestyrResult_i32){ .is_err = true"), "{c}");
+    }
+
+    /// A fallible impl method is refused at CHECK time with the reason: calls are
+    /// typed by the trait's signature, which has no error-set syntax, so accepting it
+    /// would mistype every call site as infallible.
+    #[test]
+    fn a_fallible_impl_method_is_refused_with_the_reason() {
+        let src = "trait P { fn parse(read self) -> i32 } struct W { n: i32 } \
+                   impl P for W { fn parse(read self) -> i32 !{ Bad } { return err(Bad) } } \
+                   fn main() -> i32 { return 0 }";
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (ast, _) = crate::parser::Parser::new(src, tokens).parse();
+        let (_info, d) = crate::typeck::check(&ast);
+        assert!(
+            d.iter().any(|x| x.message.contains("a trait-impl method cannot be fallible")),
+            "{d:?}"
+        );
+    }
+
     /// **`catch` recovers where `?` propagates**, and the difference shows in the C:
     /// `?` emits an early `return` of the error, `catch` emits a conditional. That is
     /// why `catch` is legal in an **infallible** function and `?` is not — recovering

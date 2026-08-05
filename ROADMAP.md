@@ -233,8 +233,16 @@ per-invocation, so non-users are byte-identical and no port mirror is due); and
 `catch |e| return e` is `?` spelled out with the tag preserved, and the port mirrors
 the binder span, the `error` prim (code 20) and all three lowerings byte-identically —
 the mirror increment also fixed a *reference* bug (early `return`s in the typeck arm
-bypassed `set()`, leaving the node's recorded type `Unknown`). **Left:** fallible
-**methods** (overlaps B); errors in more positions; richer error payloads.
+bypassed `set()`, leaving the node's recorded type `Unknown`); and **fallible
+methods, on both sides** — a struct method's `-> T !{ E }` returns its tagged result
+(one result type per generic instantiation), every consumer (`catch`/`|e|`/`?`/
+`unwrap`) works on method calls unchanged, and a fallible *trait-impl* method is a
+check-time error with the reason (calls are typed by the trait's signature, which has
+no error-set syntax). The port mirror **unified plain methods into the generic
+worklist** — the reference's `method_instances` is one LIFO list for both, and the
+port's old flat scan was a latent order divergence no corpus file had two instances
+to expose. **Left:** errors in more positions; richer error payloads; error sets in
+trait signatures (which would unlock fallible impls).
 
 ### J. Numeric / operator completeness — ~70% (MED conflict; files: typeck, cgen)
 **Left:** defined integer-overflow semantics (wrap/saturate/checked — **Motley

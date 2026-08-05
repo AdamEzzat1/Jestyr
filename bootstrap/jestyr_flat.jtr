@@ -11901,7 +11901,7 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
         string_push(sb, "; if (_q")
         push_uint__cgen(sb, n as i64)
         string_push(sb, ".is_err) return (")
-        emit_result_name(sb, p, src, g.res_ok)                     // re-wrap in the CURRENT fn's result
+        emit_result_name(sb, p, src, c, g, g.res_ok)                     // re-wrap in the CURRENT fn's result
         string_push(sb, "){ .is_err = true, .err = _q")
         push_uint__cgen(sb, n as i64)
         string_push(sb, ".err }; _q")
@@ -11944,7 +11944,7 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
             string_push(sb, "; if (_ct")
             push_uint__cgen(sb, n as i64)
             string_push(sb, ".is_err) return (")
-            emit_result_name(sb, p, src, g.res_ok)
+            emit_result_name(sb, p, src, c, g, g.res_ok)
             string_push(sb, "){ .is_err = true, .err = _ct")
             push_uint__cgen(sb, n as i64)
             string_push(sb, ".err }; _ct")
@@ -13364,7 +13364,7 @@ fn emit_call(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                 return
             }
             string_push(sb, "(")
-            emit_result_name(sb, p, src, g.res_ok)
+            emit_result_name(sb, p, src, c, g, g.res_ok)
             string_push(sb, "){ .is_err = false, .ok = (")
             emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
             string_push(sb, ") }")
@@ -13376,7 +13376,7 @@ fn emit_call(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                 return
             }
             string_push(sb, "(")
-            emit_result_name(sb, p, src, g.res_ok)
+            emit_result_name(sb, p, src, c, g, g.res_ok)
             string_push(sb, "){ .is_err = true, .err = ")
             let en: ExprData = get(ExprData, p.ex, arg_at(p, e, 0) as usize)
             push_uint__cgen(sb, error_tag_of(g, src, en.start, en.end) as i64)
@@ -13680,7 +13680,34 @@ fn fn_is_fallible__cgen(read p: Parser, read it: ItemData) -> bool {
 }
 
 // Emit a fallible fn's C result type name `JestyrResult_<mangle(ok)>` (ok = `it.z`, -1 = unit).
-fn emit_result_name(mut sb: String, read p: Parser, read src: str, ok_ty: i32) {
+// SUBST-AWARE: inside a monomorphized generic body a `-> T !{ E }` must name the
+// INSTANCE's result (`JestyrResult_f64`), not the parameter's -- a Name ok-type is
+// resolved through the armed `g.su` first, exactly as `emit_su_ty` resolves C types.
+// With no subst armed the lookup misses and this is the original mangle, character
+// for character, so every free-function site is unchanged.
+fn emit_result_name(mut sb: String, read p: Parser, read src: str, read c: Checker, read g: Cg, ok_ty: i32) {
+    string_push(sb, "JestyrResult_")
+    if ok_ty < 0 { string_push(sb, "unit")  return }
+    push_su_result_mangle(sb, p, src, c, g, ok_ty)
+}
+
+// The ok-type mangle, subst-aware (shared by the result NAME and the typedef scan's
+// dedup key, so the two cannot disagree on which instances share a typedef).
+fn push_su_result_mangle(mut sb: String, read p: Parser, read src: str, read c: Checker, read g: Cg, ok_ty: i32) {
+    let t: TypeData = get(TypeData, p.ty, ok_ty as usize)
+    if t.kind == 0 {
+        let sl: i32 = su_slot(src, g, t.start, t.end)
+        if sl >= 0 {
+            push_targ_mangle(sb, src, c, get(i32, g.su, (sl + 2) as usize), get(i32, g.su, (sl + 3) as usize), get(i32, g.su, (sl + 4) as usize))
+            return
+        }
+    }
+    push_ast_mangle(sb, p, src, ok_ty)
+}
+
+// The no-subst form, for sig emitters that have no Checker/Cg in scope (free fns --
+// where a subst can never apply). Byte-identical to the original emitter.
+fn emit_result_name_plain(mut sb: String, read p: Parser, read src: str, ok_ty: i32) {
     string_push(sb, "JestyrResult_")
     if ok_ty < 0 { string_push(sb, "unit") } else { push_ast_mangle(sb, p, src, ok_ty) }
 }
@@ -13704,6 +13731,33 @@ fn build_error_tags(mut g: Cg, read p: Parser, read src: str) {
                     push(i32, g.etags, ne)
                 }
                 k = k + 1
+            }
+        }
+        // Fallible STRUCT METHODS declare error sets too -- same whole-program map,
+        // scanned after the item's own set so a method never renumbers a free fn's
+        // tags (mirrors the reference's struct-member scan; trait impls stay out by
+        // the fallible-impl refusal).
+        if it.kind == 4 {
+            var m: i32 = 0
+            for m < it.b {
+                let mbase: i32 = it.a + m * 10
+                if get(i32, p.mar, mbase as usize) == 1 {   // tag 1 = method
+                    let mfd: ItemData = get(ItemData, p.it, get(i32, p.mar, (mbase + 1) as usize) as usize)
+                    if mfd.e >= 0 {
+                        let mec: i32 = get(i32, p.far, mfd.e as usize)
+                        var mk: i32 = 0
+                        for mk < mec {
+                            let mns: i32 = get(i32, p.far, (mfd.e + 1 + mk * 2) as usize)
+                            let mne: i32 = get(i32, p.far, (mfd.e + 2 + mk * 2) as usize)
+                            if error_tag_of(g, src, mns as usize, mne as usize) == 0 {
+                                push(i32, g.etags, mns)
+                                push(i32, g.etags, mne)
+                            }
+                            mk = mk + 1
+                        }
+                    }
+                }
+                m = m + 1
             }
         }
         r = r + 1
@@ -14151,7 +14205,23 @@ fn gmethod_check(mut wk: List(i32), mut wks: List(i32), read p: Parser, read src
     let rtid: i32 = get(i32, c.et, callee.a as usize)
     if rtid < 0 { return }
     let d: TyData = get(TyData, c.tys, rtid as usize)
-    if d.kind != 6 { return }
+    if d.kind != 6 {
+        // A PLAIN named-struct receiver takes the SAME worklist, with argc 0 and the
+        // STRUCT item in the trailing slot. The reference pushes Work::Method for
+        // every resolved method call, generic or not, and drains LIFO -- which is why
+        // a flat arena scan cannot reproduce its order: three plain methods called
+        // first/second/third emit third/second/first. The old `g.mi` flat scan was a
+        // LATENT divergence no corpus file had two instances to expose.
+        let packed: i32 = resolve_method_call(p, src, c, callee)
+        if packed < 0 { return }
+        let rb: i32 = len(i32, wk) as i32
+        push(i32, wk, packed % 1000000)          // the method fn item
+        push(i32, wk, 0)                          // argc 0: no type args
+        push(i32, wk, packed / 1000000)           // trailing: the struct ITEM
+        push(i32, wks, rb)
+        push(i32, wks, 1)                         // tag 1 = a METHOD record
+        return
+    }
     let cfit: i32 = gstruct_ctor_fn(p, src, c, rtid)
     if cfit < 0 { return }
     let mfit: i32 = gnode_method(p, src, cfit, callee.x as usize, callee.y as usize)
@@ -14186,7 +14256,11 @@ fn gfind_expr(mut wk: List(i32), mut wks: List(i32), read p: Parser, read src: s
         gmethod_check(wk, wks, p, src, c, e, eid)
         return
     }
-    if e.kind == 4 or e.kind == 6 or e.kind == 12 {   // Binary / Index / Assign
+    if e.kind == 4 or e.kind == 6 or e.kind == 12 or e.kind == 45 {   // Binary / Index / Assign / Catch
+        // Catch (45) matters here: a generic method called ONLY inside a `catch` --
+        // `sf.get() catch 0.0` -- would otherwise never be discovered, and its
+        // instance would be a LINK error, not a diagnostic. The reference's
+        // find_calls_expr grew its Catch arm with the construct; this is the port's.
         gfind_expr(wk, wks, p, src, c, e.a)
         gfind_expr(wk, wks, p, src, c, e.b)
         return
@@ -14339,6 +14413,11 @@ fn push_gmi_name(mut sb: String, read p: Parser, read src: str, read c: Checker,
     let mf: ItemData = get(ItemData, p.it, get(i32, lst, rb as usize) as usize)
     string_push(sb, "jestyr_")
     string_push(sb, src[cf.x .. cf.y])
+    if argc == 0 {                                    // plain struct: jestyr_<Struct>_<method>
+        string_push(sb, "_")
+        string_push(sb, src[mf.x .. mf.y])
+        return
+    }
     string_push(sb, "__")
     var t: i32 = 0
     for t < argc {
@@ -15121,7 +15200,7 @@ fn emit_return(mut sb: String, read p: Parser, read src: str, read c: Checker, m
     // Mirrors `emit_value_return`; a method body (`autoret`) has no tracked ret cty -> `__auto_type`.
     if len(i32, g.ens) > 0 or has_live_drops(g) {
         indent(sb, depth)
-        if g.res_ok >= 0 - 1 { emit_result_name(sb, p, src, g.res_ok) }
+        if g.res_ok >= 0 - 1 { emit_result_name(sb, p, src, c, g, g.res_ok) }
         else if g.autoret { string_push(sb, "__auto_type") }
         else { emit_c_ty(sb, p, src, g.retty) }
         string_push(sb, " j_result = ")
@@ -17235,7 +17314,7 @@ fn emit_fn_attr_prefix(mut sb: String, read p: Parser, read src: str, read it: I
 fn emit_fn_sig(mut sb: String, read p: Parser, read src: str, read it: ItemData) {
     emit_fn_attr_prefix(sb, p, src, it)
     // A fallible fn returns its result struct; otherwise its ok type (`it.z`, -1 = void).
-    if fn_is_fallible__cgen(p, it) { emit_result_name(sb, p, src, it.z) }
+    if fn_is_fallible__cgen(p, it) { emit_result_name_plain(sb, p, src, it.z) }
     else { emit_c_ty(sb, p, src, it.z) }
     string_push(sb, " ")
     // `@no_mangle` publishes the BARE name (C interop); everything else is `jestyr_<name>`.
@@ -17276,8 +17355,11 @@ fn emit_params(mut sb: String, read p: Parser, read src: str, read it: ItemData)
 // A method's signature `<ret> jestyr_<S>_<m>(<params>)` — like `emit_fn_sig` but `self` renders
 // as a real first parameter `Jestyr_<S>[* restrict] j_self` (pointer for `mut`/`out self`).
 // Mirrors `emit_method_decl`'s sig + `method_params_str`.
-fn emit_method_sig(mut sb: String, read p: Parser, read src: str, read sd: ItemData, read fd: ItemData) {
-    emit_c_ty(sb, p, src, fd.z)
+fn emit_method_sig(mut sb: String, read p: Parser, read src: str, read c: Checker, read g: Cg, read sd: ItemData, read fd: ItemData) {
+    // A fallible method returns its tagged result struct, exactly as a fallible
+    // free function does (mirrors `emit_method_decl`'s errors branch).
+    if fn_is_fallible__cgen(p, fd) { emit_result_name(sb, p, src, c, g, fd.z) }
+    else { emit_c_ty(sb, p, src, fd.z) }
     string_push(sb, " jestyr_")
     string_push(sb, src[sd.x .. sd.y])
     string_push(sb, "_")
@@ -17315,8 +17397,12 @@ fn emit_method_sig(mut sb: String, read p: Parser, read src: str, read sd: ItemD
 // names (declaration order) zip with the record's receiver-arg triples. The caller clears it.
 fn arm_gmi_su(mut g: Cg, read p: Parser, rb: i32) {
     let argc: i32 = get(i32, g.gmi, (rb + 1) as usize)
-    let cf: ItemData = get(ItemData, p.it, get(i32, g.gmi, (rb + 2 + argc * 3) as usize) as usize)
     truncate(i32, g.su, 0)
+    // A plain-struct record (argc 0) has no subst -- and its trailing item is the
+    // STRUCT, whose (a, b) are member-array coordinates, not param 7-tuples; reading
+    // them as params would index the arena with garbage.
+    if argc == 0 { return }
+    let cf: ItemData = get(ItemData, p.it, get(i32, g.gmi, (rb + 2 + argc * 3) as usize) as usize)
     var ai: i32 = 0
     var i: i32 = 0
     for i < cf.b {
@@ -17349,7 +17435,11 @@ fn emit_gmi_sig(mut sb: String, read p: Parser, read src: str, read c: Checker, 
     let argc: i32 = get(i32, g.gmi, (rb + 1) as usize)
     let cf: ItemData = get(ItemData, p.it, get(i32, g.gmi, (rb + 2 + argc * 3) as usize) as usize)
     arm_gmi_su(g, p, rb)
-    emit_su_ty(sb, p, src, c, g, mf.z)
+    // A fallible generic method returns the INSTANCE's result type -- the ok type is
+    // resolved through the armed subst, so `Slot(f64).get -> T !{ Empty }` returns
+    // `JestyrResult_f64` (one result type per instantiation, like the reference).
+    if fn_is_fallible__cgen(p, mf) { emit_result_name(sb, p, src, c, g, mf.z) }
+    else { emit_su_ty(sb, p, src, c, g, mf.z) }
     string_push(sb, " ")
     push_gmi_name(sb, p, src, c, g.gmi, rb)
     string_push(sb, "(")
@@ -17361,13 +17451,15 @@ fn emit_gmi_sig(mut sb: String, read p: Parser, read src: str, read c: Checker, 
             if emitted > 0 { string_push(sb, ", ") }
             string_push(sb, "Jestyr_")
             string_push(sb, src[cf.x .. cf.y])
-            string_push(sb, "__")
-            var t: i32 = 0
-            for t < argc {
-                if t > 0 { string_push(sb, "_") }
-                let tb: i32 = rb + 2 + t * 3
-                push_targ_mangle(sb, src, c, get(i32, g.gmi, tb as usize), get(i32, g.gmi, (tb + 1) as usize), get(i32, g.gmi, (tb + 2) as usize))
-                t = t + 1
+            if argc > 0 {                              // plain (argc 0): Jestyr_<Struct> bare
+                string_push(sb, "__")
+                var t: i32 = 0
+                for t < argc {
+                    if t > 0 { string_push(sb, "_") }
+                    let tb: i32 = rb + 2 + t * 3
+                    push_targ_mangle(sb, src, c, get(i32, g.gmi, tb as usize), get(i32, g.gmi, (tb + 1) as usize), get(i32, g.gmi, (tb + 2) as usize))
+                    t = t + 1
+                }
             }
             let sconv: i32 = get(i32, p.iar, (base + 1) as usize)
             if sconv == 2 or sconv == 4 { string_push(sb, "* restrict") }
@@ -17393,7 +17485,7 @@ fn emit_method_protos(mut sb: String, read p: Parser, read src: str, read c: Che
     for k < len(i32, g.mi) {
         let sd: ItemData = get(ItemData, p.it, get(i32, g.mi, k) as usize)
         let fd: ItemData = get(ItemData, p.it, get(i32, g.mi, k + 1) as usize)
-        emit_method_sig(sb, p, src, sd, fd)
+        emit_method_sig(sb, p, src, c, g, sd, fd)
         string_push(sb, ";\n")
         k = k + 2
     }
@@ -17418,7 +17510,7 @@ fn emit_method_defs(mut sb: String, read p: Parser, read src: str, read c: Check
         let fid: i32 = get(i32, g.mi, k + 1)
         let sd: ItemData = get(ItemData, p.it, sit as usize)
         let fd: ItemData = get(ItemData, p.it, fid as usize)
-        emit_method_sig(sb, p, src, sd, fd)
+        emit_method_sig(sb, p, src, c, g, sd, fd)
         string_push(sb, "\n")
         truncate(i32, g.pp, 0)
         var pi: i32 = 0
@@ -17436,7 +17528,13 @@ fn emit_method_defs(mut sb: String, read p: Parser, read src: str, read c: Check
         g.retty = fd.z
         g.curfn = fid
         g.autoret = true                              // the reference leaves `cur_ret_cty` unset here
-        emit_body(sb, p, src, c, g, fd.w, fd.z >= 0, 0)
+        // A fallible method body constructs ITS result type: `ok`/`err`/`?` inside it
+        // consult `res_ok`, exactly as in a fallible free function (mirrors
+        // `emit_method_decl` setting `cur_result`).
+        let mfall: bool = fn_is_fallible__cgen(p, fd)
+        if mfall { g.res_ok = fd.z } else { g.res_ok = 0 - 2 }
+        emit_body(sb, p, src, c, g, fd.w, fd.z >= 0 or mfall, 0)
+        g.res_ok = 0 - 2
         g.self_ptr = false
         g.retty = 0 - 1
         g.autoret = false
@@ -17466,7 +17564,12 @@ fn emit_method_defs(mut sb: String, read p: Parser, read src: str, read c: Check
         g.retty = mf.z
         g.curfn = mfit
         g.autoret = true
-        emit_body(sb, p, src, c, g, mf.w, mf.z >= 0, 0)
+        // Fallible generic method: `ok`/`err`/`?` construct the INSTANCE's result
+        // (res_ok resolves through the still-armed subst in emit_result_name).
+        let gmfall: bool = fn_is_fallible__cgen(p, mf)
+        if gmfall { g.res_ok = mf.z } else { g.res_ok = 0 - 2 }
+        emit_body(sb, p, src, c, g, mf.w, mf.z >= 0 or gmfall, 0)
+        g.res_ok = 0 - 2
         g.self_ptr = false
         g.retty = 0 - 1
         g.autoret = false
@@ -19921,7 +20024,7 @@ fn emit_genref_defs(mut sb: String, read p: Parser, read src: str, read c: Check
 
 // Result-struct typedefs. `JestyrResult_str` (the `try_from_utf8` intrinsic's result) is emitted
 // unconditionally up front; fallible user functions add their own (none in `hello`).
-fn emit_result_defs(mut sb: String, read p: Parser, read src: str, mut d: Dc) {
+fn emit_result_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg, mut d: Dc) {
     let sn: i32 = dc_len(d)                           // JestyrResult_str: a no-dep segment
     string_push(d.nb, "JestyrResult_str")
     let se: i32 = dc_len(d)
@@ -19976,6 +20079,49 @@ fn emit_result_defs(mut sb: String, read p: Parser, read src: str, mut d: Dc) {
             string_free(m)  string_free(probe)
         }
         r = r + 1
+    }
+    // Fallible METHOD instances need their result typedefs too -- one ok type per
+    // instantiation, walked in `g.gmi` order (the LIFO worklist order, which IS the
+    // reference's `method_instances` order), deduped through the same `seen` so a
+    // method sharing a free fn's ok type never duplicates the typedef.
+    var rb: i32 = 0
+    for rb < len(i32, g.gmi) as i32 {
+        let mf: ItemData = get(ItemData, p.it, get(i32, g.gmi, rb as usize) as usize)
+        let argc: i32 = get(i32, g.gmi, (rb + 1) as usize)
+        if fn_is_fallible__cgen(p, mf) {
+            arm_gmi_su(g, p, rb)                      // the ok type resolves through the subst
+            var m2: String = string_new()
+            if mf.z < 0 { string_push(m2, "unit") } else { push_su_result_mangle(m2, p, src, c, g, mf.z) }
+            var probe2: String = string_new()
+            string_push(probe2, "|")  string_push(probe2, string_view(m2))  string_push(probe2, "|")
+            if !contains(string_view(seen), string_view(probe2)) {
+                string_push(seen, string_view(probe2))
+                let ns2: i32 = dc_len(d)
+                string_push(d.nb, "JestyrResult_")
+                string_push(d.nb, string_view(m2))
+                let ne2: i32 = dc_len(d)
+                if mf.z >= 0 {
+                    var oc2: String = string_new()
+                    emit_su_ty(oc2, p, src, c, g, mf.z)
+                    dc_dep(d, ne2, string_view(oc2))
+                    string_free(oc2)
+                }
+                dc_begin(d, sb_len(sb), ns2, ne2, ne2, dc_len(d))
+                string_push(sb, "typedef struct { bool is_err; ")
+                if mf.z >= 0 {
+                    emit_su_ty(sb, p, src, c, g, mf.z)
+                    string_push(sb, " ok; ")
+                }
+                string_push(sb, "int err; } JestyrResult_")
+                string_push(sb, string_view(m2))
+                string_push(sb, ";\n")
+                dc_end(d, sb_len(sb))
+            }
+            string_free(m2)  string_free(probe2)
+            truncate(i32, g.su, 0)
+        }
+        var reclen2: i32 = 3 + argc * 3               // fn item, argc, args x3, ctor item
+        rb = rb + reclen2
     }
     string_free(seen)
     string_push(sb, "\n")
@@ -21558,7 +21704,11 @@ fn emit_program(mut sb: String, read p: Parser, read c: Checker, read src: str, 
     var g: Cg = Cg{ sds: make__list(i32, a), tmp: 0, pp: make__list(i32, a), rf: make__list(i32, a), res_ok: 0 - 2, etags: make__list(i32, a), req: make__list(i32, a), ens: make__list(i32, a), retty: 0 - 1, mi: make__list(i32, a), self_ptr: false, gei: make__list(i32, a), curfn: 0 - 1, mv: make__list(i32, a), ds: make__list(i32, a), dsb: make__list(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: make__list(i32, a), vtf: 0, gfi: make__list(i32, a), su: make__list(i32, a), cls: make__list(i32, a), ccx: make__list(i32, a), cca: make__list(i32, a), caps: make__list(i32, a), gsi: make__list(i32, a), sps: make__list(i32, a), dspawn: false, th: make__list(i32, a), thf: 0, dg: 0 - 1, gmi: make__list(i32, a), tmode: tmode, alloc: a }
     collect_spawns(g, p, src)                        // spawn sites (gates the pthread prelude)
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
-    collect_method_instances(g, p, src, c)           // (struct item, method fn item) pairs, first-seen
+    // Plain-struct methods now flow through the SAME worklist as generic instances
+    // (`gmethod_check`'s argc-0 records), because the reference's `method_instances`
+    // is one LIFO list for both -- `collect_method_instances`' flat first-seen scan
+    // was a latent order divergence (see `gmethod_check`). `g.mi` stays empty; its
+    // emission loops are dead and kept only to avoid churning this file's structure.
     collect_gfn_instances(g, p, src, c, a)           // generic-fn instances, LIFO worklist order
     collect_gstruct_instances(g, p, src, c)          // generic-STRUCT instances (reads gfi — after!)
     collect_genum_instances(g, p, src, c)            // generic-enum instance TyIds, expr order
@@ -21581,7 +21731,7 @@ fn emit_program(mut sb: String, read p: Parser, read c: Checker, read src: str, 
     sd_vector_defs(cap, p, src, c, g, a)             // @simd vector typedefs (Q-S2)
     emit_array_defs(cap, p, src, c, d)               // array typedefs (after slices)
     emit_genref_defs(cap, p, src, c, d)              // genref typedefs (after arrays)
-    emit_result_defs(cap, p, src, d)
+    emit_result_defs(cap, p, src, c, g, d)
     dc_flush(sb, d, string_view(cap), a)             // the topological re-emit (`flush_def_capture`)
     string_free(cap)
     string_free(d.nb)

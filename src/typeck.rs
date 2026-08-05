@@ -530,6 +530,23 @@ impl<'a> TypeChecker<'a> {
                 );
                 continue;
             }
+            // A fallible impl method is refused HERE, not merely at emission: a call
+            // through the trait is typed by the trait's signature, which has no
+            // error-set syntax — so accepting the impl would silently type every call
+            // site as infallible while the body returns a tagged result. The check-time
+            // error is the difference between a diagnostic and a mistype.
+            for f in &im.methods {
+                if let Some(es) = &f.errors {
+                    self.error(
+                        es.span,
+                        format!(
+                            "a trait-impl method cannot be fallible: calls to `{}` are typed by \
+                             trait `{}`'s signature, which declares no error set",
+                            f.name.name, im.trait_name.name
+                        ),
+                    );
+                }
+            }
             let target = self.lower_type(&empty, im.ty);
             let type_key = self.table.ty_key(&target);
             let pair = (im.trait_name.name.clone(), type_key.clone());

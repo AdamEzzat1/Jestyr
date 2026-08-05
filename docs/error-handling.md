@@ -151,4 +151,43 @@ arm's early `return`s bypassed `set()`, so a `catch`-expression's recorded type 
 `Unknown` while the port recorded it faithfully — the rare divergence where the port
 was right and the reference was wrong.
 
-## Not yet
+## Fallible methods — both sides
+
+A struct method declares an error set exactly as a free function does, and every
+consumer works on the call unchanged:
+
+```jestyr
+struct Account {
+    balance: i32
+    fn withdraw(mut self, amount: i32) -> i32 !{ Insufficient } {
+        if amount > self.balance { return err(Insufficient) }
+        self.balance = self.balance - amount
+        return ok(self.balance)
+    }
+}
+
+let left = a.withdraw(30) catch 0 - 1     // recover
+let tag  = a.withdraw(500) catch |e| (e as i64)   // bind the tag
+let v    = s.get()?                        // propagate out of a free fn
+```
+
+A **generic** struct's method gets one result type per instantiation — `Slot(i32).get`
+and `Slot(f64).get` emit `JestyrResult_i32` and `JestyrResult_f64` — exactly as two
+monomorphized functions would. `examples/method_errors.jtr` is the worked example.
+
+**Trait-impl methods stay infallible, by rule.** A call through a trait is typed by
+the trait's *signature*, which has no error-set syntax — so a fallible impl would be
+silently mistyped as infallible at every call site. It is a check-time error with that
+reason. Lifting the rule needs error sets in trait declarations, a design item.
+
+The port mirror had a finding worth the price: the reference's `method_instances` is
+**one LIFO worklist for plain and generic methods alike**, and the port's old flat
+first-seen scan of plain methods was a **latent order divergence** — three plain
+methods called `first/second/third` emit `third/second/first` — that no corpus file
+had two instances to expose. Plain methods now route through the same worklist as
+generic ones (argc-0 records), and the whole corpus stayed byte-identical.
+
+## Not yet (post-v1)
+
+* Error sets in **trait signatures** (which would unlock fallible impls).
+* Errors in more positions; richer error payloads (today an error is a tag).

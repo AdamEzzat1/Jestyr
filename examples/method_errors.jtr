@@ -1,0 +1,65 @@
+// examples/method_errors.jtr — FALLIBLE METHODS: a method's `-> T !{ E }` works
+// exactly as a free function's.
+//
+// The method returns its tagged result struct, `ok`/`err` construct it inside the
+// body, and every consumer of a fallible call — `catch`, `catch |e|`, `?`, `unwrap`,
+// `is_err` — works on a method call unchanged, because they only ever look at the
+// call's Result type, never at who declared it.
+//
+// A GENERIC struct's method gets one result type per instantiation (`Slot(i32).get`
+// and `Slot(f64).get` emit two typedefs), exactly as two monomorphized functions
+// would. Trait-impl methods stay infallible by rule: a call through a trait is typed
+// by the trait's signature, which has no error-set syntax — a fallible impl is a
+// check-time error, not a mistype.
+//
+// Run:  jestyrc run examples/method_errors.jtr
+//   →  70, -1, 1, 7, -1, 8, true, 2.5
+
+struct Account {
+    balance: i32
+
+    fn withdraw(mut self, amount: i32) -> i32 !{ Insufficient } {
+        if amount > self.balance { return err(Insufficient) }
+        self.balance = self.balance - amount
+        return ok(self.balance)
+    }
+}
+
+fn Slot(comptime T: type) -> type {
+    return struct {
+        val: T,
+        full: bool,
+
+        fn get(read self) -> T !{ Empty } {
+            if !self.full { return err(Empty) }
+            return ok(self.val)
+        }
+    }
+}
+
+// `?` propagates a METHOD's error out of a free function — the hop neither knows
+// nor cares that the callee was a method.
+fn relay(read s: Slot(i32)) -> i32 !{ Empty } {
+    let v: i32 = s.get()?
+    return ok(v + 1)
+}
+
+fn main() -> i32 {
+    var a: Account = Account { balance: 100 }
+    print_int((a.withdraw(30) catch 0 - 1) as i64)    // 70
+    print_int((a.withdraw(500) catch 0 - 1) as i64)   // -1
+
+    // `catch |e|` binds a method's error tag like any other.
+    print_int(a.withdraw(500) catch |e| (e as i64))   // 1 — Insufficient's tag
+
+    var full: Slot(i32) = Slot(i32){ val: 7, full: true }
+    var empty: Slot(i32) = Slot(i32){ val: 0, full: false }
+    print_int((full.get() catch 0 - 1) as i64)        // 7
+    print_int((empty.get() catch 0 - 1) as i64)       // -1
+    print_int(unwrap(relay(full)) as i64)             // 8
+    print_bool(is_err(relay(empty)))                  // true
+
+    var sf: Slot(f64) = Slot(f64){ val: 2.5, full: true }
+    print_float(sf.get() catch 0.0)                   // 2.5 — the second result typedef
+    return 0
+}
