@@ -65,6 +65,7 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
         cur_type_param_bounds: HashMap::new(),
         cur_expected: None,
         cur_ret: None,
+        cur_errs: None,
         diags: Vec::new(),
     };
     tc.build_table();
@@ -235,6 +236,10 @@ struct TypeChecker<'a> {
     /// The return type of the function currently being checked — the expected type
     /// for a `return <expr>`.
     cur_ret: Option<Ty>,
+    /// The declared error set of the function currently being checked (sorted),
+    /// `None` when it is infallible — what `err(E)` membership and `?`/rethrow
+    /// inclusion are checked against (error-payloads E2).
+    cur_errs: Option<Vec<String>>,
     diags: Vec<Diagnostic>,
 }
 
@@ -434,7 +439,7 @@ impl<'a> TypeChecker<'a> {
                     }
                     self.table.fns.insert(
                         key,
-                        FnSig { params, ret, ret_conv: f.ret_conv, fallible: f.errors.is_some() },
+                        FnSig { params, ret, ret_conv: f.ret_conv, errs: errs_of(&f.errors) },
                     );
                 }
                 Item::Const(c) => {
@@ -456,7 +461,7 @@ impl<'a> TypeChecker<'a> {
                     }
                     self.table.fns.insert(
                         e.name.name.clone(),
-                        FnSig { params, ret, ret_conv: e.ret_conv, fallible: false },
+                        FnSig { params, ret, ret_conv: e.ret_conv, errs: None },
                     );
                 }
                 Item::Import(_) => {}
@@ -1437,6 +1442,27 @@ impl<'a> TypeChecker<'a> {
     /// parameter head-matches the receiver's type (backlog item A). Records the
     /// resolution in `method_calls` and returns the call's result type. `None`
     /// means "not a free-function method" (the caller tries a struct method).
+    /// `?`/rethrow inclusion (error-payloads E2): the propagated set must be
+    /// included in the enclosing function's declared set. Reported at the
+    /// propagation site, naming exactly the names that are missing. When the
+    /// enclosing function declares NO set, nothing is reported here — "`?` used
+    /// outside a fallible function" is already that construct's own diagnostic.
+    fn check_propagation(&mut self, errs: &[String], span: crate::span::Span) {
+        let Some(own) = self.cur_errs.clone() else { return };
+        let missing: Vec<&String> = errs.iter().filter(|e| !own.contains(e)).collect();
+        if !missing.is_empty() {
+            let m: Vec<&str> = missing.iter().map(|s| s.as_str()).collect();
+            self.error(
+                span,
+                format!(
+                    "propagates {{ {} }}, which the enclosing error set {{ {} }} does not declare",
+                    m.join(", "),
+                    own.join(", ")
+                ),
+            );
+        }
+    }
+
     fn resolve_free_method(
         &mut self,
         call_id: ExprId,
@@ -1450,12 +1476,12 @@ impl<'a> TypeChecker<'a> {
         let tps = self.fn_type_params(f, &HashSet::new());
 
         // Take the owned parameter data we need, then release the table borrow.
-        let (recv_conv, ret, fallible, param_tys, runtime_idx) = {
+        let (recv_conv, ret, errs, param_tys, runtime_idx) = {
             let sig = self.table.fns.get(mname)?;
             let param_tys: Vec<Ty> = sig.params.iter().map(|p| p.ty.clone()).collect();
             let runtime_idx: Vec<usize> =
                 f.params.iter().enumerate().filter(|(_, p)| !p.comptime).map(|(i, _)| i).collect();
-            (sig.params[recv_idx].conv, sig.ret.clone(), sig.fallible, param_tys, runtime_idx)
+            (sig.params[recv_idx].conv, sig.ret.clone(), sig.errs.clone(), param_tys, runtime_idx)
         };
 
         // The receiver type must match for this to be a method call at all.
@@ -1491,7 +1517,10 @@ impl<'a> TypeChecker<'a> {
             MethodRes { fn_name: mname.to_string(), recv_ctor: None, type_args, recv_conv },
         );
         let ret = subst_ty(&ret, &subst);
-        Some(if fallible { Ty::Result(Box::new(ret)) } else { ret })
+        Some(match errs {
+            Some(e) => Ty::Result(Box::new(ret), e),
+            None => ret,
+        })
     }
 
     /// The `struct { … }` body a generic-struct constructor function returns.
@@ -1562,7 +1591,7 @@ impl<'a> TypeChecker<'a> {
 
         let recv_conv =
             method.params.iter().find(|p| p.is_self).map(|p| p.conv).unwrap_or(Conv::Default);
-        let fallible = method.errors.is_some();
+        let errs = errs_of(&method.errors);
 
         // The struct's type parameters → the receiver's concrete arguments.
         let subst: HashMap<String, Ty> =
@@ -1589,7 +1618,10 @@ impl<'a> TypeChecker<'a> {
                 recv_conv,
             },
         );
-        Some(if fallible { Ty::Result(Box::new(ret)) } else { ret })
+        Some(match errs {
+            Some(e) => Ty::Result(Box::new(ret), e),
+            None => ret,
+        })
     }
 
     /// Resolve a module-qualified call `binding.fname(args)` where `binding` is
@@ -1620,7 +1652,7 @@ impl<'a> TypeChecker<'a> {
                 self.qualified.insert(id, key.clone());
                 if let Some(sig) = self.table.fns.get(&key) {
                     let ret = sig.ret.clone();
-                    let fallible = sig.fallible;
+                    let errs = sig.errs.clone();
                     let want = sig.params.len();
                     if want != args.len() {
                         self.error(
@@ -1629,7 +1661,10 @@ impl<'a> TypeChecker<'a> {
                         );
                     }
                     let ret = self.monomorphize_ret(&key, args, typ, ret);
-                    let t = if fallible { Ty::Result(Box::new(ret)) } else { ret };
+                    let t = match errs {
+                        Some(e) => Ty::Result(Box::new(ret), e),
+                        None => ret,
+                    };
                     self.set(id, t)
                 } else {
                     self.set(id, Ty::Unknown)
@@ -1901,10 +1936,13 @@ impl<'a> TypeChecker<'a> {
         // `cur_expected`, so by the tail it is back to this seeded value.
         let prev_ret = self.cur_ret.take();
         self.cur_ret = f.ret_ty.map(|t| self.lower_type(&typ, t));
+        let prev_errs = self.cur_errs.take();
+        self.cur_errs = errs_of(&f.errors);
         let prev_exp = self.cur_expected.take();
         self.cur_expected = self.cur_ret.clone();
         self.infer_block(&mut scope, &typ, self_ty, &f.body);
         self.cur_expected = prev_exp;
+        self.cur_errs = prev_errs;
         self.cur_ret = prev_ret;
         self.cur_type_param_bounds = prev_bounds;
     }
@@ -2246,12 +2284,12 @@ impl<'a> TypeChecker<'a> {
                         self.table.fns.get(&key).map(|sig| {
                             let ptys: Vec<(String, Ty)> =
                                 sig.params.iter().map(|p| (p.name.clone(), p.ty.clone())).collect();
-                            (sig.ret.clone(), sig.fallible, ptys)
+                            (sig.ret.clone(), sig.errs.clone(), ptys)
                         })
                     } else {
                         None
                     };
-                    if let Some((ret, fallible, ptys)) = resolved {
+                    if let Some((ret, errs, ptys)) = resolved {
                         let want = ptys.len();
                         if key != name {
                             self.call_sym.insert(id, key.clone());
@@ -2281,11 +2319,12 @@ impl<'a> TypeChecker<'a> {
                         }
                         // For a generic call, resolve type parameters in the return.
                         let ret = self.monomorphize_ret(&key, args, typ, ret);
-                        // A fallible call yields `T !E`; `?` later unwraps it.
-                        if fallible {
-                            Ty::Result(Box::new(ret))
-                        } else {
-                            ret
+                        // A fallible call yields `T !E`; `?` later unwraps it. The
+                        // declared set rides the type, so `?` on a stored result
+                        // (`let r = f() … r?`) still knows what it propagates.
+                        match errs {
+                            Some(e) => Ty::Result(Box::new(ret), e),
+                            None => ret,
                         }
                     } else if let Some(&ei) = self.table.variants.get(&self.canon_variant_in(self.cur_mod, &name)) {
                         // An enum-variant constructor, e.g. `circle(2.0)`. For a
@@ -2296,9 +2335,35 @@ impl<'a> TypeChecker<'a> {
                     } else if name == "unwrap" {
                         // `unwrap(r: T !E) -> T` — the ok type of the result argument.
                         match args.first().map(|a| self.expr_types[a.0 as usize].clone()) {
-                            Some(Ty::Result(ok)) => *ok,
+                            Some(Ty::Result(ok, _)) => *ok,
                             _ => Ty::Unknown,
                         }
+                    } else if name == "err" {
+                        // The error constructor — reached only when no user fn or
+                        // enum variant named `err` shadowed it above (the corpus's
+                        // own `Result(T, E) { ok, err }` does). Its argument must
+                        // name an error in the ENCLOSING declared set — the
+                        // membership half of set soundness (error-payloads E2;
+                        // the census measured zero corpus violations, so this
+                        // lands strict). The recorded type stays `Unknown`,
+                        // exactly as before: this arm adds a diagnostic, never a
+                        // type, so the P3 golden cannot move.
+                        if let (Some(errs), Some(ExprKind::Name(n))) =
+                            (self.cur_errs.clone(), args.first().map(|a| &ast.expr_at(*a).kind))
+                        {
+                            if !errs.contains(&n.name) {
+                                self.error(
+                                    span,
+                                    format!(
+                                        "`err({})` — `{}` is not in the enclosing declared error set {{ {} }}",
+                                        n.name,
+                                        n.name,
+                                        errs.join(", ")
+                                    ),
+                                );
+                            }
+                        }
+                        Ty::Unknown
                     } else if name == "is_err" {
                         Ty::Prim("bool")
                     } else if let Some(t) = string_intrinsic_ret(&name) {
@@ -2416,10 +2481,17 @@ impl<'a> TypeChecker<'a> {
                 self.lower_type(typ, *ty) // the cast's type is its target type
             }
             ExprKind::Try { base } => {
-                // `e?` unwraps a `T !E` to its ok type `T`.
+                // `e?` unwraps a `T !E` to its ok type `T` — and propagates `E`,
+                // so the callee's set must be included in the enclosing declared
+                // set (error-payloads E2; the set rides the Result type, so a
+                // stored result propagates its ORIGIN's set). Diagnostic only:
+                // the recorded type is the ok type, exactly as before.
                 let bt = self.infer(scope, typ, self_ty, *base);
                 match bt {
-                    Ty::Result(ok) => *ok,
+                    Ty::Result(ok, errs) => {
+                        self.check_propagation(&errs, span);
+                        *ok
+                    }
                     _ => Ty::Unknown,
                 }
             }
@@ -2433,8 +2505,16 @@ impl<'a> TypeChecker<'a> {
                 // Catch node's recorded type `Unknown`, which the P3 typeck golden
                 // caught as a divergence from the port (which records faithfully).
                 let bt = self.infer(scope, typ, self_ty, *base);
+                // The rethrow form (`catch |e| return e`) is `?` spelled out, so
+                // it owes exactly `?`'s inclusion obligation; a recovering
+                // `catch` CONSUMES the error and owes nothing.
+                if *rethrow {
+                    if let Ty::Result(_, errs) = &bt {
+                        self.check_propagation(errs, span);
+                    }
+                }
                 let ok = match bt {
-                    Ty::Result(ok) => Some(*ok),
+                    Ty::Result(ok, _) => Some(*ok),
                     // Not fallible: nothing to recover from. Reported rather than
                     // silently accepted, because `catch` on an infallible expression
                     // reads as a guarantee that an error was handled.
@@ -3729,7 +3809,7 @@ fn string_intrinsic_ret(name: &str) -> Option<Ty> {
         "cow_view" => Ty::Prim("str"),
         "cow_is_owned" => Ty::Prim("bool"),
         // Recoverable: yields a Result so `is_err`/`unwrap`/`?` compose.
-        "try_from_utf8" => Ty::Result(Box::new(Ty::Prim("str"))),
+        "try_from_utf8" => Ty::Result(Box::new(Ty::Prim("str")), vec!["IoError".to_string()]),
         "count_codepoints" | "count_graphemes" => Ty::Prim("usize"),
         "find" => Ty::Prim("isize"),
         "is_utf8" | "str_eq" | "eq_fold" | "starts_with" | "ends_with" | "contains" => {
@@ -3747,7 +3827,11 @@ fn string_intrinsic_ret(name: &str) -> Option<Ty> {
 fn io_intrinsic_ret(name: &str) -> Option<Ty> {
     Some(match name {
         "read_file" => Ty::Prim("String"),
-        "try_read_file" => Ty::Result(Box::new(Ty::Prim("String"))),
+        // NOTE the tag-1 wart (docs/error-payloads.md §6): the intrinsics hard-code
+        // error tag 1 at emission, which ALIASES the first user-declared error
+        // name. The set name here is `IoError` so inclusion checking works; the
+        // tag itself must be fixed before `match e` extraction lands.
+        "try_read_file" => Ty::Result(Box::new(Ty::Prim("String")), vec!["IoError".to_string()]),
         "write_file" | "file_exists" | "remove_file" => Ty::Prim("bool"),
         // The self-hosted driver's plumbing: drive gcc, print diagnostics to stderr.
         "run_command" => Ty::Prim("i32"),
@@ -3889,7 +3973,7 @@ pub(crate) fn unify_tp(param: &Ty, actual: &Ty, tps: &HashSet<String>, subst: &m
             }
         }
         (Ty::Ptr { inner: i1, .. }, Ty::Ptr { inner: i2, .. }) => unify_tp(i1, i2, tps, subst),
-        (Ty::Result(o1), Ty::Result(o2)) => unify_tp(o1, o2, tps, subst),
+        (Ty::Result(o1, _), Ty::Result(o2, _)) => unify_tp(o1, o2, tps, subst),
         (Ty::Slice(e1), Ty::Slice(e2)) => unify_tp(e1, e2, tps, subst),
         (Ty::GenRef(e1), Ty::GenRef(e2)) => unify_tp(e1, e2, tps, subst),
         (Ty::RegionRef(e1), Ty::RegionRef(e2)) => unify_tp(e1, e2, tps, subst),
@@ -3910,12 +3994,24 @@ fn parse_int_literal_usize(text: &str) -> Option<usize> {
     }
 }
 
+/// A declared error set's names — sorted and deduped, so equality between two
+/// mentions of one callee's set is order-independent and the rendered
+/// diagnostics are deterministic.
+fn errs_of(es: &Option<crate::ast::ErrorSet>) -> Option<Vec<String>> {
+    es.as_ref().map(|e| {
+        let mut v: Vec<String> = e.names.iter().map(|n| n.name.clone()).collect();
+        v.sort();
+        v.dedup();
+        v
+    })
+}
+
 /// Substitute type parameters (`Ty::Opaque(name)`) throughout a type.
 fn subst_ty(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
     match ty {
         Ty::Opaque(n) => subst.get(n).cloned().unwrap_or_else(|| ty.clone()),
         Ty::Ptr { mutbl, inner } => Ty::Ptr { mutbl: *mutbl, inner: Box::new(subst_ty(inner, subst)) },
-        Ty::Result(ok) => Ty::Result(Box::new(subst_ty(ok, subst))),
+        Ty::Result(ok, errs) => Ty::Result(Box::new(subst_ty(ok, subst)), errs.clone()),
         Ty::GenStruct { ctor, args } => Ty::GenStruct {
             ctor: ctor.clone(),
             args: args.iter().map(|a| subst_ty(a, subst)).collect(),
@@ -3958,6 +4054,127 @@ mod tests {
         let (ast, pd) = Parser::new(src, tokens).parse();
         assert!(pd.is_empty(), "parse: {:?}", pd);
         check(&ast)
+    }
+
+    // --- error-set soundness (error-payloads E2; docs/error-payloads.md §6) ---
+
+    /// `err(E)` must name an error in the enclosing declared set. Strict from day
+    /// one because the E1 census measured ZERO corpus violations.
+    #[test]
+    fn err_outside_the_declared_set_is_refused() {
+        let (_, d) = analyze(
+            "fn f(b: i32) -> i32 !{ Io, Parse } { \
+               if b == 0 { return err(Missing) } \
+               return ok(b) }",
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            d[0].message.contains("`Missing` is not in the enclosing declared error set { Io, Parse }"),
+            "{:?}",
+            d[0].message
+        );
+        // The in-set spelling is clean.
+        let (_, d) = analyze(
+            "fn f(b: i32) -> i32 !{ Io, Parse } { \
+               if b == 0 { return err(Parse) } \
+               return ok(b) }",
+        );
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    /// `?` propagates the callee's set, so the enclosing set must include it —
+    /// and the set rides `Ty::Result`, so a STORED result (`let r = f() … r?`)
+    /// still knows its origin's set. That flow is what E1's syntactic census
+    /// could not check (it counted a stored base as unresolved); this is the
+    /// typed version doing strictly more.
+    #[test]
+    fn try_propagation_needs_set_inclusion_even_through_a_binding() {
+        let (_, d) = analyze(
+            "fn inner(a: i32) -> i32 !{ Io } { return ok(a) } \
+             fn narrow(a: i32) -> i32 !{ Parse } { let r = inner(a) let v = r? return ok(v) }",
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            d[0].message
+                .contains("propagates { Io }, which the enclosing error set { Parse } does not declare"),
+            "{:?}",
+            d[0].message
+        );
+        // A subset propagates clean, also through the binding.
+        let (_, d) = analyze(
+            "fn inner(a: i32) -> i32 !{ Io } { return ok(a) } \
+             fn wide(a: i32) -> i32 !{ Io, Parse } { let r = inner(a) let v = r? return ok(v) }",
+        );
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    /// `catch |e| return e` is `?` spelled out — the rethrow form owes exactly
+    /// the same inclusion obligation; a recovering `catch` consumes the error
+    /// and owes nothing.
+    #[test]
+    fn the_rethrow_form_owes_inclusion_and_a_recovering_catch_does_not() {
+        let (_, d) = analyze(
+            "fn inner(a: i32) -> i32 !{ Io } { return ok(a) } \
+             fn outer(a: i32) -> i32 !{ Parse } { \
+               let v: i32 = inner(a) catch |e| return e return ok(v) }",
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].message.contains("propagates { Io }"), "{:?}", d[0].message);
+        // Recovery consumes: no set obligation, even in an INFALLIBLE fn.
+        let (_, d) = analyze(
+            "fn inner(a: i32) -> i32 !{ Io } { return ok(a) } \
+             fn f(a: i32) -> i32 { let v: i32 = inner(a) catch 0 return v }",
+        );
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    /// A struct method's declared set participates exactly as a free function's
+    /// — on both sides of the obligation (the method as callee, the method body
+    /// as encloser).
+    #[test]
+    fn method_sets_participate_on_both_sides() {
+        let (_, d) = analyze(
+            "struct A { n: i32 \
+               fn get(read self) -> i32 !{ Empty } { \
+                 if self.n == 0 { return err(Empty) } \
+                 return ok(self.n) } } \
+             fn f(read a: A) -> i32 !{ Io } { let v = a.get()? return ok(v) }",
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            d[0].message.contains("propagates { Empty }"),
+            "{:?}",
+            d[0].message
+        );
+    }
+
+    /// A user enum variant named `err` (the corpus's `Result(T, E)`) shadows the
+    /// error constructor — its constructions carry no membership obligation. The
+    /// E1 census learned this the hard way (16 false violations in core.jtr).
+    #[test]
+    fn a_user_err_variant_shadows_the_error_constructor_here_too() {
+        let (_, d) = analyze(
+            "enum R(T, E) { okv(v: T), err(e: E) } \
+             fn f(a: i32) -> i32 !{ Io } { \
+               let r = err(a) \
+               return ok(a) }",
+        );
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    /// The fallible intrinsics carry the `IoError` set, so propagating one out
+    /// demands `IoError` in the enclosing declaration like any other name.
+    #[test]
+    fn intrinsic_propagation_demands_ioerror() {
+        let (_, d) = analyze(
+            "fn f(p: str) -> i32 !{ Parse } { let t = try_read_file(p)? return ok(1) }",
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].message.contains("propagates { IoError }"), "{:?}", d[0].message);
+        let (_, d) = analyze(
+            "fn f(p: str) -> i32 !{ IoError } { let t = try_read_file(p)? return ok(1) }",
+        );
+        assert!(d.is_empty(), "{d:?}");
     }
 
     /// Like [`analyze`] but keeps the AST too, so a test can locate a specific

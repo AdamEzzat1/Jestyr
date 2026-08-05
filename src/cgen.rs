@@ -1422,7 +1422,7 @@ impl<'a> Cgen<'a> {
                 }
             }
             Ty::Ptr { inner, .. } => self.collect_gen_struct(inner, seen, order),
-            Ty::Result(ok) => self.collect_gen_struct(ok, seen, order),
+            Ty::Result(ok, _) => self.collect_gen_struct(ok, seen, order),
             _ => {}
         }
     }
@@ -1704,7 +1704,7 @@ impl<'a> Cgen<'a> {
             | Ty::Slice(inner)
             | Ty::GenRef(inner)
             | Ty::RegionRef(inner)
-            | Ty::Result(inner) => Self::is_concrete(inner),
+            | Ty::Result(inner, _) => Self::is_concrete(inner),
             Ty::GenStruct { args, .. } | Ty::GenEnum { args, .. } => {
                 args.iter().all(Self::is_concrete)
             }
@@ -1762,7 +1762,7 @@ impl<'a> Cgen<'a> {
             | Ty::Slice(inner)
             | Ty::GenRef(inner)
             | Ty::RegionRef(inner)
-            | Ty::Result(inner) => self.collect_gen_enum(inner, seen, order),
+            | Ty::Result(inner, _) => self.collect_gen_enum(inner, seen, order),
             Ty::Fn { params, ret, .. } => {
                 for (_, t) in params {
                     self.collect_gen_enum(t, seen, order);
@@ -4876,13 +4876,13 @@ impl<'a> Cgen<'a> {
                 if let Some(b) = binder {
                     let bname = b.name.clone();
                     let okty = match &bt {
-                        Ty::Result(ok) => self.c_type(ok),
+                        Ty::Result(ok, _) => self.c_type(ok),
                         _ => "int".to_string(),
                     };
                     let fb = self.emit_expr(*fallback);
                     let val = format!("_cv{}", self.tmp);
                     self.tmp += 1;
-                    if matches!(bt, Ty::Result(ref ok) if **ok == Ty::Unit) {
+                    if matches!(bt, Ty::Result(ref ok, _) if **ok == Ty::Unit) {
                         return format!(
                             "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) {{ const int j_{bname} = {tmp}.err; (void)j_{bname}; {fb}; }} }})"
                         );
@@ -4896,7 +4896,7 @@ impl<'a> Cgen<'a> {
                 // read twice below (`.is_err` and `.ok`), and a call in base position
                 // would otherwise run twice.
                 let fb = self.emit_expr(*fallback);
-                if matches!(bt, Ty::Result(ref ok) if **ok == Ty::Unit) {
+                if matches!(bt, Ty::Result(ref ok, _) if **ok == Ty::Unit) {
                     // A `!E`-only result carries no `ok` member to read, so the value
                     // is the fallback or nothing at all.
                     return format!("({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) {{ {fb}; }} }})");
@@ -8118,7 +8118,7 @@ impl<'a> Cgen<'a> {
                     None => "int".to_string(),
                 }
             }
-            Ty::Result(ok) => self.result_c_name(ok),
+            Ty::Result(ok, _) => self.result_c_name(ok),
             Ty::GenStruct { ctor, args } => self.gen_struct_c_name(ctor, args),
             Ty::GenEnum { ctor, args } => {
                 // A niche-able instance is its bare pointer; else the tagged union.
@@ -8849,7 +8849,7 @@ impl<'a> Cgen<'a> {
                 let a: Vec<String> = args.iter().map(|t| self.ty_mangle(t)).collect();
                 format!("{ctor}__{}", a.join("_"))
             }
-            Ty::Result(ok) => format!("result_{}", self.ty_mangle(ok)),
+            Ty::Result(ok, _) => format!("result_{}", self.ty_mangle(ok)),
             Ty::Slice(elem) => format!("slice_{}", self.ty_mangle(elem)),
             Ty::Array { elem, len } => format!("arr_{}_{len}", self.ty_mangle(elem)),
             Ty::GenRef(elem) => format!("ref_{}", self.ty_mangle(elem)),
@@ -9270,7 +9270,7 @@ fn apply_subst(t: &Ty, subst: &HashMap<String, Ty>) -> Ty {
         Ty::Ptr { mutbl, inner } => {
             Ty::Ptr { mutbl: *mutbl, inner: Box::new(apply_subst(inner, subst)) }
         }
-        Ty::Result(ok) => Ty::Result(Box::new(apply_subst(ok, subst))),
+        Ty::Result(ok, errs) => Ty::Result(Box::new(apply_subst(ok, subst)), errs.clone()),
         Ty::GenStruct { ctor, args } => {
             Ty::GenStruct { ctor: ctor.clone(), args: args.iter().map(|a| apply_subst(a, subst)).collect() }
         }

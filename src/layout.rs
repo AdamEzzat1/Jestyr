@@ -212,7 +212,7 @@ pub fn layout_of(info: &TypeInfo, m: &Model, ty: &Ty) -> Option<Layout> {
         }
         Ty::Named(i) => named_layout(info, m, *i)?,
         // A `T !E` result carries an ok-value, a tag and an error code.
-        Ty::Result(inner) => {
+        Ty::Result(inner, _) => {
             let ok = layout_of(info, m, inner)?;
             aggregate(&[Layout::scalar(1), ok, Layout::scalar(4)]).0
         }

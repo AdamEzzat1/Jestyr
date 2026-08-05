@@ -212,18 +212,29 @@ lands, sets get teeth, in the census-then-enforce shape the unsafe ladder proved
      Unobservable today; observable the day `match e` lands. E3/E4 must either
      reserve tag space for intrinsic errors or give `IoError` a real entry in
      `error_tags`.
-2. **Typed sets.** `Ty::Result(ok)` grows the set: `Ty::Result(ok, errs)` where
-   `errs` is the sorted name list. **The display does NOT change** — `display()`
-   keeps rendering what it renders today, because the P3 typeck golden compares
-   type *renderings* across the whole corpus against the port, and rendering the set
-   would diff every fallible expression until typeck.jtr mirrors it. Carry the set,
-   don't show it; the port mirrors the *carrying* when the payload corpus file lands,
-   and rendering can be revisited (both sides at once) later. Set propagation rules:
-   a call's result carries the callee's declared set; `?`/`catch` consume it;
-   a `let` binding carries it through.
-3. **Enforcement.** The census checks become diagnostics: `err` ∈ set, `?` inclusion
-   (callee ⊆ caller), and — once `match e` exists — exhaustiveness over the base's
-   set. Inclusion is by name; D1 already guarantees name ⇒ payload agreement.
+2. **Typed sets.** ✅ **DONE (with step 3 in one increment)** — `Ty::Result(ok)`
+   became `Ty::Result(ok, errs)` (`errs`: the sorted, deduped name list), threaded
+   through `FnSig` (`fallible: bool` → `errs: Option<Vec<String>>`, one source of
+   truth), every call path (free, generic free-method, struct/factory method,
+   module-qualified), the intrinsics (`try_read_file`/`try_from_utf8` carry
+   `{ IoError }`), unify (oks only — sets never constrain inference) and both
+   subst functions (preserved). **The display did NOT change** — `display()` still
+   renders `T!`, because the P3 typeck golden compares type *renderings* against
+   the port corpus-wide; carry the set, don't show it. Verified, not argued: the
+   P3 golden ran green with the set carried, along with every other
+   `matches_reference` golden — zero recorded-type drift, zero emission drift.
+3. **Enforcement.** ✅ **DONE** — strict from day one, as the census licensed:
+   `err(E)` membership (checked in the Call arm AFTER variant resolution, so the
+   corpus's `Result(T, E) { ok, err }` variant still shadows the constructor);
+   `?` inclusion via `check_propagation` at the Try arm — **through bindings**,
+   which the syntactic census could not do (`let r = f() … r?` knows its origin's
+   set because the set rides the type); and the rethrow `catch |e| return e`
+   sharing the same helper. When the enclosing fn declares no set, nothing is
+   reported (that is `?`-outside-fallible's own diagnostic; no double-reporting).
+   Exhaustiveness over the base's set arrives with `match e` (E4). Six unit
+   tests; 894 default green. What E2 deliberately did NOT do: type `err(…)`/
+   `ok(…)` calls (they stay `Unknown`, exactly as before — an arm that adds a
+   diagnostic but never a type is what keeps the P3 golden still).
 
 **On set inference — a recorded tension with the design doc, resolved here.** Design
 §6.2 says sets "*infer and compose — you rarely write them out*". As implemented, a
@@ -295,7 +306,7 @@ caller matches on it), a parameter's or a static's is fine. Concretely:
 | # | Increment | Emission change? | Port mirror due? |
 |---|---|---|---|
 | E1 | ✅ Set census (`jestyrc errsets`) + the corpus audit — **zero violations, enforcement needs no migration** | none | no |
-| E2 | Typed sets (`Ty::Result(ok, errs)`, display unchanged) + `err`∈set and `?`-inclusion diagnostics | none | not until a corpus file needs the set (E4) — display-dodge holds the P3 golden still |
+| E2 | ✅ Typed sets (`Ty::Result(ok, errs)`, display unchanged) + strict `err`∈set and `?`-inclusion diagnostics — **all goldens green, zero drift** | none | not until a corpus file needs the set (E4) — display-dodge holds the P3 golden still |
 | E3 | Payload declaration/creation/propagation, reference side: parser (`Name(T)` in sets), D1 agreement check, the gated union + `.pay` emission, `err(Name(v))`, blind-copy hops, escape arms | **yes, gated on use** — zero corpus files use it, so all goldens stay green | not yet (the standing trigger: no corpus file until the mirror) |
 | E4 | `catch |e| match e { … }` + exhaustiveness, reference side | gated on use | not yet |
 | E5 | **The port mirror + the first corpus file** (`examples/error_payload.jtr`): parser.jtr / typeck.jtr (side-arena sets) / cgen.jtr / escape.jtr arms, attest+doc renderers, corpus 147, `REFRESH_SEED=1` | the corpus file's own C | **yes — all of it, one increment**, as `catch`'s mirror landed |

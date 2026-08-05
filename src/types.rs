@@ -51,8 +51,14 @@ pub enum Ty {
     Named(usize),
     /// An unresolved-but-named type or a generic type parameter. Non-`Copy`.
     Opaque(String),
-    /// A fallible result `T !E` — carries the *ok* type `T`. Non-`Copy`.
-    Result(Box<Ty>),
+    /// A fallible result `T !E` — carries the *ok* type `T` and the callee's
+    /// declared error-set names (sorted, so two mentions of one callee compare
+    /// equal). The set is CARRIED, NOT DISPLAYED: `display` renders `T!` exactly
+    /// as before, because the P3 typeck golden compares renderings against the
+    /// port corpus-wide — the set becomes visible only through the soundness
+    /// diagnostics (`err` membership, `?` inclusion; error-payloads E2,
+    /// `docs/error-payloads.md` §6). Non-`Copy`.
+    Result(Box<Ty>, Vec<String>),
     /// An applied generic struct, e.g. `List(i32)`. Non-`Copy`.
     GenStruct { ctor: String, args: Vec<Ty> },
     /// An applied generic enum, e.g. `Option(i32)`. Non-`Copy` (unless a niche
@@ -100,7 +106,7 @@ impl Ty {
             Ty::Ptr { .. } => true, // raw pointers are Copy
             Ty::Named(i) => tbl.types.get(*i).map(|t| t.is_copy).unwrap_or(false),
             Ty::Opaque(_) => false, // generic/external: assume non-Copy (conservative & correct generically)
-            Ty::Result(_) => false,
+            Ty::Result(..) => false,
             Ty::GenStruct { .. } => false,
             Ty::GenEnum { .. } => false,
             Ty::Slice(_) => false,
@@ -131,7 +137,7 @@ impl Ty {
             }
             Ty::Named(i) => tbl.types.get(*i).map(|t| t.name.clone()).unwrap_or_else(|| "?".to_string()),
             Ty::Opaque(n) => n.clone(),
-            Ty::Result(ok) => format!("{}!", ok.display(tbl)),
+            Ty::Result(ok, _) => format!("{}!", ok.display(tbl)),
             Ty::GenStruct { ctor, args } | Ty::GenEnum { ctor, args } => {
                 let a: Vec<String> = args.iter().map(|t| t.display(tbl)).collect();
                 format!("{ctor}({})", a.join(", "))
@@ -234,8 +240,10 @@ pub struct FnSig {
     pub ret: Ty,
     #[allow(dead_code)] // read once callers check returned-borrow lifetimes
     pub ret_conv: Conv,
-    /// True if the function declares an error set (`!{ … }`).
-    pub fallible: bool,
+    /// The declared error set (`!{ … }`): `Some(names)` for a fallible function
+    /// (sorted, deduped), `None` for an infallible one. The names feed the
+    /// soundness diagnostics and ride into `Ty::Result` at every call.
+    pub errs: Option<Vec<String>>,
 }
 
 /// A declared `trait`: the set of its method names, each flagged required (no
