@@ -1,20 +1,43 @@
 # Jestyr — next-frontier handoff (post-self-hosting): G/L/Q
 
-## ▶ START HERE — state of `master`, and the next move
+## ▶ START HERE — state of `master` (`fddf02a`), and the next move
 
-**All three Group-3 workstreams are now complete.** G (CTFE, tiers 0–7, both sides),
-L (layout: report → `@layout(auto)` → comptime `@size_of` → `@abi(ref)`), and Q (SIMD
-lowering, both sides, lane width pinned in the cross-OS canary). The place-lowering
-defect class (`xs[i].f = v`, `m[i][j]`, `mut`/`out` receivers) is closed by X1/X2.
+**Every ladder this note ever tracked is CLOSED.** Group 3 (G CTFE tiers 0–7, L layout,
+Q SIMD — all both sides), the place-lowering defect class (X1/X2), and the entire V1
+tier list: transitive `@no_alloc`, diagnostic JSON, suggested rewrites, the `@verified`
+planning slice, the **whole error ladder** (sets → `?` → `catch` → `catch |e|` → debug
+traces → **fallible methods**, each on both sides, corpus 146), and the **whole unsafe
+ladder** (report → contract → migration → warning → **compile error** on both
+toolchains).
 
-**Gate status on `master`:** 856 default tests green, warning-clean; all three cgen
-goldens; `selfhost_fixpoint_full`; `jestyr_driver_builds_itself`; seed current.
+**Gate status on `master`:** 876 default tests green, warning-clean; P5 corpus (146
+byte-identical) + concat + test-mode; P2/P3/P4 goldens; `selfhost_fixpoint_full`;
+`jestyr_driver_builds_itself`; seed current.
 
-**The frontier is no longer Group 3 — it is the V1 tier ladders** (§ "What is genuinely
-still open"). **Five of those have now closed**: transitive `@no_alloc`, diagnostic JSON,
-`catch` (reference side), suggested rewrites, and the `@verified` planning slice.
+**What remains is post-v1-shaped — design items, not gaps.** In rough value order:
 
-**What to pick up next, in order:**
+1. **Richer error payloads.** Today an error is an integer tag; the design wants
+   payload-carrying errors. This is a *language design* item first (surface syntax,
+   result-struct layout, `catch |e|` binding semantics) — start with a written design
+   note, not code. Touches: parser/typeck/cgen on both sides + the seed.
+2. **Error sets in TRAIT signatures** — unlocks fallible trait-impl methods, which are
+   currently refused at check time with the reason (calls are typed by the trait's
+   signature, which cannot declare an error set). The refusal sites to lift are marked:
+   `typeck.rs` (the impl-registration loop) and `emit_impl_method_decl`'s backstop.
+3. **The `#line` port + module-loader unification.** The module-path golden
+   (`jestyr_module_cgen_matches_reference_except_line_directives`) pins THREE
+   divergences, all from the two loaders producing different merged buffers: `#line`
+   directives (reference-only), per-type artifact order, and offset-derived spawn
+   symbol names (constant 78-byte skew). Unify the loaders first (that fixes 2 and 3),
+   then port `mark_line`, then tighten the golden in its three recorded steps.
+4. **Errors in more positions** (error-set syntax beyond `fn` returns) — smallest.
+
+**Standing rules that don't expire:** the two-sided tax (any emitted-C change needs the
+port mirror + corpus + REFRESH_SEED in the same increment); check `master` before
+building anything; the `.jtr` subset traps listed in §0 — including `fn take(…)` in a
+fixture (a conveyance keyword; its 14-diagnostic cascade has now cost TWO sessions).
+
+**What closed most recently** (details in the items below and `docs/error-handling.md`):
 
 1. ~~**The `catch` port mirror**~~ — **DONE** *(this session)*: both sides, corpus
    **145** (`examples/error_catch.jtr`), seed refreshed. See item 1 below for the
@@ -63,6 +86,25 @@ still open"). **Five of those have now closed**: transitive `@no_alloc`, diagnos
    bypassed `set()`, so a `catch` node's recorded type stayed `Unknown` while the port
    recorded faithfully. The rare divergence where the port was right; the rule it
    yields: **no early `return` in an `infer` arm — every exit goes through `set`**.
+5. **Fallible METHODS, both sides** (`fddf02a`, corpus **146** —
+   `examples/method_errors.jtr`): a struct method's `-> T !{ E }` returns its tagged
+   result; a generic struct's method gets one result typedef per instantiation,
+   lowered through the instance's substitution; `cur_result`/`res_ok` set during the
+   body is all `ok`/`err`/`?` ever consult. Fallible **trait-impl** methods are a
+   check-time error with the reason (see open item 2 above). **The mirror's finding,
+   worth more than the feature:** the reference's `method_instances` is ONE LIFO
+   worklist for plain and generic methods alike — three plain methods called
+   `first/second/third` emit `third/second/first` — and the port's flat first-seen
+   scan of plain methods was a **latent order divergence** that passed the golden for
+   the project's whole life because no corpus file ever had two plain-method
+   instances. Plain methods now ride the same worklist as generic ones (argc-0
+   records whose trailing slot holds the STRUCT item; `arm_gmi_su`'s argc-0 guard
+   matters — a struct item's `(a, b)` are member-array coordinates, and reading them
+   as param 7-tuples indexes the arena with garbage). The whole corpus stayed
+   byte-identical under the rerouting. Port helpers worth knowing:
+   `push_su_result_mangle` (subst-aware ok-type mangle, shared by signature and
+   typedef scan so they cannot disagree) and `emit_result_name_plain` (the no-subst
+   form for sig emitters without a Checker in scope).
 
 **Do NOT start an SMT backend.** The planning slice measured it: **7 declared
 obligations across 144 corpus files**, so a solver would have nothing to discharge. The
