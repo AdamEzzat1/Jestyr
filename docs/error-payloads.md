@@ -308,7 +308,7 @@ caller matches on it), a parameter's or a static's is fine. Concretely:
 | E1 | ✅ Set census (`jestyrc errsets`) + the corpus audit — **zero violations, enforcement needs no migration** | none | no |
 | E2 | ✅ Typed sets (`Ty::Result(ok, errs)`, display unchanged) + strict `err`∈set and `?`-inclusion diagnostics — **all goldens green, zero drift** | none | not until a corpus file needs the set (E4) — display-dodge holds the P3 golden still |
 | E3 | ✅ Payload declaration/creation/propagation, reference side: parser (`Name(T)` in sets), D1 agreement check, the gated union + `.pay` emission, `err(Name(v))`, blind-copy hops, escape arms — **all landed; corpus/concat/test-mode/fixpoint/seed all byte-identical, so the gate held** | **yes, gated on use** — zero corpus files use it, so all goldens stay green | not yet (the standing trigger: no corpus file until the mirror) |
-| E4 | `catch |e| match e { … }` + exhaustiveness, reference side | gated on use | not yet |
+| E4 | ✅ `catch |e| match e { … }` + exhaustiveness, reference side — **landed with the tag-1 wart fix (intrinsics emit the user tag when the name is declared, literal 1 otherwise — corpus-invisible, discrimination proven by running); the extractor is INLINE-ONLY (the match must be the immediate fallback over the binder), which put the static set in hand with zero new type plumbing** | gated on use | not yet |
 | E5 | **The port mirror + the first corpus file** (`examples/error_payload.jtr`): parser.jtr / typeck.jtr (side-arena sets) / cgen.jtr / escape.jtr arms, attest+doc renderers, corpus 147, `REFRESH_SEED=1` | the corpus file's own C | **yes — all of it, one increment**, as `catch`'s mirror landed |
 | E6+ | Trait error sets; named sets; owning payloads (drop design first) | later | later |
 
@@ -339,6 +339,35 @@ caller matches on it), a parameter's or a static's is fine. Concretely:
 * **Behavioral inertness is pinned by running**: the c-oracle test proves the
   gated C compiles under the locked flags and that every observable answer equals
   the tag-only world's — payloads ride along; nothing changes until E4 reads them.
+
+**What E4's landing taught (recorded for E5):**
+
+* **Inline-only was the load-bearing simplification.** The match must be the
+  *immediate fallback over the binder itself* — that one syntactic rule put the
+  base's static set (on `Ty::Result` since E2) directly in hand at the Catch
+  arm, so the binder's type never carries a set, no new `Ty` variant exists, and
+  the P3 display question never arises. A detached `match` on an error-typed
+  value stays refused by ordinary typing (the scrutinee is the opaque `error`).
+* **The patterns cost zero parser work.** `PatKind::Ident` / `Variant` /
+  `Wildcard` already parse `Empty` / `TooBig(n)` / `_`; the whole increment is
+  typeck + cgen. E5's port mirror inherits the same fact — parser.jtr's pattern
+  arena needs nothing new.
+* **The wart fix is two halves that must never split**: intrinsic constructions
+  emit `error_tags.get(name).unwrap_or(1)` and match arms look tags up through
+  the same fallback (`err_name_tag`) — origin and arm agree by construction.
+  Corpus-invisible because `IoError` is declared first (tag 1) or not at all in
+  every existing program; `try_from_utf8`'s carried set name was also corrected
+  (`IoError` → `Utf8Error`, safe: nothing in the corpus propagates it).
+* **The last arm lowers unconditionally** (`else`, no tag test): typeck proved
+  exhaustiveness, so C gets a totally-assigned result variable with no dead
+  branch. If cgen ever runs on an ill-typed match (the ungated `jc` dump mode),
+  the output is diagnosed garbage, which is that mode's contract already.
+* **Arm bodies are single expressions** — the same value-position block rule
+  every `catch` fallback has (Q-S2d's principled refusal: spilling a
+  multi-statement block into value position needs drop safety). Lifting it for
+  match arms and catch fallbacks together is one future increment, not two.
+* **Guards are refused on error arms** (they would break exhaustiveness
+  accounting); revisit only with the enum-match machinery's guarded-arm rules.
 
 Test plan highlights (beyond the standing gate): a run-based two-hop propagation test
 that matches at the top and prints the payload (proves the blind union copy end to

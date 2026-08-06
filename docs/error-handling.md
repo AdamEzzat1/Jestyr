@@ -151,6 +151,46 @@ arm's early `return`s bypassed `set()`, so a `catch`-expression's recorded type 
 `Unknown` while the port recorded it faithfully — the rare divergence where the port
 was right and the reference was wrong.
 
+## Extracting a payload — `catch |e| match e { … }`
+
+Error names can carry a value (`docs/error-payloads.md`): `!{ Empty, TooBig(i64),
+BadKey(str) }` declares `TooBig` with an `i64` payload, `err(TooBig(n))` creates
+it, every `?` hop copies it blind — and **`match` on the bound error is the one
+way to read it back**:
+
+```jestyr
+let v = hop(n) catch |e| match e {
+    Empty      => 0 - 1,
+    TooBig(v)  => v,               // the payload, with its declared type
+    BadKey(m)  => (m.len as i64),  // a str payload is a str
+}
+```
+
+* **The match must be the immediate fallback over the binder itself.** That shape
+  is what puts the base's *static* error set in hand for exhaustiveness — the
+  binder stays the opaque `error` everywhere else, and no payload accessor exists
+  outside a match arm.
+* **Exhaustive over the static set** (which the type system carries since the
+  sets-become-sound increment): a missing name is a compile error listing what is
+  uncovered; `_` covers the rest. An arm naming an error outside the set, a
+  duplicate arm, an arm after `_`, and a guard are each refused with the reason.
+* **A bare arm on a payload carrier is legal** (`TooBig => 7` ignores the value);
+  binding a payload on a bare name is not — there is nothing to bind.
+* Arm bodies are fallback values: typed against the ok type, one expression each
+  (the same value-position rule every `catch` fallback has).
+* Lowering: an if-chain on the result's tag inside the error branch, the payload
+  bound as a typed `const` from its union member, and the last arm emitted
+  unconditionally — exhaustiveness is proven at check time, so C gets a
+  totally-assigned result with no dead final branch.
+
+**The intrinsic tag wart is fixed as part of this.** `try_read_file` /
+`try_from_utf8` used to hard-code error tag 1, which aliased the first
+user-declared error name. Both now construct with the *user* tag whenever the
+program declares `IoError` / `Utf8Error` (falling back to the historical 1, so
+every existing program is byte-identical), and a match arm looks the tag up the
+same way — origin and arm can never disagree. `match e { Parse => …, IoError => … }`
+over a propagated `try_read_file` failure picks the right arm, proven by running.
+
 ## Fallible methods — both sides
 
 A struct method declares an error set exactly as a free function does, and every

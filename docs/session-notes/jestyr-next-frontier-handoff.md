@@ -29,12 +29,27 @@ byte-identical) + concat + test-mode; P2/P3/P4 goldens; `selfhost_fixpoint_full`
    declared-member initializer and `{0}` for bare names, blind-copy `?`/rethrow
    hops, intrinsic err sites zeroing pay, and the escape arm (`err(Name(p))`
    walks `p` in RETURN position — the region rules fire verbatim, zero new
-   diagnostics). Full gate re-run green: corpus/concat/test-mode byte-identical,
-   fixpoint + self-build + seed current. **Next is E4: `catch |e| match e { … }`**
-   — the extractor, exhaustive over the base's static set (E2 carries it), with
-   the intrinsic tag-1 wart (note §6) to resolve before match can discriminate
-   IoError. Then E5: the port mirror + first corpus file + seed, one increment —
-   the P2 dump note in `error-payloads.md` §10 lists what both dumps must grow.
+   diagnostics). **E4 is DONE too: `catch |e| match e { … }` extracts payloads**
+   — INLINE-ONLY (the match must be the immediate fallback over the binder,
+   which puts E2's static set in hand with zero new type plumbing), exhaustive
+   with `_` as catch-all, bare arms legal on carriers, guards/duplicates/
+   post-wildcard arms refused with reasons, lowered to a tag if-chain whose
+   last arm is unconditional. **The intrinsic tag-1 wart is FIXED** as its two
+   inseparable halves: constructions and arms both resolve through the user tag
+   with fallback 1 (`intrinsic_err_tag`/`err_name_tag`) — corpus-invisible, and
+   discrimination is proven by running (`Parse` first, `IoError` second, the
+   intrinsic failure picks the IoError arm). `try_from_utf8`'s set name was
+   corrected to `Utf8Error`. Patterns cost zero parser work (`PatKind` already
+   covers all three arm shapes — E5's port parser needs nothing new). Full gate
+   green: 909 default warning-clean, corpus/concat/test-mode byte-identical,
+   fixpoint + self-build + seed current. **Next is E5: the port mirror + the
+   first payload corpus file + seed refresh, one increment** — parser.jtr
+   (payload type in the error-set parse + the P2 dump growth on BOTH sides, see
+   note §10), typeck.jtr (payload map, D1, err-arm checks, the inline match),
+   cgen.jtr (union, pay field/init/copies, `emit_err_match`, both wart-fix
+   halves), escape.jtr (the return-position payload arm), then corpus 147 +
+   REFRESH_SEED. Arm bodies are single expressions (the standing catch-fallback
+   rule); lifting that for arms + fallbacks together is one later increment.
 2. **Error sets in TRAIT signatures** — unlocks fallible trait-impl methods, which are
    currently refused at check time with the reason (calls are typed by the trait's
    signature, which cannot declare an error set). The refusal sites to lift are marked:

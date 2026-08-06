@@ -4909,6 +4909,20 @@ impl<'a> Cgen<'a> {
                         Ty::Result(ok, _) => self.c_type(ok),
                         _ => "int".to_string(),
                     };
+                    // `catch |e| match e { … }` — the payload extractor (E4). The
+                    // match must be the immediate fallback over the binder itself
+                    // (typeck enforces the same shape), and it lowers to an
+                    // if-chain on the tag with per-arm payload binders.
+                    if let ExprKind::Match { scrut, arms } = &self.ast.expr_at(*fallback).kind {
+                        if matches!(&self.ast.expr_at(*scrut).kind,
+                                    ExprKind::Name(n) if n.name == bname)
+                        {
+                            let arms = arms.clone();
+                            return self.emit_err_match(
+                                &bname, &arms, &bt, &base_c, &res_ty, &tmp, &okty,
+                            );
+                        }
+                    }
                     let fb = self.emit_expr(*fallback);
                     let val = format!("_cv{}", self.tmp);
                     self.tmp += 1;
@@ -5269,10 +5283,11 @@ impl<'a> Cgen<'a> {
                     let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
                     let rname = self.result_c_name(&Ty::Prim("String"));
                     let payz = self.pay_zero();
+                    let t = self.intrinsic_err_tag("IoError");
                     return format!(
                         "({{ JestyrString _s; bool _ok = jestyr_rt_try_read_file({p}, &_s); \
                          _ok ? ({rname}){{ .is_err = false, .ok = _s }} \
-                             : ({rname}){{ .is_err = true, .err = 1{payz} }}; }})"
+                             : ({rname}){{ .is_err = true, .err = {t}{payz} }}; }})"
                     );
                 }
                 "run_command" => {
@@ -5496,13 +5511,18 @@ impl<'a> Cgen<'a> {
                         let bcty = self.c_type(&bt);
                         let b = self.emit_expr(a);
                         let payz = self.pay_zero();
+                        let t = self.intrinsic_err_tag("Utf8Error");
                         return format!(
                             "({{ {bcty} _u = {b}; jestyr_rt_valid_utf8((const char*)_u.ptr, _u.len) \
                              ? (JestyrResult_str){{ .is_err = false, .ok = (JestyrStr){{ (const char*)_u.ptr, _u.len }} }} \
-                             : (JestyrResult_str){{ .is_err = true, .err = 1{payz} }}; }})"
+                             : (JestyrResult_str){{ .is_err = true, .err = {t}{payz} }}; }})"
                         );
                     }
-                    return format!("(JestyrResult_str){{ .is_err = true, .err = 1{} }}", self.pay_zero());
+                    return format!(
+                        "(JestyrResult_str){{ .is_err = true, .err = {}{} }}",
+                        self.intrinsic_err_tag("Utf8Error"),
+                        self.pay_zero()
+                    );
                 }
                 // An explicit, recoverable UTF-8 check (when you want to branch
                 // rather than trap).
@@ -8812,6 +8832,119 @@ impl<'a> Cgen<'a> {
         }
     }
 
+    /// The error tag an INTRINSIC construction carries (the E4 wart fix): the
+    /// USER tag of the intrinsic's error name when the program declares it, else
+    /// the historical literal 1. This is what lets `match e { IoError => … }`
+    /// discriminate an intrinsic-originated error — and it is byte-invariant for
+    /// every existing program, because a program that never declares the name
+    /// keeps the 1, and a program that does (`fs.jtr`'s `IoError`) declares it
+    /// first, so its tag IS 1.
+    fn intrinsic_err_tag(&self, name: &str) -> i64 {
+        self.error_tags.get(name).copied().unwrap_or(1)
+    }
+
+    /// The tag an error NAME compares against in a `match e` arm: the user tag
+    /// when declared, else the intrinsic literal for the two builtin names — the
+    /// other half of [`Self::intrinsic_err_tag`]'s wart fix, so an arm and its
+    /// origin can never disagree on the number.
+    fn err_name_tag(&self, name: &str) -> i64 {
+        self.error_tags.get(name).copied().unwrap_or(match name {
+            "IoError" | "Utf8Error" => 1,
+            _ => 0,
+        })
+    }
+
+    /// Lower `catch |e| match e { … }` (error-payloads E4): an if-chain on the
+    /// result's tag inside the error branch, each payload arm binding its member
+    /// as a typed `const`, the ok path untouched.
+    ///
+    /// The LAST arm is emitted unconditionally (`else`): typeck has proven the
+    /// match exhaustive, so when every earlier tag test failed the last arm is
+    /// the one that fires — and C sees a totally-assigned result variable with
+    /// no dead final branch. The binder `e` itself stays available in every arm
+    /// body as the usual `const int`.
+    fn emit_err_match(
+        &mut self,
+        bname: &str,
+        arms: &[crate::ast::MatchArm],
+        bt: &Ty,
+        base_c: &str,
+        res_ty: &str,
+        tmp: &str,
+        okty: &str,
+    ) -> String {
+        use crate::ast::PatKind;
+        let unit_ok = matches!(bt, Ty::Result(ok, _) if **ok == Ty::Unit);
+        let val = if unit_ok {
+            String::new()
+        } else {
+            let v = format!("_cv{}", self.tmp);
+            self.tmp += 1;
+            v
+        };
+        // Build the chain in arm order — bodies emitted in that order too, so
+        // temp numbering follows the source (the X1 buffer-first rule).
+        let mut chain = String::new();
+        let last = arms.len().saturating_sub(1);
+        for (i, arm) in arms.iter().enumerate() {
+            // The tag test and the payload binding this arm needs.
+            let (cond, bindstmt) = match &self.ast.pat_at(arm.pat).kind {
+                PatKind::Ident(n) => {
+                    (Some(self.err_name_tag(&n.name)), String::new())
+                }
+                PatKind::Variant { name, subpats } => {
+                    let tag = self.err_name_tag(&name.name);
+                    let bind = match subpats.first().map(|s| &self.ast.pat_at(*s).kind) {
+                        Some(PatKind::Ident(p)) => {
+                            let pc = self
+                                .info
+                                .err_payloads
+                                .get(&name.name)
+                                .cloned()
+                                .map(|t| self.c_type(&t))
+                                .unwrap_or_else(|| "int".to_string());
+                            format!(
+                                "const {pc} j_{} = {tmp}.pay.j_{}; (void)j_{}; ",
+                                p.name, name.name, p.name
+                            )
+                        }
+                        _ => String::new(),
+                    };
+                    (Some(tag), bind)
+                }
+                // `_` (or a malformed pattern typeck already refused).
+                _ => (None, String::new()),
+            };
+            let body_c = self.emit_expr(arm.body);
+            let assign = if unit_ok {
+                format!("{body_c};")
+            } else {
+                format!("{val} = ({body_c});")
+            };
+            let block = format!("{{ {bindstmt}{assign} }}");
+            if i == last || cond.is_none() {
+                if i == 0 {
+                    chain.push_str(&block);
+                } else {
+                    chain.push_str(&format!("else {block}"));
+                }
+                break;
+            }
+            if i > 0 {
+                chain.push_str("else ");
+            }
+            chain.push_str(&format!("if ({tmp}.err == {}) {block} ", cond.unwrap()));
+        }
+        if unit_ok {
+            return format!(
+                "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) {{ const int j_{bname} = {tmp}.err; (void)j_{bname}; {chain} }} }})"
+            );
+        }
+        format!(
+            "({{ {res_ty} {tmp} = {base_c}; {okty} {val}; if ({tmp}.is_err) {{ const int j_{bname} = {tmp}.err; (void)j_{bname}; {chain} }} else {{ {val} = {tmp}.ok; }} {val}; }})"
+        )
+    }
+
     /// The `, .pay = {0}` an INTRINSIC error construction appends when gated —
     /// the intrinsics (`try_read_file`, `try_from_utf8`) construct their errors
     /// inline, and an explicit zero keeps indeterminate bytes out of the blind
@@ -9643,6 +9776,29 @@ mod tests {
         let (c, d) = gen(src);
         assert!(d.is_empty(), "{d:?}");
         assert!(c.contains("typedef union { int32_t j_Small; } JestyrErrPay;"), "{c}");
+    }
+
+    /// The extractor's lowering (E4): an if-chain on the tag inside the error
+    /// branch, the payload bound as a typed `const` from its union member, the
+    /// LAST arm unconditional (typeck proved exhaustiveness, so C gets a
+    /// totally-assigned result with no dead final branch), and the `e` binder
+    /// still present as the usual `const int`.
+    #[test]
+    fn an_error_match_lowers_to_a_tag_chain_with_payload_binders() {
+        let src = "fn f(n: i64) -> i64 !{ Empty, TooBig(i64) } { \
+                     if n == 0 { return err(Empty) } \
+                     if n > 9 { return err(TooBig(n)) } \
+                     return ok(n) } \
+                   fn g(n: i64) -> i64 { \
+                     return f(n) catch |e| match e { Empty => 0 - 1, TooBig(v) => v } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(c.contains("if (_ct0.err == 1) { _cv1 = ((0 - 1)); }"), "the Empty tag test:\n{c}");
+        assert!(
+            c.contains("else { const int64_t j_v = _ct0.pay.j_TooBig; (void)j_v; _cv1 = (j_v); }"),
+            "the last arm is unconditional and binds its member:\n{c}"
+        );
+        assert!(c.contains("const int j_e = _ct0.err; (void)j_e;"), "the binder stays:\n{c}");
     }
 
     /// Like [`gen`], but through [`emit_error_traces`] (`--error-traces`).

@@ -1550,6 +1550,147 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Check the payload extractor `catch |e| match e { … }` (error-payloads E4,
+    /// `docs/error-payloads.md` §5). Arms are error NAMES from the base's static
+    /// set — `Empty` bare, `TooBig(n)` binding the declared payload, `_` as the
+    /// catch-all — and the match must be exhaustive over that set. What is
+    /// deliberately refused, each with its reason in the diagnostic: an arm
+    /// naming an error outside the set (it cannot occur), a bare arm for a
+    /// payload carrier is FINE (the payload is simply ignored) but binding a
+    /// payload on a bare name is not (there is nothing to bind), guards (they
+    /// would break exhaustiveness accounting), non-name patterns (an error is
+    /// not a scalar), duplicate arms, and arms after the wildcard (dead).
+    /// Every arm body is typed against the ok type — each is a fallback value.
+    fn check_err_match(
+        &mut self,
+        scope: &mut Scope,
+        typ: &HashSet<String>,
+        self_ty: &Ty,
+        errs: &[String],
+        ok: &Ty,
+        scrut: ExprId,
+        arms: &[crate::ast::MatchArm],
+    ) {
+        use crate::ast::PatKind;
+        // The scrutinee is the binder name: infer it so its type row records the
+        // opaque `error`, exactly as any other read of the binder would.
+        self.infer(scope, typ, self_ty, scrut);
+        let mut covered: Vec<String> = Vec::new();
+        let mut saw_wild = false;
+        for arm in arms {
+            let pat = self.ast.pat_at(arm.pat);
+            let pspan = pat.span;
+            if saw_wild {
+                self.error(pspan, "unreachable arm: it follows the `_` catch-all");
+            }
+            if let Some(g) = arm.guard {
+                self.error(
+                    self.ast.expr_at(g).span,
+                    "a guard is not supported on an error arm — it would break exhaustiveness accounting",
+                );
+            }
+            // Which name (if any) this arm covers, and the payload binder to push.
+            let mut bind: Option<(String, Ty)> = None;
+            match &pat.kind {
+                PatKind::Wildcard => saw_wild = true,
+                PatKind::Ident(n) => {
+                    if !errs.iter().any(|e| e == &n.name) {
+                        self.error(
+                            pspan,
+                            format!(
+                                "`{}` is not in this expression's error set {{ {} }}",
+                                n.name,
+                                errs.join(", ")
+                            ),
+                        );
+                    } else if covered.contains(&n.name) {
+                        self.error(pspan, format!("duplicate arm for error `{}`", n.name));
+                    } else {
+                        covered.push(n.name.clone());
+                    }
+                }
+                PatKind::Variant { name, subpats } => {
+                    let declared = self.err_payloads.get(&name.name).cloned();
+                    if !errs.iter().any(|e| e == &name.name) {
+                        self.error(
+                            pspan,
+                            format!(
+                                "`{}` is not in this expression's error set {{ {} }}",
+                                name.name,
+                                errs.join(", ")
+                            ),
+                        );
+                    } else if declared.is_none() {
+                        self.error(
+                            pspan,
+                            format!(
+                                "error `{}` carries no payload — match it bare (`{}`)",
+                                name.name, name.name
+                            ),
+                        );
+                    } else if subpats.len() != 1 {
+                        self.error(
+                            pspan,
+                            format!(
+                                "error `{}` carries exactly one payload value, found {} pattern(s)",
+                                name.name,
+                                subpats.len()
+                            ),
+                        );
+                    } else {
+                        if covered.contains(&name.name) {
+                            self.error(pspan, format!("duplicate arm for error `{}`", name.name));
+                        } else {
+                            covered.push(name.name.clone());
+                        }
+                        match &self.ast.pat_at(subpats[0]).kind {
+                            PatKind::Ident(b) => {
+                                bind = Some((b.name.clone(), declared.unwrap()));
+                            }
+                            PatKind::Wildcard => {}
+                            _ => self.error(
+                                self.ast.pat_at(subpats[0]).span,
+                                "a payload pattern is a binding name or `_`",
+                            ),
+                        }
+                    }
+                }
+                _ => self.error(
+                    pspan,
+                    "an error arm is an error name (`Empty`, `TooBig(n)`) or `_` — \
+                     an error is not a scalar to match structurally",
+                ),
+            }
+            // The arm body is a fallback value: typed against the ok type, with
+            // the payload binder (if any) in a scope of its own.
+            scope.push(HashMap::new());
+            if let Some((n, t)) = bind {
+                scope.last_mut().unwrap().insert(n, t);
+            }
+            let prev = self.cur_expected.take();
+            self.cur_expected = Some(ok.clone());
+            self.infer(scope, typ, self_ty, arm.body);
+            self.cur_expected = prev;
+            scope.pop();
+        }
+        if !saw_wild {
+            let missing: Vec<&str> = errs
+                .iter()
+                .filter(|e| !covered.contains(e))
+                .map(String::as_str)
+                .collect();
+            if !missing.is_empty() {
+                self.error(
+                    self.ast.expr_at(scrut).span,
+                    format!(
+                        "this `match` does not cover {{ {} }} — add the arm(s) or a `_` catch-all",
+                        missing.join(", ")
+                    ),
+                );
+            }
+        }
+    }
+
     /// `?`/rethrow inclusion (error-payloads E2): the propagated set must be
     /// included in the enclosing function's declared set. Reported at the
     /// propagation site, naming exactly the names that are missing. When the
@@ -2663,6 +2804,12 @@ impl<'a> TypeChecker<'a> {
                 // Catch node's recorded type `Unknown`, which the P3 typeck golden
                 // caught as a divergence from the port (which records faithfully).
                 let bt = self.infer(scope, typ, self_ty, *base);
+                // The base's static set, kept for the `match e` extractor below
+                // (empty when the base is not a Result — that path errors anyway).
+                let base_errs = match &bt {
+                    Ty::Result(_, errs) => errs.clone(),
+                    _ => Vec::new(),
+                };
                 // The rethrow form (`catch |e| return e`) is `?` spelled out, so
                 // it owes exactly `?`'s inclusion obligation; a recovering
                 // `catch` CONSUMES the error and owes nothing.
@@ -2709,6 +2856,25 @@ impl<'a> TypeChecker<'a> {
                     self.infer(scope, typ, self_ty, *fallback);
                     scope.pop();
                     return self.set(id, ok);
+                }
+                // `catch |e| match e { … }` — THE payload extractor (error-payloads
+                // E4, `docs/error-payloads.md` §5). The match must be the immediate
+                // fallback over the binder itself: that is what puts the base's
+                // STATIC set (E2 carries it on `Ty::Result`) in hand for
+                // exhaustiveness, with no set-through-the-binder-type plumbing —
+                // the binder stays the opaque `error` everywhere else.
+                if let Some(b) = binder {
+                    if let ExprKind::Match { scrut, arms } = &self.ast.expr_at(*fallback).kind {
+                        if matches!(&self.ast.expr_at(*scrut).kind,
+                                    ExprKind::Name(n) if n.name == b.name)
+                        {
+                            let errs = base_errs.clone();
+                            self.check_err_match(scope, typ, self_ty, &errs, &ok, *scrut, arms);
+                            self.set(*fallback, ok.clone());
+                            scope.pop();
+                            return self.set(id, ok);
+                        }
+                    }
                 }
                 // The fallback is inferred **against the ok type** (the `cur_expected`
                 // idiom every other expected-type site uses), so a literal fallback
@@ -3967,7 +4133,10 @@ fn string_intrinsic_ret(name: &str) -> Option<Ty> {
         "cow_view" => Ty::Prim("str"),
         "cow_is_owned" => Ty::Prim("bool"),
         // Recoverable: yields a Result so `is_err`/`unwrap`/`?` compose.
-        "try_from_utf8" => Ty::Result(Box::new(Ty::Prim("str")), vec!["IoError".to_string()]),
+        // Its error is `Utf8Error` (the design's name), not `IoError` — E2 had
+        // them conflated; corrected with the E4 wart fix, and safe because no
+        // corpus code propagates it (`try_utf8.jtr` recovers via `is_err`).
+        "try_from_utf8" => Ty::Result(Box::new(Ty::Prim("str")), vec!["Utf8Error".to_string()]),
         "count_codepoints" | "count_graphemes" => Ty::Prim("usize"),
         "find" => Ty::Prim("isize"),
         "is_utf8" | "str_eq" | "eq_fold" | "starts_with" | "ends_with" | "contains" => {
@@ -3985,10 +4154,12 @@ fn string_intrinsic_ret(name: &str) -> Option<Ty> {
 fn io_intrinsic_ret(name: &str) -> Option<Ty> {
     Some(match name {
         "read_file" => Ty::Prim("String"),
-        // NOTE the tag-1 wart (docs/error-payloads.md §6): the intrinsics hard-code
-        // error tag 1 at emission, which ALIASES the first user-declared error
-        // name. The set name here is `IoError` so inclusion checking works; the
-        // tag itself must be fixed before `match e` extraction lands.
+        // The tag-1 wart (docs/error-payloads.md §6) is RESOLVED at emission: an
+        // intrinsic error construction emits the USER tag of its name when the
+        // program declares it (`error_tags.get("IoError")`), falling back to the
+        // historical literal 1 otherwise — so `match e { IoError => … }`
+        // discriminates correctly, and every existing program (where the name is
+        // undeclared, or declared first and therefore tag 1) is byte-identical.
         "try_read_file" => Ty::Result(Box::new(Ty::Prim("String")), vec!["IoError".to_string()]),
         "write_file" | "file_exists" | "remove_file" => Ty::Prim("bool"),
         // The self-hosted driver's plumbing: drive gcc, print diagnostics to stderr.
@@ -4321,6 +4492,110 @@ mod tests {
             d.iter().any(|x| x.message.contains("the payload of error `BadKey`")),
             "a str payload given an i64 must be refused: {d:?}"
         );
+    }
+
+    // --- the payload extractor (error-payloads E4; docs/error-payloads.md §5) ---
+
+    /// The happy path: bare arms, a payload-binding arm, exhaustive over the set.
+    #[test]
+    fn an_exhaustive_error_match_is_clean() {
+        let (_, d) = analyze(
+            "fn f(n: i64) -> i64 !{ Empty, TooBig(i64) } { \
+               if n == 0 { return err(Empty) } \
+               if n > 9 { return err(TooBig(n)) } \
+               return ok(n) } \
+             fn g(n: i64) -> i64 { \
+               return f(n) catch |e| match e { Empty => 0 - 1, TooBig(v) => v } }",
+        );
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    /// Exhaustiveness is over the base's STATIC set (E2 carries it): a missing
+    /// name is refused with the names listed; `_` covers whatever remains.
+    #[test]
+    fn an_inexhaustive_error_match_names_what_is_missing() {
+        let (_, d) = analyze(
+            "fn f(n: i64) -> i64 !{ Empty, TooBig(i64) } { \
+               if n == 0 { return err(Empty) } return ok(n) } \
+             fn g(n: i64) -> i64 { \
+               return f(n) catch |e| match e { Empty => 0 - 1 } }",
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].message.contains("does not cover { TooBig }"), "{:?}", d[0].message);
+        let (_, d) = analyze(
+            "fn f(n: i64) -> i64 !{ Empty, TooBig(i64) } { \
+               if n == 0 { return err(Empty) } return ok(n) } \
+             fn g(n: i64) -> i64 { \
+               return f(n) catch |e| match e { Empty => 0 - 1, _ => 0 } }",
+        );
+        assert!(d.is_empty(), "a wildcard covers the rest: {d:?}");
+    }
+
+    /// The refusals, each with its own message: an arm outside the set, a payload
+    /// pattern on a bare name, a duplicate arm, a guard, an arm after `_`.
+    #[test]
+    fn error_match_refusals_each_name_their_rule() {
+        let base = "fn f(n: i64) -> i64 !{ Empty, TooBig(i64) } { \
+                      if n == 0 { return err(Empty) } return ok(n) } ";
+        let (_, d) = analyze(&format!(
+            "{base}fn g(n: i64) -> i64 {{ \
+               return f(n) catch |e| match e {{ Empty => 0, Missing => 1, _ => 2 }} }}"
+        ));
+        assert!(
+            d.iter().any(|x| x.message.contains("`Missing` is not in this expression's error set")),
+            "{d:?}"
+        );
+        let (_, d) = analyze(&format!(
+            "{base}fn g(n: i64) -> i64 {{ \
+               return f(n) catch |e| match e {{ Empty(v) => v, _ => 0 }} }}"
+        ));
+        assert!(
+            d.iter().any(|x| x.message.contains("carries no payload — match it bare")),
+            "{d:?}"
+        );
+        let (_, d) = analyze(&format!(
+            "{base}fn g(n: i64) -> i64 {{ \
+               return f(n) catch |e| match e {{ Empty => 0, Empty => 1, _ => 2 }} }}"
+        ));
+        assert!(d.iter().any(|x| x.message.contains("duplicate arm for error `Empty`")), "{d:?}");
+        let (_, d) = analyze(&format!(
+            "{base}fn g(n: i64) -> i64 {{ \
+               return f(n) catch |e| match e {{ Empty if n > 0 => 0, _ => 2 }} }}"
+        ));
+        assert!(
+            d.iter().any(|x| x.message.contains("guard is not supported on an error arm")),
+            "{d:?}"
+        );
+        let (_, d) = analyze(&format!(
+            "{base}fn g(n: i64) -> i64 {{ \
+               return f(n) catch |e| match e {{ _ => 2, Empty => 0 }} }}"
+        ));
+        assert!(
+            d.iter().any(|x| x.message.contains("unreachable arm: it follows the `_` catch-all")),
+            "{d:?}"
+        );
+    }
+
+    /// A bare arm on a payload CARRIER is fine — the payload is simply ignored —
+    /// and the payload binder carries the DECLARED type into the arm body.
+    #[test]
+    fn payload_binders_are_typed_and_bare_carrier_arms_are_legal() {
+        let (_, d) = analyze(
+            "fn f(n: i64) -> i64 !{ TooBig(i64) } { \
+               if n > 9 { return err(TooBig(n)) } return ok(n) } \
+             fn g(n: i64) -> i64 { \
+               return f(n) catch |e| match e { TooBig => 0 - 1 } }",
+        );
+        assert!(d.is_empty(), "a bare carrier arm ignores the payload: {d:?}");
+        // The binder is the declared `str`, so an i64-context use is refused
+        // through the ordinary mismatch machinery.
+        let (_, d) = analyze(
+            "fn f(n: i64) -> i64 !{ Bad(str) } { \
+               if n > 9 { return err(Bad(\"x\")) } return ok(n) } \
+             fn g(n: i64) -> str { \
+               return f(n) catch |e| match e { Bad(m) => m } }",
+        );
+        assert!(!d.is_empty(), "an i64 ok-type cannot recover as str — the arm body is typed: {d:?}");
     }
 
     // --- error-set soundness (error-payloads E2; docs/error-payloads.md §6) ---

@@ -10270,6 +10270,87 @@ fn main() -> i32 {
         );
     }
 
+    /// **The payload extractor end to end (E4): values come OUT.**
+    ///
+    /// E3 proved payloads ride along inertly; this is the first program that can
+    /// READ one. Run-verified: an i64 payload extracted after one `?` hop (the
+    /// blind union copy carried real bytes, not just layout), a `str` payload
+    /// printed, a bare arm ignoring a payload, the `_` catch-all, and the `e`
+    /// binder still usable inside an arm body.
+    #[test]
+    fn error_match_extracts_payload_values() {
+        let src = "\
+fn f(n: i64) -> i64 !{ Empty, TooBig(i64), BadKey(str) } {
+    if n == 0 { return err(Empty) }
+    if n > 99 { return err(TooBig(n)) }
+    if n < 0 - 99 { return err(BadKey(\"oops\")) }
+    return ok(n * 2)
+}
+fn hop(n: i64) -> i64 !{ Empty, TooBig(i64), BadKey(str) } {
+    let v = f(n)?
+    return ok(v + 1)
+}
+fn classify(n: i64) -> i64 {
+    // Arm bodies are single expressions — the same value-position block rule
+    // every `catch` fallback already has. The `str` payload is observed
+    // through its length: only real extracted bytes have `.len == 4`.
+    return hop(n) catch |e| match e {
+        Empty      => 0 - 1,
+        TooBig(v)  => v,
+        BadKey(m)  => (m.len as i64) * (0 - 100),
+    }
+}
+fn main() -> i32 {
+    print_int(classify(5))          // ok path -> 11
+    print_int(classify(500))        // the payload, through the hop -> 500
+    print_int(classify(0))          // bare Empty -> -1
+    print_int(classify(0 - 500))    // \"oops\".len * -100 -> -400
+    print_int(hop(500) catch |e| match e { TooBig => 7, _ => (e as i64) })  // bare carrier arm -> 7
+    print_int(hop(0) catch |e| match e { TooBig => 7, _ => (e as i64) })    // binder in a body -> 1
+    return 0
+}
+";
+        assert_eq!(
+            run_inline("error-match", src),
+            ["11", "500", "-1", "-400", "7", "1"],
+            "a payload must survive creation, one blind-copy hop, and extraction"
+        );
+    }
+
+    /// **The tag-1 wart, fixed and proven by discrimination.** `try_read_file`
+    /// used to hard-code `.err = 1` while user tags also start at 1 — so with
+    /// `Parse` declared first (tag 1) and `IoError` second (tag 2), an intrinsic
+    /// failure would have matched the `Parse` arm. The fix routes the intrinsic
+    /// construction through the user tag when the name is declared; the chain
+    /// below only reaches the right arm if origin and arm agree on the number.
+    #[test]
+    fn intrinsic_errors_discriminate_correctly_in_a_match() {
+        let src = "\
+fn parse_it(s: str) -> i64 !{ Parse } {
+    if s.len == 0 { return err(Parse) }
+    return ok(s.len as i64)
+}
+fn read_it(p: str) -> i64 !{ Parse, IoError } {
+    let t = try_read_file(p)?
+    let v = parse_it(string_view(t))?
+    return ok(v)
+}
+fn main() -> i32 {
+    let r = read_it(\"jestyr_no_such_file_e4.txt\") catch |e| match e {
+        Parse   => 11,
+        IoError => 77,
+    }
+    print_int(r)
+    return 0
+}
+";
+        assert_eq!(
+            run_inline("intrinsic-tag", src),
+            ["77"],
+            "an intrinsic IoError matched the Parse arm — origin and arm disagree on the tag"
+        );
+    }
+
     /// **`catch` recovers, and the fallback runs only when it must.**
     ///
     /// The short-circuit is the property worth *running* for: `catch` supplies a
