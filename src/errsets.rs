@@ -309,24 +309,31 @@ pub fn collect(ast: &Ast) -> Vec<Site> {
                     continue;
                 }
                 let Some(o) = owner_of(e.span) else { continue };
-                let v = match args.first().map(|a| &ast.expr_at(*a).kind) {
-                    Some(ExprKind::Name(n)) => match &o.set {
-                        Some(s) if s.contains(&n.name) => {
-                            Verdict::Ok(format!("err({})", n.name))
+                // The two spellings share the membership check: `err(Name)` and
+                // the applied payload form `err(Name(v))` (error-payloads E3) —
+                // the head name is what membership is about either way.
+                let ename = match args.first().map(|a| &ast.expr_at(*a).kind) {
+                    Some(ExprKind::Name(n)) => Some(n.name.clone()),
+                    Some(ExprKind::Call { callee: ic, .. }) => {
+                        match &ast.expr_at(*ic).kind {
+                            ExprKind::Name(n) => Some(n.name.clone()),
+                            _ => None,
                         }
+                    }
+                    _ => None,
+                };
+                let v = match ename {
+                    Some(en) => match &o.set {
+                        Some(s) if s.contains(&en) => Verdict::Ok(format!("err({en})")),
                         Some(s) => Verdict::Violation(format!(
-                            "err({}) — `{}` is not in the enclosing declared set {}",
-                            n.name,
-                            n.name,
+                            "err({en}) — `{en}` is not in the enclosing declared set {}",
                             render_set(s)
                         )),
                         None => Verdict::Violation(format!(
-                            "err({}) in a function with no declared error set",
-                            n.name
+                            "err({en}) in a function with no declared error set"
                         )),
                     },
-                    // Today an error is always a bare name; anything else (a
-                    // future `err(Parse(n))`, a computed value) is not guessed.
+                    // A computed value is not guessed.
                     _ => Verdict::Unresolved("`err` with a non-name argument".to_string()),
                 };
                 (Kind::Err, v)

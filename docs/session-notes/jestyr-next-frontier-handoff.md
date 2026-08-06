@@ -42,14 +42,22 @@ byte-identical) + concat + test-mode; P2/P3/P4 goldens; `selfhost_fixpoint_full`
    corrected to `Utf8Error`. Patterns cost zero parser work (`PatKind` already
    covers all three arm shapes — E5's port parser needs nothing new). Full gate
    green: 909 default warning-clean, corpus/concat/test-mode byte-identical,
-   fixpoint + self-build + seed current. **Next is E5: the port mirror + the
-   first payload corpus file + seed refresh, one increment** — parser.jtr
-   (payload type in the error-set parse + the P2 dump growth on BOTH sides, see
-   note §10), typeck.jtr (payload map, D1, err-arm checks, the inline match),
-   cgen.jtr (union, pay field/init/copies, `emit_err_match`, both wart-fix
-   halves), escape.jtr (the return-position payload arm), then corpus 147 +
-   REFRESH_SEED. Arm bodies are single expressions (the standing catch-fallback
-   rule); lifting that for arms + fallbacks together is one later increment.
+   fixpoint + self-build + seed current. **E5 IS DONE TOO — THE WHOLE E-CHAIN
+   (E1–E5) IS CLOSED ON BOTH SIDES**: the port mirror landed all-at-once with
+   `examples/error_payload.jtr` (corpus **147**, byte-identical after ONE crash
+   fix — the Ident-pattern x/y-are-minus-one span trap, recorded in the note),
+   the P2 dump grew its payload record on both sides, `far` err records became
+   (start, end, payload) TRIPLES (five reader regions moved in lockstep),
+   typeck.jtr carries a payload MAP (`c.epay` — the port never needed typed
+   sets, only binder types), cgen.jtr mirrors the union / pay init / blind
+   copies / `emit_err_match` / both wart halves / the `Name(T)` sig renderers,
+   escape.jtr walks a payload in return position, and the SEED is refreshed —
+   **the gcc-only bootstrap compiler now builds programs with payload-carrying
+   errors**. The E1 census also learned the applied spelling (its corpus pin
+   caught the omission). Remaining E-adjacent polish, none blocking: arm
+   bodies are single expressions (the standing catch-fallback rule — lift for
+   arms + fallbacks together); owning payloads (E6+, drop design first); named
+   sets; match-over-result sugar.
 2. **Error sets in TRAIT signatures** — unlocks fallible trait-impl methods, which are
    currently refused at check time with the reason (calls are typed by the trait's
    signature, which cannot declare an error set). The refusal sites to lift are marked:

@@ -2503,7 +2503,7 @@ fn parse_fn(mut p: Parser, is_pub: i32, attr_start: i32, attr_count: i32) -> i32
         ret_conv = parse_conv(p)
         ret_ty = parse_type(p)
     }
-    var errs: List(i32) = make__list(i32, p.alloc)   // error-set name spans (pairs)
+    var errs: List(i32) = make__list(i32, p.alloc)   // error-set (start, end, payload) TRIPLES
     if cur_kind(p) == 99 {                           // `!{ Names }` error set
         bump(p)
         if cur_kind(p) == 65 { bump(p) }            // `{`
@@ -2513,7 +2513,21 @@ fn parse_fn(mut p: Parser, is_pub: i32, attr_start: i32, attr_count: i32) -> i32
             if k == 66 { em = false }               // `}`
             else if k == 110 { em = false }         // Eof
             else {
-                if cur_kind(p) == 0 { let t: Token = cur_tok(p)  push(i32, errs, t.start as i32)  push(i32, errs, t.end as i32)  bump(p) }
+                if cur_kind(p) == 0 {
+                    let t: Token = cur_tok(p)
+                    push(i32, errs, t.start as i32)
+                    push(i32, errs, t.end as i32)
+                    bump(p)
+                    // `Name(T)` -- a payload-carrying error name (error-payloads
+                    // E5): one type in parens, -1 when bare. Mirrors ErrName.
+                    var ptid: i32 = 0 - 1
+                    if cur_kind(p) == 63 {
+                        bump(p)
+                        ptid = parse_type(p)
+                        if cur_kind(p) == 64 { bump(p) }   // `)`
+                    }
+                    push(i32, errs, ptid)
+                }
                 if cur_kind(p) == 69 { bump(p) } else { em = false }   // `,`
             }
         }
@@ -2534,9 +2548,10 @@ fn parse_fn(mut p: Parser, is_pub: i32, attr_start: i32, attr_count: i32) -> i32
         } else { cm = false }
     }
     let body: i32 = parse_block(p)
-    // Write the extras block to `far`: err_count, err spans, req_count, req exprs, ens_count, ens exprs.
+    // Write the extras block to `far`: err_count, err (start, end, payload) triples,
+    // req_count, req exprs, ens_count, ens exprs.
     let e_start: i32 = len(i32, p.far) as i32
-    push(i32, p.far, (len(i32, errs) / 2) as i32)
+    push(i32, p.far, (len(i32, errs) / 3) as i32)
     var ei: usize = 0
     for ei < len(i32, errs) { push(i32, p.far, get(i32, errs, ei))  ei = ei + 1 }
     push(i32, p.far, len(i32, reqs) as i32)
@@ -3853,8 +3868,10 @@ fn attrs_has_volatile(read src: str, read p: Parser, attr_start: i32, attr_count
     return 0
 }
 
-// Dump a fn's "extras" block at `far[e…]`: the error-set names `<count> <(errname s e)>s`,
-// then the `requires` exprs `<count> <expr>s`, then the `ensures` exprs `<count> <expr>s`.
+// Dump a fn's "extras" block at `far[e…]`: the error-set names `<count> <(errname s e)
+// <payload-type|(none)>>s`, then the `requires` exprs `<count> <expr>s`, then the
+// `ensures` exprs `<count> <expr>s`. The payload record (error-payloads E5) grew on
+// BOTH sides of the P2 golden in the same increment.
 fn dump_fn_extras(read src: str, read p: Parser, e: i32) {
     var idx: i32 = e
     let err_count: i32 = get(i32, p.far, idx as usize)
@@ -3865,7 +3882,10 @@ fn dump_fn_extras(read src: str, read p: Parser, e: i32) {
         let s: i32 = get(i32, p.far, idx as usize)
         let en: i32 = get(i32, p.far, (idx + 1) as usize)
         print_str("(") print_str("errname") print_int(s as i64) print_int(en as i64) print_str(")")
-        idx = idx + 2
+        let ptid: i32 = get(i32, p.far, (idx + 2) as usize)
+        if ptid >= 0 { dump_type(src, p, ptid) }
+        else { print_str("(") print_str("none") print_str(")") }
+        idx = idx + 3
         i = i + 1
     }
     let req_count: i32 = get(i32, p.far, idx as usize)
@@ -6198,14 +6218,6 @@ pub fn run__ctfe() -> i32 {
 // `lower_type` (structural: prims, pointers, slices, arrays, refs, generic apps, fn pointers,
 // dyn, paths), independent of operand resolution.
 
-
-
-
-
-
-
-
-
 // The type-checker state: the `Ty` arena (`tys` + child slices `tya`), the per-ExprId
 // resolved-type table `et` (TyId; initialized to Unknown = id 0, overwritten iff `infer`
 // visits), the lexical scope (`scn` = bind triples (name_start, name_end, TyId), `scst` = a
@@ -6241,7 +6253,7 @@ pub fn run__ctfe() -> i32 {
 // row) and `icalls` each impl-dispatched call (5-tuples: call ExprId, trait name span, method
 // name span) — the downstream passes' `method_calls`/`impl_calls` (the escape checker's
 // give-away and manual-drop rules read them).
-pub struct Checker { pub tys: List(TyData), pub tya: List(i32), pub et: List(i32), scn: List(i32), scst: List(i32), pub tdecl: List(i32), pub tch: List(i32), pub fns: List(i32), cst: List(i32), vmap: List(i32), tra: List(i32), imp: List(i32), pub mcalls: List(i32), pub icalls: List(i32), pub bcalls: List(i32), pub dcalls: List(i32), pub dcoerce: List(i32), selfty: i32, expected: i32, curret: i32, scfloor: i32, gbs: i32, gbc: i32, alloc: Allocator }
+pub struct Checker { pub tys: List(TyData), pub tya: List(i32), pub et: List(i32), scn: List(i32), scst: List(i32), pub tdecl: List(i32), pub tch: List(i32), pub fns: List(i32), cst: List(i32), vmap: List(i32), tra: List(i32), imp: List(i32), pub mcalls: List(i32), pub icalls: List(i32), pub bcalls: List(i32), pub dcalls: List(i32), pub dcoerce: List(i32), pub epay: List(i32), selfty: i32, expected: i32, curret: i32, scfloor: i32, gbs: i32, gbc: i32, alloc: Allocator }
 
 // One `Ty` arena node - kinds in the header comment. `a`/`b` are child TyIds or slice fields;
 // `x`/`y` are aux ints (prim code, name span, ret TyId/conv).
@@ -6269,7 +6281,7 @@ fn mk_ty__typeck(mut c: Checker, kind: i32, a: i32, b: i32, x: i32, y: i32) -> i
 // The checker with the well-known instances pre-created (ids 0..7) and `et` sized to the
 // expression arena, all-Unknown.
 fn make_checker(read p: Parser, read a: Allocator) -> Checker {
-    var c: Checker = Checker{ tys: make__list(TyData, a), tya: make__list(i32, a), et: make__list(i32, a), scn: make__list(i32, a), scst: make__list(i32, a), tdecl: make__list(i32, a), tch: make__list(i32, a), fns: make__list(i32, a), cst: make__list(i32, a), vmap: make__list(i32, a), tra: make__list(i32, a), imp: make__list(i32, a), mcalls: make__list(i32, a), icalls: make__list(i32, a), bcalls: make__list(i32, a), dcalls: make__list(i32, a), dcoerce: make__list(i32, a), selfty: 1, expected: 0 - 1, curret: 0 - 1, scfloor: 0, gbs: 0 - 1, gbc: 0, alloc: a }
+    var c: Checker = Checker{ tys: make__list(TyData, a), tya: make__list(i32, a), et: make__list(i32, a), scn: make__list(i32, a), scst: make__list(i32, a), tdecl: make__list(i32, a), tch: make__list(i32, a), fns: make__list(i32, a), cst: make__list(i32, a), vmap: make__list(i32, a), tra: make__list(i32, a), imp: make__list(i32, a), mcalls: make__list(i32, a), icalls: make__list(i32, a), bcalls: make__list(i32, a), dcalls: make__list(i32, a), dcoerce: make__list(i32, a), epay: make__list(i32, a), selfty: 1, expected: 0 - 1, curret: 0 - 1, scfloor: 0, gbs: 0 - 1, gbc: 0, alloc: a }
     mk_ty__typeck(c, 0, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 0 Unknown
     mk_ty__typeck(c, 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 1 Unit
     mk_ty__typeck(c, 2, 0 - 1, 0 - 1, 2, 0 - 1)            // 2 Prim i32   (code 2)
@@ -8129,10 +8141,58 @@ fn infer(mut c: Checker, read p: Parser, read src: str, id: i32) -> i32 {
         if d.op == 1 {
             infer(c, p, src, d.b)
         } else {
-            let saved: i32 = c.expected
-            if bd.kind == 5 { c.expected = bd.a } else { c.expected = 0 - 1 }
-            infer(c, p, src, d.b)
-            c.expected = saved
+            // `catch |e| match e { … }` -- the payload extractor (error-payloads
+            // E5, mirroring `check_err_match`): when the fallback is a match
+            // over the binder itself, each arm body is a fallback value typed
+            // against the ok type, a Variant arm's binder gets the DECLARED
+            // payload type (from `c.epay`), and the Match node records the ok
+            // type. Exhaustiveness/refusals are the reference's job; a valid
+            // program has already passed them, so the port only records types.
+            var extracted: bool = false
+            if d.x >= 0 and bd.kind == 5 {         // the reference bails pre-extractor on a non-Result base
+                let fb: ExprData = get(ExprData, p.ex, d.b as usize)
+                if fb.kind == 28 {
+                    let scd: ExprData = get(ExprData, p.ex, fb.a as usize)
+                    if scd.kind == 2 {
+                        if str_eq(src[scd.start .. scd.end], src[d.x as usize .. d.y as usize]) {
+                            extracted = true
+                            infer(c, p, src, fb.a)             // the binder read: `error`
+                            var okid: i32 = 0 - 1
+                            if bd.kind == 5 { okid = bd.a }
+                            var ai: i32 = 0
+                            for ai < fb.y {
+                                let abase: i32 = fb.x + ai * 3
+                                push_scope(c)
+                                let pd: PatData = get(PatData, p.pt, get(i32, p.par, abase as usize) as usize)
+                                if pd.kind == 2 and pd.a > 0 {   // Variant `Name(x)`
+                                    let sp: PatData = get(PatData, p.pt, get(i32, p.par, pd.op as usize) as usize)
+                                    if sp.kind == 1 {            // an Ident binder
+                                        let ptid: i32 = err_payload_of(c, src, pd.x, pd.y)
+                                        var pbt: i32 = t_unknown()
+                                        if ptid >= 0 { pbt = lower_type(c, p, src, ptid) }
+                                        scope_insert(c, sp.start as i32, sp.end as i32, pbt)
+                                    }
+                                }
+                                let savedm: i32 = c.expected
+                                c.expected = okid
+                                infer(c, p, src, get(i32, p.par, (abase + 2) as usize))
+                                c.expected = savedm
+                                pop_scope(c)
+                                ai = ai + 1
+                            }
+                            var mt: i32 = okid
+                            if mt < 0 { mt = t_unknown() }
+                            set(i32, c.et, d.b as usize, mt)
+                        }
+                    }
+                }
+            }
+            if !extracted {
+                let saved: i32 = c.expected
+                if bd.kind == 5 { c.expected = bd.a } else { c.expected = 0 - 1 }
+                infer(c, p, src, d.b)
+                c.expected = saved
+            }
         }
         pop_scope(c)
         if bd.kind == 5 { r = bd.a } else { r = mk_ty__typeck(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1) }
@@ -8790,9 +8850,69 @@ fn dump_types(read src: str, read c: Checker, read p: Parser, read a: Allocator)
 // Type-check an already-parsed program: build the global table, walk the bodies, return the
 // populated Checker (its `et`/`tys`/records are the downstream passes' TypeInfo). The library
 // entry the escape checker (and later cgen) build on.
+// The whole-program error-payload map (error-payloads E5, mirroring the
+// reference's `collect_err_payloads`): every `Name(T)` in any fn's or struct
+// method's error set records a (name_start, name_end, payload_TypeId) triple in
+// `c.epay`, first declaration wins. D1 (agreement across sites) is checked by
+// the reference; the port carries the map for TYPING — the match binder's
+// declared type — and for cgen's union/member emission, and a valid program
+// has already passed the reference's checks.
+fn build_err_payloads(mut c: Checker, read p: Parser, read src: str) {
+    var r: i32 = 0
+    for r < len(i32, p.roots) {
+        let iid: i32 = get(i32, p.roots, r)
+        let it: ItemData = get(ItemData, p.it, iid as usize)
+        if it.kind == 3 and it.e >= 0 { epay_scan_far(c, p, it.e) }
+        if it.kind == 4 {
+            var m: i32 = 0
+            for m < it.b {
+                let mbase: i32 = it.a + m * 10
+                if get(i32, p.mar, mbase as usize) == 1 {   // tag 1 = method
+                    let mfd: ItemData = get(ItemData, p.it, get(i32, p.mar, (mbase + 1) as usize) as usize)
+                    if mfd.e >= 0 { epay_scan_far(c, p, mfd.e) }
+                }
+                m = m + 1
+            }
+        }
+        r = r + 1
+    }
+}
+
+// Scan one `far` extras block for payload-carrying names (err TRIPLES).
+fn epay_scan_far(mut c: Checker, read p: Parser, e: i32) {
+    let ec: i32 = get(i32, p.far, e as usize)
+    var k: i32 = 0
+    for k < ec {
+        let ptid: i32 = get(i32, p.far, (e + 3 + k * 3) as usize)
+        if ptid >= 0 {
+            push(i32, c.epay, get(i32, p.far, (e + 1 + k * 3) as usize))
+            push(i32, c.epay, get(i32, p.far, (e + 2 + k * 3) as usize))
+            push(i32, c.epay, ptid)
+        }
+        k = k + 1
+    }
+}
+
+// The declared payload TypeId of the error name at `src[ns..ne]`, -1 when bare
+// or undeclared. Text comparison, since a use site's span never equals the
+// declaration's.
+pub fn err_payload_of(read c: Checker, read src: str, ns: i32, ne: i32) -> i32 {
+    var i: usize = 0
+    for i < len(i32, c.epay) {
+        let ds: i32 = get(i32, c.epay, i)
+        let de: i32 = get(i32, c.epay, i + 1)
+        if str_eq(src[ns as usize .. ne as usize], src[ds as usize .. de as usize]) {
+            return get(i32, c.epay, i + 2)
+        }
+        i = i + 3
+    }
+    return 0 - 1
+}
+
 pub fn check_parsed(read p: Parser, read src: str, read a: Allocator) -> Checker {
     var c: Checker = make_checker(p, a)
     build_table(c, p, src)
+    build_err_payloads(c, p, src)
     walk_items(c, p, src)
     return c
 }
@@ -9591,6 +9711,39 @@ fn walk_expr(mut e: Esc, read p: Parser, read c: Checker, read src: str, id: i32
         return
     }
     if k == 10 {                                   // call
+        // Error-payloads E5: `err(Name(p))` RETURNS its payload -- the value
+        // rides the result out of the frame -- so `p` is walked in RETURN
+        // position and the existing return rules fire (a region str payload is
+        // refused like a plain return of it). Inert whenever the program
+        // declares no payloads (`c.epay` empty), which is every corpus file
+        // and the compiler itself. The reference additionally skips a SHADOWED
+        // `err` (a user fn or enum variant of that name); the port relies on
+        // the payload-name gate alone -- the shadowed-plus-payload-named-inner
+        // combination cannot appear in a valid corpus file.
+        if len(i32, c.epay) > 0 and d.y == 1 {
+            let cal: ExprData = get(ExprData, p.ex, d.a as usize)
+            if cal.kind == 2 {
+                if str_eq(src[cal.start .. cal.end], "err") {
+                    let ind: ExprData = get(ExprData, p.ex, get(i32, p.ar, d.x as usize) as usize)
+                    if ind.kind == 10 and ind.y > 0 {
+                        let inc: ExprData = get(ExprData, p.ex, ind.a as usize)
+                        if inc.kind == 2 {
+                            if err_payload_of(c, src, inc.start as i32, inc.end as i32) >= 0 {
+                                walk_expr(e, p, c, src, d.a, false)
+                                walk_expr(e, p, c, src, ind.a, false)
+                                walk_expr(e, p, c, src, get(i32, p.ar, ind.x as usize), true)
+                                check_give_away(e, p, c, src, id, d.a, d.x, d.y)
+                                check_loop_mutation(e, p, c, src, id, d.a, d.x, d.y)
+                                check_no_alloc_call(e, p, src, d.a, d.start, d.end)
+                                check_det_call(e, p, src, d.a, d.start, d.end)
+                                check_manual_drop(e, c, src, id, d.start, d.end)
+                                return
+                            }
+                        }
+                    }
+                }
+            }
+        }
         walk_expr(e, p, c, src, d.a, false)
         var i: i32 = 0
         for i < d.y { walk_expr(e, p, c, src, get(i32, p.ar, (d.x + i) as usize), false)  i = i + 1 }
@@ -10122,17 +10275,6 @@ pub fn push_sha256_hex(mut sb: String, read data: str) {
 //
 // Increment 1 (this file's current reach): `hello.jtr` — the prelude, one `fn main -> i32`, a
 // `print_str("…")` intrinsic call, a string literal, and `return 0`. Everything else is denylisted.
-
-
-
-
-
-
-
-
-
-
-
 
 // ---- the fixed C prelude (mirrors Cgen::prelude) ----
 // A FIXED header block: includes + the `jestyr_rt_*` runtime + the JestyrStr/String/Cow/Builder
@@ -11904,7 +12046,13 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
         emit_result_name(sb, p, src, c, g, g.res_ok)                     // re-wrap in the CURRENT fn's result
         string_push(sb, "){ .is_err = true, .err = _q")
         push_uint__cgen(sb, n as i64)
-        string_push(sb, ".err }; _q")
+        string_push(sb, ".err")
+        if err_pay_gated(c) {                         // the BLIND union copy (D3)
+            string_push(sb, ", .pay = _q")
+            push_uint__cgen(sb, n as i64)
+            string_push(sb, ".pay")
+        }
+        string_push(sb, " }; _q")
         push_uint__cgen(sb, n as i64)
         string_push(sb, ".ok; })")
         return
@@ -11947,7 +12095,13 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
             emit_result_name(sb, p, src, c, g, g.res_ok)
             string_push(sb, "){ .is_err = true, .err = _ct")
             push_uint__cgen(sb, n as i64)
-            string_push(sb, ".err }; _ct")
+            string_push(sb, ".err")
+            if err_pay_gated(c) {                     // rethrow copies pay exactly as `?` does
+                string_push(sb, ", .pay = _ct")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, ".pay")
+            }
+            string_push(sb, " }; _ct")
             push_uint__cgen(sb, n as i64)
             string_push(sb, ".ok; })")
             string_free(sbb)
@@ -11958,6 +12112,25 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
         // over a result variable; the binder-less form below KEEPS its original `?:`
         // string, character for character.
         if e.x >= 0 {
+            // `catch |e| match e { ... }` -- the payload extractor (E5, the
+            // reference's emit_err_match): when the fallback is a match over
+            // the binder itself, it lowers to a tag if-chain in the error
+            // branch. `_cv` is allocated BEFORE the arm bodies are emitted
+            // (the reference's temp order), and the LAST arm is unconditional
+            // -- exhaustiveness was proven at check time.
+            let fbe: ExprData = get(ExprData, p.ex, e.b as usize)
+            var is_extract: bool = false
+            if fbe.kind == 28 {
+                let sce: ExprData = get(ExprData, p.ex, fbe.a as usize)
+                if sce.kind == 2 {
+                    if str_eq(src[sce.start .. sce.end], src[e.x as usize .. e.y as usize]) { is_extract = true }
+                }
+            }
+            if is_extract {
+                emit_err_match(sb, p, src, c, g, e, fbe, string_view(sbb), n, bt)
+                string_free(sbb)
+                return
+            }
             var svb2: String = string_new()
             emit_expr(svb2, p, src, c, g, e.b)        // fallback BEFORE `_cv` is allocated
             let m: i32 = g.tmp
@@ -13150,13 +13323,19 @@ fn emit_call(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
             emit_ty_c(sb, p, src, c, get(i32, c.et, a0 as usize))
             string_push(sb, " _u = ")
             emit_expr(sb, p, src, c, g, a0)
-            string_push(sb, "; jestyr_rt_valid_utf8((const char*)_u.ptr, _u.len) ? (JestyrResult_str){ .is_err = false, .ok = (JestyrStr){ (const char*)_u.ptr, _u.len } } : (JestyrResult_str){ .is_err = true, .err = 1 }; })")
+            string_push(sb, "; jestyr_rt_valid_utf8((const char*)_u.ptr, _u.len) ? (JestyrResult_str){ .is_err = false, .ok = (JestyrStr){ (const char*)_u.ptr, _u.len } } : (JestyrResult_str){ .is_err = true, .err = ")
+            push_uint__cgen(sb, intrinsic_tag(g, src, "Utf8Error") as i64)
+            if err_pay_gated(c) { string_push(sb, ", .pay = {0}") }
+            string_push(sb, " }; })")
             return
         }
         if str_eq(nm, "try_read_file") {              // B3 recoverable read: FIXED temps _s/_ok (no counter)
             string_push(sb, "({ JestyrString _s; bool _ok = jestyr_rt_try_read_file(")
             emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
-            string_push(sb, ", &_s); _ok ? (JestyrResult_String){ .is_err = false, .ok = _s } : (JestyrResult_String){ .is_err = true, .err = 1 }; })")
+            string_push(sb, ", &_s); _ok ? (JestyrResult_String){ .is_err = false, .ok = _s } : (JestyrResult_String){ .is_err = true, .err = ")
+            push_uint__cgen(sb, intrinsic_tag(g, src, "IoError") as i64)
+            if err_pay_gated(c) { string_push(sb, ", .pay = {0}") }
+            string_push(sb, " }; })")
             return
         }
         if str_eq(nm, "arg_count") {                  // arg_count() -> the argv-count runtime global
@@ -13379,7 +13558,37 @@ fn emit_call(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
             emit_result_name(sb, p, src, c, g, g.res_ok)
             string_push(sb, "){ .is_err = true, .err = ")
             let en: ExprData = get(ExprData, p.ex, arg_at(p, e, 0) as usize)
-            push_uint__cgen(sb, error_tag_of(g, src, en.start, en.end) as i64)
+            // The applied payload form `err(Name(v))` digs the CALLEE for the
+            // tag (E5, mirrors the reference's error_tag_of Call arm); in a
+            // gated program the construction carries `.pay` -- the declared
+            // member for a payload carrier, an explicit `{0}` otherwise.
+            var tns: usize = en.start
+            var tne: usize = en.end
+            var payex: i32 = 0 - 1
+            if en.kind == 10 {
+                let ecal: ExprData = get(ExprData, p.ex, en.a as usize)
+                if ecal.kind == 2 {
+                    tns = ecal.start
+                    tne = ecal.end
+                    if en.y > 0 { payex = get(i32, p.ar, en.x as usize) }
+                }
+            }
+            push_uint__cgen(sb, error_tag_of(g, src, tns, tne) as i64)
+            if err_pay_gated(c) {
+                var isp: bool = false
+                if payex >= 0 {
+                    if err_payload_of(c, src, tns as i32, tne as i32) >= 0 { isp = true }
+                }
+                if isp {
+                    string_push(sb, ", .pay = { .j_")
+                    string_push(sb, src[tns .. tne])
+                    string_push(sb, " = (")
+                    emit_expr(sb, p, src, c, g, payex)
+                    string_push(sb, ") }")
+                } else {
+                    string_push(sb, ", .pay = {0}")
+                }
+            }
             string_push(sb, " }")
             return
         }
@@ -13724,8 +13933,8 @@ fn build_error_tags(mut g: Cg, read p: Parser, read src: str) {
             let ecount: i32 = get(i32, p.far, it.e as usize)
             var k: i32 = 0
             for k < ecount {
-                let ns: i32 = get(i32, p.far, (it.e + 1 + k * 2) as usize)
-                let ne: i32 = get(i32, p.far, (it.e + 2 + k * 2) as usize)
+                let ns: i32 = get(i32, p.far, (it.e + 1 + k * 3) as usize)
+                let ne: i32 = get(i32, p.far, (it.e + 2 + k * 3) as usize)
                 if error_tag_of(g, src, ns as usize, ne as usize) == 0 {
                     push(i32, g.etags, ns)
                     push(i32, g.etags, ne)
@@ -13747,8 +13956,8 @@ fn build_error_tags(mut g: Cg, read p: Parser, read src: str) {
                         let mec: i32 = get(i32, p.far, mfd.e as usize)
                         var mk: i32 = 0
                         for mk < mec {
-                            let mns: i32 = get(i32, p.far, (mfd.e + 1 + mk * 2) as usize)
-                            let mne: i32 = get(i32, p.far, (mfd.e + 2 + mk * 2) as usize)
+                            let mns: i32 = get(i32, p.far, (mfd.e + 1 + mk * 3) as usize)
+                            let mne: i32 = get(i32, p.far, (mfd.e + 2 + mk * 3) as usize)
                             if error_tag_of(g, src, mns as usize, mne as usize) == 0 {
                                 push(i32, g.etags, mns)
                                 push(i32, g.etags, mne)
@@ -20022,14 +20231,232 @@ fn emit_genref_defs(mut sb: String, read p: Parser, read src: str, read c: Check
     string_free(seen)
 }
 
+// ---- error payloads (E5, docs/error-payloads.md 3) -- all gated on use ----
+
+// Is the payload machinery ON? Driven by DECLARATION (any error name carries a
+// payload, `c.epay` non-empty), so a payload-free program emits today's C to
+// the byte -- the reference's `err_pay_gated`.
+fn err_pay_gated(read c: Checker) -> bool {
+    return len(i32, c.epay) > 0
+}
+
+// The extra field every result struct gains in a payload-using program.
+fn push_pay_field(mut sb: String, read c: Checker) {
+    if err_pay_gated(c) { string_push(sb, "JestyrErrPay pay; ") }
+}
+
+// The tag an error name resolves to at a match arm: the user tag when declared,
+// else the intrinsic literal 1 for the two builtin names -- the reference's
+// `err_name_tag` (both wart-fix halves resolve the same way, so an origin and
+// an arm can never disagree on the number).
+fn err_name_tag(read g: Cg, read src: str, ns: usize, ne: usize) -> i32 {
+    let t: i32 = error_tag_of(g, src, ns, ne)
+    if t != 0 { return t }
+    if str_eq(src[ns .. ne], "IoError") { return 1 }
+    if str_eq(src[ns .. ne], "Utf8Error") { return 1 }
+    return 0
+}
+
+// An INTRINSIC construction's tag: the user tag of `name` when the program
+// declares it, else the historical literal 1 (`intrinsic_err_tag`).
+fn intrinsic_tag(read g: Cg, read src: str, read name: str) -> i32 {
+    var i: usize = 0
+    for i < len(i32, g.etags) {
+        let es: i32 = get(i32, g.etags, i)
+        let ee: i32 = get(i32, g.etags, i + 1)
+        if str_eq(name, src[es as usize .. ee as usize]) { return (i / 2 + 1) as i32 }
+        i = i + 2
+    }
+    return 1
+}
+
+// The whole-program payload union (D3): one member per payload-carrying error
+// name, deduped and NAME-SORTED (the reference's BTreeMap order), each
+// rendered `<cty> j_<Name>; `.
+fn emit_err_pay_union(mut sb: String, read p: Parser, read src: str, read c: Checker) {
+    string_push(sb, "typedef union { ")
+    var done: String = string_new()
+    var more: bool = true
+    for more {
+        var bi: i32 = 0 - 1
+        var i: i32 = 0
+        for i < len(i32, c.epay) as i32 {
+            let ns: i32 = get(i32, c.epay, i as usize)
+            let ne: i32 = get(i32, c.epay, (i + 1) as usize)
+            var probe: String = string_new()
+            string_push(probe, "|")
+            string_push(probe, src[ns as usize .. ne as usize])
+            string_push(probe, "|")
+            var fresh: bool = true
+            if contains(string_view(done), string_view(probe)) { fresh = false }
+            string_free(probe)
+            if fresh {
+                if bi < 0 { bi = i }
+                else {
+                    let bs: i32 = get(i32, c.epay, bi as usize)
+                    let be: i32 = get(i32, c.epay, (bi + 1) as usize)
+                    if str_lt(src[ns as usize .. ne as usize], src[bs as usize .. be as usize]) { bi = i }
+                }
+            }
+            i = i + 3
+        }
+        if bi < 0 { more = false }
+        else {
+            let ns2: i32 = get(i32, c.epay, bi as usize)
+            let ne2: i32 = get(i32, c.epay, (bi + 1) as usize)
+            emit_c_ty(sb, p, src, get(i32, c.epay, (bi + 2) as usize))
+            string_push(sb, " j_")
+            string_push(sb, src[ns2 as usize .. ne2 as usize])
+            string_push(sb, "; ")
+            string_push(done, "|")
+            string_push(done, src[ns2 as usize .. ne2 as usize])
+            string_push(done, "|")
+        }
+    }
+    string_push(sb, "} JestyrErrPay;\n")
+    string_free(done)
+}
+
+// Lower `catch |e| match e { ... }` (error-payloads E5, mirroring the
+// reference's emit_err_match): a tag if-chain inside the error branch, each
+// payload arm binding its union member as a typed const, the `e` binder still
+// present as the usual `const int`, and the LAST arm emitted unconditionally
+// (typeck proved exhaustiveness, so C gets a totally-assigned result variable
+// with no dead final branch).
+fn emit_err_match(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg, read e: ExprData, read fbe: ExprData, read base_c: str, n: i32, bt: i32) {
+    let btd: TyData = get(TyData, c.tys, bt as usize)
+    let unit_ok: bool = btd.kind == 5 and btd.a == 1
+    var m: i32 = 0 - 1
+    if !unit_ok {
+        m = g.tmp
+        g.tmp = g.tmp + 1
+    }
+    // The chain, bodies emitted in arm order (after `_cv` -- the temp order).
+    var chain: String = string_new()
+    let last: i32 = fbe.y - 1
+    var ai: i32 = 0
+    for ai < fbe.y {
+        let abase: i32 = fbe.x + ai * 3
+        let pd: PatData = get(PatData, p.pt, get(i32, p.par, abase as usize) as usize)
+        var cond: i32 = 0 - 1                         // the tag; -1 = wildcard
+        var bind: String = string_new()
+        if pd.kind == 1 { cond = err_name_tag(g, src, pd.start, pd.end) }   // an Ident pattern's NAME is its own span (x/y are -1)
+        if pd.kind == 2 {
+            cond = err_name_tag(g, src, pd.x as usize, pd.y as usize)
+            if pd.a > 0 {
+                let sp: PatData = get(PatData, p.pt, get(i32, p.par, pd.op as usize) as usize)
+                if sp.kind == 1 {                     // an Ident binder reads its member
+                    let ptid: i32 = err_payload_of(c, src, pd.x, pd.y)
+                    string_push(bind, "const ")
+                    if ptid >= 0 { emit_c_ty(bind, p, src, ptid) } else { string_push(bind, "int") }
+                    string_push(bind, " j_")
+                    string_push(bind, src[sp.start .. sp.end])
+                    string_push(bind, " = _ct")
+                    push_uint__cgen(bind, n as i64)
+                    string_push(bind, ".pay.j_")
+                    string_push(bind, src[pd.x as usize .. pd.y as usize])
+                    string_push(bind, "; (void)j_")
+                    string_push(bind, src[sp.start .. sp.end])
+                    string_push(bind, "; ")
+                }
+            }
+        }
+        var body: String = string_new()
+        emit_expr(body, p, src, c, g, get(i32, p.par, (abase + 2) as usize))
+        var blk: String = string_new()
+        string_push(blk, "{ ")
+        string_push(blk, string_view(bind))
+        if unit_ok {
+            string_push(blk, string_view(body))
+            string_push(blk, ";")
+        } else {
+            string_push(blk, "_cv")
+            push_uint__cgen(blk, m as i64)
+            string_push(blk, " = (")
+            string_push(blk, string_view(body))
+            string_push(blk, ");")
+        }
+        string_push(blk, " }")
+        if ai == last or cond < 0 {
+            if ai > 0 { string_push(chain, "else ") }
+            string_push(chain, string_view(blk))
+            string_free(bind)
+            string_free(body)
+            string_free(blk)
+            break
+        }
+        if ai > 0 { string_push(chain, "else ") }
+        string_push(chain, "if (_ct")
+        push_uint__cgen(chain, n as i64)
+        string_push(chain, ".err == ")
+        push_uint__cgen(chain, cond as i64)
+        string_push(chain, ") ")
+        string_push(chain, string_view(blk))
+        string_push(chain, " ")
+        string_free(bind)
+        string_free(body)
+        string_free(blk)
+        ai = ai + 1
+    }
+    string_push(sb, "({ ")
+    emit_ty_c(sb, p, src, c, bt)
+    string_push(sb, " _ct")
+    push_uint__cgen(sb, n as i64)
+    string_push(sb, " = ")
+    string_push(sb, base_c)
+    string_push(sb, "; ")
+    if !unit_ok {
+        emit_ty_c(sb, p, src, c, btd.a)
+        string_push(sb, " _cv")
+        push_uint__cgen(sb, m as i64)
+        string_push(sb, "; ")
+    }
+    string_push(sb, "if (_ct")
+    push_uint__cgen(sb, n as i64)
+    string_push(sb, ".is_err) { const int j_")
+    string_push(sb, src[e.x as usize .. e.y as usize])
+    string_push(sb, " = _ct")
+    push_uint__cgen(sb, n as i64)
+    string_push(sb, ".err; (void)j_")
+    string_push(sb, src[e.x as usize .. e.y as usize])
+    string_push(sb, "; ")
+    string_push(sb, string_view(chain))
+    string_push(sb, " }")
+    if unit_ok {
+        string_push(sb, " })")
+    } else {
+        string_push(sb, " else { _cv")
+        push_uint__cgen(sb, m as i64)
+        string_push(sb, " = _ct")
+        push_uint__cgen(sb, n as i64)
+        string_push(sb, ".ok; } _cv")
+        push_uint__cgen(sb, m as i64)
+        string_push(sb, "; })")
+    }
+    string_free(chain)
+}
+
 // Result-struct typedefs. `JestyrResult_str` (the `try_from_utf8` intrinsic's result) is emitted
 // unconditionally up front; fallible user functions add their own (none in `hello`).
 fn emit_result_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg, mut d: Dc) {
-    let sn: i32 = dc_len(d)                           // JestyrResult_str: a no-dep segment
+    // The whole-program payload union (D3) precedes the result typedefs (they
+    // embed it by value); absent from every payload-free program.
+    if err_pay_gated(c) {
+        let un: i32 = dc_len(d)
+        string_push(d.nb, "JestyrErrPay")
+        let ue: i32 = dc_len(d)
+        dc_begin(d, sb_len(sb), un, ue, ue, ue)
+        emit_err_pay_union(sb, p, src, c)
+        dc_end(d, sb_len(sb))
+    }
+    let sn: i32 = dc_len(d)                           // JestyrResult_str (dep: the union when gated)
     string_push(d.nb, "JestyrResult_str")
     let se: i32 = dc_len(d)
-    dc_begin(d, sb_len(sb), sn, se, se, se)
-    string_push(sb, "typedef struct { bool is_err; JestyrStr ok; int err; } JestyrResult_str;\n")
+    if err_pay_gated(c) { dc_dep(d, se, "JestyrErrPay") }
+    dc_begin(d, sb_len(sb), sn, se, se, dc_len(d))
+    string_push(sb, "typedef struct { bool is_err; JestyrStr ok; int err; ")
+    push_pay_field(sb, c)
+    string_push(sb, "} JestyrResult_str;\n")
     dc_end(d, sb_len(sb))
     var seen: String = string_new()
     string_push(seen, "|str|")                        // `try_from_utf8`'s result is pre-seeded
@@ -20039,8 +20466,11 @@ fn emit_result_defs(mut sb: String, read p: Parser, read src: str, read c: Check
         let tn: i32 = dc_len(d)
         string_push(d.nb, "JestyrResult_String")
         let te: i32 = dc_len(d)
-        dc_begin(d, sb_len(sb), tn, te, te, te)
-        string_push(sb, "typedef struct { bool is_err; JestyrString ok; int err; } JestyrResult_String;\n")
+        if err_pay_gated(c) { dc_dep(d, te, "JestyrErrPay") }
+        dc_begin(d, sb_len(sb), tn, te, te, dc_len(d))
+        string_push(sb, "typedef struct { bool is_err; JestyrString ok; int err; ")
+        push_pay_field(sb, c)
+        string_push(sb, "} JestyrResult_String;\n")
         dc_end(d, sb_len(sb))
         string_push(seen, "|String|")
     }
@@ -20065,13 +20495,16 @@ fn emit_result_defs(mut sb: String, read p: Parser, read src: str, read c: Check
                     dc_dep(d, ne, string_view(oc0))
                     string_free(oc0)
                 }
+                if err_pay_gated(c) { dc_dep(d, ne, "JestyrErrPay") }
                 dc_begin(d, sb_len(sb), ns, ne, ne, dc_len(d))
                 string_push(sb, "typedef struct { bool is_err; ")
                 if it.z >= 0 {                        // a unit ok type omits the `ok` field
                     emit_c_ty(sb, p, src, it.z)
                     string_push(sb, " ok; ")
                 }
-                string_push(sb, "int err; } JestyrResult_")
+                string_push(sb, "int err; ")
+                push_pay_field(sb, c)
+                string_push(sb, "} JestyrResult_")
                 string_push(sb, string_view(m))
                 string_push(sb, ";\n")
                 dc_end(d, sb_len(sb))
@@ -20106,13 +20539,16 @@ fn emit_result_defs(mut sb: String, read p: Parser, read src: str, read c: Check
                     dc_dep(d, ne2, string_view(oc2))
                     string_free(oc2)
                 }
+                if err_pay_gated(c) { dc_dep(d, ne2, "JestyrErrPay") }
                 dc_begin(d, sb_len(sb), ns2, ne2, ne2, dc_len(d))
                 string_push(sb, "typedef struct { bool is_err; ")
                 if mf.z >= 0 {
                     emit_su_ty(sb, p, src, c, g, mf.z)
                     string_push(sb, " ok; ")
                 }
-                string_push(sb, "int err; } JestyrResult_")
+                string_push(sb, "int err; ")
+                push_pay_field(sb, c)
+                string_push(sb, "} JestyrResult_")
                 string_push(sb, string_view(m2))
                 string_push(sb, ";\n")
                 dc_end(d, sb_len(sb))
@@ -21491,7 +21927,7 @@ fn emit_fn_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, 
             truncate(i32, g.ens, 0)
             if it.e >= 0 {
                 let ecount: i32 = get(i32, p.far, it.e as usize)
-                let rq: i32 = it.e + 1 + ecount * 2               // req_count slot
+                let rq: i32 = it.e + 1 + ecount * 3               // req_count slot (err TRIPLES)
                 let rqc: i32 = get(i32, p.far, rq as usize)
                 var qi: i32 = 0
                 for qi < rqc { push(i32, g.req, get(i32, p.far, (rq + 1 + qi) as usize))  qi = qi + 1 }
@@ -21556,7 +21992,7 @@ fn emit_fn_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, 
         truncate(i32, g.ens, 0)
         if fd.e >= 0 {
             let ecount: i32 = get(i32, p.far, fd.e as usize)
-            let rq: i32 = fd.e + 1 + ecount * 2
+            let rq: i32 = fd.e + 1 + ecount * 3
             let rqc: i32 = get(i32, p.far, rq as usize)
             var qi: i32 = 0
             for qi < rqc { push(i32, g.req, get(i32, p.far, (rq + 1 + qi) as usize))  qi = qi + 1 }
@@ -22372,14 +22808,23 @@ fn at_params(mut sb: String, read p: Parser, read src: str, pstart: i32, pcount:
 }
 
 // Push a fn's `!{…}` error-set names comma-joined, from its `far` extras at `e`.
+// A payload carrier renders `Name(T)` through at_ty — ONE renderer, so the
+// attested contract and the docs cannot disagree on a payload's spelling
+// (mirrors the reference's `doc::err_name_str`).
 fn at_errnames(mut sb: String, read p: Parser, read src: str, e: i32) {
     let ec: i32 = get(i32, p.far, e as usize)
     var k: i32 = 0
     for k < ec {
         if k > 0 { string_push(sb, ", ") }
-        let ns: i32 = get(i32, p.far, (e + 1 + k * 2) as usize)
-        let ne: i32 = get(i32, p.far, (e + 2 + k * 2) as usize)
+        let ns: i32 = get(i32, p.far, (e + 1 + k * 3) as usize)
+        let ne: i32 = get(i32, p.far, (e + 2 + k * 3) as usize)
         string_push(sb, src[ns as usize .. ne as usize])
+        let ptid: i32 = get(i32, p.far, (e + 3 + k * 3) as usize)
+        if ptid >= 0 {
+            string_push(sb, "(")
+            at_ty__cgen(sb, p, src, ptid)
+            string_push(sb, ")")
+        }
         k = k + 1
     }
 }
@@ -22447,7 +22892,7 @@ fn at_guarantee_phrases(mut gb: String, mut gs: List(i32), read p: Parser, read 
     }
     if it.e >= 0 {
         let ec: i32 = get(i32, p.far, it.e as usize)
-        var idx: i32 = it.e + 1 + ec * 2
+        var idx: i32 = it.e + 1 + ec * 3
         let rc: i32 = get(i32, p.far, idx as usize)
         idx = idx + 1
         var i: i32 = 0

@@ -1472,7 +1472,7 @@ fn parse_fn(mut p: Parser, is_pub: i32, attr_start: i32, attr_count: i32) -> i32
         ret_conv = parse_conv(p)
         ret_ty = parse_type(p)
     }
-    var errs: List(i32) = list.make(i32, p.alloc)   // error-set name spans (pairs)
+    var errs: List(i32) = list.make(i32, p.alloc)   // error-set (start, end, payload) TRIPLES
     if cur_kind(p) == 99 {                           // `!{ Names }` error set
         bump(p)
         if cur_kind(p) == 65 { bump(p) }            // `{`
@@ -1482,7 +1482,21 @@ fn parse_fn(mut p: Parser, is_pub: i32, attr_start: i32, attr_count: i32) -> i32
             if k == 66 { em = false }               // `}`
             else if k == 110 { em = false }         // Eof
             else {
-                if cur_kind(p) == 0 { let t: tokens.Token = cur_tok(p)  list.push(i32, errs, t.start as i32)  list.push(i32, errs, t.end as i32)  bump(p) }
+                if cur_kind(p) == 0 {
+                    let t: tokens.Token = cur_tok(p)
+                    list.push(i32, errs, t.start as i32)
+                    list.push(i32, errs, t.end as i32)
+                    bump(p)
+                    // `Name(T)` -- a payload-carrying error name (error-payloads
+                    // E5): one type in parens, -1 when bare. Mirrors ErrName.
+                    var ptid: i32 = 0 - 1
+                    if cur_kind(p) == 63 {
+                        bump(p)
+                        ptid = parse_type(p)
+                        if cur_kind(p) == 64 { bump(p) }   // `)`
+                    }
+                    list.push(i32, errs, ptid)
+                }
                 if cur_kind(p) == 69 { bump(p) } else { em = false }   // `,`
             }
         }
@@ -1503,9 +1517,10 @@ fn parse_fn(mut p: Parser, is_pub: i32, attr_start: i32, attr_count: i32) -> i32
         } else { cm = false }
     }
     let body: i32 = parse_block(p)
-    // Write the extras block to `far`: err_count, err spans, req_count, req exprs, ens_count, ens exprs.
+    // Write the extras block to `far`: err_count, err (start, end, payload) triples,
+    // req_count, req exprs, ens_count, ens exprs.
     let e_start: i32 = list.len(i32, p.far) as i32
-    list.push(i32, p.far, (list.len(i32, errs) / 2) as i32)
+    list.push(i32, p.far, (list.len(i32, errs) / 3) as i32)
     var ei: usize = 0
     for ei < list.len(i32, errs) { list.push(i32, p.far, list.get(i32, errs, ei))  ei = ei + 1 }
     list.push(i32, p.far, list.len(i32, reqs) as i32)
@@ -2822,8 +2837,10 @@ fn attrs_has_volatile(read src: str, read p: Parser, attr_start: i32, attr_count
     return 0
 }
 
-// Dump a fn's "extras" block at `far[e…]`: the error-set names `<count> <(errname s e)>s`,
-// then the `requires` exprs `<count> <expr>s`, then the `ensures` exprs `<count> <expr>s`.
+// Dump a fn's "extras" block at `far[e…]`: the error-set names `<count> <(errname s e)
+// <payload-type|(none)>>s`, then the `requires` exprs `<count> <expr>s`, then the
+// `ensures` exprs `<count> <expr>s`. The payload record (error-payloads E5) grew on
+// BOTH sides of the P2 golden in the same increment.
 fn dump_fn_extras(read src: str, read p: Parser, e: i32) {
     var idx: i32 = e
     let err_count: i32 = list.get(i32, p.far, idx as usize)
@@ -2834,7 +2851,10 @@ fn dump_fn_extras(read src: str, read p: Parser, e: i32) {
         let s: i32 = list.get(i32, p.far, idx as usize)
         let en: i32 = list.get(i32, p.far, (idx + 1) as usize)
         print_str("(") print_str("errname") print_int(s as i64) print_int(en as i64) print_str(")")
-        idx = idx + 2
+        let ptid: i32 = list.get(i32, p.far, (idx + 2) as usize)
+        if ptid >= 0 { dump_type(src, p, ptid) }
+        else { print_str("(") print_str("none") print_str(")") }
+        idx = idx + 3
         i = i + 1
     }
     let req_count: i32 = list.get(i32, p.far, idx as usize)

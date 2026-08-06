@@ -78,7 +78,7 @@ import "ctfe"
 // row) and `icalls` each impl-dispatched call (5-tuples: call ExprId, trait name span, method
 // name span) — the downstream passes' `method_calls`/`impl_calls` (the escape checker's
 // give-away and manual-drop rules read them).
-pub struct Checker { pub tys: List(TyData), pub tya: List(i32), pub et: List(i32), scn: List(i32), scst: List(i32), pub tdecl: List(i32), pub tch: List(i32), pub fns: List(i32), cst: List(i32), vmap: List(i32), tra: List(i32), imp: List(i32), pub mcalls: List(i32), pub icalls: List(i32), pub bcalls: List(i32), pub dcalls: List(i32), pub dcoerce: List(i32), selfty: i32, expected: i32, curret: i32, scfloor: i32, gbs: i32, gbc: i32, alloc: Allocator }
+pub struct Checker { pub tys: List(TyData), pub tya: List(i32), pub et: List(i32), scn: List(i32), scst: List(i32), pub tdecl: List(i32), pub tch: List(i32), pub fns: List(i32), cst: List(i32), vmap: List(i32), tra: List(i32), imp: List(i32), pub mcalls: List(i32), pub icalls: List(i32), pub bcalls: List(i32), pub dcalls: List(i32), pub dcoerce: List(i32), pub epay: List(i32), selfty: i32, expected: i32, curret: i32, scfloor: i32, gbs: i32, gbc: i32, alloc: Allocator }
 
 // One `Ty` arena node - kinds in the header comment. `a`/`b` are child TyIds or slice fields;
 // `x`/`y` are aux ints (prim code, name span, ret TyId/conv).
@@ -106,7 +106,7 @@ fn mk_ty(mut c: Checker, kind: i32, a: i32, b: i32, x: i32, y: i32) -> i32 {
 // The checker with the well-known instances pre-created (ids 0..7) and `et` sized to the
 // expression arena, all-Unknown.
 fn make_checker(read p: parser.Parser, read a: Allocator) -> Checker {
-    var c: Checker = Checker{ tys: list.make(TyData, a), tya: list.make(i32, a), et: list.make(i32, a), scn: list.make(i32, a), scst: list.make(i32, a), tdecl: list.make(i32, a), tch: list.make(i32, a), fns: list.make(i32, a), cst: list.make(i32, a), vmap: list.make(i32, a), tra: list.make(i32, a), imp: list.make(i32, a), mcalls: list.make(i32, a), icalls: list.make(i32, a), bcalls: list.make(i32, a), dcalls: list.make(i32, a), dcoerce: list.make(i32, a), selfty: 1, expected: 0 - 1, curret: 0 - 1, scfloor: 0, gbs: 0 - 1, gbc: 0, alloc: a }
+    var c: Checker = Checker{ tys: list.make(TyData, a), tya: list.make(i32, a), et: list.make(i32, a), scn: list.make(i32, a), scst: list.make(i32, a), tdecl: list.make(i32, a), tch: list.make(i32, a), fns: list.make(i32, a), cst: list.make(i32, a), vmap: list.make(i32, a), tra: list.make(i32, a), imp: list.make(i32, a), mcalls: list.make(i32, a), icalls: list.make(i32, a), bcalls: list.make(i32, a), dcalls: list.make(i32, a), dcoerce: list.make(i32, a), epay: list.make(i32, a), selfty: 1, expected: 0 - 1, curret: 0 - 1, scfloor: 0, gbs: 0 - 1, gbc: 0, alloc: a }
     mk_ty(c, 0, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 0 Unknown
     mk_ty(c, 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 1 Unit
     mk_ty(c, 2, 0 - 1, 0 - 1, 2, 0 - 1)            // 2 Prim i32   (code 2)
@@ -1966,10 +1966,58 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
         if d.op == 1 {
             infer(c, p, src, d.b)
         } else {
-            let saved: i32 = c.expected
-            if bd.kind == 5 { c.expected = bd.a } else { c.expected = 0 - 1 }
-            infer(c, p, src, d.b)
-            c.expected = saved
+            // `catch |e| match e { … }` -- the payload extractor (error-payloads
+            // E5, mirroring `check_err_match`): when the fallback is a match
+            // over the binder itself, each arm body is a fallback value typed
+            // against the ok type, a Variant arm's binder gets the DECLARED
+            // payload type (from `c.epay`), and the Match node records the ok
+            // type. Exhaustiveness/refusals are the reference's job; a valid
+            // program has already passed them, so the port only records types.
+            var extracted: bool = false
+            if d.x >= 0 and bd.kind == 5 {         // the reference bails pre-extractor on a non-Result base
+                let fb: parser.ExprData = list.get(parser.ExprData, p.ex, d.b as usize)
+                if fb.kind == 28 {
+                    let scd: parser.ExprData = list.get(parser.ExprData, p.ex, fb.a as usize)
+                    if scd.kind == 2 {
+                        if str_eq(src[scd.start .. scd.end], src[d.x as usize .. d.y as usize]) {
+                            extracted = true
+                            infer(c, p, src, fb.a)             // the binder read: `error`
+                            var okid: i32 = 0 - 1
+                            if bd.kind == 5 { okid = bd.a }
+                            var ai: i32 = 0
+                            for ai < fb.y {
+                                let abase: i32 = fb.x + ai * 3
+                                push_scope(c)
+                                let pd: parser.PatData = list.get(parser.PatData, p.pt, list.get(i32, p.par, abase as usize) as usize)
+                                if pd.kind == 2 and pd.a > 0 {   // Variant `Name(x)`
+                                    let sp: parser.PatData = list.get(parser.PatData, p.pt, list.get(i32, p.par, pd.op as usize) as usize)
+                                    if sp.kind == 1 {            // an Ident binder
+                                        let ptid: i32 = err_payload_of(c, src, pd.x, pd.y)
+                                        var pbt: i32 = t_unknown()
+                                        if ptid >= 0 { pbt = lower_type(c, p, src, ptid) }
+                                        scope_insert(c, sp.start as i32, sp.end as i32, pbt)
+                                    }
+                                }
+                                let savedm: i32 = c.expected
+                                c.expected = okid
+                                infer(c, p, src, list.get(i32, p.par, (abase + 2) as usize))
+                                c.expected = savedm
+                                pop_scope(c)
+                                ai = ai + 1
+                            }
+                            var mt: i32 = okid
+                            if mt < 0 { mt = t_unknown() }
+                            list.set(i32, c.et, d.b as usize, mt)
+                        }
+                    }
+                }
+            }
+            if !extracted {
+                let saved: i32 = c.expected
+                if bd.kind == 5 { c.expected = bd.a } else { c.expected = 0 - 1 }
+                infer(c, p, src, d.b)
+                c.expected = saved
+            }
         }
         pop_scope(c)
         if bd.kind == 5 { r = bd.a } else { r = mk_ty(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1) }
@@ -2627,9 +2675,69 @@ fn dump_types(read src: str, read c: Checker, read p: parser.Parser, read a: All
 // Type-check an already-parsed program: build the global table, walk the bodies, return the
 // populated Checker (its `et`/`tys`/records are the downstream passes' TypeInfo). The library
 // entry the escape checker (and later cgen) build on.
+// The whole-program error-payload map (error-payloads E5, mirroring the
+// reference's `collect_err_payloads`): every `Name(T)` in any fn's or struct
+// method's error set records a (name_start, name_end, payload_TypeId) triple in
+// `c.epay`, first declaration wins. D1 (agreement across sites) is checked by
+// the reference; the port carries the map for TYPING — the match binder's
+// declared type — and for cgen's union/member emission, and a valid program
+// has already passed the reference's checks.
+fn build_err_payloads(mut c: Checker, read p: parser.Parser, read src: str) {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 3 and it.e >= 0 { epay_scan_far(c, p, it.e) }
+        if it.kind == 4 {
+            var m: i32 = 0
+            for m < it.b {
+                let mbase: i32 = it.a + m * 10
+                if list.get(i32, p.mar, mbase as usize) == 1 {   // tag 1 = method
+                    let mfd: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, p.mar, (mbase + 1) as usize) as usize)
+                    if mfd.e >= 0 { epay_scan_far(c, p, mfd.e) }
+                }
+                m = m + 1
+            }
+        }
+        r = r + 1
+    }
+}
+
+// Scan one `far` extras block for payload-carrying names (err TRIPLES).
+fn epay_scan_far(mut c: Checker, read p: parser.Parser, e: i32) {
+    let ec: i32 = list.get(i32, p.far, e as usize)
+    var k: i32 = 0
+    for k < ec {
+        let ptid: i32 = list.get(i32, p.far, (e + 3 + k * 3) as usize)
+        if ptid >= 0 {
+            list.push(i32, c.epay, list.get(i32, p.far, (e + 1 + k * 3) as usize))
+            list.push(i32, c.epay, list.get(i32, p.far, (e + 2 + k * 3) as usize))
+            list.push(i32, c.epay, ptid)
+        }
+        k = k + 1
+    }
+}
+
+// The declared payload TypeId of the error name at `src[ns..ne]`, -1 when bare
+// or undeclared. Text comparison, since a use site's span never equals the
+// declaration's.
+pub fn err_payload_of(read c: Checker, read src: str, ns: i32, ne: i32) -> i32 {
+    var i: usize = 0
+    for i < list.len(i32, c.epay) {
+        let ds: i32 = list.get(i32, c.epay, i)
+        let de: i32 = list.get(i32, c.epay, i + 1)
+        if str_eq(src[ns as usize .. ne as usize], src[ds as usize .. de as usize]) {
+            return list.get(i32, c.epay, i + 2)
+        }
+        i = i + 3
+    }
+    return 0 - 1
+}
+
 pub fn check_parsed(read p: parser.Parser, read src: str, read a: Allocator) -> Checker {
     var c: Checker = make_checker(p, a)
     build_table(c, p, src)
+    build_err_payloads(c, p, src)
     walk_items(c, p, src)
     return c
 }

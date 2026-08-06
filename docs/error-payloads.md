@@ -309,7 +309,7 @@ caller matches on it), a parameter's or a static's is fine. Concretely:
 | E2 | ✅ Typed sets (`Ty::Result(ok, errs)`, display unchanged) + strict `err`∈set and `?`-inclusion diagnostics — **all goldens green, zero drift** | none | not until a corpus file needs the set (E4) — display-dodge holds the P3 golden still |
 | E3 | ✅ Payload declaration/creation/propagation, reference side: parser (`Name(T)` in sets), D1 agreement check, the gated union + `.pay` emission, `err(Name(v))`, blind-copy hops, escape arms — **all landed; corpus/concat/test-mode/fixpoint/seed all byte-identical, so the gate held** | **yes, gated on use** — zero corpus files use it, so all goldens stay green | not yet (the standing trigger: no corpus file until the mirror) |
 | E4 | ✅ `catch |e| match e { … }` + exhaustiveness, reference side — **landed with the tag-1 wart fix (intrinsics emit the user tag when the name is declared, literal 1 otherwise — corpus-invisible, discrimination proven by running); the extractor is INLINE-ONLY (the match must be the immediate fallback over the binder), which put the static set in hand with zero new type plumbing** | gated on use | not yet |
-| E5 | **The port mirror + the first corpus file** (`examples/error_payload.jtr`): parser.jtr / typeck.jtr (side-arena sets) / cgen.jtr / escape.jtr arms, attest+doc renderers, corpus 147, `REFRESH_SEED=1` | the corpus file's own C | **yes — all of it, one increment**, as `catch`'s mirror landed |
+| E5 | ✅ **The port mirror + the first corpus file** (`examples/error_payload.jtr`) — **DONE, byte-identical on the first full comparison after one crash fix** (the Ident-pattern span convention, recorded below). parser.jtr (`Name(T)` parse, `far` err records grown to TRIPLES) / typeck.jtr (`c.epay` + the inline catch-match typing — a payload map, not side-arena sets: the port never needed typed sets, only the binder types) / cgen.jtr (union, pay field/init/copies, `emit_err_match`, both wart halves, at_ renderers) / escape.jtr (the return-position payload arm), corpus 147, `REFRESH_SEED=1` | the corpus file's own C | ✅ landed all-at-once, as `catch`'s mirror did |
 | E6+ | Trait error sets; named sets; owning payloads (drop design first) | later | later |
 
 **What E3's landing taught (recorded for E4/E5):**
@@ -368,6 +368,35 @@ caller matches on it), a parameter's or a static's is fine. Concretely:
   match arms and catch fallbacks together is one future increment, not two.
 * **Guards are refused on error arms** (they would break exhaustiveness
   accounting); revisit only with the enum-match machinery's guarded-arm rules.
+
+**What E5's landing taught (the port-mirror findings):**
+
+* **The Ident-pattern span convention cost the one crash.** In the port's
+  pattern arena, a kind-1 `Ident` pattern's NAME is its own `start`/`end` span —
+  its `x`/`y` are **-1** (only the kind-2 `Variant` pattern carries the name in
+  `x`/`y`). Reading `pd.x as usize` on an Ident pattern indexes the source with
+  a huge number and dies on the slice assert. Symptom: the port exe aborts with
+  `start <= end && end <= s.len` from the generated C's bounds check.
+* **A `far`-record stride change is the flat-arena analogue of an AST-shape
+  change.** Growing err records from (start, end) pairs to (start, end, payload)
+  triples touched FIVE reader regions across parser.jtr and cgen.jtr (the tag
+  scan, two requires/ensures offset computations, the attest/doc sig renderer,
+  the guarantee-lines reader) — grep every consumer of the record before
+  changing it, exactly as an `ErrName` change swept the Rust side.
+* **The port never needed typed sets.** The reference's E2 (`Ty::Result(ok,
+  errs)`) exists for *diagnostics*, which a valid corpus file never triggers —
+  so the port's mirror is a payload MAP (`c.epay`, name-span triples) consulted
+  for binder types and union members, plus faithful type *recording* in the
+  inline catch-match. The display-dodge from E2 (carry, don't render) meant the
+  P3 golden never saw a difference.
+* **The E1 census owed an update too**: `err(Name(v))` classified as "non-name
+  argument" unresolved until the census learned the applied spelling — tooling
+  that models the language must grow with it, and the corpus-pinned census test
+  is what caught the omission.
+* **Byte-identity was achieved by mirroring the reference's emit strings
+  character-for-character** (including the `_cv`-before-bodies temp order and
+  the last-arm-unconditional chain shape) — the same discipline as every prior
+  mirror, and it held on the first run once the pattern-span crash was fixed.
 
 Test plan highlights (beyond the standing gate): a run-based two-hop propagation test
 that matches at the top and prints the payload (proves the blind union copy end to

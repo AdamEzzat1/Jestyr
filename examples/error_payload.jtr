@@ -1,0 +1,49 @@
+// examples/error_payload.jtr — payload-carrying errors (error-payloads E3–E5).
+// An error NAME can carry one value: `TooBig(i64)` declares it (a property of the
+// name, whole-program), `err(TooBig(n))` creates it, every `?` hop copies the
+// payload BLIND (one union assignment — no knowledge of the live member), and
+// `catch |e| match e { … }` is the one way to read it back: exhaustive over the
+// static set, `_` as the catch-all, bare arms legal on carriers.
+//
+// Run:  jestyrc run examples/error_payload.jtr
+//   →  11, 500, -1, -400, 7, 1, 500
+
+fn f(n: i64) -> i64 !{ Empty, TooBig(i64), BadKey(str) } {
+    if n == 0 { return err(Empty) }
+    if n > 99 { return err(TooBig(n)) }
+    if n < 0 - 99 { return err(BadKey("oops")) }
+    return ok(n * 2)
+}
+
+// One `?` hop: the payload crosses inside the result struct, untouched.
+fn hop(n: i64) -> i64 !{ Empty, TooBig(i64), BadKey(str) } {
+    let v = f(n)?
+    return ok(v + 1)
+}
+
+// The rethrow form is `?` spelled out — tag AND payload preserved across it.
+fn rehop(n: i64) -> i64 !{ Empty, TooBig(i64), BadKey(str) } {
+    let v: i64 = f(n) catch |e| return e
+    return ok(v + 1)
+}
+
+// The extractor: arms are error names; `TooBig(v)` binds the declared i64,
+// `BadKey(m)` the declared str (observed through its length), `Empty` is bare.
+fn classify(n: i64) -> i64 {
+    return hop(n) catch |e| match e {
+        Empty     => 0 - 1,
+        TooBig(v) => v,
+        BadKey(m) => (m.len as i64) * (0 - 100),
+    }
+}
+
+fn main() -> i32 {
+    print_int(classify(5))                                                   // 11: the ok path
+    print_int(classify(500))                                                 // 500: the payload, through the hop
+    print_int(classify(0))                                                   // -1: a bare error coexists
+    print_int(classify(0 - 500))                                             // -400: "oops".len * -100
+    print_int(hop(500) catch |e| match e { TooBig => 7, _ => (e as i64) })   // 7: a bare arm ignores the payload
+    print_int(hop(0) catch |e| match e { TooBig => 7, _ => (e as i64) })     // 1: the binder inside an arm body
+    print_int(rehop(500) catch |e| match e { TooBig(v) => v, _ => 0 })       // 500: rethrow kept the payload
+    return 0
+}
