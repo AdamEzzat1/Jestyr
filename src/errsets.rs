@@ -108,7 +108,7 @@ struct Owner {
 }
 
 fn set_of(es: &Option<crate::ast::ErrorSet>) -> Option<BTreeSet<String>> {
-    es.as_ref().map(|e| e.names.iter().map(|n| n.name.clone()).collect())
+    es.as_ref().map(|e| e.names.iter().map(|n| n.name.name.clone()).collect())
 }
 
 fn render_set(s: &BTreeSet<String>) -> String {

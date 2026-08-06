@@ -19,16 +19,22 @@ byte-identical) + concat + test-mode; P2/P3/P4 goldens; `selfhost_fixpoint_full`
 1. **Richer error payloads.** The design note is `docs/error-payloads.md` — payload
    is a property of the NAME whole-program; one program-wide payload union so `?`
    hops copy it blind, gated on use; `catch |e| match e { … }` as the only
-   extractor. **E1 and E2 are DONE on master**: the census (`jestyrc errsets`,
-   zero corpus violations) and typed-and-enforced sets (`Ty::Result(ok, errs)` —
-   carried, never displayed, so every golden stayed green; strict `err`∈set +
-   `?`/rethrow inclusion diagnostics, flowing through bindings). **Next is E3:
-   payload declaration/creation/propagation on the reference side** — `Name(T)` in
-   set syntax, the D1 whole-program agreement check, the gated `JestyrErrPay`
-   union + `.pay` emission, blind-copy hops, and the escape arms (`err(Name(s))`
-   is a return of `s`). Gated on use → zero corpus movement until E5 (the port
-   mirror + first corpus file + seed, all in one increment). Known pre-work for
-   E4: the intrinsic tag-1 wart (note §6).
+   extractor. **E1, E2 and E3 are DONE**: the census (`jestyrc errsets`, zero
+   corpus violations), typed-and-enforced sets (`Ty::Result(ok, errs)` — carried,
+   never displayed, so every golden stayed green), and **payloads themselves on
+   the reference side** — `Name(T)` set syntax, the D1 agreement check (conflicts
+   reported at BOTH sites, first declaration wins the map), the v1 domain
+   (scalars + `str`; owning/aggregate refused with the reason), the gated
+   `JestyrErrPay` union + `.pay` on every result struct, `err(Name(v))` with the
+   declared-member initializer and `{0}` for bare names, blind-copy `?`/rethrow
+   hops, intrinsic err sites zeroing pay, and the escape arm (`err(Name(p))`
+   walks `p` in RETURN position — the region rules fire verbatim, zero new
+   diagnostics). Full gate re-run green: corpus/concat/test-mode byte-identical,
+   fixpoint + self-build + seed current. **Next is E4: `catch |e| match e { … }`**
+   — the extractor, exhaustive over the base's static set (E2 carries it), with
+   the intrinsic tag-1 wart (note §6) to resolve before match can discriminate
+   IoError. Then E5: the port mirror + first corpus file + seed, one increment —
+   the P2 dump note in `error-payloads.md` §10 lists what both dumps must grow.
 2. **Error sets in TRAIT signatures** — unlocks fallible trait-impl methods, which are
    currently refused at check time with the reason (calls are typed by the trait's
    signature, which cannot declare an error set). The refusal sites to lift are marked:

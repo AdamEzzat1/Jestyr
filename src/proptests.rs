@@ -7122,11 +7122,14 @@ mod c_oracle {
         match &f.errors {
             Some(es) => {
                 out.push(es.names.len().to_string());
+                // Dumped by NAME span, as before ErrName existed: no corpus file
+                // declares a payload, so the port's dump needs no new field until
+                // E5 — where both dumps grow the payload type together.
                 for n in &es.names {
                     out.push("(".to_string());
                     out.push("errname".to_string());
-                    out.push(n.span.start.to_string());
-                    out.push(n.span.end.to_string());
+                    out.push(n.name.span.start.to_string());
+                    out.push(n.name.span.end.to_string());
                     out.push(")".to_string());
                 }
             }
@@ -10220,6 +10223,50 @@ fn main() -> i32 {
             run_inline("catch-binder", src),
             ["1", "2", "7", "1", "2"],
             "the binder read the wrong tag, or rethrow did not preserve which error"
+        );
+    }
+
+    /// **Error payloads end to end (E3): the gated C compiles and behaves.**
+    ///
+    /// No extractor exists yet (`catch |e| match e` is E4), so a payload cannot be
+    /// *read* — what this proves by RUNNING is everything E3 claims: a payload
+    /// program's C compiles under the locked flags (the union typedef, the `pay`
+    /// field, the designated initializers), creation/propagation/recovery all
+    /// still behave, a `?` hop and a rethrow carry the error through, the tag
+    /// still surfaces via `e as i64`, and a bare `err` coexists with payload
+    /// carriers in one program. Behavior must be EXACTLY the tag-only world's —
+    /// payloads ride along; they change no answers until something reads them.
+    #[test]
+    fn error_payloads_compile_and_stay_behaviorally_inert() {
+        let src = "\
+fn f(n: i64) -> i64 !{ Empty, TooBig(i64), BadKey(str) } {
+    if n == 0 { return err(Empty) }
+    if n > 99 { return err(TooBig(n)) }
+    if n < 0 - 99 { return err(BadKey(\"neg\")) }
+    return ok(n * 2)
+}
+fn hop(n: i64) -> i64 !{ Empty, TooBig(i64), BadKey(str) } {
+    let v = f(n)?
+    return ok(v + 1)
+}
+fn rehop(n: i64) -> i64 !{ Empty, TooBig(i64), BadKey(str) } {
+    let v: i64 = f(n) catch |e| return e
+    return ok(v + 1)
+}
+fn main() -> i32 {
+    print_int(hop(5) catch 0 - 1)                      // ok path -> 11
+    print_int(hop(500) catch 0 - 1)                    // TooBig through the hop -> -1
+    print_int(hop(500) catch |e| (e as i64))           // the tag still surfaces -> 2
+    print_int(hop(0) catch |e| (e as i64))             // bare Empty coexists -> 1
+    print_int(hop(0 - 500) catch |e| (e as i64))       // str payload propagates -> 3
+    print_int(rehop(500) catch |e| (e as i64))         // rethrow carries it too -> 2
+    return 0
+}
+";
+        assert_eq!(
+            run_inline("error-payloads", src),
+            ["11", "-1", "2", "1", "3", "2"],
+            "payloads must ride along without changing any observable answer"
         );
     }
 

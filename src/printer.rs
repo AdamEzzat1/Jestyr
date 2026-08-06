@@ -185,7 +185,14 @@ impl<'a> Printer<'a> {
             self.line(d + 1, &format!("returns: {}{}", conv, self.type_str(t)));
         }
         if let Some(es) = &f.errors {
-            let names: Vec<&str> = es.names.iter().map(|n| n.name.as_str()).collect();
+            let names: Vec<String> = es
+                .names
+                .iter()
+                .map(|n| match n.payload {
+                    Some(t) => format!("{}({})", n.name.name, self.type_str(t)),
+                    None => n.name.name.clone(),
+                })
+                .collect();
             self.line(d + 1, &format!("errors: !{{ {} }}", names.join(", ")));
         }
         self.line(d + 1, "body:");

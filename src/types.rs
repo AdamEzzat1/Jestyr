@@ -452,6 +452,12 @@ pub struct TypeInfo {
     /// `Call`-expr id → the method name of a `dyn Trait` call, dispatched through
     /// the vtable slot (the trait is implicit in the receiver's fat-pointer type).
     pub dyn_calls: HashMap<ExprId, String>,
+    /// Error names that carry a payload → the payload's type (error-payloads E3;
+    /// D1 makes this whole-program). Empty for every payload-free program, which
+    /// is the backend's gate: no entry here ⇒ not one byte of payload machinery
+    /// in the emitted C. BTreeMap so the backend's union emission is
+    /// deterministic without a second sort.
+    pub err_payloads: std::collections::BTreeMap<String, Ty>,
 }
 
 impl TypeInfo {

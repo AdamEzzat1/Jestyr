@@ -307,10 +307,38 @@ caller matches on it), a parameter's or a static's is fine. Concretely:
 |---|---|---|---|
 | E1 | ✅ Set census (`jestyrc errsets`) + the corpus audit — **zero violations, enforcement needs no migration** | none | no |
 | E2 | ✅ Typed sets (`Ty::Result(ok, errs)`, display unchanged) + strict `err`∈set and `?`-inclusion diagnostics — **all goldens green, zero drift** | none | not until a corpus file needs the set (E4) — display-dodge holds the P3 golden still |
-| E3 | Payload declaration/creation/propagation, reference side: parser (`Name(T)` in sets), D1 agreement check, the gated union + `.pay` emission, `err(Name(v))`, blind-copy hops, escape arms | **yes, gated on use** — zero corpus files use it, so all goldens stay green | not yet (the standing trigger: no corpus file until the mirror) |
+| E3 | ✅ Payload declaration/creation/propagation, reference side: parser (`Name(T)` in sets), D1 agreement check, the gated union + `.pay` emission, `err(Name(v))`, blind-copy hops, escape arms — **all landed; corpus/concat/test-mode/fixpoint/seed all byte-identical, so the gate held** | **yes, gated on use** — zero corpus files use it, so all goldens stay green | not yet (the standing trigger: no corpus file until the mirror) |
 | E4 | `catch |e| match e { … }` + exhaustiveness, reference side | gated on use | not yet |
 | E5 | **The port mirror + the first corpus file** (`examples/error_payload.jtr`): parser.jtr / typeck.jtr (side-arena sets) / cgen.jtr / escape.jtr arms, attest+doc renderers, corpus 147, `REFRESH_SEED=1` | the corpus file's own C | **yes — all of it, one increment**, as `catch`'s mirror landed |
 | E6+ | Trait error sets; named sets; owning payloads (drop design first) | later | later |
+
+**What E3's landing taught (recorded for E4/E5):**
+
+* **The escape rule cost zero new diagnostics.** `err(Name(p))` walks `p` in
+  RETURN position, and the existing return rules do everything: a region-allocated
+  `str` payload is refused with the verbatim region-return message, while a plain
+  `str` parameter payload passes — correctly, since a view of caller-owned data
+  survives the return. §7's wording held as written. The arm fires only for the
+  unshadowed constructor with a declared payload name, so the corpus's own
+  `Result(T, E) { ok, err }` variant is untouched (P4 golden unchanged).
+* **The P2 reference dump hid behind a feature gate.** `ref_dump`'s `errname`
+  records (proptests.rs, `c-oracle` only) needed the `ErrName` field path fix, and
+  a plain `cargo test` could not see it — **an AST-shape change is not
+  compile-clean until the feature builds compile too.** The dump still records the
+  NAME span only, deliberately: no corpus file declares a payload, so the port's
+  dump needs no new field until E5, where both dumps grow the payload type
+  together.
+* **The intrinsics compose with a future `IoError(T)`.** `try_read_file` /
+  `try_from_utf8` construct errors inline; under the gate they carry an explicit
+  `.pay = {0}`, so no indeterminate bytes can flow through a blind hop copy even
+  if a user declares a payload on the intrinsic's tag-1-aliased name.
+* **After a D1 conflict, the FIRST declaration wins the payload map**, so
+  subsequent uses are checked against it deterministically — a conflicting
+  program gets the two located conflict diagnostics plus honest downstream
+  checking, not a cascade of arbitrary verdicts.
+* **Behavioral inertness is pinned by running**: the c-oracle test proves the
+  gated C compiles under the locked flags and that every observable answer equals
+  the tag-only world's — payloads ride along; nothing changes until E4 reads them.
 
 Test plan highlights (beyond the standing gate): a run-based two-hop propagation test
 that matches at the top and prints the payload (proves the blind union copy end to

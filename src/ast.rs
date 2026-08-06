@@ -402,9 +402,18 @@ pub struct Param {
     pub span: Span,
 }
 
+/// One name in an error set: `Io` or `Parse(i64)`. The payload type is a
+/// property of the NAME, whole-program (error-payloads D1) — every declaration
+/// site restates it, and disagreement is a compile error.
+#[derive(Clone, Debug)]
+pub struct ErrName {
+    pub name: Ident,
+    pub payload: Option<TypeId>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ErrorSet {
-    pub names: Vec<Ident>,
+    pub names: Vec<ErrName>,
     pub span: Span,
 }
 

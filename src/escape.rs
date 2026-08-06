@@ -537,6 +537,24 @@ impl<'a> Checker<'a> {
                 return;
             }
             ExprKind::Call { callee, args } => {
+                // Error-payloads E3: `err(Name(p))` RETURNS its payload — the value
+                // rides the result out of the frame — so `p` is walked in RETURN
+                // position and the existing return-borrow rules do the work (a
+                // `str` payload rooted in a borrow place is refused; a literal or
+                // owned scalar passes). Fires only for the real error constructor:
+                // a user fn or enum variant named `err` shadows it (the corpus's
+                // `Result(T, E)` does), and only for a declared payload name.
+                if let Some((ic, p)) = self.err_payload_form(*callee, args) {
+                    self.walk_expr(ctx, *callee, false);
+                    self.walk_expr(ctx, ic, false);
+                    self.walk_expr(ctx, p, true);
+                    self.check_give_away(ctx, id, *callee, args);
+                    self.check_loop_mutation(ctx, id, *callee, args);
+                    self.check_no_alloc_call(id, *callee, span);
+                    self.check_deterministic_call(id, *callee, span);
+                    self.check_manual_drop(id, span);
+                    return;
+                }
                 // Passing a borrow *down* is the allowed case — UNLESS the callee
                 // is a known function whose matching parameter is `take` (owning):
                 // you can't hand ownership of something you only borrowed.
@@ -825,6 +843,36 @@ impl<'a> Checker<'a> {
                 );
             }
         }
+    }
+
+    /// Recognize the payload-carrying error construction `err(Name(p))`
+    /// (error-payloads E3), returning the inner callee and the payload expression.
+    /// `None` when `err` is shadowed by a user fn or enum variant of that name
+    /// (then it is an ordinary call/construction), or when the head is not a
+    /// declared payload name.
+    fn err_payload_form(&self, callee: ExprId, args: &[ExprId]) -> Option<(ExprId, ExprId)> {
+        let ExprKind::Name(n) = &self.ast.expr_at(callee).kind else { return None };
+        if n.name != "err" || args.len() != 1 || self.info.err_payloads.is_empty() {
+            return None;
+        }
+        let shadowed = self.info.table.fns.contains_key("err")
+            || self
+                .info
+                .table
+                .variants
+                .keys()
+                .any(|k| k == "err" || k.starts_with("err__m"));
+        if shadowed {
+            return None;
+        }
+        let ExprKind::Call { callee: ic, args: ia } = &self.ast.expr_at(args[0]).kind else {
+            return None;
+        };
+        let ExprKind::Name(en) = &self.ast.expr_at(*ic).kind else { return None };
+        if !self.info.err_payloads.contains_key(&en.name) {
+            return None;
+        }
+        ia.first().map(|p| (*ic, *p))
     }
 
     /// Does this expression's type carry a *pointer into* the arena (so letting it
@@ -1601,6 +1649,33 @@ mod tests {
             "fn f() -> str { region r { let g: str = region_concat(r, \"a\", \"b\") return g } return \"\" }",
         );
         assert!(d.iter().any(|m| m.message.contains("region-allocated")), "{:?}", d);
+    }
+
+    /// Error-payloads E3: `err(Name(p))` returns its payload, so the existing
+    /// return rules apply to `p` — a region-allocated `str` payload would dangle
+    /// by the time the caller could read it, and is refused exactly as a plain
+    /// `return` of it is.
+    #[test]
+    fn a_region_str_payload_is_refused_like_a_return() {
+        let d = escapes(
+            "fn f() -> i32 !{ Bad(str) } { \
+               region r { let g: str = region_concat(r, \"a\", \"b\") return err(Bad(g)) } \
+               return ok(1) }",
+        );
+        assert!(d.iter().any(|m| m.message.contains("region-allocated")), "{:?}", d);
+    }
+
+    /// The payloads that carry no borrow — a literal `str` and an owned scalar —
+    /// pass, so the rule refuses dangling, not payloads.
+    #[test]
+    fn literal_and_scalar_payloads_pass_the_escape_check() {
+        let d = escapes(
+            "fn f(n: i64) -> i32 !{ Bad(str), TooBig(i64) } { \
+               if n > 9 { return err(TooBig(n)) } \
+               if n < 0 - 9 { return err(Bad(\"oops\")) } \
+               return ok(1) }",
+        );
+        assert!(d.is_empty(), "{d:?}");
     }
 
     #[test]

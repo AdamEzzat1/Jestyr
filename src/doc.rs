@@ -460,10 +460,20 @@ pub(crate) fn fn_guarantees(ast: &Ast, src: &str, f: &FnDecl) -> Vec<String> {
         }
     }
     if let Some(es) = &f.errors {
-        let names: Vec<&str> = es.names.iter().map(|n| n.name.as_str()).collect();
+        let names: Vec<String> = es.names.iter().map(|n| err_name_str(ast, n)).collect();
         g.push(format!("may fail with `!{{ {} }}`", names.join(", ")));
     }
     g
+}
+
+/// Render one error-set name — `Io`, or `Parse(i64)` for a payload carrier.
+/// Shared by the guarantee extractor and the signature reconstructor, so the
+/// attested contract and the docs cannot disagree on a payload's spelling.
+pub(crate) fn err_name_str(ast: &Ast, n: &crate::ast::ErrName) -> String {
+    match n.payload {
+        Some(t) => format!("{}({})", n.name.name, ty_str(ast, t)),
+        None => n.name.name.clone(),
+    }
 }
 
 /// The exact source text of an expression (faithful, and avoids re-printing).
@@ -496,7 +506,7 @@ pub(crate) fn fn_sig(ast: &Ast, src: &str, f: &FnDecl) -> String {
         s.push_str(&ty_str(ast, t));
     }
     if let Some(es) = &f.errors {
-        let names: Vec<&str> = es.names.iter().map(|n| n.name.as_str()).collect();
+        let names: Vec<String> = es.names.iter().map(|n| err_name_str(ast, n)).collect();
         s.push_str(&format!(" !{{ {} }}", names.join(", ")));
     }
     s

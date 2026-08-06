@@ -66,9 +66,11 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
         cur_expected: None,
         cur_ret: None,
         cur_errs: None,
+        err_payloads: std::collections::BTreeMap::new(),
         diags: Vec::new(),
     };
     tc.build_table();
+    tc.collect_err_payloads();
     tc.audit_type_paths();
     tc.check_items();
     (
@@ -96,6 +98,7 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
             bound_method_calls: tc.bound_method_calls,
             dyn_coercions: tc.dyn_coercions,
             dyn_calls: tc.dyn_calls,
+            err_payloads: tc.err_payloads,
         },
         tc.diags,
     )
@@ -240,6 +243,10 @@ struct TypeChecker<'a> {
     /// `None` when it is infallible — what `err(E)` membership and `?`/rethrow
     /// inclusion are checked against (error-payloads E2).
     cur_errs: Option<Vec<String>>,
+    /// Error names that carry a payload → the payload's type (error-payloads E3).
+    /// Whole-program by decision D1: every declaring site must agree, checked in
+    /// [`Checker::collect_err_payloads`]. Only payload-carrying names appear.
+    err_payloads: std::collections::BTreeMap<String, Ty>,
     diags: Vec<Diagnostic>,
 }
 
@@ -1442,6 +1449,107 @@ impl<'a> TypeChecker<'a> {
     /// parameter head-matches the receiver's type (backlog item A). Records the
     /// resolution in `method_calls` and returns the call's result type. `None`
     /// means "not a free-function method" (the caller tries a struct method).
+    /// Collect the whole-program payload map and check the two declaration rules
+    /// (error-payloads E3, `docs/error-payloads.md` §3):
+    ///
+    /// * **D1 agreement** — a payload is a property of the error NAME. `Parse(i64)`
+    ///   anywhere means `Parse` carries `i64` everywhere; a bare `Parse` elsewhere,
+    ///   or a `Parse(str)`, is a conflict reported at BOTH sites (two located
+    ///   diagnostics — a single diagnostic cannot carry two spans).
+    /// * **The v1 domain** — a payload is a scalar or `str`. Nothing owning (a
+    ///   `String` would owe a `drop` on every path an error can die on), nothing
+    ///   aggregate (keeps the union small and the future binder scalar), no
+    ///   references. Each refusal names the rule.
+    ///
+    /// Declaration sites live in THREE places — free fns, struct-item methods,
+    /// and methods inside `struct { … }` EXPRESSIONS (the comptime-generic
+    /// factory idiom) — the same three homes the E1 census learned to scan.
+    fn collect_err_payloads(&mut self) {
+        let ast = self.ast;
+        let mut first: HashMap<String, (Option<Ty>, crate::span::Span)> = HashMap::new();
+        let mut sets: Vec<&crate::ast::ErrorSet> = Vec::new();
+        for item in &ast.items {
+            match item {
+                Item::Fn(f) => sets.extend(f.errors.iter()),
+                Item::Struct { body, .. } => {
+                    for m in &body.members {
+                        if let StructMember::Method(f) = m {
+                            sets.extend(f.errors.iter());
+                        }
+                    }
+                }
+                Item::Impl(im) => {
+                    for f in &im.methods {
+                        sets.extend(f.errors.iter());
+                    }
+                }
+                _ => {}
+            }
+        }
+        for e in &ast.exprs {
+            if let ExprKind::StructType(body) = &e.kind {
+                for m in &body.members {
+                    if let StructMember::Method(f) = m {
+                        sets.extend(f.errors.iter());
+                    }
+                }
+            }
+        }
+        let empty = HashSet::new();
+        for es in sets {
+            for n in &es.names {
+                let pay = n.payload.map(|t| self.lower_type(&empty, t));
+                if let (Some(ty), Some(tid)) = (&pay, n.payload) {
+                    if !err_payload_ty_allowed(ty) {
+                        self.error(
+                            ast.type_at(tid).span,
+                            format!(
+                                "a v1 error payload must be a scalar or `str`, not `{}` — \
+                                 owning and aggregate payloads are deliberately deferred \
+                                 (docs/error-payloads.md §3)",
+                                ty.display(&self.table)
+                            ),
+                        );
+                        continue;
+                    }
+                }
+                match first.get(&n.name.name) {
+                    None => {
+                        first.insert(n.name.name.clone(), (pay.clone(), n.name.span));
+                        if let Some(ty) = pay {
+                            self.err_payloads.insert(n.name.name.clone(), ty);
+                        }
+                    }
+                    Some((prev, prev_span)) if *prev != pay => {
+                        let render = |p: &Option<Ty>| match p {
+                            Some(t) => format!("with payload `{}`", t.display(&self.table)),
+                            None => "with no payload".to_string(),
+                        };
+                        let (prev_span, prev_r, here_r) =
+                            (*prev_span, render(prev), render(&pay));
+                        self.error(
+                            n.name.span,
+                            format!(
+                                "error `{}` is declared {} here, but {} elsewhere — \
+                                 a payload is a property of the error name, program-wide",
+                                n.name.name, here_r, prev_r
+                            ),
+                        );
+                        self.error(
+                            prev_span,
+                            format!(
+                                "error `{}` is declared {} here, conflicting with a \
+                                 later declaration {}",
+                                n.name.name, prev_r, here_r
+                            ),
+                        );
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+
     /// `?`/rethrow inclusion (error-payloads E2): the propagated set must be
     /// included in the enclosing function's declared set. Reported at the
     /// propagation site, naming exactly the names that are missing. When the
@@ -2341,26 +2449,76 @@ impl<'a> TypeChecker<'a> {
                     } else if name == "err" {
                         // The error constructor — reached only when no user fn or
                         // enum variant named `err` shadowed it above (the corpus's
-                        // own `Result(T, E) { ok, err }` does). Its argument must
-                        // name an error in the ENCLOSING declared set — the
-                        // membership half of set soundness (error-payloads E2;
-                        // the census measured zero corpus violations, so this
-                        // lands strict). The recorded type stays `Unknown`,
-                        // exactly as before: this arm adds a diagnostic, never a
-                        // type, so the P3 golden cannot move.
-                        if let (Some(errs), Some(ExprKind::Name(n))) =
-                            (self.cur_errs.clone(), args.first().map(|a| &ast.expr_at(*a).kind))
-                        {
-                            if !errs.contains(&n.name) {
-                                self.error(
+                        // own `Result(T, E) { ok, err }` does). Two spellings:
+                        // `err(Name)` for a bare error, `err(Name(v))` for a
+                        // payload carrier (error-payloads E3). Checked here:
+                        // membership in the ENCLOSING declared set (E2), and that
+                        // the spelling matches the name's declaration — a payload
+                        // name must be applied, a bare name must not be, and the
+                        // payload value must fit the declared type. The recorded
+                        // type stays `Unknown`, exactly as before: this arm adds
+                        // diagnostics, never a type, so the P3 golden cannot move.
+                        let head = match args.first().map(|a| &ast.expr_at(*a).kind) {
+                            Some(ExprKind::Name(n)) => Some((n.name.clone(), None)),
+                            Some(ExprKind::Call { callee, args: iargs }) => {
+                                match &ast.expr_at(*callee).kind {
+                                    ExprKind::Name(n) => {
+                                        Some((n.name.clone(), Some(iargs.clone())))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some((ename, payload_args)) = head {
+                            if let Some(errs) = self.cur_errs.clone() {
+                                if !errs.contains(&ename) {
+                                    self.error(
+                                        span,
+                                        format!(
+                                            "`err({ename})` — `{ename}` is not in the enclosing declared error set {{ {} }}",
+                                            errs.join(", ")
+                                        ),
+                                    );
+                                }
+                            }
+                            let declared = self.err_payloads.get(&ename).cloned();
+                            match (&declared, &payload_args) {
+                                (Some(want), None) => self.error(
                                     span,
                                     format!(
-                                        "`err({})` — `{}` is not in the enclosing declared error set {{ {} }}",
-                                        n.name,
-                                        n.name,
-                                        errs.join(", ")
+                                        "error `{ename}` carries a payload of type `{}` — construct it with `err({ename}(…))`",
+                                        want.display(&self.table)
                                     ),
-                                );
+                                ),
+                                (None, Some(_)) => self.error(
+                                    span,
+                                    format!(
+                                        "error `{ename}` carries no payload — write `err({ename})`"
+                                    ),
+                                ),
+                                (Some(want), Some(ia)) => {
+                                    if ia.len() != 1 {
+                                        self.error(
+                                            span,
+                                            format!(
+                                                "error `{ename}` carries exactly one payload value, found {}",
+                                                ia.len()
+                                            ),
+                                        );
+                                    } else {
+                                        let got = self.expr_types[ia[0].0 as usize].clone();
+                                        let sp = ast.expr_at(ia[0]).span;
+                                        self.check_assignable(
+                                            want,
+                                            &got,
+                                            Some(ia[0]),
+                                            sp,
+                                            &format!("the payload of error `{ename}`"),
+                                        );
+                                    }
+                                }
+                                (None, None) => {}
                             }
                         }
                         Ty::Unknown
@@ -3994,12 +4152,26 @@ fn parse_int_literal_usize(text: &str) -> Option<usize> {
     }
 }
 
+/// The v1 error-payload type domain: scalars and `str`. Owning types (`String`,
+/// `Builder`, `Cow`) are out (they would owe a `drop` on every path an error can
+/// die on); aggregates, pointers and references are out (union width, binder
+/// shape, and provenance questions each deferred with the reason in the note).
+fn err_payload_ty_allowed(t: &Ty) -> bool {
+    matches!(
+        t,
+        Ty::Prim(
+            "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
+                | "f32" | "f64" | "bool" | "char" | "str"
+        )
+    )
+}
+
 /// A declared error set's names — sorted and deduped, so equality between two
 /// mentions of one callee's set is order-independent and the rendered
 /// diagnostics are deterministic.
 fn errs_of(es: &Option<crate::ast::ErrorSet>) -> Option<Vec<String>> {
     es.as_ref().map(|e| {
-        let mut v: Vec<String> = e.names.iter().map(|n| n.name.clone()).collect();
+        let mut v: Vec<String> = e.names.iter().map(|n| n.name.name.clone()).collect();
         v.sort();
         v.dedup();
         v
@@ -4054,6 +4226,101 @@ mod tests {
         let (ast, pd) = Parser::new(src, tokens).parse();
         assert!(pd.is_empty(), "parse: {:?}", pd);
         check(&ast)
+    }
+
+    // --- error payloads (E3; docs/error-payloads.md §3–§4) ---
+
+    /// D1: a payload is a property of the NAME, whole-program. A conflicting
+    /// declaration is reported at BOTH sites — two located diagnostics, since a
+    /// single diagnostic cannot carry two spans.
+    #[test]
+    fn a_payload_conflict_is_reported_at_both_sites() {
+        let (_, d) = analyze(
+            "fn f(n: i64) -> i32 !{ Parse(i64) } { \
+               if n > 9 { return err(Parse(n)) } return ok(1) } \
+             fn g(n: i32) -> i32 !{ Parse } { return ok(1) }",
+        );
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert!(
+            d.iter().any(|x| x.message.contains("declared with no payload here")
+                && x.message.contains("with payload `i64`")),
+            "the later site names the conflict: {d:?}"
+        );
+        assert!(
+            d.iter().any(|x| x.message.contains("declared with payload `i64` here")),
+            "the first site is named too: {d:?}"
+        );
+    }
+
+    /// Agreement is about the TYPE, not the spelling — the same payload type
+    /// restated at two sites is exactly what D1 asks for.
+    #[test]
+    fn restating_the_same_payload_type_is_agreement_not_conflict() {
+        let (info, d) = analyze(
+            "fn f(n: i64) -> i32 !{ TooBig(i64) } { \
+               if n > 9 { return err(TooBig(n)) } return ok(1) } \
+             fn g(n: i64) -> i32 !{ TooBig(i64) } { let v = f(n)? return ok(v) }",
+        );
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(info.err_payloads.len(), 1);
+        assert_eq!(info.err_payloads.get("TooBig"), Some(&Ty::Prim("i64")));
+    }
+
+    /// The v1 domain: scalars and `str`. An owning `String` payload is refused
+    /// with the reason (it would owe a `drop` on every path an error can die on).
+    #[test]
+    fn an_owning_payload_type_is_refused() {
+        let (_, d) = analyze(
+            "fn f(n: i32) -> i32 !{ Msg(String) } { \
+               if n > 9 { return err(Msg(int_to_string(1))) } return ok(1) }",
+        );
+        assert!(
+            d.iter().any(|x| x.message.contains("a v1 error payload must be a scalar or `str`")),
+            "{d:?}"
+        );
+    }
+
+    /// The four spelling/arity mismatches, each with its own diagnostic: a payload
+    /// name used bare, a bare name applied, two payload values, a wrong type.
+    #[test]
+    fn payload_spelling_must_match_the_declaration() {
+        // A payload name constructed bare.
+        let (_, d) = analyze(
+            "fn f(n: i64) -> i32 !{ TooBig(i64) } { \
+               if n > 9 { return err(TooBig) } return ok(1) }",
+        );
+        assert!(
+            d.iter().any(|x| x.message.contains("carries a payload of type `i64`")
+                && x.message.contains("err(TooBig(…))")),
+            "{d:?}"
+        );
+        // A bare name applied.
+        let (_, d) = analyze(
+            "fn f(n: i64) -> i32 !{ Empty } { \
+               if n > 9 { return err(Empty(n)) } return ok(1) }",
+        );
+        assert!(
+            d.iter().any(|x| x.message.contains("carries no payload — write `err(Empty)`")),
+            "{d:?}"
+        );
+        // Two payload values.
+        let (_, d) = analyze(
+            "fn f(n: i64) -> i32 !{ TooBig(i64) } { \
+               if n > 9 { return err(TooBig(n, n)) } return ok(1) }",
+        );
+        assert!(
+            d.iter().any(|x| x.message.contains("exactly one payload value, found 2")),
+            "{d:?}"
+        );
+        // A wrong payload type (str declared, integer given).
+        let (_, d) = analyze(
+            "fn f(n: i64) -> i32 !{ BadKey(str) } { \
+               if n > 9 { return err(BadKey(n)) } return ok(1) }",
+        );
+        assert!(
+            d.iter().any(|x| x.message.contains("the payload of error `BadKey`")),
+            "a str payload given an i64 must be refused: {d:?}"
+        );
     }
 
     // --- error-set soundness (error-payloads E2; docs/error-payloads.md §6) ---

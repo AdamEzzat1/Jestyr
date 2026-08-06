@@ -183,7 +183,7 @@ fn emit_program(
             if let Some(es) = &f.errors {
                 for name in &es.names {
                     let next = error_tags.len() as i64 + 1;
-                    error_tags.entry(name.name.clone()).or_insert(next);
+                    error_tags.entry(name.name.name.clone()).or_insert(next);
                 }
             }
         }
@@ -199,7 +199,7 @@ fn emit_program(
                     if let Some(es) = &f.errors {
                         for name in &es.names {
                             let next = error_tags.len() as i64 + 1;
-                            error_tags.entry(name.name.clone()).or_insert(next);
+                            error_tags.entry(name.name.name.clone()).or_insert(next);
                         }
                     }
                 }
@@ -1844,11 +1844,31 @@ impl<'a> Cgen<'a> {
     fn result_defs(&mut self) {
         let ast = self.ast;
         let mut seen: HashSet<String> = HashSet::new();
+        // The whole-program payload union (error-payloads D3) — ONE union whose
+        // members are exactly the payload-carrying error names, so every result
+        // struct can carry any error's payload and a `?` hop copies it blind.
+        // Emitted before the result typedefs (they embed it), member order is
+        // the BTreeMap's (name-sorted — deterministic without a second sort),
+        // and the whole block is absent from every payload-free program.
+        if self.err_pay_gated() {
+            self.def_begin("JestyrErrPay".to_string(), Vec::new());
+            let mut s = String::from("typedef union { ");
+            for (name, ty) in self.info.err_payloads.clone() {
+                let ct = self.c_type(&ty);
+                s.push_str(&format!("{ct} j_{name}; "));
+            }
+            s.push_str("} JestyrErrPay;\n");
+            self.raw(s);
+            self.def_end();
+        }
         // `try_from_utf8(...) -> str !Utf8Error` is an *intrinsic*, so its result
         // type isn't discovered from a fn signature — emit it up front (and seed
         // `seen` so a user `str !E` function doesn't duplicate the typedef).
-        self.def_begin("JestyrResult_str".to_string(), Vec::new());
-        self.raw("typedef struct { bool is_err; JestyrStr ok; int err; } JestyrResult_str;\n");
+        self.def_begin("JestyrResult_str".to_string(), self.pay_dep());
+        self.raw(format!(
+            "typedef struct {{ bool is_err; JestyrStr ok; int err; {}}} JestyrResult_str;\n",
+            self.pay_field()
+        ));
         self.def_end();
         seen.insert("JestyrResult_str".to_string());
         // `try_read_file(...) -> String !IoError` is an intrinsic, so its result type
@@ -1857,8 +1877,11 @@ impl<'a> Cgen<'a> {
         // function doesn't duplicate the typedef.
         if self.uses_try_read {
             let rname = self.result_c_name(&Ty::Prim("String"));
-            self.def_begin(rname.clone(), Vec::new());
-            self.raw(format!("typedef struct {{ bool is_err; JestyrString ok; int err; }} {rname};\n"));
+            self.def_begin(rname.clone(), self.pay_dep());
+            self.raw(format!(
+                "typedef struct {{ bool is_err; JestyrString ok; int err; {}}} {rname};\n",
+                self.pay_field()
+            ));
             self.def_end();
             seen.insert(rname);
         }
@@ -1872,18 +1895,19 @@ impl<'a> Cgen<'a> {
                 if !seen.insert(cname.clone()) {
                     continue;
                 }
-                let deps = if ok != Ty::Unit {
+                let mut deps: Vec<String> = if ok != Ty::Unit {
                     Self::dep_of_cty(self.c_type(&ok)).into_iter().collect()
                 } else {
                     Vec::new()
                 };
+                deps.extend(self.pay_dep());
                 self.def_begin(cname.clone(), deps);
                 self.raw(format!("typedef struct {{ bool is_err; "));
                 if ok != Ty::Unit {
                     let okc = self.c_type(&ok);
                     self.raw(format!("{okc} ok; "));
                 }
-                self.raw(format!("int err; }} {cname};\n"));
+                self.raw(format!("int err; {}}} {cname};\n", self.pay_field()));
                 self.def_end();
             }
         }
@@ -1913,18 +1937,19 @@ impl<'a> Cgen<'a> {
         if !seen.insert(cname.clone()) {
             return;
         }
-        let deps = if *ok != Ty::Unit {
+        let mut deps: Vec<String> = if *ok != Ty::Unit {
             Self::dep_of_cty(self.c_type(ok)).into_iter().collect()
         } else {
             Vec::new()
         };
+        deps.extend(self.pay_dep());
         self.def_begin(cname.clone(), deps);
         self.raw("typedef struct { bool is_err; ".to_string());
         if *ok != Ty::Unit {
             let okc = self.c_type(ok);
             self.raw(format!("{okc} ok; "));
         }
-        self.raw(format!("int err; }} {cname};\n"));
+        self.raw(format!("int err; {}}} {cname};\n", self.pay_field()));
         self.def_end();
     }
 
@@ -4826,14 +4851,18 @@ impl<'a> Cgen<'a> {
                 // character for character — reusing the braced form for both ("just
                 // one redundant brace") would change every fallible program's C and
                 // invalidate the corpus goldens, the port mirror and the seed at once.
+                // Error-payloads E3: a gated hop also copies `.pay` — BLIND (a C
+                // union assignment needs no knowledge of the live member), which
+                // is what keeps the hop one struct literal at any payload width.
+                let paycp = self.pay_copy(&tmp);
                 if self.error_traces {
                     let hop = self.et_push(span);
                     return format!(
-                        "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) {{ {hop}return ({cur}){{ .is_err = true, .err = {tmp}.err }}; }} {tmp}.ok; }})"
+                        "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) {{ {hop}return ({cur}){{ .is_err = true, .err = {tmp}.err{paycp} }}; }} {tmp}.ok; }})"
                     );
                 }
                 format!(
-                    "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) return ({cur}){{ .is_err = true, .err = {tmp}.err }}; {tmp}.ok; }})"
+                    "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) return ({cur}){{ .is_err = true, .err = {tmp}.err{paycp} }}; {tmp}.ok; }})"
                 )
             }
             ExprKind::Catch { base, binder, fallback, rethrow } => {
@@ -4861,8 +4890,9 @@ impl<'a> Cgen<'a> {
                         return format!("(({base_c}).ok)");
                     }
                     let cur = self.cur_result.clone();
+                    let paycp = self.pay_copy(&tmp);
                     return format!(
-                        "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) return ({cur}){{ .is_err = true, .err = {tmp}.err }}; {tmp}.ok; }})"
+                        "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) return ({cur}){{ .is_err = true, .err = {tmp}.err{paycp} }}; {tmp}.ok; }})"
                     );
                 }
 
@@ -5164,6 +5194,11 @@ impl<'a> Cgen<'a> {
                         self.diag(self.ast.expr_at(callee).span, "`err` used outside a fallible function");
                         return "0".to_string();
                     }
+                    // Error-payloads E3: in a gated program the construction
+                    // carries `.pay` — the declared member for `err(Name(v))`,
+                    // an explicit `{0}` for a bare name. Empty string otherwise,
+                    // so every payload-free program is byte-identical.
+                    let pay = self.err_pay_init(args.first().copied());
                     // `--error-traces`: `err` is the trace's ORIGIN — reset, then
                     // record where the error was born. Reset here rather than at the
                     // surfacing print, so a recovered-then-recreated error never shows
@@ -5171,11 +5206,11 @@ impl<'a> Cgen<'a> {
                     if self.error_traces {
                         let push = self.et_push(self.ast.expr_at(callee).span);
                         return format!(
-                            "({{ jestyr_et_reset(); {push}({}){{ .is_err = true, .err = {tag} }}; }})",
+                            "({{ jestyr_et_reset(); {push}({}){{ .is_err = true, .err = {tag}{pay} }}; }})",
                             self.cur_result
                         );
                     }
-                    return format!("({}){{ .is_err = true, .err = {tag} }}", self.cur_result);
+                    return format!("({}){{ .is_err = true, .err = {tag}{pay} }}", self.cur_result);
                 }
                 "is_err" => {
                     let v = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".to_string());
@@ -5233,10 +5268,11 @@ impl<'a> Cgen<'a> {
                 "try_read_file" => {
                     let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
                     let rname = self.result_c_name(&Ty::Prim("String"));
+                    let payz = self.pay_zero();
                     return format!(
                         "({{ JestyrString _s; bool _ok = jestyr_rt_try_read_file({p}, &_s); \
                          _ok ? ({rname}){{ .is_err = false, .ok = _s }} \
-                             : ({rname}){{ .is_err = true, .err = 1 }}; }})"
+                             : ({rname}){{ .is_err = true, .err = 1{payz} }}; }})"
                     );
                 }
                 "run_command" => {
@@ -5459,13 +5495,14 @@ impl<'a> Cgen<'a> {
                         let bt = self.info.type_of(a).clone();
                         let bcty = self.c_type(&bt);
                         let b = self.emit_expr(a);
+                        let payz = self.pay_zero();
                         return format!(
                             "({{ {bcty} _u = {b}; jestyr_rt_valid_utf8((const char*)_u.ptr, _u.len) \
                              ? (JestyrResult_str){{ .is_err = false, .ok = (JestyrStr){{ (const char*)_u.ptr, _u.len }} }} \
-                             : (JestyrResult_str){{ .is_err = true, .err = 1 }}; }})"
+                             : (JestyrResult_str){{ .is_err = true, .err = 1{payz} }}; }})"
                         );
                     }
-                    return "(JestyrResult_str){ .is_err = true, .err = 1 }".to_string();
+                    return format!("(JestyrResult_str){{ .is_err = true, .err = 1{} }}", self.pay_zero());
                 }
                 // An explicit, recoverable UTF-8 check (when you want to branch
                 // rather than trap).
@@ -8737,8 +8774,88 @@ impl<'a> Cgen<'a> {
     fn error_tag_of(&self, id: ExprId) -> Option<i64> {
         match &self.ast.expr_at(id).kind {
             ExprKind::Name(n) => self.error_tags.get(&n.name).copied(),
+            // The applied payload form `err(Parse(v))` — the tag is the HEAD name's
+            // (error-payloads E3); the payload value is emitted by `err_pay_init`.
+            ExprKind::Call { callee, .. } => match &self.ast.expr_at(*callee).kind {
+                ExprKind::Name(n) => self.error_tags.get(&n.name).copied(),
+                _ => None,
+            },
             _ => None,
         }
+    }
+
+    // --- error payloads (E3, `docs/error-payloads.md` §3) — all gated on use ---
+
+    /// Is the payload machinery ON? Driven by DECLARATION (any error name carries
+    /// a payload), so a payload-free program emits today's C to the byte.
+    fn err_pay_gated(&self) -> bool {
+        !self.info.err_payloads.is_empty()
+    }
+
+    /// The extra field every result struct gains in a payload-using program.
+    fn pay_field(&self) -> &'static str {
+        if self.err_pay_gated() {
+            "JestyrErrPay pay; "
+        } else {
+            ""
+        }
+    }
+
+    /// The dependency a result typedef takes on the payload union when gated —
+    /// registered so the def-capture sorter can never order the union after a
+    /// struct that embeds it (M5's lesson: name the segment AND the edge).
+    fn pay_dep(&self) -> Vec<String> {
+        if self.err_pay_gated() {
+            vec!["JestyrErrPay".to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The `, .pay = {0}` an INTRINSIC error construction appends when gated —
+    /// the intrinsics (`try_read_file`, `try_from_utf8`) construct their errors
+    /// inline, and an explicit zero keeps indeterminate bytes out of the blind
+    /// hop copy exactly as a user `err(BareName)` does.
+    fn pay_zero(&self) -> &'static str {
+        if self.err_pay_gated() {
+            ", .pay = {0}"
+        } else {
+            ""
+        }
+    }
+
+    /// The `, .pay = <tmp>.pay` a propagation hop appends when gated. The union
+    /// copies BLIND — a C union assignment needs no knowledge of the live
+    /// member — which is decision D3's entire payoff: the hop keeps its
+    /// single-struct-literal shape at every width of payload.
+    fn pay_copy(&self, tmp: &str) -> String {
+        if self.err_pay_gated() {
+            format!(", .pay = {tmp}.pay")
+        } else {
+            String::new()
+        }
+    }
+
+    /// The `.pay` initializer for an `err(…)` construction when gated: the
+    /// declared member for the applied form, `{0}` for a bare name — explicit,
+    /// so no indeterminate bytes ever flow through a blind-copying hop.
+    fn err_pay_init(&mut self, arg: Option<ExprId>) -> String {
+        if !self.err_pay_gated() {
+            return String::new();
+        }
+        if let Some(a) = arg {
+            if let ExprKind::Call { callee, args } = &self.ast.expr_at(a).kind {
+                if let ExprKind::Name(n) = &self.ast.expr_at(*callee).kind {
+                    if self.info.err_payloads.contains_key(&n.name) {
+                        if let Some(v) = args.first() {
+                            let vc = self.emit_expr(*v);
+                            return format!(", .pay = {{ .j_{} = ({vc}) }}", n.name);
+                        }
+                    }
+                }
+            }
+        }
+        ", .pay = {0}".to_string()
     }
 
     // --- monomorphization ---
@@ -9455,6 +9572,77 @@ mod tests {
         assert!(pd.is_empty(), "parse: {:?}", pd);
         let (info, _td) = crate::typeck::check(&ast);
         emit(&ast, &info)
+    }
+
+    // --- error payloads (E3, `docs/error-payloads.md` §3–§4) ---
+
+    /// **The absence test — the one that protects the corpus.** A payload-free
+    /// program must emit not one byte of payload machinery: no union typedef, no
+    /// `pay` field, no `.pay` initializer or hop copy. One stray token here is a
+    /// corpus-wide diff waiting to happen (the `jestyr_et_` lesson).
+    #[test]
+    fn a_payload_free_program_emits_no_payload_machinery() {
+        let src = "fn f(n: i32) -> i32 !{ TooBig } { \
+                     if n > 9 { return err(TooBig) } return ok(n) } \
+                   fn g(n: i32) -> i32 !{ TooBig } { let v = f(n)? return ok(v + 1) } \
+                   fn main() -> i32 { let a: i32 = g(3) catch 0 print_int(a as i64) return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(!c.contains("JestyrErrPay"), "payload union leaked into a payload-free program:\n{c}");
+        assert!(!c.contains(".pay"), "a `.pay` initializer/copy leaked into a payload-free program:\n{c}");
+        assert!(!c.contains(" pay;"), "a `pay` field leaked into a payload-free program:\n{c}");
+    }
+
+    /// The gated shapes, all five at once: the whole-program union (name-sorted
+    /// members, `j_` prefix), the `pay` field on every result struct, the
+    /// declared-member initializer for `err(Name(v))`, the explicit `{0}` for a
+    /// bare `err(Name)` in the same program, and the BLIND `.pay` copy in a `?`
+    /// hop (D3's payoff: the hop needs no knowledge of the live member).
+    #[test]
+    fn payload_emission_has_the_five_gated_shapes() {
+        let src = "fn f(n: i64) -> i32 !{ Empty, TooBig(i64), BadKey(str) } { \
+                     if n == 0 { return err(Empty) } \
+                     if n > 9 { return err(TooBig(n)) } \
+                     if n < 0 - 9 { return err(BadKey(\"neg\")) } \
+                     return ok(1) } \
+                   fn g(n: i64) -> i32 !{ Empty, TooBig(i64), BadKey(str) } { \
+                     let v = f(n)? return ok(v + 1) } \
+                   fn main() -> i32 { let a: i32 = g(3) catch 0 print_int(a as i64) return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{d:?}");
+        // Union members in NAME order (the BTreeMap), each with the `j_` prefix.
+        assert!(
+            c.contains("typedef union { JestyrStr j_BadKey; int64_t j_TooBig; } JestyrErrPay;"),
+            "the whole-program union:\n{c}"
+        );
+        assert!(c.contains("int err; JestyrErrPay pay; } JestyrResult_i32;"), "the pay field:\n{c}");
+        assert!(c.contains(".pay = { .j_TooBig = (j_n) }"), "the declared-member initializer:\n{c}");
+        assert!(c.contains(".pay = {0}"), "the explicit zero for a bare err:\n{c}");
+        assert!(c.contains(".err = _q0.err, .pay = _q0.pay"), "the blind hop copy:\n{c}");
+    }
+
+    /// `catch |e| return e` is `?` spelled out, so the rethrow hop copies the
+    /// payload exactly as `?` does — tag AND pay preserved across the hop.
+    #[test]
+    fn the_rethrow_hop_copies_the_payload_too() {
+        let src = "fn f(n: i64) -> i32 !{ TooBig(i64) } { \
+                     if n > 9 { return err(TooBig(n)) } return ok(1) } \
+                   fn g(n: i64) -> i32 !{ TooBig(i64) } { \
+                     let v: i32 = f(n) catch |e| return e return ok(v) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(c.contains(".err = _ct0.err, .pay = _ct0.pay"), "rethrow must copy pay:\n{c}");
+    }
+
+    /// The union member type follows the DECLARED payload type, not the reduction
+    /// domain: an `i32` payload is an `int32_t` member, `str` is a `JestyrStr`.
+    #[test]
+    fn union_member_types_follow_the_declaration() {
+        let src = "fn f(n: i32) -> i32 !{ Small(i32) } { \
+                     if n > 9 { return err(Small(n)) } return ok(n) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(c.contains("typedef union { int32_t j_Small; } JestyrErrPay;"), "{c}");
     }
 
     /// Like [`gen`], but through [`emit_error_traces`] (`--error-traces`).

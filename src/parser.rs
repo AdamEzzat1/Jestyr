@@ -573,7 +573,18 @@ impl<'src> Parser<'src> {
         let mut names = Vec::new();
         while !self.at(RBrace) && !self.at(Eof) {
             let before = self.pos;
-            names.push(self.eat_ident("error name"));
+            let name = self.eat_ident("error name");
+            // `Parse(i64)` — a payload-carrying error name (error-payloads E3).
+            // One type per name; the whole-program agreement check lives in
+            // typeck, where types can be lowered and compared.
+            let payload = if self.eat(LParen) {
+                let t = self.parse_type();
+                self.expect(RParen, "`)`");
+                Some(t)
+            } else {
+                None
+            };
+            names.push(ErrName { name, payload });
             if self.pos == before {
                 self.bump();
             }
