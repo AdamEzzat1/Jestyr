@@ -409,7 +409,7 @@ when the reference re-sorts its output by content (§2, O1).
   warning-clean; cross-impl goldens behind `--features c-oracle`; the
   fixpoint/self-build/seed family behind `--features selfhost-fixpoint`.
   **Auto-commit each green increment to `master` + `git push origin master`**
-  (`git commit -F <file>`, Co-Authored-By trailer).
+  (`git commit -F <file>`).
 - One construct per increment with its golden slice. Never a big drop.
 - **THE TWO-SIDED TAX (new since self-hosting — this is the thing that silently breaks):**
   any change to emitted C, an intrinsic, or a pass now has TWO implementations — the Rust

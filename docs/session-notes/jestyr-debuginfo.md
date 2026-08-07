@@ -145,5 +145,5 @@ From `jestyr-systems-handoff.md`, in dependency/ROI order:
 
 Every increment stays `cargo test`-green + warning-clean; toolchain-gated tests
 behind a cargo feature; teeth-verify by mutation; one green commit per increment to
-`master` (`git commit -F <file>`, `Co-Authored-By: Claude Opus 4.8`); examples stay
+`master` (`git commit -F <file>`, one increment per commit); examples stay
 byte-identical (here: guaranteed by the empty-debug fallback on the single-file path).

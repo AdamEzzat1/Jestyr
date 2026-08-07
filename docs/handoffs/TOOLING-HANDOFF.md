@@ -193,8 +193,7 @@ project's convention of dropping session summaries in `~/Downloads`.) Keep the i
 
 ## Commit-to-master discipline (do this every increment)
 
-- **One green increment per commit.** `git commit -F <msgfile>` (multi-line). End every
-  message with: `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
+- **One green increment per commit.** `git commit -F <msgfile>` (multi-line).
 - After green + warning-clean, **fast-forward master**:
   `git -C C:\Users\adame\Jestyr merge --ff-only <this-branch>`. Don't push unless asked.
 - Teeth-verify before committing. Keep all examples byte-identical (the repo invariant).

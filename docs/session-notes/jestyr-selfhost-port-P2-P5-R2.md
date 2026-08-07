@@ -22,8 +22,8 @@
 - Ship the four test layers: **unit/wiring**, **property**, **bolero fuzz**, and
   **teeth-by-mutation** (break the new logic, watch a test fail, revert).
 - Keep programs that don't use a new feature **byte-identical**.
-- **Auto-commit each green increment to `master`** (`git commit -F <file>`, end with
-  `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`), then `git push origin master`.
+- **Auto-commit each green increment to `master`** (`git commit -F <file>`),
+  then `git push origin master`.
 - Land increments small. A pass is ported *construct by construct*, each with its slice of
   the golden — never a 2.6K-line drop.
 

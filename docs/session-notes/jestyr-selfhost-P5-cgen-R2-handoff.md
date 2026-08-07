@@ -16,7 +16,7 @@
 
 ## Progress log
 
-### Increment 1 — `hello.jtr` byte-identical (commit `eb50eac`, branch `claude/jestyr-p5-cgen-r2-ac4439`)
+### Increment 1 — `hello.jtr` byte-identical (commit `eb50eac`, branch `jestyr-p5-cgen-r2-ac4439`)
 
 `examples/std/cgen.jtr` (a leaf consumer with `main`, built directly by the golden — no `_cli`
 driver needed) + golden `jestyr_cgen_matches_reference` (`--features c-oracle`). Emits
@@ -1132,7 +1132,7 @@ family, enums/match, closures, concurrency — grow the allowlist file-by-file w
 
 - `cargo test`-green (685 default) + warning-clean; cross-impl goldens behind `--features
   c-oracle`. Keep non-users byte-identical. **Auto-commit each green increment to `master` +
-  `git push origin master`** (`git commit -F <file>`, end with the Co-Authored-By trailer).
+  `git push origin master`** (`git commit -F <file>`).
 - One construct per increment with its golden slice. Never a big drop.
 - **The deep-dive lever:** every pass got a `DUMP_DIVERGE=1` first-diff printer in its golden;
   P3 also got `TYPECK_FILE=<basename>` for an aligned per-expr want/got stream. Build the cgen

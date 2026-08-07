@@ -1,6 +1,6 @@
 # Session Summary — Comments & Doc Comments (Workstream C)
 
-> **Date:** 2026-06-22 · **Branch:** `claude/pensive-merkle-b83158`
+> **Date:** 2026-06-22 · **Branch:** `pensive-merkle-b83158`
 > **Scope:** Jestyr roadmap **workstream C** — the three comment tiers and a
 > documentation generator. Everything below is implemented, tested, and shipped.
 > Companion files: user reference [`comments.md`](comments.md), runnable demo

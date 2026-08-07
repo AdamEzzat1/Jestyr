@@ -22,8 +22,7 @@ Every increment stays `cargo test`-green and **warning-clean**; default `cargo t
 is toolchain-free (no gcc) and fast. Ship the test layers (unit/golden +
 property + the gcc round-trip *example*), **teeth-verify** each new property by
 mutation (break it, watch it fail, revert), and **auto-commit each green increment**
-(`git commit -F <file>`, one increment per commit, end the message with
-`Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`), then fast-forward
+(`git commit -F <file>`, one increment per commit), then fast-forward
 `master`: `git -C <repo-root> merge --ff-only <branch>`. Don't push unless asked.
 
 Verify a numeric change end-to-end with `jestyrc run examples/std/<demo>.jtr` (there

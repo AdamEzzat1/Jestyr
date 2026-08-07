@@ -91,7 +91,7 @@ that don't use it are unchanged (files/intern read_file demos green).
 `cargo test`-green + warning-clean; four test layers + teeth-by-mutation; toolchain-free
 default suite (gcc-oracle behind `--features c-oracle`); byte-identical for programs not
 using the feature (proven by 141+ unchanged oracle demos + the gating tests); one green
-commit per increment to `master` with the `Co-Authored-By` trailer; demo `.jtr` per
+commit per increment to `master`; demo `.jtr` per
 feature.
 
 ## What's next for self-host (unchanged, the gate)

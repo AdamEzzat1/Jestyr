@@ -18,7 +18,7 @@
 
 ---
 
-## Copy-paste opener (paste into a fresh Claude session)
+## Copy-paste opener (paste into a fresh session)
 
 ```
 Read PARALLELISM-HANDOFF.md in the Jestyr repo, then continue Workstream Q
@@ -306,8 +306,7 @@ items (work-stealing runtime, SIMD, GPU) with reasons. Add a **Workstream Q** ro
 
 ## Commit-to-master discipline (every increment)
 
-- **One green increment per commit.** `git commit -F <msgfile>` (multi-line); end every
-  message with `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
+- **One green increment per commit.** `git commit -F <msgfile>` (multi-line).
 - After green + warning-clean, **fast-forward master**:
   `git -C C:\Users\adame\Jestyr merge --ff-only <this-branch>`. Don't push unless asked.
 - Teeth-verify before committing. Keep examples byte-identical.

@@ -4,7 +4,7 @@
 
 **Workstream:** K (Module system v2) — taken from ~70% to **~98%**, plus a grounded
 research pass on the **self-hosting** gate (workstream P).
-**Branch:** `claude/elated-tesla-23a2a4` → ff-merged to `master` after every green
+**Branch:** `elated-tesla-23a2a4` → ff-merged to `master` after every green
 increment. **Discipline held throughout:** each increment is `cargo test`-green and
 warning-clean (incl. the `dharht-experiment` + `bench-alloc` feature builds), ships
 unit + wiring + property + bolero-fuzz tests, is teeth-verified by mutation, and keeps

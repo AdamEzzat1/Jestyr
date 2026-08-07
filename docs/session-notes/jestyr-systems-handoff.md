@@ -25,9 +25,8 @@ Every increment stays `cargo test`-green and **warning-clean**; default `cargo t
 stays toolchain-free (gate anything needing gcc / a cross toolchain / an SMT solver behind
 a cargo feature, the way `--features c-oracle` does). Ship the test layers below,
 **teeth-verify each new property by mutation** (break it, watch it fail, revert), and
-**auto-commit each green increment** (`git commit -F <file>`, one increment per commit,
-end the message with `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`), then
-fast-forward master: `git -C C:\Users\adame\Jestyr merge --ff-only <branch>`. Keep all
+**auto-commit each green increment** (`git commit -F <file>`, one increment per commit), then
+fast-forward master: `git -C <repo-root> merge --ff-only <branch>`. Keep all
 examples byte-identical (the repo invariant). When a workstream's first cut lands, write a
 session summary back to `C:\Users\adame\Downloads\` (one file per workstream, e.g.
 `jestyr-debuginfo.md`) and update `ROADMAP.md`.

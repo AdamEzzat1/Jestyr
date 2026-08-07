@@ -57,7 +57,7 @@ keeps every golden byte-identical until a corpus file exercises a feature.
 | 1 | **No LICENSE file.** `Cargo.toml` declares `MIT OR Apache-2.0` but no license texts exist anywhere in git — a public repo without them is legally unusable (nobody can build on, cite-with-artifact, or redistribute it). Add `LICENSE-MIT` + `LICENSE-APACHE` at root. | 15 minutes |
 | 2 | **No root README.** GitHub would render a bare file listing; the de-facto entry docs are internal session handoffs whose stats contradict each other — **five different test counts** across HANDOFF.md (~9,300 lines / 294 tests / "86 tests" in its own quick-start), docs/TESTING.md (17.4k / 285 / 77 examples), ROADMAP.md §0 (~10K / 157), FP-DETERMINISM-CONTRACT.md (508), docs/error-payloads.md (~900) — all stale against the real state (909 default tests, 148-file corpus, ~28K-line self-hosted compiler, ~52K lines of Rust). | half a day |
 | 3 | **The cross-OS determinism claim is unproven by the repo's own admission.** `FP-DETERMINISM-CONTRACT.md` states the canary digest (`4389bf83…`, still locked at its proptests site) was computed on exactly ONE machine (Windows + gcc) and literally says "read this before claiming cross-OS determinism" — while NUMERICS-HANDOFF.md and TOOLING-HANDOFF.md say "cross-OS SHA canary ✅ DONE". **One Linux/WSL run of `cargo test --features c-oracle` either upgrades the headline claim to proven or saves the release from a public falsification.** The contract doc itself calls this "the only blocker to proof". | one CI/WSL run |
-| 4 | **Tracked personal data.** `docs/claude-memory-snapshot/` ships the author's machine paths, OneDrive backup layout, private-repo inventory across three projects, and laptop battery-health details; `docs/README.md` documents restoring AI-session memory with machine-specific paths. Scrub or delete from HEAD before going public. | an hour |
+| 4 | **Tracked personal data.** `docs/` shipped a tooling memory snapshot with the author's machine paths, OneDrive backup layout, private-repo inventory across three projects, and laptop battery-health details; `docs/README.md` documented restoring it with machine-specific paths. Scrub or delete from HEAD before going public. | an hour |
 | 5 | **Self-contradicting doc headers.** `docs/unsafe-contract.md` opens "Today, `unsafe` gates nothing" above its own completed ladder (step 4 ✅: compile error on both toolchains); `docs/error-payloads.md` opens "design, pre-implementation … nothing here is built yet" above the closed E-chain. A skimming reviewer mis-cites the project in whichever direction they happen to read — or concludes the docs can't be trusted. | under an hour |
 | 6 | **No CI** (no `.github/` at all). Every headline claim is verified only on the author's machine; the central byte-identity evidence is unverifiable by outsiders. A matrix (ubuntu + windows, `cargo test`, plus a gcc `c-oracle` job and a bootstrap job that compiles the seed and diffs the regenerated one — ~30 s) **doubles as blocker #3's fix**. | 2–3 hours |
 
@@ -175,7 +175,7 @@ keeps every golden byte-identical until a corpus file exercises a feature.
 
 **Day 1 — MUST (before flipping public):**
 1. `LICENSE-MIT` + `LICENSE-APACHE` (15 min).
-2. Scrub `docs/claude-memory-snapshot/` (at minimum `backup-and-remotes.md`);
+2. Scrub the tracked memory snapshot (at minimum its backup/remotes note);
    fix or banner `docs/README.md` (1 h).
 3. Root `README.md`: thesis; claims **with scopes** (byte-identity =
    single-file/concat path, three module-path divergences pinned by golden;

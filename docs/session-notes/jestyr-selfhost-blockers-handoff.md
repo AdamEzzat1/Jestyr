@@ -37,8 +37,8 @@ Every increment that fixes a blocker MUST, before it is committed:
    the type/enum-heavy examples). New language surface must be *additive*.
 4. **Keep `cargo test` toolchain-free** — the gcc-oracle tests live behind
    `--features c-oracle`; the default suite must not require a C compiler.
-5. **Auto-commit each green increment** (`git commit -F <msgfile>`, end with the
-   `Co-Authored-By:` trailer), then ff-merge `master`. Rebase if `master` moved.
+5. **Auto-commit each green increment** (`git commit -F <msgfile>`)
+   then ff-merge `master`. Rebase if `master` moved.
 
 ---
 

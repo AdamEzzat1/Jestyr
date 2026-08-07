@@ -3,7 +3,7 @@
 # Jestyr — Traits & Generics: Session Summary
 
 **Date:** 2026-06-26
-**Branch:** `claude/nice-goodall-48c49f`
+**Branch:** `nice-goodall-48c49f`
 **Scope:** the traits/interfaces epic + the generics work it depends on
 **Headline:** test suite **345 → 413 green**, warning-clean across the default,
 `dharht-experiment`, and `bench-alloc` builds; **8 commits**, ~2,700 lines added.
