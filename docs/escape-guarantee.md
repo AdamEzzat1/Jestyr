@@ -1,0 +1,104 @@
+# The escape checker's guarantee — a precise statement
+
+This page states, in one place, exactly what the escape checker promises,
+how the check works, and what it deliberately does not cover. It is a
+precise claim with an informal argument, not a mechanized proof; the
+checker is `src/escape.rs` in the reference and `escape.jtr` in the
+self-hosted port, and both toolchains enforce the same rules.
+
+## The claim
+
+> **For every program the checker accepts, no second-class borrow is
+> usable after the frame that introduced it has returned.**
+>
+> Equivalently: if a `read`/`mut`/`out` binding `b` refers to storage
+> owned by (or borrowed into) a call frame `F`, then every use of `b` —
+> and of every binding derived from `b` — occurs within the dynamic
+> extent of `F`. Use-after-return through a borrow cannot be expressed
+> in checked code.
+
+This is the property that replaces lifetime annotations. Rust proves
+"this reference outlives that one" with named lifetimes; Jestyr instead
+makes references **second-class** — they flow only *down* the call stack
+— so their validity is a structural consequence of the call stack's own
+discipline: a callee's frame always ends before its caller's.
+
+## Definitions
+
+* A **borrow** is a parameter with convention `read`, `mut`, or `out`
+  (including `read`/`mut`/`out self`). `take` transfers ownership; the
+  default convention is `read`.
+* Borrow-ness propagates through `let x = <borrow place>` and through
+  pattern bindings when matching on a borrowed scrutinee.
+* A **borrow place** is an expression naming borrowed storage: a borrow
+  binding itself (`p`, `self`) or a projection of one (`p.field`,
+  `p[i]`, `p.*`).
+
+## The check
+
+The checker walks every function body and flags exactly four **escape
+routes** — the only ways a value can outlive a frame:
+
+1. **return** — a borrow place in return position, when the function
+   returns *by value* (not declared `-> read T` / `-> mut T`).
+2. **capture** — a borrow place stored as a struct-literal field (the
+   struct value may outlive the frame).
+3. **store** — assigning a borrow place into borrowed storage
+   (`borrowed.field = borrow`): the target's owner may outlive this
+   frame.
+4. **give-away** — passing a borrow to a `take` (owning) parameter:
+   ownership cannot be supplied by a borrow. This is how "store a borrow
+   in a collection" (`vec.push(borrow)`) is caught
+   (`examples/collection.jtr`).
+
+Two things are **explicitly allowed**, and are the thesis in action:
+
+* passing a borrow as a call argument with a borrow convention — flowing
+  *down* is always safe, because the callee's frame is strictly inner;
+* returning a borrow when the return convention is itself a borrow
+  (`-> read T`) — the signature hands the borrow back to a frame that,
+  by induction, received its referent from further up.
+
+One refinement: each route fires only for **non-`Copy`** values. Copying
+a borrowed scalar out (`fn f(read p: P) -> i32 { return p.value }`)
+escapes a *copy*, not the reference; generic/opaque types are treated as
+non-`Copy` (the conservative direction).
+
+## Why the argument holds
+
+The four routes are exhaustive over the language's value flows: a value
+leaves a frame only by being returned, stored into something that
+outlives the frame (a struct value, borrowed storage reaching up the
+stack), or surrendered to an owner. Closures capture by the same
+struct-capture rule; `spawn` bodies are checked under structured
+concurrency, whose scoped join ends every task before the spawning
+frame's borrows die. With all four routes refused for borrows, every
+borrow's use set is confined to frames below its origin — and those
+frames all return first.
+
+## What the claim does *not* cover
+
+The guarantee is scoped to checked code and second-class borrows. The
+language's other reference forms make **different, explicit** promises:
+
+| Form | Promise | Enforced by |
+|---|---|---|
+| `genref` (`&T`) | use-after-free is a **deterministic runtime fault** (generation check on every deref), never UB | emitted code |
+| `region` refs (`&[r]T`) | cannot leave their region's scope | compile error (`examples/region_escape.jtr`) |
+| raw pointers | nothing — the programmer assumes the written obligations | `unsafe` blocks, required on both toolchains ([unsafe-contract.md](unsafe-contract.md)) |
+| `extern "c"` | nothing beyond the C side's own contract | the `unsafe` boundary |
+
+The claim is also about *lifetime* safety, not aliasing races: `mut`
+borrows are exclusive by convention (which is what lets the backend emit
+`restrict`), and shared-memory concurrency goes through the checked
+primitives (`Mutex`, channels) rather than through borrows.
+
+## Evidence at scale
+
+The strongest empirical evidence the discipline is livable: **the
+compiler itself** — ~25K lines of flattened Jestyr — passes this checker
+with zero escape diagnostics and self-hosts to a byte-identical fixed
+point. Rejection demos (`examples/escapes.jtr`,
+`examples/collection.jtr`, `examples/region_escape.jtr`) show each route
+firing. A mechanized formalization of the claim above is future work;
+the statement here is what it would prove.

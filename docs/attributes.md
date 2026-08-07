@@ -85,6 +85,9 @@ Argument shapes are fixed per attribute and enforced:
 | `@volatile` | field | — | `volatile` qualifier | MMIO — never cache the field |
 | `@no_panic` | fn / method | — | (static check) | every faulting op must be provably safe |
 | `@no_alloc` | fn / method | — | (static check) | nothing allocates, transitively through calls |
+| `@deterministic` | fn / method | — | (static check) | body certified deterministic (incl. every reduction) |
+| `@span(class)` | fn / method | `constant`/`log`/`linear`/`linearithmic`/`quadratic` | (static check) | checked work-span (critical-path) bound — see §4a |
+| `@simd` | fn / method | — | vectorized `par for` lowering + legality check | every `par for` in the body certified lane-safe — see §4a |
 | `@inline` | fn / method | — | `static inline __attribute__((always_inline))` | force inlining |
 | `@no_inline` | fn / method | — | `__attribute__((noinline))` | forbid inlining |
 | `@hot` | fn / method | — | `__attribute__((hot))` | optimize for the fast path |
@@ -179,6 +182,78 @@ name**. A method, a closure, or a call through a `fn(…)` pointer is not in it,
 allocation reached only that way is not caught. `@no_alloc` is therefore a strong check
 rather than a total proof today — closing the gap needs call-graph resolution the escape
 checker does not yet have.
+
+---
+
+## 4a. Checked cost models — `@span`, `@simd`, `@deterministic`
+
+These three make **performance shape part of the checked interface**, the
+same way types make data shape part of it. Each is a *contract the
+compiler verifies*, never a hint or a switch: the claim is on the
+signature, the compiler re-derives it from the body, and a body that no
+longer satisfies it is a **compile error** — so a performance property
+can't rot silently under refactoring.
+
+### `@span(class)` — a checked bound on parallel depth
+
+`@span` declares the function's asymptotic *span* (critical-path length —
+its running time on unboundedly many processors, the Cilk/NESL measure).
+The compiler computes the body's span from its loop structure: a
+sequential loop over `n` multiplies by `n`; a deterministic
+`par for … reduce(r)` contributes only `log n` (a parallel tree
+reduction). Classes: `constant`, `log`, `linear`, `linearithmic`,
+`quadratic`.
+
+The teeth: **serializing a parallel reduction is a compile error.**
+
+```jestyr
+// examples/std/par_cost.jtr — the compiler VERIFIES the span is O(log n)
+@span(log) fn par_sum(read s: []i64) -> i64 {
+    par for x in s reduce(core.sum_reduction()) { x }
+}
+```
+
+Rewrite that `par for` as a plain `for` and the span becomes linear:
+
+```text
+error: `@span(log)` is violated: this function's span is linear,
+       which exceeds the declared log
+```
+
+A reviewer sees a one-line diff; the compiler sees an asymptotic
+regression on the function's contract.
+
+### `@simd` — checked lane-safety, then vectorization
+
+`@simd` declares that every `par for` in the body may be evaluated a SIMD
+lane at a time without changing one bit of the result. The compiler
+decides legality itself (a total, elementwise integer expression — no
+calls, no division, no floats, no cross-iteration dependence) and
+**rejects** a body that doesn't qualify, naming the cause; what it
+certifies, it lowers to GCC vector extensions. The realized lane width is
+pinned by the determinism canary, so vectorization cannot silently change
+observable results.
+
+The failure mode this kills: a call quietly slipped into a hot loop turns
+"unvectorizable" from a silent performance cliff into a diagnostic.
+
+### `@deterministic` — certified reproducibility
+
+`@deterministic` has the checker certify the whole body deterministic —
+in particular, every parallel reduction in it must use a
+declared-deterministic operator (integer `add`/`min`/`max`, or the binned
+float accumulator); a non-deterministic reduction is refused at compile
+time. Paired with the locked FP flags this is the language-level half of
+the determinism contract ([FP-DETERMINISM-CONTRACT.md](../FP-DETERMINISM-CONTRACT.md)).
+
+### Why this matters (the design idea)
+
+Optimizers everywhere make cost *implicit*; these attributes make the
+programmer's cost intent **explicit and machine-checked**, which is the
+prerequisite for gating optimization on proof rather than on hope. The
+same machinery is designed to grow additional facets (a thermal/energy
+model is planned on `@span`'s skeleton — see MOTLEY.md). Demos:
+`examples/std/par_cost.jtr`, `par_for_simd.jtr`, `deterministic.jtr`.
 
 ---
 

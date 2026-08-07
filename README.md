@@ -109,7 +109,9 @@ verified platforms.
 **5. Safety enforcement.** Raw-pointer operations outside `unsafe` are
 compile errors on both toolchains ([docs/unsafe-contract.md](docs/unsafe-contract.md));
 bounds checks elide only under refinement proof; `unsafe` has a written
-contract with a completed enforcement ladder.
+contract with a completed enforcement ladder. The escape checker's
+guarantee is stated precisely in
+[docs/escape-guarantee.md](docs/escape-guarantee.md).
 
 ## How to verify (the ladder)
 
@@ -129,8 +131,11 @@ Windows.
 
 | Path | What |
 |---|---|
-| [jestyr-design.md](jestyr-design.md) | the language design doc (draft; not everything in it is built — see ROADMAP for status) |
+| [jestyr-design.md](jestyr-design.md) | the language design doc (draft; not everything in it is built) |
+| [DESIGN-STATUS.md](DESIGN-STATUS.md) | the one-screen implemented-vs-designed matrix |
 | [ROADMAP.md](ROADMAP.md) | per-workstream status |
+| [docs/escape-guarantee.md](docs/escape-guarantee.md) | the escape checker's guarantee, stated precisely |
+| [docs/TESTING.md](docs/TESTING.md) | the verification ladder with runtimes |
 | [docs/](docs/README.md) | topic docs: attributes, errors, unsafe contract, CTFE tiers, obligations, … |
 | [examples/](examples/README.md) | ~93 example programs, indexed by feature |
 | `examples/std/` | **the self-hosted compiler's own source** (plus the stdlib) — the `.jtr` files here *are* the compiler |
