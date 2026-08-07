@@ -3,9 +3,17 @@
 //! `HashMap` symbol tables with a deterministic, build-once/lookup-many structure.
 //!
 //! Compiled only under `--features dharht-experiment`. Self-contained (std only).
-//! Source: the D-HARHT blueprint; `seal_for_lookup()` then `get()` is the access
-//! pattern that matches a compiler's "build a symbol table in typeck, read it in
-//! cgen" shape. See `docs/TESTING.md` §6 for the experiment and its findings.
+//!
+//! **Provenance.** D-HARHT (Deterministic Hybrid Adaptive Radix/Hash Table) is a
+//! data-structure design from CJC-Lang, a sibling compiler-infrastructure project
+//! by the same author (see `MOTLEY.md` for the ecosystem); this file is a
+//! self-contained Rust implementation written from that project's blueprint, by
+//! the same author, and is licensed with the rest of this repository
+//! (MIT OR Apache-2.0). No third-party code is vendored here.
+//!
+//! `seal_for_lookup()` then `get()` is the access pattern that matches a
+//! compiler's "build a symbol table in typeck, read it in cgen" shape. See
+//! `docs/TESTING.md` §6 for the experiment and its findings.
 #![allow(dead_code)]
 
 use std::mem::size_of;
