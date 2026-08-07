@@ -34,8 +34,13 @@ gcc -O2 -std=c11 -ffp-contract=off -fno-fast-math -Wl,--stack,67108864 -o jc.exe
   compatible; `jc file.jtr attest-verify old.manifest` does the same against a fresh
   render. Either exits non-zero when something breaks, so both drop into CI as a gate.
 
-On Windows, pass the file with backslashes (`jc examples\hello.jtr run`) — `run` hands
-the produced exe path to `cmd.exe`, which rejects forward slashes in command position.
+The driver adapts to its host: on POSIX it probes for a C compiler in the
+reference driver's order (`cc`, `gcc`, `clang`), names the output without a
+suffix, and anchors a separator-free path with `./` before running it; on
+Windows it uses `gcc` (MinGW), names the output `<stem>.exe`, and anchors with
+`.\`. On Windows, pass the file with backslashes (`jc examples\hello.jtr run`) —
+`run` hands the produced exe path to `cmd.exe`, which rejects forward slashes
+in command position.
 
 ## Verify the fixed point
 

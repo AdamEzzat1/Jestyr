@@ -12576,6 +12576,9 @@ fn driver_build(mut m: Ml, read p: parser.Parser, read c: typeck.Checker, read s
     }
     var sb: String = string_new()
     emit_program(sb, p, c, src, a, false, "")
+    // POSIX probe: `/dev/null` opens only there (Windows fopen fails on that path).
+    // One call decides output naming, the compiler probe, and how `run` invokes.
+    let posix: bool = fs.exists("/dev/null")
     var stem: String = string_new()                   // `<file minus .jtr>`
     if ends_with(path, ".jtr") {
         string_push(stem, path[0 .. path.len - 4])
@@ -12587,13 +12590,27 @@ fn driver_build(mut m: Ml, read p: parser.Parser, read c: typeck.Checker, read s
     string_push(cpath, ".c")
     var xpath: String = string_new()
     string_push(xpath, string_view(stem))
-    string_push(xpath, ".exe")
+    if !posix { string_push(xpath, ".exe") }          // POSIX: no suffix, like the reference driver
     if !write_file(string_view(cpath), string_view(sb)) {
         eprint_str("error: cannot write the generated C")
         return 1
     }
     var cmd: String = string_new()                    // the locked flag set (mirrors CC_FLAGS)
-    string_push(cmd, "gcc -O2 -std=c11 -ffp-contract=off -fno-fast-math")
+    if posix {
+        // The reference driver's probe order (cc, gcc, clang), via the shell.
+        if run_command("cc --version >/dev/null 2>&1") == 0 {
+            string_push(cmd, "cc")
+        } else {
+            if run_command("gcc --version >/dev/null 2>&1") == 0 {
+                string_push(cmd, "gcc")
+            } else {
+                string_push(cmd, "clang")
+            }
+        }
+    } else {
+        string_push(cmd, "gcc")                       // Windows: gcc (MinGW), as documented
+    }
+    string_push(cmd, " -O2 -std=c11 -ffp-contract=off -fno-fast-math")
     if contains(string_view(sb), "pthread") { string_push(cmd, " -pthread") }
     string_push(cmd, " -o \"")
     string_push(cmd, string_view(xpath))
@@ -12608,6 +12625,16 @@ fn driver_build(mut m: Ml, read p: parser.Parser, read c: typeck.Checker, read s
     if do_run {
         var rcmd: String = string_new()
         string_push(rcmd, "\"")
+        // A separator-free path is not on the POSIX shell's PATH — anchor it.
+        // (Windows too: cmd.exe skips the current directory when
+        // NoDefaultCurrentDirectoryInExePath is set, as MSYS/Git Bash does.)
+        if posix {
+            if !contains(string_view(xpath), "/") { string_push(rcmd, "./") }
+        } else {
+            if !contains(string_view(xpath), "/") {
+                if !contains(string_view(xpath), "\\") { string_push(rcmd, ".\\") }
+            }
+        }
         string_push(rcmd, string_view(xpath))
         string_push(rcmd, "\"")
         let prc: i32 = run_command(string_view(rcmd))

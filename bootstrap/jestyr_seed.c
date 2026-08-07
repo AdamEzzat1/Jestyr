@@ -33786,6 +33786,7 @@ int32_t jestyr_driver_build(Jestyr_Ml* restrict j_m, Jestyr_Parser j_p, Jestyr_C
     }
     JestyrString j_sb = jestyr_rt_str_new();
     jestyr_emit_program(&(j_sb), j_p, j_c, j_src, j_a, false, JSTR(""));
+    bool j_posix = jestyr_exists(JSTR("/dev/null"));
     JestyrString j_stem = jestyr_rt_str_new();
     if (jestyr_rt_ends_with(j_path, JSTR(".jtr")))
     {
@@ -33800,7 +33801,10 @@ int32_t jestyr_driver_build(Jestyr_Ml* restrict j_m, Jestyr_Parser j_p, Jestyr_C
     jestyr_rt_str_push(&j_cpath, JSTR(".c"));
     JestyrString j_xpath = jestyr_rt_str_new();
     jestyr_rt_str_push(&j_xpath, jestyr_rt_str_view(&j_stem));
-    jestyr_rt_str_push(&j_xpath, JSTR(".exe"));
+    if ((!j_posix))
+    {
+        jestyr_rt_str_push(&j_xpath, JSTR(".exe"));
+    }
     if ((!jestyr_rt_write_file(jestyr_rt_str_view(&j_cpath), jestyr_rt_str_view(&j_sb))))
     {
         jestyr_rt_eprint_str(JSTR("error: cannot write the generated C"));
@@ -33815,7 +33819,29 @@ int32_t jestyr_driver_build(Jestyr_Ml* restrict j_m, Jestyr_Parser j_p, Jestyr_C
         return j_result;
     }
     JestyrString j_cmd = jestyr_rt_str_new();
-    jestyr_rt_str_push(&j_cmd, JSTR("gcc -O2 -std=c11 -ffp-contract=off -fno-fast-math"));
+    if (j_posix)
+    {
+        if ((jestyr_rt_run_command(JSTR("cc --version >/dev/null 2>&1")) == 0))
+        {
+            jestyr_rt_str_push(&j_cmd, JSTR("cc"));
+        }
+        else
+        {
+            if ((jestyr_rt_run_command(JSTR("gcc --version >/dev/null 2>&1")) == 0))
+            {
+                jestyr_rt_str_push(&j_cmd, JSTR("gcc"));
+            }
+            else
+            {
+                jestyr_rt_str_push(&j_cmd, JSTR("clang"));
+            }
+        }
+    }
+    else
+    {
+        jestyr_rt_str_push(&j_cmd, JSTR("gcc"));
+    }
+    jestyr_rt_str_push(&j_cmd, JSTR(" -O2 -std=c11 -ffp-contract=off -fno-fast-math"));
     if (jestyr_rt_contains(jestyr_rt_str_view(&j_sb), JSTR("pthread")))
     {
         jestyr_rt_str_push(&j_cmd, JSTR(" -pthread"));
@@ -33843,6 +33869,23 @@ int32_t jestyr_driver_build(Jestyr_Ml* restrict j_m, Jestyr_Parser j_p, Jestyr_C
     {
         JestyrString j_rcmd = jestyr_rt_str_new();
         jestyr_rt_str_push(&j_rcmd, JSTR("\""));
+        if (j_posix)
+        {
+            if ((!jestyr_rt_contains(jestyr_rt_str_view(&j_xpath), JSTR("/"))))
+            {
+                jestyr_rt_str_push(&j_rcmd, JSTR("./"));
+            }
+        }
+        else
+        {
+            if ((!jestyr_rt_contains(jestyr_rt_str_view(&j_xpath), JSTR("/"))))
+            {
+                if ((!jestyr_rt_contains(jestyr_rt_str_view(&j_xpath), JSTR("\\"))))
+                {
+                    jestyr_rt_str_push(&j_rcmd, JSTR(".\\"));
+                }
+            }
+        }
         jestyr_rt_str_push(&j_rcmd, jestyr_rt_str_view(&j_xpath));
         jestyr_rt_str_push(&j_rcmd, JSTR("\""));
         int32_t j_prc = jestyr_rt_run_command(jestyr_rt_str_view(&j_rcmd));
