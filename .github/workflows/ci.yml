@@ -1,0 +1,90 @@
+# Jestyr CI — the verification ladder from README.md, run where strangers can see it.
+#
+# Three jobs:
+#   test      — the default suite (unit + property + fuzz smoke), Ubuntu + Windows.
+#   c-oracle  — the full ladder on Ubuntu: gcc-in-test oracle, the 148-file corpus
+#               goldens, the self-hosting fixed point, the bootstrap-seed drift guard.
+#               The Ubuntu run of the determinism canary IS the cross-OS verification
+#               the FP determinism contract calls "the only blocker to proof": the
+#               locked digest was first computed on Windows+gcc, so this job passing
+#               means the digest is identical across OS + libc.
+#   bootstrap — the no-Rust path: gcc-compile the committed seed, verify the fixed
+#               point (the built compiler regenerates its own seed byte-for-byte),
+#               and compile-and-run a program with it.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: cargo test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # Byte-identity tests must never see CRLF-translated files.
+      - name: Disable git autocrlf
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: Run the default suite
+        run: cargo test
+
+  c-oracle:
+    name: c-oracle + corpus + self-hosting fixed point (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Disable git autocrlf
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-oracle-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: Show toolchain versions
+        run: |
+          gcc --version | head -1
+          rustc --version
+      # This runs everything: the default suite, the gcc oracle (including the
+      # cross-OS SHA-256 determinism canary), the corpus goldens, the concatenated
+      # self-hosting build, the full fixed point, and the seed drift guard.
+      - name: Full ladder
+        run: cargo test --features c-oracle,selfhost-fixpoint
+
+  bootstrap:
+    name: gcc-only bootstrap + fixed point (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Disable git autocrlf
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - name: Build the compiler from the seed (no Rust)
+        run: gcc -O2 -std=c11 -ffp-contract=off -fno-fast-math -o jc bootstrap/jestyr_seed.c
+      - name: Verify the fixed point (the compiler regenerates its own seed)
+        run: |
+          ulimit -s unlimited || true
+          ./jc bootstrap/jestyr_flat.jtr > regen.c
+          diff regen.c bootstrap/jestyr_seed.c
+      - name: Compile and run a program with the bootstrapped compiler
+        run: |
+          ulimit -s unlimited || true
+          ./jc examples/hello.jtr run
