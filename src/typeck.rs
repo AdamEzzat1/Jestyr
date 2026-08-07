@@ -333,7 +333,23 @@ impl<'a> TypeChecker<'a> {
                         e.type_params.iter().map(|p| p.name.clone()).collect();
                     for v in &e.variants {
                         let vkey = self.canon_variant_in(self.cur_mod, &v.name.name);
-                        self.table.variants.insert(vkey, idx);
+                        // Variant names resolve by bare name within a module, so a
+                        // duplicate — in this enum or another same-module enum — would
+                        // silently shadow the earlier one (a bare `err(name, …)` or
+                        // pattern would bind against the wrong enum). First-wins +
+                        // error, never last-wins.
+                        if let Some(&prev) = self.table.variants.get(&vkey) {
+                            let owner = self.table.types[prev].name.clone();
+                            self.error(
+                                v.name.span,
+                                format!(
+                                    "duplicate variant name `{}`: enum `{}` already declares it in this module",
+                                    v.name.name, owner
+                                ),
+                            );
+                        } else {
+                            self.table.variants.insert(vkey, idx);
+                        }
                     }
                 }
                 Item::Distinct(d) => {
@@ -5332,6 +5348,32 @@ mod tests {
         assert!(
             d.iter().any(|m| m.message.contains("unknown trait `Bogus`")),
             "expected an unknown-trait-in-bound error: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn a_variant_name_shared_by_two_enums_in_one_module_is_an_error() {
+        // Variant names resolve by bare name within a module; before this check the
+        // second enum's `insert` silently won and an `err(overflow)` of the FIRST
+        // enum resolved against the second — a silent miscompile, not a diagnostic.
+        let (_i, d) = analyze(
+            "enum ParseErr { overflow, bad_digit }\nenum MathErr { overflow }\nfn main() -> i32 { return 0 }",
+        );
+        assert!(
+            d.iter().any(|m| m.message.contains("duplicate variant name `overflow`")
+                && m.message.contains("ParseErr")),
+            "expected a duplicate-variant error naming the earlier enum: {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn a_variant_name_repeated_inside_one_enum_is_an_error() {
+        let (_i, d) = analyze("enum E { a, b, a }\nfn main() -> i32 { return 0 }");
+        assert!(
+            d.iter().any(|m| m.message.contains("duplicate variant name `a`")),
+            "expected a duplicate-variant error: {:?}",
             d
         );
     }
