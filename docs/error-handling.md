@@ -263,6 +263,5 @@ generic ones (argc-0 records), and the whole corpus stayed byte-identical.
 * **Owning payloads** (`String` etc. — the drop obligation must be designed
   first), **named sets** (`error FsError = { … }`), match-over-result sugar,
   and multi-statement `catch`/arm bodies (the value-position block rule).
-* The **port mirror for trait error sets** — due with the first corpus `.jtr`
-  that declares one (the standing trigger; reference side is complete and
-  gated on use, so every golden is green without it).
+* (The trait-errors port mirror landed with `examples/trait_errors.jtr` —
+  corpus 148, byte-identical; both sides are complete.)

@@ -1868,7 +1868,8 @@ fn parse_enum(mut p: Parser, is_pub: i32) -> i32 {
 
 // `trait Name { fn m(self) -> T  fn n(self) { <default> } }`. Each method is a signature
 // (name, params, ret) with an optional `{ … }` default body (else an optional `;`). Methods
-// are buffered as 7-tuples (name span, param_start, param_count, ret_conv, ret_ty, body|-1)
+// are buffered as 8-tuples (name span, param_start, param_count, ret_conv, ret_ty, body|-1,
+// err-far|-1 -- the error-set extras block, trait-errors T2)
 // then appended to `mar`. Mirrors `parse_trait` / `parse_trait_method`.
 fn parse_trait(mut p: Parser, is_pub: i32) -> i32 {
     let tt: tokens.Token = cur_tok(p)
@@ -1894,6 +1895,45 @@ fn parse_trait(mut p: Parser, is_pub: i32) -> i32 {
             var ret_conv: i32 = 0
             var ret_ty: i32 = 0 - 1
             if cur_kind(p) == 77 { bump(p)  ret_conv = parse_conv(p)  ret_ty = parse_type(p) }   // `-> conv R`
+            // `!{ Names }` -- the trait method's declared error set (trait-errors
+            // T2): the CONTRACT calls through the trait are typed by. Stored as a
+            // `far` extras block (err triples + zero reqs/ens, so every far reader
+            // shares one layout); -1 when absent. Slot 7 of the method tuple.
+            var merrs: i32 = 0 - 1
+            if cur_kind(p) == 99 {
+                bump(p)
+                if cur_kind(p) == 65 { bump(p) }
+                var tel: List(i32) = list.make(i32, p.alloc)
+                var tem: bool = true
+                for tem {
+                    let tk: i32 = cur_kind(p)
+                    if tk == 66 { tem = false }
+                    else if tk == 110 { tem = false }
+                    else {
+                        if cur_kind(p) == 0 {
+                            let te: tokens.Token = cur_tok(p)
+                            list.push(i32, tel, te.start as i32)
+                            list.push(i32, tel, te.end as i32)
+                            bump(p)
+                            var tpt: i32 = 0 - 1
+                            if cur_kind(p) == 63 {
+                                bump(p)
+                                tpt = parse_type(p)
+                                if cur_kind(p) == 64 { bump(p) }
+                            }
+                            list.push(i32, tel, tpt)
+                        }
+                        if cur_kind(p) == 69 { bump(p) } else { tem = false }
+                    }
+                }
+                if cur_kind(p) == 66 { bump(p) }
+                merrs = list.len(i32, p.far) as i32
+                list.push(i32, p.far, (list.len(i32, tel) / 3) as i32)
+                var tei: usize = 0
+                for tei < list.len(i32, tel) { list.push(i32, p.far, list.get(i32, tel, tei))  tei = tei + 1 }
+                list.push(i32, p.far, 0)             // no `requires` on a trait sig
+                list.push(i32, p.far, 0)             // no `ensures` either
+            }
             var body: i32 = 0 - 1
             if cur_kind(p) == 65 { body = parse_block(p) }   // `{ default }`
             else if cur_kind(p) == 70 { bump(p) }            // optional `;`
@@ -1904,12 +1944,13 @@ fn parse_trait(mut p: Parser, is_pub: i32) -> i32 {
             list.push(i32, mt, ret_conv)
             list.push(i32, mt, ret_ty)
             list.push(i32, mt, body)
+            list.push(i32, mt, merrs)
         } else { bump(p) }                          // error recovery
     }
     var endp: usize = ne
     if cur_kind(p) == 66 { let rb: tokens.Token = cur_tok(p)  endp = rb.end  bump(p) }
     let method_start: i32 = list.len(i32, p.mar) as i32
-    let method_count: i32 = (list.len(i32, mt) / 7) as i32
+    let method_count: i32 = (list.len(i32, mt) / 8) as i32
     var j: usize = 0
     for j < list.len(i32, mt) {
         list.push(i32, p.mar, list.get(i32, mt, j))
@@ -3017,7 +3058,7 @@ fn dump_item(read src: str, read p: Parser, iid: i32) {
         print_str("trait") print_int(d.is_pub as i64) print_int(d.x as i64) print_int(d.y as i64) print_int(d.b as i64)
         var m: i32 = 0
         for m < d.b {
-            let mb: i32 = d.a + m * 7
+            let mb: i32 = d.a + m * 8
             let mns: i32 = list.get(i32, p.mar, mb as usize)
             let mne: i32 = list.get(i32, p.mar, (mb + 1) as usize)
             let param_start: i32 = list.get(i32, p.mar, (mb + 2) as usize)
@@ -3025,10 +3066,28 @@ fn dump_item(read src: str, read p: Parser, iid: i32) {
             let ret_conv: i32 = list.get(i32, p.mar, (mb + 4) as usize)
             let ret_ty: i32 = list.get(i32, p.mar, (mb + 5) as usize)
             let body: i32 = list.get(i32, p.mar, (mb + 6) as usize)
+            let merr: i32 = list.get(i32, p.mar, (mb + 7) as usize)
             print_str("(") print_str("tmethod") print_int(mns as i64) print_int(mne as i64) print_int(param_count as i64)
             dump_params(src, p, param_start, param_count)
             print_int(ret_conv as i64)
             if ret_ty < 0 { print_str("(") print_str("none") print_str(")") } else { dump_type(src, p, ret_ty) }
+            // The error-set record (trait-errors T2), grown on BOTH sides of the
+            // P2 golden: `<count> <(errname s e) <ptype|(none)>>s`, count 0 when bare.
+            if merr < 0 { print_int(0) }
+            else {
+                let tec: i32 = list.get(i32, p.far, merr as usize)
+                print_int(tec as i64)
+                var tk2: i32 = 0
+                for tk2 < tec {
+                    let tks: i32 = list.get(i32, p.far, (merr + 1 + tk2 * 3) as usize)
+                    let tke: i32 = list.get(i32, p.far, (merr + 2 + tk2 * 3) as usize)
+                    print_str("(") print_str("errname") print_int(tks as i64) print_int(tke as i64) print_str(")")
+                    let tkp: i32 = list.get(i32, p.far, (merr + 3 + tk2 * 3) as usize)
+                    if tkp >= 0 { dump_type(src, p, tkp) }
+                    else { print_str("(") print_str("none") print_str(")") }
+                    tk2 = tk2 + 1
+                }
+            }
             if body < 0 { print_str("(") print_str("none") print_str(")") } else { dump(src, p, body) }
             print_str(")")
             m = m + 1

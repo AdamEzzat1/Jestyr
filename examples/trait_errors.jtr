@@ -1,0 +1,41 @@
+// examples/trait_errors.jtr — error sets in TRAIT signatures (trait-errors T1/T2).
+// A trait method declares `!{ … }` with the same syntax a function uses, and the
+// TRAIT's set is the contract every call through the trait is typed by: impls
+// declare a subset, `?` propagates a trait call's errors, and — because a payload
+// is a property of the NAME, whole-program — `catch |e| match e { … }` extracts a
+// payload a trait call raised, with no trait-specific syntax anywhere.
+//
+// Run:  jestyrc run examples/trait_errors.jtr
+//   →  6, -42, 30
+
+struct Flaky { n: i64 }
+struct Solid { n: i64 }
+
+trait Load { fn get(read self) -> i64 !{ Missing(i64) } }
+
+impl Load for Flaky {
+    fn get(read self) -> i64 !{ Missing(i64) } {
+        if self.n < 0 { return err(Missing(self.n)) }
+        return ok(self.n)
+    }
+}
+
+impl Load for Solid {
+    fn get(read self) -> i64 !{ Missing(i64) } { return ok(self.n * 10) }
+}
+
+// `?` out of a fallible caller: the trait call's set propagates like any other.
+fn relay(read f: Flaky) -> i64 !{ Missing(i64) } {
+    let v = f.get()?
+    return ok(v + 1)
+}
+
+fn main() -> i32 {
+    let good: Flaky = Flaky { n: 5 }
+    let bad: Flaky = Flaky { n: 0 - 42 }
+    let s: Solid = Solid { n: 3 }
+    print_int(relay(good) catch 0 - 1)                                  // 6: ok through the hop
+    print_int(relay(bad) catch |e| match e { Missing(v) => v, _ => 0 }) // -42: the payload a TRAIT call raised
+    print_int(s.get() catch 0 - 1)                                      // 30: the other impl
+    return 0
+}

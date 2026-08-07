@@ -174,13 +174,16 @@ pub fn collect(ast: &Ast) -> Vec<Site> {
                 push_methods(body, &name.name, &mut owners, &mut methods);
             }
             Item::Impl(im) => {
-                // Trait-impl methods cannot be fallible (refused at check time),
-                // but their bodies are owners all the same — a `?` inside one must
-                // attribute to the method, not fall through to nothing.
+                // Trait-impl methods are owners AND `?`-callees (trait-errors
+                // T1/T2 made them fallible): conformance forces every impl of a
+                // method toward the trait's contract, so the method map's
+                // all-agree rule resolves them exactly as struct methods.
                 for f in &im.methods {
+                    let set = set_of(&f.errors);
+                    methods.entry(f.name.name.clone()).or_default().push(set.clone());
                     owners.push(Owner {
                         name: format!("{}.{}", im.trait_name.name, f.name.name),
-                        set: set_of(&f.errors),
+                        set,
                         body: f.body.span,
                     });
                 }

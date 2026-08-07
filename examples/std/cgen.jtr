@@ -3718,6 +3718,50 @@ fn build_error_tags(mut g: Cg, read p: parser.Parser, read src: str) {
                 m = m + 1
             }
         }
+        // TRAIT declarations and their impls carry sets too (trait-errors T2) --
+        // same whole-program map, same item order as the reference, so no
+        // existing program's tags move (nothing in the old corpus declares
+        // either).
+        if it.kind == 6 {
+            var ti: i32 = 0
+            for ti < it.b {
+                let tfe: i32 = list.get(i32, p.mar, (it.a + ti * 8 + 7) as usize)
+                if tfe >= 0 {
+                    let tfc: i32 = list.get(i32, p.far, tfe as usize)
+                    var tfk: i32 = 0
+                    for tfk < tfc {
+                        let tfs: i32 = list.get(i32, p.far, (tfe + 1 + tfk * 3) as usize)
+                        let tfn: i32 = list.get(i32, p.far, (tfe + 2 + tfk * 3) as usize)
+                        if error_tag_of(g, src, tfs as usize, tfn as usize) == 0 {
+                            list.push(i32, g.etags, tfs)
+                            list.push(i32, g.etags, tfn)
+                        }
+                        tfk = tfk + 1
+                    }
+                }
+                ti = ti + 1
+            }
+        }
+        if it.kind == 7 {
+            var ii: i32 = 0
+            for ii < it.z {
+                let ifd: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, p.mar, (it.b + ii) as usize) as usize)
+                if ifd.e >= 0 {
+                    let ifc: i32 = list.get(i32, p.far, ifd.e as usize)
+                    var ifk: i32 = 0
+                    for ifk < ifc {
+                        let ifs: i32 = list.get(i32, p.far, (ifd.e + 1 + ifk * 3) as usize)
+                        let ifn: i32 = list.get(i32, p.far, (ifd.e + 2 + ifk * 3) as usize)
+                        if error_tag_of(g, src, ifs as usize, ifn as usize) == 0 {
+                            list.push(i32, g.etags, ifs)
+                            list.push(i32, g.etags, ifn)
+                        }
+                        ifk = ifk + 1
+                    }
+                }
+                ii = ii + 1
+            }
+        }
         r = r + 1
     }
 }
@@ -7544,8 +7588,27 @@ fn emit_method_defs(mut sb: String, read p: parser.Parser, read src: str, read c
 // non-alnum chars only for exotic keys a Name can't contain). `self` renders as a real first
 // parameter of the impl target's C type, by `* restrict` pointer for a `mut`/`out self`.
 // Mirrors `emit_impl_method_decl`'s sig + `method_params_str` + `impl_method_c_name`.
+// The ok TypeId of a fallible impl method (trait-errors T2), with `Self`
+// resolved to the impl's target -- the mangle, the typedef and the signature
+// all key on it from ONE place so they cannot disagree (the reference's
+// `impl_ok_ty`).
+fn impl_ok_tid(read p: parser.Parser, read src: str, read im: parser.ItemData, read fd: parser.ItemData) -> i32 {
+    if fd.z < 0 { return 0 - 1 }
+    let t: parser.TypeData = list.get(parser.TypeData, p.ty, fd.z as usize)
+    if t.kind == 0 { if str_eq(src[t.start .. t.end], "Self") { return im.a } }
+    return fd.z
+}
+
 fn emit_impl_sig(mut sb: String, read p: parser.Parser, read src: str, read im: parser.ItemData, read fd: parser.ItemData) {
-    emit_c_ty(sb, p, src, fd.z)
+    // A fallible impl method returns its tagged result struct (trait-errors T2)
+    // -- the trait's signature is the ABI, exactly as a fallible struct method.
+    if fn_is_fallible(p, fd) {
+        string_push(sb, "JestyrResult_")
+        let iok: i32 = impl_ok_tid(p, src, im, fd)
+        if iok < 0 { string_push(sb, "unit") } else { push_ast_mangle(sb, p, src, iok) }
+    } else {
+        emit_c_ty(sb, p, src, fd.z)
+    }
     string_push(sb, " jestyr_impl_")
     string_push(sb, src[im.x .. im.y])                // trait name
     string_push(sb, "__")
@@ -7581,8 +7644,9 @@ fn emit_impl_sig(mut sb: String, read p: parser.Parser, read src: str, read im: 
 
 // Trait-impl method prototypes (mirrors `impl_protos`): one `<sig>;` per concrete impl method,
 // then a CONDITIONAL trailing blank (only if any emitted — unlike method_protos'). Blanket
-// generic impls are monomorphized per instance separately (a later increment); a fallible impl
-// method is unsupported by the reference backend, which emits nothing for it.
+// generic impls are monomorphized per instance separately (a later increment). A FALLIBLE impl
+// method returns its tagged result struct (trait-errors T2), exactly as a fallible struct
+// method does — the trait's signature is the ABI.
 // The blanket `impl[T] Drop for <Ctor>(T)` item covering generic-struct ctor `src[cns..cne]`,
 // or -1. Mirrors `generic_drop_impl` (detection by constructor name).
 fn generic_drop_impl_of(read p: parser.Parser, read src: str, cns: usize, cne: usize) -> i32 {
@@ -7676,11 +7740,9 @@ fn emit_impl_protos(mut sb: String, read p: parser.Parser, read src: str, read c
             for k < it.z {                            // (b,z) = method fn-ItemId slice in mar
                 let mid: i32 = list.get(i32, p.mar, (it.b + k) as usize)
                 let fd: parser.ItemData = list.get(parser.ItemData, p.it, mid as usize)
-                if !fn_is_fallible(p, fd) {
-                    emit_impl_sig(sb, p, src, it, fd)
-                    string_push(sb, ";\n")
-                    any = true
-                }
+                emit_impl_sig(sb, p, src, it, fd)
+                string_push(sb, ";\n")
+                any = true
                 k = k + 1
             }
         }
@@ -7717,7 +7779,7 @@ fn emit_impl_defs(mut sb: String, read p: parser.Parser, read src: str, read c: 
             for k < it.z {
                 let mid: i32 = list.get(i32, p.mar, (it.b + k) as usize)
                 let fd: parser.ItemData = list.get(parser.ItemData, p.it, mid as usize)
-                if !fn_is_fallible(p, fd) {
+                if true {
                     emit_impl_sig(sb, p, src, it, fd)
                     string_push(sb, "\n")
                     list.truncate(i32, g.pp, 0)
@@ -7736,7 +7798,13 @@ fn emit_impl_defs(mut sb: String, read p: parser.Parser, read src: str, read c: 
                     g.retty = fd.z
                     g.curfn = mid
                     g.autoret = true
-                    emit_body(sb, p, src, c, g, fd.w, fd.z >= 0, 0)
+                    // A fallible impl body constructs ITS result type: ok/err/?
+                    // consult res_ok, exactly as a fallible struct method
+                    // (trait-errors T2; Self ok resolves to the target).
+                    let ifall: bool = fn_is_fallible(p, fd)
+                    if ifall { g.res_ok = impl_ok_tid(p, src, it, fd) } else { g.res_ok = 0 - 2 }
+                    emit_body(sb, p, src, c, g, fd.w, fd.z >= 0 or ifall, 0)
+                    g.res_ok = 0 - 2
                     g.self_ptr = false
                     g.retty = 0 - 1
                     g.autoret = false
@@ -10262,6 +10330,56 @@ fn emit_result_defs(mut sb: String, read p: parser.Parser, read src: str, read c
         }
         r = r + 1
     }
+    // Fallible TRAIT-IMPL methods (trait-errors T2) need their result typedefs
+    // too -- plain impls only (a blanket impl's fallible method is refused at
+    // check time until the per-instance path learns the ABI).
+    var ri9: i32 = 0
+    for ri9 < list.len(i32, p.roots) {
+        let iid9: i32 = list.get(i32, p.roots, ri9)
+        let it9: parser.ItemData = list.get(parser.ItemData, p.it, iid9 as usize)
+        if it9.kind == 7 and it9.h <= 0 {
+            var mk9: i32 = 0
+            for mk9 < it9.z {
+                let fd9: parser.ItemData = list.get(parser.ItemData, p.it, list.get(i32, p.mar, (it9.b + mk9) as usize) as usize)
+                if fn_is_fallible(p, fd9) {
+                    let ok9: i32 = impl_ok_tid(p, src, it9, fd9)
+                    var m9: String = string_new()
+                    if ok9 < 0 { string_push(m9, "unit") } else { push_ast_mangle(m9, p, src, ok9) }
+                    var probe9: String = string_new()
+                    string_push(probe9, "|")  string_push(probe9, string_view(m9))  string_push(probe9, "|")
+                    if !contains(string_view(seen), string_view(probe9)) {
+                        string_push(seen, string_view(probe9))
+                        let ns9: i32 = dc_len(d)
+                        string_push(d.nb, "JestyrResult_")
+                        string_push(d.nb, string_view(m9))
+                        let ne9: i32 = dc_len(d)
+                        if ok9 >= 0 {
+                            var oc9: String = string_new()
+                            emit_c_ty(oc9, p, src, ok9)
+                            dc_dep(d, ne9, string_view(oc9))
+                            string_free(oc9)
+                        }
+                        if err_pay_gated(c) { dc_dep(d, ne9, "JestyrErrPay") }
+                        dc_begin(d, sb_len(sb), ns9, ne9, ne9, dc_len(d))
+                        string_push(sb, "typedef struct { bool is_err; ")
+                        if ok9 >= 0 {
+                            emit_c_ty(sb, p, src, ok9)
+                            string_push(sb, " ok; ")
+                        }
+                        string_push(sb, "int err; ")
+                        push_pay_field(sb, c)
+                        string_push(sb, "} JestyrResult_")
+                        string_push(sb, string_view(m9))
+                        string_push(sb, ";\n")
+                        dc_end(d, sb_len(sb))
+                    }
+                    string_free(m9)  string_free(probe9)
+                }
+                mk9 = mk9 + 1
+            }
+        }
+        ri9 = ri9 + 1
+    }
     // Fallible METHOD instances need their result typedefs too -- one ok type per
     // instantiation, walked in `g.gmi` order (the LIFO worklist order, which IS the
     // reference's `method_instances` order), deduped through the same `seen` so a
@@ -10975,7 +11093,7 @@ fn emit_dyn_typedefs(mut sb: String, read p: parser.Parser, read src: str, read 
         string_push(sb, "typedef struct {\n")
         var mi2: i32 = 0
         for mi2 < it.b {
-            let mb: i32 = it.a + mi2 * 7
+            let mb: i32 = it.a + mi2 * 8
             string_push(sb, "    ")
             let rty: i32 = list.get(i32, p.mar, (mb + 5) as usize)
             if rty >= 0 { emit_c_ty(sb, p, src, rty) } else { string_push(sb, "void") }
@@ -11091,7 +11209,7 @@ fn emit_dyn_vtables(mut sb: String, read p: parser.Parser, read src: str) {
                     var tm: i32 = 0
                     for tm < t2.b {
                         if tm > 0 { string_push(sb, ", ") }
-                        let mb2: i32 = t2.a + tm * 7
+                        let mb2: i32 = t2.a + tm * 8
                         string_push(sb, "jestyr_vtshim_")
                         string_push(sb, src[im.x as usize .. im.y as usize])
                         string_push(sb, "__")

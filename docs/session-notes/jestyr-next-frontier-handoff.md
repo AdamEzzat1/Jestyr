@@ -58,8 +58,8 @@ byte-identical) + concat + test-mode; P2/P3/P4 goldens; `selfhost_fixpoint_full`
    bodies are single expressions (the standing catch-fallback rule — lift for
    arms + fallbacks together); owning payloads (E6+, drop design first); named
    sets; match-over-result sugar.
-2. **Error sets in TRAIT signatures** — ✅ **DONE on the reference side (T1), gated
-   on use.** A trait method declares `!{ … }` with the same syntax a fn uses
+2. **Error sets in TRAIT signatures** — ✅ **DONE ON BOTH SIDES (T1 reference +
+   T2 port mirror, corpus 148, seed refreshed).** A trait method declares `!{ … }` with the same syntax a fn uses
    (payloads ride the NAME per D1 — no new trait syntax); the trait's set is the
    contract every call is typed by; impl conformance is set inclusion (trait-bare +
    impl-set keeps the original refusal verbatim; trait-set + impl-bare refused —
@@ -70,9 +70,17 @@ byte-identical) + concat + test-mode; P2/P3/P4 goldens; `selfhost_fixpoint_full`
    Deferred with refusals-with-reasons: **dyn dispatch** (refused at the coercion —
    the vtable machinery hasn't learned the result-struct ABI), default bodies on
    fallible trait methods, fallible methods in blanket impls. Zero corpus movement
-   (gated); **the port mirror + a corpus file are the standing-trigger follow-up**,
-   and the P2 ref_dump's trait-method records will need the same both-sides growth
-   the errname records got in E5.
+   (gated). **T2 landed the port mirror all-at-once with `examples/trait_errors.jtr`
+   (corpus 148) — byte-identical on the FIRST comparison, no crash this time**:
+   trait-method tuples grew 7→8 (slot 7 = the err-far block; FIVE stride readers
+   moved in lockstep — registration, the P3 block-shim skip, the P2 dump, and the
+   two dyn-vtable iterations), the P2 tmethod record grew its error-set on both
+   sides, typeck.jtr wraps all three dispatch resolutions through `trait_ret_wrap`
+   (fallibility only — the set stays the reference's job, E2's display-dodge again),
+   cgen.jtr lifts both impl-emitter guards (`impl_ok_tid` resolves a `Self` ok to
+   the target from one place), and the census learned impl methods as `?`-callees.
+   The refreshed seed means the gcc-only bootstrap compiler builds fallible trait
+   dispatch too.
 3. **The `#line` port + module-loader unification.** The module-path golden
    (`jestyr_module_cgen_matches_reference_except_line_directives`) pins THREE
    divergences, all from the two loaders producing different merged buffers: `#line`

@@ -1063,12 +1063,6 @@ pub fn intern_keywords(mut it: Interner) -> i64 {
 // `Error` node) instead of overflowing the parser — or the recursive `dump` — stack
 // (`jestyr_parser_bounds_deep_nesting`).
 
-
-
-
-
-
-
 // One arena node. `kind`: 0=Int 1=Float 2=Name 3=Unary 4=Binary 5=Field 6=Index 7=Deref
 // 8=Try 9=Error 10=Call 11=Cast 12=Assign 13=Range 14=ArrayLit 15=ArrayRepeat 16=StructLit
 // 17=GenStructLit 18=FieldInit 19=SelfValue 20=SelfType 21=Attr 22=FString 23=Block 24=If
@@ -2899,7 +2893,8 @@ fn parse_enum(mut p: Parser, is_pub: i32) -> i32 {
 
 // `trait Name { fn m(self) -> T  fn n(self) { <default> } }`. Each method is a signature
 // (name, params, ret) with an optional `{ … }` default body (else an optional `;`). Methods
-// are buffered as 7-tuples (name span, param_start, param_count, ret_conv, ret_ty, body|-1)
+// are buffered as 8-tuples (name span, param_start, param_count, ret_conv, ret_ty, body|-1,
+// err-far|-1 -- the error-set extras block, trait-errors T2)
 // then appended to `mar`. Mirrors `parse_trait` / `parse_trait_method`.
 fn parse_trait(mut p: Parser, is_pub: i32) -> i32 {
     let tt: Token = cur_tok(p)
@@ -2925,6 +2920,45 @@ fn parse_trait(mut p: Parser, is_pub: i32) -> i32 {
             var ret_conv: i32 = 0
             var ret_ty: i32 = 0 - 1
             if cur_kind(p) == 77 { bump(p)  ret_conv = parse_conv(p)  ret_ty = parse_type(p) }   // `-> conv R`
+            // `!{ Names }` -- the trait method's declared error set (trait-errors
+            // T2): the CONTRACT calls through the trait are typed by. Stored as a
+            // `far` extras block (err triples + zero reqs/ens, so every far reader
+            // shares one layout); -1 when absent. Slot 7 of the method tuple.
+            var merrs: i32 = 0 - 1
+            if cur_kind(p) == 99 {
+                bump(p)
+                if cur_kind(p) == 65 { bump(p) }
+                var tel: List(i32) = make__list(i32, p.alloc)
+                var tem: bool = true
+                for tem {
+                    let tk: i32 = cur_kind(p)
+                    if tk == 66 { tem = false }
+                    else if tk == 110 { tem = false }
+                    else {
+                        if cur_kind(p) == 0 {
+                            let te: Token = cur_tok(p)
+                            push(i32, tel, te.start as i32)
+                            push(i32, tel, te.end as i32)
+                            bump(p)
+                            var tpt: i32 = 0 - 1
+                            if cur_kind(p) == 63 {
+                                bump(p)
+                                tpt = parse_type(p)
+                                if cur_kind(p) == 64 { bump(p) }
+                            }
+                            push(i32, tel, tpt)
+                        }
+                        if cur_kind(p) == 69 { bump(p) } else { tem = false }
+                    }
+                }
+                if cur_kind(p) == 66 { bump(p) }
+                merrs = len(i32, p.far) as i32
+                push(i32, p.far, (len(i32, tel) / 3) as i32)
+                var tei: usize = 0
+                for tei < len(i32, tel) { push(i32, p.far, get(i32, tel, tei))  tei = tei + 1 }
+                push(i32, p.far, 0)             // no `requires` on a trait sig
+                push(i32, p.far, 0)             // no `ensures` either
+            }
             var body: i32 = 0 - 1
             if cur_kind(p) == 65 { body = parse_block(p) }   // `{ default }`
             else if cur_kind(p) == 70 { bump(p) }            // optional `;`
@@ -2935,12 +2969,13 @@ fn parse_trait(mut p: Parser, is_pub: i32) -> i32 {
             push(i32, mt, ret_conv)
             push(i32, mt, ret_ty)
             push(i32, mt, body)
+            push(i32, mt, merrs)
         } else { bump(p) }                          // error recovery
     }
     var endp: usize = ne
     if cur_kind(p) == 66 { let rb: Token = cur_tok(p)  endp = rb.end  bump(p) }
     let method_start: i32 = len(i32, p.mar) as i32
-    let method_count: i32 = (len(i32, mt) / 7) as i32
+    let method_count: i32 = (len(i32, mt) / 8) as i32
     var j: usize = 0
     for j < len(i32, mt) {
         push(i32, p.mar, get(i32, mt, j))
@@ -4048,7 +4083,7 @@ fn dump_item(read src: str, read p: Parser, iid: i32) {
         print_str("trait") print_int(d.is_pub as i64) print_int(d.x as i64) print_int(d.y as i64) print_int(d.b as i64)
         var m: i32 = 0
         for m < d.b {
-            let mb: i32 = d.a + m * 7
+            let mb: i32 = d.a + m * 8
             let mns: i32 = get(i32, p.mar, mb as usize)
             let mne: i32 = get(i32, p.mar, (mb + 1) as usize)
             let param_start: i32 = get(i32, p.mar, (mb + 2) as usize)
@@ -4056,10 +4091,28 @@ fn dump_item(read src: str, read p: Parser, iid: i32) {
             let ret_conv: i32 = get(i32, p.mar, (mb + 4) as usize)
             let ret_ty: i32 = get(i32, p.mar, (mb + 5) as usize)
             let body: i32 = get(i32, p.mar, (mb + 6) as usize)
+            let merr: i32 = get(i32, p.mar, (mb + 7) as usize)
             print_str("(") print_str("tmethod") print_int(mns as i64) print_int(mne as i64) print_int(param_count as i64)
             dump_params(src, p, param_start, param_count)
             print_int(ret_conv as i64)
             if ret_ty < 0 { print_str("(") print_str("none") print_str(")") } else { dump_type(src, p, ret_ty) }
+            // The error-set record (trait-errors T2), grown on BOTH sides of the
+            // P2 golden: `<count> <(errname s e) <ptype|(none)>>s`, count 0 when bare.
+            if merr < 0 { print_int(0) }
+            else {
+                let tec: i32 = get(i32, p.far, merr as usize)
+                print_int(tec as i64)
+                var tk2: i32 = 0
+                for tk2 < tec {
+                    let tks: i32 = get(i32, p.far, (merr + 1 + tk2 * 3) as usize)
+                    let tke: i32 = get(i32, p.far, (merr + 2 + tk2 * 3) as usize)
+                    print_str("(") print_str("errname") print_int(tks as i64) print_int(tke as i64) print_str(")")
+                    let tkp: i32 = get(i32, p.far, (merr + 3 + tk2 * 3) as usize)
+                    if tkp >= 0 { dump_type(src, p, tkp) }
+                    else { print_str("(") print_str("none") print_str(")") }
+                    tk2 = tk2 + 1
+                }
+            }
             if body < 0 { print_str("(") print_str("none") print_str(")") } else { dump(src, p, body) }
             print_str(")")
             m = m + 1
@@ -6253,7 +6306,7 @@ pub fn run__ctfe() -> i32 {
 // row) and `icalls` each impl-dispatched call (5-tuples: call ExprId, trait name span, method
 // name span) — the downstream passes' `method_calls`/`impl_calls` (the escape checker's
 // give-away and manual-drop rules read them).
-pub struct Checker { pub tys: List(TyData), pub tya: List(i32), pub et: List(i32), scn: List(i32), scst: List(i32), pub tdecl: List(i32), pub tch: List(i32), pub fns: List(i32), cst: List(i32), vmap: List(i32), tra: List(i32), imp: List(i32), pub mcalls: List(i32), pub icalls: List(i32), pub bcalls: List(i32), pub dcalls: List(i32), pub dcoerce: List(i32), pub epay: List(i32), selfty: i32, expected: i32, curret: i32, scfloor: i32, gbs: i32, gbc: i32, alloc: Allocator }
+pub struct Checker { pub tys: List(TyData), pub tya: List(i32), pub et: List(i32), scn: List(i32), scst: List(i32), pub tdecl: List(i32), pub tch: List(i32), pub fns: List(i32), cst: List(i32), vmap: List(i32), tra: List(i32), imp: List(i32), pub mcalls: List(i32), pub icalls: List(i32), pub bcalls: List(i32), pub dcalls: List(i32), pub dcoerce: List(i32), pub epay: List(i32), pub tferr: List(i32), selfty: i32, expected: i32, curret: i32, scfloor: i32, gbs: i32, gbc: i32, alloc: Allocator }
 
 // One `Ty` arena node - kinds in the header comment. `a`/`b` are child TyIds or slice fields;
 // `x`/`y` are aux ints (prim code, name span, ret TyId/conv).
@@ -6281,7 +6334,7 @@ fn mk_ty__typeck(mut c: Checker, kind: i32, a: i32, b: i32, x: i32, y: i32) -> i
 // The checker with the well-known instances pre-created (ids 0..7) and `et` sized to the
 // expression arena, all-Unknown.
 fn make_checker(read p: Parser, read a: Allocator) -> Checker {
-    var c: Checker = Checker{ tys: make__list(TyData, a), tya: make__list(i32, a), et: make__list(i32, a), scn: make__list(i32, a), scst: make__list(i32, a), tdecl: make__list(i32, a), tch: make__list(i32, a), fns: make__list(i32, a), cst: make__list(i32, a), vmap: make__list(i32, a), tra: make__list(i32, a), imp: make__list(i32, a), mcalls: make__list(i32, a), icalls: make__list(i32, a), bcalls: make__list(i32, a), dcalls: make__list(i32, a), dcoerce: make__list(i32, a), epay: make__list(i32, a), selfty: 1, expected: 0 - 1, curret: 0 - 1, scfloor: 0, gbs: 0 - 1, gbc: 0, alloc: a }
+    var c: Checker = Checker{ tys: make__list(TyData, a), tya: make__list(i32, a), et: make__list(i32, a), scn: make__list(i32, a), scst: make__list(i32, a), tdecl: make__list(i32, a), tch: make__list(i32, a), fns: make__list(i32, a), cst: make__list(i32, a), vmap: make__list(i32, a), tra: make__list(i32, a), imp: make__list(i32, a), mcalls: make__list(i32, a), icalls: make__list(i32, a), bcalls: make__list(i32, a), dcalls: make__list(i32, a), dcoerce: make__list(i32, a), epay: make__list(i32, a), tferr: make__list(i32, a), selfty: 1, expected: 0 - 1, curret: 0 - 1, scfloor: 0, gbs: 0 - 1, gbc: 0, alloc: a }
     mk_ty__typeck(c, 0, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 0 Unknown
     mk_ty__typeck(c, 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 1 Unit
     mk_ty__typeck(c, 2, 0 - 1, 0 - 1, 2, 0 - 1)            // 2 Prim i32   (code 2)
@@ -6814,8 +6867,8 @@ fn build_table(mut c: Checker, read p: Parser, read src: str) {
         } else if it.kind == 6 {                   // trait: name + method sigs (Self kept Opaque)
             var mt: List(i32) = make__list(i32, c.alloc)
             var mi: i32 = 0
-            for mi < it.b {                        // method 7-tuples in mar
-                let mb: i32 = it.a + mi * 7
+            for mi < it.b {                        // method 8-tuples in mar
+                let mb: i32 = it.a + mi * 8
                 let rt: i32 = get(i32, p.mar, (mb + 5) as usize)
                 var ret: i32 = t_unit()
                 if rt >= 0 { ret = lower_type(c, p, src, rt) }
@@ -7504,7 +7557,8 @@ fn resolve_impl_method(mut c: Checker, read src: str, call_id: i32, recv: i32, m
                     push(i32, c.icalls, get(i32, c.imp, (base + 1) as usize))
                     push(i32, c.icalls, ms as i32)
                     push(i32, c.icalls, me as i32)
-                    return get(i32, c.tch, (mb + 2) as usize)
+                    let rt0: i32 = get(i32, c.tch, (mb + 2) as usize)
+                    return trait_ret_wrap(c, src, get(i32, c.imp, base as usize), get(i32, c.imp, (base + 1) as usize), ms, me, rt0)
                 }
                 j = j + 1
             }
@@ -7541,7 +7595,7 @@ fn resolve_bound_method(mut c: Checker, read p: Parser, read src: str, id: i32, 
                         push(i32, c.bcalls, be)
                         push(i32, c.bcalls, gns)
                         push(i32, c.bcalls, gne)
-                        return ret
+                        return trait_ret_wrap(c, src, bs, be, ms, me, ret)
                     }
                 }
             }
@@ -7566,7 +7620,7 @@ fn resolve_dyn_method(mut c: Checker, read src: str, call_id: i32, recv: i32, ms
             push(i32, c.dcalls, call_id)
             push(i32, c.dcalls, ms as i32)
             push(i32, c.dcalls, me as i32)
-            return ret
+            return trait_ret_wrap(c, src, rd.x, rd.y, ms, me, ret)
         }
     }
     return mk_ty__typeck(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1)
@@ -8822,10 +8876,10 @@ fn dump_types(read src: str, read c: Checker, read p: Parser, read a: Allocator)
         let it: ItemData = get(ItemData, p.it, q)
         if it.kind == 3 {
             if it.w >= 0 { set(bool, skip, it.w as usize, true) }
-        } else if it.kind == 6 {                   // trait: method 7-tuples, body at +6
+        } else if it.kind == 6 {                   // trait: method 8-tuples, body at +6
             var mi: i32 = 0
             for mi < it.b {
-                let body: i32 = get(i32, p.mar, (it.a + mi * 7 + 6) as usize)
+                let body: i32 = get(i32, p.mar, (it.a + mi * 8 + 6) as usize)
                 if body >= 0 { set(bool, skip, body as usize, true) }
                 mi = mi + 1
             }
@@ -8863,6 +8917,25 @@ fn build_err_payloads(mut c: Checker, read p: Parser, read src: str) {
         let iid: i32 = get(i32, p.roots, r)
         let it: ItemData = get(ItemData, p.it, iid as usize)
         if it.kind == 3 and it.e >= 0 { epay_scan_far(c, p, it.e) }
+        // Trait method sigs and impl methods are declaration sites too
+        // (trait-errors T2) -- a trait's `Missing(i64)` is where the payload
+        // is most naturally stated once.
+        if it.kind == 6 {
+            var tmi: i32 = 0
+            for tmi < it.b {
+                let tme: i32 = get(i32, p.mar, (it.a + tmi * 8 + 7) as usize)
+                if tme >= 0 { epay_scan_far(c, p, tme) }
+                tmi = tmi + 1
+            }
+        }
+        if it.kind == 7 {
+            var imi: i32 = 0
+            for imi < it.z {
+                let ifd: ItemData = get(ItemData, p.it, get(i32, p.mar, (it.b + imi) as usize) as usize)
+                if ifd.e >= 0 { epay_scan_far(c, p, ifd.e) }
+                imi = imi + 1
+            }
+        }
         if it.kind == 4 {
             var m: i32 = 0
             for m < it.b {
@@ -8909,10 +8982,62 @@ pub fn err_payload_of(read c: Checker, read src: str, ns: i32, ne: i32) -> i32 {
     return 0 - 1
 }
 
+// Every FALLIBLE trait method, as (trait ns, trait ne, method ns, method ne)
+// 4-tuples (trait-errors T2) -- what the three dispatch resolutions consult to
+// wrap a call's return in the Result type. Built once, mirrors the reference's
+// `TraitDef::method_errs` existence check (the set CONTENT stays the
+// reference's job; the port only needs fallibility for typing).
+fn build_trait_errs(mut c: Checker, read p: Parser, read src: str) {
+    var r: i32 = 0
+    for r < len(i32, p.roots) {
+        let iid: i32 = get(i32, p.roots, r)
+        let it: ItemData = get(ItemData, p.it, iid as usize)
+        if it.kind == 6 {
+            var mi: i32 = 0
+            for mi < it.b {
+                let mb: i32 = it.a + mi * 8
+                let tme: i32 = get(i32, p.mar, (mb + 7) as usize)
+                if tme >= 0 {
+                    if get(i32, p.far, tme as usize) > 0 {
+                        push(i32, c.tferr, it.x)
+                        push(i32, c.tferr, it.y)
+                        push(i32, c.tferr, get(i32, p.mar, mb as usize))
+                        push(i32, c.tferr, get(i32, p.mar, (mb + 1) as usize))
+                    }
+                }
+                mi = mi + 1
+            }
+        }
+        r = r + 1
+    }
+}
+
+// Wrap a trait-dispatched call's return in the Result type when the TRAIT's
+// method declares an error set (the reference's `wrap_trait_ret`). The set
+// itself is not carried -- the port never needed typed sets, and Result's
+// rendering never shows one (E2's display-dodge).
+fn trait_ret_wrap(mut c: Checker, read src: str, tns: i32, tne: i32, ms: usize, me: usize, ret: i32) -> i32 {
+    var i: usize = 0
+    for i < len(i32, c.tferr) {
+        let a: i32 = get(i32, c.tferr, i)
+        let b: i32 = get(i32, c.tferr, i + 1)
+        if str_eq(src[tns as usize .. tne as usize], src[a as usize .. b as usize]) {
+            let m1: i32 = get(i32, c.tferr, i + 2)
+            let m2: i32 = get(i32, c.tferr, i + 3)
+            if str_eq(src[ms .. me], src[m1 as usize .. m2 as usize]) {
+                return mk_ty__typeck(c, 5, ret, 0 - 1, 0 - 1, 0 - 1)
+            }
+        }
+        i = i + 4
+    }
+    return ret
+}
+
 pub fn check_parsed(read p: Parser, read src: str, read a: Allocator) -> Checker {
     var c: Checker = make_checker(p, a)
     build_table(c, p, src)
     build_err_payloads(c, p, src)
+    build_trait_errs(c, p, src)
     walk_items(c, p, src)
     return c
 }
@@ -13969,6 +14094,50 @@ fn build_error_tags(mut g: Cg, read p: Parser, read src: str) {
                 m = m + 1
             }
         }
+        // TRAIT declarations and their impls carry sets too (trait-errors T2) --
+        // same whole-program map, same item order as the reference, so no
+        // existing program's tags move (nothing in the old corpus declares
+        // either).
+        if it.kind == 6 {
+            var ti: i32 = 0
+            for ti < it.b {
+                let tfe: i32 = get(i32, p.mar, (it.a + ti * 8 + 7) as usize)
+                if tfe >= 0 {
+                    let tfc: i32 = get(i32, p.far, tfe as usize)
+                    var tfk: i32 = 0
+                    for tfk < tfc {
+                        let tfs: i32 = get(i32, p.far, (tfe + 1 + tfk * 3) as usize)
+                        let tfn: i32 = get(i32, p.far, (tfe + 2 + tfk * 3) as usize)
+                        if error_tag_of(g, src, tfs as usize, tfn as usize) == 0 {
+                            push(i32, g.etags, tfs)
+                            push(i32, g.etags, tfn)
+                        }
+                        tfk = tfk + 1
+                    }
+                }
+                ti = ti + 1
+            }
+        }
+        if it.kind == 7 {
+            var ii: i32 = 0
+            for ii < it.z {
+                let ifd: ItemData = get(ItemData, p.it, get(i32, p.mar, (it.b + ii) as usize) as usize)
+                if ifd.e >= 0 {
+                    let ifc: i32 = get(i32, p.far, ifd.e as usize)
+                    var ifk: i32 = 0
+                    for ifk < ifc {
+                        let ifs: i32 = get(i32, p.far, (ifd.e + 1 + ifk * 3) as usize)
+                        let ifn: i32 = get(i32, p.far, (ifd.e + 2 + ifk * 3) as usize)
+                        if error_tag_of(g, src, ifs as usize, ifn as usize) == 0 {
+                            push(i32, g.etags, ifs)
+                            push(i32, g.etags, ifn)
+                        }
+                        ifk = ifk + 1
+                    }
+                }
+                ii = ii + 1
+            }
+        }
         r = r + 1
     }
 }
@@ -17795,8 +17964,27 @@ fn emit_method_defs(mut sb: String, read p: Parser, read src: str, read c: Check
 // non-alnum chars only for exotic keys a Name can't contain). `self` renders as a real first
 // parameter of the impl target's C type, by `* restrict` pointer for a `mut`/`out self`.
 // Mirrors `emit_impl_method_decl`'s sig + `method_params_str` + `impl_method_c_name`.
+// The ok TypeId of a fallible impl method (trait-errors T2), with `Self`
+// resolved to the impl's target -- the mangle, the typedef and the signature
+// all key on it from ONE place so they cannot disagree (the reference's
+// `impl_ok_ty`).
+fn impl_ok_tid(read p: Parser, read src: str, read im: ItemData, read fd: ItemData) -> i32 {
+    if fd.z < 0 { return 0 - 1 }
+    let t: TypeData = get(TypeData, p.ty, fd.z as usize)
+    if t.kind == 0 { if str_eq(src[t.start .. t.end], "Self") { return im.a } }
+    return fd.z
+}
+
 fn emit_impl_sig(mut sb: String, read p: Parser, read src: str, read im: ItemData, read fd: ItemData) {
-    emit_c_ty(sb, p, src, fd.z)
+    // A fallible impl method returns its tagged result struct (trait-errors T2)
+    // -- the trait's signature is the ABI, exactly as a fallible struct method.
+    if fn_is_fallible__cgen(p, fd) {
+        string_push(sb, "JestyrResult_")
+        let iok: i32 = impl_ok_tid(p, src, im, fd)
+        if iok < 0 { string_push(sb, "unit") } else { push_ast_mangle(sb, p, src, iok) }
+    } else {
+        emit_c_ty(sb, p, src, fd.z)
+    }
     string_push(sb, " jestyr_impl_")
     string_push(sb, src[im.x .. im.y])                // trait name
     string_push(sb, "__")
@@ -17832,8 +18020,9 @@ fn emit_impl_sig(mut sb: String, read p: Parser, read src: str, read im: ItemDat
 
 // Trait-impl method prototypes (mirrors `impl_protos`): one `<sig>;` per concrete impl method,
 // then a CONDITIONAL trailing blank (only if any emitted — unlike method_protos'). Blanket
-// generic impls are monomorphized per instance separately (a later increment); a fallible impl
-// method is unsupported by the reference backend, which emits nothing for it.
+// generic impls are monomorphized per instance separately (a later increment). A FALLIBLE impl
+// method returns its tagged result struct (trait-errors T2), exactly as a fallible struct
+// method does — the trait's signature is the ABI.
 // The blanket `impl[T] Drop for <Ctor>(T)` item covering generic-struct ctor `src[cns..cne]`,
 // or -1. Mirrors `generic_drop_impl` (detection by constructor name).
 fn generic_drop_impl_of(read p: Parser, read src: str, cns: usize, cne: usize) -> i32 {
@@ -17927,11 +18116,9 @@ fn emit_impl_protos(mut sb: String, read p: Parser, read src: str, read c: Check
             for k < it.z {                            // (b,z) = method fn-ItemId slice in mar
                 let mid: i32 = get(i32, p.mar, (it.b + k) as usize)
                 let fd: ItemData = get(ItemData, p.it, mid as usize)
-                if !fn_is_fallible__cgen(p, fd) {
-                    emit_impl_sig(sb, p, src, it, fd)
-                    string_push(sb, ";\n")
-                    any = true
-                }
+                emit_impl_sig(sb, p, src, it, fd)
+                string_push(sb, ";\n")
+                any = true
                 k = k + 1
             }
         }
@@ -17968,7 +18155,7 @@ fn emit_impl_defs(mut sb: String, read p: Parser, read src: str, read c: Checker
             for k < it.z {
                 let mid: i32 = get(i32, p.mar, (it.b + k) as usize)
                 let fd: ItemData = get(ItemData, p.it, mid as usize)
-                if !fn_is_fallible__cgen(p, fd) {
+                if true {
                     emit_impl_sig(sb, p, src, it, fd)
                     string_push(sb, "\n")
                     truncate(i32, g.pp, 0)
@@ -17987,7 +18174,13 @@ fn emit_impl_defs(mut sb: String, read p: Parser, read src: str, read c: Checker
                     g.retty = fd.z
                     g.curfn = mid
                     g.autoret = true
-                    emit_body(sb, p, src, c, g, fd.w, fd.z >= 0, 0)
+                    // A fallible impl body constructs ITS result type: ok/err/?
+                    // consult res_ok, exactly as a fallible struct method
+                    // (trait-errors T2; Self ok resolves to the target).
+                    let ifall: bool = fn_is_fallible__cgen(p, fd)
+                    if ifall { g.res_ok = impl_ok_tid(p, src, it, fd) } else { g.res_ok = 0 - 2 }
+                    emit_body(sb, p, src, c, g, fd.w, fd.z >= 0 or ifall, 0)
+                    g.res_ok = 0 - 2
                     g.self_ptr = false
                     g.retty = 0 - 1
                     g.autoret = false
@@ -20513,6 +20706,56 @@ fn emit_result_defs(mut sb: String, read p: Parser, read src: str, read c: Check
         }
         r = r + 1
     }
+    // Fallible TRAIT-IMPL methods (trait-errors T2) need their result typedefs
+    // too -- plain impls only (a blanket impl's fallible method is refused at
+    // check time until the per-instance path learns the ABI).
+    var ri9: i32 = 0
+    for ri9 < len(i32, p.roots) {
+        let iid9: i32 = get(i32, p.roots, ri9)
+        let it9: ItemData = get(ItemData, p.it, iid9 as usize)
+        if it9.kind == 7 and it9.h <= 0 {
+            var mk9: i32 = 0
+            for mk9 < it9.z {
+                let fd9: ItemData = get(ItemData, p.it, get(i32, p.mar, (it9.b + mk9) as usize) as usize)
+                if fn_is_fallible__cgen(p, fd9) {
+                    let ok9: i32 = impl_ok_tid(p, src, it9, fd9)
+                    var m9: String = string_new()
+                    if ok9 < 0 { string_push(m9, "unit") } else { push_ast_mangle(m9, p, src, ok9) }
+                    var probe9: String = string_new()
+                    string_push(probe9, "|")  string_push(probe9, string_view(m9))  string_push(probe9, "|")
+                    if !contains(string_view(seen), string_view(probe9)) {
+                        string_push(seen, string_view(probe9))
+                        let ns9: i32 = dc_len(d)
+                        string_push(d.nb, "JestyrResult_")
+                        string_push(d.nb, string_view(m9))
+                        let ne9: i32 = dc_len(d)
+                        if ok9 >= 0 {
+                            var oc9: String = string_new()
+                            emit_c_ty(oc9, p, src, ok9)
+                            dc_dep(d, ne9, string_view(oc9))
+                            string_free(oc9)
+                        }
+                        if err_pay_gated(c) { dc_dep(d, ne9, "JestyrErrPay") }
+                        dc_begin(d, sb_len(sb), ns9, ne9, ne9, dc_len(d))
+                        string_push(sb, "typedef struct { bool is_err; ")
+                        if ok9 >= 0 {
+                            emit_c_ty(sb, p, src, ok9)
+                            string_push(sb, " ok; ")
+                        }
+                        string_push(sb, "int err; ")
+                        push_pay_field(sb, c)
+                        string_push(sb, "} JestyrResult_")
+                        string_push(sb, string_view(m9))
+                        string_push(sb, ";\n")
+                        dc_end(d, sb_len(sb))
+                    }
+                    string_free(m9)  string_free(probe9)
+                }
+                mk9 = mk9 + 1
+            }
+        }
+        ri9 = ri9 + 1
+    }
     // Fallible METHOD instances need their result typedefs too -- one ok type per
     // instantiation, walked in `g.gmi` order (the LIFO worklist order, which IS the
     // reference's `method_instances` order), deduped through the same `seen` so a
@@ -21226,7 +21469,7 @@ fn emit_dyn_typedefs(mut sb: String, read p: Parser, read src: str, read a: Allo
         string_push(sb, "typedef struct {\n")
         var mi2: i32 = 0
         for mi2 < it.b {
-            let mb: i32 = it.a + mi2 * 7
+            let mb: i32 = it.a + mi2 * 8
             string_push(sb, "    ")
             let rty: i32 = get(i32, p.mar, (mb + 5) as usize)
             if rty >= 0 { emit_c_ty(sb, p, src, rty) } else { string_push(sb, "void") }
@@ -21342,7 +21585,7 @@ fn emit_dyn_vtables(mut sb: String, read p: Parser, read src: str) {
                     var tm: i32 = 0
                     for tm < t2.b {
                         if tm > 0 { string_push(sb, ", ") }
-                        let mb2: i32 = t2.a + tm * 7
+                        let mb2: i32 = t2.a + tm * 8
                         string_push(sb, "jestyr_vtshim_")
                         string_push(sb, src[im.x as usize .. im.y as usize])
                         string_push(sb, "__")
