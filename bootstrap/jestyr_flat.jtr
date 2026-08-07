@@ -94,7 +94,6 @@ pub fn arena_allocator(cap: usize) -> Allocator {
 // input order (the Motley spine). A parallel `byid` array gives O(1) id→string.
 
 
-
 // One table entry: owns the key bytes (`kptr`/`klen`) and records the assigned `id`.
 // `hash` is cached so a grow re-places without re-hashing and a probe skips the
 // byte-compare on a hash mismatch.
@@ -355,7 +354,6 @@ pub fn argv(i: i32) -> str {
 // safe — exactly one release.)
 
 
-
 pub fn List(comptime T: type) -> type {
     return struct {
         ptr: *mut T,
@@ -462,9 +460,6 @@ impl[T] Drop for List(T) {
 // Byte-level (ASCII) classification, like the reference on ASCII source; the corpus is
 // ASCII outside comments/strings, which are slurped whole so their bytes never need
 // per-character classification.
-
-
-
 
 // A payload-free token: the integer `kind` tag (a `TokenKind` discriminant) plus the
 // half-open source span `[start, end)`. Fields are `pub` so consuming modules can read
@@ -4661,13 +4656,6 @@ pub fn parse_source(read src: str, mut it: Interner, kwcount: i64, read a: Alloc
 //     chain the `.jtr` subset cannot express at all. Assignment resolution therefore
 //     reads through `place_read_raw`, which deliberately does NOT copy: copying there
 //     would resolve `t[0]` against a duplicate and drop the write on the floor.
-
-
-
-
-
-
-
 
 
 // The total number of expression evaluations one top-level `eval` may perform.
@@ -9103,14 +9091,6 @@ pub fn run__typeck() -> i32 {
 // **Verification.** A diagnostic-set dump: each diagnostic as three lines — span start, span end,
 // message — in the reference's walk (emission) order. `jestyr_escape_dump_matches_reference`
 // (`--features c-oracle`) diffs it against `escape::check` over the whole corpus.
-
-
-
-
-
-
-
-
 
 // Per-run escape state, threaded `mut`. Scopes are flat arenas (like typeck's): `scn` holds
 // binding 3-tuples (name_start, name_end, is_borrow) and `scst` the per-scope start marks; `rgn`

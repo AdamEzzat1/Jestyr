@@ -11618,8 +11618,17 @@ fn main() -> i32 {
                         "{m}.jtr imports `{seg}` which is outside the self-host closure"
                     );
                     let mut end = toks[j - 1].span.end as usize;
-                    if src.as_bytes().get(end) == Some(&b'\n') {
-                        end += 1; // take the decl's own line break with it
+                    // Take the decl's own line break with it — CRLF or LF, so the
+                    // flatten is identical whichever way the checkout materialized
+                    // line endings (autocrlf=true leaves `\r\n` here; consuming only
+                    // `\n` would strand a blank line per import and fail the seed
+                    // drift guard against an LF-generated committed flat).
+                    if src.as_bytes().get(end) == Some(&b'\r')
+                        && src.as_bytes().get(end + 1) == Some(&b'\n')
+                    {
+                        end += 2;
+                    } else if src.as_bytes().get(end) == Some(&b'\n') {
+                        end += 1;
                     }
                     edits.push((t.span.start as usize, end, String::new()));
                     bindings.insert(binding, seg);
