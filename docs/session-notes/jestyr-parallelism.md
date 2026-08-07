@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Jestyr — Workstream Q (Data Parallelism), Tier 1: the deterministic SOAC library
 
 *Session summary. Increment landed on `master`. Companion: `PARALLELISM-HANDOFF.md`.*

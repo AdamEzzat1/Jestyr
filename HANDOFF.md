@@ -1,3 +1,5 @@
+> **Internal development log** — the running cross-session handoff, kept for provenance. Numbers and status lines here drift; [README.md](README.md) is the single authoritative status surface.
+
 # Jestyr — Handoff
 
 A handoff for continuing the **Jestyr** language bootstrap in a fresh session. Read

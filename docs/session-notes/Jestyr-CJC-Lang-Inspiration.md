@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Drawing on CJC-Lang for Jestyr: Structs/Enums/ADTs, Numerics, and Strings
 
 > Research-and-inspiration notes for three upcoming Jestyr sessions, sourced from the

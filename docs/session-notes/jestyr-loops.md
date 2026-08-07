@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Jestyr Loops — What Works Now
 
 > A reference for Jestyr's loop feature **as implemented**, with runnable examples.

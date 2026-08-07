@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance; parts predate self-hosting. The authoritative "how to verify the claims" ladder is in the repo [README](../README.md).
+
 # Jestyr — Testing & QA Handoff
 
 A consolidated view of **what exists** and **how it is verified**, plus the *stricter

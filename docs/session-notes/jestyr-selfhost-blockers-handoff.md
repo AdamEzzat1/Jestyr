@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Handoff — Remaining Blockers to Self-Host Jestyr
 
 > Written 2026-06-29. The goal: rewrite the Jestyr compiler in Jestyr (ROADMAP

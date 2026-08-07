@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Jestyr — the road ahead: self-hosting remainder, systems-language gaps, cgen hardening, and the assembly backend
 
 > A three-horizon handoff, written at P5-increment 21 (cgen.jtr **44/130 corpus files

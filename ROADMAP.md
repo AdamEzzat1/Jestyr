@@ -1,3 +1,5 @@
+> **Internal development log** — the running cross-session handoff, kept for provenance. Numbers and status lines here drift; [README.md](README.md) is the single authoritative status surface.
+
 # Jestyr Roadmap & Parallel Workstreams
 
 > The forward-looking plan: **everything that remains** to make Jestyr a complete

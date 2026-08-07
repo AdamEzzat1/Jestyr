@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Jestyr self-hosting — P3 typeck kickoff (cold-start handoff)
 
 > Continues ROADMAP workstream **P**. **P2 is COMPLETE** (the Jestyr parser matches the Rust

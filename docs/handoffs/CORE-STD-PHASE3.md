@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # `core` / `std` — Phase 3 (no-alloc `core`, staging `std`)
 
 A handoff for the **standard library** workstream: the no-alloc `core` tier first

@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Concurrency (Workstream N) — Handoff (run in a parallel session, commit to master)
 
 > Self-contained cold-start for the **Concurrency** workstream (design §10). Branch off

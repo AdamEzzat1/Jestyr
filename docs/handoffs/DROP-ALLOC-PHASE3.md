@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Drop/RAII + the Explicit Allocator Interface — Phase 3
 
 A handoff for the **deterministic Drop/RAII** and **explicit allocator** workstream

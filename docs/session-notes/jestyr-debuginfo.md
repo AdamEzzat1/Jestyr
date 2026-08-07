@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Jestyr — Debug-info workstream: session summary + handoff
 
 **Status: DONE (all planned increments a+b+c landed on `master`, green, warning-clean).**

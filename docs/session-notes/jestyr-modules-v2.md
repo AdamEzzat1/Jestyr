@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Jestyr modules-v2 (workstream K) — Increment 1: per-module namespaces
 
 *Session summary / design note. Landed on `master`, one green increment.*

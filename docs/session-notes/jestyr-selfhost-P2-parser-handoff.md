@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Jestyr self-hosting — P2 parser progress + what remains (cold-start handoff)
 
 > Continues ROADMAP workstream **P** (self-hosting the compiler in Jestyr). Read with

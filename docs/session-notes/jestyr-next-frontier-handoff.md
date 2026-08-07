@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Jestyr — next-frontier handoff (post-self-hosting): G/L/Q
 
 ## ▶ START HERE — state of `master` (`fddf02a`), and the next move

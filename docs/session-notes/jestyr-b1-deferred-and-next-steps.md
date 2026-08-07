@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Jestyr — B1 Done: Deferred Item & Next Steps
 
 > Written 2026-06-29, after landing **B1 (field/payload auto-drop)** on `master`

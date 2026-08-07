@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Jestyr — research-release handoff (what stands between the repo and its first public release)
 
 > **Provenance.** On 2026-08-07, with the error workstream closed on both sides

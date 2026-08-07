@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Jestyr — Session Summary (2026-06-29)
 
 **Workstream:** K (Module system v2) — taken from ~70% to **~98%**, plus a grounded

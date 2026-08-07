@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Jestyr self-hosting — P5 cgen + R2 fixpoint (cold-start handoff)
 
 > The last two stretches of the port (ROADMAP workstream P). **P1/P2a lexer, P2 parser, P3

@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Jestyr self-host — Tier-2 ergonomic unblockers B4/B5/B3 DONE (session summary)
 
 **Status: the three Tier-2 self-host unblockers from `jestyr-selfhost-blockers-handoff.md`

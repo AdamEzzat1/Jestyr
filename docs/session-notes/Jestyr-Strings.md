@@ -1,3 +1,5 @@
+> **Internal development log** — kept for provenance. Status lines and counts in this file reflect the moment it was written, not the current state. Start at the repo [README](../../README.md) for current status and verified claims.
+
 # Jestyr Strings & Text — Complete Reference
 
 Everything Jestyr can do with strings, as of the completed **"Real strings / text"**
