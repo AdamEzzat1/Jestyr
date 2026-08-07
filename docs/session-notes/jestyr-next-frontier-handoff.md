@@ -14,6 +14,16 @@ toolchains).
 byte-identical) + concat + test-mode; P2/P3/P4 goldens; `selfhost_fixpoint_full`;
 `jestyr_driver_builds_itself`; seed current.
 
+**⚑ A separate track now exists: the FIRST RESEARCH RELEASE.** A five-role
+panel (2026-08-07) judged the repo `not_ready` for going public — unanimously
+for scaffolding reasons, not substance — and estimated ~two focused days to
+ready. **The complete worklist is
+`docs/session-notes/jestyr-research-release-handoff.md`** (unanimous blockers:
+LICENSE, root README, the unproven cross-OS digest, tracked personal data,
+self-contradicting doc headers, no CI; plus each role's unique items and the
+MUST/SHOULD/LATER plan). If the goal of a session is the release, start there,
+not here.
+
 **What remains is post-v1-shaped — design items, not gaps.** In rough value order:
 
 1. **Richer error payloads.** The design note is `docs/error-payloads.md` — payload
