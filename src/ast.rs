@@ -604,6 +604,11 @@ pub struct TraitMethod {
     pub params: Vec<Param>,
     pub ret_conv: Conv,
     pub ret_ty: Option<TypeId>,
+    /// `-> T !{ A, B }` — the method's declared error set (trait-errors T1).
+    /// The TRAIT's set is the contract calls are typed by; an impl declares a
+    /// subset. Payload-ness rides the NAME (error-payloads D1), so this needs
+    /// no payload syntax of its own.
+    pub errors: Option<ErrorSet>,
     pub default_body: Option<Block>,
     pub span: Span,
 }

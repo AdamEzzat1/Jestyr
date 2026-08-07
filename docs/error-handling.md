@@ -215,10 +215,38 @@ A **generic** struct's method gets one result type per instantiation — `Slot(i
 and `Slot(f64).get` emit `JestyrResult_i32` and `JestyrResult_f64` — exactly as two
 monomorphized functions would. `examples/method_errors.jtr` is the worked example.
 
-**Trait-impl methods stay infallible, by rule.** A call through a trait is typed by
-the trait's *signature*, which has no error-set syntax — so a fallible impl would be
-silently mistyped as infallible at every call site. It is a check-time error with that
-reason. Lifting the rule needs error sets in trait declarations, a design item.
+## Error sets in trait signatures — fallible trait methods
+
+A **trait method** can declare an error set, and the trait's set is the contract
+every call through the trait is typed by:
+
+```jestyr
+trait Load { fn get(read self) -> i64 !{ Missing(i64) } }
+
+impl Load for Flaky {
+    fn get(read self) -> i64 !{ Missing(i64) } {
+        if self.n < 0 { return err(Missing(self.n)) }
+        return ok(self.n)
+    }
+}
+
+let v = f.get()?                                        // propagates { Missing }
+let w = f.get() catch |e| match e { Missing(v) => v, _ => 0 }   // extracts the payload
+```
+
+* **Conformance is set inclusion** (the same relation `?` enforces): an impl must
+  declare a subset of the trait's set. Trait bare + impl fallible stays refused
+  (the original rule); trait fallible + impl bare is refused too — the ABI
+  returns the tagged result struct, so the body must construct it.
+* **Payloads need no trait syntax**: a payload is a property of the error NAME
+  (whole-program), so `Missing(i64)` declared in the trait means `Missing`
+  carries an `i64` everywhere, and extraction works on a trait call unchanged.
+* **Static impl calls and bracket-bound generic calls** carry fallibility (both
+  lower to direct calls of the result-returning impl function). Deferred, each
+  refused with its reason: **dyn dispatch** of a fallible method (the vtable
+  machinery has not learned the result-struct ABI — the refusal is at the
+  `dyn` coercion), a **default body** on a fallible trait method, and a
+  fallible method in a **blanket `impl[…]`**.
 
 The port mirror had a finding worth the price: the reference's `method_instances` is
 **one LIFO worklist for plain and generic methods alike**, and the port's old flat
@@ -229,8 +257,12 @@ generic ones (argc-0 records), and the whole corpus stayed byte-identical.
 
 ## Not yet (post-v1)
 
-* Error sets in **trait signatures** (which would unlock fallible impls).
-* Errors in more positions; richer error payloads (today an error is a tag) —
-  **designed, not built**: `docs/error-payloads.md` carries the decisions (payload
-  is a property of the name, one whole-program payload union, `catch |e| match e`
-  as the extractor, sets made sound first) and the E1–E6 increment chain.
+* **Dyn dispatch of fallible trait methods** (refused at the coercion with the
+  reason); default bodies on fallible trait methods; fallible methods in
+  blanket impls. Each is a deliberate deferral, not a gap.
+* **Owning payloads** (`String` etc. — the drop obligation must be designed
+  first), **named sets** (`error FsError = { … }`), match-over-result sugar,
+  and multi-statement `catch`/arm bodies (the value-position block rule).
+* The **port mirror for trait error sets** — due with the first corpus `.jtr`
+  that declares one (the standing trigger; reference side is complete and
+  gated on use, so every golden is green without it).

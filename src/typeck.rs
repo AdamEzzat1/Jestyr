@@ -497,10 +497,10 @@ impl<'a> TypeChecker<'a> {
     /// through the Stage C static-dispatch path.
     fn register_operator_traits(&mut self) {
         for (name, method) in OPERATOR_TRAITS {
-            self.table
-                .traits
-                .entry(name.to_string())
-                .or_insert_with(|| TraitDef { methods: vec![(method.to_string(), true)] });
+            self.table.traits.entry(name.to_string()).or_insert_with(|| TraitDef {
+                methods: vec![(method.to_string(), true)],
+                method_errs: HashMap::new(),
+            });
         }
     }
 
@@ -521,7 +521,27 @@ impl<'a> TypeChecker<'a> {
                     .iter()
                     .map(|m| (m.name.name.clone(), m.default_body.is_none()))
                     .collect();
-                self.table.traits.insert(t.name.name.clone(), TraitDef { methods });
+                // Trait-errors T1: a method's declared set is the CONTRACT calls
+                // are typed by. A default body on a fallible trait method is
+                // refused for now — it would need cur-set plumbing through the
+                // per-impl copy, and no design has asked for it yet.
+                let mut method_errs = HashMap::new();
+                for m in &t.methods {
+                    if let Some(errs) = errs_of(&m.errors) {
+                        if m.default_body.is_some() {
+                            self.error(
+                                m.name.span,
+                                format!(
+                                    "a fallible trait method cannot have a default body — \
+                                     declare the set and implement `{}` in each impl",
+                                    m.name.name
+                                ),
+                            );
+                        }
+                        method_errs.insert(m.name.name.clone(), errs);
+                    }
+                }
+                self.table.traits.insert(t.name.name.clone(), TraitDef { methods, method_errs });
             }
         }
     }
@@ -542,21 +562,76 @@ impl<'a> TypeChecker<'a> {
                 );
                 continue;
             }
-            // A fallible impl method is refused HERE, not merely at emission: a call
-            // through the trait is typed by the trait's signature, which has no
-            // error-set syntax — so accepting the impl would silently type every call
-            // site as infallible while the body returns a tagged result. The check-time
-            // error is the difference between a diagnostic and a mistype.
+            // Fallibility conformance (trait-errors T1). A call through the trait is
+            // typed by the TRAIT's signature, so the trait's declared set is the
+            // contract and an impl must agree with it:
+            //  * trait declares no set, impl does → refused (the original rule —
+            //    the call sites would be silently mistyped as infallible);
+            //  * trait declares a set, impl declares none → refused (the ABI
+            //    returns the tagged result struct, so the body must construct it
+            //    through `ok`/`err` — an infallible body cannot);
+            //  * both declare → the impl's set must be a SUBSET of the trait's
+            //    (E2's inclusion, the same relation `?` enforces).
+            // Payload agreement needs no rule of its own: a payload is a property
+            // of the NAME (D1), checked whole-program by `collect_err_payloads`.
             for f in &im.methods {
-                if let Some(es) = &f.errors {
-                    self.error(
+                let trait_errs = self
+                    .table
+                    .traits
+                    .get(&im.trait_name.name)
+                    .and_then(|t| t.method_errs.get(&f.name.name).cloned());
+                match (&f.errors, &trait_errs) {
+                    (Some(es), None) => self.error(
                         es.span,
                         format!(
                             "a trait-impl method cannot be fallible: calls to `{}` are typed by \
                              trait `{}`'s signature, which declares no error set",
                             f.name.name, im.trait_name.name
                         ),
-                    );
+                    ),
+                    (None, Some(te)) => self.error(
+                        f.name.span,
+                        format!(
+                            "`{}` must declare an error set: trait `{}` declares `!{{ {} }}`, and a \
+                             call through the trait returns its tagged result (declare a subset)",
+                            f.name.name,
+                            im.trait_name.name,
+                            te.join(", ")
+                        ),
+                    ),
+                    (Some(es), Some(te)) => {
+                        // A blanket impl's fallible method is deferred: the
+                        // per-instance emission path has not been taught the
+                        // result-struct ABI yet, and a silent wrong lowering is
+                        // worse than a refusal with the reason.
+                        if !im.generics.is_empty() {
+                            self.error(
+                                es.span,
+                                format!(
+                                    "a fallible method in a blanket `impl[…]` is not yet supported \
+                                     (implement `{}` per concrete type)",
+                                    f.name.name
+                                ),
+                            );
+                        }
+                        let ie = errs_of(&f.errors).unwrap_or_default();
+                        let missing: Vec<&str> =
+                            ie.iter().filter(|e| !te.contains(e)).map(String::as_str).collect();
+                        if !missing.is_empty() {
+                            self.error(
+                                es.span,
+                                format!(
+                                    "impl `{}` declares {{ {} }} beyond trait `{}`'s set {{ {} }} — \
+                                     an impl's errors must be a subset of the trait's",
+                                    f.name.name,
+                                    missing.join(", "),
+                                    im.trait_name.name,
+                                    te.join(", ")
+                                ),
+                            );
+                        }
+                    }
+                    (None, None) => {}
                 }
             }
             let target = self.lower_type(&empty, im.ty);
@@ -629,8 +704,18 @@ impl<'a> TypeChecker<'a> {
                 .find(|im| im.type_key == key && im.method_rets.contains_key(method))?;
             (im.trait_name.clone(), im.method_rets.get(method).cloned().unwrap_or(Ty::Unknown))
         };
-        self.impl_calls.insert(call_id, ImplCall { trait_name, type_key: key, method: method.to_string() });
-        Some(ret)
+        self.impl_calls.insert(call_id, ImplCall { trait_name: trait_name.clone(), type_key: key, method: method.to_string() });
+        Some(self.wrap_trait_ret(&trait_name, method, ret))
+    }
+
+    /// Trait-errors T1: a call through a trait whose method declares an error set
+    /// yields `T !{ set }` — the TRAIT's set, whichever impl answers, because the
+    /// trait's signature is the contract every call site is typed by.
+    fn wrap_trait_ret(&self, trait_name: &str, method: &str, ret: Ty) -> Ty {
+        match self.table.traits.get(trait_name).and_then(|t| t.method_errs.get(method)) {
+            Some(errs) => Ty::Result(Box::new(ret), errs.clone()),
+            None => ret,
+        }
     }
 
     /// The "Zig fix" (design §8.2): inside a bracket-generic body `f[T: Tr]`, a
@@ -663,7 +748,8 @@ impl<'a> TypeChecker<'a> {
             call_id,
             BoundMethodCall { trait_name: tr.clone(), method: mname.to_string(), type_param: tp.clone() },
         );
-        Some(self.trait_method_ret(&tr, mname, recv_ty))
+        let ret = self.trait_method_ret(&tr, mname, recv_ty);
+        Some(self.wrap_trait_ret(&tr, mname, ret))
     }
 
     /// `recv.m(args)` where `recv: dyn Trait` (traits, Stage F): a **dynamic**
@@ -678,7 +764,8 @@ impl<'a> TypeChecker<'a> {
             return Some(Ty::Error);
         }
         self.dyn_calls.insert(call_id, mname.to_string());
-        Some(self.trait_method_ret(&tr, mname, recv_ty))
+        let ret = self.trait_method_ret(&tr, mname, recv_ty);
+        Some(self.wrap_trait_ret(&tr, mname, ret))
     }
 
     /// If `expected` is a `dyn Trait` and `expr` has a *concrete* type that `impl`s
@@ -692,6 +779,24 @@ impl<'a> TypeChecker<'a> {
         // Already a `dyn` value (pass-through), or unresolved — nothing to wrap.
         if dyn_trait_of(&actual).is_some() || matches!(actual, Ty::Unknown | Ty::Error) {
             return;
+        }
+        // Trait-errors T1: dyn dispatch of a fallible method is NOT yet supported —
+        // the vtable machinery has not been taught the result-struct ABI — so a
+        // trait with any fallible method cannot be erased to `dyn`. Static impl
+        // calls and bracket-bound generic calls carry fallibility fine (both lower
+        // to direct calls of the result-returning impl fn).
+        if let Some(t) = self.table.traits.get(tr) {
+            if let Some(m) = t.method_errs.keys().next() {
+                let span = self.ast.expr_at(expr).span;
+                self.error(
+                    span,
+                    format!(
+                        "cannot coerce to `dyn {tr}`: its method `{m}` is fallible, and \
+                         fallible dynamic dispatch is not yet supported (call it statically)"
+                    ),
+                );
+                return;
+            }
         }
         let key = self.table.ty_key(&actual);
         if self.table.impl_index.contains_key(&(tr.to_string(), key)) {
@@ -1481,6 +1586,14 @@ impl<'a> TypeChecker<'a> {
                 Item::Impl(im) => {
                     for f in &im.methods {
                         sets.extend(f.errors.iter());
+                    }
+                }
+                // A TRAIT method's declared set is a declaration site too
+                // (trait-errors T1) — `trait Load { fn get(…) -> T !{ Missing(i64) } }`
+                // is where the payload is most naturally stated once.
+                Item::Trait(t) => {
+                    for m in &t.methods {
+                        sets.extend(m.errors.iter());
                     }
                 }
                 _ => {}
@@ -4397,6 +4510,111 @@ mod tests {
         let (ast, pd) = Parser::new(src, tokens).parse();
         assert!(pd.is_empty(), "parse: {:?}", pd);
         check(&ast)
+    }
+
+    // --- trait error sets (T1; the fallible-impl unlock) ---
+
+    /// The conformance rules, each with its own message: trait-bare + impl-set
+    /// (the original refusal, kept verbatim), trait-set + impl-bare, and an impl
+    /// set exceeding the trait's. Same-set and subset impls are clean.
+    #[test]
+    fn impl_fallibility_must_conform_to_the_trait() {
+        let base = "struct A { n: i32 } ";
+        // Trait declares none, impl does — the original rule.
+        let (_, d) = analyze(&format!(
+            "{base}trait T {{ fn get(read self) -> i32 }} \
+             impl T for A {{ fn get(read self) -> i32 !{{ Io }} {{ return err(Io) }} }}"
+        ));
+        assert!(
+            d.iter().any(|x| x.message.contains("cannot be fallible")
+                && x.message.contains("declares no error set")),
+            "{d:?}"
+        );
+        // Trait declares a set, impl declares none.
+        let (_, d) = analyze(&format!(
+            "{base}trait T {{ fn get(read self) -> i32 !{{ Io }} }} \
+             impl T for A {{ fn get(read self) -> i32 {{ return 1 }} }}"
+        ));
+        assert!(
+            d.iter().any(|x| x.message.contains("must declare an error set")
+                && x.message.contains("!{ Io }")),
+            "{d:?}"
+        );
+        // The impl's set exceeds the trait's.
+        let (_, d) = analyze(&format!(
+            "{base}trait T {{ fn get(read self) -> i32 !{{ Io }} }} \
+             impl T for A {{ fn get(read self) -> i32 !{{ Io, Parse }} {{ return err(Io) }} }}"
+        ));
+        assert!(
+            d.iter().any(|x| x.message.contains("beyond trait `T`'s set")
+                && x.message.contains("{ Parse }")),
+            "{d:?}"
+        );
+        // A subset (and the same set) conform.
+        let (_, d) = analyze(&format!(
+            "{base}trait T {{ fn get(read self) -> i32 !{{ Io, Parse }} }} \
+             impl T for A {{ fn get(read self) -> i32 !{{ Io }} {{ return err(Io) }} }}"
+        ));
+        assert!(d.is_empty(), "a subset impl conforms: {d:?}");
+    }
+
+    /// A call through the trait is typed by the TRAIT's set — so `?` inclusion
+    /// (E2) applies: a caller declaring the set propagates, a narrower one is
+    /// refused naming what the call can raise.
+    #[test]
+    fn a_trait_call_is_typed_by_the_traits_set() {
+        let src = "struct A { n: i32 } \
+                   trait Load { fn get(read self) -> i32 !{ Missing } } \
+                   impl Load for A { fn get(read self) -> i32 !{ Missing } { \
+                     if self.n < 0 { return err(Missing) } return ok(self.n) } } \
+                   fn wide(read a: A) -> i32 !{ Missing } { let v = a.get()? return ok(v) } \
+                   fn narrow(read a: A) -> i32 !{ Io } { let v = a.get()? return ok(v) }";
+        let (_, d) = analyze(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            d[0].message.contains("propagates { Missing }"),
+            "the narrow caller is refused with the set named: {:?}",
+            d[0].message
+        );
+    }
+
+    /// The two deferred forms are refused with their reasons: a default body on
+    /// a fallible trait method, and a fallible method in a blanket impl.
+    #[test]
+    fn fallible_default_bodies_and_blanket_impls_are_deferred() {
+        let (_, d) = analyze(
+            "trait T { fn get(read self) -> i32 !{ Io } { return ok(1) } }",
+        );
+        assert!(
+            d.iter().any(|x| x.message.contains("cannot have a default body")),
+            "{d:?}"
+        );
+        let (_, d) = analyze(
+            "fn Box(comptime T: type) -> type { return struct { v: T } } \
+             trait T2 { fn get(read self) -> i32 !{ Io } } \
+             impl[U] T2 for Box(U) { fn get(read self) -> i32 !{ Io } { return err(Io) } }",
+        );
+        assert!(
+            d.iter().any(|x| x.message.contains("blanket `impl[…]` is not yet supported")),
+            "{d:?}"
+        );
+    }
+
+    /// Dyn dispatch of a fallible method is refused at the COERCION — the vtable
+    /// machinery has not learned the result-struct ABI, and a refusal with the
+    /// reason beats a wrong lowering.
+    #[test]
+    fn dyn_coercion_of_a_fallible_trait_is_refused() {
+        let (_, d) = analyze(
+            "struct A { n: i32 } \
+             trait T { fn get(read self) -> i32 !{ Io } } \
+             impl T for A { fn get(read self) -> i32 !{ Io } { return ok(self.n) } } \
+             fn f(read a: A) -> i32 { let dt: dyn T = a return 0 }",
+        );
+        assert!(
+            d.iter().any(|x| x.message.contains("fallible dynamic dispatch is not yet supported")),
+            "{d:?}"
+        );
     }
 
     // --- error payloads (E3; docs/error-payloads.md §3–§4) ---

@@ -10277,6 +10277,49 @@ fn main() -> i32 {
         );
     }
 
+    /// **Fallible trait dispatch end to end (T1), composed with payloads.**
+    ///
+    /// The whole stack in one running program: a trait method declaring a
+    /// payload-carrying set, two impls (one that fails with the payload, one
+    /// that succeeds), static dispatch through the trait, `?` propagation out
+    /// of a fallible caller, and `catch |e| match e` extracting the payload a
+    /// TRAIT call raised. This is what the E-chain + T1 exist to compose.
+    #[test]
+    fn fallible_trait_dispatch_composes_with_payload_extraction() {
+        let src = "\
+struct Flaky { n: i64 }
+struct Solid { n: i64 }
+trait Load { fn get(read self) -> i64 !{ Missing(i64) } }
+impl Load for Flaky {
+    fn get(read self) -> i64 !{ Missing(i64) } {
+        if self.n < 0 { return err(Missing(self.n)) }
+        return ok(self.n)
+    }
+}
+impl Load for Solid {
+    fn get(read self) -> i64 !{ Missing(i64) } { return ok(self.n * 10) }
+}
+fn relay(read f: Flaky) -> i64 !{ Missing(i64) } {
+    let v = f.get()?
+    return ok(v + 1)
+}
+fn main() -> i32 {
+    let good: Flaky = Flaky { n: 5 }
+    let bad: Flaky = Flaky { n: 0 - 42 }
+    let s: Solid = Solid { n: 3 }
+    print_int(relay(good) catch 0 - 1)                                  // 6: ok through the hop
+    print_int(relay(bad) catch |e| match e { Missing(v) => v, _ => 0 }) // -42: the payload a TRAIT call raised
+    print_int(s.get() catch 0 - 1)                                      // 30: the other impl
+    return 0
+}
+";
+        assert_eq!(
+            run_inline("trait-errors", src),
+            ["6", "-42", "30"],
+            "a trait call's error must propagate and extract like any other"
+        );
+    }
+
     /// **The payload extractor end to end (E4): values come OUT.**
     ///
     /// E3 proved payloads ride along inertly; this is the first program that can

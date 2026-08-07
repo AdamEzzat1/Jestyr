@@ -58,10 +58,21 @@ byte-identical) + concat + test-mode; P2/P3/P4 goldens; `selfhost_fixpoint_full`
    bodies are single expressions (the standing catch-fallback rule — lift for
    arms + fallbacks together); owning payloads (E6+, drop design first); named
    sets; match-over-result sugar.
-2. **Error sets in TRAIT signatures** — unlocks fallible trait-impl methods, which are
-   currently refused at check time with the reason (calls are typed by the trait's
-   signature, which cannot declare an error set). The refusal sites to lift are marked:
-   `typeck.rs` (the impl-registration loop) and `emit_impl_method_decl`'s backstop.
+2. **Error sets in TRAIT signatures** — ✅ **DONE on the reference side (T1), gated
+   on use.** A trait method declares `!{ … }` with the same syntax a fn uses
+   (payloads ride the NAME per D1 — no new trait syntax); the trait's set is the
+   contract every call is typed by; impl conformance is set inclusion (trait-bare +
+   impl-set keeps the original refusal verbatim; trait-set + impl-bare refused —
+   the ABI returns the result struct; superset refused naming the excess). Static
+   impl calls AND bracket-bound generic calls carry fallibility (both are direct
+   calls of the result-returning impl fn); `?`/`catch`/`match e` compose through a
+   trait call unchanged, payload extraction included (run-verified: 6, -42, 30).
+   Deferred with refusals-with-reasons: **dyn dispatch** (refused at the coercion —
+   the vtable machinery hasn't learned the result-struct ABI), default bodies on
+   fallible trait methods, fallible methods in blanket impls. Zero corpus movement
+   (gated); **the port mirror + a corpus file are the standing-trigger follow-up**,
+   and the P2 ref_dump's trait-method records will need the same both-sides growth
+   the errname records got in E5.
 3. **The `#line` port + module-loader unification.** The module-path golden
    (`jestyr_module_cgen_matches_reference_except_line_directives`) pins THREE
    divergences, all from the two loaders producing different merged buffers: `#line`

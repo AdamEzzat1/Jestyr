@@ -253,6 +253,10 @@ pub struct FnSig {
 pub struct TraitDef {
     /// (method name, is-required).
     pub methods: Vec<(String, bool)>,
+    /// Method name → its declared error set (sorted, deduped), for the methods
+    /// that have one (trait-errors T1). The TRAIT's set is what a call through
+    /// the trait is typed by; impl conformance is set inclusion (⊆).
+    pub method_errs: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl TraitDef {

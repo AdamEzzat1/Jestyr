@@ -190,9 +190,7 @@ fn emit_program(
         // Fallible STRUCT METHODS declare error sets too, and their tags live in the
         // same whole-program map — an error name means one integer everywhere,
         // whoever declares it. Scanned in declaration order after the item's own set,
-        // so adding a method never renumbers a free function's tags. (Trait-impl
-        // methods are deliberately absent: a fallible impl is refused — calls are
-        // typed by the trait's signature, which has no error-set syntax.)
+        // so adding a method never renumbers a free function's tags.
         if let Item::Struct { body, .. } = item {
             for m in &body.members {
                 if let StructMember::Method(f) = m {
@@ -201,6 +199,29 @@ fn emit_program(
                             let next = error_tags.len() as i64 + 1;
                             error_tags.entry(name.name.name.clone()).or_insert(next);
                         }
+                    }
+                }
+            }
+        }
+        // TRAIT declarations and their impls carry sets too (trait-errors T1) —
+        // same whole-program map, scanned in item order, so no existing
+        // program's tags move (nothing in the corpus declares either).
+        if let Item::Trait(t) = item {
+            for m in &t.methods {
+                if let Some(es) = &m.errors {
+                    for name in &es.names {
+                        let next = error_tags.len() as i64 + 1;
+                        error_tags.entry(name.name.name.clone()).or_insert(next);
+                    }
+                }
+            }
+        }
+        if let Item::Impl(im) = item {
+            for f in &im.methods {
+                if let Some(es) = &f.errors {
+                    for name in &es.names {
+                        let next = error_tags.len() as i64 + 1;
+                        error_tags.entry(name.name.name.clone()).or_insert(next);
                     }
                 }
             }
@@ -1909,6 +1930,22 @@ impl<'a> Cgen<'a> {
                 }
                 self.raw(format!("int err; {}}} {cname};\n", self.pay_field()));
                 self.def_end();
+            }
+        }
+        // Fallible TRAIT-IMPL methods (trait-errors T1) need their result
+        // typedefs too — plain impls only (a blanket impl's fallible method is
+        // refused at check time until the per-instance path learns the ABI).
+        for item in &ast.items {
+            if let Item::Impl(im) = item {
+                if !im.generics.is_empty() {
+                    continue;
+                }
+                for f in &im.methods {
+                    if f.errors.is_some() {
+                        let ok = self.impl_ok_ty(im, f);
+                        self.emit_result_def(&ok, &mut seen);
+                    }
+                }
             }
         }
         // Fallible METHODS need their result typedefs too. Walked per *instance*
@@ -6572,23 +6609,23 @@ impl<'a> Cgen<'a> {
     /// essentially a free function whose first parameter is the receiver (`j_self`,
     /// taken by pointer for a `mut`/`out self`), reusing the struct-method
     /// machinery for `self`.
-    fn emit_impl_method_decl(&mut self, im: &ImplDecl, f: &FnDecl, body: bool) {
-        // A fallible impl method stays refused — and the real refusal now lives in
-        // TYPECK, where it can explain itself. The reason is semantic, not an emission
-        // gap: a call through the trait is typed by the TRAIT's signature, which
-        // cannot declare an error set (there is no syntax for it), so a fallible impl
-        // would be silently mistyped as infallible at every call site. This emission
-        // guard is the backstop, kept so a future typeck regression degrades to a
-        // diagnostic rather than to C that reads a result struct as its ok type.
-        if f.errors.is_some() {
-            if body {
-                self.diag(
-                    f.name.span,
-                    "a trait-impl method cannot be fallible: calls are typed by the trait's signature, which has no error set",
-                );
-            }
-            return;
+    /// The ok type of a fallible impl method (trait-errors T1), with `Self`
+    /// resolved to the impl's target — what the result mangle, the typedef, and
+    /// the signature are all keyed on, from ONE place so they cannot disagree.
+    fn impl_ok_ty(&mut self, im: &ImplDecl, f: &FnDecl) -> Ty {
+        let empty = HashMap::new();
+        match f.ret_ty {
+            Some(t) => match &self.ast.type_at(t).kind {
+                crate::ast::TypeKind::Name(n) if n.name == "Self" => {
+                    self.ast_type_to_ty(im.ty, &empty)
+                }
+                _ => self.ast_type_to_ty(t, &empty),
+            },
+            None => Ty::Unit,
         }
+    }
+
+    fn emit_impl_method_decl(&mut self, im: &ImplDecl, f: &FnDecl, body: bool) {
         let empty = HashMap::new();
         let target = self.ast_type_to_ty(im.ty, &empty);
         let type_key = self.info.table.ty_key(&target);
@@ -6608,11 +6645,24 @@ impl<'a> Cgen<'a> {
         self.cur_no_panic = f.no_panic;
 
         let prefix = self.fn_attr_prefix(f);
-        let ret = match f.ret_ty {
-            Some(t) => self.c_ty_ast(t),
-            None => "void".to_string(),
+        // Trait-errors T1: a fallible impl method returns its tagged result
+        // struct, exactly as a fallible struct method does — `cur_result` set
+        // during the body is all `ok`/`err`/`?` ever consult. The ok type for
+        // the mangle resolves `Self` to the impl's target.
+        let ret = if f.errors.is_some() {
+            let ok = self.impl_ok_ty(im, f);
+            self.result_c_name(&ok)
+        } else {
+            match f.ret_ty {
+                Some(t) => self.c_ty_ast(t),
+                None => "void".to_string(),
+            }
         };
-        self.cur_result.clear();
+        if f.errors.is_some() {
+            self.cur_result = ret.clone();
+        } else {
+            self.cur_result.clear();
+        }
         let cname = impl_method_c_name(&im.trait_name.name, &type_key, &f.name.name);
         let params = self.method_params_str(f);
         if body {
@@ -9799,6 +9849,29 @@ mod tests {
             "the last arm is unconditional and binds its member:\n{c}"
         );
         assert!(c.contains("const int j_e = _ct0.err; (void)j_e;"), "the binder stays:\n{c}");
+    }
+
+    /// Trait-errors T1: a fallible impl method returns its tagged result struct
+    /// (the trait's signature is the ABI), the typedef exists, and a static call
+    /// through the trait composes with `catch`.
+    #[test]
+    fn a_fallible_impl_method_returns_its_result_struct() {
+        let src = "struct A { n: i32 } \
+                   trait Load { fn get(read self) -> i32 !{ Missing } } \
+                   impl Load for A { fn get(read self) -> i32 !{ Missing } { \
+                     if self.n < 0 { return err(Missing) } return ok(self.n) } } \
+                   fn main() -> i32 { \
+                     let a: A = A { n: 7 } \
+                     let v: i32 = a.get() catch 0 - 1 \
+                     print_int(v as i64) return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(c.contains("typedef struct { bool is_err; int32_t ok; int err; } JestyrResult_i32;"), "{c}");
+        assert!(
+            c.contains("JestyrResult_i32 jestyr_impl_Load__A__get("),
+            "the impl method returns the result struct: {c}"
+        );
+        assert!(c.contains("(JestyrResult_i32){ .is_err = true"), "err construction in the impl body: {c}");
     }
 
     /// Like [`gen`], but through [`emit_error_traces`] (`--error-traces`).

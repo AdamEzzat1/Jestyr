@@ -445,6 +445,10 @@ impl<'src> Parser<'src> {
             ret_conv = self.parse_conv();
             ret_ty = Some(self.parse_type());
         }
+        // `!{ … }` — the trait method's declared error set (trait-errors T1),
+        // the same syntax a function uses; payload names (`Parse(i64)`) parse
+        // for free through the shared `parse_error_set`.
+        let errors = if self.at(Bang) { Some(self.parse_error_set()) } else { None };
         // A `{ … }` body is a default implementation; otherwise the signature is
         // required, with an optional `;` terminator.
         let default_body = if self.at(LBrace) {
@@ -453,7 +457,7 @@ impl<'src> Parser<'src> {
             self.eat(Semi);
             None
         };
-        TraitMethod { name, params, ret_conv, ret_ty, default_body, span: start.to(self.prev_span()) }
+        TraitMethod { name, params, ret_conv, ret_ty, errors, default_body, span: start.to(self.prev_span()) }
     }
 
     /// `impl Trait for Type { fn m(self) -> T { … } }`.
