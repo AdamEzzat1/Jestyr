@@ -134,6 +134,7 @@ Windows.
 | [jestyr-design.md](jestyr-design.md) | the language design doc (draft; not everything in it is built) |
 | [DESIGN-STATUS.md](DESIGN-STATUS.md) | the one-screen implemented-vs-designed matrix |
 | [ROADMAP.md](ROADMAP.md) | per-workstream status |
+| [docs/technical-report.md](docs/technical-report.md) | the release's companion report: the contributions, ranked, with their scopes |
 | [docs/escape-guarantee.md](docs/escape-guarantee.md) | the escape checker's guarantee, stated precisely |
 | [docs/TESTING.md](docs/TESTING.md) | the verification ladder with runtimes |
 | [docs/](docs/README.md) | topic docs: attributes, errors, unsafe contract, CTFE tiers, obligations, … |
