@@ -1,0 +1,51 @@
+// ledger.jtr — accounts behind a trait, with FALLIBLE methods in the trait itself.
+//
+// What it shows: traits with error sets in their signatures (`!{ Insufficient(i64) }`
+// is part of the CONTRACT, and the payload carries how much was actually available),
+// generic functions with trait bounds (`[T: Account]`, monomorphized — no vtable,
+// no allocation), and `catch |e| match` recovering the payload at the call site.
+//
+// Run:  jestyrc run examples/ledger.jtr
+
+trait Account {
+    fn withdraw(read self, amt: i64) -> i64 !{ Insufficient(i64) }
+}
+
+struct Checking { balance: i64 }
+
+// A savings account keeps a locked reserve: only `balance - reserve` is spendable.
+struct Savings { balance: i64, reserve: i64 }
+
+impl Account for Checking {
+    fn withdraw(read self, amt: i64) -> i64 !{ Insufficient(i64) } {
+        if amt > self.balance { return err(Insufficient(self.balance)) }
+        return ok(self.balance - amt)
+    }
+}
+
+impl Account for Savings {
+    fn withdraw(read self, amt: i64) -> i64 !{ Insufficient(i64) } {
+        let avail: i64 = self.balance - self.reserve
+        if amt > avail { return err(Insufficient(avail)) }
+        return ok(self.balance - amt)
+    }
+}
+
+// Generic over ANY account: the bound gives us `withdraw`, the error set rides
+// along, and a failed withdrawal reports the shortfall (negative = what was there).
+fn spend[T: Account](read acct: T, amt: i64) -> i64 {
+    return acct.withdraw(amt) catch |e| match e {
+        Insufficient(avail) => 0 - avail,
+    }
+}
+
+fn main() -> i32 {
+    let c: Checking = Checking { balance: 100 }
+    let s: Savings = Savings { balance: 100, reserve: 80 }
+
+    print_int(spend(c, 30))    // 70: plenty in checking
+    print_int(spend(s, 30))    // -20: savings refused — only 20 was spendable
+    print_int(spend(s, 15))    // 85: within the spendable slice
+    print_int(spend(c, 500))   // -100: checking refused, payload says what was there
+    return 0
+}

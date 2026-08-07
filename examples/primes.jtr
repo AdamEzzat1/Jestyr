@@ -1,0 +1,60 @@
+// primes.jtr — a Sieve of Eratosthenes with machine-checked cost claims.
+//
+// What it shows: `@no_alloc` (the compiler PROVES nothing in the sieve allocates,
+// transitively), design-by-contract `requires`/`ensures` lowered to checked asserts,
+// fixed arrays on the stack, and slices as views.
+//
+// Run:  jestyrc run examples/primes.jtr
+
+// The sieve itself is proven allocation-free: every byte lives on the stack.
+@no_alloc fn count_primes_below(n: i32) -> i32
+    requires n <= 100
+    ensures result >= 0
+{
+    var composite: [100]i32 = [0; 100]
+    var count: i32 = 0
+    var i: i32 = 2
+    for i < n {
+        if composite[i as usize] == 0 {
+            count = count + 1
+            var m: i32 = i * i
+            for m < n {
+                composite[m as usize] = 1
+                m = m + i
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+@no_alloc fn nth_prime(k: i32) -> i32
+    requires k >= 1
+    requires k <= 25
+{
+    var composite: [100]i32 = [0; 100]
+    var seen: i32 = 0
+    var i: i32 = 2
+    for i < 100 {
+        if composite[i as usize] == 0 {
+            seen = seen + 1
+            if seen == k { return i }
+            var m: i32 = i * i
+            for m < 100 {
+                composite[m as usize] = 1
+                m = m + i
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    print_int(count_primes_below(100))   // 25 primes under 100
+    print_int(count_primes_below(30))    // 10
+    print_int(nth_prime(1))              // 2
+    print_int(nth_prime(10))             // 29
+    print_int(nth_prime(25))             // 97
+    return 0
+}

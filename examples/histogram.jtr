@@ -1,0 +1,40 @@
+// histogram.jtr — a word-length histogram with ASCII bars.
+//
+// What it shows: zero-copy string processing (`split` hands back sub-VIEWS of the
+// original `str` — no allocation per word), fixed arrays for counting, and the
+// owned/borrowed string split for building the display (`String` owns, `str` views).
+//
+// Run:  jestyrc run examples/histogram.jtr
+
+fn bar(read label: str, count: i32) {
+    var line: String = string_from(label)
+    string_push(line, " | ")
+    var i: i32 = 0
+    for i < count {
+        string_push(line, "#")
+        i = i + 1
+    }
+    print_str(string_view(line))
+    string_free(line)
+}
+
+fn main() -> i32 {
+    let text: str = "the quick brown fox jumps over the lazy dog and naps in warm golden afternoon sun"
+
+    var counts: [12]i32 = [0; 12]
+    var words: i32 = 0
+    for w in split(text, " ") {          // each `w` is a zero-copy view into `text`
+        let n: usize = w.len
+        if n < 12 { counts[n] = counts[n] + 1 }
+        words = words + 1
+    }
+
+    print_int(words)                     // 16 words
+    bar("2", counts[2])
+    bar("3", counts[3])
+    bar("4", counts[4])
+    bar("5", counts[5])
+    bar("6", counts[6])
+    bar("9", counts[9])
+    return 0
+}

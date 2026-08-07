@@ -27,6 +27,21 @@ error, so use `check` (marked ⛔ below).
 | `vec.jtr` | a growable vector, end to end |
 | `tests_demo.jtr` | the built-in `@test` harness (`cargo run -- test …`) |
 
+## Sample programs (whole programs, not feature demos)
+
+Seven small complete programs, each built around one pillar of the language —
+read them in this order for a guided tour:
+
+| file | program | the pillar it shows |
+|---|---|---|
+| `life.jtr` | Conway's Game of Life (a glider, 5 generations) | arrays as stack *values*, invisible `read` borrows, zero heap in the simulation |
+| `calc.jtr` | an expression evaluator | recursive ADTs, payload-carrying errors (`DivByZero(i64)` carries the numerator out), the enforced `unsafe` boundary |
+| `primes.jtr` | a Sieve of Eratosthenes | `@no_alloc` proven allocation-freedom + `requires`/`ensures` contracts |
+| `pi.jtr` | Monte Carlo π on four threads | structured concurrency, atomics, and a *deterministic* parallel answer |
+| `histogram.jtr` | a word-length histogram | zero-copy `split` views, the owned/borrowed string split |
+| `ledger.jtr` | two account types behind one trait | error sets in *trait* signatures, generic bounds (`[T: Account]`), payload recovery |
+| `arena_points.jtr` | route lengths over arena points | `region` arenas: zero-cost refs, O(1) bulk free, escape = compile error |
+
 ## Ownership, moves, borrows (the language thesis)
 
 | file | shows |

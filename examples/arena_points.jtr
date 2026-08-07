@@ -1,0 +1,44 @@
+// arena_points.jtr — geometry scratch work in a region arena.
+//
+// What it shows: `region r { … }` owns a bump arena; `region_alloc` returns a
+// `&[r]T` — a PLAIN pointer with zero per-deref cost, safe because the compiler
+// confines it to the region's scope (try returning one: compile error, see
+// examples/region_escape.jtr). The whole arena frees in O(1) at the closing brace —
+// no per-node frees, no leaks possible.
+//
+// Run:  jestyrc run examples/arena_points.jtr
+
+struct Point { x: i64, y: i64 }
+
+fn manhattan(read a: Point, read b: Point) -> i64 {
+    var dx: i64 = a.x - b.x
+    if dx < 0 { dx = 0 - dx }
+    var dy: i64 = a.y - b.y
+    if dy < 0 { dy = 0 - dy }
+    return dx + dy
+}
+
+fn main() -> i32 {
+    region r {
+        // Four waypoints, allocated into the arena — no individual ownership.
+        var a: &[r]Point = region_alloc(r, Point, Point { x: 0, y: 0 })
+        var b: &[r]Point = region_alloc(r, Point, Point { x: 3, y: 4 })
+        var c: &[r]Point = region_alloc(r, Point, Point { x: 10, y: 1 })
+        var d: &[r]Point = region_alloc(r, Point, Point { x: 7, y: 9 })
+
+        // A patrol route: a → b → c → d. Derefs are raw pointer reads.
+        var route: i64 = 0
+        route = route + manhattan(a.*, b.*)     // 7
+        route = route + manhattan(b.*, c.*)     // 10
+        route = route + manhattan(c.*, d.*)     // 11
+        print_int(route)                        // 28
+
+        // The most remote waypoint from the origin.
+        var far: i64 = 0
+        if manhattan(a.*, b.*) > far { far = manhattan(a.*, b.*) }
+        if manhattan(a.*, c.*) > far { far = manhattan(a.*, c.*) }
+        if manhattan(a.*, d.*) > far { far = manhattan(a.*, d.*) }
+        print_int(far)                          // 16 (d)
+    }                                            // the whole arena is gone, in O(1)
+    return 0
+}

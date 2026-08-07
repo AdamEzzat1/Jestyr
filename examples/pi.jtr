@@ -1,0 +1,51 @@
+// pi.jtr — Monte Carlo π on four threads, with a DETERMINISTIC answer.
+//
+// What it shows: structured concurrency (`concurrent { spawn … }` joins every task
+// at the closing brace), race-free accumulation via atomics, and the determinism
+// story: each worker owns a fixed-seed Lehmer generator and the hit-count is
+// accumulated with `atomic_add`, so the result is byte-identical on every run and
+// every machine — scheduling order cannot touch it.
+//
+// Run:  jestyrc run examples/pi.jtr
+
+const SAMPLES_PER_WORKER: i64 = comptime { 2000 }   // the compiler folds this
+const R: i64 = 1000                                  // quarter-circle radius
+
+// Lehmer / Park–Miller: state * 48271 mod (2^31 - 1). Max intermediate is
+// ~2^47, so plain i64 arithmetic never overflows.
+fn lehmer(state: i64) -> i64 {
+    return (state * 48271) % 2147483647
+}
+
+fn worker(hits: *mut i64, seed: i64) {
+    var s: i64 = seed
+    var mine: i64 = 0
+    var i: i64 = 0
+    for i < SAMPLES_PER_WORKER {
+        s = lehmer(s)
+        let x: i64 = s % R
+        s = lehmer(s)
+        let y: i64 = s % R
+        if x * x + y * y < R * R { mine = mine + 1 }
+        i = i + 1
+    }
+    atomic_add(hits, mine)
+}
+
+fn main() -> i32 {
+    var hits: *mut i64 = alloc(i64, 1)
+    atomic_store(hits, 0)
+    concurrent {
+        spawn worker(hits, 1)
+        spawn worker(hits, 20260807)
+        spawn worker(hits, 48271)
+        spawn worker(hits, 777)
+    }
+    let h: i64 = atomic_load(hits)
+    let total: i64 = SAMPLES_PER_WORKER * 4
+    // π ≈ 4 · hits / total; print it ×1000 to stay in integers.
+    print_int(h)                          // deterministic hit count
+    print_int((4000 * h) / total)         // ≈ 3141
+    free_ptr(hits)
+    return 0
+}

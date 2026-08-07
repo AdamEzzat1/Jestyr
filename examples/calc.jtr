@@ -1,0 +1,80 @@
+// calc.jtr — a tiny expression evaluator: (7 - 3) * (10 / 2) and a division by zero.
+//
+// What it shows: recursive ADTs (`indirect` boxes the children), exhaustive `match`,
+// payload-carrying error sets (`DivByZero(i64)` remembers the numerator), `?`
+// propagation, `catch |e| match` extraction, and the enforced `unsafe` boundary
+// around the raw child pointers.
+//
+// Run:  jestyrc run examples/calc.jtr
+
+enum Expr {
+    num(v: i64),
+    add(l: indirect Expr, r: indirect Expr),
+    sub(l: indirect Expr, r: indirect Expr),
+    mul(l: indirect Expr, r: indirect Expr),
+    div(l: indirect Expr, r: indirect Expr),
+}
+
+fn eval(read e: Expr) -> i64 !{ DivByZero(i64) } {
+    match e {
+        num(v)    => { return ok(v) },
+        add(l, r) => {
+            let a: i64 = eval(unsafe { l.* })?
+            let b: i64 = eval(unsafe { r.* })?
+            return ok(a + b)
+        },
+        sub(l, r) => {
+            let a: i64 = eval(unsafe { l.* })?
+            let b: i64 = eval(unsafe { r.* })?
+            return ok(a - b)
+        },
+        mul(l, r) => {
+            let a: i64 = eval(unsafe { l.* })?
+            let b: i64 = eval(unsafe { r.* })?
+            return ok(a * b)
+        },
+        div(l, r) => {
+            let a: i64 = eval(unsafe { l.* })?
+            let b: i64 = eval(unsafe { r.* })?
+            if b == 0 { return err(DivByZero(a)) }
+            return ok(a / b)
+        },
+    }
+}
+
+fn boxed(e: Expr) -> *mut Expr {
+    var p: *mut Expr = alloc(Expr, 1)
+    unsafe { p.* = e }
+    return p
+}
+
+fn main() -> i32 {
+    // (7 - 3) * (10 / 2)
+    var seven: *mut Expr = boxed(num(7))
+    var three: *mut Expr = boxed(num(3))
+    var ten: *mut Expr = boxed(num(10))
+    var two: *mut Expr = boxed(num(2))
+    var lhs: *mut Expr = boxed(sub(seven, three))
+    var rhs: *mut Expr = boxed(div(ten, two))
+    var root: Expr = mul(lhs, rhs)
+
+    let v: i64 = eval(root) catch |e| match e { DivByZero(n) => 0 - n }
+    print_int(v)                       // 20
+
+    // 42 / 0 — the error carries the numerator out.
+    var f2: *mut Expr = boxed(num(42))
+    var z: *mut Expr = boxed(num(0))
+    var bad: Expr = div(f2, z)
+    let w: i64 = eval(bad) catch |e| match e { DivByZero(n) => 0 - n }
+    print_int(w)                       // -42: the payload, recovered
+
+    free_ptr(seven)
+    free_ptr(three)
+    free_ptr(ten)
+    free_ptr(two)
+    free_ptr(lhs)
+    free_ptr(rhs)
+    free_ptr(f2)
+    free_ptr(z)
+    return 0
+}
