@@ -5,12 +5,14 @@ satisfy, what the compiler assumes, when `unsafe` is required, and what safe cod
 rely on afterwards. The companion tool is `jestyrc unsafe <file>`, which reports every
 raw-pointer operation and whether an `unsafe` block covers it.
 
-## The honest starting point
+## Enforcement status: COMPLETE
 
-**Today, `unsafe` gates nothing.** A raw deref compiles identically inside and outside
-an `unsafe` block; the keyword is documentation the compiler never checks. This page
-does not pretend otherwise — the enforcement plan is at the bottom, sized by a
-measurement rather than an intention.
+**`unsafe` is fully enforced.** An uncovered raw-pointer operation is a **compile
+error on both toolchains** (the Rust reference and the self-hosted port). The
+enforcement ladder at the bottom of this page — report → contract → migration →
+warn → error — is complete; each step records its commit. (This section originally
+opened "today, `unsafe` gates nothing": that was the honest starting point when the
+contract was written, and the ladder below is the record of closing it.)
 
 What Jestyr already has instead of raw pointers, and what the contract points people
 toward first:

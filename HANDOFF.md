@@ -11,13 +11,20 @@ decisions, and exactly what's left** with file-level pointers.
 
 ## 0. TL;DR
 
+> **Numbers in this section are historical** (they date from early in the
+> bootstrap). For current, verified counts — tests, corpus size, self-hosted
+> compiler size — see [README.md](README.md), the single authoritative status
+> surface. Since this TL;DR was written the project reached full self-hosting
+> (workstream P: the compiler compiles itself, fixed point verified) and a
+> gcc-only bootstrap seed (`bootstrap/`).
+
 Jestyr is a low-level systems language (design doc: §1). What exists today is a
-**working bootstrap compiler written in Rust (~9,300 lines, zero runtime deps)**
+**working bootstrap compiler written in Rust (zero runtime deps)**
 that takes Jestyr source all the way to a **native executable via a C backend**.
 
 The full pipeline runs: **load (multi-file) → lex → parse → resolve+typecheck →
-ownership/escape check → C codegen → gcc → binary**. ~35 example programs compile
-and run (or are correctly rejected). 294 tests pass, including `proptest` property
+ownership/escape check → C codegen → gcc → binary**. The example programs compile
+and run (or are correctly rejected); tests include `proptest` property
 tests and `bolero` fuzz tests. Build is warning-clean.
 
 **Now also done — items K and I:** a **module/package system** (`import`,
@@ -55,7 +62,7 @@ non-aliasing guarantee handed to the C optimizer as Rust-`noalias`-grade latitud
 
 **Start here in a new session:**
 ```sh
-cargo test                              # 86 tests, incl. property + fuzz
+cargo test                              # full default suite, incl. property + fuzz
 cargo run -- run examples/genmethods.jtr # generic List(T) with methods: 10, 30, 3, 2.5
 cargo run -- run examples/closure_run.jtr # closures that execute: 105, 42, 102
 cargo run -- run examples/contracts.jtr  # requires/ensures → asserts: 5, 5

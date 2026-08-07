@@ -14,20 +14,14 @@
 
 ---
 
-## 0. Current state (snapshot)
+## 0. Current state
 
-Working bootstrap compiler in Rust (~10K LOC, 157 tests, warning-clean) taking
-`.jtr` → C → native binary. Pipeline: **load (multi-file) → lex → parse →
-resolve+typecheck → ownership/escape → C codegen → cc**. Done: the tiered reference
-model (`&T`/`&[r]T`), generics + monomorphization, methods, closures, error sets +
-`?`, contracts, slices + bounds-elision, structured concurrency, `extern "c"`,
-layout attributes, **modules** (item K), **stdlib + allocator-as-value** (item I),
-the full **loop** system (unified `for` + fast-follows), **casts**, **byte-level
-string iteration**, and **doc comments + a doc generator** (item C, `jestyrc doc`).
-Since this snapshot: traits A–F + `dyn`, fn-pointer types, owned `String`/text ops,
-fixed-size arrays, the numerics/determinism stack, and the **self-hosting plumbing** —
-**file I/O**, **command-line args**, and a **symbol-table map** (`std/{fs,env,strmap}.jtr`;
-see workstream P).
+**See [README.md](README.md) for the current state and verified numbers** — this
+roadmap deliberately states none, so exactly one document owns them. In brief:
+the bootstrap compiler works end-to-end (`.jtr` → C → native binary), the
+compiler is **fully self-hosted** (workstream P complete: fixed point verified,
+gcc-only bootstrap seed committed), and the per-workstream Status column below
+records where each stream stood as of its last update.
 
 ---
 
@@ -91,10 +85,10 @@ truly-free parallel lane nobody competes on is **growing the stdlib in Jestyr**.
 | C | Comments & doc-comments | ✅ DONE | LOW | S | ✓ | — |
 | D | Attributes | ~50% | MED | S | ✓ | ✓ (provenance hooks) |
 | E | Real strings / text | ~25% | HIGH | L | ✓✓ | ✓✓ (self-host) |
-| F | Traits / `dyn` | 0% | HIGH | L | ✓✓ | ✓✓ (pass interfaces) |
-| G | CTFE + reflection | ~85% | HIGH | L | ✓ | ✓✓ (IR builder) |
-| H | Function-pointer types | 0% | HIGH | M | ✓ | ✓ (vtables) |
-| I | Error-handling polish | ~70% | MED | S | ✓ | — |
+| F | Traits / `dyn` | ✅ DONE (A–F + `dyn`; error sets in trait sigs) | HIGH | L | ✓✓ | ✓✓ (pass interfaces) |
+| G | CTFE + reflection | ✅ COMPLETE (tiers 0–7, both toolchains) | HIGH | L | ✓ | ✓✓ (IR builder) |
+| H | Function-pointer types | ✅ DONE | HIGH | M | ✓ | ✓ (vtables) |
+| I | Error-handling polish | ✅ payload chain E1–E5 + trait error sets T1–T2 done both sides | MED | S | ✓ | — |
 | J | Numeric / operator completeness | ~70% | MED | S–M | ✓ | ✓ (determinism) |
 | K | Module system v2 | ~98% | MED | M | ✓ | ✓✓ (build/incremental) |
 | L | Memory-layout pass | ✅ ~100% | MED | M | ✓ | ✓✓ (mem-efficiency) |

@@ -1,10 +1,13 @@
 # Error payloads — design note
 
-> Status: **design, pre-implementation.** This note makes the decisions the handoff
-> asked for — surface syntax, result-struct layout, `catch |e|` binding semantics —
-> and lays out the increment chain. Nothing here is built yet; when a decision below
-> is implemented, this note gains a ✅ and the increment's commit, exactly as the
-> unsafe contract (`docs/unsafe-contract.md`) recorded its ladder.
+> Status: **IMPLEMENTED — the E-chain (E1–E5) and trait error sets (T1–T2) are
+> complete on both toolchains** (corpus 148, byte-identical, bootstrap seed
+> current). This note was written as the pre-implementation design; §1 below
+> describes the *starting point* (tag-only errors), not the current state.
+> Payload-carrying errors, sound set checking, `catch |e| match` payload
+> extraction, and error sets in trait signatures are all built. Kept for
+> provenance as the design record; remaining ideas (owning payloads, named
+> sets) are listed at the end as future work.
 
 ## 1. Where we are (precise, verified against the tree)
 
