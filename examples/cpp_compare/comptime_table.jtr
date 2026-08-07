@@ -1,0 +1,23 @@
+// Compile-time table generation in Jestyr.
+//
+// Closest C++ pair: comptime_table.cpp
+// Run:
+//   cargo run --release -- run examples/cpp_compare/comptime_table.jtr
+
+fn sq(x: i64) -> i64 { return x * x }
+
+fn fib(n: i64) -> i64 {
+    if n < 2 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+
+const SQUARES: [6]i64 = comptime { [sq(0), sq(1), sq(2), sq(3), sq(4), sq(5)] }
+const FIBS: [5]i64 = comptime { [fib(1), fib(2), fib(3), fib(4), fib(5)] }
+
+fn main() -> i32 {
+    print_int(SQUARES[5] as i32)        // 25
+    print_int(SQUARES.len as i32)       // 6
+    print_int(FIBS[2] as i32)           // 2
+    print_int(comptime { 1 + 2 } as i32)
+    return 0
+}

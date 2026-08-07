@@ -1,0 +1,57 @@
+// Deterministic data parallelism in Jestyr.
+//
+// Closest C++ pair: parallel_reduce.cpp
+// Run:
+//   cargo run --release -- run examples/cpp_compare/parallel_reduce.jtr
+//
+// What to compare:
+//   - Syntax: `par for x in s reduce(r) { ... }` is one line; the C++ pair hand-rolls
+//     chunking, thread spawning, per-thread partials, and the join.
+//   - Determinism: the compiler accepts only *declared deterministic* reductions, so
+//     the answer cannot depend on the thread schedule. The C++ pair is deterministic
+//     only because integer `+` happens to be associative -- swap in float `+` and it
+//     silently is not, with no diagnostic.
+//   - Cost: `@span` makes the parallel depth a *checked* part of the signature.
+//     Serializing a `par for` back to a `for` is then a compile error rather than a
+//     silent performance regression. C++ has no analogue.
+
+import "../std/core"
+import "../std/io"
+
+fn seti(p: *mut i64, i: usize, v: i64) { unsafe { (p + i).* = v } }
+fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
+
+// A parallel tree reduction has span O(log n), and the compiler VERIFIES that the
+// body actually achieves it -- the declaration is a contract, not a comment.
+@span(log) fn par_sum_sq(read s: []i64) -> i64 {
+    par for x in s reduce(core.sum_reduction()) { x * x }
+}
+
+@span(log) fn par_max(read s: []i64) -> i64 {
+    par for x in s reduce(core.max_reduction()) { x }
+}
+
+// The serial reference is honestly O(n), declared and checked as such.
+@span(linear) fn serial_sum_sq(read s: []i64) -> i64 {
+    var acc: i64 = 0
+    for x in s { acc = acc + x * x }
+    return acc
+}
+
+fn main() -> i32 {
+    let n: usize = 1000
+    var a: *mut i64 = alloc(i64, n)
+    var i: usize = 0
+    for i < n {
+        seti(a, i, (i as i64) + 1)          // 1, 2, ..., 1000
+        i = i + 1
+    }
+    let s: []i64 = slice(i64, a, n)
+
+    io.print_i32(par_sum_sq(s) as i32)                        // 333833500
+    io.print_i32(b2i(par_sum_sq(s) == serial_sum_sq(s)))      // 1 -- bit-identical
+    io.print_i32(par_max(s) as i32)                           // 1000
+
+    free_ptr(a)
+    return 0
+}

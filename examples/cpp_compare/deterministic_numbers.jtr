@@ -1,0 +1,33 @@
+// Deterministic integer parse/format in Jestyr.
+//
+// Closest C++ pair: deterministic_numbers.cpp
+// Run:
+//   cargo run --release -- run examples/cpp_compare/deterministic_numbers.jtr
+//
+// What to compare:
+//   - Parsing reports overflow/invalid input as an explicit Result.
+//   - Formatting writes into a caller-provided byte buffer: no allocation.
+//   - The core routines are locale-free and deterministic.
+
+import "../std/core"
+import "../std/io"
+
+fn unwrap_or(take r: Result(i64, ParseIntError), take fallback: i64) -> i64 {
+    match r { ok(v) => v, err(e) => fallback }
+}
+
+fn main() -> i32 {
+    io.print_i32(unwrap_or(core.parse_i64("12345"), 0) as i32)
+    io.print_i32(unwrap_or(core.parse_i64("-42"), 0) as i32)
+    io.print_i32(unwrap_or(core.parse_i64("9999999999999999999"), 7) as i32)
+    io.print_i32(unwrap_or(core.parse_i64("12x"), 9) as i32)
+
+    var raw: *mut u8 = alloc(u8, 24)
+    var buf: []u8 = slice(u8, raw, 24)
+    let n: usize = core.format_i64(-4271, buf)
+    let view: []u8 = slice(u8, raw, n)
+    io.print_line(from_utf8(view))
+    io.print_i32(unwrap_or(core.parse_i64(from_utf8(view)), 0) as i32)
+    free_ptr(raw)
+    return 0
+}

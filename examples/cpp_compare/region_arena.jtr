@@ -1,0 +1,23 @@
+// Lexical region allocation in Jestyr.
+//
+// Closest C++ pair: region_arena.cpp
+// Run:
+//   cargo run --release -- run examples/cpp_compare/region_arena.jtr
+//
+// What to compare:
+//   - `region r` owns a bump arena for the lexical block.
+//   - `&[r]T` references are plain pointers with scope-checked lifetime.
+//   - The whole region is reclaimed at the closing brace.
+
+fn main() -> i32 {
+    region r {
+        var a: &[r]i32 = region_alloc(r, i32, 10)
+        var b: &[r]i32 = region_alloc(r, i32, 20)
+        var c: &[r]i32 = region_alloc(r, i32, a.* + b.*)
+
+        print_int(a.*)      // 10
+        print_int(b.*)      // 20
+        print_int(c.*)      // 30
+    }
+    return 0
+}

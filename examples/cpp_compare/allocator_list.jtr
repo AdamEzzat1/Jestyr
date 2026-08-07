@@ -1,0 +1,41 @@
+// Allocator-backed collection in Jestyr.
+//
+// Closest C++ pair: allocator_list.cpp
+// Run:
+//   cargo run --release -- run examples/cpp_compare/allocator_list.jtr
+//
+// What to compare:
+//   - Syntax: allocator is an ordinary value passed into the collection.
+//   - Lifetime: List(T) frees its buffer by Drop at scope exit.
+//   - Memory policy: switching system vs arena allocator changes strategy without
+//     changing the push/sum code.
+
+import "../std/mem"
+import "../std/list"
+
+fn fill_and_sum(read a: Allocator, n: i32) -> i32 {
+    var xs = list.make(i32, a)
+    var i: i32 = 0
+    for i < n {
+        list.push(i32, xs, i + 1)
+        i = i + 1
+    }
+
+    var total: i32 = 0
+    var j: usize = 0
+    for j < list.len(i32, xs) {
+        total = total + list.get(i32, xs, j)
+        j = j + 1
+    }
+    return total
+}
+
+fn main() -> i32 {
+    var sys: Allocator = mem.system_allocator()
+    print_int(fill_and_sum(sys, 1000))       // 500500
+
+    var arena: Allocator = mem.arena_allocator(65536)
+    print_int(fill_and_sum(arena, 1000))     // 500500
+    mem.destroy(arena)
+    return 0
+}

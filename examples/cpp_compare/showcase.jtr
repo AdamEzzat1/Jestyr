@@ -1,0 +1,135 @@
+// Bundled Jestyr showcase for the C++ comparison article.
+//
+// Run:
+//   cargo run --release -- run examples/cpp_compare/showcase.jtr
+
+import "../std/core"
+import "../std/io"
+import "../std/mem"
+import "../std/list"
+
+enum Expr {
+    lit(v: i32),
+    add(l: indirect Expr, r: indirect Expr),
+    neg(x: indirect Expr),
+}
+
+enum MaybePtr { none, some(p: *mut i32) }
+
+struct Natural { tag: u8, value: i32, flags: u8 }
+@packed struct Packed { tag: u8, value: i32, flags: u8 }
+@align(16) struct CacheLineHint { value: i32 }
+
+fn eval(read e: Expr) -> i32 {
+    match e {
+        lit(v)    => v,
+        add(l, r) => unsafe { eval(l.*) + eval(r.*) },
+        neg(x)    => unsafe { 0 - eval(x.*) },
+    }
+}
+
+fn boxed(e: Expr) -> *mut Expr {
+    var p: *mut Expr = alloc(Expr, 1)
+    unsafe { p.* = e }
+    return p
+}
+
+fn clamp(x: i32, lo: i32, hi: i32) -> i32
+    requires lo <= hi
+    ensures result >= lo
+    ensures result <= hi
+{
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn fill_and_sum(read a: Allocator, n: i32) -> i32 {
+    var xs = list.make(i32, a)
+    var i: i32 = 0
+    for i < n {
+        list.push(i32, xs, i + 1)
+        i = i + 1
+    }
+
+    var total: i32 = 0
+    var j: usize = 0
+    for j < list.len(i32, xs) {
+        total = total + list.get(i32, xs, j)
+        j = j + 1
+    }
+    return total
+}
+
+fn unwrap_i64(take r: Result(i64, ParseIntError), take fallback: i64) -> i64 {
+    match r { ok(v) => v, err(e) => fallback }
+}
+
+fn setf(p: *mut f64, i: i32, v: f64) { unsafe { (p + i).* = v } }
+fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
+
+fn sq(x: i64) -> i64 { return x * x }
+const SQUARES: [6]i64 = comptime { [sq(0), sq(1), sq(2), sq(3), sq(4), sq(5)] }
+
+fn main() -> i32 {
+    // ADTs + matching + niche layout.
+    var a: *mut Expr = boxed(lit(40))
+    var two: *mut Expr = boxed(lit(2))
+    var b: *mut Expr = boxed(neg(two))
+    var root: Expr = add(a, b)
+    io.print_i32(eval(root))             // 38
+    io.print_i32(size_of(MaybePtr))      // 8
+    io.print_i32(size_of(usize))         // 8
+    free_ptr(two)
+    free_ptr(b)
+    free_ptr(a)
+
+    // Contracts.
+    io.print_i32(clamp(12, 0, 10))       // 10
+    io.print_i32(clamp(0 - 4, 0, 10))    // 0
+    io.print_i32(clamp(7, 0, 10))        // 7
+
+    // Layout.
+    io.print_i32(size_of(Natural))             // 12
+    io.print_i32(size_of(Packed))              // 6
+    io.print_i32(align_of(CacheLineHint))      // 16
+    io.print_i32(offset_of(Natural, value))    // 4
+    io.print_i32(offset_of(Packed, value))     // 1
+
+    // Allocator-parametric collection.
+    var sys: Allocator = mem.system_allocator()
+    io.print_i32(fill_and_sum(sys, 1000))      // 500500
+
+    // Lexical region allocation.
+    region r {
+        var x: &[r]i32 = region_alloc(r, i32, 10)
+        var y: &[r]i32 = region_alloc(r, i32, 20)
+        var z: &[r]i32 = region_alloc(r, i32, x.* + y.*)
+        io.print_i32(z.*)                      // 30
+    }
+
+    // Deterministic parse/format.
+    io.print_i32(unwrap_i64(core.parse_i64("9999999999999999999"), 7) as i32)
+    var raw: *mut u8 = alloc(u8, 24)
+    var buf: []u8 = slice(u8, raw, 24)
+    let n: usize = core.format_i64(-4271, buf)
+    let view: []u8 = slice(u8, raw, n)
+    io.print_line(from_utf8(view))
+    free_ptr(raw)
+
+    // Compile-time table.
+    io.print_i32(SQUARES[5] as i32)            // 25
+
+    // Floating-point reduction discipline.
+    var fb: *mut f64 = alloc(f64, 4)
+    setf(fb, 0, 1.0)
+    setf(fb, 1, 1.0e100)
+    setf(fb, 2, 1.0)
+    setf(fb, 3, 0.0 - 1.0e100)
+    var fs: []f64 = slice(f64, fb, 4)
+    io.print_f64(core.f64_sum(fs))            // 0
+    io.print_f64(core.f64_kahan_sum(fs))      // 2
+    free_ptr(fb)
+
+    return 0
+}

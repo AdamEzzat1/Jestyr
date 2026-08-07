@@ -1,0 +1,50 @@
+// Algebraic data types and exhaustive matching in Jestyr.
+//
+// Closest C++ pair: adt_match.cpp
+// Run:
+//   cargo run --release -- run examples/cpp_compare/adt_match.jtr
+//
+// What to compare:
+//   - Jestyr has enum payloads and pattern matching directly in the language.
+//   - The compiler checks that every shape is handled.
+//   - Option(*mut T) niche-optimizes to the same size as a bare pointer.
+
+enum Expr {
+    lit(v: i32),
+    add(l: indirect Expr, r: indirect Expr),
+    neg(x: indirect Expr),
+}
+
+enum MaybePtr { none, some(p: *mut i32) }
+
+fn eval(read e: Expr) -> i32 {
+    match e {
+        lit(v)    => v,
+        add(l, r) => unsafe { eval(l.*) + eval(r.*) },
+        neg(x)    => unsafe { 0 - eval(x.*) },
+    }
+}
+
+fn boxed(e: Expr) -> *mut Expr {
+    var p: *mut Expr = alloc(Expr, 1)
+    unsafe { p.* = e }
+    return p
+}
+
+fn main() -> i32 {
+    // Every box is named so every box can be freed: the `neg` child needs its
+    // own binding, because nothing else in this program holds a pointer to it.
+    var a: *mut Expr = boxed(lit(40))
+    var two: *mut Expr = boxed(lit(2))
+    var b: *mut Expr = boxed(neg(two))
+    var root: Expr = add(a, b)
+
+    print_int(eval(root))             // 38
+    print_int(size_of(MaybePtr))      // pointer-sized optional pointer
+    print_int(size_of(usize))         // pointer width on this target
+
+    free_ptr(two)
+    free_ptr(b)
+    free_ptr(a)
+    return 0
+}

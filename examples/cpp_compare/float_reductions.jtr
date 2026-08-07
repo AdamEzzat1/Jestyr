@@ -1,0 +1,33 @@
+// Deterministic floating-point reductions in Jestyr.
+//
+// Closest C++ pair: float_reductions.cpp
+// Run:
+//   cargo run --release -- run examples/cpp_compare/float_reductions.jtr
+
+import "../std/core"
+import "../std/io"
+
+fn setf(p: *mut f64, i: i32, v: f64) { unsafe { (p + i).* = v } }
+fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
+
+fn main() -> i32 {
+    var b: *mut f64 = alloc(f64, 4)
+    setf(b, 0, 1.0)
+    setf(b, 1, 1.0e100)
+    setf(b, 2, 1.0)
+    setf(b, 3, 0.0 - 1.0e100)
+    var s: []f64 = slice(f64, b, 4)
+
+    io.print_f64(core.f64_sum(s))            // 0
+    io.print_f64(core.f64_kahan_sum(s))      // 2
+
+    var bins: [2048]i64 = core.binned_new()
+    core.binned_add(bins, 1.0)
+    core.binned_add(bins, 1.0e16)
+    core.binned_add(bins, 0.0 - 1.0e16)
+    core.binned_add(bins, 3.0)
+    io.print_f64(core.binned_sum(bins))      // 4
+
+    free_ptr(b)
+    return 0
+}

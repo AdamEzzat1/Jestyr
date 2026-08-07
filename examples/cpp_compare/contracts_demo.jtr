@@ -1,0 +1,27 @@
+// Design-by-contract in Jestyr.
+//
+// Closest C++ pair: contracts_demo.cpp
+// Run:
+//   cargo run --release -- run examples/cpp_compare/contracts_demo.jtr
+//
+// What to compare:
+//   - Preconditions and postconditions live on the function signature.
+//   - Jestyr lowers them to C assertions today.
+//   - The contract documents and checks the boundary in one place.
+
+fn clamp(x: i32, lo: i32, hi: i32) -> i32
+    requires lo <= hi
+    ensures result >= lo
+    ensures result <= hi
+{
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn main() -> i32 {
+    print_int(clamp(12, 0, 10))       // 10
+    print_int(clamp(0 - 4, 0, 10))    // 0
+    print_int(clamp(7, 0, 10))        // 7
+    return 0
+}

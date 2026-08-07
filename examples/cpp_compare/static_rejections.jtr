@@ -1,0 +1,45 @@
+// Static rejection examples for the article.
+//
+// This file is meant to be checked, not run:
+//   cargo run --release -- check examples/cpp_compare/static_rejections.jtr
+//
+// It demonstrates three cases where Jestyr rejects a program before C generation:
+//   1. non-exhaustive pattern matching
+//   2. returning a value allocated in a lexical region
+//   3. a parallel reduction whose determinism has not been declared
+//
+// A fourth rejection is one edit away rather than shown here, because it aborts
+// compilation before the three above can be reported: open parallel_reduce.jtr and
+// replace the `par for ... reduce(...)` body of `par_sum_sq` with the serial loop
+// from `serial_sum_sq`. The declared `@span(log)` no longer holds and the compiler
+// refuses -- an accidental serialization caught as a compile error rather than as a
+// silent performance regression.
+
+import "../std/core"
+
+enum Color { red, green, blue }
+
+fn paint(read c: Color) -> i32 {
+    match c {
+        red   => 0,
+        green => 1,
+    }
+}
+
+fn bad_region_escape() -> str {
+    region r {
+        let s: str = region_concat(r, "Jestyr", "!")
+        return s
+    }
+    return ""
+}
+
+// `par for` accepts only reductions from the declared-deterministic set, so the
+// answer cannot depend on the thread schedule. The check is nominal on purpose:
+// this reduction *is* sum underneath, and is still refused, because "happens to be
+// associative today" is not a property the compiler can rely on tomorrow.
+fn my_reduction() -> Reduction { return core.sum_reduction() }
+
+fn bad_parallel_reduction(read s: []i64) -> i64 {
+    par for x in s reduce(my_reduction()) { x }
+}
