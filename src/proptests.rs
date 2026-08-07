@@ -8804,7 +8804,9 @@ fn g(p: *mut i32) -> i32 {
         let out = Command::new(&jc).args([hello.to_str().unwrap(), "build"]).output().unwrap();
         assert!(out.status.success(), "driver build failed: {}", String::from_utf8_lossy(&out.stderr));
         assert!(dir.join("hello.c").exists(), "driver wrote no C");
-        let exe = dir.join("hello.exe");
+        // The driver names its output per platform: `<stem>.exe` on Windows,
+        // bare `<stem>` on POSIX (matching the reference driver).
+        let exe = dir.join(format!("hello{}", std::env::consts::EXE_SUFFIX));
         assert!(exe.exists(), "driver produced no exe");
         let prog = Command::new(&exe).output().unwrap();
         let want = build_and_run("examples/hello.jtr");
@@ -9186,17 +9188,7 @@ fn main() -> i32 {
         )
         .unwrap();
 
-        // These tests live in the binary crate, so cargo does not set
-        // `CARGO_BIN_EXE_*` (that is an integration-test variable). The test
-        // executable sits in `target/<profile>/deps/`, so the compiler it was built
-        // alongside is two directories up.
-        let jestyrc = {
-            let t = std::env::current_exe().unwrap();
-            let profile_dir = t.parent().unwrap().parent().unwrap();
-            let p = profile_dir.join(format!("jestyrc{}", std::env::consts::EXE_SUFFIX));
-            assert!(p.exists(), "jestyrc binary not found at {}", p.display());
-            p
-        };
+        let jestyrc = jestyrc_bin();
 
         // 1. The plan is what the script describes, and it is stable across runs.
         let plan_of = || {
@@ -9291,13 +9283,7 @@ fn main() -> i32 {
         )
         .unwrap();
 
-        let jestyrc = {
-            let t = std::env::current_exe().unwrap();
-            let profile_dir = t.parent().unwrap().parent().unwrap();
-            let p = profile_dir.join(format!("jestyrc{}", std::env::consts::EXE_SUFFIX));
-            assert!(p.exists(), "jestyrc binary not found at {}", p.display());
-            p
-        };
+        let jestyrc = jestyrc_bin();
         let plan_of = |script: &str| {
             let out = Command::new(&jestyrc)
                 .args(["plan", script])
@@ -9387,10 +9373,7 @@ fn main() -> i32 {
         )
         .unwrap();
 
-        let jestyrc = {
-            let t = std::env::current_exe().unwrap();
-            t.parent().unwrap().parent().unwrap().join(format!("jestyrc{}", std::env::consts::EXE_SUFFIX))
-        };
+        let jestyrc = jestyrc_bin();
         let plan_run = |extra: &[&str]| {
             let mut a = vec!["plan", "build.jestyr"];
             a.extend_from_slice(extra);
@@ -10163,12 +10146,7 @@ fn main() -> i32 {
     /// what keeps it out of every determinism canary's hash.
     #[test]
     fn error_traces_print_the_propagation_path() {
-        let jestyrc = {
-            let t = std::env::current_exe().unwrap();
-            let p = t.parent().unwrap().parent().unwrap().join(format!("jestyrc{}", std::env::consts::EXE_SUFFIX));
-            assert!(p.exists(), "jestyrc binary not found at {}", p.display());
-            p
-        };
+        let jestyrc = jestyrc_bin();
         let dir = std::env::temp_dir().join("jestyr_etrace");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -11175,7 +11153,7 @@ fn main() -> i32 {
         let root = dir.join("cgen.jtr");
         let out = Command::new(&jc).args([root.to_str().unwrap(), "build"]).output().unwrap();
         assert!(out.status.success(), "self-build failed: {}", String::from_utf8_lossy(&out.stderr));
-        let jc2 = dir.join("cgen.exe");
+        let jc2 = dir.join(format!("cgen{}", std::env::consts::EXE_SUFFIX));
         assert!(jc2.exists(), "self-build produced no exe");
         let probe = "examples/hello.jtr";
         let a = Command::new(&jc).arg(probe).output().unwrap();
@@ -11517,6 +11495,35 @@ fn main() -> i32 {
         assert!(stdout.contains("bench sum_to_1000 ... "), "bench line missing: {stdout}");
         assert!(stdout.contains("result: 2 passed; 0 failed"), "tally wrong: {stdout}");
         eprintln!("test-mode golden: {checked} file(s)' harness C byte-identical; demo harness ran green");
+    }
+
+    /// The `jestyrc` binary itself, for tests that drive the CLI as a process.
+    /// These tests live in the binary crate, so cargo does not set
+    /// `CARGO_BIN_EXE_*` (that is an integration-test variable); the test
+    /// executable sits in `target/<profile>/deps/`, so the compiler it was built
+    /// alongside is two directories up. `cargo test` alone does not build bin
+    /// targets — on a cold checkout (CI) the binary does not exist yet, so build
+    /// it on demand rather than assuming a developer's earlier `cargo build`.
+    fn jestyrc_bin() -> std::path::PathBuf {
+        let t = std::env::current_exe().unwrap();
+        let profile_dir = t.parent().unwrap().parent().unwrap();
+        let p = profile_dir.join(format!("jestyrc{}", std::env::consts::EXE_SUFFIX));
+        if !p.exists() {
+            let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+            let mut cmd = Command::new(cargo);
+            cmd.args(["build", "--bin", "jestyrc"]);
+            if profile_dir.file_name().and_then(|n| n.to_str()) == Some("release") {
+                cmd.arg("--release");
+            }
+            // Concurrent callers serialize on cargo's own target-dir lock.
+            let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+            assert!(
+                ok && p.exists(),
+                "jestyrc binary not found at {} and `cargo build` could not produce it",
+                p.display()
+            );
+        }
+        p
     }
 
     /// The self-hosting module closure, in the loader's DFS item order for
@@ -11952,13 +11959,21 @@ fn main() -> i32 {
     fn test_runner_filters_end_to_end() {
         let (all, all_code) = build_tests_and_run("examples/tests_demo.jtr", None);
         assert_eq!(all_code, 0, "all demo tests pass: {all}");
+        // The bench duration is measured wall-clock — normalize it before pinning
+        // the shape (Windows' coarse timer prints 0.000 where Linux prints 0.001).
+        let norm: Vec<String> = all
+            .split_whitespace()
+            .map(|t| {
+                if t.contains('.') && t.parse::<f64>().is_ok() { "<ms>".to_string() } else { t.to_string() }
+            })
+            .collect();
         assert_eq!(
-            all.split_whitespace().collect::<Vec<_>>(),
+            norm,
             [
                 "running", "2", "test(s)",
                 "test", "add_is_commutative", "...", "ok",
                 "test", "doubling_works", "...", "ok",
-                "bench", "sum_to_1000", "...", "0.000", "ms",
+                "bench", "sum_to_1000", "...", "<ms>", "ms",
                 "result:", "2", "passed;", "0", "failed",
             ]
         );

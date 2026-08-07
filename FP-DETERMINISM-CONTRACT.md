@@ -1,15 +1,21 @@
 # FP / Determinism Contract — Handoff (lock it in a fresh session)
 
-> **Honest status: the contract is *substantially* locked, not *proven*.** The parts
-> that are Jestyr's to control — the FP-codegen flags and the determinism-by-
-> construction primitives — are locked and tested, and the canary is now **purified**
-> (gap #2 below, closed): it hashes a dedicated demo that emits *only* integers and
-> our own `format_float` strings, so no `printf("%g")` output rides in the digest. The
-> one remaining blocker to *proof* is mechanical: the cross-platform run (gap #1). The
-> SHA-256 canary has still only been computed on one machine (Windows + gcc), so the
-> digest's *cross-OS identity* is **unverified**. Read this before claiming "cross-OS
-> determinism." Everything below is on `master`, **508 tests green** (+8 under
-> `--features c-oracle`), warning-clean.
+> **Status: the contract is PROVEN cross-OS (2026-08-07).** The FP-codegen flags
+> and the determinism-by-construction primitives are locked and tested; the canary
+> is **purified** (gap #2 below): it hashes a dedicated demo that emits *only*
+> integers and our own `format_float` strings, so no `printf("%g")` output rides
+> in the digest. Gap #1 — the cross-platform run — is now **closed**: the locked
+> digest (`4389bf83…`) has been reproduced identically on
+>
+> * **Windows 11 + gcc (MinGW)** — the platform it was first computed on;
+> * **Ubuntu 24.04 + gcc 13.3.0** (glibc) — the CI `c-oracle` job, first green
+>   run 2026-08-07, and re-verified on every push since.
+>
+> Same source, two OSes, two libcs, one digest — the contract's claim holds as
+> stated. macOS/clang remains untested (a welcome third data point, not a
+> blocker). Historical framing below is kept as written; where it says the
+> cross-OS run is "the only blocker to proof," read it as the record of what
+> closed on 2026-08-07.
 >
 > Companion docs: [`NUMERICS-HANDOFF.md`](NUMERICS-HANDOFF.md) (the whole numerics
 > workstream), [`CORE-STD-PHASE3.md`](CORE-STD-PHASE3.md) (ledger),
@@ -71,16 +77,14 @@ These are the gaps. Until #1 is closed, describe this as "flags + construction
 locked, **purified** single-platform regression canary," **not** "cross-OS
 determinism proven."
 
-1. **The canary digest is single-platform.** It was computed once on Windows/gcc. The
-   whole point is cross-OS identity, which is **unverified**. → **Run `cargo test
-   --features c-oracle` on Linux and macOS (and ideally clang).** If the digest
-   (`4389bf83…`) matches, the contract is *actually* locked — update this note to say
-   so. If it differs now, it is a **genuine** determinism break (the libc-formatting
-   false-alarm risk was removed in #2), so triage the numerics, don't just re-lock.
-   *This is now the only blocker to proof.* **The check is wired into CI** (the
-   ubuntu `c-oracle` job in `.github/workflows/ci.yml` runs it on every push);
-   once that job is green, record the platform + compiler version here and
-   upgrade the claim. Until then this section stands as written.
+1. ~~**The canary digest is single-platform.**~~ — ✅ **DONE (2026-08-07).** The
+   digest (`4389bf83…`) was reproduced exactly on **Ubuntu 24.04 + gcc 13.3.0**
+   by the CI `c-oracle` job (`.github/workflows/ci.yml`), which now re-runs the
+   check on every push. Two OSes, two libcs (msvcrt/MinGW and glibc), one
+   digest — the contract is **proven** as claimed in the header. macOS/clang
+   would be a welcome third platform; a digest mismatch anywhere is a genuine
+   determinism break (the libc-formatting false-alarm risk was removed in #2):
+   triage the numerics, don't re-lock.
 
 2. ~~**The canary hashes some `printf`-formatted output — an impurity.**~~ — ✅ **DONE.**
    Was: `binned.jtr`/`reductions.jtr`/`float_bits.jtr` printed floats via `print_f64`
@@ -114,13 +118,12 @@ determinism proven."
 1. ~~**Purify the canary** (#2)~~ — ✅ **DONE** (this session). Hashed input is now
    `numerics_canary.jtr` (integers + `format_float` only); re-locked to `4389bf83…`.
    The libc false-alarm risk is gone, so the cross-platform run below is now meaningful.
-2. **Verify cross-platform** (#1) — **← the next step, and the only blocker to proof.**
-   Run `cargo test --features c-oracle` on Linux (and macOS if available). Same digest
-   (`4389bf83…`) ⇒ the contract is *proven*; record the platforms + compiler versions
-   here. A *different* digest now means a real break (not formatting), so triage it.
-3. **Wire it into CI** — a matrix (linux/macos/windows × gcc/clang) running
-   `cargo test --features c-oracle`. The canary failing on any cell is then a genuine
-   determinism regression signal. (Research §3.6 Step 0.)
+2. ~~**Verify cross-platform** (#1)~~ — ✅ **DONE (2026-08-07):** digest identical
+   on Ubuntu 24.04 + gcc 13.3.0 (see the header and gap #1). macOS/clang would be
+   a welcome third platform.
+3. ~~**Wire it into CI**~~ — ✅ **DONE:** `.github/workflows/ci.yml`'s ubuntu
+   `c-oracle` job runs the canary on every push; it failing is a genuine
+   determinism regression signal. (A macos/clang cell is the natural extension.)
 4. *(Optional)* `#pragma STDC FP_CONTRACT OFF` in emitted C (#3); 32-bit SSE flags (#4).
 
 ---
@@ -142,6 +145,7 @@ determinism proven."
 
 Flags locked + tested; primitives deterministic by construction + tested; canary
 mechanism built, **purified** (hashes integer + `format_float` output only — no
-`printf`), and locked **on one platform** (`4389bf83…`). The only step left to turn
-"deterministic" into "proven deterministic": run `cargo test --features c-oracle` on a
-second OS/compiler and confirm the digest is identical.
+`printf`), and **proven cross-OS** (`4389bf83…` identical on Windows/MinGW-gcc and
+Ubuntu 24.04/gcc 13.3, re-checked by CI on every push). Remaining niceties, not
+blockers: a macOS/clang data point, and `#pragma STDC FP_CONTRACT OFF` in the
+emitted C itself.

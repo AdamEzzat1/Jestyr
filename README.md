@@ -99,12 +99,11 @@ sources by the `bootstrap_seed_is_current` test.
 primitives (parse, format, reductions) are deterministic by
 construction; a purified SHA-256 canary (integer + own-formatter output
 only) locks the observable behavior, including SIMD lane width. *Scope:*
-the canary digest (`4389bf83…`) has been verified on Windows + gcc;
-cross-OS identity is exactly what the CI Linux `c-oracle` job checks —
-until that run is green on another platform, read this claim as "locked
-single-platform canary," per
-[FP-DETERMINISM-CONTRACT.md](FP-DETERMINISM-CONTRACT.md), which tracks
-verified platforms.
+the canary digest (`4389bf83…`) is verified identical on **Windows 11 +
+gcc (MinGW)** and **Ubuntu 24.04 + gcc 13.3 (glibc)** — two OSes, two
+libcs, one digest — and CI re-checks it on every push. macOS/clang is
+untested. Details and verified-platform record:
+[FP-DETERMINISM-CONTRACT.md](FP-DETERMINISM-CONTRACT.md).
 
 **5. Safety enforcement.** Raw-pointer operations outside `unsafe` are
 compile errors on both toolchains ([docs/unsafe-contract.md](docs/unsafe-contract.md));
