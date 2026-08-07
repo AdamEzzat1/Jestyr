@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use or discuss Jestyr in research, please cite it as below."
+title: "Jestyr: a self-hosted systems language without lifetimes, held byte-identical across two compiler implementations"
+type: software
+authors:
+  - family-names: "Ezzat"
+    given-names: "Adam"
+version: 0.1.0-research
+date-released: "2026-08-07"
+license: "MIT OR Apache-2.0"
+repository-code: "https://github.com/AdamEzzat1/Jestyr"
+abstract: >-
+  Jestyr is a from-scratch low-level systems language exploring how much
+  memory safety a language can keep while dropping lifetimes entirely:
+  second-class borrows with a structural escape checker, generation-checked
+  references, and region arenas, validated by self-hosting the compiler in
+  the language itself. The project maintains two independent compiler
+  implementations (a Rust reference and the self-hosted port) whose C output
+  is held byte-identical over a test corpus, a verified self-hosting fixed
+  point, a gcc-only bootstrap seed, checked cost-model attributes, and a
+  locked floating-point determinism contract.
+keywords:
+  - programming-languages
+  - compilers
+  - memory-safety
+  - ownership
+  - self-hosting
+  - bootstrapping
+  - determinism
