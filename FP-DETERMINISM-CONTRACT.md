@@ -77,7 +77,10 @@ determinism proven."
    (`4389bf83…`) matches, the contract is *actually* locked — update this note to say
    so. If it differs now, it is a **genuine** determinism break (the libc-formatting
    false-alarm risk was removed in #2), so triage the numerics, don't just re-lock.
-   *This is now the only blocker to proof.*
+   *This is now the only blocker to proof.* **The check is wired into CI** (the
+   ubuntu `c-oracle` job in `.github/workflows/ci.yml` runs it on every push);
+   once that job is green, record the platform + compiler version here and
+   upgrade the claim. Until then this section stands as written.
 
 2. ~~**The canary hashes some `printf`-formatted output — an impurity.**~~ — ✅ **DONE.**
    Was: `binned.jtr`/`reductions.jtr`/`float_bits.jtr` printed floats via `print_f64`
