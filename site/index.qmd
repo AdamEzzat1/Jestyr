@@ -61,6 +61,10 @@ fn main() -> i32 {
 }
 ```
 
+::: {.program-output}
+60
+:::
+
 Values are owned and moved. Borrows (`read`/`mut`) are second-class —
 they can be passed down but never stored or returned, so the escape
 checker's guarantee is structural, not inferred. Data structures that

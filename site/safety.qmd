@@ -109,11 +109,26 @@ pair. Each allocation carries a generation; the reference snapshots it; every
 deref compares the snapshot against the live generation.
 
 ```{.rust}
-var r: &i32 = gen_new(i32, 42)
-print_int(r.*)        // generation matches → safe deref
-gen_free(r)           // bumps the generation
-print_int(r.*)        // faults, deterministically — never UB
+fn main() -> i32 {
+    var r: &i32 = gen_new(i32, 42)
+    print_int(r.* as i64)   // generation matches → safe deref
+    gen_free(r)             // bumps the generation
+    print_int(r.* as i64)   // faults, deterministically — never UB
+    return 0
+}
 ```
+
+::: {.program-output}
+42
+Assertion failed!
+
+Program: jestyr_uaf.exe
+File: uaf.jtr, Line 5
+:::
+
+That second line is the whole point: the use-after-free stops the program at
+the exact source line that did it, instead of silently returning whatever now
+occupies the freed memory.
 
 The promise is deliberately weaker than tier 1 and deliberately stronger than
 a raw pointer: use-after-free is not prevented at compile time, but it is a

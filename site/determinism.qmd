@@ -86,10 +86,17 @@ operations — are compile errors. The only parallelism allowed is the checked
 deterministic reduction:
 
 ```{.rust}
+import "std/core"
+
 @deterministic fn sum_of_squares(read s: []i64) -> i64 {
     return par for x in s reduce(core.sum_reduction()) { x * x }
 }
+// over the slice [1, 2, 3, 4]:
 ```
+
+::: {.program-output}
+30
+:::
 
 **`par for … reduce(r)` accepts only declared-deterministic reduction
 constructors.** A reduction whose result depends on combination order (say,

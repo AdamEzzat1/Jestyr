@@ -117,11 +117,19 @@ it is the compiler's named optimization target. What the Jestyr side buys for
 that overhead is one line —
 
 ```{.rust}
-var total = 0
-par for x in xs reduce(sum) {
-    total += x * x
+@span(log) fn par_sum_sq(read s: []i64) -> i64 {
+    par for x in s reduce(core.sum_reduction()) { x * x }
 }
 ```
+
+Over the benchmark's 20,000,000 elements, `heavy_parsum.jtr` prints the
+reduction's checksum and a `1` confirming the parallel answer equals its own
+serial pass exactly — and its C++ twin prints the same two lines:
+
+::: {.program-output}
+669953408
+1
+:::
 
 — against a page of chunking, spawning, per-thread partials, and a join, plus
 a guarantee the C++ version cannot state: the reduction is
