@@ -1,0 +1,295 @@
+---
+title: "Language tour"
+---
+
+Seven small programs, one pillar each. Every program on this page ships in the
+repo under `examples/`, every excerpt is taken from the real file, and every
+output block is what the program actually prints. Run any of them yourself:
+
+```bash
+jestyrc run examples/life.jtr
+```
+
+All seven are part of the 148-file corpus that both compilers — the ~52K-line
+Rust reference and the 29,818-line self-hosted compiler — must lower to
+byte-identical C (single-file/concat emission path).
+
+## Life: arrays are stack values
+
+`examples/life.jtr` is Conway's Game of Life on a fixed 8x8 torus. There is no
+heap anywhere in it. `[64]i32` is a plain value: it lives on the stack, copies
+on assignment, and indexing is bounds-checked. `read` parameters are borrows
+you never annotate with lifetimes — the compiler checks the aliasing, the
+source just says who gets to write.
+
+```{.rust}
+fn step(read b: [64]i32) -> [64]i32 {
+    var next: [64]i32 = [0; 64]
+    var y: i32 = 0
+    for y < H {
+        var x: i32 = 0
+        for x < W {
+            let n: i32 = neighbors(b, x, y)
+            let alive: i32 = b[idx(x, y)]
+            if alive == 1 {
+                if n == 2 or n == 3 { next[idx(x, y)] = 1 }
+            } else {
+                if n == 3 { next[idx(x, y)] = 1 }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return next
+}
+```
+
+`board = step(board)` in `main` is just a value assignment — no clone call, no
+move ceremony. The glider walks:
+
+::: {.program-output}
+```
+.#......          ........
+..#.....          ..#.....
+###.....   ...    ...#....
+........          .###....
+........          ........
+(gen 0)           (gen 4, three frames elided)
+```
+:::
+
+## Calc: recursive ADTs and errors that carry data
+
+`examples/calc.jtr` evaluates `(7 - 3) * (10 / 2)`. `indirect` boxes the
+recursive children; `match` is exhaustive; the error set `!{ DivByZero(i64) }`
+is part of the signature and its payload remembers the numerator that was about
+to be divided. Dereferencing the raw child pointers is only legal inside
+`unsafe { … }` — that boundary is a compile error to cross, not a convention.
+
+```{.rust}
+fn eval(read e: Expr) -> i64 !{ DivByZero(i64) } {
+    match e {
+        num(v)    => { return ok(v) },
+        add(l, r) => {
+            let a: i64 = eval(unsafe { l.* })?
+            let b: i64 = eval(unsafe { r.* })?
+            return ok(a + b)
+        },
+        // sub, mul elided — same shape
+        div(l, r) => {
+            let a: i64 = eval(unsafe { l.* })?
+            let b: i64 = eval(unsafe { r.* })?
+            if b == 0 { return err(DivByZero(a)) }
+            return ok(a / b)
+        },
+    }
+}
+
+let w: i64 = eval(bad) catch |e| match e { DivByZero(n) => 0 - n }
+```
+
+The second evaluation is `42 / 0`; the `catch |e| match` recovers the payload
+at the call site and prints its negation:
+
+::: {.program-output}
+```
+20
+-42
+```
+:::
+
+## Primes: proven allocation-free, with contracts
+
+`examples/primes.jtr` is a Sieve of Eratosthenes. `@no_alloc` is not a comment:
+the compiler proves — transitively, through every call — that nothing inside
+the function allocates, and rejects the program otherwise. `requires` and
+`ensures` are design-by-contract clauses lowered to checked asserts.
+
+```{.rust}
+@no_alloc fn count_primes_below(n: i32) -> i32
+    requires n <= 100
+    ensures result >= 0
+{
+    var composite: [100]i32 = [0; 100]
+    var count: i32 = 0
+    var i: i32 = 2
+    for i < n {
+        if composite[i as usize] == 0 {
+            count = count + 1
+            var m: i32 = i * i
+            for m < n {
+                composite[m as usize] = 1
+                m = m + i
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+```
+
+::: {.program-output}
+```
+25
+10
+2
+29
+97
+```
+:::
+
+## Pi: parallel, and the answer never wavers
+
+`examples/pi.jtr` throws 8,000 Monte Carlo darts across four spawned workers.
+`concurrent { spawn … }` is structured concurrency: every task joins at the
+closing brace, so no thread outlives the scope that made it. Each worker owns a
+fixed-seed Lehmer generator and folds its hits in with `atomic_add`, so
+scheduling order cannot reach the result.
+
+```{.rust}
+fn worker(hits: *mut i64, seed: i64) {
+    var s: i64 = seed
+    var mine: i64 = 0
+    var i: i64 = 0
+    for i < SAMPLES_PER_WORKER {
+        s = lehmer(s)
+        let x: i64 = s % R
+        s = lehmer(s)
+        let y: i64 = s % R
+        if x * x + y * y < R * R { mine = mine + 1 }
+        i = i + 1
+    }
+    atomic_add(hits, mine)
+}
+
+concurrent {
+    spawn worker(hits, 1)
+    spawn worker(hits, 20260807)
+    spawn worker(hits, 48271)
+    spawn worker(hits, 777)
+}
+```
+
+::: {.program-output}
+```
+6300
+3150
+```
+:::
+
+::: {.claim}
+This parallel program printed the same two numbers in 20 consecutive runs on
+one machine, and the project's cross-OS determinism canary — a digest over a
+much larger program exercising the whole numeric stack, parallel reductions
+included — is byte-identical on Windows/MinGW-gcc and
+Ubuntu 24.04/gcc 13.3.0, pinned by CI on every push.
+<span class="verify">$ jestyrc run examples/pi.jtr</span>
+:::
+
+## Histogram: strings without copies
+
+`examples/histogram.jtr` counts word lengths in a sentence. `split` never
+allocates: each `w` is a `str` — a zero-copy view into the original text.
+Owned `String` and borrowed `str` are distinct types, so "who frees this" is
+answered by the type, not by convention.
+
+```{.rust}
+let text: str = "the quick brown fox jumps over the lazy dog and naps in warm golden afternoon sun"
+
+var counts: [12]i32 = [0; 12]
+var words: i32 = 0
+for w in split(text, " ") {          // each `w` is a zero-copy view into `text`
+    let n: usize = w.len
+    if n < 12 { counts[n] = counts[n] + 1 }
+    words = words + 1
+}
+```
+
+::: {.program-output}
+```
+16
+2 | #
+3 | ######
+4 | ####
+5 | ###
+6 | #
+9 | #
+```
+:::
+
+## Ledger: traits whose contracts include failure
+
+`examples/ledger.jtr` puts two account types behind one trait — and the error
+set `!{ Insufficient(i64) }` is written into the trait method itself, so every
+implementation must honor it and every caller must handle it. `spend[T:
+Account]` is monomorphized per type: no vtable, no allocation, and the payload
+reports how much was actually available when a withdrawal fails.
+
+```{.rust}
+trait Account {
+    fn withdraw(read self, amt: i64) -> i64 !{ Insufficient(i64) }
+}
+
+impl Account for Savings {
+    fn withdraw(read self, amt: i64) -> i64 !{ Insufficient(i64) } {
+        let avail: i64 = self.balance - self.reserve
+        if amt > avail { return err(Insufficient(avail)) }
+        return ok(self.balance - amt)
+    }
+}
+
+fn spend[T: Account](read acct: T, amt: i64) -> i64 {
+    return acct.withdraw(amt) catch |e| match e {
+        Insufficient(avail) => 0 - avail,
+    }
+}
+```
+
+Negative numbers below are refusals — the payload, negated, saying what the
+account actually held:
+
+::: {.program-output}
+```
+70
+-20
+85
+-100
+```
+:::
+
+## Arena points: regions free in O(1)
+
+`examples/arena_points.jtr` does geometry scratch work in a bump arena.
+`region r { … }` owns the arena; `region_alloc` hands back `&[r]Point` — a
+plain pointer with zero per-deref cost, safe because the compiler confines it
+to the region's scope. Try to return one and you get a compile error
+(`examples/region_escape.jtr` demonstrates the rejection). At the closing
+brace the whole arena frees at once: no per-node frees, no leaks possible.
+
+```{.rust}
+region r {
+    var a: &[r]Point = region_alloc(r, Point, Point { x: 0, y: 0 })
+    var b: &[r]Point = region_alloc(r, Point, Point { x: 3, y: 4 })
+    var c: &[r]Point = region_alloc(r, Point, Point { x: 10, y: 1 })
+    var d: &[r]Point = region_alloc(r, Point, Point { x: 7, y: 9 })
+
+    var route: i64 = 0
+    route = route + manhattan(a.*, b.*)     // 7
+    route = route + manhattan(b.*, c.*)     // 10
+    route = route + manhattan(c.*, d.*)     // 11
+    print_int(route)                        // 28
+}                                            // the whole arena is gone, in O(1)
+```
+
+::: {.program-output}
+```
+28
+16
+```
+:::
+
+## Where next
+
+Every program above compiles identically under the Rust reference and the
+self-hosted compiler — that is the corpus discipline the whole project runs
+on. Back to the [overview](index.qmd).

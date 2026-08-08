@@ -1,0 +1,129 @@
+---
+title: "Jestyr"
+---
+
+Jestyr is a from-scratch systems language built to answer one question:
+**how much of Rust-grade memory safety and C-grade performance survives
+dropping lifetimes entirely?**
+
+Its answer is a tiered reference model — second-class borrows that
+provably cannot outlive their frame, generation-checked references that
+turn use-after-free into a deterministic fault, and scope-bounded
+`region` allocation — validated at real scale: the compiler is written
+in Jestyr and compiles itself. Two independent implementations of the
+same compiler — a ~52,000-line Rust reference and a 29,818-line
+self-hosted Jestyr port — are held byte-identical in their C output over
+a 148-file corpus, and a committed bootstrap seed builds the whole
+toolchain with nothing but a C compiler.
+
+This is a research release (`v0.1.0-research`), not a production tool.
+See [Research](research.qmd) for what is and isn't claimed.
+
+## Try it in two commands (no Rust required)
+
+The repository commits the compiler's own C output for its own source.
+Build it, then watch it regenerate that seed byte-for-byte:
+
+```bash
+gcc -O2 -std=c11 -ffp-contract=off -fno-fast-math -o jc bootstrap/jestyr_seed.c
+```
+
+```bash
+./jc bootstrap/jestyr_flat.jtr > regen.c && diff regen.c bootstrap/jestyr_seed.c
+```
+
+::: {.program-output}
+(empty diff)
+:::
+
+An empty diff is the self-hosting fixed point: the compiler you just
+built from the seed reproduces the seed, byte for byte. Cold clone to
+working compiler takes roughly 21–30 seconds on a laptop. From there,
+`./jc examples/hello.jtr run` compiles and runs a program. On
+Windows/MinGW add `-Wl,--stack,67108864` to the gcc line; details in
+[Get started](get-started.qmd).
+
+## The language, briefly
+
+```{.rust}
+fn main() {
+    let xs = List(i32).new(system)   // allocator is a VALUE you pass
+    xs.push(10)
+    for xs read x { print(x) }       // borrow, provably frame-bounded
+}                                     // RAII drop, no lifetimes anywhere
+```
+
+Values are owned and moved. Borrows (`read`/`mut`) are second-class —
+they can be passed down but never stored or returned, so the escape
+checker's guarantee is structural, not inferred. Data structures that
+need stored references get generation-checked `genref`s or `region`
+arenas whose escapes are compile errors. Errors are checked sets with
+stack-only payloads. Cost models are attributes the compiler enforces:
+serializing a `par for` under `@span` is a compile error, `@simd` is a
+checked legality claim, `@deterministic` rejects non-deterministic
+reductions. The full walk-through is in the [Tour](tour.qmd).
+
+## The claims, precisely scoped
+
+Every headline claim on this site states its scope and the command that
+verifies it. These are the four that matter.
+
+::: {.claim}
+**Dual-implementation byte-identity.** The ~52K-line Rust reference and
+the self-hosted Jestyr port emit byte-identical C over the 148-file
+corpus, the concatenated self-hosting build, and the compiler's own
+source. *Scope:* the single-file / concatenated emission path — the path
+the corpus, the fixed point, and the seed all use. The module-loader
+path has three known, documented divergences, pinned by their own test.
+<span class="verify">$ cargo test --features c-oracle,selfhost-fixpoint</span>
+:::
+
+::: {.claim}
+**The self-hosting fixed point.** The Jestyr-written compiler (29,818
+lines of Jestyr, 162 `unsafe` mentions — 0.5% of lines), compiled by
+itself, reproduces its own C output exactly: jc2 ≡ jc1. *Scope:*
+verified on Windows and on Ubuntu CI; the gcc-only two-command demo
+above is the same check without Rust.
+<span class="verify">$ ./jc bootstrap/jestyr_flat.jtr > regen.c && diff regen.c bootstrap/jestyr_seed.c</span>
+:::
+
+::: {.claim}
+**Cross-OS determinism.** A purified SHA-256 canary — integer ops plus
+Jestyr's own float formatter, SIMD lane width included — produces the
+digest `4389bf83…` identically on Windows 11 + MinGW gcc and Ubuntu
+24.04 + gcc 13.3.0: two OSes, two libcs, one digest, re-checked by CI on
+every push. `pi.jtr`: 20 consecutive runs, 20 identical outputs.
+*Scope:* those two platforms; macOS/clang is untested.
+<span class="verify">$ cargo test --features c-oracle determinism</span>
+:::
+
+::: {.claim}
+**Speed parity with hand-written C.** Twin programs with byte-identical
+output, medians: fib(40) 0.984×, numeric kernel ~1.0×, sieve 0.91×,
+matmul 0.96×, wordcount 1.37× (Jestyr's strmap beats
+`std::unordered_map`); honest loss on parallel sum at 0.60× (par-for
+machinery vs hand-tuned threading — a named optimization target).
+*Scope:* one machine (Windows 11, gcc/g++ 8.3, -O2, medians); correctness is
+cross-platform via CI, timings are local. Full tables and methodology in
+[Performance](performance.qmd).
+<span class="verify">$ cargo test --features c-oracle cpp_compare</span>
+:::
+
+Behind these sit 916 green default tests, the full C-oracle ladder, and
+a CI matrix (Ubuntu + Windows) that runs the corpus goldens, the
+bootstrap job, and the determinism canary on every push.
+
+## Where to go next
+
+- [Get started](get-started.qmd) — the bootstrap in detail, and the full
+  verification ladder from `cargo test` to the fixed point.
+- [Tour](tour.qmd) — the language: ownership without lifetimes, error
+  sets, checked attributes, comptime.
+- [Safety](safety.qmd) — the tiered reference model and exactly what the
+  escape checker guarantees.
+- [Performance](performance.qmd) — the twin-program benchmark suite,
+  including the losses.
+- [Determinism](determinism.qmd) — the floating-point contract and the
+  cross-OS canary.
+- [Research](research.qmd) — the technical report, the contributions
+  ranked, and the project's scope.

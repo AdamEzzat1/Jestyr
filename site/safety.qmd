@@ -1,0 +1,230 @@
+---
+title: "Safety without lifetimes"
+---
+
+Jestyr's memory safety is a mosaic, not a monolith. Four tiers, each with a
+precise promise and a named enforcer. You pick the tier per data structure, and
+the compiler holds you to it. There are no lifetime annotations anywhere in the
+language — not because inference got smarter, but because the design removed
+the thing annotations describe.
+
+| Tier | Promise | Enforced by |
+|---|---|---|
+| values + second-class borrows | a borrow cannot outlive its frame | compile error (escape checker) |
+| `genref` (`&T`) | use-after-free is a deterministic runtime fault, never UB | generation check on every deref |
+| `region` (`&[r]T`) | zero-cost refs confined to their arena's scope | compile error |
+| `unsafe` | nothing checked — a written contract you sign lexically | required block; uncovered raw-pointer ops are compile errors |
+
+## Tier 1: values, and borrows that only flow down
+
+The default is ownership by value: moves transfer, and scope exit runs RAII
+drops — recursively, into owned struct fields and live enum payloads
+(`examples/drop_nested.jtr`).
+
+References are **second-class borrows**: parameter conventions `read`, `mut`,
+and `out`. A borrow can be passed further down the call stack, but it cannot be
+returned by value, stored, or given away. That single restriction is the whole
+trick. Rust proves "this reference outlives that one" with named lifetimes;
+Jestyr makes the question unaskable — a callee's frame always ends before its
+caller's, so a borrow that only flows down is valid by the call stack's own
+discipline. There is nothing left to infer, so there is nothing to annotate.
+
+The escape checker walks every function body and refuses exactly four escape
+routes — the only ways a value leaves a frame:
+
+```{.rust}
+struct Node   { value: i32 }
+struct Holder { inner: i32 }
+
+// ✗ route 1 — return: the borrow would outlive the call
+fn leak(read p: Node) -> Node {
+    p
+}
+
+// ✗ route 2 — capture: stored in a struct value that may outlive the frame
+fn capture(read p: Node) -> Holder {
+    Holder{ inner: p }
+}
+
+// ✗ route 3 — store: written into caller-owned storage
+fn stash(read p: Node, mut h: Holder) {
+    h.inner = p
+}
+
+// route 4 — give-away: passing a borrow to a `take` (owning) parameter,
+// which is how `vec.push(borrow)` is caught (examples/collection.jtr).
+
+// ✓ flowing DOWN is always safe — the callee's frame is strictly inner
+fn ok_forward(read p: Node) {
+    consume(p)
+}
+
+// ✓ and a signature may opt into handing a borrow back out
+fn ok_borrow_out(read p: Node) -> read Node {
+    p
+}
+```
+
+The compiler's actual output on that file:
+
+::: {.program-output}
+```
+error: cannot return borrow `p`: a second-class `read`/`mut`/`out` borrow may
+       not outlive its call (pass it further down, or declare the return as
+       `read`/`mut`/`out`)
+  --> examples/escapes.jtr:11:5
+
+error: cannot store borrow `p` in struct `Holder`: a second-class borrow may
+       not outlive its call
+  --> examples/escapes.jtr:16:20
+   = help: a stored value must outlive the call: pass it as `take` to transfer
+     ownership, allocate it in a `region` if it must outlive this frame, or
+     store a `genref` handle instead of a borrow
+
+error: cannot store borrow `p` into borrowed storage: it would outlive its call
+  --> examples/escapes.jtr:21:5
+
+3 error(s)
+```
+:::
+
+Note what the help text does: each rejection names the tier that solves the
+problem legitimately. That is the mosaic working as a system.
+
+::: {.claim}
+**For every program the checker accepts, no second-class borrow is usable
+after the frame that introduced it has returned.** Scope: checked code and
+second-class borrows; lifetime safety, not aliasing races (`mut` borrows are
+exclusive by convention, and shared-memory concurrency goes through `Mutex`
+and channels). Precise statement and the exhaustiveness argument:
+[docs/escape-guarantee.md](https://github.com/AdamEzzat1/Jestyr/blob/master/docs/escape-guarantee.md).
+<span class="verify">$ jestyrc check examples/escapes.jtr</span>
+:::
+
+## Tier 2: genref — storable handles, checked derefs
+
+Borrows can't build a graph or a cache: those need references that *outlive
+frames*. That is `genref` (`&T`): a copyable, storable `{ptr, generation}`
+pair. Each allocation carries a generation; the reference snapshots it; every
+deref compares the snapshot against the live generation.
+
+```{.rust}
+var r: &i32 = gen_new(i32, 42)
+print_int(r.*)        // generation matches → safe deref
+gen_free(r)           // bumps the generation
+print_int(r.*)        // faults, deterministically — never UB
+```
+
+The promise is deliberately weaker than tier 1 and deliberately stronger than
+a raw pointer: use-after-free is not prevented at compile time, but it is a
+**deterministic runtime fault** — never a silent read of freed memory, never
+undefined behaviour for gcc to optimize around.
+
+## Tier 3: region — zero-cost arena refs
+
+The zero-cost tier. A `region r { … }` block owns a bump arena;
+`region_alloc(r, T, v)` returns a `&[r]T` — a plain pointer with **no
+per-deref check**. Safety is lexical instead: a `&[r]T` cannot leave the
+region's scope, and the whole arena is freed in O(1) at the closing brace.
+
+```{.rust}
+region r {
+    var a: &[r]i32 = region_alloc(r, i32, 10)
+    print_int(a.*)    // raw deref — zero runtime cost
+}                     // whole arena freed here, at once
+```
+
+Escaping is a compile error, with the same tier-aware help:
+
+::: {.program-output}
+```
+error: cannot return region-allocated value `g`: it is owned by its `region`
+       arena and does not outlive it (copy it into an owned `String` to
+       return it)
+  --> examples/region_escape.jtr:14:16
+```
+:::
+
+::: {.claim}
+A `&[r]T` cannot leave its region's scope; the demo file is refused with two
+errors. Scope: compile-time rejection, both toolchains.
+<span class="verify">$ jestyrc check examples/region_escape.jtr</span>
+:::
+
+## Tier 4: unsafe — enforced, and written down
+
+Raw pointers (`*mut T`, `*const T`) exist for what remains: FFI, MMIO,
+allocator internals, and the disjoint-write sharing pattern behind
+`par_binned_sum`. And `unsafe` is **fully enforced**: dereferencing,
+doing arithmetic on, or manufacturing a raw pointer outside an `unsafe` block
+is a compile error — on the Rust reference *and* the self-hosted compiler.
+This wasn't always true; the enforcement ladder (report → contract →
+migration → warn → error) was staged so that flipping to error broke nothing:
+the corpus was migrated to zero uncovered sites first, out of an original
+census of 171 raw-pointer sites.
+
+What `unsafe` buys is not a free-for-all but a *lexical obligation*: the
+[written contract](https://github.com/AdamEzzat1/Jestyr/blob/master/docs/unsafe-contract.md) specifies deref validity,
+pointer provenance (including the int-to-pointer MMIO door and `@volatile`),
+the aliasing assumptions the block must preserve, the C-interop boundary, and
+the rule that a sound block restores every invariant it suspends by its
+closing brace. `jestyrc unsafe <file>` reports every raw-pointer operation
+and whether a block covers it.
+
+::: {.claim}
+Uncovered raw-pointer operations are compile errors on both toolchains; the
+report tool and the diagnostic share one collector, so they cannot drift.
+Scope: raw deref, raw arithmetic, and int-to-pointer casts.
+<span class="verify">$ jestyrc unsafe examples/std/cgen.jtr</span>
+:::
+
+## Does it hold up at scale?
+
+The compiler is written in Jestyr, so the discipline is tested against the
+largest program the language has: **the self-hosted compiler plus its stdlib
+is 29,818 lines of Jestyr containing 162 mentions of `unsafe` — 0.5%.** The
+two biggest modules make the shape concrete: `cgen.jtr` is 14,499 lines with
+5 unsafe sites; `typeck.jtr` is 2,859 lines with 3. The flattened compiler
+passes the escape checker with zero diagnostics and self-hosts to a
+byte-identical fixed point.
+
+The safe tiers are not the slow path, either. `heavy_wordcount` — 10 million
+words hashed into `std/strmap.jtr`, a map written in Jestyr itself — runs at
+1.37× the speed of its `std::unordered_map` C++ twin (one machine: Windows 11,
+gcc/g++ 8.3, -O2, medians; byte-identical outputs; timings are local, see
+[Performance](performance.qmd)). The benchmark program contains **zero**
+`unsafe` blocks; the map's nine unsafe sites live inside `std/strmap.jtr`,
+behind a checked API.
+
+There is also a quieter argument. The bootstrap seed is compiled by two
+different C compilers on two operating systems — MinGW gcc on Windows and gcc
+13.3.0 on Ubuntu 24.04 — and the resulting compilers re-emit the compiler
+byte-for-byte and agree on the determinism canary digest (`4389bf83…`),
+pinned by CI on every push. Undefined behaviour is precisely the license for
+two compilers to diverge; across ~30K lines of exercised Jestyr, they don't.
+That is meaningful evidence against latent UB on the exercised paths — and
+only that: UB can hide on untaken paths or coincide across platforms, and
+macOS/clang is untested.
+
+::: {.claim}
+916 default tests green, a 148-file byte-identical corpus, and the gcc-only
+bootstrap fixed point — verified on Windows and Ubuntu CI. Scope: byte-identity
+is the single-file/concat emission path; correctness is cross-platform via CI,
+timings are one machine.
+<span class="verify">$ cargo test --features c-oracle,selfhost-fixpoint</span>
+:::
+
+## Honest scope
+
+The escape guarantee is a precise claim with an informal exhaustiveness
+argument, validated empirically at compiler scale — it is **not a mechanized
+proof**. A formalization is future work, and
+[docs/escape-guarantee.md](https://github.com/AdamEzzat1/Jestyr/blob/master/docs/escape-guarantee.md) states exactly the
+theorem it would prove, alongside what the claim does not cover: `genref`
+faults at runtime rather than compile time, `region` and `unsafe` make their
+own explicit promises, and the guarantee is about lifetimes, not data races.
+The rejection demos (`examples/escapes.jtr`, `examples/collection.jtr`,
+`examples/region_escape.jtr`) keep every route firing, in the test suite, on
+every push.
+
+Next: see the tiers in running code in the [Tour](tour.qmd).

@@ -1,0 +1,161 @@
+---
+title: "Performance"
+---
+
+Every benchmark on this page is a **twin program**: the same algorithm written
+twice, once in Jestyr and once in straightforward C or C++17, with identical
+traversal order, identical checksums, and one hard rule — **both binaries must
+print byte-identical output**. If the outputs differ by one byte, the pair is
+disqualified. That rule is what makes the ratios trustworthy, including the bad
+one at the bottom of the table. You are never comparing a program against a
+subtly different program.
+
+::: {.claim}
+All benchmark pairs print byte-identical output, so every ratio compares the
+same verified computation — including the parallel pair, whose Jestyr answer is
+schedule-independent by construction and cross-checked against its own serial
+pass in-program.
+<span class="verify">$ cargo run --release -- run examples/cpp_compare/heavy_sieve.jtr</span>
+:::
+
+The sources live in [`examples/cpp_compare/`](https://github.com/AdamEzzat1/Jestyr/tree/master/examples/cpp_compare)
+alongside a README that states every caveat these tables inherit.
+
+## Scope, first
+
+Read the numbers with this frame or not at all:
+
+- **One machine, one compiler.** Windows 11, gcc/g++ 8.3, `-O2`, medians of 7
+  runs. Correctness is cross-platform — CI runs the full test ladder and the
+  determinism canary on Ubuntu 24.04 with gcc 13.3 — but the *timings* are
+  local. Measure on your machine before quoting them.
+- **Single-digit percentages are code-layout noise.** They move between
+  sessions, in both directions. The tables mark the ranges where we observed
+  them.
+- **The hot loops use Jestyr's raw-pointer idiom** (`unsafe` reads/writes over
+  a flat buffer), matching what the C side does. The checked tiers — slice
+  indexing with live bounds asserts, contracts, error unions — are a dial, not
+  a mandate. Turn them on and you pay for exactly what they check; the
+  `numeric_kernel` pair below runs *with* the checks on and still holds parity.
+
+## Demonstration tier
+
+Small programs, small enough to hold both versions in your head. The `fib`
+pairs are twinned against hand-written C, `numeric_kernel` against C++17.
+
+| pair | workload | jestyr speed vs twin |
+|---|---|---|
+| `fib(40)` | naive recursion, call overhead | 0.984× |
+| `fib(45)` | same, deeper | 1.17–1.22× (layout noise, favoring Jestyr this session) |
+| `numeric_kernel` | tight integer loops over two contiguous buffers, bounds checks **live** | ~1.0× |
+
+`fib` swings past 1.0× not because Jestyr is faster than C — it emits C — but
+because at this scale, code layout decides more than the source language does.
+That is the honest reading of every single-digit delta on this page, in both
+directions.
+
+`numeric_kernel` deserves one asymmetry note: the Jestyr side is doing
+strictly more work. `xs[i]` lowers to a bounds-checked access and the locked
+flags do not include `-DNDEBUG`, so the checks are live at `-O2`. The compiler
+elides them where the loop bound proves the index (the fill loop carries no
+asserts in the emitted C) and keeps them where it cannot (the stencil's
+`i - 1` / `i + 1` defeat the proof). Against idiomatic
+`std::vector<int64_t>` the checked Jestyr build is at parity; against a
+deliberately de-idiomized C++ variant (`new int64_t[n]`, no
+value-initialization) C++ moves about 15% ahead. That 15% is the measured price
+of live bounds checks on this kernel: not free, cheap enough that idiomatic
+C++ does not beat them.
+
+## Heavy tier
+
+The `heavy_*` pairs keep the same twin discipline on workloads big enough for
+timing to mean something.
+
+| pair | workload | shape it stresses |
+|---|---|---|
+| `heavy_sieve` | Sieve of Eratosthenes to 50,000,000 (~50 MB of flags) | memory-bound, branchy, strided writes |
+| `heavy_matmul` | naive 768×768 f64 multiply (~453M mul-adds), exact integer checksum | floating-point compute |
+| `heavy_wordcount` | 10,000,000 LCG-drawn words into a hash map | allocation + hashing |
+| `heavy_parsum` | parallel sum of squares over 20,000,000 i64 (~160 MB) | threaded reduction |
+
+Medians of 7 runs, same machine and flags as above:
+
+| pair | jestyr | c++ | jestyr speed |
+|---|---|---|---|
+| `heavy_sieve` | 0.505 s | 0.458 s | 0.91× (0.9–1.2× across sessions) |
+| `heavy_matmul` | 0.210 s | 0.202 s | 0.96× |
+| `heavy_wordcount` | 0.274 s | 0.376 s | **1.37×** |
+| `heavy_parsum` | 0.145 s | 0.087 s | **0.60×** |
+
+::: {.claim}
+Heavy-tier medians, one machine (Windows 11, gcc/g++ 8.3, `-O2`, medians of 7):
+sieve 0.91×, matmul 0.96×, wordcount 1.37×, parsum 0.60× — all four pairs
+byte-identical in output.
+<span class="verify">$ cargo run --release -- build examples/cpp_compare/heavy_matmul.jtr</span>
+:::
+
+## Three findings
+
+**1. Sequential code is at parity.** Sieve, matmul, and the serial halves of
+every pair land within single digits of the C++ twin, with the deltas pointing
+both ways across sessions. That is what you expect from a language that lowers
+to C and hands `-O2` the final say: the deltas are code layout, not language
+tax.
+
+**2. Design decides the outliers — in both directions.** The wordcount win is
+not a compiler trick. Jestyr's `std/strmap` is an open-addressing table with no
+per-node allocation, written in Jestyr itself; `std::unordered_map` is
+node-based because its ABI froze that way in 2011 and cannot change. A
+standard library young enough to pick the right data structure beats a
+standard library that is not allowed to — 1.37× on ten million insertions.
+
+**3. The loss is named, scoped, and owned.** `heavy_parsum` is 0.60×: the
+general `par for … reduce` lowering costs real overhead against hand-tuned
+fixed-chunk `std::thread` code at this size. The serial halves of the same
+pair match at parity, so this is lowering overhead, not a semantics cost, and
+it is the compiler's named optimization target. What the Jestyr side buys for
+that overhead is one line —
+
+```{.rust}
+var total = 0
+par for x in xs reduce(sum) {
+    total += x * x
+}
+```
+
+— against a page of chunking, spawning, per-thread partials, and a join, plus
+a guarantee the C++ version cannot state: the reduction is
+declared-deterministic, so the answer cannot depend on the thread schedule,
+and swapping the element type to one where `+` stops being associative is a
+compile error instead of a silent wrong answer.
+
+## The one-sentence claim
+
+::: {.claim}
+On these workloads, on this machine, Jestyr's checked-off hot-loop idiom runs
+within noise of hand-written C and C++, wins where its standard library made a
+better structural choice, and loses 1.7× on one parallel lowering it has not
+optimized yet — with every comparison pinned by byte-identical output.
+<span class="verify">$ g++ -O2 -std=c++17 -pthread -o parsum_cpp examples/cpp_compare/heavy_parsum.cpp && ./parsum_cpp</span>
+:::
+
+That is the claim in full. No geometric means over the table, no "up to"
+framing. Two measurement notes if you rerun it: discard the first run of each
+binary (a cold first touch of hundreds of MB dominates everything else), and
+alternate which binary goes first, or the ordering silently decides the
+winner.
+
+## What this page does not claim
+
+- Nothing here is cross-platform *timing* evidence. The determinism digest is
+  verified on Windows/MinGW-gcc and Ubuntu 24.04/gcc 13.3 by CI on every push;
+  macOS and clang are untested. Speed numbers are one machine.
+- Nothing here compares against tuned SIMD kernels, BLAS, or a profiled C++
+  hash map. The C++ twins are straightforward C++17, the way a working
+  engineer writes it — that is the comparison a new language actually faces.
+- Byte-identity of *emitted C* (the compiler's own guarantee) is a separate,
+  stronger property scoped to the single-file and concatenated emission paths;
+  see [Determinism](determinism.qmd). This page only needs the weaker,
+  per-program form: twin outputs match.
+
+Continue with the [Tour](tour.qmd) to see the language behind the numbers.

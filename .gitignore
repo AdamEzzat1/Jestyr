@@ -12,3 +12,7 @@ examples/std/*.c
 examples/std/*.exe
 examples/cpp_compare/*.c
 examples/cpp_compare/*.exe
+
+# Quarto site build output
+site/_site/
+site/.quarto/

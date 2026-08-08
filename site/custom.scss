@@ -1,0 +1,42 @@
+/*-- scss:defaults --*/
+// Jestyr brand: the carousel's orange on clean white, dark code panels.
+$primary: #f76923;
+$link-color: #d4551a;
+$navbar-bg: #17171a;
+$code-block-bg: #1b1e24;
+$code-block-color: #dee2e8;
+$font-family-monospace: Consolas, "Cascadia Code", ui-monospace, monospace;
+
+/*-- scss:rules --*/
+.navbar-brand { font-weight: 700; letter-spacing: 0.5px; }
+
+// The claim card: every headline claim renders with its scope + verify command.
+.claim {
+  border-left: 5px solid $primary;
+  background: #f4f4f4;
+  padding: 0.9rem 1.1rem;
+  margin: 1.2rem 0;
+  border-radius: 0 6px 6px 0;
+}
+.claim .verify {
+  font-family: $font-family-monospace;
+  font-size: 0.85em;
+  color: #555;
+  display: block;
+  margin-top: 0.5rem;
+}
+
+pre { border-radius: 8px; }
+
+// Output blocks under code samples.
+.program-output {
+  background: #101216;
+  color: #78dc8c;
+  font-family: $font-family-monospace;
+  padding: 0.7rem 1rem;
+  border-radius: 8px;
+  margin-top: -0.4rem;
+  margin-bottom: 1.2rem;
+  white-space: pre;
+  font-size: 0.9em;
+}

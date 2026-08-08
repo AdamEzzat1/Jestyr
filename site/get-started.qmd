@@ -1,0 +1,163 @@
+---
+title: "Get started"
+---
+
+There are two ways to run Jestyr. The fast one needs only a C compiler.
+The full one needs a Rust toolchain and gives you the reference compiler
+plus the entire test suite. Both are built from the same repository.
+
+::: {.claim}
+Building Jestyr from scratch requires only gcc — no Rust. The committed
+bootstrap seed builds a working compiler in about 21–30 seconds cold,
+and that compiler reproduces the seed byte-for-byte. Verified on Windows
+(MinGW) and Ubuntu CI.
+<span class="verify">$ gcc -O2 -std=c11 -ffp-contract=off -fno-fast-math -o jc bootstrap/jestyr_seed.c</span>
+:::
+
+## Path 1: gcc only (no Rust)
+
+The repository commits the compiler's own C output for its own source —
+the *bootstrap seed*. Compile that C file and you have `jc`, the
+self-hosted Jestyr compiler.
+
+### Get the code
+
+```bash
+git clone https://github.com/AdamEzzat1/Jestyr.git
+cd Jestyr
+```
+
+No git? GitHub's **Download ZIP** works just as well — the bootstrap
+needs nothing but the files.
+
+### Build the compiler
+
+Linux (and other POSIX systems):
+
+```bash
+gcc -O2 -std=c11 -ffp-contract=off -fno-fast-math -o jc bootstrap/jestyr_seed.c
+```
+
+Windows (MinGW) — add stack headroom for the compiler's per-expression
+recursion:
+
+```bash
+gcc -O2 -std=c11 -ffp-contract=off -fno-fast-math -Wl,--stack,67108864 -o jc.exe bootstrap/jestyr_seed.c
+```
+
+The `-ffp-contract=off -fno-fast-math` flags are part of the language's
+floating-point determinism contract, not a suggestion — the compiler
+locks the same flags when it drives gcc itself.
+
+### Verify the fixed point
+
+The compiler you just built must emit its own seed back, byte-for-byte:
+
+```bash
+./jc bootstrap/jestyr_flat.jtr > regen.c && diff regen.c bootstrap/jestyr_seed.c
+```
+
+An empty diff is the self-hosting fixed point. On Windows the shell
+redirect writes CRLF line endings; compare with a newline-normalizing
+diff (for example `git diff --no-index --ignore-cr-at-eol`).
+
+### Use it
+
+```bash
+./jc examples/hello.jtr run
+```
+
+::: {.program-output}
+Hello from Jestyr — compiled through C to a native binary!
+:::
+
+`jc` takes a file and a subcommand:
+
+| Command | What it does |
+|---|---|
+| `jc file.jtr` | emit C on stdout |
+| `jc file.jtr build` | compile to a native binary via gcc (escape-checked, diagnostics on stderr) |
+| `jc file.jtr run` | build, then execute |
+| `jc file.jtr test [substr]` | run the `@test`/`@bench` harness; `list [substr]` shows names without compiling |
+| `jc file.jtr doc` | render the file's API docs as Markdown, including a Guarantees block reconstructed from proved contracts |
+| `jc file.jtr attest` | emit the attestation manifest: SHA-256 of the emitted C, the locked compile command, every item's signature and machine-checked guarantees |
+| `jc old.manifest attest-diff new.manifest` | classify each API change breaking or compatible (non-zero exit on breakage — a CI gate) |
+| `jc file.jtr attest-verify old.manifest` | the same check against a fresh render |
+
+The driver adapts to its host. On POSIX it probes for `cc`, `gcc`, then
+`clang`, and runs the output as `./name`. On Windows it uses MinGW gcc
+and names the output `name.exe`.
+
+**Windows path note:** pass files with backslashes —
+`jc examples\hello.jtr run` — because `run` hands the produced exe path
+to `cmd.exe`, which rejects forward slashes in command position.
+
+## Path 2: the Rust reference compiler
+
+The ~52,000-line Rust reference (`jestyrc`) is the specification-by-
+implementation that the self-hosted port is held byte-identical against.
+You want it for the test suite, the analysis subcommands, and hacking on
+the compiler itself.
+
+```bash
+cargo run -- run examples/hello.jtr
+```
+
+```bash
+cargo run -- check examples/hello.jtr
+```
+
+Or build once and use the binary directly:
+
+```bash
+cargo build --release
+./target/release/jestyrc run examples/hello.jtr
+```
+
+`jestyrc` has the same core verbs as `jc` (`check`, `emit-c`, `build`,
+`run`, `test`, `doc`, `attest`) plus analysis-only reports the port does
+not carry: `layout` (sizes, offsets, padding waste), `unsafe` (every
+raw-pointer operation and its covering block), `obligations` (what a
+`@verified` build would have to prove), `errsets`, `simd`, and `tokens`.
+The usage block at the top of `src/main.rs` is the authoritative list.
+
+## The verification ladder
+
+Every claim on this site maps to a command. The ladder runs from free to
+thorough; CI runs rungs 1–3 on Ubuntu and Windows on every push.
+
+| Rung | Command | Needs | ~Time | What it proves |
+|---|---|---|---|---|
+| 1 | `cargo test` | Rust only | ~35 s | the full default suite — 916 tests: per-stage units, property tests (including `compilation_is_deterministic` — byte-identical emission), fuzz smoke, corpus sweeps |
+| 2 | `cargo test --features c-oracle` | + gcc/cc/clang on PATH | minutes | the emitted C compiles and runs: every demo through a real C compiler with output asserts, plus the locked SHA-256 determinism canary (`4389bf83…`) |
+| 3 | `cargo test --features c-oracle,selfhost-fixpoint` | same | ~10 min | the self-hosting evidence: the 148-file corpus byte-identical between the Rust reference and the Jestyr port, the concatenated build, `selfhost_fixpoint_full` (jc2 ≡ jc1 over the compiler's own ~25K lines), and the seed drift guard `bootstrap_seed_is_current` |
+| 4 | the two commands above | gcc only, no Rust | ~30 s | the gcc-only bootstrap: the committed seed builds a compiler that reproduces the seed exactly, then compiles and runs programs |
+
+Scope notes, stated once and honestly:
+
+- **Byte-identity** (rung 3) holds on the single-file / concatenated
+  emission path — the path the corpus, the fixed point, and the seed all
+  use. The module-loader path has three known, documented divergences,
+  pinned by their own test.
+- **Determinism** (rung 2's canary) is verified identical on Windows +
+  MinGW gcc and Ubuntu 24.04 + gcc 13.3 — two OSes, two libcs, one
+  digest, re-checked by CI every push. macOS/clang is untested.
+- Rungs 2–3 are opt-in features precisely so rung 1 stays
+  toolchain-free.
+
+::: {.claim}
+916 default tests pass in ~35 s with no C toolchain installed; the full
+ladder through the self-hosting fixed point takes about 10 minutes.
+<span class="verify">$ cargo test --features c-oracle,selfhost-fixpoint</span>
+:::
+
+## Where next
+
+- [Tour](tour.qmd) — the language itself: ownership without lifetimes,
+  error sets with payloads, checked cost models.
+- [Research](research.qmd) — the full claim ledger with scopes
+  and commands.
+- [Performance](performance.qmd) — byte-identical-output twin programs
+  against hand-written C (one machine, medians, losses included).
+- `docs/TESTING.md` in the repository — the ladder in full, plus the
+  house pattern for writing tests.

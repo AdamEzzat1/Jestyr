@@ -1,0 +1,197 @@
+---
+title: "Determinism"
+---
+
+Jestyr's central promise: the same source produces the same bits, on every run
+and on every supported platform. Not "usually the same." The same.
+
+This page states the contract precisely, shows how each piece is enforced, and
+gives the commands that prove it. Scope is stated with every claim — determinism
+here is verified on Windows + gcc (MinGW/msvcrt) and Ubuntu 24.04 + gcc 13.3
+(glibc). macOS/clang is untested.
+
+::: {.claim}
+**One digest, two operating systems, two libcs.** The determinism canary — a
+program exercising the entire numeric stack — hashes to
+`4389bf83…` on Windows 11 + MinGW gcc and on Ubuntu 24.04 + gcc 13.3.0.
+CI re-checks the digest on every push. macOS/clang is untested.
+<span class="verify">$ cargo test --features c-oracle</span>
+:::
+
+## Why determinism is hard for a language that emits C
+
+Jestyr compiles to C and builds it with gcc. That means the language does not
+inherently control floating-point behavior:
+
+- `a*b+c` can fuse into an FMA, which rounds once instead of twice — a
+  different result on hardware that fuses versus hardware that doesn't;
+- `-ffast-math` would license reassociation, so `(a+b)+c` and `a+(b+c)` become
+  interchangeable — and they are not the same value in floating point;
+- libc's `printf("%g")` formats floats differently across implementations, so
+  even a correct computation can *print* differently;
+- parallel reductions sum partial results in whatever order threads finish.
+
+Any one of these breaks bit-identical output. The contract closes all of them,
+at compile time where possible, by construction where flags can't reach.
+
+## Part 1: locked compile flags
+
+Every translation unit `jestyrc` builds gets the same flags:
+
+```bash
+-O2 -std=c11 -ffp-contract=off -fno-fast-math
+```
+
+`-ffp-contract=off` forbids FMA fusion. `-fno-fast-math` forbids reassociation
+and other value-changing "optimizations." The flag set is asserted by a test
+(`fp_determinism_flags_are_locked`) that fails if anyone removes a flag, so the
+invariant is part of the test suite, not a convention.
+
+**Scope:** the flags ride the `jestyrc` build path. If you `emit-c` and compile
+the output yourself without them, the guarantee does not follow you. x86-64
+(SSE) is the verified target; legacy 32-bit x87 extended precision is
+unaddressed.
+
+## Part 2: deterministic by construction
+
+Flags stop the compiler from changing your arithmetic. The standard library
+goes further: its numeric primitives are designed so that evaluation order
+cannot matter in the first place.
+
+- **`parse_float`** — Eisel–Lemire fast path plus a division-free big-integer
+  slow path. Correctly rounded for *any* digit count, not just the easy cases.
+- **`format_float`** — Dragon4 shortest round-trip, correctly rounded,
+  locale-free. Jestyr programs never need libc's `%g`, so output formatting is
+  identical everywhere by construction.
+- **Binned superaccumulator** — sums floats into integer exponent bins with
+  add-time carry and a correctly-rounded finalize. The result is invariant to
+  chunk size and thread count because the accumulation is exact until the final
+  rounding.
+- **`par_binned_sum`** — a parallel reduction that is bit-identical to its
+  serial counterpart, built on the superaccumulator. The escape checker forbids
+  `mut`-slice spawn parameters, so the safe subset is race-free by rule, not by
+  review.
+
+Each primitive carries property tests (`proptests::lemire`,
+`proptests::dragon`, `core_props::binned_*`) in the 916-test default suite.
+
+## Part 3: the compiler rejects non-determinism
+
+Determinism is not just a library discipline — the type system enforces it.
+
+**`@deterministic` certifies schedule independence.** Inside a
+`@deterministic` function, the raw concurrency primitives whose results can
+depend on the thread schedule — `concurrent`/`spawn` and the `atomic_*`
+operations — are compile errors. The only parallelism allowed is the checked
+deterministic reduction:
+
+```{.rust}
+@deterministic fn sum_of_squares(read s: []i64) -> i64 {
+    return par for x in s reduce(core.sum_reduction()) { x * x }
+}
+```
+
+**`par for … reduce(r)` accepts only declared-deterministic reduction
+constructors.** A reduction whose result depends on combination order (say,
+non-associative float addition folded pairwise in thread-completion order) is
+rejected at compile time. You cannot accidentally write a parallel loop whose
+answer varies run to run.
+
+**`@span` makes parallel depth a checked part of the signature.** Declare
+`@span(log)` on a parallel reduction and `@span(linear)` on its serial
+reference:
+
+```{.rust}
+@span(log)    fn par_sum(read s: []i64)    -> i64 { ... }
+@span(linear) fn serial_sum(read s: []i64) -> i64 { ... }
+```
+
+If a refactor quietly serializes the `par for` into a `for`, the declared
+`@span(log)` no longer holds and the compiler names the cause. Performance
+shape is part of the contract, not a comment.
+
+## The proof: a purified SHA-256 canary
+
+Claims need a falsifier. Jestyr's is a single dedicated program,
+`examples/std/numerics_canary.jtr`, that exercises the whole numeric stack —
+bit primitives, serial and parallel reductions, the binned superaccumulator,
+parse and format — through the real `jestyrc run` pipeline. Its complete output
+is hashed with a dependency-free, self-tested SHA-256, and the digest is locked
+in the test suite:
+
+```
+4389bf8328ae7e018ebf0fb6ca4f94dd95f65eb7fb24568e55b1170b809868bc
+```
+
+Three properties make this canary trustworthy:
+
+1. **Purified output.** The demo prints only integers and `format_float`
+   strings — nothing through `printf("%g")`. So a digest mismatch can *only*
+   mean a genuine determinism break, never a libc formatting difference. Float
+   results are pinned by their formatted value, not by pass/fail flags, so the
+   canary stays sensitive to single-ULP drift.
+2. **SIMD lane width is pinned.** The demo carries two `@simd` loops — 8 `i32`
+   lanes over 23 elements, leaving a 7-element scalar remainder — and their
+   realized values enter the hash. A vector lowering that stopped agreeing with
+   the scalar path flips the digest.
+3. **Mutation-verified.** Changing a single parsed value in the demo moves the
+   digest and trips a companion token assertion. The canary detects what it
+   claims to detect.
+
+::: {.claim}
+**The digest is re-verified on every push.** CI runs the canary on
+Ubuntu 24.04 + gcc 13.3.0 alongside the Windows development runs. Same source,
+two OSes, two libcs (msvcrt and glibc), one digest. A mismatch anywhere is
+treated as a determinism regression to triage — never a reason to re-lock.
+<span class="verify">$ cargo test --features c-oracle</span>
+:::
+
+## Demonstration: deterministic concurrency in `pi.jtr`
+
+`examples/pi.jtr` estimates π by Monte Carlo on four threads. Each worker owns
+a fixed-seed Lehmer generator; hit counts are accumulated with `atomic_add`
+(addition is associative and commutative over integers, so accumulation order
+cannot change the total); `concurrent { … }` joins every task at the closing
+brace.
+
+```bash
+jestyrc run examples/pi.jtr
+```
+
+::: {.program-output}
+6300
+3150
+:::
+
+Twenty consecutive runs produce twenty identical outputs: 6300 hits,
+π × 1000 = 3150. The threads interleave differently every time; the answer
+never does.
+
+**Scoped phrasing, because scope matters:** Jestyr's deterministic concurrency
+facilities produce reproducible results across interleavings and platforms
+*when per-task state and reduction semantics are deterministic* — fixed seeds,
+order-insensitive accumulation, declared-deterministic reductions. Write a
+schedule-dependent program with the raw primitives and it will behave like one;
+that is exactly what `@deterministic` exists to forbid, function by function,
+where you choose to claim it.
+
+## What is and is not claimed
+
+| Claim | Scope | Verified by |
+|---|---|---|
+| Identical canary digest | Windows/MinGW-gcc and Ubuntu 24.04/gcc 13.3; macOS/clang untested | `cargo test --features c-oracle`, CI on every push |
+| Flags locked | the `jestyrc` build path only; manual builds of emitted C are on you | `fp_determinism_flags_are_locked` |
+| Correctly-rounded parse/format, order-invariant sums | the stdlib primitives, property-tested | default suite (916 tests) |
+| Schedule-independent functions | code inside `@deterministic`; raw primitives elsewhere are unchecked by design | compile-time rejection tests |
+| `pi.jtr` reproducibility | one program, 20/20 identical runs; the general claim is the scoped phrasing above | `jestyrc run examples/pi.jtr` |
+
+Known open edges, stated plainly: macOS/clang is a welcome third data point,
+not yet collected. The emitted C does not yet carry
+`#pragma STDC FP_CONTRACT OFF` in the file itself, so the invariant lives in
+the build command rather than the artifact. 32-bit x87 is unaddressed; x86-64
+is the verified target.
+
+Next: see the [Tour](tour.qmd) for the language these guarantees attach to, or
+[Performance](performance.qmd) for what determinism costs (medians on one
+machine: fib(40) at 0.984× hand-C — correctness is cross-platform via CI,
+timings are local).

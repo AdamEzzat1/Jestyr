@@ -1,0 +1,203 @@
+---
+title: "Research"
+---
+
+Jestyr `v0.1.0-research` is a research release: a working system built to
+answer one question and to be checked, not believed. The question — **how
+much of Rust-grade memory safety and C-grade performance survives if
+lifetimes are removed from the language entirely?** — is answered with a
+~52K-line Rust reference compiler, a 29,818-line self-hosted port that
+compiles itself, and a verification ladder that pins every headline claim
+to a command.
+
+This page ranks the contributions, states each claim at its true scope,
+and lists the boundaries plainly. The long-form version is the
+[technical report](https://github.com/AdamEzzat1/Jestyr/blob/master/docs/technical-report.md);
+the language itself is in the [Tour](tour.qmd).
+
+## The five contributions, ranked
+
+### 1. Dual-implementation byte-identity, with a gcc-only bootstrap seed
+
+The project maintains **two independent implementations of the same
+compiler** — the Rust reference and the Jestyr port — and holds them to
+**byte-identical C output** over a 148-file corpus, over a concatenated
+build of the compiler's own source, and through the self-hosting fixed
+point (the compiler, compiled by itself, reproduces its own compilation
+exactly). On top sits a committed bootstrap seed: the compiler's own C
+output for its own source, checked into the repository.
+
+This is a practical variation on Wheeler's *diverse double-compiling*
+answer to Thompson's trusting-trust problem: two implementations written
+in different languages, one bootstrappable from plain C, agreeing
+bit-for-bit on every output. Anyone with gcc can rebuild the compiler
+from the seed and watch it regenerate that seed byte-for-byte in roughly
+half a minute — no Rust, no toolchain trust beyond the C compiler you
+already audit.
+
+The discipline that made this sustainable for one person is itself part
+of the contribution: the *gated-on-use* rule (a feature that changes
+emission must leave every program not using it byte-identical), the
+*two-sided tax* (every emission change lands with its port mirror and a
+refreshed seed in the same increment, or the gates fail), and
+*census-then-enforce* migrations (measure, migrate to zero, pin, then
+turn enforcement on). The byte-identity pin also worked as a bug-finding
+instrument: porting the type checker exposed a latent order-divergence
+bug in the *reference*.
+
+### 2. Ownership without lifetimes, validated at self-hosting scale
+
+Jestyr's memory-safety answer is a tiered reference model with no
+lifetime annotations anywhere: second-class borrows (`read`/`mut`/`out`)
+that structurally cannot escape their frame — the checker refuses the
+four escape routes rather than analyzing annotations — then
+generation-checked `genref`s (use-after-free becomes a deterministic
+fault, never undefined behavior), then scope-bounded `region` arenas,
+then raw pointers behind a hard `unsafe` boundary.
+
+Hylo (formerly Val) argues second-class references suffice for safe
+systems programming. Jestyr contributes the missing **empirical data
+point at scale**: the compiler plus its stdlib — 29,818 lines of Jestyr,
+lexer to C backend, with arenas, interners, and a module loader — lives
+entirely inside this discipline and passes its own escape checker with
+zero diagnostics. Unsafe density is 0.5% (162 mentions total); the
+14,499-line C backend has 5 unsafe sites, the 2,859-line type checker
+has 3. Exclusivity of `mut` borrows hands the C optimizer `restrict`
+semantics; the compute-bound `fib(40)` twin sits at 0.984× hand-written
+C on the benchmark machine.
+
+### 3. Checked cost models
+
+The most transferable design idea: **performance shape as a checked
+interface**. `@span(log)` declares a function's asymptotic parallel span
+(the Cilk/NESL critical-path measure); the compiler re-derives the
+body's span from its loop structure and refuses a body that exceeds the
+declaration — serializing a `par for … reduce` is a compile error, not a
+silent 100× regression. `@simd` is a checked legality claim: every
+`par for` in the body is verified lane-safe, and an illegal body is
+refused with the cause named. `@no_alloc` is transitive
+allocation-freedom, checked through calls. Types made data shape part of
+the checked interface; these make *cost* part of it.
+
+### 4. The determinism contract
+
+Bitwise-reproducible floating point as an explicit, tested contract:
+locked compile flags (`-ffp-contract=off`, `-fno-fast-math`) asserted in
+tests; the language's own correctly-rounded parse and format, never the
+libc's; parallel reductions reproducible by construction (binned
+superaccumulators, fixed reduction trees); and `@deterministic`, which
+**rejects non-deterministic reduction operators at compile time**. The
+whole surface is pinned by a SHA-256 canary over a demo that prints only
+integers and own-formatter strings — a digest change can only mean a
+genuine determinism break. CI re-checks the digest on every push.
+
+### 5. Sound error sets with stack-only payloads
+
+Errors are declared sets (`-> i32 !{ Io, Parse(i32) }`) checked soundly
+through `?`, method calls, and trait dispatch; payloads are carried with
+no heap allocation and no dynamic dispatch; `catch |e| match` extracts
+them exhaustively. This is incremental over Zig's payload-free error
+sets — solid engineering rather than novelty — but it completes the
+language's no-hidden-costs story: the error type is a stack value whose
+size is known at compile time.
+
+## The claims, precisely scoped
+
+Every claim states its scope and the command that checks it.
+
+::: {.claim}
+**Dual-implementation byte-identity.** The Rust reference and the
+self-hosted port emit byte-identical C over the 148-file corpus, the
+concatenated self-hosting build, and the compiler's own source.
+*Scope:* the single-file / concatenated emission path — which is what
+the corpus, the fixed point, and the seed all use. The module-loader
+path has three known, documented divergences (no `#line` directives in
+the port, per-type artifact ordering, spawn symbol naming), themselves
+pinned by a golden test so they cannot drift silently.
+<span class="verify">$ cargo test --features c-oracle,selfhost-fixpoint</span>
+:::
+
+::: {.claim}
+**The self-hosting fixed point.** The Jestyr-written compiler, compiled
+by itself, reproduces its own C output exactly — jc2 ≡ jc1 over the
+compiler's entire source. Verified on Windows and on Ubuntu CI. From a
+cold clone, gcc alone reaches a working compiler in ~21–30 s.
+<span class="verify">$ gcc -O2 -std=c11 -ffp-contract=off -fno-fast-math -o jc bootstrap/jestyr_seed.c && ./jc bootstrap/jestyr_flat.jtr > regen.c && diff regen.c bootstrap/jestyr_seed.c</span>
+:::
+
+::: {.claim}
+**Floating-point determinism.** The canary digest (`4389bf83…`) is
+verified identical on **Windows 11 + MinGW gcc** and **Ubuntu 24.04 +
+gcc 13.3.0** — two OSes, two libcs, one digest — and CI pins it on
+every push. A Monte Carlo demo (`pi.jtr`) produced identical output on
+20 consecutive runs (6300 hits, pi×1000 = 3150). *Scope:* macOS/clang
+is untested.
+<span class="verify">$ cargo test --features c-oracle</span>
+:::
+
+::: {.claim}
+**Safety enforcement.** Raw-pointer operations outside `unsafe` are
+compile errors on **both** toolchains; the escape checker's guarantee
+is stated precisely in `docs/escape-guarantee.md`; bounds checks elide
+only under refinement proof. 916 default tests pass.
+<span class="verify">$ cargo test</span>
+:::
+
+::: {.claim}
+**Performance parity where claimed.** Byte-identical-output twin
+programs, medians: fib(40) 0.984× hand-C, fib(45) 1.17–1.22×,
+numeric_kernel ~1.0×, heavy_sieve 0.91×, heavy_matmul 0.96×,
+heavy_wordcount 1.37× (Jestyr's strmap beats `std::unordered_map`),
+heavy_parsum 0.60× — an honest loss, named below. *Scope:* one machine
+(Windows 11, gcc/g++ 8.3, `-O2`); correctness is cross-platform via CI,
+timings are local.
+<span class="verify">$ cargo test --features c-oracle cpp_compare</span>
+:::
+
+## Honest boundaries — read them as invitations
+
+- **No mechanized proofs.** The escape-checker guarantee is a precise
+  informal claim with a written argument, not a Coq/Lean development.
+  Formalizing it — or finding a counterexample — is the single most
+  valuable thing an outside researcher could do here.
+- **One-machine timings.** The benchmark numbers are medians from one
+  Windows 11 machine. The twin programs are in the repository with
+  byte-identical outputs; run them on your hardware and report what you
+  see.
+- **Single author.** Every line was written and reviewed by one person.
+  That is a real threat to validity, and it is exactly what the
+  dual-implementation byte-identity pin, the 916-test suite, and the
+  two-OS CI exist to compensate for. Independent reproduction is the
+  fix; the ladder makes it cheap.
+- **The parsum gap.** `heavy_parsum` at 0.60× of hand-tuned threading is
+  the named optimization target: the `par for` machinery pays overhead
+  the hand-C version does not, while the serial halves sit at parity.
+  If checked parallel cost models interest you, this is the open
+  problem with a benchmark already attached.
+
+## Citing this work
+
+The repository ships a `CITATION.cff`; GitHub's *Cite this repository*
+button renders it directly. The citable artifact is the tagged release:
+
+```bash
+git clone https://github.com/AdamEzzat1/Jestyr
+git checkout v0.1.0-research
+```
+
+Cite as: Adam Ezzat, *Jestyr: a self-hosted systems language without
+lifetimes, held byte-identical across two compiler implementations*,
+v0.1.0-research, 2026.
+
+## Explicitly out of scope
+
+Not in this release, by design rather than omission: a GPU backend, the
+thermal/energy cost-model facet (design only), async, an SMT-backed
+`@verified`, an LSP, a package registry, MSVC (`cl.exe`) support — and
+any claim of production readiness. This is research software released
+for inspection, reproduction, and criticism; the language surface will
+change.
+
+Start with the [Tour](tour.qmd), verify with the ladder above, and read
+the [technical report](https://github.com/AdamEzzat1/Jestyr/blob/master/docs/technical-report.md)
+for the full argument.

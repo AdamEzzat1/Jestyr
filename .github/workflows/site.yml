@@ -1,0 +1,48 @@
+# Render the Quarto site in site/ and publish it to GitHub Pages.
+#
+# Activates once Pages is enabled for the repo (Settings -> Pages -> Source:
+# GitHub Actions). On a private repo Pages requires a paid plan; on a public
+# repo it is free — flip visibility first, then enable Pages.
+
+name: Site
+
+on:
+  push:
+    branches: [master]
+    paths: ["site/**", ".github/workflows/site.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: quarto-dev/quarto-actions/setup@v2
+      - name: Render site
+        run: quarto render site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/_site
+
+  deploy:
+    needs: render
+    # Non-blocking until Pages is enabled (Settings -> Pages -> Source: GitHub
+    # Actions): without that, this job cannot succeed, but the render job above
+    # still validates the site on every push.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

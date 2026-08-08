@@ -10,10 +10,11 @@ scope-bounded `region` allocation — validated at real scale: **the
 compiler is written in Jestyr and compiles itself.**
 
 The project ships **two independent implementations of the same
-compiler** — a ~52,000-line Rust reference and a ~25,000-line self-hosted
-Jestyr port — held **byte-identical in their C output** over a 148-file
-test corpus, plus a committed bootstrap seed that builds the whole
-toolchain with nothing but a C compiler.
+compiler** — a ~52,000-line Rust reference and a self-hosted Jestyr port
+(29,818 lines of Jestyr, compiler plus stdlib) — held **byte-identical
+in their C output** over a 148-file test corpus, plus a committed
+bootstrap seed that builds the whole toolchain with nothing but a C
+compiler.
 
 This is a **research release** (`v0.1.0-research`), not a production
 tool. See [Scope](#scope-what-this-is-and-isnt).
@@ -121,7 +122,7 @@ guarantee is stated precisely in
 | Full corpus goldens + self-hosting fixed point + seed drift guard | `cargo test --features c-oracle,selfhost-fixpoint` | + gcc | ~10 min |
 | gcc-only bootstrap + fixed point | the two commands above | gcc only | ~30 s |
 
-Current state (verified 2026-08-07, this commit): **914 default tests
+Current state (verified 2026-08-08, this commit): **916 default tests
 pass** (0 failed, 3 ignored, ~35 s), 148-file byte-identical corpus,
 warning-clean build. CI runs the first three steps on Ubuntu and
 Windows.

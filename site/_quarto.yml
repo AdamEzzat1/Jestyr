@@ -1,0 +1,39 @@
+project:
+  type: website
+  output-dir: _site
+
+website:
+  title: "Jestyr"
+  description: "A systems language with no lifetimes — self-hosted, byte-verified, deterministic."
+  navbar:
+    background: dark
+    left:
+      - href: index.qmd
+        text: Home
+      - href: get-started.qmd
+        text: Get started
+      - href: tour.qmd
+        text: Tour
+      - href: safety.qmd
+        text: Safety
+      - href: performance.qmd
+        text: Performance
+      - href: determinism.qmd
+        text: Determinism
+      - href: research.qmd
+        text: Research
+    right:
+      - icon: github
+        href: https://github.com/AdamEzzat1/Jestyr
+  page-footer:
+    center: "Jestyr v0.1.0-research — MIT OR Apache-2.0. Every claim states its scope and its verification command."
+
+format:
+  html:
+    theme:
+      - cosmo
+      - custom.scss
+    toc: true
+    code-copy: true
+    highlight-style: github-dark
+    link-external-newwindow: true
