@@ -41,11 +41,19 @@ see [bootstrap/README.md](bootstrap/README.md).
 ## The language, briefly
 
 ```
-fn main() {
-    let xs = List(i32).new(system)   // allocator is a VALUE you pass
-    xs.push(10)
-    for xs read x { print(x) }       // borrow, provably frame-bounded
-}                                     // RAII drop, no lifetimes anywhere
+fn sum(read xs: [3]i32) -> i32 {     // `read`: a borrow, provably
+    var total: i32 = 0               //  frame-bounded — no lifetime
+    for read x in xs {               //  annotations, ever
+        total = total + x
+    }
+    return total
+}
+
+fn main() -> i32 {
+    var xs: [3]i32 = [10, 20, 30]    // a stack VALUE that moves, copies,
+    print_int(sum(xs))               // and drops by scope — RAII, no GC
+    return 0
+}
 ```
 
 * **Ownership without lifetimes.** Values are owned and moved; borrows

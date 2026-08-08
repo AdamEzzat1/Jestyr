@@ -1,42 +1,95 @@
 /*-- scss:defaults --*/
-// Jestyr brand: the carousel's orange on clean white, dark code panels.
+// Jestyr brand v2 — modern, readable, with a blackletter wordmark.
+// The wordmark ("Jestyr" in the navbar) is UnifrakturMaguntia; everywhere
+// else the name renders in the body font like any other word.
+@import url('https://fonts.googleapis.com/css2?family=UnifrakturMaguntia&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+
 $primary: #f76923;
-$link-color: #d4551a;
-$navbar-bg: #17171a;
+$link-color: #c94f16;
+$navbar-bg: #141417;
+$body-bg: #fdfdfc;
+$body-color: #24262b;
+$font-family-sans-serif: "Inter", "Segoe UI", system-ui, sans-serif;
+$font-family-monospace: "JetBrains Mono", Consolas, ui-monospace, monospace;
+$font-size-root: 17px;
+$line-height-base: 1.7;
+$headings-font-weight: 650;
 $code-block-bg: #1b1e24;
 $code-block-color: #dee2e8;
-$font-family-monospace: Consolas, "Cascadia Code", ui-monospace, monospace;
+$code-color: #c2410c;
+$code-bg: #f4efe9;
 
 /*-- scss:rules --*/
-.navbar-brand { font-weight: 700; letter-spacing: 0.5px; }
+// The wordmark: blackletter in the navbar only.
+.navbar-brand {
+  font-family: 'UnifrakturMaguntia', serif;
+  font-size: 2.1rem;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+  line-height: 1;
+  padding-top: 0;
+  padding-bottom: 0.2rem;
+}
+
+.navbar { padding-top: 0.55rem; padding-bottom: 0.55rem; }
+.navbar .nav-link { font-weight: 500; font-size: 0.95rem; }
+
+h1, h2, h3 { letter-spacing: -0.015em; }
+h2 {
+  margin-top: 2.4rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid #e8e6e2;
+}
+
+p { max-width: 72ch; }
 
 // The claim card: every headline claim renders with its scope + verify command.
 .claim {
-  border-left: 5px solid $primary;
-  background: #f4f4f4;
-  padding: 0.9rem 1.1rem;
-  margin: 1.2rem 0;
-  border-radius: 0 6px 6px 0;
+  border: 1px solid #eee7df;
+  border-left: 4px solid $primary;
+  background: #faf7f3;
+  padding: 1rem 1.2rem;
+  margin: 1.3rem 0;
+  border-radius: 10px;
+  box-shadow: 0 1px 3px rgba(20, 20, 23, 0.05);
 }
 .claim .verify {
   font-family: $font-family-monospace;
-  font-size: 0.85em;
-  color: #555;
+  font-size: 0.82em;
+  color: #6b6f76;
   display: block;
-  margin-top: 0.5rem;
+  margin-top: 0.55rem;
 }
 
-pre { border-radius: 8px; }
+pre {
+  border-radius: 10px;
+  border: none;
+  padding: 1rem 1.2rem;
+  font-size: 0.88em;
+  line-height: 1.55;
+}
 
 // Output blocks under code samples.
 .program-output {
   background: #101216;
   color: #78dc8c;
   font-family: $font-family-monospace;
-  padding: 0.7rem 1rem;
-  border-radius: 8px;
-  margin-top: -0.4rem;
-  margin-bottom: 1.2rem;
+  padding: 0.75rem 1.2rem;
+  border-radius: 10px;
+  margin-top: -0.5rem;
+  margin-bottom: 1.3rem;
   white-space: pre;
-  font-size: 0.9em;
+  font-size: 0.85em;
+  line-height: 1.5;
 }
+
+// Tables: airy and modern.
+.table {
+  font-size: 0.95em;
+  th { font-weight: 600; border-bottom: 2px solid #e8e6e2; }
+  td, th { padding: 0.55rem 0.75rem; }
+}
+
+.page-footer { font-size: 0.85em; color: #8a8d93; }
+
+a { text-decoration-thickness: 1px; text-underline-offset: 2.5px; }

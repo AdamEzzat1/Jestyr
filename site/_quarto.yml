@@ -14,6 +14,8 @@ website:
         text: Get started
       - href: tour.qmd
         text: Tour
+      - href: syntax.qmd
+        text: Syntax
       - href: safety.qmd
         text: Safety
       - href: performance.qmd
