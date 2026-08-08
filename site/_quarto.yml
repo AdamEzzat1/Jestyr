@@ -4,6 +4,7 @@ project:
 
 website:
   title: "Jestyr"
+  site-url: "https://adamezzat1.github.io/Jestyr/"
   description: "A systems language with no lifetimes — self-hosted, byte-verified, deterministic."
   navbar:
     background: dark

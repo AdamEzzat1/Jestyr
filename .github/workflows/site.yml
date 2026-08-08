@@ -35,10 +35,6 @@ jobs:
 
   deploy:
     needs: render
-    # Non-blocking until Pages is enabled (Settings -> Pages -> Source: GitHub
-    # Actions): without that, this job cannot succeed, but the render job above
-    # still validates the site on every push.
-    continue-on-error: true
     runs-on: ubuntu-latest
     environment:
       name: github-pages
