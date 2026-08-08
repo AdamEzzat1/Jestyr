@@ -1,0 +1,61 @@
+// heavy_matmul.jtr — naive 768×768 f64 matrix multiply: ~453M multiply-adds.
+//
+// Closest C++ pair: heavy_matmul.cpp. Compute-bound floating point in ikj order.
+// Inputs are integer-valued f64 (< 1000), so every product and partial sum is
+// exact in f64 up to 2^53 — the final checksum is an exact integer on any
+// IEEE-754 machine, and both sides must match it digit-for-digit.
+//
+// Run:  cargo run --release -- run examples/cpp_compare/heavy_matmul.jtr
+//   →   739586413
+
+const N: usize = 768
+const MOD: i64 = 1000000007
+
+fn getf(p: *mut f64, i: usize) -> f64 { return unsafe { (p + i).* } }
+fn setf(p: *mut f64, i: usize, v: f64) { unsafe { (p + i).* = v } }
+
+fn fill(p: *mut f64, n: usize, salt: i64) {
+    var i: usize = 0
+    for i < n {
+        let x: i64 = ((i as i64) * 1103515245 + salt) % 1000
+        setf(p, i, x as f64)
+        i = i + 1
+    }
+}
+
+fn main() -> i32 {
+    let nn: usize = N * N
+    var a: *mut f64 = alloc(f64, nn)
+    var b: *mut f64 = alloc(f64, nn)
+    var c: *mut f64 = alloc(f64, nn)
+    fill(a, nn, 12345)
+    fill(b, nn, 54321)
+    var i: usize = 0
+    for i < nn { setf(c, i, 0.0) i = i + 1 }
+
+    // ikj: stream a row of c against a row of b — the standard naive-but-sane order.
+    i = 0
+    for i < N {
+        var k: usize = 0
+        for k < N {
+            let aik: f64 = getf(a, i * N + k)
+            var j: usize = 0
+            for j < N {
+                setf(c, i * N + j, getf(c, i * N + j) + aik * getf(b, k * N + j))
+                j = j + 1
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+
+    var sum: f64 = 0.0
+    i = 0
+    for i < nn { sum = sum + getf(c, i) i = i + 1 }
+    print_int(((sum as i64) % MOD))
+
+    free_ptr(a)
+    free_ptr(b)
+    free_ptr(c)
+    return 0
+}

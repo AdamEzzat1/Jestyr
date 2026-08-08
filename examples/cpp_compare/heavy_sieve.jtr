@@ -1,0 +1,47 @@
+// heavy_sieve.jtr — Sieve of Eratosthenes over 50,000,000 numbers (~50 MB of flags).
+//
+// Closest C++ pair: heavy_sieve.cpp. Memory-bound, branchy: raw byte flags,
+// cache-hostile strided writes. Prints the prime count and a mod-p checksum of
+// the prime sum, so both sides must traverse everything to agree.
+//
+// Run:  cargo run --release -- run examples/cpp_compare/heavy_sieve.jtr
+//   →   3001134, 548121944
+
+const N: usize = 50000000
+const MOD: i64 = 1000000007
+
+fn get8(p: *mut u8, i: usize) -> u8 { return unsafe { (p + i).* } }
+fn set8(p: *mut u8, i: usize, v: u8) { unsafe { (p + i).* = v } }
+
+fn main() -> i32 {
+    var composite: *mut u8 = alloc(u8, N)
+    var i: usize = 0
+    for i < N { set8(composite, i, 0) i = i + 1 }
+
+    i = 2
+    for i * i < N {
+        if get8(composite, i) == 0 {
+            var m: usize = i * i
+            for m < N {
+                set8(composite, m, 1)
+                m = m + i
+            }
+        }
+        i = i + 1
+    }
+
+    var count: i64 = 0
+    var sum: i64 = 0
+    i = 2
+    for i < N {
+        if get8(composite, i) == 0 {
+            count = count + 1
+            sum = (sum + (i as i64)) % MOD
+        }
+        i = i + 1
+    }
+    print_int(count)
+    print_int(sum)
+    free_ptr(composite)
+    return 0
+}

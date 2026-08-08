@@ -263,3 +263,34 @@ Use `static_rejections` for the strongest contrast. It is not about matching
 runtime output; it is about moving mistakes earlier. Missing enum cases, region
 escapes, and undeclared parallel reductions are errors in Jestyr, while the C++
 analogue compiles with at most one opt-in warning.
+
+## The heavy tier (`heavy_*`)
+
+The original pairs above are demonstration-scale on purpose — small enough to
+hold both versions in your head. The `heavy_*` pairs are the performance tier:
+the same twin-program discipline (identical algorithm, identical traversal
+order, identical checksums, byte-identical output required) on workloads big
+enough for timing to mean something.
+
+| pair | workload | shape it stresses |
+|---|---|---|
+| `heavy_sieve` | Sieve of Eratosthenes to 50,000,000 (~50 MB of flags) | memory-bound, branchy, strided writes |
+| `heavy_matmul` | naive 768×768 f64 multiply (~453M mul-adds), exact integer checksum | floating-point compute |
+| `heavy_wordcount` | 10,000,000 LCG-drawn words into a hash map | allocation + hashing (Jestyr's own `std/strmap` vs `std::unordered_map`) |
+| `heavy_parsum` | parallel sum of squares over 20,000,000 i64 (~160 MB) | threaded reduction: one `par for … reduce` line vs hand-rolled `std::thread` chunking |
+
+Measured on one machine (Windows 11, gcc/g++ 8.3, `-O2`, medians of 7 runs;
+treat single-digit percentages as code-layout noise — they move between
+sessions):
+
+| pair | jestyr | c++ | jestyr speed |
+|---|---|---|---|
+| `heavy_sieve` | 0.505 s | 0.458 s | 0.91× (0.9–1.2× across sessions) |
+| `heavy_matmul` | 0.210 s | 0.202 s | 0.96× |
+| `heavy_wordcount` | 0.274 s | 0.376 s | **1.37×** — open addressing with no per-node allocation beats the node-based `unordered_map`, and the map itself is written in Jestyr |
+| `heavy_parsum` | 0.145 s | 0.087 s | **0.60×** — the honest loss: the general `par for` reduction machinery costs real overhead against hand-tuned fixed-chunk threading at this size. The serial halves match at parity; this is a lowering-optimization target, not a semantics cost |
+
+All four pairs print byte-identical output, so the numbers compare the same
+computation, verified — including the parallel one, whose Jestyr answer is
+schedule-independent by construction and cross-checked against its own serial
+pass in-program.

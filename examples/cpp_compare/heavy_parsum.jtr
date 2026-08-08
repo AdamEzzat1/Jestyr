@@ -1,0 +1,46 @@
+// heavy_parsum.jtr — a parallel reduction over 20,000,000 elements (~160 MB).
+//
+// Closest C++ pair: heavy_parsum.cpp (hand-rolled std::thread chunking).
+// The scale version of parallel_reduce: one `par for … reduce` line against
+// C++'s spawn/join boilerplate, on enough data for the parallelism to matter.
+// The reduction is declared-deterministic, so the sum cannot depend on the
+// schedule — and the serial pass must agree bit-for-bit.
+//
+// Run:  cargo run --release -- run examples/cpp_compare/heavy_parsum.jtr
+//   →   sum-of-squares checksum, then 1 (parallel == serial)
+
+import "../std/core"
+import "../std/io"
+
+const N: usize = 20000000
+const MOD: i64 = 1000000007
+
+fn seti(p: *mut i64, i: usize, v: i64) { unsafe { (p + i).* = v } }
+fn b2i(read b: bool) -> i32 { if b { return 1 } return 0 }
+
+@span(log) fn par_sum_sq(read s: []i64) -> i64 {
+    par for x in s reduce(core.sum_reduction()) { x * x }
+}
+
+@span(linear) fn serial_sum_sq(read s: []i64) -> i64 {
+    var acc: i64 = 0
+    for x in s { acc = acc + x * x }
+    return acc
+}
+
+fn main() -> i32 {
+    var a: *mut i64 = alloc(i64, N)
+    var i: usize = 0
+    for i < N {
+        seti(a, i, (i as i64) % 1000)
+        i = i + 1
+    }
+    let s: []i64 = slice(i64, a, N)
+
+    let p: i64 = par_sum_sq(s)
+    io.print_i32((p % MOD) as i32)
+    io.print_i32(b2i(p == serial_sum_sq(s)))
+
+    free_ptr(a)
+    return 0
+}

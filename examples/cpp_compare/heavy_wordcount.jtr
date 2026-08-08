@@ -1,0 +1,44 @@
+// heavy_wordcount.jtr — count 10,000,000 words into a hash map.
+//
+// Closest C++ pair: heavy_wordcount.cpp (std::unordered_map). Allocation- and
+// hash-bound: the shape where language runtimes usually diverge. Both sides
+// draw the same LCG word stream from the same 16-word vocabulary, so the
+// counts must agree exactly. Jestyr's map is std/strmap.jtr — open addressing
+// written in Jestyr itself, taking its Allocator as a VALUE.
+//
+// Run:  cargo run --release -- run examples/cpp_compare/heavy_wordcount.jtr
+//   →   16, then the exact counts of "alpha", "theta", "pi"
+
+import "../std/mem"
+import "../std/strmap"
+
+const TOTAL: i64 = 10000000
+
+fn word(k: i64) -> str {
+    match k {
+        0 => "alpha", 1 => "beta", 2 => "gamma", 3 => "delta",
+        4 => "epsilon", 5 => "zeta", 6 => "eta", 7 => "theta",
+        8 => "iota", 9 => "kappa", 10 => "lambda", 11 => "mu",
+        12 => "nu", 13 => "xi", 14 => "omicron", _ => "pi",
+    }
+}
+
+fn main() -> i32 {
+    let sys: Allocator = mem.system_allocator()
+    var m: StrMap = strmap.make(sys)
+
+    var state: i64 = 20260808
+    var n: i64 = 0
+    for n < TOTAL {
+        state = (state * 48271) % 2147483647
+        let w: str = word(state % 16)
+        strmap.put(m, w, strmap.get(m, w, 0) + 1)
+        n = n + 1
+    }
+
+    print_int(strmap.len(m) as i64)
+    print_int(strmap.get(m, "alpha", 0))
+    print_int(strmap.get(m, "theta", 0))
+    print_int(strmap.get(m, "pi", 0))
+    return 0
+}
