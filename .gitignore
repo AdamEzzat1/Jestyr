@@ -16,3 +16,5 @@ examples/cpp_compare/*.exe
 # Quarto site build output
 site/_site/
 site/.quarto/
+site/*_files/
+site/*.html
