@@ -334,6 +334,15 @@ fn emit_program(
         error_traces,
         drop_stack: Vec::new(),
         cur_moved: HashSet::new(),
+        fn_item_index: ast
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| match it {
+                Item::Fn(f) => Some((f as *const FnDecl as usize, i)),
+                _ => None,
+            })
+            .collect(),
         def_cap: None,
     };
     g.spawn_sites = g.collect_spawns();
@@ -645,6 +654,12 @@ struct Cgen<'a> {
     /// (any by-value escape suppresses the drop), so the result is leak-safe: a
     /// value is dropped at most once, never twice.
     cur_moved: HashSet<String>,
+    /// Address of each top-level `Item::Fn`'s `FnDecl` → its index in `ast.items`,
+    /// so [`fn_canon`](Self::fn_canon) can resolve a `&FnDecl` to its owning item
+    /// in O(1) instead of scanning every item by `ptr::eq`. Built once; the `Ast`
+    /// is borrowed immutably for the whole of codegen, so no `FnDecl` moves and
+    /// the addresses stay valid.
+    fn_item_index: HashMap<usize, usize>,
     /// While emitting aggregate *definitions* (structs/enums/generic instances/
     /// slices/arrays/genrefs/results), captures each definition as a segment of the
     /// output buffer plus its by-value type dependencies, so `flush_def_capture` can
@@ -2922,15 +2937,20 @@ impl<'a> Cgen<'a> {
     /// The canonical name of a top-level function declaration, found by identity
     /// among the program's items. A nested method (not a top-level item) is never
     /// a cross-module collision, so it falls back to its bare name.
+    ///
+    /// The identity lookup goes through [`fn_item_index`](Self::fn_item_index) — a
+    /// pointer→index map built once — rather than re-scanning `ast.items`. The scan
+    /// was O(items) and is called several times per emitted function (`emit_fn`
+    /// alone reaches it via `fn_result_type` and `fn_signature`), which made
+    /// function emission quadratic in program size: at 4,000 functions `fn_defs`
+    /// was 1.94 s of a 1.97 s compile. The map reproduces the scan exactly — one
+    /// entry per top-level `Item::Fn`, keyed by the same address `ptr::eq` compared
+    /// — so the emitted C is unchanged.
     fn fn_canon(&self, f: &FnDecl) -> String {
-        for (i, it) in self.ast.items.iter().enumerate() {
-            if let Item::Fn(g) = it {
-                if std::ptr::eq(g, f) {
-                    return self.canon_item(i, &f.name.name);
-                }
-            }
+        match self.fn_item_index.get(&(f as *const FnDecl as usize)) {
+            Some(&i) => self.canon_item(i, &f.name.name),
+            None => f.name.name.clone(),
         }
-        f.name.name.clone()
     }
 
     /// The C result-struct name if `f` is fallible, otherwise empty.
