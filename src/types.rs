@@ -418,6 +418,27 @@ impl DebugInfo {
 
 /// The result of type checking: the global table plus a type for every
 /// expression (indexed by `ExprId`).
+///
+/// # This is Jestyr's HIR
+///
+/// Worth saying out loud, because the shape hides it: the eight per-expression
+/// fields below — `expr_types` plus the seven `HashMap<ExprId, …>` resolution
+/// tables (`call_sym`, `method_calls`, `qualified`, `impl_calls`,
+/// `bound_method_calls`, `dyn_coercions`, `dyn_calls`) — **are** a high-level
+/// intermediate representation. Every one is keyed by `ExprId`, every one records
+/// a decision the type checker made that the backend cannot re-derive, and `cgen`
+/// reads all of them. An AST node plus its row across these tables is a resolved
+/// node; the collection of rows is a resolved tree, stored column-wise.
+///
+/// So the often-proposed "add a HIR between typeck and cgen" is not a new layer —
+/// it is **collecting the one that already exists**. That reframing is what makes
+/// the migration cheap at the start: folding the seven maps into a single
+/// `HashMap<ExprId, Resolved>` behind the same accessors changes no emitted C, so
+/// it costs nothing in corpus goldens, attest hashes, or bootstrap-seed churn.
+/// Only later stages — moving desugaring into HIR construction, then pointing
+/// `escape` and `cgen` at it — change output and therefore owe a port mirror.
+///
+/// Staging and rationale: `docs/frontend-roadmap.md` §5.
 pub struct TypeInfo {
     pub table: GlobalTable,
     pub expr_types: Vec<Ty>,

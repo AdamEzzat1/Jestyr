@@ -66,6 +66,7 @@ mod span;
 mod token;
 mod typeck;
 mod types;
+mod visit;
 
 #[cfg(test)]
 mod proptests;

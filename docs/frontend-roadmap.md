@@ -185,6 +185,26 @@ nothing on that axis; that is exactly why they come first.
 
 ## 6. Traversal helpers
 
+> **Implemented, but narrower than first proposed** — and the investigation is the
+> interesting part. `errsets` and `simd` do *not* have this problem: they scan the
+> expression arena flat (`for e in ast.exprs.iter()`), which is complete by
+> construction and so immune to a new variant without any helper. The pass that
+> genuinely needed it is `provenance` (`jestyrc unsafe`), which must recurse
+> because it tracks *lexical* `unsafe` scope, and whose `_ => {}` arm would have
+> silently hidden raw-pointer operations nested in any newly-added expression
+> form — an under-reporting safety report.
+>
+> `src/visit.rs` therefore ships `child_exprs`, an exhaustive structural match with
+> no `_` arm, rather than a `Visitor` trait: it answers only "what are this node's
+> sub-expressions", leaving each pass its own context. A reachability test asserts
+> that walking from every item body reaches every expression the parser built, so a
+> forgotten variant fails loudly. Adopting it in `provenance` changed the `unsafe`
+> report on **zero** of 155 corpus files — no latent bug was hiding, but the hole
+> can no longer open.
+>
+> The original proposal below is kept for the trait-shaped alternative and the
+> reasoning about which passes should *not* be retrofitted.
+
 Proposal (`src/visit.rs`, additive):
 
 ```rust
@@ -210,7 +230,8 @@ would have to model, and the abstraction would cost more than the duplication.
 | P1 | Unclosed-delimiter secondary spans | low | no | **done** — `expect_close`, opener named in `help:` |
 | P1 | CST Stage 1 + round-trip property | low | no | **done** — `src/cst.rs`, lossless over the whole corpus |
 | P2 | `visit.rs` + adopt in the 4 collector passes | low | no | kills the silent-`_`-arm class of bug |
-| P2 | HIR Stage 0–1 (fold side tables) | low | no | no output change, so no seed churn |
+| P2 | HIR Stage 0 (name the de-facto HIR) | none | no | **done** — see `TypeInfo`'s doc comment |
+| P2 | HIR Stage 1 (fold side tables) | low | no | no output change, so no seed churn |
 | P2 | Item-keyword synchronization in recovery | medium | no | needs the cascade budget as a guard |
 | P3 | Newline rule (§8) | medium | **yes** | measured-safe, but changes the language |
 | P3 | HIR Stage 2–4 | high | **yes** | the real payoff, and the real cost |

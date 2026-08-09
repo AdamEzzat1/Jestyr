@@ -273,7 +273,21 @@ fn walk_expr(
                 walk_expr(ast, info, arm.body, name, in_unsafe, out);
             }
         }
-        _ => {}
+        // Everything else recurses structurally. This used to be `_ => {}`, which
+        // silently stopped the walk at any node kind not named above — so a raw
+        // pointer operation nested inside a newly-added expression form would
+        // vanish from a report whose whole job is to find every one of them.
+        // `visit::child_exprs` is exhaustive, so a new variant is a compile error
+        // there rather than a hole here.
+        //
+        // The `unsafe` flag is not propagated specially: `Unsafe` is handled above
+        // and is the only construct that grants the permission, so a generic
+        // descent correctly carries the *enclosing* state.
+        _ => {
+            for child in crate::visit::child_exprs(ast, id) {
+                walk_expr(ast, info, child, name, in_unsafe, out);
+            }
+        }
     }
 }
 
