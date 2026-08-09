@@ -11,6 +11,12 @@ Topic docs written as features landed — `attributes.md`, `error-handling.md`,
 `obligations.md`, `diagnostics-json.md`, and friends. Each states what is
 implemented and how to exercise it.
 
+**Frontend**: [`frontend-grammar.md`](frontend-grammar.md) is the EBNF for the
+syntax the parser accepts *today* (with an explicit list of where it is
+approximate); [`frontend-roadmap.md`](frontend-roadmap.md) is the architectural
+assessment and the staged plan for CST/HIR/diagnostics work. The grammar is kept
+honest by the `grammar_conformance` tables in `src/proptests.rs`.
+
 ## `handoffs/`
 
 Workstream handoff documents (concurrency, numerics, parallelism, modules,

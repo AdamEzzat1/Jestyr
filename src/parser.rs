@@ -1156,7 +1156,7 @@ impl<'src> Parser<'src> {
 
             // Ranges are infix but build a distinct node.
             if k == DotDot || k == DotDotEq {
-                let (lbp, rbp) = (5, 6);
+                let (lbp, rbp) = RANGE_BP;
                 if lbp < min_bp {
                     break;
                 }
@@ -1201,15 +1201,12 @@ impl<'src> Parser<'src> {
     fn drain_binary_chain(&mut self, min_bp: u8) {
         loop {
             let k = self.cur().kind;
-            let cont = if k == DotDot || k == DotDotEq {
-                5 >= min_bp
-            } else {
-                bin_op(k).map(|(lbp, _, _)| lbp >= min_bp).unwrap_or(false)
-            };
-            if !cont {
+            // One lookup for both tiers — ranges and binary operators share the
+            // ladder, so asking twice is how the two copies drift.
+            let Some((lbp, rbp)) = infix_bp(k) else { break };
+            if lbp < min_bp {
                 break;
             }
-            let rbp = if k == DotDot || k == DotDotEq { 6 } else { bin_op(k).unwrap().1 };
             self.bump();
             if k == DotDot || k == DotDotEq {
                 if self.starts_expr() {
@@ -2099,6 +2096,26 @@ impl<'src> Parser<'src> {
 
 /// Infix binding powers: `(left, right, op)`. Higher binds tighter; left < right
 /// makes the operator left-associative.
+/// Binding power of the range operators `..` / `..=`.
+///
+/// Ranges are infix and participate in the same Pratt loop as the binary
+/// operators, but build a `Range` node rather than a `Binary` one, so they cannot
+/// live in [`bin_op`]'s table. Naming the power here keeps the two places that
+/// need it — the fold in `parse_binary` and the overflow drain in
+/// `drain_binary_chain` — from drifting apart, which is exactly the bug a pair of
+/// bare `5`s invites. It is the loosest binary level: `a..b + c` is `a..(b + c)`.
+const RANGE_BP: (u8, u8) = (5, 6);
+
+/// The binding power of any infix operator, range or binary — the single question
+/// `drain_binary_chain` needs to ask, and the one place that knows ranges and
+/// binary operators share a precedence ladder.
+fn infix_bp(k: TokenKind) -> Option<(u8, u8)> {
+    if matches!(k, DotDot | DotDotEq) {
+        return Some(RANGE_BP);
+    }
+    bin_op(k).map(|(l, r, _)| (l, r))
+}
+
 fn bin_op(k: TokenKind) -> Option<(u8, u8, BinOp)> {
     Some(match k {
         Or => (7, 8, BinOp::Or),
@@ -2934,6 +2951,91 @@ mod tests {
             }
             _ => panic!("expected enum"),
         }
+    }
+
+
+    /// **The precedence ladder, pinned end to end.**
+    ///
+    /// `docs/frontend-grammar.md` publishes a binding-power table; this is the
+    /// executable copy of it. Each case is an expression and the exact shape the
+    /// AST printer renders, so a change to `bin_op`, to `parse_catch`'s position
+    /// in the chain, or to the range special-case shows up as a diff here rather
+    /// than as a silent regrouping of somebody's arithmetic.
+    ///
+    /// Read `(a op b)` as "these grouped"; the printer parenthesises binary nodes
+    /// and leaves postfix/cast/assignment chains flat.
+    #[test]
+    fn the_precedence_ladder_is_pinned() {
+        const CASES: &[(&str, &str)] = &[
+            // multiplicative over additive, and left-associativity of each
+            ("a + b * c", "(a + (b * c))"),
+            ("a * b + c", "((a * b) + c)"),
+            ("a - b - c", "((a - b) - c)"),
+            // additive over shift
+            ("a << b + c", "(a << (b + c))"),
+            // shift over bitand over bitxor over bitor
+            ("a & b | c ^ d", "((a & b) | (c ^ d))"),
+            // comparison is left-associative (`a < b < c` is a type error, not a parse error)
+            ("a < b == c", "((a < b) == c)"),
+            // `and` binds tighter than `or`
+            ("a and b or c", "((a and b) or c)"),
+            // cast binds tighter than any binary operator, and chains left
+            ("a + b as i64", "(a + b as i64)"),
+            ("a as i32 as i64", "a as i32 as i64"),
+            // unary binds tighter than binary
+            ("-a * b", "(-a * b)"),
+            ("~a + b", "(~a + b)"),
+            ("!a and b", "(not a and b)"),
+            // postfix binds tightest and chains left
+            ("a.b.c", "a.b.c"),
+            ("a(b)(c)", "a(b)(c)"),
+            ("a[b][c]", "a[b][c]"),
+            ("a.b(c)?", "a.b(c)?"),
+            // assignment is loosest and right-associative
+            ("a = b = c", "a = b = c"),
+            ("a += b + c", "a += (b + c)"),
+            // `catch` sits between assignment and the binary tier, right-associative
+            ("a catch b catch c", "(a catch (b catch c))"),
+            ("a catch b + c", "(a catch (b + c))"),
+            ("x = a catch b", "x = (a catch b)"),
+            // ranges are the loosest binary level and build their own node
+            ("0..n", "0..n"),
+            ("0..=n", "0..=n"),
+            ("a..b + c", "a..(b + c)"),
+        ];
+        let mut wrong = Vec::new();
+        for (src, want) in CASES {
+            let ast = parse_ok(&format!("fn f() {{ {src} }}"));
+            let out = print_ast(&ast);
+            if !out.contains(want) {
+                wrong.push(format!("  {src}\n    want: {want}\n    got:  {}", out.trim()));
+            }
+        }
+        assert!(wrong.is_empty(), "precedence changed:\n{}", wrong.join("\n"));
+    }
+
+    /// A block-led expression in *statement* position is a complete statement: a
+    /// following operator starts a new statement rather than extending it. This is
+    /// the rule that makes `if c { 1 } else { 2 } - 3` two statements, and it is
+    /// easy to break by routing statement parsing through `parse_expr`.
+    #[test]
+    fn a_block_led_statement_is_not_extended_by_a_trailing_operator() {
+        // In STATEMENT position the `if` is a complete statement and `- 3` starts a
+        // new one, so the two are siblings and no binary node joins them.
+        let stmt = print_ast(&parse_ok("fn f() { if c { 1 } else { 2 } - 3 }"));
+        assert!(stmt.contains("if c"), "the `if` is still a statement:\n{stmt}");
+        assert!(
+            !stmt.contains("(if"),
+            "the trailing operator must not fold into the `if`:\n{stmt}"
+        );
+
+        // In EXPRESSION position the very same text *is* one binary expression —
+        // this contrast is the whole rule, so pin both halves.
+        let expr = print_ast(&parse_ok("fn f() { let x = if c { 1 } else { 2 } - 3 }"));
+        assert!(
+            expr.contains("(if ... - 3)"),
+            "in expression position the operator must extend the `if`:\n{expr}"
+        );
     }
 
     #[test]

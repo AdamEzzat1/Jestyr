@@ -12540,3 +12540,243 @@ fn main() -> i32 {
         );
     }
 }
+
+/// **Grammar conformance and parser robustness** — the tripwire for
+/// [`docs/frontend-grammar.md`](../docs/frontend-grammar.md).
+///
+/// The corpus goldens prove the parser is *stable* (its output has not changed);
+/// they cannot notice that a production quietly stopped parsing, because nothing
+/// in the corpus may exercise it. These tables close that gap from both sides:
+/// one snippet per documented production that must parse clean, and a matching
+/// set of malformed inputs that must be *rejected* — with a diagnostic, in
+/// bounded time, without panicking.
+///
+/// This is deliberately a tripwire and not a proof. A hand-written recursive
+/// descent parser's real failure mode is a silent regression in one arm, and a
+/// table of one-liners catches exactly that at near-zero maintenance cost.
+#[cfg(test)]
+mod grammar_conformance {
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+    use crate::token::TokenKind;
+
+    /// Parse a source string, returning only the error-severity diagnostics.
+    fn errors_of(src: &str) -> Vec<String> {
+        let (tokens, lex) = Lexer::new(src).tokenize();
+        let (_ast, parse) = Parser::new(src, tokens).parse();
+        lex.iter()
+            .chain(parse.iter())
+            .filter(|d| d.is_error())
+            .map(|d| d.message.clone())
+            .collect()
+    }
+
+    /// One accepted example per production in `docs/frontend-grammar.md`.
+    /// `(label, source)` — the label names the production so a failure says which.
+    const VALID: &[(&str, &str)] = &[
+        // --- items ---
+        ("Fn/minimal", "fn f() {}"),
+        ("Fn/ret", "fn f() -> i32 { return 0 }"),
+        ("Fn/params+conv", "fn f(read a: i32, mut b: i32, out c: i32) {}"),
+        ("Fn/comptime param", "fn f(comptime T: type) {}"),
+        ("Fn/generics", "fn f[T](a: T) {}"),
+        ("Fn/generics+bound", "trait Show { fn show(read self) -> i32 } fn f[T: Show](a: T) {}"),
+        ("Fn/error set", "fn f() -> i32 !{ Io } { return 0 }"),
+        ("Fn/contracts", "fn f(a: i32) -> i32 requires a > 0 { return a }"),
+        ("Fn/take conv", "fn f(take d: i32) {}"),
+        ("Fn/pub", "pub fn f() {}"),
+        ("Attr/bare", "@inline fn f() {}"),
+        ("Struct", "struct S { a: i32, b: i32 }"),
+        ("Struct/pub field", "struct S { pub a: i32 }"),
+        ("Struct/default", "struct S { a: i32 = 1 }"),
+        ("Struct/method", "struct S { a: i32 fn get(read self) -> i32 { return self.a } }"),
+        ("Record", "record R { a: i32 }"),
+        ("Union", "union U { a: i32, b: i32 }"),
+        ("Enum/nullary", "enum E { red, green, blue }"),
+        ("Enum/payload", "enum E { none, some(v: i32) }"),
+        ("Const", "const N: usize = 4"),
+        ("Distinct", "distinct Meters = i64"),
+        ("Import", "import \"std/core\""),
+        ("Trait", "trait Show { fn show(read self) -> i32 }"),
+        ("Impl", "trait Show { fn show(read self) -> i32 } struct S { a: i32 } impl Show for S { fn show(read self) -> i32 { return self.a } }"),
+        ("Extern", "extern \"c\" fn puts(s: cstr) -> i32"),
+        ("Import/hash pin", "import \"std/core\" = \"abc123\""),
+        ("Attr/args", "@align(16) struct S { a: i32 }"),
+        // --- types ---
+        ("Type/ptr", "fn f(p: *i32) {}"),
+        ("Type/ptr mut", "fn f(p: *mut i32) {}"),
+        ("Type/ptr const", "fn f(p: *const i32) {}"),
+        ("Type/slice", "fn f(s: []i32) {}"),
+        ("Type/array", "fn f(a: [4]i32) {}"),
+        ("Type/genref", "fn f(r: &i32) {}"),
+        ("Type/region ref", "fn f(r: &[a]i32) {}"),
+        ("Type/fn ptr", "fn f(g: fn(i32) -> i32) {}"),
+        ("Type/dyn", "trait Show { fn show(read self) -> i32 } fn f(d: dyn Show) {}"),
+        // --- statements ---
+        ("Stmt/let", "fn f() { let a: i32 = 1 }"),
+        ("Stmt/var", "fn f() { var a: i32 = 1 }"),
+        ("Stmt/let no type", "fn f() { let a = 1 }"),
+        ("Stmt/return bare", "fn f() { return }"),
+        ("Stmt/nested block", "fn f() { { let a = 1 } }"),
+        // --- expressions: the precedence ladder ---
+        ("Expr/assign", "fn f() { var a: i32 = 0 a = 1 }"),
+        ("Expr/compound assign", "fn f() { var a: i32 = 0 a += 1 a -= 1 a *= 2 }"),
+        ("Expr/bit assign", "fn f() { var a: i32 = 0 a &= 1 a |= 1 a ^= 1 }"),
+        ("Expr/binary ladder", "fn f() -> i32 { return 1 + 2 * 3 - 4 / 5 % 6 }"),
+        ("Expr/shift", "fn f() -> i32 { return 1 << 2 >> 3 }"),
+        ("Expr/bitwise", "fn f() -> i32 { return 1 & 2 | 3 ^ 4 }"),
+        ("Expr/comparison", "fn f() -> bool { return 1 < 2 }"),
+        ("Expr/unary", "fn f() -> i32 { return 0 - 1 }"),
+        ("Expr/unary neg", "fn f() -> i32 { return -1 }"),
+        ("Expr/not", "fn f() -> bool { return !true }"),
+        ("Expr/logical", "fn f() -> bool { return true and false or true }"),
+        ("Expr/deref", "fn f(p: *i32) -> i32 { return unsafe { p.* } }"),
+        ("Expr/array lit", "fn f() { let a: [3]i32 = [1, 2, 3] }"),
+        ("Expr/fstring", "fn f() { let x: i32 = 1 let s: str = f\"v={x}\" }"),
+        ("Expr/bitnot", "fn f() -> i32 { return ~1 }"),
+        ("Expr/cast", "fn f() -> i64 { return 1 as i64 }"),
+        ("Expr/cast chain", "fn f() -> i64 { return 1 as i32 as i64 }"),
+        ("Expr/range", "fn f() { for i in 0..4 { } }"),
+        ("Expr/range inclusive", "fn f() { for i in 0..=4 { } }"),
+        ("Expr/call", "fn g() -> i32 { return 0 } fn f() -> i32 { return g() }"),
+        ("Expr/field", "struct S { a: i32 } fn f(read s: S) -> i32 { return s.a }"),
+        ("Expr/index", "fn f(s: []i32) -> i32 { return s[0] }"),
+        ("Expr/paren", "fn f() -> i32 { return (1 + 2) * 3 }"),
+        ("Expr/array repeat", "fn f() { let a: [3]i32 = [0; 3] }"),
+        ("Expr/struct lit", "struct S { a: i32 } fn f() -> S { return S{ a: 1 } }"),
+        ("Expr/literals", "fn f() { let a = 1 let b = 1.5 let c = 0xFF let d = 0b1010 }"),
+        // --- control flow ---
+        ("If", "fn f() -> i32 { if true { return 1 } return 0 }"),
+        ("If/else", "fn f() -> i32 { if true { return 1 } else { return 0 } }"),
+        ("If/else-if", "fn f() -> i32 { if true { return 1 } else if false { return 2 } return 0 }"),
+        ("For/iter", "fn f(s: []i32) { for x in s { } }"),
+        ("For/iter conv", "fn f(s: []i32) { for read x in s { } }"),
+        ("For/cond", "fn f() { var i: i32 = 0 for i < 4 { i = i + 1 } }"),
+        ("Match", "enum E { a, b } fn f(read e: E) -> i32 { match e { a => 1, b => 2 } }"),
+        ("Match/wildcard", "enum E { a, b } fn f(read e: E) -> i32 { match e { a => 1, _ => 0 } }"),
+        ("Match/or-pattern", "enum E { a, b, c } fn f(read e: E) -> i32 { match e { a | b => 1, c => 2 } }"),
+        ("Unsafe", "fn f(p: *i32) -> i32 { return unsafe { p.* } }"),
+        ("Region", "fn f() { region r { } }"),
+        ("Comptime", "fn f() { comptime { } }"),
+        ("Concurrent", "fn f() { concurrent { } }"),
+    ];
+
+    /// Every documented production still parses. A failure here means either the
+    /// parser regressed or `docs/frontend-grammar.md` describes syntax that does
+    /// not exist — both worth knowing, and neither visible to a corpus golden.
+    #[test]
+    fn every_documented_production_parses() {
+        let mut broken = Vec::new();
+        for (label, src) in VALID {
+            let errs = errors_of(src);
+            if !errs.is_empty() {
+                broken.push(format!("  {label}: {errs:?}\n    source: {src}"));
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "productions from docs/frontend-grammar.md no longer parse:\n{}",
+            broken.join("\n")
+        );
+    }
+
+    /// Malformed inputs that must be *rejected*. Byte-identity goldens only ever
+    /// look at valid programs, so without this the error paths are untested — and
+    /// the error paths are the ones a user actually meets.
+    const INVALID: &[(&str, &str)] = &[
+        ("item/keyword only", "fn"),
+        ("item/no name", "fn () {}"),
+        ("item/unclosed params", "fn f( {}"),
+        ("item/unclosed body", "fn f() {"),
+        ("struct/unclosed", "struct S { a: i32"),
+        ("struct/missing type", "struct S { a: }"),
+        ("enum/unclosed", "enum E { a, b"),
+        ("const/no value", "const N: usize ="),
+        ("distinct/no base", "distinct M ="),
+        ("import/no path", "import"),
+        ("trait/unclosed", "trait T { fn f() -> i32"),
+        ("expr/dangling operator", "fn f() -> i32 { return 1 + }"),
+        ("expr/unclosed paren", "fn f() -> i32 { return (1 + 2 }"),
+        ("expr/double operator", "fn f() -> i32 { return 1 * / 2 }"),
+        ("type/unclosed array", "fn f(a: [4 i32) {}"),
+        ("match/no arrow", "enum E { a } fn f(read e: E) -> i32 { match e { a 1 } }"),
+        ("lexer/unterminated string", "fn f() { let s = \"oops }"),
+        ("lexer/stray backtick", "fn f() { let a = 1 ` }"),
+        ("lexer/unterminated block comment", "/* nope"),
+    ];
+
+    /// Every malformed input is rejected, and rejection is *bounded*: the parser
+    /// reports at least one error and does not drown the user in a cascade.
+    ///
+    /// The cascade bound matters as much as the rejection. A recursive descent
+    /// parser that recovers badly turns one typo into hundreds of diagnostics, and
+    /// the first real error scrolls off the screen.
+    #[test]
+    fn malformed_input_is_rejected_and_bounded() {
+        let mut wrong = Vec::new();
+        for (label, src) in INVALID {
+            let errs = errors_of(src);
+            if errs.is_empty() {
+                wrong.push(format!("  {label}: accepted invalid input: {src}"));
+                continue;
+            }
+            // Generous but finite: a handful of tokens must not produce dozens of
+            // diagnostics. Tightening this is a deliberate follow-up, not a
+            // drive-by change.
+            let (toks, _) = Lexer::new(src).tokenize();
+            let budget = 4 + toks.len();
+            if errs.len() > budget {
+                wrong.push(format!(
+                    "  {label}: diagnostic cascade — {} errors for {} tokens: {src}",
+                    errs.len(),
+                    toks.len()
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "malformed-input handling regressed:\n{}", wrong.join("\n"));
+    }
+
+    /// **Recovery makes progress and stays bounded.** `parse_module` bumps
+    /// unconditionally when an item parse consumed no tokens, so termination is
+    /// structural; this pins that it stays structural, and that recovery does not
+    /// fabricate an unbounded tree from a handful of tokens.
+    #[test]
+    fn recovery_is_bounded() {
+        for (label, src) in INVALID {
+            let (tokens, _) = Lexer::new(src).tokenize();
+            let n = tokens.len();
+            let (ast, _diags) = Parser::new(src, tokens).parse();
+            assert!(
+                ast.exprs.len() <= n * 16 + 64,
+                "{label}: parser produced {} exprs from {n} tokens — recovery is not bounded",
+                ast.exprs.len()
+            );
+        }
+    }
+
+    /// Truncating a valid program at *every* token boundary must never panic and
+    /// must always terminate. This is the cheapest generator of realistic
+    /// malformed input there is — it is what a file looks like mid-keystroke, which
+    /// is exactly the input an editor/LSP integration would hand the parser.
+    #[test]
+    fn every_prefix_of_a_valid_program_is_survivable() {
+        for (label, src) in VALID {
+            let (tokens, _) = Lexer::new(src).tokenize();
+            for cut in 0..tokens.len() {
+                let end = tokens[cut].span.start as usize;
+                if !src.is_char_boundary(end) {
+                    continue;
+                }
+                let prefix = &src[..end];
+                let (ptoks, _) = Lexer::new(prefix).tokenize();
+                assert_eq!(
+                    ptoks.last().unwrap().kind,
+                    TokenKind::Eof,
+                    "{label}: prefix lexing lost its Eof at {cut}"
+                );
+                // Must return — a hang here is the bug this test exists to find.
+                let (_ast, _d) = Parser::new(prefix, ptoks).parse();
+            }
+        }
+    }
+}
