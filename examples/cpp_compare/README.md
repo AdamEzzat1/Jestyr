@@ -288,9 +288,66 @@ sessions):
 | `heavy_sieve` | 0.505 s | 0.458 s | 0.91× (0.9–1.2× across sessions) |
 | `heavy_matmul` | 0.210 s | 0.202 s | 0.96× |
 | `heavy_wordcount` | 0.274 s | 0.376 s | **1.37×** — open addressing with no per-node allocation beats the node-based `unordered_map`, and the map itself is written in Jestyr |
-| `heavy_parsum` | 0.145 s | 0.087 s | **0.60×** — the honest loss: the general `par for` reduction machinery costs real overhead against hand-tuned fixed-chunk threading at this size. The serial halves match at parity; this is a lowering-optimization target, not a semantics cost |
+| `heavy_parsum` | 0.145 s | 0.087 s | **0.60×** — the honest loss (a later session on a busier machine measured 0.76×; the ratio moves, the loss does not). Cause diagnosed below: the loop **body is not parallelized yet**. Not a semantics cost — a lowering that has not been written yet |
 
 All four pairs print byte-identical output, so the numbers compare the same
 computation, verified — including the parallel one, whose Jestyr answer is
 schedule-independent by construction and cross-checked against its own serial
 pass in-program.
+
+### Why `heavy_parsum` loses — the actual reason
+
+An earlier version of this file blamed "the general `par for` reduction
+machinery" for the loss. That was wrong, and vague in the way performance
+excuses usually are. The real cause is specific and visible in the emitted C.
+
+`par for x in s reduce(core.sum_reduction()) { x * x }` currently lowers to
+**materialize-then-reduce**:
+
+```c
+int64_t* _pm = malloc(len * sizeof(int64_t));   /* a full-size temporary  */
+for (i = 0; i < len; i++) { _pm[i] = x * x; }   /* the BODY runs SERIALLY */
+jestyr_par_reduce((slice){_pm, len}, sum_reduction());  /* only '+' is threaded */
+free(_pm);
+```
+
+The loop body — the actual work — is not parallelized at all. It is run on one
+thread into a 160 MB scratch buffer, which four threads then re-read to perform a
+trivial `+`. The threading itself is not the problem: the chunking is the same
+fixed four-way split the C++ twin does by hand.
+
+Timing the strategies in isolation (same data, same flags, same thread count,
+20,000,000 `i64`; best of 7, and this workload is memory-bandwidth-bound so
+absolute numbers swing 20% between runs):
+
+| strategy | time | what it isolates |
+|---|---|---|
+| temp + serial body + fn-ptr reduce — **emitted today** | 86–94 ms | |
+| temp + serial body + *inlined* reduce | 77–82 ms | the reduction's indirect call |
+| temp + **parallel** body + fn-ptr reduce | 51–66 ms | the serialized body |
+| **fused** map+reduce, body via function pointer | 22–31 ms | |
+| **fused** map+reduce, body inlined | 11–12 ms | |
+
+So roughly half the cost is the temporary's memory traffic, a third is the
+serialized body, and the reduction's indirect call is the small remainder. Fusing
+the body into each worker — no temporary, each thread folding its own chunk —
+is worth **~3× with the body behind a function pointer** and **~7–8× with it
+inlined**. On the benchmark that is the difference between losing at 0.60× and
+winning outright.
+
+One caveat worth recording, because it nearly sent this analysis the wrong way:
+measuring the indirect call naively makes it look free (~4%). GCC speculatively
+devirtualizes a function pointer whose target it can see in the same translation
+unit. Laundering the pointer through a `volatile` global — which is the realistic
+case once it crosses a `pthread_create` boundary — is what produces the numbers
+above.
+
+**Determinism is not what is being traded here.** The fused form uses the same
+chunk boundaries and the same fixed combine order as `core.par_reduce`, so the
+grouping of operations is unchanged and the result stays bit-identical to the
+serial fold. What is missing is only the lowering; the guarantee is intact either
+way, and `heavy_parsum` still checks its parallel answer against its own serial
+pass in-program on every run.
+
+This is not fixed yet. It is written down here at full detail so the number in
+the table above is understood rather than excused.
