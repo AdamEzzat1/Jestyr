@@ -175,6 +175,33 @@ impl Modules {
         d.render(&self.srcs[r], &self.paths[r], severity)
     }
 
+    /// Render *every* diagnostic, building each region's line table once instead of
+    /// once per diagnostic. [`render`](Self::render) is O(file) per call, so the
+    /// per-diagnostic loop it was written for is quadratic in a failing build —
+    /// and failing builds are exactly when a compiler emits the most diagnostics
+    /// (a duplicate-variant storm across n enums emits ~3n of them). Output is
+    /// identical to calling `render` in a loop, including order.
+    ///
+    /// Regions are indexed lazily: a report that touches one file doesn't pay to
+    /// scan the other nine.
+    pub fn render_all(&self, diags: &[Diagnostic]) -> String {
+        let mut indices: Vec<Option<crate::span::LineIndex>> = (0..self.srcs.len()).map(|_| None).collect();
+        let mut out = String::new();
+        for d in diags {
+            let r = self.region_of(d.span);
+            let base = self.bases[r];
+            let mut local = d.clone();
+            local.span = Span::new(
+                (d.span.start as usize).saturating_sub(base),
+                (d.span.end as usize).saturating_sub(base),
+            );
+            let idx = indices[r].get_or_insert_with(|| crate::span::LineIndex::new(&self.srcs[r]));
+            out.push_str(&local.render_indexed(&self.srcs[r], idx, &self.paths[r], d.severity));
+            out.push('\n');
+        }
+        out
+    }
+
     /// Render every diagnostic as one **machine-readable JSON report**
     /// (`jestyrc check <file> --json`).
     ///
@@ -189,6 +216,8 @@ impl Modules {
     /// can sort them, but a tool that wants to know what the compiler saw first cannot
     /// recover that if we sort here.
     pub fn render_json(&self, diags: &[Diagnostic]) -> String {
+        // One line table per region, built on first use — see `render_all`.
+        let mut indices: Vec<Option<crate::span::LineIndex>> = (0..self.srcs.len()).map(|_| None).collect();
         let mut out = String::new();
         out.push_str(&format!(
             "{{\"version\":{},\"diagnostics\":[",
@@ -205,7 +234,8 @@ impl Modules {
                 (d.span.start as usize).saturating_sub(base),
                 (d.span.end as usize).saturating_sub(base),
             );
-            crate::diag::to_json(&local, &self.paths[r], &self.srcs[r], d.severity, &mut out);
+            let idx = indices[r].get_or_insert_with(|| crate::span::LineIndex::new(&self.srcs[r]));
+            crate::diag::to_json_indexed(&local, &self.paths[r], &self.srcs[r], idx, d.severity, &mut out);
         }
         out.push_str("]}\n");
         out

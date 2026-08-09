@@ -369,20 +369,20 @@ pub struct DebugInfo {
     srcs: Vec<String>,
     /// Each region's base offset within the concatenated global source buffer.
     bases: Vec<usize>,
-    /// Per region, the byte offset at which each line starts (so `line_starts[r][0]`
-    /// is always 0). Built once with the tables; lets [`span_to_file_line`] binary-search
-    /// for a line instead of counting newlines from byte 0 on every call.
+    /// Per region, a line-start table. Built once with the tables; lets
+    /// [`span_to_file_line`] binary-search for a line instead of counting newlines
+    /// from byte 0 on every call.
     ///
     /// [`span_to_file_line`]: DebugInfo::span_to_file_line
-    line_starts: Vec<Vec<u32>>,
+    line_index: Vec<crate::span::LineIndex>,
 }
 
 impl DebugInfo {
     /// Build the region tables from the loaded modules (the loader path). The
     /// arrays are 1:1 with `Modules`'s per-region vectors.
     pub fn new(paths: Vec<String>, srcs: Vec<String>, bases: Vec<usize>) -> DebugInfo {
-        let line_starts = srcs.iter().map(|s| line_starts_of(s)).collect();
-        DebugInfo { paths, srcs, bases, line_starts }
+        let line_index = srcs.iter().map(|s| crate::span::LineIndex::new(s)).collect();
+        DebugInfo { paths, srcs, bases, line_index }
     }
 
     /// Resolve a global span to `(file path, 1-based line)`, or `None` when there
@@ -398,7 +398,9 @@ impl DebugInfo {
     /// via `cgen::mark_line`, so the cost grew with each item's position in the file
     /// and made code generation quadratic in program size. The result is identical:
     /// `partition_point` counts the line starts at or before `local`, which equals
-    /// `1 + (newlines before local)` — exactly what `line_col` returned.
+    /// `1 + (newlines before local)` — exactly what `line_col` returned. That
+    /// equivalence now lives in [`crate::span::LineIndex`], shared with the
+    /// diagnostic renderer and the token dump.
     pub fn span_to_file_line(&self, span: crate::span::Span) -> Option<(&str, u32)> {
         let at = span.start as usize;
         for r in 0..self.bases.len() {
@@ -406,23 +408,12 @@ impl DebugInfo {
             let hi = lo + self.srcs[r].len();
             if at >= lo && at <= hi {
                 let local = (at - lo) as u32;
-                let line = self.line_starts[r].partition_point(|&s| s <= local) as u32;
+                let line = self.line_index[r].line_col(&self.srcs[r], local).line;
                 return Some((&self.paths[r], line));
             }
         }
         None
     }
-}
-
-/// The byte offset at which each line of `src` starts: `[0, …]`, then one entry
-/// per `\n` pointing just past it. Sorted by construction, so a line number is a
-/// binary search away.
-fn line_starts_of(src: &str) -> Vec<u32> {
-    let mut starts = vec![0u32];
-    starts.extend(
-        src.bytes().enumerate().filter(|(_, b)| *b == b'\n').map(|(i, _)| i as u32 + 1),
-    );
-    starts
 }
 
 /// The result of type checking: the global table plus a type for every

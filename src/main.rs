@@ -75,7 +75,6 @@ use std::process::{Command, ExitCode, Stdio};
 use lexer::Lexer;
 use parser::Parser;
 use printer::print_ast;
-use span::line_col;
 
 /// An opt-in counting global allocator (feature `bench-alloc`) tracking current,
 /// peak, and total bytes — for `selfbench`'s memory report. Off by default so the
@@ -723,12 +722,7 @@ fn run_layout(path: &str) -> ExitCode {
     };
     let (tokens, ld) = Lexer::new(&src).tokenize();
     let (ast, pd) = Parser::new(&src, tokens).parse();
-    let mut failed = false;
-    for d in ld.iter().chain(pd.iter()).filter(|d| d.is_error()) {
-        let lc = line_col(&src, d.span.start);
-        eprintln!("{path}:{}:{}: error: {}", lc.line, lc.col, d.message);
-        failed = true;
-    }
+    let failed = report_lex_parse_errors(&src, &path, &ld, &pd);
     if failed {
         return ExitCode::FAILURE;
     }
@@ -755,12 +749,7 @@ fn run_unsafe_report(path: &str) -> ExitCode {
     };
     let (tokens, ld) = Lexer::new(&src).tokenize();
     let (ast, pd) = Parser::new(&src, tokens).parse();
-    let mut failed = false;
-    for d in ld.iter().chain(pd.iter()).filter(|d| d.is_error()) {
-        let lc = line_col(&src, d.span.start);
-        eprintln!("{path}:{}:{}: error: {}", lc.line, lc.col, d.message);
-        failed = true;
-    }
+    let failed = report_lex_parse_errors(&src, &path, &ld, &pd);
     if failed {
         return ExitCode::FAILURE;
     }
@@ -785,12 +774,7 @@ fn run_obligations(path: &str) -> ExitCode {
     };
     let (tokens, ld) = Lexer::new(&src).tokenize();
     let (ast, pd) = Parser::new(&src, tokens).parse();
-    let mut failed = false;
-    for d in ld.iter().chain(pd.iter()).filter(|d| d.is_error()) {
-        let lc = line_col(&src, d.span.start);
-        eprintln!("{path}:{}:{}: error: {}", lc.line, lc.col, d.message);
-        failed = true;
-    }
+    let failed = report_lex_parse_errors(&src, &path, &ld, &pd);
     if failed {
         return ExitCode::FAILURE;
     }
@@ -813,12 +797,7 @@ fn run_errsets(path: &str) -> ExitCode {
     };
     let (tokens, ld) = Lexer::new(&src).tokenize();
     let (ast, pd) = Parser::new(&src, tokens).parse();
-    let mut failed = false;
-    for d in ld.iter().chain(pd.iter()).filter(|d| d.is_error()) {
-        let lc = line_col(&src, d.span.start);
-        eprintln!("{path}:{}:{}: error: {}", lc.line, lc.col, d.message);
-        failed = true;
-    }
+    let failed = report_lex_parse_errors(&src, &path, &ld, &pd);
     if failed {
         return ExitCode::FAILURE;
     }
@@ -841,12 +820,7 @@ fn run_simd(path: &str) -> ExitCode {
     };
     let (tokens, ld) = Lexer::new(&src).tokenize();
     let (ast, pd) = Parser::new(&src, tokens).parse();
-    let mut failed = false;
-    for d in ld.iter().chain(pd.iter()).filter(|d| d.is_error()) {
-        let lc = line_col(&src, d.span.start);
-        eprintln!("{path}:{}:{}: error: {}", lc.line, lc.col, d.message);
-        failed = true;
-    }
+    let failed = report_lex_parse_errors(&src, &path, &ld, &pd);
     if failed {
         return ExitCode::FAILURE;
     }
@@ -864,12 +838,7 @@ fn run_plan(path: &str, build: bool, emit: bool) -> ExitCode {
     };
     let (tokens, ld) = Lexer::new(&src).tokenize();
     let (ast, pd) = Parser::new(&src, tokens).parse();
-    let mut failed = false;
-    for d in ld.iter().chain(pd.iter()).filter(|d| d.is_error()) {
-        let lc = line_col(&src, d.span.start);
-        eprintln!("{path}:{}:{}: error: {}", lc.line, lc.col, d.message);
-        failed = true;
-    }
+    let failed = report_lex_parse_errors(&src, &path, &ld, &pd);
     if failed {
         return ExitCode::FAILURE;
     }
@@ -1050,9 +1019,9 @@ fn report_program(modules: &module::Modules, diags: &[diag::Diagnostic]) -> Exit
         return ExitCode::SUCCESS;
     }
     eprintln!();
-    for d in diags {
-        eprintln!("{}", modules.render(d, d.severity));
-    }
+    // One line table per region for the whole report — rendering each diagnostic
+    // independently rescans the file from byte 0, which a large error storm feels.
+    eprint!("{}", modules.render_all(diags));
     let errors = diags.iter().filter(|d| d.is_error()).count();
     if errors > 0 {
         eprintln!("{errors} error(s)");
@@ -1208,10 +1177,37 @@ fn print_usage() {
     eprintln!("                                --emit writes its comptime-generated artifacts)");
 }
 
+/// Print every lex/parse error as `path:line:col: error: message` and report whether
+/// any were found — the terse locator form the analysis commands (`layout`,
+/// `provenance`, `obligations`, `errsets`, `simd`, `doc`) use as their entry gate.
+///
+/// Shares one [`span::LineIndex`] across the loop: resolving each position
+/// independently rescans the source from byte 0, so a file with many syntax errors
+/// would cost O(errors x file).
+fn report_lex_parse_errors(
+    src: &str,
+    path: &str,
+    lex: &[diag::Diagnostic],
+    parse: &[diag::Diagnostic],
+) -> bool {
+    let mut failed = false;
+    let mut index = None;
+    for d in lex.iter().chain(parse.iter()).filter(|d| d.is_error()) {
+        let idx = index.get_or_insert_with(|| span::LineIndex::new(src));
+        let lc = idx.line_col(src, d.span.start);
+        eprintln!("{path}:{}:{}: error: {}", lc.line, lc.col, d.message);
+        failed = true;
+    }
+    failed
+}
+
 fn dump_tokens(src: &str, path: &str, tokens: &[token::Token]) {
     println!("// {} tokens from {}", tokens.len(), path);
+    // A position per token: without a shared line table this dump is quadratic in
+    // file size, and it is the one command whose whole job is to emit one line per token.
+    let index = span::LineIndex::new(src);
     for tok in tokens {
-        let lc = line_col(src, tok.span.start);
+        let lc = index.line_col(src, tok.span.start);
         let lexeme = src[tok.span.range()].replace('\n', "\\n");
         println!("   {:>4}:{:<3} {:<12} {:?}", lc.line, lc.col, tok.kind.describe(), lexeme);
     }
@@ -1222,8 +1218,9 @@ fn report(src: &str, path: &str, diags: &[diag::Diagnostic]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     eprintln!();
+    let index = span::LineIndex::new(src);
     for d in diags {
-        eprintln!("{}", d.render(src, path, diag::Severity::Error));
+        eprintln!("{}", d.render_indexed(src, &index, path, diag::Severity::Error));
     }
     eprintln!("{} error(s)", diags.len());
     ExitCode::FAILURE

@@ -343,6 +343,29 @@ fn emit_program(
                 _ => None,
             })
             .collect(),
+        fn_by_canon: {
+            // First definition wins, matching the `find_map` scan this replaces.
+            let mut m: HashMap<String, usize> = HashMap::new();
+            for (i, it) in ast.items.iter().enumerate() {
+                if let Item::Fn(f) = it {
+                    let md = *info.item_mod.get(i).unwrap_or(&0);
+                    m.entry(crate::types::canon(md, &f.name.name, &info.dup_fns)).or_insert(i);
+                }
+            }
+            m
+        },
+        gen_enum_by_canon: {
+            let mut m: HashMap<String, usize> = HashMap::new();
+            for (i, it) in ast.items.iter().enumerate() {
+                if let Item::Enum(e) = it {
+                    if e.is_generic() {
+                        let md = *info.item_mod.get(i).unwrap_or(&0);
+                        m.entry(crate::types::canon(md, &e.name.name, &info.dup_types)).or_insert(i);
+                    }
+                }
+            }
+            m
+        },
         def_cap: None,
     };
     g.spawn_sites = g.collect_spawns();
@@ -660,6 +683,12 @@ struct Cgen<'a> {
     /// is borrowed immutably for the whole of codegen, so no `FnDecl` moves and
     /// the addresses stay valid.
     fn_item_index: HashMap<usize, usize>,
+    /// Canonical function name → its index in `ast.items`, first definition wins —
+    /// the lookup behind [`find_fn`](Self::find_fn).
+    fn_by_canon: HashMap<String, usize>,
+    /// Canonical *generic* enum name → its index in `ast.items`, first wins — the
+    /// lookup behind [`find_generic_enum`](Self::find_generic_enum).
+    gen_enum_by_canon: HashMap<String, usize>,
     /// While emitting aggregate *definitions* (structs/enums/generic instances/
     /// slices/arrays/genrefs/results), captures each definition as a segment of the
     /// output buffer plus its by-value type dependencies, so `flush_def_capture` can
@@ -1164,15 +1193,16 @@ impl<'a> Cgen<'a> {
     /// arguments into the variant templates, then apply the same niche rule. So
     /// The generic-enum declaration whose *canonical* name is `ctor` (so a
     /// collided generic enum is found by its disambiguated key — bare otherwise).
+    ///
+    /// Backed by [`gen_enum_by_canon`](Self::gen_enum_by_canon), built once — the
+    /// scan it replaces allocated a `String` per item and runs on every niche-enum
+    /// query. First-wins insertion reproduces the `find_map` result exactly.
     fn find_generic_enum(&self, ctor: &str) -> Option<&'a EnumDecl> {
-        self.ast.items.iter().enumerate().find_map(|(i, it)| match it {
-            Item::Enum(e)
-                if e.is_generic() && self.canon_type_in(self.item_module(i), &e.name.name) == ctor =>
-            {
-                Some(e)
-            }
+        let i = *self.gen_enum_by_canon.get(ctor)?;
+        match &self.ast.items[i] {
+            Item::Enum(e) => Some(e),
             _ => None,
-        })
+        }
     }
 
     /// `Option(*T)`/`Option(&[r]T)` inherit the niche optimization automatically.
@@ -9129,12 +9159,18 @@ impl<'a> Cgen<'a> {
     /// name this is the bare name (callers passing a bare name are unaffected);
     /// for a duplicated name the caller passes the disambiguated `name__m<mod>`,
     /// selecting the right module's definition.
+    ///
+    /// Backed by [`fn_by_canon`](Self::fn_by_canon), built once. The scan it
+    /// replaces allocated a `String` per item inspected (via `canon_item`), and it
+    /// runs once per monomorphized instance — so a generics-heavy program paid
+    /// O(instances x items) allocations. First-wins insertion reproduces the
+    /// `find_map` result exactly.
     fn find_fn(&self, name: &str) -> Option<&'a FnDecl> {
-        let ast = self.ast;
-        ast.items.iter().enumerate().find_map(|(i, it)| match it {
-            Item::Fn(f) if self.canon_item(i, &f.name.name) == name => Some(f),
+        let i = *self.fn_by_canon.get(name)?;
+        match &self.ast.items[i] {
+            Item::Fn(f) => Some(f),
             _ => None,
-        })
+        }
     }
 
     fn make_subst(&self, f: &FnDecl, args: &[Ty]) -> HashMap<String, Ty> {

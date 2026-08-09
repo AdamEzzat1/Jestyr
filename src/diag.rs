@@ -8,7 +8,7 @@
 //! The *collect-don't-panic* discipline starts at the lexer: a bad character is
 //! recorded and recovered from, so one typo can't hide every later error.
 
-use crate::span::{line_col, Span};
+use crate::span::{LineIndex, Span};
 
 /// How severe a diagnostic is (controls the leading label).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -82,7 +82,23 @@ impl Diagnostic {
     ///    |     ^^^^^^^^
     /// ```
     pub fn render(&self, src: &str, path: &str, severity: Severity) -> String {
-        let lc = line_col(src, self.span.start);
+        self.render_indexed(src, &LineIndex::new(src), path, severity)
+    }
+
+    /// [`render`](Self::render) against a prebuilt [`LineIndex`]. Rendering *n*
+    /// diagnostics with the one-shot `render` is O(n · file), which a failing build
+    /// feels (a duplicate-variant storm can emit tens of thousands); share an index
+    /// across the loop and it is O(n · log lines).
+    ///
+    /// `index` must have been built from `src`.
+    pub fn render_indexed(
+        &self,
+        src: &str,
+        index: &LineIndex,
+        path: &str,
+        severity: Severity,
+    ) -> String {
+        let lc = index.line_col(src, self.span.start);
         let start = self.span.start as usize;
 
         // The byte range of the line containing the span's start.
@@ -151,6 +167,7 @@ fn json_escape(s: &str, out: &mut String) {
 /// Positions are **1-based line/column**, matching what the human renderer prints and
 /// what every editor expects. `end_line`/`end_col` describe the span's end, so a
 /// consumer can underline exactly what the caret renderer underlines.
+#[allow(dead_code)] // the one-shot form; report loops go through `to_json_indexed`
 pub fn to_json(
     d: &Diagnostic,
     path: &str,
@@ -158,8 +175,23 @@ pub fn to_json(
     severity: Severity,
     out: &mut String,
 ) {
-    let start = line_col(src, d.span.start);
-    let end = line_col(src, d.span.end);
+    to_json_indexed(d, path, src, &LineIndex::new(src), severity, out)
+}
+
+/// [`to_json`] against a prebuilt [`LineIndex`] — same output, but a report over
+/// many diagnostics builds the line table once instead of twice per diagnostic.
+///
+/// `index` must have been built from `src`.
+pub fn to_json_indexed(
+    d: &Diagnostic,
+    path: &str,
+    src: &str,
+    index: &LineIndex,
+    severity: Severity,
+    out: &mut String,
+) {
+    let start = index.line_col(src, d.span.start);
+    let end = index.line_col(src, d.span.end);
     out.push_str("{\"severity\":\"");
     out.push_str(severity.label());
     out.push_str("\",\"message\":\"");
