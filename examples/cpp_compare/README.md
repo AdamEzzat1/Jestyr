@@ -288,20 +288,21 @@ sessions):
 | `heavy_sieve` | 0.505 s | 0.458 s | 0.91× (0.9–1.2× across sessions) |
 | `heavy_matmul` | 0.210 s | 0.202 s | 0.96× |
 | `heavy_wordcount` | 0.274 s | 0.376 s | **1.37×** — open addressing with no per-node allocation beats the node-based `unordered_map`, and the map itself is written in Jestyr |
-| `heavy_parsum` | 0.145 s | 0.087 s | **0.60×** — the honest loss (a later session on a busier machine measured 0.76×; the ratio moves, the loss does not). Cause diagnosed below: the loop **body is not parallelized yet**. Not a semantics cost — a lowering that has not been written yet |
+| `heavy_parsum` | 0.155 s | 0.169 s | **1.09×** — was **0.60×** until the body was fused into the reduction workers; see [below](#heavy_parsum-was-the-one-loss-and-why-it-no-longer-is). The pre-fusion binary measures 0.199 s on the same run, so fusing is worth 1.28× here |
 
 All four pairs print byte-identical output, so the numbers compare the same
 computation, verified — including the parallel one, whose Jestyr answer is
 schedule-independent by construction and cross-checked against its own serial
 pass in-program.
 
-### Why `heavy_parsum` loses — the actual reason
+### `heavy_parsum` was the one loss, and why it no longer is
 
 An earlier version of this file blamed "the general `par for` reduction
-machinery" for the loss. That was wrong, and vague in the way performance
-excuses usually are. The real cause is specific and visible in the emitted C.
+machinery" for the loss. That was wrong, and vague in the way performance excuses
+usually are. The real cause was specific and visible in the emitted C, and once
+named it was fixable.
 
-`par for x in s reduce(core.sum_reduction()) { x * x }` currently lowers to
+`par for x in s reduce(core.sum_reduction()) { x * x }` **used to** lower to
 **materialize-then-reduce**:
 
 ```c
@@ -342,12 +343,26 @@ unit. Laundering the pointer through a `volatile` global — which is the realis
 case once it crosses a `pthread_create` boundary — is what produces the numbers
 above.
 
-**Determinism is not what is being traded here.** The fused form uses the same
-chunk boundaries and the same fixed combine order as `core.par_reduce`, so the
-grouping of operations is unchanged and the result stays bit-identical to the
-serial fold. What is missing is only the lowering; the guarantee is intact either
-way, and `heavy_parsum` still checks its parallel answer against its own serial
-pass in-program on every run.
+**The fix, and why determinism was never at stake.** `par for … reduce` now
+emits a per-site worker that folds its own chunk of the *source* with the body
+inlined — no temporary, and the body runs on all four threads instead of on one
+ahead of them. The chunk boundaries are `core.par_reduce`'s exactly (`q = n / 4`,
+last chunk takes the remainder) and the four slots merge with `combine` from
+`identity` in the same fixed 0,1,2,3 order. **Same grouping, same merge order**,
+so the result is bit-identical to the serial fold for any reduction on any
+schedule — the guarantee is preserved by construction, not by testing after the
+fact. `heavy_parsum` still checks its parallel answer against its own serial pass
+in-program on every run, and still prints output byte-identical to the C++ twin.
 
-This is not fixed yet. It is written down here at full detail so the number in
-the table above is understood rather than excused.
+Fusion is deliberately narrow. It applies to a top-level non-generic function, a
+non-vectorized site (`@simd` has its own lowering), an integer element type, and a
+body that mentions no name but the loop variable — because the worker is hoisted
+out of the enclosing frame and cannot see its locals. Anything else keeps the old
+lowering, byte for byte. Widening that gate needs capture analysis, which is a
+separate piece of work.
+
+Both toolchains implement it: the change is mirrored in `examples/std/cgen.jtr`,
+so the self-hosted compiler emits the same C, and the bootstrap seed was
+regenerated. Worker indices are assigned in ascending expression order on both
+sides, so the two agree structurally rather than by two traversal orders
+happening to line up.

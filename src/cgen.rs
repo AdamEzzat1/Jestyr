@@ -354,6 +354,7 @@ fn emit_program(
             }
             m
         },
+        par_fusions: HashMap::new(),
         gen_enum_by_canon: {
             let mut m: HashMap<String, usize> = HashMap::new();
             for (i, it) in ast.items.iter().enumerate() {
@@ -378,6 +379,8 @@ fn emit_program(
     // concrete `JestyrSlice_<T>` typedef even when the caller never writes a
     // `slice(T, …)` literal locally.
     g.simd_sites = g.collect_simd_sites();
+    // After `simd_sites`: a vectorized site keeps its own lowering, so fusion skips it.
+    g.par_fusions = g.collect_par_fusions();
     g.slice_instances = g.collect_slices();
     g.array_instances = g.collect_arrays();
     g.struct_instances = g.collect_struct_instances();
@@ -430,6 +433,8 @@ fn emit_program(
     g.spawn_runtime();
     g.consts();
     g.closure_fns();
+    // Before `fn_defs`: a fused `par for` call site names these workers.
+    g.par_fusion_workers();
     g.fn_defs();
     g.method_defs();
     g.impl_defs();
@@ -439,6 +444,70 @@ fn emit_program(
         g.main_wrapper();
     }
     (g.out, g.diags)
+}
+
+/// A `par for … reduce` site whose loop body may be **fused** into the reduction
+/// workers, so each thread folds its own chunk in one pass over the source.
+///
+/// The default lowering is materialize-then-reduce: run the body serially into a
+/// full-size `int64_t` temporary, then hand that temporary to `core.par_reduce`.
+/// That leaves the body — the actual work — single-threaded, and pays for a whole
+/// extra array of memory traffic. Fusing removes both.
+///
+/// Eligibility is deliberately narrow (see `collect_par_fusions`); anything that
+/// does not qualify keeps the original lowering, byte for byte.
+#[derive(Clone)]
+struct ParFusion {
+    /// Names the emitted argument struct and worker (`JestyrParArg_<i>` /
+    /// `jestyr_parwork_<i>`).
+    index: usize,
+    /// C type of the slice element — the loop variable's type inside the worker.
+    elem_cty: String,
+    /// The loop variable's C name (`j_<var>`).
+    var: String,
+    /// The body, already lowered to a C expression yielding an `int64_t`
+    /// contribution. Lowered once, in `collect_par_fusions`, and reused verbatim
+    /// when the worker is emitted.
+    contrib: String,
+}
+
+/// Does this lowered body mention no value name other than the loop variable?
+///
+/// A fused body executes inside a hoisted worker function, which cannot see the
+/// enclosing frame — so a body referring to an enclosing local (or a const, which
+/// a local may legally shadow) is not fusable without capture analysis. Rather
+/// than guess, this requires that the *only* bare `j_`-prefixed name in the
+/// emitted C is the loop variable. Field selectors (`.j_f`, `->j_f`) are fine:
+/// they are selectors on a value, not names resolved from scope.
+///
+/// Conservative by construction — a false "no" costs only the old lowering, while
+/// a false "yes" would emit C that references an out-of-scope identifier, so the
+/// bias is entirely towards refusing.
+fn body_mentions_only_loop_var(c: &str, var: &str) -> bool {
+    let b = c.as_bytes();
+    let mut i = 0usize;
+    while i + 1 < b.len() {
+        if b[i] != b'j' || b[i + 1] != b'_' {
+            i += 1;
+            continue;
+        }
+        let prev = if i == 0 { None } else { Some(b[i - 1]) };
+        // Inside a longer identifier (`foo_j_bar`) this is not a name start.
+        let in_ident = matches!(prev, Some(p) if p.is_ascii_alphanumeric() || p == b'_');
+        // A field selector, not a scope lookup.
+        let selector = matches!(prev, Some(b'.') | Some(b'>'));
+        if !in_ident && !selector {
+            let mut j = i + 2;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            if &c[i..j] != var {
+                return false;
+            }
+        }
+        i += 2;
+    }
+    true
 }
 
 #[derive(Clone)]
@@ -689,6 +758,9 @@ struct Cgen<'a> {
     /// Canonical *generic* enum name → its index in `ast.items`, first wins — the
     /// lookup behind [`find_generic_enum`](Self::find_generic_enum).
     gen_enum_by_canon: HashMap<String, usize>,
+    /// `par for … reduce` sites whose body can be **fused** into the reduction
+    /// workers instead of materialized into a temporary. See [`ParFusion`].
+    par_fusions: HashMap<ExprId, ParFusion>,
     /// While emitting aggregate *definitions* (structs/enums/generic instances/
     /// slices/arrays/genrefs/results), captures each definition as a segment of the
     /// output buffer plus its by-value type dependencies, so `flush_def_capture` can
@@ -842,7 +914,9 @@ impl<'a> Cgen<'a> {
 
     fn prelude(&mut self) {
         self.raw("#include <stdint.h>\n#include <stdbool.h>\n#include <stddef.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <assert.h>\n");
-        if !self.spawn_sites.is_empty() {
+        // A fused `par for` creates its own threads at the call site, so it needs
+        // pthread even when the program contains no explicit `spawn`.
+        if !self.spawn_sites.is_empty() || !self.par_fusions.is_empty() {
             self.raw("#include <pthread.h>\n");
         }
         if self.test_mode {
@@ -7275,6 +7349,37 @@ impl<'a> Cgen<'a> {
         };
         let prc = self.c_fn_name("par_reduce");
 
+        // The FUSED path: each worker folds its own chunk of the *source* with the
+        // body inlined — no temporary, and the body runs on all four threads rather
+        // than on one before them.
+        //
+        // Determinism is preserved by construction, not by luck: the chunk
+        // boundaries are `core.par_reduce`'s exactly (`q = n / 4`, with the last
+        // chunk taking the remainder), and the four slots are merged with `combine`
+        // from `identity` in the same fixed 0,1,2,3 order. Same grouping and same
+        // merge order as before ⇒ bit-identical result, for any reduction, on any
+        // schedule.
+        if let Some(fz) = self.par_fusions.get(&site).cloned() {
+            let k = fz.index;
+            let rty = self.c_type(&apply_subst(&self.info.type_of(reduction).clone(), &self.subst));
+            return format!(
+                "({{ {sl} _pf{n} = {src}; {rty} _pd{n} = {red}; \
+                 size_t _pn{n} = _pf{n}.len; size_t _pq{n} = _pn{n} / 4; \
+                 int64_t _ps{n}[4]; JestyrParArg_{k} _pa{n}[4]; pthread_t _pt{n}[4]; \
+                 _pa{n}[0] = (JestyrParArg_{k}){{ _pf{n}.ptr, 0, _pq{n}, &_ps{n}[0], _pd{n}.j_identity, _pd{n}.j_accumulate }}; \
+                 _pa{n}[1] = (JestyrParArg_{k}){{ _pf{n}.ptr, _pq{n}, _pq{n} + _pq{n}, &_ps{n}[1], _pd{n}.j_identity, _pd{n}.j_accumulate }}; \
+                 _pa{n}[2] = (JestyrParArg_{k}){{ _pf{n}.ptr, _pq{n} + _pq{n}, _pq{n} + _pq{n} + _pq{n}, &_ps{n}[2], _pd{n}.j_identity, _pd{n}.j_accumulate }}; \
+                 _pa{n}[3] = (JestyrParArg_{k}){{ _pf{n}.ptr, _pq{n} + _pq{n} + _pq{n}, _pn{n}, &_ps{n}[3], _pd{n}.j_identity, _pd{n}.j_accumulate }}; \
+                 for (int _pw{n} = 0; _pw{n} < 4; _pw{n}++) \
+                 pthread_create(&_pt{n}[_pw{n}], NULL, jestyr_parwork_{k}, &_pa{n}[_pw{n}]); \
+                 for (int _pw{n} = 0; _pw{n} < 4; _pw{n}++) pthread_join(_pt{n}[_pw{n}], NULL); \
+                 int64_t _pr{n} = _pd{n}.j_identity; \
+                 for (int _pw{n} = 0; _pw{n} < 4; _pw{n}++) \
+                 _pr{n} = _pd{n}.j_combine(_pr{n}, _ps{n}[_pw{n}]); \
+                 _pr{n}; }})"
+            );
+        }
+
         // The vector path, for a site an `@simd` function declared and the legality pass
         // certified. Shape: a lane-at-a-time head, then the SCALAR remainder — and the
         // remainder genuinely must be scalar, because a mask blend is not a conditional
@@ -8402,6 +8507,132 @@ impl<'a> Cgen<'a> {
     ///
     /// The verdict comes from the same `simd::classify` the attribute check uses, so a
     /// loop cgen vectorizes can never be one the compiler refused to certify.
+    /// Find the `par for … reduce` sites whose body can be fused into the reduction
+    /// workers (see [`ParFusion`]). Everything else keeps the materialize-then-reduce
+    /// lowering unchanged.
+    ///
+    /// The gate is deliberately narrow, because a fused body is hoisted into a
+    /// worker function that cannot see the enclosing frame:
+    ///
+    /// * **top-level, non-generic functions only** — a generic function is emitted
+    ///   once per instantiation with a different `subst`, so one hoisted worker
+    ///   could not serve them all. `collect_closures` draws the same line.
+    /// * **not a vectorized site** — the `@simd` path has its own lowering.
+    /// * **integer element type** — the worker is monomorphic (`spawn` targets
+    ///   cannot be generic, which is why `core.par_reduce` is `i64`-only).
+    /// * **the body mentions no name but the loop variable** — see
+    ///   [`body_mentions_only_loop_var`].
+    ///
+    /// The body is lowered here (once) so eligibility can be judged on the real
+    /// emitted C; `self.tmp` and any diagnostics produced by a *rejected* trial are
+    /// rolled back, so a program with no fusable site emits exactly what it did
+    /// before, temporary numbering included.
+    fn collect_par_fusions(&mut self) -> HashMap<ExprId, ParFusion> {
+        let mut out = HashMap::new();
+        let ast = self.ast;
+        let saved_tmp = self.tmp;
+        let saved_diags = self.diags.len();
+        let saved_mod = self.cur_mod;
+        self.subst.clear();
+        // Collected first, indexed second. Worker names (`jestyr_parwork_<i>`) are
+        // part of the emitted C, so the *self-hosted port must assign the same
+        // index to the same site*. Sorting by `ExprId` makes that agreement
+        // structural — the arena is in source order, so both implementations can
+        // reach it by walking expressions ascending — rather than an accident of
+        // matching two traversal orders.
+        let mut found: Vec<(ExprId, String, String, String)> = Vec::new();
+        for i in 0..ast.items.len() {
+            let Item::Fn(f) = &ast.items[i] else { continue };
+            if self.is_generic(f) || !self.fn_supported(f) {
+                continue;
+            }
+            self.cur_mod = self.item_module(i);
+            for site in crate::simd::sites_in_span(ast, f.body.span) {
+                let id = site.id;
+                if self.simd_sites.contains_key(&id) {
+                    continue;
+                }
+                let ExprKind::ParFor { var, iter, body, .. } = &ast.expr_at(id).kind else {
+                    continue;
+                };
+                // Exactly `emit_par_for`'s normalization — and exactly what the
+                // port's `par_elem_ty` computes, which is what lets the two agree
+                // without a second, separately-maintained rule. A non-integer
+                // element cannot reach here anyway: typeck refuses it ("slice of
+                // any integer type"), so the fallback is unreachable in a valid
+                // program rather than a silent reinterpretation.
+                let elem = match self.info.type_of(*iter).clone() {
+                    Ty::Slice(e) => (*e).clone(),
+                    Ty::Array { elem, .. } => (*elem).clone(),
+                    _ => Ty::Prim("i64"),
+                };
+                let elem = if matches!(&elem, Ty::Prim(p) if is_integer_c_prim(p)) {
+                    elem
+                } else {
+                    Ty::Prim("i64")
+                };
+                let vname = format!("j_{}", var.name);
+                let before_tmp = self.tmp;
+                let before_diags = self.diags.len();
+                let bodyc = self.emit_expr(*body);
+                let body_ty = self.info.type_of(*body).clone();
+                let contrib = if matches!(&body_ty, Ty::Prim("i64")) {
+                    bodyc
+                } else {
+                    format!("(int64_t)({bodyc})")
+                };
+                if !body_mentions_only_loop_var(&contrib, &vname) {
+                    // Not fusable: undo the trial so the untouched lowering below
+                    // numbers its temporaries exactly as it always has.
+                    self.tmp = before_tmp;
+                    self.diags.truncate(before_diags);
+                    continue;
+                }
+                let elem_cty = self.c_type(&elem);
+                found.push((id, elem_cty, vname, contrib));
+            }
+        }
+        found.sort_by_key(|(id, ..)| id.0);
+        for (index, (id, elem_cty, var, contrib)) in found.into_iter().enumerate() {
+            out.insert(id, ParFusion { index, elem_cty, var, contrib });
+        }
+        self.tmp = saved_tmp;
+        self.diags.truncate(saved_diags);
+        self.cur_mod = saved_mod;
+        out
+    }
+
+    /// Emit the argument struct and worker function for each fused `par for`.
+    ///
+    /// The worker folds its half-open `[lo, hi)` chunk into a private accumulator
+    /// with the body **inlined**, so the C compiler sees straight-line code rather
+    /// than a call per element. `accfn` is declared as a plain C function pointer
+    /// (not the generated `JestyrFn_…` typedef) because it is the same underlying
+    /// type and needs no typedef to be in scope.
+    fn par_fusion_workers(&mut self) {
+        if self.par_fusions.is_empty() {
+            return;
+        }
+        let mut fusions: Vec<ParFusion> = self.par_fusions.values().cloned().collect();
+        fusions.sort_by_key(|f| f.index);
+        for f in fusions {
+            let ParFusion { index: k, elem_cty, var, contrib } = f;
+            self.raw(format!(
+                "typedef struct {{ const {elem_cty}* ptr; size_t lo; size_t hi; int64_t* slot; \
+                 int64_t ident; int64_t (*accfn)(int64_t, int64_t); }} JestyrParArg_{k};\n"
+            ));
+            self.raw(format!(
+                "static void* jestyr_parwork_{k}(void* _pv)\n{{\n    \
+                 JestyrParArg_{k}* _pg = (JestyrParArg_{k}*)_pv;\n    \
+                 int64_t _pacc = _pg->ident;\n    \
+                 for (size_t _pi = _pg->lo; _pi < _pg->hi; _pi++) {{\n        \
+                 {elem_cty} {var} = _pg->ptr[_pi];\n        \
+                 _pacc = _pg->accfn(_pacc, {contrib});\n    }}\n    \
+                 *_pg->slot = _pacc;\n    return NULL;\n}}\n\n"
+            ));
+        }
+    }
+
     fn collect_simd_sites(&self) -> std::collections::HashMap<ExprId, Ty> {
         let mut out = std::collections::HashMap::new();
         for item in &self.ast.items {
@@ -11469,17 +11700,38 @@ mod tests {
     }
 
     #[test]
-    fn lowers_par_for_to_serial_map_plus_parallel_reduce() {
-        // `par for x in s reduce(r) { x*x }` lowers to: a serial map of the body into a
-        // scratch buffer, then a call to the deterministic engine `core.par_reduce`.
+    fn lowers_par_for_to_a_fused_parallel_reduction() {
+        // `par for x in s reduce(r) { x*x }` fuses: each worker folds its own chunk of
+        // the SOURCE with the body inlined. No scratch buffer, and the body runs on
+        // every thread rather than serially ahead of them.
         let src = "fn sum_reduction() -> i64 { return 0 } \
                    fn main() -> i32 { var a: *mut i64 = alloc(i64, 4) let s: []i64 = slice(i64, a, 4) \
                        let r: i64 = par for x in s reduce(sum_reduction()) { x * x } return 0 }";
         let (c, d) = gen(src);
         assert!(d.is_empty(), "{:?}", d);
-        assert!(c.contains("malloc("), "par for maps into a scratch buffer: {c}");
-        assert!(c.contains("jestyr_par_reduce("), "par for reduces via the par_reduce engine: {c}");
+        assert!(c.contains("jestyr_parwork_0"), "a per-site worker is emitted: {c}");
+        assert!(c.contains("(j_x * j_x)"), "the body is INLINED in the worker, not called: {c}");
+        assert!(!c.contains("_pm"), "no scratch buffer is materialized: {c}");
+        assert!(!c.contains("jestyr_par_reduce("), "the engine call is replaced by the fused loop: {c}");
+        // Determinism: the chunk split and the merge order must stay `core.par_reduce`'s.
+        assert!(c.contains("_pn0 / 4"), "same four-way split as par_reduce: {c}");
+        assert!(c.contains("j_combine"), "slots are merged with the reduction's combine: {c}");
+    }
+
+    #[test]
+    fn a_par_for_body_touching_an_enclosing_local_keeps_the_buffered_lowering() {
+        // The fused worker is hoisted out of the frame, so a body that reads an
+        // enclosing local cannot be fused without capture analysis. It must fall back
+        // to materialize-then-reduce rather than emit an out-of-scope reference.
+        let src = "fn sum_reduction() -> i64 { return 0 } \
+                   fn main() -> i32 { var a: *mut i64 = alloc(i64, 4) let s: []i64 = slice(i64, a, 4) \
+                       let k: i64 = 3 \
+                       let r: i64 = par for x in s reduce(sum_reduction()) { x * k } return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("jestyr_par_reduce("), "falls back to the engine: {c}");
         assert!(c.contains("(JestyrSlice_i64){ _pm"), "the mapped buffer is passed as a slice: {c}");
+        assert!(!c.contains("jestyr_parwork"), "no worker is emitted for a capturing body: {c}");
     }
 
     #[test]

@@ -10463,7 +10463,10 @@ fn uses_arena(read p: Parser, read src: str) -> bool {
 
 fn emit_prelude(mut sb: String, read p: Parser, read src: str, read g: Cg) {
     string_push(sb, "#include <stdint.h>\n#include <stdbool.h>\n#include <stddef.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <assert.h>\n")
-    if len(i32, g.sps) > 0 {                     // any spawn site -> the pthread runtime
+    var needs_pthread: bool = false
+    if len(i32, g.sps) > 0 { needs_pthread = true }   // any spawn site
+    if len(i32, g.pfs) > 0 { needs_pthread = true }   // a fused par-for makes its own threads
+    if needs_pthread {                                // -> the pthread runtime
         string_push(sb, "#include <pthread.h>\n")
     }
     if g.tmode {                                      // `@bench` timing via clock()
@@ -12403,6 +12406,11 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
             sd_emit_par_for(sb, p, src, c, g, e, eid, ety, pfn)
             return
         }
+        let pfi: i32 = pf_index_of(g, eid)
+        if pfi >= 0 {
+            pf_emit_fused(sb, p, src, c, g, e, ety, pfn, pfi)
+            return
+        }
         string_push(sb, "({ JestyrSlice_")
         push_ty_mangle(sb, src, c, ety)
         string_push(sb, " _pf")
@@ -13953,7 +13961,7 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // `gfi` holds the collected generic-fn instance records ([fn item, argc, (kind,a,b) targ
 // triples…], variable length — walk with a cursor); `su` is the ACTIVE instance's
 // type-parameter substitution (5-tuples: tparam span + arg triple), read by `emit_su_ty`.
-struct Cg { sds: List(i32), tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32, dg: i32, gmi: List(i32), tmode: bool, alloc: Allocator }
+struct Cg { sds: List(i32), pfs: List(i32), pfb: String, pfo: List(i32), tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32, dg: i32, gmi: List(i32), tmode: bool, alloc: Allocator }
 
 // The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
 // (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
@@ -19475,6 +19483,328 @@ fn sd_emit_par_for(mut sb: String, read p: Parser, read src: str, read c: Checke
 // It happened to agree in normal mode (where both sites landed on one row) and diverged
 // only in TEST mode, where the harness's extra code shifts the arena — a reminder that
 // "the ids matched" is not the same as "the types are the same".
+
+// ── `par for … reduce` fusion (mirrors `collect_par_fusions` / `par_fusion_workers`) ──
+//
+// The default lowering maps the body SERIALLY into a full-size int64 temporary and
+// hands that to `core.par_reduce`, so the body -- the actual work -- runs on one
+// thread while four threads do a trivial `+` over a freshly written array. Fusion
+// emits a per-site worker that folds its own chunk of the SOURCE with the body
+// inlined: no temporary, and the body runs on all four threads.
+//
+// Determinism is preserved by construction: the chunk boundaries are
+// `core.par_reduce`'s exactly (`q = n / 4`, last chunk takes the remainder) and the
+// four slots merge with `combine` from `identity` in the same fixed 0,1,2,3 order.
+// Same grouping and same merge order, so the result is bit-identical for any
+// reduction on any schedule.
+//
+// `g.pfs` holds the eids of fusable sites in ASCENDING order, so a site's POSITION
+// in the list is its worker index -- the same index the reference assigns by sorting
+// on ExprId. That is what makes the two implementations agree structurally rather
+// than by two traversal orders happening to match. `g.pfb`/`g.pfo` carry each site's
+// lowered body, emitted ONCE during collection (exactly as the reference stores
+// `ParFusion::contrib`) so the worker section does not re-run `emit_expr` and shift
+// every later temporary number.
+
+fn pf_is_ident_byte(b: i32) -> bool {
+    if b >= 48 { if b <= 57 { return true } }         // 0-9
+    if b >= 65 { if b <= 90 { return true } }         // A-Z
+    if b >= 97 { if b <= 122 { return true } }        // a-z
+    if b == 95 { return true }                        // _
+    return false
+}
+
+// Does this lowered body mention no value name other than the loop variable?
+// Mirrors `body_mentions_only_loop_var`: a fused body runs in a hoisted worker that
+// cannot see the enclosing frame, so a reference to an enclosing local (or a const,
+// which a local may legally shadow) is not fusable without capture analysis. Field
+// selectors (`.j_f`, `->j_f`) are fine -- selectors on a value, not scope lookups.
+fn pf_body_only_var(read body: str, read vname: str) -> bool {
+    let n: usize = body.len
+    var i: usize = 0
+    for i + 1 < n {
+        var isj: bool = false
+        if (body[i] as i32) == 106 {                  // 'j'
+            if (body[i + 1] as i32) == 95 { isj = true }   // '_'
+        }
+        if isj {
+            var prev: i32 = 0 - 1
+            if i > 0 { prev = body[i - 1] as i32 }
+            var skip: bool = false
+            if prev >= 0 {
+                if pf_is_ident_byte(prev) { skip = true }   // inside a longer identifier
+                if prev == 46 { skip = true }               // '.' field selector
+                if prev == 62 { skip = true }               // '>' through `->`
+            }
+            if skip == false {
+                var j: usize = i + 2
+                for j < n {
+                    if pf_is_ident_byte(body[j] as i32) == false { break }
+                    j = j + 1
+                }
+                if str_eq(body[i .. j], vname) == false { return false }
+            }
+            i = i + 2
+        } else {
+            i = i + 1
+        }
+    }
+    return true
+}
+
+// The worker index of a fused site, or -1. Position in `g.pfs` IS the index.
+fn pf_index_of(read g: Cg, eid: i32) -> i32 {
+    var i: usize = 0
+    for i < len(i32, g.pfs) {
+        if get(i32, g.pfs, i) == eid { return i as i32 }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Consider one `par for` site for fusion. Lowers the body exactly as the worker will
+// and judges the RESULT -- the same textual rule on the same text as the reference.
+// `g.tmp` is restored either way, so a rejected trial leaves the ordinary lowering
+// numbering its temporaries exactly as it always has.
+fn pf_try(mut g: Cg, read p: Parser, read src: str, read c: Checker, read d: ExprData, eid: i32) {
+    let saved_tmp: i32 = g.tmp
+    var body: String = string_new()
+    let bty: i32 = get(i32, c.et, d.op as usize)
+    let widen: bool = ty_is_i64(c, bty) == false
+    if widen { string_push(body, "(int64_t)(") }
+    emit_expr(body, p, src, c, g, d.op)
+    if widen { string_push(body, ")") }
+    var vname: String = string_new()
+    string_push(vname, "j_")
+    string_push(vname, src[d.x as usize .. d.y as usize])
+    let bs: str = string_view(body)
+    let vs: str = string_view(vname)
+    if pf_body_only_var(bs, vs) {
+        let pb: str = string_view(g.pfb)
+        let off: usize = pb.len
+        string_push(g.pfb, bs)
+        let pb2: str = string_view(g.pfb)
+        push(i32, g.pfs, eid)
+        push(i32, g.pfo, off as i32)
+        push(i32, g.pfo, pb2.len as i32)
+    }
+    string_free(body)
+    string_free(vname)
+    g.tmp = saved_tmp
+}
+
+// Find every fusable site, in ascending expression order. Mirrors
+// `collect_par_fusions`: top-level non-template functions only (a template is
+// emitted once per instantiation with a different substitution, so one hoisted
+// worker could not serve them all), and never a vectorized site -- `@simd` has its
+// own lowering. Must run AFTER `sd_collect`, whose verdicts it consults.
+fn pf_collect(mut g: Cg, read p: Parser, read src: str, read c: Checker) {
+    let ne: usize = len(ExprData, p.ex)
+    var r: usize = 0
+    for r < len(i32, p.roots) {
+        let iid: i32 = get(i32, p.roots, r)
+        let it: ItemData = get(ItemData, p.it, iid as usize)
+        if it.kind == 3 {
+            if fn_is_template(p, it) == false {
+                if it.w >= 0 {
+                    let bd: ExprData = get(ExprData, p.ex, it.w as usize)
+                    var e: usize = 0
+                    for e < ne {
+                        let d: ExprData = get(ExprData, p.ex, e)
+                        if d.kind == 41 {
+                            if d.start >= bd.start {
+                                if d.end <= bd.end {
+                                    if sd_is_site(g, e as i32) == false {
+                                        pf_try(g, p, src, c, d, e as i32)
+                                    }
+                                }
+                            }
+                        }
+                        e = e + 1
+                    }
+                }
+            }
+        }
+        r = r + 1
+    }
+}
+
+// Emit the argument struct and worker for each fused site, before the function
+// definitions that name them. The body is INLINED (taken verbatim from `g.pfb`), so
+// the C compiler sees straight-line code rather than a call per element; `accfn` is a
+// plain C function pointer because it is the same underlying type as the generated
+// `JestyrFn_…` typedef and needs no typedef in scope.
+fn pf_workers(mut sb: String, read p: Parser, read src: str, read c: Checker, read g: Cg) {
+    var i: usize = 0
+    for i < len(i32, g.pfs) {
+        let eid: i32 = get(i32, g.pfs, i)
+        let d: ExprData = get(ExprData, p.ex, eid as usize)
+        let ety: i32 = par_elem_ty(c, d.a)
+        let bo: usize = get(i32, g.pfo, i * 2) as usize
+        let be: usize = get(i32, g.pfo, i * 2 + 1) as usize
+        let pb: str = string_view(g.pfb)
+        string_push(sb, "typedef struct { const ")
+        emit_ty_c(sb, p, src, c, ety)
+        string_push(sb, "* ptr; size_t lo; size_t hi; int64_t* slot; int64_t ident; int64_t (*accfn)(int64_t, int64_t); } JestyrParArg_")
+        push_uint__cgen(sb, i as i64)
+        string_push(sb, ";\n")
+        string_push(sb, "static void* jestyr_parwork_")
+        push_uint__cgen(sb, i as i64)
+        string_push(sb, "(void* _pv)\n{\n    JestyrParArg_")
+        push_uint__cgen(sb, i as i64)
+        string_push(sb, "* _pg = (JestyrParArg_")
+        push_uint__cgen(sb, i as i64)
+        string_push(sb, "*)_pv;\n    int64_t _pacc = _pg->ident;\n    for (size_t _pi = _pg->lo; _pi < _pg->hi; _pi++) {\n        ")
+        emit_ty_c(sb, p, src, c, ety)
+        string_push(sb, " j_")
+        string_push(sb, src[d.x as usize .. d.y as usize])
+        string_push(sb, " = _pg->ptr[_pi];\n        _pacc = _pg->accfn(_pacc, ")
+        string_push(sb, pb[bo .. be])
+        string_push(sb, ");\n    }\n    *_pg->slot = _pacc;\n    return NULL;\n}\n\n")
+        i = i + 1
+    }
+}
+
+// Emit the fused call site. Keeps the reference's emission ORDER -- iter, reduction,
+// then the body (emitted and discarded here, since the worker already carries it) --
+// because `emit_expr` consumes temporary numbers and a different order would shift
+// every later `_pf<n>` in the file.
+fn pf_emit_fused(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg, read e: ExprData, ety: i32, pfn: i32, k: i32) {
+    var itb: String = string_new()
+    emit_expr(itb, p, src, c, g, e.a)                 // iter
+    var rdb: String = string_new()
+    emit_expr(rdb, p, src, c, g, e.b)                 // reduction, before the body
+    var dead: String = string_new()
+    emit_expr(dead, p, src, c, g, e.op)               // body: discarded, but it must
+    string_free(dead)                                 // still consume its temp numbers
+    let n: i64 = pfn as i64
+    let ki: i64 = k as i64
+    string_push(sb, "({ JestyrSlice_")
+    push_ty_mangle(sb, src, c, ety)
+    string_push(sb, " _pf")
+    push_uint__cgen(sb, n)
+    string_push(sb, " = ")
+    string_push(sb, string_view(itb))
+    string_push(sb, "; ")
+    emit_ty_c(sb, p, src, c, get(i32, c.et, e.b as usize))
+    string_push(sb, " _pd")
+    push_uint__cgen(sb, n)
+    string_push(sb, " = ")
+    string_push(sb, string_view(rdb))
+    string_push(sb, "; size_t _pn")
+    push_uint__cgen(sb, n)
+    string_push(sb, " = _pf")
+    push_uint__cgen(sb, n)
+    string_push(sb, ".len; size_t _pq")
+    push_uint__cgen(sb, n)
+    string_push(sb, " = _pn")
+    push_uint__cgen(sb, n)
+    string_push(sb, " / 4; int64_t _ps")
+    push_uint__cgen(sb, n)
+    string_push(sb, "[4]; JestyrParArg_")
+    push_uint__cgen(sb, ki)
+    string_push(sb, " _pa")
+    push_uint__cgen(sb, n)
+    string_push(sb, "[4]; pthread_t _pt")
+    push_uint__cgen(sb, n)
+    string_push(sb, "[4]; ")
+    var w: i64 = 0
+    for w < 4 {
+        string_push(sb, "_pa")
+        push_uint__cgen(sb, n)
+        string_push(sb, "[")
+        push_uint__cgen(sb, w)
+        string_push(sb, "] = (JestyrParArg_")
+        push_uint__cgen(sb, ki)
+        string_push(sb, "){ _pf")
+        push_uint__cgen(sb, n)
+        string_push(sb, ".ptr, ")
+        pf_push_bound(sb, n, w)                       // lo
+        string_push(sb, ", ")
+        pf_push_bound(sb, n, w + 1)                   // hi
+        string_push(sb, ", &_ps")
+        push_uint__cgen(sb, n)
+        string_push(sb, "[")
+        push_uint__cgen(sb, w)
+        string_push(sb, "], _pd")
+        push_uint__cgen(sb, n)
+        string_push(sb, ".j_identity, _pd")
+        push_uint__cgen(sb, n)
+        string_push(sb, ".j_accumulate }; ")
+        w = w + 1
+    }
+    string_push(sb, "for (int _pw")
+    push_uint__cgen(sb, n)
+    string_push(sb, " = 0; _pw")
+    push_uint__cgen(sb, n)
+    string_push(sb, " < 4; _pw")
+    push_uint__cgen(sb, n)
+    string_push(sb, "++) pthread_create(&_pt")
+    push_uint__cgen(sb, n)
+    string_push(sb, "[_pw")
+    push_uint__cgen(sb, n)
+    string_push(sb, "], NULL, jestyr_parwork_")
+    push_uint__cgen(sb, ki)
+    string_push(sb, ", &_pa")
+    push_uint__cgen(sb, n)
+    string_push(sb, "[_pw")
+    push_uint__cgen(sb, n)
+    string_push(sb, "]); for (int _pw")
+    push_uint__cgen(sb, n)
+    string_push(sb, " = 0; _pw")
+    push_uint__cgen(sb, n)
+    string_push(sb, " < 4; _pw")
+    push_uint__cgen(sb, n)
+    string_push(sb, "++) pthread_join(_pt")
+    push_uint__cgen(sb, n)
+    string_push(sb, "[_pw")
+    push_uint__cgen(sb, n)
+    string_push(sb, "], NULL); int64_t _pr")
+    push_uint__cgen(sb, n)
+    string_push(sb, " = _pd")
+    push_uint__cgen(sb, n)
+    string_push(sb, ".j_identity; for (int _pw")
+    push_uint__cgen(sb, n)
+    string_push(sb, " = 0; _pw")
+    push_uint__cgen(sb, n)
+    string_push(sb, " < 4; _pw")
+    push_uint__cgen(sb, n)
+    string_push(sb, "++) _pr")
+    push_uint__cgen(sb, n)
+    string_push(sb, " = _pd")
+    push_uint__cgen(sb, n)
+    string_push(sb, ".j_combine(_pr")
+    push_uint__cgen(sb, n)
+    string_push(sb, ", _ps")
+    push_uint__cgen(sb, n)
+    string_push(sb, "[_pw")
+    push_uint__cgen(sb, n)
+    string_push(sb, "]); _pr")
+    push_uint__cgen(sb, n)
+    string_push(sb, "; })")
+    string_free(itb)
+    string_free(rdb)
+}
+
+// Chunk boundary `w` of four: 0, q, q+q, q+q+q, then n for w == 4. Spelled as repeated
+// addition rather than multiplication because that is exactly how `core.par_reduce`
+// writes it, and the whole determinism argument rests on the two agreeing.
+fn pf_push_bound(mut sb: String, n: i64, w: i64) {
+    if w == 0 { string_push(sb, "0")  return }
+    if w == 4 {
+        string_push(sb, "_pn")
+        push_uint__cgen(sb, n)
+        return
+    }
+    var i: i64 = 0
+    for i < w {
+        if i > 0 { string_push(sb, " + ") }
+        string_push(sb, "_pq")
+        push_uint__cgen(sb, n)
+        i = i + 1
+    }
+}
+
 fn sd_vector_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, read g: Cg, read a: Allocator) {
     var seen: String = string_new()
     var any: bool = false
@@ -22360,7 +22690,7 @@ fn emit_main_wrapper(mut sb: String, read p: Parser, read src: str) {
 // `"\n"` pushes stand in for the reference's unconditionally-blank sections that are empty for a
 // program with no aggregates (closure_types, method_protos, consts) plus the guarded no-ops.
 fn emit_program(mut sb: String, read p: Parser, read c: Checker, read src: str, read a: Allocator, tmode: bool, read tf: str) {
-    var g: Cg = Cg{ sds: make__list(i32, a), tmp: 0, pp: make__list(i32, a), rf: make__list(i32, a), res_ok: 0 - 2, etags: make__list(i32, a), req: make__list(i32, a), ens: make__list(i32, a), retty: 0 - 1, mi: make__list(i32, a), self_ptr: false, gei: make__list(i32, a), curfn: 0 - 1, mv: make__list(i32, a), ds: make__list(i32, a), dsb: make__list(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: make__list(i32, a), vtf: 0, gfi: make__list(i32, a), su: make__list(i32, a), cls: make__list(i32, a), ccx: make__list(i32, a), cca: make__list(i32, a), caps: make__list(i32, a), gsi: make__list(i32, a), sps: make__list(i32, a), dspawn: false, th: make__list(i32, a), thf: 0, dg: 0 - 1, gmi: make__list(i32, a), tmode: tmode, alloc: a }
+    var g: Cg = Cg{ sds: make__list(i32, a), pfs: make__list(i32, a), pfb: string_new(), pfo: make__list(i32, a), tmp: 0, pp: make__list(i32, a), rf: make__list(i32, a), res_ok: 0 - 2, etags: make__list(i32, a), req: make__list(i32, a), ens: make__list(i32, a), retty: 0 - 1, mi: make__list(i32, a), self_ptr: false, gei: make__list(i32, a), curfn: 0 - 1, mv: make__list(i32, a), ds: make__list(i32, a), dsb: make__list(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: make__list(i32, a), vtf: 0, gfi: make__list(i32, a), su: make__list(i32, a), cls: make__list(i32, a), ccx: make__list(i32, a), cca: make__list(i32, a), caps: make__list(i32, a), gsi: make__list(i32, a), sps: make__list(i32, a), dspawn: false, th: make__list(i32, a), thf: 0, dg: 0 - 1, gmi: make__list(i32, a), tmode: tmode, alloc: a }
     collect_spawns(g, p, src)                        // spawn sites (gates the pthread prelude)
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     // Plain-struct methods now flow through the SAME worklist as generic instances
@@ -22373,6 +22703,7 @@ fn emit_program(mut sb: String, read p: Parser, read c: Checker, read src: str, 
     collect_genum_instances(g, p, src, c)            // generic-enum instance TyIds, expr order
     collect_closures(g, p, src, a)                   // closures + captures, discovery order (LAST, like the reference)
     sd_collect(g, p, src)                            // @simd sites to vectorize (Q-S2)
+    pf_collect(g, p, src, c)                         // par-for bodies that can fuse (after sd_collect)
     emit_prelude(sb, p, src, g)
     emit_forward_types(sb, p, src)
     emit_gen_forward_types(sb, p, src, c, g)         // monomorphized generic-enum instance fwd typedefs
@@ -22404,6 +22735,7 @@ fn emit_program(mut sb: String, read p: Parser, read c: Checker, read src: str, 
     emit_spawn_runtime(sb, p, src, c, g)             // spawn arg-pack structs + trampolines
     emit_consts(sb, p, src, c, g)                    // consts + its unconditional trailing blank
     emit_closure_fns(sb, p, src, c, g)               // lifted `jestyr_lam_<id>` fns before the free fns
+    pf_workers(sb, p, src, c, g)                     // fused par-for workers, before the fns that name them
     emit_fn_defs(sb, p, src, c, g)
     emit_method_defs(sb, p, src, c, g)               // method bodies after the free fns
     emit_impl_defs(sb, p, src, c, g)                 // trait-impl bodies last

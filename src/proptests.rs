@@ -4859,30 +4859,37 @@ mod par_for_width {
     #[test]
     fn the_loop_variable_has_the_element_type() {
         let c = emitted(&prog("i32", "x * x"));
-        assert!(c.contains("int32_t j_x = _pf0.ptr[_pi0];"), "loop var should be int32_t:\n{c}");
-        // …and the contribution is widened exactly once, on the way into the buffer.
-        assert!(c.contains("_pm0[_pi0] = (int64_t)((j_x * j_x));"), "contribution should widen once:\n{c}");
+        // The loop variable lives in the fused worker, at the element's own width.
+        assert!(c.contains("int32_t j_x = _pg->ptr[_pi];"), "loop var should be int32_t:\n{c}");
+        // …and the contribution is widened exactly once, on the way into the accumulator.
+        assert!(
+            c.contains("_pacc = _pg->accfn(_pacc, (int64_t)((j_x * j_x)));"),
+            "contribution should widen once:\n{c}"
+        );
     }
 
-    /// The `i64` case must emit what it always did — that byte-identity is what keeps
-    /// this increment off the corpus, the concat, the seed and every attested hash.
+    /// An `i64` body is already the accumulator's type, so it must not pick up a
+    /// redundant cast — the widening exists for narrower elements only.
     #[test]
-    fn the_i64_lowering_is_unchanged() {
+    fn an_i64_body_gains_no_cast() {
         let c = emitted(&prog("i64", "x * x"));
-        assert!(c.contains("int64_t j_x = _pf0.ptr[_pi0];"), "{c}");
-        // No cast: the body is already the reduction's type.
-        assert!(c.contains("_pm0[_pi0] = (j_x * j_x);"), "an i64 body must not gain a cast:\n{c}");
-        assert!(!c.contains("(int64_t)((j_x * j_x))"), "the i64 path must be byte-identical:\n{c}");
+        assert!(c.contains("int64_t j_x = _pg->ptr[_pi];"), "{c}");
+        assert!(
+            c.contains("_pacc = _pg->accfn(_pacc, (j_x * j_x));"),
+            "an i64 body must not gain a cast:\n{c}"
+        );
+        assert!(!c.contains("(int64_t)((j_x * j_x))"), "no redundant widening:\n{c}");
     }
 
-    /// The source slice keeps its own type while the reduce call takes the `i64` buffer
-    /// — two different slice types in one lowering, which is the thing that makes the
-    /// widening free.
+    /// The source keeps its own element width while the accumulator is `i64` — two
+    /// widths in one lowering, which is what makes the widening free. After fusion
+    /// the narrow side is the worker's `ptr`, not a materialized buffer.
     #[test]
-    fn the_source_and_the_reduced_buffer_have_different_slice_types() {
+    fn the_source_and_the_accumulator_have_different_widths() {
         let c = emitted(&prog("u8", "x as i64"));
         assert!(c.contains("JestyrSlice_u8 _pf0 = "), "source keeps its element type:\n{c}");
-        assert!(c.contains("(JestyrSlice_i64){ _pm0, _pf0.len }"), "the engine still takes []i64:\n{c}");
+        assert!(c.contains("const uint8_t* ptr;"), "the worker reads the narrow element:\n{c}");
+        assert!(c.contains("int64_t ident;"), "the accumulator is i64:\n{c}");
     }
 
     /// A non-integer element or contribution is refused, not coerced. The reduction is
