@@ -73,6 +73,13 @@ Deliberately small, additive, and behaviour-preserving.
 
 ## 3. Concrete syntax tree (for formatter / LSP)
 
+> **Stage 1 is implemented** in `src/cst.rs`. `attach` pairs each token with the
+> trivia before it, `render` reproduces the source, and `pieces` classifies a
+> trivia run into whitespace / line comment / block comment. The round trip is a
+> property over arbitrary text, over trivia soup, and over every `.jtr` file in
+> the repository (`proptests::cst_props`). No lexer, parser or AST change was
+> needed, exactly as predicted below.
+
 **The key fact: no lexer change is needed.** Spans are exact byte ranges and the
 token stream is ordered, so the trivia between two tokens is exactly
 `src[tok[i].span.end .. tok[i+1].span.start]`. Nothing is lost today — it is
@@ -114,6 +121,13 @@ on byte-for-byte; a CST is a tooling artifact and should stay one.
 Current state: rendering is strong, *content* is generic. `expect()` produces
 `expected {what}, found {kind}` with no hint about the construct being parsed and
 no secondary span.
+
+> **Item 2 is implemented.** `Parser::expect_close` keeps the message identical
+> (so anything matching on it still works) and attaches a `help:` line naming the
+> opener's line and column, resolved through a lazily-built `LineIndex` so a file
+> full of unclosed delimiters stays linear. Wired into block, `trait` and `match`
+> bodies; the remaining ~28 `expect(RBrace/RParen/RBracket)` sites are the same
+> mechanical change and can be converted as they are touched.
 
 Low-risk improvements, in order:
 
@@ -193,8 +207,8 @@ would have to model, and the abstraction would cost more than the duplication.
 |---|---|---|---|---|
 | P0 | Grammar doc + conformance tables | none | no | done — makes everything below reviewable |
 | P0 | Invalid-syntax + cascade-budget tests | none | no | done — error paths were untested |
-| P1 | Unclosed-delimiter secondary spans | low | no | biggest diagnostic win per line |
-| P1 | CST Stage 1 + round-trip property | low | no | unblocks formatter; no parser change |
+| P1 | Unclosed-delimiter secondary spans | low | no | **done** — `expect_close`, opener named in `help:` |
+| P1 | CST Stage 1 + round-trip property | low | no | **done** — `src/cst.rs`, lossless over the whole corpus |
 | P2 | `visit.rs` + adopt in the 4 collector passes | low | no | kills the silent-`_`-arm class of bug |
 | P2 | HIR Stage 0–1 (fold side tables) | low | no | no output change, so no seed churn |
 | P2 | Item-keyword synchronization in recovery | medium | no | needs the cascade budget as a guard |

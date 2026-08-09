@@ -12780,3 +12780,104 @@ mod grammar_conformance {
         }
     }
 }
+
+/// **The CST is lossless** — `docs/frontend-roadmap.md` §3.
+///
+/// A "lossless" syntax tree that cannot reproduce its input is not lossless, and
+/// no amount of structural testing substitutes for the one equation that says so.
+/// These properties are the acceptance test for `src/cst.rs`: over arbitrary
+/// text, over adversarial trivia, and over every real corpus file.
+#[cfg(test)]
+mod cst_props {
+    use crate::cst;
+    use crate::lexer::Lexer;
+    use proptest::prelude::*;
+
+    /// Rebuild the source from the CST and compare. Returns `Ok(())` or the first
+    /// divergence, for a readable failure.
+    fn round_trips(src: &str) -> Result<(), String> {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let elems = cst::attach(src, &tokens);
+        let back = cst::render(src, &elems);
+        if back == src {
+            return Ok(());
+        }
+        let at = back
+            .char_indices()
+            .zip(src.char_indices())
+            .find(|((_, a), (_, b))| a != b)
+            .map(|((i, _), _)| i)
+            .unwrap_or_else(|| src.len().min(back.len()));
+        Err(format!("diverged at byte {at}: got {:?}, want {:?}", back, src))
+    }
+
+    /// Trivia pieces must tile their span exactly — no byte dropped, none doubled.
+    fn pieces_tile(src: &str) -> Result<(), String> {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        for e in cst::attach(src, &tokens) {
+            let mut rebuilt = String::new();
+            for p in cst::pieces(src, e.trivia) {
+                rebuilt.push_str(&src[p.span.range()]);
+            }
+            if rebuilt != src[e.trivia.range()] {
+                return Err(format!(
+                    "trivia pieces lost bytes: got {:?}, want {:?}",
+                    rebuilt,
+                    &src[e.trivia.range()]
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    proptest! {
+        /// Round trip over arbitrary text. Most of these inputs do not lex cleanly,
+        /// which is the point: an editor asks for a lossless view of whatever is in
+        /// the buffer, not of a valid program.
+        #[test]
+        fn cst_round_trips_arbitrary_text(s in ".{0,400}") {
+            prop_assert!(round_trips(&s).is_ok(), "{}", round_trips(&s).unwrap_err());
+        }
+
+        /// Round trip over text built from the characters that actually make
+        /// trivia interesting — comment openers, nesting, newlines, quotes.
+        #[test]
+        fn cst_round_trips_trivia_soup(s in "[/*a-z \n\t\r\"'\\\\]{0,300}") {
+            prop_assert!(round_trips(&s).is_ok(), "{}", round_trips(&s).unwrap_err());
+        }
+
+        /// The piece classifier never loses bytes either.
+        #[test]
+        fn cst_pieces_tile_arbitrary_text(s in "[/*a-z \n\t]{0,300}") {
+            prop_assert!(pieces_tile(&s).is_ok(), "{}", pieces_tile(&s).unwrap_err());
+        }
+    }
+
+    /// The real acceptance test: every `.jtr` file in the repository round-trips
+    /// byte-for-byte, comments, blank lines, CRLF and all. This is the corpus a
+    /// formatter would have to reprint without touching untouched regions.
+    #[test]
+    fn cst_round_trips_the_whole_corpus() {
+        let mut checked = 0usize;
+        let mut failures = Vec::new();
+        for dir in ["examples", "examples/std", "examples/cpp_compare", "bootstrap"] {
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("jtr") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&p) else { continue };
+                if let Err(e) = round_trips(&src) {
+                    failures.push(format!("  {}: {e}", p.display()));
+                }
+                if let Err(e) = pieces_tile(&src) {
+                    failures.push(format!("  {} (pieces): {e}", p.display()));
+                }
+                checked += 1;
+            }
+        }
+        assert!(failures.is_empty(), "CST is not lossless:\n{}", failures.join("\n"));
+        assert!(checked > 100, "expected the whole corpus, only saw {checked} files");
+    }
+}

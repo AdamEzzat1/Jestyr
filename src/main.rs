@@ -46,6 +46,7 @@ mod attrs;
 mod buildscript;
 mod cgen;
 mod comptime;
+mod cst;
 mod diag;
 #[cfg(feature = "dharht-experiment")]
 mod dharht;

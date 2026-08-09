@@ -36,6 +36,9 @@ pub struct Parser<'src> {
     /// Set once the depth cap is first hit, so the "too deep" diagnostic is
     /// reported a single time instead of once per surplus node.
     depth_exceeded: bool,
+    /// Line table for diagnostic positions, built on first use — see
+    /// [`expect_close`](Parser::expect_close).
+    line_index: Option<crate::span::LineIndex>,
     pub ast: Ast,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -66,7 +69,7 @@ impl<'src> Parser<'src> {
     /// `TypeId`/`PatId` handles live in a single id-space — the same "one
     /// translation unit" model the C backend already uses (no id remapping).
     pub fn resume(src: &'src str, tokens: Vec<Token>, ast: Ast) -> Parser<'src> {
-        Parser { src, tokens, pos: 0, no_struct: false, expr_depth: 0, depth_exceeded: false, ast, diagnostics: Vec::new() }
+        Parser { src, tokens, pos: 0, no_struct: false, expr_depth: 0, depth_exceeded: false, line_index: None, ast, diagnostics: Vec::new() }
     }
 
     pub fn parse(self) -> (Ast, Vec<Diagnostic>) {
@@ -156,6 +159,45 @@ impl<'src> Parser<'src> {
             self.error(t.span, format!("expected {}, found `{}`", what, t.kind.describe()));
             t // do not consume — let the caller's loop bounds recover
         }
+    }
+
+    /// [`expect`](Self::expect) for a **closing delimiter**, told where the thing
+    /// it closes was opened.
+    ///
+    /// `expected `}`, found `<eof>`` pointed at the end of the file is the least
+    /// useful diagnostic a parser can produce: the mistake is at the *opener*, and
+    /// on a long file that can be hundreds of lines away. The message is unchanged
+    /// (so anything matching on it still does); a `help:` line naming the opener's
+    /// position is attached, which is what the reader actually needs.
+    ///
+    /// Positions are resolved through a lazily-built line table so a file with many
+    /// unclosed delimiters stays linear — `span::line_col` alone is O(offset), and
+    /// paying that per diagnostic is quadratic on exactly the malformed inputs that
+    /// produce the most of them.
+    fn expect_close(&mut self, kind: TokenKind, what: &str, open: Span) -> Token {
+        let t = self.cur();
+        if t.kind == kind {
+            return self.bump();
+        }
+        let opener = self.text(open);
+        let at = self.line_col_of(open.start);
+        self.diagnostics.push(
+            Diagnostic::new(
+                format!("expected {}, found `{}`", what, t.kind.describe()),
+                t.span,
+            )
+            .with_help(format!(
+                "the `{}` opened at line {}, column {} is never closed",
+                opener, at.line, at.col
+            )),
+        );
+        t // do not consume — let the caller's loop bounds recover
+    }
+
+    /// Line/column of a byte offset, via a line table built on first use.
+    fn line_col_of(&mut self, offset: u32) -> crate::span::LineCol {
+        let idx = self.line_index.get_or_insert_with(|| crate::span::LineIndex::new(self.src));
+        idx.line_col(self.src, offset)
     }
 
     fn prev_span(&self) -> Span {
@@ -414,6 +456,7 @@ impl<'src> Parser<'src> {
         let start = self.cur().span;
         self.expect(Trait, "`trait`");
         let name = self.eat_ident("trait name");
+        let open_brace = self.cur().span;
         self.expect(LBrace, "`{`");
         let mut methods = Vec::new();
         while !self.at(RBrace) && !self.at(Eof) {
@@ -428,7 +471,7 @@ impl<'src> Parser<'src> {
             }
         }
         let end = self.cur().span;
-        self.expect(RBrace, "`}`");
+        self.expect_close(RBrace, "`}`", open_brace);
         TraitDecl { is_pub: false, name, methods, span: start.to(end) }
     }
 
@@ -1010,7 +1053,7 @@ impl<'src> Parser<'src> {
             }
         }
         let end = self.cur().span;
-        self.expect(RBrace, "`}`");
+        self.expect_close(RBrace, "`}`", start);
         self.no_struct = saved;
         Block { stmts, span: start.to(end) }
     }
@@ -1904,6 +1947,7 @@ impl<'src> Parser<'src> {
         self.no_struct = true;
         let scrut = self.parse_expr();
         self.no_struct = saved;
+        let open_brace = self.cur().span;
         self.expect(LBrace, "`{`");
         let mut arms = Vec::new();
         while !self.at(RBrace) && !self.at(Eof) {
@@ -1929,7 +1973,7 @@ impl<'src> Parser<'src> {
             }
         }
         let end = self.cur().span;
-        self.expect(RBrace, "`}`");
+        self.expect_close(RBrace, "`}`", open_brace);
         self.ast.expr(ExprKind::Match { scrut, arms }, start.to(end))
     }
 
@@ -2964,6 +3008,43 @@ mod tests {
     ///
     /// Read `(a op b)` as "these grouped"; the printer parenthesises binary nodes
     /// and leaves postfix/cast/assignment chains flat.
+
+    /// An unclosed delimiter names its opener.
+    ///
+    /// `expected `}`, found `<eof>`` pointed at the end of the file is the least
+    /// useful thing a parser can say: the mistake is at the opener, which on a real
+    /// file is hundreds of lines away. The primary span stays where the error was
+    /// *detected* (that is where the parser actually is), and the `help:` line
+    /// carries the opener's position.
+    #[test]
+    fn an_unclosed_delimiter_points_at_its_opener() {
+        let cases = [
+            // (source, expected opener line, expected opener column)
+            ("fn f() -> i32 {\n    let a = 1\n    return a\n", 1, 15),
+            ("trait T {\n    fn g() -> i32\n", 1, 9),
+        ];
+        for (src, line, col) in cases {
+            let (_ast, diags) = parse(src);
+            let help = diags
+                .iter()
+                .find_map(|d| d.help.clone())
+                .unwrap_or_else(|| panic!("no help on: {src:?} -> {diags:?}"));
+            let want = format!("opened at line {line}, column {col}");
+            assert!(help.contains(&want), "want {want:?} in help {help:?} for {src:?}");
+            assert!(help.contains("never closed"), "help should say so: {help:?}");
+        }
+    }
+
+    /// The *message* is unchanged by the added help, so anything matching on it —
+    /// including the self-hosted port's own diagnostics and any tooling reading
+    /// `check --json` — keeps working. Only the `help` field is new.
+    #[test]
+    fn the_unclosed_delimiter_message_is_unchanged() {
+        let (_ast, diags) = parse("fn f() -> i32 {\n    let a = 1\n");
+        let d = diags.first().expect("one diagnostic");
+        assert_eq!(d.message, "expected `}`, found `<eof>`", "message text moved");
+    }
+
     #[test]
     fn the_precedence_ladder_is_pinned() {
         const CASES: &[(&str, &str)] = &[
