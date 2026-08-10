@@ -126,16 +126,41 @@ Present: `grammar_conformance` (production table, malformed-input table with a
 cascade budget, recovery boundedness, every-prefix survival), plus the older
 `pipeline_is_total` / `lexer_is_total` / bolero targets.
 
-Missing, in value order:
+All three items — **DONE** (`jestyr_parser_matches_reference_on_generated_input`,
+a grammar-directed generator with single-token mutation, and
+`diagnostic_count_is_linear_in_input_size`).
 
-1. **Differential fuzzing against the port.** The strongest oracle available: feed
-   the same generated input to `jestyrc` and the self-hosted parser and require
-   identical tree-or-diagnostics. The P2 goldens already do this for the *corpus*;
-   doing it for generated input would be the highest-value fuzz target in the
-   project. Nobody has built it.
-2. A grammar-directed generator (mutate valid token sequences one token at a time).
-3. A diagnostic-count *property* — error count ≤ a linear function of token count —
-   rather than the per-case budget in the table.
+The estimate "highest-value fuzz target in the project" was right, and it paid
+within a few hundred cases: **seven real divergences**, none visible to any
+existing gate, because every corpus file and every curated snippet is well-formed
+and all seven are *recovery* paths. Worst was an **out-of-bounds read** — the
+port's `cur_tok` indexed its token list unguarded, so input ending mid-construct
+(`not 1.5.`) produced spans from whatever memory followed the arena. Fixed at the
+root by making `cur_tok` total, which is the invariant the reference gets free
+from always appending `Eof`.
+
+The rest were one systematic mismatch and its relatives: the reference reads
+`self.cur().span` *before* `expect(closer)` (all 17 of its sites do), while the
+port fell back to `prev_end` — which agrees exactly when the closer is present,
+i.e. everywhere the corpus looks. Plus `eat_ident`'s failure semantics, which
+report the offending token's span and consume nothing; one of those was a **tree**
+difference rather than a span.
+
+Three things worth carrying into the next fuzz increment:
+
+- **Token-granular mutation, not byte-granular.** Byte mutation mostly yields
+  lexer errors, which both sides trivially agree on. Token mutation yields input
+  that *lexes*, which is what puts the two parsers' recovery against each other.
+- **Fixed seed, fixed budget, no `proptest`.** Each case costs a process spawn,
+  and a gate that shrinks but does not reproduce is worse than one that
+  reproduces: a CI divergence has to replay locally. The failure carries seed and
+  case number; `FUZZ_CASES` raises the budget.
+- **The generator is expression-level, so this is not full coverage.** Twelve more
+  sites share the "default instead of the offending token's span" shape at *item*
+  level (fn params, struct fields, attributes). The reference uses `eat_ident` at
+  each, but nothing proves the port matches and the valid-only corpus cannot. **An
+  item-level generator over `jestyr_parser_item_dump` is the next increment**, and
+  is where the next batch will be.
 
 ### 1.7 `par for` fusion follow-ups
 

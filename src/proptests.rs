@@ -8315,6 +8315,171 @@ mod c_oracle {
         }
     }
 
+    // ---- differential fuzzing: generated input, both toolchains ----
+    //
+    // The curated snippet list above is an oracle over inputs *someone thought of*.
+    // This is the same oracle over inputs nobody thought of, and it is the strongest
+    // one available in the project: two independent parsers, written in different
+    // languages by different means, must build the same tree for the same bytes.
+    //
+    // Why it earns its place here specifically. Twice now a rule has been added that
+    // the whole-corpus goldens were structurally blind to (the `Unknown` finalization,
+    // the newline rule) — each was silent on all 155 files, so a port missing it
+    // entirely would still have passed. Both were caught by hand-written probes,
+    // which only ever cover blindness someone noticed. Generated input does not
+    // depend on anyone noticing.
+
+    /// A tiny deterministic PRNG (xorshift64*).
+    ///
+    /// Deliberately not `proptest` here: every case costs a process spawn, so this
+    /// runs a *fixed* budget from a *fixed* seed. A gate that shrinks but does not
+    /// reproduce is worse than one that reproduces exactly — a divergence found in
+    /// CI must be replayable locally from the seed alone. Raise the budget for a
+    /// real campaign with `FUZZ_CASES=20000`.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+            &xs[self.below(xs.len())]
+        }
+    }
+
+    /// A grammar-directed expression generator.
+    ///
+    /// Restricted **on purpose** to constructs the curated P2 list already proves
+    /// both implementations build: the point is to find real divergences, not to
+    /// rediscover the port's known staging gaps, which would make the test noisy
+    /// and get it ignored. Widen this as the port's coverage widens.
+    fn gen_expr(rng: &mut Rng, depth: u32) -> String {
+        const LEAVES: &[&str] = &["0", "1", "42", "1.5", "'c'", "true", "false", "x", "xa", "xb1"];
+        if depth == 0 {
+            return rng.pick(LEAVES).to_string();
+        }
+        const BIN: &[&str] = &[
+            "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=", "and", "or", "|", "^", "&",
+            "<<", ">>",
+        ];
+        match rng.below(12) {
+            0 => rng.pick(LEAVES).to_string(),
+            1 => format!(
+                "{} {} {}",
+                gen_expr(rng, depth - 1),
+                rng.pick(BIN),
+                gen_expr(rng, depth - 1)
+            ),
+            2 => format!("({})", gen_expr(rng, depth - 1)),
+            3 => format!("{}{}", rng.pick(&["-", "!", "not ", "~", "&"]), gen_expr(rng, depth - 1)),
+            // calls: zero, one and several arguments
+            4 => match rng.below(3) {
+                0 => format!("{}()", gen_expr(rng, depth - 1)),
+                1 => format!("{}({})", gen_expr(rng, depth - 1), gen_expr(rng, depth - 1)),
+                _ => format!(
+                    "{}({}, {})",
+                    gen_expr(rng, depth - 1),
+                    gen_expr(rng, depth - 1),
+                    gen_expr(rng, depth - 1)
+                ),
+            },
+            5 => format!("{}[{}]", gen_expr(rng, depth - 1), gen_expr(rng, depth - 1)),
+            6 => format!("{}.{}", gen_expr(rng, depth - 1), rng.pick(&["b", "len", "ptr"])),
+            7 => format!("{}.*", gen_expr(rng, depth - 1)),
+            8 => format!("{}?", gen_expr(rng, depth - 1)),
+            9 => format!(
+                "{} as {}",
+                gen_expr(rng, depth - 1),
+                rng.pick(&["i32", "u8", "usize", "i64", "*mut u8"])
+            ),
+            10 => format!(
+                "{}{}{}",
+                gen_expr(rng, depth - 1),
+                rng.pick(&["..", "..="]),
+                gen_expr(rng, depth - 1)
+            ),
+            _ => format!("{} catch {}", gen_expr(rng, depth - 1), gen_expr(rng, depth - 1)),
+        }
+    }
+
+    /// Mutate one **token** of `src` — the handoff's "mutate valid token sequences
+    /// one token at a time".
+    ///
+    /// Token granularity rather than byte granularity is the whole point: a byte
+    /// mutation usually produces a lexer error, which both sides trivially agree on
+    /// and which tests nothing. A token mutation produces input that *lexes* and
+    /// stresses the two **parsers'** recovery against each other — the paths the
+    /// corpus (all valid programs) never exercises at all.
+    fn mutate_one_token(src: &str, rng: &mut Rng) -> String {
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let spans: Vec<(usize, usize)> = tokens
+            .iter()
+            .filter(|t| !matches!(t.kind, crate::token::TokenKind::Eof))
+            .map(|t| (t.span.start as usize, t.span.end as usize))
+            .collect();
+        if spans.is_empty() {
+            return src.to_string();
+        }
+        let i = rng.below(spans.len());
+        let (s, e) = spans[i];
+        const PUNCT: &[&str] =
+            &["(", ")", "[", "]", "{", "}", ".", ",", "?", "*", "+", "=", "|", ":", "as", "catch"];
+        match rng.below(4) {
+            0 => format!("{}{}", &src[..s], &src[e..]),               // delete
+            1 => format!("{}{}{}", &src[..s], &src[s..e], &src[s..]), // duplicate
+            2 => format!("{}{}{}", &src[..s], rng.pick(PUNCT), &src[e..]), // replace
+            _ => format!("{}{} {}", &src[..s], rng.pick(PUNCT), &src[s..]), // insert before
+        }
+    }
+
+    /// **Differential fuzzing against the port.** For generated expressions — valid,
+    /// and single-token mutations of valid — the Jestyr-written parser must build
+    /// the *same tree* as the Rust reference, byte for byte in the canonical dump.
+    ///
+    /// Both parsers are total and recovering, so a malformed input is not an error
+    /// case here: both produce a tree containing `error` nodes, and the dumps must
+    /// still agree. That agreement over *recovery* is what nothing else in the suite
+    /// checks — the corpus is entirely valid programs, so every recovery path in
+    /// both implementations is otherwise untested against the other.
+    #[test]
+    fn jestyr_parser_matches_reference_on_generated_input() {
+        let parser = build_exe("examples/std/parser_cli.jtr");
+        let cases: usize =
+            std::env::var("FUZZ_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(400);
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let probe = std::env::temp_dir().join("jestyr_fuzz_probe.jtr");
+        let (mut valid, mut mutated) = (0usize, 0usize);
+        for case in 0..cases {
+            let base = gen_expr(&mut rng, 1 + (case % 4) as u32);
+            // Two thirds of the budget goes to mutated input: valid programs are
+            // already covered by the corpus and the curated list, recovery is not.
+            let src = if case % 3 == 0 {
+                valid += 1;
+                base
+            } else {
+                mutated += 1;
+                mutate_one_token(&base, &mut rng)
+            };
+            std::fs::write(&probe, &src).unwrap();
+            let want = rust_expr_dump(&src);
+            let got = jestyr_expr_dump(&parser, probe.to_str().unwrap());
+            assert_eq!(
+                got, want,
+                "parsers diverged on generated case {case}\n  source: {src:?}\n  \
+                 replay: seed 0x9E3779B97F4A7C15, case {case}"
+            );
+        }
+        eprintln!("differential parser fuzz: {valid} valid + {mutated} mutated cases agreed");
+    }
+
     /// The reference item-dump for `src`: lex, parse a single item, dump it.
     fn rust_item_dump(src: &str) -> Vec<String> {
         let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
@@ -12761,6 +12926,65 @@ mod grammar_conformance {
         ("lexer/stray backtick", "fn f() { let a = 1 ` }"),
         ("lexer/unterminated block comment", "/* nope"),
     ];
+
+    /// **Diagnostics are linear in input size — as a property, not a table.**
+    ///
+    /// `malformed_input_is_rejected_and_bounded` below applies the budget
+    /// `4 + tokens` to a curated list. The bound is the interesting part, though,
+    /// and it should hold for *every* input, not the ones someone wrote down: a
+    /// recovering parser that can emit a super-linear number of diagnostics has a
+    /// recovery loop that re-reports without consuming, and the first sign of it
+    /// is usually an unusable error list rather than a hang.
+    ///
+    /// Checked here over arbitrary text, ASCII punctuation soup (which reaches
+    /// deeper into the parser than random Unicode, since more of it lexes), and
+    /// truncations of *valid* programs — the last being the shape an editor sends
+    /// on every keystroke, and the one most likely to hit a recovery loop.
+    #[test]
+    fn diagnostic_count_is_linear_in_input_size() {
+        let mut worst = (0usize, 0usize, String::new()); // (errs, tokens, src)
+        let mut check = |src: &str| {
+            let (tokens, lex) = Lexer::new(src).tokenize();
+            let n = tokens.len();
+            let (_ast, parse) = Parser::new(src, tokens).parse();
+            let errs = lex.iter().chain(parse.iter()).filter(|d| d.is_error()).count();
+            assert!(
+                errs <= 4 + n,
+                "diagnostic cascade: {errs} errors for {n} tokens (budget {}) on {src:?}",
+                4 + n
+            );
+            if errs > worst.0 {
+                worst = (errs, n, src.to_string());
+            }
+        };
+        // Every prefix of each valid conformance example: what a file looks like
+        // mid-keystroke.
+        for (_, src) in VALID {
+            for cut in 0..=src.len() {
+                if src.is_char_boundary(cut) {
+                    check(&src[..cut]);
+                }
+            }
+        }
+        // The malformed table, and punctuation soup built from it.
+        for (_, src) in INVALID {
+            check(src);
+            let doubled = format!("{src}{src}");
+            check(&doubled);
+        }
+        for n in 1..40 {
+            check(&"{".repeat(n));
+            check(&")".repeat(n));
+            check(&"|".repeat(n));
+            check(&"(".repeat(n));
+            check(&"catch ".repeat(n));
+            check(&".".repeat(n));
+        }
+        eprintln!(
+            "diagnostic-count property: worst ratio {} errors / {} tokens on {:?}",
+            worst.0, worst.1, worst.2
+        );
+    }
 
     /// Every malformed input is rejected, and rejection is *bounded*: the parser
     /// reports at least one error and does not drown the user in a cascade.

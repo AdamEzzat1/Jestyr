@@ -33,6 +33,14 @@ import "list"
 // them; the text/value is recovered from the source on demand.
 pub struct Token { pub kind: i32, pub start: usize, pub end: usize }
 
+// The synthetic end-of-input token: kind Eof, spanning the empty range at `len`.
+//
+// `tokenize` does not append one -- the parser detects the end by position -- but the
+// reference lexer's vector ALWAYS ends with `Eof { span: (len, len) }`, and the parser
+// reads `cur()` freely because of it. Handing out the same token past the end gives the
+// port that invariant without changing the token stream the goldens pin.
+pub fn eof_token(len: usize) -> Token { return Token{ kind: 110, start: len, end: len } }
+
 // An operator's kind tag together with its byte width (maximal munch), returned as a
 // pair so `tokenize` can both classify and advance in one step. Internal to this module.
 struct OpTok { kind: i32, width: usize }
