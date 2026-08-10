@@ -19,6 +19,13 @@ honest by the `grammar_conformance` tables in `src/proptests.rs`.
 
 ## `handoffs/`
 
+**Start here for "what's next":**
+[`SAFETY-MOSAIC-AND-FRONTEND-HANDOFF.md`](handoffs/SAFETY-MOSAIC-AND-FRONTEND-HANDOFF.md)
+— what the frontend/lowering work left unfinished, the safety-mosaic roadmap
+(borrowed projections, genref scopes, disjoint borrowing, region tokens, linear
+capabilities), and a measured account of what mirroring a change in the
+self-hosted compiler actually costs.
+
 Workstream handoff documents (concurrency, numerics, parallelism, modules,
 tooling, self-hosting phases). These are internal development logs, kept for
 provenance — status lines and counts inside them reflect the moment they were
