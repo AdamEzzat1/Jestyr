@@ -227,7 +227,24 @@ that is what actually gates each one.
 
 **Start with #1.** It strengthens soundness, changes no surface syntax, owes no
 port mirror, and is the only item on the list that is unambiguously safe to land
-in one sitting.
+in one sitting. *(Done — §2.5a/§2.5b.)*
+
+> **The per-item designs now live in [`docs/safety-mosaic-next.md`](../safety-mosaic-next.md).**
+> That file is the one to read before touching items 2–9: it grounds each in
+> what the implementation actually does today, gives the minimal mechanism, and
+> states the design questions that must be answered *before* syntax is chosen.
+>
+> Two findings from writing it, which change this table's reading:
+>
+> - **Item 4's design is forced, not chosen.** A splitting function cannot
+>   *return* its two halves — a pair holding two borrows is escape route 2,
+>   capture — so the safe interface must be continuation-passing
+>   (`split_mut(xs, at, f)`). That is the language's own rule selecting the
+>   shape, and it is why item 4 is the next implementable item.
+> - **Item 2 may have no consumer yet.** `-> read T from xs` adds precision that
+>   nothing in the compiler currently reads. If no caller benefits until items
+>   4/6 exist, it is a signature change — with attest-hash and doc-rendering
+>   cost — for no present payoff. Answer that before building it.
 
 ### 2.5 Item 1, grounded — the `Unknown` finalization pass
 
