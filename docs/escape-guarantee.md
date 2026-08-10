@@ -64,6 +64,50 @@ a borrowed scalar out (`fn f(read p: P) -> i32 { return p.value }`)
 escapes a *copy*, not the reference; generic/opaque types are treated as
 non-`Copy` (the conservative direction).
 
+### The refinement's one hole, and how it is closed
+
+The `Copy` refinement asks the type a question, so it needs there to *be*
+a type. `Ty::Unknown` — inference gave up — is classified `Copy`, on
+purpose: expressions the checker could not type must not manufacture
+escape errors, or every inference gap would become a cascade of false
+positives. That leniency is right for diagnostics and wrong here. At the
+two places where `Copy`-ness *decides* an outcome, it silently turns
+"we could not type it" into "it is a copy, let it escape" — which is not
+leniency but a wrong answer.
+
+So a borrow place whose type never resolved is **refused**, not assumed
+copyable:
+
+```
+error: cannot decide whether borrow `x` escapes: its type was never resolved
+```
+
+This is a *finalization*, not a fifth escape route: it does not claim the
+value escapes, only that the question cannot be answered soundly, and it
+fires nowhere else — `Unknown` remains lenient everywhere it does not
+decide an outcome.
+
+**Behaviour change, and where to expect it.** This refuses some programs
+that previously compiled. None are in the 155-file corpus (including the
+self-hosted compiler), and no corpus diagnostic moved — but the corpus is
+not the whole language, so out-of-corpus code *can* newly fail here. Every
+case found so far is ill-formed code that had simply never been rejected:
+
+```jestyr
+fn f[T](read x: T) -> i32 { return x.v }    // field of an unbounded `T`
+fn h(read p: N)    -> i32 { return p.v.w }  // `.w` on an `i32`
+```
+
+Both used to compile clean, straight through to code generation, because
+neither expression has a type and so neither ever received an escape
+verdict — the checker's silence was being read as approval. The right
+long-term fix is for the type checker to reject both *at the field
+access*, with a message about the field rather than about escape; the
+finalization would then stop firing for them. Until that exists, refusing
+is the sound behaviour. If you hit this on code you believe is
+well-formed, that is a type-inference gap worth reporting — the message
+names the binding whose type is missing.
+
 ## Why the argument holds
 
 The four routes are exhaustive over the language's value flows: a value

@@ -3,6 +3,37 @@
 All notable changes to Jestyr. This project is pre-1.0 research software;
 versions are snapshots, not stability promises.
 
+## Unreleased
+
+### Changed — may reject code that previously compiled
+
+- **A borrow whose type never resolved is now refused rather than assumed
+  copyable** (the `Unknown` finalization). `Ty::Unknown` is classified `Copy`
+  so that inference gaps do not produce cascades of false escape errors; at the
+  two points where `Copy`-ness *decides* an outcome that silently meant "let it
+  escape". Those now report:
+
+  ```
+  error: cannot decide whether borrow `x` escapes: its type was never resolved
+  ```
+
+  No file in the 155-file corpus (which includes the self-hosted compiler)
+  triggers this, and no corpus diagnostic changed — but out-of-corpus code can
+  newly fail. Every case found so far is ill-formed code that had never been
+  rejected: a field access on an unbounded type parameter (`x.v` where `x: T`),
+  and a field access on a primitive (`.w` on an `i32`). Both previously compiled
+  clean through to code generation. Rationale, and the type-checker fix that
+  should eventually supersede it, in
+  [docs/escape-guarantee.md](docs/escape-guarantee.md).
+
+### Fixed
+
+- **Struct-variant patterns bound their fields to no type**, so a borrowed
+  non-`Copy` field could escape its frame: `match w { one { n, k } => n }`
+  returned a borrow out of a `read` parameter, while the positional
+  `one(n, k) => n` and the plain projection `h.inner` both rejected it. Fixed on
+  both toolchains; emitted C is unchanged corpus-wide.
+
 ## v0.1.0-research — 2026-08-07
 
 First public release: the complete bootstrap arc, June 22 – August 7, 2026
