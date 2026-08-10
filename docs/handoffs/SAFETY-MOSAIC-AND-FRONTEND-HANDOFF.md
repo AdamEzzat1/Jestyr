@@ -15,21 +15,39 @@ if they disagree.
 
 ## Part 1 — Unfinished, in priority order
 
-### 1.1 HIR Stage 1 — fold the resolution tables (next; cheap on a clean start)
+### 1.1 HIR Stage 1 — fold the resolution tables — **DONE** (master `b791d01`)
 
-`TypeInfo` carries eight per-expression channels: `expr_types` plus seven
-`HashMap<ExprId, …>` tables (`call_sym`, `method_calls`, `qualified`,
-`impl_calls`, `bound_method_calls`, `dyn_coercions`, `dyn_calls`). Stage 0 (done)
-documented that these *are* Jestyr's HIR, stored column-wise. Stage 1 folds them
-into a single `HashMap<ExprId, Resolved>` behind the same accessors.
+`TypeInfo` carried eight per-expression channels: `expr_types` plus seven
+`HashMap<ExprId, …>` tables. Stage 0 documented that these *are* Jestyr's HIR,
+stored column-wise; Stage 1 transposed them to one `Resolved` row per `ExprId`,
+behind seven point-lookup accessors and seven `record_*` writers.
 
-- **Changes no emitted C**, so it costs nothing in corpus goldens, attest hashes
-  or bootstrap-seed churn, and owes **no port mirror**.
-- Mechanical, but touches every read site across `cgen.rs`'s ~12,800 lines.
-- **Why it stopped**: it was proposed at the tail of a session that had already
-  landed a two-toolchain lowering change. Starting a wide mechanical refactor
-  there is how you get a half-finished one. It wants a clean start, not more
-  budget.
+Two things this handoff got wrong, worth carrying forward:
+
+- **The size estimate.** "Touches every read site across `cgen.rs`'s ~12,800
+  lines" — it was ~30 non-test read sites in total, all `get`/`contains_key`.
+  A `grep` before budgeting would have shown that.
+- **The storage.** A `HashMap<ExprId, Resolved>` — the fold this document
+  proposed — is measurably *slower* than the seven maps it replaces, because
+  sparse columns are cheap to **miss**: `HashMap::get` short-circuits on an empty
+  table, so in a single-module program `qualified`, `impl_calls` and `dyn_calls`
+  cost `escape` and `cgen` almost nothing per call. Folding them into one
+  populated map turns every free miss into a real hash-and-probe (interleaved
+  `selfbench`, `lex`/`parse` as controls: **escape +20%, 3/3 rounds; total
+  +2.9%**). The shipped storage is a dense `Vec<Option<Box<Resolved>>>`, at
+  parity with master within a ±5% noise floor. **The key is already a dense
+  index — do not put it in a map.** This applies to Stages 2–4 as well.
+
+Byte-identity held for the reason predicted: every pass read these as point
+lookups and none iterated. That is now *enforced* rather than reviewed — the two
+whole-program iterators are `#[cfg(test)]`, so an emitting pass that grew a
+dependency on iteration order fails to compile.
+
+Method note: the first A/B showed a 12% total regression that was entirely
+spurious — `lex` and `parse` moved ~10% too, and neither can be affected by this
+change. Comparing two separately-built processes measures the machine. Interleave
+runs against two saved binaries and keep `lex`/`parse` as controls; if the
+controls disagree, that gap *is* your noise floor.
 
 ### 1.2 The newline / statement-boundary rule (P3, measured safe)
 
@@ -177,7 +195,7 @@ that is what actually gates each one.
 
 | # | Mechanism | Value | Risk | Size | Port mirror? | Verdict |
 |---|---|---|---|---|---|---|
-| 1 | `Unknown` safety finalization | high | **low** | small | no (diagnostics only) | **implement first** |
+| 1 | `Unknown` safety finalization | high | **low** | small | see §2.5a — *not* always "no" | census done; **gate is next** |
 | 2 | Borrowed projections (`-> read T from xs`) | high | medium | large | **yes** (syntax) | design doc first |
 | 3 | Checked genref scopes (`with alive p as read node`) | high | medium | medium | **yes** (syntax) | design, then judge |
 | 4 | Disjoint borrowing (`split_mut`) | high | medium | medium | maybe (library-first) | try library-only |
@@ -230,6 +248,52 @@ Suggested shape:
 **Acceptance**: no corpus file changes its diagnostics; a new test file with a
 deliberately-unresolvable type in a return/store position is rejected with one
 clear message.
+
+#### 2.5a What the census actually found (master `a11b35e`)
+
+The bullets above are still the right destination, but the framing —
+"ownership-relevant positions: return / capture / store / take, raw / region /
+genref" — is **too broad to implement against**. `Ty::Unknown` is *produced* in
+~50 places in `typeck.rs`, and most are deliberate quiet fallbacks: `null`, a
+bare fn name used as a value (`&make`), `Attr`, `UnOp::Ref`, the region
+intrinsics. A gate phrased over positions rejects those and breaks ordinary code.
+
+**Ask instead where `Unknown` changes an answer.** Only **two** sites in all of
+`escape.rs` consult copy-ness — `escapes_as` and `captured_borrow_name` — so the
+hole is exactly: *an expression that is already a borrow place (or a captured
+borrow), whose type we failed to infer.* That is a one-line predicate, not a
+taxonomy of positions.
+
+Instrumenting those two predicates and sweeping the corpus is cheap (~20 lines,
+temporary) and is the step to repeat before touching anything here. The first
+sweep found **2 sites in 1 file** — and both were benign only by luck, so a
+"corpus is clean, ship the gate" reading would have been wrong:
+
+> `examples/struct_variant.jtr`, `rect { w, .. } => w`. The binding *should* be
+> `f64`; it was `Unknown`. `f64` is `Copy`, so the leniency returned the right
+> verdict for the wrong reason. Substituting a non-`Copy` field reproduced a real
+> missed escape immediately.
+
+Root cause, now fixed on both toolchains: **struct-variant patterns bound every
+field to `Unknown`** because `GlobalTable` stores a variant's field types
+positionally and drops the names. `one { n, k } => n` let a borrowed non-`Copy`
+field escape a `read` parameter, while the positional `one(n, k) => n` and the
+plain projection `h.inner` both rejected it. Fixed via `variant_field_names`
+(reference) and payload `(name_start, name_end, ty)` triples (port).
+
+**Cost note that contradicts §2.4's table.** That row says item #1 owes no port
+mirror because it is "diagnostics only". True of the *gate*; false of anything
+that changes an inferred type. Emitted C and all 155 files' diagnostics were
+unchanged — `cgen` resolves variant fields itself via `variant_field_by_name` and
+never read these bindings — **yet the mirror was still owed**, because the P3
+golden compares `Ty::display` for every expression against the self-hosted typeck
+with an empty denylist. *Zero C change does not imply zero mirror owed.* Check
+the P3 golden, not just `emit-c`, whenever a type becomes more precise.
+
+**Where this leaves the gate.** The census is now **0 sites over 155 files**, which
+is precisely what unblocks it: with no legitimate `Unknown` left in a borrow
+place, the gate can reject the remainder and satisfy "no corpus file changes its
+diagnostics" by construction. That is the next increment, and it is now small.
 
 ### 2.6 Design constraints (non-negotiable)
 
