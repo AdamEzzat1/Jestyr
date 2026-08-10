@@ -195,7 +195,7 @@ that is what actually gates each one.
 
 | # | Mechanism | Value | Risk | Size | Port mirror? | Verdict |
 |---|---|---|---|---|---|---|
-| 1 | `Unknown` safety finalization | high | **low** | small | see §2.5a — *not* always "no" | census done; **gate is next** |
+| 1 | `Unknown` safety finalization | high | **low** | small | yes — see §2.5a | **DONE** (`a11b35e`, gate below) |
 | 2 | Borrowed projections (`-> read T from xs`) | high | medium | large | **yes** (syntax) | design doc first |
 | 3 | Checked genref scopes (`with alive p as read node`) | high | medium | medium | **yes** (syntax) | design, then judge |
 | 4 | Disjoint borrowing (`split_mut`) | high | medium | medium | maybe (library-first) | try library-only |
@@ -290,10 +290,36 @@ golden compares `Ty::display` for every expression against the self-hosted typec
 with an empty denylist. *Zero C change does not imply zero mirror owed.* Check
 the P3 golden, not just `emit-c`, whenever a type becomes more precise.
 
-**Where this leaves the gate.** The census is now **0 sites over 155 files**, which
-is precisely what unblocks it: with no legitimate `Unknown` left in a borrow
-place, the gate can reject the remainder and satisfy "no corpus file changes its
-diagnostics" by construction. That is the next increment, and it is now small.
+#### 2.5b The gate itself — **DONE**, and item 1 is closed
+
+The census reaching **0 over 155 files** is what unblocked it. Shipped as a
+refusal at the two copy-ness consumers (`escapes_as`, `captured_borrow_name`),
+deduped by `ExprId` and emitted sorted; mirrored in `examples/std/escape.jtr`
+with `typeck.ty_is_unknown`. No corpus diagnostic moved — the acceptance
+criterion — because the root cause was fixed first.
+
+Three things worth carrying forward:
+
+- **It was not only a backstop.** Two ill-formed shapes reach it today and used
+  to compile *clean*, straight through to code generation:
+  `fn f[T](read x: T) -> i32 { return x.v }` (field of an unbounded `T`) and
+  `fn h(read p: N) -> i32 { return p.v.w }` (`.w` on an `i32`). Neither has a
+  type, so neither had an escape verdict. **Open follow-up:** typeck should
+  reject both at the field access with a better message, after which the gate
+  stops firing for them and becomes the pure backstop it was meant to be.
+- **Order the two sides by a *total* key.** Both sort by `(span start, ExprId)`,
+  not by span with insertion order breaking ties. Expression ids correspond
+  exactly across toolchains (that is what P2/P3 compare), so neither side has to
+  reproduce the other's traversal. The unsafe rung's span-only sort works today
+  only because its ties happen not to arise; do not copy that part.
+- **A whole-corpus golden can be structurally blind to a new rule.** The P4
+  escape golden compares all 155 files, and would have passed with the port
+  missing this rung *entirely* — the census is zero over the corpus by design, so
+  both sides agree everywhere the golden looks and disagree everywhere else.
+  `jestyr_escape_finalization_matches_reference` covers it with probes that do
+  trigger, and asserts they still trigger so a later inference fix cannot render
+  it silently vacuous. **Whenever a rule is deliberately silent on the corpus,
+  the corpus goldens cannot mirror-check it — write the differential test.**
 
 ### 2.6 Design constraints (non-negotiable)
 

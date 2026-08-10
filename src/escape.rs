@@ -59,9 +59,54 @@ pub fn check(ast: &Ast, info: &TypeInfo) -> Vec<Diagnostic> {
         allocates: false,
         calls: Vec::new(),
         alloc_via,
+        unresolved: Vec::new(),
     };
     for item in &ast.items {
         ck.check_item(item);
+    }
+    // The `Unknown` FINALIZATION (safety mosaic, item 1). `Ty::Unknown` is `Copy`
+    // on purpose, so expressions the checker could not type raise no escapes and
+    // no cascades. At the two sites where copy-ness decides an outcome, though,
+    // that reads "unresolved" as "copyable" and lets a *borrow* leave the frame.
+    // The census that motivated this found exactly one such expression in the
+    // corpus — a struct-variant binding, benign only because its field happened to
+    // be `f64`; with a non-`Copy` field the same path lost a real escape. That
+    // root cause is fixed, so all 155 corpus files yield none of these and no
+    // corpus diagnostic moved.
+    //
+    // It is not merely a backstop, though. Two ill-formed shapes reach it today
+    // and used to compile CLEAN, straight through to code generation:
+    //
+    //     fn f[T](read x: T) -> i32 { return x.v }   // field of an unbounded `T`
+    //     fn h(read p: N)    -> i32 { return p.v.w } // `.w` on an `i32`
+    //
+    // Neither has a type, so neither had an escape verdict; the checker's silence
+    // was read as approval. Ideally typeck would reject both at the field access
+    // with a better message, and then this never fires for them — that is the
+    // right follow-up. Until it exists, refusing beats emitting.
+    //
+    // Sorted by span start for the same reason the unsafe pass below is: the port
+    // reaches the same set by its own traversal, and the sort is what makes two
+    // collection strategies emit identically.
+    //
+    // An error, not a warning, and for the same reason the unsafe rung is: the
+    // port's `jc build` refuses on any escape diagnostic (it has no severity
+    // model), so a warning here would be a program `jestyrc` builds and `jc` will
+    // not.
+    let mut unresolved = std::mem::take(&mut ck.unresolved);
+    unresolved.sort_by_key(|(id, _)| (ast.expr_at(*id).span.start, id.0));
+    for (id, name) in unresolved {
+        ck.diags.push(
+            Diagnostic::new(
+                format!("cannot decide whether borrow `{name}` escapes: its type was never resolved"),
+                ast.expr_at(id).span,
+            )
+            .with_help(
+                "the escape rule turns on whether the value is copied or moved, so an unresolved \
+                 type cannot be checked soundly — annotate the binding, or simplify the expression \
+                 it comes from",
+            ),
+        );
     }
     // The unsafe boundary, ENFORCED (ownership v2, step 4 — the ladder's last rung):
     // every raw-pointer operation outside an `unsafe` block is an error. Reuses
@@ -138,6 +183,7 @@ fn alloc_closure(ast: &Ast, info: &TypeInfo) -> HashMap<String, Vec<String>> {
             allocates: false,
             calls: Vec::new(),
             alloc_via: HashMap::new(),
+            unresolved: Vec::new(),
         };
         probe.check_item(item);
         if probe.allocates {
@@ -227,6 +273,11 @@ struct Checker<'a> {
     /// Functions that allocate **transitively**, each mapped to the shortest chain
     /// reaching a directly-allocating one. Empty during the measuring pass.
     alloc_via: HashMap<String, Vec<String>>,
+    /// Borrow places whose type inference never resolved, with the root binding's
+    /// name — the `Unknown` finalization, drained and emitted sorted in [`check`].
+    /// Collected by the [`alloc_closure`] probe too, and discarded there with the
+    /// rest of its findings: that pass measures, it does not judge.
+    unresolved: Vec<(ExprId, String)>,
     /// Collections currently being iterated (by simple name). A `for … in xs`
     /// loop holds a borrow of `xs` for its body, so mutating `xs` there is
     /// forbidden (iterator invalidation — the borrow contract of a loop). A stack
@@ -911,13 +962,72 @@ impl<'a> Checker<'a> {
     /// Would moving this expression out be an escape? True when it names borrowed
     /// storage *and* its type is non-`Copy` (a `Copy` value is duplicated, not
     /// referenced, so letting it "escape" is just a copy).
-    fn escapes_as(&self, ctx: &FnCtx, id: ExprId) -> bool {
+    ///
+    /// This is one of exactly **two** places in the checker where copy-ness decides
+    /// anything (`captured_borrow_name` is the other), which is why the `Unknown`
+    /// finalization is recorded here rather than as a walk of its own — see
+    /// [`Checker::note_unresolved`].
+    fn escapes_as(&mut self, ctx: &FnCtx, id: ExprId) -> bool {
         // A closure that captures a borrow is non-`Copy` by nature (it holds a
         // reference), so the Copy refinement doesn't apply to it.
         if matches!(&self.ast.expr_at(id).kind, ExprKind::Closure { .. }) {
+            // The capture path's own leniency: a captured borrow whose type is
+            // `Unknown` is filtered out by `captured_borrow_name`'s Copy test, so
+            // the closure never looks like it captures a borrow at all.
+            if let Some(n) = self.captured_unresolved_name(ctx, id) {
+                self.note_unresolved(id, n);
+            }
             return self.is_borrow_place(ctx, id);
         }
-        self.is_borrow_place(ctx, id) && self.info.is_non_copy(id)
+        let place = self.is_borrow_place(ctx, id);
+        if place && matches!(self.info.type_of(id), Ty::Unknown) {
+            let n = self.root_name(ctx, id);
+            self.note_unresolved(id, n);
+        }
+        place && self.info.is_non_copy(id)
+    }
+
+    /// Record that `id` is borrowed storage whose type inference never resolved —
+    /// the `Unknown` finalization (safety mosaic, item 1).
+    ///
+    /// `Unknown` is `Copy` (`types.rs`), deliberately, so that expressions the
+    /// checker could not type do not manufacture escape errors. That leniency is
+    /// load-bearing for diagnostics and must stay. But at the two sites where
+    /// copy-ness *decides* something, "we could not type it" is silently read as
+    /// "it is a copy, let it escape" — which is not leniency, it is an unsound
+    /// answer. This turns those into a refusal instead.
+    ///
+    /// Deduped by expression and emitted sorted in [`check`], not pushed inline:
+    /// one expression is visited by several rules, and the port collects the same
+    /// set by its own traversal. Sorting is what lets two collection strategies
+    /// agree — and the key is `(span start, ExprId)`, a *total* order, rather than
+    /// span alone with insertion order breaking ties. Expression ids correspond
+    /// exactly across the two toolchains (that is what the P2/P3 goldens compare),
+    /// so this orders identically without either side matching the other's walk.
+    fn note_unresolved(&mut self, id: ExprId, name: String) {
+        if !self.unresolved.iter().any(|(i, _)| *i == id) {
+            self.unresolved.push((id, name));
+        }
+    }
+
+    /// The read-only twin of [`Checker::captured_borrow_name`]: the name of a
+    /// borrow this closure captures whose **type never resolved**.
+    ///
+    /// Kept separate rather than folded into `captured_borrow_name` because that
+    /// one is reached through `&self` chains (`is_borrow_place`, `root_name`) used
+    /// all over the checker; making it `&mut` to record a diagnostic cascades
+    /// across the file for no gain.
+    fn captured_unresolved_name(&self, ctx: &FnCtx, closure_id: ExprId) -> Option<String> {
+        let ExprKind::Closure { params, body } = &self.ast.expr_at(closure_id).kind else {
+            return None;
+        };
+        let params: Vec<&str> = params.iter().map(|p| p.name.name.as_str()).collect();
+        let mut refs = Vec::new();
+        self.collect_names(*body, &mut refs);
+        refs.into_iter().find_map(|(n, id)| {
+            let captures_borrow = !params.contains(&n.as_str()) && ctx.lookup(&n) == Some(true);
+            (captures_borrow && matches!(self.info.type_of(id), Ty::Unknown)).then_some(n)
+        })
     }
 
     /// Reject a `spawn` whose target takes a `mut`/`out` **slice** parameter — a
@@ -1435,6 +1545,57 @@ mod tests {
         let src = WRAP.to_string()
             + "fn f(read w: Wrap) -> i32 { match w { one { k, .. } => k, _ => 0 } }";
         assert!(escapes(&src).is_empty(), "an `i32` field is copied, not escaped");
+    }
+
+    // --- the `Unknown` finalization (safety mosaic, item 1) ---
+
+    /// A borrow whose type never resolved is refused, not silently allowed.
+    ///
+    /// `Ty::Unknown` is `Copy` on purpose, so untypable expressions raise no
+    /// escapes and no cascades. At the two sites where copy-ness *decides*
+    /// something that becomes "unresolved ⇒ copyable ⇒ let it escape", which is an
+    /// unsound answer rather than a lenient one.
+    ///
+    /// Both programs below compiled **clean** before this gate — `.v` on an
+    /// unbounded type parameter and `.w` on an `i32` are ill-formed, produce no
+    /// type, and therefore got no escape verdict at all.
+    #[test]
+    fn an_unresolved_borrow_is_refused_rather_than_assumed_copyable() {
+        for src in [
+            "struct N { v: i32 } fn f[T](read x: T) -> i32 { return x.v }",
+            "struct N { v: i32 } fn h(read p: N) -> i32 { return p.v.w }",
+        ] {
+            let d = escapes(src);
+            assert_eq!(d.len(), 1, "exactly one refusal for `{src}`: {d:?}");
+            assert!(d[0].message.contains("was never resolved"), "{d:?}");
+            assert!(
+                d[0].help.is_some(),
+                "the refusal must say what to do about it: {d:?}"
+            );
+        }
+    }
+
+    /// The gate must stay *silent* on code whose types resolve — it is a
+    /// finalization check, not a second escape rule. `ok_borrow_out` hands a borrow
+    /// back through a `read` return, which is legal and fully typed.
+    #[test]
+    fn the_finalization_gate_is_silent_on_well_typed_borrows() {
+        let src = "struct N { v: i32 } \
+                   fn ok(read p: N) -> read N { p } \
+                   fn also_ok(read p: N) -> i32 { p.v }";
+        let d = escapes(src);
+        assert!(
+            !d.iter().any(|x| x.message.contains("was never resolved")),
+            "no finalization refusal on typed code: {d:?}"
+        );
+    }
+
+    /// One expression is visited by several rules, so the refusal is deduped by
+    /// span — a repeated shape must not multiply into a cascade.
+    #[test]
+    fn the_finalization_refusal_is_reported_once_per_expression() {
+        let d = escapes("fn f[T](read x: T) -> i32 { return x.v }");
+        assert_eq!(d.len(), 1, "one expression, one diagnostic: {d:?}");
     }
 
     // --- @no_alloc: the enforced allocation-free contract (Phase 3) ---

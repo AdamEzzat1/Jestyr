@@ -2856,6 +2856,15 @@ pub fn check_parsed(read p: parser.Parser, read src: str, read a: Allocator) -> 
 
 // Is a value of type `ty` implicitly duplicated (so moving it out of a borrow is a copy, not
 // an escape)? Mirrors `Ty::is_copy` -- the predicate the escape checker's refinement consults.
+// Did inference never resolve this type? (`Ty::Unknown`, kind 0.) Distinct from Error:
+// Unknown means "not inferred", Error means "already reported". The escape checker's
+// `Unknown` finalization asks this at the two sites where Copy-ness decides an outcome,
+// because there "unresolved" would otherwise be read as "copyable".
+pub fn ty_is_unknown(read c: Checker, tyid: i32) -> bool {
+    let d: TyData = list.get(TyData, c.tys, tyid as usize)
+    return d.kind == 0
+}
+
 pub fn ty_is_copy(read c: Checker, tyid: i32) -> bool {
     let d: TyData = list.get(TyData, c.tys, tyid as usize)
     let k: i32 = d.kind

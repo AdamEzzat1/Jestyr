@@ -9072,6 +9072,15 @@ pub fn check_parsed(read p: Parser, read src: str, read a: Allocator) -> Checker
 
 // Is a value of type `ty` implicitly duplicated (so moving it out of a borrow is a copy, not
 // an escape)? Mirrors `Ty::is_copy` -- the predicate the escape checker's refinement consults.
+// Did inference never resolve this type? (`Ty::Unknown`, kind 0.) Distinct from Error:
+// Unknown means "not inferred", Error means "already reported". The escape checker's
+// `Unknown` finalization asks this at the two sites where Copy-ness decides an outcome,
+// because there "unresolved" would otherwise be read as "copyable".
+pub fn ty_is_unknown(read c: Checker, tyid: i32) -> bool {
+    let d: TyData = get(TyData, c.tys, tyid as usize)
+    return d.kind == 0
+}
+
 pub fn ty_is_copy(read c: Checker, tyid: i32) -> bool {
     let d: TyData = get(TyData, c.tys, tyid as usize)
     let k: i32 = d.kind
@@ -9138,7 +9147,7 @@ pub fn run__typeck() -> i32 {
 // collection name 2-tuples; `rdepth` the scope depth at each active `region` block entry.
 // `no_alloc`/`deterministic` are the current fn's contract flags. `ret_is_borrow` = the current
 // fn returns by borrow (so a returned borrow is allowed).
-pub struct Esc { scn: List(i32), scst: List(i32), rgn: List(i32), rgst: List(i32), frozen: List(i32), rdepth: List(i32), no_alloc: bool, deterministic: bool, ret_is_borrow: bool, self_borrow: i32, alloc: Allocator, pub dsp: List(i32), pub dmsg: String }
+pub struct Esc { scn: List(i32), scst: List(i32), rgn: List(i32), rgst: List(i32), frozen: List(i32), rdepth: List(i32), no_alloc: bool, deterministic: bool, ret_is_borrow: bool, self_borrow: i32, alloc: Allocator, unres: List(i32), pub dsp: List(i32), pub dmsg: String }
 
 // ---- scope helpers (flat arenas, mirroring typeck's) ----
 
@@ -9276,10 +9285,113 @@ fn is_non_copy(read c: Checker, id: i32) -> bool {
 
 // Would moving `id` out be an escape? A closure capturing a borrow always is; otherwise a borrow
 // place whose type is non-Copy. Mirrors `escapes_as`.
-fn escapes_as(read e: Esc, read p: Parser, read c: Checker, read src: str, id: i32) -> bool {
+//
+// This and `captured_borrow` are the ONLY two places Copy-ness decides anything, which is why
+// the `Unknown` finalization records here rather than as a walk of its own: `Unknown` is Copy
+// on purpose (so untypable expressions raise no escapes and no cascades), but at these two
+// sites that reads "we could not type it" as "it is a copy, let it escape".
+fn escapes_as(mut e: Esc, read p: Parser, read c: Checker, read src: str, id: i32) -> bool {
     let d: ExprData = get(ExprData, p.ex, id as usize)
-    if d.kind == 37 { return is_borrow_place(e, p, c, src, id) }
-    return is_borrow_place(e, p, c, src, id) and is_non_copy(c, id)
+    if d.kind == 37 {
+        let cu: i32 = captured_unresolved(e, p, c, src, id)
+        if cu >= 0 { note_unresolved(e, id) }
+        return is_borrow_place(e, p, c, src, id)
+    }
+    let place: bool = is_borrow_place(e, p, c, src, id)
+    if place {
+        if ty_is_unknown(c, get(i32, c.et, id as usize)) { note_unresolved(e, id) }
+    }
+    return place and is_non_copy(c, id)
+}
+
+// Record `id` as borrowed storage whose type never resolved. Deduped by ExprId: one expression
+// is visited by several rules. Emitted sorted in `finalize_unresolved`.
+fn note_unresolved(mut e: Esc, id: i32) {
+    var i: usize = 0
+    for i < len(i32, e.unres) {
+        if get(i32, e.unres, i) == id { return }
+        i = i + 1
+    }
+    push(i32, e.unres, id)
+}
+
+// The read-only twin of `captured_borrow`: the captured borrow whose TYPE never resolved.
+// Separate because `captured_borrow` is reached through read-only chains used all over the
+// checker, and widening it to `mut` to record a diagnostic would cascade for no gain.
+fn captured_unresolved(read e: Esc, read p: Parser, read c: Checker, read src: str, closure_id: i32) -> i32 {
+    let d: ExprData = get(ExprData, p.ex, closure_id as usize)
+    var names: List(i32) = make__list(i32, e.alloc)
+    collect_names(p, d.a, names)
+    var i: usize = 0
+    for i < len(i32, names) {
+        let nid: i32 = get(i32, names, i)
+        let nd: ExprData = get(ExprData, p.ex, nid as usize)
+        var is_param: bool = false
+        if nd.kind == 2 {
+            var k: i32 = 0
+            for k < d.y {
+                let cb: i32 = d.x + k * 3
+                let pns: i32 = get(i32, p.clar, cb as usize)
+                let pne: i32 = get(i32, p.clar, (cb + 1) as usize)
+                if str_eq(src[nd.start .. nd.end], src[pns as usize .. pne as usize]) { is_param = true }
+                k = k + 1
+            }
+        }
+        if !is_param {
+            var isb: i32 = 0 - 1
+            if nd.kind == 2 { isb = e_lookup(e, src, nd.start, nd.end) }
+            else if nd.kind == 19 { isb = e.self_borrow }
+            if isb == 1 {
+                if ty_is_unknown(c, get(i32, c.et, nid as usize)) { return nid }
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Emit the `Unknown` finalization refusals, sorted by (span start, ExprId) -- a TOTAL order,
+// so this agrees with the reference without either side matching the other's traversal (the
+// same reasoning as the unsafe rung's sort, one step stronger: no insertion-order tie-break).
+fn finalize_unresolved(mut e: Esc, read p: Parser, read c: Checker, read src: str) {
+    var remaining: usize = len(i32, e.unres)
+    for remaining > 0 {
+        var best: i32 = 0 - 1
+        var bs: i32 = 2147483647
+        var bid: i32 = 2147483647
+        var j: usize = 0
+        for j < len(i32, e.unres) {
+            let idv: i32 = get(i32, e.unres, j)
+            if idv >= 0 {
+                let dj: ExprData = get(ExprData, p.ex, idv as usize)
+                let st: i32 = dj.start as i32
+                if st < bs { bs = st  bid = idv  best = j as i32 }
+                else if st == bs {
+                    if idv < bid { bs = st  bid = idv  best = j as i32 }
+                }
+            }
+            j = j + 1
+        }
+        if best < 0 { return }
+        let id: i32 = get(i32, e.unres, best as usize)
+        let d: ExprData = get(ExprData, p.ex, id as usize)
+        var sb: String = string_new()
+        string_push(sb, "cannot decide whether borrow `")
+        // A closure names the CAPTURE it could not type, not its own root name.
+        if d.kind == 37 {
+            let cu: i32 = captured_unresolved(e, p, c, src, id)
+            if cu >= 0 {
+                let cd: ExprData = get(ExprData, p.ex, cu as usize)
+                if cd.kind == 19 { string_push(sb, "self") } else { string_push(sb, src[cd.start .. cd.end]) }
+            } else { string_push(sb, "<closure>") }
+        } else {
+            push_root_name(sb, e, p, c, src, id)
+        }
+        string_push(sb, "` escapes: its type was never resolved")
+        ediag(e, d.start, d.end, string_view(sb))
+        set(i32, e.unres, best as usize, 0 - 1)   // consumed
+        remaining = remaining - 1
+    }
 }
 
 // ---- region-value predicates (mirror is_region_value / carries_arena_ref) ----
@@ -10170,8 +10282,9 @@ fn check_items(mut e: Esc, read p: Parser, read c: Checker, read src: str) {
 // its buffered diagnostics (`dsp` span pairs + `dmsg` newline-separated messages, walk order).
 // The library entry the self-hosted driver imports; `escape_cli.jtr` dumps it for the P4 golden.
 pub fn check_program(read p: Parser, read c: Checker, read src: str, read a: Allocator) -> Esc {
-    var e: Esc = Esc{ scn: make__list(i32, a), scst: make__list(i32, a), rgn: make__list(i32, a), rgst: make__list(i32, a), frozen: make__list(i32, a), rdepth: make__list(i32, a), no_alloc: false, deterministic: false, ret_is_borrow: false, self_borrow: 0, alloc: a, dsp: make__list(i32, a), dmsg: string_new() }
+    var e: Esc = Esc{ scn: make__list(i32, a), scst: make__list(i32, a), rgn: make__list(i32, a), rgst: make__list(i32, a), frozen: make__list(i32, a), rdepth: make__list(i32, a), no_alloc: false, deterministic: false, ret_is_borrow: false, self_borrow: 0, alloc: a, unres: make__list(i32, a), dsp: make__list(i32, a), dmsg: string_new() }
     check_items(e, p, c, src)
+    finalize_unresolved(e, p, c, src)
     unsafe_boundary(e, p, c, a)
     return e
 }

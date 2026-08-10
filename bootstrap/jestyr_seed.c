@@ -476,6 +476,7 @@ struct Jestyr_Esc {
     bool j_ret_is_borrow;
     int32_t j_self_borrow;
     Jestyr_Allocator j_alloc;
+    Jestyr_List__i32 j_unres;
     Jestyr_List__i32 j_dsp;
     JestyrString j_dmsg;
 };
@@ -969,6 +970,7 @@ int32_t jestyr_err_payload_of(Jestyr_Checker j_c, JestyrStr j_src, int32_t j_ns,
 void jestyr_build_trait_errs(Jestyr_Checker* restrict j_c, Jestyr_Parser j_p, JestyrStr j_src);
 int32_t jestyr_trait_ret_wrap(Jestyr_Checker* restrict j_c, JestyrStr j_src, int32_t j_tns, int32_t j_tne, size_t j_ms, size_t j_me, int32_t j_ret);
 Jestyr_Checker jestyr_check_parsed(Jestyr_Parser j_p, JestyrStr j_src, Jestyr_Allocator j_a);
+bool jestyr_ty_is_unknown(Jestyr_Checker j_c, int32_t j_tyid);
 bool jestyr_ty_is_copy(Jestyr_Checker j_c, int32_t j_tyid);
 int32_t jestyr_run__typeck(void);
 void jestyr_e_push(Jestyr_Esc* restrict j_e);
@@ -983,7 +985,10 @@ bool jestyr_is_borrow_place(Jestyr_Esc j_e, Jestyr_Parser j_p, Jestyr_Checker j_
 int32_t jestyr_root_place(Jestyr_Esc j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_id);
 void jestyr_push_root_name(JestyrString* restrict j_sb, Jestyr_Esc j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_id);
 bool jestyr_is_non_copy(Jestyr_Checker j_c, int32_t j_id);
-bool jestyr_escapes_as(Jestyr_Esc j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_id);
+bool jestyr_escapes_as(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_id);
+void jestyr_note_unresolved(Jestyr_Esc* restrict j_e, int32_t j_id);
+int32_t jestyr_captured_unresolved(Jestyr_Esc j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_closure_id);
+void jestyr_finalize_unresolved(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src);
 bool jestyr_is_region_value(Jestyr_Esc j_e, Jestyr_Parser j_p, JestyrStr j_src, int32_t j_id);
 bool jestyr_carries_arena_ref(Jestyr_Checker j_c, int32_t j_id);
 int32_t jestyr_captured_borrow(Jestyr_Esc j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_closure_id);
@@ -15250,6 +15255,12 @@ Jestyr_Checker jestyr_check_parsed(Jestyr_Parser j_p, JestyrStr j_src, Jestyr_Al
     return j_c;
 }
 
+bool jestyr_ty_is_unknown(Jestyr_Checker j_c, int32_t j_tyid)
+{
+    Jestyr_TyData j_d = jestyr_get__TyData(j_c.j_tys, (size_t)(j_tyid));
+    return (j_d.j_kind == 0);
+}
+
 bool jestyr_ty_is_copy(Jestyr_Checker j_c, int32_t j_tyid)
 {
     Jestyr_TyData j_d = jestyr_get__TyData(j_c.j_tys, (size_t)(j_tyid));
@@ -15548,14 +15559,170 @@ bool jestyr_is_non_copy(Jestyr_Checker j_c, int32_t j_id)
     return (!jestyr_ty_is_copy(j_c, j_t));
 }
 
-bool jestyr_escapes_as(Jestyr_Esc j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_id)
+bool jestyr_escapes_as(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_id)
 {
     Jestyr_ExprData j_d = jestyr_get__ExprData(j_p.j_ex, (size_t)(j_id));
     if ((j_d.j_kind == 37))
     {
-        return jestyr_is_borrow_place(j_e, j_p, j_c, j_src, j_id);
+        int32_t j_cu = jestyr_captured_unresolved((*j_e), j_p, j_c, j_src, j_id);
+        if ((j_cu >= 0))
+        {
+            jestyr_note_unresolved(&((*j_e)), j_id);
+        }
+        return jestyr_is_borrow_place((*j_e), j_p, j_c, j_src, j_id);
     }
-    return (jestyr_is_borrow_place(j_e, j_p, j_c, j_src, j_id) && jestyr_is_non_copy(j_c, j_id));
+    bool j_place = jestyr_is_borrow_place((*j_e), j_p, j_c, j_src, j_id);
+    if (j_place)
+    {
+        if (jestyr_ty_is_unknown(j_c, jestyr_get__i32(j_c.j_et, (size_t)(j_id))))
+        {
+            jestyr_note_unresolved(&((*j_e)), j_id);
+        }
+    }
+    return (j_place && jestyr_is_non_copy(j_c, j_id));
+}
+
+void jestyr_note_unresolved(Jestyr_Esc* restrict j_e, int32_t j_id)
+{
+    size_t j_i = 0;
+    while ((j_i < jestyr_len__i32((*j_e).j_unres)))
+    {
+        if ((jestyr_get__i32((*j_e).j_unres, j_i) == j_id))
+        {
+            return;
+        }
+        j_i = (j_i + 1);
+    }
+    jestyr_push__i32(&((*j_e).j_unres), j_id);
+}
+
+int32_t jestyr_captured_unresolved(Jestyr_Esc j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_closure_id)
+{
+    Jestyr_ExprData j_d = jestyr_get__ExprData(j_p.j_ex, (size_t)(j_closure_id));
+    Jestyr_List__i32 j_names = jestyr_make__list__i32(j_e.j_alloc);
+    jestyr_collect_names(j_p, j_d.j_a, &(j_names));
+    size_t j_i = 0;
+    while ((j_i < jestyr_len__i32(j_names)))
+    {
+        int32_t j_nid = jestyr_get__i32(j_names, j_i);
+        Jestyr_ExprData j_nd = jestyr_get__ExprData(j_p.j_ex, (size_t)(j_nid));
+        bool j_is_param = false;
+        if ((j_nd.j_kind == 2))
+        {
+            int32_t j_k = 0;
+            while ((j_k < j_d.j_y))
+            {
+                int32_t j_cb = (j_d.j_x + (j_k * 3));
+                int32_t j_pns = jestyr_get__i32(j_p.j_clar, (size_t)(j_cb));
+                int32_t j_pne = jestyr_get__i32(j_p.j_clar, (size_t)((j_cb + 1)));
+                if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, j_nd.j_start, j_nd.j_end), jestyr_rt_substr(j_src, (size_t)(j_pns), (size_t)(j_pne))))
+                {
+                    j_is_param = true;
+                }
+                j_k = (j_k + 1);
+            }
+        }
+        if ((!j_is_param))
+        {
+            int32_t j_isb = (0 - 1);
+            if ((j_nd.j_kind == 2))
+            {
+                j_isb = jestyr_e_lookup(j_e, j_src, j_nd.j_start, j_nd.j_end);
+            }
+            else
+            if ((j_nd.j_kind == 19))
+            {
+                j_isb = j_e.j_self_borrow;
+            }
+            if ((j_isb == 1))
+            {
+                if (jestyr_ty_is_unknown(j_c, jestyr_get__i32(j_c.j_et, (size_t)(j_nid))))
+                {
+                    int32_t j_result = j_nid;
+                    jestyr_impl_Drop__List_i32___drop(&j_names);
+                    return j_result;
+                }
+            }
+        }
+        j_i = (j_i + 1);
+    }
+    int32_t j_result = (0 - 1);
+    jestyr_impl_Drop__List_i32___drop(&j_names);
+    return j_result;
+}
+
+void jestyr_finalize_unresolved(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src)
+{
+    size_t j_remaining = jestyr_len__i32((*j_e).j_unres);
+    while ((j_remaining > 0))
+    {
+        int32_t j_best = (0 - 1);
+        int32_t j_bs = 2147483647;
+        int32_t j_bid = 2147483647;
+        size_t j_j = 0;
+        while ((j_j < jestyr_len__i32((*j_e).j_unres)))
+        {
+            int32_t j_idv = jestyr_get__i32((*j_e).j_unres, j_j);
+            if ((j_idv >= 0))
+            {
+                Jestyr_ExprData j_dj = jestyr_get__ExprData(j_p.j_ex, (size_t)(j_idv));
+                int32_t j_st = (int32_t)(j_dj.j_start);
+                if ((j_st < j_bs))
+                {
+                    j_bs = j_st;
+                    j_bid = j_idv;
+                    j_best = (int32_t)(j_j);
+                }
+                else
+                if ((j_st == j_bs))
+                {
+                    if ((j_idv < j_bid))
+                    {
+                        j_bs = j_st;
+                        j_bid = j_idv;
+                        j_best = (int32_t)(j_j);
+                    }
+                }
+            }
+            j_j = (j_j + 1);
+        }
+        if ((j_best < 0))
+        {
+            return;
+        }
+        int32_t j_id = jestyr_get__i32((*j_e).j_unres, (size_t)(j_best));
+        Jestyr_ExprData j_d = jestyr_get__ExprData(j_p.j_ex, (size_t)(j_id));
+        JestyrString j_sb = jestyr_rt_str_new();
+        jestyr_rt_str_push(&j_sb, JSTR("cannot decide whether borrow `"));
+        if ((j_d.j_kind == 37))
+        {
+            int32_t j_cu = jestyr_captured_unresolved((*j_e), j_p, j_c, j_src, j_id);
+            if ((j_cu >= 0))
+            {
+                Jestyr_ExprData j_cd = jestyr_get__ExprData(j_p.j_ex, (size_t)(j_cu));
+                if ((j_cd.j_kind == 19))
+                {
+                    jestyr_rt_str_push(&j_sb, JSTR("self"));
+                }
+                else
+                {
+                    jestyr_rt_str_push(&j_sb, jestyr_rt_substr(j_src, j_cd.j_start, j_cd.j_end));
+                }
+            }
+            else
+            {
+                jestyr_rt_str_push(&j_sb, JSTR("<closure>"));
+            }
+        }
+        else
+        {
+            jestyr_push_root_name(&(j_sb), (*j_e), j_p, j_c, j_src, j_id);
+        }
+        jestyr_rt_str_push(&j_sb, JSTR("` escapes: its type was never resolved"));
+        jestyr_ediag(&((*j_e)), j_d.j_start, j_d.j_end, jestyr_rt_str_view(&j_sb));
+        jestyr_set__i32(&((*j_e).j_unres), (size_t)(j_best), (0 - 1));
+        j_remaining = (j_remaining - 1);
+    }
 }
 
 bool jestyr_is_region_value(Jestyr_Esc j_e, Jestyr_Parser j_p, JestyrStr j_src, int32_t j_id)
@@ -15936,7 +16103,7 @@ void jestyr_check_give_away(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_
                 {
                     if ((j_rti == 0))
                     {
-                        if (jestyr_escapes_as((*j_e), j_p, j_c, j_src, j_cal.j_a))
+                        if (jestyr_escapes_as(&((*j_e)), j_p, j_c, j_src, j_cal.j_a))
                         {
                             jestyr_give_away_err(&((*j_e)), j_p, j_c, j_src, j_cal.j_a, j_pbase, j_iid, j_p);
                         }
@@ -15947,7 +16114,7 @@ void jestyr_check_give_away(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_
                         if ((j_ai < j_acount))
                         {
                             int32_t j_arg = jestyr_get__i32(j_p.j_ar, (size_t)((j_astart + j_ai)));
-                            if (jestyr_escapes_as((*j_e), j_p, j_c, j_src, j_arg))
+                            if (jestyr_escapes_as(&((*j_e)), j_p, j_c, j_src, j_arg))
                             {
                                 jestyr_give_away_err(&((*j_e)), j_p, j_c, j_src, j_arg, j_pbase, j_iid, j_p);
                             }
@@ -15981,7 +16148,7 @@ void jestyr_check_give_away(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_
             if ((j_pi < j_acount))
             {
                 int32_t j_arg = jestyr_get__i32(j_p.j_ar, (size_t)((j_astart + j_pi)));
-                if (jestyr_escapes_as((*j_e), j_p, j_c, j_src, j_arg))
+                if (jestyr_escapes_as(&((*j_e)), j_p, j_c, j_src, j_arg))
                 {
                     jestyr_give_away_err(&((*j_e)), j_p, j_c, j_src, j_arg, j_pbase, j_iid, j_p);
                 }
@@ -16447,7 +16614,7 @@ void jestyr_walk_expr(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checke
         jestyr_walk_expr(&((*j_e)), j_p, j_c, j_src, j_d.j_b, false);
         if (jestyr_is_borrow_place((*j_e), j_p, j_c, j_src, j_d.j_a))
         {
-            if (jestyr_escapes_as((*j_e), j_p, j_c, j_src, j_d.j_b))
+            if (jestyr_escapes_as(&((*j_e)), j_p, j_c, j_src, j_d.j_b))
             {
                 JestyrString j_sb = jestyr_rt_str_new();
                 jestyr_rt_str_push(&j_sb, JSTR("cannot store borrow `"));
@@ -16704,7 +16871,7 @@ void jestyr_walk_expr(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checke
     {
         if ((!(*j_e).j_ret_is_borrow))
         {
-            if (jestyr_escapes_as((*j_e), j_p, j_c, j_src, j_id))
+            if (jestyr_escapes_as(&((*j_e)), j_p, j_c, j_src, j_id))
             {
                 JestyrString j_sb = jestyr_rt_str_new();
                 if ((j_d.j_kind == 37))
@@ -16735,7 +16902,7 @@ void jestyr_walk_lit_fields(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_
         int32_t j_fid = jestyr_get__i32(j_p.j_ar, (size_t)((j_start + j_i)));
         Jestyr_ExprData j_fd = jestyr_get__ExprData(j_p.j_ex, (size_t)(j_fid));
         jestyr_walk_expr(&((*j_e)), j_p, j_c, j_src, j_fd.j_a, false);
-        if (jestyr_escapes_as((*j_e), j_p, j_c, j_src, j_fd.j_a))
+        if (jestyr_escapes_as(&((*j_e)), j_p, j_c, j_src, j_fd.j_a))
         {
             Jestyr_ExprData j_vd = jestyr_get__ExprData(j_p.j_ex, (size_t)(j_fd.j_a));
             JestyrString j_sb = jestyr_rt_str_new();
@@ -16984,8 +17151,9 @@ void jestyr_check_items(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Chec
 
 Jestyr_Esc jestyr_check_program(Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, Jestyr_Allocator j_a)
 {
-    Jestyr_Esc j_e = (Jestyr_Esc){ .j_scn = jestyr_make__list__i32(j_a), .j_scst = jestyr_make__list__i32(j_a), .j_rgn = jestyr_make__list__i32(j_a), .j_rgst = jestyr_make__list__i32(j_a), .j_frozen = jestyr_make__list__i32(j_a), .j_rdepth = jestyr_make__list__i32(j_a), .j_no_alloc = false, .j_deterministic = false, .j_ret_is_borrow = false, .j_self_borrow = 0, .j_alloc = j_a, .j_dsp = jestyr_make__list__i32(j_a), .j_dmsg = jestyr_rt_str_new() };
+    Jestyr_Esc j_e = (Jestyr_Esc){ .j_scn = jestyr_make__list__i32(j_a), .j_scst = jestyr_make__list__i32(j_a), .j_rgn = jestyr_make__list__i32(j_a), .j_rgst = jestyr_make__list__i32(j_a), .j_frozen = jestyr_make__list__i32(j_a), .j_rdepth = jestyr_make__list__i32(j_a), .j_no_alloc = false, .j_deterministic = false, .j_ret_is_borrow = false, .j_self_borrow = 0, .j_alloc = j_a, .j_unres = jestyr_make__list__i32(j_a), .j_dsp = jestyr_make__list__i32(j_a), .j_dmsg = jestyr_rt_str_new() };
     jestyr_check_items(&(j_e), j_p, j_c, j_src);
+    jestyr_finalize_unresolved(&(j_e), j_p, j_c, j_src);
     jestyr_unsafe_boundary(&(j_e), j_p, j_c, j_a);
     return j_e;
 }
@@ -34204,6 +34372,7 @@ int32_t jestyr_driver_build(Jestyr_Ml* restrict j_m, Jestyr_Parser j_p, Jestyr_C
         }
         int32_t j_result = 1;
         jestyr_impl_Drop__List_i32___drop(&j_e.j_dsp);
+        jestyr_impl_Drop__List_i32___drop(&j_e.j_unres);
         jestyr_impl_Drop__List_i32___drop(&j_e.j_rdepth);
         jestyr_impl_Drop__List_i32___drop(&j_e.j_frozen);
         jestyr_impl_Drop__List_i32___drop(&j_e.j_rgst);
@@ -34238,6 +34407,7 @@ int32_t jestyr_driver_build(Jestyr_Ml* restrict j_m, Jestyr_Parser j_p, Jestyr_C
         jestyr_rt_eprint_str(JSTR("error: cannot write the generated C"));
         int32_t j_result = 1;
         jestyr_impl_Drop__List_i32___drop(&j_e.j_dsp);
+        jestyr_impl_Drop__List_i32___drop(&j_e.j_unres);
         jestyr_impl_Drop__List_i32___drop(&j_e.j_rdepth);
         jestyr_impl_Drop__List_i32___drop(&j_e.j_frozen);
         jestyr_impl_Drop__List_i32___drop(&j_e.j_rgst);
@@ -34285,6 +34455,7 @@ int32_t jestyr_driver_build(Jestyr_Ml* restrict j_m, Jestyr_Parser j_p, Jestyr_C
         jestyr_rt_eprint_str(JSTR("error: the C compiler failed on the generated C"));
         int32_t j_result = j_rc;
         jestyr_impl_Drop__List_i32___drop(&j_e.j_dsp);
+        jestyr_impl_Drop__List_i32___drop(&j_e.j_unres);
         jestyr_impl_Drop__List_i32___drop(&j_e.j_rdepth);
         jestyr_impl_Drop__List_i32___drop(&j_e.j_frozen);
         jestyr_impl_Drop__List_i32___drop(&j_e.j_rgst);
@@ -34319,6 +34490,7 @@ int32_t jestyr_driver_build(Jestyr_Ml* restrict j_m, Jestyr_Parser j_p, Jestyr_C
         int32_t j_prc = jestyr_rt_run_command(jestyr_rt_str_view(&j_rcmd));
         int32_t j_result = j_prc;
         jestyr_impl_Drop__List_i32___drop(&j_e.j_dsp);
+        jestyr_impl_Drop__List_i32___drop(&j_e.j_unres);
         jestyr_impl_Drop__List_i32___drop(&j_e.j_rdepth);
         jestyr_impl_Drop__List_i32___drop(&j_e.j_frozen);
         jestyr_impl_Drop__List_i32___drop(&j_e.j_rgst);
@@ -34329,6 +34501,7 @@ int32_t jestyr_driver_build(Jestyr_Ml* restrict j_m, Jestyr_Parser j_p, Jestyr_C
     }
     int32_t j_result = 0;
     jestyr_impl_Drop__List_i32___drop(&j_e.j_dsp);
+    jestyr_impl_Drop__List_i32___drop(&j_e.j_unres);
     jestyr_impl_Drop__List_i32___drop(&j_e.j_rdepth);
     jestyr_impl_Drop__List_i32___drop(&j_e.j_frozen);
     jestyr_impl_Drop__List_i32___drop(&j_e.j_rgst);

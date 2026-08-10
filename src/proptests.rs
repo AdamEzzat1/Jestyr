@@ -8766,6 +8766,42 @@ fn g(p: *mut i32) -> i32 {
         eprintln!("whole-corpus escape golden: {checked} files' diagnostic sets identical");
     }
 
+    /// **The `Unknown` finalization, differentially — the rung the corpus cannot guard.**
+    ///
+    /// `jestyr_escape_dump_matches_reference` above compares the whole corpus, but it is
+    /// structurally blind to this check: the census that motivated the finalization is
+    /// **zero** over all 155 files, and stays zero by design. So if the port were missing
+    /// the rung entirely, that golden would still pass — the two toolchains would agree on
+    /// every corpus file and silently disagree on every program that triggers it.
+    ///
+    /// These are programs that *do* trigger it, so this is the only thing standing between
+    /// the reference and the port on the newest safety rule. Both probes compiled clean
+    /// before the finalization landed: `.v` on an unbounded type parameter and `.w` on an
+    /// `i32` are ill-formed, produce no type, and so received no escape verdict at all.
+    ///
+    /// The first assertion is the one that matters most — it keeps the test from going
+    /// vacuous if a later inference improvement stops these shapes reaching the gate.
+    #[test]
+    fn jestyr_escape_finalization_matches_reference() {
+        let exe = build_exe("examples/std/escape_cli.jtr");
+        let progs = [
+            "struct N { v: i32 } fn f[T](read x: T) -> i32 { return x.v }",
+            "struct N { v: i32 } fn h(read p: N) -> i32 { return p.v.w }",
+        ];
+        for (i, src) in progs.iter().enumerate() {
+            let want = rust_escape_dump(src);
+            assert!(
+                want.iter().any(|l| l.contains("was never resolved")),
+                "probe {i} no longer reaches the finalization — the test has gone vacuous, \
+                 replace it with a shape that still does: {want:?}"
+            );
+            let f = std::env::temp_dir().join(format!("jestyr_unknown_finalization_{i}.jtr"));
+            std::fs::write(&f, src).unwrap();
+            let got = jestyr_escape_dump(&exe, f.to_str().unwrap());
+            assert_eq!(got, want, "the toolchains disagree on the finalization for: {src}");
+        }
+    }
+
     /// The Rust *reference* C for `src`, as lines. Uses the single-file `parse` + `typeck::check`
     /// path (not `module::load`), so `TypeInfo::debug` is empty and no `#line` directives are
     /// emitted — the target is the pure C text. `str::lines()` drops each line's trailing `\r`,
