@@ -55,6 +55,7 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
         cur_mod: 0,
         table: GlobalTable::default(),
         expr_types: vec![Ty::Unknown; ast.exprs.len()],
+        variant_field_names: HashMap::new(),
         resolved: vec![None; ast.exprs.len()],
         cur_type_param_bounds: HashMap::new(),
         cur_expected: None,
@@ -196,6 +197,17 @@ struct TypeChecker<'a> {
     cur_mod: ModId,
     table: GlobalTable,
     expr_types: Vec<Ty>,
+    /// `(enum's index in `table.types`, bare variant name)` → its payload field
+    /// names, in declaration order.
+    ///
+    /// [`GlobalTable`] stores a variant's field *types* positionally and drops the
+    /// names, which is all the positional pattern `rect(w, h)` needs. The named
+    /// form `rect { w, h }` needs the name→position map to type its bindings, so
+    /// it is recorded here rather than widening the table (and with it every
+    /// `TypeKindG::Enum` reader in layout, doc, attest and the backend). Keyed on
+    /// the type index, not the canonical name, so two modules' same-named variants
+    /// stay distinct.
+    variant_field_names: HashMap<(usize, String), Vec<String>>,
     /// Expr id → every resolution recorded for it (see [`Resolved`]) — the row-wise
     /// HIR handed to `escape` and `cgen` verbatim as [`TypeInfo::resolved`]. Sized
     /// with `expr_types` and indexed the same way. Written only through the
@@ -431,6 +443,15 @@ impl<'a> TypeChecker<'a> {
                                 self.check_no_value_recursion(si, self.ast.type_at(*t).span, &fty);
                             }
                             ftys.push(fty);
+                        }
+                        // `variants` keeps field types *positionally*; a struct-variant
+                        // pattern (`rect { w, h }`) addresses them by name, so keep the
+                        // name→position map too. See `variant_field_names`.
+                        if let Some(si) = self_idx {
+                            self.variant_field_names.insert(
+                                (si, v.name.name.clone()),
+                                v.fields.iter().map(|(n, _)| n.name.clone()).collect(),
+                            );
                         }
                         variants.push((v.name.name.clone(), ftys));
                     }
@@ -3612,12 +3633,37 @@ impl<'a> TypeChecker<'a> {
                     self.bind_pattern_types(scope, &fty, *sp);
                 }
             }
-            PatKind::StructVariant { fields, .. } => {
-                // The table doesn't carry enum-variant field *names*, so the named
-                // bindings are typed leniently (`Unknown`) — cgen still projects the
-                // concrete field type from the variant declaration.
-                for (_, sp) in fields {
-                    self.bind_pattern_types(scope, &Ty::Unknown, *sp);
+            PatKind::StructVariant { name, fields, .. } => {
+                // Bind each named field to its *declared* type, by looking its
+                // position up in `variant_field_names` and indexing the positional
+                // types `Variant` already uses. `variant_field_types_in` projects a
+                // generic instance's arguments, so `some { v }` on an `Option(i32)`
+                // binds `v: i32` exactly as the positional `some(v)` does.
+                //
+                // These used to bind `Ty::Unknown`, on the grounds that the table
+                // carries no field names and cgen resolves the field itself. That
+                // was unsound, not merely lenient: `Unknown` is `Copy`, so
+                // `escapes_as` treated a *borrowed* field bound this way as a copy
+                // and let it escape the frame. The positional form rejected the
+                // identical program. See
+                // `a_named_variant_binding_cannot_escape_its_borrow`.
+                let ftys = self.variant_field_types_in(scrut, &name.name);
+                let fnames = self
+                    .table
+                    .variants
+                    .get(&self.canon_variant_in(self.cur_mod, &name.name))
+                    .and_then(|&ei| self.variant_field_names.get(&(ei, name.name.clone())))
+                    .cloned()
+                    .unwrap_or_default();
+                for (fname, sp) in fields {
+                    // An unknown field name stays lenient: the name error is
+                    // reported elsewhere, and guessing a type here would cascade.
+                    let fty = fnames
+                        .iter()
+                        .position(|n| *n == fname.name)
+                        .and_then(|i| ftys.get(i).cloned())
+                        .unwrap_or(Ty::Unknown);
+                    self.bind_pattern_types(scope, &fty, *sp);
                 }
             }
             // Scalar patterns and `..` rest bind nothing.

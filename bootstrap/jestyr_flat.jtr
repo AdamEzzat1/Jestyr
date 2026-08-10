@@ -6793,6 +6793,13 @@ fn build_table(mut c: Checker, read p: Parser, read src: str) {
                 var pay: List(i32) = make__list(i32, c.alloc)
                 var f: i32 = 0
                 for f < field_count {              // payload field 3-tuples: span + TypeId
+                    // Keep the field NAME span alongside the lowered type: a positional
+                    // pattern `rect(w, h)` indexes by position, but a struct-variant
+                    // pattern `rect { w, h }` addresses fields by name and needs the
+                    // name -> position map to type its bindings (mirrors the reference's
+                    // `variant_field_names`). Payload entries are therefore triples.
+                    push(i32, pay, get(i32, p.ear, (field_start + f * 3) as usize))
+                    push(i32, pay, get(i32, p.ear, (field_start + f * 3 + 1) as usize))
                     push(i32, pay, lower_type(c, p, src, get(i32, p.ear, (field_start + f * 3 + 2) as usize)))
                     f = f + 1
                 }
@@ -7104,7 +7111,7 @@ fn variant_ctor_type(mut c: Checker, read p: Parser, read src: str, erow: i32, v
         var n: i32 = pcount
         if (len(i32, argt) as i32) < n { n = len(i32, argt) as i32 }
         for i < n {
-            unify_tp2(c, src, get(i32, c.tch, (pstart + i) as usize), get(i32, argt, i as usize), tps, tpc, subst)
+            unify_tp2(c, src, get(i32, c.tch, (pstart + i * 3 + 2) as usize), get(i32, argt, i as usize), tps, tpc, subst)
             i = i + 1
         }
     }
@@ -8530,8 +8537,8 @@ fn iter_elem_type(mut c: Checker, read p: Parser, read src: str, sid: i32) -> i3
 
 // Bind a match pattern's names against the scrutinee type (mirrors `bind_pattern_types`): a
 // plain identifier binds the whole scrutinee; a variant's positional subpats bind its payload
-// field types (Unknown until the variants table lands); struct-variant named binds are lenient
-// (Unknown) like the reference; an or-pattern binds each alternative.
+// field types by position; a struct-variant's named fields bind the same types by NAME; an
+// or-pattern binds each alternative.
 fn bind_pattern_types(mut c: Checker, read p: Parser, read src: str, scrut: i32, pid: i32) {
     let d: PatData = get(PatData, p.pt, pid as usize)
     if d.kind == 1 {                               // Ident: bind the whole scrutinee - unless it
@@ -8552,7 +8559,7 @@ fn bind_pattern_types(mut c: Checker, read p: Parser, read src: str, scrut: i32,
         var i: i32 = 0
         for i < d.a {
             var fty: i32 = t_unknown()
-            if i < pcount { fty = get(i32, c.tch, (pstart + i) as usize) }
+            if i < pcount { fty = get(i32, c.tch, (pstart + i * 3 + 2) as usize) }
             if sd.kind == 6 {                      // a generic instance: T -> the concrete arg
                 if erow >= 0 {
                     fty = subst_tp_ty(c, src, fty, td(c, erow, 7), td(c, erow, 8), sd.a, sd.b)
@@ -8561,11 +8568,44 @@ fn bind_pattern_types(mut c: Checker, read p: Parser, read src: str, scrut: i32,
             bind_pattern_types(c, p, src, fty, get(i32, p.par, (d.op + i) as usize))
             i = i + 1
         }
-    } else if d.kind == 3 {                        // StructVariant fields: lenient Unknown
+    } else if d.kind == 3 {                        // StructVariant fields: bind by NAME
+        // The named twin of kind==2. Payload entries are (name_start, name_end, ty)
+        // triples, so a pattern field is typed by matching its name against the
+        // declared ones and taking that entry's type. These used to bind Unknown,
+        // which was unsound rather than lenient: Unknown is Copy, so the escape
+        // checker let a *borrowed* field bound this way leave the frame while the
+        // positional spelling of the same program was rejected.
+        let erow3: i32 = find_variant(c, src, d.x as usize, d.y as usize)
+        var vb3: i32 = 0 - 1
+        if erow3 >= 0 { vb3 = find_variant_payloads(c, src, erow3, d.x as usize, d.y as usize) }
+        var pstart3: i32 = 0
+        var pcount3: i32 = 0
+        if vb3 >= 0 {
+            pstart3 = get(i32, c.tch, (vb3 + 2) as usize)
+            pcount3 = get(i32, c.tch, (vb3 + 3) as usize)
+        }
+        let sd3: TyData = get(TyData, c.tys, scrut as usize)
         var i: i32 = 0
         for i < d.a {
+            let fns: i32 = get(i32, p.par, (d.op + i * 3) as usize)
+            let fne: i32 = get(i32, p.par, (d.op + i * 3 + 1) as usize)
             let sub: i32 = get(i32, p.par, (d.op + i * 3 + 2) as usize)
-            bind_pattern_types(c, p, src, t_unknown(), sub)
+            var fty: i32 = t_unknown()             // an unknown field name stays lenient
+            var k: i32 = 0
+            for k < pcount3 {
+                let dns: i32 = get(i32, c.tch, (pstart3 + k * 3) as usize)
+                let dne: i32 = get(i32, c.tch, (pstart3 + k * 3 + 1) as usize)
+                if str_eq(src[fns as usize .. fne as usize], src[dns as usize .. dne as usize]) {
+                    fty = get(i32, c.tch, (pstart3 + k * 3 + 2) as usize)
+                }
+                k = k + 1
+            }
+            if sd3.kind == 6 {                     // a generic instance: T -> the concrete arg
+                if erow3 >= 0 {
+                    fty = subst_tp_ty(c, src, fty, td(c, erow3, 7), td(c, erow3, 8), sd3.a, sd3.b)
+                }
+            }
+            bind_pattern_types(c, p, src, fty, sub)
             i = i + 1
         }
     } else if d.kind == 6 {                        // Or: each alternative binds the scrutinee

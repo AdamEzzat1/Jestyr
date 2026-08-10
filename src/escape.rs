@@ -1382,6 +1382,61 @@ mod tests {
         assert!(escapes(src).is_empty(), "false positives: {:?}", escapes(src));
     }
 
+    // --- struct-variant patterns bind real types (a closed soundness hole) ---
+
+    const WRAP: &str = "struct Node { value: i32 } enum Wrap { one(n: Node, k: i32), dot } ";
+
+    /// A borrowed field bound by a **named** variant pattern must not escape.
+    ///
+    /// This pins a soundness fix, not a preference. Struct-variant patterns used
+    /// to bind `Ty::Unknown` — the global table stores a variant's field types
+    /// positionally and dropped the names, so there was nothing to match `n`
+    /// against. `Unknown` is `Copy`, so `escapes_as` classified a *borrowed* field
+    /// as a copy and let it leave the frame, while the positional spelling of the
+    /// identical program was rejected.
+    ///
+    /// The assertion is deliberately an *equivalence*: two spellings of one
+    /// program must reach the same verdict. A test that only checked "named form
+    /// errors" would still pass if both forms silently regressed to accepting.
+    #[test]
+    fn a_named_variant_binding_cannot_escape_its_borrow() {
+        let positional = WRAP.to_string()
+            + "fn f(read w: Wrap) -> Node { match w { one(n, k) => n, _ => Node{ value: 0 } } }";
+        let named = WRAP.to_string()
+            + "fn f(read w: Wrap) -> Node { match w { one { n, k } => n, _ => Node{ value: 0 } } }";
+        let p = escapes(&positional);
+        let n = escapes(&named);
+        assert_eq!(p.len(), 1, "the positional form is the baseline: {p:?}");
+        assert!(p[0].message.contains("cannot return borrow"), "{p:?}");
+        assert_eq!(
+            n.len(),
+            p.len(),
+            "the named form must agree with the positional one, not silently pass: {n:?}"
+        );
+        assert!(n[0].message.contains("cannot return borrow"), "{n:?}");
+    }
+
+    /// The same hole reached through a `..` rest pattern — the spelling the corpus
+    /// actually uses (`examples/struct_variant.jtr`), and the one that surfaced it.
+    #[test]
+    fn a_rest_pattern_binding_cannot_escape_its_borrow() {
+        let src = WRAP.to_string()
+            + "fn f(read w: Wrap) -> Node { match w { one { n, .. } => n, _ => Node{ value: 0 } } }";
+        let d = escapes(&src);
+        assert_eq!(d.len(), 1, "a borrow bound through `..` still escapes: {d:?}");
+        assert!(d[0].message.contains("cannot return borrow"), "{d:?}");
+    }
+
+    /// The other half of the fix: binding a `Copy` field by name must stay clean.
+    /// Typing these bindings for real could have turned leniency into false
+    /// positives, so pin that it did not.
+    #[test]
+    fn a_named_binding_of_a_copy_field_is_not_an_escape() {
+        let src = WRAP.to_string()
+            + "fn f(read w: Wrap) -> i32 { match w { one { k, .. } => k, _ => 0 } }";
+        assert!(escapes(&src).is_empty(), "an `i32` field is copied, not escaped");
+    }
+
     // --- @no_alloc: the enforced allocation-free contract (Phase 3) ---
 
     #[test]
