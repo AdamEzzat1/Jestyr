@@ -151,22 +151,61 @@ be added additively.
 
 ## 5. HIR
 
-**Jestyr already has a HIR — it is just spelled as side tables.** `TypeInfo`
-carries `expr_types`, `method_calls`, `qualified`, `call_sym`, `impl_calls`,
+**Jestyr already has a HIR — it was just spelled as side tables.** `TypeInfo`
+carried `expr_types`, `method_calls`, `qualified`, `call_sym`, `impl_calls`,
 `bound_method_calls`, `dyn_coercions`, `dyn_calls`, `err_payloads`. `cgen` reads
-all of them, keyed by `ExprId`. That *is* a resolved layer; it is simply
+all of them, keyed by `ExprId`. That *is* a resolved layer; it was simply
 scattered across nine `HashMap`s instead of living in one tree.
 
 That reframes the work: not "introduce a HIR" but "collect the existing one".
 
-Staged, each stage gated on byte-identical C over the 148-file corpus:
+Staged, each stage gated on byte-identical C over the corpus:
 
-- **Stage 0 (documentation only).** Write down that `TypeInfo`'s side tables are
-  the de-facto HIR and that `ExprId` is its node identity. Zero risk; makes the
-  next stages legible.
-- **Stage 1.** Introduce `hir::Resolved`, a *single* struct per `ExprId` folding
-  the nine maps into one lookup. Purely a data-structure change behind the same
-  accessors; no pass changes shape. Byte-identity is trivially preserved.
+- **Stage 0 — DONE (documentation only).** Write down that `TypeInfo`'s side
+  tables are the de-facto HIR and that `ExprId` is its node identity. Zero risk;
+  makes the next stages legible.
+- **Stage 1 — DONE.** `types::Resolved`, one struct per `ExprId`, folds the seven
+  *resolution* maps (`call_sym`, `method_calls`, `qualified`, `impl_calls`,
+  `bound_method_calls`, `dyn_coercions`, `dyn_calls`) into a single
+  `TypeInfo::resolved`. `expr_types` stays a dense `Vec` — it is defined for every
+  expression, so a map would be strictly worse — and `err_payloads` stays separate
+  because it is keyed by *error name*, not `ExprId`; neither was ever part of the
+  fold.
+
+  Reads go through seven point-lookup accessors (`info.method_call(id)`,
+  `info.qualified(id)`, …) and writes through seven `record_*` helpers in the
+  checker, so the storage is now a private decision.
+
+  **The storage is a dense `Vec<Option<Box<Resolved>>>`, not a `HashMap`, and
+  that was measured rather than assumed.** The obvious fold — one
+  `HashMap<ExprId, Resolved>` — is *slower* than the seven maps it replaces,
+  because sparse columns are cheap to **miss**: `HashMap::get` short-circuits on
+  an empty table, so in a single-module program `qualified`, `impl_calls`,
+  `dyn_calls` and the rest cost `escape` and `cgen` essentially nothing per call.
+  Folding them into one populated map turns every free miss into a real
+  hash-and-probe. Interleaved `selfbench` A/B, medians of 3, with `lex`/`parse`
+  as untouched controls: **escape +20% (3/3 rounds), total +2.9%**. Indexing a
+  `Vec` is cheaper than either arrangement; re-measured over 8 interleaved rounds
+  the dense version is at parity with master, within a ±5% noise floor (the two
+  controls disagreed by 8 points, and `cgen` came out *faster* — noise dominates
+  below that). The reproducible escape regression is gone.
+
+  The lesson generalizes to Stages 2–4: a column→row transpose trades cheap
+  misses for uniform hits, so measure the fold, and prefer `ExprId`-indexed
+  vectors over maps wherever the key is already a dense index.
+
+  **Why byte-identity was
+  trivially preserved: every consumer read these maps as `get`/`contains_key` and
+  none iterated them.** That is now enforced rather than reviewed — the only two
+  whole-program iterators (`qualified_targets`, `method_resolutions`, both for
+  tests that assert *what* resolved without knowing expression ids) are
+  `#[cfg(test)]`, so a future emitting pass that tried to iterate — and thereby
+  make the generated C depend on `HashMap` order — fails to compile.
+
+  One incidental rename: the checker's `record_dyn_coercion(expr, expected: &Ty)`
+  became `check_dyn_coercion`, which is what it does (it also *errors* when the
+  concrete type doesn't implement the trait); the name now belongs to the
+  one-line field writer.
 - **Stage 2.** Move *desugaring* into HIR construction — the rewrites all three
   back passes currently repeat or assume: `while`/`loop` → `for` (already done in
   the parser), block-led vs expression forms, compound assignment, `?`

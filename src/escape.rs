@@ -953,7 +953,7 @@ impl<'a> Checker<'a> {
     fn check_give_away(&mut self, ctx: &FnCtx, call_id: ExprId, callee: ExprId, args: &[ExprId]) {
         // Method call: the receiver and the explicit arguments map onto the
         // resolved function's runtime (non-comptime) parameters.
-        if let Some(mr) = self.info.method_calls.get(&call_id).cloned() {
+        if let Some(mr) = self.info.method_call(call_id).cloned() {
             let ExprKind::Field { base, .. } = &self.ast.expr_at(callee).kind else { return };
             let base = *base;
             let Some(f) = self.find_fn(&mr.fn_name) else { return };
@@ -985,8 +985,8 @@ impl<'a> Checker<'a> {
             // as `table.fns`. Without this arm a `take` parameter reached through a
             // qualified call — e.g. the move-only `sync.channel_send(T, ch, take v)` —
             // would silently skip the give-away check, letting a *borrow* be sent.
-            ExprKind::Field { .. } => match self.info.qualified.get(&call_id) {
-                Some(q) => q.clone(),
+            ExprKind::Field { .. } => match self.info.qualified(call_id) {
+                Some(q) => q.to_string(),
                 None => return,
             },
             _ => return,
@@ -1014,7 +1014,7 @@ impl<'a> Checker<'a> {
     /// would double-free (the auto-drop still fires). The destructor is
     /// inspectable (`--show-drops`) but not hand-callable — Rust's rule.
     fn check_manual_drop(&mut self, call_id: ExprId, span: Span) {
-        if let Some(ic) = self.info.impl_calls.get(&call_id) {
+        if let Some(ic) = self.info.impl_call(call_id) {
             if ic.trait_name == "Drop" && ic.method == "drop" {
                 self.error(
                     span,
@@ -1031,8 +1031,8 @@ impl<'a> Checker<'a> {
     /// *transitive* "calls a function that allocates" closure is future work.
     fn check_no_alloc_call(&mut self, call_id: ExprId, callee: ExprId, span: Span) {
         // A module-qualified call resolves to the underlying bare function name.
-        let name = if let Some(q) = self.info.qualified.get(&call_id) {
-            q.clone()
+        let name = if let Some(q) = self.info.qualified(call_id) {
+            q.to_string()
         } else if let ExprKind::Name(n) = &self.ast.expr_at(callee).kind {
             n.name.clone()
         } else {
@@ -1088,8 +1088,8 @@ impl<'a> Checker<'a> {
         if !self.deterministic {
             return;
         }
-        let name = if let Some(q) = self.info.qualified.get(&call_id) {
-            q.clone()
+        let name = if let Some(q) = self.info.qualified(call_id) {
+            q.to_string()
         } else if let ExprKind::Name(n) = &self.ast.expr_at(callee).kind {
             n.name.clone()
         } else {
@@ -1117,7 +1117,7 @@ impl<'a> Checker<'a> {
         let mutating = |c: Conv| matches!(c, Conv::Mut | Conv::Out | Conv::Take);
 
         // Method sugar: receiver ↔ runtime[0], explicit args ↔ runtime[1..].
-        if let Some(mr) = self.info.method_calls.get(&call_id).cloned() {
+        if let Some(mr) = self.info.method_call(call_id).cloned() {
             let ExprKind::Field { base, .. } = &self.ast.expr_at(callee).kind else { return };
             let base = *base;
             let Some(f) = self.find_fn(&mr.fn_name) else { return };
@@ -1137,7 +1137,7 @@ impl<'a> Checker<'a> {
         // resolves to a bare function name either way.
         let name = match &self.ast.expr_at(callee).kind {
             ExprKind::Name(n) => Some(n.name.clone()),
-            ExprKind::Field { .. } => self.info.qualified.get(&call_id).cloned(),
+            ExprKind::Field { .. } => self.info.qualified(call_id).map(String::from),
             _ => None,
         };
         let Some(name) = name else { return };

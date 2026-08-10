@@ -416,27 +416,85 @@ impl DebugInfo {
     }
 }
 
+/// Everything the type checker decided about **one expression**, beyond its type:
+/// one row of Jestyr's HIR (see [`TypeInfo`]).
+///
+/// Every field records a resolution the backend cannot re-derive from the AST.
+/// All are `None` for the overwhelming majority of expressions — a literal, a
+/// binary operator or a local read resolves to nothing — so only expressions that
+/// actually resolved to *something* get an entry in [`TypeInfo::resolved`].
+///
+/// The six *call* resolutions are mutually exclusive in practice — a `Call`
+/// resolves as exactly one of method / impl / bound-method / dyn / qualified /
+/// colliding-symbol — but that is a property of the checker's dispatch order,
+/// not an invariant this type enforces.
+///
+/// **`dyn_coercion` is not exclusive with them, and that is load-bearing.** It is
+/// keyed on the *coerced value*, which is often an argument or a returned
+/// expression, and that expression may itself be a call: passing `make()` where a
+/// `dyn Shape` is expected records both the call's resolution and the coercion on
+/// the same `ExprId`. So the checker's writers fill in one field of an existing
+/// row (`entry(id).or_default()`) rather than inserting a fresh `Resolved` —
+/// replacing a row would silently drop whichever resolution was recorded first
+/// and emit a call without its fat-pointer wrap. Pinned by
+/// `typeck::tests::a_call_coerced_to_dyn_keeps_both_resolutions`.
+#[derive(Clone, Debug, Default)]
+pub struct Resolved {
+    /// An *unqualified* direct call (`make(a)`) → the canonical name of the
+    /// function it resolved to, recorded **only** when that differs from the bare
+    /// callee name (i.e. the name collides across modules). The backend prefers
+    /// this over the AST's bare name so a within-module call to a duplicated name
+    /// targets the right C symbol; absent for every non-colliding call, keeping
+    /// the emitted C byte-identical there.
+    pub call_sym: Option<String>,
+    /// For a `base.name(args)` call: its method resolution.
+    pub method: Option<MethodRes>,
+    /// Module-qualified access, resolved to the target's *canonical* name (see
+    /// [`canon`] — the bare name unless it collides across modules): set on a
+    /// `Call` expr (`mem.allocate(x)`) or a `Field` expr (`mem.PAGE_SIZE`). The
+    /// backend emits a direct reference, not a field access / method call
+    /// (design §9, qualified access).
+    pub qualified: Option<String>,
+    /// For a `recv.m(args)` call that resolved through an `impl Trait for
+    /// <recv-type>`: the trait-impl method resolution (traits, Stage B).
+    pub impl_call: Option<ImplCall>,
+    /// For a method call on a bracket type parameter resolved through its bound
+    /// (the "Zig fix"): the backend selects the concrete impl per monomorphized
+    /// instance via the active type substitution.
+    pub bound_method: Option<BoundMethodCall>,
+    /// The trait this expression coerces to as `dyn Trait` (traits, Stage F): the
+    /// backend wraps the value into a `{ data, vtable }` fat pointer, picking the
+    /// vtable for the value's concrete type (from `type_of(expr)`).
+    pub dyn_coercion: Option<String>,
+    /// For a `dyn Trait` call: the method name, dispatched through the vtable slot
+    /// (the trait is implicit in the receiver's fat-pointer type).
+    pub dyn_call: Option<String>,
+}
+
 /// The result of type checking: the global table plus a type for every
 /// expression (indexed by `ExprId`).
 ///
 /// # This is Jestyr's HIR
 ///
-/// Worth saying out loud, because the shape hides it: the eight per-expression
-/// fields below — `expr_types` plus the seven `HashMap<ExprId, …>` resolution
-/// tables (`call_sym`, `method_calls`, `qualified`, `impl_calls`,
-/// `bound_method_calls`, `dyn_coercions`, `dyn_calls`) — **are** a high-level
-/// intermediate representation. Every one is keyed by `ExprId`, every one records
-/// a decision the type checker made that the backend cannot re-derive, and `cgen`
-/// reads all of them. An AST node plus its row across these tables is a resolved
-/// node; the collection of rows is a resolved tree, stored column-wise.
+/// Worth saying out loud, because the shape used to hide it: `expr_types` plus
+/// [`resolved`] **are** a high-level intermediate representation. Both are keyed
+/// by `ExprId`, both record decisions the type checker made that the backend
+/// cannot re-derive, and `cgen` reads both. An AST node plus its `Resolved` row is
+/// a resolved node; the collection of rows is a resolved tree.
 ///
 /// So the often-proposed "add a HIR between typeck and cgen" is not a new layer —
-/// it is **collecting the one that already exists**. That reframing is what makes
-/// the migration cheap at the start: folding the seven maps into a single
-/// `HashMap<ExprId, Resolved>` behind the same accessors changes no emitted C, so
-/// it costs nothing in corpus goldens, attest hashes, or bootstrap-seed churn.
-/// Only later stages — moving desugaring into HIR construction, then pointing
-/// `escape` and `cgen` at it — change output and therefore owe a port mirror.
+/// it is **collecting the one that already exists**. Stage 1 of that collection is
+/// done: seven separate `HashMap<ExprId, …>` columns (`call_sym`, `method_calls`,
+/// `qualified`, `impl_calls`, `bound_method_calls`, `dyn_coercions`, `dyn_calls`)
+/// are now one row-wise map behind the accessors below. Every pass read them as
+/// point lookups and none iterated them, so the transpose changed no emitted C —
+/// it cost nothing in corpus goldens, attest hashes, or bootstrap-seed churn, and
+/// owed no port mirror.
+///
+/// Later stages — moving desugaring into HIR construction, then pointing `escape`
+/// and `cgen` at it — do change output and therefore *do* owe a port mirror.
+///
+/// [`resolved`]: TypeInfo::resolved
 ///
 /// Staging and rationale: `docs/frontend-roadmap.md` §5.
 pub struct TypeInfo {
@@ -465,35 +523,25 @@ pub struct TypeInfo {
     /// Per-module import bindings (binding name → target module), so the backend can
     /// resolve a `mod.Type` path to the right module's (possibly colliding) type.
     pub imports: Vec<std::collections::HashMap<String, ModId>>,
-    /// An *unqualified* direct call (`make(a)`) → the canonical name of the
-    /// function it resolved to, recorded **only** when that differs from the bare
-    /// callee name (i.e. the name collides across modules). The backend prefers
-    /// this over the AST's bare name so a within-module call to a duplicated name
-    /// targets the right C symbol; absent for every non-colliding call, keeping
-    /// the emitted C byte-identical there.
-    pub call_sym: HashMap<ExprId, String>,
-    /// `Call`-expr id → its method resolution, for `base.name(args)` calls.
-    pub method_calls: HashMap<ExprId, MethodRes>,
-    /// Module-qualified access, resolved to the target's *canonical* name (see
-    /// [`canon`] — the bare name unless it collides across modules): a `Call`
-    /// expr id (`mem.allocate(x)`) or a `Field` expr id (`mem.PAGE_SIZE`) →
-    /// the underlying function/const symbol. The backend emits a direct reference,
-    /// not a field access / method call (design §9, qualified access).
-    pub qualified: HashMap<ExprId, String>,
-    /// `Call`-expr id → trait-impl method resolution, for `recv.m(args)` calls
-    /// that resolved through an `impl Trait for <recv-type>` (traits, Stage B).
-    pub impl_calls: HashMap<ExprId, ImplCall>,
-    /// `Call`-expr id → a method call on a bracket type parameter resolved through
-    /// its bound (the "Zig fix"); the backend selects the concrete impl per
-    /// monomorphized instance via the active type substitution.
-    pub bound_method_calls: HashMap<ExprId, BoundMethodCall>,
-    /// Expr id → the trait name it coerces to as `dyn Trait` (traits, Stage F):
-    /// the backend wraps the value into a `{ data, vtable }` fat pointer, picking
-    /// the vtable for the value's concrete type (from `type_of(expr)`).
-    pub dyn_coercions: HashMap<ExprId, String>,
-    /// `Call`-expr id → the method name of a `dyn Trait` call, dispatched through
-    /// the vtable slot (the trait is implicit in the receiver's fat-pointer type).
-    pub dyn_calls: HashMap<ExprId, String>,
+    /// Expr id → everything the type checker resolved about it (see [`Resolved`]),
+    /// indexed by `ExprId` exactly like `expr_types`. `None` for every expression
+    /// that resolved to nothing, which is most of them.
+    ///
+    /// **Why a dense `Vec` and not a `HashMap`.** The fold was measured against
+    /// the seven-map version it replaced, and a map lost: sparse columns are cheap
+    /// to *miss*, because `HashMap::get` short-circuits on an empty table. A
+    /// single-module program left `qualified`, `impl_calls`, `dyn_calls` and the
+    /// rest empty, so most of `escape`'s and `cgen`'s per-call probes cost
+    /// essentially nothing; folding them into one populated map turned every one
+    /// of those free misses into a real hash-and-probe (`selfbench`: escape +20%,
+    /// total +2.9%). Indexing a `Vec` is cheaper than any of it, and the `Box`
+    /// keeps the row itself — seven `Option`s, a few hundred bytes — out of the
+    /// spine, so the per-expression cost is one pointer.
+    ///
+    /// Read through the accessors below rather than directly, so a later HIR
+    /// stage can change the storage again without touching call sites. That
+    /// indirection is what made *this* change a twenty-line edit.
+    pub resolved: Vec<Option<Box<Resolved>>>,
     /// Error names that carry a payload → the payload's type (error-payloads E3;
     /// D1 makes this whole-program). Empty for every payload-free program, which
     /// is the backend's gate: no entry here ⇒ not one byte of payload machinery
@@ -505,6 +553,80 @@ pub struct TypeInfo {
 impl TypeInfo {
     pub fn type_of(&self, id: ExprId) -> &Ty {
         self.expr_types.get(id.0 as usize).unwrap_or(&Ty::Unknown)
+    }
+
+    // --- the resolution accessors: one per `Resolved` field ---
+    //
+    // Each is a point lookup returning `None` when the expression resolved to
+    // nothing of that kind. Passes go through these instead of touching
+    // `resolved` so the storage stays a private decision — it was seven separate
+    // maps before HIR Stage 1, then one map, now a dense `Vec`, and every one of
+    // those moves was invisible here.
+
+    /// This expression's resolution row, if it has one. Out-of-range ids answer
+    /// `None` rather than panicking, matching `type_of`'s leniency.
+    fn row(&self, id: ExprId) -> Option<&Resolved> {
+        self.resolved.get(id.0 as usize)?.as_deref()
+    }
+
+    /// The canonical symbol of an unqualified call whose name collides across
+    /// modules — `None` for every non-colliding call.
+    pub fn call_sym(&self, id: ExprId) -> Option<&str> {
+        self.row(id)?.call_sym.as_deref()
+    }
+
+    /// How a `base.name(args)` call resolved.
+    pub fn method_call(&self, id: ExprId) -> Option<&MethodRes> {
+        self.row(id)?.method.as_ref()
+    }
+
+    /// The canonical function/const symbol behind a module-qualified access.
+    pub fn qualified(&self, id: ExprId) -> Option<&str> {
+        self.row(id)?.qualified.as_deref()
+    }
+
+    /// How a `recv.m(args)` call resolved through an `impl Trait for <recv-type>`.
+    pub fn impl_call(&self, id: ExprId) -> Option<&ImplCall> {
+        self.row(id)?.impl_call.as_ref()
+    }
+
+    /// How a method call on a bracket type parameter resolved through its bound.
+    pub fn bound_method_call(&self, id: ExprId) -> Option<&BoundMethodCall> {
+        self.row(id)?.bound_method.as_ref()
+    }
+
+    /// The trait this expression coerces to as `dyn Trait`.
+    pub fn dyn_coercion(&self, id: ExprId) -> Option<&str> {
+        self.row(id)?.dyn_coercion.as_deref()
+    }
+
+    /// The vtable-dispatched method name of a `dyn Trait` call.
+    pub fn dyn_call(&self, id: ExprId) -> Option<&str> {
+        self.row(id)?.dyn_call.as_deref()
+    }
+
+    // --- whole-program iteration: tests only, on purpose ---
+    //
+    // These serve tests that assert *what* a program resolved to without knowing
+    // the expression ids. They are `#[cfg(test)]` so that no emitting pass can
+    // grow a dependency on iteration order — which is a property of whichever
+    // storage `resolved` currently uses, not a contract. Under the `HashMap` this
+    // fold briefly used, iterating in `cgen` would have made the generated C
+    // depend on hash order and silently broken byte-identity against the
+    // self-hosted toolchain; the dense `Vec` happens to iterate in source order
+    // instead. Gating them keeps that difference from ever mattering, and keeps
+    // the storage free to change again.
+
+    /// Every module-qualified access in the program.
+    #[cfg(test)]
+    pub fn qualified_targets(&self) -> impl Iterator<Item = &str> {
+        self.resolved.iter().flatten().filter_map(|r| r.qualified.as_deref())
+    }
+
+    /// Every `base.name(args)` method resolution in the program.
+    #[cfg(test)]
+    pub fn method_resolutions(&self) -> impl Iterator<Item = &MethodRes> {
+        self.resolved.iter().flatten().filter_map(|r| r.method.as_ref())
     }
 
     /// Would moving/returning/storing this expression's value be a *move* (an

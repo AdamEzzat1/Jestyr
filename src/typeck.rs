@@ -55,13 +55,7 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
         cur_mod: 0,
         table: GlobalTable::default(),
         expr_types: vec![Ty::Unknown; ast.exprs.len()],
-        method_calls: HashMap::new(),
-        qualified: HashMap::new(),
-        call_sym: HashMap::new(),
-        impl_calls: HashMap::new(),
-        bound_method_calls: HashMap::new(),
-        dyn_coercions: HashMap::new(),
-        dyn_calls: HashMap::new(),
+        resolved: vec![None; ast.exprs.len()],
         cur_type_param_bounds: HashMap::new(),
         cur_expected: None,
         cur_ret: None,
@@ -91,13 +85,7 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
             dup_types: tc.dup_types,
             dup_variants: tc.dup_variants,
             imports: modules.imports.clone(),
-            call_sym: tc.call_sym,
-            method_calls: tc.method_calls,
-            qualified: tc.qualified,
-            impl_calls: tc.impl_calls,
-            bound_method_calls: tc.bound_method_calls,
-            dyn_coercions: tc.dyn_coercions,
-            dyn_calls: tc.dyn_calls,
+            resolved: tc.resolved,
             err_payloads: tc.err_payloads,
         },
         tc.diags,
@@ -208,25 +196,11 @@ struct TypeChecker<'a> {
     cur_mod: ModId,
     table: GlobalTable,
     expr_types: Vec<Ty>,
-    /// `Call`-expr id → method resolution (see [`MethodRes`]).
-    method_calls: HashMap<ExprId, MethodRes>,
-    /// Qualified access (`mem.allocate` / `mem.PAGE`) → the resolved *canonical*
-    /// name (bare unless the name collides across modules; see `canon`).
-    qualified: HashMap<ExprId, String>,
-    /// Unqualified direct call → its target's canonical name, recorded only when
-    /// it differs from the bare callee (a within-module call to a colliding name).
-    call_sym: HashMap<ExprId, String>,
-    /// `Call`-expr id → trait-impl method resolution (traits, Stage B).
-    impl_calls: HashMap<ExprId, ImplCall>,
-    /// `Call`-expr id → a method call on a *bracket type parameter* resolved
-    /// through its bound (the "Zig fix"). The concrete impl is selected per
-    /// monomorphized instance in the backend, via the active type substitution.
-    bound_method_calls: HashMap<ExprId, BoundMethodCall>,
-    /// Expr id → the trait it coerces to as `dyn Trait` (Stage F); the backend
-    /// builds a `{ data, vtable }` fat pointer for the value's concrete type.
-    dyn_coercions: HashMap<ExprId, String>,
-    /// `Call`-expr id → the method name of a `dyn Trait` call (vtable dispatch).
-    dyn_calls: HashMap<ExprId, String>,
+    /// Expr id → every resolution recorded for it (see [`Resolved`]) — the row-wise
+    /// HIR handed to `escape` and `cgen` verbatim as [`TypeInfo::resolved`]. Sized
+    /// with `expr_types` and indexed the same way. Written only through the
+    /// `record_*` helpers below; never read back during checking.
+    resolved: Vec<Option<Box<Resolved>>>,
     /// The bracket type parameters in scope for the function being checked, each
     /// mapped to its declared bound (`None` if unbounded). Drives the body-side
     /// "only the bound's methods are callable on a `T` value" check.
@@ -264,6 +238,46 @@ impl<'a> TypeChecker<'a> {
     fn set(&mut self, id: ExprId, ty: Ty) -> Ty {
         self.expr_types[id.0 as usize] = ty.clone();
         ty
+    }
+
+    // --- recording resolutions (the HIR write side) ---
+    //
+    // One writer per `Resolved` field. Each creates the expression's row on first
+    // write and fills in its own slot, so recording two kinds of resolution for
+    // one expression composes rather than clobbering — the shape the checker
+    // relied on when these were seven independent maps.
+
+    /// The row for `id`, created empty if this is its first resolution.
+    fn row(&mut self, id: ExprId) -> &mut Resolved {
+        self.resolved[id.0 as usize].get_or_insert_with(Default::default)
+    }
+
+    fn record_call_sym(&mut self, id: ExprId, sym: String) {
+        self.row(id).call_sym = Some(sym);
+    }
+
+    fn record_method(&mut self, id: ExprId, m: MethodRes) {
+        self.row(id).method = Some(m);
+    }
+
+    fn record_qualified(&mut self, id: ExprId, sym: String) {
+        self.row(id).qualified = Some(sym);
+    }
+
+    fn record_impl_call(&mut self, id: ExprId, c: ImplCall) {
+        self.row(id).impl_call = Some(c);
+    }
+
+    fn record_bound_method(&mut self, id: ExprId, c: BoundMethodCall) {
+        self.row(id).bound_method = Some(c);
+    }
+
+    fn record_dyn_coercion(&mut self, id: ExprId, trait_name: String) {
+        self.row(id).dyn_coercion = Some(trait_name);
+    }
+
+    fn record_dyn_call(&mut self, id: ExprId, method: String) {
+        self.row(id).dyn_call = Some(method);
     }
 
     // --- per-module namespacing ---
@@ -720,7 +734,7 @@ impl<'a> TypeChecker<'a> {
                 .find(|im| im.type_key == key && im.method_rets.contains_key(method))?;
             (im.trait_name.clone(), im.method_rets.get(method).cloned().unwrap_or(Ty::Unknown))
         };
-        self.impl_calls.insert(call_id, ImplCall { trait_name: trait_name.clone(), type_key: key, method: method.to_string() });
+        self.record_impl_call(call_id, ImplCall { trait_name: trait_name.clone(), type_key: key, method: method.to_string() });
         Some(self.wrap_trait_ret(&trait_name, method, ret))
     }
 
@@ -760,7 +774,7 @@ impl<'a> TypeChecker<'a> {
             );
             return Some(Ty::Error);
         }
-        self.bound_method_calls.insert(
+        self.record_bound_method(
             call_id,
             BoundMethodCall { trait_name: tr.clone(), method: mname.to_string(), type_param: tp.clone() },
         );
@@ -779,7 +793,7 @@ impl<'a> TypeChecker<'a> {
             self.error(span, format!("no method `{mname}` on `dyn {tr}`: not a method of the trait"));
             return Some(Ty::Error);
         }
-        self.dyn_calls.insert(call_id, mname.to_string());
+        self.record_dyn_call(call_id, mname.to_string());
         let ret = self.trait_method_ret(&tr, mname, recv_ty);
         Some(self.wrap_trait_ret(&tr, mname, ret))
     }
@@ -789,7 +803,7 @@ impl<'a> TypeChecker<'a> {
     /// `{ data, vtable }` fat pointer (Stage F). A concrete type that does **not**
     /// implement the trait is an error; a value that is already `dyn Trait` (or a
     /// non-`dyn` expected type) is left untouched.
-    fn record_dyn_coercion(&mut self, expr: ExprId, expected: &Ty) {
+    fn check_dyn_coercion(&mut self, expr: ExprId, expected: &Ty) {
         let Some(tr) = dyn_trait_of(expected) else { return };
         let actual = self.expr_types[expr.0 as usize].clone();
         // Already a `dyn` value (pass-through), or unresolved — nothing to wrap.
@@ -816,7 +830,7 @@ impl<'a> TypeChecker<'a> {
         }
         let key = self.table.ty_key(&actual);
         if self.table.impl_index.contains_key(&(tr.to_string(), key)) {
-            self.dyn_coercions.insert(expr, tr.to_string());
+            self.record_dyn_coercion(expr, tr.to_string());
         } else {
             let span = self.ast.expr_at(expr).span;
             let shown = actual.display(&self.table);
@@ -972,7 +986,7 @@ impl<'a> TypeChecker<'a> {
             .map(|im| im.method_rets.get(method).cloned().unwrap_or(Ty::Unknown));
         match resolved {
             Some(ret) => {
-                self.impl_calls.insert(
+                self.record_impl_call(
                     id,
                     ImplCall {
                         trait_name: trait_name.to_string(),
@@ -1890,7 +1904,7 @@ impl<'a> TypeChecker<'a> {
             );
         }
 
-        self.method_calls.insert(
+        self.record_method(
             call_id,
             MethodRes { fn_name: mname.to_string(), recv_ctor: None, type_args, recv_conv },
         );
@@ -1987,7 +2001,7 @@ impl<'a> TypeChecker<'a> {
             );
         }
 
-        self.method_calls.insert(
+        self.record_method(
             call_id,
             MethodRes {
                 fn_name: mname.to_string(),
@@ -2027,7 +2041,7 @@ impl<'a> TypeChecker<'a> {
                 // name is shared with another module, and is the symbol the
                 // backend emits for the direct call.
                 let key = self.canon_in(target_mod, fname);
-                self.qualified.insert(id, key.clone());
+                self.record_qualified(id, key.clone());
                 if let Some(sig) = self.table.fns.get(&key) {
                     let ret = sig.ret.clone();
                     let errs = sig.errs.clone();
@@ -2072,7 +2086,7 @@ impl<'a> TypeChecker<'a> {
         match self.owner.get(&(target_mod, name.to_string())).copied() {
             Some(true) => {
                 let key = self.canon_in(target_mod, name);
-                self.qualified.insert(id, key.clone());
+                self.record_qualified(id, key.clone());
                 let t = self.table.consts.get(&key).cloned().unwrap_or(Ty::Unknown);
                 self.set(id, t)
             }
@@ -2344,7 +2358,7 @@ impl<'a> TypeChecker<'a> {
                     self.cur_expected = prev;
                     // `let d: dyn Trait = concrete` coerces the initializer (Stage F).
                     if let (Some(ann), Some(e)) = (&expected, init) {
-                        self.record_dyn_coercion(*e, ann);
+                        self.check_dyn_coercion(*e, ann);
                     }
                     // A `distinct` type is *not* interchangeable with its base (or any
                     // other type): a mismatched initializer is an error suggesting `as`.
@@ -2385,7 +2399,7 @@ impl<'a> TypeChecker<'a> {
                         self.cur_expected = prev;
                         // `fn f() -> dyn Trait { return concrete }` coerces (Stage F).
                         if let Some(ret) = self.cur_ret.clone() {
-                            self.record_dyn_coercion(*v, &ret);
+                            self.check_dyn_coercion(*v, &ret);
                             // `cur_ret` is the *ok* type of a fallible fn, so a
                             // `return <T>` in a `-> T !E` compares against `T`.
                             let span = self.ast.expr_at(*v).span;
@@ -2447,7 +2461,7 @@ impl<'a> TypeChecker<'a> {
                     let t = t.clone();
                     let key = self.canon_cur(&n.name);
                     if key != n.name {
-                        self.call_sym.insert(id, key);
+                        self.record_call_sym(id, key);
                     }
                     t
                 } else if let Some(&i) = self.table.variants.get(&self.canon_variant_in(self.cur_mod, &n.name)) {
@@ -2461,7 +2475,7 @@ impl<'a> TypeChecker<'a> {
                     // name collides across modules.
                     let key = self.canon_cur(&n.name);
                     if key != n.name && self.owns_local(&n.name) && self.table.fns.contains_key(&key) {
-                        self.call_sym.insert(id, key);
+                        self.record_call_sym(id, key);
                     }
                     Ty::Unknown // a function name or external symbol: stay quiet
                 }
@@ -2642,7 +2656,7 @@ impl<'a> TypeChecker<'a> {
                     // A concrete argument passed where a `dyn Trait` is expected
                     // coerces into a fat pointer (Stage F).
                     if let Some(pt) = param_tys.get(i) {
-                        self.record_dyn_coercion(*a, pt);
+                        self.check_dyn_coercion(*a, pt);
                     }
                 }
                 if let Some(name) = callee_name {
@@ -2670,7 +2684,7 @@ impl<'a> TypeChecker<'a> {
                     if let Some((ret, errs, ptys)) = resolved {
                         let want = ptys.len();
                         if key != name {
-                            self.call_sym.insert(id, key.clone());
+                            self.record_call_sym(id, key.clone());
                         }
                         if want != args.len() {
                             self.error(
@@ -5260,7 +5274,7 @@ mod tests {
             .find_map(|(i, e)| matches!(e.kind, ExprKind::Call { .. }).then_some(ExprId(i as u32)))
             .expect("the x.show() call");
         assert_eq!(info.type_of(call), &Ty::Prim("i64"), "call types as the impl method's return");
-        assert!(info.impl_calls.contains_key(&call), "the resolution is recorded for the backend");
+        assert!(info.impl_call(call).is_some(), "the resolution is recorded for the backend");
     }
 
     #[test]
@@ -5422,7 +5436,7 @@ mod tests {
             .find_map(|(i, e)| {
                 let id = ExprId(i as u32);
                 (matches!(e.kind, ExprKind::Binary { op: BinOp::Add, .. })
-                    && info.impl_calls.contains_key(&id))
+                    && info.impl_call(id).is_some())
                 .then_some(id)
             })
             .expect("the dispatched `a + b` expr");
@@ -5444,7 +5458,7 @@ mod tests {
             .find_map(|(i, e)| {
                 let id = ExprId(i as u32);
                 (matches!(e.kind, ExprKind::Binary { op: BinOp::Eq, .. })
-                    && info.impl_calls.contains_key(&id))
+                    && info.impl_call(id).is_some())
                 .then_some(id)
             })
             .expect("the dispatched `a == b` expr");
@@ -5481,7 +5495,7 @@ mod tests {
             })
             .expect("the `a + b` expr");
         assert_eq!(info.type_of(plus), &Ty::Prim("i32"));
-        assert!(!info.impl_calls.contains_key(&plus), "primitives don't dispatch operators");
+        assert!(!info.impl_call(plus).is_some(), "primitives don't dispatch operators");
     }
 
     #[test]
@@ -5511,7 +5525,7 @@ mod tests {
             .find_map(|(i, e)| {
                 let id = ExprId(i as u32);
                 (matches!(e.kind, ExprKind::Binary { op: BinOp::Sub, .. })
-                    && info.impl_calls.contains_key(&id))
+                    && info.impl_call(id).is_some())
                 .then_some(id)
             })
             .expect("the dispatched `a - b`");
@@ -5539,7 +5553,7 @@ mod tests {
                 })
                 .expect("the derived comparison");
             assert_eq!(info.type_of(e), &Ty::Prim("bool"), "{want:?} types as bool");
-            assert!(info.impl_calls.contains_key(&e), "{want:?} resolved through its base trait");
+            assert!(info.impl_call(e).is_some(), "{want:?} resolved through its base trait");
         }
     }
 
@@ -5584,7 +5598,7 @@ mod tests {
             .find_map(|(i, e)| {
                 let id = ExprId(i as u32);
                 (matches!(e.kind, ExprKind::Call { .. })
-                    && info.bound_method_calls.contains_key(&id))
+                    && info.bound_method_call(id).is_some())
                 .then_some(id)
             })
             .expect("the x.show() bound-method call");
@@ -5634,7 +5648,7 @@ mod tests {
             .enumerate()
             .find_map(|(i, e)| {
                 let id = ExprId(i as u32);
-                (matches!(e.kind, ExprKind::Call { .. }) && info.dyn_calls.contains_key(&id))
+                (matches!(e.kind, ExprKind::Call { .. }) && info.dyn_call(id).is_some())
                     .then_some(id)
             })
             .expect("the s.show() dyn call");
@@ -5655,8 +5669,41 @@ mod tests {
             .exprs
             .iter()
             .enumerate()
-            .any(|(i, _)| info.dyn_coercions.contains_key(&ExprId(i as u32)));
+            .any(|(i, _)| info.dyn_coercion(ExprId(i as u32)).is_some());
         assert!(coerced, "the i32 argument is recorded as a `dyn Show` coercion");
+    }
+
+    #[test]
+    fn a_call_coerced_to_dyn_keeps_both_resolutions() {
+        // HIR Stage 1 regression pin. `dyn_coercion` is keyed on the coerced
+        // *value*, and here that value is itself a method call — so one `ExprId`
+        // carries two resolutions at once. While these were seven independent
+        // maps that composed for free; now they share a `Resolved` row, so the
+        // checker must fill in a field of the existing row rather than insert a
+        // fresh one. A writer that replaced the row would drop whichever
+        // resolution came first and emit the call without its fat-pointer wrap —
+        // a miscompile no goldens necessarily cover.
+        // `p.get()` is method sugar for the free call `get(p)`, so the argument
+        // expression carries a `MethodRes`; its `i32` result then coerces to
+        // `dyn Show` at `describe`'s parameter. Both land on the same `ExprId`.
+        let (ast, info) = analyze_full(
+            "trait Show { fn show(read self) -> i32 } \
+             impl Show for i32 { fn show(read self) -> i32 { return self + 1 } } \
+             struct P { v: i32 } \
+             fn get(read p: P) -> i32 { return p.v } \
+             fn describe(read s: dyn Show) -> i32 { return s.show() } \
+             fn use_it(read p: P) -> i32 { return describe(p.get()) }",
+        );
+        let both = ast.exprs.iter().enumerate().any(|(i, e)| {
+            let id = ExprId(i as u32);
+            matches!(e.kind, ExprKind::Call { .. })
+                && info.method_call(id).is_some()
+                && info.dyn_coercion(id).is_some()
+        });
+        assert!(
+            both,
+            "`p.get()` passed as `dyn Show` keeps its method resolution *and* its coercion"
+        );
     }
 
     #[test]
@@ -6157,7 +6204,7 @@ mod tests {
                    fn main() -> i32 { var xs = List(i32){ ptr: alloc(i32, 1), len: 0 } return xs.get(0) }";
         let (info, d) = analyze(src);
         assert!(d.is_empty(), "{:?}", d);
-        let mr = info.method_calls.values().next().expect("a method call was recorded");
+        let mr = info.method_resolutions().next().expect("a method call was recorded");
         assert_eq!(mr.fn_name, "get");
         assert_eq!(mr.type_args, vec![Ty::Prim("i32")], "type arg recovered from receiver");
     }
@@ -6172,7 +6219,7 @@ mod tests {
                    fn main() -> i32 { var xs = new(i32) return xs.get(0) }";
         let (info, d) = analyze(src);
         assert!(d.is_empty(), "{:?}", d);
-        let mr = info.method_calls.values().next().expect("a method call was recorded");
+        let mr = info.method_resolutions().next().expect("a method call was recorded");
         assert_eq!(mr.fn_name, "get");
         assert_eq!(mr.recv_ctor.as_deref(), Some("List"));
         assert_eq!(mr.type_args, vec![Ty::Prim("i32")]);
@@ -6186,7 +6233,7 @@ mod tests {
                    fn main() -> i32 { var xs = new(i32) return xs.get(0) }";
         let (info, d) = analyze(src);
         assert!(d.is_empty(), "{:?}", d);
-        let mr = info.method_calls.values().next().expect("a method call was recorded");
+        let mr = info.method_resolutions().next().expect("a method call was recorded");
         assert_eq!(mr.fn_name, "get");
         assert_eq!(mr.recv_ctor.as_deref(), Some("List"), "resolved to a struct method");
         assert_eq!(mr.type_args, vec![Ty::Prim("i32")]);

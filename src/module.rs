@@ -968,9 +968,9 @@ mod tests {
         let (info, diags) = typeck::check_program(&prog.ast, &prog.modules);
         assert!(diags.is_empty(), "no errors for a valid qualified call: {:?}", diags);
         assert!(
-            info.qualified.values().any(|n| n == "f"),
+            info.qualified_targets().any(|n| n == "f"),
             "the qualified call resolved to `f`: {:?}",
-            info.qualified.values().collect::<Vec<_>>()
+            info.qualified_targets().collect::<Vec<_>>()
         );
     }
 
@@ -1006,7 +1006,7 @@ mod tests {
             "each module's private `helper` gets a distinct C symbol too:\n{c}"
         );
         // The qualified calls resolved to the two *different* canonical names.
-        let mut q: Vec<&String> = info.qualified.values().collect();
+        let mut q: Vec<&str> = info.qualified_targets().collect();
         q.sort();
         assert!(
             q.iter().any(|n| *n == "make__m1") && q.iter().any(|n| *n == "make__m2"),

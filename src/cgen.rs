@@ -2809,10 +2809,10 @@ impl<'a> Cgen<'a> {
     /// The receiver-parameter convention of a resolved method/impl/operator call,
     /// if the callee is a `recv.m(args)` form. Used to spot a `take self` consume.
     fn recv_conv_of(&self, call_id: ExprId) -> Option<Conv> {
-        if let Some(mr) = self.info.method_calls.get(&call_id) {
+        if let Some(mr) = self.info.method_call(call_id) {
             return Some(mr.recv_conv);
         }
-        if let Some(ic) = self.info.impl_calls.get(&call_id) {
+        if let Some(ic) = self.info.impl_call(call_id) {
             return self
                 .find_impl_method(&ic.trait_name, &ic.type_key, &ic.method)
                 .and_then(|f| f.params.iter().find(|p| p.is_self).map(|p| p.conv));
@@ -2839,7 +2839,7 @@ impl<'a> Cgen<'a> {
         out: &mut HashSet<String>,
     ) {
         // A trait-impl method call: the receiver is `self`, explicit args follow it.
-        if let Some(ic) = self.info.impl_calls.get(&call_id) {
+        if let Some(ic) = self.info.impl_call(call_id) {
             if let Some(f) = self.find_impl_method(&ic.trait_name, &ic.type_key, &ic.method) {
                 self.mark_method_arg_takes(f, args, out);
             }
@@ -2847,15 +2847,15 @@ impl<'a> Cgen<'a> {
         }
         // Method sugar `base.m(args)` — a struct method (self) or a free-fn-method
         // (the receiver is the first regular param), resolved via `method_calls`.
-        if let Some(mr) = self.info.method_calls.get(&call_id) {
+        if let Some(mr) = self.info.method_call(call_id) {
             if let Some(f) = self.find_fn(&mr.fn_name) {
                 self.mark_method_arg_takes(f, args, out);
             }
             return;
         }
         // A free or module-qualified call: args align 1:1 with the params.
-        let fname = if let Some(q) = self.info.qualified.get(&call_id) {
-            Some(q.clone())
+        let fname = if let Some(q) = self.info.qualified(call_id) {
+            Some(q.to_string())
         } else if let ExprKind::Name(n) = &self.ast.expr_at(callee).kind {
             Some(n.name.clone())
         } else {
@@ -4585,7 +4585,7 @@ impl<'a> Cgen<'a> {
         // pointer (Stage F). The guard lets `emit_dyn_coercion` re-emit the
         // underlying concrete value through this same path without re-wrapping.
         if !self.dyn_guard.contains(&id) {
-            if let Some(tr) = self.info.dyn_coercions.get(&id).cloned() {
+            if let Some(tr) = self.info.dyn_coercion(id).map(String::from) {
                 return self.emit_dyn_coercion(id, &tr);
             }
         }
@@ -4688,7 +4688,7 @@ impl<'a> Cgen<'a> {
                         // address (the checker recorded it on the name expr);
                         // bare otherwise, so non-colliding `&fn` is unchanged.
                         let cname =
-                            self.info.call_sym.get(rhs).cloned().unwrap_or_else(|| n.name.clone());
+                            self.info.call_sym(*rhs).map(String::from).unwrap_or_else(|| n.name.clone());
                         if self.info.table.fns.contains_key(&cname) {
                             return format!("(&{})", self.c_fn_name(&cname));
                         }
@@ -4701,7 +4701,7 @@ impl<'a> Cgen<'a> {
                 // Operator traits (Stage E): a binary op the type checker resolved
                 // through `impl <OpTrait> for <lhs>` lowers to a direct call of the
                 // impl method (`lhs` is the receiver, `rhs` the argument).
-                if let Some(ic) = self.info.impl_calls.get(&id).cloned() {
+                if let Some(ic) = self.info.impl_call(id).cloned() {
                     return self.emit_operator_call(&ic, *op, *lhs, *rhs);
                 }
                 let l = self.emit_expr(*lhs);
@@ -4765,7 +4765,7 @@ impl<'a> Cgen<'a> {
             ExprKind::Call { callee, args } => self.emit_call(id, *callee, args),
             ExprKind::Field { base, name } => {
                 // Module-qualified const (`mem.PAGE`): emit the const directly.
-                if let Some(qname) = self.info.qualified.get(&id).cloned() {
+                if let Some(qname) = self.info.qualified(id).map(String::from) {
                     return format!("j_{qname}");
                 }
                 let bt = apply_subst(&self.info.type_of(*base).clone(), &self.subst);
@@ -5254,26 +5254,26 @@ impl<'a> Cgen<'a> {
         let ast = self.ast;
         // Module-qualified call (`mem.allocate(x)`): the type checker resolved the
         // callee to a plain function; emit a direct call (design §9).
-        if let Some(qname) = self.info.qualified.get(&call_id).cloned() {
+        if let Some(qname) = self.info.qualified(call_id).map(String::from) {
             return self.emit_named_call(&qname, args);
         }
         // Method-call sugar: the type checker resolved `base.name(args)` to a
         // concrete (possibly monomorphized) function; emit a free call with the
         // receiver threaded in as the first argument.
-        if let Some(mr) = self.info.method_calls.get(&call_id).cloned() {
+        if let Some(mr) = self.info.method_call(call_id).cloned() {
             return self.emit_method_call(callee, &mr, args);
         }
         // `recv.m(args)` resolved through an `impl Trait for <recv>` (traits,
         // Stage C): a direct, statically-dispatched call to the mangled impl
         // method, the receiver threaded in as the first argument.
-        if let Some(ic) = self.info.impl_calls.get(&call_id).cloned() {
+        if let Some(ic) = self.info.impl_call(call_id).cloned() {
             return self.emit_impl_call(callee, &ic, args);
         }
         // `x.m(args)` on a *bracket type parameter* `T`, resolved through its bound
         // (the "Zig fix"). The concrete receiver type is `T`'s binding in the
         // *current monomorphization* — so we recover it from `self.subst` and
         // dispatch to `impl <bound> for <that type>`, reusing the Stage C path.
-        if let Some(bmc) = self.info.bound_method_calls.get(&call_id).cloned() {
+        if let Some(bmc) = self.info.bound_method_call(call_id).cloned() {
             let concrete = self.subst.get(&bmc.type_param).cloned().unwrap_or(Ty::Unknown);
             let ic = ImplCall {
                 trait_name: bmc.trait_name,
@@ -5284,7 +5284,7 @@ impl<'a> Cgen<'a> {
         }
         // `d.m(args)` on a `dyn Trait` receiver — a *dynamic* call through the
         // vtable slot: `d.vtable->m(d.data, args)` (traits, Stage F).
-        if let Some(method) = self.info.dyn_calls.get(&call_id).cloned() {
+        if let Some(method) = self.info.dyn_call(call_id).map(String::from) {
             if let ExprKind::Field { base, .. } = &self.ast.expr_at(callee).kind {
                 let recv = self.emit_expr(*base);
                 let mut parts = vec![format!("{recv}.data")];
@@ -5868,7 +5868,7 @@ impl<'a> Cgen<'a> {
             // The callee's canonical name: the type checker recorded it when an
             // unqualified call targets a name that collides across modules;
             // otherwise it is the bare name (so non-colliding calls are unchanged).
-            let cname = self.info.call_sym.get(&call_id).cloned().unwrap_or_else(|| n.name.clone());
+            let cname = self.info.call_sym(call_id).map(String::from).unwrap_or_else(|| n.name.clone());
 
             // A generic function: pick (or already-collected) the monomorphized
             // instance for these type arguments and call it.
@@ -9067,7 +9067,7 @@ impl<'a> Cgen<'a> {
                 let projectable = !matches!(
                     bt,
                     Ty::Slice(_) | Ty::Array { .. } | Ty::Prim("str") | Ty::Prim("String")
-                ) && !self.info.qualified.contains_key(&id);
+                ) && self.info.qualified(id).is_none();
                 if !projectable {
                     return self.emit_expr(id);
                 }
@@ -9604,14 +9604,14 @@ impl<'a> Cgen<'a> {
                 // A resolved method call instantiates its target — a struct
                 // method (item C) or a generic free function (item A) — with
                 // type arguments threaded through the current subst.
-                if let Some(mr) = self.info.method_calls.get(&id) {
+                if let Some(mr) = self.info.method_call(id) {
                     let targs: Vec<Ty> = mr.type_args.iter().map(|t| apply_subst(t, subst)).collect();
                     if let Some(ctor) = &mr.recv_ctor {
                         work.push(Work::Method(ctor.clone(), targs, mr.fn_name.clone()));
                     } else if self.generics.contains(&mr.fn_name) {
                         work.push(Work::Fn(mr.fn_name.clone(), targs));
                     }
-                } else if let Some(qname) = self.info.qualified.get(&id) {
+                } else if let Some(qname) = self.info.qualified(id) {
                     // A module-qualified call `mem.allocate(i32, …)` to a generic
                     // function instantiates it just like a bare generic call.
                     if self.generics.contains(qname) {
@@ -9623,13 +9623,13 @@ impl<'a> Cgen<'a> {
                                 .map(|a| self.eval_type_arg(*a, subst))
                                 .collect();
                             type_args.extend(self.infer_bracket_args(gf, args, subst));
-                            work.push(Work::Fn(qname.clone(), type_args));
+                            work.push(Work::Fn(qname.to_string(), type_args));
                         }
                     }
                 } else if let ExprKind::Name(n) = &ast.expr_at(*callee).kind {
                     // Canonical callee name for a within-module call to a
                     // possibly-colliding generic (bare when it doesn't collide).
-                    let cname = self.info.call_sym.get(&id).cloned().unwrap_or_else(|| n.name.clone());
+                    let cname = self.info.call_sym(id).map(String::from).unwrap_or_else(|| n.name.clone());
                     if self.generics.contains(&cname) {
                         if let Some(gf) = self.find_fn(&cname) {
                             let mut type_args: Vec<Ty> = self
