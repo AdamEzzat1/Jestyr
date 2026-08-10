@@ -1144,7 +1144,7 @@ pub struct ItemData { pub kind: i32, pub start: usize, pub end: usize, pub is_pu
 // (an ident whose text is "par"): the escape checker forbids storing the borrowed `src` in the
 // struct, so the driver — which *has* `src` — precomputes this one text test (the only contextual
 // keyword that isn't positionally unambiguous, since `<expr-ending-in-ident> for` also occurs).
-pub struct Parser { toks: List(Token), parw: List(bool), pub ex: List(ExprData), pub ar: List(i32), pub st: List(StmtData), pub sar: List(i32), pub pt: List(PatData), pub par: List(i32), pub ty: List(TypeData), pub tar: List(i32), pub it: List(ItemData), pub iar: List(i32), pub mar: List(i32), pub ear: List(i32), pub aar: List(i32), pub gar: List(i32), pub far: List(i32), pub lar: List(i32), pub clar: List(i32), pub roots: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool, no_struct: bool }
+pub struct Parser { toks: List(Token), parw: List(bool), nlw: List(bool), pub ex: List(ExprData), pub ar: List(i32), pub st: List(StmtData), pub sar: List(i32), pub pt: List(PatData), pub par: List(i32), pub ty: List(TypeData), pub tar: List(i32), pub it: List(ItemData), pub iar: List(i32), pub mar: List(i32), pub ear: List(i32), pub aar: List(i32), pub gar: List(i32), pub far: List(i32), pub lar: List(i32), pub clar: List(i32), pub roots: List(i32), alloc: Allocator, pos: usize, n: usize, depth: i32, over: bool, no_struct: bool }
 
 // The result of parsing a `{ field, …, ..spread }` initializer body: the field-init nodes'
 // slice into the arg arena, the optional spread expr (-1 if none), and the `}` end offset.
@@ -1175,6 +1175,40 @@ fn peek_kind(read p: Parser, ahead: usize) -> i32 {
     return t.kind
 }
 fn bump(mut p: Parser) { p.pos = p.pos + 1 }
+
+// Precompute the NEWLINE mask: `nlw[i]` is true iff a line break sits between token `i-1` and
+// token `i`. Same reason `parw` is precomputed -- the parser can't hold `src` -- and the same
+// shape: one pass over the token gaps, which partition the source, so this is linear.
+//
+// This is the newline rule's whole input (reference: `Parser::starts_new_line`, which reads the
+// gap from `src` directly since it can). A postfix continuation consults it to refuse crossing
+// a line break, so `f` then `(x)` on the next line is two statements rather than a call.
+fn build_nlw(read src: str, read tk: List(Token), read a: Allocator) -> List(bool) {
+    var nw: List(bool) = make__list(bool, a)
+    let n: usize = len(Token, tk)
+    var i: usize = 0
+    for i < n {
+        var has_nl: bool = false
+        if i > 0 {
+            let prev: Token = get(Token, tk, i - 1)
+            let t: Token = get(Token, tk, i)
+            var j: usize = prev.end
+            for j < t.start {
+                if (src[j] as i32) == 10 { has_nl = true }      // '\n'
+                j = j + 1
+            }
+        }
+        push(bool, nw, has_nl)
+        i = i + 1
+    }
+    return nw
+}
+
+// Is the current token preceded by a line break? The port's `starts_new_line`.
+fn starts_new_line(read p: Parser) -> bool {
+    if p.pos >= p.n { return false }
+    return get(bool, p.nlw, p.pos)
+}
 
 // Precompute the `par` contextual-keyword mask: `parw[i]` is true iff token `i` is an ident
 // (`kind 0`) whose source text is exactly "par". The parser can't read `src` (it's a borrow the
@@ -3428,7 +3462,18 @@ fn parse_postfix(mut p: Parser) -> i32 {
     var e: i32 = parse_primary(p)
     var go: bool = true
     for go {
-        let k: i32 = cur_kind(p)
+        var k: i32 = cur_kind(p)
+        // THE NEWLINE RULE (mirrors the reference's single guard in `parse_postfix`).
+        // A postfix continuation does not cross a line break, so `f` then `(x)` on the
+        // next line is two statements and not a call. Neutralising `k` drops through to
+        // the final `else`, which is this loop's spelling of the reference's `break`.
+        //
+        // It can only fire where a line BEGINS with `.`, `.*`, `?`, `[` or `(`, so no
+        // "statement position" tracking is needed on either side -- and zero lines in
+        // the 176-file corpus begin with one, which is why no parse changed.
+        if starts_new_line(p) {
+            if k == 73 or k == 76 or k == 100 or k == 67 or k == 63 { k = 0 - 1 }
+        }
         if k == 73 {                               // '.'  -> Field
             if !descend(p) { go = false }
             else {
@@ -4507,7 +4552,8 @@ fn parse_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Allocat
     var tk: List(Token) = tokenize(src, it, kwcount, a)
     let n: usize = len(Token, tk)
     var pw: List(bool) = build_parw(src, tk, a)
-    var p: Parser = Parser{ toks: tk, parw: pw, ex: make__list(ExprData, a), ar: make__list(i32, a), st: make__list(StmtData, a), sar: make__list(i32, a), pt: make__list(PatData, a), par: make__list(i32, a), ty: make__list(TypeData, a), tar: make__list(i32, a), it: make__list(ItemData, a), iar: make__list(i32, a), mar: make__list(i32, a), ear: make__list(i32, a), aar: make__list(i32, a), gar: make__list(i32, a), far: make__list(i32, a), lar: make__list(i32, a), clar: make__list(i32, a), roots: make__list(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
+    var nw: List(bool) = build_nlw(src, tk, a)
+    var p: Parser = Parser{ toks: tk, parw: pw, nlw: nw, ex: make__list(ExprData, a), ar: make__list(i32, a), st: make__list(StmtData, a), sar: make__list(i32, a), pt: make__list(PatData, a), par: make__list(i32, a), ty: make__list(TypeData, a), tar: make__list(i32, a), it: make__list(ItemData, a), iar: make__list(i32, a), mar: make__list(i32, a), ear: make__list(i32, a), aar: make__list(i32, a), gar: make__list(i32, a), far: make__list(i32, a), lar: make__list(i32, a), clar: make__list(i32, a), roots: make__list(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
     let root: i32 = parse_expr(p)
     dump(src, p, root)
 }
@@ -4517,7 +4563,8 @@ fn parse_item_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: Al
     var tk: List(Token) = tokenize(src, it, kwcount, a)
     let n: usize = len(Token, tk)
     var pw: List(bool) = build_parw(src, tk, a)
-    var p: Parser = Parser{ toks: tk, parw: pw, ex: make__list(ExprData, a), ar: make__list(i32, a), st: make__list(StmtData, a), sar: make__list(i32, a), pt: make__list(PatData, a), par: make__list(i32, a), ty: make__list(TypeData, a), tar: make__list(i32, a), it: make__list(ItemData, a), iar: make__list(i32, a), mar: make__list(i32, a), ear: make__list(i32, a), aar: make__list(i32, a), gar: make__list(i32, a), far: make__list(i32, a), lar: make__list(i32, a), clar: make__list(i32, a), roots: make__list(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
+    var nw: List(bool) = build_nlw(src, tk, a)
+    var p: Parser = Parser{ toks: tk, parw: pw, nlw: nw, ex: make__list(ExprData, a), ar: make__list(i32, a), st: make__list(StmtData, a), sar: make__list(i32, a), pt: make__list(PatData, a), par: make__list(i32, a), ty: make__list(TypeData, a), tar: make__list(i32, a), it: make__list(ItemData, a), iar: make__list(i32, a), mar: make__list(i32, a), ear: make__list(i32, a), aar: make__list(i32, a), gar: make__list(i32, a), far: make__list(i32, a), lar: make__list(i32, a), clar: make__list(i32, a), roots: make__list(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
     let iid: i32 = parse_item(p)
     dump_item(src, p, iid)
 }
@@ -4528,7 +4575,8 @@ fn parse_module_and_dump(read src: str, mut it: Interner, kwcount: i64, read a: 
     var tk: List(Token) = tokenize(src, it, kwcount, a)
     let n: usize = len(Token, tk)
     var pw: List(bool) = build_parw(src, tk, a)
-    var p: Parser = Parser{ toks: tk, parw: pw, ex: make__list(ExprData, a), ar: make__list(i32, a), st: make__list(StmtData, a), sar: make__list(i32, a), pt: make__list(PatData, a), par: make__list(i32, a), ty: make__list(TypeData, a), tar: make__list(i32, a), it: make__list(ItemData, a), iar: make__list(i32, a), mar: make__list(i32, a), ear: make__list(i32, a), aar: make__list(i32, a), gar: make__list(i32, a), far: make__list(i32, a), lar: make__list(i32, a), clar: make__list(i32, a), roots: make__list(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
+    var nw: List(bool) = build_nlw(src, tk, a)
+    var p: Parser = Parser{ toks: tk, parw: pw, nlw: nw, ex: make__list(ExprData, a), ar: make__list(i32, a), st: make__list(StmtData, a), sar: make__list(i32, a), pt: make__list(PatData, a), par: make__list(i32, a), ty: make__list(TypeData, a), tar: make__list(i32, a), it: make__list(ItemData, a), iar: make__list(i32, a), mar: make__list(i32, a), ear: make__list(i32, a), aar: make__list(i32, a), gar: make__list(i32, a), far: make__list(i32, a), lar: make__list(i32, a), clar: make__list(i32, a), roots: make__list(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
     var ids: List(i32) = make__list(i32, a)
     for cur_kind(p) != 110 {                        // until Eof
         let before: usize = p.pos
@@ -4571,7 +4619,8 @@ pub fn parse_source(read src: str, mut it: Interner, kwcount: i64, read a: Alloc
     var tk: List(Token) = tokenize(src, it, kwcount, a)
     let n: usize = len(Token, tk)
     var pw: List(bool) = build_parw(src, tk, a)
-    var p: Parser = Parser{ toks: tk, parw: pw, ex: make__list(ExprData, a), ar: make__list(i32, a), st: make__list(StmtData, a), sar: make__list(i32, a), pt: make__list(PatData, a), par: make__list(i32, a), ty: make__list(TypeData, a), tar: make__list(i32, a), it: make__list(ItemData, a), iar: make__list(i32, a), mar: make__list(i32, a), ear: make__list(i32, a), aar: make__list(i32, a), gar: make__list(i32, a), far: make__list(i32, a), lar: make__list(i32, a), clar: make__list(i32, a), roots: make__list(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
+    var nw: List(bool) = build_nlw(src, tk, a)
+    var p: Parser = Parser{ toks: tk, parw: pw, nlw: nw, ex: make__list(ExprData, a), ar: make__list(i32, a), st: make__list(StmtData, a), sar: make__list(i32, a), pt: make__list(PatData, a), par: make__list(i32, a), ty: make__list(TypeData, a), tar: make__list(i32, a), it: make__list(ItemData, a), iar: make__list(i32, a), mar: make__list(i32, a), ear: make__list(i32, a), aar: make__list(i32, a), gar: make__list(i32, a), far: make__list(i32, a), lar: make__list(i32, a), clar: make__list(i32, a), roots: make__list(i32, a), alloc: a, pos: 0, n: n, depth: 0, over: false, no_struct: false }
     for cur_kind(p) != 110 {                        // until Eof
         let before: usize = p.pos
         let iid: i32 = parse_item(p)

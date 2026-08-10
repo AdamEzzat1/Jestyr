@@ -49,22 +49,42 @@ change. Comparing two separately-built processes measures the machine. Interleav
 runs against two saved binaries and keep `lex`/`parse` as controls; if the
 controls disagree, that gap *is* your noise floor.
 
-### 1.2 The newline / statement-boundary rule (P3, measured safe)
+### 1.2 The newline / statement-boundary rule — **DONE**, both toolchains
 
-`f` on one line and `(x)` on the next parses as `f(x)`. Documented in
-`docs/frontend-grammar.md`; options and the recommendation are in
-`docs/frontend-roadmap.md` §8.
+`f` on one line and `(x)` on the next no longer parses as `f(x)`. Option (d)
+from `docs/frontend-roadmap.md` §8; the rule and its two failure modes are now
+specified in `docs/frontend-grammar.md` under *Statement boundaries*.
 
-**The measurement is the useful part**: across all 175 `.jtr` files — including
-the compiler's own ~30,000 lines — there are **zero** lines beginning with `(`,
-`[`, `-`, `&`, `*`, `.` or `?`. Adopting the restricted rule (a postfix
-continuation may not cross a newline in statement position) would change the parse
-of *no existing file*.
+The measurement held on re-verification: **zero** lines begin with `(`, `[`,
+`-`, `&`, `*`, `.` or `?` across all 176 `.jtr` files, and parse trees are
+byte-identical over all 155 corpus files.
 
-- Recommendation stands: **do it**, as an isolated change, at P3.
-- It is P3 only because it changes what programs *mean*, so it owes a mirror in
-  `examples/std/parser.jtr`, a corpus re-verification, and a seed refresh.
-- The conformance tables (§1.6) should be in place first. They are.
+Three things the plan did not anticipate:
+
+- **No "statement position" flag was needed.** The rule as specified ("in
+  statement position") implies threading a flag through the expression parser
+  and clearing it inside every delimiter. Unnecessary: the test can only fire
+  where a line *begins* with a postfix token, and anywhere else the previous
+  token is on the same line. One guard at the single point `parse_postfix`
+  consumes a postfix token is the entire specification, on both sides — which is
+  what kept the mirror cheap, and is exactly the cost option (b) was rejected
+  for.
+- **The `.` half fails better than "chaining breaks".** `(` and `[` can begin an
+  expression, so those become two well-formed statements. `.`, `.*` and `?`
+  cannot, so a leading-dot chain is a *syntax error at that token* — not a
+  different program. Net: nothing in the grammar silently means something else
+  because of a line break.
+- **The port's parser cannot hold `src`** (the escape checker refuses the
+  stored borrow), so it precomputes a per-token newline mask in the driver,
+  mirroring the existing `parw` mask for the `par` contextual keyword. Worth
+  knowing before designing any other rule that wants to consult source text.
+
+**And the testing trap, for the second time this session:** the corpus is silent
+on this rule *by construction* — that silence is what made adoption safe — so
+the whole-corpus P2/P3/cgen goldens cannot distinguish a port that implements it
+from one that does not. Probes live in the P2 golden's curated snippet list
+instead. Same shape as §2.5b. Treat "the corpus does not exercise it" as a
+signal that a differential test is *required*, not as evidence of safety.
 
 ### 1.3 HIR Stages 2–4 (the real payoff, and the real cost)
 

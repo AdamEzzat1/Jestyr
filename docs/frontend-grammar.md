@@ -27,8 +27,8 @@ comments (`///`, `//!`, `/** */`, `/*! */`) are collected into a side table and
 are likewise invisible to the grammar — a comment can never change how code
 parses. See `docs/comments.md`.
 
-**Newlines are not tokens.** Statement boundaries are structural, not
-line-based; the consequences are real and are discussed in
+**Newlines are not tokens**, but they are not invisible either: exactly one rule
+consults them — a postfix continuation may not cross a line break. See
 [Statement boundaries](#statement-boundaries).
 
 ## Compilation unit
@@ -222,18 +222,48 @@ FieldPat    = IDENT [ ':' Pattern ]
 
 ## Statement boundaries
 
-The lexer discards newlines, so statement boundaries are purely structural. One
-consequence is documented in `src/parser.rs` and worth restating:
+Statement boundaries are structural — newlines are not tokens — with **one**
+line-based rule, which exists to remove the single case where that was a trap.
+
+**A postfix continuation does not cross a newline.** In
 
 ```
 f
 (x)
 ```
 
-parses as the call `f(x)`, because nothing separates the two lines. The same
-applies to a line starting with `(`, `[`, `-`, `&`, or `*` after an expression
-statement. This is a known sharp edge, not an accident; the trade-offs and the
-options for changing it are written up in
+the `(x)` starts a new statement; this is *not* the call `f(x)`. The rule covers
+the postfix tokens `(`, `[`, `.`, `.*` and `?`, and applies wherever a postfix
+chain could continue. It fires only where a line *begins* with one of them, so
+ordinary multi-line formatting is untouched:
+
+```
+f(
+    1,
+    2,
+)
+```
+
+is one call — the `(` is at the end of a line, not the start of one.
+
+The two halves of the rule fail differently, deliberately. `(` and `[` can also
+*begin* an expression, so breaking the chain leaves two well-formed statements —
+which is exactly the silent reinterpretation being removed. `.`, `.*` and `?`
+cannot begin an expression, so a leading-dot chain is a **syntax error at that
+token** rather than a different program:
+
+```
+value.foo()
+     .bar()     // error: expected an expression, found `.`
+```
+
+This is Go's reading rather than Swift's: a method chain must keep its postfix
+token on the line of the receiver. The consequence is that nothing in this
+grammar silently means something else because of a line break.
+
+Adopted after measuring: zero lines across all 176 `.jtr` files — including the
+compiler's own ~30,000 lines of Jestyr — begin with one of these tokens, so no
+existing program changed meaning. Rationale and the options considered:
 [docs/frontend-roadmap.md](frontend-roadmap.md#8-newline-and-statement-boundaries).
 
 ## Where this grammar is approximate

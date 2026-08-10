@@ -208,6 +208,28 @@ impl<'src> Parser<'src> {
         }
     }
 
+    /// Is there a line break between the previous token and the current one?
+    ///
+    /// The lexer discards newlines, but it does not lose them: spans are exact
+    /// byte ranges, so the trivia between two tokens is precisely the source slice
+    /// between the previous token's end and the current one's start (the same fact
+    /// `cst.rs` and the doc-comment collector rely on). Nothing to record at lex
+    /// time and no new token kind — the parser just looks.
+    ///
+    /// Linear over the file, not quadratic: each call scans one inter-token gap,
+    /// and the gaps partition the source. This is the shape the earlier
+    /// scan-from-byte-0 regressions did *not* have.
+    fn starts_new_line(&self) -> bool {
+        if self.pos == 0 {
+            return false;
+        }
+        let gap_start = self.tokens[self.pos - 1].span.end as usize;
+        let gap_end = self.cur().span.start as usize;
+        self.src
+            .get(gap_start..gap_end)
+            .is_some_and(|gap| gap.as_bytes().contains(&b'\n'))
+    }
+
     fn text(&self, span: Span) -> String {
         self.src[span.range()].to_string()
     }
@@ -1319,6 +1341,39 @@ impl<'src> Parser<'src> {
             // Every postfix operation (`.f`, `()`, `[]`, `.*`, `?`) wraps `e` one
             // level deeper, so bound the chain: `a.b.c.…` is left-deep too.
             if !matches!(self.cur().kind, LParen | LBracket | DotStar | Dot | Question) {
+                break;
+            }
+            // THE NEWLINE RULE (roadmap §8, option (d)). A postfix continuation does
+            // not cross a newline, so
+            //
+            //     f
+            //     (x)
+            //
+            // is two statements, not the call `f(x)`. Without this the lexer's
+            // discarded newlines make a complete statement silently become a call or
+            // an index — the one trap in the grammar that changes meaning rather
+            // than merely reading oddly.
+            //
+            // This is the whole rule: one test, at the single point where a postfix
+            // token is consumed. No new token kind, no lexer change, and no
+            // "statement position" flag — the test can only ever fire where a line
+            // *begins* with `(`, `[`, `.` or `?`, since anywhere else the previous
+            // token is on the same line. Option (b)'s "a newline ends a statement
+            // unless the line looks incomplete" would have needed a second grammar
+            // to specify and mirror; this needs a substring search.
+            //
+            // Measured before adopting: zero lines begin with one of these tokens
+            // across all 176 `.jtr` files, including the compiler's own ~30,000
+            // lines, so no existing program changed meaning.
+            //
+            // The two halves fail differently, and the difference is the point.
+            // `(` and `[` can also *begin* an expression, so breaking the chain
+            // leaves two well-formed statements — which is exactly the trap being
+            // removed. `.` and `?` cannot begin one, so a leading-dot chain becomes
+            // a diagnostic at that token rather than a silent reinterpretation.
+            // Swift would keep chaining; here the reader is told. Nothing in this
+            // grammar silently means something else because of a line break.
+            if self.starts_new_line() {
                 break;
             }
             if !self.descend(self.cur().span) {
@@ -3096,6 +3151,69 @@ mod tests {
     }
 
     /// A block-led expression in *statement* position is a complete statement: a
+    /// The newline rule (roadmap §8, option (d)): a postfix continuation does not
+    /// cross a line break, so `f` then `(x)` is two statements and not a call.
+    ///
+    /// The pairs are the point — each holds the *same tokens* and differs only in
+    /// where the newline falls, so they pin that the rule turns on the line break
+    /// and nothing else.
+    #[test]
+    fn a_postfix_continuation_does_not_cross_a_newline() {
+        // `(` and `[` can also *begin* an expression, so breaking the chain leaves
+        // two well-formed statements. Each pair is the same tokens, differing only
+        // in where the newline falls.
+        for (body, want) in [("side(a)\n(a)", 2), ("side(a)(a)", 1), ("xs\n[0]", 2), ("xs[0]", 1)] {
+            let src = format!("fn main() {{ {body} }}");
+            let (tokens, ld) = Lexer::new(&src).tokenize();
+            assert!(ld.is_empty(), "lex errors for {body:?}");
+            let (ast, pd) = Parser::new(&src, tokens).parse();
+            assert!(pd.is_empty(), "parse errors for {body:?}: {pd:?}");
+            let Item::Fn(f) = &ast.items[0] else { panic!("expected a fn") };
+            assert_eq!(f.body.stmts.len(), want, "{body:?} should be {want} statement(s)");
+        }
+
+        // `.` and `?` cannot begin an expression, so the rule turns a leading-dot
+        // chain into a *diagnostic* rather than a silent reinterpretation. That is
+        // the better failure mode and worth pinning: the reader is told, at the
+        // exact token, instead of getting a different program than they wrote.
+        for (body, tok) in [("a.b\n.c", "`.`"), ("a\n?", "`?`")] {
+            let src = format!("fn main() {{ {body} }}");
+            let (tokens, ld) = Lexer::new(&src).tokenize();
+            assert!(ld.is_empty(), "lex errors for {body:?}");
+            let (_ast, pd) = Parser::new(&src, tokens).parse();
+            assert!(
+                pd.iter().any(|d| d.message.contains("expected an expression") && d.message.contains(tok)),
+                "{body:?} should report {tok} as not starting an expression, got: {pd:?}"
+            );
+        }
+
+        // …and the same tokens on one line still chain, so the diagnostics above
+        // come from the newline and not from the tokens being unsupported.
+        for body in ["a.b.c", "a?"] {
+            let src = format!("fn main() {{ {body} }}");
+            let (tokens, _) = Lexer::new(&src).tokenize();
+            let (ast, pd) = Parser::new(&src, tokens).parse();
+            assert!(pd.is_empty(), "{body:?} must still parse on one line: {pd:?}");
+            let Item::Fn(f) = &ast.items[0] else { panic!("expected a fn") };
+            assert_eq!(f.body.stmts.len(), 1, "{body:?} is one statement");
+        }
+    }
+
+    /// The rule must not reach inside a delimiter: a multi-line argument list or
+    /// index is ordinary formatting, not a statement boundary. It fires only where
+    /// a line *begins* with the postfix token, which is why it needed no
+    /// "statement position" flag.
+    #[test]
+    fn the_newline_rule_does_not_break_multiline_calls() {
+        let src = "fn main() { f(\n    1,\n    2,\n) g(\n    h(\n        3\n    )\n) }";
+        let (tokens, ld) = Lexer::new(src).tokenize();
+        assert!(ld.is_empty(), "lex errors: {ld:?}");
+        let (ast, pd) = Parser::new(src, tokens).parse();
+        assert!(pd.is_empty(), "a multi-line call must still parse: {pd:?}");
+        let Item::Fn(f) = &ast.items[0] else { panic!("expected a fn") };
+        assert_eq!(f.body.stmts.len(), 2, "two calls, each spanning lines");
+    }
+
     /// following operator starts a new statement rather than extending it. This is
     /// the rule that makes `if c { 1 } else { 2 } - 3` two statements, and it is
     /// easy to break by routing statement parsing through `parse_expr`.

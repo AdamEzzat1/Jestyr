@@ -316,6 +316,35 @@ Adopting (d) would change the parse of **zero** files in the corpus, including
 the compiler's own ~30,000 lines of Jestyr. The compatibility risk is measured,
 not assumed.
 
+> **DONE — option (d) is implemented on both toolchains.** One test at the single
+> point in `parse_postfix` where a postfix token is consumed; no new token kind
+> and no lexer change, because spans make the inter-token gap recoverable (§3).
+> The reference reads that gap from `src`; the port precomputes a per-token
+> newline mask in the driver, mirroring how `parw` already handles the `par`
+> contextual keyword — its parser cannot hold `src` (the escape checker refuses
+> to let it store the borrow).
+>
+> **No "statement position" flag was needed**, on either side. The rule can only
+> fire where a line *begins* with `(`, `[`, `.`, `.*` or `?`, and anywhere else
+> the previous token is on the same line — so the single guard is the whole
+> specification. That is what kept the mirror cheap, and it is why this landed
+> without the "second grammar to specify and mirror" cost that (b) was rejected
+> for.
+>
+> **The `.` half fails better than predicted.** `(` and `[` can begin an
+> expression, so breaking those chains yields two well-formed statements. `.`,
+> `.*` and `?` cannot, so a leading-dot chain is a *syntax error at that token*
+> rather than a silent reinterpretation. Nothing in the grammar now silently
+> means something else because of a line break.
+>
+> **Testing note worth generalising.** The rule is silent on the entire file
+> corpus by construction — that silence is exactly what made it safe to adopt,
+> and it also means the whole-corpus P2/P3/cgen goldens *cannot* distinguish a
+> port that implements it from one that does not. The probes live in
+> `jestyr_parser_expr_dump_matches_reference`'s curated snippet list instead.
+> Same lesson as the `Unknown` finalization (§2.5b): **a rule deliberately silent
+> on the corpus needs a differential test on inputs that do trigger it.**
+
 **Recommendation: (d), scheduled at P3, not taken opportunistically.**
 
 Rationale. It removes a real trap; the evidence says it breaks nothing that

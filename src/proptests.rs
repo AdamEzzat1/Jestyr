@@ -8291,6 +8291,20 @@ mod c_oracle {
             "region r { alloc(r) }",     // a region scope with a body
             "region scratch { let p = make(scratch)  use(p) }", // region with statements
             "for x in xs { region r { f(r, x) } }", // a region nested in a loop body
+            // THE NEWLINE RULE (roadmap §8, option (d)) — a postfix continuation does
+            // not cross a line break. These probes matter more than most: the rule is
+            // *silent on the whole file corpus by construction* (zero lines in all 176
+            // `.jtr` files begin with `(`, `[`, `.` or `?`, which is what made adopting
+            // it safe), so the file-level goldens cannot tell a port that implements it
+            // from one that does not. These snippets are the only thing that can.
+            "f\n(x)",          // the trap itself: two statements, NOT the call `f(x)`
+            "f(x)",            // …the same tokens on one line still call
+            "xs\n[0]",         // an index likewise does not reach back a line
+            "xs[0]",           // …one line still indexes
+            "a.b\n.c",         // a leading-dot chain breaks (Go's reading, not Swift's)
+            "a.b.c",           // …one line still chains
+            "f(\n  1,\n  2,\n)", // but a multi-line ARGUMENT list is untouched: the rule
+            "g(\n  h(\n  3)\n)", //   fires only where a LINE BEGINS with the token
         ];
         for src in snippets {
             let probe = std::env::temp_dir().join("jestyr_expr_probe.jtr");
