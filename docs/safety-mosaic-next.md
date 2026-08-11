@@ -147,19 +147,34 @@ and it is a self-contained cgen increment worth doing on its own.
 
 **Staging.**
 
-0. **Fix the fn-pointer/slice typedef ordering in `cgen`** (both toolchains).
-   Prerequisite for everything below.
-1. Library-only, sequential: `split_mut` + tests that both halves are writable
-   and the writes land in the right elements. No further compiler change.
+0. **DONE** — the fn-pointer typedef fix grew into the dependency graph
+   (`dep_of_anon_typedef` / `dc_dep_anon`, both toolchains): a fixed order
+   cannot work, because struct defs need fn typedefs (vtable fields) while fn
+   typedefs need array defs need struct defs (by-value). It also surfaced a
+   *silent* sibling: by-value genref/array params in fn typedefs were K&R
+   identifier lists — unprototyped pointers, no argument checking.
+   `examples/fn_slice_param.jtr` pins all three shapes, and is allowlisted into
+   the P5 golden **and** the fixpoint subset (the goldens run an allowlist, not
+   a glob — an example the emission gates skip reads as coverage it isn't).
+1. **DONE** — `parallel.split_mut`, i64-only like `par_reduce` before it (a
+   generic `fn(mut []T, …)` needs monomorphized fn-typedef contributions the
+   port does not emit yet). The `unsafe` lives inside the library behind the
+   clamp; containment is the checker's ordinary second-class rule.
+   `a_split_mut_callback_cannot_leak_its_half` pins the contract from both
+   sides; the par_soac demo asserts the boundary pair and whole-parent sum.
+   One deliberate deviation from the acceptance line below: an out-of-range
+   `at` is **clamped**, not faulted — `mid ≤ len` makes overlap inexpressible
+   and the function total (`hi` is simply empty at the boundary), which is
+   strictly stronger than a runtime rejection.
 2. Parallel: hand the halves to two tasks. This is where the value is, and where
    `spawn`'s non-generic limit bites — expect an i32/i64-only first version.
 3. Only if 1–2 prove the shape: consider whether the checker should *know* about
    disjointness rather than trusting the library. That is a much larger change
    and should not be assumed.
 
-**Acceptance.** A test that the two halves are simultaneously writable; a test
-that an out-of-range `at` is rejected at runtime rather than producing
-overlapping slices; and the corpus unchanged.
+**Acceptance (stage 1, met).** Both halves simultaneously writable, writes land
+in the right elements (the 16/48 demo pair), overlap inexpressible for any `at`
+(by clamp, see above), and the corpus byte-identical through the full gate.
 
 **Do not** generalise this to a `split_at` returning a pair "just for
 symmetry" — that is escape route 2 and the checker will (correctly) reject it.

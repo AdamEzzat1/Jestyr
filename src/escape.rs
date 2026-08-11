@@ -1575,6 +1575,38 @@ mod tests {
         }
     }
 
+    /// The `split_mut` safety contract (safety mosaic, item 4): the two `mut`
+    /// slice views a callback receives are SECOND-CLASS — writable inside the
+    /// frame, but a callback that tries to hand one back out is rejected by the
+    /// ordinary escape rules. This is the "library-first" claim in one test: the
+    /// library provides disjointness (by construction, behind its one `unsafe`),
+    /// and the checker provides containment, with no new mechanism.
+    #[test]
+    fn a_split_mut_callback_cannot_leak_its_half()  {
+        // Returning the borrowed half by value is a move of a borrow place.
+        let d = escapes(
+            "fn bad(mut lo: []i64, mut hi: []i64) -> []i64 { return lo }",
+        );
+        assert!(
+            d.iter().any(|x| x.message.contains("escape") || x.message.contains("borrow")),
+            "returning a mut slice param must be rejected: {d:?}"
+        );
+        // Storing it into a struct value that outlives the frame is a capture.
+        let d2 = escapes(
+            "struct Stash { s: []i64 } \
+             fn bad2(mut lo: []i64, mut hi: []i64) -> Stash { return Stash{ s: lo } }",
+        );
+        assert!(
+            d2.iter().any(|x| x.message.contains("escape") || x.message.contains("borrow")),
+            "stashing a mut slice param must be rejected: {d2:?}"
+        );
+        // The intended use — write through both, leak neither — is clean.
+        let ok = escapes(
+            "fn good(mut lo: []i64, mut hi: []i64) { lo[0] = 1  hi[0] = 2 }",
+        );
+        assert!(ok.is_empty(), "writing through both halves is fine: {ok:?}");
+    }
+
     /// The gate must stay *silent* on code whose types resolve — it is a
     /// finalization check, not a second escape rule. `ok_borrow_out` hands a borrow
     /// back through a `read` return, which is legal and fully typed.

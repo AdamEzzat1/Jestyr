@@ -107,5 +107,28 @@ fn main() -> i32 {
     io.print_i32(geti(pre, m - 1) as i32)                  // 500500 (fits in i32)
     free_ptr(pre)
     free_ptr(ones)
+
+    // split_mut: both DISJOINT halves are writable and every write lands in its
+    // own half — fill [0,3) with 7 and [3,6) with 9 through the two views, then
+    // read back through the PARENT slice. 7+7+7+9+9+9 = 48; the boundary pair
+    // (index 2, index 3) proves neither view bled into the other.
+    var sm: *mut i64 = alloc(i64, 6)
+    var q: []i64 = slice(i64, sm, 6)
+    parallel.split_mut(q, 3, &fill_halves)
+    io.print_i32((geti(sm, 2) + geti(sm, 3)) as i32)       // 16 = 7 + 9 (the boundary)
+    var tot: i64 = 0
+    var k: usize = 0
+    for k < 6 { tot = tot + geti(sm, k)  k = k + 1 }
+    io.print_i32(tot as i32)                               // 48
+    free_ptr(sm)
     return 0
+}
+
+// The split_mut callback: writes 7s into the low view and 9s into the high one.
+// Both parameters are second-class `mut` borrows — writable here, storable nowhere.
+fn fill_halves(mut lo: []i64, mut hi: []i64) {
+    var i: usize = 0
+    for i < lo.len { lo[i] = 7  i = i + 1 }
+    var j: usize = 0
+    for j < hi.len { hi[j] = 9  j = j + 1 }
 }

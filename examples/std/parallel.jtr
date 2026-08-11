@@ -27,7 +27,37 @@
 // worker count does not affect the result (the determinism guarantee); making it a
 // tunable schedule is the later `with schedule(...)` increment.
 //
-//   jestyrc run examples/std/par_soac.jtr   →   1 1 1 1 1 1 500500
+//   jestyrc run examples/std/par_soac.jtr   →   1 1 1 1 1 500500 16 48
+
+// ── split_mut — checked disjoint borrowing (safety mosaic, item 4) ────────────
+//
+// Hand a callback two DISJOINT `mut` views of one slice — the "two mutable
+// halves" every in-place divide-and-conquer needs, without dropping the caller
+// into `unsafe` and without aliasing:
+//
+//   • disjointness is by construction: `lo` covers [0, at) and `hi` covers
+//     [at, len) of the same buffer, with `at` clamped to `len` — the one
+//     `unsafe` block lives HERE, behind a precondition this function enforces,
+//     which is the library-first pattern (`core.par_reduce`'s chunking makes
+//     the same argument);
+//   • the halves are SECOND-CLASS borrows in the callback's frame — the escape
+//     checker's ordinary rules apply, so the callback can write both but can
+//     store or return neither;
+//   • continuation-passing is what scopes the borrows: when `f` returns, the
+//     views are gone, and the caller's `xs` is whole again. A `(lo, hi)`
+//     RETURN would hand back two aliases of `xs` with nothing bounding them —
+//     that shape is exactly what the escape checker rejects, and the callback
+//     form is how the library expresses the same operation safely.
+//
+// i64-only for now, like `par_reduce`/`par_map` (a generic `fn(mut []T, …)`
+// needs monomorphized fn-typedef contributions the port does not emit yet).
+pub fn split_mut(mut xs: []i64, at: usize, f: fn(mut []i64, mut []i64)) {
+    var mid: usize = at
+    if mid > xs.len { mid = xs.len }
+    let lo: []i64 = unsafe { slice(i64, xs.ptr, mid) }
+    let hi: []i64 = unsafe { slice(i64, xs.ptr + mid, xs.len - mid) }
+    f(lo, hi)
+}
 
 // ── Built-in associative operators (identity in each `par_scan_*` wrapper) ─────
 pub fn op_add(a: i64, b: i64) -> i64 { return a + b }

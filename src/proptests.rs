@@ -12475,10 +12475,15 @@ fn main() -> i32 {
         // serial oracle bit-for-bit over 1003 mixed-sign values with an uneven last
         // chunk (five 1s), then the prefix sum of 1..=1000 ends at 500500. Repeated to
         // shake out any thread race: every token must be identical each run.
+        //
+        // The trailing 16/48 pair is `split_mut` (safety mosaic, item 4): the callback
+        // fills the two disjoint halves with 7s and 9s; 16 is the boundary pair
+        // (index 2 + index 3 = 7 + 9, so neither view bled into the other) and 48 is
+        // the whole-parent sum (3·7 + 3·9 — every element written, through the views).
         for _ in 0..8 {
             assert_eq!(
                 toks("examples/std/par_soac.jtr"),
-                ["1", "1", "1", "1", "1", "500500"],
+                ["1", "1", "1", "1", "1", "500500", "16", "48"],
                 "a parallel SOAC diverged from serial"
             );
         }
