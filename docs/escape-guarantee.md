@@ -108,6 +108,21 @@ is the sound behaviour. If you hit this on code you believe is
 well-formed, that is a type-inference gap worth reporting — the message
 names the binding whose type is missing.
 
+A third shape joined the list the first week the gate existed, caught in
+freshly written code rather than by a fuzzer or a probe:
+
+```jestyr
+fn read_node(n: &Node) -> i64 { return n.v }   // field through a genref
+```
+
+Field projection does not auto-deref a generational reference — the
+supported spelling is `n.*.v` — and `n.v` infers no type, so it used to
+compile silently. The gate refused it with the message above, which is
+exactly the intended behaviour: an inference gap surfacing as a clear
+refusal at the definition, not as silence. (Auto-deref for genref field
+access, or a targeted "did you mean `n.*.v`?" at the field access, is the
+matching long-term fix.)
+
 ## Why the argument holds
 
 The four routes are exhaustive over the language's value flows: a value

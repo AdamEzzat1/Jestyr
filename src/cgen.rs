@@ -403,12 +403,17 @@ fn emit_program(
     // typedefs (so a `JestyrFn_…` over a struct/enum sees its forward name) and
     // *before* `struct_defs`, so a struct may hold a fn-pointer field — the
     // hand-written-vtable shape (e.g. an allocator interface).
-    g.fn_type_typedefs();
-    // Aggregate definitions are captured per-unit and flushed in a topological order
-    // so a struct embedding another aggregate *by value* (e.g. a `List(E)` field) is
-    // emitted after that aggregate's definition. A no-op reorder for programs with no
-    // forward by-value dependency (byte-identical output).
+    // Definitions are captured per-unit and flushed in a topological order (a
+    // stable post-order DFS: deps first, otherwise call order — a no-op reorder
+    // for any program without a forward dependency, i.e. byte-identical output).
+    // The fn-pointer typedefs are INSIDE the capture, first, keeping their old
+    // output position: a struct may hold a fn-pointer field by name (the
+    // hand-written-vtable shape), while a fn typedef may name a slice/array/
+    // genref typedef in a parameter (the split_mut shape, `fn(mut []i64, …)`) —
+    // dependencies in both directions across the old fixed order, which only the
+    // dep graph can serve. Each unit declares what it needs; the flush sorts.
     g.begin_def_capture();
+    g.fn_type_typedefs();
     g.struct_defs();
     g.enum_defs();
     g.gen_struct_defs();
@@ -8953,11 +8958,41 @@ impl<'a> Cgen<'a> {
     /// `JestyrFn_<sig> j_x` — no inside-out C declarator anywhere. A `mut`/`out`
     /// parameter lowers to `T*`, matching the ABI of a real Jestyr function
     /// (see `fn_signature`), so a fn-pointer can hold `&some_fn`.
+    /// The capture-unit name `cty` depends on being *declared*, if any — the
+    /// anonymous-struct typedefs (`JestyrSlice_…`, `JestyrArr_…`, `JestyrRef_…`)
+    /// and the fn-pointer typedefs themselves (a nested `fn(fn(i32) -> i32)`).
+    ///
+    /// Unlike [`dep_of_cty`], a **pointer** does not lift the dependency: these
+    /// names have no forward declaration to fall back on (there is nothing to
+    /// forward-declare about a typedef of an anonymous struct), so even
+    /// `JestyrSlice_i64*` needs the typedef emitted first. Named aggregates
+    /// (`Jestyr_Point`) are exempt for the converse reason — `gen_forward_types`
+    /// already declared them, and C accepts a forward-declared aggregate in
+    /// prototype position.
+    fn dep_of_anon_typedef(cty: &str) -> Option<String> {
+        let base = cty.trim_end_matches('*').trim_end();
+        ["JestyrSlice_", "JestyrArr_", "JestyrRef_", "JestyrFn_"]
+            .iter()
+            .any(|p| base.starts_with(p))
+            .then(|| base.to_string())
+    }
+
     fn fn_type_typedefs(&mut self) {
         for t in self.fn_type_instances.clone() {
             let Ty::Fn { params, ret, .. } = &t else { continue };
             let name = self.fn_type_c_name(&t);
             let rc = self.c_type(ret);
+            // Each typedef is a capture unit depending on every anonymous-typedef
+            // name it mentions, so the flush emits those first. Without this the
+            // slice/array/genref typedefs landed after the fn typedefs and a
+            // `fn(mut []i64, …)` parameter failed two ways: `JestyrSlice_i64*`
+            // is a hard "unknown type name" (the `*` forces a parameter-type
+            // list), while a by-value `JestyrRef_Node`/`JestyrArr_i32_4` was
+            // silently parsed as a K&R *identifier list* — an UNPROTOTYPED
+            // function pointer with no argument checking at all ("parameter
+            // names (without types)" under -Wextra, nothing by default).
+            let mut deps: Vec<String> = Vec::new();
+            Self::add_dep(&mut deps, Self::dep_of_anon_typedef(&rc));
             let ps: Vec<String> = params
                 .iter()
                 .map(|(c, pt)| {
@@ -8969,8 +9004,13 @@ impl<'a> Cgen<'a> {
                     }
                 })
                 .collect();
+            for p in &ps {
+                Self::add_dep(&mut deps, Self::dep_of_anon_typedef(p));
+            }
             let plist = if ps.is_empty() { "void".to_string() } else { ps.join(", ") };
+            self.def_begin(name.clone(), deps);
             self.raw(format!("typedef {rc} (*{name})({plist});\n"));
+            self.def_end();
         }
         if !self.fn_type_instances.is_empty() {
             self.raw("\n");

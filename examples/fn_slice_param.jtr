@@ -1,0 +1,70 @@
+// Function-pointer types whose parameters are slice / array / genref typedefs —
+// the shapes that pin the definition-capture dependency graph in `cgen`.
+//
+// A `JestyrFn_…` typedef may name a `JestyrSlice_…`/`JestyrArr_…`/`JestyrRef_…`
+// typedef in a parameter or return position. None of those can be
+// forward-declared (each is a typedef of an *anonymous* struct), so the fn
+// typedef must be emitted AFTER them — which the capture flush guarantees via
+// per-unit dependencies. Before that fix this file failed two ways:
+//   - the slice param (`mut []i64` → `JestyrSlice_i64*`) was a hard gcc
+//     "unknown type name" — the `*` forces a parameter-type list;
+//   - the by-value genref/array params were silently parsed as K&R
+//     *identifier lists*, compiling to UNPROTOTYPED function pointers with no
+//     argument checking at all.
+//
+// The split_mut shape (safety mosaic, item 4) is the first real user: a helper
+// that hands two disjoint sub-slices to a callback.
+
+struct Node { v: i64 }
+
+fn fill(mut lo: []i64, mut hi: []i64) {
+    var i: usize = 0
+    for i < lo.len { lo[i] = 1  i = i + 1 }
+    var j: usize = 0
+    for j < hi.len { hi[j] = 2  j = j + 1 }
+}
+
+// The split_mut shape: two disjoint mut sub-slices of one parent, by callback.
+fn split_call(mut xs: []i64, at: usize, f: fn(mut []i64, mut []i64)) {
+    var mid: usize = at
+    if mid > xs.len { mid = xs.len }
+    let lo: []i64 = unsafe { slice(i64, xs.ptr, mid) }
+    let hi: []i64 = unsafe { slice(i64, xs.ptr + mid, xs.len - mid) }
+    f(lo, hi)
+}
+
+// A by-value slice parameter (no conv) — the K&R-silent shape for slices.
+fn sum_ro(xs: []i64) -> i64 {
+    var t: i64 = 0
+    var i: usize = 0
+    for i < xs.len { t = t + xs[i]  i = i + 1 }
+    return t
+}
+
+fn apply_ro(xs: []i64, f: fn([]i64) -> i64) -> i64 { return f(xs) }
+
+// A genref parameter in a fn-pointer type — by value, the K&R-silent shape.
+fn read_node(n: &Node) -> i64 { return n.*.v }
+
+fn apply_ref(n: &Node, f: fn(&Node) -> i64) -> i64 { return f(n) }
+
+// An array parameter in a fn-pointer type — by value, the K&R-silent shape.
+fn first_of(a: [4]i64) -> i64 { return a[0] }
+
+fn apply_arr(a: [4]i64, f: fn([4]i64) -> i64) -> i64 { return f(a) }
+
+fn main() -> i32 {
+    var buf: *mut i64 = alloc(i64, 4)
+    var s: []i64 = unsafe { slice(i64, buf, 4) }
+    split_call(s, 2, &fill)
+    print_int(s[0])                       // 1 — the low half was written
+    print_int(s[3])                       // 2 — the high half was written
+    print_int(apply_ro(s, &sum_ro))       // 6 = 1+1+2+2, through a by-value slice fn-ptr
+    var node: &Node = gen_new(Node, Node{ v: 40 })
+    print_int(apply_ref(node, &read_node)) // 40, through a genref fn-ptr
+    gen_free(node)
+    let arr: [4]i64 = [7, 8, 9, 10]
+    print_int(apply_arr(arr, &first_of))  // 7, through an array fn-ptr
+    free_ptr(buf)
+    return 0
+}

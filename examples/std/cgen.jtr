@@ -10235,7 +10235,42 @@ fn ast_ty_concrete(read p: parser.Parser, read src: str, tyid: i32) -> bool {
     return true
 }
 
-fn emit_fn_type_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg) {
+// Dep on an anonymous-typedef name a fn-pointer typedef mentions (mirrors
+// `dep_of_anon_typedef`). Unlike `dc_dep`, a POINTER does not lift the dependency:
+// `JestyrSlice_…`/`JestyrArr_…`/`JestyrRef_…`/`JestyrFn_…` are typedefs of
+// anonymous structs with NO forward declaration, so even `JestyrSlice_i64*` needs
+// the typedef emitted first. Named aggregates (`Jestyr_…`) are exempt -- the
+// forward declarations already satisfy prototype position.
+fn dc_dep_anon(mut d: Dc, ds: i32, read cty: str) {
+    var e: usize = cty.len
+    for e > 0 and cty[e - 1] == '*' { e = e - 1 }
+    for e > 0 and cty[e - 1] == ' ' { e = e - 1 }
+    let base: str = cty[0 .. e]
+    var hit: bool = false
+    if starts_with(base, "JestyrSlice_") { hit = true }
+    if starts_with(base, "JestyrArr_") { hit = true }
+    if starts_with(base, "JestyrRef_") { hit = true }
+    if starts_with(base, "JestyrFn_") { hit = true }
+    if !hit { return }
+    var probe: String = string_new()
+    string_push(probe, "|")
+    string_push(probe, base)
+    string_push(probe, "|")
+    var have: bool = false
+    {
+        let cur: str = string_view(d.nb)
+        have = contains(cur[ds as usize .. cur.len], string_view(probe))
+    }
+    if !have {
+        let start_empty: bool = dc_len(d) == ds
+        if start_empty { string_push(d.nb, "|") }
+        string_push(d.nb, base)
+        string_push(d.nb, "|")
+    }
+    string_free(probe)
+}
+
+fn emit_fn_type_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, mut d: Dc) {
     var any: bool = false
     var seen: String = string_new()
     var ti: usize = 0
@@ -10250,21 +10285,44 @@ fn emit_fn_type_defs(mut sb: String, read p: parser.Parser, read src: str, read 
             string_push(probe, "|")
             if !contains(string_view(seen), string_view(probe)) {
                 string_push(seen, string_view(probe))
-                string_push(sb, "typedef ")
-                emit_c_ty(sb, p, src, t.x)             // ret (-1 -> void)
-                string_push(sb, " (*JestyrFn_")
-                string_push(sb, string_view(m))
-                string_push(sb, ")(")
-                if t.a == 0 { string_push(sb, "void") }
+                // Each typedef is a CAPTURE UNIT named JestyrFn_<m>, depending on
+                // every anonymous-typedef name it mentions (mirrors the reference's
+                // `fn_type_typedefs` + `dep_of_anon_typedef`) -- the flush emits
+                // slice/array/genref typedefs first exactly where a signature
+                // names one. Param/ret C types render into a temp so the dep scan
+                // sees the finished spelling, `*` suffix included.
+                let uns: i32 = dc_len(d)
+                string_push(d.nb, "JestyrFn_")
+                string_push(d.nb, string_view(m))
+                let une: i32 = dc_len(d)
+                var line: String = string_new()
+                string_push(line, "typedef ")
+                var rc: String = string_new()
+                emit_c_ty(rc, p, src, t.x)             // ret (-1 -> void)
+                dc_dep_anon(d, une, string_view(rc))
+                string_push(line, string_view(rc))
+                string_free(rc)
+                string_push(line, " (*JestyrFn_")
+                string_push(line, string_view(m))
+                string_push(line, ")(")
+                if t.a == 0 { string_push(line, "void") }
                 var i: i32 = 0
                 for i < t.a {
-                    if i > 0 { string_push(sb, ", ") }
+                    if i > 0 { string_push(line, ", ") }
                     let conv: i32 = list.get(i32, p.tar, (t.op + i * 2) as usize)
-                    emit_c_ty(sb, p, src, list.get(i32, p.tar, (t.op + i * 2 + 1) as usize))
-                    if conv == 2 or conv == 4 { string_push(sb, "*") }
+                    var pc: String = string_new()
+                    emit_c_ty(pc, p, src, list.get(i32, p.tar, (t.op + i * 2 + 1) as usize))
+                    if conv == 2 or conv == 4 { string_push(pc, "*") }
+                    dc_dep_anon(d, une, string_view(pc))
+                    string_push(line, string_view(pc))
+                    string_free(pc)
                     i = i + 1
                 }
-                string_push(sb, ");\n")
+                string_push(line, ");\n")
+                dc_begin(d, sb_len(sb), uns, une, une, dc_len(d))
+                string_push(sb, string_view(line))
+                dc_end(d, sb_len(sb))
+                string_free(line)
                 any = true
             }
             string_free(m)
@@ -10302,21 +10360,40 @@ fn emit_fn_type_defs(mut sb: String, read p: parser.Parser, read src: str, read 
                         string_push(probe2, "|")
                         if !contains(string_view(seen), string_view(probe2)) {
                             string_push(seen, string_view(probe2))
-                            string_push(sb, "typedef ")
-                            emit_gs_ty(sb, p, src, c, ft.x, fit, tid)
-                            string_push(sb, " (*JestyrFn_")
-                            string_push(sb, string_view(m2))
-                            string_push(sb, ")(")
-                            if ft.a == 0 { string_push(sb, "void") }
+                            // Same capture-unit wrapping as pass 1 (deps incl. the
+                            // `*` suffix a mut/out conv appends).
+                            let uns2: i32 = dc_len(d)
+                            string_push(d.nb, "JestyrFn_")
+                            string_push(d.nb, string_view(m2))
+                            let une2: i32 = dc_len(d)
+                            var line2: String = string_new()
+                            string_push(line2, "typedef ")
+                            var rc2: String = string_new()
+                            emit_gs_ty(rc2, p, src, c, ft.x, fit, tid)
+                            dc_dep_anon(d, une2, string_view(rc2))
+                            string_push(line2, string_view(rc2))
+                            string_free(rc2)
+                            string_push(line2, " (*JestyrFn_")
+                            string_push(line2, string_view(m2))
+                            string_push(line2, ")(")
+                            if ft.a == 0 { string_push(line2, "void") }
                             var i2: i32 = 0
                             for i2 < ft.a {
-                                if i2 > 0 { string_push(sb, ", ") }
+                                if i2 > 0 { string_push(line2, ", ") }
                                 let conv2: i32 = list.get(i32, p.tar, (ft.op + i2 * 2) as usize)
-                                emit_gs_ty(sb, p, src, c, list.get(i32, p.tar, (ft.op + i2 * 2 + 1) as usize), fit, tid)
-                                if conv2 == 2 or conv2 == 4 { string_push(sb, "*") }
+                                var pc2: String = string_new()
+                                emit_gs_ty(pc2, p, src, c, list.get(i32, p.tar, (ft.op + i2 * 2 + 1) as usize), fit, tid)
+                                if conv2 == 2 or conv2 == 4 { string_push(pc2, "*") }
+                                dc_dep_anon(d, une2, string_view(pc2))
+                                string_push(line2, string_view(pc2))
+                                string_free(pc2)
                                 i2 = i2 + 1
                             }
-                            string_push(sb, ");\n")
+                            string_push(line2, ");\n")
+                            dc_begin(d, sb_len(sb), uns2, une2, une2, dc_len(d))
+                            string_push(sb, string_view(line2))
+                            dc_end(d, sb_len(sb))
+                            string_free(line2)
                             any = true
                         }
                         string_free(m2)
@@ -12351,12 +12428,17 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
     emit_prelude(sb, p, src, g)
     emit_forward_types(sb, p, src)
     emit_gen_forward_types(sb, p, src, c, g)         // monomorphized generic-enum instance fwd typedefs
-    emit_fn_type_defs(sb, p, src, c, g)              // fn-pointer typedefs (before aggregate defs)
-    // The aggregate-def window emits into a CAPTURE buffer; `dc_flush` re-emits its segments
+    // The definition window emits into a CAPTURE buffer; `dc_flush` re-emits its segments
     // topologically so a by-value embedding (a struct holding a `List(E)` field) is defined
     // after its dependency — a stable no-op when no forward dep exists (byte-identical).
+    // The fn-pointer typedefs are INSIDE the capture, first, keeping their old output
+    // position: a struct may hold a fn-pointer field by name (the vtable shape), while a
+    // fn typedef may name a slice/array/genref typedef in a parameter (the split_mut
+    // shape) — dependencies in both directions across the old fixed order, which only
+    // the dep graph can serve. Mirrors the same move in the reference's `emit`.
     var cap: String = string_new()
     var d: Dc = Dc{ nb: string_new(), segs: list.make(i32, a), last: 0, pns: 0, pne: 0, pds: 0, pde: 0, pstart: 0 - 1 }
+    emit_fn_type_defs(cap, p, src, c, g, d)          // fn-pointer typedefs (captured units)
     emit_struct_defs(cap, p, src, d)                 // captured-region aggregate defs (struct first)
     emit_enum_defs(cap, p, src, c, g, d)             // enum tag+struct defs (after structs)
     emit_gen_struct_defs(cap, p, src, c, g, d)       // generic-STRUCT instance defs (before gen enums)
