@@ -12476,14 +12476,15 @@ fn main() -> i32 {
         // chunk (five 1s), then the prefix sum of 1..=1000 ends at 500500. Repeated to
         // shake out any thread race: every token must be identical each run.
         //
-        // The trailing 16/48 pair is `split_mut` (safety mosaic, item 4): the callback
-        // fills the two disjoint halves with 7s and 9s; 16 is the boundary pair
-        // (index 2 + index 3 = 7 + 9, so neither view bled into the other) and 48 is
-        // the whole-parent sum (3·7 + 3·9 — every element written, through the views).
+        // The trailing pairs are item 4: 16/48 is sequential `split_mut` (7s and 9s
+        // into the two disjoint halves; 16 = the boundary pair 7+9, no bleed; 48 =
+        // the whole-parent sum), and 16/64 is `par_split_mut` — the same contract on
+        // two real TASKS (5s and 11s; 16 = 5+11 at the boundary, 64 = 4·5 + 4·11).
+        // The 8× repetition is what makes the parallel pair a determinism claim.
         for _ in 0..8 {
             assert_eq!(
                 toks("examples/std/par_soac.jtr"),
-                ["1", "1", "1", "1", "1", "500500", "16", "48"],
+                ["1", "1", "1", "1", "1", "500500", "16", "48", "16", "64"],
                 "a parallel SOAC diverged from serial"
             );
         }

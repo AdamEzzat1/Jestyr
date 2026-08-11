@@ -121,7 +121,32 @@ fn main() -> i32 {
     for k < 6 { tot = tot + geti(sm, k)  k = k + 1 }
     io.print_i32(tot as i32)                               // 48
     free_ptr(sm)
+
+    // par_split_mut: the same two-halves contract on two real TASKS. Each worker
+    // writes its own half concurrently; structured join, then read back through
+    // the parent. Boundary pair 5+11 = 16 again (no bleed, now under threads),
+    // total 4·5 + 4·11 = 64. Deterministic for any schedule — the halves are
+    // disjoint memory, so there is nothing to race on.
+    var pm: *mut i64 = alloc(i64, 8)
+    var pq: []i64 = slice(i64, pm, 8)
+    parallel.par_split_mut(pq, 4, &fill_fives, &fill_elevens)
+    io.print_i32((geti(pm, 3) + geti(pm, 4)) as i32)       // 16 = 5 + 11 (the boundary)
+    var ptot: i64 = 0
+    var pk: usize = 0
+    for pk < 8 { ptot = ptot + geti(pm, pk)  pk = pk + 1 }
+    io.print_i32(ptot as i32)                              // 64
+    free_ptr(pm)
     return 0
+}
+
+// The par_split_mut callbacks — one per half, each a second-class `mut` view.
+fn fill_fives(mut h: []i64) {
+    var i: usize = 0
+    for i < h.len { h[i] = 5  i = i + 1 }
+}
+fn fill_elevens(mut h: []i64) {
+    var i: usize = 0
+    for i < h.len { h[i] = 11  i = i + 1 }
 }
 
 // The split_mut callback: writes 7s into the low view and 9s into the high one.

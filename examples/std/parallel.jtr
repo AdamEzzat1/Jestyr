@@ -27,7 +27,7 @@
 // worker count does not affect the result (the determinism guarantee); making it a
 // tunable schedule is the later `with schedule(...)` increment.
 //
-//   jestyrc run examples/std/par_soac.jtr   →   1 1 1 1 1 500500 16 48
+//   jestyrc run examples/std/par_soac.jtr   →   1 1 1 1 1 500500 16 48 16 64
 
 // ── split_mut — checked disjoint borrowing (safety mosaic, item 4) ────────────
 //
@@ -57,6 +57,36 @@ pub fn split_mut(mut xs: []i64, at: usize, f: fn(mut []i64, mut []i64)) {
     let lo: []i64 = unsafe { slice(i64, xs.ptr, mid) }
     let hi: []i64 = unsafe { slice(i64, xs.ptr + mid, xs.len - mid) }
     f(lo, hi)
+}
+
+// ── par_split_mut — the two halves on two TASKS (item 4, stage 2) ─────────────
+//
+// The parallel payoff of `split_mut`: run `f` over the low half and `g` over the
+// high half CONCURRENTLY. Race-free for the same reason the sequential form is
+// alias-free — the halves are disjoint by construction — plus structured
+// concurrency: `concurrent` joins both tasks before this frame returns, so the
+// borrows the workers manufacture never outlive `xs`.
+//
+// The task boundary is crossed with a RAW (ptr, len) pair, not a `mut` slice:
+// `spawn` rejects `mut`/`out` slice parameters by design (a shared mutable
+// slice across tasks can race), and the recorded safe pattern — `par_map`'s —
+// is a raw pointer to a disjoint region. Each worker rebuilds the `mut` view
+// INSIDE its own frame, so the user callback still receives a second-class
+// `mut []i64` it can write but not leak; the raw pointer never reaches user
+// code.
+fn split_half_worker(p: *mut i64, n: usize, f: fn(mut []i64)) {
+    var half: []i64 = unsafe { slice(i64, p, n) }
+    f(half)
+}
+
+pub fn par_split_mut(mut xs: []i64, at: usize, f: fn(mut []i64), g: fn(mut []i64)) {
+    var mid: usize = at
+    if mid > xs.len { mid = xs.len }                 // clamp: overlap inexpressible
+    let n: usize = xs.len
+    concurrent {
+        spawn split_half_worker(xs.ptr, mid, f)
+        spawn split_half_worker(unsafe { xs.ptr + mid }, n - mid, g)
+    }
 }
 
 // ── Built-in associative operators (identity in each `par_scan_*` wrapper) ─────
