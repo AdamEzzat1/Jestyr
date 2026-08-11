@@ -554,6 +554,8 @@ struct Jestyr_Ml {
     JestyrString j_vis;
     JestyrString j_seen;
     JestyrString j_ren;
+    JestyrString j_rids;
+    int32_t j_nmod;
     Jestyr_List__i32 j_map;
     bool j_err;
 };
@@ -1349,6 +1351,7 @@ void jestyr_ml_push_stem(JestyrString* restrict j_sb, JestyrStr j_path);
 bool jestyr_ml_seen(Jestyr_Ml* restrict j_m, JestyrStr j_path);
 void jestyr_ml_load(Jestyr_Ml* restrict j_m, JestyrStr j_path, Jestyr_Interner* restrict j_it, int64_t j_kwcount, Jestyr_Allocator j_a);
 void jestyr_ml_mark_collision(Jestyr_Ml* restrict j_m, JestyrStr j_stem, JestyrStr j_name);
+void jestyr_ml_push_rid(JestyrString* restrict j_sb, JestyrStr j_rids, JestyrStr j_stem);
 bool jestyr_ml_is_collision(JestyrStr j_ren, JestyrStr j_stem, JestyrStr j_name);
 void jestyr_ml_register(Jestyr_Ml* restrict j_m, JestyrStr j_name, JestyrStr j_stem);
 bool jestyr_ml_ident_head(JestyrStr j_s);
@@ -33990,6 +33993,12 @@ void jestyr_ml_load(Jestyr_Ml* restrict j_m, JestyrStr j_path, Jestyr_Interner* 
     jestyr_rt_str_push(&(*j_m).j_vis, JSTR("|"));
     jestyr_rt_str_push(&(*j_m).j_vis, j_path);
     jestyr_rt_str_push(&(*j_m).j_vis, JSTR("|"));
+    jestyr_rt_str_push(&(*j_m).j_rids, JSTR("|"));
+    jestyr_ml_push_stem(&((*j_m).j_rids), j_path);
+    jestyr_rt_str_push(&(*j_m).j_rids, JSTR("="));
+    jestyr_push_uint__cgen(&((*j_m).j_rids), (int64_t)((*j_m).j_nmod));
+    jestyr_rt_str_push(&(*j_m).j_rids, JSTR("|"));
+    (*j_m).j_nmod = ((*j_m).j_nmod + 1);
     JestyrString j_srcb = jestyr_read_text(j_path);
     JestyrStr j_src = jestyr_rt_str_view(&j_srcb);
     if ((j_src.len == 0))
@@ -34055,6 +34064,33 @@ void jestyr_ml_mark_collision(Jestyr_Ml* restrict j_m, JestyrStr j_stem, JestyrS
         jestyr_rt_str_push(&(*j_m).j_ren, jestyr_rt_str_view(&j_probe));
     }
     jestyr_rt_str_free(&j_probe);
+}
+
+void jestyr_ml_push_rid(JestyrString* restrict j_sb, JestyrStr j_rids, JestyrStr j_stem)
+{
+    JestyrString j_probe = jestyr_rt_str_new();
+    jestyr_rt_str_push(&j_probe, JSTR("|"));
+    jestyr_rt_str_push(&j_probe, j_stem);
+    jestyr_rt_str_push(&j_probe, JSTR("="));
+    intptr_t j_at = jestyr_rt_find(j_rids, jestyr_rt_str_view(&j_probe));
+    JestyrStr j_pv = jestyr_rt_str_view(&j_probe);
+    size_t j_plen = j_pv.len;
+    jestyr_rt_str_free(&j_probe);
+    if ((j_at < 0))
+    {
+        return;
+    }
+    size_t j_k = ((size_t)(j_at) + j_plen);
+    size_t j_e = j_k;
+    while ((j_e < j_rids.len))
+    {
+        if (((int32_t)(((uint8_t)(j_rids).ptr[(j_e)])) == 124))
+        {
+            break;
+        }
+        j_e = (j_e + 1);
+    }
+    jestyr_rt_str_push(&(*j_sb), jestyr_rt_substr(j_rids, j_k, j_e));
 }
 
 bool jestyr_ml_is_collision(JestyrStr j_ren, JestyrStr j_stem, JestyrStr j_name)
@@ -34332,8 +34368,8 @@ void jestyr_ml_rewrite(Jestyr_Ml* restrict j_m, size_t j_mi, JestyrString* restr
                     jestyr_rt_str_push(&(*j_sb2), jestyr_rt_substr(j_src, j_x.j_start, j_x.j_end));
                     if (jestyr_ml_is_collision(j_ren, jestyr_rt_str_view(&j_tstem), jestyr_rt_substr(j_src, j_x.j_start, j_x.j_end)))
                     {
-                        jestyr_rt_str_push(&(*j_sb2), JSTR("__"));
-                        jestyr_rt_str_push(&(*j_sb2), jestyr_rt_str_view(&j_tstem));
+                        jestyr_rt_str_push(&(*j_sb2), JSTR("__m"));
+                        jestyr_ml_push_rid(&((*j_sb2)), jestyr_rt_str_view(&(*j_m).j_rids), jestyr_rt_str_view(&j_tstem));
                     }
                     j_cur = j_x.j_end;
                     jestyr_push__i32(&((*j_m).j_map), jestyr_sb_len(&((*j_sb2))));
@@ -34349,8 +34385,8 @@ void jestyr_ml_rewrite(Jestyr_Ml* restrict j_m, size_t j_mi, JestyrString* restr
                 {
                     jestyr_rt_str_push(&(*j_sb2), jestyr_rt_substr(j_src, j_cur, j_t.j_start));
                     jestyr_rt_str_push(&(*j_sb2), j_tx);
-                    jestyr_rt_str_push(&(*j_sb2), JSTR("__"));
-                    jestyr_rt_str_push(&(*j_sb2), j_stem);
+                    jestyr_rt_str_push(&(*j_sb2), JSTR("__m"));
+                    jestyr_ml_push_rid(&((*j_sb2)), jestyr_rt_str_view(&(*j_m).j_rids), j_stem);
                     j_cur = j_t.j_end;
                     jestyr_push__i32(&((*j_m).j_map), jestyr_sb_len(&((*j_sb2))));
                     jestyr_push__i32(&((*j_m).j_map), (int32_t)((j_src_s + j_cur)));
@@ -37051,7 +37087,7 @@ int32_t jestyr_main(void)
         }
         if ((((j_bmode || j_rmode) || j_amode) || j_vmode))
         {
-            Jestyr_Ml j_m = (Jestyr_Ml){ .j_allsrc = jestyr_rt_str_new(), .j_nb = jestyr_rt_str_new(), .j_mods = jestyr_make__list__i32(j_a), .j_vis = jestyr_rt_str_new(), .j_seen = jestyr_rt_str_new(), .j_ren = jestyr_rt_str_new(), .j_map = jestyr_make__list__i32(j_a), .j_err = false };
+            Jestyr_Ml j_m = (Jestyr_Ml){ .j_allsrc = jestyr_rt_str_new(), .j_nb = jestyr_rt_str_new(), .j_mods = jestyr_make__list__i32(j_a), .j_vis = jestyr_rt_str_new(), .j_seen = jestyr_rt_str_new(), .j_ren = jestyr_rt_str_new(), .j_rids = jestyr_rt_str_new(), .j_nmod = 0, .j_map = jestyr_make__list__i32(j_a), .j_err = false };
             JestyrString j_merged = jestyr_ml_flatten(&(j_m), jestyr_argv(1), &(j_it), j_kwcount, j_a);
             JestyrStr j_mv = jestyr_rt_str_view(&j_merged);
             if ((j_mv.len == 0))

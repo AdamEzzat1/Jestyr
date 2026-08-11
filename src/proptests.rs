@@ -11469,6 +11469,105 @@ fn main() -> i32 {
         eprintln!("driver modules: multi-file + collision + diamond + per-file attribution all green");
     }
 
+    /// **The module-path C golden** — the prerequisite `docs/…` and the memory notes
+    /// record for closing the port's `#line` gap, built first so the gap is *pinned*
+    /// instead of assumed.
+    ///
+    /// The reference's module path (`module::load` → `check_program` → `emit`) fills
+    /// `DebugInfo` and emits `#line N "file.jtr"` directives; the port's `jc build`
+    /// loader path emits none. That divergence is invisible to every other golden —
+    /// the P5 corpus golden compares the *degenerate single-file* form, where the
+    /// reference emits no `#line` either — and it is why `jestyrc attest` and
+    /// `jc attest` disagree on `c-sha256` for module-bearing programs.
+    ///
+    /// This golden asserts the exact shape of the divergence, so it cannot drift
+    /// silently in either direction:
+    ///
+    /// 1. the port's C contains **no** `#line` today — the day the port starts
+    ///    emitting them, this test fails and must be *upgraded* to full equality;
+    /// 2. the reference's C, with its `#line` lines stripped, is **byte-identical**
+    ///    to the port's — i.e. `#line` is the *whole* module-path divergence, and
+    ///    everything else (collision renames, import shifts, emission order) agrees.
+    #[test]
+    fn jestyr_driver_module_c_matches_reference_modulo_line_directives() {
+        let jc = build_exe("examples/std/cgen.jtr");
+        let dir = std::env::temp_dir().join("jestyr_mlc_golden");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The same shapes the multi-module driver test exercises: a diamond and a
+        // cross-module name collision (`mag`), so the canon-rename path is covered.
+        std::fs::write(dir.join("util.jtr"), "pub fn mag(x: i32) -> i32 { return x * 10 }\n")
+            .unwrap();
+        std::fs::write(
+            dir.join("vec2.jtr"),
+            "import \"util\"\npub struct V2 { pub x: i32, pub y: i32 }\npub fn make(x: i32, y: i32) -> V2 { return V2 { x: x, y: y } }\npub fn mag(v: V2) -> i32 { return util.mag(v.x) + v.y }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("app.jtr"),
+            "import \"util\"\nimport \"vec2\"\nfn main() -> i32 {\n    let v: vec2.V2 = vec2.make(4, 2)\n    print_int(vec2.mag(v) as i64)\n    print_int(util.mag(3) as i64)\n    return 0\n}\n",
+        )
+        .unwrap();
+        let app = dir.join("app.jtr");
+
+        // The port: `jc app.jtr build` writes `app.c` beside the source.
+        let out = Command::new(&jc).args([app.to_str().unwrap(), "build"]).output().unwrap();
+        assert!(
+            out.status.success(),
+            "jc build failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let port_c = std::fs::read_to_string(dir.join("app.c")).unwrap().replace("\r\n", "\n");
+
+        // The reference: the real module loader, then `emit` (which fills DebugInfo
+        // and emits `#line`).
+        let prog = crate::module::load(app.to_str().unwrap());
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "fixture loads: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(!td.iter().any(|d| d.is_error()), "fixture typechecks");
+        let (ref_c, _cd) = crate::cgen::emit(&prog.ast, &info);
+        let ref_c = ref_c.replace("\r\n", "\n");
+
+        // (1) The reference DOES emit #line on this path, and the port does NOT —
+        // the recorded gap, pinned so neither side can drift silently. When the
+        // port learns `#line`, delete these two asserts and compare `ref_c` to
+        // `port_c` directly.
+        assert!(
+            ref_c.lines().any(|l| l.starts_with("#line ")),
+            "the reference module path stopped emitting #line — this golden and the \
+             port gap notes are stale"
+        );
+        assert!(
+            !port_c.lines().any(|l| l.starts_with("#line ")),
+            "the port now emits #line — upgrade this golden to full byte equality \
+             (and close the attest c-sha256 gap note)"
+        );
+
+        // (2) Stripping the whole-line directives from the reference must yield the
+        // port's C byte-for-byte: #line is the WHOLE divergence.
+        let stripped: String = ref_c
+            .lines()
+            .filter(|l| !l.starts_with("#line "))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        if stripped != port_c {
+            let mismatch = stripped
+                .lines()
+                .zip(port_c.lines())
+                .enumerate()
+                .find(|(_, (a, b))| a != b);
+            panic!(
+                "module-path C diverges beyond #line at {:?}\n(reference minus #line vs jc)",
+                mismatch
+            );
+        }
+        eprintln!(
+            "module-path golden: {} #line directives are the whole divergence over {} lines",
+            ref_c.lines().filter(|l| l.starts_with("#line ")).count(),
+            port_c.lines().count()
+        );
+    }
+
     /// **The self-build.** The ported compiler compiles ITSELF from its real multi-file
     /// sources (`examples/std/cgen.jtr` + its 9 imports) through its own module loader and
     /// its own gcc driver — and the result is the same compiler: byte-identical C on a
