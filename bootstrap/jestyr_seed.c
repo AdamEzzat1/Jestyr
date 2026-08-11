@@ -3737,7 +3737,10 @@ int32_t jestyr_parse_block(Jestyr_Parser* restrict j_p)
 {
     Jestyr_Token j_lb = jestyr_cur_tok((*j_p));
     size_t j_start = j_lb.j_start;
-    jestyr_bump(&((*j_p)));
+    if ((jestyr_cur_kind((*j_p)) == 65))
+    {
+        jestyr_bump(&((*j_p)));
+    }
     bool j_saved_ns = (*j_p).j_no_struct;
     (*j_p).j_no_struct = false;
     Jestyr_List__i32 j_tmp = jestyr_make__list__i32((*j_p).j_alloc);
@@ -4497,11 +4500,11 @@ int32_t jestyr_parse_import(Jestyr_Parser* restrict j_p)
     if ((jestyr_cur_kind((*j_p)) == 48))
     {
         jestyr_bump(&((*j_p)));
+        Jestyr_Token j_at = jestyr_cur_tok((*j_p));
+        j_als = (int32_t)(j_at.j_start);
+        j_ale = (int32_t)(j_at.j_end);
         if ((jestyr_cur_kind((*j_p)) == 0))
         {
-            Jestyr_Token j_at = jestyr_cur_tok((*j_p));
-            j_als = (int32_t)(j_at.j_start);
-            j_ale = (int32_t)(j_at.j_end);
             jestyr_bump(&((*j_p)));
         }
     }
@@ -4526,13 +4529,11 @@ int32_t jestyr_parse_distinct(Jestyr_Parser* restrict j_p, int32_t j_is_pub)
     Jestyr_Token j_dt = jestyr_cur_tok((*j_p));
     size_t j_start = j_dt.j_start;
     jestyr_bump(&((*j_p)));
-    size_t j_ns = j_start;
-    size_t j_ne = j_start;
+    Jestyr_Token j_idn1 = jestyr_cur_tok((*j_p));
+    size_t j_ns = j_idn1.j_start;
+    size_t j_ne = j_idn1.j_end;
     if ((jestyr_cur_kind((*j_p)) == 0))
     {
-        Jestyr_Token j_nt = jestyr_cur_tok((*j_p));
-        j_ns = j_nt.j_start;
-        j_ne = j_nt.j_end;
         jestyr_bump(&((*j_p)));
     }
     if ((jestyr_cur_kind((*j_p)) == 84))
@@ -4549,14 +4550,16 @@ int32_t jestyr_parse_attrs(Jestyr_Parser* restrict j_p)
     while ((jestyr_cur_kind((*j_p)) == 101))
     {
         jestyr_bump(&((*j_p)));
-        size_t j_ns = 0;
-        size_t j_ne = 0;
+        Jestyr_Token j_idn2 = jestyr_cur_tok((*j_p));
+        size_t j_ns = j_idn2.j_start;
+        size_t j_ne = j_idn2.j_end;
         if ((jestyr_cur_kind((*j_p)) == 0))
         {
-            Jestyr_Token j_nt = jestyr_cur_tok((*j_p));
-            j_ns = j_nt.j_start;
-            j_ne = j_nt.j_end;
             jestyr_bump(&((*j_p)));
+        }
+        else
+        {
+            j_ne = j_ns;
         }
         int32_t j_arg_start = (int32_t)(jestyr_len__i32((*j_p).j_aar));
         int32_t j_arg_count = 0;
@@ -4627,13 +4630,11 @@ int32_t jestyr_parse_const(Jestyr_Parser* restrict j_p, int32_t j_is_pub, int32_
     Jestyr_Token j_ct = jestyr_cur_tok((*j_p));
     size_t j_start = j_ct.j_start;
     jestyr_bump(&((*j_p)));
-    size_t j_ns = j_start;
-    size_t j_ne = j_start;
+    Jestyr_Token j_idn3 = jestyr_cur_tok((*j_p));
+    size_t j_ns = j_idn3.j_start;
+    size_t j_ne = j_idn3.j_end;
     if ((jestyr_cur_kind((*j_p)) == 0))
     {
-        Jestyr_Token j_nt = jestyr_cur_tok((*j_p));
-        j_ns = j_nt.j_start;
-        j_ne = j_nt.j_end;
         jestyr_bump(&((*j_p)));
     }
     int32_t j_tyid = (0 - 1);
@@ -4676,8 +4677,9 @@ int32_t jestyr_parse_params_into_iar(Jestyr_Parser* restrict j_p)
             }
             int32_t j_conv = jestyr_parse_conv(&((*j_p)));
             int32_t j_is_self = 0;
-            size_t j_pns = 0;
-            size_t j_pne = 0;
+            Jestyr_Token j_pt0 = jestyr_cur_tok((*j_p));
+            size_t j_pns = j_pt0.j_start;
+            size_t j_pne = j_pt0.j_end;
             int32_t j_pty = (0 - 1);
             int32_t j_refine = (0 - 1);
             if ((jestyr_cur_kind((*j_p)) == 61))
@@ -4751,13 +4753,12 @@ int32_t jestyr_parse_generics(Jestyr_Parser* restrict j_p)
         }
         else
         {
-            size_t j_ns = 0;
-            size_t j_ne = 0;
+            size_t j_gbefore = (*j_p).j_pos;
+            Jestyr_Token j_idn4 = jestyr_cur_tok((*j_p));
+            size_t j_ns = j_idn4.j_start;
+            size_t j_ne = j_idn4.j_end;
             if ((jestyr_cur_kind((*j_p)) == 0))
             {
-                Jestyr_Token j_t = jestyr_cur_tok((*j_p));
-                j_ns = j_t.j_start;
-                j_ne = j_t.j_end;
                 jestyr_bump(&((*j_p)));
             }
             int32_t j_bs = (0 - 1);
@@ -4765,11 +4766,11 @@ int32_t jestyr_parse_generics(Jestyr_Parser* restrict j_p)
             if ((jestyr_cur_kind((*j_p)) == 71))
             {
                 jestyr_bump(&((*j_p)));
+                Jestyr_Token j_bt = jestyr_cur_tok((*j_p));
+                j_bs = (int32_t)(j_bt.j_start);
+                j_be = (int32_t)(j_bt.j_end);
                 if ((jestyr_cur_kind((*j_p)) == 0))
                 {
-                    Jestyr_Token j_bt = jestyr_cur_tok((*j_p));
-                    j_bs = (int32_t)(j_bt.j_start);
-                    j_be = (int32_t)(j_bt.j_end);
                     jestyr_bump(&((*j_p)));
                 }
             }
@@ -4777,6 +4778,10 @@ int32_t jestyr_parse_generics(Jestyr_Parser* restrict j_p)
             jestyr_push__i32(&((*j_p).j_gar), (int32_t)(j_ne));
             jestyr_push__i32(&((*j_p).j_gar), j_bs);
             jestyr_push__i32(&((*j_p).j_gar), j_be);
+            if (((*j_p).j_pos == j_gbefore))
+            {
+                jestyr_bump(&((*j_p)));
+            }
             if ((jestyr_cur_kind((*j_p)) == 69))
             {
                 jestyr_bump(&((*j_p)));
@@ -4799,13 +4804,11 @@ int32_t jestyr_parse_fn(Jestyr_Parser* restrict j_p, int32_t j_is_pub, int32_t j
     Jestyr_Token j_ft = jestyr_cur_tok((*j_p));
     size_t j_start = j_ft.j_start;
     jestyr_bump(&((*j_p)));
-    size_t j_ns = j_start;
-    size_t j_ne = j_start;
+    Jestyr_Token j_idn5 = jestyr_cur_tok((*j_p));
+    size_t j_ns = j_idn5.j_start;
+    size_t j_ne = j_idn5.j_end;
     if ((jestyr_cur_kind((*j_p)) == 0))
     {
-        Jestyr_Token j_nt = jestyr_cur_tok((*j_p));
-        j_ns = j_nt.j_start;
-        j_ne = j_nt.j_end;
         jestyr_bump(&((*j_p)));
     }
     int32_t j_gen_start = jestyr_parse_generics(&((*j_p)));
@@ -4946,13 +4949,11 @@ int32_t jestyr_parse_struct(Jestyr_Parser* restrict j_p, int32_t j_is_pub, int32
     Jestyr_Token j_kt = jestyr_cur_tok((*j_p));
     size_t j_start = j_kt.j_start;
     jestyr_bump(&((*j_p)));
-    size_t j_ns = j_start;
-    size_t j_ne = j_start;
+    Jestyr_Token j_idn6 = jestyr_cur_tok((*j_p));
+    size_t j_ns = j_idn6.j_start;
+    size_t j_ne = j_idn6.j_end;
     if ((jestyr_cur_kind((*j_p)) == 0))
     {
-        Jestyr_Token j_nt = jestyr_cur_tok((*j_p));
-        j_ns = j_nt.j_start;
-        j_ne = j_nt.j_end;
         jestyr_bump(&((*j_p)));
     }
     Jestyr_MembersResult j_mr = jestyr_parse_struct_members(&((*j_p)), j_ne);
@@ -5244,76 +5245,76 @@ Jestyr_MembersResult jestyr_parse_struct_members(Jestyr_Parser* restrict j_p, si
             j_more = false;
         }
         else
-        if (((jestyr_cur_kind((*j_p)) == 7) || (jestyr_cur_kind((*j_p)) == 101)))
         {
             int32_t j_mattr_start = jestyr_parse_attrs(&((*j_p)));
             int32_t j_mattr_count = (((int32_t)(jestyr_len__i32((*j_p).j_aar)) - j_mattr_start) / 4);
-            int32_t j_fid = jestyr_parse_fn(&((*j_p)), 0, j_mattr_start, j_mattr_count);
-            jestyr_push__i32(&(j_tmp), 1);
-            jestyr_push__i32(&(j_tmp), j_fid);
-            int32_t j_mp = 0;
-            while ((j_mp < 8))
+            if ((jestyr_cur_kind((*j_p)) == 7))
             {
-                jestyr_push__i32(&(j_tmp), (0 - 1));
-                j_mp = (j_mp + 1);
-            }
-        }
-        else
-        {
-            int32_t j_fpub = 0;
-            if ((jestyr_cur_kind((*j_p)) == 42))
-            {
-                jestyr_bump(&((*j_p)));
-                j_fpub = 1;
-            }
-            size_t j_fns = j_fallback;
-            size_t j_fne = j_fallback;
-            if ((jestyr_cur_kind((*j_p)) == 0))
-            {
-                Jestyr_Token j_nt = jestyr_cur_tok((*j_p));
-                j_fns = j_nt.j_start;
-                j_fne = j_nt.j_end;
-                jestyr_bump(&((*j_p)));
-            }
-            if ((jestyr_cur_kind((*j_p)) == 71))
-            {
-                jestyr_bump(&((*j_p)));
-            }
-            int32_t j_fattr_start = jestyr_parse_attrs(&((*j_p)));
-            int32_t j_fattr_count = (((int32_t)(jestyr_len__i32((*j_p).j_aar)) - j_fattr_start) / 4);
-            int32_t j_fty = jestyr_parse_type(&((*j_p)));
-            int32_t j_bs = (0 - 1);
-            int32_t j_be = (0 - 1);
-            if ((jestyr_cur_kind((*j_p)) == 71))
-            {
-                jestyr_bump(&((*j_p)));
-                if ((jestyr_cur_kind((*j_p)) == 1))
+                int32_t j_fid = jestyr_parse_fn(&((*j_p)), 0, j_mattr_start, j_mattr_count);
+                jestyr_push__i32(&(j_tmp), 1);
+                jestyr_push__i32(&(j_tmp), j_fid);
+                int32_t j_mp = 0;
+                while ((j_mp < 8))
                 {
-                    Jestyr_Token j_bt = jestyr_cur_tok((*j_p));
-                    j_bs = (int32_t)(j_bt.j_start);
-                    j_be = (int32_t)(j_bt.j_end);
-                    jestyr_bump(&((*j_p)));
+                    jestyr_push__i32(&(j_tmp), (0 - 1));
+                    j_mp = (j_mp + 1);
                 }
             }
-            int32_t j_default = (0 - 1);
-            if ((jestyr_cur_kind((*j_p)) == 84))
+            else
             {
-                jestyr_bump(&((*j_p)));
-                j_default = jestyr_parse_expr(&((*j_p)));
-            }
-            jestyr_push__i32(&(j_tmp), 0);
-            jestyr_push__i32(&(j_tmp), j_fpub);
-            jestyr_push__i32(&(j_tmp), (int32_t)(j_fns));
-            jestyr_push__i32(&(j_tmp), (int32_t)(j_fne));
-            jestyr_push__i32(&(j_tmp), j_fty);
-            jestyr_push__i32(&(j_tmp), j_default);
-            jestyr_push__i32(&(j_tmp), j_fattr_start);
-            jestyr_push__i32(&(j_tmp), j_fattr_count);
-            jestyr_push__i32(&(j_tmp), j_bs);
-            jestyr_push__i32(&(j_tmp), j_be);
-            if ((jestyr_cur_kind((*j_p)) == 69))
-            {
-                jestyr_bump(&((*j_p)));
+                int32_t j_fpub = 0;
+                if ((jestyr_cur_kind((*j_p)) == 42))
+                {
+                    jestyr_bump(&((*j_p)));
+                    j_fpub = 1;
+                }
+                Jestyr_Token j_idn7 = jestyr_cur_tok((*j_p));
+                size_t j_fns = j_idn7.j_start;
+                size_t j_fne = j_idn7.j_end;
+                if ((jestyr_cur_kind((*j_p)) == 0))
+                {
+                    jestyr_bump(&((*j_p)));
+                }
+                if ((jestyr_cur_kind((*j_p)) == 71))
+                {
+                    jestyr_bump(&((*j_p)));
+                }
+                int32_t j_fattr_start = jestyr_parse_attrs(&((*j_p)));
+                int32_t j_fattr_count = (((int32_t)(jestyr_len__i32((*j_p).j_aar)) - j_fattr_start) / 4);
+                int32_t j_fty = jestyr_parse_type(&((*j_p)));
+                int32_t j_bs = (0 - 1);
+                int32_t j_be = (0 - 1);
+                if ((jestyr_cur_kind((*j_p)) == 71))
+                {
+                    jestyr_bump(&((*j_p)));
+                    if ((jestyr_cur_kind((*j_p)) == 1))
+                    {
+                        Jestyr_Token j_bt = jestyr_cur_tok((*j_p));
+                        j_bs = (int32_t)(j_bt.j_start);
+                        j_be = (int32_t)(j_bt.j_end);
+                        jestyr_bump(&((*j_p)));
+                    }
+                }
+                int32_t j_default = (0 - 1);
+                if ((jestyr_cur_kind((*j_p)) == 84))
+                {
+                    jestyr_bump(&((*j_p)));
+                    j_default = jestyr_parse_expr(&((*j_p)));
+                }
+                jestyr_push__i32(&(j_tmp), 0);
+                jestyr_push__i32(&(j_tmp), j_fpub);
+                jestyr_push__i32(&(j_tmp), (int32_t)(j_fns));
+                jestyr_push__i32(&(j_tmp), (int32_t)(j_fne));
+                jestyr_push__i32(&(j_tmp), j_fty);
+                jestyr_push__i32(&(j_tmp), j_default);
+                jestyr_push__i32(&(j_tmp), j_fattr_start);
+                jestyr_push__i32(&(j_tmp), j_fattr_count);
+                jestyr_push__i32(&(j_tmp), j_bs);
+                jestyr_push__i32(&(j_tmp), j_be);
+                if ((jestyr_cur_kind((*j_p)) == 69))
+                {
+                    jestyr_bump(&((*j_p)));
+                }
             }
         }
     }
@@ -5341,13 +5342,11 @@ int32_t jestyr_parse_enum(Jestyr_Parser* restrict j_p, int32_t j_is_pub)
     Jestyr_Token j_et = jestyr_cur_tok((*j_p));
     size_t j_start = j_et.j_start;
     jestyr_bump(&((*j_p)));
-    size_t j_ns = j_start;
-    size_t j_ne = j_start;
+    Jestyr_Token j_idn8 = jestyr_cur_tok((*j_p));
+    size_t j_ns = j_idn8.j_start;
+    size_t j_ne = j_idn8.j_end;
     if ((jestyr_cur_kind((*j_p)) == 0))
     {
-        Jestyr_Token j_nt = jestyr_cur_tok((*j_p));
-        j_ns = j_nt.j_start;
-        j_ne = j_nt.j_end;
         jestyr_bump(&((*j_p)));
     }
     Jestyr_List__i32 j_tpt = jestyr_make__list__i32((*j_p).j_alloc);
@@ -5369,11 +5368,11 @@ int32_t jestyr_parse_enum(Jestyr_Parser* restrict j_p, int32_t j_is_pub)
             }
             else
             {
+                Jestyr_Token j_t = jestyr_cur_tok((*j_p));
+                jestyr_push__i32(&(j_tpt), (int32_t)(j_t.j_start));
+                jestyr_push__i32(&(j_tpt), (int32_t)(j_t.j_end));
                 if ((jestyr_cur_kind((*j_p)) == 0))
                 {
-                    Jestyr_Token j_t = jestyr_cur_tok((*j_p));
-                    jestyr_push__i32(&(j_tpt), (int32_t)(j_t.j_start));
-                    jestyr_push__i32(&(j_tpt), (int32_t)(j_t.j_end));
                     jestyr_bump(&((*j_p)));
                 }
                 if ((jestyr_cur_kind((*j_p)) == 69))
@@ -5419,13 +5418,12 @@ int32_t jestyr_parse_enum(Jestyr_Parser* restrict j_p, int32_t j_is_pub)
         }
         else
         {
-            size_t j_vns = j_start;
-            size_t j_vne = j_start;
+            size_t j_vbefore = (*j_p).j_pos;
+            Jestyr_Token j_idn9 = jestyr_cur_tok((*j_p));
+            size_t j_vns = j_idn9.j_start;
+            size_t j_vne = j_idn9.j_end;
             if ((jestyr_cur_kind((*j_p)) == 0))
             {
-                Jestyr_Token j_vt2 = jestyr_cur_tok((*j_p));
-                j_vns = j_vt2.j_start;
-                j_vne = j_vt2.j_end;
                 jestyr_bump(&((*j_p)));
             }
             Jestyr_List__i32 j_ft = jestyr_make__list__i32((*j_p).j_alloc);
@@ -5447,13 +5445,11 @@ int32_t jestyr_parse_enum(Jestyr_Parser* restrict j_p, int32_t j_is_pub)
                     }
                     else
                     {
-                        size_t j_fns = j_start;
-                        size_t j_fne = j_start;
+                        Jestyr_Token j_idn10 = jestyr_cur_tok((*j_p));
+                        size_t j_fns = j_idn10.j_start;
+                        size_t j_fne = j_idn10.j_end;
                         if ((jestyr_cur_kind((*j_p)) == 0))
                         {
-                            Jestyr_Token j_ftk = jestyr_cur_tok((*j_p));
-                            j_fns = j_ftk.j_start;
-                            j_fne = j_ftk.j_end;
                             jestyr_bump(&((*j_p)));
                         }
                         if ((jestyr_cur_kind((*j_p)) == 71))
@@ -5501,6 +5497,10 @@ int32_t jestyr_parse_enum(Jestyr_Parser* restrict j_p, int32_t j_is_pub)
             jestyr_push__i32(&(j_vt), j_field_start);
             jestyr_push__i32(&(j_vt), j_field_count);
             jestyr_push__i32(&(j_vt), j_disc);
+            if (((*j_p).j_pos == j_vbefore))
+            {
+                jestyr_bump(&((*j_p)));
+            }
             if ((jestyr_cur_kind((*j_p)) == 69))
             {
                 jestyr_bump(&((*j_p)));
@@ -5537,13 +5537,11 @@ int32_t jestyr_parse_trait(Jestyr_Parser* restrict j_p, int32_t j_is_pub)
     Jestyr_Token j_tt = jestyr_cur_tok((*j_p));
     size_t j_start = j_tt.j_start;
     jestyr_bump(&((*j_p)));
-    size_t j_ns = j_start;
-    size_t j_ne = j_start;
+    Jestyr_Token j_idn11 = jestyr_cur_tok((*j_p));
+    size_t j_ns = j_idn11.j_start;
+    size_t j_ne = j_idn11.j_end;
     if ((jestyr_cur_kind((*j_p)) == 0))
     {
-        Jestyr_Token j_nt = jestyr_cur_tok((*j_p));
-        j_ns = j_nt.j_start;
-        j_ne = j_nt.j_end;
         jestyr_bump(&((*j_p)));
     }
     if ((jestyr_cur_kind((*j_p)) == 65))
@@ -5568,13 +5566,11 @@ int32_t jestyr_parse_trait(Jestyr_Parser* restrict j_p, int32_t j_is_pub)
         if ((j_k == 7))
         {
             jestyr_bump(&((*j_p)));
-            size_t j_mns = j_start;
-            size_t j_mne = j_start;
+            Jestyr_Token j_idn12 = jestyr_cur_tok((*j_p));
+            size_t j_mns = j_idn12.j_start;
+            size_t j_mne = j_idn12.j_end;
             if ((jestyr_cur_kind((*j_p)) == 0))
             {
-                Jestyr_Token j_nt = jestyr_cur_tok((*j_p));
-                j_mns = j_nt.j_start;
-                j_mne = j_nt.j_end;
                 jestyr_bump(&((*j_p)));
             }
             if ((jestyr_cur_kind((*j_p)) == 63))
@@ -5713,13 +5709,11 @@ int32_t jestyr_parse_impl(Jestyr_Parser* restrict j_p)
     jestyr_bump(&((*j_p)));
     int32_t j_gen_start = jestyr_parse_generics(&((*j_p)));
     int32_t j_gen_count = (((int32_t)(jestyr_len__i32((*j_p).j_gar)) - j_gen_start) / 4);
-    size_t j_tns = j_start;
-    size_t j_tne = j_start;
+    Jestyr_Token j_idn13 = jestyr_cur_tok((*j_p));
+    size_t j_tns = j_idn13.j_start;
+    size_t j_tne = j_idn13.j_end;
     if ((jestyr_cur_kind((*j_p)) == 0))
     {
-        Jestyr_Token j_nt = jestyr_cur_tok((*j_p));
-        j_tns = j_nt.j_start;
-        j_tne = j_nt.j_end;
         jestyr_bump(&((*j_p)));
     }
     if ((jestyr_cur_kind((*j_p)) == 24))
@@ -5750,8 +5744,11 @@ int32_t jestyr_parse_impl(Jestyr_Parser* restrict j_p)
         {
             int32_t j_mattr_start = jestyr_parse_attrs(&((*j_p)));
             int32_t j_mattr_count = (((int32_t)(jestyr_len__i32((*j_p).j_aar)) - j_mattr_start) / 4);
-            int32_t j_fid = jestyr_parse_fn(&((*j_p)), 0, j_mattr_start, j_mattr_count);
-            jestyr_push__i32(&(j_mt), j_fid);
+            if ((jestyr_cur_kind((*j_p)) == 7))
+            {
+                int32_t j_fid = jestyr_parse_fn(&((*j_p)), 0, j_mattr_start, j_mattr_count);
+                jestyr_push__i32(&(j_mt), j_fid);
+            }
         }
         else
         {
@@ -5795,13 +5792,11 @@ int32_t jestyr_parse_extern(Jestyr_Parser* restrict j_p, int32_t j_is_pub)
     {
         jestyr_bump(&((*j_p)));
     }
-    size_t j_ns = j_start;
-    size_t j_ne = j_start;
+    Jestyr_Token j_idn14 = jestyr_cur_tok((*j_p));
+    size_t j_ns = j_idn14.j_start;
+    size_t j_ne = j_idn14.j_end;
     if ((jestyr_cur_kind((*j_p)) == 0))
     {
-        Jestyr_Token j_nt = jestyr_cur_tok((*j_p));
-        j_ns = j_nt.j_start;
-        j_ne = j_nt.j_end;
         jestyr_bump(&((*j_p)));
     }
     if ((jestyr_cur_kind((*j_p)) == 63))
@@ -6209,13 +6204,11 @@ int32_t jestyr_parse_type(Jestyr_Parser* restrict j_p)
         if ((jestyr_cur_kind((*j_p)) == 67))
         {
             jestyr_bump(&((*j_p)));
-            size_t j_rs = j_start;
-            size_t j_re = j_start;
+            Jestyr_Token j_idn15 = jestyr_cur_tok((*j_p));
+            size_t j_rs = j_idn15.j_start;
+            size_t j_re = j_idn15.j_end;
             if ((jestyr_cur_kind((*j_p)) == 0))
             {
-                Jestyr_Token j_rt = jestyr_cur_tok((*j_p));
-                j_rs = j_rt.j_start;
-                j_re = j_rt.j_end;
                 jestyr_bump(&((*j_p)));
             }
             if ((jestyr_cur_kind((*j_p)) == 68))
@@ -7467,7 +7460,14 @@ void jestyr_dump_attrs(JestyrStr j_src, Jestyr_Parser j_p, int32_t j_attr_start,
         int32_t j_arg_count = jestyr_get__i32(j_p.j_aar, (size_t)((j_base + 3)));
         jestyr_rt_print_str(JSTR("("));
         jestyr_rt_print_str(JSTR("attr"));
-        jestyr_rt_print_str(jestyr_rt_substr(j_src, j_ns, j_ne));
+        if ((j_ne == j_ns))
+        {
+            jestyr_rt_print_str(JSTR("<error>"));
+        }
+        else
+        {
+            jestyr_rt_print_str(jestyr_rt_substr(j_src, j_ns, j_ne));
+        }
         jestyr_rt_print_int((int64_t)(j_arg_count));
         int32_t j_j = 0;
         while ((j_j < j_arg_count))

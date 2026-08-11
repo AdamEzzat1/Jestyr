@@ -8480,6 +8480,117 @@ mod c_oracle {
         eprintln!("differential parser fuzz: {valid} valid + {mutated} mutated cases agreed");
     }
 
+    /// A grammar-directed **item** generator — the other half of the differential
+    /// fuzz, and the half that reaches the declaration-level parsers.
+    ///
+    /// The expression fuzzer above found two bugs in the "missing identifier"
+    /// family (`eat_ident` reports the offending token's span and consumes nothing;
+    /// the port defaulted to a placeholder and sometimes consumed anyway). Twelve
+    /// more sites share that shape at item level — fn names, parameter names, field
+    /// names, variant names, trait names, attribute names — and no expression can
+    /// reach any of them. This generator exists to decide those sites empirically
+    /// rather than by blanket-editing them and hoping the goldens notice.
+    ///
+    /// Restricted, like the expression generator, to constructs the curated item
+    /// list already proves both sides build.
+    fn gen_item(rng: &mut Rng, depth: u32) -> String {
+        const NAME: &[&str] = &["f", "g", "xa", "Point", "T", "Show"];
+        const TY: &[&str] = &["i32", "u8", "f64", "usize", "str", "*mut u8", "[]i32", "List(i32)"];
+        const CONV: &[&str] = &["", "read ", "mut ", "out ", "take "];
+        let n = |r: &mut Rng| r.pick(NAME).to_string();
+        let t = |r: &mut Rng| r.pick(TY).to_string();
+        match rng.below(10) {
+            // fn: conventions, generics, return type, a small body
+            0 => format!(
+                "fn {}({}{}: {}) -> {} {{ return {} }}",
+                n(rng), rng.pick(CONV), n(rng), t(rng), t(rng), gen_expr(rng, depth)
+            ),
+            1 => format!("fn {}[{}: Add]({}: {}) {{ }}", n(rng), n(rng), n(rng), t(rng)),
+            2 => format!("pub fn {}(comptime T: type, {}: {}) {{ }}", n(rng), n(rng), t(rng)),
+            // struct: fields, defaults, a method, bit-fields, @volatile
+            3 => format!("struct {} {{ {}: {}, {}: {} }}", n(rng), n(rng), t(rng), n(rng), t(rng)),
+            4 => format!("struct {} {{ {}: {} = {} }}", n(rng), n(rng), t(rng), gen_expr(rng, 0)),
+            5 => format!(
+                "struct {} {{ {}: @volatile u32, {}: u8 : 3 }}",
+                n(rng), n(rng), n(rng)
+            ),
+            // enum: nullary, payloads, generic, discriminants
+            6 => format!("enum {} {{ {}, {}(v: {}) }}", n(rng), n(rng), n(rng), t(rng)),
+            7 => format!("pub enum {}(T) {{ {}, {}(value: T) }}", n(rng), n(rng), n(rng)),
+            // trait / impl / extern / const / attribute
+            8 => match rng.below(4) {
+                0 => format!("trait {} {{ fn {}(read self) -> {} }}", n(rng), n(rng), t(rng)),
+                1 => format!("impl {} for {} {{ fn {}(read self) {{ }} }}", n(rng), n(rng), n(rng)),
+                2 => format!("extern \"c\" fn {}({}: {}) -> {}", n(rng), n(rng), t(rng), t(rng)),
+                _ => format!("distinct {} = {}", n(rng), t(rng)),
+            },
+            _ => match rng.below(3) {
+                0 => format!("@inline fn {}() {{ }}", n(rng)),
+                1 => format!("@align(16) struct {} {{ {}: i64 }}", n(rng), n(rng)),
+                _ => format!("const {}: {} = {}", n(rng), t(rng), gen_expr(rng, 0)),
+            },
+        }
+    }
+
+    /// **Differential fuzzing at ITEM level.** The declaration-level twin of
+    /// `jestyr_parser_matches_reference_on_generated_input`.
+    ///
+    /// Same contract, same reason: both parsers are total and recovering, so a
+    /// mutated item is not an error case — both build a tree containing `error`
+    /// nodes and the dumps must still agree. The corpus cannot check this because
+    /// every corpus file is a *valid* set of declarations.
+    #[test]
+    fn jestyr_parser_item_matches_reference_on_generated_input() {
+        let parser = build_exe("examples/std/parser_cli.jtr");
+        let cases: usize =
+            std::env::var("FUZZ_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(400);
+        let mut rng = Rng(0x51ED_2701_A5C9_3B17);
+        let probe = std::env::temp_dir().join("jestyr_fuzz_item_probe.jtr");
+        let (mut valid, mut mutated) = (0usize, 0usize);
+        for case in 0..cases {
+            let base = gen_item(&mut rng, (case % 3) as u32);
+            let src = if case % 3 == 0 {
+                valid += 1;
+                base
+            } else {
+                mutated += 1;
+                mutate_one_token(&base, &mut rng)
+            };
+            std::fs::write(&probe, &src).unwrap();
+            let want = rust_item_dump(&src);
+            let got = jestyr_item_dump(&parser, probe.to_str().unwrap());
+            // ONE deliberate structural difference, checked rather than skipped.
+            // For input whose first token cannot begin an item, the reference's
+            // `parse_item` returns `None` and records a diagnostic; the port
+            // materializes an Error item (kind 99) instead, because `jc` has no
+            // severity model and its parse-refusal scan looks for exactly that node
+            // (`cgen.jtr`, "Parse refusal"). Neither is wrong, but they are not
+            // byte-equal, so assert the *relationship* — no item on one side must
+            // mean exactly one `itemerr` on the other. Skipping the case instead
+            // would also hide a port that produced nothing at all.
+            if want == ["(none)"] {
+                assert_eq!(
+                    got.first().map(String::as_str),
+                    Some("("),
+                    "case {case}: port produced no node where the reference had no item: {src:?}"
+                );
+                assert_eq!(
+                    got.get(1).map(String::as_str),
+                    Some("itemerr"),
+                    "case {case}: reference had no item, so the port must have an Error item \
+                     (its driver's refusal signal): {src:?} -> {got:?}"
+                );
+                continue;
+            }
+            assert_eq!(
+                got, want,
+                "item parsers diverged on generated case {case}\n  source: {src:?}\n  \
+                 replay: seed 0x51ED2701A5C93B17, case {case}"
+            );
+        }
+        eprintln!("differential item fuzz: {valid} valid + {mutated} mutated cases agreed");
+    }
+
     /// The reference item-dump for `src`: lex, parse a single item, dump it.
     fn rust_item_dump(src: &str) -> Vec<String> {
         let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();

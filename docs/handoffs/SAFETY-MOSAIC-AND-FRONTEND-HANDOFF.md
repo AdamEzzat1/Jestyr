@@ -151,6 +151,25 @@ i.e. everywhere the corpus looks. Plus `eat_ident`'s failure semantics, which
 report the offending token's span and consume nothing; one of those was a **tree**
 difference rather than a span.
 
+**The item-level twin is DONE too**
+(`jestyr_parser_item_matches_reference_on_generated_input`): generated
+declarations — fns, structs, enums, traits, impls, externs, consts, attributes —
+plus single-token mutations, 2000 cases clean. It found **six more port bugs**,
+raising the session total to thirteen. Recurring shapes worth knowing when the
+next one appears: (a) *commit-before-check* — the port branched to "a method"
+on `@`-led input without verifying `fn` follows, in both struct and impl
+bodies; (b) *the progress bump runs before the comma check* — the reference's
+recovery bump consumes the offending token so the separator test needs a comma
+of its own, and the port's direct comma check instead let the same `,` continue
+the list (enum variants, fn generics); (c) two more missing-`eat_ident` span
+sites shaped unlike the fifteen a blanket regex had aligned; (d) missing attr
+*names*, where the reference fabricates the ident `<error>` and the dump
+compares name **text** — the port marks these with an empty span (an ident is
+never empty) and prints `<error>` for it. One deliberate structural difference
+is asserted rather than skipped: no-item on the reference side must equal
+exactly one `itemerr` (kind 99) on the port side, since `jc`'s parse-refusal
+scan depends on that node existing.
+
 Three things worth carrying into the next fuzz increment:
 
 - **Token-granular mutation, not byte-granular.** Byte mutation mostly yields

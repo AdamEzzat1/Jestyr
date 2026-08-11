@@ -1889,7 +1889,11 @@ fn parse_fstring(mut p: Parser, start: usize, end: usize) -> i32 {
 fn parse_block(mut p: Parser) -> i32 {
     let lb: Token = cur_tok(p)
     let start: usize = lb.start
-    bump(p)                                        // consume `{`
+    // `expect` semantics: consume the `{` only if it IS one. Bumping unconditionally
+    // swallowed whatever stood in its place, so a signature with a broken closer
+    // (`fn f(g: u8} { }`) ate the `}` as the body's opener and then read the real
+    // body as a nested block statement -- a TREE difference. Differential item fuzz.
+    if cur_kind(p) == 65 { bump(p) }                // consume `{`
     let saved_ns: bool = p.no_struct
     p.no_struct = false                            // struct literals are fine inside a block
     var tmp: List(i32) = make__list(i32, p.alloc)
@@ -2372,7 +2376,11 @@ fn parse_import(mut p: Parser) -> i32 {
     var als: i32 = 0 - 1  var ale: i32 = 0 - 1     // alias name span
     if cur_kind(p) == 48 {                          // `as`
         bump(p)
-        if cur_kind(p) == 0 { let at: Token = cur_tok(p)  als = at.start as i32  ale = at.end as i32  bump(p) }
+        // `eat_ident`: `as` commits to an alias -- record the offending token's
+        // span when the name is missing, as the reference's `eat_ident` does.
+        let at: Token = cur_tok(p)
+        als = at.start as i32  ale = at.end as i32
+        if cur_kind(p) == 0 { bump(p) }
     }
     var hs: i32 = 0 - 1  var he: i32 = 0 - 1       // pinned-hash inner span
     if cur_kind(p) == 84 {                          // `=`
@@ -2387,8 +2395,11 @@ fn parse_distinct(mut p: Parser, is_pub: i32) -> i32 {
     let dt: Token = cur_tok(p)
     let start: usize = dt.start
     bump(p)                                        // consume `distinct`
-    var ns: usize = start  var ne: usize = start
-    if cur_kind(p) == 0 { let nt: Token = cur_tok(p)  ns = nt.start  ne = nt.end  bump(p) }
+    // `eat_ident`: the offending token's span when the name is absent.
+    let idn1: Token = cur_tok(p)
+    var ns: usize = idn1.start
+    var ne: usize = idn1.end
+    if cur_kind(p) == 0 { bump(p) }
     if cur_kind(p) == 84 { bump(p) }               // `=`
     let base: i32 = parse_type(p)
     return mk_item_distinct(p, start, node_ty_end(p, base), is_pub, ns, ne, base)
@@ -2402,8 +2413,16 @@ fn parse_attrs(mut p: Parser) -> i32 {
     var at: List(i32) = make__list(i32, p.alloc)    // attr 4-tuples
     for cur_kind(p) == 101 {                        // `@`
         bump(p)                                    // `@`
-        var ns: usize = 0  var ne: usize = 0
-        if cur_kind(p) == 0 { let nt: Token = cur_tok(p)  ns = nt.start  ne = nt.end  bump(p) }
+        // A missing attribute name records an EMPTY span (ne == ns). The
+        // reference's `eat_ident` fabricates the literal name `<error>` there,
+        // and the attr dump prints the NAME TEXT (not a span) -- so the port
+        // needs a marker no real name can collide with, and an ident is never
+        // empty. The dump prints `<error>` for an empty slice (differential
+        // item fuzz, case 598: `@@inline` dumped `@` here, `<error>` there).
+        let idn2: Token = cur_tok(p)
+        var ns: usize = idn2.start
+        var ne: usize = idn2.end
+        if cur_kind(p) == 0 { bump(p) } else { ne = ns }
         var arg_start: i32 = len(i32, p.aar) as i32
         var arg_count: i32 = 0
         if cur_kind(p) == 63 {                      // `(args)`
@@ -2443,8 +2462,11 @@ fn parse_const(mut p: Parser, is_pub: i32, attr_start: i32, attr_count: i32) -> 
     let ct: Token = cur_tok(p)
     let start: usize = ct.start
     bump(p)                                        // consume `const`
-    var ns: usize = start  var ne: usize = start
-    if cur_kind(p) == 0 { let nt: Token = cur_tok(p)  ns = nt.start  ne = nt.end  bump(p) }
+    // `eat_ident`: the offending token's span when the name is absent.
+    let idn3: Token = cur_tok(p)
+    var ns: usize = idn3.start
+    var ne: usize = idn3.end
+    if cur_kind(p) == 0 { bump(p) }
     var tyid: i32 = 0 - 1
     if cur_kind(p) == 71 { bump(p)  tyid = parse_type(p) }   // `: T`
     if cur_kind(p) == 84 { bump(p) }               // `=`
@@ -2469,7 +2491,12 @@ fn parse_params_into_iar(mut p: Parser) -> i32 {
             if cur_kind(p) == 31 { bump(p)  comp = 1 }       // `comptime`
             let conv: i32 = parse_conv(p)
             var is_self: i32 = 0
-            var pns: usize = 0  var pne: usize = 0
+            // `eat_ident`: the offending token's span when the name is absent
+            // (`0,0` here was the one missing-identifier site the blanket
+            // alignment missed -- its two vars initialized to zero, not from a
+            // token; differential item fuzz, case 52).
+            let pt0: Token = cur_tok(p)
+            var pns: usize = pt0.start  var pne: usize = pt0.end
             var pty: i32 = 0 - 1  var refine: i32 = 0 - 1
             if cur_kind(p) == 61 {                 // `self` receiver
                 let st: Token = cur_tok(p)  pns = st.start  pne = st.end  is_self = 1  bump(p)
@@ -2508,17 +2535,32 @@ fn parse_generics(mut p: Parser) -> i32 {
         if k == 68 { more = false }                // `]`
         else if k == 110 { more = false }          // Eof
         else {
-            var ns: usize = 0  var ne: usize = 0
-            if cur_kind(p) == 0 { let t: Token = cur_tok(p)  ns = t.start  ne = t.end  bump(p) }
+            let gbefore: usize = p.pos
+            // `eat_ident`: the offending token's span when the name is absent.
+            let idn4: Token = cur_tok(p)
+            var ns: usize = idn4.start
+            var ne: usize = idn4.end
+            if cur_kind(p) == 0 { bump(p) }
             var bs: i32 = 0 - 1  var be: i32 = 0 - 1
             if cur_kind(p) == 71 {                 // `: Bound`
                 bump(p)
-                if cur_kind(p) == 0 { let bt: Token = cur_tok(p)  bs = bt.start as i32  be = bt.end as i32  bump(p) }
+                // `eat_ident`: a `:` commits to a bound, so one is recorded even
+                // when its name is missing -- at the offending token's span, as
+                // the reference's `eat_ident("trait bound")` does. Leaving it
+                // `none` erased the bound node (differential item fuzz, case 94).
+                let bt: Token = cur_tok(p)
+                bs = bt.start as i32  be = bt.end as i32
+                if cur_kind(p) == 0 { bump(p) }
             }
             push(i32, p.gar, ns as i32)
             push(i32, p.gar, ne as i32)
             push(i32, p.gar, bs)
             push(i32, p.gar, be)
+            // The reference's progress bump runs before its comma check (the
+            // enum-variant pattern) -- an entry that consumed nothing eats the
+            // offending token as recovery, and the separator test then needs a
+            // comma of its own (differential item fuzz, case 140).
+            if p.pos == gbefore { bump(p) }
             if cur_kind(p) == 69 { bump(p) } else { more = false }   // `,`
         }
     }
@@ -2533,8 +2575,11 @@ fn parse_fn(mut p: Parser, is_pub: i32, attr_start: i32, attr_count: i32) -> i32
     let ft: Token = cur_tok(p)
     let start: usize = ft.start
     bump(p)                                        // consume `fn`
-    var ns: usize = start  var ne: usize = start
-    if cur_kind(p) == 0 { let nt: Token = cur_tok(p)  ns = nt.start  ne = nt.end  bump(p) }
+    // `eat_ident`: the offending token's span when the name is absent.
+    let idn5: Token = cur_tok(p)
+    var ns: usize = idn5.start
+    var ne: usize = idn5.end
+    if cur_kind(p) == 0 { bump(p) }
     let gen_start: i32 = parse_generics(p)         // `[T: Add]`
     let gen_count: i32 = ((len(i32, p.gar) as i32) - gen_start) / 4
     if cur_kind(p) == 63 { bump(p) }               // `(`
@@ -2616,8 +2661,11 @@ fn parse_struct(mut p: Parser, is_pub: i32, kindcode: i32, attr_start: i32, attr
     let kt: Token = cur_tok(p)
     let start: usize = kt.start
     bump(p)                                        // consume `struct`/`record`/`union`
-    var ns: usize = start  var ne: usize = start
-    if cur_kind(p) == 0 { let nt: Token = cur_tok(p)  ns = nt.start  ne = nt.end  bump(p) }
+    // `eat_ident`: the offending token's span when the name is absent.
+    let idn6: Token = cur_tok(p)
+    var ns: usize = idn6.start
+    var ne: usize = idn6.end
+    if cur_kind(p) == 0 { bump(p) }
     let mr: MembersResult = parse_struct_members(p, ne)
     return mk_item_struct(p, start, mr.endp, is_pub, kindcode, ns, ne, mr.mem_start, mr.mem_count, attr_start, attr_count)
 }
@@ -2811,19 +2859,33 @@ fn parse_struct_members(mut p: Parser, fallback: usize) -> MembersResult {
         let k: i32 = cur_kind(p)
         if k == 66 { more = false }                // `}`
         else if k == 110 { more = false }          // Eof
-        else if cur_kind(p) == 7 or cur_kind(p) == 101 {   // `@`-led or bare `fn` -> a method
+        else {
+            // Attrs first (a no-op unless `@`-led), then DECIDE on what follows --
+            // mirroring the reference, which only builds a method when `fn` is
+            // actually next. Committing to `parse_fn` on any `@` fabricated a
+            // method node out of `Point: @volatile u32` written in member position
+            // (a tree difference; differential item fuzz). The reference reports
+            // "an attribute here applies to a method" and falls into the FIELD
+            // path in the SAME iteration -- even when the next token is `}` (which
+            // then yields one error-spanned field). This parser records no
+            // diagnostics, so it mirrors just that tree shape: stray attrs are
+            // consumed and dropped, and a field parses from the token after them.
             let mattr_start: i32 = parse_attrs(p)  // `@inline fn …` method attributes
             let mattr_count: i32 = ((len(i32, p.aar) as i32) - mattr_start) / 4
-            let fid: i32 = parse_fn(p, 0, mattr_start, mattr_count)
-            push(i32, tmp, 1)                  // tag 1 = method
-            push(i32, tmp, fid)
-            var mp: i32 = 0
-            for mp < 8 { push(i32, tmp, 0 - 1)  mp = mp + 1 }   // pad to a 10-tuple
-        } else {                                    // `[pub] name : [@volatile] T [: bits] [= default]`
+            if cur_kind(p) == 7 {                   // `fn` -> a method
+                let fid: i32 = parse_fn(p, 0, mattr_start, mattr_count)
+                push(i32, tmp, 1)              // tag 1 = method
+                push(i32, tmp, fid)
+                var mp: i32 = 0
+                for mp < 8 { push(i32, tmp, 0 - 1)  mp = mp + 1 }   // pad to a 10-tuple
+            } else {                                // `[pub] name : [@volatile] T [: bits] [= default]`
             var fpub: i32 = 0
             if cur_kind(p) == 42 { bump(p)  fpub = 1 }   // `pub`
-            var fns: usize = fallback  var fne: usize = fallback
-            if cur_kind(p) == 0 { let nt: Token = cur_tok(p)  fns = nt.start  fne = nt.end  bump(p) }
+            // `eat_ident`: the offending token's span when the name is absent.
+            let idn7: Token = cur_tok(p)
+            var fns: usize = idn7.start
+            var fne: usize = idn7.end
+            if cur_kind(p) == 0 { bump(p) }
             if cur_kind(p) == 71 { bump(p) }        // `:`
             let fattr_start: i32 = parse_attrs(p)   // field attributes (`@volatile`)
             let fattr_count: i32 = ((len(i32, p.aar) as i32) - fattr_start) / 4
@@ -2846,6 +2908,7 @@ fn parse_struct_members(mut p: Parser, fallback: usize) -> MembersResult {
             push(i32, tmp, bs)
             push(i32, tmp, be)
             if cur_kind(p) == 69 { bump(p) }        // optional `,`
+            }
         }
     }
     let clt6: Token = cur_tok(p)
@@ -2869,8 +2932,11 @@ fn parse_enum(mut p: Parser, is_pub: i32) -> i32 {
     let et: Token = cur_tok(p)
     let start: usize = et.start
     bump(p)                                        // consume `enum`
-    var ns: usize = start  var ne: usize = start
-    if cur_kind(p) == 0 { let nt: Token = cur_tok(p)  ns = nt.start  ne = nt.end  bump(p) }
+    // `eat_ident`: the offending token's span when the name is absent.
+    let idn8: Token = cur_tok(p)
+    var ns: usize = idn8.start
+    var ne: usize = idn8.end
+    if cur_kind(p) == 0 { bump(p) }
     var tpt: List(i32) = make__list(i32, p.alloc)   // type-param name-span pairs
     if cur_kind(p) == 63 {                          // `(` generic params
         bump(p)
@@ -2880,7 +2946,13 @@ fn parse_enum(mut p: Parser, is_pub: i32) -> i32 {
             if k == 64 { m0 = false }              // `)`
             else if k == 110 { m0 = false }        // Eof
             else {
-                if cur_kind(p) == 0 { let t: Token = cur_tok(p)  push(i32, tpt, t.start as i32)  push(i32, tpt, t.end as i32)  bump(p) }
+                // `eat_ident`: a type param is recorded even when its name is
+                // missing -- at the offending token's span (the reference pushes
+                // `eat_ident`'s result unconditionally).
+                let t: Token = cur_tok(p)
+                push(i32, tpt, t.start as i32)
+                push(i32, tpt, t.end as i32)
+                if cur_kind(p) == 0 { bump(p) }
                 if cur_kind(p) == 69 { bump(p) } else { m0 = false }   // `,`
             }
         }
@@ -2898,8 +2970,12 @@ fn parse_enum(mut p: Parser, is_pub: i32) -> i32 {
         if k == 66 { more = false }                // `}`
         else if k == 110 { more = false }          // Eof
         else {
-            var vns: usize = start  var vne: usize = start
-            if cur_kind(p) == 0 { let vt2: Token = cur_tok(p)  vns = vt2.start  vne = vt2.end  bump(p) }
+            let vbefore: usize = p.pos
+            // `eat_ident`: the offending token's span when the name is absent.
+            let idn9: Token = cur_tok(p)
+            var vns: usize = idn9.start
+            var vne: usize = idn9.end
+            if cur_kind(p) == 0 { bump(p) }
             var ft: List(i32) = make__list(i32, p.alloc)   // field 3-tuples (fname span, fty)
             if cur_kind(p) == 63 {                 // `(` named-field payload
                 bump(p)
@@ -2909,8 +2985,11 @@ fn parse_enum(mut p: Parser, is_pub: i32) -> i32 {
                     if k2 == 64 { m2 = false }     // `)`
                     else if k2 == 110 { m2 = false }
                     else {
-                        var fns: usize = start  var fne: usize = start
-                        if cur_kind(p) == 0 { let ftk: Token = cur_tok(p)  fns = ftk.start  fne = ftk.end  bump(p) }
+                        // `eat_ident`: the offending token's span when the name is absent.
+                        let idn10: Token = cur_tok(p)
+                        var fns: usize = idn10.start
+                        var fne: usize = idn10.end
+                        if cur_kind(p) == 0 { bump(p) }
                         if cur_kind(p) == 71 { bump(p) }   // `:`
                         let fty: i32 = parse_type(p)
                         push(i32, ft, fns as i32)
@@ -2938,6 +3017,13 @@ fn parse_enum(mut p: Parser, is_pub: i32) -> i32 {
             push(i32, vt, field_start)
             push(i32, vt, field_count)
             push(i32, vt, disc)
+            // The reference's progress bump runs BEFORE its comma check, so a
+            // variant that consumed nothing (a bare `,` where a name should be)
+            // eats that token as recovery -- and the separator test then needs a
+            // comma of its own. Checking the comma directly let the same `,`
+            // serve as the separator, silently continuing a list the reference
+            // ends after one error variant (differential item fuzz, case 44).
+            if p.pos == vbefore { bump(p) }
             if cur_kind(p) == 69 { bump(p) } else { more = false }   // `,`
         }
     }
@@ -2960,8 +3046,11 @@ fn parse_trait(mut p: Parser, is_pub: i32) -> i32 {
     let tt: Token = cur_tok(p)
     let start: usize = tt.start
     bump(p)                                        // consume `trait`
-    var ns: usize = start  var ne: usize = start
-    if cur_kind(p) == 0 { let nt: Token = cur_tok(p)  ns = nt.start  ne = nt.end  bump(p) }
+    // `eat_ident`: the offending token's span when the name is absent.
+    let idn11: Token = cur_tok(p)
+    var ns: usize = idn11.start
+    var ne: usize = idn11.end
+    if cur_kind(p) == 0 { bump(p) }
     if cur_kind(p) == 65 { bump(p) }               // `{`
     var mt: List(i32) = make__list(i32, p.alloc)    // trait-method 7-tuples
     var more: bool = true
@@ -2971,8 +3060,11 @@ fn parse_trait(mut p: Parser, is_pub: i32) -> i32 {
         else if k == 110 { more = false }          // Eof
         else if k == 7 {                            // `fn` -> a method signature
             bump(p)                                // `fn`
-            var mns: usize = start  var mne: usize = start
-            if cur_kind(p) == 0 { let nt: Token = cur_tok(p)  mns = nt.start  mne = nt.end  bump(p) }
+            // `eat_ident`: the offending token's span when the name is absent.
+            let idn12: Token = cur_tok(p)
+            var mns: usize = idn12.start
+            var mne: usize = idn12.end
+            if cur_kind(p) == 0 { bump(p) }
             if cur_kind(p) == 63 { bump(p) }       // `(`
             let param_start: i32 = parse_params_into_iar(p)
             let param_count: i32 = ((len(i32, p.iar) as i32) - param_start) / 7
@@ -3054,8 +3146,11 @@ fn parse_impl(mut p: Parser) -> i32 {
     bump(p)                                        // consume `impl`
     let gen_start: i32 = parse_generics(p)         // `[T]` blanket generics
     let gen_count: i32 = ((len(i32, p.gar) as i32) - gen_start) / 4
-    var tns: usize = start  var tne: usize = start
-    if cur_kind(p) == 0 { let nt: Token = cur_tok(p)  tns = nt.start  tne = nt.end  bump(p) }
+    // `eat_ident`: the offending token's span when the name is absent.
+    let idn13: Token = cur_tok(p)
+    var tns: usize = idn13.start
+    var tne: usize = idn13.end
+    if cur_kind(p) == 0 { bump(p) }
     if cur_kind(p) == 24 { bump(p) }               // `for`
     let target: i32 = parse_type(p)
     if cur_kind(p) == 65 { bump(p) }               // `{`
@@ -3068,8 +3163,17 @@ fn parse_impl(mut p: Parser) -> i32 {
         else if k == 7 or k == 101 {                // `@`-led or bare `fn` method
             let mattr_start: i32 = parse_attrs(p)
             let mattr_count: i32 = ((len(i32, p.aar) as i32) - mattr_start) / 4
-            let fid: i32 = parse_fn(p, 0, mattr_start, mattr_count)
-            push(i32, mt, fid)
+            // A method only if `fn` actually follows the attrs. The reference
+            // reports "an attribute here applies to a method (`fn …`)" and builds
+            // NOTHING for stray attrs -- consuming them is the loop's progress --
+            // so committing to `parse_fn` here fabricated a method node the
+            // reference does not have (differential item fuzz, the struct-member
+            // sibling of this fix). Unlike a struct body there is no field path
+            // to fall into: an impl body holds only methods.
+            if cur_kind(p) == 7 {
+                let fid: i32 = parse_fn(p, 0, mattr_start, mattr_count)
+                push(i32, mt, fid)
+            }
         }
         else { bump(p) }                            // error recovery
     }
@@ -3095,8 +3199,11 @@ fn parse_extern(mut p: Parser, is_pub: i32) -> i32 {
     var abis: i32 = 0 - 1  var abie: i32 = 0 - 1   // abi inner span (-1 => default "c")
     if cur_kind(p) == 3 { let at: Token = cur_tok(p)  abis = (at.start + 1) as i32  abie = (at.end - 1) as i32  bump(p) }
     if cur_kind(p) == 7 { bump(p) }                // `fn`
-    var ns: usize = start  var ne: usize = start
-    if cur_kind(p) == 0 { let nt: Token = cur_tok(p)  ns = nt.start  ne = nt.end  bump(p) }
+    // `eat_ident`: the offending token's span when the name is absent.
+    let idn14: Token = cur_tok(p)
+    var ns: usize = idn14.start
+    var ne: usize = idn14.end
+    if cur_kind(p) == 0 { bump(p) }
     if cur_kind(p) == 63 { bump(p) }               // `(`
     let param_start: i32 = parse_params_into_iar(p)
     let param_count: i32 = ((len(i32, p.iar) as i32) - param_start) / 7
@@ -3375,8 +3482,11 @@ fn parse_type(mut p: Parser) -> i32 {
         bump(p)
         if cur_kind(p) == 67 {                     // `[r]` region tag
             bump(p)
-            var rs: usize = start  var re: usize = start
-            if cur_kind(p) == 0 { let rt: Token = cur_tok(p)  rs = rt.start  re = rt.end  bump(p) }
+            // `eat_ident`: the offending token's span when the name is absent.
+            let idn15: Token = cur_tok(p)
+            var rs: usize = idn15.start
+            var re: usize = idn15.end
+            if cur_kind(p) == 0 { bump(p) }
             if cur_kind(p) == 68 { bump(p) }       // `]`
             let inner: i32 = parse_type(p)
             return mk_ty_regionref(p, start, node_ty_end(p, inner), rs, re, inner)
@@ -4049,7 +4159,11 @@ fn dump_attrs(read src: str, read p: Parser, attr_start: i32, attr_count: i32) {
         let ne: usize = get(i32, p.aar, (base + 1) as usize) as usize
         let arg_start: i32 = get(i32, p.aar, (base + 2) as usize)
         let arg_count: i32 = get(i32, p.aar, (base + 3) as usize)
-        print_str("(") print_str("attr") print_str(src[ns..ne]) print_int(arg_count as i64)
+        print_str("(") print_str("attr")
+        // An empty name span marks a missing attribute name (see parse_attrs);
+        // mirror the reference's fabricated `<error>` ident.
+        if ne == ns { print_str("<error>") } else { print_str(src[ns..ne]) }
+        print_int(arg_count as i64)
         var j: i32 = 0
         for j < arg_count {
             let arg: i32 = get(i32, p.aar, (arg_start + j) as usize)
