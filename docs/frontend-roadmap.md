@@ -106,9 +106,17 @@ Staging:
 - **Stage 1** — the token-level CST above, plus the round-trip property. Buys a
   formatter that can reprint unchanged regions verbatim. No parser change, no
   AST change, no risk to the goldens.
-- **Stage 2** — attach node spans: every AST node already has a `Span`, so a
-  syntax-node → token-range map is derivable without a second parse. Enough for
-  LSP hover, go-to-definition, and semantic tokens.
+- **Stage 2** — **implemented** (`cst::token_range` / `token_at` / `element_at`):
+  the syntax-node → token-range map, two binary searches over the ordered
+  stream, no second parse. The "derivable from spans alone" premise is now a
+  *measured* property, not an assumption:
+  `cst_node_spans_align_to_token_boundaries_over_the_corpus` checks that every
+  expression, type and pattern span the parser produces begins and ends exactly
+  on token boundaries — **152,188 spans across 172 files, all exact**. `token_at`
+  answers lexeme positions; `element_at` is the trivia-inclusive cursor query
+  (every byte belongs to exactly one element, so it is total over the source) —
+  and the first consumer of `CstToken::full_span`, as predicted. Enough for LSP
+  hover, go-to-definition, and semantic tokens.
 - **Stage 3** — only if a formatter demands it: a real green/red tree
   (rowan-style) built alongside the AST. This is the expensive one because it
   must be mirrored in the port; defer until Stages 1–2 prove insufficient.

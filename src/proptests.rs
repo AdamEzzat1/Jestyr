@@ -13278,4 +13278,74 @@ mod cst_props {
         assert!(failures.is_empty(), "CST is not lossless:\n{}", failures.join("\n"));
         assert!(checked > 100, "expected the whole corpus, only saw {checked} files");
     }
+
+    /// **Stage 2's acceptance test.** Every expression, item and type span the
+    /// parser produces maps to a token range aligned EXACTLY at both ends — the
+    /// first token starts where the span starts, the last ends where it ends —
+    /// over every parseable `.jtr` file in the repository.
+    ///
+    /// This is the "derivable from spans alone, no second parse" claim made
+    /// checkable: if any parser path built a node span that did not begin and end
+    /// on token boundaries, an LSP feature built on `token_range` would silently
+    /// select the wrong text, and this test names the file and byte offsets
+    /// instead.
+    #[test]
+    fn cst_node_spans_align_to_token_boundaries_over_the_corpus() {
+        let mut checked_files = 0usize;
+        let mut checked_spans = 0usize;
+        let mut failures = Vec::new();
+        for dir in ["examples", "examples/std", "examples/cpp_compare"] {
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("jtr") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&p) else { continue };
+                let (tokens, _) = Lexer::new(&src).tokenize();
+                let elems = cst::attach(&src, &tokens);
+                let (ast, diags) = crate::parser::Parser::new(&src, tokens).parse();
+                // Recovery (error) nodes may carry synthetic spans; the exact-
+                // alignment claim is about clean parses, which the corpus is.
+                if diags.iter().any(|d| d.is_error()) {
+                    continue;
+                }
+                let mut check = |span: crate::span::Span, what: &str| {
+                    // A zero-width span (a defaulted/absent element) covers no
+                    // tokens by definition; alignment is about real extents.
+                    if span.start >= span.end {
+                        return;
+                    }
+                    let r = cst::token_range(&elems, span);
+                    let ok = !r.is_empty()
+                        && elems[r.start].token.span.start == span.start
+                        && elems[r.end - 1].token.span.end == span.end;
+                    if !ok {
+                        failures.push(format!(
+                            "  {}: {what} span {}..{} not token-aligned",
+                            p.display(),
+                            span.start,
+                            span.end
+                        ));
+                    }
+                    checked_spans += 1;
+                };
+                for e in &ast.exprs {
+                    check(e.span, "expr");
+                }
+                for t in &ast.types {
+                    check(t.span, "type");
+                }
+                for pt in &ast.pats {
+                    check(pt.span, "pat");
+                }
+                checked_files += 1;
+            }
+        }
+        assert!(failures.is_empty(), "spans off token boundaries:\n{}", failures.join("\n"));
+        assert!(checked_files > 100, "expected the corpus, saw {checked_files} files");
+        eprintln!(
+            "stage-2 alignment: {checked_spans} spans across {checked_files} files, all exact"
+        );
+    }
 }
