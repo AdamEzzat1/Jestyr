@@ -456,6 +456,7 @@ impl<'src> Parser<'src> {
         if !self.eat(LBracket) {
             return gs;
         }
+        let open_bracket = self.prev_span();
         while !self.at(RBracket) && !self.at(Eof) {
             let before = self.pos;
             let name = self.eat_ident("type parameter");
@@ -468,7 +469,7 @@ impl<'src> Parser<'src> {
                 break;
             }
         }
-        self.expect(RBracket, "`]`");
+        self.expect_close(RBracket, "`]`", open_bracket);
         gs
     }
 
@@ -652,8 +653,9 @@ impl<'src> Parser<'src> {
             // One type per name; the whole-program agreement check lives in
             // typeck, where types can be lowered and compared.
             let payload = if self.eat(LParen) {
+                let open_paren = self.prev_span();
                 let t = self.parse_type();
-                self.expect(RParen, "`)`");
+                self.expect_close(RParen, "`)`", open_paren);
                 Some(t)
             } else {
                 None
@@ -678,13 +680,14 @@ impl<'src> Parser<'src> {
         // Optional generic parameters: `enum Option(T, E) { … }`.
         let mut type_params = Vec::new();
         if self.eat(LParen) {
+            let open_paren = self.prev_span();
             while !self.at(RParen) && !self.at(Eof) {
                 type_params.push(self.eat_ident("type parameter"));
                 if !self.eat(Comma) {
                     break;
                 }
             }
-            self.expect(RParen, "`)`");
+            self.expect_close(RParen, "`)`", open_paren);
         }
         let open_brace = self.cur().span;
         self.expect(LBrace, "`{`");
@@ -695,6 +698,7 @@ impl<'src> Parser<'src> {
             let vname = self.eat_ident("variant name");
             let mut fields = Vec::new();
             if self.eat(LParen) {
+                let open_paren = self.prev_span();
                 while !self.at(RParen) && !self.at(Eof) {
                     let fname = self.eat_ident("field name");
                     self.expect(Colon, "`:`");
@@ -704,7 +708,7 @@ impl<'src> Parser<'src> {
                         break;
                     }
                 }
-                self.expect(RParen, "`)`");
+                self.expect_close(RParen, "`)`", open_paren);
             }
             // Optional explicit discriminant: `red = 1`.
             let discriminant = if self.eat(Eq) {
@@ -807,13 +811,14 @@ impl<'src> Parser<'src> {
             let name = self.eat_ident("attribute name");
             let mut args = Vec::new();
             if self.eat(LParen) {
+                let open_paren = self.prev_span();
                 while !self.at(RParen) && !self.at(Eof) {
                     args.push(self.parse_expr());
                     if !self.eat(Comma) {
                         break;
                     }
                 }
-                self.expect(RParen, "`)`");
+                self.expect_close(RParen, "`)`", open_paren);
             }
             attrs.push(Attribute { name: name.name, args, span: start.to(self.prev_span()) });
         }
@@ -953,7 +958,7 @@ impl<'src> Parser<'src> {
                 } else {
                     // `[N]T` — a fixed-size array. `N` is a constant expression.
                     let len = self.parse_expr();
-                    self.expect(RBracket, "`]`");
+                    self.expect_close(RBracket, "`]`", start);
                     let elem = self.parse_type();
                     let span = start.to(self.ast.type_at(elem).span);
                     self.ast.ty(TypeKind::Array { len, elem }, span)
@@ -962,9 +967,10 @@ impl<'src> Parser<'src> {
             Amp => {
                 self.bump();
                 if self.eat(LBracket) {
+                    let open_bracket = self.prev_span();
                     // `&[r]T` — a zero-cost region reference tagged with region `r`
                     let region = self.eat_ident("region name");
-                    self.expect(RBracket, "`]`");
+                    self.expect_close(RBracket, "`]`", open_bracket);
                     let inner = self.parse_type();
                     let span = start.to(self.ast.type_at(inner).span);
                     self.ast.ty(TypeKind::RegionRef { region, inner }, span)
@@ -984,6 +990,7 @@ impl<'src> Parser<'src> {
                     self.bump();
                     let name = self.eat_ident("type name");
                     let args = if self.at(LParen) {
+                        let open_paren = self.cur().span;
                         self.bump();
                         let mut args = Vec::new();
                         while !self.at(RParen) && !self.at(Eof) {
@@ -992,7 +999,7 @@ impl<'src> Parser<'src> {
                                 break;
                             }
                         }
-                        self.expect(RParen, "`)`");
+                        self.expect_close(RParen, "`)`", open_paren);
                         args
                     } else {
                         Vec::new()
@@ -1002,6 +1009,7 @@ impl<'src> Parser<'src> {
                 }
                 // type application: `List(i32)`
                 if self.at(LParen) {
+                    let open_paren = self.cur().span;
                     self.bump();
                     let mut args = Vec::new();
                     while !self.at(RParen) && !self.at(Eof) {
@@ -1011,7 +1019,7 @@ impl<'src> Parser<'src> {
                         }
                     }
                     let end = self.cur().span;
-                    self.expect(RParen, "`)`");
+                    self.expect_close(RParen, "`)`", open_paren);
                     return self.ast.ty(TypeKind::App { ctor: id, args }, t.span.to(end));
                 }
                 self.ast.ty(TypeKind::Name(id), t.span)
@@ -1033,6 +1041,7 @@ impl<'src> Parser<'src> {
             // This is a *type*, not a declaration: parameters have no names.
             Fn => {
                 self.bump(); // `fn`
+                let open_paren = self.cur().span;
                 self.expect(LParen, "`(`");
                 let mut params = Vec::new();
                 while !self.at(RParen) && !self.at(Eof) {
@@ -1047,7 +1056,7 @@ impl<'src> Parser<'src> {
                         break;
                     }
                 }
-                self.expect(RParen, "`)`");
+                self.expect_close(RParen, "`)`", open_paren);
                 let mut ret_conv = Conv::Default;
                 let mut ret = None;
                 if self.eat(Arrow) {
@@ -1388,6 +1397,7 @@ impl<'src> Parser<'src> {
             }
             match self.cur().kind {
                 LParen => {
+                    let open_paren = self.cur().span;
                     self.bump();
                     let saved = self.no_struct;
                     self.no_struct = false;
@@ -1399,7 +1409,7 @@ impl<'src> Parser<'src> {
                         }
                     }
                     let end = self.cur().span;
-                    self.expect(RParen, "`)`");
+                    self.expect_close(RParen, "`)`", open_paren);
                     self.no_struct = saved;
                     // generic struct literal: `Name(typeargs){ fields }`
                     let name_info = match &self.ast.expr_at(e).kind {
@@ -1415,12 +1425,13 @@ impl<'src> Parser<'src> {
                     e = self.ast.expr(ExprKind::Call { callee: e, args }, span);
                 }
                 LBracket => {
+                    let open_bracket = self.cur().span;
                     self.bump();
                     let saved = self.no_struct;
                     self.no_struct = false;
                     let index = self.parse_expr();
                     let end = self.cur().span;
-                    self.expect(RBracket, "`]`");
+                    self.expect_close(RBracket, "`]`", open_bracket);
                     self.no_struct = saved;
                     let span = self.ast.expr_at(e).span.to(end);
                     e = self.ast.expr(ExprKind::Index { base: e, index }, span);
@@ -1547,15 +1558,16 @@ impl<'src> Parser<'src> {
                 };
                 self.no_struct = saved;
                 let end = self.cur().span;
-                self.expect(RBracket, "`]`");
+                self.expect_close(RBracket, "`]`", span);
                 self.ast.expr(node, span.to(end))
             }
             LParen => {
+                let open_paren = self.cur().span;
                 self.bump();
                 let saved = self.no_struct;
                 self.no_struct = false;
                 let inner = self.parse_expr();
-                self.expect(RParen, "`)`");
+                self.expect_close(RParen, "`)`", open_paren);
                 self.no_struct = saved;
                 inner // grouping: postfix continues on the inner expression
             }
@@ -1618,6 +1630,7 @@ impl<'src> Parser<'src> {
 
     fn parse_struct_lit(&mut self, path: Ident) -> ExprId {
         let start = path.span;
+        let open_brace = self.cur().span;
         self.expect(LBrace, "`{`");
         let saved = self.no_struct;
         self.no_struct = false;
@@ -1644,12 +1657,13 @@ impl<'src> Parser<'src> {
             }
         }
         let end = self.cur().span;
-        self.expect(RBrace, "`}`");
+        self.expect_close(RBrace, "`}`", open_brace);
         self.no_struct = saved;
         self.ast.expr(ExprKind::StructLit { path, fields, spread }, start.to(end))
     }
 
     fn parse_gen_struct_lit(&mut self, ctor: Ident, type_args: Vec<ExprId>, start: Span) -> ExprId {
+        let open_brace = self.cur().span;
         self.expect(LBrace, "`{`");
         let saved = self.no_struct;
         self.no_struct = false;
@@ -1668,7 +1682,7 @@ impl<'src> Parser<'src> {
             }
         }
         let end = self.cur().span;
-        self.expect(RBrace, "`}`");
+        self.expect_close(RBrace, "`}`", open_brace);
         self.no_struct = saved;
         self.ast.expr(ExprKind::GenStructLit { ctor, type_args, fields }, start.to(end))
     }
@@ -1730,6 +1744,7 @@ impl<'src> Parser<'src> {
     fn parse_select(&mut self) -> ExprId {
         let start = self.cur().span;
         self.expect(Select, "`select`");
+        let open_brace = self.cur().span;
         self.expect(LBrace, "`{`");
         let mut arms = Vec::new();
         while !self.at(RBrace) && !self.at(Eof) {
@@ -1738,19 +1753,20 @@ impl<'src> Parser<'src> {
             } else {
                 self.error(self.cur().span, "expected `recv(<channel>)` to start a `select` arm");
             }
+            let arm_paren = self.cur().span;
             self.expect(LParen, "`(`");
             let saved = self.no_struct;
             self.no_struct = false;
             let chan = self.parse_expr();
             self.no_struct = saved;
-            self.expect(RParen, "`)`");
+            self.expect_close(RParen, "`)`", arm_paren);
             self.expect(FatArrow, "`=>`");
             let bind = self.eat_ident("the received-value binding");
             let body = self.parse_block();
             arms.push(SelectArm { chan, bind, body });
         }
         let end = self.cur().span;
-        self.expect(RBrace, "`}`");
+        self.expect_close(RBrace, "`}`", open_brace);
         self.ast.expr(ExprKind::Select(arms), start.to(end))
     }
 
@@ -1784,14 +1800,16 @@ impl<'src> Parser<'src> {
         } else {
             self.error(self.cur().span, "expected `reduce(<reduction>)` after the `par for` iterable");
         }
+        let open_paren = self.cur().span;
         self.expect(LParen, "`(`");
         let reduction = self.parse_expr();
-        self.expect(RParen, "`)`");
+        self.expect_close(RParen, "`)`", open_paren);
         // Body: a single map expression in braces.
+        let open_brace = self.cur().span;
         self.expect(LBrace, "`{`");
         let body = self.parse_expr();
         let end = self.cur().span;
-        self.expect(RBrace, "`}`");
+        self.expect_close(RBrace, "`}`", open_brace);
         let span = start.to(end);
         self.ast.expr(ExprKind::ParFor { var, iter, reduction, body }, span)
     }
@@ -2067,6 +2085,7 @@ impl<'src> Parser<'src> {
                 let name = self.ident(t);
                 if self.at(LBrace) {
                     // A struct-variant pattern `circle { r }` / `rect { w: 0.0, .. }`.
+                    let open_brace = self.cur().span;
                     self.bump();
                     let mut fields = Vec::new();
                     let mut has_rest = false;
@@ -2090,13 +2109,14 @@ impl<'src> Parser<'src> {
                         }
                     }
                     let end = self.cur().span;
-                    self.expect(RBrace, "`}`");
+                    self.expect_close(RBrace, "`}`", open_brace);
                     return self.ast.pat(
                         PatKind::StructVariant { name, fields, has_rest },
                         span.to(end),
                     );
                 }
                 if self.at(LParen) {
+                    let open_paren = self.cur().span;
                     self.bump();
                     let mut subpats = Vec::new();
                     while !self.at(RParen) && !self.at(Eof) {
@@ -2106,7 +2126,7 @@ impl<'src> Parser<'src> {
                         }
                     }
                     let end = self.cur().span;
-                    self.expect(RParen, "`)`");
+                    self.expect_close(RParen, "`)`", open_paren);
                     // `..` rest may only appear as the final field of a variant.
                     let n = subpats.len();
                     for (i, sp) in subpats.iter().enumerate() {
