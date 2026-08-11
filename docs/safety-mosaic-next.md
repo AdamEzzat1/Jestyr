@@ -111,11 +111,46 @@ must be *checked at runtime*, not assumed — otherwise the safe interface is a
 lie, and this becomes a way to manufacture overlapping `mut` slices without
 writing `unsafe`.
 
+**The design is validated, and it is BLOCKED on a compiler bug.** The shape below
+was prototyped and it type-checks and passes the escape checker unchanged —
+`mut []T` parameters and fn-pointer types carrying conventions (`fn(read T, read
+T) -> bool` already appears in `core.sl_sort`) both exist:
+
+```jestyr
+fn split_mut(mut xs: []i64, at: usize, f: fn(mut []i64, mut []i64)) {
+    var mid: usize = at
+    if mid > xs.len { mid = xs.len }          // the precondition, CHECKED
+    let lo: []i64 = unsafe { slice(i64, xs.ptr, mid) }
+    let hi: []i64 = unsafe { slice(i64, xs.ptr + mid, xs.len - mid) }
+    f(lo, hi)
+}
+```
+
+But the emitted C does not compile. **`cgen` emits fn-pointer typedefs before the
+slice typedefs they reference:**
+
+```c
+typedef void (*JestyrFn_fn_mslice_i64_mslice_i64_ret_unit)(JestyrSlice_i64*, …);
+typedef struct { int64_t* ptr; size_t len; } JestyrSlice_i64;   /* two lines LATER */
+```
+
+The ordering is deliberate for aggregates — `gen_forward_types` forward-declares
+structs and enums so a `JestyrFn_…` can name them — but a slice typedef is a
+typedef of an *anonymous* struct and cannot be forward-declared, so it must be
+*emitted* earlier instead. `slice_struct_defs` participates in the topological
+aggregate flush (`def_begin`), so this is not a one-line reorder, and it changes
+emitted C, so it owes a `cgen.jtr` mirror and a reseed.
+
+No corpus file hits it: it needs a fn-pointer type whose parameter is a slice,
+which nothing currently writes. **That bug is the real prerequisite for item 4**,
+and it is a self-contained cgen increment worth doing on its own.
+
 **Staging.**
 
+0. **Fix the fn-pointer/slice typedef ordering in `cgen`** (both toolchains).
+   Prerequisite for everything below.
 1. Library-only, sequential: `split_mut` + tests that both halves are writable
-   and the writes land in the right elements. No compiler change, no port
-   mirror.
+   and the writes land in the right elements. No further compiler change.
 2. Parallel: hand the halves to two tasks. This is where the value is, and where
    `spawn`'s non-generic limit bites — expect an i32/i64-only first version.
 3. Only if 1–2 prove the shape: consider whether the checker should *know* about

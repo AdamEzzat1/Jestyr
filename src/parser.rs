@@ -404,9 +404,10 @@ impl<'src> Parser<'src> {
         self.expect(Fn, "`fn`");
         let name = self.eat_ident("function name");
         let generics = self.parse_generics(); // optional `[T: Add, U]`
+        let open_paren = self.cur().span;
         self.expect(LParen, "`(`");
         let params = self.parse_params();
-        self.expect(RParen, "`)`");
+        self.expect_close(RParen, "`)`", open_paren);
 
         let mut ret_conv = Conv::Default;
         let mut ret_ty = None;
@@ -501,9 +502,10 @@ impl<'src> Parser<'src> {
         let start = self.cur().span;
         self.expect(Fn, "`fn`");
         let name = self.eat_ident("method name");
+        let open_paren = self.cur().span;
         self.expect(LParen, "`(`");
         let params = self.parse_params();
-        self.expect(RParen, "`)`");
+        self.expect_close(RParen, "`)`", open_paren);
         let mut ret_conv = Conv::Default;
         let mut ret_ty = None;
         if self.eat(Arrow) {
@@ -534,6 +536,7 @@ impl<'src> Parser<'src> {
         let trait_name = self.eat_ident("trait name");
         self.expect(For, "`for`");
         let ty = self.parse_type();
+        let open_brace = self.cur().span;
         self.expect(LBrace, "`{`");
         let mut methods = Vec::new();
         while !self.at(RBrace) && !self.at(Eof) {
@@ -553,7 +556,7 @@ impl<'src> Parser<'src> {
             }
         }
         let end = self.cur().span;
-        self.expect(RBrace, "`}`");
+        self.expect_close(RBrace, "`}`", open_brace);
         ImplDecl { generics, trait_name, ty, methods, span: start.to(end) }
     }
 
@@ -570,9 +573,10 @@ impl<'src> Parser<'src> {
         };
         self.expect(Fn, "`fn`");
         let name = self.eat_ident("function name");
+        let open_paren = self.cur().span;
         self.expect(LParen, "`(`");
         let params = self.parse_params();
-        self.expect(RParen, "`)`");
+        self.expect_close(RParen, "`)`", open_paren);
 
         let mut ret_conv = Conv::Default;
         let mut ret_ty = None;
@@ -638,6 +642,7 @@ impl<'src> Parser<'src> {
     fn parse_error_set(&mut self) -> ErrorSet {
         let start = self.cur().span;
         self.expect(Bang, "`!`");
+        let open_brace = self.cur().span;
         self.expect(LBrace, "`{`");
         let mut names = Vec::new();
         while !self.at(RBrace) && !self.at(Eof) {
@@ -662,7 +667,7 @@ impl<'src> Parser<'src> {
             }
         }
         let end = self.cur().span;
-        self.expect(RBrace, "`}`");
+        self.expect_close(RBrace, "`}`", open_brace);
         ErrorSet { names, span: start.to(end) }
     }
 
@@ -681,6 +686,7 @@ impl<'src> Parser<'src> {
             }
             self.expect(RParen, "`)`");
         }
+        let open_brace = self.cur().span;
         self.expect(LBrace, "`{`");
         let mut variants = Vec::new();
         while !self.at(RBrace) && !self.at(Eof) {
@@ -724,7 +730,7 @@ impl<'src> Parser<'src> {
             }
         }
         let end = self.cur().span;
-        self.expect(RBrace, "`}`");
+        self.expect_close(RBrace, "`}`", open_brace);
         EnumDecl { is_pub: false, name, type_params, variants, span: start.to(end) }
     }
 
@@ -830,6 +836,7 @@ impl<'src> Parser<'src> {
 
     fn parse_struct_body(&mut self) -> StructBody {
         let start = self.cur().span;
+        let open_brace = self.cur().span;
         self.expect(LBrace, "`{`");
         let mut members = Vec::new();
         while !self.at(RBrace) && !self.at(Eof) {
@@ -900,7 +907,7 @@ impl<'src> Parser<'src> {
             }
         }
         let end = self.cur().span;
-        self.expect(RBrace, "`}`");
+        self.expect_close(RBrace, "`}`", open_brace);
         StructBody { members, span: start.to(end) }
     }
 
@@ -3077,6 +3084,17 @@ mod tests {
             // (source, expected opener line, expected opener column)
             ("fn f() -> i32 {\n    let a = 1\n    return a\n", 1, 15),
             ("trait T {\n    fn g() -> i32\n", 1, 9),
+            // The item bodies. An unclosed one of these is the case where the
+            // opener is furthest from the detection point — a whole type
+            // declaration away — so it is where naming the opener earns the most.
+            ("struct S {\n    a: i32\n\nfn f() {}\n", 1, 10),
+            ("enum E {\n    red,\n    green\n\nfn f() {}\n", 1, 8),
+            ("impl T for S {\n    fn g() {}\n", 1, 14),
+            ("fn f() -> i32 !{ Bad\n", 1, 16),
+            // A signature's parameter list — `(` rather than `{`, and the one case
+            // where the detection point is on the *same* line as the opener, so the
+            // help has to earn its place by naming the delimiter rather than the line.
+            ("fn f(a: i32, b: i32 {\n    return a\n}\n", 1, 5),
         ];
         for (src, line, col) in cases {
             let (_ast, diags) = parse(src);

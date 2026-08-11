@@ -94,12 +94,17 @@ emitted C owes the full two-sided tax (Part 3). Do not start these before 1.1.
 
 ### 1.4 Diagnostics remainder (low risk, no mirror owed)
 
-`Parser::expect_close` (done) keeps the message identical and adds a `help:` line
-naming the opener. Wired into **block, `trait` and `match`** bodies only.
+`Parser::expect_close` keeps the message identical and adds a `help:` line naming
+the opener. Wired into block, `trait`, `match`, **struct, enum and `impl` bodies,
+error sets, and all three function-signature parameter lists**.
 
-- ~28 other `expect(RBrace/RParen/RBracket)` sites are the same mechanical change.
-  Deliberately **not** swept: a 31-site sweep is the kind of change that looks
-  safe and isn't. Convert them as they are touched.
+- **22** `expect(RBrace/RParen/RBracket)` sites remain, down from ~28. Still
+  deliberately **not** swept: each conversion needs the opener's span in scope at
+  the matching close, so it means reading the pairing at every site rather than
+  matching a pattern. Convert them as they are touched.
+- The converted set was chosen by where the opener is *furthest* from the
+  detection point — an unclosed item body puts the mistake a whole declaration
+  away, which is where `expected `}`, found `<eof>`` is least useful.
 - Still unstarted from `docs/frontend-roadmap.md` §4: construct context in the
   message ("expected `}` to close this struct body"); item-keyword
   synchronization in `parse_module`'s recovery (the cascade-budget test is the
