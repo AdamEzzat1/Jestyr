@@ -62,6 +62,7 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
         cur_ret: None,
         cur_errs: None,
         err_payloads: std::collections::BTreeMap::new(),
+        cur_type_fn: None,
         diags: Vec::new(),
     };
     tc.build_table();
@@ -233,6 +234,15 @@ struct TypeChecker<'a> {
     /// Whole-program by decision D1: every declaring site must agree, checked in
     /// [`Checker::collect_err_payloads`]. Only payload-carrying names appear.
     err_payloads: std::collections::BTreeMap<String, Ty>,
+    /// The enclosing **comptime type-fn** while its body is being checked — the
+    /// (canonical ctor name, comptime type-param names) of `fn Box(comptime T:
+    /// type) -> type { … }`. This is what lets the `return struct { … }` arm type
+    /// a ctor-body method's `self` as the real generic-struct type
+    /// (`Box(T)` with `T` opaque) rather than an opaque `Self` — so `self.field`
+    /// resolves through the template and the escape checker judges it precisely
+    /// instead of refusing via the `Unknown` finalization. `None` outside a
+    /// type-fn, where an anonymous `struct { … }` keeps the `Self` placeholder.
+    cur_type_fn: Option<(String, Vec<String>)>,
     diags: Vec<Diagnostic>,
 }
 
@@ -2305,7 +2315,16 @@ impl<'a> TypeChecker<'a> {
         for (i, item) in ast.items.iter().enumerate() {
             self.cur_mod = *self.modules.item_mod.get(i).unwrap_or(&0);
             match item {
-                Item::Fn(f) => self.check_fn(f, &empty, &Ty::Unit),
+                Item::Fn(f) => {
+                    // Entering a comptime type-fn: record its canonical name and
+                    // type params so the `return struct { … }` arm can type its
+                    // methods' `self` as the real generic-struct type.
+                    self.cur_type_fn = self.ctor_struct_body(f).is_some().then(|| {
+                        (self.canon_cur(&f.name.name), self.comptime_tp_names(f))
+                    });
+                    self.check_fn(f, &empty, &Ty::Unit);
+                    self.cur_type_fn = None;
+                }
                 Item::Struct { name, body, .. } => {
                     let self_ty = self
                         .table
@@ -3148,9 +3167,22 @@ impl<'a> TypeChecker<'a> {
                 Ty::GenStruct { ctor: ckey, args }
             }
             ExprKind::StructType(body) => {
+                // Inside a comptime type-fn, a ctor-body method's `self` is the
+                // REAL generic-struct type (`Box(T)`, `T` opaque) — so
+                // `self.field` resolves through the template via
+                // `gen_struct_field_decl_ty`, and the escape checker judges it by
+                // its actual type instead of refusing an `Unknown`. An anonymous
+                // `struct { … }` outside a type-fn keeps the `Self` placeholder.
+                let struct_self = match &self.cur_type_fn {
+                    Some((ctor, tps)) => Ty::GenStruct {
+                        ctor: ctor.clone(),
+                        args: tps.iter().map(|t| Ty::Opaque(t.clone())).collect(),
+                    },
+                    None => Ty::Opaque("Self".to_string()),
+                };
                 for m in &body.members {
                     if let StructMember::Method(f) = m {
-                        self.check_fn(f, typ, &Ty::Opaque("Self".to_string()));
+                        self.check_fn(f, typ, &struct_self);
                     }
                 }
                 Ty::TypeKw
@@ -5804,6 +5836,59 @@ mod tests {
             .find_map(|(i, e)| matches!(e.kind, ExprKind::Closure { .. }).then_some(ExprId(i as u32)))
             .expect("the closure");
         assert!(matches!(info.type_of(clo), Ty::Opaque(s) if s == "closure"));
+    }
+
+    /// A generic-struct ctor-body method's `self` is the REAL instance type
+    /// (`Box(T)`, `T` opaque), not an opaque `Self` — so `self.field` resolves
+    /// through the template. This superseded the `Unknown` finalization's refusal
+    /// of these methods: with `self` typed, the escape checker judges a by-value
+    /// field return by the ordinary conservative rule (`T` may be non-`Copy`)
+    /// with its actionable message, and the corpus-wide borrow-return idiom
+    /// (`-> read T`) checks cleanly on its merits.
+    #[test]
+    fn a_ctor_body_method_types_self_as_the_generic_struct() {
+        let src = "fn Box(comptime T: type) -> type { \
+                       return struct { v: T  fn get(read self) -> read T { self.v } } \
+                   } \
+                   fn main() -> i32 { let a: Box(i32) = Box(i32){ v: 7 } return 0 }";
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (ast, _diags) = crate::parser::Parser::new(src, tokens).parse();
+        let (info, diags) = check(&ast);
+        assert!(diags.iter().all(|d| !d.is_error()), "clean: {diags:?}");
+        let renders: Vec<String> = (0..ast.exprs.len())
+            .map(|i| info.type_of(ExprId(i as u32)).display(&info.table))
+            .collect();
+        assert!(renders.iter().any(|r| r == "Box(T)"), "self typed as the instance: {renders:?}");
+        assert!(
+            !renders.iter().any(|r| r == "Self"),
+            "no Self placeholder survives in a type-fn: {renders:?}"
+        );
+        assert!(
+            crate::escape::check(&ast, &info).iter().all(|d| !d.is_error()),
+            "borrow-return ctor-body method is clean"
+        );
+    }
+
+    /// The by-value form is still refused — but now by the ordinary conservative
+    /// escape rule with its actionable help, not by the `Unknown` finalization.
+    #[test]
+    fn a_ctor_body_method_by_value_field_return_gets_the_ordinary_message() {
+        let src = "fn Box(comptime T: type) -> type { \
+                       return struct { v: T  fn get(read self) -> T { self.v } } \
+                   } \
+                   fn main() -> i32 { return 0 }";
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (ast, _diags) = crate::parser::Parser::new(src, tokens).parse();
+        let (info, _d) = check(&ast);
+        let esc = crate::escape::check(&ast, &info);
+        assert!(
+            esc.iter().any(|d| d.message.contains("cannot return borrow")),
+            "the ordinary conservative rule: {esc:?}"
+        );
+        assert!(
+            !esc.iter().any(|d| d.message.contains("was never resolved")),
+            "not the Unknown finalization: {esc:?}"
+        );
     }
 
     #[test]

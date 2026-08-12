@@ -78,7 +78,7 @@ import "ctfe"
 // row) and `icalls` each impl-dispatched call (5-tuples: call ExprId, trait name span, method
 // name span) — the downstream passes' `method_calls`/`impl_calls` (the escape checker's
 // give-away and manual-drop rules read them).
-pub struct Checker { pub tys: List(TyData), pub tya: List(i32), pub et: List(i32), scn: List(i32), scst: List(i32), pub tdecl: List(i32), pub tch: List(i32), pub fns: List(i32), cst: List(i32), vmap: List(i32), tra: List(i32), imp: List(i32), pub mcalls: List(i32), pub icalls: List(i32), pub bcalls: List(i32), pub dcalls: List(i32), pub dcoerce: List(i32), pub epay: List(i32), pub tferr: List(i32), selfty: i32, expected: i32, curret: i32, scfloor: i32, gbs: i32, gbc: i32, alloc: Allocator }
+pub struct Checker { pub tys: List(TyData), pub tya: List(i32), pub et: List(i32), scn: List(i32), scst: List(i32), pub tdecl: List(i32), pub tch: List(i32), pub fns: List(i32), cst: List(i32), vmap: List(i32), tra: List(i32), imp: List(i32), pub mcalls: List(i32), pub icalls: List(i32), pub bcalls: List(i32), pub dcalls: List(i32), pub dcoerce: List(i32), pub epay: List(i32), pub tferr: List(i32), selfty: i32, expected: i32, curret: i32, scfloor: i32, gbs: i32, gbc: i32, ctsv: i32, alloc: Allocator }
 
 // One `Ty` arena node - kinds in the header comment. `a`/`b` are child TyIds or slice fields;
 // `x`/`y` are aux ints (prim code, name span, ret TyId/conv).
@@ -106,7 +106,7 @@ fn mk_ty(mut c: Checker, kind: i32, a: i32, b: i32, x: i32, y: i32) -> i32 {
 // The checker with the well-known instances pre-created (ids 0..7) and `et` sized to the
 // expression arena, all-Unknown.
 fn make_checker(read p: parser.Parser, read a: Allocator) -> Checker {
-    var c: Checker = Checker{ tys: list.make(TyData, a), tya: list.make(i32, a), et: list.make(i32, a), scn: list.make(i32, a), scst: list.make(i32, a), tdecl: list.make(i32, a), tch: list.make(i32, a), fns: list.make(i32, a), cst: list.make(i32, a), vmap: list.make(i32, a), tra: list.make(i32, a), imp: list.make(i32, a), mcalls: list.make(i32, a), icalls: list.make(i32, a), bcalls: list.make(i32, a), dcalls: list.make(i32, a), dcoerce: list.make(i32, a), epay: list.make(i32, a), tferr: list.make(i32, a), selfty: 1, expected: 0 - 1, curret: 0 - 1, scfloor: 0, gbs: 0 - 1, gbc: 0, alloc: a }
+    var c: Checker = Checker{ tys: list.make(TyData, a), tya: list.make(i32, a), et: list.make(i32, a), scn: list.make(i32, a), scst: list.make(i32, a), tdecl: list.make(i32, a), tch: list.make(i32, a), fns: list.make(i32, a), cst: list.make(i32, a), vmap: list.make(i32, a), tra: list.make(i32, a), imp: list.make(i32, a), mcalls: list.make(i32, a), icalls: list.make(i32, a), bcalls: list.make(i32, a), dcalls: list.make(i32, a), dcoerce: list.make(i32, a), epay: list.make(i32, a), tferr: list.make(i32, a), selfty: 1, expected: 0 - 1, curret: 0 - 1, scfloor: 0, gbs: 0 - 1, gbc: 0, ctsv: 0 - 1, alloc: a }
     mk_ty(c, 0, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 0 Unknown
     mk_ty(c, 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1)        // 1 Unit
     mk_ty(c, 2, 0 - 1, 0 - 1, 2, 0 - 1)            // 2 Prim i32   (code 2)
@@ -2230,7 +2230,11 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
         // parser stores interpolations as text, so there is nothing to visit. The golden
         // skips the reference's interpolation Names to compare the same stream.)
     } else if k == 36 {                            // struct-value: a type value; methods checked
-        let sv: i32 = mk_ty(c, 18, 0 - 1, 0 - 1, 1, 0 - 1)     // self = Opaque("Self")
+        // Inside a comptime type-fn, `self` is the REAL `Ctor(T...)` (precomputed
+        // by `arm_type_fn_self`), so `self.field` resolves through the template;
+        // an anonymous struct-value elsewhere keeps the `Self` placeholder.
+        var sv: i32 = c.ctsv
+        if sv < 0 { sv = mk_ty(c, 18, 0 - 1, 0 - 1, 1, 0 - 1) }   // self = Opaque("Self")
         infer_methods(c, p, src, d.x, d.y, sv)
         r = mk_ty(c, 14, 0 - 1, 0 - 1, 0 - 1, 0 - 1)   // TypeKw
     } else if k == 41 {                            // par-for: elem, var bound to the ELEMENT type
@@ -2599,13 +2603,65 @@ fn infer_methods(mut c: Checker, read p: parser.Parser, read src: str, mem_start
 // Walk the top-level items exactly as `check_items` does: infer function bodies (params in
 // scope), const values (a fresh empty scope), and struct-method bodies (self = the struct);
 // skip enum/distinct/extern/import and (crucially) impl/trait bodies.
+// Entering a comptime type-fn (a fn whose top-level body returns `struct { ... }`):
+// precompute the REAL self type for its ctor-body methods -- `Ctor(T...)` (kind 6)
+// with each comptime type param as an Opaque -- mirroring the reference's
+// `cur_type_fn` + the `struct_self` construction in its StructType arm. `c.ctsv`
+// stays -1 for every other fn, where an anonymous `struct { ... }` keeps the
+// `Self` placeholder. The ctor span is the FN NAME span, whose source text is
+// already canonical under the loader's collision renames.
+fn arm_type_fn_self(mut c: Checker, read p: parser.Parser, read src: str, read it: parser.ItemData) {
+    c.ctsv = 0 - 1
+    if it.w < 0 { return }
+    let b: parser.ExprData = list.get(parser.ExprData, p.ex, it.w as usize)
+    var node: i32 = 0 - 1
+    var i: i32 = 0
+    for i < b.y {
+        if node < 0 {
+            let sid: i32 = list.get(i32, p.sar, (b.x + i) as usize)
+            let st: parser.StmtData = list.get(parser.StmtData, p.st, sid as usize)
+            // A `return struct { ... }` or a tail `struct { ... }` expression --
+            // the same two stmt shapes `ctor_struct_body` accepts, first match.
+            if st.kind == 1 or st.kind == 2 {
+                if st.a >= 0 {
+                    let v: parser.ExprData = list.get(parser.ExprData, p.ex, st.a as usize)
+                    if v.kind == 36 { node = st.a }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if node < 0 { return }
+    let fr: i32 = find_fn(c, src, it.x, it.y)
+    if fr < 0 { return }
+    let ctps: i32 = list.get(i32, c.fns, (fr * 12 + 7) as usize)
+    let ctpc: i32 = list.get(i32, c.fns, (fr * 12 + 8) as usize)
+    // Opaque args buffered first, then appended contiguously to `tya` (the
+    // parser's buffered-then-appended discipline, so nested mk_ty never scatters
+    // the slice).
+    var tmp: List(i32) = list.make(i32, c.alloc)
+    var j: i32 = 0
+    for j < ctpc {
+        let ns2: i32 = list.get(i32, c.tch, (ctps + j * 3) as usize)
+        let ne2: i32 = list.get(i32, c.tch, (ctps + j * 3 + 1) as usize)
+        list.push(i32, tmp, mk_ty(c, 4, 0 - 1, 0 - 1, ns2, ne2))
+        j = j + 1
+    }
+    let astart: i32 = list.len(i32, c.tya) as i32
+    var j2: usize = 0
+    for j2 < list.len(i32, tmp) { list.push(i32, c.tya, list.get(i32, tmp, j2))  j2 = j2 + 1 }
+    c.ctsv = mk_ty(c, 6, astart, ctpc, it.x as i32, it.y as i32)
+}
+
 fn walk_items(mut c: Checker, read p: parser.Parser, read src: str) {
     var r: usize = 0
     for r < list.len(i32, p.roots) {
         let iid: i32 = list.get(i32, p.roots, r)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 3 {                          // Fn: self_ty = Unit
+            arm_type_fn_self(c, p, src, it)
             check_fn_item(c, p, src, it, t_unit())
+            c.ctsv = 0 - 1
         } else if it.kind == 2 {                   // Const -> value `b`, in a fresh scope
             push_scope(c)
             infer_opt(c, p, src, it.b)

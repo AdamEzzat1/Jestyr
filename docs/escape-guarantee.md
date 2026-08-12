@@ -106,19 +106,17 @@ access*, with a message about the field rather than about escape; the
 finalization would then stop firing for them. Until that exists, refusing
 is the sound behaviour.
 
-**One well-formed shape is refused too**: a generic-struct ctor-body
-method returning a field *by value* (`fn get(read self) -> T { self.v }`
-inside `fn Box(comptime T: type) -> type { return struct { … } }`). Those
-methods are currently checked with `self` typed only as an opaque `Self`,
-so `self.v` never resolves; the previously "working" acceptance flowed
-through exactly the hole this finalization closes. The corpus-wide idiom —
-returning the field as a borrow, `-> read T` — is unaffected, and matches
-how such a method must be written for a non-`Copy` `T` anyway (the same
-conservative rule that refuses `fn f[T](read x: T) -> T { x }`). The
-supersession is typing `self` as the real generic-struct type there, at
-which point this paragraph should be deleted.
+The one well-formed shape this gate briefly refused — a generic-struct
+ctor-body method returning a field by value — no longer reaches it: those
+methods now check with `self` typed as the **real** generic-struct
+instance (`Box(T)`, `T` opaque) rather than an opaque `Self`, so
+`self.field` resolves through the template. The by-value form is judged by
+the same conservative rule as every generic (`T` may be non-`Copy`, so
+`fn get(read self) -> T { self.v }` gets the ordinary "declare the return
+as `read`" message), and the corpus-wide borrow-return idiom (`-> read T`)
+checks cleanly on its merits rather than through a hole.
 
-If you hit this on other code you believe is well-formed, that is a
+If you hit this on code you believe is well-formed, that is a
 type-inference gap worth reporting — the message names the binding whose
 type is missing.
 

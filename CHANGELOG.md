@@ -33,27 +33,23 @@ versions are snapshots, not stability promises.
 
   No file in the 155-file corpus (which includes the self-hosted compiler)
   triggers this, and no corpus diagnostic changed — but out-of-corpus code can
-  newly fail. Most cases found are ill-formed code that had never been rejected:
-  a field access on an unbounded type parameter (`x.v` where `x: T`), a field
-  access on a primitive (`.w` on an `i32`), a genref field reached without
-  `.*`. **One well-formed shape is also refused**: a generic-struct ctor-body
-  method returning a field *by value* —
-
-  ```jestyr
-  fn Box(comptime T: type) -> type {
-      return struct { v: T  fn get(read self) -> read T { self.v } }  // fine
-      //                    fn get(read self) -> T { self.v }         // refused
-  }
-  ```
-
-  because such methods are checked with `self` typed only as an opaque `Self`,
-  so `self.v` never resolves. The by-value form was previously accepted through
-  the same hole this gate closes, and its instance-reality is the same rule as
-  ordinary generics (`fn f[T](read x: T) -> T { x }` is likewise refused —
-  `T` may be non-`Copy`). The borrow-return form, which the entire corpus uses,
-  is unaffected. The eventual fix is typing `self` as the real generic-struct
-  type in ctor-body methods. Rationale in
+  newly fail. Every case that reaches it is ill-formed code that had never been
+  rejected: a field access on an unbounded type parameter (`x.v` where `x: T`),
+  a field access on a primitive (`.w` on an `i32`), a genref field reached
+  without `.*`. (One well-formed shape briefly hit it — a generic-struct
+  ctor-body method returning a field by value — and is now handled properly
+  instead; see below.) Rationale in
   [docs/escape-guarantee.md](docs/escape-guarantee.md).
+
+- **Generic-struct ctor-body methods now type `self` as the real instance**
+  (`Box(T)` with `T` opaque) instead of an opaque `Self`, so `self.field`
+  resolves through the template. Consequence: returning a type-param field *by
+  value* (`fn get(read self) -> T { self.v }`) is judged by the same
+  conservative rule as every generic — refused with the ordinary "declare the
+  return as `read`" message, since `T` may be non-`Copy` — where it was
+  previously accepted through the exact typing hole the `Unknown` finalization
+  closes. The borrow-return idiom (`-> read T`), used throughout the corpus, is
+  unaffected; no corpus file changes its diagnostics or its emitted C.
 
 ### Fixed
 
