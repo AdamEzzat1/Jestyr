@@ -214,13 +214,41 @@ Staged, each stage gated on byte-identical C over the corpus:
   became `check_dyn_coercion`, which is what it does (it also *errors* when the
   concrete type doesn't implement the trait); the name now belongs to the
   one-line field writer.
-- **Stage 2.** Move *desugaring* into HIR construction — the rewrites all three
-  back passes currently repeat or assume: `while`/`loop` → `for` (already done in
-  the parser), block-led vs expression forms, compound assignment, `?`
-  propagation. One construct per commit, each proven by the corpus.
-- **Stage 3.** Point `escape.rs` at HIR. It is the smallest consumer and the one
-  whose invariants are clearest.
-- **Stage 4.** Point `cgen.rs` at HIR, one node kind at a time.
+- **Stage 2 — CLOSED EMPTY, measured.** Every candidate on the original list
+  evaporated on contact: `while`/`loop` are already parser-desugared; compound
+  assignment lowers to C's compound operators directly (no desugar exists);
+  block-led forms are a parser decision; `?`'s ok-type is `type_of(base)` —
+  cgen already consumes the recorded type. The two candidates found by reading
+  (the tail-as-return rewrite, `?` propagation) also failed the test: tail-as-
+  return's "decision" is `i+1==n && ret` — two locals, duplicated only as two
+  identical blocks within cgen itself (the port has one `emit_body`), so
+  recording it would add indirection without removing a re-derivation. After
+  Stages 0–1 and Stage 3, **no desugaring remains that typeck knows and a back
+  pass re-derives**. That is a finding, not a failure: the parser desugars
+  syntax, typeck records resolutions and types, and what the back passes still
+  read from the AST is either lexical fact or emission structure.
+- **Stage 3 — DONE.** `escape.rs` consumes every recorded decision through the
+  Stage-1 accessors plus `resolved_call_target` (`qualified` ∪ `call_sym`); its
+  remaining AST reads are all lexical facts (closure shape and captures, place
+  structure, region-intrinsic names, pattern binding, spans) — the decision
+  test, written down: *does typeck already know the answer?* Record/consume if
+  yes; lexical facts stay AST reads forever. The consolidation was not
+  hygiene: three of the hand-rolled resolution chains hid soundness holes
+  (a borrow `take`n through a within-module call to a colliding name; the
+  mut-slice race check skipped for a *qualified* spawn target; a canon-blind
+  `find_fn`). The port had none of them — its loader renames collisions in the
+  source text, so its bare spelling is already canonical; the reference
+  converged on the port.
+- **Stage 4 — the audit that remains (optional, no known holes).** cgen's
+  recorded-decision reads all flow through single accessors now (the last
+  hand-rolled chain, `mark_free_arg_takes`, was converted with a byte-identity
+  gate; its missing `call_sym` half was compensated by `collect_moved`, so the
+  conversion is idempotent — verified on the collision fixture, no double
+  drop). What remains of "point cgen at HIR" is a standing audit method, not a
+  migration: for any cgen change, ask the Stage-3 question first, and prefer
+  the accessor over the AST wherever typeck already answered. cgen's remaining
+  AST reads are emission-structural — it must see syntax to emit C — and
+  wholesale conversion would churn golden-sensitive code for no semantic gain.
 
 **What stays in the AST, permanently:** anything the printer, the doc generator,
 `attest`'s signature reconstruction, or the grammar goldens need — those are

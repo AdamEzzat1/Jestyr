@@ -2891,14 +2891,19 @@ impl<'a> Cgen<'a> {
             }
             return;
         }
-        // A free or module-qualified call: args align 1:1 with the params.
-        let fname = if let Some(q) = self.info.qualified(call_id) {
-            Some(q.to_string())
-        } else if let ExprKind::Name(n) = &self.ast.expr_at(callee).kind {
-            Some(n.name.clone())
-        } else {
-            None
-        };
+        // A free or module-qualified call: args align 1:1 with the params. The
+        // RECORDED resolution (`qualified` for `m.f(…)`, `call_sym` for a bare
+        // call to a colliding name) with the bare spelling as the fallback —
+        // the same chain the escape checker consolidated (Stage 3). The
+        // `call_sym` half is new here; for the colliding-bare shape the move
+        // was already compensated by `collect_moved`, so marking it here too is
+        // idempotent — and the lookup now agrees with `find_fn`'s canon keys.
+        let fname = self.info.resolved_call_target(call_id).map(String::from).or_else(|| {
+            match &self.ast.expr_at(callee).kind {
+                ExprKind::Name(n) => Some(n.name.clone()),
+                _ => None,
+            }
+        });
         if let Some(f) = fname.and_then(|n| self.find_fn(&n)) {
             self.mark_free_arg_takes(f, args, out);
         }
