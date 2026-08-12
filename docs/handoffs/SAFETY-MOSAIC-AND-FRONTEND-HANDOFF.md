@@ -52,10 +52,17 @@ coverage; adding one unilaterally would desync discovery order).
 
 ### C. Sized and ready, no blockers
 
-- **`Unknown`-gate follow-up in typeck**: reject `x.v` on an unbounded `T` and
-  `.w` on a primitive *at the field access* with a field-shaped message; the
-  escape-side refusal then stops firing for them. Zero-C-change expected;
-  check the P3 golden anyway (renderings — the recorded trap).
+- **`Unknown`-gate follow-up in typeck — DONE (2026-08-12)**: `field_type`
+  rejects a field on a primitive and on an enclosing BRACKET type parameter
+  (the map `resolve_bound_method` consults; comptime-`T` templates stay
+  ungated — instances re-infer concretely) with field-shaped messages, types
+  them `Error`, and stops `Error`-base chains from cascading. The escape gate
+  is silent for them (it keys on `Unknown`) and remains the backstop; its
+  differential probes MOVED to index shapes (`x[0]` on `T`, `p.v[0]`) and the
+  retired field shapes are pinned as must-agree-and-not-fire on both
+  toolchains. Port mirror: `field_type` in typeck.jtr returns Error(16) in
+  the same cases (renders `<error>` both sides — P3 stays aligned; the
+  artifact is `jc`'s refusal signal). Zero corpus diagnostics moved, zero C.
 - **§1.4 diagnostics remainder**: 22 `expect_close` sites (convert as touched,
   each needs its opener span — not a sweep); construct context in `expect`
   messages; item-keyword synchronization in `parse_module` recovery (the

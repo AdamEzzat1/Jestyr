@@ -74,16 +74,15 @@ pub fn check(ast: &Ast, info: &TypeInfo) -> Vec<Diagnostic> {
     // root cause is fixed, so all 155 corpus files yield none of these and no
     // corpus diagnostic moved.
     //
-    // It is not merely a backstop, though. Two ill-formed shapes reach it today
-    // and used to compile CLEAN, straight through to code generation:
-    //
-    //     fn f[T](read x: T) -> i32 { return x.v }   // field of an unbounded `T`
-    //     fn h(read p: N)    -> i32 { return p.v.w } // `.w` on an `i32`
-    //
-    // Neither has a type, so neither had an escape verdict; the checker's silence
-    // was read as approval. Ideally typeck would reject both at the field access
-    // with a better message, and then this never fires for them — that is the
-    // right follow-up. Until it exists, refusing beats emitting.
+    // Two ill-formed shapes used to reach it — a field on a bracket type
+    // parameter (`x.v` on `T`) and a field on a primitive (`p.v.w` where `v` is
+    // `i32`). Both used to compile CLEAN, then this gate refused them, and now
+    // typeck rejects them AT THE ACCESS with a field-shaped message (the
+    // follow-up this comment used to promise): they type `Error`, not `Unknown`,
+    // so this gate is silent for them. What remains here is the true backstop —
+    // any *other* borrow whose type never resolved (an indexed `T`, a shape
+    // typeck cannot yet name) is still refused rather than assumed copyable, and
+    // the tests pin one such probe so the gate cannot go vacuous.
     //
     // Sorted by span start for the same reason the unsafe pass below is: the port
     // reaches the same set by its own traversal, and the sort is what makes two
@@ -1609,30 +1608,49 @@ mod tests {
 
     // --- the `Unknown` finalization (safety mosaic, item 1) ---
 
-    /// A borrow whose type never resolved is refused, not silently allowed.
-    ///
-    /// `Ty::Unknown` is `Copy` on purpose, so untypable expressions raise no
-    /// escapes and no cascades. At the two sites where copy-ness *decides*
-    /// something that becomes "unresolved ⇒ copyable ⇒ let it escape", which is an
-    /// unsound answer rather than a lenient one.
-    ///
-    /// Both programs below compiled **clean** before this gate — `.v` on an
-    /// unbounded type parameter and `.w` on an `i32` are ill-formed, produce no
-    /// type, and therefore got no escape verdict at all.
+    /// The gate's two original catches are now typeck's: a field on a bracket
+    /// type parameter and a field on a primitive are rejected AT THE ACCESS with
+    /// a field-shaped message (the follow-up the gate's comment promised). They
+    /// type `Error`, not `Unknown`, so the finalization gate stays silent — one
+    /// diagnostic per program, at the right pass, naming the right thing.
     #[test]
-    fn an_unresolved_borrow_is_refused_rather_than_assumed_copyable() {
-        for src in [
-            "struct N { v: i32 } fn f[T](read x: T) -> i32 { return x.v }",
-            "struct N { v: i32 } fn h(read p: N) -> i32 { return p.v.w }",
+    fn the_original_gate_catches_are_now_field_shaped_typeck_errors() {
+        for (src, needle) in [
+            (
+                "struct N { v: i32 } fn f[T](read x: T) -> i32 { return x.v }",
+                "no field `v` on type parameter `T`",
+            ),
+            (
+                "struct N { v: i32 } fn h(read p: N) -> i32 { return p.v.w }",
+                "no field `w` on `i32`",
+            ),
         ] {
-            let d = escapes(src);
-            assert_eq!(d.len(), 1, "exactly one refusal for `{src}`: {d:?}");
-            assert!(d[0].message.contains("was never resolved"), "{d:?}");
+            let (tokens, _) = Lexer::new(src).tokenize();
+            let (ast, _) = Parser::new(src, tokens).parse();
+            let (info, type_diags) = crate::typeck::check(&ast);
             assert!(
-                d[0].help.is_some(),
-                "the refusal must say what to do about it: {d:?}"
+                type_diags.iter().any(|d| d.message.contains(needle)),
+                "typeck rejects `{src}` at the field access: {type_diags:?}"
+            );
+            let esc = check(&ast, &info);
+            assert!(
+                !esc.iter().any(|d| d.message.contains("was never resolved")),
+                "the finalization gate is silent once typeck has diagnosed: {esc:?}"
             );
         }
+    }
+
+    /// The gate itself is not vacuous: a borrow whose type never resolved through
+    /// a shape typeck cannot yet name — here an *indexed* type parameter — is
+    /// still refused rather than assumed copyable. If a later typeck refinement
+    /// catches this shape too, this probe must move to yet another unresolved
+    /// shape, not be deleted: the gate is the backstop for whatever remains.
+    #[test]
+    fn an_unresolved_borrow_is_refused_rather_than_assumed_copyable() {
+        let d = escapes("fn f[T](read x: T) -> i32 { return x[0] }");
+        assert_eq!(d.len(), 1, "exactly one refusal: {d:?}");
+        assert!(d[0].message.contains("was never resolved"), "{d:?}");
+        assert!(d[0].help.is_some(), "the refusal must say what to do about it: {d:?}");
     }
 
     /// The `split_mut` safety contract (safety mosaic, item 4): the two `mut`
@@ -1683,10 +1701,11 @@ mod tests {
     }
 
     /// One expression is visited by several rules, so the refusal is deduped by
-    /// span — a repeated shape must not multiply into a cascade.
+    /// span — a repeated shape must not multiply into a cascade. (The probe is an
+    /// indexed `T` — the field-on-`T` shape this test used to use is typeck's now.)
     #[test]
     fn the_finalization_refusal_is_reported_once_per_expression() {
-        let d = escapes("fn f[T](read x: T) -> i32 { return x.v }");
+        let d = escapes("fn f[T](read x: T) -> i32 { return x[0] }");
         assert_eq!(d.len(), 1, "one expression, one diagnostic: {d:?}");
     }
 

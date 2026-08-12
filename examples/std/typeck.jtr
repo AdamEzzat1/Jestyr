@@ -959,8 +959,26 @@ fn field_type(mut c: Checker, read p: parser.Parser, read src: str, bt: i32, fs:
         if bd.x == 17 {                            // String: .len
             if str_eq(src[fs .. fe], "len") { return t_usize() }
         }
+        // Item 1's follow-up: any other field on a primitive is ill-formed. The
+        // reference diagnoses at the access ("a primitive has no fields"); Error is
+        // this side's refusal artifact (`jc` scans for it), and it renders
+        // `<error>` on both sides so the P3 stream stays aligned.
+        return mk_ty(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1)
+    }
+    if bd.kind == 4 {                              // Opaque: an enclosing BRACKET type
+        var gi: i32 = 0                            // parameter has no fields — a bound
+        for gi < c.gbc {                           // provides methods, never fields
+            let gb: i32 = c.gbs + gi * 4
+            let gns: i32 = list.get(i32, p.gar, gb as usize)
+            let gne: i32 = list.get(i32, p.gar, (gb + 1) as usize)
+            if str_eq(src[bd.x as usize .. bd.y as usize], src[gns as usize .. gne as usize]) {
+                return mk_ty(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1)
+            }
+            gi = gi + 1
+        }
         return t_unknown()
     }
+    if bd.kind == 16 { return bt }                 // already diagnosed — a chained access must not cascade
     if bd.kind == 15 {                             // Named
         if td(c, bd.x, 2) != 0 { return t_unknown() }          // enum/distinct: no fields
         let fstart: i32 = td(c, bd.x, 3)

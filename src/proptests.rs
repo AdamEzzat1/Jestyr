@@ -9083,18 +9083,21 @@ fn g(p: *mut i32) -> i32 {
     /// every corpus file and silently disagree on every program that triggers it.
     ///
     /// These are programs that *do* trigger it, so this is the only thing standing between
-    /// the reference and the port on the newest safety rule. Both probes compiled clean
-    /// before the finalization landed: `.v` on an unbounded type parameter and `.w` on an
-    /// `i32` are ill-formed, produce no type, and so received no escape verdict at all.
+    /// the reference and the port on the newest safety rule. The gate's ORIGINAL probes
+    /// (`.v` on a type parameter, `.w` on an `i32`) are typeck's now — rejected at the
+    /// field access, typed `Error`, invisible to the gate — so the probes moved to the
+    /// index shapes typeck cannot yet name: `x[0]` on a bracket `T` and `p.v[0]` on an
+    /// `i32` both type `Unknown`, and an unresolved *borrow* is still refused.
     ///
     /// The first assertion is the one that matters most — it keeps the test from going
-    /// vacuous if a later inference improvement stops these shapes reaching the gate.
+    /// vacuous if a later inference improvement stops these shapes reaching the gate
+    /// (exactly what retired the original probes).
     #[test]
     fn jestyr_escape_finalization_matches_reference() {
         let exe = build_exe("examples/std/escape_cli.jtr");
         let progs = [
-            "struct N { v: i32 } fn f[T](read x: T) -> i32 { return x.v }",
-            "struct N { v: i32 } fn h(read p: N) -> i32 { return p.v.w }",
+            "struct N { v: i32 } fn f[T](read x: T) -> i32 { return x[0] }",
+            "struct N { v: i32 } fn h(read p: N) -> i32 { return p.v[0] }",
         ];
         for (i, src) in progs.iter().enumerate() {
             let want = rust_escape_dump(src);
@@ -9107,6 +9110,25 @@ fn g(p: *mut i32) -> i32 {
             std::fs::write(&f, src).unwrap();
             let got = jestyr_escape_dump(&exe, f.to_str().unwrap());
             assert_eq!(got, want, "the toolchains disagree on the finalization for: {src}");
+        }
+        // The RETIRED probes — the shapes typeck's field-access gate now rejects (they
+        // type `Error`, not `Unknown`). Both toolchains must be silent here: if the
+        // port's typeck mirror ever regressed to `Unknown`, its gate would fire while
+        // the reference stays quiet, and this equality is what would catch it.
+        let retired = [
+            "struct N { v: i32 } fn f[T](read x: T) -> i32 { return x.v }",
+            "struct N { v: i32 } fn h(read p: N) -> i32 { return p.v.w }",
+        ];
+        for (i, src) in retired.iter().enumerate() {
+            let want = rust_escape_dump(src);
+            assert!(
+                !want.iter().any(|l| l.contains("was never resolved")),
+                "retired probe {i} reached the gate again — typeck's field gate regressed: {want:?}"
+            );
+            let f = std::env::temp_dir().join(format!("jestyr_unknown_retired_{i}.jtr"));
+            std::fs::write(&f, src).unwrap();
+            let got = jestyr_escape_dump(&exe, f.to_str().unwrap());
+            assert_eq!(got, want, "the toolchains disagree on a retired finalization probe: {src}");
         }
     }
 

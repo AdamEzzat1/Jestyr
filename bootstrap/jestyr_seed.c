@@ -12582,7 +12582,27 @@ int32_t jestyr_field_type(Jestyr_Checker* restrict j_c, Jestyr_Parser j_p, Jesty
                 return jestyr_t_usize();
             }
         }
+        return jestyr_mk_ty__typeck(&((*j_c)), 16, (0 - 1), (0 - 1), (0 - 1), (0 - 1));
+    }
+    if ((j_bd.j_kind == 4))
+    {
+        int32_t j_gi = 0;
+        while ((j_gi < (*j_c).j_gbc))
+        {
+            int32_t j_gb = ((*j_c).j_gbs + (j_gi * 4));
+            int32_t j_gns = jestyr_get__i32(j_p.j_gar, (size_t)(j_gb));
+            int32_t j_gne = jestyr_get__i32(j_p.j_gar, (size_t)((j_gb + 1)));
+            if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, (size_t)(j_bd.j_x), (size_t)(j_bd.j_y)), jestyr_rt_substr(j_src, (size_t)(j_gns), (size_t)(j_gne))))
+            {
+                return jestyr_mk_ty__typeck(&((*j_c)), 16, (0 - 1), (0 - 1), (0 - 1), (0 - 1));
+            }
+            j_gi = (j_gi + 1);
+        }
         return jestyr_t_unknown();
+    }
+    if ((j_bd.j_kind == 16))
+    {
+        return j_bt;
     }
     if ((j_bd.j_kind == 15))
     {

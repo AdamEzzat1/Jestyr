@@ -3612,6 +3612,37 @@ impl<'a> TypeChecker<'a> {
         if matches!(base, Ty::Prim("String")) && fname == "len" {
             return Ty::Prim("usize"); // an owned String's byte length
         }
+        // The `Unknown` finalization's follow-up (safety mosaic item 1): the two
+        // shapes the escape-side gate caught — a field on a primitive, a field on a
+        // bracket type parameter — are rejected HERE, at the access, with a
+        // field-shaped message. The expression types `Error` (already-diagnosed),
+        // not `Unknown` (never-resolved), so the finalization gate stays silent for
+        // them and remains the backstop for shapes typeck cannot yet name.
+        if let Ty::Prim(_) = base {
+            // `str`/`String`/slices/arrays expose their documented fields above;
+            // every other field on a primitive is ill-formed.
+            let shown = base.display(&self.table);
+            self.error(span, format!("no field `{fname}` on `{shown}` — a primitive has no fields"));
+            return Ty::Error;
+        }
+        if let Ty::Opaque(tp) = base {
+            // Only for the *enclosing fn's own* bracket parameters: a bound provides
+            // methods, never fields (the same map `resolve_bound_method` consults).
+            // A comptime-`T` template is not gated here — its instances re-infer
+            // with the concrete type and take the real field check above.
+            if self.cur_type_param_bounds.contains_key(tp) {
+                self.error(
+                    span,
+                    format!(
+                        "no field `{fname}` on type parameter `{tp}` — a bound provides methods, not fields; field access needs a concrete type"
+                    ),
+                );
+                return Ty::Error;
+            }
+        }
+        if matches!(base, Ty::Error) {
+            return Ty::Error; // already diagnosed — a chained access must not cascade
+        }
         if let Ty::GenStruct { ctor, args } = base {
             // A field *read* on a generic-struct value resolves under the
             // receiver's type arguments — the same substitution the field-*call*
