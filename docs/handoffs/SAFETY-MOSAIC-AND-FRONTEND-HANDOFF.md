@@ -8,8 +8,126 @@ mosaic so complex aliasing has somewhere to go besides "rejected" or "drop to
 raw". **Part 3** is the standing constraint both live under, which this session
 finally has a *measured* example of.
 
-Status lines here are true as of master `04d8153`. Trust the code over this file
-if they disagree.
+Status lines here are true as of master `66da1e3` (2026-08-12). Trust the code
+over this file if they disagree.
+
+---
+
+## START HERE — everything that remains, one list (2026-08-12)
+
+This section supersedes the Part 2 ranking table and every stale "next" note
+below it. The sessions of 2026-08-10..12 resolved: HIR Stages 0–4, the
+`Unknown` finalization (+ its ctor-body-self supersession), the newline rule,
+both differential fuzzers, `split_mut` stages 0–2, §1.9 both halves (port
+`#line`, generic-struct collisions), mosaic item 1, item 3's reference side,
+item 5's kernel (a demonstrated cross-region UAF, closed), item 6's worked
+example, and four toolchain defects that example exposed. What follows is ALL
+that remains, in the order a fresh session should consider it.
+
+### A. In flight elsewhere — check before touching
+
+- **break-in-match-in-loop miscompile** (task chip `task_d16f6e4b`, running in
+  its own session): a `break` inside a switch-lowered `match` inside a loop
+  exits the C *switch* — infinite loop from correct code. If it has landed:
+  un-work-around `examples/dlist_genref.jtr` (drop the `going` flag, restore
+  the natural `break` form) and confirm its runtime pin still passes. If it
+  has NOT landed, do not start it here without checking that session's state.
+
+### B. Item 3 (`with alive`) — the port ladder (the one half-finished feature)
+
+The reference side is complete and pinned (`34b1bc2`); the syntax exists in NO
+corpus or golden file yet, deliberately, so nothing byte-compares until the
+mirror lands. The ladder, in order:
+
+1. `tokens.jtr`: the `with` keyword — **at the END of the kind numbering** (the
+   ids are pinned by `jestyr_lexer_kind_ids_pin_the_numbering`; a mid-table
+   insert renumbers everything and the gate refuses — learned the hard way).
+2. `parser.jtr`: the new expr kind + its P2 dump arm; scrutinee parses at
+   **postfix** level (the ladder is unary → cast → postfix; anything higher
+   eats the construct's `as`). `alive` is CONTEXTUAL (`life.jtr` uses it as a
+   local). Mirror `parse_with` exactly: `with` kw, `alive` ident-checked,
+   postfix scrutinee, `as`, `read`, name, block, optional `else` block.
+3. `typeck.jtr`: kind arm — scrutinee must be GenRef (kind 10) else the
+   "takes a generational reference" diagnostic; bind name : referent in a
+   scope over the body; els checked; type Unit. P3 dump arm both sides.
+4. `escape.jtr`: walk scrutinee, bind name as borrow over body, walk els —
+   the frame rule does the containment (zero new checks, like the reference).
+5. `cgen.jtr`: both lowering forms. `_wa<n>` consumes ONE number from the
+   global temp counter in lockstep; the scrutinee emits BEFORE the temp is
+   numbered (the subexpr-before-enclosing-temp discipline); binding =
+   `__auto_type j_<name> = _wa<n>.ptr` joining the deref-on-use set for the
+   block; the check is the deref's exact test
+   (`((uint64_t*)ptr)[-1] == gen`); bare form = `assert`, else form = `if`.
+6. A corpus example (`examples/with_alive.jtr`) + **CGEN_GOLDEN_ALLOWLIST**
+   (the gates are allowlisted — a file not added is silently skipped) + a
+   runtime output pin; grammar doc (`docs/frontend-grammar.md`) + a
+   conformance-table row; `REFRESH_SEED=1` + the full gate.
+
+Reference details to mirror against: `src/{token,ast,parser,typeck,escape,
+cgen}.rs`, tests `with_alive_*` and `a_ctor_body_method_*`.
+
+### C. Sized and ready, no blockers
+
+- **`Unknown`-gate follow-up in typeck**: reject `x.v` on an unbounded `T` and
+  `.w` on a primitive *at the field access* with a field-shaped message; the
+  escape-side refusal then stops firing for them. Zero-C-change expected;
+  check the P3 golden anyway (renderings — the recorded trap).
+- **§1.4 diagnostics remainder**: 22 `expect_close` sites (convert as touched,
+  each needs its opener span — not a sweep); construct context in `expect`
+  messages; item-keyword synchronization in `parse_module` recovery (the
+  cascade-budget test is the guardrail); stable error codes
+  (`Diagnostic::with_code` exists, unused — additive in `check --json`).
+- **Item 4 stage 3** (`split_mut` disjointness known to the checker, not
+  assumed): design note first — today the disjointness is a library argument;
+  the checker-known version interacts with item 2.
+- **Item 5 residue** (optional): lexical taint for the aliased-root dodge
+  (`var alias = h` inside the region, store through `alias`); the
+  through-callee dodge needs signatures (item 2 territory). Both recorded in
+  `docs/safety-mosaic-next.md` item 5 with the measured example.
+
+### D. Design-gated — do not start without the design argued
+
+- **Item 2 (borrowed projections `-> read T from xs`)**: deferred BY ITS OWN
+  DOC until something consumes the precision (item 6, or item 4 stage 3).
+  Owes: parser+FnSig both sides, attest hashes move, doc/attest sig mirrors.
+- **Item 6 (`Cell[r, T]`)**: the worked example exists
+  (`examples/dlist_genref.jtr`) and the design section in
+  `docs/safety-mosaic-next.md` is rewritten around its five data. The open
+  question that decides the whole item: **what a dangling index means** —
+  generations again (= the genref tier re-invented), or wrong-but-live reads
+  (must be said plainly). Wants item 7 thinking nearby first.
+- **Item 7 (linear capabilities)**: the early-`return`/`?` interaction with
+  error sets is the design crux — write it down before syntax.
+- **Item 8 (reference capabilities)**: §2.6's lattice warning stands — if it
+  cannot be two or three named opt-in capabilities, do not build it.
+- **Item 9 (formal mini-model)**: worth writing alongside items 2/6; the
+  escape-guarantee doc's four-routes argument is the seed.
+
+### E. Standing small stuff (recorded, unranked)
+
+- CST Stage 3 (green/red tree): only if a formatter demands it.
+- `par for` fusion widening: needs capture analysis; fused+vectorized sites
+  unexplored.
+- Executable `build.jestyr`: needs CTFE surface (workstream K's last leftover).
+- `mut` variant of `with alive`: needs an exclusivity story first.
+- Enum `@copy` opt-in: `dlist_genref.jtr` datum 2 — link surgery needs
+  `take`-passed genref params solely because enums are never `Copy`; a
+  niche-enum-of-Copy could be `Copy`. Small typeck change + escape sweep.
+
+### The traps that bit this session (verbatim from memory, keep them)
+
+1. Sweep diagnostics AND emitted C against **HEAD**, not a stale binary.
+2. The P3 typeck golden compares *renderings* — a typing refinement owes a
+   port mirror even at zero emitted-C change.
+3. The P5/fixpoint gates run an **allowlist**, not a glob.
+4. A new `TokenKind` goes at the **end** of the enum.
+5. **A new shape in the corpus is itself a divergence probe** — two latent
+   port temp-order divergences and two emission gaps were found by two small
+   example files. Write the example first; let the goldens find the rest.
+6. Never write multi-line replacement scripts in a bash heredoc on this
+   machine — backslashes mangle; use a scratchpad `.py` file.
+7. `ExprId`-keyed tables are dense vectors, never maps; no emitting pass may
+   iterate one.
 
 ---
 
