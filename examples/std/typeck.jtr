@@ -2159,6 +2159,21 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
     } else if k == 38 or k == 43 {                 // concurrent / region: body block; type = Unit
         infer(c, p, src, d.a)
         r = t_unit()
+    } else if k == 46 {                            // with alive (mosaic item 3): the scrutinee must
+        // be a genref `&T`; the binding types as the referent `T` (a second-class `read`
+        // borrow, enforced by the escape checker) over the body; the construct is Unit.
+        // The reference also diagnoses a non-genref scrutinee — its binding type is
+        // Unknown either way, which is all the compared renderings see.
+        let gt: i32 = infer(c, p, src, d.a)
+        let gd: TyData = list.get(TyData, c.tys, gt as usize)
+        var inner: i32 = t_unknown()
+        if gd.kind == 10 { inner = gd.a }          // GenRef -> the referent
+        push_scope(c)
+        scope_insert(c, d.x, d.y, inner)
+        infer(c, p, src, d.b)                      // body block, the binding in scope
+        pop_scope(c)
+        infer_opt(c, p, src, d.op)                 // else block
+        r = t_unit()
     } else if k == 24 {                            // if: cond, then-block, else; type = the then's
         infer(c, p, src, d.a)
         r = infer(c, p, src, d.b)
@@ -2727,6 +2742,9 @@ fn dump_types(read src: str, read c: Checker, read p: parser.Parser, read a: All
         } else if d.kind == 31 {                   // for: body AND else are Block structs
             if d.b >= 0 { list.set(bool, skip, d.b as usize, true) }
             if d.x >= 0 { list.set(bool, skip, d.x as usize, true) }
+        } else if d.kind == 46 {                   // with alive: body AND else are Block structs
+            if d.b >= 0 { list.set(bool, skip, d.b as usize, true) }
+            if d.op >= 0 { list.set(bool, skip, d.op as usize, true) }
         } else if d.kind == 42 {                   // select: each arm's body block
             var ai: i32 = 0
             for ai < d.y {

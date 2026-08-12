@@ -1,0 +1,61 @@
+// examples/with_alive.jtr — `with alive`, the checked genref scope (safety mosaic item 3).
+//
+// A generational reference (`&T`, see genref.jtr) is checked at EVERY deref; `with alive`
+// performs that same generation check ONCE at block entry and binds a second-class `read`
+// borrow of the referent for the block's extent — uses inside are plain derefs with no
+// per-use checks. Without `else` a stale genref FAULTS at the entry check, exactly like a
+// stale deref (the bare form adds no new failure mode); with `else` staleness takes that
+// arm instead. The block claims "checked once at entry" and NOTHING more — nothing stops
+// another holder freeing the object inside the block.
+//
+// The binding is an ordinary second-class borrow, so the frame rule contains it:
+// returning it, storing it, or capturing it gets the standard refusals with zero new
+// checker machinery.
+//
+// Run:  jestyrc run examples/with_alive.jtr   →  42, 7, 9, 16, 1, 0
+
+struct P { x: i64, y: i64 }
+
+// The binding reads through freely inside the block; the VALUES computed from it are
+// ordinary owned copies and leave the block like any other local.
+fn sum_alive(read r: &P) -> i64 {
+    var s: i64 = 0
+    with alive r as read p {
+        s = p.x + p.y
+    }
+    return s
+}
+
+fn main() -> i32 {
+    // Bare form on a live genref: the entry check passes, the use inside is a plain deref.
+    var a: &i64 = gen_new(i64, 42)
+    with alive a as read v {
+        print_int(v)                     // 42
+    }
+
+    // A struct referent: field reads through the binding, in both a block and a callee.
+    var q: &P = gen_new(P, P{ x: 7, y: 9 })
+    with alive q as read p {
+        print_int(p.x)                   // 7
+        print_int(p.y)                   // 9
+    }
+    print_int(sum_alive(q))              // 16
+
+    // The else form: a LIVE genref takes the body…
+    with alive q as read live {
+        print_int(1)                     // 1
+    } else {
+        print_int(0 - 1)
+    }
+
+    // …and a STALE one takes the `else` arm instead of faulting.
+    gen_free(q)
+    with alive q as read gone {
+        print_int(0 - 2)
+    } else {
+        print_int(0)                     // 0
+    }
+
+    gen_free(a)
+    return 0
+}

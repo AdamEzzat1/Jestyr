@@ -216,9 +216,29 @@ refresh. The syntax is small; the two-sided tax is not.
 
 ---
 
-## Item 3 — checked genref scopes — REFERENCE SIDE LANDED; the port ladder remains
+## Item 3 — checked genref scopes — **COMPLETE, BOTH SIDES**
 
-**Status (2026-08-12).** The reference implements the full design, both forms:
+**Status (2026-08-12, port mirror landed).** The two-sided tax below is PAID:
+the port mirrors all five passes, `examples/with_alive.jtr` is in the corpus
+and in `CGEN_GOLDEN_ALLOWLIST` (byte-identical first run after one kind-number
+fix), its runtime output is pinned (`with_alive_demo`: 42/7/9/16/1/0 — bare
+form, field reads, a callee, the live and stale `else` arms), the grammar doc
+carries the production + two conformance rows, and the seed is refreshed.
+Two port-side facts the mirror surfaced, recorded for the next keyword/kind:
+
+- **TokenKind `With` = 111, `Unknown` moved to 112.** The port classifies
+  `with` by a deliberate discontinuity: interned LAST in `intern_keywords`
+  (so `id < kwcount` still means "keyword") but mapped to 111 instead of
+  `id + 7`, because the reference appended `With` after `Eof` (ids up to `Eof`
+  are pinned). Any future keyword must repeat this dance: intern at the end,
+  map explicitly to the next free id (113).
+- **The port's expr-kind header comment was stale**: kind 45 was already
+  `Catch` (E-chain), undocumented in the list at the top of `parser.jtr`.
+  `WithAlive` is kind **46**. The P2 module-dump golden caught the collision
+  on the new corpus file immediately — the "new shape is itself a divergence
+  probe" trap paying out; the comment now lists 45 and 46.
+
+The reference implements the full design, both forms:
 
 ```jestyr
 with alive r as read n { … }                 // stale genref → FAULTS at entry
@@ -248,18 +268,24 @@ Settled while implementing, worth knowing for the port:
   temp counter (LOCKSTEP with the port), and the binding joins `ptr_params` for
   the block so uses deref through it.
 
-**The remaining two-sided tax, in order** (the feature is reference-only until
-this is paid; no corpus/golden file uses the syntax yet, deliberately):
+**The two-sided tax (PAID — kept for the record of what it cost):**
 
-1. Port mirror: `tokens.jtr` keyword, `parser.jtr` (new expr kind + dump arm),
-   `typeck.jtr` (kind arm: GenRef check + binding), `escape.jtr` (bind-as-
-   borrow + walk), `cgen.jtr` (both lowering forms, temp-counter lockstep).
-2. P2/P3 golden dump arms on BOTH sides for the new node kind.
-3. A corpus example (`examples/with_alive.jtr`), added to the ALLOWLISTED gates
-   (`CGEN_GOLDEN_ALLOWLIST` — the recorded trap) only once the port emits it
-   byte-identically; runtime output pinned via the c-oracle demo pattern.
-4. Grammar doc (`docs/frontend-grammar.md`) + the conformance table row +
-   `REFRESH_SEED=1` + the full gate.
+1. Port mirror: `tokens.jtr` keyword, `parser.jtr` (kind 46 + dump arm),
+   `typeck.jtr` (kind arm: GenRef check + binding; the Block shim for body +
+   else), `escape.jtr` (bind-as-borrow + walk), `cgen.jtr` (both lowering
+   forms, temp-counter lockstep, `collect_moved` + `ref_expr_id` arms).
+2. P2 dump arms on BOTH sides (`withalive`: name span, span, genref, body,
+   else-or-none); P3 needed no reference-side change (the full stream is
+   compared — only the port's Block shim).
+3. `examples/with_alive.jtr` + `CGEN_GOLDEN_ALLOWLIST` + the runtime pin.
+4. Grammar doc + two conformance rows + `REFRESH_SEED=1` + the full gate.
+
+What was deliberately NOT mirrored, matching the reference's own coverage:
+the generic-instance/closure/spawn discovery walkers have no `WithAlive` arm
+in the reference either (only `visit.rs` — consumed by provenance alone —
+walks it), so the port's `gfind`/`cfind`/`crefs`/`sfind` stay arm-free; adding
+one unilaterally would DESYNC discovery order. A generic instance or closure
+inside a `with alive` body is unsupported on both sides identically.
 
 ## Item 3 — the original design (kept for the record)
 

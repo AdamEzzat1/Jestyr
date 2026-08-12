@@ -3,7 +3,7 @@
 //
 // `tokenize` turns Jestyr source into a `List(Token)`. Each `Token` is a payload-free
 // `{kind, start, end}` mirroring the Rust reference (`src/token.rs`): `kind` is the
-// integer `TokenKind` discriminant (Ident=0 … Unknown=111) and the lexeme is recovered
+// integer `TokenKind` discriminant (Ident=0 … Unknown=112) and the lexeme is recovered
 // from the source via `[start..end]` when a later pass needs it. Keeping `Token` tiny
 // and value-classified (no owned payload) makes the token vector cache-friendly and
 // keeps the clean split the reference uses: the lexer classifies, later passes interpret.
@@ -19,7 +19,8 @@
 // FIRST, in the SAME order as `TokenKind`'s keyword discriminants, so a scanned keyword's
 // kind is just `interned_id + 7` (Fn is discriminant 7, interned id 0). The interner
 // doubles as the keyword table and the classification stays in lockstep with the
-// reference by construction.
+// reference by construction. One exception: `with` (interned last) maps to kind 111 —
+// its TokenKind sits after `Eof` because the ids up to `Eof` are pinned.
 //
 // Byte-level (ASCII) classification, like the reference on ASCII source; the corpus is
 // ASCII outside comments/strings, which are slurped whole so their bytes never need
@@ -267,8 +268,9 @@ fn scan_number(read src: str, n: usize, from: usize) -> usize {
 // Classify the operator/punctuator at `i` (maximal munch): its `TokenKind`
 // discriminant and byte width, matching the reference lexer's dispatch exactly.
 // `//` and `/*` are handled as trivia before this is ever reached, so a `/` here is a
-// real `/` or `/=`. An unrecognized single byte is `Unknown` (111), as in the
-// reference (which also records a diagnostic; the corpus has none).
+// real `/` or `/=`. An unrecognized single byte is `Unknown` (112), as in the
+// reference (which also records a diagnostic; the corpus has none). 111 is `with` —
+// the keyword appended after `Eof` in the reference's pinned numbering.
 fn classify_op(read src: str, n: usize, i: usize) -> OpTok {
     let c: i32 = src[i] as i32
     var d: i32 = 0
@@ -354,7 +356,7 @@ fn classify_op(read src: str, n: usize, i: usize) -> OpTok {
         if d == 61 { return OpTok{ kind: 109, width: 2 } }
         return OpTok{ kind: 95, width: 1 }
     }
-    return OpTok{ kind: 111, width: 1 }                 // Unknown
+    return OpTok{ kind: 112, width: 1 }                 // Unknown
 }
 
 // ---- doc-comment trivia (the `jc <file> doc` input) ----
@@ -478,7 +480,8 @@ pub fn collect_docs(read src: str, read toks: List(Token), read a: Allocator) ->
 // consumes. Each token carries its `TokenKind` discriminant and half-open source span;
 // the interner `it` is filled along the way (identifiers, including the lone `_`, are
 // interned so keyword-vs-ident is `id < kwcount` and any distinct-user count is exact).
-// Keywords own ids `0..kwcount-1`, so a keyword's kind is `id + 7`.
+// Keywords own ids `0..kwcount-1`, so a keyword's kind is `id + 7` — except `with`
+// (interned LAST, kind 111: its TokenKind sits after `Eof` in the pinned numbering).
 pub fn tokenize(read src: str, mut it: Interner, kwcount: i64, read a: Allocator) -> List(Token) {
     let n: usize = src.len
     var toks: List(Token) = list.make(Token, a)
@@ -511,7 +514,13 @@ pub fn tokenize(read src: str, mut it: Interner, kwcount: i64, read a: Allocator
                 var isund: bool = false
                 if i - start == 1 { if (src[start] as i32) == 95 { isund = true } }
                 if isund { kind = 6 }                          // Underscore (a lone `_`)
-                else if id < kwcount { kind = (id as i32) + 7 } // keyword: id + 7
+                else if id < kwcount {
+                    // keyword: id + 7 — EXCEPT `with`, interned last: the reference appended
+                    // its TokenKind after `Eof` (the ids up to `Eof` are pinned against this
+                    // tokenizer), so it takes 111 instead of riding the contiguous block.
+                    if id == kwcount - 1 { kind = 111 }
+                    else { kind = (id as i32) + 7 }
+                }
                 list.push(Token, toks, Token{ kind: kind, start: start, end: i })
             }
         } else if is_digit(c) {
@@ -596,5 +605,10 @@ pub fn intern_keywords(mut it: Interner) -> i64 {
     intern.intern(it, "null")
     intern.intern(it, "self")
     intern.intern(it, "Self")
+    // `with` is interned LAST, deliberately out of discriminant order: its TokenKind was
+    // appended after `Eof` (the kind ids up to `Eof` are PINNED against this tokenizer,
+    // so a new token may only take the next free id — 111). `tokenize` special-cases
+    // `id == kwcount - 1` to that kind instead of the contiguous `id + 7`.
+    intern.intern(it, "with")
     return intern.count(it) as i64
 }

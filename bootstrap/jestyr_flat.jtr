@@ -439,7 +439,7 @@ impl[T] Drop for List(T) {
 //
 // `tokenize` turns Jestyr source into a `List(Token)`. Each `Token` is a payload-free
 // `{kind, start, end}` mirroring the Rust reference (`src/token.rs`): `kind` is the
-// integer `TokenKind` discriminant (Ident=0 … Unknown=111) and the lexeme is recovered
+// integer `TokenKind` discriminant (Ident=0 … Unknown=112) and the lexeme is recovered
 // from the source via `[start..end]` when a later pass needs it. Keeping `Token` tiny
 // and value-classified (no owned payload) makes the token vector cache-friendly and
 // keeps the clean split the reference uses: the lexer classifies, later passes interpret.
@@ -455,7 +455,8 @@ impl[T] Drop for List(T) {
 // FIRST, in the SAME order as `TokenKind`'s keyword discriminants, so a scanned keyword's
 // kind is just `interned_id + 7` (Fn is discriminant 7, interned id 0). The interner
 // doubles as the keyword table and the classification stays in lockstep with the
-// reference by construction.
+// reference by construction. One exception: `with` (interned last) maps to kind 111 —
+// its TokenKind sits after `Eof` because the ids up to `Eof` are pinned.
 //
 // Byte-level (ASCII) classification, like the reference on ASCII source; the corpus is
 // ASCII outside comments/strings, which are slurped whole so their bytes never need
@@ -700,8 +701,9 @@ fn scan_number(read src: str, n: usize, from: usize) -> usize {
 // Classify the operator/punctuator at `i` (maximal munch): its `TokenKind`
 // discriminant and byte width, matching the reference lexer's dispatch exactly.
 // `//` and `/*` are handled as trivia before this is ever reached, so a `/` here is a
-// real `/` or `/=`. An unrecognized single byte is `Unknown` (111), as in the
-// reference (which also records a diagnostic; the corpus has none).
+// real `/` or `/=`. An unrecognized single byte is `Unknown` (112), as in the
+// reference (which also records a diagnostic; the corpus has none). 111 is `with` —
+// the keyword appended after `Eof` in the reference's pinned numbering.
 fn classify_op(read src: str, n: usize, i: usize) -> OpTok {
     let c: i32 = src[i] as i32
     var d: i32 = 0
@@ -787,7 +789,7 @@ fn classify_op(read src: str, n: usize, i: usize) -> OpTok {
         if d == 61 { return OpTok{ kind: 109, width: 2 } }
         return OpTok{ kind: 95, width: 1 }
     }
-    return OpTok{ kind: 111, width: 1 }                 // Unknown
+    return OpTok{ kind: 112, width: 1 }                 // Unknown
 }
 
 // ---- doc-comment trivia (the `jc <file> doc` input) ----
@@ -911,7 +913,8 @@ pub fn collect_docs(read src: str, read toks: List(Token), read a: Allocator) ->
 // consumes. Each token carries its `TokenKind` discriminant and half-open source span;
 // the interner `it` is filled along the way (identifiers, including the lone `_`, are
 // interned so keyword-vs-ident is `id < kwcount` and any distinct-user count is exact).
-// Keywords own ids `0..kwcount-1`, so a keyword's kind is `id + 7`.
+// Keywords own ids `0..kwcount-1`, so a keyword's kind is `id + 7` — except `with`
+// (interned LAST, kind 111: its TokenKind sits after `Eof` in the pinned numbering).
 pub fn tokenize(read src: str, mut it: Interner, kwcount: i64, read a: Allocator) -> List(Token) {
     let n: usize = src.len
     var toks: List(Token) = make__list(Token, a)
@@ -944,7 +947,13 @@ pub fn tokenize(read src: str, mut it: Interner, kwcount: i64, read a: Allocator
                 var isund: bool = false
                 if i - start == 1 { if (src[start] as i32) == 95 { isund = true } }
                 if isund { kind = 6 }                          // Underscore (a lone `_`)
-                else if id < kwcount { kind = (id as i32) + 7 } // keyword: id + 7
+                else if id < kwcount {
+                    // keyword: id + 7 — EXCEPT `with`, interned last: the reference appended
+                    // its TokenKind after `Eof` (the ids up to `Eof` are pinned against this
+                    // tokenizer), so it takes 111 instead of riding the contiguous block.
+                    if id == kwcount - 1 { kind = 111 }
+                    else { kind = (id as i32) + 7 }
+                }
                 push(Token, toks, Token{ kind: kind, start: start, end: i })
             }
         } else if is_digit(c) {
@@ -1029,6 +1038,11 @@ pub fn intern_keywords(mut it: Interner) -> i64 {
     intern(it, "null")
     intern(it, "self")
     intern(it, "Self")
+    // `with` is interned LAST, deliberately out of discriminant order: its TokenKind was
+    // appended after `Eof` (the kind ids up to `Eof` are PINNED against this tokenizer,
+    // so a new token may only take the next free id — 111). `tokenize` special-cases
+    // `id == kwcount - 1` to that kind instead of the contiguous `id + 7`.
+    intern(it, "with")
     return count(it) as i64
 }
 
@@ -1071,7 +1085,7 @@ pub fn intern_keywords(mut it: Interner) -> i64 {
 // 17=GenStructLit 18=FieldInit 19=SelfValue 20=SelfType 21=Attr 22=FString 23=Block 24=If
 // 25=Unsafe 26=Char 27=Bool 28=Match 29=Str 30=Null 31=For 32=Break 33=Continue 34=Invariant
 // 35=Variant 36=StructType 37=Closure 38=Concurrent 39=Spawn 40=Await 41=ParFor 42=Select
-// 43=Region 44=Comptime. `a`/`b` are child `ExprId`s: unary/postfix use `a` for the
+// 43=Region 44=Comptime 45=Catch 46=WithAlive. `a`/`b` are child `ExprId`s: unary/postfix use `a` for the
 // operand/base, binary uses `a`=lhs `b`=rhs, index uses `a`=base `b`=index, call/cast use
 // `a`=callee/expr. `x`/`y` are auxiliary integers: Field stores its name's source span
 // `(x, y)`; Call stores `(arg_start, arg_count)` into the arg arena; Cast stores its target
@@ -1486,6 +1500,15 @@ fn mk_select(mut p: Parser, start: usize, end: usize, arm_start: i32, arm_count:
 fn mk_region(mut p: Parser, start: usize, end: usize, ns: i32, ne: i32, body: i32) -> i32 {
     let id: i32 = len(ExprData, p.ex) as i32
     push(ExprData, p.ex, ExprData{ kind: 43, start: start, end: end, op: 0, a: body, b: 0 - 1, x: ns, y: ne })
+    return id
+}
+// `with alive <genref> as read <name> { … } [else { … }]` (kind 46): the checked genref
+// scope (safety mosaic, item 3). `a`=genref `ExprId`; `b`=body Block `ExprId`; `(x, y)`=
+// binding name span; `op`=else Block `ExprId` (-1 none). Mirrors
+// `ExprKind::WithAlive { genref, name, body, els }`.
+fn mk_withalive(mut p: Parser, start: usize, end: usize, genref: i32, ns: i32, ne: i32, body: i32, els: i32) -> i32 {
+    let id: i32 = len(ExprData, p.ex) as i32
+    push(ExprData, p.ex, ExprData{ kind: 46, start: start, end: end, op: els, a: genref, b: body, x: ns, y: ne })
     return id
 }
 // ---- pattern arena constructors ----
@@ -1962,7 +1985,7 @@ fn parse_stmt(mut p: Parser) -> i32 {
         return mk_let(p, start, prev_end(p), mutbl, ns, ne, tyid, init)
     }
     // Block-led expressions in statement position parse *block-only* (no trailing operator).
-    if k == 65 or k == 22 or k == 21 or k == 38 or k == 31 or k == 24 or k == 34 or k == 37 or k == 32 {  // `{`/`if`/`match`/`unsafe`/`comptime`/`for`/`concurrent`/`select`/`region`
+    if k == 65 or k == 22 or k == 21 or k == 38 or k == 31 or k == 24 or k == 34 or k == 37 or k == 32 or k == 111 {  // `{`/`if`/`match`/`unsafe`/`comptime`/`for`/`concurrent`/`select`/`region`/`with`
         let e: i32 = parse_block_like(p)
         return mk_exprstmt(p, e)
     }
@@ -1982,6 +2005,7 @@ fn parse_block_like(mut p: Parser) -> i32 {
     if k == 34 { return parse_concurrent(p) }        // `concurrent`
     if k == 37 { return parse_select(p) }            // `select`
     if k == 32 { return parse_region(p) }            // `region`
+    if k == 111 { return parse_with(p) }             // `with`
     if k == 65 { return parse_block(p) }             // `{`
     return parse_expr(p)
 }
@@ -2738,6 +2762,40 @@ fn parse_region(mut p: Parser) -> i32 {
     return mk_region(p, start, node_end(p, body), ns, ne, body)
 }
 
+// `with alive <genref> as read <name> { body } [else { els }]` — the checked genref scope
+// (safety mosaic item 3; `docs/safety-mosaic-next.md`). Mirrors `parse_with`. `with` is a
+// keyword; `alive` is CONTEXTUAL — an ordinary identifier everywhere else (the corpus uses
+// it as a local), so it is consumed here as a plain Ident (the reference's `eat_ident`;
+// its "expected `alive`" text check feeds only reference-side diagnostics). `read` is the
+// only binding convention in v1. The scrutinee parses at POSTFIX level: the ladder is
+// unary -> cast -> postfix, so anything at or above the cast level would eat the
+// construct's `as` (`r as read` is not a type). A genref scrutinee is a place chain
+// (`r`, `self.node`, `slots[i]`), which postfix covers in full.
+fn parse_with(mut p: Parser) -> i32 {
+    let wt: Token = cur_tok(p)
+    let start: usize = wt.start
+    bump(p)                                        // consume `with`
+    if cur_kind(p) == 0 { bump(p) }                // `alive` (contextual; reference `eat_ident`)
+    let genref: i32 = parse_postfix(p)
+    if cur_kind(p) == 48 { bump(p) }               // `as`  (reference `expect`: no consume when absent)
+    if cur_kind(p) == 54 { bump(p) }               // `read`
+    // The binding name: the OFFENDING token's span when missing, never a default — the
+    // reference's `eat_ident` reports (and spans) the current token either way.
+    let nt: Token = cur_tok(p)
+    let ns: i32 = nt.start as i32
+    let ne: i32 = nt.end as i32
+    if cur_kind(p) == 0 { bump(p) }
+    let body: i32 = parse_block(p)
+    var els: i32 = 0 - 1
+    if cur_kind(p) == 23 {                         // `else`
+        bump(p)
+        els = parse_block(p)
+    }
+    var endp: usize = node_end(p, body)
+    if els >= 0 { endp = node_end(p, els) }
+    return mk_withalive(p, start, endp, genref, ns, ne, body, els)
+}
+
 // `concurrent { … }` — a structured-concurrency scope. Span runs to the block's `}`. Mirrors
 // `parse_concurrent`.
 fn parse_concurrent(mut p: Parser) -> i32 {
@@ -3325,6 +3383,7 @@ fn parse_primary(mut p: Parser) -> i32 {
     if k == 36 { return parse_await(p) }           // `await`
     if k == 37 { return parse_select(p) }          // `select`
     if k == 32 { return parse_region(p) }          // `region r { … }`
+    if k == 111 { return parse_with(p) }           // `with alive … { … }`
     if k == 24 {                                   // `for` -> loop
         return parse_for(p)
     }
@@ -4701,6 +4760,12 @@ fn dump(read src: str, read p: Parser, id: i32) {
         // Region: the region name span, span, then the body block.
         print_str("region") print_int(d.x as i64) print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
         dump(src, p, d.a)
+    } else if d.kind == 46 {
+        // WithAlive: the binding name span, span, then the genref, body block, else block.
+        print_str("withalive") print_int(d.x as i64) print_int(d.y as i64) print_uint(d.start) print_uint(d.end)
+        dump(src, p, d.a)                          // genref scrutinee
+        dump(src, p, d.b)                          // body block
+        dump_opt(src, p, d.op)                     // else block (-1 -> `(none)`)
     } else {
         print_str("error") print_uint(d.start) print_uint(d.end)
     }
@@ -8584,6 +8649,21 @@ fn infer(mut c: Checker, read p: Parser, read src: str, id: i32) -> i32 {
     } else if k == 38 or k == 43 {                 // concurrent / region: body block; type = Unit
         infer(c, p, src, d.a)
         r = t_unit()
+    } else if k == 46 {                            // with alive (mosaic item 3): the scrutinee must
+        // be a genref `&T`; the binding types as the referent `T` (a second-class `read`
+        // borrow, enforced by the escape checker) over the body; the construct is Unit.
+        // The reference also diagnoses a non-genref scrutinee — its binding type is
+        // Unknown either way, which is all the compared renderings see.
+        let gt: i32 = infer(c, p, src, d.a)
+        let gd: TyData = get(TyData, c.tys, gt as usize)
+        var inner: i32 = t_unknown()
+        if gd.kind == 10 { inner = gd.a }          // GenRef -> the referent
+        push_scope(c)
+        scope_insert(c, d.x, d.y, inner)
+        infer(c, p, src, d.b)                      // body block, the binding in scope
+        pop_scope(c)
+        infer_opt(c, p, src, d.op)                 // else block
+        r = t_unit()
     } else if k == 24 {                            // if: cond, then-block, else; type = the then's
         infer(c, p, src, d.a)
         r = infer(c, p, src, d.b)
@@ -9152,6 +9232,9 @@ fn dump_types(read src: str, read c: Checker, read p: Parser, read a: Allocator)
         } else if d.kind == 31 {                   // for: body AND else are Block structs
             if d.b >= 0 { set(bool, skip, d.b as usize, true) }
             if d.x >= 0 { set(bool, skip, d.x as usize, true) }
+        } else if d.kind == 46 {                   // with alive: body AND else are Block structs
+            if d.b >= 0 { set(bool, skip, d.b as usize, true) }
+            if d.op >= 0 { set(bool, skip, d.op as usize, true) }
         } else if d.kind == 42 {                   // select: each arm's body block
             var ai: i32 = 0
             for ai < d.y {
@@ -10332,6 +10415,20 @@ fn walk_expr(mut e: Esc, read p: Parser, read c: Checker, read src: str, id: i32
         push(i32, e.rdepth, len(i32, e.scst) as i32)
         check_block(e, p, c, src, d.a, false)
         truncate(i32, e.rdepth, len(i32, e.rdepth) - 1)
+        return
+    }
+    else if k == 46 {                              // with alive (mosaic item 3)
+        // The scrutinee is walked as an ordinary expression (a genref is Copy, so no
+        // move concerns), and the binding is a BORROW for the body's extent — which is
+        // the whole safety argument: the ordinary frame rule refuses to let it return,
+        // be captured, stored, or given away, so the checked-once-at-entry window is
+        // exactly the block. Nothing new is proved here on purpose.
+        walk_expr(e, p, c, src, d.a, false)
+        e_push(e)
+        e_bind(e, d.x, d.y, 1)
+        check_block(e, p, c, src, d.b, false)
+        e_pop(e)
+        if d.op >= 0 { check_block(e, p, c, src, d.op, false) }
         return
     }
     else if k == 41 {                              // par for
@@ -15991,6 +16088,11 @@ fn collect_moved_expr(mut g: Cg, read p: Parser, read src: str, eid: i32) {
         return
     }
     if e.kind == 43 { collect_moved_block(g, p, src, e.a)  return }   // Region block
+    if e.kind == 46 {                                 // WithAlive: body + else blocks (the genref
+        collect_moved_block(g, p, src, e.b)           // scrutinee is Copy — never a move source)
+        if e.op >= 0 { collect_moved_block(g, p, src, e.op) }
+        return
+    }
     if e.kind == 13 {                                 // Range
         if e.a >= 0 { collect_moved_expr(g, p, src, e.a) }
         if e.b >= 0 { collect_moved_expr(g, p, src, e.b) }
@@ -16197,6 +16299,7 @@ fn emit_stmt(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
         if e.kind == 25 { emit_body(sb, p, src, c, g, e.a, false, depth)  return } // unsafe { … } block
         if e.kind == 23 { emit_body(sb, p, src, c, g, s.a, false, depth)  return } // bare { … } block
         if e.kind == 43 { emit_region(sb, p, src, c, g, s.a, depth)  return }      // region r { … }
+        if e.kind == 46 { emit_with_alive(sb, p, src, c, g, s.a, depth)  return }  // with alive … { … }
         if e.kind == 38 { emit_concurrent(sb, p, src, c, g, s.a, depth)  return }  // concurrent { … }
         if e.kind == 42 { emit_select(sb, p, src, c, g, e, depth)  return }        // select { … }
         if e.kind == 39 and g.dspawn {                                             // spawn in a loop:
@@ -17491,6 +17594,88 @@ fn emit_region(mut sb: String, read p: Parser, read src: str, read c: Checker, m
     string_push(sb, rname)
     string_push(sb, ");\n")
     line_at(sb, depth, "}")
+}
+
+// `with alive <genref> as read <name> { body } [else { els }]` (kind 46; mirrors
+// `emit_with_alive`): ONE generation check at block entry — the exact test every deref
+// emits (`((uint64_t*)ptr)[-1] == gen`, the allocation-header generation) — then
+// `j_<name>` binds the plain pointer and joins the by-pointer set for the block, so body
+// uses deref through it with NO further checks. Without `else` a stale genref FAULTS at
+// the check, exactly like a stale deref; with `else` staleness takes that arm. `_wa<n>`
+// consumes ONE number from the global temp counter, and the scrutinee emits BEFORE the
+// temp is numbered (subexpr-before-enclosing-temp; counter lockstep with the reference).
+fn emit_with_alive(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg, eid: i32, depth: i32) {
+    let e: ExprData = get(ExprData, p.ex, eid as usize)
+    var gbuf: String = string_new()                   // scrutinee emits BEFORE the temp
+    emit_expr(gbuf, p, src, c, g, e.a)
+    let n: i32 = g.tmp
+    g.tmp = g.tmp + 1
+    line_at(sb, depth, "{")
+    indent(sb, depth + 1)
+    emit_su_tyid(sb, p, src, c, g, get(i32, c.et, e.a as usize))
+    string_push(sb, " _wa")
+    push_uint__cgen(sb, n as i64)
+    string_push(sb, " = (")
+    string_push(sb, string_view(gbuf))
+    string_push(sb, ");\n")
+    string_free(gbuf)
+    if e.op < 0 {                                     // bare form: fault at entry, like a deref
+        indent(sb, depth + 1)
+        string_push(sb, "assert(((uint64_t*)_wa")
+        push_uint__cgen(sb, n as i64)
+        string_push(sb, ".ptr)[-1] == _wa")
+        push_uint__cgen(sb, n as i64)
+        string_push(sb, ".gen);\n")
+        emit_wa_bind(sb, src, e, n, depth + 1)
+        emit_wa_body(sb, p, src, c, g, e, depth + 1)
+    } else {                                          // else form: staleness takes that arm
+        indent(sb, depth + 1)
+        string_push(sb, "if (((uint64_t*)_wa")
+        push_uint__cgen(sb, n as i64)
+        string_push(sb, ".ptr)[-1] == _wa")
+        push_uint__cgen(sb, n as i64)
+        string_push(sb, ".gen) {\n")
+        emit_wa_bind(sb, src, e, n, depth + 2)
+        emit_wa_body(sb, p, src, c, g, e, depth + 2)
+        line_at(sb, depth + 1, "} else {")
+        drop_scope_enter(g)
+        let eb: ExprData = get(ExprData, p.ex, e.op as usize)
+        var i: i32 = 0
+        for i < eb.y {
+            emit_stmt(sb, p, src, c, g, get(i32, p.sar, (eb.x + i) as usize), depth + 2)
+            i = i + 1
+        }
+        drop_scope_exit_emit(sb, p, src, c, g, depth + 2)
+        line_at(sb, depth + 1, "}")
+    }
+    line_at(sb, depth, "}")
+}
+
+// The binding line: `__auto_type j_<name> = _wa<n>.ptr;` — the checked pointer, bound once.
+fn emit_wa_bind(mut sb: String, read src: str, read e: ExprData, n: i32, depth: i32) {
+    indent(sb, depth)
+    string_push(sb, "__auto_type j_")
+    string_push(sb, src[e.x as usize .. e.y as usize])
+    string_push(sb, " = _wa")
+    push_uint__cgen(sb, n as i64)
+    string_push(sb, ".ptr;\n")
+}
+
+// The body of a `with alive` block (mirrors `emit_scoped_block`): the binding joins the
+// by-pointer set for its extent, so every use derefs through the bound pointer
+// (`(*j_<name>)` / `j_<name>->f`) with no generation checks — those were spent at entry.
+fn emit_wa_body(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg, read e: ExprData, depth: i32) {
+    push(i32, g.pp, e.x)
+    push(i32, g.pp, e.y)
+    drop_scope_enter(g)
+    let blk: ExprData = get(ExprData, p.ex, e.b as usize)
+    var i: i32 = 0
+    for i < blk.y {
+        emit_stmt(sb, p, src, c, g, get(i32, p.sar, (blk.x + i) as usize), depth)
+        i = i + 1
+    }
+    drop_scope_exit_emit(sb, p, src, c, g, depth)
+    truncate(i32, g.pp, len(i32, g.pp) - 2)
 }
 
 // A `for` loop statement (kind 31; mirrors `emit_for`). The `lar` header at `e.a`:
@@ -22196,6 +22381,9 @@ fn ref_expr_id(read p: Parser, eid: i32) -> i32 {
             if e.x >= 0 and e.x < eid { off = off + 1 }
         } else if e.kind == 25 or e.kind == 38 or e.kind == 43 {   // unsafe / concurrent / region
             if e.a >= 0 and e.a < eid { off = off + 1 }
+        } else if e.kind == 46 {                      // with alive: body + else are Block structs
+            if e.b >= 0 and e.b < eid { off = off + 1 }
+            if e.op >= 0 and e.op < eid { off = off + 1 }
         } else if e.kind == 16 {                      // struct-lit path: an Ident in Rust, a Name node
             if e.a >= 0 and e.a < eid { off = off + 1 }   // here. (A GenStructLit's ctor is NOT counted:
         }                                             // the Rust parser reaches `Name(args){` through the

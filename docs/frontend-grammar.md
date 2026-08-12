@@ -199,6 +199,7 @@ For       = 'for' ForHead Block
 ForHead   = [ Conv ] IDENT 'in' Expr        -- iteration
           | Expr                             -- condition ("while")
 Region    = 'region' IDENT Block
+WithAlive = 'with' 'alive' PostfixExpr 'as' 'read' IDENT Block [ 'else' Block ]
 Unsafe    = 'unsafe' Block
 Comptime  = 'comptime' Block
 Concurrent= 'concurrent' Block
@@ -209,6 +210,14 @@ Jestyr has one loop keyword. `for` with a `binding in …` head iterates; `for`
 with a bare expression head is the `while` form. `while` and `loop` are
 **reserved** and parse as a `for` with a diagnostic, so the error is "use `for`"
 rather than a cascade.
+
+`with alive` (the checked genref scope, safety mosaic item 3) performs a
+genref's generation check once at block entry and binds a second-class `read`
+borrow of the referent for the block's extent; without `else` a stale genref
+faults at the check, with `else` staleness takes that arm. `alive` is
+contextual — an ordinary identifier everywhere else — and the scrutinee parses
+at *postfix* level, so the construct's `as` is never eaten by a cast on the
+scrutinee (`r as read` is not a type).
 
 ### Patterns
 

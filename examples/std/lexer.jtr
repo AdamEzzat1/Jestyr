@@ -52,8 +52,9 @@ fn print_kind(read src: str, t: tokens.Token) {
     if k == 4 { print_str("f-string") return }
     if k == 5 { print_str("char") return }
     if k == 6 { print_str("_") return }
-    if k == 111 { print_str("<unknown>") return }
+    if k == 112 { print_str("<unknown>") return }
     print_str(src[t.start..t.end])   // keyword or operator: label == source symbol
+                                     // (incl. `with`, kind 111 — its label is its spelling)
 }
 
 // Tokenize `src` (via the shared `tokens` module), then walk the token vector printing
@@ -77,15 +78,17 @@ fn lex(read src: str, mut it: Interner, kwcount: i64, read a: Allocator, mode: i
         let k: i32 = t.kind
         if mode == 2 { print_int(k) } else if mode == 1 { print_kind(src, t) } else { print_str(src[t.start..t.end]) }
         // Tally by kind, matching the original per-branch counters: keywords are
-        // 7..=62, idents are Ident(0) and the lone `_`(6), numbers are Int(1)/Float(2),
-        // and punctuation is every operator/Unknown (>= 63). Strings, chars, and
+        // 7..=62 plus `with` (111 — appended after Eof in the pinned numbering), idents
+        // are Ident(0) and the lone `_`(6), numbers are Int(1)/Float(2), and punctuation
+        // is every operator/Unknown (>= 63, excluding 111). Strings, chars, and
         // f-strings count only toward the total.
         if k >= 7 { if k <= 62 { nkw = nkw + 1 } }
+        if k == 111 { nkw = nkw + 1 }
         if k == 0 { nid = nid + 1 }
         if k == 6 { nid = nid + 1 }
         if k == 1 { nnum = nnum + 1 }
         if k == 2 { nnum = nnum + 1 }
-        if k >= 63 { npunct = npunct + 1 }
+        if k >= 63 { if k != 111 { npunct = npunct + 1 } }
         total = total + 1
         j = j + 1
     }

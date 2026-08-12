@@ -5197,6 +5197,11 @@ fn collect_moved_expr(mut g: Cg, read p: parser.Parser, read src: str, eid: i32)
         return
     }
     if e.kind == 43 { collect_moved_block(g, p, src, e.a)  return }   // Region block
+    if e.kind == 46 {                                 // WithAlive: body + else blocks (the genref
+        collect_moved_block(g, p, src, e.b)           // scrutinee is Copy — never a move source)
+        if e.op >= 0 { collect_moved_block(g, p, src, e.op) }
+        return
+    }
     if e.kind == 13 {                                 // Range
         if e.a >= 0 { collect_moved_expr(g, p, src, e.a) }
         if e.b >= 0 { collect_moved_expr(g, p, src, e.b) }
@@ -5403,6 +5408,7 @@ fn emit_stmt(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         if e.kind == 25 { emit_body(sb, p, src, c, g, e.a, false, depth)  return } // unsafe { … } block
         if e.kind == 23 { emit_body(sb, p, src, c, g, s.a, false, depth)  return } // bare { … } block
         if e.kind == 43 { emit_region(sb, p, src, c, g, s.a, depth)  return }      // region r { … }
+        if e.kind == 46 { emit_with_alive(sb, p, src, c, g, s.a, depth)  return }  // with alive … { … }
         if e.kind == 38 { emit_concurrent(sb, p, src, c, g, s.a, depth)  return }  // concurrent { … }
         if e.kind == 42 { emit_select(sb, p, src, c, g, e, depth)  return }        // select { … }
         if e.kind == 39 and g.dspawn {                                             // spawn in a loop:
@@ -6697,6 +6703,88 @@ fn emit_region(mut sb: String, read p: parser.Parser, read src: str, read c: typ
     string_push(sb, rname)
     string_push(sb, ");\n")
     line_at(sb, depth, "}")
+}
+
+// `with alive <genref> as read <name> { body } [else { els }]` (kind 46; mirrors
+// `emit_with_alive`): ONE generation check at block entry — the exact test every deref
+// emits (`((uint64_t*)ptr)[-1] == gen`, the allocation-header generation) — then
+// `j_<name>` binds the plain pointer and joins the by-pointer set for the block, so body
+// uses deref through it with NO further checks. Without `else` a stale genref FAULTS at
+// the check, exactly like a stale deref; with `else` staleness takes that arm. `_wa<n>`
+// consumes ONE number from the global temp counter, and the scrutinee emits BEFORE the
+// temp is numbered (subexpr-before-enclosing-temp; counter lockstep with the reference).
+fn emit_with_alive(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, eid: i32, depth: i32) {
+    let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
+    var gbuf: String = string_new()                   // scrutinee emits BEFORE the temp
+    emit_expr(gbuf, p, src, c, g, e.a)
+    let n: i32 = g.tmp
+    g.tmp = g.tmp + 1
+    line_at(sb, depth, "{")
+    indent(sb, depth + 1)
+    emit_su_tyid(sb, p, src, c, g, list.get(i32, c.et, e.a as usize))
+    string_push(sb, " _wa")
+    push_uint(sb, n as i64)
+    string_push(sb, " = (")
+    string_push(sb, string_view(gbuf))
+    string_push(sb, ");\n")
+    string_free(gbuf)
+    if e.op < 0 {                                     // bare form: fault at entry, like a deref
+        indent(sb, depth + 1)
+        string_push(sb, "assert(((uint64_t*)_wa")
+        push_uint(sb, n as i64)
+        string_push(sb, ".ptr)[-1] == _wa")
+        push_uint(sb, n as i64)
+        string_push(sb, ".gen);\n")
+        emit_wa_bind(sb, src, e, n, depth + 1)
+        emit_wa_body(sb, p, src, c, g, e, depth + 1)
+    } else {                                          // else form: staleness takes that arm
+        indent(sb, depth + 1)
+        string_push(sb, "if (((uint64_t*)_wa")
+        push_uint(sb, n as i64)
+        string_push(sb, ".ptr)[-1] == _wa")
+        push_uint(sb, n as i64)
+        string_push(sb, ".gen) {\n")
+        emit_wa_bind(sb, src, e, n, depth + 2)
+        emit_wa_body(sb, p, src, c, g, e, depth + 2)
+        line_at(sb, depth + 1, "} else {")
+        drop_scope_enter(g)
+        let eb: parser.ExprData = list.get(parser.ExprData, p.ex, e.op as usize)
+        var i: i32 = 0
+        for i < eb.y {
+            emit_stmt(sb, p, src, c, g, list.get(i32, p.sar, (eb.x + i) as usize), depth + 2)
+            i = i + 1
+        }
+        drop_scope_exit_emit(sb, p, src, c, g, depth + 2)
+        line_at(sb, depth + 1, "}")
+    }
+    line_at(sb, depth, "}")
+}
+
+// The binding line: `__auto_type j_<name> = _wa<n>.ptr;` — the checked pointer, bound once.
+fn emit_wa_bind(mut sb: String, read src: str, read e: parser.ExprData, n: i32, depth: i32) {
+    indent(sb, depth)
+    string_push(sb, "__auto_type j_")
+    string_push(sb, src[e.x as usize .. e.y as usize])
+    string_push(sb, " = _wa")
+    push_uint(sb, n as i64)
+    string_push(sb, ".ptr;\n")
+}
+
+// The body of a `with alive` block (mirrors `emit_scoped_block`): the binding joins the
+// by-pointer set for its extent, so every use derefs through the bound pointer
+// (`(*j_<name>)` / `j_<name>->f`) with no generation checks — those were spent at entry.
+fn emit_wa_body(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, read e: parser.ExprData, depth: i32) {
+    list.push(i32, g.pp, e.x)
+    list.push(i32, g.pp, e.y)
+    drop_scope_enter(g)
+    let blk: parser.ExprData = list.get(parser.ExprData, p.ex, e.b as usize)
+    var i: i32 = 0
+    for i < blk.y {
+        emit_stmt(sb, p, src, c, g, list.get(i32, p.sar, (blk.x + i) as usize), depth)
+        i = i + 1
+    }
+    drop_scope_exit_emit(sb, p, src, c, g, depth)
+    list.truncate(i32, g.pp, list.len(i32, g.pp) - 2)
 }
 
 // A `for` loop statement (kind 31; mirrors `emit_for`). The `lar` header at `e.a`:
@@ -11402,6 +11490,9 @@ fn ref_expr_id(read p: parser.Parser, eid: i32) -> i32 {
             if e.x >= 0 and e.x < eid { off = off + 1 }
         } else if e.kind == 25 or e.kind == 38 or e.kind == 43 {   // unsafe / concurrent / region
             if e.a >= 0 and e.a < eid { off = off + 1 }
+        } else if e.kind == 46 {                      // with alive: body + else are Block structs
+            if e.b >= 0 and e.b < eid { off = off + 1 }
+            if e.op >= 0 and e.op < eid { off = off + 1 }
         } else if e.kind == 16 {                      // struct-lit path: an Ident in Rust, a Name node
             if e.a >= 0 and e.a < eid { off = off + 1 }   // here. (A GenStructLit's ctor is NOT counted:
         }                                             // the Rust parser reaches `Name(args){` through the

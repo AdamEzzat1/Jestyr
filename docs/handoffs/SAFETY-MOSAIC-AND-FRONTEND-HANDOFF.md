@@ -35,38 +35,20 @@ that remains, in the order a fresh session should consider it.
   tests; `examples/dlist_genref.jtr` is back to the natural `break` form and
   its runtime pin still passes. Nothing left here.
 
-### B. Item 3 (`with alive`) — the port ladder (the one half-finished feature)
+### B. Item 3 (`with alive`) — **DONE, both sides** (2026-08-12)
 
-The reference side is complete and pinned (`34b1bc2`); the syntax exists in NO
-corpus or golden file yet, deliberately, so nothing byte-compares until the
-mirror lands. The ladder, in order:
-
-1. `tokens.jtr`: the `with` keyword — **at the END of the kind numbering** (the
-   ids are pinned by `jestyr_lexer_kind_ids_pin_the_numbering`; a mid-table
-   insert renumbers everything and the gate refuses — learned the hard way).
-2. `parser.jtr`: the new expr kind + its P2 dump arm; scrutinee parses at
-   **postfix** level (the ladder is unary → cast → postfix; anything higher
-   eats the construct's `as`). `alive` is CONTEXTUAL (`life.jtr` uses it as a
-   local). Mirror `parse_with` exactly: `with` kw, `alive` ident-checked,
-   postfix scrutinee, `as`, `read`, name, block, optional `else` block.
-3. `typeck.jtr`: kind arm — scrutinee must be GenRef (kind 10) else the
-   "takes a generational reference" diagnostic; bind name : referent in a
-   scope over the body; els checked; type Unit. P3 dump arm both sides.
-4. `escape.jtr`: walk scrutinee, bind name as borrow over body, walk els —
-   the frame rule does the containment (zero new checks, like the reference).
-5. `cgen.jtr`: both lowering forms. `_wa<n>` consumes ONE number from the
-   global temp counter in lockstep; the scrutinee emits BEFORE the temp is
-   numbered (the subexpr-before-enclosing-temp discipline); binding =
-   `__auto_type j_<name> = _wa<n>.ptr` joining the deref-on-use set for the
-   block; the check is the deref's exact test
-   (`((uint64_t*)ptr)[-1] == gen`); bare form = `assert`, else form = `if`.
-6. A corpus example (`examples/with_alive.jtr`) + **CGEN_GOLDEN_ALLOWLIST**
-   (the gates are allowlisted — a file not added is silently skipped) + a
-   runtime output pin; grammar doc (`docs/frontend-grammar.md`) + a
-   conformance-table row; `REFRESH_SEED=1` + the full gate.
-
-Reference details to mirror against: `src/{token,ast,parser,typeck,escape,
-cgen}.rs`, tests `with_alive_*` and `a_ctor_body_method_*`.
+The port ladder landed in one increment: `tokens.jtr` (`with` = kind 111,
+`Unknown` → 112; interned last, mapped explicitly — the `id + 7` rule has its
+one documented exception), `parser.jtr` (kind **46** — 45 was already `Catch`,
+the stale header-comment trap; the P2 module-dump golden caught the collision
+on the new corpus file immediately), `typeck.jtr` (+ the Block shim for
+body/else), `escape.jtr`, `cgen.jtr` (`emit_with_alive`, scrutinee-before-temp
+held byte-identical first run; `collect_moved` + `ref_expr_id` arms).
+`examples/with_alive.jtr` is corpus + allowlist + runtime-pinned
+(`with_alive_demo`); grammar doc + two conformance rows; seed refreshed.
+Post-mortem detail in `docs/safety-mosaic-next.md` item 3 — including which
+discovery walkers deliberately have NO arm (matching the reference's own
+coverage; adding one unilaterally would desync discovery order).
 
 ### C. Sized and ready, no blockers
 

@@ -7987,6 +7987,24 @@ mod c_oracle {
                 out.push(en);
                 ref_dump_block(ast, body, out);
             }
+            // WithAlive: the binding name span, span, then the genref, body block, else block.
+            ExprKind::WithAlive { genref, name, body, els } => {
+                out.push("withalive".to_string());
+                out.push(name.span.start.to_string());
+                out.push(name.span.end.to_string());
+                out.push(s);
+                out.push(en);
+                ref_dump_expr(ast, *genref, out);
+                ref_dump_block(ast, body, out);
+                match els {
+                    Some(b) => ref_dump_block(ast, b, out),
+                    None => {
+                        out.push("(".to_string());
+                        out.push("none".to_string());
+                        out.push(")".to_string());
+                    }
+                }
+            }
             // Any construct the P2 slice does not yet build dumps as `error`; the golden
             // corpus is curated to the handled constructs, so this arm stays unexercised.
             _ => {
@@ -11783,8 +11801,7 @@ fn main() -> i32 {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr"];
-
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr"];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
     /// target). This is the acceptance bar the R2 fixpoint ultimately rests on. `DUMP_DIVERGE=1`
@@ -12564,7 +12581,6 @@ fn main() -> i32 {
     }
 
     #[test]
-    #[test]
     fn dlist_genref_demo() {
         // Item 6's measured baseline: the doubly linked list with genrefs.
         // Push, traverse, unlink+free the middle, traverse again — and the
@@ -12573,6 +12589,19 @@ fn main() -> i32 {
             toks("examples/dlist_genref.jtr"),
             ["1", "2", "3", "1", "3", "99"],
             "the genref doubly linked list"
+        );
+    }
+
+    #[test]
+    fn with_alive_demo() {
+        // Mosaic item 3: the checked genref scope. The bare form's single entry check
+        // admits plain derefs inside (42, then two field reads 7/9 and a callee sum 16);
+        // the `else` form takes the body on a live genref (1) and the `else` arm — not
+        // a fault — on a stale one (0).
+        assert_eq!(
+            toks("examples/with_alive.jtr"),
+            ["42", "7", "9", "16", "1", "0"],
+            "the checked genref scope"
         );
     }
 
@@ -13120,6 +13149,8 @@ mod grammar_conformance {
         ("Match/or-pattern", "enum E { a, b, c } fn f(read e: E) -> i32 { match e { a | b => 1, c => 2 } }"),
         ("Unsafe", "fn f(p: *i32) -> i32 { return unsafe { p.* } }"),
         ("Region", "fn f() { region r { } }"),
+        ("WithAlive", "fn f(r: &i32) { with alive r as read v { print_int(v as i64) } }"),
+        ("WithAlive/else", "fn f(r: &i32) { with alive r as read v { } else { } }"),
         ("Comptime", "fn f() { comptime { } }"),
         ("Concurrent", "fn f() { concurrent { } }"),
     ];
