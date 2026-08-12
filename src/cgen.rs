@@ -3036,6 +3036,12 @@ impl<'a> Cgen<'a> {
                 self.collect_moved(b, out)
             }
             ExprKind::Region { body, .. } => self.collect_moved(body, out),
+            ExprKind::WithAlive { body, els, .. } => {
+                self.collect_moved(body, out);
+                if let Some(e) = els {
+                    self.collect_moved(e, out);
+                }
+            }
             ExprKind::Closure { body, .. } => self.collect_moved_expr(*body, out),
             ExprKind::Spawn(inner) => self.collect_moved_expr(*inner, out),
             ExprKind::ParFor { iter, reduction, body, .. } => {
@@ -3483,6 +3489,9 @@ impl<'a> Cgen<'a> {
                     ExprKind::Concurrent(b) => self.emit_concurrent(b),
                     ExprKind::Select(arms) => self.emit_select(arms),
                     ExprKind::Region { name, body } => self.emit_region(&name.name, body),
+                    ExprKind::WithAlive { genref, name, body, els } => {
+                        self.emit_with_alive(*genref, &name.name, body, els.as_ref())
+                    }
                     ExprKind::For { label, head, region, body, els } => {
                         self.emit_for(label.as_ref(), head, region.as_ref(), body, els.as_ref())
                     }
@@ -5256,6 +5265,10 @@ impl<'a> Cgen<'a> {
             }
             ExprKind::Region { .. } => {
                 self.diag(span, "`region` is only supported in statement position");
+                "0".to_string()
+            }
+            ExprKind::WithAlive { .. } => {
+                self.diag(span, "`with alive` is only supported in statement position");
                 "0".to_string()
             }
             ExprKind::Break(l) => match l {
@@ -8296,6 +8309,64 @@ impl<'a> Cgen<'a> {
         self.line(format!("jestyr_arena_free(&j_{name});"));
         self.depth -= 1;
         self.line("}");
+    }
+
+    /// `with alive <genref> as read <name> { body } [else { els }]` — the checked
+    /// genref scope (safety mosaic, item 3). ONE generation check at entry — the
+    /// exact test every deref emits (`((uint64_t*)ptr)[-1] == gen`, the
+    /// allocation-header generation) — then `name` binds as a plain pointer for
+    /// the block and uses deref through it with NO further checks. Without
+    /// `else` a stale genref FAULTS at the check, exactly like a stale deref;
+    /// with `else` staleness takes that arm. The block claims "checked once at
+    /// entry" and nothing more.
+    fn emit_with_alive(&mut self, genref: ExprId, name: &str, body: &Block, els: Option<&Block>) {
+        let g = self.emit_expr(genref);
+        let rty = self.c_type(&apply_subst(&self.info.type_of(genref).clone(), &self.subst));
+        let n = self.tmp;
+        self.tmp += 1;
+        self.line("{");
+        self.depth += 1;
+        self.line(format!("{rty} _wa{n} = ({g});"));
+        let check = format!("((uint64_t*)_wa{n}.ptr)[-1] == _wa{n}.gen");
+        if els.is_none() {
+            self.line(format!("assert({check});"));
+            self.line(format!("__auto_type j_{name} = _wa{n}.ptr;"));
+            self.emit_scoped_block(body, name);
+        } else {
+            self.line(format!("if ({check}) {{"));
+            self.depth += 1;
+            self.line(format!("__auto_type j_{name} = _wa{n}.ptr;"));
+            self.emit_scoped_block(body, name);
+            self.depth -= 1;
+            self.line("} else {");
+            self.depth += 1;
+            if let Some(e) = els {
+                self.drop_scope_enter();
+                for stmt in &e.stmts {
+                    self.emit_stmt(stmt);
+                }
+                self.drop_scope_exit_emit();
+            }
+            self.depth -= 1;
+            self.line("}");
+        }
+        self.depth -= 1;
+        self.line("}");
+    }
+
+    /// The body of a `with alive` block: `name` joins `ptr_params` for its
+    /// extent, so every use derefs through the bound pointer (`(*j_name)` /
+    /// `j_name->f`) with no generation checks — those were spent at entry.
+    fn emit_scoped_block(&mut self, body: &Block, name: &str) {
+        let added = self.ptr_params.insert(name.to_string());
+        self.drop_scope_enter();
+        for stmt in &body.stmts {
+            self.emit_stmt(stmt);
+        }
+        self.drop_scope_exit_emit();
+        if added {
+            self.ptr_params.remove(name);
+        }
     }
 
     // --- type lowering ---

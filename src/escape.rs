@@ -724,6 +724,23 @@ impl<'a> Checker<'a> {
                 self.region_depths.pop();
                 return;
             }
+            ExprKind::WithAlive { genref, name, body, els } => {
+                // The scrutinee is walked as an ordinary expression (a genref is
+                // `Copy`, so no move concerns), and `name` binds as a BORROW for
+                // the body's extent — which is the whole safety argument: the
+                // ordinary frame rule refuses to let it return, be captured,
+                // stored, or given away, so the checked-once-at-entry window is
+                // exactly the block. Nothing new is proved here on purpose.
+                self.walk_expr(ctx, *genref, false);
+                ctx.push();
+                ctx.bind(&name.name, true);
+                self.check_block(ctx, body, false);
+                ctx.pop();
+                if let Some(e) = els {
+                    self.check_block(ctx, e, false);
+                }
+                return;
+            }
             ExprKind::ParFor { var, iter, reduction, body } => {
                 // The loop variable is a *fresh* i64 element value (par_reduce copies
                 // each element into a worker), not a borrow into the iterable — so it

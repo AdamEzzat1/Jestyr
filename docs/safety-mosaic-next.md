@@ -216,7 +216,52 @@ refresh. The syntax is small; the two-sided tax is not.
 
 ---
 
-## Item 3 — checked genref scopes (`with alive p as read node { … }`)
+## Item 3 — checked genref scopes — REFERENCE SIDE LANDED; the port ladder remains
+
+**Status (2026-08-12).** The reference implements the full design, both forms:
+
+```jestyr
+with alive r as read n { … }                 // stale genref → FAULTS at entry
+with alive r as read n { … } else { … }      // stale genref → the else arm
+```
+
+One generation check at block entry (the exact test every deref emits:
+`((uint64_t*)ptr)[-1] == gen`), then `n` is a plain pointer for the block — no
+per-deref checks inside. The design questions resolved: failure is BOTH forms
+(`else` optional; absent = fault, mirroring deref semantics); the binding is
+`read`-only in v1 (a `mut` variant needs an exclusivity story first); and the
+block claims **checked once at entry, nothing more** — nothing in the language
+today prevents another holder freeing the object inside the block, and the AST
+doc + this file say so plainly. Containment needed no new machinery: the
+binding is a second-class borrow, so `return n.s` from inside the block gets
+the ordinary "cannot return borrow" refusal — verified, pinned.
+
+Settled while implementing, worth knowing for the port:
+- `with` is a full keyword (zero identifier uses corpus-wide); **`alive` is
+  contextual** (`examples/life.jtr` uses it as a local).
+- **The scrutinee parses at POSTFIX level**, not `parse_expr` and not
+  `parse_unary`: the ladder is unary → cast → postfix, and anything at or above
+  the cast level eats the construct's `as` (`r as read` → "expected a type").
+  A place chain is all a scrutinee can usefully be anyway.
+- Lowering: `{ JestyrRef_T _wa<n> = (expr); assert/if(check); __auto_type
+  j_<name> = _wa<n>.ptr; body }` — `_wa<n>` consumes one number from the global
+  temp counter (LOCKSTEP with the port), and the binding joins `ptr_params` for
+  the block so uses deref through it.
+
+**The remaining two-sided tax, in order** (the feature is reference-only until
+this is paid; no corpus/golden file uses the syntax yet, deliberately):
+
+1. Port mirror: `tokens.jtr` keyword, `parser.jtr` (new expr kind + dump arm),
+   `typeck.jtr` (kind arm: GenRef check + binding), `escape.jtr` (bind-as-
+   borrow + walk), `cgen.jtr` (both lowering forms, temp-counter lockstep).
+2. P2/P3 golden dump arms on BOTH sides for the new node kind.
+3. A corpus example (`examples/with_alive.jtr`), added to the ALLOWLISTED gates
+   (`CGEN_GOLDEN_ALLOWLIST` — the recorded trap) only once the port emits it
+   byte-identically; runtime output pinned via the c-oracle demo pattern.
+4. Grammar doc (`docs/frontend-grammar.md`) + the conformance table row +
+   `REFRESH_SEED=1` + the full gate.
+
+## Item 3 — the original design (kept for the record)
 
 **The gap.** A genref (`&T`) is checked at *every* deref, and a stale deref is a
 deterministic runtime fault. That is the right default. But code that derefs the

@@ -137,6 +137,13 @@ pub fn push_children(ast: &Ast, id: ExprId, out: &mut Vec<ExprId>) {
             }
         }
         ExprKind::Region { body, .. } => push_block(body, out),
+        ExprKind::WithAlive { genref, body, els, .. } => {
+            out.push(*genref);
+            push_block(body, out);
+            if let Some(e) = els {
+                push_block(e, out);
+            }
+        }
         ExprKind::For { head, body, els, .. } => {
             match head {
                 ForHead::Infinite => {}

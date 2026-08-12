@@ -1120,7 +1120,7 @@ impl<'src> Parser<'src> {
             }
             // Block-led expressions in statement position: parse only the block
             // form so a trailing operator cannot extend them.
-            If | Match | Unsafe | Comptime | Concurrent | Select | Region | For | While | Loop
+            If | Match | Unsafe | Comptime | Concurrent | Select | Region | With | For | While | Loop
             | LBrace => Stmt::Expr(self.parse_block_like()),
             _ => Stmt::Expr(self.parse_expr()),
         }
@@ -1135,6 +1135,7 @@ impl<'src> Parser<'src> {
             Concurrent => self.parse_concurrent(),
             Select => self.parse_select(),
             Region => self.parse_region(),
+            With => self.parse_with(),
             For => self.parse_for(),
             While | Loop => self.parse_reserved_loop(),
             LBrace => {
@@ -1586,6 +1587,7 @@ impl<'src> Parser<'src> {
             Await => self.parse_await(),
             Select => self.parse_select(),
             Region => self.parse_region(),
+            With => self.parse_with(),
             For => self.parse_for(),
             While | Loop => self.parse_reserved_loop(),
             Break => {
@@ -1836,6 +1838,36 @@ impl<'src> Parser<'src> {
         let body = self.parse_block();
         let span = start.to(body.span);
         self.ast.expr(ExprKind::Region { name, body }, span)
+    }
+
+    /// `with alive <genref> as read <name> { body } [else { els }]` — the checked
+    /// genref scope (safety mosaic, item 3; `docs/safety-mosaic-next.md`). `with`
+    /// is a keyword; `alive` is CONTEXTUAL — required here by spelling, an
+    /// ordinary identifier everywhere else (the corpus uses it as a local).
+    /// `read` is the only binding convention in v1: a `mut` variant needs an
+    /// exclusivity story first, and refusing it here keeps that honest.
+    fn parse_with(&mut self) -> ExprId {
+        let start = self.cur().span;
+        self.expect(With, "`with`");
+        let ctx = self.eat_ident("`alive`");
+        if ctx.name != "alive" {
+            self.error(ctx.span, "expected `alive` after `with` (`with alive <genref> as read <name> { … }`)");
+        }
+        // The scrutinee parses BELOW the cast level (postfix only): `with alive
+        // r as read n` must give `as` to this construct, not to a cast on `r`
+        // (`r as read` is not a type; the ladder is unary → cast → postfix, so
+        // `parse_unary` would still reach the cast). A genref scrutinee is a
+        // place chain (`r`, `self.node`, `slots[i]`), which postfix covers in
+        // full — a prefix operator on a scrutinee has no meaning here anyway.
+        let genref = self.parse_postfix();
+        self.expect(As, "`as`");
+        self.expect(Read, "`read`");
+        let name = self.eat_ident("binding name");
+        let body = self.parse_block();
+        let els = if self.eat(Else) { Some(self.parse_block()) } else { None };
+        let end = els.as_ref().map(|b| b.span).unwrap_or(body.span);
+        let span = start.to(end);
+        self.ast.expr(ExprKind::WithAlive { genref, name, body, els }, span)
     }
 
     /// `for …` — the one loop keyword (see `docs/loops-spec.md`). Four shapes:
@@ -3254,6 +3286,31 @@ mod tests {
 
     /// following operator starts a new statement rather than extending it. This is
     /// the rule that makes `if c { 1 } else { 2 } - 3` two statements, and it is
+    /// `with alive <genref> as read <name> { … } [else { … }]` parses in both
+    /// forms — and the `as` belongs to the construct, not to a cast on the
+    /// scrutinee (the trap: the ladder is unary → cast → postfix, so the
+    /// scrutinee parses at postfix level).
+    #[test]
+    fn with_alive_parses_both_forms_and_owns_its_as() {
+        for src in [
+            "fn f(r: &i32) { with alive r as read v { print_int(v as i64) } }",
+            "fn f(r: &i32) { with alive r as read v { print_int(v as i64) } else { print_int(0) } }",
+        ] {
+            let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+            let (ast, diags) = Parser::new(src, tokens).parse();
+            assert!(diags.iter().all(|d| !d.is_error()), "clean parse of {src:?}: {diags:?}");
+            let has = (0..ast.exprs.len()).any(|i| {
+                matches!(ast.expr_at(crate::ast::ExprId(i as u32)).kind, ExprKind::WithAlive { .. })
+            });
+            assert!(has, "a WithAlive node parsed in {src:?}");
+        }
+        // `alive` stays an ordinary identifier everywhere else.
+        let src = "fn f() -> i32 { let alive: i32 = 1 return alive }";
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (_ast, diags) = Parser::new(src, tokens).parse();
+        assert!(diags.iter().all(|d| !d.is_error()), "`alive` is contextual: {diags:?}");
+    }
+
     /// easy to break by routing statement parsing through `parse_expr`.
     #[test]
     fn a_block_led_statement_is_not_extended_by_a_trailing_operator() {

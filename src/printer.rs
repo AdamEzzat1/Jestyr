@@ -409,6 +409,10 @@ impl<'a> Printer<'a> {
                 format!("select {{ {} }}", a.join(" "))
             }
             ExprKind::Region { name, .. } => format!("region {} {{ ... }}", name.name),
+            ExprKind::WithAlive { genref, name, els, .. } => {
+                let tail = if els.is_some() { " else { ... }" } else { "" };
+                format!("with alive {} as read {} {{ ... }}{tail}", self.expr_inline(*genref), name.name)
+            }
             ExprKind::For { head, els, .. } => {
                 let tail = if els.is_some() { " else { ... }" } else { "" };
                 match head {

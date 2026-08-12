@@ -3395,6 +3395,34 @@ impl<'a> TypeChecker<'a> {
                 self.infer_block(scope, typ, self_ty, body);
                 Ty::Unit
             }
+            ExprKind::WithAlive { genref, name, body, els } => {
+                // The scrutinee must be a generational reference `&T`; the block
+                // binds `name : T` (a second-class `read` borrow of the referent,
+                // enforced by the escape checker) for the body's extent.
+                let gt = self.infer(scope, typ, self_ty, *genref);
+                let inner = match &gt {
+                    Ty::GenRef(inner) => (**inner).clone(),
+                    Ty::Unknown | Ty::Error => Ty::Unknown,
+                    other => {
+                        let shown = other.display(&self.table);
+                        self.error(
+                            self.ast.expr_at(*genref).span,
+                            format!(
+                                "`with alive` takes a generational reference `&T`, found `{shown}` —                                  only a genref carries the generation this block checks"
+                            ),
+                        );
+                        Ty::Unknown
+                    }
+                };
+                scope.push(HashMap::new());
+                scope.last_mut().unwrap().insert(name.name.clone(), inner);
+                self.infer_block(scope, typ, self_ty, body);
+                scope.pop();
+                if let Some(e) = els {
+                    self.infer_block(scope, typ, self_ty, e);
+                }
+                Ty::Unit
+            }
             ExprKind::For { head, body, els, .. } => {
                 match head {
                     ForHead::Infinite => {
@@ -5836,6 +5864,39 @@ mod tests {
             .find_map(|(i, e)| matches!(e.kind, ExprKind::Closure { .. }).then_some(ExprId(i as u32)))
             .expect("the closure");
         assert!(matches!(info.type_of(clo), Ty::Opaque(s) if s == "closure"));
+    }
+
+    /// `with alive` requires a genref scrutinee and binds the referent's type;
+    /// the escape checker contains the binding by the ordinary frame rule.
+    #[test]
+    fn with_alive_types_the_binding_and_rejects_non_genrefs() {
+        let src = "struct N { s: String }                    fn ok(read r: &N) { with alive r as read n { print_str(n.s as str) } }                    fn bad(x: i32) { with alive x as read v { print_int(v as i64) } }";
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (ast, _pd) = crate::parser::Parser::new(src, tokens).parse();
+        let (info, diags) = check(&ast);
+        assert!(
+            diags.iter().any(|d| d.message.contains("takes a generational reference")),
+            "the i32 scrutinee is rejected: {diags:?}"
+        );
+        // In `ok`, the binding's uses type as the referent (String field reachable).
+        let renders: Vec<String> = (0..ast.exprs.len())
+            .map(|i| info.type_of(ExprId(i as u32)).display(&info.table))
+            .collect();
+        assert!(renders.iter().any(|r| r == "N"), "the binding types as the referent: {renders:?}");
+    }
+
+    /// The block's borrow cannot leave it — no new machinery, the frame rule.
+    #[test]
+    fn with_alive_binding_is_contained_by_the_frame_rule() {
+        let src = "struct N { s: String }                    fn steal(read r: &N) -> String {                        with alive r as read n { return n.s }                        return string_new()                    }";
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (ast, _pd) = crate::parser::Parser::new(src, tokens).parse();
+        let (info, _d) = check(&ast);
+        let esc = crate::escape::check(&ast, &info);
+        assert!(
+            esc.iter().any(|d| d.message.contains("cannot return borrow `n`")),
+            "the binding cannot escape the block: {esc:?}"
+        );
     }
 
     /// A generic-struct ctor-body method's `self` is the REAL instance type

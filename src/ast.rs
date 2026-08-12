@@ -311,6 +311,16 @@ pub enum ExprKind {
     /// into it are zero-cost; the whole arena is freed at the block's end.
     Region { name: Ident, body: Block },
 
+    /// `with alive <genref> as read <name> { body } [else { els }]` — the checked
+    /// genref scope (safety mosaic, item 3). ONE generation check at block entry
+    /// binds `name` as a second-class `read` borrow of the referent for the
+    /// block's extent (no per-deref checks inside); the borrow dies with the
+    /// block by the ordinary frame rule. Without `else`, a stale genref FAULTS
+    /// at the check, exactly like a stale deref; with `else`, staleness takes
+    /// that arm instead. The block claims "checked once at entry" and nothing
+    /// more — the docs say so plainly.
+    WithAlive { genref: ExprId, name: Ident, body: Block, els: Option<Block> },
+
     /// A loop — the one looping keyword (design: unified `for`, see
     /// `docs/loops-spec.md`). The header selects the shape; the binding carries a
     /// `read`/`mut` convention, exactly like a parameter. An optional `region`

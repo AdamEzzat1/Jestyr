@@ -141,6 +141,14 @@ pub enum TokenKind {
 
     // --- Sentinels ---
     Eof,
+    /// `with` — the checked-scope opener (`with alive r as read v { … }`;
+    /// safety mosaic item 3). `alive` stays contextual (an ordinary identifier
+    /// elsewhere — the corpus uses it as a local), like `par`. Appended at the
+    /// END of the enum: the numeric kind ids up to `Eof` are PINNED against the
+    /// self-hosted tokenizer (`jestyr_lexer_kind_ids_pin_the_numbering`), so a
+    /// new token may only ever take the next free id — inserting mid-enum
+    /// renumbers everything after it and the gate rightly refuses.
+    With,
     Unknown, // an unrecognized character; a diagnostic was emitted
 }
 
@@ -180,6 +188,7 @@ impl TokenKind {
             "spawn" => Spawn,
             "await" => Await,
             "select" => Select,
+            "with" => With,
             "unsafe" => Unsafe,
             "trusted" => Trusted,
             "extern" => Extern,
@@ -251,6 +260,7 @@ impl TokenKind {
             Spawn => "spawn",
             Await => "await",
             Select => "select",
+            With => "with",
             Unsafe => "unsafe",
             Trusted => "trusted",
             Extern => "extern",
