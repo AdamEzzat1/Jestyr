@@ -834,6 +834,26 @@ fn walk_expr(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src
                             string_free(sb)
                         } else { e_bind_region(e, tgt.start as i32, tgt.end as i32) }
                     }
+                    // A store THROUGH a place chain (`h.*.p = region_alloc(inner, ...)`) whose
+                    // ROOT binding was declared outside the current `region` block reaches
+                    // storage that outlives the arena -- the demonstrated use-after-free that
+                    // compiled clean (mosaic item 5's motivating hole). Mirrors the reference's
+                    // Field/Index/Deref arm: root via root_place, same depth compare.
+                    if tgt.kind == 5 or tgt.kind == 6 or tgt.kind == 7 {
+                        let rp2: i32 = root_place(e, p, c, src, d.a)
+                        let rd2: parser.ExprData = list.get(parser.ExprData, p.ex, rp2 as usize)
+                        if rd2.kind == 2 {
+                            let dep2: i32 = e_scope_depth_of(e, src, rd2.start, rd2.end)
+                            if dep2 >= 0 and dep2 < rdep {
+                                var sb2: String = string_new()
+                                string_push(sb2, "cannot store region-allocated value through `")
+                                string_push(sb2, src[rd2.start .. rd2.end])
+                                string_push(sb2, "`: it is declared outside the `region` block, so this storage outlives the arena (copy the value into an owned `String`, or allocate it in the outer region)")
+                                ediag(e, d.start, d.end, string_view(sb2))
+                                string_free(sb2)
+                            }
+                        }
+                    }
                 }
             }
         }

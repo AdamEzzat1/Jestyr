@@ -4766,7 +4766,7 @@ impl<'a> Cgen<'a> {
                 // would yield the statement-expression *value* and gcc would report
                 // "lvalue required as left operand of assignment". `emit_place`
                 // lowers the whole projection chain through element addresses.
-                if self.place_through_checked_index(*target) {
+                if self.place_through_checked_index(*target) || self.place_through_genref_deref(*target) {
                     let t = self.emit_place(*target, true);
                     let v = self.emit_expr(*value);
                     return format!("{t} {} {v}", assign_c(*op));
@@ -9198,6 +9198,28 @@ impl<'a> Cgen<'a> {
         }
     }
 
+    /// Does this place reach through a **genref deref** (`p.*`, `p.*.f`,
+    /// `p.*.f[i]`, …)? Writing through one cannot use `emit_expr` — the checked
+    /// deref is a statement expression, an rvalue — so the target routes through
+    /// [`Self::emit_place`], whose genref arm yields the `(*({ …; ptr; }))`
+    /// lvalue instead. Found by the first program to WRITE through a genref
+    /// field (`examples/dlist_genref.jtr`) — no corpus file had, so the read
+    /// path's rvalue shape had never been asked to be assignable.
+    fn place_through_genref_deref(&self, id: ExprId) -> bool {
+        match &self.ast.expr_at(id).kind {
+            ExprKind::Deref { base } => {
+                matches!(
+                    apply_subst(&self.info.type_of(*base).clone(), &self.subst),
+                    Ty::GenRef(_)
+                ) || self.place_through_genref_deref(*base)
+            }
+            ExprKind::Field { base, .. } | ExprKind::Index { base, .. } => {
+                self.place_through_genref_deref(*base)
+            }
+            _ => false,
+        }
+    }
+
     /// Emit `id` as a C **lvalue** — a place, not a value.
     ///
     /// Identical to `emit_expr` for every form except a checked index, which
@@ -9258,6 +9280,23 @@ impl<'a> Cgen<'a> {
                     self.tmp += 1;
                     return format!(
                         "(*({{ {sty} _s{n} = ({b}); size_t _ix{n} = (size_t)({i}); assert(_ix{n} < _s{n}.len); &_s{n}.ptr[_ix{n}]; }}))"
+                    );
+                }
+                self.emit_expr(id)
+            }
+            ExprKind::Deref { base } => {
+                let base = *base;
+                let bt = apply_subst(&self.info.type_of(base).clone(), &self.subst);
+                if let Ty::GenRef(_) = bt {
+                    // The same generation check the reading deref performs, but
+                    // yielding the POINTER so the surrounding `(*…)` is a real C
+                    // lvalue — assignable, addressable, projectable.
+                    let rty = self.c_type(&bt);
+                    let b = self.emit_expr(base);
+                    let n = self.tmp;
+                    self.tmp += 1;
+                    return format!(
+                        "(*({{ {rty} _r{n} = ({b}); assert(((uint64_t*)_r{n}.ptr)[-1] == _r{n}.gen); _r{n}.ptr; }}))"
                     );
                 }
                 self.emit_expr(id)

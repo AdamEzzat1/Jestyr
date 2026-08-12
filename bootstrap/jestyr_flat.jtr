@@ -10216,6 +10216,26 @@ fn walk_expr(mut e: Esc, read p: Parser, read c: Checker, read src: str, id: i32
                             string_free(sb)
                         } else { e_bind_region(e, tgt.start as i32, tgt.end as i32) }
                     }
+                    // A store THROUGH a place chain (`h.*.p = region_alloc(inner, ...)`) whose
+                    // ROOT binding was declared outside the current `region` block reaches
+                    // storage that outlives the arena -- the demonstrated use-after-free that
+                    // compiled clean (mosaic item 5's motivating hole). Mirrors the reference's
+                    // Field/Index/Deref arm: root via root_place, same depth compare.
+                    if tgt.kind == 5 or tgt.kind == 6 or tgt.kind == 7 {
+                        let rp2: i32 = root_place(e, p, c, src, d.a)
+                        let rd2: ExprData = get(ExprData, p.ex, rp2 as usize)
+                        if rd2.kind == 2 {
+                            let dep2: i32 = e_scope_depth_of(e, src, rd2.start, rd2.end)
+                            if dep2 >= 0 and dep2 < rdep {
+                                var sb2: String = string_new()
+                                string_push(sb2, "cannot store region-allocated value through `")
+                                string_push(sb2, src[rd2.start .. rd2.end])
+                                string_push(sb2, "`: it is declared outside the `region` block, so this storage outlives the arena (copy the value into an owned `String`, or allocate it in the outer region)")
+                                ediag(e, d.start, d.end, string_view(sb2))
+                                string_free(sb2)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -11672,6 +11692,25 @@ fn place_through_checked_index(read g: Cg, read p: Parser, read src: str, read c
     return place_through_checked_index(g, p, src, c, e.a)
 }
 
+// Does `eid` reach through a GENREF DEREF (`h.*`, `h.*.f`, `h.*.f[i]`)? Writing through one
+// cannot use `emit_expr` — the checked deref is a statement expression, an rvalue — so the
+// target routes through `emit_place`, whose genref arm yields `(*({ …; ptr; }))` instead.
+// Mirrors `place_through_genref_deref`; found by the first program to WRITE through a genref
+// field (`dlist_genref.jtr` / region_escape.jtr route 3).
+fn place_through_genref_deref(read p: Parser, read c: Checker, eid: i32) -> bool {
+    let e: ExprData = get(ExprData, p.ex, eid as usize)
+    if e.kind == 7 {                                  // Deref
+        let bt: i32 = get(i32, c.et, e.a as usize)
+        if bt >= 0 {
+            let bd: TyData = get(TyData, c.tys, bt as usize)
+            if bd.kind == 10 { return true }          // GenRef
+        }
+        return place_through_genref_deref(p, c, e.a)
+    }
+    if e.kind == 5 or e.kind == 6 { return place_through_genref_deref(p, c, e.a) }
+    return false
+}
+
 // Emit `eid` as a C LVALUE — a place, not a value. Identical to `emit_expr` for every form except
 // a checked index, which becomes the address-yielding `(*({ …; &elem; }))`: the statement
 // expression produces a *pointer*, and dereferencing it gives back a place, so a projection chain
@@ -11768,6 +11807,38 @@ fn emit_place(mut sb: String, read p: Parser, read src: str, read c: Checker, mu
             string_free(sbuf)
             string_free(sibuf)
             return
+        }
+        emit_expr(sb, p, src, c, g, eid)
+        return
+    }
+    if e.kind == 7 {                                  // Deref of a GENREF: the lvalue form
+        let bt: i32 = get(i32, c.et, e.a as usize)
+        if bt >= 0 {
+            let bd: TyData = get(TyData, c.tys, bt as usize)
+            if bd.kind == 10 {
+                // The same generation check the reading deref performs, but yielding the
+                // POINTER so the surrounding `(*…)` is a real C lvalue. Base emits BEFORE
+                // the temp (counter lockstep with the reference).
+                var rbuf: String = string_new()
+                emit_expr(rbuf, p, src, c, g, e.a)
+                let nr: i32 = g.tmp
+                g.tmp = g.tmp + 1
+                string_push(sb, "(*({ ")
+                emit_ty_c(sb, p, src, c, bt)
+                string_push(sb, " _r")
+                push_uint__cgen(sb, nr as i64)
+                string_push(sb, " = (")
+                string_push(sb, string_view(rbuf))
+                string_push(sb, "); assert(((uint64_t*)_r")
+                push_uint__cgen(sb, nr as i64)
+                string_push(sb, ".ptr)[-1] == _r")
+                push_uint__cgen(sb, nr as i64)
+                string_push(sb, ".gen); _r")
+                push_uint__cgen(sb, nr as i64)
+                string_push(sb, ".ptr; }))")
+                string_free(rbuf)
+                return
+            }
         }
         emit_expr(sb, p, src, c, g, eid)
         return
@@ -12285,7 +12356,7 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
         // `emit_expr` cannot produce at all — it would yield the statement-expression *value*, and
         // gcc reports "lvalue required as left operand of assignment". `emit_place` lowers the
         // whole projection chain through element addresses.
-        if place_through_checked_index(g, p, src, c, e.a) {
+        if place_through_checked_index(g, p, src, c, e.a) or place_through_genref_deref(p, c, e.a) {
             emit_place(sb, p, src, c, g, e.a, true)
             string_push(sb, " ")
             string_push(sb, assign_c(e.op))
@@ -13880,6 +13951,10 @@ fn emit_call(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
             return
         }
         if str_eq(nm, "region_alloc") {               // region_alloc(r, T, v): bump-alloc + init, plain ptr. ONE temp.
+            // the VALUE emits first (its own temps number before this one --
+            // reference order; latent until a nested region_alloc existed)
+            var vbuf0: String = string_new()
+            emit_expr(vbuf0, p, src, c, g, arg_at(p, e, 2))
             let n: i32 = g.tmp
             g.tmp = g.tmp + 1
             let r0: ExprData = get(ExprData, p.ex, arg_at(p, e, 0) as usize)
@@ -13896,7 +13971,8 @@ fn emit_call(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
             string_push(sb, ")); *_p")
             push_uint__cgen(sb, n as i64)
             string_push(sb, " = (")
-            emit_expr(sb, p, src, c, g, arg_at(p, e, 2))
+            string_push(sb, string_view(vbuf0))
+            string_free(vbuf0)
             string_push(sb, "); _p")
             push_uint__cgen(sb, n as i64)
             string_push(sb, "; })")
@@ -16845,6 +16921,11 @@ fn emit_match(mut sb: String, read p: Parser, read src: str, read c: Checker, mu
         string_free(pfx)
         return
     }
+    // the scrutinee emits FIRST (its own temps number before the match temp --
+    // reference order; latent until a scrutinee that CONSUMES temps existed,
+    // e.g. `match node.*.prev` through a genref deref)
+    var scr0: String = string_new()
+    emit_expr(scr0, p, src, c, g, scrut)
     let n: i32 = g.tmp
     g.tmp = g.tmp + 1
     indent(sb, depth)
@@ -16852,7 +16933,8 @@ fn emit_match(mut sb: String, read p: Parser, read src: str, read c: Checker, mu
     string_push(sb, " jm_")
     push_uint__cgen(sb, n as i64)
     string_push(sb, " = ")
-    emit_expr(sb, p, src, c, g, scrut)
+    string_push(sb, string_view(scr0))
+    string_free(scr0)
     string_push(sb, ";\n")
     indent(sb, depth)
     string_push(sb, "switch (jm_")  push_uint__cgen(sb, n as i64)  string_push(sb, ".tag)\n")

@@ -295,24 +295,78 @@ and the documentation must say so plainly, or this becomes a mechanism that
 
 ## Items 5–8 — design only, with the reason each is not next
 
-### 5. Branded region tokens
+### 5. Branded region tokens — the hole is real, its KERNEL is closed, brands stay design-only
 
-Give a region a *type-level brand* so a reference cannot be used with the wrong
-region. Value: catches cross-region mistakes at compile time. **Why not next:**
-brands are the mechanism most likely to fail the lifetime test above — they want
-to appear in every signature that touches a region, which is exactly the
-"inferred, pervasive, structural" shape being avoided. Design must show ordinary
-region code unchanged before any code is written.
+**Measured (2026-08-12).** The premise was tested before designing: cross-region
+confusion was not hypothetical but a **demonstrated use-after-free that
+compiled clean** —
 
-### 6. Safe mutable graph cells (`Cell[r, T]`)
+```jestyr
+region outer {
+    var h: &[outer]Holder = region_alloc(outer, Holder, …)
+    region inner {
+        h.*.p = region_alloc(inner, str, "gone")   // stored through outer storage
+    }
+    print_str(h.*.p.*)                              // reads the freed inner arena
+}
+```
 
-The highest-value item on the list, because it addresses the motivating problem
-directly: doubly linked lists, parent pointers, observer lists. A region-scoped
-cell with interior mutability and index-like handles could make in-place graph
-mutation expressible without `unsafe`. **Why not next:** highest risk, and it
-interacts with drop, with regions, and with the concurrency story simultaneously.
-Wants worked *examples first* — write the doubly linked list you wish you could
-write, then design backwards from it. Do that before proposing syntax.
+The assign-to-outer rule checked only bare `Name` targets; a store *through a
+place chain* rooted outside the region escaped it. **Closed lexically** — the
+same depth compare applied to the chain's root — with zero syntax, both
+toolchains, pinned as escape route 3 in `examples/region_escape.jtr` (the P4
+golden holds both sides to it). Ordinary region code is unchanged *by
+construction*, which was this item's design constraint.
+
+**What brands would still buy — the honest residue:** (a) a root ALIASED inside
+the region to outer storage (`var alias = h` inside `inner`, then store through
+`alias`); (b) a store performed by a *callee* the checker doesn't look into.
+Both are now written down as the actual value proposition, replacing the
+original hypothesis. Brands remain design-only: they still want to appear in
+signatures (the lifetime test), and the residue is narrow enough that the next
+step, if any, is taint-tracking the alias case lexically — not a type system.
+
+### 6. Safe mutable graph cells — the worked example EXISTS; design from its data
+
+**The prescribed method was followed** (2026-08-12): the doubly linked list is
+written, working, and pinned — `examples/dlist_genref.jtr` (push, traverse,
+unlink+free the middle, traverse again; byte-identical across both toolchains
+and runtime-pinned). It is the list you CAN write today, and it produced five
+concrete data for the design to beat:
+
+1. **No self-referential initialization exists** — a sentinel ring cannot be
+   constructed at all (struct init requires every field; there is no two-phase
+   form). Every link is therefore `enum Link { nil, at(n: &Node) }` and every
+   hop is a `match`.
+2. **Enums are never `Copy` and there is no opt-in** — so the niche `Link` over
+   a Copy genref is conservatively non-Copy, and pointer surgery through `read`
+   params trips escape route 3.
+3. **The fix is `take` on genref params** — semantically free (genrefs are
+   Copy), syntactically load-bearing, and non-obvious. Ceremony that a cell
+   mechanism should erase.
+4. **Genref-field WRITES had never been emitted by any program** — the checked
+   deref was an rvalue statement expression; the first write found the gap
+   (fixed both toolchains: the `emit_place` genref arm, `(*({ …; ptr; }))`).
+5. **`break` inside a switch-lowered `match` inside a loop miscompiles** (exits
+   the C switch, not the loop — an infinite loop from correct-looking code).
+   Tracked as its own fix; the example carries the flag workaround.
+
+Plus the run-cost profile the design must beat: one heap allocation + generation
+header per node, a checked deref per hop, per-node frees.
+
+**The design, derived backwards:** what the example actually suffered from was
+not checking cost — it was ceremony (1–3) and tooling gaps (4–5). A `Cell[r, T]`
+arena would buy: arena locality + one-shot drop (vs per-node malloc/free),
+handle = index (no generation header), and — if handles are region-scoped —
+zero per-hop checks *inside the region's lexical extent*, the same argument
+`with alive` makes for one object generalized to an arena. The open questions
+that remain before syntax: what a dangling *index* means after `remove` (an
+index is not generation-checked — either handles carry generations again, which
+is the genref tier re-invented, or removal invalidates nothing and stale
+indices read *wrong-but-live* data, which must be said plainly); and whether
+`nil` links stay an enum or the cell type carries a null index. Wants item 7's
+linear-capability thinking nearby before committing. Still design-only — but
+now design-with-data rather than design-from-scratch.
 
 ### 7. Linear capabilities (`linear File`)
 

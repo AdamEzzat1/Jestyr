@@ -561,18 +561,46 @@ impl<'a> Checker<'a> {
                 // region-marked too (a later `return` of it is then also caught).
                 if let Some(&region_depth) = self.region_depths.last() {
                     if self.is_region_value(ctx, *value) && self.carries_arena_ref(*value) {
-                        if let ExprKind::Name(n) = &self.ast.expr_at(*target).kind {
-                            let n = n.name.clone();
-                            match ctx.scope_depth_of(&n) {
-                                Some(d) if d < region_depth => self.error(
-                                    span,
-                                    format!(
-                                        "cannot store region-allocated value into `{n}`: it is declared outside the \
-                                         `region` block and would outlive the arena (copy it into an owned `String`)"
+                        match &self.ast.expr_at(*target).kind {
+                            ExprKind::Name(n) => {
+                                let n = n.name.clone();
+                                match ctx.scope_depth_of(&n) {
+                                    Some(d) if d < region_depth => self.error(
+                                        span,
+                                        format!(
+                                            "cannot store region-allocated value into `{n}`: it is declared outside the \
+                                             `region` block and would outlive the arena (copy it into an owned `String`)"
+                                        ),
                                     ),
-                                ),
-                                _ => ctx.bind_region(&n),
+                                    _ => ctx.bind_region(&n),
+                                }
                             }
+                            // A store THROUGH a place chain (`h.*.p = region_alloc(inner, …)`)
+                            // whose ROOT binding was declared outside the current `region`
+                            // block reaches storage that outlives the arena — the same dangle
+                            // as the bare-binding case, one deref deeper. This was a
+                            // demonstrated use-after-free that compiled clean (mosaic item 5's
+                            // motivating hole, closed lexically — no brands needed for the
+                            // root-outside shape). Honest limits, recorded in
+                            // `docs/safety-mosaic-next.md`: a root ALIASED inside the region
+                            // to outer storage, or a store performed by a callee, still gets
+                            // through — that residue is what a type-level mechanism would buy.
+                            ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Deref { .. } => {
+                                let root = self.root_name(ctx, *target);
+                                if let Some(d) = ctx.scope_depth_of(&root) {
+                                    if d < region_depth {
+                                        self.error(
+                                            span,
+                                            format!(
+                                                "cannot store region-allocated value through `{root}`: it is declared \
+                                                 outside the `region` block, so this storage outlives the arena \
+                                                 (copy the value into an owned `String`, or allocate it in the outer region)"
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }

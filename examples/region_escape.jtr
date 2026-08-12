@@ -5,7 +5,7 @@
 // text *provably* safe, not merely safe-by-construction — something no surveyed
 // string design (Swift/Zig/Rust/Erlang) can do.
 //
-// Run:  jestyrc check examples/region_escape.jtr   →  2 errors (both escapes below)
+// Run:  jestyrc check examples/region_escape.jtr   →  3 errors (every escape below)
 
 // Escape route 1 — RETURN: a region value can't outlive its arena.
 fn build_in_region() -> str {
@@ -24,6 +24,23 @@ fn leak_via_outer() -> i32 {
         saved = region_concat(r, "a", "b")   // ERROR: `saved` outlives the arena
     }
     print_str(saved)        // would be a use-after-free
+    return 0
+}
+
+// Escape route 3 — STORE-THROUGH-OUTER: writing an inner-region value through a
+// place chain whose ROOT lives in an outer region reaches storage that outlives
+// the inner arena — the same dangle as route 2, one deref deeper. This shape
+// compiled clean (a demonstrated use-after-free) before the rule covered place
+// chains, not just bare bindings.
+struct Holder { p: &[r]str }
+fn leak_via_outer_structure() -> i32 {
+    region outer {
+        var h: &[outer]Holder = region_alloc(outer, Holder, Holder { p: region_alloc(outer, str, "ok") })
+        region inner {
+            h.*.p = region_alloc(inner, str, "gone")   // ERROR: `h`'s storage outlives `inner`
+        }
+        print_str(h.*.p.*)  // would read the freed inner arena
+    }
     return 0
 }
 

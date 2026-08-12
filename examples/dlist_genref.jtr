@@ -1,0 +1,100 @@
+// examples/dlist_genref.jtr — the doubly linked list, written the way the
+// language allows TODAY: generational references (design §4.4).
+//
+// This file is safety-mosaic item 6's measured baseline. The design doc's
+// method is "write the doubly linked list you wish you could write, then design
+// backwards from it" — this is the list you CAN write, and its ceremony is the
+// data that design starts from:
+//
+//   • links are nullable, so every link is an `enum Link { nil, at(...) }` and
+//     every hop is a `match` — there is no self-referential initializer, so a
+//     sentinel ring cannot even be constructed (the first datum this file
+//     produced: two-phase init does not exist);
+//   • every node is its own heap allocation with a generation header;
+//   • every deref pays a generation check — that is the tier's promise (a
+//     stale touch FAULTS deterministically), and its price;
+//   • removal is unlink + `gen_free`; the freed node's storage is gone but
+//     every surviving handle to it is safely dead, not dangling.
+//
+// What item 6's region-scoped cells would have to beat, concretely: one
+// allocation per node vs arena locality; a checked deref per hop vs zero; and
+// per-node frees vs one arena drop.
+//
+// Run:  jestyrc run examples/dlist_genref.jtr   →  1 2 3 / 1 3 / 99
+
+enum Link {
+    nil,
+    at(n: &Node),
+}
+
+struct Node {
+    v: i64,
+    prev: Link,
+    next: Link,
+}
+
+// Append `v` after `last`, returning the new node's handle.
+fn push_after(take last: &Node, v: i64) -> &Node {
+    let node: &Node = gen_new(Node, Node { v: v, prev: at(last), next: nil })
+    last.*.next = at(node)
+    return node
+}
+
+// Print the list front-to-back, one checked deref per hop.
+//
+// (The natural form — `for { match cur { nil => break, … } }` — currently
+// MISCOMPILES: a `break` inside a switch-lowered match exits the C switch, not
+// the loop. Found by this file; tracked as its own fix. The flag is the
+// workaround, and ceremony datum #5 for item 6's design.)
+fn print_forward(head: &Node) {
+    var cur: Link = at(head)
+    var going: bool = true
+    for going {
+        match cur {
+            nil => { going = false },
+            at(n) => {
+                print_int(n.*.v)
+                cur = n.*.next
+            },
+        }
+    }
+}
+
+// Unlink `node` from its neighbors and free it. The bidirectional patch is the
+// operation that makes doubly linked lists the mosaic's motivating problem:
+// with genrefs it is ordinary field writes, safe because every handle is
+// generation-checked rather than borrow-checked.
+//
+// `take` on a genref param is semantically free (a genref is `Copy`) but
+// load-bearing here: a `read` param roots a borrow-place, and `Link` — an enum,
+// and ENUMS ARE NEVER `Copy` (there is no opt-in) — read out of one borrow and
+// stored through another trips escape route 3. Passing the handle by value
+// clears every store below. Ceremony datum for item 6's design.
+fn remove(take node: &Node) {
+    match node.*.prev {
+        nil => {},
+        at(p) => { p.*.next = node.*.next },
+    }
+    match node.*.next {
+        nil => {},
+        at(nx) => { nx.*.prev = node.*.prev },
+    }
+    gen_free(node)
+}
+
+fn main() -> i32 {
+    let a: &Node = gen_new(Node, Node { v: 1, prev: nil, next: nil })
+    let b: &Node = push_after(a, 2)
+    let c: &Node = push_after(b, 3)
+    print_forward(a)      // 1 2 3
+
+    remove(b)             // unlink + free the middle node
+    print_forward(a)      // 1 3
+
+    // The dead handle is SAFELY dead: `b.*` here would fault deterministically,
+    // not read freed memory. Print a marker instead of faulting the demo.
+    print_int(99)
+    gen_free(c)
+    gen_free(a)
+    return 0
+}
