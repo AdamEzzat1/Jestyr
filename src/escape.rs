@@ -1035,8 +1035,13 @@ impl<'a> Checker<'a> {
     /// safe way to share mutable state across tasks is a raw `*mut T` in `unsafe`.
     fn check_spawn_no_shared_mut_slice(&mut self, call: ExprId) {
         let ExprKind::Call { callee, .. } = &self.ast.expr_at(call).kind else { return };
-        let ExprKind::Name(n) = &self.ast.expr_at(*callee).kind else { return };
-        let Some(sig) = self.info.table.fns.get(&n.name) else { return };
+        // The recorded resolution, not a bare-`Name` match: a QUALIFIED spawn
+        // target (`spawn m.fill(s)`) has a `Field` callee and skipped this check
+        // entirely — two tasks could share a `mut` slice through exactly the
+        // spelling the module system encourages. Same consolidation as the four
+        // call checks above (Stage 3), same class of hole.
+        let Some(name) = self.resolved_callee_name(call, *callee) else { return };
+        let Some(sig) = self.info.table.fns.get(&name) else { return };
         let mut hit: Option<String> = None;
         for p in &sig.params {
             if matches!(p.conv, Conv::Mut | Conv::Out) && matches!(p.ty, Ty::Slice(_)) {
@@ -1046,7 +1051,7 @@ impl<'a> Checker<'a> {
         }
         if let Some(pname) = hit {
             let span = self.ast.expr_at(call).span;
-            let fname = n.name.clone();
+            let fname = name.clone();
             self.error(
                 span,
                 format!(
@@ -1278,10 +1283,22 @@ impl<'a> Checker<'a> {
         );
     }
 
-    /// Find a top-level function declaration by name.
+    /// Find a top-level function declaration by its **canonical** name —
+    /// mirroring typeck's `find_fn_decl`: each item's bare name is canonicalized
+    /// under its owning module before comparing, so a non-colliding name matches
+    /// its bare spelling exactly as before, and a colliding one matches only the
+    /// disambiguated `name__m<id>` — never the wrong module's definition.
     fn find_fn(&self, name: &str) -> Option<&'a FnDecl> {
-        self.ast.items.iter().find_map(|it| match it {
-            Item::Fn(f) if f.name.name == name => Some(f),
+        self.ast.items.iter().enumerate().find_map(|(i, it)| match it {
+            Item::Fn(f)
+                if crate::types::canon(
+                    *self.info.item_mod.get(i).unwrap_or(&0),
+                    &f.name.name,
+                    &self.info.dup_fns,
+                ) == name =>
+            {
+                Some(f)
+            }
             _ => None,
         })
     }

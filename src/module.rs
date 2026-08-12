@@ -1546,6 +1546,34 @@ mod tests {
         );
     }
 
+    /// The spawn race check fires through a **qualified** target too: `spawn
+    /// m.fill(s)` has a `Field` callee, and the bare-`Name` match skipped it
+    /// entirely — two tasks could share a `mut` slice through exactly the
+    /// spelling the module system encourages. Stage 3's consolidation routes it
+    /// through the recorded resolution like every other call check.
+    #[test]
+    fn a_qualified_spawn_target_still_gets_the_race_check() {
+        let dir = fixture(
+            "spawn_qualified",
+            &[
+                (
+                    "main.jtr",
+                    "import \"a\"\nfn main() -> i32 {\n    var buf: *mut i64 = alloc(i64, 4)\n    var s: []i64 = unsafe { slice(i64, buf, 4) }\n    concurrent {\n        spawn a.fill(s)\n        spawn a.fill(s)\n    }\n    free_ptr(buf)\n    return 0\n}",
+                ),
+                ("a.jtr", "pub fn fill(mut xs: []i64) { xs[0] = 1 }"),
+            ],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(diags.iter().all(|d| !d.is_error()), "typeck clean: {diags:?}");
+        let esc = crate::escape::check(&prog.ast, &info);
+        assert!(
+            esc.iter().any(|d| d.message.contains("can race across parallel tasks")),
+            "the race check fires through the qualified spawn: {esc:?}"
+        );
+    }
+
     /// Two same-named types *within one module* is still a plain duplicate
     /// definition (the genuine redefinition bug), not the cross-module message.
     #[test]
