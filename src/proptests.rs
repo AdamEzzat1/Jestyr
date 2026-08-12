@@ -11496,11 +11496,11 @@ fn main() -> i32 {
         std::fs::create_dir_all(&dir).unwrap();
         // The same shapes the multi-module driver test exercises: a diamond and a
         // cross-module name collision (`mag`), so the canon-rename path is covered.
-        std::fs::write(dir.join("util.jtr"), "pub fn mag(x: i32) -> i32 { return x * 10 }\n")
+        std::fs::write(dir.join("util.jtr"), "pub fn mag(x: i32) -> i32 { return x * 10 }\npub fn Box(comptime T: type) -> type { return struct { v: T  fn get(read self) -> read T { self.v } } }\npub fn boxed(x: i32) -> Box(i32) { return Box(i32){ v: x } }\n")
             .unwrap();
         std::fs::write(
             dir.join("vec2.jtr"),
-            "import \"util\"\npub struct V2 { pub x: i32, pub y: i32 }\npub fn make(x: i32, y: i32) -> V2 { return V2 { x: x, y: y } }\npub fn mag(v: V2) -> i32 { return util.mag(v.x) + v.y }\n",
+            "import \"util\"\npub struct V2 { pub x: i32, pub y: i32 }\npub fn make(x: i32, y: i32) -> V2 { return V2 { x: x, y: y } }\npub fn mag(v: V2) -> i32 { return util.mag(v.x) + v.y }\npub fn Box(comptime T: type) -> type { return struct { v: T, w: T  fn get(read self) -> read T { self.w } } }\npub fn boxed(x: i32) -> Box(i32) { return Box(i32){ v: x, w: x + 1 } }\n",
         )
         .unwrap();
         // The app exercises every `#line` emission point: plain statements (one
@@ -11511,7 +11511,7 @@ fn main() -> i32 {
         // TEMPLATE's lines).
         std::fs::write(
             dir.join("app.jtr"),
-            "import \"util\"\nimport \"vec2\"\nfn clamp_pos(x: i32) -> i32\n    requires x > 0 - 100\n    ensures result >= 0\n{\n    if x < 0 { return 0 }\n    return x\n}\nfn id[T](take v: T) -> T { v }\nfn main() -> i32 {\n    let v: vec2.V2 = vec2.make(4, 2)\n    print_int(vec2.mag(v) as i64)\n    print_int(util.mag(3) as i64)\n    let a: i32 = 1  let b: i32 = 2\n    print_int((a + b) as i64)\n    print_int(clamp_pos(0 - 5) as i64)\n    print_int(id(7) as i64)\n    return 0\n}\n",
+            "import \"util\"\nimport \"vec2\"\nfn clamp_pos(x: i32) -> i32\n    requires x > 0 - 100\n    ensures result >= 0\n{\n    if x < 0 { return 0 }\n    return x\n}\nfn id[T](take v: T) -> T { v }\nfn main() -> i32 {\n    let v: vec2.V2 = vec2.make(4, 2)\n    print_int(vec2.mag(v) as i64)\n    print_int(util.mag(3) as i64)\n    let a: i32 = 1  let b: i32 = 2\n    print_int((a + b) as i64)\n    print_int(clamp_pos(0 - 5) as i64)\n    print_int(id(7) as i64)\n    let ba: util.Box(i32) = util.boxed(7)\n    let bb: vec2.Box(i32) = vec2.boxed(9)\n    print_int(ba.get() as i64)\n    print_int(bb.get() as i64)\n    return 0\n}\n",
         )
         .unwrap();
         let app = dir.join("app.jtr");

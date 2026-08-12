@@ -1471,10 +1471,15 @@ impl<'a> TypeChecker<'a> {
                 if self.is_generic_enum(&ctor.name) {
                     Ty::GenEnum { ctor: self.canon_type_cur(&ctor.name), args: aty }
                 } else {
-                    // Generic struct (comptime-fn form): ctor left bare — collidable
-                    // generic structs are a deferred follow-up (the AST-walking
-                    // instance collection would need per-item module context).
-                    Ty::GenStruct { ctor: ctor.name.clone(), args: aty }
+                    // Generic struct (comptime-fn form): the ctor is a FUNCTION
+                    // name, so it canonicalizes through the fn namespace (`canon_in`
+                    // over `dup`), not the type namespace — two modules may each
+                    // define `fn Box(comptime T: type) -> type` and their instances
+                    // stay distinct (`Jestyr_Box__m<a>__i32` vs `__m<b>__i32`),
+                    // exactly like the generic-enum rule above. Bare unless the
+                    // name actually collides, so non-colliding programs key and
+                    // mangle exactly as before.
+                    Ty::GenStruct { ctor: self.canon_cur(&ctor.name), args: aty }
                 }
             }
             // `mod.Type` / `mod.Type(args)`: a module-qualified type, resolved in
@@ -1507,7 +1512,14 @@ impl<'a> TypeChecker<'a> {
                     if self.is_generic_enum_key(&key) {
                         Ty::GenEnum { ctor: key, args: aty }
                     } else {
-                        Ty::GenStruct { ctor: name.name.clone(), args: aty }
+                        // The generic-struct ctor is a fn: canon in the TARGET
+                        // module's fn namespace, so `mod.Box(i32)` picks that
+                        // module's (possibly colliding) comptime type-fn.
+                        let fkey = match target {
+                            Some(t) => self.canon_in(t, &name.name),
+                            None => self.canon_cur(&name.name),
+                        };
+                        Ty::GenStruct { ctor: fkey, args: aty }
                     }
                 }
             }
@@ -3122,14 +3134,18 @@ impl<'a> TypeChecker<'a> {
                 // closure literal coerce in a generic vtable's fn-pointer field
                 // (`Container(i32){ op: |x| x + 1 }`).
                 let args: Vec<Ty> = type_args.iter().map(|a| self.eval_type_expr(typ, *a)).collect();
+                // The ctor canons in the fn namespace, so a colliding `Box(i32){..}`
+                // infers ITS module's instance type and its field expectations
+                // resolve through the right template (bare when nothing collides).
+                let ckey = self.canon_cur(&ctor.name);
                 for fi in fields {
-                    let expected = self.gen_struct_field_decl_ty(&ctor.name, &args, &fi.name.name);
+                    let expected = self.gen_struct_field_decl_ty(&ckey, &args, &fi.name.name);
                     let prev = self.cur_expected.take();
                     self.cur_expected = expected;
                     self.infer(scope, typ, self_ty, fi.value);
                     self.cur_expected = prev;
                 }
-                Ty::GenStruct { ctor: ctor.name.clone(), args }
+                Ty::GenStruct { ctor: ckey, args }
             }
             ExprKind::StructType(body) => {
                 for m in &body.members {

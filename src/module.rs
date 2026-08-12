@@ -1462,6 +1462,55 @@ mod tests {
         assert!(!c.contains("struct Jestyr_Box__i32 "), "no bare `Jestyr_Box__i32` instance:\n{c}");
     }
 
+    /// Two modules each defining the **generic struct** `fn Box(comptime T: type)
+    /// -> type` monomorphize to distinct instance symbols — the last collidable
+    /// kind (`DESIGN-STATUS.md`, modules row). The ctor is a *function*, so it
+    /// canonicalizes through the fn namespace (`dup_fns`) rather than the type
+    /// namespace, at type resolution (typeck) and again wherever cgen re-lowers
+    /// an annotation during its per-item, per-module instance collection.
+    #[test]
+    fn two_modules_may_define_the_same_generic_struct() {
+        let dir = fixture(
+            "collide_genstruct",
+            &[
+                (
+                    "main.jtr",
+                    "import \"a\"\nimport \"b\"\nfn main() -> i32 {\n    let x: a.Box(i32) = a.make(7)\n    let y: b.Box(i32) = b.make(9)\n    return x.get() + y.get()\n}",
+                ),
+                (
+                    "a.jtr",
+                    "pub fn Box(comptime T: type) -> type { return struct { v: T  fn get(read self) -> read T { self.v } } }\npub fn make(x: i32) -> Box(i32) { return Box(i32){ v: x } }",
+                ),
+                (
+                    "b.jtr",
+                    "pub fn Box(comptime T: type) -> type { return struct { v: T, w: T  fn get(read self) -> read T { self.w } } }\npub fn make(x: i32) -> Box(i32) { return Box(i32){ v: x, w: x + 1 } }",
+                ),
+            ],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(diags.is_empty(), "two modules may define generic struct `Box(T)`: {:?}", diags);
+        assert!(
+            crate::escape::check(&prog.ast, &info).iter().all(|d| !d.is_error()),
+            "the borrow-return methods pass the escape checker"
+        );
+        let (c, cd) = crate::cgen::emit(&prog.ast, &info);
+        assert!(cd.is_empty(), "cgen diags: {:?}", cd);
+        assert!(
+            c.contains("struct Jestyr_Box__m1__i32 {") && c.contains("struct Jestyr_Box__m2__i32 {"),
+            "distinct generic-struct instance definitions:\n{c}"
+        );
+        // The two instances have their own shapes: only module 2's has field `w`.
+        assert!(!c.contains("struct Jestyr_Box__i32"), "no bare `Jestyr_Box__i32` instance:\n{c}");
+        // Each module's method resolved against ITS OWN template: a's `get`
+        // reads `v`, b's reads `w`.
+        assert!(
+            c.contains("jestyr_Box__m1__i32_get") && c.contains("jestyr_Box__m2__i32_get"),
+            "distinct method instances:\n{c}"
+        );
+    }
+
     /// Two same-named types *within one module* is still a plain duplicate
     /// definition (the genuine redefinition bug), not the cross-module message.
     #[test]

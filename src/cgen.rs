@@ -833,6 +833,19 @@ impl<'a> Cgen<'a> {
         self.canon_type_in(self.cur_mod, name)
     }
 
+    /// The canonical name of a **function** resolved from the current module —
+    /// the `fns`-table key and `find_fn`'s lookup key. A generic-STRUCT ctor is a
+    /// function (`fn Box(comptime T: type) -> type`), so a colliding ctor canons
+    /// here, in the fn namespace, not through `canon_type`'s `dup_types`.
+    fn canon_fn(&self, name: &str) -> String {
+        crate::types::canon(self.cur_mod, name, &self.info.dup_fns)
+    }
+
+    /// [`canon_fn`] in an explicit target module (a `mod.Box(i32)` path).
+    fn canon_fn_in(&self, m: crate::module::ModId, name: &str) -> String {
+        crate::types::canon(m, name, &self.info.dup_fns)
+    }
+
     /// The canonical *variant* name resolved from the module currently being
     /// emitted (the key of the `variants` table).
     fn canon_variant(&self, name: &str) -> String {
@@ -1477,7 +1490,11 @@ impl<'a> Cgen<'a> {
                 if self.enum_is_generic(&key) {
                     Ty::GenEnum { ctor: key, args: aty }
                 } else {
-                    Ty::GenStruct { ctor: ctor.name.clone(), args: aty }
+                    // The generic-struct ctor is a FN, so it canons in the fn
+                    // namespace — two modules' `Box(T)` instances stay distinct
+                    // (`Jestyr_Box__m<a>__i32` vs `__m<b>__i32`), mirroring
+                    // typeck's resolution. Bare unless the name collides.
+                    Ty::GenStruct { ctor: self.canon_fn(&ctor.name), args: aty }
                 }
             }
             TypeKind::Slice(inner) => Ty::Slice(Box::new(self.ast_type_to_ty(*inner, subst))),
@@ -1529,7 +1546,11 @@ impl<'a> Cgen<'a> {
                     if self.enum_is_generic(&key) {
                         Ty::GenEnum { ctor: key, args: aty }
                     } else {
-                        Ty::GenStruct { ctor: name.name.clone(), args: aty }
+                        let fkey = match self.path_target(&module.name) {
+                            Some(t) => self.canon_fn_in(t, &name.name),
+                            None => self.canon_fn(&name.name),
+                        };
+                        Ty::GenStruct { ctor: fkey, args: aty }
                     }
                 }
             }
@@ -1572,12 +1593,16 @@ impl<'a> Cgen<'a> {
         }
     }
 
-    fn collect_struct_instances(&self) -> Vec<(String, Vec<Ty>)> {
+    fn collect_struct_instances(&mut self) -> Vec<(String, Vec<Ty>)> {
         let ast = self.ast;
         let mut seen = HashSet::new();
         let mut order = Vec::new();
         let empty = HashMap::new();
-        for item in &ast.items {
+        // Each item walks under ITS OWN module (`cur_mod`), so a `Box(i32)`
+        // annotation canons to the module that wrote it — the per-item module
+        // context whose absence deferred collidable generic structs.
+        for (i, item) in ast.items.iter().enumerate() {
+            self.cur_mod = self.item_module(i);
             if let Item::Fn(f) = item {
                 if !self.is_generic(f) {
                     self.collect_structs_in_fn(f, &empty, &mut seen, &mut order);
@@ -1592,6 +1617,7 @@ impl<'a> Cgen<'a> {
             }
         }
         for (name, args) in self.instances.clone() {
+            self.set_cur_mod_of_fn(&name);
             if let Some(f) = self.find_fn(&name) {
                 let subst = self.make_subst(f, &args);
                 self.collect_structs_in_fn(f, &subst, &mut seen, &mut order);
@@ -1600,6 +1626,9 @@ impl<'a> Cgen<'a> {
         // Each method instance needs its receiver struct emitted, plus whatever
         // generic structs its body mentions under the struct's substitution.
         for (ctor, args, method) in self.method_instances.clone() {
+            // The method body walks under the ctor's OWNING module (the ctor
+            // string is already canonical from typeck).
+            self.set_cur_mod_of_fn(&ctor);
             if !args.is_empty() {
                 let recv = Ty::GenStruct { ctor: ctor.clone(), args: args.clone() };
                 self.collect_gen_struct(&recv, &mut seen, &mut order);
@@ -1682,7 +1711,9 @@ impl<'a> Cgen<'a> {
         match &ast.expr_at(id).kind {
             ExprKind::GenStructLit { ctor, type_args, fields } => {
                 let args: Vec<Ty> = type_args.iter().map(|a| self.eval_type_arg(*a, subst)).collect();
-                let ty = Ty::GenStruct { ctor: ctor.name.clone(), args };
+                // Canon in the fn namespace: the literal's instance belongs to the
+                // module that wrote it (`cur_mod` is set per item by the collector).
+                let ty = Ty::GenStruct { ctor: self.canon_fn(&ctor.name), args };
                 self.collect_gen_struct(&ty, seen, order);
                 for fi in fields {
                     self.collect_structs_in_expr(fi.value, subst, seen, order);
@@ -2245,6 +2276,7 @@ impl<'a> Cgen<'a> {
         }
         // monomorphized instances
         for (name, args) in self.instances.clone() {
+            self.set_cur_mod_of_fn(&name);
             if let Some(f) = self.find_fn(&name) {
                 self.subst = self.make_subst(f, &args);
                 let sig = self.fn_signature(f, &format!("jestyr_{}", self.mangle(&name, &args)));
@@ -2387,6 +2419,7 @@ impl<'a> Cgen<'a> {
         }
         // monomorphized instances
         for (name, args) in self.instances.clone() {
+            self.set_cur_mod_of_fn(&name);
             if let Some(f) = self.find_fn(&name) {
                 self.subst = self.make_subst(f, &args);
                 self.emit_fn(f, &format!("jestyr_{}", self.mangle(&name, &args)));
@@ -4987,7 +5020,9 @@ impl<'a> Cgen<'a> {
             ExprKind::GenStructLit { ctor, type_args, fields } => {
                 let subst = self.subst.clone();
                 let args: Vec<Ty> = type_args.iter().map(|a| self.eval_type_arg(*a, &subst)).collect();
-                let cname = self.gen_struct_c_name(&ctor.name, &args);
+                // The ctor canons in the fn namespace (a colliding `Box(i32){…}`
+                // names ITS module's instance); bare when nothing collides.
+                let cname = self.gen_struct_c_name(&self.canon_fn(&ctor.name), &args);
                 let mut s = format!("({cname}){{ ");
                 for (i, fi) in fields.iter().enumerate() {
                     if i > 0 {
@@ -8301,16 +8336,20 @@ impl<'a> Cgen<'a> {
             TypeKind::App { ctor, args } => {
                 let subst = self.subst.clone();
                 let aty: Vec<Ty> = args.iter().map(|a| self.ast_type_to_ty(*a, &subst)).collect();
-                // Canon the ctor so a collided generic enum gets its own instance
-                // symbol (bare for a generic struct / non-colliding name).
+                // Canon the ctor so a collided generic type gets its own instance
+                // symbol — an enum through the type namespace, a struct through the
+                // FN namespace (its ctor is a comptime type-fn); bare either way
+                // for a non-colliding name.
                 let key = self.canon_type(&ctor.name);
                 // A generic-enum instance may be niche-optimized to a bare pointer.
                 if self.enum_is_generic(&key) {
                     if let Some(n) = self.niche_enum_instance(&key, &aty) {
                         return self.c_type(&n.payload);
                     }
+                    return self.gen_struct_c_name(&key, &aty);
                 }
-                self.gen_struct_c_name(&key, &aty)
+                let fkey = self.canon_fn(&ctor.name);
+                self.gen_struct_c_name(&fkey, &aty)
             }
             TypeKind::Slice(inner) => {
                 let subst = self.subst.clone();
@@ -9436,6 +9475,16 @@ impl<'a> Cgen<'a> {
     /// runs once per monomorphized instance — so a generics-heavy program paid
     /// O(instances x items) allocations. First-wins insertion reproduces the
     /// `find_map` result exactly.
+    /// Point `cur_mod` at the owning module of the (canonically named) function
+    /// `name`, so a monomorphized template's body re-lowers its type annotations
+    /// under the module that WROTE the template — not whatever module the previous
+    /// loop iteration left behind. A no-op for an unknown name.
+    fn set_cur_mod_of_fn(&mut self, name: &str) {
+        if let Some(&i) = self.fn_by_canon.get(name) {
+            self.cur_mod = self.item_module(i);
+        }
+    }
+
     fn find_fn(&self, name: &str) -> Option<&'a FnDecl> {
         let i = *self.fn_by_canon.get(name)?;
         match &self.ast.items[i] {

@@ -90,8 +90,8 @@ decide an outcome.
 **Behaviour change, and where to expect it.** This refuses some programs
 that previously compiled. None are in the 155-file corpus (including the
 self-hosted compiler), and no corpus diagnostic moved — but the corpus is
-not the whole language, so out-of-corpus code *can* newly fail here. Every
-case found so far is ill-formed code that had simply never been rejected:
+not the whole language, so out-of-corpus code *can* newly fail here. Most
+cases found are ill-formed code that had simply never been rejected:
 
 ```jestyr
 fn f[T](read x: T) -> i32 { return x.v }    // field of an unbounded `T`
@@ -104,9 +104,23 @@ verdict — the checker's silence was being read as approval. The right
 long-term fix is for the type checker to reject both *at the field
 access*, with a message about the field rather than about escape; the
 finalization would then stop firing for them. Until that exists, refusing
-is the sound behaviour. If you hit this on code you believe is
-well-formed, that is a type-inference gap worth reporting — the message
-names the binding whose type is missing.
+is the sound behaviour.
+
+**One well-formed shape is refused too**: a generic-struct ctor-body
+method returning a field *by value* (`fn get(read self) -> T { self.v }`
+inside `fn Box(comptime T: type) -> type { return struct { … } }`). Those
+methods are currently checked with `self` typed only as an opaque `Self`,
+so `self.v` never resolves; the previously "working" acceptance flowed
+through exactly the hole this finalization closes. The corpus-wide idiom —
+returning the field as a borrow, `-> read T` — is unaffected, and matches
+how such a method must be written for a non-`Copy` `T` anyway (the same
+conservative rule that refuses `fn f[T](read x: T) -> T { x }`). The
+supersession is typing `self` as the real generic-struct type there, at
+which point this paragraph should be deleted.
+
+If you hit this on other code you believe is well-formed, that is a
+type-inference gap worth reporting — the message names the binding whose
+type is missing.
 
 A third shape joined the list the first week the gate existed, caught in
 freshly written code rather than by a fuzzer or a probe:

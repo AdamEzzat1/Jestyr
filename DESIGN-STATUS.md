@@ -28,7 +28,7 @@ per-workstream detail lives in [ROADMAP.md](ROADMAP.md) §2.
 | Generics + monomorphization, trait bounds (§8) | ✅ | |
 | Traits, `dyn` dispatch, operator traits (§7–8) | ✅ | |
 | CTFE / `comptime` (§8) | ✅ | tiers 0–7, both toolchains; dogfooded in the compiler's lexer |
-| Modules: `import`, visibility, content hashing, manifest verify (§9) | ✅ | generic-struct cross-module collisions still open |
+| Modules: `import`, visibility, content hashing, manifest verify (§9) | ✅ | all collidable kinds done (fns, consts, types, variants, generic enums, generic structs) |
 | Package registry / build system beyond the manifest (§9) | 📐 | executable `build.jestyr` needs CTFE wiring |
 | Structured concurrency (`concurrent`/`spawn`/`await`) (§10) | ✅ | pthreads backend |
 | Channels, `select`, `Mutex`, atomics (§10) | ✅ | `spawn` targets can't be generic |

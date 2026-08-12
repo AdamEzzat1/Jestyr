@@ -5,6 +5,20 @@ versions are snapshots, not stability promises.
 
 ## Unreleased
 
+### Added
+
+- **Two modules may now define the same generic struct** (`fn Box(comptime T:
+  type) -> type`), completing collidable names: their monomorphized instances
+  get distinct symbols (`Jestyr_Box__m1__i32` vs `__m2__i32`), fields, and
+  method instances, on both toolchains, byte-identically. This was the last
+  open kind in the modules row — plain fns/consts/types/variants and generic
+  enums were already collidable.
+- **`jc build|run` emits `#line` directives**, mapping generated C back to the
+  original per-file sources exactly as the reference does — the module-path C
+  of the two toolchains is now byte-identical *including* debug info, which
+  also closes the recorded `jestyrc attest` vs `jc attest` `c-sha256`
+  disagreement for module programs.
+
 ### Changed — may reject code that previously compiled
 
 - **A borrow whose type never resolved is now refused rather than assumed
@@ -19,11 +33,26 @@ versions are snapshots, not stability promises.
 
   No file in the 155-file corpus (which includes the self-hosted compiler)
   triggers this, and no corpus diagnostic changed — but out-of-corpus code can
-  newly fail. Every case found so far is ill-formed code that had never been
-  rejected: a field access on an unbounded type parameter (`x.v` where `x: T`),
-  and a field access on a primitive (`.w` on an `i32`). Both previously compiled
-  clean through to code generation. Rationale, and the type-checker fix that
-  should eventually supersede it, in
+  newly fail. Most cases found are ill-formed code that had never been rejected:
+  a field access on an unbounded type parameter (`x.v` where `x: T`), a field
+  access on a primitive (`.w` on an `i32`), a genref field reached without
+  `.*`. **One well-formed shape is also refused**: a generic-struct ctor-body
+  method returning a field *by value* —
+
+  ```jestyr
+  fn Box(comptime T: type) -> type {
+      return struct { v: T  fn get(read self) -> read T { self.v } }  // fine
+      //                    fn get(read self) -> T { self.v }         // refused
+  }
+  ```
+
+  because such methods are checked with `self` typed only as an opaque `Self`,
+  so `self.v` never resolves. The by-value form was previously accepted through
+  the same hole this gate closes, and its instance-reality is the same rule as
+  ordinary generics (`fn f[T](read x: T) -> T { x }` is likewise refused —
+  `T` may be non-`Copy`). The borrow-return form, which the entire corpus uses,
+  is unaffected. The eventual fix is typing `self` as the real generic-struct
+  type in ctor-body methods. Rationale in
   [docs/escape-guarantee.md](docs/escape-guarantee.md).
 
 ### Fixed
