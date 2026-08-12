@@ -1511,6 +1511,41 @@ mod tests {
         );
     }
 
+    /// The escape checker's call checks consult the RECORDED resolution
+    /// (`resolved_call_target`: `qualified` or `call_sym`), not a hand-rolled
+    /// bare-name lookup — so a within-module bare call to a *colliding* fn name
+    /// still gets its give-away check. Before Stage 3's consolidation, the bare
+    /// spelling missed `table.fns`' canonical key (`consume__m1`) and a borrow
+    /// slipped through a `take` parameter silently; the same code with no
+    /// collision errored. The port never had the gap — its loader renames
+    /// collisions in the source text, so its bare spelling is already canonical.
+    #[test]
+    fn a_colliding_take_target_still_gets_the_give_away_check() {
+        let dir = fixture(
+            "collide_take",
+            &[
+                (
+                    "main.jtr",
+                    "import \"a\"\nimport \"b\"\nfn main() -> i32 { return 0 }",
+                ),
+                (
+                    "a.jtr",
+                    "pub fn consume(take v: String) { drop v }\npub fn use_it(read s: String) {\n    consume(s)\n}",
+                ),
+                ("b.jtr", "pub fn consume(take v: String) { drop v }"),
+            ],
+        );
+        let prog = load(dir.join("main.jtr").to_str().unwrap());
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, diags) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(diags.iter().all(|d| !d.is_error()), "typeck clean: {diags:?}");
+        let esc = crate::escape::check(&prog.ast, &info);
+        assert!(
+            esc.iter().any(|d| d.message.contains("cannot give borrow `s`")),
+            "the give-away check fires through the colliding bare call: {esc:?}"
+        );
+    }
+
     /// Two same-named types *within one module* is still a plain duplicate
     /// definition (the genuine redefinition bug), not the cross-module message.
     #[test]

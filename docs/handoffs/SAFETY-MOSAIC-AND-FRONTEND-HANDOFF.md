@@ -86,11 +86,62 @@ from one that does not. Probes live in the P2 golden's curated snippet list
 instead. Same shape as §2.5b. Treat "the corpus does not exercise it" as a
 signal that a differential test is *required*, not as evidence of safety.
 
-### 1.3 HIR Stages 2–4 (the real payoff, and the real cost)
+### 1.3 HIR Stages 2–4 (STARTED — Stage 3's first step landed; here is the rest)
 
 Stage 2 moves desugaring into HIR construction; Stage 3 points `escape` at HIR;
 Stage 4 points `cgen` at it, one node kind at a time. Each stage that changes
-emitted C owes the full two-sided tax (Part 3). Do not start these before 1.1.
+emitted C owes the full two-sided tax (Part 3). Stages 0–1 are done.
+
+**What landed (2026-08-12): Stage 3, step 1 — and it found a soundness hole.**
+`TypeInfo::resolved_call_target(id)` unifies the recorded call resolution
+(`qualified` ∪ `call_sym`, disjoint by construction), and `escape`'s four call
+checks (take-args, `@no_alloc`, `@deterministic`, frozen-mutation) consume it
+through one `resolved_callee_name` helper instead of four hand-rolled chains.
+None of the four consulted `call_sym`, so a **within-module bare call to a
+colliding fn name silently skipped its check** — a borrow passed to a `take`
+parameter compiled clean where the identical collision-free code errored.
+Pinned by `a_colliding_take_target_still_gets_the_give_away_check`
+(`module.rs`). The port never had the gap (its loader renames collisions
+textually, so its bare spelling is canonical) — no port change was owed.
+
+**Remaining, in the order to do it:**
+
+1. **Stage 3, step 2 — the survey.** Enumerate every remaining place `escape.rs`
+   reads the AST where a recorded decision exists. Known candidates: method
+   calls resolved via `method_call(id)` but with receiver-conv re-derived at
+   some sites; `check_spawn_slice`'s signature lookup; the region-intrinsic
+   name matches (`region_str`/`region_alloc`/`region_concat`), which are
+   *intrinsics* and legitimately lexical. The test for "is this Stage 3 work"
+   is: does typeck already know the answer? If yes, record/consume; if no
+   (lexical scope, `unsafe` extent, loop nesting), it stays an AST read
+   forever — do NOT force those through the HIR.
+2. **Stage 3, step 3 — the same consolidation in `cgen`.** The same fallback
+   chains exist at cgen.rs ~2895/4729/5297/5911/9703/9721 (grep
+   `qualified(\|call_sym(`). cgen's copies DO consult `call_sym` where it
+   matters, so no hole is expected — this is uniformity, and byte-identity must
+   hold exactly (the accessor returns the same strings; zero-C-change gate).
+3. **Stage 2 — desugar recording, one construct per commit.** The original list
+   (`while`→`for`, compound assignment) is thinner than it reads: `while`/`loop`
+   are already parser-desugared, compound assignment lowers to C's compound
+   operators directly (no duplication). The real candidates found by reading:
+   the **tail-as-return** rewrite (both block emitters + `emit_body` duplicate
+   the "last stmt of a returning block becomes `return`" decision — record it
+   once at typeck), and **`?` propagation**'s ok-type derivation (cgen re-reads
+   `type_of(base)` and re-unwraps). Measure each against the corpus before
+   assuming it is worth recording — this file's history says candidates on
+   paper evaporate on contact.
+4. **Stage 4 — `cgen` node-by-node.** Do not start until Stages 2–3 are done
+   and the fuzzers cover the constructs being moved. Every step here changes
+   nothing byte-wise if done right, but each conversion is a chance to consume
+   a recorded decision instead of an AST re-derivation, and each owes the
+   zero-C-change proof (`emit-c` sweep vs HEAD, then the full gate).
+
+**Constraints that held all session and will hold next session:** prefer
+`ExprId`-indexed dense storage (the Stage-1 measurement); never let an emitting
+pass iterate a map (the `#[cfg(test)]` gate enforces it); sweep diagnostics AND
+emitted C against HEAD — not against a stale binary — before claiming
+zero-change; and the P3 typeck golden sees *renderings*, so any typing
+refinement owes a port mirror even at zero emitted-C change.
 
 ### 1.4 Diagnostics remainder (low risk, no mirror owed)
 

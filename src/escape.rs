@@ -1088,19 +1088,13 @@ impl<'a> Checker<'a> {
             return;
         }
 
-        let name = match &self.ast.expr_at(callee).kind {
-            ExprKind::Name(n) => n.name.clone(),
-            // A module-qualified call (`mod.f(…)`) has a `Field` callee; typeck
-            // recorded its resolved (canonical) target in `qualified`, keyed the same
-            // as `table.fns`. Without this arm a `take` parameter reached through a
-            // qualified call — e.g. the move-only `sync.channel_send(T, ch, take v)` —
-            // would silently skip the give-away check, letting a *borrow* be sent.
-            ExprKind::Field { .. } => match self.info.qualified(call_id) {
-                Some(q) => q.to_string(),
-                None => return,
-            },
-            _ => return,
-        };
+        // The canonical target, however the call was written — a qualified call
+        // records it in `qualified` (without which `sync.channel_send(T, ch,
+        // take v)` would silently let a borrow be sent), a bare call to a
+        // colliding name in `call_sym` (without which the same give-away slipped
+        // through a within-module call — `table.fns` is canon-keyed, so the bare
+        // spelling missed it).
+        let Some(name) = self.resolved_callee_name(call_id, callee) else { return };
         let Some(sig) = self.info.table.fns.get(&name) else { return };
         let takes: Vec<(usize, String)> = sig
             .params
@@ -1139,15 +1133,30 @@ impl<'a> Checker<'a> {
     /// qualified (`mem.allocate` resolves to its bare name). This is the direct,
     /// per-op enforcement that mirrors `@no_panic`'s un-elided-index check; the
     /// *transitive* "calls a function that allocates" closure is future work.
+    /// The canonical function name a call targets, however it was written:
+    /// the recorded resolution (`qualified` for `m.f(…)`, `call_sym` for a bare
+    /// call to a colliding name) or the bare `Name` spelling when nothing was
+    /// recorded — which is exactly when the spelling IS canonical. `None` for a
+    /// callee that is not a plain function reference (an indirect call).
+    ///
+    /// This is the Stage-3 move: consume typeck's recorded decision instead of
+    /// re-deriving it. The four checks below each hand-rolled this chain
+    /// WITHOUT the `call_sym` half, so a within-module bare call to a colliding
+    /// name looked up `table.fns` under its bare spelling, missed the canonical
+    /// key, and silently skipped the check — a borrow could be `take`n through
+    /// exactly that shape.
+    fn resolved_callee_name(&self, call_id: ExprId, callee: ExprId) -> Option<String> {
+        if let Some(sym) = self.info.resolved_call_target(call_id) {
+            return Some(sym.to_string());
+        }
+        match &self.ast.expr_at(callee).kind {
+            ExprKind::Name(n) => Some(n.name.clone()),
+            _ => None,
+        }
+    }
+
     fn check_no_alloc_call(&mut self, call_id: ExprId, callee: ExprId, span: Span) {
-        // A module-qualified call resolves to the underlying bare function name.
-        let name = if let Some(q) = self.info.qualified(call_id) {
-            q.to_string()
-        } else if let ExprKind::Name(n) = &self.ast.expr_at(callee).kind {
-            n.name.clone()
-        } else {
-            return;
-        };
+        let Some(name) = self.resolved_callee_name(call_id, callee) else { return };
         // Recorded on EVERY call, `@no_alloc` or not, because the transitive pass
         // needs this function's callees before it knows whether anyone cares.
         if is_alloc_intrinsic(&name) {
@@ -1198,13 +1207,7 @@ impl<'a> Checker<'a> {
         if !self.deterministic {
             return;
         }
-        let name = if let Some(q) = self.info.qualified(call_id) {
-            q.to_string()
-        } else if let ExprKind::Name(n) = &self.ast.expr_at(callee).kind {
-            n.name.clone()
-        } else {
-            return;
-        };
+        let Some(name) = self.resolved_callee_name(call_id, callee) else { return };
         if matches!(name.as_str(), "atomic_store" | "atomic_load" | "atomic_add" | "atomic_sub" | "atomic_xchg") {
             self.error(
                 span,
@@ -1244,13 +1247,8 @@ impl<'a> Checker<'a> {
         }
 
         // Free call (`f(args)`) or module-qualified call (`m.f(args)`): the callee
-        // resolves to a bare function name either way.
-        let name = match &self.ast.expr_at(callee).kind {
-            ExprKind::Name(n) => Some(n.name.clone()),
-            ExprKind::Field { .. } => self.info.qualified(call_id).map(String::from),
-            _ => None,
-        };
-        let Some(name) = name else { return };
+        // resolves to a canonical function name either way.
+        let Some(name) = self.resolved_callee_name(call_id, callee) else { return };
         let Some(sig) = self.info.table.fns.get(&name) else { return };
         let convs: Vec<Conv> = sig.params.iter().map(|p| p.conv).collect();
         for (i, &arg) in args.iter().enumerate() {

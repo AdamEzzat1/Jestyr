@@ -605,6 +605,26 @@ impl TypeInfo {
         self.row(id)?.dyn_call.as_deref()
     }
 
+    /// The **canonical symbol** a call resolved to, whichever way it was written:
+    /// a module-qualified call (`m.f(…)`) records it in `qualified`, a bare call
+    /// to a *colliding* name records it in `call_sym` — the two are disjoint by
+    /// construction (a `Field` callee vs a `Name` callee). `None` means the call
+    /// is a bare name that collides with nothing, i.e. the AST's spelling *is*
+    /// the canonical symbol, and the caller supplies it as the fallback.
+    ///
+    /// This is the one lookup every pass that asks "which function does this
+    /// call target" must make **in full** — consulting `qualified` alone misses
+    /// within-module calls to colliding names, whose `table.fns` key is the
+    /// canonical `name__m<id>`, not the bare spelling. The escape checker's
+    /// take/no-alloc/deterministic/frozen checks each hand-rolled that chain
+    /// without the `call_sym` half and silently skipped exactly those calls
+    /// (the port never had the gap: its loader renames collisions in the source
+    /// text, so its bare spelling is already canonical).
+    pub fn resolved_call_target(&self, id: ExprId) -> Option<&str> {
+        let r = self.row(id)?;
+        r.qualified.as_deref().or(r.call_sym.as_deref())
+    }
+
     // --- whole-program iteration: tests only, on purpose ---
     //
     // These serve tests that assert *what* a program resolved to without knowing
