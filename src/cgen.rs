@@ -306,6 +306,9 @@ fn emit_program(
         scratch_reset: None,
         cont_label: None,
         break_label: None,
+        loop_label: None,
+        in_switch: false,
+        switch_break_label: None,
         variant_trackers: HashMap::new(),
         cur_no_panic: false,
         no_mangle: ast
@@ -711,6 +714,21 @@ struct Cgen<'a> {
     /// `else`, so a plain `break` lowers to C `break`. Saved/restored per loop so
     /// it always names the nearest loop.
     break_label: Option<String>,
+    /// the innermost loop's *user* label, if any — kept alongside `break_label`
+    /// (which only arms for a loop with an `else`) so a plain `break` sitting
+    /// inside a switch-lowered `match` can `goto` it: a bare C `break` there
+    /// would exit the `switch`, not the loop. Saved/restored per loop.
+    loop_label: Option<String>,
+    /// true while emitting the arms of a switch-lowered `match` (saved and reset
+    /// per enclosing loop): a plain `break` must then route through a label
+    /// rather than lower to a C `break`. (`continue` needs no routing — a C
+    /// `switch` is transparent to it.)
+    in_switch: bool,
+    /// the `_sb{n}` break label synthesized *on first use* for an unlabeled,
+    /// `else`-less loop whose body `break`s from inside a switch-lowered
+    /// `match`. `None` until needed, so every loop without the construct emits
+    /// byte-identical C; `emit_for` consumes it to place the `__break` target.
+    switch_break_label: Option<usize>,
     /// `variant <expr>` node id → its hoisted tracker index (pre-scanned per loop).
     variant_trackers: HashMap<ExprId, usize>,
     /// is the function being emitted `@no_panic`? If so, a non-elided (faulting)
@@ -3784,6 +3802,10 @@ impl<'a> Cgen<'a> {
         self.depth += 1;
 
         let mut has_default = false;
+        // Arm bodies live inside the C `switch`: a plain Jestyr `break` in them
+        // (including via a nested if-chain match) must route through the loop's
+        // `__break` label, never lower to a C `break`. Nested loops re-clear it.
+        let saved_in_switch = std::mem::replace(&mut self.in_switch, true);
         for arm in arms {
             match &ast.pat_at(arm.pat).kind {
                 PatKind::Variant { name: vname, subpats } => {
@@ -3903,6 +3925,7 @@ impl<'a> Cgen<'a> {
                 PatKind::Error => {}
             }
         }
+        self.in_switch = saved_in_switch;
 
         self.depth -= 1;
         self.line("}");
@@ -5275,9 +5298,27 @@ impl<'a> Cgen<'a> {
                 Some(lbl) => format!("goto {}__break", lbl.name),
                 // A plain `break` in a loop that has an `else` must `goto` past the
                 // `else` block (its target sits after the `else`); otherwise a plain
-                // C `break` is exactly right.
+                // C `break` is exactly right — UNLESS it sits inside a switch-lowered
+                // `match`, where a C `break` would exit the `switch`, not the loop:
+                // route it through the loop's `__break` label (the user's if the loop
+                // is labeled, else `_sb{n}` synthesized on first use).
                 None => match &self.break_label {
                     Some(name) => format!("goto {name}__break"),
+                    None if self.in_switch => match &self.loop_label {
+                        Some(name) => format!("goto {name}__break"),
+                        None => {
+                            let n = match self.switch_break_label {
+                                Some(n) => n,
+                                None => {
+                                    let n = self.tmp;
+                                    self.tmp += 1;
+                                    self.switch_break_label = Some(n);
+                                    n
+                                }
+                            };
+                            format!("goto _sb{n}__break")
+                        }
+                    },
                     None => "break".to_string(),
                 },
             },
@@ -7704,7 +7745,17 @@ impl<'a> Cgen<'a> {
         // correctly models "the nearest loop" across nested loops.
         let saved_break = self.break_label.take();
         self.break_label = if els.is_some() { eff_label.clone() } else { None };
+        // Arm the switch-break context: a plain `break` inside a switch-lowered
+        // `match` routes through the user label when the loop has one (its target
+        // is always emitted), else through `_sb{n}` synthesized on first use.
+        let saved_loop_label = std::mem::replace(&mut self.loop_label, label.map(|l| l.name.clone()));
+        let saved_in_switch = std::mem::replace(&mut self.in_switch, false);
+        let saved_switch_break = self.switch_break_label.take();
         self.emit_for_inner(head, body);
+        let synth_break = self.switch_break_label.take();
+        self.switch_break_label = saved_switch_break;
+        self.in_switch = saved_in_switch;
+        self.loop_label = saved_loop_label;
         self.break_label = saved_break;
         // The `else` runs on normal completion: emitted between the loop and the
         // break target, so falling out of the loop runs it while a `break` (now a
@@ -7720,6 +7771,8 @@ impl<'a> Cgen<'a> {
         }
         if let Some(name) = &eff_label {
             self.line(format!("{name}__break: ;")); // labeled- and/or else-break target
+        } else if let Some(n) = synth_break {
+            self.line(format!("_sb{n}__break: ;")); // switch-break target (synthesized on use)
         }
         self.variant_trackers = saved_trackers;
         if let Some(r) = region {
@@ -12460,6 +12513,72 @@ mod tests {
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("break;"), "else-less break is plain C break: {c}");
         assert!(!c.contains("__break"), "no break label synthesized: {c}");
+    }
+
+    #[test]
+    fn switch_break_routes_through_a_synthesized_label() {
+        // A `break` inside a switch-lowered `match` arm must exit the LOOP, but a
+        // bare C `break` there exits the `switch` — the original dlist_genref
+        // infinite loop. It routes through a synthesized `_sb{n}__break` label
+        // whose target sits after the loop.
+        let src = "enum E { stop, go(v: i64) } \
+                   fn f(e: E) { for { match e { stop => { break }, go(v) => { print_int(v) } } } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("switch ("), "flat match keeps its switch lowering: {c}");
+        assert!(c.contains("goto _sb1__break;"), "switch-break → goto: {c}");
+        let loop_at = c.find("for (;;)").expect("loop emitted");
+        let tgt_at = c.find("_sb1__break: ;").expect("break target emitted");
+        assert!(loop_at < tgt_at, "break target sits after the loop: {c}");
+    }
+
+    #[test]
+    fn switch_break_reuses_a_user_label() {
+        // A labeled loop already emits `<label>__break: ;` — a switch-break inside
+        // it reuses that target instead of synthesizing one.
+        let src = "enum E { stop, go(v: i64) } \
+                   fn f(e: E) { for outer: { match e { stop => { break }, go(v) => { print_int(v) } } } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("goto outer__break;"), "switch-break reuses the user label: {c}");
+        assert!(!c.contains("_sb"), "no synthetic label when the loop is labeled: {c}");
+    }
+
+    #[test]
+    fn switch_break_in_a_nested_loop_stays_a_c_break() {
+        // A loop nested inside a match arm re-clears the in-switch context: its own
+        // plain `break` targets the inner C loop and needs no label.
+        let src = "enum E { stop, go(v: i64) } \
+                   fn f(e: E, xs: []i32) { for { match e { stop => { break }, go(v) => { for x in xs { break } } } } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("break;"), "the nested loop's break stays a C break: {c}");
+        assert!(c.contains("goto _sb1__break;"), "the outer switch-break still routes: {c}");
+    }
+
+    #[test]
+    fn switch_continue_stays_a_c_continue() {
+        // C's `switch` is transparent to `continue`, and every loop shape advances
+        // in its header or at the body top — so no routing, and (the byte-identity
+        // pin) no label is synthesized for a match that only `continue`s.
+        let src = "enum E { stop, go(v: i64) } \
+                   fn f(e: E, xs: []i32) { for x in xs { match e { stop => { continue }, go(v) => { print_int(v) } } print_int(0) } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("continue;"), "switch-continue is a plain C continue: {c}");
+        assert!(!c.contains("_sb") && !c.contains("__break"), "no label synthesized: {c}");
+    }
+
+    #[test]
+    fn switch_break_in_an_else_loop_keeps_the_fe_route() {
+        // In a loop with an `else`, `break_label` already reroutes a plain break
+        // past the `else` — a switch-break takes the same `_fe{n}` route.
+        let src = "enum E { stop, go(v: i64) } \
+                   fn f(e: E, xs: []i32) { for x in xs { match e { stop => { break }, go(v) => { print_int(v) } } } else { print_int(9) } }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(c.contains("goto _fe0__break;"), "switch-break reuses the else route: {c}");
+        assert!(!c.contains("_sb"), "no second label synthesized: {c}");
     }
 
     #[test]

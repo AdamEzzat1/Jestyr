@@ -1793,6 +1793,19 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_push(sb, "__break")
             return
         }
+        if g.sw {                                     // inside a switch-lowered match: a bare C
+            if g.ll_ns >= 0 {                         // `break` would exit the SWITCH, not the loop
+                string_push(sb, "goto ")
+                string_push(sb, src[g.ll_ns as usize .. g.ll_ne as usize])
+                string_push(sb, "__break")
+                return
+            }
+            if g.swb < 0 { g.swb = g.tmp  g.tmp = g.tmp + 1 }   // synthesize `_sb{n}` on first use
+            string_push(sb, "goto _sb")
+            push_uint(sb, g.swb as i64)
+            string_push(sb, "__break")
+            return
+        }
         string_push(sb, "break")
         return
     }
@@ -3653,6 +3666,12 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // all -1 when the nearest loop has no `else` (plain C `break` is right). `cl_*` is an armed
 // labeled-loop continue-target span (the reference's `cont_label`), consumed — `.take()` — by
 // the FIRST loop body that closes after arming.
+// `sw` is true while emitting the arms of a switch-lowered `match` (the reference's
+// `in_switch`, saved/reset per loop): a plain `break` there must `goto` the loop's `__break`
+// label — a bare C `break` would exit the `switch`, not the loop. `ll_*` is the innermost
+// loop's USER label span (the reference's `loop_label`; -1 when unlabeled) and `swb` the
+// `_sb<swb>` label synthesized ON FIRST USE for an unlabeled, `else`-less loop (-1 until
+// then, so loops without the construct emit byte-identical C).
 // `sr_*` is a region-scoped loop's armed scratch-arena name span (the reference's
 // `scratch_reset`), consumed — `.take()` — at the top of the next loop body. `vt` holds the
 // current loop's hoisted `variant`-tracker (ExprId, temp) pairs with `vtf` the active loop's
@@ -3661,7 +3680,7 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // `gfi` holds the collected generic-fn instance records ([fn item, argc, (kind,a,b) targ
 // triples…], variable length — walk with a cursor); `su` is the ACTIVE instance's
 // type-parameter substitution (5-tuples: tparam span + arg triple), read by `emit_su_ty`.
-struct Cg { sds: List(i32), pfs: List(i32), pfb: String, pfo: List(i32), tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32, dg: i32, gmi: List(i32), tmode: bool, alloc: Allocator, dmap: List(i32), dmods: List(i32), dnb: String, dall: String, dnl: List(i32), dbg_on: bool, dbgl_m: i32, dbgl_l: i32 }
+struct Cg { sds: List(i32), pfs: List(i32), pfb: String, pfo: List(i32), tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, sw: bool, ll_ns: i32, ll_ne: i32, swb: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32, dg: i32, gmi: List(i32), tmode: bool, alloc: Allocator, dmap: List(i32), dmods: List(i32), dnb: String, dall: String, dnl: List(i32), dbg_on: bool, dbgl_m: i32, dbgl_l: i32 }
 
 // The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
 // (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
@@ -6147,6 +6166,10 @@ fn emit_match(mut sb: String, read p: parser.Parser, read src: str, read c: type
     line_at(sb, depth, "{")
     let cd: i32 = depth + 1                            // case labels sit one level in from the switch
     var has_default: bool = false
+    // Arm bodies live inside the C `switch`: a plain `break` in them must route through the
+    // loop's `__break` label, never lower to a C `break` (mirrors `in_switch`).
+    let ssw: bool = g.sw
+    g.sw = true
     var k: i32 = 0
     for k < e.y {                                     // e.x = arm_start, e.y = arm_count (triples in par)
         let ab: i32 = e.x + k * 3
@@ -6205,6 +6228,7 @@ fn emit_match(mut sb: String, read p: parser.Parser, read src: str, read c: type
         }
         k = k + 1
     }
+    g.sw = ssw
     line_at(sb, depth, "}")
     if ret and !has_default { line_at(sb, depth, "__builtin_unreachable();") }
     string_free(pfx)
@@ -6742,7 +6766,23 @@ fn emit_for(mut sb: String, read p: parser.Parser, read src: str, read c: typeck
     if els >= 0 {
         if lls >= 0 { g.bl_ns = lls  g.bl_ne = lle } else { g.bl_fe = fe }
     }
+    // Arm the switch-break context (mirrors `loop_label`/`in_switch`/`switch_break_label`):
+    // a plain `break` inside a switch-lowered `match` gotos the user label when the loop has
+    // one, else `_sb{n}` synthesized on first use; nested loops save/reset/restore.
+    let sll_ns: i32 = g.ll_ns
+    let sll_ne: i32 = g.ll_ne
+    let ssw: bool = g.sw
+    let sswb: i32 = g.swb
+    g.ll_ns = lls
+    g.ll_ne = lle
+    g.sw = false
+    g.swb = 0 - 1
     emit_for_inner(sb, p, src, c, g, e, d)
+    let swb: i32 = g.swb                                       // this loop's synthesized label, if any
+    g.swb = sswb
+    g.sw = ssw
+    g.ll_ns = sll_ns
+    g.ll_ne = sll_ne
     g.bl_ns = sbl_ns
     g.bl_ne = sbl_ne
     g.bl_fe = sbl_fe
@@ -6766,6 +6806,11 @@ fn emit_for(mut sb: String, read p: parser.Parser, read src: str, read c: typeck
         indent(sb, d)
         string_push(sb, "_fe")
         push_uint(sb, fe as i64)
+        string_push(sb, "__break: ;\n")
+    } else if swb >= 0 {                                       // switch-break target (synthesized on use)
+        indent(sb, d)
+        string_push(sb, "_sb")
+        push_uint(sb, swb as i64)
         string_push(sb, "__break: ;\n")
     }
     list.truncate(i32, g.vt, vt_len as usize)                  // restore the outer loop's trackers
@@ -12591,7 +12636,7 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
     var dmods2: List(i32) = list.make(i32, a)
     var dcj: usize = 0
     for dcj < list.len(i32, dmods) { list.push(i32, dmods2, list.get(i32, dmods, dcj))  dcj = dcj + 1 }
-    var g: Cg = Cg{ sds: list.make(i32, a), pfs: list.make(i32, a), pfb: string_new(), pfo: list.make(i32, a), tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: list.make(i32, a), vtf: 0, gfi: list.make(i32, a), su: list.make(i32, a), cls: list.make(i32, a), ccx: list.make(i32, a), cca: list.make(i32, a), caps: list.make(i32, a), gsi: list.make(i32, a), sps: list.make(i32, a), dspawn: false, th: list.make(i32, a), thf: 0, dg: 0 - 1, gmi: list.make(i32, a), tmode: tmode, alloc: a, dmap: dmap2, dmods: dmods2, dnb: dnbb, dall: dallb, dnl: dnl0, dbg_on: list.len(i32, dmap) > 0, dbgl_m: 0 - 1, dbgl_l: 0 - 1 }
+    var g: Cg = Cg{ sds: list.make(i32, a), pfs: list.make(i32, a), pfb: string_new(), pfo: list.make(i32, a), tmp: 0, pp: list.make(i32, a), rf: list.make(i32, a), res_ok: 0 - 2, etags: list.make(i32, a), req: list.make(i32, a), ens: list.make(i32, a), retty: 0 - 1, mi: list.make(i32, a), self_ptr: false, gei: list.make(i32, a), curfn: 0 - 1, mv: list.make(i32, a), ds: list.make(i32, a), dsb: list.make(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, sw: false, ll_ns: 0 - 1, ll_ne: 0 - 1, swb: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: list.make(i32, a), vtf: 0, gfi: list.make(i32, a), su: list.make(i32, a), cls: list.make(i32, a), ccx: list.make(i32, a), cca: list.make(i32, a), caps: list.make(i32, a), gsi: list.make(i32, a), sps: list.make(i32, a), dspawn: false, th: list.make(i32, a), thf: 0, dg: 0 - 1, gmi: list.make(i32, a), tmode: tmode, alloc: a, dmap: dmap2, dmods: dmods2, dnb: dnbb, dall: dallb, dnl: dnl0, dbg_on: list.len(i32, dmap) > 0, dbgl_m: 0 - 1, dbgl_l: 0 - 1 }
     collect_spawns(g, p, src)                        // spawn sites (gates the pthread prelude)
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     // Plain-struct methods now flow through the SAME worklist as generic instances

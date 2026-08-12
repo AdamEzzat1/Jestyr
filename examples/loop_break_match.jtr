@@ -1,0 +1,109 @@
+// examples/loop_break_match.jtr — `break`/`continue` THROUGH a switch-lowered `match`.
+//
+// A flat enum `match` lowers to a C `switch` on the tag, and in C a `break`
+// inside a `switch` exits the SWITCH — so a Jestyr `break` in a match arm used
+// to spin the enclosing loop forever (found by dlist_genref.jtr's traversal
+// loop). The fix routes it through the loop's `__break` label machinery: the
+// user's label when the loop has one, the `_fe{n}` else-skip label when the
+// loop has an `else`, and a `_sb{n}` label synthesized ONLY on first use
+// otherwise — so a program without the construct emits byte-identical C.
+//
+// `continue` needs no routing — C's `switch` is transparent to it, and every
+// loop shape advances its induction in the header or at the body top — but it
+// is pinned here too, alongside the reset for loops nested inside an arm.
+//
+// Run:  jestyrc run examples/loop_break_match.jtr
+//   →  1 2 3 77  2 4 6 88  5 6 99  6  1 2 42
+
+enum Step {
+    stop,
+    go(v: i64),
+}
+
+enum Par {
+    odd,
+    even(v: i64),
+}
+
+// `go(i)` until `i` reaches `limit`, then `stop`.
+fn step_at(i: i64, limit: i64) -> Step {
+    if i >= limit { return stop }
+    return go(i)
+}
+
+fn parity(v: i64) -> Par {
+    if v - (v / 2) * 2 == 1 { return odd }
+    return even(v)
+}
+
+fn main() -> i32 {
+    // 1) The dlist shape: an infinite loop whose only exit is a `break` inside
+    //    a switch arm. Before the fix this looped forever (the C `break` only
+    //    left the `switch`). Routes via a synthesized `_sb{n}__break`.
+    var i: i64 = 1
+    for {
+        match step_at(i, 4) {
+            stop => { break },
+            go(v) => { print_int(v) },
+        }
+        i = i + 1
+    }
+    print_int(77)          // 1 2 3 77
+
+    // 2) `continue` from a switch arm: transparent in C, no label involved.
+    var j: i64 = 0
+    for j < 6 {
+        j = j + 1
+        match parity(j) {
+            odd => { continue },
+            even(v) => { print_int(v) },
+        }
+    }
+    print_int(88)          // 2 4 6 88
+
+    // 3) A labeled loop already emits `outer__break: ;` — the switch-break
+    //    reuses it instead of synthesizing a second label.
+    var k: i64 = 5
+    for outer: {
+        match step_at(k, 7) {
+            stop => { break },
+            go(v) => { print_int(v) },
+        }
+        k = k + 1
+    }
+    print_int(99)          // 5 6 99
+
+    // 4) A loop nested INSIDE a match arm re-clears the in-switch context: its
+    //    own plain `break` targets the inner C loop, no label.
+    var total: i64 = 0
+    var m: i64 = 0
+    for {
+        match step_at(m, 3) {
+            stop => { break },
+            go(v) => {
+                for x in 0..10 {
+                    if x > v { break }
+                    total = total + 1
+                }
+            },
+        }
+        m = m + 1
+    }
+    print_int(total)       // 6  (1 + 2 + 3 inner iterations)
+
+    // 5) A loop with an `else`: the switch-break takes the same `_fe{n}` route
+    //    a plain break does, skipping the `else` on the way out.
+    var n: i64 = 0
+    for n < 5 {
+        n = n + 1
+        match step_at(n, 3) {
+            stop => { break },
+            go(v) => { print_int(v) },
+        }
+    } else {
+        print_int(0 - 1)
+    }
+    print_int(42)          // 1 2 42  (the -1 else is skipped)
+
+    return 0
+}
