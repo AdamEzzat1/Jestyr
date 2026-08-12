@@ -166,11 +166,63 @@ and it is a self-contained cgen increment worth doing on its own.
    `at` is **clamped**, not faulted — `mid ≤ len` makes overlap inexpressible
    and the function total (`hi` is simply empty at the boundary), which is
    strictly stronger than a runtime rejection.
-2. Parallel: hand the halves to two tasks. This is where the value is, and where
-   `spawn`'s non-generic limit bites — expect an i32/i64-only first version.
-3. Only if 1–2 prove the shape: consider whether the checker should *know* about
-   disjointness rather than trusting the library. That is a much larger change
-   and should not be assumed.
+2. **DONE** — `parallel.par_split_mut`: the two halves on two real TASKS
+   (`split_half_worker` re-slices from a raw pointer per worker; user code sees
+   only the second-class `mut []i64` views). The par_soac demo's 16/64 pair is
+   the determinism pin, repeated 8× against thread races.
+3. Whether the checker should *know* about disjointness rather than trusting
+   the library — **designed below, and the answer is narrower than the
+   question**.
+
+**Stage 3, the design note (2026-08-12).** "Checker-known disjointness" turns
+out to mean three different things, and only one survives contact with a
+measurement:
+
+- **What the library already guarantees.** Overlap is inexpressible *through*
+  `split_mut`: the clamp makes `[0, at)` / `[at, len)` disjoint for every
+  input, the argument is one sentence long, and the tests pin it from both
+  sides. Nothing is wrong with this; it is the unsafe contract working as
+  written.
+- **The measured hole beside it.** The checker accepts this today, unchanged:
+
+  ```jestyr
+  fn g(mut a: []i64, mut b: []i64) { a[0] = 1  b[0] = 2 }
+  g(q, q)        // the same slice, twice, both writable — checks CLEAN
+  ```
+
+  Two `mut` views of one buffer, through any user function with two mut-slice
+  parameters — the exact aliasing `split_mut` exists to make unmanufacturable
+  is freely available one call away. A stage 3 that "proves" the library's
+  ranges disjoint while this stands would be theater.
+- **Option A — status quo.** Honest, costs nothing, leaves the hole. The
+  library's own guarantee does not need the checker's help.
+- **Option B — call-site exclusivity for `mut` slices (RECOMMENDED).** Reject
+  passing the same lexical ROOT place to two `mut []T` parameters of one call.
+  This is the same machinery family as item 5's route-3 fix (`root_place`,
+  lexical, local, no signatures): compare argument roots at the call, refuse
+  on a match, name the root in the message. Known dodges are the SAME two item
+  5 recorded — an aliased root (`var alias = q` then `g(q, alias)`) and
+  aliasing through a callee — with the same answers (a lexical taint if it
+  proves worth it; signatures = item 2 territory). `mut`+`read` overlap at one
+  call is deliberately OUT of v1: in-place idioms read and write one buffer on
+  purpose, and rejecting them needs an exclusivity story this note does not
+  have (item 8's question, not item 4's).
+- **Option C — range-aware disjointness (REJECTED for v1).** Proving
+  `[0, at) ∩ [at, len) = ∅` in the checker needs arithmetic refinement over
+  values — obligations with a solver behind them (`jestyrc obligations`
+  records 7 today, deliberately unsolved), or ranges in the type language.
+  Ranges in signatures is item 2's `from xs` grown into exactly the lattice
+  §2.6 warns about. Revisit only if item 2 lands *checked* and something
+  consumes range precision; do not back into it from here.
+
+**The decision:** stage 3 = Option B, named honestly — *call-site mut-slice
+exclusivity*, not "checker-known disjointness". It does not teach the checker
+`split_mut`'s ranges; it closes the one route by which safe code manufactures
+the overlap the library prevents. Acceptance: `g(q, q)` refused with the root
+named; `split_mut`/`par_split_mut` and the whole corpus stay clean (the corpus
+has zero same-root double-`mut` calls today — the rule is a backstop, so it
+owes a differential probe that FIRES, like the finalization gate's); both
+toolchains, same increment.
 
 **Acceptance (stage 1, met).** Both halves simultaneously writable, writes land
 in the right elements (the 16/48 demo pair), overlap inexpressible for any `at`

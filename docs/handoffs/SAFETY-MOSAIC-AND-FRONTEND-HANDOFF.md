@@ -68,9 +68,14 @@ coverage; adding one unilaterally would desync discovery order).
   messages; item-keyword synchronization in `parse_module` recovery (the
   cascade-budget test is the guardrail); stable error codes
   (`Diagnostic::with_code` exists, unused — additive in `check --json`).
-- **Item 4 stage 3** (`split_mut` disjointness known to the checker, not
-  assumed): design note first — today the disjointness is a library argument;
-  the checker-known version interacts with item 2.
+- **Item 4 stage 3 — design note DONE (2026-08-12)**, and the answer is
+  narrower than the question: not "checker-known disjointness" (range proofs =
+  option C, rejected — the §2.6 lattice) but **call-site mut-slice
+  exclusivity** — the measured hole is `g(q, q)` (same slice to two `mut []T`
+  params) checking CLEAN today. Option B in `docs/safety-mosaic-next.md` item
+  4: lexical root compare at the call, item-5-style; `mut`+`read` overlap
+  deliberately out of v1 (item 8's question). Implementation is now a sized,
+  unblocked increment: both toolchains + a differential probe that fires.
 - **Item 5 residue** (optional): lexical taint for the aliased-root dodge
   (`var alias = h` inside the region, store through `alias`); the
   through-callee dodge needs signatures (item 2 territory). Both recorded in
