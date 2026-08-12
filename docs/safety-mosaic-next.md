@@ -347,9 +347,12 @@ concrete data for the design to beat:
 4. **Genref-field WRITES had never been emitted by any program** — the checked
    deref was an rvalue statement expression; the first write found the gap
    (fixed both toolchains: the `emit_place` genref arm, `(*({ …; ptr; }))`).
-5. **`break` inside a switch-lowered `match` inside a loop miscompiles** (exits
+5. **`break` inside a switch-lowered `match` inside a loop miscompiled** (exited
    the C switch, not the loop — an infinite loop from correct-looking code).
-   Tracked as its own fix; the example carries the flag workaround.
+   FIXED on both toolchains: the `break` now routes through the loop's
+   `__break` label (`_sb{n}` synthesized on first use; pinned by
+   `examples/loop_break_match.jtr`), and the example is back to the natural
+   `break` form.
 
 Plus the run-cost profile the design must beat: one heap allocation + generation
 header per node, a checked deref per hop, per-node frees.

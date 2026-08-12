@@ -26,12 +26,14 @@ that remains, in the order a fresh session should consider it.
 
 ### A. In flight elsewhere — check before touching
 
-- **break-in-match-in-loop miscompile** (task chip `task_d16f6e4b`, running in
-  its own session): a `break` inside a switch-lowered `match` inside a loop
-  exits the C *switch* — infinite loop from correct code. If it has landed:
-  un-work-around `examples/dlist_genref.jtr` (drop the `going` flag, restore
-  the natural `break` form) and confirm its runtime pin still passes. If it
-  has NOT landed, do not start it here without checking that session's state.
+- **break-in-match-in-loop miscompile** — LANDED on both toolchains: a plain
+  `break` in a switch-lowered `match` now routes through the loop's `__break`
+  label (the user label / the `_fe{n}` else-label / `_sb{n}` synthesized on
+  first use, so unaffected programs emit byte-identical C); `continue` needs
+  no routing (C's `switch` is transparent to it, pinned). Corpus pin:
+  `examples/loop_break_match.jtr` (allowlisted, all five shapes) + cgen unit
+  tests; `examples/dlist_genref.jtr` is back to the natural `break` form and
+  its runtime pin still passes. Nothing left here.
 
 ### B. Item 3 (`with alive`) — the port ladder (the one half-finished feature)
 

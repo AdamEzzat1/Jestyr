@@ -42,16 +42,15 @@ fn push_after(take last: &Node, v: i64) -> &Node {
 
 // Print the list front-to-back, one checked deref per hop.
 //
-// (The natural form — `for { match cur { nil => break, … } }` — currently
-// MISCOMPILES: a `break` inside a switch-lowered match exits the C switch, not
-// the loop. Found by this file; tracked as its own fix. The flag is the
-// workaround, and ceremony datum #5 for item 6's design.)
+// (This natural form — a `break` inside a switch-lowered match — once
+// MISCOMPILED: the C `break` exited the switch, not the loop, so this loop
+// spun forever. Found by this file; fixed by routing the `break` through the
+// loop's `__break` label, pinned in examples/loop_break_match.jtr.)
 fn print_forward(head: &Node) {
     var cur: Link = at(head)
-    var going: bool = true
-    for going {
+    for {
         match cur {
-            nil => { going = false },
+            nil => { break },
             at(n) => {
                 print_int(n.*.v)
                 cur = n.*.next
