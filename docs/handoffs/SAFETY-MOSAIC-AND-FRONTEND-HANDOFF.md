@@ -213,9 +213,23 @@ name but the loop variable.
 
 ### 1.9 Pre-existing open items (verify before acting)
 
-- **The port emits no `#line` directives** where the reference's module path does,
-  so `jestyrc attest` and `jc attest` disagree on `c-sha256`. Invisible to every
-  golden, self-consistent within the port. Needs a module-path C golden first.
+- **CLOSED: the port's `#line` gap.** The prerequisite module-path C golden
+  (`jestyr_driver_module_c_matches_reference`) was built first — and promptly
+  found a *second*, unrecorded divergence: the port renamed cross-module
+  collisions by module *name* (`mag__util`) where the reference canons by module
+  *id* (`mag__m1`); the reference numbers modules **pre-order at first visit**
+  while the port merges deps-first, so the port now records the pre-order index
+  and renames `__m<id>`. Then the port grew `#line` emission itself
+  (`cg_mark_line` in `cgen.jtr`, mirroring `Cgen::mark_line`: five emission
+  points, per-function dedup reset, `\`→`/` path normalization, a newline
+  *binary-search* index — not a scan from byte 0), gated on the driver's debug
+  table so every non-`jc build` path stays byte-identical by construction. The
+  golden is now **full byte equality** over a fixture that exercises every
+  emission point (requires/ensures, same-line dedup, tail returns, monomorphized
+  generic instances): 19 directives over 177 lines, byte-identical. The enriched
+  fixture caught one real gap on the way — the port's *generic-instance* emitter
+  is a separate path from plain fns and needed its own entry mark. The
+  `jestyrc attest` vs `jc attest` `c-sha256` disagreement is closed with it.
 - **Generic-STRUCT cross-module collisions** remain open (`DESIGN-STATUS.md`,
   modules row). Generic *enum* collisions are done.
 

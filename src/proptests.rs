@@ -11489,7 +11489,7 @@ fn main() -> i32 {
     ///    to the port's — i.e. `#line` is the *whole* module-path divergence, and
     ///    everything else (collision renames, import shifts, emission order) agrees.
     #[test]
-    fn jestyr_driver_module_c_matches_reference_modulo_line_directives() {
+    fn jestyr_driver_module_c_matches_reference() {
         let jc = build_exe("examples/std/cgen.jtr");
         let dir = std::env::temp_dir().join("jestyr_mlc_golden");
         let _ = std::fs::remove_dir_all(&dir);
@@ -11503,9 +11503,15 @@ fn main() -> i32 {
             "import \"util\"\npub struct V2 { pub x: i32, pub y: i32 }\npub fn make(x: i32, y: i32) -> V2 { return V2 { x: x, y: y } }\npub fn mag(v: V2) -> i32 { return util.mag(v.x) + v.y }\n",
         )
         .unwrap();
+        // The app exercises every `#line` emission point: plain statements (one
+        // directive per source line), two statements ON one line (the dedup — one
+        // directive covers both), a `requires`/`ensures` pair (contract asserts
+        // point at their clauses), a tail-expression return (the bypasses-emit_stmt
+        // arm), and a generic function (whose monomorphized body re-emits the
+        // TEMPLATE's lines).
         std::fs::write(
             dir.join("app.jtr"),
-            "import \"util\"\nimport \"vec2\"\nfn main() -> i32 {\n    let v: vec2.V2 = vec2.make(4, 2)\n    print_int(vec2.mag(v) as i64)\n    print_int(util.mag(3) as i64)\n    return 0\n}\n",
+            "import \"util\"\nimport \"vec2\"\nfn clamp_pos(x: i32) -> i32\n    requires x > 0 - 100\n    ensures result >= 0\n{\n    if x < 0 { return 0 }\n    return x\n}\nfn id[T](take v: T) -> T { v }\nfn main() -> i32 {\n    let v: vec2.V2 = vec2.make(4, 2)\n    print_int(vec2.mag(v) as i64)\n    print_int(util.mag(3) as i64)\n    let a: i32 = 1  let b: i32 = 2\n    print_int((a + b) as i64)\n    print_int(clamp_pos(0 - 5) as i64)\n    print_int(id(7) as i64)\n    return 0\n}\n",
         )
         .unwrap();
         let app = dir.join("app.jtr");
@@ -11528,41 +11534,30 @@ fn main() -> i32 {
         let (ref_c, _cd) = crate::cgen::emit(&prog.ast, &info);
         let ref_c = ref_c.replace("\r\n", "\n");
 
-        // (1) The reference DOES emit #line on this path, and the port does NOT —
-        // the recorded gap, pinned so neither side can drift silently. When the
-        // port learns `#line`, delete these two asserts and compare `ref_c` to
-        // `port_c` directly.
+        // Full byte equality — the port emits `#line` now (directives, placement,
+        // dedup, path normalization all mirroring `Cgen::mark_line`), so the two
+        // module paths must agree on every byte, which also closes the
+        // `jestyrc attest` vs `jc attest` c-sha256 gap for module programs.
+        // Guard the premise so the mapping cannot silently rot to zero directives
+        // on both sides at once:
         assert!(
             ref_c.lines().any(|l| l.starts_with("#line ")),
-            "the reference module path stopped emitting #line — this golden and the \
-             port gap notes are stale"
+            "the module path stopped emitting #line entirely — the debug-info \
+             mapping is broken on both sides at once"
         );
-        assert!(
-            !port_c.lines().any(|l| l.starts_with("#line ")),
-            "the port now emits #line — upgrade this golden to full byte equality \
-             (and close the attest c-sha256 gap note)"
-        );
-
-        // (2) Stripping the whole-line directives from the reference must yield the
-        // port's C byte-for-byte: #line is the WHOLE divergence.
-        let stripped: String = ref_c
-            .lines()
-            .filter(|l| !l.starts_with("#line "))
-            .map(|l| format!("{l}\n"))
-            .collect();
-        if stripped != port_c {
-            let mismatch = stripped
+        if ref_c != port_c {
+            let mismatch = ref_c
                 .lines()
                 .zip(port_c.lines())
                 .enumerate()
                 .find(|(_, (a, b))| a != b);
             panic!(
-                "module-path C diverges beyond #line at {:?}\n(reference minus #line vs jc)",
+                "module-path C diverges at {:?}\n(reference vs jc, full byte equality)",
                 mismatch
             );
         }
         eprintln!(
-            "module-path golden: {} #line directives are the whole divergence over {} lines",
+            "module-path golden: byte-identical, {} #line directives over {} lines",
             ref_c.lines().filter(|l| l.starts_with("#line ")).count(),
             port_c.lines().count()
         );
@@ -11660,7 +11655,7 @@ fn main() -> i32 {
     /// Files are copied to a temp directory because `jc <file> build` writes its `.c` and
     /// `.exe` beside the source, and a test must not leave artifacts in `examples/`.
     #[test]
-    fn jestyr_module_cgen_matches_reference_except_line_directives() {
+    fn jestyr_module_cgen_matches_reference_with_line_directives() {
         let jc = build_exe("examples/std/cgen.jtr");
         let dir = std::env::temp_dir().join("jestyr_modline");
         let _ = std::fs::remove_dir_all(&dir);
@@ -11702,19 +11697,19 @@ fn main() -> i32 {
                     panic!("{root}: the port emitted no C ({e}): {}", String::from_utf8_lossy(&out.stderr))
                 });
 
-            let want: Vec<String> = want_c
-                .lines()
-                .filter(|l| !l.starts_with("#line "))
-                .map(normalize_task_names)
-                .collect();
+            // `#line` directives are compared OUTRIGHT — the port emits them now
+            // (`cg_mark_line`), so the mapping itself (lines, paths, dedup) is under
+            // test here over real corpus modules, not just the golden's fixture.
+            let want: Vec<String> = want_c.lines().map(normalize_task_names).collect();
             let got: Vec<String> = got_c.lines().map(normalize_task_names).collect();
             let n_directives = want_c.lines().filter(|l| l.starts_with("#line ")).count();
 
-            // Guard both directions, so neither side can make this pass by accident.
+            // Guard the premise on both sides, so the mapping cannot silently rot to
+            // zero directives at once.
             assert!(n_directives > 0, "{root}: the reference emitted no `#line` — is this the module path?");
             assert!(
-                !got_c.contains("#line "),
-                "{root}: the port now emits `#line` — delete the filter above and compare outright"
+                got_c.contains("#line "),
+                "{root}: the port stopped emitting `#line` — the debug table is not reaching emit_program"
             );
 
             // CONTENT must match exactly, always: same lines, same multiplicities. This
@@ -11743,7 +11738,7 @@ fn main() -> i32 {
                     );
                 }
                 eprintln!(
-                    "module-path C: {root} — {} lines identical in order; {n_directives} `#line` directives are the only gap",
+                    "module-path C: {root} — {} lines identical in order, {n_directives} `#line` directives included",
                     want.len()
                 );
             } else {
@@ -11751,15 +11746,16 @@ fn main() -> i32 {
                 // imports in different orders, so per-type artifacts (the
                 // `JestyrSlice_*` typedefs) come out permuted. Harmless to the C
                 // compiler — they are independent typedefs — but it means
-                // `jestyrc attest` and `jc attest` hash different bytes for the same
-                // program, exactly like the `#line` gap. Asserted to still be *only* an
-                // ordering difference, so this cannot quietly widen.
+                // `jestyrc attest` and `jc attest` hash different bytes for THIS
+                // shape of program (the `#line` gap that used to share this note is
+                // closed; loader visit order is the one divergence left). Asserted to
+                // still be *only* an ordering difference, so this cannot quietly widen.
                 assert_ne!(
                     want, got,
                     "{root}: the order now agrees — set `strict_order` to true for it"
                 );
                 eprintln!(
-                    "module-path C: {root} — {} lines match as a multiset; order differs (loader visit order) plus {n_directives} `#line` directives",
+                    "module-path C: {root} — {} lines match as a multiset ({n_directives} `#line` directives included); order differs (loader visit order)",
                     want.len()
                 );
             }
