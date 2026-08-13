@@ -303,6 +303,20 @@ struct FnCtx {
     /// region rule — a bare-Name assign overwrites the alias itself, which is
     /// separate storage, so raw depths stay right for it.
     aliased: Vec<HashMap<String, usize>>,
+    /// The consuming rule (ownership: use-after-`take`): names of DROPPABLE owned
+    /// locals given to a `take` parameter, recorded at their binding's scope
+    /// depth. The callee owns (and drops) the value now — cgen registers the
+    /// `take` param in the callee's drop scope — so any later use of the binding
+    /// reads a value whose destructor already ran. `if`/`match` walk branches
+    /// with forked copies merged by UNION (both branches may consume; a use
+    /// after either errors), like Rust's conservative analysis. A rebind
+    /// (`let`) clears the entry — a fresh binding is a fresh value.
+    consumed: Vec<HashSet<String>>,
+    /// Scope depth at entry to each enclosing loop-like construct (`for` loops,
+    /// `par for` bodies, closures — anything that may run again). Consuming a
+    /// binding declared OUTSIDE the innermost such construct is refused at the
+    /// consume site: the second run would consume a value already gone.
+    loop_floor: Vec<usize>,
     ret_is_borrow: bool,
 }
 
@@ -311,16 +325,19 @@ impl FnCtx {
         self.scopes.push(HashMap::new());
         self.region.push(HashSet::new());
         self.aliased.push(HashMap::new());
+        self.consumed.push(HashSet::new());
     }
     fn pop(&mut self) {
         self.scopes.pop();
         self.region.pop();
         self.aliased.pop();
+        self.consumed.pop();
     }
     fn bind(&mut self, name: &str, is_borrow: bool) {
         self.scopes.last_mut().unwrap().insert(name.to_string(), is_borrow);
         // A rebind is a fresh value unless the Let arm re-taints it right after.
         self.aliased.last_mut().unwrap().remove(name);
+        self.consumed.last_mut().unwrap().remove(name);
     }
     fn bind_region(&mut self, name: &str) {
         self.region.last_mut().unwrap().insert(name.to_string());
@@ -340,6 +357,18 @@ impl FnCtx {
         let i = self.scope_depth_of(name)?;
         Some(self.aliased[i].get(name).copied().unwrap_or(i))
     }
+    /// Is `name`'s current binding marked consumed? (Innermost binding wins —
+    /// a shadowing `let` cleared its own scope's entry at bind.)
+    fn is_consumed(&self, name: &str) -> bool {
+        self.scope_depth_of(name).is_some_and(|d| self.consumed[d].contains(name))
+    }
+    /// Record `name`'s binding as consumed, at its BINDING depth — the mark
+    /// outlives inner blocks and dies with the binding.
+    fn mark_consumed(&mut self, name: &str) {
+        if let Some(d) = self.scope_depth_of(name) {
+            self.consumed[d].insert(name.to_string());
+        }
+    }
     /// Innermost binding wins (handles shadowing).
     fn lookup(&self, name: &str) -> Option<bool> {
         for scope in self.scopes.iter().rev() {
@@ -348,6 +377,17 @@ impl FnCtx {
             }
         }
         None
+    }
+}
+
+/// Union-merge one branch's consumed sets into another, depth-aligned. Only
+/// depths still present in `into` matter — a branch's own inner scopes are
+/// already popped by the time it merges back.
+fn merge_consumed(into: &mut [HashSet<String>], from: Vec<HashSet<String>>) {
+    for (i, set) in from.into_iter().enumerate() {
+        if let Some(t) = into.get_mut(i) {
+            t.extend(set);
+        }
     }
 }
 
@@ -382,6 +422,11 @@ impl<'a> Checker<'a> {
          allocate it in a `region` if it must outlive this frame, or store a `genref` handle \
          instead of a borrow";
 
+    const CONSUMED_HELP: &'static str =
+        "the callee owns the value now and has already dropped it — a consumed binding cannot \
+         be read, reused, or reinitialized; bind the callee's result if you need a value back, \
+         or pass a borrow (`read`/`mut`) instead of giving ownership";
+
     fn check_item(&mut self, item: &Item) {
         match item {
             Item::Fn(f) => self.check_fn(f),
@@ -401,8 +446,14 @@ impl<'a> Checker<'a> {
 
     fn check_fn(&mut self, f: &FnDecl) {
         let ret_is_borrow = matches!(f.ret_conv, Conv::Read | Conv::Mut | Conv::Out);
-        let mut ctx =
-            FnCtx { scopes: Vec::new(), region: Vec::new(), aliased: Vec::new(), ret_is_borrow };
+        let mut ctx = FnCtx {
+            scopes: Vec::new(),
+            region: Vec::new(),
+            aliased: Vec::new(),
+            consumed: Vec::new(),
+            loop_floor: Vec::new(),
+            ret_is_borrow,
+        };
         ctx.push();
         for p in &f.params {
             // MVS (design §4.3): the default convention *is* `read` (an immutable
@@ -486,16 +537,30 @@ impl<'a> Checker<'a> {
         match &data.kind {
             ExprKind::If { cond, then, els } => {
                 self.walk_expr(ctx, *cond, false);
-                self.check_block(ctx, then, tail);
+                // Branches fork the consumed set and merge by UNION: each branch
+                // may consume the same binding (only one runs), but a use after
+                // the `if` sees either branch's consumption. A lone `if` (no
+                // `else`) keeps its consumption sticky — the branch may have run.
                 if let Some(e) = els {
+                    let saved = ctx.consumed.clone();
+                    self.check_block(ctx, then, tail);
+                    let from_then = std::mem::replace(&mut ctx.consumed, saved);
                     self.walk_expr(ctx, *e, tail);
+                    merge_consumed(&mut ctx.consumed, from_then);
+                } else {
+                    self.check_block(ctx, then, tail);
                 }
                 return;
             }
             ExprKind::Match { scrut, arms } => {
                 let scrut_borrow = self.is_borrow_place(ctx, *scrut);
                 self.walk_expr(ctx, *scrut, false);
+                // Arms fork like `if` branches: each starts from the pre-match
+                // consumed set, and the sets merge by union afterwards.
+                let saved = ctx.consumed.clone();
+                let mut merged = saved.clone();
                 for arm in arms {
+                    ctx.consumed = saved.clone();
                     ctx.push();
                     self.bind_pattern(ctx, arm.pat, scrut_borrow);
                     // The guard sees the pattern's bindings; walk it so closures or
@@ -506,7 +571,10 @@ impl<'a> Checker<'a> {
                     }
                     self.walk_expr(ctx, arm.body, tail);
                     ctx.pop();
+                    let from_arm = std::mem::take(&mut ctx.consumed);
+                    merge_consumed(&mut merged, from_arm);
                 }
+                ctx.consumed = merged;
                 return;
             }
             ExprKind::Block(b) => {
@@ -689,8 +757,21 @@ impl<'a> Checker<'a> {
                 // is a known function whose matching parameter is `take` (owning):
                 // you can't hand ownership of something you only borrowed.
                 self.walk_expr(ctx, *callee, false);
-                for a in args {
+                // The consuming rule marks each droppable `take` argument's binding
+                // AS the arguments are walked, in evaluation order (receiver first) —
+                // so `g(d, d)` with two `take` params reports the second `d` as a
+                // use-after-consume, and the use half below sees every later read.
+                let (recv_take, arg_takes) = self.take_shape(id, *callee, args.len());
+                if recv_take {
+                    if let ExprKind::Field { base, .. } = &self.ast.expr_at(*callee).kind {
+                        self.consume_take_arg(ctx, *base);
+                    }
+                }
+                for (i, a) in args.iter().enumerate() {
                     self.walk_expr(ctx, *a, false);
+                    if arg_takes.get(i).copied().unwrap_or(false) {
+                        self.consume_take_arg(ctx, *a);
+                    }
                 }
                 self.check_give_away(ctx, id, *callee, args);
                 self.check_loop_mutation(ctx, id, *callee, args);
@@ -744,12 +825,17 @@ impl<'a> Checker<'a> {
                 // The closure's own parameters shadow outer borrows; check its
                 // body for escapes within. Whether the *closure value* escapes is
                 // decided by `is_borrow_place` (does it capture a borrow?).
+                // A closure body may run any number of times, so for the consuming
+                // rule it is loop-like: a captured outer droppable must not be
+                // given to `take` inside it.
+                ctx.loop_floor.push(ctx.scopes.len());
                 ctx.push();
                 for p in params {
                     ctx.bind(&p.name.name, false);
                 }
                 self.walk_expr(ctx, *body, false);
                 ctx.pop();
+                ctx.loop_floor.pop();
             }
             ExprKind::Concurrent(b) => {
                 // Structured concurrency: tasks join at the scope's end, so a
@@ -829,10 +915,13 @@ impl<'a> Checker<'a> {
                 // writes live inside the tested `core.par_reduce` engine.
                 self.walk_expr(ctx, *iter, false);
                 self.walk_expr(ctx, *reduction, false);
+                // The body runs once per element — a loop for the consuming rule.
+                ctx.loop_floor.push(ctx.scopes.len());
                 ctx.push();
                 ctx.bind(&var.name, false);
                 self.walk_expr(ctx, *body, false);
                 ctx.pop();
+                ctx.loop_floor.pop();
                 return;
             }
             ExprKind::Select(arms) => {
@@ -863,6 +952,11 @@ impl<'a> Checker<'a> {
                 if self.no_alloc && region.is_some() {
                     self.error(span, "a region-scoped loop allocates a scratch arena — forbidden in a `@no_alloc` function");
                 }
+                // Consuming rule: a binding declared OUTSIDE the loop must not be
+                // given to `take` inside it — the next iteration would consume a
+                // value already gone. The floor is the depth before the loop's own
+                // scopes open; popped before `els`, which runs exactly once.
+                ctx.loop_floor.push(ctx.scopes.len());
                 ctx.push();
                 let mut froze = 0usize;
                 match head {
@@ -920,6 +1014,7 @@ impl<'a> Checker<'a> {
                     self.frozen.pop();
                 }
                 ctx.pop();
+                ctx.loop_floor.pop();
                 // The `else` block runs after the loop, in the enclosing scope:
                 // the loop bindings are gone and the iterated collections are no
                 // longer frozen.
@@ -933,9 +1028,26 @@ impl<'a> Checker<'a> {
                 return;
             }
 
+            // The consuming rule's use half: this binding was given to a `take`
+            // parameter, so the callee owns it and its destructor has already
+            // run by the next statement — reading, passing, or reassigning it
+            // reads a dropped value. (Falls through: a tail Name still gets the
+            // region-return check below.)
+            ExprKind::Name(n) => {
+                if ctx.is_consumed(&n.name) {
+                    self.error_help(
+                        span,
+                        format!(
+                            "cannot use `{}` after it was given to a `take` parameter: ownership moved at the call",
+                            n.name
+                        ),
+                        Self::CONSUMED_HELP,
+                    );
+                }
+            }
+
             // Leaves: nothing to descend into.
-            ExprKind::Name(_)
-            | ExprKind::SelfValue
+            ExprKind::SelfValue
             | ExprKind::SelfType
             | ExprKind::Attr(_)
             | ExprKind::Int(_)
@@ -1447,6 +1559,109 @@ impl<'a> Checker<'a> {
                 self.ast.expr_at(arg).span,
                 format!("cannot mutate `{root}` while iterating it: the `for` loop holds a borrow of it"),
             );
+        }
+    }
+
+    /// The `take` shape of a call: is the method RECEIVER consumed, and which
+    /// explicit argument positions land on `take` parameters. One resolution —
+    /// the same `method_call`/`resolved_callee_name` chain route 4 consolidated —
+    /// and the same reach: a struct METHOD's explicit parameters are in neither
+    /// `table.fns` nor the top-level items, so only its receiver (recorded in
+    /// `MethodRes.recv_conv`) is tracked, exactly as route 4 skips them.
+    fn take_shape(&self, call_id: ExprId, callee: ExprId, argc: usize) -> (bool, Vec<bool>) {
+        if let Some(mr) = self.info.method_call(call_id) {
+            let recv = mr.recv_conv == Conv::Take;
+            if let Some(f) = self.find_fn(&mr.fn_name) {
+                let runtime: Vec<Conv> =
+                    f.params.iter().filter(|p| !p.comptime).map(|p| p.conv).collect();
+                let args =
+                    (0..argc).map(|i| matches!(runtime.get(i + 1), Some(Conv::Take))).collect();
+                return (recv, args);
+            }
+            return (recv, vec![false; argc]);
+        }
+        let takes = self
+            .resolved_callee_name(call_id, callee)
+            .and_then(|n| self.info.table.fns.get(&n))
+            .map(|sig| {
+                (0..argc)
+                    .map(|i| sig.params.get(i).is_some_and(|p| p.conv == Conv::Take))
+                    .collect()
+            });
+        (false, takes.unwrap_or_else(|| vec![false; argc]))
+    }
+
+    /// The consuming rule's gate: does this type run drop glue the callee now
+    /// owns? v1 answers "has a direct concrete `impl Drop`" — the first branch
+    /// of cgen's `drop_key_of`, read from the same `impl_index` so the two
+    /// cannot drift on it. Transitively-droppable aggregates (a wrapper whose
+    /// FIELD has the impl) and blanket generic `impl[T] Drop` instances also
+    /// drop in cgen but are not yet gated here — that residue is pinned by
+    /// `transitively_droppable_reuse_is_v1_residue` so it cannot go unnoticed.
+    /// Drop-free non-Copy values stay unmarked ON PURPOSE: giving one to `take`
+    /// is an implicit copy (MVS trivially-copyable semantics — the corpus's
+    /// Option combinators reuse their inputs freely), and nothing observable is
+    /// left behind in the caller.
+    fn droppable_ty(&self, ty: &Ty) -> bool {
+        let key = self.info.table.ty_key(ty);
+        !key.is_empty() && self.info.table.impl_index.contains_key(&("Drop".to_string(), key))
+    }
+
+    /// The consuming rule's marking half: `arg` is being given to a `take`
+    /// parameter. A droppable bare-Name OWNED local is marked consumed at its
+    /// binding (a borrow already got route 4's give-away error, and a non-local
+    /// name has no binding to poison). Inside a loop or closure, consuming a
+    /// binding declared outside it is refused at the consume site. A droppable
+    /// Field/Index PROJECTION is refused outright: the container still owns
+    /// (and will drop) that part, so the callee's drop — which the take-drop
+    /// rule in cgen now emits — would be a second drop of the same value.
+    fn consume_take_arg(&mut self, ctx: &mut FnCtx, arg: ExprId) {
+        let span = self.ast.expr_at(arg).span;
+        match &self.ast.expr_at(arg).kind {
+            ExprKind::Name(n) => {
+                let name = n.name.clone();
+                if ctx.lookup(&name) != Some(false) {
+                    return;
+                }
+                if !self.droppable_ty(&self.info.type_of(arg).clone()) {
+                    return;
+                }
+                if let Some(&floor) = ctx.loop_floor.last() {
+                    if ctx.scope_depth_of(&name).is_some_and(|d| d < floor) {
+                        self.error_help(
+                            span,
+                            format!(
+                                "cannot give `{name}` to a `take` parameter here: `{name}` is declared \
+                                 outside the enclosing loop or closure, which may run again — and the \
+                                 value is already gone the second time"
+                            ),
+                            "declare the value inside the loop so each run owns a fresh one, or pass \
+                             a borrow (`read`/`mut`) so one owner keeps it",
+                        );
+                        return;
+                    }
+                }
+                ctx.mark_consumed(&name);
+            }
+            ExprKind::Field { .. } | ExprKind::Index { .. } => {
+                let root = self.root_name(ctx, arg);
+                if ctx.lookup(&root) != Some(false) {
+                    return;
+                }
+                if !self.droppable_ty(&self.info.type_of(arg).clone()) {
+                    return;
+                }
+                self.error_help(
+                    span,
+                    format!(
+                        "cannot give a droppable part of `{root}` to a `take` parameter: `{root}` \
+                         still owns it and will drop it — the callee's drop would be a second one"
+                    ),
+                    "pass the whole value with `take` so ownership moves together, or pass a \
+                     borrow (`read`/`mut`) so it stays put",
+                );
+            }
+            _ => {}
         }
     }
 
@@ -2346,6 +2561,154 @@ mod tests {
         // Same shape, but `Node` (a struct) is non-Copy, so it IS an escape.
         let d = escapes("struct Node { v: i32 } fn move_out(read n: Node) -> Node { n }");
         assert_eq!(d.len(), 1, "{:?}", d);
+    }
+
+    // --- the consuming rule: use-after-`take` of a droppable ---
+
+    /// The shared prelude for the consuming-rule probes: a droppable `Device`
+    /// plus a consumer and a pass-through.
+    const DROPPY: &str = "trait Drop { fn drop(mut self) } \
+        struct Device { id: i64 } \
+        impl Drop for Device { fn drop(mut self) { print_int(self.id) } } \
+        fn consume(take d: Device) -> i64 { return d.id } \
+        fn pass_on(take d: Device) -> Device { return d }";
+
+    #[test]
+    fn use_after_take_of_droppable_is_rejected() {
+        // The rust_vs_jestyr probe: `consume(d)` then `d.id` — the callee has
+        // dropped the value by the time the caller reads its stale copy.
+        let d = escapes(&format!(
+            "{DROPPY} fn main() -> i64 {{ let d = Device{{ id: 7 }} let e = consume(d) print_int(d.id) return e }}"
+        ));
+        assert_eq!(d.len(), 1, "{:?}", d);
+        assert!(
+            d[0].message.contains("cannot use `d` after it was given to a `take` parameter"),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn rebinding_the_result_of_a_take_chain_is_legal() {
+        // `pass_on` moves the value on; the caller re-owns it under a fresh
+        // binding and may consume that one exactly once.
+        let d = escapes(&format!(
+            "{DROPPY} fn main() -> i64 {{ let a = Device{{ id: 1 }} let b = pass_on(a) return consume(b) }}"
+        ));
+        assert!(d.is_empty(), "{:?}", d);
+    }
+
+    #[test]
+    fn double_consume_in_one_call_is_rejected() {
+        // `g(d, d)` with two `take` params: the first argument consumes, the
+        // second is already a use-after-consume (arguments mark in order).
+        let d = escapes(&format!(
+            "{DROPPY} fn pair(take a: Device, take b: Device) {{}} \
+             fn main() -> i64 {{ let d = Device{{ id: 1 }} pair(d, d) return 0 }}"
+        ));
+        assert_eq!(d.len(), 1, "{:?}", d);
+        assert!(d[0].message.contains("after it was given to a `take` parameter"), "{:?}", d);
+    }
+
+    #[test]
+    fn drop_free_reuse_after_take_stays_legal() {
+        // MVS: a drop-free non-Copy value given to `take` is an implicit copy —
+        // nothing observable is left behind, so reuse stays legal (this is the
+        // corpus's Option-combinator shape, and the deliberate gate).
+        let d = escapes(
+            "struct Plain { v: i64 } fn eat(take p: Plain) -> i64 { return p.v } \
+             fn main() -> i64 { let p = Plain{ v: 3 } let a = eat(p) return a + eat(p) }",
+        );
+        assert!(d.is_empty(), "{:?}", d);
+    }
+
+    #[test]
+    fn reassignment_after_consume_is_rejected() {
+        // No runtime drop flags: a consumed binding cannot be reinitialized —
+        // the Assign target's walk reports the use.
+        let d = escapes(&format!(
+            "{DROPPY} fn main() -> i64 {{ var d = Device{{ id: 1 }} let e = consume(d) d = Device{{ id: 2 }} return e }}"
+        ));
+        assert_eq!(d.len(), 1, "{:?}", d);
+        assert!(d[0].message.contains("cannot use `d`"), "{:?}", d);
+    }
+
+    #[test]
+    fn both_branches_may_consume_independently() {
+        // Only one branch runs: each may consume the same binding.
+        let d = escapes(&format!(
+            "{DROPPY} fn main() -> i64 {{ let d = Device{{ id: 1 }} \
+             if d.id > 0 {{ return consume(d) }} else {{ return consume(d) }} }}"
+        ));
+        assert!(d.is_empty(), "{:?}", d);
+    }
+
+    #[test]
+    fn use_after_conditional_consume_is_rejected() {
+        // A lone `if` may have run its consume — the use after it errors
+        // (branch sets merge by union; Rust rejects the same shape).
+        let d = escapes(&format!(
+            "{DROPPY} fn main() -> i64 {{ let d = Device{{ id: 1 }} var e: i64 = 0 \
+             if d.id > 0 {{ e = consume(d) }} print_int(d.id) return e }}"
+        ));
+        assert_eq!(d.len(), 1, "{:?}", d);
+        assert!(d[0].message.contains("cannot use `d`"), "{:?}", d);
+    }
+
+    #[test]
+    fn consume_of_outer_binding_in_loop_is_rejected() {
+        // The second iteration would consume a value already gone.
+        let d = escapes(&format!(
+            "{DROPPY} fn main() -> i64 {{ let d = Device{{ id: 1 }} var i: i64 = 0 \
+             for i < 3 {{ let e = consume(d) i = i + e }} return i }}"
+        ));
+        assert_eq!(d.len(), 1, "{:?}", d);
+        assert!(
+            d[0].message.contains("outside the enclosing loop or closure"),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn consume_of_loop_local_binding_is_legal() {
+        // A fresh value per iteration is the fix the loop message suggests.
+        let d = escapes(&format!(
+            "{DROPPY} fn main() -> i64 {{ var i: i64 = 0 \
+             for i < 3 {{ let d = Device{{ id: i }} i = i + consume(d) }} return i }}"
+        ));
+        assert!(d.is_empty(), "{:?}", d);
+    }
+
+    #[test]
+    fn moving_a_droppable_field_out_is_rejected() {
+        // After the take-drop fix the callee drops its copy while the container
+        // still drops the original at scope exit — a projection into `take` is
+        // a double drop, refused at the call.
+        let d = escapes(&format!(
+            "{DROPPY} struct Holder {{ dev: Device }} \
+             fn main() -> i64 {{ let h = Holder{{ dev: Device{{ id: 1 }} }} return consume(h.dev) }}"
+        ));
+        assert_eq!(d.len(), 1, "{:?}", d);
+        assert!(
+            d[0].message.contains("cannot give a droppable part of `h`"),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn transitively_droppable_reuse_is_v1_residue() {
+        // PINNED RESIDUE, not an endorsement: a wrapper with a droppable FIELD
+        // but no direct `impl Drop` slips the v1 gate (`droppable_ty` reads only
+        // the impl_index), so consuming it and reusing the binding is still
+        // accepted — while cgen's `needs_drop` DOES drop it in the callee. When
+        // the gate learns the transitive walk, this test flips to a rejection.
+        let d = escapes(&format!(
+            "{DROPPY} struct Wrap {{ dev: Device }} fn eat(take w: Wrap) {{}} \
+             fn main() -> i64 {{ let w = Wrap{{ dev: Device{{ id: 1 }} }} eat(w) return w.dev.id }}"
+        ));
+        assert!(d.is_empty(), "v1 gate is direct-impl only (residue): {:?}", d);
     }
 
     // --- route 4: giving a borrow to a `take` (owning) parameter ---

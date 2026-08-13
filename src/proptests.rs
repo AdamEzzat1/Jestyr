@@ -9220,6 +9220,75 @@ fn g(p: *mut i32) -> i32 {
         assert_eq!(got2, want2, "the toolchains disagree on a legal same-region alias");
     }
 
+    /// **The consuming rule, differentially** — the corpus never reuses a droppable
+    /// after `take` (that leak was invisible for exactly this reason), so probes
+    /// carry the rule: use-after-consume FIRES with the same message on both
+    /// toolchains for a free-fn arg, a struct-method `take self` receiver, a loop
+    /// consume, and a droppable projection; the drop-free reuse (MVS implicit
+    /// copy) and the both-branches shape stay LEGAL on both.
+    #[test]
+    fn jestyr_use_after_consume_matches_reference() {
+        let exe = build_exe("examples/std/escape_cli.jtr");
+        let prelude = "trait Drop { fn drop(mut self) } \
+            struct Device { id: i64 } \
+            impl Drop for Device { fn drop(mut self) { print_int(self.id) } } \
+            fn consume(take d: Device) -> i64 { return d.id } ";
+        let cases: [(&str, &str, &str); 6] = [
+            (
+                "use_after",
+                "fn main() -> i64 { let d = Device{ id: 7 } let e = consume(d) print_int(d.id) return e }",
+                "cannot use `d` after it was given to a `take` parameter",
+            ),
+            (
+                "take_self_recv",
+                "struct Eater { n: i64, fn eat(take self) -> i64 { return self.n } } \
+                 impl Drop for Eater { fn drop(mut self) { print_int(self.n) } } \
+                 fn main() -> i64 { let x = Eater{ n: 2 } let a = x.eat() return a + x.n }",
+                "cannot use `x` after it was given to a `take` parameter",
+            ),
+            (
+                "loop_consume",
+                "fn main() -> i64 { let d = Device{ id: 1 } var i: i64 = 0 \
+                 for i < 3 { let e = consume(d) i = i + e } return i }",
+                "outside the enclosing loop or closure",
+            ),
+            (
+                "projection",
+                "struct Holder { dev: Device } \
+                 fn main() -> i64 { let h = Holder{ dev: Device{ id: 1 } } return consume(h.dev) }",
+                "cannot give a droppable part of `h`",
+            ),
+            (
+                "drop_free_reuse",
+                "struct Plain { v: i64 } fn eat(take q: Plain) -> i64 { return q.v } \
+                 fn main() -> i64 { let q = Plain{ v: 3 } let a = eat(q) return a + eat(q) }",
+                "",
+            ),
+            (
+                "both_branches",
+                "fn main() -> i64 { let d = Device{ id: 1 } \
+                 if d.id > 0 { return consume(d) } else { return consume(d) } }",
+                "",
+            ),
+        ];
+        for (name, body, needle) in cases {
+            let src = format!("{prelude}{body}");
+            let want = rust_escape_dump(&src);
+            if needle.is_empty() {
+                assert!(want.is_empty(), "{name} must stay legal on the reference: {want:?}");
+            } else {
+                assert!(
+                    want.iter().any(|l| l.contains(needle)),
+                    "{name} no longer fires on the reference — replace it with a shape that does: {want:?}"
+                );
+            }
+            let f = std::env::temp_dir().join(format!("jestyr_consume_{name}.jtr"));
+            std::fs::write(&f, &src).unwrap();
+            let got = jestyr_escape_dump(&exe, f.to_str().unwrap());
+            assert_eq!(got, want, "the toolchains disagree on the consuming rule ({name}): {src}");
+        }
+    }
+
     /// **Enum `@copy`, differentially** — the escape consequence of the opt-in must
     /// agree across toolchains: the UN-annotated twin's `read`-param return is
     /// refused on BOTH sides (anti-vacuity — Copy-ness is doing the work), and the
