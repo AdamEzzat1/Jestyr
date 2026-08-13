@@ -1,0 +1,84 @@
+// borrowed_projection — twin of rust/std/borrowed_projection.
+//
+// THE DOCUMENTED GAP. Rust returns `&Token` — a true borrow into the
+// slice. Jestyr cannot: `-> read T` exists but names no source (`-> read
+// T from xs` is design-only, safety-mosaic item 2), and an element of a
+// non-copy type may not leave a `read` slice at all (escape route 1 —
+// see borrowed_projection_rejected.jtr). The idiomatic Jestyr answer is
+// to mark the 24-byte Token `@copy` and return it BY VALUE. Same shapes,
+// different mechanism: projection by copy, not by reference.
+//
+// Output must be byte-identical to the Rust twin.
+
+const N: i64 = 2000000
+const LOOKUPS: i64 = 2000000
+const MOD: i64 = 1000000007
+
+@copy struct Token { kind: i64, start: i64, len: i64 }
+
+fn lcg(state: i64) -> i64 {
+    return (state * 48271) % 2147483647
+}
+
+// Rust: fn first(xs: &[Token]) -> &Token. Here: a copy comes back.
+fn first(read xs: []Token) -> Token {
+    return xs[0]
+}
+
+fn at(read xs: []Token, i: usize) -> Token {
+    return xs[i]
+}
+
+// Max-by-len, first occurrence wins. Rust hands back a borrow; this
+// hands back a copy of the winner.
+fn longest(read xs: []Token) -> Token {
+    var best: Token = xs[0]
+    for i in 0..xs.len {
+        if xs[i].len > best.len {
+            best = xs[i]
+        }
+    }
+    return best
+}
+
+// Field projection through a read parameter.
+fn kind_of(read t: Token) -> i64 {
+    return t.kind
+}
+
+fn main() -> i32 {
+    var a: *mut Token = alloc(Token, N as usize)
+    var toks: []Token = slice(Token, a, N as usize)
+    var s: i64 = 20260813
+    var start: i64 = 0
+    for i in 0..toks.len {
+        s = lcg(s)
+        let kind: i64 = s % 12
+        s = lcg(s)
+        let len: i64 = s % 24 + 1
+        toks[i] = Token { kind: kind, start: start, len: len }
+        start = start + len
+    }
+
+    // Random-access lookups through the value-return of `at`.
+    s = 777
+    var sum: i64 = 0
+    var i: i64 = 0
+    for i < LOOKUPS {
+        s = lcg(s)
+        let t: Token = at(toks, (s % N) as usize)
+        sum = (sum + t.start % 1000003 + t.len * 31 + kind_of(t)) % MOD
+        i = i + 1
+    }
+
+    // Whole-slice projections.
+    let f: Token = first(toks)
+    let l: Token = longest(toks)
+
+    print_int(sum)
+    print_int(f.kind * 1000 + f.len)
+    print_int(l.start % 1000003)
+    print_int(l.len)
+    free_ptr(a)
+    return 0
+}

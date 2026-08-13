@@ -1,0 +1,18 @@
+// REJECTION PROBE — must NOT compile.
+// The same buffer fed to two writable slice parameters of one call —
+// Jestyr's call-site analogue of Rust's E0499 (two &mut into one
+// buffer). The diagnostic names the fix: divide with split_mut.
+
+fn g(mut a: []i64, mut b: []i64) {
+    a[0] = 1
+    b[0] = 2
+}
+
+fn main() -> i32 {
+    var p: *mut i64 = alloc(i64, 8)
+    var q: []i64 = slice(i64, p, 8)
+    g(q, q)
+    print_int(q[0])
+    free_ptr(p)
+    return 0
+}

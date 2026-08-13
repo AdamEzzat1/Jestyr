@@ -1,0 +1,93 @@
+﻿{
+    "date":  "2026-08-13 01:10",
+    "rustc":  "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo":  "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "gcc":  "gcc.exe (x86_64-posix-seh, Built by strawberryperl.com project) 8.3.0",
+    "jestyr_branch":  "claude/rust-jestyr-ownership-benchmark-1bd785",
+    "jestyr_commit":  "f675669",
+    "reps":  7,
+    "timing":  "interleaved min-of-7, first round discarded",
+    "results":  [
+                    {
+                        "case":  "transient_borrow",
+                        "track":  "rust-std",
+                        "runtime_ms":  468.8,
+                        "compile_ms":  1033,
+                        "binary_bytes":  128512,
+                        "loc":  101,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "transient_borrow",
+                        "track":  "jestyr",
+                        "runtime_ms":  452.5,
+                        "compile_ms":  342,
+                        "binary_bytes":  69068,
+                        "loc":  91,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "borrowed_projection",
+                        "track":  "rust-std",
+                        "runtime_ms":  96.2,
+                        "compile_ms":  916,
+                        "binary_bytes":  128000,
+                        "loc":  62,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "borrowed_projection",
+                        "track":  "jestyr",
+                        "runtime_ms":  99.4,
+                        "compile_ms":  505,
+                        "binary_bytes":  70453,
+                        "loc":  56,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "disjoint_mutation",
+                        "track":  "rust-std",
+                        "runtime_ms":  479.4,
+                        "compile_ms":  799,
+                        "binary_bytes":  128000,
+                        "loc":  63,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "disjoint_mutation",
+                        "track":  "jestyr",
+                        "runtime_ms":  559,
+                        "compile_ms":  687,
+                        "binary_bytes":  101843,
+                        "loc":  59,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "observer_registry",
+                        "track":  "rust-std",
+                        "runtime_ms":  56.1,
+                        "compile_ms":  533,
+                        "binary_bytes":  129024,
+                        "loc":  109,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "observer_registry",
+                        "track":  "rust-idiomatic",
+                        "runtime_ms":  50,
+                        "compile_ms":  499,
+                        "binary_bytes":  129024,
+                        "loc":  63,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "observer_registry",
+                        "track":  "jestyr",
+                        "runtime_ms":  70.7,
+                        "compile_ms":  358,
+                        "binary_bytes":  70838,
+                        "loc":  74,
+                        "output_match":  true
+                    }
+                ]
+}

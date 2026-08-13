@@ -1,0 +1,21 @@
+// REJECTION PROBE — must NOT compile.
+// The un-annotated version of the projection: Token WITHOUT @copy, so
+// returning an element of a read slice is escape route 1 (a borrow
+// place leaving by value). Rust's twin probe rejects the borrow
+// OUTLIVING the data (E0597); Jestyr rejects the borrow LEAVING at all.
+
+struct Token { kind: i64, start: i64, len: i64 }
+
+fn at(read xs: []Token, i: usize) -> Token {
+    return xs[i]
+}
+
+fn main() -> i32 {
+    var a: *mut Token = alloc(Token, 1)
+    var xs: []Token = slice(Token, a, 1)
+    xs[0] = Token { kind: 1, start: 0, len: 3 }
+    let t: Token = at(xs, 0)
+    print_int(t.kind)
+    free_ptr(a)
+    return 0
+}

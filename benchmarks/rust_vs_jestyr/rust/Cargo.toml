@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "std/transient_borrow",
+    "std/borrowed_projection",
+    "std/disjoint_mutation",
+    "std/observer_registry",
+    "idiomatic/observer_registry",
+]
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
