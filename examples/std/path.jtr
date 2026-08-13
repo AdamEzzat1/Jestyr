@@ -1,0 +1,394 @@
+// std/path.jtr — lexical path manipulation.
+//
+// TIER: `core`-shaped. No heap, no OS, no syscalls. Every function here is
+// `@no_alloc`, so "path handling never allocates" is a *proven* property, not a
+// comment — the escape checker rejects this file if any of it ever reaches for
+// the allocator. Nothing here touches the filesystem: `path.base("/nope")` is
+// answerable without the file existing, which is exactly why the lexical layer
+// is separate from `std/fs`.
+//
+// TWO SHAPES, matching the rest of std:
+//   * queries return a `str` VIEW into the argument (`-> read str`) — zero copy,
+//     and the view is only valid while the argument is;
+//   * composition writes into a CALLER buffer and returns the byte count, the
+//     same idiom as `core.format_u64` — so the allocation is the caller's,
+//     visible at the call site, and this module keeps its `@no_alloc` proof.
+//
+// SEPARATORS: `/` and `\` are BOTH accepted when parsing, because Jestyr builds
+// on Windows and POSIX and the compiler's own module loader already reads both.
+// `/` is the only separator ever WRITTEN, so composed output is byte-identical
+// across platforms — the determinism rule applied to paths.
+//
+// The self-hosted compiler hand-rolls this logic today (`path_dir_len` and the
+// stem/join code in `examples/std/cgen.jtr`); it is the intended first consumer
+// once this module has settled.
+//
+// Run the tests:  jestyrc test examples/std/path.jtr
+
+const SLASH: i32 = 47      // '/'
+const BACKSLASH: i32 = 92  // '\'
+const DOT: i32 = 46        // '.'
+const COLON: i32 = 58      // ':'
+
+// ---------------------------------------------------------------- predicates
+
+// Is `ch` a path separator? Both spellings count.
+@no_alloc pub fn is_sep(ch: i32) -> bool {
+    return ch == SLASH or ch == BACKSLASH
+}
+
+// Is the byte at `i` a separator? (Bounds are the caller's; `i < p.len`.)
+@no_alloc fn sep_at(read p: str, i: usize) -> bool {
+    return is_sep(p[i] as i32)
+}
+
+// Does `p` name a location from a root rather than from the current directory?
+// True for a leading separator, and for a Windows drive prefix (`C:`).
+@no_alloc pub fn is_abs(read p: str) -> bool {
+    if p.len == 0 { return false }
+    if sep_at(p, 0) { return true }
+    if p.len >= 2 {
+        if (p[1] as i32) == COLON { return true }
+    }
+    return false
+}
+
+// ------------------------------------------------------------------- queries
+
+// The length of the directory prefix INCLUDING its trailing separator, so that
+// `p[0 .. dir_len(p)]` is a prefix you can concatenate onto directly. 0 when `p`
+// has no separator. (This is the exact shape `cgen.jtr`'s loader needs.)
+@no_alloc pub fn dir_len(read p: str) -> usize {
+    var i: usize = p.len
+    for i > 0 {
+        if sep_at(p, i - 1) { return i }
+        i = i - 1
+    }
+    return 0
+}
+
+// The last segment: everything after the final separator.
+//   base("a/b/c.jtr") == "c.jtr"      base("bare") == "bare"
+//   base("a/b/")      == ""           (a trailing separator means "no segment")
+@no_alloc pub fn base(read p: str) -> read str {
+    return p[dir_len(p) .. p.len]
+}
+
+// Everything before the final separator, WITHOUT the trailing separator.
+//   dir("a/b/c") == "a/b"     dir("c") == ""      dir("/a") == "/"
+// Note "" (not POSIX's ".") for a bare name: an empty prefix is what `join`
+// wants, and it keeps this function a pure view with no invented storage.
+@no_alloc pub fn dir(read p: str) -> read str {
+    let d: usize = dir_len(p)
+    if d == 0 { return p[0 .. 0] }
+    if d == 1 { return p[0 .. 1] }   // the root itself: "/"
+    return p[0 .. d - 1]
+}
+
+// The byte offset of the extension's dot within `base(p)`, or `base.len` when
+// there is none. A dot at offset 0 is a dotfile (".bashrc"), not an extension.
+@no_alloc fn ext_dot(read b: str) -> usize {
+    var i: usize = b.len
+    for i > 1 {
+        if (b[i - 1] as i32) == DOT { return i - 1 }
+        i = i - 1
+    }
+    return b.len
+}
+
+// The extension WITHOUT its dot; "" when there is none.
+//   ext("a/b.tar.gz") == "gz"   ext("README") == ""   ext(".bashrc") == ""
+@no_alloc pub fn ext(read p: str) -> read str {
+    let b: str = base(p)
+    let d: usize = ext_dot(b)
+    if d == b.len { return b[0 .. 0] }
+    return b[d + 1 .. b.len]
+}
+
+// The last segment with its extension removed.
+//   stem("a/b.tar.gz") == "b.tar"   stem("README") == "README"
+//   stem(".bashrc")    == ".bashrc"
+@no_alloc pub fn stem(read p: str) -> read str {
+    let b: str = base(p)
+    return b[0 .. ext_dot(b)]
+}
+
+// --------------------------------------------------------------- composition
+
+// Join `a` and `b` into `buf`, returning the byte count written.
+//
+// Rules (Rust's `Path::join` semantics): an absolute `b` replaces `a` entirely;
+// an empty side contributes nothing; exactly one `/` lands between them.
+// REQUIRES `buf.len >= a.len + b.len + 1` — a short buffer trips the slice
+// bounds check, which is a deterministic fault rather than a silent truncation.
+@no_alloc pub fn join(read a: str, read b: str, mut buf: []u8) -> usize {
+    var n: usize = 0
+    if is_abs(b) or a.len == 0 {
+        for i in 0..b.len {
+            buf[n] = b[i] as u8
+            n = n + 1
+        }
+        return n
+    }
+    for i in 0..a.len {
+        buf[n] = a[i] as u8
+        n = n + 1
+    }
+    if b.len == 0 { return n }
+    if sep_at(a, a.len - 1) == false {
+        buf[n] = SLASH as u8
+        n = n + 1
+    }
+    for j in 0..b.len {
+        buf[n] = b[j] as u8
+        n = n + 1
+    }
+    return n
+}
+
+// Scan back from `n` for the start of the last segment in `buf`, not below
+// `root`. Used to pop a segment when `..` is resolved.
+@no_alloc fn pop_seg(read buf: []u8, n: usize, root: usize) -> usize {
+    var k: usize = n
+    for k > root {
+        if (buf[k - 1] as i32) == SLASH { return k - 1 }
+        k = k - 1
+    }
+    return root
+}
+
+// Normalize `p` into `buf`, returning the byte count written.
+//
+// Separators become `/`; runs of separators collapse; `.` segments drop; `..`
+// segments cancel the preceding one when there is one to cancel. A relative
+// path keeps leading `..` (there is nothing above it to cancel); an absolute
+// path never rises above its root. An empty result is written as ".", so the
+// output is always a usable path — which also makes normalize IDEMPOTENT:
+// `normalize(normalize(p)) == normalize(p)` for every input.
+//
+// REQUIRES `buf.len >= p.len` when `p` is non-empty, and `buf.len >= 1`
+// otherwise: normalization only ever shrinks, except "" which becomes ".".
+@no_alloc pub fn normalize(read p: str, mut buf: []u8) -> usize {
+    let abs: bool = p.len > 0 and sep_at(p, 0)
+    var n: usize = 0
+    if abs {
+        buf[0] = SLASH as u8
+        n = 1
+    }
+    let root: usize = n
+    var i: usize = 0
+    for i < p.len {
+        if sep_at(p, i) {
+            i = i + 1
+            continue
+        }
+        // The segment is [s, i) once this inner scan stops.
+        let s: usize = i
+        for i < p.len {
+            if sep_at(p, i) { break }
+            i = i + 1
+        }
+        let seg: str = p[s .. i]
+        if seg.len == 1 {
+            if (seg[0] as i32) == DOT { continue }
+        }
+        if seg.len == 2 {
+            if (seg[0] as i32) == DOT and (seg[1] as i32) == DOT {
+                // Pop, unless there is nothing poppable: an absolute path is
+                // already at its root, and a relative one must keep the `..`.
+                if n > root {
+                    let back: usize = pop_seg(buf, n, root)
+                    // Where the previous segment actually starts: past the
+                    // separator `pop_seg` landed on, or at the root when it
+                    // found none.
+                    var seg_start: usize = root
+                    if back > root { seg_start = back + 1 }
+                    // A leading `..` chain is not poppable — it is not a segment
+                    // we put there, so keep appending instead. Compare the whole
+                    // SEGMENT, not its last two bytes: a directory legitimately
+                    // named `a..` ends in two dots and must still be popped.
+                    let plen: usize = n - seg_start
+                    var prev_is_dotdot: bool = false
+                    if plen == 2 {
+                        prev_is_dotdot = (buf[seg_start] as i32) == DOT and (buf[seg_start + 1] as i32) == DOT
+                    }
+                    if prev_is_dotdot == false {
+                        n = back
+                        continue
+                    }
+                } else {
+                    if abs { continue }
+                }
+            }
+        }
+        if n > root {
+            buf[n] = SLASH as u8
+            n = n + 1
+        }
+        for k in s..i {
+            buf[n] = p[k] as u8
+            n = n + 1
+        }
+    }
+    if n == 0 {
+        buf[0] = DOT as u8
+        return 1
+    }
+    return n
+}
+
+// ---------------------------------------------------------------------- tests
+//
+// Colocated with the code they check (the shape `cgen.jtr` already uses), so
+// `jestyrc test examples/std/path.jtr` is the whole unit layer. These cover the
+// edge cases the property tests cannot name: dotfiles, roots, trailing
+// separators, and both separator spellings.
+
+@test fn base_strips_the_directory() -> bool {
+    if str_eq(base("examples/std/core.jtr"), "core.jtr") == false { return false }
+    if str_eq(base("bare.txt"), "bare.txt") == false { return false }
+    if str_eq(base("a/b/"), "") == false { return false }
+    return str_eq(base(""), "")
+}
+
+@test fn base_reads_both_separators() -> bool {
+    return str_eq(base("a\\b\\c.jtr"), "c.jtr")
+}
+
+@test fn dir_drops_the_trailing_separator() -> bool {
+    if str_eq(dir("a/b/c"), "a/b") == false { return false }
+    if str_eq(dir("c"), "") == false { return false }
+    if str_eq(dir("/a"), "/") == false { return false }
+    return str_eq(dir("/"), "/")
+}
+
+@test fn ext_ignores_dotfiles() -> bool {
+    if str_eq(ext("a/b.tar.gz"), "gz") == false { return false }
+    if str_eq(ext("README"), "") == false { return false }
+    if str_eq(ext(".bashrc"), "") == false { return false }
+    return str_eq(ext("a.b/c"), "")
+}
+
+@test fn stem_is_base_without_the_extension() -> bool {
+    if str_eq(stem("a/b.tar.gz"), "b.tar") == false { return false }
+    if str_eq(stem("README"), "README") == false { return false }
+    return str_eq(stem(".bashrc"), ".bashrc")
+}
+
+@test fn is_abs_knows_roots_and_drives() -> bool {
+    if is_abs("/etc") == false { return false }
+    if is_abs("C:\\Users") == false { return false }
+    if is_abs("rel/ative") { return false }
+    return is_abs("") == false
+}
+
+@test fn dir_len_includes_the_separator() -> bool {
+    if dir_len("a/b/c") != 4 { return false }
+    if dir_len("bare") != 0 { return false }
+    return dir_len("/x") == 1
+}
+
+@test fn join_composes_one_separator() -> bool {
+    var raw: *mut u8 = alloc(u8, 128)
+    var buf: []u8 = slice(u8, raw, 128)
+    var ok: bool = true
+
+    var n: usize = join("examples/std", "path.jtr", buf)
+    if str_eq(from_utf8(slice(u8, raw, n)), "examples/std/path.jtr") == false { ok = false }
+
+    n = join("examples/std/", "path.jtr", buf)        // already separated
+    if str_eq(from_utf8(slice(u8, raw, n)), "examples/std/path.jtr") == false { ok = false }
+
+    n = join("ignored", "/abs/olute", buf)            // absolute rhs wins
+    if str_eq(from_utf8(slice(u8, raw, n)), "/abs/olute") == false { ok = false }
+
+    n = join("", "solo", buf)
+    if str_eq(from_utf8(slice(u8, raw, n)), "solo") == false { ok = false }
+
+    n = join("solo", "", buf)
+    if str_eq(from_utf8(slice(u8, raw, n)), "solo") == false { ok = false }
+
+    free_ptr(raw)
+    return ok
+}
+
+@test fn normalize_collapses_and_cancels() -> bool {
+    var raw: *mut u8 = alloc(u8, 128)
+    var buf: []u8 = slice(u8, raw, 128)
+    var ok: bool = true
+
+    var n: usize = normalize("a//b/./c", buf)
+    if str_eq(from_utf8(slice(u8, raw, n)), "a/b/c") == false { ok = false }
+
+    n = normalize("a/b/../c", buf)
+    if str_eq(from_utf8(slice(u8, raw, n)), "a/c") == false { ok = false }
+
+    n = normalize("a\\b/c", buf)                      // separators unify
+    if str_eq(from_utf8(slice(u8, raw, n)), "a/b/c") == false { ok = false }
+
+    n = normalize("/../x", buf)                       // cannot rise above root
+    if str_eq(from_utf8(slice(u8, raw, n)), "/x") == false { ok = false }
+
+    n = normalize("../x", buf)                        // relative keeps its `..`
+    if str_eq(from_utf8(slice(u8, raw, n)), "../x") == false { ok = false }
+
+    n = normalize("../../x", buf)
+    if str_eq(from_utf8(slice(u8, raw, n)), "../../x") == false { ok = false }
+
+    n = normalize("a/..", buf)                        // empty result becomes "."
+    if str_eq(from_utf8(slice(u8, raw, n)), ".") == false { ok = false }
+
+    n = normalize("", buf)
+    if str_eq(from_utf8(slice(u8, raw, n)), ".") == false { ok = false }
+
+    n = normalize("/", buf)
+    if str_eq(from_utf8(slice(u8, raw, n)), "/") == false { ok = false }
+
+    free_ptr(raw)
+    return ok
+}
+
+// Regression: a directory whose NAME ends in two dots is not a `..` segment.
+// An earlier version compared the last two bytes of the output rather than the
+// whole preceding segment, so `a../..` refused to pop and produced `a../..`.
+// Both this module and the Rust oracle in src/proptests.rs shared the flaw, so
+// the differential test agreed with itself and could not have caught it.
+@test fn normalize_pops_dirs_that_merely_end_in_dots() -> bool {
+    var raw: *mut u8 = alloc(u8, 128)
+    var buf: []u8 = slice(u8, raw, 128)
+    var ok: bool = true
+
+    var n: usize = normalize("a../..", buf)
+    if str_eq(from_utf8(slice(u8, raw, n)), ".") == false { ok = false }
+
+    n = normalize("x/a../..", buf)
+    if str_eq(from_utf8(slice(u8, raw, n)), "x") == false { ok = false }
+
+    n = normalize("..a/..", buf)
+    if str_eq(from_utf8(slice(u8, raw, n)), ".") == false { ok = false }
+
+    // ...while a real `..` chain still refuses to pop itself.
+    n = normalize("../../x", buf)
+    if str_eq(from_utf8(slice(u8, raw, n)), "../../x") == false { ok = false }
+
+    free_ptr(raw)
+    return ok
+}
+
+@test fn normalize_is_idempotent_on_the_awkward_cases() -> bool {
+    var raw: *mut u8 = alloc(u8, 128)
+    var raw2: *mut u8 = alloc(u8, 128)
+    var buf: []u8 = slice(u8, raw, 128)
+    var buf2: []u8 = slice(u8, raw2, 128)
+    var ok: bool = true
+
+    // One pass, then a second over the first pass's output: must not move.
+    let n1: usize = normalize("a/b/../../../c/./", buf)
+    let once: str = from_utf8(slice(u8, raw, n1))
+    let n2: usize = normalize(once, buf2)
+    if str_eq(from_utf8(slice(u8, raw2, n2)), once) == false { ok = false }
+
+    free_ptr(raw2)
+    free_ptr(raw)
+    return ok
+}

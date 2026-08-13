@@ -7,6 +7,32 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/path` — the first slice of the stdlib readiness layer**, and the first
+  stdlib module whose allocation behavior is *proven*. Lexical path
+  manipulation (`base`, `dir`, `ext`, `stem`, `is_abs`, `dir_len`, `join`,
+  `normalize`) with no heap and no syscalls: every function is `@no_alloc`, so
+  the escape checker rejects the file if any of it ever reaches for the
+  allocator. Queries return `read str` views into their argument; composition
+  writes into a caller-supplied `[]u8` and returns the byte count, the
+  `core.format_u64` idiom. Both `/` and `\` parse as separators, only `/` is
+  ever written, so composed output is byte-identical across platforms.
+
+  It is also the `@test` harness's first real user — the unit tests ship
+  beside the code (`jestyrc test examples/std/path.jtr`), where previously
+  `examples/tests_demo.jtr` was the only file in the corpus using the
+  attribute. Verified at four layers: the in-language `@test` suite, a
+  toolchain-free "compiles clean" test, a c-oracle assertion on the demo's
+  documented output, and a **differential property test** that drives the
+  compiled Jestyr module and requires it to agree with an independent Rust
+  oracle, plus bolero totality coverage on that oracle.
+
+  Costs nothing in bootstrap terms: no closure module imports it, so there is
+  no port mirror and no reseed. Both files *are* in `CGEN_GOLDEN_ALLOWLIST`
+  though — the self-hosted `cgen.jtr` lowers them byte-identically to the
+  reference backend, verified rather than assumed. See
+  [docs/stdlib-roadmap.md](docs/stdlib-roadmap.md) for the tier model, the
+  priority order, and the list of things deliberately staying out of `std`.
+
 - **Two modules may now define the same generic struct** (`fn Box(comptime T:
   type) -> type`), completing collidable names: their monomorphized instances
   get distinct symbols (`Jestyr_Box__m1__i32` vs `__m2__i32`), fields, and

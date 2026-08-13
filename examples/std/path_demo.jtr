@@ -1,0 +1,138 @@
+// std/path_demo.jtr — worked examples for `std/path`, and the oracle the Rust
+// property tests drive.
+//
+// TWO MODES, on purpose:
+//   * no arguments — print the worked demo below. This is what the c-oracle
+//     test asserts, so the documented output is verified rather than claimed.
+//   * `path_demo <op> <a> [b]` — apply one operation and print the result,
+//     one line, nothing else. `src/proptests.rs` builds this once and runs it
+//     per generated case, so the properties are checked against the REAL
+//     Jestyr implementation rather than a Rust re-description of it.
+//
+// Run:  cargo run --release -- run examples/std/path_demo.jtr
+//   →   core.jtr / examples/std / jtr / core / examples/std/path.jtr / a/c
+//       1 0 4
+//
+// Ops: base | dir | ext | stem | norm | join | isabs | dirlen
+
+import "path"
+import "env"
+
+const CAP: usize = 4096
+
+fn emit(read s: str) {
+    print_str(s)
+}
+
+// `op a b` -> one line on stdout. Unknown ops print nothing and exit 2, so a
+// typo in the test harness fails loudly instead of silently passing.
+fn run_op(read op: str, read a: str, read b: str, mut buf: []u8, raw: *mut u8) -> i32 {
+    if str_eq(op, "base") {
+        emit(path.base(a))
+        return 0
+    }
+    if str_eq(op, "dir") {
+        emit(path.dir(a))
+        return 0
+    }
+    if str_eq(op, "ext") {
+        emit(path.ext(a))
+        return 0
+    }
+    if str_eq(op, "stem") {
+        emit(path.stem(a))
+        return 0
+    }
+    if str_eq(op, "isabs") {
+        if path.is_abs(a) {
+            emit("1")
+        } else {
+            emit("0")
+        }
+        return 0
+    }
+    if str_eq(op, "dirlen") {
+        let k: usize = core_format(path.dir_len(a), buf)
+        emit(from_utf8(slice(u8, raw, k)))
+        return 0
+    }
+    if str_eq(op, "norm") {
+        let n: usize = path.normalize(a, buf)
+        emit(from_utf8(slice(u8, raw, n)))
+        return 0
+    }
+    if str_eq(op, "join") {
+        let n: usize = path.join(a, b, buf)
+        emit(from_utf8(slice(u8, raw, n)))
+        return 0
+    }
+    return 2
+}
+
+// A tiny unsigned decimal formatter, local so this demo stays a leaf (importing
+// `core` would pull the whole numerics tier in for one number). Digits are
+// generated least-significant first, then reversed in place.
+fn core_format(v: usize, mut dst: []u8) -> usize {
+    if v == 0 {
+        dst[0] = 48
+        return 1
+    }
+    var n: usize = 0
+    var x: usize = v
+    for x > 0 {
+        dst[n] = (48 + (x % 10)) as u8
+        x = x / 10
+        n = n + 1
+    }
+    var i: usize = 0
+    var j: usize = n - 1
+    for i < j {
+        let t: u8 = dst[i]
+        dst[i] = dst[j]
+        dst[j] = t
+        i = i + 1
+        j = j - 1
+    }
+    return n
+}
+
+fn demo(mut buf: []u8, raw: *mut u8) {
+    let p: str = "examples/std/core.jtr"
+    emit(path.base(p))                 // core.jtr
+    emit(path.dir(p))                  // examples/std
+    emit(path.ext(p))                  // jtr
+    emit(path.stem(p))                 // core
+
+    let n: usize = path.join("examples/std", "path.jtr", buf)
+    emit(from_utf8(slice(u8, raw, n)))  // examples/std/path.jtr
+
+    let m: usize = path.normalize("a//b/../c/./", buf)
+    emit(from_utf8(slice(u8, raw, m)))  // a/c
+
+    // Predicates, as digits so the expected output stays greppable.
+    if path.is_abs("/etc") { emit("1") } else { emit("0") }
+    if path.is_abs("rel") { emit("1") } else { emit("0") }
+
+    let k: usize = core_format(path.dir_len("a/b/c"), buf)
+    emit(from_utf8(slice(u8, raw, k)))   // 4
+}
+
+fn main() -> i32 {
+    var raw: *mut u8 = alloc(u8, CAP)
+    var buf: []u8 = slice(u8, raw, CAP)
+    var code: i32 = 0
+
+    if env.argc() < 2 {
+        demo(buf, raw)
+    } else {
+        let op: str = env.argv(1)
+        var a: str = ""
+        var b: str = ""
+        if env.argc() > 2 { a = env.argv(2) }
+        if env.argc() > 3 { b = env.argv(3) }
+        code = run_op(op, a, b, buf, raw)
+    }
+
+    free_ptr(raw)
+    return code
+}

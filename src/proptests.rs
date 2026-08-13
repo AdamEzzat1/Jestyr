@@ -3233,8 +3233,329 @@ mod comptime_props {
     }
 }
 
+// ------------------------------------------------------------ std/path oracle
+//
+// An independent Rust implementation of the `examples/std/path.jtr` spec. It is
+// the *oracle*, not a convenience: the c-oracle property test runs generated
+// paths through the real compiled Jestyr module and through these, and requires
+// them to agree — a differential test between two implementations written from
+// the same spec, the same shape as `dharht_memory_matches_hashmap`.
+//
+// Because the oracle is load-bearing, it gets fuzzed itself (`fuzz_path_*`
+// below): an oracle that panics or disagrees with its own stated invariants
+// would silently make the differential test meaningless.
+//
+// Byte-level on purpose. Splitting on `/` can never land inside a multi-byte
+// UTF-8 sequence (continuation bytes are >= 0x80, `/` is 0x2F), so the byte
+// form is total on arbitrary input *and* exact on text.
+
+fn path_ref_is_sep(c: u8) -> bool {
+    c == b'/' || c == b'\\'
+}
+
+fn path_ref_dir_len(b: &[u8]) -> usize {
+    let mut i = b.len();
+    while i > 0 {
+        if path_ref_is_sep(b[i - 1]) {
+            return i;
+        }
+        i -= 1;
+    }
+    0
+}
+
+/// The offset of the extension dot within a *base* segment, or `b.len()` when
+/// there is none. Offset 0 is a dotfile, not an extension.
+fn path_ref_ext_dot(b: &[u8]) -> usize {
+    let mut i = b.len();
+    while i > 1 {
+        if b[i - 1] == b'.' {
+            return i - 1;
+        }
+        i -= 1;
+    }
+    b.len()
+}
+
+fn path_ref_base(b: &[u8]) -> &[u8] {
+    &b[path_ref_dir_len(b)..]
+}
+
+fn path_ref_dir(b: &[u8]) -> &[u8] {
+    let d = path_ref_dir_len(b);
+    if d == 0 {
+        return &b[0..0];
+    }
+    if d == 1 {
+        return &b[0..1];
+    }
+    &b[0..d - 1]
+}
+
+fn path_ref_ext(b: &[u8]) -> &[u8] {
+    let base = path_ref_base(b);
+    let d = path_ref_ext_dot(base);
+    if d == base.len() {
+        return &base[0..0];
+    }
+    &base[d + 1..]
+}
+
+fn path_ref_stem(b: &[u8]) -> &[u8] {
+    let base = path_ref_base(b);
+    &base[..path_ref_ext_dot(base)]
+}
+
+fn path_ref_is_abs(b: &[u8]) -> bool {
+    if b.is_empty() {
+        return false;
+    }
+    if path_ref_is_sep(b[0]) {
+        return true;
+    }
+    b.len() >= 2 && b[1] == b':'
+}
+
+fn path_ref_join(a: &[u8], b: &[u8]) -> Vec<u8> {
+    if path_ref_is_abs(b) || a.is_empty() {
+        return b.to_vec();
+    }
+    let mut out = a.to_vec();
+    if b.is_empty() {
+        return out;
+    }
+    if !path_ref_is_sep(a[a.len() - 1]) {
+        out.push(b'/');
+    }
+    out.extend_from_slice(b);
+    out
+}
+
+/// Total on arbitrary bytes: never panics, never allocates unboundedly, and
+/// always returns an already-normalized result (hence idempotent).
+fn path_ref_normalize(p: &[u8]) -> Vec<u8> {
+    let abs = !p.is_empty() && path_ref_is_sep(p[0]);
+    let mut out: Vec<u8> = Vec::new();
+    if abs {
+        out.push(b'/');
+    }
+    let root = out.len();
+    let mut i = 0usize;
+    while i < p.len() {
+        if path_ref_is_sep(p[i]) {
+            i += 1;
+            continue;
+        }
+        let s = i;
+        while i < p.len() && !path_ref_is_sep(p[i]) {
+            i += 1;
+        }
+        let seg = &p[s..i];
+        if seg == b"." {
+            continue;
+        }
+        if seg == b".." {
+            if out.len() > root {
+                // Scan back for the previous separator, never below the root.
+                let mut k = out.len();
+                while k > root && out[k - 1] != b'/' {
+                    k -= 1;
+                }
+                let back = if k > root { k - 1 } else { root };
+                // Where the previous segment actually starts: past the separator
+                // we landed on, or at the root when there was none.
+                let seg_start = if back > root { back + 1 } else { root };
+                // A leading `..` chain is not poppable — nothing we placed.
+                // Compare the whole SEGMENT, not its last two bytes: a directory
+                // legitimately named `a..` ends in two dots and must still pop.
+                let prev = &out[seg_start..];
+                let prev_is_dotdot = prev == b"..";
+                if !prev_is_dotdot {
+                    out.truncate(back);
+                    continue;
+                }
+            } else if abs {
+                // Already at the root: `..` has nowhere to go.
+                continue;
+            }
+        }
+        if out.len() > root {
+            out.push(b'/');
+        }
+        out.extend_from_slice(seg);
+    }
+    if out.is_empty() {
+        return b".".to_vec();
+    }
+    out
+}
+
+/// **`std/path` — toolchain-free layer.** The module and its demo lower with no
+/// diagnostics, and the Rust oracle upholds the invariants the Jestyr module
+/// documents. The differential check against the real compiled module needs a C
+/// compiler and lives in `c_oracle::path_matches_the_reference`.
+mod path_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn diags_of(rel: &str) -> Vec<String> {
+        let prog = crate::module::load(rel);
+        let mut diags: Vec<String> = prog.diags.iter().map(|d| d.message.clone()).collect();
+        let (info, td) = typeck::check_program(&prog.ast, &prog.modules);
+        diags.extend(td.iter().map(|d| d.message.clone()));
+        diags.extend(escape::check(&prog.ast, &info).iter().map(|d| d.message.clone()));
+        let (_c, cd) = cgen::emit(&prog.ast, &info);
+        diags.extend(cd.iter().map(|d| d.message.clone()));
+        diags
+    }
+
+    /// The module is `@no_alloc` throughout, so this also proves the escape
+    /// checker accepts the allocation-free contract on every function in it —
+    /// "path handling never allocates" is checked here, not asserted in a doc.
+    #[test]
+    fn path_module_compiles_clean() {
+        let d = diags_of("examples/std/path.jtr");
+        assert!(d.is_empty(), "examples/std/path.jtr: {d:?}");
+    }
+
+    #[test]
+    fn path_demo_compiles_clean() {
+        let d = diags_of("examples/std/path_demo.jtr");
+        assert!(d.is_empty(), "examples/std/path_demo.jtr: {d:?}");
+    }
+
+    /// The worked cases from the module's own doc comments, checked against the
+    /// oracle — so the oracle is pinned to the documented behavior before it is
+    /// used to judge the Jestyr implementation.
+    #[test]
+    fn reference_matches_the_documented_cases() {
+        let n = |s: &str| String::from_utf8(path_ref_normalize(s.as_bytes())).unwrap();
+        assert_eq!(n("a//b/./c"), "a/b/c");
+        assert_eq!(n("a/b/../c"), "a/c");
+        assert_eq!(n("a\\b/c"), "a/b/c");
+        assert_eq!(n("/../x"), "/x");
+        assert_eq!(n("../x"), "../x");
+        assert_eq!(n("../../x"), "../../x");
+        assert_eq!(n("a/.."), ".");
+        assert_eq!(n(""), ".");
+        assert_eq!(n("/"), "/");
+
+        // Regression: a directory NAMED `a..` ends in two dots but is not a
+        // `..` segment, so it must still be popped. The first version of both
+        // this oracle and the Jestyr module compared the trailing two bytes
+        // instead of the whole segment and got these wrong — identically, which
+        // is exactly why a differential test alone is not sufficient.
+        assert_eq!(n("a../.."), ".");
+        assert_eq!(n("x/a../.."), "x");
+        assert_eq!(n("..a/.."), ".");
+
+        let j = |a: &str, b: &str| String::from_utf8(path_ref_join(a.as_bytes(), b.as_bytes())).unwrap();
+        assert_eq!(j("examples/std", "path.jtr"), "examples/std/path.jtr");
+        assert_eq!(j("examples/std/", "path.jtr"), "examples/std/path.jtr");
+        assert_eq!(j("ignored", "/abs/olute"), "/abs/olute");
+        assert_eq!(j("", "solo"), "solo");
+        assert_eq!(j("solo", ""), "solo");
+    }
+
+    proptest! {
+        /// **Normalization is idempotent.** The claim the module's doc comment
+        /// makes, and the reason the empty result is written as "." rather than
+        /// "": a second pass over the output must not move it.
+        #[test]
+        fn reference_normalize_is_idempotent(s in r"[a-z0-9./\\]{0,60}") {
+            let once = path_ref_normalize(s.as_bytes());
+            let twice = path_ref_normalize(&once);
+            prop_assert_eq!(&once, &twice);
+        }
+
+        /// A normalized path never contains a backslash, an empty segment, or a
+        /// `.` segment — the three things normalization exists to remove.
+        ///
+        /// The one sanctioned exception is the whole output being exactly ".",
+        /// which is how an empty result is spelled so that normalization stays
+        /// idempotent and always yields a usable path. proptest found this the
+        /// first time the property was written without the carve-out.
+        #[test]
+        fn reference_normalize_output_is_clean(s in r"[a-z0-9./\\]{0,60}") {
+            let out = path_ref_normalize(s.as_bytes());
+            prop_assert!(!out.contains(&b'\\'), "backslash survived: {:?}", out);
+            prop_assert!(!out.is_empty(), "output is never empty");
+            if out == b"." {
+                return Ok(());
+            }
+            let body = if out[0] == b'/' { &out[1..] } else { &out[..] };
+            if !body.is_empty() {
+                prop_assert!(!body.windows(2).any(|w| w == b"//"), "empty segment: {:?}", out);
+                for seg in body.split(|&c| c == b'/') {
+                    prop_assert!(seg != b".", "`.` segment survived: {:?}", out);
+                }
+            }
+        }
+
+        /// `dir` and `base` recompose the original: joining them back gives a
+        /// path that normalizes to the same thing.
+        #[test]
+        fn reference_dir_and_base_recompose(s in r"[a-z0-9]{1,8}(/[a-z0-9]{1,8}){0,4}") {
+            let b = s.as_bytes();
+            let rejoined = path_ref_join(path_ref_dir(b), path_ref_base(b));
+            prop_assert_eq!(
+                path_ref_normalize(&rejoined),
+                path_ref_normalize(b)
+            );
+        }
+
+        /// `stem` and `ext` partition `base`: stem + "." + ext == base whenever
+        /// an extension exists, and stem == base when it does not.
+        #[test]
+        fn reference_stem_and_ext_partition_base(s in r"[a-z0-9]{1,8}(\.[a-z0-9]{1,5}){0,3}") {
+            let b = s.as_bytes();
+            let base = path_ref_base(b);
+            let stem = path_ref_stem(b);
+            let ext = path_ref_ext(b);
+            if ext.is_empty() {
+                prop_assert_eq!(stem, base);
+            } else {
+                let mut rebuilt = stem.to_vec();
+                rebuilt.push(b'.');
+                rebuilt.extend_from_slice(ext);
+                prop_assert_eq!(&rebuilt, &base.to_vec());
+            }
+        }
+    }
+}
+
 mod fuzz {
     use super::*;
+
+    /// **The path oracle is total.** Arbitrary bytes — including invalid UTF-8,
+    /// NULs, and separator soup — must not panic it. The oracle judges the real
+    /// Jestyr module in `c_oracle`, so an oracle that falls over on some input
+    /// would quietly weaken that test rather than fail it.
+    #[test]
+    fn fuzz_path_normalize_reference_is_total() {
+        bolero::check!().with_type::<Vec<u8>>().for_each(|b: &Vec<u8>| {
+            let once = path_ref_normalize(b);
+            // Idempotence has to survive the fuzzer too, not just the generator.
+            let twice = path_ref_normalize(&once);
+            assert_eq!(once, twice, "normalize not idempotent on {b:?}");
+            assert!(!once.is_empty(), "normalize returned empty on {b:?}");
+        });
+    }
+
+    /// The view queries are total and internally consistent on arbitrary bytes:
+    /// `dir_len` always lands in range, and `base` is exactly the tail past it.
+    #[test]
+    fn fuzz_path_queries_are_total() {
+        bolero::check!().with_type::<Vec<u8>>().for_each(|b: &Vec<u8>| {
+            let d = path_ref_dir_len(b);
+            assert!(d <= b.len(), "dir_len out of range on {b:?}");
+            assert_eq!(path_ref_base(b), &b[d..], "base is the tail past dir_len");
+            let stem = path_ref_stem(b);
+            let ext = path_ref_ext(b);
+            assert!(stem.len() <= path_ref_base(b).len());
+            assert!(ext.len() <= path_ref_base(b).len());
+        });
+    }
 
     /// Coverage-guided fuzzing of the whole pipeline. Under `cargo test` this
     /// replays the corpus and a bounded number of generated inputs; under
@@ -6604,6 +6925,11 @@ use crate::sha256;
 #[cfg(all(test, feature = "c-oracle"))]
 mod c_oracle {
     use super::sha256;
+    // The `std/path` oracle, for the differential test against the shipped module.
+    use super::{
+        path_ref_base, path_ref_dir, path_ref_dir_len, path_ref_ext, path_ref_is_abs,
+        path_ref_join, path_ref_normalize, path_ref_stem,
+    };
     use std::process::Command;
 
     /// Compile `rel` (a `.jtr` path, with imports) to C, build with the locked FP
@@ -11938,7 +12264,7 @@ fn main() -> i32 {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr"];
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr"];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
     /// target). This is the acceptance bar the R2 fixpoint ultimately rests on. `DUMP_DIVERGE=1`
@@ -12570,6 +12896,118 @@ fn main() -> i32 {
                 "result:", "1", "passed;", "0", "failed",
             ],
             "filter must select only doubling_works and drop the bench"
+        );
+    }
+
+    /// **`std/path` end-to-end.** The demo's documented output, verified rather
+    /// than claimed — the header comment in `path_demo.jtr` lists exactly these.
+    #[test]
+    fn path_demo() {
+        assert_eq!(
+            toks("examples/std/path_demo.jtr"),
+            [
+                "core.jtr",
+                "examples/std",
+                "jtr",
+                "core",
+                "examples/std/path.jtr",
+                "a/c",
+                "1",
+                "0",
+                "4",
+            ]
+        );
+    }
+
+    /// **The `@test` harness, used in anger for the first time by the stdlib.**
+    /// `std/path.jtr` ships its unit tests beside the code; this runs them
+    /// through the emitted harness and requires a zero exit, so the module's own
+    /// edge cases (dotfiles, roots, trailing separators, both separator
+    /// spellings) are part of the suite rather than a manual step.
+    #[test]
+    fn path_module_unit_tests_pass() {
+        let (out, code) = build_tests_and_run("examples/std/path.jtr", None);
+        assert_eq!(code, 0, "std/path unit tests must pass:\n{out}");
+        assert!(out.contains("11 passed; 0 failed"), "unexpected harness output:\n{out}");
+    }
+
+    /// **Differential: the real Jestyr module vs the Rust oracle.** Compile
+    /// `path_demo.jtr` once, then drive it per generated case and require the
+    /// compiled Jestyr implementation to agree with `path_ref_*` on every
+    /// operation. This is what makes the property tests statements about the
+    /// shipped module rather than about a Rust re-description of it.
+    ///
+    /// The alphabet deliberately excludes backslash: passing one through the
+    /// Windows command line runs into the CRT's backslash-before-quote rules,
+    /// which would test the argument encoder rather than the path module.
+    /// Backslash handling is pinned in-language instead, by
+    /// `base_reads_both_separators` and `normalize_collapses_and_cancels` in
+    /// `examples/std/path.jtr`.
+    #[test]
+    fn path_matches_the_reference() {
+        use std::sync::OnceLock;
+        static EXE: OnceLock<std::path::PathBuf> = OnceLock::new();
+        let exe = EXE.get_or_init(|| build_exe("examples/std/path_demo.jtr"));
+
+        let run = |op: &str, a: &str, b: &str| -> String {
+            let out = Command::new(exe).args([op, a, b]).output().unwrap();
+            assert!(out.status.success(), "path_demo {op} {a:?} {b:?} exited {:?}", out.status);
+            String::from_utf8(out.stdout).unwrap().trim_end_matches(['\r', '\n']).to_string()
+        };
+
+        // 64 cases, not proptest's default 256: every case is eight process
+        // spawns, and the default put this single test at ~100 s. The
+        // toolchain-free properties in `path_props` still run the full default
+        // count, so coverage of the *spec* is undiminished — this test's job is
+        // to catch the Jestyr implementation drifting from it, which a smaller
+        // sample does perfectly well.
+        proptest::proptest!(
+            proptest::prelude::ProptestConfig::with_cases(64),
+            |(s in r"[a-z0-9./]{0,40}", t in r"[a-z0-9./]{0,20}")| {
+            let sb = s.as_bytes();
+            let as_str = |v: &[u8]| String::from_utf8(v.to_vec()).unwrap();
+
+            proptest::prop_assert_eq!(run("norm", &s, ""), as_str(&path_ref_normalize(sb)), "norm {:?}", s);
+            proptest::prop_assert_eq!(run("base", &s, ""), as_str(path_ref_base(sb)), "base {:?}", s);
+            proptest::prop_assert_eq!(run("dir", &s, ""), as_str(path_ref_dir(sb)), "dir {:?}", s);
+            proptest::prop_assert_eq!(run("ext", &s, ""), as_str(path_ref_ext(sb)), "ext {:?}", s);
+            proptest::prop_assert_eq!(run("stem", &s, ""), as_str(path_ref_stem(sb)), "stem {:?}", s);
+            proptest::prop_assert_eq!(run("dirlen", &s, ""), path_ref_dir_len(sb).to_string(), "dirlen {:?}", s);
+            proptest::prop_assert_eq!(
+                run("isabs", &s, ""),
+                if path_ref_is_abs(sb) { "1" } else { "0" },
+                "isabs {:?}", s
+            );
+            proptest::prop_assert_eq!(
+                run("join", &s, &t),
+                as_str(&path_ref_join(sb, t.as_bytes())),
+                "join {:?} {:?}", s, t
+            );
+        }
+        );
+    }
+
+    /// Normalization is idempotent *in the shipped module*, not merely in the
+    /// oracle: a second pass over the real implementation's own output must not
+    /// move it.
+    #[test]
+    fn path_normalize_is_idempotent_end_to_end() {
+        use std::sync::OnceLock;
+        static EXE2: OnceLock<std::path::PathBuf> = OnceLock::new();
+        let exe = EXE2.get_or_init(|| build_exe("examples/std/path_demo.jtr"));
+
+        let norm = |a: &str| -> String {
+            let out = Command::new(exe).args(["norm", a, ""]).output().unwrap();
+            String::from_utf8(out.stdout).unwrap().trim_end_matches(['\r', '\n']).to_string()
+        };
+
+        proptest::proptest!(
+            proptest::prelude::ProptestConfig::with_cases(64),
+            |(s in r"[a-z0-9./]{0,40}")| {
+            let once = norm(&s);
+            let twice = norm(&once);
+            proptest::prop_assert_eq!(&once, &twice, "not idempotent on {:?}", s);
+        }
         );
     }
 
