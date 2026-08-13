@@ -79,8 +79,12 @@ coverage; adding one unilaterally would desync discovery order).
     and the item-level differential fuzzer compares that shape across
     toolchains — so it owes a `parser.jtr` mirror, contrary to §1.4's "no
     mirror owed" note (which is true only of diagnostic text).
-  - **stable error codes — REMAIN** (`Diagnostic::with_code` still unused;
-    top ~20 parse errors first, additive in `check --json`).
+  - **stable error codes — DONE for the parser (2026-08-12)**: `E0001`–`E0023`,
+    one code per RULE (not per site), covering every parser diagnostic; the
+    table lives on `Parser::error_code`, `check --json` already carried the
+    field, and `parse_errors_carry_stable_codes` pins identity. Typeck/escape
+    codes remain unassigned (assign incrementally, per the `with_code` doc;
+    a suggested split: E1xxx typeck, E2xxx escape).
 - **Item 4 stage 3 — DONE, designed AND built (2026-08-12)**: not
   "checker-known disjointness" (range proofs = option C, rejected — the §2.6
   lattice) but **call-site mut-slice exclusivity** — the measured hole was

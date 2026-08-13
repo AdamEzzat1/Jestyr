@@ -156,7 +156,7 @@ impl<'src> Parser<'src> {
         if t.kind == kind {
             self.bump()
         } else {
-            self.error(t.span, format!("expected {}, found `{}`", what, t.kind.describe()));
+            self.error_code(t.span, format!("expected {}, found `{}`", what, t.kind.describe()), "E0001");
             t // do not consume — let the caller's loop bounds recover
         }
     }
@@ -189,6 +189,7 @@ impl<'src> Parser<'src> {
                 format!("expected {}, found `{}`", what, t.kind.describe()),
                 t.span,
             )
+            .with_code("E0002")
             .with_help(format!(
                 "the {}'s `{}` opened at line {}, column {} is never closed",
                 construct, opener, at.line, at.col
@@ -247,13 +248,47 @@ impl<'src> Parser<'src> {
             self.bump();
             self.ident(t)
         } else {
-            self.error(t.span, format!("expected {}, found `{}`", what, t.kind.describe()));
+            self.error_code(t.span, format!("expected {}, found `{}`", what, t.kind.describe()), "E0003");
             Ident { name: "<error>".to_string(), span: t.span }
         }
     }
 
     fn error(&mut self, span: Span, message: impl Into<String>) {
         self.diagnostics.push(Diagnostic::new(message, span));
+    }
+
+    /// [`error`](Self::error) with a **stable code** — linkable and testable by
+    /// identity rather than message substring (roadmap §4 item 4; codes ride
+    /// `check --json` additively). The parser owns `E0001`–`E0023`; codes are
+    /// per RULE, not per site, and once assigned never renumber:
+    ///
+    /// | code  | rule |
+    /// |-------|------|
+    /// | E0001 | expected token (`expect`) |
+    /// | E0002 | unclosed delimiter (`expect_close`) |
+    /// | E0003 | expected identifier (`eat_ident`) |
+    /// | E0004 | expression nesting too deep |
+    /// | E0005 | expected an item |
+    /// | E0006 | expected a type |
+    /// | E0007 | expected an expression |
+    /// | E0008 | expected a pattern |
+    /// | E0009 | attribute not allowed here |
+    /// | E0010 | malformed `import` (path / pinned hash) |
+    /// | E0011 | expected a member signature in a trait/impl body |
+    /// | E0012 | `mut`/`out self` on an immutable record method |
+    /// | E0013 | malformed bit-field width |
+    /// | E0014 | empty f-string interpolation |
+    /// | E0015 | malformed `catch return` binder |
+    /// | E0016 | malformed `select` arm |
+    /// | E0017 | `par for` without `reduce(…)` |
+    /// | E0018 | `with` without `alive` |
+    /// | E0019 | unsupported `take` iteration |
+    /// | E0020 | reserved loop keyword (`while`/`loop`) |
+    /// | E0021 | `..` not last in a struct pattern |
+    /// | E0022 | range pattern missing its upper bound |
+    /// | E0023 | `else` on an infinite `for` |
+    fn error_code(&mut self, span: Span, message: impl Into<String>, code: &'static str) {
+        self.diagnostics.push(Diagnostic::new(message, span).with_code(code));
     }
 
     /// Record one more level of expression nesting. Returns `true` while there is
@@ -268,9 +303,10 @@ impl<'src> Parser<'src> {
         if self.expr_depth > MAX_EXPR_DEPTH {
             if !self.depth_exceeded {
                 self.depth_exceeded = true;
-                self.error(
+                self.error_code(
                     span,
                     format!("expression nesting too deep (exceeds the {MAX_EXPR_DEPTH}-level limit)"),
+                    "E0004",
                 );
             }
             return false;
@@ -321,7 +357,7 @@ impl<'src> Parser<'src> {
             }
             Distinct => {
                 if let Some(a) = attrs.first() {
-                    self.error(a.span, "attributes are not allowed on `distinct`");
+                    self.error_code(a.span, "attributes are not allowed on `distinct`", "E0009");
                 }
                 let mut d = self.parse_distinct();
                 d.is_pub = is_pub;
@@ -335,7 +371,7 @@ impl<'src> Parser<'src> {
             }
             Import => {
                 if let Some(a) = attrs.first() {
-                    self.error(a.span, "attributes are not allowed on `import`");
+                    self.error_code(a.span, "attributes are not allowed on `import`", "E0009");
                 }
                 Some(Item::Import(self.parse_import()))
             }
@@ -346,14 +382,15 @@ impl<'src> Parser<'src> {
             }
             Impl => {
                 if let Some(a) = attrs.first() {
-                    self.error(a.span, "attributes are not allowed on an `impl` block itself");
+                    self.error_code(a.span, "attributes are not allowed on an `impl` block itself", "E0009");
                 }
                 Some(Item::Impl(self.parse_impl()))
             }
             other => {
-                self.error(
+                self.error_code(
                     self.cur().span,
                     format!("expected an item (`fn`, `trait`, `impl`, `enum`, `const`, `struct`, `record`, `distinct`, `extern`, `import`), found `{}`", other.describe()),
+                    "E0005",
                 );
                 self.bump();
                 None
@@ -382,7 +419,7 @@ impl<'src> Parser<'src> {
             // Strip the surrounding quotes; the lexer kept them in the span.
             self.text(sp).trim_matches('"').to_string()
         } else {
-            self.error(self.cur().span, "expected a module path string after `import`");
+            self.error_code(self.cur().span, "expected a module path string after `import`", "E0010");
             String::new()
         };
         let alias = if self.eat(As) { Some(self.eat_ident("import alias")) } else { None };
@@ -393,7 +430,7 @@ impl<'src> Parser<'src> {
                 self.bump();
                 Some(self.text(sp).trim_matches('"').to_string())
             } else {
-                self.error(self.cur().span, "expected a quoted sha256 hash after `=` in an import");
+                self.error_code(self.cur().span, "expected a quoted sha256 hash after `=` in an import", "E0010");
                 None
             }
         } else {
@@ -491,7 +528,7 @@ impl<'src> Parser<'src> {
             if self.at(Fn) {
                 methods.push(self.parse_trait_method());
             } else {
-                self.error(self.cur().span, "expected a method signature (`fn …`) in the trait body");
+                self.error_code(self.cur().span, "expected a method signature (`fn …`) in the trait body", "E0011");
             }
             if self.pos == before {
                 self.bump();
@@ -551,9 +588,9 @@ impl<'src> Parser<'src> {
                 self.check_fn_attrs(&f, true);
                 methods.push(f);
             } else if let Some(a) = mattrs.first() {
-                self.error(a.span, "an attribute here applies to a method (`fn …`)");
+                self.error_code(a.span, "an attribute here applies to a method (`fn …`)", "E0009");
             } else {
-                self.error(self.cur().span, "expected a method (`fn …`) in the impl body");
+                self.error_code(self.cur().span, "expected a method (`fn …`) in the impl body", "E0011");
             }
             if self.pos == before {
                 self.bump();
@@ -784,13 +821,14 @@ impl<'src> Parser<'src> {
                     if let Some(p) =
                         f.params.iter().find(|p| p.is_self && matches!(p.conv, Conv::Mut | Conv::Out))
                     {
-                        self.error(
+                        self.error_code(
                             f.name.span,
                             format!(
                                 "a method of immutable record `{}` cannot take `{} self`",
                                 name.name,
                                 p.conv.label()
                             ),
+                            "E0012",
                         );
                     }
                 }
@@ -858,9 +896,10 @@ impl<'src> Parser<'src> {
                 members.push(StructMember::Method(f));
             } else {
                 if let Some(a) = mattrs.first() {
-                    self.error(
+                    self.error_code(
                         a.span,
                         "an attribute here applies to a method; a field's attributes (e.g. `@volatile`) go after its `:`",
+                        "E0009",
                     );
                 }
                 let fstart = self.cur().span;
@@ -880,13 +919,13 @@ impl<'src> Parser<'src> {
                         match self.text(t.span).replace('_', "").parse::<u32>() {
                             Ok(n) => Some(n),
                             Err(_) => {
-                                self.error(t.span, "bit-field width must be a non-negative integer".to_string());
+                                self.error_code(t.span, "bit-field width must be a non-negative integer".to_string(), "E0013");
                                 None
                             }
                         }
                     } else {
                         let sp = t.span;
-                        self.error(sp, "expected a bit-field width (an integer) after `:`".to_string());
+                        self.error_code(sp, "expected a bit-field width (an integer) after `:`".to_string(), "E0013");
                         None
                     }
                 } else {
@@ -1070,7 +1109,7 @@ impl<'src> Parser<'src> {
                 self.ast.ty(TypeKind::Fn { params, ret_conv, ret }, span)
             }
             other => {
-                self.error(start, format!("expected a type, found `{}`", other.describe()));
+                self.error_code(start, format!("expected a type, found `{}`", other.describe()), "E0006");
                 self.bump(); // ensure progress
                 self.ast.ty(TypeKind::Error, start)
             }
@@ -1191,13 +1230,15 @@ impl<'src> Parser<'src> {
                 let name = self.eat_ident("the error binder");
                 match &binder {
                     Some(b) if b.name == name.name => {}
-                    Some(b) => self.error(
+                    Some(b) => self.error_code(
                         name.span,
                         format!("`catch |{0}| return …` can only return the binder `{0}`", b.name),
+                        "E0015",
                     ),
-                    None => self.error(
+                    None => self.error_code(
                         rspan,
                         "`catch return` needs an error binder: write `catch |e| return e`",
+                        "E0015",
                     ),
                 }
                 let fb = self.ast.expr(ExprKind::Name(name.clone()), name.span);
@@ -1486,7 +1527,7 @@ impl<'src> Parser<'src> {
                 }
                 let name = name.trim().to_string();
                 if name.is_empty() {
-                    self.error(span, "empty `{}` interpolation in an f-string".to_string());
+                    self.error_code(span, "empty `{}` interpolation in an f-string".to_string(), "E0014");
                 }
                 let id = self.ast.expr(ExprKind::Name(Ident { name, span }), span);
                 exprs.push(id);
@@ -1626,7 +1667,7 @@ impl<'src> Parser<'src> {
                 self.ast.expr(ExprKind::Block(b), sp)
             }
             other => {
-                self.error(span, format!("expected an expression, found `{}`", other.describe()));
+                self.error_code(span, format!("expected an expression, found `{}`", other.describe()), "E0007");
                 self.bump();
                 self.ast.expr(ExprKind::Error, span)
             }
@@ -1756,7 +1797,7 @@ impl<'src> Parser<'src> {
             if self.at(TokenKind::Ident) && self.text(self.cur().span) == "recv" {
                 self.bump();
             } else {
-                self.error(self.cur().span, "expected `recv(<channel>)` to start a `select` arm");
+                self.error_code(self.cur().span, "expected `recv(<channel>)` to start a `select` arm", "E0016");
             }
             let arm_paren = self.cur().span;
             self.expect(LParen, "`(`");
@@ -1803,7 +1844,7 @@ impl<'src> Parser<'src> {
         if self.at(TokenKind::Ident) && self.text(self.cur().span) == "reduce" {
             self.bump();
         } else {
-            self.error(self.cur().span, "expected `reduce(<reduction>)` after the `par for` iterable");
+            self.error_code(self.cur().span, "expected `reduce(<reduction>)` after the `par for` iterable", "E0017");
         }
         let open_paren = self.cur().span;
         self.expect(LParen, "`(`");
@@ -1854,7 +1895,7 @@ impl<'src> Parser<'src> {
         self.expect(With, "`with`");
         let ctx = self.eat_ident("`alive`");
         if ctx.name != "alive" {
-            self.error(ctx.span, "expected `alive` after `with` (`with alive <genref> as read <name> { … }`)");
+            self.error_code(ctx.span, "expected `alive` after `with` (`with alive <genref> as read <name> { … }`)", "E0018");
         }
         // The scrutinee parses BELOW the cast level (postfix only): `with alive
         // r as read n` must give `as` to this construct, not to a cast on `r`
@@ -1898,9 +1939,10 @@ impl<'src> Parser<'src> {
             let els_start = self.prev_span();
             let b = self.parse_block();
             if matches!(head, ForHead::Infinite) {
-                self.error(
+                self.error_code(
                     els_start.to(b.span),
                     "an infinite `for { … }` only exits via `break`, so its `else` can never run — remove the `else`, or give the loop a condition or range",
+                    "E0023",
                 );
             }
             Some(b)
@@ -1977,7 +2019,7 @@ impl<'src> Parser<'src> {
             Take => {
                 let sp = self.cur().span;
                 self.bump();
-                self.error(sp, "`take` iteration is not supported yet (slices are borrows); use `read` or `mut`");
+                self.error_code(sp, "`take` iteration is not supported yet (slices are borrows); use `read` or `mut`", "E0019");
                 Conv::Read
             }
             _ => Conv::Read,
@@ -2011,7 +2053,7 @@ impl<'src> Parser<'src> {
     fn parse_reserved_loop(&mut self) -> ExprId {
         let start = self.cur().span;
         if self.at(While) {
-            self.error(start, "Jestyr has one loop keyword — write `for <cond> { … }` (not `while`)");
+            self.error_code(start, "Jestyr has one loop keyword — write `for <cond> { … }` (not `while`)", "E0020");
             self.bump();
             let saved = self.no_struct;
             self.no_struct = true;
@@ -2021,7 +2063,7 @@ impl<'src> Parser<'src> {
             let span = start.to(body.span);
             self.ast.expr(ExprKind::For { label: None, head: ForHead::While(cond), region: None, body, els: None }, span)
         } else {
-            self.error(start, "Jestyr has one loop keyword — write `for { … }` (not `loop`)");
+            self.error_code(start, "Jestyr has one loop keyword — write `for { … }` (not `loop`)", "E0020");
             self.bump();
             let body = self.parse_block();
             let span = start.to(body.span);
@@ -2168,7 +2210,7 @@ impl<'src> Parser<'src> {
                         let is_rest = matches!(self.ast.pat_at(*sp).kind, PatKind::Rest);
                         let sp_span = self.ast.pat_at(*sp).span;
                         if is_rest && i + 1 != n {
-                            self.error(sp_span, "`..` may only appear as the last field pattern".to_string());
+                            self.error_code(sp_span, "`..` may only appear as the last field pattern".to_string(), "E0021");
                         }
                     }
                     self.ast.pat(PatKind::Variant { name, subpats }, span.to(end))
@@ -2186,7 +2228,7 @@ impl<'src> Parser<'src> {
                         Some(h) => h,
                         None => {
                             let sp = self.cur().span;
-                            self.error(sp, "expected the upper bound of a range pattern".to_string());
+                            self.error_code(sp, "expected the upper bound of a range pattern".to_string(), "E0022");
                             return self.ast.pat(PatKind::Error, lo_span);
                         }
                     };
@@ -2203,7 +2245,7 @@ impl<'src> Parser<'src> {
                 self.ast.pat(PatKind::Rest, span)
             }
             other => {
-                self.error(span, format!("expected a pattern, found `{}`", other.describe()));
+                self.error_code(span, format!("expected a pattern, found `{}`", other.describe()), "E0008");
                 self.bump();
                 self.ast.pat(PatKind::Error, span)
             }
@@ -3171,6 +3213,25 @@ mod tests {
         let (_ast, diags) = parse("fn f() -> i32 {\n    let a = 1\n");
         let d = diags.first().expect("one diagnostic");
         assert_eq!(d.message, "expected `}`, found `<eof>`", "message text moved");
+    }
+
+    /// Stable codes make parse errors testable by IDENTITY rather than message
+    /// substring — pin a few so a renumbering (the thing "stable" forbids) or a
+    /// dropped code is caught. The full table lives on `error_code`.
+    #[test]
+    fn parse_errors_carry_stable_codes() {
+        for (src, code) in [
+            ("fn f() -> i32 {\n    let a = 1\n", "E0002"), // unclosed delimiter
+            ("fn () {}", "E0003"),                         // missing identifier
+            ("@copy import \"x\"", "E0009"),               // attribute not allowed here
+            ("fn f() { while true { } }", "E0020"),        // reserved loop keyword
+        ] {
+            let (_ast, diags) = parse(src);
+            assert!(
+                diags.iter().any(|d| d.code == Some(code)),
+                "`{src}` carries {code}: {diags:?}"
+            );
+        }
     }
 
     /// The construct context lives in the `help:` line (the message is the pinned
