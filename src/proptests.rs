@@ -9132,6 +9132,50 @@ fn g(p: *mut i32) -> i32 {
         }
     }
 
+    /// **Call-site mut-slice exclusivity, differentially (item 4 stage 3)** — another
+    /// rule the corpus cannot guard: it has zero same-place double-`mut` calls by
+    /// construction, so the whole-corpus escape golden would pass with the port
+    /// missing the rule entirely. Two probes FIRE (same local twice; same field
+    /// chain twice) with the anti-vacuity assertion, and two must stay LEGAL
+    /// (distinct fields; `read`+`mut` overlap) so neither toolchain over-rejects.
+    #[test]
+    fn jestyr_slice_alias_matches_reference() {
+        let exe = build_exe("examples/std/escape_cli.jtr");
+        let hdr = "fn g(mut a: []i64, mut b: []i64) { a[0] = 1  b[0] = 2 } \
+                   fn r(read a: []i64, mut b: []i64) { b[0] = a[0] } \
+                   struct S { lo: []i64, hi: []i64 } ";
+        let firing = [
+            format!("{hdr}fn m(mut q: []i64) {{ g(q, q) }}"),
+            format!("{hdr}fn n(read s: S) {{ g(s.lo, s.lo) }}"),
+        ];
+        for (i, src) in firing.iter().enumerate() {
+            let want = rust_escape_dump(src);
+            assert!(
+                want.iter().any(|l| l.contains("two writable slice parameters")),
+                "probe {i} no longer fires — replace it with a shape that does: {want:?}"
+            );
+            let f = std::env::temp_dir().join(format!("jestyr_slice_alias_{i}.jtr"));
+            std::fs::write(&f, src).unwrap();
+            let got = jestyr_escape_dump(&exe, f.to_str().unwrap());
+            assert_eq!(got, want, "the toolchains disagree on mut-slice exclusivity for: {src}");
+        }
+        let legal = [
+            format!("{hdr}fn n(read s: S) {{ g(s.lo, s.hi) }}"),
+            format!("{hdr}fn m(mut q: []i64) {{ r(q, q) }}"),
+        ];
+        for (i, src) in legal.iter().enumerate() {
+            let want = rust_escape_dump(src);
+            assert!(
+                !want.iter().any(|l| l.contains("two writable slice parameters")),
+                "legal probe {i} is rejected — the rule over-reaches: {want:?}"
+            );
+            let f = std::env::temp_dir().join(format!("jestyr_slice_alias_ok_{i}.jtr"));
+            std::fs::write(&f, src).unwrap();
+            let got = jestyr_escape_dump(&exe, f.to_str().unwrap());
+            assert_eq!(got, want, "the toolchains disagree on a legal two-slice call: {src}");
+        }
+    }
+
     /// The Rust *reference* C for `src`, as lines. Uses the single-file `parse` + `typeck::check`
     /// path (not `module::load`), so `TypeInfo::debug` is empty and no `#line` directives are
     /// emitted — the target is the pure C text. `str::lines()` drops each line's trailing `\r`,

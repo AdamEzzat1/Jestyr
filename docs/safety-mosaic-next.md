@@ -218,11 +218,24 @@ measurement:
 **The decision:** stage 3 = Option B, named honestly — *call-site mut-slice
 exclusivity*, not "checker-known disjointness". It does not teach the checker
 `split_mut`'s ranges; it closes the one route by which safe code manufactures
-the overlap the library prevents. Acceptance: `g(q, q)` refused with the root
-named; `split_mut`/`par_split_mut` and the whole corpus stay clean (the corpus
-has zero same-root double-`mut` calls today — the rule is a backstop, so it
-owes a differential probe that FIRES, like the finalization gate's); both
-toolchains, same increment.
+the overlap the library prevents.
+
+**BUILT (2026-08-12, both toolchains), with one refinement over the note:**
+the compared key is the whole lexical PLACE CHAIN, not the root — `g(s.lo,
+s.hi)` passes two distinct slice fields of one struct and must stay legal, so
+root-comparison was too coarse. `place_key` renders `q` / `s.a` / `p.*.buf`
+from AST idents (whitespace-canonical on both sides); a non-place argument
+never compares (`g(mk(), mk())` is two fresh slices); Index steps are
+excluded (their subscript's equality is not a lexical question). One refusal
+per call, at the second occurrence, naming the place and the fix
+(`split_mut`). Covers free calls and method sugar (reference also qualified
+calls via `resolved_callee_name`; the port's scope matches its sibling checks
+— bare + mcall). Pinned: unit tests both ways (fires on `g(q, q)` and
+`g(s.lo, s.lo)`; silent on distinct fields, `read`+`mut` overlap, non-places)
+and the differential probe `jestyr_slice_alias_matches_reference` — the
+corpus is structurally blind to this rule (zero same-place double-`mut` calls
+by construction), so the probe carries the anti-vacuity assertion, like the
+finalization gate's.
 
 **Acceptance (stage 1, met).** Both halves simultaneously writable, writes land
 in the right elements (the 16/48 demo pair), overlap inexpressible for any `at`

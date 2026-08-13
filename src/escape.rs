@@ -628,6 +628,7 @@ impl<'a> Checker<'a> {
                     self.walk_expr(ctx, p, true);
                     self.check_give_away(ctx, id, *callee, args);
                     self.check_loop_mutation(ctx, id, *callee, args);
+                    self.check_slice_alias(id, *callee, args);
                     self.check_no_alloc_call(id, *callee, span);
                     self.check_deterministic_call(id, *callee, span);
                     self.check_manual_drop(id, span);
@@ -642,6 +643,7 @@ impl<'a> Checker<'a> {
                 }
                 self.check_give_away(ctx, id, *callee, args);
                 self.check_loop_mutation(ctx, id, *callee, args);
+                self.check_slice_alias(id, *callee, args);
                 self.check_no_alloc_call(id, *callee, span);
                 self.check_deterministic_call(id, *callee, span);
                 self.check_manual_drop(id, span);
@@ -1104,6 +1106,86 @@ impl<'a> Checker<'a> {
                      `unsafe` (each task a disjoint region, as `par_binned_sum` does), or pass it `read`."
                 ),
             );
+        }
+    }
+
+    /// Item 4 stage 3 — call-site mut-slice exclusivity. The same lexical place in
+    /// two writable (`mut`/`out`) **slice** argument positions of one call gives the
+    /// callee two views that alias EVERY element — exactly the overlap `split_mut`
+    /// exists to make unmanufacturable, freely available one call beside it until
+    /// now. Refused lexically: both arguments spell the same place (`g(q, q)`,
+    /// `g(s.a, s.a)`). Distinct spellings that still alias (an aliased root
+    /// `var alias = q`, a view re-passed through a callee) are the same two dodges
+    /// item 5 records, with the same answers. `mut`+`read` overlap at one call is
+    /// deliberately allowed — in-place idioms read and write one buffer on purpose
+    /// (the design note, `docs/safety-mosaic-next.md` item 4 stage 3).
+    fn check_slice_alias(&mut self, call_id: ExprId, callee: ExprId, args: &[ExprId]) {
+        // The runtime argument list in parameter order (receiver first for method
+        // sugar) with the resolved signature's (conv, is-slice) row per parameter.
+        let (fname, params, runtime): (String, Vec<(Conv, bool)>, Vec<ExprId>) =
+            if let Some(mr) = self.info.method_call(call_id).cloned() {
+                let ExprKind::Field { base, .. } = &self.ast.expr_at(callee).kind else {
+                    return;
+                };
+                let Some(f) = self.find_fn(&mr.fn_name) else { return };
+                let rows = f
+                    .params
+                    .iter()
+                    .filter(|p| !p.comptime)
+                    .map(|p| {
+                        let is_slice = p.ty.is_some_and(|t| {
+                            matches!(self.ast.type_at(t).kind, TypeKind::Slice(_))
+                        });
+                        (p.conv, is_slice)
+                    })
+                    .collect();
+                let mut v = vec![*base];
+                v.extend_from_slice(args);
+                (mr.fn_name.clone(), rows, v)
+            } else {
+                let Some(name) = self.resolved_callee_name(call_id, callee) else { return };
+                let Some(sig) = self.info.table.fns.get(&name) else { return };
+                let rows =
+                    sig.params.iter().map(|p| (p.conv, matches!(p.ty, Ty::Slice(_)))).collect();
+                (name, rows, args.to_vec())
+            };
+        let mut seen: Vec<String> = Vec::new();
+        for (i, &arg) in runtime.iter().enumerate() {
+            let Some(&(conv, is_slice)) = params.get(i) else { break };
+            if !(matches!(conv, Conv::Mut | Conv::Out) && is_slice) {
+                continue;
+            }
+            let Some(key) = self.place_key(arg) else { continue };
+            if seen.contains(&key) {
+                self.error(
+                    self.ast.expr_at(arg).span,
+                    format!(
+                        "cannot pass `{key}` to two writable slice parameters of `{fname}` in one \
+                         call: the two views would alias every element — divide the buffer with \
+                         `split_mut` instead"
+                    ),
+                );
+                return; // one refusal per call
+            }
+            seen.push(key);
+        }
+    }
+
+    /// The lexical spelling of a place chain (`q`, `s.a`, `p.*.buf`), or `None` when
+    /// the expression is not a pure place — a call's text can repeat without its
+    /// values aliasing (`g(mk(), mk())` is two fresh slices), so only places compare.
+    /// Built from AST idents, so `s . a` and `s.a` spell the same key. Index steps
+    /// are excluded on purpose: their subscript is an arbitrary expression whose
+    /// equality this lexical rule cannot decide.
+    fn place_key(&self, id: ExprId) -> Option<String> {
+        match &self.ast.expr_at(id).kind {
+            ExprKind::Name(n) => Some(n.name.clone()),
+            ExprKind::SelfValue => Some("self".to_string()),
+            ExprKind::Field { base, name } => {
+                Some(format!("{}.{}", self.place_key(*base)?, name.name))
+            }
+            ExprKind::Deref { base } => Some(format!("{}.*", self.place_key(*base)?)),
+            _ => None,
         }
     }
 
@@ -1683,6 +1765,50 @@ mod tests {
             "fn good(mut lo: []i64, mut hi: []i64) { lo[0] = 1  hi[0] = 2 }",
         );
         assert!(ok.is_empty(), "writing through both halves is fine: {ok:?}");
+    }
+
+    // --- item 4 stage 3: call-site mut-slice exclusivity ---
+
+    /// The measured hole beside `split_mut`, closed: the same lexical place in two
+    /// writable slice argument positions is refused — `g(q, q)` was two total-alias
+    /// `mut` views through any user fn, one call away from the library that exists
+    /// to make that overlap unmanufacturable. The chain compares, not just the
+    /// root: `g(t.lo, t.lo)` is refused while `g(t.lo, t.hi)` stays legal.
+    #[test]
+    fn the_same_place_cannot_feed_two_writable_slice_params() {
+        let hdr = "fn g(mut a: []i64, mut b: []i64) { a[0] = 1  b[0] = 2 } ";
+        let d = escapes(&(hdr.to_string() + "fn m(mut q: []i64) { g(q, q) }"));
+        assert_eq!(d.len(), 1, "one refusal: {d:?}");
+        assert!(d[0].message.contains("two writable slice parameters"), "{d:?}");
+        assert!(d[0].message.contains("split_mut"), "the fix is named: {d:?}");
+
+        let fields = "struct S { lo: []i64, hi: []i64 } ";
+        let d2 = escapes(&(hdr.to_string() + fields + "fn n(read s: S) { g(s.lo, s.lo) }"));
+        assert!(
+            d2.iter().any(|x| x.message.contains("two writable slice parameters")),
+            "the whole chain compares: {d2:?}"
+        );
+    }
+
+    /// What stays legal, on purpose: distinct places (disjoint by declaration),
+    /// `read`+`mut` overlap (in-place idioms read and write one buffer), and a
+    /// repeated non-place argument (`g(mk(), mk())` is two fresh slices — text
+    /// equality means nothing off a place chain).
+    #[test]
+    fn distinct_places_read_overlap_and_non_places_stay_legal() {
+        let hdr = "fn g(mut a: []i64, mut b: []i64) { a[0] = 1  b[0] = 2 } \
+                   fn r(read a: []i64, mut b: []i64) { b[0] = a[0] } \
+                   struct S { lo: []i64, hi: []i64 } ";
+        for tail in [
+            "fn n(read s: S) { g(s.lo, s.hi) }",
+            "fn m(mut q: []i64) { r(q, q) }",
+        ] {
+            let d = escapes(&(hdr.to_string() + tail));
+            assert!(
+                !d.iter().any(|x| x.message.contains("two writable slice parameters")),
+                "`{tail}` must stay legal: {d:?}"
+            );
+        }
     }
 
     /// The gate must stay *silent* on code whose types resolve — it is a

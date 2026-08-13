@@ -10147,6 +10147,131 @@ fn flag_frozen(mut e: Esc, read p: Parser, read c: Checker, read src: str, arg: 
     }
 }
 
+// Item 4 stage 3 — call-site mut-slice exclusivity (mirrors `check_slice_alias`):
+// the same lexical place in two writable (`mut`/`out`) SLICE argument positions of
+// one call gives the callee two views that alias EVERY element — the overlap
+// `split_mut` exists to make unmanufacturable. Lexical on purpose: the aliased-root
+// and through-callee dodges are item 5's two, with the same answers; `mut`+`read`
+// overlap is deliberately allowed (in-place idioms). One refusal per call.
+
+// Is the param 7-tuple at `pbase` a runtime `mut`/`out` slice?
+fn sa_param_is_wslice(read p: Parser, pbase: i32) -> bool {
+    if get(i32, p.iar, pbase as usize) != 0 { return false }      // comptime row
+    let conv: i32 = get(i32, p.iar, (pbase + 1) as usize)
+    if conv != 2 and conv != 4 { return false }                        // mut / out
+    let tyid: i32 = get(i32, p.iar, (pbase + 5) as usize)
+    if tyid < 0 { return false }
+    let ptd: TypeData = get(TypeData, p.ty, tyid as usize)
+    return ptd.kind == 3                                               // Slice `[]T`
+}
+
+// The lexical spelling of a place chain (`q`, `s.a`, `p.*.buf`), built from AST
+// idents so `s . a` and `s.a` spell the same key (like the reference's
+// Ident-based render); not a pure place -> false (a call's text can repeat
+// without its values aliasing). Index steps excluded: their subscript is an
+// arbitrary expression whose equality a lexical rule cannot decide.
+fn sa_place_key(read p: Parser, read src: str, id: i32, mut sb: String) -> bool {
+    let d: ExprData = get(ExprData, p.ex, id as usize)
+    if d.kind == 2 { string_push(sb, src[d.start .. d.end])  return true }
+    if d.kind == 19 { string_push(sb, "self")  return true }
+    if d.kind == 5 {
+        if !sa_place_key(p, src, d.a, sb) { return false }
+        string_push(sb, ".")
+        string_push(sb, src[d.x as usize .. d.y as usize])
+        return true
+    }
+    if d.kind == 7 {
+        if !sa_place_key(p, src, d.a, sb) { return false }
+        string_push(sb, ".*")
+        return true
+    }
+    return false
+}
+
+// One writable-slice argument: a repeated place key is the refusal (returns true);
+// a fresh key joins `seen` (`|key|` segments — keys never contain `|`).
+fn sa_note(mut e: Esc, read p: Parser, read src: str, arg: i32, mut seen: String, read fname: str) -> bool {
+    var key: String = string_new()
+    if !sa_place_key(p, src, arg, key) { string_free(key)  return false }
+    var probe: String = string_new()
+    string_push(probe, "|")
+    string_push(probe, string_view(key))
+    string_push(probe, "|")
+    if contains(string_view(seen), string_view(probe)) {
+        let ad: ExprData = get(ExprData, p.ex, arg as usize)
+        var sb: String = string_new()
+        string_push(sb, "cannot pass `")
+        string_push(sb, string_view(key))
+        string_push(sb, "` to two writable slice parameters of `")
+        string_push(sb, fname)
+        string_push(sb, "` in one call: the two views would alias every element — divide the buffer with `split_mut` instead")
+        ediag(e, ad.start, ad.end, string_view(sb))
+        string_free(sb)
+        string_free(probe)
+        string_free(key)
+        return true
+    }
+    string_push(seen, string_view(probe))
+    string_free(probe)
+    string_free(key)
+    return false
+}
+
+// The check itself: method sugar maps receiver -> runtime[0], args -> runtime[1..];
+// a free call maps source args positionally over ALL param rows (comptime type
+// arguments are real source arguments). Mirrors `check_slice_alias`.
+fn check_slice_alias(mut e: Esc, read p: Parser, read c: Checker, read src: str, id: i32, callee: i32, astart: i32, acount: i32) {
+    let cal: ExprData = get(ExprData, p.ex, callee as usize)
+    let mr: i32 = mcall_row(c, id)
+    if mr >= 0 {
+        if cal.kind != 5 { return }
+        let iid: i32 = get(i32, c.fns, (mr * 12 + 9) as usize)
+        let f: ItemData = get(ItemData, p.it, iid as usize)
+        var seen: String = string_new()
+        var hit: bool = false
+        var rti: i32 = 0
+        var pi: i32 = 0
+        for pi < f.b {
+            let pbase: i32 = f.a + pi * 7
+            if get(i32, p.iar, pbase as usize) == 0 {
+                if sa_param_is_wslice(p, pbase) {
+                    var arg: i32 = 0 - 1
+                    if rti == 0 { arg = cal.a }
+                    else {
+                        let ai: i32 = rti - 1
+                        if ai < acount { arg = get(i32, p.ar, (astart + ai) as usize) }
+                    }
+                    if arg >= 0 {
+                        if !hit { hit = sa_note(e, p, src, arg, seen, src[cal.x as usize .. cal.y as usize]) }
+                    }
+                }
+                rti = rti + 1
+            }
+            pi = pi + 1
+        }
+        string_free(seen)
+        return
+    }
+    if cal.kind != 2 { return }
+    let fr: i32 = fn_row_by_span(c, src, cal.start, cal.end)
+    if fr < 0 { return }
+    let iid2: i32 = get(i32, c.fns, (fr * 12 + 9) as usize)
+    let f2: ItemData = get(ItemData, p.it, iid2 as usize)
+    var seen2: String = string_new()
+    var hit2: bool = false
+    var pi2: i32 = 0
+    for pi2 < f2.b {
+        if sa_param_is_wslice(p, f2.a + pi2 * 7) {
+            if pi2 < acount {
+                let arg2: i32 = get(i32, p.ar, (astart + pi2) as usize)
+                if !hit2 { hit2 = sa_note(e, p, src, arg2, seen2, src[cal.start .. cal.end]) }
+            }
+        }
+        pi2 = pi2 + 1
+    }
+    string_free(seen2)
+}
+
 // A `spawn` target taking a `mut`/`out` SLICE parameter races — reject it.
 fn check_spawn_slice(mut e: Esc, read p: Parser, read c: Checker, read src: str, call: i32) {
     let cd: ExprData = get(ExprData, p.ex, call as usize)
@@ -10377,6 +10502,7 @@ fn walk_expr(mut e: Esc, read p: Parser, read c: Checker, read src: str, id: i32
                                 walk_expr(e, p, c, src, get(i32, p.ar, ind.x as usize), true)
                                 check_give_away(e, p, c, src, id, d.a, d.x, d.y)
                                 check_loop_mutation(e, p, c, src, id, d.a, d.x, d.y)
+                                check_slice_alias(e, p, c, src, id, d.a, d.x, d.y)
                                 check_no_alloc_call(e, p, src, d.a, d.start, d.end)
                                 check_det_call(e, p, src, d.a, d.start, d.end)
                                 check_manual_drop(e, c, src, id, d.start, d.end)
@@ -10392,6 +10518,7 @@ fn walk_expr(mut e: Esc, read p: Parser, read c: Checker, read src: str, id: i32
         for i < d.y { walk_expr(e, p, c, src, get(i32, p.ar, (d.x + i) as usize), false)  i = i + 1 }
         check_give_away(e, p, c, src, id, d.a, d.x, d.y)
         check_loop_mutation(e, p, c, src, id, d.a, d.x, d.y)
+        check_slice_alias(e, p, c, src, id, d.a, d.x, d.y)
         check_no_alloc_call(e, p, src, d.a, d.start, d.end)
         check_det_call(e, p, src, d.a, d.start, d.end)
         check_manual_drop(e, c, src, id, d.start, d.end)

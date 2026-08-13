@@ -68,14 +68,18 @@ coverage; adding one unilaterally would desync discovery order).
   messages; item-keyword synchronization in `parse_module` recovery (the
   cascade-budget test is the guardrail); stable error codes
   (`Diagnostic::with_code` exists, unused — additive in `check --json`).
-- **Item 4 stage 3 — design note DONE (2026-08-12)**, and the answer is
-  narrower than the question: not "checker-known disjointness" (range proofs =
-  option C, rejected — the §2.6 lattice) but **call-site mut-slice
-  exclusivity** — the measured hole is `g(q, q)` (same slice to two `mut []T`
-  params) checking CLEAN today. Option B in `docs/safety-mosaic-next.md` item
-  4: lexical root compare at the call, item-5-style; `mut`+`read` overlap
-  deliberately out of v1 (item 8's question). Implementation is now a sized,
-  unblocked increment: both toolchains + a differential probe that fires.
+- **Item 4 stage 3 — DONE, designed AND built (2026-08-12)**: not
+  "checker-known disjointness" (range proofs = option C, rejected — the §2.6
+  lattice) but **call-site mut-slice exclusivity** — the measured hole was
+  `g(q, q)` (same slice to two `mut []T` params) checking CLEAN. Built both
+  toolchains: the compared key is the whole lexical place chain (`place_key`
+  from AST idents — `g(s.lo, s.hi)` stays legal, non-places never compare,
+  Index steps excluded), one refusal per call, `mut`+`read` overlap
+  deliberately legal (item 8's question). Differential probe
+  `jestyr_slice_alias_matches_reference` (2 firing + 2 legal, anti-vacuity
+  asserted) — the corpus is structurally blind to the rule. **ITEM 4 IS
+  CLOSED end to end** (stages 0–3). Dodges recorded in the design note:
+  aliased root, through-callee — item 5's two, same answers.
 - **Item 5 residue** (optional): lexical taint for the aliased-root dodge
   (`var alias = h` inside the region, store through `alias`); the
   through-callee dodge needs signatures (item 2 territory). Both recorded in
