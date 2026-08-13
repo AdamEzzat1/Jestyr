@@ -1,0 +1,35 @@
+// ✗ REJECTION PROBE — must fail `jestyrc check` (check_rejections.ps1).
+//
+// Use-after-take of a DROPPABLE: `d` was given to `consume`, whose take
+// parameter now owns (and at scope exit DROPS) the Device — so the read
+// below would observe a destructed value. The consuming rule refuses it:
+// "cannot use `d` after it was given to a `take` parameter". This is the
+// twin of rust/std/resource_capabilities/rejected.rs (E0382), landed by
+// the two take fixes this suite's first pass motivated. Note the gate:
+// the rule fires because Device is DROPPABLE — the drop-free version of
+// this probe (resource_capabilities_gap.jtr) still compiles by design,
+// as an MVS implicit copy.
+
+trait Drop {
+    fn drop(mut self)
+}
+
+struct Device { id: i64, energy: i64 }
+
+impl Drop for Device {
+    fn drop(mut self) {
+        print_int(self.id)
+    }
+}
+
+fn consume(take d: Device) -> i64 {
+    return d.energy + d.id
+}
+
+fn main() -> i32 {
+    let d: Device = Device { id: 1, energy: 10 }
+    let e: i64 = consume(d)
+    print_int(d.energy)   // ✗ use after consume — refused
+    print_int(e)
+    return 0
+}

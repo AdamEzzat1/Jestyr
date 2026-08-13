@@ -46,18 +46,21 @@ print byte-identical output; every timing row below is gated on that.
   measured free at 24-byte elements (95.8 vs 92.2 ms) but does not
   scale to large or non-copyable elements.
 - **Resource capabilities (7)** — runtime parity (20.9 vs 24.0 ms) and
-  matching shapes (`take` ≡ by-value `mut d`), but Rust's affine story
-  is complete and Jestyr's is not. Two gaps MEASURED by this suite's
-  probes:
-  1. use-after-take compiles (`resource_capabilities_gap.jtr` is the
-     pinned witness) — the giver's binding is not poisoned; Rust
-     refuses the same program with E0382;
-  2. a take parameter the callee does not return is never dropped —
-     with a Drop impl, move-in-and-discard runs zero drops anywhere
-     (caller correctly elides as moved-out; callee never inserts one).
-     A moved-in resource leaks.
-  Both are exactly the data mosaic item 7 (linear capabilities) needs;
-  a fix task has been spun off separately.
+  matching shapes (`take` ≡ by-value `mut d`). The two gaps this
+  suite's probes MEASURED in the first pass are now CLOSED by the
+  spun-off compiler task (both toolchains, third pass):
+  1. a `take` parameter the callee does not return is now dropped BY
+     the callee — "the new owner drops it" holds, the leak is gone;
+  2. use-after-take of a DROPPABLE is refused ("cannot use `d` after it
+     was given to a `take` parameter") —
+     `resource_capabilities_rejected.jtr` is the E0382 twin, and it
+     refuses on cue. The line Jestyr draws differently from Rust, on
+     purpose: a DROP-FREE non-Copy value given to `take` is an MVS
+     implicit copy and stays legal (`resource_capabilities_gap.jtr`,
+     reframed from gap-witness to semantics probe). Rust poisons every
+     non-Copy move; Jestyr poisons where a destructor makes the stale
+     copy dangerous. Residue: transitively-droppable wrappers don't yet
+     poison (the checker's v1 gate is a direct `impl Drop`).
 - **Arena AST (4)** — the biggest performance gap in the suite: 5.4×
   (210.1 vs 39.2/38.6 ms). Jestyr's only way to carry cross-links today
   is genrefs — one `gen_new` heap allocation per node (1,048,575 of
@@ -79,6 +82,56 @@ flat-buffer cases (1, 2, 3, 8, 9) show ~0–17%. Nobody should quote
 wins case 4 by 5.4× verifies NOTHING about its indices, and the twins
 that do verify (typed-arena via lifetimes, slotmap via generations)
 each import a crate and their own ceremony.
+
+## The stdlib pass (third pass): jestyr vs jestyr-std
+
+The question this pass answers: does writing the same cases on
+`examples/std` (today that means `std/list`) change the numbers? Five
+cases got a `jestyr_std/` variant (1, 2, 4, 5, 6 — cases 3 and 8's main
+tracks already import std, 7 and 9 have nothing for a container to do).
+All five were byte-identical to every existing track on the first build.
+Absolute ms below are from the third-pass run (machine slower than the
+first pass across ALL tracks — compare ratios, not runs):
+
+| case | rust-std | jestyr (no-std) | jestyr-std | reading |
+|---|---|---|---|---|
+| transient_borrow | 520.9 | 529.5 | 557.7 | std ~5% slower: copy-out/copy-in |
+| borrowed_projection | 144.1 | 144.4 | 160.3 | std ~11% slower: call-shaped access |
+| observer_registry | 91.7 | 100.2 | 103.9 | ~noise: genref checks dominate |
+| arena_ast | 56.4 | 307.5 | **79.0** | 5.45× → **1.40×** |
+| dlist | 26.6 | 69.1 | **27.0** | 2.6× → **1.02× — parity** |
+
+**The headline: the graph tax was never the language — it was the graph
+REPRESENTATION, and the stdlib now offers the other one.** `List(Node)`
+plus i64 links is the rust-std Vec shape, and Jestyr compiles it to the
+same speed class: dlist lands ON rust-std/slotmap (27.0 vs 26.6/27.0
+ms), arena_ast lands at 1.4× (79 vs 56.4) — down from 5.45×. What the
+index variants give up is exactly what rust-std gives up: nothing
+checks a stale index, where the genref twin faults deterministically.
+The jestyr/jestyr-std pair therefore prices the checked story WITHIN
+one language: ~2.6–3.9× on pointer-chasing shapes, and that price now
+has an in-language escape valve rather than being the only option.
+(arena_ast's remaining 1.4×: `eval` recursion through a `read
+List(Node)` parameter passes a 32-byte struct where Rust's `&[Node]`
+is ptr+len in registers; unexplored, single-case, not narrated
+further.)
+
+**Where std costs instead of pays:** the flat-buffer cases. `List` has
+no in-place element access — `get` copies out, `set` copies back — so
+transient_borrow's 56-byte Players pay ~5% over the no-std twin's
+in-place `for mut p in ps` slice loop, and borrowed_projection pays
+~11% for call-shaped access against a bounds-ELIDED slice loop (the
+elision from case 3 works for the no-std twin; `list.get` is a call
+into another module instead). The stdlib API gaps this measures, now
+recorded: no `reserve` (rust-std pre-sizes, `List` doubles from 4), no
+`get_ref`/slice view, no iteration support. Each would close its share
+of the 5–11%.
+
+**Compile/size columns:** jestyr-std compiles cost about the same
+(612→673 ms arena_ast, 883→1290 ms dlist — the import closure is
+tokenized per build) and binaries stay half the Rust size. LOC is a
+wash (arena_ast 77→76, dlist 101→97): `std/list` removes the manual
+capacity/free lines and adds the `list.` call spelling.
 
 ## Case 3's 17%, confirmed in the emitted C
 
@@ -181,11 +234,16 @@ deref, checked else-arm via `with alive`.
 
 ## Remaining follow-ups
 
-- The spun-off compiler task: take-param drops + use-after-take
-  poisoning (feeds mosaic item 7).
+- ~~The spun-off compiler task: take-param drops + use-after-take
+  poisoning~~ — DONE (third pass; see case 7 above and the stdlib-pass
+  section below). What still feeds mosaic item 7: transitive
+  droppability in the consuming rule's gate, and `take self` drop glue.
 - Mosaic item 6 (region-scoped cells) now has its target numbers: beat
   210 ms/5.4× on arena_ast and 52 ms/3.2× on dlist while keeping the
-  checked-or-faulting guarantee.
+  checked-or-faulting guarantee. The stdlib pass sharpens the target:
+  `std/list` indices already deliver 1.4×/1.0× WITHOUT the guarantee,
+  so item 6's whole value is closing the checked story's share of the
+  gap, not the container's.
 - A stale-deref fault demo (bare `.*` after `gen_free`) as a recorded
   runtime-behavior probe.
 - gcc-side memory for the Jestyr pipeline if a fair job-object-based

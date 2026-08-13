@@ -1,0 +1,126 @@
+// dlist_std — the jestyr-std track: same case as jestyr/dlist.jtr, but
+// nodes live in ONE `std/list` `List(DNode)` and prev/next are plain i64
+// slot indices (NIL = -1) — the rust-std twin's exact shape, deleted
+// slots unlinked but not reused, no per-node allocation, no generation
+// checks.
+//
+// And no protection either: a stale index silently reads whatever lives
+// in that slot now — the same safety class as rust-std, where the no-std
+// jestyr twin's genref faults deterministically on a stale hop. The pair
+// (jestyr vs jestyr-std) prices that checked story within one language.
+//
+// Output must be byte-identical to all three existing tracks.
+
+import "../../../examples/std/list"
+import "../../../examples/std/mem"
+
+const N: i64 = 200000
+const NIL: i64 = 0 - 1
+
+struct DNode { v: i64, prev: i64, next: i64 }
+
+fn lcg(state: i64) -> i64 {
+    return (state * 48271) % 2147483647
+}
+
+fn sum_forward(read ns: list.List(DNode), head: i64) -> i64 {
+    var t: i64 = 0
+    var cur: i64 = head
+    for cur != NIL {
+        let n: DNode = list.get(DNode, ns, cur as usize)
+        t = t + n.v
+        cur = n.next
+    }
+    return t
+}
+
+fn sum_backward(read ns: list.List(DNode), tail: i64) -> i64 {
+    var t: i64 = 0
+    var cur: i64 = tail
+    for cur != NIL {
+        let n: DNode = list.get(DNode, ns, cur as usize)
+        t = t + n.v
+        cur = n.prev
+    }
+    return t
+}
+
+fn main() -> i32 {
+    let al: Allocator = mem.system_allocator()
+    var ns: list.List(DNode) = list.make(DNode, al)
+    var s: i64 = 20260813
+
+    // Build: push_back N nodes.
+    s = lcg(s)
+    list.push(DNode, ns, DNode { v: s % 1000, prev: NIL, next: NIL })
+    let head: i64 = 0
+    var tail: i64 = 0
+    var i: i64 = 1
+    for i < N {
+        s = lcg(s)
+        list.push(DNode, ns, DNode { v: s % 1000, prev: tail, next: NIL })
+        let id: i64 = (list.len(DNode, ns) as i64) - 1
+        var t0: DNode = list.get(DNode, ns, tail as usize)
+        t0.next = id
+        list.set(DNode, ns, tail as usize, t0)
+        tail = id
+        i = i + 1
+    }
+    var live: i64 = N
+
+    let f1: i64 = sum_forward(ns, head)
+
+    // Delete every 3rd visited node (tail guarded: never deleted).
+    var k: i64 = 0
+    var cur: i64 = head
+    for cur != NIL {
+        k = k + 1
+        let nx: i64 = list.get(DNode, ns, cur as usize).next
+        if k % 3 == 0 and nx != NIL {
+            let pv: i64 = list.get(DNode, ns, cur as usize).prev
+            if pv != NIL {
+                var p0: DNode = list.get(DNode, ns, pv as usize)
+                p0.next = nx
+                list.set(DNode, ns, pv as usize, p0)
+            }
+            var x0: DNode = list.get(DNode, ns, nx as usize)
+            x0.prev = pv
+            list.set(DNode, ns, nx as usize, x0)
+            live = live - 1
+        }
+        cur = nx
+    }
+
+    let b1: i64 = sum_backward(ns, tail)
+
+    // Insert a fresh node after every 5th surviving node; skip past it.
+    var m: i64 = 0
+    cur = head
+    for cur != NIL {
+        m = m + 1
+        let nx: i64 = list.get(DNode, ns, cur as usize).next
+        if m % 5 == 0 {
+            s = lcg(s)
+            list.push(DNode, ns, DNode { v: s % 1000, prev: cur, next: nx })
+            let id: i64 = (list.len(DNode, ns) as i64) - 1
+            var c0: DNode = list.get(DNode, ns, cur as usize)
+            c0.next = id
+            list.set(DNode, ns, cur as usize, c0)
+            if nx != NIL {
+                var x1: DNode = list.get(DNode, ns, nx as usize)
+                x1.prev = id
+                list.set(DNode, ns, nx as usize, x1)
+            }
+            live = live + 1
+        }
+        cur = nx
+    }
+
+    let f2: i64 = sum_forward(ns, head)
+
+    print_int(f1)
+    print_int(b1)
+    print_int(f2)
+    print_int(live)
+    return 0
+}

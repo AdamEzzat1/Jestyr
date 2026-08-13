@@ -1,0 +1,104 @@
+// arena_ast_std — the jestyr-std track: same case as
+// jestyr/arena_ast.jtr, but the node graph lives in ONE `std/list`
+// `List(Node)` and links are plain i64 indices (NIL = -1) — exactly the
+// rust-std twin's Vec-of-nodes shape, now expressible in Jestyr because
+// the stdlib provides the growable vector the hand-rolled version
+// lacked a container for.
+//
+// What this track isolates: the no-std jestyr twin pays one `gen_new`
+// heap allocation per node plus a generation check per hop (the graph
+// tax the first pass measured at ~5.4x). This variant has neither — and
+// neither does it have the CHECKED story: a stale index reads whatever
+// lives in that slot now, the same safety class as rust-std. The pair
+// (jestyr vs jestyr-std) therefore prices the checked story against the
+// index story WITHIN one language.
+//
+// Output must be byte-identical to all three existing tracks.
+
+import "../../../examples/std/list"
+import "../../../examples/std/mem"
+
+const LEAVES: usize = 524288
+const MOD: i64 = 1000000007
+const NIL: i64 = 0 - 1
+
+struct Node { kind: i64, val: i64, left: i64, right: i64, parent: i64 }
+
+fn lcg(state: i64) -> i64 {
+    return (state * 48271) % 2147483647
+}
+
+fn eval(read ns: list.List(Node), id: i64) -> i64 {
+    if id == NIL {
+        return 0
+    }
+    let n: Node = list.get(Node, ns, id as usize)
+    if n.kind == 0 {
+        return n.val
+    }
+    let a: i64 = eval(ns, n.left)
+    let b: i64 = eval(ns, n.right)
+    if n.kind == 1 {
+        return (a + b) % MOD
+    }
+    return (a * b) % MOD
+}
+
+// Path length in nodes (leaf included) up to the root.
+fn path_len(read ns: list.List(Node), id: i64) -> i64 {
+    var d: i64 = 0
+    var cur: i64 = id
+    for cur != NIL {
+        d = d + 1
+        cur = list.get(Node, ns, cur as usize).parent
+    }
+    return d
+}
+
+fn main() -> i32 {
+    let al: Allocator = mem.system_allocator()
+    var ns: list.List(Node) = list.make(Node, al)
+    var lvl: list.List(i64) = list.make(i64, al)
+    var s: i64 = 20260813
+    var count: i64 = 0
+
+    for i in 0..LEAVES {
+        s = lcg(s)
+        list.push(Node, ns, Node { kind: 0, val: s % 100, left: NIL, right: NIL, parent: NIL })
+        list.push(i64, lvl, count)
+        count = count + 1
+    }
+
+    var cnt: usize = LEAVES
+    for cnt > 1 {
+        let half: usize = cnt / 2
+        for j in 0..half {
+            let lc: i64 = list.get(i64, lvl, j * 2)
+            let rc: i64 = list.get(i64, lvl, j * 2 + 1)
+            s = lcg(s)
+            let kind: i64 = s % 2 + 1
+            let pid: i64 = count
+            list.push(Node, ns, Node { kind: kind, val: 0, left: lc, right: rc, parent: NIL })
+            count = count + 1
+            var a: Node = list.get(Node, ns, lc as usize)
+            a.parent = pid
+            list.set(Node, ns, lc as usize, a)
+            var b: Node = list.get(Node, ns, rc as usize)
+            b.parent = pid
+            list.set(Node, ns, rc as usize, b)
+            list.set(i64, lvl, j, pid)
+        }
+        cnt = half
+    }
+    let root: i64 = list.get(i64, lvl, 0)
+
+    var wsum: i64 = 0
+    for i in 0..LEAVES {
+        wsum = wsum + path_len(ns, i as i64) * ((i as i64) % 13 + 1)
+    }
+
+    print_int(eval(ns, root))
+    print_int(wsum)
+    print_int(count)
+    return 0
+}
