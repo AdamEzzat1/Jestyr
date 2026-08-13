@@ -3293,9 +3293,27 @@ fn parse_item(mut p: Parser) -> i32 {
     if k == 15 { return parse_trait(p, is_pub) }   // `trait`
     if k == 16 { return parse_impl(p) }            // `impl` (no pub)
     if k == 40 { return parse_extern(p, is_pub) }  // `extern`
+    // Unrecognized: ONE Error item per garbage RUN, synchronized to the next item
+    // keyword (mirrors the reference's `other` arm — both toolchains must consume
+    // the same run or their item streams desynchronize on malformed input). The
+    // offending token is never itself a sync point (every item keyword dispatches
+    // above), so the first bump always makes progress; `@`(101)/`pub`(42) count as
+    // sync points so the next item's attributes and visibility still parse.
     let t: Token = cur_tok(p)
-    bump(p)                                        // unrecognized: error over one token
-    return mk_item_err(p, t.start, t.end)
+    bump(p)
+    var endp: usize = t.end
+    var more: bool = true
+    for more {
+        let sk: i32 = cur_kind(p)
+        if sk == 7 or sk == 15 or sk == 16 or sk == 13 or sk == 10 or sk == 11 or sk == 12 or sk == 14 or sk == 18 or sk == 40 or sk == 41 or sk == 42 or sk == 101 or sk == 110 {
+            more = false                           // fn/trait/impl/enum/const/struct/record/union/distinct/extern/import/pub/@/Eof
+        } else {
+            let st: Token = cur_tok(p)
+            endp = st.end
+            bump(p)
+        }
+    }
+    return mk_item_err(p, t.start, endp)
 }
 
 // A leaf or a parenthesized group. `( e )` returns the inner expression unchanged

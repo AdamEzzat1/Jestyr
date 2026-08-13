@@ -5971,7 +5971,23 @@ int32_t jestyr_parse_item(Jestyr_Parser* restrict j_p)
     }
     Jestyr_Token j_t = jestyr_cur_tok((*j_p));
     jestyr_bump(&((*j_p)));
-    return jestyr_mk_item_err(&((*j_p)), j_t.j_start, j_t.j_end);
+    size_t j_endp = j_t.j_end;
+    bool j_more = true;
+    while (j_more)
+    {
+        int32_t j_sk = jestyr_cur_kind((*j_p));
+        if (((((((((((((((j_sk == 7) || (j_sk == 15)) || (j_sk == 16)) || (j_sk == 13)) || (j_sk == 10)) || (j_sk == 11)) || (j_sk == 12)) || (j_sk == 14)) || (j_sk == 18)) || (j_sk == 40)) || (j_sk == 41)) || (j_sk == 42)) || (j_sk == 101)) || (j_sk == 110)))
+        {
+            j_more = false;
+        }
+        else
+        {
+            Jestyr_Token j_st = jestyr_cur_tok((*j_p));
+            j_endp = j_st.j_end;
+            jestyr_bump(&((*j_p)));
+        }
+    }
+    return jestyr_mk_item_err(&((*j_p)), j_t.j_start, j_endp);
 }
 
 int32_t jestyr_parse_primary(Jestyr_Parser* restrict j_p)

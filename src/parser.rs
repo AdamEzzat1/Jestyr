@@ -392,7 +392,35 @@ impl<'src> Parser<'src> {
                     format!("expected an item (`fn`, `trait`, `impl`, `enum`, `const`, `struct`, `record`, `distinct`, `extern`, `import`), found `{}`", other.describe()),
                     "E0005",
                 );
+                // SYNCHRONIZE to the next item keyword (roadmap §4 item 3): one
+                // diagnostic per garbage RUN, not per token — bumping a single
+                // token re-entered this arm once per token and cascaded. The
+                // offending token is never itself a sync point (every item
+                // keyword is dispatched above), so the first bump always makes
+                // progress; `@`/`pub` count as sync points so the next item's
+                // attributes and visibility still parse. Mirrored in the port
+                // (`parse_item`'s fall-through in parser.jtr): both toolchains
+                // must consume the same run, or their item streams desynchronize
+                // on malformed input.
                 self.bump();
+                while !matches!(
+                    self.cur().kind,
+                    Fn | Trait
+                        | Impl
+                        | Enum
+                        | Const
+                        | Struct
+                        | Record
+                        | Union
+                        | Distinct
+                        | Extern
+                        | Import
+                        | Pub
+                        | At
+                        | Eof
+                ) {
+                    self.bump();
+                }
                 None
             }
         }
@@ -3213,6 +3241,21 @@ mod tests {
         let (_ast, diags) = parse("fn f() -> i32 {\n    let a = 1\n");
         let d = diags.first().expect("one diagnostic");
         assert_eq!(d.message, "expected `}`, found `<eof>`", "message text moved");
+    }
+
+    /// Recovery synchronizes to the next item keyword: ONE diagnostic per garbage
+    /// run, and the items on either side of it still parse. (Pre-sync, each
+    /// garbage token re-entered the error arm — seven `?`s meant seven
+    /// diagnostics.)
+    #[test]
+    fn item_recovery_synchronizes_to_the_next_item_keyword() {
+        let (ast, diags) = parse("fn a() {}\n? ? ? ? ? ? ?\nfn b() {}");
+        assert_eq!(ast.items.len(), 2, "both items parse: {diags:?}");
+        assert_eq!(
+            diags.iter().filter(|d| d.code == Some("E0005")).count(),
+            1,
+            "one diagnostic per garbage run: {diags:?}"
+        );
     }
 
     /// Stable codes make parse errors testable by IDENTITY rather than message
