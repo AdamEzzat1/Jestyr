@@ -1,0 +1,115 @@
+// transient_borrow — twin of rust/std/transient_borrow.
+//
+// Jestyr's side of the case: `read` / `mut` parameter modes instead of
+// `&` / `&mut`, zero lifetime annotations, exclusivity checked at the
+// call boundary. One honest structural difference: a Jestyr struct may
+// not hold a slice (storing a borrow in a struct is escape route 2), so
+// World carries ptr+len — the stdlib's own container idiom — and each
+// function rebuilds its view. Rust's Vec<Player> owns its buffer.
+//
+// Output must be byte-identical to the Rust twin.
+
+const N: usize = 1000000
+const TICKS: i64 = 40
+const MOD: i64 = 1000000007
+
+struct V3 { x: i64, y: i64, z: i64 }
+struct Player { pos: V3, vel: V3, hp: i64, score: i64 }
+struct World { ptr: *mut Player, len: usize, tick: i64 }
+
+fn lcg(state: i64) -> i64 {
+    return (state * 48271) % 2147483647
+}
+
+// Immutable borrow of the whole world: read every player, mutate nothing.
+fn total_score(read w: World) -> i64 {
+    var ps: []Player = slice(Player, w.ptr, w.len)
+    var t: i64 = 0
+    for p in ps {
+        t = t + p.score
+    }
+    return t
+}
+
+// Mutable borrow of one player: clamp hp into [0, 100].
+fn clamp_hp(mut p: Player) {
+    if p.hp < 0 {
+        p.hp = 0
+    }
+    if p.hp > 100 {
+        p.hp = 100
+    }
+}
+
+// Mutable borrow of the whole world: move everyone, damage on schedule,
+// score the survivors.
+fn advance(mut w: World) {
+    w.tick = w.tick + 1
+    let damage_round: bool = w.tick % 8 == 0
+    var ps: []Player = slice(Player, w.ptr, w.len)
+    for mut p in ps {
+        p.pos.x = p.pos.x + p.vel.x
+        p.pos.y = p.pos.y + p.vel.y
+        p.pos.z = p.pos.z + p.vel.z
+        if damage_round {
+            p.hp = p.hp - (p.pos.x + p.pos.y + p.pos.z) % 7
+            clamp_hp(p)
+        }
+        if p.hp > 0 {
+            p.score = p.score + p.hp % 10
+        }
+    }
+}
+
+// Immutable borrow again: fold the final state into one checksum.
+fn inspect(read w: World) -> i64 {
+    var ps: []Player = slice(Player, w.ptr, w.len)
+    var c: i64 = 0
+    for p in ps {
+        c = c + p.pos.x * 3 + p.pos.y * 5 + p.pos.z * 7 + p.hp * 11
+        c = c % MOD
+    }
+    return c
+}
+
+fn main() -> i32 {
+    var a: *mut Player = alloc(Player, N)
+    var ps: []Player = slice(Player, a, N)
+    var s: i64 = 20260813
+    for i in 0..N {
+        s = lcg(s)
+        let px: i64 = s % 1000
+        s = lcg(s)
+        let py: i64 = s % 1000
+        s = lcg(s)
+        let pz: i64 = s % 1000
+        s = lcg(s)
+        let vx: i64 = s % 9 - 4
+        s = lcg(s)
+        let vy: i64 = s % 9 - 4
+        s = lcg(s)
+        let vz: i64 = s % 9 - 4
+        s = lcg(s)
+        let hp: i64 = s % 100 + 1
+        ps[i] = Player {
+            pos: V3 { x: px, y: py, z: pz },
+            vel: V3 { x: vx, y: vy, z: vz },
+            hp: hp,
+            score: 0,
+        }
+    }
+    var w: World = World { ptr: a, len: N, tick: 0 }
+
+    var score_trace: i64 = 0
+    var t: i64 = 0
+    for t < TICKS {
+        advance(w)
+        score_trace = (score_trace + total_score(w)) % MOD
+        t = t + 1
+    }
+    print_int(score_trace)
+    print_int(inspect(w))
+    print_int(w.tick)
+    free_ptr(a)
+    return 0
+}

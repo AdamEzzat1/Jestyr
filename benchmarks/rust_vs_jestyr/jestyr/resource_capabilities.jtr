@@ -1,0 +1,59 @@
+// resource_capabilities — twin of rust/std/resource_capabilities.
+//
+// The same ownership pipeline: charge (take + mutate + return),
+// transfer (pure handoff), audit (read borrow). `take` conveys
+// ownership for drop purposes — the giver's copy is not dropped — and
+// the taken value is directly mutable in the callee, so the shapes
+// match Rust's `mut d: Device` by-value idiom one-for-one.
+//
+// The HONEST GAP (measured by resource_capabilities_gap.jtr): Jestyr
+// does not yet poison the giver's binding — use-after-take compiles and
+// reads the stale copy, where Rust refuses with E0382. And a take
+// parameter the callee does not return is never dropped (probed during
+// this suite; see results/ANALYSIS.md) — the linear-capability design
+// (safety-mosaic item 7, DESIGN-ONLY) is what would close both.
+//
+// Output must be byte-identical to the Rust twin.
+
+const N: i64 = 2000000
+const MOD: i64 = 1000000007
+
+struct Device { id: i64, energy: i64 }
+
+fn lcg(state: i64) -> i64 {
+    return (state * 48271) % 2147483647
+}
+
+// Takes ownership, mutates, gives it back.
+fn charge(take d: Device, k: i64) -> Device {
+    d.energy = d.energy + k
+    return d
+}
+
+// Pure handoff: ownership passes through.
+fn transfer(take d: Device) -> Device {
+    return d
+}
+
+// Borrow-only inspection.
+fn audit(read d: Device) -> i64 {
+    return d.energy % 97 + d.id
+}
+
+fn main() -> i32 {
+    var d: Device = Device { id: 7, energy: 0 }
+    var s: i64 = 20260813
+    var acc: i64 = 0
+    var i: i64 = 0
+    for i < N {
+        s = lcg(s)
+        d = charge(d, s % 50)
+        d = transfer(d)
+        acc = (acc + audit(d)) % MOD
+        i = i + 1
+    }
+    print_int(acc)
+    print_int(d.energy)
+    print_int(d.id)
+    return 0
+}

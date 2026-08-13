@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "std/transient_borrow",
+    "std/borrowed_projection",
+    "std/disjoint_mutation",
+    "std/observer_registry",
+    "std/arena_ast",
+    "std/dlist",
+    "std/resource_capabilities",
+    "std/structured_concurrency",
+    "std/unsafe_boundary",
+    "idiomatic/observer_registry",
+    "idiomatic/arena_ast",
+    "idiomatic/dlist",
+    "idiomatic/structured_concurrency",
+]
+
+[profile.release]
+opt-level = 3
+codegen-units = 1

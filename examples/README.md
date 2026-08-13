@@ -183,8 +183,20 @@ The self-hosted compiler and the standard library, all in Jestyr:
   → `escape.jtr` → `cgen.jtr` (which also contains the module loader and
   the gcc driver). The `*_cli.jtr` files are their stage-dump entry points.
 * **The stdlib:** `core.jtr`, `mem.jtr`, `io.jtr`, `list.jtr`, `fs.jtr`,
-  `env.jtr`, `strmap.jtr`, `intern.jtr`, `combinators.jtr`,
-  `slice_algos.jtr`.
+  `env.jtr`, `path.jtr`, `strmap.jtr`, `intern.jtr`, `combinators.jtr`,
+  `slice_algos.jtr`. See [docs/stdlib-roadmap.md](../docs/stdlib-roadmap.md)
+  for the tiers (`core` / `mem` / `std` / `sys` / `parallel`), what is
+  planned next, and what is deliberately staying out.
+  * `env.jtr` reads the process environment: `argc`/`argv`/`program` plus
+    `get`/`has`/`get_or` over the `env_var` intrinsic. Values are `str` VIEWS
+    into OS-owned storage — no allocation, nothing to free. Worked examples in
+    `env_demo.jtr`. (`get`, not Rust's `var`: `var` is a Jestyr keyword.)
+  * `path.jtr` is lexical path manipulation — `base`, `dir`, `ext`, `stem`,
+    `is_abs`, `dir_len`, `join`, `normalize`. Every function is `@no_alloc`,
+    so "path handling never allocates" is proven rather than promised:
+    queries return `read str` views into the argument, and composition writes
+    into a caller buffer. It also ships its own `@test` suite —
+    `jestyrc test examples/std/path.jtr`. Worked examples in `path_demo.jtr`.
 * **Numerics & determinism:** `numbers.jtr`, `parse_float.jtr`,
   `format_float.jtr`, `float_bits.jtr`, `binned.jtr`, `reductions.jtr`,
   `numerics_canary.jtr` (the locked determinism canary), `sha256.jtr`
@@ -200,3 +212,11 @@ Changing anything under `examples/std/` changes the compiler — the
 byte-identity corpus, the self-hosting fixed point, and the committed
 bootstrap seed all pin its behavior (see
 [bootstrap/README.md](../bootstrap/README.md) on refreshing the seed).
+
+To be precise about *which* changes force a reseed: the self-host closure is
+the twelve modules listed in `SELFHOST_MODULES` (`src/proptests.rs`) — `mem`,
+`intern`, `fs`, `env`, `list`, `tokens`, `parser`, `ctfe`, `typeck`, `escape`,
+`sha256`, `cgen`. Editing one of those, or importing a new module *from* one,
+pays the two-sided tax. A new stdlib module nothing in that closure imports
+(as `path.jtr` is today) does not — though the corpus sweeps still glob it up,
+so it must stay clean.

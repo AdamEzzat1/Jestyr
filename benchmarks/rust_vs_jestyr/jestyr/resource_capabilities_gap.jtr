@@ -1,0 +1,22 @@
+// KNOWN-GAP PROBE — this COMPILES today, and the case argues it should
+// not. Use after take: `d` was given to `consume`, but the giver's
+// binding is not poisoned, so the read below is accepted and returns
+// the stale copy (deterministic under C value semantics — not UB, but
+// not a move either). Rust's twin probe (rejected.rs) is refused with
+// E0382. Tracked as measured input to safety-mosaic item 7 (linear
+// capabilities); NOT named *_rejected.jtr because check_rejections.ps1
+// would rightly fail it.
+
+struct Device { id: i64, energy: i64 }
+
+fn consume(take d: Device) -> i64 {
+    return d.energy + d.id
+}
+
+fn main() -> i32 {
+    let d: Device = Device { id: 1, energy: 10 }
+    let e: i64 = consume(d)
+    print_int(d.energy)   // accepted today; a linear story would refuse
+    print_int(e)
+    return 0
+}

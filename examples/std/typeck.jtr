@@ -1538,6 +1538,7 @@ fn intrinsic_ret(mut c: Checker, t: str) -> i32 {
     if str_eq(t, "eprint_str") { return t_unit() }
     if str_eq(t, "arg_count") { return t_i32() }
     if str_eq(t, "arg") { return t_str() }
+    if str_eq(t, "env_var") { return t_str() }
     if str_eq(t, "atomic_load") or str_eq(t, "atomic_add") or str_eq(t, "atomic_sub") or str_eq(t, "atomic_xchg") { return t_i64() }
     return 0 - 1
 }

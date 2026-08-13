@@ -4485,6 +4485,10 @@ fn io_intrinsic_ret(name: &str) -> Option<Ty> {
         "eprint_str" => Ty::Unit,
         "arg_count" => Ty::Prim("i32"),
         "arg" => Ty::Prim("str"),
+        // `env_var(name) -> str` — a view into the C runtime's environment
+        // block, empty when unset. A view (not a `String`) for the same reason
+        // `arg` is one: the storage is OS-owned and outlives the call.
+        "env_var" => Ty::Prim("str"),
         _ => return None,
     })
 }

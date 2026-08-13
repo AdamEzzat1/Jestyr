@@ -1,0 +1,20 @@
+// REJECTION PROBE — must NOT compile.
+// A read borrow leaving through a return: `keep` neither takes
+// ownership nor declares `-> read`, so handing the parameter back out
+// is refused. (Rust's twin probe rejects a DIFFERENT overlap — reading
+// the world while a &mut is live. Jestyr deliberately ALLOWS read+mut
+// overlap at one call site for in-place idioms; its refused shape is
+// the borrow that tries to outlive the call.)
+
+struct Player { hp: i64, score: i64 }
+
+fn keep(read p: Player) -> Player {
+    return p
+}
+
+fn main() -> i32 {
+    let p: Player = Player { hp: 10, score: 0 }
+    let q: Player = keep(p)
+    print_int(q.hp)
+    return 0
+}

@@ -7,6 +7,46 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`env_var` intrinsic and an expanded `std/env`.** `env.get(name)` reads an
+  environment variable as a `str` **view** into OS-owned storage — no
+  allocation, nothing to free, the same contract `argv` has — with `has` for the
+  set-vs-empty question `get` cannot express, `get_or` for the
+  read-a-setting-with-a-default shape, and `program()` for argv[0]. Spelled
+  `get` rather than Rust's `var` because `var` is a Jestyr keyword.
+
+  The runtime helper is emitted **only when the program calls it**, so every
+  program that does not stays byte-identical. Landed with its port mirror and a
+  refreshed seed in the same commit, and went byte-identical on the first
+  attempt: `selfhost_fixpoint_full` and `selfhost_fixpoint_subset` both green.
+  The eleven edit sites an intrinsic touches are now written down as a checklist
+  in [docs/stdlib-roadmap.md](docs/stdlib-roadmap.md).
+
+- **`std/path` — the first slice of the stdlib readiness layer**, and the first
+  stdlib module whose allocation behavior is *proven*. Lexical path
+  manipulation (`base`, `dir`, `ext`, `stem`, `is_abs`, `dir_len`, `join`,
+  `normalize`) with no heap and no syscalls: every function is `@no_alloc`, so
+  the escape checker rejects the file if any of it ever reaches for the
+  allocator. Queries return `read str` views into their argument; composition
+  writes into a caller-supplied `[]u8` and returns the byte count, the
+  `core.format_u64` idiom. Both `/` and `\` parse as separators, only `/` is
+  ever written, so composed output is byte-identical across platforms.
+
+  It is also the `@test` harness's first real user — the unit tests ship
+  beside the code (`jestyrc test examples/std/path.jtr`), where previously
+  `examples/tests_demo.jtr` was the only file in the corpus using the
+  attribute. Verified at four layers: the in-language `@test` suite, a
+  toolchain-free "compiles clean" test, a c-oracle assertion on the demo's
+  documented output, and a **differential property test** that drives the
+  compiled Jestyr module and requires it to agree with an independent Rust
+  oracle, plus bolero totality coverage on that oracle.
+
+  Costs nothing in bootstrap terms: no closure module imports it, so there is
+  no port mirror and no reseed. Both files *are* in `CGEN_GOLDEN_ALLOWLIST`
+  though — the self-hosted `cgen.jtr` lowers them byte-identically to the
+  reference backend, verified rather than assumed. See
+  [docs/stdlib-roadmap.md](docs/stdlib-roadmap.md) for the tier model, the
+  priority order, and the list of things deliberately staying out of `std`.
+
 - **Two modules may now define the same generic struct** (`fn Box(comptime T:
   type) -> type`), completing collidable names: their monomorphized instances
   get distinct symbols (`Jestyr_Box__m1__i32` vs `__m2__i32`), fields, and
@@ -18,6 +58,23 @@ versions are snapshots, not stability promises.
   of the two toolchains is now byte-identical *including* debug info, which
   also closes the recorded `jestyrc attest` vs `jc attest` `c-sha256`
   disagreement for module programs.
+
+### Documented
+
+- **A self-host closure module's NAME is a reserved identifier across the whole
+  flattened compiler**, recorded in
+  [docs/stdlib-roadmap.md](docs/stdlib-roadmap.md) after migrating `cgen.jtr`'s
+  loader onto `std/path` was tried and reverted. The flatten concatenates the
+  twelve closure modules at the token level and strips module qualifiers, so it
+  cannot distinguish `mod.item` from a field access on a local variable of the
+  same name. `cgen.jtr` has thirteen `path.` sites — `path.start`, `path.end`,
+  `path.len` on locals — and importing a module named `path` rewrote them into
+  bare `start`/`end`/`len`, producing a flattened compiler gcc rejected. The
+  duplication (`path_dir_len`, ten lines) is cheaper than renaming every local
+  named `path` across 15,000 lines, so it stays, documented at both sites.
+  Notably this passed the seed refresh and the byte-identity goldens; only
+  `selfhost_fixpoint_full` and `jestyr_driver_builds_itself` — the gates that
+  actually compile the flattened compiler — caught it.
 
 ### Changed — may reject code that previously compiled
 

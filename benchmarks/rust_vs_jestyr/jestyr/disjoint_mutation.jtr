@@ -1,0 +1,85 @@
+// disjoint_mutation — twin of rust/std/disjoint_mutation.
+//
+// Rust's split_at_mut RETURNS the two halves as a tuple. Jestyr cannot
+// return two borrows (a pair holding borrows is escape route 2), so
+// std/parallel.split_mut is CONTINUATION-PASSING: it builds the two
+// disjoint views and calls your function with them. Same guarantee,
+// inverted control flow. The call-site rule backing it up — the same
+// buffer cannot feed two writable slice params — is exercised by
+// disjoint_mutation_rejected.jtr (Jestyr's E0499, at the call site).
+//
+// Output must be byte-identical to the Rust twin.
+
+import "../../../examples/std/parallel"
+
+const N: usize = 8000000
+const MID: usize = 4000000
+const ROUNDS: i64 = 25
+const MOD: i64 = 1000000007
+
+fn lcg(state: i64) -> i64 {
+    return (state * 48271) % 2147483647
+}
+
+// Each helper takes its own exclusive slice — mode `mut` means no other
+// view of that memory is writable during the call.
+fn bump(mut half: []i64) {
+    for i in 0..half.len {
+        half[i] = half[i] + (i as i64) % 7
+    }
+}
+
+fn scale(mut half: []i64) {
+    for i in 0..half.len {
+        half[i] = (half[i] * 3 + i as i64) % 100003
+    }
+}
+
+// One writer, one reader, same buffer, disjoint by construction.
+fn add_into(mut dst: []i64, read src: []i64) {
+    var n: usize = dst.len
+    if src.len < n {
+        n = src.len
+    }
+    for i in 0..n {
+        dst[i] = (dst[i] + src[i]) % 100003
+    }
+}
+
+// The continuation split_mut calls with the two disjoint halves.
+fn round_phases(mut lo: []i64, mut hi: []i64) {
+    bump(lo)
+    scale(hi)
+    add_into(lo, hi)
+}
+
+fn checksum(read xs: []i64) -> i64 {
+    var c: i64 = 0
+    for v in xs {
+        c = (c * 31 + v) % MOD
+    }
+    return c
+}
+
+fn main() -> i32 {
+    var a: *mut i64 = alloc(i64, N)
+    var xs: []i64 = slice(i64, a, N)
+    var s: i64 = 20260813
+    for i in 0..xs.len {
+        s = lcg(s)
+        xs[i] = s % 1000
+    }
+
+    var r: i64 = 0
+    for r < ROUNDS {
+        parallel.split_mut(xs, MID, &round_phases)
+        r = r + 1
+    }
+
+    print_int(checksum(xs))
+    print_int(xs[0])
+    print_int(xs[MID])
+    print_int(xs[N - 1])
+    free_ptr(a)
+    return 0
+}

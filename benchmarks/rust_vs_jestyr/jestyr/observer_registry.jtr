@@ -1,0 +1,97 @@
+// observer_registry — twin of rust/std/observer_registry (hand-rolled
+// generational arena) and rust/idiomatic (slotmap).
+//
+// Jestyr needs NO registry: the generation check is the pointer type.
+// `gen_new` hands out a generational reference (&Obj), `gen_free` bumps
+// the generation, and `with alive h as read o { … } else { … }` is the
+// whole stale-handle story — a checked scope that takes the else arm on
+// a stale handle instead of faulting. (A bare `h.*` deref of a stale
+// genref is a deterministic runtime FAULT, never UB — the third
+// behavior class this case records.)
+//
+// Output must be byte-identical to both Rust twins.
+
+const INITIAL: i64 = 100000
+const ROUNDS: i64 = 20
+const DELETES: i64 = 30000
+const SPAWNS: i64 = 15000
+const CAP: usize = 400000
+const MOD: i64 = 1000000007
+
+struct Obj { id: i64, hp: i64 }
+@copy struct Handle { r: &Obj }
+
+fn lcg(state: i64) -> i64 {
+    return (state * 48271) % 2147483647
+}
+
+fn main() -> i32 {
+    var a: *mut Handle = alloc(Handle, CAP)
+    var hs: []Handle = slice(Handle, a, CAP)
+    var hcount: usize = 0
+    var s: i64 = 20260813
+    var next_id: i64 = 0
+
+    var i: i64 = 0
+    for i < INITIAL {
+        s = lcg(s)
+        hs[hcount] = Handle { r: gen_new(Obj, Obj { id: next_id, hp: s % 100 + 1 }) }
+        hcount = hcount + 1
+        next_id = next_id + 1
+        i = i + 1
+    }
+
+    var chk: i64 = 0
+    var dead_deletes: i64 = 0
+    var r: i64 = 0
+    for r < ROUNDS {
+        // Delete phase: victims drawn from every handle ever issued, so
+        // some draws hit handles that are already stale.
+        var d: i64 = 0
+        for d < DELETES {
+            s = lcg(s)
+            let j: usize = (s % (hcount as i64)) as usize
+            var ok: i64 = 0
+            with alive hs[j].r as read o {
+                ok = 1
+            } else {
+                ok = 0
+            }
+            if ok == 1 {
+                gen_free(hs[j].r)
+            } else {
+                dead_deletes = dead_deletes + 1
+            }
+            d = d + 1
+        }
+        // Spawn phase: fresh objects, fresh generations.
+        var b: i64 = 0
+        for b < SPAWNS {
+            s = lcg(s)
+            hs[hcount] = Handle { r: gen_new(Obj, Obj { id: next_id, hp: s % 100 + 1 }) }
+            hcount = hcount + 1
+            next_id = next_id + 1
+            b = b + 1
+        }
+        // Sweep phase: dereference EVERY handle ever issued.
+        var live_sum: i64 = 0
+        var live_count: i64 = 0
+        var stale_count: i64 = 0
+        for i2 in 0..hcount {
+            with alive hs[i2].r as read o {
+                live_sum = live_sum + o.hp + o.id % 7
+                live_count = live_count + 1
+            } else {
+                stale_count = stale_count + 1
+            }
+        }
+        chk = (chk * 31 + live_sum + live_count * 13 + stale_count * 17) % MOD
+        r = r + 1
+    }
+
+    print_int(chk)
+    print_int(hcount as i64)
+    print_int(dead_deletes)
+    free_ptr(a)
+    return 0
+}
