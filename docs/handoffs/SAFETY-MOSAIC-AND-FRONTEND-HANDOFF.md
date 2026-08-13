@@ -80,10 +80,14 @@ coverage; adding one unilaterally would desync discovery order).
   asserted) — the corpus is structurally blind to the rule. **ITEM 4 IS
   CLOSED end to end** (stages 0–3). Dodges recorded in the design note:
   aliased root, through-callee — item 5's two, same answers.
-- **Item 5 residue** (optional): lexical taint for the aliased-root dodge
-  (`var alias = h` inside the region, store through `alias`); the
-  through-callee dodge needs signatures (item 2 territory). Both recorded in
-  `docs/safety-mosaic-next.md` item 5 with the measured example.
+- **Item 5 residue (a) — DONE (2026-08-12)**: the lexical alias taint, both
+  toolchains — a place-chain-initialized `let` inherits its root's effective
+  depth (transitive; self-shadow safe; rebind clears), and the
+  store-through-chain rule consults it, refusing the `var alias = h` dodge
+  with an aliasing-shaped message. Same-region aliases stay legal; bare-Name
+  assigns keep raw depths (an alias is separate storage). Differential probe
+  `jestyr_alias_taint_matches_reference`. Item 5's remaining residue is ONLY
+  (b) through-callee stores — signatures, item 2 territory.
 
 ### D. Design-gated — do not start without the design argued
 

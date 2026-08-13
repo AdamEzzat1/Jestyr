@@ -30,13 +30,14 @@ import "typeck"
 // collection name 2-tuples; `rdepth` the scope depth at each active `region` block entry.
 // `no_alloc`/`deterministic` are the current fn's contract flags. `ret_is_borrow` = the current
 // fn returns by borrow (so a returned borrow is allowed).
-pub struct Esc { scn: List(i32), scst: List(i32), rgn: List(i32), rgst: List(i32), frozen: List(i32), rdepth: List(i32), no_alloc: bool, deterministic: bool, ret_is_borrow: bool, self_borrow: i32, alloc: Allocator, unres: List(i32), pub dsp: List(i32), pub dmsg: String }
+pub struct Esc { scn: List(i32), scst: List(i32), rgn: List(i32), rgst: List(i32), frozen: List(i32), rdepth: List(i32), no_alloc: bool, deterministic: bool, ret_is_borrow: bool, self_borrow: i32, alloc: Allocator, unres: List(i32), pub dsp: List(i32), pub dmsg: String, ta: List(i32), tast: List(i32) }
 
 // ---- scope helpers (flat arenas, mirroring typeck's) ----
 
 fn e_push(mut e: Esc) {
     list.push(i32, e.scst, (list.len(i32, e.scn) / 3) as i32)
     list.push(i32, e.rgst, (list.len(i32, e.rgn) / 2) as i32)
+    list.push(i32, e.tast, (list.len(i32, e.ta) / 4) as i32)
 }
 fn e_pop(mut e: Esc) {
     let d: usize = list.len(i32, e.scst)
@@ -48,12 +49,52 @@ fn e_pop(mut e: Esc) {
     let mr: i32 = list.get(i32, e.rgst, dr - 1)
     list.truncate(i32, e.rgn, (mr * 2) as usize)
     list.truncate(i32, e.rgst, dr - 1)
+    let dt: usize = list.len(i32, e.tast)
+    let mt: i32 = list.get(i32, e.tast, dt - 1)
+    list.truncate(i32, e.ta, (mt * 4) as usize)
+    list.truncate(i32, e.tast, dt - 1)
 }
-// Bind `src[ns..ne]` with borrow-ness `isb` (1/0) in the innermost scope.
+// Bind `src[ns..ne]` with borrow-ness `isb` (1/0) in the innermost scope. Every bind
+// also pushes an alias-taint TOMBSTONE (depth -1): a rebind is a fresh value unless
+// the `let` arm re-taints it right after (the lookup takes the LAST matching entry).
 fn e_bind(mut e: Esc, ns: i32, ne: i32, isb: i32) {
     list.push(i32, e.scn, ns)
     list.push(i32, e.scn, ne)
     list.push(i32, e.scn, isb)
+    list.push(i32, e.ta, ns)
+    list.push(i32, e.ta, ne)
+    list.push(i32, e.ta, (list.len(i32, e.tast) as i32) - 1)
+    list.push(i32, e.ta, 0 - 1)
+}
+// Record binding `src[ns..ne]` (in the CURRENT scope) as an alias reaching depth `d` —
+// item 5's residue (a): `var alias = h` inherits `h`'s effective depth, transitively.
+fn e_taint_alias(mut e: Esc, ns: i32, ne: i32, d: i32) {
+    list.push(i32, e.ta, ns)
+    list.push(i32, e.ta, ne)
+    list.push(i32, e.ta, (list.len(i32, e.tast) as i32) - 1)
+    list.push(i32, e.ta, d)
+}
+// The depth `src[ns..ne]`'s storage actually REACHES (mirrors `effective_depth_of`):
+// an alias binding answers its inherited depth; every other name its own scope index.
+// The taint entry must belong to the SAME scope the name resolves in — a deeper
+// shadow is a fresh binding, not the alias.
+fn e_alias_depth_of(read e: Esc, read src: str, ns: usize, ne: usize) -> i32 {
+    let i: i32 = e_scope_depth_of(e, src, ns, ne)
+    if i < 0 { return i }
+    var k: i32 = (list.len(i32, e.ta) as i32) - 4
+    for k >= 0 {
+        if list.get(i32, e.ta, (k + 2) as usize) == i {
+            let tns: i32 = list.get(i32, e.ta, k as usize)
+            let tne: i32 = list.get(i32, e.ta, (k + 1) as usize)
+            if str_eq(src[ns .. ne], src[tns as usize .. tne as usize]) {
+                let d: i32 = list.get(i32, e.ta, (k + 3) as usize)
+                if d < 0 { return i }              // tombstone: an ordinary binding
+                return d
+            }
+        }
+        k = k - 4
+    }
+    return i
 }
 // Innermost-first lookup: 1 = borrow, 0 = owned, -1 = not found.
 fn e_lookup(read e: Esc, read src: str, ns: usize, ne: usize) -> i32 {
@@ -864,12 +905,30 @@ fn check_block(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read s
         let is_last: bool = (i + 1) == d.y
         if s.kind == 0 {                           // let / var
             var isb: i32 = 0
+            var tdep: i32 = 0 - 1                  // alias taint (item 5 residue (a))
             if s.a >= 0 {
                 walk_expr(e, p, c, src, s.a, false)
                 if is_region_value(e, p, src, s.a) { e_bind_region(e, s.x, s.y) }
+                // A pure place-chain initializer makes this binding an ALIAS of its
+                // root's storage: inherit the root's effective depth (transitive),
+                // computed BEFORE the bind so `var h = h` self-shadowing taints
+                // correctly. Only a strictly shallower reach is worth recording.
+                var kb: String = string_new()
+                if sa_place_key(p, src, s.a, kb) {
+                    let rp0: i32 = root_place(e, p, c, src, s.a)
+                    let rd0: parser.ExprData = list.get(parser.ExprData, p.ex, rp0 as usize)
+                    if rd0.kind == 2 {
+                        let d0: i32 = e_alias_depth_of(e, src, rd0.start, rd0.end)
+                        if d0 >= 0 {
+                            if d0 < (list.len(i32, e.scst) as i32) - 1 { tdep = d0 }
+                        }
+                    }
+                }
+                string_free(kb)
                 if is_borrow_place(e, p, c, src, s.a) { isb = 1 }
             }
             e_bind(e, s.x, s.y, isb)
+            if tdep >= 0 { e_taint_alias(e, s.x, s.y, tdep) }
         } else if s.kind == 1 {                    // return
             if s.a >= 0 { walk_expr(e, p, c, src, s.a, true) }
         } else {                                   // expr statement: tail iff last && tail
@@ -963,17 +1022,25 @@ fn walk_expr(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src
                     // ROOT binding was declared outside the current `region` block reaches
                     // storage that outlives the arena -- the demonstrated use-after-free that
                     // compiled clean (mosaic item 5's motivating hole). Mirrors the reference's
-                    // Field/Index/Deref arm: root via root_place, same depth compare.
+                    // Field/Index/Deref arm: root via root_place, EFFECTIVE depth compare --
+                    // an alias binding (`var alias = h` inside the region, item 5 residue (a))
+                    // answers its inherited depth, so the dodge is seen through.
                     if tgt.kind == 5 or tgt.kind == 6 or tgt.kind == 7 {
                         let rp2: i32 = root_place(e, p, c, src, d.a)
                         let rd2: parser.ExprData = list.get(parser.ExprData, p.ex, rp2 as usize)
                         if rd2.kind == 2 {
-                            let dep2: i32 = e_scope_depth_of(e, src, rd2.start, rd2.end)
+                            let raw2: i32 = e_scope_depth_of(e, src, rd2.start, rd2.end)
+                            let dep2: i32 = e_alias_depth_of(e, src, rd2.start, rd2.end)
                             if dep2 >= 0 and dep2 < rdep {
                                 var sb2: String = string_new()
                                 string_push(sb2, "cannot store region-allocated value through `")
                                 string_push(sb2, src[rd2.start .. rd2.end])
-                                string_push(sb2, "`: it is declared outside the `region` block, so this storage outlives the arena (copy the value into an owned `String`, or allocate it in the outer region)")
+                                if raw2 >= rdep {
+                                    // Declared inside; REACHES outside -- the alias.
+                                    string_push(sb2, "`: it aliases storage declared outside the `region` block, so this store outlives the arena (copy the value into an owned `String`, or allocate it in the outer region)")
+                                } else {
+                                    string_push(sb2, "`: it is declared outside the `region` block, so this storage outlives the arena (copy the value into an owned `String`, or allocate it in the outer region)")
+                                }
                                 ediag(e, d.start, d.end, string_view(sb2))
                                 string_free(sb2)
                             }
@@ -1326,7 +1393,7 @@ fn check_items(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read s
 // its buffered diagnostics (`dsp` span pairs + `dmsg` newline-separated messages, walk order).
 // The library entry the self-hosted driver imports; `escape_cli.jtr` dumps it for the P4 golden.
 pub fn check_program(read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator) -> Esc {
-    var e: Esc = Esc{ scn: list.make(i32, a), scst: list.make(i32, a), rgn: list.make(i32, a), rgst: list.make(i32, a), frozen: list.make(i32, a), rdepth: list.make(i32, a), no_alloc: false, deterministic: false, ret_is_borrow: false, self_borrow: 0, alloc: a, unres: list.make(i32, a), dsp: list.make(i32, a), dmsg: string_new() }
+    var e: Esc = Esc{ scn: list.make(i32, a), scst: list.make(i32, a), rgn: list.make(i32, a), rgst: list.make(i32, a), frozen: list.make(i32, a), rdepth: list.make(i32, a), no_alloc: false, deterministic: false, ret_is_borrow: false, self_borrow: 0, alloc: a, unres: list.make(i32, a), dsp: list.make(i32, a), dmsg: string_new(), ta: list.make(i32, a), tast: list.make(i32, a) }
     check_items(e, p, c, src)
     finalize_unresolved(e, p, c, src)
     unsafe_boundary(e, p, c, a)

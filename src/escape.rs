@@ -296,6 +296,13 @@ struct FnCtx {
     /// `region_concat`). Such a value is owned by its arena and may not escape — the
     /// region-safety proof (design §4.4).
     region: Vec<HashSet<String>>,
+    /// Item 5's residue (a), closed lexically: a binding whose initializer is a
+    /// pure PLACE CHAIN inherits its root's effective depth (`var alias = h`
+    /// inside a region still reaches `h`'s outer storage), transitively. Keyed
+    /// per scope beside `scopes`; consulted only by the store-THROUGH-chain
+    /// region rule — a bare-Name assign overwrites the alias itself, which is
+    /// separate storage, so raw depths stay right for it.
+    aliased: Vec<HashMap<String, usize>>,
     ret_is_borrow: bool,
 }
 
@@ -303,13 +310,17 @@ impl FnCtx {
     fn push(&mut self) {
         self.scopes.push(HashMap::new());
         self.region.push(HashSet::new());
+        self.aliased.push(HashMap::new());
     }
     fn pop(&mut self) {
         self.scopes.pop();
         self.region.pop();
+        self.aliased.pop();
     }
     fn bind(&mut self, name: &str, is_borrow: bool) {
         self.scopes.last_mut().unwrap().insert(name.to_string(), is_borrow);
+        // A rebind is a fresh value unless the Let arm re-taints it right after.
+        self.aliased.last_mut().unwrap().remove(name);
     }
     fn bind_region(&mut self, name: &str) {
         self.region.last_mut().unwrap().insert(name.to_string());
@@ -321,6 +332,13 @@ impl FnCtx {
     /// whether an assignment target lives *outside* a region block.
     fn scope_depth_of(&self, name: &str) -> Option<usize> {
         self.scopes.iter().enumerate().rev().find(|(_, s)| s.contains_key(name)).map(|(i, _)| i)
+    }
+    /// The depth `name`'s storage actually REACHES: an alias binding answers its
+    /// initializer root's inherited depth; every other name answers its own
+    /// scope index.
+    fn effective_depth_of(&self, name: &str) -> Option<usize> {
+        let i = self.scope_depth_of(name)?;
+        Some(self.aliased[i].get(name).copied().unwrap_or(i))
     }
     /// Innermost binding wins (handles shadowing).
     fn lookup(&self, name: &str) -> Option<bool> {
@@ -383,7 +401,8 @@ impl<'a> Checker<'a> {
 
     fn check_fn(&mut self, f: &FnDecl) {
         let ret_is_borrow = matches!(f.ret_conv, Conv::Read | Conv::Mut | Conv::Out);
-        let mut ctx = FnCtx { scopes: Vec::new(), region: Vec::new(), ret_is_borrow };
+        let mut ctx =
+            FnCtx { scopes: Vec::new(), region: Vec::new(), aliased: Vec::new(), ret_is_borrow };
         ctx.push();
         for p in &f.params {
             // MVS (design §4.3): the default convention *is* `read` (an immutable
@@ -412,6 +431,7 @@ impl<'a> Checker<'a> {
             let is_last = i + 1 == n;
             match stmt {
                 Stmt::Let { name, init, .. } => {
+                    let mut alias_depth = None;
                     let is_borrow = if let Some(e) = init {
                         self.walk_expr(ctx, *e, false);
                         // A binding initialized from a region-allocated value is
@@ -419,11 +439,25 @@ impl<'a> Checker<'a> {
                         if self.is_region_value(ctx, *e) {
                             ctx.bind_region(&name.name);
                         }
+                        // Item 5's residue (a): a pure place-chain initializer makes
+                        // this binding an ALIAS of its root's storage — inherit the
+                        // root's effective depth (transitive), computed BEFORE the
+                        // bind so `var h = h` self-shadowing taints correctly. Only
+                        // a strictly shallower reach is worth recording.
+                        if self.place_key(*e).is_some() {
+                            let root = self.root_name(ctx, *e);
+                            alias_depth = ctx
+                                .effective_depth_of(&root)
+                                .filter(|&d| d + 1 < ctx.scopes.len());
+                        }
                         self.is_borrow_place(ctx, *e)
                     } else {
                         false
                     };
                     ctx.bind(&name.name, is_borrow);
+                    if let Some(d) = alias_depth {
+                        ctx.aliased.last_mut().unwrap().insert(name.name.clone(), d);
+                    }
                 }
                 Stmt::Return { value, .. } => {
                     if let Some(v) = value {
@@ -580,22 +614,39 @@ impl<'a> Checker<'a> {
                             // as the bare-binding case, one deref deeper. This was a
                             // demonstrated use-after-free that compiled clean (mosaic item 5's
                             // motivating hole, closed lexically — no brands needed for the
-                            // root-outside shape). Honest limits, recorded in
-                            // `docs/safety-mosaic-next.md`: a root ALIASED inside the region
-                            // to outer storage, or a store performed by a callee, still gets
-                            // through — that residue is what a type-level mechanism would buy.
+                            // root-outside shape). Residue (a) — a root ALIASED inside the
+                            // region to outer storage (`var alias = h`, store through
+                            // `alias`) — is closed by the lexical alias taint: the root
+                            // answers its EFFECTIVE depth, inherited from its initializer's
+                            // root at the `let`. The remaining honest limit is a store
+                            // performed by a *callee* the checker doesn't look into —
+                            // signatures, item 2 territory (`docs/safety-mosaic-next.md`).
                             ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Deref { .. } => {
                                 let root = self.root_name(ctx, *target);
-                                if let Some(d) = ctx.scope_depth_of(&root) {
+                                let raw = ctx.scope_depth_of(&root);
+                                if let Some(d) = ctx.effective_depth_of(&root) {
                                     if d < region_depth {
-                                        self.error(
-                                            span,
-                                            format!(
-                                                "cannot store region-allocated value through `{root}`: it is declared \
-                                                 outside the `region` block, so this storage outlives the arena \
-                                                 (copy the value into an owned `String`, or allocate it in the outer region)"
-                                            ),
-                                        );
+                                        if raw.is_some_and(|r| r >= region_depth) {
+                                            // Declared inside; REACHES outside — the alias.
+                                            self.error(
+                                                span,
+                                                format!(
+                                                    "cannot store region-allocated value through `{root}`: it aliases \
+                                                     storage declared outside the `region` block, so this store outlives \
+                                                     the arena (copy the value into an owned `String`, or allocate it in \
+                                                     the outer region)"
+                                                ),
+                                            );
+                                        } else {
+                                            self.error(
+                                                span,
+                                                format!(
+                                                    "cannot store region-allocated value through `{root}`: it is declared \
+                                                     outside the `region` block, so this storage outlives the arena \
+                                                     (copy the value into an owned `String`, or allocate it in the outer region)"
+                                                ),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -2162,6 +2213,47 @@ mod tests {
             "fn f() -> i32 { var n: i32 = 0 region r { let g: str = region_concat(r, \"a\", \"b\") n = g.len as i32 } return n }",
         );
         assert!(d.is_empty(), "in-scope use must stay clean: {:?}", d);
+    }
+
+    /// Item 5 residue (a), closed: `var alias = h` INSIDE the inner region gives
+    /// the chain an inner-declared root that still REACHES `h`'s outer storage —
+    /// the recorded dodge around the route-3 depth compare. The alias taint makes
+    /// the root answer its inherited depth, so the store is refused with a message
+    /// naming the aliasing (not a false "declared outside").
+    #[test]
+    fn an_aliased_root_cannot_dodge_the_store_through_outer_rule() {
+        let src = "struct Holder { p: &[r]str } \
+                   fn f() -> i32 { \
+                       region outer { \
+                           var h: &[outer]Holder = region_alloc(outer, Holder, Holder { p: region_alloc(outer, str, \"ok\") }) \
+                           region inner { \
+                               var alias = h \
+                               alias.*.p = region_alloc(inner, str, \"gone\") \
+                           } \
+                       } \
+                       return 0 }";
+        let d = escapes(src);
+        assert!(
+            d.iter().any(|x| x.message.contains("aliases storage declared outside")),
+            "the aliased root is seen through: {d:?}"
+        );
+    }
+
+    /// The taint must not over-reach: an alias taken in the SAME region as its
+    /// root stores region values through it freely (equal depth), and rebinding
+    /// the name to a fresh value clears the inherited reach.
+    #[test]
+    fn a_same_region_alias_stays_legal() {
+        let src = "struct Holder { p: &[r]str } \
+                   fn f() -> i32 { \
+                       region r { \
+                           var h: &[r]Holder = region_alloc(r, Holder, Holder { p: region_alloc(r, str, \"ok\") }) \
+                           var alias = h \
+                           alias.*.p = region_alloc(r, str, \"still fine\") \
+                       } \
+                       return 0 }";
+        let d = escapes(src);
+        assert!(d.is_empty(), "a same-region alias is not an escape: {d:?}");
     }
 
     #[test]

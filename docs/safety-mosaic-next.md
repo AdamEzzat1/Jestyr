@@ -412,10 +412,20 @@ construction*, which was this item's design constraint.
 **What brands would still buy — the honest residue:** (a) a root ALIASED inside
 the region to outer storage (`var alias = h` inside `inner`, then store through
 `alias`); (b) a store performed by a *callee* the checker doesn't look into.
-Both are now written down as the actual value proposition, replacing the
-original hypothesis. Brands remain design-only: they still want to appear in
-signatures (the lifetime test), and the residue is narrow enough that the next
-step, if any, is taint-tracking the alias case lexically — not a type system.
+
+**Residue (a) is CLOSED (2026-08-12), by exactly the predicted taint** — both
+toolchains: a `let`/`var` whose initializer is a pure place chain inherits its
+root's *effective* depth (transitive, `var b = a` chains; computed before the
+bind so `var h = h` self-shadowing taints; any rebind clears it), and the
+store-through-chain rule consults effective depth, refusing with an
+aliasing-shaped message ("it **aliases** storage declared outside…" — not the
+false "is declared outside"). Bare-Name assigns keep RAW depths on purpose: an
+alias is separate storage, and overwriting it touches nothing outer. Pinned by
+unit tests both ways (the dodge refused; a same-region alias legal) and the
+differential probe `jestyr_alias_taint_matches_reference` (the corpus is blind
+— route 3's example uses its root directly). What brands would still buy is
+now ONLY residue (b), the through-callee store — signatures, item 2 territory;
+the lattice warning stands.
 
 ### 6. Safe mutable graph cells — the worked example EXISTS; design from its data
 

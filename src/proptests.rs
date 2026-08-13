@@ -9176,6 +9176,50 @@ fn g(p: *mut i32) -> i32 {
         }
     }
 
+    /// **The alias taint, differentially (item 5 residue (a))** — the corpus has no
+    /// aliased-root store (route 3's pinned example uses the root directly), so the
+    /// probes carry the rule: `var alias = h` inside the inner region then a store
+    /// through `alias` FIRES with the aliasing-shaped message on both toolchains,
+    /// and the same-region alias stays LEGAL on both.
+    #[test]
+    fn jestyr_alias_taint_matches_reference() {
+        let exe = build_exe("examples/std/escape_cli.jtr");
+        let firing = "struct Holder { p: &[r]str } \
+             fn f() -> i32 { \
+                 region outer { \
+                     var h: &[outer]Holder = region_alloc(outer, Holder, Holder { p: region_alloc(outer, str, \"ok\") }) \
+                     region inner { \
+                         var alias = h \
+                         alias.*.p = region_alloc(inner, str, \"gone\") \
+                     } \
+                 } \
+                 return 0 }";
+        let want = rust_escape_dump(firing);
+        assert!(
+            want.iter().any(|l| l.contains("aliases storage declared outside")),
+            "the probe no longer fires — replace it with a shape that does: {want:?}"
+        );
+        let f = std::env::temp_dir().join("jestyr_alias_taint_0.jtr");
+        std::fs::write(&f, firing).unwrap();
+        let got = jestyr_escape_dump(&exe, f.to_str().unwrap());
+        assert_eq!(got, want, "the toolchains disagree on the alias taint");
+
+        let legal = "struct Holder { p: &[r]str } \
+             fn f() -> i32 { \
+                 region r { \
+                     var h: &[r]Holder = region_alloc(r, Holder, Holder { p: region_alloc(r, str, \"ok\") }) \
+                     var alias = h \
+                     alias.*.p = region_alloc(r, str, \"still fine\") \
+                 } \
+                 return 0 }";
+        let want2 = rust_escape_dump(legal);
+        assert!(want2.is_empty(), "the same-region alias must stay legal: {want2:?}");
+        let f2 = std::env::temp_dir().join("jestyr_alias_taint_ok.jtr");
+        std::fs::write(&f2, legal).unwrap();
+        let got2 = jestyr_escape_dump(&exe, f2.to_str().unwrap());
+        assert_eq!(got2, want2, "the toolchains disagree on a legal same-region alias");
+    }
+
     /// The Rust *reference* C for `src`, as lines. Uses the single-file `parse` + `typeck::check`
     /// path (not `module::load`), so `TypeInfo::debug` is empty and no `#line` directives are
     /// emitted — the target is the pure C text. `str::lines()` drops each line's trailing `\r`,
