@@ -124,16 +124,50 @@ coverage; adding one unilaterally would desync discovery order).
 - **Item 9 (formal mini-model)**: worth writing alongside items 2/6; the
   escape-guarantee doc's four-routes argument is the seed.
 
-### E. Standing small stuff (recorded, unranked)
+### E. Standing small stuff (scoped 2026-08-12; two remain gated, two scoped, one sized)
 
-- CST Stage 3 (green/red tree): only if a formatter demands it.
-- `par for` fusion widening: needs capture analysis; fused+vectorized sites
-  unexplored.
-- Executable `build.jestyr`: needs CTFE surface (workstream K's last leftover).
-- `mut` variant of `with alive`: needs an exclusivity story first.
-- Enum `@copy` opt-in: `dlist_genref.jtr` datum 2 — link surgery needs
-  `take`-passed genref params solely because enums are never `Copy`; a
-  niche-enum-of-Copy could be `Copy`. Small typeck change + escape sweep.
+- **CST Stage 3 (green/red tree): GATED, unchanged** — its own recorded
+  condition is "only if a formatter demands it", and no formatter exists.
+  Building it now would pay the mirror tax for a consumer that may never come.
+- **`mut` variant of `with alive`: GATED, unchanged** — "needs an exclusivity
+  story first" is item 8's design question (the same one that parked
+  `mut`+`read` overlap in the slice-exclusivity rule). Do item 8's design
+  first or not at all.
+- **`par for` fusion widening — SCOPED, defer until measured.** What exists:
+  `par_map`/`par_scan`/`par_reduce` each materialize their intermediate
+  (separate passes, separate buffers); `@simd` vectorizes within a pass.
+  "Widening" = fusing an adjacent map into the consumer's worker loop to skip
+  the intermediate buffer. The blocker is real: inlining a map lambda into a
+  worker requires knowing its captures are read-only and thread-safe —
+  capture analysis the checker does not do (closures are checked, not
+  summarized). It also interacts with `@span` (a fused pass changes the cost
+  shape) and `@deterministic` (fusion must not reorder a non-associative
+  step). **Prerequisite before any of that: a benchmark showing the
+  intermediate buffer costs something** — the interner lesson (measured dead)
+  says build the measurement first, and none exists.
+- **Executable `build.jestyr` — SCOPED; CTFE no longer blocks it.** The §E
+  note predated workstream G: the comptime interpreter is now COMPLETE on
+  both sides (tiers 0–7), so "needs CTFE surface" is stale. What it actually
+  needs is the design + driver wiring: (1) what a `build.jestyr` evaluates TO
+  (the natural answer: the manifest `Modules::render_manifest` already
+  defines — the content-hash DAG as a lockfile); (2) `jestyrc build` /
+  `jc build` evaluating the file at comptime and verifying the result against
+  the loaded closure (the `verify_manifest` half exists); (3) the two-sided
+  tax: both interpreters must evaluate it identically — pinned by a golden
+  over the produced manifest, which `attest` already knows how to compare.
+  Multi-session; start with the design note deciding (1).
+- **Enum `@copy` opt-in — SIZED, the next code increment here.** The §E
+  one-liner undersold it: `EnumDecl` has NO attrs field, so this is parser
+  (attrs attached to enum items, BOTH toolchains — the port's `ItemData`
+  attr slice `(u,v)` is Fn/Const/Struct-only today), P2 item-dump arms both
+  sides, `attrs.rs` (`copy` gains `Target::Enum`), typeck registration +
+  VALIDATION (all payloads must be Copy, else `@copy` would double-drop —
+  the validation is load-bearing, unlike the trusted struct form), and the
+  port typeck/escape copy-ness mirror. Zero emitted-C change expected
+  (all-Copy-payload enums have no drop glue already) — but the P3 golden
+  trap applies, and a differential probe is owed (the corpus is blind until
+  `dlist_genref.jtr` adopts it, which is the payoff: `take`-passed genref
+  params for link surgery become plain `read`).
 
 ### The traps that bit this session (verbatim from memory, keep them)
 
