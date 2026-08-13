@@ -1,0 +1,77 @@
+// std/time_demo.jtr — measuring elapsed time in-language.
+//
+// Until now Jestyr code could not ask the time at all: `@bench` timed a whole
+// function from generated C, and everything else (the cpp_compare suite) timed
+// binaries from the OUTSIDE. This is the in-language version.
+//
+// The demo asserts PROPERTIES, never a duration, because a printed millisecond
+// count would differ on every machine and could not be pinned by the c-oracle
+// test. Two lessons are baked into how it does that, both learned the hard way:
+//
+//   1. Do not time work the optimizer can delete. The first version of this
+//      file summed 0..1,000,000 and asserted the clock had advanced; gcc -O2
+//      recognized the Gauss sum, replaced the loop with a closed form, and the
+//      elapsed time was legitimately zero. The loop below carries a modulo
+//      dependency chain so each iteration needs the previous one.
+//   2. Do not assert that a clock advanced over a FIXED amount of work. Clock
+//      granularity varies by platform (coarse on Windows), so "fast machine +
+//      coarse clock" can read zero without anything being wrong. Instead spin
+//      until the clock is observed to change, bounded so a genuinely stuck
+//      clock reports failure rather than hanging.
+//
+// Run:  cargo run --release -- run examples/std/time_demo.jtr
+//   →   1 / 1 / 1 / 1 / 496500
+//       (496500 is sum(1..1e6) = 500000500000 folded mod 1000000007)
+
+import "time"
+
+const N: i64 = 1000000
+const SPIN_CAP: i64 = 200000000
+
+fn flag(read b: bool) {
+    if b {
+        print_str("1")
+    } else {
+        print_str("0")
+    }
+}
+
+// Real work with a loop-carried dependency, so -O2 cannot close-form it away.
+// The result is printed, so it cannot be dead-code eliminated either.
+fn burn(n: i64) -> i64 {
+    var acc: i64 = 0
+    var i: i64 = 1
+    for i <= n {
+        acc = (acc + i) % 1000000007
+        i = i + 1
+    }
+    return acc
+}
+
+fn main() -> i32 {
+    // (1) The clock is observed to advance. Bounded: any clock with finite
+    // granularity ticks long before the cap, and a stuck one prints 0.
+    let t0: i64 = time.now_nanos()
+    var spins: i64 = 0
+    for spins < SPIN_CAP {
+        if time.since_nanos(t0) > 0 { break }
+        spins = spins + 1
+    }
+    flag(time.since_nanos(t0) > 0)
+
+    // (2) Elapsed is never negative — the monotonicity that CLOCK_MONOTONIC
+    // buys us and a wall clock would not.
+    let t1: i64 = time.now_nanos()
+    let sum: i64 = burn(N)
+    let ns: i64 = time.since_nanos(t1)
+    flag(ns >= 0)
+
+    // (3) A later reading never precedes an earlier one.
+    flag(time.since_nanos(t1) >= ns)
+
+    // (4) The nanosecond→millisecond conversion agrees with the raw division.
+    flag(time.nanos_to_millis(ns) == ns / 1000000)
+
+    print_int(sum)                 // 496500, deterministic
+    return 0
+}

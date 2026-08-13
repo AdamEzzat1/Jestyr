@@ -7,6 +7,25 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`mono_nanos` intrinsic and `std/time` — Jestyr code can measure elapsed
+  time.** Until now it could not ask the clock at all: `@bench` timed a whole
+  function from generated C, and every other measurement in the repo timed
+  binaries from the outside. `time.now_nanos()` reads `CLOCK_MONOTONIC`, with
+  `since_nanos`/`since_micros`/`since_millis` on top.
+
+  Monotonic on purpose, and monotonic only — no calendar, no time-of-day. The
+  origin is unspecified, so only DIFFERENCES are meaningful, which is the right
+  primitive for durations and immune to the wall clock being adjusted
+  mid-measurement. A calendar tier needs its own intrinsic.
+
+  Gated on use (the helper and `<time.h>` are emitted only for programs that
+  call it), mirrored in the port, seed refreshed in the same commit, rung 3
+  green. `examples/std/time_demo.jtr` records two lessons its own failures
+  taught: do not time work the optimizer can delete (gcc -O2 close-formed the
+  first version's Gauss-sum loop, making zero elapsed the honest answer), and do
+  not assert a clock advanced over a *fixed* amount of work — spin until it is
+  observed to tick instead, since granularity varies by platform.
+
 - **`env_var` intrinsic and an expanded `std/env`.** `env.get(name)` reads an
   environment variable as a `str` **view** into OS-owned storage — no
   allocation, nothing to free, the same contract `argv` has — with `has` for the

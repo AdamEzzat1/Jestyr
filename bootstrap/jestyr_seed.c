@@ -1074,6 +1074,7 @@ bool jestyr_uses_try_read(Jestyr_Parser j_p, JestyrStr j_src);
 bool jestyr_uses_run_command(Jestyr_Parser j_p, JestyrStr j_src);
 bool jestyr_uses_eprint(Jestyr_Parser j_p, JestyrStr j_src);
 bool jestyr_uses_env_var(Jestyr_Parser j_p, JestyrStr j_src);
+bool jestyr_uses_mono_nanos(Jestyr_Parser j_p, JestyrStr j_src);
 bool jestyr_uses_arena(Jestyr_Parser j_p, JestyrStr j_src);
 void jestyr_emit_prelude(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrStr j_src, Jestyr_Cg j_g);
 JestyrStr jestyr_c_prim(JestyrStr j_name);
@@ -13430,6 +13431,10 @@ int32_t jestyr_intrinsic_ret(Jestyr_Checker* restrict j_c, JestyrStr j_t)
     {
         return jestyr_t_str();
     }
+    if (jestyr_rt_str_eq(j_t, JSTR("mono_nanos")))
+    {
+        return jestyr_t_i64();
+    }
     if ((((jestyr_rt_str_eq(j_t, JSTR("atomic_load")) || jestyr_rt_str_eq(j_t, JSTR("atomic_add"))) || jestyr_rt_str_eq(j_t, JSTR("atomic_sub"))) || jestyr_rt_str_eq(j_t, JSTR("atomic_xchg"))))
     {
         return jestyr_t_i64();
@@ -18171,6 +18176,28 @@ bool jestyr_uses_env_var(Jestyr_Parser j_p, JestyrStr j_src)
     return false;
 }
 
+bool jestyr_uses_mono_nanos(Jestyr_Parser j_p, JestyrStr j_src)
+{
+    size_t j_i = 0;
+    while ((j_i < jestyr_len__ExprData(j_p.j_ex)))
+    {
+        Jestyr_ExprData j_e = jestyr_get__list__ExprData(j_p.j_ex, j_i);
+        if ((j_e.j_kind == 10))
+        {
+            Jestyr_ExprData j_callee = jestyr_get__list__ExprData(j_p.j_ex, (size_t)(j_e.j_a));
+            if ((j_callee.j_kind == 2))
+            {
+                if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, j_callee.j_start, j_callee.j_end), JSTR("mono_nanos")))
+                {
+                    return true;
+                }
+            }
+        }
+        j_i = (j_i + 1);
+    }
+    return false;
+}
+
 bool jestyr_uses_arena(Jestyr_Parser j_p, JestyrStr j_src)
 {
     size_t j_i = 0;
@@ -18221,7 +18248,7 @@ void jestyr_emit_prelude(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrS
     {
         jestyr_rt_str_push(&(*j_sb), JSTR("#include <pthread.h>\n"));
     }
-    if (j_g.j_tmode)
+    if ((j_g.j_tmode || jestyr_uses_mono_nanos(j_p, j_src)))
     {
         jestyr_rt_str_push(&(*j_sb), JSTR("#include <time.h>\n"));
     }
@@ -18314,6 +18341,11 @@ void jestyr_emit_prelude(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrS
     {
         jestyr_rt_str_push(&(*j_sb), JSTR("/* getenv() as a str view; empty when unset. Storage is the environment's. */\n"));
         jestyr_rt_str_push(&(*j_sb), JSTR("static JestyrStr jestyr_rt_env_var(JestyrStr name) { char* cn = jestyr_rt_cpath(name); const char* v = getenv(cn); free(cn); if (!v) return (JestyrStr){ \"\", 0 }; return (JestyrStr){ v, strlen(v) }; }\n"));
+    }
+    if (jestyr_uses_mono_nanos(j_p, j_src))
+    {
+        jestyr_rt_str_push(&(*j_sb), JSTR("/* Monotonic nanoseconds. Only DIFFERENCES are meaningful (origin unspecified). */\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("static int64_t jestyr_rt_mono_nanos(void) { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts); return (int64_t)_ts.tv_sec * 1000000000 + (int64_t)_ts.tv_nsec; }\n"));
     }
     jestyr_rt_str_push(&(*j_sb), JSTR("\n"));
     jestyr_rt_str_push(&(*j_sb), JSTR("/* Command-line arguments (self-hosting plumbing): argv is captured in main()\n"));
@@ -21149,6 +21181,10 @@ JestyrStr jestyr_intrinsic_helper(JestyrStr j_nm)
     if (jestyr_rt_str_eq(j_nm, JSTR("env_var")))
     {
         return JSTR("jestyr_rt_env_var");
+    }
+    if (jestyr_rt_str_eq(j_nm, JSTR("mono_nanos")))
+    {
+        return JSTR("jestyr_rt_mono_nanos");
     }
     if (jestyr_rt_str_eq(j_nm, JSTR("write_file")))
     {
@@ -32977,7 +33013,7 @@ bool jestyr_is_global_cname(Jestyr_Parser j_p, JestyrStr j_src, size_t j_ns, siz
     jestyr_rt_str_push(&j_probe, JSTR("|"));
     jestyr_rt_str_push(&j_probe, j_nm);
     jestyr_rt_str_push(&j_probe, JSTR("|"));
-    bool j_hit = jestyr_rt_contains(JSTR("|print_int|print_float|print_str|print_bool|alloc|alloc_i32|realloc|realloc_i32|free_ptr|size_of|slice|align_of|offset_of|count_codepoints|codepoints|from_utf8|is_utf8|substr|str_eq|starts_with|ends_with|contains|find|trim|count_graphemes|graphemes|split|try_from_utf8|eq_fold|os_from_bytes|to_str_lossy|cow_borrow|cow_to_mut|cow_view|cow_is_owned|cow_free|string_new|string_from|string_push|string_view|string_free|builder_new|builder_push|builder_build|builder_free|region_str|region_concat|bytes|gen_new|gen_free|region_alloc|ok|err|is_err|unwrap|arena_open|arena_alloc|arena_close|read_file|try_read_file|write_file|file_exists|remove_file|run_command|eprint_str|env_var|arg_count|arg|"), jestyr_rt_str_view(&j_probe));
+    bool j_hit = jestyr_rt_contains(JSTR("|print_int|print_float|print_str|print_bool|alloc|alloc_i32|realloc|realloc_i32|free_ptr|size_of|slice|align_of|offset_of|count_codepoints|codepoints|from_utf8|is_utf8|substr|str_eq|starts_with|ends_with|contains|find|trim|count_graphemes|graphemes|split|try_from_utf8|eq_fold|os_from_bytes|to_str_lossy|cow_borrow|cow_to_mut|cow_view|cow_is_owned|cow_free|string_new|string_from|string_push|string_view|string_free|builder_new|builder_push|builder_build|builder_free|region_str|region_concat|bytes|gen_new|gen_free|region_alloc|ok|err|is_err|unwrap|arena_open|arena_alloc|arena_close|read_file|try_read_file|write_file|file_exists|remove_file|run_command|eprint_str|env_var|mono_nanos|arg_count|arg|"), jestyr_rt_str_view(&j_probe));
     jestyr_rt_str_free(&j_probe);
     return j_hit;
 }

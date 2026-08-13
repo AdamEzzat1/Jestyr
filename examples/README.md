@@ -187,6 +187,11 @@ The self-hosted compiler and the standard library, all in Jestyr:
   `slice_algos.jtr`. See [docs/stdlib-roadmap.md](../docs/stdlib-roadmap.md)
   for the tiers (`core` / `mem` / `std` / `sys` / `parallel`), what is
   planned next, and what is deliberately staying out.
+  * `time.jtr` measures elapsed time over the `mono_nanos` intrinsic —
+    `now_nanos`, `since_nanos`/`since_micros`/`since_millis`. Monotonic only:
+    no calendar, no time-of-day, because only DIFFERENCES are meaningful.
+    Worked examples (and two hard-won lessons about timing demos) in
+    `time_demo.jtr`.
   * `env.jtr` reads the process environment: `argc`/`argv`/`program` plus
     `get`/`has`/`get_or` over the `env_var` intrinsic. Values are `str` VIEWS
     into OS-owned storage — no allocation, nothing to free. Worked examples in

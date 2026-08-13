@@ -302,6 +302,13 @@ fn emit_program(
                 false
             }
         }),
+        uses_mono_nanos: ast.exprs.iter().any(|e| {
+            if let ExprKind::Call { callee, .. } = &e.kind {
+                matches!(&ast.expr_at(*callee).kind, ExprKind::Name(n) if n.name == "mono_nanos")
+            } else {
+                false
+            }
+        }),
         task_handles: HashMap::new(),
         dyn_spawn_active: false,
         slice_instances: Vec::new(),
@@ -686,6 +693,8 @@ struct Cgen<'a> {
     uses_eprint: bool,
     /// `env_var(name) -> str` is used — gate its runtime helper.
     uses_env_var: bool,
+    /// `mono_nanos() -> i64` is used — gate its runtime helper and `<time.h>`.
+    uses_mono_nanos: bool,
     /// task handles (`let h = spawn …`) live in the current `concurrent` scope,
     /// keyed by binding name — consumed by `await`. Saved/restored across nesting.
     task_handles: HashMap<String, TaskHandle>,
@@ -964,8 +973,8 @@ impl<'a> Cgen<'a> {
         if !self.spawn_sites.is_empty() || !self.par_fusions.is_empty() {
             self.raw("#include <pthread.h>\n");
         }
-        if self.test_mode {
-            self.raw("#include <time.h>\n"); // `@bench` timing via clock()
+        if self.test_mode || self.uses_mono_nanos {
+            self.raw("#include <time.h>\n"); // `@bench` timing via clock(); `mono_nanos`
         }
         self.raw("\n");
         if self.error_traces {
@@ -1085,6 +1094,13 @@ impl<'a> Cgen<'a> {
         if self.uses_env_var {
             self.raw("/* getenv() as a str view; empty when unset. Storage is the environment's. */\n");
             self.raw("static JestyrStr jestyr_rt_env_var(JestyrStr name) { char* cn = jestyr_rt_cpath(name); const char* v = getenv(cn); free(cn); if (!v) return (JestyrStr){ \"\", 0 }; return (JestyrStr){ v, strlen(v) }; }\n");
+        }
+        // A monotonic nanosecond counter. CLOCK_MONOTONIC never jumps with the
+        // wall clock, so a difference is a real elapsed duration; the origin is
+        // unspecified, which is why only differences are meaningful.
+        if self.uses_mono_nanos {
+            self.raw("/* Monotonic nanoseconds. Only DIFFERENCES are meaningful (origin unspecified). */\n");
+            self.raw("static int64_t jestyr_rt_mono_nanos(void) { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts); return (int64_t)_ts.tv_sec * 1000000000 + (int64_t)_ts.tv_nsec; }\n");
         }
         self.raw("\n");
         self.raw("/* Command-line arguments (self-hosting plumbing): argv is captured in main()\n");
@@ -5593,6 +5609,7 @@ impl<'a> Cgen<'a> {
                 }
                 // Command-line args. `arg_count()` is argc; `arg(i)` is a `str` view of
                 // argv[i] (arg(0) = program path, out-of-range = empty).
+                "mono_nanos" => return "jestyr_rt_mono_nanos()".to_string(),
                 "arg_count" => return "jestyr_rt_arg_count()".to_string(),
                 "arg" => {
                     let i = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "0".to_string());
@@ -10122,7 +10139,7 @@ fn is_intrinsic(name: &str) -> bool {
             | "arena_open" | "arena_alloc" | "arena_close"
             | "read_file" | "try_read_file" | "write_file" | "file_exists" | "remove_file"
             | "run_command" | "eprint_str"
-            | "arg_count" | "arg" | "env_var"
+            | "arg_count" | "arg" | "env_var" | "mono_nanos"
     )
 }
 

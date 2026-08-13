@@ -110,7 +110,7 @@ interesting it is.
 | 3 | `process` — a named wrapper over `run_command` + `eprint_str` | std | none | build scripts; matches the `io.jtr` pattern exactly |
 | 4 | `str` — a named module over the string intrinsics | core | none | `substr`/`find`/`trim`/`starts_with` are compiler builtins with no module in front of them, exactly the gap `fs.jtr` describes itself as filling |
 | 5 | ~~`env` expansion (`env_var` intrinsic)~~ ✅ | std | one intrinsic + reseed | configuration, temp dirs |
-| 6 | `time` | std | **new intrinsic** + reseed | benchmarks, timeouts; no clock is exposed to Jestyr code today |
+| 6 | ~~`time` (`mono_nanos` intrinsic)~~ ✅ | std | one intrinsic + reseed | in-language elapsed measurement |
 | 7 | `fs` expansion — bytes, directory listing, temp files | std | **new intrinsics** + reseed; `fs` is a closure module; `readdir` needs real cross-platform C | build tools, anything that walks a tree |
 | 8 | `fmt` — consolidated deterministic formatting | core | **high** | workstream E; touches types/typeck/cgen |
 | 9 | `sys` | sys | blocked | needs `extern "c"` |
@@ -281,10 +281,11 @@ Recorded here because library work is where they actually bite.
 - **`@no_alloc` cannot see through the allocator vtable** (above), so the tier
   boundary between `core` and `mem` is enforced by convention at exactly the
   point where it matters most.
-- **No clock intrinsic.** `@bench` uses C's `clock()` inside generated code;
-  Jestyr code cannot ask the time at all. This is now the cheapest remaining
-  gap — the `env_var` slice established the exact recipe, and a monotonic clock
-  is the same eleven edits.
+- ~~**No clock intrinsic.**~~ **Closed** by `mono_nanos` + `std/time`. What
+  remains unexposed is the *wall* clock: there is still no calendar date or
+  time-of-day, deliberately — `CLOCK_MONOTONIC` is the right primitive for
+  measuring durations and immune to the wall clock being adjusted mid-measure.
+  A calendar tier is a separate question needing its own intrinsic.
 - **Keyword collisions cost API names.** `env.get` is spelled that way because
   `var` is a Jestyr keyword; `out` is reserved too, and a parameter named `out`
   produces a parse cascade rather than a clear message. Worth checking a

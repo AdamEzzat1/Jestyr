@@ -1,0 +1,43 @@
+// std/time.jtr — elapsed time, and only elapsed time.
+//
+// TIER: `std`. Thin named wrappers over the `mono_nanos` intrinsic, in the
+// `io.jtr` / `env.jtr` shape — when `extern "c"` eventually retires the
+// intrinsic, only this module changes.
+//
+// WHAT THIS DELIBERATELY DOES NOT DO. There is no wall clock here: no calendar
+// date, no time-of-day, no formatting. `mono_nanos` reads a MONOTONIC counter
+// whose origin is unspecified, so an absolute reading is meaningless and only a
+// DIFFERENCE is a real duration. That is the honest primitive for the job this
+// module exists for — measuring how long something took — and it is immune to
+// the wall clock being adjusted underneath you mid-measurement. A calendar tier
+// is a separate question and needs its own intrinsic.
+//
+// Nanoseconds are `i64`, which overflows after ~292 years of uptime. Not a
+// practical concern, stated so nobody has to wonder.
+
+// A raw reading of the monotonic counter, in nanoseconds. Only meaningful when
+// subtracted from another reading.
+pub fn now_nanos() -> i64 {
+    return mono_nanos()
+}
+
+// Nanoseconds elapsed since `start` (a previous `now_nanos()`).
+pub fn since_nanos(start: i64) -> i64 {
+    return mono_nanos() - start
+}
+
+// Microseconds elapsed since `start`, truncated.
+pub fn since_micros(start: i64) -> i64 {
+    return since_nanos(start) / 1000
+}
+
+// Milliseconds elapsed since `start`, truncated.
+pub fn since_millis(start: i64) -> i64 {
+    return since_nanos(start) / 1000000
+}
+
+// Whole milliseconds in a nanosecond duration, truncated — for turning a
+// recorded `since_nanos` into a human number without re-reading the clock.
+pub fn nanos_to_millis(ns: i64) -> i64 {
+    return ns / 1000000
+}

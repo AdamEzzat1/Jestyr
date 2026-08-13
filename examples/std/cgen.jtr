@@ -99,6 +99,23 @@ fn uses_env_var(read p: parser.Parser, read src: str) -> bool {
     return false
 }
 
+// Does the program call `mono_nanos`? Gates its runtime helper AND <time.h>
+// (mirrors `uses_mono_nanos`).
+fn uses_mono_nanos(read p: parser.Parser, read src: str) -> bool {
+    var i: usize = 0
+    for i < list.len(parser.ExprData, p.ex) {
+        let e: parser.ExprData = list.get(parser.ExprData, p.ex, i)
+        if e.kind == 10 {
+            let callee: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+            if callee.kind == 2 {
+                if str_eq(src[callee.start .. callee.end], "mono_nanos") { return true }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
 fn uses_arena(read p: parser.Parser, read src: str) -> bool {
     var i: usize = 0
     for i < list.len(parser.ExprData, p.ex) {
@@ -129,7 +146,7 @@ fn emit_prelude(mut sb: String, read p: parser.Parser, read src: str, read g: Cg
     if needs_pthread {                                // -> the pthread runtime
         string_push(sb, "#include <pthread.h>\n")
     }
-    if g.tmode {                                      // `@bench` timing via clock()
+    if g.tmode or uses_mono_nanos(p, src) {           // `@bench` timing via clock(); `mono_nanos`
         string_push(sb, "#include <time.h>\n")
     }
     string_push(sb, "\n")
@@ -223,6 +240,13 @@ fn emit_prelude(mut sb: String, read p: parser.Parser, read src: str, read g: Cg
     if uses_env_var(p, src) {
         string_push(sb, "/* getenv() as a str view; empty when unset. Storage is the environment's. */\n")
         string_push(sb, "static JestyrStr jestyr_rt_env_var(JestyrStr name) { char* cn = jestyr_rt_cpath(name); const char* v = getenv(cn); free(cn); if (!v) return (JestyrStr){ \"\", 0 }; return (JestyrStr){ v, strlen(v) }; }\n")
+    }
+    // A monotonic nanosecond counter. CLOCK_MONOTONIC never jumps with the wall
+    // clock, so a difference is a real elapsed duration; the origin is
+    // unspecified, which is why only differences are meaningful.
+    if uses_mono_nanos(p, src) {
+        string_push(sb, "/* Monotonic nanoseconds. Only DIFFERENCES are meaningful (origin unspecified). */\n")
+        string_push(sb, "static int64_t jestyr_rt_mono_nanos(void) { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts); return (int64_t)_ts.tv_sec * 1000000000 + (int64_t)_ts.tv_nsec; }\n")
     }
     string_push(sb, "\n")
     string_push(sb, "/* Command-line arguments (self-hosting plumbing): argv is captured in main()\n")
@@ -2269,6 +2293,7 @@ fn intrinsic_helper(read nm: str) -> str {
     if str_eq(nm, "run_command") { return "jestyr_rt_run_command" }
     if str_eq(nm, "eprint_str") { return "jestyr_rt_eprint_str" }
     if str_eq(nm, "env_var") { return "jestyr_rt_env_var" }
+    if str_eq(nm, "mono_nanos") { return "jestyr_rt_mono_nanos" }
     if str_eq(nm, "write_file") { return "jestyr_rt_write_file" }
     if str_eq(nm, "file_exists") { return "jestyr_rt_file_exists" }
     if str_eq(nm, "remove_file") { return "jestyr_rt_remove_file" }
@@ -11366,7 +11391,7 @@ fn is_global_cname(read p: parser.Parser, read src: str, ns: usize, ne: usize) -
     string_push(probe, "|")
     string_push(probe, nm)
     string_push(probe, "|")
-    let hit: bool = contains("|print_int|print_float|print_str|print_bool|alloc|alloc_i32|realloc|realloc_i32|free_ptr|size_of|slice|align_of|offset_of|count_codepoints|codepoints|from_utf8|is_utf8|substr|str_eq|starts_with|ends_with|contains|find|trim|count_graphemes|graphemes|split|try_from_utf8|eq_fold|os_from_bytes|to_str_lossy|cow_borrow|cow_to_mut|cow_view|cow_is_owned|cow_free|string_new|string_from|string_push|string_view|string_free|builder_new|builder_push|builder_build|builder_free|region_str|region_concat|bytes|gen_new|gen_free|region_alloc|ok|err|is_err|unwrap|arena_open|arena_alloc|arena_close|read_file|try_read_file|write_file|file_exists|remove_file|run_command|eprint_str|env_var|arg_count|arg|", string_view(probe))
+    let hit: bool = contains("|print_int|print_float|print_str|print_bool|alloc|alloc_i32|realloc|realloc_i32|free_ptr|size_of|slice|align_of|offset_of|count_codepoints|codepoints|from_utf8|is_utf8|substr|str_eq|starts_with|ends_with|contains|find|trim|count_graphemes|graphemes|split|try_from_utf8|eq_fold|os_from_bytes|to_str_lossy|cow_borrow|cow_to_mut|cow_view|cow_is_owned|cow_free|string_new|string_from|string_push|string_view|string_free|builder_new|builder_push|builder_build|builder_free|region_str|region_concat|bytes|gen_new|gen_free|region_alloc|ok|err|is_err|unwrap|arena_open|arena_alloc|arena_close|read_file|try_read_file|write_file|file_exists|remove_file|run_command|eprint_str|env_var|mono_nanos|arg_count|arg|", string_view(probe))
     string_free(probe)
     return hit
 }

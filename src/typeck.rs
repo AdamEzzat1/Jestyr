@@ -4489,6 +4489,9 @@ fn io_intrinsic_ret(name: &str) -> Option<Ty> {
         // block, empty when unset. A view (not a `String`) for the same reason
         // `arg` is one: the storage is OS-owned and outlives the call.
         "env_var" => Ty::Prim("str"),
+        // `mono_nanos() -> i64` — a monotonic counter in nanoseconds. Only
+        // DIFFERENCES are meaningful; the origin is unspecified.
+        "mono_nanos" => Ty::Prim("i64"),
         _ => return None,
     })
 }
