@@ -367,6 +367,12 @@ impl<'a> TypeChecker<'a> {
                     let idx = self.register_type(&e.name, true);
                     self.table.types[idx].type_params =
                         e.type_params.iter().map(|p| p.name.clone()).collect();
+                    // `@copy` opts a PLAIN enum into Copy (the niche-Link-over-genref
+                    // case) — payload copy-ness is VALIDATED in phase 2, once payload
+                    // types are lowered; a generic enum never (its instances are
+                    // `GenEnum`, which stays non-Copy).
+                    self.table.types[idx].is_copy = e.type_params.is_empty()
+                        && e.attrs.iter().any(|a| a.name == "copy");
                     for v in &e.variants {
                         let vkey = self.canon_variant_in(self.cur_mod, &v.name.name);
                         // Variant names resolve by bare name within a module, so a
@@ -445,12 +451,28 @@ impl<'a> TypeChecker<'a> {
                         e.type_params.iter().map(|p| p.name.clone()).collect();
                     let self_idx = self.table.type_index.get(&self.canon_type_cur(&e.name.name)).copied();
                     let mut variants = Vec::new();
+                    let declared_copy =
+                        self_idx.is_some_and(|si| self.table.types[si].is_copy);
                     for v in &e.variants {
                         let mut ftys = Vec::new();
                         for (_, t) in &v.fields {
                             let fty = self.lower_type(&tp, *t);
                             if let Some(si) = self_idx {
                                 self.check_no_value_recursion(si, self.ast.type_at(*t).span, &fty);
+                            }
+                            // The `@copy` contract is checked, not trusted: a copy of a
+                            // droppable payload would drop twice. (Copy-ness of a Named
+                            // payload reads the phase-1 flag, so declaration order does
+                            // not matter.)
+                            if declared_copy && !fty.is_copy(&self.table) {
+                                let shown = fty.display(&self.table);
+                                self.error(
+                                    self.ast.type_at(*t).span,
+                                    format!(
+                                        "`@copy` enum `{}` carries a non-Copy payload `{shown}` in variant `{}` — a copy would double-drop it; only Copy payloads may ride a `@copy` enum",
+                                        e.name.name, v.name.name
+                                    ),
+                                );
                             }
                             ftys.push(fty);
                         }
@@ -5542,6 +5564,27 @@ mod tests {
             d.iter().any(|m| m.message.contains("duplicate variant name `a`")),
             "expected a duplicate-variant error: {:?}",
             d
+        );
+    }
+
+    /// The `@copy` enum contract is CHECKED, not trusted (unlike the struct form):
+    /// a copy of a droppable payload would drop twice, so a non-Copy payload under
+    /// `@copy` is refused at the payload's type. All-Copy payloads pass.
+    #[test]
+    fn a_copy_enum_requires_copy_payloads() {
+        let (_i, d) = analyze(
+            "@copy enum Bad { none, own(s: String) }\nfn main() -> i32 { return 0 }",
+        );
+        assert!(
+            d.iter().any(|m| m.message.contains("non-Copy payload `String`")),
+            "a droppable payload under @copy must be refused: {d:?}"
+        );
+        let (_i2, d2) = analyze(
+            "@copy enum Link { nil, at(n: &i64), idx(i: usize) }\nfn main() -> i32 { return 0 }",
+        );
+        assert!(
+            d2.iter().all(|m| !m.is_error()),
+            "all-Copy payloads (genref, usize) pass: {d2:?}"
         );
     }
 

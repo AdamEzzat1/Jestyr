@@ -156,18 +156,22 @@ coverage; adding one unilaterally would desync discovery order).
   tax: both interpreters must evaluate it identically — pinned by a golden
   over the produced manifest, which `attest` already knows how to compare.
   Multi-session; start with the design note deciding (1).
-- **Enum `@copy` opt-in — SIZED, the next code increment here.** The §E
-  one-liner undersold it: `EnumDecl` has NO attrs field, so this is parser
-  (attrs attached to enum items, BOTH toolchains — the port's `ItemData`
-  attr slice `(u,v)` is Fn/Const/Struct-only today), P2 item-dump arms both
-  sides, `attrs.rs` (`copy` gains `Target::Enum`), typeck registration +
-  VALIDATION (all payloads must be Copy, else `@copy` would double-drop —
-  the validation is load-bearing, unlike the trusted struct form), and the
-  port typeck/escape copy-ness mirror. Zero emitted-C change expected
-  (all-Copy-payload enums have no drop glue already) — but the P3 golden
-  trap applies, and a differential probe is owed (the corpus is blind until
-  `dlist_genref.jtr` adopts it, which is the payoff: `take`-passed genref
-  params for link surgery become plain `read`).
+- **Enum `@copy` opt-in — DONE, both toolchains (2026-08-12).** Smaller than
+  the sizing feared: the port parser already parsed+discarded enum attrs, so
+  both dumps agreed all along — the port only needed to STORE them
+  (`ItemData (u,v)` for kind 5; the dump prints nothing, matching the
+  reference item dump). Reference: `EnumDecl.attrs`, `copy` gains
+  `Target::Enum`, registration sets `is_copy` for PLAIN enums only (generic
+  instances are `GenEnum`, still non-Copy), and phase 2 VALIDATES payload
+  copy-ness ("a copy would double-drop" — checked, unlike the trusted struct
+  form). Port typeck: enum tdecl rows use slot 9 like structs;
+  `ty_is_copy` kind-1 arm reads it. `examples/copy_enum.jtr` (corpus +
+  allowlist + runtime pin 1/2/3/9 — and it exercises the natural
+  break-in-match as a second pin of that fix); differential probe
+  `jestyr_copy_enum_matches_reference` (the un-annotated twin refused on
+  both sides, the opted form clean on both). Remaining payoff, deliberately
+  deferred: adopting it in `dlist_genref.jtr` (retiring the `take`-passed
+  genref params) rewrites a pinned example — its own small increment.
 
 ### The traps that bit this session (verbatim from memory, keep them)
 

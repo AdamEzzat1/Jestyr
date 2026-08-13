@@ -1669,10 +1669,12 @@ fn mk_item_struct(mut p: Parser, start: usize, end: usize, is_pub: i32, kindcode
 }
 // An `enum Name(tparams) { variants }` item (kind 5): `(x,y)`=name span, `(op,a)`=(tparam_start,
 // tparam_count) of name-span pairs in `ear`, `(b,z)`=(variant_start, variant_count) of variant
-// 5-tuples in `ear`.
-fn mk_item_enum(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, tparam_start: i32, tparam_count: i32, variant_start: i32, variant_count: i32) -> i32 {
+// 5-tuples in `ear`, `(u,v)`=leading-attribute slice in `aar` (`@copy` — the plain-enum
+// Copy opt-in — is the first consumer; the dump does not print enum attrs, matching the
+// reference item dump).
+fn mk_item_enum(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, tparam_start: i32, tparam_count: i32, variant_start: i32, variant_count: i32, attr_start: i32, attr_count: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 5, start: start, end: end, is_pub: is_pub, op: tparam_start, a: tparam_count, b: variant_start, x: ns as i32, y: ne as i32, z: variant_count, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 5, start: start, end: end, is_pub: is_pub, op: tparam_start, a: tparam_count, b: variant_start, x: ns as i32, y: ne as i32, z: variant_count, w: 0 - 1, u: attr_start, v: attr_count, g: 0 - 1, h: 0 - 1, e: 0 - 1 })
     return id
 }
 // A `trait Name { methods }` item (kind 6): `(x,y)`=name span, `(a,b)`=(method_start,
@@ -2986,7 +2988,7 @@ fn parse_struct_members(mut p: Parser, fallback: usize) -> MembersResult {
 // variant is a name, an optional named-field payload `(f: T, …)`, and an optional `= disc`
 // discriminant. Type-params append to `ear` first; each variant's fields append as parsed;
 // variant 5-tuples buffer then append last. Mirrors `parse_enum`.
-fn parse_enum(mut p: Parser, is_pub: i32) -> i32 {
+fn parse_enum(mut p: Parser, is_pub: i32, attr_start: i32, attr_count: i32) -> i32 {
     let et: Token = cur_tok(p)
     let start: usize = et.start
     bump(p)                                        // consume `enum`
@@ -3092,7 +3094,7 @@ fn parse_enum(mut p: Parser, is_pub: i32) -> i32 {
     let variant_count: i32 = (len(i32, vt) / 5) as i32
     var a2: usize = 0
     for a2 < len(i32, vt) { push(i32, p.ear, get(i32, vt, a2))  a2 = a2 + 1 }
-    return mk_item_enum(p, start, endp, is_pub, ns, ne, tparam_start, tparam_count, variant_start, variant_count)
+    return mk_item_enum(p, start, endp, is_pub, ns, ne, tparam_start, tparam_count, variant_start, variant_count, attr_start, attr_count)
 }
 
 // `trait Name { fn m(self) -> T  fn n(self) { <default> } }`. Each method is a signature
@@ -3273,9 +3275,9 @@ fn parse_extern(mut p: Parser, is_pub: i32) -> i32 {
 }
 
 // Parse one top-level item: leading `@…` attributes, then an optional `pub`, then dispatch on
-// the item keyword. Attributes are attached to `fn`/`const`/`struct` (the kinds that store
-// them); other kinds parse+discard them (the reference validates/rejects — not modeled here).
-// Mirrors `parse_item`.
+// the item keyword. Attributes are attached to `fn`/`const`/`struct`/`enum` (the kinds that
+// store them — enums for `@copy`); other kinds parse+discard them (the reference
+// validates/rejects — not modeled here). Mirrors `parse_item`.
 fn parse_item(mut p: Parser) -> i32 {
     let attr_start: i32 = parse_attrs(p)
     let attr_count: i32 = ((len(i32, p.aar) as i32) - attr_start) / 4
@@ -3289,7 +3291,7 @@ fn parse_item(mut p: Parser) -> i32 {
     if k == 11 { return parse_struct(p, is_pub, 0, attr_start, attr_count) }  // `struct`
     if k == 12 { return parse_struct(p, is_pub, 1, attr_start, attr_count) }  // `record`
     if k == 14 { return parse_struct(p, is_pub, 2, attr_start, attr_count) }  // `union`
-    if k == 13 { return parse_enum(p, is_pub) }    // `enum`
+    if k == 13 { return parse_enum(p, is_pub, attr_start, attr_count) }    // `enum`
     if k == 15 { return parse_trait(p, is_pub) }   // `trait`
     if k == 16 { return parse_impl(p) }            // `impl` (no pub)
     if k == 40 { return parse_extern(p, is_pub) }  // `extern`
@@ -7015,6 +7017,20 @@ fn build_table(mut c: Checker, read p: Parser, read src: str) {
             }
         } else if it.kind == 5 {                   // enum: row + tparam spans + variant names
             let row: i32 = push_tdecl(c, it.x, it.y, 1)
+            // `@copy` opts a PLAIN enum into Copy (slot 9 = 1, like the struct form;
+            // the reference validates payload copy-ness — its refusal runs first).
+            // A generic enum never: its instances are GenEnum, which stays non-Copy.
+            if it.u >= 0 and it.a == 0 {
+                var eai: i32 = 0
+                for eai < it.v {
+                    let eans: i32 = get(i32, p.aar, (it.u + eai * 4) as usize)
+                    let eane: i32 = get(i32, p.aar, (it.u + eai * 4 + 1) as usize)
+                    if str_eq(src[eans as usize .. eane as usize], "copy") {
+                        set(i32, c.tdecl, (row * 10 + 9) as usize, 1)
+                    }
+                    eai = eai + 1
+                }
+            }
             var tps: List(i32) = make__list(i32, c.alloc)
             var t: i32 = 0
             for t < it.a {                         // tparam 2-tuples in `ear` at it.op
@@ -9474,15 +9490,16 @@ pub fn ty_is_copy(read c: Checker, tyid: i32) -> bool {
         if d.x == 18 { return false }              // Builder
         return true
     }
-    if k == 15 {                                   // Named: a struct's @copy opt-in; enums never;
+    if k == 15 {                                   // Named: struct AND plain-enum @copy opt-ins;
         let kind: i32 = td(c, d.x, 2)              // a distinct inherits its base's copyness
         if kind == 0 { return td(c, d.x, 9) == 1 }
+        if kind == 1 { return td(c, d.x, 9) == 1 } // enum: @copy (validated by the reference)
         if kind == 2 {
             let base: i32 = td(c, d.x, 9)
             if base >= 0 { return ty_is_copy(c, base) }
             return false
         }
-        return false                               // enum
+        return false
     }
     if k == 9 { return ty_is_copy(c, d.a) }        // Array: Copy iff its element is
     if k == 4 or k == 5 or k == 6 or k == 8 or k == 13 or k == 17 or k == 18 {

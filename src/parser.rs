@@ -332,6 +332,7 @@ impl<'src> Parser<'src> {
                 self.check_attrs(&attrs, attrs::Target::Enum);
                 let mut e = self.parse_enum();
                 e.is_pub = is_pub;
+                e.attrs = attrs;
                 Some(Item::Enum(e))
             }
             Const => {
@@ -803,7 +804,7 @@ impl<'src> Parser<'src> {
         }
         let end = self.cur().span;
         self.expect_close(RBrace, "`}`", open_brace, "enum body");
-        EnumDecl { is_pub: false, name, type_params, variants, span: start.to(end) }
+        EnumDecl { is_pub: false, name, type_params, variants, attrs: Vec::new(), span: start.to(end) }
     }
 
     fn parse_const(&mut self) -> ConstDecl {

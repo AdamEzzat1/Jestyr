@@ -520,6 +520,11 @@ pub struct EnumVariant {
 pub struct EnumDecl {
     pub is_pub: bool,
     pub name: Ident,
+    /// Leading `@…` attributes. `@copy` opts a PLAIN enum whose every variant
+    /// payload is `Copy` into being `Copy` itself (the niche-`Link`-over-genref
+    /// case from `dlist_genref.jtr`); validated in typeck — an unchecked `@copy`
+    /// over a droppable payload would double-drop. Generic enums stay non-Copy.
+    pub attrs: Vec<Attribute>,
     /// Generic type parameters, e.g. `enum Option(T) { … }` (empty for a plain
     /// enum). A generic enum is a *template* — monomorphized per instantiation,
     /// like a generic struct. (See `docs/structs-enums-design.md` §2.2b.)

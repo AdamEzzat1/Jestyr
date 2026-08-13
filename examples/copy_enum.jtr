@@ -1,0 +1,45 @@
+// examples/copy_enum.jtr — the enum `@copy` opt-in (dlist_genref.jtr datum 2).
+//
+// Enums were never Copy and had no opt-in, so a niche `Link` over a COPY payload
+// (a genref is a copyable fat pointer) was conservatively non-Copy — and every
+// piece of link surgery through `read` params tripped the escape rules, forcing
+// `take`-passed genrefs for what is semantically a free copy. `@copy` on a plain
+// enum whose every payload is Copy erases that ceremony; the contract is CHECKED
+// (a droppable payload under `@copy` is refused — it would drop twice).
+//
+// Run:  jestyrc run examples/copy_enum.jtr   →  1, 2, 3, 9
+
+struct Node { v: i64, next: Link }
+@copy enum Link { nil, at(n: &Node) }
+
+// Returning a `read` param by value — legal BECAUSE Link is @copy. This is the
+// shape dlist_genref.jtr had to spell with `take` parameters.
+fn step(read l: Link) -> Link {
+    match l {
+        nil => nil,
+        at(n) => n.*.next,               // the link copies out of the referent freely
+    }
+}
+
+fn main() -> i32 {
+    var c: &Node = gen_new(Node, Node{ v: 3, next: nil })
+    var b: &Node = gen_new(Node, Node{ v: 2, next: at(c) })
+    var a: &Node = gen_new(Node, Node{ v: 1, next: at(b) })
+    var cur: Link = at(a)
+    var sum: i64 = 3
+    for {
+        match cur {
+            nil => { break },            // the natural form (break-in-match, fixed)
+            at(n) => {
+                print_int(n.*.v)         // 1, 2, 3
+                sum = sum + n.*.v
+                cur = step(cur)
+            },
+        }
+    }
+    print_int(sum)                       // 9 = 3 + 1 + 2 + 3
+    gen_free(a)
+    gen_free(b)
+    gen_free(c)
+    return 0
+}

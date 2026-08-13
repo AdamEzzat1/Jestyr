@@ -96,7 +96,7 @@ const SPECS: &[Spec] = &[
     Spec { name: "align", targets: &[Target::Struct], args: Args::Pow2, status: Status::Active },
     Spec { name: "layout", targets: &[Target::Struct], args: Args::Word, status: Status::Active },
     // opt-in `Copy` for a small aggregate (design §2.8): freely copied, never moves.
-    Spec { name: "copy", targets: &[Target::Struct], args: Args::None, status: Status::Active },
+    Spec { name: "copy", targets: &[Target::Struct, Target::Enum], args: Args::None, status: Status::Active },
     // `@abi(<word>)` (workstream L, increment 3) — how this function's **large
     // read-only aggregate parameters** are passed. `value` is the default (a copy,
     // which is what `read` has always meant physically); `ref` passes them as

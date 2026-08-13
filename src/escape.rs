@@ -2263,6 +2263,24 @@ mod tests {
         assert!(d.is_empty(), "a @copy aggregate may be returned by value: {:?}", d);
     }
 
+    /// The enum form of the opt-in (`dlist_genref.jtr` datum 2): a `@copy` enum
+    /// whose payloads are all Copy — the niche `Link`-over-genref — moves out of a
+    /// `read` param as a copy, so link surgery no longer needs `take` params. The
+    /// UN-annotated twin stays refused, so the opt-in is doing the work.
+    #[test]
+    fn copy_enum_of_copy_payloads_can_be_returned() {
+        let d = escapes(
+            "@copy enum Link { nil, at(n: &i64) } \
+             fn next(read l: Link) -> Link { return l }",
+        );
+        assert!(d.is_empty(), "a @copy enum of Copy payloads is freely copyable: {d:?}");
+        let d2 = escapes("enum Link { nil, at(n: &i64) } fn next(read l: Link) -> Link { return l }");
+        assert!(
+            !d2.is_empty(),
+            "without @copy the same return must still be refused (the opt-in is load-bearing)"
+        );
+    }
+
     #[test]
     fn allows_returning_a_borrow_when_the_signature_says_so() {
         // NB: `out` is a reserved convention keyword, so the fn is named `reborrow`.

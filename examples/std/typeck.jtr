@@ -507,6 +507,20 @@ fn build_table(mut c: Checker, read p: parser.Parser, read src: str) {
             }
         } else if it.kind == 5 {                   // enum: row + tparam spans + variant names
             let row: i32 = push_tdecl(c, it.x, it.y, 1)
+            // `@copy` opts a PLAIN enum into Copy (slot 9 = 1, like the struct form;
+            // the reference validates payload copy-ness — its refusal runs first).
+            // A generic enum never: its instances are GenEnum, which stays non-Copy.
+            if it.u >= 0 and it.a == 0 {
+                var eai: i32 = 0
+                for eai < it.v {
+                    let eans: i32 = list.get(i32, p.aar, (it.u + eai * 4) as usize)
+                    let eane: i32 = list.get(i32, p.aar, (it.u + eai * 4 + 1) as usize)
+                    if str_eq(src[eans as usize .. eane as usize], "copy") {
+                        list.set(i32, c.tdecl, (row * 10 + 9) as usize, 1)
+                    }
+                    eai = eai + 1
+                }
+            }
             var tps: List(i32) = list.make(i32, c.alloc)
             var t: i32 = 0
             for t < it.a {                         // tparam 2-tuples in `ear` at it.op
@@ -2966,15 +2980,16 @@ pub fn ty_is_copy(read c: Checker, tyid: i32) -> bool {
         if d.x == 18 { return false }              // Builder
         return true
     }
-    if k == 15 {                                   // Named: a struct's @copy opt-in; enums never;
+    if k == 15 {                                   // Named: struct AND plain-enum @copy opt-ins;
         let kind: i32 = td(c, d.x, 2)              // a distinct inherits its base's copyness
         if kind == 0 { return td(c, d.x, 9) == 1 }
+        if kind == 1 { return td(c, d.x, 9) == 1 } // enum: @copy (validated by the reference)
         if kind == 2 {
             let base: i32 = td(c, d.x, 9)
             if base >= 0 { return ty_is_copy(c, base) }
             return false
         }
-        return false                               // enum
+        return false
     }
     if k == 9 { return ty_is_copy(c, d.a) }        // Array: Copy iff its element is
     if k == 4 or k == 5 or k == 6 or k == 8 or k == 13 or k == 17 or k == 18 {
