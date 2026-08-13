@@ -185,6 +185,30 @@ versions are snapshots, not stability promises.
 
 ### Fixed
 
+- **`jestyrc test <file>` ran the whole import closure's tests, not the named
+  file's.** `jestyrc test examples/std/path_demo.jtr` ran `std/path`'s eleven even
+  though `path_demo.jtr` has none of its own. Nobody had noticed because until
+  `std/test` landed, no *imported* module shipped a suite — and then importing it
+  dragged 22 extra tests into every consumer's run. Collection is now scoped to the
+  named module (the root file is always module 0, since `Loader::load_file`
+  registers it before merging any import), and `--list` is scoped identically so it
+  can never name a test the harness would not run.
+
+  `item_mod` defaults to 0 when absent, so every single-module entry point — all
+  the `typeck::check` unit tests — is unaffected. Pinned by
+  `the_harness_is_scoped_to_the_named_module`, which asserts both directions.
+
+  **No port mirror was owed**, which is unusual enough to write down given that
+  "zero C change" normally is not the same as "zero mirror owed":
+  `examples/std/cgen.jtr` reaches test mode only through its single-file dump path,
+  while its module loader is wired to `build`/`run`, which never emit a harness —
+  so every item there is module 0 and the new condition is vacuously true.
+  `jestyr_cgen_test_mode_matches_reference` and `bootstrap_seed_is_current` both
+  stayed green untouched. The reasoning is recorded at the change site in
+  `src/cgen.rs` rather than in `cgen.jtr`, because `flatten_selfhost_concat` edits
+  raw source spans and therefore preserves comments: a comment-only edit there
+  would force a 28K-line seed regeneration for no behavior change.
+
 - **Struct-variant patterns bound their fields to no type**, so a borrowed
   non-`Copy` field could escape its frame: `match w { one { n, k } => n }`
   returned a borrow out of a `read` parameter, while the positional

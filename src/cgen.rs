@@ -98,10 +98,16 @@ pub enum TestKind {
 /// `test_main`'s `runnable` predicate exactly (non-generic, backend-supported), so
 /// the list never names a test the harness would silently skip. Pure: needs no
 /// `TypeInfo` and never compiles, so `--list` is toolchain-free.
-pub fn list_tests(ast: &Ast) -> Vec<(String, TestKind)> {
+pub fn list_tests(ast: &Ast, item_mod: &[ModId]) -> Vec<(String, TestKind)> {
+    // Scoped to the named module exactly as `test_main` is, so `--list` never names
+    // a test the harness would not run. An empty `item_mod` (the single-module
+    // unit-test entry points, which have no loader) puts every item in module 0.
+    let own = |i: usize| item_mod.get(i).copied().unwrap_or(0) == 0;
     ast.items
         .iter()
-        .filter_map(|it| match it {
+        .enumerate()
+        .filter_map(|(i, it)| match it {
+            _ if !own(i) => None,
             Item::Fn(f) if is_generic_ast(ast, f) || !fn_supported_ast(ast, f) => None,
             Item::Fn(f) if f.has_attr("test") => Some((f.name.name.clone(), TestKind::Test)),
             Item::Fn(f) if f.has_attr("bench") => Some((f.name.name.clone(), TestKind::Bench)),
@@ -3266,11 +3272,34 @@ impl<'a> Cgen<'a> {
         // first so it doesn't alias the `runnable` closure's borrow.
         let filter = self.test_filter.clone();
         let passes = |name: &str| filter.as_deref().is_none_or(|f| name.contains(f));
+        // Only the NAMED module's own tests, not its import closure's. `jestyrc test
+        // my_module.jtr` on a file importing `std/test` would otherwise also run
+        // that module's suite — and `jestyrc test examples/std/path_demo.jtr` used
+        // to run `std/path`'s eleven despite `path_demo.jtr` having none of its
+        // own. The root file is always module 0 (`Loader::load_file` registers it
+        // before merging any import), and `item_mod` defaults to 0 when absent, so
+        // a single-module AST — every `typeck::check` unit-test entry point —
+        // behaves exactly as before.
+        //
+        // NO PORT MIRROR IS OWED, unusually, and the reason is worth writing down
+        // because "zero C change" is normally not the same as "zero mirror owed".
+        // `examples/std/cgen.jtr` reaches test mode only through the single-file
+        // dump (`jc <file> test`, the golden path); its module loader is wired to
+        // `build`/`run`, which never emit a harness. So in the port every item is
+        // module 0 and this condition is vacuously true — the emitted C is
+        // identical on both sides without touching it. Anyone giving the port a
+        // real module-aware `test` subcommand owes the scoping then. Deliberately
+        // NOT noted in `cgen.jtr` itself: `flatten_selfhost_concat` edits raw
+        // source spans and so preserves comments, meaning a comment-only edit
+        // there would force a 28K-line bootstrap seed regeneration for no
+        // behavior change.
+        let own = |i: usize| self.item_module(i) == 0;
         let tests: Vec<String> = ast
             .items
             .iter()
-            .filter_map(|it| match it {
-                Item::Fn(f) if f.has_attr("test") && runnable(f) && passes(&f.name.name) => {
+            .enumerate()
+            .filter_map(|(i, it)| match it {
+                Item::Fn(f) if f.has_attr("test") && own(i) && runnable(f) && passes(&f.name.name) => {
                     Some(f.name.name.clone())
                 }
                 _ => None,
@@ -3279,8 +3308,9 @@ impl<'a> Cgen<'a> {
         let benches: Vec<String> = ast
             .items
             .iter()
-            .filter_map(|it| match it {
-                Item::Fn(f) if f.has_attr("bench") && runnable(f) && passes(&f.name.name) => {
+            .enumerate()
+            .filter_map(|(i, it)| match it {
+                Item::Fn(f) if f.has_attr("bench") && own(i) && runnable(f) && passes(&f.name.name) => {
                     Some(f.name.name.clone())
                 }
                 _ => None,

@@ -642,7 +642,7 @@ fn run() -> ExitCode {
             // `jestyrc test --list` prints the runnable test/bench names (optionally
             // narrowed by the same name filter) and exits — no codegen, no compiler.
             if let Mode::Test { list: true, filter } = &mode {
-                return list_tests(&prog.ast, filter.as_deref());
+                return list_tests(&prog.ast, &prog.modules.item_mod, filter.as_deref());
             }
 
             // `test` mode emits a `@test`/`@bench` harness `main` (with optional
@@ -993,8 +993,8 @@ fn run_attest_diff(old_path: &str, new_path: &str) -> ExitCode {
 /// `filter` substring. One greppable line per item, so CI can slice the harness.
 /// Always succeeds — listing zero items (e.g. an over-narrow filter) is not an
 /// error, just an empty list with a stderr note.
-fn list_tests(ast: &ast::Ast, filter: Option<&str>) -> ExitCode {
-    let items: Vec<(String, cgen::TestKind)> = cgen::list_tests(ast)
+fn list_tests(ast: &ast::Ast, item_mod: &[module::ModId], filter: Option<&str>) -> ExitCode {
+    let items: Vec<(String, cgen::TestKind)> = cgen::list_tests(ast, item_mod)
         .into_iter()
         .filter(|(name, _)| filter.is_none_or(|f| name.contains(f)))
         .collect();

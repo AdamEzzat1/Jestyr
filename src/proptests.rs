@@ -1678,7 +1678,7 @@ mod test_runner {
     fn list(src: &str) -> Vec<(String, TestKind)> {
         let (tokens, _) = Lexer::new(src).tokenize();
         let (ast, _) = Parser::new(src, tokens).parse();
-        cgen::list_tests(&ast)
+        cgen::list_tests(&ast, &[])
     }
 
     // ── unit: discovery (`list_tests`) ────────────────────────────────────────
@@ -1784,13 +1784,54 @@ mod test_runner {
 
         // `--list` discovery on the same AST (one greppable line per item upstream).
         assert_eq!(
-            cgen::list_tests(&prog.ast),
+            cgen::list_tests(&prog.ast, &prog.modules.item_mod),
             vec![
                 ("add_is_commutative".to_string(), TestKind::Test),
                 ("doubling_works".to_string(), TestKind::Test),
                 ("sum_to_1000".to_string(), TestKind::Bench),
             ]
         );
+    }
+
+    /// **The harness runs the NAMED module's tests, not its import closure's.**
+    /// `jestyrc test my_module.jtr` on a file that imports `std/test` would
+    /// otherwise also run that module's 22 — and before this rule, `jestyrc test
+    /// examples/std/path_demo.jtr` ran `std/path`'s eleven even though
+    /// `path_demo.jtr` has no tests of its own.
+    ///
+    /// Both directions are asserted, because the interesting failure is silent
+    /// either way: an importer must contribute all of its own tests and none of
+    /// its dependency's, and `--list` must agree with what the harness bakes (a
+    /// `--list` that names an unrun test is worse than no `--list`).
+    #[test]
+    fn the_harness_is_scoped_to_the_named_module() {
+        // `path_demo.jtr` imports `path` (11 tests) and has none of its own.
+        let prog = crate::module::load("examples/std/path_demo.jtr");
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, _td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        let c = cgen::emit_tests_filtered(&prog.ast, &info, None).0;
+        assert_eq!(baked_test_count(&c), 0, "an importer contributes none of its dependency's tests");
+        assert!(c.contains("running 0 test(s)"), "the count is baked, not discovered at runtime");
+        assert!(
+            cgen::list_tests(&prog.ast, &prog.modules.item_mod).is_empty(),
+            "`--list` must agree with the harness"
+        );
+
+        // ...while the module that OWNS them still contributes all eleven.
+        let own = crate::module::load("examples/std/path.jtr");
+        let (oinfo, _) = crate::typeck::check_program(&own.ast, &own.modules);
+        let oc = cgen::emit_tests_filtered(&own.ast, &oinfo, None).0;
+        assert_eq!(baked_test_count(&oc), 11, "the owning module still runs its own");
+        assert_eq!(cgen::list_tests(&own.ast, &own.modules.item_mod).len(), 11);
+
+        // And a single-module AST (no loader, so `item_mod` is unpopulated) is
+        // unaffected — every item defaults to module 0.
+        let src = "@test fn a() -> bool { return true }\n@test fn b() -> bool { return true }\n";
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (ast, _) = crate::parser::Parser::new(src, tokens).parse();
+        let (sinfo, _) = crate::typeck::check(&ast);
+        assert_eq!(baked_test_count(&cgen::emit_tests_filtered(&ast, &sinfo, None).0), 2);
+        assert_eq!(cgen::list_tests(&ast, &[]).len(), 2);
     }
 }
 
@@ -1806,7 +1847,7 @@ mod test_runner_props {
     fn list(src: &str) -> Vec<(String, TestKind)> {
         let (tokens, _) = Lexer::new(src).tokenize();
         let (ast, _) = Parser::new(src, tokens).parse();
-        cgen::list_tests(&ast)
+        cgen::list_tests(&ast, &[])
     }
     fn baked_count(src: &str, filter: Option<&str>) -> usize {
         let (ast, info) = typeck_full(src);
@@ -4439,7 +4480,7 @@ mod fuzz {
             let (ast, _) = Parser::new(&prog, tokens).parse();
             let (info, _) = crate::typeck::check(&ast);
 
-            let discovered = cgen::list_tests(&ast).len();
+            let discovered = cgen::list_tests(&ast, &[]).len();
             let count = |c: &str| -> usize {
                 c.find("running ")
                     .and_then(|at| c[at + 8..].split_whitespace().next())
@@ -12855,7 +12896,7 @@ fn main() -> i32 {
         {
             let (tokens, _) = crate::lexer::Lexer::new(&demo_src).tokenize();
             let (ast, _) = crate::parser::Parser::new(&demo_src, tokens).parse();
-            let want_list: Vec<String> = crate::cgen::list_tests(&ast)
+            let want_list: Vec<String> = crate::cgen::list_tests(&ast, &[])
                 .into_iter()
                 .map(|(name, kind)| {
                     let tag = match kind {

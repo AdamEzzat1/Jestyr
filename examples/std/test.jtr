@@ -41,14 +41,14 @@
 // never trap, which is what lets `std/test_report.finish` print it
 // unconditionally; and a check name cannot forge a `FAIL` line.
 //
-// ONE SURPRISE TO KNOW BEFORE YOU IMPORT THIS. The `@test` harness collects tests
-// from the whole import closure, not just the file you name — so `jestyrc test
-// my_module.jtr` on a file that imports `test` also runs the 22 tests below.
-// (Pre-existing harness behavior, not something this module introduces:
-// `jestyrc test examples/std/path_demo.jtr` already runs `std/path`'s eleven, and
-// `path_demo.jtr` has no tests of its own.) Narrow it with the name filter —
-// `jestyrc test my_module.jtr my_` — which selects at codegen, so the harness's
-// `running N test(s)` line counts only what it baked.
+// IMPORTING THIS DOES NOT DRAG ITS SUITE INTO YOURS. `jestyrc test my_module.jtr`
+// runs the tests of the module you NAMED, not of its import closure, so the 22
+// tests below stay out of your harness. That was not true when this module first
+// landed — the harness collected from the whole closure, which nobody had noticed
+// because no imported module shipped a suite (`jestyrc test
+// examples/std/path_demo.jtr` ran `std/path`'s eleven despite `path_demo.jtr`
+// having none of its own). Scoping it was the first change this module's existence
+// forced on the driver.
 //
 // Run the tests:  jestyrc test examples/std/test.jtr
 

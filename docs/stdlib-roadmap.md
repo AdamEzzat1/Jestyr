@@ -211,7 +211,7 @@ is a test people do not write.
 | **OS / runtime?** | `test.jtr`: none — no imports at all. `test_report.jtr`: stdout, nothing else. |
 | **Guarantees** | Never aborts (a failed expectation returns `false`); never allocates; the report is always printable ASCII plus `\n`; the rendering is unambiguous (decodable, so two different values can never render alike); golden comparison is insensitive to CRLF and to a missing final newline and to nothing else. |
 | **Capability model** | The recorder is an explicit `Check` value, not an ambient global. The report *sink* is a caller-supplied `[]u8`. The report *destination* is a separate module the caller chooses to import. |
-| **Limits** | No float expectations; no expected-diagnostic helpers; no temp-file helpers; first-difference only, not a full diff. All four are argued below. Plus one inherited surprise: importing `test` pulls its own 22 tests into your harness run (see below). |
+| **Limits** | No float expectations; no expected-diagnostic helpers; no temp-file helpers; first-difference only, not a full diff. All four are argued below. |
 
 The API in one screen:
 
@@ -281,16 +281,24 @@ consumer's output.
   and a policy about how much of it to keep; that is a slice, not a function.
 - **`unwrap`-style helpers.** Same reason as everywhere else in this document.
 
-**One inherited surprise, worth knowing before you import it.** The `@test`
-harness collects tests from the whole import closure, so `jestyrc test
-my_module.jtr` on a file importing `test` also runs `test`'s own 22. This is
-pre-existing harness behavior rather than something the module introduces —
-`jestyrc test examples/std/path_demo.jtr` already runs `std/path`'s eleven, and
-`path_demo.jtr` has no tests of its own — but it becomes much more visible once a
-stdlib module people actually import ships a suite. The name filter (`jestyrc test
-my_module.jtr my_`) narrows it, and filters at codegen so the `running N test(s)`
-line counts only what was baked. Whether the harness *should* scope to the named
-file is a driver question, not a library one.
+**The one bug this module's existence exposed, now fixed.** The `@test` harness
+collected tests from the whole import closure, so `jestyrc test my_module.jtr` on
+a file importing `test` also ran `test`'s own 22. Pre-existing behavior rather
+than something the module introduced — `jestyrc test examples/std/path_demo.jtr`
+ran `std/path`'s eleven even though `path_demo.jtr` has none of its own — and
+nobody had noticed, because until now no *imported* module shipped a suite. It is
+now scoped to the named module (the root file is always module 0), pinned by
+`the_harness_is_scoped_to_the_named_module`, which asserts both directions and
+that `--list` agrees with what the harness bakes.
+
+Unusually for an emission-adjacent change, **no port mirror was owed**, and the
+reason is worth knowing because "zero C change" normally is *not* the same as
+"zero mirror owed": `examples/std/cgen.jtr` reaches test mode only through its
+single-file dump path, while its module loader is wired to `build`/`run`, which
+never emit a harness. So every item in the port is module 0 and the new condition
+is vacuously true there. `jestyr_cgen_test_mode_matches_reference` and
+`bootstrap_seed_is_current` both stayed green untouched, which is the evidence —
+not the argument.
 
 **How it was verified.** Six layers, all green:
 
