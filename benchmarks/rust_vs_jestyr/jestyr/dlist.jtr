@@ -1,0 +1,130 @@
+// dlist — twin of rust/std/dlist (raw slot indices) and rust/idiomatic
+// (slotmap keys).
+//
+// The list the safety mosaic calls its motivating problem, written with
+// today's genrefs + the @copy niche Link (00dfcee): bidirectional patch
+// is ordinary field writes, removal is unlink + gen_free, and — the part
+// neither Rust twin has in the LANGUAGE — a handle touched after
+// gen_free faults deterministically instead of silently reading a
+// reused slot (std twin) or needing a crate to miss (slotmap twin).
+// Before enum @copy landed, every hop here needed take-passed handles
+// (see examples/dlist_genref.jtr); now read-position matches suffice.
+//
+// Output must be byte-identical to both Rust twins.
+
+const N: i64 = 200000
+
+@copy enum Link { nil, at(n: &Node) }
+struct Node { v: i64, prev: Link, next: Link }
+
+fn lcg(state: i64) -> i64 {
+    return (state * 48271) % 2147483647
+}
+
+fn sum_forward(read head: Link) -> i64 {
+    var t: i64 = 0
+    var cur: Link = head
+    for {
+        match cur {
+            nil => { break },
+            at(n) => {
+                t = t + n.*.v
+                cur = n.*.next
+            },
+        }
+    }
+    return t
+}
+
+fn sum_backward(read tail: Link) -> i64 {
+    var t: i64 = 0
+    var cur: Link = tail
+    for {
+        match cur {
+            nil => { break },
+            at(n) => {
+                t = t + n.*.v
+                cur = n.*.prev
+            },
+        }
+    }
+    return t
+}
+
+fn main() -> i32 {
+    var s: i64 = 20260813
+
+    // Build: push_back N nodes.
+    s = lcg(s)
+    let h: &Node = gen_new(Node, Node { v: s % 1000, prev: nil, next: nil })
+    let head: Link = at(h)
+    var tail: &Node = h
+    var i: i64 = 1
+    for i < N {
+        s = lcg(s)
+        let nn: &Node = gen_new(Node, Node { v: s % 1000, prev: at(tail), next: nil })
+        tail.*.next = at(nn)
+        tail = nn
+        i = i + 1
+    }
+    var live: i64 = N
+
+    let f1: i64 = sum_forward(head)
+
+    // Delete every 3rd visited node (tail guarded: never deleted).
+    var k: i64 = 0
+    var cur: Link = head
+    for {
+        match cur {
+            nil => { break },
+            at(n) => {
+                k = k + 1
+                let nx: Link = n.*.next
+                if k % 3 == 0 {
+                    match nx {
+                        nil => {},
+                        at(x) => {
+                            let pv: Link = n.*.prev
+                            match pv { nil => {}, at(p) => { p.*.next = nx } }
+                            x.*.prev = pv
+                            gen_free(n)
+                            live = live - 1
+                        },
+                    }
+                }
+                cur = nx
+            },
+        }
+    }
+
+    let b1: i64 = sum_backward(at(tail))
+
+    // Insert a fresh node after every 5th surviving node; skip past it.
+    var m: i64 = 0
+    cur = head
+    for {
+        match cur {
+            nil => { break },
+            at(n) => {
+                m = m + 1
+                let nx: Link = n.*.next
+                if m % 5 == 0 {
+                    s = lcg(s)
+                    let nn: &Node = gen_new(Node, Node { v: s % 1000, prev: cur, next: nx })
+                    n.*.next = at(nn)
+                    match nx { nil => {}, at(x) => { x.*.prev = at(nn) } }
+                    live = live + 1
+                }
+                cur = nx
+            },
+        }
+    }
+
+    let f2: i64 = sum_forward(head)
+
+    print_int(f1)
+    print_int(b1)
+    print_int(f2)
+    print_int(live)
+    return 0
+}

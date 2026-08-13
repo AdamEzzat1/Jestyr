@@ -107,6 +107,23 @@ Where practical, counted analytically from the program (this suite's
 cases allocate a knowable O(1) number of buffers) and stated in the case
 notes; no allocator instrumentation in the first pass.
 
+## Peak compiler memory
+
+`scripts/measure_compiler_memory.ps1`: peak working set of the compiler
+process, polled via `PeakWorkingSet64` every 5 ms until exit. What each
+number covers is NOT symmetrical and both footnotes are load-bearing:
+
+- rustc is invoked directly on the case's `main.rs` at `-O` — one
+  process containing the whole compiler including LLVM codegen.
+- jestyrc runs `emit-c` — parse/check/lower/emit but NOT gcc, which
+  jestyrc forks as a child whose memory the parent's counters do not
+  include. The gcc pass's memory is unmeasured.
+- Idiomatic-track crates are skipped (direct rustc needs extern
+  plumbing that would measure the wrong thing).
+
+Results in `results/compiler_memory.md`. Numbers contextualize the
+toolchains' working-set scale; they do not rank compilers.
+
 ## Accepted / rejected programs
 
 Rejection cases (a program each language must refuse) are separate files,

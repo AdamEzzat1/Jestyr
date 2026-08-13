@@ -32,6 +32,29 @@ $cases = @(
         @{ track = "rust-std";       exe = (Join-Path $rustTarget "observer_registry.exe");  src = (Join-Path $root "rust\std\observer_registry\src\main.rs") },
         @{ track = "rust-idiomatic"; exe = (Join-Path $rustTarget "observer_registry_idiomatic.exe"); src = (Join-Path $root "rust\idiomatic\observer_registry\src\main.rs") },
         @{ track = "jestyr";         jtr = (Join-Path $root "jestyr\observer_registry.jtr") }
+    )},
+    @{ name = "arena_ast";          tracks = @(
+        @{ track = "rust-std";       exe = (Join-Path $rustTarget "arena_ast.exe");          src = (Join-Path $root "rust\std\arena_ast\src\main.rs") },
+        @{ track = "rust-idiomatic"; exe = (Join-Path $rustTarget "arena_ast_idiomatic.exe"); src = (Join-Path $root "rust\idiomatic\arena_ast\src\main.rs") },
+        @{ track = "jestyr";         jtr = (Join-Path $root "jestyr\arena_ast.jtr") }
+    )},
+    @{ name = "dlist";              tracks = @(
+        @{ track = "rust-std";       exe = (Join-Path $rustTarget "dlist.exe");              src = (Join-Path $root "rust\std\dlist\src\main.rs") },
+        @{ track = "rust-idiomatic"; exe = (Join-Path $rustTarget "dlist_idiomatic.exe");    src = (Join-Path $root "rust\idiomatic\dlist\src\main.rs") },
+        @{ track = "jestyr";         jtr = (Join-Path $root "jestyr\dlist.jtr") }
+    )},
+    @{ name = "resource_capabilities"; tracks = @(
+        @{ track = "rust-std";       exe = (Join-Path $rustTarget "resource_capabilities.exe"); src = (Join-Path $root "rust\std\resource_capabilities\src\main.rs") },
+        @{ track = "jestyr";         jtr = (Join-Path $root "jestyr\resource_capabilities.jtr") }
+    )},
+    @{ name = "structured_concurrency"; tracks = @(
+        @{ track = "rust-std";       exe = (Join-Path $rustTarget "structured_concurrency.exe"); src = (Join-Path $root "rust\std\structured_concurrency\src\main.rs") },
+        @{ track = "rust-idiomatic"; exe = (Join-Path $rustTarget "structured_concurrency_idiomatic.exe"); src = (Join-Path $root "rust\idiomatic\structured_concurrency\src\main.rs") },
+        @{ track = "jestyr";         jtr = (Join-Path $root "jestyr\structured_concurrency.jtr") }
+    )},
+    @{ name = "unsafe_boundary";    tracks = @(
+        @{ track = "rust-std";       exe = (Join-Path $rustTarget "unsafe_boundary.exe");    src = (Join-Path $root "rust\std\unsafe_boundary\src\main.rs") },
+        @{ track = "jestyr";         jtr = (Join-Path $root "jestyr\unsafe_boundary.jtr") }
     )}
 )
 
@@ -108,7 +131,13 @@ foreach ($case in $cases) {
 Write-Host "== rust per-package compile times"
 $pkgs = @{ "transient_borrow" = "transient_borrow"; "borrowed_projection" = "borrowed_projection";
            "disjoint_mutation" = "disjoint_mutation"; "observer_registry" = "observer_registry";
-           "observer_registry_idiomatic" = "observer_registry_idiomatic" }
+           "observer_registry_idiomatic" = "observer_registry_idiomatic";
+           "arena_ast" = "arena_ast"; "arena_ast_idiomatic" = "arena_ast_idiomatic";
+           "dlist" = "dlist"; "dlist_idiomatic" = "dlist_idiomatic";
+           "resource_capabilities" = "resource_capabilities";
+           "structured_concurrency" = "structured_concurrency";
+           "structured_concurrency_idiomatic" = "structured_concurrency_idiomatic";
+           "unsafe_boundary" = "unsafe_boundary" }
 $rustCompile = @{}
 foreach ($p in $pkgs.Keys) {
     $samples = @()

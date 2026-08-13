@@ -1,0 +1,69 @@
+// unsafe_boundary — twin of rust/std/unsafe_boundary.
+//
+// The same SIMULATED register block (heap memory, no real hardware).
+// Exactly two unsafe blocks, each a single raw pointer op — and in
+// Jestyr the fence is enforced by the unsafe ladder: the same op
+// outside `unsafe` is a compile error on both toolchains (see
+// unsafe_boundary_rejected.jtr). The bounds precondition is a
+// `requires` CONTRACT on the signature, visible to the caller and
+// compiled to a live assert — where the Rust twin buries an assert! in
+// the body.
+//
+// Output must be byte-identical to the Rust twin.
+
+const REGS: usize = 64
+const OPS: i64 = 10000000
+const MOD: i64 = 1000000007
+
+struct RegBlock { base: *mut i64, n: usize }
+
+fn lcg(state: i64) -> i64 {
+    return (state * 48271) % 2147483647
+}
+
+// SAFETY invariant: base points at n contiguous i64 owned by the backing
+// allocation, which outlives the block; requires fences the index.
+fn write_reg(read rb: RegBlock, i: usize, v: i64)
+    requires i < rb.n
+{
+    unsafe { (rb.base + i).* = v }
+}
+
+fn read_reg(read rb: RegBlock, i: usize) -> i64
+    requires i < rb.n
+{
+    unsafe { return (rb.base + i).* }
+}
+
+fn main() -> i32 {
+    var p: *mut i64 = alloc(i64, REGS)
+    var zs: []i64 = slice(i64, p, REGS)
+    for z in 0..zs.len {
+        zs[z] = 0
+    }
+    let rb: RegBlock = RegBlock { base: p, n: REGS }
+
+    var s: i64 = 20260813
+    var acc: i64 = 0
+    var i: i64 = 0
+    for i < OPS {
+        s = lcg(s)
+        let idx: usize = (s % (REGS as i64)) as usize
+        s = lcg(s)
+        if s % 3 == 0 {
+            write_reg(rb, idx, s % 1000)
+        } else {
+            acc = (acc + read_reg(rb, idx)) % MOD
+        }
+        i = i + 1
+    }
+
+    var total: i64 = 0
+    for r in 0..REGS {
+        total = total + read_reg(rb, r)
+    }
+    print_int(acc)
+    print_int(total)
+    free_ptr(p)
+    return 0
+}

@@ -1,0 +1,15 @@
+// REJECTION PROBE — must NOT compile.
+// The raw pointer write WITHOUT its unsafe fence: the enforced unsafe
+// ladder makes this a compile error, same guarantee class as Rust's
+// E0133. The fence is compiler-required on both toolchains.
+
+fn poke(p: *mut i64, v: i64) {
+    p.* = v
+}
+
+fn main() -> i32 {
+    var p: *mut i64 = alloc(i64, 1)
+    poke(p, 42)
+    free_ptr(p)
+    return 0
+}

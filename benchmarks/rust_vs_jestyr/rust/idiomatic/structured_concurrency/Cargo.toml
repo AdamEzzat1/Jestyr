@@ -1,0 +1,11 @@
+[package]
+name = "structured_concurrency_idiomatic"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rayon = "1"
+
+[[bin]]
+name = "structured_concurrency_idiomatic"
+path = "src/main.rs"

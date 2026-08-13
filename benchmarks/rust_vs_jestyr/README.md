@@ -45,12 +45,12 @@ ecosystem; missing expressiveness IS documented (fairness rules in
 | 1 | [transient borrowing](cases/01-transient-borrow.md) | implemented | std, jestyr |
 | 2 | [borrowed projection](cases/02-borrowed-projection.md) | implemented | std, jestyr |
 | 3 | [disjoint mutation](cases/03-disjoint-mutation.md) | implemented | std, jestyr |
-| 4 | [arena AST](cases/04-arena-ast.md) | planned | — |
-| 5 | [doubly linked list / graph](cases/05-doubly-linked-list.md) | planned | — |
+| 4 | [arena AST](cases/04-arena-ast.md) | implemented | std, idiomatic (typed-arena), jestyr |
+| 5 | [doubly linked list / graph](cases/05-doubly-linked-list.md) | implemented | std, idiomatic (slotmap), jestyr |
 | 6 | [observer registry / stale handles](cases/06-observer-registry.md) | implemented | std, idiomatic (slotmap), jestyr |
-| 7 | [resource capabilities](cases/07-resource-capabilities.md) | planned | — |
-| 8 | [structured concurrency](cases/08-structured-concurrency.md) | planned | — |
-| 9 | [unsafe boundary](cases/09-unsafe-boundary.md) | planned | — |
+| 7 | [resource capabilities](cases/07-resource-capabilities.md) | implemented + gap probes | std, jestyr |
+| 8 | [structured concurrency](cases/08-structured-concurrency.md) | implemented | std, idiomatic (rayon), jestyr |
+| 9 | [unsafe boundary](cases/09-unsafe-boundary.md) | implemented | std, jestyr |
 
 ## Running
 
@@ -65,9 +65,12 @@ idiomatic track needs one `cargo` fetch of `slotmap` on first build.
 
 ## Current limitations
 
-- First pass covers cases 1, 2, 3, 6 only.
-- Peak compiler memory is not yet measured (see METHODOLOGY).
+- Case 7's linear-capability half is design-only (safety-mosaic item 7
+  unimplemented); it ships as two measured gap probes instead.
+- Peak compiler memory (`scripts/measure_compiler_memory.ps1`, results
+  in `results/compiler_memory.md`) covers rustc single-process and
+  jestyrc-without-gcc — read the footnotes before comparing.
 - Binary sizes compare an MSVC-linked Rust exe against a MinGW-linked C
   exe; reported raw, see METHODOLOGY for the caveat.
-- Annotation counts are hand-itemized in `results/latest.md`, not
+- Annotation counts are hand-itemized in `results/ANALYSIS.md`, not
   machine-counted.

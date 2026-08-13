@@ -5,7 +5,15 @@ members = [
     "std/borrowed_projection",
     "std/disjoint_mutation",
     "std/observer_registry",
+    "std/arena_ast",
+    "std/dlist",
+    "std/resource_capabilities",
+    "std/structured_concurrency",
+    "std/unsafe_boundary",
     "idiomatic/observer_registry",
+    "idiomatic/arena_ast",
+    "idiomatic/dlist",
+    "idiomatic/structured_concurrency",
 ]
 
 [profile.release]

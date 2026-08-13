@@ -1,18 +1,20 @@
 ﻿{
-    "date":  "2026-08-13 01:10",
+    "date":  "2026-08-13 01:39",
     "rustc":  "rustc 1.97.1 (8bab26f4f 2026-07-14)",
     "cargo":  "cargo 1.97.1 (c980f4866 2026-06-30)",
     "gcc":  "gcc.exe (x86_64-posix-seh, Built by strawberryperl.com project) 8.3.0",
+    "cpu":  "11th Gen Intel(R) Core(TM) i7-11390H @ 3.40GHz",
+    "os":  "Microsoft Windows 11 Pro",
     "jestyr_branch":  "claude/rust-jestyr-ownership-benchmark-1bd785",
-    "jestyr_commit":  "f675669",
+    "jestyr_commit":  "321b9fb",
     "reps":  7,
     "timing":  "interleaved min-of-7, first round discarded",
     "results":  [
                     {
                         "case":  "transient_borrow",
                         "track":  "rust-std",
-                        "runtime_ms":  468.8,
-                        "compile_ms":  1033,
+                        "runtime_ms":  457.9,
+                        "compile_ms":  1305,
                         "binary_bytes":  128512,
                         "loc":  101,
                         "output_match":  true
@@ -20,8 +22,8 @@
                     {
                         "case":  "transient_borrow",
                         "track":  "jestyr",
-                        "runtime_ms":  452.5,
-                        "compile_ms":  342,
+                        "runtime_ms":  494.4,
+                        "compile_ms":  288,
                         "binary_bytes":  69068,
                         "loc":  91,
                         "output_match":  true
@@ -29,8 +31,8 @@
                     {
                         "case":  "borrowed_projection",
                         "track":  "rust-std",
-                        "runtime_ms":  96.2,
-                        "compile_ms":  916,
+                        "runtime_ms":  92.2,
+                        "compile_ms":  850,
                         "binary_bytes":  128000,
                         "loc":  62,
                         "output_match":  true
@@ -38,17 +40,17 @@
                     {
                         "case":  "borrowed_projection",
                         "track":  "jestyr",
-                        "runtime_ms":  99.4,
-                        "compile_ms":  505,
-                        "binary_bytes":  70453,
+                        "runtime_ms":  95.8,
+                        "compile_ms":  261,
+                        "binary_bytes":  69941,
                         "loc":  56,
                         "output_match":  true
                     },
                     {
                         "case":  "disjoint_mutation",
                         "track":  "rust-std",
-                        "runtime_ms":  479.4,
-                        "compile_ms":  799,
+                        "runtime_ms":  535.4,
+                        "compile_ms":  860,
                         "binary_bytes":  128000,
                         "loc":  63,
                         "output_match":  true
@@ -56,8 +58,8 @@
                     {
                         "case":  "disjoint_mutation",
                         "track":  "jestyr",
-                        "runtime_ms":  559,
-                        "compile_ms":  687,
+                        "runtime_ms":  555.7,
+                        "compile_ms":  408,
                         "binary_bytes":  101843,
                         "loc":  59,
                         "output_match":  true
@@ -65,8 +67,8 @@
                     {
                         "case":  "observer_registry",
                         "track":  "rust-std",
-                        "runtime_ms":  56.1,
-                        "compile_ms":  533,
+                        "runtime_ms":  56,
+                        "compile_ms":  664,
                         "binary_bytes":  129024,
                         "loc":  109,
                         "output_match":  true
@@ -74,8 +76,8 @@
                     {
                         "case":  "observer_registry",
                         "track":  "rust-idiomatic",
-                        "runtime_ms":  50,
-                        "compile_ms":  499,
+                        "runtime_ms":  49.4,
+                        "compile_ms":  687,
                         "binary_bytes":  129024,
                         "loc":  63,
                         "output_match":  true
@@ -83,10 +85,127 @@
                     {
                         "case":  "observer_registry",
                         "track":  "jestyr",
-                        "runtime_ms":  70.7,
-                        "compile_ms":  358,
+                        "runtime_ms":  70.3,
+                        "compile_ms":  294,
                         "binary_bytes":  70838,
                         "loc":  74,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "arena_ast",
+                        "track":  "rust-std",
+                        "runtime_ms":  39.2,
+                        "compile_ms":  1077,
+                        "binary_bytes":  128512,
+                        "loc":  72,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "arena_ast",
+                        "track":  "rust-idiomatic",
+                        "runtime_ms":  38.6,
+                        "compile_ms":  1154,
+                        "binary_bytes":  131072,
+                        "loc":  85,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "arena_ast",
+                        "track":  "jestyr",
+                        "runtime_ms":  210.1,
+                        "compile_ms":  272,
+                        "binary_bytes":  74971,
+                        "loc":  77,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "dlist",
+                        "track":  "rust-std",
+                        "runtime_ms":  16.2,
+                        "compile_ms":  668,
+                        "binary_bytes":  128000,
+                        "loc":  82,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "dlist",
+                        "track":  "rust-idiomatic",
+                        "runtime_ms":  18.3,
+                        "compile_ms":  981,
+                        "binary_bytes":  130048,
+                        "loc":  80,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "dlist",
+                        "track":  "jestyr",
+                        "runtime_ms":  51.8,
+                        "compile_ms":  445,
+                        "binary_bytes":  80102,
+                        "loc":  101,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "resource_capabilities",
+                        "track":  "rust-std",
+                        "runtime_ms":  24,
+                        "compile_ms":  506,
+                        "binary_bytes":  126976,
+                        "loc":  35,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "resource_capabilities",
+                        "track":  "jestyr",
+                        "runtime_ms":  20.9,
+                        "compile_ms":  364,
+                        "binary_bytes":  60841,
+                        "loc":  33,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "structured_concurrency",
+                        "track":  "rust-std",
+                        "runtime_ms":  94.7,
+                        "compile_ms":  1287,
+                        "binary_bytes":  159744,
+                        "loc":  38,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "structured_concurrency",
+                        "track":  "rust-idiomatic",
+                        "runtime_ms":  100.5,
+                        "compile_ms":  1349,
+                        "binary_bytes":  212992,
+                        "loc":  21,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "structured_concurrency",
+                        "track":  "jestyr",
+                        "runtime_ms":  106.4,
+                        "compile_ms":  1447,
+                        "binary_bytes":  226267,
+                        "loc":  29,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "unsafe_boundary",
+                        "track":  "rust-std",
+                        "runtime_ms":  102.6,
+                        "compile_ms":  570,
+                        "binary_bytes":  127488,
+                        "loc":  48,
+                        "output_match":  true
+                    },
+                    {
+                        "case":  "unsafe_boundary",
+                        "track":  "jestyr",
+                        "runtime_ms":  110.5,
+                        "compile_ms":  336,
+                        "binary_bytes":  66809,
+                        "loc":  47,
                         "output_match":  true
                     }
                 ]

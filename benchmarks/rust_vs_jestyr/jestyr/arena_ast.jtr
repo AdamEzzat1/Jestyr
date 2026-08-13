@@ -1,0 +1,102 @@
+// arena_ast — twin of rust/std/arena_ast (indices) and rust/idiomatic
+// (typed-arena references + Cell back-links).
+//
+// Jestyr's answer to a cross-linked node graph TODAY is genrefs: every
+// node is a gen_new allocation, links are a niche `@copy enum Link`
+// (pointer-sized, nil = null — the 00dfcee opt-in), and parent
+// back-links are ordinary field writes AFTER construction — no Cell,
+// no interior-mutability concept, because exclusivity is per-call, not
+// per-reference. The price: one heap allocation per node and a
+// generation check per hop. Lexical `region` allocation exists but its
+// refs cannot be stored in struct fields, so regions cannot carry this
+// case — recorded as the gap safety-mosaic item 6 exists to close.
+//
+// Output must be byte-identical to both Rust twins.
+
+const LEAVES: usize = 524288
+const MOD: i64 = 1000000007
+
+@copy enum Link { nil, at(n: &Node) }
+struct Node { kind: i64, val: i64, left: Link, right: Link, parent: Link }
+
+fn lcg(state: i64) -> i64 {
+    return (state * 48271) % 2147483647
+}
+
+fn eval(read l: Link) -> i64 {
+    match l {
+        nil => 0,
+        at(n) => {
+            if n.*.kind == 0 {
+                n.*.val
+            } else {
+                let a: i64 = eval(n.*.left)
+                let b: i64 = eval(n.*.right)
+                if n.*.kind == 1 { (a + b) % MOD } else { (a * b) % MOD }
+            }
+        },
+    }
+}
+
+// Path length in nodes (leaf included) up to the root.
+fn path_len(read l: Link) -> i64 {
+    var d: i64 = 0
+    var cur: Link = l
+    for {
+        match cur {
+            nil => { break },
+            at(n) => {
+                d = d + 1
+                cur = n.*.parent
+            },
+        }
+    }
+    return d
+}
+
+fn main() -> i32 {
+    var lb: *mut Link = alloc(Link, LEAVES)
+    var leaves: []Link = slice(Link, lb, LEAVES)
+    var wb: *mut Link = alloc(Link, LEAVES)
+    var lvl: []Link = slice(Link, wb, LEAVES)
+    var s: i64 = 20260813
+    var count: i64 = 0
+
+    for i in 0..LEAVES {
+        s = lcg(s)
+        let n: &Node = gen_new(Node, Node { kind: 0, val: s % 100, left: nil, right: nil, parent: nil })
+        leaves[i] = at(n)
+        lvl[i] = at(n)
+        count = count + 1
+    }
+
+    var cnt: usize = LEAVES
+    for cnt > 1 {
+        let half: usize = cnt / 2
+        for j in 0..half {
+            let lc: Link = lvl[j * 2]
+            let rc: Link = lvl[j * 2 + 1]
+            s = lcg(s)
+            let kind: i64 = s % 2 + 1
+            let p: &Node = gen_new(Node, Node { kind: kind, val: 0, left: lc, right: rc, parent: nil })
+            count = count + 1
+            match lc { nil => {}, at(a) => { a.*.parent = at(p) } }
+            match rc { nil => {}, at(b) => { b.*.parent = at(p) } }
+            lvl[j] = at(p)
+        }
+        cnt = half
+    }
+    let root: Link = lvl[0]
+
+    var wsum: i64 = 0
+    for i in 0..LEAVES {
+        wsum = wsum + path_len(leaves[i]) * ((i as i64) % 13 + 1)
+    }
+
+    print_int(eval(root))
+    print_int(wsum)
+    print_int(count)
+    free_ptr(lb)
+    free_ptr(wb)
+    return 0
+}

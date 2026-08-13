@@ -1,145 +1,192 @@
-# First-pass analysis — cases 1, 2, 3, 6
+# Analysis — all nine cases
 
 Measured 2026-08-13 on rustc 1.97.1 / cargo 1.97.1 (MSVC target), Jestyr
-`claude/rust-jestyr-ownership-benchmark-1bd785@f675669` (= master `f675669`)
-via gcc 8.3.0 `-O2`. Numbers in `latest.md`/`latest.json`; this file is the
-part a table cannot hold. Every claim below is scoped to these four
-workloads — see METHODOLOGY rule 7.
+branch `claude/rust-jestyr-ownership-benchmark-1bd785` via gcc 8.3.0
+`-O2`. Tables in `latest.md`/`latest.json` and `compiler_memory.md`;
+this file is the part a table cannot hold. Every claim is scoped to
+these workloads — METHODOLOGY rule 7. All 22 track-runs across 9 cases
+print byte-identical output; every timing row below is gated on that.
 
-## Headline answers to the research question
+## The research question, answered per pattern
 
-Patterns where Jestyr expressed the safe program with **less** machinery
-than Rust:
+**Where Jestyr expressed the safe program with less machinery:**
 
-- **Observer/stale-handles (case 6)** is the clear one. Rust std needs a
-  45-line hand-rolled generational arena; idiomatic Rust outsources it to
-  `slotmap`. Jestyr needs **no registry at all** — the generation check
-  lives in the pointer type (`&Obj`), and `with alive h as read o { }
-  else { }` is the entire stale story. Cost: 1.3–1.4× runtime (70.7 ms vs
-  56.1/50.0) for per-access generation checks against slotmap's
-  slab layout. Fewer concepts, fewer lines, slower dereference.
-- **Transient borrowing (case 1)** is annotation-parity with a sigil
-  asymmetry: Rust spells the borrow at both the signature AND every call
-  site (`advance(&mut w)`, `total_score(&w)`, `for p in &mut w.players`);
-  Jestyr spells the mode only in the signature (`advance(w)` at the call
-  site). Zero lifetimes on either side. Runtime parity (452.5 vs 468.8 ms
-  — single-digit %, i.e. noise).
+- **Observer/stale-handles (6)** — no registry at all: the generation
+  check is the pointer type, `with alive … else` is the whole stale
+  story. Rust std hand-rolls a 45-line arena; idiomatic Rust imports
+  `slotmap`. Cost: 1.3–1.4× runtime (70.3 vs 56.0/49.4 ms).
+- **Doubly linked list (5)** — link surgery is ordinary field writes;
+  enum `@copy` (the niche Link) retired the take-ceremony the older
+  `dlist_genref.jtr` needed. The std twin is only "safe" because it
+  escaped into unchecked indices — a stale u32 silently reads whatever
+  occupies the slot; Jestyr's stale handle FAULTS deterministically,
+  slotmap's key misses. Cost of the checked pointer: 3.2× (51.8 vs
+  16.2 ms).
+- **Structured concurrency (8)** — one `par for … reduce` line against
+  ~20 lines of scope/chunk/join (std). rayon matches the brevity but
+  not the guarantee: both Rust twins are deterministic only because i64
+  `+` happens to be associative; the f64 version would silently go
+  schedule-dependent, where Jestyr refuses it at compile time, and
+  `@span(log)` makes accidental serialization a compile error. Runtime
+  95–106 ms across all three — parity.
+- **Unsafe boundary (9)** — parity of mechanism (2 fenced blocks each,
+  both compiler-required), with one Jestyr-specific edge: the bounds
+  precondition is a `requires` contract on the signature, not an
+  `assert!` in the body. ~8% runtime cost (110.5 vs 102.6 ms).
+- **Transient borrowing (1)** — annotation parity, zero call-site
+  sigils vs Rust's `&`/`&mut` at every use. Runtime parity (the leader
+  swapped between sessions inside the noise band: 452–494 ms both
+  sides).
 
-Patterns where **Rust** has the stronger story:
+**Where Rust has the stronger story:**
 
-- **Borrowed projection (case 2)**: Rust returns `&Token` natively with
-  elided lifetimes. Jestyr cannot return a borrow into a parameter — its
-  `-> read T` annotation names no source, and the `-> read T from xs`
-  design (safety-mosaic item 2) is unimplemented. The idiomatic fallback
-  (mark the 24-byte `Token` `@copy`, return by value) measured **free**
-  at this scale (99.4 vs 96.2 ms), but it is a real expressiveness gap:
-  it only works because the element is small and copyable. A projection
-  into a large or non-copyable element has no Jestyr spelling today
-  beyond returning an index.
-- **Disjoint mutation (case 3)**: Rust's `split_at_mut` returns the two
-  halves as values; Jestyr's `std/parallel.split_mut` must invert control
-  (continuation-passing) because returning a pair of borrows is escape
-  route 2 by design. Same guarantee, clumsier shape: the round body
-  becomes a named top-level function. Jestyr also ran 17% slower here
-  (559 vs 479.4 ms) — see the performance note below.
+- **Borrowed projection (2)** — Rust returns `&Token` natively; Jestyr
+  cannot return a borrow into a parameter (`-> read T from xs` is
+  design-only, mosaic item 2). The `@copy` value-return fallback
+  measured free at 24-byte elements (95.8 vs 92.2 ms) but does not
+  scale to large or non-copyable elements.
+- **Resource capabilities (7)** — runtime parity (20.9 vs 24.0 ms) and
+  matching shapes (`take` ≡ by-value `mut d`), but Rust's affine story
+  is complete and Jestyr's is not. Two gaps MEASURED by this suite's
+  probes:
+  1. use-after-take compiles (`resource_capabilities_gap.jtr` is the
+     pinned witness) — the giver's binding is not poisoned; Rust
+     refuses the same program with E0382;
+  2. a take parameter the callee does not return is never dropped —
+     with a Drop impl, move-in-and-discard runs zero drops anywhere
+     (caller correctly elides as moved-out; callee never inserts one).
+     A moved-in resource leaks.
+  Both are exactly the data mosaic item 7 (linear capabilities) needs;
+  a fix task has been spun off separately.
+- **Arena AST (4)** — the biggest performance gap in the suite: 5.4×
+  (210.1 vs 39.2/38.6 ms). Jestyr's only way to carry cross-links today
+  is genrefs — one `gen_new` heap allocation per node (1,048,575 of
+  them) plus a generation check per hop, against one `Vec` (std) or
+  arena chunks (typed-arena). Region allocation cannot carry the case:
+  region refs cannot live in struct fields. Expressiveness-wise Jestyr
+  is *simpler* here (no `'a`, no `Cell`) — the cost is all in layout
+  and allocation, which is mosaic item 6's exact design target.
 
-## Annotation itemization (hand-audited, per METHODOLOGY)
+## The graph tax, named precisely
 
-Units differ per language by design; itemized so readers can re-weigh.
+Cases 4 and 5 isolate what the checked-pointer model costs when the
+data structure IS pointers: 3.2–5.4×, from (a) per-node individual heap
+allocation with a generation header vs contiguous/arena placement, and
+(b) a checked deref per hop vs a bare load. Case 6 shows the same model
+at 1.3–1.4× when access is sweep-shaped rather than chase-shaped. The
+flat-buffer cases (1, 2, 3, 8, 9) show ~0–17%. Nobody should quote
+"genrefs are 5× slower" without the second half: the std-Rust twin that
+wins case 4 by 5.4× verifies NOTHING about its indices, and the twins
+that do verify (typed-arena via lifetimes, slotmap via generations)
+each import a crate and their own ceremony.
+
+## Case 3's 17%, confirmed in the emitted C
+
+The elision hypothesis from the first pass is now confirmed, not
+assumed: in `emit-c` output, `bump` and `scale` (loops bounded by
+`0..half.len`) contain ZERO asserts, while `add_into` — whose loop
+bound is `min(dst.len, src.len)`, a derived value the prover does not
+connect to either slice — carries THREE live asserts per iteration
+(read dst, read src, write dst), ~300M across the run. Also visible in
+the same emission: `mut []i64` params lower to `JestyrSlice_i64*
+restrict` — Jestyr's exclusivity handed to gcc as an aliasing
+guarantee, the same promise rustc makes LLVM via noalias.
+
+## Annotation itemization (hand-audited)
+
+First pass:
 
 | case | Rust ceremony | Jestyr ceremony |
 |---|---|---|
-| transient_borrow | 0 lifetimes; 4 signature borrows (`&World`×2, `&mut World`, `&mut Player`); 5 call-site/loop sigils (`&mut w`, `&w`×2, `&w.players`, `&mut w.players`) | 4 signature modes (`read`×2, `mut`×2); 1 loop mode (`for mut p`); 0 call-site sigils; **3 `slice()` view rebuilds** (structural: a struct may not hold a slice, so `World` carries ptr+len) |
-| borrowed_projection | 0 lifetimes (all elided); 7 signature `&` (3 param, 3 return, 1 field-fn); 3 call-site `&toks` | 1 load-bearing `@copy`; 4 `read` modes; 0 call-site sigils; every projection is a 24-byte copy instead of a pointer |
-| disjoint_mutation | 4 signature borrows (`&mut [i64]`×3, `&[i64]`); 1 `split_at_mut` + tuple destructure per round; 1 `&xs` call site | 4 signature modes + 2 callback modes; 1 import; **1 CPS inversion** (named `round_phases` + `&round_phases` fn-pointer) |
-| observer_registry (std) | `#[derive(Clone, Copy)]` on Handle; ~45-line Registry type (2 structs + 3 methods + free list); `Option`/`match` at every access | 1 `@copy` on Handle; 3 `with alive … else` sites; **no registry type at all** (`gen_new`/`gen_free` are the language) |
-| observer_registry (slotmap) | 1 crate dependency; registry vanishes into `SlotMap` | — |
+| transient_borrow | 0 lifetimes; 4 signature borrows; 5 call-site/loop sigils | 4 signature modes; 1 loop mode; 0 call-site sigils; 3 `slice()` view rebuilds (a struct may not hold a slice, so World carries ptr+len) |
+| borrowed_projection | 0 lifetimes (elided); 7 signature `&`; 3 call-site `&toks` | 1 load-bearing `@copy`; 4 `read` modes; every projection a 24-byte copy |
+| disjoint_mutation | 4 signature borrows; `split_at_mut` + tuple destructure; 1 `&xs` | 4 + 2 callback modes; 1 import; CPS inversion (named `round_phases` + `&round_phases`) |
+| observer_registry (std) | `#[derive(Clone, Copy)]`; ~45-line Registry; `Option`/`match` per access | 1 `@copy`; 3 `with alive … else` sites; no registry type at all |
+| observer_registry (slotmap) | 1 crate dep; registry vanishes | — |
 
-`unsafe` count: **0 in all eight program sources** on every track. All
-three languages' internal unsafe lives in libraries (Rust std's
-`split_at_mut`, slotmap's slots, Jestyr's `std/parallel` slice surgery) —
-the boundary sits below the program on every side, which is itself a
-result: none of these four patterns forced unsafe to the surface anywhere.
+Second pass:
 
-## Rejection twins (diagnostics verbatim)
+| case | Rust ceremony | Jestyr ceremony |
+|---|---|---|
+| arena_ast (std) | 0 lifetimes, 0 borrows in the graph — indices carry no proof | 1 `@copy` enum; `read` modes; genref `.*` derefs |
+| arena_ast (typed-arena) | **7 `'a` occurrences** (the suite's first named lifetimes), 3 `Cell<…>` wrappers, `.get()`/`.set()`/`.unwrap()` at every back-link | back-links are plain field writes (`a.*.parent = at(p)`) — no interior-mutability concept exists to need |
+| dlist (std) | NIL sentinel discipline, free-list omitted (documented) | 1 `@copy` enum; `gen_free` at delete; per-hop `match` on Link (the nullable-link ceremony `dlist_genref.jtr` recorded) |
+| dlist (slotmap) | `Option<DefaultKey>` links, crate dep | — |
+| resource_capabilities | 2 `mut` value params, 1 `&` audit | 3 `take` modes, 1 `read` — one-for-one with Rust |
+| structured_concurrency (std) | scope closure, `move`, manual chunk math, join loop | `@span(log)`+`@span(linear)`, 1 import, 1 `par for` line |
+| structured_concurrency (rayon) | crate dep + prelude import | — |
+| unsafe_boundary | 2 `unsafe` blocks, 2 body `assert!`s, SAFETY comment | 2 `unsafe` blocks, 2 signature `requires` contracts, SAFETY comment |
 
-Rust (`rejected.rs`, one per case dir):
+`unsafe` in program sources across all nine cases: **2 blocks per side
+in case 9 (the case about unsafe), zero everywhere else** — on every
+track. Library-internal unsafe (std's `split_at_mut`, slotmap, rayon,
+Jestyr's `std/parallel`) noted, not counted, per METHODOLOGY.
 
-- overlap: `error[E0502]: cannot borrow 'w' as immutable because it is
-  also borrowed as mutable`
-- dangling projection: `error[E0597]: 'toks' does not live long enough`
-- double-mut: `error[E0499]: cannot borrow 'xs' as mutable more than once
-  at a time`
+## Rejection probes (verbatim diagnostics)
 
-Jestyr (`*_rejected.jtr`):
+Nine probes, all verified refused:
 
-- borrow escaping by return: `error: cannot return borrow 'p': a
-  second-class 'read'/'mut'/'out' borrow may not outlive its call (pass
-  it further down, or declare the return as 'read'/'mut'/'out')`
-- non-copy element leaving a read slice: same rule, at `return xs[i]`
-- aliased writable slices: `error: cannot pass 'q' to two writable slice
-  parameters of 'g' in one call: the two views would alias every element
-  — divide the buffer with 'split_mut' instead`
+- Rust: E0502 (read-while-mut), E0597 (dangling projection), E0499
+  (double `&mut`), E0382 (use after move), E0133 (raw deref outside
+  unsafe).
+- Jestyr: borrow-return refusal ("a second-class `read`/`mut`/`out`
+  borrow may not outlive its call"), same rule for a non-copy element
+  leaving a read slice, mut-slice exclusivity ("cannot pass `q` to two
+  writable slice parameters of `g` in one call … divide the buffer with
+  `split_mut` instead"), unsafe ladder ("a raw-pointer deref belongs in
+  an `unsafe` block").
 
-Three asymmetries worth recording rather than averaging away:
+Plus one KNOWN-GAP file that compiles on purpose
+(`resource_capabilities_gap.jtr` — Jestyr's missing E0382, see case 7).
 
-1. Rust's E0499 fires at the *borrow site*; Jestyr's exclusivity rule
-   fires at the *call site* and is lexical (an aliased root dodges it —
-   documented in the checker's own notes). Rust's guarantee is deeper.
-2. Rust rejects the *read-while-mut overlap* (E0502); Jestyr deliberately
-   **allows** `mut`+`read` of one place at one call (in-place idioms).
-   Same program, opposite verdicts, both by design — this is the sharpest
-   philosophical divergence the first pass found.
-3. Jestyr's stale-handle story has a class Rust std cannot express at
-   all: a *bare* stale dereference is a deterministic runtime fault
-   (generation assert), never UB and never a silent `None` — with
-   `with alive … else` as the non-faulting query form. Rust encodes
-   staleness in `Option` and relies on the caller not to `unwrap`.
+Standing asymmetries: Rust's aliasing refusals fire at the borrow site
+and are deep; Jestyr's exclusivity rule is lexical and call-site (an
+aliased root dodges it). Jestyr deliberately ALLOWS the read+mut
+overlap Rust's E0502 refuses. Jestyr's stale-handle story has a
+behavior class Rust cannot express in std: deterministic fault on bare
+deref, checked else-arm via `with alive`.
 
-## Performance notes (implementation, not language)
+## Toolchain numbers (contextual, not rankings)
 
-- **Parity where traversal is simple** (cases 1, 2): Jestyr's emitted C
-  under gcc `-O2` matches rustc/LLVM within noise, *with live bounds
-  checks* on the Jestyr side.
-- **The 17% loss in case 3** is consistent with the known bounds-check
-  elision boundary: `bump`/`scale` loop over `0..half.len` (provable,
-  elided), but `add_into` loops to `min(dst.len, src.len)` — a derived
-  bound the prover does not connect back to either slice, so ~200M
-  checked accesses stay live across the 25 rounds. Confirming via
-  `emit-c` diff is a recorded next step, not assumed.
-- **The 1.3–1.4× loss in case 6** buys the checked-pointer model:
-  every sweep access pays a generation compare against a header word,
-  and every spawn is an individual `gen_new` heap allocation, vs
-  slotmap's contiguous slab. Nobody should quote this as "genrefs are
-  slow" — it is the cost of *not writing* the arena.
-- **Compile time**: Jestyr (parse→check→emit-C→gcc) beat cold per-crate
-  cargo builds on every case (342–687 ms vs 499–1033 ms). Different
-  pipelines doing different work; recorded, not ranked.
-- **Binary size**: Jestyr's gcc/MinGW exes are ~55–80 KB vs Rust/MSVC's
-  ~128 KB. Toolchain-confounded (see METHODOLOGY); recorded raw.
+- **Compile time** (median of 3, cold package): Jestyr 261–1447 ms vs
+  Rust 506–1349 ms. Jestyr's slowest case (structured_concurrency,
+  1447 ms) is the one that imports std modules and threads gcc through
+  pthread lowering.
+- **Peak compiler memory** (`compiler_memory.md`): real rustc (not the
+  rustup shim — the first measurement caught the shim's flat 11 MB and
+  was redone) 50–66 MB per case; jestyrc 2.6–8 MB WITHOUT gcc, which
+  it forks and which is not measured. Different pipelines; footnotes
+  are load-bearing.
+- **Binary size**: Jestyr/MinGW 61–101 KB vs Rust/MSVC ~127–131 KB on
+  flat cases; the threaded pair inverts (Jestyr 226 KB vs std 160 KB,
+  rayon 213 KB). Toolchain-confounded; raw.
 
-## Surprises
+## Surprises (second pass)
 
-1. The borrowed-projection gap **cost nothing at runtime** here — a
-   24-byte copy per lookup is invisible next to the cache miss that
-   fetches the token. The gap is real but its price, at this element
-   size, is zero.
-2. Hand-rolled Rust arena vs slotmap: 56.1 vs 50.0 ms — the crate is
-   slightly faster than the obvious hand-rolled version, and 46 lines
-   shorter. The std-only track's real cost is the code, not the speed.
-3. Zero lifetime annotations appeared on the Rust side across all four
-   cases — elision covered everything. The ceremony difference between
-   the languages in these patterns is call-site sigils vs signature
-   modes, not lifetimes vs modes. Harder cases (4, 5, 7) are where named
-   lifetimes would start appearing in Rust.
+1. **The suite's first named lifetimes appeared only in case 4's
+   typed-arena twin** — and immediately brought `Cell` with them.
+   Everywhere else, elision + modes kept both languages annotation-flat.
+2. **resource_capabilities ran slightly FASTER in Jestyr** (20.9 vs
+   24.0 ms) — a `take`-and-return pipeline through gcc optimizes to
+   nothing just as well as Rust's moves through LLVM.
+3. **The three-way concurrency tie** (94.7 / 100.5 / 106.4 ms): the
+   fused `par for` worker, hand-chunked scoped threads, and rayon's
+   work-stealing all hit memory bandwidth on this workload. The
+   differentiator is the compile-time determinism check, which only one
+   language has — and it costs nothing at runtime here.
+4. **Use-after-take compiling was not known before this suite** — a
+   benchmark probe, not a fuzzer or an audit, surfaced it (plus the
+   never-dropped take param). Twin-writing is an effective adversarial
+   review of the ownership model.
 
-## Next steps
+## Remaining follow-ups
 
-- Cases 4 (arena AST), 5 (doubly linked list — `dlist_genref.jtr` is a
-  ready-made Jestyr side), 7 (resource capabilities, part design-only),
-  8 (structured concurrency — reuse `heavy_parsum` discipline), 9
-  (unsafe boundary).
-- `emit-c` diff to confirm the case-3 bounds-check attribution.
-- Peak compiler memory measurement (deferred from first pass).
-- A stale-deref *fault* demo (bare `.*` after `gen_free`) as a recorded
-  runtime-behavior probe alongside the compile-time rejections.
+- The spun-off compiler task: take-param drops + use-after-take
+  poisoning (feeds mosaic item 7).
+- Mosaic item 6 (region-scoped cells) now has its target numbers: beat
+  210 ms/5.4× on arena_ast and 52 ms/3.2× on dlist while keeping the
+  checked-or-faulting guarantee.
+- A stale-deref fault demo (bare `.*` after `gen_free`) as a recorded
+  runtime-behavior probe.
+- gcc-side memory for the Jestyr pipeline if a fair job-object-based
+  measurement is ever wanted.

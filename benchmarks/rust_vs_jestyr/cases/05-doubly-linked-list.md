@@ -1,19 +1,33 @@
 # Case 5 — Doubly Linked List / Graph
 
-**Status: planned** (second pass)
+**Status: implemented** (rust/std, rust/idiomatic (slotmap), jestyr)
 
 ## What it tests
 
-The intentionally hard case: back-edges. Rust std-only either goes
-index-based or pays for `Rc<RefCell<_>>` (runtime borrow flags, leak-able
-cycles); the honest unsafe variant is a separate, clearly-marked file if
-written at all. The ecosystem track uses a slotmap/arena. Jestyr's
-candidates: genref-linked nodes (the `dlist` shape mentioned in the
-safety-mosaic notes) and the enum `@copy` niche-Link representation.
+The intentionally hard case: back-edges under churn. 200,000 nodes
+pushed back, forward sum, delete-every-3rd mid-walk (tail guarded),
+backward sum, insert-after-every-5th mid-walk, final sum + count.
 
-## Sketch
+## What each side actually expressed
 
-Build a 1,000,000-node deque via pushes at both ends, splice and reverse
-segments, walk both directions folding a checksum. Score escape hatches
-(`unsafe`, `RefCell`, index arithmetic) as first-class results, runtime
-second.
+- **rust-std**: slot indices in a `Vec` (`u32` prev/next + NIL). No
+  unsafe, no `Rc<RefCell<_>>` — but deleted slots are unlinked, not
+  freed (reuse would need a hand-rolled free list), and a stale index
+  silently reads whatever occupies the slot. The bidirectional patch is
+  easy precisely because nothing checks it.
+- **rust-idiomatic**: `slotmap` keys as links. Removal genuinely frees;
+  a stale key deterministically MISSES. Generational safety as a crate.
+- **jestyr**: genrefs + `@copy` Link — the `dlist_genref.jtr` shape,
+  minus the take-ceremony that enum `@copy` (00dfcee) retired: link
+  surgery through read-position bindings, removal is unlink + `gen_free`.
+  A stale handle touched after `gen_free` FAULTS deterministically —
+  the language-level version of what slotmap does as a library, with a
+  harder failure mode (fault vs miss) and a stronger guarantee (the
+  std twin has neither).
+
+## Escape hatches used
+
+None on any side: no `unsafe`, no `RefCell`, no `Rc`. The std twin's
+"escape hatch" is subtler — it escaped into UNCHECKED indices, which
+compile clean and verify nothing. That asymmetry (where did the safety
+go?) is the case's real result; see ANALYSIS.
