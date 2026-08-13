@@ -7,6 +7,62 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/test` + `std/test_report` — expectations and golden comparison, split
+  across the tier boundary.** The `@test` harness has existed since workstream O
+  and had two users in the whole corpus, because writing a test meant hand-rolling
+  `if str_eq(a, b) == false { return false }` and getting a bare `false` back when
+  it failed. Now: `test.eq_str(c, rep, "base", got, want)` records the check,
+  returns the verdict, and appends `FAIL base: got "x" want "y"` — and
+  `test_report.finish(c, raw)` is the last line of the test body.
+
+  The split is the point. `test.jtr` is `core`: zero imports, every function
+  `@no_alloc` (so "asserting never allocates" is checked, not claimed), and it
+  **cannot print**. A `Check` value counts; failure text is rendered into a `[]u8`
+  the caller supplies. `test_report.jtr` is the `std` half and the only file in the
+  slice that performs an effect. That is what lets one `Check` end up on stdout,
+  another end up compared against a golden file, and a third run somewhere with no
+  stdout at all.
+
+  `eq_golden` compares line-wise, insensitive to CRLF and to a missing final
+  newline and to nothing else — so the same golden file compares equal checked out
+  on Windows and on POSIX — and names the line that differs, which is the whole
+  value of a golden over `str_eq`. `escaped` renders arbitrary bytes as printable
+  ASCII, so a failure message can show you the trailing `\r` that made two
+  apparently-identical lines differ; the property that makes it trustworthy is
+  that it **round-trips** (an independent decoder recovers the original bytes at
+  arbitrary bytes, under the fuzzer), so two different values can never render
+  alike. It also means the report is always valid UTF-8, which is why
+  `test_report.finish` can hand it to `from_utf8` unconditionally instead of
+  carrying a latent abort in the failure path.
+
+  Everything from the caller goes through the escaper — values **and** check
+  names. An earlier version wrote the name through the module-authored-text path,
+  so a name containing `\n` forged an extra `FAIL` line into the report (log
+  injection, in miniature) and a name containing a high byte would have broken the
+  printable-ASCII invariant that `from_utf8` call depends on. Pinned by
+  `a_check_name_cannot_forge_a_report_line`. Worth recording that the property
+  tests could not have caught it: they check the primitives, and the hole was in a
+  caller of them.
+
+  Six verification layers, all green: 21 colocated `@test` functions, 3
+  toolchain-free compile-clean tests, 11 proptest properties over a Rust oracle, 4
+  Bolero fuzz targets, a differential test driving the **compiled Jestyr module**
+  against that oracle (five ops × 48 cases), and byte-identity between the
+  reference backend and the self-hosted `cgen.jtr` including the emitted test
+  harness. The differential test reaches bytes `path`'s could not: `test_demo.jtr`
+  takes stand-ins in its arguments (`;` newline, `^` backslash, `#` quote, `!`
+  0x01), where `path_matches_the_reference` had to exclude backslash because it
+  passed paths through the command line literally.
+
+  No new intrinsic, no closure change, no reseed. Three language gaps recorded
+  in `docs/stdlib-roadmap.md` from building it: a capability handle cannot own
+  borrowed storage (a borrow is second-class, so `[]u8` cannot be a struct field
+  — counters live in the handle, storage stays with the caller); `[]u8` cannot be
+  range-sliced, which is why `finish` takes a `*mut u8` at all; and module
+  `const`s are emitted **unqualified**, so `std/path`'s `BACKSLASH` and this
+  module's collided as `redefinition of 'j_BACKSLASH'` in generated C — note the
+  asymmetry with modules-v2, which does let two modules share a struct name.
+
 - **`mono_nanos` intrinsic and `std/time` — Jestyr code can measure elapsed
   time.** Until now it could not ask the clock at all: `@bench` timed a whole
   function from generated C, and every other measurement in the repo timed

@@ -183,7 +183,8 @@ The self-hosted compiler and the standard library, all in Jestyr:
   → `escape.jtr` → `cgen.jtr` (which also contains the module loader and
   the gcc driver). The `*_cli.jtr` files are their stage-dump entry points.
 * **The stdlib:** `core.jtr`, `mem.jtr`, `io.jtr`, `list.jtr`, `fs.jtr`,
-  `env.jtr`, `path.jtr`, `strmap.jtr`, `intern.jtr`, `combinators.jtr`,
+  `env.jtr`, `path.jtr`, `test.jtr`, `test_report.jtr`, `strmap.jtr`,
+  `intern.jtr`, `combinators.jtr`,
   `slice_algos.jtr`. See [docs/stdlib-roadmap.md](../docs/stdlib-roadmap.md)
   for the tiers (`core` / `mem` / `std` / `sys` / `parallel`), what is
   planned next, and what is deliberately staying out.
@@ -202,6 +203,17 @@ The self-hosted compiler and the standard library, all in Jestyr:
     queries return `read str` views into the argument, and composition writes
     into a caller buffer. It also ships its own `@test` suite —
     `jestyrc test examples/std/path.jtr`. Worked examples in `path_demo.jtr`.
+  * `test.jtr` + `test_report.jtr` are expectations and golden comparison for
+    the `@test` harness, split across the tier boundary on purpose. `test.jtr`
+    is `core` — zero imports, every function `@no_alloc`, and it cannot print:
+    a `Check` handle counts, and failure text is rendered into a `[]u8` the
+    caller supplies. `test_report.jtr` is the `std` half and the only file in
+    the slice that performs an effect (`finish`/`dump` print; `exit_code`
+    doesn't). `eq_golden` compares line-wise, insensitive to CRLF and to a
+    missing final newline, and names the line that differs; `escaped` renders
+    arbitrary bytes as printable ASCII so a failure message can show you the
+    trailing `\r`. Worked examples in `test_demo.jtr`; own suite via
+    `jestyrc test examples/std/test.jtr`.
 * **Numerics & determinism:** `numbers.jtr`, `parse_float.jtr`,
   `format_float.jtr`, `float_bits.jtr`, `binned.jtr`, `reductions.jtr`,
   `numerics_canary.jtr` (the locked determinism canary), `sha256.jtr`

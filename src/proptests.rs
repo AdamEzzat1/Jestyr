@@ -3539,6 +3539,388 @@ mod path_props {
     }
 }
 
+// ------------------------------------------------------------ std/test oracle
+//
+// An independent Rust implementation of the `examples/std/test.jtr` spec — the
+// value rendering and the line-wise golden comparison. As with the `std/path`
+// oracle above, this is the *oracle* and not a convenience: the c-oracle
+// property test runs generated inputs through the real compiled Jestyr module
+// and through these, and requires them to agree.
+//
+// Byte-level on purpose. Both halves of the spec are defined over bytes — the
+// escaping classifies each byte independently, and `\n` (0x0A) and `\r` (0x0D)
+// can never appear inside a multi-byte UTF-8 sequence (continuation bytes are
+// >= 0x80) — so the byte form is total on arbitrary input *and* exact on text.
+
+fn test_ref_is_plain(b: u8) -> bool {
+    b != b'\\' && b != b'"' && (0x20..0x7f).contains(&b)
+}
+
+fn test_ref_esc_width(b: u8) -> usize {
+    if test_ref_is_plain(b) {
+        return 1;
+    }
+    match b {
+        b'\\' | b'"' | b'\n' | b'\r' | b'\t' => 2,
+        _ => 4,
+    }
+}
+
+fn test_ref_escaped_len(v: &[u8]) -> usize {
+    v.iter().map(|&b| test_ref_esc_width(b)).sum()
+}
+
+/// The escaped rendering of one byte.
+fn test_ref_esc_byte(b: u8) -> Vec<u8> {
+    if test_ref_is_plain(b) {
+        return vec![b];
+    }
+    match b {
+        b'\\' => b"\\\\".to_vec(),
+        b'"' => b"\\\"".to_vec(),
+        b'\n' => b"\\n".to_vec(),
+        b'\r' => b"\\r".to_vec(),
+        b'\t' => b"\\t".to_vec(),
+        _ => format!("\\x{b:02x}").into_bytes(),
+    }
+}
+
+/// `escaped(v, dst)` with `dst.len() == cap`: whole escape units only, so a
+/// short destination truncates cleanly and never emits half of an escape.
+/// `cap == usize::MAX` is the untruncated rendering.
+fn test_ref_escaped(v: &[u8], cap: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &b in v {
+        let unit = test_ref_esc_byte(b);
+        if out.len() + unit.len() > cap {
+            break;
+        }
+        out.extend_from_slice(&unit);
+    }
+    out
+}
+
+/// The inverse of `test_ref_escaped`, or `None` if the input is not a
+/// well-formed rendering. Not part of the Jestyr module's API — it exists so the
+/// property tests can state the strongest claim available about the escaping:
+/// that it is UNAMBIGUOUS. A rendering you cannot decode is a rendering that
+/// could show two different values identically, which is the one failure mode a
+/// failure message must not have.
+fn test_ref_unescape(v: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        if v[i] != b'\\' {
+            if !test_ref_is_plain(v[i]) {
+                return None; // a raw byte that should have been escaped
+            }
+            out.push(v[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let tag = *v.get(i)?;
+        i += 1;
+        match tag {
+            b'\\' => out.push(b'\\'),
+            b'"' => out.push(b'"'),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'x' => {
+                let hex = v.get(i..i + 2)?;
+                let s = std::str::from_utf8(hex).ok()?;
+                out.push(u8::from_str_radix(s, 16).ok()?);
+                i += 2;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// The index of the first `\n` at or after `from`; `s.len()` when there is none.
+fn test_ref_nl_at(s: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i < s.len() {
+        if s[i] == b'\n' {
+            return i;
+        }
+        i += 1;
+    }
+    s.len()
+}
+
+/// The content of the line beginning at `from`, without its `\n` or a `\r`
+/// immediately before it.
+fn test_ref_line_body(s: &[u8], from: usize) -> &[u8] {
+    let mut e = test_ref_nl_at(s, from);
+    if e > from && s[e - 1] == b'\r' {
+        e -= 1;
+    }
+    &s[from..e]
+}
+
+/// Where the line after the one beginning at `from` starts; `s.len()` when that
+/// was the last line — which is what makes a trailing newline optional.
+fn test_ref_line_next(s: &[u8], from: usize) -> usize {
+    let e = test_ref_nl_at(s, from);
+    if e == s.len() {
+        return s.len();
+    }
+    e + 1
+}
+
+fn test_ref_line_count(s: &[u8]) -> usize {
+    let mut at = 0;
+    let mut n = 0;
+    while at < s.len() {
+        n += 1;
+        at = test_ref_line_next(s, at);
+    }
+    n
+}
+
+/// The 1-based number of the first line where `got` and `want` differ, or 0 when
+/// they are line-wise equal.
+fn test_ref_first_diff_line(got: &[u8], want: &[u8]) -> usize {
+    let mut a = 0;
+    let mut b = 0;
+    let mut ln = 0;
+    while a < got.len() || b < want.len() {
+        ln += 1;
+        if a >= got.len() || b >= want.len() {
+            return ln;
+        }
+        if test_ref_line_body(got, a) != test_ref_line_body(want, b) {
+            return ln;
+        }
+        a = test_ref_line_next(got, a);
+        b = test_ref_line_next(want, b);
+    }
+    0
+}
+
+fn test_ref_lines_eq(got: &[u8], want: &[u8]) -> bool {
+    test_ref_first_diff_line(got, want) == 0
+}
+
+/// The `test_demo` argument stand-ins, applied Rust-side so the oracle sees the
+/// same bytes the compiled Jestyr module does. Mirrors `unescape_arg` in
+/// `examples/std/test_demo.jtr` exactly.
+fn test_ref_unescape_arg(s: &str) -> Vec<u8> {
+    s.bytes()
+        .map(|b| match b {
+            b';' => b'\n',
+            b'~' => b'\r',
+            b'^' => b'\\',
+            b'#' => b'"',
+            b'@' => b'\t',
+            b'!' => 0x01,
+            other => other,
+        })
+        .collect()
+}
+
+/// **`std/test` — toolchain-free layer.** The three files of the slice lower with
+/// no diagnostics, and the Rust oracle upholds the invariants the Jestyr module
+/// documents. The differential check against the real compiled module needs a C
+/// compiler and lives in `c_oracle::test_matches_the_reference`.
+mod test_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn diags_of(rel: &str) -> Vec<String> {
+        let prog = crate::module::load(rel);
+        let mut diags: Vec<String> = prog.diags.iter().map(|d| d.message.clone()).collect();
+        let (info, td) = typeck::check_program(&prog.ast, &prog.modules);
+        diags.extend(td.iter().map(|d| d.message.clone()));
+        diags.extend(escape::check(&prog.ast, &info).iter().map(|d| d.message.clone()));
+        let (_c, cd) = cgen::emit(&prog.ast, &info);
+        diags.extend(cd.iter().map(|d| d.message.clone()));
+        diags
+    }
+
+    /// The module is `@no_alloc` throughout, so this also proves the escape
+    /// checker accepts the allocation-free contract on every function in it —
+    /// "asserting never allocates" is checked here, not asserted in a doc.
+    #[test]
+    fn test_module_compiles_clean() {
+        let d = diags_of("examples/std/test.jtr");
+        assert!(d.is_empty(), "examples/std/test.jtr: {d:?}");
+    }
+
+    /// The hosted half. It is *not* `@no_alloc`-annotated and does not need to
+    /// be: it prints, which is the whole reason it is a separate file.
+    #[test]
+    fn test_report_module_compiles_clean() {
+        let d = diags_of("examples/std/test_report.jtr");
+        assert!(d.is_empty(), "examples/std/test_report.jtr: {d:?}");
+    }
+
+    /// The demo imports five modules at once (`test`, `test_report`, `path`,
+    /// `env`, `fs`), so this is also the regression for the const-name collision
+    /// that `std/path`'s `BACKSLASH` and this module's caused in generated C.
+    #[test]
+    fn test_demo_compiles_clean() {
+        let d = diags_of("examples/std/test_demo.jtr");
+        assert!(d.is_empty(), "examples/std/test_demo.jtr: {d:?}");
+    }
+
+    /// The worked cases from the module's own doc comments and unit tests,
+    /// checked against the oracle — so the oracle is pinned to the documented
+    /// behavior before it is used to judge the Jestyr implementation.
+    #[test]
+    fn reference_matches_the_documented_cases() {
+        let esc = |s: &str| String::from_utf8(test_ref_escaped(s.as_bytes(), usize::MAX)).unwrap();
+        assert_eq!(esc("a\nb"), "a\\nb");
+        assert_eq!(esc("x\ty\r"), "x\\ty\\r");
+        assert_eq!(esc("q\"q"), "q\\\"q");
+        assert_eq!(esc("plain"), "plain");
+        assert_eq!(esc(""), "");
+        assert_eq!(esc("é"), "\\xc3\\xa9");
+        assert_eq!(test_ref_escaped_len("é".as_bytes()), 8);
+        // A destination too small for `a` plus `\n` emits `a` alone, never a
+        // dangling backslash.
+        assert_eq!(test_ref_escaped(b"a\nb", 2), b"a".to_vec());
+
+        let lc = |s: &str| test_ref_line_count(s.as_bytes());
+        assert_eq!(lc(""), 0);
+        assert_eq!(lc("a"), 1);
+        assert_eq!(lc("a\n"), 1);
+        assert_eq!(lc("a\nb"), 2);
+        assert_eq!(lc("a\nb\n"), 2);
+        assert_eq!(lc("a\n\n"), 2);
+        assert_eq!(lc("\n"), 1);
+
+        let d = |a: &str, b: &str| test_ref_first_diff_line(a.as_bytes(), b.as_bytes());
+        assert_eq!(d("a\nb\nc", "a\nb\nc"), 0);
+        assert_eq!(d("a\nX\nc", "a\nb\nc"), 2);
+        assert_eq!(d("X\nb", "a\nb"), 1);
+        assert_eq!(d("a\nb", "a"), 2);
+        assert_eq!(d("a", "a\nb"), 2);
+        assert_eq!(d("", "a"), 1);
+
+        let e = |a: &str, b: &str| test_ref_lines_eq(a.as_bytes(), b.as_bytes());
+        assert!(e("a\r\nb\r\n", "a\nb"));
+        assert!(e("a\nb\n", "a\nb"));
+        assert!(!e("a\n\n", "a"));
+        assert!(!e("", "\n"));
+    }
+
+    proptest! {
+        /// **The report is always printable.** Every byte of an escaped value is
+        /// in 0x20..0x7e, which is what lets `std/test_report.finish` hand the
+        /// report to `from_utf8` unconditionally — `from_utf8` traps on invalid
+        /// UTF-8, so an unescaped value would be a latent abort in the failure
+        /// path, the worst possible place for one.
+        #[test]
+        fn reference_escaped_is_printable_ascii(v in proptest::collection::vec(any::<u8>(), 0..64)) {
+            for &b in test_ref_escaped(&v, usize::MAX).iter() {
+                prop_assert!((0x20..0x7f).contains(&b), "non-printable {b:#04x} in rendering of {v:?}");
+            }
+        }
+
+        /// `escaped_len` is exactly the length `escaped` produces when it is not
+        /// truncated — the contract that lets a caller size a buffer instead of
+        /// guessing.
+        #[test]
+        fn reference_escaped_len_agrees(v in proptest::collection::vec(any::<u8>(), 0..64)) {
+            prop_assert_eq!(test_ref_escaped(&v, usize::MAX).len(), test_ref_escaped_len(&v));
+        }
+
+        /// **The escaping is unambiguous:** decoding a rendering recovers the
+        /// original bytes exactly. This is the property that makes a failure
+        /// message trustworthy — two different values can never render alike.
+        #[test]
+        fn reference_escaping_round_trips(v in proptest::collection::vec(any::<u8>(), 0..64)) {
+            let rendered = test_ref_escaped(&v, usize::MAX);
+            prop_assert_eq!(test_ref_unescape(&rendered), Some(v));
+        }
+
+        /// A truncated rendering is still a well-formed one: a prefix of the
+        /// full rendering, and decodable on its own. Half an escape would be
+        /// neither.
+        #[test]
+        fn reference_truncation_never_splits_an_escape(
+            v in proptest::collection::vec(any::<u8>(), 0..64),
+            cap in 0usize..80,
+        ) {
+            let full = test_ref_escaped(&v, usize::MAX);
+            let cut = test_ref_escaped(&v, cap);
+            prop_assert!(cut.len() <= cap, "wrote {} into a cap of {cap}", cut.len());
+            prop_assert!(full.starts_with(&cut), "truncation is not a prefix: {cut:?} of {full:?}");
+            prop_assert!(test_ref_unescape(&cut).is_some(), "truncated to something undecodable: {cut:?}");
+        }
+
+        /// Line-wise comparison is reflexive, and 0 means equal.
+        #[test]
+        fn reference_first_diff_line_is_reflexive(s in r"[ab\r\n]{0,40}") {
+            prop_assert_eq!(test_ref_first_diff_line(s.as_bytes(), s.as_bytes()), 0);
+            prop_assert!(test_ref_lines_eq(s.as_bytes(), s.as_bytes()));
+        }
+
+        /// **Symmetric.** The two early-return guards ("got ran out" and "want
+        /// ran out") are ordered, so this could plausibly be false; the module's
+        /// doc comment claims it, and callers reporting `got`/`want` either way
+        /// round rely on it.
+        #[test]
+        fn reference_first_diff_line_is_symmetric(a in r"[ab\r\n]{0,40}", b in r"[ab\r\n]{0,40}") {
+            prop_assert_eq!(
+                test_ref_first_diff_line(a.as_bytes(), b.as_bytes()),
+                test_ref_first_diff_line(b.as_bytes(), a.as_bytes())
+            );
+        }
+
+        /// The answer is a line number that exists in at least one side, or one
+        /// past the shorter side's last — never further.
+        #[test]
+        fn reference_first_diff_line_is_bounded(a in r"[ab\r\n]{0,40}", b in r"[ab\r\n]{0,40}") {
+            let r = test_ref_first_diff_line(a.as_bytes(), b.as_bytes());
+            let lo = test_ref_line_count(a.as_bytes()).min(test_ref_line_count(b.as_bytes()));
+            prop_assert!(r <= lo + 1, "first_diff_line {r} exceeds min line count {lo} + 1");
+        }
+
+        /// **CRLF is invisible.** The same text with every `\n` widened to
+        /// `\r\n` — a golden file checked out on Windows — compares equal. This
+        /// is the entire reason `eq_golden` exists rather than `eq_str`.
+        #[test]
+        fn reference_crlf_is_invisible(s in r"[ab\n]{0,40}") {
+            let unix = s.replace("\r\n", "\n");
+            let dos = unix.replace('\n', "\r\n");
+            prop_assert!(
+                test_ref_lines_eq(dos.as_bytes(), unix.as_bytes()),
+                "{dos:?} should compare equal to {unix:?}"
+            );
+        }
+
+        /// **A final newline is optional.** Appending one to a non-empty text
+        /// never changes the comparison, and never changes the line count.
+        #[test]
+        fn reference_final_newline_is_optional(s in r"[ab\n]{1,40}") {
+            let with = format!("{s}\n");
+            let before = test_ref_line_count(s.as_bytes());
+            // Appending a newline closes an already-open last line — unless the
+            // text already ended in one, in which case it opens a new (empty)
+            // one.
+            if !s.ends_with('\n') {
+                prop_assert!(test_ref_lines_eq(with.as_bytes(), s.as_bytes()));
+                prop_assert_eq!(test_ref_line_count(with.as_bytes()), before);
+            } else {
+                prop_assert_eq!(test_ref_line_count(with.as_bytes()), before + 1);
+            }
+        }
+
+        /// The argument decoder used by the differential test is length- and
+        /// order-preserving, so a generated case maps to exactly the bytes the
+        /// oracle is asked about.
+        #[test]
+        fn reference_arg_decoder_is_byte_for_byte(s in r"[ab;~^#@!]{0,40}") {
+            prop_assert_eq!(test_ref_unescape_arg(&s).len(), s.len());
+        }
+    }
+}
+
 mod fuzz {
     use super::*;
 
@@ -3569,6 +3951,88 @@ mod fuzz {
             let ext = path_ref_ext(b);
             assert!(stem.len() <= path_ref_base(b).len());
             assert!(ext.len() <= path_ref_base(b).len());
+        });
+    }
+
+    /// **The `std/test` value renderer is total.** Arbitrary bytes — NULs,
+    /// invalid UTF-8, high bytes, quote and backslash soup — must not panic the
+    /// oracle, and must come out printable and decodable. The escaping is the
+    /// only thing standing between a value and `from_utf8` in
+    /// `std/test_report.finish`, so a byte it mishandles is an abort in the
+    /// failure path.
+    #[test]
+    fn fuzz_test_escaping_is_total() {
+        bolero::check!().with_type::<Vec<u8>>().for_each(|v: &Vec<u8>| {
+            let rendered = test_ref_escaped(v, usize::MAX);
+            assert_eq!(rendered.len(), test_ref_escaped_len(v), "escaped_len disagrees on {v:?}");
+            for &b in rendered.iter() {
+                assert!((0x20..0x7f).contains(&b), "non-printable {b:#04x} rendering {v:?}");
+            }
+            assert_eq!(
+                test_ref_unescape(&rendered).as_ref(),
+                Some(v),
+                "rendering of {v:?} does not decode back"
+            );
+        });
+    }
+
+    /// Truncation is total too, at every cap: never over the cap, always a
+    /// prefix of the full rendering, always decodable on its own. The cap is
+    /// derived from the input so a tiny fuzz case reaches both sides of every
+    /// escape width (1, 2 and 4).
+    #[test]
+    fn fuzz_test_escaped_truncation_is_total() {
+        bolero::check!().with_type::<Vec<u8>>().for_each(|v: &Vec<u8>| {
+            let cap = v.first().copied().unwrap_or(0) as usize % 24;
+            let full = test_ref_escaped(v, usize::MAX);
+            let cut = test_ref_escaped(v, cap);
+            assert!(cut.len() <= cap, "wrote {} into a cap of {cap} for {v:?}", cut.len());
+            assert!(full.starts_with(&cut), "truncation not a prefix for {v:?}");
+            assert!(test_ref_unescape(&cut).is_some(), "truncation undecodable for {v:?}");
+        });
+    }
+
+    /// **Line comparison is total and self-consistent** on arbitrary bytes: the
+    /// answer is symmetric, within one past the shorter side's line count, and 0
+    /// exactly when the two are line-wise equal. Splits the fuzz input into two
+    /// sides at a derived point so a single flat input exercises both operands,
+    /// including the empty-vs-nonempty and identical-halves cases.
+    #[test]
+    fn fuzz_test_line_diff_is_total() {
+        bolero::check!().with_type::<Vec<u8>>().for_each(|bytes: &Vec<u8>| {
+            let at = if bytes.is_empty() { 0 } else { bytes[0] as usize % (bytes.len() + 1) };
+            let (a, b) = bytes.split_at(at.min(bytes.len()));
+
+            let r = test_ref_first_diff_line(a, b);
+            assert_eq!(r, test_ref_first_diff_line(b, a), "asymmetric on {a:?} / {b:?}");
+            let lo = test_ref_line_count(a).min(test_ref_line_count(b));
+            assert!(r <= lo + 1, "first_diff_line {r} exceeds {lo} + 1 on {a:?} / {b:?}");
+            assert_eq!(r == 0, test_ref_lines_eq(a, b), "lines_eq disagrees on {a:?} / {b:?}");
+
+            // Reflexivity, on both halves, at arbitrary bytes.
+            assert_eq!(test_ref_first_diff_line(a, a), 0, "not reflexive on {a:?}");
+            assert_eq!(test_ref_first_diff_line(b, b), 0, "not reflexive on {b:?}");
+        });
+    }
+
+    /// **CRLF stays invisible at arbitrary bytes.** Widening every `\n` to
+    /// `\r\n` must never change a golden comparison — the claim `eq_golden`
+    /// exists to make, fuzzed rather than sampled, because the `\r`-stripping
+    /// rule only removes ONE `\r` and a run of them is the obvious edge.
+    #[test]
+    fn fuzz_test_crlf_widening_is_invisible() {
+        bolero::check!().with_type::<Vec<u8>>().for_each(|v: &Vec<u8>| {
+            // Normalize to LF first: widening is only invisible relative to a
+            // text that has no `\r` of its own to be confused with.
+            let unix: Vec<u8> = v.iter().copied().filter(|&b| b != b'\r').collect();
+            let mut dos = Vec::with_capacity(unix.len() * 2);
+            for &b in unix.iter() {
+                if b == b'\n' {
+                    dos.push(b'\r');
+                }
+                dos.push(b);
+            }
+            assert!(test_ref_lines_eq(&dos, &unix), "CRLF widening changed the verdict on {unix:?}");
         });
     }
 
@@ -6944,6 +7408,11 @@ mod c_oracle {
     use super::{
         path_ref_base, path_ref_dir, path_ref_dir_len, path_ref_ext, path_ref_is_abs,
         path_ref_join, path_ref_normalize, path_ref_stem,
+    };
+    // The `std/test` oracle, likewise.
+    use super::{
+        test_ref_escaped, test_ref_escaped_len, test_ref_first_diff_line, test_ref_line_count,
+        test_ref_lines_eq, test_ref_unescape_arg,
     };
     use std::process::Command;
 
@@ -12279,7 +12748,7 @@ fn main() -> i32 {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr"];
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr"];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
     /// target). This is the acceptance bar the R2 fixpoint ultimately rests on. `DUMP_DIVERGE=1`
@@ -13022,6 +13491,140 @@ fn main() -> i32 {
             let once = norm(&s);
             let twice = norm(&once);
             proptest::prop_assert_eq!(&once, &twice, "not idempotent on {:?}", s);
+        }
+        );
+    }
+
+    /// **`std/test` end-to-end.** The demo's documented output, verified rather
+    /// than claimed — the header comment in `test_demo.jtr` lists exactly these
+    /// lines. Compared as whole text rather than whitespace tokens, because this
+    /// module's whole subject is line structure: a token comparison would not
+    /// notice the slice's newline discipline breaking.
+    ///
+    /// It is also the end-to-end proof of the `fs` handoff — the last three
+    /// lines are a golden written to disk, read back, and compared, so the
+    /// capability path the module was designed around is exercised and not just
+    /// described.
+    #[test]
+    fn test_demo() {
+        let got = build_and_run("examples/std/test_demo.jtr").replace("\r\n", "\n");
+        let want = concat!(
+            "-- expectations --\n",
+            "FAIL ext: got \"gz\" want \"tar.gz\"\n",
+            "5 checks, 1 failed\n",
+            "-- golden --\n",
+            "FAIL report2: line 2: got \"5 checks, 1 failed\" want \"4 checks, 1 failed\"\n",
+            "2 checks, 1 failed\n",
+            "-- escaping --\n",
+            "a\\r\n",
+            "3\n",
+            "-- golden from a file --\n",
+            "1\n",
+            "1\n",
+            "0\n",
+        );
+        assert_eq!(got, want, "test_demo output drifted from its documented header");
+    }
+
+    /// **`std/test`'s own unit tests.** The module ships them beside the code, so
+    /// this runs them through the emitted harness and requires a zero exit — the
+    /// edge cases the property tests cannot name (an undersized report buffer,
+    /// `i64::MIN`, the value cap, the newline discipline) are part of the suite
+    /// rather than a manual step.
+    #[test]
+    fn test_module_unit_tests_pass() {
+        let (out, code) = build_tests_and_run("examples/std/test.jtr", None);
+        assert_eq!(code, 0, "std/test unit tests must pass:\n{out}");
+        assert!(out.contains("22 passed; 0 failed"), "unexpected harness output:\n{out}");
+    }
+
+    /// **Differential: the real Jestyr module vs the Rust oracle.** Compile
+    /// `test_demo.jtr` once, then drive it per generated case and require the
+    /// compiled Jestyr implementation to agree with `test_ref_*` on every
+    /// operation. This is what makes the property tests statements about the
+    /// shipped module rather than about a Rust re-description of it.
+    ///
+    /// The generated alphabet is the argument stand-ins (`;` newline, `~` CR, `^`
+    /// backslash, `#` quote, `@` tab, `!` a control byte) plus plain letters, so
+    /// every byte the escaping treats specially is reachable — unlike
+    /// `path_matches_the_reference`, which had to exclude backslash because it
+    /// passed paths through the command line literally.
+    #[test]
+    fn test_matches_the_reference() {
+        use std::sync::OnceLock;
+        static EXE: OnceLock<std::path::PathBuf> = OnceLock::new();
+        let exe = EXE.get_or_init(|| build_exe("examples/std/test_demo.jtr"));
+
+        let run = |op: &str, a: &str, b: &str| -> String {
+            let out = Command::new(exe).args([op, a, b]).output().unwrap();
+            assert!(out.status.success(), "test_demo {op} {a:?} {b:?} exited {:?}", out.status);
+            String::from_utf8(out.stdout).unwrap().trim_end_matches(['\r', '\n']).to_string()
+        };
+
+        // 48 cases, not proptest's default 256: every case is five process
+        // spawns. The toolchain-free properties in `test_props` still run the
+        // full default count, so coverage of the *spec* is undiminished — this
+        // test's job is to catch the Jestyr implementation drifting from it,
+        // which a smaller sample does perfectly well.
+        proptest::proptest!(
+            proptest::prelude::ProptestConfig::with_cases(48),
+            |(s in r"[ab.;~^#@!]{0,30}", t in r"[ab.;~^#@!]{0,20}")| {
+            let x = test_ref_unescape_arg(&s);
+            let y = test_ref_unescape_arg(&t);
+
+            // `esc` prints the rendering; the demo's output buffer is 4 KiB
+            // against a 30-byte input, so it is never the truncating case (that
+            // is covered in-language and by the oracle properties).
+            proptest::prop_assert_eq!(
+                run("esc", &s, ""),
+                String::from_utf8(test_ref_escaped(&x, usize::MAX)).unwrap(),
+                "esc {:?}", s
+            );
+            proptest::prop_assert_eq!(
+                run("esclen", &s, ""),
+                test_ref_escaped_len(&x).to_string(),
+                "esclen {:?}", s
+            );
+            proptest::prop_assert_eq!(
+                run("lc", &s, ""),
+                test_ref_line_count(&x).to_string(),
+                "lc {:?}", s
+            );
+            proptest::prop_assert_eq!(
+                run("diff", &s, &t),
+                test_ref_first_diff_line(&x, &y).to_string(),
+                "diff {:?} {:?}", s, t
+            );
+            proptest::prop_assert_eq!(
+                run("lines", &s, &t),
+                if test_ref_lines_eq(&x, &y) { "1" } else { "0" },
+                "lines {:?} {:?}", s, t
+            );
+        }
+        );
+    }
+
+    /// The `esc` operation's output is printable ASCII *in the shipped module*,
+    /// not merely in the oracle — the property `std/test_report.finish` relies on
+    /// when it hands a report to `from_utf8`. Checked against the compiled
+    /// implementation because that is the one that runs.
+    #[test]
+    fn test_escaping_is_printable_end_to_end() {
+        use std::sync::OnceLock;
+        static EXE2: OnceLock<std::path::PathBuf> = OnceLock::new();
+        let exe = EXE2.get_or_init(|| build_exe("examples/std/test_demo.jtr"));
+
+        proptest::proptest!(
+            proptest::prelude::ProptestConfig::with_cases(48),
+            |(s in r"[ab.;~^#@!]{0,30}")| {
+            let out = Command::new(exe).args(["esc", &s, ""]).output().unwrap();
+            let text = String::from_utf8(out.stdout).unwrap();
+            for b in text.trim_end_matches(['\r', '\n']).bytes() {
+                proptest::prop_assert!(
+                    (0x20..0x7f).contains(&b),
+                    "non-printable {:#04x} escaping {:?}", b, s
+                );
+            }
         }
         );
     }

@@ -6,8 +6,9 @@ directory, ask the time, or assert anything without hand-rolling it. This
 document is the plan for closing that gap, and — as importantly — the list of
 things that should stay out of `std` for now.
 
-Status: **`path` landed** (2026-08-13, the first slice). Everything else here is
-a plan, not a promise.
+Status: **`path`, `env`, `time` and `test` landed** (2026-08-13). Everything else
+here is a plan, not a promise. Nothing in `std` is production-ready; this is a
+research-preview standard library being pushed toward a capability-first Std v2.
 
 ## The shape we are copying, and from whom
 
@@ -31,7 +32,7 @@ syscalls. `examples/std/core.jtr` already carries Option/Result combinators,
 slice algorithms, integer parse/format, the float tier (bits, Kahan/Neumaier,
 pairwise, binned accumulator) and correctly-rounded parse/format.
 
-Present: `core.jtr`, `path.jtr`, `sha256.jtr`, `float_bits.jtr`,
+Present: `core.jtr`, `path.jtr`, `test.jtr`, `sha256.jtr`, `float_bits.jtr`,
 `slice_algos.jtr`, `combinators.jtr`.
 
 The tier's contract is now *checked*, not merely documented: `path.jtr` marks
@@ -66,11 +67,18 @@ Thin *named* wrappers over intrinsics, so that when `extern "c"` eventually
 retires an intrinsic, exactly one module changes. `io.jtr` and `env.jtr` state
 this intent in their own headers and are the pattern to copy.
 
-Present: `fs.jtr` (read/write/exists/remove), `env.jtr` (argc/argv), `io.jtr`
-(four print wrappers).
+Present: `fs.jtr` (read/write/exists/remove), `env.jtr` (argc/argv/env_var),
+`io.jtr` (four print wrappers), `time.jtr` (monotonic elapsed),
+`test_report.jtr` (printing a `Check` report).
 
-Thin is an understatement: `fs` is 35 lines and `env` is 15. This tier is where
+Thin is an understatement: `fs` is 35 lines and `env` is 45. This tier is where
 most of the remaining work lives.
+
+`test_report.jtr` is the tier boundary made visible: it exists *only* because
+`std/test` must not print. Three functions, one import of `io`, and the whole
+rest of the slice stays `core`. When a module's job splits cleanly into "decide"
+and "emit", that is the split to make — it is what lets the deciding half be
+`@no_alloc`-proven and reusable on a freestanding target.
 
 ### `sys` — the platform boundary
 
@@ -106,7 +114,7 @@ interesting it is.
 | # | Slice | Tier | Cost | Unlocks |
 |---|---|---|---|---|
 | 1 | ~~`path`~~ ✅ | core | none | every CLI (but *not* the compiler's loader — see above) |
-| 2 | `test` — assert helpers, golden compare | core | none | makes `@test` pleasant to write; the harness exists and has almost no users |
+| 2 | ~~`test` — assert helpers, golden compare~~ ✅ | core + std | none | makes `@test` pleasant to write; the harness had two users in the whole corpus |
 | 3 | `process` — a named wrapper over `run_command` + `eprint_str` | std | none | build scripts; matches the `io.jtr` pattern exactly |
 | 4 | `str` — a named module over the string intrinsics | core | none | `substr`/`find`/`trim`/`starts_with` are compiler builtins with no module in front of them, exactly the gap `fs.jtr` describes itself as filling |
 | 5 | ~~`env` expansion (`env_var` intrinsic)~~ ✅ | std | one intrinsic + reseed | configuration, temp dirs |
@@ -115,8 +123,8 @@ interesting it is.
 | 8 | `fmt` — consolidated deterministic formatting | core | **high** | workstream E; touches types/typeck/cgen |
 | 9 | `sys` | sys | blocked | needs `extern "c"` |
 
-Slices 2–4 are the remaining *free* ones and should be taken first. Everything
-from 6 down pays a new intrinsic. That cost is now measured rather than
+Slices 3–4 (`process`, `str`) are the remaining *free* ones and should be taken
+next. Everything from 7 down pays a new intrinsic. That cost is now measured rather than
 estimated, because slice 5 paid it: **eleven edits and one reseed**, and it went
 byte-identical on the first attempt.
 
@@ -186,6 +194,184 @@ no new intrinsic, no reseed, a real in-repo consumer, and a specification crisp
 enough to property-test. It is also the shape of module we want more of —
 lexical, allocation-free, and testable without a filesystem.
 
+### Why `test` went second — and what it actually is
+
+Same reasoning as `path`, plus one thing `path` did not have: every future slice
+pays for its absence. The `@test` harness has existed since workstream O and had
+**two users in the entire corpus** (`tests_demo.jtr` and `path.jtr`), because
+writing a test meant hand-rolling `if str_eq(a, b) == false { return false }` and
+getting a bare `false` back when it failed. A test that cannot say *why* it failed
+is a test people do not write.
+
+| | |
+|---|---|
+| **Files** | `examples/std/test.jtr` (core), `examples/std/test_report.jtr` (std), `examples/std/test_demo.jtr` (demo + differential oracle driver) |
+| **Tier** | `core` for the whole decision half; `std` for the three hosted functions (`finish`/`dump` print, `exit_code` does not) |
+| **Allocates?** | **No.** Every function in `test.jtr` is `@no_alloc`, so the escape checker rejects the file if any of it reaches for the allocator. The caller's report buffer is the only storage, and the caller allocates it. |
+| **OS / runtime?** | `test.jtr`: none — no imports at all. `test_report.jtr`: stdout, nothing else. |
+| **Guarantees** | Never aborts (a failed expectation returns `false`); never allocates; the report is always printable ASCII plus `\n`; the rendering is unambiguous (decodable, so two different values can never render alike); golden comparison is insensitive to CRLF and to a missing final newline and to nothing else. |
+| **Capability model** | The recorder is an explicit `Check` value, not an ambient global. The report *sink* is a caller-supplied `[]u8`. The report *destination* is a separate module the caller chooses to import. |
+| **Limits** | No float expectations; no expected-diagnostic helpers; no temp-file helpers; first-difference only, not a full diff. All four are argued below. Plus one inherited surprise: importing `test` pulls its own 22 tests into your harness run (see below). |
+
+The API in one screen:
+
+```jestyr
+import "test"
+import "test_report"
+import "path"
+
+@test fn my_test() -> bool {
+    var raw: *mut u8 = alloc(u8, 1024)
+    var rep: []u8 = slice(u8, raw, 1024)
+    var c: test.Check = test.new()
+
+    test.eq_str(c, rep, "base", path.base("a/b.jtr"), "b.jtr")
+    test.eq_usize(c, rep, "dir_len", path.dir_len("a/b/c"), 4)
+    test.eq_golden(c, rep, "output", produced, expected)
+
+    let ok: bool = test_report.finish(c, raw)   // prints only on failure
+    free_ptr(raw)
+    return ok
+}
+```
+
+Expectations: `is_true`, `is_false`, `eq_bool`, `eq_i64`, `ne_i64`, `eq_usize`,
+`eq_str`, `eq_golden`. Queries: `passed`, `checks`, `failures`, `report_len`,
+`lost`. Composition: `note`, `tally`. Primitives, usable on their own:
+`escaped`, `escaped_len`, `line_count`, `first_diff_line`, `lines_eq`.
+
+**Three design decisions worth the words.**
+
+*The handle carries counters; the caller carries storage.* It would read better
+as `Check{ buf: rep }` and the escape checker refuses: a Jestyr borrow is
+second-class, so a `[]u8` may not be stored in a struct that outlives the call
+(`cannot store borrow in struct: a second-class borrow may not outlive its
+call`). The alternative is a raw `*mut u8` field, which drags `unsafe` into a
+`core` module to save one argument. This is safety-mosaic item 2 showing up
+again, from a different direction than `path` hit it.
+
+*The module cannot print.* `assert!` in most languages hides two effects —
+counting, somewhere global, and reporting, to somebody's stdout. Making both
+explicit is what lets one `Check` end up on stdout, another end up compared
+against a golden file, and a third run on a target with no stdout at all. Only
+the third is impossible if the assertion library prints for you.
+
+*`\n` separates report lines rather than terminating them.* The harness emits
+`printf("test %s ... ")` with no newline and `print_str` appends one, so a
+terminating newline puts a blank line in the middle of the harness's output for
+every failing test. A one-line rule in the library beats a wart in every
+consumer's output.
+
+**What was deliberately left out, and why.**
+
+- **Float expectations.** A `near_f64` whose failure message cannot show the two
+  values is worse than no helper at all, and honestly formatting an `f64` is the
+  `fmt` slice (#8, high cost, touches types/typeck/cgen). Bit-exact comparison is
+  available today as `eq_i64` over `float_bits`, which is also the comparison
+  `FP-DETERMINISM-CONTRACT.md` actually cares about.
+- **Expected-diagnostic helpers.** Asserting "this source produces error E0007
+  at 4:12" requires the compiler as a library from inside Jestyr. Real, wanted,
+  and gated on the driver growing a diagnostics API — not on this slice.
+- **Temp files and temp dirs.** No `mkdtemp` intrinsic, and inventing one from
+  `env.get("TEMP")` plus a counter would be a non-deterministic API wearing a
+  deterministic costume. It belongs to the `fs` expansion (#7), which pays new
+  intrinsics anyway.
+- **A full diff.** `first_diff_line` answers "where", which is the whole value of
+  a golden over `str_eq`. An edit-distance diff needs somewhere to put its output
+  and a policy about how much of it to keep; that is a slice, not a function.
+- **`unwrap`-style helpers.** Same reason as everywhere else in this document.
+
+**One inherited surprise, worth knowing before you import it.** The `@test`
+harness collects tests from the whole import closure, so `jestyrc test
+my_module.jtr` on a file importing `test` also runs `test`'s own 22. This is
+pre-existing harness behavior rather than something the module introduces —
+`jestyrc test examples/std/path_demo.jtr` already runs `std/path`'s eleven, and
+`path_demo.jtr` has no tests of its own — but it becomes much more visible once a
+stdlib module people actually import ships a suite. The name filter (`jestyrc test
+my_module.jtr my_`) narrows it, and filters at codegen so the `running N test(s)`
+line counts only what was baked. Whether the harness *should* scope to the named
+file is a driver question, not a library one.
+
+**How it was verified.** Six layers, all green:
+
+| Layer | What | Command |
+|---|---|---|
+| Jestyr unit | 22 colocated `@test` functions | `jestyrc test examples/std/test.jtr` |
+| Rust toolchain-free | 3 compile-clean (module, hosted half, 5-import demo) + 1 oracle-pinning case set | `cargo test --release test_props` |
+| Property (proptest) | 11 properties over the Rust oracle | same |
+| Bolero fuzz | 4 totality/consistency targets on arbitrary bytes | `cargo test --release fuzz_test_` |
+| Differential (c-oracle) | the **compiled Jestyr module** vs the Rust oracle, five ops × 48 cases | `cargo test --release --features c-oracle c_oracle::test_` |
+| Byte-identity golden | reference backend ≡ self-hosted `cgen.jtr`, incl. test-mode harness | `cargo test --release --features c-oracle jestyr_cgen` |
+
+The differential test is the load-bearing one, and it does something
+`path_matches_the_reference` could not: `test_demo.jtr` takes byte *stand-ins* in
+its arguments (`;` newline, `~` CR, `^` backslash, `#` quote, `@` tab, `!` 0x01),
+so every byte the escaping treats specially reaches the compiled module. `path`'s
+differential test had to exclude backslash entirely because it passed paths
+through the command line literally, and says so in its own doc comment.
+
+The strongest property is that the escaping **round-trips**: an independent Rust
+decoder recovers the original bytes from every rendering, at arbitrary bytes,
+under the fuzzer. That is the claim a failure message actually needs — not that
+the rendering is pretty, but that two different values can never render alike.
+
+Heeding the lesson `path` learned the hard way (a differential test cannot catch
+a bug both implementations share), the oracle is pinned to the module's own
+documented cases *before* it is used to judge anything, and the awkward cases
+that a generator will not name — `i64::MIN`, an undersized report buffer, the
+96-byte value cap, the newline discipline — are pinned by named in-language tests
+instead.
+
+## Std v2: capabilities, not conveniences
+
+The direction the stdlib is being built in, stated so it can be argued with.
+
+1. **Ownership is visible.** Views out (`-> read str`), buffers in (`mut buf:
+   []u8`). No function returns storage the caller did not ask for.
+2. **Allocation is explicit.** If a function allocates, an `Allocator` is in its
+   signature. If it cannot allocate, `@no_alloc` proves it.
+3. **The safety tier is visible.** `core` / `mem` / `std` / `sys` is a real
+   boundary, not a naming convention — and when a module straddles it, the module
+   splits (see `test` / `test_report`).
+4. **Effects go through handles, not globals.** An explicit `Fs`, `Clock`, `Env`,
+   `Process`, `Reader`, `Writer` or recorder beats an ambient free function,
+   because a handle can be substituted, sandboxed, or absent.
+5. **Deterministic by default.** Where a platform difference exists, the API
+   picks one answer and writes it down (`path` writes only `/`; `test` treats
+   CRLF as invisible).
+6. **Borrowed adapters over allocating results.** A collector allocates only when
+   an allocator is in the signature.
+
+### Tier 2 roadmap impact
+
+Where this slice leaves the seven planned Tier 2 areas.
+
+| Area | Status after this slice |
+|---|---|
+| **5. Testing / golden utilities** | **Advanced, mostly.** Assertions, expect-eq, golden comparison and the report sink all landed. Expected diagnostics and temp dirs did not (both argued above). |
+| **6. No-std contract** | **Advanced.** The `core` / `std` line is now *demonstrated* rather than described: `test.jtr` has zero imports and is `@no_alloc` throughout; the only effect in the slice is three functions in a separate `std` file. This is the pattern the remaining slices should copy. |
+| **3. Reader / Writer** | **Nudged, not built.** `put`/`puts`/`put_i64` in `test.jtr` are a minimal byte sink over a caller buffer, and `tally` is formatting-into-a-sink. That is the shape a real `Writer` generalizes; the sink is deliberately private so nothing depends on it before the real abstraction exists. |
+| **1. Capability handles** | **Pattern established, handles not built.** `Check` is a capability-shaped recorder and `test_demo.jtr` shows the `fs` → `test` → `test_report` handoff, but `Fs`/`Clock`/`Env`/`Process` are still ambient free functions over intrinsics. |
+| **2. Typed `Path`/`PathBuf`/`OsStr`** | **Untouched, on purpose.** No hosted filesystem API changed here. |
+| **4. Collections v2** | **Untouched.** |
+| **7. Package / build integration** | **Untouched.** The slice is three files consumed by ordinary `import`, which is as far as it should reach. |
+
+**The next smallest follow-up**, in order:
+
+1. **Adopt it.** Convert `examples/std/path.jtr`'s 11 `@test` functions to
+   `std/test`. It is the module `test` was designed against, the conversion is
+   mechanical, and it is the honest way to find out whether the API is actually
+   pleasant. (Deliberately *not* done in this slice: `path.jtr` is the only
+   pre-existing stdlib module with a real suite, so leaving it untouched keeps it
+   as the control group for exactly that comparison.)
+2. **`std/process`** (priority #3, free) — a `Process` capability over
+   `run_command`, which is the first of the four Tier 2 handles that can be built
+   with no new intrinsic.
+3. **Range-slice `[]u8` in the C backend.** It would delete the `raw: *mut u8`
+   parameter from `test_report.finish`, and it is the single most-felt gap in the
+   buffers-in convention across the whole stdlib.
+4. **Mangle module `const`s by module** — see the gap recorded below.
+
 ### Cheap vs expensive, precisely
 
 This is the single most useful operational fact for anyone extending the stdlib.
@@ -239,8 +425,10 @@ Saying no is most of what keeps a standard library good.
    checked. Know its blind spot (above).
 3. **Views out, buffers in.** Return `-> read str` for a borrow into an
    argument; take `mut buf: []u8` and return a length for anything composed.
-4. **Ship `@test` functions beside the code.** `std/path.jtr` does; before it,
-   `examples/tests_demo.jtr` was the harness's only user in the entire corpus.
+4. **Ship `@test` functions beside the code**, and write them with `std/test` —
+   `eq_str(c, rep, "name", got, want)` tells you what broke, where a bare
+   `return false` does not. `std/path.jtr` predates the module and still uses
+   plain comparisons; converting it is follow-up #1 above.
 5. **Add the two Rust-side tests**: a toolchain-free "compiles clean" via
    `module::load` + typeck + escape + cgen, and a c-oracle `toks(...)` assertion
    on the demo's documented output.
@@ -278,6 +466,27 @@ Recorded here because library work is where they actually bite.
   candidate; `path.join(a, b, buf)` could not return a view even in principle,
   which is why it writes into a caller buffer. This is safety-mosaic item 2, and
   `path` is now its first concrete stdlib consumer.
+- **A capability handle cannot own borrowed storage.** A borrow is second-class,
+  so `[]u8` may not be a struct field (`cannot store borrow in struct: a
+  second-class borrow may not outlive its call`). Any handle that wants to hold a
+  caller's buffer must either take it as a parameter on every call — what
+  `std/test` does, and what keeps it `unsafe`-free — or store a raw `*mut u8` and
+  pay `unsafe`, as `strmap.jtr` does. Worth knowing *before* designing a handle,
+  because it changes every signature in the module.
+- **`[]u8` cannot be range-sliced.** `rep[0 .. n]` is `error: the C backend does
+  not support ranges yet`, though `str` slices fine. So viewing the filled prefix
+  of a caller buffer still goes through `slice(u8, raw, n)`, which means the raw
+  pointer has to be kept alive and passed around next to the slice. This is the
+  single most-felt gap in the "buffers in" convention — it is why
+  `std/test_report.finish` takes a `*mut u8` at all.
+- **Module `const`s are emitted unqualified, so two modules cannot share a const
+  name.** `const BACKSLASH` in both `std/path` and `std/test` produced `error:
+  redefinition of 'j_BACKSLASH'` from gcc when one program imported both. Note the
+  asymmetry with modules-v2, which *does* let two modules share a non-generic
+  struct name: types are collidable, consts are not. Until the mangling is fixed
+  (an emission change, so it owes the port mirror plus a reseed), a stdlib module
+  meant to be imported next to anything must prefix its constants —
+  `std/test` uses `B_` and says so at the declaration site.
 - **`@no_alloc` cannot see through the allocator vtable** (above), so the tier
   boundary between `core` and `mem` is enforced by convention at exactly the
   point where it matters most.
