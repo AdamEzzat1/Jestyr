@@ -1,0 +1,63 @@
+// examples/drop_take.jtr — a `take` parameter is dropped by its CALLEE.
+//
+// `take` transfers ownership (design §4.3), and drop.jtr's contract is "the new
+// owner drops it" — so the callee that received a droppable by `take` runs its
+// destructor at scope exit, exactly like a `let`-declared local, after the return
+// value has been read out. A `take` parameter the body RETURNS is moved on again
+// and drops nothing (the same `cur_moved` rule that protects a returned local).
+// Before this rule, a moved-in droppable was dropped by NOBODY: the caller
+// correctly skipped it as given away, and the callee never owned it — a silent
+// leak for any `Drop` type handed to a consumer.
+//
+//   jestyrc run examples/drop_take.jtr
+//   →   100      (pass_on moved its param on: no drop yet)
+//       1        (consume drops the Device it was given, at ITS scope exit)
+//       10       (back in main, the energy consume returned)
+//       2        (put's take param drops at the METHOD's scope exit)
+//       201      (main's arithmetic, after the method returned)
+
+trait Drop {
+    fn drop(mut self)
+}
+
+struct Device {
+    id: i64,
+    energy: i64,
+}
+
+impl Drop for Device {
+    fn drop(mut self) {
+        print_int(self.id)
+    }
+}
+
+// ✓ dropped HERE: `consume` owns `d` and does not move it on — its scope exit
+//   drops it (after `d.energy` was spilled for the return).
+fn consume(take d: Device) -> i64 {
+    return d.energy
+}
+
+// ✗ not dropped here: the parameter is returned, so ownership moves to the caller.
+fn pass_on(take d: Device) -> Device {
+    return d
+}
+
+// Methods own their `take` parameters exactly as free functions do.
+struct Sink {
+    count: i64,
+    fn put(mut self, take d: Device) {
+        self.count = self.count + 1
+    }
+}
+
+fn main() -> i64 {
+    let a = Device{ id: 1, energy: 10 }
+    let b = pass_on(a)                    // a → pass_on → b: one owner, no drop
+    print_int(100)                        // 100
+    let e = consume(b)                    // consume's exit drops the Device → 1
+    print_int(e)                          // 10
+    var s = Sink{ count: 0 }
+    s.put(Device{ id: 2, energy: 0 })     // put's exit drops its param → 2
+    print_int(s.count + 200)              // 201
+    return 0
+}

@@ -14795,7 +14795,9 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // (ns, ne, range `ExprId`) triples for each enclosing exclusive `for i in 0..s.len` loop, so a
 // provably-in-range `s[i]` elides its bounds check (mirrors `cur_refines`/`index_in_range`).
 // `mv` holds the current fn's *moved-out* local-name spans (ns,ne pairs — the reference's
-// `cur_moved`; only `emit_fn` populates it, method/impl bodies run with it empty). `ds` is the
+// `cur_moved`; free fns AND method/impl bodies all collect it, like the reference). `tkd` is the
+// pending take-param drop list (`cur_take_drops`): pre-filtered 4-int `ds`-format entries armed
+// per fn, drained ONCE by `emit_body` into the root drop scope. `ds` is the
 // flattened drop-scope stack: 4-int entries (local ns, ne, type-name ns, ne) of live droppable
 // locals; `dsb` holds each open scope's start offset into `ds`. `autoret` marks a method/impl body
 // (the reference's empty `cur_ret_cty`) so a spilled return uses `__auto_type`.
@@ -14818,7 +14820,7 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // `gfi` holds the collected generic-fn instance records ([fn item, argc, (kind,a,b) targ
 // triples…], variable length — walk with a cursor); `su` is the ACTIVE instance's
 // type-parameter substitution (5-tuples: tparam span + arg triple), read by `emit_su_ty`.
-struct Cg { sds: List(i32), pfs: List(i32), pfb: String, pfo: List(i32), tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, sw: bool, ll_ns: i32, ll_ne: i32, swb: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32, dg: i32, gmi: List(i32), tmode: bool, alloc: Allocator, dmap: List(i32), dmods: List(i32), dnb: String, dall: String, dnl: List(i32), dbg_on: bool, dbgl_m: i32, dbgl_l: i32 }
+struct Cg { sds: List(i32), pfs: List(i32), pfb: String, pfo: List(i32), tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), tkd: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, sw: bool, ll_ns: i32, ll_ne: i32, swb: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32, dg: i32, gmi: List(i32), tmode: bool, alloc: Allocator, dmap: List(i32), dmods: List(i32), dnb: String, dall: String, dnl: List(i32), dbg_on: bool, dbgl_m: i32, dbgl_l: i32 }
 
 // The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
 // (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
@@ -16229,10 +16231,45 @@ fn register_drop_local(mut g: Cg, read p: Parser, read src: str, read c: Checker
     push(i32, g.ds, tne)
 }
 
+// The fn's droppable `take` parameters, pre-filtered into `ds`-format 4-tuples (name span,
+// type-name span) awaiting the body's ROOT drop scope — a `take` parameter is an ownership
+// transfer, so the callee is the new owner and drops it at scope exit unless the body moves
+// it on. Mirrors `take_param_drops` + the `register_drop_local` filters, applied at fill
+// time (after the move analysis) since a param is not a `let`: skip `self`, `comptime`,
+// non-`take`, moved-on (`mv`), and non-droppable annotations. Only a bare-Name annotation
+// registers — a blanket-droppable `Ctor(T)` param and a substituted tparam `take x: T`
+// instance are the recorded later increment, the same class as template-body lets under
+// subst (the reference registers those; no corpus file reaches them yet).
+fn fill_take_drops(mut g: Cg, read p: Parser, read src: str, read it: ItemData) {
+    truncate(i32, g.tkd, 0)
+    var i: i32 = 0
+    for i < it.b {
+        let base: i32 = it.a + i * 7
+        let comp: i32 = get(i32, p.iar, base as usize)
+        let conv: i32 = get(i32, p.iar, (base + 1) as usize)
+        let is_self: i32 = get(i32, p.iar, (base + 4) as usize)
+        let pty: i32 = get(i32, p.iar, (base + 5) as usize)
+        if comp == 0 and conv == 3 and is_self == 0 and pty >= 0 {
+            let pns: i32 = get(i32, p.iar, (base + 2) as usize)
+            let pne: i32 = get(i32, p.iar, (base + 3) as usize)
+            let t: TypeData = get(TypeData, p.ty, pty as usize)
+            if t.kind == 0 and !is_moved_name(g, src, pns, pne) {
+                if needs_drop_name(p, src, t.start as i32, t.end as i32) {
+                    push(i32, g.tkd, pns)
+                    push(i32, g.tkd, pne)
+                    push(i32, g.tkd, t.start as i32)
+                    push(i32, g.tkd, t.end as i32)
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
 // ---- move analysis (mirrors collect_moved / collect_moved_expr — over-approximated, leak-safe:
 // a name is "moved" if returned, bound to a `take` param, captured into a literal, or rebound;
-// borrows never move. Only `emit_fn_defs` runs this; method/impl bodies keep `mv` empty, exactly
-// like the reference's `cur_moved` lifecycle.) ----
+// borrows never move. Free fns AND method/impl bodies all run this, exactly like the reference's
+// `cur_moved` lifecycle since the take-drop fix.) ----
 
 // Mark `eid`'s span moved if it is exactly a bare Name.
 fn mv_mark(mut g: Cg, read p: Parser, eid: i32) {
@@ -16598,6 +16635,17 @@ fn emit_stmt(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
 fn emit_body(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg, block_eid: i32, ret: bool, depth: i32) {
     line_at(sb, depth, "{")
     drop_scope_enter(g)
+    // Pending droppable `take` params (armed per fn) join the ROOT drop scope before any
+    // statement — drained here, once, so nested blocks find the list empty. Mirrors
+    // `register_take_drops`; emits nothing, so requires-asserts below are unaffected.
+    if len(i32, g.tkd) > 0 {
+        var tk: usize = 0
+        for tk < len(i32, g.tkd) {
+            push(i32, g.ds, get(i32, g.tkd, tk))
+            tk = tk + 1
+        }
+        truncate(i32, g.tkd, 0)
+    }
     // Pending `requires` preconditions (armed per fn by emit_fn_defs) fire as asserts at the top
     // of the FN body only — consumed here so nested blocks don't re-emit them.
     if len(i32, g.req) > 0 {
@@ -18957,6 +19005,11 @@ fn emit_method_defs(mut sb: String, read p: Parser, read src: str, read c: Check
         g.retty = fd.z
         g.curfn = fid
         g.autoret = true                              // the reference leaves `cur_ret_cty` unset here
+        // Methods own their `take` params exactly as free fns do, and the move analysis
+        // must run for the same reason (mirrors `emit_method_decl` post-take-drop-fix).
+        truncate(i32, g.mv, 0)
+        collect_moved_block(g, p, src, fd.w)
+        fill_take_drops(g, p, src, fd)
         // A fallible method body constructs ITS result type: `ok`/`err`/`?` inside it
         // consult `res_ok`, exactly as in a fallible free function (mirrors
         // `emit_method_decl` setting `cur_result`).
@@ -18968,6 +19021,7 @@ fn emit_method_defs(mut sb: String, read p: Parser, read src: str, read c: Check
         g.retty = 0 - 1
         g.autoret = false
         truncate(i32, g.pp, 0)
+        truncate(i32, g.mv, 0)
         string_push(sb, "\n")
         k = k + 2
     }
@@ -18993,6 +19047,14 @@ fn emit_method_defs(mut sb: String, read p: Parser, read src: str, read c: Check
         g.retty = mf.z
         g.curfn = mfit
         g.autoret = true
+        // Worklist methods collect moved too (mirrors `emit_method_decl`). A CONCRETE
+        // receiver (empty subst — plain methods ride this loop since fddf02a) fills its
+        // droppable `take` params from the raw annotations, exactly like a free fn; an
+        // armed-subst instance needs the SUBSTITUTED type — the recorded later
+        // increment, the same class as template-body lets under subst.
+        truncate(i32, g.mv, 0)
+        collect_moved_block(g, p, src, mf.w)
+        if len(i32, g.su) == 0 { fill_take_drops(g, p, src, mf) }
         // Fallible generic method: `ok`/`err`/`?` construct the INSTANCE's result
         // (res_ok resolves through the still-armed subst in emit_result_name).
         let gmfall: bool = fn_is_fallible__cgen(p, mf)
@@ -19004,6 +19066,7 @@ fn emit_method_defs(mut sb: String, read p: Parser, read src: str, read c: Check
         g.autoret = false
         truncate(i32, g.pp, 0)
         truncate(i32, g.su, 0)
+        truncate(i32, g.mv, 0)
         string_push(sb, "\n")
         let argc: i32 = get(i32, g.gmi, (rb + 1) as usize)
         rb = rb + 3 + argc * 3
@@ -19195,7 +19258,7 @@ fn emit_impl_protos(mut sb: String, read p: Parser, read src: str, read c: Check
 // Trait-impl method definitions (mirrors `impl_defs` -> `emit_impl_method_decl(body=true)`):
 // sig + body + blank each, after the struct-method defs. The body runs like a struct method's —
 // `self_ptr` for a `mut`/`out self`, the method's `mut`/`out` params by pointer, `autoret` (the
-// reference leaves `cur_ret_cty` unset), and an EMPTY move set (only `emit_fn` collects moved).
+// reference leaves `cur_ret_cty` unset), its own move set, and its droppable `take` params.
 fn emit_impl_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg) {
     var r: i32 = 0
     for r < len(i32, p.roots) {
@@ -19225,6 +19288,11 @@ fn emit_impl_defs(mut sb: String, read p: Parser, read src: str, read c: Checker
                     g.retty = fd.z
                     g.curfn = mid
                     g.autoret = true
+                    // An impl method owns its `take` params too (mirrors
+                    // `emit_impl_method_decl` post-take-drop-fix).
+                    truncate(i32, g.mv, 0)
+                    collect_moved_block(g, p, src, fd.w)
+                    fill_take_drops(g, p, src, fd)
                     // A fallible impl body constructs ITS result type: ok/err/?
                     // consult res_ok, exactly as a fallible struct method
                     // (trait-errors T2; Self ok resolves to the target).
@@ -19236,6 +19304,7 @@ fn emit_impl_defs(mut sb: String, read p: Parser, read src: str, read c: Checker
                     g.retty = 0 - 1
                     g.autoret = false
                     truncate(i32, g.pp, 0)
+                    truncate(i32, g.mv, 0)
                     string_push(sb, "\n")
                 }
                 k = k + 1
@@ -23639,9 +23708,10 @@ fn emit_fn_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, 
             if fallible { g.res_ok = it.z } else { g.res_ok = 0 - 2 }
             g.curfn = iid
             // The fn's move analysis: locals whose value escapes are never drop-registered.
-            // Only free fns collect (mirrors `emit_fn` — method/impl bodies keep `mv` empty).
             truncate(i32, g.mv, 0)
             collect_moved_block(g, p, src, it.w)
+            // Droppable `take` params join the body's root drop scope (the callee owns them).
+            fill_take_drops(g, p, src, it)
             let returns_value: bool = it.z >= 0 or fallible
             // Map the emitted body back to its `.jtr` declaration line; reset the
             // dedup so this entry directive always fires for a new function.
@@ -23865,7 +23935,7 @@ fn emit_program(mut sb: String, read p: Parser, read c: Checker, read src: str, 
     var dmods2: List(i32) = make__list(i32, a)
     var dcj: usize = 0
     for dcj < len(i32, dmods) { push(i32, dmods2, get(i32, dmods, dcj))  dcj = dcj + 1 }
-    var g: Cg = Cg{ sds: make__list(i32, a), pfs: make__list(i32, a), pfb: string_new(), pfo: make__list(i32, a), tmp: 0, pp: make__list(i32, a), rf: make__list(i32, a), res_ok: 0 - 2, etags: make__list(i32, a), req: make__list(i32, a), ens: make__list(i32, a), retty: 0 - 1, mi: make__list(i32, a), self_ptr: false, gei: make__list(i32, a), curfn: 0 - 1, mv: make__list(i32, a), ds: make__list(i32, a), dsb: make__list(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, sw: false, ll_ns: 0 - 1, ll_ne: 0 - 1, swb: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: make__list(i32, a), vtf: 0, gfi: make__list(i32, a), su: make__list(i32, a), cls: make__list(i32, a), ccx: make__list(i32, a), cca: make__list(i32, a), caps: make__list(i32, a), gsi: make__list(i32, a), sps: make__list(i32, a), dspawn: false, th: make__list(i32, a), thf: 0, dg: 0 - 1, gmi: make__list(i32, a), tmode: tmode, alloc: a, dmap: dmap2, dmods: dmods2, dnb: dnbb, dall: dallb, dnl: dnl0, dbg_on: len(i32, dmap) > 0, dbgl_m: 0 - 1, dbgl_l: 0 - 1 }
+    var g: Cg = Cg{ sds: make__list(i32, a), pfs: make__list(i32, a), pfb: string_new(), pfo: make__list(i32, a), tmp: 0, pp: make__list(i32, a), rf: make__list(i32, a), res_ok: 0 - 2, etags: make__list(i32, a), req: make__list(i32, a), ens: make__list(i32, a), retty: 0 - 1, mi: make__list(i32, a), self_ptr: false, gei: make__list(i32, a), curfn: 0 - 1, mv: make__list(i32, a), tkd: make__list(i32, a), ds: make__list(i32, a), dsb: make__list(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, sw: false, ll_ns: 0 - 1, ll_ne: 0 - 1, swb: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: make__list(i32, a), vtf: 0, gfi: make__list(i32, a), su: make__list(i32, a), cls: make__list(i32, a), ccx: make__list(i32, a), cca: make__list(i32, a), caps: make__list(i32, a), gsi: make__list(i32, a), sps: make__list(i32, a), dspawn: false, th: make__list(i32, a), thf: 0, dg: 0 - 1, gmi: make__list(i32, a), tmode: tmode, alloc: a, dmap: dmap2, dmods: dmods2, dnb: dnbb, dall: dallb, dnl: dnl0, dbg_on: len(i32, dmap) > 0, dbgl_m: 0 - 1, dbgl_l: 0 - 1 }
     collect_spawns(g, p, src)                        // spawn sites (gates the pthread prelude)
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     // Plain-struct methods now flow through the SAME worklist as generic instances
