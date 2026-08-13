@@ -279,16 +279,20 @@ enough for timing to mean something.
 | `heavy_wordcount` | 10,000,000 LCG-drawn words into a hash map | allocation + hashing (Jestyr's own `std/strmap` vs `std::unordered_map`) |
 | `heavy_parsum` | parallel sum of squares over 20,000,000 i64 (~160 MB) | threaded reduction: one `par for … reduce` line vs hand-rolled `std::thread` chunking |
 
-Measured on one machine (Windows 11, gcc/g++ 8.3, `-O2`, medians of 7 runs;
-treat single-digit percentages as code-layout noise — they move between
-sessions):
+Measured on one machine (Windows 11, gcc/g++ 8.3, `-O2`; **minimum of 11
+interleaved runs per side** — an earlier revision of this table used
+sequential medians, which let a background-load spike land entirely on one
+side's block and once overstated the wordcount win as 1.37×; interleaving
+alternates the two binaries so load hits both, and the minimum approaches the
+true cost. Treat single-digit percentages as code-layout noise — they move
+between sessions):
 
 | pair | jestyr | c++ | jestyr speed |
 |---|---|---|---|
-| `heavy_sieve` | 0.505 s | 0.458 s | 0.91× (0.9–1.2× across sessions) |
-| `heavy_matmul` | 0.210 s | 0.202 s | 0.96× |
-| `heavy_wordcount` | 0.274 s | 0.376 s | **1.37×** — open addressing with no per-node allocation beats the node-based `unordered_map`, and the map itself is written in Jestyr |
-| `heavy_parsum` | 0.155 s | 0.169 s | **1.09×** — was **0.60×** until the body was fused into the reduction workers; see [below](#heavy_parsum-was-the-one-loss-and-why-it-no-longer-is). The pre-fusion binary measures 0.199 s on the same run, so fusing is worth 1.28× here |
+| `heavy_sieve` | 0.502 s | 0.514 s | 1.02× (0.9–1.2× across sessions) |
+| `heavy_matmul` | 0.245 s | 0.255 s | 1.04× |
+| `heavy_wordcount` | 0.277 s | 0.305 s | **1.10×** — open addressing with no per-node allocation edges out the node-based `unordered_map`, and the map itself is written in Jestyr |
+| `heavy_parsum` | 0.082 s | 0.095 s | **1.15×** — was **0.60×** until the body was fused into the reduction workers; see [below](#heavy_parsum-was-the-one-loss-and-why-it-no-longer-is). Timed pre- vs post-fusion on the recorded day, fusing alone was worth 1.28× |
 
 All four pairs print byte-identical output, so the numbers compare the same
 computation, verified — including the parallel one, whose Jestyr answer is
