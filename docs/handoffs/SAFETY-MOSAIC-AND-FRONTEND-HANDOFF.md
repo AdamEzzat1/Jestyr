@@ -63,11 +63,24 @@ coverage; adding one unilaterally would desync discovery order).
   toolchains. Port mirror: `field_type` in typeck.jtr returns Error(16) in
   the same cases (renders `<error>` both sides — P3 stays aligned; the
   artifact is `jc`'s refusal signal). Zero corpus diagnostics moved, zero C.
-- **§1.4 diagnostics remainder**: 22 `expect_close` sites (convert as touched,
-  each needs its opener span — not a sweep); construct context in `expect`
-  messages; item-keyword synchronization in `parse_module` recovery (the
-  cascade-budget test is the guardrail); stable error codes
-  (`Diagnostic::with_code` exists, unused — additive in `check --json`).
+- **§1.4 diagnostics remainder** — mostly done, one careful piece left:
+  - the "22 `expect_close` sites" bullet was STALE — `4b5e062` (2026-08-11)
+    completed the sweep before this list was written; zero `expect(closer)`
+    sites remain.
+  - **construct context — DONE (2026-08-12)**, in the `help:` line, NOT the
+    message: the message text is a pinned contract
+    (`the_unclosed_delimiter_message_is_unchanged`, kept for tooling and the
+    port's future message parity), so `expect_close` gained a `construct`
+    parameter and the help now reads "the struct body's `{` opened at line L,
+    column C is never closed" (32 sites labeled; pinned by
+    `the_unclosed_delimiter_help_names_its_construct`).
+  - **item-keyword synchronization in `parse_module` recovery — REMAINS**, and
+    it is NOT text-only: recovery changes the AST shape on malformed input,
+    and the item-level differential fuzzer compares that shape across
+    toolchains — so it owes a `parser.jtr` mirror, contrary to §1.4's "no
+    mirror owed" note (which is true only of diagnostic text).
+  - **stable error codes — REMAIN** (`Diagnostic::with_code` still unused;
+    top ~20 parse errors first, additive in `check --json`).
 - **Item 4 stage 3 — DONE, designed AND built (2026-08-12)**: not
   "checker-known disjointness" (range proofs = option C, rejected — the §2.6
   lattice) but **call-site mut-slice exclusivity** — the measured hole was
