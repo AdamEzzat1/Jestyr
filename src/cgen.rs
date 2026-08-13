@@ -295,6 +295,13 @@ fn emit_program(
                 false
             }
         }),
+        uses_env_var: ast.exprs.iter().any(|e| {
+            if let ExprKind::Call { callee, .. } = &e.kind {
+                matches!(&ast.expr_at(*callee).kind, ExprKind::Name(n) if n.name == "env_var")
+            } else {
+                false
+            }
+        }),
         task_handles: HashMap::new(),
         dyn_spawn_active: false,
         slice_instances: Vec::new(),
@@ -677,6 +684,8 @@ struct Cgen<'a> {
     uses_run_command: bool,
     /// `eprint_str(s)` (stderr diagnostics for the self-hosted driver) is used.
     uses_eprint: bool,
+    /// `env_var(name) -> str` is used — gate its runtime helper.
+    uses_env_var: bool,
     /// task handles (`let h = spawn …`) live in the current `concurrent` scope,
     /// keyed by binding name — consumed by `await`. Saved/restored across nesting.
     task_handles: HashMap<String, TaskHandle>,
@@ -1069,6 +1078,13 @@ impl<'a> Cgen<'a> {
         if self.uses_run_command {
             self.raw("/* Run an external command via system(): the self-hosted driver's compile step. */\n");
             self.raw("static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); return (int32_t)rc; }\n");
+        }
+        // Environment lookup. The name must be NUL-terminated for getenv, so it
+        // goes through `cpath`; the RESULT is OS-owned storage, returned as a
+        // borrowed view (never freed here), exactly like argv in `arg`.
+        if self.uses_env_var {
+            self.raw("/* getenv() as a str view; empty when unset. Storage is the environment's. */\n");
+            self.raw("static JestyrStr jestyr_rt_env_var(JestyrStr name) { char* cn = jestyr_rt_cpath(name); const char* v = getenv(cn); free(cn); if (!v) return (JestyrStr){ \"\", 0 }; return (JestyrStr){ v, strlen(v) }; }\n");
         }
         self.raw("\n");
         self.raw("/* Command-line arguments (self-hosting plumbing): argv is captured in main()\n");
@@ -5557,6 +5573,10 @@ impl<'a> Cgen<'a> {
                 "eprint_str" => {
                     let s = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
                     return format!("jestyr_rt_eprint_str({s})");
+                }
+                "env_var" => {
+                    let n = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
+                    return format!("jestyr_rt_env_var({n})");
                 }
                 "write_file" => {
                     let p = args.first().map(|a| self.emit_expr(*a)).unwrap_or_else(|| "(JestyrStr){0,0}".to_string());
@@ -10102,7 +10122,7 @@ fn is_intrinsic(name: &str) -> bool {
             | "arena_open" | "arena_alloc" | "arena_close"
             | "read_file" | "try_read_file" | "write_file" | "file_exists" | "remove_file"
             | "run_command" | "eprint_str"
-            | "arg_count" | "arg"
+            | "arg_count" | "arg" | "env_var"
     )
 }
 

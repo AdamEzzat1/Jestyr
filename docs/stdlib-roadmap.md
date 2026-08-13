@@ -105,14 +105,79 @@ interesting it is.
 
 | # | Slice | Tier | Cost | Unlocks |
 |---|---|---|---|---|
-| 1 | ~~`path`~~ ✅ | core | none | every CLI; the compiler's own loader |
+| 1 | ~~`path`~~ ✅ | core | none | every CLI (but *not* the compiler's loader — see above) |
 | 2 | `test` — assert helpers, golden compare | core | none | makes `@test` pleasant to write; the harness exists and has almost no users |
-| 3 | `fs` expansion — read/write bytes, directory listing, temp files | std | **new intrinsics** | build tools, anything that walks a tree |
-| 4 | `process` — a named wrapper over `run_command` + `eprint_str` | std | none | build scripts; matches the `io.jtr` pattern exactly |
-| 5 | `str` — a named module over the string intrinsics | core | none | `substr`/`find`/`trim`/`starts_with` are compiler builtins with no module in front of them, exactly the gap `fs.jtr` describes itself as filling |
-| 6 | `fmt` — consolidated deterministic formatting | core | **high** | workstream E; touches types/typeck/cgen |
-| 7 | `time` | std/sys | **new intrinsic** | benchmarks, timeouts; no clock is exposed to Jestyr code today |
-| 8 | `sys` | sys | blocked | needs `extern "c"` |
+| 3 | `process` — a named wrapper over `run_command` + `eprint_str` | std | none | build scripts; matches the `io.jtr` pattern exactly |
+| 4 | `str` — a named module over the string intrinsics | core | none | `substr`/`find`/`trim`/`starts_with` are compiler builtins with no module in front of them, exactly the gap `fs.jtr` describes itself as filling |
+| 5 | ~~`env` expansion (`env_var` intrinsic)~~ ✅ | std | one intrinsic + reseed | configuration, temp dirs |
+| 6 | `time` | std | **new intrinsic** + reseed | benchmarks, timeouts; no clock is exposed to Jestyr code today |
+| 7 | `fs` expansion — bytes, directory listing, temp files | std | **new intrinsics** + reseed; `fs` is a closure module; `readdir` needs real cross-platform C | build tools, anything that walks a tree |
+| 8 | `fmt` — consolidated deterministic formatting | core | **high** | workstream E; touches types/typeck/cgen |
+| 9 | `sys` | sys | blocked | needs `extern "c"` |
+
+Slices 2–4 are the remaining *free* ones and should be taken first. Everything
+from 6 down pays a new intrinsic. That cost is now measured rather than
+estimated, because slice 5 paid it: **eleven edits and one reseed**, and it went
+byte-identical on the first attempt.
+
+The eleven sites, as a checklist for the next intrinsic:
+
+| Side | File | What |
+|---|---|---|
+| reference | `src/typeck.rs` | the return type in the intrinsic table |
+| reference | `src/cgen.rs` | the lowering (`name` → `jestyr_rt_name(...)`) |
+| reference | `src/cgen.rs` | the `is_intrinsic` name list |
+| reference | `src/cgen.rs` | a `uses_X` field, its detection, and the gated helper emission |
+| port | `examples/std/typeck.jtr` | the return type mirror |
+| port | `examples/std/cgen.jtr` | a `uses_X` scan mirroring the reference's |
+| port | `examples/std/cgen.jtr` | the gated helper emission, byte-for-byte |
+| port | `examples/std/cgen.jtr` | the intrinsic→C name map |
+| port | `examples/std/cgen.jtr` | the pipe-delimited intrinsic name list |
+| both | — | `REFRESH_SEED=1 …` then rung 3 |
+
+Two things that make it go smoothly: emit the helper **gated on use** so every
+program not calling it stays byte-identical, and keep the emitted C text
+identical between the two sides down to the comment — the goldens compare
+strings, not behavior.
+
+Note that `fs` and `env` being closure modules means expanding *them* forces a
+reseed even when the intrinsic already exists.
+
+### A closure module's NAME is a reserved identifier — measured the hard way
+
+Migrating `cgen.jtr`'s hand-rolled loader onto `std/path` looked like the
+obvious next step, and it was tried. It does not work, for a reason worth
+knowing before anyone tries again.
+
+The self-host build flattens its twelve modules by **concatenating them at the
+token level** and stripping module qualifiers, so `mod.item` becomes `item`. The
+flatten cannot tell a module-qualified reference from a field access on a local
+variable that happens to share the module's name. `cgen.jtr` has thirteen
+`path.` sites — `path.start`, `path.end`, `path.len` on locals of type
+`ExprData` and `str`. Importing a module named `path` rewrote all of them into
+bare `start` / `end` / `len`, and gcc rejected the flattened compiler:
+
+```
+error: 'j_start' undeclared (first use in this function)
+    let svenum: i32 = find_variant_enum(p, src, start, end)
+```
+
+The fix would be renaming every local named `path` across 15,000 lines and
+permanently reserving the identifier, to delete ten lines of duplicated
+`dir_len`. That is not a trade worth making, so `cgen.jtr` keeps its own
+`path_dir_len` and the duplication is accepted and documented at both sites.
+
+**The general rule:** a module joining `SELFHOST_MODULES` makes its name
+reserved across the whole flattened compiler. The existing twelve
+(`mem`, `list`, `fs`, `env`, …) already are — which is why no local in
+`cgen.jtr` is called `fs` or `list`. Check for `\bNAME\.` collisions in every
+closure module *before* adding an import, not after; the failure surfaces as
+undeclared-identifier errors in generated C, a long way from the cause.
+
+(The seed regenerated cleanly and the byte-identity goldens passed — this failed
+only at `selfhost_fixpoint_full` and `jestyr_driver_builds_itself`, the two
+gates that actually compile the flattened compiler. Rung 3 is not optional for a
+closure change.)
 
 ### Why `path` went first
 
@@ -217,7 +282,13 @@ Recorded here because library work is where they actually bite.
   boundary between `core` and `mem` is enforced by convention at exactly the
   point where it matters most.
 - **No clock intrinsic.** `@bench` uses C's `clock()` inside generated code;
-  Jestyr code cannot ask the time at all.
+  Jestyr code cannot ask the time at all. This is now the cheapest remaining
+  gap — the `env_var` slice established the exact recipe, and a monotonic clock
+  is the same eleven edits.
+- **Keyword collisions cost API names.** `env.get` is spelled that way because
+  `var` is a Jestyr keyword; `out` is reserved too, and a parameter named `out`
+  produces a parse cascade rather than a clear message. Worth checking a
+  proposed API name against the keyword list before writing the module.
 - **`spawn` targets cannot be generic**, which shapes `parallel` more than any
   library decision did.
 - **A stack array has no `.ptr`**, so `slice(T, arr.ptr, n)` does not typecheck

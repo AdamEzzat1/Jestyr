@@ -1,0 +1,39 @@
+// std/env_demo.jtr — the process-environment tier, worked.
+//
+// `env.get` reads a variable as a `str` VIEW into the process environment:
+// OS-owned storage, so there is no allocation and nothing to free — the same
+// contract `argv` has. Unset and set-but-empty both read as empty, which is why
+// `has` exists as a separate question and `get_or` exists for the common
+// read-a-setting-with-a-default shape.
+//
+// The demo deliberately reads a variable that is guaranteed NOT to be set, so
+// its output is identical on every machine and in CI. Reading a real variable
+// (PATH, HOME, USERPROFILE) would print something different everywhere and make
+// the c-oracle assertion untestable — a small lesson about what belongs in a
+// demo whose output is pinned.
+//
+// Run:  cargo run --release -- run examples/std/env_demo.jtr
+//   →   0 / 0 / fallback-used / 1
+
+import "env"
+
+fn flag(read b: bool) {
+    if b {
+        print_str("1")
+    } else {
+        print_str("0")
+    }
+}
+
+fn main() -> i32 {
+    let unset: str = "JESTYR_DEMO_DEFINITELY_UNSET"
+
+    print_int(env.get(unset).len as i64)      // 0 — unset reads empty
+    flag(env.has(unset))                      // 0 — and `has` agrees
+    print_str(env.get_or(unset, "fallback-used"))
+
+    // argv(0) is always present, so this is a stable non-empty check.
+    flag(env.program().len > 0)               // 1
+
+    return 0
+}

@@ -187,6 +187,10 @@ The self-hosted compiler and the standard library, all in Jestyr:
   `slice_algos.jtr`. See [docs/stdlib-roadmap.md](../docs/stdlib-roadmap.md)
   for the tiers (`core` / `mem` / `std` / `sys` / `parallel`), what is
   planned next, and what is deliberately staying out.
+  * `env.jtr` reads the process environment: `argc`/`argv`/`program` plus
+    `get`/`has`/`get_or` over the `env_var` intrinsic. Values are `str` VIEWS
+    into OS-owned storage — no allocation, nothing to free. Worked examples in
+    `env_demo.jtr`. (`get`, not Rust's `var`: `var` is a Jestyr keyword.)
   * `path.jtr` is lexical path manipulation — `base`, `dir`, `ext`, `stem`,
     `is_abs`, `dir_len`, `join`, `normalize`. Every function is `@no_alloc`,
     so "path handling never allocates" is proven rather than promised:
