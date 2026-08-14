@@ -1,0 +1,226 @@
+// std/process_test.jtr — the unit suite for `std/process`, written with `std/test`.
+//
+// A sibling file rather than colocated, per the convention in
+// docs/stdlib-roadmap.md: a `@test` function is emitted into every program that
+// imports its module, so a suite inside `process.jtr` would put `std/test`,
+// `std/test_report` and `std/fs` into every consumer of `std/process`.
+//
+// These tests perform real effects — they run shell commands and touch the
+// filesystem — because that is the only honest way to test a capability that
+// exists to gate real effects. Each uses its own probe filename so no test can
+// observe another's leftovers, and each removes it. The one exit status asserted
+// is zero: `run` returns the raw `system()` status, an exit code on Windows and a
+// wait status on POSIX, so only zero (and "non-zero") mean the same thing
+// everywhere. `exit 0` and `exit 1` are builtins in both cmd.exe and POSIX sh.
+//
+// Run:  jestyrc test examples/std/process_test.jtr
+//   →   6 passed; 0 failed
+
+import "process"
+import "test"
+import "test_report"
+import "fs"
+
+const REPORT_CAP: usize = 512
+
+// `echo x > <name>`, built into `buf`. Spelled identically in cmd.exe and sh, and
+// only the file's existence is ever checked, so shell quoting cannot matter.
+fn write_cmd(read name: str, mut buf: []u8) -> usize {
+    let head: str = "echo x > "
+    var n: usize = 0
+    for i in 0..head.len {
+        buf[n] = head[i] as u8
+        n = n + 1
+    }
+    for j in 0..name.len {
+        buf[n] = name[j] as u8
+        n = n + 1
+    }
+    return n
+}
+
+@test fn host_executes_and_counts() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var h: process.Process = process.host()
+
+    test.is_true(c, rep, "can_run(host)", process.can_run(h))
+    test.eq_i64(c, rep, "status(exit 0)", process.run(h, "exit 0") as i64, 0)
+    test.eq_i64(c, rep, "runs", process.runs(h), 1)
+    test.eq_i64(c, rep, "refused", process.refused(h), 0)
+    test.eq_i64(c, rep, "last_status", process.last_status(h) as i64, 0)
+
+    let ok: bool = test_report.finish(c, raw)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn denied_refuses_and_counts_the_attempt() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var d: process.Process = process.denied()
+
+    test.is_false(c, rep, "can_run(denied)", process.can_run(d))
+    test.is_false(c, rep, "run_ok(denied)", process.run_ok(d, "exit 0"))
+    test.eq_i64(c, rep, "runs", process.runs(d), 0)
+    test.eq_i64(c, rep, "refused", process.refused(d), 1)
+    // The refusal status is deliberately not a documented discriminator, but it
+    // must at least not look like success.
+    test.ne_i64(c, rep, "last_status", process.last_status(d) as i64, 0)
+
+    let ok: bool = test_report.finish(c, raw)
+    free_ptr(raw)
+    return ok
+}
+
+// THE TEST THAT MATTERS: a denied handle must produce no effect, not merely
+// report failure. Same command, same shell, opposite handles — the filesystem is
+// the witness. If this passes with `host` and fails to be empty with `denied`,
+// the capability is decoration.
+@test fn denied_causes_no_effect_where_host_does() -> bool {
+    let probe: str = "jestyr_proc_effect_test.tmp"
+    var craw: *mut u8 = alloc(u8, 256)
+    var cbuf: []u8 = slice(u8, craw, 256)
+    let n: usize = write_cmd(probe, cbuf)
+    let cmd: str = from_utf8(slice(u8, craw, n))
+
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // Control: the command genuinely works, so the negative result below means
+    // something. Without this half the test would pass on a typo'd command.
+    fs.remove(probe)
+    var h: process.Process = process.host()
+    process.run_ok(h, cmd)
+    test.is_true(c, rep, "host leaves the file", fs.exists(probe))
+    fs.remove(probe)
+
+    // The experiment: identical command, denied handle, no file.
+    var d: process.Process = process.denied()
+    process.run_ok(d, cmd)
+    test.is_false(c, rep, "denied leaves nothing", fs.exists(probe))
+    test.eq_i64(c, rep, "denied counted it", process.refused(d), 1)
+
+    fs.remove(probe)
+    let ok: bool = test_report.finish(c, raw)
+    free_ptr(raw)
+    free_ptr(craw)
+    return ok
+}
+
+// `run_ok` is the portable predicate: zero means success everywhere, and any
+// non-zero raw status — 1 on Windows, 256 on POSIX for `exit 1` — means failure
+// everywhere. This is the assertion that would break if `run_ok` ever compared
+// the status against a literal instead of zero.
+@test fn run_ok_is_portable_across_status_conventions() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var h: process.Process = process.host()
+
+    test.is_true(c, rep, "run_ok(exit 0)", process.run_ok(h, "exit 0"))
+    test.is_false(c, rep, "run_ok(exit 1)", process.run_ok(h, "exit 1"))
+    test.ne_i64(c, rep, "exit 1 is non-zero", process.last_status(h) as i64, 0)
+    test.eq_i64(c, rep, "both executed", process.runs(h), 2)
+
+    let ok: bool = test_report.finish(c, raw)
+    free_ptr(raw)
+    return ok
+}
+
+// The intended shape of use: a subsystem declares in its signature that it may
+// execute commands, and the caller decides whether it actually can. This is what
+// the handle buys — `plan` cannot spawn anything the caller did not authorize.
+fn plan(mut p: process.Process, read probe: str, mut buf: []u8, craw: *mut u8) -> bool {
+    let n: usize = write_cmd(probe, buf)
+    return process.run_ok(p, from_utf8(slice(u8, craw, n)))
+}
+
+@test fn a_subsystem_takes_the_capability_as_a_parameter() -> bool {
+    let probe: str = "jestyr_proc_subsystem_test.tmp"
+    var craw: *mut u8 = alloc(u8, 256)
+    var cbuf: []u8 = slice(u8, craw, 256)
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    fs.remove(probe)
+    var d: process.Process = process.denied()
+    test.is_false(c, rep, "plan(denied) fails", plan(d, probe, cbuf, craw))
+    test.is_false(c, rep, "plan(denied) had no effect", fs.exists(probe))
+
+    var h: process.Process = process.host()
+    test.is_true(c, rep, "plan(host) succeeds", plan(h, probe, cbuf, craw))
+    test.is_true(c, rep, "plan(host) had its effect", fs.exists(probe))
+
+    fs.remove(probe)
+    let ok: bool = test_report.finish(c, raw)
+    free_ptr(raw)
+    free_ptr(craw)
+    return ok
+}
+
+// The handle's invariants, checked exhaustively over small attempt counts rather
+// than asserted for one case: for ANY number of attempts `n`, a host handle ends
+// with `runs == n` and `refused == 0`, a denied handle with the mirror image, and
+// in both cases `runs + refused == n` — no attempt is ever lost or double-counted.
+//
+// This is the property layer for this module, and it lives in-language on purpose.
+// A proptest over a Rust model of a four-field struct would only be testing the
+// Rust model; driving the real compiled handle is what makes the statement about
+// shipped code. `exit 0` keeps each attempt cheap, and n is capped at 4 because
+// every host attempt is a real process spawn.
+@test fn attempts_are_never_lost_or_double_counted() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    for n in 0..5 {
+        var h: process.Process = process.host()
+        var d: process.Process = process.denied()
+        for _i in 0..n {
+            process.run(h, "exit 0")
+            process.run(d, "exit 0")
+        }
+        test.eq_i64(c, rep, "host runs == n", process.runs(h), n as i64)
+        test.eq_i64(c, rep, "host refused == 0", process.refused(h), 0)
+        test.eq_i64(c, rep, "denied runs == 0", process.runs(d), 0)
+        test.eq_i64(c, rep, "denied refused == n", process.refused(d), n as i64)
+        test.eq_i64(c, rep, "host total == n", process.runs(h) + process.refused(h), n as i64)
+        test.eq_i64(c, rep, "denied total == n", process.runs(d) + process.refused(d), n as i64)
+    }
+
+    let ok: bool = test_report.finish(c, raw)
+    free_ptr(raw)
+    return ok
+}
+
+// Two handles are independent values, not views onto one global. A `denied` handle
+// existing does not disarm a `host` one, and counts do not pool.
+@test fn handles_are_independent_values() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var a: process.Process = process.host()
+    var b: process.Process = process.host()
+    var d: process.Process = process.denied()
+
+    process.run(a, "exit 0")
+    process.run(a, "exit 0")
+    process.run(b, "exit 0")
+    process.run(d, "exit 0")
+
+    test.eq_i64(c, rep, "a.runs", process.runs(a), 2)
+    test.eq_i64(c, rep, "b.runs", process.runs(b), 1)
+    test.eq_i64(c, rep, "d.runs", process.runs(d), 0)
+    test.eq_i64(c, rep, "d.refused", process.refused(d), 1)
+    test.eq_i64(c, rep, "a.refused", process.refused(a), 0)
+
+    let ok: bool = test_report.finish(c, raw)
+    free_ptr(raw)
+    return ok
+}

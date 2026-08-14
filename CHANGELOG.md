@@ -7,6 +7,49 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/process` — running a command behind an explicit capability.** The first
+  of the four planned Tier 2 handles (`Fs`, `Clock`, `Env`, `Process`), and free:
+  a named wrapper over the existing `run_command` and `eprint_str` intrinsics, no
+  new intrinsic and no reseed.
+
+  `run_command` is ambient — any function anywhere can reach it, and no signature
+  reveals that it did. A `Process` value makes the authority to spawn something a
+  caller must *pass*, so `fn build(mut p: Process, …)` announces in its type that
+  it may execute commands. This is explicitly **not** a sandbox: nothing stops
+  direct `run_command`, and nothing in a library could. It has the same shape of
+  limitation as `@no_alloc`'s call-graph blind spot and is worth having for the
+  same reason — the honest path is also the documented one, and the capability is
+  visible in the signature.
+
+  `denied()` is the half that earns its keep: a handle that executes nothing while
+  still counting every attempt, so a test can assert both that nothing ran and
+  that the right number of attempts were made. `process_test.jtr` proves the
+  refusal is real rather than cosmetic by running one file-creating command through
+  a `host()` handle and finding the file, then the *same* command through a
+  `denied()` handle and finding nothing — the host half is present as a control so
+  the negative result cannot pass vacuously. Flipping `denied()` to permit kills
+  four of the seven tests.
+
+  **`run_ok` is the portable API, and that is forced by a real platform
+  difference.** The runtime helper is `return (int32_t)system(cp)` — raw. Windows
+  gives the command's exit code; POSIX specifies a *wait status* with the code in
+  the high byte, so `exit 3` is 3 on one platform and 768 on the other. Only zero
+  means the same thing on both, so `run_ok` (== 0) is portable while `run` is
+  documented as platform-specific for any non-zero value. Normalizing it
+  (`WEXITSTATUS` in the helper) is a runtime change owing the `cgen.jtr` mirror
+  plus a reseed, and is recorded as follow-up 3 in `docs/stdlib-roadmap.md`; it is
+  also the clearest argument yet for the `sys` tier.
+
+  Seven `@test` functions in the sibling `process_test.jtr`, two toolchain-free
+  compile-clean tests, a c-oracle assertion on the demo's documented output, and
+  byte-identity between the reference backend and the self-hosted `cgen.jtr` for
+  all three files (first attempt). Deliberately **no** command-string fuzzer:
+  feeding fuzzer-generated strings to `system()` would execute arbitrary shell
+  commands, which is not something a test suite should do. The property layer is
+  in-language instead — `attempts_are_never_lost_or_double_counted` checks
+  `runs + refused == n` exhaustively over small `n` against the real compiled
+  handle, rather than against a Rust re-description of a four-field struct.
+
 - **`std/test` + `std/test_report` — expectations and golden comparison, split
   across the tier boundary.** The `@test` harness has existed since workstream O
   and had two users in the whole corpus, because writing a test meant hand-rolling

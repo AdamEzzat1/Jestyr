@@ -1,0 +1,135 @@
+// std/process.jtr — running an external command, behind an explicit capability.
+//
+// TIER: `std`. Requires a shell. Thin named wrappers over the `run_command` and
+// `eprint_str` intrinsics, in the `io.jtr` / `env.jtr` shape — when `extern "c"`
+// eventually retires them, only this module changes (design §14).
+//
+// WHY A HANDLE AND NOT A FREE `run(cmd)`. Executing a command is the single most
+// dangerous thing this standard library can do, and `run_command` is an ambient
+// intrinsic: any function anywhere can reach it, and no signature reveals that it
+// did. A `Process` value is the smallest fix — the ability to spawn becomes
+// something a caller must be *given*, so `fn build(mut p: Process, ...)` announces
+// in its type that it may execute commands and `fn parse(read src: str)` announces
+// that it may not.
+//
+// This is not a sandbox. Nothing stops a function from calling `run_command`
+// directly, and nothing here can. `@no_alloc` has the same shape of limitation and
+// is still worth having: the value is that the honest path is also the documented
+// one, and that a reviewer can see the capability in the signature. A real
+// enforcement story needs the compiler to treat effects as part of a type, which
+// is a language question and not a library one.
+//
+// `denied()` is the other half of the point. It is a handle that refuses to
+// execute anything while still COUNTING what was asked of it, so a test can hand
+// one to code under test and afterwards assert both that nothing ran and that the
+// right number of attempts were made. `process_demo.jtr` proves the refusal is
+// real rather than cosmetic: it runs a file-creating command through a `host()`
+// handle and finds the file, then through a `denied()` handle and finds nothing.
+//
+// EXIT CODES ARE NOT PORTABLE, AND THAT SHAPES THE API. The runtime helper is
+// `return (int32_t)system(cp)` — the raw `system()` result. On Windows that is the
+// command's exit code; POSIX specifies a *wait status*, where the code sits in the
+// high byte, so `exit 3` is 3 on Windows and 768 on Linux. Therefore:
+//
+//   * `run_ok` is the portable API. Zero means success on every platform, because
+//     a zero wait status and a zero exit code coincide.
+//   * `run` returns the raw status and is documented as platform-specific for any
+//     non-zero value. Use it when you are already platform-aware; do not compare
+//     it against a literal.
+//
+// Normalizing that (WEXITSTATUS in the helper) is a runtime change and so owes the
+// `cgen.jtr` mirror plus a bootstrap reseed — recorded in docs/stdlib-roadmap.md
+// rather than smuggled in here. It is also exactly the kind of platform difference
+// a `sys` tier would own once `extern "c"` lands.
+//
+// Worked example:  examples/std/process_demo.jtr
+// Run the tests:   jestyrc test examples/std/process_test.jtr
+
+// The status `run` reports when a denied handle refuses. Deliberately NOT a
+// reliable discriminator: a real `system()` failure can also be -1. Use
+// `refused(p)` or `can_run(p)` to tell refusal from failure — the count is exact,
+// the code is a courtesy. (Prefixed because a module `const` is emitted under its
+// bare name, so two modules cannot share one; see std/test.jtr.)
+const PROC_DENIED: i32 = 0 - 1
+
+// The capability. Scalars only — a Jestyr borrow is second-class, so a handle
+// cannot own borrowed storage; see `std/test.jtr` for the same constraint shaping
+// the same kind of value.
+pub struct Process {
+    allowed: bool,
+    runs: i64,
+    refused: i64,
+    last: i32,
+}
+
+// A handle that can actually execute. Naming it `host` rather than `new` is the
+// point: acquiring the authority to run commands should read like an act.
+pub fn host() -> Process {
+    return Process{ allowed: true, runs: 0, refused: 0, last: 0 }
+}
+
+// A handle that executes nothing and counts every attempt. For tests, dry runs,
+// and any subsystem that should be able to *describe* work without doing it.
+pub fn denied() -> Process {
+    return Process{ allowed: false, runs: 0, refused: 0, last: 0 }
+}
+
+// ---------------------------------------------------------------- the queries
+
+// Will this handle execute? False for `denied()`.
+@no_alloc pub fn can_run(read p: Process) -> bool {
+    return p.allowed
+}
+
+// How many commands this handle actually executed.
+@no_alloc pub fn runs(read p: Process) -> i64 {
+    return p.runs
+}
+
+// How many commands this handle refused to execute. Always 0 for `host()`; for
+// `denied()` this is the assertion a test wants — "it tried to invoke gcc twice".
+@no_alloc pub fn refused(read p: Process) -> i64 {
+    return p.refused
+}
+
+// The raw status of the most recent `run`/`run_ok` through this handle, or 0 if
+// nothing has run. Platform-specific when non-zero — see the header.
+@no_alloc pub fn last_status(read p: Process) -> i32 {
+    return p.last
+}
+
+// ---------------------------------------------------------------- the actions
+
+// Execute `cmd` through the shell and return the RAW platform status, recording
+// the attempt. A denied handle executes nothing and returns `PROC_DENIED`.
+//
+// Not `@no_alloc`: the runtime NUL-terminates the command string on the heap, and
+// the command itself may do anything at all.
+pub fn run(mut p: Process, read cmd: str) -> i32 {
+    if p.allowed == false {
+        p.refused = p.refused + 1
+        p.last = PROC_DENIED
+        return PROC_DENIED
+    }
+    let rc: i32 = run_command(cmd)
+    p.runs = p.runs + 1
+    p.last = rc
+    return rc
+}
+
+// Execute `cmd` and report whether it SUCCEEDED. This is the portable spelling —
+// zero is success on every platform, while any other value's meaning is not — so
+// prefer it unless you are deliberately reading a platform-specific status.
+// A denied handle refuses, which is reported as failure.
+pub fn run_ok(mut p: Process, read cmd: str) -> bool {
+    return run(p, cmd) == 0
+}
+
+// Write one line to STDERR. The diagnostic channel, kept separate from stdout so
+// that a program whose stdout is data — a compiler emitting C, a tool emitting
+// JSON — can report progress without corrupting it. Takes no handle: writing a
+// diagnostic is not the capability worth gating, and pretending otherwise would
+// make the handle look more like a sandbox than it is.
+pub fn note(read text: str) {
+    eprint_str(text)
+}

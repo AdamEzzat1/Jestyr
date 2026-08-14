@@ -6,7 +6,7 @@ directory, ask the time, or assert anything without hand-rolling it. This
 document is the plan for closing that gap, and — as importantly — the list of
 things that should stay out of `std` for now.
 
-Status: **`path`, `env`, `time` and `test` landed** (2026-08-13). Everything else
+Status: **`path`, `env`, `time`, `test` and `process` landed** (2026-08-13). Everything else
 here is a plan, not a promise. Nothing in `std` is production-ready; this is a
 research-preview standard library being pushed toward a capability-first Std v2.
 
@@ -69,7 +69,8 @@ this intent in their own headers and are the pattern to copy.
 
 Present: `fs.jtr` (read/write/exists/remove), `env.jtr` (argc/argv/env_var),
 `io.jtr` (four print wrappers), `time.jtr` (monotonic elapsed),
-`test_report.jtr` (printing a `Check` report).
+`test_report.jtr` (printing a `Check` report), `process.jtr` (running a command
+behind a capability handle).
 
 Thin is an understatement: `fs` is 35 lines and `env` is 45. This tier is where
 most of the remaining work lives.
@@ -115,7 +116,7 @@ interesting it is.
 |---|---|---|---|---|
 | 1 | ~~`path`~~ ✅ | core | none | every CLI (but *not* the compiler's loader — see above) |
 | 2 | ~~`test` — assert helpers, golden compare~~ ✅ | core + std | none | makes `@test` pleasant to write; the harness had two users in the whole corpus |
-| 3 | `process` — a named wrapper over `run_command` + `eprint_str` | std | none | build scripts; matches the `io.jtr` pattern exactly |
+| 3 | ~~`process` — a named wrapper over `run_command` + `eprint_str`~~ ✅ | std | none | build scripts; the first Tier 2 capability handle |
 | 4 | `str` — a named module over the string intrinsics | core | none | `substr`/`find`/`trim`/`starts_with` are compiler builtins with no module in front of them, exactly the gap `fs.jtr` describes itself as filling |
 | 5 | ~~`env` expansion (`env_var` intrinsic)~~ ✅ | std | one intrinsic + reseed | configuration, temp dirs |
 | 6 | ~~`time` (`mono_nanos` intrinsic)~~ ✅ | std | one intrinsic + reseed | in-language elapsed measurement |
@@ -123,8 +124,8 @@ interesting it is.
 | 8 | `fmt` — consolidated deterministic formatting | core | **high** | workstream E; touches types/typeck/cgen |
 | 9 | `sys` | sys | blocked | needs `extern "c"` |
 
-Slices 3–4 (`process`, `str`) are the remaining *free* ones and should be taken
-next. Everything from 7 down pays a new intrinsic. That cost is now measured rather than
+Slice 4 (`str`) is the last remaining *free* one and should be taken next.
+Everything from 7 down pays a new intrinsic. That cost is now measured rather than
 estimated, because slice 5 paid it: **eleven edits and one reseed**, and it went
 byte-identical on the first attempt.
 
@@ -373,14 +374,38 @@ Where this slice leaves the seven planned Tier 2 areas.
    is a real cost that the buffers-in convention forces and that a
    `[]u8`-range-slice would only partly relieve. The conversion also turned up the
    test-emission leak that moved convention 4 above.
-2. **`std/process`** (priority #3, free) — a `Process` capability over
-   `run_command`, which is the first of the four Tier 2 handles that can be built
-   with no new intrinsic.
-3. **Range-slice `[]u8` in the C backend.** It would delete the `raw: *mut u8`
+2. ~~**`std/process`**~~ ✅ The first of the four Tier 2 handles is built. Two
+   findings worth carrying forward:
+
+   * **A capability handle is worth having even without enforcement.** Nothing
+     stops a function from calling `run_command` directly and nothing in the
+     library can, so `Process` does not sandbox — it makes the authority to spawn
+     something a caller must *pass*, which puts it in the signature where a
+     reviewer sees it. Same shape of limitation as `@no_alloc`'s blind spot, and
+     worth having for the same reason. Real enforcement needs effects in the type
+     system, which is a language question.
+   * **`denied()` earns its keep by counting.** A handle that refuses but still
+     records attempts lets a test assert *both* that nothing ran and that the
+     right number of attempts were made. `process_test.jtr` proves the refusal is
+     real rather than cosmetic by running one file-creating command through each
+     handle kind and letting the filesystem be the witness — with the `host` half
+     present as a control, so the negative result cannot pass vacuously. Flipping
+     `denied()` to permit kills four of the seven tests.
+
+3. **Normalize `run_command`'s exit status.** The runtime helper is
+   `return (int32_t)system(cp)` — raw. Windows gives the exit code; POSIX
+   specifies a *wait status* with the code in the high byte, so `exit 3` is 3 on
+   one and 768 on the other. `std/process` works around it by making `run_ok`
+   (== 0, which coincides on both) the portable API and documenting `run`'s value
+   as platform-specific, but the honest fix is `WEXITSTATUS` in the helper. That
+   is a runtime/emission change: it owes the `cgen.jtr` mirror and a reseed. It is
+   also the clearest argument yet for the `sys` tier — this is exactly the
+   platform difference `sys` should own once `extern "c"` lands.
+4. **Range-slice `[]u8` in the C backend.** It would delete the `raw: *mut u8`
    parameter from `test_report.finish`, and it is the single most-felt gap in the
    buffers-in convention across the whole stdlib.
-4. **Mangle module `const`s by module** — see the gap recorded below.
-5. **Stop emitting `@test`/`@bench` items in non-test mode** — see convention 4
+5. **Mangle module `const`s by module** — see the gap recorded below.
+6. **Stop emitting `@test`/`@bench` items in non-test mode** — see convention 4
    above for why, and for why it is not as small as it looks.
 
 ### Cheap vs expensive, precisely

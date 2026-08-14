@@ -218,6 +218,16 @@ The self-hosted compiler and the standard library, all in Jestyr:
     arbitrary bytes as printable ASCII so a failure message can show you the
     trailing `\r`. Worked examples in `test_demo.jtr`; own suite via
     `jestyrc test examples/std/test.jtr`.
+  * `process.jtr` runs external commands behind an explicit capability. A
+    `Process` value is the authority to spawn, so `fn build(mut p: Process, …)`
+    announces in its type that it may execute commands; `denied()` is a handle
+    that refuses everything while still *counting* the attempts, which is what
+    makes it useful in a test. It is not a sandbox — nothing stops direct
+    `run_command` — but it puts the authority where a reviewer sees it. Note
+    `run_ok` (== 0) is the portable API: `run` returns the raw `system()` status,
+    an exit code on Windows and a wait status on POSIX. `process_demo.jtr` proves
+    the refusal is real by running one file-creating command through each handle
+    kind and checking the filesystem; suite in `process_test.jtr`.
 * **Numerics & determinism:** `numbers.jtr`, `parse_float.jtr`,
   `format_float.jtr`, `float_bits.jtr`, `binned.jtr`, `reductions.jtr`,
   `numerics_canary.jtr` (the locked determinism canary), `sha256.jtr`

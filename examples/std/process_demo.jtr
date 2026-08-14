@@ -1,0 +1,94 @@
+// std/process_demo.jtr — worked examples for `std/process`.
+//
+// The interesting part is a CONTROLLED EXPERIMENT, not a printout. A capability
+// handle is only worth having if refusing is real, so the demo runs the *same*
+// file-creating command twice — once through `host()`, once through `denied()` —
+// and checks the filesystem after each. The host run must leave a file behind and
+// the denied run must not. Anything else and `denied()` is decoration.
+//
+// `echo x > file` is spelled the same in cmd.exe and POSIX sh, and only the file's
+// EXISTENCE is checked, so nothing here depends on how a shell quotes or
+// line-terminates. `exit 0` is a builtin in both and is the only exit status this
+// demo asserts: `run` returns the raw `system()` status, which is a wait status on
+// POSIX and an exit code on Windows, so any NON-zero value would differ by
+// platform (see the module header).
+//
+// The `process.note` line goes to STDERR and so must NOT appear in the expected
+// stdout below — that stream split is the reason `note` exists.
+//
+// Run:  cargo run --release -- run examples/std/process_demo.jtr
+//   →   -- host --
+//       0
+//       1
+//       0
+//       1
+//       -- denied --
+//       0
+//       0
+//       1
+//       0
+//       -- cleanup --
+//       0
+
+import "process"
+import "fs"
+import "env"
+
+const PROBE: str = "jestyr_process_demo.tmp"
+
+fn b2i(read b: bool) -> i32 {
+    if b { return 1 }
+    return 0
+}
+
+// `echo x > <PROBE>` — builds the command string into `buf` so the filename is
+// written once. Returns the byte count.
+fn probe_cmd(mut buf: []u8) -> usize {
+    let head: str = "echo x > "
+    var n: usize = 0
+    for i in 0..head.len {
+        buf[n] = head[i] as u8
+        n = n + 1
+    }
+    for j in 0..PROBE.len {
+        buf[n] = PROBE[j] as u8
+        n = n + 1
+    }
+    return n
+}
+
+fn main() -> i32 {
+    var raw: *mut u8 = alloc(u8, 256)
+    var buf: []u8 = slice(u8, raw, 256)
+    let n: usize = probe_cmd(buf)
+    let cmd: str = from_utf8(slice(u8, raw, n))
+
+    // Diagnostics go to stderr, so this line is absent from the expected stdout.
+    process.note("process_demo: probing the shell (stderr only)")
+
+    // ---- the real capability: the command runs, and the file appears.
+    print_str("-- host --")
+    var h: process.Process = process.host()
+    print_int(process.run(h, "exit 0") as i64)      // 0  — the one portable status
+    print_int(b2i(process.run_ok(h, cmd)))          // 1  — the shell accepted it
+    print_int(process.refused(h) as i64)            // 0  — a host handle refuses nothing
+    print_int(b2i(fs.exists(PROBE)))                // 1  — the effect really happened
+
+    // Clear the evidence, so the denied run starts from the same state.
+    fs.remove(PROBE)
+
+    // ---- the denied capability: the same command, no effect, but counted.
+    print_str("-- denied --")
+    var d: process.Process = process.denied()
+    print_int(b2i(process.run_ok(d, cmd)))          // 0  — refusal reports as failure
+    print_int(process.runs(d) as i64)               // 0  — nothing executed
+    print_int(process.refused(d) as i64)            // 1  — but the attempt was recorded
+    print_int(b2i(fs.exists(PROBE)))                // 0  — THE POINT: no file
+
+    print_str("-- cleanup --")
+    fs.remove(PROBE)
+    print_int(b2i(fs.exists(PROBE)))                // 0
+
+    free_ptr(raw)
+    return 0
+}
