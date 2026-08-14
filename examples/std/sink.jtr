@@ -1,0 +1,151 @@
+// std/sink.jtr — bytes out, into a buffer the caller owns.
+//
+// TIER: `core`. No heap, no OS, no imports. Every function `@no_alloc`, and here that
+// marker is load-bearing rather than decorative: `Sink` is a CONCRETE struct with free
+// functions, so every call is a direct call and the checker can actually see the whole
+// graph. The `Writer` *trait* lives in `std/writer.jtr` instead, because `@no_alloc`
+// does not see through a trait method — it passes VACUOUSLY, reporting success on code
+// that allocates on every call. The full argument and the probe are in
+// `docs/io-design.md`; the short version is that the tier boundary here is the boundary
+// of a real proof.
+//
+// WHY THE BUFFER IS A PARAMETER. A Jestyr borrow is second-class, so a `[]u8` may not be
+// stored in a struct that outlives the call. Counters live in the handle, storage stays
+// with the caller. That is not a workaround, it is the same shape `std/test`'s `Check`
+// arrived at, and it means a `Sink` costs 24 bytes of stack and no allocation ever.
+//
+// WRITES DO NOT FAIL AT THE CALL SITE. A byte that does not fit is COUNTED, not
+// returned, so formatting code stays straight-line — fifty `?`s down a formatter is how
+// errors get swallowed, not how they get handled. Check `overflowed(s)` once at the end;
+// `lost(s)` says how many bytes were dropped. The trade is per-write precision, which
+// formatting does not want and a protocol would; such a caller compares `written()`
+// across the call.
+//
+// Run the tests:  jestyrc test examples/std/sink_test.jtr
+
+const S_ZERO: i32 = 48        // '0'
+const S_MINUS: i32 = 45       // '-'
+const S_LOWER_A: i32 = 97     // 'a'
+
+// The cursor. Offsets and counters only — see the header on why the buffer is not here.
+pub struct Sink {
+    used: usize,
+    lost: usize,
+}
+
+// A sink positioned at the start of whatever buffer you pass it.
+@no_alloc pub fn new() -> Sink {
+    return Sink{ used: 0, lost: 0 }
+}
+
+// ------------------------------------------------------------------------ writing
+
+// One byte. Silently counted as lost if `buf` is full — the deliberate
+// infallible-at-the-call-site rule.
+@no_alloc pub fn put(mut s: Sink, mut buf: []u8, b: u8) {
+    if s.used >= buf.len {
+        s.lost = s.lost + 1
+        return
+    }
+    buf[s.used] = b
+    s.used = s.used + 1
+}
+
+// A whole `str`, byte for byte. No encoding is applied: what is in the string is what
+// lands in the buffer.
+@no_alloc pub fn put_str(mut s: Sink, mut buf: []u8, read text: str) {
+    for i in 0..text.len {
+        put(s, buf, text[i] as u8)
+    }
+}
+
+// A signed decimal, most-significant digit first. Never negates the input, so `i64`'s
+// most negative value formats correctly instead of overflowing.
+@no_alloc pub fn put_i64(mut s: Sink, mut buf: []u8, v: i64) {
+    if v == 0 {
+        put(s, buf, S_ZERO as u8)
+        return
+    }
+    if v < 0 { put(s, buf, S_MINUS as u8) }
+    // The largest power of ten no greater than |v|. 10^18 is the ceiling for any `i64`,
+    // so `p * 10` cannot overflow before the loop stops.
+    var p: i64 = 1
+    for v / p >= 10 or v / p <= -10 {
+        p = p * 10
+    }
+    for p > 0 {
+        var d: i64 = (v / p) % 10
+        if d < 0 { d = 0 - d }
+        put(s, buf, (S_ZERO as i64 + d) as u8)
+        p = p / 10
+    }
+}
+
+// An unsigned decimal.
+@no_alloc pub fn put_usize(mut s: Sink, mut buf: []u8, v: usize) {
+    put_i64(s, buf, v as i64)
+}
+
+// `true` or `false`.
+@no_alloc pub fn put_bool(mut s: Sink, mut buf: []u8, b: bool) {
+    if b {
+        put_str(s, buf, "true")
+    } else {
+        put_str(s, buf, "false")
+    }
+}
+
+// One lowercase hex digit of `v`'s low four bits.
+@no_alloc fn hex_nibble(v: i32) -> u8 {
+    let d: i32 = v % 16
+    if d < 10 { return (S_ZERO + d) as u8 }
+    return (S_LOWER_A + d - 10) as u8
+}
+
+// A byte as exactly two lowercase hex digits, no `0x`. Fixed width on purpose: hex is
+// for dumps and digests, where alignment matters more than brevity.
+@no_alloc pub fn put_hex_u8(mut s: Sink, mut buf: []u8, b: u8) {
+    put(s, buf, hex_nibble((b as i32) / 16))
+    put(s, buf, hex_nibble(b as i32))
+}
+
+// A newline. Named rather than `put(s, buf, 10)` at forty call sites.
+@no_alloc pub fn put_nl(mut s: Sink, mut buf: []u8) {
+    put(s, buf, 10 as u8)
+}
+
+// ------------------------------------------------------------------------ queries
+
+// Bytes written so far — the length of the meaningful prefix of the buffer.
+@no_alloc pub fn written(read s: Sink) -> usize {
+    return s.used
+}
+
+// Bytes that did not fit. Non-zero means the output you are holding is incomplete; it
+// does not mean any earlier byte is wrong.
+@no_alloc pub fn lost(read s: Sink) -> usize {
+    return s.lost
+}
+
+// Did anything not fit? The one check a caller is expected to make, once, at the end.
+@no_alloc pub fn overflowed(read s: Sink) -> bool {
+    return s.lost > 0
+}
+
+// Reposition to the start of the buffer, forgetting the loss count too. The bytes are
+// not cleared — `written()` is the only thing that says which of them mean anything, so
+// zeroing would be work nobody can observe.
+@no_alloc pub fn reset(mut s: Sink) {
+    s.used = 0
+    s.lost = 0
+}
+
+// The written prefix as a `str` view.
+//
+// REQUIRES the buffer to hold valid UTF-8, which is the caller's business: `put` takes
+// arbitrary bytes and this module never validates. Every `put_*` helper above emits
+// printable ASCII, so a sink written only through those is always safe here; a sink fed
+// raw bytes through `put` may not be, and `from_utf8` traps rather than lying.
+@no_alloc pub fn view(read s: Sink, read buf: []u8) -> read str {
+    return from_utf8(buf[0 .. s.used])
+}

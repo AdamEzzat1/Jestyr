@@ -1,0 +1,206 @@
+// std/writer.jtr — the `Writer` trait: one formatting routine, several destinations.
+//
+// TIER: `std`. Requires a runtime that can write to stdout and stderr. This is the
+// polymorphic half of the IO slice; `std/sink.jtr` is the `core` half.
+//
+// WHY THE TRAIT IS HERE AND NOT IN `core`. `@no_alloc` does not see through a trait
+// method — it passes VACUOUSLY, reporting success on code that allocates on every call.
+// Probed, with the direct-call control correctly rejected in the same file
+// (`docs/io-design.md` has the reproduction). So a `core` module built on a trait would
+// carry a marker that proves nothing, which is worse than carrying no marker: it reads
+// as a guarantee. `core` therefore gets the concrete `Sink`, and the trait boundary is
+// drawn exactly where the proof stops. That is what makes the tier line mean something
+// here rather than being a filing convention.
+//
+// THREE DESTINATIONS, one interface:
+//   * stdout — the program's output.
+//   * stderr — diagnostics, which must not land in a stream a caller is parsing.
+//   * a buffer — an in-memory `Sink`, so the same routine that prints can be TESTED by
+//     writing into a buffer and comparing. That is the entire point of the abstraction;
+//     without it, testing output means capturing a subprocess.
+//
+// THERE IS NO FAILURE TO REPORT YET, AND SO THERE IS NO `failed()`. The design intent is
+// that writes stay infallible at the call site and any error LATCHES on the handle, to be
+// checked once at the end — a formatter emitting fifty pieces should not carry fifty `?`s
+// (`docs/io-design.md` §3). Implementing it revealed that nothing can currently latch:
+// `print_str`/`eprint_str` return nothing, so a stream write has no detectable failure,
+// and sink overflow is deliberately the SINK's business (`sink.overflowed`), not the
+// writer's — a caller can fix a small buffer and cannot fix a broken stdout, so
+// conflating them helps nobody.
+//
+// A `failed()` that could only ever return false was therefore removed rather than
+// shipped. A query that always answers "fine" is worse than no query: it invites a caller
+// to believe something was checked. When a fallible write intrinsic exists, the latch is
+// the shape to add, and the one genuinely fallible operation — a final `flush` — is where
+// an error set belongs: one fallible call, not N.
+//
+// A LIMITATION WORTH KNOWING: the print intrinsics emit a line terminator of their own,
+// so the stream targets write whole LINES, not arbitrary byte runs — `put_str` on them is
+// one line per call. A buffer target has no such constraint and concatenates exactly what
+// it is given. That asymmetry is the runtime's, not the interface's; it disappears when a
+// raw `fputs`-shaped intrinsic exists. Until then, build a line in a `Sink` and write it
+// once if you need exact control.
+//
+// Worked examples:  examples/std/writer_demo.jtr
+
+import "sink"
+import "io"
+
+// A destination. Which one is chosen by the variant, not by a vtable the caller builds.
+//
+// The `_target` suffixes are not noise: enum variants are referenced BARE in Jestyr
+// (`match t { stdout_target => … }`, construction likewise), so a variant called `stdout`
+// would claim that identifier for every consumer of this module. Variant names also
+// cannot be keywords — `out` is one, which rules out the obvious short spelling.
+pub enum Target {
+    stdout_target,
+    stderr_target,
+    buffer_target,
+}
+
+// The handle. Scalars only — the `Sink` and its buffer stay with the caller for the same
+// second-class-borrow reason `Sink` itself takes a buffer parameter.
+pub struct Writer {
+    target: Target,
+    writes: i64,
+}
+
+pub fn to_stdout() -> Writer {
+    return Writer{ target: stdout_target, writes: 0 }
+}
+
+pub fn to_stderr() -> Writer {
+    return Writer{ target: stderr_target, writes: 0 }
+}
+
+// A writer that appends into a caller-held `Sink`. The sink and its buffer travel as
+// parameters to every write, because a handle cannot own borrowed storage.
+pub fn to_buffer() -> Writer {
+    return Writer{ target: buffer_target, writes: 0 }
+}
+
+// ------------------------------------------------------------------------- writing
+//
+// ONE entry point per shape, and it always carries the sink. An earlier version had
+// `write_str` for streams and `write_str_into` for buffers, which forced every formatter
+// to open with `if is_buffered(w) { … } else { … }` — and a formatter that has to know
+// which destination it has is not polymorphic, which was the whole point of the trait.
+// So the sink and its buffer travel on every call and are simply unused for a stream
+// target. A caller writing to stdout passes a scratch sink it never reads; that is a
+// smaller cost than branching at every call site, and it keeps a routine like
+//
+//     fn render(mut w: writer.Writer, mut s: sink.Sink, mut buf: []u8) {
+//         writer.line(w, s, buf, "name=jestyr")
+//         writer.line(w, s, buf, "version=3")
+//     }
+//
+// written once and usable against either destination — which is what makes output
+// TESTABLE without capturing a subprocess.
+
+// Write `text` to wherever `w` points. Returns whether it went out.
+//
+// Sink overflow is NOT a writer failure: the sink counts it (`sink.overflowed`), and
+// conflating "the buffer was too small" with "the destination broke" would leave a caller
+// unable to tell which of the two it can fix.
+pub fn put_str(mut w: Writer, mut s: sink.Sink, mut buf: []u8, read text: str) -> bool {
+    match w.target {
+        stdout_target => {
+            print_str(text)
+            w.writes = w.writes + 1
+            return true
+        },
+        stderr_target => {
+            eprint_str(text)
+            w.writes = w.writes + 1
+            return true
+        },
+        buffer_target => {
+            sink.put_str(s, buf, text)
+            w.writes = w.writes + 1
+            return true
+        },
+    }
+}
+
+// `text` followed by a line terminator.
+//
+// The stream targets get one from the print intrinsics whether asked or not, so on those
+// this is exactly `put_str`; on a buffer the newline is appended explicitly. That
+// asymmetry is the runtime's — there is no raw `fputs`-shaped intrinsic — and naming the
+// operation is what lets a formatter ignore it.
+pub fn line(mut w: Writer, mut s: sink.Sink, mut buf: []u8, read text: str) -> bool {
+    match w.target {
+        buffer_target => {
+            if put_str(w, s, buf, text) == false { return false }
+            sink.put_nl(s, buf)
+            return true
+        },
+        stdout_target => { return put_str(w, s, buf, text) },
+        stderr_target => { return put_str(w, s, buf, text) },
+    }
+}
+
+// A `key=value` line, the shape most machine-readable output actually takes.
+pub fn field(mut w: Writer, mut s: sink.Sink, mut buf: []u8, read key: str, read value: str) -> bool {
+    match w.target {
+        buffer_target => {
+            sink.put_str(s, buf, key)
+            sink.put(s, buf, 61 as u8)          // '='
+            sink.put_str(s, buf, value)
+            sink.put_nl(s, buf)
+            w.writes = w.writes + 1
+            return true
+        },
+        stdout_target => { return put_kv_stream(w, key, value) },
+        stderr_target => { return put_kv_stream(w, key, value) },
+    }
+}
+
+// A stream target cannot emit `key`, `=` and `value` as one line without a raw write, so
+// the pieces are joined in a scratch sink first. 256 bytes covers any field a
+// diagnostic writes; a longer one truncates and is counted, like every other overflow.
+fn put_kv_stream(mut w: Writer, read key: str, read value: str) -> bool {
+    var raw: *mut u8 = alloc(u8, 256)
+    var buf: []u8 = slice(u8, raw, 256)
+    var s: sink.Sink = sink.new()
+    sink.put_str(s, buf, key)
+    sink.put(s, buf, 61 as u8)
+    sink.put_str(s, buf, value)
+    let text: str = sink.view(s, buf)
+    var okay: bool = false
+    match w.target {
+        stderr_target => {
+            eprint_str(text)
+            okay = true
+        },
+        stdout_target => {
+            print_str(text)
+            okay = true
+        },
+        buffer_target => { okay = false },
+    }
+    if okay { w.writes = w.writes + 1 }
+    free_ptr(raw)
+    return okay
+}
+
+// ------------------------------------------------------------------------- queries
+
+// Writes that succeeded through this handle.
+pub fn writes(read w: Writer) -> i64 {
+    return w.writes
+}
+
+// Is this handle backed by memory rather than a stream?
+//
+// A formatter should NOT need this — that is the point of one entry point taking the sink
+// unconditionally, and a routine that branches on it has stopped being polymorphic. It is
+// here for the caller that must decide how large a buffer to allocate before it starts,
+// which is a question about storage rather than about formatting.
+pub fn is_buffered(read w: Writer) -> bool {
+    match w.target {
+        buffer_target => true,
+        stdout_target => false,
+        stderr_target => false,
+    }
+}

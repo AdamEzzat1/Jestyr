@@ -1,0 +1,221 @@
+// std/cursor_test.jtr — the unit suite for `std/cursor`.
+//
+// A sibling file, per the convention: a colocated `@test` is emitted into every consumer.
+//
+// The line tests are the load-bearing ones. `line` claims the same trailing-newline rule
+// as `std/test.eq_golden` — "a\n" is one line, "a\n\n" is two — so a golden compared
+// line-by-line through a cursor agrees with one compared wholesale. If that ever drifts,
+// `lines_follow_the_same_rule_as_eq_golden` fails rather than two subsystems quietly
+// disagreeing about what a file contains.
+//
+// Run:  jestyrc test examples/std/cursor_test.jtr
+//   →   8 passed; 0 failed
+
+import "cursor"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 768
+
+@test fn bytes_advance_and_report_exhaustion() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let src: str = "ab"
+    var k: cursor.Cursor = cursor.new()
+
+    test.eq_usize(c, rep, "position", cursor.position(k), 0)
+    test.eq_usize(c, rep, "remaining", cursor.remaining(k, src), 2)
+    test.is_false(c, rep, "not at end", cursor.at_end(k, src))
+    test.eq_i64(c, rep, "peek", cursor.peek(k, src) as i64, 97)
+    test.eq_i64(c, rep, "peek does not advance", cursor.position(k) as i64, 0)
+    test.eq_i64(c, rep, "byte a", cursor.byte(k, src) as i64, 97)
+    test.eq_i64(c, rep, "byte b", cursor.byte(k, src) as i64, 98)
+    test.is_true(c, rep, "at end", cursor.at_end(k, src))
+    // -1 at exhaustion rather than a trap, matching `find`'s convention.
+    test.eq_i64(c, rep, "byte at end", cursor.byte(k, src) as i64, -1)
+    test.eq_i64(c, rep, "peek at end", cursor.peek(k, src) as i64, -1)
+    test.eq_usize(c, rep, "remaining 0", cursor.remaining(k, src), 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn chunk_clamps_and_rest_drains() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let src: str = "abcdef"
+    var k: cursor.Cursor = cursor.new()
+
+    test.eq_str(c, rep, "chunk 2", cursor.chunk(k, src, 2), "ab")
+    test.eq_str(c, rep, "chunk clamps", cursor.chunk(k, src, 99), "cdef")
+    test.eq_usize(c, rep, "chunk past end is empty", cursor.chunk(k, src, 3).len, 0)
+
+    var k2: cursor.Cursor = cursor.new()
+    test.eq_str(c, rep, "rest", cursor.rest(k2, src), "abcdef")
+    test.is_true(c, rep, "rest drains", cursor.at_end(k2, src))
+    test.eq_usize(c, rep, "rest again is empty", cursor.rest(k2, src).len, 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **The rule that must match `std/test.eq_golden`.** A trailing newline closes the last
+// line rather than opening an empty one.
+@test fn lines_follow_the_same_rule_as_eq_golden() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // "a\n" is ONE line.
+    var k1: cursor.Cursor = cursor.new()
+    let s1: str = "a\n"
+    test.eq_str(c, rep, "a", cursor.line(k1, s1), "a")
+    test.is_true(c, rep, "one line only", cursor.at_end(k1, s1))
+
+    // "a\n\n" is TWO — the second empty.
+    var k2: cursor.Cursor = cursor.new()
+    let s2: str = "a\n\n"
+    test.eq_str(c, rep, "first", cursor.line(k2, s2), "a")
+    test.is_false(c, rep, "more to come", cursor.at_end(k2, s2))
+    test.eq_usize(c, rep, "second is empty", cursor.line(k2, s2).len, 0)
+    test.is_true(c, rep, "then done", cursor.at_end(k2, s2))
+
+    // No trailing newline at all: still one line.
+    var k3: cursor.Cursor = cursor.new()
+    let s3: str = "abc"
+    test.eq_str(c, rep, "unterminated", cursor.line(k3, s3), "abc")
+    test.is_true(c, rep, "consumed", cursor.at_end(k3, s3))
+
+    // Empty source: zero lines, so the `at_end`-first loop runs zero times.
+    var k4: cursor.Cursor = cursor.new()
+    test.is_true(c, rep, "empty is zero lines", cursor.at_end(k4, ""))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn lines_strip_one_carriage_return() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var k: cursor.Cursor = cursor.new()
+    let src: str = "a\r\nb\r\n"
+    test.eq_str(c, rep, "crlf first", cursor.line(k, src), "a")
+    test.eq_str(c, rep, "crlf second", cursor.line(k, src), "b")
+    test.is_true(c, rep, "done", cursor.at_end(k, src))
+
+    // Exactly ONE — a doubled CR keeps the inner one, and a lone CR is not a terminator.
+    var k2: cursor.Cursor = cursor.new()
+    test.eq_str(c, rep, "double cr", cursor.line(k2, "a\r\r\n"), "a\r")
+    var k3: cursor.Cursor = cursor.new()
+    test.eq_str(c, rep, "lone cr is content", cursor.line(k3, "a\rb"), "a\rb")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// `until` on a missing separator yields the rest and parks at the end, so a loop over it
+// always terminates and the final field is still delivered.
+@test fn until_always_terminates() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var k: cursor.Cursor = cursor.new()
+    let src: str = "a,b,c"
+    test.eq_str(c, rep, "field 1", cursor.until(k, src, ","), "a")
+    test.eq_str(c, rep, "field 2", cursor.until(k, src, ","), "b")
+    test.eq_str(c, rep, "field 3 (no sep left)", cursor.until(k, src, ","), "c")
+    test.is_true(c, rep, "parked at end", cursor.at_end(k, src))
+
+    // A multi-byte separator is consumed whole.
+    var k2: cursor.Cursor = cursor.new()
+    test.eq_str(c, rep, "multi", cursor.until(k2, "a::b", "::"), "a")
+    test.eq_str(c, rep, "multi rest", cursor.rest(k2, "a::b"), "b")
+
+    // An empty separator consumes nothing — the alternative advances by zero forever.
+    var k3: cursor.Cursor = cursor.new()
+    test.eq_usize(c, rep, "empty sep is empty", cursor.until(k3, "abc", "").len, 0)
+    test.eq_usize(c, rep, "empty sep did not move", cursor.position(k3), 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn looking_at_and_consume_are_the_parser_primitives() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var k: cursor.Cursor = cursor.new()
+    let src: str = "--flag=1"
+
+    test.is_true(c, rep, "looking_at", cursor.looking_at(k, src, "--"))
+    test.eq_usize(c, rep, "looking_at does not move", cursor.position(k), 0)
+    test.is_true(c, rep, "consume", cursor.consume(k, src, "--"))
+    test.eq_usize(c, rep, "consume moved", cursor.position(k), 2)
+    // A failed consume must not move the cursor — the property that makes backtracking
+    // unnecessary.
+    test.is_false(c, rep, "consume(miss)", cursor.consume(k, src, "xx"))
+    test.eq_usize(c, rep, "still at 2", cursor.position(k), 2)
+    test.eq_str(c, rep, "name", cursor.until(k, src, "="), "flag")
+    test.eq_str(c, rep, "value", cursor.rest(k, src), "1")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn whitespace_and_words() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var k: cursor.Cursor = cursor.new()
+    let src: str = "  one\ttwo  "
+
+    test.eq_usize(c, rep, "skipped 2", cursor.skip_ws(k, src), 2)
+    test.eq_str(c, rep, "word 1", cursor.word(k, src), "one")
+    test.eq_usize(c, rep, "skipped tab", cursor.skip_ws(k, src), 1)
+    test.eq_str(c, rep, "word 2", cursor.word(k, src), "two")
+    test.eq_usize(c, rep, "trailing ws", cursor.skip_ws(k, src), 2)
+    test.is_true(c, rep, "done", cursor.at_end(k, src))
+    // A word at whitespace is empty — hence skip_ws first.
+    var k2: cursor.Cursor = cursor.new()
+    test.eq_usize(c, rep, "word at ws is empty", cursor.word(k2, " x").len, 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn seek_clamps_and_reset_rewinds() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var k: cursor.Cursor = cursor.new()
+    let src: str = "abcdef"
+
+    cursor.seek(k, src, 3)
+    test.eq_str(c, rep, "seek", cursor.peek_rest(k, src), "def")
+    // Out of range parks at the end rather than faulting.
+    cursor.seek(k, src, 999)
+    test.is_true(c, rep, "clamped to end", cursor.at_end(k, src))
+    test.eq_usize(c, rep, "at len", cursor.position(k), 6)
+    cursor.reset(k)
+    test.eq_usize(c, rep, "reset", cursor.position(k), 0)
+    test.eq_str(c, rep, "whole source again", cursor.peek_rest(k, src), "abcdef")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

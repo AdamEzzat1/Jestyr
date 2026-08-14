@@ -1,0 +1,102 @@
+// std/writer_demo.jtr — the IO slice, and the thing it buys you.
+//
+// `render` below is written ONCE. It is called twice: once against stdout, where its
+// output is what you see, and once against a buffer, where the result is a `str` a test
+// can compare. That is the entire argument for a `Writer` — without it, checking a
+// program's output means capturing a subprocess, which is why so much output goes
+// unchecked.
+//
+// Then the two `core` halves are shown composing: bytes written through a `Sink` are read
+// back through a `Cursor`, line by line, with no allocation between them beyond the one
+// buffer the caller owns.
+//
+// Run:  cargo run --release -- run examples/std/writer_demo.jtr
+//   →   -- to stdout --
+//       name=jestyr
+//       tier=core
+//       lines=2
+//       -- the same routine, into a buffer --
+//       1
+//       3
+//       -- read the buffer back with a cursor --
+//       name=jestyr
+//       tier=core
+//       lines=2
+//       3
+//       -- overflow is counted, not silent --
+//       1
+//       1
+
+import "sink"
+import "cursor"
+import "writer"
+import "test"
+import "test_report"
+
+const CAP: usize = 512
+
+fn b2i(read b: bool) -> i32 {
+    if b { return 1 }
+    return 0
+}
+
+// ONE formatting routine. It never asks where it is writing — no `is_buffered`, no
+// branching. That is what makes it testable.
+fn render(mut w: writer.Writer, mut s: sink.Sink, mut buf: []u8) {
+    writer.field(w, s, buf, "name", "jestyr")
+    writer.field(w, s, buf, "tier", "core")
+    writer.field(w, s, buf, "lines", "2")
+}
+
+fn main() -> i32 {
+    // ---- against stdout. The scratch sink is unused; a stream target ignores it.
+    print_str("-- to stdout --")
+    var sraw: *mut u8 = alloc(u8, 16)
+    var sbuf: []u8 = slice(u8, sraw, 16)
+    var scratch: sink.Sink = sink.new()
+    var wout: writer.Writer = writer.to_stdout()
+    render(wout, scratch, sbuf)
+
+    // ---- the same routine, into a buffer, and now it can be ASSERTED.
+    print_str("-- the same routine, into a buffer --")
+    var braw: *mut u8 = alloc(u8, CAP)
+    var buf: []u8 = slice(u8, braw, CAP)
+    var s: sink.Sink = sink.new()
+    var wbuf: writer.Writer = writer.to_buffer()
+    render(wbuf, s, buf)
+
+    var rraw: *mut u8 = alloc(u8, CAP)
+    var rep: []u8 = slice(u8, rraw, CAP)
+    var c: test.Check = test.new()
+    let want: str = "name=jestyr\ntier=core\nlines=2\n"
+    test.eq_str(c, rep, "buffered output", sink.view(s, buf), want)
+    print_int(b2i(test_report.finish(c, rep)))       // 1 — matches, byte for byte
+    print_int(writer.writes(wbuf) as i32)            // 3 — three fields
+    free_ptr(rraw)
+
+    // ---- and the two core halves compose: Sink out, Cursor in.
+    print_str("-- read the buffer back with a cursor --")
+    let text: str = sink.view(s, buf)
+    var k: cursor.Cursor = cursor.new()
+    var lines: i32 = 0
+    for cursor.at_end(k, text) == false {
+        print_str(cursor.line(k, text))
+        lines = lines + 1
+    }
+    print_int(lines)                                 // 3 — the trailing newline
+                                                     //     closes the last line
+    // ---- a buffer too small reports the loss rather than lying.
+    print_str("-- overflow is counted, not silent --")
+    var traw: *mut u8 = alloc(u8, 8)
+    var tiny: []u8 = slice(u8, traw, 8)
+    var ts: sink.Sink = sink.new()
+    var tw: writer.Writer = writer.to_buffer()
+    render(tw, ts, tiny)
+    print_int(b2i(sink.overflowed(ts)))              // 1 — it did not fit
+    print_int(b2i(sink.written(ts) == 8))            // 1 — and wrote exactly 8
+    free_ptr(traw)
+
+    free_ptr(braw)
+    free_ptr(sraw)
+    return 0
+}

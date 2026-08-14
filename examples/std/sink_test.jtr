@@ -1,0 +1,150 @@
+// std/sink_test.jtr — the unit suite for `std/sink`.
+//
+// A sibling file: a `@test` function is emitted into every program importing its module,
+// so a suite colocated in a `core` module would leak its test code into every consumer.
+//
+// Run:  jestyrc test examples/std/sink_test.jtr
+//   →   6 passed; 0 failed
+
+import "sink"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 512
+
+@test fn writes_land_in_the_callers_buffer() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var braw: *mut u8 = alloc(u8, 64)
+    var buf: []u8 = slice(u8, braw, 64)
+    var s: sink.Sink = sink.new()
+
+    sink.put_str(s, buf, "ab")
+    sink.put(s, buf, 99 as u8)              // 'c'
+    test.eq_usize(c, rep, "written", sink.written(s), 3)
+    test.eq_str(c, rep, "view", sink.view(s, buf), "abc")
+    test.is_false(c, rep, "no overflow", sink.overflowed(s))
+    test.eq_usize(c, rep, "nothing lost", sink.lost(s), 0)
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn numbers_and_bools_format() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var braw: *mut u8 = alloc(u8, 64)
+    var buf: []u8 = slice(u8, braw, 64)
+    var s: sink.Sink = sink.new()
+
+    sink.put_i64(s, buf, 0)
+    sink.put(s, buf, 32 as u8)
+    sink.put_i64(s, buf, -42)
+    sink.put(s, buf, 32 as u8)
+    sink.put_usize(s, buf, 7)
+    sink.put(s, buf, 32 as u8)
+    sink.put_bool(s, buf, true)
+    sink.put(s, buf, 32 as u8)
+    sink.put_bool(s, buf, false)
+    test.eq_str(c, rep, "formatted", sink.view(s, buf), "0 -42 7 true false")
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The most negative `i64` formats correctly — the reason `put_i64` never negates its
+// input.
+@test fn the_most_negative_i64_formats() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var braw: *mut u8 = alloc(u8, 64)
+    var buf: []u8 = slice(u8, braw, 64)
+    var s: sink.Sink = sink.new()
+
+    sink.put_i64(s, buf, -9223372036854775807 - 1)
+    test.eq_str(c, rep, "i64 min", sink.view(s, buf), "-9223372036854775808")
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn hex_is_two_fixed_lowercase_digits() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var braw: *mut u8 = alloc(u8, 64)
+    var buf: []u8 = slice(u8, braw, 64)
+    var s: sink.Sink = sink.new()
+
+    sink.put_hex_u8(s, buf, 0 as u8)
+    sink.put_hex_u8(s, buf, 15 as u8)
+    sink.put_hex_u8(s, buf, 16 as u8)
+    sink.put_hex_u8(s, buf, 255 as u8)
+    // Fixed width is the point: `00` not `0`, so a dump stays aligned.
+    test.eq_str(c, rep, "hex", sink.view(s, buf), "000f10ff")
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **Overflow is counted, not silent, and never corrupts what did fit.** The whole reason
+// writes do not fail at the call site.
+@test fn overflow_is_counted_and_the_prefix_survives() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var braw: *mut u8 = alloc(u8, 64)
+    var buf: []u8 = slice(u8, braw, 4)      // room for four bytes only
+    var s: sink.Sink = sink.new()
+
+    sink.put_str(s, buf, "abcdefgh")        // eight offered
+    test.eq_usize(c, rep, "wrote 4", sink.written(s), 4)
+    test.eq_usize(c, rep, "lost 4", sink.lost(s), 4)
+    test.is_true(c, rep, "overflowed", sink.overflowed(s))
+    // The bytes that fit are the FIRST four, unmangled.
+    test.eq_str(c, rep, "prefix intact", sink.view(s, buf), "abcd")
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn reset_rewinds_position_and_loss() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var braw: *mut u8 = alloc(u8, 64)
+    var buf: []u8 = slice(u8, braw, 4)
+    var s: sink.Sink = sink.new()
+
+    sink.put_str(s, buf, "abcdefgh")
+    sink.reset(s)
+    test.eq_usize(c, rep, "rewound", sink.written(s), 0)
+    test.is_false(c, rep, "loss cleared", sink.overflowed(s))
+    // Writing again starts from the beginning and overwrites.
+    sink.put_str(s, buf, "xy")
+    test.eq_str(c, rep, "reused", sink.view(s, buf), "xy")
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

@@ -1,0 +1,147 @@
+// std/writer_test.jtr — the unit suite for `std/writer`.
+//
+// A sibling file, per the convention. Nothing here writes to a STREAM: a `@test` that
+// printed would interleave with the harness's own `test <name> ... ok` line. The stream
+// targets are exercised in `writer_demo.jtr`, where the output is the point and the
+// c-oracle test asserts it. What is tested here is the part a stream cannot show you —
+// that the same routine, pointed at a buffer, produces exactly the bytes you expect.
+//
+// Run:  jestyrc test examples/std/writer_test.jtr
+//   →   5 passed; 0 failed
+
+import "sink"
+import "writer"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 512
+
+// The routine under test in every case below: written once, never asking where it writes.
+fn render(mut w: writer.Writer, mut s: sink.Sink, mut buf: []u8) {
+    writer.field(w, s, buf, "a", "1")
+    writer.field(w, s, buf, "b", "2")
+}
+
+@test fn a_buffer_writer_produces_exactly_the_expected_bytes() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var braw: *mut u8 = alloc(u8, 128)
+    var buf: []u8 = slice(u8, braw, 128)
+    var s: sink.Sink = sink.new()
+    var w: writer.Writer = writer.to_buffer()
+
+    render(w, s, buf)
+    test.eq_str(c, rep, "rendered", sink.view(s, buf), "a=1\nb=2\n")
+    test.eq_i64(c, rep, "two writes", writer.writes(w), 2)
+    test.is_true(c, rep, "is_buffered", writer.is_buffered(w))
+    test.is_false(c, rep, "no overflow", sink.overflowed(s))
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn put_str_concatenates_and_line_terminates() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var braw: *mut u8 = alloc(u8, 128)
+    var buf: []u8 = slice(u8, braw, 128)
+    var s: sink.Sink = sink.new()
+    var w: writer.Writer = writer.to_buffer()
+
+    // `put_str` adds nothing of its own — three calls, one line.
+    writer.put_str(w, s, buf, "a")
+    writer.put_str(w, s, buf, "b")
+    writer.put_str(w, s, buf, "c")
+    test.eq_str(c, rep, "concatenated", sink.view(s, buf), "abc")
+    // `line` appends the terminator.
+    writer.line(w, s, buf, "!")
+    test.eq_str(c, rep, "then a line", sink.view(s, buf), "abc!\n")
+    test.eq_i64(c, rep, "four writes", writer.writes(w), 4)
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The two targets are independent values, not views onto one global stream.
+@test fn writers_are_independent_values() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var braw: *mut u8 = alloc(u8, 128)
+    var buf: []u8 = slice(u8, braw, 128)
+    var s: sink.Sink = sink.new()
+
+    var a: writer.Writer = writer.to_buffer()
+    var b: writer.Writer = writer.to_stdout()
+    writer.put_str(a, s, buf, "x")
+
+    test.eq_i64(c, rep, "a wrote", writer.writes(a), 1)
+    test.eq_i64(c, rep, "b did not", writer.writes(b), 0)
+    test.is_true(c, rep, "a is buffered", writer.is_buffered(a))
+    test.is_false(c, rep, "b is not", writer.is_buffered(b))
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **Sink overflow is the SINK's business, not the writer's.** A caller can fix a buffer
+// that is too small; it cannot fix a broken stdout. Keeping the two separate is what lets
+// it tell which happened — the writer still reports its writes as having gone out, and
+// the sink is where the truncation shows.
+@test fn overflow_is_reported_by_the_sink_not_the_writer() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var braw: *mut u8 = alloc(u8, 64)
+    var tiny: []u8 = slice(u8, braw, 4)         // "a=1\n" fits exactly; "b=2\n" does not
+    var s: sink.Sink = sink.new()
+    var w: writer.Writer = writer.to_buffer()
+
+    render(w, s, tiny)
+    test.eq_str(c, rep, "what fit", sink.view(s, tiny), "a=1\n")
+    test.is_true(c, rep, "sink says overflowed", sink.overflowed(s))
+    test.eq_usize(c, rep, "lost four bytes", sink.lost(s), 4)
+    // The writer counted both writes: it did its job, the buffer was the constraint.
+    test.eq_i64(c, rep, "writer still counted 2", writer.writes(w), 2)
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// A stream writer ignores the sink entirely, so a scratch sink stays untouched. This is
+// the cost of the single-entry-point design, pinned so it stays a known cost: nothing
+// leaks into the buffer you passed but did not intend to use.
+@test fn a_stream_writer_leaves_the_scratch_sink_alone() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var braw: *mut u8 = alloc(u8, 64)
+    var scratch: []u8 = slice(u8, braw, 64)
+    var s: sink.Sink = sink.new()
+    var w: writer.Writer = writer.to_stderr()   // stderr, so the harness's stdout stays clean
+
+    writer.put_str(w, s, scratch, "diagnostic")
+    test.eq_usize(c, rep, "scratch untouched", sink.written(s), 0)
+    test.is_false(c, rep, "no overflow either", sink.overflowed(s))
+    test.eq_i64(c, rep, "but the write counted", writer.writes(w), 1)
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

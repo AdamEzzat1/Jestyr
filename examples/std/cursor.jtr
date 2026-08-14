@@ -1,0 +1,220 @@
+// std/cursor.jtr — bytes in, from a buffer the caller already holds.
+//
+// TIER: `core`. No heap, no OS, no imports. Every function `@no_alloc`, and as in
+// `std/sink.jtr` that marker is a real proof here because `Cursor` is a concrete struct
+// reached through free functions — nothing polymorphic, so the checker sees the whole
+// call graph. Every result is a VIEW into the source, valid only while the source is.
+//
+// READING IS NOT SYMMETRIC WITH WRITING, which is the honest thing to say up front.
+// `std/writer.jtr` has a hosted implementation because `print_str` writes incrementally.
+// There is no reading counterpart: the intrinsics offer `read_file`/`try_read_file`,
+// which slurp a whole file, and there is no partial read, no `read_line`, no file
+// handle. So this is the *whole* reader that can honestly be built today — a cursor over
+// bytes already in memory. A streaming hosted `Reader` is blocked on an intrinsic, not
+// on a design decision, and wrapping `read_file` in a `Reader` trait would ship an API
+// whose central promise (that it streams) is false. See `docs/io-design.md`.
+//
+// In practice that costs nothing: `cursor` over `fs.read_text`'s result covers every
+// case a slurping reader could, and says what it is.
+//
+// THE SOURCE IS A PARAMETER, not a field — a Jestyr borrow is second-class and may not
+// be stored in a struct that outlives the call. The handle carries one offset. Pass the
+// SAME source on every call; passing a different one is not detectable here and will
+// read from the wrong place.
+//
+// Run the tests:  jestyrc test examples/std/cursor_test.jtr
+
+const C_LF: i32 = 10
+const C_CR: i32 = 13
+const C_TAB: i32 = 9
+const C_SPACE: i32 = 32
+
+// The position. One offset, nothing else.
+pub struct Cursor {
+    at: usize,
+}
+
+// A cursor at the start of whatever source you pass it.
+@no_alloc pub fn new() -> Cursor {
+    return Cursor{ at: 0 }
+}
+
+// ------------------------------------------------------------------------ position
+
+// The current byte offset.
+@no_alloc pub fn position(read c: Cursor) -> usize {
+    return c.at
+}
+
+// Is everything consumed?
+@no_alloc pub fn at_end(read c: Cursor, read src: str) -> bool {
+    return c.at >= src.len
+}
+
+// Bytes not yet consumed.
+@no_alloc pub fn remaining(read c: Cursor, read src: str) -> usize {
+    if c.at >= src.len { return 0 }
+    return src.len - c.at
+}
+
+// Move to `to`, CLAMPED to the end of the source — an out-of-range seek parks the cursor
+// at the end rather than faulting, because a cursor past the end is a well-defined
+// "nothing left" and every read here already handles it.
+@no_alloc pub fn seek(mut c: Cursor, read src: str, to: usize) {
+    if to > src.len {
+        c.at = src.len
+        return
+    }
+    c.at = to
+}
+
+@no_alloc pub fn reset(mut c: Cursor) {
+    c.at = 0
+}
+
+// Everything left, as a view, WITHOUT consuming it.
+@no_alloc pub fn peek_rest(read c: Cursor, read src: str) -> read str {
+    if c.at >= src.len { return src[0 .. 0] }
+    return src[c.at .. src.len]
+}
+
+// ------------------------------------------------------------------------- reading
+
+// The next byte, advancing past it. **-1 at end of input** rather than a trap, matching
+// the `-1` convention `find` already uses for "not there". A `u8` return could not
+// express exhaustion without a separate check.
+@no_alloc pub fn byte(mut c: Cursor, read src: str) -> i32 {
+    if c.at >= src.len { return 0 - 1 }
+    let b: i32 = src[c.at] as i32
+    c.at = c.at + 1
+    return b
+}
+
+// The next byte WITHOUT advancing; -1 at end.
+@no_alloc pub fn peek(read c: Cursor, read src: str) -> i32 {
+    if c.at >= src.len { return 0 - 1 }
+    return src[c.at] as i32
+}
+
+// At most `n` bytes, advancing past them. Fewer when the source runs out, so the result's
+// `.len` is the truth about what you got.
+//
+// Named `chunk` because `take` is a Jestyr KEYWORD (the ownership-transfer parameter
+// convention) and a function called that is a parse error, not a shadowing warning.
+@no_alloc pub fn chunk(mut c: Cursor, read src: str, n: usize) -> read str {
+    if c.at >= src.len { return src[0 .. 0] }
+    var stop: usize = c.at + n
+    if stop > src.len { stop = src.len }
+    let start: usize = c.at
+    c.at = stop
+    return src[start .. stop]
+}
+
+// Everything left, consuming it.
+@no_alloc pub fn rest(mut c: Cursor, read src: str) -> read str {
+    if c.at >= src.len { return src[0 .. 0] }
+    let start: usize = c.at
+    c.at = src.len
+    return src[start .. src.len]
+}
+
+// The next logical line: up to the next `\n`, with one trailing `\r` removed, advancing
+// PAST the newline.
+//
+// A trailing newline does not create a final empty line — `"a\n"` is one line, `"a\n\n"`
+// is two. That is the same rule `std/test.eq_golden` applies, so a golden compared
+// line-by-line through a cursor agrees with one compared wholesale.
+//
+// An empty line and end-of-input both return an empty view, so **test `at_end` first**:
+//
+//     for at_end(c, src) == false {
+//         let l: str = line(c, src)
+//         …
+//     }
+@no_alloc pub fn line(mut c: Cursor, read src: str) -> read str {
+    if c.at >= src.len { return src[0 .. 0] }
+    let start: usize = c.at
+    var i: usize = c.at
+    for i < src.len {
+        if (src[i] as i32) == C_LF { break }
+        i = i + 1
+    }
+    var stop: usize = i
+    if stop > start {
+        if (src[stop - 1] as i32) == C_CR { stop = stop - 1 }
+    }
+    // Advance past the newline when there was one; to the end when there was not.
+    if i < src.len {
+        c.at = i + 1
+    } else {
+        c.at = src.len
+    }
+    return src[start .. stop]
+}
+
+// Up to the next occurrence of `sep`, advancing PAST the separator. When `sep` is absent
+// this yields the rest and parks at the end — so a loop over `until` always terminates,
+// and the last field of a separator-less input is still delivered.
+//
+// An empty `sep` consumes nothing and returns empty, deliberately: the alternative
+// advances by zero forever.
+@no_alloc pub fn until(mut c: Cursor, read src: str, read sep: str) -> read str {
+    if c.at >= src.len { return src[0 .. 0] }
+    if sep.len == 0 { return src[0 .. 0] }
+    let start: usize = c.at
+    var i: usize = c.at
+    for i + sep.len <= src.len {
+        if str_eq(src[i .. i + sep.len], sep) {
+            c.at = i + sep.len
+            return src[start .. i]
+        }
+        i = i + 1
+    }
+    c.at = src.len
+    return src[start .. src.len]
+}
+
+// Does what remains begin with `p`? Does not advance.
+@no_alloc pub fn looking_at(read c: Cursor, read src: str, read p: str) -> bool {
+    if p.len == 0 { return true }
+    if c.at + p.len > src.len { return false }
+    return str_eq(src[c.at .. c.at + p.len], p)
+}
+
+// Advance past `p` if and only if that is what comes next; report whether it did. The
+// primitive a hand-written parser wants — `if consume(c, src, "--") { … }`.
+@no_alloc pub fn consume(mut c: Cursor, read src: str, read p: str) -> bool {
+    if looking_at(c, src, p) == false { return false }
+    c.at = c.at + p.len
+    return true
+}
+
+@no_alloc fn is_ws(ch: i32) -> bool {
+    if ch == C_SPACE { return true }
+    if ch == C_TAB { return true }
+    if ch == C_LF { return true }
+    return ch == C_CR
+}
+
+// Advance past any run of ASCII whitespace, returning how many bytes were skipped. The
+// same four bytes `std/str.trim_start` treats as whitespace, stated rather than implied.
+@no_alloc pub fn skip_ws(mut c: Cursor, read src: str) -> usize {
+    let start: usize = c.at
+    for c.at < src.len {
+        if is_ws(src[c.at] as i32) == false { break }
+        c.at = c.at + 1
+    }
+    return c.at - start
+}
+
+// A run of bytes that are NOT whitespace, advancing past it — one token. Empty when the
+// cursor is at whitespace or at the end, so `skip_ws` first.
+@no_alloc pub fn word(mut c: Cursor, read src: str) -> read str {
+    if c.at >= src.len { return src[0 .. 0] }
+    let start: usize = c.at
+    for c.at < src.len {
+        if is_ws(src[c.at] as i32) { break }
+        c.at = c.at + 1
+    }
+    return src[start .. c.at]
+}

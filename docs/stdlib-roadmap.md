@@ -6,8 +6,9 @@ directory, ask the time, or assert anything without hand-rolling it. This
 document is the plan for closing that gap, and — as importantly — the list of
 things that should stay out of `std` for now.
 
-Status: **`path`, `env`, `time`, `test`, `process` and all four Tier 2 capability
-handles (`Fs`/`Clock`/`Env`/`Process`) landed** (2026-08-13). Everything else
+Status: **`path`, `env`, `time`, `test`, `process`, `str`, the IO slice
+(`sink`/`cursor`/`writer`) and all four Tier 2 capability handles
+(`Fs`/`Clock`/`Env`/`Process`) landed** (2026-08-13/14). Everything else
 here is a plan, not a promise. Nothing in `std` is production-ready; this is a
 research-preview standard library being pushed toward a capability-first Std v2.
 
@@ -16,9 +17,9 @@ research-preview standard library being pushed toward a capability-first Std v2.
 > first. It covers the four Tier 2 areas that remain (no-std contract, typed
 > path/`OsStr`, `Reader`/`Writer`, Collections v2) with what was *verified* about each
 > — including two things this document would otherwise mislead you about:
-> `Reader`/`Writer` is **not** blocked on traits (a mutating trait method works today,
-> statically and through `dyn`), and `distinct` is **not** an enforced newtype, so a
-> typed `Path` built on it would carry a name with no check.
+> `distinct` is **not** an enforced newtype, so a typed `Path` built on it would carry a
+> name with no check. (`Reader`/`Writer` turned out not to be blocked on traits either —
+> that area is now done; see `docs/io-design.md`.)
 
 ## The shape we are copying, and from whom
 
@@ -42,8 +43,15 @@ syscalls. `examples/std/core.jtr` already carries Option/Result combinators,
 slice algorithms, integer parse/format, the float tier (bits, Kahan/Neumaier,
 pairwise, binned accumulator) and correctly-rounded parse/format.
 
-Present: `core.jtr`, `path.jtr`, `str.jtr`, `test.jtr`, `sha256.jtr`, `float_bits.jtr`,
-`slice_algos.jtr`, `combinators.jtr`.
+Present: `core.jtr`, `path.jtr`, `str.jtr`, `test.jtr`, `sink.jtr`, `cursor.jtr`,
+`sha256.jtr`, `float_bits.jtr`, `slice_algos.jtr`, `combinators.jtr`.
+
+`sink.jtr` (bytes out into a caller buffer) and `cursor.jtr` (bytes in, views out) are
+the `core` half of the IO slice. The `Writer` *trait* is deliberately `std` and not here:
+**`@no_alloc` passes vacuously through a trait method** — probed, with the direct-call
+control correctly rejected — so a `core` module built on a trait would carry a marker
+that proves nothing. The tier line is drawn exactly where the proof stops. Argued in
+`docs/io-design.md`, pinned by `no_alloc_does_not_see_through_a_trait_method`.
 
 The tier's contract is now *checked*, not merely documented: `path.jtr` marks
 every function `@no_alloc`, so the escape checker rejects the file if any of it
@@ -79,14 +87,14 @@ this intent in their own headers and are the pattern to copy.
 
 Present: `fs.jtr` (read/write/exists/remove **+ the `Fs` capability**), `env.jtr`
 (argc/argv/env_var **+ `Env`**), `time.jtr` (monotonic elapsed **+ `Clock`**),
-`process.jtr` (`Process`), `io.jtr` (four print wrappers), `test_report.jtr`
-(printing a `Check` report), `test_fixture.jtr` (temp paths and captured command
-output, for expected-diagnostic tests).
+`process.jtr` (`Process`), `io.jtr` (four print wrappers), `writer.jtr` (the `Writer`
+trait over stdout/stderr/a buffer), `test_report.jtr` (printing a `Check` report),
+`test_fixture.jtr` (temp paths and captured command output, for expected-diagnostic
+tests).
 
 `fs` and `env` are no longer 35 and 45 lines — the capability handles roughly
-tripled both. This tier is still where most of the remaining work lives, and the
-biggest single hole in it is now `Reader`/`Writer` (Tier 2 area 3), which has no
-module at all.
+tripled both. This tier is still where most of the remaining work lives; the biggest
+remaining Tier 2 hole is now Collections v2, since the IO slice landed.
 
 `test_report.jtr` is the tier boundary made visible: it exists *only* because
 `std/test` must not print. Three functions, one import of `io`, and the whole

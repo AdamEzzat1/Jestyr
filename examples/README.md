@@ -199,6 +199,16 @@ The self-hosted compiler and the standard library, all in Jestyr:
     `get`/`has`/`get_or` over the `env_var` intrinsic. Values are `str` VIEWS
     into OS-owned storage — no allocation, nothing to free. Worked examples in
     `env_demo.jtr`. (`get`, not Rust's `var`: `var` is a Jestyr keyword.)
+  * `sink.jtr` + `cursor.jtr` + `writer.jtr` are the IO slice (Tier 2 area 3).
+    `sink` writes bytes into a buffer the caller owns; `cursor` reads them back, every
+    result a view (`byte`, `line`, `until`, `consume`, `skip_ws`, `word`); `writer` is
+    the `std`-tier trait that points one formatting routine at stdout, stderr, or a
+    `sink`. `writer_demo.jtr` is the argument for it — one `render` function called
+    twice, and the buffered result compared byte-for-byte, which is how output becomes
+    testable without capturing a subprocess. The tier split is not filing: **`@no_alloc`
+    passes vacuously through a trait method**, so the trait cannot be `core` without the
+    marker becoming a false proof (`docs/io-design.md`). Reading over a *stream* is
+    blocked on an intrinsic and deliberately not faked.
   * `str.jtr` is the named module in front of the string intrinsics — `eq`,
     `has_prefix`, `index_of`, `trimmed` forwarding to the builtins, plus the views
     `str_ops.jtr` says you must hand-roll with `find` + `substr`: `before`/`after`,

@@ -3564,6 +3564,100 @@ fn str_ref_strip_suffix<'a>(s: &'a [u8], p: &[u8]) -> &'a [u8] {
     if p.len() <= s.len() && s.ends_with(p) { &s[..s.len() - p.len()] } else { s }
 }
 
+/// **The IO slice (Tier 2 area 3) — toolchain-free layer.** `sink`/`cursor` are `core`
+/// and `@no_alloc` throughout; `writer` is `std`. The design decisions and the two that
+/// implementation corrected are in `docs/io-design.md`.
+mod io_props {
+    use super::*;
+
+    fn diags_of(rel: &str) -> Vec<String> {
+        let prog = crate::module::load(rel);
+        let mut diags: Vec<String> = prog.diags.iter().map(|d| d.message.clone()).collect();
+        let (info, td) = typeck::check_program(&prog.ast, &prog.modules);
+        diags.extend(td.iter().map(|d| d.message.clone()));
+        diags.extend(escape::check(&prog.ast, &info).iter().map(|d| d.message.clone()));
+        let (_c, cd) = cgen::emit(&prog.ast, &info);
+        diags.extend(cd.iter().map(|d| d.message.clone()));
+        diags
+    }
+
+    #[test]
+    fn io_modules_compile_clean() {
+        for f in [
+            "sink.jtr", "cursor.jtr", "writer.jtr",
+            "sink_test.jtr", "cursor_test.jtr", "writer_test.jtr", "writer_demo.jtr",
+        ] {
+            let d = diags_of(&format!("examples/std/{f}"));
+            assert!(d.is_empty(), "examples/std/{f}: {d:?}");
+        }
+    }
+
+    /// **The `core` halves stay leaves, and that is the whole architecture.**
+    ///
+    /// `sink` and `cursor` are `core`: they must import nothing (an import becomes their
+    /// consumers' import) and declare no `@test` (a colocated test is emitted into every
+    /// consumer). `writer` is `std` and imports `sink` + `io` — that is expected, and it
+    /// is *why* the trait lives there: `@no_alloc` passes vacuously through a trait
+    /// method, so the polymorphic layer cannot be `core` without the marker becoming a
+    /// false proof.
+    #[test]
+    fn the_core_io_halves_stay_leaves() {
+        for m in ["sink", "cursor"] {
+            let prog = crate::module::load(&format!("examples/std/{m}.jtr"));
+            assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+            assert_eq!(
+                prog.modules.names.len(),
+                1,
+                "std/{m} must import nothing — it is `core`; found {:?}",
+                prog.modules.names
+            );
+            let tests = crate::cgen::list_tests(&prog.ast, &prog.modules.item_mod);
+            assert!(tests.is_empty(), "std/{m} must declare no @test; found {tests:?}");
+        }
+        // `writer` is deliberately NOT a leaf; assert that too, so the tier split is
+        // pinned in both directions rather than only the strict one.
+        let w = crate::module::load("examples/std/writer.jtr");
+        assert!(
+            w.modules.names.len() > 1,
+            "std/writer is the hosted half and is expected to import; found only {:?}",
+            w.modules.names
+        );
+    }
+
+    /// **`@no_alloc` passes vacuously through a trait method.** The finding that decided
+    /// which tier gets the `Writer` trait, pinned so that if the checker ever learns to
+    /// see through trait dispatch, this test fails and `docs/io-design.md` gets revisited
+    /// rather than quietly becoming wrong.
+    ///
+    /// The control in the same program — a direct call to an allocating free function —
+    /// must still be rejected, otherwise the test would pass for the boring reason that
+    /// `@no_alloc` checks nothing at all.
+    #[test]
+    fn no_alloc_does_not_see_through_a_trait_method() {
+        let via_trait = "trait Snk { fn put(mut self, b: u8) -> bool }\n\
+             struct G { n: i64 }\n\
+             impl Snk for G {\n\
+                 fn put(mut self, b: u8) -> bool { var p: *mut u8 = alloc(u8, 64)\n free_ptr(p)\n self.n = self.n + 1\n return true }\n\
+             }\n\
+             @no_alloc fn fill[T: Snk](mut s: T) -> bool { return s.put(65) }\n\
+             fn main() -> i32 { return 0 }\n";
+        assert!(
+            escape_diags(via_trait).is_empty(),
+            "trait dispatch is still opaque to @no_alloc; if this now errors, the IO tier \
+             split in docs/io-design.md should be revisited"
+        );
+
+        let direct = "fn allocates() -> bool { var p: *mut u8 = alloc(u8, 8)\n free_ptr(p)\n return true }\n\
+             @no_alloc fn d() -> bool { return allocates() }\n\
+             fn main() -> i32 { return 0 }\n";
+        let d = escape_diags(direct);
+        assert!(
+            d.iter().any(|m| m.contains("allocates")),
+            "the direct-call control must still be rejected, or this proves nothing: {d:?}"
+        );
+    }
+}
+
 /// **`std/str` — toolchain-free layer.** The module, its suite and its demo lower with
 /// no diagnostics, and the Rust oracle upholds the invariants the Jestyr module
 /// documents. The differential check against the real compiled module needs a C
@@ -13522,7 +13616,7 @@ fn main() -> i32 {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "drop_take.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr", "test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr", "caps_demo.jtr", "fs_test.jtr", "env_test.jtr", "time_test.jtr", "str.jtr", "str_test.jtr", "str_demo.jtr"];
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "drop_take.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr", "test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr", "caps_demo.jtr", "fs_test.jtr", "env_test.jtr", "time_test.jtr", "str.jtr", "str_test.jtr", "str_demo.jtr", "sink.jtr", "cursor.jtr", "writer.jtr", "sink_test.jtr", "cursor_test.jtr", "writer_test.jtr", "writer_demo.jtr"];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
     /// target). This is the acceptance bar the R2 fixpoint ultimately rests on. `DUMP_DIVERGE=1`
@@ -14339,6 +14433,48 @@ fn main() -> i32 {
     }
 
     /// **Differential: the real Jestyr module vs the Rust oracle.** Compile
+    /// **The IO slice end-to-end — and the payoff is the assertion in the middle.**
+    ///
+    /// `writer_demo.jtr` writes the same three fields twice through ONE `render` routine:
+    /// once to stdout (the first three lines) and once into a buffer. The `1` after
+    /// "into a buffer" is the buffered result comparing byte-for-byte against the
+    /// expected text — which is the entire argument for a `Writer`, since checking a
+    /// program's output otherwise means capturing a subprocess.
+    ///
+    /// The cursor block then reads those same bytes back line by line, so `Sink` out and
+    /// `Cursor` in are shown composing; the `3` is the line count under the
+    /// trailing-newline rule. The last two `1`s are a buffer deliberately too small
+    /// reporting the loss instead of lying about it.
+    #[test]
+    fn writer_demo() {
+        assert_eq!(
+            toks("examples/std/writer_demo.jtr"),
+            [
+                "--", "to", "stdout", "--",
+                "name=jestyr", "tier=core", "lines=2",
+                "--", "the", "same", "routine,", "into", "a", "buffer", "--",
+                "1", "3",
+                "--", "read", "the", "buffer", "back", "with", "a", "cursor", "--",
+                "name=jestyr", "tier=core", "lines=2", "3",
+                "--", "overflow", "is", "counted,", "not", "silent", "--",
+                "1", "1",
+            ]
+        );
+    }
+
+    /// The three IO suites through the real harness.
+    #[test]
+    fn io_suites_pass() {
+        for (f, n) in [("sink_test", 6), ("cursor_test", 8), ("writer_test", 5)] {
+            let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
+            assert_eq!(code, 0, "std/{f} must pass:\n{out}");
+            assert!(
+                out.contains(&format!("{n} passed; 0 failed")),
+                "unexpected harness output for {f}:\n{out}"
+            );
+        }
+    }
+
     /// **`std/str` end-to-end.** The demo's documented output, verified rather than
     /// claimed — the header comment in `str_demo.jtr` lists exactly these. It is the
     /// job `examples/str_ops.jtr` says you must otherwise do by hand with `find` +

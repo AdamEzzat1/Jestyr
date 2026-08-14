@@ -7,6 +7,46 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **The IO slice — `sink` + `cursor` (`core`) and `writer` (`std`).** Tier 2 area 3. The
+  four design decisions, and the two that implementation corrected, are written up in
+  `docs/io-design.md`.
+
+  **The finding that set the architecture:** `@no_alloc` does not see through a trait
+  method and **passes vacuously** — it accepts a `@no_alloc` function writing through a
+  trait whose impl allocates on every call, while correctly rejecting the direct-call
+  control in the same file. So a `core` module built on a trait would carry a marker that
+  proves nothing, which is worse than carrying none: it reads as a guarantee. `core`
+  therefore gets the concrete `Sink`/`Cursor` (free functions, direct calls, a real
+  proof) and the `Writer` trait lives in `std`. The tier line is drawn exactly where the
+  proof stops. Pinned by `no_alloc_does_not_see_through_a_trait_method`, which asserts
+  the control still fails too — otherwise it would pass for the boring reason.
+
+  `writer_demo.jtr` is the payoff rather than a tour: one `render` routine, called once
+  against stdout and once against a buffer, with the buffered result compared
+  byte-for-byte. That is what makes program output testable without capturing a
+  subprocess.
+
+  **Two things implementation changed, recorded rather than smoothed over.** The
+  `failed()` latch was *removed, not shipped*: `print_str`/`eprint_str` return nothing so
+  a stream write has no detectable failure, and sink overflow is deliberately the sink's
+  business — so `failed()` could only ever answer `false`, and a query that always says
+  "fine" invites a caller to believe it checked something. And the `Writer` API needed
+  **one** entry point, not two: `write_str` + `write_str_into` forced every formatter to
+  open with `if is_buffered(w)`, and a formatter that must know its destination is not
+  polymorphic. The sink now travels on every write and is unused for streams — a real
+  cost, pinned by `a_stream_writer_leaves_the_scratch_sink_alone`.
+
+  **Reading is not symmetric with writing and was not faked.** There is no partial-read
+  intrinsic, no file handle, no `read_line` — only `read_file`, which slurps. `Cursor`
+  over that result is the whole honest reader; a streaming `Reader` is blocked on an
+  intrinsic, and wrapping the slurp in one would ship an API whose central promise is
+  false. Also deferred with reasons: no `BufWriter` (wants an allocator, and stdout
+  already buffers in C stdio), no error sets on writes (they want a fallible `flush`).
+
+  19 `@test`s across three sibling suites, 3 toolchain-free structural tests, the demo's
+  documented output, and byte-identity with the self-hosted `cgen.jtr` for all seven new
+  files, first try. No intrinsic, no closure change, no reseed.
+
 - **`std/str` — the named module in front of the string intrinsics.** `core` tier, zero
   imports, every function `@no_alloc`, every result a view. Two halves: thin wrappers so
   that when `extern "c"` retires an intrinsic one module changes rather than every call

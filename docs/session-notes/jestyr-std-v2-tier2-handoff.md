@@ -56,7 +56,7 @@ and remote).
 | 7. Package / build | ✅ *as scoped* — `build.jestyr` (CTFE, effect-free by construction) + module-manifest hash DAG. A package manager is deliberately out |
 | 6. No-std contract | 🟡 documented, partly checked — §3.1 |
 | 2. Typed path / OsStr | 🟡 language ahead of library — §3.2 |
-| 3. Reader / Writer | 🔴 nothing built — §3.3 |
+| 3. Reader / Writer | ✅ **Writer done** (`sink` core + `writer` std); **Reader is memory-only** (`cursor`) — streaming is intrinsic-blocked, see §3.3 |
 | 4. Collections v2 | 🔴 nothing built — §3.4 |
 
 Also landed on the way, because the library work forced them: `jestyrc test <file>`
@@ -192,52 +192,49 @@ overclaiming.
 **Do not** convert `std/path` to typed `Path` before step 1, or you will ship an API
 whose central claim is unenforced.
 
-### §3.3 — Reader / Writer (area 3): NOT language-blocked. I was wrong about this
+### §3.3 — Reader / Writer (area 3): ✅ DONE. Writer fully, Reader only over memory
 
-I told the user earlier that this was gated on the traits/generics design. **I probed
-it and that is false.** A `Writer`-shaped trait works today in all three forms:
+Built and on `master`. The four design decisions, and the two that **implementation
+corrected**, are in `docs/io-design.md` — read that rather than re-deriving them.
 
-```jestyr
-trait Sink {
-    fn put(mut self, b: u8) -> bool     // a MUTATING trait method
-    fn written(read self) -> i64
-}
-// two impls with observably different behavior (a counter and a capped sink)
-fn fill[T: Sink](mut s: T, count: i64) -> i64 { … }   // generic, static dispatch ✓
-var d: dyn Sink = c2                                   // erased receiver ✓
-d.put(66)                                              // mutation through dyn ✓
-```
+* `sink.jtr` (`core`) — bytes out into a caller-owned `[]u8`. Concrete struct, free
+  functions, `@no_alloc` a *real* proof.
+* `cursor.jtr` (`core`) — bytes in, every result a view: `byte`, `peek`, `chunk`, `rest`,
+  `line`, `until`, `looking_at`, `consume`, `skip_ws`, `word`.
+* `writer.jtr` (`std`) — one routine to stdout, stderr, or a `Sink`.
 
-All three printed the right answers (`5`, `3`, `1` — the capped sink refusing past its
-limit is what shows the impls are really distinct). Traits carry error sets in their
-signatures too (`ledger.jtr`), `dyn` is a fat pointer with a compiler-built vtable
-byte-compatible with a hand-written one (`dyn_dispatch.jtr`), and operator traits
-exist (`operators.jtr`).
+**The finding that set the tier line:** `@no_alloc` does not see through a trait method
+and **passes vacuously** — it accepts `@no_alloc fn fill[T: Sink](mut s: T)` whose impl
+allocates on every call, while correctly rejecting the direct-call control in the same
+file. So the polymorphic layer cannot be `core` without the marker becoming a *false*
+proof, which is worse than no marker. Pinned by
+`no_alloc_does_not_see_through_a_trait_method`, which also asserts the control still
+fails — otherwise the test would pass for the boring reason that `@no_alloc` checks
+nothing.
 
-**So this area is blocked on DESIGN DECISIONS, not capability.** The four to settle
-before writing code:
+**Two things implementation changed**, recorded because the design doc would otherwise
+read as having been right first time:
 
-1. **Trait or vtable struct?** `mem.jtr`'s `Allocator` is a hand-written struct of
-   `fn(…)` pointers, and its header explains why — it had to exist *before* traits
-   did. Traits exist now. Pick one and be consistent, because a `Writer` trait next to
-   an `Allocator` vtable is two idioms for one job.
-2. **Where does buffering live?** A `BufWriter` wrapping a `Writer` needs to own a
-   buffer, and a handle **cannot own borrowed storage** (§5) — so either it owns heap
-   memory through an `Allocator` (making it `mem`-tier, not `core`) or the caller
-   passes the buffer at every call, as `std/test`'s sink does.
-3. **How do errors propagate?** `write` returning `bool` is what `fs.write` does today;
-   error sets (`-> usize !{ IoError }`) are the richer option and traits support them.
-   Choose once — this is the decision that is expensive to change later.
-4. **Is `core` allowed a `Writer`?** `std/test`'s sink is `core` and `@no_alloc`
-   because it writes into a caller `[]u8`. That is the shape that keeps a `Writer`
-   usable on a freestanding target, and it is worth preserving.
+1. The `failed()` latch was **removed, not shipped.** `print_str`/`eprint_str` return
+   nothing, so a stream write has no detectable failure, and sink overflow is
+   deliberately the *sink's* business — so `failed()` could only ever return `false`. A
+   query that always answers "fine" invites a caller to believe it checked something.
+2. The `Writer` API needed **one** entry point, not two. `write_str` + `write_str_into`
+   forced every formatter to open with `if is_buffered(w)`, and a formatter that must
+   know its destination is not polymorphic. The sink now travels on every write and is
+   unused for stream targets — a real cost, pinned by
+   `a_stream_writer_leaves_the_scratch_sink_alone`.
 
-**First increment:** promote the sink already inside `test.jtr` (`put`/`puts`/`line`,
-which its own header flags as "the smallest thing that could be called a writer… when
-a real `Writer` lands these three functions are what it replaces") into a `core`
-`std/io_write.jtr` over a caller buffer, then make `test_report` and `io.jtr` consume
-it. That is additive, keeps `core` heap-free, and gives you a real consumer
-immediately — which is how every successful slice on this branch went.
+**READING IS NOT SYMMETRIC AND WAS NOT FAKED.** There is no partial-read intrinsic, no
+file handle, no `read_line` — only `read_file`/`try_read_file`, which slurp. So `cursor`
+over `fs.read_text`'s result is the whole honest reader; a streaming hosted `Reader` is
+blocked on an intrinsic, and wrapping the slurp in a `Reader` trait would ship an API
+whose central promise is false. **The next increment here is that intrinsic**, on the
+eleven-site recipe (§2), not more library code.
+
+Still open, deliberately: no `BufWriter` (wants an allocator, so `mem`-tier — and stdout
+already buffers in C stdio, so wrapping it would double-buffer), and no error sets on
+writes (they want a fallible `flush` to hang on).
 
 ### §3.4 — Collections v2 (area 4): the blocker is narrower than the roadmap says
 
@@ -380,8 +377,11 @@ Things that cost time this session and will cost it again.
    * **typeck accepts `*mut u8` where `[]u8` is expected.** `jestyrc check` reports
      "assignability … passed" and only gcc catches it, as a message about generated C.
      Same family as the open int→int decision. Recorded in §4 as a follow-up.
-2. **`Reader`/`Writer` (§3.3)** — highest value of the four, and now known not to be
-   language-blocked. Settle the four design decisions in writing *first*.
+2. ~~**`Reader`/`Writer` (§3.3)**~~ ✅ — done. The four decisions are settled in
+   `docs/io-design.md`, which also records the two that implementation corrected. Shipped:
+   `sink.jtr` (`core`, bytes out to a caller buffer, `@no_alloc` proven), `cursor.jtr`
+   (`core`, bytes in, views out), `writer.jtr` (`std`, one routine to stdout/stderr/buffer).
+   Streaming reads remain blocked on an intrinsic and are NOT faked.
 3. **`@no_os` (§3.1)** — turns the no-std contract from convention into a check, and is
    small.
 4. **`PathBuf` (§3.2 step 2)** — owned, independent of the `distinct` question.
