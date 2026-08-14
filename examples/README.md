@@ -124,7 +124,9 @@ read them in this order for a guided tour:
 ## Arrays, slices, ranges
 
 `arrays.jtr`, `array_lit.jtr`, `slices.jtr` (bounds-checked fat pointers),
-`ranges.jtr`.
+`ranges.jtr`, `slice_range.jtr` (`xs[lo .. hi]` on a `[]T` — a narrower view of
+the same buffer, no copy; closed, open-ended, inclusive and empty forms, with
+bounds asserted).
 
 ## Loops
 
@@ -218,7 +220,9 @@ The self-hosted compiler and the standard library, all in Jestyr:
     arbitrary bytes as printable ASCII so a failure message can show you the
     trailing `\r`. Worked examples in `test_demo.jtr`; own suite via
     `jestyrc test examples/std/test.jtr`.
-  * `process.jtr` runs external commands behind an explicit capability. A
+  * `process.jtr` runs external commands behind an explicit capability. (For the
+    `[]T` range-slicing that lets `test_report.finish` take a slice rather than a
+    raw pointer, see `slice_range.jtr` in the top-level examples.) A
     `Process` value is the authority to spawn, so `fn build(mut p: Process, …)`
     announces in its type that it may execute commands; `denied()` is a handle
     that refuses everything while still *counting* the attempts, which is what

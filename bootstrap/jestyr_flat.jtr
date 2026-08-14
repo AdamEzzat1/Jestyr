@@ -8606,7 +8606,15 @@ fn infer(mut c: Checker, read p: Parser, read src: str, id: i32) -> i32 {
         let bt: i32 = infer(c, p, src, d.a)
         infer(c, p, src, d.b)
         let bd: TyData = get__list(TyData, c.tys, bt as usize)
-        if bd.kind == 8 or bd.kind == 9 { r = bd.a }
+        // A RANGE index on a `[]T` re-slices to the same slice type (a narrower view
+        // of the same buffer); a plain index yields the element. Not extended to a
+        // fixed-size ARRAY (kind 9), whose sub-view would have to borrow the array's
+        // storage — that needs borrowed projection, not just a type.
+        if bd.kind == 8 {
+            let sx: ExprData = get__list(ExprData, p.ex, d.b as usize)
+            if sx.kind == 13 { r = bt } else { r = bd.a }
+        }
+        else if bd.kind == 9 { r = bd.a }
         else if bd.kind == 2 {
             if bd.x == 14 {
                 let ix: ExprData = get__list(ExprData, p.ex, d.b as usize)
@@ -12530,6 +12538,72 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
             return
         }
         if expr_is_slice(c, e.a) {                    // slice indexing
+            let sx: ExprData = get__list(ExprData, p.ex, e.b as usize)
+            if sx.kind == 13 {                        // Range -> a narrower view of the same buffer
+                // `{ ptr, len }` in, `{ ptr + lo, hi - lo }` out: pointer arithmetic and
+                // a subtraction, no copy. Emitted inline rather than as a runtime helper
+                // because it is generic in the element type. Bounds are asserted, so a
+                // bad range faults deterministically; no UTF-8 boundary check, unlike
+                // `str` -- a `[]T` has no encoding.
+                //
+                // The BASE emits before the temp is taken and lo/hi after, matching the
+                // reference's order so nested temps number identically.
+                var rb: String = string_new()
+                emit_expr(rb, p, src, c, g, e.a)
+                let n: i32 = g.tmp
+                g.tmp = g.tmp + 1
+                let sty: i32 = get__list(i32, c.et, e.a as usize)
+                var lob: String = string_new()
+                if sx.a >= 0 { emit_expr(lob, p, src, c, g, sx.a) } else { string_push(lob, "0") }
+                var hib: String = string_new()
+                if sx.b >= 0 {
+                    if sx.op == 1 {                   // inclusive `..=hi` -> ((hi) + 1)
+                        string_push(hib, "((")
+                        emit_expr(hib, p, src, c, g, sx.b)
+                        string_push(hib, ") + 1)")
+                    } else {
+                        emit_expr(hib, p, src, c, g, sx.b)
+                    }
+                } else {                              // open end -> the spilled `.len`
+                    string_push(hib, "_s")
+                    push_uint__cgen(hib, n as i64)
+                    string_push(hib, ".len")
+                }
+                string_push(sb, "({ ")
+                emit_ty_c(sb, p, src, c, sty)
+                string_push(sb, " _s")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, " = (")
+                string_push(sb, string_view(rb))
+                string_push(sb, "); size_t _lo")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, " = (size_t)(")
+                string_push(sb, string_view(lob))
+                string_push(sb, "); size_t _hi")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, " = (size_t)(")
+                string_push(sb, string_view(hib))
+                string_push(sb, "); assert(_lo")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, " <= _hi")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, " && _hi")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, " <= _s")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, ".len); (")
+                emit_ty_c(sb, p, src, c, sty)
+                string_push(sb, "){ _s")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, ".ptr + _lo")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, ", _hi")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, " - _lo")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, " }; })")
+                return
+            }
             if index_in_range(g, p, src, e.a, e.b) {  // refinement proved i < s.len: raw access
                 string_push(sb, "((")
                 emit_expr(sb, p, src, c, g, e.a)

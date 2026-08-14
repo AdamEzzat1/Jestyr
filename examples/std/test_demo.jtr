@@ -184,7 +184,7 @@ fn golden_from_a_file(read produced: str) {
     var rep: []u8 = slice(u8, raw, CAP)
     var c: test.Check = test.new()
     test.eq_golden(c, rep, "on-disk", produced, view)
-    print_int(b2i(test_report.finish(c, raw)))   // 1 — matched what we produced
+    print_int(b2i(test_report.finish(c, rep)))   // 1 — matched what we produced
     free_ptr(raw)
     string_free(loaded)
 
@@ -199,7 +199,7 @@ fn demo() {
 
     print_str("-- expectations --")
     check_path(c, rep)
-    test_report.dump(c, raw)
+    test_report.dump(c, rep)
 
     // The report just produced, now treated as data.
     let produced: str = from_utf8(slice(u8, raw, test.report_len(c)))
@@ -209,7 +209,7 @@ fn demo() {
     var rep2: []u8 = slice(u8, raw2, CAP)
     var g: test.Check = test.new()
     check_goldens(g, rep2, produced)
-    test_report.dump(g, raw2)
+    test_report.dump(g, rep2)
 
     // Why the escaping earns its keep: `"a\r"` and `"a"` print identically, so a
     // failure message that did not escape would show you two equal-looking

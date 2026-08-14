@@ -7,6 +7,33 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **Range-slicing a `[]T`.** `xs[lo .. hi]` narrows a slice to a view of the same
+  buffer — `{ ptr, len }` in, `{ ptr + lo, hi - lo }` out — no copy and no
+  allocation, the `[]T` twin of `str`'s existing sub-view. It used to be rejected
+  with `error: the C backend does not support ranges yet` even though `str` sliced
+  fine. All four forms work (closed `a .. b`, open-ended `a ..`, inclusive
+  `a ..= b`, empty `a .. a`), and bounds are asserted (`lo <= hi <= len`) so a bad
+  range faults deterministically instead of producing a view past the end of the
+  buffer. No UTF-8 boundary check, unlike `str`: a `[]T` has no encoding.
+
+  The payoff is that **no raw pointer crosses a stdlib boundary any more**.
+  `std/test_report.finish(c, rep)` takes the `[]u8` the checks recorded into and
+  narrows it itself, where before it needed the `*mut u8` that `alloc` returned
+  purely to reach `slice(u8, raw, n)`.
+
+  Deliberately **not** extended to a fixed-size array: `arr[lo .. hi]` would yield
+  a view borrowing the array's inline storage, which is the borrowed-projection
+  question (safety-mosaic item 2) rather than a typing one.
+
+  This is the one change in this batch that paid the full two-sided tax — mirrors in
+  `examples/std/typeck.jtr` and `examples/std/cgen.jtr` plus a refreshed bootstrap
+  seed in the same commit — because it adds a construct the corpus then uses.
+  Emitted C went byte-identical between the reference backend and the self-hosted
+  one on the first attempt; `examples/slice_range.jtr` is the corpus demo carrying
+  that guarantee. One subtlety for the next such mirror: the base expression emits
+  *before* the statement-expression's temp is taken and the bounds *after*, so
+  nested temps number identically on both sides.
+
 - **`std/process` — running a command behind an explicit capability.** The first
   of the four planned Tier 2 handles (`Fs`, `Clock`, `Env`, `Process`), and free:
   a named wrapper over the existing `run_command` and `eprint_str` intrinsics, no

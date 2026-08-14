@@ -51,7 +51,7 @@ fn write_cmd(read name: str, mut buf: []u8) -> usize {
     test.eq_i64(c, rep, "refused", process.refused(h), 0)
     test.eq_i64(c, rep, "last_status", process.last_status(h) as i64, 0)
 
-    let ok: bool = test_report.finish(c, raw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     return ok
 }
@@ -70,7 +70,7 @@ fn write_cmd(read name: str, mut buf: []u8) -> usize {
     // must at least not look like success.
     test.ne_i64(c, rep, "last_status", process.last_status(d) as i64, 0)
 
-    let ok: bool = test_report.finish(c, raw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     return ok
 }
@@ -105,7 +105,7 @@ fn write_cmd(read name: str, mut buf: []u8) -> usize {
     test.eq_i64(c, rep, "denied counted it", process.refused(d), 1)
 
     fs.remove(probe)
-    let ok: bool = test_report.finish(c, raw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     free_ptr(craw)
     return ok
@@ -126,7 +126,7 @@ fn write_cmd(read name: str, mut buf: []u8) -> usize {
     test.ne_i64(c, rep, "exit 1 is non-zero", process.last_status(h) as i64, 0)
     test.eq_i64(c, rep, "both executed", process.runs(h), 2)
 
-    let ok: bool = test_report.finish(c, raw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     return ok
 }
@@ -157,7 +157,7 @@ fn plan(mut p: process.Process, read probe: str, mut buf: []u8, craw: *mut u8) -
     test.is_true(c, rep, "plan(host) had its effect", fs.exists(probe))
 
     fs.remove(probe)
-    let ok: bool = test_report.finish(c, raw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     free_ptr(craw)
     return ok
@@ -193,7 +193,7 @@ fn plan(mut p: process.Process, read probe: str, mut buf: []u8, craw: *mut u8) -
         test.eq_i64(c, rep, "denied total == n", process.runs(d) + process.refused(d), n as i64)
     }
 
-    let ok: bool = test_report.finish(c, raw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     return ok
 }
@@ -220,7 +220,7 @@ fn plan(mut p: process.Process, read probe: str, mut buf: []u8, craw: *mut u8) -
     test.eq_i64(c, rep, "d.refused", process.refused(d), 1)
     test.eq_i64(c, rep, "a.refused", process.refused(a), 0)
 
-    let ok: bool = test_report.finish(c, raw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     return ok
 }

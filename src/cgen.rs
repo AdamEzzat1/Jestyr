@@ -4971,6 +4971,39 @@ impl<'a> Cgen<'a> {
                         return format!("jestyr_rt_substr({b}, {lo_c}, {hi_c})");
                     }
                 }
+                // `xs[i..j]` on a `[]T` → a narrower view of the same buffer. The
+                // slice repr is `{ ptr, len }`, so this is pointer arithmetic and a
+                // subtraction, no copy — the direct analogue of `jestyr_rt_substr`,
+                // emitted inline because it is generic in the element type and a
+                // per-type runtime helper would be one function per instantiation.
+                //
+                // Bounds are asserted (`lo <= hi <= len`), which makes a bad range a
+                // deterministic fault rather than a view past the end. Unlike `str`
+                // there is no UTF-8 boundary check: `[]T` has no encoding.
+                if let Ty::Slice(_) = &bt {
+                    if let ExprKind::Range { lo, hi, inclusive } = &self.ast.expr_at(*index).kind {
+                        let (lo, hi, inclusive) = (*lo, *hi, *inclusive);
+                        let sty = self.c_type(&bt);
+                        let b = self.emit_expr(*base);
+                        let n = self.tmp;
+                        self.tmp += 1;
+                        let lo_c = lo.map(|e| self.emit_expr(e)).unwrap_or_else(|| "0".to_string());
+                        let hi_c = match hi {
+                            Some(e) => {
+                                let h = self.emit_expr(e);
+                                if inclusive { format!("(({h}) + 1)") } else { h }
+                            }
+                            None => format!("_s{n}.len"),
+                        };
+                        // `_s` is spilled first so `base` is evaluated once even when
+                        // the open-ended form reads its `.len`.
+                        return format!(
+                            "({{ {sty} _s{n} = ({b}); size_t _lo{n} = (size_t)({lo_c}); size_t _hi{n} = (size_t)({hi_c}); \
+                             assert(_lo{n} <= _hi{n} && _hi{n} <= _s{n}.len); \
+                             ({sty}){{ _s{n}.ptr + _lo{n}, _hi{n} - _lo{n} }}; }})"
+                        );
+                    }
+                }
                 let proven = matches!(bt, Ty::Slice(_)) && self.index_in_range(*base, *index);
                 // An array index takes `&base`, so the base has to be a *place*: for
                 // `m[i][j]` the inner `m[i]` is itself a checked index and `&({ … })`

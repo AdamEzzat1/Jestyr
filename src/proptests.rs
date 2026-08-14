@@ -3466,6 +3466,102 @@ mod path_props {
         assert!(d.is_empty(), "examples/std/path.jtr: {d:?}");
     }
 
+    /// **Range-slicing a `[]T`.** `xs[lo .. hi]` must TYPE as the same slice type
+    /// (not as the element type, which is what a plain index yields) and must lower
+    /// with no diagnostics in all four forms. Toolchain-free.
+    ///
+    /// The typing half is the part a golden cannot catch: if `xs[a .. b]` inferred
+    /// `u8` instead of `[]u8`, `let v: []u8 = xs[a .. b]` would be an assignability
+    /// error rather than a wrong program, so this asserts the successful direction.
+    #[test]
+    fn slice_range_types_as_a_slice() {
+        let cases = [
+            "let v: []u8 = xs[1 .. 3]",       // closed
+            "let v: []u8 = xs[1 ..]",         // open-ended
+            "let v: []u8 = xs[1 ..= 3]",      // inclusive
+            "let v: []u8 = xs[2 .. 2]",       // empty
+            "let v: []u8 = xs[0 ..][1 ..]",   // a view of a view
+            "print_int(xs[1 .. 3].len as i64)", // `.len` of a temporary view
+        ];
+        for body in cases {
+            let src = format!(
+                "fn main() -> i32 {{\n    var raw: *mut u8 = alloc(u8, 8)\n    var xs: []u8 = slice(u8, raw, 8)\n    {body}\n    free_ptr(raw)\n    return 0\n}}\n"
+            );
+            let (tokens, ld) = crate::lexer::Lexer::new(&src).tokenize();
+            assert!(ld.is_empty(), "lex: {body}");
+            let (ast, pd) = crate::parser::Parser::new(&src, tokens).parse();
+            assert!(pd.is_empty(), "parse {body}: {pd:?}");
+            let (info, td) = crate::typeck::check(&ast);
+            assert!(td.is_empty(), "typeck {body}: {td:?}");
+            assert!(crate::escape::check(&ast, &info).is_empty(), "escape {body}");
+            let (c, cd) = crate::cgen::emit(&ast, &info);
+            assert!(cd.is_empty(), "cgen {body}: {cd:?}");
+            // The lowering is a view, not a copy: the result is built from the
+            // base's own pointer plus an offset, with the bounds asserted.
+            //
+            // Asserting the PRESENCE of pointer arithmetic, not the absence of a
+            // `memcpy` — the first version of this test did the latter and failed,
+            // because the runtime prelude contains `memcpy` for unrelated reasons.
+            // A global absence is never evidence about a local lowering.
+            assert!(c.contains("assert(_lo"), "bounds must be checked: {body}");
+            assert!(c.contains(".ptr + _lo"), "a sub-view must be pointer arithmetic: {body}");
+        }
+        // ...and a plain (non-range) index still yields the ELEMENT, unchanged.
+        let src = "fn main() -> i32 {\n    var raw: *mut u8 = alloc(u8, 8)\n    var xs: []u8 = slice(u8, raw, 8)\n    let b: u8 = xs[1]\n    free_ptr(raw)\n    return 0\n}\n";
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (ast, _) = crate::parser::Parser::new(src, tokens).parse();
+        let (_info, td) = crate::typeck::check(&ast);
+        assert!(td.is_empty(), "a scalar index must still yield the element: {td:?}");
+    }
+
+    proptest! {
+        /// **Every in-range `[lo .. hi]` compiles clean, and the lowering is a view.**
+        /// Generated over the whole valid space rather than the handful of literals
+        /// the demo uses, so an off-by-one in the emitted bounds expression or a
+        /// mis-numbered temp shows up as a diagnostic rather than as luck.
+        ///
+        /// Toolchain-free (no gcc), which is what makes it affordable at proptest's
+        /// default case count; the runtime behavior is pinned separately by
+        /// `slice_range_demo` and `a_bad_slice_range_faults`.
+        #[test]
+        fn slice_range_pipeline_is_clean_for_valid_ranges(lo in 0usize..8, len in 0usize..9) {
+            let hi = (lo + len).min(8);
+            let src = format!(
+                "fn main() -> i32 {{\n    var raw: *mut u8 = alloc(u8, 8)\n    var xs: []u8 = slice(u8, raw, 8)\n    let v: []u8 = xs[{lo} .. {hi}]\n    print_int(v.len as i64)\n    free_ptr(raw)\n    return 0\n}}\n"
+            );
+            let (tokens, ld) = crate::lexer::Lexer::new(&src).tokenize();
+            prop_assert!(ld.is_empty());
+            let (ast, pd) = crate::parser::Parser::new(&src, tokens).parse();
+            prop_assert!(pd.is_empty(), "parse {}..{}: {:?}", lo, hi, pd);
+            let (info, td) = crate::typeck::check(&ast);
+            prop_assert!(td.is_empty(), "typeck {}..{}: {:?}", lo, hi, td);
+            prop_assert!(crate::escape::check(&ast, &info).is_empty());
+            let (c, cd) = crate::cgen::emit(&ast, &info);
+            prop_assert!(cd.is_empty(), "cgen {}..{}: {:?}", lo, hi, cd);
+            prop_assert!(c.contains(".ptr + _lo"), "must be pointer arithmetic, not a copy");
+            prop_assert!(c.contains("assert(_lo"), "bounds must be asserted");
+        }
+    }
+
+    /// A fixed-size ARRAY is deliberately not range-sliceable — the view would have
+    /// to borrow the array's inline storage, which is the borrowed-projection
+    /// question rather than a typing one. Pinned so the carve-out is a decision
+    /// rather than an oversight: this must still be refused.
+    #[test]
+    fn array_range_slicing_is_still_refused() {
+        let src = "fn main() -> i32 {\n    var a: [8]u8 = [0; 8]\n    let v: []u8 = a[1 .. 3]\n    return 0\n}\n";
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (ast, _) = crate::parser::Parser::new(src, tokens).parse();
+        let (info, td) = crate::typeck::check(&ast);
+        let (_c, cd) = crate::cgen::emit(&ast, &info);
+        let all: Vec<String> =
+            td.iter().chain(cd.iter()).map(|d| d.message.clone()).collect();
+        assert!(
+            !all.is_empty(),
+            "range-slicing a fixed-size array must still be refused, not silently accepted"
+        );
+    }
+
     /// **`std/process` — the capability handle, toolchain-free.** The module, its
     /// demo and its suite all lower with no diagnostics.
     #[test]
@@ -4153,6 +4249,23 @@ mod fuzz {
                 dos.push(b);
             }
             assert!(test_ref_lines_eq(&dos, &unix), "CRLF widening changed the verdict on {unix:?}");
+        });
+    }
+
+    /// **Slice range bounds are total on arbitrary expression text.** The bounds of
+    /// `xs[lo .. hi]` are ordinary expressions, so anything the parser accepts can
+    /// land there — including nested ranges, calls, casts and garbage. The pipeline
+    /// must resolve every one of them to a diagnostic or to C, never to a panic.
+    ///
+    /// A real campaign is `cargo bolero test fuzz_slice_range_bounds`; under
+    /// `cargo test` this replays the corpus and a bounded number of generated inputs.
+    #[test]
+    fn fuzz_slice_range_bounds() {
+        bolero::check!().with_type::<(String, String)>().for_each(|(lo, hi): &(String, String)| {
+            let src = format!(
+                "fn main() -> i32 {{\n    var raw: *mut u8 = alloc(u8, 8)\n    var xs: []u8 = slice(u8, raw, 8)\n    let v: []u8 = xs[{lo} .. {hi}]\n    free_ptr(raw)\n    return 0\n}}\n"
+            );
+            run_pipeline(&src);
         });
     }
 
@@ -12882,7 +12995,7 @@ fn main() -> i32 {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr"];
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr"];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
     /// target). This is the acceptance bar the R2 fixpoint ultimately rests on. `DUMP_DIVERGE=1`
@@ -13535,6 +13648,49 @@ fn main() -> i32 {
                 "4",
             ]
         );
+    }
+
+    /// **`[]T` range-slicing end-to-end.** The demo's documented output, verified
+    /// rather than claimed — `slice_range.jtr`'s header lists exactly these.
+    #[test]
+    fn slice_range_demo() {
+        assert_eq!(
+            toks("examples/slice_range.jtr"),
+            ["4", "DEFG", "ABC", "NOP", "0", "BCD", "16"]
+        );
+    }
+
+    /// **A bad slice range faults rather than over-reading.** Two shapes — `hi`
+    /// past the end and `lo > hi` — must both abort, because the alternative is a
+    /// view onto memory the buffer does not own. Asserted as a NON-zero exit with
+    /// the assertion text, so the check cannot be satisfied by the program merely
+    /// printing something wrong.
+    #[test]
+    fn a_bad_slice_range_faults() {
+        for (label, body) in [
+            ("hi past the end", "let v: []u8 = xs[2 .. 99]"),
+            ("lo greater than hi", "let v: []u8 = xs[5 .. 2]"),
+        ] {
+            let src = format!(
+                "fn main() -> i32 {{\n    var raw: *mut u8 = alloc(u8, 8)\n    var xs: []u8 = slice(u8, raw, 8)\n    {body}\n    print_int(v.len as i64)\n    free_ptr(raw)\n    return 0\n}}\n"
+            );
+            let dir = std::env::temp_dir().join("jestyr_slice_fault");
+            let _ = std::fs::create_dir_all(&dir);
+            let f = dir.join("bad.jtr");
+            std::fs::write(&f, &src).unwrap();
+            let exe = build_exe(f.to_str().unwrap());
+            let out = Command::new(&exe).output().unwrap();
+            assert!(
+                !out.status.success(),
+                "{label}: a bad range must fault, but the program exited 0 with {:?}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                err.contains("_lo") || err.contains("assert"),
+                "{label}: expected the bounds assertion, got stderr {err:?}"
+            );
+        }
     }
 
     /// **`std/process` end-to-end — the capability refusal is real.** The demo runs

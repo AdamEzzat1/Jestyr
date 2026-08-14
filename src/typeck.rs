@@ -2932,12 +2932,19 @@ impl<'a> TypeChecker<'a> {
                 let bt = self.infer(scope, typ, self_ty, *base);
                 self.infer(scope, typ, self_ty, *index);
                 // Indexing a slice yields its element type; a string yields a byte,
-                // *except* `s[i..j]` (a range index) which slices a sub-`str`.
+                // *except* `s[i..j]` (a range index) which slices a sub-view — of the
+                // same slice type for `[]T`, and of `str` for a string.
+                let ranged = matches!(ast.expr_at(*index).kind, ExprKind::Range { .. });
                 match bt {
+                    // `xs[i..j]` on a `[]T` re-slices: same element type, narrower view.
+                    // Deliberately NOT extended to a fixed-size array, whose sub-view
+                    // would have to borrow the array's storage — that needs the
+                    // borrowed-projection story (safety-mosaic item 2), not just a type.
+                    Ty::Slice(elem) if ranged => Ty::Slice(elem),
                     Ty::Slice(elem) => *elem,
                     Ty::Array { elem, .. } => *elem, // a fixed-size array indexes to its element
                     Ty::Prim("str") => {
-                        if matches!(ast.expr_at(*index).kind, ExprKind::Range { .. }) {
+                        if ranged {
                             Ty::Prim("str")
                         } else {
                             Ty::Prim("u8")

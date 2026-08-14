@@ -401,9 +401,30 @@ Where this slice leaves the seven planned Tier 2 areas.
    is a runtime/emission change: it owes the `cgen.jtr` mirror and a reseed. It is
    also the clearest argument yet for the `sys` tier — this is exactly the
    platform difference `sys` should own once `extern "c"` lands.
-4. **Range-slice `[]u8` in the C backend.** It would delete the `raw: *mut u8`
-   parameter from `test_report.finish`, and it is the single most-felt gap in the
-   buffers-in convention across the whole stdlib.
+4. ~~**Range-slice `[]u8` in the C backend.**~~ ✅ `xs[lo .. hi]` on a `[]T` now
+   narrows to a view of the same buffer — `{ ptr, len }` in, `{ ptr + lo, hi - lo }`
+   out, no copy and no allocation, the `[]T` twin of `str`'s sub-view. All four
+   forms work (closed, open-ended, inclusive, empty) and bounds are asserted, so a
+   bad range faults deterministically instead of viewing past the end. No UTF-8
+   boundary check, unlike `str`: a `[]T` has no encoding.
+
+   The payoff is that **no raw pointer crosses a stdlib boundary any more** —
+   `test_report.finish(c, rep)` takes the `[]u8` the checks recorded into and
+   narrows it itself, where it used to need the `*mut u8` that `alloc` returned.
+
+   Deliberately NOT extended to a fixed-size array: `arr[lo .. hi]` would have to
+   borrow the array's storage, which is the borrowed-projection question
+   (safety-mosaic item 2) rather than a typing one.
+
+   This is the one change in this run that paid **the full two-sided tax** — the
+   `typeck.jtr` and `cgen.jtr` mirrors plus a bootstrap reseed (+76 lines of
+   flattened source, +87 of seed C) — because it adds a construct the corpus then
+   uses. Emitted C went byte-identical between the two backends on the first
+   attempt; `examples/slice_range.jtr` is the corpus demo carrying that guarantee.
+   The one subtlety worth knowing for the next such mirror: the base expression is
+   emitted BEFORE the statement-expression's temp is taken and the bounds after, so
+   nested temps number identically on both sides. Getting that order wrong is
+   invisible until a slice range appears inside another one.
 5. ~~**Mangle module `const`s by module**~~ ✅ Two lines, no port mirror, no
    reseed — see the (now closed) gap recorded below.
 6. **Stop emitting `@test`/`@bench` items in non-test mode** — see convention 4
@@ -547,12 +568,19 @@ Recorded here because library work is where they actually bite.
   `std/test` does, and what keeps it `unsafe`-free — or store a raw `*mut u8` and
   pay `unsafe`, as `strmap.jtr` does. Worth knowing *before* designing a handle,
   because it changes every signature in the module.
-- **`[]u8` cannot be range-sliced.** `rep[0 .. n]` is `error: the C backend does
-  not support ranges yet`, though `str` slices fine. So viewing the filled prefix
-  of a caller buffer still goes through `slice(u8, raw, n)`, which means the raw
-  pointer has to be kept alive and passed around next to the slice. This is the
-  single most-felt gap in the "buffers in" convention — it is why
-  `std/test_report.finish` takes a `*mut u8` at all.
+- ~~**`[]u8` cannot be range-sliced.**~~ **Closed.** `rep[0 .. n]` used to be
+  `error: the C backend does not support ranges yet` even though `str` sliced fine,
+  so viewing the filled prefix of a caller buffer went through
+  `slice(u8, raw, n)` — which meant keeping the raw pointer alive and passing it
+  around beside the slice. It was the single most-felt gap in the "buffers in"
+  convention, and it is why `std/test_report.finish` originally took a `*mut u8`.
+  It now takes the `[]u8`.
+
+  What remains unsupported, deliberately: range-slicing a fixed-size **array**.
+  `arr[lo .. hi]` would produce a view borrowing the array's inline storage, which
+  is the borrowed-projection question (safety-mosaic item 2), not a typing one.
+  A stack array still has no `.ptr` either, so fixed-size scratch buffers continue
+  to come from the heap.
 - ~~**Module `const`s are emitted unqualified, so two modules cannot share a const
   name.**~~ **Closed.** `const BACKSLASH` in both `std/path` and `std/test`
   produced `error: redefinition of 'j_BACKSLASH'` from gcc when one program

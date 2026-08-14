@@ -47,7 +47,7 @@ const REPORT_CAP: usize = 512
     test.eq_str(c, rep, "base(trailing-sep)", path.base("a/b/"), "")
     test.eq_str(c, rep, "base(empty)", path.base(""), "")
 
-    let ok: bool = test_report.finish(c, raw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     return ok
 }
@@ -59,7 +59,7 @@ const REPORT_CAP: usize = 512
 
     test.eq_str(c, rep, "base(backslash)", path.base("a\\b\\c.jtr"), "c.jtr")
 
-    let ok: bool = test_report.finish(c, raw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     return ok
 }
@@ -74,7 +74,7 @@ const REPORT_CAP: usize = 512
     test.eq_str(c, rep, "dir(/a)", path.dir("/a"), "/")
     test.eq_str(c, rep, "dir(root)", path.dir("/"), "/")
 
-    let ok: bool = test_report.finish(c, raw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     return ok
 }
@@ -89,7 +89,7 @@ const REPORT_CAP: usize = 512
     test.eq_str(c, rep, "ext(dotfile)", path.ext(".bashrc"), "")
     test.eq_str(c, rep, "ext(dot-in-dir-only)", path.ext("a.b/c"), "")
 
-    let ok: bool = test_report.finish(c, raw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     return ok
 }
@@ -103,7 +103,7 @@ const REPORT_CAP: usize = 512
     test.eq_str(c, rep, "stem(no-dot)", path.stem("README"), "README")
     test.eq_str(c, rep, "stem(dotfile)", path.stem(".bashrc"), ".bashrc")
 
-    let ok: bool = test_report.finish(c, raw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     return ok
 }
@@ -118,7 +118,7 @@ const REPORT_CAP: usize = 512
     test.is_false(c, rep, "is_abs(relative)", path.is_abs("rel/ative"))
     test.is_false(c, rep, "is_abs(empty)", path.is_abs(""))
 
-    let ok: bool = test_report.finish(c, raw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     return ok
 }
@@ -132,7 +132,7 @@ const REPORT_CAP: usize = 512
     test.eq_usize(c, rep, "dir_len(bare)", path.dir_len("bare"), 0)
     test.eq_usize(c, rep, "dir_len(/x)", path.dir_len("/x"), 1)
 
-    let ok: bool = test_report.finish(c, raw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     return ok
 }
@@ -159,7 +159,7 @@ const REPORT_CAP: usize = 512
     n = path.join("solo", "", buf)
     test.eq_str(c, rep, "join(empty-rhs)", from_utf8(slice(u8, raw, n)), "solo")
 
-    let ok: bool = test_report.finish(c, rraw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(rraw)
     free_ptr(raw)
     return ok
@@ -199,7 +199,7 @@ const REPORT_CAP: usize = 512
     n = path.normalize("/", buf)
     test.eq_str(c, rep, "norm(root)", from_utf8(slice(u8, raw, n)), "/")
 
-    let ok: bool = test_report.finish(c, rraw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(rraw)
     free_ptr(raw)
     return ok
@@ -230,7 +230,7 @@ const REPORT_CAP: usize = 512
     n = path.normalize("../../x", buf)
     test.eq_str(c, rep, "norm(real-dotdot-chain)", from_utf8(slice(u8, raw, n)), "../../x")
 
-    let ok: bool = test_report.finish(c, rraw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(rraw)
     free_ptr(raw)
     return ok
@@ -251,7 +251,7 @@ const REPORT_CAP: usize = 512
     let n2: usize = path.normalize(once, buf2)
     test.eq_str(c, rep, "norm(idempotent)", from_utf8(slice(u8, raw2, n2)), once)
 
-    let ok: bool = test_report.finish(c, rraw)
+    let ok: bool = test_report.finish(c, rep)
     free_ptr(rraw)
     free_ptr(raw2)
     free_ptr(raw)
