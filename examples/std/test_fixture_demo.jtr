@@ -1,0 +1,107 @@
+// std/test_fixture_demo.jtr — worked examples for `std/test_fixture`.
+//
+// EVERY LINE OF OUTPUT IS MACHINE-INDEPENDENT, which takes some care in a demo
+// whose whole subject is the OS. A temp path contains a username; captured shell
+// error text differs between cmd.exe and sh. So nothing prints a path or a captured
+// message — the demo prints only PROPERTIES of them: is the path absolute, does it
+// end in the name we asked for, did the capture round-trip, is the failure's output
+// non-empty. Those hold on every machine, which is what lets the c-oracle test
+// assert them.
+//
+// The capture round-trip is the interesting one, and it is a controlled experiment
+// like `process_demo`'s: the same capture is run through a `host()` handle and a
+// `denied()` handle, and the file must exist after the first and not after the
+// second. A capture helper that ignored the capability would pass the first check
+// and fail the second.
+//
+// Run:  cargo run --release -- run examples/std/test_fixture_demo.jtr
+//   →   -- temp_path --
+//       1
+//       1
+//       -- capture --
+//       1
+//       1
+//       -- capture failure --
+//       1
+//       1
+//       -- denied --
+//       0
+//       0
+//       -- cleanup --
+//       0
+
+import "test_fixture"
+import "test"
+import "test_report"
+import "process"
+import "path"
+import "fs"
+import "env"
+
+const CAP: usize = 1024
+
+fn b2i(read b: bool) -> i32 {
+    if b { return 1 }
+    return 0
+}
+
+fn main() -> i32 {
+    var praw: *mut u8 = alloc(u8, CAP)
+    var pbuf: []u8 = slice(u8, praw, CAP)
+    var craw: *mut u8 = alloc(u8, CAP * 2)
+    var cbuf: []u8 = slice(u8, craw, CAP * 2)
+
+    // ---- a temp path is absolute and ends in the name we asked for.
+    print_str("-- temp_path --")
+    let n: usize = test_fixture.temp_path("jestyr_fixture_demo.tmp", pbuf)
+    let opath: str = from_utf8(pbuf[0 .. n])
+    // Absolute on any machine whose environment names a temp directory; the "."
+    // fallback would make this 0, which is why the assertion is on `is_abs` of the
+    // JOINED path rather than on the directory itself.
+    print_int(b2i(path.is_abs(opath)))                          // 1
+    print_int(b2i(str_eq(path.base(opath), "jestyr_fixture_demo.tmp")))   // 1
+
+    // ---- capture: run a command, read back exactly what it printed.
+    print_str("-- capture --")
+    var h: process.Process = process.host()
+    fs.remove(opath)
+    let rc: i32 = test_fixture.capture(h, "echo captured", opath, cbuf)
+    print_int(b2i(rc == 0))                                   // 1
+    var text: String = fs.read_text(opath)
+    let view: str = string_view(text)
+    // `echo` adds a line ending whose spelling differs by shell, so this compares
+    // LINE-WISE — which is exactly what `eq_golden` is for.
+    var raw: *mut u8 = alloc(u8, CAP)
+    var rep: []u8 = slice(u8, raw, CAP)
+    var c: test.Check = test.new()
+    test.eq_golden(c, rep, "captured", view, "captured")
+    print_int(b2i(test_report.finish(c, rep)))                // 1
+    free_ptr(raw)
+    string_free(text)
+
+    // ---- a FAILING command still has its output captured. The message differs by
+    // shell, so only its non-emptiness and the non-zero status are asserted.
+    print_str("-- capture failure --")
+    fs.remove(opath)
+    let bad: i32 = test_fixture.capture(h, "jestyr_no_such_command_xyz", opath, cbuf)
+    print_int(b2i(bad != 0))                                  // 1
+    var errtext: String = fs.read_text(opath)
+    print_int(b2i(errtext.len > 0))                           // 1
+    string_free(errtext)
+
+    // ---- the capability still governs it: a denied handle captures nothing.
+    print_str("-- denied --")
+    fs.remove(opath)
+    var d: process.Process = process.denied()
+    let refused: i32 = test_fixture.capture(d, "echo captured", opath, cbuf)
+    print_int(b2i(refused == 0))                              // 0 — refused
+    print_int(b2i(fs.exists(opath)))                            // 0 — no file written
+
+    print_str("-- cleanup --")
+    fs.remove(opath)
+    print_int(b2i(fs.exists(opath)))                            // 0
+
+    free_ptr(craw)
+    free_ptr(praw)
+    return 0
+}

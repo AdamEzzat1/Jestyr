@@ -1,0 +1,126 @@
+// std/test_fixture_test.jtr — the unit suite for `std/test_fixture`.
+//
+// A sibling file, per the convention in docs/stdlib-roadmap.md. These tests touch
+// the real filesystem and shell, because a module whose entire job is fetching
+// bytes from the OS cannot be tested without one. Each case uses a distinct probe
+// name and removes it — which is also the documented workaround for there being no
+// `mkdir` intrinsic to isolate in.
+//
+// Run:  jestyrc test examples/std/test_fixture_test.jtr
+//   →   4 passed; 0 failed
+
+import "test_fixture"
+import "test"
+import "test_report"
+import "process"
+import "path"
+import "fs"
+
+const CAP: usize = 1024
+
+@test fn temp_dir_is_never_empty() -> bool {
+    var raw: *mut u8 = alloc(u8, CAP)
+    var rep: []u8 = slice(u8, raw, CAP)
+    var c: test.Check = test.new()
+
+    // Either the environment named one or the "." fallback applied; an empty answer
+    // would make every `temp_path` a bare filename in an unknown directory.
+    test.is_true(c, rep, "temp_dir non-empty", test_fixture.temp_dir().len > 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn temp_path_ends_with_the_name() -> bool {
+    var praw: *mut u8 = alloc(u8, CAP)
+    var pbuf: []u8 = slice(u8, praw, CAP)
+    var raw: *mut u8 = alloc(u8, CAP)
+    var rep: []u8 = slice(u8, raw, CAP)
+    var c: test.Check = test.new()
+
+    let n: usize = test_fixture.temp_path("jestyr_fixture_name.tmp", pbuf)
+    let p: str = from_utf8(pbuf[0 .. n])
+    test.eq_str(c, rep, "base", path.base(p), "jestyr_fixture_name.tmp")
+    // The directory part is whatever the OS named, but it must be SOMETHING — a
+    // bare filename would mean `temp_dir` leaked through empty.
+    test.is_true(c, rep, "has a directory", path.dir_len(p) > 0)
+    // Only one separator lands between the two halves; `path.join` guarantees it,
+    // and this is the composition that would break if `temp_dir` ever returned a
+    // trailing separator and `join` stopped collapsing it.
+    test.eq_usize(c, rep, "no doubled separator", path.dir_len(p), n - 23)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    free_ptr(praw)
+    return ok
+}
+
+// The round trip that makes expected-diagnostic tests possible: run a command,
+// read back exactly what it said. Compared LINE-WISE, because `echo`'s line ending
+// differs between shells and that difference is not the subject.
+@test fn capture_round_trips_a_commands_output() -> bool {
+    var praw: *mut u8 = alloc(u8, CAP)
+    var pbuf: []u8 = slice(u8, praw, CAP)
+    var craw: *mut u8 = alloc(u8, CAP * 2)
+    var cbuf: []u8 = slice(u8, craw, CAP * 2)
+    var raw: *mut u8 = alloc(u8, CAP)
+    var rep: []u8 = slice(u8, raw, CAP)
+    var c: test.Check = test.new()
+
+    let n: usize = test_fixture.temp_path("jestyr_fixture_capture.tmp", pbuf)
+    let p: str = from_utf8(pbuf[0 .. n])
+    fs.remove(p)
+
+    var h: process.Process = process.host()
+    let rc: i32 = test_fixture.capture(h, "echo captured", p, cbuf)
+    test.eq_i64(c, rep, "status", rc as i64, 0)
+    test.is_true(c, rep, "file written", fs.exists(p))
+
+    var text: String = fs.read_text(p)
+    test.eq_golden(c, rep, "text", string_view(text), "captured")
+    string_free(text)
+
+    fs.remove(p)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    free_ptr(craw)
+    free_ptr(praw)
+    return ok
+}
+
+// The capability still governs a capture: a denied handle must write no file. This
+// is what makes it safe to hand a denied handle to a capture-based test — the file
+// the test would then read simply is not there, rather than being stale.
+@test fn a_denied_handle_captures_nothing() -> bool {
+    var praw: *mut u8 = alloc(u8, CAP)
+    var pbuf: []u8 = slice(u8, praw, CAP)
+    var craw: *mut u8 = alloc(u8, CAP * 2)
+    var cbuf: []u8 = slice(u8, craw, CAP * 2)
+    var raw: *mut u8 = alloc(u8, CAP)
+    var rep: []u8 = slice(u8, raw, CAP)
+    var c: test.Check = test.new()
+
+    let n: usize = test_fixture.temp_path("jestyr_fixture_denied.tmp", pbuf)
+    let p: str = from_utf8(pbuf[0 .. n])
+    fs.remove(p)
+
+    // Control first: the same capture through a host handle DOES write, so the
+    // negative result below is about the capability and not about a bad command.
+    var h: process.Process = process.host()
+    test_fixture.capture(h, "echo captured", p, cbuf)
+    test.is_true(c, rep, "host writes it", fs.exists(p))
+    fs.remove(p)
+
+    var d: process.Process = process.denied()
+    let refused: i32 = test_fixture.capture(d, "echo captured", p, cbuf)
+    test.ne_i64(c, rep, "refused status", refused as i64, 0)
+    test.is_false(c, rep, "denied writes nothing", fs.exists(p))
+
+    fs.remove(p)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    free_ptr(craw)
+    free_ptr(praw)
+    return ok
+}

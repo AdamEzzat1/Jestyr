@@ -3466,6 +3466,20 @@ mod path_props {
         assert!(d.is_empty(), "examples/std/path.jtr: {d:?}");
     }
 
+    /// **`std/test_fixture` — the OS-facing half of the test slice.** The module,
+    /// its demo and its suite all lower with no diagnostics, and the module ships no
+    /// `@test` of its own (the suite is the sibling file).
+    #[test]
+    fn test_fixture_compiles_clean() {
+        for f in ["test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr"] {
+            let d = diags_of(&format!("examples/std/{f}"));
+            assert!(d.is_empty(), "examples/std/{f}: {d:?}");
+        }
+        let prog = crate::module::load("examples/std/test_fixture.jtr");
+        let tests = crate::cgen::list_tests(&prog.ast, &prog.modules.item_mod);
+        assert!(tests.is_empty(), "the suite belongs in test_fixture_test.jtr; found {tests:?}");
+    }
+
     /// **Range-slicing a `[]T`.** `xs[lo .. hi]` must TYPE as the same slice type
     /// (not as the element type, which is what a plain index yields) and must lower
     /// with no diagnostics in all four forms. Toolchain-free.
@@ -3921,6 +3935,34 @@ fn test_ref_lines_eq(got: &[u8], want: &[u8]) -> bool {
     test_ref_first_diff_line(got, want) == 0
 }
 
+/// How many lines differ, counting a line present on one side only. The oracle for
+/// `std/test.diff_count`. Aligned, not an edit script — line `i` against line `i` —
+/// which is the same limitation the Jestyr side documents, and is why one inserted
+/// line makes every following line differ.
+fn test_ref_diff_count(got: &[u8], want: &[u8]) -> usize {
+    let mut a = 0;
+    let mut b = 0;
+    let mut n = 0;
+    while a < got.len() || b < want.len() {
+        if a >= got.len() || b >= want.len() {
+            n += 1;
+            if a < got.len() {
+                a = test_ref_line_next(got, a);
+            }
+            if b < want.len() {
+                b = test_ref_line_next(want, b);
+            }
+            continue;
+        }
+        if test_ref_line_body(got, a) != test_ref_line_body(want, b) {
+            n += 1;
+        }
+        a = test_ref_line_next(got, a);
+        b = test_ref_line_next(want, b);
+    }
+    n
+}
+
 /// The `test_demo` argument stand-ins, applied Rust-side so the oracle sees the
 /// same bytes the compiled Jestyr module does. Mirrors `unescape_arg` in
 /// `examples/std/test_demo.jtr` exactly.
@@ -4086,6 +4128,27 @@ mod test_props {
                 test_ref_first_diff_line(a.as_bytes(), b.as_bytes()),
                 test_ref_first_diff_line(b.as_bytes(), a.as_bytes())
             );
+        }
+
+        /// **`diff_count` agrees with `lines_eq` at zero, is symmetric, and is
+        /// bounded by the longer side.** The three properties that make the number
+        /// meaningful: zero exactly when the texts match line-wise, order-independent,
+        /// and never claiming more differing lines than there are lines.
+        #[test]
+        fn reference_diff_count_is_coherent(a in r"[ab\r\n]{0,40}", b in r"[ab\r\n]{0,40}") {
+            let (x, y) = (a.as_bytes(), b.as_bytes());
+            let n = test_ref_diff_count(x, y);
+            prop_assert_eq!(
+                n == 0,
+                test_ref_lines_eq(x, y),
+                "diff_count zero must coincide with lines_eq: {:?} vs {:?}", a, b
+            );
+            prop_assert_eq!(n, test_ref_diff_count(y, x), "diff_count must be symmetric");
+            let most = test_ref_line_count(x).max(test_ref_line_count(y));
+            prop_assert!(n <= most, "counted {} differing lines out of {}", n, most);
+            // And it is at least as strong as `first_diff_line`: if anything differs,
+            // both agree that something does.
+            prop_assert_eq!(n > 0, test_ref_first_diff_line(x, y) > 0);
         }
 
         /// The answer is a line number that exists in at least one side, or one
@@ -7644,8 +7707,8 @@ mod c_oracle {
     };
     // The `std/test` oracle, likewise.
     use super::{
-        test_ref_escaped, test_ref_escaped_len, test_ref_first_diff_line, test_ref_line_count,
-        test_ref_lines_eq, test_ref_unescape_arg,
+        test_ref_diff_count, test_ref_escaped, test_ref_escaped_len, test_ref_first_diff_line,
+        test_ref_line_count, test_ref_lines_eq, test_ref_unescape_arg,
     };
     use std::process::Command;
 
@@ -12995,7 +13058,7 @@ fn main() -> i32 {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr"];
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr", "test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr"];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
     /// target). This is the acceptance bar the R2 fixpoint ultimately rests on. `DUMP_DIVERGE=1`
@@ -13650,6 +13713,39 @@ fn main() -> i32 {
         );
     }
 
+    /// **`std/test_fixture` end-to-end.** Every asserted value is a PROPERTY rather
+    /// than a path or a captured message, because those are machine- and
+    /// shell-specific: is the temp path absolute, does it end in the requested name,
+    /// did the capture round-trip, was a failing command's output still captured, and
+    /// did a `denied()` handle write nothing.
+    ///
+    /// The `denied` pair is the controlled half — the same capture through a `host()`
+    /// handle writes the file, so the two zeros are about the capability rather than
+    /// about a broken command.
+    #[test]
+    fn test_fixture_demo() {
+        assert_eq!(
+            toks("examples/std/test_fixture_demo.jtr"),
+            [
+                "--", "temp_path", "--", "1", "1",
+                "--", "capture", "--", "1", "1",
+                "--", "capture", "failure", "--", "1", "1",
+                "--", "denied", "--", "0", "0",
+                "--", "cleanup", "--", "0",
+            ]
+        );
+    }
+
+    /// `std/test_fixture`'s suite through the real harness — it touches the real
+    /// filesystem and shell, which is the only honest way to test a module whose job
+    /// is fetching bytes from the OS.
+    #[test]
+    fn test_fixture_unit_tests_pass() {
+        let (out, code) = build_tests_and_run("examples/std/test_fixture_test.jtr", None);
+        assert_eq!(code, 0, "std/test_fixture unit tests must pass:\n{out}");
+        assert!(out.contains("4 passed; 0 failed"), "unexpected harness output:\n{out}");
+    }
+
     /// **`[]T` range-slicing end-to-end.** The demo's documented output, verified
     /// rather than claimed — `slice_range.jtr`'s header lists exactly these.
     #[test]
@@ -13860,7 +13956,7 @@ fn main() -> i32 {
     fn test_module_unit_tests_pass() {
         let (out, code) = build_tests_and_run("examples/std/test.jtr", None);
         assert_eq!(code, 0, "std/test unit tests must pass:\n{out}");
-        assert!(out.contains("22 passed; 0 failed"), "unexpected harness output:\n{out}");
+        assert!(out.contains("26 passed; 0 failed"), "unexpected harness output:\n{out}");
     }
 
     /// **Differential: the real Jestyr module vs the Rust oracle.** Compile
@@ -13924,6 +14020,11 @@ fn main() -> i32 {
                 run("lines", &s, &t),
                 if test_ref_lines_eq(&x, &y) { "1" } else { "0" },
                 "lines {:?} {:?}", s, t
+            );
+            proptest::prop_assert_eq!(
+                run("dcount", &s, &t),
+                test_ref_diff_count(&x, &y).to_string(),
+                "dcount {:?} {:?}", s, t
             );
         }
         );

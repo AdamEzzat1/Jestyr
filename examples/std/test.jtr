@@ -74,6 +74,10 @@ const HIGH: i32 = 127       // first non-printable byte above the ASCII range
 // so the marker can never be mistaken for literal dots in the value.
 const SHOW_MAX: usize = 96
 
+// The most differing lines `eq_golden_all` will list before summarizing the rest,
+// so a wholly-changed golden cannot flood the report buffer.
+const DIFF_MAX: usize = 8
+
 // The recorder. Counters only — see the header on why the report buffer is not a
 // field. `lost` counts report bytes that did not fit, so an undersized buffer is
 // a reported fact rather than silent truncation.
@@ -511,6 +515,100 @@ pub struct Check {
     return false
 }
 
+// How many lines differ, counting a line present in one side and absent from the
+// other. 0 exactly when `lines_eq`.
+//
+// THIS IS AN ALIGNED COMPARISON, NOT AN EDIT SCRIPT, and the difference matters
+// when you read the number. Line `i` is compared against line `i`, so inserting one
+// line at the top makes EVERY subsequent line differ and the count is the file
+// length, where a real diff would report a single insertion. Getting that right
+// needs an LCS table — O(n*m) storage, i.e. an allocator — which is exactly what a
+// `core`-tier module cannot have. A genuine edit-script diff belongs in an
+// allocator-taking tier above this one; until then this answers "how much of the
+// output moved", not "what would I have to change".
+@no_alloc pub fn diff_count(read got: str, read want: str) -> usize {
+    var a: usize = 0
+    var b: usize = 0
+    var n: usize = 0
+    for a < got.len or b < want.len {
+        if a >= got.len or b >= want.len {
+            // One side ran out: every remaining line of the other differs.
+            n = n + 1
+            if a < got.len { a = line_next(got, a) }
+            if b < want.len { b = line_next(want, b) }
+            continue
+        }
+        if str_eq(line_body(got, a), line_body(want, b)) == false { n = n + 1 }
+        a = line_next(got, a)
+        b = line_next(want, b)
+    }
+    return n
+}
+
+// Golden comparison that reports EVERY differing line rather than only the first —
+// the shape you want when a golden has genuinely moved and you need to see how far.
+//
+// The report is a header plus one indented line per difference, capped at
+// `DIFF_MAX` so a wholly-changed golden cannot flood the buffer:
+//
+//   FAIL out: 3 of 5 lines differ
+//     line 2: got "b" want "B"
+//     line 4: got "d" want "D"
+//     ... and 1 more differing line(s)
+//
+// Use `eq_golden` when you want the first difference only; that stays the default
+// because it is what you read while iterating. Read the caveat on `diff_count`
+// before trusting the ratio: this is an aligned comparison, so one inserted line
+// makes everything after it differ.
+@no_alloc pub fn eq_golden_all(mut c: Check, mut rep: []u8, read name: str, read got: str, read want: str) -> bool {
+    started(c)
+    let total: usize = diff_count(got, want)
+    if total == 0 { return true }
+    let gl: usize = line_count(got)
+    let wl: usize = line_count(want)
+    var most: usize = gl
+    if wl > most { most = wl }
+    fail(c, rep, name)
+    puts(c, rep, ": ")
+    put_i64(c, rep, total as i64)
+    puts(c, rep, " of ")
+    put_i64(c, rep, most as i64)
+    puts(c, rep, " lines differ")
+    var shown: usize = 0
+    var i: usize = 1
+    for i <= most {
+        if shown >= DIFF_MAX { break }
+        let g: str = line_at(got, i)
+        let w: str = line_at(want, i)
+        // `line_at` yields "" for an absent line, which is indistinguishable from a
+        // genuinely empty one — so compare presence explicitly rather than bodies.
+        var differs: bool = false
+        if i > gl or i > wl {
+            differs = true
+        } else {
+            differs = str_eq(g, w) == false
+        }
+        if differs {
+            line(c, rep)
+            puts(c, rep, "  line ")
+            put_i64(c, rep, i as i64)
+            puts(c, rep, ": got ")
+            put_value(c, rep, g)
+            puts(c, rep, " want ")
+            put_value(c, rep, w)
+            shown = shown + 1
+        }
+        i = i + 1
+    }
+    if total > shown {
+        line(c, rep)
+        puts(c, rep, "  ... and ")
+        put_i64(c, rep, (total - shown) as i64)
+        puts(c, rep, " more differing line(s)")
+    }
+    return false
+}
+
 // The body of the 1-based line `n`, or "" when there is no such line. O(n) —
 // only ever called on the failure path, where a second scan is free.
 @no_alloc fn line_at(read s: str, n: usize) -> read str {
@@ -886,6 +984,76 @@ pub struct Check {
     if str_eq(from_utf8(slice(u8, raw2, report_len(c2))), "1 checks, 0 failed") == false { ok = false }
 
     free_ptr(raw2)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn diff_count_counts_every_differing_line() -> bool {
+    if diff_count("a\nb\nc", "a\nb\nc") != 0 { return false }
+    if diff_count("a\nX\nc", "a\nb\nc") != 1 { return false }
+    if diff_count("X\nY\nZ", "a\nb\nc") != 3 { return false }
+    // A line present on one side only counts as differing.
+    if diff_count("a\nb", "a") != 1 { return false }
+    if diff_count("a", "a\nb\nc") != 2 { return false }
+    if diff_count("", "") != 0 { return false }
+    // Agrees with `lines_eq` at zero, which is the coupling that matters.
+    if diff_count("a\r\nb", "a\nb") != 0 { return false }
+    return diff_count("", "a") == 1
+}
+
+// The documented limitation, asserted rather than merely described: this is an
+// ALIGNED comparison, so one inserted line makes every following line differ. A
+// real edit-script diff would call this a single insertion. If someone later
+// implements LCS in an allocator-taking tier, this test is the one that should
+// change — and it should change deliberately.
+@test fn diff_count_is_aligned_not_an_edit_script() -> bool {
+    // "x" inserted at the top: all four lines are now misaligned.
+    if diff_count("x\na\nb\nc", "a\nb\nc") != 4 { return false }
+    // ...whereas a genuine single-line edit really is one.
+    return diff_count("a\nX\nc", "a\nb\nc") == 1
+}
+
+@test fn eq_golden_all_lists_each_difference() -> bool {
+    var raw: *mut u8 = alloc(u8, 1024)
+    var rep: []u8 = slice(u8, raw, 1024)
+    var c: Check = new()
+    var ok: bool = true
+
+    eq_golden_all(c, rep, "out", "a\nX\nc\nY", "a\nb\nc\nd")
+    let want: str = "FAIL out: 2 of 4 lines differ\n  line 2: got \"X\" want \"b\"\n  line 4: got \"Y\" want \"d\""
+    if str_eq(from_utf8(rep[0 .. report_len(c)]), want) == false { ok = false }
+
+    // An equal pair writes nothing and passes, like every other expectation.
+    var c2: Check = new()
+    var raw2: *mut u8 = alloc(u8, 256)
+    var rep2: []u8 = slice(u8, raw2, 256)
+    if eq_golden_all(c2, rep2, "same", "a\r\nb\r\n", "a\nb") == false { ok = false }
+    if report_len(c2) != 0 { ok = false }
+
+    free_ptr(raw2)
+    free_ptr(raw)
+    return ok
+}
+
+// A wholly-changed golden is summarized rather than dumped: DIFF_MAX lines, then a
+// count of the rest. Without the cap a 500-line golden would fill any buffer and
+// `lost` would start eating the report.
+@test fn eq_golden_all_caps_the_listing() -> bool {
+    var raw: *mut u8 = alloc(u8, 2048)
+    var rep: []u8 = slice(u8, raw, 2048)
+    var c: Check = new()
+    var ok: bool = true
+
+    // 12 lines, all different: 8 listed, 4 summarized.
+    let g: str = "0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11"
+    let w: str = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl"
+    eq_golden_all(c, rep, "big", g, w)
+    let got: str = from_utf8(rep[0 .. report_len(c)])
+    if line_count(got) != 1 + 8 + 1 { ok = false }      // header + 8 + summary
+    if str_eq(line_at(got, 1), "FAIL big: 12 of 12 lines differ") == false { ok = false }
+    if str_eq(line_at(got, 10), "  ... and 4 more differing line(s)") == false { ok = false }
+    if lost(c) != 0 { ok = false }
+
     free_ptr(raw)
     return ok
 }

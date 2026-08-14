@@ -7,6 +7,54 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/test_fixture`, `eq_golden_all`, and `diff_count` — the three `std/test`
+  gaps closed.** The slice shipped with three named limits; all three now have an
+  answer, two of them by building it and one by bounding it honestly.
+
+  **Expected diagnostics** turned out not to need the compiler as a library, which
+  was the original reason for deferring them. It needs to *run* the compiler and
+  compare text: `test_fixture.capture(p, cmd, out_path, buf)` runs a command with
+  both streams redirected into a file, `fs.read_text` reads it, `eq_golden_all`
+  judges it. Deliberately no `expect_diagnostics(file, want)` one-liner — it would
+  have to invent the compiler's path, and a helper that silently runs the wrong
+  binary is worse than no helper, so the caller supplies it.
+
+  **Temp files** are available (`test_fixture.temp_path`), resolving `TMPDIR`, then
+  `TEMP`/`TMP`, then `.` — no single spelling is portable, and on this repo's Windows
+  box `TMPDIR` is unset while both others are set. It stays deterministic because the
+  *caller* names the file. Temp **directories** are still absent: there is no `mkdir`
+  intrinsic, and creating one via `process.run("mkdir …")` is refused because it
+  would make every caller's test depend on shell quoting for a path it did not
+  choose.
+
+  **The diff** now reports every differing line (`eq_golden_all`, capped at 8 then
+  summarized) and counts them (`diff_count`), where before only the first difference
+  was reported. The limit is stated precisely and *tested*, not just written down:
+  this is an **aligned** line comparison, so one inserted line at the top makes every
+  following line differ and the count becomes the file length, where a real diff
+  would report a single insertion. An LCS table needs O(n·m) storage — an allocator —
+  which a `core` module cannot have. `diff_count_is_aligned_not_an_edit_script` pins
+  it, so if someone implements LCS in an allocator-taking tier, that test is the one
+  that must change deliberately.
+
+  `test_fixture` is `std` and the second file in the slice that performs effects
+  (`test.jtr` decides, `test_report.jtr` prints, `test_fixture.jtr` fetches). Every
+  capture goes through the `Process` capability, so a `denied()` handle writes no
+  file — verified with a `host()` control in the same test.
+
+  One platform detail found by a failing golden and now owned by `capture`: **no
+  space before the `>`**. cmd.exe's `echo` treats everything after `echo ` literally
+  including the space preceding a redirect, so `echo hi > "f"` writes `"hi "` while
+  `echo hi> "f"` writes `"hi"`; POSIX sh tokenizes `>` as an operator either way.
+
+  Layers: 26 `@test` functions in `test.jtr` (up from 22) and 4 in the sibling
+  `test_fixture_test.jtr`, a compile-clean test, a c-oracle assertion on the demo's
+  documented output (every value a *property*, never a path or a captured message,
+  since those are machine-specific), a `diff_count` Rust oracle with a coherence
+  property (zero iff `lines_eq`, symmetric, bounded by the longer side), and a new
+  `dcount` op wired into the existing differential test so `diff_count` is checked
+  against that oracle through the real compiled module.
+
 - **Range-slicing a `[]T`.** `xs[lo .. hi]` narrows a slice to a view of the same
   buffer — `{ ptr, len }` in, `{ ptr + lo, hi - lo }` out — no copy and no
   allocation, the `[]T` twin of `str`'s existing sub-view. It used to be rejected

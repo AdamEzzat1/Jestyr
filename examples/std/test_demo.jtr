@@ -9,7 +9,7 @@
 //     generated case, so the properties are checked against the REAL Jestyr
 //     implementation rather than a Rust re-description of it.
 //
-// Ops: esc | esclen | lc | diff | lines
+// Ops: esc | esclen | lc | diff | lines | dcount
 //
 // An argument carries stand-ins for the bytes a command line cannot: `;` is a
 // newline, `~` a carriage return, `^` a backslash, `#` a double quote, `@` a tab,
@@ -126,7 +126,11 @@ fn run_op(read op: str, read a: str, read b: str) -> i32 {
                     if str_eq(op, "lines") {
                         if test.lines_eq(x, y) { print_str("1") } else { print_str("0") }
                     } else {
-                        code = 2
+                        if str_eq(op, "dcount") {
+                            emit_num(test.diff_count(x, y), obuf, oraw)
+                        } else {
+                            code = 2
+                        }
                     }
                 }
             }

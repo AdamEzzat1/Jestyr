@@ -1,0 +1,117 @@
+// std/test_fixture.jtr — the OS-facing scaffolding a test needs, and nothing else.
+//
+// TIER: `std`. Requires a filesystem, an environment, and a shell. This is the
+// third file of the `std/test` slice and the second that performs effects:
+// `test.jtr` decides (`core`), `test_report.jtr` prints, and this one produces the
+// INPUTS a test compares — temp file paths, and the captured output of a command.
+//
+// WHY IT IS SEPARATE FROM `test.jtr`. Because `test.jtr` is `core` and must stay
+// linkable with no OS at all. Every function here would break that, and none of
+// them is needed to *judge* anything — they only fetch bytes for `test.eq_golden`
+// to judge. Keeping the fetch and the judgement in different files is what lets the
+// judging half be `@no_alloc`-proven and reusable on a freestanding target.
+//
+// THE EXPECTED-DIAGNOSTICS RECIPE, which is the reason `capture` exists. There is
+// no in-language way to invoke the compiler as a library, so an expected-diagnostic
+// test shells out and compares text:
+//
+//     var pr: process.Process = process.host()
+//     let n: usize = test_fixture.temp_path("diag.txt", pbuf)
+//     let out: str = from_utf8(pbuf[0 .. n])
+//     test_fixture.capture(pr, "jestyrc check bad.jtr", out, cbuf)
+//     var text: String = fs.read_text(out)
+//     test.eq_golden_all(c, rep, "diagnostics", string_view(text), WANT)
+//     string_free(text)
+//
+// The COMPILER PATH IS THE CALLER'S to supply, deliberately. A test harness knows
+// where its compiler is; a library cannot, and guessing (`argv(0)`, a `PATH`
+// lookup) would silently test the wrong binary. That is also why this module offers
+// no `expect_diagnostics(file, want)` convenience: it would have to invent that
+// path, and a helper that runs the wrong compiler is worse than no helper.
+//
+// TEMP DIRECTORIES ARE NOT HERE, and cannot be yet. There is no `mkdir` intrinsic,
+// so a test can name a file inside the OS temp directory (`temp_path`) but cannot
+// create a fresh directory to isolate itself in. Creating one via
+// `process.run("mkdir …")` would work on both shells and is deliberately NOT done:
+// it would make every caller's test depend on shell quoting for a path it did not
+// choose. A real `temp_dir()` wants one new intrinsic and the eleven-site recipe in
+// docs/stdlib-roadmap.md. Until then, name your temp files distinctly — the suites
+// in this repo prefix theirs `jestyr_<module>_<case>`.
+//
+// Worked example:  examples/std/test_fixture_demo.jtr
+
+import "process"
+import "fs"
+import "env"
+import "path"
+
+// The OS temp directory: `TMPDIR` (POSIX), else `TEMP` or `TMP` (Windows), else
+// ".". A view into the process environment — OS-owned storage, nothing to free,
+// the same contract as `env.get`.
+//
+// All three spellings are checked because no single one is portable: on this
+// repo's Windows box `TMPDIR` is unset while `TEMP` and `TMP` are both set, and on
+// POSIX it is the other way round. The "." fallback means a caller always gets a
+// usable relative path rather than an empty one.
+pub fn temp_dir() -> str {
+    let a: str = env.get("TMPDIR")
+    if a.len > 0 { return a }
+    let b: str = env.get("TEMP")
+    if b.len > 0 { return b }
+    let c: str = env.get("TMP")
+    if c.len > 0 { return c }
+    return "."
+}
+
+// `<temp_dir()>/<name>` written into `buf`, returning the byte count — the
+// buffers-in idiom, so this module allocates nothing.
+//
+// The separator written is always `/`, because that is what `std/path.join` emits
+// and both Windows and POSIX accept it. REQUIRES
+// `buf.len >= temp_dir().len + name.len + 1`.
+pub fn temp_path(read name: str, mut buf: []u8) -> usize {
+    return path.join(temp_dir(), name, buf)
+}
+
+// Run `cmd`, redirecting BOTH its stdout and its stderr into `out_path`, and return
+// the raw platform status. `buf` is scratch for building the command line and must
+// hold `cmd.len + out_path.len + 11`.
+//
+// Both streams are captured together (`> file 2>&1`) because a diagnostic test
+// wants everything the tool said, and which stream a given message chose is the
+// tool's business. `2>&1` and the quoted redirect are spelled identically in
+// cmd.exe and POSIX sh.
+//
+// NO SPACE BEFORE THE `>`, and that is not a style choice. cmd.exe's `echo` treats
+// everything after `echo ` literally, INCLUDING a space that precedes the redirect
+// operator, so `echo hi > "f"` writes "hi " with a trailing space while
+// `echo hi> "f"` writes "hi". POSIX sh tokenizes `>` as an operator either way, so
+// omitting the space is portable and captures what the command actually said rather
+// than what the shell's quoting added. Found by a demo whose golden compare failed
+// on exactly one trailing byte.
+//
+// Goes through the `Process` capability like any other command, so a `denied()`
+// handle captures nothing and writes no file — which is what makes a
+// capture-based test safe to hand a denied handle.
+pub fn capture(mut p: process.Process, read cmd: str, read out_path: str, mut buf: []u8) -> i32 {
+    var n: usize = 0
+    for i in 0..cmd.len {
+        buf[n] = cmd[i] as u8
+        n = n + 1
+    }
+    let mid: str = "> \""
+    for j in 0..mid.len {
+        buf[n] = mid[j] as u8
+        n = n + 1
+    }
+    for k in 0..out_path.len {
+        buf[n] = out_path[k] as u8
+        n = n + 1
+    }
+    let tail: str = "\" 2>&1"
+    for m in 0..tail.len {
+        buf[n] = tail[m] as u8
+        n = n + 1
+    }
+    return process.run(p, from_utf8(buf[0 .. n]))
+}

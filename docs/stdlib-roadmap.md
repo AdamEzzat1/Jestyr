@@ -70,7 +70,8 @@ this intent in their own headers and are the pattern to copy.
 Present: `fs.jtr` (read/write/exists/remove), `env.jtr` (argc/argv/env_var),
 `io.jtr` (four print wrappers), `time.jtr` (monotonic elapsed),
 `test_report.jtr` (printing a `Check` report), `process.jtr` (running a command
-behind a capability handle).
+behind a capability handle), `test_fixture.jtr` (temp paths and captured command
+output, for expected-diagnostic tests).
 
 Thin is an understatement: `fs` is 35 lines and `env` is 45. This tier is where
 most of the remaining work lives.
@@ -206,13 +207,13 @@ is a test people do not write.
 
 | | |
 |---|---|
-| **Files** | `examples/std/test.jtr` (core), `examples/std/test_report.jtr` (std), `examples/std/test_demo.jtr` (demo + differential oracle driver) |
-| **Tier** | `core` for the whole decision half; `std` for the three hosted functions (`finish`/`dump` print, `exit_code` does not) |
+| **Files** | `examples/std/test.jtr` (core), `examples/std/test_report.jtr` (std, prints), `examples/std/test_fixture.jtr` (std, fetches), `examples/std/test_demo.jtr` (demo + differential oracle driver), plus the sibling suites `test_fixture_test.jtr` and `test_fixture_demo.jtr` |
+| **Tier** | `core` for the whole decision half; `std` for the hosted halves — `test_report` prints, `test_fixture` reads the environment, the filesystem and a shell |
 | **Allocates?** | **No.** Every function in `test.jtr` is `@no_alloc`, so the escape checker rejects the file if any of it reaches for the allocator. The caller's report buffer is the only storage, and the caller allocates it. |
-| **OS / runtime?** | `test.jtr`: none — no imports at all. `test_report.jtr`: stdout, nothing else. |
+| **OS / runtime?** | `test.jtr`: none — no imports at all. `test_report.jtr`: stdout, nothing else. `test_fixture.jtr`: environment + filesystem + shell, all of it through the `Process` capability. |
 | **Guarantees** | Never aborts (a failed expectation returns `false`); never allocates; the report is always printable ASCII plus `\n`; the rendering is unambiguous (decodable, so two different values can never render alike); golden comparison is insensitive to CRLF and to a missing final newline and to nothing else. |
 | **Capability model** | The recorder is an explicit `Check` value, not an ambient global. The report *sink* is a caller-supplied `[]u8`. The report *destination* is a separate module the caller chooses to import. |
-| **Limits** | No float expectations; no expected-diagnostic helpers; no temp-file helpers; first-difference only, not a full diff. All four are argued below. |
+| **Limits** | No float expectations, and no temp *directory* (there is no `mkdir` intrinsic). The diff is an ALIGNED line comparison, not an edit script — one inserted line makes every following line differ, because LCS needs O(n·m) storage that a `core` module cannot have. Argued below. |
 
 The API in one screen:
 
@@ -270,16 +271,38 @@ consumer's output.
   `fmt` slice (#8, high cost, touches types/typeck/cgen). Bit-exact comparison is
   available today as `eq_i64` over `float_bits`, which is also the comparison
   `FP-DETERMINISM-CONTRACT.md` actually cares about.
-- **Expected-diagnostic helpers.** Asserting "this source produces error E0007
-  at 4:12" requires the compiler as a library from inside Jestyr. Real, wanted,
-  and gated on the driver growing a diagnostics API — not on this slice.
-- **Temp files and temp dirs.** No `mkdtemp` intrinsic, and inventing one from
-  `env.get("TEMP")` plus a counter would be a non-deterministic API wearing a
-  deterministic costume. It belongs to the `fs` expansion (#7), which pays new
-  intrinsics anyway.
-- **A full diff.** `first_diff_line` answers "where", which is the whole value of
-  a golden over `str_eq`. An edit-distance diff needs somewhere to put its output
-  and a policy about how much of it to keep; that is a slice, not a function.
+- ~~**Expected-diagnostic helpers.**~~ **Available**, though not as the convenience
+  wrapper first imagined. It does not need the compiler as a library: it needs to
+  run the compiler and compare text, which is `std/test_fixture.capture` plus
+  `fs.read_text` plus `test.eq_golden_all`. The recipe is in `test_fixture.jtr`'s
+  header.
+
+  What is deliberately absent is an `expect_diagnostics(file, want)` one-liner,
+  because it would have to invent the compiler's path — and a helper that silently
+  runs the wrong binary is worse than no helper. **The caller supplies the path**; a
+  test harness knows where its compiler is, a library cannot.
+- **Temp files: yes. Temp directories: no.** `test_fixture.temp_path(name, buf)`
+  names a file inside the OS temp directory (`TMPDIR`, else `TEMP`/`TMP`, else `.`
+  — no single spelling is portable), which is deterministic because the CALLER
+  chooses the name. Creating a fresh *directory* to isolate in still needs a
+  `mkdir` intrinsic; doing it via `process.run("mkdir …")` would work on both
+  shells and is refused, because it would make every caller's test depend on shell
+  quoting for a path it did not choose. That belongs to the `fs` expansion (#7),
+  which pays new intrinsics anyway. Until then, suites here prefix their probes
+  `jestyr_<module>_<case>`.
+- **A full diff: every differing line, but still not an edit script.**
+  `eq_golden_all` reports all differences (capped at 8, then summarized) and
+  `diff_count` counts them, which is what you want once a golden has genuinely
+  moved. `eq_golden` — first difference only — stays the default because it is what
+  you read while iterating.
+
+  The honest limit, asserted by `diff_count_is_aligned_not_an_edit_script` rather
+  than merely written here: line `i` is compared against line `i`, so **one
+  inserted line at the top makes every following line differ** and the count is the
+  file length, where a real diff would report a single insertion. Fixing that needs
+  an LCS table — O(n·m) storage, i.e. an allocator — which is exactly what a `core`
+  module cannot have. An edit-script diff belongs in an allocator-taking tier above
+  this one.
 - **`unwrap`-style helpers.** Same reason as everywhere else in this document.
 
 **The one bug this module's existence exposed, now fixed.** The `@test` harness
@@ -365,6 +388,10 @@ Where this slice leaves the seven planned Tier 2 areas.
 | **4. Collections v2** | **Untouched.** |
 | **7. Package / build integration** | **Untouched.** The slice is three files consumed by ordinary `import`, which is as far as it should reach. |
 
+Six follow-ups were listed when this slice landed. **Five are done**; what remains
+is one runtime fix and one emission change, both stated precisely below. The list is
+kept in its original numbering so the commit history reads against it.
+
 **The next smallest follow-up**, in order:
 
 1. ~~**Adopt it.**~~ ✅ `std/path`'s eleven tests are now written with `std/test`,
@@ -429,6 +456,17 @@ Where this slice leaves the seven planned Tier 2 areas.
    reseed — see the (now closed) gap recorded below.
 6. **Stop emitting `@test`/`@bench` items in non-test mode** — see convention 4
    above for why, and for why it is not as small as it looks.
+7. ~~**Close the three `std/test` gaps**~~ ✅ `std/test_fixture` (temp paths +
+   captured command output, which is what expected-diagnostic tests actually
+   needed), plus `eq_golden_all` / `diff_count` for every differing line rather
+   than only the first. The one gap that stays open is a temp **directory**, which
+   needs a `mkdir` intrinsic; and the diff remains an aligned comparison rather
+   than an edit script, because LCS needs an allocator. Both are argued above.
+
+So the standing work is exactly two items — **3** (normalize `run_command`'s exit
+status: a runtime change, owes the mirror and a reseed) and **6** (stop emitting
+`@test` items in non-test mode: an emission change, owes the same, and is bigger
+than one predicate). Everything else on this list is closed.
 
 ### Cheap vs expensive, precisely
 

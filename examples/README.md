@@ -218,8 +218,19 @@ The self-hosted compiler and the standard library, all in Jestyr:
     doesn't). `eq_golden` compares line-wise, insensitive to CRLF and to a
     missing final newline, and names the line that differs; `escaped` renders
     arbitrary bytes as printable ASCII so a failure message can show you the
-    trailing `\r`. Worked examples in `test_demo.jtr`; own suite via
-    `jestyrc test examples/std/test.jtr`.
+    trailing `\r`. `eq_golden_all` reports *every* differing line (capped) when a
+    golden has moved wholesale — an aligned line comparison, not an edit script, so
+    one inserted line makes everything after it differ. Worked examples in
+    `test_demo.jtr`; own suite via `jestyrc test examples/std/test.jtr`.
+  * `test_fixture.jtr` is the third file of that slice and the other hosted one: it
+    *fetches* what a test compares. `temp_path` names a file in the OS temp
+    directory (`TMPDIR`, else `TEMP`/`TMP`, else `.`), and `capture` runs a command
+    with both streams redirected into a file — which is how an expected-diagnostic
+    test works without a compiler-as-library: run `jestyrc check bad.jtr`, read the
+    file, `eq_golden_all` it. The compiler path is the caller's to supply, on
+    purpose. Captures go through the `Process` capability, so a `denied()` handle
+    writes nothing. No temp *directories* — that needs a `mkdir` intrinsic.
+    `test_fixture_demo.jtr`, suite in `test_fixture_test.jtr`.
   * `process.jtr` runs external commands behind an explicit capability. (For the
     `[]T` range-slicing that lets `test_report.finish` take a slice rather than a
     raw pointer, see `slice_range.jtr` in the top-level examples.) A
