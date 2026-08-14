@@ -1,0 +1,247 @@
+// std/test_demo.jtr — worked examples for `std/test` + `std/test_report`, and
+// the oracle the Rust property tests drive.
+//
+// TWO MODES, on purpose (the shape `path_demo.jtr` established):
+//   * no arguments — print the worked demo below. This is what the c-oracle test
+//     asserts, so the documented output is verified rather than claimed.
+//   * `test_demo <op> <a> [b]` — apply one operation and print the result, one
+//     line, nothing else. `src/proptests.rs` builds this once and runs it per
+//     generated case, so the properties are checked against the REAL Jestyr
+//     implementation rather than a Rust re-description of it.
+//
+// Ops: esc | esclen | lc | diff | lines | dcount
+//
+// An argument carries stand-ins for the bytes a command line cannot: `;` is a
+// newline, `~` a carriage return, `^` a backslash, `#` a double quote, `@` a tab,
+// and `!` the control byte 0x01. The Rust oracle applies the same substitution;
+// nothing else about the bytes is touched.
+//
+// Run:  cargo run --release -- run examples/std/test_demo.jtr
+//   →   -- expectations --
+//       FAIL ext: got "gz" want "tar.gz"
+//       5 checks, 1 failed
+//       -- golden --
+//       FAIL report2: line 2: got "5 checks, 1 failed" want "4 checks, 1 failed"
+//       2 checks, 1 failed
+//       -- escaping --
+//       a\r
+//       3
+//       -- golden from a file --
+//       1
+//       1
+//       0
+
+import "test"
+import "test_report"
+import "path"
+import "env"
+import "fs"
+
+const CAP: usize = 1024
+
+// Decode the argument stand-ins into the bytes they name, returning the byte
+// count written. Every byte `std/test` treats specially is reachable this way,
+// which is the point: a differential test cannot check the escaping of a
+// backslash or a quote if it cannot get one through the command line. (That is
+// not hypothetical — `path_demo`'s differential test had to EXCLUDE backslash
+// for exactly this reason, and says so.)
+//
+// The substitutions stay inside ASCII and inside valid UTF-8, because
+// `from_utf8` traps on invalid input; the non-ASCII `\xNN` path is pinned
+// in-language instead, by `escaped_hexes_the_rest` in `std/test.jtr`.
+fn unescape_arg(read s: str, mut dst: []u8) -> usize {
+    var n: usize = 0
+    for i in 0..s.len {
+        let ch: i32 = s[i] as i32
+        var b: i32 = ch
+        if ch == 59 { b = 10 }        // ';' -> newline
+        if ch == 126 { b = 13 }       // '~' -> carriage return
+        if ch == 94 { b = 92 }        // '^' -> backslash
+        if ch == 35 { b = 34 }        // '#' -> double quote
+        if ch == 64 { b = 9 }         // '@' -> tab
+        if ch == 33 { b = 1 }         // '!' -> 0x01, a control byte
+        dst[n] = b as u8
+        n = n + 1
+    }
+    return n
+}
+
+// A tiny unsigned decimal formatter, local so this demo stays a leaf — the same
+// choice (and the same reason) as `path_demo.jtr`'s: importing `core` would pull
+// the whole numerics tier in for one number. Digits are generated
+// least-significant first, then reversed in place.
+fn emit_num(v: usize, mut dst: []u8, raw: *mut u8) {
+    if v == 0 {
+        print_str("0")
+        return
+    }
+    var n: usize = 0
+    var x: usize = v
+    for x > 0 {
+        dst[n] = (48 + (x % 10)) as u8
+        x = x / 10
+        n = n + 1
+    }
+    var i: usize = 0
+    var j: usize = n - 1
+    for i < j {
+        let t: u8 = dst[i]
+        dst[i] = dst[j]
+        dst[j] = t
+        i = i + 1
+        j = j - 1
+    }
+    print_str(from_utf8(slice(u8, raw, n)))
+}
+
+// `op a b` -> one line on stdout. Unknown ops print nothing and exit 2, so a
+// typo in the test harness fails loudly instead of silently passing.
+fn run_op(read op: str, read a: str, read b: str) -> i32 {
+    var araw: *mut u8 = alloc(u8, CAP)
+    var braw: *mut u8 = alloc(u8, CAP)
+    var oraw: *mut u8 = alloc(u8, CAP * 4)
+    var abuf: []u8 = slice(u8, araw, CAP)
+    var bbuf: []u8 = slice(u8, braw, CAP)
+    var obuf: []u8 = slice(u8, oraw, CAP * 4)
+
+    let an: usize = unescape_arg(a, abuf)
+    let bn: usize = unescape_arg(b, bbuf)
+    let x: str = from_utf8(slice(u8, araw, an))
+    let y: str = from_utf8(slice(u8, braw, bn))
+    var code: i32 = 0
+
+    if str_eq(op, "esc") {
+        let n: usize = test.escaped(x, obuf)
+        print_str(from_utf8(slice(u8, oraw, n)))
+    } else {
+        if str_eq(op, "esclen") {
+            emit_num(test.escaped_len(x), obuf, oraw)
+        } else {
+            if str_eq(op, "lc") {
+                emit_num(test.line_count(x), obuf, oraw)
+            } else {
+                if str_eq(op, "diff") {
+                    emit_num(test.first_diff_line(x, y), obuf, oraw)
+                } else {
+                    if str_eq(op, "lines") {
+                        if test.lines_eq(x, y) { print_str("1") } else { print_str("0") }
+                    } else {
+                        if str_eq(op, "dcount") {
+                            emit_num(test.diff_count(x, y), obuf, oraw)
+                        } else {
+                            code = 2
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    free_ptr(oraw)
+    free_ptr(braw)
+    free_ptr(araw)
+    return code
+}
+
+// ---------------------------------------------------------------- the demo
+//
+// A realistic slice of work: checking ANOTHER module (`std/path`) with
+// `std/test`, then treating the resulting report as a golden.
+
+// Five expectations against `std/path`. The last one is wrong ON PURPOSE — a
+// demo where nothing fails cannot show you what a failure looks like.
+fn check_path(mut c: test.Check, mut rep: []u8) {
+    test.eq_str(c, rep, "base", path.base("examples/std/test.jtr"), "test.jtr")
+    test.eq_str(c, rep, "dir", path.dir("examples/std/test.jtr"), "examples/std")
+    test.eq_usize(c, rep, "dir_len", path.dir_len("a/b/c"), 4)
+    test.is_true(c, rep, "is_abs", path.is_abs("/etc"))
+    test.eq_str(c, rep, "ext", path.ext("a/b.tar.gz"), "tar.gz")   // ext is "gz"
+    test.tally(c, rep)
+}
+
+// Compare the produced report against two goldens: one written with CRLF (as a
+// golden file checked out on Windows would be — must still match) and one that
+// is genuinely wrong (must name the line).
+fn check_goldens(mut g: test.Check, mut rep: []u8, read produced: str) {
+    let crlf: str = "FAIL ext: got \"gz\" want \"tar.gz\"\r\n5 checks, 1 failed\r\n"
+    test.eq_golden(g, rep, "report", produced, crlf)
+    let wrong: str = "FAIL ext: got \"gz\" want \"tar.gz\"\n4 checks, 1 failed"
+    test.eq_golden(g, rep, "report2", produced, wrong)
+    test.tally(g, rep)
+}
+
+fn b2i(read b: bool) -> i32 {
+    if b { return 1 }
+    return 0
+}
+
+// The capability handoff, end to end: `fs` supplies the bytes, `test` judges
+// them, `test_report` prints the verdict. `std/test` itself never learns that a
+// filesystem exists — which is what lets it stay `core`.
+fn golden_from_a_file(read produced: str) {
+    let gp: str = "jestyr_test_demo_golden.tmp"
+    print_int(b2i(fs.write(gp, produced)))       // 1 — wrote the golden
+
+    var loaded: String = fs.read_text(gp)
+    let view: str = string_view(loaded)
+    var raw: *mut u8 = alloc(u8, CAP)
+    var rep: []u8 = slice(u8, raw, CAP)
+    var c: test.Check = test.new()
+    test.eq_golden(c, rep, "on-disk", produced, view)
+    print_int(b2i(test_report.finish(c, rep)))   // 1 — matched what we produced
+    free_ptr(raw)
+    string_free(loaded)
+
+    fs.remove(gp)
+    print_int(b2i(fs.exists(gp)))                // 0 — cleaned up
+}
+
+fn demo() {
+    var raw: *mut u8 = alloc(u8, CAP)
+    var rep: []u8 = slice(u8, raw, CAP)
+    var c: test.Check = test.new()
+
+    print_str("-- expectations --")
+    check_path(c, rep)
+    test_report.dump(c, rep)
+
+    // The report just produced, now treated as data.
+    let produced: str = from_utf8(slice(u8, raw, test.report_len(c)))
+
+    print_str("-- golden --")
+    var raw2: *mut u8 = alloc(u8, CAP)
+    var rep2: []u8 = slice(u8, raw2, CAP)
+    var g: test.Check = test.new()
+    check_goldens(g, rep2, produced)
+    test_report.dump(g, rep2)
+
+    // Why the escaping earns its keep: `"a\r"` and `"a"` print identically, so a
+    // failure message that did not escape would show you two equal-looking
+    // values and no reason.
+    print_str("-- escaping --")
+    var eraw: *mut u8 = alloc(u8, 64)
+    var ebuf: []u8 = slice(u8, eraw, 64)
+    let en: usize = test.escaped("a\r", ebuf)
+    print_str(from_utf8(slice(u8, eraw, en)))                 // a\r
+    emit_num(test.escaped_len("a\r"), rep2, raw2)           // 3
+    free_ptr(eraw)
+
+    print_str("-- golden from a file --")
+    golden_from_a_file(produced)
+
+    free_ptr(raw2)
+    free_ptr(raw)
+}
+
+fn main() -> i32 {
+    if env.argc() < 2 {
+        demo()
+        return 0
+    }
+    let op: str = env.argv(1)
+    var a: str = ""
+    var b: str = ""
+    if env.argc() > 2 { a = env.argv(2) }
+    if env.argc() > 3 { b = env.argv(3) }
+    return run_op(op, a, b)
+}

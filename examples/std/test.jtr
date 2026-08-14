@@ -1,0 +1,1078 @@
+// std/test.jtr — expectations and golden comparison for the `@test` harness.
+//
+// TIER: `core`. No heap, no OS, no syscalls, no imports. Every function here is
+// `@no_alloc`, so "asserting never allocates" is a *proven* property rather than
+// a comment — the escape checker rejects this file if any of it ever reaches for
+// the allocator. Nothing here prints, either: the hosted half of the slice is
+// `std/test_report.jtr`, which is the only file in it that touches an effect.
+//
+// WHY A HANDLE INSTEAD OF AN `assert!`. A macro-style assert hides two effects:
+// it counts (somewhere global) and it reports (to somebody's stdout). Both are
+// explicit here. `Check` is a plain value the test owns and passes; the report is
+// written into a `[]u8` the test supplies. So a test that wants its failures on
+// stdout says so, a test that wants them compared against a golden file says
+// that instead, and neither is the module's business. The module cannot print,
+// cannot allocate, and cannot abort — a failing expectation returns `false` and
+// records why, which is what makes it composable with `@test`'s `-> bool`.
+//
+// WHY THE BUFFER IS A PARAMETER AND NOT A FIELD. It would read better as
+// `Check{ buf: rep }`, and the escape checker refuses: a Jestyr borrow is
+// second-class, so `[]u8` may not be stored in a struct that outlives the call
+// ("a stored value must outlive the call"). The alternative is a raw `*mut u8`
+// field, which would drag `unsafe` into a `core` module to save an argument.
+// Counters in the handle, storage in the caller's hand, is the honest shape —
+// and it is the same "views out, buffers in" rule `std/path` follows.
+//
+// THREE SHAPES:
+//   * expectations — `eq_str(c, rep, "name", got, want)` returns the verdict and
+//     appends one line to the report when it fails. Never aborts.
+//   * golden comparison — line-wise, CRLF-insensitive, final-newline-optional,
+//     so a golden file checked out on Windows compares equal to one written on
+//     POSIX. `first_diff_line` reports *where*, which is the whole value of a
+//     golden over a plain string compare.
+//   * value rendering — `escaped` writes arbitrary bytes as printable ASCII, so
+//     a failure message can show you the trailing `\r` that made two
+//     apparently-identical lines differ.
+//
+// AN INVARIANT WORTH KNOWING: every byte this module writes into the report is
+// either a newline or printable ASCII (0x20..0x7e), because everything that came
+// from the caller — values AND check names — goes through the escaper, and only
+// module-authored ASCII takes the direct path. So `from_utf8` on the report can
+// never trap, which is what lets `std/test_report.finish` print it
+// unconditionally; and a check name cannot forge a `FAIL` line.
+//
+// IMPORTING THIS DOES NOT DRAG ITS SUITE INTO YOURS. `jestyrc test my_module.jtr`
+// runs the tests of the module you NAMED, not of its import closure, so the 22
+// tests below stay out of your harness. That was not true when this module first
+// landed — the harness collected from the whole closure, which nobody had noticed
+// because no imported module shipped a suite (`jestyrc test
+// examples/std/path_demo.jtr` ran `std/path`'s eleven despite `path_demo.jtr`
+// having none of its own). Scoping it was the first change this module's existence
+// forced on the driver.
+//
+// Run the tests:  jestyrc test examples/std/test.jtr
+
+// These names are plain again. They were briefly prefixed `B_`, because a module
+// `const` used to be emitted under its BARE C name: `std/path` also declares
+// `BACKSLASH`, and any program importing both modules died with `error:
+// redefinition of 'j_BACKSLASH'` in the generated C — an odd asymmetry, since
+// modules-v2 already let two modules share a non-generic *struct* name. Consts are
+// now canon'd by module like functions and types are, so the prefix is unnecessary
+// and the collision is a non-event.
+const NL: i32 = 10          // '\n'
+const CR: i32 = 13          // '\r'
+const TAB: i32 = 9          // '\t'
+const QUOTE: i32 = 34       // '"'
+const BACKSLASH: i32 = 92   // '\'
+const ZERO: i32 = 48        // '0'
+const MINUS: i32 = 45       // '-'
+const LOW: i32 = 32         // first printable byte
+const HIGH: i32 = 127       // first non-printable byte above the ASCII range
+
+// The most escaped bytes of a single value a failure message will show. Longer
+// values are cut at a whole escape unit and marked `...` *outside* the quotes,
+// so the marker can never be mistaken for literal dots in the value.
+const SHOW_MAX: usize = 96
+
+// The most differing lines `eq_golden_all` will list before summarizing the rest,
+// so a wholly-changed golden cannot flood the report buffer.
+const DIFF_MAX: usize = 8
+
+// The recorder. Counters only — see the header on why the report buffer is not a
+// field. `lost` counts report bytes that did not fit, so an undersized buffer is
+// a reported fact rather than silent truncation.
+pub struct Check {
+    checks: i64,
+    failures: i64,
+    used: usize,
+    lost: usize,
+}
+
+// A fresh recorder: no checks, no failures, an empty report.
+@no_alloc pub fn new() -> Check {
+    return Check{ checks: 0, failures: 0, used: 0, lost: 0 }
+}
+
+// ------------------------------------------------------------------- the sink
+//
+// A minimal byte sink over a caller buffer. This is deliberately the smallest
+// thing that could be called a writer; a real `Writer` is a later slice, and
+// when it lands these three functions are what it replaces.
+
+@no_alloc fn put(mut c: Check, mut rep: []u8, ch: i32) {
+    if c.used >= rep.len {
+        c.lost = c.lost + 1
+        return
+    }
+    rep[c.used] = ch as u8
+    c.used = c.used + 1
+}
+
+// Module-authored ASCII text — labels and punctuation, never user data (user
+// data goes through `put_value`, which escapes it).
+@no_alloc fn puts(mut c: Check, mut rep: []u8, read s: str) {
+    for i in 0..s.len {
+        put(c, rep, s[i] as i32)
+    }
+}
+
+// Begin a new report line. `\n` SEPARATES lines rather than terminating them, so
+// the report never ends with one. That matters because `print_str` supplies its
+// own newline and the `@test` harness prints `test <name> ... ` without one: a
+// terminating newline would leave a blank line in the middle of the harness's
+// output for every failing test.
+@no_alloc fn line(mut c: Check, mut rep: []u8) {
+    if c.used > 0 { put(c, rep, NL) }
+}
+
+// A signed decimal, most-significant digit first. Never negates `v`, so
+// `i64`'s most negative value formats correctly instead of overflowing.
+@no_alloc fn put_i64(mut c: Check, mut rep: []u8, v: i64) {
+    if v == 0 {
+        put(c, rep, ZERO)
+        return
+    }
+    if v < 0 { put(c, rep, MINUS) }
+    // The largest power of ten no greater than |v|. 10^18 is the ceiling for
+    // any `i64`, so `p * 10` cannot overflow before the loop stops.
+    var p: i64 = 1
+    for v / p >= 10 or v / p <= -10 {
+        p = p * 10
+    }
+    for p > 0 {
+        var d: i64 = (v / p) % 10
+        if d < 0 { d = 0 - d }
+        put(c, rep, (ZERO as i64 + d) as i32)
+        p = p / 10
+    }
+}
+
+// ------------------------------------------------------------ value rendering
+
+// Does `ch` go into the output as itself? Backslash and quote do not (they would
+// make the rendering ambiguous), and neither does anything outside printable
+// ASCII.
+@no_alloc fn is_plain(ch: i32) -> bool {
+    if ch == BACKSLASH { return false }
+    if ch == QUOTE { return false }
+    return ch >= LOW and ch < HIGH
+}
+
+// The escaped width of one byte: 1 as itself, 2 for a named escape, 4 for `\xNN`.
+@no_alloc fn esc_width(ch: i32) -> usize {
+    if is_plain(ch) { return 1 }
+    if ch == BACKSLASH or ch == QUOTE { return 2 }
+    if ch == NL or ch == CR or ch == TAB { return 2 }
+    return 4
+}
+
+// One lowercase hex digit of `v`'s low nibble-selected half; `hi` picks which.
+@no_alloc fn hex_digit(v: i32, hi: bool) -> i32 {
+    var d: i32 = v % 16
+    if hi { d = (v / 16) % 16 }
+    if d < 10 { return ZERO + d }
+    return 87 + d          // 'a' is 97, and 97 - 10 == 87
+}
+
+// The exact number of bytes `escaped` needs for `v` — so a caller can size a
+// buffer instead of guessing, and so the two functions can be checked against
+// each other.
+@no_alloc pub fn escaped_len(read v: str) -> usize {
+    var n: usize = 0
+    for i in 0..v.len {
+        n = n + esc_width(v[i] as i32)
+    }
+    return n
+}
+
+// Write one escaped byte. The caller has already checked that it fits.
+@no_alloc fn put_esc_byte(mut c: Check, mut rep: []u8, ch: i32) {
+    if is_plain(ch) {
+        put(c, rep, ch)
+        return
+    }
+    put(c, rep, BACKSLASH)
+    if ch == BACKSLASH {
+        put(c, rep, BACKSLASH)
+        return
+    }
+    if ch == QUOTE {
+        put(c, rep, QUOTE)
+        return
+    }
+    if ch == NL {
+        put(c, rep, 110)         // 'n'
+        return
+    }
+    if ch == CR {
+        put(c, rep, 114)         // 'r'
+        return
+    }
+    if ch == TAB {
+        put(c, rep, 116)         // 't'
+        return
+    }
+    put(c, rep, 120)             // 'x'
+    put(c, rep, hex_digit(ch, true))
+    put(c, rep, hex_digit(ch, false))
+}
+
+// Render `v` into `dst` as printable ASCII, returning the byte count written.
+//
+// `\\`, `\"`, `\n`, `\r` and `\t` get named escapes; every other byte outside
+// printable ASCII becomes `\xNN` with lowercase hex. The output therefore
+// contains only bytes in 0x20..0x7e, whatever `v` held.
+//
+// Writing stops at the last WHOLE escape unit that fits, so a short `dst`
+// truncates cleanly and never emits half of an escape. `escaped_len(v)` is the
+// length that always fits; a shorter return value means it was cut.
+@no_alloc pub fn escaped(read v: str, mut dst: []u8) -> usize {
+    var c: Check = new()
+    var i: usize = 0
+    for i < v.len {
+        let ch: i32 = v[i] as i32
+        let w: usize = esc_width(ch)
+        if c.used + w > dst.len { return c.used }
+        put_esc_byte(c, dst, ch)
+        i = i + 1
+    }
+    return c.used
+}
+
+// An escaped but UNQUOTED run of bytes — for a check's name, which is
+// caller-supplied and therefore just as untrusted as a value, but reads badly in
+// quotes (`FAIL "base": got …`). Escaped rather than passed through `puts`
+// because a name carrying a `\n` would otherwise forge a report line, and a name
+// carrying a high byte would break the printable-ASCII invariant that lets
+// `std/test_report.finish` call `from_utf8` unconditionally. Not capped: a
+// truncated name is a failure you cannot identify, and `put` already bounds the
+// buffer.
+@no_alloc fn put_ident(mut c: Check, mut rep: []u8, read s: str) {
+    for i in 0..s.len {
+        put_esc_byte(c, rep, s[i] as i32)
+    }
+}
+
+// A quoted, escaped, length-capped value inside a report line.
+@no_alloc fn put_value(mut c: Check, mut rep: []u8, read v: str) {
+    put(c, rep, QUOTE)
+    var shown: usize = 0
+    var i: usize = 0
+    var cut: bool = false
+    for i < v.len {
+        let ch: i32 = v[i] as i32
+        let w: usize = esc_width(ch)
+        if shown + w > SHOW_MAX {
+            cut = true
+            break
+        }
+        put_esc_byte(c, rep, ch)
+        shown = shown + w
+        i = i + 1
+    }
+    put(c, rep, QUOTE)
+    if cut { puts(c, rep, "...") }
+}
+
+// ------------------------------------------------------------ line comparison
+//
+// "Line" means: bytes up to the next `\n`, with one trailing `\r` removed, and a
+// final `\n` at end of input closing the last line rather than opening an empty
+// one. That is exactly the pair of differences between the same golden file
+// checked out on Windows and on POSIX, and the reason a golden compare is not
+// just `str_eq`.
+
+// The index of the first `\n` at or after `from`; `s.len` when there is none.
+@no_alloc fn nl_at(read s: str, from: usize) -> usize {
+    var i: usize = from
+    for i < s.len {
+        if (s[i] as i32) == NL { return i }
+        i = i + 1
+    }
+    return s.len
+}
+
+// The content of the line beginning at `from`, without its `\n` or a `\r`
+// immediately before it. A view into `s`, valid only while `s` is.
+@no_alloc fn line_body(read s: str, from: usize) -> read str {
+    var e: usize = nl_at(s, from)
+    if e > from {
+        if (s[e - 1] as i32) == CR { e = e - 1 }
+    }
+    return s[from .. e]
+}
+
+// Where the line after the one beginning at `from` starts; `s.len` when that was
+// the last line. `from == s.len` means there are no more lines, which is what
+// makes a trailing newline optional rather than significant.
+@no_alloc fn line_next(read s: str, from: usize) -> usize {
+    let e: usize = nl_at(s, from)
+    if e == s.len { return s.len }
+    return e + 1
+}
+
+// How many logical lines `s` holds. "" is zero lines; "a" and "a\n" are both
+// one; "a\n\n" is two (the second is empty).
+@no_alloc pub fn line_count(read s: str) -> usize {
+    var at: usize = 0
+    var n: usize = 0
+    for at < s.len {
+        n = n + 1
+        at = line_next(s, at)
+    }
+    return n
+}
+
+// The 1-based number of the first line where `got` and `want` differ, or 0 when
+// they are line-wise equal. When one side simply ends first, that is the line
+// number just past its last — so the result is never more than
+// `min(line_count(got), line_count(want)) + 1`.
+//
+// Symmetric in its arguments, by construction: whichever side runs out, the
+// answer is the same line number.
+@no_alloc pub fn first_diff_line(read got: str, read want: str) -> usize {
+    var a: usize = 0
+    var b: usize = 0
+    var ln: usize = 0
+    for a < got.len or b < want.len {
+        ln = ln + 1
+        if a >= got.len { return ln }
+        if b >= want.len { return ln }
+        if str_eq(line_body(got, a), line_body(want, b)) == false { return ln }
+        a = line_next(got, a)
+        b = line_next(want, b)
+    }
+    return 0
+}
+
+// Are `got` and `want` the same text, line for line? Insensitive to `\r\n` vs
+// `\n` and to a missing final newline; sensitive to everything else.
+@no_alloc pub fn lines_eq(read got: str, read want: str) -> bool {
+    return first_diff_line(got, want) == 0
+}
+
+// ---------------------------------------------------------------- the queries
+
+// Did every expectation so far pass?
+@no_alloc pub fn passed(read c: Check) -> bool {
+    return c.failures == 0
+}
+
+// How many expectations have been recorded (passing and failing).
+@no_alloc pub fn checks(read c: Check) -> i64 {
+    return c.checks
+}
+
+// How many of them failed.
+@no_alloc pub fn failures(read c: Check) -> i64 {
+    return c.failures
+}
+
+// Bytes of report written so far — the length to view when printing it.
+@no_alloc pub fn report_len(read c: Check) -> usize {
+    return c.used
+}
+
+// Report bytes that did not fit the buffer. Non-zero means the report you are
+// reading is incomplete; the verdict is still correct.
+@no_alloc pub fn lost(read c: Check) -> usize {
+    return c.lost
+}
+
+// ----------------------------------------------------------- the expectations
+//
+// Each records one check, returns the verdict, and on failure appends exactly
+// one `\n`-terminated line beginning `FAIL <name>`. Returning the verdict lets a
+// test stop early (`if eq_i64(...) == false { return finish(c, raw) }`) without
+// the module deciding that for it.
+
+@no_alloc fn fail(mut c: Check, mut rep: []u8, read name: str) {
+    c.failures = c.failures + 1
+    line(c, rep)
+    puts(c, rep, "FAIL ")
+    put_ident(c, rep, name)
+}
+
+@no_alloc fn started(mut c: Check) {
+    c.checks = c.checks + 1
+}
+
+// Append a free-form note (escaped, so it cannot corrupt the report). Does not
+// count as a check and never changes the verdict — context, not an assertion.
+@no_alloc pub fn note(mut c: Check, mut rep: []u8, read text: str) {
+    line(c, rep)
+    puts(c, rep, "note: ")
+    put_value(c, rep, text)
+}
+
+// Append a `<checks> checks, <failures> failed` tally line. Formatting an `i64`
+// belongs to this (`core`, OS-free) half of the slice; PRINTING the result is
+// `std/test_report`'s job, which is why this writes into the report rather than
+// to stdout. Useful for a CLI driving `Check` outside the `@test` harness, where
+// nothing else would say how much ran.
+@no_alloc pub fn tally(mut c: Check, mut rep: []u8) {
+    line(c, rep)
+    put_i64(c, rep, c.checks)
+    puts(c, rep, " checks, ")
+    put_i64(c, rep, c.failures)
+    puts(c, rep, " failed")
+}
+
+@no_alloc pub fn is_true(mut c: Check, mut rep: []u8, read name: str, got: bool) -> bool {
+    started(c)
+    if got { return true }
+    fail(c, rep, name)
+    puts(c, rep, ": expected true")
+    return false
+}
+
+@no_alloc pub fn is_false(mut c: Check, mut rep: []u8, read name: str, got: bool) -> bool {
+    started(c)
+    if got == false { return true }
+    fail(c, rep, name)
+    puts(c, rep, ": expected false")
+    return false
+}
+
+@no_alloc pub fn eq_bool(mut c: Check, mut rep: []u8, read name: str, got: bool, want: bool) -> bool {
+    started(c)
+    if got == want { return true }
+    fail(c, rep, name)
+    puts(c, rep, ": got ")
+    if got { puts(c, rep, "true") } else { puts(c, rep, "false") }
+    puts(c, rep, " want ")
+    if want { puts(c, rep, "true") } else { puts(c, rep, "false") }
+    return false
+}
+
+@no_alloc pub fn eq_i64(mut c: Check, mut rep: []u8, read name: str, got: i64, want: i64) -> bool {
+    started(c)
+    if got == want { return true }
+    fail(c, rep, name)
+    puts(c, rep, ": got ")
+    put_i64(c, rep, got)
+    puts(c, rep, " want ")
+    put_i64(c, rep, want)
+    return false
+}
+
+@no_alloc pub fn ne_i64(mut c: Check, mut rep: []u8, read name: str, got: i64, avoid: i64) -> bool {
+    started(c)
+    if got != avoid { return true }
+    fail(c, rep, name)
+    puts(c, rep, ": got ")
+    put_i64(c, rep, got)
+    puts(c, rep, " want anything else")
+    return false
+}
+
+// The `usize` spelling, so call sites comparing a written-byte count or a
+// `dir_len` do not have to cast. Widths are compared, not the casts.
+@no_alloc pub fn eq_usize(mut c: Check, mut rep: []u8, read name: str, got: usize, want: usize) -> bool {
+    return eq_i64(c, rep, name, got as i64, want as i64)
+}
+
+@no_alloc pub fn eq_str(mut c: Check, mut rep: []u8, read name: str, read got: str, read want: str) -> bool {
+    started(c)
+    if str_eq(got, want) { return true }
+    fail(c, rep, name)
+    puts(c, rep, ": got ")
+    put_value(c, rep, got)
+    puts(c, rep, " want ")
+    put_value(c, rep, want)
+    return false
+}
+
+// Golden comparison: line-wise equality, with the failure naming the line.
+//
+// Two failure shapes, because the two causes want different information. When a
+// line's content differs you want the line and both versions; when one side ran
+// out you want the counts. Reporting only the first difference is deliberate —
+// a full diff needs an edit-distance algorithm and a place to put its output,
+// which is a later slice, not this one.
+@no_alloc pub fn eq_golden(mut c: Check, mut rep: []u8, read name: str, read got: str, read want: str) -> bool {
+    started(c)
+    let at: usize = first_diff_line(got, want)
+    if at == 0 { return true }
+    let gl: usize = line_count(got)
+    let wl: usize = line_count(want)
+    fail(c, rep, name)
+    if at > gl or at > wl {
+        puts(c, rep, ": got ")
+        put_i64(c, rep, gl as i64)
+        puts(c, rep, " lines, want ")
+        put_i64(c, rep, wl as i64)
+        puts(c, rep, " lines; first differs at line ")
+        put_i64(c, rep, at as i64)
+        return false
+    }
+    puts(c, rep, ": line ")
+    put_i64(c, rep, at as i64)
+    puts(c, rep, ": got ")
+    put_value(c, rep, line_at(got, at))
+    puts(c, rep, " want ")
+    put_value(c, rep, line_at(want, at))
+    return false
+}
+
+// How many lines differ, counting a line present in one side and absent from the
+// other. 0 exactly when `lines_eq`.
+//
+// THIS IS AN ALIGNED COMPARISON, NOT AN EDIT SCRIPT, and the difference matters
+// when you read the number. Line `i` is compared against line `i`, so inserting one
+// line at the top makes EVERY subsequent line differ and the count is the file
+// length, where a real diff would report a single insertion. Getting that right
+// needs an LCS table — O(n*m) storage, i.e. an allocator — which is exactly what a
+// `core`-tier module cannot have. A genuine edit-script diff belongs in an
+// allocator-taking tier above this one; until then this answers "how much of the
+// output moved", not "what would I have to change".
+@no_alloc pub fn diff_count(read got: str, read want: str) -> usize {
+    var a: usize = 0
+    var b: usize = 0
+    var n: usize = 0
+    for a < got.len or b < want.len {
+        if a >= got.len or b >= want.len {
+            // One side ran out: every remaining line of the other differs.
+            n = n + 1
+            if a < got.len { a = line_next(got, a) }
+            if b < want.len { b = line_next(want, b) }
+            continue
+        }
+        if str_eq(line_body(got, a), line_body(want, b)) == false { n = n + 1 }
+        a = line_next(got, a)
+        b = line_next(want, b)
+    }
+    return n
+}
+
+// Golden comparison that reports EVERY differing line rather than only the first —
+// the shape you want when a golden has genuinely moved and you need to see how far.
+//
+// The report is a header plus one indented line per difference, capped at
+// `DIFF_MAX` so a wholly-changed golden cannot flood the buffer:
+//
+//   FAIL out: 3 of 5 lines differ
+//     line 2: got "b" want "B"
+//     line 4: got "d" want "D"
+//     ... and 1 more differing line(s)
+//
+// Use `eq_golden` when you want the first difference only; that stays the default
+// because it is what you read while iterating. Read the caveat on `diff_count`
+// before trusting the ratio: this is an aligned comparison, so one inserted line
+// makes everything after it differ.
+@no_alloc pub fn eq_golden_all(mut c: Check, mut rep: []u8, read name: str, read got: str, read want: str) -> bool {
+    started(c)
+    let total: usize = diff_count(got, want)
+    if total == 0 { return true }
+    let gl: usize = line_count(got)
+    let wl: usize = line_count(want)
+    var most: usize = gl
+    if wl > most { most = wl }
+    fail(c, rep, name)
+    puts(c, rep, ": ")
+    put_i64(c, rep, total as i64)
+    puts(c, rep, " of ")
+    put_i64(c, rep, most as i64)
+    puts(c, rep, " lines differ")
+    var shown: usize = 0
+    var i: usize = 1
+    for i <= most {
+        if shown >= DIFF_MAX { break }
+        let g: str = line_at(got, i)
+        let w: str = line_at(want, i)
+        // `line_at` yields "" for an absent line, which is indistinguishable from a
+        // genuinely empty one — so compare presence explicitly rather than bodies.
+        var differs: bool = false
+        if i > gl or i > wl {
+            differs = true
+        } else {
+            differs = str_eq(g, w) == false
+        }
+        if differs {
+            line(c, rep)
+            puts(c, rep, "  line ")
+            put_i64(c, rep, i as i64)
+            puts(c, rep, ": got ")
+            put_value(c, rep, g)
+            puts(c, rep, " want ")
+            put_value(c, rep, w)
+            shown = shown + 1
+        }
+        i = i + 1
+    }
+    if total > shown {
+        line(c, rep)
+        puts(c, rep, "  ... and ")
+        put_i64(c, rep, (total - shown) as i64)
+        puts(c, rep, " more differing line(s)")
+    }
+    return false
+}
+
+// The body of the 1-based line `n`, or "" when there is no such line. O(n) —
+// only ever called on the failure path, where a second scan is free.
+@no_alloc fn line_at(read s: str, n: usize) -> read str {
+    var at: usize = 0
+    var k: usize = 1
+    for at < s.len {
+        if k == n { return line_body(s, at) }
+        at = line_next(s, at)
+        k = k + 1
+    }
+    return s[0 .. 0]
+}
+
+// ---------------------------------------------------------------------- tests
+//
+// `jestyrc test examples/std/test.jtr` is the whole unit layer. This module tests
+// itself with itself where that is honest — the primitives (`escaped`,
+// `first_diff_line`) are checked with plain comparisons first, and only then used
+// to check the expectations.
+//
+// COLOCATED, unlike `std/path`'s suite, which lives in a sibling
+// `path_test.jtr`. A `@test` function is emitted into every program importing its
+// module, so a suite colocated in a library leaks into that library's consumers —
+// which is why `std/path` (a `core` module with real consumers) moved its out. The
+// exception applies here: everything that imports `std/test` is itself a test, and
+// already allocates and prints. Nothing is protected by moving these out.
+
+@test fn escaped_names_the_control_bytes() -> bool {
+    var raw: *mut u8 = alloc(u8, 64)
+    var dst: []u8 = slice(u8, raw, 64)
+    var ok: bool = true
+
+    var n: usize = escaped("a\nb", dst)
+    if str_eq(from_utf8(slice(u8, raw, n)), "a\\nb") == false { ok = false }
+
+    n = escaped("x\ty\r", dst)
+    if str_eq(from_utf8(slice(u8, raw, n)), "x\\ty\\r") == false { ok = false }
+
+    n = escaped("q\"q", dst)
+    if str_eq(from_utf8(slice(u8, raw, n)), "q\\\"q") == false { ok = false }
+
+    n = escaped("plain", dst)
+    if str_eq(from_utf8(slice(u8, raw, n)), "plain") == false { ok = false }
+
+    n = escaped("", dst)
+    if n != 0 { ok = false }
+
+    free_ptr(raw)
+    return ok
+}
+
+// A byte outside printable ASCII becomes `\xNN`. The input is a two-byte UTF-8
+// sequence (U+00E9), so this also pins that escaping is byte-wise and not
+// codepoint-wise — a failure message shows you the bytes you actually have.
+@test fn escaped_hexes_the_rest() -> bool {
+    var raw: *mut u8 = alloc(u8, 64)
+    var dst: []u8 = slice(u8, raw, 64)
+    var ok: bool = true
+
+    let n: usize = escaped("é", dst)
+    if str_eq(from_utf8(slice(u8, raw, n)), "\\xc3\\xa9") == false { ok = false }
+    if escaped_len("é") != 8 { ok = false }
+
+    free_ptr(raw)
+    return ok
+}
+
+@test fn escaped_len_agrees_with_escaped() -> bool {
+    var raw: *mut u8 = alloc(u8, 64)
+    var dst: []u8 = slice(u8, raw, 64)
+    var ok: bool = true
+
+    if escaped("a\nb", dst) != escaped_len("a\nb") { ok = false }
+    if escaped("plain", dst) != escaped_len("plain") { ok = false }
+    if escaped_len("") != 0 { ok = false }
+
+    free_ptr(raw)
+    return ok
+}
+
+// A short destination stops at a whole escape unit: three bytes cannot hold
+// `a` plus `\n`, so only `a` is written rather than a dangling backslash.
+@test fn escaped_truncates_at_a_whole_unit() -> bool {
+    var raw: *mut u8 = alloc(u8, 8)
+    var dst: []u8 = slice(u8, raw, 2)
+    var ok: bool = true
+
+    let n: usize = escaped("a\nb", dst)
+    if n != 1 { ok = false }
+    if str_eq(from_utf8(slice(u8, raw, n)), "a") == false { ok = false }
+
+    free_ptr(raw)
+    return ok
+}
+
+@test fn line_count_makes_the_final_newline_optional() -> bool {
+    if line_count("") != 0 { return false }
+    if line_count("a") != 1 { return false }
+    if line_count("a\n") != 1 { return false }
+    if line_count("a\nb") != 2 { return false }
+    if line_count("a\nb\n") != 2 { return false }
+    if line_count("a\n\n") != 2 { return false }
+    return line_count("\n") == 1
+}
+
+@test fn lines_eq_ignores_crlf_and_the_last_newline() -> bool {
+    if lines_eq("a\r\nb\r\n", "a\nb") == false { return false }
+    if lines_eq("a\nb\n", "a\nb") == false { return false }
+    if lines_eq("a", "a") == false { return false }
+    if lines_eq("", "") == false { return false }
+    // ...and is sensitive to everything else, including a blank line that only
+    // exists on one side.
+    if lines_eq("a\n\n", "a") { return false }
+    if lines_eq("a b", "a  b") { return false }
+    return lines_eq("", "\n") == false
+}
+
+@test fn first_diff_line_points_at_the_line() -> bool {
+    if first_diff_line("a\nb\nc", "a\nb\nc") != 0 { return false }
+    if first_diff_line("a\nX\nc", "a\nb\nc") != 2 { return false }
+    if first_diff_line("X\nb", "a\nb") != 1 { return false }
+    // One side ends first: the answer is the line just past its last.
+    if first_diff_line("a\nb", "a") != 2 { return false }
+    if first_diff_line("a", "a\nb") != 2 { return false }
+    return first_diff_line("", "a") == 1
+}
+
+// Symmetry is a claim the doc comment makes and the two early-return guards
+// could plausibly break, so it is pinned rather than assumed.
+@test fn first_diff_line_is_symmetric() -> bool {
+    if first_diff_line("a\nb", "a") != first_diff_line("a", "a\nb") { return false }
+    if first_diff_line("X\nb", "a\nb") != first_diff_line("a\nb", "X\nb") { return false }
+    return first_diff_line("", "a") == first_diff_line("a", "")
+}
+
+// From here on the module is used to test itself. A passing expectation must
+// leave the report untouched and the verdict clean.
+@test fn a_passing_check_writes_nothing() -> bool {
+    var raw: *mut u8 = alloc(u8, 256)
+    var rep: []u8 = slice(u8, raw, 256)
+    var c: Check = new()
+    var ok: bool = true
+
+    if eq_i64(c, rep, "n", 7, 7) == false { ok = false }
+    if eq_str(c, rep, "s", "x", "x") == false { ok = false }
+    if is_true(c, rep, "t", true) == false { ok = false }
+    if eq_bool(c, rep, "b", false, false) == false { ok = false }
+
+    if report_len(c) != 0 { ok = false }
+    if checks(c) != 4 { ok = false }
+    if failures(c) != 0 { ok = false }
+    if passed(c) == false { ok = false }
+    if lost(c) != 0 { ok = false }
+
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_failing_check_says_what_and_why() -> bool {
+    var raw: *mut u8 = alloc(u8, 256)
+    var rep: []u8 = slice(u8, raw, 256)
+    var c: Check = new()
+    var ok: bool = true
+
+    if eq_i64(c, rep, "count", 3, 4) { ok = false }
+    if str_eq(from_utf8(slice(u8, raw, report_len(c))), "FAIL count: got 3 want 4") == false { ok = false }
+    if failures(c) != 1 { ok = false }
+    if passed(c) { ok = false }
+
+    free_ptr(raw)
+    return ok
+}
+
+// The point of escaping: two values that print identically are shown to differ.
+@test fn a_failing_str_check_escapes_the_values() -> bool {
+    var raw: *mut u8 = alloc(u8, 256)
+    var rep: []u8 = slice(u8, raw, 256)
+    var c: Check = new()
+    var ok: bool = true
+
+    eq_str(c, rep, "line", "a\r", "a")
+    if str_eq(from_utf8(slice(u8, raw, report_len(c))), "FAIL line: got \"a\\r\" want \"a\"") == false { ok = false }
+
+    free_ptr(raw)
+    return ok
+}
+
+@test fn negative_and_extreme_numbers_format() -> bool {
+    var raw: *mut u8 = alloc(u8, 256)
+    var rep: []u8 = slice(u8, raw, 256)
+    var c: Check = new()
+    var ok: bool = true
+
+    eq_i64(c, rep, "n", -42, 0)
+    if str_eq(from_utf8(slice(u8, raw, report_len(c))), "FAIL n: got -42 want 0") == false { ok = false }
+
+    // The most negative `i64`: formatted without ever negating it.
+    var c2: Check = new()
+    var raw2: *mut u8 = alloc(u8, 256)
+    var rep2: []u8 = slice(u8, raw2, 256)
+    eq_i64(c2, rep2, "m", -9223372036854775807 - 1, 0)
+    if str_eq(from_utf8(slice(u8, raw2, report_len(c2))), "FAIL m: got -9223372036854775808 want 0") == false { ok = false }
+
+    free_ptr(raw2)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn golden_failure_names_the_line() -> bool {
+    var raw: *mut u8 = alloc(u8, 256)
+    var rep: []u8 = slice(u8, raw, 256)
+    var c: Check = new()
+    var ok: bool = true
+
+    eq_golden(c, rep, "out", "a\nX\nc", "a\nb\nc")
+    if str_eq(from_utf8(slice(u8, raw, report_len(c))), "FAIL out: line 2: got \"X\" want \"b\"") == false { ok = false }
+
+    free_ptr(raw)
+    return ok
+}
+
+@test fn golden_failure_names_the_counts_when_a_side_ends() -> bool {
+    var raw: *mut u8 = alloc(u8, 256)
+    var rep: []u8 = slice(u8, raw, 256)
+    var c: Check = new()
+    var ok: bool = true
+
+    eq_golden(c, rep, "out", "a\nb", "a")
+    let want: str = "FAIL out: got 2 lines, want 1 lines; first differs at line 2"
+    if str_eq(from_utf8(slice(u8, raw, report_len(c))), want) == false { ok = false }
+
+    free_ptr(raw)
+    return ok
+}
+
+// A golden that only differs by line endings passes, which is the whole reason
+// `eq_golden` exists rather than `eq_str`.
+@test fn golden_accepts_crlf() -> bool {
+    var raw: *mut u8 = alloc(u8, 256)
+    var rep: []u8 = slice(u8, raw, 256)
+    var c: Check = new()
+    var ok: bool = true
+
+    if eq_golden(c, rep, "out", "a\r\nb\r\n", "a\nb") == false { ok = false }
+    if report_len(c) != 0 { ok = false }
+
+    free_ptr(raw)
+    return ok
+}
+
+// An undersized report buffer must not corrupt the verdict, and must say that
+// it dropped bytes rather than pretend the report is whole.
+@test fn a_short_report_buffer_is_reported_not_hidden() -> bool {
+    var raw: *mut u8 = alloc(u8, 64)
+    var rep: []u8 = slice(u8, raw, 8)
+    var c: Check = new()
+    var ok: bool = true
+
+    eq_i64(c, rep, "count", 3, 4)          // wants 25 bytes, has 8
+    if report_len(c) != 8 { ok = false }
+    if lost(c) == 0 { ok = false }
+    if failures(c) != 1 { ok = false }     // the verdict survives
+    if passed(c) { ok = false }
+
+    free_ptr(raw)
+    return ok
+}
+
+// A long value is cut at a whole escape unit, with the marker outside the quotes
+// so it cannot be confused with dots in the value.
+@test fn a_long_value_is_capped() -> bool {
+    var raw: *mut u8 = alloc(u8, 1024)
+    var rep: []u8 = slice(u8, raw, 1024)
+    var c: Check = new()
+    var big: *mut u8 = alloc(u8, 400)
+    var bigs: []u8 = slice(u8, big, 400)
+    for i in 0..400 { bigs[i] = 97 }       // 400 * 'a'
+    var ok: bool = true
+
+    eq_str(c, rep, "v", from_utf8(slice(u8, big, 400)), "")
+    let got: str = from_utf8(slice(u8, raw, report_len(c)))
+    // `FAIL v: got "` (13) + SHOW_MAX shown + `"...` (4) + ` want ""` (8)
+    let head: usize = 13 + SHOW_MAX
+    if got.len != head + 4 + 8 { ok = false }
+    // The cut marker sits OUTSIDE the closing quote, so it can never be read as
+    // dots belonging to the value.
+    if str_eq(got[head .. head + 4], "\"...") == false { ok = false }
+    if lost(c) != 0 { ok = false }
+
+    free_ptr(big)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn note_records_context_without_a_verdict() -> bool {
+    var raw: *mut u8 = alloc(u8, 256)
+    var rep: []u8 = slice(u8, raw, 256)
+    var c: Check = new()
+    var ok: bool = true
+
+    note(c, rep, "seed 7")
+    if str_eq(from_utf8(slice(u8, raw, report_len(c))), "note: \"seed 7\"") == false { ok = false }
+    if checks(c) != 0 { ok = false }
+    if passed(c) == false { ok = false }   // a note is not a failure
+
+    free_ptr(raw)
+    return ok
+}
+
+// Regression: a check's NAME is caller data too, so it is escaped like a value.
+// An earlier version wrote it through `puts` (the module-authored-text path), so
+// a name containing a newline forged an extra `FAIL` line into the report, and a
+// name containing a high byte would have broken the printable-ASCII invariant
+// that lets `std/test_report.finish` call `from_utf8` unconditionally. The
+// property tests could not have caught this: they check the primitives, and the
+// hole was in a caller of them.
+@test fn a_check_name_cannot_forge_a_report_line() -> bool {
+    var raw: *mut u8 = alloc(u8, 256)
+    var rep: []u8 = slice(u8, raw, 256)
+    var c: Check = new()
+    var ok: bool = true
+
+    eq_i64(c, rep, "a\nFAIL forged", 1, 2)
+    let got: str = from_utf8(slice(u8, raw, report_len(c)))
+    if str_eq(got, "FAIL a\\nFAIL forged: got 1 want 2") == false { ok = false }
+    // One failure, one line: the newline never made it through as a newline.
+    if failures(c) != 1 { ok = false }
+    for i in 0..got.len {
+        if (got[i] as i32) == 10 { ok = false }
+    }
+
+    free_ptr(raw)
+    return ok
+}
+
+// `\n` separates report lines rather than terminating them, so the report never
+// ends with one — pinned here because `std/test_report.finish` depends on it to
+// avoid a blank line in the harness's output.
+@test fn the_report_never_ends_with_a_newline() -> bool {
+    var raw: *mut u8 = alloc(u8, 256)
+    var rep: []u8 = slice(u8, raw, 256)
+    var c: Check = new()
+    var ok: bool = true
+
+    eq_i64(c, rep, "a", 1, 2)
+    eq_i64(c, rep, "b", 3, 4)
+    let got: str = from_utf8(slice(u8, raw, report_len(c)))
+    if str_eq(got, "FAIL a: got 1 want 2\nFAIL b: got 3 want 4") == false { ok = false }
+    if (got[got.len - 1] as i32) == 10 { ok = false }
+
+    free_ptr(raw)
+    return ok
+}
+
+@test fn tally_counts_what_ran() -> bool {
+    var raw: *mut u8 = alloc(u8, 256)
+    var rep: []u8 = slice(u8, raw, 256)
+    var c: Check = new()
+    var ok: bool = true
+
+    eq_i64(c, rep, "a", 1, 1)
+    eq_i64(c, rep, "b", 1, 2)
+    tally(c, rep)
+    let want: str = "FAIL b: got 1 want 2\n2 checks, 1 failed"
+    if str_eq(from_utf8(slice(u8, raw, report_len(c))), want) == false { ok = false }
+
+    // A clean run's tally is the whole report — the tally itself is not a check.
+    var c2: Check = new()
+    var raw2: *mut u8 = alloc(u8, 256)
+    var rep2: []u8 = slice(u8, raw2, 256)
+    eq_i64(c2, rep2, "a", 1, 1)
+    tally(c2, rep2)
+    if str_eq(from_utf8(slice(u8, raw2, report_len(c2))), "1 checks, 0 failed") == false { ok = false }
+
+    free_ptr(raw2)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn diff_count_counts_every_differing_line() -> bool {
+    if diff_count("a\nb\nc", "a\nb\nc") != 0 { return false }
+    if diff_count("a\nX\nc", "a\nb\nc") != 1 { return false }
+    if diff_count("X\nY\nZ", "a\nb\nc") != 3 { return false }
+    // A line present on one side only counts as differing.
+    if diff_count("a\nb", "a") != 1 { return false }
+    if diff_count("a", "a\nb\nc") != 2 { return false }
+    if diff_count("", "") != 0 { return false }
+    // Agrees with `lines_eq` at zero, which is the coupling that matters.
+    if diff_count("a\r\nb", "a\nb") != 0 { return false }
+    return diff_count("", "a") == 1
+}
+
+// The documented limitation, asserted rather than merely described: this is an
+// ALIGNED comparison, so one inserted line makes every following line differ. A
+// real edit-script diff would call this a single insertion. If someone later
+// implements LCS in an allocator-taking tier, this test is the one that should
+// change — and it should change deliberately.
+@test fn diff_count_is_aligned_not_an_edit_script() -> bool {
+    // "x" inserted at the top: all four lines are now misaligned.
+    if diff_count("x\na\nb\nc", "a\nb\nc") != 4 { return false }
+    // ...whereas a genuine single-line edit really is one.
+    return diff_count("a\nX\nc", "a\nb\nc") == 1
+}
+
+@test fn eq_golden_all_lists_each_difference() -> bool {
+    var raw: *mut u8 = alloc(u8, 1024)
+    var rep: []u8 = slice(u8, raw, 1024)
+    var c: Check = new()
+    var ok: bool = true
+
+    eq_golden_all(c, rep, "out", "a\nX\nc\nY", "a\nb\nc\nd")
+    let want: str = "FAIL out: 2 of 4 lines differ\n  line 2: got \"X\" want \"b\"\n  line 4: got \"Y\" want \"d\""
+    if str_eq(from_utf8(rep[0 .. report_len(c)]), want) == false { ok = false }
+
+    // An equal pair writes nothing and passes, like every other expectation.
+    var c2: Check = new()
+    var raw2: *mut u8 = alloc(u8, 256)
+    var rep2: []u8 = slice(u8, raw2, 256)
+    if eq_golden_all(c2, rep2, "same", "a\r\nb\r\n", "a\nb") == false { ok = false }
+    if report_len(c2) != 0 { ok = false }
+
+    free_ptr(raw2)
+    free_ptr(raw)
+    return ok
+}
+
+// A wholly-changed golden is summarized rather than dumped: DIFF_MAX lines, then a
+// count of the rest. Without the cap a 500-line golden would fill any buffer and
+// `lost` would start eating the report.
+@test fn eq_golden_all_caps_the_listing() -> bool {
+    var raw: *mut u8 = alloc(u8, 2048)
+    var rep: []u8 = slice(u8, raw, 2048)
+    var c: Check = new()
+    var ok: bool = true
+
+    // 12 lines, all different: 8 listed, 4 summarized.
+    let g: str = "0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11"
+    let w: str = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl"
+    eq_golden_all(c, rep, "big", g, w)
+    let got: str = from_utf8(rep[0 .. report_len(c)])
+    if line_count(got) != 1 + 8 + 1 { ok = false }      // header + 8 + summary
+    if str_eq(line_at(got, 1), "FAIL big: 12 of 12 lines differ") == false { ok = false }
+    if str_eq(line_at(got, 10), "  ... and 4 more differing line(s)") == false { ok = false }
+    if lost(c) != 0 { ok = false }
+
+    free_ptr(raw)
+    return ok
+}
+
+@test fn ne_and_is_false_report_too() -> bool {
+    var raw: *mut u8 = alloc(u8, 256)
+    var rep: []u8 = slice(u8, raw, 256)
+    var c: Check = new()
+    var ok: bool = true
+
+    if ne_i64(c, rep, "d", 5, 4) == false { ok = false }
+    if ne_i64(c, rep, "d", 4, 4) { ok = false }
+    if is_false(c, rep, "f", false) == false { ok = false }
+    if is_false(c, rep, "f", true) { ok = false }
+    if eq_usize(c, rep, "u", 4, 4) == false { ok = false }
+    if failures(c) != 2 { ok = false }
+    let want: str = "FAIL d: got 4 want anything else\nFAIL f: expected false"
+    if str_eq(from_utf8(slice(u8, raw, report_len(c))), want) == false { ok = false }
+
+    free_ptr(raw)
+    return ok
+}

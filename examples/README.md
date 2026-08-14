@@ -124,7 +124,9 @@ read them in this order for a guided tour:
 ## Arrays, slices, ranges
 
 `arrays.jtr`, `array_lit.jtr`, `slices.jtr` (bounds-checked fat pointers),
-`ranges.jtr`.
+`ranges.jtr`, `slice_range.jtr` (`xs[lo .. hi]` on a `[]T` — a narrower view of
+the same buffer, no copy; closed, open-ended, inclusive and empty forms, with
+bounds asserted).
 
 ## Loops
 
@@ -183,7 +185,8 @@ The self-hosted compiler and the standard library, all in Jestyr:
   → `escape.jtr` → `cgen.jtr` (which also contains the module loader and
   the gcc driver). The `*_cli.jtr` files are their stage-dump entry points.
 * **The stdlib:** `core.jtr`, `mem.jtr`, `io.jtr`, `list.jtr`, `fs.jtr`,
-  `env.jtr`, `path.jtr`, `strmap.jtr`, `intern.jtr`, `combinators.jtr`,
+  `env.jtr`, `path.jtr`, `test.jtr`, `test_report.jtr`, `strmap.jtr`,
+  `intern.jtr`, `combinators.jtr`,
   `slice_algos.jtr`. See [docs/stdlib-roadmap.md](../docs/stdlib-roadmap.md)
   for the tiers (`core` / `mem` / `std` / `sys` / `parallel`), what is
   planned next, and what is deliberately staying out.
@@ -200,8 +203,55 @@ The self-hosted compiler and the standard library, all in Jestyr:
     `is_abs`, `dir_len`, `join`, `normalize`. Every function is `@no_alloc`,
     so "path handling never allocates" is proven rather than promised:
     queries return `read str` views into the argument, and composition writes
-    into a caller buffer. It also ships its own `@test` suite —
-    `jestyrc test examples/std/path.jtr`. Worked examples in `path_demo.jtr`.
+    into a caller buffer. Its suite is the sibling `path_test.jtr` (written with
+    `std/test`) — `jestyrc test examples/std/path_test.jtr`, 11 tests. It is a
+    *separate file* because a `@test` function is emitted into every consumer of
+    its module, so colocating a suite would put the test code, and
+    `test_report`'s `printf`, into everything importing `std/path` — see that
+    file's header. Worked examples in `path_demo.jtr`.
+  * `test.jtr` + `test_report.jtr` are expectations and golden comparison for
+    the `@test` harness, split across the tier boundary on purpose. `test.jtr`
+    is `core` — zero imports, every function `@no_alloc`, and it cannot print:
+    a `Check` handle counts, and failure text is rendered into a `[]u8` the
+    caller supplies. `test_report.jtr` is the `std` half and the only file in
+    the slice that performs an effect (`finish`/`dump` print; `exit_code`
+    doesn't). `eq_golden` compares line-wise, insensitive to CRLF and to a
+    missing final newline, and names the line that differs; `escaped` renders
+    arbitrary bytes as printable ASCII so a failure message can show you the
+    trailing `\r`. `eq_golden_all` reports *every* differing line (capped) when a
+    golden has moved wholesale — an aligned line comparison, not an edit script, so
+    one inserted line makes everything after it differ. Worked examples in
+    `test_demo.jtr`; own suite via `jestyrc test examples/std/test.jtr`.
+  * `test_fixture.jtr` is the third file of that slice and the other hosted one: it
+    *fetches* what a test compares. `temp_path` names a file in the OS temp
+    directory (`TMPDIR`, else `TEMP`/`TMP`, else `.`), and `capture` runs a command
+    with both streams redirected into a file — which is how an expected-diagnostic
+    test works without a compiler-as-library: run `jestyrc check bad.jtr`, read the
+    file, `eq_golden_all` it. The compiler path is the caller's to supply, on
+    purpose. Captures go through the `Process` capability, so a `denied()` handle
+    writes nothing. No temp *directories* — that needs a `mkdir` intrinsic.
+    `test_fixture_demo.jtr`, suite in `test_fixture_test.jtr`.
+  * **The four Tier 2 capability handles** — `fs.Fs`, `time.Clock`, `env.Env` and
+    `process.Process` — sit beside the ambient free functions in their own modules.
+    Each restricted mode is chosen for a different reason: `time.manual(n)` for
+    *determinism* (a denied clock would be useless), `env.sealed()` to *prove a
+    negative* while still counting lookups, `fs.read_only()` because "read but don't
+    modify" is what a linter needs, and `process.denied()` to refuse while recording.
+    `caps_demo.jtr` is the argument for the design — a build stamp that is
+    byte-identical across two runs with deterministic handles and varies with
+    `host()` ones. Suites in `fs_test.jtr`, `env_test.jtr`, `time_test.jtr`.
+  * `process.jtr` runs external commands behind an explicit capability. (For the
+    `[]T` range-slicing that lets `test_report.finish` take a slice rather than a
+    raw pointer, see `slice_range.jtr` in the top-level examples.) A
+    `Process` value is the authority to spawn, so `fn build(mut p: Process, …)`
+    announces in its type that it may execute commands; `denied()` is a handle
+    that refuses everything while still *counting* the attempts, which is what
+    makes it useful in a test. It is not a sandbox — nothing stops direct
+    `run_command` — but it puts the authority where a reviewer sees it. Note
+    `run_ok` (== 0) is the portable API: `run` returns the raw `system()` status,
+    an exit code on Windows and a wait status on POSIX. `process_demo.jtr` proves
+    the refusal is real by running one file-creating command through each handle
+    kind and checking the filesystem; suite in `process_test.jtr`.
 * **Numerics & determinism:** `numbers.jtr`, `parse_float.jtr`,
   `format_float.jtr`, `float_bits.jtr`, `binned.jtr`, `reductions.jtr`,
   `numerics_canary.jtr` (the locked determinism canary), `sha256.jtr`

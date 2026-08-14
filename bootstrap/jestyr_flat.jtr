@@ -328,6 +328,126 @@ pub fn remove(path: str) -> bool {
     return remove_file(path)
 }
 
+// ---------------------------------------------------------- the Fs capability
+//
+// Everything above is ambient: any function can read or delete any file and no
+// signature says so. `Fs` is the same operations behind an explicit handle.
+//
+// THREE STATES, NOT TWO, because "read but do not modify" is a real thing to want
+// and not merely the midpoint of a symmetry. A formatter that must never write, a
+// linter, an analysis pass, `jestyrc check` itself — all of them read a tree and
+// must leave it alone, and `read_only()` makes that checkable instead of hoped for.
+// `denied()` is the third, for code that should touch no file at all.
+//
+//   host()       read ✓  write ✓  remove ✓
+//   read_only()  read ✓  write ✗  remove ✗
+//   denied()     read ✗  write ✗  remove ✗
+//
+// Refusals are COUNTED, not silent, so a test asserts both that nothing was written
+// and that the code tried — which is the difference between "it respected the
+// capability" and "it never got that far". A write refused through a read-only
+// handle returns false, the same answer a genuinely failed write gives, so `refused`
+// is the discriminator rather than the return value.
+//
+// Not enforcement: `write_file` stays reachable, and the self-hosted compiler calls
+// the ambient functions above directly. Those are the low-level layer — the shape a
+// `sys` tier will eventually own — and this is the layer above them. Same trade as
+// `std/process`, argued at length there.
+
+pub struct Fs {
+    can_read: bool,
+    can_write: bool,
+    reads: i64,
+    writes: i64,
+    refused: i64,
+}
+
+// Full access.
+pub fn host__fs() -> Fs {
+    return Fs{ can_read: true, can_write: true, reads: 0, writes: 0, refused: 0 }
+}
+
+// Reads allowed, mutation refused. The interesting one.
+pub fn read_only() -> Fs {
+    return Fs{ can_read: true, can_write: false, reads: 0, writes: 0, refused: 0 }
+}
+
+// No filesystem access at all.
+pub fn denied() -> Fs {
+    return Fs{ can_read: false, can_write: false, reads: 0, writes: 0, refused: 0 }
+}
+
+// Read the whole file at `path`. Through a handle that cannot read, this returns an
+// EMPTY owned String and counts a refusal — deliberately the same answer a missing
+// file gives, because a denied handle should be indistinguishable from an empty
+// world rather than a special error the caller has to learn. The caller owns the
+// result and `string_free`s it either way.
+pub fn open_text(mut f: Fs, path: str) -> String {
+    if f.can_read == false {
+        f.refused = f.refused + 1
+        return read_file("")
+    }
+    f.reads = f.reads + 1
+    return read_file(path)
+}
+
+// Write `data` to `path`. False (and a counted refusal) unless the handle allows
+// mutation.
+pub fn put(mut f: Fs, path: str, data: str) -> bool {
+    if f.can_write == false {
+        f.refused = f.refused + 1
+        return false
+    }
+    f.writes = f.writes + 1
+    return write_file(path, data)
+}
+
+// Does `path` exist? A read, so a denied handle answers false — an existence probe
+// is a read of the directory, and letting it through would leak the shape of a tree
+// the handle is supposed to hide.
+pub fn present__fs(mut f: Fs, path: str) -> bool {
+    if f.can_read == false {
+        f.refused = f.refused + 1
+        return false
+    }
+    f.reads = f.reads + 1
+    return file_exists(path)
+}
+
+// Delete `path`. Mutation, so refused by everything but `host`.
+pub fn erase(mut f: Fs, path: str) -> bool {
+    if f.can_write == false {
+        f.refused = f.refused + 1
+        return false
+    }
+    f.writes = f.writes + 1
+    return remove_file(path)
+}
+
+pub fn can_read(read f: Fs) -> bool {
+    return f.can_read
+}
+
+pub fn can_write(read f: Fs) -> bool {
+    return f.can_write
+}
+
+// Reads performed (including existence probes).
+pub fn reads(read f: Fs) -> i64 {
+    return f.reads
+}
+
+// Mutations performed.
+pub fn writes(read f: Fs) -> i64 {
+    return f.writes
+}
+
+// Operations this handle refused — the count that distinguishes "respected the
+// capability" from "never tried".
+pub fn refused(read f: Fs) -> i64 {
+    return f.refused
+}
+
 // std/env.jtr — the `std` process-environment tier: thin, named wrappers over the
 // command-line-argument intrinsics, so user code says `env.argc()` / `env.argv(i)`
 // instead of reaching for a bare compiler builtin. This is how a self-hosted compiler
@@ -371,6 +491,78 @@ pub fn get_or(read name: str, read fallback: str) -> read str {
 // The program's own path, as the OS reported it (`argv(0)`).
 pub fn program() -> str {
     return arg(0)
+}
+
+// --------------------------------------------------------- the Env capability
+//
+// Everything above is ambient: any function can read any variable and no signature
+// says so. `Env` is the same reads behind an explicit handle.
+//
+// THE RESTRICTED MODE PROVES A NEGATIVE, which is the point. A `sealed()` handle
+// reports every variable as unset while still COUNTING the lookups, so a test can
+// establish two different things: that a subsystem behaves identically without any
+// ambient configuration (pass it a sealed handle and compare output), and that it
+// nevertheless tried to read N variables (assert `lookups`). The first is a
+// reproducibility claim; the second tells you which claim you are actually making.
+//
+// This matters more than it looks for a compiler. A build that silently varies with
+// `CC` or `TMPDIR` is not reproducible, and the failure is invisible until someone
+// else's machine disagrees. Passing `sealed()` turns that into a test.
+//
+// Not enforcement — `env_var` stays reachable. It puts the dependency in the
+// signature. Same trade as `std/process`, argued at length there.
+
+pub struct Env {
+    sealed: bool,
+    lookups: i64,
+}
+
+// A handle onto the real process environment.
+pub fn host__env() -> Env {
+    return Env{ sealed: false, lookups: 0 }
+}
+
+// A handle that reports every variable as unset, counting the attempts. Hand this to
+// code that must not depend on ambient configuration.
+pub fn sealed() -> Env {
+    return Env{ sealed: true, lookups: 0 }
+}
+
+// The value of `name`, or "" when unset — or always "" through a sealed handle.
+// Named `lookup` because `get` above already owns the ambient spelling.
+pub fn lookup__env(mut e: Env, read name: str) -> str {
+    e.lookups = e.lookups + 1
+    if e.sealed { return "" }
+    return env_var(name)
+}
+
+// `lookup` with a default, the shape most configuration reading actually wants. A
+// sealed handle therefore yields `fallback` for everything, which is exactly the
+// "does this still work with no configuration at all" question.
+// (`-> read str` for the same reason `get_or` above needs it: `fallback` is a
+// second-class borrow, so returning it has to be declared. Note the return may
+// borrow from EITHER the environment or `fallback` — borrowed projection has no way
+// to say which, safety-mosaic item 2, and this is now its third stdlib consumer.)
+pub fn lookup_or(mut e: Env, read name: str, read fallback: str) -> read str {
+    let v: str = lookup__env(e, name)
+    if v.len > 0 { return v }
+    return fallback
+}
+
+// Is `name` set and non-empty? Always false through a sealed handle.
+pub fn present__env(mut e: Env, read name: str) -> bool {
+    return lookup__env(e, name).len > 0
+}
+
+// How many variables were looked up through this handle — the count a test asserts
+// to show a sealed run really did try to read configuration.
+pub fn lookups(read e: Env) -> i64 {
+    return e.lookups
+}
+
+// Does this handle hide the environment?
+pub fn is_sealed(read e: Env) -> bool {
+    return e.sealed
 }
 
 // std/list.jtr — a generic growable list, allocator-parameterized (design §16.1).
@@ -8606,7 +8798,15 @@ fn infer(mut c: Checker, read p: Parser, read src: str, id: i32) -> i32 {
         let bt: i32 = infer(c, p, src, d.a)
         infer(c, p, src, d.b)
         let bd: TyData = get__list(TyData, c.tys, bt as usize)
-        if bd.kind == 8 or bd.kind == 9 { r = bd.a }
+        // A RANGE index on a `[]T` re-slices to the same slice type (a narrower view
+        // of the same buffer); a plain index yields the element. Not extended to a
+        // fixed-size ARRAY (kind 9), whose sub-view would have to borrow the array's
+        // storage — that needs borrowed projection, not just a type.
+        if bd.kind == 8 {
+            let sx: ExprData = get__list(ExprData, p.ex, d.b as usize)
+            if sx.kind == 13 { r = bt } else { r = bd.a }
+        }
+        else if bd.kind == 9 { r = bd.a }
         else if bd.kind == 2 {
             if bd.x == 14 {
                 let ix: ExprData = get__list(ExprData, p.ex, d.b as usize)
@@ -12810,6 +13010,72 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
             return
         }
         if expr_is_slice(c, e.a) {                    // slice indexing
+            let sx: ExprData = get__list(ExprData, p.ex, e.b as usize)
+            if sx.kind == 13 {                        // Range -> a narrower view of the same buffer
+                // `{ ptr, len }` in, `{ ptr + lo, hi - lo }` out: pointer arithmetic and
+                // a subtraction, no copy. Emitted inline rather than as a runtime helper
+                // because it is generic in the element type. Bounds are asserted, so a
+                // bad range faults deterministically; no UTF-8 boundary check, unlike
+                // `str` -- a `[]T` has no encoding.
+                //
+                // The BASE emits before the temp is taken and lo/hi after, matching the
+                // reference's order so nested temps number identically.
+                var rb: String = string_new()
+                emit_expr(rb, p, src, c, g, e.a)
+                let n: i32 = g.tmp
+                g.tmp = g.tmp + 1
+                let sty: i32 = get__list(i32, c.et, e.a as usize)
+                var lob: String = string_new()
+                if sx.a >= 0 { emit_expr(lob, p, src, c, g, sx.a) } else { string_push(lob, "0") }
+                var hib: String = string_new()
+                if sx.b >= 0 {
+                    if sx.op == 1 {                   // inclusive `..=hi` -> ((hi) + 1)
+                        string_push(hib, "((")
+                        emit_expr(hib, p, src, c, g, sx.b)
+                        string_push(hib, ") + 1)")
+                    } else {
+                        emit_expr(hib, p, src, c, g, sx.b)
+                    }
+                } else {                              // open end -> the spilled `.len`
+                    string_push(hib, "_s")
+                    push_uint__cgen(hib, n as i64)
+                    string_push(hib, ".len")
+                }
+                string_push(sb, "({ ")
+                emit_ty_c(sb, p, src, c, sty)
+                string_push(sb, " _s")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, " = (")
+                string_push(sb, string_view(rb))
+                string_push(sb, "); size_t _lo")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, " = (size_t)(")
+                string_push(sb, string_view(lob))
+                string_push(sb, "); size_t _hi")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, " = (size_t)(")
+                string_push(sb, string_view(hib))
+                string_push(sb, "); assert(_lo")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, " <= _hi")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, " && _hi")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, " <= _s")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, ".len); (")
+                emit_ty_c(sb, p, src, c, sty)
+                string_push(sb, "){ _s")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, ".ptr + _lo")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, ", _hi")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, " - _lo")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, " }; })")
+                return
+            }
             if index_in_range(g, p, src, e.a, e.b) {  // refinement proved i < s.len: raw access
                 string_push(sb, "((")
                 emit_expr(sb, p, src, c, g, e.a)

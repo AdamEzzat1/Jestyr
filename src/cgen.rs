@@ -98,10 +98,16 @@ pub enum TestKind {
 /// `test_main`'s `runnable` predicate exactly (non-generic, backend-supported), so
 /// the list never names a test the harness would silently skip. Pure: needs no
 /// `TypeInfo` and never compiles, so `--list` is toolchain-free.
-pub fn list_tests(ast: &Ast) -> Vec<(String, TestKind)> {
+pub fn list_tests(ast: &Ast, item_mod: &[ModId]) -> Vec<(String, TestKind)> {
+    // Scoped to the named module exactly as `test_main` is, so `--list` never names
+    // a test the harness would not run. An empty `item_mod` (the single-module
+    // unit-test entry points, which have no loader) puts every item in module 0.
+    let own = |i: usize| item_mod.get(i).copied().unwrap_or(0) == 0;
     ast.items
         .iter()
-        .filter_map(|it| match it {
+        .enumerate()
+        .filter_map(|(i, it)| match it {
+            _ if !own(i) => None,
             Item::Fn(f) if is_generic_ast(ast, f) || !fn_supported_ast(ast, f) => None,
             Item::Fn(f) if f.has_attr("test") => Some((f.name.name.clone(), TestKind::Test)),
             Item::Fn(f) if f.has_attr("bench") => Some((f.name.name.clone(), TestKind::Bench)),
@@ -2450,7 +2456,15 @@ impl<'a> Cgen<'a> {
                     // Exported as a bare external symbol (no `static`, no `j_` prefix).
                     self.raw(format!("const {cty} {}{section} = {v};\n", c.name.name));
                 } else {
-                    self.raw(format!("static const {cty} j_{}{section} = {v};\n", c.name.name));
+                    // Canon'd like a function, because a `const` shares the *value*
+                    // namespace with them (`build_owner` notes both in `name_mods`).
+                    // Without this, two modules each declaring `const BACKSLASH` both
+                    // emitted `static const int32_t j_BACKSLASH`, and gcc rejected the
+                    // program — even though modules-v2 explicitly allows two modules
+                    // to share a non-generic *struct* name. `canon` renames only on a
+                    // real collision, so every collision-free program is unchanged.
+                    let cn = self.canon_fn(&c.name.name);
+                    self.raw(format!("static const {cty} j_{cn}{section} = {v};\n"));
                 }
             }
         }
@@ -3308,11 +3322,34 @@ impl<'a> Cgen<'a> {
         // first so it doesn't alias the `runnable` closure's borrow.
         let filter = self.test_filter.clone();
         let passes = |name: &str| filter.as_deref().is_none_or(|f| name.contains(f));
+        // Only the NAMED module's own tests, not its import closure's. `jestyrc test
+        // my_module.jtr` on a file importing `std/test` would otherwise also run
+        // that module's suite — and `jestyrc test examples/std/path_demo.jtr` used
+        // to run `std/path`'s eleven despite `path_demo.jtr` having none of its
+        // own. The root file is always module 0 (`Loader::load_file` registers it
+        // before merging any import), and `item_mod` defaults to 0 when absent, so
+        // a single-module AST — every `typeck::check` unit-test entry point —
+        // behaves exactly as before.
+        //
+        // NO PORT MIRROR IS OWED, unusually, and the reason is worth writing down
+        // because "zero C change" is normally not the same as "zero mirror owed".
+        // `examples/std/cgen.jtr` reaches test mode only through the single-file
+        // dump (`jc <file> test`, the golden path); its module loader is wired to
+        // `build`/`run`, which never emit a harness. So in the port every item is
+        // module 0 and this condition is vacuously true — the emitted C is
+        // identical on both sides without touching it. Anyone giving the port a
+        // real module-aware `test` subcommand owes the scoping then. Deliberately
+        // NOT noted in `cgen.jtr` itself: `flatten_selfhost_concat` edits raw
+        // source spans and so preserves comments, meaning a comment-only edit
+        // there would force a 28K-line bootstrap seed regeneration for no
+        // behavior change.
+        let own = |i: usize| self.item_module(i) == 0;
         let tests: Vec<String> = ast
             .items
             .iter()
-            .filter_map(|it| match it {
-                Item::Fn(f) if f.has_attr("test") && runnable(f) && passes(&f.name.name) => {
+            .enumerate()
+            .filter_map(|(i, it)| match it {
+                Item::Fn(f) if f.has_attr("test") && own(i) && runnable(f) && passes(&f.name.name) => {
                     Some(f.name.name.clone())
                 }
                 _ => None,
@@ -3321,8 +3358,9 @@ impl<'a> Cgen<'a> {
         let benches: Vec<String> = ast
             .items
             .iter()
-            .filter_map(|it| match it {
-                Item::Fn(f) if f.has_attr("bench") && runnable(f) && passes(&f.name.name) => {
+            .enumerate()
+            .filter_map(|(i, it)| match it {
+                Item::Fn(f) if f.has_attr("bench") && own(i) && runnable(f) && passes(&f.name.name) => {
                     Some(f.name.name.clone())
                 }
                 _ => None,
@@ -4802,7 +4840,15 @@ impl<'a> Cgen<'a> {
                     // A `@no_mangle` const is referenced by its bare exported name.
                     n.name.clone()
                 } else {
-                    format!("j_{}", n.name)
+                    // `call_sym` carries typeck's resolution for a bare name that
+                    // COLLIDES across modules — set only for a const or function the
+                    // current module owns, and only after `scope_lookup` has failed,
+                    // so a local shadowing the name still wins and emits bare. Absent
+                    // for every non-colliding name, which is why output is unchanged
+                    // for programs that do not collide.
+                    let cname =
+                        self.info.call_sym(id).map(String::from).unwrap_or_else(|| n.name.clone());
+                    format!("j_{cname}")
                 }
             }
             ExprKind::SelfValue => {
@@ -4966,6 +5012,39 @@ impl<'a> Cgen<'a> {
                             None => format!("({b}).len"),
                         };
                         return format!("jestyr_rt_substr({b}, {lo_c}, {hi_c})");
+                    }
+                }
+                // `xs[i..j]` on a `[]T` → a narrower view of the same buffer. The
+                // slice repr is `{ ptr, len }`, so this is pointer arithmetic and a
+                // subtraction, no copy — the direct analogue of `jestyr_rt_substr`,
+                // emitted inline because it is generic in the element type and a
+                // per-type runtime helper would be one function per instantiation.
+                //
+                // Bounds are asserted (`lo <= hi <= len`), which makes a bad range a
+                // deterministic fault rather than a view past the end. Unlike `str`
+                // there is no UTF-8 boundary check: `[]T` has no encoding.
+                if let Ty::Slice(_) = &bt {
+                    if let ExprKind::Range { lo, hi, inclusive } = &self.ast.expr_at(*index).kind {
+                        let (lo, hi, inclusive) = (*lo, *hi, *inclusive);
+                        let sty = self.c_type(&bt);
+                        let b = self.emit_expr(*base);
+                        let n = self.tmp;
+                        self.tmp += 1;
+                        let lo_c = lo.map(|e| self.emit_expr(e)).unwrap_or_else(|| "0".to_string());
+                        let hi_c = match hi {
+                            Some(e) => {
+                                let h = self.emit_expr(e);
+                                if inclusive { format!("(({h}) + 1)") } else { h }
+                            }
+                            None => format!("_s{n}.len"),
+                        };
+                        // `_s` is spilled first so `base` is evaluated once even when
+                        // the open-ended form reads its `.len`.
+                        return format!(
+                            "({{ {sty} _s{n} = ({b}); size_t _lo{n} = (size_t)({lo_c}); size_t _hi{n} = (size_t)({hi_c}); \
+                             assert(_lo{n} <= _hi{n} && _hi{n} <= _s{n}.len); \
+                             ({sty}){{ _s{n}.ptr + _lo{n}, _hi{n} - _lo{n} }}; }})"
+                        );
                     }
                 }
                 let proven = matches!(bt, Ty::Slice(_)) && self.index_in_range(*base, *index);

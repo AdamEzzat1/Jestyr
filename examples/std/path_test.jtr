@@ -1,0 +1,259 @@
+// std/path_test.jtr — the unit suite for `std/path`, written with `std/test`.
+//
+// WHY THIS IS A SEPARATE FILE, when `examples/README.md` says to colocate tests.
+// Colocation was measured and it leaks. A `@test` function is an ordinary function
+// with an attribute, so the C backend emits it — and everything it calls —
+// into every program that imports the module. Moving these eleven tests into
+// `path.jtr` and importing `std/test_report` put 2,300 lines of C and a `printf`
+// into `path_demo.jtr`, which is to say into every consumer of `std/path`. That
+// breaks exactly the property `path.jtr` works hardest to earn: it is a `core`
+// module, and `core` links on a freestanding target.
+//
+// (The old tests already leaked `malloc`/`free` the same way, for the same reason.
+// Nobody had noticed because nothing measured it. `path.jtr` is now back to zero
+// imports and zero test code, so its consumers are cleaner than before this file
+// existed.)
+//
+// THE RULE THIS SUGGESTS: a module with non-test consumers keeps its tests in a
+// sibling `*_test.jtr`. A module only ever imported BY tests — `std/test` itself —
+// may colocate, because its consumers allocate and print anyway. The alternative
+// is a compiler fix (stop emitting `@test`/`@bench` items in non-test mode, where
+// nothing can reach them), which would make colocation safe everywhere and shrink
+// every binary; it is a real emission change and is recorded as future work in
+// docs/stdlib-roadmap.md.
+//
+// This split only became clean once `jestyrc test` was scoped to the named module:
+// before that, running this file's suite would also have run `std/test`'s own 22.
+//
+// The case NAMES are the cases — `base(trailing-sep)`, not `base` — because in CI
+// output the name is the only thing identifying which of four assertions broke.
+//
+// Run:  jestyrc test examples/std/path_test.jtr
+//   →   11 passed; 0 failed
+
+import "path"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 512
+
+@test fn base_strips_the_directory() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_str(c, rep, "base(dir/file)", path.base("examples/std/core.jtr"), "core.jtr")
+    test.eq_str(c, rep, "base(bare)", path.base("bare.txt"), "bare.txt")
+    test.eq_str(c, rep, "base(trailing-sep)", path.base("a/b/"), "")
+    test.eq_str(c, rep, "base(empty)", path.base(""), "")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn base_reads_both_separators() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_str(c, rep, "base(backslash)", path.base("a\\b\\c.jtr"), "c.jtr")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn dir_drops_the_trailing_separator() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_str(c, rep, "dir(a/b/c)", path.dir("a/b/c"), "a/b")
+    test.eq_str(c, rep, "dir(bare)", path.dir("c"), "")
+    test.eq_str(c, rep, "dir(/a)", path.dir("/a"), "/")
+    test.eq_str(c, rep, "dir(root)", path.dir("/"), "/")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn ext_ignores_dotfiles() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_str(c, rep, "ext(a/b.tar.gz)", path.ext("a/b.tar.gz"), "gz")
+    test.eq_str(c, rep, "ext(no-dot)", path.ext("README"), "")
+    test.eq_str(c, rep, "ext(dotfile)", path.ext(".bashrc"), "")
+    test.eq_str(c, rep, "ext(dot-in-dir-only)", path.ext("a.b/c"), "")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn stem_is_base_without_the_extension() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_str(c, rep, "stem(a/b.tar.gz)", path.stem("a/b.tar.gz"), "b.tar")
+    test.eq_str(c, rep, "stem(no-dot)", path.stem("README"), "README")
+    test.eq_str(c, rep, "stem(dotfile)", path.stem(".bashrc"), ".bashrc")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn is_abs_knows_roots_and_drives() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.is_true(c, rep, "is_abs(/etc)", path.is_abs("/etc"))
+    test.is_true(c, rep, "is_abs(drive)", path.is_abs("C:\\Users"))
+    test.is_false(c, rep, "is_abs(relative)", path.is_abs("rel/ative"))
+    test.is_false(c, rep, "is_abs(empty)", path.is_abs(""))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn dir_len_includes_the_separator() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_usize(c, rep, "dir_len(a/b/c)", path.dir_len("a/b/c"), 4)
+    test.eq_usize(c, rep, "dir_len(bare)", path.dir_len("bare"), 0)
+    test.eq_usize(c, rep, "dir_len(/x)", path.dir_len("/x"), 1)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn join_composes_one_separator() -> bool {
+    var raw: *mut u8 = alloc(u8, 128)
+    var buf: []u8 = slice(u8, raw, 128)
+    var rraw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, rraw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var n: usize = path.join("examples/std", "path.jtr", buf)
+    test.eq_str(c, rep, "join(needs-sep)", from_utf8(slice(u8, raw, n)), "examples/std/path.jtr")
+
+    n = path.join("examples/std/", "path.jtr", buf)        // already separated
+    test.eq_str(c, rep, "join(has-sep)", from_utf8(slice(u8, raw, n)), "examples/std/path.jtr")
+
+    n = path.join("ignored", "/abs/olute", buf)            // absolute rhs wins
+    test.eq_str(c, rep, "join(abs-rhs)", from_utf8(slice(u8, raw, n)), "/abs/olute")
+
+    n = path.join("", "solo", buf)
+    test.eq_str(c, rep, "join(empty-lhs)", from_utf8(slice(u8, raw, n)), "solo")
+
+    n = path.join("solo", "", buf)
+    test.eq_str(c, rep, "join(empty-rhs)", from_utf8(slice(u8, raw, n)), "solo")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(rraw)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn normalize_collapses_and_cancels() -> bool {
+    var raw: *mut u8 = alloc(u8, 128)
+    var buf: []u8 = slice(u8, raw, 128)
+    var rraw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, rraw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var n: usize = path.normalize("a//b/./c", buf)
+    test.eq_str(c, rep, "norm(dup-sep-and-dot)", from_utf8(slice(u8, raw, n)), "a/b/c")
+
+    n = path.normalize("a/b/../c", buf)
+    test.eq_str(c, rep, "norm(dotdot)", from_utf8(slice(u8, raw, n)), "a/c")
+
+    n = path.normalize("a\\b/c", buf)                      // separators unify
+    test.eq_str(c, rep, "norm(sep-unify)", from_utf8(slice(u8, raw, n)), "a/b/c")
+
+    n = path.normalize("/../x", buf)                       // cannot rise above root
+    test.eq_str(c, rep, "norm(above-root)", from_utf8(slice(u8, raw, n)), "/x")
+
+    n = path.normalize("../x", buf)                        // relative keeps its `..`
+    test.eq_str(c, rep, "norm(relative-dotdot)", from_utf8(slice(u8, raw, n)), "../x")
+
+    n = path.normalize("../../x", buf)
+    test.eq_str(c, rep, "norm(dotdot-chain)", from_utf8(slice(u8, raw, n)), "../../x")
+
+    n = path.normalize("a/..", buf)                        // empty result becomes "."
+    test.eq_str(c, rep, "norm(empties-to-dot)", from_utf8(slice(u8, raw, n)), ".")
+
+    n = path.normalize("", buf)
+    test.eq_str(c, rep, "norm(empty)", from_utf8(slice(u8, raw, n)), ".")
+
+    n = path.normalize("/", buf)
+    test.eq_str(c, rep, "norm(root)", from_utf8(slice(u8, raw, n)), "/")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(rraw)
+    free_ptr(raw)
+    return ok
+}
+
+// Regression: a directory whose NAME ends in two dots is not a `..` segment.
+// An earlier version compared the last two bytes of the output rather than the
+// whole preceding segment, so `a../..` refused to pop and produced `a../..`.
+// Both this module and the Rust oracle in src/proptests.rs shared the flaw, so
+// the differential test agreed with itself and could not have caught it.
+@test fn normalize_pops_dirs_that_merely_end_in_dots() -> bool {
+    var raw: *mut u8 = alloc(u8, 128)
+    var buf: []u8 = slice(u8, raw, 128)
+    var rraw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, rraw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var n: usize = path.normalize("a../..", buf)
+    test.eq_str(c, rep, "norm(a../..)", from_utf8(slice(u8, raw, n)), ".")
+
+    n = path.normalize("x/a../..", buf)
+    test.eq_str(c, rep, "norm(x/a../..)", from_utf8(slice(u8, raw, n)), "x")
+
+    n = path.normalize("..a/..", buf)
+    test.eq_str(c, rep, "norm(..a/..)", from_utf8(slice(u8, raw, n)), ".")
+
+    // ...while a real `..` chain still refuses to pop itself.
+    n = path.normalize("../../x", buf)
+    test.eq_str(c, rep, "norm(real-dotdot-chain)", from_utf8(slice(u8, raw, n)), "../../x")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(rraw)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn normalize_is_idempotent_on_the_awkward_cases() -> bool {
+    var raw: *mut u8 = alloc(u8, 128)
+    var raw2: *mut u8 = alloc(u8, 128)
+    var buf: []u8 = slice(u8, raw, 128)
+    var buf2: []u8 = slice(u8, raw2, 128)
+    var rraw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, rraw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // One pass, then a second over the first pass's output: must not move.
+    let n1: usize = path.normalize("a/b/../../../c/./", buf)
+    let once: str = from_utf8(slice(u8, raw, n1))
+    let n2: usize = path.normalize(once, buf2)
+    test.eq_str(c, rep, "norm(idempotent)", from_utf8(slice(u8, raw2, n2)), once)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(rraw)
+    free_ptr(raw2)
+    free_ptr(raw)
+    return ok
+}

@@ -1,0 +1,86 @@
+// std/test_report.jtr — the hosted half of the `std/test` slice: the one place
+// in it that performs an effect.
+//
+// TIER: `std`. Requires a runtime that can write to stdout, and nothing else. No
+// filesystem, no clock, no environment. `std/test.jtr` — the expectations, the
+// golden comparison, the value rendering — is `core` and stays that way: it
+// cannot print, cannot allocate, and cannot abort. This file is the seam, and it
+// is deliberately three functions long so that the seam is obvious.
+//
+// WHY THE SPLIT IS WORTH TWO FILES. "Where does a failure message go?" is a
+// capability question, not a formatting question. A test running under `jestyrc
+// test` wants it on stdout. A test comparing its own output against a golden
+// wants it in a buffer. A future test running on a freestanding target wants it
+// nowhere. Only the last of those three is impossible if the assertion library
+// prints for you — which is exactly why it does not.
+//
+// NO RAW POINTER CROSSES THIS BOUNDARY, which was not true when the module
+// landed. `finish` used to take the `*mut u8` that `alloc` returned, purely because
+// `[]u8` could not be range-sliced — viewing the recorded prefix of a buffer meant
+// `slice(u8, raw, n)`, which needs the pointer. Now that `xs[lo .. hi]` works on a
+// slice, `finish` takes the same `[]u8` the checks recorded into and narrows it
+// itself. The caller still holds a pointer for `alloc`/`free_ptr`, but it no longer
+// has to hand one to a library.
+//
+// Worked example:  examples/std/test_demo.jtr
+
+import "test"
+import "io"
+
+// Print the accumulated report and return the verdict — the last line of a
+// `@test` body:
+//
+//     @test fn my_test() -> bool {
+//         var raw: *mut u8 = alloc(u8, 1024)
+//         var rep: []u8 = slice(u8, raw, 1024)
+//         var c: test.Check = test.new()
+//         test.eq_str(c, rep, "base", path.base("a/b.jtr"), "b.jtr")
+//         let ok: bool = test_report.finish(c, rep)
+//         free_ptr(raw)
+//         return ok
+//     }
+//
+// A clean run prints NOTHING — the harness already says `... ok`, and a passing
+// test that chatters is a test suite nobody reads. A failing run prints one line
+// per failure, each beginning `FAIL <name>`, followed by a truncation notice if
+// the report buffer was too small to hold them all.
+//
+// The empty line first is deliberate: the harness has printed `test <name> ... `
+// without a newline, so the report needs one to start in column zero. It pairs
+// with `std/test` using `\n` as a line SEPARATOR — so a failing test's output is
+// exactly as many lines as it has failures, with no blank line at either end.
+pub fn finish(read c: test.Check, read rep: []u8) -> bool {
+    let n: usize = test.report_len(c)
+    if n > 0 {
+        io.print_line("")
+        // Safe unconditionally: every byte `std/test` writes is a newline or
+        // printable ASCII, so this can never trap on invalid UTF-8.
+        print_str(from_utf8(rep[0 .. n]))
+    }
+    if test.lost(c) > 0 {
+        io.print_line("note: report truncated; enlarge the buffer to see the rest")
+    }
+    return test.passed(c)
+}
+
+// Print the report unconditionally, whether or not anything failed — for a
+// program driving `Check` outside the `@test` harness, where a `tally` line or a
+// `note` is the only output there is. Returns the verdict, like `finish`.
+pub fn dump(read c: test.Check, read rep: []u8) -> bool {
+    let n: usize = test.report_len(c)
+    if n > 0 {
+        print_str(from_utf8(rep[0 .. n]))
+    }
+    if test.lost(c) > 0 {
+        io.print_line("note: report truncated; enlarge the buffer to see the rest")
+    }
+    return test.passed(c)
+}
+
+// The process exit code the verdict implies: 0 when everything passed, 1
+// otherwise. So a `main` driving `Check` directly ends `return
+// test_report.exit_code(c)` and drops into CI without inventing a convention.
+pub fn exit_code(read c: test.Check) -> i32 {
+    if test.passed(c) { return 0 }
+    return 1
+}

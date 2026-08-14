@@ -2067,7 +2067,15 @@ fn infer(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
         let bt: i32 = infer(c, p, src, d.a)
         infer(c, p, src, d.b)
         let bd: TyData = list.get(TyData, c.tys, bt as usize)
-        if bd.kind == 8 or bd.kind == 9 { r = bd.a }
+        // A RANGE index on a `[]T` re-slices to the same slice type (a narrower view
+        // of the same buffer); a plain index yields the element. Not extended to a
+        // fixed-size ARRAY (kind 9), whose sub-view would have to borrow the array's
+        // storage — that needs borrowed projection, not just a type.
+        if bd.kind == 8 {
+            let sx: parser.ExprData = list.get(parser.ExprData, p.ex, d.b as usize)
+            if sx.kind == 13 { r = bt } else { r = bd.a }
+        }
+        else if bd.kind == 9 { r = bd.a }
         else if bd.kind == 2 {
             if bd.x == 14 {
                 let ix: parser.ExprData = list.get(parser.ExprData, p.ex, d.b as usize)

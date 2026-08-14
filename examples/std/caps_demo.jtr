@@ -1,0 +1,162 @@
+// std/caps_demo.jtr — the four capability handles, and what they are actually for.
+//
+// `Fs`, `Clock`, `Env` and `Process` are the Tier 2 handles. Demonstrating them one
+// at a time would show the mechanics and miss the point, so this demo does the thing
+// they exist for: it builds a BUILD STAMP — a line of text derived from
+// configuration, elapsed time and the filesystem — and shows that the stamp is
+// REPRODUCIBLE when the handles are deterministic and not otherwise.
+//
+// That is the whole argument for the design. `stamp` reads configuration, consults a
+// clock and probes a file, and its signature says so:
+//
+//     fn stamp(mut f: fs.Fs, mut cl: time.Clock, mut e: env.Env, …)
+//
+// Give it `fs.denied()`, `time.manual(0)` and `env.sealed()` and its output is a
+// pure function of its arguments — twice in a row, byte-identical, on any machine.
+// Give it `host()` handles and it varies. Nothing about `stamp` changes between the
+// two; the caller chooses.
+//
+// Note what each restricted mode is chosen FOR, since they are not symmetric:
+//   * `time.manual` — determinism. A `denied()` clock would be useless (code would
+//     divide by a zero duration); a clock you advance yourself is testable.
+//   * `env.sealed`  — proving a negative. Behaves identically with no ambient
+//     configuration, while still counting that it tried to read some.
+//   * `fs.read_only` — mutation refused but reads allowed, which is what a linter or
+//     `jestyrc check` needs. `denied()` is the third state.
+//   * `process.denied` — refuses to execute while counting attempts (see
+//     `process_demo.jtr`, which proves the refusal with the filesystem as witness).
+//
+// Run:  cargo run --release -- run examples/std/caps_demo.jtr
+//   →   -- deterministic --
+//       1
+//       1
+//       1
+//       1
+//       -- host --
+//       0
+//       1
+//       -- read_only --
+//       1
+//       0
+//       1
+//       0
+//       -- cleanup --
+//       0
+
+import "fs"
+import "env"
+import "time"
+import "process"
+import "test"
+import "test_report"
+
+const CAP: usize = 512
+const PROBE: str = "jestyr_caps_demo.tmp"
+
+fn b2i(read b: bool) -> i32 {
+    if b { return 1 }
+    return 0
+}
+
+// A decimal into `dst` at `at`, returning the new offset. Local so this demo stays a
+// leaf, the same choice `path_demo.jtr` and `test_demo.jtr` make.
+fn put_num(v: i64, mut dst: []u8, at: usize) -> usize {
+    if v == 0 {
+        dst[at] = 48
+        return at + 1
+    }
+    var digits: i64 = 0
+    var p: i64 = 1
+    for v / p >= 10 {
+        p = p * 10
+        digits = digits + 1
+    }
+    var n: usize = at
+    for p > 0 {
+        dst[n] = (48 + ((v / p) % 10)) as u8
+        p = p / 10
+        n = n + 1
+    }
+    return n
+}
+
+fn put_str(read s: str, mut dst: []u8, at: usize) -> usize {
+    var n: usize = at
+    for i in 0..s.len {
+        dst[n] = s[i] as u8
+        n = n + 1
+    }
+    return n
+}
+
+// The subsystem under test. Every effect it performs is named in its signature:
+// configuration, a clock, a filesystem. Nothing else.
+fn stamp(mut f: fs.Fs, mut cl: time.Clock, mut e: env.Env, mut dst: []u8) -> usize {
+    let cfg: str = env.lookup_or(e, "JESTYR_CAPS_DEMO_CFG", "default")
+    let t0: i64 = time.read_nanos(cl)
+    time.advance(cl, 5)                       // a manual clock moves; a host one ignores it
+    let elapsed: i64 = time.since(cl, t0)
+    let seen: bool = fs.present(f, PROBE)
+
+    var n: usize = put_str(cfg, dst, 0)
+    n = put_str("|", dst, n)
+    n = put_num(elapsed, dst, n)
+    n = put_str("|", dst, n)
+    if seen { n = put_str("1", dst, n) } else { n = put_str("0", dst, n) }
+    return n
+}
+
+fn main() -> i32 {
+    var araw: *mut u8 = alloc(u8, CAP)
+    var abuf: []u8 = slice(u8, araw, CAP)
+    var braw: *mut u8 = alloc(u8, CAP)
+    var bbuf: []u8 = slice(u8, braw, CAP)
+
+    // ---- two runs with deterministic handles must agree, byte for byte.
+    print_str("-- deterministic --")
+    var f1: fs.Fs = fs.denied()
+    var c1: time.Clock = time.manual(0)
+    var e1: env.Env = env.sealed()
+    let n1: usize = stamp(f1, c1, e1, abuf)
+
+    var f2: fs.Fs = fs.denied()
+    var c2: time.Clock = time.manual(0)
+    var e2: env.Env = env.sealed()
+    let n2: usize = stamp(f2, c2, e2, bbuf)
+
+    var raw: *mut u8 = alloc(u8, CAP)
+    var rep: []u8 = slice(u8, raw, CAP)
+    var chk: test.Check = test.new()
+    test.eq_str(chk, rep, "stamp is reproducible",
+                from_utf8(abuf[0 .. n1]), from_utf8(bbuf[0 .. n2]))
+    print_int(b2i(test_report.finish(chk, rep)))   // 1 — identical
+    free_ptr(raw)
+
+    print_int(b2i(time.is_deterministic(c1)))      // 1 — the clock is why
+    print_int(env.lookups(e1))                     // 1 — sealed, but it DID try
+    print_int(b2i(fs.refused(f1) > 0))             // 1 — the probe was refused
+
+    // ---- the same subsystem with host handles is not reproducible, and says so.
+    print_str("-- host --")
+    var hc: time.Clock = time.host()
+    print_int(b2i(time.is_deterministic(hc)))      // 0
+    var hf: fs.Fs = fs.host()
+    print_int(b2i(fs.can_write(hf)))               // 1
+
+    // ---- read_only: reads pass, mutation is refused and counted, nothing lands.
+    print_str("-- read_only --")
+    var ro: fs.Fs = fs.read_only()
+    print_int(b2i(fs.can_read(ro)))                // 1
+    print_int(b2i(fs.can_write(ro)))               // 0
+    fs.put(ro, PROBE, "should not appear")
+    print_int(b2i(fs.refused(ro) > 0))             // 1 — it tried and was refused
+    print_int(b2i(fs.present(hf, PROBE)))          // 0 — checked through a handle
+                                                   //     that CAN read: no file
+    print_str("-- cleanup --")
+    fs.erase(hf, PROBE)
+    print_int(b2i(fs.present(hf, PROBE)))          // 0
+
+    free_ptr(braw)
+    free_ptr(araw)
+    return 0
+}

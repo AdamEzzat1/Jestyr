@@ -41,3 +41,82 @@ pub fn since_millis(start: i64) -> i64 {
 pub fn nanos_to_millis(ns: i64) -> i64 {
     return ns / 1000000
 }
+
+// ------------------------------------------------------- the Clock capability
+//
+// The functions above are the ambient layer: any code anywhere can call
+// `now_nanos()` and no signature reveals that it did. `Clock` is the same reading
+// behind an explicit handle, and the reason to want one here is different from
+// every other capability in this library.
+//
+// GATING A CLOCK IS ABOUT DETERMINISM, NOT PERMISSION. Nobody needs protecting
+// from the time; what breaks is REPRODUCIBILITY — a build stamp, a cache key, or a
+// test that reads the clock produces a different answer on every run. So the
+// restricted variant here is not a `denied()` clock (which would be useless: code
+// would divide by a zero duration) but a MANUAL one, whose reading only changes
+// when the caller advances it. Hand a subsystem `manual(0)` and its output is a
+// pure function of its inputs; hand it `host()` in production.
+//
+// That is the same shape as `@deterministic` on a reduction and as the `par for`
+// SHA canary: the library's job is to make the non-deterministic thing nameable,
+// so a test can pin it.
+//
+// Like `std/process`, this is not enforcement — `now_nanos()` is still reachable
+// from anywhere. It puts the dependency in the signature where a reviewer sees it.
+
+pub struct Clock {
+    manual: bool,
+    now: i64,
+    reads: i64,
+}
+
+// A clock that reads the real monotonic counter. Non-deterministic by nature.
+pub fn host() -> Clock {
+    return Clock{ manual: false, now: 0, reads: 0 }
+}
+
+// A clock that reads `start` and never moves on its own — only `advance` changes
+// it. This is the one to pass in a test: elapsed times become exactly what the test
+// chose, so a duration can be asserted rather than merely bounded.
+pub fn manual(start: i64) -> Clock {
+    return Clock{ manual: true, now: start, reads: 0 }
+}
+
+// The current reading in nanoseconds, counting the read. For a `host` clock this is
+// `mono_nanos()`; for a `manual` one it is whatever `advance` has accumulated.
+//
+// Named `read_nanos` rather than `now_nanos` because the ambient function above
+// already owns that name and Jestyr has no overloading — the distinct spelling also
+// makes a grep for `now_nanos(` find exactly the ambient callers.
+pub fn read_nanos(mut c: Clock) -> i64 {
+    c.reads = c.reads + 1
+    if c.manual { return c.now }
+    return mono_nanos()
+}
+
+// Nanoseconds between `start` and this clock's current reading.
+pub fn since(mut c: Clock, start: i64) -> i64 {
+    return read_nanos(c) - start
+}
+
+// Move a manual clock forward by `by` nanoseconds. Returns whether the clock
+// actually moved: false for a `host` clock, because the system counter cannot be
+// set and silently ignoring the request would be a foot-gun. `by` may be negative
+// on a manual clock — that is the caller's business, and how you would test code
+// that must survive a non-monotonic reading.
+pub fn advance(mut c: Clock, by: i64) -> bool {
+    if c.manual == false { return false }
+    c.now = c.now + by
+    return true
+}
+
+// How many times this clock has been read — the assertion for "this code consults
+// the clock exactly once", which is what makes a stamped output reproducible.
+pub fn reads(read c: Clock) -> i64 {
+    return c.reads
+}
+
+// Is this clock reproducible? True only for `manual`.
+pub fn is_deterministic(read c: Clock) -> bool {
+    return c.manual
+}
