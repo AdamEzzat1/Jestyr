@@ -3438,6 +3438,315 @@ fn path_ref_normalize(p: &[u8]) -> Vec<u8> {
     out
 }
 
+// ------------------------------------------------------------- std/str oracle
+//
+// An independent Rust implementation of the operations `examples/std/str.jtr` ADDS on
+// top of the string intrinsics. The thin wrappers (`eq`, `has_prefix`, …) are not
+// oracled: they forward one call and a Rust re-description of them would test nothing.
+// What is oracled is the part with decisions in it — the miss behaviours of
+// `before`/`after`, the empty-needle rules, and the reverse search.
+//
+// Byte-level, like the path oracle, so it is total on arbitrary input.
+
+fn str_ref_is_ws(c: u8) -> bool {
+    c == b' ' || c == b'\t' || c == b'\n' || c == b'\r'
+}
+
+fn str_ref_trim_start(s: &[u8]) -> &[u8] {
+    let mut i = 0;
+    while i < s.len() && str_ref_is_ws(s[i]) {
+        i += 1;
+    }
+    &s[i..]
+}
+
+fn str_ref_trim_end(s: &[u8]) -> &[u8] {
+    let mut n = s.len();
+    while n > 0 && str_ref_is_ws(s[n - 1]) {
+        n -= 1;
+    }
+    &s[..n]
+}
+
+fn str_ref_strip_cr(s: &[u8]) -> &[u8] {
+    if s.last() == Some(&b'\r') { &s[..s.len() - 1] } else { s }
+}
+
+fn str_ref_find(s: &[u8], needle: &[u8]) -> isize {
+    if needle.is_empty() {
+        return 0;
+    }
+    if needle.len() > s.len() {
+        return -1;
+    }
+    for i in 0..=(s.len() - needle.len()) {
+        if &s[i..i + needle.len()] == needle {
+            return i as isize;
+        }
+    }
+    -1
+}
+
+/// The empty needle yields `s.len` — the far end, mirroring `find`'s 0 — which is what
+/// makes `after_last(s, "")` empty rather than all of `s`.
+fn str_ref_rfind(s: &[u8], needle: &[u8]) -> isize {
+    if needle.is_empty() {
+        return s.len() as isize;
+    }
+    if needle.len() > s.len() {
+        return -1;
+    }
+    for i in (0..=(s.len() - needle.len())).rev() {
+        if &s[i..i + needle.len()] == needle {
+            return i as isize;
+        }
+    }
+    -1
+}
+
+/// Non-overlapping, and **0 for an empty needle** — the deliberate anti-infinite-loop
+/// rule, since the counting loop advances by the needle's length.
+fn str_ref_count(s: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut n = 0;
+    let mut i = 0;
+    while i + needle.len() <= s.len() {
+        if &s[i..i + needle.len()] == needle {
+            n += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    n
+}
+
+/// On a miss this yields ALL of `s` while `str_ref_after` yields nothing — the
+/// asymmetry the module documents, so the pair never both claim the whole string.
+fn str_ref_before<'a>(s: &'a [u8], sep: &[u8]) -> &'a [u8] {
+    match str_ref_find(s, sep) {
+        -1 => s,
+        i => &s[..i as usize],
+    }
+}
+
+fn str_ref_after<'a>(s: &'a [u8], sep: &[u8]) -> &'a [u8] {
+    match str_ref_find(s, sep) {
+        -1 => &s[..0],
+        i => &s[i as usize + sep.len()..],
+    }
+}
+
+fn str_ref_before_last<'a>(s: &'a [u8], sep: &[u8]) -> &'a [u8] {
+    match str_ref_rfind(s, sep) {
+        -1 => s,
+        i => &s[..i as usize],
+    }
+}
+
+fn str_ref_after_last<'a>(s: &'a [u8], sep: &[u8]) -> &'a [u8] {
+    match str_ref_rfind(s, sep) {
+        -1 => &s[..0],
+        i => {
+            let start = i as usize + sep.len();
+            if start > s.len() { &s[..0] } else { &s[start..] }
+        }
+    }
+}
+
+fn str_ref_strip_prefix<'a>(s: &'a [u8], p: &[u8]) -> &'a [u8] {
+    if s.starts_with(p) { &s[p.len()..] } else { s }
+}
+
+fn str_ref_strip_suffix<'a>(s: &'a [u8], p: &[u8]) -> &'a [u8] {
+    if p.len() <= s.len() && s.ends_with(p) { &s[..s.len() - p.len()] } else { s }
+}
+
+/// **`std/str` — toolchain-free layer.** The module, its suite and its demo lower with
+/// no diagnostics, and the Rust oracle upholds the invariants the Jestyr module
+/// documents. The differential check against the real compiled module needs a C
+/// compiler and lives in `c_oracle::str_matches_the_reference`.
+mod str_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn diags_of(rel: &str) -> Vec<String> {
+        let prog = crate::module::load(rel);
+        let mut diags: Vec<String> = prog.diags.iter().map(|d| d.message.clone()).collect();
+        let (info, td) = typeck::check_program(&prog.ast, &prog.modules);
+        diags.extend(td.iter().map(|d| d.message.clone()));
+        diags.extend(escape::check(&prog.ast, &info).iter().map(|d| d.message.clone()));
+        let (_c, cd) = cgen::emit(&prog.ast, &info);
+        diags.extend(cd.iter().map(|d| d.message.clone()));
+        diags
+    }
+
+    /// Every function in `str.jtr` is `@no_alloc`, so this also proves the escape
+    /// checker accepts the allocation-free contract across the whole module — "string
+    /// handling never allocates" is checked here, not asserted in a doc comment.
+    #[test]
+    fn str_module_compiles_clean() {
+        for f in ["str.jtr", "str_test.jtr", "str_demo.jtr"] {
+            let d = diags_of(&format!("examples/std/{f}"));
+            assert!(d.is_empty(), "examples/std/{f}: {d:?}");
+        }
+    }
+
+    /// `std/str` is `core` with non-test consumers, so its suite must stay in the
+    /// sibling file — a colocated `@test` is emitted into everything importing it.
+    #[test]
+    fn str_stays_a_leaf_module() {
+        let prog = crate::module::load("examples/std/str.jtr");
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        assert_eq!(
+            prog.modules.names.len(),
+            1,
+            "std/str must import nothing — it is `core`; found {:?}",
+            prog.modules.names
+        );
+        let tests = crate::cgen::list_tests(&prog.ast, &prog.modules.item_mod);
+        assert!(tests.is_empty(), "std/str must declare no @test; found {tests:?}");
+    }
+
+    /// The worked cases from the module's own doc comments, so the oracle is pinned to
+    /// the documented behaviour before it is used to judge the Jestyr implementation.
+    #[test]
+    fn reference_matches_the_documented_cases() {
+        // A `fn`, not a closure: a closure returning a borrow of its own argument
+        // cannot express the lifetime relation.
+        fn b(s: &str) -> &[u8] {
+            s.as_bytes()
+        }
+        let u = |v: &[u8]| String::from_utf8(v.to_vec()).unwrap();
+
+        assert_eq!(u(str_ref_before(b("a=b"), b("="))), "a");
+        assert_eq!(u(str_ref_before(b("nope"), b("="))), "nope");
+        assert_eq!(u(str_ref_after(b("a=b"), b("="))), "b");
+        assert_eq!(u(str_ref_after(b("nope"), b("="))), "");
+        assert_eq!(u(str_ref_before_last(b("a.b.c"), b("."))), "a.b");
+        assert_eq!(u(str_ref_after_last(b("a.b.c"), b("."))), "c");
+
+        // The empty-needle rules: both ends, and a zero count.
+        assert_eq!(str_ref_find(b("abc"), b("")), 0);
+        assert_eq!(str_ref_rfind(b("abc"), b("")), 3);
+        assert_eq!(str_ref_count(b("abc"), b("")), 0);
+        // Non-overlapping.
+        assert_eq!(str_ref_count(b("aaa"), b("aa")), 1);
+        assert_eq!(str_ref_count(b("aaaa"), b("aa")), 2);
+
+        assert_eq!(u(str_ref_strip_prefix(b("--f"), b("--"))), "f");
+        assert_eq!(u(str_ref_strip_prefix(b("f"), b("--"))), "f");
+        assert_eq!(u(str_ref_strip_suffix(b("f.jtr"), b(".jtr"))), "f");
+        assert_eq!(u(str_ref_strip_suffix(b("a"), b("aaaa"))), "a");
+        assert_eq!(u(str_ref_strip_cr(b("l\r"))), "l");
+        assert_eq!(u(str_ref_strip_cr(b("l\r\r"))), "l\r");
+    }
+
+    proptest! {
+        /// **`before` and `after` recompose the input.** `before + sep + after == s`
+        /// whenever the separator is present — the invariant that makes the pair a
+        /// split rather than two unrelated searches.
+        #[test]
+        fn reference_before_and_after_recompose(s in r"[a-c=]{0,30}") {
+            let sb = s.as_bytes();
+            let sep = b"=";
+            if str_ref_find(sb, sep) < 0 {
+                return Ok(());
+            }
+            let mut rebuilt = str_ref_before(sb, sep).to_vec();
+            rebuilt.extend_from_slice(sep);
+            rebuilt.extend_from_slice(str_ref_after(sb, sep));
+            prop_assert_eq!(&rebuilt, &sb.to_vec());
+        }
+
+        /// The same for the last-separator pair.
+        #[test]
+        fn reference_before_last_and_after_last_recompose(s in r"[a-c.]{0,30}") {
+            let sb = s.as_bytes();
+            let sep = b".";
+            if str_ref_rfind(sb, sep) < 0 || sb.is_empty() {
+                return Ok(());
+            }
+            let mut rebuilt = str_ref_before_last(sb, sep).to_vec();
+            rebuilt.extend_from_slice(sep);
+            rebuilt.extend_from_slice(str_ref_after_last(sb, sep));
+            prop_assert_eq!(&rebuilt, &sb.to_vec());
+        }
+
+        /// **Trimming is idempotent and only ever shrinks**, and composing the two ends
+        /// equals trimming both — the property the Jestyr suite checks against the
+        /// `trim` INTRINSIC, checked here against the spec.
+        #[test]
+        fn reference_trim_is_idempotent_and_shrinking(s in r"[a-c \t\r\n]{0,40}") {
+            let sb = s.as_bytes();
+            let once = str_ref_trim_start(str_ref_trim_end(sb));
+            let twice = str_ref_trim_start(str_ref_trim_end(once));
+            prop_assert_eq!(once, twice, "not idempotent");
+            prop_assert!(once.len() <= sb.len(), "trimming grew the input");
+            if !once.is_empty() {
+                prop_assert!(!str_ref_is_ws(once[0]));
+                prop_assert!(!str_ref_is_ws(once[once.len() - 1]));
+            }
+        }
+
+        /// **Every view is a genuine sub-slice of its source** — never invented storage,
+        /// never out of bounds. The whole module promises views; this is that promise.
+        #[test]
+        fn reference_views_stay_within_the_source(s in r"[a-c.=\-]{0,30}") {
+            let sb = s.as_bytes();
+            for sep in [&b"="[..], &b"."[..], &b"--"[..], &b""[..]] {
+                for v in [
+                    str_ref_before(sb, sep),
+                    str_ref_after(sb, sep),
+                    str_ref_before_last(sb, sep),
+                    str_ref_after_last(sb, sep),
+                    str_ref_strip_prefix(sb, sep),
+                    str_ref_strip_suffix(sb, sep),
+                    str_ref_trim_start(sb),
+                    str_ref_trim_end(sb),
+                    str_ref_strip_cr(sb),
+                ] {
+                    prop_assert!(v.len() <= sb.len(), "view longer than source");
+                    // A sub-slice's bytes must appear contiguously in the source.
+                    prop_assert!(
+                        v.is_empty() || sb.windows(v.len()).any(|w| w == v),
+                        "view {:?} is not a contiguous run of {:?}", v, sb
+                    );
+                }
+            }
+        }
+
+        /// `count_of` agrees with a naive scan, and is bounded by the input length.
+        #[test]
+        fn reference_count_is_consistent(s in r"[ab]{0,24}") {
+            let sb = s.as_bytes();
+            for sep in [&b"a"[..], &b"aa"[..], &b"ab"[..]] {
+                let n = str_ref_count(sb, sep);
+                prop_assert!(n * sep.len() <= sb.len(), "counted more bytes than exist");
+                // Presence and count must agree.
+                prop_assert_eq!(n > 0, str_ref_find(sb, sep) >= 0);
+            }
+        }
+
+        /// `rfind` never precedes `find`, and both land on real matches.
+        #[test]
+        fn reference_rfind_is_at_or_after_find(s in r"[ab.]{0,30}") {
+            let sb = s.as_bytes();
+            let sep = b".";
+            let f = str_ref_find(sb, sep);
+            let r = str_ref_rfind(sb, sep);
+            prop_assert_eq!(f < 0, r < 0, "find and rfind disagree on presence");
+            if f >= 0 {
+                prop_assert!(r >= f, "rfind {} precedes find {}", r, f);
+                prop_assert_eq!(&sb[f as usize..f as usize + 1], sep);
+                prop_assert_eq!(&sb[r as usize..r as usize + 1], sep);
+            }
+        }
+    }
+}
+
 /// **`std/path` — toolchain-free layer.** The module and its demo lower with no
 /// diagnostics, and the Rust oracle upholds the invariants the Jestyr module
 /// documents. The differential check against the real compiled module needs a C
@@ -4227,6 +4536,61 @@ mod test_props {
 
 mod fuzz {
     use super::*;
+
+    /// **The `std/str` oracle is total on arbitrary bytes** — invalid UTF-8, NULs,
+    /// separator soup, needles longer than the haystack, empty needles. It judges the
+    /// real Jestyr module in `c_oracle`, so an oracle that panicked on some input would
+    /// quietly weaken that test rather than fail it.
+    ///
+    /// The needle is derived FROM the input rather than fixed, so the fuzzer reaches the
+    /// cases that matter: a needle equal to the whole haystack, a needle one byte longer,
+    /// and the empty needle that every one of these functions special-cases.
+    #[test]
+    fn fuzz_str_reference_is_total() {
+        bolero::check!().with_type::<Vec<u8>>().for_each(|b: &Vec<u8>| {
+            let split_at = b.first().copied().unwrap_or(0) as usize % (b.len() + 1);
+            let (hay, needle) = b.split_at(split_at);
+            for n in [needle, &b[..], &[][..]] {
+                let before = str_ref_before(hay, n);
+                let after = str_ref_after(hay, n);
+                let bl = str_ref_before_last(hay, n);
+                let al = str_ref_after_last(hay, n);
+                // Every result is a view no longer than its source.
+                for v in [before, after, bl, al,
+                          str_ref_strip_prefix(hay, n), str_ref_strip_suffix(hay, n),
+                          str_ref_trim_start(hay), str_ref_trim_end(hay),
+                          str_ref_strip_cr(hay)] {
+                    assert!(v.len() <= hay.len(), "view longer than source on {hay:?}");
+                }
+                // find/rfind agree on presence and stay in range.
+                let f = str_ref_find(hay, n);
+                let r = str_ref_rfind(hay, n);
+                assert_eq!(f < 0, r < 0, "presence disagreement on {hay:?} / {n:?}");
+                if f >= 0 {
+                    assert!(f as usize <= hay.len());
+                    assert!(r as usize <= hay.len());
+                    assert!(r >= f, "rfind precedes find on {hay:?} / {n:?}");
+                }
+                // Counting never claims more bytes than exist.
+                let c = str_ref_count(hay, n);
+                if !n.is_empty() {
+                    assert!(c * n.len() <= hay.len(), "over-count on {hay:?} / {n:?}");
+                }
+            }
+        });
+    }
+
+    /// **Trimming is total and idempotent under the fuzzer**, not merely under a
+    /// generator whose alphabet I chose.
+    #[test]
+    fn fuzz_str_trim_is_idempotent() {
+        bolero::check!().with_type::<Vec<u8>>().for_each(|b: &Vec<u8>| {
+            let once = str_ref_trim_start(str_ref_trim_end(b)).to_vec();
+            let twice = str_ref_trim_start(str_ref_trim_end(&once)).to_vec();
+            assert_eq!(once, twice, "trim not idempotent on {b:?}");
+            assert!(once.len() <= b.len());
+        });
+    }
 
     /// **The path oracle is total.** Arbitrary bytes — including invalid UTF-8,
     /// NULs, and separator soup — must not panic it. The oracle judges the real
@@ -7734,6 +8098,12 @@ mod c_oracle {
     use super::{
         test_ref_diff_count, test_ref_escaped, test_ref_escaped_len, test_ref_first_diff_line,
         test_ref_line_count, test_ref_lines_eq, test_ref_unescape_arg,
+    };
+    // The `std/str` oracle, likewise.
+    use super::{
+        str_ref_after, str_ref_after_last, str_ref_before, str_ref_before_last, str_ref_count,
+        str_ref_rfind, str_ref_strip_prefix, str_ref_strip_suffix, str_ref_trim_end,
+        str_ref_trim_start,
     };
     use std::process::Command;
 
@@ -13152,7 +13522,7 @@ fn main() -> i32 {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "drop_take.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr", "test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr", "caps_demo.jtr", "fs_test.jtr", "env_test.jtr", "time_test.jtr"];
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "drop_take.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr", "test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr", "caps_demo.jtr", "fs_test.jtr", "env_test.jtr", "time_test.jtr", "str.jtr", "str_test.jtr", "str_demo.jtr"];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
     /// target). This is the acceptance bar the R2 fixpoint ultimately rests on. `DUMP_DIVERGE=1`
@@ -13969,6 +14339,154 @@ fn main() -> i32 {
     }
 
     /// **Differential: the real Jestyr module vs the Rust oracle.** Compile
+    /// **`std/str` end-to-end.** The demo's documented output, verified rather than
+    /// claimed — the header comment in `str_demo.jtr` lists exactly these. It is the
+    /// job `examples/str_ops.jtr` says you must otherwise do by hand with `find` +
+    /// `substr`: parse a config line, split an extension, strip a flag's dashes.
+    #[test]
+    fn str_demo() {
+        assert_eq!(
+            toks("examples/std/str_demo.jtr"),
+            [
+                "--", "parsing", "a", "config", "line", "--",
+                "timeout", "30", "1",
+                "--", "paths,", "lexically", "--",
+                "archive.tar", "gz",
+                "--", "flags", "--",
+                "verbose", "1",
+                "--", "counting", "--",
+                "3", "2",
+            ]
+        );
+    }
+
+    /// `std/str`'s suite through the real harness — 10 tests, including the two that
+    /// check the author rather than the code: whether the hand-written ASCII whitespace
+    /// set agrees with the `trim` intrinsic, and whether `split`'s five documented
+    /// behaviours are what the language actually does.
+    #[test]
+    fn str_module_unit_tests_pass() {
+        let (out, code) = build_tests_and_run("examples/std/str_test.jtr", None);
+        assert_eq!(code, 0, "std/str unit tests must pass:\n{out}");
+        assert!(out.contains("10 passed; 0 failed"), "unexpected harness output:\n{out}");
+    }
+
+    /// **Differential: the real `std/str` module vs the Rust oracle.** Compile
+    /// `str_demo.jtr` once, then drive it per generated case and require the compiled
+    /// Jestyr implementation to agree with `str_ref_*` on every operation — which is
+    /// what makes `str_props`' properties statements about the shipped module.
+    ///
+    /// The generated alphabet includes the whitespace stand-ins (`_` space, `~` CR,
+    /// `@` tab) that the demo decodes, so trimming is exercised through the compiled
+    /// module rather than only in-language. Backslash is excluded for the same reason
+    /// `path_matches_the_reference` excludes it — on Windows it would test the CRT's
+    /// argument encoder instead of the module.
+    #[test]
+    fn str_matches_the_reference() {
+        use std::sync::OnceLock;
+        static EXE: OnceLock<std::path::PathBuf> = OnceLock::new();
+        let exe = EXE.get_or_init(|| build_exe("examples/std/str_demo.jtr"));
+
+        // The demo's decoding, applied to the generated argument so the oracle sees the
+        // same bytes the module does.
+        fn decode(s: &str) -> Vec<u8> {
+            s.bytes()
+                .map(|c| match c {
+                    b'_' => b' ',
+                    b';' => b'\n',
+                    b'~' => b'\r',
+                    b'@' => b'\t',
+                    other => other,
+                })
+                .collect()
+        }
+        // Strip exactly the ONE line terminator `print_str` appends — `\n`, which
+        // Windows renders as `\r\n` — and nothing more. A greedy
+        // `trim_end_matches(['\r','\n'])` was the first version and it was WRONG: it
+        // also ate a carriage return that legitimately belonged to the result, so
+        // `after("\r", "")` (correctly the whole string) compared as empty and failed a
+        // correct module. Popping `\n` then one `\r` is unambiguous, because a payload
+        // ending in CR arrives as `…\r` + `\r\n`.
+        let run = |op: &str, a: &str, b: &str| -> String {
+            let out = Command::new(exe).args([op, a, b]).output().unwrap();
+            assert!(out.status.success(), "str_demo {op} {a:?} {b:?} exited {:?}", out.status);
+            let mut s = String::from_utf8(out.stdout).unwrap();
+            if s.ends_with('\n') {
+                s.pop();
+                if s.ends_with('\r') {
+                    s.pop();
+                }
+            }
+            s
+        };
+
+        // 48 cases, not proptest's default 256: each is twelve process spawns. The
+        // toolchain-free properties in `str_props` still run the full default count, so
+        // coverage of the SPEC is undiminished — this test's job is to catch the Jestyr
+        // implementation drifting from it, which a smaller sample does well.
+        proptest::proptest!(
+            proptest::prelude::ProptestConfig::with_cases(48),
+            |(s in r"[ab.=_~@\-]{0,24}", t in r"[.=_\-]{0,3}")| {
+            let sb = decode(&s);
+            let tb = decode(&t);
+            let as_str = |v: &[u8]| String::from_utf8(v.to_vec()).unwrap();
+            // Only compare when both sides are printable-safe round-trippable text:
+            // the harness compares stdout, and a NUL or a stray CR would test the
+            // pipe rather than the module. The alphabet above guarantees this.
+            proptest::prop_assert_eq!(run("before", &s, &t), as_str(str_ref_before(&sb, &tb)), "before {:?} {:?}", s, t);
+            proptest::prop_assert_eq!(run("after", &s, &t), as_str(str_ref_after(&sb, &tb)), "after {:?} {:?}", s, t);
+            proptest::prop_assert_eq!(run("beforelast", &s, &t), as_str(str_ref_before_last(&sb, &tb)), "beforelast {:?} {:?}", s, t);
+            proptest::prop_assert_eq!(run("afterlast", &s, &t), as_str(str_ref_after_last(&sb, &tb)), "afterlast {:?} {:?}", s, t);
+            proptest::prop_assert_eq!(run("stripp", &s, &t), as_str(str_ref_strip_prefix(&sb, &tb)), "stripp {:?} {:?}", s, t);
+            proptest::prop_assert_eq!(run("strips", &s, &t), as_str(str_ref_strip_suffix(&sb, &tb)), "strips {:?} {:?}", s, t);
+            proptest::prop_assert_eq!(run("lastindex", &s, &t), str_ref_rfind(&sb, &tb).to_string(), "lastindex {:?} {:?}", s, t);
+            proptest::prop_assert_eq!(run("count", &s, &t), str_ref_count(&sb, &tb).to_string(), "count {:?} {:?}", s, t);
+            proptest::prop_assert_eq!(
+                run("blank", &s, ""),
+                if str_ref_trim_start(&sb).is_empty() { "1" } else { "0" },
+                "blank {:?}", s
+            );
+        }
+        );
+    }
+
+    /// Trimming through the COMPILED module, kept separate because its output can end
+    /// in whitespace that `run`'s newline trim would eat — so these compare lengths and
+    /// the trimmed core rather than raw stdout.
+    #[test]
+    fn str_trim_matches_the_reference_end_to_end() {
+        use std::sync::OnceLock;
+        static EXE2: OnceLock<std::path::PathBuf> = OnceLock::new();
+        let exe = EXE2.get_or_init(|| build_exe("examples/std/str_demo.jtr"));
+
+        let run = |op: &str, a: &str| -> String {
+            let out = Command::new(exe).args([op, a, ""]).output().unwrap();
+            assert!(out.status.success());
+            // Strip only the ONE trailing newline `print_str` adds, so a trimmed
+            // result that legitimately ends in a space survives the comparison.
+            let mut s = String::from_utf8(out.stdout).unwrap();
+            if s.ends_with('\n') {
+                s.pop();
+                if s.ends_with('\r') {
+                    s.pop();
+                }
+            }
+            s
+        };
+
+        proptest::proptest!(
+            proptest::prelude::ProptestConfig::with_cases(48),
+            |(s in r"[ab_@]{0,20}")| {
+            let sb: Vec<u8> = s.bytes().map(|c| match c {
+                b'_' => b' ', b'@' => b'\t', other => other }).collect();
+            let want_start = String::from_utf8(str_ref_trim_start(&sb).to_vec()).unwrap();
+            let want_end = String::from_utf8(str_ref_trim_end(&sb).to_vec()).unwrap();
+            proptest::prop_assert_eq!(run("trimstart", &s), want_start, "trimstart {:?}", s);
+            proptest::prop_assert_eq!(run("trimend", &s), want_end, "trimend {:?}", s);
+        }
+        );
+    }
+
     /// `path_demo.jtr` once, then drive it per generated case and require the
     /// compiled Jestyr implementation to agree with `path_ref_*` on every
     /// operation. This is what makes the property tests statements about the

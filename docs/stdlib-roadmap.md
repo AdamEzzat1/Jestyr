@@ -42,7 +42,7 @@ syscalls. `examples/std/core.jtr` already carries Option/Result combinators,
 slice algorithms, integer parse/format, the float tier (bits, Kahan/Neumaier,
 pairwise, binned accumulator) and correctly-rounded parse/format.
 
-Present: `core.jtr`, `path.jtr`, `test.jtr`, `sha256.jtr`, `float_bits.jtr`,
+Present: `core.jtr`, `path.jtr`, `str.jtr`, `test.jtr`, `sha256.jtr`, `float_bits.jtr`,
 `slice_algos.jtr`, `combinators.jtr`.
 
 The tier's contract is now *checked*, not merely documented: `path.jtr` marks
@@ -172,17 +172,21 @@ interesting it is.
 | 1 | ~~`path`~~ ✅ | core | none | every CLI (but *not* the compiler's loader — see above) |
 | 2 | ~~`test` — assert helpers, golden compare~~ ✅ | core + std | none | makes `@test` pleasant to write; the harness had two users in the whole corpus |
 | 3 | ~~`process` — a named wrapper over `run_command` + `eprint_str`~~ ✅ | std | none | build scripts; the first Tier 2 capability handle |
-| 4 | `str` — a named module over the string intrinsics | core | none | `substr`/`find`/`trim`/`starts_with` are compiler builtins with no module in front of them, exactly the gap `fs.jtr` describes itself as filling |
+| 4 | ~~`str` — a named module over the string intrinsics~~ ✅ | core | none | `substr`/`find`/`trim`/`starts_with` had no module in front of them; plus the `before`/`after`/`strip_*`/`trim_start`/`trim_end` views that `str_ops.jtr` said you must hand-roll |
 | 5 | ~~`env` expansion (`env_var` intrinsic)~~ ✅ | std | one intrinsic + reseed | configuration, temp dirs |
 | 6 | ~~`time` (`mono_nanos` intrinsic)~~ ✅ | std | one intrinsic + reseed | in-language elapsed measurement |
 | 7 | `fs` expansion — bytes, directory listing, temp files | std | **new intrinsics** + reseed; `fs` is a closure module; `readdir` needs real cross-platform C | build tools, anything that walks a tree |
 | 8 | `fmt` — consolidated deterministic formatting | core | **high** | workstream E; touches types/typeck/cgen |
 | 9 | `sys` | sys | blocked | needs `extern "c"` |
 
-Slice 4 (`str`) is the last remaining *free* one and should be taken next.
-Everything from 7 down pays a new intrinsic. That cost is now measured rather than
-estimated, because slice 5 paid it: **eleven edits and one reseed**, and it went
-byte-identical on the first attempt.
+**Slices 1–6 are all done — the free ones are exhausted.** Everything from 7 down pays
+a new intrinsic or is blocked, so the next stdlib slice is the first one that costs
+something. That cost is measured rather than estimated, because slice 5 paid it:
+**eleven edits and one reseed**, and it went byte-identical on the first attempt.
+
+(The remaining *Tier 2* areas — Reader/Writer, Collections v2, typed paths, the checked
+no-std boundary — are a different axis from this priority list and are tracked in
+`docs/session-notes/jestyr-std-v2-tier2-handoff.md`.)
 
 The eleven sites, as a checklist for the next intrinsic:
 

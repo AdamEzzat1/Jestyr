@@ -8,3 +8,4 @@ cc ee3ff726a78cb57e54f260efd4e8931c22935fa933f2ab9aab8d27cf126e56cf # shrinks to
 cc b598eeac63601295ba2010058f7e95b1c7a0f50e7e54452548dc27e606cea043 # shrinks to m = 1, p = 0, n = 2048, split = 0
 cc 4907e610dcf28e766a7c18cd0827dea25ef33e4c36594c53c9948d9422335dd3 # shrinks to (old, new, want) = ("pub fn f(n: i32) -> i32 { return n }", "pub fn f(n: i32) -> i32 !{ E } { return n }", Breaking)
 cc a93c230d24aad08d815d38e6ec03d242604d15cfc14275a59fe2899c25140cb1 # shrinks to s = ""
+cc 8a0be303e6c45d31e6afcd0a1f583b65d120ba74394a1a97b2b917d178b5a5dd # shrinks to s = "~", t = ""

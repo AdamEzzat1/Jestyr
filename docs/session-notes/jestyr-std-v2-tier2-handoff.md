@@ -1,8 +1,9 @@
 # Std v2 Tier 2 — what remains, and what I verified about it
 
-Cold-start note for the next session. Four of the seven Tier 2 areas are done; this
-covers the other four, plus two standing compiler follow-ups. Written immediately
-after finishing the capability handles, so the measurements in it are fresh.
+Cold-start note for the next session. Three of the seven Tier 2 areas are done and one
+is partly checked; this covers the other four, plus three standing compiler follow-ups.
+`std/str` (§6 item 1) is also done — the roadmap's priority list is now out of *free*
+slices entirely.
 
 **All of it is on `master` and pushed. Start from `master` — there is no branch to
 chase.**
@@ -276,9 +277,9 @@ should be a real one — `strmap.jtr`'s users, or the compiler's symbol table.
 
 ---
 
-## §4. Two standing compiler follow-ups
+## §4. Three standing compiler follow-ups
 
-Both recorded in `docs/stdlib-roadmap.md`'s follow-up list; neither blocks the above.
+Recorded in `docs/stdlib-roadmap.md`'s follow-up list; none of them blocks the above.
 
 1. **Normalize `run_command`'s exit status.** The runtime helper is
    `return (int32_t)system(cp)` — raw. Windows gives the exit code; POSIX specifies a
@@ -288,7 +289,16 @@ Both recorded in `docs/stdlib-roadmap.md`'s follow-up list; neither blocks the a
    platform-specific. The fix is `WEXITSTATUS` in the helper: a runtime change, so it
    owes the `cgen.jtr` mirror **and** a reseed. It is also the clearest concrete
    argument for the `sys` tier.
-2. **Stop emitting `@test`/`@bench` items in non-test mode.** This is the proper fix
+2. **Close the pointer-to-slice assignability hole.** `fn f(read s: []u8)` called as
+   `f(raw)` with `raw: *mut u8` passes typeck — `jestyrc check` prints
+   "assignability … passed" — and fails only in gcc, as `incompatible type for argument
+   1`. That is the exact "degrades to gcc" failure mode the port work spent effort
+   eliminating, and it makes `jestyrc check` a false negative for a mistake that is easy
+   to make (I made it, writing `test_report.finish(c, raw)` against the pre-`fe49492`
+   signature). Probably one arm in the assignability check; it is the same family as the
+   OPEN int→int conversion decision recorded in `[[jestyr-typeck-assignability]]`, so
+   settle both together. Typeck change → mirror + reseed.
+3. **Stop emitting `@test`/`@bench` items in non-test mode.** This is the proper fix
    for the leak in §5 and would let library tests be colocated again. Bigger than one
    predicate: `uses_*` helper gating, forward declarations, and generic-instance
    collection all scan `@test` bodies, and it moves the non-test golden for the three
@@ -358,8 +368,18 @@ Things that cost time this session and will cost it again.
 
 ## §6. Suggested order
 
-1. **`std/str`** — the last *free* slice on the roadmap's priority list, and it makes
-   every later slice easier. Not a Tier 2 area itself, but cheap and load-bearing.
+1. ~~**`std/str`**~~ ✅ — done. `core`, `@no_alloc` throughout, zero imports: named
+   wrappers over the string intrinsics plus the views `examples/str_ops.jtr` said you
+   had to hand-roll (`before`/`after`/`before_last`/`after_last`/`strip_prefix`/
+   `strip_suffix`/`trim_start`/`trim_end`/`strip_cr`/`last_index_of`/`count_of`/
+   `clamped`). Two findings worth carrying:
+   * **`split` already existed** as a for-loop form (`for w in split(s, sep)`,
+     zero-copy views, `examples/histogram.jtr`) — so `std/str` names and *documents* its
+     measured semantics rather than reimplementing it. `split` and `graphemes` being
+     loop forms is also why no function there is called either.
+   * **typeck accepts `*mut u8` where `[]u8` is expected.** `jestyrc check` reports
+     "assignability … passed" and only gcc catches it, as a message about generated C.
+     Same family as the open int→int decision. Recorded in §4 as a follow-up.
 2. **`Reader`/`Writer` (§3.3)** — highest value of the four, and now known not to be
    language-blocked. Settle the four design decisions in writing *first*.
 3. **`@no_os` (§3.1)** — turns the no-std contract from convention into a check, and is

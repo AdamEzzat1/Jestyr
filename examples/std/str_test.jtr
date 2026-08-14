@@ -1,0 +1,262 @@
+// std/str_test.jtr — the unit suite for `std/str`.
+//
+// A sibling file, per the convention in docs/stdlib-roadmap.md: a `@test` function is
+// emitted into every program importing its module, so a suite colocated in a `core`
+// module would put its test code — and `test_report`'s `printf` — into every consumer.
+//
+// Two of these tests exist to catch ME rather than the code:
+// `trim_start_and_trim_end_compose_to_trim` checks my hand-written ASCII whitespace set
+// against the `trim` intrinsic's definition, which I never read; and
+// `split_semantics_are_what_the_header_claims` pins the five behaviours `str.jtr`'s
+// header documents, so the documentation cannot drift from the language.
+//
+// Run:  jestyrc test examples/std/str_test.jtr
+//   →   10 passed; 0 failed
+
+import "str"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 1024
+
+@test fn wrappers_forward_to_the_intrinsics() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.is_true(c, rep, "eq", str.eq("abc", "abc"))
+    test.is_false(c, rep, "eq(differs)", str.eq("abc", "abd"))
+    test.is_true(c, rep, "eq_ignore_case", str.eq_ignore_case("AbC", "aBc"))
+    test.is_true(c, rep, "has_prefix", str.has_prefix("hello", "he"))
+    test.is_true(c, rep, "has_suffix", str.has_suffix("hello", "lo"))
+    test.is_true(c, rep, "has", str.has("hello", "ell"))
+    test.is_false(c, rep, "has(absent)", str.has("hello", "xyz"))
+    test.eq_i64(c, rep, "index_of", str.index_of("hello", "l") as i64, 2)
+    test.eq_i64(c, rep, "index_of(absent)", str.index_of("hello", "z") as i64, -1)
+    test.eq_str(c, rep, "trimmed", str.trimmed("  x  "), "x")
+    test.is_true(c, rep, "is_valid_utf8", str.is_valid_utf8("héllo"))
+    // A two-byte codepoint: 6 bytes, 5 scalars.
+    test.eq_usize(c, rep, "codepoint_count", str.codepoint_count("héllo"), 5)
+    test.eq_usize(c, rep, "byte len differs", str.index_of("héllo", "o") as usize, 5)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **The test that checks my assumption, not the code.** `trim_start`/`trim_end` are
+// hand-written over an ASCII whitespace set I chose (space, tab, LF, CR); `trim` is a
+// compiler intrinsic whose definition I never read. Composing mine must equal theirs,
+// or one of the two is lying to callers.
+@test fn trim_start_and_trim_end_compose_to_trim() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_str(c, rep, "spaces", str.trim_start(str.trim_end("  x  ")), trim("  x  "))
+    test.eq_str(c, rep, "tabs", str.trim_start(str.trim_end("\tx\t")), trim("\tx\t"))
+    test.eq_str(c, rep, "newlines", str.trim_start(str.trim_end("\nx\n")), trim("\nx\n"))
+    test.eq_str(c, rep, "crlf", str.trim_start(str.trim_end("\r\nx\r\n")), trim("\r\nx\r\n"))
+    test.eq_str(c, rep, "mixed", str.trim_start(str.trim_end(" \t\r\n x \n\r\t ")), trim(" \t\r\n x \n\r\t "))
+    test.eq_str(c, rep, "all-space", str.trim_start(str.trim_end("   ")), trim("   "))
+    test.eq_str(c, rep, "empty", str.trim_start(str.trim_end("")), trim(""))
+    test.eq_str(c, rep, "nothing to trim", str.trim_start(str.trim_end("x")), trim("x"))
+    // Interior whitespace must survive both.
+    test.eq_str(c, rep, "interior kept", str.trim_start(str.trim_end("  a b  ")), "a b")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn trim_start_and_trim_end_work_independently() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_str(c, rep, "trim_start", str.trim_start("  x  "), "x  ")
+    test.eq_str(c, rep, "trim_end", str.trim_end("  x  "), "  x")
+    test.eq_str(c, rep, "trim_start(none)", str.trim_start("x  "), "x  ")
+    test.eq_str(c, rep, "trim_end(none)", str.trim_end("  x"), "  x")
+    test.eq_usize(c, rep, "trim_start(all ws)", str.trim_start(" \t\n").len, 0)
+    test.eq_usize(c, rep, "trim_end(all ws)", str.trim_end(" \t\n").len, 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// `strip_cr` removes exactly ONE carriage return and never a space — that separation is
+// the reason it is not just `trim_end`.
+@test fn strip_cr_takes_one_cr_and_nothing_else() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_str(c, rep, "one cr", str.strip_cr("line\r"), "line")
+    test.eq_str(c, rep, "no cr", str.strip_cr("line"), "line")
+    test.eq_str(c, rep, "only one", str.strip_cr("line\r\r"), "line\r")
+    test.eq_str(c, rep, "space kept", str.strip_cr("line \r"), "line ")
+    test.eq_str(c, rep, "trailing space not eaten", str.strip_cr("line "), "line ")
+    test.eq_usize(c, rep, "empty", str.strip_cr("").len, 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn strip_prefix_and_suffix_return_the_input_on_a_miss() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_str(c, rep, "strip_prefix", str.strip_prefix("--flag", "--"), "flag")
+    test.eq_str(c, rep, "strip_prefix(miss)", str.strip_prefix("flag", "--"), "flag")
+    test.eq_str(c, rep, "strip_suffix", str.strip_suffix("file.jtr", ".jtr"), "file")
+    test.eq_str(c, rep, "strip_suffix(miss)", str.strip_suffix("file.txt", ".jtr"), "file.txt")
+    // A pattern longer than the input must not underflow the length arithmetic.
+    test.eq_str(c, rep, "suffix longer than input", str.strip_suffix("a", "aaaa"), "a")
+    test.eq_str(c, rep, "prefix longer than input", str.strip_prefix("a", "aaaa"), "a")
+    // Stripping the whole string leaves empty, not the input.
+    test.eq_usize(c, rep, "strip whole", str.strip_prefix("ab", "ab").len, 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The documented asymmetry: on a miss `before` yields everything and `after` yields
+// nothing, so the two never both claim the whole string.
+@test fn before_and_after_split_on_the_first_separator() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_str(c, rep, "before", str.before("key=value", "="), "key")
+    test.eq_str(c, rep, "after", str.after("key=value", "="), "value")
+    test.eq_str(c, rep, "before(first only)", str.before("a=b=c", "="), "a")
+    test.eq_str(c, rep, "after(first only)", str.after("a=b=c", "="), "b=c")
+    test.eq_str(c, rep, "before(miss)", str.before("nope", "="), "nope")
+    test.eq_usize(c, rep, "after(miss) is empty", str.after("nope", "=").len, 0)
+    // A multi-byte separator is consumed whole.
+    test.eq_str(c, rep, "before(multi)", str.before("a::b", "::"), "a")
+    test.eq_str(c, rep, "after(multi)", str.after("a::b", "::"), "b")
+    // A separator at the very end leaves an empty tail, not a fault.
+    test.eq_usize(c, rep, "after(trailing sep)", str.after("a=", "=").len, 0)
+    test.eq_usize(c, rep, "before(leading sep)", str.before("=a", "=").len, 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn before_last_and_after_last_split_on_the_final_separator() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_str(c, rep, "before_last", str.before_last("a.b.c", "."), "a.b")
+    test.eq_str(c, rep, "after_last", str.after_last("a.b.c", "."), "c")
+    test.eq_str(c, rep, "before_last(miss)", str.before_last("abc", "."), "abc")
+    test.eq_usize(c, rep, "after_last(miss)", str.after_last("abc", ".").len, 0)
+    test.eq_str(c, rep, "single sep", str.before_last("a.b", "."), "a")
+    test.eq_usize(c, rep, "sep at end", str.after_last("a.", ".").len, 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn last_index_of_and_count_of_handle_the_empty_needle() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_i64(c, rep, "last_index_of", str.last_index_of("a.b.c", ".") as i64, 3)
+    test.eq_i64(c, rep, "last_index_of(first)", str.last_index_of("a.bc", ".") as i64, 1)
+    test.eq_i64(c, rep, "last_index_of(at 0)", str.last_index_of("abc", "a") as i64, 0)
+    test.eq_i64(c, rep, "last_index_of(absent)", str.last_index_of("abc", "z") as i64, -1)
+    test.eq_i64(c, rep, "needle longer", str.last_index_of("a", "aaaa") as i64, -1)
+    // Empty needle: `index_of` gives 0, `last_index_of` gives s.len — both ends.
+    test.eq_i64(c, rep, "index_of(empty)", str.index_of("abc", "") as i64, 0)
+    test.eq_i64(c, rep, "last_index_of(empty)", str.last_index_of("abc", "") as i64, 3)
+
+    // Non-overlapping counting, and 0 for an empty needle (the anti-infinite-loop rule).
+    test.eq_usize(c, rep, "count_of", str.count_of("a,b,c", ","), 2)
+    test.eq_usize(c, rep, "count_of(none)", str.count_of("abc", ","), 0)
+    test.eq_usize(c, rep, "count_of(non-overlapping)", str.count_of("aaa", "aa"), 1)
+    test.eq_usize(c, rep, "count_of(adjacent)", str.count_of("aaaa", "aa"), 2)
+    test.eq_usize(c, rep, "count_of(empty needle)", str.count_of("abc", ""), 0)
+    test.eq_usize(c, rep, "count_of(whole)", str.count_of("abc", "abc"), 1)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn matches_at_and_clamped_stay_in_bounds() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.is_true(c, rep, "matches_at", str.matches_at("hello", 1, "ell"))
+    test.is_false(c, rep, "matches_at(no)", str.matches_at("hello", 0, "ell"))
+    test.is_false(c, rep, "matches_at(past end)", str.matches_at("hello", 3, "ello"))
+    test.is_false(c, rep, "matches_at(way past)", str.matches_at("hello", 99, "e"))
+    test.is_true(c, rep, "matches_at(empty)", str.matches_at("hello", 2, ""))
+
+    // `clamped` pulls out-of-range bounds in rather than faulting the way `s[a..b]` does.
+    test.eq_str(c, rep, "clamped(in range)", str.clamped("hello", 1, 3), "el")
+    test.eq_str(c, rep, "clamped(hi past end)", str.clamped("hello", 3, 99), "lo")
+    test.eq_usize(c, rep, "clamped(both past)", str.clamped("hello", 90, 99).len, 0)
+    test.eq_usize(c, rep, "clamped(inverted)", str.clamped("hello", 4, 1).len, 0)
+    test.eq_str(c, rep, "clamped(whole)", str.clamped("hello", 0, 5), "hello")
+
+    test.is_true(c, rep, "is_empty", str.is_empty(""))
+    test.is_false(c, rep, "is_empty(no)", str.is_empty("x"))
+    test.is_true(c, rep, "is_blank(spaces)", str.is_blank(" \t\n"))
+    test.is_true(c, rep, "is_blank(empty)", str.is_blank(""))
+    test.is_false(c, rep, "is_blank(no)", str.is_blank(" x "))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **Pins the five `split` behaviours `str.jtr`'s header documents.** The module claims
+// them in prose; without this, the prose could drift from the language and nobody would
+// notice. `split` is a for-loop form, so each case is counted rather than collected.
+@test fn split_semantics_are_what_the_header_claims() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var fields: i64 = 0
+    var empties: i64 = 0
+    for w in split("a,,b", ",") {
+        fields = fields + 1
+        if w.len == 0 { empties = empties + 1 }
+    }
+    test.eq_i64(c, rep, "empty fields kept: count", fields, 3)
+    test.eq_i64(c, rep, "empty fields kept: empties", empties, 1)
+
+    var trailing: i64 = 0
+    for w in split("a,b,", ",") { trailing = trailing + 1 }
+    test.eq_i64(c, rep, "trailing sep yields a final empty", trailing, 3)
+
+    var of_empty: i64 = 0
+    for w in split("", ",") { of_empty = of_empty + 1 }
+    test.eq_i64(c, rep, "empty source is ONE empty field", of_empty, 1)
+
+    var no_sep: i64 = 0
+    for w in split("abc", ",") { no_sep = no_sep + 1 }
+    test.eq_i64(c, rep, "no separator is one field", no_sep, 1)
+
+    var multi: i64 = 0
+    for w in split("a::b", "::") { multi = multi + 1 }
+    test.eq_i64(c, rep, "multi-byte separator", multi, 2)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

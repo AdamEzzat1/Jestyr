@@ -7,6 +7,48 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/str` — the named module in front of the string intrinsics.** `core` tier, zero
+  imports, every function `@no_alloc`, every result a view. Two halves: thin wrappers so
+  that when `extern "c"` retires an intrinsic one module changes rather than every call
+  site (`eq`, `eq_ignore_case`, `has_prefix`, `has_suffix`, `has`, `index_of`, `trimmed`,
+  `is_valid_utf8`, `codepoint_count`, `grapheme_count`); and the operations that were
+  genuinely missing — `before`/`after`, `before_last`/`after_last`,
+  `strip_prefix`/`strip_suffix`, `trim_start`/`trim_end`/`strip_cr`, `last_index_of`,
+  `count_of`, `matches_at`, `clamped`, `is_empty`/`is_blank`. `examples/str_ops.jtr` said
+  it outright — "with `find` + `substr` you can split by hand" — and that hand-splitting
+  is what these replace.
+
+  **It deliberately does not reimplement `split`**, which already exists as a for-loop
+  form handing back zero-copy views (`for w in split(s, sep)`,
+  `examples/histogram.jtr`). A library cursor beside it would be two ways to do one
+  thing, so the module documents `split`'s semantics instead — measured, not guessed:
+  empty fields kept, a trailing separator yielding a final empty field, `split("")`
+  giving *one* empty field rather than none, multi-byte separators working. `split` and
+  `graphemes` being loop forms is also why nothing here is named either.
+
+  Decisions made for reasons rather than symmetry: `before` returns all of `s` on a miss
+  while `after` returns nothing, so the pair never both claim the whole string;
+  `count_of` counts 0 for an empty needle, because the alternative invites an infinite
+  loop in any caller advancing by the needle's length; `last_index_of("")` is `s.len`
+  where `index_of("")` is 0, which is what makes `after_last(s, "")` empty.
+
+  Verified at six layers: 10 `@test`s in the sibling `str_test.jtr`, 9 toolchain-free
+  properties over an independent Rust oracle, 2 bolero fuzz targets (the needle is
+  derived from the fuzz input, so needle-longer-than-haystack and empty-needle cases are
+  actually reached), a differential driving the COMPILED module against that oracle over
+  nine ops, the demo's documented output, and byte-identity with the self-hosted
+  `cgen.jtr`. Two of the Jestyr tests exist to check the author rather than the code: one
+  pins the hand-written ASCII whitespace set against the `trim` intrinsic's definition,
+  the other pins `split`'s five documented behaviours so the prose cannot drift from the
+  language.
+
+  The differential also caught a bug in *itself* rather than the module: its first
+  version stripped trailing `\r`/`\n` greedily from stdout, so `after("\r", "")` —
+  correctly the whole string — compared as empty and failed a correct implementation. It
+  now removes exactly the one terminator `print_str` appends.
+
+  No intrinsic, no closure change, no reseed.
+
 - **All four Tier 2 capability handles — `Fs`, `Clock`, `Env`, `Process`.** `Process`
   landed first; `Fs`, `Clock` and `Env` are added to the existing `fs.jtr`,
   `time.jtr` and `env.jtr` beside the ambient free functions they wrap. One module per

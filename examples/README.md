@@ -199,6 +199,15 @@ The self-hosted compiler and the standard library, all in Jestyr:
     `get`/`has`/`get_or` over the `env_var` intrinsic. Values are `str` VIEWS
     into OS-owned storage — no allocation, nothing to free. Worked examples in
     `env_demo.jtr`. (`get`, not Rust's `var`: `var` is a Jestyr keyword.)
+  * `str.jtr` is the named module in front of the string intrinsics — `eq`,
+    `has_prefix`, `index_of`, `trimmed` forwarding to the builtins, plus the views
+    `str_ops.jtr` says you must hand-roll with `find` + `substr`: `before`/`after`,
+    `before_last`/`after_last`, `strip_prefix`/`strip_suffix`,
+    `trim_start`/`trim_end`/`strip_cr`, `last_index_of`, `count_of`, `clamped`. Every
+    function is `@no_alloc` and every result is a VIEW. It deliberately does **not**
+    reimplement `split`, which is already a for-loop form (`for w in split(s, sep)`) —
+    it documents that form's measured semantics instead. Suite in `str_test.jtr`
+    (10 tests), worked examples in `str_demo.jtr`.
   * `path.jtr` is lexical path manipulation — `base`, `dir`, `ext`, `stem`,
     `is_abs`, `dir_len`, `join`, `normalize`. Every function is `@no_alloc`,
     so "path handling never allocates" is proven rather than promised:
