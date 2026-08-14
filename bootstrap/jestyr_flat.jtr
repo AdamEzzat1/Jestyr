@@ -9579,7 +9579,13 @@ pub fn run__typeck() -> i32 {
 // collection name 2-tuples; `rdepth` the scope depth at each active `region` block entry.
 // `no_alloc`/`deterministic` are the current fn's contract flags. `ret_is_borrow` = the current
 // fn returns by borrow (so a returned borrow is allowed).
-pub struct Esc { scn: List(i32), scst: List(i32), rgn: List(i32), rgst: List(i32), frozen: List(i32), rdepth: List(i32), no_alloc: bool, deterministic: bool, ret_is_borrow: bool, self_borrow: i32, alloc: Allocator, unres: List(i32), pub dsp: List(i32), pub dmsg: String, ta: List(i32), tast: List(i32) }
+// `cons` is the consuming rule's flat mark list (mirrors `FnCtx::consumed`): 4-int entries
+// (name span, binding depth, flag 1=consumed / 0=tombstone). Every `e_bind` pushes a tombstone
+// at bind depth, and the lookup takes the LAST entry matching both text and the name's CURRENT
+// binding depth — so marks from dead or shadowing bindings never leak, and scope pops need no
+// cleanup. `lfloor` is the loop-floor stack (`FnCtx::loop_floor`): scope depth at entry to each
+// enclosing loop-like construct (for / par for / closure).
+pub struct Esc { scn: List(i32), scst: List(i32), rgn: List(i32), rgst: List(i32), frozen: List(i32), rdepth: List(i32), no_alloc: bool, deterministic: bool, ret_is_borrow: bool, self_borrow: i32, alloc: Allocator, unres: List(i32), pub dsp: List(i32), pub dmsg: String, ta: List(i32), tast: List(i32), cons: List(i32), lfloor: List(i32) }
 
 // ---- scope helpers (flat arenas, mirroring typeck's) ----
 
@@ -9614,6 +9620,11 @@ fn e_bind(mut e: Esc, ns: i32, ne: i32, isb: i32) {
     push(i32, e.ta, ne)
     push(i32, e.ta, (len(i32, e.tast) as i32) - 1)
     push(i32, e.ta, 0 - 1)
+    // The consuming rule's tombstone: a rebind is a fresh, unconsumed value.
+    push(i32, e.cons, ns)
+    push(i32, e.cons, ne)
+    push(i32, e.cons, (len(i32, e.scst) as i32) - 1)
+    push(i32, e.cons, 0)
 }
 // Record binding `src[ns..ne]` (in the CURRENT scope) as an alias reaching depth `d` —
 // item 5's residue (a): `var alias = h` inherits `h`'s effective depth, transitively.
@@ -9677,6 +9688,36 @@ fn e_scope_depth_of(read e: Esc, read src: str, ns: usize, ne: usize) -> i32 {
         }
     }
     return 0 - 1
+}
+// Is `src[ns..ne]`'s CURRENT binding consumed? Backward scan for the last `cons` entry
+// matching both the text and the binding's depth — a shadowing inner binding's marks sit at
+// a deeper depth and never mask the outer one, and every `e_bind` pushed a tombstone, so
+// marks from dead same-depth bindings are always masked. Mirrors `FnCtx::is_consumed`.
+fn e_is_consumed(read e: Esc, read src: str, ns: usize, ne: usize) -> bool {
+    let dep: i32 = e_scope_depth_of(e, src, ns, ne)
+    if dep < 0 { return false }
+    var i: i32 = len(i32, e.cons) as i32
+    for i >= 4 {
+        i = i - 4
+        if get__list(i32, e.cons, (i + 2) as usize) == dep {
+            let cns: i32 = get__list(i32, e.cons, i as usize)
+            let cne: i32 = get__list(i32, e.cons, (i + 1) as usize)
+            if str_eq(src[ns .. ne], src[cns as usize .. cne as usize]) {
+                return get__list(i32, e.cons, (i + 3) as usize) == 1
+            }
+        }
+    }
+    return false
+}
+// Record `src[ns..ne]`'s binding as consumed, at its BINDING depth — the mark outlives inner
+// blocks and dies (via the depth match above) with the binding. Mirrors `FnCtx::mark_consumed`.
+fn e_mark_consumed(mut e: Esc, read src: str, ns: i32, ne: i32) {
+    let dep: i32 = e_scope_depth_of(e, src, ns as usize, ne as usize)
+    if dep < 0 { return }
+    push(i32, e.cons, ns)
+    push(i32, e.cons, ne)
+    push(i32, e.cons, dep)
+    push(i32, e.cons, 1)
 }
 // Mark `src[ns..ne]` region-tainted in the innermost region scope.
 fn e_bind_region(mut e: Esc, ns: i32, ne: i32) {
@@ -10054,6 +10095,179 @@ fn mcall_row(read c: Checker, id: i32) -> i32 {
         i = i + 1
     }
     return 0 - 1
+}
+
+// ---- the consuming rule (use-after-`take` of a droppable; mirrors take_shape /
+//      droppable_ty / consume_take_arg + the FnCtx consumed set) ----
+
+// Does the expression's type run drop glue the callee now owns? v1 answers "a Named type
+// with a direct concrete `impl Drop`" — the same items scan as cgen's `has_drop_impl`
+// (duplicated here because the import goes the other way). Transitively-droppable
+// aggregates, blanket generic `impl[T] Drop` instances, and concrete-generic-instance
+// impls are the reference gate's `impl_index` reach beyond this — recorded residue, no
+// corpus file distinguishes them. Drop-free values stay unmarked ON PURPOSE: giving one
+// to `take` is an implicit copy (MVS; the Option-combinator shape).
+fn droppable_expr(read p: Parser, read c: Checker, read src: str, eid: i32) -> bool {
+    let tid: i32 = get__list(i32, c.et, eid as usize)
+    if tid < 0 { return false }
+    let td: TyData = get__list(TyData, c.tys, tid as usize)
+    if td.kind != 15 { return false }                 // Named
+    let tns: i32 = get__list(i32, c.tdecl, (td.x * 10 + 0) as usize)
+    let tne: i32 = get__list(i32, c.tdecl, (td.x * 10 + 1) as usize)
+    var r: i32 = 0
+    for r < len(i32, p.roots) {
+        let iid: i32 = get__list(i32, p.roots, r)
+        let it: ItemData = get__list(ItemData, p.it, iid as usize)
+        if it.kind == 7 and it.h <= 0 {
+            if str_eq(src[it.x .. it.y], "Drop") {
+                let tt: TypeData = get__list(TypeData, p.ty, it.a as usize)
+                if tt.kind == 0 {
+                    if str_eq(src[tt.start .. tt.end], src[tns as usize .. tne as usize]) { return true }
+                }
+            }
+        }
+        r = r + 1
+    }
+    return false
+}
+
+// Is the method-sugar RECEIVER of call `id` a `take` receiver? Free-fn-methods answer from
+// the recorded `mcalls` resolution (runtime[0]); a plain struct method resolves through the
+// receiver's Named struct type, like cgen's `resolve_method_call` (the reference reads the
+// recorded `MethodRes.recv_conv`, which covers both the same way).
+fn recv_is_take(read p: Parser, read c: Checker, read src: str, id: i32, callee: i32) -> bool {
+    let cal: ExprData = get__list(ExprData, p.ex, callee as usize)
+    if cal.kind != 5 { return false }
+    let mr: i32 = mcall_row(c, id)
+    if mr >= 0 {
+        let iid: i32 = get__list(i32, c.fns, (mr * 12 + 9) as usize)
+        let f: ItemData = get__list(ItemData, p.it, iid as usize)
+        var pi: i32 = 0
+        for pi < f.b {
+            let pbase: i32 = f.a + pi * 7
+            if get__list(i32, p.iar, pbase as usize) == 0 {
+                return get__list(i32, p.iar, (pbase + 1) as usize) == 3
+            }
+            pi = pi + 1
+        }
+        return false
+    }
+    // A plain struct method: base types as a Named struct declaring the method.
+    let brow: i32 = get__list(i32, c.et, cal.a as usize)
+    if brow < 0 { return false }
+    let btd: TyData = get__list(TyData, c.tys, brow as usize)
+    if btd.kind != 15 { return false }
+    if get__list(i32, c.tdecl, (btd.x * 10 + 2) as usize) != 0 { return false }
+    let sns: i32 = get__list(i32, c.tdecl, (btd.x * 10 + 0) as usize)
+    let sne: i32 = get__list(i32, c.tdecl, (btd.x * 10 + 1) as usize)
+    var r: i32 = 0
+    for r < len(i32, p.roots) {
+        let iid: i32 = get__list(i32, p.roots, r)
+        let it: ItemData = get__list(ItemData, p.it, iid as usize)
+        if it.kind == 4 {
+            if str_eq(src[it.x .. it.y], src[sns as usize .. sne as usize]) {
+                var m: i32 = 0
+                for m < it.b {
+                    let base: i32 = it.a + m * 10
+                    if get__list(i32, p.mar, base as usize) == 1 {
+                        let fid: i32 = get__list(i32, p.mar, (base + 1) as usize)
+                        let fd: ItemData = get__list(ItemData, p.it, fid as usize)
+                        if str_eq(src[cal.x as usize .. cal.y as usize], src[fd.x .. fd.y]) {
+                            var pi: i32 = 0
+                            for pi < fd.b {
+                                let pbase: i32 = fd.a + pi * 7
+                                if get__list(i32, p.iar, (pbase + 4) as usize) == 1 {
+                                    return get__list(i32, p.iar, (pbase + 1) as usize) == 3
+                                }
+                                pi = pi + 1
+                            }
+                            return false
+                        }
+                    }
+                    m = m + 1
+                }
+                return false
+            }
+        }
+        r = r + 1
+    }
+    return false
+}
+
+// Does explicit argument `ai` of call `id` land on a `take` parameter? The same resolution
+// chain as `check_give_away` (method sugar: runtime[ai+1]; bare call: param `ai`), so the
+// consuming rule and route 4 agree on which positions consume.
+fn arg_is_take(read p: Parser, read c: Checker, read src: str, id: i32, callee: i32, ai: i32) -> bool {
+    let mr: i32 = mcall_row(c, id)
+    if mr >= 0 {
+        let iid: i32 = get__list(i32, c.fns, (mr * 12 + 9) as usize)
+        let f: ItemData = get__list(ItemData, p.it, iid as usize)
+        var rti: i32 = 0
+        var pi: i32 = 0
+        for pi < f.b {
+            let pbase: i32 = f.a + pi * 7
+            if get__list(i32, p.iar, pbase as usize) == 0 {
+                if rti == ai + 1 { return get__list(i32, p.iar, (pbase + 1) as usize) == 3 }
+                rti = rti + 1
+            }
+            pi = pi + 1
+        }
+        return false
+    }
+    let cal: ExprData = get__list(ExprData, p.ex, callee as usize)
+    if cal.kind != 2 { return false }
+    let fr: i32 = fn_row_by_span(c, src, cal.start, cal.end)
+    if fr < 0 { return false }
+    let iid: i32 = get__list(i32, c.fns, (fr * 12 + 9) as usize)
+    let f: ItemData = get__list(ItemData, p.it, iid as usize)
+    if ai < f.b { return get__list(i32, p.iar, (f.a + ai * 7 + 1) as usize) == 3 }
+    return false
+}
+
+// The consuming rule's marking half (mirrors `consume_take_arg`): a droppable bare-Name
+// OWNED local given to `take` is marked consumed at its binding (a borrow already got
+// route 4's give-away error). Inside a loop or closure, consuming a binding declared
+// outside it is refused at the consume site. A droppable Field/Index PROJECTION is
+// refused outright: the container still owns (and will drop) that part, so the callee's
+// drop — which the take-drop rule in cgen now emits — would be a second drop.
+fn consume_take_arg(mut e: Esc, read p: Parser, read c: Checker, read src: str, arg: i32) {
+    let ad: ExprData = get__list(ExprData, p.ex, arg as usize)
+    if ad.kind == 2 {
+        if e_lookup(e, src, ad.start, ad.end) != 0 { return }
+        if !droppable_expr(p, c, src, arg) { return }
+        if len(i32, e.lfloor) > 0 {
+            let lf: i32 = get__list(i32, e.lfloor, len(i32, e.lfloor) - 1)
+            let dep: i32 = e_scope_depth_of(e, src, ad.start, ad.end)
+            if dep >= 0 and dep < lf {
+                var sb: String = string_new()
+                string_push(sb, "cannot give `")
+                string_push(sb, src[ad.start .. ad.end])
+                string_push(sb, "` to a `take` parameter here: `")
+                string_push(sb, src[ad.start .. ad.end])
+                string_push(sb, "` is declared outside the enclosing loop or closure, which may run again — and the value is already gone the second time")
+                ediag(e, ad.start, ad.end, string_view(sb))
+                string_free(sb)
+                return
+            }
+        }
+        e_mark_consumed(e, src, ad.start as i32, ad.end as i32)
+        return
+    }
+    if ad.kind == 5 or ad.kind == 6 {
+        let rp: i32 = root_place(e, p, c, src, arg)
+        let rd: ExprData = get__list(ExprData, p.ex, rp as usize)
+        if rd.kind != 2 { return }
+        if e_lookup(e, src, rd.start, rd.end) != 0 { return }
+        if !droppable_expr(p, c, src, arg) { return }
+        var sb: String = string_new()
+        string_push(sb, "cannot give a droppable part of `")
+        string_push(sb, src[rd.start .. rd.end])
+        string_push(sb, "` to a `take` parameter: `")
+        string_push(sb, src[rd.start .. rd.end])
+        string_push(sb, "` still owns it and will drop it — the callee's drop would be a second one")
+        ediag(e, ad.start, ad.end, string_view(sb))
+        string_free(sb)
+    }
 }
 
 // Give-away (route 4): passing a borrow to a `take` parameter. Method sugar maps receiver ->
@@ -10497,13 +10711,33 @@ fn walk_expr(mut e: Esc, read p: Parser, read c: Checker, read src: str, id: i32
     let k: i32 = d.kind
     if k == 24 {                                   // if
         walk_expr(e, p, c, src, d.a, false)
-        check_block(e, p, c, src, d.b, tail)
-        if d.op >= 0 { walk_expr(e, p, c, src, d.op, tail) }
+        // The consuming rule forks branches and merges by UNION (mirrors the
+        // reference): marks only ever APPEND to `cons`, so the then-branch's
+        // tail is set aside, `else` runs from the pre-branch state, and the
+        // tail is re-appended. A lone `if` keeps its marks sticky.
+        if d.op >= 0 {
+            let cfloor: usize = len(i32, e.cons)
+            check_block(e, p, c, src, d.b, tail)
+            var thn: List(i32) = make__list(i32, e.alloc)
+            var ti: usize = cfloor
+            for ti < len(i32, e.cons) { push(i32, thn, get__list(i32, e.cons, ti))  ti = ti + 1 }
+            truncate(i32, e.cons, cfloor)
+            walk_expr(e, p, c, src, d.op, tail)
+            var tj: usize = 0
+            for tj < len(i32, thn) { push(i32, e.cons, get__list(i32, thn, tj))  tj = tj + 1 }
+            free(i32, thn)
+        } else {
+            check_block(e, p, c, src, d.b, tail)
+        }
         return
     }
     if k == 28 {                                   // match
         let scrut_borrow: bool = is_borrow_place(e, p, c, src, d.a)
         walk_expr(e, p, c, src, d.a, false)
+        // Arms fork like `if` branches: each starts from the pre-match consumed
+        // state; the arms' marks accumulate and re-append after the last arm.
+        let cfloor: usize = len(i32, e.cons)
+        var acc: List(i32) = make__list(i32, e.alloc)
         var i: i32 = 0
         for i < d.y {
             let base: i32 = d.x + i * 3
@@ -10515,8 +10749,14 @@ fn walk_expr(mut e: Esc, read p: Parser, read c: Checker, read src: str, id: i32
             if g >= 0 { walk_expr(e, p, c, src, g, false) }
             walk_expr(e, p, c, src, get__list(i32, p.par, (base + 2) as usize), tail)
             e_pop(e)
+            var ai: usize = cfloor
+            for ai < len(i32, e.cons) { push(i32, acc, get__list(i32, e.cons, ai))  ai = ai + 1 }
+            truncate(i32, e.cons, cfloor)
             i = i + 1
         }
+        var aj: usize = 0
+        for aj < len(i32, acc) { push(i32, e.cons, get__list(i32, acc, aj))  aj = aj + 1 }
+        free(i32, acc)
         return
     }
     if k == 23 { check_block(e, p, c, src, id, tail)  return }             // block
@@ -10647,8 +10887,21 @@ fn walk_expr(mut e: Esc, read p: Parser, read c: Checker, read src: str, id: i32
             }
         }
         walk_expr(e, p, c, src, d.a, false)
+        // The consuming rule marks each droppable `take` argument's binding AS the
+        // arguments are walked, in evaluation order (receiver first) — so `g(d, d)`
+        // with two `take` params reports the second `d` as a use-after-consume, and
+        // the use half sees every later read. Mirrors the reference's Call arm.
+        if recv_is_take(p, c, src, id, d.a) {
+            let calx: ExprData = get__list(ExprData, p.ex, d.a as usize)
+            if calx.kind == 5 { consume_take_arg(e, p, c, src, calx.a) }
+        }
         var i: i32 = 0
-        for i < d.y { walk_expr(e, p, c, src, get__list(i32, p.ar, (d.x + i) as usize), false)  i = i + 1 }
+        for i < d.y {
+            let arg: i32 = get__list(i32, p.ar, (d.x + i) as usize)
+            walk_expr(e, p, c, src, arg, false)
+            if arg_is_take(p, c, src, id, d.a, i) { consume_take_arg(e, p, c, src, arg) }
+            i = i + 1
+        }
         check_give_away(e, p, c, src, id, d.a, d.x, d.y)
         check_loop_mutation(e, p, c, src, id, d.a, d.x, d.y)
         check_slice_alias(e, p, c, src, id, d.a, d.x, d.y)
@@ -10669,6 +10922,9 @@ fn walk_expr(mut e: Esc, read p: Parser, read c: Checker, read src: str, id: i32
     }
     else if k == 7 or k == 8 or k == 11 { walk_expr(e, p, c, src, d.a, false) }                   // deref/try/cast
     else if k == 37 {                              // closure: params shadow; body checked, no escape
+        // A closure body may run any number of times — loop-like for the
+        // consuming rule (a captured outer droppable must not be `take`n inside).
+        push(i32, e.lfloor, len(i32, e.scst) as i32)
         e_push(e)
         var i: i32 = 0
         for i < d.y {
@@ -10678,6 +10934,7 @@ fn walk_expr(mut e: Esc, read p: Parser, read c: Checker, read src: str, id: i32
         }
         walk_expr(e, p, c, src, d.a, false)
         e_pop(e)
+        truncate(i32, e.lfloor, len(i32, e.lfloor) - 1)
     }
     else if k == 38 {                              // concurrent
         if e.deterministic {
@@ -10712,10 +10969,13 @@ fn walk_expr(mut e: Esc, read p: Parser, read c: Checker, read src: str, id: i32
     else if k == 41 {                              // par for
         walk_expr(e, p, c, src, d.a, false)        // iter
         walk_expr(e, p, c, src, d.b, false)        // reduction
+        // The body runs once per element — a loop for the consuming rule.
+        push(i32, e.lfloor, len(i32, e.scst) as i32)
         e_push(e)
         e_bind(e, d.x, d.y, 0)                      // var: fresh i64
         walk_expr(e, p, c, src, d.op, false)       // body
         e_pop(e)
+        truncate(i32, e.lfloor, len(i32, e.lfloor) - 1)
         return
     }
     else if k == 42 {                              // select
@@ -10735,6 +10995,21 @@ fn walk_expr(mut e: Esc, read p: Parser, read c: Checker, read src: str, id: i32
         return
     }
     else if k == 31 { walk_for(e, p, c, src, id)  return }
+
+    // The consuming rule's use half: this binding was given to a `take` parameter,
+    // so the callee owns it and its destructor has already run — reading, passing,
+    // or reassigning it reads a dropped value. (Falls through: a tail Name still
+    // gets the region-return checks below, like the reference's Name arm.)
+    if k == 2 {
+        if e_is_consumed(e, src, d.start, d.end) {
+            var sb: String = string_new()
+            string_push(sb, "cannot use `")
+            string_push(sb, src[d.start .. d.end])
+            string_push(sb, "` after it was given to a `take` parameter: ownership moved at the call")
+            ediag(e, d.start, d.end, string_view(sb))
+            string_free(sb)
+        }
+    }
 
     // tail: region-value return
     if tail {
@@ -10804,6 +11079,10 @@ fn walk_for(mut e: Esc, read p: Parser, read c: Checker, read src: str, id: i32)
             ediag(e, d.start, d.end, "a region-scoped loop allocates a scratch arena — forbidden in a `@no_alloc` function")
         }
     }
+    // Consuming rule: a binding declared OUTSIDE the loop must not be given to
+    // `take` inside it — the floor is the depth before the loop's scopes open,
+    // popped before `els` (which runs exactly once).
+    push(i32, e.lfloor, len(i32, e.scst) as i32)
     e_push(e)
     var froze: i32 = 0
     if d.op == 1 { walk_expr(e, p, c, src, get__list(i32, p.lar, (base + 4) as usize), false) }   // while cond
@@ -10860,6 +11139,7 @@ fn walk_for(mut e: Esc, read p: Parser, read c: Checker, read src: str, id: i32)
     var f: i32 = 0
     for f < froze { truncate(i32, e.frozen, len(i32, e.frozen) - 2)  f = f + 1 }
     e_pop(e)
+    truncate(i32, e.lfloor, len(i32, e.lfloor) - 1)
     if d.x >= 0 { check_block(e, p, c, src, d.x, false) }   // else, in enclosing scope
 }
 
@@ -10942,7 +11222,7 @@ fn check_items(mut e: Esc, read p: Parser, read c: Checker, read src: str) {
 // its buffered diagnostics (`dsp` span pairs + `dmsg` newline-separated messages, walk order).
 // The library entry the self-hosted driver imports; `escape_cli.jtr` dumps it for the P4 golden.
 pub fn check_program(read p: Parser, read c: Checker, read src: str, read a: Allocator) -> Esc {
-    var e: Esc = Esc{ scn: make__list(i32, a), scst: make__list(i32, a), rgn: make__list(i32, a), rgst: make__list(i32, a), frozen: make__list(i32, a), rdepth: make__list(i32, a), no_alloc: false, deterministic: false, ret_is_borrow: false, self_borrow: 0, alloc: a, unres: make__list(i32, a), dsp: make__list(i32, a), dmsg: string_new(), ta: make__list(i32, a), tast: make__list(i32, a) }
+    var e: Esc = Esc{ scn: make__list(i32, a), scst: make__list(i32, a), rgn: make__list(i32, a), rgst: make__list(i32, a), frozen: make__list(i32, a), rdepth: make__list(i32, a), no_alloc: false, deterministic: false, ret_is_borrow: false, self_borrow: 0, alloc: a, unres: make__list(i32, a), dsp: make__list(i32, a), dmsg: string_new(), ta: make__list(i32, a), tast: make__list(i32, a), cons: make__list(i32, a), lfloor: make__list(i32, a) }
     check_items(e, p, c, src)
     finalize_unresolved(e, p, c, src)
     unsafe_boundary(e, p, c, a)
@@ -14875,7 +15155,9 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // (ns, ne, range `ExprId`) triples for each enclosing exclusive `for i in 0..s.len` loop, so a
 // provably-in-range `s[i]` elides its bounds check (mirrors `cur_refines`/`index_in_range`).
 // `mv` holds the current fn's *moved-out* local-name spans (ns,ne pairs — the reference's
-// `cur_moved`; only `emit_fn` populates it, method/impl bodies run with it empty). `ds` is the
+// `cur_moved`; free fns AND method/impl bodies all collect it, like the reference). `tkd` is the
+// pending take-param drop list (`cur_take_drops`): pre-filtered 4-int `ds`-format entries armed
+// per fn, drained ONCE by `emit_body` into the root drop scope. `ds` is the
 // flattened drop-scope stack: 4-int entries (local ns, ne, type-name ns, ne) of live droppable
 // locals; `dsb` holds each open scope's start offset into `ds`. `autoret` marks a method/impl body
 // (the reference's empty `cur_ret_cty`) so a spilled return uses `__auto_type`.
@@ -14898,7 +15180,7 @@ fn line_at(mut sb: String, depth: i32, read text: str) {
 // `gfi` holds the collected generic-fn instance records ([fn item, argc, (kind,a,b) targ
 // triples…], variable length — walk with a cursor); `su` is the ACTIVE instance's
 // type-parameter substitution (5-tuples: tparam span + arg triple), read by `emit_su_ty`.
-struct Cg { sds: List(i32), pfs: List(i32), pfb: String, pfo: List(i32), tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, sw: bool, ll_ns: i32, ll_ne: i32, swb: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32, dg: i32, gmi: List(i32), tmode: bool, alloc: Allocator, dmap: List(i32), dmods: List(i32), dnb: String, dall: String, dnl: List(i32), dbg_on: bool, dbgl_m: i32, dbgl_l: i32 }
+struct Cg { sds: List(i32), pfs: List(i32), pfb: String, pfo: List(i32), tmp: i32, pp: List(i32), rf: List(i32), res_ok: i32, etags: List(i32), req: List(i32), ens: List(i32), retty: i32, mi: List(i32), self_ptr: bool, gei: List(i32), curfn: i32, mv: List(i32), tkd: List(i32), ds: List(i32), dsb: List(i32), autoret: bool, bl_ns: i32, bl_ne: i32, bl_fe: i32, sw: bool, ll_ns: i32, ll_ne: i32, swb: i32, cl_ns: i32, cl_ne: i32, sr_ns: i32, sr_ne: i32, vt: List(i32), vtf: i32, gfi: List(i32), su: List(i32), cls: List(i32), ccx: List(i32), cca: List(i32), caps: List(i32), gsi: List(i32), sps: List(i32), dspawn: bool, th: List(i32), thf: i32, dg: i32, gmi: List(i32), tmode: bool, alloc: Allocator, dmap: List(i32), dmods: List(i32), dnb: String, dall: String, dnl: List(i32), dbg_on: bool, dbgl_m: i32, dbgl_l: i32 }
 
 // The integer tag of an error name `src[ns..ne]` in the whole-program tag map (`etags` holds
 // (start,end) src-span pairs, first-seen order across every fn's error set; tag = index + 1).
@@ -16309,10 +16591,45 @@ fn register_drop_local(mut g: Cg, read p: Parser, read src: str, read c: Checker
     push(i32, g.ds, tne)
 }
 
+// The fn's droppable `take` parameters, pre-filtered into `ds`-format 4-tuples (name span,
+// type-name span) awaiting the body's ROOT drop scope — a `take` parameter is an ownership
+// transfer, so the callee is the new owner and drops it at scope exit unless the body moves
+// it on. Mirrors `take_param_drops` + the `register_drop_local` filters, applied at fill
+// time (after the move analysis) since a param is not a `let`: skip `self`, `comptime`,
+// non-`take`, moved-on (`mv`), and non-droppable annotations. Only a bare-Name annotation
+// registers — a blanket-droppable `Ctor(T)` param and a substituted tparam `take x: T`
+// instance are the recorded later increment, the same class as template-body lets under
+// subst (the reference registers those; no corpus file reaches them yet).
+fn fill_take_drops(mut g: Cg, read p: Parser, read src: str, read it: ItemData) {
+    truncate(i32, g.tkd, 0)
+    var i: i32 = 0
+    for i < it.b {
+        let base: i32 = it.a + i * 7
+        let comp: i32 = get__list(i32, p.iar, base as usize)
+        let conv: i32 = get__list(i32, p.iar, (base + 1) as usize)
+        let is_self: i32 = get__list(i32, p.iar, (base + 4) as usize)
+        let pty: i32 = get__list(i32, p.iar, (base + 5) as usize)
+        if comp == 0 and conv == 3 and is_self == 0 and pty >= 0 {
+            let pns: i32 = get__list(i32, p.iar, (base + 2) as usize)
+            let pne: i32 = get__list(i32, p.iar, (base + 3) as usize)
+            let t: TypeData = get__list(TypeData, p.ty, pty as usize)
+            if t.kind == 0 and !is_moved_name(g, src, pns, pne) {
+                if needs_drop_name(p, src, t.start as i32, t.end as i32) {
+                    push(i32, g.tkd, pns)
+                    push(i32, g.tkd, pne)
+                    push(i32, g.tkd, t.start as i32)
+                    push(i32, g.tkd, t.end as i32)
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
 // ---- move analysis (mirrors collect_moved / collect_moved_expr — over-approximated, leak-safe:
 // a name is "moved" if returned, bound to a `take` param, captured into a literal, or rebound;
-// borrows never move. Only `emit_fn_defs` runs this; method/impl bodies keep `mv` empty, exactly
-// like the reference's `cur_moved` lifecycle.) ----
+// borrows never move. Free fns AND method/impl bodies all run this, exactly like the reference's
+// `cur_moved` lifecycle since the take-drop fix.) ----
 
 // Mark `eid`'s span moved if it is exactly a bare Name.
 fn mv_mark(mut g: Cg, read p: Parser, eid: i32) {
@@ -16678,6 +16995,17 @@ fn emit_stmt(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
 fn emit_body(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg, block_eid: i32, ret: bool, depth: i32) {
     line_at(sb, depth, "{")
     drop_scope_enter(g)
+    // Pending droppable `take` params (armed per fn) join the ROOT drop scope before any
+    // statement — drained here, once, so nested blocks find the list empty. Mirrors
+    // `register_take_drops`; emits nothing, so requires-asserts below are unaffected.
+    if len(i32, g.tkd) > 0 {
+        var tk: usize = 0
+        for tk < len(i32, g.tkd) {
+            push(i32, g.ds, get__list(i32, g.tkd, tk))
+            tk = tk + 1
+        }
+        truncate(i32, g.tkd, 0)
+    }
     // Pending `requires` preconditions (armed per fn by emit_fn_defs) fire as asserts at the top
     // of the FN body only — consumed here so nested blocks don't re-emit them.
     if len(i32, g.req) > 0 {
@@ -19037,6 +19365,11 @@ fn emit_method_defs(mut sb: String, read p: Parser, read src: str, read c: Check
         g.retty = fd.z
         g.curfn = fid
         g.autoret = true                              // the reference leaves `cur_ret_cty` unset here
+        // Methods own their `take` params exactly as free fns do, and the move analysis
+        // must run for the same reason (mirrors `emit_method_decl` post-take-drop-fix).
+        truncate(i32, g.mv, 0)
+        collect_moved_block(g, p, src, fd.w)
+        fill_take_drops(g, p, src, fd)
         // A fallible method body constructs ITS result type: `ok`/`err`/`?` inside it
         // consult `res_ok`, exactly as in a fallible free function (mirrors
         // `emit_method_decl` setting `cur_result`).
@@ -19048,6 +19381,7 @@ fn emit_method_defs(mut sb: String, read p: Parser, read src: str, read c: Check
         g.retty = 0 - 1
         g.autoret = false
         truncate(i32, g.pp, 0)
+        truncate(i32, g.mv, 0)
         string_push(sb, "\n")
         k = k + 2
     }
@@ -19073,6 +19407,14 @@ fn emit_method_defs(mut sb: String, read p: Parser, read src: str, read c: Check
         g.retty = mf.z
         g.curfn = mfit
         g.autoret = true
+        // Worklist methods collect moved too (mirrors `emit_method_decl`). A CONCRETE
+        // receiver (empty subst — plain methods ride this loop since fddf02a) fills its
+        // droppable `take` params from the raw annotations, exactly like a free fn; an
+        // armed-subst instance needs the SUBSTITUTED type — the recorded later
+        // increment, the same class as template-body lets under subst.
+        truncate(i32, g.mv, 0)
+        collect_moved_block(g, p, src, mf.w)
+        if len(i32, g.su) == 0 { fill_take_drops(g, p, src, mf) }
         // Fallible generic method: `ok`/`err`/`?` construct the INSTANCE's result
         // (res_ok resolves through the still-armed subst in emit_result_name).
         let gmfall: bool = fn_is_fallible__cgen(p, mf)
@@ -19084,6 +19426,7 @@ fn emit_method_defs(mut sb: String, read p: Parser, read src: str, read c: Check
         g.autoret = false
         truncate(i32, g.pp, 0)
         truncate(i32, g.su, 0)
+        truncate(i32, g.mv, 0)
         string_push(sb, "\n")
         let argc: i32 = get__list(i32, g.gmi, (rb + 1) as usize)
         rb = rb + 3 + argc * 3
@@ -19275,7 +19618,7 @@ fn emit_impl_protos(mut sb: String, read p: Parser, read src: str, read c: Check
 // Trait-impl method definitions (mirrors `impl_defs` -> `emit_impl_method_decl(body=true)`):
 // sig + body + blank each, after the struct-method defs. The body runs like a struct method's —
 // `self_ptr` for a `mut`/`out self`, the method's `mut`/`out` params by pointer, `autoret` (the
-// reference leaves `cur_ret_cty` unset), and an EMPTY move set (only `emit_fn` collects moved).
+// reference leaves `cur_ret_cty` unset), its own move set, and its droppable `take` params.
 fn emit_impl_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg) {
     var r: i32 = 0
     for r < len(i32, p.roots) {
@@ -19305,6 +19648,11 @@ fn emit_impl_defs(mut sb: String, read p: Parser, read src: str, read c: Checker
                     g.retty = fd.z
                     g.curfn = mid
                     g.autoret = true
+                    // An impl method owns its `take` params too (mirrors
+                    // `emit_impl_method_decl` post-take-drop-fix).
+                    truncate(i32, g.mv, 0)
+                    collect_moved_block(g, p, src, fd.w)
+                    fill_take_drops(g, p, src, fd)
                     // A fallible impl body constructs ITS result type: ok/err/?
                     // consult res_ok, exactly as a fallible struct method
                     // (trait-errors T2; Self ok resolves to the target).
@@ -19316,6 +19664,7 @@ fn emit_impl_defs(mut sb: String, read p: Parser, read src: str, read c: Checker
                     g.retty = 0 - 1
                     g.autoret = false
                     truncate(i32, g.pp, 0)
+                    truncate(i32, g.mv, 0)
                     string_push(sb, "\n")
                 }
                 k = k + 1
@@ -23719,9 +24068,10 @@ fn emit_fn_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, 
             if fallible { g.res_ok = it.z } else { g.res_ok = 0 - 2 }
             g.curfn = iid
             // The fn's move analysis: locals whose value escapes are never drop-registered.
-            // Only free fns collect (mirrors `emit_fn` — method/impl bodies keep `mv` empty).
             truncate(i32, g.mv, 0)
             collect_moved_block(g, p, src, it.w)
+            // Droppable `take` params join the body's root drop scope (the callee owns them).
+            fill_take_drops(g, p, src, it)
             let returns_value: bool = it.z >= 0 or fallible
             // Map the emitted body back to its `.jtr` declaration line; reset the
             // dedup so this entry directive always fires for a new function.
@@ -23945,7 +24295,7 @@ fn emit_program(mut sb: String, read p: Parser, read c: Checker, read src: str, 
     var dmods2: List(i32) = make__list(i32, a)
     var dcj: usize = 0
     for dcj < len(i32, dmods) { push(i32, dmods2, get__list(i32, dmods, dcj))  dcj = dcj + 1 }
-    var g: Cg = Cg{ sds: make__list(i32, a), pfs: make__list(i32, a), pfb: string_new(), pfo: make__list(i32, a), tmp: 0, pp: make__list(i32, a), rf: make__list(i32, a), res_ok: 0 - 2, etags: make__list(i32, a), req: make__list(i32, a), ens: make__list(i32, a), retty: 0 - 1, mi: make__list(i32, a), self_ptr: false, gei: make__list(i32, a), curfn: 0 - 1, mv: make__list(i32, a), ds: make__list(i32, a), dsb: make__list(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, sw: false, ll_ns: 0 - 1, ll_ne: 0 - 1, swb: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: make__list(i32, a), vtf: 0, gfi: make__list(i32, a), su: make__list(i32, a), cls: make__list(i32, a), ccx: make__list(i32, a), cca: make__list(i32, a), caps: make__list(i32, a), gsi: make__list(i32, a), sps: make__list(i32, a), dspawn: false, th: make__list(i32, a), thf: 0, dg: 0 - 1, gmi: make__list(i32, a), tmode: tmode, alloc: a, dmap: dmap2, dmods: dmods2, dnb: dnbb, dall: dallb, dnl: dnl0, dbg_on: len(i32, dmap) > 0, dbgl_m: 0 - 1, dbgl_l: 0 - 1 }
+    var g: Cg = Cg{ sds: make__list(i32, a), pfs: make__list(i32, a), pfb: string_new(), pfo: make__list(i32, a), tmp: 0, pp: make__list(i32, a), rf: make__list(i32, a), res_ok: 0 - 2, etags: make__list(i32, a), req: make__list(i32, a), ens: make__list(i32, a), retty: 0 - 1, mi: make__list(i32, a), self_ptr: false, gei: make__list(i32, a), curfn: 0 - 1, mv: make__list(i32, a), tkd: make__list(i32, a), ds: make__list(i32, a), dsb: make__list(i32, a), autoret: false, bl_ns: 0 - 1, bl_ne: 0 - 1, bl_fe: 0 - 1, sw: false, ll_ns: 0 - 1, ll_ne: 0 - 1, swb: 0 - 1, cl_ns: 0 - 1, cl_ne: 0 - 1, sr_ns: 0 - 1, sr_ne: 0 - 1, vt: make__list(i32, a), vtf: 0, gfi: make__list(i32, a), su: make__list(i32, a), cls: make__list(i32, a), ccx: make__list(i32, a), cca: make__list(i32, a), caps: make__list(i32, a), gsi: make__list(i32, a), sps: make__list(i32, a), dspawn: false, th: make__list(i32, a), thf: 0, dg: 0 - 1, gmi: make__list(i32, a), tmode: tmode, alloc: a, dmap: dmap2, dmods: dmods2, dnb: dnbb, dall: dallb, dnl: dnl0, dbg_on: len(i32, dmap) > 0, dbgl_m: 0 - 1, dbgl_l: 0 - 1 }
     collect_spawns(g, p, src)                        // spawn sites (gates the pthread prelude)
     build_error_tags(g, p, src)                      // whole-program error-name -> tag map
     // Plain-struct methods now flow through the SAME worklist as generic instances

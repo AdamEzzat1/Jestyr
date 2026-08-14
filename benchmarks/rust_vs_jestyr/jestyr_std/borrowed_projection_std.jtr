@@ -1,0 +1,89 @@
+// borrowed_projection_std — the jestyr-std track: same case as
+// jestyr/borrowed_projection.jtr, but the token buffer is a `std/list`
+// `List(Token)` instead of a hand-rolled `alloc` + `slice` pair. The
+// projections still return the 24-byte `@copy` Token BY VALUE (that gap
+// is the case's story and no library can close it) — what changes is
+// only who owns the buffer: RAII instead of `free_ptr`, `push` instead
+// of manual indexing, and `list.get` instead of a bounds-checked slice
+// index. `get` is caller-checked (unchecked), so this track also
+// measures slice bounds checks against the std API's unchecked access.
+//
+// Output must be byte-identical to the rust-std and jestyr tracks.
+
+import "../../../examples/std/list"
+import "../../../examples/std/mem"
+
+const N: i64 = 2000000
+const LOOKUPS: i64 = 2000000
+const MOD: i64 = 1000000007
+
+@copy struct Token { kind: i64, start: i64, len: i64 }
+
+fn lcg(state: i64) -> i64 {
+    return (state * 48271) % 2147483647
+}
+
+// Rust: fn first(xs: &[Token]) -> &Token. Here: a copy comes back.
+fn first(read xs: list.List(Token)) -> Token {
+    return list.get(Token, xs, 0)
+}
+
+fn at(read xs: list.List(Token), i: usize) -> Token {
+    return list.get(Token, xs, i)
+}
+
+// Max-by-len, first occurrence wins. Rust hands back a borrow; this
+// hands back a copy of the winner.
+fn longest(read xs: list.List(Token)) -> Token {
+    var best: Token = list.get(Token, xs, 0)
+    for i in 0..list.len(Token, xs) {
+        let t: Token = list.get(Token, xs, i)
+        if t.len > best.len {
+            best = t
+        }
+    }
+    return best
+}
+
+// Field projection through a read parameter.
+fn kind_of(read t: Token) -> i64 {
+    return t.kind
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var toks: list.List(Token) = list.make(Token, a)
+    var s: i64 = 20260813
+    var start: i64 = 0
+    var bi: i64 = 0
+    for bi < N {
+        s = lcg(s)
+        let kind: i64 = s % 12
+        s = lcg(s)
+        let len: i64 = s % 24 + 1
+        list.push(Token, toks, Token { kind: kind, start: start, len: len })
+        start = start + len
+        bi = bi + 1
+    }
+
+    // Random-access lookups through the value-return of `at`.
+    s = 777
+    var sum: i64 = 0
+    var i: i64 = 0
+    for i < LOOKUPS {
+        s = lcg(s)
+        let t: Token = at(toks, (s % N) as usize)
+        sum = (sum + t.start % 1000003 + t.len * 31 + kind_of(t)) % MOD
+        i = i + 1
+    }
+
+    // Whole-list projections.
+    let f: Token = first(toks)
+    let l: Token = longest(toks)
+
+    print_int(sum)
+    print_int(f.kind * 1000 + f.len)
+    print_int(l.start % 1000003)
+    print_int(l.len)
+    return 0
+}

@@ -1,11 +1,15 @@
-// KNOWN-GAP PROBE — this COMPILES today, and the case argues it should
-// not. Use after take: `d` was given to `consume`, but the giver's
-// binding is not poisoned, so the read below is accepted and returns
-// the stale copy (deterministic under C value semantics — not UB, but
-// not a move either). Rust's twin probe (rejected.rs) is refused with
-// E0382. Tracked as measured input to safety-mosaic item 7 (linear
-// capabilities); NOT named *_rejected.jtr because check_rejections.ps1
-// would rightly fail it.
+// SEMANTICS PROBE — this COMPILES BY DESIGN (it was a KNOWN-GAP probe;
+// the gap is now closed where it mattered). Device here is DROP-FREE,
+// and a drop-free non-Copy value given to `take` is an MVS implicit
+// copy: nothing observable is left behind in the caller, so the read
+// below returns a well-defined copy — deliberately unlike Rust, which
+// refuses any non-Copy use-after-move (E0382). The line Jestyr draws
+// instead: add a `Drop` impl to Device and the same program is REFUSED
+// ("cannot use `d` after it was given to a `take` parameter") — that
+// twin is resource_capabilities_rejected.jtr, and the callee now drops
+// its take parameter, closing the leak this suite's first pass found.
+// Residue: a wrapper that is only TRANSITIVELY droppable does not yet
+// poison (the checker's v1 gate is a direct `impl Drop`).
 
 struct Device { id: i64, energy: i64 }
 

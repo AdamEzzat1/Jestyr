@@ -6,12 +6,13 @@
 // the taken value is directly mutable in the callee, so the shapes
 // match Rust's `mut d: Device` by-value idiom one-for-one.
 //
-// The HONEST GAP (measured by resource_capabilities_gap.jtr): Jestyr
-// does not yet poison the giver's binding — use-after-take compiles and
-// reads the stale copy, where Rust refuses with E0382. And a take
-// parameter the callee does not return is never dropped (probed during
-// this suite; see results/ANALYSIS.md) — the linear-capability design
-// (safety-mosaic item 7, DESIGN-ONLY) is what would close both.
+// The two gaps this suite's first pass found are CLOSED: a take
+// parameter the callee does not return is now dropped BY the callee
+// ("the new owner drops it"), and use-after-take of a DROPPABLE is
+// refused (resource_capabilities_rejected.jtr — the E0382 twin). The
+// line Jestyr draws differently from Rust: Device here is drop-free, so
+// take is an implicit MVS copy and this pipeline needs no poisoning —
+// see resource_capabilities_gap.jtr for that semantics probe.
 //
 // Output must be byte-identical to the Rust twin.
 

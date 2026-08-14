@@ -351,6 +351,7 @@ fn emit_program(
         error_traces,
         drop_stack: Vec::new(),
         cur_moved: HashSet::new(),
+        cur_take_drops: Vec::new(),
         fn_item_index: ast
             .items
             .iter()
@@ -787,6 +788,16 @@ struct Cgen<'a> {
     /// (any by-value escape suppresses the drop), so the result is leak-safe: a
     /// value is dropped at most once, never twice.
     cur_moved: HashSet<String>,
+    /// The current function's `take` parameters (name + substituted type), awaiting
+    /// registration into the body's ROOT drop scope. A `take` parameter is an
+    /// ownership transfer, so the callee is the value's new owner (`drop.jtr`: "the
+    /// new owner drops it") — it must drop at the callee's scope exit exactly like a
+    /// `let`-declared local, unless the body moves it on again (`cur_moved`, applied
+    /// by `register_drop_local` as for any local). Filled by the fn/method emitters,
+    /// drained ONCE by the first body emission after `drop_scope_enter` — a nested
+    /// block's `emit_body` finds it empty. `take self` is not yet registered
+    /// (deferred until droppable-with-methods files need it, with the port).
+    cur_take_drops: Vec<DropLocal>,
     /// Address of each top-level `Item::Fn`'s `FnDecl` → its index in `ast.items`,
     /// so [`fn_canon`](Self::fn_canon) can resolve a `&FnDecl` to its owning item
     /// in O(1) instead of scanning every item by `ptr::eq`. Built once; the `Ast`
@@ -2504,6 +2515,7 @@ impl<'a> Cgen<'a> {
         let mut moved = HashSet::new();
         self.collect_moved(&f.body, &mut moved);
         self.cur_moved = moved;
+        self.cur_take_drops = self.take_param_drops(f);
 
         let sig = self.fn_signature(f, c_name);
         let returns_value = self.ret_type(f) != "void";
@@ -2522,6 +2534,7 @@ impl<'a> Cgen<'a> {
         self.cur_refines.clear();
         self.cur_no_panic = false;
         self.cur_moved.clear();
+        self.cur_take_drops.clear();
     }
 
     /// Like `emit_body`, but prefixed with the function's `requires`
@@ -2530,6 +2543,7 @@ impl<'a> Cgen<'a> {
         self.line("{");
         self.depth += 1;
         self.drop_scope_enter();
+        self.register_take_drops();
         for r in requires {
             // Point a precondition's `assert` at the `requires` clause itself, so a
             // contract failure blames the `.jtr` contract, not generated C (incr. c).
@@ -2812,6 +2826,34 @@ impl<'a> Cgen<'a> {
     /// Open a drop scope for a `{ }` block.
     fn drop_scope_enter(&mut self) {
         self.drop_stack.push(Vec::new());
+    }
+
+    /// The `take` parameters of `f` (name + type under the current substitution) —
+    /// the values this function now owns and is responsible for dropping. All are
+    /// collected; `register_drop_local` applies the `needs_drop`/`cur_moved`
+    /// filters at registration, so a `take` parameter the body returns or hands on
+    /// is skipped exactly like a moved local.
+    fn take_param_drops(&mut self, f: &FnDecl) -> Vec<DropLocal> {
+        let mut out = Vec::new();
+        for p in &f.params {
+            if p.is_self || p.comptime || p.conv != Conv::Take {
+                continue;
+            }
+            let Some(tid) = p.ty else { continue };
+            let ty = self.ast_type_to_ty(tid, &self.subst);
+            out.push(DropLocal { name: p.name.name.clone(), ty });
+        }
+        out
+    }
+
+    /// Register the pending `take` parameters into the drop scope just opened —
+    /// the function body's ROOT scope, since this drains on the FIRST body
+    /// emission and a nested block's `emit_body` finds it already empty. Placed
+    /// before any statement, so an early `return` drops them too.
+    fn register_take_drops(&mut self) {
+        for d in std::mem::take(&mut self.cur_take_drops) {
+            self.register_drop_local(&d.name, &d.ty);
+        }
     }
 
     /// Close the innermost drop scope, emitting its locals' drops in reverse
@@ -3464,6 +3506,7 @@ impl<'a> Cgen<'a> {
         self.line("{");
         self.depth += 1;
         self.drop_scope_enter();
+        self.register_take_drops();
         let n = block.stmts.len();
         for (i, stmt) in block.stmts.iter().enumerate() {
             let last = i + 1 == n;
@@ -6782,6 +6825,13 @@ impl<'a> Cgen<'a> {
         // `@no_panic`/`@inline`/`@cold`/… are honoured on methods too (they emit as
         // free C functions), so the attribute machinery must follow them here.
         self.cur_no_panic = f.no_panic;
+        // Methods own their `take` parameters exactly as free functions do, and the
+        // move analysis must run for the same reason: a `take` parameter the body
+        // returns (or stores on) is moved, not dropped here.
+        let mut moved = HashSet::new();
+        self.collect_moved(&f.body, &mut moved);
+        self.cur_moved = moved;
+        self.cur_take_drops = self.take_param_drops(f);
 
         let prefix = self.fn_attr_prefix(f);
         // A fallible method returns its tagged result struct, exactly as a fallible
@@ -6815,6 +6865,8 @@ impl<'a> Cgen<'a> {
         self.subst.clear();
         self.cur_no_panic = false;
         self.cur_result.clear();
+        self.cur_moved.clear();
+        self.cur_take_drops.clear();
     }
 
     fn method_protos(&mut self) {
@@ -6903,6 +6955,12 @@ impl<'a> Cgen<'a> {
             .collect();
         self.cur_ensures.clear();
         self.cur_no_panic = f.no_panic;
+        // Same as `emit_method_decl`: an impl method owns its `take` parameters,
+        // and the move analysis decides which of them it merely hands on.
+        let mut moved = HashSet::new();
+        self.collect_moved(&f.body, &mut moved);
+        self.cur_moved = moved;
+        self.cur_take_drops = self.take_param_drops(f);
 
         let prefix = self.fn_attr_prefix(f);
         // Trait-errors T1: a fallible impl method returns its tagged result
@@ -6939,6 +6997,8 @@ impl<'a> Cgen<'a> {
         self.subst.clear();
         self.cur_no_panic = false;
         self.cur_result.clear();
+        self.cur_moved.clear();
+        self.cur_take_drops.clear();
     }
 
     fn impl_protos(&mut self) {
@@ -11002,7 +11062,9 @@ mod tests {
     #[test]
     fn taken_droppable_is_not_dropped_by_caller() {
         // The complement: a `take` argument *consumes* — the callee owns it, so the
-        // caller must NOT also drop it (that would double-free).
+        // caller must NOT also drop it (that would double-free). The value still
+        // drops EXACTLY once: in the callee, whose `take` parameter joined its root
+        // drop scope ("the new owner drops it" — `drop.jtr`).
         let src = "trait Drop { fn drop(mut self) } struct R { n: i32 } \
             impl Drop for R { fn drop(mut self) { print_int(self.n) } } \
             fn consume(take r: R) {} \
@@ -11011,8 +11073,67 @@ mod tests {
         assert!(d.is_empty(), "{:?}", d);
         assert_eq!(
             c.matches("jestyr_impl_Drop__R__drop(&j_r)").count(),
-            0,
-            "a taken droppable must not be dropped by the caller:\n{c}"
+            1,
+            "a taken droppable drops exactly once (in the callee):\n{c}"
+        );
+        // rsplit: the DEFINITION is the last occurrence (a prototype precedes it),
+        // and cutting at the closing brace isolates one body.
+        let caller = c
+            .rsplit("void jestyr_f(")
+            .next()
+            .and_then(|s| s.split("\n}").next())
+            .unwrap_or("");
+        assert!(
+            !caller.contains("jestyr_impl_Drop__R__drop"),
+            "the caller must not drop a value it gave away:\n{c}"
+        );
+        let callee = c
+            .rsplit("void jestyr_consume(")
+            .next()
+            .and_then(|s| s.split("\n}").next())
+            .unwrap_or("");
+        assert!(
+            callee.contains("jestyr_impl_Drop__R__drop(&j_r)"),
+            "the callee owns its `take` parameter and drops it at scope exit:\n{c}"
+        );
+    }
+
+    #[test]
+    fn returned_take_param_is_not_dropped_by_callee() {
+        // A `take` parameter the body RETURNS is moved on — the callee is no longer
+        // the owner at scope exit, so it must emit no drop glue for it (the same
+        // `cur_moved` rule that protects a returned local).
+        let src = "trait Drop { fn drop(mut self) } struct R { n: i32 } \
+            impl Drop for R { fn drop(mut self) { print_int(self.n) } } \
+            fn pass_on(take r: R) -> R { return r }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        let callee = c
+            .rsplit("jestyr_pass_on(")
+            .next()
+            .and_then(|s| s.split("\n}").next())
+            .unwrap_or("");
+        assert!(
+            !callee.contains("jestyr_impl_Drop__R__drop"),
+            "a returned `take` parameter is moved, not dropped:\n{c}"
+        );
+    }
+
+    #[test]
+    fn method_take_param_drops_in_callee() {
+        // Methods own their `take` parameters exactly as free functions do — the
+        // parameter joins the method body's root drop scope. The only drop call in
+        // this program is the one inside `put` (nothing else ever owns an `R`).
+        let src = "trait Drop { fn drop(mut self) } struct R { n: i32 } \
+            impl Drop for R { fn drop(mut self) { print_int(self.n) } } \
+            struct S { n: i32, fn put(mut self, take r: R) { print_int(self.n) } } \
+            fn f() { var s = S{ n: 3 } s.put(R{ n: 1 }) }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        assert_eq!(
+            c.matches("jestyr_impl_Drop__R__drop(&j_r)").count(),
+            1,
+            "a method's `take` parameter drops exactly once, in the method:\n{c}"
         );
     }
 

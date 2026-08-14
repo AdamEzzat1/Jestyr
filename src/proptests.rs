@@ -9561,6 +9561,75 @@ fn g(p: *mut i32) -> i32 {
         assert_eq!(got2, want2, "the toolchains disagree on a legal same-region alias");
     }
 
+    /// **The consuming rule, differentially** — the corpus never reuses a droppable
+    /// after `take` (that leak was invisible for exactly this reason), so probes
+    /// carry the rule: use-after-consume FIRES with the same message on both
+    /// toolchains for a free-fn arg, a struct-method `take self` receiver, a loop
+    /// consume, and a droppable projection; the drop-free reuse (MVS implicit
+    /// copy) and the both-branches shape stay LEGAL on both.
+    #[test]
+    fn jestyr_use_after_consume_matches_reference() {
+        let exe = build_exe("examples/std/escape_cli.jtr");
+        let prelude = "trait Drop { fn drop(mut self) } \
+            struct Device { id: i64 } \
+            impl Drop for Device { fn drop(mut self) { print_int(self.id) } } \
+            fn consume(take d: Device) -> i64 { return d.id } ";
+        let cases: [(&str, &str, &str); 6] = [
+            (
+                "use_after",
+                "fn main() -> i64 { let d = Device{ id: 7 } let e = consume(d) print_int(d.id) return e }",
+                "cannot use `d` after it was given to a `take` parameter",
+            ),
+            (
+                "take_self_recv",
+                "struct Eater { n: i64, fn eat(take self) -> i64 { return self.n } } \
+                 impl Drop for Eater { fn drop(mut self) { print_int(self.n) } } \
+                 fn main() -> i64 { let x = Eater{ n: 2 } let a = x.eat() return a + x.n }",
+                "cannot use `x` after it was given to a `take` parameter",
+            ),
+            (
+                "loop_consume",
+                "fn main() -> i64 { let d = Device{ id: 1 } var i: i64 = 0 \
+                 for i < 3 { let e = consume(d) i = i + e } return i }",
+                "outside the enclosing loop or closure",
+            ),
+            (
+                "projection",
+                "struct Holder { dev: Device } \
+                 fn main() -> i64 { let h = Holder{ dev: Device{ id: 1 } } return consume(h.dev) }",
+                "cannot give a droppable part of `h`",
+            ),
+            (
+                "drop_free_reuse",
+                "struct Plain { v: i64 } fn eat(take q: Plain) -> i64 { return q.v } \
+                 fn main() -> i64 { let q = Plain{ v: 3 } let a = eat(q) return a + eat(q) }",
+                "",
+            ),
+            (
+                "both_branches",
+                "fn main() -> i64 { let d = Device{ id: 1 } \
+                 if d.id > 0 { return consume(d) } else { return consume(d) } }",
+                "",
+            ),
+        ];
+        for (name, body, needle) in cases {
+            let src = format!("{prelude}{body}");
+            let want = rust_escape_dump(&src);
+            if needle.is_empty() {
+                assert!(want.is_empty(), "{name} must stay legal on the reference: {want:?}");
+            } else {
+                assert!(
+                    want.iter().any(|l| l.contains(needle)),
+                    "{name} no longer fires on the reference — replace it with a shape that does: {want:?}"
+                );
+            }
+            let f = std::env::temp_dir().join(format!("jestyr_consume_{name}.jtr"));
+            std::fs::write(&f, &src).unwrap();
+            let got = jestyr_escape_dump(&exe, f.to_str().unwrap());
+            assert_eq!(got, want, "the toolchains disagree on the consuming rule ({name}): {src}");
+        }
+    }
+
     /// **Enum `@copy`, differentially** — the escape consequence of the opt-in must
     /// agree across toolchains: the UN-annotated twin's `read`-param return is
     /// refused on BOTH sides (anti-vacuity — Copy-ness is doing the work), and the
@@ -12279,7 +12348,7 @@ fn main() -> i32 {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr"];
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "drop_take.jtr"];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
     /// target). This is the acceptance bar the R2 fixpoint ultimately rests on. `DUMP_DIVERGE=1`

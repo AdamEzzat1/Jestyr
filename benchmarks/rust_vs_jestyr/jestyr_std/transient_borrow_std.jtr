@@ -1,0 +1,120 @@
+// transient_borrow_std — the jestyr-std track: same case as
+// jestyr/transient_borrow.jtr, but the player buffer is a `std/list`
+// `List(Player)` instead of a hand-rolled `alloc` + `slice` pair, and
+// World holds the List by value (RAII frees it — no `free_ptr`).
+//
+// What the stdlib changes: no raw pointer, no manual capacity, no manual
+// free. What it costs: `List` has no in-place element access — `get`
+// copies the 56-byte Player out and `set` copies it back, where the
+// no-std twin mutates through a `mut` slice element in place. That API
+// gap (a `get_ref`/slice-view is future work) is exactly what this
+// track exists to measure.
+//
+// Output must be byte-identical to the rust-std and jestyr tracks.
+
+import "../../../examples/std/list"
+import "../../../examples/std/mem"
+
+const N: usize = 1000000
+const TICKS: i64 = 40
+const MOD: i64 = 1000000007
+
+struct V3 { x: i64, y: i64, z: i64 }
+struct Player { pos: V3, vel: V3, hp: i64, score: i64 }
+struct World { players: list.List(Player), tick: i64 }
+
+fn lcg(state: i64) -> i64 {
+    return (state * 48271) % 2147483647
+}
+
+// Immutable borrow of the whole world: read every player, mutate nothing.
+fn total_score(read w: World) -> i64 {
+    var t: i64 = 0
+    for i in 0..list.len(Player, w.players) {
+        t = t + list.get(Player, w.players, i).score
+    }
+    return t
+}
+
+// Mutable borrow of one player: clamp hp into [0, 100].
+fn clamp_hp(mut p: Player) {
+    if p.hp < 0 {
+        p.hp = 0
+    }
+    if p.hp > 100 {
+        p.hp = 100
+    }
+}
+
+// Mutable borrow of the whole world: move everyone, damage on schedule,
+// score the survivors. Copy-out / copy-in per element — the std API's shape.
+fn advance(mut w: World) {
+    w.tick = w.tick + 1
+    let damage_round: bool = w.tick % 8 == 0
+    for i in 0..list.len(Player, w.players) {
+        var p: Player = list.get(Player, w.players, i)
+        p.pos.x = p.pos.x + p.vel.x
+        p.pos.y = p.pos.y + p.vel.y
+        p.pos.z = p.pos.z + p.vel.z
+        if damage_round {
+            p.hp = p.hp - (p.pos.x + p.pos.y + p.pos.z) % 7
+            clamp_hp(p)
+        }
+        if p.hp > 0 {
+            p.score = p.score + p.hp % 10
+        }
+        list.set(Player, w.players, i, p)
+    }
+}
+
+// Immutable borrow again: fold the final state into one checksum.
+fn inspect(read w: World) -> i64 {
+    var c: i64 = 0
+    for i in 0..list.len(Player, w.players) {
+        let p: Player = list.get(Player, w.players, i)
+        c = c + p.pos.x * 3 + p.pos.y * 5 + p.pos.z * 7 + p.hp * 11
+        c = c % MOD
+    }
+    return c
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var ps: list.List(Player) = list.make(Player, a)
+    var s: i64 = 20260813
+    for i in 0..N {
+        s = lcg(s)
+        let px: i64 = s % 1000
+        s = lcg(s)
+        let py: i64 = s % 1000
+        s = lcg(s)
+        let pz: i64 = s % 1000
+        s = lcg(s)
+        let vx: i64 = s % 9 - 4
+        s = lcg(s)
+        let vy: i64 = s % 9 - 4
+        s = lcg(s)
+        let vz: i64 = s % 9 - 4
+        s = lcg(s)
+        let hp: i64 = s % 100 + 1
+        list.push(Player, ps, Player {
+            pos: V3 { x: px, y: py, z: pz },
+            vel: V3 { x: vx, y: vy, z: vz },
+            hp: hp,
+            score: 0,
+        })
+    }
+    var w: World = World { players: ps, tick: 0 }
+
+    var score_trace: i64 = 0
+    var t: i64 = 0
+    for t < TICKS {
+        advance(w)
+        score_trace = (score_trace + total_score(w)) % MOD
+        t = t + 1
+    }
+    print_int(score_trace)
+    print_int(inspect(w))
+    print_int(w.tick)
+    return 0
+}

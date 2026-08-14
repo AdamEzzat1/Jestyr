@@ -18,11 +18,13 @@ $rustTarget = Join-Path $root "rust\target\release"
 $cases = @(
     @{ name = "transient_borrow";   tracks = @(
         @{ track = "rust-std";       exe = (Join-Path $rustTarget "transient_borrow.exe");   src = (Join-Path $root "rust\std\transient_borrow\src\main.rs") },
-        @{ track = "jestyr";         jtr = (Join-Path $root "jestyr\transient_borrow.jtr") }
+        @{ track = "jestyr";         jtr = (Join-Path $root "jestyr\transient_borrow.jtr") },
+        @{ track = "jestyr-std";     jtr = (Join-Path $root "jestyr_std\transient_borrow_std.jtr") }
     )},
     @{ name = "borrowed_projection"; tracks = @(
         @{ track = "rust-std";       exe = (Join-Path $rustTarget "borrowed_projection.exe"); src = (Join-Path $root "rust\std\borrowed_projection\src\main.rs") },
-        @{ track = "jestyr";         jtr = (Join-Path $root "jestyr\borrowed_projection.jtr") }
+        @{ track = "jestyr";         jtr = (Join-Path $root "jestyr\borrowed_projection.jtr") },
+        @{ track = "jestyr-std";     jtr = (Join-Path $root "jestyr_std\borrowed_projection_std.jtr") }
     )},
     @{ name = "disjoint_mutation";  tracks = @(
         @{ track = "rust-std";       exe = (Join-Path $rustTarget "disjoint_mutation.exe");  src = (Join-Path $root "rust\std\disjoint_mutation\src\main.rs") },
@@ -31,17 +33,20 @@ $cases = @(
     @{ name = "observer_registry";  tracks = @(
         @{ track = "rust-std";       exe = (Join-Path $rustTarget "observer_registry.exe");  src = (Join-Path $root "rust\std\observer_registry\src\main.rs") },
         @{ track = "rust-idiomatic"; exe = (Join-Path $rustTarget "observer_registry_idiomatic.exe"); src = (Join-Path $root "rust\idiomatic\observer_registry\src\main.rs") },
-        @{ track = "jestyr";         jtr = (Join-Path $root "jestyr\observer_registry.jtr") }
+        @{ track = "jestyr";         jtr = (Join-Path $root "jestyr\observer_registry.jtr") },
+        @{ track = "jestyr-std";     jtr = (Join-Path $root "jestyr_std\observer_registry_std.jtr") }
     )},
     @{ name = "arena_ast";          tracks = @(
         @{ track = "rust-std";       exe = (Join-Path $rustTarget "arena_ast.exe");          src = (Join-Path $root "rust\std\arena_ast\src\main.rs") },
         @{ track = "rust-idiomatic"; exe = (Join-Path $rustTarget "arena_ast_idiomatic.exe"); src = (Join-Path $root "rust\idiomatic\arena_ast\src\main.rs") },
-        @{ track = "jestyr";         jtr = (Join-Path $root "jestyr\arena_ast.jtr") }
+        @{ track = "jestyr";         jtr = (Join-Path $root "jestyr\arena_ast.jtr") },
+        @{ track = "jestyr-std";     jtr = (Join-Path $root "jestyr_std\arena_ast_std.jtr") }
     )},
     @{ name = "dlist";              tracks = @(
         @{ track = "rust-std";       exe = (Join-Path $rustTarget "dlist.exe");              src = (Join-Path $root "rust\std\dlist\src\main.rs") },
         @{ track = "rust-idiomatic"; exe = (Join-Path $rustTarget "dlist_idiomatic.exe");    src = (Join-Path $root "rust\idiomatic\dlist\src\main.rs") },
-        @{ track = "jestyr";         jtr = (Join-Path $root "jestyr\dlist.jtr") }
+        @{ track = "jestyr";         jtr = (Join-Path $root "jestyr\dlist.jtr") },
+        @{ track = "jestyr-std";     jtr = (Join-Path $root "jestyr_std\dlist_std.jtr") }
     )},
     @{ name = "resource_capabilities"; tracks = @(
         @{ track = "rust-std";       exe = (Join-Path $rustTarget "resource_capabilities.exe"); src = (Join-Path $root "rust\std\resource_capabilities\src\main.rs") },
