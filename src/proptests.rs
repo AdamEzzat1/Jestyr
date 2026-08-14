@@ -3466,6 +3466,31 @@ mod path_props {
         assert!(d.is_empty(), "examples/std/path.jtr: {d:?}");
     }
 
+    /// **The four Tier 2 capability handles.** `Fs`, `Clock`, `Env` (added to the
+    /// existing `fs`/`time`/`env` modules) and `Process`, plus the composed demo, all
+    /// lower with no diagnostics — and the three suites live in sibling files, which
+    /// for `fs` and `env` is not merely convention: they are self-host closure
+    /// modules, so a `@test` inside them would be compiled into the flattened
+    /// compiler itself.
+    #[test]
+    fn capability_handles_compile_clean() {
+        for f in [
+            "fs.jtr", "env.jtr", "time.jtr", "process.jtr", "caps_demo.jtr",
+            "fs_test.jtr", "env_test.jtr", "time_test.jtr",
+        ] {
+            let d = diags_of(&format!("examples/std/{f}"));
+            assert!(d.is_empty(), "examples/std/{f}: {d:?}");
+        }
+        for m in ["fs", "env", "time", "process"] {
+            let prog = crate::module::load(&format!("examples/std/{m}.jtr"));
+            let tests = crate::cgen::list_tests(&prog.ast, &prog.modules.item_mod);
+            assert!(
+                tests.is_empty(),
+                "std/{m} must declare no @test — the suite is {m}_test.jtr; found {tests:?}"
+            );
+        }
+    }
+
     /// **`std/test_fixture` — the OS-facing half of the test slice.** The module,
     /// its demo and its suite all lower with no diagnostics, and the module ships no
     /// `@test` of its own (the suite is the sibling file).
@@ -13058,7 +13083,7 @@ fn main() -> i32 {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr", "test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr"];
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr", "test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr", "caps_demo.jtr", "fs_test.jtr", "env_test.jtr", "time_test.jtr"];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
     /// target). This is the acceptance bar the R2 fixpoint ultimately rests on. `DUMP_DIVERGE=1`
@@ -13711,6 +13736,44 @@ fn main() -> i32 {
                 "4",
             ]
         );
+    }
+
+    /// **The capability handles end-to-end — reproducibility is the payoff.** The
+    /// demo builds a "build stamp" from configuration, a clock and the filesystem,
+    /// twice, and the first `1` is the two stamps being byte-identical. That is the
+    /// argument for the whole design: the same subsystem is reproducible with
+    /// `fs.denied()` + `time.manual(0)` + `env.sealed()` and not with `host()`
+    /// handles, and nothing about the subsystem changes between the two.
+    ///
+    /// The `read_only` block is the three-state part: reads pass, the write is
+    /// refused AND counted, and no file appears — checked through a handle that *can*
+    /// read, so the absence is real rather than a permission artifact.
+    #[test]
+    fn caps_demo() {
+        assert_eq!(
+            toks("examples/std/caps_demo.jtr"),
+            [
+                "--", "deterministic", "--", "1", "1", "1", "1",
+                "--", "host", "--", "0", "1",
+                "--", "read_only", "--", "1", "0", "1", "0",
+                "--", "cleanup", "--", "0",
+            ]
+        );
+    }
+
+    /// The three capability suites through the real harness. They touch the real
+    /// filesystem, environment and clock, because a capability that gates real
+    /// effects cannot be tested without them.
+    #[test]
+    fn capability_suites_pass() {
+        for (f, n) in [("fs_test", 5), ("env_test", 5), ("time_test", 5)] {
+            let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
+            assert_eq!(code, 0, "std/{f} must pass:\n{out}");
+            assert!(
+                out.contains(&format!("{n} passed; 0 failed")),
+                "unexpected harness output for {f}:\n{out}"
+            );
+        }
     }
 
     /// **`std/test_fixture` end-to-end.** Every asserted value is a PROPERTY rather

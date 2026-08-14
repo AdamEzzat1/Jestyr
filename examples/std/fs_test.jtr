@@ -1,0 +1,165 @@
+// std/fs_test.jtr — the unit suite for the `Fs` capability in `std/fs`.
+//
+// A sibling file, per the convention in docs/stdlib-roadmap.md — and here it is not
+// merely convention: `fs.jtr` is one of the twelve self-host closure modules, so a
+// `@test` inside it would be compiled into the flattened compiler itself.
+//
+// Every negative result has a positive CONTROL beside it. "The write was refused"
+// only means something if the same write through a `host()` handle lands, so each
+// refusal test does both and lets the filesystem be the witness.
+//
+// Run:  jestyrc test examples/std/fs_test.jtr
+//   →   5 passed; 0 failed
+
+import "fs"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 512
+
+@test fn host_can_do_everything() -> bool {
+    let probe: str = "jestyr_fs_host_test.tmp"
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var h: fs.Fs = fs.host()
+
+    test.is_true(c, rep, "can_read", fs.can_read(h))
+    test.is_true(c, rep, "can_write", fs.can_write(h))
+    test.is_true(c, rep, "put", fs.put(h, probe, "hello"))
+    test.is_true(c, rep, "present", fs.present(h, probe))
+
+    var text: String = fs.open_text(h, probe)
+    test.eq_str(c, rep, "open_text", string_view(text), "hello")
+    string_free(text)
+
+    test.is_true(c, rep, "erase", fs.erase(h, probe))
+    test.is_false(c, rep, "gone", fs.present(h, probe))
+    test.eq_i64(c, rep, "refused", fs.refused(h), 0)
+
+    fs.erase(h, probe)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// THE INTERESTING STATE: reads pass, mutation is refused, and nothing lands. The
+// `host` control writes the same file first so a passing "no file" result cannot be
+// an accident of a bad path.
+@test fn read_only_refuses_mutation_but_allows_reads() -> bool {
+    let probe: str = "jestyr_fs_ro_test.tmp"
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var h: fs.Fs = fs.host()
+    var ro: fs.Fs = fs.read_only()
+
+    // Control: the file exists and is readable, so the reads below are real.
+    fs.put(h, probe, "readable")
+    test.is_true(c, rep, "control wrote it", fs.present(h, probe))
+
+    test.is_true(c, rep, "ro can read", fs.can_read(ro))
+    test.is_false(c, rep, "ro cannot write", fs.can_write(ro))
+    test.is_true(c, rep, "ro present", fs.present(ro, probe))
+    var text: String = fs.open_text(ro, probe)
+    test.eq_str(c, rep, "ro open_text", string_view(text), "readable")
+    string_free(text)
+
+    // Mutation refused, and the file is untouched — both halves matter.
+    test.is_false(c, rep, "ro put refused", fs.put(ro, probe, "overwritten"))
+    test.is_false(c, rep, "ro erase refused", fs.erase(ro, probe))
+    var after: String = fs.open_text(h, probe)
+    test.eq_str(c, rep, "content untouched", string_view(after), "readable")
+    string_free(after)
+    test.is_true(c, rep, "file still there", fs.present(h, probe))
+
+    // Counted, not silent: two refusals, no writes.
+    test.eq_i64(c, rep, "refused twice", fs.refused(ro), 2)
+    test.eq_i64(c, rep, "no writes", fs.writes(ro), 0)
+    test.ne_i64(c, rep, "reads happened", fs.reads(ro), 0)
+
+    fs.erase(h, probe)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// A denied handle cannot even see the file — an existence probe is a read of the
+// directory, and letting it through would leak the shape of a tree the handle exists
+// to hide. Control: `host` sees it fine.
+@test fn denied_cannot_read_or_write() -> bool {
+    let probe: str = "jestyr_fs_denied_test.tmp"
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var h: fs.Fs = fs.host()
+    var d: fs.Fs = fs.denied()
+
+    fs.put(h, probe, "secret")
+    test.is_true(c, rep, "control sees it", fs.present(h, probe))
+
+    test.is_false(c, rep, "denied can_read", fs.can_read(d))
+    test.is_false(c, rep, "denied present", fs.present(d, probe))
+    var text: String = fs.open_text(d, probe)
+    test.eq_usize(c, rep, "denied read is empty", text.len, 0)
+    string_free(text)
+    test.is_false(c, rep, "denied put", fs.put(d, probe, "x"))
+    // Three OPERATIONS were refused — `present`, `open_text`, `put`. `can_read` is a
+    // pure query and deliberately does not count as an attempt: asking a handle what
+    // it permits is not itself an act needing permission.
+    test.eq_i64(c, rep, "three ops refused", fs.refused(d), 3)
+    test.eq_i64(c, rep, "no reads", fs.reads(d), 0)
+
+    // ...and the file it could not see is still exactly as the control left it.
+    var after: String = fs.open_text(h, probe)
+    test.eq_str(c, rep, "untouched", string_view(after), "secret")
+    string_free(after)
+
+    fs.erase(h, probe)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// Handles are independent values, not views onto one global permission bit.
+@test fn handles_are_independent() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var a: fs.Fs = fs.host()
+    var b: fs.Fs = fs.denied()
+    fs.present(a, "jestyr_fs_nope.tmp")
+    fs.present(b, "jestyr_fs_nope.tmp")
+
+    test.eq_i64(c, rep, "a.reads", fs.reads(a), 1)
+    test.eq_i64(c, rep, "a.refused", fs.refused(a), 0)
+    test.eq_i64(c, rep, "b.reads", fs.reads(b), 0)
+    test.eq_i64(c, rep, "b.refused", fs.refused(b), 1)
+    test.is_true(c, rep, "a still open", fs.can_write(a))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The ambient free functions are still there and still work — the handle layer is
+// additive, not a replacement. The self-hosted compiler calls these directly.
+@test fn the_ambient_layer_still_works() -> bool {
+    let probe: str = "jestyr_fs_ambient_test.tmp"
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.is_true(c, rep, "write", fs.write(probe, "ambient"))
+    test.is_true(c, rep, "exists", fs.exists(probe))
+    var text: String = fs.read_text(probe)
+    test.eq_str(c, rep, "read_text", string_view(text), "ambient")
+    string_free(text)
+    test.is_true(c, rep, "remove", fs.remove(probe))
+    test.is_false(c, rep, "gone", fs.exists(probe))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

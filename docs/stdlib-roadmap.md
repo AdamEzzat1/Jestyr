@@ -6,7 +6,8 @@ directory, ask the time, or assert anything without hand-rolling it. This
 document is the plan for closing that gap, and — as importantly — the list of
 things that should stay out of `std` for now.
 
-Status: **`path`, `env`, `time`, `test` and `process` landed** (2026-08-13). Everything else
+Status: **`path`, `env`, `time`, `test`, `process` and all four Tier 2 capability
+handles (`Fs`/`Clock`/`Env`/`Process`) landed** (2026-08-13). Everything else
 here is a plan, not a promise. Nothing in `std` is production-ready; this is a
 research-preview standard library being pushed toward a capability-first Std v2.
 
@@ -67,20 +68,64 @@ Thin *named* wrappers over intrinsics, so that when `extern "c"` eventually
 retires an intrinsic, exactly one module changes. `io.jtr` and `env.jtr` state
 this intent in their own headers and are the pattern to copy.
 
-Present: `fs.jtr` (read/write/exists/remove), `env.jtr` (argc/argv/env_var),
-`io.jtr` (four print wrappers), `time.jtr` (monotonic elapsed),
-`test_report.jtr` (printing a `Check` report), `process.jtr` (running a command
-behind a capability handle), `test_fixture.jtr` (temp paths and captured command
+Present: `fs.jtr` (read/write/exists/remove **+ the `Fs` capability**), `env.jtr`
+(argc/argv/env_var **+ `Env`**), `time.jtr` (monotonic elapsed **+ `Clock`**),
+`process.jtr` (`Process`), `io.jtr` (four print wrappers), `test_report.jtr`
+(printing a `Check` report), `test_fixture.jtr` (temp paths and captured command
 output, for expected-diagnostic tests).
 
-Thin is an understatement: `fs` is 35 lines and `env` is 45. This tier is where
-most of the remaining work lives.
+`fs` and `env` are no longer 35 and 45 lines — the capability handles roughly
+tripled both. This tier is still where most of the remaining work lives, and the
+biggest single hole in it is now `Reader`/`Writer` (Tier 2 area 3), which has no
+module at all.
 
 `test_report.jtr` is the tier boundary made visible: it exists *only* because
 `std/test` must not print. Three functions, one import of `io`, and the whole
 rest of the slice stays `core`. When a module's job splits cleanly into "decide"
 and "emit", that is the split to make — it is what lets the deciding half be
 `@no_alloc`-proven and reusable on a freestanding target.
+
+#### The four Tier 2 capability handles
+
+`Fs`, `Clock`, `Env` and `Process` are all built. Three of them live *inside* the
+existing modules (`fs.jtr`, `time.jtr`, `env.jtr`) beside the ambient free functions
+they wrap, because one module per domain beats a parallel universe of `*_cap`
+modules; `Process` has its own module because `run_command` had no module in front of
+it at all.
+
+**Two layers, on purpose.** The free functions (`fs.read_text(path)`) are the
+low-level intrinsic-naming layer — the shape a `sys` tier will eventually own, and
+what the self-hosted compiler calls directly. The handles are the layer above. The
+low-level functions are not deprecated; they are documented as the primitive.
+
+**The restricted mode of each handle is chosen for a different reason**, which is the
+part worth internalizing — they are not four copies of one symmetry:
+
+| Handle | Restricted modes | What the restriction is *for* |
+|---|---|---|
+| `Clock` | `manual(start)` | **Determinism.** A `denied()` clock is useless — code would divide by a zero duration. A clock you `advance` yourself makes an elapsed time assertable instead of merely bounded. |
+| `Env` | `sealed()` | **Proving a negative.** Reports every variable unset while still *counting* lookups, so a test shows both that a subsystem works with no ambient configuration and that it tried to read some. |
+| `Fs` | `read_only()`, `denied()` | **Three states, because "read but don't modify" is a real need** — a linter, a formatter, `jestyrc check`. `denied()` refuses reads too, including existence probes, since a probe leaks the shape of a tree the handle exists to hide. |
+| `Process` | `denied()` | **Refusing while recording.** Counts attempts so a test asserts both that nothing ran and that the right number of attempts were made. |
+
+`caps_demo.jtr` is the argument for the whole design rather than a tour of the
+mechanics: a `stamp` function whose signature names every effect it performs
+(`mut f: fs.Fs, mut cl: time.Clock, mut e: env.Env`) produces byte-identical output
+on two runs with deterministic handles, and varies with `host()` ones. Nothing about
+`stamp` changes between the two — the caller chooses.
+
+**Cost, measured:** `time.jtr` was free. `fs.jtr` and `env.jtr` are closure modules,
+so they owed a **reseed** (+192 lines of flattened source, +163 of seed C) — but *not*
+a port mirror, because adding library code to a closure module changes the flattened
+source, not the compiler's behavior. That distinction is worth keeping straight; the
+`cgen.jtr` mirror is owed for emission changes, and this was not one. Byte-identity
+held for every file on the first attempt.
+
+**A limitation this work surfaced:** `env.argc()` / `argv()` / `program()` read
+0 and empty **inside a `@test`**, because the harness emits `int main(void)` and the
+runtime never records the arguments. Environment *variables* are unaffected (`getenv`
+does not go through `main`). Pinned by `argv_is_invisible_to_the_test_harness` so that
+if the harness ever forwards `argv`, someone decides deliberately what should happen.
 
 ### `sys` — the platform boundary
 

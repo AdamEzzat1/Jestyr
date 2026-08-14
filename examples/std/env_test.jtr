@@ -1,0 +1,132 @@
+// std/env_test.jtr — the unit suite for the `Env` capability in `std/env`.
+//
+// A sibling file: `env.jtr` is one of the twelve self-host closure modules, so a
+// `@test` inside it would be compiled into the flattened compiler.
+//
+// SEALING CAN ONLY BE PROVEN AGAINST A VARIABLE THAT IS ACTUALLY SET, and no single
+// variable name is portable. The suite uses the same three-way probe
+// `std/test_fixture.temp_dir` relies on — at least one of `TMPDIR`, `TEMP`, `TMP` is
+// set on any machine that can run a build — so "the host handle sees something the
+// sealed handle does not" is a claim that holds on both platforms without depending
+// on which spelling won.
+//
+// Run:  jestyrc test examples/std/env_test.jtr
+//   →   5 passed; 0 failed
+
+import "env"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 512
+
+// True if the host environment names a temp directory under any of the three
+// spellings — the portable "something is definitely set" probe.
+fn host_sees_a_temp_dir(mut e: env.Env) -> bool {
+    if env.present(e, "TMPDIR") { return true }
+    if env.present(e, "TEMP") { return true }
+    return env.present(e, "TMP")
+}
+
+@test fn host_reads_the_real_environment() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var h: env.Env = env.host()
+
+    test.is_false(c, rep, "not sealed", env.is_sealed(h))
+    test.is_true(c, rep, "sees a temp dir", host_sees_a_temp_dir(h))
+    test.ne_i64(c, rep, "lookups counted", env.lookups(h), 0)
+    // A name nothing sets reads empty rather than faulting.
+    test.eq_usize(c, rep, "unset is empty", env.lookup(h, "JESTYR_NO_SUCH_VAR_XYZ").len, 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// THE POINT OF SEALING: the same probe that succeeds through a host handle must fail
+// through a sealed one — and the sealed handle must still record that it was asked.
+// The host half is the control; without it, "sealed sees nothing" would also pass on
+// a machine where nothing is set at all.
+@test fn sealed_hides_everything_but_counts_the_attempt() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var h: env.Env = env.host()
+    var s: env.Env = env.sealed()
+
+    test.is_true(c, rep, "control sees it", host_sees_a_temp_dir(h))
+    test.is_true(c, rep, "is_sealed", env.is_sealed(s))
+    test.is_false(c, rep, "sealed sees nothing", host_sees_a_temp_dir(s))
+    // Three lookups attempted (the probe tries all three spellings), all reported
+    // unset — which is what makes "it tried and got nothing" distinguishable from
+    // "it never asked".
+    test.eq_i64(c, rep, "attempts recorded", env.lookups(s), 3)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// `lookup_or` through a sealed handle always yields the fallback, which is the
+// "does this still work with no configuration at all" question in one call.
+@test fn sealed_always_takes_the_fallback() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var s: env.Env = env.sealed()
+    var h: env.Env = env.host()
+
+    test.eq_str(c, rep, "sealed falls back", env.lookup_or(s, "TEMP", "fallback"), "fallback")
+    test.eq_str(c, rep, "unset falls back too",
+                env.lookup_or(h, "JESTYR_NO_SUCH_VAR_XYZ", "fallback"), "fallback")
+    test.eq_i64(c, rep, "one lookup each", env.lookups(s), 1)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The ambient free functions still work — the handle layer is additive. The
+// self-hosted compiler reads its configuration through these.
+@test fn the_ambient_layer_still_works() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_usize(c, rep, "unset get", env.get("JESTYR_NO_SUCH_VAR_XYZ").len, 0)
+    test.is_false(c, rep, "unset has", env.has("JESTYR_NO_SUCH_VAR_XYZ"))
+    test.eq_str(c, rep, "get_or", env.get_or("JESTYR_NO_SUCH_VAR_XYZ", "d"), "d")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// **COMMAND-LINE ARGUMENTS ARE NOT VISIBLE INSIDE A `@test`**, and this pins it
+// rather than working around it. The harness emits `int main(void)` — no `argc`, no
+// `argv` — so the runtime never records them and `argc()` reads 0 while `program()`
+// reads empty. Environment VARIABLES are unaffected, because `getenv` does not go
+// through `main`'s parameters, which is why every other test in this file works.
+//
+// Asserted explicitly so that if the harness ever starts forwarding `argv`, this
+// test fails and someone decides deliberately what the new behavior should be. An
+// argument-reading test needs a real `main` — `env_demo.jtr` is where argv is
+// exercised.
+@test fn argv_is_invisible_to_the_test_harness() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_i64(c, rep, "argc is 0 under the harness", env.argc() as i64, 0)
+    test.eq_usize(c, rep, "program is empty", env.program().len, 0)
+    test.eq_usize(c, rep, "argv(0) is empty", env.argv(0).len, 0)
+    // ...while a variable read still works, which is the contrast that identifies
+    // `main(void)` as the cause rather than a broken environment.
+    var h: env.Env = env.host()
+    test.is_true(c, rep, "variables still readable", host_sees_a_temp_dir(h))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

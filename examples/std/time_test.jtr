@@ -1,0 +1,118 @@
+// std/time_test.jtr — the unit suite for the `Clock` capability in `std/time`.
+//
+// A sibling file for consistency with the other capability suites, though `time.jtr`
+// is NOT a closure module, so colocating here would only have leaked into consumers
+// rather than into the compiler.
+//
+// NOTHING HERE ASSERTS A DURATION FROM THE HOST CLOCK. Two readings of a real
+// monotonic counter may be equal — the granularity is the platform's business — so a
+// test that required them to differ would flake. `time_demo.jtr` already learned this
+// the hard way: an earlier version asserted the clock advanced across a fixed loop
+// and failed, because gcc recognized the Gauss sum and replaced the loop with a
+// closed form. The manual clock exists precisely so a duration CAN be asserted, and
+// that is the only place this suite asserts one.
+//
+// Run:  jestyrc test examples/std/time_test.jtr
+//   →   5 passed; 0 failed
+
+import "time"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 512
+
+@test fn a_manual_clock_is_exactly_what_you_set() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var m: time.Clock = time.manual(1000)
+
+    test.is_true(c, rep, "is_deterministic", time.is_deterministic(m))
+    test.eq_i64(c, rep, "reads the start", time.read_nanos(m), 1000)
+    // Reading again does not move it — the property the host clock cannot offer.
+    test.eq_i64(c, rep, "stable across reads", time.read_nanos(m), 1000)
+    test.is_true(c, rep, "advance took", time.advance(m, 250))
+    test.eq_i64(c, rep, "moved by exactly 250", time.read_nanos(m), 1250)
+    test.eq_i64(c, rep, "since the start", time.since(m, 1000), 250)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// A manual clock may go BACKWARD, on purpose: that is how you test code which must
+// survive a non-monotonic reading without waiting for a leap second.
+@test fn a_manual_clock_may_run_backward() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var m: time.Clock = time.manual(100)
+
+    test.is_true(c, rep, "advance back", time.advance(m, 0 - 30))
+    test.eq_i64(c, rep, "went backward", time.read_nanos(m), 70)
+    test.eq_i64(c, rep, "negative elapsed", time.since(m, 100), 0 - 30)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// A host clock cannot be set, and says so rather than silently ignoring the request.
+@test fn a_host_clock_refuses_to_be_advanced() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var h: time.Clock = time.host()
+
+    test.is_false(c, rep, "not deterministic", time.is_deterministic(h))
+    test.is_false(c, rep, "advance refused", time.advance(h, 1000))
+    // The reading is still a real counter: only its SHAPE is asserted, never a
+    // duration (see the header).
+    test.ne_i64(c, rep, "reads something", time.read_nanos(h), 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The read counter is the assertion for "this code consults the clock exactly once",
+// which is what makes a stamped output reproducible.
+@test fn reads_are_counted() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var m: time.Clock = time.manual(0)
+
+    test.eq_i64(c, rep, "fresh", time.reads(m), 0)
+    time.read_nanos(m)
+    time.read_nanos(m)
+    test.eq_i64(c, rep, "two reads", time.reads(m), 2)
+    // `since` reads too — worth pinning, because a caller counting clock consultations
+    // would otherwise be surprised by it.
+    time.since(m, 0)
+    test.eq_i64(c, rep, "since counts as a read", time.reads(m), 3)
+    // `advance` is not a read.
+    time.advance(m, 1)
+    test.eq_i64(c, rep, "advance is not a read", time.reads(m), 3)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The ambient free functions still work — the handle layer is additive.
+@test fn the_ambient_layer_still_works() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    let t0: i64 = time.now_nanos()
+    test.ne_i64(c, rep, "now_nanos reads", t0, 0)
+    // Shape only: elapsed is never negative, and the ns->ms conversion agrees.
+    test.is_true(c, rep, "elapsed not negative", time.since_nanos(t0) >= 0)
+    test.eq_i64(c, rep, "nanos_to_millis", time.nanos_to_millis(2500000), 2)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

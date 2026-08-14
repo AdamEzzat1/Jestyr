@@ -231,6 +231,15 @@ The self-hosted compiler and the standard library, all in Jestyr:
     purpose. Captures go through the `Process` capability, so a `denied()` handle
     writes nothing. No temp *directories* — that needs a `mkdir` intrinsic.
     `test_fixture_demo.jtr`, suite in `test_fixture_test.jtr`.
+  * **The four Tier 2 capability handles** — `fs.Fs`, `time.Clock`, `env.Env` and
+    `process.Process` — sit beside the ambient free functions in their own modules.
+    Each restricted mode is chosen for a different reason: `time.manual(n)` for
+    *determinism* (a denied clock would be useless), `env.sealed()` to *prove a
+    negative* while still counting lookups, `fs.read_only()` because "read but don't
+    modify" is what a linter needs, and `process.denied()` to refuse while recording.
+    `caps_demo.jtr` is the argument for the design — a build stamp that is
+    byte-identical across two runs with deterministic handles and varies with
+    `host()` ones. Suites in `fs_test.jtr`, `env_test.jtr`, `time_test.jtr`.
   * `process.jtr` runs external commands behind an explicit capability. (For the
     `[]T` range-slicing that lets `test_report.finish` take a slice rather than a
     raw pointer, see `slice_range.jtr` in the top-level examples.) A

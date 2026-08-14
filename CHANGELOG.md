@@ -7,6 +7,55 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **All four Tier 2 capability handles — `Fs`, `Clock`, `Env`, `Process`.** `Process`
+  landed first; `Fs`, `Clock` and `Env` are added to the existing `fs.jtr`,
+  `time.jtr` and `env.jtr` beside the ambient free functions they wrap. One module per
+  domain rather than a parallel universe of `*_cap` modules; the free functions stay as
+  the documented low-level layer (the shape a `sys` tier will own, and what the
+  self-hosted compiler calls directly).
+
+  **Each restricted mode is chosen for a different reason** — they are not four copies
+  of one symmetry, and this is the part worth reading:
+
+  - `time.manual(start)` — **determinism**, not permission. A `denied()` clock would be
+    useless (code would divide by a zero duration); a clock you `advance` yourself makes
+    an elapsed time *assertable* instead of merely bounded. It may also run backward, on
+    purpose, so code that must survive a non-monotonic reading can be tested.
+  - `env.sealed()` — **proving a negative.** Reports every variable unset while still
+    counting lookups, so a test establishes both that a subsystem behaves identically
+    with no ambient configuration and that it nevertheless tried to read some. A build
+    that silently varies with `CC` or `TMPDIR` becomes a test rather than someone
+    else's broken machine.
+  - `fs.read_only()` and `fs.denied()` — **three states, because "read but don't
+    modify" is a real need**, not the midpoint of a symmetry: a linter, a formatter,
+    `jestyrc check`. `denied()` refuses reads too, including existence probes, since a
+    probe leaks the shape of a tree the handle exists to hide.
+  - `process.denied()` — refusing while recording attempts.
+
+  `caps_demo.jtr` is the argument rather than a tour: a `stamp` function whose
+  signature names every effect it performs produces byte-identical output across two
+  runs with deterministic handles, and varies with `host()` ones — with nothing about
+  `stamp` changing between them.
+
+  **Cost, measured.** `time.jtr` was free. `fs.jtr` and `env.jtr` are self-host closure
+  modules and owed a **reseed** (+192 lines of flattened source, +163 of seed C) — but
+  **not** a port mirror, because adding library code to a closure module changes the
+  flattened source, not the compiler's behavior. The `cgen.jtr` mirror is owed for
+  emission changes, and this was not one. Byte-identity held for every file first try.
+
+  Suites live in sibling files (`fs_test.jtr`, `env_test.jtr`, `time_test.jtr`, 15
+  tests) — for `fs` and `env` that is not merely convention, since a `@test` inside a
+  closure module would be compiled into the flattened compiler itself. Every negative
+  result has a positive control beside it: "the write was refused" only means something
+  if the same write through a `host()` handle lands.
+
+  **A limitation surfaced and pinned:** `env.argc()` / `argv()` / `program()` read 0 and
+  empty **inside a `@test`**, because the harness emits `int main(void)` and the runtime
+  never records the arguments. Environment *variables* are unaffected (`getenv` does not
+  go through `main`), which is the contrast that identifies the cause.
+  `argv_is_invisible_to_the_test_harness` asserts it, so if the harness ever forwards
+  `argv` someone decides deliberately what should happen.
+
 - **`std/test_fixture`, `eq_golden_all`, and `diff_count` — the three `std/test`
   gaps closed.** The slice shipped with three named limits; all three now have an
   answer, two of them by building it and one by bounding it honestly.

@@ -33,3 +33,123 @@ pub fn exists(path: str) -> bool {
 pub fn remove(path: str) -> bool {
     return remove_file(path)
 }
+
+// ---------------------------------------------------------- the Fs capability
+//
+// Everything above is ambient: any function can read or delete any file and no
+// signature says so. `Fs` is the same operations behind an explicit handle.
+//
+// THREE STATES, NOT TWO, because "read but do not modify" is a real thing to want
+// and not merely the midpoint of a symmetry. A formatter that must never write, a
+// linter, an analysis pass, `jestyrc check` itself — all of them read a tree and
+// must leave it alone, and `read_only()` makes that checkable instead of hoped for.
+// `denied()` is the third, for code that should touch no file at all.
+//
+//   host()       read ✓  write ✓  remove ✓
+//   read_only()  read ✓  write ✗  remove ✗
+//   denied()     read ✗  write ✗  remove ✗
+//
+// Refusals are COUNTED, not silent, so a test asserts both that nothing was written
+// and that the code tried — which is the difference between "it respected the
+// capability" and "it never got that far". A write refused through a read-only
+// handle returns false, the same answer a genuinely failed write gives, so `refused`
+// is the discriminator rather than the return value.
+//
+// Not enforcement: `write_file` stays reachable, and the self-hosted compiler calls
+// the ambient functions above directly. Those are the low-level layer — the shape a
+// `sys` tier will eventually own — and this is the layer above them. Same trade as
+// `std/process`, argued at length there.
+
+pub struct Fs {
+    can_read: bool,
+    can_write: bool,
+    reads: i64,
+    writes: i64,
+    refused: i64,
+}
+
+// Full access.
+pub fn host() -> Fs {
+    return Fs{ can_read: true, can_write: true, reads: 0, writes: 0, refused: 0 }
+}
+
+// Reads allowed, mutation refused. The interesting one.
+pub fn read_only() -> Fs {
+    return Fs{ can_read: true, can_write: false, reads: 0, writes: 0, refused: 0 }
+}
+
+// No filesystem access at all.
+pub fn denied() -> Fs {
+    return Fs{ can_read: false, can_write: false, reads: 0, writes: 0, refused: 0 }
+}
+
+// Read the whole file at `path`. Through a handle that cannot read, this returns an
+// EMPTY owned String and counts a refusal — deliberately the same answer a missing
+// file gives, because a denied handle should be indistinguishable from an empty
+// world rather than a special error the caller has to learn. The caller owns the
+// result and `string_free`s it either way.
+pub fn open_text(mut f: Fs, path: str) -> String {
+    if f.can_read == false {
+        f.refused = f.refused + 1
+        return read_file("")
+    }
+    f.reads = f.reads + 1
+    return read_file(path)
+}
+
+// Write `data` to `path`. False (and a counted refusal) unless the handle allows
+// mutation.
+pub fn put(mut f: Fs, path: str, data: str) -> bool {
+    if f.can_write == false {
+        f.refused = f.refused + 1
+        return false
+    }
+    f.writes = f.writes + 1
+    return write_file(path, data)
+}
+
+// Does `path` exist? A read, so a denied handle answers false — an existence probe
+// is a read of the directory, and letting it through would leak the shape of a tree
+// the handle is supposed to hide.
+pub fn present(mut f: Fs, path: str) -> bool {
+    if f.can_read == false {
+        f.refused = f.refused + 1
+        return false
+    }
+    f.reads = f.reads + 1
+    return file_exists(path)
+}
+
+// Delete `path`. Mutation, so refused by everything but `host`.
+pub fn erase(mut f: Fs, path: str) -> bool {
+    if f.can_write == false {
+        f.refused = f.refused + 1
+        return false
+    }
+    f.writes = f.writes + 1
+    return remove_file(path)
+}
+
+pub fn can_read(read f: Fs) -> bool {
+    return f.can_read
+}
+
+pub fn can_write(read f: Fs) -> bool {
+    return f.can_write
+}
+
+// Reads performed (including existence probes).
+pub fn reads(read f: Fs) -> i64 {
+    return f.reads
+}
+
+// Mutations performed.
+pub fn writes(read f: Fs) -> i64 {
+    return f.writes
+}
+
+// Operations this handle refused — the count that distinguishes "respected the
+// capability" from "never tried".
+pub fn refused(read f: Fs) -> i64 {
+    return f.refused
+}
