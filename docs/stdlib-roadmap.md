@@ -11,6 +11,15 @@ handles (`Fs`/`Clock`/`Env`/`Process`) landed** (2026-08-13). Everything else
 here is a plan, not a promise. Nothing in `std` is production-ready; this is a
 research-preview standard library being pushed toward a capability-first Std v2.
 
+> **Picking this up cold?** Read
+> [`docs/session-notes/jestyr-std-v2-tier2-handoff.md`](session-notes/jestyr-std-v2-tier2-handoff.md)
+> first. It covers the four Tier 2 areas that remain (no-std contract, typed
+> path/`OsStr`, `Reader`/`Writer`, Collections v2) with what was *verified* about each
+> — including two things this document would otherwise mislead you about:
+> `Reader`/`Writer` is **not** blocked on traits (a mutating trait method works today,
+> statically and through `dyn`), and `distinct` is **not** an enforced newtype, so a
+> typed `Path` built on it would carry a name with no check.
+
 ## The shape we are copying, and from whom
 
 | Source | What we take |
