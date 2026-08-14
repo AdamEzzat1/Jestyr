@@ -4,45 +4,45 @@ Cold-start note for the next session. Four of the seven Tier 2 areas are done; t
 covers the other four, plus two standing compiler follow-ups. Written immediately
 after finishing the capability handles, so the measurements in it are fresh.
 
-**Read §0 first — the work is on a branch that has not merged.**
+**All of it is on `master` and pushed. Start from `master` — there is no branch to
+chase.**
 
 ---
 
-## §0. READ FIRST: the branch state
+## §0. READ FIRST: where the work is
 
-Everything below assumes you are working from **`claude/jestyr-std-v2-design-4aeb42`**,
-which holds **nine commits that are not on `master`**:
+`master` == `origin/master` == **`2c1085f`**, zero divergence, working tree clean.
+`git pull` and go.
 
-```
-7618933  stdlib: Fs, Clock and Env -- all four Tier 2 capability handles now exist
-897d35d  stdlib: std/test_fixture + every-differing-line goldens -- the last three gaps
-fe49492  cgen: range-slice a []T, and take the raw pointer out of std/test_report
-e7462b6  cgen: canon module consts, so two modules may share a const name
-cce5df6  stdlib: std/process -- the first Tier 2 capability handle
-c194a73  stdlib: adopt std/test in std/path -- and stop leaking test code into consumers
-5b7062e  test harness: scope `jestyrc test <file>` to the named module
-2b0ff09  stdlib: std/test -- expectations and golden compare, split across the tier line
-         (8ac867c = master's tip when this started)
-```
+Getting there took a reconciliation worth two minutes of your time, because it left
+refs lying around and because the failure mode generalizes.
 
-They are a clean linear fast-forward. The merge was **blocked, not forgotten**: the
-main checkout at `C:/Users/adame/Jestyr` was mid-flight on its own closure change —
-22 dirty files including `src/cgen.rs`, `examples/std/cgen.jtr`, an in-progress
-bootstrap reseed, and **`src/proptests.rs`, which these commits also touch**. Merging
-into that tree would have conflicted and risked corrupting the reseed.
+The nine Std v2 commits (`2b0ff09` std/test · `5b7062e` harness scoping · `c194a73`
+path adopts std/test · `cce5df6` std/process · `e7462b6` const canon'ing · `fe49492`
+`[]T` range-slice · `897d35d` test_fixture · `7618933` Fs/Clock/Env · `2bda2c2` this
+note) were built on a branch because the main checkout was sitting on an **uncommitted
+but fully-resolved merge** of `claude/elegant-hellman-1d7ac2`. That pending merge
+carried compiler work existing nowhere else: `3195ee1` (a `take` parameter is dropped
+by its callee — the RAII hole) and `c341703` (use-after-`take` of a droppable is
+refused), both sides, plus a reseed and the `jestyr-std` benchmark track.
 
-**First action of the next session:**
+**An uncommitted resolved merge is the most fragile state in git.** Hours of conflict
+resolution live only in the index, and a single `git merge --abort` erases them with no
+reflog entry to recover from. The fix was to commit it *first* (`dfee158`) — the commit
+is the backup — and only then merge the branch in (`2c1085f`).
 
-```bash
-cd C:/Users/adame/Jestyr && git status --short && git log --oneline -1
-```
+Integration cost, for calibration: exactly **one** conflict, `CGEN_GOLDEN_ALLOWLIST` in
+`src/proptests.rs`, where both sides had appended. Resolved as the union, 169 entries.
+Treat that file carefully — a dropped entry there does not error, it silently stops
+verifying a corpus file against the self-hosted backend. `src/cgen.rs`,
+`examples/std/cgen.jtr` **and both generated `bootstrap/` files auto-merged correctly**;
+`bootstrap_seed_is_current` passed *without* a refresh, because the two changes had
+touched disjoint regions of the flattened source. I predicted that auto-merge would be
+garbage and was wrong — **check before assuming a reseed is owed.**
 
-* Clean and still at `8ac867c` → `git merge --ff-only claude/jestyr-std-v2-design-4aeb42`.
-* Clean but *ahead* → that session landed. Rebase this branch onto it. Expect
-  conflicts in `src/proptests.rs` and `examples/std/cgen.jtr`, and note that
-  `bootstrap/jestyr_seed.c` + `jestyr_flat.jtr` are **generated** — do not hand-merge
-  them, take either side and re-run `REFRESH_SEED=1` (§2).
-* Still dirty → leave it alone and keep working on the branch.
+Two refs are safe to delete once you are satisfied:
+`backup/pre-integration-2026-08-14`, and `claude/jestyr-std-v2-design-4aeb42` (local
+and remote).
 
 ---
 
@@ -62,6 +62,13 @@ Also landed on the way, because the library work forced them: `jestyrc test <fil
 scoped to the named module; module `const`s canon'd by module; `[]T` range-slicing;
 and `std/path`'s suite moved out of the module (see the leak trap in §5).
 
+And now on `master` alongside them, from the other line of work that reconciled in
+§0 — relevant because it changes RAII behavior under you: a **`take` parameter is
+dropped by its callee** (`3195ee1`, closing the RAII hole) and **use-after-`take` of a
+droppable is refused** (`c341703`), both sides, with `examples/drop_take.jtr` as the
+demo. If you write anything that moves ownership into a function, that is the current
+rule.
+
 The narrative for all of it is in `docs/stdlib-roadmap.md`, which is the authoritative
 document — this note is the *forward-looking* half and will go stale faster.
 
@@ -76,7 +83,11 @@ cargo build --release
 cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-Baseline at the time of writing: **1135 passed, 0 failed, 3 ignored** (~350 s).
+Baseline on `master` at `2c1085f`: **1149 passed, 0 failed, 3 ignored** (~320 s). That
+number is the merged tree — it is the run that proved the `take`-drop lowering and the
+const-canon'ing / `[]T` range-slicing compose, since each had only ever been verified
+against a tree lacking the other. (The Std v2 branch alone was 1135.)
+
 Reseed, when owed:
 
 ```bash
@@ -329,20 +340,32 @@ Things that cost time this session and will cost it again.
 * .jtr subset traps for closure modules: a `for` condition cannot start with `(`; a
   bare `{` after a call-init parses as the ctor form; never chain `string_view(x).len`.
   Author `.jtr` with Write, not shell heredocs — heredocs mangle backslashes.
+* **Commit a resolved merge before doing anything else with the repo.** The resolution
+  lives only in the index, so `merge --abort` destroys it with nothing in the reflog to
+  recover. This repo had one sitting uncommitted for a whole session (§0). Corollary:
+  when several worktrees share one clone, `git status` in the *other* checkout is part
+  of reading the situation — `MERGE_HEAD` existing is a very different fact from "22
+  dirty files", and only the former tells you work is at risk.
+* **Generated files can auto-merge correctly — verify instead of assuming either way.**
+  I expected a 3-way merge of two independently regenerated 28,000-line files
+  (`bootstrap/jestyr_seed.c`, `jestyr_flat.jtr`) to be garbage. It was exact, because
+  the two changes touched disjoint regions of the flattened source, and
+  `bootstrap_seed_is_current` proves it in 18 s by recomputing from source. Cheaper to
+  run the guard than to reason about it. (The converse still holds: if it *does* fail,
+  regenerate, never hand-merge.)
 
 ---
 
 ## §6. Suggested order
 
-1. **Merge or rebase (§0).** Nothing else matters until the nine commits are safe.
-2. **`std/str`** — the last *free* slice on the roadmap's priority list, and it makes
+1. **`std/str`** — the last *free* slice on the roadmap's priority list, and it makes
    every later slice easier. Not a Tier 2 area itself, but cheap and load-bearing.
-3. **`Reader`/`Writer` (§3.3)** — highest value of the four, and now known not to be
+2. **`Reader`/`Writer` (§3.3)** — highest value of the four, and now known not to be
    language-blocked. Settle the four design decisions in writing *first*.
-4. **`@no_os` (§3.1)** — turns the no-std contract from convention into a check, and is
+3. **`@no_os` (§3.1)** — turns the no-std contract from convention into a check, and is
    small.
-5. **`PathBuf` (§3.2 step 2)** — owned, independent of the `distinct` question.
-6. **`HashMap(K,V)` (§3.4)** — after the hashing decision, with a real consumer.
+4. **`PathBuf` (§3.2 step 2)** — owned, independent of the `distinct` question.
+5. **`HashMap(K,V)` (§3.4)** — after the hashing decision, with a real consumer.
 
 Leave `distinct`-enforced `Path` and `sys` alone until their blockers (the int→int
 assignability decision; `extern "c"`) are actually resolved. Both are the kind of thing
