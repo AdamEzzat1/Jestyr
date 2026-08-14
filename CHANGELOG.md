@@ -228,6 +228,31 @@ versions are snapshots, not stability promises.
 
 ### Fixed
 
+- **Two modules could not share a `const` name.** `const BACKSLASH` in both
+  `std/path` and `std/test` made gcc reject any program importing both with `error:
+  redefinition of 'j_BACKSLASH'` — an odd asymmetry with modules-v2, which already
+  allowed two modules to share a non-generic struct name. Consts are now canon'd by
+  module, like functions and types.
+
+  Two lines, because only emission bypassed machinery that already existed:
+  `build_owner` already notes a `const` in `name_mods` (consts share the *value*
+  namespace with functions, so a colliding const was already in `dup_fns`), and
+  typeck already recorded the resolved symbol for an unqualified reference via
+  `record_call_sym` — after `scope_lookup`, so a local shadowing the name still
+  wins. The fixes were to canon the definition in `Cgen::consts` and to consume
+  `call_sym` in the value-position `Name` arm; the qualified path (`mathx.TWO`) was
+  already correct.
+
+  `canon` renames only on a real collision, so **every collision-free program is
+  byte-identical** — the corpus golden did not move, and `std/test` dropped its
+  `B_` prefix workaround in the same change. No port mirror and no reseed were
+  owed: the port's `ml_*` loader already renames colliding top-level definitions at
+  the token level and its scheme coincides with `canon`'s `__m<modid>`, verified by
+  emitting byte-identical C from both backends for a two-`SCALE` program. Pinned by
+  the fixtures in `jestyr_driver_module_c_matches_reference` (byte equality) and
+  `jestyr_driver_builds_multi_module` (the values stay distinct at runtime,
+  including one read unqualified from inside its own module).
+
 - **A module's `@test` functions were emitted into every program importing it.**
   A `@test` function is an ordinary function with an attribute, and there is no
   dead-code elimination at the C-backend layer, so `std/path`'s colocated suite

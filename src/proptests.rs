@@ -12502,16 +12502,21 @@ fn main() -> i32 {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Two libs sharing a top-level name (`mag`) — the collision-rename path — plus a
-        // diamond (`app` and `vec2` both import `util`).
-        std::fs::write(dir.join("util.jtr"), "pub fn mag(x: i32) -> i32 { return x * 10 }\n").unwrap();
+        // diamond (`app` and `vec2` both import `util`), plus a colliding CONST (`SCALE`
+        // at two different values). The const case used to emit two
+        // `static const int32_t j_SCALE` definitions and make gcc reject the program,
+        // an odd asymmetry given a colliding struct name was already fine. Both
+        // spellings are covered: `vec2.scaled` reads `SCALE` unqualified from inside its
+        // own module, and `app` reads both qualified.
+        std::fs::write(dir.join("util.jtr"), "pub const SCALE: i32 = 10\npub fn mag(x: i32) -> i32 { return x * SCALE }\n").unwrap();
         std::fs::write(
             dir.join("vec2.jtr"),
-            "import \"util\"\npub struct V2 { pub x: i32, pub y: i32 }\npub fn make(x: i32, y: i32) -> V2 { return V2 { x: x, y: y } }\npub fn mag(v: V2) -> i32 { return util.mag(v.x) + v.y }\n",
+            "import \"util\"\npub const SCALE: i32 = 3\npub struct V2 { pub x: i32, pub y: i32 }\npub fn make(x: i32, y: i32) -> V2 { return V2 { x: x, y: y } }\npub fn mag(v: V2) -> i32 { return util.mag(v.x) + v.y }\npub fn scaled(v: V2) -> i32 { return v.y * SCALE }\n",
         )
         .unwrap();
         std::fs::write(
             dir.join("app.jtr"),
-            "import \"util\"\nimport \"vec2\"\nfn main() -> i32 {\n    let v: vec2.V2 = vec2.make(4, 2)\n    print_int(vec2.mag(v) as i64)\n    print_int(util.mag(3) as i64)\n    return 0\n}\n",
+            "import \"util\"\nimport \"vec2\"\nfn main() -> i32 {\n    let v: vec2.V2 = vec2.make(4, 2)\n    print_int(vec2.mag(v) as i64)\n    print_int(util.mag(3) as i64)\n    print_int(util.SCALE as i64)\n    print_int(vec2.SCALE as i64)\n    print_int(vec2.scaled(v) as i64)\n    return 0\n}\n",
         )
         .unwrap();
         let app = dir.join("app.jtr");
@@ -12523,7 +12528,11 @@ fn main() -> i32 {
         let want_out = Command::new(&want_exe).output().unwrap();
         let want = String::from_utf8_lossy(&want_out.stdout).replace("\r\n", "\n");
         assert_eq!(got, want, "multi-module output diverged from the reference module build");
-        assert_eq!(want, "42\n30\n", "fixture sanity");
+        // `10` and `3` are the two colliding `SCALE`s read qualified, and `6` (= 2 * 3)
+        // is `vec2.scaled` reading its OWN `SCALE` unqualified — so a per-module const
+        // that resolves to the wrong module's value fails here rather than silently
+        // computing with it.
+        assert_eq!(want, "42\n30\n10\n3\n6\n", "fixture sanity");
 
         // Per-FILE diagnostic attribution (the `#line` analogue): an escape error inside an
         // imported module must render against THAT file's original line:col, and an error in
@@ -12581,11 +12590,16 @@ fn main() -> i32 {
         std::fs::create_dir_all(&dir).unwrap();
         // The same shapes the multi-module driver test exercises: a diamond and a
         // cross-module name collision (`mag`), so the canon-rename path is covered.
-        std::fs::write(dir.join("util.jtr"), "pub fn mag(x: i32) -> i32 { return x * 10 }\npub fn Box(comptime T: type) -> type { return struct { v: T  fn get(read self) -> read T { self.v } } }\npub fn boxed(x: i32) -> Box(i32) { return Box(i32){ v: x } }\n")
+        // `SCALE` is a CONST declared in both modules at different values — the shape
+        // that used to emit two `static const int32_t j_SCALE` definitions and make gcc
+        // reject the program, even though a colliding struct name was already fine.
+        // Both spellings are exercised: each module reads its own unqualified, and
+        // `app.jtr` reads both qualified.
+        std::fs::write(dir.join("util.jtr"), "pub const SCALE: i32 = 10\npub fn mag(x: i32) -> i32 { return x * SCALE }\npub fn Box(comptime T: type) -> type { return struct { v: T  fn get(read self) -> read T { self.v } } }\npub fn boxed(x: i32) -> Box(i32) { return Box(i32){ v: x } }\n")
             .unwrap();
         std::fs::write(
             dir.join("vec2.jtr"),
-            "import \"util\"\npub struct V2 { pub x: i32, pub y: i32 }\npub fn make(x: i32, y: i32) -> V2 { return V2 { x: x, y: y } }\npub fn mag(v: V2) -> i32 { return util.mag(v.x) + v.y }\npub fn Box(comptime T: type) -> type { return struct { v: T, w: T  fn get(read self) -> read T { self.w } } }\npub fn boxed(x: i32) -> Box(i32) { return Box(i32){ v: x, w: x + 1 } }\n",
+            "import \"util\"\npub const SCALE: i32 = 3\npub struct V2 { pub x: i32, pub y: i32 }\npub fn make(x: i32, y: i32) -> V2 { return V2 { x: x, y: y } }\npub fn mag(v: V2) -> i32 { return util.mag(v.x) + v.y }\npub fn scaled(v: V2) -> i32 { return v.y * SCALE }\npub fn Box(comptime T: type) -> type { return struct { v: T, w: T  fn get(read self) -> read T { self.w } } }\npub fn boxed(x: i32) -> Box(i32) { return Box(i32){ v: x, w: x + 1 } }\n",
         )
         .unwrap();
         // The app exercises every `#line` emission point: plain statements (one
@@ -12596,7 +12610,7 @@ fn main() -> i32 {
         // TEMPLATE's lines).
         std::fs::write(
             dir.join("app.jtr"),
-            "import \"util\"\nimport \"vec2\"\nfn clamp_pos(x: i32) -> i32\n    requires x > 0 - 100\n    ensures result >= 0\n{\n    if x < 0 { return 0 }\n    return x\n}\nfn id[T](take v: T) -> T { v }\nfn main() -> i32 {\n    let v: vec2.V2 = vec2.make(4, 2)\n    print_int(vec2.mag(v) as i64)\n    print_int(util.mag(3) as i64)\n    let a: i32 = 1  let b: i32 = 2\n    print_int((a + b) as i64)\n    print_int(clamp_pos(0 - 5) as i64)\n    print_int(id(7) as i64)\n    let ba: util.Box(i32) = util.boxed(7)\n    let bb: vec2.Box(i32) = vec2.boxed(9)\n    print_int(ba.get() as i64)\n    print_int(bb.get() as i64)\n    return 0\n}\n",
+            "import \"util\"\nimport \"vec2\"\nfn clamp_pos(x: i32) -> i32\n    requires x > 0 - 100\n    ensures result >= 0\n{\n    if x < 0 { return 0 }\n    return x\n}\nfn id[T](take v: T) -> T { v }\nfn main() -> i32 {\n    let v: vec2.V2 = vec2.make(4, 2)\n    print_int(vec2.mag(v) as i64)\n    print_int(util.mag(3) as i64)\n    let a: i32 = 1  let b: i32 = 2\n    print_int((a + b) as i64)\n    print_int(clamp_pos(0 - 5) as i64)\n    print_int(id(7) as i64)\n    let ba: util.Box(i32) = util.boxed(7)\n    let bb: vec2.Box(i32) = vec2.boxed(9)\n    print_int(ba.get() as i64)\n    print_int(bb.get() as i64)\n    print_int(util.SCALE as i64)\n    print_int(vec2.SCALE as i64)\n    print_int(vec2.scaled(v) as i64)\n    return 0\n}\n",
         )
         .unwrap();
         let app = dir.join("app.jtr");

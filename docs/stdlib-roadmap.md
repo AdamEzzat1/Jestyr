@@ -404,7 +404,8 @@ Where this slice leaves the seven planned Tier 2 areas.
 4. **Range-slice `[]u8` in the C backend.** It would delete the `raw: *mut u8`
    parameter from `test_report.finish`, and it is the single most-felt gap in the
    buffers-in convention across the whole stdlib.
-5. **Mangle module `const`s by module** — see the gap recorded below.
+5. ~~**Mangle module `const`s by module**~~ ✅ Two lines, no port mirror, no
+   reseed — see the (now closed) gap recorded below.
 6. **Stop emitting `@test`/`@bench` items in non-test mode** — see convention 4
    above for why, and for why it is not as small as it looks.
 
@@ -552,14 +553,33 @@ Recorded here because library work is where they actually bite.
   pointer has to be kept alive and passed around next to the slice. This is the
   single most-felt gap in the "buffers in" convention — it is why
   `std/test_report.finish` takes a `*mut u8` at all.
-- **Module `const`s are emitted unqualified, so two modules cannot share a const
-  name.** `const BACKSLASH` in both `std/path` and `std/test` produced `error:
-  redefinition of 'j_BACKSLASH'` from gcc when one program imported both. Note the
-  asymmetry with modules-v2, which *does* let two modules share a non-generic
-  struct name: types are collidable, consts are not. Until the mangling is fixed
-  (an emission change, so it owes the port mirror plus a reseed), a stdlib module
-  meant to be imported next to anything must prefix its constants —
-  `std/test` uses `B_` and says so at the declaration site.
+- ~~**Module `const`s are emitted unqualified, so two modules cannot share a const
+  name.**~~ **Closed.** `const BACKSLASH` in both `std/path` and `std/test`
+  produced `error: redefinition of 'j_BACKSLASH'` from gcc when one program
+  imported both — an odd asymmetry with modules-v2, which already let two modules
+  share a non-generic struct name. Consts are now canon'd by module.
+
+  It turned out to be **two lines**, because almost all the machinery was already
+  there and only emission bypassed it. `build_owner` already notes a `const` in
+  `name_mods` (consts share the *value* namespace with functions), so a colliding
+  const was already in `dup_fns`; and typeck already recorded the resolved symbol
+  for an unqualified reference via `record_call_sym` — after `scope_lookup`, so a
+  local shadowing the name correctly still wins. The two fixes were to canon the
+  *definition* in `Cgen::consts` and to consume `call_sym` in the value-position
+  `Name` arm. The qualified path (`mathx.TWO`) was already correct.
+
+  `canon` renames only on a real collision, so **every collision-free program is
+  byte-identical** — which is why the corpus golden did not move, and why
+  `std/test` could drop its `B_` prefix workaround in the same commit.
+
+  **No port mirror was owed here either**, for a different reason than the harness
+  scoping: the port's `ml_*` loader already renames colliding top-level
+  definitions at the token level, and its scheme coincides exactly with `canon`'s
+  `__m<modid>`. Verified rather than assumed — the reference and `jc` emit
+  byte-identical C for a program with two `SCALE` consts at different values, now
+  pinned by the fixtures in `jestyr_driver_module_c_matches_reference` (byte
+  equality) and `jestyr_driver_builds_multi_module` (the values stay distinct at
+  runtime, including one read unqualified from inside its own module).
 - **`@no_alloc` cannot see through the allocator vtable** (above), so the tier
   boundary between `core` and `mem` is enforced by convention at exactly the
   point where it matters most.

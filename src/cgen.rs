@@ -2445,7 +2445,15 @@ impl<'a> Cgen<'a> {
                     // Exported as a bare external symbol (no `static`, no `j_` prefix).
                     self.raw(format!("const {cty} {}{section} = {v};\n", c.name.name));
                 } else {
-                    self.raw(format!("static const {cty} j_{}{section} = {v};\n", c.name.name));
+                    // Canon'd like a function, because a `const` shares the *value*
+                    // namespace with them (`build_owner` notes both in `name_mods`).
+                    // Without this, two modules each declaring `const BACKSLASH` both
+                    // emitted `static const int32_t j_BACKSLASH`, and gcc rejected the
+                    // program — even though modules-v2 explicitly allows two modules
+                    // to share a non-generic *struct* name. `canon` renames only on a
+                    // real collision, so every collision-free program is unchanged.
+                    let cn = self.canon_fn(&c.name.name);
+                    self.raw(format!("static const {cty} j_{cn}{section} = {v};\n"));
                 }
             }
         }
@@ -4789,7 +4797,15 @@ impl<'a> Cgen<'a> {
                     // A `@no_mangle` const is referenced by its bare exported name.
                     n.name.clone()
                 } else {
-                    format!("j_{}", n.name)
+                    // `call_sym` carries typeck's resolution for a bare name that
+                    // COLLIDES across modules — set only for a const or function the
+                    // current module owns, and only after `scope_lookup` has failed,
+                    // so a local shadowing the name still wins and emits bare. Absent
+                    // for every non-colliding name, which is why output is unchanged
+                    // for programs that do not collide.
+                    let cname =
+                        self.info.call_sym(id).map(String::from).unwrap_or_else(|| n.name.clone());
+                    format!("j_{cname}")
                 }
             }
             ExprKind::SelfValue => {

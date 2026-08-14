@@ -52,29 +52,27 @@
 //
 // Run the tests:  jestyrc test examples/std/test.jtr
 
-// The `B_` prefix on the byte constants is defensive, not decorative. A module
-// `const` is emitted to C under its BARE name (`j_BACKSLASH`), so two modules
-// that both define `const BACKSLASH` cannot appear in one program — even though
-// modules-v2 lets two modules share a non-generic *struct* name. `std/path`
-// already owns `BACKSLASH`, and a program importing both this module and that one
-// hit `error: redefinition of 'j_BACKSLASH'` in the generated C. Fixing the
-// mangling is an emission change (and so owes the port mirror plus a bootstrap
-// reseed); a stdlib module intended to be imported next to anything should not be
-// claiming generic const names in the first place.
-const B_NL: i32 = 10          // '\n'
-const B_CR: i32 = 13          // '\r'
-const B_TAB: i32 = 9          // '\t'
-const B_QUOTE: i32 = 34       // '"'
-const B_BACKSLASH: i32 = 92   // '\'
-const B_ZERO: i32 = 48        // '0'
-const B_MINUS: i32 = 45       // '-'
-const B_LOW: i32 = 32         // first printable byte
-const B_HIGH: i32 = 127       // first non-printable byte above the ASCII range
+// These names are plain again. They were briefly prefixed `B_`, because a module
+// `const` used to be emitted under its BARE C name: `std/path` also declares
+// `BACKSLASH`, and any program importing both modules died with `error:
+// redefinition of 'j_BACKSLASH'` in the generated C — an odd asymmetry, since
+// modules-v2 already let two modules share a non-generic *struct* name. Consts are
+// now canon'd by module like functions and types are, so the prefix is unnecessary
+// and the collision is a non-event.
+const NL: i32 = 10          // '\n'
+const CR: i32 = 13          // '\r'
+const TAB: i32 = 9          // '\t'
+const QUOTE: i32 = 34       // '"'
+const BACKSLASH: i32 = 92   // '\'
+const ZERO: i32 = 48        // '0'
+const MINUS: i32 = 45       // '-'
+const LOW: i32 = 32         // first printable byte
+const HIGH: i32 = 127       // first non-printable byte above the ASCII range
 
 // The most escaped bytes of a single value a failure message will show. Longer
 // values are cut at a whole escape unit and marked `...` *outside* the quotes,
 // so the marker can never be mistaken for literal dots in the value.
-const B_SHOW_MAX: usize = 96
+const SHOW_MAX: usize = 96
 
 // The recorder. Counters only — see the header on why the report buffer is not a
 // field. `lost` counts report bytes that did not fit, so an undersized buffer is
@@ -120,17 +118,17 @@ pub struct Check {
 // terminating newline would leave a blank line in the middle of the harness's
 // output for every failing test.
 @no_alloc fn line(mut c: Check, mut rep: []u8) {
-    if c.used > 0 { put(c, rep, B_NL) }
+    if c.used > 0 { put(c, rep, NL) }
 }
 
 // A signed decimal, most-significant digit first. Never negates `v`, so
 // `i64`'s most negative value formats correctly instead of overflowing.
 @no_alloc fn put_i64(mut c: Check, mut rep: []u8, v: i64) {
     if v == 0 {
-        put(c, rep, B_ZERO)
+        put(c, rep, ZERO)
         return
     }
-    if v < 0 { put(c, rep, B_MINUS) }
+    if v < 0 { put(c, rep, MINUS) }
     // The largest power of ten no greater than |v|. 10^18 is the ceiling for
     // any `i64`, so `p * 10` cannot overflow before the loop stops.
     var p: i64 = 1
@@ -140,7 +138,7 @@ pub struct Check {
     for p > 0 {
         var d: i64 = (v / p) % 10
         if d < 0 { d = 0 - d }
-        put(c, rep, (B_ZERO as i64 + d) as i32)
+        put(c, rep, (ZERO as i64 + d) as i32)
         p = p / 10
     }
 }
@@ -151,16 +149,16 @@ pub struct Check {
 // make the rendering ambiguous), and neither does anything outside printable
 // ASCII.
 @no_alloc fn is_plain(ch: i32) -> bool {
-    if ch == B_BACKSLASH { return false }
-    if ch == B_QUOTE { return false }
-    return ch >= B_LOW and ch < B_HIGH
+    if ch == BACKSLASH { return false }
+    if ch == QUOTE { return false }
+    return ch >= LOW and ch < HIGH
 }
 
 // The escaped width of one byte: 1 as itself, 2 for a named escape, 4 for `\xNN`.
 @no_alloc fn esc_width(ch: i32) -> usize {
     if is_plain(ch) { return 1 }
-    if ch == B_BACKSLASH or ch == B_QUOTE { return 2 }
-    if ch == B_NL or ch == B_CR or ch == B_TAB { return 2 }
+    if ch == BACKSLASH or ch == QUOTE { return 2 }
+    if ch == NL or ch == CR or ch == TAB { return 2 }
     return 4
 }
 
@@ -168,7 +166,7 @@ pub struct Check {
 @no_alloc fn hex_digit(v: i32, hi: bool) -> i32 {
     var d: i32 = v % 16
     if hi { d = (v / 16) % 16 }
-    if d < 10 { return B_ZERO + d }
+    if d < 10 { return ZERO + d }
     return 87 + d          // 'a' is 97, and 97 - 10 == 87
 }
 
@@ -189,24 +187,24 @@ pub struct Check {
         put(c, rep, ch)
         return
     }
-    put(c, rep, B_BACKSLASH)
-    if ch == B_BACKSLASH {
-        put(c, rep, B_BACKSLASH)
+    put(c, rep, BACKSLASH)
+    if ch == BACKSLASH {
+        put(c, rep, BACKSLASH)
         return
     }
-    if ch == B_QUOTE {
-        put(c, rep, B_QUOTE)
+    if ch == QUOTE {
+        put(c, rep, QUOTE)
         return
     }
-    if ch == B_NL {
+    if ch == NL {
         put(c, rep, 110)         // 'n'
         return
     }
-    if ch == B_CR {
+    if ch == CR {
         put(c, rep, 114)         // 'r'
         return
     }
-    if ch == B_TAB {
+    if ch == TAB {
         put(c, rep, 116)         // 't'
         return
     }
@@ -253,14 +251,14 @@ pub struct Check {
 
 // A quoted, escaped, length-capped value inside a report line.
 @no_alloc fn put_value(mut c: Check, mut rep: []u8, read v: str) {
-    put(c, rep, B_QUOTE)
+    put(c, rep, QUOTE)
     var shown: usize = 0
     var i: usize = 0
     var cut: bool = false
     for i < v.len {
         let ch: i32 = v[i] as i32
         let w: usize = esc_width(ch)
-        if shown + w > B_SHOW_MAX {
+        if shown + w > SHOW_MAX {
             cut = true
             break
         }
@@ -268,7 +266,7 @@ pub struct Check {
         shown = shown + w
         i = i + 1
     }
-    put(c, rep, B_QUOTE)
+    put(c, rep, QUOTE)
     if cut { puts(c, rep, "...") }
 }
 
@@ -284,7 +282,7 @@ pub struct Check {
 @no_alloc fn nl_at(read s: str, from: usize) -> usize {
     var i: usize = from
     for i < s.len {
-        if (s[i] as i32) == B_NL { return i }
+        if (s[i] as i32) == NL { return i }
         i = i + 1
     }
     return s.len
@@ -295,7 +293,7 @@ pub struct Check {
 @no_alloc fn line_body(read s: str, from: usize) -> read str {
     var e: usize = nl_at(s, from)
     if e > from {
-        if (s[e - 1] as i32) == B_CR { e = e - 1 }
+        if (s[e - 1] as i32) == CR { e = e - 1 }
     }
     return s[from .. e]
 }
@@ -794,8 +792,8 @@ pub struct Check {
 
     eq_str(c, rep, "v", from_utf8(slice(u8, big, 400)), "")
     let got: str = from_utf8(slice(u8, raw, report_len(c)))
-    // `FAIL v: got "` (13) + B_SHOW_MAX shown + `"...` (4) + ` want ""` (8)
-    let head: usize = 13 + B_SHOW_MAX
+    // `FAIL v: got "` (13) + SHOW_MAX shown + `"...` (4) + ` want ""` (8)
+    let head: usize = 13 + SHOW_MAX
     if got.len != head + 4 + 8 { ok = false }
     // The cut marker sits OUTSIDE the closing quote, so it can never be read as
     // dots belonging to the value.
