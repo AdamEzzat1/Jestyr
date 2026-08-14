@@ -201,8 +201,12 @@ The self-hosted compiler and the standard library, all in Jestyr:
     `is_abs`, `dir_len`, `join`, `normalize`. Every function is `@no_alloc`,
     so "path handling never allocates" is proven rather than promised:
     queries return `read str` views into the argument, and composition writes
-    into a caller buffer. It also ships its own `@test` suite —
-    `jestyrc test examples/std/path.jtr`. Worked examples in `path_demo.jtr`.
+    into a caller buffer. Its suite is the sibling `path_test.jtr` (written with
+    `std/test`) — `jestyrc test examples/std/path_test.jtr`, 11 tests. It is a
+    *separate file* because a `@test` function is emitted into every consumer of
+    its module, so colocating a suite would put the test code, and
+    `test_report`'s `printf`, into everything importing `std/path` — see that
+    file's header. Worked examples in `path_demo.jtr`.
   * `test.jtr` + `test_report.jtr` are expectations and golden comparison for
     the `@test` harness, split across the tier boundary on purpose. `test.jtr`
     is `core` — zero imports, every function `@no_alloc`, and it cannot print:

@@ -528,11 +528,17 @@ pub struct Check {
 
 // ---------------------------------------------------------------------- tests
 //
-// Colocated with the code they check, the shape `std/path.jtr` uses, so
-// `jestyrc test examples/std/test.jtr` is the whole unit layer. This module
-// tests itself with itself where that is honest — the primitives (`escaped`,
-// `first_diff_line`) are checked with plain comparisons first, and only then
-// used to check the expectations.
+// `jestyrc test examples/std/test.jtr` is the whole unit layer. This module tests
+// itself with itself where that is honest — the primitives (`escaped`,
+// `first_diff_line`) are checked with plain comparisons first, and only then used
+// to check the expectations.
+//
+// COLOCATED, unlike `std/path`'s suite, which lives in a sibling
+// `path_test.jtr`. A `@test` function is emitted into every program importing its
+// module, so a suite colocated in a library leaks into that library's consumers —
+// which is why `std/path` (a `core` module with real consumers) moved its out. The
+// exception applies here: everything that imports `std/test` is itself a test, and
+// already allocates and prints. Nothing is protected by moving these out.
 
 @test fn escaped_names_the_control_bytes() -> bool {
     var raw: *mut u8 = alloc(u8, 64)

@@ -366,12 +366,13 @@ Where this slice leaves the seven planned Tier 2 areas.
 
 **The next smallest follow-up**, in order:
 
-1. **Adopt it.** Convert `examples/std/path.jtr`'s 11 `@test` functions to
-   `std/test`. It is the module `test` was designed against, the conversion is
-   mechanical, and it is the honest way to find out whether the API is actually
-   pleasant. (Deliberately *not* done in this slice: `path.jtr` is the only
-   pre-existing stdlib module with a real suite, so leaving it untouched keeps it
-   as the control group for exactly that comparison.)
+1. ~~**Adopt it.**~~ ✅ `std/path`'s eleven tests are now written with `std/test`,
+   in `examples/std/path_test.jtr`. The verdict on the API: the expectations
+   themselves read well and the failure messages are the whole point, but **four
+   lines of boilerplate per test** (`alloc`, `slice`, `new`, `finish` + `free_ptr`)
+   is a real cost that the buffers-in convention forces and that a
+   `[]u8`-range-slice would only partly relieve. The conversion also turned up the
+   test-emission leak that moved convention 4 above.
 2. **`std/process`** (priority #3, free) — a `Process` capability over
    `run_command`, which is the first of the four Tier 2 handles that can be built
    with no new intrinsic.
@@ -379,6 +380,8 @@ Where this slice leaves the seven planned Tier 2 areas.
    parameter from `test_report.finish`, and it is the single most-felt gap in the
    buffers-in convention across the whole stdlib.
 4. **Mangle module `const`s by module** — see the gap recorded below.
+5. **Stop emitting `@test`/`@bench` items in non-test mode** — see convention 4
+   above for why, and for why it is not as small as it looks.
 
 ### Cheap vs expensive, precisely
 
@@ -433,10 +436,47 @@ Saying no is most of what keeps a standard library good.
    checked. Know its blind spot (above).
 3. **Views out, buffers in.** Return `-> read str` for a borrow into an
    argument; take `mut buf: []u8` and return a length for anything composed.
-4. **Ship `@test` functions beside the code**, and write them with `std/test` —
-   `eq_str(c, rep, "name", got, want)` tells you what broke, where a bare
-   `return false` does not. `std/path.jtr` predates the module and still uses
-   plain comparisons; converting it is follow-up #1 above.
+4. **Ship `@test` functions with the code, but in a sibling `*_test.jtr`** —
+   `examples/std/path_test.jtr` beside `examples/std/path.jtr` — and write them
+   with `std/test`: `eq_str(c, rep, "name", got, want)` tells you what broke,
+   where a bare `return false` does not.
+
+   This convention used to say *colocated*, and that was measured to be wrong for
+   any module with non-test consumers. **A `@test` function is an ordinary
+   function with an attribute, so the C backend emits it, and everything it
+   transitively calls, into every program that imports the module.** There is no
+   dead-code elimination at that layer. Converting `std/path`'s eleven tests
+   in-place and importing `std/test_report` therefore put 2,045 extra lines of C
+   *and a `printf`* into `path_demo.jtr` — which is to say into every consumer of
+   `std/path`, breaking precisely the freestanding-linkable property the `core`
+   tier exists to guarantee.
+
+   The numbers, for the same consumer (`path_demo.jtr`):
+
+   | arrangement | emitted C |
+   |---|---|
+   | tests colocated, converted to `std/test` | 2,789 lines, pulls in `printf` |
+   | tests colocated, old plain comparisons | 1,087 lines, 11 `malloc` |
+   | **tests in a sibling `path_test.jtr`** | **744 lines, no test code at all** |
+
+   Note the middle row: the *original* colocated tests already leaked `alloc`/
+   `free_ptr` into consumers. Nobody had noticed because nothing measured it, and
+   `std/path` is now cleaner than it was before this convention changed.
+
+   Two exceptions, both principled. A module only ever imported *by* tests may
+   colocate — `std/test` keeps its own 22, because everything importing it
+   allocates and prints anyway. And a leaf demo with no importers has nobody to
+   leak into. Pinned by `path_stays_a_leaf_module`, which asserts `std/path`
+   imports nothing and declares no `@test`.
+
+   The real fix is a compiler change: **stop emitting `@test`/`@bench` items in
+   non-test mode**, where by construction nothing can reach them. That would make
+   colocation safe everywhere and shrink every binary carrying a suite. It is a
+   genuine emission change — it moves the non-test golden for the three corpus
+   files that have `@test` items, so it owes the `cgen.jtr` mirror and a reseed —
+   and it is bigger than one predicate, because the `uses_*` helper gating,
+   forward declarations, and generic-instance collection all scan `@test` bodies
+   too. Worth doing; not worth smuggling into a library slice.
 5. **Add the two Rust-side tests**: a toolchain-free "compiles clean" via
    `module::load` + typeck + escape + cgen, and a c-oracle `toks(...)` assertion
    on the demo's documented output.

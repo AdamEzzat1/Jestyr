@@ -1805,24 +1805,31 @@ mod test_runner {
     /// `--list` that names an unrun test is worse than no `--list`).
     #[test]
     fn the_harness_is_scoped_to_the_named_module() {
-        // `path_demo.jtr` imports `path` (11 tests) and has none of its own.
-        let prog = crate::module::load("examples/std/path_demo.jtr");
+        // `path_test.jtr` imports `std/test` (22 tests of its own) and must
+        // contribute only its own eleven — the case that motivated this rule.
+        let prog = crate::module::load("examples/std/path_test.jtr");
         assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
         let (info, _td) = crate::typeck::check_program(&prog.ast, &prog.modules);
         let c = cgen::emit_tests_filtered(&prog.ast, &info, None).0;
-        assert_eq!(baked_test_count(&c), 0, "an importer contributes none of its dependency's tests");
-        assert!(c.contains("running 0 test(s)"), "the count is baked, not discovered at runtime");
-        assert!(
-            cgen::list_tests(&prog.ast, &prog.modules.item_mod).is_empty(),
+        assert_eq!(
+            baked_test_count(&c),
+            11,
+            "an importer contributes all of its own tests and none of its dependency's"
+        );
+        assert!(c.contains("running 11 test(s)"), "the count is baked, not discovered at runtime");
+        assert_eq!(
+            cgen::list_tests(&prog.ast, &prog.modules.item_mod).len(),
+            11,
             "`--list` must agree with the harness"
         );
 
-        // ...while the module that OWNS them still contributes all eleven.
-        let own = crate::module::load("examples/std/path.jtr");
-        let (oinfo, _) = crate::typeck::check_program(&own.ast, &own.modules);
-        let oc = cgen::emit_tests_filtered(&own.ast, &oinfo, None).0;
-        assert_eq!(baked_test_count(&oc), 11, "the owning module still runs its own");
-        assert_eq!(cgen::list_tests(&own.ast, &own.modules.item_mod).len(), 11);
+        // ...and a module with no tests of its own contributes none, even though it
+        // imports one with plenty. `path_demo.jtr` imports `path` and `env`.
+        let demo = crate::module::load("examples/std/path_demo.jtr");
+        let (dinfo, _) = crate::typeck::check_program(&demo.ast, &demo.modules);
+        let dc = cgen::emit_tests_filtered(&demo.ast, &dinfo, None).0;
+        assert_eq!(baked_test_count(&dc), 0, "a module with no tests of its own runs none");
+        assert!(cgen::list_tests(&demo.ast, &demo.modules.item_mod).is_empty());
 
         // And a single-module AST (no loader, so `item_mod` is unpopulated) is
         // unaffected — every item defaults to module 0.
@@ -3457,6 +3464,46 @@ mod path_props {
     fn path_module_compiles_clean() {
         let d = diags_of("examples/std/path.jtr");
         assert!(d.is_empty(), "examples/std/path.jtr: {d:?}");
+    }
+
+    /// The relocated `std/path` suite lowers clean, toolchain-free. (The header of
+    /// `examples/std/path_test.jtr` argues why it is a sibling file rather than
+    /// colocated: a `@test` function is an ordinary function, so colocating emits
+    /// the test code — and `std/test_report`'s `printf` — into every consumer.)
+    #[test]
+    fn path_test_module_compiles_clean() {
+        let d = diags_of("examples/std/path_test.jtr");
+        assert!(d.is_empty(), "examples/std/path_test.jtr: {d:?}");
+    }
+
+    /// **`std/path` stays a leaf, so its consumers stay clean.** The `core` tier
+    /// claim is about what a consumer LINKS, and a `@test` function is emitted like
+    /// any other — so colocating a suite that imports `std/test_report` put 2,045
+    /// extra lines of C and a `printf` into `path_demo.jtr`, i.e. into every
+    /// program using `std/path`. Measured, not theorized: 744 lines with the suite
+    /// in a sibling file, 1,087 with the old plain colocated tests, 2,789 with the
+    /// converted ones colocated.
+    ///
+    /// Two structural assertions, both cheap and both regression-prone: `path.jtr`
+    /// imports nothing, and it declares no `@test`. Either one failing means the
+    /// leak is back.
+    #[test]
+    fn path_stays_a_leaf_module() {
+        let prog = crate::module::load("examples/std/path.jtr");
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        assert_eq!(
+            prog.modules.names.len(),
+            1,
+            "std/path must import nothing — it is `core`, and its imports become its \
+             consumers' imports; found {:?}",
+            prog.modules.names
+        );
+        let tests = crate::cgen::list_tests(&prog.ast, &prog.modules.item_mod);
+        assert!(
+            tests.is_empty(),
+            "std/path must declare no @test — they are emitted into every consumer; \
+             found {tests:?}. The suite lives in examples/std/path_test.jtr."
+        );
     }
 
     #[test]
@@ -12789,7 +12836,7 @@ fn main() -> i32 {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr"];
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr"];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
     /// target). This is the acceptance bar the R2 fixpoint ultimately rests on. `DUMP_DIVERGE=1`
@@ -13451,7 +13498,7 @@ fn main() -> i32 {
     /// spellings) are part of the suite rather than a manual step.
     #[test]
     fn path_module_unit_tests_pass() {
-        let (out, code) = build_tests_and_run("examples/std/path.jtr", None);
+        let (out, code) = build_tests_and_run("examples/std/path_test.jtr", None);
         assert_eq!(code, 0, "std/path unit tests must pass:\n{out}");
         assert!(out.contains("11 passed; 0 failed"), "unexpected harness output:\n{out}");
     }

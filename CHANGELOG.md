@@ -185,6 +185,30 @@ versions are snapshots, not stability promises.
 
 ### Fixed
 
+- **A module's `@test` functions were emitted into every program importing it.**
+  A `@test` function is an ordinary function with an attribute, and there is no
+  dead-code elimination at the C-backend layer, so `std/path`'s colocated suite
+  was compiled into every consumer — 1,087 lines of `path_demo.c`, 11 `malloc`
+  calls among them. Converting those tests to `std/test` in place would have made
+  it 2,789 lines and added a `printf`, breaking the freestanding-linkable property
+  the `core` tier exists to guarantee.
+
+  `std/path`'s suite now lives in the sibling `examples/std/path_test.jtr`, so
+  `path_demo.c` is **744 lines with no test code at all** — cleaner than before
+  the conversion started. The stdlib convention changed with it: a module with
+  non-test consumers keeps its tests in a sibling `*_test.jtr`; a module only ever
+  imported *by* tests (`std/test` itself) may colocate. Pinned by
+  `path_stays_a_leaf_module`, which asserts `std/path` imports nothing and
+  declares no `@test`.
+
+  The underlying compiler fix — stop emitting `@test`/`@bench` items in non-test
+  mode, where nothing can reach them — is recorded as future work in
+  `docs/stdlib-roadmap.md`. It is a real emission change (it moves the non-test
+  golden for the three corpus files carrying `@test` items, so it owes the
+  `cgen.jtr` mirror and a reseed) and it is bigger than one predicate, because the
+  `uses_*` helper gating, forward declarations, and generic-instance collection all
+  scan `@test` bodies too.
+
 - **`jestyrc test <file>` ran the whole import closure's tests, not the named
   file's.** `jestyrc test examples/std/path_demo.jtr` ran `std/path`'s eleven even
   though `path_demo.jtr` has none of its own. Nobody had noticed because until
