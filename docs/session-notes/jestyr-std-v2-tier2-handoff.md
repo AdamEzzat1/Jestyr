@@ -1,392 +1,308 @@
-# Std v2 Tier 2 — what remains, and what I verified about it
+# Std v2 Tier 2 — what remains
 
-Cold-start note for the next session. Three of the seven Tier 2 areas are done and one
-is partly checked; this covers the other four, plus three standing compiler follow-ups.
-`std/str` (§6 item 1) is also done — the roadmap's priority list is now out of *free*
-slices entirely.
+Cold-start note. **Remaining work first (§1), then what is deliberately deferred and why
+(§2).** What is already built is in §3 — read it only to avoid rebuilding something.
 
-**All of it is on `master` and pushed. Start from `master` — there is no branch to
-chase.**
+Everything is on `master` and pushed: `master` == `origin/master` == **`920fc9a`**, clean
+tree. `git pull` and go; there is no branch to chase.
 
----
+Baseline before you change anything, so a later failure is yours:
 
-## §0. READ FIRST: where the work is
+```bash
+cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
+```
 
-`master` == `origin/master` == **`2c1085f`**, zero divergence, working tree clean.
-`git pull` and go.
-
-Getting there took a reconciliation worth two minutes of your time, because it left
-refs lying around and because the failure mode generalizes.
-
-The nine Std v2 commits (`2b0ff09` std/test · `5b7062e` harness scoping · `c194a73`
-path adopts std/test · `cce5df6` std/process · `e7462b6` const canon'ing · `fe49492`
-`[]T` range-slice · `897d35d` test_fixture · `7618933` Fs/Clock/Env · `2bda2c2` this
-note) were built on a branch because the main checkout was sitting on an **uncommitted
-but fully-resolved merge** of `claude/elegant-hellman-1d7ac2`. That pending merge
-carried compiler work existing nowhere else: `3195ee1` (a `take` parameter is dropped
-by its callee — the RAII hole) and `c341703` (use-after-`take` of a droppable is
-refused), both sides, plus a reseed and the `jestyr-std` benchmark track.
-
-**An uncommitted resolved merge is the most fragile state in git.** Hours of conflict
-resolution live only in the index, and a single `git merge --abort` erases them with no
-reflog entry to recover from. The fix was to commit it *first* (`dfee158`) — the commit
-is the backup — and only then merge the branch in (`2c1085f`).
-
-Integration cost, for calibration: exactly **one** conflict, `CGEN_GOLDEN_ALLOWLIST` in
-`src/proptests.rs`, where both sides had appended. Resolved as the union, 169 entries.
-Treat that file carefully — a dropped entry there does not error, it silently stops
-verifying a corpus file against the self-hosted backend. `src/cgen.rs`,
-`examples/std/cgen.jtr` **and both generated `bootstrap/` files auto-merged correctly**;
-`bootstrap_seed_is_current` passed *without* a refresh, because the two changes had
-touched disjoint regions of the flattened source. I predicted that auto-merge would be
-garbage and was wrong — **check before assuming a reseed is owed.**
-
-Two refs are safe to delete once you are satisfied:
-`backup/pre-integration-2026-08-14`, and `claude/jestyr-std-v2-design-4aeb42` (local
-and remote).
+**1169 passed, 0 failed, 3 ignored** (~320 s). The 3 ignored are deliberate slow numeric
+sweeps (`dragon_matches_std_thorough`, `slow_parse_matches_std_thorough`,
+`dump_pow10_table`), not breakage.
 
 ---
 
-## §1. What is already done — do not rebuild it
+## §1. REMAINING
+
+Ranked by value per unit of risk. Each has a concrete first increment, because "design
+Collections v2" is not a task and "a deterministic `HashMap(K,V)` using `strmap`'s probing
+with a canaried hash" is.
+
+### §1.1 — Collections v2 (Tier 2 area 4). The only area with nothing built
+
+**The roadmap's stated blocker is narrower than it reads.** It says generic containers
+"keep colliding with the escape checker's treatment of opaque `T` as non-`Copy`; each new
+one is a fight". Directionally true, but `genlist.jtr`, `vec_generic.jtr` and `list.jtr`
+all exist, work, and are in the byte-identity allowlist. `container.jtr` is a **deliberate
+rejection demo** — what is refused is storing a *borrow* in a collection, which is correct
+and should stay refused. So this is a design job, not a fight with the checker.
+
+Four things to settle before writing code:
+
+1. **The hash function, decided and canaried first.** Tier 2 wants deterministic by
+   default, randomized only explicitly. `sha256.jtr` is in-language and already the
+   cross-OS determinism canary, so a deterministic hasher has a proven byte-exact
+   primitive to build on. Pin the chosen function in that canary so changing it is a
+   visible break rather than a silent rehash.
+2. **`K` needs `Hash + Eq` as a trait bound.** Bounds work (`ledger.jtr`'s
+   `[T: Account]`). **Verify the bound composes for a *generic struct's* type parameter
+   before committing** — `gen_vtable.jtr` is the nearest precedent and the likeliest bite.
+3. **Allocator-explicit, copying `List(T)` exactly.** `List` stores its `Allocator` and
+   frees through a blanket `impl[T] Drop for List(T)`. That shape is proven; do not invent
+   a second one.
+4. **Pick ONE container.** The "no generic collections zoo" objection is about breadth,
+   not existence. One deterministic `HashMap(K,V)` with a real consumer is a slice; four
+   containers with none is the zoo.
+
+**First increment:** `HashMap(K,V)` modelled on `strmap.jtr`'s open addressing (it already
+caches hashes so a grow re-places without rehashing), generic in the key, hash fixed and
+canaried. Give it a real consumer on day one — `strmap`'s users, or the compiler's symbol
+table. Every slice on this branch that went well had one.
+
+### §1.2 — `@no_os` (Tier 2 area 6). Small, and turns convention into a check
+
+The tier model is documented and *partly* enforced: `@no_alloc` makes "never allocates"
+checked on `path`, `str`, `test`, `sink`, `cursor`; `path_stays_a_leaf_module` and friends
+check the test-leak boundary. **What is missing is a checked OS boundary** — "`core` links
+on a freestanding target" is still convention.
+
+**First increment:** add `@no_os` mirroring `@no_alloc`'s implementation. The intrinsic
+list is closed and short — `arg`, `arg_count`, `read_file`, `try_read_file`, `write_file`,
+`file_exists`, `remove_file`, `run_command`, `eprint_str`, `mono_nanos`, `env_var`, plus
+the print family — so the check is "does the call graph reach one of these". Then put it on
+`core.jtr`, `path.jtr`, `str.jtr`, `test.jtr`, `sink.jtr`, `cursor.jtr`, `sha256.jtr`.
+
+Emission-neutral, so **probably** no port mirror — but `attrs.rs` is reference-only today,
+so verify whether `escape.jtr` owes one rather than assuming. Expect the same blind spot as
+`@no_alloc` (§5) and say so in the docs instead of overclaiming.
+
+### §1.3 — `PathBuf` (Tier 2 area 2, the half that is not blocked)
+
+`struct PathBuf { s: String }` compiles today. `String` is owned so there is no
+second-class-borrow problem, and RAII already recurses into owned struct fields (B1 field
+auto-drop), so it frees itself. An owned, growable path is genuinely useful and does **not**
+wait on the `distinct` question in §1.6.
+
+Keep `std/path`'s lexical layer exactly as it is — `@no_alloc`-proven, view+buffer based.
+The typed layer sits *above* it, never replaces it.
+
+### §1.4 — A partial-read intrinsic. The thing that unblocks a streaming `Reader`
+
+`std/cursor` is the whole reader that can honestly exist today, because the intrinsics only
+offer `read_file`/`try_read_file`, which slurp. There is no partial read, no file handle, no
+`read_line`. **The next increment in the IO area is that intrinsic, not more library code** —
+anything else is an API pretending to stream.
+
+Pays the eleven-site recipe (§4) plus a reseed. Design it before writing it: a file handle
+plus `read_into(handle, buf) -> usize` is the shape a real `Reader` needs, and it is a bigger
+surface than the one-call intrinsics added so far (`env_var`, `mono_nanos`), because it
+introduces a *resource with a lifetime* — which is a `Drop`/RAII question as much as an
+intrinsic one.
+
+### §1.5 — Three compiler follow-ups, each independent
+
+**1. Normalize `run_command`'s exit status.** The runtime helper is
+`return (int32_t)system(cp)` — raw. Windows gives the exit code; POSIX specifies a wait
+status with the code in the high byte, so `exit 3` is 3 on one platform and 768 on the
+other. `std/process` works around it by making `run_ok` (`== 0`, which coincides) the
+portable API and documenting `run`'s value as platform-specific. Fix is `WEXITSTATUS` in the
+helper. Runtime change → mirror + reseed. Also the clearest concrete argument for `sys`.
+
+**2. Close the pointer-to-slice assignability hole.** `fn f(read s: []u8)` called as `f(raw)`
+with `raw: *mut u8` **passes typeck** — `jestyrc check` prints "assignability … passed" — and
+fails only in gcc as `incompatible type for argument 1`. That is the "degrades to gcc"
+failure mode the port work spent real effort eliminating, and it makes `check` a false
+negative for an easy mistake (I made it, writing `test_report.finish(c, raw)` against a
+changed signature). Probably one arm in the assignability check. Same family as the **OPEN
+int→int conversion decision** (`[[jestyr-typeck-assignability]]`) — settle both together.
+Typeck change → mirror + reseed.
+
+**3. Stop emitting `@test`/`@bench` items in non-test mode.** The proper fix for the leak in
+§5, and it would let library tests be colocated again. Bigger than one predicate: `uses_*`
+helper gating, forward declarations and generic-instance collection all scan `@test` bodies,
+and it moves the non-test golden for the corpus files carrying `@test` items. Mirror +
+reseed.
+
+### §1.6 — Typed `Path` (Tier 2 area 2, the blocked half)
+
+**Do not build this on `distinct` yet.** Probed: `distinct Path = str` compiles, and then
+passing a bare `str` where a `Path` is wanted is **accepted** — as is passing an `AccountId`
+where a `UserId` is wanted. `distinct` today gives a *name* with **no check**, which is worse
+than nothing because it reads as safety.
+
+Enforcement has to come from assignability, which means resolving the open int→int question
+first (§1.5.2 — they are the same rule). Until then a typed `Path` ships an API whose central
+claim is unenforced.
+
+The language is *ahead* of the library here: `os_str` is already a real distinct primitive
+(`os_from_bytes`, `to_str_lossy`, participating in the text-family conversion rules;
+`examples/os_str.jtr`).
+
+---
+
+## §2. DEFERRED — with the reason, so it is not re-litigated
+
+Each was considered and rejected *for now*. The reason matters more than the verdict: when
+the reason stops holding, the item becomes live.
+
+| Deferred | Why, precisely | Becomes live when |
+|---|---|---|
+| **Streaming `Reader`** | No partial-read intrinsic, no file handle. Wrapping `read_file`'s slurp in a `Reader` trait ships an API whose central promise — that it streams — is false, and gets rebuilt immediately | §1.4 lands |
+| **`BufWriter`** | A handle cannot own borrowed storage, so it needs an `Allocator` → `mem` tier, not `core`. And the one destination that would benefit is stdout, which **already buffers in C stdio** — wrapping it is double buffering with a second copy | A real case appears (socket, compressor) |
+| **Error sets on writes** | Fifty `?`s down a formatter is how errors get swallowed, not handled. The one genuinely fallible operation is a final `flush`, and that is where an error set belongs — one fallible call, not N | A fallible write intrinsic exists |
+| **`failed()` on `Writer`** | Removed, not shipped: `print_str`/`eprint_str` return nothing so a stream write has no detectable failure, and sink overflow is deliberately the *sink's* business. It could only ever answer `false`, and a query that always says "fine" invites a caller to believe it checked something | Same as above |
+| **`sys` tier** | Genuinely blocked on `extern "c"` (design §14, 📐). Until then it is a wrapper around a wrapper — today the platform boundary *is* the closed intrinsic list | `extern "c"` lands |
+| **Typed `Path` on `distinct`** | `distinct` is not enforced at argument positions (§1.6) | The int→int assignability decision is settled |
+| **A generic collections zoo** | A breadth objection, not an existence objection. One container with a real consumer is a slice | Never as a zoo; one at a time (§1.1) |
+| **A package manager** | `ROADMAP.md` calls it ecosystem-premature, and the module-manifest hash DAG covers the real need (a lockfile-lite pinning the build graph) | Deliberately open-ended |
+| **Networking / HTTP / TLS** | No async story (📐), no `extern "c"`, and the moment a socket lands the platform boundary stops being optional | After `sys` |
+| **JSON / serialization** | Wants the string tier settled; a serializer on today's primitives would be rewritten | After `fmt` (roadmap slice 8) |
+| **Iterators / lazy sequences** | A language design question (traits + closures + lifetimes) in a library costume. Answer it in the design, not by shipping a shape we would have to break | A design answer exists |
+| **A logging framework** | Wants formatting, time and a global — the third is deliberately absent | Probably never as stated |
+| **`unwrap`-style panicking helpers** | Would undercut the error-set design that payloads and `catch \|e\|` exist to serve | Never |
+
+Two refs are safe to delete when you are satisfied: `backup/pre-integration-2026-08-14` and
+`claude/jestyr-std-v2-design-4aeb42` (local + remote). The other ~46 `claude/*` branches
+predate this work.
+
+---
+
+## §3. DONE — do not rebuild
 
 | Tier 2 area | State |
 |---|---|
-| 1. Capability handles | ✅ **all four.** `process.Process`, `fs.Fs`, `time.Clock`, `env.Env` |
+| 1. Capability handles | ✅ **all four** — `process.Process`, `fs.Fs`, `time.Clock`, `env.Env` |
+| 3. Reader / Writer | ✅ **Writer complete** (`sink` core + `writer` std); **Reader is memory-only** (`cursor`) — streaming is §1.4, not a gap in the design |
 | 5. Testing / golden | ✅ `std/test` (core) + `test_report` (prints) + `test_fixture` (fetches) |
-| 7. Package / build | ✅ *as scoped* — `build.jestyr` (CTFE, effect-free by construction) + module-manifest hash DAG. A package manager is deliberately out |
-| 6. No-std contract | 🟡 documented, partly checked — §3.1 |
-| 2. Typed path / OsStr | 🟡 language ahead of library — §3.2 |
-| 3. Reader / Writer | ✅ **Writer done** (`sink` core + `writer` std); **Reader is memory-only** (`cursor`) — streaming is intrinsic-blocked, see §3.3 |
-| 4. Collections v2 | 🔴 nothing built — §3.4 |
+| 7. Package / build | ✅ *as scoped* — `build.jestyr` (CTFE, effect-free by construction) + module-manifest hash DAG |
+| 6. No-std contract | 🟡 documented, `@no_alloc`-checked; needs §1.2 |
+| 2. Typed path / OsStr | 🟡 `os_str` is a real primitive; `PathBuf` is §1.3, typed `Path` is §1.6 |
+| 4. Collections v2 | 🔴 §1.1 |
 
-Also landed on the way, because the library work forced them: `jestyrc test <file>`
-scoped to the named module; module `const`s canon'd by module; `[]T` range-slicing;
-and `std/path`'s suite moved out of the module (see the leak trap in §5).
+**The roadmap's priority list is out of free slices.** Slices 1–6 (`path`, `test`,
+`process`, `str`, `env`, `time`) are done; 7 (`fs` expansion), 8 (`fmt`) and 9 (`sys`) each
+pay a new intrinsic or are blocked.
 
-And now on `master` alongside them, from the other line of work that reconciled in
-§0 — relevant because it changes RAII behavior under you: a **`take` parameter is
-dropped by its callee** (`3195ee1`, closing the RAII hole) and **use-after-`take` of a
-droppable is refused** (`c341703`), both sides, with `examples/drop_take.jtr` as the
-demo. If you write anything that moves ownership into a function, that is the current
-rule.
+Also landed, because the library work forced them: `jestyrc test <file>` scoped to the named
+module; module `const`s canon'd by module; `[]T` range-slicing; `std/path`'s suite moved to
+a sibling file. And from the other line of work that merged in: **a `take` parameter is
+dropped by its callee** (`3195ee1`) and **use-after-`take` of a droppable is refused**
+(`c341703`) — relevant because it changes RAII behaviour under anything new you write that
+moves ownership into a function.
 
-The narrative for all of it is in `docs/stdlib-roadmap.md`, which is the authoritative
-document — this note is the *forward-looking* half and will go stale faster.
+Three documents carry the arguments, worth reading before touching their areas:
+`docs/stdlib-roadmap.md` (tiers, priority, what stays out), `docs/io-design.md` (the four IO
+decisions **and the two that implementation corrected**), and this note.
 
 ---
 
-## §2. The verification gate
+## §4. The verification gate
 
-Build and the three rungs:
+**Verify the tax rather than assuming it** — four compiler changes on this branch, and only
+one owed a mirror.
 
-```bash
-cargo build --release
-cargo test --release --features "c-oracle,selfhost-fixpoint"
-```
+| Change | Port mirror in `cgen.jtr`? | Reseed? |
+|---|---|---|
+| New `examples/std/*.jtr` that no closure module imports | no | no |
+| **Library** code added to a closure module (`fs`, `env`, …) | **no** | **yes** |
+| **Emission or typeck behaviour** change | **yes** | **yes** |
+| New intrinsic | yes (the eleven-site recipe) | yes |
 
-Baseline on `master` at `2c1085f`: **1149 passed, 0 failed, 3 ignored** (~320 s). That
-number is the merged tree — it is the run that proved the `take`-drop lowering and the
-const-canon'ing / `[]T` range-slicing compose, since each had only ever been verified
-against a tree lacking the other. (The Std v2 branch alone was 1135.)
-
-Reseed, when owed:
+The closure is exactly twelve modules, hardcoded as `SELFHOST_MODULES` in
+`src/proptests.rs`: `mem, intern, fs, env, list, tokens, parser, ctfe, typeck, escape,
+sha256, cgen`. Library code in one changes the *flattened source*, not the compiler's
+behaviour — hence reseed, no mirror.
 
 ```bash
 REFRESH_SEED=1 cargo test --release --features "c-oracle,selfhost-fixpoint" bootstrap_seed_is_current
 ```
 
-### The tax rules, corrected
+Two facts worth having: a **comment-only** edit to a closure module still forces a reseed
+(`flatten_selfhost_concat` edits raw source spans, so it preserves comments); and
+`docs/TESTING.md`'s "any change to `examples/std/*.jtr` forces a reseed" is conservative
+shorthand that is technically wrong.
 
-I got this wrong once mid-session, so it is stated carefully:
-
-| Change | Port mirror in `cgen.jtr`? | Reseed? |
-|---|---|---|
-| New `examples/std/*.jtr` no closure module imports | no | no |
-| **Library** code added to a closure module (`fs`, `env`, …) | **no** | **yes** |
-| **Emission or typeck behavior** change | **yes** | **yes** |
-| New intrinsic | yes (the 11-site recipe) | yes |
-
-The closure is exactly twelve modules, hardcoded as `SELFHOST_MODULES` in
-`src/proptests.rs`: `mem, intern, fs, env, list, tokens, parser, ctfe, typeck,
-escape, sha256, cgen`. Adding library code to one changes the *flattened source*, not
-the compiler's behavior — that is why it owes a reseed but no mirror. `Fs` + `Env`
-cost +192 lines of flat source and +163 of seed C; `time` was free (not in the
-closure).
-
-Two further facts worth having: a **comment-only** edit to a closure module still
-forces a reseed (`flatten_selfhost_concat` applies span edits to raw source, so it
-preserves comments); and `docs/TESTING.md`'s "any change to `examples/std/*.jtr` forces
-a reseed" is conservative shorthand that is technically wrong.
+New modules should be added to `CGEN_GOLDEN_ALLOWLIST` — opt-in byte-identity against the
+self-hosted backend. Measure rather than assume; every file added on this branch passed
+first try. **Treat that list carefully: a dropped entry does not error, it silently stops
+verifying a file.**
 
 ---
 
-## §3. The four remaining areas
-
-### §3.1 — No-std contract (area 6): documented, partly checked
-
-**State.** The tier model (`core` / `mem` / `std` / `sys` / `parallel`) is written up in
-`docs/stdlib-roadmap.md`, and parts of it are now *enforced* rather than asserted:
-
-* `@no_alloc` on every function in `path.jtr` and `test.jtr` makes "never allocates" a
-  compiler-checked property. Its blind spot is real and documented: it resolves the
-  call graph **by free-function name**, so it does not see through a method, a
-  closure, or a `fn(…)` pointer — code allocating through the `Allocator` vtable
-  passes.
-* `path_stays_a_leaf_module` and `process_ships_no_tests_in_the_module` check the
-  *leak* boundary (§5).
-
-**What is missing is a checked OS boundary.** There is no `@no_os` analogue, so
-"`core` links on a freestanding target" is convention. `sys` does not exist and is
-genuinely blocked on `extern "c"` (design §14, 📐) — until then it would be a wrapper
-around a wrapper, which the roadmap argues at length.
-
-**First increment, if you want progress here without waiting for `extern "c"`:** add a
-`@no_os` attribute mirroring `@no_alloc`'s implementation — the intrinsic list is
-closed and short (`arg`, `arg_count`, `read_file`, `try_read_file`, `write_file`,
-`file_exists`, `remove_file`, `run_command`, `eprint_str`, `mono_nanos`, `env_var`,
-plus the print family), so the check is "does the call graph reach one of these".
-Then put it on `core.jtr`, `path.jtr`, `test.jtr`, `sha256.jtr` and the tier claim
-becomes checked. Cost: an attribute + a checker pass, both sides, **emission-neutral**
-so probably no mirror — but `attrs.rs` is reference-only today, so verify whether
-`escape.jtr` needs the mirror before assuming.
-
-Expect the same blind spot as `@no_alloc` and say so in the docs rather than
-overclaiming.
-
-### §3.2 — Typed path / OsStr (area 2): the language is ahead, and `distinct` will not do it
-
-**Verified this session, and it changes the plan:**
-
-* `os_str` is **already a real distinct primitive** in the compiler, not a library
-  idea: `os_from_bytes(…) -> os_str`, `to_str_lossy(…) -> String`, and it participates
-  in the text-family conversion rules (`src/typeck.rs`, the `str`/`String`/`cstr`/
-  `os_str`/`Builder`/`Cow` family). `examples/os_str.jtr` is the demo — WTF-8 platform
-  bytes you have not proven valid.
-* **`distinct` is NOT an enforced newtype today.** I probed it: `distinct Path = str`
-  compiles, and then `base_of(s)` with a bare `str` is **accepted**; so is passing an
-  `AccountId` where a `UserId` is wanted (`distinct UserId = i32`,
-  `distinct AccountId = i32`). Building `Path` on `distinct` would give you a *name*
-  with **no check** — worse than nothing, because it would read as safety.
-  See `[[jestyr-typeck-assignability]]`, which records the int→int conversion decision
-  as explicitly OPEN; this is the same permissiveness.
-* A struct *field* of type `str` **is** declarable (`struct PathView { s: str }`
-  compiles). The refusal is at the **store site**, not the declaration: storing a
-  second-class borrow (a `read str`/`mut []u8` **parameter**) into a struct that
-  outlives the call is what the escape checker rejects. So `Path` built from a literal
-  is fine and `Path` built from a function's `read str` parameter is not.
-
-**Therefore the honest sequencing is:**
-
-1. Decide what `Path` is *for*. If it is "don't confuse a path with arbitrary text at
-   an OS boundary", the enforcement has to come from assignability, so **fix `distinct`
-   first** — and that means resolving the open int→int conversion question, because the
-   two are the same rule.
-2. `PathBuf` (owned) is easier and independent: `struct PathBuf { s: String }`
-   compiles today, `String` is owned so there is no borrow problem, and RAII already
-   recurses into owned struct fields (B1 field auto-drop), so it would free itself.
-   That is a genuinely cheap, useful increment — an owned, growable path — and it does
-   not wait on `distinct`.
-3. Keep `std/path`'s lexical layer exactly as it is. It is `@no_alloc`-proven,
-   view+buffer based, and the typed layer should sit *above* it rather than replace it.
-
-**Do not** convert `std/path` to typed `Path` before step 1, or you will ship an API
-whose central claim is unenforced.
-
-### §3.3 — Reader / Writer (area 3): ✅ DONE. Writer fully, Reader only over memory
-
-Built and on `master`. The four design decisions, and the two that **implementation
-corrected**, are in `docs/io-design.md` — read that rather than re-deriving them.
-
-* `sink.jtr` (`core`) — bytes out into a caller-owned `[]u8`. Concrete struct, free
-  functions, `@no_alloc` a *real* proof.
-* `cursor.jtr` (`core`) — bytes in, every result a view: `byte`, `peek`, `chunk`, `rest`,
-  `line`, `until`, `looking_at`, `consume`, `skip_ws`, `word`.
-* `writer.jtr` (`std`) — one routine to stdout, stderr, or a `Sink`.
-
-**The finding that set the tier line:** `@no_alloc` does not see through a trait method
-and **passes vacuously** — it accepts `@no_alloc fn fill[T: Sink](mut s: T)` whose impl
-allocates on every call, while correctly rejecting the direct-call control in the same
-file. So the polymorphic layer cannot be `core` without the marker becoming a *false*
-proof, which is worse than no marker. Pinned by
-`no_alloc_does_not_see_through_a_trait_method`, which also asserts the control still
-fails — otherwise the test would pass for the boring reason that `@no_alloc` checks
-nothing.
-
-**Two things implementation changed**, recorded because the design doc would otherwise
-read as having been right first time:
-
-1. The `failed()` latch was **removed, not shipped.** `print_str`/`eprint_str` return
-   nothing, so a stream write has no detectable failure, and sink overflow is
-   deliberately the *sink's* business — so `failed()` could only ever return `false`. A
-   query that always answers "fine" invites a caller to believe it checked something.
-2. The `Writer` API needed **one** entry point, not two. `write_str` + `write_str_into`
-   forced every formatter to open with `if is_buffered(w)`, and a formatter that must
-   know its destination is not polymorphic. The sink now travels on every write and is
-   unused for stream targets — a real cost, pinned by
-   `a_stream_writer_leaves_the_scratch_sink_alone`.
-
-**READING IS NOT SYMMETRIC AND WAS NOT FAKED.** There is no partial-read intrinsic, no
-file handle, no `read_line` — only `read_file`/`try_read_file`, which slurp. So `cursor`
-over `fs.read_text`'s result is the whole honest reader; a streaming hosted `Reader` is
-blocked on an intrinsic, and wrapping the slurp in a `Reader` trait would ship an API
-whose central promise is false. **The next increment here is that intrinsic**, on the
-eleven-site recipe (§2), not more library code.
-
-Still open, deliberately: no `BufWriter` (wants an allocator, so `mem`-tier — and stdout
-already buffers in C stdio, so wrapping it would double-buffer), and no error sets on
-writes (they want a fallible `flush` to hang on).
-
-### §3.4 — Collections v2 (area 4): the blocker is narrower than the roadmap says
-
-**State.** `List(T)` (generic, allocator-parameterized, RAII-freed), `StrMap`
-(string keys → `i64`), `intern`. No generic `HashMap(K,V)`, `Set(T)`, `Deque(T)`,
-`SmallVec`.
-
-**The roadmap says** generic containers "keep colliding with the escape checker's
-treatment of opaque `T` as non-`Copy`; each new one is a fight, not a fill-in." That
-is directionally right but reads as broader than it is: **generic containers demonstrably
-work** — `genlist.jtr`, `vec_generic.jtr`, `list.jtr` are all in the corpus and in the
-byte-identity allowlist. `container.jtr` is a **deliberate rejection demo**: what is
-refused is storing a *borrow* in a collection, which is correct and should stay
-refused.
-
-**So the real questions are these, and they are design not capability:**
-
-1. **Deterministic hashing.** The prompt's Tier 2 spec says deterministic by default,
-   randomized only explicitly. `sha256.jtr` exists in-language and is already used as
-   the cross-OS determinism canary, so a deterministic hasher has a proven,
-   byte-exact primitive to build on. Decide the hash *function* before the map, and
-   pin it in the canary so a change to it is a visible break.
-2. **`K` needs equality and hashing.** That is a trait bound (`[K: Hash + Eq]`), and
-   trait bounds work (`ledger.jtr`'s `[T: Account]`). Verify the bound composes for a
-   *generic struct's* type parameter before committing — `gen_vtable.jtr` is the
-   nearest precedent.
-3. **Allocator-explicit, like `List(T)`.** `List` stores its `Allocator` and frees via
-   a blanket `impl[T] Drop for List(T)`. Copy that shape exactly; it is proven.
-4. **Pick ONE.** The roadmap's "no generic collections zoo" objection is about
-   breadth, not existence. A single deterministic `HashMap(K,V)` with a real consumer
-   is a slice; four containers with none is the zoo it warns against.
-
-**First increment:** a deterministic `HashMap(K,V)` modelled on `strmap.jtr`'s open
-addressing (it already caches hashes so a grow can re-place without re-hashing) but
-generic in the key, with the hash function fixed and canaried. Its first consumer
-should be a real one — `strmap.jtr`'s users, or the compiler's symbol table.
-
----
-
-## §4. Three standing compiler follow-ups
-
-Recorded in `docs/stdlib-roadmap.md`'s follow-up list; none of them blocks the above.
-
-1. **Normalize `run_command`'s exit status.** The runtime helper is
-   `return (int32_t)system(cp)` — raw. Windows gives the exit code; POSIX specifies a
-   *wait status* with the code in the high byte, so `exit 3` is 3 on one platform and
-   768 on the other. `std/process` works around it by making `run_ok` (`== 0`, which
-   coincides on both) the portable API and documenting `run`'s value as
-   platform-specific. The fix is `WEXITSTATUS` in the helper: a runtime change, so it
-   owes the `cgen.jtr` mirror **and** a reseed. It is also the clearest concrete
-   argument for the `sys` tier.
-2. **Close the pointer-to-slice assignability hole.** `fn f(read s: []u8)` called as
-   `f(raw)` with `raw: *mut u8` passes typeck — `jestyrc check` prints
-   "assignability … passed" — and fails only in gcc, as `incompatible type for argument
-   1`. That is the exact "degrades to gcc" failure mode the port work spent effort
-   eliminating, and it makes `jestyrc check` a false negative for a mistake that is easy
-   to make (I made it, writing `test_report.finish(c, raw)` against the pre-`fe49492`
-   signature). Probably one arm in the assignability check; it is the same family as the
-   OPEN int→int conversion decision recorded in `[[jestyr-typeck-assignability]]`, so
-   settle both together. Typeck change → mirror + reseed.
-3. **Stop emitting `@test`/`@bench` items in non-test mode.** This is the proper fix
-   for the leak in §5 and would let library tests be colocated again. Bigger than one
-   predicate: `uses_*` helper gating, forward declarations, and generic-instance
-   collection all scan `@test` bodies, and it moves the non-test golden for the three
-   corpus files that have `@test` items — so mirror + reseed.
-
----
-
-## §5. Traps, consolidated
-
-Things that cost time this session and will cost it again.
+## §5. Traps
 
 * **A colocated `@test` is emitted into every consumer.** A `@test` fn is an ordinary
   function with an attribute and there is no dead-code elimination in the C backend.
-  Measured on `path_demo.c`: **1,087** lines with `std/path`'s original colocated
-  tests → **2,789** once those used `std/test_report` (pulling in `printf`) → **744**
-  with the suite in a sibling `path_test.jtr`. A `core` module's own test scaffolding
-  silently breaks its tier claim. **Convention: a module with non-test consumers puts
-  tests in a sibling `*_test.jtr`.** A module only ever imported *by* tests
-  (`std/test`) may colocate.
-* **A capability handle cannot own borrowed storage.** A Jestyr borrow is
-  second-class, so storing a `mut []u8`/`read str` **parameter** into a struct is
-  refused ("a stored value must outlive the call"). Counters go in the handle, storage
-  stays with the caller. The field *declaration* is fine — the refusal is at the store.
-  `strmap.jtr` pays `unsafe` + raw pointers instead.
-* **`out` is a reserved keyword.** A *local* named `out` gives `E0007: expected an
-  expression` at every use; a parameter cascades worse. Cost me a rename mid-file.
-* **`env.argc()`/`argv()`/`program()` read 0 and empty inside a `@test`** — the harness
-  emits `int main(void)`, so the runtime never records arguments. Environment
-  *variables* are unaffected (`getenv` bypasses `main`). Pinned by
-  `argv_is_invisible_to_the_test_harness`.
+  Measured on `path_demo.c`: **1,087** lines with `std/path`'s original colocated tests →
+  **2,789** once they used `std/test_report` (pulling in `printf`) → **744** with the suite
+  in a sibling `path_test.jtr`. A `core` module's own test scaffolding silently breaks its
+  tier claim. **Convention: a module with non-test consumers puts tests in a sibling
+  `*_test.jtr`;** a module only ever imported *by* tests (`std/test`) may colocate. Proper
+  fix is §1.5.3.
+* **`@no_alloc` passes VACUOUSLY through a trait method.** It accepts a `@no_alloc` function
+  writing through a trait whose impl allocates on every call, while correctly rejecting the
+  direct-call control. Not a weak proof — a *false* one. This is why the `Writer` trait is
+  `std` while `Sink`/`Cursor` are `core`. Pinned by
+  `no_alloc_does_not_see_through_a_trait_method`.
+* **A handle cannot own borrowed storage.** A Jestyr borrow is second-class, so storing a
+  `mut []u8`/`read str` **parameter** in a struct is refused. Counters in the handle, storage
+  with the caller. The field *declaration* is fine — the refusal is at the store.
+* **Keywords cost API names.** `out` and `take` are reserved; a *local* named `out` gives
+  E0007 at every use, and `fn take(…)` is a parse error. **Enum variants are bare identifiers
+  in a shared namespace** and cannot be keywords — hence `stdout_target`/`stderr_target`
+  rather than claiming `stdout` from every consumer.
+* **Some builtins are for-loop forms, not calls** — `split` and `graphemes`. Do not
+  reimplement them and do not name a function either (`grapheme_count` is the counting
+  spelling). `std/str`'s header documents `split`'s measured semantics.
+* **`env.argc()`/`argv()`/`program()` read 0/empty inside a `@test`** — the harness emits
+  `int main(void)`, so the runtime never records arguments. Environment *variables* are
+  unaffected (`getenv` bypasses `main`).
 * **A closure module's NAME is reserved across the whole flattened compiler.** Grep
-  `\bNAME\.` in every closure module before adding an import — the `cgen.jtr` →
-  `std/path` migration was tried and reverted for exactly this.
-* **Don't assert a global absence to prove a local property.** I asserted the emitted C
-  contained no `memcpy` to prove a slice sub-view is copy-free; it failed, because the
-  runtime prelude has `memcpy` for unrelated reasons. Assert the *presence* of
-  `.ptr + _lo`.
+  `\bNAME\.` in every closure module before adding an import — the `cgen.jtr` → `std/path`
+  migration was tried and reverted for exactly this.
+* **Commit a resolved merge before doing anything else.** The resolution lives only in the
+  index, so `merge --abort` destroys it with nothing in the reflog. When several worktrees
+  share one clone, `git status` in the *other* checkout is part of reading the situation —
+  `MERGE_HEAD` existing is a very different fact from "22 dirty files".
+* **Generated files can auto-merge correctly — check, don't assume either way.** I expected a
+  3-way merge of two independently regenerated 28,000-line bootstrap files to be garbage. It
+  was exact, and `bootstrap_seed_is_current` proves it in 18 s. (Converse still holds: if it
+  fails, regenerate, never hand-merge.)
+* **Don't assert a global absence to prove a local property.** Asserting the emitted C had no
+  `memcpy` to prove a slice view is copy-free failed — the runtime prelude has `memcpy`.
+  Assert the *presence* of `.ptr + _lo`.
 * **A differential test cannot catch a bug both sides share.** `normalize` compared the
-  output's last two bytes instead of the whole segment; the Rust oracle written from
-  the same spec had the identical flaw. Keep worked examples and adversarial reading
-  alongside differential agreement.
-* **Pair every refusal test with a positive control.** "The write was refused" means
-  nothing unless the same write through a `host()` handle lands. Flipping
-  `process.denied()` to permit kills 4 of 7 tests — that is the mutation check worth
-  running on any new capability.
-* **When a documented limitation is load-bearing, pin it with a test** that must be
-  changed deliberately (`diff_count_is_aligned_not_an_edit_script`,
+  output's last two bytes instead of the whole segment; the Rust oracle written from the same
+  spec had the identical flaw. Keep worked examples and adversarial reading alongside
+  differential agreement.
+* **A differential can also be wrong about a correct module.** `str`'s first version stripped
+  trailing `\r`/`\n` from stdout greedily, so `after("\r", "")` — correctly the whole string
+  — compared as empty and failed correct code. Strip exactly the one terminator `print_str`
+  appends.
+* **Pair every refusal test with a positive control.** "The write was refused" means nothing
+  unless the same write through a `host()` handle lands. Flipping `process.denied()` to
+  permit kills 4 of 7 tests — that is the mutation check worth running on any new capability.
+* **Write tests that check YOU, not just the code.** Two on this branch earned their keep:
+  one pinned a hand-written ASCII whitespace set against the `trim` intrinsic's definition
+  (they agreed — the value is that they now cannot drift), the other pinned `split`'s
+  documented semantics so prose cannot drift from the language.
+* **When a documented limitation is load-bearing, pin it with a test** that must be changed
+  deliberately (`diff_count_is_aligned_not_an_edit_script`,
   `array_range_slicing_is_still_refused`).
-* .jtr subset traps for closure modules: a `for` condition cannot start with `(`; a
-  bare `{` after a call-init parses as the ctor form; never chain `string_view(x).len`.
-  Author `.jtr` with Write, not shell heredocs — heredocs mangle backslashes.
-* **Commit a resolved merge before doing anything else with the repo.** The resolution
-  lives only in the index, so `merge --abort` destroys it with nothing in the reflog to
-  recover. This repo had one sitting uncommitted for a whole session (§0). Corollary:
-  when several worktrees share one clone, `git status` in the *other* checkout is part
-  of reading the situation — `MERGE_HEAD` existing is a very different fact from "22
-  dirty files", and only the former tells you work is at risk.
-* **Generated files can auto-merge correctly — verify instead of assuming either way.**
-  I expected a 3-way merge of two independently regenerated 28,000-line files
-  (`bootstrap/jestyr_seed.c`, `jestyr_flat.jtr`) to be garbage. It was exact, because
-  the two changes touched disjoint regions of the flattened source, and
-  `bootstrap_seed_is_current` proves it in 18 s by recomputing from source. Cheaper to
-  run the guard than to reason about it. (The converse still holds: if it *does* fail,
-  regenerate, never hand-merge.)
+* .jtr subset traps for closure modules: a `for` condition cannot start with `(`; a bare `{`
+  after a call-init parses as the ctor form; never chain `string_view(x).len`. **Author `.jtr`
+  with Write, not shell heredocs** — heredocs mangle backslashes.
 
 ---
 
 ## §6. Suggested order
 
-1. ~~**`std/str`**~~ ✅ — done. `core`, `@no_alloc` throughout, zero imports: named
-   wrappers over the string intrinsics plus the views `examples/str_ops.jtr` said you
-   had to hand-roll (`before`/`after`/`before_last`/`after_last`/`strip_prefix`/
-   `strip_suffix`/`trim_start`/`trim_end`/`strip_cr`/`last_index_of`/`count_of`/
-   `clamped`). Two findings worth carrying:
-   * **`split` already existed** as a for-loop form (`for w in split(s, sep)`,
-     zero-copy views, `examples/histogram.jtr`) — so `std/str` names and *documents* its
-     measured semantics rather than reimplementing it. `split` and `graphemes` being
-     loop forms is also why no function there is called either.
-   * **typeck accepts `*mut u8` where `[]u8` is expected.** `jestyrc check` reports
-     "assignability … passed" and only gcc catches it, as a message about generated C.
-     Same family as the open int→int decision. Recorded in §4 as a follow-up.
-2. ~~**`Reader`/`Writer` (§3.3)**~~ ✅ — done. The four decisions are settled in
-   `docs/io-design.md`, which also records the two that implementation corrected. Shipped:
-   `sink.jtr` (`core`, bytes out to a caller buffer, `@no_alloc` proven), `cursor.jtr`
-   (`core`, bytes in, views out), `writer.jtr` (`std`, one routine to stdout/stderr/buffer).
-   Streaming reads remain blocked on an intrinsic and are NOT faked.
-3. **`@no_os` (§3.1)** — turns the no-std contract from convention into a check, and is
-   small.
-4. **`PathBuf` (§3.2 step 2)** — owned, independent of the `distinct` question.
-5. **`HashMap(K,V)` (§3.4)** — after the hashing decision, with a real consumer.
+1. **`@no_os` (§1.2)** — small, self-contained, and it converts the `core` tier's central
+   claim from convention into a check. Good first move in a fresh session.
+2. **`PathBuf` (§1.3)** — cheap, independent, useful.
+3. **`HashMap(K,V)` (§1.1)** — the only untouched area. Settle the hash function *first*,
+   verify the trait bound composes on a generic struct's parameter, then build one container
+   with a real consumer.
+4. **The assignability hole + int→int decision (§1.5.2)** — settle them together; it also
+   unblocks §1.6.
+5. **The partial-read intrinsic (§1.4)** — the largest, and the only route to a real
+   streaming `Reader`.
 
-Leave `distinct`-enforced `Path` and `sys` alone until their blockers (the int→int
-assignability decision; `extern "c"`) are actually resolved. Both are the kind of thing
-that looks like library work and is not.
+Leave `sys` and typed `Path`-on-`distinct` alone until their blockers actually move. Both
+look like library work and are not.
