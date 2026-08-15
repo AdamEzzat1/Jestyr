@@ -10492,6 +10492,174 @@ mod tests {
         emit(&ast, &info)
     }
 
+    /// How many times `helper` is **called**, ignoring the runtime prelude's own
+    /// definition of it.
+    ///
+    /// ## Why this exists
+    /// The prelude emits a core set of `jestyr_rt_*` helpers into *every* program —
+    /// a 106-line do-nothing `fn main() -> i32 { return 0 }` already contains
+    /// `jestyr_rt_eq_fold`, `jestyr_rt_valid_utf8`, `jestyr_rt_str_free` and the
+    /// rest. So `call_sites(&c, "jestyr_rt_eq_fold") >= 1` is true whatever the program
+    /// does, and four tests below were asserting exactly that: they would have
+    /// passed if the intrinsic under test had lowered to nothing at all.
+    ///
+    /// The definition is a `static` at the start of its line; every other
+    /// occurrence is a call. Counting those makes the assertion *local* to the
+    /// program's own code, which is the property the test is actually about.
+    ///
+    /// The same trap in its absence-flavoured form is recorded in the Tier 2
+    /// handoff (§5, the `memcpy` case) and is now blocked from returning by
+    /// `no_emitted_c_assertion_is_satisfied_by_the_empty_program`.
+    fn call_sites(c: &str, helper: &str) -> usize {
+        let needle = format!("{helper}(");
+        c.lines()
+            .filter(|l| l.contains(&needle) && !l.trim_start().starts_with("static "))
+            .count()
+    }
+
+    /// The emitted text of one function, from its signature to the closing brace at
+    /// column 0.
+    ///
+    /// The right instrument when the thing being asserted is a *fragment* rather than
+    /// a helper call — `break;`, `.len;`, an index expression. Those strings appear
+    /// somewhere in the prelude of every program, so asking the whole file whether it
+    /// contains one answers a question about the runtime, not about the lowering.
+    fn body_of<'a>(c: &'a str, c_fn_name: &str) -> &'a str {
+        let sig = format!("jestyr_{c_fn_name}(");
+        let start = c.find(&sig).unwrap_or_else(|| panic!("no emitted `{c_fn_name}` in:\n{c}"));
+        let rest = &c[start..];
+        // The body ends at the first `}` in column 0 after the opening brace.
+        match rest.find("\n}") {
+            Some(end) => &rest[..end + 2],
+            None => rest,
+        }
+    }
+
+    /// **The control for [`call_sites`]** — a strengthened assertion is only worth
+    /// having if it can fail.
+    ///
+    /// A program that does nothing still *contains* every prelude helper, which is
+    /// exactly why `contains` was the wrong instrument; it must nonetheless *call*
+    /// none of them. Both halves are asserted, so this test states the trap rather
+    /// than merely avoiding it.
+    #[test]
+    fn call_sites_ignores_the_prelude_definition() {
+        let (empty, d) = gen("fn main() -> i32 { return 0 }");
+        assert!(d.is_empty(), "{d:?}");
+        for helper in
+            ["jestyr_rt_eq_fold", "jestyr_rt_valid_utf8", "jestyr_rt_count_cp", "jestyr_rt_str_free"]
+        {
+            assert!(
+                empty.contains(&format!("{helper}(")),
+                "{helper} IS in every program — that is the trap `contains` walks into"
+            );
+            assert_eq!(
+                call_sites(&empty, helper),
+                0,
+                "…but a do-nothing program calls it zero times, which is the property \
+                 worth asserting"
+            );
+        }
+    }
+
+    /// **The lesson, made permanent.** Any assertion of the form "the emitted C
+    /// contains X" is vacuous when X is in the C of a program that does nothing —
+    /// it would hold even if the feature under test lowered to nothing at all.
+    ///
+    /// Four such assertions existed when this was written (`eq_fold`, `from_utf8`,
+    /// `is_utf8`, `count_codepoints`), each the *only* check in its test. They were
+    /// found by an audit; this keeps the audit running.
+    ///
+    /// Scans the test sources rather than the compiler: the property is about how
+    /// tests are written, so it is the only place it can be checked. Comment lines
+    /// are skipped (a doc comment naming the trap is not committing it), and the
+    /// allowlist below is for assertions where the prelude *is* the subject.
+    #[test]
+    fn no_emitted_c_assertion_is_satisfied_by_the_empty_program() {
+        let (empty, d) = gen("fn main() -> i32 { return 0 }");
+        assert!(d.is_empty(), "{d:?}");
+
+        // Assertions whose subject genuinely IS the unconditional prelude or the
+        // wrapper — for these, "every program has it" is the fact being asserted, not
+        // an accident that hides a weak test.
+        const ALLOWED: &[&str] = &[
+            "#include", // `valid_program_emits_prelude` — that a prelude exists at all
+            "#line ",   // the `#line` directive golden — emitted for every program
+            "int main(int argc, char** argv) { jestyr_rt_argc = argc; jestyr_rt_argv = argv; return (int) jestyr_main(); }",
+            "jestyr_rt_read_file(JestyrStr path)", // "…runtime defined": the definition IS the claim
+            "jestyr_rt_write_file(JestyrStr path, JestyrStr data)",
+            "static int jestyr_rt_argc = 0;", // "argc global declared in the prelude"
+            "typedef struct { const char* ptr; size_t len; } JestyrStr;",
+            "int main(", // a skip-guard in the module golden, not an assertion
+        ];
+
+        let sources = [
+            ("src/cgen.rs", include_str!("cgen.rs")),
+            ("src/proptests.rs", include_str!("proptests.rs")),
+        ];
+        let mut bad: Vec<String> = Vec::new();
+        for (name, text) in sources {
+            for (i, line) in text.lines().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue; // a comment describing the trap is not the trap
+                }
+                // `<var>.contains("…")` in a POSITIVE assertion over emitted C.
+                for (pos, _) in line.match_indices(".contains(\"") {
+                    // Skip the negated form: an absence claim is a different question.
+                    let before = &line[..pos];
+                    if before.trim_end().ends_with('!') || before.contains("!c.contains") {
+                        continue;
+                    }
+                    let recv = before.rsplit(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or("");
+                    if !matches!(recv, "c" | "lc" | "src_c" | "c_src") {
+                        continue; // not emitted-C
+                    }
+                    // Scan to the CLOSING quote, honouring `\"` — stopping at the first
+                    // `"` truncated `"\"C:/proj/m.jtr\""` to a lone backslash, which is
+                    // in every program's `#line` paths, so the audit reported a site
+                    // that was fine. A checker that cries wolf gets switched off.
+                    let rest = &line[pos + ".contains(\"".len()..];
+                    let mut lit = String::new();
+                    let mut it = rest.chars();
+                    let mut closed = false;
+                    while let Some(ch) = it.next() {
+                        match ch {
+                            '\\' => match it.next() {
+                                Some('"') => lit.push('"'),
+                                Some('n') => lit.push('\n'),
+                                Some('\\') => lit.push('\\'),
+                                Some(other) => {
+                                    lit.push('\\');
+                                    lit.push(other);
+                                }
+                                None => break,
+                            },
+                            '"' => {
+                                closed = true;
+                                break;
+                            }
+                            _ => lit.push(ch),
+                        }
+                    }
+                    if !closed || lit.is_empty() || ALLOWED.contains(&lit.as_str()) {
+                        continue;
+                    }
+                    if empty.contains(&lit) {
+                        bad.push(format!("{name}:{}  {lit:?}", i + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "these assertions hold for a program that does NOTHING, so they cannot \
+             distinguish a working lowering from one that emits nothing — assert on a \
+             call site (see `call_sites`) or on the emitted function's own text:\n  {}",
+            bad.join("\n  ")
+        );
+    }
+
     // --- error payloads (E3, `docs/error-payloads.md` §3–§4) ---
 
     /// **The absence test — the one that protects the corpus.** A payload-free
@@ -12413,7 +12581,7 @@ mod tests {
         let (c, d) = gen("fn f() -> i32 { var p = alloc_i32(4) free_ptr(p) return 0 }");
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("malloc((size_t)(4) * sizeof(int32_t))"), "{c}");
-        assert!(c.contains("free("), "{c}");
+        assert!(call_sites(&c, "free") >= 1, "{c}");
     }
 
     #[test]
@@ -12474,7 +12642,7 @@ mod tests {
         let src = "fn f(read who: str) -> i32 { let n: i32 = 3 var m: String = f\"{who}: {n}\" let r: i32 = m.len as i32 string_free(m) return r }";
         let (c, d) = gen(src);
         assert!(d.is_empty(), "{:?}", d);
-        assert!(c.contains("jestyr_rt_str_new()"), "an f-string builds a fresh String: {c}");
+        assert!(call_sites(&c, "jestyr_rt_str_new") >= 1, "an f-string builds a fresh String: {c}");
         assert!(c.contains("jestyr_rt_str_push_i64(&"), "an int interpolation formats as decimal: {c}");
     }
 
@@ -12494,8 +12662,11 @@ mod tests {
         let (c, d) = gen(src);
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("JestyrString j_s"), "String is the owned heap type: {c}");
-        assert!(c.contains("jestyr_rt_str_from("), "string_from copies into an owned buffer: {c}");
-        assert!(c.contains("jestyr_rt_str_push(&"), "string_push takes the String by address: {c}");
+        assert!(call_sites(&c, "jestyr_rt_str_from") >= 1, "string_from copies into an owned buffer: {c}");
+        assert!(
+            body_of(&c, "f").contains("jestyr_rt_str_push(&"),
+            "string_push takes the String by address: {c}"
+        );
         assert!(c.contains("j_s.len"), "String.len is an O(1) field: {c}");
     }
 
@@ -12507,7 +12678,7 @@ mod tests {
         let (c, d) = gen(src);
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("JestyrStr j_t"), "a string slice types as str: {c}");
-        assert!(c.contains("jestyr_rt_substr("), "via the boundary-checked helper: {c}");
+        assert!(call_sites(&c, "jestyr_rt_substr") >= 1, "via the boundary-checked helper: {c}");
     }
 
     #[test]
@@ -12515,7 +12686,7 @@ mod tests {
         let (c, d) = gen("fn f(read s: str) -> i32 { let t = substr(s, 1, 3) return t.len as i32 }");
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("JestyrStr j_t"), "substr(...) types as str: {c}");
-        assert!(c.contains("jestyr_rt_substr("), "substr lowers to the helper: {c}");
+        assert!(call_sites(&c, "jestyr_rt_substr") >= 1, "substr lowers to the helper: {c}");
     }
 
     #[test]
@@ -12528,8 +12699,8 @@ mod tests {
         let (c, d) = gen(src);
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("jestyr_rt_find(_rest"), "split scans with find: {c}");
-        assert!(c.contains("jestyr_rt_is_combining("), "graphemes absorbs combining marks: {c}");
-        assert!(c.contains("jestyr_rt_count_graphemes("), "count_graphemes: {c}");
+        assert!(call_sites(&c, "jestyr_rt_is_combining") >= 1, "graphemes absorbs combining marks: {c}");
+        assert!(call_sites(&c, "jestyr_rt_count_graphemes") >= 1, "count_graphemes: {c}");
         assert!(c.contains("size_t j_off = _k"), "(offset, codepoint) binds the byte offset: {c}");
     }
 
@@ -12542,9 +12713,9 @@ mod tests {
             let i = find(s, \"x\") let t = trim(s) return i as i32 }";
         let (c, d) = gen(src);
         assert!(d.is_empty(), "{:?}", d);
-        assert!(c.contains("jestyr_rt_str_eq("), "str_eq: {c}");
-        assert!(c.contains("jestyr_rt_find("), "find: {c}");
-        assert!(c.contains("jestyr_rt_trim("), "trim: {c}");
+        assert!(call_sites(&c, "jestyr_rt_str_eq") >= 1, "str_eq: {c}");
+        assert!(call_sites(&c, "jestyr_rt_find") >= 1, "find: {c}");
+        assert!(call_sites(&c, "jestyr_rt_trim") >= 1, "trim: {c}");
         assert!(c.contains("JestyrStr j_t"), "trim yields a str view: {c}");
         assert!(c.contains("bool j_a"), "str_eq yields a bool: {c}");
     }
@@ -12556,8 +12727,8 @@ mod tests {
         let (c, d) = gen(src);
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("JestyrCow j_c"), "Cow-typed binding: {c}");
-        assert!(c.contains("jestyr_rt_cow_borrow("), "borrow (no alloc): {c}");
-        assert!(c.contains("jestyr_rt_cow_to_mut("), "copy-on-write point: {c}");
+        assert!(call_sites(&c, "jestyr_rt_cow_borrow") >= 1, "borrow (no alloc): {c}");
+        assert!(call_sites(&c, "jestyr_rt_cow_to_mut") >= 1, "copy-on-write point: {c}");
     }
 
     #[test]
@@ -12566,14 +12737,14 @@ mod tests {
         let (c, d) = gen(src);
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("JestyrStr j_os"), "os_str lowers to a view: {c}");
-        assert!(c.contains("jestyr_rt_to_str_lossy("), "lossy decode to a proven String: {c}");
+        assert!(call_sites(&c, "jestyr_rt_to_str_lossy") >= 1, "lossy decode to a proven String: {c}");
     }
 
     #[test]
     fn eq_fold_is_case_insensitive() {
         let (c, d) = gen("fn f() -> i32 { if eq_fold(\"Hi\", \"hi\") { return 1 } return 0 }");
         assert!(d.is_empty(), "{:?}", d);
-        assert!(c.contains("jestyr_rt_eq_fold("), "eq_fold lowers to the fold compare: {c}");
+        assert_eq!(call_sites(&c, "jestyr_rt_eq_fold"), 1, "eq_fold lowers to one fold compare: {c}");
     }
 
     #[test]
@@ -12599,9 +12770,9 @@ mod tests {
         assert!(c.contains("jestyr_rt_write_file(JestyrStr path, JestyrStr data)"), "write_file runtime defined: {c}");
         // ...and each call site lowers to them; read_file yields an owned String.
         assert!(c.contains("JestyrString j_s = jestyr_rt_read_file("), "read_file binds an owned String: {c}");
-        assert!(c.contains("jestyr_rt_write_file("), "write call lowered: {c}");
-        assert!(c.contains("jestyr_rt_file_exists("), "exists call lowered: {c}");
-        assert!(c.contains("jestyr_rt_remove_file("), "remove call lowered: {c}");
+        assert!(call_sites(&c, "jestyr_rt_write_file") >= 1, "write call lowered: {c}");
+        assert!(call_sites(&c, "jestyr_rt_file_exists") >= 1, "exists call lowered: {c}");
+        assert!(call_sites(&c, "jestyr_rt_remove_file") >= 1, "remove call lowered: {c}");
     }
 
     #[test]
@@ -12620,22 +12791,25 @@ mod tests {
         let src = "fn f(b: []u8) -> i32 { let s: str = from_utf8(b) return s.len as i32 }";
         let (c, d) = gen(src);
         assert!(d.is_empty(), "{:?}", d);
-        assert!(c.contains("jestyr_rt_valid_utf8("), "from_utf8 validates: {c}");
-        assert!(c.contains("assert("), "validity is asserted at the boundary: {c}");
+        assert_eq!(call_sites(&c, "jestyr_rt_valid_utf8"), 1, "from_utf8 validates: {c}");
+        assert!(
+            c.lines().any(|l| l.contains("assert(") && l.contains("jestyr_rt_valid_utf8")),
+            "validity is asserted AT the boundary, in one expression: {c}"
+        );
     }
 
     #[test]
     fn is_utf8_is_a_recoverable_check() {
         let (c, d) = gen("fn f(b: []u8) -> i32 { return is_utf8(b) as i32 }");
         assert!(d.is_empty(), "{:?}", d);
-        assert!(c.contains("jestyr_rt_valid_utf8("), "is_utf8 → validity check: {c}");
+        assert_eq!(call_sites(&c, "jestyr_rt_valid_utf8"), 1, "is_utf8 → validity check: {c}");
     }
 
     #[test]
     fn count_codepoints_is_an_on_decode() {
         let (c, d) = gen("fn f(read s: str) -> i32 { return count_codepoints(s) as i32 }");
         assert!(d.is_empty(), "{:?}", d);
-        assert!(c.contains("jestyr_rt_count_cp("), "count_codepoints → O(n) decode: {c}");
+        assert_eq!(call_sites(&c, "jestyr_rt_count_cp"), 1, "count_codepoints → O(n) decode: {c}");
     }
 
     #[test]
@@ -12643,7 +12817,7 @@ mod tests {
         let src = "fn f(read s: str) -> i32 { var n: i32 = 0 for cp in codepoints(s) { n = n + 1 } return n }";
         let (c, d) = gen(src);
         assert!(d.is_empty(), "{:?}", d);
-        assert!(c.contains("jestyr_rt_decode_cp("), "codepoint iteration decodes UTF-8: {c}");
+        assert!(call_sites(&c, "jestyr_rt_decode_cp") >= 1, "codepoint iteration decodes UTF-8: {c}");
         assert!(c.contains("uint32_t j_cp"), "each codepoint binds as a u32: {c}");
     }
 
@@ -12671,7 +12845,10 @@ mod tests {
         let src = "fn f(s: str) -> i32 { var t: i32 = 0 for c in s { t = t + (c as i32) } return t }";
         let (c, d) = gen(src);
         assert!(d.is_empty(), "{:?}", d);
-        assert!(c.contains(".len;"), "iterates to the view's length, not strlen: {c}");
+        assert!(
+            body_of(&c, "f").contains(".len;"),
+            "iterates to the view's length, not strlen: {c}"
+        );
         assert!(!c.contains("strlen("), "length is O(1) — no strlen: {c}");
         assert!(c.contains("uint8_t j_c = (uint8_t)"), "each byte binds as u8: {c}");
     }
@@ -12719,7 +12896,8 @@ mod tests {
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("while ((j_k > 0))"), "conditional → while: {c}");
         assert!(c.contains("for (;;)"), "infinite → for(;;): {c}");
-        assert!(c.contains("break;") && c.contains("continue;"), "break/continue: {c}");
+        let b = body_of(&c, "f");
+        assert!(b.contains("break;") && b.contains("continue;"), "break/continue: {c}");
     }
 
     #[test]
@@ -12791,7 +12969,7 @@ mod tests {
         // No `else` ⇒ no synthetic label, and a plain `break` stays a C `break`.
         let (c, d) = gen("fn f() { for { break } }");
         assert!(d.is_empty(), "{:?}", d);
-        assert!(c.contains("break;"), "else-less break is plain C break: {c}");
+        assert!(body_of(&c, "f").contains("break;"), "else-less break is plain C break: {c}");
         assert!(!c.contains("__break"), "no break label synthesized: {c}");
     }
 
@@ -12832,7 +13010,10 @@ mod tests {
                    fn f(e: E, xs: []i32) { for { match e { stop => { break }, go(v) => { for x in xs { break } } } } }";
         let (c, d) = gen(src);
         assert!(d.is_empty(), "{:?}", d);
-        assert!(c.contains("break;"), "the nested loop's break stays a C break: {c}");
+        assert!(
+            body_of(&c, "f").contains("break;"),
+            "the nested loop's break stays a C break: {c}"
+        );
         assert!(c.contains("goto _sb1__break;"), "the outer switch-break still routes: {c}");
     }
 
@@ -13527,7 +13708,7 @@ mod tests {
         assert!(c.contains("_ar0.a[_k0] = _v0"), "repeat literal fills the array: {c}");
         assert!(c.contains("assert(_ix") && c.contains("->a[_ix"), "bounds-checked element access: {c}");
         assert!(c.contains("((size_t)4)"), "`.len` is the constant length: {c}");
-        assert!(c.contains("_a") && c.contains("->a[_k"), "for-loop iterates the inline field: {c}");
+        assert!(c.contains("->a[_k"), "for-loop iterates the inline field: {c}");
     }
 
     #[test]
