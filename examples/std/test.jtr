@@ -89,7 +89,7 @@ pub struct Check {
 }
 
 // A fresh recorder: no checks, no failures, an empty report.
-@no_alloc pub fn new() -> Check {
+@no_alloc @no_os pub fn new() -> Check {
     return Check{ checks: 0, failures: 0, used: 0, lost: 0 }
 }
 
@@ -99,7 +99,7 @@ pub struct Check {
 // thing that could be called a writer; a real `Writer` is a later slice, and
 // when it lands these three functions are what it replaces.
 
-@no_alloc fn put(mut c: Check, mut rep: []u8, ch: i32) {
+@no_alloc @no_os fn put(mut c: Check, mut rep: []u8, ch: i32) {
     if c.used >= rep.len {
         c.lost = c.lost + 1
         return
@@ -110,7 +110,7 @@ pub struct Check {
 
 // Module-authored ASCII text — labels and punctuation, never user data (user
 // data goes through `put_value`, which escapes it).
-@no_alloc fn puts(mut c: Check, mut rep: []u8, read s: str) {
+@no_alloc @no_os fn puts(mut c: Check, mut rep: []u8, read s: str) {
     for i in 0..s.len {
         put(c, rep, s[i] as i32)
     }
@@ -121,13 +121,13 @@ pub struct Check {
 // own newline and the `@test` harness prints `test <name> ... ` without one: a
 // terminating newline would leave a blank line in the middle of the harness's
 // output for every failing test.
-@no_alloc fn line(mut c: Check, mut rep: []u8) {
+@no_alloc @no_os fn line(mut c: Check, mut rep: []u8) {
     if c.used > 0 { put(c, rep, NL) }
 }
 
 // A signed decimal, most-significant digit first. Never negates `v`, so
 // `i64`'s most negative value formats correctly instead of overflowing.
-@no_alloc fn put_i64(mut c: Check, mut rep: []u8, v: i64) {
+@no_alloc @no_os fn put_i64(mut c: Check, mut rep: []u8, v: i64) {
     if v == 0 {
         put(c, rep, ZERO)
         return
@@ -152,14 +152,14 @@ pub struct Check {
 // Does `ch` go into the output as itself? Backslash and quote do not (they would
 // make the rendering ambiguous), and neither does anything outside printable
 // ASCII.
-@no_alloc fn is_plain(ch: i32) -> bool {
+@no_alloc @no_os fn is_plain(ch: i32) -> bool {
     if ch == BACKSLASH { return false }
     if ch == QUOTE { return false }
     return ch >= LOW and ch < HIGH
 }
 
 // The escaped width of one byte: 1 as itself, 2 for a named escape, 4 for `\xNN`.
-@no_alloc fn esc_width(ch: i32) -> usize {
+@no_alloc @no_os fn esc_width(ch: i32) -> usize {
     if is_plain(ch) { return 1 }
     if ch == BACKSLASH or ch == QUOTE { return 2 }
     if ch == NL or ch == CR or ch == TAB { return 2 }
@@ -167,7 +167,7 @@ pub struct Check {
 }
 
 // One lowercase hex digit of `v`'s low nibble-selected half; `hi` picks which.
-@no_alloc fn hex_digit(v: i32, hi: bool) -> i32 {
+@no_alloc @no_os fn hex_digit(v: i32, hi: bool) -> i32 {
     var d: i32 = v % 16
     if hi { d = (v / 16) % 16 }
     if d < 10 { return ZERO + d }
@@ -177,7 +177,7 @@ pub struct Check {
 // The exact number of bytes `escaped` needs for `v` — so a caller can size a
 // buffer instead of guessing, and so the two functions can be checked against
 // each other.
-@no_alloc pub fn escaped_len(read v: str) -> usize {
+@no_alloc @no_os pub fn escaped_len(read v: str) -> usize {
     var n: usize = 0
     for i in 0..v.len {
         n = n + esc_width(v[i] as i32)
@@ -186,7 +186,7 @@ pub struct Check {
 }
 
 // Write one escaped byte. The caller has already checked that it fits.
-@no_alloc fn put_esc_byte(mut c: Check, mut rep: []u8, ch: i32) {
+@no_alloc @no_os fn put_esc_byte(mut c: Check, mut rep: []u8, ch: i32) {
     if is_plain(ch) {
         put(c, rep, ch)
         return
@@ -226,7 +226,7 @@ pub struct Check {
 // Writing stops at the last WHOLE escape unit that fits, so a short `dst`
 // truncates cleanly and never emits half of an escape. `escaped_len(v)` is the
 // length that always fits; a shorter return value means it was cut.
-@no_alloc pub fn escaped(read v: str, mut dst: []u8) -> usize {
+@no_alloc @no_os pub fn escaped(read v: str, mut dst: []u8) -> usize {
     var c: Check = new()
     var i: usize = 0
     for i < v.len {
@@ -247,14 +247,14 @@ pub struct Check {
 // `std/test_report.finish` call `from_utf8` unconditionally. Not capped: a
 // truncated name is a failure you cannot identify, and `put` already bounds the
 // buffer.
-@no_alloc fn put_ident(mut c: Check, mut rep: []u8, read s: str) {
+@no_alloc @no_os fn put_ident(mut c: Check, mut rep: []u8, read s: str) {
     for i in 0..s.len {
         put_esc_byte(c, rep, s[i] as i32)
     }
 }
 
 // A quoted, escaped, length-capped value inside a report line.
-@no_alloc fn put_value(mut c: Check, mut rep: []u8, read v: str) {
+@no_alloc @no_os fn put_value(mut c: Check, mut rep: []u8, read v: str) {
     put(c, rep, QUOTE)
     var shown: usize = 0
     var i: usize = 0
@@ -283,7 +283,7 @@ pub struct Check {
 // just `str_eq`.
 
 // The index of the first `\n` at or after `from`; `s.len` when there is none.
-@no_alloc fn nl_at(read s: str, from: usize) -> usize {
+@no_alloc @no_os fn nl_at(read s: str, from: usize) -> usize {
     var i: usize = from
     for i < s.len {
         if (s[i] as i32) == NL { return i }
@@ -294,7 +294,7 @@ pub struct Check {
 
 // The content of the line beginning at `from`, without its `\n` or a `\r`
 // immediately before it. A view into `s`, valid only while `s` is.
-@no_alloc fn line_body(read s: str, from: usize) -> read str {
+@no_alloc @no_os fn line_body(read s: str, from: usize) -> read str {
     var e: usize = nl_at(s, from)
     if e > from {
         if (s[e - 1] as i32) == CR { e = e - 1 }
@@ -305,7 +305,7 @@ pub struct Check {
 // Where the line after the one beginning at `from` starts; `s.len` when that was
 // the last line. `from == s.len` means there are no more lines, which is what
 // makes a trailing newline optional rather than significant.
-@no_alloc fn line_next(read s: str, from: usize) -> usize {
+@no_alloc @no_os fn line_next(read s: str, from: usize) -> usize {
     let e: usize = nl_at(s, from)
     if e == s.len { return s.len }
     return e + 1
@@ -313,7 +313,7 @@ pub struct Check {
 
 // How many logical lines `s` holds. "" is zero lines; "a" and "a\n" are both
 // one; "a\n\n" is two (the second is empty).
-@no_alloc pub fn line_count(read s: str) -> usize {
+@no_alloc @no_os pub fn line_count(read s: str) -> usize {
     var at: usize = 0
     var n: usize = 0
     for at < s.len {
@@ -330,7 +330,7 @@ pub struct Check {
 //
 // Symmetric in its arguments, by construction: whichever side runs out, the
 // answer is the same line number.
-@no_alloc pub fn first_diff_line(read got: str, read want: str) -> usize {
+@no_alloc @no_os pub fn first_diff_line(read got: str, read want: str) -> usize {
     var a: usize = 0
     var b: usize = 0
     var ln: usize = 0
@@ -347,35 +347,35 @@ pub struct Check {
 
 // Are `got` and `want` the same text, line for line? Insensitive to `\r\n` vs
 // `\n` and to a missing final newline; sensitive to everything else.
-@no_alloc pub fn lines_eq(read got: str, read want: str) -> bool {
+@no_alloc @no_os pub fn lines_eq(read got: str, read want: str) -> bool {
     return first_diff_line(got, want) == 0
 }
 
 // ---------------------------------------------------------------- the queries
 
 // Did every expectation so far pass?
-@no_alloc pub fn passed(read c: Check) -> bool {
+@no_alloc @no_os pub fn passed(read c: Check) -> bool {
     return c.failures == 0
 }
 
 // How many expectations have been recorded (passing and failing).
-@no_alloc pub fn checks(read c: Check) -> i64 {
+@no_alloc @no_os pub fn checks(read c: Check) -> i64 {
     return c.checks
 }
 
 // How many of them failed.
-@no_alloc pub fn failures(read c: Check) -> i64 {
+@no_alloc @no_os pub fn failures(read c: Check) -> i64 {
     return c.failures
 }
 
 // Bytes of report written so far — the length to view when printing it.
-@no_alloc pub fn report_len(read c: Check) -> usize {
+@no_alloc @no_os pub fn report_len(read c: Check) -> usize {
     return c.used
 }
 
 // Report bytes that did not fit the buffer. Non-zero means the report you are
 // reading is incomplete; the verdict is still correct.
-@no_alloc pub fn lost(read c: Check) -> usize {
+@no_alloc @no_os pub fn lost(read c: Check) -> usize {
     return c.lost
 }
 
@@ -386,20 +386,20 @@ pub struct Check {
 // test stop early (`if eq_i64(...) == false { return finish(c, raw) }`) without
 // the module deciding that for it.
 
-@no_alloc fn fail(mut c: Check, mut rep: []u8, read name: str) {
+@no_alloc @no_os fn fail(mut c: Check, mut rep: []u8, read name: str) {
     c.failures = c.failures + 1
     line(c, rep)
     puts(c, rep, "FAIL ")
     put_ident(c, rep, name)
 }
 
-@no_alloc fn started(mut c: Check) {
+@no_alloc @no_os fn started(mut c: Check) {
     c.checks = c.checks + 1
 }
 
 // Append a free-form note (escaped, so it cannot corrupt the report). Does not
 // count as a check and never changes the verdict — context, not an assertion.
-@no_alloc pub fn note(mut c: Check, mut rep: []u8, read text: str) {
+@no_alloc @no_os pub fn note(mut c: Check, mut rep: []u8, read text: str) {
     line(c, rep)
     puts(c, rep, "note: ")
     put_value(c, rep, text)
@@ -410,7 +410,7 @@ pub struct Check {
 // `std/test_report`'s job, which is why this writes into the report rather than
 // to stdout. Useful for a CLI driving `Check` outside the `@test` harness, where
 // nothing else would say how much ran.
-@no_alloc pub fn tally(mut c: Check, mut rep: []u8) {
+@no_alloc @no_os pub fn tally(mut c: Check, mut rep: []u8) {
     line(c, rep)
     put_i64(c, rep, c.checks)
     puts(c, rep, " checks, ")
@@ -418,7 +418,7 @@ pub struct Check {
     puts(c, rep, " failed")
 }
 
-@no_alloc pub fn is_true(mut c: Check, mut rep: []u8, read name: str, got: bool) -> bool {
+@no_alloc @no_os pub fn is_true(mut c: Check, mut rep: []u8, read name: str, got: bool) -> bool {
     started(c)
     if got { return true }
     fail(c, rep, name)
@@ -426,7 +426,7 @@ pub struct Check {
     return false
 }
 
-@no_alloc pub fn is_false(mut c: Check, mut rep: []u8, read name: str, got: bool) -> bool {
+@no_alloc @no_os pub fn is_false(mut c: Check, mut rep: []u8, read name: str, got: bool) -> bool {
     started(c)
     if got == false { return true }
     fail(c, rep, name)
@@ -434,7 +434,7 @@ pub struct Check {
     return false
 }
 
-@no_alloc pub fn eq_bool(mut c: Check, mut rep: []u8, read name: str, got: bool, want: bool) -> bool {
+@no_alloc @no_os pub fn eq_bool(mut c: Check, mut rep: []u8, read name: str, got: bool, want: bool) -> bool {
     started(c)
     if got == want { return true }
     fail(c, rep, name)
@@ -445,7 +445,7 @@ pub struct Check {
     return false
 }
 
-@no_alloc pub fn eq_i64(mut c: Check, mut rep: []u8, read name: str, got: i64, want: i64) -> bool {
+@no_alloc @no_os pub fn eq_i64(mut c: Check, mut rep: []u8, read name: str, got: i64, want: i64) -> bool {
     started(c)
     if got == want { return true }
     fail(c, rep, name)
@@ -456,7 +456,7 @@ pub struct Check {
     return false
 }
 
-@no_alloc pub fn ne_i64(mut c: Check, mut rep: []u8, read name: str, got: i64, avoid: i64) -> bool {
+@no_alloc @no_os pub fn ne_i64(mut c: Check, mut rep: []u8, read name: str, got: i64, avoid: i64) -> bool {
     started(c)
     if got != avoid { return true }
     fail(c, rep, name)
@@ -468,11 +468,11 @@ pub struct Check {
 
 // The `usize` spelling, so call sites comparing a written-byte count or a
 // `dir_len` do not have to cast. Widths are compared, not the casts.
-@no_alloc pub fn eq_usize(mut c: Check, mut rep: []u8, read name: str, got: usize, want: usize) -> bool {
+@no_alloc @no_os pub fn eq_usize(mut c: Check, mut rep: []u8, read name: str, got: usize, want: usize) -> bool {
     return eq_i64(c, rep, name, got as i64, want as i64)
 }
 
-@no_alloc pub fn eq_str(mut c: Check, mut rep: []u8, read name: str, read got: str, read want: str) -> bool {
+@no_alloc @no_os pub fn eq_str(mut c: Check, mut rep: []u8, read name: str, read got: str, read want: str) -> bool {
     started(c)
     if str_eq(got, want) { return true }
     fail(c, rep, name)
@@ -490,7 +490,7 @@ pub struct Check {
 // out you want the counts. Reporting only the first difference is deliberate —
 // a full diff needs an edit-distance algorithm and a place to put its output,
 // which is a later slice, not this one.
-@no_alloc pub fn eq_golden(mut c: Check, mut rep: []u8, read name: str, read got: str, read want: str) -> bool {
+@no_alloc @no_os pub fn eq_golden(mut c: Check, mut rep: []u8, read name: str, read got: str, read want: str) -> bool {
     started(c)
     let at: usize = first_diff_line(got, want)
     if at == 0 { return true }
@@ -526,7 +526,7 @@ pub struct Check {
 // `core`-tier module cannot have. A genuine edit-script diff belongs in an
 // allocator-taking tier above this one; until then this answers "how much of the
 // output moved", not "what would I have to change".
-@no_alloc pub fn diff_count(read got: str, read want: str) -> usize {
+@no_alloc @no_os pub fn diff_count(read got: str, read want: str) -> usize {
     var a: usize = 0
     var b: usize = 0
     var n: usize = 0
@@ -560,7 +560,7 @@ pub struct Check {
 // because it is what you read while iterating. Read the caveat on `diff_count`
 // before trusting the ratio: this is an aligned comparison, so one inserted line
 // makes everything after it differ.
-@no_alloc pub fn eq_golden_all(mut c: Check, mut rep: []u8, read name: str, read got: str, read want: str) -> bool {
+@no_alloc @no_os pub fn eq_golden_all(mut c: Check, mut rep: []u8, read name: str, read got: str, read want: str) -> bool {
     started(c)
     let total: usize = diff_count(got, want)
     if total == 0 { return true }
@@ -611,7 +611,7 @@ pub struct Check {
 
 // The body of the 1-based line `n`, or "" when there is no such line. O(n) —
 // only ever called on the failure path, where a second scan is free.
-@no_alloc fn line_at(read s: str, n: usize) -> read str {
+@no_alloc @no_os fn line_at(read s: str, n: usize) -> read str {
     var at: usize = 0
     var k: usize = 1
     for at < s.len {

@@ -35,24 +35,24 @@ pub struct Cursor {
 }
 
 // A cursor at the start of whatever source you pass it.
-@no_alloc pub fn new() -> Cursor {
+@no_alloc @no_os pub fn new() -> Cursor {
     return Cursor{ at: 0 }
 }
 
 // ------------------------------------------------------------------------ position
 
 // The current byte offset.
-@no_alloc pub fn position(read c: Cursor) -> usize {
+@no_alloc @no_os pub fn position(read c: Cursor) -> usize {
     return c.at
 }
 
 // Is everything consumed?
-@no_alloc pub fn at_end(read c: Cursor, read src: str) -> bool {
+@no_alloc @no_os pub fn at_end(read c: Cursor, read src: str) -> bool {
     return c.at >= src.len
 }
 
 // Bytes not yet consumed.
-@no_alloc pub fn remaining(read c: Cursor, read src: str) -> usize {
+@no_alloc @no_os pub fn remaining(read c: Cursor, read src: str) -> usize {
     if c.at >= src.len { return 0 }
     return src.len - c.at
 }
@@ -60,7 +60,7 @@ pub struct Cursor {
 // Move to `to`, CLAMPED to the end of the source — an out-of-range seek parks the cursor
 // at the end rather than faulting, because a cursor past the end is a well-defined
 // "nothing left" and every read here already handles it.
-@no_alloc pub fn seek(mut c: Cursor, read src: str, to: usize) {
+@no_alloc @no_os pub fn seek(mut c: Cursor, read src: str, to: usize) {
     if to > src.len {
         c.at = src.len
         return
@@ -68,12 +68,12 @@ pub struct Cursor {
     c.at = to
 }
 
-@no_alloc pub fn reset(mut c: Cursor) {
+@no_alloc @no_os pub fn reset(mut c: Cursor) {
     c.at = 0
 }
 
 // Everything left, as a view, WITHOUT consuming it.
-@no_alloc pub fn peek_rest(read c: Cursor, read src: str) -> read str {
+@no_alloc @no_os pub fn peek_rest(read c: Cursor, read src: str) -> read str {
     if c.at >= src.len { return src[0 .. 0] }
     return src[c.at .. src.len]
 }
@@ -83,7 +83,7 @@ pub struct Cursor {
 // The next byte, advancing past it. **-1 at end of input** rather than a trap, matching
 // the `-1` convention `find` already uses for "not there". A `u8` return could not
 // express exhaustion without a separate check.
-@no_alloc pub fn byte(mut c: Cursor, read src: str) -> i32 {
+@no_alloc @no_os pub fn byte(mut c: Cursor, read src: str) -> i32 {
     if c.at >= src.len { return 0 - 1 }
     let b: i32 = src[c.at] as i32
     c.at = c.at + 1
@@ -91,7 +91,7 @@ pub struct Cursor {
 }
 
 // The next byte WITHOUT advancing; -1 at end.
-@no_alloc pub fn peek(read c: Cursor, read src: str) -> i32 {
+@no_alloc @no_os pub fn peek(read c: Cursor, read src: str) -> i32 {
     if c.at >= src.len { return 0 - 1 }
     return src[c.at] as i32
 }
@@ -101,7 +101,7 @@ pub struct Cursor {
 //
 // Named `chunk` because `take` is a Jestyr KEYWORD (the ownership-transfer parameter
 // convention) and a function called that is a parse error, not a shadowing warning.
-@no_alloc pub fn chunk(mut c: Cursor, read src: str, n: usize) -> read str {
+@no_alloc @no_os pub fn chunk(mut c: Cursor, read src: str, n: usize) -> read str {
     if c.at >= src.len { return src[0 .. 0] }
     var stop: usize = c.at + n
     if stop > src.len { stop = src.len }
@@ -111,7 +111,7 @@ pub struct Cursor {
 }
 
 // Everything left, consuming it.
-@no_alloc pub fn rest(mut c: Cursor, read src: str) -> read str {
+@no_alloc @no_os pub fn rest(mut c: Cursor, read src: str) -> read str {
     if c.at >= src.len { return src[0 .. 0] }
     let start: usize = c.at
     c.at = src.len
@@ -131,7 +131,7 @@ pub struct Cursor {
 //         let l: str = line(c, src)
 //         …
 //     }
-@no_alloc pub fn line(mut c: Cursor, read src: str) -> read str {
+@no_alloc @no_os pub fn line(mut c: Cursor, read src: str) -> read str {
     if c.at >= src.len { return src[0 .. 0] }
     let start: usize = c.at
     var i: usize = c.at
@@ -158,7 +158,7 @@ pub struct Cursor {
 //
 // An empty `sep` consumes nothing and returns empty, deliberately: the alternative
 // advances by zero forever.
-@no_alloc pub fn until(mut c: Cursor, read src: str, read sep: str) -> read str {
+@no_alloc @no_os pub fn until(mut c: Cursor, read src: str, read sep: str) -> read str {
     if c.at >= src.len { return src[0 .. 0] }
     if sep.len == 0 { return src[0 .. 0] }
     let start: usize = c.at
@@ -175,7 +175,7 @@ pub struct Cursor {
 }
 
 // Does what remains begin with `p`? Does not advance.
-@no_alloc pub fn looking_at(read c: Cursor, read src: str, read p: str) -> bool {
+@no_alloc @no_os pub fn looking_at(read c: Cursor, read src: str, read p: str) -> bool {
     if p.len == 0 { return true }
     if c.at + p.len > src.len { return false }
     return str_eq(src[c.at .. c.at + p.len], p)
@@ -183,13 +183,13 @@ pub struct Cursor {
 
 // Advance past `p` if and only if that is what comes next; report whether it did. The
 // primitive a hand-written parser wants — `if consume(c, src, "--") { … }`.
-@no_alloc pub fn consume(mut c: Cursor, read src: str, read p: str) -> bool {
+@no_alloc @no_os pub fn consume(mut c: Cursor, read src: str, read p: str) -> bool {
     if looking_at(c, src, p) == false { return false }
     c.at = c.at + p.len
     return true
 }
 
-@no_alloc fn is_ws(ch: i32) -> bool {
+@no_alloc @no_os fn is_ws(ch: i32) -> bool {
     if ch == C_SPACE { return true }
     if ch == C_TAB { return true }
     if ch == C_LF { return true }
@@ -198,7 +198,7 @@ pub struct Cursor {
 
 // Advance past any run of ASCII whitespace, returning how many bytes were skipped. The
 // same four bytes `std/str.trim_start` treats as whitespace, stated rather than implied.
-@no_alloc pub fn skip_ws(mut c: Cursor, read src: str) -> usize {
+@no_alloc @no_os pub fn skip_ws(mut c: Cursor, read src: str) -> usize {
     let start: usize = c.at
     for c.at < src.len {
         if is_ws(src[c.at] as i32) == false { break }
@@ -209,7 +209,7 @@ pub struct Cursor {
 
 // A run of bytes that are NOT whitespace, advancing past it — one token. Empty when the
 // cursor is at whitespace or at the end, so `skip_ws` first.
-@no_alloc pub fn word(mut c: Cursor, read src: str) -> read str {
+@no_alloc @no_os pub fn word(mut c: Cursor, read src: str) -> read str {
     if c.at >= src.len { return src[0 .. 0] }
     let start: usize = c.at
     for c.at < src.len {

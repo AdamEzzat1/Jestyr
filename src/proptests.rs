@@ -1641,6 +1641,226 @@ mod alloc_props {
     }
 }
 
+/// Property tests for the `@no_os` enforced freestanding contract — the `core` tier's
+/// central claim, made checkable (Tier 2 area 6; `docs/attributes.md`).
+///
+/// Same soundness-**and**-completeness shape as [`alloc_props`], and deliberately so:
+/// the generator knows by construction whether the body it built reaches the OS, so the
+/// property asserts the checker rejects a `@no_os` body *iff* it does — no false
+/// negatives (a missed OS call, which would make the attribute a lie) and no false
+/// positives (a rejected freestanding body, which would make it unusable).
+///
+/// The `OS_CALLS` list is the anti-vacuity guard. A name that drifted out of
+/// `escape::is_os_intrinsic` — or was mistyped into it — would not fail to compile; it
+/// would silently stop being checked. Exercising every one against the real checker is
+/// what turns that from a silent hole into a red test.
+mod no_os_props {
+    use super::escape_diags;
+    use proptest::prelude::*;
+
+    /// Every OS-facing effect, with a well-typed form for each: the file, process,
+    /// argument, environment, clock and stream intrinsics, plus the two *syntactic*
+    /// effects — starting a thread needs a thread runtime just as opening a file needs
+    /// a filesystem, and the first version of this check missed exactly that.
+    const OS_CALLS: &[&str] = &[
+        "print_int(n as i64)",
+        "print_float(1.0)",
+        "print_str(\"x\")",
+        "print_bool(true)",
+        "eprint_str(\"x\")",
+        "let _a = read_file(\"f\")",
+        "let _b = try_read_file(\"f\")",
+        "let _c = write_file(\"f\", \"c\")",
+        "let _d = file_exists(\"f\")",
+        "let _e = remove_file(\"f\")",
+        "let _g = run_command(\"c\")",
+        "let _h = arg_count()",
+        "let _i = arg(0)",
+        "let _j = env_var(\"P\")",
+        "let _k = mono_nanos()",
+        "let _l = spawn os_probe_sq(3) let _m = await _l",
+    ];
+
+    /// Freestanding statements that must never trip the checker. `alloc` is in here on
+    /// purpose: allocation is the *other* axis, and a `@no_os` body that allocates must
+    /// stay accepted or `std/sha256` would have to drop a true claim.
+    const BENIGN: &[&str] =
+        &["let s = n + 1", "let t = n * 2", "let p = alloc(i32, 4) free_ptr(p)", ""];
+
+    /// A spawn target, so the thread case has something well-typed to call.
+    const PRELUDE: &str = "fn os_probe_sq(x: i64) -> i64 { return x * x } ";
+
+    proptest! {
+        /// A `@no_os` body with any OS effect is *always* rejected, whichever effect
+        /// and wherever in the body.
+        #[test]
+        fn os_touching_body_is_always_rejected(
+            oi in 0usize..OS_CALLS.len(),
+            bi in 0usize..BENIGN.len(),
+        ) {
+            let src = format!(
+                "{PRELUDE}@no_os fn f(n: i32) -> i32 {{ {} {} return n }}",
+                BENIGN[bi], OS_CALLS[oi]
+            );
+            let diags = escape_diags(&src);
+            prop_assert!(
+                diags.iter().any(|m| m.contains("@no_os")),
+                "an OS-touching @no_os body must be rejected: {}\n{:?}", src, diags
+            );
+        }
+
+        /// A `@no_os` body built only from freestanding statements is *always*
+        /// accepted — no false positives.
+        #[test]
+        fn freestanding_body_is_always_accepted(
+            b0 in 0usize..BENIGN.len(),
+            b1 in 0usize..BENIGN.len(),
+        ) {
+            let src = format!(
+                "{PRELUDE}@no_os fn f(n: i32) -> i32 {{ {} {} return n }}",
+                BENIGN[b0], BENIGN[b1]
+            );
+            let diags = escape_diags(&src);
+            prop_assert!(
+                !diags.iter().any(|m| m.contains("@no_os")),
+                "a freestanding @no_os body must be accepted: {}\n{:?}", src, diags
+            );
+        }
+
+        /// **The axes stay separate.** The same OS effect in a `@no_alloc`-only function
+        /// is never reported, and the same allocation in a `@no_os`-only function is
+        /// never reported. Without this, either contract could quietly acquire the
+        /// other's rules and start refusing code it has no business judging.
+        #[test]
+        fn neither_contract_judges_the_other_axis(oi in 0usize..OS_CALLS.len()) {
+            let os_under_no_alloc = format!(
+                "{PRELUDE}@no_alloc fn f(n: i32) -> i32 {{ {} return n }}", OS_CALLS[oi]
+            );
+            let d = escape_diags(&os_under_no_alloc);
+            prop_assert!(
+                !d.iter().any(|m| m.contains("@no_alloc")),
+                "@no_alloc must not judge OS access: {}\n{:?}", os_under_no_alloc, d
+            );
+
+            let alloc_under_no_os =
+                "@no_os fn g(n: i32) -> i32 { let p = alloc(i32, 4) free_ptr(p) return n }";
+            let d = escape_diags(alloc_under_no_os);
+            prop_assert!(
+                !d.iter().any(|m| m.contains("@no_os")),
+                "@no_os must not judge allocation: {:?}", d
+            );
+        }
+    }
+}
+
+/// **The `core` tier's freestanding claim, pinned at the library.**
+///
+/// [`no_os_props`] proves the *checker* is right; this proves the *library* actually
+/// uses it. The two failure modes it guards are different, and the second is the one
+/// that bites: a contributor deleting `@no_os` from a function would not break a build
+/// — coverage would just quietly shrink, exactly the way a dropped
+/// `CGEN_GOLDEN_ALLOWLIST` entry silently stops verifying a file.
+mod no_os_tier {
+    use super::*;
+    use crate::ast::Item;
+
+    /// Every module whose header claims the `core` tier. None of them imports anything
+    /// (that is what makes them `core`), so every item belongs to the file named.
+    const FREESTANDING_MODULES: &[&str] =
+        &["core", "sha256", "path", "str", "test", "sink", "cursor"];
+
+    /// The **only** functions in those modules allowed to lack the claim, with the
+    /// reason. Both spawn worker threads, and a thread runtime is precisely what a
+    /// freestanding target has not got. Each has a serial twin that *is* `@no_os`
+    /// (`f64_binned_sum`, `serial_reduce`) and is bit-identical to it.
+    ///
+    /// Adding a name here should be an argued decision, which is why the list is short
+    /// and checked in both directions below.
+    const NOT_FREESTANDING: &[&str] = &["par_binned_sum", "par_reduce"];
+
+    #[test]
+    fn every_core_tier_function_carries_the_checked_freestanding_claim() {
+        let mut exceptions_seen: Vec<String> = Vec::new();
+        for m in FREESTANDING_MODULES {
+            let prog = crate::module::load(&format!("examples/std/{m}.jtr"));
+            assert!(prog.diags.is_empty(), "std/{m} load diags: {:?}", prog.diags);
+            assert_eq!(
+                prog.modules.names.len(),
+                1,
+                "std/{m} must import nothing — it is `core`; found {:?}",
+                prog.modules.names
+            );
+
+            // The claim must be *checked*, not merely written: run the real escape
+            // checker. Without this the test would pass on a module full of `@no_os`
+            // functions that all call `print_str`.
+            let (info, td) = typeck::check_program(&prog.ast, &prog.modules);
+            assert!(td.is_empty(), "std/{m} typeck: {td:?}");
+            let ed = escape::check(&prog.ast, &info);
+            assert!(ed.is_empty(), "std/{m} escape: {ed:?}");
+
+            for item in &prog.ast.items {
+                let Item::Fn(f) = item else { continue };
+                let name = f.name.name.as_str();
+                // A colocated `@test`/`@bench` is scaffolding, not library surface, and
+                // the tier claim is about what a consumer links. `std/test` is the only
+                // module here that has any — it may colocate precisely because
+                // everything importing it is itself a test, which already prints and
+                // allocates (see the leak trap in the Tier 2 handoff §5).
+                if f.has_attr("test") || f.has_attr("bench") {
+                    continue;
+                }
+                if NOT_FREESTANDING.contains(&name) {
+                    assert!(
+                        !f.has_attr("no_os"),
+                        "`{name}` is listed as not-freestanding but carries `@no_os` — \
+                         remove it from NOT_FREESTANDING or drop the attribute"
+                    );
+                    exceptions_seen.push(name.to_string());
+                    continue;
+                }
+                assert!(
+                    f.has_attr("no_os"),
+                    "std/{m}: `{name}` has no `@no_os`. Every function in a `core`-tier \
+                     module carries the checked freestanding claim; if this one genuinely \
+                     cannot, add it to NOT_FREESTANDING with the reason"
+                );
+            }
+        }
+        // …and the exception list cannot rot: every name on it must still exist.
+        for name in NOT_FREESTANDING {
+            assert!(
+                exceptions_seen.iter().any(|s| s == name),
+                "`{name}` is in NOT_FREESTANDING but no such function exists any more — \
+                 delete the entry rather than leaving a dead exemption"
+            );
+        }
+    }
+
+    /// **The anti-vacuity control.** The pin above would pass just as happily if
+    /// `@no_os` checked nothing at all, so break one module the way a careless debug
+    /// session would — a stray `print_str` in a `core` function — and require that the
+    /// same pipeline rejects it.
+    #[test]
+    fn a_stray_print_in_a_core_module_would_be_caught() {
+        let src = std::fs::read_to_string("examples/std/sink.jtr").expect("read sink.jtr");
+        let needle = "@no_alloc @no_os pub fn new() -> Sink {";
+        assert!(src.contains(needle), "sink.jtr's shape changed; update this probe");
+        let mutated = src.replacen(needle, &format!("{needle}\n    print_str(\"debug\")"), 1);
+
+        let (tokens, lex) = Lexer::new(&mutated).tokenize();
+        assert!(lex.is_empty(), "{lex:?}");
+        let (ast, _pd) = Parser::new(&mutated, tokens).parse();
+        let (info, _td) = typeck::check(&ast);
+        let d = escape::check(&ast, &info);
+        assert!(
+            d.iter().any(|m| m.message.contains("@no_os")),
+            "a stray print in a `core` module must be rejected, or the tier claim is \
+             decoration: {d:?}"
+        );
+    }
+}
+
 /// Tests for the `jestyrc test` runner polish (workstream O, increment 1): the
 /// `@test`/`@bench` discovery (`cgen::list_tests`), the codegen-time name filter
 /// (`cgen::emit_tests_filtered`), and their plumbing through the real pipeline.
@@ -3653,6 +3873,43 @@ mod io_props {
         let d = escape_diags(direct);
         assert!(
             d.iter().any(|m| m.contains("allocates")),
+            "the direct-call control must still be rejected, or this proves nothing: {d:?}"
+        );
+    }
+
+    /// **`@no_os` inherits the same blind spot, and it is pinned for the same reason.**
+    ///
+    /// Both contracts resolve the call graph by *free-function name*, so a trait method
+    /// is opaque to both — a `@no_os` function writing through a trait whose impl prints
+    /// passes. That is why the tier split in `docs/io-design.md` puts `Writer` in `std`
+    /// and `Sink`/`Cursor` in `core`, and it is why `docs/attributes.md` states the limit
+    /// rather than letting a user find it.
+    ///
+    /// The control in the same program — a direct call to a printing free function —
+    /// must still be rejected, or this passes for the boring reason that `@no_os` checks
+    /// nothing at all.
+    #[test]
+    fn no_os_does_not_see_through_a_trait_method_either() {
+        let via_trait = "trait Snk { fn put(mut self, b: u8) -> bool }\n\
+             struct G { n: i64 }\n\
+             impl Snk for G {\n\
+                 fn put(mut self, b: u8) -> bool { print_int(b as i64)\n self.n = self.n + 1\n return true }\n\
+             }\n\
+             @no_os fn fill[T: Snk](mut s: T) -> bool { return s.put(65) }\n\
+             fn main() -> i32 { return 0 }\n";
+        assert!(
+            escape_diags(via_trait).iter().all(|m| !m.contains("@no_os")),
+            "trait dispatch is still opaque to @no_os; if this now errors, the IO tier \
+             split in docs/io-design.md and the limit stated in docs/attributes.md should \
+             both be revisited"
+        );
+
+        let direct = "fn prints() -> bool { print_int(1)\n return true }\n\
+             @no_os fn d() -> bool { return prints() }\n\
+             fn main() -> i32 { return 0 }\n";
+        let d = escape_diags(direct);
+        assert!(
+            d.iter().any(|m| m.contains("@no_os")),
             "the direct-call control must still be rejected, or this proves nothing: {d:?}"
         );
     }
@@ -10909,6 +11166,61 @@ fn g(p: *mut i32) -> i32 {
         std::fs::write(&f2, opted).unwrap();
         let got2 = jestyr_escape_dump(&exe, f2.to_str().unwrap());
         assert_eq!(got2, want2, "the toolchains disagree on the @copy enum");
+    }
+
+    /// **`@no_os`, differentially** — the freestanding contract must mean the same thing
+    /// on both toolchains, or `jestyrc` and `jc` disagree about which programs are
+    /// `core`.
+    ///
+    /// Covers all three shapes the rule has, because they are enforced at different
+    /// places and a mirror can be complete for one and missing for another: an OS
+    /// *intrinsic* (a call), `spawn` and `par for` (expression kinds — syntax, not
+    /// calls). Each violation asserts the reference refuses it *before* comparing, so a
+    /// silently-vacuous check on both sides cannot pass this as agreement.
+    ///
+    /// The transitive half is deliberately not here: it is reference-only on both
+    /// absence contracts (`escape.jtr` mirrors `@no_alloc`'s direct rule too), so
+    /// asserting agreement on it would pin a divergence that is known and documented.
+    #[test]
+    fn jestyr_no_os_matches_reference() {
+        let exe = build_exe("examples/std/escape_cli.jtr");
+        let cases: &[(&str, &str)] = &[
+            ("direct_call", "@no_os fn f(n: i32) -> i32 { print_int(n as i64) return n }"),
+            (
+                "spawn",
+                "fn sq(x: i64) -> i64 { return x * x } \
+                 @no_os fn f() -> i32 { let h = spawn sq(3) let _v = await h return 0 }",
+            ),
+            (
+                "par_for",
+                "@no_os fn f(read xs: []i64) -> i64 { return par for x in xs reduce(core_add) { x } }",
+            ),
+        ];
+        for (name, src) in cases {
+            let want = rust_escape_dump(src);
+            assert!(
+                want.iter().any(|l| l.contains("@no_os")),
+                "the reference must refuse the {name} case, or the comparison proves \
+                 nothing: {want:?}"
+            );
+            let f = std::env::temp_dir().join(format!("jestyr_no_os_{name}.jtr"));
+            std::fs::write(&f, src).unwrap();
+            let got = jestyr_escape_dump(&exe, f.to_str().unwrap());
+            assert_eq!(got, want, "the toolchains disagree on @no_os ({name}): {src}");
+        }
+
+        // …and the positive control: an OS-free body is clean on both. Without it the
+        // test would pass just as well against a port that refused everything.
+        let clean = "@no_os fn f(a: i32, b: i32) -> i32 { let s = a + b return s }";
+        let want = rust_escape_dump(clean);
+        assert!(want.is_empty(), "the freestanding control must be clean: {want:?}");
+        let f = std::env::temp_dir().join("jestyr_no_os_clean.jtr");
+        std::fs::write(&f, clean).unwrap();
+        assert_eq!(
+            jestyr_escape_dump(&exe, f.to_str().unwrap()),
+            want,
+            "the toolchains disagree on the freestanding control"
+        );
     }
 
     /// The Rust *reference* C for `src`, as lines. Uses the single-file `parse` + `typeck::check`

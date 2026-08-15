@@ -85,6 +85,7 @@ Argument shapes are fixed per attribute and enforced:
 | `@volatile` | field | — | `volatile` qualifier | MMIO — never cache the field |
 | `@no_panic` | fn / method | — | (static check) | every faulting op must be provably safe |
 | `@no_alloc` | fn / method | — | (static check) | nothing allocates, transitively through calls |
+| `@no_os` | fn / method | — | (static check) | nothing reaches the OS, transitively through calls |
 | `@deterministic` | fn / method | — | (static check) | body certified deterministic (incl. every reduction) |
 | `@span(class)` | fn / method | `constant`/`log`/`linear`/`linearithmic`/`quadratic` | (static check) | checked work-span (critical-path) bound — see §4a |
 | `@simd` | fn / method | — | vectorized `par for` lowering + legality check | every `par for` in the body certified lane-safe — see §4a |
@@ -182,6 +183,68 @@ name**. A method, a closure, or a call through a `fn(…)` pointer is not in it,
 allocation reached only that way is not caught. `@no_alloc` is therefore a strong check
 rather than a total proof today — closing the gap needs call-graph resolution the escape
 checker does not yet have.
+
+### `@no_os` — proven freestanding, transitively
+
+The `core` tier's central claim, made checkable. In a `@no_os` function the escape
+checker must **prove** the body never reaches the operating system, so "this links on a
+bare-metal target" stops being a header comment and becomes a compile error when it
+stops being true.
+
+The OS boundary is a **closed list**, because in Jestyr the platform *is* the intrinsic
+set — there is no `extern "c"` yet, so nothing else can reach it:
+
+| Group | Intrinsics | Needs |
+|---|---|---|
+| Files | `read_file`, `try_read_file`, `write_file`, `file_exists`, `remove_file` | a filesystem |
+| Process / args / env | `run_command`, `arg_count`, `arg`, `env_var` | a process model, `argv`, an environment |
+| Clock | `mono_nanos` | a monotonic timer |
+| Streams | `print_int`, `print_float`, `print_str`, `print_bool`, `eprint_str` | stdout / stderr |
+| Threads | `spawn`, `par for` | a thread runtime |
+
+The last row is the one that is easy to forget and the reason the attribute earns its
+keep twice over. A stray debug `print_str` in a `core` function is invisible in review
+and fatal on a target with no stdout — and a parallel loop is not a pure computation, it
+is four `pthread_create` calls wearing one.
+
+```jestyr
+fn helper(n: i32) { print_int(n as i64) }
+
+@no_os fn f(n: i32) -> i32 {
+    helper(n)     // error: `helper` reaches the operating system — forbidden in a
+    return 0      //        `@no_os` function (`helper` calls the OS directly)
+}
+```
+
+As with `@no_alloc` the rule is transitive, the diagnostic names the **path** and the
+function that actually reaches the OS, the analysis is a least fixpoint (so recursion
+settles rather than loops), and the reported chain is deterministic:
+
+```text
+error: `outer` reaches the operating system — forbidden in a `@no_os` function
+       (via `middle` → `deep`; `deep` calls the OS directly)
+```
+
+**`@no_os` and `@no_alloc` are orthogonal, deliberately.** They are separate axes and the
+library has a live example of each without the other:
+
+* `std/sha256` allocates (it builds a `String`) and touches no OS → `@no_os` only.
+* `std/core`'s `par_binned_sum` and `par_reduce` spawn worker threads → **neither**, and
+  each has a serial twin (`f64_binned_sum`, `serial_reduce`) that is bit-identical and
+  `@no_os`. Annotating `core` is what made that distinction visible; before it, both
+  functions sat under a module header claiming the whole file was freestanding.
+
+Write both attributes when you want both proofs. `@no_os` says nothing about `region`
+blocks or arenas, and `@no_alloc` says nothing about printing.
+
+**What it does not see** is exactly `@no_alloc`'s blind spot, for exactly the same
+reason: the call graph resolves **free functions by name**, so a trait method, a closure
+or a `fn(…)` pointer is opaque to it. A `@no_os` function that prints through a trait
+whose impl prints will pass. That limit is why `docs/io-design.md` puts the `Writer`
+*trait* in `std` while `Sink`/`Cursor` stay `core`, and it is pinned by
+`no_os_does_not_see_through_a_trait_method_either` so that if the checker ever learns to
+see through dispatch, the tier decisions get revisited rather than quietly becoming
+wrong.
 
 ---
 

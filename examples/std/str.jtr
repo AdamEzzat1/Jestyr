@@ -48,54 +48,54 @@ const WS_CR: i32 = 13
 // One line each, on purpose. The value is the indirection, not the code.
 
 // Byte-for-byte equality.
-@no_alloc pub fn eq(read a: str, read b: str) -> bool {
+@no_alloc @no_os pub fn eq(read a: str, read b: str) -> bool {
     return str_eq(a, b)
 }
 
 // ASCII-case-insensitive equality (the intrinsic's `eq_fold`).
-@no_alloc pub fn eq_ignore_case(read a: str, read b: str) -> bool {
+@no_alloc @no_os pub fn eq_ignore_case(read a: str, read b: str) -> bool {
     return eq_fold(a, b)
 }
 
 // Does `s` begin with `p`? An empty `p` is a prefix of everything (measured).
-@no_alloc pub fn has_prefix(read s: str, read p: str) -> bool {
+@no_alloc @no_os pub fn has_prefix(read s: str, read p: str) -> bool {
     return starts_with(s, p)
 }
 
-@no_alloc pub fn has_suffix(read s: str, read p: str) -> bool {
+@no_alloc @no_os pub fn has_suffix(read s: str, read p: str) -> bool {
     return ends_with(s, p)
 }
 
 // Does `needle` occur anywhere in `s`? An empty needle occurs in everything.
-@no_alloc pub fn has(read s: str, read needle: str) -> bool {
+@no_alloc @no_os pub fn has(read s: str, read needle: str) -> bool {
     return contains(s, needle)
 }
 
 // The byte offset of the FIRST occurrence of `needle`, or **-1** when absent. An
 // empty needle yields 0. Returns `isize` (not an Option) because that is what the
 // intrinsic yields; compare `>= 0` before casting to `usize`.
-@no_alloc pub fn index_of(read s: str, read needle: str) -> isize {
+@no_alloc @no_os pub fn index_of(read s: str, read needle: str) -> isize {
     return find(s, needle)
 }
 
 // Both ends trimmed of whitespace — a zero-copy sub-view.
-@no_alloc pub fn trimmed(read s: str) -> read str {
+@no_alloc @no_os pub fn trimmed(read s: str) -> read str {
     return trim(s)
 }
 
 // Is `s` well-formed UTF-8?
-@no_alloc pub fn is_valid_utf8(read s: str) -> bool {
+@no_alloc @no_os pub fn is_valid_utf8(read s: str) -> bool {
     return is_utf8(s)
 }
 
 // Unicode scalar values in `s` (not bytes — `s.len` is the byte count).
-@no_alloc pub fn codepoint_count(read s: str) -> usize {
+@no_alloc @no_os pub fn codepoint_count(read s: str) -> usize {
     return count_codepoints(s)
 }
 
 // User-perceived characters in `s`. Named `grapheme_count` because bare `graphemes`
 // is a for-loop iteration form.
-@no_alloc pub fn grapheme_count(read s: str) -> usize {
+@no_alloc @no_os pub fn grapheme_count(read s: str) -> usize {
     return count_graphemes(s)
 }
 
@@ -104,7 +104,7 @@ const WS_CR: i32 = 13
 // Is `needle` present in `s` starting exactly at `at`? The primitive the reverse and
 // counting searches are built from. An empty needle matches anywhere, including at
 // `s.len`.
-@no_alloc pub fn matches_at(read s: str, at: usize, read needle: str) -> bool {
+@no_alloc @no_os pub fn matches_at(read s: str, at: usize, read needle: str) -> bool {
     if needle.len == 0 { return true }
     if at > s.len { return false }
     if at + needle.len > s.len { return false }
@@ -116,7 +116,7 @@ const WS_CR: i32 = 13
 // An empty needle yields `s.len`, mirroring how `index_of` yields 0 for one: the
 // empty string occurs at both ends, and picking the far end is what makes
 // `after_last(s, "")` empty rather than the whole string.
-@no_alloc pub fn last_index_of(read s: str, read needle: str) -> isize {
+@no_alloc @no_os pub fn last_index_of(read s: str, read needle: str) -> isize {
     if needle.len == 0 { return s.len as isize }
     if needle.len > s.len { return 0 - 1 }
     // Start at the last offset where `needle` could still fit and walk down.
@@ -134,7 +134,7 @@ const WS_CR: i32 = 13
 // An empty needle counts 0, deliberately. The alternative (`s.len + 1`, the number of
 // gaps) is useless to callers and invites an infinite loop in any caller that advances
 // by the needle's length — which is exactly what this function does internally.
-@no_alloc pub fn count_of(read s: str, read needle: str) -> usize {
+@no_alloc @no_os pub fn count_of(read s: str, read needle: str) -> usize {
     if needle.len == 0 { return 0 }
     var n: usize = 0
     var i: usize = 0
@@ -151,7 +151,7 @@ const WS_CR: i32 = 13
 
 // ------------------------------------------------------------------ views, added
 
-@no_alloc fn is_ws(ch: i32) -> bool {
+@no_alloc @no_os fn is_ws(ch: i32) -> bool {
     if ch == WS_SPACE { return true }
     if ch == WS_TAB { return true }
     if ch == WS_LF { return true }
@@ -163,7 +163,7 @@ const WS_CR: i32 = 13
 // whitespace" and is stated rather than implied. `trim_start` composed with
 // `trim_end` is pinned against the `trim` intrinsic in the test suite, so a drift
 // between the two definitions fails a test rather than surprising a caller.
-@no_alloc pub fn trim_start(read s: str) -> read str {
+@no_alloc @no_os pub fn trim_start(read s: str) -> read str {
     var i: usize = 0
     for i < s.len {
         if is_ws(s[i] as i32) == false { break }
@@ -173,7 +173,7 @@ const WS_CR: i32 = 13
 }
 
 // `s` without trailing whitespace.
-@no_alloc pub fn trim_end(read s: str) -> read str {
+@no_alloc @no_os pub fn trim_end(read s: str) -> read str {
     var n: usize = s.len
     for n > 0 {
         if is_ws(s[n - 1] as i32) == false { break }
@@ -185,7 +185,7 @@ const WS_CR: i32 = 13
 // `s` without ONE trailing carriage return — the CRLF-to-LF fixup, kept separate from
 // `trim_end` because a golden comparison wants to normalize line endings without also
 // eating meaningful trailing spaces. (`std/test.eq_golden` applies this rule per line.)
-@no_alloc pub fn strip_cr(read s: str) -> read str {
+@no_alloc @no_os pub fn strip_cr(read s: str) -> read str {
     if s.len == 0 { return s }
     if (s[s.len - 1] as i32) == WS_CR { return s[0 .. s.len - 1] }
     return s
@@ -194,12 +194,12 @@ const WS_CR: i32 = 13
 // `s` with `p` removed from its front, or `s` unchanged when `p` is not a prefix.
 // Returning the input rather than an Option keeps this composable in a chain; use
 // `has_prefix` first when the distinction matters.
-@no_alloc pub fn strip_prefix(read s: str, read p: str) -> read str {
+@no_alloc @no_os pub fn strip_prefix(read s: str, read p: str) -> read str {
     if starts_with(s, p) { return s[p.len .. s.len] }
     return s
 }
 
-@no_alloc pub fn strip_suffix(read s: str, read p: str) -> read str {
+@no_alloc @no_os pub fn strip_suffix(read s: str, read p: str) -> read str {
     if p.len > s.len { return s }
     if ends_with(s, p) { return s[0 .. s.len - p.len] }
     return s
@@ -207,7 +207,7 @@ const WS_CR: i32 = 13
 
 // Everything before the FIRST `sep`; all of `s` when `sep` is absent.
 //   before("a=b", "=") == "a"     before("nope", "=") == "nope"
-@no_alloc pub fn before(read s: str, read sep: str) -> read str {
+@no_alloc @no_os pub fn before(read s: str, read sep: str) -> read str {
     let i: isize = find(s, sep)
     if i < 0 { return s }
     return s[0 .. i as usize]
@@ -220,7 +220,7 @@ const WS_CR: i32 = 13
 // "there is no part after the separator" is the honest answer when there is no
 // separator. Splitting a `key=value` where the `=` is missing therefore gives you the
 // whole thing as a key and nothing as a value.
-@no_alloc pub fn after(read s: str, read sep: str) -> read str {
+@no_alloc @no_os pub fn after(read s: str, read sep: str) -> read str {
     let i: isize = find(s, sep)
     if i < 0 { return s[0 .. 0] }
     let start: usize = (i as usize) + sep.len
@@ -228,14 +228,14 @@ const WS_CR: i32 = 13
 }
 
 // Everything before the LAST `sep`; all of `s` when absent.
-@no_alloc pub fn before_last(read s: str, read sep: str) -> read str {
+@no_alloc @no_os pub fn before_last(read s: str, read sep: str) -> read str {
     let i: isize = last_index_of(s, sep)
     if i < 0 { return s }
     return s[0 .. i as usize]
 }
 
 // Everything after the LAST `sep`; EMPTY when absent, matching `after`.
-@no_alloc pub fn after_last(read s: str, read sep: str) -> read str {
+@no_alloc @no_os pub fn after_last(read s: str, read sep: str) -> read str {
     let i: isize = last_index_of(s, sep)
     if i < 0 { return s[0 .. 0] }
     let start: usize = (i as usize) + sep.len
@@ -250,7 +250,7 @@ const WS_CR: i32 = 13
 // deterministically beats silently shortening. This exists for the case where the
 // bounds come from arithmetic on a search result and the caller would otherwise write
 // the same three guards inline.
-@no_alloc pub fn clamped(read s: str, from: usize, to: usize) -> read str {
+@no_alloc @no_os pub fn clamped(read s: str, from: usize, to: usize) -> read str {
     var lo: usize = from
     var hi: usize = to
     if lo > s.len { lo = s.len }
@@ -261,11 +261,11 @@ const WS_CR: i32 = 13
 
 // Is `s` empty? Spelled out because `s.len == 0` at a call site reads as a length
 // check rather than an emptiness question.
-@no_alloc pub fn is_empty(read s: str) -> bool {
+@no_alloc @no_os pub fn is_empty(read s: str) -> bool {
     return s.len == 0
 }
 
 // Is `s` empty or only whitespace? The check configuration parsing actually wants.
-@no_alloc pub fn is_blank(read s: str) -> bool {
+@no_alloc @no_os pub fn is_blank(read s: str) -> bool {
     return trim_start(s).len == 0
 }

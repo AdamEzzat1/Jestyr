@@ -3,8 +3,7 @@
 Cold-start note. **Remaining work first (§1), then what is deliberately deferred and why
 (§2).** What is already built is in §3 — read it only to avoid rebuilding something.
 
-Everything is on `master` and pushed: `master` == `origin/master` == **`920fc9a`**, clean
-tree. `git pull` and go; there is no branch to chase.
+Everything is on `master`, clean tree. `git pull` and go; there is no branch to chase.
 
 Baseline before you change anything, so a later failure is yours:
 
@@ -12,7 +11,7 @@ Baseline before you change anything, so a later failure is yours:
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1169 passed, 0 failed, 3 ignored** (~320 s). The 3 ignored are deliberate slow numeric
+**1187 passed, 0 failed, 3 ignored** (~250 s). The 3 ignored are deliberate slow numeric
 sweeps (`dragon_matches_std_thorough`, `slow_parse_matches_std_thorough`,
 `dump_pow10_table`), not breakage.
 
@@ -55,34 +54,17 @@ caches hashes so a grow re-places without rehashing), generic in the key, hash f
 canaried. Give it a real consumer on day one — `strmap`'s users, or the compiler's symbol
 table. Every slice on this branch that went well had one.
 
-### §1.2 — `@no_os` (Tier 2 area 6). Small, and turns convention into a check
-
-The tier model is documented and *partly* enforced: `@no_alloc` makes "never allocates"
-checked on `path`, `str`, `test`, `sink`, `cursor`; `path_stays_a_leaf_module` and friends
-check the test-leak boundary. **What is missing is a checked OS boundary** — "`core` links
-on a freestanding target" is still convention.
-
-**First increment:** add `@no_os` mirroring `@no_alloc`'s implementation. The intrinsic
-list is closed and short — `arg`, `arg_count`, `read_file`, `try_read_file`, `write_file`,
-`file_exists`, `remove_file`, `run_command`, `eprint_str`, `mono_nanos`, `env_var`, plus
-the print family — so the check is "does the call graph reach one of these". Then put it on
-`core.jtr`, `path.jtr`, `str.jtr`, `test.jtr`, `sink.jtr`, `cursor.jtr`, `sha256.jtr`.
-
-Emission-neutral, so **probably** no port mirror — but `attrs.rs` is reference-only today,
-so verify whether `escape.jtr` owes one rather than assuming. Expect the same blind spot as
-`@no_alloc` (§5) and say so in the docs instead of overclaiming.
-
-### §1.3 — `PathBuf` (Tier 2 area 2, the half that is not blocked)
+### §1.2 — `PathBuf` (Tier 2 area 2, the half that is not blocked)
 
 `struct PathBuf { s: String }` compiles today. `String` is owned so there is no
 second-class-borrow problem, and RAII already recurses into owned struct fields (B1 field
 auto-drop), so it frees itself. An owned, growable path is genuinely useful and does **not**
-wait on the `distinct` question in §1.6.
+wait on the `distinct` question in §1.5.
 
 Keep `std/path`'s lexical layer exactly as it is — `@no_alloc`-proven, view+buffer based.
 The typed layer sits *above* it, never replaces it.
 
-### §1.4 — A partial-read intrinsic. The thing that unblocks a streaming `Reader`
+### §1.3 — A partial-read intrinsic. The thing that unblocks a streaming `Reader`
 
 `std/cursor` is the whole reader that can honestly exist today, because the intrinsics only
 offer `read_file`/`try_read_file`, which slurp. There is no partial read, no file handle, no
@@ -95,7 +77,7 @@ surface than the one-call intrinsics added so far (`env_var`, `mono_nanos`), bec
 introduces a *resource with a lifetime* — which is a `Drop`/RAII question as much as an
 intrinsic one.
 
-### §1.5 — Three compiler follow-ups, each independent
+### §1.4 — Three compiler follow-ups, each independent
 
 **1. Normalize `run_command`'s exit status.** The runtime helper is
 `return (int32_t)system(cp)` — raw. Windows gives the exit code; POSIX specifies a wait
@@ -119,7 +101,7 @@ helper gating, forward declarations and generic-instance collection all scan `@t
 and it moves the non-test golden for the corpus files carrying `@test` items. Mirror +
 reseed.
 
-### §1.6 — Typed `Path` (Tier 2 area 2, the blocked half)
+### §1.5 — Typed `Path` (Tier 2 area 2, the blocked half)
 
 **Do not build this on `distinct` yet.** Probed: `distinct Path = str` compiles, and then
 passing a bare `str` where a `Path` is wanted is **accepted** — as is passing an `AccountId`
@@ -127,7 +109,7 @@ where a `UserId` is wanted. `distinct` today gives a *name* with **no check**, w
 than nothing because it reads as safety.
 
 Enforcement has to come from assignability, which means resolving the open int→int question
-first (§1.5.2 — they are the same rule). Until then a typed `Path` ships an API whose central
+first (§1.4.2 — they are the same rule). Until then a typed `Path` ships an API whose central
 claim is unenforced.
 
 The language is *ahead* of the library here: `os_str` is already a real distinct primitive
@@ -143,12 +125,12 @@ the reason stops holding, the item becomes live.
 
 | Deferred | Why, precisely | Becomes live when |
 |---|---|---|
-| **Streaming `Reader`** | No partial-read intrinsic, no file handle. Wrapping `read_file`'s slurp in a `Reader` trait ships an API whose central promise — that it streams — is false, and gets rebuilt immediately | §1.4 lands |
+| **Streaming `Reader`** | No partial-read intrinsic, no file handle. Wrapping `read_file`'s slurp in a `Reader` trait ships an API whose central promise — that it streams — is false, and gets rebuilt immediately | §1.3 lands |
 | **`BufWriter`** | A handle cannot own borrowed storage, so it needs an `Allocator` → `mem` tier, not `core`. And the one destination that would benefit is stdout, which **already buffers in C stdio** — wrapping it is double buffering with a second copy | A real case appears (socket, compressor) |
 | **Error sets on writes** | Fifty `?`s down a formatter is how errors get swallowed, not handled. The one genuinely fallible operation is a final `flush`, and that is where an error set belongs — one fallible call, not N | A fallible write intrinsic exists |
 | **`failed()` on `Writer`** | Removed, not shipped: `print_str`/`eprint_str` return nothing so a stream write has no detectable failure, and sink overflow is deliberately the *sink's* business. It could only ever answer `false`, and a query that always says "fine" invites a caller to believe it checked something | Same as above |
 | **`sys` tier** | Genuinely blocked on `extern "c"` (design §14, 📐). Until then it is a wrapper around a wrapper — today the platform boundary *is* the closed intrinsic list | `extern "c"` lands |
-| **Typed `Path` on `distinct`** | `distinct` is not enforced at argument positions (§1.6) | The int→int assignability decision is settled |
+| **Typed `Path` on `distinct`** | `distinct` is not enforced at argument positions (§1.5) | The int→int assignability decision is settled |
 | **A generic collections zoo** | A breadth objection, not an existence objection. One container with a real consumer is a slice | Never as a zoo; one at a time (§1.1) |
 | **A package manager** | `ROADMAP.md` calls it ecosystem-premature, and the module-manifest hash DAG covers the real need (a lockfile-lite pinning the build graph) | Deliberately open-ended |
 | **Networking / HTTP / TLS** | No async story (📐), no `extern "c"`, and the moment a socket lands the platform boundary stops being optional | After `sys` |
@@ -168,12 +150,49 @@ predate this work.
 | Tier 2 area | State |
 |---|---|
 | 1. Capability handles | ✅ **all four** — `process.Process`, `fs.Fs`, `time.Clock`, `env.Env` |
-| 3. Reader / Writer | ✅ **Writer complete** (`sink` core + `writer` std); **Reader is memory-only** (`cursor`) — streaming is §1.4, not a gap in the design |
+| 3. Reader / Writer | ✅ **Writer complete** (`sink` core + `writer` std); **Reader is memory-only** (`cursor`) — streaming is §1.3, not a gap in the design |
 | 5. Testing / golden | ✅ `std/test` (core) + `test_report` (prints) + `test_fixture` (fetches) |
 | 7. Package / build | ✅ *as scoped* — `build.jestyr` (CTFE, effect-free by construction) + module-manifest hash DAG |
-| 6. No-std contract | 🟡 documented, `@no_alloc`-checked; needs §1.2 |
-| 2. Typed path / OsStr | 🟡 `os_str` is a real primitive; `PathBuf` is §1.3, typed `Path` is §1.6 |
+| 6. No-std contract | ✅ **both axes checked** — `@no_alloc` *and* `@no_os` (below) |
+| 2. Typed path / OsStr | 🟡 `os_str` is a real primitive; `PathBuf` is §1.2, typed `Path` is §1.5 |
 | 4. Collections v2 | 🔴 §1.1 |
+
+### `@no_os` — the freestanding contract, checked (closed Tier 2 area 6)
+
+`@no_alloc`'s sibling on the other axis, built the same way: a per-function flag in the
+escape checker, a direct rule, and a transitive closure by free-function name. Both
+closures now come from **one** probe pass over the program (`effect_closures` +
+`shortest_chains` in `src/escape.rs`), so adding a third proven-absence contract costs a
+seed set, not another traversal.
+
+The OS boundary is a closed list — with no `extern "c"`, the intrinsic set *is* the
+platform: files, process/args/env, the clock, the print family, **and threads**
+(`spawn`, `par for`). Carried on every function in `core`, `sha256`, `path`, `str`,
+`test`, `sink`, `cursor`. Full table in `docs/attributes.md`.
+
+**Two things worth knowing before extending it:**
+
+* **The threads row was not in the original plan, and it is the whole reason the
+  attribute earned its keep.** Annotating `core.jtr` wholesale is what surfaced that
+  `par_binned_sum` and `par_reduce` spawn workers — so the first definition
+  (files/process/env/clock/stdio) would have certified "freestanding" for a function
+  starting four pthreads. They are now the two argued exceptions, each with a `@no_os`
+  serial twin (`f64_binned_sum`, `serial_reduce`) that is bit-identical. The same two
+  functions also allocate, so `core.jtr`'s old header — "nothing here allocates" — had
+  been false for as long as they had been in the file.
+* **`@no_os` and `@no_alloc` are orthogonal and must stay so.** `sha256` allocates and
+  is OS-free; `sink` is neither. `neither_contract_judges_the_other_axis` pins both
+  directions, so neither contract can acquire the other's rules by osmosis.
+
+The port mirror **was** owed and is built: `escape.jtr` already mirrored `@no_alloc`'s
+direct rule, so `@no_os`'s direct rule is mirrored to match, leaving the asymmetry at
+exactly "transitive is reference-only" for both. `jestyr_no_os_matches_reference` proves
+agreement on all three enforcement shapes (an intrinsic call, `spawn`, `par for`) plus a
+clean control.
+
+Tests: `escape::tests::no_os_*` (11), `no_os_props` (3 properties incl. every intrinsic
+name), `no_os_tier` (the library-coverage pin + its anti-vacuity control),
+`no_os_does_not_see_through_a_trait_method_either`, `jestyr_no_os_matches_reference`.
 
 **The roadmap's priority list is out of free slices.** Slices 1–6 (`path`, `test`,
 `process`, `str`, `env`, `time`) are done; 7 (`fs` expansion), 8 (`fmt`) and 9 (`sys`) each
@@ -234,7 +253,7 @@ verifying a file.**
   in a sibling `path_test.jtr`. A `core` module's own test scaffolding silently breaks its
   tier claim. **Convention: a module with non-test consumers puts tests in a sibling
   `*_test.jtr`;** a module only ever imported *by* tests (`std/test`) may colocate. Proper
-  fix is §1.5.3.
+  fix is §1.4.3.
 * **`@no_alloc` passes VACUOUSLY through a trait method.** It accepts a `@no_alloc` function
   writing through a trait whose impl allocates on every call, while correctly rejecting the
   direct-call control. Not a weak proof — a *false* one. This is why the `Writer` trait is
@@ -285,23 +304,37 @@ verifying a file.**
 * **When a documented limitation is load-bearing, pin it with a test** that must be changed
   deliberately (`diff_count_is_aligned_not_an_edit_script`,
   `array_range_slicing_is_still_refused`).
+* **A header comment claiming a property is evidence the property is false.** `core.jtr`
+  said "nothing here allocates and nothing here syscalls"; annotating it proved both
+  halves wrong for the same two functions (`par_binned_sum`, `par_reduce`). The comment
+  had survived every review of the module *because* reviewers read it as settled. When
+  you find a prose claim doing load-bearing work, the cheapest way to find out whether it
+  is true is to make the compiler assert it and see what falls over.
+* **An effect contract that inspects only call *names* misses effects carried by
+  syntax.** `@no_alloc` hooks `region` blocks as well as intrinsics; `@no_os` had to hook
+  `spawn` and `par for` for the same reason. Ask "what can this effect ride in on that
+  is not a call?" before declaring the intrinsic list closed.
+* **A closed list is a vacuity hazard.** A name mistyped into `is_os_intrinsic` would not
+  fail to compile — it would silently stop being checked, for that intrinsic only.
+  `no_os_props::os_touching_body_is_always_rejected` exercises every name against the
+  real checker, which is the only thing that turns that into a red test.
 * .jtr subset traps for closure modules: a `for` condition cannot start with `(`; a bare `{`
   after a call-init parses as the ctor form; never chain `string_view(x).len`. **Author `.jtr`
   with Write, not shell heredocs** — heredocs mangle backslashes.
+* **Windows has no `python3`** in this environment, and multi-edit scripting through it
+  fails silently late. Use the editing tools or `sed`.
 
 ---
 
 ## §6. Suggested order
 
-1. **`@no_os` (§1.2)** — small, self-contained, and it converts the `core` tier's central
-   claim from convention into a check. Good first move in a fresh session.
-2. **`PathBuf` (§1.3)** — cheap, independent, useful.
-3. **`HashMap(K,V)` (§1.1)** — the only untouched area. Settle the hash function *first*,
+1. **`PathBuf` (§1.2)** — cheap, independent, useful.
+2. **`HashMap(K,V)` (§1.1)** — the only untouched area. Settle the hash function *first*,
    verify the trait bound composes on a generic struct's parameter, then build one container
    with a real consumer.
-4. **The assignability hole + int→int decision (§1.5.2)** — settle them together; it also
-   unblocks §1.6.
-5. **The partial-read intrinsic (§1.4)** — the largest, and the only route to a real
+3. **The assignability hole + int→int decision (§1.4.2)** — settle them together; it also
+   unblocks §1.5.
+4. **The partial-read intrinsic (§1.3)** — the largest, and the only route to a real
    streaming `Reader`.
 
 Leave `sys` and typed `Path`-on-`distinct` alone until their blockers actually move. Both

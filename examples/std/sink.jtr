@@ -34,7 +34,7 @@ pub struct Sink {
 }
 
 // A sink positioned at the start of whatever buffer you pass it.
-@no_alloc pub fn new() -> Sink {
+@no_alloc @no_os pub fn new() -> Sink {
     return Sink{ used: 0, lost: 0 }
 }
 
@@ -42,7 +42,7 @@ pub struct Sink {
 
 // One byte. Silently counted as lost if `buf` is full — the deliberate
 // infallible-at-the-call-site rule.
-@no_alloc pub fn put(mut s: Sink, mut buf: []u8, b: u8) {
+@no_alloc @no_os pub fn put(mut s: Sink, mut buf: []u8, b: u8) {
     if s.used >= buf.len {
         s.lost = s.lost + 1
         return
@@ -53,7 +53,7 @@ pub struct Sink {
 
 // A whole `str`, byte for byte. No encoding is applied: what is in the string is what
 // lands in the buffer.
-@no_alloc pub fn put_str(mut s: Sink, mut buf: []u8, read text: str) {
+@no_alloc @no_os pub fn put_str(mut s: Sink, mut buf: []u8, read text: str) {
     for i in 0..text.len {
         put(s, buf, text[i] as u8)
     }
@@ -61,7 +61,7 @@ pub struct Sink {
 
 // A signed decimal, most-significant digit first. Never negates the input, so `i64`'s
 // most negative value formats correctly instead of overflowing.
-@no_alloc pub fn put_i64(mut s: Sink, mut buf: []u8, v: i64) {
+@no_alloc @no_os pub fn put_i64(mut s: Sink, mut buf: []u8, v: i64) {
     if v == 0 {
         put(s, buf, S_ZERO as u8)
         return
@@ -82,12 +82,12 @@ pub struct Sink {
 }
 
 // An unsigned decimal.
-@no_alloc pub fn put_usize(mut s: Sink, mut buf: []u8, v: usize) {
+@no_alloc @no_os pub fn put_usize(mut s: Sink, mut buf: []u8, v: usize) {
     put_i64(s, buf, v as i64)
 }
 
 // `true` or `false`.
-@no_alloc pub fn put_bool(mut s: Sink, mut buf: []u8, b: bool) {
+@no_alloc @no_os pub fn put_bool(mut s: Sink, mut buf: []u8, b: bool) {
     if b {
         put_str(s, buf, "true")
     } else {
@@ -96,7 +96,7 @@ pub struct Sink {
 }
 
 // One lowercase hex digit of `v`'s low four bits.
-@no_alloc fn hex_nibble(v: i32) -> u8 {
+@no_alloc @no_os fn hex_nibble(v: i32) -> u8 {
     let d: i32 = v % 16
     if d < 10 { return (S_ZERO + d) as u8 }
     return (S_LOWER_A + d - 10) as u8
@@ -104,38 +104,38 @@ pub struct Sink {
 
 // A byte as exactly two lowercase hex digits, no `0x`. Fixed width on purpose: hex is
 // for dumps and digests, where alignment matters more than brevity.
-@no_alloc pub fn put_hex_u8(mut s: Sink, mut buf: []u8, b: u8) {
+@no_alloc @no_os pub fn put_hex_u8(mut s: Sink, mut buf: []u8, b: u8) {
     put(s, buf, hex_nibble((b as i32) / 16))
     put(s, buf, hex_nibble(b as i32))
 }
 
 // A newline. Named rather than `put(s, buf, 10)` at forty call sites.
-@no_alloc pub fn put_nl(mut s: Sink, mut buf: []u8) {
+@no_alloc @no_os pub fn put_nl(mut s: Sink, mut buf: []u8) {
     put(s, buf, 10 as u8)
 }
 
 // ------------------------------------------------------------------------ queries
 
 // Bytes written so far — the length of the meaningful prefix of the buffer.
-@no_alloc pub fn written(read s: Sink) -> usize {
+@no_alloc @no_os pub fn written(read s: Sink) -> usize {
     return s.used
 }
 
 // Bytes that did not fit. Non-zero means the output you are holding is incomplete; it
 // does not mean any earlier byte is wrong.
-@no_alloc pub fn lost(read s: Sink) -> usize {
+@no_alloc @no_os pub fn lost(read s: Sink) -> usize {
     return s.lost
 }
 
 // Did anything not fit? The one check a caller is expected to make, once, at the end.
-@no_alloc pub fn overflowed(read s: Sink) -> bool {
+@no_alloc @no_os pub fn overflowed(read s: Sink) -> bool {
     return s.lost > 0
 }
 
 // Reposition to the start of the buffer, forgetting the loss count too. The bytes are
 // not cleared — `written()` is the only thing that says which of them mean anything, so
 // zeroing would be work nobody can observe.
-@no_alloc pub fn reset(mut s: Sink) {
+@no_alloc @no_os pub fn reset(mut s: Sink) {
     s.used = 0
     s.lost = 0
 }
@@ -146,6 +146,6 @@ pub struct Sink {
 // arbitrary bytes and this module never validates. Every `put_*` helper above emits
 // printable ASCII, so a sink written only through those is always safe here; a sink fed
 // raw bytes through `put` may not be, and `from_utf8` traps rather than lying.
-@no_alloc pub fn view(read s: Sink, read buf: []u8) -> read str {
+@no_alloc @no_os pub fn view(read s: Sink, read buf: []u8) -> read str {
     return from_utf8(buf[0 .. s.used])
 }

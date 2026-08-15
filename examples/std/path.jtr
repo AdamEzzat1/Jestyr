@@ -33,18 +33,18 @@ const COLON: i32 = 58      // ':'
 // ---------------------------------------------------------------- predicates
 
 // Is `ch` a path separator? Both spellings count.
-@no_alloc pub fn is_sep(ch: i32) -> bool {
+@no_alloc @no_os pub fn is_sep(ch: i32) -> bool {
     return ch == SLASH or ch == BACKSLASH
 }
 
 // Is the byte at `i` a separator? (Bounds are the caller's; `i < p.len`.)
-@no_alloc fn sep_at(read p: str, i: usize) -> bool {
+@no_alloc @no_os fn sep_at(read p: str, i: usize) -> bool {
     return is_sep(p[i] as i32)
 }
 
 // Does `p` name a location from a root rather than from the current directory?
 // True for a leading separator, and for a Windows drive prefix (`C:`).
-@no_alloc pub fn is_abs(read p: str) -> bool {
+@no_alloc @no_os pub fn is_abs(read p: str) -> bool {
     if p.len == 0 { return false }
     if sep_at(p, 0) { return true }
     if p.len >= 2 {
@@ -58,7 +58,7 @@ const COLON: i32 = 58      // ':'
 // The length of the directory prefix INCLUDING its trailing separator, so that
 // `p[0 .. dir_len(p)]` is a prefix you can concatenate onto directly. 0 when `p`
 // has no separator. (This is the exact shape `cgen.jtr`'s loader needs.)
-@no_alloc pub fn dir_len(read p: str) -> usize {
+@no_alloc @no_os pub fn dir_len(read p: str) -> usize {
     var i: usize = p.len
     for i > 0 {
         if sep_at(p, i - 1) { return i }
@@ -70,7 +70,7 @@ const COLON: i32 = 58      // ':'
 // The last segment: everything after the final separator.
 //   base("a/b/c.jtr") == "c.jtr"      base("bare") == "bare"
 //   base("a/b/")      == ""           (a trailing separator means "no segment")
-@no_alloc pub fn base(read p: str) -> read str {
+@no_alloc @no_os pub fn base(read p: str) -> read str {
     return p[dir_len(p) .. p.len]
 }
 
@@ -78,7 +78,7 @@ const COLON: i32 = 58      // ':'
 //   dir("a/b/c") == "a/b"     dir("c") == ""      dir("/a") == "/"
 // Note "" (not POSIX's ".") for a bare name: an empty prefix is what `join`
 // wants, and it keeps this function a pure view with no invented storage.
-@no_alloc pub fn dir(read p: str) -> read str {
+@no_alloc @no_os pub fn dir(read p: str) -> read str {
     let d: usize = dir_len(p)
     if d == 0 { return p[0 .. 0] }
     if d == 1 { return p[0 .. 1] }   // the root itself: "/"
@@ -87,7 +87,7 @@ const COLON: i32 = 58      // ':'
 
 // The byte offset of the extension's dot within `base(p)`, or `base.len` when
 // there is none. A dot at offset 0 is a dotfile (".bashrc"), not an extension.
-@no_alloc fn ext_dot(read b: str) -> usize {
+@no_alloc @no_os fn ext_dot(read b: str) -> usize {
     var i: usize = b.len
     for i > 1 {
         if (b[i - 1] as i32) == DOT { return i - 1 }
@@ -98,7 +98,7 @@ const COLON: i32 = 58      // ':'
 
 // The extension WITHOUT its dot; "" when there is none.
 //   ext("a/b.tar.gz") == "gz"   ext("README") == ""   ext(".bashrc") == ""
-@no_alloc pub fn ext(read p: str) -> read str {
+@no_alloc @no_os pub fn ext(read p: str) -> read str {
     let b: str = base(p)
     let d: usize = ext_dot(b)
     if d == b.len { return b[0 .. 0] }
@@ -108,7 +108,7 @@ const COLON: i32 = 58      // ':'
 // The last segment with its extension removed.
 //   stem("a/b.tar.gz") == "b.tar"   stem("README") == "README"
 //   stem(".bashrc")    == ".bashrc"
-@no_alloc pub fn stem(read p: str) -> read str {
+@no_alloc @no_os pub fn stem(read p: str) -> read str {
     let b: str = base(p)
     return b[0 .. ext_dot(b)]
 }
@@ -121,7 +121,7 @@ const COLON: i32 = 58      // ':'
 // an empty side contributes nothing; exactly one `/` lands between them.
 // REQUIRES `buf.len >= a.len + b.len + 1` — a short buffer trips the slice
 // bounds check, which is a deterministic fault rather than a silent truncation.
-@no_alloc pub fn join(read a: str, read b: str, mut buf: []u8) -> usize {
+@no_alloc @no_os pub fn join(read a: str, read b: str, mut buf: []u8) -> usize {
     var n: usize = 0
     if is_abs(b) or a.len == 0 {
         for i in 0..b.len {
@@ -148,7 +148,7 @@ const COLON: i32 = 58      // ':'
 
 // Scan back from `n` for the start of the last segment in `buf`, not below
 // `root`. Used to pop a segment when `..` is resolved.
-@no_alloc fn pop_seg(read buf: []u8, n: usize, root: usize) -> usize {
+@no_alloc @no_os fn pop_seg(read buf: []u8, n: usize, root: usize) -> usize {
     var k: usize = n
     for k > root {
         if (buf[k - 1] as i32) == SLASH { return k - 1 }
@@ -168,7 +168,7 @@ const COLON: i32 = 58      // ':'
 //
 // REQUIRES `buf.len >= p.len` when `p` is non-empty, and `buf.len >= 1`
 // otherwise: normalization only ever shrinks, except "" which becomes ".".
-@no_alloc pub fn normalize(read p: str, mut buf: []u8) -> usize {
+@no_alloc @no_os pub fn normalize(read p: str, mut buf: []u8) -> usize {
     let abs: bool = p.len > 0 and sep_at(p, 0)
     var n: usize = 0
     if abs {

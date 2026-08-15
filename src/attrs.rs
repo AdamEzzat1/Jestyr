@@ -133,6 +133,22 @@ const SPECS: &[Spec] = &[
         args: Args::None,
         status: Status::Active,
     },
+    // `@no_os` (design §3/§14 — the `core` tier's central claim) — the escape checker
+    // must *prove* the body reaches no OS-facing intrinsic: files, process, arguments,
+    // environment, the monotonic clock, and stdout/stderr. "This links on a freestanding
+    // target" stops being a header comment and becomes a checked property.
+    //
+    // **Orthogonal to `@no_alloc`, deliberately.** Allocation and OS access are separate
+    // axes and the library has a living example of each without the other: `std/sha256`
+    // builds a `String` (allocates) while touching no OS, and `std/sink` does neither.
+    // So this attribute says nothing about `region` blocks or arenas — write both
+    // attributes when you want both proofs.
+    Spec {
+        name: "no_os",
+        targets: &[Target::Fn, Target::Method],
+        args: Args::None,
+        status: Status::Active,
+    },
     // `@deterministic` (design §10 / Phase 3) — the escape checker certifies the
     // function's result is **schedule-independent**: it forbids the raw concurrency
     // primitives whose result can depend on the thread schedule (`concurrent`/`spawn`,

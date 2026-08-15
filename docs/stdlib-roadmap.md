@@ -53,16 +53,44 @@ control correctly rejected — so a `core` module built on a trait would carry a
 that proves nothing. The tier line is drawn exactly where the proof stops. Argued in
 `docs/io-design.md`, pinned by `no_alloc_does_not_see_through_a_trait_method`.
 
-The tier's contract is now *checked*, not merely documented: `path.jtr` marks
-every function `@no_alloc`, so the escape checker rejects the file if any of it
-ever reaches for the allocator. New `core`-tier modules should do the same.
+**Both halves of the tier's contract are now *checked*, not merely documented.**
 
-> One honest limit on that proof, worth knowing before you lean on it:
-> `@no_alloc` resolves the call graph **by free-function name**, so it does not
-> see through a method, a closure, or a `fn(…)` pointer
-> (`docs/attributes.md:180-184`). A module that allocates through an
-> `Allocator` value's vtable will still pass. It is a strong check on
-> direct-call code, not a total proof.
+*No heap:* `path.jtr`, `str.jtr`, `test.jtr`, `sink.jtr` and `cursor.jtr` mark every
+function `@no_alloc`, so the escape checker rejects the file if any of it ever reaches
+for the allocator.
+
+*No OS:* `@no_os` does the same for the platform boundary — files, process, arguments,
+environment, the clock, stdout/stderr, and **threads**. Every function in `core.jtr`,
+`sha256.jtr`, `path.jtr`, `str.jtr`, `test.jtr`, `sink.jtr` and `cursor.jtr` carries it,
+with two argued exceptions. New `core`-tier modules should carry both.
+
+Annotating `core.jtr` is what turned that header claim from prose into fact, and it
+immediately falsified part of it. Two functions — `par_binned_sum` and `par_reduce` —
+**spawn worker threads**, so they are not freestanding and are now marked as the
+exceptions they always were. Each has a serial twin (`f64_binned_sum`, `serial_reduce`)
+that is bit-identical and does carry `@no_os`, so a freestanding consumer has somewhere
+to go. The module header used to say "nothing here allocates"; those same two functions
+allocate a scratch buffer, so it did not.
+
+That is the argument for checking a claim rather than writing it down: the file had
+carried a false header for as long as the parallel functions had been in it, and nobody
+— including several careful passes over this module — had noticed.
+
+> One honest limit on **both** proofs, worth knowing before you lean on either:
+> they resolve the call graph **by free-function name**, so neither sees through a
+> method, a closure, or a `fn(…)` pointer (`docs/attributes.md`, the `@no_alloc` and
+> `@no_os` sections). A module that allocates through an `Allocator` value's vtable
+> will still pass `@no_alloc`, and one that prints through a trait method will still
+> pass `@no_os`. Strong checks on direct-call code, not total proofs — pinned by
+> `no_alloc_does_not_see_through_a_trait_method` and
+> `no_os_does_not_see_through_a_trait_method_either` so the limit cannot lapse
+> unnoticed.
+>
+> The `@no_os` list is closed in a way `@no_alloc`'s is not, though, and that is worth
+> the asymmetry: with no `extern "c"` yet, the intrinsic set *is* the platform, so
+> nothing outside the list can reach the OS at all. When `extern "c"` lands, that
+> stops being true and `@no_os` needs an `extern` rule — which is one more concrete
+> reason the `sys` tier waits on it.
 
 ### `mem` / `alloc` — explicit allocation
 

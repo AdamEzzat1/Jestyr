@@ -36,7 +36,7 @@ import "typeck"
 // binding depth — so marks from dead or shadowing bindings never leak, and scope pops need no
 // cleanup. `lfloor` is the loop-floor stack (`FnCtx::loop_floor`): scope depth at entry to each
 // enclosing loop-like construct (for / par for / closure).
-pub struct Esc { scn: List(i32), scst: List(i32), rgn: List(i32), rgst: List(i32), frozen: List(i32), rdepth: List(i32), no_alloc: bool, deterministic: bool, ret_is_borrow: bool, self_borrow: i32, alloc: Allocator, unres: List(i32), pub dsp: List(i32), pub dmsg: String, ta: List(i32), tast: List(i32), cons: List(i32), lfloor: List(i32) }
+pub struct Esc { scn: List(i32), scst: List(i32), rgn: List(i32), rgst: List(i32), frozen: List(i32), rdepth: List(i32), no_alloc: bool, no_os: bool, deterministic: bool, ret_is_borrow: bool, self_borrow: i32, alloc: Allocator, unres: List(i32), pub dsp: List(i32), pub dmsg: String, ta: List(i32), tast: List(i32), cons: List(i32), lfloor: List(i32) }
 
 // ---- scope helpers (flat arenas, mirroring typeck's) ----
 
@@ -522,6 +522,29 @@ fn is_alloc_intrinsic(read src: str, ns: usize, ne: usize) -> bool {
     if str_eq(n, "gen_new") { return true }
     return false
 }
+// The OS boundary as a closed list — mirrors `escape::is_os_intrinsic` on the reference
+// side. With no `extern "c"` yet the intrinsic set IS the platform, so this list is the
+// whole of what `@no_os` has to refuse (plus `spawn` / `par for`, which are syntax, not
+// calls, and are handled at their expression kinds below).
+fn is_os_intrinsic(read src: str, ns: usize, ne: usize) -> bool {
+    let n: str = src[ns .. ne]
+    if str_eq(n, "read_file") { return true }
+    if str_eq(n, "try_read_file") { return true }
+    if str_eq(n, "write_file") { return true }
+    if str_eq(n, "file_exists") { return true }
+    if str_eq(n, "remove_file") { return true }
+    if str_eq(n, "run_command") { return true }
+    if str_eq(n, "arg_count") { return true }
+    if str_eq(n, "arg") { return true }
+    if str_eq(n, "env_var") { return true }
+    if str_eq(n, "mono_nanos") { return true }
+    if str_eq(n, "print_int") { return true }
+    if str_eq(n, "print_float") { return true }
+    if str_eq(n, "print_str") { return true }
+    if str_eq(n, "print_bool") { return true }
+    if str_eq(n, "eprint_str") { return true }
+    return false
+}
 fn is_atomic_op(read src: str, ns: usize, ne: usize) -> bool {
     let n: str = src[ns .. ne]
     if str_eq(n, "atomic_store") { return true }
@@ -836,6 +859,26 @@ fn check_no_alloc_call(mut e: Esc, read p: parser.Parser, read src: str, callee:
         string_push(sb, "`")
         string_push(sb, src[ns .. ne])
         string_push(sb, "` allocates — forbidden in a `@no_alloc` function (the proven-allocation-free contract)")
+        ediag(e, span_s, span_e, string_view(sb))
+        string_free(sb)
+    }
+}
+
+// In `@no_os`: reject an OS-intrinsic call (bare or `mod.f` -> its bare field name).
+// The DIRECT rule only, exactly as `check_no_alloc_call` above is the direct half of
+// `@no_alloc` — the transitive closure is reference-only on both contracts.
+fn check_no_os_call(mut e: Esc, read p: parser.Parser, read src: str, callee: i32, span_s: usize, span_e: usize) {
+    if !e.no_os { return }
+    let cal: parser.ExprData = list.get(parser.ExprData, p.ex, callee as usize)
+    var ns: usize = 0  var ne: usize = 0  var ok: bool = false
+    if cal.kind == 2 { ns = cal.start  ne = cal.end  ok = true }
+    else if cal.kind == 5 { ns = cal.x as usize  ne = cal.y as usize  ok = true }   // mod.name -> name
+    if !ok { return }
+    if is_os_intrinsic(src, ns, ne) {
+        var sb: String = string_new()
+        string_push(sb, "`")
+        string_push(sb, src[ns .. ne])
+        string_push(sb, "` reaches the operating system — forbidden in a `@no_os` function (the proven-freestanding contract)")
         ediag(e, span_s, span_e, string_view(sb))
         string_free(sb)
     }
@@ -1328,6 +1371,7 @@ fn walk_expr(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src
                                 check_loop_mutation(e, p, c, src, id, d.a, d.x, d.y)
                                 check_slice_alias(e, p, c, src, id, d.a, d.x, d.y)
                                 check_no_alloc_call(e, p, src, d.a, d.start, d.end)
+                                check_no_os_call(e, p, src, d.a, d.start, d.end)
                                 check_det_call(e, p, src, d.a, d.start, d.end)
                                 check_manual_drop(e, c, src, id, d.start, d.end)
                                 return
@@ -1357,6 +1401,7 @@ fn walk_expr(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src
         check_loop_mutation(e, p, c, src, id, d.a, d.x, d.y)
         check_slice_alias(e, p, c, src, id, d.a, d.x, d.y)
         check_no_alloc_call(e, p, src, d.a, d.start, d.end)
+        check_no_os_call(e, p, src, d.a, d.start, d.end)
         check_det_call(e, p, src, d.a, d.start, d.end)
         check_manual_drop(e, c, src, id, d.start, d.end)
         return
@@ -1394,7 +1439,16 @@ fn walk_expr(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src
         check_block(e, p, c, src, d.a, false)
         return
     }
-    else if k == 39 { check_spawn_slice(e, p, c, src, d.a)  walk_expr(e, p, c, src, d.a, false)  return }  // spawn
+    else if k == 39 {                              // spawn
+        // Starting a task needs a thread runtime, which a freestanding target has not
+        // got — so `spawn` is an OS effect. Reported here rather than on the enclosing
+        // `concurrent` block: an empty scope starts no thread, and a rule on the block
+        // would double-report `concurrent { spawn … }`.
+        if e.no_os { ediag(e, d.start, d.end, "`spawn` starts a thread — forbidden in a `@no_os` function (the proven-freestanding contract)") }
+        check_spawn_slice(e, p, c, src, d.a)
+        walk_expr(e, p, c, src, d.a, false)
+        return
+    }
     else if k == 40 { walk_expr(e, p, c, src, d.a, false)  return }                               // await
     else if k == 43 {                              // region
         if e.no_alloc { ediag(e, d.start, d.end, "a `region` block allocates an arena — forbidden in a `@no_alloc` function") }
@@ -1418,6 +1472,8 @@ fn walk_expr(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src
         return
     }
     else if k == 41 {                              // par for
+        // Like `spawn`, a parallel loop needs a thread runtime — an OS effect.
+        if e.no_os { ediag(e, d.start, d.end, "a `par for` loop starts threads — forbidden in a `@no_os` function (the proven-freestanding contract)") }
         walk_expr(e, p, c, src, d.a, false)        // iter
         walk_expr(e, p, c, src, d.b, false)        // reduction
         // The body runs once per element — a loop for the consuming rule.
@@ -1629,10 +1685,12 @@ fn fn_has_attr(read p: parser.Parser, read src: str, read f: parser.ItemData, re
 
 fn check_fn(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str, read f: parser.ItemData) {
     let saved_na: bool = e.no_alloc
+    let saved_no: bool = e.no_os
     let saved_det: bool = e.deterministic
     let saved_rb: bool = e.ret_is_borrow
     let saved_sb: i32 = e.self_borrow
     e.no_alloc = fn_has_attr(p, src, f, "no_alloc")
+    e.no_os = fn_has_attr(p, src, f, "no_os")
     e.deterministic = fn_has_attr(p, src, f, "deterministic")
     let rc: i32 = f.op                             // ret_conv
     e.ret_is_borrow = (rc == 1 or rc == 2 or rc == 4)
@@ -1653,6 +1711,7 @@ fn check_fn(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src:
     if f.w >= 0 { check_block(e, p, c, src, f.w, true) }   // body is in return position
     e_pop(e)
     e.no_alloc = saved_na
+    e.no_os = saved_no
     e.deterministic = saved_det
     e.ret_is_borrow = saved_rb
     e.self_borrow = saved_sb
@@ -1673,7 +1732,7 @@ fn check_items(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read s
 // its buffered diagnostics (`dsp` span pairs + `dmsg` newline-separated messages, walk order).
 // The library entry the self-hosted driver imports; `escape_cli.jtr` dumps it for the P4 golden.
 pub fn check_program(read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator) -> Esc {
-    var e: Esc = Esc{ scn: list.make(i32, a), scst: list.make(i32, a), rgn: list.make(i32, a), rgst: list.make(i32, a), frozen: list.make(i32, a), rdepth: list.make(i32, a), no_alloc: false, deterministic: false, ret_is_borrow: false, self_borrow: 0, alloc: a, unres: list.make(i32, a), dsp: list.make(i32, a), dmsg: string_new(), ta: list.make(i32, a), tast: list.make(i32, a), cons: list.make(i32, a), lfloor: list.make(i32, a) }
+    var e: Esc = Esc{ scn: list.make(i32, a), scst: list.make(i32, a), rgn: list.make(i32, a), rgst: list.make(i32, a), frozen: list.make(i32, a), rdepth: list.make(i32, a), no_alloc: false, no_os: false, deterministic: false, ret_is_borrow: false, self_borrow: 0, alloc: a, unres: list.make(i32, a), dsp: list.make(i32, a), dmsg: string_new(), ta: list.make(i32, a), tast: list.make(i32, a), cons: list.make(i32, a), lfloor: list.make(i32, a) }
     check_items(e, p, c, src)
     finalize_unresolved(e, p, c, src)
     unsafe_boundary(e, p, c, a)

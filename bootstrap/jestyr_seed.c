@@ -498,6 +498,7 @@ struct Jestyr_Esc {
     Jestyr_List__i32 j_frozen;
     Jestyr_List__i32 j_rdepth;
     bool j_no_alloc;
+    bool j_no_os;
     bool j_deterministic;
     bool j_ret_is_borrow;
     int32_t j_self_borrow;
@@ -1075,6 +1076,7 @@ void jestyr_collect_names_fieldinits(Jestyr_Parser j_p, int32_t j_start, int32_t
 void jestyr_collect_block_names(Jestyr_Parser j_p, int32_t j_blk, Jestyr_List__i32* restrict j_acc);
 bool jestyr_frozen_contains(Jestyr_Esc j_e, JestyrStr j_src, size_t j_ns, size_t j_ne);
 bool jestyr_is_alloc_intrinsic(JestyrStr j_src, size_t j_ns, size_t j_ne);
+bool jestyr_is_os_intrinsic(JestyrStr j_src, size_t j_ns, size_t j_ne);
 bool jestyr_is_atomic_op(JestyrStr j_src, size_t j_ns, size_t j_ne);
 int32_t jestyr_mcall_row(Jestyr_Checker j_c, int32_t j_id);
 bool jestyr_droppable_expr(Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_eid);
@@ -1086,6 +1088,7 @@ int32_t jestyr_fn_row_by_span(Jestyr_Checker j_c, JestyrStr j_src, size_t j_ns, 
 void jestyr_give_away_err(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p2, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_arg, int32_t j_pbase, int32_t j_iid, Jestyr_Parser j_p);
 void jestyr_check_manual_drop(Jestyr_Esc* restrict j_e, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_id, size_t j_span_s, size_t j_span_e);
 void jestyr_check_no_alloc_call(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, JestyrStr j_src, int32_t j_callee, size_t j_span_s, size_t j_span_e);
+void jestyr_check_no_os_call(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, JestyrStr j_src, int32_t j_callee, size_t j_span_s, size_t j_span_e);
 void jestyr_check_det_call(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, JestyrStr j_src, int32_t j_callee, size_t j_span_s, size_t j_span_e);
 void jestyr_check_loop_mutation(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_id, int32_t j_callee, int32_t j_astart, int32_t j_acount);
 void jestyr_flag_frozen(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, int32_t j_arg);
@@ -16677,6 +16680,72 @@ bool jestyr_is_alloc_intrinsic(JestyrStr j_src, size_t j_ns, size_t j_ne)
     return false;
 }
 
+bool jestyr_is_os_intrinsic(JestyrStr j_src, size_t j_ns, size_t j_ne)
+{
+    JestyrStr j_n = jestyr_rt_substr(j_src, j_ns, j_ne);
+    if (jestyr_rt_str_eq(j_n, JSTR("read_file")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("try_read_file")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("write_file")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("file_exists")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("remove_file")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("run_command")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("arg_count")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("arg")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("env_var")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("mono_nanos")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("print_int")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("print_float")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("print_str")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("print_bool")))
+    {
+        return true;
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("eprint_str")))
+    {
+        return true;
+    }
+    return false;
+}
+
 bool jestyr_is_atomic_op(JestyrStr j_src, size_t j_ns, size_t j_ne)
 {
     JestyrStr j_n = jestyr_rt_substr(j_src, j_ns, j_ne);
@@ -17111,6 +17180,44 @@ void jestyr_check_no_alloc_call(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jes
         jestyr_rt_str_push(&j_sb, JSTR("`"));
         jestyr_rt_str_push(&j_sb, jestyr_rt_substr(j_src, j_ns, j_ne));
         jestyr_rt_str_push(&j_sb, JSTR("` allocates — forbidden in a `@no_alloc` function (the proven-allocation-free contract)"));
+        jestyr_ediag(&((*j_e)), j_span_s, j_span_e, jestyr_rt_str_view(&j_sb));
+        jestyr_rt_str_free(&j_sb);
+    }
+}
+
+void jestyr_check_no_os_call(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, JestyrStr j_src, int32_t j_callee, size_t j_span_s, size_t j_span_e)
+{
+    if ((!(*j_e).j_no_os))
+    {
+        return;
+    }
+    Jestyr_ExprData j_cal = jestyr_get__list__ExprData(j_p.j_ex, (size_t)(j_callee));
+    size_t j_ns = 0;
+    size_t j_ne = 0;
+    bool j_ok = false;
+    if ((j_cal.j_kind == 2))
+    {
+        j_ns = j_cal.j_start;
+        j_ne = j_cal.j_end;
+        j_ok = true;
+    }
+    else
+    if ((j_cal.j_kind == 5))
+    {
+        j_ns = (size_t)(j_cal.j_x);
+        j_ne = (size_t)(j_cal.j_y);
+        j_ok = true;
+    }
+    if ((!j_ok))
+    {
+        return;
+    }
+    if (jestyr_is_os_intrinsic(j_src, j_ns, j_ne))
+    {
+        JestyrString j_sb = jestyr_rt_str_new();
+        jestyr_rt_str_push(&j_sb, JSTR("`"));
+        jestyr_rt_str_push(&j_sb, jestyr_rt_substr(j_src, j_ns, j_ne));
+        jestyr_rt_str_push(&j_sb, JSTR("` reaches the operating system — forbidden in a `@no_os` function (the proven-freestanding contract)"));
         jestyr_ediag(&((*j_e)), j_span_s, j_span_e, jestyr_rt_str_view(&j_sb));
         jestyr_rt_str_free(&j_sb);
     }
@@ -17809,6 +17916,7 @@ void jestyr_walk_expr(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checke
                                 jestyr_check_loop_mutation(&((*j_e)), j_p, j_c, j_src, j_id, j_d.j_a, j_d.j_x, j_d.j_y);
                                 jestyr_check_slice_alias(&((*j_e)), j_p, j_c, j_src, j_id, j_d.j_a, j_d.j_x, j_d.j_y);
                                 jestyr_check_no_alloc_call(&((*j_e)), j_p, j_src, j_d.j_a, j_d.j_start, j_d.j_end);
+                                jestyr_check_no_os_call(&((*j_e)), j_p, j_src, j_d.j_a, j_d.j_start, j_d.j_end);
                                 jestyr_check_det_call(&((*j_e)), j_p, j_src, j_d.j_a, j_d.j_start, j_d.j_end);
                                 jestyr_check_manual_drop(&((*j_e)), j_c, j_src, j_id, j_d.j_start, j_d.j_end);
                                 return;
@@ -17842,6 +17950,7 @@ void jestyr_walk_expr(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checke
         jestyr_check_loop_mutation(&((*j_e)), j_p, j_c, j_src, j_id, j_d.j_a, j_d.j_x, j_d.j_y);
         jestyr_check_slice_alias(&((*j_e)), j_p, j_c, j_src, j_id, j_d.j_a, j_d.j_x, j_d.j_y);
         jestyr_check_no_alloc_call(&((*j_e)), j_p, j_src, j_d.j_a, j_d.j_start, j_d.j_end);
+        jestyr_check_no_os_call(&((*j_e)), j_p, j_src, j_d.j_a, j_d.j_start, j_d.j_end);
         jestyr_check_det_call(&((*j_e)), j_p, j_src, j_d.j_a, j_d.j_start, j_d.j_end);
         jestyr_check_manual_drop(&((*j_e)), j_c, j_src, j_id, j_d.j_start, j_d.j_end);
         return;
@@ -17930,6 +18039,10 @@ void jestyr_walk_expr(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checke
     else
     if ((j_k == 39))
     {
+        if ((*j_e).j_no_os)
+        {
+            jestyr_ediag(&((*j_e)), j_d.j_start, j_d.j_end, JSTR("`spawn` starts a thread — forbidden in a `@no_os` function (the proven-freestanding contract)"));
+        }
         jestyr_check_spawn_slice(&((*j_e)), j_p, j_c, j_src, j_d.j_a);
         jestyr_walk_expr(&((*j_e)), j_p, j_c, j_src, j_d.j_a, false);
         return;
@@ -17969,6 +18082,10 @@ void jestyr_walk_expr(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checke
     else
     if ((j_k == 41))
     {
+        if ((*j_e).j_no_os)
+        {
+            jestyr_ediag(&((*j_e)), j_d.j_start, j_d.j_end, JSTR("a `par for` loop starts threads — forbidden in a `@no_os` function (the proven-freestanding contract)"));
+        }
         jestyr_walk_expr(&((*j_e)), j_p, j_c, j_src, j_d.j_a, false);
         jestyr_walk_expr(&((*j_e)), j_p, j_c, j_src, j_d.j_b, false);
         jestyr_push__i32(&((*j_e).j_lfloor), (int32_t)(jestyr_len__i32((*j_e).j_scst)));
@@ -18251,10 +18368,12 @@ bool jestyr_fn_has_attr(Jestyr_Parser j_p, JestyrStr j_src, Jestyr_ItemData j_f,
 void jestyr_check_fn(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, Jestyr_ItemData j_f)
 {
     bool j_saved_na = (*j_e).j_no_alloc;
+    bool j_saved_no = (*j_e).j_no_os;
     bool j_saved_det = (*j_e).j_deterministic;
     bool j_saved_rb = (*j_e).j_ret_is_borrow;
     int32_t j_saved_sb = (*j_e).j_self_borrow;
     (*j_e).j_no_alloc = jestyr_fn_has_attr(j_p, j_src, j_f, JSTR("no_alloc"));
+    (*j_e).j_no_os = jestyr_fn_has_attr(j_p, j_src, j_f, JSTR("no_os"));
     (*j_e).j_deterministic = jestyr_fn_has_attr(j_p, j_src, j_f, JSTR("deterministic"));
     int32_t j_rc = j_f.j_op;
     (*j_e).j_ret_is_borrow = (((j_rc == 1) || (j_rc == 2)) || (j_rc == 4));
@@ -18291,6 +18410,7 @@ void jestyr_check_fn(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Checker
     }
     jestyr_e_pop(&((*j_e)));
     (*j_e).j_no_alloc = j_saved_na;
+    (*j_e).j_no_os = j_saved_no;
     (*j_e).j_deterministic = j_saved_det;
     (*j_e).j_ret_is_borrow = j_saved_rb;
     (*j_e).j_self_borrow = j_saved_sb;
@@ -18318,7 +18438,7 @@ void jestyr_check_items(Jestyr_Esc* restrict j_e, Jestyr_Parser j_p, Jestyr_Chec
 
 Jestyr_Esc jestyr_check_program(Jestyr_Parser j_p, Jestyr_Checker j_c, JestyrStr j_src, Jestyr_Allocator j_a)
 {
-    Jestyr_Esc j_e = (Jestyr_Esc){ .j_scn = jestyr_make__list__i32(j_a), .j_scst = jestyr_make__list__i32(j_a), .j_rgn = jestyr_make__list__i32(j_a), .j_rgst = jestyr_make__list__i32(j_a), .j_frozen = jestyr_make__list__i32(j_a), .j_rdepth = jestyr_make__list__i32(j_a), .j_no_alloc = false, .j_deterministic = false, .j_ret_is_borrow = false, .j_self_borrow = 0, .j_alloc = j_a, .j_unres = jestyr_make__list__i32(j_a), .j_dsp = jestyr_make__list__i32(j_a), .j_dmsg = jestyr_rt_str_new(), .j_ta = jestyr_make__list__i32(j_a), .j_tast = jestyr_make__list__i32(j_a), .j_cons = jestyr_make__list__i32(j_a), .j_lfloor = jestyr_make__list__i32(j_a) };
+    Jestyr_Esc j_e = (Jestyr_Esc){ .j_scn = jestyr_make__list__i32(j_a), .j_scst = jestyr_make__list__i32(j_a), .j_rgn = jestyr_make__list__i32(j_a), .j_rgst = jestyr_make__list__i32(j_a), .j_frozen = jestyr_make__list__i32(j_a), .j_rdepth = jestyr_make__list__i32(j_a), .j_no_alloc = false, .j_no_os = false, .j_deterministic = false, .j_ret_is_borrow = false, .j_self_borrow = 0, .j_alloc = j_a, .j_unres = jestyr_make__list__i32(j_a), .j_dsp = jestyr_make__list__i32(j_a), .j_dmsg = jestyr_rt_str_new(), .j_ta = jestyr_make__list__i32(j_a), .j_tast = jestyr_make__list__i32(j_a), .j_cons = jestyr_make__list__i32(j_a), .j_lfloor = jestyr_make__list__i32(j_a) };
     jestyr_check_items(&(j_e), j_p, j_c, j_src);
     jestyr_finalize_unresolved(&(j_e), j_p, j_c, j_src);
     jestyr_unsafe_boundary(&(j_e), j_p, j_c, j_a);

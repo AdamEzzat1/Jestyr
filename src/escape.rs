@@ -47,7 +47,7 @@ use crate::span::Span;
 use crate::types::{Ty, TypeInfo};
 
 pub fn check(ast: &Ast, info: &TypeInfo) -> Vec<Diagnostic> {
-    let alloc_via = alloc_closure(ast, info);
+    let effects = effect_closures(ast, info);
     let mut ck = Checker {
         ast,
         info,
@@ -55,10 +55,13 @@ pub fn check(ast: &Ast, info: &TypeInfo) -> Vec<Diagnostic> {
         frozen: Vec::new(),
         region_depths: Vec::new(),
         no_alloc: false,
+        no_os: false,
         deterministic: false,
         allocates: false,
+        uses_os: false,
         calls: Vec::new(),
-        alloc_via,
+        alloc_via: effects.alloc_via,
+        os_via: effects.os_via,
         unresolved: Vec::new(),
     };
     for item in &ast.items {
@@ -143,30 +146,53 @@ pub fn check(ast: &Ast, info: &TypeInfo) -> Vec<Diagnostic> {
     ck.diags
 }
 
-/// For every top-level function that allocates **transitively**, the shortest call
-/// chain from it to a function that allocates *directly*.
+/// The transitive effect closures the two proven-absence contracts read.
 ///
-/// ## Why this reuses the checker instead of restating "allocates"
-/// The direct rule already exists in three places — an allocation intrinsic, a `region`
-/// block, a region-scoped loop. Writing a second walker that looked for those would be
-/// two definitions of "allocates" that could drift, and the one that drifted would make
-/// `@no_alloc` claim a proof it does not have. So this runs the **real checker** over
-/// each function with the per-op rules recording into `allocates`/`calls`, and reads
-/// those out. One decision point, two consumers — the rule this codebase applies to
-/// `at_ty`, `simd::classify` and `layout::field_order`.
+/// One struct rather than two return values because both are computed from the **same**
+/// probe pass and the same call graph; splitting them into two entry points would run
+/// the whole checker over every function twice for no gain.
+struct Effects {
+    /// Functions that allocate transitively → the shortest chain to one that allocates
+    /// *directly* (`@no_alloc`).
+    alloc_via: HashMap<String, Vec<String>>,
+    /// Functions that reach the OS transitively → the shortest chain to one that
+    /// reaches it *directly* (`@no_os`).
+    os_via: HashMap<String, Vec<String>>,
+}
+
+/// For every top-level function that allocates — or reaches the OS — **transitively**,
+/// the shortest call chain from it to a function that does so *directly*.
+///
+/// ## Why this reuses the checker instead of restating "allocates" / "reaches the OS"
+/// The direct rules already exist: allocation has three (an allocation intrinsic, a
+/// `region` block, a region-scoped loop) and OS access has one ([`is_os_intrinsic`]).
+/// Writing a second walker that looked for those would be two definitions of each effect
+/// that could drift, and the one that drifted would make its attribute claim a proof it
+/// does not have. So this runs the **real checker** over each function with the per-op
+/// rules recording into `allocates`/`uses_os`/`calls`, and reads those out. One decision
+/// point, several consumers — the rule this codebase applies to `at_ty`,
+/// `simd::classify` and `layout::field_order`.
 ///
 /// The diagnostics from those probe runs are discarded: they belong to the main pass,
-/// which reports each function once with the right `no_alloc` flag.
+/// which reports each function once with the right contract flags.
+///
+/// ## Why one pass for both effects
+/// The probe is the expensive part — it walks every function's whole body — and the call
+/// graph it yields is shared. So the walk happens once, each effect gets its own `direct`
+/// seed set, and [`shortest_chains`] closes over the one graph twice. Adding a third
+/// proven-absence contract costs a seed set and a `shortest_chains` call, not another
+/// traversal of the program.
 ///
 /// ## What it deliberately does not resolve
 /// Only **free functions**, resolved by name. A method, a closure, or a call through a
-/// `fn(…)` pointer is not in the graph, so a `@no_alloc` function that allocates through
-/// one is not caught. That is a real limit, not an oversight — closing it needs
-/// call-graph resolution the escape checker does not have today — and it is recorded in
-/// `docs/attributes.md` rather than left for a user to discover.
-fn alloc_closure(ast: &Ast, info: &TypeInfo) -> HashMap<String, Vec<String>> {
-    // Per function: does it allocate directly, and whom does it call?
-    let mut direct: HashSet<String> = HashSet::new();
+/// `fn(…)` pointer is not in the graph, so a `@no_alloc`/`@no_os` function that allocates
+/// or calls the OS through one is not caught. That is a real limit, not an oversight —
+/// closing it needs call-graph resolution the escape checker does not have today — and it
+/// is recorded in `docs/attributes.md` rather than left for a user to discover.
+fn effect_closures(ast: &Ast, info: &TypeInfo) -> Effects {
+    // Per function: which effects does it have directly, and whom does it call?
+    let mut alloc_direct: HashSet<String> = HashSet::new();
+    let mut os_direct: HashSet<String> = HashSet::new();
     let mut calls: HashMap<String, Vec<String>> = HashMap::new();
     for item in &ast.items {
         let Item::Fn(f) = item else { continue };
@@ -178,30 +204,47 @@ fn alloc_closure(ast: &Ast, info: &TypeInfo) -> HashMap<String, Vec<String>> {
             region_depths: Vec::new(),
             // `false`, so the probe never reports: it is measuring, not judging.
             no_alloc: false,
+            no_os: false,
             deterministic: false,
             allocates: false,
+            uses_os: false,
             calls: Vec::new(),
             alloc_via: HashMap::new(),
+            os_via: HashMap::new(),
             unresolved: Vec::new(),
         };
         probe.check_item(item);
         if probe.allocates {
-            direct.insert(f.name.name.clone());
+            alloc_direct.insert(f.name.name.clone());
+        }
+        if probe.uses_os {
+            os_direct.insert(f.name.name.clone());
         }
         let mut cs: Vec<String> = probe.calls.into_iter().map(|(n, _)| n).collect();
         cs.sort();
         cs.dedup();
         calls.insert(f.name.name.clone(), cs);
     }
+    Effects {
+        alloc_via: shortest_chains(&alloc_direct, &calls),
+        os_via: shortest_chains(&os_direct, &calls),
+    }
+}
 
-    // Least fixpoint: a function allocates if it calls one that does. Iterated to
+/// Close `direct` over the call graph `calls`, mapping each function that reaches the
+/// effect to the **shortest** chain of callees that gets there.
+fn shortest_chains(
+    direct: &HashSet<String>,
+    calls: &HashMap<String, Vec<String>>,
+) -> HashMap<String, Vec<String>> {
+    // Least fixpoint: a function has the effect if it calls one that does. Iterated to
     // saturation rather than recursed, so a cycle (mutual or self recursion) settles
     // instead of looping — the same totality instinct the comptime interpreter applies.
-    // A directly-allocating function is reached via an EMPTY chain — it is itself the
-    // culprit. Seeding it with its own name instead would duplicate that name in every
-    // chain that passes through it.
+    // A function with the effect DIRECTLY is reached via an EMPTY chain — it is itself
+    // the culprit. Seeding it with its own name instead would duplicate that name in
+    // every chain that passes through it.
     let mut via: HashMap<String, Vec<String>> = HashMap::new();
-    for d in &direct {
+    for d in direct {
         via.insert(d.clone(), Vec::new());
     }
     loop {
@@ -238,9 +281,9 @@ fn alloc_closure(ast: &Ast, info: &TypeInfo) -> HashMap<String, Vec<String>> {
             break;
         }
     }
-    // Directly-allocating functions STAY in the map, with their empty chains. The
-    // direct rule in `check_no_alloc_call` only recognizes allocation *intrinsics*, so
-    // dropping them here would let a one-hop call to a user function that allocates
+    // Functions with the effect directly STAY in the map, with their empty chains. The
+    // direct rule in `check_effect_call` only recognizes *intrinsics*, so dropping them
+    // here would let a one-hop call to a user function that has the effect
     // (`@no_alloc fn f() { g() }` where `g` calls `alloc`) pass unreported — which it
     // did, until this comment's test caught it.
     via
@@ -255,6 +298,13 @@ struct Checker<'a> {
     /// compile error — the enforced allocation-free contract (the `@no_panic`
     /// analog). Saved/restored around nested method bodies.
     no_alloc: bool,
+    /// Is the function currently being checked `@no_os`? If so, a call reaching any
+    /// OS-facing intrinsic ([`is_os_intrinsic`]) is a compile error — the enforced
+    /// freestanding contract, which turns the `core` tier's "links on a bare-metal
+    /// target" from a header comment into a checked property. Independent of
+    /// `no_alloc`: a `@no_os` function may allocate (`std/sha256` does).
+    /// Saved/restored around nested method bodies.
+    no_os: bool,
     /// Is the function currently being checked `@deterministic`? If so, the raw
     /// concurrency primitives whose result can depend on the thread schedule —
     /// `concurrent`/`spawn` and the `atomic_*` ops — are compile errors; parallelism
@@ -266,12 +316,18 @@ struct Checker<'a> {
     /// regardless of `no_alloc`, because [`alloc_closure`] measures every function
     /// before it knows which ones are annotated.
     allocates: bool,
+    /// Set when the function being walked calls an OS-facing intrinsic **directly**.
+    /// Recorded regardless of `no_os`, for the same reason `allocates` is.
+    uses_os: bool,
     /// Every resolved callee name seen while walking, with its span — the call-graph
-    /// edges [`alloc_closure`] closes over.
+    /// edges [`effect_closures`] closes over.
     calls: Vec<(String, Span)>,
     /// Functions that allocate **transitively**, each mapped to the shortest chain
     /// reaching a directly-allocating one. Empty during the measuring pass.
     alloc_via: HashMap<String, Vec<String>>,
+    /// Functions that reach the OS **transitively**, each mapped to the shortest chain
+    /// reaching one that calls an OS intrinsic. Empty during the measuring pass.
+    os_via: HashMap<String, Vec<String>>,
     /// Borrow places whose type inference never resolved, with the root binding's
     /// name — the `Unknown` finalization, drained and emitted sorted in [`check`].
     /// Collected by the [`alloc_closure`] probe too, and discarded there with the
@@ -463,15 +519,18 @@ impl<'a> Checker<'a> {
             let name = if p.is_self { "self" } else { p.name.name.as_str() };
             ctx.bind(name, is_borrow);
         }
-        // `@no_alloc` is per-function — save/restore so a nested method body does
-        // not inherit (or clobber) the enclosing function's contract.
+        // The proven-absence contracts are per-function — save/restore so a nested
+        // method body does not inherit (or clobber) the enclosing function's.
         let saved_no_alloc = self.no_alloc;
         self.no_alloc = f.has_attr("no_alloc");
+        let saved_no_os = self.no_os;
+        self.no_os = f.has_attr("no_os");
         let saved_det = self.deterministic;
         self.deterministic = f.has_attr("deterministic");
         // The body is in return position: its tail expression is the result.
         self.check_block(&mut ctx, &f.body, true);
         self.no_alloc = saved_no_alloc;
+        self.no_os = saved_no_os;
         self.deterministic = saved_det;
     }
 
@@ -748,7 +807,7 @@ impl<'a> Checker<'a> {
                     self.check_give_away(ctx, id, *callee, args);
                     self.check_loop_mutation(ctx, id, *callee, args);
                     self.check_slice_alias(id, *callee, args);
-                    self.check_no_alloc_call(id, *callee, span);
+                    self.check_effect_call(id, *callee, span);
                     self.check_deterministic_call(id, *callee, span);
                     self.check_manual_drop(id, span);
                     return;
@@ -776,7 +835,7 @@ impl<'a> Checker<'a> {
                 self.check_give_away(ctx, id, *callee, args);
                 self.check_loop_mutation(ctx, id, *callee, args);
                 self.check_slice_alias(id, *callee, args);
-                self.check_no_alloc_call(id, *callee, span);
+                self.check_effect_call(id, *callee, span);
                 self.check_deterministic_call(id, *callee, span);
                 self.check_manual_drop(id, span);
                 return;
@@ -865,6 +924,20 @@ impl<'a> Checker<'a> {
                 // raw pointers don't overlap needs range-aware alias analysis (e.g.
                 // `raw+0` vs `raw+2048`), which is out of scope; this rule keeps the
                 // safe subset race-free and makes the unsafe boundary explicit.
+                //
+                // Starting a task needs a **thread runtime**, which a freestanding
+                // target does not have — so `spawn` is an OS effect. Reported here and
+                // at `par for` rather than at the enclosing `concurrent` block: a
+                // `concurrent` scope with nothing spawned in it starts no thread, and a
+                // rule on the block would double-report the common nested shape.
+                self.uses_os = true;
+                if self.no_os {
+                    self.error(
+                        span,
+                        "`spawn` starts a thread — forbidden in a `@no_os` function \
+                         (the proven-freestanding contract)",
+                    );
+                }
                 self.check_spawn_no_shared_mut_slice(*call);
                 self.walk_expr(ctx, *call, false);
                 return;
@@ -913,6 +986,16 @@ impl<'a> Checker<'a> {
                 // can't escape. Walk the iterable, the per-element body, and the
                 // reduction. No new data-race surface: the reduction's disjoint-region
                 // writes live inside the tested `core.par_reduce` engine.
+                //
+                // Like `spawn`, a parallel loop needs a thread runtime — an OS effect.
+                self.uses_os = true;
+                if self.no_os {
+                    self.error(
+                        span,
+                        "a `par for` loop starts threads — forbidden in a `@no_os` function \
+                         (the proven-freestanding contract)",
+                    );
+                }
                 self.walk_expr(ctx, *iter, false);
                 self.walk_expr(ctx, *reduction, false);
                 // The body runs once per element — a loop for the consuming rule.
@@ -1449,46 +1532,72 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_no_alloc_call(&mut self, call_id: ExprId, callee: ExprId, span: Span) {
+    /// Record a call's effects on the enclosing function, and enforce whichever
+    /// proven-absence contracts that function declared.
+    ///
+    /// The recording half runs unconditionally — [`effect_closures`] needs every
+    /// function's callees before it knows which functions are annotated — so this is
+    /// also where the call-graph edges come from.
+    fn check_effect_call(&mut self, call_id: ExprId, callee: ExprId, span: Span) {
         let Some(name) = self.resolved_callee_name(call_id, callee) else { return };
-        // Recorded on EVERY call, `@no_alloc` or not, because the transitive pass
-        // needs this function's callees before it knows whether anyone cares.
         if is_alloc_intrinsic(&name) {
             self.allocates = true;
         }
+        if is_os_intrinsic(&name) {
+            self.uses_os = true;
+        }
         self.calls.push((name.clone(), span));
-        if !self.no_alloc {
-            return;
+        // A fixed order, so a call that breaks *both* contracts always reports
+        // allocation first. The port golden compares diagnostics as a sequence, and a
+        // set whose order depended on the attribute spelling would be a difference the
+        // two implementations had to agree on for no reason.
+        if self.no_alloc {
+            self.report_effect(Effect::Alloc, &name, span);
         }
-        if is_alloc_intrinsic(&name) {
+        if self.no_os {
+            self.report_effect(Effect::Os, &name, span);
+        }
+    }
+
+    /// One violation of `eff`'s contract at `span`, direct or transitive.
+    ///
+    /// Both contracts phrase their diagnostic identically because they *are* the same
+    /// finding about different effects — a reader who has learned to read one has
+    /// learned to read the other. [`Effect`] holds the four words that differ.
+    fn report_effect(&mut self, eff: Effect, name: &str, span: Span) {
+        if eff.is_intrinsic(name) {
             self.error(
                 span,
                 format!(
-                    "`{name}` allocates — forbidden in a `@no_alloc` function (the proven-allocation-free contract)"
+                    "`{name}` {} — forbidden in a `@{}` function ({})",
+                    eff.verb(),
+                    eff.attr(),
+                    eff.contract()
                 ),
             );
             return;
         }
-        // …and the TRANSITIVE rule: calling something that allocates, however
-        // indirectly, breaks the same contract. `alloc_via` carries the shortest
-        // chain, so the diagnostic can name the function that actually allocates
-        // rather than only the one that was called.
-        if let Some(chain) = self.alloc_via.get(&name) {
-            let culprit = chain.last().cloned().unwrap_or_else(|| name.clone());
-            // Name the whole path only when there is one worth naming — for a direct
-            // callee the chain is a single hop and "via `f`; `f` allocates" is noise.
-            let detail = if chain.len() > 1 {
-                format!("via `{}`; `{culprit}` allocates directly", chain.join("` → `"))
-            } else {
-                format!("`{culprit}` allocates directly")
-            };
-            self.error(
-                span,
-                format!(
-                    "`{name}` allocates — forbidden in a `@no_alloc` function ({detail})"
-                ),
-            );
-        }
+        // …and the TRANSITIVE rule: calling something with the effect, however
+        // indirectly, breaks the same contract. The closure carries the shortest chain,
+        // so the diagnostic can name the function that actually has the effect rather
+        // than only the one that was called. Cloned to end the borrow before `error`.
+        let chain = match eff {
+            Effect::Alloc => self.alloc_via.get(name),
+            Effect::Os => self.os_via.get(name),
+        };
+        let Some(chain) = chain.cloned() else { return };
+        let culprit = chain.last().cloned().unwrap_or_else(|| name.to_string());
+        // Name the whole path only when there is one worth naming — for a direct
+        // callee the chain is a single hop and "via `f`; `f` allocates" is noise.
+        let detail = if chain.len() > 1 {
+            format!("via `{}`; `{culprit}` {}", chain.join("` → `"), eff.culprit_verb())
+        } else {
+            format!("`{culprit}` {}", eff.culprit_verb())
+        };
+        self.error(
+            span,
+            format!("`{name}` {} — forbidden in a `@{}` function ({detail})", eff.verb(), eff.attr()),
+        );
     }
 
     /// In a `@deterministic` function, reject a call to an `atomic_*` op — a
@@ -1859,6 +1968,101 @@ impl<'a> Checker<'a> {
 /// memory (heap `malloc`/`realloc`, an arena open, or an arena bump)? These are
 /// the operations a `@no_alloc` function may not perform. (`free_ptr`/`arena_close`
 /// release memory and are allowed; they don't allocate.)
+/// A proven-**absence** contract: an effect an annotated function must not have,
+/// together with the four words its diagnostic differs by.
+///
+/// Two contracts, one sentence shape. Keeping the phrasing in a shared place is not
+/// tidiness — it is what stops the two from drifting into differently-structured
+/// messages for the same finding, which is the thing that makes a diagnostic style
+/// unlearnable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Effect {
+    /// Allocation, heap or arena — `@no_alloc`.
+    Alloc,
+    /// Any OS-facing intrinsic — `@no_os`.
+    Os,
+}
+
+impl Effect {
+    fn attr(self) -> &'static str {
+        match self {
+            Effect::Alloc => "no_alloc",
+            Effect::Os => "no_os",
+        }
+    }
+    /// What the offending callee does — the sentence's verb.
+    fn verb(self) -> &'static str {
+        match self {
+            Effect::Alloc => "allocates",
+            Effect::Os => "reaches the operating system",
+        }
+    }
+    /// The parenthetical on a DIRECT violation: the contract being broken.
+    fn contract(self) -> &'static str {
+        match self {
+            Effect::Alloc => "the proven-allocation-free contract",
+            Effect::Os => "the proven-freestanding contract",
+        }
+    }
+    /// What the function at the far end of a transitive chain does.
+    fn culprit_verb(self) -> &'static str {
+        match self {
+            Effect::Alloc => "allocates directly",
+            Effect::Os => "calls the OS directly",
+        }
+    }
+    /// Is `name` an intrinsic with this effect — the *direct* rule?
+    fn is_intrinsic(self, name: &str) -> bool {
+        match self {
+            Effect::Alloc => is_alloc_intrinsic(name),
+            Effect::Os => is_os_intrinsic(name),
+        }
+    }
+}
+
+/// The OS boundary, as a closed list — every intrinsic that needs a hosted platform
+/// underneath it. This is what `@no_os` proves the absence of, and therefore what
+/// "`core` links on a freestanding target" actually means.
+///
+/// Four groups, and each is here for a concrete reason rather than by analogy:
+///
+/// * **Files** — `read_file`, `try_read_file`, `write_file`, `file_exists`,
+///   `remove_file`. A filesystem.
+/// * **Process, arguments, environment** — `run_command`, `arg_count`, `arg`,
+///   `env_var`. A process model, an `argv`, an environment block.
+/// * **The clock** — `mono_nanos`. A monotonic timer the platform has to supply.
+/// * **Standard streams** — `print_int`, `print_float`, `print_str`, `print_bool`,
+///   `eprint_str`. These are the easy ones to forget, and the reason the attribute is
+///   worth having: a debug `print_str` left in a `core` function is invisible in review
+///   and fatal on a target with no stdout.
+///
+/// The list mirrors `typeck::io_intrinsic_ret` plus the print family. It is restated
+/// rather than shared because that function answers "what type does this return", not
+/// "does this touch the OS", and the two questions will not always have the same answer
+/// — but a name that drifted out of one and not the other would make this check
+/// silently vacuous *for that intrinsic*, so `no_os_props` exercises every name here
+/// against the real checker.
+fn is_os_intrinsic(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "try_read_file"
+            | "write_file"
+            | "file_exists"
+            | "remove_file"
+            | "run_command"
+            | "arg_count"
+            | "arg"
+            | "env_var"
+            | "mono_nanos"
+            | "print_int"
+            | "print_float"
+            | "print_str"
+            | "print_bool"
+            | "eprint_str"
+    )
+}
+
 fn is_alloc_intrinsic(name: &str) -> bool {
     matches!(
         name,
@@ -2332,6 +2536,177 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(escapes(src)[0].message, first, "the chain choice must be stable");
         }
+    }
+
+    // --- @no_os: the enforced freestanding contract ---
+    //
+    // The `core` tier's central claim, made checkable. Deliberately structured as a
+    // near-copy of the `@no_alloc` family above, because the two contracts are the same
+    // analysis over different effects — if one grows a case the other should be asked
+    // whether it needs the same one.
+
+    #[test]
+    fn no_os_rejects_a_direct_os_call() {
+        let d = escapes("@no_os fn f(n: i32) -> i32 { print_int(n as i64) return n }");
+        assert!(!d.is_empty(), "a printing @no_os body must be rejected");
+        assert!(d[0].message.contains("@no_os"), "{d:?}");
+        assert!(d[0].message.contains("reaches the operating system"), "{d:?}");
+    }
+
+    /// Every name in [`is_os_intrinsic`] must actually be rejected. A typo in that list
+    /// would not fail to compile — it would silently make the check **vacuous for that
+    /// intrinsic**, which is the worst failure mode an absence-proof can have.
+    #[test]
+    fn no_os_rejects_every_intrinsic_on_the_list() {
+        // Each with a call shape that type-checks, so a diagnostic can only come from
+        // the contract and never from a mis-typed probe.
+        for call in [
+            "print_int(1)",
+            "print_float(1.0)",
+            "print_str(\"x\")",
+            "print_bool(true)",
+            "eprint_str(\"x\")",
+            "read_file(\"f\")",
+            "try_read_file(\"f\")",
+            "write_file(\"f\", \"c\")",
+            "file_exists(\"f\")",
+            "remove_file(\"f\")",
+            "run_command(\"c\")",
+            "arg_count()",
+            "arg(0)",
+            "env_var(\"P\")",
+            "mono_nanos()",
+        ] {
+            let src = format!("@no_os fn f() -> i32 {{ let _v = {call} return 0 }}");
+            let d = escapes(&src);
+            assert!(
+                d.iter().any(|m| m.message.contains("@no_os")),
+                "`{call}` is on the OS list but was not rejected — the check is vacuous \
+                 for it: {d:?}"
+            );
+        }
+    }
+
+    /// Threads are an OS service too. This is the case the first implementation missed:
+    /// it certified `core.par_binned_sum` — which spawns four workers — as freestanding.
+    #[test]
+    fn no_os_rejects_starting_a_thread() {
+        let spawned = escapes(
+            "fn sq(x: i64) -> i64 { return x * x } \
+             @no_os fn f() -> i32 { let h = spawn sq(3) let _v = await h return 0 }",
+        );
+        assert!(
+            spawned.iter().any(|m| m.message.contains("`spawn` starts a thread")),
+            "spawning under @no_os must be rejected: {spawned:?}"
+        );
+        let par = escapes(
+            "@no_os fn f(read xs: []i64) -> i64 { return par for x in xs reduce(core_add) { x } }",
+        );
+        assert!(
+            par.iter().any(|m| m.message.contains("`par for` loop starts threads")),
+            "a par for under @no_os must be rejected: {par:?}"
+        );
+    }
+
+    /// A `concurrent` scope that spawns nothing starts no thread, so it is not itself
+    /// the effect — and pinning that is what stops the rule from being restated on the
+    /// block later and double-reporting every `concurrent { spawn … }`.
+    #[test]
+    fn no_os_reports_the_spawn_not_the_concurrent_block() {
+        let d = escapes(
+            "fn sq(x: i64) -> i64 { return x * x } \
+             @no_os fn f() -> i32 { concurrent { let h = spawn sq(3) let _v = await h } return 0 }",
+        );
+        let hits = d.iter().filter(|m| m.message.contains("@no_os")).count();
+        assert_eq!(hits, 1, "exactly one diagnostic, at the spawn: {d:?}");
+    }
+
+    #[test]
+    fn no_os_accepts_a_pure_body() {
+        let d = escapes("@no_os fn f(a: i32, b: i32) -> i32 { let s = a + b return s }");
+        assert!(d.is_empty(), "pure computation must be accepted: {d:?}");
+    }
+
+    #[test]
+    fn no_os_rejects_an_os_call_one_hop_away() {
+        let d = escapes(
+            "fn helper(n: i32) { print_int(n as i64) } \
+             @no_os fn f(n: i32) -> i32 { helper(n) return 0 }",
+        );
+        assert!(d.iter().any(|m| m.message.contains("@no_os")), "{d:?}");
+        assert!(d[0].message.contains("`helper` calls the OS directly"), "{d:?}");
+    }
+
+    #[test]
+    fn no_os_names_the_chain_to_the_real_culprit() {
+        let d = escapes(
+            "fn deep(n: i32) { print_int(n as i64) } \
+             fn middle(n: i32) { deep(n) } \
+             fn outer(n: i32) { middle(n) } \
+             @no_os fn f(n: i32) -> i32 { outer(n) return 0 }",
+        );
+        assert!(!d.is_empty(), "must be rejected");
+        assert!(
+            d[0].message.contains("via `middle` → `deep`; `deep` calls the OS directly"),
+            "the chain must name the real culprit: {d:?}"
+        );
+    }
+
+    #[test]
+    fn no_os_terminates_on_recursive_call_graphs() {
+        // Mutual recursion must settle, not loop — the same totality property the
+        // allocation closure has.
+        let d = escapes(
+            "fn a(n: i32) -> i32 { if n > 0 { return b(n - 1) } return 0 } \
+             fn b(n: i32) -> i32 { return a(n) } \
+             @no_os fn f(n: i32) -> i32 { return a(n) }",
+        );
+        assert!(d.is_empty(), "an OS-free cycle must be accepted: {d:?}");
+    }
+
+    /// **The two contracts are orthogonal axes, and both directions matter.**
+    ///
+    /// `std/sha256` is the living case for the first half — it builds a `String` and
+    /// touches no OS — and if `@no_os` ever started refusing allocation, that module
+    /// would have to drop a true claim. The second half keeps `@no_alloc` from
+    /// acquiring an OS rule by osmosis.
+    #[test]
+    fn the_two_absence_contracts_do_not_leak_into_each_other() {
+        let allocating = escapes(
+            "@no_os fn f(n: i32) -> i32 { let p = alloc(i32, n) free_ptr(p) return 0 }",
+        );
+        assert!(allocating.is_empty(), "@no_os says nothing about allocation: {allocating:?}");
+
+        let printing = escapes("@no_alloc fn f(n: i32) -> i32 { print_int(n as i64) return n }");
+        assert!(printing.is_empty(), "@no_alloc says nothing about the OS: {printing:?}");
+    }
+
+    /// Both contracts on one function report both violations, in a fixed order — so a
+    /// function claiming both proofs and having both effects is told about both rather
+    /// than fixing one and rediscovering the other.
+    #[test]
+    fn a_call_breaking_both_contracts_reports_both_allocation_first() {
+        let d = escapes(
+            "fn bad(n: i32) -> *mut i32 { print_int(n as i64) return alloc(i32, n) } \
+             @no_alloc @no_os fn f(n: i32) -> i32 { let p = bad(n) free_ptr(p) return 0 }",
+        );
+        let contract: Vec<&str> = d
+            .iter()
+            .filter(|m| m.message.contains("forbidden in a"))
+            .map(|m| if m.message.contains("@no_alloc") { "alloc" } else { "os" })
+            .collect();
+        assert_eq!(contract, vec!["alloc", "os"], "both, allocation first: {d:?}");
+    }
+
+    /// `@no_os` is per-function, exactly as `@no_alloc` is: an unannotated neighbour
+    /// may print freely.
+    #[test]
+    fn no_os_is_per_function_not_inherited() {
+        let d = escapes(
+            "@no_os fn f(n: i32) -> i32 { return n } \
+             fn g(n: i32) { print_int(n as i64) }",
+        );
+        assert!(d.is_empty(), "{d:?}");
     }
 
     // --- the thesis in action: allowed uses ---

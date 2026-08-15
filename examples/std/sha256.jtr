@@ -19,16 +19,16 @@ const SHA_K: [64]i64 = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
 ]
 
-fn mask32(x: i64) -> i64 {
+@no_os fn mask32(x: i64) -> i64 {
     return x & 4294967295
 }
 
-fn rotr32(x: i64, n: i64) -> i64 {
+@no_os fn rotr32(x: i64, n: i64) -> i64 {
     return mask32((x >> n) | (x << (32 - n)))
 }
 
 // Byte `j` of the virtually-padded message (source, 0x80, zeros, 8-byte BE bit length).
-fn pad_byte(read data: str, j: usize, padded: usize) -> i64 {
+@no_os fn pad_byte(read data: str, j: usize, padded: usize) -> i64 {
     if j < data.len { return data[j] as i64 }
     if j == data.len { return 128 }
     if j >= padded - 8 {
@@ -39,7 +39,7 @@ fn pad_byte(read data: str, j: usize, padded: usize) -> i64 {
     return 0
 }
 
-fn push_hex8(mut sb: String, x: i64) {
+@no_os fn push_hex8(mut sb: String, x: i64) {
     let digits: str = "0123456789abcdef"
     var sh: i64 = 28
     for sh >= 0 {
@@ -50,7 +50,7 @@ fn push_hex8(mut sb: String, x: i64) {
 }
 
 // Append the lowercase-hex SHA-256 digest of `data` (64 ASCII chars) to `sb`.
-pub fn push_sha256_hex(mut sb: String, read data: str) {
+@no_os pub fn push_sha256_hex(mut sb: String, read data: str) {
     var h: [8]i64 = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
     let rem: usize = (data.len + 1) % 64
     var pad: usize = 0
