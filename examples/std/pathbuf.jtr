@@ -1,0 +1,198 @@
+// std/pathbuf.jtr — an OWNED, growable path.
+//
+// The counterpart to `std/path`, which is deliberately allocation-free: `path`
+// gives you VIEWS into text you already hold, and composition there writes into a
+// buffer the caller owns. That is the right default, and it is unusable when the
+// answer has to outlive the inputs — a path you build up over several steps, or
+// return, needs storage of its own. `PathBuf` is that storage.
+//
+// TIER: `std`. It allocates, so it is not `core`, and the lexical layer it sits on
+// stays exactly as it was — every query below DELEGATES to `std/path` rather than
+// reimplementing it, so there is one definition of "what is the extension" and the
+// owned type cannot drift from the borrowed one.
+//
+// Every function is `@no_os`: allocating and reaching the OS are separate axes
+// (docs/attributes.md), and this module only ever touches the heap.
+//
+// WHAT IT IS FOR, concretely: `String` in Jestyr is *manually* freed — the buffer
+// has a single owner responsible for calling `string_free`, and the compiler does
+// not do it for you. Wrapping it in a struct does not change that; a
+// `struct PathBuf { s: String }` with no `Drop` impl compiles, runs, and leaks,
+// which is measurable in the emitted C (zero `jestyr_rt_str_free` calls). So the
+// value here is NOT "a String with path methods" — it is **RAII on a String**. The
+// `Drop` impl below is the module's whole reason to exist; the path API is what
+// makes it worth having one.
+//
+// ALLOCATOR: `PathBuf` builds on `String`, the language's owned-text primitive, so
+// it does not take an `Allocator` the way `List(T)` does. That is a deliberate
+// simplification and the one place this module bends the `mem`-tier rule ("if it
+// allocates, the allocation is visible in the signature") — here the allocation is
+// visible in the *type* instead: a `PathBuf` is a droppable owned value, and the
+// only way to get one is a constructor. If the tier rule ever tightens, the upgrade
+// is a `PathBuf` over `List(u8)` with a stored allocator, and this API survives it
+// unchanged because nothing below exposes the storage.
+//
+// SEPARATORS follow `std/path` exactly: `/` and `\` are both accepted when parsing,
+// `/` is the only one ever written, so composed output is byte-identical across
+// platforms.
+//
+// Run the tests:  jestyrc test examples/std/pathbuf_test.jtr
+
+import "path"
+import "mem"
+
+// An owned, growable path. The field is deliberately not `pub`-facing in spirit:
+// reach for `view` rather than `b.s`, so the storage can change later.
+pub struct PathBuf {
+    s: String,
+}
+
+// RAII. This is the difference between `PathBuf` and a bare `String`: the buffer is
+// released at scope exit, with no `free` call for a caller to forget. `free` below
+// is kept for explicit early teardown and is idempotent, so calling it *and*
+// letting Drop run is safe — exactly one release, as in `std/list`.
+impl Drop for PathBuf {
+    fn drop(mut self) {
+        string_free(self.s)
+    }
+}
+
+// ----------------------------------------------------------------- construction
+
+// An empty path.
+@no_os pub fn new() -> PathBuf {
+    let sb: String = string_new()
+    return PathBuf{ s: sb }
+}
+
+// A path owning a copy of `p`.
+@no_os pub fn from(read p: str) -> PathBuf {
+    var sb: String = string_new()
+    string_push(sb, p)
+    return PathBuf{ s: sb }
+}
+
+// Release the buffer early. Idempotent (`string_free` nulls the pointer), so this
+// composes with the automatic drop rather than racing it.
+@no_os pub fn free(mut b: PathBuf) {
+    string_free(b.s)
+}
+
+// ------------------------------------------------------------------- inspection
+
+// The current path as a view. Valid only while `b` is — and while `b` is not
+// pushed to, since a push may move the buffer.
+@no_os pub fn view(read b: PathBuf) -> read str {
+    return string_view(b.s)
+}
+
+@no_os pub fn len(read b: PathBuf) -> usize {
+    let v: str = string_view(b.s)
+    return v.len
+}
+
+@no_os pub fn is_empty(read b: PathBuf) -> bool {
+    let v: str = string_view(b.s)
+    return v.len == 0
+}
+
+// --------------------------------------------------------------------- mutation
+
+// Replace the contents with `v`.
+//
+// The fresh buffer is filled BEFORE the old one is freed, which is what makes this
+// safe when `v` is a view into `b`'s own storage — and it always is for `pop` and
+// `set_ext` below, which is the whole reason this is one shared helper rather than
+// three open-coded rewrites.
+@no_os pub fn set(mut b: PathBuf, read v: str) {
+    var fresh: String = string_new()
+    string_push(fresh, v)
+    string_free(b.s)
+    b.s = fresh
+}
+
+// Drop every byte.
+@no_os pub fn clear(mut b: PathBuf) {
+    set(b, "")
+}
+
+// Append one segment, with `path.join`'s rules: an ABSOLUTE `seg` replaces the
+// whole path, an empty `seg` contributes nothing, and exactly one `/` lands between
+// the two — so `push` on "a/" and on "a" both give "a/b".
+//
+// Unlike `path.join` this needs no caller buffer, which is the point: growth is the
+// operation `path` cannot offer and this type exists for.
+@no_os pub fn push(mut b: PathBuf, read seg: str) {
+    if seg.len == 0 { return }
+    if path.is_abs(seg) {
+        set(b, seg)
+        return
+    }
+    let cur: str = string_view(b.s)
+    let n: usize = cur.len
+    var need_sep: bool = n > 0
+    if n > 0 {
+        if path.is_sep(cur[n - 1] as i32) { need_sep = false }
+    }
+    // `cur` must not be read past this point: a push may reallocate the buffer.
+    if need_sep { string_push(b.s, "/") }
+    string_push(b.s, seg)
+}
+
+// Remove the last segment, as `path.dir` defines it. `false` (and no change) when
+// there was nothing to remove.
+//   "/usr/local/bin" -> "/usr/local"      "/a" -> "/"      "a" -> ""
+@no_os pub fn pop(mut b: PathBuf) -> bool {
+    let v: str = string_view(b.s)
+    if v.len == 0 { return false }
+    let up: str = path.dir(v)
+    set(b, up)
+    return true
+}
+
+// Replace the extension, keeping the directory prefix and the stem. An empty `e`
+// removes the extension. A path with no extension GAINS one.
+//   set_ext("src/main.jtr", "c") -> "src/main.c"
+//   set_ext("README", "md")      -> "README.md"
+//   set_ext("a/b.tar.gz", "")    -> "a/b.tar"
+@no_os pub fn set_ext(mut b: PathBuf, read e: str) {
+    let v: str = string_view(b.s)
+    let d: usize = path.dir_len(v)
+    let st: str = path.stem(v)
+    var fresh: String = string_new()
+    string_push(fresh, v[0 .. d])
+    string_push(fresh, st)
+    if e.len > 0 {
+        string_push(fresh, ".")
+        string_push(fresh, e)
+    }
+    string_free(b.s)
+    b.s = fresh
+}
+
+// ---------------------------------------------------------------------- queries
+//
+// Every one of these is `std/path` applied to the current view. They exist so a
+// caller holding a `PathBuf` does not have to spell `path.base(pathbuf.view(b))`,
+// and they deliberately add no semantics of their own — if `path.ext` changes, so
+// does this, because there is only one implementation.
+
+@no_os pub fn base(read b: PathBuf) -> read str {
+    return path.base(string_view(b.s))
+}
+
+@no_os pub fn dir(read b: PathBuf) -> read str {
+    return path.dir(string_view(b.s))
+}
+
+@no_os pub fn ext(read b: PathBuf) -> read str {
+    return path.ext(string_view(b.s))
+}
+
+@no_os pub fn stem(read b: PathBuf) -> read str {
+    return path.stem(string_view(b.s))
+}
+
+@no_os pub fn is_abs(read b: PathBuf) -> bool {
+    return path.is_abs(string_view(b.s))
+}

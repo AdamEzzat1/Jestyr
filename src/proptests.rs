@@ -1753,6 +1753,136 @@ mod no_os_props {
     }
 }
 
+/// **`std/pathbuf` — the owned, growable path (Tier 2 area 2, the unblocked half).**
+///
+/// The module exists for one reason, and it is not the path API: a Jestyr `String` is
+/// *manually* freed, so `struct PathBuf { s: String }` with no `Drop` impl compiles,
+/// runs, produces correct answers, and leaks. `PathBuf` is RAII on a `String`; the path
+/// methods are what make it worth having one.
+///
+/// That claim is about **emitted C**, so it is checked against emitted C.
+mod pathbuf_props {
+    use super::*;
+
+    fn diags_of(rel: &str) -> Vec<String> {
+        let prog = crate::module::load(rel);
+        let mut diags: Vec<String> = prog.diags.iter().map(|d| d.message.clone()).collect();
+        let (info, td) = typeck::check_program(&prog.ast, &prog.modules);
+        diags.extend(td.iter().map(|d| d.message.clone()));
+        diags.extend(escape::check(&prog.ast, &info).iter().map(|d| d.message.clone()));
+        let (_c, cd) = cgen::emit(&prog.ast, &info);
+        diags.extend(cd.iter().map(|d| d.message.clone()));
+        diags
+    }
+
+    #[test]
+    fn pathbuf_compiles_clean() {
+        for f in ["pathbuf.jtr", "pathbuf_test.jtr"] {
+            let d = diags_of(&format!("examples/std/{f}"));
+            assert!(d.is_empty(), "examples/std/{f}: {d:?}");
+        }
+    }
+
+    /// **The finding the module is built on, pinned as a matched pair.**
+    ///
+    /// A struct owning a `String` does *not* free it — B1's field auto-drop recurses
+    /// into fields that are themselves droppable, and `String` is a primitive with a
+    /// manual `string_free`, not a `Drop` type. So the `Drop` impl is load-bearing, and
+    /// the difference is visible in the C.
+    ///
+    /// **Counted CALL SITES, not substrings** — and that distinction is the whole test.
+    /// The runtime prelude *defines* `jestyr_rt_str_free` in every program that mentions
+    /// a `String`, so `c.contains("jestyr_rt_str_free")` is true of the leaking version
+    /// too. The first draft of this test asserted exactly that and passed the buggy
+    /// program; it is the same trap as the `memcpy` absence that already misled this
+    /// project once (Tier 2 handoff §5), met a second time in the same shape.
+    fn str_free_call_sites(c: &str) -> usize {
+        c.lines()
+            .filter(|l| {
+                l.contains("jestyr_rt_str_free(") && !l.trim_start().starts_with("static void")
+            })
+            .count()
+    }
+
+    #[test]
+    fn pathbuf_frees_its_buffer_and_the_impl_is_what_does_it() {
+        // The real module, through the real loader.
+        let prog = crate::module::load("examples/std/pathbuf.jtr");
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, _td) = typeck::check_program(&prog.ast, &prog.modules);
+        let (c, _cd) = cgen::emit(&prog.ast, &info);
+        assert!(
+            c.contains("jestyr_impl_Drop__PathBuf__drop"),
+            "std/pathbuf must emit a Drop impl — without it the type leaks and has no \
+             reason to exist"
+        );
+        assert!(
+            str_free_call_sites(&c) > 0,
+            "the Drop impl must actually CALL the release, not merely have the runtime \
+             helper available"
+        );
+
+        // The twin: the same struct, the same use, no `Drop` impl. This is the version
+        // the Tier 2 handoff proposed ("String is owned … so it frees itself"), and it
+        // emits not one free.
+        let leaky = "struct PathBuf { s: String }\n\
+             fn from(read p: str) -> PathBuf { var sb: String = string_new()\n \
+                 string_push(sb, p)\n return PathBuf{ s: sb } }\n\
+             fn main() -> i32 { var b: PathBuf = from(\"/usr\")\n \
+                 print_str(string_view(b.s))\n return 0 }\n";
+        let (tokens, lex) = Lexer::new(leaky).tokenize();
+        assert!(lex.is_empty(), "{lex:?}");
+        let (ast, _pd) = Parser::new(leaky, tokens).parse();
+        let (linfo, ltd) = typeck::check(&ast);
+        assert!(ltd.is_empty(), "the leaky twin must still COMPILE — that is the trap: {ltd:?}");
+        let (lc, _lcd) = cgen::emit(&ast, &linfo);
+        assert_eq!(
+            str_free_call_sites(&lc),
+            0,
+            "a String field with no Drop impl must emit no free CALL — the buffer leaks. \
+             If this now fails the compiler learned to drop primitives, and std/pathbuf's \
+             rationale (and its header) should be revisited rather than left claiming \
+             something untrue"
+        );
+    }
+
+    /// `pathbuf` allocates, so it is `std` rather than `core` — but it never reaches the
+    /// OS, and says so. The other live example of the two axes being independent
+    /// (`std/sha256` is the first).
+    #[test]
+    fn pathbuf_is_os_free_even_though_it_allocates() {
+        use crate::ast::Item;
+        let prog = crate::module::load("examples/std/pathbuf.jtr");
+        let (info, _td) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(escape::check(&prog.ast, &info).is_empty(), "the @no_os claim must hold");
+
+        // …and it is claimed on every function, not just the easy ones. The loader
+        // also brings in `path` and `mem`, so items are filtered to this module —
+        // otherwise `mem`'s allocator functions would fail a claim they never made.
+        let me = prog
+            .modules
+            .names
+            .iter()
+            .position(|n| n == "pathbuf")
+            .expect("the loaded program must contain the pathbuf module");
+        let mut checked = 0;
+        for (i, item) in prog.ast.items.iter().enumerate() {
+            let Item::Fn(f) = item else { continue };
+            if prog.modules.item_mod[i] != me {
+                continue;
+            }
+            assert!(
+                f.has_attr("no_os"),
+                "std/pathbuf: `{}` has no `@no_os`; the module header claims every \
+                 function has it",
+                f.name.name
+            );
+            checked += 1;
+        }
+        assert!(checked >= 15, "expected the whole module's surface, saw {checked} functions");
+    }
+}
+
 /// **The `core` tier's freestanding claim, pinned at the library.**
 ///
 /// [`no_os_props`] proves the *checker* is right; this proves the *library* actually
@@ -13928,7 +14058,7 @@ fn main() -> i32 {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "drop_take.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr", "test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr", "caps_demo.jtr", "fs_test.jtr", "env_test.jtr", "time_test.jtr", "str.jtr", "str_test.jtr", "str_demo.jtr", "sink.jtr", "cursor.jtr", "writer.jtr", "sink_test.jtr", "cursor_test.jtr", "writer_test.jtr", "writer_demo.jtr"];
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "drop_take.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr", "test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr", "caps_demo.jtr", "fs_test.jtr", "env_test.jtr", "time_test.jtr", "str.jtr", "str_test.jtr", "str_demo.jtr", "sink.jtr", "cursor.jtr", "writer.jtr", "sink_test.jtr", "cursor_test.jtr", "writer_test.jtr", "writer_demo.jtr", "pathbuf.jtr", "pathbuf_test.jtr"];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
     /// target). This is the acceptance bar the R2 fixpoint ultimately rests on. `DUMP_DIVERGE=1`

@@ -1,0 +1,221 @@
+// std/pathbuf_test.jtr — the unit suite for `std/pathbuf`.
+//
+// A sibling file, not colocated, for the reason `path_test.jtr` documents at
+// length: a `@test` function is emitted into every consumer of its module.
+//
+// The suite that matters most is the LAST one. Every query on `PathBuf` delegates
+// to `std/path`, and the module's header claims the owned type therefore "cannot
+// drift from the borrowed one". That is only true while something checks it, so
+// the last test runs both APIs over the same inputs and compares them — if a
+// future `pathbuf.ext` grows a clever special case, that is where it fails.
+//
+// Run:  jestyrc test examples/std/pathbuf_test.jtr
+
+import "path"
+import "pathbuf"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 512
+
+// ------------------------------------------------------------- construct / read
+
+@test fn from_and_view_round_trip() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var b: pathbuf.PathBuf = pathbuf.from("examples/std/core.jtr")
+    test.eq_str(c, rep, "view(from)", pathbuf.view(b), "examples/std/core.jtr")
+    test.eq_usize(c, rep, "len", pathbuf.len(b), 21)
+    test.is_false(c, rep, "is_empty(non-empty)", pathbuf.is_empty(b))
+
+    var e: pathbuf.PathBuf = pathbuf.new()
+    test.eq_str(c, rep, "view(new)", pathbuf.view(e), "")
+    test.is_true(c, rep, "is_empty(new)", pathbuf.is_empty(e))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ------------------------------------------------------------------------- push
+
+@test fn push_follows_join_semantics() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // The ordinary case, and the one that proves growth works: three pushes past
+    // the initial allocation, read back whole.
+    var b: pathbuf.PathBuf = pathbuf.from("/usr")
+    pathbuf.push(b, "local")
+    pathbuf.push(b, "share")
+    pathbuf.push(b, "doc")
+    test.eq_str(c, rep, "push(x3)", pathbuf.view(b), "/usr/local/share/doc")
+
+    // Exactly one separator lands, whether or not the left side already ends in one.
+    var t: pathbuf.PathBuf = pathbuf.from("a/")
+    pathbuf.push(t, "b")
+    test.eq_str(c, rep, "push(trailing-sep)", pathbuf.view(t), "a/b")
+
+    var n: pathbuf.PathBuf = pathbuf.from("a")
+    pathbuf.push(n, "b")
+    test.eq_str(c, rep, "push(no-sep)", pathbuf.view(n), "a/b")
+
+    // Pushing onto an empty path must not invent a leading separator.
+    var z: pathbuf.PathBuf = pathbuf.new()
+    pathbuf.push(z, "rel")
+    test.eq_str(c, rep, "push(onto-empty)", pathbuf.view(z), "rel")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn push_absolute_replaces_and_empty_is_a_noop() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // `path.join`'s rule: an absolute right-hand side wins outright.
+    var b: pathbuf.PathBuf = pathbuf.from("/usr/local")
+    pathbuf.push(b, "/etc")
+    test.eq_str(c, rep, "push(absolute)", pathbuf.view(b), "/etc")
+
+    // …and an empty segment changes nothing at all — not even a separator, which
+    // is the mistake the `seg.len == 0` guard exists to prevent.
+    var k: pathbuf.PathBuf = pathbuf.from("a/b")
+    pathbuf.push(k, "")
+    test.eq_str(c, rep, "push(empty)", pathbuf.view(k), "a/b")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// -------------------------------------------------------------------------- pop
+
+@test fn pop_removes_one_segment() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var b: pathbuf.PathBuf = pathbuf.from("/usr/local/bin")
+    test.is_true(c, rep, "pop(deep)", pathbuf.pop(b))
+    test.eq_str(c, rep, "pop(deep)=", pathbuf.view(b), "/usr/local")
+    test.is_true(c, rep, "pop(again)", pathbuf.pop(b))
+    test.eq_str(c, rep, "pop(again)=", pathbuf.view(b), "/usr")
+
+    // The root is where it stops being interesting: "/a" -> "/", and "/" -> "/".
+    var r: pathbuf.PathBuf = pathbuf.from("/a")
+    pathbuf.pop(r)
+    test.eq_str(c, rep, "pop(/a)", pathbuf.view(r), "/")
+
+    // A bare name pops to empty…
+    var n: pathbuf.PathBuf = pathbuf.from("bare")
+    test.is_true(c, rep, "pop(bare)", pathbuf.pop(n))
+    test.eq_str(c, rep, "pop(bare)=", pathbuf.view(n), "")
+    // …and popping an empty path reports that it did nothing.
+    test.is_false(c, rep, "pop(empty)", pathbuf.pop(n))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---------------------------------------------------------------------- set_ext
+
+@test fn set_ext_replaces_adds_and_removes() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // The compiler's own use case: a source name to its object name.
+    var b: pathbuf.PathBuf = pathbuf.from("src/main.jtr")
+    pathbuf.set_ext(b, "c")
+    test.eq_str(c, rep, "set_ext(replace)", pathbuf.view(b), "src/main.c")
+
+    // A path with no extension gains one.
+    var n: pathbuf.PathBuf = pathbuf.from("README")
+    pathbuf.set_ext(n, "md")
+    test.eq_str(c, rep, "set_ext(add)", pathbuf.view(n), "README.md")
+
+    // Only the LAST extension is replaced — `stem("a/b.tar.gz")` is "b.tar".
+    var d: pathbuf.PathBuf = pathbuf.from("a/b.tar.gz")
+    pathbuf.set_ext(d, "")
+    test.eq_str(c, rep, "set_ext(remove)", pathbuf.view(d), "a/b.tar")
+
+    // A dotfile is a name, not an extension, so it must not be truncated to "".
+    var h: pathbuf.PathBuf = pathbuf.from(".bashrc")
+    pathbuf.set_ext(h, "bak")
+    test.eq_str(c, rep, "set_ext(dotfile)", pathbuf.view(h), ".bashrc.bak")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ------------------------------------------------------------------ set / clear
+
+@test fn set_survives_aliasing_its_own_storage() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // THE case `set` is written the way it is for: the new value is a view INTO
+    // the buffer being replaced. Freeing first would read freed memory; this
+    // passes only because `set` fills the fresh buffer before releasing the old.
+    var b: pathbuf.PathBuf = pathbuf.from("/usr/local/bin")
+    pathbuf.set(b, path.dir(pathbuf.view(b)))
+    test.eq_str(c, rep, "set(self-view)", pathbuf.view(b), "/usr/local")
+
+    pathbuf.clear(b)
+    test.eq_str(c, rep, "clear", pathbuf.view(b), "")
+    test.is_true(c, rep, "clear->is_empty", pathbuf.is_empty(b))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---------------------------------------------------------- delegation is total
+//
+// The header claims every query is `std/path` applied to the view, so the two can
+// never disagree. This is that claim, checked. It is the test most likely to earn
+// its keep later: it fails the moment someone "improves" one of the five wrappers.
+
+@test fn queries_agree_with_std_path() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var b: pathbuf.PathBuf = pathbuf.from("examples/std/core.jtr")
+    let v: str = pathbuf.view(b)
+    test.eq_str(c, rep, "base==", pathbuf.base(b), path.base(v))
+    test.eq_str(c, rep, "dir==", pathbuf.dir(b), path.dir(v))
+    test.eq_str(c, rep, "ext==", pathbuf.ext(b), path.ext(v))
+    test.eq_str(c, rep, "stem==", pathbuf.stem(b), path.stem(v))
+    test.eq_bool(c, rep, "is_abs==", pathbuf.is_abs(b), path.is_abs(v))
+
+    // A second shape, so the agreement is not an accident of one input: absolute,
+    // no extension, and a root-adjacent directory.
+    var r: pathbuf.PathBuf = pathbuf.from("/README")
+    let w: str = pathbuf.view(r)
+    test.eq_str(c, rep, "base==(abs)", pathbuf.base(r), path.base(w))
+    test.eq_str(c, rep, "dir==(abs)", pathbuf.dir(r), path.dir(w))
+    test.eq_str(c, rep, "ext==(abs)", pathbuf.ext(r), path.ext(w))
+    test.eq_str(c, rep, "stem==(abs)", pathbuf.stem(r), path.stem(w))
+    test.eq_bool(c, rep, "is_abs==(abs)", pathbuf.is_abs(r), path.is_abs(w))
+
+    // …and the values themselves, so this suite is not purely relative — two
+    // wrappers that were both broken the same way would still pass the above.
+    test.eq_str(c, rep, "base(literal)", pathbuf.base(b), "core.jtr")
+    test.eq_str(c, rep, "ext(literal)", pathbuf.ext(b), "jtr")
+    test.eq_str(c, rep, "stem(literal)", pathbuf.stem(b), "core")
+    test.is_true(c, rep, "is_abs(literal)", pathbuf.is_abs(r))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

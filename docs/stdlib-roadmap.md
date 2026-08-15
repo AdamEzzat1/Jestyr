@@ -118,7 +118,16 @@ Present: `fs.jtr` (read/write/exists/remove **+ the `Fs` capability**), `env.jtr
 `process.jtr` (`Process`), `io.jtr` (four print wrappers), `writer.jtr` (the `Writer`
 trait over stdout/stderr/a buffer), `test_report.jtr` (printing a `Check` report),
 `test_fixture.jtr` (temp paths and captured command output, for expected-diagnostic
-tests).
+tests), `pathbuf.jtr` (`PathBuf` — the owned, growable path).
+
+`pathbuf.jtr` is the owned counterpart to `core`'s borrowed `path`, and it is worth
+reading for *why* it exists rather than what it does. A Jestyr `String` is **manually**
+freed, and B1's field auto-drop recurses only into fields that are themselves droppable
+— a primitive is not — so `struct PathBuf { s: String }` with no `Drop` impl compiles,
+runs, returns correct answers, and leaks. `PathBuf` is therefore **RAII on a `String`**;
+the path API is what makes it worth having one. Every query delegates to `std/path`
+rather than reimplementing it, and `queries_agree_with_std_path` checks that the owned
+type has not drifted from the borrowed one.
 
 `fs` and `env` are no longer 35 and 45 lines — the capability handles roughly
 tripled both. This tier is still where most of the remaining work lives; the biggest

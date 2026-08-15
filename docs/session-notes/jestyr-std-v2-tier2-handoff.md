@@ -11,7 +11,7 @@ Baseline before you change anything, so a later failure is yours:
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1187 passed, 0 failed, 3 ignored** (~250 s). The 3 ignored are deliberate slow numeric
+**1190 passed, 0 failed, 3 ignored** (~250 s). The 3 ignored are deliberate slow numeric
 sweeps (`dragon_matches_std_thorough`, `slow_parse_matches_std_thorough`,
 `dump_pow10_table`), not breakage.
 
@@ -54,17 +54,7 @@ caches hashes so a grow re-places without rehashing), generic in the key, hash f
 canaried. Give it a real consumer on day one — `strmap`'s users, or the compiler's symbol
 table. Every slice on this branch that went well had one.
 
-### §1.2 — `PathBuf` (Tier 2 area 2, the half that is not blocked)
-
-`struct PathBuf { s: String }` compiles today. `String` is owned so there is no
-second-class-borrow problem, and RAII already recurses into owned struct fields (B1 field
-auto-drop), so it frees itself. An owned, growable path is genuinely useful and does **not**
-wait on the `distinct` question in §1.5.
-
-Keep `std/path`'s lexical layer exactly as it is — `@no_alloc`-proven, view+buffer based.
-The typed layer sits *above* it, never replaces it.
-
-### §1.3 — A partial-read intrinsic. The thing that unblocks a streaming `Reader`
+### §1.2 — A partial-read intrinsic. The thing that unblocks a streaming `Reader`
 
 `std/cursor` is the whole reader that can honestly exist today, because the intrinsics only
 offer `read_file`/`try_read_file`, which slurp. There is no partial read, no file handle, no
@@ -77,7 +67,7 @@ surface than the one-call intrinsics added so far (`env_var`, `mono_nanos`), bec
 introduces a *resource with a lifetime* — which is a `Drop`/RAII question as much as an
 intrinsic one.
 
-### §1.4 — Three compiler follow-ups, each independent
+### §1.3 — Three compiler follow-ups, each independent
 
 **1. Normalize `run_command`'s exit status.** The runtime helper is
 `return (int32_t)system(cp)` — raw. Windows gives the exit code; POSIX specifies a wait
@@ -101,7 +91,7 @@ helper gating, forward declarations and generic-instance collection all scan `@t
 and it moves the non-test golden for the corpus files carrying `@test` items. Mirror +
 reseed.
 
-### §1.5 — Typed `Path` (Tier 2 area 2, the blocked half)
+### §1.4 — Typed `Path` (Tier 2 area 2, the blocked half)
 
 **Do not build this on `distinct` yet.** Probed: `distinct Path = str` compiles, and then
 passing a bare `str` where a `Path` is wanted is **accepted** — as is passing an `AccountId`
@@ -109,7 +99,7 @@ where a `UserId` is wanted. `distinct` today gives a *name* with **no check**, w
 than nothing because it reads as safety.
 
 Enforcement has to come from assignability, which means resolving the open int→int question
-first (§1.4.2 — they are the same rule). Until then a typed `Path` ships an API whose central
+first (§1.3.2 — they are the same rule). Until then a typed `Path` ships an API whose central
 claim is unenforced.
 
 The language is *ahead* of the library here: `os_str` is already a real distinct primitive
@@ -125,12 +115,12 @@ the reason stops holding, the item becomes live.
 
 | Deferred | Why, precisely | Becomes live when |
 |---|---|---|
-| **Streaming `Reader`** | No partial-read intrinsic, no file handle. Wrapping `read_file`'s slurp in a `Reader` trait ships an API whose central promise — that it streams — is false, and gets rebuilt immediately | §1.3 lands |
+| **Streaming `Reader`** | No partial-read intrinsic, no file handle. Wrapping `read_file`'s slurp in a `Reader` trait ships an API whose central promise — that it streams — is false, and gets rebuilt immediately | §1.2 lands |
 | **`BufWriter`** | A handle cannot own borrowed storage, so it needs an `Allocator` → `mem` tier, not `core`. And the one destination that would benefit is stdout, which **already buffers in C stdio** — wrapping it is double buffering with a second copy | A real case appears (socket, compressor) |
 | **Error sets on writes** | Fifty `?`s down a formatter is how errors get swallowed, not handled. The one genuinely fallible operation is a final `flush`, and that is where an error set belongs — one fallible call, not N | A fallible write intrinsic exists |
 | **`failed()` on `Writer`** | Removed, not shipped: `print_str`/`eprint_str` return nothing so a stream write has no detectable failure, and sink overflow is deliberately the *sink's* business. It could only ever answer `false`, and a query that always says "fine" invites a caller to believe it checked something | Same as above |
 | **`sys` tier** | Genuinely blocked on `extern "c"` (design §14, 📐). Until then it is a wrapper around a wrapper — today the platform boundary *is* the closed intrinsic list | `extern "c"` lands |
-| **Typed `Path` on `distinct`** | `distinct` is not enforced at argument positions (§1.5) | The int→int assignability decision is settled |
+| **Typed `Path` on `distinct`** | `distinct` is not enforced at argument positions (§1.4) | The int→int assignability decision is settled |
 | **A generic collections zoo** | A breadth objection, not an existence objection. One container with a real consumer is a slice | Never as a zoo; one at a time (§1.1) |
 | **A package manager** | `ROADMAP.md` calls it ecosystem-premature, and the module-manifest hash DAG covers the real need (a lockfile-lite pinning the build graph) | Deliberately open-ended |
 | **Networking / HTTP / TLS** | No async story (📐), no `extern "c"`, and the moment a socket lands the platform boundary stops being optional | After `sys` |
@@ -150,12 +140,39 @@ predate this work.
 | Tier 2 area | State |
 |---|---|
 | 1. Capability handles | ✅ **all four** — `process.Process`, `fs.Fs`, `time.Clock`, `env.Env` |
-| 3. Reader / Writer | ✅ **Writer complete** (`sink` core + `writer` std); **Reader is memory-only** (`cursor`) — streaming is §1.3, not a gap in the design |
+| 3. Reader / Writer | ✅ **Writer complete** (`sink` core + `writer` std); **Reader is memory-only** (`cursor`) — streaming is §1.2, not a gap in the design |
 | 5. Testing / golden | ✅ `std/test` (core) + `test_report` (prints) + `test_fixture` (fetches) |
 | 7. Package / build | ✅ *as scoped* — `build.jestyr` (CTFE, effect-free by construction) + module-manifest hash DAG |
 | 6. No-std contract | ✅ **both axes checked** — `@no_alloc` *and* `@no_os` (below) |
-| 2. Typed path / OsStr | 🟡 `os_str` is a real primitive; `PathBuf` is §1.2, typed `Path` is §1.5 |
+| 2. Typed path / OsStr | 🟡 `os_str` is a real primitive; **`PathBuf` is BUILT** (below); typed `Path` is §1.4 |
 | 4. Collections v2 | 🔴 §1.1 |
+
+### `std/pathbuf` — the owned, growable path (Tier 2 area 2, the unblocked half)
+
+**The handoff that proposed this was wrong about why it was cheap, and the correction is
+the module's whole point.** It said `String` is owned so B1's field auto-drop "frees it".
+It does not: B1 recurses into fields that are themselves *droppable*, and `String` is a
+primitive with a manual `string_free`. `struct PathBuf { s: String }` with no `Drop` impl
+compiles, runs, gives right answers, and **leaks** — measured as zero
+`jestyr_rt_str_free` CALL SITES in the emitted C. So `PathBuf` is RAII on a `String`; the
+path API is what makes it worth having one.
+
+Sixteen functions, every one `@no_os` (it allocates and never syscalls — the second live
+example of the two axes being independent, after `sha256`). Every query DELEGATES to
+`std/path`, and `queries_agree_with_std_path` runs both APIs over the same inputs so the
+owned type cannot drift from the borrowed one. `set` fills the fresh buffer *before*
+freeing the old, which is what makes `pop`/`set_ext` safe when the new value is a view
+into the buffer being replaced — pinned by `set_survives_aliasing_its_own_storage`.
+
+New module, imported by nothing in the closure → **no mirror, no reseed**. Added to
+`CGEN_GOLDEN_ALLOWLIST`; byte-identical against the self-hosted backend first try.
+
+**One trap worth carrying forward, because it is the second time:** asserting
+`c.contains("jestyr_rt_str_free")` to prove the buffer is freed **passes for the leaking
+version too**, because the runtime prelude *defines* that helper in every program that
+mentions a `String`. Count CALL SITES, not substrings. This is the same shape as the
+`memcpy` absence already recorded in §5 — the lesson generalises past `memcpy` to any
+runtime helper.
 
 ### `@no_os` — the freestanding contract, checked (closed Tier 2 area 6)
 
@@ -253,7 +270,7 @@ verifying a file.**
   in a sibling `path_test.jtr`. A `core` module's own test scaffolding silently breaks its
   tier claim. **Convention: a module with non-test consumers puts tests in a sibling
   `*_test.jtr`;** a module only ever imported *by* tests (`std/test`) may colocate. Proper
-  fix is §1.4.3.
+  fix is §1.3.3.
 * **`@no_alloc` passes VACUOUSLY through a trait method.** It accepts a `@no_alloc` function
   writing through a trait whose impl allocates on every call, while correctly rejecting the
   direct-call control. Not a weak proof — a *false* one. This is why the `Writer` trait is
@@ -328,13 +345,12 @@ verifying a file.**
 
 ## §6. Suggested order
 
-1. **`PathBuf` (§1.2)** — cheap, independent, useful.
-2. **`HashMap(K,V)` (§1.1)** — the only untouched area. Settle the hash function *first*,
+1. **`HashMap(K,V)` (§1.1)** — the only untouched area. Settle the hash function *first*,
    verify the trait bound composes on a generic struct's parameter, then build one container
    with a real consumer.
-3. **The assignability hole + int→int decision (§1.4.2)** — settle them together; it also
-   unblocks §1.5.
-4. **The partial-read intrinsic (§1.3)** — the largest, and the only route to a real
+2. **The assignability hole + int→int decision (§1.3.2)** — settle them together; it also
+   unblocks §1.4.
+3. **The partial-read intrinsic (§1.2)** — the largest, and the only route to a real
    streaming `Reader`.
 
 Leave `sys` and typed `Path`-on-`distinct` alone until their blockers actually move. Both
