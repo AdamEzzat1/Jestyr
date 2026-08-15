@@ -20492,6 +20492,18 @@ void jestyr_emit_expr(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrStr 
                     return;
                 }
             }
+            if ((j_rhs.j_kind == 5))
+            {
+                size_t j_qs = (size_t)(j_rhs.j_x);
+                size_t j_qe = (size_t)(j_rhs.j_y);
+                if ((jestyr_find_fn_item(j_p, j_src, jestyr_rt_substr(j_src, j_qs, j_qe)) >= 0))
+                {
+                    jestyr_rt_str_push(&(*j_sb), JSTR("(&jestyr_"));
+                    jestyr_rt_str_push(&(*j_sb), jestyr_rt_substr(j_src, j_qs, j_qe));
+                    jestyr_rt_str_push(&(*j_sb), JSTR(")"));
+                    return;
+                }
+            }
         }
         jestyr_rt_str_push(&(*j_sb), JSTR("("));
         if ((j_e.j_op == 1))

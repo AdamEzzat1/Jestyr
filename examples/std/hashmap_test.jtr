@@ -1,0 +1,239 @@
+// std/hashmap_test.jtr — the unit suite for `std/hashmap`.
+//
+// A sibling file, not colocated: a `@test` is emitted into every consumer of its
+// module (see `path_test.jtr` for the measurement).
+//
+// Two suites carry most of the weight:
+//
+//   * `collisions_still_find_every_key` injects a hash that returns a CONSTANT, so
+//     every key lands in one bucket and the probe chain is the whole table. It is
+//     the only test that exercises wraparound and long chains, and it is possible
+//     at all because hashing is a stored function pointer rather than a trait —
+//     a design consequence worth having a test for.
+//   * `a_struct_key_works` instantiates the map at a second key type, which is the
+//     difference between "a generic map" and "an i64 map with type parameters".
+//
+// Run:  jestyrc test examples/std/hashmap_test.jtr
+
+import "hashmap"
+import "mem"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 512
+
+// --- a second key type, to prove the map is really generic in K ----------------
+
+@copy struct Point { x: i64, y: i64 }
+
+fn hash_point(p: Point) -> u64 {
+    // Combine, then avalanche with the module's own finalizer — the shape the
+    // header recommends for a custom key.
+    return hashmap.mix64((p.x * 0x9e3779b97f4a7c15) ^ p.y)
+}
+
+fn eq_point(a: Point, b: Point) -> bool {
+    if a.x != b.x { return false }
+    return a.y == b.y
+}
+
+// --- a deliberately terrible hash, for the collision suite ---------------------
+
+fn hash_awful(k: i64) -> u64 {
+    return 7
+}
+
+// ------------------------------------------------------------------------ basics
+
+@test fn put_get_and_has() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var m: hashmap.HashMap(i64, i64) = hashmap.make(i64, i64, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    test.is_true(c, rep, "empty", hashmap.is_empty(i64, i64, m))
+    test.eq_usize(c, rep, "len(empty)", hashmap.len(i64, i64, m), 0)
+    test.is_false(c, rep, "has(absent, empty map)", hashmap.has(i64, i64, m, 1))
+    test.eq_i64(c, rep, "get(absent, empty map)", hashmap.get(i64, i64, m, 1, 0 - 1), 0 - 1)
+
+    hashmap.put(i64, i64, m, 10, 100)
+    hashmap.put(i64, i64, m, 20, 200)
+    hashmap.put(i64, i64, m, 30, 300)
+
+    test.eq_usize(c, rep, "len(3)", hashmap.len(i64, i64, m), 3)
+    test.eq_i64(c, rep, "get(10)", hashmap.get(i64, i64, m, 10, 0 - 1), 100)
+    test.eq_i64(c, rep, "get(20)", hashmap.get(i64, i64, m, 20, 0 - 1), 200)
+    test.eq_i64(c, rep, "get(30)", hashmap.get(i64, i64, m, 30, 0 - 1), 300)
+    test.is_true(c, rep, "has(20)", hashmap.has(i64, i64, m, 20))
+    test.is_false(c, rep, "has(99)", hashmap.has(i64, i64, m, 99))
+    test.eq_i64(c, rep, "get(99)=default", hashmap.get(i64, i64, m, 99, 0 - 7), 0 - 7)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn overwrite_replaces_without_growing_len() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var m: hashmap.HashMap(i64, i64) = hashmap.make(i64, i64, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    hashmap.put(i64, i64, m, 5, 50)
+    hashmap.put(i64, i64, m, 5, 51)
+    hashmap.put(i64, i64, m, 5, 52)
+
+    test.eq_i64(c, rep, "overwrite value", hashmap.get(i64, i64, m, 5, 0), 52)
+    test.eq_usize(c, rep, "overwrite keeps len", hashmap.len(i64, i64, m), 1)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ------------------------------------------------------------------------ growth
+
+@test fn growth_preserves_every_entry() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    // 200 entries forces several doublings from the initial capacity of 8, so this
+    // covers rehashing rather than just insertion.
+    var m: hashmap.HashMap(i64, i64) = hashmap.make(i64, i64, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    var i: i64 = 0
+    for i < 200 {
+        hashmap.put(i64, i64, m, i, i * 3)
+        i = i + 1
+    }
+    test.eq_usize(c, rep, "len after 200", hashmap.len(i64, i64, m), 200)
+
+    // Every key still resolves to its own value — a rehash that dropped or
+    // mis-placed an entry shows up here and nowhere else.
+    var bad: i64 = 0
+    var j: i64 = 0
+    for j < 200 {
+        if hashmap.get(i64, i64, m, j, 0 - 1) != j * 3 { bad = bad + 1 }
+        j = j + 1
+    }
+    test.eq_i64(c, rep, "entries lost or corrupted by growth", bad, 0)
+
+    // The load factor cap must have kept capacity ahead of length.
+    test.is_true(c, rep, "cap > len", hashmap.cap(i64, i64, m) > hashmap.len(i64, i64, m))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// -------------------------------------------------------------------- collisions
+
+@test fn collisions_still_find_every_key() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    // Every key hashes to 7. Correctness now rests entirely on linear probing and
+    // its wraparound, with `eq_fn` doing all the discrimination — the worst case
+    // the structure has, made reachable on purpose.
+    var m: hashmap.HashMap(i64, i64) = hashmap.make(i64, i64, sys, &hash_awful, &hashmap.eq_i64)
+    var i: i64 = 0
+    for i < 50 {
+        hashmap.put(i64, i64, m, i, i + 1000)
+        i = i + 1
+    }
+    test.eq_usize(c, rep, "len under total collision", hashmap.len(i64, i64, m), 50)
+
+    var bad: i64 = 0
+    var j: i64 = 0
+    for j < 50 {
+        if hashmap.get(i64, i64, m, j, 0 - 1) != j + 1000 { bad = bad + 1 }
+        j = j + 1
+    }
+    test.eq_i64(c, rep, "keys unreachable under collision", bad, 0)
+    test.is_false(c, rep, "absent key under collision", hashmap.has(i64, i64, m, 999))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ------------------------------------------------------------ a second key type
+
+@test fn a_struct_key_works() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var m: hashmap.HashMap(Point, i64) = hashmap.make(Point, i64, sys, &hash_point, &eq_point)
+    hashmap.put(Point, i64, m, Point{ x: 1, y: 2 }, 12)
+    hashmap.put(Point, i64, m, Point{ x: 3, y: 4 }, 34)
+    hashmap.put(Point, i64, m, Point{ x: 2, y: 1 }, 21)
+
+    test.eq_usize(c, rep, "len(struct keys)", hashmap.len(Point, i64, m), 3)
+    test.eq_i64(c, rep, "get(1,2)", hashmap.get(Point, i64, m, Point{ x: 1, y: 2 }, 0), 12)
+    test.eq_i64(c, rep, "get(3,4)", hashmap.get(Point, i64, m, Point{ x: 3, y: 4 }, 0), 34)
+    // (2,1) must not collide with (1,2) — an XOR-only combiner would make them equal.
+    test.eq_i64(c, rep, "get(2,1) is not (1,2)", hashmap.get(Point, i64, m, Point{ x: 2, y: 1 }, 0), 21)
+    test.is_false(c, rep, "has(absent point)", hashmap.has(Point, i64, m, Point{ x: 9, y: 9 }))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ------------------------------------------------------------------- determinism
+
+@test fn the_hash_is_fixed_and_seedless() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // Golden values. Tier 2 asks for "deterministic by default, randomized only
+    // explicitly", which is only meaningful if changing the function is a VISIBLE
+    // break rather than a silent rehash — so the finalizer is pinned here, and
+    // independently checked against a Rust SplitMix64 oracle in
+    // `hashmap_props::mix64_is_really_splitmix64`.
+    test.eq_i64(c, rep, "mix64(0)", hashmap.mix64(0) as i64, 0)
+    test.is_true(c, rep, "mix64(1) != 1", hashmap.mix64(1) != 1)
+    // Same input, same answer, within a run and across runs.
+    test.eq_i64(c, rep, "mix64 is a function", hashmap.mix64(12345) as i64, hashmap.mix64(12345) as i64)
+    test.is_true(c, rep, "adjacent keys diverge", hashmap.mix64(1) != hashmap.mix64(2))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---------------------------------------------------------------------- teardown
+
+@test fn explicit_free_is_idempotent_with_drop() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    // `free` releases and zeroes `cap`; the automatic drop then sees an empty map
+    // and releases nothing. Calling both must not double-free — the `std/list`
+    // contract, restated here because this map holds FOUR buffers rather than one.
+    var m: hashmap.HashMap(i64, i64) = hashmap.make(i64, i64, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    hashmap.put(i64, i64, m, 1, 1)
+    hashmap.put(i64, i64, m, 2, 2)
+    hashmap.free(i64, i64, m)
+
+    test.eq_usize(c, rep, "cap after free", hashmap.cap(i64, i64, m), 0)
+    test.eq_usize(c, rep, "len after free", hashmap.len(i64, i64, m), 0)
+    // …and the emptied map is still usable rather than poisoned.
+    test.is_false(c, rep, "has after free", hashmap.has(i64, i64, m, 1))
+    hashmap.put(i64, i64, m, 5, 55)
+    test.eq_i64(c, rep, "reusable after free", hashmap.get(i64, i64, m, 5, 0), 55)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

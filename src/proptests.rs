@@ -1753,6 +1753,69 @@ mod no_os_props {
     }
 }
 
+/// **`std/hashmap` — the generic deterministic map (Tier 2 area 4, Collections v2).**
+///
+/// The `.jtr` suite covers behaviour (probing, growth, collisions, a second key type).
+/// What lives here is what a Jestyr test cannot check about itself: that the hash is
+/// really the function it claims to be, judged against an independent Rust oracle
+/// rather than against its own output.
+mod hashmap_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn diags_of(rel: &str) -> Vec<String> {
+        let prog = crate::module::load(rel);
+        let mut diags: Vec<String> = prog.diags.iter().map(|d| d.message.clone()).collect();
+        let (info, td) = typeck::check_program(&prog.ast, &prog.modules);
+        diags.extend(td.iter().map(|d| d.message.clone()));
+        diags.extend(escape::check(&prog.ast, &info).iter().map(|d| d.message.clone()));
+        let (_c, cd) = cgen::emit(&prog.ast, &info);
+        diags.extend(cd.iter().map(|d| d.message.clone()));
+        diags
+    }
+
+    #[test]
+    fn hashmap_compiles_clean() {
+        for f in ["hashmap.jtr", "hashmap_test.jtr"] {
+            let d = diags_of(&format!("examples/std/{f}"));
+            assert!(d.is_empty(), "examples/std/{f}: {d:?}");
+        }
+    }
+
+    /// The SplitMix64 finalizer, written from the published constants rather than
+    /// copied from the Jestyr source — an oracle, not a mirror.
+    fn splitmix64_finalize(x: u64) -> u64 {
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+
+    /// **Determinism is only meaningful if changing the hash is a visible break.**
+    ///
+    /// Tier 2 asks for "deterministic by default, randomized only explicitly". Pinning
+    /// `mix64` against golden values taken from its own output would satisfy the letter
+    /// and prove nothing — it would pin whatever the code happens to do, including a
+    /// typo'd constant. So the Jestyr module is compiled and RUN, and its answers are
+    /// compared against the oracle above over a wide input sweep.
+    ///
+    proptest! {
+        /// The finalizer must be a bijection-shaped mixer: distinct inputs give
+        /// distinct outputs across the oracle. Checked on the ORACLE (cheap, no
+        /// toolchain), with `mix64_is_really_splitmix64` tying the Jestyr side to it —
+        /// so the two together say "the module computes a function that avalanches".
+        #[test]
+        fn the_finalizer_separates_adjacent_keys(a in any::<u64>()) {
+            let b = a.wrapping_add(1);
+            prop_assert_ne!(
+                splitmix64_finalize(a),
+                splitmix64_finalize(b),
+                "adjacent keys must not collide — short probe chains depend on it"
+            );
+        }
+    }
+}
+
 /// **`std/pathbuf` — the owned, growable path (Tier 2 area 2, the unblocked half).**
 ///
 /// The module exists for one reason, and it is not the path API: a Jestyr `String` is
@@ -14058,7 +14121,7 @@ fn main() -> i32 {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "drop_take.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr", "test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr", "caps_demo.jtr", "fs_test.jtr", "env_test.jtr", "time_test.jtr", "str.jtr", "str_test.jtr", "str_demo.jtr", "sink.jtr", "cursor.jtr", "writer.jtr", "sink_test.jtr", "cursor_test.jtr", "writer_test.jtr", "writer_demo.jtr", "pathbuf.jtr", "pathbuf_test.jtr"];
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "drop_take.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr", "test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr", "caps_demo.jtr", "fs_test.jtr", "env_test.jtr", "time_test.jtr", "str.jtr", "str_test.jtr", "str_demo.jtr", "sink.jtr", "cursor.jtr", "writer.jtr", "sink_test.jtr", "cursor_test.jtr", "writer_test.jtr", "writer_demo.jtr", "pathbuf.jtr", "pathbuf_test.jtr", "hashmap.jtr", "hashmap_test.jtr", "hashmap_demo.jtr"];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
     /// target). This is the acceptance bar the R2 fixpoint ultimately rests on. `DUMP_DIVERGE=1`
@@ -14959,6 +15022,82 @@ fn main() -> i32 {
     /// module rather than only in-language. Backslash is excluded for the same reason
     /// `path_matches_the_reference` excludes it — on Windows it would test the CRT's
     /// argument encoder instead of the module.
+    /// The SplitMix64 finalizer, written from the published constants rather than
+    /// copied from the Jestyr source — an oracle, not a mirror.
+    fn splitmix64_finalize(x: u64) -> u64 {
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+
+    /// Needs a C toolchain, so it is driven through `std/hashmap_demo`'s `mix` mode
+    /// behind the `c-oracle` feature, like its peers. The value crosses the CLI as a
+    /// SIGNED decimal and is reinterpreted, so the full `u64` range is reachable
+    /// (`0xffff…f` arrives as `-1`) — it is the bit pattern being compared.
+    #[cfg(feature = "c-oracle")]
+    #[test]
+    fn mix64_is_really_splitmix64() {
+        use std::sync::OnceLock;
+        static EXE: OnceLock<std::path::PathBuf> = OnceLock::new();
+        let exe = EXE.get_or_init(|| build_exe("examples/std/hashmap_demo.jtr"));
+
+        // Chosen to exercise every shift: zero, one, the high bit, all-ones, the two
+        // alternating-bit patterns, and values whose >>30 / >>27 / >>31 differ.
+        let inputs: [u64; 10] = [
+            0,
+            1,
+            2,
+            0xffff_ffff_ffff_ffff,
+            0x8000_0000_0000_0000,
+            0x0000_0000_ffff_ffff,
+            0xdead_beef_cafe_babe,
+            12345,
+            0x5555_5555_5555_5555,
+            0xaaaa_aaaa_aaaa_aaaa,
+        ];
+        for v in inputs {
+            let out = Command::new(exe).args(["mix", &(v as i64).to_string()]).output().unwrap();
+            assert!(out.status.success(), "hashmap_demo mix {v} exited {:?}", out.status);
+            let got: i64 = String::from_utf8(out.stdout).unwrap().trim().parse().unwrap();
+            assert_eq!(
+                got as u64,
+                splitmix64_finalize(v),
+                "mix64({v:#x}) disagrees with the SplitMix64 oracle — the map's \
+                 determinism claim rests on this function being what it says it is"
+            );
+        }
+    }
+
+    /// The map's answers do not depend on the run. Same file, two processes, byte-
+    /// identical output — the seedless-hash claim, observed end to end rather than
+    /// asserted about the hash in isolation.
+    #[cfg(feature = "c-oracle")]
+    #[test]
+    fn the_histogram_is_reproducible_across_runs() {
+        use std::sync::OnceLock;
+        static EXE: OnceLock<std::path::PathBuf> = OnceLock::new();
+        let exe = EXE.get_or_init(|| build_exe("examples/std/hashmap_demo.jtr"));
+
+        let run = || {
+            let out =
+                Command::new(exe).args(["count", "examples/std/path.jtr"]).output().unwrap();
+            assert!(out.status.success(), "hashmap_demo count exited {:?}", out.status);
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let first = run();
+        assert_eq!(first, run(), "the histogram must not vary run to run");
+
+        // …and it is not vacuously empty: `path.jtr` has content, so the distinct-byte
+        // count and the space count are both well above zero. Without this the test
+        // would pass just as happily on two empty outputs.
+        let nums: Vec<i64> =
+            first.lines().filter(|l| !l.trim().is_empty()).map(|l| l.trim().parse().unwrap()).collect();
+        assert_eq!(nums.len(), 5, "expected 5 lines, got:\n{first}");
+        assert!(nums[0] > 40, "distinct byte values seen: {}", nums[0]);
+        assert!(nums[2] > 100, "space count: {}", nums[2]);
+    }
+
     #[test]
     fn str_matches_the_reference() {
         use std::sync::OnceLock;

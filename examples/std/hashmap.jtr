@@ -1,0 +1,316 @@
+// std/hashmap.jtr — a generic, deterministic hash map, `K -> V`.
+//
+// The general form of `std/strmap`, which is fixed at `str -> i64`. Same proven
+// engine — open addressing, power-of-two capacity, cached hashes, a 0.7 load cap,
+// FNV-1a with a SplitMix64 finalizer and NO random seed, so the table is
+// bit-reproducible run to run (the Motley determinism spine). What is new is that
+// the key and value types are yours.
+//
+// ─── How `K` gets hashing and equality, and why it is not a trait bound ─────────
+//
+// The obvious design is `[K: Hash + Eq]`. It is not expressible in Jestyr today,
+// and both halves fail for their own reason — probed, not assumed:
+//
+//   * `[K: Hash + Eq]` does not parse. A bracket parameter takes exactly one bound;
+//     `+` there is a syntax error.
+//   * Collapsing the two into one `MapKey` trait does not help, because `Self` is
+//     not a legal type in a trait method's parameter list, so the trait cannot even
+//     SAY `fn eq(read self, read other: Self) -> bool`.
+//
+// So hashing and equality arrive the way allocation already does: as function
+// pointers stored in the value, exactly the shape of `mem.Allocator`. That is not a
+// workaround borrowed from an older era of the language — for a map key it is the
+// only expressible option, and it has the pleasant property that two maps over the
+// same `K` may hash differently on purpose (a test can inject a deliberately awful
+// hash; see `collisions_still_find_every_key`).
+//
+// When bracket parameters grow multiple bounds, or traits grow `Self`, this is the
+// module to revisit — the storage and the API would not change, only how `hash_fn`
+// and `eq_fn` are supplied.
+//
+// ─── Why struct-of-arrays, when `strmap` uses one array of slots ───────────────
+//
+// Because a generic type cannot contain a pointer to ANOTHER generic type: a field
+// `slots: *mut Slot(K, V)` is refused by the C backend ("does not support
+// type-expressions yet"). So the four per-slot columns live in four parallel
+// arrays, each pointing at a type parameter or a concrete type.
+//
+// That is a language limit turned into the better layout. A probe walks `hashes`,
+// a dense `u64` array, and touches `keys` only when a hash matches — so a miss
+// costs one cache line of pure hash comparisons instead of striding over
+// `sizeof(K) + sizeof(V) + 16` bytes per step.
+//
+// ─── What this does NOT do, deliberately ───────────────────────────────────────
+//
+//   * **Keys are stored BY VALUE and the map never frees them.** For plain data —
+//     `i64`, an enum tag, a small `@copy` struct — that is exactly right. For a key
+//     that owns heap memory, use `std/strmap` (which copies key bytes into its own
+//     storage) rather than reaching for this.
+//   * **No `remove`.** Open addressing without tombstones, matching `strmap`. A
+//     deletion has to either tombstone or back-shift, and both change the probe
+//     invariant that `get` stops at the first empty slot. When a caller needs it,
+//     it is a considered addition, not a fill-in.
+//
+// Run the tests:  jestyrc test examples/std/hashmap_test.jtr
+
+import "mem"
+
+pub fn HashMap(comptime K: type, comptime V: type) -> type {
+    return struct {
+        // The four columns. `hashes[i]` is meaningful only where `used[i]`.
+        hashes: *mut u64,
+        used: *mut bool,
+        keys: *mut K,
+        vals: *mut V,
+        cap: usize,      // power of two (0 = unallocated)
+        len: usize,      // occupied slots
+        hash_fn: fn(K) -> u64,
+        eq_fn: fn(K, K) -> bool,
+        a: Allocator,
+    }
+}
+
+// ------------------------------------------------------------- the hash toolkit
+//
+// Exposed so a caller can build `hash_fn` for their own key type from the same
+// primitives the module trusts, rather than inventing one. Determinism is the
+// point: the constants are fixed and there is no seed.
+
+// The SplitMix64 finalizer. FNV alone diffuses poorly and near-identical keys
+// (`x1`, `x2`, … — the common case in source code) land in adjacent buckets; this
+// avalanches them apart, which is what keeps probe chains short.
+@no_os pub fn mix64(x: u64) -> u64 {
+    var z: u64 = x
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+    z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+    z = z ^ (z >> 31)
+    return z
+}
+
+// Ready-made for the common key type. `mix64` alone is a fine integer hash — the
+// FNV byte loop exists for *sequences*, and an `i64` is one word.
+@no_os pub fn hash_i64(k: i64) -> u64 {
+    return mix64(k as u64)
+}
+
+@no_os pub fn eq_i64(a: i64, b: i64) -> bool {
+    return a == b
+}
+
+// ------------------------------------------------------------- pointer accessors
+//
+// `unsafe { ptr.* }` is only legal in statement/return position, never as a `var`
+// initializer, so these tail-`unsafe` helpers let every caller below bind with a
+// plain `let`. The same shape `strmap` uses, one per column.
+
+@no_os fn hash_at(p: *mut u64, i: usize) -> u64 {
+    unsafe { (p + i).* }
+}
+@no_os fn used_at(p: *mut bool, i: usize) -> bool {
+    unsafe { (p + i).* }
+}
+@no_os fn key_at(comptime K: type, p: *mut K, i: usize) -> K {
+    unsafe { (p + i).* }
+}
+@no_os fn val_at(comptime V: type, p: *mut V, i: usize) -> V {
+    unsafe { (p + i).* }
+}
+
+// ------------------------------------------------------------------ construction
+
+// An empty map bound to allocator `a`, hashing with `h` and comparing with `e`.
+// Owns no memory until the first `put`.
+@no_os pub fn make(comptime K: type, comptime V: type, read a: Allocator, h: fn(K) -> u64, e: fn(K, K) -> bool) -> HashMap(K, V) {
+    return HashMap(K, V){ hashes: null, used: null, keys: null, vals: null, cap: 0, len: 0, hash_fn: h, eq_fn: e, a: a }
+}
+
+@no_os pub fn len(comptime K: type, comptime V: type, read m: HashMap(K, V)) -> usize {
+    return m.len
+}
+
+@no_os pub fn cap(comptime K: type, comptime V: type, read m: HashMap(K, V)) -> usize {
+    return m.cap
+}
+
+@no_os pub fn is_empty(comptime K: type, comptime V: type, read m: HashMap(K, V)) -> bool {
+    return m.len == 0
+}
+
+// ----------------------------------------------------------------------- growth
+
+// Place a key/value with an already-computed hash into the four columns. Used by
+// `put` for a new key and by `grow` when rehashing, so the probe order is defined
+// in exactly one place. The caller guarantees the key is absent and a free slot
+// exists, so there is no compare-for-overwrite and no growth check here.
+@no_os fn place(comptime K: type, comptime V: type, hs: *mut u64, us: *mut bool, ks: *mut K, vs: *mut V, cp: usize, h: u64, k: K, v: V) {
+    var idx: usize = (h as usize) & (cp - 1)
+    var probes: usize = 0
+    for probes < cp {
+        let occupied: bool = used_at(us, idx)
+        if not occupied {
+            unsafe { (hs + idx).* = h }
+            unsafe { (us + idx).* = true }
+            unsafe { (ks + idx).* = k }
+            unsafe { (vs + idx).* = v }
+            return
+        }
+        idx = (idx + 1) & (cp - 1)
+        probes = probes + 1
+    }
+}
+
+// Grow to `newcap` and rehash every occupied slot. The cached hash is reused, so a
+// grow never calls `hash_fn` again — which matters when the key is expensive to
+// hash, and is why the column exists at all.
+@no_os fn grow(comptime K: type, comptime V: type, mut m: HashMap(K, V), newcap: usize) {
+    var nh: *mut u64 = mem.allocate(u64, m.a, newcap)
+    var nu: *mut bool = mem.allocate(bool, m.a, newcap)
+    var nk: *mut K = mem.allocate(K, m.a, newcap)
+    var nv: *mut V = mem.allocate(V, m.a, newcap)
+    var i: usize = 0
+    for i < newcap {
+        unsafe { (nu + i).* = false }
+        i = i + 1
+    }
+    let oldcap: usize = m.cap
+    var j: usize = 0
+    for j < oldcap {
+        let occupied: bool = used_at(m.used, j)
+        if occupied {
+            let h: u64 = hash_at(m.hashes, j)
+            let k: K = key_at(K, m.keys, j)
+            let v: V = val_at(V, m.vals, j)
+            place(K, V, nh, nu, nk, nv, newcap, h, k, v)
+        }
+        j = j + 1
+    }
+    if oldcap != 0 {
+        mem.release(u64, m.a, m.hashes)
+        mem.release(bool, m.a, m.used)
+        mem.release(K, m.a, m.keys)
+        mem.release(V, m.a, m.vals)
+    }
+    m.hashes = nh
+    m.used = nu
+    m.keys = nk
+    m.vals = nv
+    m.cap = newcap
+}
+
+// ------------------------------------------------------------------- the map API
+
+// Insert `k -> v`, or overwrite the value if `k` is already present (the count is
+// unchanged in that case).
+//
+// The load factor is brought under 0.7 BEFORE inserting, so the probe loop below
+// is guaranteed to find a free slot and cannot run to completion.
+@no_os pub fn put(comptime K: type, comptime V: type, mut m: HashMap(K, V), k: K, v: V) {
+    if m.cap == 0 {
+        grow(K, V, m, 8)
+    } else {
+        if (m.len + 1) * 10 > m.cap * 7 { grow(K, V, m, m.cap * 2) }
+    }
+    let h: u64 = m.hash_fn(k)
+    var idx: usize = (h as usize) & (m.cap - 1)
+    var probes: usize = 0
+    for probes < m.cap {
+        let occupied: bool = used_at(m.used, idx)
+        if not occupied {
+            unsafe { (m.hashes + idx).* = h }
+            unsafe { (m.used + idx).* = true }
+            unsafe { (m.keys + idx).* = k }
+            unsafe { (m.vals + idx).* = v }
+            m.len = m.len + 1
+            return
+        }
+        // The cached hash is checked first so an unequal key usually costs one
+        // integer compare rather than a call through `eq_fn`.
+        if hash_at(m.hashes, idx) == h {
+            let existing: K = key_at(K, m.keys, idx)
+            if m.eq_fn(existing, k) {
+                unsafe { (m.vals + idx).* = v }
+                return
+            }
+        }
+        idx = (idx + 1) & (m.cap - 1)
+        probes = probes + 1
+    }
+}
+
+// The value for `k`, or `default` when absent.
+//
+// The probe stops at the first EMPTY slot, which is sound only because nothing is
+// ever removed — see the module header.
+@no_os pub fn get(comptime K: type, comptime V: type, read m: HashMap(K, V), k: K, take default: V) -> V {
+    if m.cap == 0 { return default }
+    let h: u64 = m.hash_fn(k)
+    var idx: usize = (h as usize) & (m.cap - 1)
+    var probes: usize = 0
+    for probes < m.cap {
+        let occupied: bool = used_at(m.used, idx)
+        if not occupied { return default }
+        if hash_at(m.hashes, idx) == h {
+            let existing: K = key_at(K, m.keys, idx)
+            if m.eq_fn(existing, k) { return val_at(V, m.vals, idx) }
+        }
+        idx = (idx + 1) & (m.cap - 1)
+        probes = probes + 1
+    }
+    return default
+}
+
+// Whether `k` is present.
+@no_os pub fn has(comptime K: type, comptime V: type, read m: HashMap(K, V), k: K) -> bool {
+    if m.cap == 0 { return false }
+    let h: u64 = m.hash_fn(k)
+    var idx: usize = (h as usize) & (m.cap - 1)
+    var probes: usize = 0
+    for probes < m.cap {
+        let occupied: bool = used_at(m.used, idx)
+        if not occupied { return false }
+        if hash_at(m.hashes, idx) == h {
+            let existing: K = key_at(K, m.keys, idx)
+            if m.eq_fn(existing, k) { return true }
+        }
+        idx = (idx + 1) & (m.cap - 1)
+        probes = probes + 1
+    }
+    return false
+}
+
+// ---------------------------------------------------------------------- teardown
+
+// Free a column, already type-erased to bytes. A free function rather than an
+// `impl` method so the module-qualified `mem.free_bytes` resolves — qualified calls
+// inside an `impl` body are a known bootstrap limitation, and `std/list` factors
+// its own release out for the same reason. Non-generic, so one copy serves every
+// instantiation.
+@no_os fn release_col(read a: Allocator, p: *mut u8, n: usize) {
+    if n != 0 { mem.free_bytes(a, p) }
+}
+
+// Explicit teardown. Idempotent (it zeroes `cap`), so calling it AND letting the
+// automatic drop run releases exactly once — the `std/list` contract.
+@no_os pub fn free(comptime K: type, comptime V: type, mut m: HashMap(K, V)) {
+    release_col(m.a, m.hashes as *mut u8, m.cap)
+    release_col(m.a, m.used as *mut u8, m.cap)
+    release_col(m.a, m.keys as *mut u8, m.cap)
+    release_col(m.a, m.vals as *mut u8, m.cap)
+    m.hashes = null
+    m.used = null
+    m.keys = null
+    m.vals = null
+    m.cap = 0
+    m.len = 0
+}
+
+// RAII for every `HashMap(K, V)` at once, monomorphized per instantiation. The four
+// columns go back to the stored allocator at scope exit; no manual free needed.
+impl[K, V] Drop for HashMap(K, V) {
+    fn drop(mut self) {
+        release_col(self.a, self.hashes as *mut u8, self.cap)
+        release_col(self.a, self.used as *mut u8, self.cap)
+        release_col(self.a, self.keys as *mut u8, self.cap)
+        release_col(self.a, self.vals as *mut u8, self.cap)
+    }
+}

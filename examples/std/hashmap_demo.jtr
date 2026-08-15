@@ -1,0 +1,95 @@
+// std/hashmap_demo.jtr — `std/hashmap`'s first real consumer, and its CLI oracle.
+//
+// A byte-frequency histogram over a real file. It is a genuine use of the map
+// rather than a toy: the keys are `i64` byte values, insertion order follows the
+// file, the table grows through several doublings, and the answer must be
+// bit-identical on every platform and every run — which is exactly the property the
+// seedless hash exists to provide.
+//
+//   hashmap_demo count <file>     total distinct byte values, then `<byte> <count>`
+//                                 for a fixed set of probes
+//   hashmap_demo mix <n>          the SplitMix64 finalizer of `n`
+//
+// The `mix` mode is what `hashmap_props::mix64_is_really_splitmix64` drives, so the
+// hash is judged against an independent Rust implementation rather than against its
+// own recorded output.
+
+import "hashmap"
+import "mem"
+import "str"
+
+// Parse a decimal (optionally negative) argument. `str` has no integer parser and
+// this demo is not the place to add one to the library.
+fn parse_i64(read s: str) -> i64 {
+    var neg: bool = false
+    var i: usize = 0
+    if s.len > 0 {
+        if (s[0] as i32) == 45 { neg = true  i = 1 }
+    }
+    var n: i64 = 0
+    for i < s.len {
+        let d: i64 = (s[i] as i64) - 48
+        if d >= 0 {
+            if d <= 9 { n = n * 10 + d }
+        }
+        i = i + 1
+    }
+    if neg { return 0 - n }
+    return n
+}
+
+// Count how many times each byte value occurs in `text`.
+//
+// This is the shape most uses of a map take: probe for the current value, add one,
+// put it back. `get`'s default carries the "absent means zero" rule, so there is no
+// separate has/insert branch.
+fn histogram(mut m: hashmap.HashMap(i64, i64), read text: str) {
+    var i: usize = 0
+    for i < text.len {
+        let k: i64 = text[i] as i64
+        let seen: i64 = hashmap.get(i64, i64, m, k, 0)
+        hashmap.put(i64, i64, m, k, seen + 1)
+        i = i + 1
+    }
+}
+
+fn main() -> i32 {
+    var sys: Allocator = mem.system_allocator()
+    if env_argc() < 3 {
+        print_str("usage: hashmap_demo count <file> | mix <n>")
+        return 1
+    }
+    let mode: str = arg(1)
+    let operand: str = arg(2)
+
+    if str.eq(mode, "mix") {
+        print_int(hashmap.mix64(parse_i64(operand) as u64) as i64)
+        return 0
+    }
+
+    if str.eq(mode, "count") {
+        let text: String = read_file(operand)
+        var m: hashmap.HashMap(i64, i64) = hashmap.make(i64, i64, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+        histogram(m, string_view(text))
+        // Distinct byte values seen…
+        print_int(hashmap.len(i64, i64, m) as i64)
+        // …then a fixed set of probes, so the output is stable and diffable:
+        // newline, space, and the letters `e` and `z`.
+        print_int(hashmap.get(i64, i64, m, 10, 0))
+        print_int(hashmap.get(i64, i64, m, 32, 0))
+        print_int(hashmap.get(i64, i64, m, 101, 0))
+        print_int(hashmap.get(i64, i64, m, 122, 0))
+        string_free(text)
+        return 0
+    }
+
+    print_str("unknown mode")
+    return 1
+}
+
+// `arg_count` is spelled through a wrapper because the name reads better at the one
+// call site above, and because a `@no_os` consumer of this file would then have a
+// single place to see the OS boundary being crossed.
+fn env_argc() -> i32 {
+    return arg_count()
+}

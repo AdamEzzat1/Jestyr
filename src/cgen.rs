@@ -4889,6 +4889,21 @@ impl<'a> Cgen<'a> {
                             return format!("(&{})", self.c_fn_name(&cname));
                         }
                     }
+                    // `&mod.f` — a module-qualified function reference. The checker
+                    // records the resolution on the field expr, exactly as it does
+                    // for a qualified const (`mem.PAGE`), so this reuses that rather
+                    // than re-deriving the target.
+                    //
+                    // Without this the generic path below emitted `(&j_f)` — the
+                    // spelling of a *local* named `f` — which type-checks, escape-
+                    // checks and then fails in gcc as an undeclared identifier. That
+                    // is the "degrades to gcc" failure mode, and it reached a real
+                    // API: `std/hashmap` is parameterized by `&hashmap.hash_i64`.
+                    if let Some(qname) = self.info.qualified(*rhs).map(String::from) {
+                        if self.info.table.fns.contains_key(&qname) {
+                            return format!("(&{})", self.c_fn_name(&qname));
+                        }
+                    }
                 }
                 let r = self.emit_expr(*rhs);
                 format!("({}{r})", unop_c(*op))
@@ -11514,6 +11529,34 @@ mod tests {
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("(&jestyr_dbl)"), "address-of-fn is the mangled C symbol: {c}");
         assert!(c.contains("j_op(21)"), "the call through `op` is indirect: {c}");
+    }
+
+    /// **`&mod.f` is a function address, not a field access.**
+    ///
+    /// This used to emit `(&j_f)` — the spelling of a *local* named `f` — which
+    /// passed resolution, typeck and the escape checker and then failed in gcc as an
+    /// undeclared identifier. The "degrades to gcc" failure mode, reached by an
+    /// ordinary API: `std/hashmap` is parameterized by `&hashmap.hash_i64`.
+    ///
+    /// Written against the module loader rather than a bare snippet because the bug
+    /// only exists for a *qualified* path, which needs a real second module.
+    #[test]
+    fn lowers_address_of_a_module_qualified_function() {
+        let prog = crate::module::load("examples/std/hashmap_test.jtr");
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(td.is_empty(), "{td:?}");
+        let (c, cd) = emit(&prog.ast, &info);
+        assert!(cd.is_empty(), "{cd:?}");
+        assert!(
+            c.contains("(&jestyr_hash_i64)"),
+            "`&hashmap.hash_i64` must lower to the mangled C symbol"
+        );
+        assert!(
+            !c.contains("(&j_hash_i64)"),
+            "the field-access spelling `j_hash_i64` is the bug: it is not a declared C \
+             identifier, so gcc rejects it after the whole front end passed"
+        );
     }
 
     #[test]

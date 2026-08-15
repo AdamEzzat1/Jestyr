@@ -118,7 +118,32 @@ Present: `fs.jtr` (read/write/exists/remove **+ the `Fs` capability**), `env.jtr
 `process.jtr` (`Process`), `io.jtr` (four print wrappers), `writer.jtr` (the `Writer`
 trait over stdout/stderr/a buffer), `test_report.jtr` (printing a `Check` report),
 `test_fixture.jtr` (temp paths and captured command output, for expected-diagnostic
-tests), `pathbuf.jtr` (`PathBuf` — the owned, growable path).
+tests), `pathbuf.jtr` (`PathBuf` — the owned, growable path), `hashmap.jtr`
+(`HashMap(K, V)` — the generic deterministic map).
+
+`hashmap.jtr` is Collections v2's first container: `strmap`'s engine (open addressing,
+power-of-two capacity, cached hashes, 0.7 load cap, seedless FNV-1a + SplitMix64) made
+generic in both key and value. Three language limits shaped it, each probed rather than
+assumed, and each worth knowing before the *next* container is attempted:
+
+* **`[K: Hash + Eq]` is not expressible.** A bracket parameter takes exactly one bound
+  (`+` is a parse error), and `Self` is not a legal type in a trait method's parameter
+  list — so a single combined `MapKey` trait cannot state `eq(self, other)` either.
+  Hashing and equality are therefore *stored function pointers*, the `mem.Allocator`
+  shape. For a map key that is not a legacy workaround; it is the only option the
+  language offers today.
+* **A generic type cannot hold a pointer to another generic type.** `slots: *mut
+  Slot(K,V)` is refused by the C backend, so the map is struct-of-arrays: four parallel
+  columns. That turns out to be the better probe layout — a miss walks a dense `u64`
+  array and touches keys only on a hash match.
+* **An opaque-`V` default must be `take`.** `get(…, default: V) -> V` is refused because
+  the default convention is `read`, a second-class borrow that may not outlive the call.
+  This is the "opaque `T` is non-`Copy`" collision this roadmap warns about, in its
+  mildest form: a one-keyword fix.
+
+The hash's determinism is checked against an independent Rust SplitMix64 oracle, not
+against its own recorded output, and `hashmap_demo count <file>` (a byte histogram) is
+both the day-one consumer and the CLI that oracle drives.
 
 `pathbuf.jtr` is the owned counterpart to `core`'s borrowed `path`, and it is worth
 reading for *why* it exists rather than what it does. A Jestyr `String` is **manually**

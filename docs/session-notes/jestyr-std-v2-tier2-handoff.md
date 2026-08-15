@@ -11,7 +11,7 @@ Baseline before you change anything, so a later failure is yours:
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1190 passed, 0 failed, 3 ignored** (~250 s). The 3 ignored are deliberate slow numeric
+**1195 passed, 0 failed, 3 ignored** (~300 s). The 3 ignored are deliberate slow numeric
 sweeps (`dragon_matches_std_thorough`, `slow_parse_matches_std_thorough`,
 `dump_pow10_table`), not breakage.
 
@@ -23,7 +23,31 @@ Ranked by value per unit of risk. Each has a concrete first increment, because "
 Collections v2" is not a task and "a deterministic `HashMap(K,V)` using `strmap`'s probing
 with a canaried hash" is.
 
-### §1.1 — Collections v2 (Tier 2 area 4). The only area with nothing built
+### §1.1 — Collections v2 (Tier 2 area 4). ONE container built; the area stays open
+
+**`std/hashmap` exists** — a generic, deterministic `HashMap(K, V)` with a real consumer
+(`hashmap_demo`, a byte histogram). What follows is the ORIGINAL plan, kept because two
+of its four points turned out to be wrong in ways the next container will hit too:
+
+* Point 1 (**decide the hash**) was already answered: `strmap.jtr` had FNV-1a +
+  SplitMix64, fixed constants, no seed. `hashmap` reuses the finalizer and is checked
+  against an independent Rust SplitMix64 oracle rather than against its own output.
+* Point 2 (**`[K: Hash + Eq]`**) is **not expressible**, and both halves fail separately:
+  a bracket parameter takes exactly ONE bound (`+` is a parse error), and `Self` is not a
+  legal type in a trait method's parameter list — so one combined `MapKey` trait cannot
+  say `fn eq(read self, read other: Self)` either. Hashing and equality are therefore
+  **stored function pointers**, the `mem.Allocator` shape.
+* Point 3 (**copy `List(T)`**) held, with one forced change: a generic type **cannot hold
+  a pointer to another generic type** (`slots: *mut Slot(K,V)` → "the C backend does not
+  support type-expressions yet"). So the map is **struct-of-arrays** — four parallel
+  columns — which is the better probe layout anyway.
+* Point 4 (**pick one**) held and still holds.
+
+**What is left in this area**, now that one container exists: `Set(T)`, `Deque(T)`,
+`SmallVec`, and a `remove` for `hashmap` (open addressing without tombstones cannot
+delete — `get` stops at the first empty slot). None is urgent; each wants a consumer.
+
+The original text follows.
 
 **The roadmap's stated blocker is narrower than it reads.** It says generic containers
 "keep colliding with the escape checker's treatment of opaque `T` as non-`Copy`; each new
@@ -145,7 +169,46 @@ predate this work.
 | 7. Package / build | ✅ *as scoped* — `build.jestyr` (CTFE, effect-free by construction) + module-manifest hash DAG |
 | 6. No-std contract | ✅ **both axes checked** — `@no_alloc` *and* `@no_os` (below) |
 | 2. Typed path / OsStr | 🟡 `os_str` is a real primitive; **`PathBuf` is BUILT** (below); typed `Path` is §1.4 |
-| 4. Collections v2 | 🔴 §1.1 |
+| 4. Collections v2 | 🟡 **`HashMap(K,V)` BUILT** with a real consumer; `Set`/`Deque`/`remove` remain — §1.1 |
+
+### `std/hashmap` — the generic deterministic map (Tier 2 area 4, first container)
+
+`HashMap(K, V)`: open addressing, power-of-two capacity, cached hashes, 0.7 load cap,
+seedless hash — `strmap`'s proven engine, made generic. Consumer on day one:
+`hashmap_demo count <file>`, a byte histogram, which is also the CLI the SplitMix64
+oracle drives.
+
+Three language limits shaped it, all **probed rather than assumed** — see §1.1 for the
+detail. Briefly: multi-bounds don't parse; `Self` isn't a trait-method parameter type; a
+generic type can't hold a pointer to another generic type. Hence fn-pointer hash/eq and a
+struct-of-arrays layout.
+
+Two smaller findings worth carrying:
+
+* **`take` is what makes an opaque-`V` default returnable.** `get(…, default: V) -> V`
+  is refused — the default convention is `read`, and a `read` parameter is a second-class
+  borrow that may not outlive the call, which for an opaque `V` the checker cannot see
+  past. `take default: V` fixes it. This is the "opaque `T` is non-`Copy`" collision the
+  roadmap warns about, in its mildest form: a one-keyword fix, not a fight.
+* **A real cgen bug fell out of it** (fixed here, see below): `&mod.f` emitted `(&j_f)`.
+
+### `&mod.f` — taking the address of a module-qualified function (cgen fix)
+
+`&hashmap.hash_i64` lowered to `(&j_hash_i64)` — the spelling of a *local* named
+`hash_i64` — because the `UnOp::Ref` arm handled only `ExprKind::Name`, so a qualified
+path fell through to the generic field-access path. Resolution, typeck and the escape
+checker all passed; **gcc** then failed with "undeclared identifier".
+
+That is precisely the *degrades-to-gcc* failure mode §1.3.2 complains about, and it was
+reached by an ordinary API rather than an exotic one — a map parameterized by
+`&hashmap.hash_i64` is the natural spelling. Fixed by reusing `info.qualified(id)`, the
+same resolution a module-qualified **const** (`mem.PAGE`) already consumed two arms away.
+
+Emission change → **port mirror + reseed**, both paid. The port's `&fn` path took the
+same shape (a Field node carries its name span in `(x, y)`, so the module base is simply
+skipped — after flattening there are no modules left). Known, pre-existing asymmetry
+left alone: neither side canonicalises a *colliding* name in address position, which the
+call path does via `call_sym`.
 
 ### `std/pathbuf` — the owned, growable path (Tier 2 area 2, the unblocked half)
 
@@ -345,12 +408,9 @@ verifying a file.**
 
 ## §6. Suggested order
 
-1. **`HashMap(K,V)` (§1.1)** — the only untouched area. Settle the hash function *first*,
-   verify the trait bound composes on a generic struct's parameter, then build one container
-   with a real consumer.
-2. **The assignability hole + int→int decision (§1.3.2)** — settle them together; it also
+1. **The assignability hole + int→int decision (§1.3.2)** — settle them together; it also
    unblocks §1.4.
-3. **The partial-read intrinsic (§1.2)** — the largest, and the only route to a real
+2. **The partial-read intrinsic (§1.2)** — the largest, and the only route to a real
    streaming `Reader`.
 
 Leave `sys` and typed `Path`-on-`distinct` alone until their blockers actually move. Both

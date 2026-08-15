@@ -12918,6 +12918,21 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                     return
                 }
             }
+            // `&mod.f` -> the same mangled address. A Field node carries its name's
+            // span in (x, y), so the module base is simply skipped: after flattening
+            // there are no modules left, only the one mangled symbol. Without this the
+            // generic path below emitted `(&j_f)` — a local's spelling — which gcc
+            // rejects as undeclared, after the whole front end had passed.
+            if rhs.kind == 5 {
+                let qs: usize = rhs.x as usize
+                let qe: usize = rhs.y as usize
+                if find_fn_item(p, src, src[qs .. qe]) >= 0 {
+                    string_push(sb, "(&jestyr_")
+                    string_push(sb, src[qs .. qe])
+                    string_push(sb, ")")
+                    return
+                }
+            }
         }
         string_push(sb, "(")
         if e.op == 1 { string_push(sb, "-") }
