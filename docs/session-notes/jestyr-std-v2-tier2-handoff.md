@@ -184,7 +184,7 @@ predate this work.
 | 7. Package / build | ✅ *as scoped* — `build.jestyr` (CTFE, effect-free by construction) + module-manifest hash DAG |
 | 6. No-std contract | ✅ **both axes checked** — `@no_alloc` *and* `@no_os` (below) |
 | 2. Typed path / OsStr | 🟡 `os_str` is a real primitive; **`PathBuf` is BUILT** (below); typed `Path` is §1.4 |
-| 4. Collections v2 | 🟡 **`HashMap(K,V)` BUILT** with a real consumer; `Set`/`Deque`/`remove` remain — §1.1 |
+| 4. Collections v2 | 🟡 **`HashMap(K,V)` + `remove` + enumeration + `std/set` BUILT**, with a real consumer; only `Deque(T)` / `SmallVec` remain — §1.1 |
 
 ### `std/hashmap` — the generic deterministic map (Tier 2 area 4, first container)
 
