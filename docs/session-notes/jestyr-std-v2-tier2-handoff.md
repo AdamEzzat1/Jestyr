@@ -43,9 +43,24 @@ of its four points turned out to be wrong in ways the next container will hit to
   columns — which is the better probe layout anyway.
 * Point 4 (**pick one**) held and still holds.
 
-**What is left in this area**, now that one container exists: `Set(T)`, `Deque(T)`,
-`SmallVec`, and a `remove` for `hashmap` (open addressing without tombstones cannot
-delete — `get` stops at the first empty slot). None is urgent; each wants a consumer.
+**`remove`, enumeration and `std/set` have since landed too.** What is left in this
+area: **`Deque(T)`** (a ring buffer — a genuinely separate engine, not a variation on
+this one) and **`SmallVec`** (inline storage, which needs a `[N]T` field inside a
+generic type — expect the same "type-expressions" refusal that forced struct-of-arrays,
+so PROBE IT FIRST). Neither is urgent; each wants a consumer.
+
+Two limits found while adding `set`, both worth knowing before designing a container:
+
+* **A type-returning fn must literally `return struct { … }`.** `pub fn Set(comptime T:
+  type) -> type { return hashmap.HashMap(T, bool) }` is refused — a generic type cannot
+  ALIAS another. Combined with "a generic type cannot hold a pointer to another generic
+  type", there is no way to wrap a container in a newtype today. `std/set` therefore has
+  no `Set(T)` type: it is free functions over `HashMap(T, bool)`, which costs the
+  distinction between a set and a map-to-bool and buys one engine instead of two.
+* **The map had no way to ENUMERATE what you stored**, which is a bigger gap than `Set`
+  was. Now `slots`/`slot_live`/`slot_key`/`slot_val` — indexed access to the slot array,
+  deliberately not dressed up as an iterator, because the cost is O(capacity) and a
+  nicer API would hide that.
 
 The original text follows.
 

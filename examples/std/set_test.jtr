@@ -1,0 +1,188 @@
+// std/set_test.jtr — the unit suite for `std/set`.
+//
+// The algebra is tested by its LAWS rather than by worked examples alone, the way
+// `core`'s combinators are tested by the functor/monad laws: worked examples check
+// the cases you thought of, laws check the ones you did not. The strongest here is
+// inclusion–exclusion — |x ∪ y| + |x ∩ y| == |x| + |y| — which ties all three
+// operations together, so an error in any one of them breaks it.
+//
+// Run:  jestyrc test examples/std/set_test.jtr
+
+import "hashmap"
+import "set"
+import "mem"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 512
+
+// Set equality: mutual inclusion. Sets have no order, so this is the only
+// meaningful comparison — and it is why `is_subset` is part of the API.
+fn same(read x: hashmap.HashMap(i64, bool), read y: hashmap.HashMap(i64, bool)) -> bool {
+    if not set.is_subset(i64, x, y) { return false }
+    return set.is_subset(i64, y, x)
+}
+
+fn of3(read a: Allocator, p: i64, q: i64, r: i64) -> hashmap.HashMap(i64, bool) {
+    var s: hashmap.HashMap(i64, bool) = set.make(i64, a, &hashmap.hash_i64, &hashmap.eq_i64)
+    set.add(i64, s, p)
+    set.add(i64, s, q)
+    set.add(i64, s, r)
+    return s
+}
+
+@test fn membership_and_idempotent_add() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var s: hashmap.HashMap(i64, bool) = set.make(i64, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    test.is_true(c, rep, "empty", set.is_empty(i64, s))
+
+    set.add(i64, s, 4)
+    set.add(i64, s, 4)
+    set.add(i64, s, 4)
+    test.eq_usize(c, rep, "add is idempotent", set.len(i64, s), 1)
+    test.is_true(c, rep, "contains(4)", set.contains(i64, s, 4))
+    test.is_false(c, rep, "contains(5)", set.contains(i64, s, 5))
+
+    test.is_true(c, rep, "discard(member)", set.discard(i64, s, 4))
+    test.is_false(c, rep, "discard(non-member)", set.discard(i64, s, 4))
+    test.is_true(c, rep, "empty after discard", set.is_empty(i64, s))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn the_operations_compute_the_right_members() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    // {1,2,3} and {3,4,5} — overlapping in exactly one member.
+    var x: hashmap.HashMap(i64, bool) = of3(sys, 1, 2, 3)
+    var y: hashmap.HashMap(i64, bool) = of3(sys, 3, 4, 5)
+
+    var u: hashmap.HashMap(i64, bool) = set.union_of(i64, x, y, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    test.eq_usize(c, rep, "|union|", set.len(i64, u), 5)
+    test.is_true(c, rep, "union has 1", set.contains(i64, u, 1))
+    test.is_true(c, rep, "union has 5", set.contains(i64, u, 5))
+    test.is_false(c, rep, "union has no 9", set.contains(i64, u, 9))
+
+    var n: hashmap.HashMap(i64, bool) = set.intersect(i64, x, y, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    test.eq_usize(c, rep, "|intersect|", set.len(i64, n), 1)
+    test.is_true(c, rep, "intersect is {3}", set.contains(i64, n, 3))
+
+    var d: hashmap.HashMap(i64, bool) = set.difference(i64, x, y, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    test.eq_usize(c, rep, "|difference|", set.len(i64, d), 2)
+    test.is_true(c, rep, "difference has 1", set.contains(i64, d, 1))
+    test.is_false(c, rep, "difference drops the shared 3", set.contains(i64, d, 3))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The laws. Each ties several operations together, so a bug in one shows up here
+// even when its own worked example happens to pass.
+@test fn the_algebra_obeys_its_laws() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var x: hashmap.HashMap(i64, bool) = of3(sys, 1, 2, 3)
+    var y: hashmap.HashMap(i64, bool) = of3(sys, 3, 4, 5)
+
+    // Commutativity, both operations.
+    var uxy: hashmap.HashMap(i64, bool) = set.union_of(i64, x, y, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    var uyx: hashmap.HashMap(i64, bool) = set.union_of(i64, y, x, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    test.is_true(c, rep, "union commutes", same(uxy, uyx))
+
+    var nxy: hashmap.HashMap(i64, bool) = set.intersect(i64, x, y, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    var nyx: hashmap.HashMap(i64, bool) = set.intersect(i64, y, x, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    test.is_true(c, rep, "intersect commutes", same(nxy, nyx))
+
+    // Idempotence: x ∪ x == x == x ∩ x.
+    var uxx: hashmap.HashMap(i64, bool) = set.union_of(i64, x, x, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    test.is_true(c, rep, "union is idempotent", same(uxx, x))
+    var nxx: hashmap.HashMap(i64, bool) = set.intersect(i64, x, x, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    test.is_true(c, rep, "intersect is idempotent", same(nxx, x))
+
+    // INCLUSION–EXCLUSION: |x ∪ y| + |x ∩ y| == |x| + |y|. The strongest law here,
+    // because it constrains union, intersect and len simultaneously.
+    let lhs: usize = set.len(i64, uxy) + set.len(i64, nxy)
+    let rhs: usize = set.len(i64, x) + set.len(i64, y)
+    test.eq_usize(c, rep, "inclusion-exclusion", lhs, rhs)
+
+    // (x \ y) ∪ (x ∩ y) == x — difference and intersect partition x.
+    var d: hashmap.HashMap(i64, bool) = set.difference(i64, x, y, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    var back: hashmap.HashMap(i64, bool) = set.union_of(i64, d, nxy, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    test.is_true(c, rep, "difference and intersect partition x", same(back, x))
+
+    // Subset relations that must hold by construction.
+    test.is_true(c, rep, "x subset of union", set.is_subset(i64, x, uxy))
+    test.is_true(c, rep, "intersect subset of x", set.is_subset(i64, nxy, x))
+    test.is_false(c, rep, "union not subset of x", set.is_subset(i64, uxy, x))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The empty set is where an implementation that "works" usually stops working.
+@test fn the_empty_set_behaves() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var e: hashmap.HashMap(i64, bool) = set.make(i64, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    var x: hashmap.HashMap(i64, bool) = of3(sys, 1, 2, 3)
+
+    // An empty operand never allocated a slot array, so these also cover the
+    // `cap == 0` path through every operation.
+    var u: hashmap.HashMap(i64, bool) = set.union_of(i64, x, e, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    test.is_true(c, rep, "x union empty == x", same(u, x))
+
+    var n: hashmap.HashMap(i64, bool) = set.intersect(i64, x, e, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    test.is_true(c, rep, "x intersect empty is empty", set.is_empty(i64, n))
+
+    var d: hashmap.HashMap(i64, bool) = set.difference(i64, x, e, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    test.is_true(c, rep, "x minus empty == x", same(d, x))
+
+    var d2: hashmap.HashMap(i64, bool) = set.difference(i64, e, x, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    test.is_true(c, rep, "empty minus x is empty", set.is_empty(i64, d2))
+
+    test.is_true(c, rep, "empty is a subset of anything", set.is_subset(i64, e, x))
+    test.is_false(c, rep, "non-empty is not a subset of empty", set.is_subset(i64, x, e))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// Removal leaves tombstones, and enumeration must skip them — otherwise every
+// operation here would resurrect discarded members.
+@test fn discarded_members_do_not_come_back_through_the_algebra() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var x: hashmap.HashMap(i64, bool) = of3(sys, 1, 2, 3)
+    set.discard(i64, x, 2)
+    test.eq_usize(c, rep, "|x| after discard", set.len(i64, x), 2)
+
+    var y: hashmap.HashMap(i64, bool) = of3(sys, 7, 8, 9)
+    var u: hashmap.HashMap(i64, bool) = set.union_of(i64, x, y, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    test.eq_usize(c, rep, "|union| excludes the tombstone", set.len(i64, u), 5)
+    test.is_false(c, rep, "the discarded member stays gone", set.contains(i64, u, 2))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

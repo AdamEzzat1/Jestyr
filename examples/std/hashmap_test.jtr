@@ -237,3 +237,160 @@ fn hash_awful(k: i64) -> u64 {
     free_ptr(raw)
     return ok
 }
+
+// --------------------------------------------------------------------- removal
+
+@test fn remove_reports_and_decrements() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var m: hashmap.HashMap(i64, i64) = hashmap.make(i64, i64, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    hashmap.put(i64, i64, m, 1, 10)
+    hashmap.put(i64, i64, m, 2, 20)
+    hashmap.put(i64, i64, m, 3, 30)
+
+    test.is_true(c, rep, "remove(present)", hashmap.remove(i64, i64, m, 2))
+    test.eq_usize(c, rep, "len after remove", hashmap.len(i64, i64, m), 2)
+    test.is_false(c, rep, "has(removed)", hashmap.has(i64, i64, m, 2))
+    test.eq_i64(c, rep, "get(removed)=default", hashmap.get(i64, i64, m, 2, 0 - 1), 0 - 1)
+    // …and the neighbours are untouched.
+    test.eq_i64(c, rep, "get(1) survives", hashmap.get(i64, i64, m, 1, 0), 10)
+    test.eq_i64(c, rep, "get(3) survives", hashmap.get(i64, i64, m, 3, 0), 30)
+
+    // Removing what is not there changes nothing and says so.
+    test.is_false(c, rep, "remove(absent)", hashmap.remove(i64, i64, m, 99))
+    test.is_false(c, rep, "remove(twice)", hashmap.remove(i64, i64, m, 2))
+    test.eq_usize(c, rep, "len unchanged by failed removes", hashmap.len(i64, i64, m), 2)
+
+    // Reinserting a removed key works and restores the count.
+    hashmap.put(i64, i64, m, 2, 22)
+    test.eq_i64(c, rep, "reinsert after remove", hashmap.get(i64, i64, m, 2, 0), 22)
+    test.eq_usize(c, rep, "len after reinsert", hashmap.len(i64, i64, m), 3)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// THE test for tombstones. Every key hashes to 7, so all 20 sit in one probe
+// chain; removing from the MIDDLE of that chain is exactly the case where
+// clearing the slot to EMPTY would truncate it and silently strand every key
+// beyond. Nothing else in this suite can catch that.
+@test fn removing_mid_chain_keeps_later_keys_reachable() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var m: hashmap.HashMap(i64, i64) = hashmap.make(i64, i64, sys, &hash_awful, &hashmap.eq_i64)
+    var i: i64 = 0
+    for i < 20 {
+        hashmap.put(i64, i64, m, i, i + 500)
+        i = i + 1
+    }
+    // Remove one from the middle of the single chain.
+    test.is_true(c, rep, "remove(mid-chain)", hashmap.remove(i64, i64, m, 7))
+    test.eq_usize(c, rep, "len after mid-chain remove", hashmap.len(i64, i64, m), 19)
+
+    var lost: i64 = 0
+    var j: i64 = 0
+    for j < 20 {
+        if j != 7 {
+            if hashmap.get(i64, i64, m, j, 0 - 1) != j + 500 { lost = lost + 1 }
+        }
+        j = j + 1
+    }
+    test.eq_i64(c, rep, "keys stranded past the tombstone", lost, 0)
+    test.is_false(c, rep, "the removed key is gone", hashmap.has(i64, i64, m, 7))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// A put/remove cycle at steady occupancy must not grow the table forever. The
+// load factor counts tombstones, so without the rehash-in-place rule every cycle
+// would breach it and double the capacity.
+@test fn churn_does_not_grow_the_table_without_bound() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var m: hashmap.HashMap(i64, i64) = hashmap.make(i64, i64, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    // Ten live keys, then a thousand insert/remove pairs on top of them.
+    var i: i64 = 0
+    for i < 10 {
+        hashmap.put(i64, i64, m, i, i)
+        i = i + 1
+    }
+    var n: i64 = 0
+    for n < 1000 {
+        hashmap.put(i64, i64, m, 1000 + n, n)
+        hashmap.remove(i64, i64, m, 1000 + n)
+        n = n + 1
+    }
+    test.eq_usize(c, rep, "live entries after churn", hashmap.len(i64, i64, m), 10)
+    // 1010 insertions happened; an unbounded table would be in the thousands.
+    test.is_true(c, rep, "capacity stayed bounded", hashmap.cap(i64, i64, m) <= 64)
+
+    // …and the original ten are all still correct.
+    var bad: i64 = 0
+    var j: i64 = 0
+    for j < 10 {
+        if hashmap.get(i64, i64, m, j, 0 - 1) != j { bad = bad + 1 }
+        j = j + 1
+    }
+    test.eq_i64(c, rep, "live keys corrupted by churn", bad, 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---------------------------------------------------------------- enumeration
+
+@test fn walking_the_slots_recovers_exactly_the_live_entries() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var m: hashmap.HashMap(i64, i64) = hashmap.make(i64, i64, sys, &hashmap.hash_i64, &hashmap.eq_i64)
+    var i: i64 = 0
+    for i < 30 {
+        hashmap.put(i64, i64, m, i, i * 7)
+        i = i + 1
+    }
+    hashmap.remove(i64, i64, m, 3)
+    hashmap.remove(i64, i64, m, 17)
+
+    // The walk must visit each live entry once, with its own value, and must not
+    // visit either tombstone.
+    var seen: i64 = 0
+    var wrong: i64 = 0
+    var resurrected: i64 = 0
+    let n: usize = hashmap.slots(i64, i64, m)
+    var s: usize = 0
+    for s < n {
+        if hashmap.slot_live(i64, i64, m, s) {
+            let k: i64 = hashmap.slot_key(i64, i64, m, s)
+            if hashmap.slot_val(i64, i64, m, s) != k * 7 { wrong = wrong + 1 }
+            if k == 3 { resurrected = resurrected + 1 }
+            if k == 17 { resurrected = resurrected + 1 }
+            seen = seen + 1
+        }
+        s = s + 1
+    }
+    test.eq_i64(c, rep, "live entries visited", seen, 28)
+    test.eq_i64(c, rep, "values mismatched during the walk", wrong, 0)
+    test.eq_i64(c, rep, "tombstones visited", resurrected, 0)
+    // …and the walk length is CAPACITY, which is the cost the API refuses to hide.
+    test.is_true(c, rep, "slots() == cap()", n == hashmap.cap(i64, i64, m))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

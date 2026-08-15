@@ -46,24 +46,41 @@
 //     `i64`, an enum tag, a small `@copy` struct — that is exactly right. For a key
 //     that owns heap memory, use `std/strmap` (which copies key bytes into its own
 //     storage) rather than reaching for this.
-//   * **No `remove`.** Open addressing without tombstones, matching `strmap`. A
-//     deletion has to either tombstone or back-shift, and both change the probe
-//     invariant that `get` stops at the first empty slot. When a caller needs it,
-//     it is a considered addition, not a fill-in.
+// ─── Deletion, and the invariant that makes it subtle ─────────────────────────
+//
+// `get` stops at the first EMPTY slot — that is what makes a miss cheap. Clearing
+// a slot to EMPTY on deletion would therefore truncate the probe chain of every
+// key that had collided past it, and those keys become silently unreachable while
+// still counted. So a removed slot becomes a TOMBSTONE: probes walk THROUGH it,
+// and only an insert may reuse it.
+//
+// Tombstones are not free — they lengthen probe chains and never shorten on their
+// own — so the load factor counts them (`len + tombs`), and a table that is mostly
+// tombstones REHASHES AT THE SAME CAPACITY rather than doubling. Without that, a
+// put/remove cycle at steady occupancy would grow the table forever.
 //
 // Run the tests:  jestyrc test examples/std/hashmap_test.jtr
 
 import "mem"
 
+// Slot states. A `u8` column rather than two `bool` columns: one byte per slot,
+// one load per probe step, and the three states are mutually exclusive by
+// construction rather than by convention.
+const EMPTY: u8 = 0
+const OCCUPIED: u8 = 1
+const TOMB: u8 = 2
+
 pub fn HashMap(comptime K: type, comptime V: type) -> type {
     return struct {
-        // The four columns. `hashes[i]` is meaningful only where `used[i]`.
+        // The four columns. `hashes[i]`/`keys[i]`/`vals[i]` are meaningful only
+        // where `state[i] == OCCUPIED`.
         hashes: *mut u64,
-        used: *mut bool,
+        state: *mut u8,  // EMPTY | OCCUPIED | TOMB
         keys: *mut K,
         vals: *mut V,
         cap: usize,      // power of two (0 = unallocated)
-        len: usize,      // occupied slots
+        len: usize,      // OCCUPIED slots
+        tombs: usize,    // TOMB slots — they cost probe length until a rehash
         hash_fn: fn(K) -> u64,
         eq_fn: fn(K, K) -> bool,
         a: Allocator,
@@ -106,7 +123,7 @@ pub fn HashMap(comptime K: type, comptime V: type) -> type {
 @no_os fn hash_at(p: *mut u64, i: usize) -> u64 {
     unsafe { (p + i).* }
 }
-@no_os fn used_at(p: *mut bool, i: usize) -> bool {
+@no_os fn state_at(p: *mut u8, i: usize) -> u8 {
     unsafe { (p + i).* }
 }
 @no_os fn key_at(comptime K: type, p: *mut K, i: usize) -> K {
@@ -121,7 +138,7 @@ pub fn HashMap(comptime K: type, comptime V: type) -> type {
 // An empty map bound to allocator `a`, hashing with `h` and comparing with `e`.
 // Owns no memory until the first `put`.
 @no_os pub fn make(comptime K: type, comptime V: type, read a: Allocator, h: fn(K) -> u64, e: fn(K, K) -> bool) -> HashMap(K, V) {
-    return HashMap(K, V){ hashes: null, used: null, keys: null, vals: null, cap: 0, len: 0, hash_fn: h, eq_fn: e, a: a }
+    return HashMap(K, V){ hashes: null, state: null, keys: null, vals: null, cap: 0, len: 0, tombs: 0, hash_fn: h, eq_fn: e, a: a }
 }
 
 @no_os pub fn len(comptime K: type, comptime V: type, read m: HashMap(K, V)) -> usize {
@@ -142,14 +159,14 @@ pub fn HashMap(comptime K: type, comptime V: type) -> type {
 // `put` for a new key and by `grow` when rehashing, so the probe order is defined
 // in exactly one place. The caller guarantees the key is absent and a free slot
 // exists, so there is no compare-for-overwrite and no growth check here.
-@no_os fn place(comptime K: type, comptime V: type, hs: *mut u64, us: *mut bool, ks: *mut K, vs: *mut V, cp: usize, h: u64, k: K, v: V) {
+@no_os fn place(comptime K: type, comptime V: type, hs: *mut u64, us: *mut u8, ks: *mut K, vs: *mut V, cp: usize, h: u64, k: K, v: V) {
     var idx: usize = (h as usize) & (cp - 1)
     var probes: usize = 0
     for probes < cp {
-        let occupied: bool = used_at(us, idx)
-        if not occupied {
+        let st: u8 = state_at(us, idx)
+        if st == EMPTY {
             unsafe { (hs + idx).* = h }
-            unsafe { (us + idx).* = true }
+            unsafe { (us + idx).* = OCCUPIED }
             unsafe { (ks + idx).* = k }
             unsafe { (vs + idx).* = v }
             return
@@ -164,19 +181,21 @@ pub fn HashMap(comptime K: type, comptime V: type) -> type {
 // hash, and is why the column exists at all.
 @no_os fn grow(comptime K: type, comptime V: type, mut m: HashMap(K, V), newcap: usize) {
     var nh: *mut u64 = mem.allocate(u64, m.a, newcap)
-    var nu: *mut bool = mem.allocate(bool, m.a, newcap)
+    var nu: *mut u8 = mem.allocate(u8, m.a, newcap)
     var nk: *mut K = mem.allocate(K, m.a, newcap)
     var nv: *mut V = mem.allocate(V, m.a, newcap)
     var i: usize = 0
     for i < newcap {
-        unsafe { (nu + i).* = false }
+        unsafe { (nu + i).* = EMPTY }
         i = i + 1
     }
     let oldcap: usize = m.cap
     var j: usize = 0
     for j < oldcap {
-        let occupied: bool = used_at(m.used, j)
-        if occupied {
+        let st: u8 = state_at(m.state, j)
+        // Only OCCUPIED slots move. Tombstones are DROPPED here, which is the only
+        // thing that ever reclaims them — hence `rehash` below.
+        if st == OCCUPIED {
             let h: u64 = hash_at(m.hashes, j)
             let k: K = key_at(K, m.keys, j)
             let v: V = val_at(V, m.vals, j)
@@ -186,15 +205,37 @@ pub fn HashMap(comptime K: type, comptime V: type) -> type {
     }
     if oldcap != 0 {
         mem.release(u64, m.a, m.hashes)
-        mem.release(bool, m.a, m.used)
+        mem.release(u8, m.a, m.state)
         mem.release(K, m.a, m.keys)
         mem.release(V, m.a, m.vals)
     }
     m.hashes = nh
-    m.used = nu
+    m.state = nu
     m.keys = nk
     m.vals = nv
     m.cap = newcap
+    m.tombs = 0
+}
+
+// Make room for one more entry, choosing between DOUBLING and rehashing in place.
+//
+// The distinction is what stops a put/remove cycle from growing the table without
+// bound: at steady occupancy the load factor is breached by tombstones, not by
+// live entries, and doubling would answer the wrong problem. So the capacity only
+// grows when the LIVE entries alone would exceed half the table; otherwise the
+// same capacity is rebuilt, which drops every tombstone.
+@no_os fn reserve_one(comptime K: type, comptime V: type, mut m: HashMap(K, V)) {
+    if m.cap == 0 {
+        grow(K, V, m, 8)
+        return
+    }
+    if (m.len + m.tombs + 1) * 10 > m.cap * 7 {
+        if (m.len + 1) * 2 > m.cap {
+            grow(K, V, m, m.cap * 2)
+        } else {
+            grow(K, V, m, m.cap)
+        }
+    }
 }
 
 // ------------------------------------------------------------------- the map API
@@ -205,31 +246,44 @@ pub fn HashMap(comptime K: type, comptime V: type) -> type {
 // The load factor is brought under 0.7 BEFORE inserting, so the probe loop below
 // is guaranteed to find a free slot and cannot run to completion.
 @no_os pub fn put(comptime K: type, comptime V: type, mut m: HashMap(K, V), k: K, v: V) {
-    if m.cap == 0 {
-        grow(K, V, m, 8)
-    } else {
-        if (m.len + 1) * 10 > m.cap * 7 { grow(K, V, m, m.cap * 2) }
-    }
+    reserve_one(K, V, m)
     let h: u64 = m.hash_fn(k)
     var idx: usize = (h as usize) & (m.cap - 1)
     var probes: usize = 0
+    // The first tombstone passed, if any. An insert prefers it to the empty slot
+    // that ends the chain, which is what keeps chains from growing every time a
+    // key is removed and a different one added.
+    var reuse: usize = 0
+    var found_reuse: bool = false
     for probes < m.cap {
-        let occupied: bool = used_at(m.used, idx)
-        if not occupied {
-            unsafe { (m.hashes + idx).* = h }
-            unsafe { (m.used + idx).* = true }
-            unsafe { (m.keys + idx).* = k }
-            unsafe { (m.vals + idx).* = v }
+        let st: u8 = state_at(m.state, idx)
+        if st == EMPTY {
+            var at: usize = idx
+            if found_reuse {
+                at = reuse
+                m.tombs = m.tombs - 1
+            }
+            unsafe { (m.hashes + at).* = h }
+            unsafe { (m.state + at).* = OCCUPIED }
+            unsafe { (m.keys + at).* = k }
+            unsafe { (m.vals + at).* = v }
             m.len = m.len + 1
             return
         }
-        // The cached hash is checked first so an unequal key usually costs one
-        // integer compare rather than a call through `eq_fn`.
-        if hash_at(m.hashes, idx) == h {
-            let existing: K = key_at(K, m.keys, idx)
-            if m.eq_fn(existing, k) {
-                unsafe { (m.vals + idx).* = v }
-                return
+        if st == TOMB {
+            if not found_reuse {
+                reuse = idx
+                found_reuse = true
+            }
+        } else {
+            // OCCUPIED. The cached hash is checked first so an unequal key usually
+            // costs one integer compare rather than a call through `eq_fn`.
+            if hash_at(m.hashes, idx) == h {
+                let existing: K = key_at(K, m.keys, idx)
+                if m.eq_fn(existing, k) {
+                    unsafe { (m.vals + idx).* = v }
+                    return
+                }
             }
         }
         idx = (idx + 1) & (m.cap - 1)
@@ -247,11 +301,15 @@ pub fn HashMap(comptime K: type, comptime V: type) -> type {
     var idx: usize = (h as usize) & (m.cap - 1)
     var probes: usize = 0
     for probes < m.cap {
-        let occupied: bool = used_at(m.used, idx)
-        if not occupied { return default }
-        if hash_at(m.hashes, idx) == h {
-            let existing: K = key_at(K, m.keys, idx)
-            if m.eq_fn(existing, k) { return val_at(V, m.vals, idx) }
+        let st: u8 = state_at(m.state, idx)
+        // EMPTY ends the chain; TOMB does NOT — a key placed before the deletion
+        // may still lie beyond it.
+        if st == EMPTY { return default }
+        if st == OCCUPIED {
+            if hash_at(m.hashes, idx) == h {
+                let existing: K = key_at(K, m.keys, idx)
+                if m.eq_fn(existing, k) { return val_at(V, m.vals, idx) }
+            }
         }
         idx = (idx + 1) & (m.cap - 1)
         probes = probes + 1
@@ -266,16 +324,83 @@ pub fn HashMap(comptime K: type, comptime V: type) -> type {
     var idx: usize = (h as usize) & (m.cap - 1)
     var probes: usize = 0
     for probes < m.cap {
-        let occupied: bool = used_at(m.used, idx)
-        if not occupied { return false }
-        if hash_at(m.hashes, idx) == h {
-            let existing: K = key_at(K, m.keys, idx)
-            if m.eq_fn(existing, k) { return true }
+        let st: u8 = state_at(m.state, idx)
+        if st == EMPTY { return false }
+        if st == OCCUPIED {
+            if hash_at(m.hashes, idx) == h {
+                let existing: K = key_at(K, m.keys, idx)
+                if m.eq_fn(existing, k) { return true }
+            }
         }
         idx = (idx + 1) & (m.cap - 1)
         probes = probes + 1
     }
     return false
+}
+
+// Remove `k`, reporting whether it was there. The slot becomes a TOMBSTONE rather
+// than EMPTY, so every key that collided past it stays reachable — see the header.
+//
+// The value is not returned. Handing back a `V` would mean moving a value the map
+// owns out through a `read` receiver, and the same second-class-borrow rule that
+// forces `get`'s default to be `take` applies here; `get` before `remove` is the
+// honest spelling and costs one extra probe.
+@no_os pub fn remove(comptime K: type, comptime V: type, mut m: HashMap(K, V), k: K) -> bool {
+    if m.cap == 0 { return false }
+    let h: u64 = m.hash_fn(k)
+    var idx: usize = (h as usize) & (m.cap - 1)
+    var probes: usize = 0
+    for probes < m.cap {
+        let st: u8 = state_at(m.state, idx)
+        if st == EMPTY { return false }
+        if st == OCCUPIED {
+            if hash_at(m.hashes, idx) == h {
+                let existing: K = key_at(K, m.keys, idx)
+                if m.eq_fn(existing, k) {
+                    unsafe { (m.state + idx).* = TOMB }
+                    m.len = m.len - 1
+                    m.tombs = m.tombs + 1
+                    return true
+                }
+            }
+        }
+        idx = (idx + 1) & (m.cap - 1)
+        probes = probes + 1
+    }
+    return false
+}
+
+// ------------------------------------------------------------------- enumeration
+//
+// Jestyr has no iterator protocol, so enumeration is exposed as indexed access to
+// the SLOT ARRAY: walk `0 .. slots(m)` and ask each index whether it is live.
+// Deliberately not hidden behind a fake iterator — the caller can see that the
+// cost is proportional to CAPACITY, not to `len`, which is the truth about an
+// open-addressed table and would be disguised by a nicer-looking API.
+//
+// ORDER is slot order: a pure function of the hash, the capacity and the insertion
+// sequence, and therefore reproducible run to run — but NOT insertion order, and
+// it changes when the table grows. Code that needs a stable order must sort.
+
+// The number of slots to walk. Equal to capacity, and 0 for an unallocated map.
+@no_os pub fn slots(comptime K: type, comptime V: type, read m: HashMap(K, V)) -> usize {
+    return m.cap
+}
+
+// Does slot `i` hold a live entry? False for both empty and tombstoned slots.
+@no_os pub fn slot_live(comptime K: type, comptime V: type, read m: HashMap(K, V), i: usize) -> bool {
+    if i >= m.cap { return false }
+    return state_at(m.state, i) == OCCUPIED
+}
+
+// The key at slot `i`. Meaningful only where `slot_live` — reading a dead slot
+// yields whatever was last written there.
+@no_os pub fn slot_key(comptime K: type, comptime V: type, read m: HashMap(K, V), i: usize) -> K {
+    return key_at(K, m.keys, i)
+}
+
+@no_os pub fn slot_val(comptime K: type, comptime V: type, read m: HashMap(K, V), i: usize) -> V {
+    return val_at(V, m.vals, i)
 }
 
 // ---------------------------------------------------------------------- teardown
@@ -293,15 +418,16 @@ pub fn HashMap(comptime K: type, comptime V: type) -> type {
 // automatic drop run releases exactly once — the `std/list` contract.
 @no_os pub fn free(comptime K: type, comptime V: type, mut m: HashMap(K, V)) {
     release_col(m.a, m.hashes as *mut u8, m.cap)
-    release_col(m.a, m.used as *mut u8, m.cap)
+    release_col(m.a, m.state as *mut u8, m.cap)
     release_col(m.a, m.keys as *mut u8, m.cap)
     release_col(m.a, m.vals as *mut u8, m.cap)
     m.hashes = null
-    m.used = null
+    m.state = null
     m.keys = null
     m.vals = null
     m.cap = 0
     m.len = 0
+    m.tombs = 0
 }
 
 // RAII for every `HashMap(K, V)` at once, monomorphized per instantiation. The four
@@ -309,7 +435,7 @@ pub fn HashMap(comptime K: type, comptime V: type) -> type {
 impl[K, V] Drop for HashMap(K, V) {
     fn drop(mut self) {
         release_col(self.a, self.hashes as *mut u8, self.cap)
-        release_col(self.a, self.used as *mut u8, self.cap)
+        release_col(self.a, self.state as *mut u8, self.cap)
         release_col(self.a, self.keys as *mut u8, self.cap)
         release_col(self.a, self.vals as *mut u8, self.cap)
     }

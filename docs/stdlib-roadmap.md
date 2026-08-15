@@ -145,6 +145,28 @@ The hash's determinism is checked against an independent Rust SplitMix64 oracle,
 against its own recorded output, and `hashmap_demo count <file>` (a byte histogram) is
 both the day-one consumer and the CLI that oracle drives.
 
+`remove` arrived with **tombstones**, which is the only correct answer here: `get` stops
+at the first empty slot, so clearing a removed slot would truncate the probe chain of
+every key that had collided past it, silently stranding them. A removed slot is marked
+`TOMB`; probes walk through it and only an insert may reuse it. Because tombstones never
+shorten on their own, the load factor counts them and a table that is mostly tombstones
+**rehashes at the same capacity instead of doubling** — without that, a put/remove cycle
+at steady occupancy grows the table forever. Both properties are pinned, and the mutation
+that clears to `EMPTY` instead strands 10 of 20 keys while every other test still passes.
+
+`set.jtr` is the algebra (`union_of`, `intersect`, `difference`, `is_subset`) over
+`HashMap(T, bool)`. It has **no `Set(T)` type**, and both ways of giving it one are
+refused: a type-returning function must literally `return struct { … }` (so it cannot
+alias `HashMap`), and a generic type cannot hold a pointer to another generic type (so it
+cannot wrap one). The trade is that a set and a map-to-bool are the same type to the
+checker, in exchange for one probing engine rather than two. Its laws — commutativity,
+idempotence, inclusion–exclusion, and that difference and intersect partition the left
+operand — are the test oracle, in the style of `core`'s combinator laws.
+
+Set algebra needed enumeration, which the map did not have; `slots`/`slot_live`/
+`slot_key`/`slot_val` expose indexed access to the slot array rather than a fake
+iterator, because the walk is O(capacity) and an iterator-shaped API would disguise that.
+
 `pathbuf.jtr` is the owned counterpart to `core`'s borrowed `path`, and it is worth
 reading for *why* it exists rather than what it does. A Jestyr `String` is **manually**
 freed, and B1's field auto-drop recurses only into fields that are themselves droppable

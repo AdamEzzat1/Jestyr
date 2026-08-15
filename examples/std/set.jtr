@@ -1,0 +1,137 @@
+// std/set.jtr — a set of `T`, and the algebra over it.
+//
+// ─── Why there is no `Set(T)` TYPE ─────────────────────────────────────────────
+//
+// A set is a `HashMap(T, bool)`, and this module says so rather than hiding it.
+// Both ways of hiding it are refused by the language, which is worth recording
+// because the next person will reach for them in the same order:
+//
+//   * `pub fn Set(comptime T: type) -> type { return hashmap.HashMap(T, bool) }`
+//     → "generic-struct constructor must `return struct { … }`". A type-returning
+//     function must produce a literal struct; it cannot alias another one.
+//   * `struct Set(T) { m: HashMap(T, bool) }` → a generic type cannot contain a
+//     pointer to another generic type, the same limit that made `hashmap` itself
+//     struct-of-arrays.
+//
+// The remaining honest option is a *newtype-free* module: the values are plain
+// `hashmap.HashMap(T, bool)` and everything here is a free function over them. The
+// cost is that a set and a map-to-bool are the same type to the checker. The
+// benefit is zero duplicated engine — one probing implementation, one hash, one
+// set of tombstone rules — which is the trade this codebase makes elsewhere
+// (`std/pathbuf` delegates rather than reimplementing `std/path`).
+//
+// ─── What the algebra costs ────────────────────────────────────────────────────
+//
+// `union`, `intersect` and `difference` walk the SLOT ARRAY of their input, so
+// they are O(capacity), not O(len) — see `hashmap`'s enumeration section. For a
+// set that has just been churned down from a large one, capacity can be much
+// larger than the element count. That is a property of open addressing, and it is
+// stated here rather than discovered later.
+//
+// Every result is a FRESH set built through the destination's own allocator and
+// hash, so an operation never aliases its inputs and the caller owns the result.
+//
+// Run the tests:  jestyrc test examples/std/set_test.jtr
+
+import "hashmap"
+import "mem"
+
+// An empty set over `T`. The hash and equality functions are the caller's, for
+// exactly the reasons `hashmap.make` documents.
+@no_os pub fn make(comptime T: type, read a: Allocator, h: fn(T) -> u64, e: fn(T, T) -> bool) -> hashmap.HashMap(T, bool) {
+    return hashmap.make(T, bool, a, h, e)
+}
+
+// Add `x`. Idempotent: adding a member again leaves the set unchanged.
+@no_os pub fn add(comptime T: type, mut s: hashmap.HashMap(T, bool), x: T) {
+    hashmap.put(T, bool, s, x, true)
+}
+
+// Remove `x`, reporting whether it was a member.
+@no_os pub fn discard(comptime T: type, mut s: hashmap.HashMap(T, bool), x: T) -> bool {
+    return hashmap.remove(T, bool, s, x)
+}
+
+@no_os pub fn contains(comptime T: type, read s: hashmap.HashMap(T, bool), x: T) -> bool {
+    return hashmap.has(T, bool, s, x)
+}
+
+@no_os pub fn len(comptime T: type, read s: hashmap.HashMap(T, bool)) -> usize {
+    return hashmap.len(T, bool, s)
+}
+
+@no_os pub fn is_empty(comptime T: type, read s: hashmap.HashMap(T, bool)) -> bool {
+    return hashmap.is_empty(T, bool, s)
+}
+
+// Copy every member of `src` into `dst`. The primitive the algebra below is built
+// from, and useful on its own.
+@no_os pub fn add_all(comptime T: type, mut dst: hashmap.HashMap(T, bool), read src: hashmap.HashMap(T, bool)) {
+    let n: usize = hashmap.slots(T, bool, src)
+    var i: usize = 0
+    for i < n {
+        if hashmap.slot_live(T, bool, src, i) {
+            hashmap.put(T, bool, dst, hashmap.slot_key(T, bool, src, i), true)
+        }
+        i = i + 1
+    }
+}
+
+// ---------------------------------------------------------------- the algebra
+//
+// Each builds a fresh set through `a`/`h`/`e` rather than borrowing one input's,
+// so the result is independent of both operands' storage and lifetime. That costs
+// an allocation and buys the caller not having to reason about which input the
+// answer aliases.
+
+// Every member of either.
+@no_os pub fn union_of(comptime T: type, read x: hashmap.HashMap(T, bool), read y: hashmap.HashMap(T, bool), read a: Allocator, h: fn(T) -> u64, e: fn(T, T) -> bool) -> hashmap.HashMap(T, bool) {
+    var out_set: hashmap.HashMap(T, bool) = hashmap.make(T, bool, a, h, e)
+    add_all(T, out_set, x)
+    add_all(T, out_set, y)
+    return out_set
+}
+
+// Every member of both. Walks `x` and probes `y`, so the cost is `x`'s CAPACITY
+// probes against `y` — pass the smaller set as `x` when it matters.
+@no_os pub fn intersect(comptime T: type, read x: hashmap.HashMap(T, bool), read y: hashmap.HashMap(T, bool), read a: Allocator, h: fn(T) -> u64, e: fn(T, T) -> bool) -> hashmap.HashMap(T, bool) {
+    var out_set: hashmap.HashMap(T, bool) = hashmap.make(T, bool, a, h, e)
+    let n: usize = hashmap.slots(T, bool, x)
+    var i: usize = 0
+    for i < n {
+        if hashmap.slot_live(T, bool, x, i) {
+            let k: T = hashmap.slot_key(T, bool, x, i)
+            if hashmap.has(T, bool, y, k) { hashmap.put(T, bool, out_set, k, true) }
+        }
+        i = i + 1
+    }
+    return out_set
+}
+
+// Members of `x` that are not in `y`.
+@no_os pub fn difference(comptime T: type, read x: hashmap.HashMap(T, bool), read y: hashmap.HashMap(T, bool), read a: Allocator, h: fn(T) -> u64, e: fn(T, T) -> bool) -> hashmap.HashMap(T, bool) {
+    var out_set: hashmap.HashMap(T, bool) = hashmap.make(T, bool, a, h, e)
+    let n: usize = hashmap.slots(T, bool, x)
+    var i: usize = 0
+    for i < n {
+        if hashmap.slot_live(T, bool, x, i) {
+            let k: T = hashmap.slot_key(T, bool, x, i)
+            if not hashmap.has(T, bool, y, k) { hashmap.put(T, bool, out_set, k, true) }
+        }
+        i = i + 1
+    }
+    return out_set
+}
+
+// Is every member of `x` also in `y`? Vacuously true for an empty `x`.
+@no_os pub fn is_subset(comptime T: type, read x: hashmap.HashMap(T, bool), read y: hashmap.HashMap(T, bool)) -> bool {
+    let n: usize = hashmap.slots(T, bool, x)
+    var i: usize = 0
+    for i < n {
+        if hashmap.slot_live(T, bool, x, i) {
+            if not hashmap.has(T, bool, y, hashmap.slot_key(T, bool, x, i)) { return false }
+        }
+        i = i + 1
+    }
+    return true
+}
