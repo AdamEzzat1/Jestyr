@@ -1,0 +1,140 @@
+// std/deque_demo.jtr — `std/deque`'s consumers: the two algorithms that are the
+// reason a double-ended queue exists.
+//
+//   deque_demo window <k>   sliding-window maximum over a fixed series
+//   deque_demo bfs <start>   breadth-first order over a fixed graph
+//
+// SLIDING-WINDOW MAXIMUM is the canonical deque algorithm and the better
+// demonstration: it uses every operation. The deque holds INDICES whose values
+// are strictly decreasing, so the front is always the current window's maximum.
+// Each step pops from the FRONT (evicting an index that has slid out of the
+// window) and from the BACK (dropping indices whose values the new element
+// dominates, since they can never be a maximum again). Both ends, O(1) each,
+// which is exactly what a `List` cannot give: evicting from the front there
+// shifts every remaining element and makes the whole scan quadratic.
+//
+// BFS is the other classic — a queue, front to back, and the standard reason a
+// program reaches for one.
+//
+// Both are deterministic: fixed input, fixed output, no clock and no allocation
+// order dependence, so they are safe to compare byte-for-byte across platforms.
+
+import "deque"
+import "mem"
+
+const N: usize = 16
+const NONE: i64 = 0 - 1
+
+// The series the window slides over. Deliberately not monotone, with a repeated
+// maximum and a run of descending values, so the back-popping rule is exercised.
+const SERIES: [16]i64 = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3]
+
+// An 8-node graph as an adjacency matrix, flattened row-major. Row `i` column `j`
+// is 1 when `i -> j`. Undirected, and deliberately containing a cycle so BFS's
+// visited check is doing real work rather than the graph being a tree.
+const NODES: usize = 8
+const ADJ: [64]i64 = [
+    0, 1, 1, 0, 0, 0, 0, 0,
+    1, 0, 1, 1, 0, 0, 0, 0,
+    1, 1, 0, 0, 1, 0, 0, 0,
+    0, 1, 0, 0, 1, 1, 0, 0,
+    0, 0, 1, 1, 0, 0, 1, 0,
+    0, 0, 0, 1, 0, 0, 1, 0,
+    0, 0, 0, 0, 1, 1, 0, 1,
+    0, 0, 0, 0, 0, 0, 1, 0,
+]
+
+fn parse_i64(read s: str) -> i64 {
+    var n: i64 = 0
+    var i: usize = 0
+    for i < s.len {
+        let d: i64 = (s[i] as i64) - 48
+        if d >= 0 {
+            if d <= 9 { n = n * 10 + d }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// The maximum of every length-`k` window, printed one per line.
+//
+// The invariant: the deque holds indices in increasing order whose SERIES values
+// are strictly decreasing. Front = the window's maximum.
+fn window_max(read a: Allocator, k: usize) {
+    var dq: deque.Deque(i64) = deque.make(i64, a)
+    var i: usize = 0
+    for i < N {
+        // Evict the front once it has slid out of the window.
+        if not deque.is_empty(i64, dq) {
+            let oldest: i64 = deque.front(i64, dq, NONE)
+            if (oldest as usize) + k <= i { deque.pop_front(i64, dq, NONE) }
+        }
+        // Drop back indices this element dominates — they can never win again.
+        var draining: bool = true
+        for draining {
+            if deque.is_empty(i64, dq) {
+                draining = false
+            } else {
+                let last: i64 = deque.back(i64, dq, NONE)
+                if SERIES[last as usize] <= SERIES[i] {
+                    deque.pop_back(i64, dq, NONE)
+                } else {
+                    draining = false
+                }
+            }
+        }
+        deque.push_back(i64, dq, i as i64)
+        // Once the first full window exists, the front is its maximum.
+        if i + 1 >= k {
+            print_int(SERIES[deque.front(i64, dq, NONE) as usize])
+        }
+        i = i + 1
+    }
+}
+
+// Breadth-first visit order from `start`, one node per line.
+fn bfs(read a: Allocator, start: i64) {
+    var seen: [8]i64 = [0; 8]
+    var q: deque.Deque(i64) = deque.make(i64, a)
+    deque.push_back(i64, q, start)
+    seen[start as usize] = 1
+    for not deque.is_empty(i64, q) {
+        let node: i64 = deque.pop_front(i64, q, NONE)
+        print_int(node)
+        var j: usize = 0
+        for j < NODES {
+            if ADJ[(node as usize) * NODES + j] == 1 {
+                if seen[j] == 0 {
+                    seen[j] = 1
+                    deque.push_back(i64, q, j as i64)
+                }
+            }
+            j = j + 1
+        }
+    }
+}
+
+fn main() -> i32 {
+    var sys: Allocator = mem.system_allocator()
+    if arg_count() < 3 {
+        print_str("usage: deque_demo window <k> | bfs <start>")
+        return 1
+    }
+    let mode: str = arg(1)
+    let n: i64 = parse_i64(arg(2))
+
+    if str_eq(mode, "window") {
+        if n < 1 { return 1 }
+        window_max(sys, n as usize)
+        return 0
+    }
+    if str_eq(mode, "bfs") {
+        if n < 0 { return 1 }
+        if n >= 8 { return 1 }
+        bfs(sys, n)
+        return 0
+    }
+    print_str("unknown mode")
+    return 1
+}

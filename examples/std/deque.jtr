@@ -1,0 +1,179 @@
+// std/deque.jtr — a double-ended queue over a growable ring buffer.
+//
+// The second container of Collections v2, and a genuinely different engine from
+// `std/hashmap`: no hashing, no probing, no tombstones. What they share is the
+// shape the language forces on any container here — `comptime T: type`, a stored
+// `Allocator`, a blanket `impl[T] Drop`.
+//
+// ─── The ring, and why capacity is a power of two ─────────────────────────────
+//
+// Elements live in `cap` slots with the front at `head`; logical index `i` is at
+// physical slot `(head + i) & (cap - 1)`. The mask is why capacity is a power of
+// two: wraparound costs one AND rather than a `%`, and `push_front` can step
+// backwards as `(head + cap - 1) & (cap - 1)` without a signed underflow.
+//
+// A ring is what makes both ends O(1). A `List(T)` can push and pop at the back
+// cheaply, but removing from the FRONT shifts every remaining element — so a
+// queue built on `List` is quadratic in exactly the workload queues exist for.
+//
+// ─── Growth re-linearises ─────────────────────────────────────────────────────
+//
+// A grow copies elements out in LOGICAL order and resets `head` to 0, so the new
+// buffer is contiguous. Copying the old buffer verbatim would preserve the split
+// and force every later index to keep masking against the old capacity.
+//
+// ─── What this does NOT do ────────────────────────────────────────────────────
+//
+//   * Elements are stored BY VALUE and the deque never frees them — the same
+//     contract as `std/hashmap`'s keys. For `T` owning heap memory, drain the
+//     deque and release the elements yourself before it drops.
+//   * `pop_*` and `front`/`back` take a `take default: T` for the empty case, for
+//     the reason `hashmap.get` does: a plain `read` parameter is a second-class
+//     borrow that may not outlive the call, which for an opaque `T` the escape
+//     checker cannot see past. Pair them with `is_empty` when the default would
+//     be ambiguous.
+//
+// Run the tests:  jestyrc test examples/std/deque_test.jtr
+
+import "mem"
+
+pub fn Deque(comptime T: type) -> type {
+    return struct {
+        ptr: *mut T,
+        head: usize,   // physical slot of the front element
+        len: usize,
+        cap: usize,    // power of two (0 = unallocated)
+        a: Allocator,
+    }
+}
+
+// `unsafe { ptr.* }` is legal only in statement/return position, so reads go
+// through a tail-`unsafe` helper — the same shape `strmap` and `hashmap` use.
+@no_os fn at(comptime T: type, p: *mut T, i: usize) -> T {
+    unsafe { (p + i).* }
+}
+
+// ------------------------------------------------------------------ construction
+
+// An empty deque bound to allocator `a`. Owns no memory until the first push.
+@no_os pub fn make(comptime T: type, read a: Allocator) -> Deque(T) {
+    return Deque(T){ ptr: null, head: 0, len: 0, cap: 0, a: a }
+}
+
+@no_os pub fn len(comptime T: type, read d: Deque(T)) -> usize {
+    return d.len
+}
+
+@no_os pub fn cap(comptime T: type, read d: Deque(T)) -> usize {
+    return d.cap
+}
+
+@no_os pub fn is_empty(comptime T: type, read d: Deque(T)) -> bool {
+    return d.len == 0
+}
+
+// ----------------------------------------------------------------------- growth
+
+// Double the ring (from 8), copying elements out in LOGICAL order so the result
+// is contiguous and `head` returns to 0.
+@no_os fn grow(comptime T: type, mut d: Deque(T)) {
+    var newcap: usize = 8
+    if d.cap != 0 { newcap = d.cap * 2 }
+    var np: *mut T = mem.allocate(T, d.a, newcap)
+    var i: usize = 0
+    for i < d.len {
+        let slot: usize = (d.head + i) & (d.cap - 1)
+        unsafe { (np + i).* = at(T, d.ptr, slot) }
+        i = i + 1
+    }
+    if d.cap != 0 { mem.release(T, d.a, d.ptr) }
+    d.ptr = np
+    d.cap = newcap
+    d.head = 0
+}
+
+@no_os fn reserve_one(comptime T: type, mut d: Deque(T)) {
+    if d.len == d.cap { grow(T, d) }
+}
+
+// -------------------------------------------------------------------- the ends
+
+@no_os pub fn push_back(comptime T: type, mut d: Deque(T), x: T) {
+    reserve_one(T, d)
+    let slot: usize = (d.head + d.len) & (d.cap - 1)
+    unsafe { (d.ptr + slot).* = x }
+    d.len = d.len + 1
+}
+
+// Step `head` backwards through the mask. `+ cap - 1` rather than `- 1` because
+// `head` is a `usize` and slot 0 must wrap to the top rather than underflow.
+@no_os pub fn push_front(comptime T: type, mut d: Deque(T), x: T) {
+    reserve_one(T, d)
+    let slot: usize = (d.head + d.cap - 1) & (d.cap - 1)
+    unsafe { (d.ptr + slot).* = x }
+    d.head = slot
+    d.len = d.len + 1
+}
+
+@no_os pub fn pop_front(comptime T: type, mut d: Deque(T), take default: T) -> T {
+    if d.len == 0 { return default }
+    let v: T = at(T, d.ptr, d.head)
+    d.head = (d.head + 1) & (d.cap - 1)
+    d.len = d.len - 1
+    return v
+}
+
+@no_os pub fn pop_back(comptime T: type, mut d: Deque(T), take default: T) -> T {
+    if d.len == 0 { return default }
+    let slot: usize = (d.head + d.len - 1) & (d.cap - 1)
+    d.len = d.len - 1
+    return at(T, d.ptr, slot)
+}
+
+// ------------------------------------------------------------------- inspection
+
+@no_os pub fn front(comptime T: type, read d: Deque(T), take default: T) -> T {
+    if d.len == 0 { return default }
+    return at(T, d.ptr, d.head)
+}
+
+@no_os pub fn back(comptime T: type, read d: Deque(T), take default: T) -> T {
+    if d.len == 0 { return default }
+    return at(T, d.ptr, (d.head + d.len - 1) & (d.cap - 1))
+}
+
+// The element at LOGICAL index `i` — 0 is the front. Random access is O(1); the
+// ring is an array, not a linked list.
+@no_os pub fn get(comptime T: type, read d: Deque(T), i: usize, take default: T) -> T {
+    if i >= d.len { return default }
+    return at(T, d.ptr, (d.head + i) & (d.cap - 1))
+}
+
+// --------------------------------------------------------------------- teardown
+
+// Drop every element. The buffer is KEPT, so a queue that is drained and refilled
+// does not re-allocate — the usual lifecycle for a work queue.
+@no_os pub fn clear(comptime T: type, mut d: Deque(T)) {
+    d.len = 0
+    d.head = 0
+}
+
+@no_os fn release_buf(read a: Allocator, p: *mut u8, n: usize) {
+    if n != 0 { mem.free_bytes(a, p) }
+}
+
+// Explicit teardown. Idempotent (it zeroes `cap`), so calling it AND letting the
+// automatic drop run releases exactly once — the `std/list` contract.
+@no_os pub fn free(comptime T: type, mut d: Deque(T)) {
+    release_buf(d.a, d.ptr as *mut u8, d.cap)
+    d.ptr = null
+    d.head = 0
+    d.len = 0
+    d.cap = 0
+}
+
+impl[T] Drop for Deque(T) {
+    fn drop(mut self) {
+        release_buf(self.a, self.ptr as *mut u8, self.cap)
+    }
+}

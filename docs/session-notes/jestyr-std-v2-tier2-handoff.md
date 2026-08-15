@@ -43,11 +43,37 @@ of its four points turned out to be wrong in ways the next container will hit to
   columns — which is the better probe layout anyway.
 * Point 4 (**pick one**) held and still holds.
 
-**`remove`, enumeration and `std/set` have since landed too.** What is left in this
-area: **`Deque(T)`** (a ring buffer — a genuinely separate engine, not a variation on
-this one) and **`SmallVec`** (inline storage, which needs a `[N]T` field inside a
-generic type — expect the same "type-expressions" refusal that forced struct-of-arrays,
-so PROBE IT FIRST). Neither is urgent; each wants a consumer.
+**AREA 4 IS NOW COMPLETE as scoped**: `HashMap` (+ `remove`, enumeration), `set`,
+`Deque(T)` and `SmallVec(T)` all exist, each with tests and a consumer.
+
+My prediction that `SmallVec` would hit the "type-expressions" refusal was **wrong** —
+an inline `[8]T` inside a generic type is fine, because a fixed-size array of a type
+PARAMETER is not another generic instantiation. What it hit instead was three other
+things, all worth knowing:
+
+* **A comptime VALUE parameter is not accepted in type position.** `SmallVec(i64, 4)`
+  → "expected a type, found `int`", so the inline capacity is a fixed constant, not a
+  caller-chosen `N`.
+* **An opaque `T` cannot be returned from an array field by value.** `return v.buf[i]`
+  reads as letting a borrow of the receiver escape. The fix is the one the diagnostic
+  suggests: declare the return `-> read T`. Two other routes — coercing the array to a
+  slice for its `.ptr`, and `&v.buf` — **passed `jestyrc check` and then failed in
+  gcc**, which is §1.3.2's hole hit twice in ten minutes. **Probe with `run`, never
+  `check`.**
+* **A real cgen bug** (fixed here): a generic struct's array FIELD never got its
+  `JestyrArr_<T>_<N>` typedef emitted, so the struct referenced a type nothing defined.
+  Single-file programs hid it — an inline `[0; 8]` literal in a non-generic caller is
+  concrete and the per-expression scan caught it; move the constructor into an imported
+  module and the literal moves into the generic body, where its type is `[8]T` and not
+  concrete. **The module boundary was the trigger.**
+
+**The one debt this leaves:** that cgen fix is an emission change and is **NOT mirrored
+in `examples/std/cgen.jtr`** — the port's `emit_array_defs` mirrors only the reference's
+original two scans, and adding a generic-struct-instantiation walk there is a real piece
+of work. So `smallvec.jtr`/`smallvec_test.jtr` are deliberately **kept out of
+`CGEN_GOLDEN_ALLOWLIST`** (which is opt-in), and `jc` cannot compile them today. Nothing
+else is affected: the change only ADDS typedefs for generic structs with array fields,
+and no closure module has one — the seed is unchanged. Mirroring it is the follow-up.
 
 Two limits found while adding `set`, both worth knowing before designing a container:
 

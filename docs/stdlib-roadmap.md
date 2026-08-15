@@ -167,6 +167,32 @@ Set algebra needed enumeration, which the map did not have; `slots`/`slot_live`/
 `slot_key`/`slot_val` expose indexed access to the slot array rather than a fake
 iterator, because the walk is O(capacity) and an iterator-shaped API would disguise that.
 
+`deque.jtr` is `Deque(T)`, a growable ring buffer — a genuinely different engine from the
+map, sharing only the shape the language forces (`comptime T`, a stored `Allocator`, a
+blanket `Drop`). Capacity is a power of two so wraparound is one AND, and `push_front`
+steps back as `(head + cap - 1) & (cap - 1)` without a signed underflow. A grow copies
+elements out in LOGICAL order and resets `head` to 0; copying the buffer verbatim is the
+bug every hand-written ring has once, and the mutation that does so is caught only by
+`growth_while_wrapped_preserves_order`. Consumers: sliding-window maximum (the canonical
+monotonic-deque algorithm, which uses all four ends and is checked against a brute-force
+oracle for every window size) and breadth-first search.
+
+`smallvec.jtr` is `SmallVec(T)`, which keeps its first eight elements in the value and
+allocates only on overflow — `is_spilled` is public precisely so a caller can assert the
+no-allocation path. Three constraints shaped it: an inline `[8]T` inside a generic type
+is fine, but a comptime VALUE parameter is not accepted in type position (so the inline
+capacity is fixed, not caller-chosen); an opaque `T` cannot be returned from an array
+field by value, so `get`/`last` return `-> read T` and are caller-checked exactly as
+`std/list.get` is; and there is **no self-pointer** into the inline buffer, because a
+`SmallVec` is an ordinary value whose every copy would leave such a pointer dangling
+silently — `spilled` discriminates instead, and `an_inline_vector_is_a_value_not_a_reference`
+pins it.
+
+**Known debt:** `smallvec` required a cgen fix (a generic struct's array field never got
+its `JestyrArr_<T>_<N>` typedef emitted across a module boundary) that is not yet mirrored
+in the self-hosted backend, so the two `smallvec` files are deliberately outside
+`CGEN_GOLDEN_ALLOWLIST` and `jc` cannot compile them. No other program is affected.
+
 `pathbuf.jtr` is the owned counterpart to `core`'s borrowed `path`, and it is worth
 reading for *why* it exists rather than what it does. A Jestyr `String` is **manually**
 freed, and B1's field auto-drop recurses only into fields that are themselves droppable

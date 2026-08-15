@@ -9200,6 +9200,34 @@ impl<'a> Cgen<'a> {
                 }
             }
         }
+        // Generic STRUCT instantiations, whose array FIELDS the walks above miss.
+        //
+        // `SmallVec(T) = struct { buf: [8]T, … }` mentions `[8]T` only inside the
+        // generic body, where it is not concrete and `add` rejects it; the concrete
+        // `[8]i64` never appears as an expression type of its own, because nothing
+        // ever names the field's type. The emitted struct then referenced
+        // `JestyrArr_i64_8` while nothing defined it — resolution, typeck and the
+        // escape checker all passed and **gcc** failed on an unknown type name, the
+        // degrades-to-gcc mode again.
+        //
+        // Single-file programs escaped it by accident: an inline `[0; 8]` literal in
+        // a non-generic caller has a concrete type, so the first loop caught it. Put
+        // the constructor in an imported module and the literal moves into the
+        // generic body, where it does not.
+        for t in &self.info.expr_types {
+            let Ty::GenStruct { ctor, args } = t else { continue };
+            let Some(f) = self.find_fn(ctor) else { continue };
+            let Some(body) = self.ctor_struct_body(f) else { continue };
+            let names = self.type_param_names(f);
+            let subst: HashMap<String, Ty> = names.into_iter().zip(args.iter().cloned()).collect();
+            for m in &body.members {
+                if let StructMember::Field { ty, .. } = m {
+                    if matches!(self.ast.type_at(*ty).kind, TypeKind::Array { .. }) {
+                        add(self.ast_type_to_ty(*ty, &subst), &mut seen, &mut out);
+                    }
+                }
+            }
+        }
         out
     }
 
@@ -11697,6 +11725,35 @@ mod tests {
         assert!(d.is_empty(), "{:?}", d);
         assert!(c.contains("(&jestyr_dbl)"), "address-of-fn is the mangled C symbol: {c}");
         assert!(c.contains("j_op(21)"), "the call through `op` is indirect: {c}");
+    }
+
+    /// **A generic struct's array FIELD needs its typedef emitted.**
+    ///
+    /// `SmallVec(T) = struct { buf: [8]T, … }` mentions `[8]T` only inside the
+    /// generic body, where it is not concrete; the concrete `[8]i64` is never an
+    /// expression type of its own. So the emitted struct referenced
+    /// `JestyrArr_i64_8` and nothing defined it — resolution, typeck and the escape
+    /// checker all passed, and gcc failed on an unknown type name.
+    ///
+    /// Single-file programs hid it: an inline `[0; 8]` literal in a non-generic
+    /// caller is concrete, so the per-expression scan caught it. This test goes
+    /// through the module loader, because the module boundary IS the trigger.
+    #[test]
+    fn a_generic_structs_array_field_gets_its_typedef() {
+        let prog = crate::module::load("examples/std/smallvec_test.jtr");
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(td.is_empty(), "{td:?}");
+        let (c, cd) = emit(&prog.ast, &info);
+        assert!(cd.is_empty(), "{cd:?}");
+        assert!(
+            c.contains("} JestyrArr_i64_8;"),
+            "the inline array's typedef must be DEFINED, not just referenced"
+        );
+        // …and it is defined before the struct that embeds it by value.
+        let def = c.find("} JestyrArr_i64_8;").unwrap();
+        let use_ = c.find("JestyrArr_i64_8 j_buf;").unwrap();
+        assert!(def < use_, "the typedef must precede the struct embedding it");
     }
 
     /// **`&mod.f` is a function address, not a field access.**

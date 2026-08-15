@@ -1,0 +1,223 @@
+// std/smallvec.jtr — a growable sequence that does not allocate until it has to.
+//
+// The third container of Collections v2. `List(T)` allocates on its first push;
+// `SmallVec(T)` keeps the first `INLINE` elements in the value itself and only
+// reaches for the allocator when it overflows. For the common shape — a handful of
+// path segments, a few function arguments, the operands of one expression — that
+// is the difference between one heap round-trip per call and none.
+//
+// ─── The one rule that makes this safe: NO SELF-POINTER ───────────────────────
+//
+// The obvious implementation keeps a single `ptr` that points either at the heap
+// or at the inline array, so every read is one indirection. **That is a
+// use-after-move waiting to happen.** A `SmallVec` is an ordinary value: `make`
+// returns one by value, and any assignment or argument pass copies the struct —
+// at which point a pointer into the OLD struct's inline array is dangling, and it
+// dangles silently because the bytes it points at are still mapped and still
+// plausible.
+//
+// So there is no self-pointer. `spilled` says which storage is live, and each
+// accessor branches. The cost is a predictable branch per access; the benefit is
+// that moving a `SmallVec` is just copying bytes, which is what the language
+// already assumes about every value.
+//
+// ─── Why the inline capacity is a fixed constant ──────────────────────────────
+//
+// `SmallVec(T, N)` with a caller-chosen `N` is not expressible: a comptime VALUE
+// parameter is not accepted in type position (`SmallVec(i64, 4)` → "expected a
+// type, found `int`"). An inline `[8]T` inside a generic type IS fine — that was
+// probed, and it is the one place `hashmap`'s "no nested generic types" limit does
+// not bite, because a fixed-size array of a type PARAMETER is not another generic
+// instantiation.
+//
+// So `INLINE` is fixed here. One size, not a family — the "no collections zoo"
+// rule applied inside a single container.
+//
+// ─── Why `make` wants a seed value ────────────────────────────────────────────
+//
+// The inline array has to be initialised, and an opaque `T` has no zero this
+// module can invent — there is no `Default` trait and no way to spell "the zero of
+// T". So `make` takes one value of `T` to fill the unused slots with. It is never
+// read back (`len` bounds every accessor); it exists because the array must hold
+// *something*.
+//
+//   * Elements are stored BY VALUE and never freed, as in `deque` and `hashmap`.
+//   * Once spilled, a `SmallVec` stays spilled — `clear` keeps the heap buffer,
+//     because a container that un-spilled would free and re-allocate on exactly
+//     the sawtooth workload this type exists to make cheap.
+//
+// Run the tests:  jestyrc test examples/std/smallvec_test.jtr
+
+import "mem"
+
+// The number of elements held without allocating. Eight is the usual answer: it
+// keeps the value small enough to pass around freely while covering the "a
+// handful" cases this type is for.
+pub const INLINE: usize = 8
+
+pub fn SmallVec(comptime T: type) -> type {
+    return struct {
+        buf: [8]T,       // live while `spilled` is false
+        ptr: *mut T,     // live while `spilled` is true — never points at `buf`
+        len: usize,
+        cap: usize,      // heap capacity; 0 while inline
+        spilled: bool,
+        a: Allocator,
+    }
+}
+
+@no_os fn at(comptime T: type, p: *mut T, i: usize) -> T {
+    unsafe { (p + i).* }
+}
+
+// ------------------------------------------------------------------ construction
+
+// An empty `SmallVec`. `zero` fills the inline array's unused slots and is never
+// read back — see the header.
+@no_os pub fn make(comptime T: type, read a: Allocator, zero: T) -> SmallVec(T) {
+    return SmallVec(T){ buf: [zero; 8], ptr: null, len: 0, cap: 0, spilled: false, a: a }
+}
+
+@no_os pub fn len(comptime T: type, read v: SmallVec(T)) -> usize {
+    return v.len
+}
+
+@no_os pub fn is_empty(comptime T: type, read v: SmallVec(T)) -> bool {
+    return v.len == 0
+}
+
+// Has this vector reached for the allocator? The observable property the type
+// exists to provide, so it is part of the API rather than an internal detail —
+// a caller tuning for the no-allocation path needs to be able to assert on it.
+@no_os pub fn is_spilled(comptime T: type, read v: SmallVec(T)) -> bool {
+    return v.spilled
+}
+
+// Total capacity before the next allocation: the inline size while inline.
+@no_os pub fn cap(comptime T: type, read v: SmallVec(T)) -> usize {
+    if v.spilled { return v.cap }
+    return INLINE
+}
+
+// ----------------------------------------------------------------------- growth
+
+// Move to the heap, doubling the inline capacity. One-way: nothing un-spills.
+@no_os fn spill(comptime T: type, mut v: SmallVec(T)) {
+    let newcap: usize = INLINE * 2
+    var np: *mut T = mem.allocate(T, v.a, newcap)
+    var i: usize = 0
+    for i < v.len {
+        unsafe { (np + i).* = v.buf[i] }
+        i = i + 1
+    }
+    v.ptr = np
+    v.cap = newcap
+    v.spilled = true
+}
+
+@no_os fn grow_heap(comptime T: type, mut v: SmallVec(T)) {
+    let newcap: usize = v.cap * 2
+    var np: *mut T = mem.allocate(T, v.a, newcap)
+    var i: usize = 0
+    for i < v.len {
+        unsafe { (np + i).* = at(T, v.ptr, i) }
+        i = i + 1
+    }
+    mem.release(T, v.a, v.ptr)
+    v.ptr = np
+    v.cap = newcap
+}
+
+// ------------------------------------------------------------------ the sequence
+
+@no_os pub fn push(comptime T: type, mut v: SmallVec(T), take x: T) {
+    if not v.spilled {
+        if v.len < INLINE {
+            v.buf[v.len] = x
+            v.len = v.len + 1
+            return
+        }
+        spill(T, v)
+    }
+    if v.len == v.cap { grow_heap(T, v) }
+    unsafe { (v.ptr + v.len).* = x }
+    v.len = v.len + 1
+}
+
+// Element `i`, as a BORROW valid while `v` is.
+//
+// `-> read T` rather than `-> T`, and that is forced rather than chosen. For an
+// opaque `T` the escape checker cannot tell a copy from a borrow, so returning
+// `v.buf[i]` by value reads as letting a borrow of the receiver escape. Two other
+// routes were tried and BOTH passed `jestyrc check` and then failed in gcc —
+// coercing the fixed array to a slice for its `.ptr`, and taking `&v.buf` — which
+// is the "degrades to gcc" hole §1.3.2 of the Tier 2 note is about. Declaring the
+// borrow is the honest answer, and it is what the escape diagnostic suggests.
+//
+// CALLER-CHECKED: `i` must be `< len`, exactly as `std/list.get` requires. A
+// bounds-checked variant is the same future work there and here.
+@no_os pub fn get(comptime T: type, read v: SmallVec(T), i: usize) -> read T {
+    if v.spilled { unsafe { return (v.ptr + i).* } }
+    return v.buf[i]
+}
+
+// The last element, as a borrow. Caller-checked: the vector must not be empty.
+// Pair with `pop`, which reports emptiness, when that is not already known.
+@no_os pub fn last(comptime T: type, read v: SmallVec(T)) -> read T {
+    let i: usize = v.len - 1
+    if v.spilled { unsafe { return (v.ptr + i).* } }
+    return v.buf[i]
+}
+
+@no_os pub fn set(comptime T: type, mut v: SmallVec(T), i: usize, take x: T) -> bool {
+    if i >= v.len { return false }
+    if v.spilled {
+        unsafe { (v.ptr + i).* = x }
+        return true
+    }
+    v.buf[i] = x
+    return true
+}
+
+// Shrink by one, reporting whether there was anything to remove.
+//
+// It does NOT return the element. A `-> read T` return would hand back a borrow of
+// storage the vector has just disowned — valid today, because popping only moves
+// `len`, and a trap the moment `pop` ever zeroes or reuses the slot. Read `last`
+// first when the value is wanted; the compiler then sees the borrow end before
+// the removal, which is the order that stays true.
+@no_os pub fn pop(comptime T: type, mut v: SmallVec(T)) -> bool {
+    if v.len == 0 { return false }
+    v.len = v.len - 1
+    return true
+}
+
+// --------------------------------------------------------------------- teardown
+
+// Drop every element, KEEPING any heap buffer — see the header on why this does
+// not un-spill.
+@no_os pub fn clear(comptime T: type, mut v: SmallVec(T)) {
+    v.len = 0
+}
+
+@no_os fn release_buf(read a: Allocator, p: *mut u8, n: usize) {
+    if n != 0 { mem.free_bytes(a, p) }
+}
+
+// Explicit teardown: release the heap buffer and return to the inline state.
+// Idempotent (it clears `spilled` and zeroes `cap`), so it composes with the
+// automatic drop — the `std/list` contract.
+@no_os pub fn free(comptime T: type, mut v: SmallVec(T)) {
+    if v.spilled { release_buf(v.a, v.ptr as *mut u8, v.cap) }
+    v.ptr = null
+    v.cap = 0
+    v.len = 0
+    v.spilled = false
+}
+
+impl[T] Drop for SmallVec(T) {
+    fn drop(mut self) {
+        // Only a spilled vector owns anything; an inline one is pure value.
+        if self.spilled { release_buf(self.a, self.ptr as *mut u8, self.cap) }
+    }
+}

@@ -1,0 +1,206 @@
+// std/smallvec_test.jtr — the unit suite for `std/smallvec`.
+//
+// A sibling file, not colocated: a `@test` is emitted into every consumer of its
+// module (see `path_test.jtr` for the measurement).
+//
+// The suite that defines the type is `stays_inline_until_it_cannot`. Everything
+// else here would also pass for a plain `List(T)`; only that one asserts the
+// property the type exists for, and `is_spilled` is public precisely so it can.
+//
+// Run:  jestyrc test examples/std/smallvec_test.jtr
+
+import "smallvec"
+import "mem"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 512
+const NONE: i64 = 0 - 1
+
+// THE property. Eight pushes must not allocate; the ninth must.
+@test fn stays_inline_until_it_cannot() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var v: smallvec.SmallVec(i64) = smallvec.make(i64, sys, 0)
+    test.is_false(c, rep, "fresh is inline", smallvec.is_spilled(i64, v))
+    test.eq_usize(c, rep, "inline capacity", smallvec.cap(i64, v), 8)
+
+    var i: i64 = 0
+    for i < 8 {
+        smallvec.push(i64, v, i)
+        i = i + 1
+    }
+    test.eq_usize(c, rep, "len at the inline limit", smallvec.len(i64, v), 8)
+    test.is_false(c, rep, "8 elements still inline", smallvec.is_spilled(i64, v))
+
+    // The ninth is the one that must reach for the allocator.
+    smallvec.push(i64, v, 8)
+    test.is_true(c, rep, "9 elements has spilled", smallvec.is_spilled(i64, v))
+    test.eq_usize(c, rep, "capacity after spilling", smallvec.cap(i64, v), 16)
+
+    // …and nothing was lost in the move to the heap.
+    var bad: i64 = 0
+    var j: usize = 0
+    for j < 9 {
+        if smallvec.get(i64, v, j) != j as i64 { bad = bad + 1 }
+        j = j + 1
+    }
+    test.eq_i64(c, rep, "elements lost in the spill", bad, 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The sequence behaves the same either side of the spill boundary — which is the
+// whole contract, since a caller is not supposed to care which storage is live.
+@test fn the_sequence_reads_the_same_inline_and_spilled() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    // Inline: push, read, overwrite, pop.
+    var v: smallvec.SmallVec(i64) = smallvec.make(i64, sys, 0)
+    smallvec.push(i64, v, 10)
+    smallvec.push(i64, v, 20)
+    smallvec.push(i64, v, 30)
+    test.eq_i64(c, rep, "get inline", smallvec.get(i64, v, 1), 20)
+    test.is_true(c, rep, "set inline", smallvec.set(i64, v, 1, 21))
+    test.eq_i64(c, rep, "set took effect inline", smallvec.get(i64, v, 1), 21)
+    test.eq_i64(c, rep, "last before pop", smallvec.last(i64, v), 30)
+    test.is_true(c, rep, "pop inline", smallvec.pop(i64, v))
+    test.eq_usize(c, rep, "len after pop", smallvec.len(i64, v), 2)
+
+    // Spilled: the same four operations, past the boundary.
+    var w: smallvec.SmallVec(i64) = smallvec.make(i64, sys, 0)
+    var i: i64 = 0
+    for i < 20 {
+        smallvec.push(i64, w, i * 10)
+        i = i + 1
+    }
+    test.is_true(c, rep, "spilled", smallvec.is_spilled(i64, w))
+    test.eq_i64(c, rep, "get spilled", smallvec.get(i64, w, 15), 150)
+    test.is_true(c, rep, "set spilled", smallvec.set(i64, w, 15, 151))
+    test.eq_i64(c, rep, "set took effect spilled", smallvec.get(i64, w, 15), 151)
+    test.eq_i64(c, rep, "last before spilled pop", smallvec.last(i64, w), 190)
+    test.is_true(c, rep, "pop spilled", smallvec.pop(i64, w))
+    test.eq_usize(c, rep, "len after spilled pop", smallvec.len(i64, w), 19)
+
+    // Out-of-range access answers the default rather than reading past `len`, on
+    // both paths — including the slot just past the end, which still holds a value.
+    test.is_false(c, rep, "set past len inline", smallvec.set(i64, v, 9, 1))
+    test.is_false(c, rep, "set past len spilled", smallvec.set(i64, w, 99, 1))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// Repeated growth past the first heap capacity, so `grow_heap` runs more than once.
+@test fn repeated_growth_preserves_every_element() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var v: smallvec.SmallVec(i64) = smallvec.make(i64, sys, 0)
+    var i: i64 = 0
+    for i < 200 {
+        smallvec.push(i64, v, i * 3)
+        i = i + 1
+    }
+    test.eq_usize(c, rep, "len", smallvec.len(i64, v), 200)
+    test.is_true(c, rep, "cap kept ahead of len", smallvec.cap(i64, v) >= 200)
+
+    var bad: i64 = 0
+    var j: usize = 0
+    for j < 200 {
+        if smallvec.get(i64, v, j) != (j as i64) * 3 { bad = bad + 1 }
+        j = j + 1
+    }
+    test.eq_i64(c, rep, "elements lost across repeated growth", bad, 0)
+
+    // Draining agrees with random access, back to front.
+    var drain_ok: bool = true
+    var k: i64 = 199
+    for k >= 0 {
+        if smallvec.last(i64, v) != k * 3 { drain_ok = false }
+        if not smallvec.pop(i64, v) { drain_ok = false }
+        k = k - 1
+    }
+    // …and popping an empty vector reports that it did nothing.
+    test.is_false(c, rep, "pop(empty)", smallvec.pop(i64, v))
+    test.is_true(c, rep, "drain order", drain_ok)
+    test.is_true(c, rep, "empty after drain", smallvec.is_empty(i64, v))
+    // Draining does NOT un-spill — the buffer is kept for the next fill.
+    test.is_true(c, rep, "still spilled after drain", smallvec.is_spilled(i64, v))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn clear_keeps_the_buffer_and_free_returns_it_inline() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var v: smallvec.SmallVec(i64) = smallvec.make(i64, sys, 0)
+    var i: i64 = 0
+    for i < 30 {
+        smallvec.push(i64, v, i)
+        i = i + 1
+    }
+    let before: usize = smallvec.cap(i64, v)
+    smallvec.clear(i64, v)
+    test.is_true(c, rep, "empty after clear", smallvec.is_empty(i64, v))
+    test.eq_usize(c, rep, "clear keeps the buffer", smallvec.cap(i64, v), before)
+    test.is_true(c, rep, "clear does not un-spill", smallvec.is_spilled(i64, v))
+
+    // `free` releases the heap buffer and returns to the inline state, so a
+    // following automatic drop sees nothing to release. Both running is safe.
+    smallvec.free(i64, v)
+    test.is_false(c, rep, "free returns it inline", smallvec.is_spilled(i64, v))
+    test.eq_usize(c, rep, "inline capacity again", smallvec.cap(i64, v), 8)
+    test.is_true(c, rep, "empty after free", smallvec.is_empty(i64, v))
+
+    // …and it is immediately reusable, inline, without allocating.
+    smallvec.push(i64, v, 7)
+    test.eq_i64(c, rep, "reusable after free", smallvec.get(i64, v, 0), 7)
+    test.is_false(c, rep, "reuse does not allocate", smallvec.is_spilled(i64, v))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// A `SmallVec` is a plain value: copying it must copy the ELEMENTS, not share
+// storage. This is the test that would fail if the inline buffer were ever
+// reached through a stored self-pointer — the design rule the header is about.
+@test fn an_inline_vector_is_a_value_not_a_reference() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var v: smallvec.SmallVec(i64) = smallvec.make(i64, sys, 0)
+    smallvec.push(i64, v, 1)
+    smallvec.push(i64, v, 2)
+
+    // Copy while INLINE, then diverge the original.
+    var copy: smallvec.SmallVec(i64) = v
+    smallvec.set(i64, v, 0, 99)
+
+    test.eq_i64(c, rep, "the original changed", smallvec.get(i64, v, 0), 99)
+    test.eq_i64(c, rep, "the copy did not", smallvec.get(i64, copy, 0), 1)
+    test.eq_usize(c, rep, "the copy kept its length", smallvec.len(i64, copy), 2)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
