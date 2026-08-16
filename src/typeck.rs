@@ -1141,8 +1141,33 @@ impl<'a> TypeChecker<'a> {
         if want == got {
             return true;
         }
-        // Only primitive-vs-primitive is judged. Anything else — named types,
-        // generics, slices, references, fn-pointers, `dyn` coercions — has a
+        // A SLICE is a `{ptr, len}` pair. A raw pointer is not (it has no length)
+        // and a fixed array is not (it is a value, `struct { T a[N]; }`). There is
+        // no implicit conversion in any of those directions, and cgen emits none —
+        // `slice(T, p, n)` is the explicit spelling, and it exists precisely because
+        // the length has to come from somewhere.
+        //
+        // This is judged HERE rather than left to the "not modelled yet" default
+        // below, because the default was not neutral: it accepted the mismatch and
+        // let it reach gcc as `incompatible type for argument 1`. That is the
+        // degrades-to-gcc failure the port work spent real effort eliminating, and
+        // it makes `check` a false negative for an easy mistake — one made twice
+        // while writing `std/test_report` and again while writing `std/smallvec`,
+        // where `let s: []T = a` on a fixed array passed `check` and failed in gcc.
+        //
+        // Deliberately narrow: only the pairings that have no conversion at all in
+        // either direction. Everything else the default still declines to judge.
+        let no_conversion = |a: &Ty, b: &Ty| {
+            matches!(
+                (a, b),
+                (Ty::Slice(_), Ty::Ptr { .. }) | (Ty::Slice(_), Ty::Array { .. })
+            )
+        };
+        if no_conversion(want, got) || no_conversion(got, want) {
+            return false;
+        }
+        // Only primitive-vs-primitive is judged beyond that. Anything else — named
+        // types, generics, references, fn-pointers, `dyn` coercions — has a
         // coercion story this pass does not model yet, so it is left alone.
         let (Ty::Prim(w), Ty::Prim(g)) = (want, got) else {
             return true;
@@ -1157,14 +1182,33 @@ impl<'a> TypeChecker<'a> {
         if prim_family(w) == PrimFamily::Text {
             return true;
         }
-        // Within the numeric family, only the **integer/floating boundary** is
-        // judged. Width and signedness changes (`i32` → `usize`, `i64` → `i32`)
-        // are conversions C performs silently, and whether Jestyr wants them to
-        // require an explicit `as` is an open language-design question — the
-        // self-hosted sources currently spell it both ways. Reporting them would
-        // be deciding that question here, so they are left alone; see
-        // `docs/structs-enums-design.md` §2.6.
+        // Within the numeric family, the integer/floating boundary is judged, and
+        // so — as of the int-conversion decision — is any integer conversion that
+        // can LOSE OR REINTERPRET a value.
+        //
+        // ## The decision, and the measurement behind it
+        //
+        // This was an open language-design question, left alone because "the
+        // self-hosted sources spell it both ways" and reporting would decide it.
+        // Measured rather than argued: with the literal-defaulting guard below
+        // already absorbing `var n: usize = 0`, a strict rule costs **six sites in
+        // the entire corpus**, every one of them `i32 → usize` (four in
+        // `cgen.jtr`, two in `typeck.jtr`), and every one passing an arena field
+        // that uses `-1` as a sentinel into a length parameter. A negative
+        // sentinel silently becoming a huge `usize` is precisely the class of bug
+        // a determinism-first language should not compile.
+        //
+        // So: **lossless widening within one signedness is fine; narrowing and any
+        // change of signedness need an explicit `as`.** Widening is allowed rather
+        // than refused because it cannot lose information, and a rule that flagged
+        // `i32 → i64` would be pure noise — the corpus contains no such site, so
+        // permitting it costs nothing and keeps the rule about real hazards.
         if prim_family(w) == PrimFamily::Numeric && integer_prim(w) == integer_prim(g) {
+            if integer_prim(w) && w != g && !lossless_widening(g, w) {
+                // Subject to the literal-defaulting guard below: an untyped literal
+                // may still be written at any integer type.
+                return rhs.is_none_or(|e| self.literal_defaulted(e, w));
+            }
             return true;
         }
         // Only judge when the value's type is trustworthy — see `literal_defaulted`.
@@ -4340,6 +4384,27 @@ fn prim_family(p: &str) -> PrimFamily {
     }
 }
 
+/// The bit width of an integer primitive. `isize`/`usize` are pointer-width,
+/// which this backend emits as 64 — the same assumption `size_of` already makes.
+fn int_width(p: &str) -> u32 {
+    match p {
+        "i8" | "u8" => 8,
+        "i16" | "u16" => 16,
+        "i32" | "u32" => 32,
+        _ => 64,
+    }
+}
+
+/// Does `from` fit in `to` with neither truncation nor reinterpretation — that
+/// is, same signedness and no narrowing?
+///
+/// Sign changes are excluded at every width, including equal ones: `i32 → u32`
+/// loses nothing in bits but turns a negative value into a large positive one,
+/// which is the reinterpretation the rule exists to catch.
+fn lossless_widening(from: &str, to: &str) -> bool {
+    from.starts_with('i') == to.starts_with('i') && int_width(to) >= int_width(from)
+}
+
 /// Is `p` one of the fixed-width integer primitives?
 fn integer_prim(p: &str) -> bool {
     matches!(p, "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize")
@@ -6233,6 +6298,88 @@ mod tests {
         assert!(d2.is_empty(), "explicit `as` is fine: {:?}", d2);
     }
 
+    /// **A raw pointer is not a slice, and neither is a fixed array.**
+    ///
+    /// Both used to pass `check` — the assignability pass judged only
+    /// primitive-vs-primitive and accepted everything else — and fail in gcc as
+    /// `incompatible type for argument 1`. That is the degrades-to-gcc mode, and it
+    /// caught real code twice: `std/test_report` against a changed signature, and
+    /// `std/smallvec`'s `let s: []T = a` on its inline array.
+    #[test]
+    fn a_pointer_or_array_is_not_a_slice() {
+        let (_i, d) = analyze(
+            "fn takes(read s: []u8) -> usize { return s.len }\n\
+             fn main() -> i32 { var raw: *mut u8 = alloc(u8, 4) let n: usize = takes(raw) free_ptr(raw) return 0 }",
+        );
+        assert!(
+            d.iter().any(|m| m.message.contains("found `*mut u8`")),
+            "a raw pointer has no length: {d:?}"
+        );
+
+        let (_i, d) = analyze(
+            "fn takes(read s: []i64) -> usize { return s.len }\n\
+             fn main() -> i32 { let a: [4]i64 = [1, 2, 3, 4] let n: usize = takes(a) return 0 }",
+        );
+        assert!(
+            d.iter().any(|m| m.message.contains("found `[4]i64`")),
+            "a fixed array is a value, not a fat pointer: {d:?}"
+        );
+
+        // …and the explicit construction is of course still fine.
+        let (_i, d) = analyze(
+            "fn takes(read s: []u8) -> usize { return s.len }\n\
+             fn main() -> i32 { var raw: *mut u8 = alloc(u8, 4) let s: []u8 = slice(u8, raw, 4)\n \
+             let n: usize = takes(s) free_ptr(raw) return 0 }",
+        );
+        assert!(d.is_empty(), "`slice(T, p, n)` is the spelling that carries a length: {d:?}");
+    }
+
+    /// **The int-conversion rule** (the decision recorded on `assignable`): lossless
+    /// widening within one signedness is implicit; narrowing and any change of
+    /// signedness need an explicit `as`.
+    ///
+    /// The corpus measurement behind it: exactly six sites, all `i32 → usize`, all
+    /// passing a `-1`-sentinel arena field into a length parameter.
+    #[test]
+    fn integer_conversions_allow_widening_and_refuse_loss() {
+        // Widening within a signedness loses nothing, so it stays implicit.
+        let (_i, d) = analyze(
+            "fn wide(x: i64) -> i64 { return x }\n\
+             fn main() -> i32 { var a: i32 = 5 let r: i64 = wide(a) return 0 }",
+        );
+        assert!(d.is_empty(), "i32 → i64 is lossless: {d:?}");
+
+        // Narrowing can truncate.
+        let (_i, d) = analyze(
+            "fn narrow(x: i32) -> i32 { return x }\n\
+             fn main() -> i32 { var a: i64 = 5 let r: i32 = narrow(a) return 0 }",
+        );
+        assert!(d.iter().any(|m| m.message.contains("found `i64`")), "i64 → i32 truncates: {d:?}");
+
+        // A sign change reinterprets even at equal width — the case the six corpus
+        // sites were, and the reason equal width is not a free pass.
+        let (_i, d) = analyze(
+            "fn takes(x: usize) -> usize { return x }\n\
+             fn main() -> i32 { var a: i32 = 5 let r: usize = takes(a) return 0 }",
+        );
+        assert!(
+            d.iter().any(|m| m.message.contains("found `i32`")),
+            "i32 → usize turns a negative sentinel into a huge length: {d:?}"
+        );
+
+        // An explicit `as` is the escape hatch, and it is trusted.
+        let (_i, d) = analyze(
+            "fn takes(x: usize) -> usize { return x }\n\
+             fn main() -> i32 { var a: i32 = 5 let r: usize = takes(a as usize) return 0 }",
+        );
+        assert!(d.is_empty(), "an explicit cast says the conversion was meant: {d:?}");
+
+        // …and an untyped literal is still writable at any integer type, which is
+        // what keeps `var n: usize = 0` from becoming five thousand diagnostics.
+        let (_i, d) = analyze("fn main() -> i32 { var n: usize = 0 var m: u8 = 7 return 0 }");
+        assert!(d.is_empty(), "literal defaulting is untouched: {d:?}");
+    }
+
     #[test]
     fn assignability_is_checked_at_all_three_positions() {
         // The initializer, the argument and the return expression each get the
@@ -6281,15 +6428,29 @@ mod tests {
         assert!(d.is_empty(), "a literal-defaulted operand is not judged: {:?}", d);
     }
 
+    /// **The open question is now settled — this test is the inversion its own
+    /// previous version asked for.**
+    ///
+    /// It used to assert that `i32 → usize` was *deliberately not reported*,
+    /// because whether it should need an explicit `as` was an open language
+    /// question and "the self-hosted sources spell it both ways". Deciding it by
+    /// measurement rather than by argument turned out to be cheap: with literal
+    /// defaulting already absorbing `var n: usize = 0`, the strict rule costs six
+    /// sites in the whole corpus, every one passing a `-1`-sentinel arena field
+    /// into a length parameter. So a sign change is now reported, and the sibling
+    /// `integer_conversions_allow_widening_and_refuse_loss` states the full rule.
     #[test]
-    fn integer_width_changes_are_deliberately_not_reported() {
-        // Whether `i32` -> `usize` needs an explicit `as` is an open language
-        // question (the self-hosted sources spell it both ways), so `assignable`
-        // stays silent on width/signedness. If Jestyr later decides these need a
-        // cast, this test is the one to invert.
+    fn integer_sign_changes_now_need_an_explicit_cast() {
         let (_i, d) = analyze("fn g(i: usize) -> i32 { return 0 }\n\
                                fn f(r: i32) -> i32 { return g(r) }");
-        assert!(d.is_empty(), "int-to-int width changes are not judged yet: {:?}", d);
+        assert!(
+            d.iter().any(|m| m.message.contains("found `i32`")),
+            "i32 → usize reinterprets a negative value: {d:?}"
+        );
+        // The same call with the conversion spelled out is accepted.
+        let (_i, d) = analyze("fn g(i: usize) -> i32 { return 0 }\n\
+                               fn f(r: i32) -> i32 { return g(r as usize) }");
+        assert!(d.is_empty(), "{d:?}");
     }
 
     #[test]

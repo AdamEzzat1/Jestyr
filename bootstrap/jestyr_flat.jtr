@@ -7219,7 +7219,7 @@ fn build_table(mut c: Checker, read p: Parser, read src: str) {
     // Phase 1: type names + variant names + enum type-param spans.
     var r: usize = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 4 {                          // struct/record/union
             let row: i32 = push_tdecl(c, it.x, it.y, 0)
@@ -7279,7 +7279,7 @@ fn build_table(mut c: Checker, read p: Parser, read src: str) {
     var row: i32 = 0
     var r2: usize = 0
     for r2 < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r2)
+        let iid: i32 = get__list(i32, p.roots, r2 as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 4 {                          // struct: fields + method sigs
             var flds: List(i32) = make__list(i32, c.alloc)
@@ -9420,7 +9420,7 @@ fn arm_type_fn_self(mut c: Checker, read p: Parser, read src: str, read it: Item
         i = i + 1
     }
     if node < 0 { return }
-    let fr: i32 = find_fn(c, src, it.x, it.y)
+    let fr: i32 = find_fn(c, src, it.x as usize, it.y as usize)
     if fr < 0 { return }
     let ctps: i32 = get__list(i32, c.fns, (fr * 12 + 7) as usize)
     let ctpc: i32 = get__list(i32, c.fns, (fr * 12 + 8) as usize)
@@ -9444,7 +9444,7 @@ fn arm_type_fn_self(mut c: Checker, read p: Parser, read src: str, read it: Item
 fn walk_items(mut c: Checker, read p: Parser, read src: str) {
     var r: usize = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 {                          // Fn: self_ty = Unit
             arm_type_fn_self(c, p, src, it)
@@ -9573,7 +9573,7 @@ fn dump_types(read src: str, read c: Checker, read p: Parser, read a: Allocator)
 fn build_err_payloads(mut c: Checker, read p: Parser, read src: str) {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 and it.e >= 0 { epay_scan_far(c, p, it.e) }
         // Trait method sigs and impl methods are declaration sites too
@@ -9649,7 +9649,7 @@ pub fn err_payload_of(read c: Checker, read src: str, ns: i32, ne: i32) -> i32 {
 fn build_trait_errs(mut c: Checker, read p: Parser, read src: str) {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 6 {
             var mi: i32 = 0
@@ -10339,7 +10339,7 @@ fn droppable_expr(read p: Parser, read c: Checker, read src: str, eid: i32) -> b
     let tne: i32 = get__list(i32, c.tdecl, (td.x * 10 + 1) as usize)
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 7 and it.h <= 0 {
             if str_eq(src[it.x .. it.y], "Drop") {
@@ -10385,7 +10385,7 @@ fn recv_is_take(read p: Parser, read c: Checker, read src: str, id: i32, callee:
     let sne: i32 = get__list(i32, c.tdecl, (btd.x * 10 + 1) as usize)
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 4 {
             if str_eq(src[it.x .. it.y], src[sns as usize .. sne as usize]) {
@@ -11469,7 +11469,7 @@ fn check_fn(mut e: Esc, read p: Parser, read c: Checker, read src: str, read f: 
 fn check_items(mut e: Esc, read p: Parser, read c: Checker, read src: str) {
     var r: usize = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 { check_fn(e, p, c, src, it) }                    // Fn
         else if it.kind == 4 { walk_methods(e, p, c, src, it.a, it.b) }   // Struct methods
@@ -14278,7 +14278,7 @@ fn find_impl_method_item(read p: Parser, read src: str, tns: i32, tne: i32, read
     var mid: i32 = 0 - 1
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 7 and it.h <= 0 {
             if str_eq(src[it.x .. it.y], src[tns as usize .. tne as usize]) {
@@ -15321,7 +15321,7 @@ fn emit_extern_protos(mut sb: String, read p: Parser, read src: str) {
     var any: bool = false
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 8 {
             any = true
@@ -15356,7 +15356,7 @@ fn emit_extern_protos(mut sb: String, read p: Parser, read src: str) {
 fn find_extern_item(read p: Parser, read src: str, read nm: str) -> i32 {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 8 {
             if str_eq(src[it.x .. it.y], nm) { return iid }
@@ -15451,7 +15451,7 @@ fn emit_user_args(mut sb: String, read p: Parser, read src: str, read c: Checker
 fn find_fn_item(read p: Parser, read src: str, read nm: str) -> i32 {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 {
             if str_eq(src[it.x .. it.y], nm) { return iid }
@@ -15599,7 +15599,7 @@ fn emit_result_name_plain(mut sb: String, read p: Parser, read src: str, ok_ty: 
 fn build_error_tags(mut g: Cg, read p: Parser, read src: str) {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 and it.e >= 0 {
             let ecount: i32 = get__list(i32, p.far, it.e as usize)
@@ -16274,7 +16274,7 @@ fn collect_gfn_instances(mut g: Cg, read p: Parser, read src: str, read c: Check
     var wks: List(i32) = make__list(i32, a)
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 and !fn_is_template(p, it) { gfind_block(wk, wks, p, src, c, it.w) }
         if it.kind == 7 and it.h <= 0 {
@@ -16596,7 +16596,7 @@ fn emit_generic_call(mut sb: String, read p: Parser, read src: str, read c: Chec
 fn find_named_item(read p: Parser, read src: str, ns: i32, ne: i32) -> i32 {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 4 or it.kind == 5 or it.kind == 1 {
             if str_eq(src[it.x .. it.y], src[ns as usize .. ne as usize]) { return iid }
@@ -16611,7 +16611,7 @@ fn find_named_item(read p: Parser, read src: str, ns: i32, ne: i32) -> i32 {
 fn has_drop_impl(read p: Parser, read src: str, ns: i32, ne: i32) -> bool {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 7 and it.h <= 0 {
             if str_eq(src[it.x .. it.y], "Drop") {
@@ -16991,7 +16991,7 @@ fn mark_take_args(mut g: Cg, read p: Parser, read src: str, read e: ExprData) {
     var fid: i32 = 0 - 1
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 {
             if str_eq(src[it.x .. it.y], src[callee.start .. callee.end]) { fid = iid }
@@ -17552,7 +17552,7 @@ fn niche_app_pay(read p: Parser, read src: str, read t: TypeData) -> i32 {
     var eit: i32 = 0 - 1
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let cand: ItemData = get__list(ItemData, p.it, iid as usize)
         if cand.kind == 5 and cand.a > 0 {
             if str_eq(src[cand.x .. cand.y], src[t.x as usize .. t.y as usize]) { eit = iid }
@@ -18409,7 +18409,7 @@ fn emit_struct_attr(mut sb: String, read p: Parser, read src: str, read it: Item
 fn find_struct_item(read p: Parser, read src: str, ns: usize, ne: usize) -> i32 {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 4 {
             if str_eq(src[ns .. ne], src[it.x .. it.y]) { return iid }
@@ -18435,7 +18435,7 @@ fn structlit_has_field(read p: Parser, read src: str, read e: ExprData, ns: usiz
 fn find_enum_item(read p: Parser, read src: str, ns: usize, ne: usize) -> i32 {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 5 {
             if str_eq(src[ns .. ne], src[it.x .. it.y]) { return iid }
@@ -19842,7 +19842,7 @@ fn emit_impl_sig(mut sb: String, read p: Parser, read src: str, read im: ItemDat
 fn generic_drop_impl_of(read p: Parser, read src: str, cns: usize, cne: usize) -> i32 {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 7 and it.h > 0 {
             if str_eq(src[it.x as usize .. it.y as usize], "Drop") {
@@ -19923,7 +19923,7 @@ fn emit_impl_protos(mut sb: String, read p: Parser, read src: str, read c: Check
     var any: bool = false
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 7 and it.h <= 0 {
             var k: i32 = 0
@@ -19962,7 +19962,7 @@ fn emit_impl_protos(mut sb: String, read p: Parser, read src: str, read c: Check
 fn emit_impl_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg) {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 7 and it.h <= 0 {
             var k: i32 = 0
@@ -20058,7 +20058,7 @@ fn emit_impl_defs(mut sb: String, read p: Parser, read src: str, read c: Checker
 fn emit_forward_types(mut sb: String, read p: Parser, read src: str) {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 1 {                             // distinct: `typedef <base> Jestyr_<name>;`
             string_push(sb, "typedef ")
@@ -20097,7 +20097,7 @@ fn emit_forward_types(mut sb: String, read p: Parser, read src: str) {
 fn find_variant_enum(read p: Parser, read src: str, ns: usize, ne: usize) -> i32 {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 5 {
             var k: i32 = 0
@@ -20551,7 +20551,7 @@ fn dc_flush(mut sb: String, mut d: Dc, read cap: str, read a: Allocator) {
 fn emit_struct_defs(mut sb: String, read p: Parser, read src: str, mut d: Dc) {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 4 {
             let ns: i32 = dc_len(d)                   // segment name: Jestyr_<name>
@@ -20590,7 +20590,7 @@ fn emit_struct_defs(mut sb: String, read p: Parser, read src: str, mut d: Dc) {
 fn emit_enum_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg, mut d: Dc) {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 5 and it.a == 0 and niche_named_some(p, iid) < 0 {   // non-generic, non-niche enum
             let en: str = src[it.x .. it.y]
@@ -20987,7 +20987,7 @@ fn sd_collect(mut g: Cg, read p: Parser, read src: str) {
     let ne: usize = len(ExprData, p.ex)
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 {
             if item_has_attr(p, src, it, "simd") {
@@ -21434,7 +21434,7 @@ fn pf_collect(mut g: Cg, read p: Parser, read src: str, read c: Checker) {
     let ne: usize = len(ExprData, p.ex)
     var r: usize = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 {
             if fn_is_template(p, it) == false {
@@ -21761,7 +21761,7 @@ fn push_ctfe_brace(mut sb: String, read ci: Interp, read v: Value) {
 fn emit_consts(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg) {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 2 {                             // Const: (x,y)=name span, a=type, b=value
             string_push(sb, "static const ")
@@ -21822,7 +21822,7 @@ fn emit_array_defs(mut sb: String, read p: Parser, read src: str, read c: Checke
     }
     var r: i32 = 0                                    // then fn signature annotations
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 {
             var pi: i32 = 0
@@ -22288,7 +22288,7 @@ fn collect_gstruct_instances(mut g: Cg, read p: Parser, read src: str, read c: C
     var seen: String = string_new()
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 and !fn_is_gen(p, it) { gsw_fn(g, p, src, c, seen, it) }
         if it.kind == 7 {
@@ -22888,7 +22888,7 @@ fn emit_result_defs(mut sb: String, read p: Parser, read src: str, read c: Check
     }
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 and fn_is_fallible__cgen(p, it) {
             var m: String = string_new()              // ok-type mangle = the dedup key
@@ -22930,7 +22930,7 @@ fn emit_result_defs(mut sb: String, read p: Parser, read src: str, read c: Check
     // check time until the per-instance path learns the ABI).
     var ri9: i32 = 0
     for ri9 < len(i32, p.roots) {
-        let iid9: i32 = get__list(i32, p.roots, ri9)
+        let iid9: i32 = get__list(i32, p.roots, ri9 as usize)
         let it9: ItemData = get__list(ItemData, p.it, iid9 as usize)
         if it9.kind == 7 and it9.h <= 0 {
             var mk9: i32 = 0
@@ -23237,7 +23237,7 @@ fn is_global_cname(read p: Parser, read src: str, ns: usize, ne: usize) -> bool 
     if find_variant_enum(p, src, ns, ne) >= 0 { return true }
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 2 {
             if str_eq(src[it.x .. it.y], nm) { return true }
@@ -23310,7 +23310,7 @@ fn collect_closures(mut g: Cg, read p: Parser, read src: str, read a: Allocator)
     var found: List(i32) = make__list(i32, a)
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 and !fn_is_gen(p, it) { cfind_block(found, p, it.w) }
         if it.kind == 2 { cfind_expr(found, p, it.b) }
@@ -23361,7 +23361,7 @@ fn ref_expr_id(read p: Parser, eid: i32) -> i32 {
     }
     var r: i32 = 0
     for r < len(i32, p.roots) {                  // fn / struct-method / impl-method bodies
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 {
             if it.w >= 0 and it.w < eid { off = off + 1 }
@@ -23661,10 +23661,10 @@ fn emit_dyn_typedefs(mut sb: String, read p: Parser, read src: str, read a: Allo
     var trs: List(i32) = make__list(i32, a)
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 6 {
-            if trait_is_dyn(p, src, it.x, it.y) { push(i32, trs, iid) }
+            if trait_is_dyn(p, src, it.x as usize, it.y as usize) { push(i32, trs, iid) }
         }
         r = r + 1
     }
@@ -23724,7 +23724,7 @@ fn emit_dyn_typedefs(mut sb: String, read p: Parser, read src: str, read a: Allo
 fn emit_dyn_vtables(mut sb: String, read p: Parser, read src: str) {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let im: ItemData = get__list(ItemData, p.it, iid as usize)
         if im.kind == 7 {
             if trait_is_dyn(p, src, im.x as usize, im.y as usize) {
@@ -23795,7 +23795,7 @@ fn emit_dyn_vtables(mut sb: String, read p: Parser, read src: str) {
                 var tr: i32 = 0
                 var tit: i32 = 0 - 1
                 for tr < len(i32, p.roots) {
-                    let tid2: i32 = get__list(i32, p.roots, tr)
+                    let tid2: i32 = get__list(i32, p.roots, tr as usize)
                     let t2: ItemData = get__list(ItemData, p.it, tid2 as usize)
                     if t2.kind == 6 {
                         if str_eq(src[t2.x .. t2.y], src[im.x as usize .. im.y as usize]) { tit = tid2 }
@@ -23930,7 +23930,7 @@ fn sfind_block(mut sites: List(i32), read p: Parser, beid: i32) {
 fn collect_spawns(mut g: Cg, read p: Parser, read src: str) {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 and !fn_is_gen(p, it) { sfind_block(g.sps, p, it.w) }
         if it.kind == 4 {
@@ -24333,7 +24333,7 @@ fn emit_closure_fns(mut sb: String, read p: Parser, read src: str, read c: Check
 fn emit_fn_protos(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg) {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 and !fn_is_template(p, it) {  // Fn (templates are never emitted directly)
             emit_fn_sig(sb, p, src, it)
@@ -24355,7 +24355,7 @@ fn emit_fn_protos(mut sb: String, read p: Parser, read src: str, read c: Checker
 fn emit_fn_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg) {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 and !fn_is_template(p, it) {  // Fn (templates are never emitted directly)
             emit_fn_sig(sb, p, src, it)
@@ -24417,7 +24417,7 @@ fn emit_fn_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, 
             // dedup so this entry directive always fires for a new function.
             g.dbgl_m = 0 - 1
             g.dbgl_l = 0 - 1
-            cg_mark_line(sb, g, it.x)
+            cg_mark_line(sb, g, it.x as usize)
             emit_body(sb, p, src, c, g, it.w, returns_value, 0)   // w = body Block ExprId; fn body at depth 0
             g.res_ok = 0 - 2
             truncate(i32, g.pp, 0)
@@ -24483,7 +24483,7 @@ fn emit_fn_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, 
         // through one emitter with the same entry mark + dedup reset).
         g.dbgl_m = 0 - 1
         g.dbgl_l = 0 - 1
-        cg_mark_line(sb, g, fd.x)
+        cg_mark_line(sb, g, fd.x as usize)
         emit_body(sb, p, src, c, g, fd.w, fd.z >= 0 or gfallible, 0)
         g.res_ok = 0 - 2
         truncate(i32, g.pp, 0)
@@ -24530,7 +24530,7 @@ fn emit_test_main(mut sb: String, read p: Parser, read src: str, read tf: str) {
     var n: i32 = 0
     var r0: i32 = 0
     for r0 < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r0)
+        let iid: i32 = get__list(i32, p.roots, r0 as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if test_runnable(p, src, it, "test", tf) { n = n + 1 }
         r0 = r0 + 1
@@ -24541,7 +24541,7 @@ fn emit_test_main(mut sb: String, read p: Parser, read src: str, read tf: str) {
     string_push(sb, " test(s)\\n\");\n")
     var r: i32 = 0
     for r < len(i32, p.roots) {                  // every `@test`, source order
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if test_runnable(p, src, it, "test", tf) {
             string_push(sb, "    printf(\"test ")
@@ -24555,7 +24555,7 @@ fn emit_test_main(mut sb: String, read p: Parser, read src: str, read tf: str) {
     }
     var r2: i32 = 0
     for r2 < len(i32, p.roots) {                 // then every `@bench`, source order
-        let iid: i32 = get__list(i32, p.roots, r2)
+        let iid: i32 = get__list(i32, p.roots, r2 as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if test_runnable(p, src, it, "bench", tf) {
             string_push(sb, "    { clock_t _s = clock(); ")
@@ -24576,7 +24576,7 @@ fn emit_test_main(mut sb: String, read p: Parser, read src: str, read tf: str) {
 fn emit_test_list(mut sb: String, read p: Parser, read src: str, read tf: str) {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if test_runnable(p, src, it, "test", tf) {
             string_push(sb, "test ")
@@ -24594,7 +24594,7 @@ fn emit_test_list(mut sb: String, read p: Parser, read src: str, read tf: str) {
 fn emit_main_wrapper(mut sb: String, read p: Parser, read src: str) {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 {
             if str_eq(src[it.x .. it.y], "main") {
@@ -25569,7 +25569,7 @@ fn at_records(mut ob: String, read p: Parser, read src: str, read a: Allocator) 
     var ids: List(i32) = make__list(i32, a)
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         let ks: str = at_kind_str(it)
         if ks.len > 0 { push(i32, ids, iid) }
@@ -25901,7 +25901,7 @@ fn tg_add_fn(mut t: Tg, read p: Parser, read src: str, read it: ItemData, kind: 
 fn dc_targets(mut t: Tg, read p: Parser, read src: str) {
     var r: i32 = 0
     for r < len(i32, p.roots) {
-        let iid: i32 = get__list(i32, p.roots, r)
+        let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 {
             tg_add_fn(t, p, src, it, 0, 0 - 1, 0 - 1)

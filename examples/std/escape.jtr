@@ -590,7 +590,7 @@ fn droppable_expr(read p: parser.Parser, read c: typeck.Checker, read src: str, 
     let tne: i32 = list.get(i32, c.tdecl, (td.x * 10 + 1) as usize)
     var r: i32 = 0
     for r < list.len(i32, p.roots) {
-        let iid: i32 = list.get(i32, p.roots, r)
+        let iid: i32 = list.get(i32, p.roots, r as usize)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 7 and it.h <= 0 {
             if str_eq(src[it.x .. it.y], "Drop") {
@@ -636,7 +636,7 @@ fn recv_is_take(read p: parser.Parser, read c: typeck.Checker, read src: str, id
     let sne: i32 = list.get(i32, c.tdecl, (btd.x * 10 + 1) as usize)
     var r: i32 = 0
     for r < list.len(i32, p.roots) {
-        let iid: i32 = list.get(i32, p.roots, r)
+        let iid: i32 = list.get(i32, p.roots, r as usize)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 4 {
             if str_eq(src[it.x .. it.y], src[sns as usize .. sne as usize]) {
@@ -1720,7 +1720,7 @@ fn check_fn(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src:
 fn check_items(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src: str) {
     var r: usize = 0
     for r < list.len(i32, p.roots) {
-        let iid: i32 = list.get(i32, p.roots, r)
+        let iid: i32 = list.get(i32, p.roots, r as usize)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 3 { check_fn(e, p, c, src, it) }                    // Fn
         else if it.kind == 4 { walk_methods(e, p, c, src, it.a, it.b) }   // Struct methods

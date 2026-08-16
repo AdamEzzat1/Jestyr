@@ -488,7 +488,7 @@ fn build_table(mut c: Checker, read p: parser.Parser, read src: str) {
     // Phase 1: type names + variant names + enum type-param spans.
     var r: usize = 0
     for r < list.len(i32, p.roots) {
-        let iid: i32 = list.get(i32, p.roots, r)
+        let iid: i32 = list.get(i32, p.roots, r as usize)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 4 {                          // struct/record/union
             let row: i32 = push_tdecl(c, it.x, it.y, 0)
@@ -548,7 +548,7 @@ fn build_table(mut c: Checker, read p: parser.Parser, read src: str) {
     var row: i32 = 0
     var r2: usize = 0
     for r2 < list.len(i32, p.roots) {
-        let iid: i32 = list.get(i32, p.roots, r2)
+        let iid: i32 = list.get(i32, p.roots, r2 as usize)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 4 {                          // struct: fields + method sigs
             var flds: List(i32) = list.make(i32, c.alloc)
@@ -2689,7 +2689,7 @@ fn arm_type_fn_self(mut c: Checker, read p: parser.Parser, read src: str, read i
         i = i + 1
     }
     if node < 0 { return }
-    let fr: i32 = find_fn(c, src, it.x, it.y)
+    let fr: i32 = find_fn(c, src, it.x as usize, it.y as usize)
     if fr < 0 { return }
     let ctps: i32 = list.get(i32, c.fns, (fr * 12 + 7) as usize)
     let ctpc: i32 = list.get(i32, c.fns, (fr * 12 + 8) as usize)
@@ -2713,7 +2713,7 @@ fn arm_type_fn_self(mut c: Checker, read p: parser.Parser, read src: str, read i
 fn walk_items(mut c: Checker, read p: parser.Parser, read src: str) {
     var r: usize = 0
     for r < list.len(i32, p.roots) {
-        let iid: i32 = list.get(i32, p.roots, r)
+        let iid: i32 = list.get(i32, p.roots, r as usize)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 3 {                          // Fn: self_ty = Unit
             arm_type_fn_self(c, p, src, it)
@@ -2842,7 +2842,7 @@ fn dump_types(read src: str, read c: Checker, read p: parser.Parser, read a: All
 fn build_err_payloads(mut c: Checker, read p: parser.Parser, read src: str) {
     var r: i32 = 0
     for r < list.len(i32, p.roots) {
-        let iid: i32 = list.get(i32, p.roots, r)
+        let iid: i32 = list.get(i32, p.roots, r as usize)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 3 and it.e >= 0 { epay_scan_far(c, p, it.e) }
         // Trait method sigs and impl methods are declaration sites too
@@ -2918,7 +2918,7 @@ pub fn err_payload_of(read c: Checker, read src: str, ns: i32, ne: i32) -> i32 {
 fn build_trait_errs(mut c: Checker, read p: parser.Parser, read src: str) {
     var r: i32 = 0
     for r < list.len(i32, p.roots) {
-        let iid: i32 = list.get(i32, p.roots, r)
+        let iid: i32 = list.get(i32, p.roots, r as usize)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 6 {
             var mi: i32 = 0

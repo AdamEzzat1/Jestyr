@@ -141,14 +141,50 @@ other. `std/process` works around it by making `run_ok` (`== 0`, which coincides
 portable API and documenting `run`'s value as platform-specific. Fix is `WEXITSTATUS` in the
 helper. Runtime change → mirror + reseed. Also the clearest concrete argument for `sys`.
 
-**2. Close the pointer-to-slice assignability hole.** `fn f(read s: []u8)` called as `f(raw)`
-with `raw: *mut u8` **passes typeck** — `jestyrc check` prints "assignability … passed" — and
-fails only in gcc as `incompatible type for argument 1`. That is the "degrades to gcc"
-failure mode the port work spent real effort eliminating, and it makes `check` a false
-negative for an easy mistake (I made it, writing `test_report.finish(c, raw)` against a
-changed signature). Probably one arm in the assignability check. Same family as the **OPEN
-int→int conversion decision** (`[[jestyr-typeck-assignability]]`) — settle both together.
-Typeck change → mirror + reseed.
+**2. ~~Close the pointer-to-slice assignability hole~~ — DONE, together with the
+int→int decision it was entangled with.** Both are settled; kept here because the
+*method* generalises.
+
+`assignable` judged only primitive-vs-primitive and returned `true` for everything
+else, so `f(raw)` against `fn f(read s: []u8)` passed `check` and failed in gcc. Now a
+slice-vs-pointer and slice-vs-array mismatch is refused in either direction —
+deliberately narrow, covering only pairings with no conversion at all.
+
+**The int→int question was settled by MEASUREMENT — and the measurement itself needed
+correcting twice, which is the more useful lesson.**
+
+The old comment said the self-hosted sources "spell it both ways", implying a large
+migration. Three successive numbers came out of trying to check that:
+
+* **~5300** — raw diagnostics. Meaningless: a site inside `core` is re-reported for
+  every file that imports it, and most of it was `var n: usize = 0`, which the
+  literal-defaulting guard already absorbs.
+* **6** — distinct sites, per-file, with the literal guard respected. This is the number
+  I acted on, and it was WRONG.
+* **55** — the true count. Per-file checking **misses module-qualified calls**:
+  `list.get(i32, p.roots, r)` is not argument-checked, and only the flatten — where it
+  becomes a bare `get__list` — exposes it. My measurement had *the same blind spot as the
+  checker it was measuring*, so it under-reported by 9×.
+
+All 55 are `i32 → usize` index arguments, all mechanical, so the decision stands. But the
+methodology lesson is the transferable part: **measure on the flattened program, not
+per-file**, whenever the question is about calls.
+
+**A second hole fell out of it, unfixed:** module-qualified calls skip argument
+assignability entirely. That is why the per-file sweep was clean while the concat was
+not, and it is a strictly larger version of the hole this item set out to close. It is
+the obvious next increment.
+
+Rule adopted: **lossless widening within one signedness stays implicit; narrowing and
+any change of signedness need an explicit `as`.** Widening is permitted rather than
+refused because it cannot lose information and the corpus has no such site, so a rule
+against it would be pure noise. Reference-only — the port has no assignability check at
+all — so no mirror; the six `as usize` edits are in closure modules, hence the reseed.
+
+The old pin `integer_width_changes_are_deliberately_not_reported` said "if Jestyr later
+decides these need a cast, this test is the one to invert", and inverting it is exactly
+what happened. **That is the pattern worth copying: when you defer a decision, pin the
+deferral with a test that names its own successor.**
 
 **3. Stop emitting `@test`/`@bench` items in non-test mode.** The proper fix for the leak in
 §5, and it would let library tests be colocated again. Bigger than one predicate: `uses_*`
@@ -163,9 +199,12 @@ passing a bare `str` where a `Path` is wanted is **accepted** — as is passing 
 where a `UserId` is wanted. `distinct` today gives a *name* with **no check**, which is worse
 than nothing because it reads as safety.
 
-Enforcement has to come from assignability, which means resolving the open int→int question
-first (§1.3.2 — they are the same rule). Until then a typed `Path` ships an API whose central
-claim is unenforced.
+Enforcement has to come from assignability, and **the int→int question that gated it is now
+settled** (§1.3.2), so this is no longer blocked — it is merely unbuilt. The next step is to
+find out whether `distinct` flows through the same `assignable` path the integer rule now
+judges, or bypasses it; `distinct_types_are_not_interchangeable_with_their_base` already
+passes for the *initializer* position, so the gap is probably argument and return positions
+rather than the whole notion.
 
 The language is *ahead* of the library here: `os_str` is already a real distinct primitive
 (`os_from_bytes`, `to_str_lossy`, participating in the text-family conversion rules;
@@ -185,7 +224,7 @@ the reason stops holding, the item becomes live.
 | **Error sets on writes** | Fifty `?`s down a formatter is how errors get swallowed, not handled. The one genuinely fallible operation is a final `flush`, and that is where an error set belongs — one fallible call, not N | A fallible write intrinsic exists |
 | **`failed()` on `Writer`** | Removed, not shipped: `print_str`/`eprint_str` return nothing so a stream write has no detectable failure, and sink overflow is deliberately the *sink's* business. It could only ever answer `false`, and a query that always says "fine" invites a caller to believe it checked something | Same as above |
 | **`sys` tier** | Genuinely blocked on `extern "c"` (design §14, 📐). Until then it is a wrapper around a wrapper — today the platform boundary *is* the closed intrinsic list | `extern "c"` lands |
-| **Typed `Path` on `distinct`** | `distinct` is not enforced at argument positions (§1.4) | The int→int assignability decision is settled |
+| **Typed `Path` on `distinct`** | `distinct` is not enforced at argument positions (§1.4). **Its stated trigger — the int→int decision — has now FIRED**, so this is live: the next step is to check whether `distinct` follows the same `assignable` path the int rule now judges | NOW — the blocker is cleared |
 | **A generic collections zoo** | A breadth objection, not an existence objection. One container with a real consumer is a slice | Never as a zoo; one at a time (§1.1) |
 | **A package manager** | `ROADMAP.md` calls it ecosystem-premature, and the module-manifest hash DAG covers the real need (a lockfile-lite pinning the build graph) | Deliberately open-ended |
 | **Networking / HTTP / TLS** | No async story (📐), no `extern "c"`, and the moment a socket lands the platform boundary stops being optional | After `sys` |
