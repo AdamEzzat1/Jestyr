@@ -1166,6 +1166,17 @@ impl<'a> TypeChecker<'a> {
         if no_conversion(want, got) || no_conversion(got, want) {
             return false;
         }
+        // A `distinct` type is NOMINAL: it borrows its base's representation and
+        // nothing else. Judged here rather than only at `let` initializers, because
+        // a rule that holds in one position and not the others is not a rule.
+        // Measured before this change: `takes_uid(n)` with a bare `i64` was accepted,
+        // and so was `takes_uid(a)` with an unrelated `AccountId` — so `distinct`
+        // bought a *name* with no check, which reads as safety and is not. The
+        // `AccountId`-for-`UserId` row is the one that makes this a correctness fix
+        // rather than a strictness preference.
+        if self.distinct_mismatch(want, got) {
+            return false;
+        }
         // Only primitive-vs-primitive is judged beyond that. Anything else — named
         // types, generics, references, fn-pointers, `dyn` coercions — has a
         // coercion story this pass does not model yet, so it is left alone.
@@ -1260,11 +1271,18 @@ impl<'a> TypeChecker<'a> {
             return;
         }
         let (w, g) = (want.display(&self.table), got.display(&self.table));
-        let hint = match (want, got) {
-            (Ty::Prim(w), Ty::Prim(g)) if numeric_prim(w) && numeric_prim(g) => {
-                format!(" — an explicit `as {w}` converts")
+        // The `distinct` hint takes precedence: it names the *reason* the pair is
+        // refused, and it is the same wording the `let`-initializer arm has always
+        // used, so the suggestion does not change with the position.
+        let hint = if self.distinct_mismatch(want, got) {
+            " — `distinct` types need an explicit `as`".to_string()
+        } else {
+            match (want, got) {
+                (Ty::Prim(w), Ty::Prim(g)) if numeric_prim(w) && numeric_prim(g) => {
+                    format!(" — an explicit `as {w}` converts")
+                }
+                _ => String::new(),
             }
-            _ => String::new(),
         };
         self.error(span, format!("{what}: expected `{w}`, found `{g}`{hint}"));
     }
@@ -2151,15 +2169,40 @@ impl<'a> TypeChecker<'a> {
                 // backend emits for the direct call.
                 let key = self.canon_in(target_mod, fname);
                 self.record_qualified(id, key.clone());
-                if let Some(sig) = self.table.fns.get(&key) {
-                    let ret = sig.ret.clone();
-                    let errs = sig.errs.clone();
-                    let want = sig.params.len();
+                // Clone the signature out before any `&mut self` call below, exactly
+                // as the unqualified path does.
+                let resolved = self.table.fns.get(&key).map(|sig| {
+                    let ptys: Vec<(String, Ty)> =
+                        sig.params.iter().map(|p| (p.name.clone(), p.ty.clone())).collect();
+                    (sig.ret.clone(), sig.errs.clone(), ptys)
+                });
+                if let Some((ret, errs, ptys)) = resolved {
+                    let want = ptys.len();
                     if want != args.len() {
                         self.error(
                             span,
                             format!("`{binding}.{fname}` expects {want} argument(s), found {}", args.len()),
                         );
+                    }
+                    // Argument-vs-parameter types. This path used to check ARITY ONLY,
+                    // which is why the int→int sweep read 6 sites per-file and 55 on the
+                    // flattened program: `list.get(i32, p.roots, r)` was never argument-
+                    // checked, and only the flatten — where it becomes a bare
+                    // `get__list` — exposed it. The measurement had the same blind spot
+                    // as the checker it was measuring. Arity-gated for the same reason
+                    // as the unqualified path.
+                    if want == args.len() {
+                        for ((pname, pty), a) in ptys.iter().zip(args.iter()) {
+                            let got = self.expr_types[a.0 as usize].clone();
+                            let sp = self.ast.expr_at(*a).span;
+                            self.check_assignable(
+                                pty,
+                                &got,
+                                Some(*a),
+                                sp,
+                                &format!("argument `{pname}` of `{binding}.{fname}`"),
+                            );
+                        }
                     }
                     let ret = self.monomorphize_ret(&key, args, typ, ret);
                     let t = match errs {
@@ -6296,6 +6339,74 @@ mod tests {
         let (_i2, d2) =
             analyze("distinct UserId = i32 fn main() -> i32 { var x: UserId = 5 as UserId return 0 }");
         assert!(d2.is_empty(), "explicit `as` is fine: {:?}", d2);
+    }
+
+    /// **`distinct` is enforced at ARGUMENT and RETURN positions too, not just at
+    /// initializers.**
+    ///
+    /// Measured before this existed: the initializer arm was the *only* consumer of
+    /// `distinct_mismatch`, so a bare `i64` passed where a `UserId` was wanted, and —
+    /// the row that matters — **an unrelated `AccountId` passed where a `UserId` was
+    /// wanted**. A rule that holds in one position and not the others is not a weak
+    /// check, it is no check, and a typed `Path` built on that would have been a name
+    /// dressed as safety.
+    ///
+    /// Each refusal is paired with the `as` spelling that must still be accepted; a
+    /// refusal test alone would pass just as well against a checker that rejects
+    /// everything.
+    #[test]
+    fn distinct_is_enforced_at_argument_and_return_positions() {
+        let prelude = "distinct UserId = i32\n\
+                       distinct AccountId = i32\n\
+                       fn takes_uid(u: UserId) -> i32 { return 0 }\n";
+
+        // 1. The base type where a distinct type is wanted.
+        let (_a, da) = analyze(&format!(
+            "{prelude}fn main() -> i32 {{ let n: i32 = 5 return takes_uid(n) }}"
+        ));
+        assert!(
+            da.iter().any(|m| m.message.contains("distinct")),
+            "a bare `i32` must not pass as a `UserId`: {da:?}"
+        );
+
+        // 2. A DIFFERENT distinct type over the same base — the row that makes this a
+        //    correctness fix rather than a strictness preference.
+        let (_b, db) = analyze(&format!(
+            "{prelude}fn main() -> i32 {{ let a: AccountId = 5 as AccountId return takes_uid(a) }}"
+        ));
+        assert!(
+            db.iter().any(|m| m.message.contains("distinct")),
+            "an `AccountId` must not pass as a `UserId`: {db:?}"
+        );
+
+        // 3. The return position.
+        let (_c, dc) = analyze(&format!(
+            "{prelude}fn ret_uid(x: i32) -> UserId {{ return x }}\nfn main() -> i32 {{ return 0 }}"
+        ));
+        assert!(
+            dc.iter().any(|m| m.message.contains("distinct")),
+            "a bare `i32` must not be returned as a `UserId`: {dc:?}"
+        );
+
+        // 4. POSITIVE CONTROLS: every one of the above with an explicit `as` is fine.
+        let (_d, dd) = analyze(&format!(
+            "{prelude}fn ret_uid(x: i32) -> UserId {{ return x as UserId }}\n\
+             fn main() -> i32 {{\n\
+             \x20   let n: i32 = 5\n\
+             \x20   let a: AccountId = 5 as AccountId\n\
+             \x20   let p: i32 = takes_uid(n as UserId)\n\
+             \x20   let q: i32 = takes_uid(a as i32 as UserId)\n\
+             \x20   return p + q\n\
+             }}"
+        ));
+        assert!(dd.is_empty(), "explicit `as` must still be accepted everywhere: {dd:?}");
+
+        // 5. And a distinct value passed where its OWN type is wanted is untouched —
+        //    otherwise the rule would make the type unusable rather than safe.
+        let (_e, de) = analyze(&format!(
+            "{prelude}fn main() -> i32 {{ let u: UserId = 5 as UserId return takes_uid(u) }}"
+        ));
+        assert!(de.is_empty(), "a `UserId` must pass as a `UserId`: {de:?}");
     }
 
     /// **A raw pointer is not a slice, and neither is a fixed array.**

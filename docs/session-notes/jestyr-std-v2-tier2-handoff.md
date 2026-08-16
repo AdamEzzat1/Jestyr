@@ -314,12 +314,34 @@ file, three `distinct` types, `jestyrc check`:
 | `takes_uid(a)` where `a: AccountId`, param is `UserId` | ❌ accepted — **two unrelated distinct types interchange** |
 | `fn ret_uid(x: i64) -> UserId { return x }` | ❌ accepted |
 
-So `distinct` is enforced at **initializers only**. The notion is sound and the diagnostic
-already exists with the right wording; what is missing is that argument and return positions
-never consult it. That is the same shape as §1.3.2's own leftover — module-qualified calls
-skip argument assignability entirely — so **the two are probably one fix**, and the third row
-above is the one to lead with: a rule that lets `AccountId` pass as `UserId` is not a weak
-check, it is no check at all.
+So `distinct` was enforced at **initializers only**. The notion was sound and the diagnostic
+already had the right wording; argument and return positions simply never consulted it.
+
+**BOTH ARE NOW FIXED, and they were indeed one fix** — the commit titled *"`distinct` is a
+type everywhere, not just in an initializer"*. Two changes, done
+together because neither is much use alone:
+
+1. **`distinct_mismatch` moved into `assignable`**, so every position that goes through
+   `check_assignable` — argument, return, initializer — judges it, and
+   `check_assignable`'s hint gained a `distinct` arm so the `as` suggestion no longer
+   depends on where you are standing.
+2. **`resolve_qualified_call` now argument-checks**, closing §1.3.2's own leftover. It had
+   checked ARITY ONLY, which is the whole reason the int→int sweep read 6 sites per-file
+   and 55 on the flatten.
+
+**The corpus cost was ONE site**, found by the sweep rather than predicted:
+`io.print_i32(list.len(i32, xs))` in `examples/std/demo.jtr` — a `usize` narrowing into an
+`i32` parameter, invisible until qualified calls were checked. Fixed with `as i32`, the same
+way the 55 were. The flattened compiler passes clean, which is the stronger signal: after
+the flatten there are no qualified calls left, so a regression there would have been the
+*existing* rules breaking.
+
+**Typed `Path` is now buildable and is deliberately NOT built.** Enforcement was the
+blocker and it is gone; what remains is a library-design question the handoff never priced —
+`std/path`'s queries return `read str` views, so a `distinct Path = str` makes every literal
+and every returned view need an `as`, and `pathbuf` delegates to all of them. That is a real
+ergonomic bill, and the "no zoo" discipline says price it before spending it. The compiler
+half is done; the library half wants a measured cast count first.
 
 The language is *ahead* of the library here: `os_str` is already a real distinct primitive
 (`os_from_bytes`, `to_str_lossy`, participating in the text-family conversion rules;

@@ -28,7 +28,7 @@ fn main() -> i32 {
     list.push(i32, xs, 40)
     list.push(i32, xs, 50)   // 5th push grows the buffer from cap 4 -> 8
 
-    io.print_i32(list.len(i32, xs))          // 5
+    io.print_i32(list.len(i32, xs) as i32)   // 5 — `len` is a `usize`; narrowing is explicit
     io.print_i32(list.get(i32, xs, 0))       // 10
     io.print_i32(list.get(i32, xs, 4))       // 50
     io.print_i32(core.imax(list.get(i32, xs, 2), list.get(i32, xs, 3)))  // 40

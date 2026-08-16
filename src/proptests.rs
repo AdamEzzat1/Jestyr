@@ -1816,6 +1816,82 @@ mod hashmap_props {
     }
 }
 
+/// **A module-qualified call argument-checks its arguments.**
+///
+/// `resolve_qualified_call` used to check ARITY ONLY. That is the hole the int→int
+/// measurement ran into and mis-measured because of: a per-file sweep read **6**
+/// offending sites, the flattened program read **55**, and the whole 9× gap was
+/// `list.get(i32, p.roots, r)`-shaped calls that were never argument-checked at all —
+/// only the flatten, where the call becomes a bare `get__list`, exposed them. The
+/// measurement had the same blind spot as the checker it was measuring.
+///
+/// A single-source test cannot reach this path (it needs a real `import`), which is
+/// exactly why the gap survived: every assignability pin lived in `typeck.rs`'s
+/// single-source `analyze`. Hence a fixture on disk and the real module loader.
+#[cfg(test)]
+mod qualified_call_args {
+    use super::*;
+
+    fn diags(dir: &std::path::Path, app: &str) -> Vec<String> {
+        std::fs::write(
+            dir.join("lib.jtr"),
+            "pub fn takes_i32(x: i32) -> i32 { return x }\n\
+             pub distinct UserId = i32\n\
+             pub fn takes_uid(u: UserId) -> i32 { return 0 }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("app.jtr"), app).unwrap();
+        let path = dir.join("app.jtr");
+        let prog = crate::module::load(path.to_str().unwrap());
+        let (_info, td) = typeck::check_program(&prog.ast, &prog.modules);
+        td.iter().map(|d| d.message.clone()).collect()
+    }
+
+    #[test]
+    fn a_qualified_call_checks_its_argument_types() {
+        let dir = std::env::temp_dir().join("jestyr_qualified_args");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A narrowing conversion through a qualified call. This is the shape that was
+        // silently accepted: `usize` into an `i32` parameter, where a negative
+        // sentinel or a large length becomes a different number.
+        let d = diags(
+            &dir,
+            "import \"lib\"\nfn main() -> i32 { let n: usize = 5 return lib.takes_i32(n) }\n",
+        );
+        assert!(
+            d.iter().any(|m| m.contains("argument `x` of `lib.takes_i32`")),
+            "a qualified call must name the offending parameter: {d:?}"
+        );
+
+        // The `distinct` rule reaches through the qualified path too — the two fixes
+        // compose, which is the point of doing them together.
+        let d2 = diags(
+            &dir,
+            "import \"lib\"\nfn main() -> i32 { let n: i32 = 5 return lib.takes_uid(n) }\n",
+        );
+        assert!(
+            d2.iter().any(|m| m.contains("distinct")),
+            "a bare `i32` must not pass as a qualified `UserId`: {d2:?}"
+        );
+
+        // POSITIVE CONTROL. Without this the two assertions above would pass equally
+        // well against a checker that rejects every qualified call.
+        let ok = diags(
+            &dir,
+            "import \"lib\"\n\
+             fn main() -> i32 {\n\
+             \x20   let n: usize = 5\n\
+             \x20   let a: i32 = lib.takes_i32(n as i32)\n\
+             \x20   let b: i32 = lib.takes_uid(7 as lib.UserId)\n\
+             \x20   return a + b\n\
+             }\n",
+        );
+        assert!(ok.is_empty(), "correct qualified calls must still typecheck: {ok:?}");
+    }
+}
+
 /// **`std/pathbuf` — the owned, growable path (Tier 2 area 2, the unblocked half).**
 ///
 /// The module exists for one reason, and it is not the path API: a Jestyr `String` is
