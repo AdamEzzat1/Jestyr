@@ -194,11 +194,69 @@ decides these need a cast, this test is the one to invert", and inverting it is 
 what happened. **That is the pattern worth copying: when you defer a decision, pin the
 deferral with a test that names its own successor.**
 
-**3. Stop emitting `@test`/`@bench` items in non-test mode.** The proper fix for the leak in
-§5, and it would let library tests be colocated again. Bigger than one predicate: `uses_*`
-helper gating, forward declarations and generic-instance collection all scan `@test` bodies,
-and it moves the non-test golden for the corpus files carrying `@test` items. Mirror +
-reseed.
+**3. ~~Stop emitting `@test`/`@bench` items in non-test mode~~ — DONE, but it does NOT
+deliver what it was expected to.** `@test`/`@bench` items are now skipped in non-test
+mode: at both emission sites, and in the five `uses_*` gates (which scan the FLAT
+expression arena, so a `print_str` in a test body would otherwise still switch on the
+print runtime for every consumer). Mirror + reseed paid.
+
+**Measured on `path_demo.c`, with `std/path`'s eleven tests colocated:**
+
+| | lines |
+|---|---|
+| tests in a sibling file (the current convention) | **820** |
+| colocated, before this change | **3162** |
+| colocated, after this change | **1845** |
+
+So it removes 42% of the penalty — real, and worth having — but colocation is still
+2.25× the sibling-file cost, so **the convention stays.** The remaining 1,025 lines are
+not the tests: they are the ordinary `pub fn` items of the modules those tests IMPORT
+(`std/test`, `std/test_report`). Skipping `@test` items cannot touch those, because
+`test_report.finish` is a perfectly ordinary function.
+
+**What would actually free colocation is reachability-based dead-code elimination**, and
+that is a different feature entirely — the backend currently emits every item it is
+handed. Worth recording plainly, because the follow-up was written as though this change
+were the whole fix, and it is not.
+
+### §1.5 — `extern "c"` ALREADY WORKS, and `sys`'s real blocker is something else
+
+**The roadmap says "needs `extern "c"`" in four places and it is wrong.**
+`examples/extern_c.jtr` has been in the corpus and the byte-identity allowlist the whole
+time; it calls libc's `puts` and `abs` directly. Probed further, and these all work
+end-to-end:
+
+* scalar arguments and returns, `cstr` arguments (`.cstr` bridges a literal);
+* **raw pointer arguments**, and **out-parameters the OS writes through** —
+  `extern "c" fn time(t: *mut i64) -> i64` both reads back and fills a slot.
+
+So the platform boundary is already crossable, and `sys` was never gated on the feature
+it is recorded as waiting for.
+
+**The real blocker is that C's own file API cannot be spelled.** Binding
+`fopen`/`fread`/`fclose` needs `FILE*`. Jestyr has no opaque pointer type, so the nearest
+spelling is `*mut u8`, which emits `uint8_t* fopen(...)` — and that **clashes with the
+prelude's `<stdio.h>`**:
+
+```
+error: conflicting types for 'fclose'; have 'int32_t(uint8_t *)'
+note:  previous declaration ... 'int __cdecl fclose(FILE *_File)'
+```
+
+The same clash hits `memset`, `strlen` and anything else already declared by the
+prelude's unconditional includes whose signature Jestyr cannot reproduce exactly.
+(`abs` works precisely because `i32 -> i32` matches `<stdlib.h>` exactly.)
+
+**So the next increment for `sys` is a `void*`-shaped FFI type**, not `extern "c"`.
+`void*` converts implicitly to and from `FILE*` in C, which makes the clash disappear and
+the whole stdio family bindable.
+
+**This also re-plans §1.2.** A streaming `Reader` was blocked on a partial-read
+*intrinsic* — the eleven-site recipe plus a reseed. With an opaque pointer type,
+`fopen`/`fread`/`fclose` bind directly and the `Reader` needs **no compiler change at
+all**. That is a much smaller and more honest route than adding a file handle to the
+intrinsic list, and it puts the resource-with-a-lifetime question where it belongs: in
+the library, as a `Drop` impl over a handle.
 
 ### §1.4 — Typed `Path` (Tier 2 area 2, the blocked half)
 
@@ -231,7 +289,7 @@ the reason stops holding, the item becomes live.
 | **`BufWriter`** | A handle cannot own borrowed storage, so it needs an `Allocator` → `mem` tier, not `core`. And the one destination that would benefit is stdout, which **already buffers in C stdio** — wrapping it is double buffering with a second copy | A real case appears (socket, compressor) |
 | **Error sets on writes** | Fifty `?`s down a formatter is how errors get swallowed, not handled. The one genuinely fallible operation is a final `flush`, and that is where an error set belongs — one fallible call, not N | A fallible write intrinsic exists |
 | **`failed()` on `Writer`** | Removed, not shipped: `print_str`/`eprint_str` return nothing so a stream write has no detectable failure, and sink overflow is deliberately the *sink's* business. It could only ever answer `false`, and a query that always says "fine" invites a caller to believe it checked something | Same as above |
-| **`sys` tier** | Genuinely blocked on `extern "c"` (design §14, 📐). Until then it is a wrapper around a wrapper — today the platform boundary *is* the closed intrinsic list | `extern "c"` lands |
+| **`sys` tier** | **NOT blocked on `extern "c"` — that already works** (see §1.5). Blocked instead on an OPAQUE POINTER TYPE: binding `fopen`/`fread`/`fclose` needs `FILE*`, Jestyr emits `uint8_t*`, and the prototype then CLASHES with the prelude's own `<stdio.h>` | A `void*`-shaped FFI type exists |
 | **Typed `Path` on `distinct`** | `distinct` is not enforced at argument positions (§1.4). **Its stated trigger — the int→int decision — has now FIRED**, so this is live: the next step is to check whether `distinct` follows the same `assignable` path the int rule now judges | NOW — the blocker is cleared |
 | **A generic collections zoo** | A breadth objection, not an existence objection. One container with a real consumer is a slice | Never as a zoo; one at a time (§1.1) |
 | **A package manager** | `ROADMAP.md` calls it ecosystem-premature, and the module-manifest hash DAG covers the real need (a lockfile-lite pinning the build graph) | Deliberately open-ended |

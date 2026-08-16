@@ -147,6 +147,28 @@ fn emit_program(
 ) -> (String, Vec<Diagnostic>) {
     // Index every enum variant by name, so the backend can construct and match
     // on them by finding the owning enum and the variant's payload fields.
+    // The bodies of `@test`/`@bench` items, which non-test mode does not emit.
+    //
+    // The `uses_*` gates below scan the FLAT expression arena, so without this a
+    // `print_str` inside a test body would still switch on the print runtime — and
+    // pull `printf` into every consumer of the module, which is most of what made
+    // colocated tests expensive in the first place. Span containment is the same
+    // technique `provenance::collect` and the port's flat-arena scans use.
+    let skip_spans: Vec<crate::span::Span> = if test_mode {
+        Vec::new()
+    } else {
+        ast.items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Fn(f) if f.has_attr("test") || f.has_attr("bench") => Some(f.body.span),
+                _ => None,
+            })
+            .collect()
+    };
+    let live = |e: &crate::ast::ExprData| {
+        !skip_spans.iter().any(|s| e.span.start >= s.start && e.span.end <= s.end)
+    };
+
     let mut variants = HashMap::new();
     for (i, item) in ast.items.iter().enumerate() {
         if let Item::Enum(e) = item {
@@ -280,35 +302,35 @@ fn emit_program(
         spawn_sites: Vec::new(),
         // Gate the `try_read_file` runtime + result typedef on actual use, so an
         // unrelated program's C is byte-identical (the additive invariant).
-        uses_try_read: ast.exprs.iter().any(|e| {
+        uses_try_read: ast.exprs.iter().filter(|e| live(e)).any(|e| {
             if let ExprKind::Call { callee, .. } = &e.kind {
                 matches!(&ast.expr_at(*callee).kind, ExprKind::Name(n) if n.name == "try_read_file")
             } else {
                 false
             }
         }),
-        uses_run_command: ast.exprs.iter().any(|e| {
+        uses_run_command: ast.exprs.iter().filter(|e| live(e)).any(|e| {
             if let ExprKind::Call { callee, .. } = &e.kind {
                 matches!(&ast.expr_at(*callee).kind, ExprKind::Name(n) if n.name == "run_command")
             } else {
                 false
             }
         }),
-        uses_eprint: ast.exprs.iter().any(|e| {
+        uses_eprint: ast.exprs.iter().filter(|e| live(e)).any(|e| {
             if let ExprKind::Call { callee, .. } = &e.kind {
                 matches!(&ast.expr_at(*callee).kind, ExprKind::Name(n) if n.name == "eprint_str")
             } else {
                 false
             }
         }),
-        uses_env_var: ast.exprs.iter().any(|e| {
+        uses_env_var: ast.exprs.iter().filter(|e| live(e)).any(|e| {
             if let ExprKind::Call { callee, .. } = &e.kind {
                 matches!(&ast.expr_at(*callee).kind, ExprKind::Name(n) if n.name == "env_var")
             } else {
                 false
             }
         }),
-        uses_mono_nanos: ast.exprs.iter().any(|e| {
+        uses_mono_nanos: ast.exprs.iter().filter(|e| live(e)).any(|e| {
             if let ExprKind::Call { callee, .. } = &e.kind {
                 matches!(&ast.expr_at(*callee).kind, ExprKind::Name(n) if n.name == "mono_nanos")
             } else {
@@ -2342,11 +2364,33 @@ impl<'a> Cgen<'a> {
         }
     }
 
+    /// Is this item a `@test`/`@bench` that the current mode does not emit?
+    ///
+    /// A `@test` is an ordinary function carrying an attribute, and the C backend
+    /// has no dead-code elimination, so in NON-test mode it and everything it
+    /// reaches used to be emitted into every program importing the module. Measured
+    /// on `path_demo.c`: 1,087 lines with `std/path`'s tests colocated, 2,789 once
+    /// those tests pulled in `std/test_report`'s `printf`, 744 with the suite moved
+    /// to a sibling file. A `core` module's own test scaffolding silently broke its
+    /// tier claim, and the convention "tests live in a sibling `*_test.jtr`" existed
+    /// only to work around this.
+    ///
+    /// Skipping them here is the real fix. Emission is where it MATTERS for
+    /// correctness; the collectors below skip them too, but only to keep the
+    /// instances and runtime helpers they reach out of the output.
+    fn test_only_item(&self, item: &Item) -> bool {
+        !self.test_mode
+            && matches!(item, Item::Fn(f) if f.has_attr("test") || f.has_attr("bench"))
+    }
+
     fn fn_protos(&mut self) {
         let ast = self.ast;
         // non-generic functions
         for (i, item) in ast.items.iter().enumerate() {
             self.cur_mod = self.item_module(i);
+            if self.test_only_item(item) {
+                continue;
+            }
             if let Item::Fn(f) = item {
                 if self.is_generic(f) || !self.fn_supported(f) {
                     continue;
@@ -2492,6 +2536,9 @@ impl<'a> Cgen<'a> {
         // non-generic functions
         for (i, item) in ast.items.iter().enumerate() {
             self.cur_mod = self.item_module(i);
+            if self.test_only_item(item) {
+                continue;
+            }
             if let Item::Fn(f) = item {
                 if self.is_generic(f) {
                     continue; // emitted as monomorphized instances below
@@ -11743,6 +11790,47 @@ mod tests {
         assert!(c.contains("j_op(21)"), "the call through `op` is indirect: {c}");
     }
 
+    /// **A `@test` is not emitted unless you are running tests.**
+    ///
+    /// A `@test` is an ordinary function with an attribute, and this backend has no
+    /// dead-code elimination, so every consumer of a module used to receive its test
+    /// functions — and everything those reached. That is why `std/path`'s suite had
+    /// to live in a sibling file, and why the convention exists at all.
+    ///
+    /// Both directions are asserted: absent in normal emission, present in the
+    /// harness. A one-directional version would pass for a backend that had simply
+    /// stopped emitting tests altogether.
+    #[test]
+    fn a_test_function_is_emitted_only_in_test_mode() {
+        let src = "@test fn checks_something() -> bool { print_str(\"in the test\") return true }\n\
+                   fn main() -> i32 { return 0 }\n";
+        let (tokens, ld) = Lexer::new(src).tokenize();
+        assert!(ld.is_empty(), "{ld:?}");
+        let (ast, pd) = Parser::new(src, tokens).parse();
+        assert!(pd.is_empty(), "{pd:?}");
+        let (info, _td) = crate::typeck::check(&ast);
+
+        let (normal, d) = emit(&ast, &info);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(
+            !normal.contains("jestyr_checks_something"),
+            "a @test must not reach an ordinary program's C:\n{normal}"
+        );
+        // …and neither must what it alone pulls in. The `uses_*` gates scan the flat
+        // expression arena, so without a span filter this string would still be here.
+        assert!(
+            !normal.contains("in the test"),
+            "a @test body's contents must not leak either:\n{normal}"
+        );
+
+        let (harness, d) = emit_tests(&ast, &info);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(
+            harness.contains("jestyr_checks_something"),
+            "the harness must still run it:\n{harness}"
+        );
+    }
+
     /// **A generic struct's array FIELD needs its typedef emitted.**
     ///
     /// `SmallVec(T) = struct { buf: [8]T, … }` mentions `[8]T` only inside the
@@ -11781,9 +11869,14 @@ mod tests {
     ///
     /// Written against the module loader rather than a bare snippet because the bug
     /// only exists for a *qualified* path, which needs a real second module.
+    ///
+    /// Uses the DEMO, not the test file: since `@test` items stopped being emitted in
+    /// non-test mode, a `&mod.f` sitting inside a `@test` body is correctly absent
+    /// from this output. The demo passes `&hashmap.hash_i64` from `main`, which is
+    /// where a real consumer writes it anyway.
     #[test]
     fn lowers_address_of_a_module_qualified_function() {
-        let prog = crate::module::load("examples/std/hashmap_test.jtr");
+        let prog = crate::module::load("examples/std/hashmap_demo.jtr");
         assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
         let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
         assert!(td.is_empty(), "{td:?}");

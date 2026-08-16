@@ -11744,11 +11744,44 @@ const SHA_K: [64]i64 = [
 // value-level arena intrinsic? Gates the arena prelude block (mirrors `uses_arena`).
 // Does the program call `try_read_file`? Gates its runtime helper + `JestyrResult_String`
 // typedef so unrelated programs stay byte-identical (mirrors `uses_try_read`).
-fn uses_try_read(read p: Parser, read src: str) -> bool {
+// Is `it` a `@test`/`@bench` item that the current mode does not emit? (Mirrors
+// `Cgen::test_only_item`.) A `@test` is an ordinary fn with an attribute and there is
+// no dead-code elimination, so in NON-test mode it and everything only it reaches
+// used to land in every consumer of the module.
+fn test_only_item(read p: Parser, read src: str, read it: ItemData, tmode: bool) -> bool {
+    if tmode { return false }
+    if item_has_attr(p, src, it, "test") { return true }
+    return item_has_attr(p, src, it, "bench")
+}
+
+// Does expression span [s, e) lie inside such an item? The `uses_*` gates below scan
+// the flat expression arena, so without this a `print_str` in a test body would still
+// switch on the print runtime for every consumer. Span containment, matching the
+// reference's `live` filter. (A `@test` takes no parameters, so its item span and its
+// body span contain exactly the same expressions.)
+fn in_skipped_test(read p: Parser, read src: str, tmode: bool, s: usize, e: usize) -> bool {
+    if tmode { return false }
+    var r: i32 = 0
+    for r < len(i32, p.roots) {
+        let iid: i32 = get__list(i32, p.roots, r as usize)
+        let it: ItemData = get__list(ItemData, p.it, iid as usize)
+        if it.kind == 3 {
+            if test_only_item(p, src, it, tmode) {
+                if s >= it.start {
+                    if e <= it.end { return true }
+                }
+            }
+        }
+        r = r + 1
+    }
+    return false
+}
+
+fn uses_try_read(read p: Parser, read src: str, tmode: bool) -> bool {
     var i: usize = 0
     for i < len(ExprData, p.ex) {
         let e: ExprData = get__list(ExprData, p.ex, i)
-        if e.kind == 10 {
+        if e.kind == 10 and !in_skipped_test(p, src, tmode, e.start, e.end) {
             let callee: ExprData = get__list(ExprData, p.ex, e.a as usize)
             if callee.kind == 2 {
                 if str_eq(src[callee.start .. callee.end], "try_read_file") { return true }
@@ -11761,11 +11794,11 @@ fn uses_try_read(read p: Parser, read src: str) -> bool {
 
 // Does the program call `run_command` / `eprint_str`? Gates the driver-plumbing runtime
 // helpers (mirrors `uses_run_command` / `uses_eprint`).
-fn uses_run_command(read p: Parser, read src: str) -> bool {
+fn uses_run_command(read p: Parser, read src: str, tmode: bool) -> bool {
     var i: usize = 0
     for i < len(ExprData, p.ex) {
         let e: ExprData = get__list(ExprData, p.ex, i)
-        if e.kind == 10 {
+        if e.kind == 10 and !in_skipped_test(p, src, tmode, e.start, e.end) {
             let callee: ExprData = get__list(ExprData, p.ex, e.a as usize)
             if callee.kind == 2 {
                 if str_eq(src[callee.start .. callee.end], "run_command") { return true }
@@ -11776,11 +11809,11 @@ fn uses_run_command(read p: Parser, read src: str) -> bool {
     return false
 }
 
-fn uses_eprint(read p: Parser, read src: str) -> bool {
+fn uses_eprint(read p: Parser, read src: str, tmode: bool) -> bool {
     var i: usize = 0
     for i < len(ExprData, p.ex) {
         let e: ExprData = get__list(ExprData, p.ex, i)
-        if e.kind == 10 {
+        if e.kind == 10 and !in_skipped_test(p, src, tmode, e.start, e.end) {
             let callee: ExprData = get__list(ExprData, p.ex, e.a as usize)
             if callee.kind == 2 {
                 if str_eq(src[callee.start .. callee.end], "eprint_str") { return true }
@@ -11792,11 +11825,11 @@ fn uses_eprint(read p: Parser, read src: str) -> bool {
 }
 
 // Does the program call `env_var`? Gates its runtime helper (mirrors `uses_env_var`).
-fn uses_env_var(read p: Parser, read src: str) -> bool {
+fn uses_env_var(read p: Parser, read src: str, tmode: bool) -> bool {
     var i: usize = 0
     for i < len(ExprData, p.ex) {
         let e: ExprData = get__list(ExprData, p.ex, i)
-        if e.kind == 10 {
+        if e.kind == 10 and !in_skipped_test(p, src, tmode, e.start, e.end) {
             let callee: ExprData = get__list(ExprData, p.ex, e.a as usize)
             if callee.kind == 2 {
                 if str_eq(src[callee.start .. callee.end], "env_var") { return true }
@@ -11809,11 +11842,11 @@ fn uses_env_var(read p: Parser, read src: str) -> bool {
 
 // Does the program call `mono_nanos`? Gates its runtime helper AND <time.h>
 // (mirrors `uses_mono_nanos`).
-fn uses_mono_nanos(read p: Parser, read src: str) -> bool {
+fn uses_mono_nanos(read p: Parser, read src: str, tmode: bool) -> bool {
     var i: usize = 0
     for i < len(ExprData, p.ex) {
         let e: ExprData = get__list(ExprData, p.ex, i)
-        if e.kind == 10 {
+        if e.kind == 10 and !in_skipped_test(p, src, tmode, e.start, e.end) {
             let callee: ExprData = get__list(ExprData, p.ex, e.a as usize)
             if callee.kind == 2 {
                 if str_eq(src[callee.start .. callee.end], "mono_nanos") { return true }
@@ -11854,7 +11887,7 @@ fn emit_prelude(mut sb: String, read p: Parser, read src: str, read g: Cg) {
     if needs_pthread {                                // -> the pthread runtime
         string_push(sb, "#include <pthread.h>\n")
     }
-    if g.tmode or uses_mono_nanos(p, src) {           // `@bench` timing via clock(); `mono_nanos`
+    if g.tmode or uses_mono_nanos(p, src, g.tmode) {           // `@bench` timing via clock(); `mono_nanos`
         string_push(sb, "#include <time.h>\n")
     }
     string_push(sb, "\n")
@@ -11918,7 +11951,7 @@ fn emit_prelude(mut sb: String, read p: Parser, read src: str, read g: Cg) {
     string_push(sb, "static void jestyr_rt_print_float(double x) { printf(\"%g\\n\", x); }\n")
     string_push(sb, "static void jestyr_rt_print_str(JestyrStr s) { printf(\"%.*s\\n\", (int) s.len, s.ptr); }\n")
     string_push(sb, "static void jestyr_rt_print_bool(bool b) { printf(\"%s\\n\", b ? \"true\" : \"false\"); }\n\n")
-    if uses_eprint(p, src) {
+    if uses_eprint(p, src, g.tmode) {
         string_push(sb, "/* Stderr line print (driver diagnostics) — same shape as print_str, other stream. */\n")
         string_push(sb, "static void jestyr_rt_eprint_str(JestyrStr s) { fprintf(stderr, \"%.*s\\n\", (int) s.len, s.ptr); }\n\n")
     }
@@ -11933,12 +11966,12 @@ fn emit_prelude(mut sb: String, read p: Parser, read src: str, read g: Cg) {
     string_push(sb, "static bool jestyr_rt_remove_file(JestyrStr path) { char* cp = jestyr_rt_cpath(path); int rc = remove(cp); free(cp); return rc == 0; }\n")
     // Recoverable read (B3): emitted ONLY when `try_read_file` is used, so a program that
     // doesn't use it stays byte-identical.
-    if uses_try_read(p, src) {
+    if uses_try_read(p, src, g.tmode) {
         string_push(sb, "/* Recoverable whole-file read: false on open/seek failure (the `String !IoError` err branch). */\n")
         string_push(sb, "static bool jestyr_rt_try_read_file(JestyrStr path, JestyrString* out) { *out = jestyr_rt_str_new(); char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, \"rb\"); free(cp); if (!f) return false; if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; } long sz = ftell(f); if (sz < 0) { fclose(f); return false; } rewind(f); size_t cap = (size_t)sz ? (size_t)sz : 1; out->ptr = (char*)malloc(cap); out->cap = cap; out->len = fread(out->ptr, 1, (size_t)sz, f); fclose(f); return true; }\n")
     }
     // Driving an external command (the self-hosted driver's gcc invocation) — on use only.
-    if uses_run_command(p, src) {
+    if uses_run_command(p, src, g.tmode) {
         string_push(sb, "/* Run an external command via system(), returning the EXIT CODE on every platform. */\n")
         // `system()`'s value is not portable: Windows gives the exit code, POSIX a
         // wait status with the code in the high byte, so `exit 3` was 3 vs 768. Only
@@ -11955,14 +11988,14 @@ fn emit_prelude(mut sb: String, read p: Parser, read src: str, read g: Cg) {
     // Environment lookup. The name must be NUL-terminated for getenv, so it goes
     // through `cpath`; the RESULT is OS-owned storage, returned as a borrowed
     // view (never freed here), exactly like argv in `arg`.
-    if uses_env_var(p, src) {
+    if uses_env_var(p, src, g.tmode) {
         string_push(sb, "/* getenv() as a str view; empty when unset. Storage is the environment's. */\n")
         string_push(sb, "static JestyrStr jestyr_rt_env_var(JestyrStr name) { char* cn = jestyr_rt_cpath(name); const char* v = getenv(cn); free(cn); if (!v) return (JestyrStr){ \"\", 0 }; return (JestyrStr){ v, strlen(v) }; }\n")
     }
     // A monotonic nanosecond counter. CLOCK_MONOTONIC never jumps with the wall
     // clock, so a difference is a real elapsed duration; the origin is
     // unspecified, which is why only differences are meaningful.
-    if uses_mono_nanos(p, src) {
+    if uses_mono_nanos(p, src, g.tmode) {
         string_push(sb, "/* Monotonic nanoseconds. Only DIFFERENCES are meaningful (origin unspecified). */\n")
         string_push(sb, "static int64_t jestyr_rt_mono_nanos(void) { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts); return (int64_t)_ts.tv_sec * 1000000000 + (int64_t)_ts.tv_nsec; }\n")
     }
@@ -22884,7 +22917,7 @@ fn emit_result_defs(mut sb: String, read p: Parser, read src: str, read c: Check
     string_push(seen, "|str|")                        // `try_from_utf8`'s result is pre-seeded
     // `try_read_file`'s result type isn't discovered from a fn signature — emit it (only when
     // used) and seed `seen` so a user `String !E` fn doesn't duplicate the typedef (B3).
-    if uses_try_read(p, src) {
+    if uses_try_read(p, src, g.tmode) {
         let tn: i32 = dc_len(d)
         string_push(d.nb, "JestyrResult_String")
         let te: i32 = dc_len(d)
@@ -24345,7 +24378,7 @@ fn emit_fn_protos(mut sb: String, read p: Parser, read src: str, read c: Checker
     for r < len(i32, p.roots) {
         let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
-        if it.kind == 3 and !fn_is_template(p, it) {  // Fn (templates are never emitted directly)
+        if it.kind == 3 and !fn_is_template(p, it) and !test_only_item(p, src, it, g.tmode) {  // Fn (templates never emitted directly; @test only in test mode)
             emit_fn_sig(sb, p, src, it)
             string_push(sb, ";\n")
         }
@@ -24367,7 +24400,7 @@ fn emit_fn_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, 
     for r < len(i32, p.roots) {
         let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
-        if it.kind == 3 and !fn_is_template(p, it) {  // Fn (templates are never emitted directly)
+        if it.kind == 3 and !fn_is_template(p, it) and !test_only_item(p, src, it, g.tmode) {  // Fn (templates never emitted directly; @test only in test mode)
             emit_fn_sig(sb, p, src, it)
             string_push(sb, "\n")
             // Register the fn's by-pointer (`mut`/`out`) params so body uses render `(*j_x)`.

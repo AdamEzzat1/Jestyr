@@ -295,7 +295,7 @@ interesting it is.
 | 6 | ~~`time` (`mono_nanos` intrinsic)~~ ✅ | std | one intrinsic + reseed | in-language elapsed measurement |
 | 7 | `fs` expansion — bytes, directory listing, temp files | std | **new intrinsics** + reseed; `fs` is a closure module; `readdir` needs real cross-platform C | build tools, anything that walks a tree |
 | 8 | `fmt` — consolidated deterministic formatting | core | **high** | workstream E; touches types/typeck/cgen |
-| 9 | `sys` | sys | blocked | needs `extern "c"` |
+| 9 | `sys` | sys | blocked | needs an OPAQUE POINTER type — **not** `extern "c"`, which already works |
 
 **Slices 1–6 are all done — the free ones are exhausted.** Everything from 7 down pays
 a new intrinsic or is blocked, so the next stdlib slice is the first one that costs
