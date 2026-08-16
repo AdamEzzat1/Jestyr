@@ -154,7 +154,33 @@ caches hashes so a grow re-places without rehashing), generic in the key, hash f
 canaried. Give it a real consumer on day one — `strmap`'s users, or the compiler's symbol
 table. Every slice on this branch that went well had one.
 
-### §1.2 — A partial-read intrinsic. The thing that unblocks a streaming `Reader`
+### §1.2 — ~~A partial-read intrinsic~~ — DONE, and NO INTRINSIC WAS NEEDED
+
+**`std/file` streams, and the compiler gained no file handle, no `read_into`, and no
+eleven-site intrinsic.** `fread` already existed; what was missing was only a way to spell
+its arguments. Two small language facts closed it — `cptr` and header-declared externs,
+both in §1.5 — and the resource-with-a-lifetime question landed where it belongs, in the
+library, as a `Drop` impl over a handle.
+
+`Reader` is a concrete type with `open`/`is_open`/`read_into`/`at_eof`/`failed`/`close`,
+RAII teardown, five tests and a demo whose whole point is that its buffer is 32 bytes: the
+demo's peak memory does not depend on the file's size, which is the one thing a streaming
+reader offers and the one thing a slurping demo could not show. Its byte/line/longest-line
+counts are checked against `wc`/`awk`.
+
+There is deliberately **no `Reader` trait** — that is still `docs/io-design.md`'s open
+four-decision question, and shipping a trait to have one would be the "iterators in a
+library costume" mistake. And deliberately **no error set**: `fread` reports a short count
+and `ferror` reports why, which is two calls rather than fifty `?`s.
+
+**The one real limitation, recorded rather than papered over:** `open` takes a `cstr`, and
+the only way to build one today is `.cstr` on a string LITERAL — so a path computed at
+runtime cannot be opened. That belongs to the string tier (a `String -> cstr` bridge with a
+NUL guarantee), not to this module.
+
+The original text follows.
+
+### §1.2 (original) — A partial-read intrinsic. The thing that unblocks a streaming `Reader`
 
 `std/cursor` is the whole reader that can honestly exist today, because the intrinsics only
 offer `read_file`/`try_read_file`, which slurp. There is no partial read, no file handle, no
@@ -286,6 +312,60 @@ prelude's unconditional includes whose signature Jestyr cannot reproduce exactly
 `void*` converts implicitly to and from `FILE*` in C, which makes the clash disappear and
 the whole stdio family bindable.
 
+> **THAT LAST SENTENCE IS WRONG, and finding out why is the useful part of this
+> section.** `cptr` was built, the probe was run, and the clash **did not disappear**:
+>
+> ```text
+> error: conflicting types for 'fclose'
+>  int32_t fclose(void* j_f);
+>  note: previous declaration ... int __cdecl fclose(FILE *_File)
+> ```
+>
+> C's implicit `void*` conversion applies to **values**, not to prototype compatibility.
+> `int(void*)` and `int(FILE*)` are different function types, so a redeclaration in those
+> terms conflicts exactly as `uint8_t*` did. **No spelling of the parameter can fix this**
+> short of Jestyr having a nominal `FILE` — the type name is not the problem.
+>
+> **The actual missing piece is not emitting the prototype at all.** Deleting those three
+> lines from the generated C by hand made it compile and run first try, which is what
+> turned a guess into a finding.
+
+### §1.5 (resolved) — `cptr` + header-declared externs; `sys`'s blocker is GONE
+
+Two changes, both small, and together they make `std/file` (§1.2) pure library code:
+
+**1. `cptr` — C's `void*` as an opaque handle.** A primitive, six sites plus the port pair
+(`prim_code`/`prim_name`, the C-type map, the size class). It lowers to `void*`, holds a
+`FILE*` without Jestyr knowing what a `FILE` is, and — the load-bearing decision — gets its
+**own `PrimFamily::Opaque`** rather than falling into `Text`. `Text` is the family whose
+members convert freely into one another (`prim_family(w) == Text` returns `true`
+unconditionally in `assignable`), so a `cptr` landing there would have been silently
+interchangeable with `str`, `String` and `cstr`.
+
+**2. `extern "<header>.h"` suppresses the prototype.** The string after `extern` says where
+the declaration comes from: `"c"` means "nowhere — emit one", a `.h` name means "that header
+already did". Keyed on the `.h` suffix rather than on `abi != "c"` so a typo (`extern "cc"`)
+falls back to emitting a prototype instead of silently dropping the declaration. The abi
+span was already parsed and recorded on **both** sides (`it.w`/`it.u` in the port), so this
+cost no parser change anywhere.
+
+**The opacity claim was written before it was true — three holes, all found by probing.**
+`std/file`'s header asserts a `cptr` "cannot be dereferenced and cannot have arithmetic done
+to it"; when first written that was **false**, which is §5's "a header comment claiming a
+property is evidence the property is false", caught this time because the claim was probed
+rather than trusted. All three reached gcc rather than the checker:
+
+| hole | why it slipped through |
+|---|---|
+| `f.*` | fell to `Deref`'s `_ => Ty::Unknown` arm; `*(void*)` is not valid C |
+| `f + 1` | binary `+` took the OTHER operand's numeric type, so `(f + 1).*` type-checked as an **`i32` deref** |
+| `let p: *mut u8 = f` | the "not modelled yet" default in `assignable` accepted it |
+
+All three are refused now, and the **widening** direction is deliberately left open —
+`*mut u8` → `cptr` is how a buffer reaches `fread`, and C performs exactly that conversion.
+The asymmetry is the design: widening to opaque is safe, recovering a typed pointer from an
+opaque handle is not.
+
 **This also re-plans §1.2.** A streaming `Reader` was blocked on a partial-read
 *intrinsic* — the eleven-site recipe plus a reseed. With an opaque pointer type,
 `fopen`/`fread`/`fclose` bind directly and the `Reader` needs **no compiler change at
@@ -356,11 +436,11 @@ the reason stops holding, the item becomes live.
 
 | Deferred | Why, precisely | Becomes live when |
 |---|---|---|
-| **Streaming `Reader`** | No partial-read intrinsic, no file handle. Wrapping `read_file`'s slurp in a `Reader` trait ships an API whose central promise — that it streams — is false, and gets rebuilt immediately | §1.2 lands |
+| ~~**Streaming `Reader`**~~ | ✅ **BUILT** as `std/file` — and with no intrinsic at all: `cptr` + header-declared externs made it library code. The `Reader` **trait** is still deferred (the four-decision question stands); this is a concrete type | done |
 | **`BufWriter`** | A handle cannot own borrowed storage, so it needs an `Allocator` → `mem` tier, not `core`. And the one destination that would benefit is stdout, which **already buffers in C stdio** — wrapping it is double buffering with a second copy | A real case appears (socket, compressor) |
 | **Error sets on writes** | Fifty `?`s down a formatter is how errors get swallowed, not handled. The one genuinely fallible operation is a final `flush`, and that is where an error set belongs — one fallible call, not N | A fallible write intrinsic exists |
 | **`failed()` on `Writer`** | Removed, not shipped: `print_str`/`eprint_str` return nothing so a stream write has no detectable failure, and sink overflow is deliberately the *sink's* business. It could only ever answer `false`, and a query that always says "fine" invites a caller to believe it checked something | Same as above |
-| **`sys` tier** | **NOT blocked on `extern "c"` — that already works** (see §1.5). Blocked instead on an OPAQUE POINTER TYPE: binding `fopen`/`fread`/`fclose` needs `FILE*`, Jestyr emits `uint8_t*`, and the prototype then CLASHES with the prelude's own `<stdio.h>` | A `void*`-shaped FFI type exists |
+| ~~**`sys` tier**~~ | ✅ **UNBLOCKED.** Blocked on neither `extern "c"` (already worked) nor, as it turned out, on an opaque pointer type alone — `void*` does not fix a prototype clash. **Prototype SUPPRESSION did** (`extern "stdio.h"`), and `std/file` is the proof that the whole stdio family now binds. What remains is scope, not capability: which syscalls `sys` should expose | now — pick the surface |
 | **Typed `Path` on `distinct`** | `distinct` is not enforced at argument positions (§1.4). **Its stated trigger — the int→int decision — has now FIRED**, so this is live: the next step is to check whether `distinct` follows the same `assignable` path the int rule now judges | NOW — the blocker is cleared |
 | **A generic collections zoo** | A breadth objection, not an existence objection. One container with a real consumer is a slice | Never as a zoo; one at a time (§1.1) |
 | **A package manager** | `ROADMAP.md` calls it ecosystem-premature, and the module-manifest hash DAG covers the real need (a lockfile-lite pinning the build graph) | Deliberately open-ended |
@@ -381,7 +461,7 @@ predate this work.
 | Tier 2 area | State |
 |---|---|
 | 1. Capability handles | ✅ **all four** — `process.Process`, `fs.Fs`, `time.Clock`, `env.Env` |
-| 3. Reader / Writer | ✅ **Writer complete** (`sink` core + `writer` std); **Reader is memory-only** (`cursor`) — streaming is §1.2, not a gap in the design |
+| 3. Reader / Writer | ✅ **Writer complete** (`sink` core + `writer` std); **Reader complete for files** — `cursor` over memory, `std/file` streaming from disk. Only the `Reader` *trait* is open, and deliberately |
 | 5. Testing / golden | ✅ `std/test` (core) + `test_report` (prints) + `test_fixture` (fetches) |
 | 7. Package / build | ✅ *as scoped* — `build.jestyr` (CTFE, effect-free by construction) + module-manifest hash DAG |
 | 6. No-std contract | ✅ **both axes checked** — `@no_alloc` *and* `@no_os` (below) |
@@ -609,6 +689,18 @@ loader-triggered divergence can fail.
   accepted a struct whose `i64` field was 32 bits wide. Values above 2³² truncated silently.
   Whenever the port can render a type it might not have substituted, assert on the C **type
   name** and on a runtime value that does not fit the fallback.
+* **A C-level "implicit conversion" does not make two PROTOTYPES compatible.** `void*`
+  converts to and from `FILE*` freely — as a *value*. `int(void*)` is still an incompatible
+  redeclaration of `int(FILE*)`, so the whole "bind stdio with an opaque pointer type" plan
+  failed on its first probe. When the blocker is a redeclaration conflict, the answer is
+  usually to stop redeclaring, not to find a better type name.
+* **A new type's safety properties are claims until probed, and the module header is where
+  they get written down too early.** `cptr`'s "cannot be dereferenced, cannot do arithmetic"
+  was false in three separate ways when first written — a bare `f.*` fell to
+  `Ty::Unknown`, `f + 1` took the *other* operand's numeric type so `(f + 1).*` type-checked
+  as an `i32` deref, and `let p: *mut u8 = f` rode the not-modelled-yet default. Probe each
+  claim in the header as a rejection test **and** pair it with the positive control that
+  keeps the type usable (here: widening `*mut u8` → `cptr`, which `fread` needs).
 * **Substituting renderers come in sets; a form handled by one and not the others is a bug.**
   `emit_su_ty` (AST), `emit_su_tyid` (checker) and `emit_gs_ty` (struct-instance) must all
   know every type form. Arrays were in the first and missing from the other two, so five call

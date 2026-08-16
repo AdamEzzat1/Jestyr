@@ -189,6 +189,16 @@ pub fn prim_ty(name: &str) -> Option<&'static str> {
         "char" => "char",
         "str" => "str",
         "cstr" => "cstr",
+        // `cptr` — C's `void*`, the opaque FFI handle. It exists because a `FILE*`
+        // cannot otherwise be spelled: `*mut u8` emits `uint8_t*`, and the resulting
+        // `extern "c"` prototype then CLASHES with the prelude's own `<stdio.h>`
+        // ("conflicting types for 'fclose'"). `void*` converts to and from any object
+        // pointer in C, so the clash disappears and the whole stdio family binds.
+        //
+        // Deliberately NOT dereferenceable and not arithmetic-capable — it is a
+        // token, not a pointer you may follow. That is what keeps binding stdio out
+        // of the `unsafe` ladder: there is no raw-pointer operation to guard.
+        "cptr" => "cptr",
         "os_str" => "os_str",
         "String" => "String",
         "Builder" => "Builder",

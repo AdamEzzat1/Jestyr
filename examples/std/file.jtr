@@ -1,0 +1,142 @@
+// std/file.jtr — a STREAMING file reader, and the first module that reaches the
+// operating system without a compiler intrinsic.
+//
+// ─── Why this module is the interesting one ───────────────────────────────────
+//
+// Every other IO path in the tree slurps: `read_file`/`try_read_file` hand back
+// the whole file as a `String`. `std/cursor` is a reader over memory, which is
+// honest but is not streaming. The roadmap recorded the fix as a new *intrinsic*
+// — a file handle plus `read_into(handle, buf)`, paying the eleven-site recipe
+// and a reseed, and introducing a resource with a lifetime into the compiler.
+//
+// None of that was needed. `fread` already exists, and what was missing was only
+// a way to SPELL its arguments. Two small language facts close the gap:
+//
+//   1. `cptr` — C's `void*`, an opaque handle. It holds the `FILE*` without
+//      Jestyr having to know what a `FILE` is.
+//   2. `extern "stdio.h"` — the string after `extern` says where the declaration
+//      comes from. `"c"` means "nowhere, emit one"; a header name means "that
+//      header already did, so do NOT emit one".
+//
+// The second is the one that actually unblocked this, and the roadmap's diagnosis
+// was wrong about it. `void*` alone does not work: C requires a redeclaration to
+// be *compatible*, and `int fclose(void*)` is not compatible with
+// `int fclose(FILE*)` — implicit `void*` conversion applies to VALUES, not to
+// prototypes. So the fix is to not redeclare at all, and then `cptr` values pass
+// through `<stdio.h>`'s own declarations by exactly those implicit conversions.
+//
+// ─── What this is NOT ─────────────────────────────────────────────────────────
+//
+// There is deliberately no `Reader` TRAIT here. That is still the open design
+// question `docs/io-design.md` records — four decisions, none of which this module
+// answers — and shipping a trait to have one would be the "iterators in a library
+// costume" mistake. `Reader` here is a concrete type that streams; when the trait
+// question is settled, this is what it will be settled against.
+//
+// Nor is there an error set. `fread` reports a short count and `ferror` reports
+// why, which is two calls, not fifty `?`s down a formatter — the same argument
+// `io-design.md` makes for putting the error set on `flush` and nowhere else.
+//
+// ─── The one real limitation ──────────────────────────────────────────────────
+//
+// `open` takes a `cstr`, because that is what `fopen` takes, and the only way to
+// build one today is `.cstr` on a string LITERAL. So a path computed at runtime
+// cannot be opened yet. That is a genuine gap and it belongs to the string tier
+// (a `String -> cstr` bridge with a NUL guarantee), not here — putting a
+// half-answer in this module would be the thing this file's header warns about.
+//
+// Nothing here is `@no_os`: this module IS the OS boundary, and it is the first
+// file in the tree where that is the point rather than a failure.
+//
+// Run the tests:  jestyrc test examples/std/file_test.jtr
+
+// For the `Drop` trait, which `std/mem` declares — the same reason `std/pathbuf`
+// imports it. Nothing here allocates.
+import "mem"
+
+// The stdio family. Declared by <stdio.h>, which the prelude already includes —
+// hence the header name rather than "c". Emitting prototypes for these is a
+// compile ERROR, not a redundancy; see `cgen::extern_protos`.
+extern "stdio.h" fn fopen(path: cstr, mode: cstr) -> cptr
+extern "stdio.h" fn fclose(f: cptr) -> i32
+extern "stdio.h" fn fread(buf: cptr, size: usize, n: usize, f: cptr) -> usize
+extern "stdio.h" fn feof(f: cptr) -> i32
+extern "stdio.h" fn ferror(f: cptr) -> i32
+
+// An open file, read sequentially.
+//
+// The handle is `cptr` rather than `*mut u8` for two reasons, and the second is
+// the one that matters: a `cptr` cannot be dereferenced and cannot have arithmetic
+// done to it, because it is not a pointer type in Jestyr's grammar at all. So this
+// struct cannot be made to read the FILE's innards even inside `unsafe` — there is
+// no operation to write. A `*mut u8` would have offered several.
+pub struct Reader {
+    h: cptr,
+}
+
+// ------------------------------------------------------------------ opening
+
+// Open `path` for binary reading. Check `is_open` before reading: a failed open
+// is reported as a closed `Reader`, not as an error value, because there is
+// exactly one failure and a whole error set for it would be ceremony.
+//
+// Binary mode ("rb") is not a default, it is a decision: text mode on Windows
+// rewrites `\r\n` to `\n` on the way past, so the SAME file would yield different
+// bytes on different platforms. A determinism-first language does not get to do
+// that silently. Callers wanting line endings normalised should normalise them.
+pub fn open(path: cstr) -> Reader {
+    return Reader{ h: fopen(path, "rb".cstr) }
+}
+
+// Did the open succeed? A `Reader` for which this is false is inert: every read
+// returns 0 and `close` does nothing.
+pub fn is_open(read r: Reader) -> bool {
+    return r.h != null
+}
+
+// ------------------------------------------------------------------ reading
+
+// Fill as much of `buf` as the file has left, returning the byte count.
+//
+// A short count means EOF **or** an error, and this deliberately does not
+// collapse the two: ask `at_eof` or `failed`. Returning a sentinel would make the
+// common loop (`for n > 0`) wrong on the uncommon path, which is how "read errors
+// look like EOF" bugs are written.
+pub fn read_into(mut r: Reader, mut buf: []u8) -> usize {
+    if r.h == null { return 0 }
+    if buf.len == 0 { return 0 }
+    return fread(buf.ptr, 1, buf.len, r.h)
+}
+
+// Has the file been read to its end? Only meaningful after a read that returned
+// less than the buffer size — `feof` reports a *past* attempt, not a prediction,
+// which is C's semantics and not worth papering over.
+pub fn at_eof(read r: Reader) -> bool {
+    if r.h == null { return true }
+    return feof(r.h) != 0
+}
+
+// Did a read fail? Distinct from `at_eof`: both make a read return short, and only
+// this one means the bytes are missing rather than absent.
+pub fn failed(read r: Reader) -> bool {
+    if r.h == null { return false }
+    return ferror(r.h) != 0
+}
+
+// ------------------------------------------------------------------ teardown
+
+// Close the file early. Idempotent, and composes with the automatic drop — the
+// `std/list` contract: it clears the handle, so the `Drop` impl finds nothing left
+// to do and a double close cannot reach `fclose` twice.
+pub fn close(mut r: Reader) {
+    if r.h != null {
+        fclose(r.h)
+        r.h = null
+    }
+}
+
+impl Drop for Reader {
+    fn drop(mut self) {
+        if self.h != null { fclose(self.h) }
+    }
+}

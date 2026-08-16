@@ -111,8 +111,8 @@ fn prim_layout(name: &str) -> Option<Layout> {
         "i64" | "u64" | "f64" | "isize" | "usize" => Layout::scalar(8),
         // `str` is a length-carrying view: `{ const char* ptr; size_t len; }`.
         "str" | "os_str" => Layout::new(2 * PTR, PTR),
-        // `cstr` is a bare NUL-terminated pointer.
-        "cstr" => Layout::scalar(PTR),
+        // `cstr` is a bare NUL-terminated pointer; `cptr` a bare opaque one.
+        "cstr" | "cptr" => Layout::scalar(PTR),
         // Owned/growable buffers: `{ ptr, len, cap }`.
         "String" | "Cow" => Layout::new(3 * PTR, PTR),
         // `{ JestyrStr* frags; size_t n; size_t cap; }`.

@@ -2416,11 +2416,37 @@ impl<'a> Cgen<'a> {
 
     /// Emit a C prototype for each `extern "c"` declaration. The function is
     /// called by its bare name and resolved by the linker (design §12).
+    ///
+    /// **Unless a HEADER already declares it.** The string after `extern` says where
+    /// the declaration comes from: `"c"` means "nowhere — Jestyr must supply one",
+    /// and a `.h` name means "that header does, so do not". Emitting one anyway is
+    /// not merely redundant, it is a hard error, because C requires a redeclaration
+    /// to be *compatible* and Jestyr cannot reproduce most libc signatures exactly:
+    ///
+    /// ```text
+    /// error: conflicting types for 'fclose'
+    ///  int32_t fclose(void* j_f);
+    ///  note: previous declaration ... int __cdecl fclose(FILE *_File)
+    /// ```
+    ///
+    /// This is the real blocker the roadmap recorded as "needs an opaque pointer
+    /// type", and the diagnosis was wrong: `void*` does NOT resolve the clash,
+    /// because C's implicit `void*` conversions apply to **values**, not to prototype
+    /// compatibility — `int(void*)` and `int(FILE*)` are still incompatible types.
+    /// Suppressing the prototype is what actually works, and then `cptr` values flow
+    /// through the header's own declarations by exactly those implicit conversions.
+    ///
+    /// Keyed on `.h` rather than on `abi != "c"` so a typo (`extern "cc"`) falls back
+    /// to emitting a prototype — the current behaviour — instead of silently dropping
+    /// the declaration and leaving the call to C's implicit-declaration rules.
     fn extern_protos(&mut self) {
         let ast = self.ast;
         let mut any = false;
         for item in &ast.items {
             if let Item::Extern(e) = item {
+                if e.abi.ends_with(".h") {
+                    continue;
+                }
                 any = true;
                 let ret = match e.ret_ty {
                     Some(t) => self.c_ty_ast(t),
@@ -10511,6 +10537,10 @@ fn prim_c(name: &str) -> Option<&'static str> {
         "str" => "JestyrStr",
         "os_str" => "JestyrStr", // structurally a view, but unproven (possibly ill-formed)
         "cstr" => "const char*",
+        // `void*` is the point: C converts it to and from any object pointer
+        // implicitly, so an `extern "c" fn fclose(f: cptr) -> i32` prototype AGREES
+        // with `<stdio.h>`'s `int fclose(FILE*)` instead of conflicting with it.
+        "cptr" => "void*",
         "String" => "JestyrString",
         "Builder" => "JestyrBuilder",
         "Cow" => "JestyrCow",
@@ -12613,6 +12643,57 @@ mod tests {
         assert!(c.contains("int32_t puts(const char* j_s);"), "extern prototype: {c}");
         assert!(c.contains("puts(JSTR(\"hi\").ptr)"), "bare call, str→cstr at the boundary: {c}");
         assert!(!c.contains("jestyr_puts"), "extern names are not mangled: {c}");
+    }
+
+    /// **A header-declared extern gets NO prototype — and that is what unblocked
+    /// `sys`.**
+    ///
+    /// The roadmap recorded the blocker as "Jestyr cannot spell `FILE*`", and the
+    /// fix as an opaque pointer type. **That diagnosis was wrong**, and probing is
+    /// what showed it: with `cptr` in hand, `extern "c" fn fclose(f: cptr) -> i32`
+    /// still failed, because C requires a redeclaration to be *compatible* and
+    /// `int(void*)` is not compatible with `int(FILE*)`. Implicit `void*` conversion
+    /// applies to VALUES, not to prototypes.
+    ///
+    /// So the real missing piece is not emitting the prototype at all. The string
+    /// after `extern` says where the declaration comes from: `"c"` means "nowhere,
+    /// supply one", a `.h` name means "that header did". Keyed on the `.h` suffix
+    /// rather than on `abi != "c"` so a typo falls back to emitting a prototype —
+    /// the old behaviour — instead of silently dropping the declaration.
+    #[test]
+    fn a_header_declared_extern_emits_no_prototype() {
+        let src = "extern \"stdio.h\" fn fclose(f: cptr) -> i32 \
+                   fn main() -> i32 { return 0 }";
+        let (c, d) = gen(src);
+        assert!(d.is_empty(), "{:?}", d);
+        // Assert the absence of the PROTOTYPE, not of the name: the runtime prelude
+        // already calls `fclose` inside its `read_file` helper, so `c.contains(
+        // "fclose(")` is true for every program and would have passed vacuously.
+        // (§5, "don't assert a global absence to prove a local property" — walked
+        // into once more while writing this very test.)
+        assert!(
+            !c.contains("int32_t fclose(void* j_f);"),
+            "a header-declared extern must not be redeclared — that is a hard C error: {c}"
+        );
+
+        // The CONTROL, and it is the point: `"c"` still emits one, so this is a
+        // targeted suppression rather than externs quietly ceasing to be declared.
+        let (c2, d2) = gen(
+            "extern \"c\" fn my_own_thing(f: cptr) -> i32 fn main() -> i32 { return 0 }",
+        );
+        assert!(d2.is_empty(), "{:?}", d2);
+        assert!(
+            c2.contains("int32_t my_own_thing(void* j_f);"),
+            "a non-header extern still gets its prototype, and `cptr` lowers to `void*`: {c2}"
+        );
+
+        // A misspelled abi must NOT be read as a header name.
+        let (c3, _d3) =
+            gen("extern \"cc\" fn other(f: cptr) -> i32 fn main() -> i32 { return 0 }");
+        assert!(
+            c3.contains("int32_t other(void* j_f);"),
+            "only a `.h` suffix suppresses; anything else keeps the old behaviour: {c3}"
+        );
     }
 
     #[test]

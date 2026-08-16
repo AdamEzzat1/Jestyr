@@ -1,0 +1,154 @@
+// std/file_test.jtr — `std/file`'s suite, in a sibling file because a colocated
+// `@test` is emitted into every consumer (the convention `path_test.jtr` set).
+//
+// These tests read a file guaranteed to exist and to be stable: the module's own
+// source. That is deliberate — a fixture written by the test would need a writable
+// path, which is a second OS surface this module does not have, and a fixture
+// checked in beside the test would drift from it silently.
+//
+// Run:  jestyrc test examples/std/file_test.jtr
+
+import "file"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 512
+
+// The module's own source, read relative to the repo root — the same working-
+// directory assumption `test_fixture` already makes.
+fn self_path() -> cstr {
+    return "examples/std/file.jtr".cstr
+}
+
+@test fn open_reports_success_and_failure() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var good: file.Reader = file.open(self_path())
+    test.is_true(c, rep, "the module's own source opens", file.is_open(good))
+    file.close(good)
+
+    var bad: file.Reader = file.open("examples/std/no_such_file_exists.jtr".cstr)
+    test.is_false(c, rep, "a missing file does not report as open", file.is_open(bad))
+
+    // Every operation on a closed reader is inert rather than undefined.
+    var buf: *mut u8 = alloc(u8, 8)
+    var s: []u8 = slice(u8, buf, 8)
+    test.eq_usize(c, rep, "a closed reader reads nothing", file.read_into(bad, s), 0)
+    test.is_false(c, rep, "a closed reader reports no read error", file.failed(bad))
+    free_ptr(buf)
+    file.close(bad)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The property that makes this module STREAMING rather than slurping: a buffer
+// smaller than the file still makes progress, and repeated reads advance.
+@test fn reads_advance_through_the_file() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var r: file.Reader = file.open(self_path())
+    test.is_true(c, rep, "open", file.is_open(r))
+    var buf: *mut u8 = alloc(u8, 16)
+    var s: []u8 = slice(u8, buf, 16)
+
+    let n1: usize = file.read_into(r, s)
+    test.eq_usize(c, rep, "a 16-byte read from a much larger file fills the buffer", n1, 16)
+    let first: i64 = unsafe { (buf + 0).* as i64 }
+
+    let n2: usize = file.read_into(r, s)
+    test.eq_usize(c, rep, "the second read also fills", n2, 16)
+    let second: i64 = unsafe { (buf + 0).* as i64 }
+
+    // The file begins `// std/file_test…`, so byte 0 of the first read is `/`.
+    test.eq_i64(c, rep, "the file begins with `/`", first, 47)
+    // Not a strong claim about CONTENT, but it proves the cursor moved: if reads
+    // restarted, `second` would equal `first`.
+    test.ne_i64(c, rep, "the second read starts elsewhere — the cursor advanced", second, first)
+
+    free_ptr(buf)
+    file.close(r)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// Reading to the end must terminate, report EOF, and NOT report an error. The loop
+// here is the one a real caller writes, so an API that made that loop wrong would
+// hang or miscount rather than merely fail an assertion.
+@test fn a_full_read_terminates_at_eof_without_an_error() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var r: file.Reader = file.open(self_path())
+    test.is_true(c, rep, "open", file.is_open(r))
+    var buf: *mut u8 = alloc(u8, 64)
+    var s: []u8 = slice(u8, buf, 64)
+    var total: usize = 0
+    var reading: bool = true
+    for reading {
+        let n: usize = file.read_into(r, s)
+        if n == 0 {
+            reading = false
+        } else {
+            total = total + n
+        }
+    }
+    test.is_true(c, rep, "this module's source is comfortably over 1000 bytes", total > 1000)
+    test.is_true(c, rep, "the loop ended because the file ended", file.at_eof(r))
+    test.is_false(c, rep, "and not because a read failed", file.failed(r))
+
+    free_ptr(buf)
+    file.close(r)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// A zero-length buffer must read nothing and must NOT look like EOF — the
+// degenerate case that would otherwise silently truncate a caller's loop.
+@test fn a_zero_length_buffer_reads_nothing_and_is_not_eof() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var r: file.Reader = file.open(self_path())
+    var buf: *mut u8 = alloc(u8, 1)
+    var s: []u8 = slice(u8, buf, 0)
+    test.eq_usize(c, rep, "an empty buffer takes no bytes", file.read_into(r, s), 0)
+    test.is_false(c, rep, "and that is not EOF — nothing was attempted", file.at_eof(r))
+
+    free_ptr(buf)
+    file.close(r)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// `close` is idempotent and composes with the automatic drop. A double `fclose`
+// is undefined behaviour a test cannot reliably observe, so this asserts the
+// OBSERVABLE proxy: the handle is cleared, so `Drop` finds nothing to do.
+@test fn close_is_idempotent_and_composes_with_drop() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var r: file.Reader = file.open(self_path())
+    test.is_true(c, rep, "open", file.is_open(r))
+    file.close(r)
+    test.is_false(c, rep, "closed", file.is_open(r))
+    file.close(r)
+    test.is_false(c, rep, "still closed, and the second close did nothing", file.is_open(r))
+    // `r` now drops at scope exit with a null handle — the composition the
+    // module's header claims.
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

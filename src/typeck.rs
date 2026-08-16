@@ -1177,6 +1177,13 @@ impl<'a> TypeChecker<'a> {
         if self.distinct_mismatch(want, got) {
             return false;
         }
+        // A typed pointer may be WIDENED to `cptr` — that is how a buffer reaches
+        // `fread`, and C performs exactly that conversion implicitly. The reverse is
+        // refused: recovering a typed pointer from an opaque handle contradicts the
+        // one claim the type makes, so it needs an explicit `as`.
+        if matches!(got, Ty::Prim("cptr")) && matches!(want, Ty::Ptr { .. } | Ty::Slice(_)) {
+            return false;
+        }
         // Only primitive-vs-primitive is judged beyond that. Anything else — named
         // types, generics, references, fn-pointers, `dyn` coercions — has a
         // coercion story this pass does not model yet, so it is left alone.
@@ -2665,7 +2672,21 @@ impl<'a> TypeChecker<'a> {
                     match op {
                         Eq | Ne | Lt | Le | Gt | Ge | And | Or => Ty::Prim("bool"),
                         _ => {
-                            if is_numeric(&lt) {
+                            // `cptr` is an OPAQUE handle: `f + 1` has no meaning,
+                            // and C's own `void*` arithmetic is a GNU extension
+                            // rather than standard. Without this guard the
+                            // expression took the *other* operand's numeric type,
+                            // so `(f + 1).*` type-checked as an `i32` deref and
+                            // sailed through to gcc — degrades-to-gcc on a
+                            // brand-new feature. Comparisons are unaffected: they
+                            // are handled by the arm above, so `f == null` works.
+                            if matches!(lt, Ty::Prim("cptr")) || matches!(rt, Ty::Prim("cptr")) {
+                                self.error(
+                                    span,
+                                    "`cptr` is an opaque handle — arithmetic on it has no meaning; cast it to a typed pointer first".to_string(),
+                                );
+                                Ty::Error
+                            } else if is_numeric(&lt) {
                                 lt
                             } else if is_numeric(&rt) {
                                 rt
@@ -3083,6 +3104,16 @@ impl<'a> TypeChecker<'a> {
                     Ty::Ptr { inner, .. } => *inner,
                     Ty::GenRef(elem) => *elem,    // `r.*` on a generational reference
                     Ty::RegionRef(elem) => *elem, // `r.*` on a region reference
+                    // `cptr` is opaque: there is nothing on the other end Jestyr has
+                    // a type for, and `*(void*)` is not valid C either. A silent
+                    // `Unknown` here would have let it reach gcc.
+                    Ty::Prim("cptr") => {
+                        self.error(
+                            span,
+                            "`cptr` is an opaque handle and cannot be dereferenced — cast it to a typed pointer (`as *mut u8`) if you really own the memory".to_string(),
+                        );
+                        Ty::Error
+                    }
                     _ => Ty::Unknown,
                 }
             }
@@ -4416,6 +4447,14 @@ enum PrimFamily {
     Bool,
     Char,
     Text,
+    /// `cptr` alone — the opaque FFI handle. It gets its OWN family rather than
+    /// falling into `Text`, and that is the whole safety story: `Text` is the
+    /// family whose members convert freely into one another (`prim_family(w) ==
+    /// Text` returns `true` unconditionally in `assignable`, because the
+    /// borrow/own conversions there are not modelled). A `cptr` landing in `Text`
+    /// would have been silently interchangeable with `str`, `String` and `cstr` —
+    /// the exact opposite of an opaque handle.
+    Opaque,
 }
 
 fn prim_family(p: &str) -> PrimFamily {
@@ -4423,6 +4462,7 @@ fn prim_family(p: &str) -> PrimFamily {
         _ if numeric_prim(p) => PrimFamily::Numeric,
         "bool" => PrimFamily::Bool,
         "char" => PrimFamily::Char,
+        "cptr" => PrimFamily::Opaque,
         _ => PrimFamily::Text,
     }
 }
@@ -6407,6 +6447,67 @@ mod tests {
             "{prelude}fn main() -> i32 {{ let u: UserId = 5 as UserId return takes_uid(u) }}"
         ));
         assert!(de.is_empty(), "a `UserId` must pass as a `UserId`: {de:?}");
+    }
+
+    /// **`cptr` is opaque, and every way of looking through it is refused.**
+    ///
+    /// The module header of `std/file` claims a `cptr` "cannot be dereferenced and
+    /// cannot have arithmetic done to it". When that claim was first written it was
+    /// **false** — which is §5's "a header comment claiming a property is evidence
+    /// the property is false", caught by probing instead of trusting. All three
+    /// holes reached gcc rather than the checker:
+    ///
+    /// * `f.*` fell to the `_ => Ty::Unknown` arm, and `*(void*)` is not valid C;
+    /// * `f + 1` took the OTHER operand's numeric type, so `(f + 1).*` type-checked
+    ///   as an `i32` deref (and `void*` arithmetic is a GNU extension, not C);
+    /// * `let p: *mut u8 = f` was accepted by the "not modelled yet" default.
+    ///
+    /// The widening direction must stay open in the same breath, because that is how
+    /// a buffer reaches `fread` — so the positive controls are not decoration here,
+    /// they are the half that keeps the type usable.
+    #[test]
+    fn a_cptr_is_opaque_in_every_direction_that_matters() {
+        let prelude = "extern \"stdio.h\" fn fopen(path: cstr, mode: cstr) -> cptr\n";
+        let probe = |body: &str| {
+            let (_i, d) = analyze(&format!(
+                "{prelude}fn main() -> i32 {{ var f: cptr = fopen(\"x\".cstr, \"rb\".cstr) {body} return 0 }}"
+            ));
+            d.iter().map(|m| m.message.clone()).collect::<Vec<_>>()
+        };
+
+        // REFUSALS.
+        assert!(
+            probe("unsafe { let x: u8 = f.* }").iter().any(|m| m.contains("cannot be dereferenced")),
+            "a bare deref must be refused"
+        );
+        assert!(
+            probe("unsafe { let x: u8 = (f + 1).* }")
+                .iter()
+                .any(|m| m.contains("arithmetic on it has no meaning")),
+            "arithmetic must be refused before the deref can hide it"
+        );
+        assert!(
+            probe("let p: *mut u8 = f").iter().any(|m| m.contains("found `cptr`")),
+            "narrowing an opaque handle back to a typed pointer must be refused"
+        );
+        assert!(
+            probe("let s: str = f").iter().any(|m| m.contains("found `cptr`")),
+            "`cptr` must not be in the text family — that family converts freely"
+        );
+
+        // POSITIVE CONTROLS. Each is something the type would be useless without.
+        assert!(probe("let ok: bool = f == null").is_empty(), "comparing to `null` must work");
+        assert!(
+            probe("var g: cptr = f").is_empty(),
+            "a `cptr` must be assignable to a `cptr`"
+        );
+        assert!(
+            probe(
+                "var b: *mut u8 = alloc(u8, 4) var h: cptr = b free_ptr(b)"
+            )
+            .is_empty(),
+            "WIDENING a typed pointer to `cptr` must stay open — it is how a buffer reaches `fread`"
+        );
     }
 
     /// **A raw pointer is not a slice, and neither is a fixed array.**

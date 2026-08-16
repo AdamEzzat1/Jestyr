@@ -1,0 +1,87 @@
+// std/file_demo.jtr — `std/file`'s consumer: counting a file without holding it.
+//
+//   file_demo                 byte, line and longest-line counts for a fixed file
+//
+// The point of the demo is the BUFFER SIZE. It reads through a 32-byte window, so
+// the program's peak memory does not depend on the file's size — which is the one
+// thing a streaming reader offers over `read_file`, and the one thing a demo that
+// slurped would fail to show. A file a thousand times larger would run in the same
+// footprint.
+//
+// It also exercises the boundary that a naive line counter gets wrong: a newline
+// may land on any offset, including the last byte of a window, so the count must
+// come from the running byte stream and not from anything window-shaped.
+//
+// The input is this repository's `LICENSE-MIT` — checked in, stable, and not a
+// file the demo itself writes, so the numbers are reproducible.
+
+import "file"
+
+const WINDOW: usize = 32
+const NEWLINE: u8 = 10
+const CARRIAGE_RETURN: u8 = 13
+
+fn main() -> i32 {
+    var r: file.Reader = file.open("LICENSE-MIT".cstr)
+    if !file.is_open(r) {
+        print_str("cannot open LICENSE-MIT (run from the repository root)")
+        return 1
+    }
+
+    var raw: *mut u8 = alloc(u8, WINDOW)
+    var win: []u8 = slice(u8, raw, WINDOW)
+
+    var bytes: usize = 0
+    var lines: usize = 0
+    var longest: usize = 0
+    var current: usize = 0                 // length of the line in progress
+    var reading: bool = true
+
+    for reading {
+        let n: usize = file.read_into(r, win)
+        if n == 0 {
+            reading = false
+        } else {
+            bytes = bytes + n
+            var i: usize = 0
+            for i < n {
+                let b: u8 = unsafe { (raw + i).* }
+                if b == NEWLINE {
+                    lines = lines + 1
+                    if current > longest { longest = current }
+                    current = 0
+                } else {
+                    // `open` reads in BINARY mode, so a CRLF file still carries its
+                    // `\r` — deliberately, because text mode would make the same
+                    // file yield different bytes on different platforms. Normalising
+                    // is therefore the caller's job, and this is the caller: without
+                    // this line the longest-line count reads one higher than every
+                    // text tool's, which is the module's contract showing through
+                    // rather than a bug.
+                    if b != CARRIAGE_RETURN { current = current + 1 }
+                }
+                i = i + 1
+            }
+        }
+    }
+    // A trailing line with no final newline still counts as a line.
+    if current > 0 {
+        lines = lines + 1
+        if current > longest { longest = current }
+    }
+
+    if file.failed(r) {
+        print_str("read error")
+        free_ptr(raw)
+        file.close(r)
+        return 1
+    }
+
+    print_int(bytes as i64)
+    print_int(lines as i64)
+    print_int(longest as i64)
+
+    free_ptr(raw)
+    file.close(r)
+    return 0
+}

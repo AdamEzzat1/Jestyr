@@ -11673,6 +11673,10 @@ int32_t jestyr_prim_code(JestyrStr j_t)
     {
         return 19;
     }
+    if (jestyr_rt_str_eq(j_t, JSTR("cptr")))
+    {
+        return 21;
+    }
     return (0 - 1);
 }
 
@@ -11757,6 +11761,10 @@ JestyrStr jestyr_prim_name(int32_t j_pc)
     if ((j_pc == 19))
     {
         return JSTR("Cow");
+    }
+    if ((j_pc == 21))
+    {
+        return JSTR("cptr");
     }
     return JSTR("error");
 }
@@ -19132,6 +19140,10 @@ JestyrStr jestyr_c_prim(JestyrStr j_name)
     {
         return JSTR("const char*");
     }
+    if (jestyr_rt_str_eq(j_name, JSTR("cptr")))
+    {
+        return JSTR("void*");
+    }
     if (jestyr_rt_str_eq(j_name, JSTR("String")))
     {
         return JSTR("JestyrString");
@@ -23539,7 +23551,18 @@ void jestyr_emit_extern_protos(JestyrString* restrict j_sb, Jestyr_Parser j_p, J
     {
         int32_t j_iid = jestyr_get__list__i32(j_p.j_roots, (size_t)(j_r));
         Jestyr_ItemData j_it = jestyr_get__list__ItemData(j_p.j_it, (size_t)(j_iid));
-        if ((j_it.j_kind == 8))
+        bool j_hdr = false;
+        if ((j_it.j_w >= 0))
+        {
+            if (((j_it.j_u - j_it.j_w) >= 2))
+            {
+                if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, (size_t)((j_it.j_u - 2)), (size_t)(j_it.j_u)), JSTR(".h")))
+                {
+                    j_hdr = true;
+                }
+            }
+        }
+        if (((j_it.j_kind == 8) && (!j_hdr)))
         {
             j_any = true;
             jestyr_emit_c_ty(&((*j_sb)), j_p, j_src, j_it.j_z);
@@ -29954,6 +29977,10 @@ int32_t jestyr_la_prim_align(JestyrStr j_name)
         return 8;
     }
     if (jestyr_rt_str_eq(j_name, JSTR("cstr")))
+    {
+        return 8;
+    }
+    if (jestyr_rt_str_eq(j_name, JSTR("cptr")))
     {
         return 8;
     }

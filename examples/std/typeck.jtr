@@ -192,6 +192,7 @@ fn prim_code(t: str) -> i32 {
     if str_eq(t, "String") { return 17 }
     if str_eq(t, "Builder") { return 18 }
     if str_eq(t, "Cow") { return 19 }
+    if str_eq(t, "cptr") { return 21 }                 // 20 is the error binder (see `prim_name`)
     return 0 - 1
 }
 
@@ -217,6 +218,7 @@ fn prim_name(pc: i32) -> str {
     if pc == 17 { return "String" }
     if pc == 18 { return "Builder" }
     if pc == 19 { return "Cow" }
+    if pc == 21 { return "cptr" }                  // the opaque FFI handle (C `void*`)
     return "error"                                 // 20 -- the opaque error-binder type
 }
 

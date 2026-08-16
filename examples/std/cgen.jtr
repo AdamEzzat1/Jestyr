@@ -330,6 +330,7 @@ fn c_prim(read name: str) -> str {
     if str_eq(name, "str") { return "JestyrStr" }
     if str_eq(name, "os_str") { return "JestyrStr" }
     if str_eq(name, "cstr") { return "const char*" }
+    if str_eq(name, "cptr") { return "void*" }         // opaque FFI handle; agrees with <stdio.h>
     if str_eq(name, "String") { return "JestyrString" }
     if str_eq(name, "Builder") { return "JestyrBuilder" }
     if str_eq(name, "Cow") { return "JestyrCow" }
@@ -3658,7 +3659,17 @@ fn emit_extern_protos(mut sb: String, read p: parser.Parser, read src: str) {
     for r < list.len(i32, p.roots) {
         let iid: i32 = list.get(i32, p.roots, r as usize)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
-        if it.kind == 8 {
+        // A HEADER-declared extern (`extern "stdio.h" fn …`) gets NO prototype: C
+        // requires a redeclaration to be compatible, and Jestyr cannot reproduce most
+        // libc signatures exactly (`int32_t fclose(void*)` vs `int fclose(FILE*)`).
+        // The abi's INNER span is `(w,u)`, -1 when absent (the default "c").
+        var hdr: bool = false
+        if it.w >= 0 {
+            if it.u - it.w >= 2 {
+                if str_eq(src[(it.u - 2) as usize .. it.u as usize], ".h") { hdr = true }
+            }
+        }
+        if it.kind == 8 and !hdr {
             any = true
             emit_c_ty(sb, p, src, it.z)               // ret type (-1 = void)
             string_push(sb, " ")
@@ -8554,6 +8565,7 @@ fn la_prim_align(read name: str) -> i32 {
     if str_eq(name, "str") { return 8 }
     if str_eq(name, "os_str") { return 8 }
     if str_eq(name, "cstr") { return 8 }
+    if str_eq(name, "cptr") { return 8 }
     if str_eq(name, "String") { return 8 }
     if str_eq(name, "Builder") { return 8 }
     if str_eq(name, "Cow") { return 8 }
