@@ -14922,7 +14922,7 @@ fn main() -> i32 {
     fn process_module_unit_tests_pass() {
         let (out, code) = build_tests_and_run("examples/std/process_test.jtr", None);
         assert_eq!(code, 0, "std/process unit tests must pass:\n{out}");
-        assert!(out.contains("7 passed; 0 failed"), "unexpected harness output:\n{out}");
+        assert!(out.contains("8 passed; 0 failed"), "unexpected harness output:\n{out}");
     }
 
     /// **The `@test` harness, used in anger for the first time by the stdlib.**

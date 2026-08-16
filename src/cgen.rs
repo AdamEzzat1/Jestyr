@@ -1102,8 +1102,24 @@ impl<'a> Cgen<'a> {
         // Driving an external command (the self-hosted driver's gcc invocation).
         // Emitted only on use; reuses the NUL-terminating `jestyr_rt_cpath`.
         if self.uses_run_command {
-            self.raw("/* Run an external command via system(): the self-hosted driver's compile step. */\n");
+            self.raw("/* Run an external command via system(), returning the EXIT CODE on every platform. */\n");
+            // `system()`'s return value is not portable: Windows yields the exit
+            // code directly, POSIX yields a *wait status* with the code in the high
+            // byte, so `exit 3` was 3 on one platform and 768 on the other. Only
+            // zero coincided, which is why `std/process` had to document `run` as
+            // platform-specific and steer callers to `run_ok`.
+            //
+            // Normalised here rather than in the library, because the library
+            // cannot see which platform it is on — the intrinsic is the platform
+            // boundary. `-1` reports "did not exit normally" (signalled, or the
+            // shell could not be started), which is distinguishable from any real
+            // exit code because those are 0..255.
+            self.raw("#if defined(_WIN32)\n");
             self.raw("static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); return (int32_t)rc; }\n");
+            self.raw("#else\n");
+            self.raw("#include <sys/wait.h>\n");
+            self.raw("static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); if (rc == -1) return -1; return WIFEXITED(rc) ? (int32_t)WEXITSTATUS(rc) : -1; }\n");
+            self.raw("#endif\n");
         }
         // Environment lookup. The name must be NUL-terminated for getenv, so it
         // goes through `cpath`; the RESULT is OS-owned storage, returned as a

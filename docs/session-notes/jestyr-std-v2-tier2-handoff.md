@@ -134,12 +134,20 @@ intrinsic one.
 
 ### §1.3 — Three compiler follow-ups, each independent
 
-**1. Normalize `run_command`'s exit status.** The runtime helper is
-`return (int32_t)system(cp)` — raw. Windows gives the exit code; POSIX specifies a wait
-status with the code in the high byte, so `exit 3` is 3 on one platform and 768 on the
-other. `std/process` works around it by making `run_ok` (`== 0`, which coincides) the
-portable API and documenting `run`'s value as platform-specific. Fix is `WEXITSTATUS` in the
-helper. Runtime change → mirror + reseed. Also the clearest concrete argument for `sys`.
+**1. ~~Normalize `run_command`'s exit status~~ — DONE.** The helper was
+`return (int32_t)system(cp)`, raw: Windows gives the exit code, POSIX a wait status
+with the code in the high byte, so `exit 3` was 3 on one platform and 768 on the other.
+It now applies `WEXITSTATUS` on POSIX, so **`run` returns the exit code everywhere** and
+`-1` is reserved for "did not exit normally" (signalled, or no shell) — distinguishable
+because real codes are 0..255.
+
+Normalised in the INTRINSIC, not the library, because the library cannot see which
+platform it is on: until a `sys` tier exists, the intrinsic list *is* the platform
+boundary. `std/process` no longer documents `run` as unusable, and `run_ok` is now a
+readability choice rather than the only portable spelling. Runtime change → port mirror
+(paid) + reseed (paid). Pinned by `run_reports_the_exit_code_not_a_wait_status`, whose
+assertions would have read 768 and 10752 on Linux before the fix — the cross-OS canary
+is what makes that test more than a Windows tautology.
 
 **2. ~~Close the pointer-to-slice assignability hole~~ — DONE, together with the
 int→int decision it was entangled with.** Both are settled; kept here because the

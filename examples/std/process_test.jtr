@@ -224,3 +224,29 @@ fn plan(mut p: process.Process, read probe: str, mut buf: []u8, craw: *mut u8) -
     free_ptr(raw)
     return ok
 }
+
+// The exit code is the exit code, on every platform.
+//
+// This is the test the old workaround existed instead of. `system()` hands back a
+// raw wait status on POSIX with the code in the high byte, so before the intrinsic
+// normalised it these assertions read 768 and 10752 on Linux while passing on
+// Windows — which is why `run`'s value used to be documented as unusable and
+// callers were steered to `run_ok`. The cross-OS CI canary is what makes this
+// assertion meaningful rather than a Windows-only tautology.
+@test fn run_reports_the_exit_code_not_a_wait_status() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var p: process.Process = process.host()
+    test.eq_i64(c, rep, "exit 0", process.run(p, "exit 0") as i64, 0)
+    test.eq_i64(c, rep, "exit 3", process.run(p, "exit 3") as i64, 3)
+    test.eq_i64(c, rep, "exit 42", process.run(p, "exit 42") as i64, 42)
+    // …and the portable predicate still agrees with it.
+    test.is_true(c, rep, "run_ok(exit 0)", process.run_ok(p, "exit 0"))
+    test.is_false(c, rep, "run_ok(exit 3)", process.run_ok(p, "exit 3"))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

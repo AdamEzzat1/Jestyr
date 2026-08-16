@@ -26,21 +26,21 @@
 // real rather than cosmetic: it runs a file-creating command through a `host()`
 // handle and finds the file, then through a `denied()` handle and finds nothing.
 //
-// EXIT CODES ARE NOT PORTABLE, AND THAT SHAPES THE API. The runtime helper is
+// EXIT CODES ARE PORTABLE NOW, AND THEY DID NOT USED TO BE. The runtime helper was
 // `return (int32_t)system(cp)` — the raw `system()` result. On Windows that is the
-// command's exit code; POSIX specifies a *wait status*, where the code sits in the
-// high byte, so `exit 3` is 3 on Windows and 768 on Linux. Therefore:
+// command's exit code; POSIX specifies a *wait status* with the code in the high
+// byte, so `exit 3` was 3 on Windows and 768 on Linux, and only zero coincided.
+// This module worked around it by steering callers to `run_ok`.
 //
-//   * `run_ok` is the portable API. Zero means success on every platform, because
-//     a zero wait status and a zero exit code coincide.
-//   * `run` returns the raw status and is documented as platform-specific for any
-//     non-zero value. Use it when you are already platform-aware; do not compare
-//     it against a literal.
+// The helper now applies `WEXITSTATUS` on POSIX, so **`run` returns the exit code
+// on every platform** and may be compared against a literal. `-1` is reserved for
+// "did not exit normally" — signalled, or the shell could not be started — which is
+// distinguishable from any real exit code, since those are 0..255.
 //
-// Normalizing that (WEXITSTATUS in the helper) is a runtime change and so owes the
-// `cgen.jtr` mirror plus a bootstrap reseed — recorded in docs/stdlib-roadmap.md
-// rather than smuggled in here. It is also exactly the kind of platform difference
-// a `sys` tier would own once `extern "c"` lands.
+// It was normalised in the INTRINSIC rather than here, because the library cannot
+// see which platform it is on: the intrinsic list is the platform boundary until a
+// `sys` tier exists. `run_ok` remains the right spelling when all you want is
+// success, but it is no longer the *only* portable one.
 //
 // Worked example:  examples/std/process_demo.jtr
 // Run the tests:   jestyrc test examples/std/process_test.jtr
@@ -117,9 +117,10 @@ pub fn run(mut p: Process, read cmd: str) -> i32 {
     return rc
 }
 
-// Execute `cmd` and report whether it SUCCEEDED. This is the portable spelling —
-// zero is success on every platform, while any other value's meaning is not — so
-// prefer it unless you are deliberately reading a platform-specific status.
+// Execute `cmd` and report whether it SUCCEEDED. Prefer it when success is the only
+// question — it says so at the call site, and it cannot be misread the way a bare
+// `== 0` on an integer can. (It is no longer the only PORTABLE spelling: `run`'s
+// exit code is normalised across platforms now.)
 // A denied handle refuses, which is reported as failure.
 pub fn run_ok(mut p: Process, read cmd: str) -> bool {
     return run(p, cmd) == 0

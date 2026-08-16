@@ -84,8 +84,13 @@ static bool jestyr_rt_file_exists(JestyrStr path) { char* cp = jestyr_rt_cpath(p
 static bool jestyr_rt_remove_file(JestyrStr path) { char* cp = jestyr_rt_cpath(path); int rc = remove(cp); free(cp); return rc == 0; }
 /* Recoverable whole-file read: false on open/seek failure (the `String !IoError` err branch). */
 static bool jestyr_rt_try_read_file(JestyrStr path, JestyrString* out) { *out = jestyr_rt_str_new(); char* cp = jestyr_rt_cpath(path); FILE* f = fopen(cp, "rb"); free(cp); if (!f) return false; if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; } long sz = ftell(f); if (sz < 0) { fclose(f); return false; } rewind(f); size_t cap = (size_t)sz ? (size_t)sz : 1; out->ptr = (char*)malloc(cap); out->cap = cap; out->len = fread(out->ptr, 1, (size_t)sz, f); fclose(f); return true; }
-/* Run an external command via system(): the self-hosted driver's compile step. */
+/* Run an external command via system(), returning the EXIT CODE on every platform. */
+#if defined(_WIN32)
 static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); return (int32_t)rc; }
+#else
+#include <sys/wait.h>
+static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); if (rc == -1) return -1; return WIFEXITED(rc) ? (int32_t)WEXITSTATUS(rc) : -1; }
+#endif
 /* getenv() as a str view; empty when unset. Storage is the environment's. */
 static JestyrStr jestyr_rt_env_var(JestyrStr name) { char* cn = jestyr_rt_cpath(name); const char* v = getenv(cn); free(cn); if (!v) return (JestyrStr){ "", 0 }; return (JestyrStr){ v, strlen(v) }; }
 
@@ -18973,8 +18978,13 @@ void jestyr_emit_prelude(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrS
     }
     if (jestyr_uses_run_command(j_p, j_src))
     {
-        jestyr_rt_str_push(&(*j_sb), JSTR("/* Run an external command via system(): the self-hosted driver's compile step. */\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("/* Run an external command via system(), returning the EXIT CODE on every platform. */\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("#if defined(_WIN32)\n"));
         jestyr_rt_str_push(&(*j_sb), JSTR("static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); return (int32_t)rc; }\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("#else\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("#include <sys/wait.h>\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); if (rc == -1) return -1; return WIFEXITED(rc) ? (int32_t)WEXITSTATUS(rc) : -1; }\n"));
+        jestyr_rt_str_push(&(*j_sb), JSTR("#endif\n"));
     }
     if (jestyr_uses_env_var(j_p, j_src))
     {

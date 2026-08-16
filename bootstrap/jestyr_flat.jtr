@@ -11939,8 +11939,18 @@ fn emit_prelude(mut sb: String, read p: Parser, read src: str, read g: Cg) {
     }
     // Driving an external command (the self-hosted driver's gcc invocation) — on use only.
     if uses_run_command(p, src) {
-        string_push(sb, "/* Run an external command via system(): the self-hosted driver's compile step. */\n")
+        string_push(sb, "/* Run an external command via system(), returning the EXIT CODE on every platform. */\n")
+        // `system()`'s value is not portable: Windows gives the exit code, POSIX a
+        // wait status with the code in the high byte, so `exit 3` was 3 vs 768. Only
+        // zero coincided. Normalised HERE because the library cannot see which
+        // platform it is on -- the intrinsic is the platform boundary. `-1` means
+        // "did not exit normally", distinguishable from any real code (0..255).
+        string_push(sb, "#if defined(_WIN32)\n")
         string_push(sb, "static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); return (int32_t)rc; }\n")
+        string_push(sb, "#else\n")
+        string_push(sb, "#include <sys/wait.h>\n")
+        string_push(sb, "static int32_t jestyr_rt_run_command(JestyrStr cmd) { char* cp = jestyr_rt_cpath(cmd); int rc = system(cp); free(cp); if (rc == -1) return -1; return WIFEXITED(rc) ? (int32_t)WEXITSTATUS(rc) : -1; }\n")
+        string_push(sb, "#endif\n")
     }
     // Environment lookup. The name must be NUL-terminated for getenv, so it goes
     // through `cpath`; the RESULT is OS-owned storage, returned as a borrowed
