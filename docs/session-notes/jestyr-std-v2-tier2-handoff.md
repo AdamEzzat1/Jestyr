@@ -67,13 +67,48 @@ things, all worth knowing:
   module and the literal moves into the generic body, where its type is `[8]T` and not
   concrete. **The module boundary was the trigger.**
 
-**The one debt this leaves:** that cgen fix is an emission change and is **NOT mirrored
-in `examples/std/cgen.jtr`** — the port's `emit_array_defs` mirrors only the reference's
-original two scans, and adding a generic-struct-instantiation walk there is a real piece
-of work. So `smallvec.jtr`/`smallvec_test.jtr` are deliberately **kept out of
-`CGEN_GOLDEN_ALLOWLIST`** (which is opt-in), and `jc` cannot compile them today. Nothing
-else is affected: the change only ADDS typedefs for generic structs with array fields,
-and no closure module has one — the seed is unchanged. Mirroring it is the follow-up.
+**~~The one debt this leaves~~ — PAID, and it was worse than recorded.** The note said the
+port "cannot compile" `smallvec` and framed the mirror as adding one missing scan. Both
+halves were wrong, and the way they were wrong is the transferable part.
+
+**It compiled fine and produced a silently wrong program.** The port did not omit
+`JestyrArr_i64_8`; it emitted `JestyrArr_T_8`, defined as `int a[8]` — the opaque `T`
+falling back to `int` — and used it for the field, both index forms and the repeat
+literal. gcc accepted all of it, because `int` is a real type. A `Holder(i64)` storing
+`9000000000` read back **`410065408`**: the field was 32 bits wide and every element
+truncated. A missing typedef is a link error you cannot miss; a *wrong* typedef that
+names something valid is a miscompile. **The `int` fallback for an unresolved opaque type
+is what converts the first into the second** — worth remembering anywhere the port renders
+a type it might not have substituted.
+
+**And it was five call sites, not one scan.** The collection pass was the smallest part:
+
+| site | was | now |
+|---|---|---|
+| the array typedef itself | (never emitted concretely) | new generic-struct pass over `g.gsi` |
+| `emit_one_array_def` | emitted `JestyrArr_T_8` | `tyid_concrete` screen — mirrors `collect_arrays`' `is_concrete` |
+| the struct instance's field | `emit_gs_ty` had no Array arm | Array arm via `push_gs_mangle` |
+| both array-index forms + the repeat literal (5 calls) | `emit_ty_c` (unsubstituted) | `emit_su_tyid` (+ its new Array arm and `push_su_tymangle`) |
+
+The root cause is one shape repeated: the port keeps a substituted renderer and an
+unsubstituted one side by side, and **the array paths reached for the wrong one**.
+`emit_su_tyid` handled checker kinds 4/6/3 (Opaque, GenStruct, Ptr) and simply had no
+Array arm, so every array fell through to `emit_ty_c`. If you add a type form to the port,
+check `emit_su_ty`/`emit_su_tyid`/`emit_gs_ty` as a *set* — a form handled by one and not
+the others is exactly this bug.
+
+`smallvec.jtr`/`smallvec_test.jtr` are now in `CGEN_GOLDEN_ALLOWLIST`, the mirror and the
+reseed are paid, and `jc` compiles them.
+
+**The pin is new, because no existing gate could hold this.** `jestyr_cgen_matches_reference`
+compiles every corpus file **with no import resolution**, and the single-file form is
+exactly the one where an inline `[zero; 8]` literal is concrete and the bug disappears — so
+the corpus golden is *structurally* blind here, and adding files to the allowlist does not
+help. `jestyr_driver_generic_struct_array_field_matches_reference` goes through `jc`'s own
+loader and gcc driver instead, and asserts three things: byte-equality with the reference,
+the presence of `JestyrArr_i64_8` with the absence of `JestyrArr_T_8`, and — because
+§5 warns a differential cannot catch a bug both sides share — that the built binary
+**prints `9000000000` back untruncated**.
 
 Two limits found while adding `set`, both worth knowing before designing a container:
 
@@ -266,11 +301,25 @@ where a `UserId` is wanted. `distinct` today gives a *name* with **no check**, w
 than nothing because it reads as safety.
 
 Enforcement has to come from assignability, and **the int→int question that gated it is now
-settled** (§1.3.2), so this is no longer blocked — it is merely unbuilt. The next step is to
-find out whether `distinct` flows through the same `assignable` path the integer rule now
-judges, or bypasses it; `distinct_types_are_not_interchangeable_with_their_base` already
-passes for the *initializer* position, so the gap is probably argument and return positions
-rather than the whole notion.
+settled** (§1.3.2), so this is no longer blocked — it is merely unbuilt.
+
+**The scope is now MEASURED rather than guessed, and the guess above was right.** One probe
+file, three `distinct` types, `jestyrc check`:
+
+| position | verdict |
+|---|---|
+| `let a: AccountId = 7` | ✅ **refused** — "`distinct` types need an explicit `as`" |
+| `takes_path(s)` where `s: str`, param is `Path` | ❌ accepted |
+| `takes_uid(n)` where `n: i64`, param is `UserId` | ❌ accepted |
+| `takes_uid(a)` where `a: AccountId`, param is `UserId` | ❌ accepted — **two unrelated distinct types interchange** |
+| `fn ret_uid(x: i64) -> UserId { return x }` | ❌ accepted |
+
+So `distinct` is enforced at **initializers only**. The notion is sound and the diagnostic
+already exists with the right wording; what is missing is that argument and return positions
+never consult it. That is the same shape as §1.3.2's own leftover — module-qualified calls
+skip argument assignability entirely — so **the two are probably one fix**, and the third row
+above is the one to lead with: a rule that lets `AccountId` pass as `UserId` is not a weak
+check, it is no check at all.
 
 The language is *ahead* of the library here: `os_str` is already a real distinct primitive
 (`os_from_bytes`, `to_str_lossy`, participating in the text-family conversion rules;
@@ -315,7 +364,7 @@ predate this work.
 | 7. Package / build | ✅ *as scoped* — `build.jestyr` (CTFE, effect-free by construction) + module-manifest hash DAG |
 | 6. No-std contract | ✅ **both axes checked** — `@no_alloc` *and* `@no_os` (below) |
 | 2. Typed path / OsStr | 🟡 `os_str` is a real primitive; **`PathBuf` is BUILT** (below); typed `Path` is §1.4 |
-| 4. Collections v2 | 🟡 **`HashMap(K,V)` + `remove` + enumeration + `std/set` BUILT**, with a real consumer; only `Deque(T)` / `SmallVec` remain — §1.1 |
+| 4. Collections v2 | ✅ *as scoped* — `HashMap(K,V)` (+ `remove`, enumeration), `set`, `Deque(T)`, `SmallVec(T)`, each with tests and a consumer; the port mirror is paid and all four are allowlisted — §1.1 |
 
 ### `std/hashmap` — the generic deterministic map (Tier 2 area 4, first container)
 
@@ -468,6 +517,15 @@ self-hosted backend. Measure rather than assume; every file added on this branch
 first try. **Treat that list carefully: a dropped entry does not error, it silently stops
 verifying a file.**
 
+**And know what the list does NOT buy you.** Every file in it is compiled *single-file, with
+no import resolution*, because that is what `rust_cgen_dump` does. So the allowlist verifies
+emission for definitions the file owns, and says nothing about what happens once a definition
+is reached across a module edge — which is where the generic-struct array-field miscompile
+lived, invisible to a full-green corpus. The module-boundary gates are the separate
+`jestyr_driver_*` tests that run `jc <file> build` through the real loader; **a change to
+substitution or monomorphization owes one of those**, and it is the only place a
+loader-triggered divergence can fail.
+
 ---
 
 ## §5. Traps
@@ -516,6 +574,24 @@ verifying a file.**
   output's last two bytes instead of the whole segment; the Rust oracle written from the same
   spec had the identical flaw. Keep worked examples and adversarial reading alongside
   differential agreement.
+* **The corpus golden is BLIND to anything the module boundary triggers.**
+  `jestyr_cgen_matches_reference` compiles each file with **no import resolution**, so a
+  divergence that only appears once a definition crosses a module edge cannot fail it — and
+  adding the file to `CGEN_GOLDEN_ALLOWLIST` does not help, because the single-file form is
+  the form that works. That is how the generic-struct array-field miscompile survived: an
+  inline `[zero; 8]` in a non-generic caller is concrete, so the expr scan catches it; the
+  same literal inside the generic body is not. **A port change that touches substitution
+  owes a `jc <file> build` test through the real loader**, not just an allowlist entry.
+* **In the port, a wrong type NAME is a miscompile, not a build failure.** An unresolved
+  opaque type renders as `int`, so `JestyrArr_T_8` was *defined* — as `int a[8]` — and gcc
+  accepted a struct whose `i64` field was 32 bits wide. Values above 2³² truncated silently.
+  Whenever the port can render a type it might not have substituted, assert on the C **type
+  name** and on a runtime value that does not fit the fallback.
+* **Substituting renderers come in sets; a form handled by one and not the others is a bug.**
+  `emit_su_ty` (AST), `emit_su_tyid` (checker) and `emit_gs_ty` (struct-instance) must all
+  know every type form. Arrays were in the first and missing from the other two, so five call
+  sites quietly fell back to the unsubstituted `emit_ty_c`. Adding a type form means checking
+  all three.
 * **A differential can also be wrong about a correct module.** `str`'s first version stripped
   trailing `\r`/`\n` from stdout greedily, so `after("\r", "")` — correctly the whole string
   — compared as empty and failed correct code. Strip exactly the one terminator `print_str`

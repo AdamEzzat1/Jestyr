@@ -12756,7 +12756,7 @@ fn emit_place(mut sb: String, read p: Parser, read src: str, read c: Checker, mu
                 g.tmp = g.tmp + 1
                 string_push(sb, "(*({ ")
                 if !wr { string_push(sb, "const ") }
-                emit_ty_c(sb, p, src, c, bt)
+                emit_su_tyid(sb, p, src, c, g, bt)     // subst-aware: `[8]T` in an instance body
                 string_push(sb, "* _a")
                 push_uint__cgen(sb, na as i64)
                 string_push(sb, " = &(")
@@ -13241,7 +13241,7 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                 let n: i32 = g.tmp
                 g.tmp = g.tmp + 1
                 string_push(sb, "({ const ")
-                emit_ty_c(sb, p, src, c, bt)
+                emit_su_tyid(sb, p, src, c, g, bt)     // subst-aware (see the place-form above)
                 string_push(sb, "* _a")
                 push_uint__cgen(sb, n as i64)
                 string_push(sb, " = &(")
@@ -13512,7 +13512,7 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                     let n: i32 = g.tmp                // (non-const pointer; ONE temp)
                     g.tmp = g.tmp + 1
                     string_push(sb, "({ ")
-                    emit_ty_c(sb, p, src, c, btid)
+                    emit_su_tyid(sb, p, src, c, g, btid)   // subst-aware (the WRITE form)
                     string_push(sb, "* _a")
                     push_uint__cgen(sb, n as i64)
                     string_push(sb, " = &(")
@@ -13556,11 +13556,11 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
         let n: i32 = g.tmp
         g.tmp = g.tmp + 1
         string_push(sb, "({ ")
-        emit_ty_c(sb, p, src, c, atid)
+        emit_su_tyid(sb, p, src, c, g, atid)          // subst-aware: `[zero; 8]` of a `T`
         string_push(sb, " _ar")
         push_uint__cgen(sb, n as i64)
         string_push(sb, "; ")
-        emit_ty_c(sb, p, src, c, ad.a)
+        emit_su_tyid(sb, p, src, c, g, ad.a)          // ...and its ELEMENT type likewise
         string_push(sb, " _v")
         push_uint__cgen(sb, n as i64)
         string_push(sb, " = (")
@@ -15843,6 +15843,25 @@ fn push_su_mangle(mut sb: String, read p: Parser, read src: str, read c: Checker
     push_ast_mangle(sb, p, src, tyid)
 }
 
+// A CHECKER type's mangle under the ACTIVE substitution: an Opaque tparam mangles as its
+// bound arg, everything else falls to `push_ty_mangle`. This is `emit_su_tyid`'s leaf rule
+// in mangle form — factored out because the Array arm below needs the ELEMENT's substituted
+// mangle to name `JestyrArr_<elem>_<N>`, and `push_ty_mangle` alone would render the opaque
+// tparam (`JestyrArr_T_8`) rather than the instance's element type.
+fn push_su_tymangle(mut sb: String, read src: str, read c: Checker, read g: Cg, tid: i32) {
+    if tid >= 0 and len(i32, g.su) > 0 {
+        let d: TyData = get__list(TyData, c.tys, tid as usize)
+        if d.kind == 4 {                              // Opaque tparam -> its bound arg
+            let sl: i32 = su_slot(src, g, d.x as usize, d.y as usize)
+            if sl >= 0 {
+                push_targ_mangle(sb, src, c, get__list(i32, g.su, (sl + 2) as usize), get__list(i32, g.su, (sl + 3) as usize), get__list(i32, g.su, (sl + 4) as usize))
+                return
+            }
+        }
+    }
+    push_ty_mangle(sb, src, c, tid)
+}
+
 fn emit_su_ty(mut sb: String, read p: Parser, read src: str, read c: Checker, read g: Cg, tyid: i32) {
     if tyid >= 0 {
         let t: TypeData = get__list(TypeData, p.ty, tyid as usize)
@@ -15936,6 +15955,17 @@ fn emit_su_tyid(mut sb: String, read p: Parser, read src: str, read c: Checker, 
         if d.kind == 3 {                              // Ptr of an Opaque tparam
             emit_su_tyid(sb, p, src, c, g, d.a)
             string_push(sb, "*")
+            return
+        }
+        if d.kind == 9 {                              // Array `[N]T` inside an instance body
+            // Without this arm a `[8]T` place inside `SmallVec(i64)`'s monomorphized body
+            // fell to `emit_ty_c`, which renders the still-opaque element: the C read
+            // `JestyrArr_T_8* _a = &v.buf` typed the field as `int a[8]`. That COMPILED —
+            // `int` is a real type — and silently truncated every `i64` to 32 bits.
+            string_push(sb, "JestyrArr_")
+            push_su_tymangle(sb, src, c, g, d.a)
+            string_push(sb, "_")
+            push_uint__cgen(sb, d.b as i64)
             return
         }
     }
@@ -21852,10 +21882,12 @@ fn emit_consts(mut sb: String, read p: Parser, read src: str, read c: Checker, m
 
 // Array typedefs: one `typedef struct { <ecty> a[N]; } JestyrArr_<m>_<N>;` per distinct concrete
 // array instance. Mirrors `collect_arrays`' scan ORDER — the Checker's per-expr types FIRST (in
-// expr-arena order), then function signature annotations. The expr scan is load-bearing: a
-// `const T: [5]i64 = [2,3,…]` literal infers its OWN `[5]i32` (the const's value is inferred with
-// no expected type), so BOTH `JestyrArr_i32_5` and `JestyrArr_i64_5` are emitted, in that order.
-fn emit_array_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, mut d: Dc) {
+// expr-arena order), then function signature annotations, then a monomorphized generic struct's
+// array FIELDS. The expr scan is load-bearing: a `const T: [5]i64 = [2,3,…]` literal infers its
+// OWN `[5]i32` (the const's value is inferred with no expected type), so BOTH `JestyrArr_i32_5`
+// and `JestyrArr_i64_5` are emitted, in that order. Every scan screens for CONCRETENESS, which
+// is what keeps the generic body's own `[8]T` out.
+fn emit_array_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, read g: Cg, mut d: Dc) {
     var seen: String = string_new()
     var any: bool = false
     var i: usize = 0
@@ -21877,8 +21909,81 @@ fn emit_array_defs(mut sb: String, read p: Parser, read src: str, read c: Checke
         }
         r = r + 1
     }
+    // Then a monomorphized generic struct's array FIELDS, which the two scans above cannot
+    // see. `SmallVec(T) = struct { buf: [8]T, … }` mentions `[8]T` only inside the generic
+    // body, where it is not concrete; the concrete `[8]i64` is never an expression type of
+    // its own, because nothing ever names the field's type. Instance order, member order,
+    // same dedup — mirrors the generic-struct pass of `collect_arrays`.
+    //
+    // A single-file program hid the gap: an inline `[0; 8]` literal in a NON-generic caller
+    // is concrete, so the expr scan caught it. Move the constructor into an imported module
+    // and the literal moves into the generic body, where it does not — the module boundary
+    // was the trigger.
+    var gk: usize = 0
+    for gk < len(i32, g.gsi) {
+        let tid: i32 = get__list(i32, g.gsi, gk)
+        let fit: i32 = gstruct_ctor_fn(p, src, c, tid)
+        let node: i32 = ctor_struct_node(p, fit)
+        if node >= 0 {                                // import-degenerate ctors have no fields
+            let sx: ExprData = get__list(ExprData, p.ex, node as usize)
+            var mi: i32 = 0
+            for mi < sx.y {
+                let mb: i32 = sx.x + mi * 10
+                if get__list(i32, p.mar, mb as usize) == 0 {
+                    let fty: i32 = get__list(i32, p.mar, (mb + 4) as usize)
+                    if fty >= 0 {
+                        let ft: TypeData = get__list(TypeData, p.ty, fty as usize)
+                        if ft.kind == 4 {
+                            any = emit_one_gs_array_def(sb, p, src, c, fty, fit, tid, seen, d) or any
+                        }
+                    }
+                }
+                mi = mi + 1
+            }
+        }
+        gk = gk + 1
+    }
     if any { string_push(sb, "\n") }
     string_free(seen)
+}
+
+// One array typedef for a generic struct's `[N]T` FIELD, under the instance's substitution:
+// the same shape as `emit_one_array_def_ast`, but every element rendering goes through the
+// `gs_*` substituting pair so `[8]T` in `SmallVec(i64)` names `JestyrArr_i64_8`.
+fn emit_one_gs_array_def(mut sb: String, read p: Parser, read src: str, read c: Checker, tyid: i32, fit: i32, tid: i32, mut seen: String, mut d: Dc) -> bool {
+    if tyid < 0 { return false }
+    let t: TypeData = get__list(TypeData, p.ty, tyid as usize)
+    if t.kind != 4 { return false }
+    if !gs_elem_concrete(p, src, c, t.a, fit, tid) { return false }
+    var m: String = string_new()
+    push_gs_mangle(m, p, src, c, t.a, fit, tid)
+    string_push(m, "_")
+    push_array_len(m, p, src, t.b)
+    var ec: String = string_new()
+    emit_gs_ty(ec, p, src, c, t.a, fit, tid)
+    var ln: String = string_new()
+    push_array_len(ln, p, src, t.b)
+    let ok: bool = push_array_typedef_raw(sb, string_view(m), seen, string_view(ec), string_view(ln), d)
+    string_free(m)  string_free(ec)  string_free(ln)
+    return ok
+}
+
+// Is an array element concrete under a struct instance's substitution? The `is_concrete`
+// screen `collect_arrays` applies, in the one form that can actually fail here: a type
+// PARAMETER is concrete only once substituted, and only if the arg it binds to is itself
+// concrete (an instance may carry an opaque import name).
+fn gs_elem_concrete(read p: Parser, read src: str, read c: Checker, tyid: i32, fit: i32, tid: i32) -> bool {
+    if tyid < 0 { return false }
+    let t: TypeData = get__list(TypeData, p.ty, tyid as usize)
+    if t.kind == 0 {
+        let arg: i32 = gs_tparam_arg(p, src, c, fit, tid, t.start, t.end)
+        if arg >= 0 { return tyid_concrete(c, arg) }
+        return true                                   // a plain named type (`i64`, a struct)
+    }
+    if t.kind == 2 or t.kind == 3 or t.kind == 4 or t.kind == 5 or t.kind == 6 {
+        return gs_elem_concrete(p, src, c, t.a, fit, tid)
+    }
+    return true
 }
 
 // One array typedef from a Checker TyId (only an Array, kind 9, contributes).
@@ -21886,6 +21991,11 @@ fn emit_one_array_def(mut sb: String, read p: Parser, read src: str, read c: Che
     if tyid < 0 { return false }
     let td: TyData = get__list(TyData, c.tys, tyid as usize)
     if td.kind != 9 { return false }
+    // `collect_arrays` screens every candidate through `is_concrete`; without the mirror the
+    // `[zero; 8]` literal in `SmallVec`'s generic body — typed `[8]T` with `T` still opaque —
+    // emitted a `JestyrArr_T_8` the reference never emits. The CONCRETE instance comes from
+    // the generic-struct pass below instead.
+    if !tyid_concrete(c, tyid) { return false }
     var m: String = string_new()                      // the instance key = its full mangle
     push_ty_mangle(m, src, c, td.a)
     string_push(m, "_")
@@ -22109,6 +22219,13 @@ fn emit_gs_ty(mut sb: String, read p: Parser, read src: str, read c: Checker, ty
     if t.kind == 9 {
         string_push(sb, "JestyrFn_")
         push_gs_mangle(sb, p, src, c, tyid, fit, tid)
+        return
+    }
+    if t.kind == 4 {                                  // `buf: [8]T` -> `JestyrArr_i64_8`
+        string_push(sb, "JestyrArr_")
+        push_gs_mangle(sb, p, src, c, t.a, fit, tid)
+        string_push(sb, "_")
+        push_array_len(sb, p, src, t.b)
         return
     }
     emit_c_ty(sb, p, src, tyid)
@@ -24712,7 +24829,7 @@ fn emit_program(mut sb: String, read p: Parser, read c: Checker, read src: str, 
     emit_gen_enum_defs(cap, p, src, c, g, d)         // generic-enum instance defs (after plain enums)
     emit_slice_defs(cap, p, src, c, d)               // slice typedefs (after aggregates)
     sd_vector_defs(cap, p, src, c, g, a)             // @simd vector typedefs (Q-S2)
-    emit_array_defs(cap, p, src, c, d)               // array typedefs (after slices)
+    emit_array_defs(cap, p, src, c, g, d)            // array typedefs (after slices)
     emit_genref_defs(cap, p, src, c, d)              // genref typedefs (after arrays)
     emit_result_defs(cap, p, src, c, g, d)
     dc_flush(sb, d, string_view(cap), a)             // the topological re-emit (`flush_def_capture`)

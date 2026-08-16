@@ -13901,6 +13901,110 @@ fn main() -> i32 {
         );
     }
 
+    /// **A generic struct's array FIELD, across the module boundary** — the one shape
+    /// every other golden is structurally blind to.
+    ///
+    /// `Holder(T) = struct { buf: [8]T, … }` names `[8]T` only inside the generic body,
+    /// where it is not concrete, and the concrete `[8]i64` is never an expression type of
+    /// its own because nothing ever names the field's type. In a SINGLE file the inline
+    /// `[zero; 8]` literal sits in a non-generic caller, where it *is* concrete and the
+    /// expression scan catches it; move the constructor into an imported module and the
+    /// literal moves into the generic body, where it is not. **The module boundary is the
+    /// trigger** — which is exactly why [`jestyr_cgen_matches_reference`], which compiles
+    /// every corpus file with no import resolution at all, can never reach this.
+    ///
+    /// The port used to render the field declaration, both array-index forms and the
+    /// array-repeat literal through the UNSUBSTITUTED `emit_ty_c`, naming `JestyrArr_T_8`
+    /// and defining it as `int a[8]`. That is not a link error: `int` is a real type, so
+    /// **gcc accepted the program** and every `i64` element was silently truncated to 32
+    /// bits (`9000000000` came back as `410065408`).
+    ///
+    /// Hence the last assertion. Byte-equality alone would still pass if both sides
+    /// regressed together — §5's "a differential test cannot catch a bug both sides
+    /// share" — so the fixture stores a value that does not fit in 32 bits and the
+    /// driver-built binary has to print it back intact.
+    #[test]
+    fn jestyr_driver_generic_struct_array_field_matches_reference() {
+        let jc = build_exe("examples/std/cgen.jtr");
+        let dir = std::env::temp_dir().join("jestyr_gs_array_field");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Between them these four functions cover every site that has to render the
+        // field's type under the instance's substitution: the field declaration, the
+        // `[zero; 8]` repeat literal (array type AND element type), the indexed WRITE,
+        // and the indexed READ. `take x: T` is forced — storing a by-value opaque `T`
+        // is the escape checker's non-`Copy` collision, the same one `smallvec.push`
+        // hits.
+        std::fs::write(
+            dir.join("lib.jtr"),
+            "pub fn Holder(comptime T: type) -> type { return struct { buf: [8]T, n: usize } }\n\
+             pub fn make(comptime T: type, zero: T) -> Holder(T) { return Holder(T){ buf: [zero; 8], n: 0 } }\n\
+             pub fn put(comptime T: type, mut h: Holder(T), i: usize, take x: T) { h.buf[i] = x  h.n = h.n + 1 }\n\
+             pub fn get(comptime T: type, read h: Holder(T), i: usize) -> read T { return h.buf[i] }\n",
+        )
+        .unwrap();
+        // 9000000000 is 0x2_18711A00: truncating to 32 bits leaves 410065408, so a
+        // wrongly-`int` element array cannot produce the right answer by accident.
+        std::fs::write(
+            dir.join("app.jtr"),
+            "import \"lib\"\n\
+             fn main() -> i32 {\n\
+             \x20   var h: lib.Holder(i64) = lib.make(i64, 0)\n\
+             \x20   lib.put(i64, h, 0, 9000000000)\n\
+             \x20   print_int(lib.get(i64, h, 0))\n\
+             \x20   return 0\n\
+             }\n",
+        )
+        .unwrap();
+        let app = dir.join("app.jtr");
+
+        // The port, through its own loader and its own gcc driver.
+        let out = Command::new(&jc).args([app.to_str().unwrap(), "build"]).output().unwrap();
+        assert!(
+            out.status.success(),
+            "jc build failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let port_c = std::fs::read_to_string(dir.join("app.c")).unwrap().replace("\r\n", "\n");
+
+        // The reference, through the real module loader.
+        let prog = crate::module::load(app.to_str().unwrap());
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "fixture loads: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(!td.iter().any(|d| d.is_error()), "fixture typechecks");
+        let (ref_c, _cd) = crate::cgen::emit(&prog.ast, &info);
+        let ref_c = ref_c.replace("\r\n", "\n");
+
+        if ref_c != port_c {
+            let mismatch =
+                ref_c.lines().zip(port_c.lines()).enumerate().find(|(_, (a, b))| a != b);
+            panic!("generic-struct array-field C diverges at {mismatch:?}");
+        }
+
+        // Anti-vacuity: name the typedef that must exist and the one that must not, so
+        // an agreement reached by BOTH sides dropping the field is still a red test.
+        assert!(
+            port_c.contains("typedef struct { int64_t a[8]; } JestyrArr_i64_8;"),
+            "the concrete element typedef is missing entirely"
+        );
+        assert!(
+            !port_c.contains("JestyrArr_T_8"),
+            "the opaque-element array typedef is back: the substitution is not applied"
+        );
+
+        // The claim byte-equality cannot make: the program is CORRECT, not merely
+        // agreed upon. A 32-bit element array prints 410065408 here.
+        let exe = dir.join(format!("app{}", std::env::consts::EXE_SUFFIX));
+        assert!(exe.exists(), "driver produced no exe");
+        let run = Command::new(&exe).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n"),
+            "9000000000\n",
+            "the array element was truncated — the field is not 64 bits wide"
+        );
+        eprintln!("generic-struct array field: byte-identical + untruncated through jc's own driver");
+    }
+
     /// **The self-build.** The ported compiler compiles ITSELF from its real multi-file
     /// sources (`examples/std/cgen.jtr` + its 9 imports) through its own module loader and
     /// its own gcc driver — and the result is the same compiler: byte-identical C on a
@@ -14121,7 +14225,7 @@ fn main() -> i32 {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "drop_take.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr", "test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr", "caps_demo.jtr", "fs_test.jtr", "env_test.jtr", "time_test.jtr", "str.jtr", "str_test.jtr", "str_demo.jtr", "sink.jtr", "cursor.jtr", "writer.jtr", "sink_test.jtr", "cursor_test.jtr", "writer_test.jtr", "writer_demo.jtr", "pathbuf.jtr", "pathbuf_test.jtr", "hashmap.jtr", "hashmap_test.jtr", "hashmap_demo.jtr", "set.jtr", "set_test.jtr", "deque.jtr", "deque_test.jtr", "deque_demo.jtr"];
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "drop_take.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr", "test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr", "caps_demo.jtr", "fs_test.jtr", "env_test.jtr", "time_test.jtr", "str.jtr", "str_test.jtr", "str_demo.jtr", "sink.jtr", "cursor.jtr", "writer.jtr", "sink_test.jtr", "cursor_test.jtr", "writer_test.jtr", "writer_demo.jtr", "pathbuf.jtr", "pathbuf_test.jtr", "hashmap.jtr", "hashmap_test.jtr", "hashmap_demo.jtr", "set.jtr", "set_test.jtr", "deque.jtr", "deque_test.jtr", "deque_demo.jtr", "smallvec.jtr", "smallvec_test.jtr"];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
     /// target). This is the acceptance bar the R2 fixpoint ultimately rests on. `DUMP_DIVERGE=1`
