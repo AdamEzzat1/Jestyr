@@ -173,10 +173,37 @@ four-decision question, and shipping a trait to have one would be the "iterators
 library costume" mistake. And deliberately **no error set**: `fread` reports a short count
 and `ferror` reports why, which is two calls rather than fifty `?`s.
 
-**The one real limitation, recorded rather than papered over:** `open` takes a `cstr`, and
-the only way to build one today is `.cstr` on a string LITERAL — so a path computed at
-runtime cannot be opened. That belongs to the string tier (a `String -> cstr` bridge with a
-NUL guarantee), not to this module.
+**~~The one real limitation~~ — CLOSED by `std/cstring`, and it needed no compiler change
+either.** `buf as cstr` on a Jestyr-built NUL-terminated buffer already worked; the runtime
+had been doing exactly that inside `jestyr_rt_cpath` for `read_file` all along. So
+`CString` is an owned NUL-terminated copy with RAII, `as_cstr` hands out a view anchored to
+it, and `file.open_path(a, p)` takes a `read str`, copies through it, and frees before
+returning — no `cstr` outlives the call and callers never see one.
+
+**It REFUSES an interior NUL rather than truncating.** A `str` may hold a zero byte; C stops
+at it. `open_path("examples/std/file.jtr\0junk")` silently opening the real prefix would be
+a security answer dressed as a correctness one, so it returns a closed `Reader`, and
+`cstring.has_interior_nul` is public for callers who need to tell that from "no such file".
+The test pins the refusal *and* the positive control that the prefix alone genuinely opens —
+without that control the refusal proves nothing.
+
+**And `sys`'s scope is now settled, by a rule rather than a list:** *if ISO C specifies it,
+it can live in `std`; if it needs a platform, it needs a platform layer.* The whole stdio
+set this module binds — `fopen`/`fread`/`fclose`/`feof`/`ferror`/`fseek`/`ftell`/`rewind` —
+is ISO C, so one binding behaves identically everywhere and a platform tier would be pure
+ceremony. Directory listing is the counter-example that keeps `sys` alive: POSIX
+`opendir`/`readdir` versus Windows `FindFirstFile`/`FindNextFile` differ in *what a
+directory entry is*, which is a real abstraction with a real design cost. Same for `stat`
+vs `GetFileAttributesEx`, permissions, symlinks, process control. So the boundary is not
+"OS calls go in `sys`" — this module makes OS calls — it is **"calls that need a portability
+decision go in `sys`"**.
+
+`size`/`offset`/`restart` landed as the increment that demonstrates the rule. `size` saves
+and restores the read position, because a `size` that silently rewound would make the
+obvious `let n = size(r)` inside a read loop skip or repeat data — invisible until the file
+exceeds one buffer. Its test checks the offset MID-READ (asking before the first read would
+pass even for a rewinding implementation) and cross-checks the total against a full drain,
+so a wrong `SEEK_END` constant cannot pass by returning a plausible number.
 
 The original text follows.
 
@@ -416,16 +443,88 @@ way the 55 were. The flattened compiler passes clean, which is the stronger sign
 the flatten there are no qualified calls left, so a regression there would have been the
 *existing* rules breaking.
 
-**Typed `Path` is now buildable and is deliberately NOT built.** Enforcement was the
-blocker and it is gone; what remains is a library-design question the handoff never priced —
-`std/path`'s queries return `read str` views, so a `distinct Path = str` makes every literal
-and every returned view need an `as`, and `pathbuf` delegates to all of them. That is a real
-ergonomic bill, and the "no zoo" discipline says price it before spending it. The compiler
-half is done; the library half wants a measured cast count first.
+**Typed `Path` is now buildable — and the measurement says DO NOT BUILD IT YET.**
+
+The bill was estimated by actually doing it: `std/path` converted to
+`pub distinct Path = str`, all eight signatures changed, then `check` run over the family.
+
+| file | distinct cast sites |
+|---|---|
+| `path_test.jtr` | 64 |
+| `path_demo.jtr` | 27 |
+| `pathbuf_test.jtr` | 20 |
+| **`path.jtr`** (the library itself) | **11** |
+| **`pathbuf.jtr`** (the library itself) | **10** |
+| **total** | **132** |
+
+(Counted as DISTINCT `file:line:col`, because a per-file sweep re-reports every imported
+module's sites — the same double-counting §1.3.2's measurement lesson warns about. The raw
+error total was 186.)
+
+**Two things in that table decide it.** First, 111 of 132 fall on CALLERS — a safety type
+whose cost lands mostly outside the library it protects has the wrong distribution. Second,
+and worse, **21 fall inside the library's own implementation**: `distinct` gives a nominal
+type with no operation inheritance, so `std/path`'s internal helpers (`sep_at(p)`, returning
+a substring as a `Path`) must cast in both directions constantly. The type does not compose
+with its own base.
+
+**So the blocker moved rather than cleared.** It is no longer enforcement (done); it is that
+`distinct` needs to inherit its base's operations — indexing, `.len`, and acceptance by
+`str`-taking builtins — so only the *boundary* needs a cast. That is a language feature, and
+it is the thing to build before typed `Path`, not after. A smaller quirk found alongside:
+`return p.len` directly from a `distinct`-typed parameter reports "its type was never
+resolved", while `let n: usize = p.len  return n` is fine.
 
 The language is *ahead* of the library here: `os_str` is already a real distinct primitive
 (`os_from_bytes`, `to_str_lossy`, participating in the text-family conversion rules;
 `examples/os_str.jtr`).
+
+---
+
+### §1.6 — OPEN BUG: a trait-`impl` method body resolves no name that needs resolving
+
+Found while writing `std/cstring`'s `Drop`. **Not fixed here** — the fix is bigger than it
+looks and this is a named follow-up, not a silent trap.
+
+```jtr
+// helper.jtr
+pub fn note(x: i64) -> i64 { return x + 1 }
+
+// main.jtr
+import "helper"
+trait Tick { fn tick(read self) -> i64 }
+struct S { v: i64 }
+impl Tick for S {
+    fn tick(read self) -> i64 { return helper.note(self.v) }   // ← `'j_helper' undeclared`
+}
+fn main() -> i32 { let s: S = S{ v: 1 }  print_int(s.tick())  return 0 }
+```
+
+Resolution, typeck and the escape checker all pass; **gcc** fails. Degrades-to-gcc again.
+
+**Two facets, one cause.** A module-qualified call emits `j_helper` as though the module
+binding were a local struct value; and a name needing COLLISION canonicalization emits the
+bare symbol (naming the helper `release` collided with `mem.release`, canon'd to
+`release__m1` everywhere *except* inside `drop`, which emitted `jestyr_release` and failed
+to link). The rule today is: **inside a trait-`impl` method body, only a name whose canon
+equals its bare spelling resolves.**
+
+**The cause is that impl method bodies are never inferred.** `check_fn` has exactly three
+call sites — free fns, struct methods, and `StructType` methods — and `check_items` says
+`Item::Trait(_) | Item::Impl(_) => {}` with a comment claiming Stage B handles them.
+Stage B (`register_impls`) checks *signatures and coherence only*. So nothing ever calls
+`record_qualified` for these bodies and cgen falls through to the field-access path.
+
+**Why no corpus file caught it:** `std/list` and `std/smallvec` both route `Drop` through a
+*local* helper for their own reasons, so no `Drop` impl in the tree had ever made a
+qualified or colliding call. `std/cstring` uses the same local-helper shape as a documented
+**workaround**, with a deliberately unshared name (`drop_cbuf`).
+
+**Fixing it properly means inferring impl bodies**, which would newly type-check code that
+has never been checked — expect a wave of real diagnostics, plus `info.expr_types` changes
+→ mirror + reseed + golden churn. A narrower option exists (a pass that walks impl bodies
+only to record qualified/canon resolutions) but it needs correct scope tracking, since a
+local may legitimately shadow an import binding.
 
 ---
 

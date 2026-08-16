@@ -1,0 +1,114 @@
+// std/cstring_test.jtr — `std/cstring`'s suite, in a sibling file (the convention).
+//
+// Run:  jestyrc test examples/std/cstring_test.jtr
+
+import "cstring"
+import "mem"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 512
+
+// Read byte `i` of a `CString`'s buffer through its C view. There is no public
+// indexing — a `cstr` has no length — so the test reaches for the same pointer C
+// would, which is exactly the representation being asserted about.
+fn byte_at(read c: cstring.CString, i: usize) -> i64 {
+    let p: *mut u8 = cstring.as_cstr(c) as *mut u8
+    unsafe { return (p + i).* as i64 }
+}
+
+@test fn a_copy_is_nul_terminated_and_keeps_its_length() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var s: cstring.CString = cstring.from_str(sys, "abc")
+    test.eq_usize(c, rep, "len excludes the terminator", cstring.len(s), 3)
+    test.is_false(c, rep, "not empty", cstring.is_empty(s))
+    test.eq_i64(c, rep, "byte 0", byte_at(s, 0), 97)
+    test.eq_i64(c, rep, "byte 2", byte_at(s, 2), 99)
+    // The property the whole type exists for: byte `len` is the NUL.
+    test.eq_i64(c, rep, "the byte after the content is the terminator", byte_at(s, 3), 0)
+    cstring.free(s)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// An empty string must be a valid empty C string — a one-byte buffer holding the
+// terminator — and NOT a null pointer, because C APIs distinguish "" from NULL and
+// handing over the latter turns a bad argument into a crash.
+@test fn an_empty_string_is_a_valid_empty_c_string() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var s: cstring.CString = cstring.from_str(sys, "")
+    test.eq_usize(c, rep, "len", cstring.len(s), 0)
+    test.is_true(c, rep, "is_empty", cstring.is_empty(s))
+    test.eq_i64(c, rep, "byte 0 is the terminator", byte_at(s, 0), 0)
+    cstring.free(s)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The hazard the module reports rather than hides. A `str` may hold a zero byte;
+// a C string may not, so such a copy is faithful but its C VIEW stops early.
+@test fn an_interior_nul_is_detected_and_the_copy_still_truncates_in_c() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    // Built byte-by-byte: a source literal cannot carry a raw zero.
+    var buf: *mut u8 = alloc(u8, 3)
+    unsafe { (buf + 0).* = 97 }      // 'a'
+    unsafe { (buf + 1).* = 0 }       // the interior NUL
+    unsafe { (buf + 2).* = 98 }      // 'b'
+    // `from_utf8`, not `string_view` — the latter takes a `String`. A zero byte is
+    // valid UTF-8, so this validates and keeps all three bytes.
+    let sv: str = from_utf8(slice(u8, buf, 3))
+
+    test.is_true(c, rep, "the hazard is detected", cstring.has_interior_nul(sv))
+    test.is_false(c, rep, "and a clean string is not flagged", cstring.has_interior_nul("abc"))
+
+    // The copy is FAITHFUL — Jestyr still sees three bytes — even though C would
+    // read one. Asserting both halves is what stops a future "fix" from silently
+    // truncating the buffer instead of reporting.
+    var s: cstring.CString = cstring.from_str(sys, sv)
+    test.eq_usize(c, rep, "the copy keeps every byte", cstring.len(s), 3)
+    test.eq_i64(c, rep, "including the interior zero", byte_at(s, 1), 0)
+    test.eq_i64(c, rep, "and the byte after it", byte_at(s, 2), 98)
+    cstring.free(s)
+    free_ptr(buf)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// `free` is idempotent and composes with the automatic drop — the `std/list`
+// contract. A double free is undefined behaviour a test cannot observe directly,
+// so this asserts the observable proxy: the second call finds nothing to do.
+@test fn free_is_idempotent_and_composes_with_drop() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var s: cstring.CString = cstring.from_str(sys, "abc")
+    cstring.free(s)
+    test.eq_usize(c, rep, "cleared", cstring.len(s), 0)
+    cstring.free(s)
+    test.eq_usize(c, rep, "still cleared, and the second free did nothing", cstring.len(s), 0)
+    // `s` now drops with a null buffer.
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

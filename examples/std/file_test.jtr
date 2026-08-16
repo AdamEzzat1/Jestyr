@@ -9,6 +9,8 @@
 // Run:  jestyrc test examples/std/file_test.jtr
 
 import "file"
+import "cstring"
+import "mem"
 import "test"
 import "test_report"
 
@@ -45,6 +47,79 @@ fn self_path() -> cstr {
     return ok
 }
 
+// `open_path` is the reason `std/cstring` exists: a path that is not a source
+// literal. The path here is BUILT at runtime from two pieces, so a `.cstr` bridge
+// could not have produced it — which is the limitation this closes.
+@test fn open_path_opens_a_path_computed_at_runtime() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    var built: String = string_new()
+    string_push(built, "examples/std/")
+    string_push(built, "file.jtr")
+
+    var r: file.Reader = file.open_path(sys, string_view(built))
+    test.is_true(c, rep, "a runtime-built path opens", file.is_open(r))
+    var buf: *mut u8 = alloc(u8, 8)
+    var s: []u8 = slice(u8, buf, 8)
+    test.eq_usize(c, rep, "and reads", file.read_into(r, s), 8)
+    free_ptr(buf)
+    file.close(r)
+
+    // A missing computed path is a closed reader, not a crash.
+    var gone: file.Reader = file.open_path(sys, "examples/std/nope_not_here.jtr")
+    test.is_false(c, rep, "a missing computed path reports closed", file.is_open(gone))
+    file.close(gone)
+    string_free(built)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The security-relevant refusal. A path with an interior NUL must NOT open the
+// truncated prefix, because C would stop at the zero and open a different file
+// than the caller named. Built byte-by-byte, since a literal cannot carry a zero.
+@test fn open_path_refuses_an_interior_nul_rather_than_truncating() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    // "examples/std/file.jtr" + NUL + "junk" — the prefix names a REAL file, so a
+    // truncating implementation would happily open it. That is the whole point:
+    // the positive control for this test is that the prefix alone does open.
+    let good: str = "examples/std/file.jtr"
+    var probe: file.Reader = file.open_path(sys, good)
+    test.is_true(c, rep, "control: the prefix alone is a real file", file.is_open(probe))
+    file.close(probe)
+
+    var b: *mut u8 = alloc(u8, good.len + 5)
+    var i: usize = 0
+    for i < good.len {
+        unsafe { (b + i).* = good[i] }
+        i = i + 1
+    }
+    unsafe { (b + good.len).* = 0 }          // the interior NUL
+    unsafe { (b + good.len + 1).* = 106 }    // 'j'
+    unsafe { (b + good.len + 2).* = 117 }    // 'u'
+    unsafe { (b + good.len + 3).* = 110 }    // 'n'
+    unsafe { (b + good.len + 4).* = 107 }    // 'k'
+    let poisoned: str = from_utf8(slice(u8, b, good.len + 5))
+
+    test.is_true(c, rep, "the hazard is detected", cstring.has_interior_nul(poisoned))
+    var r: file.Reader = file.open_path(sys, poisoned)
+    test.is_false(c, rep, "and the open is REFUSED, not truncated to the real prefix", file.is_open(r))
+    file.close(r)
+    free_ptr(b)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
 // The property that makes this module STREAMING rather than slurping: a buffer
 // smaller than the file still makes progress, and repeated reads advance.
 @test fn reads_advance_through_the_file() -> bool {
@@ -70,6 +145,52 @@ fn self_path() -> cstr {
     // Not a strong claim about CONTENT, but it proves the cursor moved: if reads
     // restarted, `second` would equal `first`.
     test.ne_i64(c, rep, "the second read starts elsewhere — the cursor advanced", second, first)
+
+    free_ptr(buf)
+    file.close(r)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// `size` must not disturb the read position — the bug that would otherwise be
+// invisible until a file exceeds one buffer. The check is done MID-READ on purpose:
+// asking before the first read would pass even for an implementation that rewinds.
+@test fn size_reports_the_total_without_moving_the_cursor() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var r: file.Reader = file.open(self_path())
+    test.is_true(c, rep, "open", file.is_open(r))
+    var buf: *mut u8 = alloc(u8, 16)
+    var s: []u8 = slice(u8, buf, 16)
+
+    file.read_into(r, s)
+    test.eq_i64(c, rep, "offset after one 16-byte read", file.offset(r), 16)
+
+    let total: i64 = file.size(r)
+    test.is_true(c, rep, "size is a real number", total > 1000)
+    // The property: measuring did not move us.
+    test.eq_i64(c, rep, "offset is UNCHANGED by size()", file.offset(r), 16)
+
+    // ...and reading continues from where it was, not from the start.
+    file.read_into(r, s)
+    test.eq_i64(c, rep, "the next read continues", file.offset(r), 32)
+
+    // `restart` is the explicit way back.
+    file.restart(r)
+    test.eq_i64(c, rep, "restart returns to the beginning", file.offset(r), 0)
+
+    // Independent cross-check: the total must equal what a full drain counts, so a
+    // wrong SEEK_END constant cannot pass by returning a plausible number.
+    var drained: i64 = 0
+    var reading: bool = true
+    for reading {
+        let n: usize = file.read_into(r, s)
+        if n == 0 { reading = false } else { drained = drained + (n as i64) }
+    }
+    test.eq_i64(c, rep, "size agrees with a full drain", total, drained)
 
     free_ptr(buf)
     file.close(r)

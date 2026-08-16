@@ -1,0 +1,137 @@
+// std/cstring.jtr — an owned, NUL-terminated copy of a `str`, for the C APIs
+// that insist on one.
+//
+// ─── Why this exists ──────────────────────────────────────────────────────────
+//
+// Jestyr's `str` is a length-carrying view: `{ptr, len}`, no terminator. C's
+// string APIs are the other convention, and `.cstr` bridges the gap for a string
+// LITERAL only — the literal's bytes are in static storage with a NUL already
+// after them, which is exactly why it works and exactly why it does not
+// generalise. So until this module, `std/file.open` could only open a path
+// written into the source, which is not much of a filesystem API.
+//
+// The runtime has had the answer all along: `jestyr_rt_cpath` mallocs `len + 1`,
+// copies, and writes the NUL — it is how the `read_file` intrinsic accepts a
+// computed path. This module is that helper, in the language, with an owner.
+//
+// ─── Ownership is the whole design ────────────────────────────────────────────
+//
+// A `cstr` is a bare pointer with no length and no owner. Handing one out is
+// therefore handing out a borrow, and the borrow has to be anchored to something
+// — which is what this type is. `as_cstr` returns a view valid exactly as long as
+// the `CString` is, and the `Drop` impl is what makes "as long as" mean something
+// a reader can check.
+//
+// It is deliberately NOT a `String` replacement: no push, no concat, no growth.
+// A `CString` is a one-shot conversion at the FFI boundary, and giving it string
+// operations would invite it inland, where `str`/`String` are the right types and
+// the terminator is dead weight.
+//
+// ─── The interior-NUL hazard, reported rather than hidden ─────────────────────
+//
+// A Jestyr `str` may contain a zero byte; a C string may not. The copy here is
+// faithful, so a `str` with an interior NUL produces a `CString` whose C view
+// STOPS EARLY — silently, because that is what C does. Rather than pretend
+// otherwise, `has_interior_nul` lets a caller ask, and every function that hands
+// a path to the OS should. `std/file.open_path` does.
+//
+// Truncating instead would be worse: `open_path("a\0../../etc/passwd")` opening
+// `a` is a security answer, not a correctness one, and the caller who built that
+// string is the only one who can say what it meant.
+//
+// Run the tests:  jestyrc test examples/std/cstring_test.jtr
+
+import "mem"
+
+// An owned NUL-terminated byte buffer. `n` is the length WITHOUT the terminator,
+// so it matches the source `str`'s `len` and never has to be adjusted by callers.
+pub struct CString {
+    p: *mut u8,
+    n: usize,
+    a: Allocator,
+}
+
+// Copy `s` into a fresh NUL-terminated buffer.
+//
+// Always succeeds: an empty `str` gives a one-byte buffer holding just the
+// terminator, which is a valid empty C string rather than a null pointer. That
+// matters because C APIs distinguish "" from NULL, and returning the latter for
+// an empty path would turn a bad argument into a crash.
+@no_os pub fn from_str(read a: Allocator, read s: str) -> CString {
+    var p: *mut u8 = mem.alloc_bytes(a, s.len + 1)
+    var i: usize = 0
+    for i < s.len {
+        unsafe { (p + i).* = s[i] }
+        i = i + 1
+    }
+    unsafe { (p + s.len).* = 0 }
+    return CString{ p: p, n: s.len, a: a }
+}
+
+// The C view. Valid exactly as long as this `CString` is — do not store it past
+// the owner's lifetime, which is the one rule a `cstr` cannot enforce for itself.
+@no_os pub fn as_cstr(read c: CString) -> cstr {
+    return c.p as cstr
+}
+
+// The length WITHOUT the terminator — the same number the source `str` reported.
+@no_os pub fn len(read c: CString) -> usize {
+    return c.n
+}
+
+@no_os pub fn is_empty(read c: CString) -> bool {
+    return c.n == 0
+}
+
+// Does `s` contain a zero byte before its end? Such a `str` cannot round-trip
+// through C: the terminator is in the middle, so every C consumer sees a shorter
+// string than Jestyr does. Ask this BEFORE handing a computed string to the OS.
+//
+// This takes a `str` rather than a `CString` on purpose — the useful moment to
+// ask is before the copy, when the caller still has somewhere to put the error.
+@no_alloc @no_os pub fn has_interior_nul(read s: str) -> bool {
+    var i: usize = 0
+    for i < s.len {
+        if s[i] == 0 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// The release, factored out of both teardown paths — and NOT merely for tidiness.
+//
+// A module-qualified call inside a trait-`impl` method body does not compile:
+// `mem.free_bytes(...)` written directly in `drop` emits `j_mem` as if `mem` were
+// a local, and gcc fails with "'j_mem' undeclared". Resolution, typeck and the
+// escape checker all pass — the degrades-to-gcc mode again. `std/list` and
+// `std/smallvec` both happen to route `Drop` through a local helper for their own
+// reasons, which is why no corpus file had ever exercised it.
+//
+// The same body has a SECOND facet, found by hitting it: a name that needs
+// COLLISION canonicalization breaks there too. Calling this helper `release`
+// collided with `mem.release`, so it canon'd to `release__m1` everywhere except
+// inside `drop`, which emitted the bare `jestyr_release` and failed to link. Hence
+// the deliberately unshared name. The rule is: inside a trait-`impl` method body,
+// only a name whose canon EQUALS its bare spelling resolves.
+//
+// So this indirection is a WORKAROUND for a compiler bug, recorded as one rather
+// than presented as style. An 8-line reproducer is in the Tier 2 note.
+@no_os fn drop_cbuf(read a: Allocator, p: *mut u8) {
+    mem.free_bytes(a, p)
+}
+
+// Explicit teardown. Idempotent, so it composes with the automatic drop — the
+// `std/list` contract.
+@no_os pub fn free(mut c: CString) {
+    if c.p != null {
+        drop_cbuf(c.a, c.p)
+        c.p = null
+        c.n = 0
+    }
+}
+
+impl Drop for CString {
+    fn drop(mut self) {
+        if self.p != null { drop_cbuf(self.a, self.p) }
+    }
+}

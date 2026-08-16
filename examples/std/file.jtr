@@ -37,22 +37,53 @@
 // why, which is two calls, not fifty `?`s down a formatter — the same argument
 // `io-design.md` makes for putting the error set on `flush` and nowhere else.
 //
-// ─── The one real limitation ──────────────────────────────────────────────────
+// ─── Opening a computed path ──────────────────────────────────────────────────
 //
-// `open` takes a `cstr`, because that is what `fopen` takes, and the only way to
-// build one today is `.cstr` on a string LITERAL. So a path computed at runtime
-// cannot be opened yet. That is a genuine gap and it belongs to the string tier
-// (a `String -> cstr` bridge with a NUL guarantee), not here — putting a
-// half-answer in this module would be the thing this file's header warns about.
+// `open` takes a `cstr`, because that is what `fopen` takes, and `.cstr` bridges
+// a string LITERAL only. `open_path` is the general entry: it takes a `read str`,
+// copies it through `std/cstring` into a NUL-terminated buffer, and frees that
+// buffer before returning — so the terminator's lifetime never escapes this
+// module and callers never hold a `cstr` at all.
+//
+// It also REFUSES a path containing an interior NUL, rather than letting C stop
+// early at it. `open_path("a\0/../etc/passwd")` silently opening `a` would be a
+// security answer dressed as a correctness one; a closed `Reader` is the honest
+// one. `cstring.has_interior_nul` is public for callers who want to distinguish
+// that refusal from a missing file.
+//
+// ─── What belongs here, and what `sys` is for ─────────────────────────────────
+//
+// With `cptr` and header-declared externs, binding an OS call is no longer hard —
+// which makes SCOPE the question, not capability. The rule this module follows:
+//
+//   **If ISO C specifies it, it can live in `std`. If it needs a platform, it
+//   needs a platform layer, and that is what `sys` is for.**
+//
+// `fopen`/`fread`/`fclose`/`feof`/`ferror`/`fseek`/`ftell`/`rewind` are all ISO C:
+// one binding behaves the same everywhere, so there is nothing for a platform tier
+// to abstract and putting them behind one would be ceremony.
+//
+// Directory listing is the clean counter-example, and it is why `sys` still has
+// work to do: POSIX spells it `opendir`/`readdir`/`closedir`, Windows spells it
+// `FindFirstFile`/`FindNextFile`, and the two do not merely differ in name — they
+// differ in what a directory entry *is*. That is a real abstraction with a real
+// design cost, and it cannot be smuggled in as "just another extern". The same
+// goes for file metadata (`stat` vs `GetFileAttributesEx`), permissions, symlinks
+// and process control.
+//
+// So the boundary is not "OS calls go in `sys`" — this module makes OS calls. It
+// is "**calls that need a portability decision go in `sys`**", and everything here
+// needs none.
 //
 // Nothing here is `@no_os`: this module IS the OS boundary, and it is the first
 // file in the tree where that is the point rather than a failure.
 //
 // Run the tests:  jestyrc test examples/std/file_test.jtr
 
-// For the `Drop` trait, which `std/mem` declares — the same reason `std/pathbuf`
-// imports it. Nothing here allocates.
+// `mem` for the `Drop` trait (the same reason `std/pathbuf` imports it) and for
+// the allocator `open_path` hands to `cstring`.
 import "mem"
+import "cstring"
 
 // The stdio family. Declared by <stdio.h>, which the prelude already includes —
 // hence the header name rather than "c". Emitting prototypes for these is a
@@ -62,6 +93,19 @@ extern "stdio.h" fn fclose(f: cptr) -> i32
 extern "stdio.h" fn fread(buf: cptr, size: usize, n: usize, f: cptr) -> usize
 extern "stdio.h" fn feof(f: cptr) -> i32
 extern "stdio.h" fn ferror(f: cptr) -> i32
+// Seeking. `fseek`/`ftell`/`rewind` are ISO C, so they behave the same on every
+// platform Jestyr targets — which is the rule that decides what belongs here at
+// all (see the header's note on scope).
+extern "stdio.h" fn fseek(f: cptr, off: i64, whence: i32) -> i32
+extern "stdio.h" fn ftell(f: cptr) -> i64
+extern "stdio.h" fn rewind(f: cptr)
+
+// `SEEK_END`/`SEEK_SET` are macros, so their VALUES are what crosses the boundary.
+// 0/1/2 are fixed by ISO C and by every ABI Jestyr targets; `size` below is pinned
+// against an independent byte count in the test, so a wrong constant here fails
+// loudly rather than returning a plausible number.
+const SEEK_SET: i32 = 0
+const SEEK_END: i32 = 2
 
 // An open file, read sequentially.
 //
@@ -86,6 +130,25 @@ pub struct Reader {
 // that silently. Callers wanting line endings normalised should normalise them.
 pub fn open(path: cstr) -> Reader {
     return Reader{ h: fopen(path, "rb".cstr) }
+}
+
+// Open a path computed at runtime — the general entry; `open` is the literal-only
+// shorthand.
+//
+// Returns a CLOSED reader for a path containing an interior NUL, because C would
+// otherwise stop at it and open a different, shorter path than the caller named.
+// That is indistinguishable from "no such file" here on purpose: both mean "you
+// did not get what you asked for", and a caller who needs to tell them apart can
+// ask `cstring.has_interior_nul` before calling.
+//
+// The NUL-terminated copy is freed before this returns, so no `cstr` outlives the
+// call and the caller never sees one.
+pub fn open_path(read a: Allocator, read p: str) -> Reader {
+    if cstring.has_interior_nul(p) { return Reader{ h: null } }
+    var c: cstring.CString = cstring.from_str(a, p)
+    var r: Reader = Reader{ h: fopen(cstring.as_cstr(c), "rb".cstr) }
+    cstring.free(c)
+    return r
 }
 
 // Did the open succeed? A `Reader` for which this is false is inert: every read
@@ -121,6 +184,40 @@ pub fn at_eof(read r: Reader) -> bool {
 pub fn failed(read r: Reader) -> bool {
     if r.h == null { return false }
     return ferror(r.h) != 0
+}
+
+// ------------------------------------------------------------------ position
+
+// The file's total size in bytes, or -1 if it cannot be determined.
+//
+// **This does not disturb the read position** — it saves it, measures, and
+// restores. A `size` that silently rewound would make the obvious
+// `let n = size(r)` inside a read loop skip or repeat data, and that bug is
+// invisible until the file is bigger than one buffer.
+//
+// -1 rather than 0 for failure, because 0 is a real answer: an empty file exists
+// and is legitimately zero bytes.
+pub fn size(mut r: Reader) -> i64 {
+    if r.h == null { return 0 - 1 }
+    let here: i64 = ftell(r.h)
+    if here < 0 { return 0 - 1 }
+    if fseek(r.h, 0, SEEK_END) != 0 { return 0 - 1 }
+    let n: i64 = ftell(r.h)
+    if fseek(r.h, here, SEEK_SET) != 0 { return 0 - 1 }
+    return n
+}
+
+// The current read offset, or -1 if unknown.
+pub fn offset(read r: Reader) -> i64 {
+    if r.h == null { return 0 - 1 }
+    return ftell(r.h)
+}
+
+// Return to the start, clearing EOF. The one seek worth exposing before a general
+// `seek(whence, off)`: re-reading from the beginning is the common need, and it
+// cannot be spelled with the read API alone.
+pub fn restart(mut r: Reader) {
+    if r.h != null { rewind(r.h) }
 }
 
 // ------------------------------------------------------------------ teardown
