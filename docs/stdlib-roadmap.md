@@ -86,11 +86,18 @@ carried a false header for as long as the parallel functions had been in it, and
 > `no_os_does_not_see_through_a_trait_method_either` so the limit cannot lapse
 > unnoticed.
 >
-> The `@no_os` list is closed in a way `@no_alloc`'s is not, though, and that is worth
-> the asymmetry: with no `extern "c"` yet, the intrinsic set *is* the platform, so
-> nothing outside the list can reach the OS at all. When `extern "c"` lands, that
-> stops being true and `@no_os` needs an `extern` rule — which is one more concrete
-> reason the `sys` tier waits on it.
+> The `@no_os` list is closed in a way `@no_alloc`'s is not, and this document used to
+> justify that by saying the intrinsics *are* the platform "with no `extern "c"` yet".
+> **That was wrong: `extern "c"` has worked the whole time** — `examples/extern_c.jtr`
+> is in the corpus and calls libc's `puts` and `abs` — so a `@no_os` function could
+> reach the C library directly and still be certified freestanding.
+>
+> The paragraph correctly predicted that `@no_os` would then need an `extern` rule. It
+> now has one: **any call to an `extern "c"` function is an OS effect**, direct or
+> transitive, reported as "an `extern "c"` call into the platform's C library". So the
+> claim is sound again — but it was unsound for as long as both features coexisted,
+> which is a reminder that a closed list is only closed relative to an assumption worth
+> re-checking. Pinned by `no_os_rejects_an_extern_c_call`.
 
 ### `mem` / `alloc` — explicit allocation
 

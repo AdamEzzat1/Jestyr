@@ -62,6 +62,7 @@ pub fn check(ast: &Ast, info: &TypeInfo) -> Vec<Diagnostic> {
         calls: Vec::new(),
         alloc_via: effects.alloc_via,
         os_via: effects.os_via,
+        extern_fns: extern_fn_names(ast),
         unresolved: Vec::new(),
     };
     for item in &ast.items {
@@ -211,6 +212,7 @@ fn effect_closures(ast: &Ast, info: &TypeInfo) -> Effects {
             calls: Vec::new(),
             alloc_via: HashMap::new(),
             os_via: HashMap::new(),
+            extern_fns: extern_fn_names(ast),
             unresolved: Vec::new(),
         };
         probe.check_item(item);
@@ -328,6 +330,14 @@ struct Checker<'a> {
     /// Functions that reach the OS **transitively**, each mapped to the shortest chain
     /// reaching one that calls an OS intrinsic. Empty during the measuring pass.
     os_via: HashMap<String, Vec<String>>,
+    /// Every `extern "c"` function the program declares.
+    ///
+    /// Calling one leaves Jestyr for the platform's C library, so it is an OS effect
+    /// by definition — and it is the one that is *not* on the closed intrinsic list.
+    /// `docs/stdlib-roadmap.md` predicted this gap ("when `extern \"c\"` lands, the
+    /// intrinsic set stops being the whole platform and `@no_os` needs an `extern`
+    /// rule"); `extern "c"` turned out to already work, so the rule was already owed.
+    extern_fns: HashSet<String>,
     /// Borrow places whose type inference never resolved, with the root binding's
     /// name — the `Unknown` finalization, drained and emitted sorted in [`check`].
     /// Collected by the [`alloc_closure`] probe too, and discarded there with the
@@ -1543,7 +1553,7 @@ impl<'a> Checker<'a> {
         if is_alloc_intrinsic(&name) {
             self.allocates = true;
         }
-        if is_os_intrinsic(&name) {
+        if is_os_intrinsic(&name) || self.extern_fns.contains(&name) {
             self.uses_os = true;
         }
         self.calls.push((name.clone(), span));
@@ -1565,6 +1575,18 @@ impl<'a> Checker<'a> {
     /// finding about different effects — a reader who has learned to read one has
     /// learned to read the other. [`Effect`] holds the four words that differ.
     fn report_effect(&mut self, eff: Effect, name: &str, span: Span) {
+        // An `extern "c"` callee is the platform boundary made explicit, so it gets
+        // its own sentence rather than being described as an "intrinsic" it is not.
+        if eff == Effect::Os && self.extern_fns.contains(name) {
+            self.error(
+                span,
+                format!(
+                    "`{name}` is an `extern \"c\"` call into the platform's C library — \
+                     forbidden in a `@no_os` function (the proven-freestanding contract)"
+                ),
+            );
+            return;
+        }
         if eff.is_intrinsic(name) {
             self.error(
                 span,
@@ -2042,6 +2064,17 @@ impl Effect {
 /// — but a name that drifted out of one and not the other would make this check
 /// silently vacuous *for that intrinsic*, so `no_os_props` exercises every name here
 /// against the real checker.
+/// The names of every `extern "c"` declaration in the program.
+fn extern_fn_names(ast: &Ast) -> HashSet<String> {
+    ast.items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Extern(e) => Some(e.name.name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn is_os_intrinsic(name: &str) -> bool {
     matches!(
         name,
@@ -2662,6 +2695,41 @@ mod tests {
              @no_os fn f(n: i32) -> i32 { return a(n) }",
         );
         assert!(d.is_empty(), "an OS-free cycle must be accepted: {d:?}");
+    }
+
+    /// **An `extern "c"` call is the platform boundary, so `@no_os` must see it.**
+    ///
+    /// The OS-intrinsic list is closed, and that was sound only while the intrinsics
+    /// WERE the whole platform. `extern "c"` works — `examples/extern_c.jtr` calls
+    /// libc's `puts` and `abs` — so a `@no_os` function could reach the C library
+    /// directly and still be certified freestanding. `docs/stdlib-roadmap.md`
+    /// predicted this gap on the assumption `extern "c"` was still to come; it was
+    /// already here, so the rule was already owed.
+    #[test]
+    fn no_os_rejects_an_extern_c_call() {
+        let d = escapes(
+            "extern \"c\" fn abs(x: i32) -> i32 \
+             @no_os fn f(x: i32) -> i32 { return abs(x) }",
+        );
+        assert!(
+            d.iter().any(|m| m.message.contains("extern")),
+            "an extern call leaves Jestyr for the platform: {d:?}"
+        );
+
+        // Transitively, too — one hop away is still the platform.
+        let d = escapes(
+            "extern \"c\" fn abs(x: i32) -> i32 \
+             fn helper(x: i32) -> i32 { return abs(x) } \
+             @no_os fn f(x: i32) -> i32 { return helper(x) }",
+        );
+        assert!(d.iter().any(|m| m.message.contains("@no_os")), "{d:?}");
+
+        // …and an unannotated function may of course call it.
+        let d = escapes(
+            "extern \"c\" fn abs(x: i32) -> i32 \
+             fn f(x: i32) -> i32 { return abs(x) }",
+        );
+        assert!(d.is_empty(), "{d:?}");
     }
 
     /// **The two contracts are orthogonal axes, and both directions matter.**
