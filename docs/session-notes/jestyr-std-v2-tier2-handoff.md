@@ -528,6 +528,65 @@ local may legitimately shadow an import binding.
 
 ---
 
+### §1.7 — `std/file`'s WRITE half — done, and it moved one item from "nice" to "the actual fix"
+
+`file.Writer` (`create`/`append`/`create_path`/`append_path`/`is_writable`/`write_from`/
+`write_str`/`written`/`finish`, plus a `Drop` impl) closed §2's *Error sets on writes* row
+with **one new extern** (`fwrite`) and **zero edits to `sink.jtr` or `writer.jtr`**.
+
+**Two measurements decided the shape, and the second is the one to carry forward.**
+
+1. ~~Over a stream that has already lost every byte handed to it, `ferror` returns 32 and
+   **`fflush` returns 0**.~~ **THIS MEASUREMENT WAS VACUOUS AND IS WITHDRAWN.** The `ferror`
+   half is real (32, and sticky). The `fflush` half proved nothing: the failed `fwrite` left
+   the output buffer EMPTY, so the 0 meant "an empty buffer flushed cleanly" — true of every
+   conforming implementation, including one that reports losses faithfully — and deleting the
+   write from the probe left the assertion passing. The probe also called `fflush` on an input
+   stream, which is UB (C11 7.21.5.2). It has been deleted.
+
+   **The conclusion survives on a structural argument that needs no measurement:** `fclose`
+   performs the final implicit flush *and reports it*, so the close is genuinely last and
+   subsumes anything a `flush` could say. Shipping both would give a caller two places to ask
+   one question and make the earlier one unable to answer it — the always-answers-fine shape
+   `writer.jtr` already refused once. `finish` is the close; there is no `flush`.
+2. **A discarded fallible result in statement position compiles and runs with no
+   diagnostic.** `f(3)` where `f -> i64 !{ … }` is silently accepted. That means even
+   `file.finish(w)` written as a statement throws the verdict away, so the module's header
+   states the Drop contract unhedged rather than claiming the error is hard to ignore.
+   **A must-use / linear obligation on an un-`finish`ed handle at scope exit moves from
+   "nice to have" to the actual fix**, and the same gap is what makes `var b: Writer = a`
+   (two names, one handle) reachable now that tests copy handles.
+
+**The error set is `!{ FileNotOpen, FileWriteFailed, FileCloseFailed }`, payload-free, and
+the payload-freedom is an ABI promise.** One payload-carrying name widens the result struct
+of every program that links this — a whole-program change that would drag a verification
+tax with it; a bare set keeps every existing program's C byte-identical, which is what kept
+this increment at zero tax. (The payload a caller actually wants — *which path* — is refused
+by the escape checker anyway; only literals survive.) `FileCloseFailed` is the member that
+justifies the whole function: no per-call count could ever catch it.
+
+**The honest gap, recorded rather than buried.** `FileNotOpen` has two positive controls (a
+double `finish`, and a genuinely failed open). `FileWriteFailed` and `FileCloseFailed` have
+**none at all**, and cannot from ISO C alone — `create`/`append` cannot produce an
+open-but-unwritable stream. A companion `file_stdio_test.jtr` was written to pin the
+*mechanism* against raw stdio and then **deleted**: its central assertion (`fflush` answers
+0 over a stream that lost bytes) passed only because the failed write left the output buffer
+empty, and it reached that state by flushing an *input* stream — UB per C11 7.21.5.2, inside
+a module whose scope rule is "if ISO C specifies it". A test that proves nothing and invokes
+UB to do it is worse than an acknowledged gap. **The missing control is a `sys` obligation**:
+manufacturing a broken stream needs a read-only fd or a full filesystem, which is a
+portability decision.
+
+Tax: `file.jtr` is not in `SELFHOST_MODULES`, so **no mirror and no reseed**. The one
+construct new to the corpus is `text.ptr as cptr`, a `cstr`→`cptr` cast, and
+`jestyr_cgen_matches_reference` covers it — **run with `--features c-oracle`, since without
+it that test matches nothing and still prints `ok`** (§5). `file_test` grew 8 → 19 cases,
+`cstring_test` has 4, and **both are now pinned by `io_suites_pass`**, which until this point
+listed only `sink`/`cursor`/`writer` — so the filesystem-touching suites were the ones not
+gating.
+
+---
+
 ## §2. DEFERRED — with the reason, so it is not re-litigated
 
 Each was considered and rejected *for now*. The reason matters more than the verdict: when
@@ -537,8 +596,8 @@ the reason stops holding, the item becomes live.
 |---|---|---|
 | ~~**Streaming `Reader`**~~ | ✅ **BUILT** as `std/file` — and with no intrinsic at all: `cptr` + header-declared externs made it library code. The `Reader` **trait** is still deferred (the four-decision question stands); this is a concrete type | done |
 | **`BufWriter`** | A handle cannot own borrowed storage, so it needs an `Allocator` → `mem` tier, not `core`. And the one destination that would benefit is stdout, which **already buffers in C stdio** — wrapping it is double buffering with a second copy | A real case appears (socket, compressor) |
-| **Error sets on writes** | Fifty `?`s down a formatter is how errors get swallowed, not handled. The one genuinely fallible operation is a final `flush`, and that is where an error set belongs — one fallible call, not N | A fallible write intrinsic exists |
-| **`failed()` on `Writer`** | Removed, not shipped: `print_str`/`eprint_str` return nothing so a stream write has no detectable failure, and sink overflow is deliberately the *sink's* business. It could only ever answer `false`, and a query that always says "fine" invites a caller to believe it checked something | Same as above |
+| ~~**Error sets on writes**~~ | ✅ **SHIPPED** as `file.finish` — and **no intrinsic was needed**, for the same reason §1.2's reader needed none: `fwrite`/`fflush`/`ferror` bind through `extern "stdio.h"`. The "one fallible call, not N" rule is achieved literally: `finish` is the **only** fallible function in `std/file`, and the write half carries zero `?`s. **The deferral named the wrong call**, though — see §1.7 | done |
+| **`failed()` on `Writer`** | **The recorded reason is DEAD and the item still loses.** `ferror` genuinely answers `true` (measured: 32, and sticky), so "it could only ever answer false" no longer holds. It loses on three grounds that survive: a `write_failed` reads only `ferror` while `finish` reads `ferror` **and** `fclose`, so polling it through a long stream and losing everything at the close is exactly the invites-a-caller-to-believe trap in a new form; a short write is unambiguous (a file has no EOF in this direction) so the failing call already reported it with a number; and its `true` branch is unreachable through `create`/`append`, so shipping it means shipping an untested half | A caller must **abandon** a long stream mid-way rather than learn at the end. Its positive control then needs an open-but-unwritable stream — a platform call, therefore `sys` |
 | ~~**`sys` tier**~~ | ✅ **UNBLOCKED.** Blocked on neither `extern "c"` (already worked) nor, as it turned out, on an opaque pointer type alone — `void*` does not fix a prototype clash. **Prototype SUPPRESSION did** (`extern "stdio.h"`), and `std/file` is the proof that the whole stdio family now binds. What remains is scope, not capability: which syscalls `sys` should expose | now — pick the surface |
 | **Typed `Path` on `distinct`** | `distinct` is not enforced at argument positions (§1.4). **Its stated trigger — the int→int decision — has now FIRED**, so this is live: the next step is to check whether `distinct` follows the same `assignable` path the int rule now judges | NOW — the blocker is cleared |
 | **A generic collections zoo** | A breadth objection, not an existence objection. One container with a real consumer is a slice | Never as a zoo; one at a time (§1.1) |
@@ -771,6 +830,31 @@ loader-triggered divergence can fail.
 * **Don't assert a global absence to prove a local property.** Asserting the emitted C had no
   `memcpy` to prove a slice view is copy-free failed — the runtime prelude has `memcpy`.
   Assert the *presence* of `.ptr + _lo`.
+* **A `cargo test` that matches ZERO tests prints `ok`.** The self-hosting goldens live in
+  `mod c_oracle`, gated `#[cfg(all(test, feature = "c-oracle"))]`, and `c-oracle` is **not** a
+  default feature — so `cargo test --release jestyr_cgen_matches_reference` reports
+  `ok. 0 passed; 0 failed; 1083 filtered out` and looks green. Any verification claim citing a
+  featureless invocation of a `c-oracle` test is decorative. **Read the `N passed` count, not
+  the word `ok`.** (The commands in §4 and at the top of this note are correct; this is about
+  ad-hoc runs.)
+* **A test can invoke UB to prove nothing.** A probe file written for `std/file`'s write half
+  asserted that `fflush` answers 0 over a stream that had lost bytes — the measurement the
+  whole "one fallible call is `finish`, not `flush`" argument was hung on. It passed because
+  the failed `fwrite` left the output buffer EMPTY, so it measured "an empty buffer flushes
+  clean", true of every conforming implementation including one that reports losses
+  faithfully; deleting the write left the assertion passing. It also called `fflush` on an
+  input stream, which is undefined behaviour (C11 7.21.5.2), inside a module whose scope rule
+  is "if ISO C specifies it". Deleted rather than repaired. **When a design argument rests on
+  one measurement, mutate the probe: remove the thing being measured and see if it still
+  passes.**
+* **Every oracle can answer truthfully and the result still be corrupt.** The documented
+  `sink` → `file` recipe formats into a fixed buffer then writes the prefix. When the sink
+  overflows it drops bytes and counts them; `write_from` then reports the truncated prefix as
+  fully written (it was); `finish` reports the stream fine (it was). Nothing lied and the
+  record on disk was `user=alice balan`. The only signal is `sink.overflowed`, so it belongs
+  in the *recipe*, not a footnote — pinned by
+  `a_sink_that_overflowed_is_caught_before_it_reaches_the_file`, which performs the unguarded
+  write on purpose so the test shows what lands without the guard.
 * **A differential test cannot catch a bug both sides share.** `normalize` compared the
   output's last two bytes instead of the whole segment; the Rust oracle written from the same
   spec had the identical flaw. Keep worked examples and adversarial reading alongside

@@ -15147,10 +15147,26 @@ fn main() -> i32 {
         );
     }
 
-    /// The three IO suites through the real harness.
+    /// The IO suites through the real harness.
+    ///
+    /// `file_test` and `cstring_test` were added late and, until then, **neither
+    /// gated**: the Rust suite checked only that they COMPILE. A suite that runs when a
+    /// person types the command is documentation, not a gate — and these two are the
+    /// ones that touch the real filesystem, so they are exactly what a refactor can
+    /// break silently.
+    ///
+    /// The counts are hardcoded on purpose: adding a test must be a deliberate edit
+    /// here, so a test that stops being EMITTED (a dropped `@test`, the colocated-test
+    /// trap) fails loudly instead of quietly shrinking the run.
     #[test]
     fn io_suites_pass() {
-        for (f, n) in [("sink_test", 6), ("cursor_test", 8), ("writer_test", 5)] {
+        for (f, n) in [
+            ("sink_test", 6),
+            ("cursor_test", 8),
+            ("writer_test", 5),
+            ("file_test", 19),
+            ("cstring_test", 4),
+        ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");
             assert!(

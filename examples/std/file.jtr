@@ -1,4 +1,4 @@
-// std/file.jtr — a STREAMING file reader, and the first module that reaches the
+// std/file.jtr — STREAMING file IO, and the first module that reaches the
 // operating system without a compiler intrinsic.
 //
 // ─── Why this module is the interesting one ───────────────────────────────────
@@ -33,9 +33,74 @@
 // costume" mistake. `Reader` here is a concrete type that streams; when the trait
 // question is settled, this is what it will be settled against.
 //
-// Nor is there an error set. `fread` reports a short count and `ferror` reports
-// why, which is two calls, not fifty `?`s down a formatter — the same argument
-// `io-design.md` makes for putting the error set on `flush` and nowhere else.
+// Nor is there an error set ON THE READ HALF. `fread` reports a short count and
+// `ferror` reports why, which is two calls, not fifty `?`s down a formatter — the
+// same argument `io-design.md` makes for putting the error set at the end and
+// nowhere else. The write half has exactly one fallible call, `finish`, for that
+// same reason and no other; see below.
+//
+// ─── Writing: one fallible call, and it is not `flush` ────────────────────────
+//
+// `io-design.md` §3 named the right shape — many infallible writes, one fallible
+// operation at the end — and named the wrong call. It said `flush`.
+//
+// **The first version of this comment justified that with a measurement that proved
+// nothing, and the honest record is worth more than the tidy claim.** It said "over a
+// stream that has already lost bytes, `fflush` returns 0". The probe behind it opened
+// a file `"rb"`, watched `fwrite` refuse every byte, and then flushed — but because
+// the write delivered nothing, the output buffer was EMPTY, so the 0 meant "an empty
+// buffer flushed cleanly", which is true of every conforming implementation including
+// one that reports losses faithfully. Deleting the write from the probe left the
+// assertion passing. Worse, `fflush` on an input stream is undefined behaviour
+// (C11 7.21.5.2) — in a module whose scope rule is "if ISO C specifies it".
+//
+// The conclusion survives on a structural argument that needs no measurement:
+// **`fclose` performs the final implicit flush and reports it**, so the close is
+// genuinely last and subsumes anything a `flush` could say. Shipping both would give a
+// caller two places to ask one question, and the earlier one cannot answer it — that
+// is the always-answers-fine shape `writer.jtr` already refused once, and it does not
+// need a benchmark to reject.
+//
+// So `finish` is the one fallible function here, `flush` does not exist, and a
+// formatter emitting fifty pieces carries zero `?`s: fifty `write_str` calls and one
+// `finish`.
+//
+// `flush` becomes worth adding when a caller must learn about durability MID-stream
+// without ending the file — a log tailed by another process. Nothing in the tree has
+// one, and a `flush` added before that caller exists would be a second, weaker place
+// to ask the question `finish` answers.
+//
+// ─── What `Drop` on a `Writer` does and does not promise ──────────────────────
+//
+// `finish` is where a write is REPORTED. `Drop` is where the descriptor is
+// RECLAIMED. Letting a `Writer` fall out of scope is choosing not to know: bytes
+// that `fwrite` accepted into stdio's buffer and that the Drop-time `fclose` then
+// failed to push are counted by `written()`, invisible to everything, and lost after
+// the last Jestyr expression in the scope.
+//
+// That is stated plainly rather than hedged, because `Drop` CANNOT report and
+// nothing here will make it able to: a fallible trait-impl method is refused by name,
+// there is no return channel, a module-level "last error" latch is the errno design
+// and a data race in a language with real `spawn`, and `eprint_str` from a library
+// writes to a stream the caller may be formatting into in order to complain about
+// output. There is no fifth channel.
+//
+// The mitigation that is real: `is_writable(w)` is false IFF you finished, so "did I
+// remember?" is answerable before scope exit, by a caller and by a test. The real fix
+// is a language feature — a must-use obligation making an un-`finish`ed `Writer` at
+// scope exit a compile error. It is not merely nice to have: a discarded fallible
+// result in statement position compiles and runs today with no diagnostic, so even
+// `file.finish(w)` written as a statement throws the verdict away silently. Nothing
+// in this module makes that hard to do by accident, and this comment will not pretend
+// otherwise.
+//
+// Two more limits, named here rather than discovered later. A `Drop`-owning struct is
+// freely copy-initializable and the source stays readable, so `var b: Writer = a`
+// leaves two names for one handle — the same missing linear-type obligation. And ISO
+// C cannot close the false-ok case: if a platform's `fclose` returns 0 without ever
+// setting the error indicator while bytes were dropped downstream, `finish` returns
+// ok and is wrong. `fsync` is POSIX, and by this module's own scope rule that makes
+// it `sys`'s.
 //
 // ─── Opening a computed path ──────────────────────────────────────────────────
 //
@@ -43,7 +108,10 @@
 // a string LITERAL only. `open_path` is the general entry: it takes a `read str`,
 // copies it through `std/cstring` into a NUL-terminated buffer, and frees that
 // buffer before returning — so the terminator's lifetime never escapes this
-// module and callers never hold a `cstr` at all.
+// module and callers never hold a `cstr` at all. `create`/`create_path` and
+// `append`/`append_path` are the same pair on the write side, sharing one private
+// opener; the refusal matters MORE there, because a truncated read path opens the
+// wrong file while a truncated write path clobbers it.
 //
 // It also REFUSES a path containing an interior NUL, rather than letting C stop
 // early at it. `open_path("a\0/../etc/passwd")` silently opening `a` would be a
@@ -91,6 +159,7 @@ import "cstring"
 extern "stdio.h" fn fopen(path: cstr, mode: cstr) -> cptr
 extern "stdio.h" fn fclose(f: cptr) -> i32
 extern "stdio.h" fn fread(buf: cptr, size: usize, n: usize, f: cptr) -> usize
+extern "stdio.h" fn fwrite(buf: cptr, size: usize, n: usize, f: cptr) -> usize
 extern "stdio.h" fn feof(f: cptr) -> i32
 extern "stdio.h" fn ferror(f: cptr) -> i32
 // Seeking. `fseek`/`ftell`/`rewind` are ISO C, so they behave the same on every
@@ -233,6 +302,195 @@ pub fn close(mut r: Reader) {
 }
 
 impl Drop for Reader {
+    fn drop(mut self) {
+        if self.h != null { fclose(self.h) }
+    }
+}
+
+// ==================================================================== writing
+//
+// An open file, written sequentially.
+//
+// `put` counts bytes the STREAM ACCEPTED — not bytes on disk. Nothing short of
+// `finish` can say whether they landed, and the field exists because `finish` needs
+// a value to hand back; `written()` is that value made readable for free rather than
+// a second, weaker way to ask about failure.
+//
+// `cptr` for the handle for `Reader`'s recorded reason: it cannot be dereferenced and
+// has no arithmetic, not even inside `unsafe`, so this struct cannot be made to read
+// the FILE's innards. `usize` for the counter to match `fwrite`, `read_into` and
+// `finish`'s ok type, so no width conversion appears anywhere in the path.
+pub struct Writer {
+    h: cptr,
+    put: usize,
+}
+
+// ------------------------------------------------------------------ opening
+
+// Truncate `path` (or create it) and open it for binary writing.
+//
+// The mode is in the NAME rather than a parameter, because which of truncate and
+// append you meant is a call-site decision and a `bool` at the call site does not
+// say which way round it goes. Binary mode is the same determinism decision `open`
+// made with "rb" and with more force: text mode EXPANDS `\n` on the way out, so the
+// same program would write different bytes on different platforms.
+pub fn create(path: cstr) -> Writer {
+    return Writer{ h: fopen(path, "wb".cstr), put: 0 }
+}
+
+// Open `path` for binary writing, positioned at the end — existing bytes are kept.
+pub fn append(path: cstr) -> Writer {
+    return Writer{ h: fopen(path, "ab".cstr), put: 0 }
+}
+
+// `create` for a path computed at runtime.
+pub fn create_path(read a: Allocator, read p: str) -> Writer {
+    return open_for_write(a, p, "wb".cstr)
+}
+
+// `append` for a path computed at runtime.
+pub fn append_path(read a: Allocator, read p: str) -> Writer {
+    return open_for_write(a, p, "ab".cstr)
+}
+
+// The one place a computed write path is opened, so the interior-NUL refusal cannot
+// be present in one entry point and forgotten in the other. Private because the mode
+// belongs in the name; see `create`.
+//
+// Refusing an interior NUL is load-bearing here in a way it is not on the read side:
+// C stopping early at the zero would not merely open the wrong file, it would
+// TRUNCATE it.
+fn open_for_write(read a: Allocator, read p: str, mode: cstr) -> Writer {
+    if cstring.has_interior_nul(p) { return Writer{ h: null, put: 0 } }
+    var c: cstring.CString = cstring.from_str(a, p)
+    var w: Writer = Writer{ h: fopen(cstring.as_cstr(c), mode), put: 0 }
+    cstring.free(c)
+    return w
+}
+
+// Is there a file behind this handle? False for a failed open and false after
+// `finish`, which is what makes it answerable as "did I remember to finish?" before
+// the scope ends. A `Writer` for which this is false is inert: every write takes
+// nothing and `Drop` does nothing.
+pub fn is_writable(read w: Writer) -> bool {
+    return w.h != null
+}
+
+// ------------------------------------------------------------------ writing
+
+// Hand `buf` to the stream, returning how many bytes it took.
+//
+// The mirror of `read_into`, down to the borrow mode saying which direction the
+// bytes go. A short count here is UNAMBIGUOUS in a way a short read is not — a file
+// has no EOF in this direction — so there is no `at_eof`/`failed` pair to
+// disambiguate it, and the number is the whole report for this call.
+pub fn write_from(mut w: Writer, read buf: []u8) -> usize {
+    if w.h == null { return 0 }
+    if buf.len == 0 { return 0 }
+    let n: usize = fwrite(buf.ptr, 1, buf.len, w.h)
+    w.put = w.put + n
+    return n
+}
+
+// A `str`'s bytes, exactly as they are. No encoding is applied and no terminator is
+// added — `write_str(w, "\n")` is spellable, and a `write_line` would be a policy
+// decision no caller in the tree has asked for yet.
+pub fn write_str(mut w: Writer, read text: str) -> usize {
+    if w.h == null { return 0 }
+    if text.len == 0 { return 0 }
+    let n: usize = fwrite(text.ptr as cptr, 1, text.len, w.h)
+    w.put = w.put + n
+    return n
+}
+
+// ------------------------------------------------------------------ progress
+
+// Bytes this handle has handed to the stream. PROGRESS, not durability: it counts
+// what `fwrite` accepted, and only `finish` says whether any of it landed.
+//
+// Per-handle, not per-file — an `append` writer that adds two bytes to a five-byte
+// file reports 2. The module reports progress freely and reports failure at exactly
+// one place, which is the line that keeps a caller from checking the wrong thing.
+pub fn written(read w: Writer) -> usize {
+    return w.put
+}
+
+// ------------------------------------------------------------------ finishing
+
+// Close the file and report whether the bytes landed, returning the total this
+// handle handed over. THE ONLY FALLIBLE FUNCTION IN THIS MODULE.
+//
+// Order matters and is not incidental: `ferror` is read BEFORE the close, because
+// after it the FILE is gone; `fclose` then runs on every path, so nothing leaks; and
+// the handle is nulled, so this binding's `Drop` finds nothing to do and a second
+// `finish` on it returns `FileNotOpen` rather than closing twice.
+//
+// **"this binding's"** is doing real work in that sentence, and an earlier draft said
+// "`Drop` can never double-close", which contradicted this same header eighty lines
+// up. A `Writer` is copy-initializable: `var b: Writer = a` leaves two names for one
+// `FILE*`, so `finish(b)` nulls `b` and leaves `a` holding a stale live handle that
+// `a`'s `Drop` will close a second time — from ordinary, non-`unsafe` code, with no
+// diagnostic. That is the missing linear-type obligation, not something this function
+// can fix, and claiming otherwise would be the kind of load-bearing false comment this
+// module's own tests exist to catch.
+//
+// The three members are actionably different, which is why this is a set and `open`'s
+// single failure is not:
+//
+//   * `FileNotOpen`   — the handle is null: the open failed (wrong path, missing
+//                       directory, interior NUL) or `finish` already ran. This member
+//                       is what stops `finish` from lying — without it a `Writer`
+//                       whose `create` failed would answer `ok(0)`, "fine, zero
+//                       bytes", for a file that never existed.
+//   * `FileWriteFailed` — the error indicator was already latched when this began, so
+//                       an earlier `write_*` did not deliver and said so in its return
+//                       value. An earlier failure outranks a close failure, because it
+//                       is the one the caller could have caught.
+//   * `FileCloseFailed` — nothing had failed before and the close, including its
+//                       implicit final flush, reported a problem. THIS IS THE CASE NO
+//                       PER-CALL COUNT COULD CATCH, and it is the entire reason this
+//                       function exists.
+//
+// The last two are described MECHANICALLY on purpose, and are **asserted rather than
+// tested**: `create`/`append` cannot produce an open-but-unwritable stream, so neither
+// has been observed through this API or any other. A companion file that poked raw
+// stdio was written to cover them and then deleted — its central assertion passed only
+// because the failed write left the output buffer empty, and it reached that state by
+// flushing an input stream, which is UB. A test that proves nothing and invokes UB to
+// do it is worse than an acknowledged gap.
+//
+// Manufacturing a genuinely broken stream needs a read-only descriptor or a full
+// filesystem — a portability decision, which by this module's own scope rule is
+// `sys`'s. Until then this gap is stated, not papered over.
+//
+// The names are prefixed because the error namespace is flat and whole-program: a
+// consumer declaring its own `WriteFailed` with a payload would get a diagnostic
+// pointing into this module. They carry NO payload, and that is an ABI promise, not
+// an omission — one payload-carrying name widens the result struct of every program
+// that links this, and the payload a caller actually wants (which path) is refused by
+// the escape checker anyway.
+//
+// The ok type is `usize` rather than `bool` because a `bool` would smuggle the
+// always-answers-fine query back in through the return position.
+//
+// Idempotent in EFFECT (the handle is already null, so no second `fclose`, and `Drop`
+// finds nothing to do) and deliberately not in REPORT: a second call is
+// `err(FileNotOpen)`. A `sealed` field would be a byte spent making a caller's bug
+// read more prettily.
+pub fn finish(mut w: Writer) -> usize !{ FileNotOpen, FileWriteFailed, FileCloseFailed } {
+    if w.h == null { return err(FileNotOpen) }
+    let latched: i32 = ferror(w.h)
+    let closed: i32 = fclose(w.h)
+    w.h = null
+    if latched != 0 { return err(FileWriteFailed) }
+    if closed != 0 { return err(FileCloseFailed) }
+    return ok(w.put)
+}
+
+impl Drop for Writer {
+    // Bare externs only. A module-qualified call inside a trait-impl body emits the
+    // module binding as if it were a local and fails in gcc (§1.6), and a `Drop` that
+    // called `finish` could not report its answer anyway.
     fn drop(mut self) {
         if self.h != null { fclose(self.h) }
     }

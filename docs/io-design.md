@@ -155,3 +155,57 @@ without capturing a subprocess.**
 Deferred with reasons above, not for lack of time: `BufWriter` (wants an allocator), a
 streaming `Reader` (wants an intrinsic), and error sets on writes (wants a flush to hang
 them on).
+
+## What `std/file`'s write half corrected — decision 3 was right about the shape and wrong about the call
+
+Both deferrals in that last paragraph have since fired, and neither needed an intrinsic:
+`cptr` + header-declared externs made the streaming `Reader` library code, and `fwrite` /
+`fflush` / `ferror` made a fallible write reachable. `file.Writer` is the result, and
+implementing it corrected decision 3 a second time.
+
+**"One fallible call at the end" held. "The end is `flush`" did not.**
+
+The first version of this section justified that with a measurement — that `fflush` answers
+0 over a stream which had already lost bytes — and **that measurement was withdrawn**. The
+probe's failed `fwrite` left the output buffer empty, so the 0 meant "an empty buffer
+flushed cleanly", which every conforming implementation reports; removing the write left the
+assertion passing. It also flushed an *input* stream, which is UB (C11 7.21.5.2). What
+survives measurement is only that `fwrite` refuses and says so (0) and that `ferror` latches
+(32, sticky).
+
+**The conclusion stands on structure instead, which is stronger.** `fclose` performs the
+final implicit flush **and reports it**, so the close is genuinely the last operation and
+subsumes anything a `flush` could say. Shipping both would hand a caller two places to ask
+one question while making the earlier one unable to answer it — the same always-answers-fine
+shape this document already removed once, and no benchmark is needed to reject it.
+
+`std/file` therefore ships **`finish`** — close, report, hand back the total — as the
+module's *only* fallible function, and ships no `flush` at all. A formatter carries zero
+`?`s: N `write_str` calls and one `finish`.
+
+**`failed()` is still refused, and now for a reason that survives the counter-evidence.**
+The recorded reason ("it could only ever answer false") is dead: `ferror` answers true. It
+loses anyway, on three grounds the 2026 argument did not have:
+
+1. A `write_failed` could only read `ferror`; `finish` reads `ferror` **and** `fclose`. A
+   caller polling it through a hundred megabytes can see `false` every time and still lose
+   everything at the close — which is precisely "a query that invites a caller to believe
+   it checked something", in the deferred-flush case.
+2. **A short write is unambiguous.** The read half's `failed()` earns its place as a
+   *disambiguator* — a short read means EOF or error. A file has no EOF in the write
+   direction, so `write_from`'s return value already reported the failure, at the failing
+   call, with a number. A query strictly coarser and later than what the caller already
+   holds is a second-best path, not a safety net.
+3. Its `true` branch is **unreachable through the public surface**: `create`/`append` open
+   `"wb"`/`"ab"`, so no caller and no test can obtain a `Writer` over an open-but-unwritable
+   stream. Shipping it would mean shipping an asserted, untested half.
+
+What ships instead is two questions with two answers, neither vacuous: `is_writable(w)`
+("is there a file here") and `finish(w)` ("did the bytes land"). Progress is reported
+freely (`written()`); failure is reported at exactly one place.
+
+**Revisit trigger, recorded:** a caller that must *abandon* a long stream mid-way rather
+than discover the loss at the end — the wrong-trade case decision 3 names above. It then
+ships as `write_failed`, its header saying plainly that a `false` answer does not survive
+`finish`, and its positive control comes from whatever route makes an open-but-unwritable
+stream reachable — a platform call, therefore `sys`.

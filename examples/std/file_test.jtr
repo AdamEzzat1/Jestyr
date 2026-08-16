@@ -1,20 +1,47 @@
 // std/file_test.jtr — `std/file`'s suite, in a sibling file because a colocated
 // `@test` is emitted into every consumer (the convention `path_test.jtr` set).
 //
-// These tests read a file guaranteed to exist and to be stable: the module's own
-// source. That is deliberate — a fixture written by the test would need a writable
-// path, which is a second OS surface this module does not have, and a fixture
-// checked in beside the test would drift from it silently.
+// The READ tests use a file guaranteed to exist and to be stable: the module's own
+// source. A fixture checked in beside the test would drift from it silently.
+//
+// The WRITE tests use fixtures they create themselves, in the OS temp directory via
+// `test_fixture.temp_path`, and remove with `fs.remove`. The note that used to stand
+// here — that a written fixture "would need a writable path, which is a second OS
+// surface this module does not have" — expired when the module grew a `Writer`, and
+// is replaced rather than left to rot.
+//
+// The round-trip is what makes the write tests mean anything: `write_from`'s count
+// and `finish`'s total both come from the module under test, so only reading the
+// bytes back through the reader proves they landed.
+//
+// **Two error members are UNREACHABLE from here and are therefore unpinned:**
+// `FileWriteFailed` and `FileCloseFailed`. `create`/`append` open `"wb"`/`"ab"`, so no
+// caller and no test can obtain a `Writer` over an open-but-unwritable stream, and
+// nothing portable forces a close to fail. A companion file that poked raw stdio was
+// written and then DELETED rather than shipped: its central assertion — that `fflush`
+// answers 0 over a stream that has lost bytes — passed only because the failed write
+// left the output buffer empty, so it measured "an empty buffer flushes clean" and
+// held for every conforming implementation. It also called `fflush` on an input
+// stream, which is undefined behaviour (C11 7.21.5.2). A test that proves nothing and
+// invokes UB to do it is worse than the acknowledged gap.
+//
+// The honest state: those two members are asserted, not tested. Reaching them needs a
+// platform call (a read-only descriptor, a full filesystem), which by this module's own
+// scope rule belongs to `sys`.
 //
 // Run:  jestyrc test examples/std/file_test.jtr
 
 import "file"
 import "cstring"
 import "mem"
+import "fs"
+import "sink"
+import "test_fixture"
 import "test"
 import "test_report"
 
 const REPORT_CAP: usize = 512
+const PATH_CAP: usize = 512
 
 // The module's own source, read relative to the repo root — the same working-
 // directory assumption `test_fixture` already makes.
@@ -269,6 +296,552 @@ fn self_path() -> cstr {
     // `r` now drops at scope exit with a null handle — the composition the
     // module's header claims.
 
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ==================================================================== writing
+
+// Drain `p` into `buf` and hand back the TRUE byte count. Every write test ends here,
+// because a count returned by the module under test cannot testify about itself.
+//
+// It reads through a small scratch and copies, rather than handing the reader a
+// moving sub-slice of `buf`: a range expression over a `mut []u8` is refused by the
+// C backend, and a 32-byte scratch also makes the drain a streaming one, which is
+// what the read half is for. The count keeps rising past `buf.len` so a caller who
+// under-sized `buf` sees a length that disagrees rather than a plausible one.
+fn read_back(read a: Allocator, read p: str, mut buf: []u8) -> usize {
+    var r: file.Reader = file.open_path(a, p)
+    if file.is_open(r) == false { return 0 }
+    var sraw: *mut u8 = alloc(u8, 32)
+    var s: []u8 = slice(u8, sraw, 32)
+    var n: usize = 0
+    var reading: bool = true
+    for reading {
+        let got: usize = file.read_into(r, s)
+        if got == 0 {
+            reading = false
+        } else {
+            for j in 0..got {
+                if n < buf.len { buf[n] = s[j] }
+                n = n + 1
+            }
+        }
+    }
+    free_ptr(sraw)
+    file.close(r)
+    return n
+}
+
+// A `Writer` created and ABANDONED — no `finish`, no `close`. It drops when this
+// function returns, which is the whole point: the caller then reads the file.
+fn write_and_abandon(read a: Allocator, read p: str, read text: str) -> usize {
+    var w: file.Writer = file.create_path(a, p)
+    return file.write_str(w, text)
+}
+
+// The headline property. Everything else in the write half is a claim about counts;
+// this is the one test that opens the file afterwards and looks.
+//
+// ADVERSARIAL BY CONSTRUCTION: `write_str` and `write_from` return numbers, and
+// `finish` returns a number, and all three come from the code under test. An
+// implementation that counted correctly and wrote nowhere would pass every assertion
+// except the last two.
+@test fn a_write_round_trips_through_the_reader() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var praw: *mut u8 = alloc(u8, PATH_CAP)
+    var pbuf: []u8 = slice(u8, praw, PATH_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    let pn: usize = test_fixture.temp_path("jestyr_file_roundtrip", pbuf)
+    let p: str = from_utf8(pbuf[0 .. pn])
+    fs.remove(p)
+
+    var w: file.Writer = file.create_path(sys, p)
+    test.is_true(c, rep, "control: a temp fixture opens for writing", file.is_writable(w))
+
+    let a: usize = file.write_str(w, "hello ")
+    test.eq_usize(c, rep, "write_str takes every byte", a, 6)
+
+    var braw: *mut u8 = alloc(u8, 5)
+    var b: []u8 = slice(u8, braw, 5)
+    b[0] = 119 as u8   // 'w'
+    b[1] = 111 as u8   // 'o'
+    b[2] = 114 as u8   // 'r'
+    b[3] = 108 as u8   // 'l'
+    b[4] = 100 as u8   // 'd'
+    let d: usize = file.write_from(w, b)
+    test.eq_usize(c, rep, "write_from takes every byte", d, 5)
+    free_ptr(braw)
+
+    let r = file.finish(w)
+    test.is_false(c, rep, "finish reports no error", is_err(r))
+    test.eq_usize(c, rep, "and hands back the total this handle wrote", unwrap(r), a + d)
+
+    var gbuf: *mut u8 = alloc(u8, 64)
+    var g: []u8 = slice(u8, gbuf, 64)
+    let n: usize = read_back(sys, p, g)
+    test.eq_usize(c, rep, "the file on disk is exactly that long", n, a + d)
+    test.eq_str(c, rep, "and holds exactly those bytes", from_utf8(g[0 .. n]), "hello world")
+
+    free_ptr(gbuf)
+    fs.remove(p)
+    free_ptr(praw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// `append` must extend rather than truncate — the difference `create` names in its
+// own name. The counter assertion is the sharper half: an appending handle reports
+// what IT wrote, not what the file holds.
+@test fn append_adds_to_the_end_rather_than_truncating() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var praw: *mut u8 = alloc(u8, PATH_CAP)
+    var pbuf: []u8 = slice(u8, praw, PATH_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    let pn: usize = test_fixture.temp_path("jestyr_file_append", pbuf)
+    let p: str = from_utf8(pbuf[0 .. pn])
+    fs.remove(p)
+
+    var first: file.Writer = file.create_path(sys, p)
+    file.write_str(first, "abc")
+    let r1 = file.finish(first)
+    test.is_false(c, rep, "the first write finished cleanly", is_err(r1))
+
+    var second: file.Writer = file.append_path(sys, p)
+    test.is_true(c, rep, "an existing file opens for appending", file.is_writable(second))
+    file.write_str(second, "de")
+    // Per-handle, not per-file. A `written` that reported 5 here would be describing
+    // the file, which is a durability claim this module refuses to make.
+    test.eq_usize(c, rep, "the appending handle counts ITS bytes, not the file's", file.written(second), 2)
+    let r2 = file.finish(second)
+    test.is_false(c, rep, "the append finished cleanly", is_err(r2))
+    test.eq_usize(c, rep, "and reports 2", unwrap(r2), 2)
+
+    var gbuf: *mut u8 = alloc(u8, 64)
+    var g: []u8 = slice(u8, gbuf, 64)
+    let n: usize = read_back(sys, p, g)
+    test.eq_usize(c, rep, "the file holds both writes", n, 5)
+    test.eq_i64(c, rep, "the original first byte survived", g[0] as i64, 97)
+    test.eq_i64(c, rep, "and the appended byte is last", g[4] as i64, 101)
+
+    free_ptr(gbuf)
+    fs.remove(p)
+    free_ptr(praw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The positive control that makes the test above non-vacuous: `create` over an
+// existing file must NOT preserve what was there. Without this, an `append` that
+// silently truncated and an `append` that worked would look identical whenever the
+// second write happened to be longer.
+@test fn create_truncates_an_existing_file() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var praw: *mut u8 = alloc(u8, PATH_CAP)
+    var pbuf: []u8 = slice(u8, praw, PATH_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    let pn: usize = test_fixture.temp_path("jestyr_file_truncate", pbuf)
+    let p: str = from_utf8(pbuf[0 .. pn])
+    fs.remove(p)
+
+    var big: file.Writer = file.create_path(sys, p)
+    file.write_str(big, "abcde")
+    file.finish(big)
+
+    var gbuf: *mut u8 = alloc(u8, 64)
+    var g: []u8 = slice(u8, gbuf, 64)
+    test.eq_usize(c, rep, "control: five bytes are there to be destroyed", read_back(sys, p, g), 5)
+
+    var small: file.Writer = file.create_path(sys, p)
+    file.write_str(small, "z")
+    file.finish(small)
+    test.eq_usize(c, rep, "create truncated it to one", read_back(sys, p, g), 1)
+    test.eq_i64(c, rep, "and that one byte is the new one", g[0] as i64, 122)
+
+    free_ptr(gbuf)
+    fs.remove(p)
+    free_ptr(praw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// `finish` reports once. The second call is `err(FileNotOpen)` rather than a second
+// `ok` — idempotent in effect, deliberately not in report.
+//
+// Consumed with `is_err`/`unwrap` and never with `catch 0`, because a sentinel would
+// make an error indistinguishable from an empty file.
+@test fn finish_reports_the_total_and_is_exactly_once() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var praw: *mut u8 = alloc(u8, PATH_CAP)
+    var pbuf: []u8 = slice(u8, praw, PATH_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    let pn: usize = test_fixture.temp_path("jestyr_file_finish_once", pbuf)
+    let p: str = from_utf8(pbuf[0 .. pn])
+    fs.remove(p)
+
+    var w: file.Writer = file.create_path(sys, p)
+    file.write_str(w, "xyz")
+
+    let r1 = file.finish(w)
+    test.is_false(c, rep, "the first finish succeeds", is_err(r1))
+    test.eq_usize(c, rep, "and reports every byte handed over", unwrap(r1), 3)
+    // The "did I remember?" proxy the header promises — answerable before scope exit.
+    test.is_false(c, rep, "a finished writer is no longer writable", file.is_writable(w))
+
+    let r2 = file.finish(w)
+    test.is_true(c, rep, "a second finish is an error, not a second ok", is_err(r2))
+
+    fs.remove(p)
+    free_ptr(praw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The positive control for `FileNotOpen` that comes from a genuinely FAILED OPEN
+// rather than from a double finish — the case where `ok(0)` would have been a lie
+// about a file that never existed.
+@test fn a_writer_that_never_opened_is_inert_and_finish_says_so() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var praw: *mut u8 = alloc(u8, PATH_CAP)
+    var pbuf: []u8 = slice(u8, praw, PATH_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    // A directory component that does not exist, so `fopen` fails rather than
+    // creating anything.
+    let pn: usize = test_fixture.temp_path("jestyr_file_no_such_dir/inner.txt", pbuf)
+    let p: str = from_utf8(pbuf[0 .. pn])
+
+    var w: file.Writer = file.create_path(sys, p)
+    test.is_false(c, rep, "a failed open is not writable", file.is_writable(w))
+
+    var braw: *mut u8 = alloc(u8, 4)
+    var b: []u8 = slice(u8, braw, 4)
+    test.eq_usize(c, rep, "write_from takes nothing", file.write_from(w, b), 0)
+    test.eq_usize(c, rep, "write_str takes nothing", file.write_str(w, "abcd"), 0)
+    test.eq_usize(c, rep, "and nothing was counted", file.written(w), 0)
+    free_ptr(braw)
+
+    let r = file.finish(w)
+    // The member that stops `finish` from answering "fine, zero bytes".
+    test.is_true(c, rep, "finish reports the failure rather than ok(0)", is_err(r))
+
+    free_ptr(praw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The security case, and it is sharper on this side than on the read side: a
+// truncating open would not merely read the wrong file, it would CLOBBER it.
+//
+// So the assertion is not "the open was refused" — that is the weaker claim — but
+// that the prefix file's contents are byte-for-byte unchanged afterwards.
+@test fn create_path_refuses_an_interior_nul_rather_than_clobbering_the_prefix() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var praw: *mut u8 = alloc(u8, PATH_CAP)
+    var pbuf: []u8 = slice(u8, praw, PATH_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    let pn: usize = test_fixture.temp_path("jestyr_file_nul_prefix", pbuf)
+    let good: str = from_utf8(pbuf[0 .. pn])
+    fs.remove(good)
+
+    // Positive control: the prefix names a path that genuinely DOES open for writing,
+    // so a truncating implementation would happily clobber it. Without this the
+    // refusal below would prove nothing.
+    var seed: file.Writer = file.create_path(sys, good)
+    test.is_true(c, rep, "control: the prefix alone opens for writing", file.is_writable(seed))
+    file.write_str(seed, "KEEP")
+    file.finish(seed)
+
+    // "<temp>/jestyr_file_nul_prefix" + NUL + "junk". Built byte-by-byte, since a
+    // literal cannot carry a zero.
+    var nb: *mut u8 = alloc(u8, pn + 5)
+    var i: usize = 0
+    for i < pn {
+        unsafe { (nb + i).* = good[i] }
+        i = i + 1
+    }
+    unsafe { (nb + pn).* = 0 }
+    unsafe { (nb + pn + 1).* = 106 }   // 'j'
+    unsafe { (nb + pn + 2).* = 117 }   // 'u'
+    unsafe { (nb + pn + 3).* = 110 }   // 'n'
+    unsafe { (nb + pn + 4).* = 107 }   // 'k'
+    let poisoned: str = from_utf8(slice(u8, nb, pn + 5))
+
+    test.is_true(c, rep, "the hazard is detected", cstring.has_interior_nul(poisoned))
+    var bad: file.Writer = file.create_path(sys, poisoned)
+    test.is_false(c, rep, "and the open is REFUSED, not truncated to the real prefix", file.is_writable(bad))
+    let r = file.finish(bad)
+    test.is_true(c, rep, "finishing a refused writer is an error", is_err(r))
+    free_ptr(nb)
+
+    // The claim that matters: refusing to open is worth nothing if the prefix was
+    // truncated on the way to being refused.
+    var gbuf: *mut u8 = alloc(u8, 64)
+    var g: []u8 = slice(u8, gbuf, 64)
+    let n: usize = read_back(sys, good, g)
+    test.eq_usize(c, rep, "the prefix file was NOT truncated", n, 4)
+    test.eq_str(c, rep, "and still holds what it held", from_utf8(g[0 .. n]), "KEEP")
+
+    free_ptr(gbuf)
+    fs.remove(good)
+    free_ptr(praw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The degenerate mirror of the read half's zero-length case. Zero here must read as
+// "nothing was asked for", never as failure — an implementation that latched on an
+// empty write would poison the `finish` of every formatter that emitted an empty
+// field.
+@test fn a_zero_length_write_takes_nothing_and_is_not_a_failure() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var praw: *mut u8 = alloc(u8, PATH_CAP)
+    var pbuf: []u8 = slice(u8, praw, PATH_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    let pn: usize = test_fixture.temp_path("jestyr_file_zero_write", pbuf)
+    let p: str = from_utf8(pbuf[0 .. pn])
+    fs.remove(p)
+
+    var w: file.Writer = file.create_path(sys, p)
+    file.write_str(w, "ab")
+
+    var eraw: *mut u8 = alloc(u8, 1)
+    var e: []u8 = slice(u8, eraw, 0)
+    test.eq_usize(c, rep, "an empty slice takes nothing", file.write_from(w, e), 0)
+    test.eq_usize(c, rep, "an empty str takes nothing", file.write_str(w, ""), 0)
+    test.eq_usize(c, rep, "and the counter did not move", file.written(w), 2)
+    free_ptr(eraw)
+
+    let r = file.finish(w)
+    test.is_false(c, rep, "an empty write is not a failure to finish on", is_err(r))
+    test.eq_usize(c, rep, "the total is still what was really written", unwrap(r), 2)
+
+    fs.remove(p)
+    free_ptr(praw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// Four numbers that must agree, in the discipline `size_reports_the_total…` used for
+// the read half: the sum of the per-call returns, `written`, `finish`'s ok value, and
+// an independent drain of the file. Three of them come from the same field; the
+// fourth is the one that cannot be faked.
+@test fn written_counts_bytes_accepted_and_agrees_with_a_read_back() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var praw: *mut u8 = alloc(u8, PATH_CAP)
+    var pbuf: []u8 = slice(u8, praw, PATH_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    let pn: usize = test_fixture.temp_path("jestyr_file_counts", pbuf)
+    let p: str = from_utf8(pbuf[0 .. pn])
+    fs.remove(p)
+
+    var w: file.Writer = file.create_path(sys, p)
+    var sum: usize = 0
+    for i in 0..7 {
+        sum = sum + file.write_str(w, "chunk")
+    }
+    test.eq_usize(c, rep, "seven five-byte writes", sum, 35)
+    test.eq_usize(c, rep, "written agrees with the per-call returns", file.written(w), sum)
+
+    let r = file.finish(w)
+    test.eq_usize(c, rep, "finish agrees with written", unwrap(r), sum)
+
+    var gbuf: *mut u8 = alloc(u8, 128)
+    var g: []u8 = slice(u8, gbuf, 128)
+    test.eq_usize(c, rep, "and the file on disk agrees with all three", read_back(sys, p, g), sum)
+
+    free_ptr(gbuf)
+    fs.remove(p)
+    free_ptr(praw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// `Drop` is a leak-preventer that gives bytes their best chance, and the module's
+// header says exactly that and no more. This pins the "best chance" half: a `Writer`
+// abandoned inside `write_and_abandon` still closes, and the bytes are readable
+// afterwards.
+//
+// What it does NOT pin, because nothing can: that the abandoning caller learned
+// anything. That is the trade the header states in those words.
+@test fn a_dropped_writer_still_closes_and_its_bytes_still_land() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var praw: *mut u8 = alloc(u8, PATH_CAP)
+    var pbuf: []u8 = slice(u8, praw, PATH_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    let pn: usize = test_fixture.temp_path("jestyr_file_dropped", pbuf)
+    let p: str = from_utf8(pbuf[0 .. pn])
+    fs.remove(p)
+
+    let handed: usize = write_and_abandon(sys, p, "dropped")
+    test.eq_usize(c, rep, "the abandoned writer accepted the bytes", handed, 7)
+
+    var gbuf: *mut u8 = alloc(u8, 64)
+    var g: []u8 = slice(u8, gbuf, 64)
+    let n: usize = read_back(sys, p, g)
+    test.eq_usize(c, rep, "and the Drop-time close pushed them out", n, 7)
+    test.eq_str(c, rep, "byte for byte", from_utf8(g[0 .. n]), "dropped")
+
+    // The paired half: after an explicit `finish` the handle is null, so the same
+    // `Drop` runs and finds nothing to do. A double `fclose` is undefined behaviour a
+    // test cannot observe; this is the observable proxy, as on the read side.
+    var w: file.Writer = file.create_path(sys, p)
+    file.finish(w)
+    test.is_false(c, rep, "a finished writer leaves Drop nothing to do", file.is_writable(w))
+
+    free_ptr(gbuf)
+    fs.remove(p)
+    free_ptr(praw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The documented composition: format into a `core` `Sink` over a caller buffer, check
+// `overflowed` ONCE, then hand the written prefix to the file in one call.
+//
+// **The `overflowed` check is part of the recipe, not decoration**, and leaving it out
+// is a silent-corruption bug rather than a missing nicety. A `Sink` drops what does not
+// fit and counts it (`sink.jtr:43`); `write_from` then reports the truncated prefix as
+// fully written, because it was; and `finish` returns ok, because the stream is fine.
+// Every oracle in the pipeline answers truthfully and the record on disk is still
+// wrong. `a_sink_that_overflowed_is_caught_before_it_reaches_the_file` below measures
+// exactly that, so the guard cannot be quietly dropped again.
+//
+// This is also why no `write_sink` bridge exists: a bridge would have to choose between
+// writing truncated output silently and conflating sink overflow with stream failure.
+// The first draft of this file made that argument and then shipped a recipe that did
+// the first of them, which is the kind of self-refutation worth leaving on the record.
+@test fn a_sink_prefix_writes_through_in_one_call() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var praw: *mut u8 = alloc(u8, PATH_CAP)
+    var pbuf: []u8 = slice(u8, praw, PATH_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    let pn: usize = test_fixture.temp_path("jestyr_file_sink", pbuf)
+    let p: str = from_utf8(pbuf[0 .. pn])
+    fs.remove(p)
+
+    var sraw: *mut u8 = alloc(u8, 64)
+    var sbuf: []u8 = slice(u8, sraw, 64)
+    var s: sink.Sink = sink.new()
+    sink.put_str(s, sbuf, "count=")
+    sink.put_i64(s, sbuf, 42)
+    sink.put_nl(s, sbuf)
+    test.is_false(c, rep, "control: the scratch buffer was big enough", sink.overflowed(s))
+
+    var w: file.Writer = file.create_path(sys, p)
+    // The guard, written out as callers must write it.
+    var n: usize = 0
+    if not sink.overflowed(s) { n = file.write_from(w, sbuf[0 .. sink.written(s)]) }
+    test.eq_usize(c, rep, "the whole formatted prefix went in one call", n, sink.written(s))
+    let r = file.finish(w)
+    test.is_false(c, rep, "and finished cleanly", is_err(r))
+    free_ptr(sraw)
+
+    var gbuf: *mut u8 = alloc(u8, 64)
+    var g: []u8 = slice(u8, gbuf, 64)
+    let got: usize = read_back(sys, p, g)
+    test.eq_str(c, rep, "the file holds what the sink formatted", from_utf8(g[0 .. got]), "count=42\n")
+
+    free_ptr(gbuf)
+    fs.remove(p)
+    free_ptr(praw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// The loss path the recipe above guards against, measured rather than asserted.
+//
+// Every oracle in this pipeline answers TRUTHFULLY and the result is still a corrupt
+// record: the sink drops what does not fit and counts it, `write_from` reports the
+// truncated prefix as fully written (it was), and `finish` returns ok (the stream is
+// fine). `sink.overflowed` is the ONLY signal, which is exactly why the guard belongs
+// in the recipe rather than in a footnote.
+//
+// The unguarded write is performed here on purpose, so the test can show what lands
+// without it — a test that only checked the guard would prove the guard runs, not that
+// it matters.
+@test fn a_sink_that_overflowed_is_caught_before_it_reaches_the_file() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var praw: *mut u8 = alloc(u8, PATH_CAP)
+    var pbuf: []u8 = slice(u8, praw, PATH_CAP)
+    var c: test.Check = test.new()
+    var sys: Allocator = mem.system_allocator()
+
+    let pn: usize = test_fixture.temp_path("jestyr_file_sink_of", pbuf)
+    let p: str = from_utf8(pbuf[0 .. pn])
+    fs.remove(p)
+
+    // 16 bytes of room for a 22-byte record: "user=" + "alice" + " balance=" + "100".
+    var sraw: *mut u8 = alloc(u8, 16)
+    var sbuf: []u8 = slice(u8, sraw, 16)
+    var s: sink.Sink = sink.new()
+    sink.put_str(s, sbuf, "user=")
+    sink.put_str(s, sbuf, "alice")
+    sink.put_str(s, sbuf, " balance=")
+    sink.put_i64(s, sbuf, 100)
+
+    test.is_true(c, rep, "the sink overflowed", sink.overflowed(s))
+    test.eq_usize(c, rep, "and knows exactly how much it dropped", sink.lost(s), 6)
+    test.eq_usize(c, rep, "keeping only what fit", sink.written(s), 16)
+
+    // What the UNGUARDED recipe would do — every answer truthful, the record corrupt.
+    var w: file.Writer = file.create_path(sys, p)
+    let n: usize = file.write_from(w, sbuf[0 .. sink.written(s)])
+    test.eq_usize(c, rep, "write_from truthfully reports the truncated prefix", n, 16)
+    let r = file.finish(w)
+    test.is_false(c, rep, "and finish truthfully reports the stream was fine", is_err(r))
+
+    var gbuf: *mut u8 = alloc(u8, 64)
+    var g: []u8 = slice(u8, gbuf, 64)
+    let got: usize = read_back(sys, p, g)
+    // The point of the whole test: a corrupt record, and not one oracle lied.
+    test.eq_str(c, rep, "the file holds a TRUNCATED record", from_utf8(g[0 .. got]), "user=alice balan")
+
+    free_ptr(gbuf)
+    free_ptr(sraw)
+    fs.remove(p)
+    free_ptr(praw)
     let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     return ok
