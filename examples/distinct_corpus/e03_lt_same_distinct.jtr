@@ -1,0 +1,8 @@
+// e03 — `<` between two values of the SAME distinct-over-integer.
+distinct Id = i64
+fn main() -> i32 {
+    let a: Id = 1 as Id
+    let a2: Id = 2 as Id
+    print_bool(a < a2)
+    return 0
+}

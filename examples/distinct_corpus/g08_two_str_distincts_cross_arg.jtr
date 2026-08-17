@@ -1,0 +1,9 @@
+// g08 — two DIFFERENT distincts over `str` at an argument boundary.
+distinct P = str
+distinct Q = str
+fn takes_p(p: P) -> usize { return (p as str).len }
+fn main() -> i32 {
+    let q: Q = "hello" as Q
+    print_int(takes_p(q) as i32)
+    return 0
+}

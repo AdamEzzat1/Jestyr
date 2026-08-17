@@ -1,0 +1,9 @@
+// a07 — laundering shape 6: `a + (b + (0 * 0))`.
+distinct Id = i64
+distinct Acct = i64
+fn main() -> i32 {
+    let a: Id = 3 as Id
+    let b: Acct = 2 as Acct
+    print_int((a + (b + (0 * 0))) as i32)
+    return 0
+}

@@ -1,0 +1,7 @@
+// d10 — `count_codepoints` on a distinct-over-str.
+distinct P = str
+fn main() -> i32 {
+    let p: P = "hello" as P
+    print_int(count_codepoints(p) as i32)
+    return 0
+}

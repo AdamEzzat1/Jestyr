@@ -1,0 +1,8 @@
+// f09 — a distinct over the C-interop text type.
+distinct CHandle = cstr
+fn main() -> i32 {
+    let s: str = "hi"
+    let h: CHandle = s.cstr as CHandle
+    print_int(1)
+    return 0
+}

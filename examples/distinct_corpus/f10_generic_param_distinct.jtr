@@ -1,0 +1,10 @@
+// f10 — a distinct type as a generic argument: does monomorphisation give it a
+// symbol separate from its base's instance?
+distinct Id = i64
+fn tag[T](read x: T) -> i32 { return 1 }
+fn main() -> i32 {
+    let a: Id = 5 as Id
+    let n: i64 = 5
+    print_int(tag(a) + tag(n))
+    return 0
+}

@@ -1,0 +1,7 @@
+// d11 — `is_utf8` on a distinct-over-str.
+distinct P = str
+fn main() -> i32 {
+    let p: P = "hello" as P
+    print_bool(is_utf8(p))
+    return 0
+}

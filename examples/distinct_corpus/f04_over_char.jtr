@@ -1,0 +1,7 @@
+// f04 — comparison on a distinct-over-char.
+distinct Ch = char
+fn main() -> i32 {
+    let c: Ch = 'a' as Ch
+    print_bool((c as char) == 'a')
+    return 0
+}

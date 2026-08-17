@@ -1,0 +1,8 @@
+// g05 — CONTROL for g01 over a scalar base: casting an `i64` VARIABLE.
+distinct Id = i64
+fn main() -> i32 {
+    let n: i64 = 5
+    let a: Id = n as Id
+    print_int(a as i32)
+    return 0
+}

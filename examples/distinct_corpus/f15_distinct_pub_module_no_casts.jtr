@@ -1,0 +1,10 @@
+// f15 — the SAME shape with the casts REMOVED: what a design that inherits the
+// base's operations would have to accept.
+pub distinct Path = str
+pub fn path_of(s: str) -> Path { return s }
+pub fn path_len(p: Path) -> usize { return p.len }
+fn main() -> i32 {
+    let p: Path = path_of("/tmp/x")
+    print_int(path_len(p) as i32)
+    return 0
+}

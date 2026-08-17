@@ -1,0 +1,8 @@
+// f13 — a slice whose element type is a distinct.
+distinct Id = i64
+fn main() -> i32 {
+    var arr: [3]Id = [1 as Id, 2 as Id, 3 as Id]
+    let s: []Id = slice(Id, arr.ptr, 3)
+    print_int(s[1] as i32)
+    return 0
+}

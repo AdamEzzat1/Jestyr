@@ -1,0 +1,10 @@
+// g01 — THE ESCAPE HATCH ITSELF: casting a `str` VARIABLE (not a literal) into a
+// distinct-over-str. This is the spelling every one of the 132 `Path` cast sites
+// would use.
+distinct P = str
+fn main() -> i32 {
+    let s: str = "hello"
+    let p: P = s as P
+    print_str(p as str)
+    return 0
+}

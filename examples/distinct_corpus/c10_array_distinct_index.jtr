@@ -1,0 +1,7 @@
+// c10 — indexing a distinct-over-fixed-array.
+distinct Trip = [3]i64
+fn main() -> i32 {
+    let t: Trip = [1, 2, 3] as Trip
+    print_int(t[1] as i32)
+    return 0
+}

@@ -1,0 +1,9 @@
+// c14 — a distinct over a struct whose field is itself a distinct.
+distinct Id = i64
+struct Rec { id: Id }
+distinct W = Rec
+fn main() -> i32 {
+    let w: W = Rec { id: 5 as Id } as W
+    print_int(w.id as i32)
+    return 0
+}

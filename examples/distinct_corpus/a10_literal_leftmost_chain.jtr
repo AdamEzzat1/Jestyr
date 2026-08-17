@@ -1,0 +1,10 @@
+// a10 — literal LEFTMOST: `(1 + a) + b`. The left operand of every binary is a
+// primitive, so a left-operand-only operator rule never sees a distinct.
+distinct Id = i64
+distinct Acct = i64
+fn main() -> i32 {
+    let a: Id = 1 as Id
+    let b: Acct = 2 as Acct
+    print_int(((1 + a) + b) as i32)
+    return 0
+}

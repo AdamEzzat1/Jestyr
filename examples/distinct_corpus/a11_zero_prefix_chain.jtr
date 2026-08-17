@@ -1,0 +1,9 @@
+// a11 — `0 + a + b` (left-assoc, so the leftmost operand is the literal).
+distinct Id = i64
+distinct Acct = i64
+fn main() -> i32 {
+    let a: Id = 1 as Id
+    let b: Acct = 2 as Acct
+    print_int((0 + a + b) as i32)
+    return 0
+}

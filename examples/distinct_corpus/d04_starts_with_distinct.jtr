@@ -1,0 +1,7 @@
+// d04 — `starts_with` on a distinct-over-str.
+distinct P = str
+fn main() -> i32 {
+    let p: P = "hello" as P
+    print_bool(starts_with(p, "he"))
+    return 0
+}

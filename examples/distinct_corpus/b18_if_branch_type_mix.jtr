@@ -1,0 +1,10 @@
+// b18 — the two arms of an `if` expression disagree on id space.
+distinct Id = i64
+distinct Acct = i64
+fn main() -> i32 {
+    let a: Id = 1 as Id
+    let b: Acct = 2 as Acct
+    let c: Id = if true { a } else { b }
+    print_int(c as i32)
+    return 0
+}

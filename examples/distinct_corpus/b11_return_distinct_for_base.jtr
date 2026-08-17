@@ -1,0 +1,7 @@
+// b11 — return position: a distinct where the BASE is declared.
+distinct Id = i64
+fn ret_i64() -> i64 { let a: Id = 5 as Id return a }
+fn main() -> i32 {
+    print_int(ret_i64() as i32)
+    return 0
+}

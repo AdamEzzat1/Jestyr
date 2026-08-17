@@ -1,0 +1,8 @@
+// c11 — using a distinct-over-integer AS an index into a base-typed array.
+distinct Id = i64
+fn main() -> i32 {
+    let arr: [3]i64 = [10, 20, 30]
+    let i: Id = 1 as Id
+    print_int(arr[i] as i32)
+    return 0
+}

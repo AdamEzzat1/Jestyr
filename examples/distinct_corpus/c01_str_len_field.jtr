@@ -1,0 +1,7 @@
+// c01 — `.len` on a distinct-over-str: the property `Path` most needs.
+distinct P = str
+fn main() -> i32 {
+    let p: P = "hello" as P
+    print_int(p.len as i32)
+    return 0
+}

@@ -1,0 +1,8 @@
+// a08 — laundering shape 7: `a + (n + 1)`, `n` a bare base value.
+distinct Id = i64
+fn main() -> i32 {
+    let a: Id = 3 as Id
+    let n: i64 = 2
+    print_int((a + (n + 1)) as i32)
+    return 0
+}

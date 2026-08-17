@@ -1,0 +1,9 @@
+// a30 — `+` over two distincts-over-str (if `+` means anything for text).
+distinct P = str
+distinct Q = str
+fn main() -> i32 {
+    let p: P = "a" as P
+    let q: Q = "b" as Q
+    print_str(p + q)
+    return 0
+}

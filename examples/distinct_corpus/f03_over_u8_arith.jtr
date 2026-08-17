@@ -1,0 +1,7 @@
+// f03 — arithmetic on a distinct-over-u8.
+distinct Byte = u8
+fn main() -> i32 {
+    let b: Byte = 3 as Byte
+    print_int((b + 1) as i32)
+    return 0
+}

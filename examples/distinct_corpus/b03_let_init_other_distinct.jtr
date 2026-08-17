@@ -1,0 +1,9 @@
+// b03 — `let` initializer: the WRONG distinct type.
+distinct Id = i64
+distinct Acct = i64
+fn main() -> i32 {
+    let b: Acct = 2 as Acct
+    let x: Id = b
+    print_int(x as i32)
+    return 0
+}

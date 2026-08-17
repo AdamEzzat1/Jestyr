@@ -1,0 +1,8 @@
+// e05 — POSITIVE CONTROL for e01: the same comparison through the base.
+distinct Id = i64
+fn main() -> i32 {
+    let a: Id = 1 as Id
+    let a2: Id = 1 as Id
+    print_bool((a as i64) == (a2 as i64))
+    return 0
+}

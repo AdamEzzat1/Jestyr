@@ -1,0 +1,10 @@
+// e08 — POSITIVE CONTROL: a distinct with a hand-written `impl Eq` — does the
+// operator-trait path even accept an impl on a distinct type?
+distinct Id = i64
+impl Eq for Id { fn eq(self, other: Id) -> bool { return (self as i64) == (other as i64) } }
+fn main() -> i32 {
+    let a: Id = 1 as Id
+    let a2: Id = 1 as Id
+    print_bool(a == a2)
+    return 0
+}

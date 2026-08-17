@@ -1,0 +1,7 @@
+// a15 — unary minus on a distinct.
+distinct Id = i64
+fn main() -> i32 {
+    let a: Id = 1 as Id
+    print_int((-a) as i32)
+    return 0
+}

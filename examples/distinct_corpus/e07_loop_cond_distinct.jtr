@@ -1,0 +1,8 @@
+// e07 — a distinct-over-integer as a loop condition operand.
+distinct Id = i64
+fn main() -> i32 {
+    var a: Id = 0 as Id
+    for a < 3 as Id { a += 1 as Id }
+    print_int(a as i32)
+    return 0
+}

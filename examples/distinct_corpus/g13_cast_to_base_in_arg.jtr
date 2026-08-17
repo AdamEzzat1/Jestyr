@@ -1,0 +1,8 @@
+// g13 — the expression-position cast at an ARGUMENT boundary: `f(p as str)`.
+distinct P = str
+fn width(s: str) -> usize { return s.len }
+fn main() -> i32 {
+    let p: P = "hello" as P
+    print_int(width(p as str) as i32)
+    return 0
+}

@@ -1,0 +1,7 @@
+// c12 — single-byte indexing of a distinct-over-str.
+distinct P = str
+fn main() -> i32 {
+    let p: P = "hello" as P
+    print_int(p[0] as i32)
+    return 0
+}

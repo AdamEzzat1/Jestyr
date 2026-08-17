@@ -1,0 +1,7 @@
+// g04 — CONTROL for g01: the same cast applied to a string LITERAL.
+distinct P = str
+fn main() -> i32 {
+    let p: P = "hello" as P
+    print_str(p as str)
+    return 0
+}

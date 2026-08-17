@@ -1,0 +1,9 @@
+// a26 — inequality across two id spaces.
+distinct Id = i64
+distinct Acct = i64
+fn main() -> i32 {
+    let a: Id = 1 as Id
+    let b: Acct = 2 as Acct
+    print_bool(a != b)
+    return 0
+}

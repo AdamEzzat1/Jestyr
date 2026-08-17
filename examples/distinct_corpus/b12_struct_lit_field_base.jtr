@@ -1,0 +1,8 @@
+// b12 — struct-literal field: a bare literal into a distinct-typed field.
+distinct Id = i64
+struct Rec { id: Id }
+fn main() -> i32 {
+    let r: Rec = Rec { id: 5 }
+    print_int(r.id as i32)
+    return 0
+}

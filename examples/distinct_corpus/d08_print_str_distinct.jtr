@@ -1,0 +1,7 @@
+// d08 — a distinct-over-str straight into `print_str`.
+distinct P = str
+fn main() -> i32 {
+    let p: P = "hello" as P
+    print_str(p)
+    return 0
+}

@@ -1,0 +1,7 @@
+// b15 — array literal of a distinct element type, filled with bare literals.
+distinct Id = i64
+fn main() -> i32 {
+    let ids: [3]Id = [1, 2, 3]
+    print_int(ids[0] as i32)
+    return 0
+}

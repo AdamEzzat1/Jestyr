@@ -1,0 +1,9 @@
+// f05 — a distinct over the OWNED text type (`String`) — the shape `PathBuf`
+// would take.
+distinct PB = String
+fn main() -> i32 {
+    let s: String = string_new()
+    let pb: PB = s as PB
+    print_int(pb.len as i32)
+    return 0
+}

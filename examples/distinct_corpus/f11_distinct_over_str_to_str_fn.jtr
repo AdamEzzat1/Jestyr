@@ -1,0 +1,9 @@
+// f11 — THE `Path` CASE: a distinct-over-str passed to a user fn taking `str`.
+// This is the cast site the 132-site count is made of.
+distinct P = str
+fn width(s: str) -> usize { return s.len }
+fn main() -> i32 {
+    let p: P = "hello" as P
+    print_int(width(p) as i32)
+    return 0
+}

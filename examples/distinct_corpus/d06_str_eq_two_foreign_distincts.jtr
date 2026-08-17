@@ -1,0 +1,10 @@
+// d06 — `str_eq` given TWO DIFFERENT distincts over str: the builtin launders
+// the id spaces if it does not check.
+distinct P = str
+distinct Q = str
+fn main() -> i32 {
+    let p: P = "hi" as P
+    let q: Q = "hi" as Q
+    print_bool(str_eq(p, q))
+    return 0
+}

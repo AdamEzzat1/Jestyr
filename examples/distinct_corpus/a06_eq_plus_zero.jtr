@@ -1,0 +1,9 @@
+// a06 — laundering shape 5: `a == (b + 0)`.
+distinct Id = i64
+distinct Acct = i64
+fn main() -> i32 {
+    let a: Id = 3 as Id
+    let b: Acct = 3 as Acct
+    print_bool(a == (b + 0))
+    return 0
+}

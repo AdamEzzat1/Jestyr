@@ -1,0 +1,11 @@
+// b14 — writing the WRONG distinct through a struct field.
+distinct Id = i64
+distinct Acct = i64
+struct Rec { id: Id }
+fn main() -> i32 {
+    var r: Rec = Rec { id: 5 as Id }
+    let b: Acct = 2 as Acct
+    r.id = b
+    print_int(r.id as i32)
+    return 0
+}

@@ -1,0 +1,9 @@
+// b08 — argument position: a DIFFERENT distinct over the same base.
+distinct Id = i64
+distinct Acct = i64
+fn takes_id(x: Id) -> i64 { return x as i64 }
+fn main() -> i32 {
+    let b: Acct = 2 as Acct
+    print_int(takes_id(b) as i32)
+    return 0
+}

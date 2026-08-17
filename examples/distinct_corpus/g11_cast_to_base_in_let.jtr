@@ -1,0 +1,9 @@
+// g11 — ISOLATION for g07: the same `p as str` in a `let` initializer instead of
+// inside an expression. Same cast, different position.
+distinct P = str
+fn main() -> i32 {
+    let p: P = "hello" as P
+    let s: str = p as str
+    print_int(s.len as i32)
+    return 0
+}

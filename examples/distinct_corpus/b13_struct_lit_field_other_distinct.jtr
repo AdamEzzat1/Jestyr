@@ -1,0 +1,10 @@
+// b13 — struct-literal field: the WRONG distinct over the same base.
+distinct Id = i64
+distinct Acct = i64
+struct Rec { id: Id }
+fn main() -> i32 {
+    let b: Acct = 2 as Acct
+    let r: Rec = Rec { id: b }
+    print_int(r.id as i32)
+    return 0
+}

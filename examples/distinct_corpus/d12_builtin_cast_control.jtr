@@ -1,0 +1,8 @@
+// d12 — POSITIVE CONTROL for d01/d02: the same builtin calls with `as str`.
+distinct P = str
+fn main() -> i32 {
+    let p: P = "hello" as P
+    print_int(find(p as str, "l") as i32)
+    print_str(substr(p as str, 1, 3))
+    return 0
+}

@@ -1,0 +1,7 @@
+// a19 — `1 + a`: untyped literal left, distinct right.
+distinct Id = i64
+fn main() -> i32 {
+    let a: Id = 1 as Id
+    print_int((1 + a) as i32)
+    return 0
+}

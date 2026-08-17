@@ -1,0 +1,9 @@
+// b17 — inference through an unannotated binding, then a cross-space use.
+distinct Id = i64
+distinct Acct = i64
+fn takes_id(x: Id) -> i64 { return x as i64 }
+fn main() -> i32 {
+    let b = 2 as Acct
+    print_int(takes_id(b) as i32)
+    return 0
+}

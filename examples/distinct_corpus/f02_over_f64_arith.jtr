@@ -1,0 +1,7 @@
+// f02 — arithmetic on a distinct-over-f64.
+distinct Metres = f64
+fn main() -> i32 {
+    let m: Metres = 1.5 as Metres
+    print_float((m + 1.0) as f64)
+    return 0
+}

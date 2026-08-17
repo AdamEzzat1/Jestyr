@@ -1,0 +1,7 @@
+// d09 — a distinct-over-i32 straight into `print_int`.
+distinct Id = i32
+fn main() -> i32 {
+    let a: Id = 7 as Id
+    print_int(a)
+    return 0
+}

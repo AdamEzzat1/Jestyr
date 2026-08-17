@@ -1,0 +1,8 @@
+// f06 — a distinct over a distinct.
+distinct Id = i64
+distinct Key = Id
+fn main() -> i32 {
+    let k: Key = (1 as Id) as Key
+    print_int(k as i32)
+    return 0
+}

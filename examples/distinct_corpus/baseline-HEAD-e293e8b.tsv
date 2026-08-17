@@ -1,0 +1,111 @@
+a01_add_two_distincts	TYPECK_REJECT	error: type `Id` does not implement `Add` (the `+` operator)
+a02_add_paren_right_literal	TYPECK_REJECT	error: type `Acct` does not implement `Add` (the `+` operator)
+a03_add_left_paren_literal	TYPECK_REJECT	error: type `Id` does not implement `Add` (the `+` operator)
+a04_mul_nested_literal	TYPECK_REJECT	error: type `Acct` does not implement `Mul` (the `*` operator)
+a05_sub_zero_minus	TYPECK_REJECT	error: type `Id` does not implement `Sub` (the `-` operator)
+a06_eq_plus_zero	TYPECK_REJECT	error: type `Acct` does not implement `Add` (the `+` operator)
+a07_add_deep_zero	TYPECK_REJECT	error: type `Acct` does not implement `Add` (the `+` operator)
+a08_add_base_plus_one	TYPECK_REJECT	error: type `Id` does not implement `Add` (the `+` operator)
+a09_assign_add_launder	TYPECK_REJECT	error: type `Acct` does not implement `Add` (the `+` operator)
+a10_literal_leftmost_chain	RUN_OK	4
+a11_zero_prefix_chain	RUN_OK	3
+a12_zero_prefix_eq	RUN_OK	true
+a13_compound_assign_cross	RUN_OK	3
+a14_compound_assign_base	RUN_OK	3
+a15_unary_minus	RUN_OK	-1
+a16_add_distinct_and_base	TYPECK_REJECT	error: type `Id` does not implement `Add` (the `+` operator)
+a17_add_base_and_distinct	RUN_OK	3
+a18_add_literal_right	TYPECK_REJECT	error: type `Id` does not implement `Add` (the `+` operator)
+a19_add_literal_left	RUN_OK	2
+a20_nested_parens_only	TYPECK_REJECT	error: type `Id` does not implement `Add` (the `+` operator)
+a21_div_cross	TYPECK_REJECT	error: type `Id` does not implement `Div` (the `/` operator)
+a22_rem_cross	RUN_OK	1
+a23_bitand_cross	RUN_OK	2
+a24_shl_cross	RUN_OK	4
+a25_lt_cross	TYPECK_REJECT	error: type `Id` does not implement `Ord` (the `<` operator)
+a26_ne_cross	TYPECK_REJECT	error: type `Id` does not implement `Eq` (the `!=` operator)
+a27_add_same_distinct	TYPECK_REJECT	error: type `Id` does not implement `Add` (the `+` operator)
+a28_cast_then_add_control	RUN_OK	3
+a29_bool_cond_cross	RUN_OK	2
+a30_str_concat_cross	TYPECK_REJECT	error: type `P` does not implement `Add` (the `+` operator)
+b01_let_init_base_literal	TYPECK_REJECT	error: expected `Id`, found `i32` — `distinct` types need an explicit `as`
+b02_let_init_distinct_to_base	TYPECK_REJECT	error: expected `i64`, found `Id` — `distinct` types need an explicit `as`
+b03_let_init_other_distinct	TYPECK_REJECT	error: expected `Id`, found `Acct` — `distinct` types need an explicit `as`
+b04_assign_stmt_other_distinct	RUN_OK	2
+b05_assign_stmt_base_literal	RUN_OK	7
+b06_assign_stmt_base_var	RUN_OK	9
+b07_arg_base_for_distinct	TYPECK_REJECT	error: argument `x` of `takes_id`: expected `Id`, found `i64` — `distinct` types need an explicit `as`
+b08_arg_other_distinct	TYPECK_REJECT	error: argument `x` of `takes_id`: expected `Id`, found `Acct` — `distinct` types need an explicit `as`
+b09_arg_distinct_for_base	TYPECK_REJECT	error: argument `x` of `takes_i64`: expected `i64`, found `Id` — `distinct` types need an explicit `as`
+b10_return_base_for_distinct	TYPECK_REJECT	error: return: expected `Id`, found `i32` — `distinct` types need an explicit `as`
+b11_return_distinct_for_base	TYPECK_REJECT	error: return: expected `i64`, found `Id` — `distinct` types need an explicit `as`
+b12_struct_lit_field_base	RUN_OK	5
+b13_struct_lit_field_other_distinct	RUN_OK	2
+b14_struct_field_assign_other	RUN_OK	2
+b15_array_lit_elem_base	RUN_OK	1
+b16_positions_all_cast_control	RUN_OK	7 5
+b17_var_init_no_annotation	TYPECK_REJECT	error: argument `x` of `takes_id`: expected `Id`, found `Acct` — `distinct` types need an explicit `as`
+b18_if_branch_type_mix	RUN_OK	1
+c01_str_len_field	GCC_REJECT	c01_str_len_field.jtr:5:39: error: 'Jestyr_P' {aka 'struct <anonymous>'} has no member named 'j_len'; did you mean 'len'?
+c02_str_ptr_field	GCC_REJECT	c02_str_ptr_field.jtr:5:27: error: 'Jestyr_P' {aka 'struct <anonymous>'} has no member named 'j_ptr'; did you mean 'ptr'?
+c03_str_range_slice	CGEN_REJECT	error: the C backend does not support ranges yet
+c04_str_range_slice_control	RUN_OK	he
+c05_struct_distinct_field_read	RUN_OK	3
+c06_struct_distinct_field_write	RUN_OK	9
+c07_slice_distinct_len	GCC_REJECT	jestyr_c07_slice_distinct_len.c:92:9: error: unknown type name 'JestyrSlice_i64'
+c08_slice_distinct_index	GCC_REJECT	jestyr_c08_slice_distinct_index.c:92:9: error: unknown type name 'JestyrSlice_i64'
+c09_array_distinct_len	GCC_REJECT	jestyr_c09_array_distinct_len.c:92:9: error: unknown type name 'JestyrArr_i64_3'
+c10_array_distinct_index	GCC_REJECT	jestyr_c10_array_distinct_index.c:92:9: error: unknown type name 'JestyrArr_i64_3'
+c11_distinct_as_index	RUN_OK	20
+c12_str_byte_index	GCC_REJECT	c12_str_byte_index.jtr:5:40: error: subscripted value is neither array nor pointer nor vector
+c13_struct_distinct_method	GCC_REJECT	c13_struct_distinct_method.jtr:8:28: error: 'Jestyr_W' {aka 'struct Jestyr_Pt'} has no member named 'j_total'
+c14_distinct_field_of_distinct	RUN_OK	5
+d01_find_distinct	RUN_OK	2
+d02_substr_distinct	RUN_OK	el
+d03_trim_distinct	RUN_OK	hi
+d04_starts_with_distinct	RUN_OK	true
+d05_contains_distinct	RUN_OK	true
+d06_str_eq_two_foreign_distincts	RUN_OK	true
+d07_str_eq_same_distinct	RUN_OK	true
+d08_print_str_distinct	RUN_OK	hello
+d09_print_int_distinct	RUN_OK	7
+d10_count_codepoints_distinct	RUN_OK	5
+d11_from_utf8_distinct_bytes	RUN_OK	true
+d12_builtin_cast_control	RUN_OK	2 el
+e01_eq_same_distinct	TYPECK_REJECT	error: type `Id` does not implement `Eq` (the `==` operator)
+e02_ne_same_distinct	TYPECK_REJECT	error: type `Id` does not implement `Eq` (the `!=` operator)
+e03_lt_same_distinct	TYPECK_REJECT	error: type `Id` does not implement `Ord` (the `<` operator)
+e04_eq_same_distinct_str	TYPECK_REJECT	error: type `P` does not implement `Eq` (the `==` operator)
+e05_eq_via_cast_control	RUN_OK	true
+e06_match_on_distinct	CGEN_REJECT	error: the C backend only supports `match` on enum values
+e07_loop_cond_distinct	TYPECK_REJECT	error: type `Id` does not implement `Ord` (the `<` operator)
+e08_eq_impl_control	RUN_OK	true
+f01_over_bool_if	RUN_OK	1
+f02_over_f64_arith	TYPECK_REJECT	error: type `Metres` does not implement `Add` (the `+` operator)
+f03_over_u8_arith	TYPECK_REJECT	error: type `Byte` does not implement `Add` (the `+` operator)
+f04_over_char	RUN_OK	true
+f05_over_string_owned	GCC_REJECT	f05_over_string_owned.jtr:7:40: error: 'Jestyr_PB' {aka 'struct <anonymous>'} has no member named 'j_len'; did you mean 'len'?
+f06_over_distinct_chained	RUN_OK	1
+f07_over_enum_cast_match	GCC_REJECT	f07_over_enum_cast_match.jtr:5:5: error: conversion to non-scalar type requested
+f08_over_enum_direct_match	CGEN_REJECT	error: the C backend only supports `match` on enum values
+f09_over_cstr	RUN_OK	1
+f10_generic_param_distinct	RUN_OK	2
+f11_distinct_over_str_to_str_fn	TYPECK_REJECT	error: argument `s` of `width`: expected `str`, found `P` — `distinct` types need an explicit `as`
+f12_str_fn_returns_base_into_distinct	TYPECK_REJECT	error: expected `P`, found `str` — `distinct` types need an explicit `as`
+f13_distinct_in_slice_elem	GCC_REJECT	f13_distinct_in_slice_elem.jtr:5:49: error: 'JestyrArr_Id_3' {aka 'struct <anonymous>'} has no member named 'j_ptr'
+f14_distinct_pub_module_shape	GCC_REJECT	f14_distinct_pub_module_shape.jtr:6:5: error: conversion to non-scalar type requested
+f15_distinct_pub_module_no_casts	TYPECK_REJECT	error: return: expected `Path`, found `str` — `distinct` types need an explicit `as`
+g01_cast_str_var_to_distinct	RUN_OK	hello
+g02_cast_distinct_str_to_base	RUN_OK	hello
+g03_cast_str_in_return	RUN_OK	hello
+g04_cast_str_literal_to_distinct	RUN_OK	hello
+g05_cast_i64_var_to_distinct	RUN_OK	5
+g06_cast_struct_var_to_distinct	RUN_OK	3
+g07_distinct_str_len_via_cast	GCC_REJECT	g07_distinct_str_len_via_cast.jtr:5:5: error: conversion to non-scalar type requested
+g08_two_str_distincts_cross_arg	TYPECK_REJECT	error: argument `p` of `takes_p`: expected `P`, found `Q` — `distinct` types need an explicit `as`
+g09_distinct_arg_positive	GCC_REJECT	g09_distinct_arg_positive.jtr:4:5: error: conversion to non-scalar type requested
+g10_distinct_str_eq_base	RUN_OK	true
+g11_cast_to_base_in_let	RUN_OK	5
+g12_cast_struct_to_base_in_expr	GCC_REJECT	g12_cast_struct_to_base_in_expr.jtr:6:5: error: conversion to non-scalar type requested
+g13_cast_to_base_in_arg	RUN_OK	5
+g14_cast_str_to_str_in_expr_control	GCC_REJECT	g14_cast_str_to_str_in_expr_control.jtr:6:5: error: conversion to non-scalar type requested

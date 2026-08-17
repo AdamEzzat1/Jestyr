@@ -1,0 +1,7 @@
+// b01 — `let` initializer: bare literal into a distinct binding.
+distinct Id = i64
+fn main() -> i32 {
+    var x: Id = 5
+    print_int(x as i32)
+    return 0
+}

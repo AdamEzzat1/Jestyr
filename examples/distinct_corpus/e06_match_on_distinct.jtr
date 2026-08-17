@@ -1,0 +1,10 @@
+// e06 — `match` scrutinising a distinct-over-integer against base literals.
+distinct Id = i64
+fn main() -> i32 {
+    let a: Id = 1 as Id
+    match a {
+        1 => print_int(10),
+        _ => print_int(20),
+    }
+    return 0
+}

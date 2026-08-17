@@ -1,0 +1,8 @@
+// f12 — THE OTHER HALF: a `str`-returning helper's result bound to a distinct.
+distinct P = str
+fn main() -> i32 {
+    let p: P = "hello/world" as P
+    let tail: P = substr(p as str, 6, 11)
+    print_str(tail as str)
+    return 0
+}

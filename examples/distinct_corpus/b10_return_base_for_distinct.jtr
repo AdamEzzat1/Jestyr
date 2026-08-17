@@ -1,0 +1,7 @@
+// b10 — return position: bare literal where a distinct is declared.
+distinct Id = i64
+fn ret_id() -> Id { return 5 }
+fn main() -> i32 {
+    print_int(ret_id() as i32)
+    return 0
+}

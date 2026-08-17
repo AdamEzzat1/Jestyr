@@ -1,0 +1,11 @@
+// f07 — a distinct over an enum, matched after an explicit cast back.
+enum Colour { red, green }
+distinct Tint = Colour
+fn main() -> i32 {
+    let t: Tint = red as Tint
+    match t as Colour {
+        red => print_int(1),
+        green => print_int(2),
+    }
+    return 0
+}

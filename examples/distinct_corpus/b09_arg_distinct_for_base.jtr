@@ -1,0 +1,8 @@
+// b09 — argument position: a distinct where the BASE is declared.
+distinct Id = i64
+fn takes_i64(x: i64) -> i64 { return x }
+fn main() -> i32 {
+    let a: Id = 5 as Id
+    print_int(takes_i64(a) as i32)
+    return 0
+}

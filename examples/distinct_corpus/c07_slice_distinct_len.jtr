@@ -1,0 +1,8 @@
+// c07 — `.len` on a distinct-over-slice.
+distinct Buf = []i64
+fn main() -> i32 {
+    let arr: [3]i64 = [1, 2, 3]
+    let b: Buf = slice(i64, arr.ptr, 3) as Buf
+    print_int(b.len as i32)
+    return 0
+}

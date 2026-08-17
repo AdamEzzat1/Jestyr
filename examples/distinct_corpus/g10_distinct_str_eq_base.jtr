@@ -1,0 +1,8 @@
+// g10 — `str_eq` mixing a distinct-over-str with a bare `str`.
+distinct P = str
+fn main() -> i32 {
+    let p: P = "hi" as P
+    let s: str = "hi"
+    print_bool(str_eq(p, s))
+    return 0
+}

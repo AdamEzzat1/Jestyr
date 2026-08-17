@@ -1,0 +1,9 @@
+// a23 — bitwise AND across two id spaces.
+distinct Id = i64
+distinct Acct = i64
+fn main() -> i32 {
+    let a: Id = 6 as Id
+    let b: Acct = 3 as Acct
+    print_int((a & b) as i32)
+    return 0
+}

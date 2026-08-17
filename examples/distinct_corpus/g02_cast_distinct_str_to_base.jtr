@@ -1,0 +1,8 @@
+// g02 — the other direction: a distinct-over-str cast back to `str`.
+distinct P = str
+fn main() -> i32 {
+    let p: P = "hello" as P
+    let s: str = p as str
+    print_str(s)
+    return 0
+}

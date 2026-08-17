@@ -1,0 +1,10 @@
+// a09 — laundering shape 8: `a = a + (b + 1)`.
+distinct Id = i64
+distinct Acct = i64
+fn main() -> i32 {
+    var a: Id = 3 as Id
+    let b: Acct = 2 as Acct
+    a = a + (b + 1)
+    print_int(a as i32)
+    return 0
+}

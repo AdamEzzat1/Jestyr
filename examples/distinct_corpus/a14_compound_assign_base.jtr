@@ -1,0 +1,9 @@
+// a14 — compound assignment with the bare base: `a += n`.
+distinct Id = i64
+fn main() -> i32 {
+    var a: Id = 1 as Id
+    let n: i64 = 2
+    a += n
+    print_int(a as i32)
+    return 0
+}

@@ -1,0 +1,8 @@
+// b07 — argument position: bare base where a distinct is declared.
+distinct Id = i64
+fn takes_id(x: Id) -> i64 { return x as i64 }
+fn main() -> i32 {
+    let n: i64 = 5
+    print_int(takes_id(n) as i32)
+    return 0
+}

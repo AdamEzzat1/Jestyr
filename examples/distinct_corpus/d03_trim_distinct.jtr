@@ -1,0 +1,7 @@
+// d03 — `trim` on a distinct-over-str.
+distinct P = str
+fn main() -> i32 {
+    let p: P = "  hi  " as P
+    print_str(trim(p))
+    return 0
+}

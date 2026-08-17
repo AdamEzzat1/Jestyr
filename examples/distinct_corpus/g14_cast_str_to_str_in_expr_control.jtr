@@ -1,0 +1,8 @@
+// g14 — CONTROL for g07/g12: is `(<expr> as <non-scalar>).field` broken for the
+// BASE type on its own, with no `distinct` anywhere? This separates "distinct
+// casts are broken" from "casting to a struct-repr type is broken".
+fn main() -> i32 {
+    let s: str = "hello"
+    print_int((s as str).len as i32)
+    return 0
+}

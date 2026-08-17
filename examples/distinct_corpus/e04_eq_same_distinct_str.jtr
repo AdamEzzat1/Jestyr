@@ -1,0 +1,8 @@
+// e04 — `==` between two values of the SAME distinct-over-str.
+distinct P = str
+fn main() -> i32 {
+    let p: P = "hi" as P
+    let q: P = "hi" as P
+    print_bool(p == q)
+    return 0
+}

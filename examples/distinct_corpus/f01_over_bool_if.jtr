@@ -1,0 +1,7 @@
+// f01 — a distinct-over-bool used directly as an `if` condition.
+distinct Flag = bool
+fn main() -> i32 {
+    let f: Flag = true as Flag
+    if f { print_int(1) } else { print_int(0) }
+    return 0
+}

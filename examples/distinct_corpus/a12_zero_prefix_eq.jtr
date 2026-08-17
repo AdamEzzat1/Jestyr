@@ -1,0 +1,9 @@
+// a12 — `0 + a == 0 + b`: cross-space EQUALITY laundered by a zero prefix.
+distinct Id = i64
+distinct Acct = i64
+fn main() -> i32 {
+    let a: Id = 1 as Id
+    let b: Acct = 1 as Acct
+    print_bool(0 + a == 0 + b)
+    return 0
+}

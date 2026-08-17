@@ -1,0 +1,6 @@
+// c04 — POSITIVE CONTROL for c03: the same slice on the bare base.
+fn main() -> i32 {
+    let p: str = "hello"
+    print_str(p[0..2])
+    return 0
+}

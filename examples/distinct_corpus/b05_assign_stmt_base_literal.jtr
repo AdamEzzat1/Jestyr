@@ -1,0 +1,8 @@
+// b05 — assignment statement: a bare literal into a distinct binding.
+distinct Id = i64
+fn main() -> i32 {
+    var a: Id = 1 as Id
+    a = 7
+    print_int(a as i32)
+    return 0
+}

@@ -1,0 +1,9 @@
+// a27 — addition of two values of the SAME distinct type (the operation a typed
+// `Path`/`Id` actually wants).
+distinct Id = i64
+fn main() -> i32 {
+    let a: Id = 1 as Id
+    let a2: Id = 2 as Id
+    print_int((a + a2) as i32)
+    return 0
+}

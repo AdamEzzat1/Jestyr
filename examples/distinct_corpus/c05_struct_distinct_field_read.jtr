@@ -1,0 +1,8 @@
+// c05 — field read through a distinct-over-struct.
+struct Pt { x: i32, y: i32 }
+distinct W = Pt
+fn main() -> i32 {
+    let w: W = Pt { x: 3, y: 4 } as W
+    print_int(w.x)
+    return 0
+}

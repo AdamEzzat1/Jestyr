@@ -1,0 +1,9 @@
+// b06 — assignment statement: a bare base VARIABLE into a distinct binding.
+distinct Id = i64
+fn main() -> i32 {
+    var a: Id = 1 as Id
+    let n: i64 = 9
+    a = n
+    print_int(a as i32)
+    return 0
+}

@@ -1,0 +1,7 @@
+// g07 — POSITIVE CONTROL for c01: `.len` reached through an explicit cast.
+distinct P = str
+fn main() -> i32 {
+    let p: P = "hello" as P
+    print_int((p as str).len as i32)
+    return 0
+}

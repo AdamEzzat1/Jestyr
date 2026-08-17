@@ -1,0 +1,8 @@
+// b02 — `let` initializer: a distinct value into a base-typed binding.
+distinct Id = i64
+fn main() -> i32 {
+    let a: Id = 5 as Id
+    let y: i64 = a
+    print_int(y as i32)
+    return 0
+}

@@ -1,0 +1,10 @@
+// f14 — the exact declaration shape `std/path` would take: a `pub distinct`
+// over `str` with a constructor and an accessor, all inside one file.
+pub distinct Path = str
+pub fn path_of(s: str) -> Path { return s as Path }
+pub fn path_len(p: Path) -> usize { return (p as str).len }
+fn main() -> i32 {
+    let p: Path = path_of("/tmp/x")
+    print_int(path_len(p) as i32)
+    return 0
+}

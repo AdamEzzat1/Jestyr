@@ -1,0 +1,7 @@
+// g03 — the cast in return position: `fn of(s: str) -> P { return s as P }`.
+distinct P = str
+fn of(s: str) -> P { return s as P }
+fn main() -> i32 {
+    print_str(of("hello") as str)
+    return 0
+}

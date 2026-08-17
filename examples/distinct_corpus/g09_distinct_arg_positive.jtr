@@ -1,0 +1,8 @@
+// g09 — POSITIVE CONTROL for g08: the matching distinct at the boundary.
+distinct P = str
+fn takes_p(p: P) -> usize { return (p as str).len }
+fn main() -> i32 {
+    let p: P = "hello" as P
+    print_int(takes_p(p) as i32)
+    return 0
+}

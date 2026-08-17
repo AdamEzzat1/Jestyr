@@ -1,0 +1,8 @@
+// a17 — bare base on the LEFT, distinct on the right: `n + a`.
+distinct Id = i64
+fn main() -> i32 {
+    let a: Id = 1 as Id
+    let n: i64 = 2
+    print_int((n + a) as i32)
+    return 0
+}

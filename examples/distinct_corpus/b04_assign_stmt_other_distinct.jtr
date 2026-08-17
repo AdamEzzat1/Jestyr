@@ -1,0 +1,10 @@
+// b04 — ASSIGNMENT STATEMENT (not an initializer): the wrong distinct type.
+distinct Id = i64
+distinct Acct = i64
+fn main() -> i32 {
+    var a: Id = 1 as Id
+    let b: Acct = 2 as Acct
+    a = b
+    print_int(a as i32)
+    return 0
+}

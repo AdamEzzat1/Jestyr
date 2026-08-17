@@ -1,0 +1,7 @@
+// d05 — `contains` on a distinct-over-str.
+distinct P = str
+fn main() -> i32 {
+    let p: P = "hello" as P
+    print_bool(contains(p, "ell"))
+    return 0
+}

@@ -1,0 +1,10 @@
+// a29 — two distincts-over-bool used as conditions (Jestyr has no `&&`, so the
+// laundering shape for booleans is nested conditions).
+distinct Flag = bool
+distinct Mask = bool
+fn main() -> i32 {
+    let f: Flag = true as Flag
+    let m: Mask = false as Mask
+    if f { if m { print_int(1) } else { print_int(2) } } else { print_int(3) }
+    return 0
+}

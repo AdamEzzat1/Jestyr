@@ -1,0 +1,11 @@
+// f08 — matching a distinct-over-enum WITHOUT the cast.
+enum Colour { red, green }
+distinct Tint = Colour
+fn main() -> i32 {
+    let t: Tint = red as Tint
+    match t {
+        red => print_int(1),
+        green => print_int(2),
+    }
+    return 0
+}
