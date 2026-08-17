@@ -357,6 +357,30 @@ the whole stdio family bindable.
 > lines from the generated C by hand made it compile and run first try, which is what
 > turned a guess into a finding.
 
+### §1.8 — `sys` directory listing: BLOCKED, and not on what anyone expected
+
+Investigated, not built, because the answer came back `feasible: false` for a reason that
+outranks the portability design:
+
+**Jestyr has NO conditional-compilation mechanism at any level** — no `@cfg`, no item-level
+`comptime if`, no platform input to CTFE (by deliberate design). The only conditional
+compilation in the whole system is hand-written `#if defined(_WIN32)` inside a cgen prelude
+*string*. So **the platform boundary is the INTRINSIC, not the library**, and a single `.jtr`
+cannot hold both an `extern "dirent.h"` and an `extern "windows.h"` binding — whichever
+header is absent kills the build.
+
+That makes `sys`-as-a-library a category error until a `cfg` mechanism exists. The §1.5 scope
+rule still stands ("calls needing a portability decision go in `sys`"); what is missing is
+any way for a library to *make* that decision. **The next increment for `sys` is a
+conditional-compilation design, not a directory API** — and note that this session's
+correction to `sys`'s blocker was itself corrected: first "needs `extern "c"`" (false), then
+"needs an opaque pointer type" (false), now "needs `cfg`". Each was found by probing rather
+than by reasoning about the previous claim.
+
+A second blocker surfaced in the same study and is fixed as §1.7 — `extern "<hdr>.h"` emitted
+no `#include`, so binding any header outside the fixed prelude silently truncated pointers
+through `int`. Even with `cfg`, `sys` could not have worked without that.
+
 ### §1.5 (resolved) — `cptr` + header-declared externs; `sys`'s blocker is GONE
 
 Two changes, both small, and together they make `std/file` (§1.2) pure library code:
@@ -475,13 +499,89 @@ it is the thing to build before typed `Path`, not after. A smaller quirk found a
 `return p.len` directly from a `distinct`-typed parameter reports "its type was never
 resolved", while `let n: usize = p.len  return n` is fine.
 
+**ATTEMPTED AND DELIBERATELY REVERTED — read this before trying again.** A 633-line
+implementation (peeling the distinct in `field_type`, the `Index` arms, and five cgen place
+paths) was written and then thrown away, for three separate reasons, each of which is a
+requirement on the next attempt:
+
+1. **It was a SOUNDNESS REGRESSION against HEAD.** Replacing the "does not implement `Add`"
+   rejection with an operand check that exempts untyped literals meant the exemption
+   laundered almost everything: `a + (b + 1)` mixed two unrelated distinct id spaces
+   silently, end to end, printing an answer. HEAD had rejected all of those. **Only the bare
+   spelling `a + b` was still caught.** Whatever replaces a blunt refusal must be measured
+   against what the blunt refusal already caught.
+2. **It broke the P3 differential.** `field_type` peeled a distinct while the port's
+   `examples/std/typeck.jtr` still returned `t_unknown()` for a distinct's fields, so
+   `jestyr_typeck_dump_matches_reference` failed. The P3 golden has **no allowlist**, so
+   this cannot be staged away.
+3. **The cgen half emitted invalid C from the port.** Five `peel_distinct` calls on the
+   reference side with no mirror produced `return (j_p)[];` from `jc` — not merely wrong,
+   not valid C syntax — while `jestyrc` was fine. Invisible because the one file exercising
+   it was never allowlisted.
+
+The patch is preserved at `scratchpad/distinct-partial.patch` for its *shape*, not its
+correctness. **The lesson worth carrying: this feature touches typeck inference AND cgen
+place emission, so it owes a port mirror on both, and its acceptance test is the 132-cast
+measurement, not a compiling corpus.**
+
 The language is *ahead* of the library here: `os_str` is already a real distinct primitive
 (`os_from_bytes`, `to_str_lossy`, participating in the text-family conversion rules;
 `examples/os_str.jtr`).
 
 ---
 
-### §1.6 — OPEN BUG: a trait-`impl` method body resolves no name that needs resolving
+### §1.6 — ~~OPEN BUG~~ FIXED, and it was far bigger than "a resolution bug"
+
+**No `impl` method body was ever CHECKED AT ALL** — not typed, not arity-checked, not
+assignability-checked, and (the part with a visible price) not resolved. `check_items`
+matched `Item::Trait(_) | Item::Impl(_) => {}` on a comment claiming Stage B handled them;
+Stage B (`register_impls`) reads signatures only and never touches `m.body`. `check_fn` had
+exactly three call sites and none was `Item::Impl`.
+
+**`escape.rs` had the byte-identical hole with the same wrong comment**, so no impl body was
+ever escape-checked either — **`impl Drop` included**, which is where raw pointers get freed
+and therefore the worst place in the language to have no checker.
+
+The fix is one arm per side: infer each impl method with `self` typed as the impl target,
+lowered with the impl's bracket parameters in scope so a blanket `impl[T] Drop for Deque(T)`
+gets `Deque(T)`. **Measured over all 208 corpus files: zero new diagnostics and zero
+emitted-C bytes changed.** The only thing that moves is `expr_types` — monotone fill-in, `?`
+slots becoming concrete in the 21 impl-bearing files — which the P3 differential dump
+compares, hence the mirror in `examples/std/typeck.jtr` and `examples/std/escape.jtr` and a
+reseed.
+
+Two deferrals are now written down instead of misdescribed: the impl's own bracket BOUNDS
+are not merged into `cur_type_param_bounds`, and `Self` in a body's type position stays
+`Opaque("Self")`. A trait's default bodies keep the same hole; the corpus has none.
+
+`std/cstring`'s `drop_cbuf` workaround is now unnecessary — left in place deliberately this
+run, and worth removing as a follow-up *with the gate re-run*, since removing it is the
+cleanest live proof the fix holds on real library code.
+
+### §1.7 — `extern "<hdr>.h"` promised a header and did not deliver it (FIXED)
+
+Found while investigating `sys`, and it is a bug in the mechanism §1.5 shipped. The
+declaration suppresses the prototype *on the grounds that the header declares it* — but
+nothing emitted the `#include`. A program declaring
+`extern "dirent.h" fn opendir(path: cstr) -> cptr` got neither:
+
+```text
+warning: implicit declaration of function 'opendir'
+warning: initialization of 'void *' from 'int' makes pointer from integer without a cast
+```
+
+**A warning, so it built and ran** — and worked only because this MinGW heap sits below 4GB.
+That is the `int`-fallback silent miscompile for the third time this session (after
+`JestyrArr_T_8` and the array-index paths): *an unresolved thing degrades to `int`, and `int`
+is a real type, so C accepts it.* Under C23 it is a hard error instead of a lucky one.
+
+`std/file` escaped purely by accident — every header it names is already in the fixed
+prelude. The fix emits `#include <hdr>` for each distinct `.h` abi, first-appearance order,
+deduplicated, unconditionally rather than only for headers the prelude lacks (a repeat
+include is free; a rule keyed on the prelude's current contents would break silently the day
+that list changes). Mirror + reseed paid.
+
+### §1.6 (original text) — the bug as first recorded
 
 Found while writing `std/cstring`'s `Drop`. **Not fixed here** — the fix is bigger than it
 looks and this is a named follow-up, not a silent trap.

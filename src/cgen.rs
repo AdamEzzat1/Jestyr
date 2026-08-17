@@ -1015,6 +1015,39 @@ impl<'a> Cgen<'a> {
         if self.test_mode || self.uses_mono_nanos {
             self.raw("#include <time.h>\n"); // `@bench` timing via clock(); `mono_nanos`
         }
+        // Headers named by `extern "<hdr>.h" fn …`. **This is what makes that spelling
+        // mean what it says.** `extern_protos` deliberately emits no prototype for such
+        // a declaration, on the grounds that the header already declares it — but until
+        // this existed, nothing made the header PRESENT. A program declaring
+        // `extern "dirent.h" fn opendir(path: cstr) -> cptr` got neither an include nor
+        // a prototype, so `opendir` was an implicit declaration: gcc assumed it returned
+        // `int` and truncated the `DIR*` through it —
+        //
+        //   warning: implicit declaration of function 'opendir'
+        //   warning: initialization of 'void *' from 'int' makes pointer from integer
+        //
+        // — a WARNING, so it built and ran, and happened to work only because this
+        // MinGW heap sits below 4GB. That is the `int`-fallback silent miscompile again,
+        // and C23 makes it a hard error rather than a lucky one.
+        //
+        // `std/file` escaped it purely by accident: every header it names is already in
+        // the fixed list above. Emitted unconditionally rather than only for headers the
+        // prelude lacks, because a repeat include is free (header guards) while a rule
+        // keyed on the prelude's current contents would silently break the day that list
+        // changes. First-appearance order, deduplicated, so the output stays
+        // deterministic.
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut hdrs: Vec<&str> = Vec::new();
+        for item in &self.ast.items {
+            if let Item::Extern(e) = item {
+                if e.abi.ends_with(".h") && seen.insert(e.abi.as_str()) {
+                    hdrs.push(e.abi.as_str());
+                }
+            }
+        }
+        for h in hdrs {
+            self.raw(format!("#include <{h}>\n"));
+        }
         self.raw("\n");
         if self.error_traces {
             // The debug error-trace runtime (`--error-traces`). A fixed-size buffer of
@@ -12782,6 +12815,30 @@ mod tests {
             c2.contains("int32_t my_own_thing(void* j_f);"),
             "a non-header extern still gets its prototype, and `cptr` lowers to `void*`: {c2}"
         );
+
+        // ...and the header it names is INCLUDED. Without this the declaration promised
+        // something nothing delivered: no prototype (deliberately) and no include
+        // (an oversight), so the call was an implicit declaration and gcc truncated a
+        // returned pointer through `int` — a warning, so it built and ran, and worked
+        // only by the accident of a heap below 4GB.
+        let (c4, d4) = gen(
+            "extern \"dirent.h\" fn opendir(p: cstr) -> cptr fn main() -> i32 { return 0 }",
+        );
+        assert!(d4.is_empty(), "{:?}", d4);
+        assert!(c4.contains("#include <dirent.h>\n"), "the named header must be included: {c4}");
+        // Deduplicated, and only for `.h` abis — `extern "c"` names no header.
+        let (c5, _d5) = gen(
+            "extern \"dirent.h\" fn opendir(p: cstr) -> cptr \
+             extern \"dirent.h\" fn closedir(d: cptr) -> i32 \
+             extern \"c\" fn mine(x: i32) -> i32 \
+             fn main() -> i32 { return 0 }",
+        );
+        assert_eq!(
+            c5.matches("#include <dirent.h>").count(),
+            1,
+            "one include per distinct header, not one per declaration: {c5}"
+        );
+        assert!(!c5.contains("#include <c>"), "a non-header abi must not become an include: {c5}");
 
         // A misspelled abi must NOT be read as a header name.
         let (c3, _d3) =

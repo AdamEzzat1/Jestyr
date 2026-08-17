@@ -18976,6 +18976,36 @@ void jestyr_emit_prelude(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrS
     {
         jestyr_rt_str_push(&(*j_sb), JSTR("#include <time.h>\n"));
     }
+    JestyrString j_seen_h = jestyr_rt_str_new();
+    int32_t j_hr = 0;
+    while ((j_hr < jestyr_len__i32(j_p.j_roots)))
+    {
+        int32_t j_hid = jestyr_get__list__i32(j_p.j_roots, (size_t)(j_hr));
+        Jestyr_ItemData j_hit = jestyr_get__list__ItemData(j_p.j_it, (size_t)(j_hid));
+        if (((j_hit.j_kind == 8) && (j_hit.j_w >= 0)))
+        {
+            if (((j_hit.j_u - j_hit.j_w) >= 2))
+            {
+                if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, (size_t)((j_hit.j_u - 2)), (size_t)(j_hit.j_u)), JSTR(".h")))
+                {
+                    JestyrString j_probe_h = jestyr_rt_str_new();
+                    jestyr_rt_str_push(&j_probe_h, JSTR("|"));
+                    jestyr_rt_str_push(&j_probe_h, jestyr_rt_substr(j_src, (size_t)(j_hit.j_w), (size_t)(j_hit.j_u)));
+                    jestyr_rt_str_push(&j_probe_h, JSTR("|"));
+                    if ((!jestyr_rt_contains(jestyr_rt_str_view(&j_seen_h), jestyr_rt_str_view(&j_probe_h))))
+                    {
+                        jestyr_rt_str_push(&j_seen_h, jestyr_rt_str_view(&j_probe_h));
+                        jestyr_rt_str_push(&(*j_sb), JSTR("#include <"));
+                        jestyr_rt_str_push(&(*j_sb), jestyr_rt_substr(j_src, (size_t)(j_hit.j_w), (size_t)(j_hit.j_u)));
+                        jestyr_rt_str_push(&(*j_sb), JSTR(">\n"));
+                    }
+                    jestyr_rt_str_free(&j_probe_h);
+                }
+            }
+        }
+        j_hr = (j_hr + 1);
+    }
+    jestyr_rt_str_free(&j_seen_h);
     jestyr_rt_str_push(&(*j_sb), JSTR("\n"));
     jestyr_rt_str_push(&(*j_sb), JSTR("/* Jestyr string view — a length-carrying `{ptr, len}` (a borrowed UTF-8 view,\n"));
     jestyr_rt_str_push(&(*j_sb), JSTR("   like Zig `[]const u8` / Rust `&str`). `.len` is O(1); no `strlen`. A bare\n"));

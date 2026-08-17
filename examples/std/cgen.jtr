@@ -182,6 +182,36 @@ fn emit_prelude(mut sb: String, read p: parser.Parser, read src: str, read g: Cg
     if g.tmode or uses_mono_nanos(p, src, g.tmode) {           // `@bench` timing via clock(); `mono_nanos`
         string_push(sb, "#include <time.h>\n")
     }
+    // Headers named by `extern "<hdr>.h" fn …` — what makes that spelling mean what it
+    // says. `emit_extern_protos` emits no prototype for such a declaration because the
+    // header declares it; without this nothing made the header PRESENT, so the call was
+    // an implicit declaration and its pointer return was truncated through `int`.
+    // First-appearance order, deduplicated. The abi's INNER span is `(w,u)`, -1 absent.
+    var seen_h: String = string_new()
+    var hr: i32 = 0
+    for hr < list.len(i32, p.roots) {
+        let hid: i32 = list.get(i32, p.roots, hr as usize)
+        let hit: parser.ItemData = list.get(parser.ItemData, p.it, hid as usize)
+        if hit.kind == 8 and hit.w >= 0 {
+            if hit.u - hit.w >= 2 {
+                if str_eq(src[(hit.u - 2) as usize .. hit.u as usize], ".h") {
+                    var probe_h: String = string_new()
+                    string_push(probe_h, "|")
+                    string_push(probe_h, src[hit.w as usize .. hit.u as usize])
+                    string_push(probe_h, "|")
+                    if !contains(string_view(seen_h), string_view(probe_h)) {
+                        string_push(seen_h, string_view(probe_h))
+                        string_push(sb, "#include <")
+                        string_push(sb, src[hit.w as usize .. hit.u as usize])
+                        string_push(sb, ">\n")
+                    }
+                    string_free(probe_h)
+                }
+            }
+        }
+        hr = hr + 1
+    }
+    string_free(seen_h)
     string_push(sb, "\n")
     string_push(sb, "/* Jestyr string view — a length-carrying `{ptr, len}` (a borrowed UTF-8 view,\n")
     string_push(sb, "   like Zig `[]const u8` / Rust `&str`). `.len` is O(1); no `strlen`. A bare\n")
