@@ -98,40 +98,34 @@ pub struct CString {
     return false
 }
 
-// The release, factored out of both teardown paths — and NOT merely for tidiness.
-//
-// A module-qualified call inside a trait-`impl` method body does not compile:
-// `mem.free_bytes(...)` written directly in `drop` emits `j_mem` as if `mem` were
-// a local, and gcc fails with "'j_mem' undeclared". Resolution, typeck and the
-// escape checker all pass — the degrades-to-gcc mode again. `std/list` and
-// `std/smallvec` both happen to route `Drop` through a local helper for their own
-// reasons, which is why no corpus file had ever exercised it.
-//
-// The same body has a SECOND facet, found by hitting it: a name that needs
-// COLLISION canonicalization breaks there too. Calling this helper `release`
-// collided with `mem.release`, so it canon'd to `release__m1` everywhere except
-// inside `drop`, which emitted the bare `jestyr_release` and failed to link. Hence
-// the deliberately unshared name. The rule is: inside a trait-`impl` method body,
-// only a name whose canon EQUALS its bare spelling resolves.
-//
-// So this indirection is a WORKAROUND for a compiler bug, recorded as one rather
-// than presented as style. An 8-line reproducer is in the Tier 2 note.
-@no_os fn drop_cbuf(read a: Allocator, p: *mut u8) {
-    mem.free_bytes(a, p)
-}
-
 // Explicit teardown. Idempotent, so it composes with the automatic drop — the
 // `std/list` contract.
 @no_os pub fn free(mut c: CString) {
     if c.p != null {
-        drop_cbuf(c.a, c.p)
+        mem.free_bytes(c.a, c.p)
         c.p = null
         c.n = 0
     }
 }
 
+// Both teardown paths call `mem.free_bytes` DIRECTLY, and that is worth a note
+// because until recently they could not.
+//
+// A module-qualified call inside a trait-`impl` method body used to emit `j_mem`
+// as though the module binding were a local, and gcc failed with "'j_mem'
+// undeclared" — resolution, typeck and the escape checker all passing first. The
+// cause was that impl method bodies were never inferred at all, so nothing ever
+// recorded the qualified resolution. This module carried a `drop_cbuf` indirection
+// as a documented workaround, with a deliberately unshared name because a
+// COLLISION-canonicalized name broke in the same body for the same reason.
+//
+// The workaround is gone because the bug is (see the Tier 2 note, §1.6). Its
+// removal is the point: `impl Drop` is where the language frees raw memory, so a
+// `Drop` body that can finally call across a module boundary — and that is now
+// escape-checked, which it also never was — is the useful proof that the fix holds
+// on real library code rather than on an eight-line reproducer.
 impl Drop for CString {
     fn drop(mut self) {
-        if self.p != null { drop_cbuf(self.a, self.p) }
+        if self.p != null { mem.free_bytes(self.a, self.p) }
     }
 }
