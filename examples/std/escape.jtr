@@ -1724,6 +1724,20 @@ fn check_items(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read s
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 3 { check_fn(e, p, c, src, it) }                    // Fn
         else if it.kind == 4 { walk_methods(e, p, c, src, it.a, it.b) }   // Struct methods
+        else if it.kind == 7 {                                           // Impl method bodies
+            // The reference's `Item::Impl` arm in `escape::check_item`. Both sides used
+            // to skip these on a comment claiming Stage B checked them; it does not, so
+            // no impl body was ever escape-checked — `impl Drop` included, which is
+            // where raw pointers are freed. The methods are fn-`ItemId`s at `(b, z)` in
+            // `mar`, not the 10-tuple member layout `walk_methods` reads.
+            var mi: i32 = 0
+            for mi < it.z {
+                let fid: i32 = list.get(i32, p.mar, (it.b + mi) as usize)
+                let f: parser.ItemData = list.get(parser.ItemData, p.it, fid as usize)
+                check_fn(e, p, c, src, f)
+                mi = mi + 1
+            }
+        }
         r = r + 1
     }
 }

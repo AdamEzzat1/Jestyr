@@ -2458,9 +2458,51 @@ impl<'a> TypeChecker<'a> {
                     let mut scope: Scope = vec![HashMap::new()];
                     self.infer(&mut scope, &empty, &Ty::Unit, c.value);
                 }
+                // An `impl`'s method BODIES. Stage B (`register_impls`) checks only the
+                // SIGNATURES — coherence, membership, fallibility conformance, the
+                // recorded return types — and never looks at `m.body`. Without this
+                // arm nothing inside an impl body was ever inferred: no arity, no
+                // assignability, no exhaustiveness, and — the reason this arm exists —
+                // no *resolution*. `record_qualified` and `record_call_sym` are only
+                // ever written by `infer`, so a `mod.f(…)` call or a collision-renamed
+                // bare call inside an impl body reached cgen with no resolution at all
+                // and degraded: `helper.note(x)` emitted as the field access
+                // `j_helper.j_note(x)`, and a colliding `release(x)` as the bare
+                // `jestyr_release` instead of the canonical `jestyr_release__m0` —
+                // both undeclared C identifiers, i.e. a whole-front-end pass followed
+                // by a gcc failure.
+                //
+                // `self_ty` is the impl target lowered with the impl's bracket
+                // parameters in scope, so a blanket `impl[T] Drop for Deque(T)` types
+                // `self` as `Deque(T)` exactly as `register_impls` keys it.
+                //
+                // Two deliberate deferrals, both with zero occurrences in the corpus:
+                //  * the impl's own bracket BOUNDS are not merged into
+                //    `cur_type_param_bounds` (`check_fn` rebuilds it from `f.generics`),
+                //    so a bound-method call on the impl's `T` reports at the definition
+                //    site rather than dispatching. That is the honest answer today:
+                //    the blanket-impl emission path has never seen a recorded bound
+                //    call from an impl body, so resolving one would trade a diagnostic
+                //    for a mis-emission.
+                //  * `Self` in a body's TYPE position lowers to `Opaque("Self")` (no
+                //    `self_subst` here, unlike the recorded return types). `assignable`
+                //    is lenient on `Opaque`, so this costs nothing today; `Self { … }`
+                //    in *expression* position already resolves through `self_ty`.
+                Item::Impl(im) => {
+                    let gen: HashSet<String> =
+                        im.generics.iter().map(|g| g.name.name.clone()).collect();
+                    let self_ty = self.lower_type(&gen, im.ty);
+                    for m in &im.methods {
+                        self.check_fn(m, &gen, &self_ty);
+                    }
+                }
                 Item::Enum(_) | Item::Distinct(_) | Item::Extern(_) | Item::Import(_) => {}
-                // Trait/impl method bodies are checked in Stage B (against the trait).
-                Item::Trait(_) | Item::Impl(_) => {}
+                // A trait's DEFAULT method bodies keep the identical hole (`self` would
+                // be `Opaque("Self")`). Nothing in the corpus has one, and a fallible
+                // default body is already refused outright (`register_traits`), so this
+                // is left for the increment that needs it — but it is a hole, not a
+                // "checked in Stage B" as the comment here used to claim.
+                Item::Trait(_) => {}
             }
         }
     }
@@ -6983,6 +7025,73 @@ mod tests {
                 first.1.iter().map(|x| x.message.clone()).collect::<Vec<_>>()
             );
         }
+    }
+
+    /// **An `impl` method BODY is type-checked at all.**
+    ///
+    /// `check_items` used to skip `Item::Impl` outright, on a comment claiming the
+    /// bodies were "checked in Stage B (against the trait)". Stage B is
+    /// `register_impls`, which reads only the SIGNATURES — coherence, membership,
+    /// fallibility conformance, the recorded return types — and never touches
+    /// `m.body`. So an impl body accepted literally anything: no arity, no
+    /// assignability, no exhaustiveness, no resolution.
+    ///
+    /// Each case is a PAIR: the ill-typed body must be diagnosed and its well-typed
+    /// twin must stay clean, so the refusal cannot pass because the whole file is
+    /// rejected for some other reason. And each error is one the identical body in a
+    /// FREE fn has always been refused for — the impl body was the only place it was
+    /// invisible.
+    #[test]
+    fn an_impl_method_body_is_type_checked() {
+        let base = "struct A { n: i32 } \
+                    fn takes_two(a: i32, b: i32) -> i32 { return a + b } \
+                    trait T { fn get(read self) -> i32 } ";
+        // Wrong arity, inside the impl body.
+        let (_, d) = analyze(&format!(
+            "{base}impl T for A {{ fn get(read self) -> i32 {{ return takes_two(1) }} }}"
+        ));
+        assert!(
+            d.iter().any(|x| x.is_error() && x.message.contains("takes_two")),
+            "a wrong-arity call in an impl body must be refused: {d:?}"
+        );
+        // The well-typed twin — the positive control for the case above.
+        let (_, d) = analyze(&format!(
+            "{base}impl T for A {{ fn get(read self) -> i32 {{ return takes_two(1, 2) }} }}"
+        ));
+        assert!(!d.iter().any(|x| x.is_error()), "the correct call must stay clean: {d:?}");
+        // An unknown FIELD on `self`, which also pins that `self` types as the impl
+        // target rather than staying unknown (an unknown receiver would say nothing).
+        let (_, d) = analyze(&format!(
+            "{base}impl T for A {{ fn get(read self) -> i32 {{ return self.nope }} }}"
+        ));
+        assert!(
+            d.iter().any(|x| x.is_error() && x.message.contains("nope")),
+            "`self` must be typed as the impl target, so a bad field is refused: {d:?}"
+        );
+        let (_, d) = analyze(&format!(
+            "{base}impl T for A {{ fn get(read self) -> i32 {{ return self.n }} }}"
+        ));
+        assert!(!d.iter().any(|x| x.is_error()), "the real field must stay clean: {d:?}");
+    }
+
+    /// A **blanket** `impl[T] …`'s body is checked too, with `self` typed as the
+    /// impl target — `Deque(T)`, not `Unknown` — which is what makes a field access
+    /// on `self` resolve inside a generic container's `drop`.
+    #[test]
+    fn a_blanket_impls_body_types_self_as_the_target() {
+        let src = "fn Holder(comptime T: type) -> type { return struct { n: i32 } } \
+                   trait Drop { fn drop(mut self) } \
+                   impl[T] Drop for Holder(T) { fn drop(mut self) { self.nope = 1 } }";
+        let (_, d) = analyze(src);
+        assert!(
+            d.iter().any(|x| x.is_error() && x.message.contains("nope")),
+            "a blanket impl body is checked against the target type: {d:?}"
+        );
+        let ok = "fn Holder(comptime T: type) -> type { return struct { n: i32 } } \
+                  trait Drop { fn drop(mut self) } \
+                  impl[T] Drop for Holder(T) { fn drop(mut self) { self.n = 1 } }";
+        let (_, d) = analyze(ok);
+        assert!(!d.iter().any(|x| x.is_error()), "the real field must stay clean: {d:?}");
     }
 
     #[test]

@@ -503,10 +503,21 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+            // An `impl`'s method bodies. The comment here used to say they were
+            // "escape-checked once their resolution lands (Stage B)"; Stage B is
+            // `typeck::register_impls`, which reads signatures only, so in fact
+            // NOTHING inside an impl body was ever escape-checked — including every
+            // `impl Drop` in the corpus, which is where raw pointers get freed and
+            // therefore the worst place in the language to have no checker.
+            Item::Impl(im) => {
+                for m in &im.methods {
+                    self.check_fn(m);
+                }
+            }
             Item::Enum(_) | Item::Const(_) | Item::Distinct(_) | Item::Extern(_) | Item::Import(_) => {}
-            // Trait/impl method bodies are escape-checked once their resolution
-            // lands (Stage B); a bare signature has nothing to check.
-            Item::Trait(_) | Item::Impl(_) => {}
+            // A trait's DEFAULT bodies keep the hole (as in `typeck::check_items`);
+            // nothing in the corpus has one. A bare signature has nothing to check.
+            Item::Trait(_) => {}
         }
     }
 
@@ -3309,5 +3320,61 @@ mod tests {
              var a: *mut i64 = alloc(i64, 1) concurrent { spawn w(s, a) } free_ptr(p) free_ptr(a) return 0 }",
         );
         assert!(!d.iter().any(|m| m.message.contains("shared mutable slice")), "false positive: {:?}", d);
+    }
+
+    // --- impl method bodies are escape-checked at all ---
+
+    /// **An `impl` method body reaches the escape checker.**
+    ///
+    /// `check_item` skipped `Item::Impl` on a comment claiming the bodies were
+    /// "escape-checked once their resolution lands (Stage B)". Stage B is
+    /// `typeck::register_impls`, which reads signatures only — so no impl body was
+    /// ever escape-checked, `impl Drop` included, which is precisely where raw
+    /// pointers are freed.
+    ///
+    /// Closing it changed **nothing** across all 208 corpus files, which is also what
+    /// a vacuous change looks like — hence this probe. Each case is a PAIR: the
+    /// escaping body must be refused with the message its free-fn twin gets, and the
+    /// well-behaved body must stay clean, so the refusal cannot be passing because
+    /// the file is rejected for some other reason.
+    #[test]
+    fn an_impl_method_body_is_escape_checked() {
+        let base = "struct Node { value: i32 } struct Holder { inner: Node } \
+                    trait Stash { fn keep(read self, read p: Node) -> Holder } ";
+        // Storing a second-class borrow in a struct — the free-fn refusal of
+        // `rejects_capturing_a_borrow_in_a_struct`, now reached inside an impl.
+        let d = escapes(&format!(
+            "{base}impl Stash for Node {{ fn keep(read self, read p: Node) -> Holder {{ \
+               return Holder{{ inner: p }} }} }}"
+        ));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            d[0].message.contains("cannot store borrow `p` in struct `Holder`"),
+            "the impl body gets the same refusal as the free fn: {d:?}"
+        );
+        // The control: an impl body that stores an OWNED value is fine, so the arm
+        // is not simply rejecting every impl.
+        let d = escapes(&format!(
+            "{base}impl Stash for Node {{ fn keep(read self, take p: Node) -> Holder {{ \
+               return Holder{{ inner: p }} }} }}"
+        ));
+        assert!(d.is_empty(), "an owned value may be stored: {d:?}");
+        // And the `impl Drop` shape this matters most for: a use-after-consume in a
+        // drop body, which until now nothing looked at.
+        let dr = "struct Buf { n: i32 } fn consume(take b: Buf) {} \
+                  trait Drop { fn drop(mut self) } ";
+        let d = escapes(&format!(
+            "{dr}impl Drop for Buf {{ fn drop(mut self) {{ var b: Buf = Buf{{ n: 1 }} \
+               consume(b) consume(b) }} }}"
+        ));
+        assert!(
+            d.iter().any(|m| m.message.contains("cannot use `b` after it was given to a `take`")),
+            "a use-after-consume inside `drop` must be caught: {d:?}"
+        );
+        let d = escapes(&format!(
+            "{dr}impl Drop for Buf {{ fn drop(mut self) {{ var b: Buf = Buf{{ n: 1 }} \
+               consume(b) }} }}"
+        ));
+        assert!(d.is_empty(), "consuming once is fine: {d:?}");
     }
 }

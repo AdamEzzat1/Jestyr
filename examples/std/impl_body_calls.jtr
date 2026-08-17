@@ -1,0 +1,60 @@
+// std/impl_body_calls.jtr — the reproducer for "a trait-`impl` method body was never
+// type-checked", and now its regression fixture.
+//
+// `check_items` inferred `fn` bodies, `const` values and struct-method bodies, and
+// skipped `impl` bodies entirely — the comment claimed Stage B checked them, but
+// Stage B (`register_impls`) only ever looks at SIGNATURES. Nothing wrote
+// `expr_types` or a resolution for a single expression inside an impl body, so cgen
+// saw no resolution and degraded in two ways, both of which this file exercises:
+//
+//   (a) `helper.note(self.v)` — a module-qualified call. With no recorded
+//       qualification it lowered as a FIELD ACCESS on a nonexistent local:
+//       `j_helper.j_note(...)`, and gcc failed with "'j_helper' undeclared".
+//
+//   (b) `release(n)` — a bare call whose name collides with `helper.release`, so its
+//       canonical symbol is `jestyr_release__m…`. With no recorded call symbol it
+//       fell back to the BARE spelling `jestyr_release`, which nothing defines.
+//
+// Both are "the whole front end passes, then gcc fails" — the failure mode the port
+// work spent real effort eliminating. `tick_free` is the CONTROL: the identical two
+// calls from a free function always lowered correctly, which is what isolates the
+// impl body as the variable.
+//
+// Run:  jestyrc run examples/std/impl_body_calls.jtr   → 40 then 40
+//       (`note(20)` = 41, `release(41)` = 40; both routes must agree)
+
+import "impl_call_helper" as helper
+
+struct Cell {
+    v: i64,
+}
+
+// Collides with `helper.release`: both spellings canonicalize, so a call site that
+// forgets to canonicalize names a symbol that does not exist.
+fn release(v: i64) -> i64 {
+    return v - 1
+}
+
+trait Tick {
+    fn tick(read self) -> i64
+}
+
+impl Tick for Cell {
+    fn tick(read self) -> i64 {
+        let n: i64 = helper.note(self.v)
+        return release(n)
+    }
+}
+
+// The control: the same two calls, from a free fn. This path was always correct.
+fn tick_free(read c: Cell) -> i64 {
+    let n: i64 = helper.note(c.v)
+    return release(n)
+}
+
+fn main() -> i32 {
+    let c: Cell = Cell{ v: 20 }
+    print_int(c.tick())
+    print_int(tick_free(c))
+    return 0
+}

@@ -11923,6 +11923,102 @@ mod tests {
         );
     }
 
+    /// The emitted body of one function, by its C signature prefix — so a claim about
+    /// an impl method is made against THAT function's text and nothing else. A global
+    /// `contains`/`!contains` over the whole translation unit proves nothing here: the
+    /// runtime prelude and the rest of the module closure carry many symbols, and the
+    /// free-fn control in these fixtures legitimately emits the same canonical names.
+    fn fn_body<'a>(c: &'a str, sig_prefix: &str) -> &'a str {
+        // Every function is emitted twice: a prototype (`… );`) and the definition.
+        // Take the occurrence whose next punctuation is `{`, not `;`.
+        for (at, _) in c.match_indices(sig_prefix) {
+            let rest = &c[at..];
+            let Some(open) = rest.find('{') else { continue };
+            if rest[..open].contains(';') {
+                continue; // the prototype
+            }
+            let close = rest[open..].find("\n}").expect("a body end") + open;
+            return &rest[open..close];
+        }
+        panic!("no DEFINITION of `{sig_prefix}` in:\n{c}");
+    }
+
+    /// **A module-qualified call inside a trait-`impl` method body resolves.**
+    ///
+    /// `check_items` skipped `Item::Impl` entirely, so *nothing* inside an impl body
+    /// was ever inferred — and resolution is written by `infer`. With no recorded
+    /// qualification, `emit_call` fell through to the field-access path and emitted
+    /// `j_helper.j_note(…)`, a field of a local that does not exist. Resolution,
+    /// typeck and the escape checker all passed; gcc then said `'j_helper'
+    /// undeclared`. The same call from a FREE fn in the same file was always correct,
+    /// and is asserted here as the control that isolates the impl body.
+    ///
+    /// Written against the real module loader: a qualified call needs an import
+    /// binding, so a single-source snippet cannot reach this path at all.
+    #[test]
+    fn resolves_a_module_qualified_call_inside_an_impl_body() {
+        let prog = crate::module::load("examples/std/impl_body_calls.jtr");
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(td.is_empty(), "{td:?}");
+        let (c, cd) = emit(&prog.ast, &info);
+        assert!(cd.is_empty(), "{cd:?}");
+
+        let body = fn_body(&c, "int64_t jestyr_impl_Tick__Cell__tick(");
+        assert!(
+            body.contains("jestyr_note(j_self.j_v)"),
+            "`helper.note(self.v)` must lower to the mangled C symbol inside the impl \
+             method:\n{body}"
+        );
+        assert!(
+            !body.contains("j_helper"),
+            "`j_helper` is the bug — the field-access spelling of an import binding, \
+             which is not a declared C identifier:\n{body}"
+        );
+        // The control: the identical call from a free fn was never broken, so its
+        // correctness is what makes the assertion above about the impl body alone.
+        let control = fn_body(&c, "int64_t jestyr_tick_free(");
+        assert!(control.contains("jestyr_note(j_c.j_v)"), "the free-fn control:\n{control}");
+    }
+
+    /// **…and so does a call whose name needs COLLISION canonicalization.**
+    ///
+    /// The second facet of the same hole, one `emit_*` line away: with no recorded
+    /// call symbol, `emit_generic_call` falls back to the BARE spelling, so a local
+    /// `release` colliding with the imported module's `release` emitted
+    /// `jestyr_release` where the canonical symbol is `jestyr_release__m0` — an
+    /// implicit declaration in C, then a link failure. `std/cstring` carries a local
+    /// helper with a deliberately unshared name as a workaround for exactly this.
+    #[test]
+    fn canonicalizes_a_colliding_call_inside_an_impl_body() {
+        let prog = crate::module::load("examples/std/impl_body_calls.jtr");
+        assert!(prog.diags.is_empty(), "load diags: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(td.is_empty(), "{td:?}");
+        let (c, cd) = emit(&prog.ast, &info);
+        assert!(cd.is_empty(), "{cd:?}");
+        // The canonical symbol is whatever the free-fn control emits — read it from
+        // there rather than hardcoding an index, so a change in collision numbering
+        // cannot make this test pass vacuously.
+        let control = fn_body(&c, "int64_t jestyr_tick_free(");
+        let canon = ["jestyr_release__m0", "jestyr_release__m1"]
+            .into_iter()
+            .find(|s| control.contains(s))
+            .unwrap_or_else(|| panic!("the free-fn control must call a canon symbol:\n{control}"));
+
+        let body = fn_body(&c, "int64_t jestyr_impl_Tick__Cell__tick(");
+        assert!(
+            body.contains(canon),
+            "the impl body must call the canonical `{canon}`:\n{body}"
+        );
+        // The bug spelled it bare. `canon` starts with the bare name, so the absence
+        // has to be judged on the call site's full token, not on a substring.
+        assert!(
+            !body.contains("jestyr_release(j_n)"),
+            "the bare `jestyr_release` is the bug — nothing defines it:\n{body}"
+        );
+    }
+
     #[test]
     fn lowers_a_mut_parameter_in_a_fn_pointer_type_by_pointer() {
         // A `mut` parameter declared *in the pointer's type* lowers to `T*`,

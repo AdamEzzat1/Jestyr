@@ -2660,8 +2660,9 @@ fn infer_methods(mut c: Checker, read p: parser.Parser, read src: str, mem_start
 }
 
 // Walk the top-level items exactly as `check_items` does: infer function bodies (params in
-// scope), const values (a fresh empty scope), and struct-method bodies (self = the struct);
-// skip enum/distinct/extern/import and (crucially) impl/trait bodies.
+// scope), const values (a fresh empty scope), struct-method bodies (self = the struct) and
+// impl-method bodies (self = the impl target); skip enum/distinct/extern/import. A TRAIT's
+// default bodies are still skipped — the same hole, on both sides, and nothing has one.
 // Entering a comptime type-fn (a fn whose top-level body returns `struct { ... }`):
 // precompute the REAL self type for its ctor-body methods -- `Ctor(T...)` (kind 6)
 // with each comptime type param as an Opaque -- mirroring the reference's
@@ -2730,6 +2731,21 @@ fn walk_items(mut c: Checker, read p: parser.Parser, read src: str) {
             let row: i32 = find_type(c, src, it.x as usize, it.y as usize)
             if row >= 0 { selfty = mk_ty(c, 15, 0 - 1, 0 - 1, row, 0 - 1) }
             infer_methods(c, p, src, it.a, it.b, selfty)
+        } else if it.kind == 7 {                   // Impl -> method bodies with self = the target
+            // The reference's `Item::Impl` arm in `check_items`. Both sides used to skip
+            // impl bodies on a comment claiming Stage B checked them; Stage B reads only
+            // the SIGNATURES (the `it.kind == 7` arm in the table pass above), so no
+            // expression inside an impl body was ever typed — every slot stayed `?`.
+            // The methods are fn-`ItemId`s at `(it.b, it.z)` in `mar`, NOT the 10-tuple
+            // member layout `infer_methods` walks, so this loop is its own.
+            let selfty: i32 = lower_type(c, p, src, it.a)
+            var mi: i32 = 0
+            for mi < it.z {
+                let fid: i32 = list.get(i32, p.mar, (it.b + mi) as usize)
+                let f: parser.ItemData = list.get(parser.ItemData, p.it, fid as usize)
+                check_fn_item(c, p, src, f, selfty)
+                mi = mi + 1
+            }
         }
         r = r + 1
     }

@@ -1,0 +1,18 @@
+// std/impl_call_helper.jtr — the second module of the `impl_body_calls` reproducer.
+//
+// It exists to be IMPORTED. A module-qualified call (`helper.note(x)`) needs a real
+// module boundary, so the bug it pins cannot be written in a single source file at
+// all — hence a two-file fixture rather than a snippet.
+//
+// `release` is here for the second facet: the consumer defines its own `release`
+// too, so both spellings need COLLISION canonicalization (`release__m0` /
+// `release__m1`) and a call that forgets to canonicalize emits a symbol that does
+// not exist.
+
+pub fn note(v: i64) -> i64 {
+    return v * 2 + 1
+}
+
+pub fn release(v: i64) -> i64 {
+    return 0 - v
+}
