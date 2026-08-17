@@ -1,0 +1,161 @@
+// examples/distinct_ops.jtr — a `distinct` type INHERITS ITS BASE'S OPERATIONS.
+//
+//   jestyrc run examples/distinct_ops.jtr
+//
+// `distinct D = Base` has always been a nominal type: same representation, not
+// interchangeable, conversions by `as` (see `examples/distinct.jtr`). What it did
+// NOT have was any of the base's *operations* — `a + a` on a `distinct Id = i64`
+// was "type `Id` does not implement `Add`", which is why a typed `Path` over `str`
+// would have cost 132 casts and was never built.
+//
+// The rule, in one sentence: **a distinct inherits an operation on its base at its
+// OWN type — the base's signature with every occurrence of `Base` replaced by `D`
+// — and only when both operand positions are `D` itself.**
+//
+//   Id + Id  ->  Id          (inherited, at `Id`)
+//   Id + i64                 REFUSED — a distinct shares its base's ops with itself
+//   Id + Acct                REFUSED — two unrelated id spaces over one base
+//   i64 + Id                 REFUSED — the rule reads BOTH operands, not just the left
+//
+// That last line is the load-bearing one. The old rule looked only at the LEFT
+// operand, so `0 + a + b` and `n + a` mixed two id spaces and ran. The refusals
+// live in `src/typeck.rs`'s unit tests (a compiling example cannot hold them) and
+// in `examples/distinct_corpus/`, which replays all 111 shapes.
+//
+// This file is the POSITIVE half: every operation a distinct legitimately inherits.
+
+distinct Id = i64            // an integer id space
+distinct Key = Id            // a chain — peeling is transitive, `Key` reaches `i64`
+distinct Flag = bool         // `and`/`or` come from `bool`
+distinct Metres = f64        // float arithmetic and ordering
+distinct Ch = char           // ordering and equality, but no arithmetic
+
+struct Pt { x: i32, y: i32 }
+distinct W = Pt              // a distinct over a struct reads the struct's fields
+
+// A hand-written impl WINS over inheritance: inheritance supplies the operation the
+// base has, it does not override one the author declared. (`Tag`'s `eq` is
+// deliberately wrong-by-construction — always `true` — so which path ran is visible
+// in the output rather than merely asserted.)
+distinct Tag = i64
+impl Eq for Tag { fn eq(self, other: Tag) -> bool { return true } }
+
+fn arith() -> i32 {
+    let a: Id = 12 as Id
+    let b: Id = 5 as Id
+    // `+ - * /` and the integer-only `% & | ^ << >>`, each yielding an `Id`.
+    let sum: Id = a + b
+    let dif: Id = a - b
+    let pro: Id = a * b
+    let quo: Id = a / b
+    let rem: Id = a % b
+    let bit: Id = a & b
+    let bor: Id = a | b
+    let xor: Id = a ^ b
+    let shl: Id = b << (1 as Id)
+    let shr: Id = a >> (1 as Id)
+    print_int(sum as i32)                       // 17
+    print_int(dif as i32)                       // 7
+    print_int(pro as i32)                       // 60
+    print_int(quo as i32)                       // 2
+    print_int(rem as i32)                       // 2
+    print_int(bit as i32)                       // 4
+    print_int(bor as i32)                       // 13
+    print_int(xor as i32)                       // 9
+    print_int(shl as i32)                       // 10
+    print_int(shr as i32)                       // 6
+    return 0
+}
+
+fn compare() -> i32 {
+    let a: Id = 1 as Id
+    let b: Id = 2 as Id
+    print_bool(a == a)                          // true
+    print_bool(a != b)                          // true
+    print_bool(a < b)                           // true
+    print_bool(b <= b)                          // true
+    print_bool(b > a)                           // true
+    print_bool(a >= a)                          // true
+    return 0
+}
+
+// A compound assignment is `a = a OP a`, so it inherits the same way — and it is
+// checked, which it was not before (`a += b` across two id spaces used to run).
+fn accumulate() -> i32 {
+    var a: Id = 0 as Id
+    for a < 5 as Id { a += 1 as Id }
+    a *= 3 as Id
+    a -= 1 as Id
+    print_int(a as i32)                         // 14
+    return 0
+}
+
+// A chain peels transitively: `Key` -> `Id` -> `i64`, so `Key` has integer ops too,
+// at `Key`.
+fn chained() -> i32 {
+    let k: Key = (2 as Id) as Key
+    let j: Key = (3 as Id) as Key
+    let s: Key = k + j
+    print_int(s as i32)                         // 5
+    print_bool(k < j)                           // true
+    return 0
+}
+
+fn over_bool() -> i32 {
+    let t: Flag = true as Flag
+    let f: Flag = false as Flag
+    print_bool(t and t)                         // true
+    print_bool(t or f)                          // true
+    print_bool(t == t)                          // true
+    return 0
+}
+
+fn over_float() -> i32 {
+    let x: Metres = 1.5 as Metres
+    let y: Metres = 0.5 as Metres
+    let z: Metres = x + y
+    print_bool((z as f64) == 2.0)               // true
+    print_bool(y < x)                           // true
+    return 0
+}
+
+fn over_char() -> i32 {
+    let a: Ch = 'a' as Ch
+    let b: Ch = 'b' as Ch
+    print_bool(a < b)                           // true
+    print_bool(a == a)                          // true
+    return 0
+}
+
+// MEMBER inheritance: a distinct over a struct projects the struct's declared
+// fields — reads and writes both — at the field's own declared type.
+fn members() -> i32 {
+    var w: W = Pt { x: 3, y: 4 } as W
+    print_int(w.x)                              // 3
+    print_int(w.y)                              // 4
+    w.x = 9
+    print_int(w.x)                              // 9
+    return 0
+}
+
+// The impl-first control: `Tag`'s `==` must reach the (deliberately wrong) impl,
+// not the inherited integer comparison, so this prints `true` for unequal values.
+fn impl_wins() -> i32 {
+    let s: Tag = 1 as Tag
+    let t: Tag = 2 as Tag
+    print_bool(s == t)                          // true — via `impl Eq for Tag`
+    return 0
+}
+
+fn main() -> i32 {
+    arith()
+    compare()
+    accumulate()
+    chained()
+    over_bool()
+    over_float()
+    over_char()
+    members()
+    impl_wins()
+    return 0
+}

@@ -7677,6 +7677,93 @@ fn variant_ctor_type(mut c: Checker, read p: Parser, read src: str, erow: i32, v
     return mk_ty__typeck(c, 6, astart, tpc, td(c, erow, 0), td(c, erow, 1))    // GenEnum(enum name, args)
 }
 
+// ---- `distinct` operation inheritance (mirrors `distinct_root` / `peel_distinct` /
+//      `distinct_op_result` / `binary_distinct_rule`) ----
+//
+// A `distinct D = Base` inherits an operation on `Base` AT `D`'s OWN TYPE — the base's
+// signature with every occurrence of `Base` replaced by `D` — and only when both operand
+// positions are `D` itself. So `Id + Id` is an `Id`, `p[a..b]` on a `distinct P = str` is a
+// `P`, and `p.len` is the string's `usize`; while `Id + i64`, `Id + Acct` and `i64 + Id` are
+// all refused. The reference diagnoses those; this side records the same TYPES (Error where it
+// refuses), which is what the P3 dump compares.
+
+// The tdecl row of `t` when `t` is a `distinct` type, else -1. The ROW is the identity to
+// compare on (the reference compares `Ty::Named(i)` indices; a TyId here is per-occurrence).
+fn distinct_row(read c: Checker, t: i32) -> i32 {
+    if t < 0 { return 0 - 1 }
+    let d: TyData = get__list(TyData, c.tys, t as usize)
+    if d.kind == 15 {
+        if td(c, d.x, 2) == 2 { return d.x }
+    }
+    return 0 - 1
+}
+
+// Follow `distinct` bases to the representation type underneath (`Key = Id = i64` -> `i64`).
+// CAPPED at 16 hops: `check` accepts a cyclic declaration today (`distinct A = B` /
+// `distinct B = A`) and an uncapped walk would hang the compiler on one. Exhaustion yields
+// Error, which every consumer treats as already-diagnosed. A base slot still unfilled is
+// Unknown, exactly the reference's initial value.
+fn peel_distinct(mut c: Checker, t: i32) -> i32 {
+    var cur: i32 = t
+    var i: i32 = 0
+    for i < 16 {
+        let d: TyData = get__list(TyData, c.tys, cur as usize)
+        if d.kind != 15 { return cur }
+        if td(c, d.x, 2) != 2 { return cur }
+        let base: i32 = td(c, d.x, 9)
+        if base < 0 { return t_unknown() }
+        cur = base
+        i = i + 1
+    }
+    return mk_ty__typeck(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1)
+}
+
+// The result of `d OP d` where `d` is a distinct whose representation is `base` — the base's
+// own operator signature with the base replaced by `d`. -1 means the base has no such
+// operator, so `d` has none either. A deliberate POSITIVE LIST, not "whatever the base does":
+// `str == str` and `str + str` are holes that pass `check` and die in gcc, so inheriting them
+// would move a distinct's `==`/`+` from a Jestyr refusal to a gcc one.
+// Op codes: 1=add 2=sub 3=mul 4=div 5=rem 6=eq 7=ne 8=lt 9=le 10=gt 11=ge 12=and 13=or
+// 14=bitand 15=bitor 16=bitxor 17=shl 18=shr.
+fn distinct_op_result(read c: Checker, op: i32, d: i32, base: i32) -> i32 {
+    let bd: TyData = get__list(TyData, c.tys, base as usize)
+    var int: bool = false
+    var flt: bool = false
+    var bl: bool = false
+    var ch: bool = false
+    var ptr: bool = false                          // identity compares; no arithmetic
+    if bd.kind == 2 {
+        if bd.x <= 9 { int = true }
+        if bd.x == 10 or bd.x == 11 { flt = true }
+        if bd.x == 12 { bl = true }
+        if bd.x == 13 { ch = true }
+        if bd.x == 21 { ptr = true }               // cptr
+    }
+    if bd.kind == 3 { ptr = true }                 // a typed pointer
+    if op <= 4 {                                   // + - * /
+        if int or flt { return d }
+        return 0 - 1
+    }
+    if op == 5 {                                   // %
+        if int { return d }
+        return 0 - 1
+    }
+    if op >= 14 {                                  // & | ^ << >>
+        if int { return d }
+        return 0 - 1
+    }
+    if op == 6 or op == 7 {                        // == !=
+        if int or flt or bl or ch or ptr { return t_bool() }
+        return 0 - 1
+    }
+    if op <= 11 {                                  // < <= > >=
+        if int or flt or ch { return t_bool() }
+        return 0 - 1
+    }
+    if bl { return t_bool() }                      // and / or
+    return 0 - 1
+}
+
 // The type of field `src[fs..fe]` on a value of type `bt` (mirrors `field_type`): arrays and
 // slices expose `len`/`ptr`, `str` exposes `len`/`ptr`/`cstr`, `String` exposes `len`; a Named
 // struct projects the declared field type (no such field -> Error); enums/distincts project
@@ -7727,7 +7814,15 @@ fn field_type(mut c: Checker, read p: Parser, read src: str, bt: i32, fs: usize,
     }
     if bd.kind == 16 { return bt }                 // already diagnosed — a chained access must not cascade
     if bd.kind == 15 {                             // Named
-        if td(c, bd.x, 2) != 0 { return t_unknown() }          // enum/distinct: no fields
+        // A distinct inherits its base's MEMBERS: `p.len` on a `distinct P = str` is the
+        // string's `usize` length, `w.x` on a `distinct W = Pt` is `Pt`'s declared field.
+        // Recursing on the peeled base rather than duplicating the arms above is what keeps
+        // the struct case honest. An ENUM keeps Unknown — its payloads project via `match`.
+        if td(c, bd.x, 2) == 2 {
+            let peeled: i32 = peel_distinct(c, bt)
+            return field_type(c, p, src, peeled, fs, fe)
+        }
+        if td(c, bd.x, 2) != 0 { return t_unknown() }          // enum: no directly-read fields
         let fstart: i32 = td(c, bd.x, 3)
         let fcount: i32 = td(c, bd.x, 4)
         var i: i32 = 0
@@ -8208,8 +8303,11 @@ fn op_method_name(op: i32) -> str {
 }
 
 // `a OP b` on a user type (Named / GenStruct lhs) dispatches through the op's trait impl:
-// the impl method's registered return, or Error when the type lacks the impl. Mirrors
-// `resolve_operator_trait` (which the reference consults before native semantics).
+// the impl method's registered return, or **-1** when the type lacks the impl. Mirrors the
+// PURE half `lookup_operator_impl` — the reference splits the diagnostic off precisely so the
+// `distinct` inheritance rule can consult the impl first (a hand-written `impl Eq for Id`
+// still wins) without committing to an error it is about to handle itself. The Binary arm
+// turns a -1 into Error where the reference reports "does not implement".
 // A successful resolution is recorded in `icalls` keyed on the BINARY ExprId (the impl
 // declaration's own trait/method-name spans spell "Add"/"add" etc.), so the backend lowers the
 // op to the impl call — the reference records these in `impl_calls` the same way.
@@ -8245,7 +8343,7 @@ fn resolve_operator(mut c: Checker, read src: str, id: i32, op: i32, lt: i32) ->
         }
         i = i + 1
     }
-    return mk_ty__typeck(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1)    // no impl -> Error (like the reference)
+    return 0 - 1                                       // no impl for this op on this type
 }
 
 // The return type of a string/file-IO/atomic INTRINSIC (not a declared fn), or -1 (mirrors
@@ -8692,18 +8790,46 @@ fn infer(mut c: Checker, read p: Parser, read src: str, id: i32) -> i32 {
         if d.op == 2 { r = t_bool() }
         else if d.op == 1 or d.op == 3 { r = rt }
         else { r = t_unknown() }                   // Ref
-    } else if k == 4 {                             // Binary: operator traits, then native rules
+    } else if k == 4 {                             // Binary: distinct rule, op traits, native
         let lt: i32 = infer(c, p, src, d.a)
         let rt: i32 = infer(c, p, src, d.b)
+        var handled: bool = false
+        // The `distinct` rule runs FIRST, because it is the arm that must see BOTH operands:
+        // the operator-trait rule below looks only at the left one, which is how `0 + a + b`
+        // and `n + a` mixed two id spaces silently. It bows out when NO operand is a distinct,
+        // leaving the path below untouched.
+        let dl: i32 = distinct_row(c, lt)
+        let dr: i32 = distinct_row(c, rt)
+        if dl >= 0 or dr >= 0 {
+            handled = true
+            var got: bool = false
+            if !str_eq(op_trait_name(d.op), "") { // a hand-written impl still wins
+                let it: i32 = resolve_operator(c, src, id, d.op, lt)
+                if it >= 0 {
+                    r = it
+                    got = true
+                }
+            }
+            if !got {
+                r = mk_ty__typeck(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1)   // mixed / no such op -> Error
+                if dl == dr {                                  // both the SAME distinct
+                    let pb: i32 = peel_distinct(c, lt)
+                    let ot: i32 = distinct_op_result(c, d.op, lt, pb)
+                    if ot >= 0 { r = ot }
+                }
+            }
+        }
         // A user type (Named/GenStruct lhs) with a MAPPED op dispatches through the operator
         // trait (Add/Sub/Mul/Div/Eq/Ord): the impl method's return, or Error without an impl.
         // The reference consults this BEFORE native semantics.
-        var handled: bool = false
         let ld: TyData = get__list(TyData, c.tys, lt as usize)
-        if ld.kind == 15 or ld.kind == 6 {
-            if !str_eq(op_trait_name(d.op), "") {
-                r = resolve_operator(c, src, id, d.op, lt)
-                handled = true
+        if !handled {
+            if ld.kind == 15 or ld.kind == 6 {
+                if !str_eq(op_trait_name(d.op), "") {
+                    r = resolve_operator(c, src, id, d.op, lt)
+                    if r < 0 { r = mk_ty__typeck(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1) }
+                    handled = true
+                }
             }
         }
         if !handled {
@@ -8797,8 +8923,16 @@ fn infer(mut c: Checker, read p: Parser, read src: str, id: i32) -> i32 {
         pop_scope(c)
         if bd.kind == 5 { r = bd.a } else { r = mk_ty__typeck(c, 16, 0 - 1, 0 - 1, 0 - 1, 0 - 1) }
     } else if k == 6 {                             // index: slice/array -> elem; str -> u8 (range -> str)
-        let bt: i32 = infer(c, p, src, d.a)
+        let bt0: i32 = infer(c, p, src, d.a)
         infer(c, p, src, d.b)
+        // A distinct inherits the whole of indexing from its base, under the substitution
+        // rule: `p[i]` on a `distinct P = str` is a `u8` (no occurrence of `str` in the
+        // result, nothing to substitute) while `p[a..b]` is a **`P`** — which is exactly what
+        // lets the internal helpers of a `distinct Path = str` need no casts at all. Peeling
+        // is a no-op on every non-distinct type, so nothing else moves.
+        var sub: i32 = 0 - 1
+        if distinct_row(c, bt0) >= 0 { sub = bt0 }
+        let bt: i32 = peel_distinct(c, bt0)
         let bd: TyData = get__list(TyData, c.tys, bt as usize)
         // A RANGE index on a `[]T` re-slices to the same slice type (a narrower view
         // of the same buffer); a plain index yields the element. Not extended to a
@@ -8806,13 +8940,17 @@ fn infer(mut c: Checker, read p: Parser, read src: str, id: i32) -> i32 {
         // storage — that needs borrowed projection, not just a type.
         if bd.kind == 8 {
             let sx: ExprData = get__list(ExprData, p.ex, d.b as usize)
-            if sx.kind == 13 { r = bt } else { r = bd.a }
+            if sx.kind == 13 {
+                if sub >= 0 { r = sub } else { r = bt }
+            } else { r = bd.a }
         }
         else if bd.kind == 9 { r = bd.a }
         else if bd.kind == 2 {
             if bd.x == 14 {
                 let ix: ExprData = get__list(ExprData, p.ex, d.b as usize)
-                if ix.kind == 13 { r = t_str() } else { r = mk_ty__typeck(c, 2, 0 - 1, 0 - 1, 5, 0 - 1) }
+                if ix.kind == 13 {
+                    if sub >= 0 { r = sub } else { r = t_str() }
+                } else { r = mk_ty__typeck(c, 2, 0 - 1, 0 - 1, 5, 0 - 1) }
             }
         }
     } else if k == 12 {                            // assign: both children; the statement is Unit

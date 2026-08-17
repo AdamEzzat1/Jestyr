@@ -18,6 +18,18 @@ bash examples/distinct_corpus/record.sh > /tmp/now.tsv
 diff examples/distinct_corpus/baseline-HEAD-e293e8b.tsv /tmp/now.tsv
 ```
 
+Two baselines are kept, and the older one is never retired:
+
+| file | what it records |
+| --- | --- |
+| `baseline-HEAD-e293e8b.tsv` | the language **before** operation inheritance. The permanent reference for "was this row ever a rejection?" — the question the previous attempt got wrong. |
+| `baseline-typeck-inheritance.tsv` | after the **typeck half** of operation inheritance (the operator rule, member/index inheritance, and the four unchecked assignment positions). The cgen half is not in it, so every `GCC_REJECT` row is still present. |
+
+Diffing the two is the honest summary of the change: **18 holes close**
+(`RUN_OK` → `TYPECK_REJECT`), **5 rows flip open on purpose** (R4 — a distinct
+with *itself*: `a27`, `e01`, `e02`, `e03`, `e07`), and **no other row leaves a
+rejection**. `TYPECK_REJECT` goes 37 → 50.
+
 `record.sh` prints one TSV row per program: `<program>\t<verdict>\t<detail>`.
 It takes an optional path to the compiler under test, so a self-hosted `jc` can be
 recorded the same way.

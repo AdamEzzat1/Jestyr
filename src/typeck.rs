@@ -1023,33 +1023,15 @@ impl<'a> TypeChecker<'a> {
     /// operator, or a primitive operand using native C ops). A user type used with
     /// a trait-backed operator but lacking the `impl` is an error.
     fn resolve_operator_trait(&mut self, id: ExprId, op: BinOp, lt: &Ty, span: Span) -> Option<Ty> {
-        let (trait_name, method) = op_trait_method(op)?;
+        let (trait_name, _) = op_trait_method(op)?;
         // Only user types overload operators; primitives keep native semantics.
         if !matches!(lt, Ty::Named(_) | Ty::GenStruct { .. }) {
             return None;
         }
-        let key = self.table.ty_key(lt);
-        let resolved: Option<Ty> = self
-            .table
-            .impls
-            .iter()
-            .find(|im| {
-                im.trait_name == trait_name && im.type_key == key && im.method_rets.contains_key(method)
-            })
-            .map(|im| im.method_rets.get(method).cloned().unwrap_or(Ty::Unknown));
-        match resolved {
-            Some(ret) => {
-                self.record_impl_call(
-                    id,
-                    ImplCall {
-                        trait_name: trait_name.to_string(),
-                        type_key: key,
-                        method: method.to_string(),
-                    },
-                );
-                Some(ret)
-            }
+        match self.lookup_operator_impl(id, op, lt) {
+            Some(ret) => Some(ret),
             None => {
+                let key = self.table.ty_key(lt);
                 self.error(
                     span,
                     format!(
@@ -1060,6 +1042,39 @@ impl<'a> TypeChecker<'a> {
                 Some(Ty::Error)
             }
         }
+    }
+
+    /// The *pure* half of [`resolve_operator_trait`]: does `lt` carry an `impl`
+    /// for `op`'s trait? Records the dispatch on a hit (that is what makes the
+    /// backend lower the operator to the impl call) and emits **no diagnostic** on
+    /// a miss, so a caller that has its own fallback — the `distinct`
+    /// inheritance rule — can consult the impl first without committing to an
+    /// error it is about to handle.
+    ///
+    /// [`resolve_operator_trait`]: Self::resolve_operator_trait
+    fn lookup_operator_impl(&mut self, id: ExprId, op: BinOp, lt: &Ty) -> Option<Ty> {
+        let (trait_name, method) = op_trait_method(op)?;
+        if !matches!(lt, Ty::Named(_) | Ty::GenStruct { .. }) {
+            return None;
+        }
+        let key = self.table.ty_key(lt);
+        let ret: Ty = self
+            .table
+            .impls
+            .iter()
+            .find(|im| {
+                im.trait_name == trait_name && im.type_key == key && im.method_rets.contains_key(method)
+            })
+            .map(|im| im.method_rets.get(method).cloned().unwrap_or(Ty::Unknown))?;
+        self.record_impl_call(
+            id,
+            ImplCall {
+                trait_name: trait_name.to_string(),
+                type_key: key,
+                method: method.to_string(),
+            },
+        );
+        Some(ret)
     }
 
     fn register_type(&mut self, name: &Ident, is_enum: bool) -> usize {
@@ -1110,6 +1125,139 @@ impl<'a> TypeChecker<'a> {
     /// Is `t` a `distinct` nominal type?
     fn is_distinct(&self, t: &Ty) -> bool {
         matches!(t, Ty::Named(i) if matches!(self.table.types[*i].kind, TypeKindG::Distinct { .. }))
+    }
+
+    /// `t` itself when it is a `distinct` type, else `None`.
+    ///
+    /// This is the type an inherited operation is reinstated *at* (design §2.2):
+    /// `distinct P = str` inherits `str: [Range] -> str` as `P: [Range] -> P`,
+    /// so a sub-view of a `P` is a `P` and needs no cast. It deliberately returns
+    /// the OUTERMOST distinct of a chain (`Key = Id = i64` yields `Key`), because
+    /// that is the type the expression was written at.
+    fn distinct_root(&self, t: &Ty) -> Option<Ty> {
+        self.is_distinct(t).then(|| t.clone())
+    }
+
+    /// Follow `distinct` bases to the representation type underneath.
+    ///
+    /// Transitive (`distinct Key = Id`, `distinct Id = i64` peels to `i64`) and
+    /// **capped**, because `check` accepts a cyclic declaration today (`distinct
+    /// A = B` / `distinct B = A`) and an uncapped walk would hang the compiler on
+    /// one. Exhausting the cap yields `Ty::Error`, which every consumer already
+    /// treats as already-diagnosed.
+    fn peel_distinct(&self, t: &Ty) -> Ty {
+        let mut cur = t.clone();
+        for _ in 0..16 {
+            let Ty::Named(i) = &cur else { return cur };
+            let TypeKindG::Distinct { base } = &self.table.types[*i].kind else { return cur };
+            cur = base.clone();
+        }
+        Ty::Error
+    }
+
+    /// The result of `d OP d` where `d` is a `distinct` type whose representation
+    /// is `base` — the base's own operator signature with every occurrence of the
+    /// base replaced by `d` (design §2.2). `None` means the base has no such
+    /// operator, so `d` has none either.
+    ///
+    /// A deliberate **positive list**, not "whatever the base does": `str == str`
+    /// and `str + str` are HEAD holes that pass `check` and die in gcc, so
+    /// inheriting them would move a distinct's `==`/`+` from a Jestyr refusal to a
+    /// gcc one — losing the rejection rather than keeping it.
+    fn distinct_op_result(&self, op: BinOp, d: &Ty, base: &Ty) -> Option<Ty> {
+        use BinOp::*;
+        let int = matches!(base, Ty::Prim(p) if integer_prim(p));
+        let float = matches!(base, Ty::Prim("f32") | Ty::Prim("f64"));
+        let boolean = matches!(base, Ty::Prim("bool"));
+        let character = matches!(base, Ty::Prim("char"));
+        // A pointer compares for identity but has no arithmetic (`cptr` is opaque
+        // by design, and typed-pointer arithmetic is not a Jestyr operator).
+        let pointer = matches!(base, Ty::Prim("cptr") | Ty::Ptr { .. });
+        let bool_ty = Ty::Prim("bool");
+        match op {
+            Add | Sub | Mul | Div if int || float => Some(d.clone()),
+            Rem | BitAnd | BitOr | BitXor | Shl | Shr if int => Some(d.clone()),
+            Eq | Ne if int || float || boolean || character || pointer => Some(bool_ty),
+            Lt | Le | Gt | Ge if int || float || character => Some(bool_ty),
+            And | Or if boolean => Some(bool_ty),
+            _ => None,
+        }
+    }
+
+    /// The `distinct` half of binary-operator resolution (design §2.3). Returns
+    /// `None` when **no** operand is a distinct type — that hands the node to the
+    /// unchanged HEAD path, so a program with no `distinct` in it infers exactly
+    /// as before.
+    ///
+    /// The rule is a predicate over the two **types**, never over the expression
+    /// tree. That is the whole reason it is safe: the previous attempt at this
+    /// exempted "untyped literal" operands through `literal_defaulted`, whose
+    /// Binary arm is a *recursive disjunction*, so one literal anywhere in a
+    /// subtree exempted the whole operand and `a + (b + 1)` mixed two id spaces
+    /// silently. Here `1` types as `i32` and `(b + 1)` types as `Error`; neither
+    /// is a distinct type, so both are refused by the same clause that refuses
+    /// `a + b` — with no literal predicate to get wrong.
+    fn binary_distinct_rule(&mut self, id: ExprId, op: BinOp, lt: &Ty, rt: &Ty, span: Span) -> Option<Ty> {
+        let (dl, dr) = (self.distinct_root(lt), self.distinct_root(rt));
+        if dl.is_none() && dr.is_none() {
+            return None;
+        }
+        // A hand-written `impl Add for Id` still wins: inheritance supplies the
+        // operation the base has, it does not override one the author declared.
+        if let Some(ret) = self.lookup_operator_impl(id, op, lt) {
+            return Some(ret);
+        }
+        if dl == dr {
+            // Both operands are the SAME distinct type: inherit the base's
+            // operation, at this type.
+            let base = self.peel_distinct(lt);
+            if let Some(t) = self.distinct_op_result(op, lt, &base) {
+                return Some(t);
+            }
+            let (d, b) = (lt.display(&self.table), base.display(&self.table));
+            self.error(
+                span,
+                format!(
+                    "type `{d}` has no `{}` operator — its base `{b}` has none either",
+                    op_symbol(op)
+                ),
+            );
+            return Some(Ty::Error);
+        }
+        // A mixed pair. `Error` on one side means the inner node already reported
+        // — cascading a second diagnostic onto the same mistake helps nobody.
+        if matches!(lt, Ty::Error) || matches!(rt, Ty::Error) {
+            return Some(Ty::Error);
+        }
+        let (l, r) = (lt.display(&self.table), rt.display(&self.table));
+        let why = if dl.is_some() && dr.is_some() {
+            "unrelated `distinct` types over the same base"
+        } else {
+            "a `distinct` type shares its base's operations only with itself"
+        };
+        self.error(
+            span,
+            format!(
+                "operator `{}` mixes `{l}` with `{r}` — {why}; cast one side",
+                op_symbol(op)
+            ),
+        );
+        Some(Ty::Error)
+    }
+
+    /// The BinOp a compound assignment performs (`a += b` is `a = a + b`).
+    fn assign_op_binop(op: AssignOp) -> Option<BinOp> {
+        Some(match op {
+            AssignOp::Assign => return None,
+            AssignOp::Add => BinOp::Add,
+            AssignOp::Sub => BinOp::Sub,
+            AssignOp::Mul => BinOp::Mul,
+            AssignOp::Div => BinOp::Div,
+            AssignOp::Rem => BinOp::Rem,
+            AssignOp::BitAnd => BinOp::BitAnd,
+            AssignOp::BitOr => BinOp::BitOr,
+            AssignOp::BitXor => BinOp::BitXor,
+        })
     }
 
     /// Should assigning `got` where `ann` is expected be rejected on `distinct`
@@ -2704,10 +2852,20 @@ impl<'a> TypeChecker<'a> {
             ExprKind::Binary { op, lhs, rhs } => {
                 let lt = self.infer(scope, typ, self_ty, *lhs);
                 let rt = self.infer(scope, typ, self_ty, *rhs);
+                // A `distinct` type inherits its base's operators AT ITS OWN TYPE,
+                // and only with itself: `Id + Id` is an `Id`, while `Id + i64`,
+                // `Id + Acct` and `i64 + Id` are all refused. Consulted first
+                // because it is the arm that must see BOTH operands — HEAD's
+                // operator-trait rule looks only at the left one, which is how
+                // `0 + a + b` and `n + a` mixed id spaces silently. Returns `None`
+                // when no operand is a distinct, leaving the path below untouched.
+                if let Some(t) = self.binary_distinct_rule(id, *op, &lt, &rt, span) {
+                    t
+                }
                 // Operator traits (Stage E): `a OP b` on a user type dispatches
                 // through `impl <OpTrait> for <lhs>`; primitives fall through to
                 // native semantics below.
-                if let Some(t) = self.resolve_operator_trait(id, *op, &lt, span) {
+                else if let Some(t) = self.resolve_operator_trait(id, *op, &lt, span) {
                     t
                 } else {
                     use BinOp::*;
@@ -2739,9 +2897,41 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
             }
-            ExprKind::Assign { target, value, .. } => {
-                self.infer(scope, typ, self_ty, *target);
-                self.infer(scope, typ, self_ty, *value);
+            ExprKind::Assign { op, target, value } => {
+                let tt = self.infer(scope, typ, self_ty, *target);
+                let vt = self.infer(scope, typ, self_ty, *value);
+                // An assignment STATEMENT is an assignment position like any other.
+                // It was the one HEAD left unchecked, so `a = b` with two unrelated
+                // id spaces ran end to end while the byte-identical `let a: Id = b`
+                // was refused — a rule that holds at three positions and not the
+                // fourth is not a rule. Diagnostic only: the recorded type is still
+                // `Unit`, so nothing downstream moves.
+                if self.distinct_mismatch(&tt, &vt) {
+                    let (w, g) = (tt.display(&self.table), vt.display(&self.table));
+                    self.error(
+                        span,
+                        format!(
+                            "assignment: expected `{w}`, found `{g}` — `distinct` types need an explicit `as`"
+                        ),
+                    );
+                } else if let Some(bin) = Self::assign_op_binop(*op) {
+                    // `a += b` is `a = a + b`, so it owes the operator half of the
+                    // rule too: a compound assignment on a distinct whose base has
+                    // no such operator is the same refusal as writing it out.
+                    if self.is_distinct(&tt) {
+                        let base = self.peel_distinct(&tt);
+                        if self.distinct_op_result(bin, &tt, &base).is_none() {
+                            let (d, b) = (tt.display(&self.table), base.display(&self.table));
+                            self.error(
+                                span,
+                                format!(
+                                    "type `{d}` has no `{}` operator — its base `{b}` has none either",
+                                    op_symbol(bin)
+                                ),
+                            );
+                        }
+                    }
+                }
                 // A `record`'s fields are immutable: assigning one is a static
                 // error (the whole binding may still be rebound, like `let`).
                 if let ExprKind::Field { base, .. } = &ast.expr_at(*target).kind {
@@ -3079,23 +3269,33 @@ impl<'a> TypeChecker<'a> {
                 self.field_type(span, &bt, &name.name)
             }
             ExprKind::Index { base, index } => {
-                let bt = self.infer(scope, typ, self_ty, *base);
+                let bt0 = self.infer(scope, typ, self_ty, *base);
                 self.infer(scope, typ, self_ty, *index);
                 // Indexing a slice yields its element type; a string yields a byte,
                 // *except* `s[i..j]` (a range index) which slices a sub-view — of the
                 // same slice type for `[]T`, and of `str` for a string.
+                //
+                // A `distinct` inherits the whole of that from its base, under the
+                // substitution rule: the base's signature with the base replaced by
+                // the distinct. So `p[i]` on a `distinct P = str` is a `u8` (no
+                // occurrence of `str` in the result, nothing to substitute) while
+                // `p[a..b]` is a **`P`** — which is exactly what makes the internal
+                // helpers of a `distinct Path = str` need no casts at all. Peeling
+                // is a no-op on every non-distinct type, so nothing else moves.
+                let sub = self.distinct_root(&bt0);
+                let bt = self.peel_distinct(&bt0);
                 let ranged = matches!(ast.expr_at(*index).kind, ExprKind::Range { .. });
                 match bt {
                     // `xs[i..j]` on a `[]T` re-slices: same element type, narrower view.
                     // Deliberately NOT extended to a fixed-size array, whose sub-view
                     // would have to borrow the array's storage — that needs the
                     // borrowed-projection story (safety-mosaic item 2), not just a type.
-                    Ty::Slice(elem) if ranged => Ty::Slice(elem),
+                    Ty::Slice(elem) if ranged => sub.unwrap_or(Ty::Slice(elem)),
                     Ty::Slice(elem) => *elem,
                     Ty::Array { elem, .. } => *elem, // a fixed-size array indexes to its element
                     Ty::Prim("str") => {
                         if ranged {
-                            Ty::Prim("str")
+                            sub.unwrap_or(Ty::Prim("str"))
                         } else {
                             Ty::Prim("u8")
                         }
@@ -3133,6 +3333,20 @@ impl<'a> TypeChecker<'a> {
                     self.cur_expected = exp_elem.clone();
                     let t = self.infer(scope, typ, self_ty, *e);
                     self.cur_expected = prev;
+                    // Each element is an assignment position against the annotated
+                    // element type: `let ids: [3]Id = [1, 2, 3]` is three `let x: Id
+                    // = 1`s, and was accepted only because nothing looked.
+                    if let Some(exp) = &exp_elem {
+                        if self.distinct_mismatch(exp, &t) {
+                            let (w, g) = (exp.display(&self.table), t.display(&self.table));
+                            self.error(
+                                self.ast.expr_at(*e).span,
+                                format!(
+                                    "array element: expected `{w}`, found `{g}` — `distinct` types need an explicit `as`"
+                                ),
+                            );
+                        }
+                    }
                     if elem_ty.is_none() {
                         elem_ty = Some(t);
                     }
@@ -3314,9 +3528,25 @@ impl<'a> TypeChecker<'a> {
                     let expected =
                         named_idx.and_then(|i| self.struct_field_decl_ty(i, &fi.name.name));
                     let prev = self.cur_expected.take();
-                    self.cur_expected = expected;
-                    self.infer(scope, typ, self_ty, fi.value);
+                    self.cur_expected = expected.clone();
+                    let vt = self.infer(scope, typ, self_ty, fi.value);
                     self.cur_expected = prev;
+                    // A struct-literal field is an assignment position: `Rec { id: 5 }`
+                    // on a `distinct`-typed field is the same mistake as `let x: Id = 5`,
+                    // which was already refused. `ExprKind::Int` types as `i32` flat
+                    // regardless of the expected type, so the literal really is caught.
+                    if let Some(exp) = &expected {
+                        if self.distinct_mismatch(exp, &vt) {
+                            let (w, g) = (exp.display(&self.table), vt.display(&self.table));
+                            let fname = fi.name.name.clone();
+                            self.error(
+                                self.ast.expr_at(fi.value).span,
+                                format!(
+                                    "field `{fname}`: expected `{w}`, found `{g}` — `distinct` types need an explicit `as`"
+                                ),
+                            );
+                        }
+                    }
                 }
                 if let Some(s) = spread {
                     self.infer(scope, typ, self_ty, *s);
@@ -3382,7 +3612,21 @@ impl<'a> TypeChecker<'a> {
                 self.infer(scope, typ, self_ty, *cond);
                 let t = self.infer_block(scope, typ, self_ty, then);
                 if let Some(e) = els {
-                    self.infer(scope, typ, self_ty, *e);
+                    let et = self.infer(scope, typ, self_ty, *e);
+                    // An `if` EXPRESSION has one type, and it is the then-branch's.
+                    // Without this the else-branch could smuggle a foreign distinct
+                    // through the only assignment position that never re-checked it:
+                    // `let c: Id = if p { a } else { b }` type-checked against the
+                    // then-branch alone, so the `Acct` in the else arm was invisible.
+                    if self.distinct_mismatch(&t, &et) {
+                        let (w, g) = (t.display(&self.table), et.display(&self.table));
+                        self.error(
+                            self.ast.expr_at(*e).span,
+                            format!(
+                                "`if` branches disagree: expected `{w}`, found `{g}` — `distinct` types need an explicit `as`"
+                            ),
+                        );
+                    }
                 }
                 t
             }
@@ -3848,6 +4092,17 @@ impl<'a> TypeChecker<'a> {
             };
         }
         if let Ty::Named(i) = base {
+            // A `distinct` inherits its base's MEMBERS: `p.len` on a `distinct P =
+            // str` is the string's `usize` length, `w.x` on a `distinct W = Pt` is
+            // `Pt`'s declared field. Recursing on the peeled base rather than
+            // duplicating the arms above is what keeps the struct case honest —
+            // the per-field visibility check below still runs, at the struct's own
+            // module. (An enum keeps `Unknown`: its payloads project through
+            // `match`, not through a field.)
+            if matches!(self.table.types[*i].kind, TypeKindG::Distinct { .. }) {
+                let peeled = self.peel_distinct(base);
+                return self.field_type(span, &peeled, fname);
+            }
             // Read what we need, dropping the table borrow before any diagnostic.
             let (found, sname, is_struct) = {
                 let decl = &self.table.types[*i];
@@ -4795,7 +5050,18 @@ fn op_symbol(op: BinOp) -> &'static str {
         Gt => ">",
         Le => "<=",
         Ge => ">=",
-        _ => "?",
+        // Completed for the `distinct` inheritance rule, which covers EVERY binary
+        // operator rather than only the six that map to a trait: `a % b` and
+        // `a << b` across two id spaces used to run, and their diagnostic would
+        // otherwise have named the operator `?`.
+        Rem => "%",
+        And => "and",
+        Or => "or",
+        BitAnd => "&",
+        BitOr => "|",
+        BitXor => "^",
+        Shl => "<<",
+        Shr => ">>",
     }
 }
 
@@ -6489,6 +6755,322 @@ mod tests {
             "{prelude}fn main() -> i32 {{ let u: UserId = 5 as UserId return takes_uid(u) }}"
         ));
         assert!(de.is_empty(), "a `UserId` must pass as a `UserId`: {de:?}");
+    }
+
+    /// **A `distinct` inherits its base's operators — with ITSELF, and nothing else.**
+    ///
+    /// The refusal half of the rule, and specifically the eight *laundering* shapes
+    /// that killed the previous attempt at this feature. That attempt exempted an
+    /// operand it judged an "untyped literal", delegating to [`literal_defaulted`],
+    /// whose Binary arm is a **recursive disjunction over the expression tree** — so
+    /// one integer literal anywhere in a subtree exempted the whole operand, and only
+    /// the bare spelling `a + b` was still caught. `a + (b + 1)`, `(a + 1) + b`,
+    /// `a * (b * 2)`, `a - (0 - b)`, `a == (b + 0)` and `a + (b + (0 * 0))` all mixed
+    /// two unrelated id spaces and ran end to end, printing an answer.
+    ///
+    /// They are refused here without any literal predicate at all: the rule reads the
+    /// two operand **types**, `1` types as `i32` and `(b + 1)` types as `Error`, and
+    /// neither is a distinct type. That is a structural property, not a predicate to
+    /// get right — which is the whole reason this shape was chosen.
+    ///
+    /// Every refusal is paired with the spelling that must still compile, because a
+    /// refusal test alone passes just as well against a checker that rejects
+    /// everything.
+    ///
+    /// [`literal_defaulted`]: Self::literal_defaulted
+    #[test]
+    fn a_distinct_inherits_its_base_operators_only_with_itself() {
+        let prelude = "distinct Id = i64\ndistinct Acct = i64\n";
+        let refused = |body: &str| {
+            let (_i, d) = analyze(&format!(
+                "{prelude}fn main() -> i32 {{\n\
+                 \x20   var a: Id = 1 as Id\n\
+                 \x20   let b: Acct = 2 as Acct\n\
+                 \x20   let n: i64 = 3\n\
+                 {body}\n\
+                 \x20   return 0\n\
+                 }}"
+            ));
+            assert!(!d.is_empty(), "must be refused at `check` time: `{body}`");
+            d
+        };
+
+        // The eight laundering shapes. Each is refused at the INNER node, before the
+        // outer node exists — `(b + 1)` is `Acct + i32`, which is already a mix.
+        for body in [
+            "    let z: Id = a + b",             // the bare spelling
+            "    let z: Id = a + (b + 1)",       // the row `literal_defaulted` lost
+            "    let z: Id = (a + 1) + b",
+            "    let z: Id = a * (b * 2)",
+            "    let z: Id = a - (0 - b)",
+            "    print_bool(a == (b + 0))",
+            "    let z: Id = a + (b + (0 * 0))",
+            "    let z: Id = a + (n + 1)",
+            "    a = a + (b + 1)",
+        ] {
+            refused(body);
+        }
+
+        // The left-operand-only hole: HEAD's rule read `lhs` alone, so every one of
+        // these mixed two id spaces and RAN.
+        for body in [
+            "    let z: Id = 1 + a + b",
+            "    let z: Id = 0 + a + b",
+            "    print_bool(0 + a == 0 + b)",
+            "    let z: Id = n + a",
+            "    let z: Id = 1 + a",
+        ] {
+            refused(body);
+        }
+
+        // The operators with no trait mapping at all (`%`, `&`, `<<`): the old rule
+        // covered six operators, this one covers every binary operator.
+        for body in
+            ["    let z: Id = a % b", "    let z: Id = a & b", "    let z: Id = a << b"]
+        {
+            refused(body);
+        }
+
+        // A compound assignment is `a = a OP a`, and it was checked at no position.
+        for body in ["    a += b", "    a += n", "    a = b", "    a = 7"] {
+            refused(body);
+        }
+
+        // POSITIVE CONTROLS. Same-type operators are exactly what this feature adds,
+        // so they must compile — including the ones with no trait (`%`, `&`, `<<`),
+        // the comparisons, and the compound forms.
+        let (_ok, dok) = analyze(&format!(
+            "{prelude}fn main() -> i32 {{\n\
+             \x20   var a: Id = 12 as Id\n\
+             \x20   let c: Id = 5 as Id\n\
+             \x20   let s: Id = a + c - c * c / c % c & c | c ^ c\n\
+             \x20   let t: Id = a << (1 as Id)\n\
+             \x20   a += c\n\
+             \x20   a = s + t\n\
+             \x20   print_bool(a == s)\n\
+             \x20   print_bool(a < s)\n\
+             \x20   print_bool(a != s)\n\
+             \x20   return 0\n\
+             }}"
+        ));
+        assert!(dok.is_empty(), "a distinct with ITSELF must compile: {dok:?}");
+
+        // ...and the cast spelling of every refusal above still works, so the escape
+        // hatch is intact.
+        let (_cast, dcast) = analyze(&format!(
+            "{prelude}fn main() -> i32 {{\n\
+             \x20   var a: Id = 1 as Id\n\
+             \x20   let b: Acct = 2 as Acct\n\
+             \x20   let n: i64 = 3\n\
+             \x20   let z: Id = a + (b as i64 as Id)\n\
+             \x20   a += n as Id\n\
+             \x20   a = (n + 1) as Id\n\
+             \x20   print_int(z as i32)\n\
+             \x20   return 0\n\
+             }}"
+        ));
+        assert!(dcast.is_empty(), "the `as` escape hatch must stay open: {dcast:?}");
+    }
+
+    /// **Inheritance is a POSITIVE list, not "whatever the base does".**
+    ///
+    /// `str == str` and `str + str` pass `check` at HEAD and die in gcc. Inheriting
+    /// them would move a `distinct P = str`'s `==` from a Jestyr refusal to a gcc
+    /// one — which is losing the rejection, not keeping it: `check` is the gate
+    /// people run, and gcc knows nothing about id spaces. So a base with no such
+    /// operator gives its distinct no such operator, and the message says why.
+    ///
+    /// The bool/char rows are the paired controls: they prove the list is a *list*
+    /// and not a blanket refusal of non-integer bases.
+    #[test]
+    fn a_distinct_inherits_no_operator_its_base_lacks() {
+        let (_i, d) = analyze(
+            "distinct P = str\n\
+             fn main() -> i32 {\n\
+             \x20   let p: P = \"hi\" as P\n\
+             \x20   let q: P = \"hi\" as P\n\
+             \x20   print_bool(p == q)\n\
+             \x20   return 0\n\
+             }",
+        );
+        assert!(
+            d.iter().any(|m| m.message.contains("has no `==` operator")),
+            "`str` has no `==`, so `P` must not inherit one: {d:?}"
+        );
+
+        // Arithmetic on a distinct-over-`str` likewise: `+` is not concatenation.
+        let (_j, dj) = analyze(
+            "distinct P = str\ndistinct Q = str\n\
+             fn main() -> i32 {\n\
+             \x20   let p: P = \"a\" as P\n\
+             \x20   let q: Q = \"b\" as Q\n\
+             \x20   let r: P = p + q\n\
+             \x20   return 0\n\
+             }",
+        );
+        assert!(!dj.is_empty(), "two distincts over `str` must not add: {dj:?}");
+
+        // POSITIVE CONTROLS: bases that DO have the operator.
+        let (_k, dk) = analyze(
+            "distinct Flag = bool\ndistinct Ch = char\ndistinct M = f64\n\
+             fn main() -> i32 {\n\
+             \x20   let f: Flag = true as Flag\n\
+             \x20   let c: Ch = 'a' as Ch\n\
+             \x20   let m: M = 1.5 as M\n\
+             \x20   print_bool(f and f)\n\
+             \x20   print_bool(c < c)\n\
+             \x20   print_bool((m + m) > m)\n\
+             \x20   return 0\n\
+             }",
+        );
+        assert!(dk.is_empty(), "bool/char/f64 bases keep their operators: {dk:?}");
+
+        // ...and a base without ARITHMETIC still keeps its comparisons: `char` has
+        // `<` but no `+`, so the list is per-operator, not per-base.
+        let (_l, dl) = analyze(
+            "distinct Ch = char\n\
+             fn main() -> i32 {\n\
+             \x20   let c: Ch = 'a' as Ch\n\
+             \x20   let z: Ch = c + c\n\
+             \x20   return 0\n\
+             }",
+        );
+        assert!(
+            dl.iter().any(|m| m.message.contains("has no `+` operator")),
+            "`char` has no `+`, so `Ch` must not inherit one: {dl:?}"
+        );
+    }
+
+    /// **A hand-written `impl` still wins over inheritance.**
+    ///
+    /// Inheritance supplies the operation the base has; it does not override one the
+    /// author declared. Resolution is impl-first, so the emitted call is unchanged
+    /// for every type that already had an operator impl — including a `distinct`,
+    /// which the operator-trait path has always accepted (only the *derivation* was
+    /// missing).
+    #[test]
+    fn a_hand_written_operator_impl_beats_the_inherited_one() {
+        let (ast, info) = analyze_full(
+            "distinct Tag = i64\n\
+             impl Eq for Tag { fn eq(self, other: Tag) -> bool { return true } }\n\
+             fn main() -> i32 {\n\
+             \x20   let s: Tag = 1 as Tag\n\
+             \x20   let t: Tag = 2 as Tag\n\
+             \x20   print_bool(s == t)\n\
+             \x20   return 0\n\
+             }",
+        );
+        let dispatched = |ast: &Ast, info: &TypeInfo| {
+            (0..ast.exprs.len())
+                .filter(|id| matches!(ast.exprs[*id].kind, ExprKind::Binary { .. }))
+                .filter_map(|id| info.impl_call(ExprId(id as u32)))
+                .any(|c| c.trait_name == "Eq" && c.method == "eq")
+        };
+        assert!(
+            dispatched(&ast, &info),
+            "the `==` must dispatch to `impl Eq for Tag`, not to the inherited integer compare"
+        );
+
+        // POSITIVE CONTROL: the same distinct with NO impl records no dispatch — the
+        // inherited operator lowers to the native C one, which is what makes the
+        // operator half of this feature cost zero emission change.
+        let (_ast2, info2) = analyze_full(
+            "distinct Tag = i64\n\
+             fn main() -> i32 {\n\
+             \x20   let s: Tag = 1 as Tag\n\
+             \x20   let t: Tag = 2 as Tag\n\
+             \x20   print_bool(s == t)\n\
+             \x20   return 0\n\
+             }",
+        );
+        assert!(
+            !dispatched(&_ast2, &info2),
+            "an inherited operator must record no impl dispatch"
+        );
+    }
+
+    /// **A `distinct` inherits its base's MEMBERS, and a sub-view comes back at the
+    /// distinct's own type.**
+    ///
+    /// `.len` on a `distinct P = str` used to type as `Unknown` and reach gcc as
+    /// `'Jestyr_P' has no member named 'j_len'` — `check` said ok. And `p[a..b]`
+    /// typing as a bare `str` is what would have forced 21 casts *inside*
+    /// `std/path` itself, before a single caller was counted. The substitution rule
+    /// (`str: [Range] -> str` inherits as `P: [Range] -> P`) is what takes that 21
+    /// to zero.
+    #[test]
+    fn a_distinct_inherits_its_base_members_and_sub_views() {
+        let (ast, info) = analyze_full(
+            "distinct P = str\n\
+             fn main() -> i32 {\n\
+             \x20   let p: P = \"hello\" as P\n\
+             \x20   let n: usize = p.len\n\
+             \x20   let b: u8 = p[0]\n\
+             \x20   let sub: P = p[0..2]\n\
+             \x20   return 0\n\
+             }",
+        );
+        // The sub-view is the LAST Index expression in the file; its recorded type
+        // must be `P`, not `str` — that is the substitution, and the whole payoff.
+        let mut ranged: Option<Ty> = None;
+        for (id, ed) in ast.exprs.iter().enumerate() {
+            if let ExprKind::Index { index, .. } = &ed.kind {
+                if matches!(ast.expr_at(*index).kind, ExprKind::Range { .. }) {
+                    ranged = Some(info.expr_types[id].clone());
+                }
+            }
+        }
+        assert_eq!(
+            ranged.map(|t| format!("{t:?}")),
+            Some(format!("{:?}", Ty::Named(0))),
+            "`p[0..2]` on a `distinct P = str` must be a `P`"
+        );
+
+        // A distinct over a STRUCT projects the struct's declared fields, at their
+        // own declared types — reads and writes both.
+        let (_a2, d2) = analyze(
+            "struct Pt { x: i32, y: i32 }\ndistinct W = Pt\n\
+             fn main() -> i32 {\n\
+             \x20   var w: W = Pt { x: 3, y: 4 } as W\n\
+             \x20   w.x = 9\n\
+             \x20   print_int(w.x + w.y)\n\
+             \x20   return 0\n\
+             }",
+        );
+        assert!(d2.is_empty(), "a distinct over a struct reads its fields: {d2:?}");
+
+        // NEGATIVE CONTROL: inheritance is of the base's members, not of arbitrary
+        // ones — a field the base does not have is still an error.
+        let (_a3, d3) = analyze(
+            "struct Pt { x: i32 }\ndistinct W = Pt\n\
+             fn main() -> i32 {\n\
+             \x20   let w: W = Pt { x: 3 } as W\n\
+             \x20   print_int(w.nope)\n\
+             \x20   return 0\n\
+             }",
+        );
+        assert!(!d3.is_empty(), "a field the BASE lacks must still be refused");
+    }
+
+    /// **A cyclic `distinct` declaration must not hang the compiler.**
+    ///
+    /// `distinct A = B` / `distinct B = A` passes `check` at HEAD (measured), so
+    /// every peel of a distinct's base is walking a graph that can contain a loop.
+    /// The cap is the safety property; this test is what proves the cap is wired in
+    /// rather than merely written — without it, `peel_distinct` spins forever the
+    /// first time anyone writes `a + a` on a cyclic type.
+    #[test]
+    fn a_cyclic_distinct_declaration_terminates() {
+        let (_i, _d) = analyze(
+            "distinct A = B\ndistinct B = A\n\
+             fn main() -> i32 {\n\
+             \x20   let x: A = 1 as A\n\
+             \x20   let y: A = x + x\n\
+             \x20   print_int(0)\n\
+             \x20   return 0\n\
+             }",
+        );
+        // Reaching here at all is the assertion: the peel terminated.
     }
 
     /// **`cptr` is opaque, and every way of looking through it is refused.**
