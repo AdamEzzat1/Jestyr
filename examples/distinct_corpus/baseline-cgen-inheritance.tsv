@@ -1,0 +1,45 @@
+a01_add_two_distincts	TYPECK_REJECT	error: operator `+` mixes `Id` with `Acct` — unrelated `distinct` types over the same base; cast one side
+a02_add_paren_right_literal	TYPECK_REJECT	error: operator `+` mixes `Acct` with `i32` — a `distinct` type shares its base's operations only with itself; cast one side
+a03_add_left_paren_literal	TYPECK_REJECT	error: operator `+` mixes `Id` with `i32` — a `distinct` type shares its base's operations only with itself; cast one side
+a04_mul_nested_literal	TYPECK_REJECT	error: operator `*` mixes `Acct` with `i32` — a `distinct` type shares its base's operations only with itself; cast one side
+a05_sub_zero_minus	TYPECK_REJECT	error: operator `-` mixes `i32` with `Acct` — a `distinct` type shares its base's operations only with itself; cast one side
+a06_eq_plus_zero	TYPECK_REJECT	error: operator `+` mixes `Acct` with `i32` — a `distinct` type shares its base's operations only with itself; cast one side
+a07_add_deep_zero	TYPECK_REJECT	error: operator `+` mixes `Acct` with `i32` — a `distinct` type shares its base's operations only with itself; cast one side
+a08_add_base_plus_one	TYPECK_REJECT	error: operator `+` mixes `Id` with `i64` — a `distinct` type shares its base's operations only with itself; cast one side
+a09_assign_add_launder	TYPECK_REJECT	error: operator `+` mixes `Acct` with `i32` — a `distinct` type shares its base's operations only with itself; cast one side
+a10_literal_leftmost_chain	TYPECK_REJECT	error: operator `+` mixes `i32` with `Id` — a `distinct` type shares its base's operations only with itself; cast one side
+a11_zero_prefix_chain	TYPECK_REJECT	error: operator `+` mixes `i32` with `Id` — a `distinct` type shares its base's operations only with itself; cast one side
+a12_zero_prefix_eq	TYPECK_REJECT	error: operator `+` mixes `i32` with `Id` — a `distinct` type shares its base's operations only with itself; cast one side
+a13_compound_assign_cross	TYPECK_REJECT	error: assignment: expected `Id`, found `Acct` — `distinct` types need an explicit `as`
+a14_compound_assign_base	TYPECK_REJECT	error: assignment: expected `Id`, found `i64` — `distinct` types need an explicit `as`
+a15_unary_minus	RUN_OK	-1
+a16_add_distinct_and_base	TYPECK_REJECT	error: operator `+` mixes `Id` with `i64` — a `distinct` type shares its base's operations only with itself; cast one side
+a17_add_base_and_distinct	TYPECK_REJECT	error: operator `+` mixes `i64` with `Id` — a `distinct` type shares its base's operations only with itself; cast one side
+a18_add_literal_right	TYPECK_REJECT	error: operator `+` mixes `Id` with `i32` — a `distinct` type shares its base's operations only with itself; cast one side
+a19_add_literal_left	TYPECK_REJECT	error: operator `+` mixes `i32` with `Id` — a `distinct` type shares its base's operations only with itself; cast one side
+a20_nested_parens_only	TYPECK_REJECT	error: operator `+` mixes `Id` with `Acct` — unrelated `distinct` types over the same base; cast one side
+a21_div_cross	TYPECK_REJECT	error: operator `/` mixes `Id` with `Acct` — unrelated `distinct` types over the same base; cast one side
+a22_rem_cross	TYPECK_REJECT	error: operator `%` mixes `Id` with `Acct` — unrelated `distinct` types over the same base; cast one side
+a23_bitand_cross	TYPECK_REJECT	error: operator `&` mixes `Id` with `Acct` — unrelated `distinct` types over the same base; cast one side
+a24_shl_cross	TYPECK_REJECT	error: operator `<<` mixes `Id` with `Acct` — unrelated `distinct` types over the same base; cast one side
+a25_lt_cross	TYPECK_REJECT	error: operator `<` mixes `Id` with `Acct` — unrelated `distinct` types over the same base; cast one side
+a26_ne_cross	TYPECK_REJECT	error: operator `!=` mixes `Id` with `Acct` — unrelated `distinct` types over the same base; cast one side
+a27_add_same_distinct	RUN_OK	3
+a28_cast_then_add_control	RUN_OK	3
+a29_bool_cond_cross	RUN_OK	2
+a30_str_concat_cross	TYPECK_REJECT	error: operator `+` mixes `P` with `Q` — unrelated `distinct` types over the same base; cast one side
+b01_let_init_base_literal	TYPECK_REJECT	error: expected `Id`, found `i32` — `distinct` types need an explicit `as`
+b02_let_init_distinct_to_base	TYPECK_REJECT	error: expected `i64`, found `Id` — `distinct` types need an explicit `as`
+b03_let_init_other_distinct	TYPECK_REJECT	error: expected `Id`, found `Acct` — `distinct` types need an explicit `as`
+b04_assign_stmt_other_distinct	TYPECK_REJECT	error: assignment: expected `Id`, found `Acct` — `distinct` types need an explicit `as`
+b05_assign_stmt_base_literal	TYPECK_REJECT	error: assignment: expected `Id`, found `i32` — `distinct` types need an explicit `as`
+b06_assign_stmt_base_var	TYPECK_REJECT	error: assignment: expected `Id`, found `i64` — `distinct` types need an explicit `as`
+b07_arg_base_for_distinct	TYPECK_REJECT	error: argument `x` of `takes_id`: expected `Id`, found `i64` — `distinct` types need an explicit `as`
+b08_arg_other_distinct	TYPECK_REJECT	error: argument `x` of `takes_id`: expected `Id`, found `Acct` — `distinct` types need an explicit `as`
+b09_arg_distinct_for_base	TYPECK_REJECT	error: argument `x` of `takes_i64`: expected `i64`, found `Id` — `distinct` types need an explicit `as`
+b10_return_base_for_distinct	TYPECK_REJECT	error: return: expected `Id`, found `i32` — `distinct` types need an explicit `as`
+b11_return_distinct_for_base	TYPECK_REJECT	error: return: expected `i64`, found `Id` — `distinct` types need an explicit `as`
+b12_struct_lit_field_base	TYPECK_REJECT	error: field `id`: expected `Id`, found `i32` — `distinct` types need an explicit `as`
+b13_struct_lit_field_other_distinct	TYPECK_REJECT	error: field `id`: expected `Id`, found `Acct` — `distinct` types need an explicit `as`
+b14_struct_field_assign_other	TYPECK_REJECT	error: assignment: expected `Id`, found `Acct` — `distinct` types need an explicit `as`
+b15_array_lit_elem_base	TYPECK_REJECT	error: array element: expected `Id`, found `i32` — `distinct` types need an explicit `as`

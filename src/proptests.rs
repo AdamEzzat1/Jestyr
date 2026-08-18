@@ -7374,6 +7374,162 @@ fn main() -> i32 {\n\
     }
 }
 
+/// **The cgen half of `distinct` operation inheritance** (design §6.1/§6.2/§6.5).
+///
+/// `distinct D = Base` lowers to `typedef <base C type> Jestyr_D`, so `D` and `Base` are
+/// literally the same C type and an inherited member emits byte-for-byte what the base
+/// emits. What the backend needs the peel for is **dispatch** — choosing an arm of
+/// Field / Index / the index-assign lvalue path at all. Each shape below is paired with
+/// the bare-base spelling it must keep emitting identically: asserting only that the
+/// distinct form is right would pass just as well against a backend that emitted the
+/// same (wrong) thing for both.
+mod distinct_members_cgen {
+    use super::compile;
+
+    /// The BODY of `f`, so a shape assertion cannot be satisfied by the C prelude —
+    /// which is full of `.len` and `JestyrStr` and would make a whole-file `contains`
+    /// vacuously true.
+    fn body(src: &str) -> String {
+        let (c, d) = compile(src);
+        assert_eq!(d, 0, "program must compile clean:\n{c}");
+        // The DEFINITION, not the prototype: the prototype ends its line in `;`, the
+        // definition is followed by the brace on the next line. (Matching on `(void)`
+        // would silently skip every `f` that takes a parameter.)
+        let at = c
+            .match_indices("jestyr_f(")
+            .map(|(i, _)| i)
+            .find(|&i| c[i..].lines().next().is_some_and(|l| l.ends_with(')')))
+            .unwrap_or_else(|| panic!("no `f` definition in:\n{c}"));
+        let rest = &c[at..];
+        let end = rest.find("\n}\n").map(|i| i + 2).unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    /// `.len` on a `distinct P = str` must reach the string view's REAL C field, exactly
+    /// as the bare `str` does — not the `.j_len` struct-field spelling, which is the
+    /// member `JestyrStr` has not got and the reason `c01` died in gcc.
+    #[test]
+    fn a_distinct_over_str_projects_the_string_views_own_fields() {
+        let d = body("distinct P = str\nfn f() -> usize { let p: P = \"hi\" as P\n return p.len }\n");
+        assert!(d.contains("return j_p.len;"), "distinct `.len` is not the view's field:\n{d}");
+        assert!(!d.contains("j_len"), "distinct `.len` took the struct-field arm:\n{d}");
+        // Positive control: the bare base emits the same projection, so the assertion
+        // above is about the peel and not about `.len` being spelled that way at all.
+        let b = body("fn f() -> usize { let p: str = \"hi\"\n return p.len }\n");
+        assert!(b.contains("return j_p.len;"), "bare `str` control moved:\n{b}");
+    }
+
+    /// A byte index and a sub-view, likewise. The sub-view is the substitution rule's
+    /// half (`str: [Range] -> str` inherits as `P: [Range] -> P`), and it must still
+    /// lower to the same zero-copy `jestyr_rt_substr` the base does.
+    #[test]
+    fn a_distinct_over_str_indexes_and_sub_views_like_its_base() {
+        let prog = |t: &str, cast: &str| {
+            format!(
+                "distinct P = str\nfn f() -> i32 {{ let p: {t} = \"hi\"{cast}\n let q: {t} = p[0..1]\n return (p[0] as i32) + (q.len as i32) }}\n"
+            )
+        };
+        let d = body(&prog("P", " as P"));
+        let b = body(&prog("str", ""));
+        assert!(d.contains("jestyr_rt_substr(j_p, 0, 1)"), "sub-view is not the substr view:\n{d}");
+        assert!(d.contains("((uint8_t)(j_p).ptr[(0)])"), "byte index is not a buffer read:\n{d}");
+        // The two differ only by the boundary cast on the initializer; every operation
+        // line is identical, which is the claim.
+        assert_eq!(
+            d.replace("Jestyr_P", "JestyrStr").replace("(JestyrStr)(JSTR(\"hi\"))", "JSTR(\"hi\")"),
+            b,
+            "the distinct's operations must emit what the base's do:\n{d}\n---\n{b}"
+        );
+    }
+
+    /// A slice-index WRITE through a distinct is a different emission site from the
+    /// read — it needs an lvalue, so an unpeeled base silently produced the
+    /// bounds-checked *value* form and gcc reported "lvalue required".
+    #[test]
+    fn a_distinct_over_a_slice_writes_through_the_element_lvalue() {
+        let d = body("distinct Buf = []i32\nfn f(mut xs: []i32) -> i32 { var b: Buf = xs as Buf\n b[0] = 7\n return b[0] }\n");
+        assert!(d.contains(".ptr[_ix0] = 7;"), "the write is not through the element:\n{d}");
+        assert!(!d.contains("_ix0]; }) ="), "the write went through the VALUE form:\n{d}");
+        assert!(d.contains("JestyrSlice_i32 _s0"), "the spilled temp is not the base's C type:\n{d}");
+        let b = body("fn f(mut xs: []i32) -> i32 { var b: []i32 = xs\n b[0] = 7\n return b[0] }\n");
+        assert!(b.contains(".ptr[_ix0] = 7;"), "bare `[]i32` control moved:\n{b}");
+    }
+
+    /// A place chain THROUGH a checked index whose base is a distinct: `is_checked_index`
+    /// has to peel the same way the Index arm does, or the two disagree about whether a
+    /// statement expression was emitted and the chain reaches for an lvalue that is not
+    /// there.
+    #[test]
+    fn a_place_chain_through_a_distinct_slice_takes_the_element_address() {
+        let d = body(
+            "struct Pt { x: i32 }\ndistinct Row = []Pt\nfn f(mut r0: []Pt) -> i32 { var r: Row = r0 as Row\n r[0].x = 7\n return r[0].x }\n",
+        );
+        assert!(d.contains("&_s0.ptr[_ix0]; })).j_x = 7;"), "the chain is not through the address:\n{d}");
+        let b = body("struct Pt { x: i32 }\nfn f(mut r0: []Pt) -> i32 { var r: []Pt = r0\n r[0].x = 7\n return r[0].x }\n");
+        assert!(b.contains("&_s0.ptr[_ix0]; })).j_x = 7;"), "bare `[]Pt` control moved:\n{b}");
+    }
+
+    /// A `distinct` over a STRUCT still projects to an assignable field: the peel
+    /// changes which arm is chosen, not whether the base is a place.
+    #[test]
+    fn a_distinct_over_a_struct_still_projects_its_fields() {
+        let d = body(
+            "struct Pt { x: i32 }\ndistinct W = Pt\nfn f() -> i32 { var w: W = Pt { x: 1 } as W\n w.x = 9\n return w.x }\n",
+        );
+        assert!(d.contains("j_w.j_x = 9;"), "struct field write is not a place:\n{d}");
+        let b = body("struct Pt { x: i32 }\nfn f() -> i32 { var w: Pt = Pt { x: 1 }\n w.x = 9\n return w.x }\n");
+        assert!(b.contains("j_w.j_x = 9;"), "bare struct control moved:\n{b}");
+    }
+
+    /// A `distinct` whose base lowers to an ANONYMOUS-struct typedef must be emitted
+    /// AFTER that typedef. It was emitted two lines before it (`c07`–`c10`:
+    /// "unknown type name 'JestyrSlice_i64'"), because the forward-typedef section runs
+    /// before the definition capture.
+    #[test]
+    fn a_distinct_over_a_slice_follows_its_bases_definition() {
+        let (c, d) = compile(
+            "distinct Buf = []i32\nfn f(read b: Buf) -> usize { return b.len }\nfn main() -> i32 { return 0 }\n",
+        );
+        assert_eq!(d, 0, "must compile clean:\n{c}");
+        let base = c.find("} JestyrSlice_i32;").expect("no slice typedef");
+        let alias = c.find("typedef JestyrSlice_i32 Jestyr_Buf;").expect("no distinct typedef");
+        assert!(base < alias, "the `distinct` typedef precedes the type it aliases:\n{c}");
+    }
+
+    /// A `distinct` over a PRIMITIVE keeps its old position in the forward section —
+    /// the split is what makes the reorder byte-neutral for every existing program.
+    #[test]
+    fn a_distinct_over_a_primitive_stays_in_the_forward_section() {
+        let (c, d) = compile("distinct Id = i64\nfn main() -> i32 { return 0 }\n");
+        assert_eq!(d, 0, "must compile clean:\n{c}");
+        let alias = c.find("typedef int64_t Jestyr_Id;").expect("no distinct typedef");
+        let protos = c.find("int32_t jestyr_main(void);").expect("no prototypes");
+        assert!(alias < protos, "primitive-based distinct left the forward section:\n{c}");
+    }
+
+    /// `(x as T).f` — C binds `.` tighter than a cast, so `({cty})({e})` in a field
+    /// BASE parsed as `({cty})(({e}).f)`: a `size_t` cast to a struct. The second half
+    /// is the anti-vacuity control — it contains no `distinct` at all and failed the
+    /// same way, which is what says the fix belongs in the cast's parenthesisation
+    /// rather than in the `distinct` peel.
+    #[test]
+    fn a_cast_in_a_field_base_is_parenthesized() {
+        let d = body("distinct P = str\nfn f() -> usize { let p: P = \"hi\" as P\n return (p as str).len }\n");
+        assert!(d.contains("((JestyrStr)(j_p)).len"), "distinct cast base unparenthesized:\n{d}");
+        let b = body("fn f() -> usize { let s: str = \"hi\"\n return (s as str).len }\n");
+        assert!(b.contains("((JestyrStr)(j_s)).len"), "BARE-BASE cast still unparenthesized:\n{b}");
+    }
+
+    /// …and only there. Parenthesising inside the `Cast` arm itself would move every
+    /// cast in every golden; a cast in any other position keeps its old spelling.
+    #[test]
+    fn a_cast_outside_a_field_base_is_unchanged() {
+        let d = body("fn f() -> i64 { let n: i32 = 3\n return n as i64 }\n");
+        assert!(d.contains("(int64_t)(j_n)"), "the cast lost its old spelling:\n{d}");
+        assert!(!d.contains("((int64_t)(j_n))"), "a plain cast was re-parenthesized:\n{d}");
+    }
+}
+
 /// Reference implementation of correctly-rounded decimal→`f64` parsing via
 /// **Eisel–Lemire** — the algorithm and power-of-ten table that the Jestyr
 /// `core.parse_float` will mirror. Validated end-to-end against Rust's own
@@ -14301,7 +14457,7 @@ fn main() -> i32 {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "distinct_ops.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "drop_take.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr", "test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr", "caps_demo.jtr", "fs_test.jtr", "env_test.jtr", "time_test.jtr", "str.jtr", "str_test.jtr", "str_demo.jtr", "sink.jtr", "cursor.jtr", "writer.jtr", "sink_test.jtr", "cursor_test.jtr", "writer_test.jtr", "writer_demo.jtr", "pathbuf.jtr", "pathbuf_test.jtr", "hashmap.jtr", "hashmap_test.jtr", "hashmap_demo.jtr", "set.jtr", "set_test.jtr", "deque.jtr", "deque_test.jtr", "deque_demo.jtr", "smallvec.jtr", "smallvec_test.jtr", "file.jtr", "file_test.jtr", "file_demo.jtr", "cstring.jtr", "cstring_test.jtr"];
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "distinct_ops.jtr", "distinct_members.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "drop_take.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr", "test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr", "caps_demo.jtr", "fs_test.jtr", "env_test.jtr", "time_test.jtr", "str.jtr", "str_test.jtr", "str_demo.jtr", "sink.jtr", "cursor.jtr", "writer.jtr", "sink_test.jtr", "cursor_test.jtr", "writer_test.jtr", "writer_demo.jtr", "pathbuf.jtr", "pathbuf_test.jtr", "hashmap.jtr", "hashmap_test.jtr", "hashmap_demo.jtr", "set.jtr", "set_test.jtr", "deque.jtr", "deque_test.jtr", "deque_demo.jtr", "smallvec.jtr", "smallvec_test.jtr", "file.jtr", "file_test.jtr", "file_demo.jtr", "cstring.jtr", "cstring_test.jtr"];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
     /// target). This is the acceptance bar the R2 fixpoint ultimately rests on. `DUMP_DIVERGE=1`
@@ -14347,6 +14503,63 @@ fn main() -> i32 {
         }
         assert!(diverged.is_empty(), "Jestyr cgen diverged from the reference on: {diverged:?}");
         eprintln!("cgen golden: {checked} file(s)' emitted C byte-identical");
+    }
+
+    /// **The `distinct` member/index/place emission, end to end on BOTH compilers.**
+    ///
+    /// `examples/distinct_members.jtr` is the file the cgen half of operation
+    /// inheritance is proved on: `.len`/`.ptr` and a byte index over a `distinct P =
+    /// str`, a substituted sub-view, a bounds-checked read AND write through a
+    /// `distinct Buf = []i32`, an index write through a `distinct Trip = [3]i32`, two
+    /// place chains (`r[0].x = v` over a slice and over an array), struct-field
+    /// projection, a `String`-based distinct, and a cast in a field base — paired with
+    /// the bare-base spelling of that last one, which has no `distinct` in it at all.
+    ///
+    /// `jestyr_cgen_matches_reference` proves the two compilers agree byte-for-byte.
+    /// This proves the bytes are C: the previous attempt at this emission shipped
+    /// `return (j_p)[];` from `jc` — not valid C — while `jestyrc` was fine, and it was
+    /// invisible because the one file exercising it was never allowlisted. The port's
+    /// own output is compiled and run here, and its stdout must equal the reference's.
+    #[test]
+    fn jestyr_cgen_distinct_members_compiles_and_runs() {
+        let file = "examples/distinct_members.jtr";
+        let exe = build_exe("examples/std/cgen.jtr");
+        let c_src = jestyr_cgen_dump(&exe, file).join("\n") + "\n";
+        let dir = std::env::temp_dir();
+        let cfile = dir.join("jestyr_port_distinct_members.c");
+        let out_exe = dir.join(format!("jestyr_port_distinct_members{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&cfile, &c_src).unwrap();
+        let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
+        let st = Command::new(&cc)
+            .args(crate::CC_FLAGS)
+            .arg("-o")
+            .arg(&out_exe)
+            .arg(&cfile)
+            .status()
+            .unwrap();
+        assert!(st.success(), "the PORT's C for {file} does not compile");
+        let ran = Command::new(&out_exe).output().unwrap();
+        assert!(ran.status.success(), "the port-built {file} exited non-zero");
+        let got: Vec<String> =
+            String::from_utf8(ran.stdout).unwrap().split_whitespace().map(|s| s.to_string()).collect();
+        assert_eq!(got, toks(file), "port-built and reference-built {file} disagree");
+        // Anti-vacuity: the program must actually have printed something, and the exact
+        // values are the ones the file's inline comments claim.
+        assert_eq!(
+            got,
+            [
+                "5", "104", "111", "true", // .len / [0] / [4] / .ptr over `distinct P = str`
+                "2", "he", "lo", // the substituted sub-views
+                "5", "3", "5", // (p as str).len, (w as Pt).x, the bare-base control
+                "3", "20", "99", "35", "2", // `distinct Buf = []i32`: len, read, write, +=, sub-view
+                "3", "2", "9", // `distinct Trip = [3]i32`: const len, read, write
+                "7", "8", "8", // the slice place chain
+                "7", "8", // the array place chain
+                "3", "9", "10", // struct-field read and write through the distinct
+                "4", // `distinct Owned = String`'s O(1) byte length
+            ]
+            .map(String::from)
+        );
     }
 
     /// **Test-mode golden (`jestyrc test` parity).** For every allowlisted corpus file, the

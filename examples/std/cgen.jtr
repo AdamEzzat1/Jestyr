@@ -764,6 +764,56 @@ fn expr_is_slice(read c: typeck.Checker, eid: i32) -> bool {
     return d.kind == 8
 }
 
+// ---- `distinct` representation peeling (mirrors the reference's `peel_distinct`/`repr_of`) ----
+//
+// `distinct D = Base` lowers to `typedef <base C type> Jestyr_D`, so `D` and `Base` are
+// LITERALLY the same C type and an inherited operation emits byte-for-byte what the base
+// emits. What the backend needs the peel for is DISPATCH — deciding which arm of Field /
+// Index / the index-assign lvalue path to take at all. Without it a `distinct P = str`
+// reached the struct-field arm and emitted `.j_len`, a member `JestyrStr` has not got.
+//
+// The REPRESENTATION TyId of expr `eid`: its recorded type with every `distinct` layer
+// removed. Capped at 16 hops for the same reason typeck's is — `check` accepts a cyclic
+// `distinct A = B` / `distinct B = A` today, and an uncapped walk would hang the compiler.
+// tdecl slot 2 = kind (2 = distinct), slot 9 = the base TyId.
+fn repr_tyid(read c: typeck.Checker, eid: i32) -> i32 {
+    var cur: i32 = list.get(i32, c.et, eid as usize)
+    var i: i32 = 0
+    for i < 16 {
+        if cur < 0 { return cur }
+        let d: typeck.TyData = list.get(typeck.TyData, c.tys, cur as usize)
+        if d.kind != 15 { return cur }                            // not Named
+        if list.get(i32, c.tdecl, (d.x * 10 + 2) as usize) != 2 { return cur }
+        cur = list.get(i32, c.tdecl, (d.x * 10 + 9) as usize)     // the distinct's base
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Is the REPRESENTATION of expr `eid` the primitive `str`? (TyData kind 2 Prim, code 14.)
+fn repr_is_str(read c: typeck.Checker, eid: i32) -> bool {
+    let tid: i32 = repr_tyid(c, eid)
+    if tid < 0 { return false }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+    return d.kind == 2 and d.x == 14
+}
+
+// Is the REPRESENTATION of expr `eid` the primitive with code `pc`?
+fn repr_is_prim(read c: typeck.Checker, eid: i32, pc: i32) -> bool {
+    let tid: i32 = repr_tyid(c, eid)
+    if tid < 0 { return false }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+    return d.kind == 2 and d.x == pc
+}
+
+// Is the REPRESENTATION of expr `eid` a slice `[]T`? (TyData kind 8.)
+fn repr_is_slice(read c: typeck.Checker, eid: i32) -> bool {
+    let tid: i32 = repr_tyid(c, eid)
+    if tid < 0 { return false }
+    let d: typeck.TyData = list.get(typeck.TyData, c.tys, tid as usize)
+    return d.kind == 8
+}
+
 // The tdecl row of expr `eid`'s type if it is a Named ENUM (tdecl kind 1), else -1. The `Jestyr_<E>`
 // tag prefix and payload C types come from this row's name.
 fn expr_enum_row(read c: typeck.Checker, eid: i32) -> i32 {
@@ -1000,9 +1050,12 @@ fn is_checked_index(read g: Cg, read p: parser.Parser, read src: str, read c: ty
     let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
     if e.kind != 6 { return false }                   // Index
     // A slice spills only when the bounds check survives; a refinement-proved index emits
-    // `(b).ptr[(i)]`, which is already an lvalue.
-    if expr_is_slice(c, e.a) { return !index_in_range(g, p, src, e.a, e.b) }
-    let bt: i32 = list.get(i32, c.et, e.a as usize)
+    // `(b).ptr[(i)]`, which is already an lvalue. REPRESENTATION-based, so a
+    // `distinct Buf = []i64` answers the same as its base — this must agree with the Index
+    // arm's own peel, or the two disagree about whether a statement expression was emitted
+    // and a place chain reaches for an lvalue that is not there.
+    if repr_is_slice(c, e.a) { return !index_in_range(g, p, src, e.a, e.b) }
+    let bt: i32 = repr_tyid(c, e.a)
     if bt < 0 { return false }
     let bd: typeck.TyData = list.get(typeck.TyData, c.tys, bt as usize)
     return bd.kind == 9                               // a fixed-size array ALWAYS spills through &base
@@ -1047,15 +1100,17 @@ fn place_through_genref_deref(read p: parser.Parser, read c: typeck.Checker, eid
 fn emit_place(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, eid: i32, wr: bool) {
     let e: parser.ExprData = list.get(parser.ExprData, p.ex, eid as usize)
     if e.kind == 5 {                                  // Field
-        let bt: i32 = list.get(i32, c.et, e.a as usize)
+        let bt: i32 = repr_tyid(c, e.a)
         var barr: bool = false
         if bt >= 0 {
             let bd: typeck.TyData = list.get(typeck.TyData, c.tys, bt as usize)
             if bd.kind == 9 { barr = true }
         }
         // Only a struct-shaped base projects to an assignable field. A slice's `.ptr`/`.len`, a
-        // `str`'s views and an array's constant `.len` are computed, never places.
-        if barr or expr_is_slice(c, e.a) or expr_is_str(c, e.a) or expr_is_prim(c, e.a, 17) {
+        // `str`'s views and an array's constant `.len` are computed, never places. Peeled, so a
+        // `distinct` over a STRUCT still projects (`w.x = 9`) while one over a slice/array/`str`
+        // correctly falls back to `emit_expr`.
+        if barr or repr_is_slice(c, e.a) or repr_is_str(c, e.a) or repr_is_prim(c, e.a, 17) {
             emit_expr(sb, p, src, c, g, eid)
             return
         }
@@ -1065,7 +1120,7 @@ fn emit_place(mut sb: String, read p: parser.Parser, read src: str, read c: type
         return
     }
     if e.kind == 6 {                                  // Index
-        let bt: i32 = list.get(i32, c.et, e.a as usize)
+        let bt: i32 = repr_tyid(c, e.a)
         if bt >= 0 {
             let bd: typeck.TyData = list.get(typeck.TyData, c.tys, bt as usize)
             if bd.kind == 9 {                         // array: `(*({ A* _a = &(<place>); …; &_a->a[_ix]; }))`
@@ -1102,7 +1157,7 @@ fn emit_place(mut sb: String, read p: parser.Parser, read src: str, read c: type
                 return
             }
         }
-        if expr_is_slice(c, e.a) and !index_in_range(g, p, src, e.a, e.b) {
+        if repr_is_slice(c, e.a) and !index_in_range(g, p, src, e.a, e.b) {
             // The spilled `{ptr,len}` view is a copy, but the address taken points into the
             // *buffer*, so it outlives the statement expression — a slice copy names the same
             // elements.
@@ -1384,7 +1439,11 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         let fname: str = src[e.x as usize .. e.y as usize]
         // A fixed-size array's `.len` is its CONSTANT length, not a struct field — the base is a
         // place expression, so not emitting it loses no side effect (mirrors the reference).
-        let bt: i32 = list.get(i32, c.et, e.a as usize)
+        // REPRESENTATION-based throughout this arm: a `distinct` inherits its base's MEMBERS
+        // (`p.len` on a `distinct P = str`, `w.x` on a `distinct W = Pt`), so the arm is chosen
+        // on what the value IS in C. Without the peel every distinct fell through to `.j_len`,
+        // a member `JestyrStr` has not got.
+        let bt: i32 = repr_tyid(c, e.a)
         if bt >= 0 {
             let bd: typeck.TyData = list.get(typeck.TyData, c.tys, bt as usize)
             if bd.kind == 9 and str_eq(fname, "len") {
@@ -1394,14 +1453,23 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
                 return
             }
         }
+        // `(x as T).f` — C binds `.` TIGHTER than a cast, so the `(<cty>)(<inner>)` a Cast
+        // base emits parses as `(JestyrStr)((j_p).len)`: a `size_t` cast to a struct,
+        // "conversion to non-scalar type requested". The base position needs parens of its
+        // own. Gated on the base really being a Cast (kind 11) so every existing golden is
+        // byte-identical. Not a `distinct` bug — `(s as str).len` on a plain `str` fails
+        // the same way.
+        let bcast: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
+        if bcast.kind == 11 { string_push(sb, "(") }
         emit_expr(sb, p, src, c, g, e.a)
+        if bcast.kind == 11 { string_push(sb, ")") }
         // A string view's `len`/`ptr`/`cstr` are real C fields (not `j_`-prefixed).
-        if expr_is_str(c, e.a) {
+        if repr_is_str(c, e.a) {
             if str_eq(fname, "len") { string_push(sb, ".len")  return }
             if str_eq(fname, "ptr") or str_eq(fname, "cstr") { string_push(sb, ".ptr")  return }
         }
         // A slice's `ptr`/`len` are real C fields too.
-        if expr_is_slice(c, e.a) {
+        if repr_is_slice(c, e.a) {
             if str_eq(fname, "len") or str_eq(fname, "ptr") {
                 string_push(sb, ".")
                 string_push(sb, fname)
@@ -1409,7 +1477,7 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             }
         }
         // An owned `String`'s byte length is its real C field (O(1)).
-        if expr_is_prim(c, e.a, 17) {                 // prim code 17 = String
+        if repr_is_prim(c, e.a, 17) {                 // prim code 17 = String
             if str_eq(fname, "len") { string_push(sb, ".len")  return }
         }
         string_push(sb, ".j_")
@@ -1417,7 +1485,10 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         return
     }
     if e.kind == 6 {                                  // Index. `s[lo..hi]` on a str -> substr sub-view
-        if expr_is_str(c, e.a) {
+        // REPRESENTATION-based: `p[0]` on a `distinct P = str` reads a byte and `p[0..2]` takes
+        // the zero-copy sub-view. Typeck hands the sub-view back AT `P` (the substitution rule),
+        // but the C is identical either way — `Jestyr_P` IS `JestyrStr`.
+        if repr_is_str(c, e.a) {
             let ix: parser.ExprData = list.get(parser.ExprData, p.ex, e.b as usize)
             if ix.kind == 13 {                        // Range: op=inclusive, a=lo (-1 none), b=hi (-1 none)
                 string_push(sb, "jestyr_rt_substr(")
@@ -1449,7 +1520,7 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_push(sb, ")])")
             return
         }
-        if expr_is_slice(c, e.a) {                    // slice indexing
+        if repr_is_slice(c, e.a) {                    // slice indexing
             let sx: parser.ExprData = list.get(parser.ExprData, p.ex, e.b as usize)
             if sx.kind == 13 {                        // Range -> a narrower view of the same buffer
                 // `{ ptr, len }` in, `{ ptr + lo, hi - lo }` out: pointer arithmetic and
@@ -1464,7 +1535,7 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
                 emit_expr(rb, p, src, c, g, e.a)
                 let n: i32 = g.tmp
                 g.tmp = g.tmp + 1
-                let sty: i32 = list.get(i32, c.et, e.a as usize)
+                let sty: i32 = repr_tyid(c, e.a)
                 var lob: String = string_new()
                 if sx.a >= 0 { emit_expr(lob, p, src, c, g, sx.a) } else { string_push(lob, "0") }
                 var hib: String = string_new()
@@ -1528,7 +1599,7 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             let n: i32 = g.tmp
             g.tmp = g.tmp + 1
             string_push(sb, "({ ")
-            emit_ty_c(sb, p, src, c, list.get(i32, c.et, e.a as usize))
+            emit_ty_c(sb, p, src, c, repr_tyid(c, e.a))
             string_push(sb, " _s")
             push_uint(sb, n as i64)
             string_push(sb, " = (")
@@ -1548,7 +1619,7 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             string_push(sb, "]; })")
             return
         }
-        let bt: i32 = list.get(i32, c.et, e.a as usize)
+        let bt: i32 = repr_tyid(c, e.a)
         if bt >= 0 {
             let bd: typeck.TyData = list.get(typeck.TyData, c.tys, bt as usize)
             if bd.kind == 9 {                         // array indexing: spill the address, assert, index
@@ -1774,7 +1845,9 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         }
         let tgt: parser.ExprData = list.get(parser.ExprData, p.ex, e.a as usize)
         if tgt.kind == 6 {
-            let btid: i32 = list.get(i32, c.et, tgt.a as usize)
+            // REPRESENTATION again: a `distinct Buf = []i64` writes through the same
+            // `{ptr,len}` lvalue its base does, and the spilled temp's C type is the base's.
+            let btid: i32 = repr_tyid(c, tgt.a)
             if btid >= 0 {
                 let bd: typeck.TyData = list.get(typeck.TyData, c.tys, btid as usize)
                 if bd.kind == 8 {                     // slice-index WRITE: fold into the stmt-expr
@@ -8467,11 +8540,22 @@ fn emit_forward_types(mut sb: String, read p: parser.Parser, read src: str) {
         let iid: i32 = list.get(i32, p.roots, r as usize)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 1 {                             // distinct: `typedef <base> Jestyr_<name>;`
-            string_push(sb, "typedef ")
-            emit_c_ty(sb, p, src, it.a)               // a = base TypeId
-            string_push(sb, " Jestyr_")
-            string_push(sb, src[it.x .. it.y])
-            string_push(sb, ";\n")
+            // …unless the base lowers to an ANONYMOUS-struct typedef (`distinct Buf = []i64`
+            // -> `JestyrSlice_i64`), which nothing has defined this early — the forward
+            // section runs before the definition capture. Those go through
+            // `emit_distinct_defs`, which orders them after the base. Every other base (a
+            // primitive, a pointer, a named aggregate) keeps its position here, so the
+            // emitted C of every existing program is unchanged.
+            var dbase: String = string_new()
+            emit_c_ty(dbase, p, src, it.a)            // a = base TypeId
+            if !cty_is_anon(string_view(dbase)) {
+                string_push(sb, "typedef ")
+                string_push(sb, string_view(dbase))
+                string_push(sb, " Jestyr_")
+                string_push(sb, src[it.x .. it.y])
+                string_push(sb, ";\n")
+            }
+            string_free(dbase)
         }
         if it.kind == 4 {                             // struct/record/union: forward typedef
             string_push(sb, "typedef ")
@@ -10952,6 +11036,54 @@ fn dc_dep_anon(mut d: Dc, ds: i32, read cty: str) {
     string_free(probe)
 }
 
+// Does the rendered C type `cty` name an ANONYMOUS-struct typedef — one with no forward
+// declaration to fall back on? Same four prefixes `dc_dep_anon` tests; factored out because
+// the `distinct` typedefs need the same question answered about their base.
+fn cty_is_anon(read cty: str) -> bool {
+    var e: usize = cty.len
+    for e > 0 and cty[e - 1] == '*' { e = e - 1 }
+    for e > 0 and cty[e - 1] == ' ' { e = e - 1 }
+    let base: str = cty[0 .. e]
+    if starts_with(base, "JestyrSlice_") { return true }
+    if starts_with(base, "JestyrArr_") { return true }
+    if starts_with(base, "JestyrRef_") { return true }
+    if starts_with(base, "JestyrFn_") { return true }
+    return false
+}
+
+// `typedef JestyrSlice_i64 Jestyr_Buf;` — the `distinct` typedefs whose base is an
+// anonymous-struct typedef, emitted as CAPTURE UNITS so the flush puts the base's definition
+// first (mirrors the reference's `distinct_typedefs`). Empty for a program without one, which
+// is what makes the split byte-neutral. Found by `examples/distinct_corpus/c07`-`c10`: the
+// typedef WAS collected, it was emitted two lines before `JestyrSlice_i64` existed.
+fn emit_distinct_defs(mut sb: String, read p: parser.Parser, read src: str, mut d: Dc) {
+    var r: i32 = 0
+    for r < list.len(i32, p.roots) {
+        let iid: i32 = list.get(i32, p.roots, r as usize)
+        let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
+        if it.kind == 1 {
+            var dbase: String = string_new()
+            emit_c_ty(dbase, p, src, it.a)
+            if cty_is_anon(string_view(dbase)) {
+                let uns: i32 = dc_len(d)
+                string_push(d.nb, "Jestyr_")
+                string_push(d.nb, src[it.x .. it.y])
+                let une: i32 = dc_len(d)
+                dc_dep_anon(d, une, string_view(dbase))
+                dc_begin(d, sb_len(sb), uns, une, une, dc_len(d))
+                string_push(sb, "typedef ")
+                string_push(sb, string_view(dbase))
+                string_push(sb, " Jestyr_")
+                string_push(sb, src[it.x .. it.y])
+                string_push(sb, ";\n")
+                dc_end(d, sb_len(sb))
+            }
+            string_free(dbase)
+        }
+        r = r + 1
+    }
+}
+
 fn emit_fn_type_defs(mut sb: String, read p: parser.Parser, read src: str, read c: typeck.Checker, mut g: Cg, mut d: Dc) {
     var any: bool = false
     var seen: String = string_new()
@@ -13156,6 +13288,7 @@ fn emit_program(mut sb: String, read p: parser.Parser, read c: typeck.Checker, r
     // the dep graph can serve. Mirrors the same move in the reference's `emit`.
     var cap: String = string_new()
     var d: Dc = Dc{ nb: string_new(), segs: list.make(i32, a), last: 0, pns: 0, pne: 0, pds: 0, pde: 0, pstart: 0 - 1 }
+    emit_distinct_defs(cap, p, src, d)               // FIRST: `distinct` over a slice/array/fn type
     emit_fn_type_defs(cap, p, src, c, g, d)          // fn-pointer typedefs (captured units)
     emit_struct_defs(cap, p, src, d)                 // captured-region aggregate defs (struct first)
     emit_enum_defs(cap, p, src, c, g, d)             // enum tag+struct defs (after structs)

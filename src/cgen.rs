@@ -459,6 +459,9 @@ fn emit_program(
     // dependencies in both directions across the old fixed order, which only the
     // dep graph can serve. Each unit declares what it needs; the flush sorts.
     g.begin_def_capture();
+    // First in the capture: a `distinct` over a slice/array/genref/fn type, whose
+    // typedef names an anonymous struct the forward section cannot have emitted yet.
+    g.distinct_typedefs();
     g.fn_type_typedefs();
     g.struct_defs();
     g.enum_defs();
@@ -1363,6 +1366,16 @@ impl<'a> Cgen<'a> {
                 // `distinct UserId = u64` → a zero-cost C typedef of the base.
                 Item::Distinct(dd) => {
                     let base = self.c_ty_ast(dd.base);
+                    // …unless the base lowers to an ANONYMOUS-struct typedef
+                    // (`distinct Buf = []i64` → `JestyrSlice_i64`), which nothing
+                    // has defined this early — the forward section runs before the
+                    // definition capture. Those go through `distinct_typedefs`,
+                    // which orders them after the base. Every other base (a
+                    // primitive, a pointer, a named aggregate) keeps its position
+                    // here, so the emitted C of every existing program is unchanged.
+                    if Self::dep_of_anon_typedef(&base).is_some() {
+                        continue;
+                    }
                     let c = self.canon_type(&dd.name.name);
                     self.raw(format!("typedef {base} Jestyr_{c};\n"));
                 }
@@ -5058,7 +5071,11 @@ impl<'a> Cgen<'a> {
                 // pointer. (The slice is spilled to a temp so a side-effecting base is
                 // evaluated once; copying the `{ptr,len}` view still writes the buffer.)
                 if let ExprKind::Index { base, index } = &self.ast.expr_at(*target).kind {
-                    let bt = apply_subst(&self.info.type_of(*base).clone(), &self.subst);
+                    // `repr_of`, not the raw inferred type: a `distinct Buf = []i64`
+                    // writes through the same `{ptr,len}` lvalue its base does, and
+                    // dispatch is the only thing the peel is for (`Jestyr_Buf` IS
+                    // `JestyrSlice_i64`, so the emitted bytes are the base's).
+                    let bt = self.repr_of(*base);
                     if matches!(bt, Ty::Slice(_)) {
                         let aop = assign_c(*op);
                         let proven = self.index_in_range(*base, *index);
@@ -5101,7 +5118,12 @@ impl<'a> Cgen<'a> {
                 if let Some(qname) = self.info.qualified(id).map(String::from) {
                     return format!("j_{qname}");
                 }
-                let bt = apply_subst(&self.info.type_of(*base).clone(), &self.subst);
+                // A `distinct` inherits its base's MEMBERS (`p.len` on a `distinct P
+                // = str`, `w.x` on a `distinct W = Pt`), so the arm is chosen on the
+                // REPRESENTATION. Before this the peel was missing and every distinct
+                // fell through to `.j_len` — a field that does not exist on
+                // `JestyrStr`, which is corpus rows `c01`/`c02`/`f05`.
+                let bt = self.repr_of(*base);
                 // A fixed-size array's `.len` is its constant length (not a struct
                 // field). (`base` is a place expression in practice, so not emitting it
                 // loses no side effect.)
@@ -5111,6 +5133,19 @@ impl<'a> Cgen<'a> {
                     }
                 }
                 let b = self.emit_expr(*base);
+                // `(x as T).f` — C binds `.` TIGHTER than a cast, so the `({cty})({e})`
+                // this arm's base emits parses as `(JestyrStr)((j_p).len)`: a `size_t`
+                // cast to a struct, "conversion to non-scalar type requested". The base
+                // position needs parens of its own. Gated on the base really being a
+                // cast, so every existing golden is byte-identical — no `.jtr` outside
+                // `examples/distinct_corpus/` has a cast in a field-base position. This
+                // is not a `distinct` bug: `(s as str).len` on a plain `str` fails the
+                // same way (`g14`, the anti-vacuity control).
+                let b = if matches!(self.ast.expr_at(*base).kind, ExprKind::Cast { .. }) {
+                    format!("({b})")
+                } else {
+                    b
+                };
                 // A slice's `ptr`/`len` are real C fields (not `j_`-prefixed).
                 if matches!(bt, Ty::Slice(_)) && (name.name == "len" || name.name == "ptr") {
                     format!("{b}.{}", name.name)
@@ -5131,7 +5166,11 @@ impl<'a> Cgen<'a> {
             ExprKind::Index { base, index } => {
                 // Resolve through the active monomorphization subst so a generic
                 // `[]T` indexed inside a generic function names `JestyrSlice_i32`.
-                let bt = apply_subst(&self.info.type_of(*base).clone(), &self.subst);
+                // …and through any `distinct` layer, so `p[0]` on a `distinct P = str`
+                // reads a byte and `p[0..2]` takes the zero-copy sub-view (`c03`,
+                // `c12`). Typeck gives the sub-view back at `P`; the C is identical
+                // either way, since `Jestyr_P` IS `JestyrStr`.
+                let bt = self.repr_of(*base);
                 // `s[i..j]` on a string → a boundary-checked, zero-copy sub-view.
                 if matches!(bt, Ty::Prim("str")) {
                     let range = match &self.ast.expr_at(*index).kind {
@@ -9486,6 +9525,29 @@ impl<'a> Cgen<'a> {
             .then(|| base.to_string())
     }
 
+    /// `typedef JestyrSlice_i64 Jestyr_Buf;` — the `distinct` typedefs whose base is
+    /// an anonymous-struct typedef, emitted as capture units so the flush puts the
+    /// base's definition first. [`Self::forward_types`] emits every other `distinct`
+    /// in its original position; this section is empty for a program without one,
+    /// which is what makes the split byte-neutral.
+    ///
+    /// Found by `examples/distinct_corpus/c07`–`c10`: the typedef *was* collected,
+    /// it was emitted two lines before `JestyrSlice_i64` existed.
+    fn distinct_typedefs(&mut self) {
+        let ast = self.ast;
+        for (i, item) in ast.items.iter().enumerate() {
+            let Item::Distinct(dd) = item else { continue };
+            self.cur_mod = self.item_module(i);
+            let base = self.c_ty_ast(dd.base);
+            let Some(dep) = Self::dep_of_anon_typedef(&base) else { continue };
+            let c = self.canon_type(&dd.name.name);
+            let name = format!("Jestyr_{c}");
+            self.def_begin(name.clone(), vec![dep]);
+            self.raw(format!("typedef {base} {name};\n"));
+            self.def_end();
+        }
+    }
+
     fn fn_type_typedefs(&mut self) {
         for t in self.fn_type_instances.clone() {
             let Ty::Fn { params, ret, .. } = &t else { continue };
@@ -9559,13 +9621,45 @@ impl<'a> Cgen<'a> {
             && matches!(&ast.expr_at(*fb).kind, ExprKind::Name(n) if n.name == sname.name)
     }
 
+    /// Follow `distinct` bases to the **representation** type underneath — the type
+    /// the C emission is actually about. `distinct D = Base` lowers to `typedef
+    /// <base C type> Jestyr_D`, so `D` and `Base` are literally the same C type and
+    /// an inherited operation emits byte-for-byte what the base emits; what the
+    /// backend needs the peel for is *dispatch* — deciding which arm of `Field` /
+    /// `Index` / the index-assign lvalue path to take at all.
+    ///
+    /// Capped at 16 hops, for the same reason `typeck::peel_distinct` is: `check`
+    /// accepts a cyclic `distinct A = B` / `distinct B = A` today, and an uncapped
+    /// walk would hang the compiler on one.
+    fn peel_distinct(&self, t: &Ty) -> Ty {
+        let mut cur = t.clone();
+        for _ in 0..16 {
+            let Ty::Named(i) = &cur else { return cur };
+            let TypeKindG::Distinct { base } = &self.info.table.types[*i].kind else { return cur };
+            cur = base.clone();
+        }
+        Ty::Error
+    }
+
+    /// The type `id` is emitted *as*: resolved through the active monomorphization
+    /// subst (so a `[]T` inside a generic function names `JestyrSlice_i32`) and then
+    /// peeled of every `distinct` layer. A no-op on every non-`distinct` type, which
+    /// is why swapping it in at the dispatch sites moves no existing byte.
+    fn repr_of(&self, id: ExprId) -> Ty {
+        let t = apply_subst(&self.info.type_of(id).clone(), &self.subst);
+        self.peel_distinct(&t)
+    }
+
     /// Does `emit_expr` lower `id` to a bounds-checked *statement expression* —
     /// a GNU `({ …; elem; })` that yields a **value**? Such a form is legal
     /// wherever a value is wanted and illegal in all three place positions: the
     /// left of `=`, the operand of `&`, and the base of another index.
     fn is_checked_index(&self, id: ExprId) -> bool {
         let ExprKind::Index { base, index } = &self.ast.expr_at(id).kind else { return false };
-        let bt = apply_subst(&self.info.type_of(*base).clone(), &self.subst);
+        // The peel must agree with the Index arm's, or the two disagree about
+        // whether a statement expression was emitted and a place chain reaches for
+        // an lvalue that is not there.
+        let bt = self.repr_of(*base);
         match bt {
             // A fixed-size array always spills through `&base` and yields `_a->a[_ix]`.
             Ty::Array { .. } => true,
@@ -9631,7 +9725,11 @@ impl<'a> Cgen<'a> {
             ExprKind::Field { base, name } => {
                 let base = *base;
                 let fname = name.name.clone();
-                let bt = apply_subst(&self.info.type_of(base).clone(), &self.subst);
+                // Peeled, so a `distinct` over a STRUCT still projects to an
+                // assignable field (`w.x = 9`) while a distinct over a slice/array/
+                // `str` correctly falls back to `emit_expr` — those members are
+                // computed, never places.
+                let bt = self.repr_of(base);
                 // Only a struct-shaped base projects to an assignable field. A
                 // slice's `.ptr`/`.len`, a `str`'s views and an array's constant
                 // `.len` are computed, never places — leave them to `emit_expr`.
@@ -9647,7 +9745,7 @@ impl<'a> Cgen<'a> {
             }
             ExprKind::Index { base, index } => {
                 let (base, index) = (*base, *index);
-                let bt = apply_subst(&self.info.type_of(base).clone(), &self.subst);
+                let bt = self.repr_of(base);
                 if let Ty::Array { len, .. } = &bt {
                     let nlen = *len;
                     let aty = self.c_type(&bt);

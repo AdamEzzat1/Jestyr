@@ -1,0 +1,175 @@
+// examples/distinct_members.jtr — the MEMBER half of `distinct` operation inheritance:
+// `.len` / `.ptr`, `[i]`, `[a..b]`, field reads and writes, and the places all of those
+// have to be able to stand in.
+//
+//   jestyrc run examples/distinct_members.jtr
+//
+// `examples/distinct_ops.jtr` is the operator half (`+`, `==`, `<`, …). This file is the
+// other one, and it is where the C BACKEND does the work: `distinct D = Base` lowers to
+// `typedef <base C type> Jestyr_D`, so `D` and `Base` are literally the same C type and an
+// inherited member emits byte-for-byte what the base emits. What cgen needs the peel for is
+// DISPATCH — deciding which arm of Field / Index / the index-assign lvalue path to take at
+// all. Without it a `distinct P = str` reached the struct-field arm and emitted `.j_len`, a
+// member `JestyrStr` has not got: the program type-checked and died in gcc.
+//
+// The substitution rule (`str: [Range] -> str` inherits as `P: [Range] -> P`) is what makes
+// `sub` below need no cast — that is the property that takes a `distinct Path = str`'s 21
+// INTERNAL casts to zero.
+//
+// This file is registered in `CGEN_GOLDEN_ALLOWLIST`. Without that registration the jc-vs-
+// jestyrc byte comparison silently skips it — which is exactly how an earlier attempt at
+// this shipped `return (j_p)[];` from the self-hosted compiler while the reference was fine.
+
+distinct P = str             // a text view — the `Path` shape
+distinct Buf = []i32         // a slice view
+distinct Trip = [3]i32       // a fixed-size array, by value
+distinct Owned = String      // the owned text type — the `PathBuf` shape
+
+struct Pt { x: i32, y: i32 }
+distinct W = Pt              // a struct, whose fields project through
+distinct Row = []Pt          // a slice OF structs — the place-chain case
+distinct Grid = [2]Pt        // an ARRAY of structs — the other place-chain case
+
+// `.len`, `.ptr` and a byte index, all inherited from `str` at `P`'s own type. None of the
+// three mentions `str` in its result, so none of them substitutes.
+fn text_members() -> i32 {
+    let p: P = "hello" as P
+    print_int(p.len as i32)                     // 5
+    print_int(p[0] as i32)                      // 104 — 'h'
+    print_int(p[4] as i32)                      // 111 — 'o'
+    let c: cstr = p.ptr                         // `.ptr` is the base's, at the base's type
+    print_bool(c != null)                       // true
+    return 0
+}
+
+// The SUBSTITUTION: `str`'s sub-view returns `str`, so `P`'s returns `P` — the annotation on
+// `sub` is checked, not inferred loosely, and it needs no `as`.
+fn text_subview() -> i32 {
+    let p: P = "hello" as P
+    let sub: P = p[0..2]
+    print_int(sub.len as i32)                   // 2
+    print_str(sub as str)                       // he  — the BOUNDARY still casts
+    let tail: P = p[3 .. p.len]
+    print_str(tail as str)                      // lo
+    return 0
+}
+
+// A cast in the BASE of a field access. C binds `.` tighter than a cast, so the emitted
+// `(JestyrStr)(j_p).len` used to parse as `(JestyrStr)((j_p).len)` — a `size_t` cast to a
+// struct, "conversion to non-scalar type requested". `bare_base_control` is the anti-vacuity
+// half: it has no `distinct` in it at all and failed exactly the same way, which is what says
+// the fix belongs in the cast's parenthesisation and not in the `distinct` peel.
+fn cast_in_field_base() -> i32 {
+    let p: P = "hello" as P
+    print_int((p as str).len as i32)            // 5
+    let w: W = Pt { x: 3, y: 4 } as W
+    print_int((w as Pt).x)                      // 3
+    return 0
+}
+
+fn bare_base_control() -> i32 {
+    let s: str = "hello"
+    print_int((s as str).len as i32)            // 5
+    return 0
+}
+
+fn set(p: *mut i32, i: i32, v: i32) {
+    unsafe { (p + i).* = v }
+}
+
+// A distinct over `[]T`: `.len`, a bounds-checked read, a bounds-checked WRITE (the
+// index-assign lvalue path, which is a different emission site from the read), and the
+// substituted sub-view.
+fn slice_members() -> i32 {
+    var raw: *mut i32 = alloc_i32(3)
+    set(raw, 0, 10)
+    set(raw, 1, 20)
+    set(raw, 2, 30)
+    var b: Buf = slice(i32, raw, 3) as Buf
+    print_int(b.len as i32)                     // 3
+    print_int(b[1])                             // 20
+    b[1] = 99
+    print_int(b[1])                             // 99
+    b[2] += 5
+    print_int(b[2])                             // 35
+    let view: Buf = b[0..2]
+    print_int(view.len as i32)                  // 2
+    free_ptr(raw)
+    return 0
+}
+
+// A distinct over `[N]T`: the constant `.len`, an index read, and an index write. A fixed
+// array is a value struct, so every one of these goes through `&base` — the place path.
+fn array_members() -> i32 {
+    var t: Trip = [1, 2, 3] as Trip
+    print_int(t.len as i32)                     // 3
+    print_int(t[1])                             // 2
+    t[2] = 9
+    print_int(t[2])                             // 9
+    return 0
+}
+
+// A PLACE CHAIN that reaches through a checked index whose base is a distinct: `r[i].x = v`
+// is a projection `emit_expr` cannot produce at all, so it routes through `emit_place`, and
+// `is_checked_index` has to peel the same way the Index arm does or the two disagree about
+// whether a statement expression was emitted.
+fn place_chain() -> i32 {
+    var raw: *mut Pt = alloc(Pt, 2)
+    var r: Row = slice(Pt, raw, 2) as Row
+    r[0].x = 7
+    r[0].y = 8
+    r[1].x = r[0].x + 1
+    print_int(r[0].x)                           // 7
+    print_int(r[0].y)                           // 8
+    print_int(r[1].x)                           // 8
+    free_ptr(raw)
+    return 0
+}
+
+// The same chain over a distinct-over-ARRAY. A fixed array's element address is taken through
+// `&base`, so `g[0].x = v` walks `emit_place` twice — Field, then Index — and the Index step
+// is where the peel decides between the array arm and falling back to a value expression.
+fn array_place_chain() -> i32 {
+    var g: Grid = [Pt { x: 0, y: 0 }, Pt { x: 0, y: 0 }] as Grid
+    g[0].x = 7
+    g[1].y = g[0].x + 1
+    print_int(g[0].x)                           // 7
+    print_int(g[1].y)                           // 8
+    return 0
+}
+
+// A distinct over a STRUCT still projects to an assignable field — the peel changes which
+// arm is chosen, not whether the base is a place.
+fn struct_members() -> i32 {
+    var w: W = Pt { x: 3, y: 4 } as W
+    print_int(w.x)                              // 3
+    w.x = 9
+    w.y = w.x + 1
+    print_int(w.x)                              // 9
+    print_int(w.y)                              // 10
+    return 0
+}
+
+// The owned text type's byte length is a real C field too (O(1)), reached through the
+// distinct the same way.
+fn owned_members() -> i32 {
+    var s: String = string_new()
+    string_push(s, "abcd")
+    let o: Owned = s as Owned
+    print_int(o.len as i32)                     // 4
+    return 0
+}
+
+fn main() -> i32 {
+    text_members()
+    text_subview()
+    cast_in_field_base()
+    bare_base_control()
+    slice_members()
+    array_members()
+    place_chain()
+    array_place_chain()
+    struct_members()
+    owned_members()
+    return 0
+}
