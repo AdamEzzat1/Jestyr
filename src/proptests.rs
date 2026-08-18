@@ -64,6 +64,254 @@ fn typeck_diags(src: &str) -> Vec<String> {
     td.iter().map(|d| d.message.clone()).collect()
 }
 
+/// **Must-use fallible results.** A call whose type is `T !E` in statement position
+/// throws the verdict away, and that is now refused.
+///
+/// The canary is `file.finish`: `std/file`'s header records that it is the one call
+/// reporting whether the bytes landed, and that writing it as a bare statement compiled
+/// and ran with no diagnostic at all. Measured over all 208 corpus files before choosing
+/// the severity — **four** sites, every one of them `file.finish(…)` in `file_test.jtr`,
+/// zero false positives elsewhere. Those four now assert the verdict instead.
+///
+/// Every assertion below is paired with its positive control, because "the discard was
+/// refused" means nothing unless the handled spellings still compile: `?` propagates,
+/// `catch` recovers, and a trailing expression is the implicit return rather than a
+/// discard. Without those three the rule could pass by refusing all fallible calls.
+#[cfg(test)]
+mod must_use_fallible {
+    use super::*;
+
+    const NEEDLE: &str = "the fallible result of this call is discarded";
+
+    fn risky() -> &'static str {
+        "fn risky(n: i64) -> i64 !{ Bad } {\n\
+         \x20   if n < 0 { return err(Bad) }\n\
+         \x20   return ok(n * 2)\n\
+         }\n"
+    }
+
+    #[test]
+    fn a_discarded_fallible_result_in_statement_position_is_refused() {
+        let src = format!(
+            "{}fn use_it(n: i64) -> i64 !{{ Bad }} {{\n\
+             \x20   risky(n)\n\
+             \x20   return ok(1)\n\
+             }}\n",
+            risky()
+        );
+        let ds = typeck_diags(&src);
+        assert!(
+            ds.iter().any(|d| d.contains(NEEDLE)),
+            "a bare fallible call must be refused; got {ds:?}"
+        );
+        // The message names the SET, so a reader learns what was thrown away rather than
+        // only that something was.
+        assert!(
+            ds.iter().any(|d| d.contains("!{ Bad }")),
+            "the diagnostic must name the discarded error set; got {ds:?}"
+        );
+    }
+
+    /// Positive control 1: `?` propagates, so nothing is discarded.
+    #[test]
+    fn propagating_with_try_is_not_a_discard() {
+        let src = format!(
+            "{}fn use_it(n: i64) -> i64 !{{ Bad }} {{\n\
+             \x20   risky(n)?\n\
+             \x20   return ok(1)\n\
+             }}\n",
+            risky()
+        );
+        let ds = typeck_diags(&src);
+        assert!(!ds.iter().any(|d| d.contains(NEEDLE)), "`?` must not be flagged; got {ds:?}");
+    }
+
+    /// Positive control 2: `catch` recovers — the deliberate-discard spelling. Without a
+    /// way to say "I know, and I am ignoring it", the rule would be unusable rather than
+    /// strict, so this control is what justifies the error severity.
+    #[test]
+    fn recovering_with_catch_is_not_a_discard() {
+        let src = format!(
+            "{}fn use_it(n: i64) -> i64 {{\n\
+             \x20   risky(n) catch 0\n\
+             \x20   return 1\n\
+             }}\n",
+            risky()
+        );
+        let ds = typeck_diags(&src);
+        assert!(!ds.iter().any(|d| d.contains(NEEDLE)), "`catch` must not be flagged; got {ds:?}");
+    }
+
+    /// Positive control 3: a block's TRAILING expression is its value — in a fallible
+    /// body that is the implicit return, which discards nothing. Flagging it would refuse
+    /// the most ordinary way to write a forwarding function, so this is the boundary the
+    /// rule must not cross.
+    #[test]
+    fn a_trailing_fallible_expression_is_the_implicit_return() {
+        let src = format!(
+            "{}fn forward(n: i64) -> i64 !{{ Bad }} {{\n\
+             \x20   risky(n)\n\
+             }}\n",
+            risky()
+        );
+        let ds = typeck_diags(&src);
+        assert!(
+            !ds.iter().any(|d| d.contains(NEEDLE)),
+            "a trailing fallible expression is a return, not a discard; got {ds:?}"
+        );
+    }
+
+    /// Anti-vacuity: an INFALLIBLE call discarded in statement position is still fine.
+    /// This rule is about error sets, not about unused values — `print_int`-shaped code
+    /// and every `sink.put_str(…)` statement in the tree depend on it.
+    #[test]
+    fn discarding_an_infallible_result_is_still_allowed() {
+        let src = "fn plain(n: i64) -> i64 { return n * 2 }\n\
+                   fn use_it(n: i64) -> i64 {\n\
+                   \x20   plain(n)\n\
+                   \x20   return 1\n\
+                   }\n";
+        let ds = typeck_diags(src);
+        assert!(
+            !ds.iter().any(|d| d.contains(NEEDLE)),
+            "an infallible discard must stay legal; got {ds:?}"
+        );
+    }
+
+    /// The corpus stays clean. A future file that discards a verdict fails here rather
+    /// than being noticed by hand — and this is also the test that would have caught the
+    /// four `file.finish` sites if the rule had existed first.
+    #[test]
+    fn no_corpus_file_discards_a_fallible_result() {
+        let mut offenders: Vec<String> = Vec::new();
+        for dir in ["examples", "examples/std"] {
+            let Ok(rd) = std::fs::read_dir(dir) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) != Some("jtr") {
+                    continue;
+                }
+                let prog = crate::module::load(p.to_str().unwrap());
+                let (_info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+                if td.iter().any(|d| d.message.contains(NEEDLE)) {
+                    offenders.push(p.display().to_string());
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "these files discard a fallible result: {offenders:?}");
+    }
+}
+
+/// **A `return` in a fallible function must be Result-typed.**
+///
+/// `cgen` emits `return <value>` verbatim, so a bare ok value out of a `-> T !E` produced
+/// C assigning an `int64_t` to a `JestyrResult_i64`: `jestyrc check` passed and gcc
+/// refused. Found while probing the must-use escape hatches, and it is the same
+/// degrades-to-gcc class.
+///
+/// The boundary was PROBED, not reasoned about, and it is not where it looks: forwarding
+/// another fallible call is fine (a whole result), while `return f(x)?` and
+/// `return f(x) catch v` are broken — they unwrap to the ok type and are then emitted as
+/// bare values. Each of the five forms below is a case from that probe, so the tests
+/// record the measurement rather than restating the rule.
+#[cfg(test)]
+mod fallible_return {
+    use super::*;
+
+    const NEEDLE: &str = "must return a result, not a bare value";
+
+    fn with(body: &str) -> Vec<String> {
+        let src = format!(
+            "fn base(n: i64) -> i64 !{{ Bad }} {{\n\
+             \x20   if n < 0 {{ return err(Bad) }}\n\
+             \x20   return ok(n * 2)\n\
+             }}\n{body}"
+        );
+        typeck_diags(&src)
+    }
+
+    #[test]
+    fn a_bare_value_is_refused() {
+        let ds = with("fn f(n: i64) -> i64 !{ Bad } { return n * 2 }\n");
+        assert!(ds.iter().any(|d| d.contains(NEEDLE)), "bare value must be refused; got {ds:?}");
+    }
+
+    /// `?` unwraps to the ok type, so it cannot sit directly after `return` in a fallible
+    /// function. This is the case most likely to be written by someone who has read the
+    /// `?` docs, which is why it gets its own test rather than riding on the bare-value one.
+    #[test]
+    fn try_directly_after_return_is_refused() {
+        let ds = with("fn f(n: i64) -> i64 !{ Bad } { return base(n)? }\n");
+        assert!(ds.iter().any(|d| d.contains(NEEDLE)), "`return e?` must be refused; got {ds:?}");
+    }
+
+    #[test]
+    fn catch_directly_after_return_is_refused() {
+        let ds = with("fn f(n: i64) -> i64 !{ Bad } { return base(n) catch 0 }\n");
+        assert!(
+            ds.iter().any(|d| d.contains(NEEDLE)),
+            "`return e catch v` must be refused; got {ds:?}"
+        );
+    }
+
+    /// Positive control 1 and 2: the two spellings the whole corpus uses.
+    #[test]
+    fn ok_and_err_are_the_accepted_spellings() {
+        for body in [
+            "fn f(n: i64) -> i64 !{ Bad } { return ok(n) }\n",
+            "fn f(n: i64) -> i64 !{ Bad } { return err(Bad) }\n",
+        ] {
+            let ds = with(body);
+            assert!(!ds.iter().any(|d| d.contains(NEEDLE)), "{body} must be accepted; got {ds:?}");
+        }
+    }
+
+    /// Positive control 3, and the one that stops the rule from being "always wrap":
+    /// forwarding another fallible call returns a WHOLE result and compiles correctly
+    /// today. A rule that demanded a literal `ok(…)`/`err(…)` would refuse working code.
+    #[test]
+    fn forwarding_another_fallible_call_is_accepted() {
+        let ds = with("fn f(n: i64) -> i64 !{ Bad } { return base(n) }\n");
+        assert!(
+            !ds.iter().any(|d| d.contains(NEEDLE)),
+            "forwarding a whole result must be accepted; got {ds:?}"
+        );
+    }
+
+    /// Anti-vacuity: an INFALLIBLE function returning a bare value is the normal case and
+    /// must stay silent. Without this the rule could pass by refusing every `return`.
+    #[test]
+    fn an_infallible_function_still_returns_bare_values() {
+        let ds = with("fn f(n: i64) -> i64 { return n * 2 }\n");
+        assert!(
+            !ds.iter().any(|d| d.contains(NEEDLE)),
+            "an infallible return must stay legal; got {ds:?}"
+        );
+    }
+
+    /// The corpus needed no edits for this rule — recorded as a test so a future file
+    /// that reintroduces the shape fails here rather than in gcc.
+    #[test]
+    fn no_corpus_file_returns_a_bare_value_from_a_fallible_function() {
+        let mut offenders: Vec<String> = Vec::new();
+        for dir in ["examples", "examples/std"] {
+            let Ok(rd) = std::fs::read_dir(dir) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) != Some("jtr") {
+                    continue;
+                }
+                let prog = crate::module::load(p.to_str().unwrap());
+                let (_info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+                if td.iter().any(|d| d.message.contains(NEEDLE)) {
+                    offenders.push(p.display().to_string());
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "these files return a bare value from `-> T !E`: {offenders:?}");
+    }
+}
+
 /// Like [`compile`] but stops after type-checking and hands back the AST plus the
 /// inferred-type table, so a property can locate an expression and assert its
 /// inferred type (the teeth for a typeck-completeness invariant).
@@ -14237,6 +14485,109 @@ fn main() -> i32 {
         eprintln!("generic-struct array field: byte-identical + untruncated through jc's own driver");
     }
 
+    /// **`std/diag` across the module boundary** — a generic instantiated with a
+    /// module-LOCAL struct, and a `distinct` used as one of its fields.
+    ///
+    /// `diag.jtr` declares `struct Label` and `distinct FileId = usize`, then stores
+    /// `List(Label)` inside `Diagnostic`. Every consumer instantiates `List` with a type
+    /// it does not own, across an import edge — which is the same shape as the
+    /// generic-struct array-field miscompile above and is invisible to
+    /// [`jestyr_cgen_matches_reference`], because that test compiles each file with no
+    /// import resolution at all and a single-file `diag.jtr` never instantiates anything.
+    ///
+    /// Two anti-vacuity assertions, both aimed at the port's `int` fallback for an
+    /// unresolved type: `Jestyr_List__Label` must be present (the substitution happened)
+    /// and no `_T`-suffixed instance may survive (it happened everywhere). `FileId` must
+    /// lower to `size_t`, not `int` — a `distinct` over `usize` that degraded to `int`
+    /// would index a file table with a 32-bit value and still compile.
+    ///
+    /// The last assertion is the one byte-equality cannot make: the binary the port's own
+    /// driver produced must print what the reference toolchain's does, character for
+    /// character. Both sides agreeing on wrong C is §5's shared-bug hole.
+    #[test]
+    fn jestyr_driver_diag_across_the_module_boundary() {
+        let jc = build_exe("examples/std/cgen.jtr");
+        let dir = std::env::temp_dir().join("jestyr_diag_boundary");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for m in ["diag", "sink", "list", "mem", "str"] {
+            std::fs::copy(format!("examples/std/{m}.jtr"), dir.join(format!("{m}.jtr"))).unwrap();
+        }
+        // A consumer that exercises the whole chain: build a two-file map, attach labels
+        // of three kinds (so `List(Label)` genuinely grows and is read back), and render.
+        std::fs::write(
+            dir.join("app.jtr"),
+            "import \"diag\"\n\
+             import \"sink\"\n\
+             import \"mem\"\n\
+             fn main() -> i32 {\n\
+             \x20   let a: Allocator = mem.system_allocator()\n\
+             \x20   var m: diag.SourceMap = diag.map_new(a)\n\
+             \x20   let f: diag.FileId = diag.add_file(m, \"a.jtr\", \"let x = y\\n\")\n\
+             \x20   let g: diag.FileId = diag.add_file(m, \"b.jtr\", \"pub let y\\n\")\n\
+             \x20   var d: diag.Diagnostic = diag.new_error(a, \"E0007\", \"unknown name `y`\")\n\
+             \x20   diag.primary(d, diag.span(f, 8, 9), \"not found\")\n\
+             \x20   diag.secondary(d, diag.span(g, 4, 5), \"shadowed here\")\n\
+             \x20   diag.note(d, \"two files, three labels\")\n\
+             \x20   var raw: *mut u8 = alloc(u8, 4096)\n\
+             \x20   var buf: []u8 = slice(u8, raw, 4096)\n\
+             \x20   var s: Sink = sink.new()\n\
+             \x20   diag.render(s, buf, m, d, diag.plain())\n\
+             \x20   print_str(sink.view(s, buf))\n\
+             \x20   print_int(diag.label_count(d) as i64)\n\
+             \x20   return 0\n\
+             }\n",
+        )
+        .unwrap();
+        let app = dir.join("app.jtr");
+
+        // The port, through its own loader and its own gcc driver.
+        let out = Command::new(&jc).args([app.to_str().unwrap(), "build"]).output().unwrap();
+        assert!(out.status.success(), "jc build failed: {}", String::from_utf8_lossy(&out.stderr));
+        let port_c = std::fs::read_to_string(dir.join("app.c")).unwrap().replace("\r\n", "\n");
+
+        // The reference, through the real module loader.
+        let prog = crate::module::load(app.to_str().unwrap());
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "fixture loads: {:?}", prog.diags);
+        let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        assert!(!td.iter().any(|d| d.is_error()), "fixture typechecks: {td:?}");
+        let (ref_c, _cd) = crate::cgen::emit(&prog.ast, &info);
+        let ref_c = ref_c.replace("\r\n", "\n");
+        if ref_c != port_c {
+            let mismatch =
+                ref_c.lines().zip(port_c.lines()).enumerate().find(|(_, (a, b))| a != b);
+            panic!("std/diag C diverges across the module boundary at {mismatch:?}");
+        }
+
+        // Anti-vacuity: the substitution reached the instance, and reached ALL of it.
+        assert!(
+            port_c.contains("Jestyr_List__Label"),
+            "the concrete `List(Label)` instance is missing — nothing was substituted"
+        );
+        assert!(
+            !port_c.contains("Jestyr_List__T"),
+            "an unsubstituted `List(T)` survived: the port fell back to the opaque renderer"
+        );
+        assert!(
+            port_c.contains("typedef size_t Jestyr_FileId;"),
+            "`distinct FileId = usize` did not lower to size_t — the `int` fallback is back"
+        );
+
+        // The claim byte-equality cannot make: the produced program is CORRECT.
+        let exe = dir.join(format!("app{}", std::env::consts::EXE_SUFFIX));
+        assert!(exe.exists(), "driver produced no exe");
+        let run = Command::new(&exe).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n"),
+            "error[E0007]: unknown name `y`\n  \
+             --> a.jtr:1:9\n   |\n 1 | let x = y\n   |         ^ not found\n  \
+             --> b.jtr:1:5\n   |\n 1 | pub let y\n   |     - shadowed here\n   |\n   \
+             = note: two files, three labels\n\n3\n",
+            "the port-built binary rendered a different diagnostic"
+        );
+        eprintln!("std/diag: byte-identical + correct through jc's own loader and driver");
+    }
+
     /// **The self-build.** The ported compiler compiles ITSELF from its real multi-file
     /// sources (`examples/std/cgen.jtr` + its 9 imports) through its own module loader and
     /// its own gcc driver — and the result is the same compiler: byte-identical C on a
@@ -14457,7 +14808,7 @@ fn main() -> i32 {
     /// the reference. P5 is grown construct-by-construct, so this starts as a one-file allowlist
     /// and expands; once it covers the corpus it inverts to a (shrinking) denylist, mirroring how
     /// the P2/P3/P4 goldens converged to an empty denylist.
-    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "distinct_ops.jtr", "distinct_members.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "drop_take.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr", "test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr", "caps_demo.jtr", "fs_test.jtr", "env_test.jtr", "time_test.jtr", "str.jtr", "str_test.jtr", "str_demo.jtr", "sink.jtr", "cursor.jtr", "writer.jtr", "sink_test.jtr", "cursor_test.jtr", "writer_test.jtr", "writer_demo.jtr", "pathbuf.jtr", "pathbuf_test.jtr", "hashmap.jtr", "hashmap_test.jtr", "hashmap_demo.jtr", "set.jtr", "set_test.jtr", "deque.jtr", "deque_test.jtr", "deque_demo.jtr", "smallvec.jtr", "smallvec_test.jtr", "file.jtr", "file_test.jtr", "file_demo.jtr", "cstring.jtr", "cstring_test.jtr"];
+    const CGEN_GOLDEN_ALLOWLIST: &[&str] = &["hello.jtr", "bench_fib.jtr", "eq_fold.jtr", "distinct.jtr", "distinct_ops.jtr", "distinct_members.jtr", "compute.jtr", "copy_optin.jtr", "io.jtr", "str_ops.jtr", "substr.jtr", "union.jtr", "tests_demo.jtr", "loops.jtr", "slices.jtr", "array_lit.jtr", "errors.jtr", "discriminants.jtr", "shapes.jtr", "recursion.jtr", "rest_pat.jtr", "refine.jtr", "spread.jtr", "layout.jtr", "defaults.jtr", "mmio.jtr", "try_utf8.jtr", "container.jtr", "extern_c.jtr", "bitfields.jtr", "reflect.jtr", "contracts.jtr", "records.jtr", "docs.jtr", "guards.jtr", "builder.jtr", "cow.jtr", "os_str.jtr", "owned_string.jtr", "strings.jtr", "utf8_validate.jtr", "slice_utf8.jtr", "fstring.jtr", "vec.jtr", "orpat.jtr", "ranges.jtr", "drop.jtr", "drop_nested.jtr", "genref.jtr", "dlist_genref.jtr", "with_alive.jtr", "copy_enum.jtr", "loops_else.jtr", "region.jtr", "region_string.jtr", "loops_advanced.jtr", "codepoints.jtr", "bracket_generic.jtr", "generic.jtr", "unsafe_init.jtr", "env.jtr", "bound_method.jtr", "traits_static.jtr", "operators.jtr", "fs.jtr", "str_iter.jtr", "arrays.jtr", "vec_alloc.jtr", "alloc_vtable.jtr", "mem.jtr", "fn_ptr.jtr", "fn_slice_param.jtr", "closure_run.jtr", "gen_vtable.jtr", "dynamic_spawn.jtr", "concurrent.jtr", "parallel.jtr", "atomics.jtr", "args.jtr", "await.jtr", "dyn_dispatch.jtr", "attributes.jtr", "niche.jtr", "option.jtr", "nested_match.jtr", "struct_variant.jtr", "vec_generic.jtr", "genlist.jtr", "sync.jtr", "genmethods.jtr", "methods.jtr", "core.jtr", "list.jtr", "mvs.jtr", "collection.jtr", "alloc_demo.jtr", "region_escape.jtr", "typeerr.jtr", "match_check.jtr", "exhaustive_check.jtr", "numbers.jtr", "numerics_canary.jtr", "closures.jtr", "escapes.jtr", "binned.jtr", "cgen.jtr", "channel.jtr", "combinators.jtr", "demo.jtr", "deterministic.jtr", "drop_named_type_param.jtr", "escape.jtr", "files.jtr", "float_bits.jtr", "format_float.jtr", "intern.jtr", "intern_demo.jtr", "lexer.jtr", "mutex.jtr", "par_cost.jtr", "par_for.jtr", "par_reduce.jtr", "par_reduce_int.jtr", "par_soac.jtr", "parse_float.jtr", "parser.jtr", "parser_cli.jtr", "reductions.jtr", "select.jtr", "slice_algos.jtr", "strmap.jtr", "strmap_demo.jtr", "tokens.jtr", "try_read.jtr", "typeck.jtr", "typeck_cli.jtr", "proc_demo.jtr", "escape_cli.jtr", "sha256.jtr", "doc_cli.jtr", "comptime_block.jtr", "comptime_reflect.jtr", "def_order.jtr", "nested_place.jtr", "layout_auto.jtr", "error_catch.jtr", "method_errors.jtr", "error_payload.jtr", "trait_errors.jtr", "loop_break_match.jtr", "path.jtr", "path_demo.jtr", "env_demo.jtr", "time.jtr", "time_demo.jtr", "drop_take.jtr", "test.jtr", "test_report.jtr", "test_demo.jtr", "path_test.jtr", "process.jtr", "process_demo.jtr", "process_test.jtr", "slice_range.jtr", "test_fixture.jtr", "test_fixture_demo.jtr", "test_fixture_test.jtr", "caps_demo.jtr", "fs_test.jtr", "env_test.jtr", "time_test.jtr", "str.jtr", "str_test.jtr", "str_demo.jtr", "sink.jtr", "cursor.jtr", "writer.jtr", "sink_test.jtr", "cursor_test.jtr", "writer_test.jtr", "writer_demo.jtr", "pathbuf.jtr", "pathbuf_test.jtr", "hashmap.jtr", "hashmap_test.jtr", "hashmap_demo.jtr", "set.jtr", "set_test.jtr", "deque.jtr", "deque_test.jtr", "deque_demo.jtr", "smallvec.jtr", "smallvec_test.jtr", "file.jtr", "file_test.jtr", "file_demo.jtr", "cstring.jtr", "cstring_test.jtr", "diag.jtr", "diag_test.jtr", "diag_demo.jtr"];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
     /// target). This is the acceptance bar the R2 fixpoint ultimately rests on. `DUMP_DIVERGE=1`
@@ -15379,6 +15730,7 @@ fn main() -> i32 {
             ("writer_test", 5),
             ("file_test", 19),
             ("cstring_test", 4),
+            ("diag_test", 15),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

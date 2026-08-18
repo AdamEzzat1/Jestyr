@@ -2763,6 +2763,41 @@ impl<'a> TypeChecker<'a> {
                             let span = self.ast.expr_at(*v).span;
                             self.check_assignable(&ret, &got, Some(*v), span, "return");
                         }
+                        // **A `return` in a fallible function must be Result-typed.**
+                        //
+                        // The ok-type comparison above is deliberate and is NOT the whole
+                        // rule: cgen emits `return <value>` verbatim, so returning a bare
+                        // ok value from a `-> T !E` produced C that assigns an `int64_t`
+                        // to a `JestyrResult_i64`. `check` passed and gcc refused — the
+                        // degrades-to-gcc class this session set out to burn down.
+                        //
+                        // Probed rather than reasoned about, because the boundary is not
+                        // where it looks. Legal (all Result-typed): `return ok(v)`,
+                        // `return err(E)`, and `return other_fallible(x)` — forwarding a
+                        // whole result is fine and worth keeping. Broken: `return f(x)?`
+                        // and `return f(x) catch v`, both of which UNWRAP to the ok type
+                        // and then get emitted as bare values. So the rule is exactly
+                        // "the returned expression is a Result", which covers all three
+                        // shapes with one condition.
+                        //
+                        // Reference-only: this adds a diagnostic and changes no emitted
+                        // byte, so there is no port mirror and no reseed. The port stays
+                        // permissive here exactly as it does for assignability.
+                        if self.cur_errs.is_some()
+                            && !matches!(got, Ty::Result(..) | Ty::Error | Ty::Unknown)
+                        {
+                            let span = self.ast.expr_at(*v).span;
+                            self.error(
+                                span,
+                                "a fallible function must return a result, not a bare value",
+                            );
+                            self.diags.last_mut().unwrap().help = Some(
+                                "wrap it: `return ok(<expr>)` for success, `return err(<Name>)` \
+                                 for failure. `?` and `catch` unwrap a result, so they cannot \
+                                 appear directly after `return` here"
+                                    .to_string(),
+                            );
+                        }
                     }
                     result = Ty::Unit;
                 }
@@ -2770,6 +2805,53 @@ impl<'a> TypeChecker<'a> {
                     let t = self.infer(scope, typ, self_ty, *e);
                     if i + 1 == n {
                         result = t;
+                    } else if let Ty::Result(_, errs) = &t {
+                        // **A discarded fallible result.** `file.finish(w)` written as a
+                        // statement throws away the only verdict the whole `std/file`
+                        // write half produces — whether the bytes actually landed. Until
+                        // now that compiled and ran with no diagnostic at all.
+                        //
+                        // Only NON-trailing statements are judged. A block's last
+                        // expression is its value, so in a `-> T !E` body it is the
+                        // implicit return and discards nothing; flagging it would refuse
+                        // the single most ordinary way to write a fallible function.
+                        //
+                        // `e?` and `e catch v` both unwrap to the ok type before they get
+                        // here, so the two spellings that DO handle the error are not
+                        // reachable by this rule — which is what makes it a rule about
+                        // discarding rather than a rule about calling.
+                        //
+                        // **An ERROR, not a warning, and the corpus is why.** Measured
+                        // over all 208 files before choosing: FOUR sites, every one of
+                        // them `file.finish(…)` in `file_test.jtr` — the exact call
+                        // `std/file`'s header names as the one that reports whether the
+                        // bytes landed. Zero false positives anywhere else. A rule that
+                        // narrow, with a deliberate-discard spelling already in the
+                        // language, does not need a grace period; a warning here would
+                        // just be an error nobody reads.
+                        //
+                        // REFERENCE-ONLY, deliberately. The port has no assignability
+                        // check either (the int→int rule set that precedent), and this
+                        // creates no Error *type*, so `jc` stays permissive where
+                        // `jestyrc` refuses. That asymmetry is the checker being ahead of
+                        // the bootstrap, not a divergence in what the two backends emit —
+                        // no C changes, so no mirror and no reseed.
+                        let set = if errs.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" `!{{ {} }}`", errs.join(", "))
+                        };
+                        self.error(
+                            self.ast.expr_at(*e).span,
+                            format!(
+                                "the fallible result of this call is discarded; its error set{set} is thrown away"
+                            ),
+                        );
+                        self.diags.last_mut().unwrap().help = Some(
+                            "handle it: `expr?` propagates, `expr catch <fallback>` recovers, \
+                             and `let _v = expr catch <fallback>` records the verdict"
+                                .to_string(),
+                        );
                     }
                 }
             }

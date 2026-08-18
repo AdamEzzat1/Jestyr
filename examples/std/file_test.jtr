@@ -458,7 +458,10 @@ fn write_and_abandon(read a: Allocator, read p: str, read text: str) -> usize {
 
     var big: file.Writer = file.create_path(sys, p)
     file.write_str(big, "abcde")
-    file.finish(big)
+    // The setup writes its five bytes THROUGH the checked call. A setup whose write
+    // silently failed would make the real assertion below fail for the wrong reason —
+    // which is the whole argument for refusing a discarded verdict.
+    test.eq_usize(c, rep, "setup: five bytes landed", file.finish(big) catch 0, 5)
 
     var gbuf: *mut u8 = alloc(u8, 64)
     var g: []u8 = slice(u8, gbuf, 64)
@@ -466,7 +469,7 @@ fn write_and_abandon(read a: Allocator, read p: str, read text: str) -> usize {
 
     var small: file.Writer = file.create_path(sys, p)
     file.write_str(small, "z")
-    file.finish(small)
+    test.eq_usize(c, rep, "setup: one byte landed", file.finish(small) catch 0, 1)
     test.eq_usize(c, rep, "create truncated it to one", read_back(sys, p, g), 1)
     test.eq_i64(c, rep, "and that one byte is the new one", g[0] as i64, 122)
 
@@ -573,7 +576,7 @@ fn write_and_abandon(read a: Allocator, read p: str, read text: str) -> usize {
     var seed: file.Writer = file.create_path(sys, good)
     test.is_true(c, rep, "control: the prefix alone opens for writing", file.is_writable(seed))
     file.write_str(seed, "KEEP")
-    file.finish(seed)
+    test.eq_usize(c, rep, "control: the four seed bytes landed", file.finish(seed) catch 0, 4)
 
     // "<temp>/jestyr_file_nul_prefix" + NUL + "junk". Built byte-by-byte, since a
     // literal cannot carry a zero.
@@ -721,7 +724,9 @@ fn write_and_abandon(read a: Allocator, read p: str, read text: str) -> usize {
     // `Drop` runs and finds nothing to do. A double `fclose` is undefined behaviour a
     // test cannot observe; this is the observable proxy, as on the read side.
     var w: file.Writer = file.create_path(sys, p)
-    file.finish(w)
+    // Nothing was written, so the verdict is zero bytes — but it is still a verdict, and
+    // the fallback (999) is deliberately impossible so a swallowed error cannot pass.
+    test.eq_usize(c, rep, "an empty finish still reports", file.finish(w) catch 999, 0)
     test.is_false(c, rep, "a finished writer leaves Drop nothing to do", file.is_writable(w))
 
     free_ptr(gbuf)

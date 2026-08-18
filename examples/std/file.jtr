@@ -86,13 +86,24 @@
 // output. There is no fifth channel.
 //
 // The mitigation that is real: `is_writable(w)` is false IFF you finished, so "did I
-// remember?" is answerable before scope exit, by a caller and by a test. The real fix
-// is a language feature — a must-use obligation making an un-`finish`ed `Writer` at
-// scope exit a compile error. It is not merely nice to have: a discarded fallible
-// result in statement position compiles and runs today with no diagnostic, so even
-// `file.finish(w)` written as a statement throws the verdict away silently. Nothing
-// in this module makes that hard to do by accident, and this comment will not pretend
-// otherwise.
+// remember?" is answerable before scope exit, by a caller and by a test.
+//
+// HALF OF THE LANGUAGE FIX HAS LANDED, and the two halves are worth keeping apart.
+//
+//   * **Discarding the verdict is now a compile error.** `file.finish(w)` as a bare
+//     statement used to compile and run with no diagnostic at all; a fallible result in
+//     statement position is refused now, with `?` to propagate and `catch` to recover as
+//     the two handled spellings. Measured over the whole corpus before it was turned on:
+//     four sites, all of them `finish` in `file_test.jtr`, which now assert the byte
+//     count instead of dropping it.
+//   * **Not finishing at all is still silent.** Letting a `Writer` fall out of scope
+//     un-`finish`ed remains legal, because that is a LINEAR obligation on the handle at
+//     scope exit rather than a rule about one expression, and nothing in the language
+//     tracks it yet. The paragraph above still stands unhedged for that case: `Drop`
+//     reclaims the descriptor and cannot report.
+//
+// So the failure this module can no longer hide is "I called it and ignored the answer";
+// the one it still cannot see is "I never called it".
 //
 // Two more limits, named here rather than discovered later. A `Drop`-owning struct is
 // freely copy-initializable and the source stays readable, so `var b: Writer = a`
