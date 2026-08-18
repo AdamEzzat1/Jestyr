@@ -1,0 +1,346 @@
+// std/cli_test.jtr — the unit suite for `std/cli`.
+//
+// Every case builds its `Args` from string literals rather than from `env`, which is the
+// whole reason `parse` is a pure function of `(Spec, Args)`: `env.argc()` reads 0 inside a
+// `@test` because the harness emits `int main(void)`, so a parser that sourced its own
+// argv could only be tested by running a subprocess.
+//
+// Run:  jestyrc test examples/std/cli_test.jtr
+
+import "cli"
+import "sink"
+import "mem"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 4096
+const BUF_CAP: usize = 4096
+
+// The spec every case parses against: two flags, two options, two subcommands.
+fn demo_spec(read a: Allocator) -> cli.Spec {
+    var s: cli.Spec = cli.spec_new(a, "jtool", "a tool for the test suite")
+    cli.flag(s, 118, "verbose", "say more")               // -v
+    cli.flag(s, 0, "dry-run", "change nothing")           // long only
+    cli.option(s, 111, "out", "where to write")           // -o
+    cli.option(s, 0, "format", "brief or full")
+    cli.subcommand(s, "build", "compile it")
+    cli.subcommand(s, "check", "look at it")
+    return s
+}
+
+fn args_of2(read a: Allocator, read x: str, read y: str) -> cli.Args {
+    var r: cli.Args = cli.args_new(a)
+    cli.push_arg(r, x)
+    cli.push_arg(r, y)
+    return r
+}
+
+@test fn flags_and_options_in_both_spellings() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var s: cli.Spec = demo_spec(a)
+
+    // `--out value` (separate) and `--format=value` (attached) must agree.
+    var r: cli.Args = cli.args_new(a)
+    cli.push_arg(r, "--verbose")
+    cli.push_arg(r, "--out")
+    cli.push_arg(r, "a.c")
+    cli.push_arg(r, "--format=brief")
+    cli.push_arg(r, "build")
+    cli.push_arg(r, "one")
+    cli.push_arg(r, "two")
+    var m: cli.Matches = cli.parse(a, s, r)
+
+    test.is_true(c, rep, "parse ok", cli.succeeded(m))
+    test.is_true(c, rep, "verbose set", cli.is_set(m, s, "verbose"))
+    test.is_false(c, rep, "dry-run unset", cli.is_set(m, s, "dry-run"))
+    test.eq_str(c, rep, "separate value", cli.value_or(m, s, "out", "?"), "a.c")
+    test.eq_str(c, rep, "attached value", cli.value_or(m, s, "format", "?"), "brief")
+    test.eq_str(c, rep, "absent value falls back", cli.value_or(m, s, "missing", "dflt"), "dflt")
+    test.eq_i64(c, rep, "subcommand", cli.command(m) as i64, 0)
+    test.eq_usize(c, rep, "two positionals", cli.positional_count(m), 2)
+    test.eq_str(c, rep, "positional 0", cli.positional(m, 0), "one")
+    test.eq_str(c, rep, "positional 1", cli.positional(m, 1), "two")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn short_forms_work_and_only_where_declared() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var s: cli.Spec = demo_spec(a)
+
+    var r: cli.Args = cli.args_new(a)
+    cli.push_arg(r, "-v")
+    cli.push_arg(r, "-o")
+    cli.push_arg(r, "out.txt")
+    cli.push_arg(r, "check")
+    var m: cli.Matches = cli.parse(a, s, r)
+    test.is_true(c, rep, "short flag", cli.is_set(m, s, "verbose"))
+    test.eq_str(c, rep, "short option", cli.value_or(m, s, "out", "?"), "out.txt")
+    test.eq_i64(c, rep, "second subcommand", cli.command(m) as i64, 1)
+
+    // `--dry-run` has no short form, so `-d` is not silently accepted as it.
+    var r2: cli.Args = args_of2(a, "-d", "build")
+    var m2: cli.Matches = cli.parse(a, s, r2)
+    test.is_false(c, rep, "undeclared short is refused", cli.succeeded(m2))
+    test.eq_str(c, rep, "and says which", cli.error_text(m2), "unknown option: -d")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn an_unknown_option_is_an_error_not_a_positional() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var s: cli.Spec = demo_spec(a)
+
+    // The typo case, and the reason this is an error. A parser that treated `--ouput` as
+    // a filename would have the tool write to a file literally called `--ouput`.
+    var r: cli.Args = args_of2(a, "--ouput", "x")
+    var m: cli.Matches = cli.parse(a, s, r)
+    test.is_false(c, rep, "refused", cli.succeeded(m))
+    test.eq_str(c, rep, "names the typo", cli.error_text(m), "unknown option: --ouput")
+    test.eq_i64(c, rep, "usage exit code", cli.exit_code(m) as i64, 2)
+
+    // The positive control WITHOUT which the above proves nothing: the correctly spelled
+    // option parses and does not reach the positional list.
+    var r2: cli.Args = args_of2(a, "--out", "x")
+    var m2: cli.Matches = cli.parse(a, s, r2)
+    test.is_true(c, rep, "positive control", cli.succeeded(m2))
+    test.eq_str(c, rep, "captured as a value", cli.value_or(m2, s, "out", "?"), "x")
+    test.eq_usize(c, rep, "not a positional", cli.positional_count(m2), 0)
+    test.eq_i64(c, rep, "ok exit code", cli.exit_code(m2) as i64, 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn the_first_error_is_kept_not_the_last() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var s: cli.Spec = demo_spec(a)
+
+    // Two bad options. The FIRST is the one a user has to fix first, and a parser that
+    // reported the last would send them to the wrong end of their command line.
+    var r: cli.Args = args_of2(a, "--aaa", "--zzz")
+    var m: cli.Matches = cli.parse(a, s, r)
+    test.eq_str(c, rep, "first error wins", cli.error_text(m), "unknown option: --aaa")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn missing_values_and_bundles_are_refused() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var s: cli.Spec = demo_spec(a)
+
+    // An option at the very end with nothing to consume.
+    var r: cli.Args = cli.args_new(a)
+    cli.push_arg(r, "--out")
+    var m: cli.Matches = cli.parse(a, s, r)
+    test.is_false(c, rep, "missing value refused", cli.succeeded(m))
+    test.eq_str(c, rep, "says which", cli.error_text(m), "missing value for --out")
+
+    // A flag given a value it cannot take.
+    var r2: cli.Args = cli.args_new(a)
+    cli.push_arg(r2, "--verbose=yes")
+    var m2: cli.Matches = cli.parse(a, s, r2)
+    test.is_false(c, rep, "value on a flag refused", cli.succeeded(m2))
+
+    // Bundles are refused rather than guessed: `-vo` is ambiguous the moment `-o` takes a
+    // value, and a wrong guess is a bug report where a diagnostic is one line.
+    var r3: cli.Args = cli.args_new(a)
+    cli.push_arg(r3, "-vo")
+    var m3: cli.Matches = cli.parse(a, s, r3)
+    test.is_false(c, rep, "bundle refused", cli.succeeded(m3))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_double_dash_stops_option_parsing() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // No subcommands here, so every bare word is a positional — which is what lets this
+    // case show that a file genuinely NAMED `--out` survives.
+    var s: cli.Spec = cli.spec_new(a, "jt", "")
+    cli.option(s, 111, "out", "where")
+
+    var r: cli.Args = cli.args_new(a)
+    cli.push_arg(r, "--out")
+    cli.push_arg(r, "real.txt")
+    cli.push_arg(r, "--")
+    cli.push_arg(r, "--out")
+    cli.push_arg(r, "-v")
+    var m: cli.Matches = cli.parse(a, s, r)
+
+    test.is_true(c, rep, "ok", cli.succeeded(m))
+    test.eq_str(c, rep, "the real option still parsed", cli.value_or(m, s, "out", "?"), "real.txt")
+    test.eq_usize(c, rep, "both survivors are positionals", cli.positional_count(m), 2)
+    test.eq_str(c, rep, "a file named --out", cli.positional(m, 0), "--out")
+    test.eq_str(c, rep, "and one named -v", cli.positional(m, 1), "-v")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn help_is_a_success_not_an_error() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var s: cli.Spec = demo_spec(a)
+
+    var r: cli.Args = cli.args_new(a)
+    cli.push_arg(r, "--help")
+    var m: cli.Matches = cli.parse(a, s, r)
+
+    // A tool that exits non-zero on `--help` breaks every script that pipes it, so these
+    // three assertions are one contract: help is requested, the parse SUCCEEDED, and the
+    // exit code is 0.
+    test.is_true(c, rep, "help requested", cli.wants_help(m))
+    test.is_true(c, rep, "and it is not an error", cli.succeeded(m))
+    test.eq_i64(c, rep, "exit 0", cli.exit_code(m) as i64, 0)
+
+    // `-h` is the same request.
+    var r2: cli.Args = cli.args_new(a)
+    cli.push_arg(r2, "-h")
+    var m2: cli.Matches = cli.parse(a, s, r2)
+    test.is_true(c, rep, "-h too", cli.wants_help(m2))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn an_unknown_command_is_refused() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var s: cli.Spec = demo_spec(a)
+
+    var r: cli.Args = cli.args_new(a)
+    cli.push_arg(r, "biuld")
+    var m: cli.Matches = cli.parse(a, s, r)
+    test.is_false(c, rep, "typo refused", cli.succeeded(m))
+    test.eq_str(c, rep, "names it", cli.error_text(m), "unknown command: biuld")
+
+    // Positive control: a spec with NO subcommands takes the same word as a positional,
+    // so a simple tool pays nothing for the feature.
+    var s2: cli.Spec = cli.spec_new(a, "simple", "")
+    var r2: cli.Args = cli.args_new(a)
+    cli.push_arg(r2, "biuld")
+    var m2: cli.Matches = cli.parse(a, s2, r2)
+    test.is_true(c, rep, "no subcommands, no complaint", cli.succeeded(m2))
+    test.eq_str(c, rep, "just a positional", cli.positional(m2, 0), "biuld")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn help_renders_aligned_and_complete() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var braw: *mut u8 = alloc(u8, BUF_CAP)
+    var buf: []u8 = slice(u8, braw, BUF_CAP)
+    var sk: sink.Sink = sink.new()
+
+    var s: cli.Spec = cli.spec_new(a, "jt", "does a thing")
+    cli.flag(s, 118, "verbose", "say more")
+    cli.option(s, 0, "output", "where to write")
+    cli.subcommand(s, "run", "do it")
+    cli.render_help(sk, buf, s)
+
+    // Pinned in full. The option column is computed from the longest entry
+    // (`output <val>`, 12), so adding a longer option re-aligns the whole block instead
+    // of running past a hard-coded column.
+    test.eq_golden(c, rep, "help", sink.view(sk, buf),
+        "jt - does a thing\n\nusage: jt [options] <command> [args]\n\noptions:\n  -v, --verbose       say more\n      --output <val>  where to write\n\ncommands:\n        run           do it\n")
+    test.is_false(c, rep, "fits", sink.overflowed(sk))
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn help_into_a_small_buffer_overflows_visibly() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // Deliberately too small, unguarded on purpose — the same shape as `std/diag`'s
+    // overflow case. A truncated usage message reads as a complete one.
+    var braw: *mut u8 = alloc(u8, 12)
+    var buf: []u8 = slice(u8, braw, 12)
+    var sk: sink.Sink = sink.new()
+    var s: cli.Spec = cli.spec_new(a, "jt", "does a thing")
+    cli.flag(s, 118, "verbose", "say more")
+    let n: usize = cli.render_help(sk, buf, s)
+
+    test.eq_usize(c, rep, "wrote what it could", n, 12)
+    test.is_true(c, rep, "THE signal", sink.overflowed(sk))
+
+    // Positive control: the same help into a buffer that fits does not overflow.
+    var big: *mut u8 = alloc(u8, BUF_CAP)
+    var bbuf: []u8 = slice(u8, big, BUF_CAP)
+    var sk2: sink.Sink = sink.new()
+    cli.render_help(sk2, bbuf, s)
+    test.is_false(c, rep, "positive control", sink.overflowed(sk2))
+
+    free_ptr(big)
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn an_empty_command_line_is_valid_and_empty() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var s: cli.Spec = demo_spec(a)
+
+    // No arguments is not an error — it is what a bare `jtool` gives, and the caller
+    // decides whether that means "print help" or "use the defaults".
+    var r: cli.Args = cli.args_new(a)
+    var m: cli.Matches = cli.parse(a, s, r)
+    test.is_true(c, rep, "ok", cli.succeeded(m))
+    test.is_false(c, rep, "no help asked", cli.wants_help(m))
+    test.eq_i64(c, rep, "no command", cli.command(m) as i64, 0 - 1)
+    test.eq_usize(c, rep, "no positionals", cli.positional_count(m), 0)
+    test.eq_usize(c, rep, "no args", cli.args_len(r), 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

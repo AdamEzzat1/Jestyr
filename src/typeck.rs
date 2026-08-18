@@ -535,6 +535,50 @@ impl<'a> TypeChecker<'a> {
                     let ret = f.ret_ty.map(|t| self.lower_type(&typ, t)).unwrap_or(Ty::Unit);
                     // Key on the canonical name so two modules may each define
                     // `make`; a clash here is a *same-module* redefinition.
+                    // **A function named like an intrinsic is refused.**
+                    //
+                    // cgen dispatches intrinsics by NAME before it looks at user
+                    // functions, so a module defining `fn arg_count(read r: Args)` had
+                    // every unqualified call to it emitted as `jestyr_rt_arg_count()` —
+                    // the runtime's argc — **with the argument silently discarded**. The
+                    // program compiled without a warning from Jestyr or from gcc and
+                    // returned the process's argument count instead of the caller's data.
+                    //
+                    // That is worse than the `int`-fallback miscompiles already recorded,
+                    // because there is no wrong TYPE to notice: the shadowing intrinsic
+                    // has a plausible signature and C is perfectly happy. The only signal
+                    // was a wrong answer at runtime, in a module (`std/cli`) whose whole
+                    // job is counting arguments — which is how it got caught at all.
+                    //
+                    // **A WARNING, not an error, and the corpus is why.** Two existing
+                    // modules shadow an intrinsic — `lexer.str_eq` and `set.contains` —
+                    // and both work today, because `str_eq`'s semantics happen to match
+                    // the intrinsic's and `contains` is only ever called qualified. An
+                    // error would refuse working code to catch a hazard those two have
+                    // not yet been bitten by; a warning names the hazard and leaves them
+                    // alone. They are still traps: change `lexer.str_eq`'s behaviour and
+                    // the change is silently ignored at every unqualified call.
+                    //
+                    // **The real fix is in cgen — prefer the user's function when the
+                    // program defines one** — and it is deferred because it is an
+                    // emission change: it would rename `str_eq`'s call sites in a closure
+                    // module, so it owes a port mirror, a reseed and a golden churn. This
+                    // warning is what makes that a known debt rather than a latent one.
+                    if crate::cgen::is_intrinsic(&f.name.name) {
+                        self.warn(
+                            f.name.span,
+                            format!(
+                                "`{}` shadows a compiler intrinsic: an unqualified call emits the intrinsic, not this function",
+                                f.name.name
+                            ),
+                        );
+                        self.diags.last_mut().unwrap().help = Some(
+                            "a qualified call (`mod.name(..)`) reaches this definition and an \
+                             unqualified one does not, so the two spellings disagree silently — \
+                             rename it unless the semantics are identical"
+                                .to_string(),
+                        );
+                    }
                     let key = self.canon_in(item_m, &f.name.name);
                     let cfg = crate::attrs::cfg_of(ast, &f.attrs);
                     if self.table.fns.contains_key(&key)

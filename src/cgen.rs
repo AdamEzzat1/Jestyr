@@ -10574,7 +10574,7 @@ fn is_scalar_ty(t: &Ty) -> bool {
 
 /// Is `name` a backend intrinsic (a prelude stand-in for the stdlib / C interop)?
 /// Used so a reference to one is not mistaken for a closure capture.
-fn is_intrinsic(name: &str) -> bool {
+pub fn is_intrinsic(name: &str) -> bool {
     matches!(
         name,
         "print_int" | "print_float" | "print_str" | "print_bool"

@@ -312,6 +312,74 @@ mod fallible_return {
     }
 }
 
+/// **Intrinsic shadowing.** A function whose name is a cgen intrinsic is silently
+/// replaced by that intrinsic at every UNQUALIFIED call, arguments and all.
+///
+/// Found by `std/cli`, whose first spelling of its argument count was `arg_count` — a real
+/// intrinsic. Every unqualified call emitted `jestyr_rt_arg_count()`, the process's argc,
+/// **with the argument discarded**. Jestyr reported nothing and gcc reported nothing,
+/// because the shadowing intrinsic has a plausible signature and the C is well-formed;
+/// the only signal was a wrong answer at runtime. Qualified calls resolved correctly, so
+/// one name meant two things depending on how it was spelled.
+///
+/// The rule is a WARNING because two corpus modules already shadow and both work —
+/// `lexer.str_eq` (semantics match the intrinsic's) and `set.contains` (only ever called
+/// qualified). Two tests exempt that warning by message; this test is what stops the
+/// exemption from quietly covering a third name.
+#[cfg(test)]
+mod intrinsic_shadowing {
+    use super::*;
+
+    const NEEDLE: &str = "shadows a compiler intrinsic";
+
+    /// The exact, closed set. A new module that shadows an intrinsic fails here, which is
+    /// the point: the two below are grandfathered, not the start of a pattern.
+    #[test]
+    fn intrinsic_shadowing_is_confined_to_two_names() {
+        let mut hits: Vec<String> = Vec::new();
+        for dir in ["examples", "examples/std"] {
+            let Ok(rd) = std::fs::read_dir(dir) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) != Some("jtr") {
+                    continue;
+                }
+                let prog = crate::module::load(p.to_str().unwrap());
+                let (_info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+                for d in td.iter().filter(|d| d.message.contains(NEEDLE)) {
+                    // Take the backticked name out of the message so the assertion is
+                    // about WHICH names shadow, not about how many files import them.
+                    if let Some(n) = d.message.split('`').nth(1) {
+                        if !hits.contains(&n.to_string()) {
+                            hits.push(n.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        hits.sort();
+        assert_eq!(
+            hits,
+            vec!["contains".to_string(), "str_eq".to_string()],
+            "the set of intrinsic-shadowing names changed — a new one is a latent miscompile, \
+             and a removed one means this exemption can shrink"
+        );
+    }
+
+    /// The shape that started it, kept as an executable record: a user function named for
+    /// an intrinsic is reported, and one that is not is silent.
+    #[test]
+    fn a_function_named_for_an_intrinsic_is_reported() {
+        let ds = typeck_diags("fn arg_count(x: i64) -> i64 { return x }\nfn main() -> i32 { return 0 }\n");
+        assert!(ds.iter().any(|d| d.contains(NEEDLE)), "shadowing must be reported; got {ds:?}");
+        let clean = typeck_diags("fn args_len(x: i64) -> i64 { return x }\nfn main() -> i32 { return 0 }\n");
+        assert!(
+            !clean.iter().any(|d| d.contains(NEEDLE)),
+            "an ordinary name must be silent; got {clean:?}"
+        );
+    }
+}
+
 /// **`@cfg(<platform>)` — conditional compilation that does not fork the emitted C.**
 ///
 /// The design is forced by an invariant the compiler already sells: `attest` hashes the
@@ -2222,7 +2290,12 @@ mod hashmap_props {
     #[test]
     fn hashmap_compiles_clean() {
         for f in ["hashmap.jtr", "hashmap_test.jtr", "set.jtr", "set_test.jtr", "deque.jtr", "deque_test.jtr", "smallvec.jtr", "smallvec_test.jtr"] {
-            let d = diags_of(&format!("examples/std/{f}"));
+            let mut d = diags_of(&format!("examples/std/{f}"));
+            // `set.contains` shadows an intrinsic. It is correct today — every call to it
+            // is qualified, and a qualified call reaches the user function — but the name
+            // is a trap, and the warning says so. Exempted by message so any OTHER
+            // diagnostic still fails; see `intrinsic_shadowing_is_confined_to_two_names`.
+            d.retain(|m| !m.contains("shadows a compiler intrinsic"));
             assert!(d.is_empty(), "examples/std/{f}: {d:?}");
         }
     }
@@ -15212,6 +15285,9 @@ fn main() -> i32 {
         "diag.jtr",
         "diag_test.jtr",
         "diag_demo.jtr",
+        "cli.jtr",
+        "cli_test.jtr",
+        "cli_demo.jtr",
     ];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
@@ -16135,6 +16211,7 @@ fn main() -> i32 {
             ("file_test", 19),
             ("cstring_test", 4),
             ("diag_test", 15),
+            ("cli_test", 11),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

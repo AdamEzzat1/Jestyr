@@ -1,0 +1,171 @@
+// examples/std/cli_demo.jtr — `std/cli`'s consumer: a real tool, wired to `std/diag`.
+//
+// `jlint` parses a Jestyr source file with the ported parser, finds its syntax-error
+// recovery nodes, and reports them — as full caret diagnostics or as one line each,
+// chosen by a flag. That is a genuine command-line tool: subcommands, options, a
+// `--help` that exits 0, and exit codes a script can branch on.
+//
+//   jlint check <file>     report syntax errors        (exit 0 clean, 1 if any found)
+//   jlint count <file>     just the number
+//   --format=brief|full    how much to print
+//   --quiet, -q            suppress the report, keep the exit code
+//   --help, -h             usage, on stdout, exit 0
+//
+// Build it and run it:
+//     jestyrc build examples/std/cli_demo.jtr
+//     ./cli_demo check some.jtr --format=brief
+//
+// (`jestyrc run` does not forward arguments to the built binary, so a bare `run` takes
+// the no-arguments path and prints usage — which is itself the behaviour worth showing.)
+//
+// The exit-code split is the part worth copying. `EXIT_USAGE` (2) means the command line
+// was wrong and nothing ran; `EXIT_FAILURE` (1) means the tool ran and the answer was
+// "there are errors"; 0 means clean. A tool that returned 1 for both leaves a script
+// unable to tell "your file is bad" from "your invocation is bad" — the distinction
+// `grep` and `diff` established and every CI script relies on.
+
+import "cli"
+import "diag"
+import "sink"
+import "mem"
+import "fs"
+import "intern"
+import "tokens"
+import "parser"
+import "list"
+
+const CAP: usize = 16384
+
+fn spec_of(read a: Allocator) -> cli.Spec {
+    var s: cli.Spec = cli.spec_new(a, "jlint", "report syntax errors in a Jestyr source file")
+    cli.option(s, 0, "format", "brief or full (default full)")
+    cli.flag(s, 113, "quiet", "print nothing; the exit code is the answer")
+    cli.subcommand(s, "check", "report every syntax error")
+    cli.subcommand(s, "count", "print how many there are")
+    return s
+}
+
+// Write a rendered buffer out, refusing to print a truncated one. Both `std/diag` and
+// `std/cli` return the byte count they MANAGED to write, which is the truth and is not
+// the same as "all of it" — `sink.overflowed` is the only thing that distinguishes them.
+fn emit(read text: str, overflowed: bool, to_err: bool) {
+    if overflowed {
+        eprint_str("output too large to render; raise the buffer")
+        return
+    }
+    if to_err {
+        eprint_str(text)
+        return
+    }
+    print_str(text)
+}
+
+fn show_help(read s: cli.Spec, to_err: bool) {
+    var raw: *mut u8 = alloc(u8, CAP)
+    var buf: []u8 = slice(u8, raw, CAP)
+    var sk: Sink = sink.new()
+    cli.render_help(sk, buf, s)
+    emit(sink.view(sk, buf), sink.overflowed(sk), to_err)
+    free_ptr(raw)
+}
+
+// Report `d` and say whether anything was printed.
+fn report(read m: diag.SourceMap, read d: diag.Diagnostic, brief: bool) {
+    var raw: *mut u8 = alloc(u8, CAP)
+    var buf: []u8 = slice(u8, raw, CAP)
+    var sk: Sink = sink.new()
+    if brief {
+        diag.render_brief(sk, buf, m, d)
+    } else {
+        diag.render(sk, buf, m, d, diag.plain())
+    }
+    emit(sink.view(sk, buf), sink.overflowed(sk), true)
+    free_ptr(raw)
+}
+
+// Every parse-recovery node in `src`, reported through `std/diag`. Returns the count.
+fn lint(read a: Allocator, read path: str, read src: str, brief: bool, quiet: bool) -> i32 {
+    var m: diag.SourceMap = diag.map_new(a)
+    let f: diag.FileId = diag.add_file(m, path, src)
+    var it: Interner = intern.make(a)
+    let kwcount: i64 = tokens.intern_keywords(it)
+    var p: parser.Parser = parser.parse_source(src, it, kwcount, a)
+
+    var found: i32 = 0
+    var i: usize = 0
+    for i < list.len(parser.ExprData, p.ex) {
+        let e: parser.ExprData = list.get(parser.ExprData, p.ex, i)
+        if e.kind == 9 {
+            if quiet == false {
+                var d: diag.Diagnostic = diag.new_error(a, "E0001", "expected an expression")
+                diag.primary(d, diag.span(f, e.start, e.end), "the parser could not read this")
+                report(m, d, brief)
+            }
+            found = found + 1
+        }
+        i = i + 1
+    }
+    var j: usize = 0
+    for j < list.len(parser.ItemData, p.it) {
+        let itd: parser.ItemData = list.get(parser.ItemData, p.it, j)
+        if itd.kind == 99 {
+            if quiet == false {
+                var d2: diag.Diagnostic = diag.new_error(a, "E0002", "expected an item")
+                diag.primary(d2, diag.span(f, itd.start, itd.end), "not a `fn`, `struct`, `enum`, `const`, `trait`, `impl` or `import`")
+                report(m, d2, brief)
+            }
+            found = found + 1
+        }
+        j = j + 1
+    }
+    return found
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var s: cli.Spec = spec_of(a)
+    var args: cli.Args = cli.args_from_env(a)
+    var mt: cli.Matches = cli.parse(a, s, args)
+
+    // A usage error prints help on STDERR and exits 2 — stdout stays clean, so a script
+    // piping this tool's output never has a diagnostic land in its data.
+    if cli.succeeded(mt) == false {
+        eprint_str(cli.error_text(mt))
+        show_help(s, true)
+        return cli.EXIT_USAGE
+    }
+    // `--help` is a SUCCESS: stdout, exit 0. A tool that exits non-zero here breaks
+    // every script that pipes it.
+    if cli.wants_help(mt) {
+        show_help(s, false)
+        return cli.EXIT_OK
+    }
+    // No command at all is not an error either — it is what a bare `jlint` gives.
+    if cli.command(mt) < 0 {
+        show_help(s, false)
+        return cli.EXIT_OK
+    }
+    if cli.positional_count(mt) == 0 {
+        eprint_str("this command needs a file")
+        return cli.EXIT_USAGE
+    }
+
+    let path: str = cli.positional(mt, 0)
+    if fs.exists(path) == false {
+        eprint_str("no such file")
+        return cli.EXIT_USAGE
+    }
+    let brief: bool = cli.value_or(mt, s, "format", "full").len == 5
+    let quiet: bool = cli.is_set(mt, s, "quiet")
+    let counting: bool = cli.command(mt) == 1
+
+    var text: String = fs.read_text(path)
+    let n: i32 = lint(a, path, string_view(text), brief, quiet or counting)
+    string_free(text)
+
+    if counting { print_int(n as i64) }
+    // The answer, as an exit code: 1 means "the tool ran and found problems", which is
+    // distinct from 2 ("your command line was wrong") above.
+    if n > 0 { return cli.EXIT_FAILURE }
+    return cli.EXIT_OK
+}

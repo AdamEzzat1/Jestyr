@@ -1,0 +1,617 @@
+// std/cli.jtr — command-line parsing for tools, not for scripts.
+//
+// TIER: `std`. Building a `Spec` or an `Args` allocates (`@no_os`); parsing and help
+// rendering do neither beyond that. **Nothing here reads the environment.** That is the
+// module's central decision and it is not stylistic — see below.
+//
+// ─── Why the parser does not read `argv` ──────────────────────────────────────
+//
+// The obvious API is `cli.parse(spec)`, reaching for `env.argv` itself. Two reasons not to.
+//
+// **It would be untestable in this tree.** `env.argc()`/`argv()` read 0 and empty inside a
+// `@test`, because the harness emits `int main(void)` and the runtime never records
+// arguments. A parser that sourced its own input could therefore only be tested by
+// building a binary and running it as a subprocess — which is exactly the "capturing a
+// subprocess" cost `std/writer` exists to avoid for output.
+//
+// **And it would hide the input.** A CLI should be testable with a sealed env, a denied
+// fs, a manual clock and a scratch writer; a parser that fetches its own argv is one more
+// hidden global in a library whose whole point is that there are none. So `Args` is a
+// value you build — from `env` in `main`, from string literals in a test — and `parse` is
+// a pure function of `(Spec, Args)`.
+//
+// `args_from_env(a)` is the one function that touches `env`, it is three lines, and it is
+// the only thing a test cannot cover. That is the boundary in the right place.
+//
+// ─── Help goes to a Sink, for the same reason diagnostics do ──────────────────
+//
+// `render_help` writes into a caller `Sink` and returns a byte count. There is no
+// `Writer` parameter and no error set: a `sink` write is infallible at the call site by
+// design, so an error set here would be a query that can only answer "fine". The caller
+// decides whether help lands on stdout (a successful `--help`) or stderr (a usage error),
+// which is a policy this module should not make — and the two differ in the exit code as
+// much as the stream. `std/diag`'s header has the long form of this argument.
+//
+// **Check `sink.overflowed(s)`.** Help is not bounded: a long option list can exceed any
+// fixed buffer, and a truncated usage message is worse than none.
+//
+// ─── What it deliberately does not do ─────────────────────────────────────────
+//
+// No env-var fallback for options, no config-file merging, no shell completion, no
+// `--flag=` inference from a struct. Each is a real feature and each wants a decision this
+// module cannot make alone (precedence order; a config format; which shells). What is here
+// is the substrate a tool needs before any of those are worth arguing about.
+//
+// Run the tests:  jestyrc test examples/std/cli_test.jtr
+// Worked example: jestyrc run examples/std/cli_demo.jtr
+
+import "list"
+import "sink"
+import "str"
+import "env"
+
+// ------------------------------------------------------------------------- args
+
+// The argument vector as a value: every argument concatenated into one `String`, with two
+// offsets per argument in `ix`. Same shape as `std/diag`'s `SourceMap`, and for the same
+// reason — a `List(String)` would leak, because the field auto-drop recurses into
+// droppable FIELDS and `String` is a primitive with a manual `string_free`.
+pub struct Args {
+    text: String,
+    ix: List(i32),
+}
+
+impl Drop for Args {
+    fn drop(mut self) {
+        string_free(self.text)
+    }
+}
+
+pub fn args_new(read a: Allocator) -> Args {
+    return Args{ text: string_new(), ix: list.make(i32, a) }
+}
+
+// Append one argument. Copies, so the caller's buffer may go.
+pub fn push_arg(mut r: Args, read s: str) {
+    let v0: str = string_view(r.text)
+    let start: usize = v0.len
+    string_push(r.text, s)
+    let v1: str = string_view(r.text)
+    list.push(i32, r.ix, start as i32)
+    list.push(i32, r.ix, v1.len as i32)
+}
+
+pub fn args_len(read r: Args) -> usize {
+    return list.len(i32, r.ix) / 2
+}
+
+pub fn arg_at(read r: Args, i: usize) -> str {
+    let v: str = string_view(r.text)
+    return v[list.get(i32, r.ix, i * 2) as usize .. list.get(i32, r.ix, i * 2 + 1) as usize]
+}
+
+// The real `argv`, minus `argv[0]`. The ONLY function in this module that reads the
+// environment, and the only one a `@test` cannot exercise — see the header.
+pub fn args_from_env(read a: Allocator) -> Args {
+    var r: Args = args_new(a)
+    var i: i32 = 1
+    for i < env.argc() {
+        push_arg(r, env.argv(i))
+        i = i + 1
+    }
+    return r
+}
+
+// ------------------------------------------------------------------------- spec
+
+// What an option carries. `opt_flag` is present-or-not (`-v`, `--verbose`); `opt_value`
+// takes the next argument or an `=`-attached one (`--out=x`, `--out x`).
+//
+// There is deliberately no `opt_count` (`-vvv`). It is easy to add and nothing in this
+// tree wants it, and an option kind with no caller is a shape we would have to keep
+// working without ever finding out whether it was the right one.
+@copy pub enum OptKind {
+    opt_flag,
+    opt_value,
+}
+
+// A command-line interface: the program's name and blurb, its options, and its
+// subcommands. Strings live in one arena; `opts` holds six `i32`s per option and `cmds`
+// four per subcommand.
+pub struct Spec {
+    text: String,
+    // per option: short_char, long_start, long_end, help_start, help_end, kind
+    opts: List(i32),
+    // per subcommand: name_start, name_end, help_start, help_end
+    cmds: List(i32),
+    ns: usize,
+    ne: usize,
+    as_: usize,
+    ae: usize,
+}
+
+impl Drop for Spec {
+    fn drop(mut self) {
+        string_free(self.text)
+    }
+}
+
+pub fn spec_new(read a: Allocator, read name: str, read about: str) -> Spec {
+    var t: String = string_new()
+    let v0: str = string_view(t)
+    let ns: usize = v0.len
+    string_push(t, name)
+    let v1: str = string_view(t)
+    let ne: usize = v1.len
+    string_push(t, about)
+    let v2: str = string_view(t)
+    return Spec{ text: t, opts: list.make(i32, a), cmds: list.make(i32, a), ns: ns, ne: ne, as_: ne, ae: v2.len }
+}
+
+pub fn program_name(read s: Spec) -> str {
+    let v: str = string_view(s.text)
+    return v[s.ns .. s.ne]
+}
+
+pub fn about(read s: Spec) -> str {
+    let v: str = string_view(s.text)
+    return v[s.as_ .. s.ae]
+}
+
+// `short` is the one-character form's byte (`118` for `-v`), or 0 for none.
+fn add_opt(mut s: Spec, short: i32, read long: str, read help: str, k: OptKind) {
+    let v0: str = string_view(s.text)
+    let ls: usize = v0.len
+    string_push(s.text, long)
+    let v1: str = string_view(s.text)
+    let le: usize = v1.len
+    string_push(s.text, help)
+    let v2: str = string_view(s.text)
+    list.push(i32, s.opts, short)
+    list.push(i32, s.opts, ls as i32)
+    list.push(i32, s.opts, le as i32)
+    list.push(i32, s.opts, le as i32)
+    list.push(i32, s.opts, v2.len as i32)
+    list.push(i32, s.opts, kind_code(k))
+}
+
+@no_alloc @no_os fn kind_code(k: OptKind) -> i32 {
+    match k {
+        opt_flag => { return 0 },
+        opt_value => { return 1 },
+    }
+}
+
+pub fn flag(mut s: Spec, short: i32, read long: str, read help: str) {
+    add_opt(s, short, long, help, opt_flag)
+}
+
+pub fn option(mut s: Spec, short: i32, read long: str, read help: str) {
+    add_opt(s, short, long, help, opt_value)
+}
+
+pub fn subcommand(mut s: Spec, read name: str, read help: str) {
+    let v0: str = string_view(s.text)
+    let ns: usize = v0.len
+    string_push(s.text, name)
+    let v1: str = string_view(s.text)
+    let ne: usize = v1.len
+    string_push(s.text, help)
+    let v2: str = string_view(s.text)
+    list.push(i32, s.cmds, ns as i32)
+    list.push(i32, s.cmds, ne as i32)
+    list.push(i32, s.cmds, ne as i32)
+    list.push(i32, s.cmds, v2.len as i32)
+}
+
+pub fn opt_count(read s: Spec) -> usize {
+    return list.len(i32, s.opts) / 6
+}
+
+pub fn opt_long(read s: Spec, i: usize) -> str {
+    let v: str = string_view(s.text)
+    return v[list.get(i32, s.opts, i * 6 + 1) as usize .. list.get(i32, s.opts, i * 6 + 2) as usize]
+}
+
+pub fn opt_help(read s: Spec, i: usize) -> str {
+    let v: str = string_view(s.text)
+    return v[list.get(i32, s.opts, i * 6 + 3) as usize .. list.get(i32, s.opts, i * 6 + 4) as usize]
+}
+
+pub fn opt_short(read s: Spec, i: usize) -> i32 {
+    return list.get(i32, s.opts, i * 6)
+}
+
+pub fn opt_takes_value(read s: Spec, i: usize) -> bool {
+    return list.get(i32, s.opts, i * 6 + 5) == 1
+}
+
+pub fn cmd_count(read s: Spec) -> usize {
+    return list.len(i32, s.cmds) / 4
+}
+
+pub fn cmd_name(read s: Spec, i: usize) -> str {
+    let v: str = string_view(s.text)
+    return v[list.get(i32, s.cmds, i * 4) as usize .. list.get(i32, s.cmds, i * 4 + 1) as usize]
+}
+
+pub fn cmd_help(read s: Spec, i: usize) -> str {
+    let v: str = string_view(s.text)
+    return v[list.get(i32, s.cmds, i * 4 + 2) as usize .. list.get(i32, s.cmds, i * 4 + 3) as usize]
+}
+
+// ----------------------------------------------------------------------- matches
+
+// What a parse produced. Values and the error message live in one arena; `seen` is one
+// entry per spec option and `vals` two.
+pub struct Matches {
+    text: String,
+    seen: List(i32),
+    vals: List(i32),
+    pos: List(i32),
+    cmd: i32,
+    es: usize,
+    ee: usize,
+    help: bool,
+}
+
+impl Drop for Matches {
+    fn drop(mut self) {
+        string_free(self.text)
+    }
+}
+
+// `true` if the parse succeeded. A caller that ignores this and reads values gets the
+// defaults, which is why `error_text` is non-empty exactly when this is false.
+pub fn succeeded(read m: Matches) -> bool {
+    return m.ee == m.es
+}
+
+pub fn error_text(read m: Matches) -> str {
+    let v: str = string_view(m.text)
+    return v[m.es .. m.ee]
+}
+
+// `--help` or `-h` was given. Kept separate from `succeeded`, because help is a SUCCESS that
+// should not run the command — conflating the two is how tools end up exiting 1 on
+// `--help`, which breaks every script that pipes it.
+pub fn wants_help(read m: Matches) -> bool {
+    return m.help
+}
+
+pub fn is_set(read m: Matches, read s: Spec, read long: str) -> bool {
+    let i: isize = find_long(s, long)
+    if i < 0 { return false }
+    return list.get(i32, m.seen, i as usize) != 0
+}
+
+// The option's value, or `fallback` when it was not given. There is no "was it given"
+// distinction beyond `is_set`, and no `Option`-shaped return, because the caller almost
+// always has a default and the two-call shape is what makes that explicit.
+pub fn value_or(read m: Matches, read s: Spec, read long: str, read fallback: str) -> read str {
+    let i: isize = find_long(s, long)
+    if i < 0 { return fallback }
+    let b: usize = (i as usize) * 2
+    let vs: i32 = list.get(i32, m.vals, b)
+    if vs < 0 { return fallback }
+    let v: str = string_view(m.text)
+    return v[vs as usize .. list.get(i32, m.vals, b + 1) as usize]
+}
+
+// The chosen subcommand's index in the spec, or -1. `cmd_name(s, i)` renders it.
+pub fn command(read m: Matches) -> isize {
+    return m.cmd as isize
+}
+
+pub fn positional_count(read m: Matches) -> usize {
+    return list.len(i32, m.pos) / 2
+}
+
+pub fn positional(read m: Matches, i: usize) -> str {
+    let v: str = string_view(m.text)
+    return v[list.get(i32, m.pos, i * 2) as usize .. list.get(i32, m.pos, i * 2 + 1) as usize]
+}
+
+fn find_long(read s: Spec, read long: str) -> isize {
+    var i: usize = 0
+    for i < opt_count(s) {
+        if str.eq(opt_long(s, i), long) { return i as isize }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn find_short(read s: Spec, c: i32) -> isize {
+    var i: usize = 0
+    for i < opt_count(s) {
+        if opt_short(s, i) == c and c != 0 { return i as isize }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn find_cmd(read s: Spec, read name: str) -> isize {
+    var i: usize = 0
+    for i < cmd_count(s) {
+        if str.eq(cmd_name(s, i), name) { return i as isize }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn fail(mut m: Matches, read what: str, read detail: str) {
+    if m.ee != m.es { return }              // keep the FIRST error, not the last
+    let v0: str = string_view(m.text)
+    m.es = v0.len
+    string_push(m.text, what)
+    string_push(m.text, detail)
+    let v1: str = string_view(m.text)
+    m.ee = v1.len
+}
+
+fn push_pos(mut m: Matches, read v: str) {
+    let v0: str = string_view(m.text)
+    let s: usize = v0.len
+    string_push(m.text, v)
+    let v1: str = string_view(m.text)
+    list.push(i32, m.pos, s as i32)
+    list.push(i32, m.pos, v1.len as i32)
+}
+
+fn set_value(mut m: Matches, i: usize, read v: str) {
+    let v0: str = string_view(m.text)
+    let s: usize = v0.len
+    string_push(m.text, v)
+    let v1: str = string_view(m.text)
+    list.set(i32, m.vals, i * 2, s as i32)
+    list.set(i32, m.vals, i * 2 + 1, v1.len as i32)
+}
+
+// Parse `r` against `s`.
+//
+// The accepted surface, in full, because a parser's grammar is its contract:
+//
+//   --long            a flag
+//   --long value      an option's value as the next argument
+//   --long=value      an option's value attached
+//   -x                a short flag
+//   -x value          a short option's value
+//   --help  -h        sets `wants_help`, always accepted, never an error
+//   --                everything after is a positional, even if it looks like a flag
+//   anything else     a subcommand (the first one, if the spec declares any) or a positional
+//
+// Unknown options are an ERROR, not a positional. A tool that silently treated `--ouput`
+// as a filename would write to a file called `--ouput`; the typo has to stop the program.
+// Bundled short flags (`-abc`) are deliberately not accepted — they are ambiguous the
+// moment one of them takes a value, and rejecting them is a one-line diagnostic where
+// guessing is a bug report.
+pub fn parse(read a: Allocator, read s: Spec, read r: Args) -> Matches {
+    var m: Matches = Matches{ text: string_new(), seen: list.make(i32, a), vals: list.make(i32, a), pos: list.make(i32, a), cmd: 0 - 1, es: 0, ee: 0, help: false }
+    var k: usize = 0
+    for k < opt_count(s) {
+        list.push(i32, m.seen, 0)
+        list.push(i32, m.vals, 0 - 1)
+        list.push(i32, m.vals, 0 - 1)
+        k = k + 1
+    }
+
+    let n: usize = args_len(r)
+    var only_pos: bool = false
+    var i: usize = 0
+    for i < n {
+        let arg: str = arg_at(r, i)
+        if only_pos {
+            take_positional(m, s, arg)
+            i = i + 1
+            continue
+        }
+        if str.eq(arg, "--") {
+            only_pos = true
+            i = i + 1
+            continue
+        }
+        if str.eq(arg, "--help") or str.eq(arg, "-h") {
+            m.help = true
+            i = i + 1
+            continue
+        }
+        if str.has_prefix(arg, "--") {
+            let body: str = arg[2 .. arg.len]
+            let eq: isize = str.index_of(body, "=")
+            if eq >= 0 {
+                let nm: str = body[0 .. eq as usize]
+                let vl: str = body[(eq as usize) + 1 .. body.len]
+                let oi: isize = find_long(s, nm)
+                if oi < 0 {
+                    fail(m, "unknown option: --", nm)
+                } else if opt_takes_value(s, oi as usize) == false {
+                    fail(m, "this option takes no value: --", nm)
+                } else {
+                    list.set(i32, m.seen, oi as usize, 1)
+                    set_value(m, oi as usize, vl)
+                }
+                i = i + 1
+                continue
+            }
+            let oi2: isize = find_long(s, body)
+            if oi2 < 0 {
+                fail(m, "unknown option: --", body)
+                i = i + 1
+                continue
+            }
+            list.set(i32, m.seen, oi2 as usize, 1)
+            if opt_takes_value(s, oi2 as usize) {
+                if i + 1 >= n {
+                    fail(m, "missing value for --", body)
+                    i = i + 1
+                    continue
+                }
+                set_value(m, oi2 as usize, arg_at(r, i + 1))
+                i = i + 2
+                continue
+            }
+            i = i + 1
+            continue
+        }
+        if str.has_prefix(arg, "-") and arg.len > 1 {
+            if arg.len > 2 {
+                fail(m, "bundled short flags are not supported: ", arg)
+                i = i + 1
+                continue
+            }
+            let oi3: isize = find_short(s, arg[1] as i32)
+            if oi3 < 0 {
+                fail(m, "unknown option: ", arg)
+                i = i + 1
+                continue
+            }
+            list.set(i32, m.seen, oi3 as usize, 1)
+            if opt_takes_value(s, oi3 as usize) {
+                if i + 1 >= n {
+                    fail(m, "missing value for ", arg)
+                    i = i + 1
+                    continue
+                }
+                set_value(m, oi3 as usize, arg_at(r, i + 1))
+                i = i + 2
+                continue
+            }
+            i = i + 1
+            continue
+        }
+        take_positional(m, s, arg)
+        i = i + 1
+    }
+    return m
+}
+
+// The first bare word is the subcommand when the spec declares any; everything after is a
+// positional. A spec with no subcommands treats them all as positionals, so a simple tool
+// pays nothing for the feature.
+fn take_positional(mut m: Matches, read s: Spec, read arg: str) {
+    if cmd_count(s) > 0 and m.cmd < 0 {
+        let ci: isize = find_cmd(s, arg)
+        if ci < 0 {
+            fail(m, "unknown command: ", arg)
+            return
+        }
+        m.cmd = ci as i32
+        return
+    }
+    push_pos(m, arg)
+}
+
+// -------------------------------------------------------------------- exit codes
+
+// 0 — the command did what it was asked.
+pub const EXIT_OK: i32 = 0
+// 1 — the command ran and the answer was "no": a check failed, a diff was non-empty.
+// Distinct from a usage error so a script can tell "your input is bad" from "your
+// command line is bad", which is the distinction `grep` and `diff` established.
+pub const EXIT_FAILURE: i32 = 1
+// 2 — the command line itself was wrong. Nothing ran.
+pub const EXIT_USAGE: i32 = 2
+
+// The exit code a parse implies: usage on error, ok otherwise (including `--help`, which
+// is a success — a tool that exits non-zero on `--help` breaks every script that pipes it).
+pub fn exit_code(read m: Matches) -> i32 {
+    if succeeded(m) == false { return EXIT_USAGE }
+    return EXIT_OK
+}
+
+// ------------------------------------------------------------------ help rendering
+
+@no_alloc @no_os fn put_pad(mut sk: Sink, mut buf: []u8, n: usize) {
+    for i in 0..n {
+        sink.put(sk, buf, 32 as u8)
+    }
+}
+
+// Usage, options and subcommands, into a caller buffer. Returns bytes written — which is
+// not what it needed if the buffer was small, so **check `sink.overflowed`**.
+//
+// The option column is padded to a width computed from the longest long-name, so the help
+// stays aligned without a hard-coded column that silently mangles the day someone adds
+// `--preserve-timestamps`.
+@no_alloc @no_os pub fn render_help(mut sk: Sink, mut buf: []u8, read s: Spec) -> usize {
+    let before: usize = sink.written(sk)
+    sink.put_str(sk, buf, program_name(s))
+    let ab: str = about(s)
+    if ab.len > 0 {
+        sink.put_str(sk, buf, " - ")
+        sink.put_str(sk, buf, ab)
+    }
+    sink.put_nl(sk, buf)
+    sink.put_nl(sk, buf)
+    sink.put_str(sk, buf, "usage: ")
+    sink.put_str(sk, buf, program_name(s))
+    if opt_count(s) > 0 { sink.put_str(sk, buf, " [options]") }
+    if cmd_count(s) > 0 { sink.put_str(sk, buf, " <command>") }
+    sink.put_str(sk, buf, " [args]")
+    sink.put_nl(sk, buf)
+
+    var w: usize = 0
+    var i: usize = 0
+    for i < opt_count(s) {
+        var n: usize = opt_long(s, i).len
+        if opt_takes_value(s, i) { n = n + 6 }        // " <val>"
+        if n > w { w = n }
+        i = i + 1
+    }
+    var ci: usize = 0
+    for ci < cmd_count(s) {
+        let n2: usize = cmd_name(s, ci).len
+        if n2 > w { w = n2 }
+        ci = ci + 1
+    }
+
+    if opt_count(s) > 0 {
+        sink.put_nl(sk, buf)
+        sink.put_str(sk, buf, "options:")
+        sink.put_nl(sk, buf)
+        var j: usize = 0
+        for j < opt_count(s) {
+            sink.put_str(sk, buf, "  ")
+            let sc: i32 = opt_short(s, j)
+            if sc != 0 {
+                sink.put(sk, buf, 45 as u8)
+                sink.put(sk, buf, sc as u8)
+                sink.put_str(sk, buf, ", ")
+            } else {
+                sink.put_str(sk, buf, "    ")
+            }
+            sink.put_str(sk, buf, "--")
+            let ln: str = opt_long(s, j)
+            sink.put_str(sk, buf, ln)
+            var used: usize = ln.len
+            if opt_takes_value(s, j) {
+                sink.put_str(sk, buf, " <val>")
+                used = used + 6
+            }
+            put_pad(sk, buf, w - used + 2)
+            sink.put_str(sk, buf, opt_help(s, j))
+            sink.put_nl(sk, buf)
+            j = j + 1
+        }
+    }
+
+    if cmd_count(s) > 0 {
+        sink.put_nl(sk, buf)
+        sink.put_str(sk, buf, "commands:")
+        sink.put_nl(sk, buf)
+        var c2: usize = 0
+        for c2 < cmd_count(s) {
+            // Eight, matching the options block: two of indent, then the four a `-x, `
+            // short form occupies, then the two of `--`. A command list indented to a
+            // different column than the option list above it reads as a different table.
+            sink.put_str(sk, buf, "        ")
+            let nm: str = cmd_name(s, c2)
+            sink.put_str(sk, buf, nm)
+            put_pad(sk, buf, w - nm.len + 2)
+            sink.put_str(sk, buf, cmd_help(s, c2))
+            sink.put_nl(sk, buf)
+            c2 = c2 + 1
+        }
+    }
+    return sink.written(sk) - before
+}
