@@ -1,0 +1,197 @@
+// examples/std/diag_demo.jtr — `std/diag`'s first real consumer: a syntax-error
+// report over a genuine Jestyr source file, rendered from the REAL parser's
+// recovery artifacts.
+//
+// This is deliberately not a demo that hand-builds a diagnostic and admires it. The
+// self-hosted driver in `cgen.jtr` already finds parse errors — it scans `p.ex` for an
+// Error expression (kind 9) and `p.it` for an Error item (kind 99), which are the ported
+// parser's recovery nodes — and it renders them as a bare
+// `path:line:col: error: syntax error (unexpected or malformed input)`. That line is all
+// a caller gets today: no source, no caret, no note. This program takes the same two
+// scans and renders them through `std/diag` instead, which is exactly the upgrade
+// `cgen.jtr`'s own comment records as a follow-up ("the reference's expected/found
+// message text is a follow-up").
+//
+// Run it:
+//     jestyrc run examples/std/diag_demo.jtr                    # a built-in broken source
+//     jestyrc run examples/std/diag_demo.jtr <some.jtr>         # any file on disk
+//
+// The second half (`showcase`) renders one hand-built diagnostic that uses every feature
+// at once — two files, a secondary label, a note, a suggestion, tabs, context lines — for
+// the same reason `writer_demo.jtr` exists: the parse-error path exercises one shape
+// well, and the renderer has to be readable in the shapes a type checker will want next.
+
+import "diag"
+import "sink"
+import "mem"
+import "env"
+import "fs"
+import "intern"
+import "tokens"
+import "parser"
+import "list"
+import "str"
+
+const CAP: usize = 8192
+
+// A source with two syntax errors in it, used when no file is named. Kept in-language
+// rather than as a fixture on disk so the demo has no setup and no path assumptions.
+fn broken_source() -> str {
+    return "fn add(a: i32, b: i32) -> i32 {\n    return a + \n}\n\nfn main() -> i32 {\n\tlet total: i32 = add(1, 2)\n\tprint_int(total as i64)\n\treturn 0\n}\n"
+}
+
+// Render `d` to stderr through a caller-owned buffer, and REFUSE to print a truncated
+// diagnostic. See `std/diag`'s header: `render` reports what it wrote, which is the
+// truth and is not the same as "all of it".
+fn report(read m: diag.SourceMap, read d: diag.Diagnostic, read th: diag.Theme) -> bool {
+    var raw: *mut u8 = alloc(u8, CAP)
+    var buf: []u8 = slice(u8, raw, CAP)
+    var s: Sink = sink.new()
+    let n: usize = diag.render(s, buf, m, d, th)
+    if sink.overflowed(s) {
+        // The one honest thing to do. A truncated diagnostic is worse than a short
+        // notice that one exists, because the truncation lands mid-caret and reads as a
+        // complete report.
+        eprint_str("diagnostic too large to render; re-run with a larger buffer")
+        return false
+    }
+    if n == 0 { return false }
+    eprint_str(sink.view(s, buf))
+    return true
+}
+
+// ---- the real consumer: every parse-recovery node in a file, as a full diagnostic ----
+
+// One line: `file:line:col: error[CODE]: message`. What the cascade gets.
+fn report_brief(read m: diag.SourceMap, read d: diag.Diagnostic) {
+    var raw: *mut u8 = alloc(u8, CAP)
+    var buf: []u8 = slice(u8, raw, CAP)
+    var s: Sink = sink.new()
+    diag.render_brief(s, buf, m, d)
+    if sink.overflowed(s) {
+        eprint_str("diagnostic too large to render")
+        return
+    }
+    eprint_str(sink.view(s, buf))
+}
+
+// The FIRST recovery node gets the full treatment; every later one gets a line.
+//
+// That is a policy, not a limitation, and it is the reason `render_brief` exists. The
+// parser's recovery cascades — one missing operand below produces five Error nodes,
+// because recovery resumes mid-expression and every following token is then read in the
+// wrong context. Rendering five full caret blocks for one mistake buries the mistake. The
+// self-hosted driver's current answer is to stop at the first and say nothing about the
+// rest; this says how many there were, which is strictly more information for the same
+// screenful.
+fn report_parse_errors(mut m: diag.SourceMap, f: diag.FileId, read src: str, read a: Allocator, read th: diag.Theme) -> i32 {
+    var it: Interner = intern.make(a)
+    let kwcount: i64 = tokens.intern_keywords(it)
+    var p: parser.Parser = parser.parse_source(src, it, kwcount, a)
+
+    var found: i32 = 0
+
+    // Error EXPRESSIONS (parser recovery kind 9).
+    var i: usize = 0
+    for i < list.len(parser.ExprData, p.ex) {
+        let e: parser.ExprData = list.get(parser.ExprData, p.ex, i)
+        if e.kind == 9 {
+            var d: diag.Diagnostic = diag.new_error(a, "E0001", "expected an expression")
+            diag.primary(d, diag.span(f, e.start, e.end), "the parser could not read this as an expression")
+            if found == 0 {
+                diag.note(d, "the parser recovered here and kept going, so the diagnostics below may be consequences of this one")
+                report(m, d, th)
+            } else {
+                report_brief(m, d)
+            }
+            found = found + 1
+        }
+        i = i + 1
+    }
+
+    // Error ITEMS (parser recovery kind 99).
+    var j: usize = 0
+    for j < list.len(parser.ItemData, p.it) {
+        let itd: parser.ItemData = list.get(parser.ItemData, p.it, j)
+        if itd.kind == 99 {
+            var d2: diag.Diagnostic = diag.new_error(a, "E0002", "expected an item")
+            diag.primary(d2, diag.span(f, itd.start, itd.end), "only `fn`, `struct`, `enum`, `const`, `trait`, `impl`, `import` and `distinct` may appear here")
+            if found == 0 {
+                report(m, d2, th)
+            } else {
+                report_brief(m, d2)
+            }
+            found = found + 1
+        }
+        j = j + 1
+    }
+    return found
+}
+
+// ---- the showcase: every rendering feature at once, over two files ----
+
+// Locate `needle` in `hay` and return the span it occupies. Spans are COMPUTED here
+// rather than written as literal offsets, because a hand-counted offset in a demo is a
+// number that silently rots the moment someone edits the string above it — and a caret
+// pointing at the wrong token is exactly the failure this module exists to prevent.
+fn span_of(f: diag.FileId, read hay: str, read needle: str) -> diag.Span {
+    let at: isize = str.index_of(hay, needle)
+    if at < 0 { return diag.span(f, 0, 0) }
+    return diag.span(f, at as usize, (at as usize) + needle.len)
+}
+
+fn showcase(read a: Allocator) {
+    var m: diag.SourceMap = diag.map_new(a)
+    let use_src: str = "import \"shapes\"\n\nfn area() -> i32 {\n\tlet p: Point = Point{ x: 1, y: 2 }\n\treturn p.z\n}\n"
+    let def_src: str = "pub struct Point {\n    pub x: i32,\n    pub y: i32,\n}\n"
+    let use_f: diag.FileId = diag.add_file(m, "area.jtr", use_src)
+    let def_f: diag.FileId = diag.add_file(m, "shapes.jtr", def_src)
+
+    var d: diag.Diagnostic = diag.new_error(a, "E0042", "no field `z` on struct `Point`")
+    // `\treturn p.z` — the offending `z` sits after ONE tab plus `return p.`. If the
+    // caret below lands under that `z`, tab expansion is working in both the source row
+    // and the caret row; if it lands three columns left, it is not. That is the whole
+    // reason this line is indented with a tab and the one above it is not.
+    let zspan: diag.Span = span_of(use_f, use_src, "p.z")
+    diag.primary(d, diag.span(use_f, zspan.start + 2, zspan.end), "unknown field")
+    diag.secondary(d, span_of(def_f, def_src, "Point"), "`Point` is declared here")
+    diag.note(d, "`Point` has fields `x` and `y`")
+    diag.suggest(d, diag.span(use_f, zspan.start + 2, zspan.end), "did you mean `y`?")
+
+    eprint_str("--- terminal theme (unicode bars, one line of context) ---")
+    report(m, d, diag.terminal())
+    eprint_str("--- plain theme (ascii, no context) ---")
+    report(m, d, diag.plain())
+    eprint_str("--- brief (one line, the shape a driver already prints) ---")
+    var raw: *mut u8 = alloc(u8, CAP)
+    var buf: []u8 = slice(u8, raw, CAP)
+    var s: Sink = sink.new()
+    diag.render_brief(s, buf, m, d)
+    eprint_str(sink.view(s, buf))
+}
+
+fn main() -> i32 {
+    var a: Allocator = mem.system_allocator()
+    let th: diag.Theme = diag.terminal()
+
+    var m: diag.SourceMap = diag.map_new(a)
+    var found: i32 = 0
+    if env.argc() > 1 {
+        let path: str = env.argv(1)
+        var src: String = fs.read_text(path)
+        let sv: str = string_view(src)
+        let f: diag.FileId = diag.add_file(m, path, sv)
+        // The map COPIED the source, so the `String` we read into can go now.
+        found = report_parse_errors(m, f, sv, a, th)
+        string_free(src)
+    } else {
+        let sv2: str = broken_source()
+        let f2: diag.FileId = diag.add_file(m, "<built-in>", sv2)
+        found = report_parse_errors(m, f2, sv2, a, th)
+    }
+
+    eprint_str("--- parse diagnostics reported ---")
+    print_int(found as i64)
+    showcase(a)
+    return 0
+}

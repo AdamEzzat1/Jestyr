@@ -1,0 +1,516 @@
+// std/diag_test.jtr — the unit suite for `std/diag`.
+//
+// A sibling file: a `@test` function is an ordinary function with an attribute and there
+// is no dead-code elimination in the C backend, so a suite colocated in `diag.jtr` would
+// be emitted into every program that renders a diagnostic.
+//
+// Run:  jestyrc test examples/std/diag_test.jtr
+
+import "diag"
+import "sink"
+import "mem"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 4096
+const BUF_CAP: usize = 4096
+
+// ------------------------------------------------------------------- source map
+
+@test fn a_map_round_trips_names_and_sources() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var m: diag.SourceMap = diag.map_new(a)
+    test.eq_usize(c, rep, "empty map", diag.file_count(m), 0)
+
+    let f0: diag.FileId = diag.add_file(m, "one.jtr", "let x = 1\n")
+    let f1: diag.FileId = diag.add_file(m, "two.jtr", "fn main() {}\n")
+
+    test.eq_usize(c, rep, "two files", diag.file_count(m), 2)
+    test.eq_str(c, rep, "name 0", diag.file_name(m, f0), "one.jtr")
+    test.eq_str(c, rep, "name 1", diag.file_name(m, f1), "two.jtr")
+    test.eq_str(c, rep, "source 0", diag.file_source(m, f0), "let x = 1\n")
+    test.eq_str(c, rep, "source 1", diag.file_source(m, f1), "fn main() {}\n")
+
+    // Concatenation is an implementation detail and must not leak: file 1's source must
+    // not begin with file 0's, which is the failure a wrong `src_start` produces and
+    // which a single-file test cannot see.
+    test.is_true(c, rep, "f0 known", diag.has_file(m, f0))
+    test.is_false(c, rep, "f2 unknown", diag.has_file(m, 2 as diag.FileId))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn the_map_copies_so_the_callers_string_may_die() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var m: diag.SourceMap = diag.map_new(a)
+    var owned: String = string_new()
+    string_push(owned, "alpha\nbeta\n")
+    let f: diag.FileId = diag.add_file(m, "owned.jtr", string_view(owned))
+    string_free(owned)
+
+    // If `add_file` had stored a view rather than a copy, this reads freed memory. The
+    // assertion is on the CONTENT, not on "it did not crash": a dangling read frequently
+    // returns the old bytes, so only a check that would notice a change proves anything.
+    test.eq_str(c, rep, "survives the free", diag.file_source(m, f), "alpha\nbeta\n")
+    test.eq_str(c, rep, "line 2", diag.line_text(m, f, 2), "beta")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ------------------------------------------------------------ line/column mapping
+
+@test fn positions_are_one_based_and_clamp_past_the_end() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var m: diag.SourceMap = diag.map_new(a)
+    //                              0123456789
+    let f: diag.FileId = diag.add_file(m, "p.jtr", "ab\ncdef\ngh")
+
+    let p0: diag.Pos = diag.pos_of(m, f, 0)
+    test.eq_usize(c, rep, "0 -> 1:1 line", p0.line, 1)
+    test.eq_usize(c, rep, "0 -> 1:1 col", p0.col, 1)
+
+    let p3: diag.Pos = diag.pos_of(m, f, 3)          // 'c', first byte of line 2
+    test.eq_usize(c, rep, "3 -> 2:1 line", p3.line, 2)
+    test.eq_usize(c, rep, "3 -> 2:1 col", p3.col, 1)
+
+    let p6: diag.Pos = diag.pos_of(m, f, 6)          // 'f', last byte of line 2
+    test.eq_usize(c, rep, "6 -> 2:4 line", p6.line, 2)
+    test.eq_usize(c, rep, "6 -> 2:4 col", p6.col, 4)
+
+    // Past the end. A diagnostic about a truncated file has a span that runs off it, and
+    // that is exactly the report a reader most needs — so this clamps rather than faults.
+    let pend: diag.Pos = diag.pos_of(m, f, 9999)
+    test.eq_usize(c, rep, "clamped line", pend.line, 3)
+    test.eq_usize(c, rep, "clamped col", pend.col, 3)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn lines_are_counted_without_their_terminators() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var m: diag.SourceMap = diag.map_new(a)
+    let trailing: diag.FileId = diag.add_file(m, "t.jtr", "a\nb\n")
+    let partial: diag.FileId = diag.add_file(m, "u.jtr", "a\nb")
+    let empty: diag.FileId = diag.add_file(m, "e.jtr", "")
+
+    // A trailing newline does NOT create a third line. Off-by-one here shows up as a
+    // renderer printing a phantom blank context line at the end of every file.
+    test.eq_usize(c, rep, "trailing newline", diag.line_count(m, trailing), 2)
+    test.eq_usize(c, rep, "no trailing newline", diag.line_count(m, partial), 2)
+    test.eq_usize(c, rep, "empty file", diag.line_count(m, empty), 1)
+
+    test.eq_str(c, rep, "line 1", diag.line_text(m, trailing, 1), "a")
+    test.eq_str(c, rep, "line 2 no terminator", diag.line_text(m, trailing, 2), "b")
+    test.eq_str(c, rep, "last partial line", diag.line_text(m, partial, 2), "b")
+    test.eq_str(c, rep, "line 0 is empty", diag.line_text(m, trailing, 0), "")
+    test.eq_str(c, rep, "line past end is empty", diag.line_text(m, trailing, 9), "")
+    test.eq_str(c, rep, "empty file line 1", diag.line_text(m, empty, 1), "")
+
+    test.eq_usize(c, rep, "line 1 starts at 0", diag.line_start(m, trailing, 1), 0)
+    test.eq_usize(c, rep, "line 2 starts at 2", diag.line_start(m, trailing, 2), 2)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// -------------------------------------------------------------- the diagnostic
+
+@test fn a_diagnostic_keeps_its_text_and_its_label_order() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var d: diag.Diagnostic = diag.new_error(a, "E0042", "no field `z`")
+    test.eq_str(c, rep, "message", diag.message(d), "no field `z`")
+    test.eq_str(c, rep, "code", diag.code(d), "E0042")
+    test.eq_usize(c, rep, "no labels yet", diag.label_count(d), 0)
+
+    let sp: diag.Span = diag.span(0 as diag.FileId, 3, 5)
+    diag.primary(d, sp, "first")
+    diag.note(d, "second")
+    diag.secondary(d, sp, "third")
+
+    // Order is the CALLER's, not a sort by position or by kind — the same rule
+    // `--json` follows, for the same reason: a consumer can sort, but cannot recover
+    // what the pass said first once we have sorted here.
+    test.eq_usize(c, rep, "three labels", diag.label_count(d), 3)
+    test.eq_str(c, rep, "label 0", diag.label_text(d, diag.label_at(d, 0)), "first")
+    test.eq_str(c, rep, "label 1", diag.label_text(d, diag.label_at(d, 1)), "second")
+    test.eq_str(c, rep, "label 2", diag.label_text(d, diag.label_at(d, 2)), "third")
+
+    // The arena holds message, code and every label end to end; each accessor must slice
+    // its own piece back out and nothing else. A single wrong offset here silently
+    // renders one label's text where another's belongs.
+    test.eq_str(c, rep, "message still intact", diag.message(d), "no field `z`")
+    test.eq_str(c, rep, "code still intact", diag.code(d), "E0042")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn an_empty_code_renders_as_no_brackets() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var braw: *mut u8 = alloc(u8, BUF_CAP)
+    var buf: []u8 = slice(u8, braw, BUF_CAP)
+    var s: sink.Sink = sink.new()
+
+    var m: diag.SourceMap = diag.map_new(a)
+    var d: diag.Diagnostic = diag.new_warning(a, "", "unused binding `x`")
+    diag.render(s, buf, m, d, diag.plain())
+
+    // `[]` would read as a code that exists and is blank. A pass that has not committed
+    // to a stable code should be indistinguishable from one that never will.
+    test.eq_str(c, rep, "no empty brackets", sink.view(s, buf), "warning: unused binding `x`\n")
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ----------------------------------------------------------------- the renderer
+
+@test fn a_full_render_matches_its_golden() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var braw: *mut u8 = alloc(u8, BUF_CAP)
+    var buf: []u8 = slice(u8, braw, BUF_CAP)
+    var s: sink.Sink = sink.new()
+
+    var m: diag.SourceMap = diag.map_new(a)
+    let f: diag.FileId = diag.add_file(m, "a.jtr", "fn main() {\n    let x = y\n}\n")
+    var d: diag.Diagnostic = diag.new_error(a, "E0007", "unknown name `y`")
+    diag.primary(d, diag.span(f, 24, 25), "not found in this scope")
+    diag.note(d, "did you mean `x`?")
+    diag.render(s, buf, m, d, diag.plain())
+
+    // Pinned in full, because every part of this layout is load-bearing: the gutter
+    // width, the space before the bar, where the caret sits, and the `= note:` prefix.
+    // `eq_golden` reports the first differing line rather than dumping both blobs.
+    test.eq_golden(c, rep, "render", sink.view(s, buf),
+        "error[E0007]: unknown name `y`\n  --> a.jtr:2:13\n   |\n 2 |     let x = y\n   |             ^ not found in this scope\n   |\n   = note: did you mean `x`?\n")
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn caret_alignment_is_byte_based_and_tabs_expand() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var braw: *mut u8 = alloc(u8, BUF_CAP)
+    var buf: []u8 = slice(u8, braw, BUF_CAP)
+    var s: sink.Sink = sink.new()
+
+    var m: diag.SourceMap = diag.map_new(a)
+    // One tab, then `ab`. The span is on `b` (byte 3, column 4).
+    let f: diag.FileId = diag.add_file(m, "t.jtr", "\tab\n")
+    var d: diag.Diagnostic = diag.new_error(a, "", "here")
+    diag.primary(d, diag.span(f, 2, 3), "")
+    diag.render(s, buf, m, d, diag.plain())
+
+    // The tab becomes `tab_width` (4) spaces in the SOURCE row, so the caret must be
+    // indented by 4 + 1 = 5 to sit under `b`. A renderer that copied the tab through and
+    // counted it as one column would put the caret three cells left of its token — the
+    // single most common bug in this kind of code.
+    test.eq_golden(c, rep, "tab-expanded caret", sink.view(s, buf),
+        "error: here\n  --> t.jtr:1:3\n   |\n 1 |     ab\n   |      ^\n")
+
+    // And the POSITION reported in the header is a byte column (3), not a display column
+    // (6). This is the pin to invert when a display-width function exists: `--json`
+    // reports byte columns too, and the two must not disagree about where a diagnostic
+    // points.
+    let p: diag.Pos = diag.pos_of(m, f, 2)
+    test.eq_usize(c, rep, "byte column, not display column", p.col, 3)
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn labels_on_one_line_share_a_source_row() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var braw: *mut u8 = alloc(u8, BUF_CAP)
+    var buf: []u8 = slice(u8, braw, BUF_CAP)
+    var s: sink.Sink = sink.new()
+
+    var m: diag.SourceMap = diag.map_new(a)
+    let f: diag.FileId = diag.add_file(m, "x.jtr", "a + b\n")
+    var d: diag.Diagnostic = diag.new_error(a, "", "mismatched types")
+    diag.primary(d, diag.span(f, 0, 1), "this is an `i32`")
+    diag.secondary(d, diag.span(f, 4, 5), "this is a `str`")
+    diag.render(s, buf, m, d, diag.plain())
+
+    // ONE `x.jtr` source row with two underlines beneath it. Printing the row twice is
+    // what the first version did and it reads as two different places in the file.
+    test.eq_golden(c, rep, "shared row", sink.view(s, buf),
+        "error: mismatched types\n  --> x.jtr:1:1\n   |\n 1 | a + b\n   | ^ this is an `i32`\n   |     - this is a `str`\n")
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn labels_are_grouped_by_file_not_by_call_order() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var braw: *mut u8 = alloc(u8, BUF_CAP)
+    var buf: []u8 = slice(u8, braw, BUF_CAP)
+    var s: sink.Sink = sink.new()
+
+    var m: diag.SourceMap = diag.map_new(a)
+    let fa: diag.FileId = diag.add_file(m, "a.jtr", "use\n")
+    let fb: diag.FileId = diag.add_file(m, "b.jtr", "def\n")
+    var d: diag.Diagnostic = diag.new_error(a, "", "conflict")
+    // a, b, a — the interleaving that made the first version print `a.jtr` twice.
+    diag.primary(d, diag.span(fa, 0, 3), "used here")
+    diag.secondary(d, diag.span(fb, 0, 3), "defined here")
+    diag.suggest(d, diag.span(fa, 0, 3), "rename it")
+    diag.render(s, buf, m, d, diag.plain())
+
+    test.eq_golden(c, rep, "grouped", sink.view(s, buf),
+        "error: conflict\n  --> a.jtr:1:1\n   |\n 1 | use\n   | ^^^ used here\n   | --- rename it\n  --> b.jtr:1:1\n   |\n 1 | def\n   | --- defined here\n")
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_span_is_clamped_to_its_first_line_and_never_to_nothing() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var braw: *mut u8 = alloc(u8, BUF_CAP)
+    var buf: []u8 = slice(u8, braw, BUF_CAP)
+    var s: sink.Sink = sink.new()
+
+    var m: diag.SourceMap = diag.map_new(a)
+    let f: diag.FileId = diag.add_file(m, "m.jtr", "ab\ncd\n")
+
+    // A span running across the newline underlines only what is on line 1 — two carets,
+    // not five. A renderer that ran the caret to the raw end offset would draw a run
+    // wider than the line it sits under.
+    var d: diag.Diagnostic = diag.new_error(a, "", "spans two lines")
+    diag.primary(d, diag.span(f, 0, 5), "")
+    diag.render(s, buf, m, d, diag.plain())
+    test.eq_golden(c, rep, "clamped", sink.view(s, buf),
+        "error: spans two lines\n  --> m.jtr:1:1\n   |\n 1 | ab\n   | ^^\n")
+
+    // A zero-width span is an insertion point ("a `;` is missing HERE") and still has to
+    // point somewhere, so it renders one caret rather than none.
+    var s2: sink.Sink = sink.new()
+    var braw2: *mut u8 = alloc(u8, BUF_CAP)
+    var buf2: []u8 = slice(u8, braw2, BUF_CAP)
+    var d2: diag.Diagnostic = diag.new_error(a, "", "insert here")
+    diag.primary(d2, diag.span(f, 2, 2), "")
+    diag.render(s2, buf2, m, d2, diag.plain())
+    test.eq_golden(c, rep, "zero width", sink.view(s2, buf2),
+        "error: insert here\n  --> m.jtr:1:3\n   |\n 1 | ab\n   |   ^\n")
+
+    free_ptr(braw2)
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_span_naming_an_unknown_file_is_skipped_not_fatal() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var braw: *mut u8 = alloc(u8, BUF_CAP)
+    var buf: []u8 = slice(u8, braw, BUF_CAP)
+    var s: sink.Sink = sink.new()
+
+    var m: diag.SourceMap = diag.map_new(a)
+    let f: diag.FileId = diag.add_file(m, "k.jtr", "ok\n")
+
+    // A pass that produced a span against a file the renderer was not given must still
+    // deliver the MESSAGE. Losing the whole report because one label is unresolvable is
+    // the worst possible failure mode for a diagnostic renderer.
+    var d: diag.Diagnostic = diag.new_error(a, "", "still says something")
+    diag.primary(d, diag.span(7 as diag.FileId, 0, 1), "points nowhere")
+    diag.render(s, buf, m, d, diag.plain())
+    test.eq_golden(c, rep, "message survives", sink.view(s, buf),
+        "error: still says something\n")
+
+    // The positive control WITHOUT which the line above proves nothing: the identical
+    // diagnostic against a file the map does have renders its snippet.
+    var s2: sink.Sink = sink.new()
+    var braw2: *mut u8 = alloc(u8, BUF_CAP)
+    var buf2: []u8 = slice(u8, braw2, BUF_CAP)
+    var d2: diag.Diagnostic = diag.new_error(a, "", "still says something")
+    diag.primary(d2, diag.span(f, 0, 1), "points nowhere")
+    diag.render(s2, buf2, m, d2, diag.plain())
+    test.eq_golden(c, rep, "positive control", sink.view(s2, buf2),
+        "error: still says something\n  --> k.jtr:1:1\n   |\n 1 | ok\n   | ^ points nowhere\n")
+
+    free_ptr(braw2)
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn the_brief_form_is_the_line_a_driver_already_prints() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var braw: *mut u8 = alloc(u8, BUF_CAP)
+    var buf: []u8 = slice(u8, braw, BUF_CAP)
+    var s: sink.Sink = sink.new()
+
+    var m: diag.SourceMap = diag.map_new(a)
+    let f: diag.FileId = diag.add_file(m, "b.jtr", "fn main() {\n    let x = y\n}\n")
+    var d: diag.Diagnostic = diag.new_error(a, "E0007", "unknown name `y`")
+    diag.secondary(d, diag.span(f, 0, 2), "not this one")
+    diag.primary(d, diag.span(f, 24, 25), "this one")
+    diag.render_brief(s, buf, m, d)
+
+    // The location comes from the PRIMARY label, not from the first spanned one — a
+    // secondary points at context and a tool jumping there would land in the wrong place.
+    test.eq_str(c, rep, "brief", sink.view(s, buf),
+        "b.jtr:2:13: error[E0007]: unknown name `y`")
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// -------------------------------------------------------- the overflow contract
+
+@test fn an_unguarded_render_into_a_small_buffer_truncates_mid_diagnostic() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // Deliberately far too small. This test performs the UNGUARDED render on purpose, so
+    // the suite shows exactly what a caller who skips `sink.overflowed` gets — the same
+    // reason `a_sink_that_overflowed_is_caught_before_it_reaches_the_file` exists.
+    var braw: *mut u8 = alloc(u8, 20)
+    var buf: []u8 = slice(u8, braw, 20)
+    var s: sink.Sink = sink.new()
+
+    var m: diag.SourceMap = diag.map_new(a)
+    let f: diag.FileId = diag.add_file(m, "o.jtr", "let x = y\n")
+    var d: diag.Diagnostic = diag.new_error(a, "E0007", "unknown name `y`")
+    diag.primary(d, diag.span(f, 8, 9), "not found in this scope")
+    let n: usize = diag.render(s, buf, m, d, diag.plain())
+
+    // Every number here is TRUE and the output is still ruined. `render` reports what it
+    // wrote; it wrote 20 bytes; those 20 bytes are a header cut in half. Nothing in the
+    // return value distinguishes this from a complete render — only `overflowed` does.
+    test.eq_usize(c, rep, "reported what it wrote", n, 20)
+    test.eq_str(c, rep, "and it is a fragment", sink.view(s, buf), "error[E0007]: unknow")
+    test.is_true(c, rep, "THE signal", sink.overflowed(s))
+    test.is_true(c, rep, "and it says how much was lost", sink.lost(s) > 0)
+
+    // The positive control: the same render into a buffer that fits does not overflow,
+    // so the assertion above is about size and not about the diagnostic being unrenderable.
+    var big: *mut u8 = alloc(u8, BUF_CAP)
+    var bbuf: []u8 = slice(u8, big, BUF_CAP)
+    var s2: sink.Sink = sink.new()
+    diag.render(s2, bbuf, m, d, diag.plain())
+    test.is_false(c, rep, "positive control", sink.overflowed(s2))
+
+    free_ptr(big)
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ------------------------------------------------------------------- the theme
+
+@test fn the_theme_is_policy_and_changes_only_what_it_claims() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var m: diag.SourceMap = diag.map_new(a)
+    let f: diag.FileId = diag.add_file(m, "th.jtr", "one\ntwo\nthree\n")
+    var d: diag.Diagnostic = diag.new_error(a, "", "mid")
+    diag.primary(d, diag.span(f, 4, 7), "")
+
+    // No gutter: no line NUMBERS at all, and the whole block narrows by their width. An
+    // earlier implementation zeroed the width and kept printing the number, giving
+    // `2 | two` — a gutter with no column instead of no gutter. This golden is what
+    // caught it.
+    var b1: *mut u8 = alloc(u8, BUF_CAP)
+    var buf1: []u8 = slice(u8, b1, BUF_CAP)
+    var s1: sink.Sink = sink.new()
+    let bare: diag.Theme = diag.theme(false, 4, false, 0, 0)
+    diag.render(s1, buf1, m, d, bare)
+    test.eq_golden(c, rep, "no gutter", sink.view(s1, buf1),
+        "error: mid\n --> th.jtr:2:1\n  |\n  | two\n  | ^^^\n")
+
+    // Context lines: one either side of the labelled line, and no phantom line 4.
+    var b2: *mut u8 = alloc(u8, BUF_CAP)
+    var buf2: []u8 = slice(u8, b2, BUF_CAP)
+    var s2: sink.Sink = sink.new()
+    let ctx: diag.Theme = diag.theme(true, 4, false, 1, 1)
+    diag.render(s2, buf2, m, d, ctx)
+    test.eq_golden(c, rep, "context", sink.view(s2, buf2),
+        "error: mid\n  --> th.jtr:2:1\n   |\n 1 | one\n 2 | two\n   | ^^^\n 3 | three\n")
+
+    free_ptr(b2)
+    free_ptr(b1)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
