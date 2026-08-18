@@ -424,7 +424,59 @@ all**. That is a much smaller and more honest route than adding a file handle to
 intrinsic list, and it puts the resource-with-a-lifetime question where it belongs: in
 the library, as a `Drop` impl over a handle.
 
-### §1.4 — Typed `Path` (Tier 2 area 2, the blocked half)
+### §1.4 — ~~Typed `Path` blocked~~ — `distinct` NOW INHERITS ITS BASE'S OPERATIONS
+
+**Landed** (`37822bf` corpus, `ed99c8a` typeck, `b0c8ec0` cgen). The rule in one sentence:
+a `distinct D = Base` inherits an operation at **its own type** — the base's signature with
+every `Base` replaced by `D` — and only when both operand positions are `D` itself. So
+`Id + Id` is an `Id` and `p[a..b]` on a `distinct P = str` is a `P`, while `Id + i64`,
+`Id + Acct` and `i64 + Id` are refused.
+
+**This is a net soundness GAIN, and that is measured, not asserted.** The first thing built
+was the anti-regression corpus that the *previous, reverted* attempt lacked: 111
+single-construct programs under `examples/distinct_corpus/` with `record.sh` and a pinned
+HEAD verdict for each. Replaying it after the change:
+
+| transition | count | what it is |
+|---|---:|---|
+| `RUN_OK` → `TYPECK_REJECT` | **18** | holes CLOSED |
+| `GCC_REJECT`/`CGEN_REJECT` → `RUN_OK` | 10 | the feature — member access that used to reach gcc |
+| `TYPECK_REJECT` → `RUN_OK` | 5 | the feature — a distinct operating with *itself* |
+| any other rejection → `RUN_OK` | **0** | no regression |
+
+**Measuring HEAD turned up more than the corpus was built to protect.** HEAD's enforcement
+was two narrow rules and both leaked: the operator-trait refusal was *left-operand-only and
+per-operator*, so `(1 + a) + b` mixed two id spaces and printed `4`, and `%`/`&`/`<<` had no
+operator trait at all; and `distinct_mismatch` ran at exactly three positions, so plain
+assignment, struct-literal fields, field writes, array elements and `if`-branch mixing were
+all unchecked. Those are 18 of the closed holes. **My own earlier note that "HEAD rejects
+all eight laundering shapes" was too generous to HEAD.**
+
+**Why the previous regression cannot recur — structurally, not by vigilance.** That attempt
+exempted an "untyped literal" via `literal_defaulted`, whose `Binary` arm is a *recursive
+disjunction*, so one literal anywhere in a subtree exempted the whole operand.
+`binary_distinct_rule` reads two `Ty` values and never touches an `ExprId`: `1` types as
+`i32`, `(b + 1)` types as `Error`, neither is a distinct, so both are refused by the same
+clause that refuses `a + b`. There is no literal predicate to get wrong.
+
+**The cast count, measured independently of the agent that wrote the feature:**
+
+* **Inside `std/path`: 21 → 0.** `base`/`dir`/`ext`/`stem` slice their argument and return
+  the slice, and a slice of a `Path` is a `Path`. The implementation is cast-free. *That was
+  the whole reason typed `Path` was priced at 132 and shelved, so typed `Path` is now
+  buildable.*
+* **At the boundary: 121 remain**, 84 of them in the two test files, where every call site
+  passes a string literal inline (`path.base("a/b/")`). **A string literal does not adopt a
+  distinct-over-`str` the way `5` adopts `i64` through literal defaulting.** That asymmetry
+  is the next question and it is a language decision, not a lowering one — recorded here
+  rather than fixed.
+
+A first measurement of mine said 133 and looked like no improvement; it was a *half*
+conversion (public signatures only, internal helpers left as `str`). Converting the
+internals is the point of the feature, and doing so takes them to zero. **Measure the
+conversion you would actually ship.**
+
+### §1.4 (original text) — why it was blocked
 
 **Do not build this on `distinct` yet.** Probed: `distinct Path = str` compiles, and then
 passing a bare `str` where a `Path` is wanted is **accepted** — as is passing an `AccountId`
