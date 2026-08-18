@@ -1,4 +1,4 @@
-# Std v3 — structured diagnostics, and the two error-model rules it forced
+# Std v3 — structured diagnostics, the error-model rules it forced, and `@cfg`
 
 Cold-start note. **What was built and what it measured (§1), what the build turned up in
 the compiler (§2), what is still open (§3), traps (§4), suggested order (§5).**
@@ -9,8 +9,8 @@ Branch `claude/std-v3-systems-language-6d8931`. Baseline before anything changed
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1228 passed, 0 failed, 3 ignored.** After this work: **1242 passed, 0 failed, 3 ignored**
-(+1 module-boundary driver test, +6 must-use, +7 fallible-return; `io_suites_pass` grew a
+**1228 passed, 0 failed, 3 ignored.** After this work: **1252 passed, 0 failed, 3 ignored**
+(+1 module-boundary driver test, +6 must-use, +7 fallible-return, +10 `@cfg`; `io_suites_pass` grew a
 `diag_test` entry rather than a new test).
 
 ---
@@ -207,6 +207,52 @@ constructor or it is effectively read-only outside its module — `diag.theme(�
 exactly this reason. Worth knowing before designing any library type in this tree; found by
 writing the test that varies the theme, not by reading the grammar.
 
+### §3.0 — `@cfg(<platform>)` — BUILT, reference-side. The port mirror is owed
+
+The `sys` blocker recorded as "Jestyr has NO conditional-compilation mechanism at any
+level" is closed on the reference toolchain. `examples/cfg_platform.jtr` binds the actual
+divergent family — POSIX `opendir`/`readdir`/`closedir` against Windows
+`FindFirstFileA`/`FindClose` — and runs.
+
+**The design was forced, not chosen.** `attest` hashes the emitted C and "same source →
+byte-identical C" is the invariant that hash commits to. A `cfg` that dropped items before
+codegen would make emission a function of the HOST, so the same source would attest
+differently on Linux and Windows and the cross-OS canary would go with it. So **`@cfg`
+selects at the C preprocessor, not in codegen**: every guarded item is emitted, wrapped in
+`#if defined(_WIN32)` / `#if !defined(_WIN32)`, and `cc` keeps the half that applies.
+
+Two consequences, both improvements on a dropping `cfg`:
+
+* **Both platforms are always checked** — a type error or an escape violation in the
+  inactive branch is caught on either host. Pinned by `the_inactive_branch_is_still_checked`.
+  (The first probe for this used an unknown bare NAME and passed, proving nothing —
+  unknown bare names are not an error for any function here. Fix the probe, not the claim.)
+* **Two items may share a name when their platforms are disjoint.** Same-platform
+  duplicates and unguarded-vs-guarded still collide, each with its own control test.
+
+Five emission sites carry the guard: the `#include` for a header-declared extern (which
+**must** be guarded — `<dirent.h>` does not exist on Windows, so an unguarded include fails
+before the guarded prototype is reached), `extern "c"` prototypes, non-generic fn
+prototypes and definitions, and monomorphized instances. A header named by mixed platforms
+falls back to unconditional.
+
+`ExternFn` gained an `attrs` field: extern attributes were parsed, validated against
+`Target::Extern`, and then **discarded**, which was invisible while no attribute meant
+anything on an extern.
+
+**What is owed, and why it could land anyway.** The port does not understand `@cfg`, so
+`cgen.jtr` needs the mirror and the seed needs refreshing. It lands green regardless
+because **no corpus file uses `@cfg`**, so no existing emitted byte changes and
+`jestyr_cgen_matches_reference` is untouched — verified. `cfg_platform.jtr` is deliberately
+NOT in `CGEN_GOLDEN_ALLOWLIST`, and `cfg_is_not_yet_in_the_byte_identity_allowlist` fails
+the moment someone adds it without the mirror. **`sys` is therefore unblocked for `jestyrc`
+and not yet for `jc`** — build the mirror before writing `sys` itself, or `sys` will be the
+first module the self-hosted compiler cannot build.
+
+The vocabulary is `posix` and `windows`, closed on purpose, with `cfg_guard` total over it
+and an anti-vacuity test tying the two together. `linux`/`macos` stay out until something
+needs to tell them apart.
+
 ### §3.3 — Not attempted, and why
 
 | item | why not now |
@@ -249,14 +295,15 @@ writing the test that varies the theme, not by reading the grammar.
 
 ## §5. Suggested order from here
 
-1. **`string_view(x).len`** (§3.1) — smallest fix with a fixture already written, and it
+1. **The `@cfg` port mirror** (§3.0) — `cgen.jtr` + reseed. Do it BEFORE writing `sys`, or `sys` is the first module `jc` cannot build.
+2. **`string_view(x).len`** (§3.1) — smallest fix with a fixture already written, and it
    retires a workaround in three places.
-2. **Wire `std/diag` into `cgen.jtr`'s driver** (§1) — the consumer that makes the module
+3. **Wire `std/diag` into `cgen.jtr`'s driver** (§1) — the consumer that makes the module
    load-bearing rather than available. Reseed + golden run; budget it as its own increment.
-3. **Must-use for handles** (brief §2.1) — the un-`finish`ed `Writer` half. This is the
+4. **Must-use for handles** (brief §2.1) — the un-`finish`ed `Writer` half. This is the
    move-only/linear work, and `file.Writer` is the canary with the argument already written
    down in its header.
-4. **CLI app kit** (brief §1.2), then the formatter (brief §5 item 4), which is what stresses
+5. **CLI app kit** (brief §1.2), then the formatter (brief §5 item 4), which is what stresses
    parser spans against `std/diag` before LSP complexity.
 
 Leave the JSON renderer alone until a codec exists; a second hand-written escaper is the
