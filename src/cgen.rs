@@ -1039,17 +1039,39 @@ impl<'a> Cgen<'a> {
         // keyed on the prelude's current contents would silently break the day that list
         // changes. First-appearance order, deduplicated, so the output stays
         // deterministic.
-        let mut seen: HashSet<&str> = HashSet::new();
+        //
+        // A header inherits the `@cfg` of the declarations that name it — and only when
+        // they ALL agree. `<dirent.h>` does not exist on Windows, so an unguarded
+        // `#include` of it would fail before the guarded `opendir` prototype was even
+        // reached; the include is the first thing that has to be conditional. Mixed
+        // cfgs (or any unguarded declaration) fall back to an unconditional include,
+        // because a header one platform needs unconditionally cannot be guarded away.
+        let mut seen: HashMap<&str, Option<Option<String>>> = HashMap::new();
         let mut hdrs: Vec<&str> = Vec::new();
         for item in &self.ast.items {
             if let Item::Extern(e) = item {
-                if e.abi.ends_with(".h") && seen.insert(e.abi.as_str()) {
-                    hdrs.push(e.abi.as_str());
+                if !e.abi.ends_with(".h") {
+                    continue;
+                }
+                let cfg = crate::attrs::cfg_of(self.ast, &e.attrs);
+                match seen.get_mut(e.abi.as_str()) {
+                    None => {
+                        seen.insert(e.abi.as_str(), Some(cfg));
+                        hdrs.push(e.abi.as_str());
+                    }
+                    // Already seen with a different platform → unconditional.
+                    Some(slot) => {
+                        if slot.as_ref() != Some(&cfg) {
+                            *slot = None;
+                        }
+                    }
                 }
             }
         }
         for h in hdrs {
+            let g = self.cfg_open(seen.get(h).cloned().flatten().flatten());
             self.raw(format!("#include <{h}>\n"));
+            self.cfg_close(g);
         }
         self.raw("\n");
         if self.error_traces {
@@ -2429,6 +2451,25 @@ impl<'a> Cgen<'a> {
             && matches!(item, Item::Fn(f) if f.has_attr("test") || f.has_attr("bench"))
     }
 
+    /// Open the C preprocessor guard for a `@cfg` item, if it has one; the bool says
+    /// whether [`Self::cfg_close`] must emit the `#endif`.
+    ///
+    /// **The item is always emitted.** `@cfg` selects at the C preprocessor, not in
+    /// codegen, so the emitted C is the same on every host and `attest`'s "same source →
+    /// byte-identical C" survives a platform-conditional program. See `attrs::cfg_guard`.
+    fn cfg_open(&mut self, word: Option<String>) -> bool {
+        let Some(w) = word else { return false };
+        let Some(g) = crate::attrs::cfg_guard(&w) else { return false };
+        self.raw(format!("#if {g}\n"));
+        true
+    }
+
+    fn cfg_close(&mut self, open: bool) {
+        if open {
+            self.raw("#endif\n");
+        }
+    }
+
     fn fn_protos(&mut self) {
         let ast = self.ast;
         // non-generic functions
@@ -2442,9 +2483,12 @@ impl<'a> Cgen<'a> {
                     continue;
                 }
                 self.subst.clear();
+                let cfg = crate::attrs::cfg_of(ast, &f.attrs);
                 let cname = self.c_fn_name(&self.fn_canon(f));
                 let sig = self.fn_signature(f, &cname);
+                let g = self.cfg_open(cfg);
                 self.raw(format!("{sig};\n"));
+                self.cfg_close(g);
             }
         }
         // monomorphized instances
@@ -2452,8 +2496,11 @@ impl<'a> Cgen<'a> {
             self.set_cur_mod_of_fn(&name);
             if let Some(f) = self.find_fn(&name) {
                 self.subst = self.make_subst(f, &args);
+                let cfg = crate::attrs::cfg_of(ast, &f.attrs);
                 let sig = self.fn_signature(f, &format!("jestyr_{}", self.mangle(&name, &args)));
+                let g = self.cfg_open(cfg);
                 self.raw(format!("{sig};\n"));
+                self.cfg_close(g);
                 self.subst.clear();
             }
         }
@@ -2494,12 +2541,15 @@ impl<'a> Cgen<'a> {
                     continue;
                 }
                 any = true;
+                let cfg = crate::attrs::cfg_of(ast, &e.attrs);
                 let ret = match e.ret_ty {
                     Some(t) => self.c_ty_ast(t),
                     None => "void".to_string(),
                 };
                 let params = self.extern_params_str(e);
+                let g = self.cfg_open(cfg);
                 self.raw(format!("{ret} {}({});\n", e.name.name, params));
+                self.cfg_close(g);
             }
         }
         if any {
@@ -2623,8 +2673,11 @@ impl<'a> Cgen<'a> {
                     continue;
                 }
                 self.subst.clear();
+                let cfg = crate::attrs::cfg_of(ast, &f.attrs);
                 let cname = self.c_fn_name(&self.fn_canon(f));
+                let g = self.cfg_open(cfg);
                 self.emit_fn(f, &cname);
+                self.cfg_close(g);
             }
         }
         // monomorphized instances
@@ -2632,7 +2685,10 @@ impl<'a> Cgen<'a> {
             self.set_cur_mod_of_fn(&name);
             if let Some(f) = self.find_fn(&name) {
                 self.subst = self.make_subst(f, &args);
+                let cfg = crate::attrs::cfg_of(ast, &f.attrs);
+                let g = self.cfg_open(cfg);
                 self.emit_fn(f, &format!("jestyr_{}", self.mangle(&name, &args)));
+                self.cfg_close(g);
                 self.subst.clear();
             }
         }

@@ -349,6 +349,18 @@ impl<'a> TypeChecker<'a> {
     fn build_table(&mut self) {
         let ast = self.ast;
 
+        // The `@cfg` platform each registered function name was declared under, so a
+        // second declaration of the same name can be judged. Two items may share a name
+        // when their platforms are DISJOINT — that is the entire point of `@cfg`:
+        // `@cfg(posix) fn dir_open` and `@cfg(windows) fn dir_open` are one API with two
+        // implementations, and only one of them survives the C preprocessor.
+        //
+        // Everything else stays a duplicate-definition error. In particular two items on
+        // the SAME platform still collide, and an unguarded item collides with anything,
+        // because it is live everywhere — which is what keeps this a narrow relaxation
+        // rather than a hole in redefinition checking.
+        let mut fn_cfg: HashMap<String, Option<String>> = HashMap::new();
+
         // Phase 1: register the names of all user types so they can be referred
         // to in any order. `cur_mod` is tracked so a re-registration can tell a
         // same-module redefinition from a cross-module type-name collision.
@@ -524,9 +536,16 @@ impl<'a> TypeChecker<'a> {
                     // Key on the canonical name so two modules may each define
                     // `make`; a clash here is a *same-module* redefinition.
                     let key = self.canon_in(item_m, &f.name.name);
-                    if self.table.fns.contains_key(&key) {
+                    let cfg = crate::attrs::cfg_of(ast, &f.attrs);
+                    if self.table.fns.contains_key(&key)
+                        && !crate::attrs::cfgs_are_disjoint(
+                            fn_cfg.get(&key).unwrap_or(&None),
+                            &cfg,
+                        )
+                    {
                         self.error(f.name.span, format!("duplicate definition of `{}`", f.name.name));
                     }
+                    fn_cfg.insert(key.clone(), cfg);
                     self.table.fns.insert(
                         key,
                         FnSig { params, ret, ret_conv: f.ret_conv, errs: errs_of(&f.errors) },
@@ -546,9 +565,16 @@ impl<'a> TypeChecker<'a> {
                         })
                         .collect();
                     let ret = e.ret_ty.map(|t| self.lower_type(&empty, t)).unwrap_or(Ty::Unit);
-                    if self.table.fns.contains_key(&e.name.name) {
+                    let cfg = crate::attrs::cfg_of(ast, &e.attrs);
+                    if self.table.fns.contains_key(&e.name.name)
+                        && !crate::attrs::cfgs_are_disjoint(
+                            fn_cfg.get(&e.name.name).unwrap_or(&None),
+                            &cfg,
+                        )
+                    {
                         self.error(e.name.span, format!("duplicate definition of `{}`", e.name.name));
                     }
+                    fn_cfg.insert(e.name.name.clone(), cfg);
                     self.table.fns.insert(
                         e.name.name.clone(),
                         FnSig { params, ret, ret_conv: e.ret_conv, errs: None },

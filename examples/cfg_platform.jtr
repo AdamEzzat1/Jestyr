@@ -1,0 +1,117 @@
+// examples/cfg_platform.jtr — `@cfg(<platform>)`, the language's only conditional
+// compilation, and the thing that unblocks a `sys` tier.
+//
+// ─── The design, and why it is not the obvious one ────────────────────────────
+//
+// The obvious `@cfg` drops the inactive items before codegen. That would be wrong here,
+// and the reason is an invariant this compiler already sells: `jestyrc attest` hashes the
+// **emitted C**, and "same source → byte-identical C" is what the hash commits to. Items
+// dropped by host would make emission a function of the machine, so the same source would
+// attest to a different hash on Linux and on Windows, and the reproducible-build story
+// would be over — along with the cross-OS determinism canary that backs it.
+//
+// So `@cfg` selects at the **C preprocessor**, not in codegen. Every guarded item is
+// emitted, wrapped in `#if defined(_WIN32)` or `#if !defined(_WIN32)`, and `cc` keeps the
+// half that applies. The emitted C is identical on every host; only which half survives
+// preprocessing differs.
+//
+// Two consequences fall out, and both are improvements over a dropping `cfg`:
+//
+//   1. **Both platforms are always type-checked.** The Windows branch below is resolved,
+//      typed, escape-checked and error-set-checked on Linux, and the POSIX branch on
+//      Windows. Under a dropping `cfg` the inactive branch rots silently until someone
+//      builds on the other OS; here it cannot.
+//   2. **Two items may share a name when their platforms are disjoint.** That is the
+//      point — `open_dir` below is one API with two implementations. Two items on the
+//      SAME platform are still a duplicate definition, and an unguarded item still
+//      collides with everything, because it is live everywhere.
+//
+// ─── What this file proves ────────────────────────────────────────────────────
+//
+// It binds the actual divergent syscall family — POSIX `opendir`/`readdir`/`closedir`
+// against the Windows `FindFirstFileA`/`FindNextFileA`/`FindClose` — which is the exact
+// case the roadmap recorded as blocking `sys`, and the reason "OS calls go in `sys`" was
+// never the right rule: the two APIs disagree about *what a directory entry is*.
+//
+// `#include <dirent.h>` inherits its declarations' guard, which is not a nicety: that
+// header does not exist on Windows, so an unguarded include would fail before the guarded
+// prototype was even reached. The include is the first thing that has to be conditional.
+//
+// Run:  jestyrc run examples/cfg_platform.jtr
+//   →   the platform name, then whether a directory handle opened.
+
+// ---- POSIX ----------------------------------------------------------------
+// `DIR*` and `struct dirent*` are opaque handles here; `cptr` is C's `void*`, and the
+// implicit conversions at the call boundary are C's own.
+
+@cfg(posix) extern "dirent.h" fn opendir(path: cstr) -> cptr
+@cfg(posix) extern "dirent.h" fn readdir(d: cptr) -> cptr
+@cfg(posix) extern "dirent.h" fn closedir(d: cptr) -> i32
+
+// ---- Windows --------------------------------------------------------------
+// `FindFirstFileA` wants a search pattern and a `WIN32_FIND_DATAA` out-parameter, which
+// is a 320-byte struct this file has no reason to model: the caller passes a buffer and
+// the handle is what matters. That asymmetry with the POSIX side is the abstraction cost
+// `sys` exists to absorb, and it is why a portable `Dir` type is a design job rather than
+// a binding job.
+
+@cfg(windows) extern "windows.h" fn FindFirstFileA(pattern: cstr, data: cptr) -> cptr
+@cfg(windows) extern "windows.h" fn FindClose(h: cptr) -> i32
+
+// ---- one API, two implementations -----------------------------------------
+//
+// Both are named `open_dir`. Their platforms are disjoint, so this is not a duplicate
+// definition — and exactly one of them reaches the C compiler.
+
+@cfg(posix) fn open_dir(p: cstr, scratch: *mut u8) -> cptr {
+    return opendir(p)
+}
+
+@cfg(windows) fn open_dir(p: cstr, scratch: *mut u8) -> cptr {
+    return FindFirstFileA(p, scratch as cptr)
+}
+
+@cfg(posix) fn close_dir(h: cptr) -> i32 {
+    return closedir(h)
+}
+
+@cfg(windows) fn close_dir(h: cptr) -> i32 {
+    return FindClose(h)
+}
+
+@cfg(posix) fn platform_name() -> str {
+    return "posix"
+}
+
+@cfg(windows) fn platform_name() -> str {
+    return "windows"
+}
+
+// The search pattern differs too: POSIX opens the directory itself, Windows needs a
+// glob. Same name, disjoint platforms, one call site below.
+@cfg(posix) fn here_pattern() -> cstr {
+    return ".".cstr
+}
+
+@cfg(windows) fn here_pattern() -> cstr {
+    return ".\\*".cstr
+}
+
+fn main() -> i32 {
+    print_str(platform_name())
+
+    // 320 bytes covers WIN32_FIND_DATAA; POSIX ignores it entirely.
+    var scratch: *mut u8 = alloc(u8, 512)
+    let h: cptr = open_dir(here_pattern(), scratch)
+
+    // A `cptr` is opaque: it cannot be dereferenced and cannot have arithmetic done to
+    // it, so the only question askable of it is whether it is null — which is exactly
+    // the question here.
+    let opened: bool = h != null
+    print_bool(opened)
+    if opened {
+        print_int(close_dir(h) as i64)
+    }
+    free_ptr(scratch)
+    return 0
+}

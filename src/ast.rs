@@ -566,6 +566,12 @@ impl ConstDecl {
 pub struct ExternFn {
     pub is_pub: bool,
     pub abi: String,
+    /// Leading `@name` directives. Previously parsed, validated against
+    /// `Target::Extern`, and then **discarded** — which was invisible while no
+    /// attribute meant anything on an extern. `@cfg(<platform>)` is the first that
+    /// does, and it is the primary case: the declaration that has to be guarded is
+    /// `opendir` versus `FindFirstFileA`, not the function that calls them.
+    pub attrs: Vec<Attribute>,
     pub name: Ident,
     pub params: Vec<Param>,
     pub ret_conv: Conv,

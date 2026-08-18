@@ -312,6 +312,203 @@ mod fallible_return {
     }
 }
 
+/// **`@cfg(<platform>)` — conditional compilation that does not fork the emitted C.**
+///
+/// The design is forced by an invariant the compiler already sells: `attest` hashes the
+/// emitted C and "same source → byte-identical C" is what the hash commits to. A `cfg`
+/// that dropped items before codegen would make emission a function of the HOST, so the
+/// same source would attest differently on Linux and Windows. So guarded items are all
+/// emitted, wrapped in `#if defined(_WIN32)` / `#if !defined(_WIN32)`, and the C
+/// preprocessor selects.
+///
+/// [`cfg_emission_is_host_independent`] is the load-bearing test: everything else here
+/// is about the vocabulary and the name rules.
+#[cfg(test)]
+mod cfg_platform {
+    use super::*;
+
+    fn emit(src: &str) -> String {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
+        let (info, _td) = typeck::check(&ast);
+        let (c, _cd) = crate::cgen::emit(&ast, &info);
+        c
+    }
+
+    /// Every stage's messages. `@cfg`'s vocabulary is validated in the PARSER (attributes
+    /// are checked at the item keyword), the name rules in typeck, and the `unsafe` rule
+    /// in the escape checker — so a helper that read only one stage would silently pass
+    /// the tests aimed at the other two.
+    fn compile_diags(src: &str) -> Vec<String> {
+        let (tokens, ld) = Lexer::new(src).tokenize();
+        let (ast, pd) = Parser::new(src, tokens).parse();
+        let (info, td) = typeck::check(&ast);
+        let ed = escape::check(&ast, &info);
+        ld.iter()
+            .chain(pd.iter())
+            .chain(td.iter())
+            .chain(ed.iter())
+            .map(|d| d.message.clone())
+            .collect()
+    }
+
+    const TWO: &str = "@cfg(posix) fn name() -> i32 { return 1 }\n\
+                       @cfg(windows) fn name() -> i32 { return 2 }\n\
+                       fn main() -> i32 { return name() }\n";
+
+    /// **The one that matters.** Both bodies reach the C, each behind its own guard, so
+    /// the output does not depend on which machine ran the compiler. If this ever fails
+    /// because someone made `cfg` drop items, `attest`'s hash silently becomes
+    /// host-dependent and the cross-OS canary is the next thing to go.
+    #[test]
+    fn cfg_emission_is_host_independent() {
+        let c = emit(TWO);
+        assert!(c.contains("#if defined(_WIN32)"), "no Windows guard emitted:\n{c}");
+        assert!(c.contains("#if !defined(_WIN32)"), "no POSIX guard emitted:\n{c}");
+        // Both bodies, not just both prototypes: `return 1;` and `return 2;`.
+        assert!(c.contains("return 1;"), "the POSIX body was dropped:\n{c}");
+        assert!(c.contains("return 2;"), "the Windows body was dropped:\n{c}");
+        // Guards balance. An unclosed `#if` makes every later item conditional on it,
+        // which compiles on one platform and silently deletes half the program on the other.
+        let opens = c.matches("#if ").count();
+        let closes = c.matches("#endif").count();
+        assert_eq!(opens, closes, "unbalanced preprocessor guards: {opens} #if vs {closes} #endif");
+    }
+
+    /// A header inherits its declarations' guard. `<dirent.h>` does not exist on Windows,
+    /// so an unguarded include fails before the guarded prototype is even reached — the
+    /// include is the FIRST thing that has to be conditional, not an afterthought.
+    #[test]
+    fn a_header_include_inherits_its_declarations_guard() {
+        let c = emit("@cfg(posix) extern \"dirent.h\" fn opendir(p: cstr) -> cptr\n\
+                      fn main() -> i32 { return 0 }\n");
+        let at = c.find("#include <dirent.h>").expect("the include is missing entirely");
+        let before = &c[..at];
+        assert!(
+            before.trim_end().ends_with("#if !defined(_WIN32)"),
+            "the dirent.h include is not guarded:\n{}",
+            &c[..at + 40.min(c.len() - at)]
+        );
+    }
+
+    /// Mixed platforms on one header fall back to an unconditional include: a header one
+    /// platform needs unconditionally cannot be guarded away.
+    #[test]
+    fn a_header_named_by_mixed_platforms_is_unconditional() {
+        let c = emit("@cfg(posix) extern \"stdio.h\" fn a1(p: cstr) -> cptr\n\
+                      extern \"stdio.h\" fn a2(p: cstr) -> cptr\n\
+                      fn main() -> i32 { return 0 }\n");
+        let at = c.find("#include <stdio.h>").expect("the include is missing");
+        assert!(
+            !c[..at].trim_end().ends_with("#if !defined(_WIN32)"),
+            "a mixed-platform header must not be guarded"
+        );
+    }
+
+    /// The vocabulary is closed, and an unknown platform is an ERROR rather than an item
+    /// left unguarded on every target — the vacuity hazard a closed list always carries.
+    #[test]
+    fn an_unknown_platform_is_refused() {
+        let ds = compile_diags("@cfg(freebsd) fn a() -> i32 { return 1 }\nfn main() -> i32 { return 0 }\n");
+        assert!(
+            ds.iter().any(|d| d.contains("unknown platform `freebsd`")),
+            "an unknown platform must be refused; got {ds:?}"
+        );
+    }
+
+    /// Anti-vacuity for the closed list: every accepted word must HAVE a guard, and
+    /// nothing else may. A name added to `CFG_WORDS` without a `cfg_guard` arm would
+    /// silently emit the item unguarded, which is the failure this pins.
+    #[test]
+    fn cfg_vocabulary_is_closed_and_total() {
+        for w in crate::attrs::CFG_WORDS {
+            assert!(crate::attrs::cfg_guard(w).is_some(), "`{w}` is accepted but has no guard");
+        }
+        for w in ["freebsd", "linux", "macos", "", "POSIX", "windows "] {
+            assert!(
+                crate::attrs::cfg_guard(w).is_none() || crate::attrs::CFG_WORDS.contains(&w),
+                "`{w}` has a guard but is not in the vocabulary"
+            );
+        }
+    }
+
+    /// Disjoint platforms may share a name — the entire point. One API, two
+    /// implementations, and only one survives the preprocessor.
+    #[test]
+    fn disjoint_platforms_may_share_a_name() {
+        let ds = compile_diags(TWO);
+        assert!(
+            !ds.iter().any(|d| d.contains("duplicate definition")),
+            "disjoint platforms must be allowed to share a name; got {ds:?}"
+        );
+    }
+
+    /// Control 1: the SAME platform twice is still a duplicate. Without this the
+    /// relaxation would be a hole in redefinition checking rather than a narrow rule.
+    #[test]
+    fn the_same_platform_twice_still_collides() {
+        let ds = compile_diags("@cfg(posix) fn d() -> i32 { return 1 }\n\
+                                @cfg(posix) fn d() -> i32 { return 2 }\n\
+                                fn main() -> i32 { return 0 }\n");
+        assert!(
+            ds.iter().any(|d| d.contains("duplicate definition")),
+            "same-platform duplicates must still be refused; got {ds:?}"
+        );
+    }
+
+    /// Control 2: an unguarded item is live everywhere, so it collides with a guarded one.
+    #[test]
+    fn an_unguarded_item_collides_with_a_guarded_one() {
+        let ds = compile_diags("fn d() -> i32 { return 1 }\n\
+                                @cfg(posix) fn d() -> i32 { return 2 }\n\
+                                fn main() -> i32 { return 0 }\n");
+        assert!(
+            ds.iter().any(|d| d.contains("duplicate definition")),
+            "an unguarded item is live on every platform; got {ds:?}"
+        );
+    }
+
+    /// **Both platforms are always checked**, which is strictly better than a dropping
+    /// `cfg` where the inactive branch rots until someone builds on the other OS.
+    ///
+    /// The first probe for this used an unknown bare NAME and passed — because unknown
+    /// bare names are not an error for any function here, guarded or not. That proved
+    /// nothing about `cfg`. These two use a real type error and a real escape violation,
+    /// and both fire wherever this test runs: on Windows the `posix` arm is inactive, on
+    /// Linux the `windows` arm is, and each assertion names a branch of each kind.
+    #[test]
+    fn the_inactive_branch_is_still_checked() {
+        let td = compile_diags("@cfg(windows) fn f() -> i32 { return 1 }\n\
+                                @cfg(posix) fn f() -> i32 { return \"not an int\" }\n\
+                                fn main() -> i32 { return f() }\n");
+        assert!(
+            td.iter().any(|d| d.contains("expected `i32`, found `str`")),
+            "a type error in the posix branch must be caught on any host; got {td:?}"
+        );
+        let ed = compile_diags("@cfg(posix) fn g() -> i32 { return 1 }\n\
+                                @cfg(windows) fn g() -> i32 { let p: *mut u8 = alloc(u8, 4)  return p.* as i32 }\n\
+                                fn main() -> i32 { return g() }\n");
+        assert!(
+            ed.iter().any(|d| d.contains("`unsafe`")),
+            "an escape violation in the windows branch must be caught on any host; got {ed:?}"
+        );
+    }
+
+    /// The corpus has no `@cfg`, so this feature changes no existing emitted byte — which
+    /// is what lets it land with the port mirror still owed. When `examples/cfg_platform.jtr`
+    /// is added to `CGEN_GOLDEN_ALLOWLIST`, the port must understand `@cfg` first.
+    #[test]
+    fn cfg_is_not_yet_in_the_byte_identity_allowlist() {
+        assert!(
+            !std::fs::read_to_string("src/proptests.rs")
+                .unwrap()
+                .contains("\"cfg_platform.jtr\","),
+            "cfg_platform.jtr is allowlisted, so the port mirror for `@cfg` must exist — \
+             if it does, delete this test along with the deferral it records"
+        );
+    }
+}
+
 /// Like [`compile`] but stops after type-checking and hands back the AST plus the
 /// inferred-type table, so a property can locate an expression and assert its
 /// inferred type (the teeth for a typeck-completeness invariant).

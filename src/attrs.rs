@@ -115,6 +115,35 @@ const SPECS: &[Spec] = &[
     // Until they do, `@abi` on a method is refused by the target list rather than
     // emitting a signature some call sites do not match.
     Spec { name: "abi", targets: &[Target::Fn], args: Args::Word, status: Status::Active },
+    // `@cfg(<platform>)` — conditional compilation, and the ONLY one in the language.
+    //
+    // **It does not remove the item.** That is the whole design, and it is forced by an
+    // invariant this compiler already sells: `attest` hashes the emitted C, and
+    // "same source → byte-identical C" is what the hash commits to (`attest.rs` §1,
+    // backed by the cross-OS numerics canary). A `cfg` that dropped items before codegen
+    // would make emission a function of the HOST, so the same source would attest to a
+    // different hash on Linux and Windows and the reproducible-build story would be over.
+    //
+    // So a `@cfg` item is emitted like any other, wrapped in the C preprocessor guard for
+    // its platform, and the C compiler does the selecting. Emission stays a pure function
+    // of the source; the only thing that varies is which half of it `cc` keeps.
+    //
+    // Two consequences worth stating, because they are not obvious:
+    //
+    //   * **Both platforms are type-checked, always.** `@cfg(windows)` code is checked on
+    //     Linux and vice versa — resolution, types, escape, error sets, all of it. That is
+    //     strictly better than a real `cfg`, where the inactive branch rots silently until
+    //     someone builds on the other OS.
+    //   * **Two items may share a name if their platforms are disjoint.** That is the
+    //     point: `@cfg(posix) fn dir_open` and `@cfg(windows) fn dir_open` are one API
+    //     with two implementations. Same-platform duplicates stay a duplicate-definition
+    //     error, which is what keeps the relaxation from being a hole.
+    Spec {
+        name: "cfg",
+        targets: &[Target::Fn, Target::Extern],
+        args: Args::Word,
+        status: Status::Active,
+    },
     // ── bare-metal field qualifier (design §16) ────────────────────────────
     Spec { name: "volatile", targets: &[Target::Field], args: Args::None, status: Status::Active },
     // ── safety / verification (functions) ──────────────────────────────────
@@ -327,6 +356,13 @@ pub fn validate(ast: &Ast, attrs: &[Attribute], target: Target, diags: &mut Vec<
                 }
                 check_args(ast, a, spec, diags);
             }
+        }
+    }
+    // `@cfg(<platform>)` — checked here rather than in `validate_fn`, because it applies
+    // to `extern` declarations too and this is the one pass both targets reach.
+    for a in attrs {
+        if a.name == "cfg" {
+            check_cfg_word(ast, a, diags);
         }
     }
     check_duplicates(attrs, diags);
@@ -565,6 +601,81 @@ impl Cost {
 /// * `value` — the default. A `read` parameter is physically a copy.
 /// * `ref` — a large read-only aggregate is passed as `const T*` instead.
 pub const ABI_WORDS: &[&str] = &["value", "ref"];
+
+/// The platforms `@cfg(<word>)` accepts.
+///
+/// A CLOSED list, and short on purpose. A closed list is a vacuity hazard — a mistyped
+/// platform would not fail to compile, it would silently stop guarding — so
+/// [`cfg_guard`] is total over exactly these names and `check_cfg_word` rejects anything
+/// else, with `cfg_vocabulary_is_closed_and_total` exercising every name against the
+/// real validator so a name added to one and not the other is a red test.
+///
+/// `posix` and `windows` are the only two the platform boundary actually needs today:
+/// the split that blocks `sys` is `opendir`/`readdir` versus `FindFirstFile`, and every
+/// other divergence recorded in the roadmap (`stat`, permissions, symlinks, process
+/// control) falls the same way. `linux`/`macos` are deliberately absent until something
+/// needs to tell them apart — a vocabulary that outruns its callers is a set of names
+/// nobody has had to define precisely.
+pub const CFG_WORDS: &[&str] = &["posix", "windows"];
+
+/// The C preprocessor condition guarding `word`'s items, or `None` for an unknown word.
+///
+/// `_WIN32` is the one predefined macro every Windows C compiler agrees on (MSVC, MinGW,
+/// clang-cl), and it is already what the cgen prelude keys its own platform block on — so
+/// `@cfg` guards and the runtime prelude cannot disagree about what "Windows" means.
+/// `posix` is defined as the complement rather than by probing `_POSIX_VERSION`, because
+/// the complement is decidable at preprocessing time on every host, while the feature
+/// macro requires a header that on Windows is the thing that is missing.
+pub fn cfg_guard(word: &str) -> Option<&'static str> {
+    match word {
+        "windows" => Some("defined(_WIN32)"),
+        "posix" => Some("!defined(_WIN32)"),
+        _ => None,
+    }
+}
+
+/// The `@cfg` platform of an item's attributes, if it has one. `None` means
+/// unconditional — emitted with no guard, compiled everywhere.
+pub fn cfg_of(ast: &Ast, attrs: &[Attribute]) -> Option<String> {
+    for a in attrs {
+        if a.name != "cfg" {
+            continue;
+        }
+        if let Some(ExprKind::Name(n)) = a.args.first().map(|id| &ast.expr_at(*id).kind) {
+            if CFG_WORDS.contains(&n.name.as_str()) {
+                return Some(n.name.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Two `@cfg`s cannot both be active, so items carrying them may share a name.
+/// `None` (unconditional) is disjoint from nothing — it is live on every platform.
+pub fn cfgs_are_disjoint(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x != y,
+        _ => false,
+    }
+}
+
+/// Validate `@cfg(<word>)`'s vocabulary. The closed list is the point: an unrecognized
+/// platform must be an error and not a silently-unguarded item.
+fn check_cfg_word(ast: &Ast, a: &Attribute, diags: &mut Vec<Diagnostic>) {
+    let word = match a.args.first().map(|id| &ast.expr_at(*id).kind) {
+        Some(ExprKind::Name(n)) => n.name.clone(),
+        // A malformed argument was already reported by `check_args`.
+        _ => return,
+    };
+    if !CFG_WORDS.contains(&word.as_str()) {
+        diags.push(
+            Diagnostic::new(format!("unknown platform `{word}` in `@cfg`"), a.span).with_help(
+                "expected `posix` or `windows`. The vocabulary is closed on purpose: an \
+                 unrecognized platform would leave the item unguarded on every target",
+            ),
+        );
+    }
+}
 
 /// Validate `@abi(<word>)`: the vocabulary, and the one rule that keeps it sound.
 ///

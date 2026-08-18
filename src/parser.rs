@@ -368,6 +368,7 @@ impl<'src> Parser<'src> {
                 self.check_attrs(&attrs, attrs::Target::Extern);
                 let mut e = self.parse_extern();
                 e.is_pub = is_pub;
+                e.attrs = attrs;
                 Some(Item::Extern(e))
             }
             Import => {
@@ -655,7 +656,7 @@ impl<'src> Parser<'src> {
             ret_ty = Some(self.parse_type());
         }
         let span = start.to(self.prev_span());
-        ExternFn { is_pub: false, abi, name, params, ret_conv, ret_ty, span }
+        ExternFn { is_pub: false, abi, attrs: Vec::new(), name, params, ret_conv, ret_ty, span }
     }
 
     fn parse_conv(&mut self) -> Conv {
