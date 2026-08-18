@@ -459,7 +459,7 @@ disjunction*, so one literal anywhere in a subtree exempted the whole operand.
 `i32`, `(b + 1)` types as `Error`, neither is a distinct, so both are refused by the same
 clause that refuses `a + b`. There is no literal predicate to get wrong.
 
-**The cast count, measured independently of the agent that wrote the feature:**
+**The cast count, re-measured from scratch rather than carried over:**
 
 * **Inside `std/path`: 21 → 0.** `base`/`dir`/`ext`/`stem` slice their argument and return
   the slice, and a slice of a `Path` is a `Path`. The implementation is cast-free. *That was
@@ -760,9 +760,8 @@ the reason stops holding, the item becomes live.
 | **A logging framework** | Wants formatting, time and a global — the third is deliberately absent | Probably never as stated |
 | **`unwrap`-style panicking helpers** | Would undercut the error-set design that payloads and `catch \|e\|` exist to serve | Never |
 
-Two refs are safe to delete when you are satisfied: `backup/pre-integration-2026-08-14` and
-`claude/jestyr-std-v2-design-4aeb42` (local + remote). The other ~46 `claude/*` branches
-predate this work.
+The `backup/pre-integration-2026-08-14` ref is safe to delete when you are satisfied, along
+with the topic branches that predate this work. `master` carries everything.
 
 ---
 

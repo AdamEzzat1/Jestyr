@@ -1,7 +1,7 @@
 # Analysis — all nine cases
 
 Measured 2026-08-13 on rustc 1.97.1 / cargo 1.97.1 (MSVC target), Jestyr
-branch `claude/rust-jestyr-ownership-benchmark-1bd785` via gcc 8.3.0
+at `db62a7b` via gcc 8.3.0
 `-O2`. Tables in `latest.md`/`latest.json` and `compiler_memory.md`;
 this file is the part a table cannot hold. Every claim is scoped to
 these workloads — METHODOLOGY rule 7. All 22 track-runs across 9 cases

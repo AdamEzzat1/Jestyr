@@ -3,7 +3,7 @@
 - date: 2026-08-13 13:26
 - rustc: rustc 1.97.1 (8bab26f4f 2026-07-14) / cargo 1.97.1 (c980f4866 2026-06-30)
 - gcc: gcc.exe (x86_64-posix-seh, Built by strawberryperl.com project) 8.3.0
-- jestyr: claude/elegant-hellman-1d7ac2@db62a7b
+- jestyr: db62a7b
 - timing: interleaved min-of-7 runs, first round discarded
 
 | case | track | runtime (ms) | compile (ms) | binary (B) | LOC | outputs match |

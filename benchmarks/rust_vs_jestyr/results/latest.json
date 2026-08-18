@@ -5,8 +5,7 @@
     "gcc":  "gcc.exe (x86_64-posix-seh, Built by strawberryperl.com project) 8.3.0",
     "cpu":  "11th Gen Intel(R) Core(TM) i7-11390H @ 3.40GHz",
     "os":  "Microsoft Windows 11 Pro",
-    "jestyr_branch":  "claude/elegant-hellman-1d7ac2",
-    "jestyr_commit":  "db62a7b",
+        "jestyr_commit":  "db62a7b",
     "reps":  7,
     "timing":  "interleaved min-of-7, first round discarded",
     "results":  [
