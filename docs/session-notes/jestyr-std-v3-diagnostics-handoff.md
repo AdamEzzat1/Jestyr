@@ -207,6 +207,98 @@ constructor or it is effectively read-only outside its module — `diag.theme(�
 exactly this reason. Worth knowing before designing any library type in this tree; found by
 writing the test that varies the theme, not by reading the grammar.
 
+### §3.-4 — Tier 3 §1.6 (`std/json`) and brief §2.1/§2.2/§2.3 — **Tier 3 is 8 of 8**
+
+`std/json` (10 tests), the `string_view` miscompile, and move-only droppables.
+
+**`std/json`.** The deferral said "after `fmt`", which was right about a serialization
+FRAMEWORK and wrong about a codec: a framework renders arbitrary values and needs
+formatting; JSON renders exactly six things and `std/sink` already renders four. What was
+really blocking was reflection, and the answer is to not need it — no derive, no trait, no
+value-to-JSON mapping. The writer is `@no_alloc` into a caller `Sink`; the reader builds a
+flat node arena.
+
+Four decisions worth keeping: key order is the CALLER's (never sorted, never deduplicated —
+`docs/diagnostics-json.md` commits to byte-identical-across-runs); numbers are integers only
+and a float is marked non-integral rather than truncated, because a silent `3` for `3.5` is
+a plausible wrong answer; trailing content is an error, since accepting a prefix makes a
+truncated file look valid; and nesting is capped at 128 so untrusted `[[[[…` is a diagnostic
+rather than a stack overflow.
+
+Nested containers collect through a scratch stack — an inner container appends while the
+outer is still open, so one shared child list would interleave two containers' slices.
+`nested_containers_do_not_interleave_their_children` walks `[1,[2,3],4,[5,[6,7]],8]`.
+
+**New .jtr trap:** a `\u00XX` escape in a Jestyr string literal passes through to the
+emitted C verbatim, and C rejects a universal character name below 0x20. Accepted by the
+front end, fails in gcc.
+
+**`string_view(x).len` (§2.3) was never a subset trap — it was a missing table entry.**
+`string_intrinsic_ret` had no row for the owned-String family, so the call typed as
+`Unknown` and cgen emitted `.j_len` against `JestyrStr`, whose C field is `len`. It survived
+because the workaround is invisible: an annotated `let v: str = string_view(s)` supplies the
+type the intrinsic did not, so every call site was written that way and the repo recorded
+the shape as a **.jtr subset trap** rather than as the compiler bug it is. Three table rows,
+mirrored in `examples/std/typeck.jtr` (the P3 golden has no allowlist), reseed paid.
+
+**Move-only droppables (§2.1, and §2.2's handle half).** A `let`/`var` initialized from a
+bare droppable NAME now moves it, reusing `take`'s machinery — one notion of "moved", one
+diagnostic, with a `MoveCause` so a rebinding is not reported as a `take` argument.
+
+**The bigger half was a pre-existing hole.** `droppable_ty` looked up `("Drop", ty_key)`, and
+a blanket `impl[T] Drop for List(T)` registers under `List(T)` — so a concrete `List(i64)`
+never matched and **every ownership rule silently skipped the most-used droppable in the
+tree**. Use-after-`take` of a `List` was not diagnosed at all. Matching on the constructor
+fixed the old rule and the new one together.
+
+Measured over 210 corpus files before choosing the severity: **two sites, both in one
+test** — and that test was documenting a latent double free. `smallvec_test` copied a
+`SmallVec`, which frees a heap buffer once spilled, and was safe only because it held two
+elements and never spilled: a property of the test, not of the code it checked. Rewritten
+to pin the real invariant (no self-pointer into the inline buffer) through a `read`
+parameter, which is physically a copy and creates no second owner.
+
+**No port mirror is owed today** — the corpus trips the rule zero times, so both sides
+agree and `jestyr_escape_dump_matches_reference` is green. One is owed the moment a corpus
+file trips it.
+
+### §3.-3 — §2.5 error-model ergonomics: THREE of five rows were already done
+
+Probed rather than inherited, because the table this session started from was carrying
+claims from an older note. What is actually open is one row, and it is a documented
+deferral rather than a gap.
+
+| Row | Real state |
+|---|---|
+| Discarded-error diagnostics | ✅ done earlier this session |
+| Good propagation | ✅ a superset propagates; a NARROWER enclosing set is refused, naming the members it does not declare |
+| Trait-signature error sets | ✅ **already enforced** — an impl declaring an error its trait never promised is refused, with both sets in the message |
+| Payload extraction | ✅ `catch \|e\| match e { NotFound(w) => …, Busy(n) => n }` discriminates and binds |
+| Named / namespaced sets | ⬜ **measured and NOT built** |
+| Owning payloads | ⬜ deliberately deferred, with a diagnostic that says so |
+
+**Named sets were measured and declined.** The ergonomic complaint is that every signature
+respells `!{ A, B, C }`. Over the whole corpus: **40 error-set sites, 18 distinct sets, and
+the largest multi-member repeat is 3** (`!{ Empty, TooBig(i64), BadKey(str) }`). The most
+frequent set of all is `!{ TooBig }` at five sites — a single member, which a named set
+saves nothing on. A new top-level item form costs a lexer keyword, a parser item, an AST
+node, visibility, typeck resolution, **and the port's parser and typeck mirrors — and the
+P2/P3 goldens have no allowlist.** That is a large two-sided tax against a repetition
+count of three. Same verdict and same method as typed `Path` at 132 casts: measure the
+conversion you would actually ship, and this one does not pay.
+
+It becomes live when a real consumer repeats a multi-member set across modules — `sys`
+growing a shared platform-error set is the likeliest trigger.
+
+**Owning payloads are refused by name, with a reason.** `!{ NotFound(String) }` gives *"a
+v1 error payload must be a scalar or `str` — owning and aggregate payloads are deliberately
+deferred (docs/error-payloads.md §3)"*. And a `str` payload cannot carry the thing a caller
+actually wants: `err(NotFound(p))` on a `read p: str` is refused by the escape checker,
+correctly, since the error outlives the call — so only literals survive. That is the felt
+gap, and closing it means the error union carries heap data, which widens the result struct
+of every program that links it and needs a drop obligation on the error path. A whole-program
+ABI change, argued in its own doc, and not something to start as a rider.
+
 ### §3.-2 — Tier 3 §1.4 (finished), §1.5, §1.7, §1.8
 
 `std/walk` (7), `std/bitset` (6), `std/memprof` (6), `std/runtime` (5). **Tier 3 is now 7
