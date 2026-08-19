@@ -1,0 +1,172 @@
+// std/sysdir_test.jtr — the unit suite for `std/sysdir`.
+//
+// These tests touch the real filesystem, which is the only way to test a directory
+// listing honestly: the whole point of the module is that POSIX and Windows disagree, and
+// a mock would encode one of their answers and prove nothing about the other.
+//
+// They read `examples/modules`, a fixture that is IN the repository and has exactly two
+// entries — so the assertions are about content, not just about "something came back".
+// Run from the repository root.
+//
+// Run:  jestyrc test examples/std/sysdir_test.jtr
+
+import "sysdir"
+import "str"
+import "mem"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 4096
+
+// Count entries, and report whether both known names appeared. One pass, because a
+// `Dir` is a cursor and cannot be rewound — which is itself worth encoding in the test's
+// shape rather than pretending otherwise.
+fn scan(mut d: sysdir.Dir, mut saw_main: bool, mut saw_mathx: bool, mut dots: i32) -> i32 {
+    var n: i32 = 0
+    for true {
+        let name: str = sysdir.next_name(d)
+        if name.len == 0 { break }
+        if str.eq(name, "main.jtr") { saw_main = true }
+        if str.eq(name, "mathx.jtr") { saw_mathx = true }
+        if sysdir.is_dot_entry(name) { dots = dots + 1 }
+        n = n + 1
+        if n > 64 { break }              // a runaway cursor must fail, not hang
+    }
+    return n
+}
+
+@test fn a_real_directory_lists_exactly_its_contents() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var d: sysdir.Dir = sysdir.open(a, "examples/modules")
+    test.is_true(c, rep, "opened", sysdir.is_open(d))
+
+    var saw_main: bool = false
+    var saw_mathx: bool = false
+    var dots: i32 = 0
+    let n: i32 = scan(d, saw_main, saw_mathx, dots)
+    sysdir.close(d)
+
+    // EXACTLY two. `examples/modules` holds `main.jtr` and `mathx.jtr` and nothing else,
+    // so this pins the count rather than asserting "at least one" — which would pass for
+    // an implementation that returned the first entry forever.
+    test.eq_i64(c, rep, "two entries", n as i64, 2)
+    test.is_true(c, rep, "main.jtr", saw_main)
+    test.is_true(c, rep, "mathx.jtr", saw_mathx)
+    // `.` and `..` are filtered by `next_name`. A walker that saw them would recurse into
+    // its own parent forever, so this is the assertion that keeps that bug out.
+    test.eq_i64(c, rep, "no dot entries", dots as i64, 0)
+    test.is_false(c, rep, "closed after close", sysdir.is_open(d))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn the_unfiltered_form_yields_dot_and_dotdot() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // The positive control for the filter above: without this, "no dot entries" would
+    // also pass for an implementation that never yielded them at all — and then
+    // `raw_next_name` would be silently broken for the caller who needs it.
+    var d: sysdir.Dir = sysdir.open(a, "examples/modules")
+    var dots: i32 = 0
+    var total: i32 = 0
+    for true {
+        let name: str = sysdir.raw_next_name(d)
+        if name.len == 0 { break }
+        if sysdir.is_dot_entry(name) { dots = dots + 1 }
+        total = total + 1
+        if total > 64 { break }
+    }
+    sysdir.close(d)
+
+    test.eq_i64(c, rep, "both dot entries appear", dots as i64, 2)
+    test.eq_i64(c, rep, "four raw entries", total as i64, 4)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_missing_directory_gives_a_closed_handle() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var d: sysdir.Dir = sysdir.open(a, "no/such/directory/anywhere")
+    test.is_false(c, rep, "not open", sysdir.is_open(d))
+    // Reading a closed handle is defined: the end marker, not a fault. A caller that did
+    // not check `is_open` gets an empty listing rather than a crash.
+    test.eq_usize(c, rep, "reads as empty", sysdir.next_name(d).len, 0)
+    sysdir.close(d)                          // and closing it twice is harmless
+    sysdir.close(d)
+    test.is_false(c, rep, "still closed", sysdir.is_open(d))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn an_interior_nul_in_the_path_is_refused() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // C stops at the NUL, so `examples/modules\0/../../etc` would open the real prefix.
+    // Listing it silently would be a security answer dressed as a correctness one, the
+    // same refusal `std/file.open_path` makes.
+    var d: sysdir.Dir = sysdir.open(a, "examples/modules\0/junk")
+    test.is_false(c, rep, "refused", sysdir.is_open(d))
+
+    // The positive control WITHOUT which the refusal proves nothing: the prefix alone
+    // genuinely opens, so the refusal is about the NUL and not about the path being bad.
+    var d2: sysdir.Dir = sysdir.open(a, "examples/modules")
+    test.is_true(c, rep, "positive control", sysdir.is_open(d2))
+    sysdir.close(d2)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn every_name_is_nonempty_and_terminated() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // The assertion that catches a WRONG NAME OFFSET, which is the failure mode both
+    // platforms share and neither reports: reading `d_name` at the wrong offset, or
+    // `cFileName` at the wrong one, yields plausible-looking garbage rather than an
+    // error. A name that does not end in `.jtr` here means the offset is wrong.
+    var d: sysdir.Dir = sysdir.open(a, "examples/modules")
+    var all_jtr: bool = true
+    var any: bool = false
+    var n: i32 = 0
+    for true {
+        let name: str = sysdir.next_name(d)
+        if name.len == 0 { break }
+        any = true
+        if str.has_suffix(name, ".jtr") == false { all_jtr = false }
+        if name.len < 5 { all_jtr = false }
+        n = n + 1
+        if n > 64 { break }
+    }
+    sysdir.close(d)
+
+    test.is_true(c, rep, "saw something", any)
+    test.is_true(c, rep, "every name is a real .jtr filename", all_jtr)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

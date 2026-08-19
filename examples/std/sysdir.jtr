@@ -1,0 +1,255 @@
+// std/sysdir.jtr — directory listing, and the first module that needs a platform.
+//
+// TIER: `sys`. This is the module the scope rule was written for: *if ISO C specifies it,
+// it can live in `std`; if it needs a portability DECISION, it needs a platform layer.*
+// Reading a file is ISO C (`fopen`/`fread`), so `std/file` is `std`. Listing a directory
+// is not, and POSIX and Windows do not merely spell it differently — they disagree about
+// what a directory entry IS. POSIX hands back a `struct dirent*` you keep calling for;
+// Windows hands back a search handle plus a 320-byte `WIN32_FIND_DATAA` it fills in, and
+// its first result arrives from the OPEN call rather than from the first read.
+//
+// ─── Why this could not be written before ─────────────────────────────────────
+//
+// Not for want of FFI: `extern` has worked the whole time, `cptr` holds an opaque handle,
+// and `extern "<hdr>.h"` binds a header-declared function. The blocker was that a single
+// `.jtr` could not hold both bindings — whichever header is absent kills the build — so
+// the platform boundary had to be the compiler's intrinsic list, and a `sys` LIBRARY was
+// a category error.
+//
+// `@cfg(<platform>)` closes that, and it does so without forking the emitted C: both
+// branches are emitted, each inside its own `#if`, and the C preprocessor selects. So the
+// C this module produces is the same on every host — `attest`'s hash stays a function of
+// the source — and, more usefully here, **both platforms are type-checked wherever you
+// build.** The Windows branch below is resolved, typed and escape-checked on Linux and
+// vice versa. Under a `cfg` that dropped items, the branch you are not building rots.
+//
+// ─── What is deliberately NOT abstracted ──────────────────────────────────────
+//
+// `Dir` is an opaque handle and `next_name` yields one name at a time. There is no
+// `DirEntry` with `is_file`/`size`/`modified`, because every one of those is a second
+// portability decision (`d_type` is not in POSIX and is absent on some filesystems;
+// `dwFileAttributes` has no POSIX equivalent) and inventing a lowest-common-denominator
+// record would be exactly the "nice API that erases cost" this tier is supposed to avoid.
+// Names first; a caller that needs metadata asks for it explicitly, when someone has made
+// that decision on purpose.
+//
+// `.` and `..` are FILTERED OUT, and that is the one convenience taken. Both platforms
+// yield them, every caller drops them, and a walker that forgot to would recurse into its
+// own parent forever — a bug bad enough that shipping the trap and documenting it would
+// be the wrong trade. `raw_next_name` is the unfiltered form for a caller that needs it.
+//
+// ─── Order is NOT specified, and pretending otherwise would be a lie ──────────
+//
+// Neither `readdir` nor `FindNextFileA` promises an order, and NTFS and ext4 genuinely
+// differ. Anything that needs determinism — a build graph, a golden test — must sort, so
+// this module returns names in whatever order the OS gives and says so loudly rather than
+// sorting internally and charging every caller for it. `std/walk` is where sorting
+// happens, because that is where determinism is actually required.
+//
+// Run the tests:  jestyrc test examples/std/sysdir_test.jtr
+
+import "cstring"
+import "str"
+
+// ---- POSIX ------------------------------------------------------------------
+//
+// `DIR*` and `struct dirent*` are both `cptr`. Jestyr never learns what either is; the
+// only questions asked of them are "is it null" and "hand it back to the next call".
+//
+// `readdir` returns a pointer to a struct whose first member is not the name. `d_name`
+// sits at an offset that differs between libcs, so the pointer is narrowed back to
+// `*mut u8` with an explicit `as` and read at `D_NAME_OFFSET` — see that constant for why
+// the number is asserted rather than assumed.
+
+@cfg(posix) extern "dirent.h" fn opendir(path: cstr) -> cptr
+@cfg(posix) extern "dirent.h" fn readdir(d: cptr) -> cptr
+@cfg(posix) extern "dirent.h" fn closedir(d: cptr) -> i32
+
+// ---- Windows ----------------------------------------------------------------
+//
+// `FindFirstFileA` takes a search PATTERN (`dir\*`), not a directory, and returns both a
+// handle and the first entry. `FindNextFileA` fills the same buffer for each subsequent
+// one. `INVALID_HANDLE_VALUE` is `(HANDLE)-1`, not null, which is why `is_open` compares
+// against a sentinel rather than testing for null.
+
+@cfg(windows) extern "windows.h" fn FindFirstFileA(pattern: cstr, data: cptr) -> cptr
+@cfg(windows) extern "windows.h" fn FindNextFileA(h: cptr, data: cptr) -> i32
+@cfg(windows) extern "windows.h" fn FindClose(h: cptr) -> i32
+
+// A directory being read.
+//
+// `buf` is the platform's scratch: unused on POSIX, the `WIN32_FIND_DATAA` on Windows.
+// It is owned by the handle and freed by `close`, which is what lets `next_name` have the
+// same signature on both platforms instead of making every caller carry a buffer whose
+// size is a Windows implementation detail.
+pub struct Dir {
+    h: cptr,
+    buf: *mut u8,
+    pending: bool,          // Windows: the open already produced the first entry
+    open: bool,
+}
+
+// Windows fills `cFileName` at byte offset 44 of `WIN32_FIND_DATAA` (four DWORDs of
+// attributes and times = 4 + 8*3 = 28, plus two DWORDs of size = 8, plus two reserved
+// DWORDs = 8 → 44). POSIX's `d_name` offset is NOT portable in the same way, which is why
+// only the Windows side hard-codes one.
+const WIN32_NAME_OFFSET: usize = 44
+const WIN32_FIND_DATA_SIZE: usize = 512
+const INVALID_HANDLE: i64 = 0 - 1
+
+// POSIX's `d_name` offset, and the one number in this module that is NOT portable across
+// its own platform.
+//
+// `struct dirent` is `{ ino_t d_ino; off_t d_off; unsigned short d_reclen; unsigned char
+// d_type; char d_name[]; }` on glibc and musl for LP64 — 8 + 8 + 2 + 1 = 19. macOS is a
+// different struct (`d_ino`, `d_seekoff`, `d_reclen`, `d_namlen`, `d_type`) and puts the
+// name at 21. POSIX itself specifies only that `d_name` exists and is NUL-terminated; the
+// offset is the implementation's.
+//
+// **19 is the Linux value and it is asserted, not assumed.** `d_name_offset_is_right_for_
+// this_libc` reads a directory whose contents it created and fails if the first byte of
+// the name is not what it wrote — so a platform where 19 is wrong gets a red test rather
+// than garbage names. That test only runs on POSIX, which means the CI Linux canary is
+// what actually exercises it; on Windows this constant is not compiled at all.
+//
+// This is exactly the trigger the `@cfg` vocabulary was left closed for: `linux` and
+// `macos` become worth adding when something needs to tell them apart, and this is that
+// something. They are NOT added here because a branch nobody can run on either machine
+// available to this session would be an untested claim, which is the failure mode this
+// module's whole header argues against.
+// Unguarded, because a constant needs no guard: it is unused on Windows and costs one
+// line of C. `@cfg` is scoped to functions and externs deliberately -- widening it to
+// consts would be surface added for a case that does not need it.
+const D_NAME_OFFSET: usize = 19
+const D_NAME_MAX: usize = 256
+
+@no_os pub fn is_open(read d: Dir) -> bool {
+    return d.open
+}
+
+// Read a NUL-terminated name out of `p` at `off`, bounded by `cap` so a buffer the OS did
+// not terminate cannot run off the end. Returns an empty string for an empty name.
+fn name_at(p: *mut u8, off: usize, cap: usize) -> str {
+    var n: usize = 0
+    for off + n < cap {
+        var b: u8 = 0
+        unsafe { b = (p + (off + n)).* }
+        if (b as i32) == 0 { break }
+        n = n + 1
+    }
+    var base: *mut u8 = null
+    unsafe { base = p + off }
+    let sl: []u8 = slice(u8, base, n)
+    return from_utf8(sl)
+}
+
+// `.` and `..` — every platform yields them and every caller drops them.
+@no_alloc @no_os pub fn is_dot_entry(read name: str) -> bool {
+    return str.eq(name, ".") or str.eq(name, "..")
+}
+
+// ---- opening ----------------------------------------------------------------
+
+// Open `path` for listing. A closed `Dir` is returned on failure; ask `is_open`.
+//
+// The path is copied through `std/cstring`, which REFUSES an interior NUL rather than
+// letting C stop early at it — `open("a\0/../etc")` silently listing `a` would be a
+// security answer dressed as a correctness one. The copy is freed before returning, so no
+// `cstr` outlives the call and callers never hold one.
+@cfg(posix) pub fn open(read a: Allocator, read path: str) -> Dir {
+    if cstring.has_interior_nul(path) {
+        return Dir{ h: null, buf: null, pending: false, open: false }
+    }
+    var c: CString = cstring.from_str(a, path)
+    let h: cptr = opendir(cstring.as_cstr(c))
+    cstring.free(c)
+    if h == null {
+        return Dir{ h: null, buf: null, pending: false, open: false }
+    }
+    return Dir{ h: h, buf: null, pending: false, open: true }
+}
+
+// The Windows half. `FindFirstFileA` wants a PATTERN, so `\*` is appended — and it also
+// produces the first entry, which is why `pending` exists: without it the first name in
+// every directory would be dropped.
+@cfg(windows) pub fn open(read a: Allocator, read path: str) -> Dir {
+    if cstring.has_interior_nul(path) {
+        return Dir{ h: null, buf: null, pending: false, open: false }
+    }
+    var pat: String = string_new()
+    string_push(pat, path)
+    string_push(pat, "\\*")
+    let pv: str = string_view(pat)
+    var c: CString = cstring.from_str(a, pv)
+    string_free(pat)
+    var buf: *mut u8 = alloc(u8, WIN32_FIND_DATA_SIZE)
+    let h: cptr = FindFirstFileA(cstring.as_cstr(c), buf as cptr)
+    cstring.free(c)
+    // INVALID_HANDLE_VALUE is (HANDLE)-1, not null — testing for null would treat every
+    // failed open as a successful one.
+    if h == null or (h as i64) == INVALID_HANDLE {
+        free_ptr(buf)
+        return Dir{ h: null, buf: null, pending: false, open: false }
+    }
+    return Dir{ h: h, buf: buf, pending: true, open: true }
+}
+
+// ---- reading ----------------------------------------------------------------
+
+// The next entry's name, INCLUDING `.` and `..`, or the empty string at the end.
+//
+// An empty string is the end marker rather than a `bool` out-parameter because a
+// directory entry can never legitimately have an empty name on either platform.
+@cfg(posix) pub fn raw_next_name(mut d: Dir) -> str {
+    if d.open == false { return "" }
+    let e: cptr = readdir(d.h)
+    if e == null { return "" }
+    // Narrowing a `cptr` back to a typed pointer is the one direction the type is
+    // deliberately asymmetric about — widening `*mut u8` to `cptr` is implicit, and
+    // recovering a typed pointer needs an explicit `as`. That explicitness is the point
+    // here: this cast is a claim about a foreign struct's layout, and it should look like
+    // one at the call site.
+    let p: *mut u8 = e as *mut u8
+    return name_at(p, D_NAME_OFFSET, D_NAME_MAX + D_NAME_OFFSET)
+}
+
+@cfg(windows) pub fn raw_next_name(mut d: Dir) -> str {
+    if d.open == false { return "" }
+    if d.pending {
+        d.pending = false
+        return name_at(d.buf, WIN32_NAME_OFFSET, WIN32_FIND_DATA_SIZE)
+    }
+    if FindNextFileA(d.h, d.buf as cptr) == 0 { return "" }
+    return name_at(d.buf, WIN32_NAME_OFFSET, WIN32_FIND_DATA_SIZE)
+}
+
+// The next entry that is not `.` or `..`, or the empty string at the end. The form
+// callers want; see the header on why the filter is the one convenience taken.
+pub fn next_name(mut d: Dir) -> str {
+    for true {
+        let n: str = raw_next_name(d)
+        if n.len == 0 { return n }
+        if is_dot_entry(n) == false { return n }
+    }
+    return ""
+}
+
+// ---- closing ----------------------------------------------------------------
+
+@cfg(posix) pub fn close(mut d: Dir) {
+    if d.open == false { return }
+    closedir(d.h)
+    d.open = false
+    d.h = null
+}
+
+@cfg(windows) pub fn close(mut d: Dir) {
+    if d.open == false { return }
+    FindClose(d.h)
+    if d.buf != null {
+        free_ptr(d.buf)
+        d.buf = null
+    }
+    d.open = false
+    d.h = null
+}

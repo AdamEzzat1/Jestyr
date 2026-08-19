@@ -207,6 +207,50 @@ constructor or it is effectively read-only outside its module — `diag.theme(�
 exactly this reason. Worth knowing before designing any library type in this tree; found by
 writing the test that varies the theme, not by reading the grammar.
 
+### §3.-1 — Tier 3 §1.2/§1.3/§1.4 — three modules, and where §1.4 stops
+
+`std/cli` (11 tests), `std/buildgraph` (10), `std/sysdir` (5), each with a real consumer.
+`cli_demo` is `jlint` — parses a file with the ported parser and reports through
+`std/diag`; `buildgraph_demo` is `jplan` — orders the manifest `Modules::render_manifest`
+actually emits, verified against a real one by
+`jplan_orders_a_manifest_the_compiler_rendered`.
+
+**`std/sysdir` is the first `sys`-tier module, and it lists a real directory.** The thing
+recorded as "BLOCKED, and not on what anyone expected" now works: `examples/modules` reads
+back as exactly `main.jtr` and `mathx.jtr`, `.`/`..` filtered, a missing directory giving a
+closed handle, an interior NUL refused with the prefix-opens positive control beside it.
+
+Two things that made it possible and were not obvious:
+
+* **`cptr` narrowing.** POSIX `readdir` returns a `struct dirent*` whose name must be read
+  out of it — impossible through an opaque handle. An explicit `e as *mut u8` IS accepted
+  (only the implicit direction is refused), and the explicitness is right: the cast is a
+  claim about a foreign struct's layout and should look like one. Windows needs no such
+  cast, because the OS writes into a buffer Jestyr owns.
+* **`d_name`'s offset is the one number that is not portable within POSIX** — 19 on
+  glibc/musl LP64, 21 on macOS. It is a plain `const` (a constant needs no guard; it is
+  merely unused on Windows) and it is *asserted*, not assumed:
+  `every_name_is_nonempty_and_terminated` fails on a platform where 19 is wrong, because a
+  wrong offset yields plausible garbage rather than an error. **This is the trigger the
+  `@cfg` vocabulary was left closed for** — `linux`/`macos` become worth adding here — and
+  they are deliberately NOT added, because neither machine in this session can run the
+  branch and an untested branch is the failure this module's header argues against.
+
+**§1.4 IS NOT FINISHED.** `sysdir` is the platform half. The brief's actual ask —
+`walk(fs, root, opts, visitor)` with deterministic order, ignore/glob, and a capability —
+is unbuilt, and it is `std`, not `sys`. What it needs, precisely:
+
+* **Sorting, because `sysdir` refuses to.** Neither `readdir` nor `FindNextFileA` promises
+  an order and NTFS and ext4 genuinely differ, so the module returns OS order and says so.
+  Determinism is `walk`'s job, which is where it is actually required.
+* **A visitor that is a fn pointer**, not a closure — the `mem.Allocator` shape.
+* **`Fs` as the capability**, so a walk can be denied and tested denied, with the positive
+  control through `host()` that a refusal test needs to mean anything.
+
+`sysdir.jtr`/`sysdir_test.jtr` are in `io_suites_pass` and deliberately **not** in
+`CGEN_GOLDEN_ALLOWLIST`: they use `@cfg`, so byte-identity against the self-hosted backend
+is owed together with §3.0's port mirror.
+
 ### §3.0 — `@cfg(<platform>)` — BUILT, reference-side. The port mirror is owed
 
 The `sys` blocker recorded as "Jestyr has NO conditional-compilation mechanism at any
