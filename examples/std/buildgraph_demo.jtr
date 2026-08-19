@@ -1,0 +1,125 @@
+// examples/std/buildgraph_demo.jtr — `jplan`: read a module manifest, print the build
+// order, name the cycle.
+//
+// The consumer that makes `std/buildgraph` load-bearing rather than available, and the
+// point of it is that the input is not invented here. `jestyr-manifest/v1` is what
+// `Modules::render_manifest` emits — the compiler's own content-hash DAG — so this is a
+// Jestyr-side tool checking the Rust-side compiler's real build graph, not a parallel
+// description of one.
+//
+//   jplan <manifest>     the build order, one module per line; exit 1 if cyclic
+//   --quiet, -q          print nothing; the exit code is the answer
+//
+// There are deliberately NO subcommands. The first draft had `order` and `check`, and a
+// bare `jplan some.manifest` then read the PATH as an unknown command -- because a spec
+// that declares subcommands takes the first bare word as one. Two commands that differed
+// only in whether they printed were never worth that: `--quiet` already covers it, and the
+// exit code is the answer either way.
+//
+// It is also the third module of this Tier-3 slice wired to the other two: `std/cli`
+// parses the command line and `std/diag` is what a richer error report would use next.
+//
+// Build and run it:
+//     jestyrc build examples/std/buildgraph_demo.jtr
+//     ./buildgraph_demo some.manifest
+
+import "buildgraph"
+import "cli"
+import "sink"
+import "mem"
+import "fs"
+
+const CAP: usize = 65536
+
+// A manifest with a diamond in it, used when no file is named. `base` is reachable by two
+// paths and must be built once, first — the shape that separates a real topological sort
+// from a walk.
+fn builtin() -> str {
+    return "jestyr-manifest/v1\nmodule app 1111\n  import left 2222\n  import right 3333\nmodule left 2222\n  import base 4444\nmodule right 3333\n  import base 4444\nmodule base 4444\n"
+}
+
+fn spec_of(read a: Allocator) -> cli.Spec {
+    var s: cli.Spec = cli.spec_new(a, "jplan", "order a jestyr module manifest")
+    cli.flag(s, 113, "quiet", "print nothing; the exit code is the answer")
+    return s
+}
+
+fn emit(read text: str, overflowed: bool, to_err: bool) {
+    if overflowed {
+        eprint_str("output too large to render; raise the buffer")
+        return
+    }
+    if to_err {
+        eprint_str(text)
+        return
+    }
+    print_str(text)
+}
+
+fn show_help(read s: cli.Spec, to_err: bool) {
+    var raw: *mut u8 = alloc(u8, CAP)
+    var buf: []u8 = slice(u8, raw, CAP)
+    var sk: Sink = sink.new()
+    cli.render_help(sk, buf, s)
+    emit(sink.view(sk, buf), sink.overflowed(sk), to_err)
+    free_ptr(raw)
+}
+
+// Order `text` and report. Returns the process exit code.
+fn run(read a: Allocator, read text: str, quiet: bool) -> i32 {
+    var m: buildgraph.Manifest = buildgraph.parse_manifest(a, text)
+    if buildgraph.parsed(m) == false {
+        eprint_str(buildgraph.error_text(m))
+        return cli.EXIT_USAGE
+    }
+    var p: buildgraph.Plan = buildgraph.plan(a, m)
+
+    if quiet == false {
+        var raw: *mut u8 = alloc(u8, CAP)
+        var buf: []u8 = slice(u8, raw, CAP)
+        var sk: Sink = sink.new()
+        buildgraph.render_plan(sk, buf, m, p)
+        // A cycle goes to stderr and an order goes to stdout, so a script can pipe the
+        // order without a diagnostic landing in its data.
+        emit(sink.view(sk, buf), sink.overflowed(sk), buildgraph.has_cycle(p))
+        free_ptr(raw)
+    }
+
+    // 1 means "the tool ran and the answer was no"; 2 (above) means the input was
+    // unreadable and nothing ran. A build script branches on exactly this distinction.
+    if buildgraph.has_cycle(p) { return cli.EXIT_FAILURE }
+    return cli.EXIT_OK
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var s: cli.Spec = spec_of(a)
+    var args: cli.Args = cli.args_from_env(a)
+    var mt: cli.Matches = cli.parse(a, s, args)
+
+    if cli.succeeded(mt) == false {
+        eprint_str(cli.error_text(mt))
+        show_help(s, true)
+        return cli.EXIT_USAGE
+    }
+    if cli.wants_help(mt) {
+        show_help(s, false)
+        return cli.EXIT_OK
+    }
+    let quiet: bool = cli.is_set(mt, s, "quiet")
+
+    // No file named: run the built-in diamond, so the demo demonstrates something without
+    // needing a fixture on disk.
+    if cli.positional_count(mt) == 0 {
+        return run(a, builtin(), quiet)
+    }
+    let path: str = cli.positional(mt, 0)
+    if fs.exists(path) == false {
+        eprint_str("no such manifest")
+        return cli.EXIT_USAGE
+    }
+    var text: String = fs.read_text(path)
+    let code: i32 = run(a, string_view(text), quiet)
+    string_free(text)
+    return code
+}

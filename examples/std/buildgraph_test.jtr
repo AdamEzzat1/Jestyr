@@ -1,0 +1,305 @@
+// std/buildgraph_test.jtr — the unit suite for `std/buildgraph`.
+//
+// Run:  jestyrc test examples/std/buildgraph_test.jtr
+
+import "buildgraph"
+import "sink"
+import "mem"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 4096
+const BUF_CAP: usize = 4096
+
+// A three-module chain: app -> lib -> core. Hashes are stand-ins for real sha256s; the
+// only property that matters is that they are distinct and that the import tags match
+// their target's `module` line, which is what `render_manifest` guarantees.
+fn chain() -> str {
+    return "jestyr-manifest/v1\nmodule app aaa\n  import lib bbb\nmodule lib bbb\n  import core ccc\nmodule core ccc\n"
+}
+
+@test fn a_manifest_parses_into_modules_and_edges() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var m: buildgraph.Manifest = buildgraph.parse_manifest(a, chain())
+    test.is_true(c, rep, "parsed", buildgraph.parsed(m))
+    test.eq_usize(c, rep, "three modules", buildgraph.module_count(m), 3)
+    test.eq_str(c, rep, "name 0", buildgraph.module_name(m, 0), "app")
+    test.eq_str(c, rep, "hash 0", buildgraph.module_hash(m, 0), "aaa")
+    test.eq_str(c, rep, "name 2", buildgraph.module_name(m, 2), "core")
+
+    // Imports belong to the module they follow, and the count is per module — the field
+    // a shared arena makes easy to get wrong by one.
+    test.eq_usize(c, rep, "app has one import", buildgraph.import_count(m, 0), 1)
+    test.eq_usize(c, rep, "lib has one import", buildgraph.import_count(m, 1), 1)
+    test.eq_usize(c, rep, "core has none", buildgraph.import_count(m, 2), 0)
+    test.eq_str(c, rep, "app's edge binding", buildgraph.import_binding(m, 0, 0), "lib")
+    test.eq_str(c, rep, "app's edge hash", buildgraph.import_hash(m, 0, 0), "bbb")
+    test.eq_str(c, rep, "lib's edge binding", buildgraph.import_binding(m, 1, 0), "core")
+
+    // An edge names its target by hash, so resolving is a lookup.
+    test.eq_i64(c, rep, "bbb is lib", buildgraph.resolve(m, "bbb") as i64, 1)
+    test.eq_i64(c, rep, "ccc is core", buildgraph.resolve(m, "ccc") as i64, 2)
+    test.eq_i64(c, rep, "an unknown hash", buildgraph.resolve(m, "zzz") as i64, 0 - 1)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn the_plan_puts_dependencies_first() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var m: buildgraph.Manifest = buildgraph.parse_manifest(a, chain())
+    var p: buildgraph.Plan = buildgraph.plan(a, m)
+
+    test.is_false(c, rep, "no cycle", buildgraph.has_cycle(p))
+    test.eq_usize(c, rep, "all three ordered", buildgraph.plan_len(p), 3)
+    // core, then lib, then app — the order a build executes in. The manifest lists them
+    // in the opposite order, so this cannot pass by accident.
+    test.eq_str(c, rep, "first", buildgraph.module_name(m, buildgraph.plan_at(p, 0)), "core")
+    test.eq_str(c, rep, "second", buildgraph.module_name(m, buildgraph.plan_at(p, 1)), "lib")
+    test.eq_str(c, rep, "third", buildgraph.module_name(m, buildgraph.plan_at(p, 2)), "app")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_diamond_visits_the_shared_dependency_once() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // app -> {left, right} -> base. The shape that distinguishes a real topological sort
+    // from a walk: `base` is reachable twice and must appear exactly once, before both.
+    let src: str = "jestyr-manifest/v1\nmodule app aaa\n  import left bbb\n  import right ccc\nmodule left bbb\n  import base ddd\nmodule right ccc\n  import base ddd\nmodule base ddd\n"
+    var m: buildgraph.Manifest = buildgraph.parse_manifest(a, src)
+    var p: buildgraph.Plan = buildgraph.plan(a, m)
+
+    test.is_false(c, rep, "no cycle", buildgraph.has_cycle(p))
+    test.eq_usize(c, rep, "four, not five", buildgraph.plan_len(p), 4)
+    test.eq_str(c, rep, "base first", buildgraph.module_name(m, buildgraph.plan_at(p, 0)), "base")
+    test.eq_str(c, rep, "then left", buildgraph.module_name(m, buildgraph.plan_at(p, 1)), "left")
+    test.eq_str(c, rep, "then right", buildgraph.module_name(m, buildgraph.plan_at(p, 2)), "right")
+    test.eq_str(c, rep, "app last", buildgraph.module_name(m, buildgraph.plan_at(p, 3)), "app")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_cycle_is_reported_and_the_order_is_emptied() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    let src: str = "jestyr-manifest/v1\nmodule a aaa\n  import b bbb\nmodule b bbb\n  import a aaa\n"
+    var m: buildgraph.Manifest = buildgraph.parse_manifest(a, src)
+    var p: buildgraph.Plan = buildgraph.plan(a, m)
+
+    test.is_true(c, rep, "cycle found", buildgraph.has_cycle(p))
+    test.is_true(c, rep, "and it names a participant", buildgraph.cycle_module(p) >= 0)
+    // EMPTY, not partial. A build order for a graph that has no valid order is a lie, and
+    // emptying it is what makes a caller who ignores `has_cycle` harmless rather than
+    // wrong — they build nothing instead of building in an impossible order.
+    test.eq_usize(c, rep, "no order survives", buildgraph.plan_len(p), 0)
+
+    // The positive control: break the cycle and the same shape orders fine. Without it
+    // the assertions above would pass for an implementation that reported every graph
+    // as cyclic.
+    let fixed: str = "jestyr-manifest/v1\nmodule a aaa\n  import b bbb\nmodule b bbb\n"
+    var m2: buildgraph.Manifest = buildgraph.parse_manifest(a, fixed)
+    var p2: buildgraph.Plan = buildgraph.plan(a, m2)
+    test.is_false(c, rep, "positive control", buildgraph.has_cycle(p2))
+    test.eq_usize(c, rep, "and orders both", buildgraph.plan_len(p2), 2)
+
+    // A module importing ITSELF is a cycle of length one, which a colour-based check gets
+    // right only if it marks the node in-progress before descending.
+    let selfdep: str = "jestyr-manifest/v1\nmodule a aaa\n  import a aaa\n"
+    var m3: buildgraph.Manifest = buildgraph.parse_manifest(a, selfdep)
+    var p3: buildgraph.Plan = buildgraph.plan(a, m3)
+    test.is_true(c, rep, "self-import is a cycle", buildgraph.has_cycle(p3))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn the_order_depends_on_the_text_and_not_on_the_hashes() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // The same graph with hashes that sort the other way. An implementation that ordered
+    // by hash would flip the two roots here; ordering by manifest position does not — and
+    // that is what keeps a build log diffable when any module's content changes.
+    let lo: str = "jestyr-manifest/v1\nmodule first aaa\nmodule second bbb\n"
+    let hi: str = "jestyr-manifest/v1\nmodule first zzz\nmodule second yyy\n"
+    var m1: buildgraph.Manifest = buildgraph.parse_manifest(a, lo)
+    var m2: buildgraph.Manifest = buildgraph.parse_manifest(a, hi)
+    var p1: buildgraph.Plan = buildgraph.plan(a, m1)
+    var p2: buildgraph.Plan = buildgraph.plan(a, m2)
+
+    test.eq_str(c, rep, "ascending hashes: first", buildgraph.module_name(m1, buildgraph.plan_at(p1, 0)), "first")
+    test.eq_str(c, rep, "descending hashes: still first", buildgraph.module_name(m2, buildgraph.plan_at(p2, 0)), "first")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn identical_content_shares_a_hash_and_that_is_visible() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // Two byte-identical modules hash the same, so an edge to that hash names both.
+    let src: str = "jestyr-manifest/v1\nmodule app zzz\n  import twin aaa\nmodule twin aaa\nmodule clone aaa\n"
+    var m: buildgraph.Manifest = buildgraph.parse_manifest(a, src)
+
+    test.is_true(c, rep, "ambiguity is reportable", buildgraph.hash_is_ambiguous(m, "aaa"))
+    test.is_false(c, rep, "and a unique hash is not", buildgraph.hash_is_ambiguous(m, "zzz"))
+    test.eq_i64(c, rep, "resolve takes the first", buildgraph.resolve(m, "aaa") as i64, 1)
+
+    // It still orders: either twin is a valid predecessor, which is why this is a query
+    // rather than an error.
+    var p: buildgraph.Plan = buildgraph.plan(a, m)
+    test.is_false(c, rep, "no cycle", buildgraph.has_cycle(p))
+    test.eq_usize(c, rep, "all three ordered", buildgraph.plan_len(p), 3)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn an_unresolvable_edge_is_skipped_not_fatal() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // A partial manifest of one subtree legitimately pins a module it does not contain.
+    let src: str = "jestyr-manifest/v1\nmodule app aaa\n  import missing qqq\n"
+    var m: buildgraph.Manifest = buildgraph.parse_manifest(a, src)
+    var p: buildgraph.Plan = buildgraph.plan(a, m)
+
+    test.is_true(c, rep, "parsed", buildgraph.parsed(m))
+    test.is_false(c, rep, "no cycle", buildgraph.has_cycle(p))
+    test.eq_usize(c, rep, "the module still orders", buildgraph.plan_len(p), 1)
+    // Completeness is the caller's question, and it is answerable.
+    test.eq_i64(c, rep, "the edge is visibly dangling", buildgraph.resolve(m, "qqq") as i64, 0 - 1)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn malformed_manifests_are_refused_with_the_line() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // A wrong version header. A manifest is a machine artifact — the handshake is the
+    // whole point of versioning it.
+    var m1: buildgraph.Manifest = buildgraph.parse_manifest(a, "jestyr-manifest/v2\nmodule a aaa\n")
+    test.is_false(c, rep, "wrong version refused", buildgraph.parsed(m1))
+    test.eq_str(c, rep, "and says so", buildgraph.error_text(m1), "not a jestyr-manifest/v1: jestyr-manifest/v2")
+
+    // An import with no module to attach to would otherwise be a SILENTLY DROPPED EDGE —
+    // which produces a build order that compiles a consumer before its provider, the
+    // exact failure this module exists to prevent.
+    var m2: buildgraph.Manifest = buildgraph.parse_manifest(a, "jestyr-manifest/v1\n  import lib bbb\n")
+    test.is_false(c, rep, "orphan import refused", buildgraph.parsed(m2))
+
+    // A line with a keyword and no operands.
+    var m3: buildgraph.Manifest = buildgraph.parse_manifest(a, "jestyr-manifest/v1\nmodule a\n")
+    test.is_false(c, rep, "missing hash refused", buildgraph.parsed(m3))
+
+    // A word nothing recognizes.
+    var m4: buildgraph.Manifest = buildgraph.parse_manifest(a, "jestyr-manifest/v1\nprovides a aaa\n")
+    test.is_false(c, rep, "unknown keyword refused", buildgraph.parsed(m4))
+
+    // Empty input is not a valid manifest either — a consumer must never confuse "no
+    // modules" with "the tool did not run".
+    var m5: buildgraph.Manifest = buildgraph.parse_manifest(a, "")
+    test.is_false(c, rep, "empty refused", buildgraph.parsed(m5))
+
+    // The positive control: the well-formed version of the same shape parses.
+    var m6: buildgraph.Manifest = buildgraph.parse_manifest(a, "jestyr-manifest/v1\nmodule a aaa\n  import lib bbb\n")
+    test.is_true(c, rep, "positive control", buildgraph.parsed(m6))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_final_line_without_a_newline_still_parses() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // Text that has been trimmed, or read from a source that dropped the terminator.
+    // Losing the last module would silently drop a build step.
+    var m: buildgraph.Manifest = buildgraph.parse_manifest(a, "jestyr-manifest/v1\nmodule a aaa\nmodule b bbb")
+    test.is_true(c, rep, "parsed", buildgraph.parsed(m))
+    test.eq_usize(c, rep, "both modules", buildgraph.module_count(m), 2)
+    test.eq_str(c, rep, "the last one survived", buildgraph.module_name(m, 1), "b")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn the_plan_renders_and_overflow_is_visible() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var braw: *mut u8 = alloc(u8, BUF_CAP)
+    var buf: []u8 = slice(u8, braw, BUF_CAP)
+    var sk: sink.Sink = sink.new()
+
+    var m: buildgraph.Manifest = buildgraph.parse_manifest(a, chain())
+    var p: buildgraph.Plan = buildgraph.plan(a, m)
+    buildgraph.render_plan(sk, buf, m, p)
+    test.eq_golden(c, rep, "plan", sink.view(sk, buf), "1. core\n2. lib\n3. app\n")
+
+    // A cyclic graph renders the cycle instead of an order.
+    var sk2: sink.Sink = sink.new()
+    var b2: *mut u8 = alloc(u8, BUF_CAP)
+    var buf2: []u8 = slice(u8, b2, BUF_CAP)
+    var mc: buildgraph.Manifest = buildgraph.parse_manifest(a, "jestyr-manifest/v1\nmodule a aaa\n  import b bbb\nmodule b bbb\n  import a aaa\n")
+    var pc: buildgraph.Plan = buildgraph.plan(a, mc)
+    buildgraph.render_plan(sk2, buf2, mc, pc)
+    test.eq_golden(c, rep, "cycle", sink.view(sk2, buf2), "cycle: a\n")
+
+    // Unguarded into a buffer that cannot hold it: every number is true and the output is
+    // still a build order cut in half. Only `overflowed` says so.
+    var b3: *mut u8 = alloc(u8, 5)
+    var buf3: []u8 = slice(u8, b3, 5)
+    var sk3: sink.Sink = sink.new()
+    buildgraph.render_plan(sk3, buf3, m, p)
+    test.is_true(c, rep, "THE signal", sink.overflowed(sk3))
+    test.is_false(c, rep, "positive control", sink.overflowed(sk))
+
+    free_ptr(b3)
+    free_ptr(b2)
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

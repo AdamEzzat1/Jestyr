@@ -1,0 +1,403 @@
+// std/buildgraph.jtr — the module graph as data: parse a manifest, order the build,
+// name the cycle.
+//
+// TIER: `std` (allocates; no OS). Nothing here reads a file — a `Manifest` is parsed from
+// text you hand it, for the same reason `std/cli` parses an `Args` you hand it: the input
+// is the caller's, and a library that fetched its own could not be tested without a
+// filesystem.
+//
+// ─── This is NOT a package manager, and the distinction is the design ─────────
+//
+// `ROADMAP.md` calls a package manager ecosystem-premature and it is right. What was
+// actually missing is smaller and underneath it: the boring graph utilities every build
+// tool needs before dependency RESOLUTION is even a question. Fetching, version solving,
+// registries and lockfile writing are all downstream of "what depends on what, in what
+// order, and is it acyclic" — and that part is answerable today, from an artifact the
+// compiler already emits.
+//
+// ─── It consumes what `jestyrc` already produces ──────────────────────────────
+//
+// `Modules::render_manifest` emits `jestyr-manifest/v1`: one `module <name> <hash>` line
+// per module, each followed by indented `import <binding> <hash>` lines. That is the
+// content-hash DAG, already deterministic and already order-independent (imports are
+// sorted by binding). So this module invents no format. It parses the one the compiler
+// commits to, which is what makes a Jestyr-side build tool able to check the Rust-side
+// compiler's own build graph rather than a parallel description of it.
+//
+// **Imports name their target by HASH, not by name.** That is the manifest's design and it
+// is the right one — a hash edge cannot drift when a module is renamed — but it means
+// resolving an edge is a lookup, and two modules with byte-identical content share a hash.
+// `resolve` returns the FIRST match and `hash_is_ambiguous` reports the case, because
+// silently picking one of two identical modules is fine for ordering and would be wrong to
+// hide from a caller doing anything else.
+//
+// ─── Order is deterministic, and not by hash ──────────────────────────────────
+//
+// The plan is a depth-first post-order over modules **in manifest order**, so the output
+// depends only on the manifest's text — not on hash values, not on iteration order of any
+// map. Sorting by hash would also be deterministic and would be wrong: it would reshuffle
+// the entire build order every time any module's content changed, which makes a build log
+// undiffable for no benefit.
+//
+// A dependency comes before its dependents. That is the order a build executes in, and it
+// is the only thing a "build plan" has to get right.
+//
+// ─── A cycle is reported, not survived ────────────────────────────────────────
+//
+// `plan` sets `has_cycle` and names a module on the cycle. It does not return a partial
+// order alongside it: a build order for a graph that has no valid order is a lie, and a
+// caller that ignored the flag would run it. The count of ordered modules is therefore 0
+// when a cycle exists, which is the shape that makes ignoring the flag harmless.
+//
+// Run the tests:  jestyrc test examples/std/buildgraph_test.jtr
+// Worked example: jestyrc run examples/std/buildgraph_demo.jtr
+
+import "list"
+import "sink"
+import "str"
+
+const NL: i32 = 10
+const SP: i32 = 32
+
+// ---------------------------------------------------------------------- manifest
+
+// A parsed `jestyr-manifest/v1`. Names and hashes live in one arena; `mods` holds six
+// `i32`s per module and `imps` four per import — the same concatenation shape
+// `std/diag`'s `SourceMap` and `std/cli`'s `Args` use, and for the same reason: a
+// `List(String)` would leak, because the field auto-drop recurses into droppable FIELDS
+// and `String` is a primitive with a manual `string_free`.
+pub struct Manifest {
+    text: String,
+    // per module: name_s, name_e, hash_s, hash_e, imp_start, imp_count
+    mods: List(i32),
+    // per import: binding_s, binding_e, hash_s, hash_e
+    imps: List(i32),
+    es: usize,
+    ee: usize,
+}
+
+impl Drop for Manifest {
+    fn drop(mut self) {
+        string_free(self.text)
+    }
+}
+
+// `true` if the text parsed. `error_text` is non-empty exactly when this is false.
+pub fn parsed(read m: Manifest) -> bool {
+    return m.ee == m.es
+}
+
+pub fn error_text(read m: Manifest) -> str {
+    let v: str = string_view(m.text)
+    return v[m.es .. m.ee]
+}
+
+pub fn module_count(read m: Manifest) -> usize {
+    return list.len(i32, m.mods) / 6
+}
+
+pub fn module_name(read m: Manifest, i: usize) -> str {
+    let v: str = string_view(m.text)
+    return v[list.get(i32, m.mods, i * 6) as usize .. list.get(i32, m.mods, i * 6 + 1) as usize]
+}
+
+pub fn module_hash(read m: Manifest, i: usize) -> str {
+    let v: str = string_view(m.text)
+    return v[list.get(i32, m.mods, i * 6 + 2) as usize .. list.get(i32, m.mods, i * 6 + 3) as usize]
+}
+
+pub fn import_count(read m: Manifest, i: usize) -> usize {
+    return list.get(i32, m.mods, i * 6 + 5) as usize
+}
+
+fn import_base(read m: Manifest, i: usize, j: usize) -> usize {
+    return (list.get(i32, m.mods, i * 6 + 4) as usize + j) * 4
+}
+
+pub fn import_binding(read m: Manifest, i: usize, j: usize) -> str {
+    let b: usize = import_base(m, i, j)
+    let v: str = string_view(m.text)
+    return v[list.get(i32, m.imps, b) as usize .. list.get(i32, m.imps, b + 1) as usize]
+}
+
+pub fn import_hash(read m: Manifest, i: usize, j: usize) -> str {
+    let b: usize = import_base(m, i, j)
+    let v: str = string_view(m.text)
+    return v[list.get(i32, m.imps, b + 2) as usize .. list.get(i32, m.imps, b + 3) as usize]
+}
+
+// The module a hash names, or -1. See the header on why edges are hashes.
+pub fn resolve(read m: Manifest, read h: str) -> isize {
+    var i: usize = 0
+    for i < module_count(m) {
+        if str.eq(module_hash(m, i), h) { return i as isize }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Two modules with byte-identical content share a hash, so an edge to that hash names
+// both. Harmless for ordering — either is a valid predecessor — and worth being able to
+// ask about rather than discovering later.
+pub fn hash_is_ambiguous(read m: Manifest, read h: str) -> bool {
+    var n: usize = 0
+    var i: usize = 0
+    for i < module_count(m) {
+        if str.eq(module_hash(m, i), h) { n = n + 1 }
+        i = i + 1
+    }
+    return n > 1
+}
+
+fn fail(mut m: Manifest, read what: str, read detail: str) {
+    if m.ee != m.es { return }              // the FIRST error, not the last
+    let v0: str = string_view(m.text)
+    m.es = v0.len
+    string_push(m.text, what)
+    string_push(m.text, detail)
+    let v1: str = string_view(m.text)
+    m.ee = v1.len
+}
+
+// Append `s` to the arena and record its slice as two entries in `dst`.
+fn push_slice(mut m: Manifest, mut dst: List(i32), read s: str) {
+    let v0: str = string_view(m.text)
+    let a: usize = v0.len
+    string_push(m.text, s)
+    let v1: str = string_view(m.text)
+    list.push(i32, dst, a as i32)
+    list.push(i32, dst, v1.len as i32)
+}
+
+// The word starting at `at`, and where it ends. Words are space-delimited; the manifest
+// has no quoting, because a module name is an identifier and a hash is hex.
+fn word_end(read line: str, at: usize) -> usize {
+    var k: usize = at
+    for k < line.len {
+        if (line[k] as i32) == SP { return k }
+        k = k + 1
+    }
+    return line.len
+}
+
+fn skip_spaces(read line: str, at: usize) -> usize {
+    var k: usize = at
+    for k < line.len {
+        if (line[k] as i32) != SP { return k }
+        k = k + 1
+    }
+    return line.len
+}
+
+// Parse `jestyr-manifest/v1`.
+//
+// The grammar, in full:
+//
+//   jestyr-manifest/v1
+//   module <name> <hash>
+//     import <binding> <hash>
+//     ...
+//
+// An `import` line before any `module` line is an error rather than a silently dropped
+// edge — a manifest that lost a dependency would produce a build order that compiles a
+// consumer before its provider, which is exactly the failure this module exists to
+// prevent. Unknown leading words are likewise errors: a manifest is a machine artifact,
+// so a line nothing recognizes means the version handshake was wrong, not that there is
+// something to skip.
+pub fn parse_manifest(read a: Allocator, read text: str) -> Manifest {
+    var m: Manifest = Manifest{ text: string_new(), mods: list.make(i32, a), imps: list.make(i32, a), es: 0, ee: 0 }
+    var ls: usize = 0
+    var k: usize = 0
+    var seen_header: bool = false
+    var cur: isize = 0 - 1
+    for k <= text.len {
+        var at_end: bool = false
+        if k == text.len { at_end = true }
+        var eol: bool = at_end
+        if at_end == false {
+            if (text[k] as i32) == NL { eol = true }
+        }
+        if eol == false {
+            k = k + 1
+            continue
+        }
+        let line: str = text[ls .. k]
+        ls = k + 1
+        k = k + 1
+        if line.len == 0 { continue }
+        if seen_header == false {
+            if str.eq(line, "jestyr-manifest/v1") == false {
+                fail(m, "not a jestyr-manifest/v1: ", line)
+                return m
+            }
+            seen_header = true
+            continue
+        }
+        let s0: usize = skip_spaces(line, 0)
+        if s0 >= line.len { continue }
+        let w0e: usize = word_end(line, s0)
+        let kw: str = line[s0 .. w0e]
+        let s1: usize = skip_spaces(line, w0e)
+        let w1e: usize = word_end(line, s1)
+        let a1: str = line[s1 .. w1e]
+        let s2: usize = skip_spaces(line, w1e)
+        let w2e: usize = word_end(line, s2)
+        let a2: str = line[s2 .. w2e]
+        if a1.len == 0 or a2.len == 0 {
+            fail(m, "malformed line: ", line)
+            return m
+        }
+        if str.eq(kw, "module") {
+            push_slice(m, m.mods, a1)
+            push_slice(m, m.mods, a2)
+            list.push(i32, m.mods, (list.len(i32, m.imps) / 4) as i32)
+            list.push(i32, m.mods, 0)
+            cur = (list.len(i32, m.mods) / 6) as isize - 1
+            continue
+        }
+        if str.eq(kw, "import") {
+            if cur < 0 {
+                fail(m, "import before any module: ", line)
+                return m
+            }
+            push_slice(m, m.imps, a1)
+            push_slice(m, m.imps, a2)
+            let cb: usize = (cur as usize) * 6 + 5
+            list.set(i32, m.mods, cb, list.get(i32, m.mods, cb) + 1)
+            continue
+        }
+        fail(m, "unknown line: ", line)
+        return m
+    }
+    if seen_header == false {
+        fail(m, "empty input: ", "expected a jestyr-manifest/v1 header")
+    }
+    return m
+}
+
+// -------------------------------------------------------------------- build plan
+
+// A build order, or the cycle that means there isn't one.
+//
+// `order` holds module indices, dependencies first. When `cycle >= 0` it is EMPTY — see
+// the header: a partial order for a cyclic graph is a lie, and emptying it is what makes
+// a caller who ignores `has_cycle` harmless rather than wrong.
+pub struct Plan {
+    order: List(i32),
+    state: List(i32),          // 0 unvisited, 1 in progress, 2 done
+    cycle: i32,
+}
+
+pub fn plan_len(read p: Plan) -> usize {
+    return list.len(i32, p.order)
+}
+
+pub fn plan_at(read p: Plan, i: usize) -> usize {
+    return list.get(i32, p.order, i) as usize
+}
+
+pub fn has_cycle(read p: Plan) -> bool {
+    return p.cycle >= 0
+}
+
+// A module that lies on the cycle, or -1. One, not the whole ring: naming a participant
+// is what a caller needs to start looking, and reconstructing the full ring costs a
+// parent chain this pass has no other use for.
+pub fn cycle_module(read p: Plan) -> isize {
+    return p.cycle as isize
+}
+
+// Depth-first post-order from `i`. Iterative rather than recursive: a manifest is
+// untrusted input and a deep chain would otherwise be a stack overflow rather than a
+// diagnostic — the same reason the parser carries a depth cap.
+fn visit(mut p: Plan, read m: Manifest, start: usize, read a: Allocator) {
+    var stack: List(i32) = list.make(i32, a)
+    var phase: List(i32) = list.make(i32, a)      // 0 = enter, 1 = leave
+    list.push(i32, stack, start as i32)
+    list.push(i32, phase, 0)
+    for list.len(i32, stack) > 0 {
+        let top: usize = list.len(i32, stack) - 1
+        let node: usize = list.get(i32, stack, top) as usize
+        let ph: i32 = list.get(i32, phase, top)
+        list.truncate(i32, stack, top)
+        list.truncate(i32, phase, top)
+        if ph == 1 {
+            list.set(i32, p.state, node, 2)
+            list.push(i32, p.order, node as i32)
+            continue
+        }
+        let st: i32 = list.get(i32, p.state, node)
+        if st == 2 { continue }
+        if st == 1 {
+            if p.cycle < 0 { p.cycle = node as i32 }
+            continue
+        }
+        list.set(i32, p.state, node, 1)
+        // Schedule the leave first, so it runs after every child.
+        list.push(i32, stack, node as i32)
+        list.push(i32, phase, 1)
+        // Children in REVERSE manifest order, so they pop in manifest order — which is
+        // what makes the plan a function of the manifest's text and nothing else.
+        let n: usize = import_count(m, node)
+        var j: usize = n
+        for j > 0 {
+            j = j - 1
+            let t: isize = resolve(m, import_hash(m, node, j))
+            if t >= 0 {
+                list.push(i32, stack, t as i32)
+                list.push(i32, phase, 0)
+            }
+        }
+    }
+    list.free(i32, phase)
+    list.free(i32, stack)
+}
+
+// The build order for `m`: every dependency before every dependent.
+//
+// An import whose hash resolves to nothing is SKIPPED rather than refused. A manifest can
+// legitimately pin a module it does not itself contain — that is what a partial manifest
+// of one subtree looks like — and refusing would make this unusable for exactly the
+// incremental case a build tool wants. `resolve` returning -1 is the caller's to check
+// when completeness matters.
+pub fn plan(read a: Allocator, read m: Manifest) -> Plan {
+    var p: Plan = Plan{ order: list.make(i32, a), state: list.make(i32, a), cycle: 0 - 1 }
+    var i: usize = 0
+    for i < module_count(m) {
+        list.push(i32, p.state, 0)
+        i = i + 1
+    }
+    var r: usize = 0
+    for r < module_count(m) {
+        if list.get(i32, p.state, r) == 0 { visit(p, m, r, a) }
+        r = r + 1
+    }
+    if p.cycle >= 0 { list.truncate(i32, p.order, 0) }
+    return p
+}
+
+// ---------------------------------------------------------------------- rendering
+
+// The plan as text, into a caller `Sink`. Returns bytes written — **check
+// `sink.overflowed`**; a truncated build order reads as a complete one.
+//
+// Structured data first, rendered at the edge: `plan` returns indices and this turns them
+// into lines. A tool that wanted JSON, or to execute the order, uses the indices.
+@no_alloc @no_os pub fn render_plan(mut sk: Sink, mut buf: []u8, read m: Manifest, read p: Plan) -> usize {
+    let before: usize = sink.written(sk)
+    if has_cycle(p) {
+        sink.put_str(sk, buf, "cycle: ")
+        sink.put_str(sk, buf, module_name(m, p.cycle as usize))
+        sink.put_nl(sk, buf)
+        return sink.written(sk) - before
+    }
+    var i: usize = 0
+    for i < plan_len(p) {
+        sink.put_usize(sk, buf, i + 1)
+        sink.put_str(sk, buf, ". ")
+        sink.put_str(sk, buf, module_name(m, plan_at(p, i)))
+        sink.put_nl(sk, buf)
+        i = i + 1
+    }
+    return sink.written(sk) - before
+}

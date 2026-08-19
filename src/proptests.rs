@@ -312,6 +312,83 @@ mod fallible_return {
     }
 }
 
+/// **`std/buildgraph` against a manifest the compiler actually emitted.**
+///
+/// Every other test of that module feeds it a hand-written manifest, which proves the
+/// parser handles the format *as documented*. This one closes the loop the module exists
+/// for: `Modules::render_manifest` renders a real program's content-hash DAG, the
+/// Jestyr-built `jplan` reads it, and the order it produces has to put the dependency
+/// first. A format drift on either side fails here and nowhere else — the hand-written
+/// fixtures would keep passing against a manifest the compiler no longer writes.
+#[cfg(all(test, feature = "c-oracle"))]
+mod buildgraph_against_the_real_manifest {
+    use super::*;
+
+    #[test]
+    fn jplan_orders_a_manifest_the_compiler_rendered() {
+        let dir = std::env::temp_dir().join("jestyr_buildgraph_real");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("lib.jtr"),
+            "pub fn f(x: i32) -> i32 { return x + 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("main.jtr"),
+            "import \"lib\"\nfn main() -> i32 { return lib.f(2) }\n",
+        )
+        .unwrap();
+
+        // The compiler's own manifest — not a fixture written to match it.
+        let prog = crate::module::load(dir.join("main.jtr").to_str().unwrap());
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "fixture loads: {:?}", prog.diags);
+        let manifest = prog.modules.render_manifest();
+        assert!(
+            manifest.starts_with("jestyr-manifest/v1\n"),
+            "the format this module parses changed:\n{manifest}"
+        );
+        let mpath = dir.join("real.manifest");
+        std::fs::write(&mpath, &manifest).unwrap();
+
+        let exe = super::c_oracle::build_exe("examples/std/buildgraph_demo.jtr");
+        let out = std::process::Command::new(&exe).arg(mpath.to_str().unwrap()).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+
+        // `main` imports `lib`, so `lib` builds first. Asserting the whole rendering
+        // rather than "contains lib" — a plan that emitted only one module, or emitted
+        // them in the manifest's own order, would pass a containment check.
+        // `print_str` appends a terminator of its own, so the buffer's trailing newline
+        // arrives doubled — the line-oriented print intrinsic `std/writer`'s header
+        // documents. Compared without it rather than pinning the artefact.
+        assert_eq!(
+            stdout.trim_end(),
+            "1. lib\n2. main",
+            "unexpected plan for the real manifest"
+        );
+        assert_eq!(out.status.code(), Some(0), "an acyclic graph must exit 0");
+
+        // Anti-vacuity: the same tool on a cyclic manifest must disagree. Without this,
+        // an implementation that printed a fixed string would pass the assertion above.
+        let cyc = dir.join("cyc.manifest");
+        std::fs::write(
+            &cyc,
+            "jestyr-manifest/v1\nmodule a aaa\n  import b bbb\nmodule b bbb\n  import a aaa\n",
+        )
+        .unwrap();
+        let out2 = std::process::Command::new(&exe).arg(cyc.to_str().unwrap()).output().unwrap();
+        assert_eq!(out2.status.code(), Some(1), "a cycle must exit 1");
+        assert!(
+            String::from_utf8_lossy(&out2.stderr).contains("cycle:"),
+            "the cycle goes to stderr so a pipe of the order stays clean"
+        );
+        assert!(
+            String::from_utf8_lossy(&out2.stdout).trim().is_empty(),
+            "nothing may reach stdout when there is no valid order"
+        );
+    }
+}
+
 /// **Intrinsic shadowing.** A function whose name is a cgen intrinsic is silently
 /// replaced by that intrinsic at every UNQUALIFIED call, arguments and all.
 ///
@@ -9444,7 +9521,7 @@ mod c_oracle {
 
     /// Compile `rel` to an executable and return its path (does NOT run it) — for
     /// programs that take command-line arguments, like the self-hosting lexer.
-    fn build_exe(rel: &str) -> std::path::PathBuf {
+    pub(super) fn build_exe(rel: &str) -> std::path::PathBuf {
         let prog = crate::module::load(rel);
         assert!(!prog.diags.iter().any(|d| d.is_error()), "load errors in {rel}: {:?}", prog.diags);
         let (info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
@@ -15288,6 +15365,9 @@ fn main() -> i32 {
         "cli.jtr",
         "cli_test.jtr",
         "cli_demo.jtr",
+        "buildgraph.jtr",
+        "buildgraph_test.jtr",
+        "buildgraph_demo.jtr",
     ];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
@@ -16212,6 +16292,7 @@ fn main() -> i32 {
             ("cstring_test", 4),
             ("diag_test", 15),
             ("cli_test", 11),
+            ("buildgraph_test", 10),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");
