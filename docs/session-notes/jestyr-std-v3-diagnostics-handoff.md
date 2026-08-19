@@ -1,17 +1,99 @@
-# Std v3 — structured diagnostics, the error-model rules it forced, and `@cfg`
+# Std v3 — Tier 3 complete, `@cfg`, and the ownership rules it forced
 
-Cold-start note. **What was built and what it measured (§1), what the build turned up in
-the compiler (§2), what is still open (§3), traps (§4), suggested order (§5).**
+Cold-start note. **§0 is what to do next — read it first.** Then: what was built (§1), what
+the build turned up in the compiler (§2), what is still open (§3), traps (§4), order (§5).
 
-Branch `claude/std-v3-systems-language-6d8931`. Baseline before anything changed:
+**Everything is on `master` (`fe5cfb3`).** `git pull` and go; there is no branch to chase.
 
 ```bash
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1228 passed, 0 failed, 3 ignored.** After this work: **1252 passed, 0 failed, 3 ignored**
-(+1 module-boundary driver test, +6 must-use, +7 fallible-return, +10 `@cfg`; `io_suites_pass` grew a
-`diag_test` entry rather than a new test).
+**1228 passed at the start of this work; 1262 passed, 0 failed, 3 ignored now.** The 3
+ignored are the deliberate slow numeric sweeps, not breakage.
+
+---
+
+## §0. START HERE — what is left, measured rather than inherited
+
+**Tier 3 is 8 of 8. Done.** `diag`, `cli`, `buildgraph`, `sysdir`+`walk`, `bitset`,
+`json`, `memprof`, `runtime`. Every one has a real consumer and a suite.
+
+> A note if you are working from an older summary: **§1.4's `walk` IS built** —
+> `examples/std/walk.jtr` + `walk_test.jtr`, 7 tests, with the sort `sysdir` refuses to do,
+> a fn-pointer + `ctx` visitor, and `Fs` as the capability (a denied walk reports
+> `refused=1`, with the `host()` positive control beside it). Any text saying "walk is
+> unbuilt" predates commit `98f4bac`.
+
+### The one blocking debt
+
+**The `@cfg` port mirror.** `cgen.jtr` does not understand `@cfg`, so three files are
+excluded from byte-identity verification: `cfg_platform.jtr`, `sysdir.jtr`, `walk.jtr`
+(transitively — it imports `sysdir`). **`sys` is therefore unblocked for `jestyrc` and NOT
+for `jc`.** Do this before writing more `sys`, or `sys` becomes the first thing the
+self-hosted compiler cannot build — which quietly breaks the property everything else here
+rests on.
+
+Scope: mirror the guard emission at five sites in `examples/std/cgen.jtr` (header include,
+`extern "c"` prototype, non-generic fn prototype, non-generic fn definition, monomorphized
+instance), then reseed. `cfg_is_not_yet_in_the_byte_identity_allowlist` fails the moment
+someone allowlists a `@cfg` file without the mirror.
+
+### Known bugs, open
+
+| Bug | State |
+|---|---|
+| **Intrinsic shadowing** — a fn named for a cgen intrinsic is silently replaced at every UNQUALIFIED call, arguments discarded | typeck WARNS; the real fix (cgen prefers the user's fn) is an emission change in a closure module → mirror + reseed + golden churn. `lexer.str_eq` and `set.contains` are grandfathered and pinned by `intrinsic_shadowing_is_confined_to_two_names` |
+| **`Self` in a trait method parameter** | Parses ✓, type-checks ✓ (as `Opaque("Self")`), and **cgen refuses**: *"the C backend cannot lower the external type `Self` yet"*. A diagnostic, not a miscompile — but `check` passes and `run` fails, so it is still the degrades-to-gcc class |
+| **Move-only port mirror** | Not owed today (the corpus trips the rule zero times, so both sides agree). Owed the moment a corpus file trips it |
+| **`.jtr` trap:** a `\u00XX` escape in a string literal passes through to the emitted C verbatim; C rejects a universal character name below 0x20 | Accepted by the front end, fails in gcc. Use a byte-append helper |
+
+### §2.4 — trait / generic expressiveness. THREE separate gaps, each measured
+
+Probed this session; the state is more precise than "untouched".
+
+1. **Multi-bounds do not parse.** `fn f[T: Hash + Eq]` → `expected ], found +` at the `+`.
+   A parser change plus the port's parser mirror — and **the P2 golden has no allowlist**,
+   so the mirror is not optional. This is the one Collections v2 bent around, and it is why
+   `hashmap` stores fn-pointer hash/eq instead of a bound.
+2. **`Self` in a trait parameter is a CGEN gap, not a parse or typeck gap** — see the bug
+   table. Fixing it means teaching cgen to substitute the impl target for `Self` in a
+   method signature, which the impl-body work already does for `self`.
+3. **Generic aliases are refused by design**: `fn Stack(comptime T: type) -> type { return
+   list.List(T) }` → *"generic-struct constructor must `return struct { … }`"*. Combined
+   with "a generic type cannot hold a pointer to another generic type", there is still no
+   way to newtype a container — which is why `std/set` is free functions over
+   `HashMap(T, bool)` rather than a `Set(T)`.
+
+Do (1) first if Collections v3 is coming; do (2) first if a trait needs `Self`-typed
+comparison, which is what a `MapKey` trait would want.
+
+### §2.6 — memory init / unsafe contracts. Genuinely untouched
+
+**There is no uninitialized-memory facility at all** — no `uninit`, no `MaybeUninit`, no
+`alloc_uninit`, nothing in typeck or cgen. Containers therefore need a real value for every
+slot, which is why `hashmap` carries fake defaults and why `get(…, take default: V)` exists
+at all.
+
+What it needs, in order: an `uninit(T, n)`-shaped allocation, an initialize-element
+operation, a drop-the-initialized-prefix rule, and the partial-initialization destructor
+question. `unsafe` as a permission marker already exists and is fully enforced (the unsafe
+ladder is complete), so the contract half is there — the *primitive* is not.
+
+### §2.7 — concurrency with ownership. Measured, and smaller than it looks
+
+`std/sync` already does two of the things this row asks for:
+
+* **`channel_send(…, take v: T)`** — moving a value into a channel already transfers
+  ownership, and with this session's `droppable_ty` fix that now covers generic containers
+  too.
+* **`mutex_with(m, op: fn(*mut T))`** is a SCOPED-CALLBACK lock: there is no `Guard` value,
+  so "non-copyable mutex guards" is moot in the current shape — the lock cannot outlive the
+  callback because it is never a value a caller holds. That is a sound design, not a gap.
+
+What is actually missing: a `Send`-like marker (nothing stops a non-thread-safe handle
+crossing `spawn`), join handles with typed results, and channel close semantics. The
+`Send` question is the real one and it is a type-system feature, not a library one.
 
 ---
 
@@ -176,10 +258,12 @@ green, `selfhost_fixpoint_full` green, seed unchanged.
 
 ## §3. OPEN — with what is known
 
-### §3.1 — `string_view(x).len` emits invalid C. NOT FIXED, fixture below
+### §3.1 — `string_view(x).len` emitted invalid C. **FIXED** — see §3.-4
 
-Recorded in the previous handoff as a `.jtr` **subset trap for closure modules**. It is not:
-it is a bug in the **reference** compiler, and it bites any module holding a `String`.
+Recorded in the previous handoff as a `.jtr` **subset trap for closure modules**. It was
+not: it was a missing row in `string_intrinsic_ret`, so the call typed as `Unknown` and
+cgen emitted `.j_len` against `JestyrStr`. Fixed, mirrored in the port, reseeded, and pinned
+by `string_intrinsic_types`. **The text below is the ORIGINAL report, kept for its shape.**
 
 ```jtr
 fn main() -> i32 {
@@ -357,7 +441,7 @@ ownership being real, and it is now the first thing the module's header explains
 `@cfg` exclusion is transitive. `bitset`, `memprof` and `runtime` are allowlisted and were
 byte-identical first try.
 
-### §3.-1 — Tier 3 §1.2/§1.3/§1.4 — three modules, and where §1.4 stops
+### §3.-1 — Tier 3 §1.2/§1.3/§1.4 — three modules (§1.4 was FINISHED later, in §3.-2)
 
 `std/cli` (11 tests), `std/buildgraph` (10), `std/sysdir` (5), each with a real consumer.
 `cli_demo` is `jlint` — parses a file with the ported parser and reports through
@@ -489,16 +573,27 @@ needs to tell them apart.
 
 ## §5. Suggested order from here
 
-1. **The `@cfg` port mirror** (§3.0) — `cgen.jtr` + reseed. Do it BEFORE writing `sys`, or `sys` is the first module `jc` cannot build.
-2. **`string_view(x).len`** (§3.1) — smallest fix with a fixture already written, and it
-   retires a workaround in three places.
-3. **Wire `std/diag` into `cgen.jtr`'s driver** (§1) — the consumer that makes the module
-   load-bearing rather than available. Reseed + golden run; budget it as its own increment.
-4. **Must-use for handles** (brief §2.1) — the un-`finish`ed `Writer` half. This is the
-   move-only/linear work, and `file.Writer` is the canary with the argument already written
-   down in its header.
-5. **CLI app kit** (brief §1.2), then the formatter (brief §5 item 4), which is what stresses
-   parser spans against `std/diag` before LSP complexity.
+1. **The `@cfg` port mirror** (§0) — `cgen.jtr` + reseed. The one blocking debt: until it
+   lands, `sys` is buildable by `jestyrc` and not by `jc`, and three files sit outside
+   byte-identity verification.
+2. **Wire `std/diag` into `cgen.jtr`'s driver** — the consumer that makes the module
+   load-bearing rather than merely available. The driver today prints
+   `path:line:col: error: …` and stops at the first; `diag_demo.jtr` already shows the
+   upgrade. Closure module, so reseed + golden run; budget it as its own increment.
+3. **Intrinsic shadowing, properly** — cgen prefers the user's function over the intrinsic.
+   Emission change in a closure module: mirror, reseed, golden churn. The warning makes
+   this a known debt rather than a latent one, but `lexer.str_eq` is a live trap until then.
+4. **Pick ONE of §2.4's three gaps** — multi-bounds if Collections v3 is next, `Self`-in-cgen
+   if a trait needs typed comparison. Do not do both at once: the first is a parser change
+   owing a P2 mirror, the second is a cgen change owing a P5 one.
+5. **§2.6's uninit primitive**, which is what would let containers stop carrying fake
+   defaults. Larger than it looks — the partial-initialization destructor rule is the hard
+   part, not the allocation.
 
-Leave the JSON renderer alone until a codec exists; a second hand-written escaper is the
-thing `docs/diagnostics-json.md` already warns is only defensible once.
+Leave named error sets alone until a consumer repeats a multi-member set across modules
+(measured: 40 sites, 18 distinct, largest multi-member repeat is 3 — §3.-3). Leave owning
+error payloads alone until someone is ready for a whole-program ABI change.
+
+The JSON machine renderer for diagnostics is now unblocked — `std/json` exists — but wiring
+it is a second hand-written escaper unless the compiler uses the module, which is a
+cross-language dependency this tree has never taken. Decide that deliberately.
