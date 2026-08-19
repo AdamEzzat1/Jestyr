@@ -1,0 +1,232 @@
+// std/runtime_test.jtr — the unit suite for `std/runtime`.
+//
+// Every case runs on `time.manual()`, which is the point: a runtime whose clock is a
+// parameter can be tested instantly and exactly, and one that reached for the wall clock
+// could only be tested by waiting. No test here takes measurable time even though several
+// of them span "seconds".
+//
+// Run:  jestyrc test examples/std/runtime_test.jtr
+
+import "runtime"
+import "time"
+import "sink"
+import "mem"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 4096
+const CTX_CAP: usize = 256
+
+// The callbacks' shared context: byte 0 is a count, bytes 1.. are a log of the ids that
+// fired, in order, one byte each. A raw block because a fn pointer's context is a raw
+// pointer and there is nothing else it could be.
+fn ctx_new() -> *mut u8 {
+    var p: *mut u8 = alloc(u8, CTX_CAP)
+    for i in 0..CTX_CAP {
+        unsafe { (p + i).* = 0 as u8 }
+    }
+    return p
+}
+
+fn ctx_n(p: *mut u8) -> usize {
+    var b: u8 = 0
+    unsafe { b = p.* }
+    return b as usize
+}
+
+fn ctx_log(p: *mut u8, i: usize) -> i64 {
+    var b: u8 = 0
+    unsafe { b = (p + (1 + i)).* }
+    return b as i64
+}
+
+fn note(ctx: *mut u8, id: i64, now: i64) {
+    let n: usize = ctx_n(ctx)
+    unsafe { (ctx + (1 + n)).* = id as u8 }
+    unsafe { ctx.* = (n + 1) as u8 }
+}
+
+@test fn a_timer_fires_only_once_its_deadline_arrives() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var clk: time.Clock = time.manual(0)
+    var rt: runtime.Runtime = runtime.make(a, clk)
+    var ctx: *mut u8 = ctx_new()
+    runtime.after(rt, 1000, runtime.task(ctx, &note))
+
+    test.eq_usize(c, rep, "one pending", runtime.pending(rt), 1)
+    test.is_false(c, rep, "not idle", runtime.is_idle(rt))
+    test.eq_i64(c, rep, "the deadline is visible", runtime.next_deadline(rt), 1000)
+
+    // Nothing is due yet, and polling must not fire it early — the whole contract.
+    test.eq_i64(c, rep, "nothing fires early", runtime.poll(rt), 0)
+    test.eq_usize(c, rep, "nothing was logged", ctx_n(ctx), 0)
+
+    // Just short of the deadline: still nothing.
+    runtime.advance(rt, 999)
+    test.eq_i64(c, rep, "999 is not 1000", runtime.poll(rt), 0)
+
+    // And exactly at it: fires. `<=` not `<`, which this pins.
+    runtime.advance(rt, 1)
+    test.eq_i64(c, rep, "fires at the deadline", runtime.poll(rt), 1)
+    test.eq_usize(c, rep, "logged once", ctx_n(ctx), 1)
+    test.is_true(c, rep, "idle now", runtime.is_idle(rt))
+    test.eq_i64(c, rep, "no deadline left", runtime.next_deadline(rt), 0 - 1)
+
+    // And it does not fire twice.
+    runtime.advance(rt, 10000)
+    test.eq_i64(c, rep, "fires once only", runtime.poll(rt), 0)
+    test.eq_usize(c, rep, "still one", ctx_n(ctx), 1)
+
+    runtime.free(rt)
+    free_ptr(ctx)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn timers_fire_in_deadline_order_and_ties_break_by_registration() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var clk: time.Clock = time.manual(0)
+    var rt: runtime.Runtime = runtime.make(a, clk)
+    var ctx: *mut u8 = ctx_new()
+
+    // Registered out of deadline order: 300, 100, 200. They must fire 100, 200, 300 —
+    // ids 2, 3, 1.
+    runtime.after(rt, 300, runtime.task(ctx, &note))       // id 1
+    runtime.after(rt, 100, runtime.task(ctx, &note))       // id 2
+    runtime.after(rt, 200, runtime.task(ctx, &note))       // id 3
+    // Two more at the SAME deadline as id 2. Ties break by registration, so 4 then 5 —
+    // not by callback address, which would vary between builds and make this untestable.
+    runtime.after(rt, 100, runtime.task(ctx, &note))       // id 4
+    runtime.after(rt, 100, runtime.task(ctx, &note))       // id 5
+
+    test.eq_i64(c, rep, "earliest deadline", runtime.next_deadline(rt), 100)
+    runtime.advance(rt, 1000)
+    test.eq_i64(c, rep, "all five fire", runtime.poll(rt), 5)
+
+    test.eq_usize(c, rep, "five logged", ctx_n(ctx), 5)
+    test.eq_i64(c, rep, "1st: id 2 (t=100)", ctx_log(ctx, 0), 2)
+    test.eq_i64(c, rep, "2nd: id 4 (t=100, later reg)", ctx_log(ctx, 1), 4)
+    test.eq_i64(c, rep, "3rd: id 5 (t=100, latest reg)", ctx_log(ctx, 2), 5)
+    test.eq_i64(c, rep, "4th: id 3 (t=200)", ctx_log(ctx, 3), 3)
+    test.eq_i64(c, rep, "5th: id 1 (t=300)", ctx_log(ctx, 4), 1)
+
+    runtime.free(rt)
+    free_ptr(ctx)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_cancelled_timer_never_fires_and_the_control_shows_it_would_have() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var clk: time.Clock = time.manual(0)
+    var rt: runtime.Runtime = runtime.make(a, clk)
+    var ctx: *mut u8 = ctx_new()
+
+    let keep: i64 = runtime.after(rt, 100, runtime.task(ctx, &note))
+    let drop: i64 = runtime.after(rt, 100, runtime.task(ctx, &note))
+    test.eq_usize(c, rep, "two pending", runtime.pending(rt), 2)
+
+    test.is_true(c, rep, "cancel reports the change", runtime.cancel(rt, drop))
+    test.is_false(c, rep, "cancelling twice does not", runtime.cancel(rt, drop))
+    test.is_false(c, rep, "nor does an unknown id", runtime.cancel(rt, 999))
+    test.eq_usize(c, rep, "one pending", runtime.pending(rt), 1)
+    test.eq_i64(c, rep, "counted", runtime.cancelled(rt), 1)
+
+    runtime.advance(rt, 100)
+    test.eq_i64(c, rep, "only the survivor fires", runtime.poll(rt), 1)
+    test.eq_usize(c, rep, "one logged", ctx_n(ctx), 1)
+    // THE control: the surviving id is the one that was NOT cancelled. Asserting only
+    // "one fired" would pass if cancellation had killed the wrong timer.
+    test.eq_i64(c, rep, "and it is the kept one", ctx_log(ctx, 0), keep)
+
+    runtime.free(rt)
+    free_ptr(ctx)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_task_scheduled_during_a_poll_waits_for_the_next_one() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var clk: time.Clock = time.manual(0)
+    var rt: runtime.Runtime = runtime.make(a, clk)
+    var ctx: *mut u8 = ctx_new()
+
+    // Two already-due tasks. A single `poll` fires exactly the ones present when it
+    // started — the rule that stops a self-rescheduling task from spinning forever inside
+    // one poll, which is the classic starvation bug.
+    runtime.soon(rt, runtime.task(ctx, &note))
+    runtime.soon(rt, runtime.task(ctx, &note))
+    test.eq_i64(c, rep, "both fire", runtime.poll(rt), 2)
+    test.is_true(c, rep, "idle", runtime.is_idle(rt))
+
+    // `run_until_idle` is the settle operation and is bounded, so even a pathological
+    // zero-delay chain terminates instead of hanging the suite.
+    runtime.soon(rt, runtime.task(ctx, &note))
+    let n: i64 = runtime.run_until_idle(rt, 8)
+    test.eq_i64(c, rep, "settled", n, 1)
+    test.is_true(c, rep, "idle again", runtime.is_idle(rt))
+    test.eq_i64(c, rep, "three in total", runtime.fired(rt), 3)
+
+    runtime.free(rt)
+    free_ptr(ctx)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn the_clock_is_the_only_thing_that_touches_the_world() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // A manual clock is deterministic, and the runtime built on it inherits that: this
+    // whole suite spans "seconds" of simulated time and takes none. That is the property
+    // that would be lost the moment a hidden global runtime or a real sleep appeared.
+    var clk: time.Clock = time.manual(5000)
+    test.is_true(c, rep, "the clock is deterministic", time.is_deterministic(clk))
+
+    var rt: runtime.Runtime = runtime.make(a, clk)
+    var ctx: *mut u8 = ctx_new()
+    // A deadline computed from a start time of 5000, not from zero — the timer is relative
+    // to the clock it was registered against, which is what makes a manual clock usable at
+    // all.
+    runtime.after(rt, 250, runtime.task(ctx, &note))
+    test.eq_i64(c, rep, "absolute deadline", runtime.next_deadline(rt), 5250)
+
+    runtime.advance(rt, 250)
+    test.eq_i64(c, rep, "fires", runtime.poll(rt), 1)
+
+    var braw: *mut u8 = alloc(u8, 128)
+    var buf: []u8 = slice(u8, braw, 128)
+    var s: sink.Sink = sink.new()
+    runtime.render(s, buf, rt)
+    test.eq_str(c, rep, "report", sink.view(s, buf), "fired=1 cancelled=0 pending=0")
+    test.is_false(c, rep, "fits", sink.overflowed(s))
+
+    free_ptr(braw)
+    runtime.free(rt)
+    free_ptr(ctx)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

@@ -1,0 +1,326 @@
+// std/walk_test.jtr — the unit suite for `std/walk`.
+//
+// Walks real directories in this repository, for the same reason `sysdir_test` does: the
+// module exists because the OS's order is unspecified, and a mock would encode one answer
+// and prove nothing. Run from the repository root.
+//
+// The visitor's context is a `*mut u8` pointing at a counter block, which is the shape
+// `mem.Allocator` established and the only one a fn pointer can accumulate through. Each
+// test allocates its own, so no state crosses cases.
+//
+// Run:  jestyrc test examples/std/walk_test.jtr
+
+import "walk"
+import "fs"
+import "str"
+import "path"
+import "sink"
+import "mem"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 8192
+const NAMES_CAP: usize = 4096
+
+// The visitor context: a byte block holding a count and an appended, comma-separated list
+// of the base names seen, so a test can assert ORDER and not merely totals.
+//
+// Bytes 0..8 are the count as eight little-endian bytes; 8.. is the name text. Hand-rolled
+// because a fn pointer's context is a raw pointer and there is nothing else it could be.
+const CTX_COUNT: usize = 0
+const CTX_TEXT: usize = 8
+
+fn ctx_new() -> *mut u8 {
+    var p: *mut u8 = alloc(u8, NAMES_CAP)
+    for i in 0..NAMES_CAP {
+        unsafe { (p + i).* = 0 as u8 }
+    }
+    return p
+}
+
+fn ctx_count(p: *mut u8) -> usize {
+    var n: usize = 0
+    for i in 0..8 {
+        var b: u8 = 0
+        unsafe { b = (p + (CTX_COUNT + (i as usize))).* }
+        n = n + (b as usize) * pow256(i as usize)
+    }
+    return n
+}
+
+fn pow256(k: usize) -> usize {
+    var v: usize = 1
+    for i in 0..k {
+        v = v * 256
+    }
+    return v
+}
+
+fn ctx_set_count(p: *mut u8, n: usize) {
+    var v: usize = n
+    for i in 0..8 {
+        unsafe { (p + (CTX_COUNT + (i as usize))).* = (v % 256) as u8 }
+        v = v / 256
+    }
+}
+
+fn ctx_text_len(p: *mut u8) -> usize {
+    var n: usize = 0
+    for CTX_TEXT + n < NAMES_CAP {
+        var b: u8 = 0
+        unsafe { b = (p + (CTX_TEXT + n)).* }
+        if (b as i32) == 0 { break }
+        n = n + 1
+    }
+    return n
+}
+
+fn ctx_text(p: *mut u8) -> str {
+    let n: usize = ctx_text_len(p)
+    var base: *mut u8 = null
+    unsafe { base = p + CTX_TEXT }
+    let sl: []u8 = slice(u8, base, n)
+    return from_utf8(sl)
+}
+
+fn ctx_append(p: *mut u8, read s: str) {
+    var at: usize = CTX_TEXT + ctx_text_len(p)
+    for i in 0..s.len {
+        if at + 1 >= NAMES_CAP { return }
+        unsafe { (p + at).* = s[i] as u8 }
+        at = at + 1
+    }
+    if at + 1 < NAMES_CAP {
+        unsafe { (p + at).* = 44 as u8 }         // ','
+    }
+}
+
+// Count everything and record each base name, in visit order.
+fn note_entry(ctx: *mut u8, p: str, depth: usize, isd: bool) -> bool {
+    ctx_set_count(ctx, ctx_count(ctx) + 1)
+    ctx_append(ctx, path.base(p))
+    return true
+}
+
+// Count only; used where the name list would be long.
+fn count_only(ctx: *mut u8, p: str, depth: usize, isd: bool) -> bool {
+    ctx_set_count(ctx, ctx_count(ctx) + 1)
+    return true
+}
+
+// Refuse to descend into any directory: returns false for directories, true for files.
+fn prune_dirs(ctx: *mut u8, p: str, depth: usize, isd: bool) -> bool {
+    ctx_set_count(ctx, ctx_count(ctx) + 1)
+    if isd { return false }
+    return true
+}
+
+// Stop the walk at the first file.
+fn stop_at_first_file(ctx: *mut u8, p: str, depth: usize, isd: bool) -> bool {
+    ctx_set_count(ctx, ctx_count(ctx) + 1)
+    if isd { return true }
+    return false
+}
+
+@test fn a_walk_visits_a_directorys_entries_in_sorted_order() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var ctx: *mut u8 = ctx_new()
+    let v: walk.Visitor = walk.visitor(ctx, &note_entry)
+    let r: walk.WalkReport = walk.walk(a, fs.host(), "examples/modules", walk.options(), v)
+
+    test.eq_usize(c, rep, "two files", walk.files(r), 2)
+    test.eq_usize(c, rep, "no subdirectories", walk.dirs(r), 0)
+    test.is_true(c, rep, "complete", walk.complete(r))
+    // BYTE-WISE ASCENDING, and pinned as a sequence rather than a set. `sysdir` returns
+    // OS order and refuses to promise one; this assertion is the entire reason this
+    // module exists on top of it.
+    test.eq_str(c, rep, "sorted order", ctx_text(ctx), "main.jtr,mathx.jtr,")
+    test.eq_usize(c, rep, "visitor saw both", ctx_count(ctx), 2)
+
+    free_ptr(ctx)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_denied_capability_walks_nothing_and_says_so() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var ctx: *mut u8 = ctx_new()
+    let v: walk.Visitor = walk.visitor(ctx, &count_only)
+    let denied: walk.WalkReport = walk.walk(a, fs.denied(), "examples/modules", walk.options(), v)
+
+    test.eq_usize(c, rep, "nothing visited", ctx_count(ctx), 0)
+    test.eq_usize(c, rep, "no files", walk.files(denied), 0)
+    test.eq_usize(c, rep, "refused is reported", walk.refused(denied), 1)
+    test.is_false(c, rep, "and not complete", walk.complete(denied))
+
+    // THE POSITIVE CONTROL. "A denied walk returned nothing" means nothing on its own —
+    // a walk that was simply broken would also return nothing. The identical walk through
+    // `host()` must return everything.
+    var ctx2: *mut u8 = ctx_new()
+    let v2: walk.Visitor = walk.visitor(ctx2, &count_only)
+    let allowed: walk.WalkReport = walk.walk(a, fs.host(), "examples/modules", walk.options(), v2)
+    test.eq_usize(c, rep, "host() sees both", ctx_count(ctx2), 2)
+    test.is_true(c, rep, "and is complete", walk.complete(allowed))
+
+    // A read-only capability still reads: the walk never writes, so denying writes must
+    // not deny it.
+    var ctx3: *mut u8 = ctx_new()
+    let v3: walk.Visitor = walk.visitor(ctx3, &count_only)
+    walk.walk(a, fs.read_only(), "examples/modules", walk.options(), v3)
+    test.eq_usize(c, rep, "read_only() also sees both", ctx_count(ctx3), 2)
+
+    free_ptr(ctx3)
+    free_ptr(ctx2)
+    free_ptr(ctx)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn depth_is_bounded_and_directories_are_counted() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // `examples/` has subdirectories, so depth actually bites here.
+    var shallow: *mut u8 = ctx_new()
+    let v1: walk.Visitor = walk.visitor(shallow, &count_only)
+    let r1: walk.WalkReport = walk.walk(a, fs.host(), "examples", walk.with_depth(walk.options(), 1), v1)
+    test.eq_usize(c, rep, "depth 1 stays at the top", walk.deepest(r1), 1)
+
+    var deep: *mut u8 = ctx_new()
+    let v2: walk.Visitor = walk.visitor(deep, &count_only)
+    let r2: walk.WalkReport = walk.walk(a, fs.host(), "examples", walk.with_depth(walk.options(), 2), v2)
+
+    // Depth 2 must see strictly more than depth 1 — the assertion that fails if
+    // `max_depth` were ignored, which a count-only check on one depth would not catch.
+    test.is_true(c, rep, "depth 2 sees more", ctx_count(deep) > ctx_count(shallow))
+    test.is_true(c, rep, "and goes deeper", walk.deepest(r2) > walk.deepest(r1))
+    test.is_true(c, rep, "subdirectories were found", walk.dirs(r1) > 0)
+
+    free_ptr(deep)
+    free_ptr(shallow)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn returning_false_prunes_a_directory_but_stops_at_a_file() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // Pruning: `false` on every directory. The walk must still visit the root's FILES —
+    // a pruned directory is skipped, not the whole traversal.
+    var pruned: *mut u8 = ctx_new()
+    let v1: walk.Visitor = walk.visitor(pruned, &prune_dirs)
+    let r1: walk.WalkReport = walk.walk(a, fs.host(), "examples", walk.options(), v1)
+    test.is_false(c, rep, "pruning is not stopping", walk.stopped(r1))
+    test.eq_usize(c, rep, "nothing below the top level", walk.deepest(r1), 1)
+    test.is_true(c, rep, "top-level files were still visited", walk.files(r1) > 0)
+
+    // Stopping: `false` on the first FILE ends the walk.
+    var stopped: *mut u8 = ctx_new()
+    let v2: walk.Visitor = walk.visitor(stopped, &stop_at_first_file)
+    let r2: walk.WalkReport = walk.walk(a, fs.host(), "examples/modules", walk.options(), v2)
+    test.is_true(c, rep, "stopped", walk.stopped(r2))
+    test.eq_usize(c, rep, "after exactly one entry", ctx_count(stopped), 1)
+    test.is_false(c, rep, "and is not complete", walk.complete(r2))
+
+    free_ptr(stopped)
+    free_ptr(pruned)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_missing_root_is_refused_not_fatal() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var ctx: *mut u8 = ctx_new()
+    let v: walk.Visitor = walk.visitor(ctx, &count_only)
+    let r: walk.WalkReport = walk.walk(a, fs.host(), "no/such/tree", walk.options(), v)
+
+    // Counted and skipped rather than thrown: a walk over ten thousand directories that
+    // aborted on the first unreadable one would be useless for the auditing job it exists
+    // for. The count is the caller's to check.
+    test.eq_usize(c, rep, "refused", walk.refused(r), 1)
+    test.eq_usize(c, rep, "nothing visited", ctx_count(ctx), 0)
+    test.is_false(c, rep, "not complete", walk.complete(r))
+
+    free_ptr(ctx)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn sorting_is_what_makes_two_walks_agree() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // Two sorted walks of the same tree produce the same sequence. That is the property
+    // a build graph or a golden test depends on, and it is the reason this module buffers
+    // and sorts rather than streaming the OS's order.
+    var one: *mut u8 = ctx_new()
+    var two: *mut u8 = ctx_new()
+    walk.walk(a, fs.host(), "examples/modules", walk.options(), walk.visitor(one, &note_entry))
+    walk.walk(a, fs.host(), "examples/modules", walk.options(), walk.visitor(two, &note_entry))
+    test.eq_str(c, rep, "identical sequences", ctx_text(one), ctx_text(two))
+
+    // Unsorted still visits everything — it declines the ORDER guarantee, not the walk.
+    // Asserting the count rather than the sequence is the honest test: asserting a
+    // sequence here would pin whatever this filesystem happens to do today.
+    var un: *mut u8 = ctx_new()
+    let r: walk.WalkReport = walk.walk(a, fs.host(), "examples/modules", walk.with_sorted(walk.options(), false), walk.visitor(un, &count_only))
+    test.eq_usize(c, rep, "unsorted sees the same entries", ctx_count(un), 2)
+    test.is_true(c, rep, "and is complete", walk.complete(r))
+
+    free_ptr(un)
+    free_ptr(two)
+    free_ptr(one)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn hidden_entries_are_skipped_unless_asked_for() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // The repository root has `.git` and `.claude`. Off by default is what stops a walk
+    // from descending into `.git`, which is the most common way one of these becomes a
+    // performance bug.
+    var without: *mut u8 = ctx_new()
+    let r1: walk.WalkReport = walk.walk(a, fs.host(), ".", walk.with_depth(walk.options(), 1), walk.visitor(without, &count_only))
+
+    var shown: *mut u8 = ctx_new()
+    let opts: walk.WalkOptions = walk.with_hidden(walk.with_depth(walk.options(), 1), true)
+    let r2: walk.WalkReport = walk.walk(a, fs.host(), ".", opts, walk.visitor(shown, &count_only))
+
+    test.is_true(c, rep, "hidden entries exist here", ctx_count(shown) > ctx_count(without))
+    test.is_true(c, rep, "both are complete", walk.complete(r1) and walk.complete(r2))
+
+    free_ptr(shown)
+    free_ptr(without)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

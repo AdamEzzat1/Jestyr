@@ -1,0 +1,209 @@
+// std/memprof.jtr — a counting allocator: where the memory went, and whether it came back.
+//
+// TIER: `std`. It COMPOSES with `mem.Allocator` rather than replacing it — a `Counting`
+// wraps any allocator and hands back an `Allocator` you pass wherever one was expected, so
+// instrumenting a data structure costs one line at its construction and nothing at its use.
+//
+// ─── Why this is a wrapper and not a new allocator ────────────────────────────
+//
+// `Allocator` is already a vtable: a `*mut u8` context plus three function pointers. That
+// is exactly the shape an instrument needs — the wrapper's context is its own counter
+// block, its functions bump the counters and delegate. Nothing in `std/list`,
+// `std/hashmap` or any future container has to know it exists, which is the whole point:
+// an instrument you have to thread through call sites measures the code you remembered to
+// change.
+//
+// ─── What it counts, and the one number people actually want ──────────────────
+//
+// Allocations, frees, bytes requested, bytes released, live bytes, and the HIGH-WATER
+// MARK. The last is the number a memory budget is written against — "peak RSS" is what an
+// embedded target or a CI limit cares about, and totals cannot produce it after the fact:
+// a run that allocates 1 GB and frees it in 1 KB pieces has a 1 KB peak and a 1 GB total,
+// and only one of those tells you whether it fits.
+//
+// ─── The leak report is a test helper, and it is honest about its limits ──────
+//
+// `leaked(c)` is live bytes at the moment you ask. It is a real leak check for a scope
+// that should have released everything — and it is NOT a general leak detector: it cannot
+// see memory an allocator handed out and the program still legitimately holds. Used at the
+// end of a test, after the structures under test have been dropped, it is exact. Used
+// mid-program it reports occupancy, which is a different question.
+//
+// **It cannot see `region` or arena allocation**, because those do not go through this
+// vtable — `mem.arena_allocator` has its own. Wrapping an arena counts the arena's
+// wholesale reservations, not the bump allocations inside it, and that is the truthful
+// answer rather than a misleading one: the arena's cost to the system IS its reservation.
+//
+// ─── Why free does not know the size ──────────────────────────────────────────
+//
+// `Allocator::free_fn` takes a pointer and no length — that is the interface, and this
+// module does not get to change it. So `bytes_released` and `live_bytes` need the size of
+// each block, which means REMEMBERING it. A hash map keyed by pointer would be the general
+// answer and would allocate on every allocation, which is an instrument that changes what
+// it measures. Instead the wrapper stores the size in a header immediately before the
+// block it returns, which is what a real allocator does and costs one word per allocation.
+//
+// That header is why a `Counting` allocator's pointers must not be freed through the
+// UNDERLYING allocator directly — the pointer the caller holds is not the one the base
+// allocator handed out. Nothing enforces this today; the language cannot yet. It is stated
+// here and pinned by `a_wrapped_pointer_is_offset_from_the_bases`.
+//
+// Run the tests:  jestyrc test examples/std/memprof_test.jtr
+
+import "mem"
+import "sink"
+
+// The counter block. It is the wrapper's allocator CONTEXT, so it must outlive every
+// allocation made through it — the same rule any allocator's state follows.
+// The counters themselves, living on the heap because the allocator vtable needs a real
+// ADDRESS for its context and Jestyr has no way to take one of a local struct. That is not
+// a workaround: an instrument whose state is heap-allocated has a visible lifetime, and
+// `free_counting` is where it ends.
+pub struct Counters {
+    base: Allocator,
+    allocs: i64,
+    frees: i64,
+    bytes_requested: i64,
+    bytes_released: i64,
+    live: i64,
+    peak: i64,
+}
+
+// The handle. Copyable and cheap, like every other handle in this tree; the state is
+// behind the pointer, so two copies observe the same counters -- which is what lets a
+// caller keep one and hand an `Allocator` built from it to a container.
+@copy pub struct Counting {
+    p: *mut Counters,
+}
+
+// One machine word, holding the block's size so `free` can subtract it. `align: 8` in
+// `alloc_bytes` means the payload stays 8-aligned when the header is 8 bytes.
+const HEADER: usize = 8
+
+pub fn counting(read base: Allocator) -> Counting {
+    var p: *mut Counters = alloc(Counters, 1)
+    unsafe { p.* = Counters{ base: base, allocs: 0, frees: 0, bytes_requested: 0, bytes_released: 0, live: 0, peak: 0 } }
+    return Counting{ p: p }
+}
+
+// Release the counter block. The numbers are gone after this, so read them first.
+pub fn free_counting(mut c: Counting) {
+    if c.p != null {
+        free_ptr(c.p as *mut u8)
+        c.p = null
+    }
+}
+
+fn write_header(p: *mut u8, size: usize) {
+    var v: usize = size
+    for i in 0..HEADER {
+        unsafe { (p + i).* = (v % 256) as u8 }
+        v = v / 256
+    }
+}
+
+fn read_header(p: *mut u8) -> usize {
+    var n: usize = 0
+    var mul: usize = 1
+    for i in 0..HEADER {
+        var b: u8 = 0
+        unsafe { b = (p + i).* }
+        n = n + (b as usize) * mul
+        mul = mul * 256
+    }
+    return n
+}
+
+// The vtable's three functions. Each takes the `Counting` block as its `ctx` — the same
+// `*mut u8`-as-context convention `mem.system_allocator` uses for its own state.
+
+fn counting_alloc(ctx: *mut u8, l: Layout) -> *mut u8 {
+    var c: *mut Counters = ctx as *mut Counters
+    var total: usize = l.size + HEADER
+    var raw: *mut u8 = null
+    unsafe {
+        raw = mem.alloc_bytes(c.*.base, total)
+        if raw == null { return null }
+        write_header(raw, l.size)
+        c.*.allocs = c.*.allocs + 1
+        c.*.bytes_requested = c.*.bytes_requested + (l.size as i64)
+        c.*.live = c.*.live + (l.size as i64)
+        if c.*.live > c.*.peak { c.*.peak = c.*.live }
+        return raw + HEADER
+    }
+}
+
+fn counting_free(ctx: *mut u8, p: *mut u8) {
+    if p == null { return }
+    var c: *mut Counters = ctx as *mut Counters
+    unsafe {
+        let base_ptr: *mut u8 = p - HEADER
+        let size: usize = read_header(base_ptr)
+        c.*.frees = c.*.frees + 1
+        c.*.bytes_released = c.*.bytes_released + (size as i64)
+        c.*.live = c.*.live - (size as i64)
+        mem.free_bytes(c.*.base, base_ptr)
+    }
+}
+
+fn counting_destroy(ctx: *mut u8) {
+    var c: *mut Counters = ctx as *mut Counters
+    unsafe { mem.destroy(c.*.base) }
+}
+
+// The instrumented allocator. Pass this wherever an `Allocator` is expected; `c` must
+// outlive it.
+pub fn allocator(read c: Counting) -> Allocator {
+    var ctx: *mut u8 = null
+    unsafe { ctx = c.p as *mut u8 }
+    return Allocator{ ctx: ctx, alloc_fn: &counting_alloc, free_fn: &counting_free, destroy_fn: &counting_destroy }
+}
+
+// ------------------------------------------------------------------- the numbers
+
+@no_alloc @no_os pub fn allocs(read c: Counting) -> i64 { unsafe { return c.p.*.allocs } }
+@no_alloc @no_os pub fn frees(read c: Counting) -> i64 { unsafe { return c.p.*.frees } }
+@no_alloc @no_os pub fn bytes_requested(read c: Counting) -> i64 { unsafe { return c.p.*.bytes_requested } }
+@no_alloc @no_os pub fn bytes_released(read c: Counting) -> i64 { unsafe { return c.p.*.bytes_released } }
+
+// Bytes handed out and not yet returned, right now.
+@no_alloc @no_os pub fn live_bytes(read c: Counting) -> i64 { unsafe { return c.p.*.live } }
+
+// The largest `live_bytes` ever reached. The number a memory budget is written against —
+// see the header on why totals cannot produce it.
+@no_alloc @no_os pub fn peak_bytes(read c: Counting) -> i64 { unsafe { return c.p.*.peak } }
+
+// Allocations that were never freed, by count.
+@no_alloc @no_os pub fn outstanding(read c: Counting) -> i64 { unsafe { return c.p.*.allocs - c.p.*.frees } }
+
+// Live bytes, named for how it is used: call it after the structures under test are gone.
+// Read the header on what it can and cannot see.
+@no_alloc @no_os pub fn leaked(read c: Counting) -> i64 { unsafe { return c.p.*.live } }
+
+@no_alloc @no_os pub fn clean(read c: Counting) -> bool {
+    unsafe { return c.p.*.live == 0 and c.p.*.allocs == c.p.*.frees }
+}
+
+// ---------------------------------------------------------------------- reporting
+
+// The counters as text, into a caller `Sink`. Returns bytes written — **check
+// `sink.overflowed`**.
+//
+// Structured first, rendered at the edge: every number above is readable on its own, and
+// this is one way to print them rather than the only way to get at them.
+@no_alloc @no_os pub fn render(mut s: Sink, mut buf: []u8, read c: Counting) -> usize {
+    let before: usize = sink.written(s)
+    sink.put_str(s, buf, "allocs=")
+    unsafe { sink.put_i64(s, buf, c.p.*.allocs) }
+    sink.put_str(s, buf, " frees=")
+    unsafe { sink.put_i64(s, buf, c.p.*.frees) }
+    sink.put_str(s, buf, " requested=")
+    unsafe { sink.put_i64(s, buf, c.p.*.bytes_requested) }
+    sink.put_str(s, buf, " released=")
+    unsafe { sink.put_i64(s, buf, c.p.*.bytes_released) }
+    sink.put_str(s, buf, " live=")
+    unsafe { sink.put_i64(s, buf, c.p.*.live) }
+    sink.put_str(s, buf, " peak=")
+    unsafe { sink.put_i64(s, buf, c.p.*.peak) }
+    return sink.written(s) - before
+}

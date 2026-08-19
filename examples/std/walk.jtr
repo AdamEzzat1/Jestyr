@@ -1,0 +1,297 @@
+// std/walk.jtr — a deterministic directory walk, through a capability, into a visitor.
+//
+// TIER: `std`. `std/sysdir` is the `sys` half — it binds `opendir`/`FindFirstFileA` and
+// says nothing about order. This is where the portability decisions that a *traversal*
+// needs get made: what order, how deep, what to skip, and who is allowed to look.
+//
+// ─── Order is this module's whole job ─────────────────────────────────────────
+//
+// `sysdir` returns names in whatever order the OS gives, and says so loudly, because
+// neither `readdir` nor `FindNextFileA` promises one and NTFS and ext4 genuinely differ.
+// That is the honest primitive and it is unusable for anything that has to be reproducible
+// — a build graph, a golden test, a manifest.
+//
+// So `walk` SORTS each directory's entries before visiting them, byte-wise, ascending.
+// Byte-wise rather than locale-aware for the same reason `sha256` is the determinism
+// canary: a collation that depends on an environment variable is not a determinism story.
+// The cost is real and visible — every directory's names are buffered and sorted before
+// its first entry is visited — which is the trade `opts.sorted = false` exists to decline.
+//
+// ─── The visitor is a fn pointer plus a context, not a closure ────────────────
+//
+// Jestyr has no closures that can cross a module boundary, so a visitor that could
+// accumulate anything needs the shape `mem.Allocator` already uses: a `*mut u8` context
+// and a function pointer that receives it. That is not a workaround dressed up — it is
+// what makes the visitor's state EXPLICIT. A closure would hide which memory the walk
+// writes into; this signature cannot.
+//
+// The visitor returns a `bool`: `true` to continue, `false` to prune. On a directory,
+// `false` means "do not descend into it"; on a file it means "stop the walk entirely".
+// Those are different questions and the single return value answers both because the
+// caller always knows which one it was asked — `is_dir` is a parameter.
+//
+// ─── The capability is `Fs`, and a denied walk is a refusal, not a crash ──────
+//
+// `walk` takes an `Fs` and checks `can_read` before it opens anything. A denied capability
+// yields zero entries and a non-zero `refused` count, which is a REPORT, not an error —
+// the same shape `std/fs`'s own operations use. The test that matters is not that a
+// denied walk returns nothing; it is that the identical walk through `host()` returns
+// everything, which is the positive control without which a refusal proves nothing.
+//
+// ─── Errors are counted, not thrown ───────────────────────────────────────────
+//
+// A directory that cannot be opened mid-walk — permissions, a race with a delete — is
+// counted in `refused` and skipped. There is no error set, and that is deliberate: a walk
+// over ten thousand directories that aborted on the first unreadable one would be useless
+// for exactly the auditing job it exists for, and `?` at every level would put the failure
+// decision in the wrong place. The count is the caller's to check, and `complete()` is the
+// one-call form of "did I see everything".
+//
+// Run the tests:  jestyrc test examples/std/walk_test.jtr
+
+import "sysdir"
+import "list"
+import "str"
+import "path"
+import "fs"
+import "mem"
+
+// How to walk. Every field is a policy the caller states rather than a default this
+// module hides.
+@copy pub struct WalkOptions {
+    // Deepest level to descend. 0 means unlimited; 1 visits the root's entries only.
+    max_depth: usize,
+    // Include entries whose name starts with `.`. Off by default: a walk that descended
+    // into `.git` by accident is the single most common way one of these becomes a
+    // performance bug.
+    hidden: bool,
+    // Sort each directory's names byte-wise before visiting. On by default — see the
+    // header. Turning it off buys OS order and gives up reproducibility.
+    sorted: bool,
+    // Visit a directory itself, not only its contents.
+    visit_dirs: bool,
+}
+
+// The defaults: unlimited depth, no hidden entries, deterministic order, directories
+// reported as well as descended.
+@no_alloc @no_os pub fn options() -> WalkOptions {
+    return WalkOptions{ max_depth: 0, hidden: false, sorted: true, visit_dirs: true }
+}
+
+@no_alloc @no_os pub fn with_depth(read o: WalkOptions, d: usize) -> WalkOptions {
+    return WalkOptions{ max_depth: d, hidden: o.hidden, sorted: o.sorted, visit_dirs: o.visit_dirs }
+}
+
+@no_alloc @no_os pub fn with_hidden(read o: WalkOptions, h: bool) -> WalkOptions {
+    return WalkOptions{ max_depth: o.max_depth, hidden: h, sorted: o.sorted, visit_dirs: o.visit_dirs }
+}
+
+@no_alloc @no_os pub fn with_sorted(read o: WalkOptions, s: bool) -> WalkOptions {
+    return WalkOptions{ max_depth: o.max_depth, hidden: o.hidden, sorted: s, visit_dirs: o.visit_dirs }
+}
+
+@no_alloc @no_os pub fn with_visit_dirs(read o: WalkOptions, v: bool) -> WalkOptions {
+    return WalkOptions{ max_depth: o.max_depth, hidden: o.hidden, sorted: o.sorted, visit_dirs: v }
+}
+
+// The callback and the state it writes into. See the header on why this is a fn pointer
+// and a context rather than a closure.
+//
+// `on_entry(ctx, path, depth, is_dir) -> bool`: `true` continues; `false` prunes this
+// directory, or stops the walk when the entry is a file.
+@copy pub struct Visitor {
+    ctx: *mut u8,
+    on_entry: fn(*mut u8, str, usize, bool) -> bool,
+}
+
+@no_alloc @no_os pub fn visitor(ctx: *mut u8, f: fn(*mut u8, str, usize, bool) -> bool) -> Visitor {
+    return Visitor{ ctx: ctx, on_entry: f }
+}
+
+// What a walk did. Counts, not a list: a walk over a large tree that accumulated every
+// path would make its own memory cost invisible, which is the trade this module is
+// supposed to keep in the open.
+pub struct WalkReport {
+    files: usize,
+    dirs: usize,
+    refused: usize,
+    stopped: bool,
+    deepest: usize,
+}
+
+@no_alloc @no_os pub fn files(read r: WalkReport) -> usize { return r.files }
+@no_alloc @no_os pub fn dirs(read r: WalkReport) -> usize { return r.dirs }
+@no_alloc @no_os pub fn refused(read r: WalkReport) -> usize { return r.refused }
+@no_alloc @no_os pub fn stopped(read r: WalkReport) -> bool { return r.stopped }
+@no_alloc @no_os pub fn deepest(read r: WalkReport) -> usize { return r.deepest }
+
+// `true` when nothing was skipped and the visitor did not stop early — the one-call form
+// of "the report describes the whole tree".
+@no_alloc @no_os pub fn complete(read r: WalkReport) -> bool {
+    return r.refused == 0 and r.stopped == false
+}
+
+const PATH_CAP: usize = 4096
+
+// Byte-wise `a < b`. Shorter is smaller when one is a prefix of the other, which is what
+// makes the order total rather than merely consistent.
+@no_alloc @no_os fn less(read a: str, read b: str) -> bool {
+    var n: usize = a.len
+    if b.len < n { n = b.len }
+    for i in 0..n {
+        let x: i32 = a[i] as i32
+        let y: i32 = b[i] as i32
+        if x < y { return true }
+        if x > y { return false }
+    }
+    return a.len < b.len
+}
+
+// One directory's names, buffered so they can be sorted before any is visited.
+//
+// This buffer is why sorting has a cost worth naming: a directory with 100,000 entries
+// holds all 100,000 names before the first is reported. `opts.sorted = false` streams
+// instead, and is the right choice when the consumer does not need reproducibility.
+struct Names {
+    text: String,
+    ix: List(i32),
+}
+
+impl Drop for Names {
+    fn drop(mut self) {
+        string_free(self.text)
+    }
+}
+
+fn names_new(read a: Allocator) -> Names {
+    return Names{ text: string_new(), ix: list.make(i32, a) }
+}
+
+fn names_push(mut n: Names, read s: str) {
+    let v0: str = string_view(n.text)
+    let st: usize = v0.len
+    string_push(n.text, s)
+    let v1: str = string_view(n.text)
+    list.push(i32, n.ix, st as i32)
+    list.push(i32, n.ix, v1.len as i32)
+}
+
+fn names_len(read n: Names) -> usize {
+    return list.len(i32, n.ix) / 2
+}
+
+fn names_at(read n: Names, i: usize) -> str {
+    let v: str = string_view(n.text)
+    return v[list.get(i32, n.ix, i * 2) as usize .. list.get(i32, n.ix, i * 2 + 1) as usize]
+}
+
+// Insertion sort over the INDEX pairs, leaving the arena untouched.
+//
+// Insertion rather than a faster sort because a directory is small and the arena must not
+// move: sorting the text itself would invalidate every offset. n² on a 100,000-entry
+// directory would be the wrong choice, and it is the one place this module would need a
+// better algorithm before it could claim to scale — recorded rather than hidden.
+fn names_sort(mut n: Names) {
+    let cnt: usize = names_len(n)
+    var i: usize = 1
+    for i < cnt {
+        var j: usize = i
+        for j > 0 {
+            if less(names_at(n, j), names_at(n, j - 1)) == false { break }
+            let as0: i32 = list.get(i32, n.ix, j * 2)
+            let ae0: i32 = list.get(i32, n.ix, j * 2 + 1)
+            list.set(i32, n.ix, j * 2, list.get(i32, n.ix, (j - 1) * 2))
+            list.set(i32, n.ix, j * 2 + 1, list.get(i32, n.ix, (j - 1) * 2 + 1))
+            list.set(i32, n.ix, (j - 1) * 2, as0)
+            list.set(i32, n.ix, (j - 1) * 2 + 1, ae0)
+            j = j - 1
+        }
+        i = i + 1
+    }
+}
+
+@no_alloc @no_os fn is_hidden(read name: str) -> bool {
+    if name.len == 0 { return false }
+    return (name[0] as i32) == 46            // '.'
+}
+
+// Is `p` a directory? Asked by OPENING it, because neither platform exposes a portable
+// entry-type flag — POSIX's `d_type` is not in the standard and is absent on some
+// filesystems, and using it would make the answer depend on which one you are on.
+//
+// The cost is one extra open per entry, and it is the honest price of a portable answer.
+// A `sys`-tier `stat` would be cheaper and is a separate portability decision.
+fn is_dir(read a: Allocator, read p: str) -> bool {
+    var d: sysdir.Dir = sysdir.open(a, p)
+    if sysdir.is_open(d) == false { return false }
+    sysdir.close(d)
+    return true
+}
+
+// Walk `root`, reporting into `v`. Returns counts; see `complete`.
+//
+// Depth-first, directories reported before their contents (pre-order), because a visitor
+// that wants to prune must be asked about the directory BEFORE the walk descends — a
+// post-order walk cannot offer pruning at all.
+pub fn walk(read a: Allocator, read cap: fs.Fs, read root: str, read opts: WalkOptions, read v: Visitor) -> WalkReport {
+    var r: WalkReport = WalkReport{ files: 0, dirs: 0, refused: 0, stopped: false, deepest: 0 }
+    // The capability gate. A denied walk sees nothing and says it was refused — a report,
+    // not an error, matching every other `std/fs` operation.
+    if fs.can_read(cap) == false {
+        r.refused = 1
+        return r
+    }
+    descend(a, root, 1, opts, v, r)
+    return r
+}
+
+// One level. Recursive: a filesystem tree's depth is bounded by the OS's own path limit,
+// so the recursion cannot outrun the stack in a way an explicit one would prevent — and
+// `max_depth` is a caller-facing bound on top of that.
+fn descend(read a: Allocator, read dir: str, depth: usize, read opts: WalkOptions, read v: Visitor, mut r: WalkReport) {
+    if r.stopped { return }
+    if opts.max_depth != 0 and depth > opts.max_depth { return }
+    if depth > r.deepest { r.deepest = depth }
+
+    var d: sysdir.Dir = sysdir.open(a, dir)
+    if sysdir.is_open(d) == false {
+        // Unreadable mid-walk: permissions, or a race with a delete. Counted and skipped
+        // — see the header on why this is not an error set.
+        r.refused = r.refused + 1
+        return
+    }
+
+    var names: Names = names_new(a)
+    for true {
+        let nm: str = sysdir.next_name(d)
+        if nm.len == 0 { break }
+        if opts.hidden == false and is_hidden(nm) { continue }
+        names_push(names, nm)
+    }
+    sysdir.close(d)
+    if opts.sorted { names_sort(names) }
+
+    var raw: *mut u8 = alloc(u8, PATH_CAP)
+    var buf: []u8 = slice(u8, raw, PATH_CAP)
+    var i: usize = 0
+    for i < names_len(names) {
+        if r.stopped { break }
+        let n: usize = path.join(dir, names_at(names, i), buf)
+        let full: str = from_utf8(buf[0 .. n])
+        let isd: bool = is_dir(a, full)
+        if isd {
+            r.dirs = r.dirs + 1
+            var go: bool = true
+            if opts.visit_dirs { go = v.on_entry(v.ctx, full, depth, true) }
+            // `false` on a directory PRUNES it — the walk continues with its siblings.
+            if go { descend(a, full, depth + 1, opts, v, r) }
+        } else {
+            r.files = r.files + 1
+            // `false` on a file STOPS the walk. Two meanings, one return value, and the
+            // caller always knows which was asked because `is_dir` is a parameter.
+            if v.on_entry(v.ctx, full, depth, false) == false { r.stopped = true }
+        }
+        i = i + 1
+    }
+    free_ptr(raw)
+}

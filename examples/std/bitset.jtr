@@ -1,0 +1,168 @@
+// std/bitset.jtr — a dense set of small integers, one bit each.
+//
+// TIER: `std` (allocates through the `Allocator` you hand it; no OS).
+//
+// ─── Why this one, and not a data-structure zoo ───────────────────────────────
+//
+// The brief lists seven candidate compiler structures — intern table v2, bitset, sparse
+// set, indexed vector, stable graph, work queue, arena map — and the rule attached to them
+// is "pick one with an immediate consumer". This is that one, and `std/buildgraph`'s
+// topological sort is the consumer: it marks each module white/grey/black to detect cycles,
+// which was a `List(i32)` at four bytes per node for information that is two bits.
+//
+// The others stay unbuilt on purpose. A `stable graph` with no caller is a shape we would
+// have to keep working without ever learning whether it was the right one, and the tree
+// already has the `intern` table and `List` doing indexed-vector duty.
+//
+// ─── What it is, precisely ────────────────────────────────────────────────────
+//
+// A FIXED-CAPACITY set of `0..cap`. Not growable, because every consumer here knows its
+// universe up front — the number of modules, the number of expression ids — and a set that
+// grew on `insert` would hide an allocation inside an operation callers expect to be a
+// couple of instructions. `cap` is stated at construction and `insert` outside it is a
+// no-op that `would_overflow` reports, rather than a silent resize or a fault.
+//
+// Words are `i64`, so a set of 64 fits in one. That is the whole cost model: memory is
+// `ceil(cap/64) * 8` bytes and every operation is O(1) except `count` and `clear`, which
+// are O(words) — and `count` is deliberately not cached, because a cached count is one
+// more thing that can disagree with the bits.
+//
+// Run the tests:  jestyrc test examples/std/bitset_test.jtr
+
+import "list"
+
+pub struct BitSet {
+    words: List(i64),
+    cap: usize,
+}
+
+const BITS: usize = 64
+
+// A set that can hold `0..cap`.
+pub fn make(read a: Allocator, cap: usize) -> BitSet {
+    var w: List(i64) = list.make(i64, a)
+    var n: usize = (cap + BITS - 1) / BITS
+    // One word even for an empty set, so `words` is never a null buffer and every
+    // operation has the same shape regardless of capacity.
+    if n == 0 { n = 1 }
+    var i: usize = 0
+    for i < n {
+        list.push(i64, w, 0)
+        i = i + 1
+    }
+    return BitSet{ words: w, cap: cap }
+}
+
+pub fn capacity(read s: BitSet) -> usize {
+    return s.cap
+}
+
+// `true` if `i` is in range. Out-of-range membership is `false` and out-of-range insertion
+// is a no-op — see the header on why this is not a fault.
+@no_alloc @no_os pub fn in_range(read s: BitSet, i: usize) -> bool {
+    return i < s.cap
+}
+
+@no_alloc @no_os fn word_of(i: usize) -> usize {
+    return i / BITS
+}
+
+// The bit's mask. Built by shifting rather than by a table, and `1` is an `i64` so the
+// shift cannot overflow into the sign bit at 63 — which is the one index a naive
+// implementation gets wrong and nothing smaller than a 64-element test would catch.
+@no_alloc @no_os fn mask_of(i: usize) -> i64 {
+    var m: i64 = 1
+    let sh: usize = i % BITS
+    var k: usize = 0
+    for k < sh {
+        m = m * 2
+        k = k + 1
+    }
+    return m
+}
+
+// Named `has` rather than `contains` because `contains` is a cgen intrinsic, and an
+// unqualified call to a function with an intrinsic's name emits the INTRINSIC. The warning
+// typeck now raises caught this while the module was being written, which is the whole
+// reason that warning exists -- `set.contains` predates it and is grandfathered.
+pub fn has(read s: BitSet, i: usize) -> bool {
+    if in_range(s, i) == false { return false }
+    let w: i64 = list.get(i64, s.words, word_of(i))
+    return (w & mask_of(i)) != 0
+}
+
+// Add `i`. Returns whether the set CHANGED, which is what makes "have I seen this before"
+// a single call instead of a contains-then-insert pair that can race with itself in a
+// loop's control flow.
+pub fn insert(mut s: BitSet, i: usize) -> bool {
+    if in_range(s, i) == false { return false }
+    let wi: usize = word_of(i)
+    let w: i64 = list.get(i64, s.words, wi)
+    let m: i64 = mask_of(i)
+    if (w & m) != 0 { return false }
+    list.set(i64, s.words, wi, w | m)
+    return true
+}
+
+// Remove `i`. Returns whether the set changed.
+pub fn remove(mut s: BitSet, i: usize) -> bool {
+    if in_range(s, i) == false { return false }
+    let wi: usize = word_of(i)
+    let w: i64 = list.get(i64, s.words, wi)
+    let m: i64 = mask_of(i)
+    if (w & m) == 0 { return false }
+    list.set(i64, s.words, wi, w & (0 - 1 - m))
+    return true
+}
+
+// An insertion that reports having been out of range, for a caller that treats that as a
+// bug rather than as a no-op.
+@no_alloc @no_os pub fn would_overflow(read s: BitSet, i: usize) -> bool {
+    return i >= s.cap
+}
+
+// Empty the set. O(words), and it does not release memory — a set that is cleared in a
+// loop should not allocate in that loop.
+pub fn clear(mut s: BitSet) {
+    var i: usize = 0
+    for i < list.len(i64, s.words) {
+        list.set(i64, s.words, i, 0)
+        i = i + 1
+    }
+}
+
+// How many members. O(words) with a per-word popcount, deliberately not cached: a cached
+// count is one more thing that can disagree with the bits, and every caller that needs it
+// in a hot loop can keep its own.
+pub fn count(read s: BitSet) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    for i < list.len(i64, s.words) {
+        var w: i64 = list.get(i64, s.words, i)
+        // Bit-at-a-time rather than a popcount intrinsic, because there is no such
+        // intrinsic and a shift-and-mask loop is honest about its cost.
+        var k: usize = 0
+        for k < BITS {
+            if (w & 1) != 0 { n = n + 1 }
+            // Logical shift: `w` may have the sign bit set, and an arithmetic shift would
+            // smear it and count 64 members for a set holding one.
+            w = (w >> 1) & 9223372036854775807
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+pub fn is_empty(read s: BitSet) -> bool {
+    var i: usize = 0
+    for i < list.len(i64, s.words) {
+        if list.get(i64, s.words, i) != 0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+pub fn free(mut s: BitSet) {
+    list.free(i64, s.words)
+}

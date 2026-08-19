@@ -55,6 +55,7 @@
 import "list"
 import "sink"
 import "str"
+import "bitset"
 
 const NL: i32 = 10
 const SP: i32 = 32
@@ -284,7 +285,13 @@ pub fn parse_manifest(read a: Allocator, read text: str) -> Manifest {
 // a caller who ignores `has_cycle` harmless rather than wrong.
 pub struct Plan {
     order: List(i32),
-    state: List(i32),          // 0 unvisited, 1 in progress, 2 done
+    // The classic white/grey/black colouring, as TWO bitsets rather than one `List(i32)`.
+    // A colour is two bits of information and was costing four bytes a node; `std/bitset`
+    // exists because this is the shape a compiler pass reaches for constantly.
+    // `active` is grey (on the current DFS path -- re-entering one is the cycle), `done`
+    // is black.
+    active: bitset.BitSet,
+    done: bitset.BitSet,
     cycle: i32,
 }
 
@@ -322,17 +329,17 @@ fn visit(mut p: Plan, read m: Manifest, start: usize, read a: Allocator) {
         list.truncate(i32, stack, top)
         list.truncate(i32, phase, top)
         if ph == 1 {
-            list.set(i32, p.state, node, 2)
+            bitset.remove(p.active, node)
+            bitset.insert(p.done, node)
             list.push(i32, p.order, node as i32)
             continue
         }
-        let st: i32 = list.get(i32, p.state, node)
-        if st == 2 { continue }
-        if st == 1 {
+        if bitset.has(p.done, node) { continue }
+        if bitset.has(p.active, node) {
             if p.cycle < 0 { p.cycle = node as i32 }
             continue
         }
-        list.set(i32, p.state, node, 1)
+        bitset.insert(p.active, node)
         // Schedule the leave first, so it runs after every child.
         list.push(i32, stack, node as i32)
         list.push(i32, phase, 1)
@@ -361,15 +368,11 @@ fn visit(mut p: Plan, read m: Manifest, start: usize, read a: Allocator) {
 // incremental case a build tool wants. `resolve` returning -1 is the caller's to check
 // when completeness matters.
 pub fn plan(read a: Allocator, read m: Manifest) -> Plan {
-    var p: Plan = Plan{ order: list.make(i32, a), state: list.make(i32, a), cycle: 0 - 1 }
-    var i: usize = 0
-    for i < module_count(m) {
-        list.push(i32, p.state, 0)
-        i = i + 1
-    }
+    let n: usize = module_count(m)
+    var p: Plan = Plan{ order: list.make(i32, a), active: bitset.make(a, n), done: bitset.make(a, n), cycle: 0 - 1 }
     var r: usize = 0
-    for r < module_count(m) {
-        if list.get(i32, p.state, r) == 0 { visit(p, m, r, a) }
+    for r < n {
+        if bitset.has(p.done, r) == false { visit(p, m, r, a) }
         r = r + 1
     }
     if p.cycle >= 0 { list.truncate(i32, p.order, 0) }

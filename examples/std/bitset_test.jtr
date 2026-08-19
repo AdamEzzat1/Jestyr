@@ -1,0 +1,187 @@
+// std/bitset_test.jtr — the unit suite for `std/bitset`.
+//
+// Run:  jestyrc test examples/std/bitset_test.jtr
+
+import "bitset"
+import "mem"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 4096
+
+@test fn membership_round_trips() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var s: bitset.BitSet = bitset.make(a, 100)
+    test.eq_usize(c, rep, "capacity", bitset.capacity(s), 100)
+    test.is_true(c, rep, "starts empty", bitset.is_empty(s))
+    test.eq_usize(c, rep, "count 0", bitset.count(s), 0)
+
+    test.is_true(c, rep, "insert reports the change", bitset.insert(s, 7))
+    test.is_true(c, rep, "and it is there", bitset.has(s, 7))
+    test.is_false(c, rep, "a neighbour is not", bitset.has(s, 8))
+    test.is_false(c, rep, "the one before is not", bitset.has(s, 6))
+    // The second insert changes NOTHING and says so — which is what makes "have I seen
+    // this before" one call instead of contains-then-insert.
+    test.is_false(c, rep, "re-insert reports no change", bitset.insert(s, 7))
+    test.eq_usize(c, rep, "still one member", bitset.count(s), 1)
+
+    test.is_true(c, rep, "remove reports the change", bitset.remove(s, 7))
+    test.is_false(c, rep, "gone", bitset.has(s, 7))
+    test.is_false(c, rep, "re-remove reports no change", bitset.remove(s, 7))
+    test.is_true(c, rep, "empty again", bitset.is_empty(s))
+
+    bitset.free(s)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn the_word_boundary_and_the_sign_bit_are_both_correct() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // Bit 63 is the sign bit of an `i64` word and bit 64 is the first bit of the SECOND
+    // word. Both are the indices a naive implementation gets wrong, and a set smaller than
+    // 65 elements cannot reach either — which is why this case exists separately.
+    var s: bitset.BitSet = bitset.make(a, 200)
+    bitset.insert(s, 63)
+    bitset.insert(s, 64)
+    bitset.insert(s, 65)
+    bitset.insert(s, 127)
+    bitset.insert(s, 128)
+
+    test.is_true(c, rep, "63 (the sign bit)", bitset.has(s, 63))
+    test.is_true(c, rep, "64 (next word)", bitset.has(s, 64))
+    test.is_true(c, rep, "65", bitset.has(s, 65))
+    test.is_true(c, rep, "127", bitset.has(s, 127))
+    test.is_true(c, rep, "128", bitset.has(s, 128))
+    test.is_false(c, rep, "62 was never set", bitset.has(s, 62))
+    test.is_false(c, rep, "66 was never set", bitset.has(s, 66))
+
+    // The count is what catches a sign-smearing arithmetic shift: with bit 63 set, a
+    // `>>` that propagated the sign would report 64 members for this word alone.
+    test.eq_usize(c, rep, "exactly five", bitset.count(s), 5)
+
+    // Removing the sign bit must not disturb its word's other members.
+    bitset.remove(s, 63)
+    test.is_false(c, rep, "63 gone", bitset.has(s, 63))
+    test.is_true(c, rep, "64 untouched", bitset.has(s, 64))
+    test.eq_usize(c, rep, "four left", bitset.count(s), 4)
+
+    bitset.free(s)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn out_of_range_is_a_no_op_that_can_be_asked_about() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var s: bitset.BitSet = bitset.make(a, 10)
+    // No silent resize and no fault: the set is fixed-capacity by design, so an index past
+    // the end is simply not a member, and a caller that treats that as a bug has
+    // `would_overflow` to say so.
+    test.is_false(c, rep, "insert past the end changes nothing", bitset.insert(s, 10))
+    test.is_false(c, rep, "and it is not a member", bitset.has(s, 10))
+    test.is_true(c, rep, "still empty", bitset.is_empty(s))
+    test.is_true(c, rep, "and the overflow is reportable", bitset.would_overflow(s, 10))
+    test.is_false(c, rep, "the last valid index is not an overflow", bitset.would_overflow(s, 9))
+
+    // The positive control: the boundary index below it works normally.
+    test.is_true(c, rep, "positive control", bitset.insert(s, 9))
+    test.is_true(c, rep, "9 is a member", bitset.has(s, 9))
+
+    bitset.free(s)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn clear_empties_without_releasing() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var s: bitset.BitSet = bitset.make(a, 130)
+    var i: usize = 0
+    for i < 130 {
+        bitset.insert(s, i)
+        i = i + 1
+    }
+    test.eq_usize(c, rep, "all 130", bitset.count(s), 130)
+
+    bitset.clear(s)
+    test.is_true(c, rep, "empty", bitset.is_empty(s))
+    test.eq_usize(c, rep, "count 0", bitset.count(s), 0)
+    // Capacity survives — a set cleared in a loop must not reallocate in that loop.
+    test.eq_usize(c, rep, "capacity kept", bitset.capacity(s), 130)
+    test.is_true(c, rep, "and it is reusable", bitset.insert(s, 129))
+    test.eq_usize(c, rep, "one member", bitset.count(s), 1)
+
+    bitset.free(s)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_zero_capacity_set_is_legal_and_holds_nothing() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // A graph with no nodes is a legal graph, so a set over it must be a legal set — the
+    // caller should not have to special-case the empty universe.
+    var s: bitset.BitSet = bitset.make(a, 0)
+    test.eq_usize(c, rep, "capacity 0", bitset.capacity(s), 0)
+    test.is_true(c, rep, "empty", bitset.is_empty(s))
+    test.is_false(c, rep, "nothing fits", bitset.insert(s, 0))
+    test.is_false(c, rep, "and 0 is not a member", bitset.has(s, 0))
+    test.eq_usize(c, rep, "count 0", bitset.count(s), 0)
+
+    bitset.free(s)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn every_index_in_a_dense_range_is_independent() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // Set every third index across three words, then check ALL 200 — the exhaustive form,
+    // because an off-by-one in `word_of` or `mask_of` shows up as one wrong neighbour and
+    // a spot check would very likely miss it.
+    var s: bitset.BitSet = bitset.make(a, 200)
+    var i: usize = 0
+    for i < 200 {
+        if i % 3 == 0 { bitset.insert(s, i) }
+        i = i + 1
+    }
+    var wrong: usize = 0
+    var j: usize = 0
+    for j < 200 {
+        let want: bool = j % 3 == 0
+        if bitset.has(s, j) != want { wrong = wrong + 1 }
+        j = j + 1
+    }
+    test.eq_usize(c, rep, "no index disagrees", wrong, 0)
+    test.eq_usize(c, rep, "67 members", bitset.count(s), 67)
+
+    bitset.free(s)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

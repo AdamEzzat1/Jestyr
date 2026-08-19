@@ -1,0 +1,262 @@
+// std/runtime.jtr — an event loop you can name, hold, and step by hand.
+//
+// TIER: `std`. It allocates through the `Allocator` you give it and reaches the OS only
+// through the `time.Clock` you give it — so a `Runtime` over `time.manual()` touches
+// nothing at all and runs in a test.
+//
+// ─── The rule this module exists to obey ──────────────────────────────────────
+//
+// **No hidden runtime.** If timers, cancellation, or later work-stealing and IO polling
+// exist, the caller must be able to NAME the runtime and drive it. That is the difference
+// between an async story you can test and one you can only observe: a global executor
+// started on first use is a hidden global with a thread pool attached, and this tree has
+// spent a lot of effort not having hidden globals.
+//
+// So there is no `spawn()` free function, no ambient executor, and no `block_on` that
+// conjures one. You construct a `Runtime`, you hand it to whoever schedules work, and you
+// step it. `poll(rt)` runs what is due and returns; `run_until_idle(rt)` runs until
+// nothing is left. Neither ever blocks, and neither ever sleeps — see below.
+//
+// ─── What this deliberately IS NOT, yet ───────────────────────────────────────
+//
+// **There is no IO here, and adding a `Pollable` that could not poll would be worse than
+// having none.** Non-blocking sockets and file handles need `epoll`/`kqueue`/IOCP, which
+// are three different models with three different readiness semantics — the same kind of
+// portability decision that made directory listing a `sys` module, only larger. That work
+// belongs behind `sys` and behind the `@cfg` port mirror that `std/sysdir` already owes.
+//
+// What CAN exist honestly today is the boundary itself: a runtime handle, timers on a
+// clock, cancellation, and a deterministic step function. Those are the parts every async
+// design needs to agree on FIRST, and settling them against a manual clock is much cheaper
+// than settling them against a socket.
+//
+// **Nothing here sleeps.** A loop with no IO cannot wait for anything but time, and a real
+// sleep would make every test take as long as its longest timer. `poll` asks the clock,
+// fires what is due, and returns; `next_deadline` tells a caller how long it could sleep
+// if it had something to sleep on. Under `time.host()` a caller drives that itself; under
+// `time.manual()` a test calls `time.advance` and gets the same behaviour instantly.
+//
+// ─── Order is deterministic, and ties break by insertion ──────────────────────
+//
+// Timers fire in deadline order. Two timers with the SAME deadline fire in the order they
+// were registered — not in an arbitrary order, and not by callback address, which would
+// vary between builds. That is what lets a test assert a sequence rather than a set, and
+// it is the same reasoning `std/walk` sorts for.
+//
+// ─── Cancellation is a token, not a callback ──────────────────────────────────
+//
+// `cancel(rt, id)` marks a timer dead; the loop drops it when it comes due. It does NOT
+// remove it eagerly, because eager removal in the middle of a fire loop is where
+// use-after-free lives in every event loop that has one. A cancelled timer costs one
+// comparison at its deadline and nothing else.
+//
+// Run the tests:  jestyrc test examples/std/runtime_test.jtr
+
+import "list"
+import "time"
+import "sink"
+
+// A scheduled callback. `on_fire(ctx, id, now)` — the `ctx` + fn-pointer shape
+// `mem.Allocator` established and the only one a fn pointer can carry state through.
+@copy pub struct Task {
+    ctx: *mut u8,
+    on_fire: fn(*mut u8, i64, i64),
+}
+
+@no_alloc @no_os pub fn task(ctx: *mut u8, f: fn(*mut u8, i64, i64)) -> Task {
+    return Task{ ctx: ctx, on_fire: f }
+}
+
+// The loop. `clock` is the only thing here that can touch the OS, and only when it is
+// `time.host()`.
+pub struct Runtime {
+    clock: time.Clock,
+    tasks: List(Task),
+    // Four parallel columns, one entry per timer: a struct-of-arrays rather than a
+    // `List(Timer)`, for the same reason `std/hashmap` is one — a generic type cannot hold
+    // a pointer to another generic type, and the columns index identically anyway.
+    deadlines: List(i64),
+    ids: List(i64),
+    alive: List(bool),
+    next_id: i64,
+    fired: i64,
+    cancelled: i64,
+}
+
+// `take c` because the runtime STORES the clock: a `read` borrow is second-class and may
+// not outlive the call, and a runtime that borrowed its clock could not outlive the frame
+// that made it. Taking ownership is the honest signature -- the clock belongs to the loop.
+pub fn make(read a: Allocator, take c: time.Clock) -> Runtime {
+    return Runtime{ clock: c, tasks: list.make(Task, a), deadlines: list.make(i64, a), ids: list.make(i64, a), alive: list.make(bool, a), next_id: 1, fired: 0, cancelled: 0 }
+}
+
+pub fn free(mut rt: Runtime) {
+    list.free(Task, rt.tasks)
+    list.free(i64, rt.deadlines)
+    list.free(i64, rt.ids)
+    list.free(bool, rt.alive)
+}
+
+// Schedule `t` to fire `after` nanoseconds from now. Returns the timer's id, which is what
+// `cancel` takes.
+//
+// The deadline is computed from the clock ONCE, at registration. A timer whose deadline
+// were recomputed on every poll would drift, and under a manual clock it would never fire
+// at all — the bug that makes hand-rolled loops untestable.
+pub fn after(mut rt: Runtime, after_nanos: i64, read t: Task) -> i64 {
+    let now: i64 = time.read_nanos(rt.clock)
+    let id: i64 = rt.next_id
+    rt.next_id = rt.next_id + 1
+    list.push(Task, rt.tasks, t)
+    list.push(i64, rt.deadlines, now + after_nanos)
+    list.push(i64, rt.ids, id)
+    list.push(bool, rt.alive, true)
+    return id
+}
+
+// Schedule `t` for the next poll, whenever that is. `after(rt, 0, t)` with the intent
+// spelled out.
+pub fn soon(mut rt: Runtime, read t: Task) -> i64 {
+    return after(rt, 0, t)
+}
+
+// Mark `id` dead. Returns whether it was alive.
+//
+// The entry is NOT removed here — see the header. Cancelling from inside a callback is
+// therefore safe, which is the case that matters and the one an eager removal breaks.
+pub fn cancel(mut rt: Runtime, id: i64) -> bool {
+    var i: usize = 0
+    for i < list.len(i64, rt.ids) {
+        if list.get(i64, rt.ids, i) == id and list.get(bool, rt.alive, i) {
+            list.set(bool, rt.alive, i, false)
+            rt.cancelled = rt.cancelled + 1
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// How many timers are still live.
+pub fn pending(read rt: Runtime) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    for i < list.len(bool, rt.alive) {
+        if list.get(bool, rt.alive, i) { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// The runtime OWNS its clock (`take` at construction), so time is driven through the
+// runtime and not through the caller's copy. That is not a wart, it is the consequence of
+// the ownership being honest: a `Clock` handed to `make` is moved in, and a test that kept
+// advancing its own copy would be advancing a clock nothing reads. The first draft of the
+// suite did exactly that and every timer silently failed to fire.
+pub fn advance(mut rt: Runtime, by: i64) -> bool {
+    return time.advance(rt.clock, by)
+}
+
+// The runtime's current time.
+pub fn now(mut rt: Runtime) -> i64 {
+    return time.read_nanos(rt.clock)
+}
+
+pub fn fired(read rt: Runtime) -> i64 { return rt.fired }
+pub fn cancelled(read rt: Runtime) -> i64 { return rt.cancelled }
+pub fn is_idle(read rt: Runtime) -> bool { return pending(rt) == 0 }
+
+// The earliest live deadline, or -1 when nothing is scheduled. What a caller would sleep
+// until if it had something to sleep on — this module never sleeps itself.
+pub fn next_deadline(read rt: Runtime) -> i64 {
+    var best: i64 = 0 - 1
+    var i: usize = 0
+    for i < list.len(i64, rt.deadlines) {
+        if list.get(bool, rt.alive, i) {
+            let d: i64 = list.get(i64, rt.deadlines, i)
+            if best < 0 or d < best { best = d }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// The index of the next timer to fire at `now`: earliest deadline, ties broken by
+// REGISTRATION ORDER, which is the index itself. Returns -1 when nothing is due.
+//
+// A linear scan, deliberately. A binary heap is the textbook answer and it is the wrong
+// one here: a heap does not preserve insertion order among equal keys without a tiebreak
+// field, and the tiebreak is the property tests depend on. When a loop holds thousands of
+// timers this becomes the thing to fix, and the fix is a heap keyed on `(deadline, id)` —
+// recorded rather than pre-empted.
+fn due_index(read rt: Runtime, now: i64) -> isize {
+    var best: isize = 0 - 1
+    var best_d: i64 = 0
+    var i: usize = 0
+    for i < list.len(i64, rt.deadlines) {
+        if list.get(bool, rt.alive, i) {
+            let d: i64 = list.get(i64, rt.deadlines, i)
+            if d <= now {
+                if best < 0 or d < best_d {
+                    best = i as isize
+                    best_d = d
+                }
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// Fire every timer due at the current time. Returns how many fired.
+//
+// A timer registered BY a callback during this poll is not fired by the same poll even if
+// it is already due — the loop re-reads the clock once at entry and fires against that.
+// Without that rule a `soon` that re-schedules itself would spin forever inside one poll,
+// which is the classic starvation bug and is much easier to prevent than to debug.
+pub fn poll(mut rt: Runtime) -> i64 {
+    let now: i64 = time.read_nanos(rt.clock)
+    let limit: usize = list.len(i64, rt.deadlines)
+    var n: i64 = 0
+    for true {
+        let ix: isize = due_index(rt, now)
+        if ix < 0 { break }
+        let i: usize = ix as usize
+        if i >= limit { break }
+        list.set(bool, rt.alive, i, false)
+        let t: Task = list.get(Task, rt.tasks, i)
+        rt.fired = rt.fired + 1
+        n = n + 1
+        t.on_fire(t.ctx, list.get(i64, rt.ids, i), now)
+    }
+    return n
+}
+
+// Poll until nothing is due at the current time. Timers scheduled by callbacks ARE fired
+// here, because each `poll` re-reads the clock — so this is the "settle" operation, and it
+// still cannot spin on a self-rescheduling zero-delay task under a manual clock: that task
+// is due again immediately, so `max_rounds` bounds it rather than pretending it cannot
+// happen.
+pub fn run_until_idle(mut rt: Runtime, max_rounds: usize) -> i64 {
+    var total: i64 = 0
+    var r: usize = 0
+    for r < max_rounds {
+        let n: i64 = poll(rt)
+        if n == 0 { break }
+        total = total + n
+        r = r + 1
+    }
+    return total
+}
+
+// The counters as text, into a caller `Sink`. **Check `sink.overflowed`.**
+@no_alloc @no_os pub fn render(mut s: Sink, mut buf: []u8, read rt: Runtime) -> usize {
+    let before: usize = sink.written(s)
+    sink.put_str(s, buf, "fired=")
+    sink.put_i64(s, buf, rt.fired)
+    sink.put_str(s, buf, " cancelled=")
+    sink.put_i64(s, buf, rt.cancelled)
+    sink.put_str(s, buf, " pending=")
+    sink.put_usize(s, buf, pending(rt))
+    return sink.written(s) - before
+}

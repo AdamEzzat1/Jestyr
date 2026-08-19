@@ -14,7 +14,11 @@
 trait Drop { fn drop(mut self) }
 
 // The size + alignment of an allocation request (Rust's `Layout`).
-pub struct Layout { size: usize, align: usize }
+// `pub` fields: an allocator WRAPPER (`std/memprof`) is exactly the caller that has to
+// read the requested size, and a `Layout` whose size is unreadable outside this module is
+// not a layout, it is an opaque token. Making them public costs a reseed and nothing else
+// -- no emission changes, because field visibility is a front-end rule.
+pub struct Layout { pub size: usize, pub align: usize }
 
 // `@copy`: an allocator is a cheap handle (a context pointer + thin fn-pointers),
 // freely copied by value — so a collection may *store* one without it escaping.

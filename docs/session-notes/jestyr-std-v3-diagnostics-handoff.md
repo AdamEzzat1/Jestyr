@@ -207,6 +207,64 @@ constructor or it is effectively read-only outside its module — `diag.theme(�
 exactly this reason. Worth knowing before designing any library type in this tree; found by
 writing the test that varies the theme, not by reading the grammar.
 
+### §3.-2 — Tier 3 §1.4 (finished), §1.5, §1.7, §1.8
+
+`std/walk` (7), `std/bitset` (6), `std/memprof` (6), `std/runtime` (5). **Tier 3 is now 7
+of 8**; only §1.6 (serialization) is unbuilt, still gated on the `fmt` tier.
+
+**§1.4 is complete.** `walk(a, fs, root, opts, visitor)` does the sorting `sysdir` refuses
+to — byte-wise, because a locale-aware collation is not a determinism story — with a
+fn-pointer + `ctx` visitor (the `mem.Allocator` shape; Jestyr has no closures that cross a
+module edge). `false` from the visitor PRUNES a directory and STOPS at a file; two
+meanings, one return value, and the caller always knows which was asked because `is_dir`
+is a parameter. The capability is real: `fs.denied()` walks nothing and reports
+`refused=1`, with the `host()` positive control beside it, because "a denied walk returned
+nothing" is also what a broken walk returns.
+
+Two costs named rather than hidden: `is_dir` is answered by OPENING the entry, since
+neither platform exposes a portable type flag (POSIX `d_type` is not in the standard), and
+sorting buffers a whole directory's names before visiting the first.
+
+**§1.5 — `bitset`, and the rule was "pick one with a consumer".** `buildgraph`'s
+topological sort was colouring nodes white/grey/black in a `List(i32)` — four bytes for two
+bits. It is now two bitsets, and all 10 buildgraph tests still pass unchanged, which is the
+only evidence that mattered. The other six candidates stay unbuilt. **The intrinsic-shadow
+warning earned its keep immediately**: `bitset.contains` tripped it while the module was
+being written, and it is `has` now — `set.contains` is grandfathered, this one never had to
+be.
+
+**§1.7 — `memprof`, a counting allocator that wraps rather than replaces.** Peak vs total
+is the whole point and is pinned by a test that allocates 10×1000 bytes serially (total
+10,000, peak 1,000) and again concurrently (same total, peak 10,000) — same totals,
+different answer to "does it fit". `free_fn` gets no length, so the size lives in an
+8-byte header before each block; that is why a wrapped pointer must not be freed through
+the base allocator, which is stated and pinned.
+
+Two things it forced. `mem.Layout`'s fields are now `pub` — a Layout whose size is
+unreadable outside `mem` is an opaque token, not a layout — which cost a **reseed** (paid).
+And `Counting` had to become a handle over a heap block, because the allocator vtable needs
+a real ADDRESS for its context and Jestyr cannot take one of a local struct.
+
+**§1.8 — `runtime`, the boundary and not the IO.** An explicit `Runtime` over a
+`time.Clock`: timers, cancellation, `poll`, `run_until_idle`, `next_deadline`. No hidden
+executor, no `spawn` free function, no `block_on`, and **nothing sleeps** — under
+`time.manual()` the whole suite spans simulated seconds and takes none.
+
+**There is deliberately no `Pollable`.** Non-blocking IO needs epoll/kqueue/IOCP — three
+models with three readiness semantics — which is `sys` work behind the same `@cfg` port
+mirror `sysdir` already owes. Shipping a `Pollable` that could not poll would be worse than
+having none. What is settled here is the part every async design must agree on first, and
+settling it against a manual clock is far cheaper than against a socket.
+
+A real design bug surfaced in its own tests: the runtime takes its clock by `take`, so
+advancing the CALLER's copy did nothing and every timer silently failed to fire. Fixed by
+`runtime.advance` — time is driven through its owner. That is the honest consequence of
+ownership being real, and it is now the first thing the module's header explains.
+
+`walk`, like `sysdir`, is **not** in `CGEN_GOLDEN_ALLOWLIST`: it imports `sysdir`, so the
+`@cfg` exclusion is transitive. `bitset`, `memprof` and `runtime` are allowlisted and were
+byte-identical first try.
+
 ### §3.-1 — Tier 3 §1.2/§1.3/§1.4 — three modules, and where §1.4 stops
 
 `std/cli` (11 tests), `std/buildgraph` (10), `std/sysdir` (5), each with a real consumer.

@@ -15368,6 +15368,12 @@ fn main() -> i32 {
         "buildgraph.jtr",
         "buildgraph_test.jtr",
         "buildgraph_demo.jtr",
+        "memprof.jtr",
+        "memprof_test.jtr",
+        "bitset.jtr",
+        "bitset_test.jtr",
+        "runtime.jtr",
+        "runtime_test.jtr",
     ];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
@@ -16293,10 +16299,15 @@ fn main() -> i32 {
             ("diag_test", 15),
             ("cli_test", 11),
             ("buildgraph_test", 10),
-            // `sysdir` is the first `sys`-tier module. It is NOT in CGEN_GOLDEN_ALLOWLIST:
+            // `sysdir` and `walk` are NOT in CGEN_GOLDEN_ALLOWLIST -- `sysdir` uses `@cfg`
+            // and `walk` imports it, so the dependency is transitive:
             // it uses `@cfg`, which the port does not understand yet, so byte-identity
             // against the self-hosted backend is owed along with that mirror.
             ("sysdir_test", 5),
+            ("walk_test", 7),
+            ("memprof_test", 6),
+            ("bitset_test", 6),
+            ("runtime_test", 5),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");
