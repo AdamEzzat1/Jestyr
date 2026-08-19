@@ -3,7 +3,7 @@
 Cold-start note. **§0 is what to do next — read it first.** Then: what was built (§1), what
 the build turned up in the compiler (§2), what is still open (§3), traps (§4), order (§5).
 
-**Everything is on `master` (`fe5cfb3`).** `git pull` and go; there is no branch to chase.
+**Everything is on `master` (`577f3bc`).** `git pull` and go; there is no branch to chase.
 
 ```bash
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
