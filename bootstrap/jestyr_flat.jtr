@@ -1374,8 +1374,11 @@ pub struct PatData { pub kind: i32, pub start: usize, pub end: usize, pub op: i3
 //       `op`=ret_conv, `z`=ret `TypeId` (-1 none), `w`=body Block `ExprId`.
 // `(u,v)` = an optional leading-attribute slice `(attr_start, attr_count)` of 4-tuples in
 // `aar` (Fn/Const/Struct only; -1 elsewhere). `(g,h)` = an optional generic-parameter slice
-// `(gen_start, gen_count)` of 4-tuples in `gar` (Fn/Impl only; -1 elsewhere).
-pub struct ItemData { pub kind: i32, pub start: usize, pub end: usize, pub is_pub: i32, pub op: i32, pub a: i32, pub b: i32, pub x: i32, pub y: i32, pub z: i32, pub w: i32, pub u: i32, pub v: i32, pub g: i32, pub h: i32, pub e: i32 }
+// `(gen_start, gen_count)` of 4-tuples in `gar` (Fn/Impl only; -1 elsewhere). `(xat,xac)` =
+// an Extern's attribute slice — externs are the one kind whose `(u,v)` is taken (by the abi
+// span), and `(g,h)` is NOT a safe place to borrow: `typeck.fn_call_ret` reads it as the
+// generic slice off whatever item a call resolves to, an extern included.
+pub struct ItemData { pub kind: i32, pub start: usize, pub end: usize, pub is_pub: i32, pub op: i32, pub a: i32, pub b: i32, pub x: i32, pub y: i32, pub z: i32, pub w: i32, pub u: i32, pub v: i32, pub g: i32, pub h: i32, pub e: i32, pub xat: i32, pub xac: i32 }
 
 // `st` is the statement arena; `sar` the statement-id child arena a Block slices. `pt` is
 // the pattern arena; `par` a shared i32 child arena for pattern children (variant subpats,
@@ -1862,26 +1865,26 @@ fn parse_conv(mut p: Parser) -> i32 {
 // An `import` item: `(x,y)`=path span, `(z,w)`=alias span (z=-1 none), `(a,b)`=hash span.
 fn mk_item_import(mut p: Parser, start: usize, end: usize, ps: usize, pe: usize, als: i32, ale: i32, hs: i32, he: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 0, start: start, end: end, is_pub: 0, op: 0 - 1, a: hs, b: he, x: ps as i32, y: pe as i32, z: als, w: ale, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 0, start: start, end: end, is_pub: 0, op: 0 - 1, a: hs, b: he, x: ps as i32, y: pe as i32, z: als, w: ale, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1 })
     return id
 }
 // A `distinct Name = Base` item: `(x,y)`=name span, `a`=base TypeId.
 fn mk_item_distinct(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, base: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 1, start: start, end: end, is_pub: is_pub, op: 0 - 1, a: base, b: 0 - 1, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 1, start: start, end: end, is_pub: is_pub, op: 0 - 1, a: base, b: 0 - 1, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1 })
     return id
 }
 // A `const Name [: T] = value` item: `(x,y)`=name span, `a`=type TypeId (-1 none), `b`=value.
 fn mk_item_const(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, tyid: i32, value: i32, attr_start: i32, attr_count: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 2, start: start, end: end, is_pub: is_pub, op: 0 - 1, a: tyid, b: value, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1, u: attr_start, v: attr_count, g: 0 - 1, h: 0 - 1, e: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 2, start: start, end: end, is_pub: is_pub, op: 0 - 1, a: tyid, b: value, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1, u: attr_start, v: attr_count, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1 })
     return id
 }
 // A `fn Name(params) [-> conv R] { … }` item: `(x,y)`=name span, `(a,b)`=(param_start,
 // param_count) of 7-tuples in `iar`, `op`=ret_conv, `z`=ret TypeId (-1 none), `w`=body.
 fn mk_item_fn(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, param_start: i32, param_count: i32, ret_conv: i32, ret_ty: i32, body: i32, attr_start: i32, attr_count: i32, gen_start: i32, gen_count: i32, e_start: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 3, start: start, end: end, is_pub: is_pub, op: ret_conv, a: param_start, b: param_count, x: ns as i32, y: ne as i32, z: ret_ty, w: body, u: attr_start, v: attr_count, g: gen_start, h: gen_count, e: e_start })
+    push(ItemData, p.it, ItemData{ kind: 3, start: start, end: end, is_pub: is_pub, op: ret_conv, a: param_start, b: param_count, x: ns as i32, y: ne as i32, z: ret_ty, w: body, u: attr_start, v: attr_count, g: gen_start, h: gen_count, e: e_start, xat: 0 - 1, xac: 0 - 1 })
     return id
 }
 // A `struct`/`record`/`union Name { members }` item (kind 4): `op`=kind code (0=struct,
@@ -1889,7 +1892,7 @@ fn mk_item_fn(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, n
 // in `mar`.
 fn mk_item_struct(mut p: Parser, start: usize, end: usize, is_pub: i32, kindcode: i32, ns: usize, ne: usize, mem_start: i32, mem_count: i32, attr_start: i32, attr_count: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 4, start: start, end: end, is_pub: is_pub, op: kindcode, a: mem_start, b: mem_count, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1, u: attr_start, v: attr_count, g: 0 - 1, h: 0 - 1, e: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 4, start: start, end: end, is_pub: is_pub, op: kindcode, a: mem_start, b: mem_count, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1, u: attr_start, v: attr_count, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1 })
     return id
 }
 // An `enum Name(tparams) { variants }` item (kind 5): `(x,y)`=name span, `(op,a)`=(tparam_start,
@@ -1899,35 +1902,42 @@ fn mk_item_struct(mut p: Parser, start: usize, end: usize, is_pub: i32, kindcode
 // reference item dump).
 fn mk_item_enum(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, tparam_start: i32, tparam_count: i32, variant_start: i32, variant_count: i32, attr_start: i32, attr_count: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 5, start: start, end: end, is_pub: is_pub, op: tparam_start, a: tparam_count, b: variant_start, x: ns as i32, y: ne as i32, z: variant_count, w: 0 - 1, u: attr_start, v: attr_count, g: 0 - 1, h: 0 - 1, e: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 5, start: start, end: end, is_pub: is_pub, op: tparam_start, a: tparam_count, b: variant_start, x: ns as i32, y: ne as i32, z: variant_count, w: 0 - 1, u: attr_start, v: attr_count, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1 })
     return id
 }
 // A `trait Name { methods }` item (kind 6): `(x,y)`=name span, `(a,b)`=(method_start,
 // method_count) of trait-method 7-tuples in `mar`.
 fn mk_item_trait(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, method_start: i32, method_count: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 6, start: start, end: end, is_pub: is_pub, op: 0 - 1, a: method_start, b: method_count, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 6, start: start, end: end, is_pub: is_pub, op: 0 - 1, a: method_start, b: method_count, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1 })
     return id
 }
 // An `impl Trait for Type { methods }` item (kind 7): `(x,y)`=trait-name span, `a`=target
 // `TypeId`, `(b,z)`=(method_start, method_count) of method fn-`ItemId`s in `mar`.
 fn mk_item_impl(mut p: Parser, start: usize, end: usize, tns: usize, tne: usize, target: i32, method_start: i32, method_count: i32, gen_start: i32, gen_count: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 7, start: start, end: end, is_pub: 0, op: 0 - 1, a: target, b: method_start, x: tns as i32, y: tne as i32, z: method_count, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: gen_start, h: gen_count, e: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 7, start: start, end: end, is_pub: 0, op: 0 - 1, a: target, b: method_start, x: tns as i32, y: tne as i32, z: method_count, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: gen_start, h: gen_count, e: 0 - 1, xat: 0 - 1, xac: 0 - 1 })
     return id
 }
 // An `extern ["abi"] fn Name(params) [-> conv R]` item (kind 8): `(x,y)`=name span,
 // `(a,b)`=(param_start, param_count) in `iar`, `op`=ret_conv, `z`=ret TypeId (-1 none). The
 // abi string is consumed but not dumped (deferred, like fn generics) — extern-core.
-fn mk_item_extern(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, param_start: i32, param_count: i32, ret_conv: i32, ret_ty: i32, abis: i32, abie: i32) -> i32 {
+// `(xat,xac)`=leading-attribute slice in `aar`. An extern is the one item kind whose attrs
+// do NOT live in `(u,v)`, because `(w,u)` is already the abi's inner span —
+// `@cfg(posix) extern "dirent.h" fn opendir(…)` is what needs them, so that the backend can
+// wrap both the prototype and the header's `#include` in the right `#if`. `(g,h)` was the
+// obvious free pair and is NOT usable: it is the bracket-generic slice into `gar`, and
+// `fn_call_ret` reads it off whatever item a call resolves to — an extern included. Hence a
+// dedicated pair rather than another overload of the same two slots.
+fn mk_item_extern(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, param_start: i32, param_count: i32, ret_conv: i32, ret_ty: i32, abis: i32, abie: i32, attr_start: i32, attr_count: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 8, start: start, end: end, is_pub: is_pub, op: ret_conv, a: param_start, b: param_count, x: ns as i32, y: ne as i32, z: ret_ty, w: abis, u: abie, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 8, start: start, end: end, is_pub: is_pub, op: ret_conv, a: param_start, b: param_count, x: ns as i32, y: ne as i32, z: ret_ty, w: abis, u: abie, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: attr_start, xac: attr_count })
     return id
 }
 // An unrecognized item -> Error (kind 99), spanning the offending token.
 fn mk_item_err(mut p: Parser, start: usize, end: usize) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 99, start: start, end: end, is_pub: 0, op: 0 - 1, a: 0 - 1, b: 0 - 1, x: 0 - 1, y: 0 - 1, z: 0 - 1, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 99, start: start, end: end, is_pub: 0, op: 0 - 1, a: 0 - 1, b: 0 - 1, x: 0 - 1, y: 0 - 1, z: 0 - 1, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1 })
     return id
 }
 
@@ -3477,7 +3487,7 @@ fn parse_impl(mut p: Parser) -> i32 {
 
 // `extern ["abi"] fn Name(params) [-> conv R]` — a bodyless foreign declaration. The abi
 // string's inner span is captured (defaults to text "c" when absent). Mirrors `parse_extern`.
-fn parse_extern(mut p: Parser, is_pub: i32) -> i32 {
+fn parse_extern(mut p: Parser, is_pub: i32, attr_start: i32, attr_count: i32) -> i32 {
     let et: Token = cur_tok(p)
     let start: usize = et.start
     bump(p)                                        // consume `extern`
@@ -3496,13 +3506,13 @@ fn parse_extern(mut p: Parser, is_pub: i32) -> i32 {
     var ret_conv: i32 = 0
     var ret_ty: i32 = 0 - 1
     if cur_kind(p) == 77 { bump(p)  ret_conv = parse_conv(p)  ret_ty = parse_type(p) }   // `-> conv R`
-    return mk_item_extern(p, start, prev_end(p), is_pub, ns, ne, param_start, param_count, ret_conv, ret_ty, abis, abie)
+    return mk_item_extern(p, start, prev_end(p), is_pub, ns, ne, param_start, param_count, ret_conv, ret_ty, abis, abie, attr_start, attr_count)
 }
 
 // Parse one top-level item: leading `@…` attributes, then an optional `pub`, then dispatch on
-// the item keyword. Attributes are attached to `fn`/`const`/`struct`/`enum` (the kinds that
-// store them — enums for `@copy`); other kinds parse+discard them (the reference
-// validates/rejects — not modeled here). Mirrors `parse_item`.
+// the item keyword. Attributes are attached to `fn`/`const`/`struct`/`enum`/`extern` (the kinds
+// that store them — enums for `@copy`, externs for `@cfg`); other kinds parse+discard them (the
+// reference validates/rejects — not modeled here). Mirrors `parse_item`.
 fn parse_item(mut p: Parser) -> i32 {
     let attr_start: i32 = parse_attrs(p)
     let attr_count: i32 = ((len(i32, p.aar) as i32) - attr_start) / 4
@@ -3519,7 +3529,7 @@ fn parse_item(mut p: Parser) -> i32 {
     if k == 13 { return parse_enum(p, is_pub, attr_start, attr_count) }    // `enum`
     if k == 15 { return parse_trait(p, is_pub) }   // `trait`
     if k == 16 { return parse_impl(p) }            // `impl` (no pub)
-    if k == 40 { return parse_extern(p, is_pub) }  // `extern`
+    if k == 40 { return parse_extern(p, is_pub, attr_start, attr_count) }  // `extern`
     // Unrecognized: ONE Error item per garbage RUN, synchronized to the next item
     // keyword (mirrors the reference's `other` arm — both toolchains must consume
     // the same run or their item streams desynchronize on malformed input). The
@@ -12088,9 +12098,38 @@ fn emit_prelude(mut sb: String, read p: Parser, read src: str, read g: Cg) {
                     string_push(probe_h, "|")
                     if !contains(string_view(seen_h), string_view(probe_h)) {
                         string_push(seen_h, string_view(probe_h))
+                        // A header inherits the `@cfg` of the declarations that name it — and
+                        // only when they ALL agree. `<dirent.h>` does not exist on Windows, so
+                        // an unguarded `#include` of it would fail before the guarded `opendir`
+                        // prototype was even reached; the include is the first thing that has to
+                        // be conditional. Mixed cfgs (or any unguarded declaration) fall back to
+                        // an unconditional include, because a header one platform needs
+                        // unconditionally cannot be guarded away.
+                        let hname: str = src[hit.w as usize .. hit.u as usize]
+                        var hw: str = ""
+                        var hfirst: bool = true
+                        var hmixed: bool = false
+                        var qr: i32 = 0
+                        for qr < len(i32, p.roots) {
+                            let qid: i32 = get__list(i32, p.roots, qr as usize)
+                            let qit: ItemData = get__list(ItemData, p.it, qid as usize)
+                            if qit.kind == 8 and qit.w >= 0 {
+                                if qit.u - qit.w >= 2 {
+                                    if str_eq(src[(qit.u - 2) as usize .. qit.u as usize], ".h") and str_eq(src[qit.w as usize .. qit.u as usize], hname) {
+                                        let qw: str = cfg_word(p, src, qit.xat, qit.xac)
+                                        if hfirst { hw = qw  hfirst = false }
+                                        else if !str_eq(hw, qw) { hmixed = true }
+                                    }
+                                }
+                            }
+                            qr = qr + 1
+                        }
+                        if hmixed { hw = "" }
+                        let hg: bool = cfg_open(sb, cfg_cond(hw))
                         string_push(sb, "#include <")
-                        string_push(sb, src[hit.w as usize .. hit.u as usize])
+                        string_push(sb, hname)
                         string_push(sb, ">\n")
+                        cfg_close(sb, hg)
                     }
                     string_free(probe_h)
                 }
@@ -15653,35 +15692,45 @@ fn emit_extern_protos(mut sb: String, read p: Parser, read src: str) {
         // requires a redeclaration to be compatible, and Jestyr cannot reproduce most
         // libc signatures exactly (`int32_t fclose(void*)` vs `int fclose(FILE*)`).
         // The abi's INNER span is `(w,u)`, -1 when absent (the default "c").
-        var hdr: bool = false
-        if it.w >= 0 {
-            if it.u - it.w >= 2 {
-                if str_eq(src[(it.u - 2) as usize .. it.u as usize], ".h") { hdr = true }
-            }
-        }
-        if it.kind == 8 and !hdr {
-            any = true
-            emit_c_ty(sb, p, src, it.z)               // ret type (-1 = void)
-            string_push(sb, " ")
-            string_push(sb, src[it.x .. it.y])
-            string_push(sb, "(")
-            var emitted: i32 = 0
-            var i: i32 = 0
-            for i < it.b {
-                let base: i32 = it.a + i * 7
-                if get__list(i32, p.iar, base as usize) == 0 and get__list(i32, p.iar, (base + 4) as usize) == 0 {
-                    if emitted > 0 { string_push(sb, ", ") }
-                    let conv: i32 = get__list(i32, p.iar, (base + 1) as usize)
-                    emit_c_ty(sb, p, src, get__list(i32, p.iar, (base + 5) as usize))
-                    if conv == 2 or conv == 4 { string_push(sb, "*") }
-                    string_push(sb, " j_")
-                    string_push(sb, src[get__list(i32, p.iar, (base + 2) as usize) as usize .. get__list(i32, p.iar, (base + 3) as usize) as usize])
-                    emitted = emitted + 1
+        //
+        // The `kind == 8` test has to come FIRST. `(w,u)` only means "abi span" on an
+        // extern; on a Fn they are the body ExprId and the attribute slice, so testing
+        // them on every root item read two arbitrary source bytes — silently harmless
+        // while they never spelled `.h`, and an out-of-bounds/non-boundary slice the
+        // moment an offset landed inside a multibyte character.
+        if it.kind == 8 {
+            var hdr: bool = false
+            if it.w >= 0 {
+                if it.u - it.w >= 2 {
+                    if str_eq(src[(it.u - 2) as usize .. it.u as usize], ".h") { hdr = true }
                 }
-                i = i + 1
             }
-            if emitted == 0 { string_push(sb, "void") }
-            string_push(sb, ");\n")
+            if !hdr {
+                any = true
+                let eg: bool = cfg_open(sb, cfg_cond(cfg_word(p, src, it.xat, it.xac)))
+                emit_c_ty(sb, p, src, it.z)               // ret type (-1 = void)
+                string_push(sb, " ")
+                string_push(sb, src[it.x .. it.y])
+                string_push(sb, "(")
+                var emitted: i32 = 0
+                var i: i32 = 0
+                for i < it.b {
+                    let base: i32 = it.a + i * 7
+                    if get__list(i32, p.iar, base as usize) == 0 and get__list(i32, p.iar, (base + 4) as usize) == 0 {
+                        if emitted > 0 { string_push(sb, ", ") }
+                        let conv: i32 = get__list(i32, p.iar, (base + 1) as usize)
+                        emit_c_ty(sb, p, src, get__list(i32, p.iar, (base + 5) as usize))
+                        if conv == 2 or conv == 4 { string_push(sb, "*") }
+                        string_push(sb, " j_")
+                        string_push(sb, src[get__list(i32, p.iar, (base + 2) as usize) as usize .. get__list(i32, p.iar, (base + 3) as usize) as usize])
+                        emitted = emitted + 1
+                    }
+                    i = i + 1
+                }
+                if emitted == 0 { string_push(sb, "void") }
+                string_push(sb, ");\n")
+                cfg_close(sb, eg)
+            }
         }
         r = r + 1
     }
@@ -19795,6 +19844,61 @@ fn item_has_attr(read p: Parser, read src: str, read it: ItemData, read want: st
         i = i + 1
     }
     return false
+}
+
+// The `@cfg(<platform>)` word on an attribute slice, "" when there is none. `(ats, atc)` is
+// the slice into `aar` — `(u,v)` for a fn/const/struct/enum, `(xat,xac)` for an extern
+// (whose `(u,v)` is already the abi span). The vocabulary is CLOSED: an unrecognized word yields ""
+// here, matching the reference, which reports it as an error rather than guarding on it —
+// a typo must not silently become "unguarded on every target". Mirrors `attrs::cfg_of`.
+fn cfg_word(read p: Parser, read src: str, ats: i32, atc: i32) -> str {
+    var i: i32 = 0
+    for i < atc {
+        let ab: i32 = ats + i * 4
+        let ns: i32 = get__list(i32, p.aar, ab as usize)
+        let ne: i32 = get__list(i32, p.aar, (ab + 1) as usize)
+        if str_eq(src[ns as usize .. ne as usize], "cfg") {
+            let ac: i32 = get__list(i32, p.aar, (ab + 3) as usize)
+            if ac > 0 {
+                let a0: i32 = get__list(i32, p.aar, get__list(i32, p.aar, (ab + 2) as usize) as usize)
+                let ax: ExprData = get__list(ExprData, p.ex, a0 as usize)
+                if ax.kind == 2 {                      // a bare Name (span-only)
+                    let w: str = src[ax.start .. ax.end]
+                    if str_eq(w, "posix") { return "posix" }
+                    if str_eq(w, "windows") { return "windows" }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// A `@cfg` word's C preprocessor condition; "" (no guard) for "" or anything unrecognized.
+// Mirrors `attrs::cfg_guard`.
+fn cfg_cond(read w: str) -> str {
+    if str_eq(w, "windows") { return "defined(_WIN32)" }
+    if str_eq(w, "posix") { return "!defined(_WIN32)" }
+    return ""
+}
+
+// Open the C preprocessor guard for a `@cfg`ed item; the bool says whether `cfg_close` must
+// emit the `#endif`.
+//
+// **The item is always emitted.** `@cfg` selects at the C preprocessor, not in codegen, so
+// the emitted C is the same on every host and attest's "same source -> byte-identical C"
+// survives a platform-conditional program — and both platforms stay type-checked, because
+// neither branch is ever dropped. Mirrors `Cgen::cfg_open`.
+fn cfg_open(mut sb: String, read cond: str) -> bool {
+    if cond.len == 0 { return false }
+    string_push(sb, "#if ")
+    string_push(sb, cond)
+    string_push(sb, "\n")
+    return true
+}
+
+fn cfg_close(mut sb: String, open: bool) {
+    if open { string_push(sb, "#endif\n") }
 }
 
 // A fn's optimization/ABI/tooling attributes as its leading declaration clause: a storage
@@ -24849,15 +24953,23 @@ fn emit_fn_protos(mut sb: String, read p: Parser, read src: str, read c: Checker
         let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 and !fn_is_template(p, it) and !test_only_item(p, src, it, g.tmode) {  // Fn (templates never emitted directly; @test only in test mode)
+            let fg: bool = cfg_open(sb, cfg_cond(cfg_word(p, src, it.u, it.v)))
             emit_fn_sig(sb, p, src, it)
             string_push(sb, ";\n")
+            cfg_close(sb, fg)
         }
         r = r + 1
     }
     var gi: i32 = 0
     for (gi as usize) < len(i32, g.gfi) {
+        // An instance inherits its TEMPLATE's `@cfg`, like every other property of the
+        // signature it is substituted from.
+        let tid: i32 = get__list(i32, g.gfi, gi as usize)
+        let tit: ItemData = get__list(ItemData, p.it, tid as usize)
+        let ig: bool = cfg_open(sb, cfg_cond(cfg_word(p, src, tit.u, tit.v)))
         emit_gfn_sig(sb, p, src, c, g, gi)
         string_push(sb, ";\n")
+        cfg_close(sb, ig)
         truncate(i32, g.su, 0)
         gi = gi + 2 + get__list(i32, g.gfi, (gi + 1) as usize) * 3
     }
@@ -24871,6 +24983,7 @@ fn emit_fn_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, 
         let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 and !fn_is_template(p, it) and !test_only_item(p, src, it, g.tmode) {  // Fn (templates never emitted directly; @test only in test mode)
+            let fg: bool = cfg_open(sb, cfg_cond(cfg_word(p, src, it.u, it.v)))
             emit_fn_sig(sb, p, src, it)
             string_push(sb, "\n")
             // Register the fn's by-pointer (`mut`/`out`) params so body uses render `(*j_x)`.
@@ -24938,6 +25051,7 @@ fn emit_fn_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, 
             truncate(i32, g.ens, 0)
             truncate(i32, g.mv, 0)
             string_push(sb, "\n")
+            cfg_close(sb, fg)
         }
         r = r + 1
     }
@@ -24947,6 +25061,7 @@ fn emit_fn_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, 
     for (gi as usize) < len(i32, g.gfi) {
         let fit: i32 = get__list(i32, g.gfi, gi as usize)
         let fd: ItemData = get__list(ItemData, p.it, fit as usize)
+        let dg: bool = cfg_open(sb, cfg_cond(cfg_word(p, src, fd.u, fd.v)))
         emit_gfn_sig(sb, p, src, c, g, gi)            // arms g.su for the body too
         string_push(sb, "\n")
         truncate(i32, g.pp, 0)
@@ -25005,6 +25120,7 @@ fn emit_fn_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, 
         truncate(i32, g.mv, 0)
         truncate(i32, g.su, 0)
         string_push(sb, "\n")
+        cfg_close(sb, dg)
         gi = gi + 2 + get__list(i32, g.gfi, (gi + 1) as usize) * 3
     }
 }

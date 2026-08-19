@@ -1,0 +1,75 @@
+// examples/cfg_headers.jtr — which `#include` gets a guard, and why the rule is
+// "only when every declaration agrees".
+//
+// `@cfg` guards items at the C preprocessor (see `cfg_platform.jtr` for why it does not
+// drop them). A header is different: nothing in the source says `#include <dirent.h>` — the
+// backend synthesizes it from `extern "dirent.h" fn …`, so it has to work out the header's
+// platform from the declarations that name it.
+//
+// The rule is agreement, and it is one-sided on purpose:
+//
+//   * every declaration naming the header carries the SAME `@cfg`  →  the include is guarded
+//   * they disagree, or ANY of them is unguarded                   →  the include is emitted
+//                                                                     unconditionally
+//
+// The asymmetry is the point. Guarding too little costs a redundant `#include`, which header
+// guards make free. Guarding too much deletes a header some platform needs unconditionally,
+// which is a compile error in code that has nothing to do with `@cfg` — so the fallback is
+// always "unconditional".
+//
+// This file exists because none of that is reachable from the rest of the corpus:
+// `cfg_platform.jtr` and `std/sysdir.jtr` only ever exercise the AGREEING case, one header
+// per platform. The other two rows would be dead code that still type-checked.
+//
+// Run:  jestyrc run examples/cfg_headers.jtr
+
+// ---- row 1: MIXED platforms name <stdio.h> → unconditional include ----------
+// One name, declared once per platform against the same header. `puts` exists on both, so
+// neither declaration is a placeholder — and because their platforms disagree, `<stdio.h>`
+// cannot be guarded to either one.
+
+@cfg(posix) extern "stdio.h" fn puts(s: cstr) -> i32
+@cfg(windows) extern "stdio.h" fn puts(s: cstr) -> i32
+
+// ---- row 2: AGREEING platforms name <ctype.h> → guarded include -------------
+// Both declarations are `posix`, so the include is too. This is the shape `sysdir` uses.
+
+@cfg(posix) extern "ctype.h" fn toupper(c: i32) -> i32
+@cfg(posix) extern "ctype.h" fn tolower(c: i32) -> i32
+
+// ---- row 3: one guarded + one UNGUARDED on <stdlib.h> → unconditional -------
+// An unguarded declaration is live on every platform, so the header is too — even though
+// its neighbour is `windows`-only. This is the row that would break loudly if the rule
+// were "guard when ANY declaration is guarded".
+
+@cfg(windows) extern "stdlib.h" fn _exit(code: i32)
+extern "stdlib.h" fn abs(x: i32) -> i32
+
+// ---- the prototypes themselves ---------------------------------------------
+// A HEADER-declared extern gets no prototype (the header declares it). A plain `extern "c"`
+// one does, and that prototype carries the guard — the fourth emission site. Declared and
+// not called: a prototype forces no symbol, and what is being shown is the `#if` around it.
+
+@cfg(posix) extern "c" fn getpid() -> i32
+@cfg(windows) extern "c" fn _getpid() -> i32
+
+// `toupper` is POSIX-only here, so the call has to live inside a guarded function; the
+// Windows arm does the ASCII arithmetic itself. Same name, disjoint platforms, one call site.
+
+@cfg(posix) fn up(c: i32) -> i32 {
+    return toupper(c)
+}
+
+@cfg(windows) fn up(c: i32) -> i32 {
+    if c >= 97 and c <= 122 { return c - 32 }
+    return c
+}
+
+fn main() -> i32 {
+    // `puts` appends its own newline; a non-negative result means it wrote.
+    let wrote: i32 = puts("cfg headers".cstr)
+    print_bool(wrote >= 0)
+    print_int(up(97) as i64)          // 'a' -> 'A' = 65
+    print_int(abs(0 - 7) as i64)
+    return 0
+}

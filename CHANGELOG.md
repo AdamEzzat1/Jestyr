@@ -7,6 +7,46 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`@cfg` in the self-hosted back end — `sys` now builds under `jc`.** The Jestyr-written
+  `cgen.jtr` emits the same `#if defined(_WIN32)` / `#if !defined(_WIN32)` guards the Rust
+  reference does, at all five sites: the header `#include`, the `extern "c"` prototype, the
+  non-generic fn prototype and definition, and the monomorphized instance. `cfg_platform.jtr`
+  and `sysdir.jtr` join `CGEN_GOLDEN_ALLOWLIST` and are byte-identity verified in dump and
+  test mode; the bootstrap seed is refreshed. Verified end-to-end on a multi-module driver:
+  `jc` loads `sysdir`'s import closure itself, emits **both** platform branches, drives gcc,
+  and the program lists a real directory — with C byte-identical to the reference's over the
+  whole closure.
+
+  Nothing is dropped by host, which is the whole point: `attest` hashes the emitted C, so
+  host-dependent emission would make the same source attest differently on Linux and
+  Windows. The C preprocessor selects; both platforms stay type-checked.
+
+  **`ItemData` grew a dedicated `(xat,xac)` attribute pair for externs** rather than
+  overloading an existing slot. `(g,h)` looks free on an extern and is not: it is the
+  bracket-generic slice into `gar`, and `typeck.fn_call_ret` reads it off *whatever item a
+  call resolves to*, extern included — so attributes parked there crash on the first call to
+  an extern. Recorded because the same trap is waiting in every other `ItemData` slot.
+
+  The deferral test `cfg_is_not_yet_in_the_byte_identity_allowlist` is replaced by its
+  inverse, `every_cfg_bearing_corpus_file_is_byte_identity_verified`: it scans the corpus
+  for a real leading `@cfg(` and asserts each such file is allowlisted, because a dropped
+  allowlist entry does not error — it silently stops verifying a file.
+
+- **`examples/cfg_headers.jtr`** — which synthesized `#include` gets a guard, and why the
+  rule is *every* declaration naming the header must agree rather than *any* of them being
+  guarded. Guarding too little costs a redundant include, which header guards make free;
+  guarding too much deletes a header some platform needs unconditionally, which breaks code
+  that has nothing to do with `@cfg` — so the fallback is always "unconditional".
+
+  It exists because the rule was corpus-blind: `cfg_platform.jtr` and `std/sysdir.jtr` only
+  ever exercise the AGREEING case (one header per platform), so the mixed row and the
+  guarded-plus-unguarded row were dead code that still type-checked. Being allowlisted is
+  what puts the *port's* copy of the agreement scan under byte-identity rather than under a
+  one-off probe. On the reference side,
+  `a_header_named_by_two_opposite_platforms_is_unconditional` fills the matching gap: the
+  existing mixed test pairs a guarded declaration with an unguarded one, where
+  "unconditional" also falls out of "one of them is live everywhere".
+
 - **The IO slice — `sink` + `cursor` (`core`) and `writer` (`std`).** Tier 2 area 3. The
   four design decisions, and the two that implementation corrected, are written up in
   `docs/io-design.md`.
@@ -433,6 +473,16 @@ versions are snapshots, not stability promises.
   unaffected; no corpus file changes its diagnostics or its emitted C.
 
 ### Fixed
+
+- **The self-hosted back end read two arbitrary source bytes per top-level item.**
+  `emit_extern_protos` tested `(w,u)` as an extern's abi span *before* checking
+  `kind == 8`. On a `Fn` those two slots are the body `ExprId` and the attribute offset, so
+  the header probe `src[u-2 .. u]` sliced wherever those happened to point. It never
+  produced a wrong prototype — the odds of two random bytes spelling `.h` are slim — but it
+  aborted the compiler outright the moment an offset landed inside a UTF-8 continuation
+  byte, which is what a file with box-drawing characters in its header comment does. Found
+  while porting `@cfg`, not by the corpus: every allowlisted file happened to keep those
+  offsets pointing at ASCII. The `kind` test now comes first.
 
 - **Two modules could not share a `const` name.** `const BACKSLASH` in both
   `std/path` and `std/test` made gcc reject any program importing both with `error:

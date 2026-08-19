@@ -25,19 +25,63 @@ ignored are the deliberate slow numeric sweeps, not breakage.
 > `refused=1`, with the `host()` positive control beside it). Any text saying "walk is
 > unbuilt" predates commit `98f4bac`.
 
-### The one blocking debt
+### The one blocking debt — **CLOSED**
 
-**The `@cfg` port mirror.** `cgen.jtr` does not understand `@cfg`, so three files are
-excluded from byte-identity verification: `cfg_platform.jtr`, `sysdir.jtr`, `walk.jtr`
-(transitively — it imports `sysdir`). **`sys` is therefore unblocked for `jestyrc` and NOT
-for `jc`.** Do this before writing more `sys`, or `sys` becomes the first thing the
-self-hosted compiler cannot build — which quietly breaks the property everything else here
-rests on.
+**The `@cfg` port mirror is DONE.** `cgen.jtr` understands `@cfg`; `cfg_platform.jtr` and
+`sysdir.jtr` are in `CGEN_GOLDEN_ALLOWLIST` and byte-identity verified in both dump and
+test mode; the seed is refreshed. **`sys` now builds under `jc`** — end to end, verified on
+a real multi-module driver: the self-hosted compiler loaded `sysdir`'s import closure
+itself, emitted both platform branches under `#if` guards, drove gcc, and the program
+listed a real directory. Its C is **byte-identical to the reference's over the whole
+closure** (modulo the pre-existing `#line` divergence, which is unrelated and unchanged).
 
-Scope: mirror the guard emission at five sites in `examples/std/cgen.jtr` (header include,
-`extern "c"` prototype, non-generic fn prototype, non-generic fn definition, monomorphized
-instance), then reseed. `cfg_is_not_yet_in_the_byte_identity_allowlist` fails the moment
-someone allowlists a `@cfg` file without the mirror.
+What it took, beyond the five emission sites:
+
+* **The extern needed somewhere to keep its attributes.** `mk_item_extern` discarded them.
+  `(g,h)` looks free on an extern and is NOT usable: it is the bracket-generic slice into
+  `gar`, and `typeck.fn_call_ret` reads it off *whatever item a call resolves to* — extern
+  included, so parking attrs there segfaults on the first call to an extern. `ItemData`
+  grew a dedicated `(xat,xac)` pair instead. **Before overloading any `ItemData` slot,
+  grep for who reads it off an item of a different `kind`.**
+* **A latent slice bug in `emit_extern_protos`**, found by `@cfg` only because
+  `cfg_platform.jtr` has multibyte characters in its header comment. The header test read
+  `(w,u)` as "abi span" *before* checking `kind == 8`; on a Fn those are the body ExprId and
+  the attribute offset, so it sliced two arbitrary source bytes on every root item. Harmless
+  while they never spelled `.h` — an assertion failure the moment an offset landed inside a
+  UTF-8 continuation byte. Fixed by testing `kind` first.
+
+**`walk.jtr` is still out of the allowlist, and the old reason was wrong.** It was recorded
+as blocked "transitively — it imports `sysdir`"; measured, that has nothing to do with it
+(`walk.jtr` contains no `@cfg`). The golden feeds the RAW file to both backends with
+imports UNRESOLVED, and `walk.jtr` is the first corpus file to put a scope-local droppable
+(`var names: Names`, dropped through an `impl Drop` whose `Drop` trait lives in the
+unresolved `mem`) into that degraded mode: **the reference emits no auto-drop for it, the
+port emits one.** Every other allowlisted `impl Drop` file emits ZERO auto-drop calls in
+raw-dump mode, so none of them exercises it. Rebuilt self-contained with `trait Drop`
+declared locally, the two agree byte-for-byte — drop call included — and with the module
+path resolved (`jestyrc emit-c examples/std/walk.jtr`) the reference emits the drop too. So
+it is a disagreement about how far to degrade an ERRONEOUS program, not an emission bug,
+and it is the one thing standing between `walk.jtr` and the allowlist. The reference's
+likely reason (unprobed): `names_new`'s signature mentions `Allocator`, which is unresolved,
+so the call's result type degrades and `needs_drop` never sees `Names`.
+
+`cfg_is_not_yet_in_the_byte_identity_allowlist` is gone, replaced by its inverse —
+`every_cfg_bearing_corpus_file_is_byte_identity_verified` scans the corpus for a real
+leading `@cfg(` attribute and asserts each such file is allowlisted. A dropped entry does
+not error, it silently stops verifying a file; for the one feature whose whole point is that
+both platforms are always emitted, that silence is worth its own test.
+
+**`examples/cfg_headers.jtr` is new, and it is the anti-vacuity half.** The header-agreement
+rule (guard the synthesized `#include` only when EVERY declaration naming that header
+agrees; mixed platforms or any unguarded declaration → unconditional) was corpus-blind:
+`cfg_platform.jtr` and `sysdir.jtr` only ever exercise the agreeing case, one header per
+platform, so the other two rows were dead code that still type-checked. The new file pins
+all three and is allowlisted, which is what puts the **port's** agreement scan under
+byte-identity rather than under a probe I ran once. The reference side gained
+`a_header_named_by_two_opposite_platforms_is_unconditional` for the same reason: the
+pre-existing mixed test pairs a guarded declaration with an *unguarded* one, where
+"unconditional" also falls out of "one of them is live everywhere" — so `all agree` vs
+`any is guarded` was not actually distinguished by anything.
 
 ### Known bugs, open
 
@@ -518,14 +562,14 @@ falls back to unconditional.
 `Target::Extern`, and then **discarded**, which was invisible while no attribute meant
 anything on an extern.
 
-**What is owed, and why it could land anyway.** The port does not understand `@cfg`, so
-`cgen.jtr` needs the mirror and the seed needs refreshing. It lands green regardless
-because **no corpus file uses `@cfg`**, so no existing emitted byte changes and
-`jestyr_cgen_matches_reference` is untouched — verified. `cfg_platform.jtr` is deliberately
-NOT in `CGEN_GOLDEN_ALLOWLIST`, and `cfg_is_not_yet_in_the_byte_identity_allowlist` fails
-the moment someone adds it without the mirror. **`sys` is therefore unblocked for `jestyrc`
-and not yet for `jc`** — build the mirror before writing `sys` itself, or `sys` will be the
-first module the self-hosted compiler cannot build.
+**What was owed — now paid.** The port did not understand `@cfg`, so `cgen.jtr` needed the
+mirror and the seed a refresh. The feature landed green ahead of that because **no corpus
+file used `@cfg`**, so no existing emitted byte changed. The mirror has since landed (§0):
+`cfg_platform.jtr` and `sysdir.jtr` are in `CGEN_GOLDEN_ALLOWLIST`,
+`cfg_is_not_yet_in_the_byte_identity_allowlist` is replaced by its inverse, and **`sys`
+builds under `jc`**. The port's own extern items had to grow an attribute slice to get
+there — `ExternFn.attrs` on the reference side has a `(xat,xac)` counterpart in
+`parser.ItemData` now.
 
 The vocabulary is `posix` and `windows`, closed on purpose, with `cfg_guard` total over it
 and an anti-vacuity test tying the two together. `linux`/`macos` stay out until something
@@ -573,9 +617,10 @@ needs to tell them apart.
 
 ## §5. Suggested order from here
 
-1. **The `@cfg` port mirror** (§0) — `cgen.jtr` + reseed. The one blocking debt: until it
-   lands, `sys` is buildable by `jestyrc` and not by `jc`, and three files sit outside
-   byte-identity verification.
+1. ~~**The `@cfg` port mirror**~~ — **DONE** (§0). `sys` builds under `jc`;
+   `cfg_platform.jtr` and `sysdir.jtr` are allowlisted and byte-identity verified.
+   `walk.jtr` remains out, for a reason that turned out to be about auto-drop under
+   unresolved imports and not about `@cfg` at all — see §0 if you want to close it.
 2. **Wire `std/diag` into `cgen.jtr`'s driver** — the consumer that makes the module
    load-bearing rather than merely available. The driver today prints
    `path:line:col: error: …` and stops at the first; `diag_demo.jtr` already shows the

@@ -201,9 +201,38 @@ fn emit_prelude(mut sb: String, read p: parser.Parser, read src: str, read g: Cg
                     string_push(probe_h, "|")
                     if !contains(string_view(seen_h), string_view(probe_h)) {
                         string_push(seen_h, string_view(probe_h))
+                        // A header inherits the `@cfg` of the declarations that name it — and
+                        // only when they ALL agree. `<dirent.h>` does not exist on Windows, so
+                        // an unguarded `#include` of it would fail before the guarded `opendir`
+                        // prototype was even reached; the include is the first thing that has to
+                        // be conditional. Mixed cfgs (or any unguarded declaration) fall back to
+                        // an unconditional include, because a header one platform needs
+                        // unconditionally cannot be guarded away.
+                        let hname: str = src[hit.w as usize .. hit.u as usize]
+                        var hw: str = ""
+                        var hfirst: bool = true
+                        var hmixed: bool = false
+                        var qr: i32 = 0
+                        for qr < list.len(i32, p.roots) {
+                            let qid: i32 = list.get(i32, p.roots, qr as usize)
+                            let qit: parser.ItemData = list.get(parser.ItemData, p.it, qid as usize)
+                            if qit.kind == 8 and qit.w >= 0 {
+                                if qit.u - qit.w >= 2 {
+                                    if str_eq(src[(qit.u - 2) as usize .. qit.u as usize], ".h") and str_eq(src[qit.w as usize .. qit.u as usize], hname) {
+                                        let qw: str = cfg_word(p, src, qit.xat, qit.xac)
+                                        if hfirst { hw = qw  hfirst = false }
+                                        else if !str_eq(hw, qw) { hmixed = true }
+                                    }
+                                }
+                            }
+                            qr = qr + 1
+                        }
+                        if hmixed { hw = "" }
+                        let hg: bool = cfg_open(sb, cfg_cond(hw))
                         string_push(sb, "#include <")
-                        string_push(sb, src[hit.w as usize .. hit.u as usize])
+                        string_push(sb, hname)
                         string_push(sb, ">\n")
+                        cfg_close(sb, hg)
                     }
                     string_free(probe_h)
                 }
@@ -3766,35 +3795,45 @@ fn emit_extern_protos(mut sb: String, read p: parser.Parser, read src: str) {
         // requires a redeclaration to be compatible, and Jestyr cannot reproduce most
         // libc signatures exactly (`int32_t fclose(void*)` vs `int fclose(FILE*)`).
         // The abi's INNER span is `(w,u)`, -1 when absent (the default "c").
-        var hdr: bool = false
-        if it.w >= 0 {
-            if it.u - it.w >= 2 {
-                if str_eq(src[(it.u - 2) as usize .. it.u as usize], ".h") { hdr = true }
-            }
-        }
-        if it.kind == 8 and !hdr {
-            any = true
-            emit_c_ty(sb, p, src, it.z)               // ret type (-1 = void)
-            string_push(sb, " ")
-            string_push(sb, src[it.x .. it.y])
-            string_push(sb, "(")
-            var emitted: i32 = 0
-            var i: i32 = 0
-            for i < it.b {
-                let base: i32 = it.a + i * 7
-                if list.get(i32, p.iar, base as usize) == 0 and list.get(i32, p.iar, (base + 4) as usize) == 0 {
-                    if emitted > 0 { string_push(sb, ", ") }
-                    let conv: i32 = list.get(i32, p.iar, (base + 1) as usize)
-                    emit_c_ty(sb, p, src, list.get(i32, p.iar, (base + 5) as usize))
-                    if conv == 2 or conv == 4 { string_push(sb, "*") }
-                    string_push(sb, " j_")
-                    string_push(sb, src[list.get(i32, p.iar, (base + 2) as usize) as usize .. list.get(i32, p.iar, (base + 3) as usize) as usize])
-                    emitted = emitted + 1
+        //
+        // The `kind == 8` test has to come FIRST. `(w,u)` only means "abi span" on an
+        // extern; on a Fn they are the body ExprId and the attribute slice, so testing
+        // them on every root item read two arbitrary source bytes — silently harmless
+        // while they never spelled `.h`, and an out-of-bounds/non-boundary slice the
+        // moment an offset landed inside a multibyte character.
+        if it.kind == 8 {
+            var hdr: bool = false
+            if it.w >= 0 {
+                if it.u - it.w >= 2 {
+                    if str_eq(src[(it.u - 2) as usize .. it.u as usize], ".h") { hdr = true }
                 }
-                i = i + 1
             }
-            if emitted == 0 { string_push(sb, "void") }
-            string_push(sb, ");\n")
+            if !hdr {
+                any = true
+                let eg: bool = cfg_open(sb, cfg_cond(cfg_word(p, src, it.xat, it.xac)))
+                emit_c_ty(sb, p, src, it.z)               // ret type (-1 = void)
+                string_push(sb, " ")
+                string_push(sb, src[it.x .. it.y])
+                string_push(sb, "(")
+                var emitted: i32 = 0
+                var i: i32 = 0
+                for i < it.b {
+                    let base: i32 = it.a + i * 7
+                    if list.get(i32, p.iar, base as usize) == 0 and list.get(i32, p.iar, (base + 4) as usize) == 0 {
+                        if emitted > 0 { string_push(sb, ", ") }
+                        let conv: i32 = list.get(i32, p.iar, (base + 1) as usize)
+                        emit_c_ty(sb, p, src, list.get(i32, p.iar, (base + 5) as usize))
+                        if conv == 2 or conv == 4 { string_push(sb, "*") }
+                        string_push(sb, " j_")
+                        string_push(sb, src[list.get(i32, p.iar, (base + 2) as usize) as usize .. list.get(i32, p.iar, (base + 3) as usize) as usize])
+                        emitted = emitted + 1
+                    }
+                    i = i + 1
+                }
+                if emitted == 0 { string_push(sb, "void") }
+                string_push(sb, ");\n")
+                cfg_close(sb, eg)
+            }
         }
         r = r + 1
     }
@@ -7908,6 +7947,61 @@ fn item_has_attr(read p: parser.Parser, read src: str, read it: parser.ItemData,
         i = i + 1
     }
     return false
+}
+
+// The `@cfg(<platform>)` word on an attribute slice, "" when there is none. `(ats, atc)` is
+// the slice into `aar` — `(u,v)` for a fn/const/struct/enum, `(xat,xac)` for an extern
+// (whose `(u,v)` is already the abi span). The vocabulary is CLOSED: an unrecognized word yields ""
+// here, matching the reference, which reports it as an error rather than guarding on it —
+// a typo must not silently become "unguarded on every target". Mirrors `attrs::cfg_of`.
+fn cfg_word(read p: parser.Parser, read src: str, ats: i32, atc: i32) -> str {
+    var i: i32 = 0
+    for i < atc {
+        let ab: i32 = ats + i * 4
+        let ns: i32 = list.get(i32, p.aar, ab as usize)
+        let ne: i32 = list.get(i32, p.aar, (ab + 1) as usize)
+        if str_eq(src[ns as usize .. ne as usize], "cfg") {
+            let ac: i32 = list.get(i32, p.aar, (ab + 3) as usize)
+            if ac > 0 {
+                let a0: i32 = list.get(i32, p.aar, list.get(i32, p.aar, (ab + 2) as usize) as usize)
+                let ax: parser.ExprData = list.get(parser.ExprData, p.ex, a0 as usize)
+                if ax.kind == 2 {                      // a bare Name (span-only)
+                    let w: str = src[ax.start .. ax.end]
+                    if str_eq(w, "posix") { return "posix" }
+                    if str_eq(w, "windows") { return "windows" }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// A `@cfg` word's C preprocessor condition; "" (no guard) for "" or anything unrecognized.
+// Mirrors `attrs::cfg_guard`.
+fn cfg_cond(read w: str) -> str {
+    if str_eq(w, "windows") { return "defined(_WIN32)" }
+    if str_eq(w, "posix") { return "!defined(_WIN32)" }
+    return ""
+}
+
+// Open the C preprocessor guard for a `@cfg`ed item; the bool says whether `cfg_close` must
+// emit the `#endif`.
+//
+// **The item is always emitted.** `@cfg` selects at the C preprocessor, not in codegen, so
+// the emitted C is the same on every host and attest's "same source -> byte-identical C"
+// survives a platform-conditional program — and both platforms stay type-checked, because
+// neither branch is ever dropped. Mirrors `Cgen::cfg_open`.
+fn cfg_open(mut sb: String, read cond: str) -> bool {
+    if cond.len == 0 { return false }
+    string_push(sb, "#if ")
+    string_push(sb, cond)
+    string_push(sb, "\n")
+    return true
+}
+
+fn cfg_close(mut sb: String, open: bool) {
+    if open { string_push(sb, "#endif\n") }
 }
 
 // A fn's optimization/ABI/tooling attributes as its leading declaration clause: a storage
@@ -12962,15 +13056,23 @@ fn emit_fn_protos(mut sb: String, read p: parser.Parser, read src: str, read c: 
         let iid: i32 = list.get(i32, p.roots, r as usize)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 3 and !fn_is_template(p, it) and !test_only_item(p, src, it, g.tmode) {  // Fn (templates never emitted directly; @test only in test mode)
+            let fg: bool = cfg_open(sb, cfg_cond(cfg_word(p, src, it.u, it.v)))
             emit_fn_sig(sb, p, src, it)
             string_push(sb, ";\n")
+            cfg_close(sb, fg)
         }
         r = r + 1
     }
     var gi: i32 = 0
     for (gi as usize) < list.len(i32, g.gfi) {
+        // An instance inherits its TEMPLATE's `@cfg`, like every other property of the
+        // signature it is substituted from.
+        let tid: i32 = list.get(i32, g.gfi, gi as usize)
+        let tit: parser.ItemData = list.get(parser.ItemData, p.it, tid as usize)
+        let ig: bool = cfg_open(sb, cfg_cond(cfg_word(p, src, tit.u, tit.v)))
         emit_gfn_sig(sb, p, src, c, g, gi)
         string_push(sb, ";\n")
+        cfg_close(sb, ig)
         list.truncate(i32, g.su, 0)
         gi = gi + 2 + list.get(i32, g.gfi, (gi + 1) as usize) * 3
     }
@@ -12984,6 +13086,7 @@ fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str, read c: ty
         let iid: i32 = list.get(i32, p.roots, r as usize)
         let it: parser.ItemData = list.get(parser.ItemData, p.it, iid as usize)
         if it.kind == 3 and !fn_is_template(p, it) and !test_only_item(p, src, it, g.tmode) {  // Fn (templates never emitted directly; @test only in test mode)
+            let fg: bool = cfg_open(sb, cfg_cond(cfg_word(p, src, it.u, it.v)))
             emit_fn_sig(sb, p, src, it)
             string_push(sb, "\n")
             // Register the fn's by-pointer (`mut`/`out`) params so body uses render `(*j_x)`.
@@ -13051,6 +13154,7 @@ fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str, read c: ty
             list.truncate(i32, g.ens, 0)
             list.truncate(i32, g.mv, 0)
             string_push(sb, "\n")
+            cfg_close(sb, fg)
         }
         r = r + 1
     }
@@ -13060,6 +13164,7 @@ fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str, read c: ty
     for (gi as usize) < list.len(i32, g.gfi) {
         let fit: i32 = list.get(i32, g.gfi, gi as usize)
         let fd: parser.ItemData = list.get(parser.ItemData, p.it, fit as usize)
+        let dg: bool = cfg_open(sb, cfg_cond(cfg_word(p, src, fd.u, fd.v)))
         emit_gfn_sig(sb, p, src, c, g, gi)            // arms g.su for the body too
         string_push(sb, "\n")
         list.truncate(i32, g.pp, 0)
@@ -13118,6 +13223,7 @@ fn emit_fn_defs(mut sb: String, read p: parser.Parser, read src: str, read c: ty
         list.truncate(i32, g.mv, 0)
         list.truncate(i32, g.su, 0)
         string_push(sb, "\n")
+        cfg_close(sb, dg)
         gi = gi + 2 + list.get(i32, g.gfi, (gi + 1) as usize) * 3
     }
 }

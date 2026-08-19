@@ -710,6 +710,29 @@ mod cfg_platform {
         );
     }
 
+    /// The other disagreement, and the one the test above does NOT cover: two declarations
+    /// that are both guarded but on OPPOSITE platforms. `a_header_named_by_mixed_platforms_is_unconditional`
+    /// pairs a guarded declaration with an unguarded one, where "unconditional" also falls out
+    /// of "one of them is live everywhere". Here neither is, and the include still has to be
+    /// unconditional — a rule that has to be `all agree`, not `any is guarded`.
+    /// `examples/cfg_headers.jtr` is the corpus half of this, which is what puts the PORT's
+    /// copy of the agreement scan under byte-identity.
+    #[test]
+    fn a_header_named_by_two_opposite_platforms_is_unconditional() {
+        let c = emit("@cfg(posix) extern \"stdio.h\" fn a1(p: cstr) -> cptr\n\
+                      @cfg(windows) extern \"stdio.h\" fn a2(p: cstr) -> cptr\n\
+                      fn main() -> i32 { return 0 }\n");
+        // The prelude includes <stdio.h> unconditionally too, so locate the SYNTHESIZED one:
+        // it is the last, emitted after the fixed prelude list.
+        let at = c.rfind("#include <stdio.h>").expect("the include is missing");
+        let before = c[..at].trim_end();
+        assert!(
+            !before.ends_with("#if !defined(_WIN32)") && !before.ends_with("#if defined(_WIN32)"),
+            "a header named by two opposite platforms must not be guarded to either:\n{}",
+            &c[..at + 30.min(c.len() - at)]
+        );
+    }
+
     /// The vocabulary is closed, and an unknown platform is an ERROR rather than an item
     /// left unguarded on every target — the vacuity hazard a closed list always carries.
     #[test]
@@ -799,18 +822,43 @@ mod cfg_platform {
         );
     }
 
-    /// The corpus has no `@cfg`, so this feature changes no existing emitted byte — which
-    /// is what lets it land with the port mirror still owed. When `examples/cfg_platform.jtr`
-    /// is added to `CGEN_GOLDEN_ALLOWLIST`, the port must understand `@cfg` first.
+    /// **The port mirror exists**, so the three `@cfg`-bearing files are byte-identity
+    /// verified like everything else — this asserts they are actually IN the allowlist, the
+    /// inverse of the deferral test that stood here while `cgen.jtr` did not understand
+    /// `@cfg`. A dropped allowlist entry does not error, it silently stops verifying a file;
+    /// for the one feature whose whole point is that both platforms are always emitted, that
+    /// silence is worth a test of its own.
     #[test]
-    fn cfg_is_not_yet_in_the_byte_identity_allowlist() {
-        assert!(
-            !std::fs::read_to_string("src/proptests.rs")
-                .unwrap()
-                .contains("\"cfg_platform.jtr\","),
-            "cfg_platform.jtr is allowlisted, so the port mirror for `@cfg` must exist — \
-             if it does, delete this test along with the deferral it records"
-        );
+    fn every_cfg_bearing_corpus_file_is_byte_identity_verified() {
+        let mut cfg_files: Vec<String> = Vec::new();
+        for dir in ["examples", "examples/std"] {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) != Some("jtr") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&p).unwrap();
+                // A real attribute, not the word in a comment: `@cfg(` at a line start.
+                if src.lines().any(|l| l.trim_start().starts_with("@cfg(")) {
+                    cfg_files.push(p.file_name().unwrap().to_str().unwrap().to_string());
+                }
+            }
+        }
+        assert!(cfg_files.len() >= 2, "expected the `@cfg` corpus, found {cfg_files:?}");
+        // Read the allowlist as TEXT rather than naming the const: it lives inside the
+        // `c-oracle`-gated module, and this invariant has to hold in a default `cargo test`
+        // too — the day someone drops an entry is not the day they are running the oracle.
+        // Line-wise, not a substring of the whole file: the allowlist is one entry per line
+        // (deliberately — see its header), and a `\n` probe would miss under CRLF checkouts.
+        let me = std::fs::read_to_string("src/proptests.rs").unwrap();
+        let entries: Vec<&str> = me.lines().map(str::trim).collect();
+        for f in &cfg_files {
+            assert!(
+                entries.contains(&format!("\"{f}\",").as_str()),
+                "`{f}` uses `@cfg` but is not in CGEN_GOLDEN_ALLOWLIST, so nothing checks that \
+                 the port emits the same guards the reference does"
+            );
+        }
     }
 }
 
@@ -15536,7 +15584,22 @@ fn main() -> i32 {
         "runtime_test.jtr",
         "json.jtr",
         "json_test.jtr",
+        "cfg_platform.jtr",
+        "cfg_headers.jtr",
+        "sysdir.jtr",
     ];
+    // **`walk.jtr` is deliberately absent, and NOT because of `@cfg`.** The old note said it
+    // was blocked "transitively — it imports sysdir"; measured, that is wrong. This golden
+    // feeds the RAW file to both backends with imports UNRESOLVED, and `walk.jtr` is the first
+    // corpus file that puts a scope-local droppable (`var names: Names`, dropped by an
+    // `impl Drop` whose `Drop` trait lives in the unresolved `mem`) in that degraded mode: the
+    // reference emits no auto-drop for it, the port emits one. Every other allowlisted
+    // `impl Drop` file emits ZERO auto-drop calls in raw-dump mode, so none of them exercises
+    // it. Rebuild the same function in a self-contained file with `trait Drop` declared
+    // locally and the two agree byte-for-byte, drop call included — and with the module path
+    // resolved (`jestyrc emit-c examples/std/walk.jtr`) the reference emits the drop too. So
+    // this is a disagreement about how far to degrade an ERRONEOUS program, not an emission
+    // bug, and it is the one thing standing between `walk.jtr` and the allowlist.
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
     /// target). This is the acceptance bar the R2 fixpoint ultimately rests on. `DUMP_DIVERGE=1`
