@@ -389,6 +389,166 @@ mod buildgraph_against_the_real_manifest {
     }
 }
 
+/// **Move-only resources (brief §2.1): a droppable moves when it is rebound.**
+///
+/// `var b: Writer = a` used to leave TWO names for one handle — both dropped it, and
+/// `std/file`'s header documented that as a limitation the language could not express.
+/// Now the source is marked moved and the next use of it is refused, reusing `take`'s
+/// existing machinery so there is one notion of "moved" and one diagnostic.
+///
+/// Measured over all 210 corpus files before choosing the severity: **two sites, both in
+/// one test**, and that test turned out to be documenting a latent double free — a
+/// `SmallVec` copy that was safe only because it had not spilled. Zero other sites, so
+/// this is an error rather than a warning.
+#[cfg(test)]
+mod move_only_resources {
+    use super::*;
+
+    /// A droppable type and a consumer, shared by the cases below.
+    const PRELUDE: &str = "trait Drop { fn drop(mut self) }\n\
+                           struct Res { v: i64 }\n\
+                           impl Drop for Res { fn drop(mut self) { print_int(self.v) } }\n";
+
+    fn diags(body: &str) -> Vec<String> {
+        escape_diags(&format!("{PRELUDE}fn main() -> i32 {{\n{body}\n  return 0\n}}\n"))
+    }
+
+    #[test]
+    fn rebinding_a_droppable_moves_it() {
+        let d = diags("  var a: Res = Res{ v: 1 }\n  var b: Res = a\n  print_int(a.v)");
+        assert!(
+            d.iter().any(|m| m.contains("moved to another binding")),
+            "a rebound droppable must be moved; got {d:?}"
+        );
+        // The message names the RIGHT event: saying "given to a `take` parameter" here
+        // would send the reader looking for a call that does not exist.
+        assert!(
+            !d.iter().any(|m| m.contains("`take` parameter")),
+            "the diagnostic must not blame a `take` parameter; got {d:?}"
+        );
+    }
+
+    /// The control that keeps this a rule about RESOURCES. A plain struct with no `Drop`
+    /// still copies, because nothing is owned twice — if this ever fails, the rule has
+    /// become a borrow checker.
+    #[test]
+    fn a_non_droppable_still_copies() {
+        let d = escape_diags(
+            "struct P { v: i64 }\nfn main() -> i32 {\n  var a: P = P{ v: 1 }\n  var b: P = a\n  print_int(a.v)\n  print_int(b.v)\n  return 0\n}\n",
+        );
+        assert!(d.is_empty(), "a non-droppable must still copy freely; got {d:?}");
+    }
+
+    /// Using the NEW binding is fine — the move gives it the value, it does not destroy it.
+    #[test]
+    fn the_new_binding_owns_it() {
+        let d = diags("  var a: Res = Res{ v: 1 }\n  var b: Res = a\n  print_int(b.v)");
+        assert!(d.is_empty(), "the destination binding must be usable; got {d:?}");
+    }
+
+    /// **The bug this rule actually found.** `std/smallvec` frees a heap buffer once
+    /// spilled, so two bindings for one spilled vector is a double free. The corpus test
+    /// that copied one was safe only because it held two elements and never spilled —
+    /// a property of the test, not of the code it was checking.
+    ///
+    /// This reproduces the shape with a generic container carrying a BLANKET `Drop`,
+    /// which is also the case `droppable_ty` used to miss entirely: an
+    /// `impl[T] Drop for Box(T)` registers under `Box(T)`, so a concrete `Box(i64)` never
+    /// matched and every ownership rule silently skipped it.
+    #[test]
+    fn a_blanket_drop_impl_makes_every_instance_move_only() {
+        let src = "trait Drop { fn drop(mut self) }\n\
+                   pub fn Box(comptime T: type) -> type { return struct { v: T } }\n\
+                   impl[T] Drop for Box(T) { fn drop(mut self) { } }\n\
+                   fn main() -> i32 {\n\
+                   \x20 var a: Box(i64) = Box(i64){ v: 1 }\n\
+                   \x20 var b: Box(i64) = a\n\
+                   \x20 print_int(a.v)\n\
+                   \x20 return 0\n\
+                   }\n";
+        let d = escape_diags(src);
+        assert!(
+            d.iter().any(|m| m.contains("moved to another binding")),
+            "a blanket `Drop` impl must make its instances move-only; got {d:?}"
+        );
+    }
+
+    /// The pre-existing `take` rule had the same blind spot, so closing it fixed two
+    /// rules at once. Kept as its own case because it is a different code path.
+    #[test]
+    fn use_after_take_now_sees_generic_containers_too() {
+        let src = "trait Drop { fn drop(mut self) }\n\
+                   pub fn Box(comptime T: type) -> type { return struct { v: T } }\n\
+                   impl[T] Drop for Box(T) { fn drop(mut self) { } }\n\
+                   fn eat(take b: Box(i64)) -> i64 { return b.v }\n\
+                   fn main() -> i32 {\n\
+                   \x20 var a: Box(i64) = Box(i64){ v: 1 }\n\
+                   \x20 print_int(eat(a))\n\
+                   \x20 print_int(a.v)\n\
+                   \x20 return 0\n\
+                   }\n";
+        let d = escape_diags(src);
+        assert!(
+            d.iter().any(|m| m.contains("`take` parameter")),
+            "use-after-take must see a blanket-Drop container; got {d:?}"
+        );
+    }
+}
+
+/// **`string_view(x).len` — an untyped intrinsic that reached gcc as a wrong field name.**
+///
+/// `string_intrinsic_ret` had no entry for the owned-String family, so `string_view(s)`
+/// typed as `Unknown`; cgen's field arm fell past its `Ty::Prim("str")` case to the
+/// generic one and emitted `.j_len` against `JestyrStr`, whose C field is `len`. The
+/// program passed `jestyrc check` in full and failed in gcc — the degrades-to-gcc class
+/// the brief's §2.3 is about.
+///
+/// It survived a long time because the workaround is invisible: `let v: str =
+/// string_view(s)` then `v.len` works, since the annotation supplies the type the
+/// intrinsic did not. Every call site in the tree had been written that way, and the repo
+/// recorded "never chain `string_view(x).len`" as a `.jtr` subset TRAP rather than as a
+/// compiler bug.
+#[cfg(test)]
+mod string_intrinsic_types {
+    use super::*;
+
+    /// The three shapes that were broken, and the annotated form that always worked —
+    /// kept beside them so a regression cannot be mistaken for the workaround still
+    /// being needed.
+    #[test]
+    fn the_owned_string_family_is_typed() {
+        for (src, want) in [
+            ("string_view(s).len", "size_t"),
+            ("string_view(s).ptr", "const char*"),
+        ] {
+            let program = format!(
+                "fn main() -> i32 {{\n  var s: String = string_new()\n  string_push(s, \"hello\")\n  let x: {} = {}\n  return 0\n}}\n",
+                if want == "size_t" { "usize" } else { "*const u8" },
+                src
+            );
+            let (c, n) = compile(&program);
+            assert_eq!(n, 0, "`{src}` must compile clean; got {n} diagnostics");
+            assert!(
+                !c.contains(".j_len") && !c.contains(".j_ptr"),
+                "`{src}` emitted a Jestyr-mangled field against a runtime struct:\n{c}"
+            );
+        }
+    }
+
+    /// The type is right, not merely present — `string_new()` is a `String` and
+    /// `string_view` of it is a `str`, which is what makes an un-annotated `let` get the
+    /// correct C type.
+    #[test]
+    fn an_unannotated_let_gets_the_right_c_type() {
+        let (c, n) = compile(
+            "fn main() -> i32 {\n  var s: String = string_new()\n  let v = string_view(s)\n  let k = v.len\n  return 0\n}\n",
+        );
+        assert_eq!(n, 0, "must compile clean; got {n}");
+        assert!(c.contains("JestyrStr j_v"), "`let v = string_view(s)` is not a JestyrStr:\n{c}");
+        assert!(!c.contains(".j_len"), "the mangled field is back:\n{c}");
+    }
+}
+
 /// **Intrinsic shadowing.** A function whose name is a cgen intrinsic is silently
 /// replaced by that intrinsic at every UNQUALIFIED call, arguments and all.
 ///
@@ -15374,6 +15534,8 @@ fn main() -> i32 {
         "bitset_test.jtr",
         "runtime.jtr",
         "runtime_test.jtr",
+        "json.jtr",
+        "json_test.jtr",
     ];
     /// **P5 cgen golden.** For each allowlisted corpus `.jtr`, the Jestyr C backend must emit C
     /// *byte-identical* to `cgen::emit` (line-for-line; see [`rust_cgen_dump`] for the `#line`-free
@@ -16308,6 +16470,7 @@ fn main() -> i32 {
             ("memprof_test", 6),
             ("bitset_test", 6),
             ("runtime_test", 5),
+            ("json_test", 10),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

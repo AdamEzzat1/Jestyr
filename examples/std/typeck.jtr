@@ -1620,6 +1620,11 @@ fn resolve_operator(mut c: Checker, read src: str, id: i32, op: i32, lt: i32) ->
 fn intrinsic_ret(mut c: Checker, t: str) -> i32 {
     if str_eq(t, "substr") or str_eq(t, "from_utf8") or str_eq(t, "trim") { return t_str() }
     if str_eq(t, "cow_view") { return t_str() }
+    // The owned-String family. Absent from BOTH tables until now, and its absence was a
+    // miscompile: an untyped `string_view(s)` made cgen emit `.j_len` against `JestyrStr`,
+    // whose C field is `len`. Mirrors the reference's `string_intrinsic_ret`.
+    if str_eq(t, "string_view") { return t_str() }
+    if str_eq(t, "string_new") or str_eq(t, "string_from") { return mk_ty(c, 2, 0 - 1, 0 - 1, 17, 0 - 1) }   // String
     if str_eq(t, "os_from_bytes") { return mk_ty(c, 2, 0 - 1, 0 - 1, 16, 0 - 1) }   // os_str
     if str_eq(t, "to_str_lossy") or str_eq(t, "read_file") { return mk_ty(c, 2, 0 - 1, 0 - 1, 17, 0 - 1) }   // String
     if str_eq(t, "cow_borrow") or str_eq(t, "cow_to_mut") { return mk_ty(c, 2, 0 - 1, 0 - 1, 19, 0 - 1) }    // Cow

@@ -356,6 +356,28 @@ struct Checker<'a> {
 
 /// Per-function analysis state: a stack of lexical scopes mapping each in-scope
 /// binding to whether it denotes a borrow, plus this function's return mode.
+/// Why a binding stopped owning its value. Both are moves; they read differently to a
+/// person, and a diagnostic that said "given to a `take` parameter" about a plain `let`
+/// would send the reader looking for a call that is not there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MoveCause {
+    /// Given to a `take` parameter: the callee owns and drops it.
+    TakeArg,
+    /// Rebound to a new name: the new binding owns and drops it.
+    Rebind,
+}
+
+impl MoveCause {
+    fn phrase(self) -> &'static str {
+        match self {
+            MoveCause::TakeArg => "it was given to a `take` parameter: ownership moved at the call",
+            MoveCause::Rebind => "it was moved to another binding: the new name owns it and will drop it",
+        }
+    }
+}
+
+/// Per-function analysis state: a stack of lexical scopes mapping each in-scope
+/// binding to whether it denotes a borrow, plus this function's return mode.
 struct FnCtx {
     scopes: Vec<HashMap<String, bool>>,
     /// Names bound to a **region-allocated** value (from `region_str`/`region_alloc`/
@@ -369,7 +391,7 @@ struct FnCtx {
     /// region rule — a bare-Name assign overwrites the alias itself, which is
     /// separate storage, so raw depths stay right for it.
     aliased: Vec<HashMap<String, usize>>,
-    /// The consuming rule (ownership: use-after-`take`): names of DROPPABLE owned
+    /// The consuming rule (ownership: use-after-move): names of DROPPABLE owned
     /// locals given to a `take` parameter, recorded at their binding's scope
     /// depth. The callee owns (and drops) the value now — cgen registers the
     /// `take` param in the callee's drop scope — so any later use of the binding
@@ -377,7 +399,10 @@ struct FnCtx {
     /// with forked copies merged by UNION (both branches may consume; a use
     /// after either errors), like Rust's conservative analysis. A rebind
     /// (`let`) clears the entry — a fresh binding is a fresh value.
-    consumed: Vec<HashSet<String>>,
+    /// The value is WHY it moved, so the diagnostic can name the event: a `take`
+    /// argument and a rebinding are the same thing to the value and different things to
+    /// the reader, and "given to a `take` parameter" is actively misleading on a `let`.
+    consumed: Vec<HashMap<String, MoveCause>>,
     /// Scope depth at entry to each enclosing loop-like construct (`for` loops,
     /// `par for` bodies, closures — anything that may run again). Consuming a
     /// binding declared OUTSIDE the innermost such construct is refused at the
@@ -391,7 +416,7 @@ impl FnCtx {
         self.scopes.push(HashMap::new());
         self.region.push(HashSet::new());
         self.aliased.push(HashMap::new());
-        self.consumed.push(HashSet::new());
+        self.consumed.push(HashMap::new());
     }
     fn pop(&mut self) {
         self.scopes.pop();
@@ -426,13 +451,19 @@ impl FnCtx {
     /// Is `name`'s current binding marked consumed? (Innermost binding wins —
     /// a shadowing `let` cleared its own scope's entry at bind.)
     fn is_consumed(&self, name: &str) -> bool {
-        self.scope_depth_of(name).is_some_and(|d| self.consumed[d].contains(name))
+        self.consumed_cause(name).is_some()
+    }
+    /// Why `name` stopped owning its value, if it did — so the diagnostic can name the
+    /// event rather than guessing at one.
+    fn consumed_cause(&self, name: &str) -> Option<MoveCause> {
+        let d = self.scope_depth_of(name)?;
+        self.consumed[d].get(name).copied()
     }
     /// Record `name`'s binding as consumed, at its BINDING depth — the mark
     /// outlives inner blocks and dies with the binding.
-    fn mark_consumed(&mut self, name: &str) {
+    fn mark_consumed(&mut self, name: &str, why: MoveCause) {
         if let Some(d) = self.scope_depth_of(name) {
-            self.consumed[d].insert(name.to_string());
+            self.consumed[d].insert(name.to_string(), why);
         }
     }
     /// Innermost binding wins (handles shadowing).
@@ -449,7 +480,7 @@ impl FnCtx {
 /// Union-merge one branch's consumed sets into another, depth-aligned. Only
 /// depths still present in `into` matter — a branch's own inner scopes are
 /// already popped by the time it merges back.
-fn merge_consumed(into: &mut [HashSet<String>], from: Vec<HashSet<String>>) {
+fn merge_consumed(into: &mut [HashMap<String, MoveCause>], from: Vec<HashMap<String, MoveCause>>) {
     for (i, set) in from.into_iter().enumerate() {
         if let Some(t) = into.get_mut(i) {
             t.extend(set);
@@ -585,6 +616,36 @@ impl<'a> Checker<'a> {
                     } else {
                         false
                     };
+                    // **A droppable moves on rebinding** (brief §2.1 — move-only
+                    // resources). `var b: Writer = a` used to leave TWO names for one
+                    // handle: both dropped it, and `std/file`'s header had to document
+                    // that as a limitation the language could not express.
+                    //
+                    // The rule reuses `take`'s machinery exactly — the source is marked
+                    // consumed, so the existing use-after-move diagnostic fires on the
+                    // next mention. That is deliberate: one notion of "moved", one
+                    // diagnostic, and a rebinding and a `take` argument are the same
+                    // event from the value's point of view.
+                    //
+                    // Only a BARE NAME initializer moves. A field or index initializer
+                    // (`let w = pair.writer`) is already refused by the `take` path's
+                    // place-chain arm for the same reason, and a call initializer
+                    // (`let w = file.create(..)`) produces a fresh value that nothing
+                    // else owns.
+                    //
+                    // Scoped to droppables so nothing else changes: an `i64`, a `str`, a
+                    // `@copy` handle and a plain struct with no `Drop` all still copy,
+                    // which is what keeps this a rule about RESOURCES rather than a
+                    // borrow checker.
+                    if let Some(e) = init {
+                        if let ExprKind::Name(n) = &self.ast.expr_at(*e).kind {
+                            if ctx.lookup(&n.name) == Some(false)
+                                && self.droppable_ty(&self.info.type_of(*e).clone())
+                            {
+                                ctx.mark_consumed(&n.name, MoveCause::Rebind);
+                            }
+                        }
+                    }
                     ctx.bind(&name.name, is_borrow);
                     if let Some(d) = alias_depth {
                         ctx.aliased.last_mut().unwrap().insert(name.name.clone(), d);
@@ -1138,13 +1199,10 @@ impl<'a> Checker<'a> {
             // reads a dropped value. (Falls through: a tail Name still gets the
             // region-return check below.)
             ExprKind::Name(n) => {
-                if ctx.is_consumed(&n.name) {
+                if let Some(why) = ctx.consumed_cause(&n.name) {
                     self.error_help(
                         span,
-                        format!(
-                            "cannot use `{}` after it was given to a `take` parameter: ownership moved at the call",
-                            n.name
-                        ),
+                        format!("cannot use `{}` after {}", n.name, why.phrase()),
                         Self::CONSUMED_HELP,
                     );
                 }
@@ -1746,7 +1804,37 @@ impl<'a> Checker<'a> {
     /// left behind in the caller.
     fn droppable_ty(&self, ty: &Ty) -> bool {
         let key = self.info.table.ty_key(ty);
-        !key.is_empty() && self.info.table.impl_index.contains_key(&("Drop".to_string(), key))
+        if !key.is_empty()
+            && self.info.table.impl_index.contains_key(&("Drop".to_string(), key))
+        {
+            return true;
+        }
+        // **A BLANKET impl is keyed by its own spelling, not by its instances.**
+        // `impl[T] Drop for List(T)` registers under `List(T)`, so a concrete
+        // `List(i64)` — key `List(i64)` — never matched, and every ownership rule that
+        // consults this silently skipped the most-used droppable in the tree: a
+        // use-after-`take` of a `List` was NOT diagnosed.
+        //
+        // That was a pre-existing hole in the `take` rule, found while adding the
+        // rebinding one, and it is the same shape as the miscompiles already recorded —
+        // a lookup that misses returns "no" rather than failing, so the check just
+        // stops happening for that type.
+        //
+        // Matching on the CONSTRUCTOR closes it: any `Drop` impl whose key names the
+        // same generic constructor makes every instance of it droppable. That is exactly
+        // what a blanket impl means, and a non-blanket `impl Drop for List(i64)` would
+        // have been caught by the exact-key lookup above.
+        match ty {
+            Ty::GenStruct { ctor, .. } | Ty::GenEnum { ctor, .. } => {
+                let prefix = format!("{ctor}(");
+                self.info
+                    .table
+                    .impl_index
+                    .keys()
+                    .any(|(tr, k)| tr == "Drop" && k.starts_with(&prefix))
+            }
+            _ => false,
+        }
     }
 
     /// The consuming rule's marking half: `arg` is being given to a `take`
@@ -1783,7 +1871,7 @@ impl<'a> Checker<'a> {
                         return;
                     }
                 }
-                ctx.mark_consumed(&name);
+                ctx.mark_consumed(&name, MoveCause::TakeArg);
             }
             ExprKind::Field { .. } | ExprKind::Index { .. } => {
                 let root = self.root_name(ctx, arg);

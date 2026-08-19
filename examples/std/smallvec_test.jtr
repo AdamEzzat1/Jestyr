@@ -179,9 +179,24 @@ const NONE: i64 = 0 - 1
     return ok
 }
 
-// A `SmallVec` is a plain value: copying it must copy the ELEMENTS, not share
-// storage. This is the test that would fail if the inline buffer were ever
-// reached through a stored self-pointer — the design rule the header is about.
+// A `SmallVec`'s inline buffer must not be reached through a stored self-pointer — the
+// design rule `smallvec.jtr`'s header is about. A physical copy of the struct must still
+// see its OWN elements; if `ptr` ever pointed into `buf`, the copy's `ptr` would dangle
+// into the original.
+//
+// **This test used to make that copy with `var copy: SmallVec(i64) = v`, and that is now
+// a compile error — correctly.** A `SmallVec` frees a heap buffer once spilled, so two
+// bindings for one spilled vector is a double free; the version here was safe only
+// because it held two elements and never spilled, which is a property of the test rather
+// than of the code it was checking. The ownership rule (brief §2.1) found it.
+//
+// The invariant survives without the hazard: a `read` parameter is PHYSICALLY a copy and
+// creates no second owner, so `sees_own_elements` exercises exactly the self-pointer
+// question the original was asking.
+fn sees_own_elements(read v: smallvec.SmallVec(i64)) -> i64 {
+    return smallvec.get(i64, v, 0)
+}
+
 @test fn an_inline_vector_is_a_value_not_a_reference() -> bool {
     var raw: *mut u8 = alloc(u8, REPORT_CAP)
     var rep: []u8 = slice(u8, raw, REPORT_CAP)
@@ -192,13 +207,15 @@ const NONE: i64 = 0 - 1
     smallvec.push(i64, v, 1)
     smallvec.push(i64, v, 2)
 
-    // Copy while INLINE, then diverge the original.
-    var copy: smallvec.SmallVec(i64) = v
-    smallvec.set(i64, v, 0, 99)
+    // A physical copy (the `read` parameter) sees its own inline elements, not a
+    // dangling view into the caller's struct.
+    test.eq_i64(c, rep, "a copy sees its own buffer", sees_own_elements(v), 1)
 
+    // And mutating through the owner still works afterwards — the copy took nothing away.
+    smallvec.set(i64, v, 0, 99)
     test.eq_i64(c, rep, "the original changed", smallvec.get(i64, v, 0), 99)
-    test.eq_i64(c, rep, "the copy did not", smallvec.get(i64, copy, 0), 1)
-    test.eq_usize(c, rep, "the copy kept its length", smallvec.len(i64, copy), 2)
+    test.eq_i64(c, rep, "and a fresh copy sees the change", sees_own_elements(v), 99)
+    test.eq_usize(c, rep, "length intact", smallvec.len(i64, v), 2)
 
     let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)

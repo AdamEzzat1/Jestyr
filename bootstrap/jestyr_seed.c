@@ -13699,6 +13699,14 @@ int32_t jestyr_intrinsic_ret(Jestyr_Checker* restrict j_c, JestyrStr j_t)
     {
         return jestyr_t_str();
     }
+    if (jestyr_rt_str_eq(j_t, JSTR("string_view")))
+    {
+        return jestyr_t_str();
+    }
+    if ((jestyr_rt_str_eq(j_t, JSTR("string_new")) || jestyr_rt_str_eq(j_t, JSTR("string_from"))))
+    {
+        return jestyr_mk_ty__typeck(&((*j_c)), 2, (0 - 1), (0 - 1), 17, (0 - 1));
+    }
     if (jestyr_rt_str_eq(j_t, JSTR("os_from_bytes")))
     {
         return jestyr_mk_ty__typeck(&((*j_c)), 2, (0 - 1), (0 - 1), 16, (0 - 1));

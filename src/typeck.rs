@@ -5049,6 +5049,19 @@ pub(crate) fn is_scalar_match_ty(p: &str) -> bool {
 fn string_intrinsic_ret(name: &str) -> Option<Ty> {
     Some(match name {
         "substr" | "from_utf8" | "trim" => Ty::Prim("str"),
+        // The owned-String family, absent from this table until now — and its absence
+        // was a MISCOMPILE, not a missing convenience.
+        //
+        // `string_view(s)` typed as `Unknown`, so cgen's field-access arm fell past its
+        // `Ty::Prim("str")` case to the generic one and emitted `.j_len` — the Jestyr
+        // field mangling — against `JestyrStr`, whose C field is `len`. gcc then failed
+        // with "no member named 'j_len'". `let v: str = string_view(s)` followed by
+        // `v.len` worked, because the annotation supplied the type the intrinsic did not,
+        // which is exactly why this survived so long: every call site in the tree had
+        // been written around it, and `docs/session-notes` records "never chain
+        // `string_view(x).len`" as a .jtr subset TRAP rather than as the bug it is.
+        "string_new" | "string_from" => Ty::Prim("String"),
+        "string_view" => Ty::Prim("str"),
         "os_from_bytes" => Ty::Prim("os_str"),
         "to_str_lossy" => Ty::Prim("String"),
         "cow_borrow" | "cow_to_mut" => Ty::Prim("Cow"),

@@ -1,0 +1,327 @@
+// std/json_test.jtr — the unit suite for `std/json`.
+//
+// Run:  jestyrc test examples/std/json_test.jtr
+
+import "json"
+import "sink"
+import "str"
+import "mem"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 8192
+const BUF_CAP: usize = 4096
+
+@test fn a_document_writes_in_the_order_it_was_called() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var braw: *mut u8 = alloc(u8, BUF_CAP)
+    var buf: []u8 = slice(u8, braw, BUF_CAP)
+    var s: sink.Sink = sink.new()
+    var w: json.Writer = json.writer()
+
+    json.begin_object(w, s, buf)
+    json.key(w, s, buf, "version")
+    json.put_i64(w, s, buf, 1)
+    json.key(w, s, buf, "ok")
+    json.put_bool(w, s, buf, true)
+    json.key(w, s, buf, "note")
+    json.put_null(w, s, buf)
+    json.key(w, s, buf, "items")
+    json.begin_array(w, s, buf)
+    json.put_str(w, s, buf, "a")
+    json.put_i64(w, s, buf, -7)
+    json.end_array(w, s, buf)
+    json.end_object(w, s, buf)
+
+    // Keys in CALL order, not sorted and not deduplicated — the property a checked-in,
+    // diffable report depends on.
+    test.eq_str(c, rep, "document", sink.view(s, buf),
+        "{\"version\":1,\"ok\":true,\"note\":null,\"items\":[\"a\",-7]}")
+    test.is_true(c, rep, "balanced", json.balanced(w))
+    test.is_false(c, rep, "fits", sink.overflowed(s))
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn every_byte_that_must_be_escaped_is() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var braw: *mut u8 = alloc(u8, BUF_CAP)
+    var buf: []u8 = slice(u8, braw, BUF_CAP)
+    var s: sink.Sink = sink.new()
+    var w: json.Writer = json.writer()
+
+    // The whole format rests on this: ONE raw `"` makes the document unparseable, so a
+    // miss loses every field rather than one.
+    json.put_str(w, s, buf, "q\"b\\n\nr\rt\tx")
+    test.eq_str(c, rep, "escaped", sink.view(s, buf), "\"q\\\"b\\\\n\\nr\\rt\\tx\"")
+
+    // A C0 control with no short form takes the `\u00XX` long form.
+    var s2: sink.Sink = sink.new()
+    var b2: *mut u8 = alloc(u8, BUF_CAP)
+    var buf2: []u8 = slice(u8, b2, BUF_CAP)
+    var w2: json.Writer = json.writer()
+    json.put_str(w2, s2, buf2, "ab")
+    test.eq_str(c, rep, "control", sink.view(s2, buf2), "\"a\\u0001b\"")
+
+    // Non-ASCII passes through: JSON is UTF-8 by definition, and escaping it would be
+    // correct-but-wasteful and would disagree with the Rust-side escaper.
+    var s3: sink.Sink = sink.new()
+    var b3: *mut u8 = alloc(u8, BUF_CAP)
+    var buf3: []u8 = slice(u8, b3, BUF_CAP)
+    var w3: json.Writer = json.writer()
+    json.put_str(w3, s3, buf3, "café")
+    test.eq_str(c, rep, "utf-8 passes through", sink.view(s3, buf3), "\"café\"")
+
+    free_ptr(b3)
+    free_ptr(b2)
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn an_unbalanced_document_is_visible_before_it_ships() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    var braw: *mut u8 = alloc(u8, BUF_CAP)
+    var buf: []u8 = slice(u8, braw, BUF_CAP)
+    var s: sink.Sink = sink.new()
+    var w: json.Writer = json.writer()
+
+    // The writer has no failure channel by design, so an unclosed container is caught by
+    // asking — the same shape as `sink.overflowed`. Together those two are the whole
+    // "did my output survive" question.
+    json.begin_object(w, s, buf)
+    json.key(w, s, buf, "a")
+    json.put_i64(w, s, buf, 1)
+    test.is_false(c, rep, "not balanced yet", json.balanced(w))
+    test.eq_i64(c, rep, "depth 1", json.depth(w), 1)
+
+    json.end_object(w, s, buf)
+    test.is_true(c, rep, "balanced now", json.balanced(w))
+    test.eq_i64(c, rep, "depth 0", json.depth(w), 0)
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_document_round_trips_through_the_reader() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var d: json.Doc = json.parse(a, "{\"version\":1,\"ok\":true,\"items\":[\"a\",-7],\"note\":null}")
+    test.is_true(c, rep, "parsed", json.parsed(d))
+    let r: isize = json.root(d)
+    test.is_true(c, rep, "has a root", r >= 0)
+    let rn: usize = r as usize
+    test.eq_usize(c, rep, "four pairs", json.len(d, rn), 4)
+
+    let v: isize = json.get(d, rn, "version")
+    test.is_true(c, rep, "version found", v >= 0)
+    test.eq_i64(c, rep, "version = 1", json.as_i64(d, v as usize), 1)
+    test.is_true(c, rep, "and it is integral", json.is_integral(d, v as usize))
+
+    let okn: isize = json.get(d, rn, "ok")
+    test.is_true(c, rep, "ok = true", json.as_bool(d, okn as usize))
+
+    let items: isize = json.get(d, rn, "items")
+    test.eq_usize(c, rep, "two items", json.len(d, items as usize), 2)
+    test.eq_str(c, rep, "items[0]", json.as_str(d, json.elem(d, items as usize, 0)), "a")
+    test.eq_i64(c, rep, "items[1]", json.as_i64(d, json.elem(d, items as usize, 1)), 0 - 7)
+
+    // An absent key is -1, not a fault and not an empty value that a caller could mistake
+    // for a present null.
+    test.eq_i64(c, rep, "absent key", json.get(d, rn, "missing") as i64, 0 - 1)
+
+    // Pairs keep the document's order, which is what makes a re-render diffable.
+    test.eq_str(c, rep, "pair 0", json.pair_key(d, rn, 0), "version")
+    test.eq_str(c, rep, "pair 3", json.pair_key(d, rn, 3), "note")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn escapes_survive_the_reader() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var d: json.Doc = json.parse(a, "{\"s\":\"q\\\"b\\\\n\\nr\\tx\\u0041\"}")
+    test.is_true(c, rep, "parsed", json.parsed(d))
+    let rn: usize = json.root(d) as usize
+    let sn: isize = json.get(d, rn, "s")
+    // The DECODED text, not the source bytes: `\n` is one newline, `A` is `A`.
+    test.eq_str(c, rep, "decoded", json.as_str(d, sn as usize), "q\"b\\n\nr\txA")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_float_parses_but_is_not_claimed_to_be_an_integer() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // The document is valid JSON and must parse; the NUMBER is one this module cannot
+    // represent, and it says so instead of truncating. A silent `3` here would be the
+    // worst of the three options — a plausible wrong answer.
+    var d: json.Doc = json.parse(a, "{\"pi\":3.5,\"n\":42}")
+    test.is_true(c, rep, "parsed", json.parsed(d))
+    let rn: usize = json.root(d) as usize
+
+    let pi: isize = json.get(d, rn, "pi")
+    test.is_false(c, rep, "3.5 is not integral", json.is_integral(d, pi as usize))
+
+    // The positive control: the integer beside it IS integral and reads back exactly.
+    let n: isize = json.get(d, rn, "n")
+    test.is_true(c, rep, "42 is integral", json.is_integral(d, n as usize))
+    test.eq_i64(c, rep, "and reads back", json.as_i64(d, n as usize), 42)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn malformed_input_is_refused_and_says_why() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var d1: json.Doc = json.parse(a, "{\"a\":1")
+    test.is_false(c, rep, "unterminated object", json.parsed(d1))
+
+    var d2: json.Doc = json.parse(a, "[1,2")
+    test.is_false(c, rep, "unterminated array", json.parsed(d2))
+
+    var d3: json.Doc = json.parse(a, "{\"a\" 1}")
+    test.is_false(c, rep, "missing colon", json.parsed(d3))
+
+    var d4: json.Doc = json.parse(a, "\"abc")
+    test.is_false(c, rep, "unterminated string", json.parsed(d4))
+
+    var d5: json.Doc = json.parse(a, "")
+    test.is_false(c, rep, "empty input", json.parsed(d5))
+
+    // TRAILING CONTENT is an error. Accepting the prefix would make a truncated or
+    // concatenated file look valid, which is the quiet acceptance `std/cstring` refuses
+    // for interior NULs.
+    var d6: json.Doc = json.parse(a, "{\"a\":1} garbage")
+    test.is_false(c, rep, "trailing content", json.parsed(d6))
+    test.eq_str(c, rep, "and says so", json.error_text(d6), "trailing content after the value")
+
+    // The positive control: the same document without the trailing junk parses.
+    var d7: json.Doc = json.parse(a, "{\"a\":1}")
+    test.is_true(c, rep, "positive control", json.parsed(d7))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn deep_nesting_is_bounded_rather_than_fatal() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // 200 opening brackets. A recursive-descent reader with no cap is a stack overflow on
+    // untrusted input — a crash, not a diagnostic — so this asserts it comes back as an
+    // ERROR and the process survives to report it.
+    var deep: String = string_new()
+    var i: usize = 0
+    for i < 200 {
+        string_push(deep, "[")
+        i = i + 1
+    }
+    let dv: str = string_view(deep)
+    var d: json.Doc = json.parse(a, dv)
+    test.is_false(c, rep, "refused, not crashed", json.parsed(d))
+    string_free(deep)
+
+    // The positive control: nesting well inside the cap parses fine, so the cap is about
+    // depth and not about arrays being broken.
+    var d2: json.Doc = json.parse(a, "[[[[[1]]]]]")
+    test.is_true(c, rep, "positive control", json.parsed(d2))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn nested_containers_do_not_interleave_their_children() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // The failure the scratch stack exists to prevent: an inner container appends its
+    // children while the outer one is still open, so a reader that wrote straight into
+    // one shared list would give the outer container the inner one's slice.
+    var d: json.Doc = json.parse(a, "[1,[2,3],4,[5,[6,7]],8]")
+    test.is_true(c, rep, "parsed", json.parsed(d))
+    let rn: usize = json.root(d) as usize
+
+    test.eq_usize(c, rep, "five top-level elements", json.len(d, rn), 5)
+    test.eq_i64(c, rep, "[0]", json.as_i64(d, json.elem(d, rn, 0)), 1)
+    test.eq_i64(c, rep, "[2]", json.as_i64(d, json.elem(d, rn, 2)), 4)
+    test.eq_i64(c, rep, "[4]", json.as_i64(d, json.elem(d, rn, 4)), 8)
+
+    let inner: usize = json.elem(d, rn, 1)
+    test.eq_usize(c, rep, "[1] has two", json.len(d, inner), 2)
+    test.eq_i64(c, rep, "[1][1]", json.as_i64(d, json.elem(d, inner, 1)), 3)
+
+    let deep: usize = json.elem(d, rn, 3)
+    test.eq_usize(c, rep, "[3] has two", json.len(d, deep), 2)
+    let deeper: usize = json.elem(d, deep, 1)
+    test.eq_usize(c, rep, "[3][1] has two", json.len(d, deeper), 2)
+    test.eq_i64(c, rep, "[3][1][0]", json.as_i64(d, json.elem(d, deeper, 0)), 6)
+    test.eq_i64(c, rep, "[3][1][1]", json.as_i64(d, json.elem(d, deeper, 1)), 7)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn empty_containers_are_legal() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // `{"version":1,"diagnostics":[]}` is the exact shape `--json` promises for a clean
+    // program, so an empty array had better parse.
+    var d: json.Doc = json.parse(a, "{\"version\":1,\"diagnostics\":[]}")
+    test.is_true(c, rep, "parsed", json.parsed(d))
+    let rn: usize = json.root(d) as usize
+    let ds: isize = json.get(d, rn, "diagnostics")
+    test.is_true(c, rep, "found", ds >= 0)
+    test.eq_usize(c, rep, "empty", json.len(d, ds as usize), 0)
+
+    var d2: json.Doc = json.parse(a, "{}")
+    test.is_true(c, rep, "empty object parses", json.parsed(d2))
+    test.eq_usize(c, rep, "no pairs", json.len(d2, json.root(d2) as usize), 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

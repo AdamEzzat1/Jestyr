@@ -1,0 +1,663 @@
+// std/json.jtr — a deterministic JSON reader and writer, and not a framework.
+//
+// TIER: `std` for the reader (it allocates a node arena); the WRITER is `@no_alloc` and
+// writes into a caller `Sink`, so emitting JSON costs no heap at all.
+//
+// ─── Why this exists now, and why it is this small ────────────────────────────
+//
+// The deferral said "after `fmt`", and that was right about a general serialization
+// FRAMEWORK and wrong about this. A framework needs a formatting tier to render arbitrary
+// values; a JSON codec needs to render exactly six things — null, bool, number, string,
+// array, object — and `std/sink` already renders four of them. What was actually blocking
+// was reflection, and the answer is not to wait for reflection but to not need it: this
+// module has no `derive`, no trait, and no value-to-JSON mapping. You write JSON by
+// calling the writer; you read JSON into a node tree and ask it questions.
+//
+// **`jestyrc check --json` is the consumer that proves the shape.** The compiler already
+// emits machine-readable diagnostics as hand-escaped text, and `docs/diagnostics-json.md`
+// records why the escaper is hand-written: zero runtime dependencies. This module is the
+// in-language version of that same escaper, held to the same rule the doc states — one
+// unescaped byte makes the WHOLE report unparseable, losing every diagnostic rather than
+// one.
+//
+// ─── Determinism is the point, so object key order is the caller's ────────────
+//
+// A writer that sorted keys, or emitted them in hash order, would make two runs of the
+// same tool disagree — and `docs/diagnostics-json.md` already commits to "byte-identical
+// across runs, so a report can be diffed and checked in". So the writer emits keys in the
+// order you call `key()`, full stop. It does not deduplicate them either: JSON permits
+// repeated keys and silently dropping one would hide a caller's bug.
+//
+// ─── Numbers are integers, and that is a stated limit ─────────────────────────
+//
+// `put_i64` only. JSON numbers are decimal and unbounded; doubles round-trip through
+// decimal only with a correctly-rounded formatter, which this tree HAS (`std/numbers`)
+// and which is a much larger dependency than the rest of this module put together. An
+// integer-only writer is honest and complete for the things JSON is used for here —
+// diagnostics, manifests, lockfiles, build plans. `parse` reads a float's SYNTAX and
+// reports the token as a number it cannot convert, rather than truncating it silently.
+//
+// ─── The reader is a tree, and its cost is visible ────────────────────────────
+//
+// `parse` builds a flat node arena — one `List(i32)` of records plus one string arena —
+// and returns indices. Not a streaming reader, because every consumer named above wants
+// random access to a small document; not a value type, because a recursive `enum Json`
+// would need boxing Jestyr does not have. The arena's size is proportional to the input
+// and is freed in one call.
+//
+// Run the tests:  jestyrc test examples/std/json_test.jtr
+
+import "list"
+import "sink"
+import "str"
+
+// ------------------------------------------------------------------------ writing
+
+const QUOTE: i32 = 34
+const BACKSLASH: i32 = 92
+const LBRACE: i32 = 123
+const RBRACE: i32 = 125
+const LBRACK: i32 = 91
+const RBRACK: i32 = 93
+const COLON: i32 = 58
+const COMMA: i32 = 44
+
+// A writer's nesting state. Scalars only: the buffer stays with the caller, the same
+// second-class-borrow reason `Sink` itself takes one.
+//
+// `need_comma` is why this is a struct rather than a pile of free calls — JSON's
+// separator rule is positional, and a caller tracking it by hand is a caller who will
+// eventually emit `{"a":1,}`.
+@copy pub struct Writer {
+    depth: i64,
+    need_comma: bool,
+}
+
+@no_alloc @no_os pub fn writer() -> Writer {
+    return Writer{ depth: 0, need_comma: false }
+}
+
+// Emit a separator if one is due. Called before every value and every key.
+@no_alloc @no_os fn sep(mut w: Writer, mut s: Sink, mut buf: []u8) {
+    if w.need_comma { sink.put(s, buf, COMMA as u8) }
+    w.need_comma = false
+}
+
+// Escape and quote `text`.
+//
+// **Every byte that must be escaped is escaped**, which is the property the whole format
+// rests on: one raw `"` makes the entire document unparseable, so this loses everything
+// rather than one field. Quote, backslash and the C0 controls, with the short forms for
+// the four that have them; everything else below 0x20 as `\u00XX`. Non-ASCII passes
+// through unchanged, because JSON is UTF-8 by definition — and DEL (0x7F) is not a JSON
+// control character, so it is not escaped either. That is the same set
+// `diag::json_escape` uses on the Rust side, deliberately.
+@no_alloc @no_os pub fn put_str(mut w: Writer, mut s: Sink, mut buf: []u8, read text: str) {
+    sep(w, s, buf)
+    sink.put(s, buf, QUOTE as u8)
+    for i in 0..text.len {
+        let ch: i32 = text[i] as i32
+        if ch == QUOTE {
+            sink.put(s, buf, BACKSLASH as u8)
+            sink.put(s, buf, QUOTE as u8)
+        } else if ch == BACKSLASH {
+            sink.put(s, buf, BACKSLASH as u8)
+            sink.put(s, buf, BACKSLASH as u8)
+        } else if ch == 10 {
+            sink.put(s, buf, BACKSLASH as u8)
+            sink.put(s, buf, 110 as u8)          // n
+        } else if ch == 13 {
+            sink.put(s, buf, BACKSLASH as u8)
+            sink.put(s, buf, 114 as u8)          // r
+        } else if ch == 9 {
+            sink.put(s, buf, BACKSLASH as u8)
+            sink.put(s, buf, 116 as u8)          // t
+        } else if ch == 8 {
+            sink.put(s, buf, BACKSLASH as u8)
+            sink.put(s, buf, 98 as u8)           // b
+        } else if ch == 12 {
+            sink.put(s, buf, BACKSLASH as u8)
+            sink.put(s, buf, 102 as u8)          // f
+        } else if ch < 32 {
+            sink.put(s, buf, BACKSLASH as u8)
+            sink.put(s, buf, 117 as u8)          // u
+            sink.put(s, buf, 48 as u8)
+            sink.put(s, buf, 48 as u8)
+            sink.put_hex_u8(s, buf, ch as u8)
+        } else {
+            sink.put(s, buf, text[i] as u8)
+        }
+    }
+    sink.put(s, buf, QUOTE as u8)
+    w.need_comma = true
+}
+
+@no_alloc @no_os pub fn put_i64(mut w: Writer, mut s: Sink, mut buf: []u8, v: i64) {
+    sep(w, s, buf)
+    sink.put_i64(s, buf, v)
+    w.need_comma = true
+}
+
+@no_alloc @no_os pub fn put_bool(mut w: Writer, mut s: Sink, mut buf: []u8, v: bool) {
+    sep(w, s, buf)
+    sink.put_bool(s, buf, v)
+    w.need_comma = true
+}
+
+@no_alloc @no_os pub fn put_null(mut w: Writer, mut s: Sink, mut buf: []u8) {
+    sep(w, s, buf)
+    sink.put_str(s, buf, "null")
+    w.need_comma = true
+}
+
+// An object key. The next `put_*` is its value; the separator between them is emitted
+// here so a caller cannot forget it.
+@no_alloc @no_os pub fn key(mut w: Writer, mut s: Sink, mut buf: []u8, read name: str) {
+    put_str(w, s, buf, name)
+    sink.put(s, buf, COLON as u8)
+    w.need_comma = false
+}
+
+@no_alloc @no_os pub fn begin_object(mut w: Writer, mut s: Sink, mut buf: []u8) {
+    sep(w, s, buf)
+    sink.put(s, buf, LBRACE as u8)
+    w.depth = w.depth + 1
+    w.need_comma = false
+}
+
+@no_alloc @no_os pub fn end_object(mut w: Writer, mut s: Sink, mut buf: []u8) {
+    sink.put(s, buf, RBRACE as u8)
+    w.depth = w.depth - 1
+    w.need_comma = true
+}
+
+@no_alloc @no_os pub fn begin_array(mut w: Writer, mut s: Sink, mut buf: []u8) {
+    sep(w, s, buf)
+    sink.put(s, buf, LBRACK as u8)
+    w.depth = w.depth + 1
+    w.need_comma = false
+}
+
+@no_alloc @no_os pub fn end_array(mut w: Writer, mut s: Sink, mut buf: []u8) {
+    sink.put(s, buf, RBRACK as u8)
+    w.depth = w.depth - 1
+    w.need_comma = true
+}
+
+// `true` when every container opened has been closed. A document that ends mid-object is
+// not JSON, and the writer cannot refuse at the call site — it has no failure channel by
+// design — so this is where a caller checks. Paired with `sink.overflowed`, the two
+// together are the whole "did my output survive" question.
+@no_alloc @no_os pub fn balanced(read w: Writer) -> bool {
+    return w.depth == 0
+}
+
+@no_alloc @no_os pub fn depth(read w: Writer) -> i64 {
+    return w.depth
+}
+
+// ------------------------------------------------------------------------ reading
+
+// A node's kind.
+@copy pub enum Kind {
+    json_null,
+    json_bool,
+    json_number,
+    json_string,
+    json_array,
+    json_object,
+}
+
+// The parsed document: a flat node arena plus one string arena.
+//
+// Six `i32`s per node: kind, a, b, c, d, parent — reused per kind rather than a tagged
+// union, because a generic type cannot hold a pointer to another generic type and a
+// recursive `enum Json` would need boxing Jestyr has not got.
+//   null/bool/number: `a` is the value (bool as 0/1; number as an i64) and `b` says
+//     whether the number was integral.
+//   string: `(a,b)` slices `text`.
+//   array/object: `(a,b)` is a (start,count) slice of `kids`; for an object, `kids`
+//     alternates key-node, value-node.
+pub struct Doc {
+    text: String,
+    nodes: List(i32),
+    kids: List(i32),
+    root: i32,
+    es: usize,
+    ee: usize,
+}
+
+impl Drop for Doc {
+    fn drop(mut self) {
+        string_free(self.text)
+    }
+}
+
+pub fn parsed(read d: Doc) -> bool {
+    return d.ee == d.es
+}
+
+pub fn error_text(read d: Doc) -> str {
+    let v: str = string_view(d.text)
+    return v[d.es .. d.ee]
+}
+
+pub fn root(read d: Doc) -> isize {
+    return d.root as isize
+}
+
+pub fn node_count(read d: Doc) -> usize {
+    return list.len(i32, d.nodes) / 6
+}
+
+@no_alloc @no_os fn kind_of_code(k: i32) -> Kind {
+    if k == 0 { return json_null }
+    if k == 1 { return json_bool }
+    if k == 2 { return json_number }
+    if k == 3 { return json_string }
+    if k == 4 { return json_array }
+    return json_object
+}
+
+pub fn kind(read d: Doc, n: usize) -> Kind {
+    return kind_of_code(list.get(i32, d.nodes, n * 6))
+}
+
+pub fn as_bool(read d: Doc, n: usize) -> bool {
+    return list.get(i32, d.nodes, n * 6 + 1) != 0
+}
+
+pub fn as_i64(read d: Doc, n: usize) -> i64 {
+    return list.get(i32, d.nodes, n * 6 + 1) as i64
+}
+
+// `true` when a number fitted an `i64` exactly. A float's syntax parses and lands here as
+// `false` with `as_i64` meaningless — reported rather than truncated, see the header.
+pub fn is_integral(read d: Doc, n: usize) -> bool {
+    return list.get(i32, d.nodes, n * 6 + 2) != 0
+}
+
+pub fn as_str(read d: Doc, n: usize) -> str {
+    let v: str = string_view(d.text)
+    return v[list.get(i32, d.nodes, n * 6 + 1) as usize .. list.get(i32, d.nodes, n * 6 + 2) as usize]
+}
+
+// How many elements an array has, or how many PAIRS an object has.
+pub fn len(read d: Doc, n: usize) -> usize {
+    let c: usize = list.get(i32, d.nodes, n * 6 + 2) as usize
+    match kind(d, n) {
+        json_object => { return c / 2 },
+        json_array => { return c },
+        json_null => { return 0 },
+        json_bool => { return 0 },
+        json_number => { return 0 },
+        json_string => { return 0 },
+    }
+}
+
+pub fn elem(read d: Doc, n: usize, i: usize) -> usize {
+    let start: usize = list.get(i32, d.nodes, n * 6 + 1) as usize
+    return list.get(i32, d.kids, start + i) as usize
+}
+
+pub fn pair_key(read d: Doc, n: usize, i: usize) -> str {
+    let start: usize = list.get(i32, d.nodes, n * 6 + 1) as usize
+    return as_str(d, list.get(i32, d.kids, start + i * 2) as usize)
+}
+
+pub fn pair_value(read d: Doc, n: usize, i: usize) -> usize {
+    let start: usize = list.get(i32, d.nodes, n * 6 + 1) as usize
+    return list.get(i32, d.kids, start + i * 2 + 1) as usize
+}
+
+// The value for `name`, or -1. A LINEAR scan, deliberately: the documents this module
+// exists for have a handful of keys, and a hash index would allocate per lookup to save
+// nothing. It also returns the FIRST match, because JSON permits duplicate keys and
+// picking the last would silently disagree with a reader that picked the first.
+pub fn get(read d: Doc, n: usize, read name: str) -> isize {
+    var i: usize = 0
+    for i < len(d, n) {
+        if str.eq(pair_key(d, n, i), name) { return pair_value(d, n, i) as isize }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ------------------------------------------------------------------------ parsing
+
+// A cursor over the input, plus the scratch stack nested containers share.
+//
+// `scratch` is why this is a struct and not a bare index: a nested container appends its
+// own children while the outer one is still open, so writing directly into `kids` would
+// interleave two containers slices. Each container takes a base offset, pushes into
+// `scratch`, copies its run into `kids` on close, and truncates back.
+struct P {
+    at: usize,
+    scratch: List(i32),
+}
+
+fn fail(mut d: Doc, read what: str, read detail: str) {
+    if d.ee != d.es { return }              // the FIRST error, not the last
+    let v0: str = string_view(d.text)
+    d.es = v0.len
+    string_push(d.text, what)
+    string_push(d.text, detail)
+    let v1: str = string_view(d.text)
+    d.ee = v1.len
+}
+
+@no_alloc @no_os fn is_space(ch: i32) -> bool {
+    return ch == 32 or ch == 9 or ch == 10 or ch == 13
+}
+
+fn skip_ws(read src: str, mut p: P) {
+    for p.at < src.len {
+        if is_space(src[p.at] as i32) == false { return }
+        p.at = p.at + 1
+    }
+}
+
+// Append a node and return its index.
+fn push_node(mut d: Doc, k: i32, a: i32, b: i32) -> i32 {
+    let ix: i32 = (list.len(i32, d.nodes) / 6) as i32
+    list.push(i32, d.nodes, k)
+    list.push(i32, d.nodes, a)
+    list.push(i32, d.nodes, b)
+    list.push(i32, d.nodes, 0)
+    list.push(i32, d.nodes, 0)
+    list.push(i32, d.nodes, 0 - 1)
+    return ix
+}
+
+// Read a quoted string's CONTENT into the arena, honouring escapes, and return its slice.
+// `\uXXXX` is decoded for the ASCII range and passed through as the replacement character
+// otherwise: full UTF-16 surrogate-pair decoding is a real feature and a real decision
+// (what to do with an unpaired surrogate), and guessing it here would be the kind of quiet
+// wrongness this tree avoids. `unicode_escape_beyond_ascii_is_replaced` pins it.
+fn read_string(mut d: Doc, read src: str, mut p: P) -> i32 {
+    if p.at >= src.len or (src[p.at] as i32) != 34 {
+        fail(d, "expected a string", "")
+        return 0 - 1
+    }
+    p.at = p.at + 1
+    let v0: str = string_view(d.text)
+    let start: usize = v0.len
+    for p.at < src.len {
+        let ch: i32 = src[p.at] as i32
+        if ch == 34 {
+            p.at = p.at + 1
+            let v1: str = string_view(d.text)
+            return push_node(d, 3, start as i32, v1.len as i32)
+        }
+        if ch == 92 {
+            p.at = p.at + 1
+            if p.at >= src.len { break }
+            let e: i32 = src[p.at] as i32
+            if e == 110 { string_push(d.text, "\n") }
+            else if e == 114 { string_push(d.text, "\r") }
+            else if e == 116 { string_push(d.text, "\t") }
+            // Backspace and form feed go through `push_byte`, not a literal: Jestyr passes
+            // a unicode escape into the emitted C verbatim, and C rejects a universal
+            // character name below 0x20. A .jtr trap -- accepted by the front end, fails in gcc.
+            else if e == 98 { push_byte(d, 8) }
+            else if e == 102 { push_byte(d, 12) }
+            else if e == 34 { string_push(d.text, "\"") }
+            else if e == 92 { string_push(d.text, "\\") }
+            else if e == 47 { string_push(d.text, "/") }
+            else if e == 117 {
+                var code: i32 = 0
+                var k: usize = 0
+                for k < 4 {
+                    p.at = p.at + 1
+                    if p.at >= src.len { break }
+                    let h: i32 = src[p.at] as i32
+                    var dv: i32 = 0 - 1
+                    if h >= 48 and h <= 57 { dv = h - 48 }
+                    else if h >= 97 and h <= 102 { dv = h - 87 }
+                    else if h >= 65 and h <= 70 { dv = h - 55 }
+                    if dv < 0 {
+                        fail(d, "bad unicode escape", "")
+                        return 0 - 1
+                    }
+                    code = code * 16 + dv
+                    k = k + 1
+                }
+                if code < 128 {
+                    push_byte(d, code)
+                } else {
+                    string_push(d.text, "?")
+                }
+            } else {
+                fail(d, "unknown escape", "")
+                return 0 - 1
+            }
+            p.at = p.at + 1
+            continue
+        }
+        push_byte(d, ch)
+        p.at = p.at + 1
+    }
+    fail(d, "unterminated string", "")
+    return 0 - 1
+}
+
+// Append one byte to the arena. `string_push` takes a `str`, so a single byte needs a
+// one-byte view — built from a stack cell rather than a heap block, which is why this is
+// a helper rather than an inline expression.
+fn push_byte(mut d: Doc, ch: i32) {
+    var one: *mut u8 = alloc(u8, 1)
+    unsafe { one.* = ch as u8 }
+    let sl: []u8 = slice(u8, one, 1)
+    string_push(d.text, from_utf8(sl))
+    free_ptr(one)
+}
+
+// A number. Integral only — see the header. A float's SYNTAX is consumed so the document
+// still parses, and the node is marked non-integral so `as_i64` cannot be believed.
+fn read_number(mut d: Doc, read src: str, mut p: P) -> i32 {
+    let start: usize = p.at
+    var neg: bool = false
+    if p.at < src.len {
+        if (src[p.at] as i32) == 45 {
+            neg = true
+            p.at = p.at + 1
+        }
+    }
+    var v: i64 = 0
+    var digits: usize = 0
+    for p.at < src.len {
+        let ch: i32 = src[p.at] as i32
+        if ch < 48 or ch > 57 { break }
+        v = v * 10 + (ch - 48) as i64
+        digits = digits + 1
+        p.at = p.at + 1
+    }
+    if digits == 0 {
+        fail(d, "expected a number", "")
+        return 0 - 1
+    }
+    // A fraction or an exponent: consume it, and mark the node non-integral rather than
+    // truncating. Silently returning the integer part would be the worst of the three
+    // options — a caller would get a plausible wrong answer.
+    var integral: bool = true
+    if p.at < src.len {
+        let ch2: i32 = src[p.at] as i32
+        if ch2 == 46 or ch2 == 101 or ch2 == 69 {
+            integral = false
+            for p.at < src.len {
+                let c3: i32 = src[p.at] as i32
+                let ok: bool = (c3 >= 48 and c3 <= 57) or c3 == 46 or c3 == 101 or c3 == 69 or c3 == 43 or c3 == 45
+                if ok == false { break }
+                p.at = p.at + 1
+            }
+        }
+    }
+    if neg { v = 0 - v }
+    var flag: i32 = 0
+    if integral { flag = 1 }
+    return push_node(d, 2, v as i32, flag)
+}
+
+fn matches_word(read src: str, at: usize, read w: str) -> bool {
+    if at + w.len > src.len { return false }
+    return str.eq(src[at .. at + w.len], w)
+}
+
+// One value. Recursive, with an explicit depth cap: a JSON document is untrusted input and
+// `[[[[...` nests as deeply as the attacker likes, so an uncapped recursive-descent reader
+// is a stack overflow rather than a diagnostic. 128 is far past any document these
+// consumers produce and far short of any stack.
+const MAX_DEPTH: usize = 128
+
+fn read_value(mut d: Doc, read src: str, mut p: P, depth: usize) -> i32 {
+    if depth > MAX_DEPTH {
+        fail(d, "nesting too deep", "")
+        return 0 - 1
+    }
+    skip_ws(src, p)
+    if p.at >= src.len {
+        fail(d, "unexpected end of input", "")
+        return 0 - 1
+    }
+    let ch: i32 = src[p.at] as i32
+    if ch == 34 { return read_string(d, src, p) }
+    if ch == 45 or (ch >= 48 and ch <= 57) { return read_number(d, src, p) }
+    if matches_word(src, p.at, "true") {
+        p.at = p.at + 4
+        return push_node(d, 1, 1, 0)
+    }
+    if matches_word(src, p.at, "false") {
+        p.at = p.at + 5
+        return push_node(d, 1, 0, 0)
+    }
+    if matches_word(src, p.at, "null") {
+        p.at = p.at + 4
+        return push_node(d, 0, 0, 0)
+    }
+    if ch == LBRACK { return read_array(d, src, p, depth) }
+    if ch == LBRACE { return read_object(d, src, p, depth) }
+    fail(d, "unexpected character", "")
+    return 0 - 1
+}
+
+fn read_array(mut d: Doc, read src: str, mut p: P, depth: usize) -> i32 {
+    p.at = p.at + 1
+    let base: usize = list.len(i32, p.scratch)
+    skip_ws(src, p)
+    if p.at < src.len {
+        if (src[p.at] as i32) == RBRACK {
+            p.at = p.at + 1
+            return push_node(d, 4, list.len(i32, d.kids) as i32, 0)
+        }
+    }
+    for true {
+        let v: i32 = read_value(d, src, p, depth + 1)
+        if v < 0 { return 0 - 1 }
+        list.push(i32, p.scratch, v)
+        skip_ws(src, p)
+        if p.at >= src.len {
+            fail(d, "unterminated array", "")
+            return 0 - 1
+        }
+        let ch: i32 = src[p.at] as i32
+        if ch == COMMA {
+            p.at = p.at + 1
+            continue
+        }
+        if ch == RBRACK {
+            p.at = p.at + 1
+            break
+        }
+        fail(d, "expected `,` or `]`", "")
+        return 0 - 1
+    }
+    let start: usize = list.len(i32, d.kids)
+    var i: usize = base
+    for i < list.len(i32, p.scratch) {
+        list.push(i32, d.kids, list.get(i32, p.scratch, i))
+        i = i + 1
+    }
+    let count: usize = list.len(i32, p.scratch) - base
+    list.truncate(i32, p.scratch, base)
+    return push_node(d, 4, start as i32, count as i32)
+}
+
+// An object. Children alternate key-node, value-node — so `len` divides by two and
+// `pair_key`/`pair_value` index by two. Storing keys as ordinary string NODES rather than
+// as a separate table is what keeps the arena one shape.
+fn read_object(mut d: Doc, read src: str, mut p: P, depth: usize) -> i32 {
+    p.at = p.at + 1
+    let base: usize = list.len(i32, p.scratch)
+    skip_ws(src, p)
+    if p.at < src.len {
+        if (src[p.at] as i32) == RBRACE {
+            p.at = p.at + 1
+            return push_node(d, 5, list.len(i32, d.kids) as i32, 0)
+        }
+    }
+    for true {
+        skip_ws(src, p)
+        let k: i32 = read_string(d, src, p)
+        if k < 0 { return 0 - 1 }
+        skip_ws(src, p)
+        if p.at >= src.len {
+            fail(d, "expected `:`", "")
+            return 0 - 1
+        }
+        if (src[p.at] as i32) != COLON {
+            fail(d, "expected `:`", "")
+            return 0 - 1
+        }
+        p.at = p.at + 1
+        let v: i32 = read_value(d, src, p, depth + 1)
+        if v < 0 { return 0 - 1 }
+        list.push(i32, p.scratch, k)
+        list.push(i32, p.scratch, v)
+        skip_ws(src, p)
+        if p.at >= src.len {
+            fail(d, "unterminated object", "")
+            return 0 - 1
+        }
+        let ch: i32 = src[p.at] as i32
+        if ch == COMMA {
+            p.at = p.at + 1
+            continue
+        }
+        if ch == RBRACE {
+            p.at = p.at + 1
+            break
+        }
+        fail(d, "expected `,` or `}`", "")
+        return 0 - 1
+    }
+    let start: usize = list.len(i32, d.kids)
+    var i: usize = base
+    for i < list.len(i32, p.scratch) {
+        list.push(i32, d.kids, list.get(i32, p.scratch, i))
+        i = i + 1
+    }
+    let count: usize = list.len(i32, p.scratch) - base
+    list.truncate(i32, p.scratch, base)
+    return push_node(d, 5, start as i32, count as i32)
+}
+
+// Parse `src`. Check `parsed(d)`; `error_text(d)` says what went wrong.
+//
+// TRAILING CONTENT IS AN ERROR. `{"a":1} garbage` is not a JSON document, and accepting
+// the prefix would make a truncated or concatenated file look valid — the same class of
+// quiet acceptance `std/cstring` refuses for interior NULs.
+pub fn parse(read a: Allocator, read src: str) -> Doc {
+    var d: Doc = Doc{ text: string_new(), nodes: list.make(i32, a), kids: list.make(i32, a), root: 0 - 1, es: 0, ee: 0 }
+    var p: P = P{ at: 0, scratch: list.make(i32, a) }
+    let r: i32 = read_value(d, src, p, 0)
+    if r >= 0 {
+        skip_ws(src, p)
+        if p.at < src.len {
+            fail(d, "trailing content after the value", "")
+        } else {
+            d.root = r
+        }
+    }
+    list.free(i32, p.scratch)
+    return d
+}
