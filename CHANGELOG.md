@@ -7,6 +7,47 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **The self-hosted driver renders through `std/diag`.** `jc <file> build|run` now prints the
+  same caret block the reference does — header, `--> file:line:col`, the offending source
+  line, an underline — instead of one `path:line:col: error: <msg>` line, and reports every
+  diagnostic in a stage rather than stopping at the first, with the reference's trailing
+  `N error(s)`.
+
+  **The reason this was worth doing is not the carets.** The loader already held a source
+  map and nothing knew it: `Ml.nb` is every loaded module's name concatenated, `Ml.allsrc`
+  every module's source, and `Ml.mods` six offsets per module — a `diag.SourceMap` with
+  different field names. Handing those ranges to `diag.add_file` once *deleted* the driver's
+  hand-rolled line/column counter, which was a second implementation of `diag.pos_of` and
+  the kind of duplicate that drifts silently because nothing compares them. Adding a file per
+  module in loader order also means a module index **is** its `FileId`, so no side table.
+
+  **A span end had been computed and discarded for the life of the driver.**
+  `escape.Esc.dsp` has always held `(start, end)` pairs; `eprint_diag` took only the start,
+  so it could not have drawn anything but a one-column caret. The `^^^…` runs now matching
+  the reference are not new information — they are information that stopped being thrown
+  away. The golden asserts the multi-column run for exactly that reason.
+
+  **Abbreviation is per stage, because only some diagnostics cascade.** Parse recovery
+  cascades (one missing operand yields four Error nodes, since recovery resumes
+  mid-expression) and so does an Error type, which propagates into every enclosing
+  expression — those get `diag_demo.jtr`'s policy of one caret block then one line each,
+  which is the whole reason `render_brief` exists. Escape diagnostics do **not** cascade:
+  each is an independent rule violation at an independent site, so all of them render in
+  full, as the reference does. A blanket policy would have silently abbreviated real
+  findings.
+
+  No error codes on the port's diagnostics. The reference attaches one (`error[E0007]:
+  expected an expression, found `)``) because its parser knows which rule failed; these
+  messages are generic v1 text recovered from an Error node, so a code here would either
+  collide with a reference code under a different meaning or invent a parallel numbering.
+
+  **Cost, named rather than absorbed:** `diag` and its `sink` dependency join the
+  self-hosting closure, so `SELFHOST_MODULES` is fourteen modules and the bootstrap seed
+  grows 40,715 → 41,886 lines of C. That is what "load-bearing" means here — `std/diag` is
+  no longer merely available to programs the compiler compiles, it is part of the compiler.
+  The closure absorbed it without incident: the concat build, the `jc2 ≡ jc1` fixed point and
+  the self-build through `jc`'s own loader are all green.
+
 - **`@cfg` in the self-hosted back end — `sys` now builds under `jc`.** The Jestyr-written
   `cgen.jtr` emits the same `#if defined(_WIN32)` / `#if !defined(_WIN32)` guards the Rust
   reference does, at all five sites: the header `#include`, the `extern "c"` prototype, the

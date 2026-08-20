@@ -621,10 +621,28 @@ needs to tell them apart.
    `cfg_platform.jtr` and `sysdir.jtr` are allowlisted and byte-identity verified.
    `walk.jtr` remains out, for a reason that turned out to be about auto-drop under
    unresolved imports and not about `@cfg` at all — see §0 if you want to close it.
-2. **Wire `std/diag` into `cgen.jtr`'s driver** — the consumer that makes the module
-   load-bearing rather than merely available. The driver today prints
-   `path:line:col: error: …` and stops at the first; `diag_demo.jtr` already shows the
-   upgrade. Closure module, so reseed + golden run; budget it as its own increment.
+2. ~~**Wire `std/diag` into `cgen.jtr`'s driver**~~ — **DONE.** `jc <file> build|run` renders
+   the reference's caret block and reports every diagnostic in a stage. `diag` + `sink` joined
+   the self-hosting closure (`SELFHOST_MODULES` is now **fourteen**; seed 40,715 → 41,886
+   lines) and it absorbed them without incident — concat, `jc2 ≡ jc1`, and self-build all
+   green. Three things worth carrying forward:
+   * **The loader was already a source map** (`Ml.nb`/`allsrc`/`mods` ≡ name/text/offsets),
+     so wiring diag DELETED the driver's hand-rolled line/col counter — a second copy of
+     `diag.pos_of` that nothing compared. Adding one file per module in loader order makes a
+     module index *be* its `FileId`.
+   * **`escape.Esc.dsp` always held (start, end) pairs and the old renderer took only the
+     start**, so it could never have drawn more than a one-column caret. The `^^^…` runs are
+     information that stopped being discarded, not information that was computed.
+   * **Abbreviation is per stage.** Parse recovery cascades and Error types propagate → one
+     caret block then one line each (`diag_demo.jtr`'s policy, and why `render_brief`
+     exists). Escape diagnostics do NOT cascade — each is an independent violation at an
+     independent site — so all render in full, as the reference does. A blanket
+     first-full-rest-brief would have silently abbreviated real findings.
+
+   Left deliberately: no error codes on the port's diagnostics (its messages are generic v1
+   text from an Error node; a code would collide with a reference code under a different
+   meaning), and diag's gutter prints one leading space more than the reference's — cosmetic,
+   and changing it would churn `diag_test.jtr`'s goldens for nothing.
 3. **Intrinsic shadowing, properly** — cgen prefers the user's function over the intrinsic.
    Emission change in a closure module: mirror, reseed, golden churn. The warning makes
    this a known debt rather than a latent one, but `lexer.str_eq` is a live trap until then.

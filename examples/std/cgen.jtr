@@ -24,6 +24,8 @@ import "typeck"
 import "ctfe"
 import "escape"
 import "sha256"
+import "diag"
+import "sink"
 
 // ---- the fixed C prelude (mirrors Cgen::prelude) ----
 // A FIXED header block: includes + the `jestyr_rt_*` runtime + the JestyrStr/String/Cow/Builder
@@ -13855,18 +13857,62 @@ fn ml_flatten(mut m: Ml, read root: str, mut it: Interner, kwcount: i64, read a:
 // ---- the product driver (`build` / `run`) — the self-hosted compiler as a daily tool ----
 // Unlike the raw `jc <file>` dump (the golden's plumbing mode, mirroring `cgen::emit`
 // unconditionally), the product modes GATE on the escape checker's buffered diagnostics,
-// render them `path:line:col: error: <msg>` on stderr, write `<stem>.c`, drive gcc with
-// the locked flag set via `run_command`, and (for `run`) execute the produced binary,
-// forwarding its exit code. Parse and typeck refusal use the recovery artifacts (Error
-// nodes / Error types) with generic v1 messages at exact mapped locations; the reference's
-// expected/found message text is a follow-up.
+// render them through **`std/diag`** on stderr, write `<stem>.c`, drive gcc with the locked
+// flag set via `run_command`, and (for `run`) execute the produced binary, forwarding its
+// exit code. Parse and typeck refusal use the recovery artifacts (Error nodes / Error
+// types) with generic v1 messages at exact mapped locations; the reference's expected/found
+// message text is a follow-up.
+//
+// ─── Why the driver imports `std/diag` rather than keeping its own renderer ────
+//
+// The driver used to print one `path:line:col: error: <msg>` line and stop at the first
+// diagnostic, counting line and column itself. Two things were wrong with that, and only
+// one of them is cosmetic.
+//
+// The cosmetic one: no source line, no caret, so a diagnostic said WHERE without showing
+// WHAT. `diag.plain()` renders the same `--> file:line:col` / gutter / caret block the
+// reference's `src/diag.rs` does, so both toolchains now look alike at a glance.
+//
+// The one that matters: **the loader already held a source map and nothing knew it.**
+// `Ml.nb` is every loaded module's name concatenated, `Ml.allsrc` every module's source,
+// and `Ml.mods` six offsets per module — which is a `diag.SourceMap` with different field
+// names. Handing those ranges to `diag.add_file` once deletes the hand-rolled line/column
+// counter here (a second implementation of `diag.pos_of`, and the kind of duplicate that
+// drifts silently because nothing compares them).
+//
+// The cost is honest and worth naming: `diag` and its `sink` dependency join the
+// self-hosting closure, so `SELFHOST_MODULES` is fourteen modules and the bootstrap seed
+// carries both. That is what "load-bearing" means here — the module is no longer merely
+// available to programs the compiler compiles, it is part of the compiler.
 
-// One diagnostic on stderr, attributed to its OWNING FILE — the `#line` analogue. A merged
-// span maps back through the rewrite checkpoints (last checkpoint at or before the span;
-// verbatim in between), then the owning module is found by its `allsrc` range and 1-based
-// line/col are counted in that module's ORIGINAL source.
-fn eprint_diag(mut m: Ml, start: usize, read msg: str) {
-    var cm: i32 = 0 - 1                               // best checkpoint (merged, allsrc)
+const DIAG_CAP: usize = 8192
+
+// The `SourceMap` the driver renders through: one file per loaded module, added in loader
+// order, so **a module index IS its `FileId`** — which is what lets `driver_report` map an
+// owning-module index straight to a file without a side table.
+fn driver_map(mut m: Ml, read a: Allocator) -> diag.SourceMap {
+    var sm: diag.SourceMap = diag.map_new(a)
+    let nbv: str = string_view(m.nb)
+    let all: str = string_view(m.allsrc)
+    var mi: usize = 0
+    for mi < list.len(i32, m.mods) / 6 {
+        let mb: usize = mi * 6
+        let ns: usize = list.get(i32, m.mods, mb + 2) as usize
+        let ne: usize = list.get(i32, m.mods, mb + 3) as usize
+        let ss: usize = list.get(i32, m.mods, mb + 4) as usize
+        let se: usize = list.get(i32, m.mods, mb + 5) as usize
+        let fid: diag.FileId = diag.add_file(sm, nbv[ns .. ne], all[ss .. se])
+        mi = mi + 1
+    }
+    return sm
+}
+
+// A merged-source offset → the corresponding offset in `allsrc`, or -1 when unmapped. The
+// merged span maps back through the rewrite checkpoints: the last checkpoint at or before
+// the span, verbatim in between. (This is the `#line` analogue — the rewriter's renames
+// shift offsets, and the checkpoints are where it recorded the shift.)
+fn driver_orig(mut m: Ml, start: usize) -> i64 {
+    var cm: i32 = 0 - 1
     var co: i32 = 0 - 1
     var i: usize = 0
     for i < list.len(i32, m.map) / 2 {
@@ -13877,18 +13923,14 @@ fn eprint_diag(mut m: Ml, start: usize, read msg: str) {
         }
         i = i + 1
     }
-    var b: String = string_new()
-    if cm < 0 {                                       // no mapping (shouldn't happen): raw offset
-        string_push(b, "<merged>:")
-        push_uint(b, start as i64)
-        string_push(b, ": error: ")
-        string_push(b, msg)
-        eprint_str(string_view(b))
-        string_free(b)
-        return
-    }
-    let orig: usize = (co as usize) + (start - (cm as usize))
-    var found: i32 = 0 - 1                            // the module owning `orig`
+    if cm < 0 { return 0 - 1 }
+    return (co as i64) + (start as i64) - (cm as i64)
+}
+
+// The index of the module whose `allsrc` range contains `orig` (0 if none, which cannot
+// happen for a mapped offset but must not be a crash if it does).
+fn driver_owner(mut m: Ml, orig: usize) -> i32 {
+    var found: i32 = 0 - 1
     var mi: usize = 0
     for mi < list.len(i32, m.mods) / 6 {
         let ss: i32 = list.get(i32, m.mods, mi * 6 + 4)
@@ -13897,45 +13939,121 @@ fn eprint_diag(mut m: Ml, start: usize, read msg: str) {
         mi = mi + 1
     }
     if found < 0 { found = 0 }
-    let mb: usize = (found as usize) * 6
-    let all: str = string_view(m.allsrc)
-    let ss2: usize = list.get(i32, m.mods, mb + 4) as usize
-    var line: i64 = 1
-    var col: i64 = 1
-    var k: usize = ss2
-    for k < orig {
-        if (all[k] as i32) == 10 {
-            line = line + 1
-            col = 1
-        } else {
-            col = col + 1
-        }
-        k = k + 1
+    return found
+}
+
+// One diagnostic on stderr, attributed to its OWNING FILE and rendered through `std/diag`.
+//
+// `full` picks the rendering, and **the choice is per STAGE rather than global** because
+// the argument for abbreviating only holds where diagnostics cascade:
+//
+//   * parse — one missing operand produces five Error nodes, because recovery resumes
+//     mid-expression and every following token is then read in the wrong context;
+//   * type — an Error type propagates into every enclosing expression;
+//   * escape — it does NOT cascade. Each diagnostic is an independent rule violation at an
+//     independent site, which is why the reference renders all of them in full and so does
+//     this.
+//
+// So the cascading stages get `diag_demo.jtr`'s first-full-rest-brief policy (five caret
+// blocks for one mistake bury the mistake, and that is the whole reason `render_brief`
+// exists), and the non-cascading one does not.
+//
+// **No error code.** The reference attaches one (`error[E0007]: expected an expression,
+// found `)``) because its parser knows which rule failed; these messages are deliberately
+// generic v1 text recovered from an Error node, so a code here would either duplicate a
+// reference code with a different meaning or invent a parallel numbering. Saying less is
+// the honest option until the port carries the reference's expected/found text.
+fn driver_report(mut m: Ml, read sm: diag.SourceMap, read a: Allocator, start: usize, end: usize, read msg: str, read label: str, full: bool, nprev: i32, prevfull: bool) {
+    // The separator rule: a blank line goes before a diagnostic when EITHER it or the one
+    // before it is a caret block. Consecutive one-liners run together, which is what makes
+    // a cascade tail read as a list rather than as four paragraphs.
+    //
+    // Emitted before rather than after, so that the summary's own blank line is the only
+    // thing between the last diagnostic and `N error(s)` — otherwise the count of blank
+    // lines there would depend on which form the last diagnostic happened to take.
+    if nprev > 0 and (full or prevfull) { eprint_str("") }
+    let og: i64 = driver_orig(m, start)
+    var d: diag.Diagnostic = diag.new_error(a, "", msg)
+    if og >= 0 {
+        let orig: usize = og as usize
+        let own: i32 = driver_owner(m, orig)
+        let base: usize = list.get(i32, m.mods, (own as usize) * 6 + 4) as usize
+        let lim: usize = list.get(i32, m.mods, (own as usize) * 6 + 5) as usize
+        // The span is clamped to the owning file: a merged END can run past the module
+        // boundary when recovery swallowed a run, and a span outside its file would place
+        // the caret in another module's text rather than fail loudly.
+        var hi: usize = orig
+        let oge: i64 = driver_orig(m, end)
+        if oge > og { hi = oge as usize }
+        if hi > lim { hi = lim }
+        diag.primary(d, diag.span(own as diag.FileId, orig - base, hi - base), label)
     }
-    let nbv: str = string_view(m.nb)
-    string_push(b, nbv[list.get(i32, m.mods, mb + 2) as usize .. list.get(i32, m.mods, mb + 3) as usize])
-    string_push(b, ":")
-    push_uint(b, line)
-    string_push(b, ":")
-    push_uint(b, col)
-    string_push(b, ": error: ")
-    string_push(b, msg)
-    eprint_str(string_view(b))
-    string_free(b)
+    var raw: *mut u8 = alloc(u8, DIAG_CAP)
+    var buf: []u8 = slice(u8, raw, DIAG_CAP)
+    var s: Sink = sink.new()
+    if full {
+        let n: usize = diag.render(s, buf, sm, d, diag.plain())
+    } else {
+        let n2: usize = diag.render_brief(s, buf, sm, d)
+    }
+    // The overflow contract, which is the one thing a caller must not skip: `render`
+    // returns what it WROTE, so a truncated caret block is indistinguishable from a
+    // complete one at every oracle. Fall back to the one-line form, which fits any sane
+    // buffer, rather than print a diagnostic cut in half — possibly mid-caret.
+    if sink.overflowed(s) {
+        sink.reset(s)
+        let n3: usize = diag.render_brief(s, buf, sm, d)
+    }
+    // `render` ends its last row with a newline and `render_brief` does not, while
+    // `eprint_str` supplies one either way. Trimming the renderer's own trailing newline is
+    // what makes the two forms space identically — and keeps exactly one blank line before
+    // the `N error(s)` summary, like the reference, instead of one or two depending on
+    // which form the last diagnostic happened to take.
+    let v: str = sink.view(s, buf)
+    if v.len > 0 and (v[v.len - 1] as i32) == 10 {
+        eprint_str(v[0 .. v.len - 1])
+    } else {
+        eprint_str(v)
+    }
+    free_ptr(raw)
+}
+
+// The trailing `N error(s)` the reference prints, after one blank line. A count is not
+// decoration: where the first-full-rest-brief policy applies, it is what tells a reader
+// whether the one caret block they are looking at was the whole story.
+fn driver_error_count(n: i32) {
+    eprint_str("")
+    var c: String = string_new()
+    push_uint(c, n as i64)
+    string_push(c, " error(s)")
+    eprint_str(string_view(c))
+    string_free(c)
 }
 
 // The `build`/`run` modes: 1 on diagnostics or a write failure, gcc's code on a failed
 // compile, the program's own exit code for `run`, else 0.
 fn driver_build(mut m: Ml, read p: parser.Parser, read c: typeck.Checker, read src: str, read a: Allocator, read path: str, do_run: bool) -> i32 {
+    // The loader's own tables, handed to `diag` once. Built here rather than per
+    // diagnostic: `add_file` copies each module's source into the map's arena, so building
+    // it inside the reporter would copy the whole program once per error.
+    var sm: diag.SourceMap = driver_map(m, a)
+    var nerr: i32 = 0
+    var prevfull: bool = false                    // was the last diagnostic a caret block?
+
     // Parse refusal: any Error expr (kind 9) or Error item (kind 99) — the ported parser's
     // recovery artifacts. v1 messages are generic (the reference's expected/found text is a
     // follow-up); the LOCATION is exact via the checkpoint mapper.
+    //
+    // Every artifact is now reported, not just the first. The stages stay separate and each
+    // still refuses before the next, because a program that did not parse has garbage types
+    // and reporting those on top would be noise, not information.
     var pi2: usize = 0
     for pi2 < list.len(parser.ExprData, p.ex) {
         let pe: parser.ExprData = list.get(parser.ExprData, p.ex, pi2)
         if pe.kind == 9 {
-            eprint_diag(m, pe.start, "syntax error (unexpected or malformed input)")
-            return 1
+            driver_report(m, sm, a, pe.start, pe.end, "syntax error (unexpected or malformed input)", "the parser could not read this as an expression", nerr == 0, nerr, prevfull)
+            prevfull = nerr == 0
+            nerr = nerr + 1
         }
         pi2 = pi2 + 1
     }
@@ -13943,10 +14061,15 @@ fn driver_build(mut m: Ml, read p: parser.Parser, read c: typeck.Checker, read s
     for pj < list.len(parser.ItemData, p.it) {
         let itd: parser.ItemData = list.get(parser.ItemData, p.it, pj)
         if itd.kind == 99 {
-            eprint_diag(m, itd.start, "syntax error: expected an item")
-            return 1
+            driver_report(m, sm, a, itd.start, itd.end, "syntax error: expected an item", "only `fn`, `struct`, `enum`, `const`, `trait`, `impl`, `import` and `distinct` may appear here", nerr == 0, nerr, prevfull)
+            prevfull = nerr == 0
+            nerr = nerr + 1
         }
         pj = pj + 1
+    }
+    if nerr > 0 {
+        driver_error_count(nerr)
+        return 1
     }
     // Type refusal: any expression the checker resolved to the Error type (kind 16 — a real
     // mismatch, e.g. an operator with no impl; degenerate Unknowns never refuse).
@@ -13957,11 +14080,16 @@ fn driver_build(mut m: Ml, read p: parser.Parser, read c: typeck.Checker, read s
             let td2: typeck.TyData = list.get(typeck.TyData, c.tys, tid2 as usize)
             if td2.kind == 16 {
                 let ed2: parser.ExprData = list.get(parser.ExprData, p.ex, ti2)
-                eprint_diag(m, ed2.start, "type error at this expression")
-                return 1
+                driver_report(m, sm, a, ed2.start, ed2.end, "type error at this expression", "this expression has no valid type", nerr == 0, nerr, prevfull)
+                prevfull = nerr == 0
+                nerr = nerr + 1
             }
         }
         ti2 = ti2 + 1
+    }
+    if nerr > 0 {
+        driver_error_count(nerr)
+        return 1
     }
     var e: escape.Esc = escape.check_program(p, c, src, a)
     if list.len(i32, e.dsp) > 0 {                     // refuse to emit on escape diagnostics
@@ -13971,12 +14099,20 @@ fn driver_build(mut m: Ml, read p: parser.Parser, read c: typeck.Checker, read s
         var k: usize = 0
         for k < dm.len {
             if (dm[k] as i32) == 10 {
-                eprint_diag(m, list.get(i32, e.dsp, di * 2) as usize, dm[ls .. k])
+                // `dsp` holds span PAIRS; the end was already recorded and was previously
+                // thrown away, which is why the old renderer could only ever have drawn a
+                // one-column caret. Every escape diagnostic renders in FULL — they do not
+                // cascade, so abbreviating the second one would lose a real finding rather
+                // than suppress an echo of the first.
+                driver_report(m, sm, a, list.get(i32, e.dsp, di * 2) as usize, list.get(i32, e.dsp, di * 2 + 1) as usize, dm[ls .. k], "", true, nerr, prevfull)
+                prevfull = true
+                nerr = nerr + 1
                 di = di + 1
                 ls = k + 1
             }
             k = k + 1
         }
+        driver_error_count(nerr)
         return 1
     }
     var sb: String = string_new()

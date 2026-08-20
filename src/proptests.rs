@@ -12508,13 +12508,30 @@ fn g(p: *mut i32) -> i32 {
         assert!(out.status.success(), "driver run failed: {}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(String::from_utf8_lossy(&out.stdout), want, "driver run stdout diverged");
         // 3. An escape-diagnostic file is REFUSED: non-zero exit, rendered stderr, no C written.
+        //
+        // The driver renders through `std/diag` (`diag.plain()`), so this pins the CARET
+        // BLOCK, not just a located line: header, `--> file:line:col`, the offending source
+        // line, and an underline. The multi-column run is the load-bearing assertion —
+        // `escape.Esc.dsp` has always held (start, end) PAIRS and the old renderer took only
+        // the start, so a `^^^…` run is something it could not have produced. And every
+        // escape diagnostic renders in full: they do not cascade, so all three appear.
         let bad = dir.join("bad.jtr");
         std::fs::copy("examples/region_escape.jtr", &bad).unwrap();
         let out = Command::new(&jc).args([bad.to_str().unwrap(), "build"]).output().unwrap();
         assert!(!out.status.success(), "driver must refuse a file with escape diagnostics");
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains(": error: "), "diagnostics not rendered: {stderr}");
-        assert!(stderr.contains("bad.jtr:"), "diagnostic path missing: {stderr}");
+        assert!(stderr.contains("error: cannot "), "diagnostics not rendered: {stderr}");
+        assert!(stderr.contains("  --> "), "no `-->` location line: {stderr}");
+        assert!(stderr.contains("bad.jtr:14:16"), "diagnostic location missing: {stderr}");
+        assert!(
+            stderr.contains("saved = region_concat(r, \"a\", \"b\")"),
+            "the offending source line is not shown: {stderr}"
+        );
+        assert!(stderr.contains("^^^^^^^^^^"), "no multi-column caret run: {stderr}");
+        assert!(
+            stderr.contains("3 error(s)"),
+            "all three escape diagnostics must be reported, with a count: {stderr}"
+        );
         assert!(!dir.join("bad.c").exists(), "driver must not emit C for a refused file");
         // 4. A PARSE error refuses with a located syntax diagnostic (generic v1 message).
         // The scan keys on the parser's RECOVERY artifacts (Error nodes), which expression-
@@ -12526,8 +12543,38 @@ fn g(p: *mut i32) -> i32 {
         assert!(!out.status.success(), "driver must refuse a parse-error file");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("syntax error"), "parse refusal not rendered: {stderr}");
+        assert!(stderr.contains("  --> "), "no `-->` location line: {stderr}");
         assert!(stderr.contains("synbad.jtr:2:"), "parse diagnostic location wrong: {stderr}");
+        assert!(
+            stderr.contains("fn broken() -> i32 { return ) }"),
+            "the offending source line is not shown: {stderr}"
+        );
         assert!(!dir.join("synbad.c").exists(), "driver must not emit C for a parse-error file");
+
+        // 4b. A CASCADE gets one caret block and then one line each — `diag_demo.jtr`'s
+        // policy, and the reason `render_brief` exists. One missing operand produces four
+        // Error nodes here because recovery resumes mid-expression; four caret blocks for
+        // one mistake would bury the mistake, and saying nothing about the other three (the
+        // driver's previous answer, which stopped at the first) loses that there were any.
+        let casc = dir.join("cascade.jtr");
+        std::fs::write(&casc, "fn f(a: i32) -> i32 {\n    return a + \n}\nfn main() -> i32 { return f(1) }\n")
+            .unwrap();
+        let out = Command::new(&jc).args([casc.to_str().unwrap(), "build"]).output().unwrap();
+        assert!(!out.status.success(), "driver must refuse a cascading parse-error file");
+        let stderr = String::from_utf8_lossy(&out.stderr).replace("\r\n", "\n");
+        let blocks = stderr.matches("  --> ").count();
+        let briefs = stderr.matches("cascade.jtr:4:").count();   // brief lines carry the path too
+        assert_eq!(blocks, 1, "exactly one diagnostic gets the caret block: {stderr}");
+        assert!(briefs >= 2, "the rest must still be reported, one line each: {stderr}");
+        assert!(
+            stderr.contains("4 error(s)"),
+            "the count is what says the caret block was not the whole story: {stderr}"
+        );
+        // Consecutive one-liners run together; a caret block is set off by a blank line.
+        assert!(
+            !stderr.contains("input)\n\ncascade.jtr:4:11"),
+            "consecutive brief lines must not be blank-separated: {stderr:?}"
+        );
         // 5. A TYPE error (an unknown field -> the Error type, typeerr.jtr's shape) refuses
         // likewise. (Prim-operator misuse recovers to the operand type, not Error — v1
         // catches what the checker actually marks Error.)
@@ -12541,8 +12588,10 @@ fn g(p: *mut i32) -> i32 {
         assert!(!out.status.success(), "driver must refuse a type-error file");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("type error"), "type refusal not rendered: {stderr}");
+        assert!(stderr.contains("  --> "), "no `-->` location line: {stderr}");
         assert!(stderr.contains("tybad.jtr:4:"), "type diagnostic location wrong: {stderr}");
-        eprintln!("driver: build + run + escape/parse/type refusal all green");
+        assert!(stderr.contains("return p.z"), "the offending source line is not shown: {stderr}");
+        eprintln!("driver: build + run + escape/parse/type refusal all green, rendered through std/diag");
     }
 
     /// **In-language attest.** `jc <file> attest` emits the FULL attestation manifest —
@@ -14826,13 +14875,31 @@ fn main() -> i32 {
         let out = Command::new(&jc).args([app2.to_str().unwrap(), "build"]).output().unwrap();
         assert!(!out.status.success(), "driver must refuse the bad multi-module program");
         let stderr = String::from_utf8_lossy(&out.stderr);
+        // Rendered through `std/diag` since the driver's diag increment, so the file:line:col
+        // lives on the `--> ` line rather than at the head of the message. The attribution
+        // itself is what this pins, and it is stronger now than the one-line form allowed:
+        // the caret block also prints the SOURCE LINE it resolved to, so a diagnostic
+        // attributed to the right file at the wrong line no longer looks identical to a
+        // correct one.
         assert!(
-            stderr.contains("bad_lib.jtr:3:48: error: cannot return borrow"),
+            stderr.contains("error: cannot return borrow"),
+            "imported module's diagnostic not rendered: {stderr}"
+        );
+        assert!(
+            stderr.contains("bad_lib.jtr:3:48"),
             "imported module's diagnostic not attributed to its file: {stderr}"
+        );
+        assert!(
+            stderr.contains("pub fn leak(read s: String) -> String { return s }"),
+            "the attributed line did not resolve to the offending source: {stderr}"
         );
         assert!(
             stderr.contains("app2.jtr:3:"),
             "importer's diagnostic line not corrected for the removed import: {stderr}"
+        );
+        assert!(
+            stderr.contains("pub fn leak2(read s: String) -> String { return s }"),
+            "the importer's corrected line did not resolve to its source: {stderr}"
         );
         eprintln!("driver modules: multi-file + collision + diamond + per-file attribution all green");
     }
@@ -15829,8 +15896,12 @@ fn main() -> i32 {
     /// The self-hosting module closure, in the loader's DFS item order for
     /// `examples/std/cgen.jtr` (each module's imports precede it, diamonds memoized —
     /// exactly the order `module::load` merges their items in).
-    const SELFHOST_MODULES: &[&str] =
-        &["mem", "intern", "fs", "env", "list", "tokens", "parser", "ctfe", "typeck", "escape", "sha256", "cgen"];
+    /// `sink` and `diag` join at `cgen.jtr`'s `import "diag"`: the DFS visits diag's own
+    /// imports first, `list` is already memoized, so `sink` lands immediately before `diag`.
+    const SELFHOST_MODULES: &[&str] = &[
+        "mem", "intern", "fs", "env", "list", "tokens", "parser", "ctfe", "typeck", "escape",
+        "sha256", "sink", "diag", "cgen",
+    ];
 
     /// Flatten the multi-module Jestyr compiler into ONE single-file program — the
     /// R2-full "concatenated-source build". The loader already compiles a program as a

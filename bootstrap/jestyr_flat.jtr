@@ -397,7 +397,7 @@ pub fn open_text(mut f: Fs, path: str) -> String {
 
 // Write `data` to `path`. False (and a counted refusal) unless the handle allows
 // mutation.
-pub fn put(mut f: Fs, path: str, data: str) -> bool {
+pub fn put__fs(mut f: Fs, path: str, data: str) -> bool {
     if f.can_write == false {
         f.refused = f.refused + 1
         return false
@@ -11904,6 +11904,989 @@ const SHA_K: [64]i64 = [
         push_hex8(sb, h[k])
         k = k + 1
     }
+}
+
+// std/sink.jtr — bytes out, into a buffer the caller owns.
+//
+// TIER: `core`. No heap, no OS, no imports. Every function `@no_alloc`, and here that
+// marker is load-bearing rather than decorative: `Sink` is a CONCRETE struct with free
+// functions, so every call is a direct call and the checker can actually see the whole
+// graph. The `Writer` *trait* lives in `std/writer.jtr` instead, because `@no_alloc`
+// does not see through a trait method — it passes VACUOUSLY, reporting success on code
+// that allocates on every call. The full argument and the probe are in
+// `docs/io-design.md`; the short version is that the tier boundary here is the boundary
+// of a real proof.
+//
+// WHY THE BUFFER IS A PARAMETER. A Jestyr borrow is second-class, so a `[]u8` may not be
+// stored in a struct that outlives the call. Counters live in the handle, storage stays
+// with the caller. That is not a workaround, it is the same shape `std/test`'s `Check`
+// arrived at, and it means a `Sink` costs 24 bytes of stack and no allocation ever.
+//
+// WRITES DO NOT FAIL AT THE CALL SITE. A byte that does not fit is COUNTED, not
+// returned, so formatting code stays straight-line — fifty `?`s down a formatter is how
+// errors get swallowed, not how they get handled. Check `overflowed(s)` once at the end;
+// `lost(s)` says how many bytes were dropped. The trade is per-write precision, which
+// formatting does not want and a protocol would; such a caller compares `written()`
+// across the call.
+//
+// Run the tests:  jestyrc test examples/std/sink_test.jtr
+
+const S_ZERO: i32 = 48        // '0'
+const S_MINUS: i32 = 45       // '-'
+const S_LOWER_A: i32 = 97     // 'a'
+
+// The cursor. Offsets and counters only — see the header on why the buffer is not here.
+pub struct Sink {
+    used: usize,
+    lost: usize,
+}
+
+// A sink positioned at the start of whatever buffer you pass it.
+@no_alloc @no_os pub fn new() -> Sink {
+    return Sink{ used: 0, lost: 0 }
+}
+
+// ------------------------------------------------------------------------ writing
+
+// One byte. Silently counted as lost if `buf` is full — the deliberate
+// infallible-at-the-call-site rule.
+@no_alloc @no_os pub fn put__sink(mut s: Sink, mut buf: []u8, b: u8) {
+    if s.used >= buf.len {
+        s.lost = s.lost + 1
+        return
+    }
+    buf[s.used] = b
+    s.used = s.used + 1
+}
+
+// A whole `str`, byte for byte. No encoding is applied: what is in the string is what
+// lands in the buffer.
+@no_alloc @no_os pub fn put_str(mut s: Sink, mut buf: []u8, read text: str) {
+    for i in 0..text.len {
+        put__sink(s, buf, text[i] as u8)
+    }
+}
+
+// A signed decimal, most-significant digit first. Never negates the input, so `i64`'s
+// most negative value formats correctly instead of overflowing.
+@no_alloc @no_os pub fn put_i64(mut s: Sink, mut buf: []u8, v: i64) {
+    if v == 0 {
+        put__sink(s, buf, S_ZERO as u8)
+        return
+    }
+    if v < 0 { put__sink(s, buf, S_MINUS as u8) }
+    // The largest power of ten no greater than |v|. 10^18 is the ceiling for any `i64`,
+    // so `p * 10` cannot overflow before the loop stops.
+    var p: i64 = 1
+    for v / p >= 10 or v / p <= -10 {
+        p = p * 10
+    }
+    for p > 0 {
+        var d: i64 = (v / p) % 10
+        if d < 0 { d = 0 - d }
+        put__sink(s, buf, (S_ZERO as i64 + d) as u8)
+        p = p / 10
+    }
+}
+
+// An unsigned decimal.
+@no_alloc @no_os pub fn put_usize(mut s: Sink, mut buf: []u8, v: usize) {
+    put_i64(s, buf, v as i64)
+}
+
+// `true` or `false`.
+@no_alloc @no_os pub fn put_bool(mut s: Sink, mut buf: []u8, b: bool) {
+    if b {
+        put_str(s, buf, "true")
+    } else {
+        put_str(s, buf, "false")
+    }
+}
+
+// One lowercase hex digit of `v`'s low four bits.
+@no_alloc @no_os fn hex_nibble(v: i32) -> u8 {
+    let d: i32 = v % 16
+    if d < 10 { return (S_ZERO + d) as u8 }
+    return (S_LOWER_A + d - 10) as u8
+}
+
+// A byte as exactly two lowercase hex digits, no `0x`. Fixed width on purpose: hex is
+// for dumps and digests, where alignment matters more than brevity.
+@no_alloc @no_os pub fn put_hex_u8(mut s: Sink, mut buf: []u8, b: u8) {
+    put__sink(s, buf, hex_nibble((b as i32) / 16))
+    put__sink(s, buf, hex_nibble(b as i32))
+}
+
+// A newline. Named rather than `put(s, buf, 10)` at forty call sites.
+@no_alloc @no_os pub fn put_nl(mut s: Sink, mut buf: []u8) {
+    put__sink(s, buf, 10 as u8)
+}
+
+// ------------------------------------------------------------------------ queries
+
+// Bytes written so far — the length of the meaningful prefix of the buffer.
+@no_alloc @no_os pub fn written(read s: Sink) -> usize {
+    return s.used
+}
+
+// Bytes that did not fit. Non-zero means the output you are holding is incomplete; it
+// does not mean any earlier byte is wrong.
+@no_alloc @no_os pub fn lost(read s: Sink) -> usize {
+    return s.lost
+}
+
+// Did anything not fit? The one check a caller is expected to make, once, at the end.
+@no_alloc @no_os pub fn overflowed(read s: Sink) -> bool {
+    return s.lost > 0
+}
+
+// Reposition to the start of the buffer, forgetting the loss count too. The bytes are
+// not cleared — `written()` is the only thing that says which of them mean anything, so
+// zeroing would be work nobody can observe.
+@no_alloc @no_os pub fn reset(mut s: Sink) {
+    s.used = 0
+    s.lost = 0
+}
+
+// The written prefix as a `str` view.
+//
+// REQUIRES the buffer to hold valid UTF-8, which is the caller's business: `put` takes
+// arbitrary bytes and this module never validates. Every `put_*` helper above emits
+// printable ASCII, so a sink written only through those is always safe here; a sink fed
+// raw bytes through `put` may not be, and `from_utf8` traps rather than lying.
+@no_alloc @no_os pub fn view(read s: Sink, read buf: []u8) -> read str {
+    return from_utf8(buf[0 .. s.used])
+}
+
+// std/diag.jtr — structured diagnostics: a source map, spans, labels, and a
+// renderer that does not own its destination.
+//
+// TIER: building a `SourceMap` or a `Diagnostic` allocates (`@no_os`, not
+// `@no_alloc`); **rendering does neither** (`@no_alloc @no_os`). That split is the
+// module's shape in one line: the data structure is built once with an allocator you
+// hand it, and every rendering afterwards is a pure function into a buffer you own.
+//
+// ─── Why there is no `Writer` parameter ───────────────────────────────────────
+//
+// The obvious signature is `render(w: file.Writer, …) -> usize !{ RenderFailed }`,
+// and it is wrong twice over.
+//
+// **The error set would be a lie.** `sink` writes are infallible at the call site by
+// deliberate design: a byte that does not fit is COUNTED, not returned, so a formatter
+// emitting a hundred pieces carries zero `?`s. And `file.Writer`'s one fallible call is
+// `finish`. A renderer between them has nothing to fail at — an error set there would be
+// `writer.jtr`'s deleted `failed()` in a new costume: a query that can only ever answer
+// "fine" is worse than no query, because it invites a caller to believe something was
+// checked.
+//
+// **The writer parameter would cost a second buffer.** `writer.Writer`'s stream targets
+// are LINE-oriented (the print intrinsics append their own terminator) and already carry
+// a `Sink` on every call, so a writer-taking renderer would need one sink to assemble a
+// line and a second to be written into. Rendering into a caller `Sink` composes with all
+// three destinations with no such doubling:
+//
+//     diag.render(s, buf, m, d, th)
+//     if sink.overflowed(s) { … }                      // ← NOT optional; see below
+//     eprint_str(sink.view(s, buf))                    // stderr
+//     file.write_str(w, sink.view(s, buf))             // a file
+//     writer.put_str(w, s2, b2, sink.view(s, buf))     // the trait
+//
+// So the output target IS explicit — it is simply the caller's, which is the same
+// answer `sink` and `test`'s `Check` already arrived at, and it keeps this module free
+// of `io`, `file` and `writer` and therefore genuinely `@no_os`.
+//
+// ─── The overflow contract, which is the one thing a caller must not skip ─────
+//
+// A diagnostic is not bounded: a long source line and a long message can exceed any
+// fixed buffer. When that happens `render` returns the number of bytes it MANAGED to
+// write and the sink counts the rest as lost. **Every oracle then answers truthfully and
+// the output is still corrupt** — `render` reports what it wrote (it did), a following
+// `file.write_str` reports the prefix as fully written (it was), `finish` reports the
+// stream fine (it was), and what lands on disk is a diagnostic cut in half, quite
+// possibly mid-caret. The only signal is `sink.overflowed(s)`, so it belongs in the
+// recipe above rather than in a footnote. `diag_test.jtr` performs the unguarded render
+// on purpose so the suite shows what a caller gets without the guard.
+//
+// ─── Storage: two arenas, no per-label ownership ──────────────────────────────
+//
+// A `SourceMap` is every file's text concatenated into ONE `String`, every file's name
+// concatenated into another, and a `List(i32)` holding four offsets per file. A
+// `Diagnostic` is the same shape at a smaller scale: one `String` arena holding the
+// message, the code and every label's text, with each `Label` storing a slice into it.
+//
+// That is not cleverness, it is the only shape available. A Jestyr borrow is
+// second-class, so a `read str` cannot be stored in a struct that outlives the call; and
+// a `List(String)` would leak, because B1's field auto-drop recurses into droppable
+// FIELDS and `String` is a primitive with a manual `string_free` — the trap `std/pathbuf`
+// paid for. Concatenating sidesteps both: there is exactly one owned buffer per arena and
+// exactly one `string_free` for it.
+//
+// Measured while building this, and worth knowing before you write any `Drop` impl over a
+// mixed struct: **an explicit `impl Drop` does NOT replace the field auto-drop, it runs
+// before it.** The emitted C for `SourceMap` calls `Drop__SourceMap__drop` (the two
+// `String`s) and then `Drop__List_i32___drop` on the `ix` field. So an impl covering the
+// primitives is right and adding `list.free` to it would be a double free.
+//
+// ─── What a `Label` is, and why `Note` and `Suggestion` are not separate types ─
+//
+// The API has four concepts — primary label, secondary label, note, suggestion — and ONE
+// record. They differ in exactly two bits of behaviour: whether they point at source, and
+// which character underlines it. Three structs that agree on all their fields would be
+// three ways to store one thing, which the renderer would then have to walk three times
+// in the right interleaving to keep the caller's order. One record with a `LabelKind`
+// keeps the order for free and keeps `render` a single loop.
+//
+// ─── Columns are BYTE columns ─────────────────────────────────────────────────
+//
+// `pos_of` counts bytes, not characters and not display cells, and the caret row is
+// aligned in the same units. For ASCII — every `.jtr` keyword, identifier and operator —
+// they coincide. For a line with multi-byte UTF-8 before the span they do not, and the
+// caret sits left of its target. This is stated rather than hedged because it is the same
+// choice `jestyrc --json` already made (`docs/diagnostics-json.md` documents `col` as
+// 1-based with no character claim), and a renderer that disagreed with the JSON report
+// about where a diagnostic points would be worse than one that is uniformly byte-based.
+// `caret_alignment_is_byte_based_and_that_is_pinned` is the test to invert when a display
+// -width function exists.
+//
+// TABS are the one exception, because they are not a width question but an alignment one:
+// a tab in the source expands to `th.tab_width` spaces in BOTH the source row and the
+// caret row, so the caret stays under its token. A renderer that copied the tab through
+// and counted it as one column would misplace every caret after an indent.
+//
+// Run the tests:  jestyrc test examples/std/diag_test.jtr
+// Worked example: jestyrc run examples/std/diag_demo.jtr examples/std/diag_demo.jtr
+
+
+// ------------------------------------------------------------------ identifiers
+
+// A file's index in a `SourceMap`.
+//
+// `distinct` rather than a bare `usize` because the two numbers this module traffics in —
+// a file index and a byte offset — are both `usize` and are never interchangeable, and
+// mixing them silently reads the wrong file's text. The nominal type makes that a compile
+// error; `distinct`'s operation inheritance is what makes the cost bearable, since a
+// `FileId` still compares with `==` and still arithmetics with another `FileId`.
+//
+// The bill, measured rather than guessed (the `std/path` lesson: measure the conversion
+// you would actually ship): **11 casts inside this module**, all at the boundary where an
+// id becomes a table index, and **0 in `diag_demo.jtr`**, which never spells an id at all
+// — it takes what `add_file` returns and hands it back. That distribution is the opposite
+// of the one that shelved typed `Path` (111 of 132 casts on callers), which is what makes
+// it worth having here.
+pub distinct FileId = usize
+
+// A byte range in one file. Offsets are FILE-RELATIVE, not relative to the map's
+// concatenated text: a span stays meaningful if the map is later rebuilt with its files
+// in a different order, and `pos_of` only has to scan the one file's slice. The price is
+// that a span is meaningless without its `FileId`, which is why the field is not optional.
+@copy pub struct Span {
+    pub file: FileId,
+    pub start: usize,
+    pub end: usize,
+}
+
+// A 1-based line and BYTE column — the units `jestyrc --json` already reports.
+@copy pub struct Pos {
+    pub line: usize,
+    pub col: usize,
+}
+
+pub fn span(f: FileId, start: usize, end: usize) -> Span {
+    return Span{ file: f, start: start, end: end }
+}
+
+// ------------------------------------------------------------------- source map
+
+// Every file's source in one buffer, every file's name in another, and four offsets per
+// file in `ix`: name_start, name_end, src_start, src_end. See the header on why this is
+// concatenation rather than a `List(String)`.
+pub struct SourceMap {
+    text: String,
+    names: String,
+    ix: List(i32),
+}
+
+// The two `String`s are freed here; `ix` is freed by the field auto-drop that runs after
+// this body. Do not add `list.free` — see the header.
+impl Drop for SourceMap {
+    fn drop(mut self) {
+        string_free(self.text)
+        string_free(self.names)
+    }
+}
+
+pub fn map_new(read a: Allocator) -> SourceMap {
+    return SourceMap{ text: string_new(), names: string_new(), ix: make__list(i32, a) }
+}
+
+// Register `src` under `name` and return its id. The map COPIES both, so the caller may
+// free or reuse its own buffers immediately — which is what lets a driver read a file,
+// hand it over, and drop the `String` it read into.
+pub fn add_file(mut m: SourceMap, read name: str, read src: str) -> FileId {
+    let id: usize = len(i32, m.ix) / 4
+    let nv0: str = string_view(m.names)
+    let ns: usize = nv0.len
+    string_push(m.names, name)
+    let nv1: str = string_view(m.names)
+    let tv0: str = string_view(m.text)
+    let ss: usize = tv0.len
+    string_push(m.text, src)
+    let tv1: str = string_view(m.text)
+    push(i32, m.ix, ns as i32)
+    push(i32, m.ix, nv1.len as i32)
+    push(i32, m.ix, ss as i32)
+    push(i32, m.ix, tv1.len as i32)
+    return id as FileId
+}
+
+pub fn file_count(read m: SourceMap) -> usize {
+    return len(i32, m.ix) / 4
+}
+
+// `true` if `f` names a file this map holds. Every accessor below is caller-checked
+// against this, in the `list.get` tradition: a bounds-checked variant is future work for
+// the whole tree, not a policy this module gets to invent alone.
+pub fn has_file(read m: SourceMap, f: FileId) -> bool {
+    return (f as usize) < file_count(m)
+}
+
+pub fn file_name(read m: SourceMap, f: FileId) -> str {
+    let b: usize = (f as usize) * 4
+    let nv: str = string_view(m.names)
+    return nv[get__list(i32, m.ix, b) as usize .. get__list(i32, m.ix, b + 1) as usize]
+}
+
+pub fn file_source(read m: SourceMap, f: FileId) -> str {
+    let b: usize = (f as usize) * 4
+    let tv: str = string_view(m.text)
+    return tv[get__list(i32, m.ix, b + 2) as usize .. get__list(i32, m.ix, b + 3) as usize]
+}
+
+// ------------------------------------------------------- line and column mapping
+
+// The 1-based line and byte column of `off` in `f`. An offset past the end of the file
+// clamps to the last position rather than reading out of bounds, because a diagnostic
+// about a truncated file is exactly when a span runs off the end and a renderer that
+// crashed there would lose the one report that mattered.
+pub fn pos_of(read m: SourceMap, f: FileId, off: usize) -> Pos {
+    let s: str = file_source(m, f)
+    var lim: usize = off
+    if lim > s.len { lim = s.len }
+    var line: usize = 1
+    var col: usize = 1
+    var i: usize = 0
+    for i < lim {
+        if (s[i] as i32) == 10 {
+            line = line + 1
+            col = 1
+        } else {
+            col = col + 1
+        }
+        i = i + 1
+    }
+    return Pos{ line: line, col: col }
+}
+
+// How many lines `f` has. A file not ending in a newline still counts its last partial
+// line; an empty file has one (empty) line, so `line_text(m, f, 1)` is always legal.
+pub fn line_count(read m: SourceMap, f: FileId) -> usize {
+    let s: str = file_source(m, f)
+    var n: usize = 1
+    var i: usize = 0
+    for i < s.len {
+        if (s[i] as i32) == 10 {
+            if i + 1 < s.len { n = n + 1 }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// The text of 1-based `line`, WITHOUT its terminator. Out of range gives the empty
+// string, which is what lets the context-line loop in `render` ask for lines that may not
+// exist without a bounds dance at every call.
+pub fn line_text(read m: SourceMap, f: FileId, line: usize) -> str {
+    let s: str = file_source(m, f)
+    if line == 0 { return s[0 .. 0] }
+    var cur: usize = 1
+    var start: usize = 0
+    var i: usize = 0
+    for i < s.len {
+        if (s[i] as i32) == 10 {
+            if cur == line { return s[start .. i] }
+            cur = cur + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if cur == line { return s[start .. s.len] }
+    return s[0 .. 0]
+}
+
+// The byte offset at which 1-based `line` starts. `render` needs this to turn a span's
+// absolute offset into a column WITHIN the line it is underlining.
+pub fn line_start(read m: SourceMap, f: FileId, line: usize) -> usize {
+    let s: str = file_source(m, f)
+    if line <= 1 { return 0 }
+    var cur: usize = 1
+    var i: usize = 0
+    for i < s.len {
+        if (s[i] as i32) == 10 {
+            cur = cur + 1
+            if cur == line { return i + 1 }
+        }
+        i = i + 1
+    }
+    return s.len
+}
+
+// ------------------------------------------------------------------ diagnostics
+
+@copy pub enum Severity {
+    sev_error,
+    sev_warning,
+    sev_note,
+    sev_help,
+}
+
+// What a label does. `lab_primary` and `lab_secondary` point at source and underline it
+// (`^` and `-` respectively, the convention every terminal reader already knows);
+// `lab_note` and `lab_help` render as trailing `= note:` / `= help:` lines. A
+// SUGGESTION is a `lab_help` that also carries a span — see `suggest`.
+@copy pub enum LabelKind {
+    lab_primary,
+    lab_secondary,
+    lab_note,
+    lab_help,
+}
+
+// One annotation. `ts`/`te` slice this label's text out of the owning `Diagnostic`'s
+// arena; `spanned` is false for a note that points at nothing in particular.
+@copy pub struct Label {
+    pub kind: LabelKind,
+    pub span: Span,
+    pub spanned: bool,
+    ts: usize,
+    te: usize,
+}
+
+// A diagnostic and everything it says. `arena` holds the message, the code and every
+// label's text end to end; the `ms`/`me` and `cs`/`ce` pairs slice the first two out.
+pub struct Diagnostic {
+    pub sev: Severity,
+    arena: String,
+    ms: usize,
+    me: usize,
+    cs: usize,
+    ce: usize,
+    labels: List(Label),
+}
+
+// `arena` is freed here; `labels` by the field auto-drop that follows. See the header.
+impl Drop for Diagnostic {
+    fn drop(mut self) {
+        string_free(self.arena)
+    }
+}
+
+// A diagnostic with no labels yet. `code` may be empty, which renders as no `[…]` at all
+// rather than as `[]` — a stable code is a promise to a consumer and an empty one is the
+// honest way to say a pass has not made that promise yet.
+pub fn make__diag(read a: Allocator, sev: Severity, read code: str, read msg: str) -> Diagnostic {
+    var arena: String = string_new()
+    let v0: str = string_view(arena)
+    let cs: usize = v0.len
+    string_push(arena, code)
+    let v1: str = string_view(arena)
+    let ce: usize = v1.len
+    string_push(arena, msg)
+    let v2: str = string_view(arena)
+    return Diagnostic{ sev: sev, arena: arena, ms: ce, me: v2.len, cs: cs, ce: ce, labels: make__list(Label, a) }
+}
+
+pub fn new_error(read a: Allocator, read code: str, read msg: str) -> Diagnostic {
+    return make__diag(a, sev_error, code, msg)
+}
+
+pub fn new_warning(read a: Allocator, read code: str, read msg: str) -> Diagnostic {
+    return make__diag(a, sev_warning, code, msg)
+}
+
+pub fn message(read d: Diagnostic) -> str {
+    let v: str = string_view(d.arena)
+    return v[d.ms .. d.me]
+}
+
+pub fn code(read d: Diagnostic) -> str {
+    let v: str = string_view(d.arena)
+    return v[d.cs .. d.ce]
+}
+
+pub fn label_count(read d: Diagnostic) -> usize {
+    return len(Label, d.labels)
+}
+
+pub fn label_at(read d: Diagnostic, i: usize) -> Label {
+    return get__list(Label, d.labels, i)
+}
+
+pub fn label_text(read d: Diagnostic, read l: Label) -> str {
+    let v: str = string_view(d.arena)
+    return v[l.ts .. l.te]
+}
+
+// The shared adder. Labels render in the order they were added — the caller's order, not
+// a sort — for the same reason `--json` keeps emission order: a consumer that wants them
+// sorted can sort, a consumer that wants to know what the pass said first cannot recover
+// it once we have sorted here.
+fn add_label(mut d: Diagnostic, k: LabelKind, sp: Span, spanned: bool, read text: str) {
+    let v0: str = string_view(d.arena)
+    let ts: usize = v0.len
+    string_push(d.arena, text)
+    let v1: str = string_view(d.arena)
+    push(Label, d.labels, Label{ kind: k, span: sp, spanned: spanned, ts: ts, te: v1.len })
+}
+
+// The span this diagnostic is ABOUT. `text` may be empty, which underlines without
+// annotating — right when the message above already said everything.
+pub fn primary(mut d: Diagnostic, sp: Span, read text: str) {
+    add_label(d, lab_primary, sp, true, text)
+}
+
+// A span that explains the primary one: the earlier binding, the trait that declared the
+// signature, the first of the two conflicting definitions.
+pub fn secondary(mut d: Diagnostic, sp: Span, read text: str) {
+    add_label(d, lab_secondary, sp, true, text)
+}
+
+// A trailing `= note:` line, pointing at nothing.
+pub fn note(mut d: Diagnostic, read text: str) {
+    add_label(d, lab_note, span(0 as FileId, 0, 0), false, text)
+}
+
+// A trailing `= help:` line, pointing at nothing.
+pub fn help(mut d: Diagnostic, read text: str) {
+    add_label(d, lab_help, span(0 as FileId, 0, 0), false, text)
+}
+
+// A suggestion: a help that names the span it would REPLACE. Stored as a spanned
+// `lab_help` so it renders under the code like a label rather than as a detached line —
+// a suggestion whose location the reader has to reconstruct is not much of a suggestion.
+//
+// It deliberately does NOT apply itself, and there is no `apply` here. A machine-
+// applicable rewrite has to say whether it is safe to apply unattended, and that is a
+// data question for the machine renderer (`docs/diagnostics-json.md`'s `help` field is
+// prose today), not something to guess from a string.
+pub fn suggest(mut d: Diagnostic, sp: Span, read replacement: str) {
+    add_label(d, lab_help, sp, true, replacement)
+}
+
+// ------------------------------------------------------------------------ theme
+
+// Rendering policy, passed in rather than compiled in. `context_before`/`context_after`
+// are source lines of surrounding context; `gutter` prints line numbers; `tab_width` is
+// how far a tab expands in BOTH the source row and the caret row; `unicode` picks the
+// vertical bar (`│` vs `|`) and nothing else, because `^` and `-` are not an ASCII
+// fallback for anything — they are the convention.
+@copy pub struct Theme {
+    pub gutter: bool,
+    pub tab_width: usize,
+    pub unicode: bool,
+    pub context_before: usize,
+    pub context_after: usize,
+}
+
+// A theme with every knob given explicitly.
+//
+// This exists because a module-qualified struct LITERAL is a parse error —
+// `diag.Theme{ gutter: false, … }` from another file does not parse, even though
+// `diag.Theme` in type position is fine. So a `pub struct` a caller is expected to build
+// needs an exported constructor, or it is effectively read-only outside its module. Worth
+// knowing before designing any library type in this tree; found by writing the test that
+// varies the theme, not by reading the grammar.
+pub fn theme(gutter: bool, tab_width: usize, unicode: bool, context_before: usize, context_after: usize) -> Theme {
+    return Theme{ gutter: gutter, tab_width: tab_width, unicode: unicode, context_before: context_before, context_after: context_after }
+}
+
+// ASCII, line numbers, no surrounding context. The default because it is the one that
+// renders identically into a golden file, a CI log and a terminal that has lied about its
+// encoding.
+pub fn plain() -> Theme {
+    return Theme{ gutter: true, tab_width: 4, unicode: false, context_before: 0, context_after: 0 }
+}
+
+// For a terminal: box-drawing bars and one line of context either side.
+pub fn terminal() -> Theme {
+    return Theme{ gutter: true, tab_width: 4, unicode: true, context_before: 1, context_after: 1 }
+}
+
+// ----------------------------------------------------------------- the renderer
+
+const SP: i32 = 32
+const NL: i32 = 10
+const TAB: i32 = 9
+const BAR: i32 = 124        // '|'
+const EQ: i32 = 61          // '='
+const CARET: i32 = 94       // '^'
+const DASH: i32 = 45        // '-'
+
+@no_alloc @no_os fn digits(n: usize) -> usize {
+    var d: usize = 1
+    var v: usize = n
+    for v >= 10 {
+        d = d + 1
+        v = v / 10
+    }
+    return d
+}
+
+@no_alloc @no_os fn put_pad(mut s: Sink, mut buf: []u8, n: usize) {
+    for i in 0..n {
+        put__sink(s, buf, SP as u8)
+    }
+}
+
+// The vertical bar, honouring the theme. `│` is U+2502, three UTF-8 bytes — written as
+// bytes rather than as a literal so this file stays pure ASCII and cannot be broken by an
+// editor re-encoding it.
+@no_alloc @no_os fn put_bar(mut s: Sink, mut buf: []u8, read th: Theme) {
+    if th.unicode {
+        put__sink(s, buf, 226 as u8)
+        put__sink(s, buf, 148 as u8)
+        put__sink(s, buf, 130 as u8)
+        return
+    }
+    put__sink(s, buf, BAR as u8)
+}
+
+// ` <pad> | ` — the row head with no line number.
+@no_alloc @no_os fn put_head_bar(mut s: Sink, mut buf: []u8, read th: Theme, w: usize) {
+    put_pad(s, buf, w + 2)
+    put_bar(s, buf, th)
+}
+
+// ` <lineno right-aligned in w> | ` — the row head that carries a line number.
+//
+// With `gutter` off it degrades to the numberless head. The first version merely set the
+// width to zero and kept printing the number, which produced `2 | two` — a gutter with no
+// column rather than no gutter, and the test that varied the theme is what caught it. A
+// theme field named for what it shows has to be able to show nothing.
+@no_alloc @no_os fn put_head_num(mut s: Sink, mut buf: []u8, read th: Theme, w: usize, n: usize) {
+    if th.gutter == false {
+        put_head_bar(s, buf, th, w)
+        put__sink(s, buf, SP as u8)
+        return
+    }
+    put__sink(s, buf, SP as u8)
+    let d: usize = digits(n)
+    if w > d { put_pad(s, buf, w - d) }
+    put_usize(s, buf, n)
+    put__sink(s, buf, SP as u8)
+    put_bar(s, buf, th)
+    put__sink(s, buf, SP as u8)
+}
+
+// Copy a source line with tabs expanded, and report the expanded width of the first
+// `upto` BYTES of it — which is exactly the caret's column. One function does both so the
+// two can never disagree about how wide a tab is, which is the whole failure mode.
+@no_alloc @no_os fn put_source(mut s: Sink, mut buf: []u8, read text: str, read th: Theme) {
+    for i in 0..text.len {
+        let c: i32 = text[i] as i32
+        if c == TAB {
+            put_pad(s, buf, th.tab_width)
+        } else {
+            put__sink(s, buf, text[i] as u8)
+        }
+    }
+}
+
+@no_alloc @no_os fn expanded_width(read text: str, upto: usize, read th: Theme) -> usize {
+    var w: usize = 0
+    var lim: usize = upto
+    if lim > text.len { lim = text.len }
+    for i in 0..lim {
+        if (text[i] as i32) == TAB {
+            w = w + th.tab_width
+        } else {
+            w = w + 1
+        }
+    }
+    return w
+}
+
+// Enums carry no `Eq` in Jestyr, so every kind question goes through a `match`. Three
+// total predicates rather than a comparison at each site: an exhaustive `match` is what
+// makes adding a fifth `LabelKind` a compile error at each place that has to decide, and
+// a chain of `==` would silently take the else branch instead.
+@no_alloc @no_os fn under_char(k: LabelKind) -> i32 {
+    match k {
+        lab_primary => { return CARET },
+        lab_secondary => { return DASH },
+        lab_note => { return DASH },
+        lab_help => { return DASH },
+    }
+}
+
+@no_alloc @no_os fn is_primary(k: LabelKind) -> bool {
+    match k {
+        lab_primary => { return true },
+        lab_secondary => { return false },
+        lab_note => { return false },
+        lab_help => { return false },
+    }
+}
+
+@no_alloc @no_os fn is_note(k: LabelKind) -> bool {
+    match k {
+        lab_note => { return true },
+        lab_primary => { return false },
+        lab_secondary => { return false },
+        lab_help => { return false },
+    }
+}
+
+@no_alloc @no_os fn put_severity(mut s: Sink, mut buf: []u8, sev: Severity) {
+    match sev {
+        sev_error => { put_str(s, buf, "error") },
+        sev_warning => { put_str(s, buf, "warning") },
+        sev_note => { put_str(s, buf, "note") },
+        sev_help => { put_str(s, buf, "help") },
+    }
+}
+
+// One numbered source row, tabs expanded.
+@no_alloc @no_os fn put_source_row(mut s: Sink, mut buf: []u8, read m: SourceMap, read th: Theme, w: usize, f: FileId, line: usize) {
+    let src: str = line_text(m, f, line)
+    put_head_num(s, buf, th, w, line)
+    put_source(s, buf, src, th)
+    put_nl(s, buf)
+}
+
+// One underline row beneath the source row already emitted for `line`. It re-reads that
+// line rather than taking its text as a parameter, because the caret's offset must be
+// computed with the SAME tab expansion the source row used and the only way to guarantee
+// that is to compute both from the one string.
+@no_alloc @no_os fn put_caret_row(mut s: Sink, mut buf: []u8, read m: SourceMap, read th: Theme, w: usize, f: FileId, line: usize, col: usize, width: usize, under: i32, read text: str) {
+    let src: str = line_text(m, f, line)
+    put_head_bar(s, buf, th, w)
+    put__sink(s, buf, SP as u8)
+    put_pad(s, buf, expanded_width(src, col - 1, th))
+    for i in 0..width {
+        put__sink(s, buf, under as u8)
+    }
+    if text.len > 0 {
+        put__sink(s, buf, SP as u8)
+        put_str(s, buf, text)
+    }
+    put_nl(s, buf)
+}
+
+// Render `d` into `s`. Returns the number of bytes WRITTEN — which is not the number of
+// bytes the diagnostic needs if the buffer was too small. **Check `sink.overflowed(s)`**;
+// the header says why in full.
+//
+// Multi-line spans underline only their FIRST line, from the start column to the end of
+// that line. Underlining a whole region takes a second rendering mode (rustc's `/` `|`
+// `\` gutter), and a v1 that drew a caret run across a line break would place the run in
+// the wrong place rather than in a simplified place. The label text still says what the
+// region is.
+@no_alloc @no_os pub fn render(mut s: Sink, mut buf: []u8, read m: SourceMap, read d: Diagnostic, read th: Theme) -> usize {
+    let before: usize = written(s)
+
+    // ---- the header: `error[E0042]: no field `z` on struct `Point``
+    put_severity(s, buf, d.sev)
+    let c: str = code(d)
+    if c.len > 0 {
+        put__sink(s, buf, 91 as u8)          // '['
+        put_str(s, buf, c)
+        put__sink(s, buf, 93 as u8)          // ']'
+    }
+    put__sink(s, buf, 58 as u8)              // ':'
+    put__sink(s, buf, SP as u8)
+    put_str(s, buf, message(d))
+    put_nl(s, buf)
+
+    let n: usize = label_count(d)
+
+    // ---- the gutter width: the widest line number any row will print
+    var maxline: usize = 1
+    var gi: usize = 0
+    for gi < n {
+        let l: Label = label_at(d, gi)
+        if l.spanned {
+            if has_file(m, l.span.file) {
+                let p: Pos = pos_of(m, l.span.file, l.span.start)
+                let last: usize = p.line + th.context_after
+                if last > maxline { maxline = last }
+            }
+        }
+        gi = gi + 1
+    }
+    var w: usize = digits(maxline)
+    if th.gutter == false { w = 0 }
+
+    // ---- the snippet block, GROUPED BY FILE
+    //
+    // Labels keep the caller's order, but the block is walked file by file: the outer
+    // loop picks each file the first time a label mentions it, the inner loop then emits
+    // every label in THAT file. Rendering strictly in label order instead is what the
+    // first version did, and with a primary in `a.jtr`, a secondary in `b.jtr` and a
+    // suggestion back in `a.jtr` it printed `a.jtr`'s source line twice under two
+    // separate `-->` headers — which reads as two different places in the file. Grouping
+    // costs one O(labels²) scan over a list that is almost always under five entries.
+    //
+    // Within a file, consecutive labels on the SAME line share one source row and stack
+    // their underlines, which is what makes "here, and also here" legible.
+    var any: bool = false
+    var fi: usize = 0
+    for fi < n {
+        let lf: Label = label_at(d, fi)
+        if lf.spanned == false or has_file(m, lf.span.file) == false {
+            fi = fi + 1
+            continue
+        }
+        // Already rendered under an earlier label's header?
+        var seen: bool = false
+        var q: usize = 0
+        for q < fi {
+            let lq: Label = label_at(d, q)
+            if lq.spanned and has_file(m, lq.span.file) and lq.span.file == lf.span.file {
+                seen = true
+            }
+            q = q + 1
+        }
+        if seen {
+            fi = fi + 1
+            continue
+        }
+
+        let f: FileId = lf.span.file
+        let hp: Pos = pos_of(m, f, lf.span.start)
+        put_pad(s, buf, w + 1)
+        put_str(s, buf, "--> ")
+        put_str(s, buf, file_name(m, f))
+        put__sink(s, buf, 58 as u8)
+        put_usize(s, buf, hp.line)
+        put__sink(s, buf, 58 as u8)
+        put_usize(s, buf, hp.col)
+        put_nl(s, buf)
+        put_head_bar(s, buf, th, w)
+        put_nl(s, buf)
+
+        let lc: usize = line_count(m, f)
+        var last_line: usize = 0
+        var li: usize = fi
+        for li < n {
+            let l: Label = label_at(d, li)
+            if l.spanned == false or has_file(m, l.span.file) == false or l.span.file != f {
+                li = li + 1
+                continue
+            }
+            let p: Pos = pos_of(m, f, l.span.start)
+            if p.line != last_line {
+                // Context before — never re-printing a line this block already showed.
+                var cb: usize = th.context_before
+                if cb >= p.line { cb = p.line - 1 }
+                var k: usize = p.line - cb
+                if last_line > 0 and k <= last_line { k = last_line + 1 }
+                for k < p.line {
+                    put_source_row(s, buf, m, th, w, f, k)
+                    k = k + 1
+                }
+                put_source_row(s, buf, m, th, w, f, p.line)
+                last_line = p.line
+            }
+            // The underline. `width` is the span clamped to this line, and never zero:
+            // a zero-width span (an insertion point) still has to point somewhere.
+            let lt: str = line_text(m, f, p.line)
+            var endc: usize = l.span.end
+            if endc < l.span.start { endc = l.span.start }
+            var width: usize = endc - l.span.start
+            let room: usize = lt.len + 1 - p.col
+            if width > room { width = room }
+            if width == 0 { width = 1 }
+            put_caret_row(s, buf, m, th, w, f, p.line, p.col, width, under_char(l.kind), label_text(d, l))
+            li = li + 1
+        }
+        // Context after the last labelled line in this file.
+        var j: usize = last_line + 1
+        let lim: usize = last_line + th.context_after
+        for j <= lim {
+            if j <= lc {
+                put_source_row(s, buf, m, th, w, f, j)
+            }
+            j = j + 1
+        }
+        any = true
+        fi = fi + 1
+    }
+
+    // ---- trailing `= note:` / `= help:` lines
+    var ni: usize = 0
+    var first_note: bool = true
+    for ni < n {
+        let l: Label = label_at(d, ni)
+        if l.spanned == false {
+            if first_note and any {
+                put_head_bar(s, buf, th, w)
+                put_nl(s, buf)
+                first_note = false
+            }
+            put_pad(s, buf, w + 2)
+            put__sink(s, buf, EQ as u8)
+            put__sink(s, buf, SP as u8)
+            if is_note(l.kind) {
+                put_str(s, buf, "note: ")
+            } else {
+                put_str(s, buf, "help: ")
+            }
+            put_str(s, buf, label_text(d, l))
+            put_nl(s, buf)
+        }
+        ni = ni + 1
+    }
+
+    return written(s) - before
+}
+
+// The one-line form: `file:line:col: error: message`, the shape a driver already prints
+// and an editor already parses. No source, no caret, no allocation — for a `--brief` mode
+// or for the second and subsequent occurrences of a repeated diagnostic.
+//
+// It exists so that "structured" does not become a synonym for "verbose": the DATA is the
+// structure, and how much of it a caller renders is the caller's policy. A tool that had
+// to build a different diagnostic type to get a short line would rebuild the whole thing.
+@no_alloc @no_os pub fn render_brief(mut s: Sink, mut buf: []u8, read m: SourceMap, read d: Diagnostic) -> usize {
+    let before: usize = written(s)
+    let n: usize = label_count(d)
+    var found: bool = false
+    var li: usize = 0
+    for li < n {
+        let l: Label = label_at(d, li)
+        if l.spanned and is_primary(l.kind) and found == false {
+            if has_file(m, l.span.file) {
+                let p: Pos = pos_of(m, l.span.file, l.span.start)
+                put_str(s, buf, file_name(m, l.span.file))
+                put__sink(s, buf, 58 as u8)
+                put_usize(s, buf, p.line)
+                put__sink(s, buf, 58 as u8)
+                put_usize(s, buf, p.col)
+                put_str(s, buf, ": ")
+                found = true
+            }
+        }
+        li = li + 1
+    }
+    put_severity(s, buf, d.sev)
+    let c: str = code(d)
+    if c.len > 0 {
+        put__sink(s, buf, 91 as u8)
+        put_str(s, buf, c)
+        put__sink(s, buf, 93 as u8)
+    }
+    put_str(s, buf, ": ")
+    put_str(s, buf, message(d))
+    return written(s) - before
 }
 
 // examples/std/cgen.jtr — the P5 C backend, written *in Jestyr*. It imports the P2 parser (AST)
@@ -25752,18 +26735,62 @@ fn ml_flatten(mut m: Ml, read root: str, mut it: Interner, kwcount: i64, read a:
 // ---- the product driver (`build` / `run`) — the self-hosted compiler as a daily tool ----
 // Unlike the raw `jc <file>` dump (the golden's plumbing mode, mirroring `cgen::emit`
 // unconditionally), the product modes GATE on the escape checker's buffered diagnostics,
-// render them `path:line:col: error: <msg>` on stderr, write `<stem>.c`, drive gcc with
-// the locked flag set via `run_command`, and (for `run`) execute the produced binary,
-// forwarding its exit code. Parse and typeck refusal use the recovery artifacts (Error
-// nodes / Error types) with generic v1 messages at exact mapped locations; the reference's
-// expected/found message text is a follow-up.
+// render them through **`std/diag`** on stderr, write `<stem>.c`, drive gcc with the locked
+// flag set via `run_command`, and (for `run`) execute the produced binary, forwarding its
+// exit code. Parse and typeck refusal use the recovery artifacts (Error nodes / Error
+// types) with generic v1 messages at exact mapped locations; the reference's expected/found
+// message text is a follow-up.
+//
+// ─── Why the driver imports `std/diag` rather than keeping its own renderer ────
+//
+// The driver used to print one `path:line:col: error: <msg>` line and stop at the first
+// diagnostic, counting line and column itself. Two things were wrong with that, and only
+// one of them is cosmetic.
+//
+// The cosmetic one: no source line, no caret, so a diagnostic said WHERE without showing
+// WHAT. `diag.plain()` renders the same `--> file:line:col` / gutter / caret block the
+// reference's `src/diag.rs` does, so both toolchains now look alike at a glance.
+//
+// The one that matters: **the loader already held a source map and nothing knew it.**
+// `Ml.nb` is every loaded module's name concatenated, `Ml.allsrc` every module's source,
+// and `Ml.mods` six offsets per module — which is a `diag.SourceMap` with different field
+// names. Handing those ranges to `diag.add_file` once deletes the hand-rolled line/column
+// counter here (a second implementation of `diag.pos_of`, and the kind of duplicate that
+// drifts silently because nothing compares them).
+//
+// The cost is honest and worth naming: `diag` and its `sink` dependency join the
+// self-hosting closure, so `SELFHOST_MODULES` is fourteen modules and the bootstrap seed
+// carries both. That is what "load-bearing" means here — the module is no longer merely
+// available to programs the compiler compiles, it is part of the compiler.
 
-// One diagnostic on stderr, attributed to its OWNING FILE — the `#line` analogue. A merged
-// span maps back through the rewrite checkpoints (last checkpoint at or before the span;
-// verbatim in between), then the owning module is found by its `allsrc` range and 1-based
-// line/col are counted in that module's ORIGINAL source.
-fn eprint_diag(mut m: Ml, start: usize, read msg: str) {
-    var cm: i32 = 0 - 1                               // best checkpoint (merged, allsrc)
+const DIAG_CAP: usize = 8192
+
+// The `SourceMap` the driver renders through: one file per loaded module, added in loader
+// order, so **a module index IS its `FileId`** — which is what lets `driver_report` map an
+// owning-module index straight to a file without a side table.
+fn driver_map(mut m: Ml, read a: Allocator) -> SourceMap {
+    var sm: SourceMap = map_new(a)
+    let nbv: str = string_view(m.nb)
+    let all: str = string_view(m.allsrc)
+    var mi: usize = 0
+    for mi < len(i32, m.mods) / 6 {
+        let mb: usize = mi * 6
+        let ns: usize = get__list(i32, m.mods, mb + 2) as usize
+        let ne: usize = get__list(i32, m.mods, mb + 3) as usize
+        let ss: usize = get__list(i32, m.mods, mb + 4) as usize
+        let se: usize = get__list(i32, m.mods, mb + 5) as usize
+        let fid: FileId = add_file(sm, nbv[ns .. ne], all[ss .. se])
+        mi = mi + 1
+    }
+    return sm
+}
+
+// A merged-source offset → the corresponding offset in `allsrc`, or -1 when unmapped. The
+// merged span maps back through the rewrite checkpoints: the last checkpoint at or before
+// the span, verbatim in between. (This is the `#line` analogue — the rewriter's renames
+// shift offsets, and the checkpoints are where it recorded the shift.)
+fn driver_orig(mut m: Ml, start: usize) -> i64 {
+    var cm: i32 = 0 - 1
     var co: i32 = 0 - 1
     var i: usize = 0
     for i < len(i32, m.map) / 2 {
@@ -25774,18 +26801,14 @@ fn eprint_diag(mut m: Ml, start: usize, read msg: str) {
         }
         i = i + 1
     }
-    var b: String = string_new()
-    if cm < 0 {                                       // no mapping (shouldn't happen): raw offset
-        string_push(b, "<merged>:")
-        push_uint__cgen(b, start as i64)
-        string_push(b, ": error: ")
-        string_push(b, msg)
-        eprint_str(string_view(b))
-        string_free(b)
-        return
-    }
-    let orig: usize = (co as usize) + (start - (cm as usize))
-    var found: i32 = 0 - 1                            // the module owning `orig`
+    if cm < 0 { return 0 - 1 }
+    return (co as i64) + (start as i64) - (cm as i64)
+}
+
+// The index of the module whose `allsrc` range contains `orig` (0 if none, which cannot
+// happen for a mapped offset but must not be a crash if it does).
+fn driver_owner(mut m: Ml, orig: usize) -> i32 {
+    var found: i32 = 0 - 1
     var mi: usize = 0
     for mi < len(i32, m.mods) / 6 {
         let ss: i32 = get__list(i32, m.mods, mi * 6 + 4)
@@ -25794,45 +26817,121 @@ fn eprint_diag(mut m: Ml, start: usize, read msg: str) {
         mi = mi + 1
     }
     if found < 0 { found = 0 }
-    let mb: usize = (found as usize) * 6
-    let all: str = string_view(m.allsrc)
-    let ss2: usize = get__list(i32, m.mods, mb + 4) as usize
-    var line: i64 = 1
-    var col: i64 = 1
-    var k: usize = ss2
-    for k < orig {
-        if (all[k] as i32) == 10 {
-            line = line + 1
-            col = 1
-        } else {
-            col = col + 1
-        }
-        k = k + 1
+    return found
+}
+
+// One diagnostic on stderr, attributed to its OWNING FILE and rendered through `std/diag`.
+//
+// `full` picks the rendering, and **the choice is per STAGE rather than global** because
+// the argument for abbreviating only holds where diagnostics cascade:
+//
+//   * parse — one missing operand produces five Error nodes, because recovery resumes
+//     mid-expression and every following token is then read in the wrong context;
+//   * type — an Error type propagates into every enclosing expression;
+//   * escape — it does NOT cascade. Each diagnostic is an independent rule violation at an
+//     independent site, which is why the reference renders all of them in full and so does
+//     this.
+//
+// So the cascading stages get `diag_demo.jtr`'s first-full-rest-brief policy (five caret
+// blocks for one mistake bury the mistake, and that is the whole reason `render_brief`
+// exists), and the non-cascading one does not.
+//
+// **No error code.** The reference attaches one (`error[E0007]: expected an expression,
+// found `)``) because its parser knows which rule failed; these messages are deliberately
+// generic v1 text recovered from an Error node, so a code here would either duplicate a
+// reference code with a different meaning or invent a parallel numbering. Saying less is
+// the honest option until the port carries the reference's expected/found text.
+fn driver_report(mut m: Ml, read sm: SourceMap, read a: Allocator, start: usize, end: usize, read msg: str, read label: str, full: bool, nprev: i32, prevfull: bool) {
+    // The separator rule: a blank line goes before a diagnostic when EITHER it or the one
+    // before it is a caret block. Consecutive one-liners run together, which is what makes
+    // a cascade tail read as a list rather than as four paragraphs.
+    //
+    // Emitted before rather than after, so that the summary's own blank line is the only
+    // thing between the last diagnostic and `N error(s)` — otherwise the count of blank
+    // lines there would depend on which form the last diagnostic happened to take.
+    if nprev > 0 and (full or prevfull) { eprint_str("") }
+    let og: i64 = driver_orig(m, start)
+    var d: Diagnostic = new_error(a, "", msg)
+    if og >= 0 {
+        let orig: usize = og as usize
+        let own: i32 = driver_owner(m, orig)
+        let base: usize = get__list(i32, m.mods, (own as usize) * 6 + 4) as usize
+        let lim: usize = get__list(i32, m.mods, (own as usize) * 6 + 5) as usize
+        // The span is clamped to the owning file: a merged END can run past the module
+        // boundary when recovery swallowed a run, and a span outside its file would place
+        // the caret in another module's text rather than fail loudly.
+        var hi: usize = orig
+        let oge: i64 = driver_orig(m, end)
+        if oge > og { hi = oge as usize }
+        if hi > lim { hi = lim }
+        primary(d, span(own as FileId, orig - base, hi - base), label)
     }
-    let nbv: str = string_view(m.nb)
-    string_push(b, nbv[get__list(i32, m.mods, mb + 2) as usize .. get__list(i32, m.mods, mb + 3) as usize])
-    string_push(b, ":")
-    push_uint__cgen(b, line)
-    string_push(b, ":")
-    push_uint__cgen(b, col)
-    string_push(b, ": error: ")
-    string_push(b, msg)
-    eprint_str(string_view(b))
-    string_free(b)
+    var raw: *mut u8 = alloc(u8, DIAG_CAP)
+    var buf: []u8 = slice(u8, raw, DIAG_CAP)
+    var s: Sink = new()
+    if full {
+        let n: usize = render(s, buf, sm, d, plain())
+    } else {
+        let n2: usize = render_brief(s, buf, sm, d)
+    }
+    // The overflow contract, which is the one thing a caller must not skip: `render`
+    // returns what it WROTE, so a truncated caret block is indistinguishable from a
+    // complete one at every oracle. Fall back to the one-line form, which fits any sane
+    // buffer, rather than print a diagnostic cut in half — possibly mid-caret.
+    if overflowed(s) {
+        reset(s)
+        let n3: usize = render_brief(s, buf, sm, d)
+    }
+    // `render` ends its last row with a newline and `render_brief` does not, while
+    // `eprint_str` supplies one either way. Trimming the renderer's own trailing newline is
+    // what makes the two forms space identically — and keeps exactly one blank line before
+    // the `N error(s)` summary, like the reference, instead of one or two depending on
+    // which form the last diagnostic happened to take.
+    let v: str = view(s, buf)
+    if v.len > 0 and (v[v.len - 1] as i32) == 10 {
+        eprint_str(v[0 .. v.len - 1])
+    } else {
+        eprint_str(v)
+    }
+    free_ptr(raw)
+}
+
+// The trailing `N error(s)` the reference prints, after one blank line. A count is not
+// decoration: where the first-full-rest-brief policy applies, it is what tells a reader
+// whether the one caret block they are looking at was the whole story.
+fn driver_error_count(n: i32) {
+    eprint_str("")
+    var c: String = string_new()
+    push_uint__cgen(c, n as i64)
+    string_push(c, " error(s)")
+    eprint_str(string_view(c))
+    string_free(c)
 }
 
 // The `build`/`run` modes: 1 on diagnostics or a write failure, gcc's code on a failed
 // compile, the program's own exit code for `run`, else 0.
 fn driver_build(mut m: Ml, read p: Parser, read c: Checker, read src: str, read a: Allocator, read path: str, do_run: bool) -> i32 {
+    // The loader's own tables, handed to `diag` once. Built here rather than per
+    // diagnostic: `add_file` copies each module's source into the map's arena, so building
+    // it inside the reporter would copy the whole program once per error.
+    var sm: SourceMap = driver_map(m, a)
+    var nerr: i32 = 0
+    var prevfull: bool = false                    // was the last diagnostic a caret block?
+
     // Parse refusal: any Error expr (kind 9) or Error item (kind 99) — the ported parser's
     // recovery artifacts. v1 messages are generic (the reference's expected/found text is a
     // follow-up); the LOCATION is exact via the checkpoint mapper.
+    //
+    // Every artifact is now reported, not just the first. The stages stay separate and each
+    // still refuses before the next, because a program that did not parse has garbage types
+    // and reporting those on top would be noise, not information.
     var pi2: usize = 0
     for pi2 < len(ExprData, p.ex) {
         let pe: ExprData = get__list(ExprData, p.ex, pi2)
         if pe.kind == 9 {
-            eprint_diag(m, pe.start, "syntax error (unexpected or malformed input)")
-            return 1
+            driver_report(m, sm, a, pe.start, pe.end, "syntax error (unexpected or malformed input)", "the parser could not read this as an expression", nerr == 0, nerr, prevfull)
+            prevfull = nerr == 0
+            nerr = nerr + 1
         }
         pi2 = pi2 + 1
     }
@@ -25840,10 +26939,15 @@ fn driver_build(mut m: Ml, read p: Parser, read c: Checker, read src: str, read 
     for pj < len(ItemData, p.it) {
         let itd: ItemData = get__list(ItemData, p.it, pj)
         if itd.kind == 99 {
-            eprint_diag(m, itd.start, "syntax error: expected an item")
-            return 1
+            driver_report(m, sm, a, itd.start, itd.end, "syntax error: expected an item", "only `fn`, `struct`, `enum`, `const`, `trait`, `impl`, `import` and `distinct` may appear here", nerr == 0, nerr, prevfull)
+            prevfull = nerr == 0
+            nerr = nerr + 1
         }
         pj = pj + 1
+    }
+    if nerr > 0 {
+        driver_error_count(nerr)
+        return 1
     }
     // Type refusal: any expression the checker resolved to the Error type (kind 16 — a real
     // mismatch, e.g. an operator with no impl; degenerate Unknowns never refuse).
@@ -25854,11 +26958,16 @@ fn driver_build(mut m: Ml, read p: Parser, read c: Checker, read src: str, read 
             let td2: TyData = get__list(TyData, c.tys, tid2 as usize)
             if td2.kind == 16 {
                 let ed2: ExprData = get__list(ExprData, p.ex, ti2)
-                eprint_diag(m, ed2.start, "type error at this expression")
-                return 1
+                driver_report(m, sm, a, ed2.start, ed2.end, "type error at this expression", "this expression has no valid type", nerr == 0, nerr, prevfull)
+                prevfull = nerr == 0
+                nerr = nerr + 1
             }
         }
         ti2 = ti2 + 1
+    }
+    if nerr > 0 {
+        driver_error_count(nerr)
+        return 1
     }
     var e: Esc = check_program(p, c, src, a)
     if len(i32, e.dsp) > 0 {                     // refuse to emit on escape diagnostics
@@ -25868,12 +26977,20 @@ fn driver_build(mut m: Ml, read p: Parser, read c: Checker, read src: str, read 
         var k: usize = 0
         for k < dm.len {
             if (dm[k] as i32) == 10 {
-                eprint_diag(m, get__list(i32, e.dsp, di * 2) as usize, dm[ls .. k])
+                // `dsp` holds span PAIRS; the end was already recorded and was previously
+                // thrown away, which is why the old renderer could only ever have drawn a
+                // one-column caret. Every escape diagnostic renders in FULL — they do not
+                // cascade, so abbreviating the second one would lose a real finding rather
+                // than suppress an echo of the first.
+                driver_report(m, sm, a, get__list(i32, e.dsp, di * 2) as usize, get__list(i32, e.dsp, di * 2 + 1) as usize, dm[ls .. k], "", true, nerr, prevfull)
+                prevfull = true
+                nerr = nerr + 1
                 di = di + 1
                 ls = k + 1
             }
             k = k + 1
         }
+        driver_error_count(nerr)
         return 1
     }
     var sb: String = string_new()

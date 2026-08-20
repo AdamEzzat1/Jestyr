@@ -342,7 +342,7 @@ Migrating `cgen.jtr`'s hand-rolled loader onto `std/path` looked like the
 obvious next step, and it was tried. It does not work, for a reason worth
 knowing before anyone tries again.
 
-The self-host build flattens its twelve modules by **concatenating them at the
+The self-host build flattens its fourteen modules by **concatenating them at the
 token level** and stripping module qualifiers, so `mod.item` becomes `item`. The
 flatten cannot tell a module-qualified reference from a field access on a local
 variable that happens to share the module's name. `cgen.jtr` has thirteen
@@ -663,9 +663,9 @@ uncovered raw-pointer sites, unresolvable error sets, and borrows whose type
 never resolves.
 
 **Expensive** — anything that (a) needs a new intrinsic, (b) changes emission,
-or (c) is imported by one of the twelve self-host closure modules
+or (c) is imported by one of the fourteen self-host closure modules
 (`mem, intern, fs, env, list, tokens, parser, ctfe, typeck, escape, sha256,
-cgen` — the list is `SELFHOST_MODULES` in `src/proptests.rs`). Those pay the
+sink, diag, cgen` — the list is `SELFHOST_MODULES` in `src/proptests.rs`). Those pay the
 two-sided tax: the port mirror in `examples/std/cgen.jtr` plus a refreshed
 bootstrap seed **in the same commit**, or rung 3 fails.
 
