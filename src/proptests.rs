@@ -2823,6 +2823,58 @@ mod pathbuf_props {
         }
         assert!(checked >= 15, "expected the whole module's surface, saw {checked} functions");
     }
+
+    /// **`std/census`'s "this half does no I/O" claim, pinned.**
+    ///
+    /// The module header says the whole tally is `@no_os` and that the compiler checks it.
+    /// That sentence was written before it was true: seven of the twenty-nine functions —
+    /// `observe` among them, which is the one the claim is really about — carried no
+    /// attribute at all, because I had left `@no_os` off wherever a function allocates.
+    /// The two axes are orthogonal (`std/pathbuf` above allocates on every call and carries
+    /// the claim throughout), so the fix was to make the header true rather than soften it.
+    ///
+    /// This exists because that failure is silent in both directions: a header comment
+    /// claiming a property is not evidence of the property, and a dropped attribute breaks
+    /// no build — coverage just quietly shrinks. The `checked >= 29` floor is what turns a
+    /// deletion into a test failure instead of a smaller number nobody looks at.
+    #[test]
+    fn census_is_os_free_even_though_it_allocates() {
+        use crate::ast::Item;
+        let prog = crate::module::load("examples/std/census.jtr");
+        assert!(!prog.diags.iter().any(|d| d.is_error()), "load errors: {:?}", prog.diags);
+        let (info, td) = typeck::check_program(&prog.ast, &prog.modules);
+        assert!(!td.iter().any(|d| d.is_error()), "typeck errors: {td:?}");
+        // The claim must be CHECKED, not merely written — otherwise this passes on a module
+        // of `@no_os` functions that all call `print_str`.
+        assert!(
+            !escape::check(&prog.ast, &info).iter().any(|d| d.is_error()),
+            "the @no_os claim must hold under the escape checker"
+        );
+
+        // The loader also pulls in list/sink/path/str/bitset/json, so items are filtered to
+        // this module — otherwise `json`'s own surface would fail a claim it never made.
+        let me = prog
+            .modules
+            .names
+            .iter()
+            .position(|n| n == "census")
+            .expect("the loaded program must contain the census module");
+        let mut checked = 0;
+        for (i, item) in prog.ast.items.iter().enumerate() {
+            let Item::Fn(f) = item else { continue };
+            if prog.modules.item_mod[i] != me {
+                continue;
+            }
+            assert!(
+                f.has_attr("no_os"),
+                "std/census: `{}` has no `@no_os`; the module header claims the whole tally \
+                 has it, and the demo's write-up repeats that claim in public",
+                f.name.name
+            );
+            checked += 1;
+        }
+        assert!(checked >= 29, "expected the whole module's surface, saw {checked} functions");
+    }
 }
 
 /// **The `core` tier's freestanding claim, pinned at the library.**

@@ -85,7 +85,7 @@ impl Drop for Census {
     }
 }
 
-pub fn new(read a: Allocator) -> Census {
+@no_os pub fn new(read a: Allocator) -> Census {
     return Census{
         names: string_new(),
         rows: list.make(Bucket, a),
@@ -149,7 +149,7 @@ pub fn new(read a: Allocator) -> Census {
 // when the table is full; the caller counts that rather than merging into a neighbour,
 // because a bucket silently absorbing an unrelated extension is a wrong answer that looks
 // like a right one.
-fn bucket_for(mut c: Census, read label: str) -> isize {
+@no_os fn bucket_for(mut c: Census, read label: str) -> isize {
     let nv: str = string_view(c.names)
     var i: usize = 0
     for i < list.len(Bucket, c.rows) {
@@ -166,7 +166,7 @@ fn bucket_for(mut c: Census, read label: str) -> isize {
 
 // Fold one file into the census. `p` is used only for its extension and for the
 // largest-file record; `content` is the file's bytes, supplied by the caller.
-pub fn observe(mut c: Census, read p: str, read content: str) {
+@no_os pub fn observe(mut c: Census, read p: str, read content: str) {
     let bin: bool = is_binary(content)
     let lines: i64 = line_count(content)
     let n: i64 = content.len as i64
@@ -221,7 +221,7 @@ pub fn observe(mut c: Census, read p: str, read content: str) {
 // Bytes descending, ties by extension name ascending. Insertion sort: `MAX_EXTS` is 64, so
 // the O(n²) is 4,096 comparisons at the absolute worst and the code is short enough to be
 // obviously right — which is the trade a sort in a demo should make.
-pub fn sort(mut c: Census) {
+@no_os pub fn sort(mut c: Census) {
     let n: usize = list.len(Bucket, c.rows)
     var i: usize = 1
     for i < n {
@@ -239,7 +239,7 @@ pub fn sort(mut c: Census) {
 }
 
 // Does `x` sort before `y`?
-fn row_before(read c: Census, read x: Bucket, read y: Bucket) -> bool {
+@no_os fn row_before(read c: Census, read x: Bucket, read y: Bucket) -> bool {
     if x.bytes != y.bytes { return x.bytes > y.bytes }
     let nv: str = string_view(c.names)
     return str_lt(nv[x.ns .. x.ne], nv[y.ns .. y.ne])
@@ -276,9 +276,9 @@ fn row_before(read c: Census, read x: Bucket, read y: Bucket) -> bool {
 // How many of the 256 byte values appear anywhere in the tree's TEXT files. A pure-ASCII
 // source tree lands near 90; anything above 128 means non-ASCII bytes are present, which is
 // the cheap way to notice that a "plain ASCII" repo is not one.
-pub fn distinct_bytes(read c: Census) -> usize { return bitset.count(c.seen) }
+@no_os pub fn distinct_bytes(read c: Census) -> usize { return bitset.count(c.seen) }
 
-pub fn row_name(read c: Census, i: usize) -> read str {
+@no_os pub fn row_name(read c: Census, i: usize) -> read str {
     let b: Bucket = list.get(Bucket, c.rows, i)
     return string_view(c.names)[b.ns .. b.ne]
 }
