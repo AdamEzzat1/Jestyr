@@ -91,6 +91,32 @@ pre-existing mixed test pairs a guarded declaration with an *unguarded* one, whe
 | **`Self` in a trait method parameter** | Parses ✓, type-checks ✓ (as `Opaque("Self")`), and **cgen refuses**: *"the C backend cannot lower the external type `Self` yet"*. A diagnostic, not a miscompile — but `check` passes and `run` fails, so it is still the degrades-to-gcc class |
 | **Move-only port mirror** | Not owed today (the corpus trips the rule zero times, so both sides agree). Owed the moment a corpus file trips it |
 | **`.jtr` trap:** a `\u00XX` escape in a string literal passes through to the emitted C verbatim; C rejects a universal character name below 0x20 | Accepted by the front end, fails in gcc. Use a byte-append helper |
+| **NEW — `jc` cannot BUILD a program whose module set collides with a `list` generic's name.** A module defining a plain `pub fn len(…)` alongside `import "list"` (whose `pub fn len(comptime T: type, …)` is generic) makes the self-hosted typeck mark `l.len`/`l.cap` INSIDE `list.jtr`'s generic bodies as the Error type, so the driver refuses with 9+ generic "type error at this expression". `jestyrc` compiles and runs the same program | **Reference-vs-port divergence, `jc build` only.** Already bites an EXISTING corpus file: `jc json_test.jtr build` → 17 errors, and any program importing `std/json` inherits it (`json.jtr` defines `pub fn len`). Invisible to `CGEN_GOLDEN_ALLOWLIST` — that golden compiles each file with **no import resolution**, which is exactly the path where the collision cannot arise, so `json.jtr` and `json_test.jtr` are byte-identity verified *and* unbuildable. This is the blind spot the repo already recorded as "a port change touching substitution or monomorphization owes a `jestyr_driver_*` test, not an allowlist entry" |
+
+**The 12-line repro for that last one** (put both files in `examples/std/`, then `jc zzc.jtr run`):
+
+```
+// zzclash.jtr
+pub fn len(read s: str) -> usize { return s.len }
+
+// zzc.jtr
+import "list"
+import "zzclash"
+import "mem"
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var xs: List(i32) = list.make(i32, a)
+    list.push(i32, xs, 7)
+    print_int(list.len(i32, xs) as i64)
+    print_int(zzclash.len("abc") as i64)
+    return 0
+}
+```
+
+`jestyrc run` prints `1` then `3`. `jc … run` reports four errors inside `list.jtr` and refuses.
+Found by building `examples/std/census_cli.jtr` (the Tier 3 demo) with `jc` — **a real program
+reached a hole the whole corpus had not**, because the corpus exercises the byte-identity dump
+path far more than the module-resolving `build` path.
 
 ### §2.4 — trait / generic expressiveness. THREE separate gaps, each measured
 

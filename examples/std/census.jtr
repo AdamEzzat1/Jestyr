@@ -1,0 +1,436 @@
+// examples/std/census.jtr — what is actually in this directory tree, by extension.
+//
+// A source-tree census: files, bytes, lines and text/binary split per extension, plus the
+// largest file and how much of the byte space the tree actually uses. `tokei`-shaped, and
+// small enough to read in one sitting.
+//
+// ─── The one design decision, and it is the whole reason this file is testable ──
+//
+// **`observe` never touches the filesystem.** The caller supplies the path AND the bytes;
+// this module folds them into a tally. Every I/O decision — which directory, which
+// capability, whether a read was even permitted — lives in `census_cli.jtr`.
+//
+// That split is not tidiness. A census whose core did its own reading could only be tested
+// against a real directory, which means the test suite would be measuring the filesystem's
+// state as much as the code's. Here the interesting cases — a file with no trailing
+// newline, a file that is one NUL byte, a name with two dots, an empty file — are literals
+// in `census_test.jtr`, and the suite runs identically on any machine.
+//
+// It also means the whole tally is `@no_os`: the compiler checks that claim, so "this half
+// does no I/O" is enforced rather than asserted in a comment.
+//
+// ─── Why the rows are sorted by an explicit call ───────────────────────────────
+//
+// `sort` is a separate `mut` function rather than something `render_*` does, because the
+// renderers are `@no_alloc @no_os` and take `read c` — a renderer that reordered its
+// argument would need `mut`, and then "rendering does not modify the census" would stop
+// being true. Ordering is a policy; the caller applies it once before printing.
+//
+// The order is bytes descending, ties broken by extension name ascending. Both halves
+// matter: without the tiebreak, two extensions of equal size could swap between runs and
+// the output would stop being reproducible for a reason nothing in the code names.
+
+import "list"
+import "sink"
+import "path"
+import "str"
+import "bitset"
+import "json"
+
+// Distinct extensions tracked. A tree with more than this many gets the overflow bucket,
+// which is counted rather than silently merged — see `overflowed`.
+pub const MAX_EXTS: usize = 64
+
+// Every byte value, so `seen` is a 256-bit set: exactly the shape a bitset is for.
+const BYTE_VALUES: usize = 256
+
+const NL: i32 = 10
+const NUL: i32 = 0
+
+// One extension's row. `@copy` because it is six plain integers and a span — a value, not a
+// resource, and the default `read` borrow would make it unstorable in a `List`.
+@copy pub struct Bucket {
+    ns: usize,
+    ne: usize,
+    files: i64,
+    bytes: i64,
+    lines: i64,
+    binary: i64,
+}
+
+// The tally. Extension names live in one `String` arena with each row holding a span into
+// it, rather than a `List(String)` — which would leak, because the field auto-drop recurses
+// into droppable FIELDS and `String` is a primitive with a manual `string_free`.
+pub struct Census {
+    names: String,
+    rows: List(Bucket),
+    seen: BitSet,
+    total_files: i64,
+    total_bytes: i64,
+    total_lines: i64,
+    total_binary: i64,
+    biggest: String,
+    biggest_bytes: i64,
+    dropped: i64,
+}
+
+// The two `String`s and the `BitSet` are freed here; `rows` is NOT, because an explicit
+// `impl Drop` runs BEFORE the field auto-drop rather than replacing it, and `List` already
+// carries a blanket `Drop`. Freeing it here would be a double free.
+impl Drop for Census {
+    fn drop(mut self) {
+        string_free(self.names)
+        string_free(self.biggest)
+        bitset.free(self.seen)
+    }
+}
+
+pub fn new(read a: Allocator) -> Census {
+    return Census{
+        names: string_new(),
+        rows: list.make(Bucket, a),
+        seen: bitset.make(a, BYTE_VALUES),
+        total_files: 0,
+        total_bytes: 0,
+        total_lines: 0,
+        total_binary: 0,
+        biggest: string_new(),
+        biggest_bytes: 0 - 1,
+        dropped: 0,
+    }
+}
+
+// ---- classification (pure, and the part the suite pins) ---------------------
+
+// The extension bucket a path belongs to: `path.ext` when there is one, else `(none)`.
+//
+// A dotfile is NOT an extension. `path.ext` already refuses to call `.bashrc` an extension
+// (a leading dot is a hidden-file marker, not a type), so this only has to name the empty
+// case — and it names it visibly rather than as an empty column, because a blank cell in a
+// table reads as a rendering bug.
+@no_alloc @no_os pub fn ext_label(read p: str) -> read str {
+    let e: str = path.ext(p)
+    if e.len == 0 { return "(none)" }
+    return e
+}
+
+// Lines, counted the way `wc -l` does NOT: a final line without a trailing newline still
+// counts. `wc -l` reports newline COUNT, so a one-line file with no terminator reports 0,
+// which is right for its question and wrong for "how many lines of source is this".
+// The empty file is 0 either way.
+@no_alloc @no_os pub fn line_count(read content: str) -> i64 {
+    if content.len == 0 { return 0 }
+    var n: i64 = 0
+    var i: usize = 0
+    for i < content.len {
+        if (content[i] as i32) == NL { n = n + 1 }
+        i = i + 1
+    }
+    if (content[content.len - 1] as i32) != NL { n = n + 1 }
+    return n
+}
+
+// A file is binary if it contains a NUL byte — the same test `grep` and `git` use, and the
+// only one that is cheap and never wrong in the direction that matters: a NUL is not legal
+// in UTF-8 text, so this never calls real source binary. It CAN call a binary file text
+// (a NUL-free blob), which costs a wrong row and not a wrong read.
+@no_alloc @no_os pub fn is_binary(read content: str) -> bool {
+    var i: usize = 0
+    for i < content.len {
+        if (content[i] as i32) == NUL { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ---- the tally --------------------------------------------------------------
+
+// The row index for `label`, appending a new row if this is the first sighting. Returns -1
+// when the table is full; the caller counts that rather than merging into a neighbour,
+// because a bucket silently absorbing an unrelated extension is a wrong answer that looks
+// like a right one.
+fn bucket_for(mut c: Census, read label: str) -> isize {
+    let nv: str = string_view(c.names)
+    var i: usize = 0
+    for i < list.len(Bucket, c.rows) {
+        let b: Bucket = list.get(Bucket, c.rows, i)
+        if str.eq(nv[b.ns .. b.ne], label) { return i as isize }
+        i = i + 1
+    }
+    if list.len(Bucket, c.rows) >= MAX_EXTS { return 0 - 1 }
+    let ns: usize = c.names.len
+    string_push(c.names, label)
+    list.push(Bucket, c.rows, Bucket{ ns: ns, ne: c.names.len, files: 0, bytes: 0, lines: 0, binary: 0 })
+    return (list.len(Bucket, c.rows) - 1) as isize
+}
+
+// Fold one file into the census. `p` is used only for its extension and for the
+// largest-file record; `content` is the file's bytes, supplied by the caller.
+pub fn observe(mut c: Census, read p: str, read content: str) {
+    let bin: bool = is_binary(content)
+    let lines: i64 = line_count(content)
+    let n: i64 = content.len as i64
+
+    c.total_files = c.total_files + 1
+    c.total_bytes = c.total_bytes + n
+    if bin {
+        c.total_binary = c.total_binary + 1
+    } else {
+        // Binary files contribute no line count: "lines" in a PNG is not a number anyone
+        // wants summed, and including it would make the totals column quietly meaningless.
+        c.total_lines = c.total_lines + lines
+    }
+
+    // The byte-value set over TEXT files only, for the same reason: a couple of binaries
+    // would saturate it to 256 and the statistic would stop distinguishing anything.
+    if !bin {
+        var i: usize = 0
+        for i < content.len {
+            let ok: bool = bitset.insert(c.seen, content[i] as usize)
+            i = i + 1
+        }
+    }
+
+    if n > c.biggest_bytes {
+        c.biggest_bytes = n
+        // There is no `string_clear` intrinsic: free and re-new. Safe because the old
+        // buffer is replaced in the same breath, so the `Drop` impl frees the new one.
+        string_free(c.biggest)
+        c.biggest = string_new()
+        string_push(c.biggest, p)
+    }
+
+    let bi: isize = bucket_for(c, ext_label(p))
+    if bi < 0 {
+        c.dropped = c.dropped + 1
+        return
+    }
+    var b: Bucket = list.get(Bucket, c.rows, bi as usize)
+    b.files = b.files + 1
+    b.bytes = b.bytes + n
+    if bin {
+        b.binary = b.binary + 1
+    } else {
+        b.lines = b.lines + lines
+    }
+    list.set(Bucket, c.rows, bi as usize, b)
+}
+
+// ---- ordering ---------------------------------------------------------------
+
+// Bytes descending, ties by extension name ascending. Insertion sort: `MAX_EXTS` is 64, so
+// the O(n²) is 4,096 comparisons at the absolute worst and the code is short enough to be
+// obviously right — which is the trade a sort in a demo should make.
+pub fn sort(mut c: Census) {
+    let n: usize = list.len(Bucket, c.rows)
+    var i: usize = 1
+    for i < n {
+        var j: usize = i
+        for j > 0 {
+            let a: Bucket = list.get(Bucket, c.rows, j - 1)
+            let b: Bucket = list.get(Bucket, c.rows, j)
+            if !row_before(c, b, a) { break }
+            list.set(Bucket, c.rows, j - 1, b)
+            list.set(Bucket, c.rows, j, a)
+            j = j - 1
+        }
+        i = i + 1
+    }
+}
+
+// Does `x` sort before `y`?
+fn row_before(read c: Census, read x: Bucket, read y: Bucket) -> bool {
+    if x.bytes != y.bytes { return x.bytes > y.bytes }
+    let nv: str = string_view(c.names)
+    return str_lt(nv[x.ns .. x.ne], nv[y.ns .. y.ne])
+}
+
+// Byte-wise `<` over two views. Spelled out because the ordering is load-bearing for
+// reproducibility and a locale-aware compare would make the output machine-dependent.
+@no_alloc @no_os fn str_lt(read a: str, read b: str) -> bool {
+    var i: usize = 0
+    for i < a.len and i < b.len {
+        let x: i32 = a[i] as i32
+        let y: i32 = b[i] as i32
+        if x != y { return x < y }
+        i = i + 1
+    }
+    return a.len < b.len
+}
+
+// ---- accessors --------------------------------------------------------------
+
+@no_alloc @no_os pub fn row_count(read c: Census) -> usize { return list.len(Bucket, c.rows) }
+@no_alloc @no_os pub fn total_files(read c: Census) -> i64 { return c.total_files }
+@no_alloc @no_os pub fn total_bytes(read c: Census) -> i64 { return c.total_bytes }
+@no_alloc @no_os pub fn total_lines(read c: Census) -> i64 { return c.total_lines }
+@no_alloc @no_os pub fn total_binary(read c: Census) -> i64 { return c.total_binary }
+@no_alloc @no_os pub fn largest_bytes(read c: Census) -> i64 { return c.biggest_bytes }
+
+// Extensions that did not fit in the table. Non-zero means the report is incomplete, and
+// the renderers say so rather than letting a truncated table read as a full one.
+@no_alloc @no_os pub fn overflowed(read c: Census) -> i64 { return c.dropped }
+
+@no_alloc @no_os pub fn largest_path(read c: Census) -> read str { return string_view(c.biggest) }
+
+// How many of the 256 byte values appear anywhere in the tree's TEXT files. A pure-ASCII
+// source tree lands near 90; anything above 128 means non-ASCII bytes are present, which is
+// the cheap way to notice that a "plain ASCII" repo is not one.
+pub fn distinct_bytes(read c: Census) -> usize { return bitset.count(c.seen) }
+
+pub fn row_name(read c: Census, i: usize) -> read str {
+    let b: Bucket = list.get(Bucket, c.rows, i)
+    return string_view(c.names)[b.ns .. b.ne]
+}
+
+@no_alloc @no_os pub fn row_at(read c: Census, i: usize) -> Bucket {
+    return list.get(Bucket, c.rows, i)
+}
+
+@no_alloc @no_os pub fn bucket_files(read b: Bucket) -> i64 { return b.files }
+@no_alloc @no_os pub fn bucket_bytes(read b: Bucket) -> i64 { return b.bytes }
+@no_alloc @no_os pub fn bucket_lines(read b: Bucket) -> i64 { return b.lines }
+@no_alloc @no_os pub fn bucket_binary(read b: Bucket) -> i64 { return b.binary }
+
+// ---- rendering --------------------------------------------------------------
+//
+// Both renderers are `@no_alloc @no_os`: they write into a `Sink` over a buffer the caller
+// owns and allocate nothing. The compiler checks it, so the claim is a proof rather than a
+// comment — and it is the reason this file can be linked into something with a `@no_alloc`
+// budget without auditing it by hand.
+
+@no_alloc @no_os fn put_pad(mut s: Sink, mut buf: []u8, n: usize) {
+    var i: usize = 0
+    for i < n {
+        sink.put(s, buf, 32 as u8)
+        i = i + 1
+    }
+}
+
+// Right-align `v` in `w` columns. Numbers that do not line up are numbers nobody compares.
+@no_alloc @no_os fn put_num(mut s: Sink, mut buf: []u8, v: i64, w: usize) {
+    var d: usize = 1
+    var t: i64 = v
+    for t >= 10 {
+        d = d + 1
+        t = t / 10
+    }
+    if d < w { put_pad(s, buf, w - d) }
+    sink.put_i64(s, buf, v)
+}
+
+@no_alloc @no_os fn put_left(mut s: Sink, mut buf: []u8, read text: str, w: usize) {
+    sink.put_str(s, buf, text)
+    if text.len < w { put_pad(s, buf, w - text.len) }
+}
+
+// The human table. Returns bytes written — which is not what the report NEEDS if the buffer
+// was too small, so the caller checks `sink.overflowed`.
+@no_alloc @no_os pub fn render_table(mut s: Sink, mut buf: []u8, read c: Census) -> usize {
+    let before: usize = sink.written(s)
+    put_left(s, buf, "  ext", 12)
+    put_left(s, buf, "     files", 11)
+    put_left(s, buf, "       bytes", 13)
+    put_left(s, buf, "       lines", 13)
+    sink.put_str(s, buf, "   binary")
+    sink.put_nl(s, buf)
+    sink.put_str(s, buf, "  ")
+    var u: usize = 0
+    for u < 56 {
+        sink.put(s, buf, 45 as u8)
+        u = u + 1
+    }
+    sink.put_nl(s, buf)
+
+    var i: usize = 0
+    for i < list.len(Bucket, c.rows) {
+        let b: Bucket = list.get(Bucket, c.rows, i)
+        sink.put_str(s, buf, "  ")
+        put_left(s, buf, string_view(c.names)[b.ns .. b.ne], 10)
+        put_num(s, buf, b.files, 11)
+        put_num(s, buf, b.bytes, 13)
+        put_num(s, buf, b.lines, 13)
+        put_num(s, buf, b.binary, 9)
+        sink.put_nl(s, buf)
+        i = i + 1
+    }
+
+    sink.put_nl(s, buf)
+    sink.put_str(s, buf, "  total    ")
+    put_num(s, buf, c.total_files, 11)
+    put_num(s, buf, c.total_bytes, 13)
+    put_num(s, buf, c.total_lines, 13)
+    put_num(s, buf, c.total_binary, 9)
+    sink.put_nl(s, buf)
+
+    if c.biggest_bytes >= 0 {
+        sink.put_str(s, buf, "  largest   ")
+        sink.put_str(s, buf, string_view(c.biggest))
+        sink.put_str(s, buf, " (")
+        sink.put_i64(s, buf, c.biggest_bytes)
+        sink.put_str(s, buf, " bytes)")
+        sink.put_nl(s, buf)
+    }
+    sink.put_str(s, buf, "  byte values in text   ")
+    sink.put_usize(s, buf, bitset.count(c.seen))
+    sink.put_str(s, buf, " of 256")
+    sink.put_nl(s, buf)
+    if c.dropped > 0 {
+        sink.put_str(s, buf, "  NOTE: ")
+        sink.put_i64(s, buf, c.dropped)
+        sink.put_str(s, buf, " file(s) had an extension past the table limit and are counted only in the totals")
+        sink.put_nl(s, buf)
+    }
+    return sink.written(s) - before
+}
+
+// The machine form, through `std/json`'s writer — which tracks nesting depth, so a report
+// that forgot to close an array is a `balanced() == false` the caller can check rather than
+// output a consumer has to discover is malformed.
+@no_alloc @no_os pub fn render_json(mut w: Writer, mut s: Sink, mut buf: []u8, read c: Census) {
+    json.begin_object(w, s, buf)
+    json.key(w, s, buf, "files")
+    json.put_i64(w, s, buf, c.total_files)
+    json.key(w, s, buf, "bytes")
+    json.put_i64(w, s, buf, c.total_bytes)
+    json.key(w, s, buf, "lines")
+    json.put_i64(w, s, buf, c.total_lines)
+    json.key(w, s, buf, "binary")
+    json.put_i64(w, s, buf, c.total_binary)
+    json.key(w, s, buf, "distinct_bytes")
+    json.put_i64(w, s, buf, bitset.count(c.seen) as i64)
+    json.key(w, s, buf, "truncated")
+    json.put_bool(w, s, buf, c.dropped > 0)
+    json.key(w, s, buf, "largest")
+    if c.biggest_bytes >= 0 {
+        json.begin_object(w, s, buf)
+        json.key(w, s, buf, "path")
+        json.put_str(w, s, buf, string_view(c.biggest))
+        json.key(w, s, buf, "bytes")
+        json.put_i64(w, s, buf, c.biggest_bytes)
+        json.end_object(w, s, buf)
+    } else {
+        json.put_null(w, s, buf)
+    }
+    json.key(w, s, buf, "by_ext")
+    json.begin_array(w, s, buf)
+    var i: usize = 0
+    for i < list.len(Bucket, c.rows) {
+        let b: Bucket = list.get(Bucket, c.rows, i)
+        json.begin_object(w, s, buf)
+        json.key(w, s, buf, "ext")
+        json.put_str(w, s, buf, string_view(c.names)[b.ns .. b.ne])
+        json.key(w, s, buf, "files")
+        json.put_i64(w, s, buf, b.files)
+        json.key(w, s, buf, "bytes")
+        json.put_i64(w, s, buf, b.bytes)
+        json.key(w, s, buf, "lines")
+        json.put_i64(w, s, buf, b.lines)
+        json.key(w, s, buf, "binary")
+        json.put_i64(w, s, buf, b.binary)
+        json.end_object(w, s, buf)
+        i = i + 1
+    }
+    json.end_array(w, s, buf)
+    json.end_object(w, s, buf)
+}

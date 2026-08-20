@@ -12478,6 +12478,129 @@ fn g(p: *mut i32) -> i32 {
         assert_eq!(build_and_run("examples/proc_demo.jtr").replace("\r\n", "\n"), "0\ndone\n");
     }
 
+    /// **The `census` demo, checked against a recount written independently in Rust.**
+    ///
+    /// `examples/std/census_cli.jtr` is the Tier 3 showcase — `cli`, `walk`, `sysdir`, `fs`,
+    /// `diag`, `json`, `bitset` and `memprof` in one tool. A demo nobody checks is a demo
+    /// that quietly rots, and "it printed a table" is not a check: the first version of this
+    /// tool printed a perfectly plausible table in which every directory was also counted as
+    /// a zero-byte file, and the only visible symptom was the file total exceeding the
+    /// walk's own count by exactly the number of directories.
+    ///
+    /// So this recounts the fixture in Rust — same definitions, different code — and
+    /// compares. The fixture is built from the cases where a plausible implementation goes
+    /// wrong: a file with no trailing newline (so "lines" differs from `wc -l` by exactly
+    /// one), a NUL-bearing binary (which must contribute bytes but NOT lines), an empty
+    /// file, an extensionless file, and a nested directory.
+    #[test]
+    fn census_demo_matches_an_independent_recount() {
+        let exe = build_exe("examples/std/census_cli.jtr");
+        let dir = std::env::temp_dir().join("jestyr_census_fx");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("three.jtr"), b"a\nb\nc\n").unwrap();
+        std::fs::write(dir.join("noeol.jtr"), b"x\ny").unwrap(); // no trailing newline
+        std::fs::write(dir.join("empty.md"), b"").unwrap();
+        std::fs::write(dir.join("blob.png"), b"PNG\x00\x01\x02\n").unwrap(); // NUL => binary
+        std::fs::write(dir.join("Makefile"), b"no ext here\n").unwrap();
+        std::fs::write(dir.join("sub").join("deep.jtr"), b"nested\nlines\n").unwrap();
+        let root = dir.to_str().unwrap().to_string();
+
+        // The recount. Deliberately NOT a port of the Jestyr code — it is the definitions
+        // from `std/census`'s header re-derived, which is the only version of a differential
+        // test that can catch a mistake both sides would otherwise share.
+        let (mut want_files, mut want_bytes, mut want_lines, mut want_binary) = (0i64, 0i64, 0i64, 0i64);
+        let mut stack = vec![dir.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                let b = std::fs::read(&p).unwrap();
+                want_files += 1;
+                want_bytes += b.len() as i64;
+                if b.contains(&0u8) {
+                    want_binary += 1;
+                } else if !b.is_empty() {
+                    want_lines += b.iter().filter(|&&c| c == b'\n').count() as i64;
+                    if *b.last().unwrap() != b'\n' {
+                        want_lines += 1; // the unterminated last line still counts
+                    }
+                }
+            }
+        }
+
+        let run = |args: &[&str]| -> String {
+            let out = Command::new(&exe).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "census {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n")
+        };
+        let json = run(&["scan", &root, "--json"]);
+        let field = |k: &str| -> i64 {
+            let at = json.find(&format!("\"{k}\":")).unwrap_or_else(|| panic!("no `{k}` in {json}"));
+            let rest = &json[at + k.len() + 3..];
+            let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            rest[..end].parse().unwrap_or_else(|_| panic!("`{k}` is not a number in {json}"))
+        };
+        assert_eq!(field("files"), want_files, "file count disagrees with the recount: {json}");
+        assert_eq!(field("bytes"), want_bytes, "byte total disagrees with the recount: {json}");
+        assert_eq!(field("lines"), want_lines, "line total disagrees with the recount: {json}");
+        assert_eq!(field("binary"), want_binary, "binary count disagrees with the recount: {json}");
+        // The fixture is chosen so those are not vacuous: without the binary rule the line
+        // total would be higher, and without the unterminated-line rule it would be lower.
+        assert_eq!(want_binary, 1, "the fixture must contain exactly one binary");
+        assert_eq!(want_lines, 8, "the fixture's line total is the number the rules produce");
+
+        // Two renderers, one tally: the table must agree with the JSON, or one of them is
+        // reading a different structure than it claims to.
+        let table = run(&["scan", &root]);
+        assert!(
+            table.contains(&format!("{want_files} file(s)")),
+            "the table header disagrees with the recount:\n{table}"
+        );
+        for n in [want_files, want_bytes, want_lines] {
+            assert!(table.contains(&n.to_string()), "the table is missing {n}:\n{table}");
+        }
+
+        // Determinism. `walk` sorts, so an unchanged tree gives byte-identical output — the
+        // property that makes `census --json` diffable in CI rather than merely printable.
+        assert_eq!(json, run(&["scan", &root, "--json"]), "two runs over one tree diverged");
+
+        // The capability, with its positive control beside it. A refusal that reported zero
+        // files would look identical to a walk of an empty directory, so the control is what
+        // makes the refusal mean anything.
+        let denied = run(&["scan", &root, "--sandboxed", "--json"]);
+        assert!(denied.contains("\"files\":0"), "a denied capability must see nothing: {denied}");
+        assert!(want_files > 0, "the positive control must actually find files");
+
+        // `--profile` must report a CLEAN run. Not decoration either: the first draft printed
+        // the profile from inside the scan, so the census's own arenas were still live and a
+        // program that leaks nothing reported `live=288`.
+        let out = Command::new(&exe).args(["scan", &root, "--profile"]).output().unwrap();
+        let prof = String::from_utf8_lossy(&out.stderr).replace("\r\n", "\n");
+        assert!(prof.contains("live=0"), "the scan must return all of its memory: {prof}");
+        assert!(!prof.contains("did not return all"), "memprof flagged a leak: {prof}");
+
+        // A usage error renders through `std/diag`: a caret under the offending argument,
+        // over the command line itself as the source. Exit 2, and stdout stays clean.
+        let out = Command::new(&exe).args(["scan", &root, "--depth", "abc"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "a bad option value must exit 2");
+        assert!(out.stdout.is_empty(), "a usage error must leave stdout clean");
+        let err = String::from_utf8_lossy(&out.stderr).replace("\r\n", "\n");
+        assert!(err.contains("--> <command line>:1:"), "no diag location line: {err}");
+        assert!(err.contains("^^^ not a number"), "no caret under the bad value: {err}");
+
+        eprintln!(
+            "census: {want_files} files / {want_bytes} bytes / {want_lines} lines agree with an independent recount"
+        );
+    }
+
     /// **The self-hosted DRIVER.** `jc <file> build` must gate on the ported escape checker
     /// (refusing with `path:line:col: error:` diagnostics on stderr and writing nothing),
     /// and on a clean file must write `<stem>.c`, drive gcc itself via `run_command`, and
@@ -15654,6 +15777,9 @@ fn main() -> i32 {
         "cfg_platform.jtr",
         "cfg_headers.jtr",
         "sysdir.jtr",
+        "census.jtr",
+        "census_test.jtr",
+        "census_cli.jtr",
     ];
     // **`walk.jtr` is deliberately absent, and NOT because of `@cfg`.** The old note said it
     // was blocked "transitively — it imports sysdir"; measured, that is wrong. This golden

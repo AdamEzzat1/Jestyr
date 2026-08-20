@@ -1,0 +1,369 @@
+// examples/std/census_cli.jtr — `census`, the command-line tool.
+//
+//   census scan <dir> [--json] [--hidden] [--depth N] [--profile] [--sandboxed]
+//   census --help
+//
+// Everything that touches the outside world lives here; `std/census` holds the tally and
+// cannot do I/O at all (the compiler checks that — every function in it carries `@no_os`).
+//
+// ─── What this file is a demonstration OF ─────────────────────────────────────
+//
+// Seven of the Tier 3 standard library's modules, each doing the job it exists for rather
+// than being name-dropped:
+//
+//   cli      the spec, the parse, and `--` handling. Unknown options are an ERROR here, not
+//            a silent positional, which is the difference between `--porcelin` producing a
+//            usage message and producing a scan of a directory named `--porcelin`.
+//   walk     deterministic traversal. Sorted by default, so two runs over an unchanged tree
+//            produce byte-identical output — which is what makes `census --json` diffable
+//            in CI rather than merely printable.
+//   sysdir   underneath `walk`; the `@cfg(posix|windows)` module that reads a directory.
+//   fs       the CAPABILITY. `--sandboxed` hands the walk `fs.denied()` instead of
+//            `fs.host()` and the tool reports how many reads were refused. The authority to
+//            read appears in the signature; it is not ambient.
+//   diag     usage errors with a caret under the offending argument, over the command line
+//            itself as the "source file".
+//   json     `--json`, through the writer that tracks nesting depth.
+//   bitset   inside `census`: a 256-bit set of the byte values the tree's text actually uses.
+//   memprof  `--profile` swaps in a counting allocator and prints allocations, peak bytes
+//            and leaks. It wraps the SAME allocator everything else already takes as a
+//            parameter, which is the entire reason it can be swapped in for one run.
+//
+// ─── The one thing worth stealing ─────────────────────────────────────────────
+//
+// The scan is two phases, and the split is deliberate. `walk` hands its visitor a raw
+// pointer as context (a fn pointer has nowhere else to carry state), so phase one keeps the
+// visitor as small as it can possibly be: append the path, count it, return. Phase two is
+// ordinary code with ordinary types, reading each file and folding it into the census.
+//
+// Doing the reading inside the visitor would have worked and would have been worse: the
+// awkward part of the program would then be the part with the raw pointer in it.
+
+import "census"
+import "cli"
+import "walk"
+import "fs"
+import "diag"
+import "json"
+import "sink"
+import "memprof"
+import "list"
+import "str"
+import "mem"
+
+const REPORT_CAP: usize = 262144
+const LINE_CAP: usize = 4096
+const DIAG_CAP: usize = 8192
+
+// ---- phase one: collect the paths -------------------------------------------
+
+// The visitor's context. Held behind a raw pointer because that is what a fn pointer can
+// carry; kept to three fields for the same reason.
+struct Collect {
+    paths: String,
+    offs: List(i32),
+    files: i64,
+}
+
+fn collect(ctx: *mut u8, p: str, depth: usize, is_dir: bool) -> bool {
+    // Directories are VISITED and not collected. `walk` reports them so a caller can prune
+    // (returning `false` on a directory skips its subtree), which means the visitor sees
+    // both kinds and has to say which one it wants. Without this test a directory reads as
+    // a zero-byte extensionless file, and the only symptom is the file total exceeding the
+    // walk's own count by exactly the number of directories — a discrepancy that looks like
+    // a rounding artifact until an independent `find | wc -l` says otherwise.
+    if is_dir { return true }
+    unsafe {
+        let c: *mut Collect = ctx as *mut Collect
+        list.push(i32, c.*.offs, c.*.paths.len as i32)
+        string_push(c.*.paths, p)
+        list.push(i32, c.*.offs, c.*.paths.len as i32)
+        c.*.files = c.*.files + 1
+    }
+    return true
+}
+
+// ---- usage errors, with a caret under the argument that caused them ---------
+
+// The command line rebuilt as one line, with each argument's start offset pushed into
+// `starts` — so a diagnostic can point INTO it. The "source file" a compiler renders
+// against does not have to be a file; it has to be text with offsets.
+fn command_line(read args: cli.Args, mut starts: List(i32)) -> String {
+    var b: String = string_new()
+    var i: usize = 0
+    for i < cli.args_len(args) {
+        if i > 0 { string_push(b, " ") }
+        list.push(i32, starts, b.len as i32)
+        string_push(b, cli.arg_at(args, i))
+        list.push(i32, starts, b.len as i32)
+        i = i + 1
+    }
+    string_push(b, "\n")
+    return b
+}
+
+// Render one usage error against the command line, with a caret under argument `ai`
+// (or no caret at all when `ai` is negative — a complaint about the command as a whole).
+fn usage_error(read a: Allocator, read args: cli.Args, read msg: str, read label: str, ai: isize) {
+    var starts: List(i32) = list.make(i32, a)
+    var line: String = command_line(args, starts)
+
+    var m: diag.SourceMap = diag.map_new(a)
+    let f: diag.FileId = diag.add_file(m, "<command line>", string_view(line))
+    var d: diag.Diagnostic = diag.new_error(a, "", msg)
+    if ai >= 0 {
+        let k: usize = (ai as usize) * 2
+        if k + 1 < list.len(i32, starts) {
+            let s0: usize = list.get(i32, starts, k) as usize
+            let s1: usize = list.get(i32, starts, k + 1) as usize
+            diag.primary(d, diag.span(f, s0, s1), label)
+        }
+    }
+    diag.help(d, "run `census --help` for the full usage")
+
+    var raw: *mut u8 = alloc(u8, DIAG_CAP)
+    var buf: []u8 = slice(u8, raw, DIAG_CAP)
+    var s: Sink = sink.new()
+    let n: usize = diag.render(s, buf, m, d, diag.plain())
+    if sink.overflowed(s) {
+        sink.reset(s)
+        let n2: usize = diag.render_brief(s, buf, m, d)
+    }
+    let v: str = sink.view(s, buf)
+    if v.len > 0 and (v[v.len - 1] as i32) == 10 {
+        eprint_str(v[0 .. v.len - 1])
+    } else {
+        eprint_str(v)
+    }
+    free_ptr(raw)
+    string_free(line)
+    list.free(i32, starts)
+}
+
+// The index of the argument that supplies `--<long>`'s value: the `--long=value` form is
+// the argument itself, the separated form is the one after it. -1 when absent.
+fn value_arg_index(read args: cli.Args, read long: str) -> isize {
+    var pre: String = string_new()
+    string_push(pre, "--")
+    string_push(pre, long)
+    var i: usize = 0
+    var hit: isize = 0 - 1
+    for i < cli.args_len(args) {
+        let x: str = cli.arg_at(args, i)
+        if str.has_prefix(x, string_view(pre)) {
+            if x.len > pre.len {
+                if (x[pre.len] as i32) == 61 { hit = i as isize }   // `--long=value`
+            } else {
+                if i + 1 < cli.args_len(args) { hit = (i + 1) as isize }
+            }
+        }
+        i = i + 1
+    }
+    string_free(pre)
+    return hit
+}
+
+// A non-negative decimal, or -1. Deliberately strict: no sign, no whitespace, no empty
+// string, and no partial parse — `--depth 3x` is a mistake, and a tool that read it as 3
+// would be guessing about the user's intent in the one place guessing is least welcome.
+fn parse_uint(read s: str) -> i64 {
+    if s.len == 0 { return 0 - 1 }
+    var v: i64 = 0
+    var i: usize = 0
+    for i < s.len {
+        let ch: i32 = s[i] as i32
+        if ch < 48 or ch > 57 { return 0 - 1 }
+        if v > 100000000 { return 0 - 1 }              // absurd depth; refuse rather than wrap
+        v = v * 10 + ((ch - 48) as i64)
+        i = i + 1
+    }
+    return v
+}
+
+// ---- help -------------------------------------------------------------------
+
+fn spec_of(read a: Allocator) -> cli.Spec {
+    var s: cli.Spec = cli.spec_new(a, "census", "a source-tree census: files, bytes and lines by extension")
+    cli.subcommand(s, "scan", "walk a directory and report what is in it")
+    cli.flag(s, 106, "json", "emit the report as JSON instead of a table")
+    cli.flag(s, 97, "hidden", "include dot-files and dot-directories")
+    cli.flag(s, 112, "profile", "report allocations, peak bytes and leaks for the run")
+    cli.flag(s, 115, "sandboxed", "hand the walk a DENIED filesystem capability and report the refusals")
+    cli.option(s, 100, "depth", "maximum directory depth (0 = unlimited)")
+    return s
+}
+
+fn show_help(read s: cli.Spec, to_stderr: bool) {
+    var raw: *mut u8 = alloc(u8, LINE_CAP)
+    var buf: []u8 = slice(u8, raw, LINE_CAP)
+    var k: Sink = sink.new()
+    let n: usize = cli.render_help(k, buf, s)
+    if to_stderr {
+        eprint_str(sink.view(k, buf))
+    } else {
+        print_str(sink.view(k, buf))
+    }
+    free_ptr(raw)
+}
+
+// ---- main -------------------------------------------------------------------
+
+fn main() -> i32 {
+    let base: Allocator = mem.system_allocator()
+    var args: cli.Args = cli.args_from_env(base)
+    var spec: cli.Spec = spec_of(base)
+    var mt: cli.Matches = cli.parse(base, spec, args)
+
+    if cli.wants_help(mt) {
+        show_help(spec, false)
+        return cli.EXIT_OK
+    }
+    if cli.succeeded(mt) == false {
+        // `cli` already produced the sentence; `diag` supplies the picture. The caret goes
+        // under the LAST argument, which for an unknown-option error is the one that was
+        // being read when the parse gave up.
+        let last: isize = (cli.args_len(args) as isize) - 1
+        usage_error(base, args, cli.error_text(mt), "this argument", last)
+        return cli.EXIT_USAGE
+    }
+    if cli.command(mt) < 0 {
+        show_help(spec, false)
+        return cli.EXIT_OK
+    }
+    if cli.positional_count(mt) == 0 {
+        usage_error(base, args, "`scan` needs a directory to walk", "", 0 - 1)
+        return cli.EXIT_USAGE
+    }
+
+    let root: str = cli.positional(mt, 0)
+    let want_json: bool = cli.is_set(mt, spec, "json")
+    let want_hidden: bool = cli.is_set(mt, spec, "hidden")
+    let want_profile: bool = cli.is_set(mt, spec, "profile")
+    let sandboxed: bool = cli.is_set(mt, spec, "sandboxed")
+
+    let depth_text: str = cli.value_or(mt, spec, "depth", "0")
+    let depth: i64 = parse_uint(depth_text)
+    if depth < 0 {
+        // The caret lands on the argument that carried the value, which is the whole point
+        // of rendering through `diag` rather than printing a sentence: the message says
+        // what is wrong and the picture says where.
+        usage_error(base, args, "`--depth` expects a non-negative whole number", "not a number", value_arg_index(args, "depth"))
+        return cli.EXIT_USAGE
+    }
+
+    // `--profile` swaps in a counting allocator over the same base. Everything downstream
+    // already takes an `Allocator` parameter, which is what makes this a one-line change
+    // rather than a build flag.
+    var prof: memprof.Counting = memprof.counting(base)
+    var a: Allocator = base
+    if want_profile { a = memprof.allocator(prof) }
+
+    let code: i32 = run_scan(a, root, want_json, want_hidden, sandboxed, depth)
+
+    // Printed AFTER `run_scan` returns, and that is not a formatting preference. Every
+    // allocation the scan makes is owned by a local inside it, and those drop at ITS scope
+    // exit — so a profile printed from the middle of the scan reports the census's own
+    // arenas as live and calls a correct program leaky. The first draft of this file did
+    // exactly that and reported `live=288` on a run that leaks nothing.
+    if want_profile {
+        var praw: *mut u8 = alloc(u8, LINE_CAP)
+        var pbuf: []u8 = slice(u8, praw, LINE_CAP)
+        var ps: Sink = sink.new()
+        let pn: usize = memprof.render(ps, pbuf, prof)
+        eprint_str(sink.view(ps, pbuf))
+        if memprof.clean(prof) == false {
+            eprint_str("census: the run did not return all of its memory")
+        }
+        free_ptr(praw)
+    }
+    memprof.free_counting(prof)
+    return code
+}
+
+// The scan itself. A separate function so every allocation it makes is released at ITS
+// return — which is what lets `--profile` above report a number that means something.
+fn run_scan(read a: Allocator, read root: str, want_json: bool, want_hidden: bool, sandboxed: bool, depth: i64) -> i32 {
+    // The capability. `--sandboxed` is not a simulation: `fs.denied()` refuses every read
+    // and COUNTS the refusal, so the run below really does see an empty tree, and the
+    // number it prints is evidence rather than a claim.
+    var cap: fs.Fs = fs.host()
+    if sandboxed { cap = fs.denied() }
+
+    var col: *mut Collect = alloc(Collect, 1)
+    unsafe {
+        col.*.paths = string_new()
+        col.*.offs = list.make(i32, a)
+        col.*.files = 0
+    }
+
+    var opts: walk.WalkOptions = walk.options()
+    opts = walk.with_hidden(opts, want_hidden)
+    opts = walk.with_sorted(opts, true)
+    if depth > 0 { opts = walk.with_depth(opts, depth as usize) }
+
+    // `&collect`, not `collect`: a BARE function name in fn-pointer argument position
+    // type-checks and then emits a local's spelling (`j_collect`), so gcc rejects it. The
+    // address-of form is the one that lowers correctly — a degrades-to-gcc hole, filed
+    // rather than worked around silently.
+    let vis: walk.Visitor = walk.visitor(col as *mut u8, &collect)
+    let rep: walk.WalkReport = walk.walk(a, cap, root, opts, vis)
+
+    // Phase two: ordinary code, ordinary types.
+    var cs: census.Census = census.new(a)
+    var i: usize = 0
+    unsafe {
+        for i < list.len(i32, col.*.offs) / 2 {
+            let s0: usize = list.get(i32, col.*.offs, i * 2) as usize
+            let s1: usize = list.get(i32, col.*.offs, i * 2 + 1) as usize
+            let pv: str = string_view(col.*.paths)
+            var text: String = fs.open_text(cap, pv[s0 .. s1])
+            census.observe(cs, pv[s0 .. s1], string_view(text))
+            string_free(text)
+            i = i + 1
+        }
+    }
+    census.sort(cs)
+
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var buf: []u8 = slice(u8, raw, REPORT_CAP)
+    var s: Sink = sink.new()
+    if want_json {
+        var w: Writer = json.writer()
+        census.render_json(w, s, buf, cs)
+        sink.put_nl(s, buf)
+    } else {
+        sink.put_str(s, buf, "census of ")
+        sink.put_str(s, buf, root)
+        sink.put_str(s, buf, ": ")
+        sink.put_usize(s, buf, walk.dirs(rep))
+        sink.put_str(s, buf, " dir(s), ")
+        sink.put_usize(s, buf, walk.files(rep))
+        sink.put_str(s, buf, " file(s)")
+        if walk.refused(rep) > 0 {
+            sink.put_str(s, buf, ", ")
+            sink.put_usize(s, buf, walk.refused(rep))
+            sink.put_str(s, buf, " REFUSED by the filesystem capability")
+        }
+        sink.put_nl(s, buf)
+        sink.put_nl(s, buf)
+        let n: usize = census.render_table(s, buf, cs)
+    }
+    // The overflow contract: the sink COUNTS what did not fit, so a truncated report is
+    // detectable rather than merely short. A tool that printed the prefix and said nothing
+    // would be handing a CI job a wrong answer that parses.
+    var bad: bool = false
+    if sink.overflowed(s) {
+        eprint_str("census: report did not fit the buffer; it is TRUNCATED and must not be trusted")
+        bad = true
+    }
+    print_str(sink.view(s, buf))
+    free_ptr(raw)
+
+    unsafe {
+        string_free(col.*.paths)
+        list.free(i32, col.*.offs)
+    }
+    free_ptr(col)
+    if bad { return cli.EXIT_FAILURE }
+    return cli.EXIT_OK
+}

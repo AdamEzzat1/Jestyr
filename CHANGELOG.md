@@ -7,6 +7,42 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`census` — a source-tree census, and the Tier 3 standard library's showcase.**
+  `examples/std/census.jtr` (the tally), `census_cli.jtr` (the tool), `census_test.jtr`
+  (9 cases). Files, bytes, lines and the text/binary split per extension, plus the largest
+  file and how much of the 256-value byte space the tree's text actually uses.
+
+  ```
+  census scan <dir> [--json] [--hidden] [--depth N] [--profile] [--sandboxed]
+  ```
+
+  Seven Tier 3 modules, each doing the job it exists for: `cli` (spec + parse; an unknown
+  option is an error, not a silent positional), `walk` + `sysdir` (sorted, so two runs over
+  an unchanged tree are byte-identical and `--json` is diffable in CI), `fs` (the
+  capability — `--sandboxed` hands the walk `fs.denied()` and reports the refusals), `diag`
+  (usage errors with a caret under the offending argument, rendered over the command line
+  itself as the "source file"), `json`, `bitset` (the 256-bit byte-value set) and `memprof`
+  (`--profile`).
+
+  **The split that makes it testable:** `observe` never touches the filesystem — the caller
+  supplies the path and the bytes. So every awkward case is a string literal in the suite
+  (no trailing newline, one NUL byte, two dots in a name, an empty file), and the whole
+  tally half is `@no_os` — checked rather than asserted. Both renderers are
+  `@no_alloc @no_os`.
+
+  **Verified against an independent recount** (`census_demo_matches_an_independent_recount`):
+  the fixture is counted again in Rust from the rules re-derived rather than ported, then
+  compared — plus determinism across runs, table-vs-JSON agreement, the capability refusal
+  with its positive control beside it, a clean `--profile`, and the caret diagnostic's exit
+  code and clean stdout.
+
+  Three bugs that loop caught which the output did not show: the visitor counted directories
+  as zero-byte files (a perfectly plausible table — only `find | wc -l` disagreed);
+  `--profile` reported `live=288` on a run that leaks nothing (the profile was printed from
+  inside the scan, before the census's own arenas dropped, so the measurement was in the
+  wrong place rather than the memory); and nine test expectations were wrong while the
+  library was right every time.
+
 - **The self-hosted driver renders through `std/diag`.** `jc <file> build|run` now prints the
   same caret block the reference does — header, `--> file:line:col`, the offending source
   line, an underline — instead of one `path:line:col: error: <msg>` line, and reports every

@@ -1,0 +1,314 @@
+// std/census_test.jtr — the unit suite for `std/census`.
+//
+// Every case here is a string LITERAL, not a file on disk. That is the payoff of keeping
+// `observe` free of I/O: the awkward inputs — a file with no trailing newline, a file that
+// is one NUL byte, a name with two dots, an empty file — are things you can write down,
+// so the suite measures the code rather than the state of the machine it runs on.
+//
+// Run:  jestyrc test examples/std/census_test.jtr
+
+import "census"
+import "json"
+import "sink"
+import "bitset"
+import "mem"
+import "test"
+import "test_report"
+
+const REPORT_CAP: usize = 8192
+const OUT_CAP: usize = 8192
+
+// ---- classification ---------------------------------------------------------
+
+@test fn line_counting_handles_the_three_awkward_endings() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_i64(c, rep, "empty file", census.line_count(""), 0)
+    test.eq_i64(c, rep, "one terminated line", census.line_count("a\n"), 1)
+    // The case `wc -l` gets "wrong" for this question: no trailing newline still means a
+    // line of source exists. Pinned in both directions so a change to either is deliberate.
+    test.eq_i64(c, rep, "one UNterminated line", census.line_count("a"), 1)
+    test.eq_i64(c, rep, "two terminated", census.line_count("a\nb\n"), 2)
+    test.eq_i64(c, rep, "two, last unterminated", census.line_count("a\nb"), 2)
+    // A lone newline is one (empty) line, not zero and not two.
+    test.eq_i64(c, rep, "just a newline", census.line_count("\n"), 1)
+    test.eq_i64(c, rep, "trailing blank line", census.line_count("a\n\n"), 2)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn binary_detection_keys_on_nul_and_nothing_else() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.is_false(c, rep, "ascii is text", census.is_binary("fn main() -> i32 { return 0 }"))
+    test.is_false(c, rep, "empty is text", census.is_binary(""))
+    // High bytes are NOT binary: UTF-8 source is full of them, and calling a file with an
+    // em-dash in a comment "binary" would be the failure mode that matters.
+    test.is_false(c, rep, "utf-8 is text", census.is_binary("// a dash \xe2\x80\x94 here"))
+    test.is_true(c, rep, "a NUL anywhere is binary", census.is_binary("PNG\x00IHDR"))
+    test.is_true(c, rep, "a NUL at the end too", census.is_binary("abc\x00"))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn extension_labels_follow_path_ext_including_dotfiles() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_str(c, rep, "ordinary", census.ext_label("src/main.jtr"), "jtr")
+    // Two dots: the LAST one wins, so a tarball is `.gz` and not `.tar.gz`. Recorded
+    // because either answer is defensible and only one of them is what `path.ext` does.
+    test.eq_str(c, rep, "two dots", census.ext_label("dist/app.tar.gz"), "gz")
+    test.eq_str(c, rep, "no extension", census.ext_label("Makefile"), "(none)")
+    // The label is `path.ext`'s answer verbatim, so it carries NO leading dot -- `jtr`, not
+    // `.jtr`. A dotfile is a hidden-file marker rather than a type, so `.bashrc` has no
+    // extension at all and lands in the `(none)` bucket.
+    test.eq_str(c, rep, "dotfile", census.ext_label(".bashrc"), "(none)")
+    test.eq_str(c, rep, "dotfile with ext", census.ext_label(".config.json"), "json")
+    test.eq_str(c, rep, "directory-ish path", census.ext_label("a.b/c"), "(none)")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- the tally --------------------------------------------------------------
+
+@test fn observe_buckets_by_extension_and_totals_add_up() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var cs: census.Census = census.new(a)
+    census.observe(cs, "a.jtr", "fn main() -> i32 { return 0 }\n")   // 30 bytes, 1 line
+    census.observe(cs, "b.jtr", "one\ntwo\n")                        // 8 bytes, 2 lines
+    census.observe(cs, "r.md", "# title\n")                          // 8 bytes, 1 line
+
+    test.eq_usize(c, rep, "two extensions", census.row_count(cs), 2)
+    test.eq_i64(c, rep, "three files", census.total_files(cs), 3)
+    test.eq_i64(c, rep, "bytes", census.total_bytes(cs), 46)
+    test.eq_i64(c, rep, "lines", census.total_lines(cs), 4)
+    test.eq_i64(c, rep, "no binaries", census.total_binary(cs), 0)
+    test.eq_i64(c, rep, "nothing dropped", census.overflowed(cs), 0)
+
+    // The largest-file record, which is a running max and not a final sort.
+    test.eq_i64(c, rep, "largest is the 30-byte one", census.largest_bytes(cs), 30)
+    test.eq_str(c, rep, "and it is named", census.largest_path(cs), "a.jtr")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_binary_file_contributes_bytes_but_no_lines() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var cs: census.Census = census.new(a)
+    census.observe(cs, "t.txt", "hello\n")
+    census.observe(cs, "i.png", "\x89PNG\x00\x0d\x0a\x1a\x0a")
+
+    test.eq_i64(c, rep, "both counted as files", census.total_files(cs), 2)
+    test.eq_i64(c, rep, "both counted in bytes", census.total_bytes(cs), 15)
+    // The load-bearing one: "lines" in a PNG is not a number anyone wants summed, so the
+    // binary's 3 newline-ish bytes must NOT reach the line total.
+    test.eq_i64(c, rep, "only the text file has lines", census.total_lines(cs), 1)
+    test.eq_i64(c, rep, "one binary", census.total_binary(cs), 1)
+
+    // …and the byte-value set is over TEXT only, for the same reason: a handful of
+    // binaries would saturate it to 256 and it would stop distinguishing anything.
+    // "hello\n" is six distinct values (h, e, l, o, \n — l repeats).
+    test.eq_usize(c, rep, "distinct byte values, text only", census.distinct_bytes(cs), 5)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn sort_is_bytes_descending_with_a_name_tiebreak() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var cs: census.Census = census.new(a)
+    census.observe(cs, "s.md", "ab")                 // .md   = 2 bytes
+    census.observe(cs, "b.jtr", "abcdefgh")          // .jtr  = 8 bytes
+    census.observe(cs, "z.rs", "ab")                 // .rs   = 2 bytes
+    census.sort(cs)
+
+    test.eq_str(c, rep, "biggest first", census.row_name(cs, 0), "jtr")
+    // The tiebreak is what makes the output REPRODUCIBLE: `.md` and `.rs` are both 2 bytes,
+    // and without a name comparison their order would depend on insertion order, which
+    // depends on directory traversal, which is not a promise this tool can keep.
+    test.eq_str(c, rep, "tie broken by name", census.row_name(cs, 1), "md")
+    test.eq_str(c, rep, "then the other", census.row_name(cs, 2), "rs")
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- the JSON contract, verified by PARSING IT BACK -------------------------
+
+@test fn the_json_report_round_trips_through_the_parser() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var cs: census.Census = census.new(a)
+    census.observe(cs, "a.jtr", "fn main() -> i32 { return 0 }\n")
+    census.observe(cs, "b.jtr", "one\ntwo\n")
+    census.observe(cs, "r.md", "# title\n")
+    census.sort(cs)
+
+    var obuf: *mut u8 = alloc(u8, OUT_CAP)
+    var ob: []u8 = slice(u8, obuf, OUT_CAP)
+    var s: Sink = sink.new()
+    var w: Writer = json.writer()
+    census.render_json(w, s, ob, cs)
+
+    test.is_false(c, rep, "the buffer held it", sink.overflowed(s))
+    // The writer's own nesting check: an unbalanced report is a bug the producer can see,
+    // rather than one the consumer discovers.
+    test.is_true(c, rep, "brackets balanced", json.balanced(w))
+
+    // …and then the strong form: parse the output with the SAME library and read the
+    // fields back. A renderer can emit plausible-looking JSON that no parser accepts; only
+    // a round trip rules that ob, and a hand-written `contains("\"files\":3")` would not.
+    let text: str = sink.view(s, ob)
+    var d: json.Doc = json.parse(a, text)
+    test.is_true(c, rep, "it parses", json.parsed(d))
+
+    let root: isize = json.root(d)
+    test.is_true(c, rep, "has a root", root >= 0)
+    if root >= 0 {
+        let r: usize = root as usize
+        let fi: isize = json.get(d, r, "files")
+        let bi: isize = json.get(d, r, "bytes")
+        let li: isize = json.get(d, r, "lines")
+        let ti: isize = json.get(d, r, "truncated")
+        let ei: isize = json.get(d, r, "by_ext")
+        test.is_true(c, rep, "every key is present", fi >= 0 and bi >= 0 and li >= 0 and ti >= 0 and ei >= 0)
+        if fi >= 0 { test.eq_i64(c, rep, "files survives the trip", json.as_i64(d, fi as usize), 3) }
+        if bi >= 0 { test.eq_i64(c, rep, "bytes survives the trip", json.as_i64(d, bi as usize), 46) }
+        if li >= 0 { test.eq_i64(c, rep, "lines survives the trip", json.as_i64(d, li as usize), 4) }
+        if ti >= 0 { test.is_false(c, rep, "not truncated", json.as_bool(d, ti as usize)) }
+        if ei >= 0 {
+            let e: usize = ei as usize
+            test.eq_usize(c, rep, "two ext rows", json.len(d, e), 2)
+            // Ordering survives serialization too — the sort is part of the contract, not
+            // a display detail, because a diff of two JSON reports has to be meaningful.
+            let first: usize = json.elem(d, e, 0)
+            let ki: isize = json.get(d, first, "ext")
+            if ki >= 0 { test.eq_str(c, rep, "biggest bucket first", json.as_str(d, ki as usize), "jtr") }
+        }
+    }
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(obuf)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_path_with_a_quote_survives_json_escaping() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // The classic injection shape: a filename that closes the string. If the writer did
+    // not escape, the document would not parse — which is exactly what this asserts, so
+    // the test fails loudly rather than producing subtly wrong output.
+    var cs: census.Census = census.new(a)
+    census.observe(cs, "od\"d\\name.jtr", "x\n")
+
+    var obuf: *mut u8 = alloc(u8, OUT_CAP)
+    var ob: []u8 = slice(u8, obuf, OUT_CAP)
+    var s: Sink = sink.new()
+    var w: Writer = json.writer()
+    census.render_json(w, s, ob, cs)
+
+    var d: json.Doc = json.parse(a, sink.view(s, ob))
+    test.is_true(c, rep, "still parses", json.parsed(d))
+    let root: isize = json.root(d)
+    if root >= 0 {
+        let li: isize = json.get(d, root as usize, "largest")
+        if li >= 0 {
+            let pi: isize = json.get(d, li as usize, "path")
+            if pi >= 0 {
+                test.eq_str(c, rep, "and the name comes back intact", json.as_str(d, pi as usize), "od\"d\\name.jtr")
+            }
+        }
+    }
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(obuf)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- the table --------------------------------------------------------------
+
+@test fn the_table_reports_what_it_tallied() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var cs: census.Census = census.new(a)
+    census.observe(cs, "a.jtr", "fn main() -> i32 { return 0 }\n")
+    census.observe(cs, "r.md", "# title\n")
+    census.sort(cs)
+
+    var obuf: *mut u8 = alloc(u8, OUT_CAP)
+    var ob: []u8 = slice(u8, obuf, OUT_CAP)
+    var s: Sink = sink.new()
+    let n: usize = census.render_table(s, ob, cs)
+
+    test.is_false(c, rep, "fits the buffer", sink.overflowed(s))
+    test.is_true(c, rep, "wrote something", n > 0)
+    let text: str = sink.view(s, ob)
+    test.is_true(c, rep, "has the ext column", str_has(text, "jtr"))
+    test.is_true(c, rep, "has the other row", str_has(text, "md"))
+    test.is_true(c, rep, "names the largest file", str_has(text, "a.jtr (30 bytes)"))
+    test.is_true(c, rep, "reports the byte-value coverage", str_has(text, " of 256"))
+    // No truncation happened, so the report must NOT carry the incomplete-report note —
+    // a warning that is always present is a warning nobody reads.
+    test.is_false(c, rep, "no spurious truncation note", str_has(text, "NOTE:"))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(obuf)
+    free_ptr(raw)
+    return ok
+}
+
+// `contains` is a cgen intrinsic name, so a local helper cannot be called that.
+fn str_has(read h: str, read needle: str) -> bool {
+    if needle.len > h.len { return false }
+    var i: usize = 0
+    for i + needle.len <= h.len {
+        var j: usize = 0
+        var same: bool = true
+        for j < needle.len {
+            if h[i + j] != needle[j] { same = false  break }
+            j = j + 1
+        }
+        if same { return true }
+        i = i + 1
+    }
+    return false
+}
