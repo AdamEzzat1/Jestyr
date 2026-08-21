@@ -274,6 +274,8 @@ fn emit_program(
         enum_instances: Vec::new(),
         error_tags,
         cur_result: String::new(),
+        unit_tail: false,
+        cur_result_unit: false,
         cur_ensures: Vec::new(),
         cur_ret_cty: String::new(),
         closures: Vec::new(),
@@ -686,6 +688,18 @@ struct Cgen<'a> {
     /// the C result-struct type of the function currently being emitted (empty if
     /// the function is not fallible). Used by `ok`/`err`/`?`.
     cur_result: String,
+    /// **One-shot**: the body about to be emitted is a fallible function's OUTERMOST
+    /// body and its ok type is unit (`fn f(…) !{ E }`, no declared return type), so
+    /// reaching the end of it means SUCCESS and a result struct has to be returned there.
+    ///
+    /// A flag rather than a parameter because `emit_body` is shared with `if` branches,
+    /// nested blocks and match arms — every body function takes it with `mem::take`, so
+    /// the outermost one consumes it and nothing nested ever sees it set.
+    unit_tail: bool,
+    /// Persistent for the function being emitted: its result's ok type is unit. Read by
+    /// `emit_return` for a valueless `return`, which `unit_tail` cannot serve because it
+    /// is consumed at the body's opening brace.
+    cur_result_unit: bool,
     /// `ensures` postconditions of the function being emitted (checked before
     /// every value return, with `result` bound to the returned value).
     cur_ensures: Vec<ExprId>,
@@ -2711,41 +2725,6 @@ impl<'a> Cgen<'a> {
             .collect();
         self.ptr_params.extend(self.abi_ref_params(f));
         self.cur_result = self.fn_result_type(f);
-        // **A fallible function with no return type cannot be lowered yet**, and until
-        // now it was accepted all the way to `cc`. `fn f(x: i32) !{ Bad }` parses,
-        // type-checks, and `jestyrc check` reports ok — then produces C that fails three
-        // separate ways: a bare `return` emits `return;` out of a function whose C return
-        // type is `JestyrResult_unit` (a gcc *warning*, so the success path compiles and
-        // hands back an uninitialized tag), `?` emits `.ok` against a struct that has no
-        // such member, and `catch` emits an invalid void expression.
-        //
-        // The first of those is the dangerous one: it is the only failure mode here that
-        // gcc does not refuse, so the shape's *working* path is the one that miscompiles.
-        //
-        // Refused HERE rather than in typeck, following the `Self`-in-a-trait-parameter
-        // precedent: the limitation genuinely is the backend's, the shape is a reasonable
-        // thing to want, and a typeck error would refuse `examples/vec.jtr` — whose
-        // `push` is a method on an uninstantiated `comptime T` factory and is therefore
-        // never emitted at all. Measured over the corpus: **that one site, and it does
-        // not reach cgen**, so this rule fires nowhere and changes no emitted byte.
-        //
-        // Consequence to know: `check` still passes and `build` now fails, which is the
-        // same `check`/`run` gap `Self` has. The real fix is to lower `JestyrResult_unit`
-        // — construct it on the valueless `return`, skip the `.ok` projection in `?`, and
-        // give `catch` a statement form — which is an emission change and so owes the
-        // port mirror in `examples/std/cgen.jtr` plus a reseed. Zero golden churn, since
-        // no corpus file emits the shape.
-        if f.errors.is_some() && f.ret_ty.is_none() {
-            self.diag(
-                f.name.span,
-                format!(
-                    "the C backend cannot lower `{}` yet: a fallible function must declare \
-                     a return type, because `!{{ … }}` with none lowers to a result struct \
-                     with no ok field",
-                    f.name.name
-                ),
-            );
-        }
         self.cur_ensures = f.ensures.clone();
         self.cur_ret_cty = self.ret_type(f);
         self.cur_no_panic = f.no_panic;
@@ -2759,6 +2738,11 @@ impl<'a> Cgen<'a> {
 
         let sig = self.fn_signature(f, c_name);
         let returns_value = self.ret_type(f) != "void";
+        // `!{ E }` with NO declared return type -- the ok type is unit, so reaching
+        // the end of the body is SUCCESS. Set for the outermost body only;
+        // `emit_fn_body` takes it with `mem::take`.
+        self.unit_tail = f.errors.is_some() && f.ret_ty.is_none();
+        self.cur_result_unit = self.unit_tail;
         self.raw(format!("{sig}\n"));
         // Map the function's emitted body back to its `.jtr` declaration line. The
         // per-statement directives (increment b) then refine the mapping; reset the
@@ -2769,6 +2753,7 @@ impl<'a> Cgen<'a> {
         self.raw("\n");
         self.ptr_params.clear();
         self.cur_result.clear();
+        self.cur_result_unit = false;
         self.cur_ensures.clear();
         self.cur_ret_cty.clear();
         self.cur_refines.clear();
@@ -2780,6 +2765,7 @@ impl<'a> Cgen<'a> {
     /// Like `emit_body`, but prefixed with the function's `requires`
     /// preconditions as `assert`s (active in debug, elided under `-DNDEBUG`).
     fn emit_fn_body(&mut self, block: &Block, ret: bool, requires: &[ExprId]) {
+        let unit_tail = std::mem::take(&mut self.unit_tail);
         self.line("{");
         self.depth += 1;
         self.drop_scope_enter();
@@ -2808,6 +2794,24 @@ impl<'a> Cgen<'a> {
             } else {
                 self.emit_stmt(stmt);
             }
+        }
+        // **Falling off the end of a unit-fallible function means SUCCESS**, and it has
+        // to be spelled. `fn f(…) !{ E } { if bad { return err(E) } }` is the natural way
+        // to write a procedure that either fails early or completes, and it used to run
+        // off the end of a function whose C return type is `JestyrResult_unit` -- reading
+        // an indeterminate tag at the caller.
+        //
+        // This is well-defined ONLY because the ok type is unit: there is no value to
+        // invent, so "reached the end" carries exactly one meaning. A `-> T !E` (or a
+        // plain `-> T`) that falls off the end is a DIFFERENT, pre-existing gap and is
+        // deliberately not touched here -- the compiler cannot know what `T` to return.
+        //
+        // Emitted through `emit_value_return` and BEFORE the drop-scope exit, so it runs
+        // the `ensures` postconditions and the scope's drops exactly as a written tail
+        // `return` does. Skipped when the body already ends in one, so the ordinary
+        // spelling emits no second return.
+        if unit_tail && !matches!(block.stmts.last(), Some(Stmt::Return { .. })) {
+            self.emit_value_return(format!("({}){{ .is_err = false }}", self.cur_result));
         }
         // A function body that returns by value has already dropped (the tail was a
         // `return`); a fall-through (void) body drops its locals here.
@@ -3767,6 +3771,9 @@ impl<'a> Cgen<'a> {
     // --- statements ---
 
     fn emit_body(&mut self, block: &Block, ret: bool) {
+        // Shared with `if` branches, nested blocks and match arms, so the flag is taken
+        // (and cleared) here: only the outermost body of a unit-fallible function sees it.
+        let unit_tail = std::mem::take(&mut self.unit_tail);
         self.line("{");
         self.depth += 1;
         self.drop_scope_enter();
@@ -3787,6 +3794,24 @@ impl<'a> Cgen<'a> {
             } else {
                 self.emit_stmt(stmt);
             }
+        }
+        // **Falling off the end of a unit-fallible function means SUCCESS**, and it has
+        // to be spelled. `fn f(…) !{ E } { if bad { return err(E) } }` is the natural way
+        // to write a procedure that either fails early or completes, and it used to run
+        // off the end of a function whose C return type is `JestyrResult_unit` -- reading
+        // an indeterminate tag at the caller.
+        //
+        // This is well-defined ONLY because the ok type is unit: there is no value to
+        // invent, so "reached the end" carries exactly one meaning. A `-> T !E` (or a
+        // plain `-> T`) that falls off the end is a DIFFERENT, pre-existing gap and is
+        // deliberately not touched here -- the compiler cannot know what `T` to return.
+        //
+        // Emitted through `emit_value_return` and BEFORE the drop-scope exit, so it runs
+        // the `ensures` postconditions and the scope's drops exactly as a written tail
+        // `return` does. Skipped when the body already ends in one, so the ordinary
+        // spelling emits no second return.
+        if unit_tail && !matches!(block.stmts.last(), Some(Stmt::Return { .. })) {
+            self.emit_value_return(format!("({}){{ .is_err = false }}", self.cur_result));
         }
         if block_diverges(block, ret) {
             self.drop_scope_exit_discard();
@@ -3867,8 +3892,34 @@ impl<'a> Cgen<'a> {
 
     fn emit_return(&mut self, value: Option<ExprId>) {
         let Some(e) = value else {
-            self.emit_all_drops();
-            self.line("return;");
+            // **A valueless `return` out of a FALLIBLE function is the success path**, and
+            // it has to construct the result struct. `fn f(…) !{ E }` has no declared
+            // return type, so its C return type is `JestyrResult_unit` — and emitting a
+            // bare `return;` from it was only a gcc *warning*, so the shape compiled and
+            // handed the caller an uninitialized tag. That made the WORKING path the one
+            // that miscompiled, which is the worst version of degrades-to-gcc.
+            //
+            // `.is_err = false` alone is enough: C zero-initializes every member a
+            // designated initializer omits, so `err` and the payload union are cleared
+            // without naming them (and naming `err` would diff the payload-free programs
+            // against the port mirror and the seed for no gain).
+            //
+            // Routed through `emit_value_return` rather than `line("return …")` so the
+            // `ensures` postconditions and the scope's drops run exactly as they do for
+            // every other returned value.
+            // Scoped to a UNIT result on purpose. A valueless `return` out of a
+            // `-> T !E` would have no `T` to supply, so turning it into
+            // `{ .is_err = false }` would manufacture a zero-valued SUCCESS — strictly
+            // worse than the pre-existing bare `return;`, which is the same
+            // falls-off-the-end gap a plain `-> T` already has and is not this change's
+            // business to fix.
+            if !self.cur_result_unit {
+                self.emit_all_drops();
+                self.line("return;");
+            } else {
+                let v = format!("({}){{ .is_err = false }}", self.cur_result);
+                self.emit_value_return(v);
+            }
             return;
         };
         let ast = self.ast;
@@ -5514,14 +5565,27 @@ impl<'a> Cgen<'a> {
                 // union assignment needs no knowledge of the live member), which
                 // is what keeps the hop one struct literal at any payload width.
                 let paycp = self.pay_copy(&tmp);
+                // **A `!E`-only result carries no `ok` member**, so the yielded value is
+                // dropped from the statement-expression rather than read. Its C type then
+                // becomes `void`, which is exactly right: `f(x)?` on a unit-fallible callee
+                // is a statement, and the two `catch` arms already lower the same shape the
+                // same way (`ok == Ty::Unit` → no `.ok`, no value variable).
+                //
+                // Without this the emitted C read `.ok` off a struct that has no such
+                // member — `check` passed and gcc refused, the degrades-to-gcc class.
+                let yield_ok = if matches!(self.info.type_of(*base), Ty::Result(ref ok, _) if **ok == Ty::Unit) {
+                    String::new()
+                } else {
+                    format!(" {tmp}.ok;")
+                };
                 if self.error_traces {
                     let hop = self.et_push(span);
                     return format!(
-                        "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) {{ {hop}return ({cur}){{ .is_err = true, .err = {tmp}.err{paycp} }}; }} {tmp}.ok; }})"
+                        "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) {{ {hop}return ({cur}){{ .is_err = true, .err = {tmp}.err{paycp} }}; }}{yield_ok} }})"
                     );
                 }
                 format!(
-                    "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) return ({cur}){{ .is_err = true, .err = {tmp}.err{paycp} }}; {tmp}.ok; }})"
+                    "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) return ({cur}){{ .is_err = true, .err = {tmp}.err{paycp} }};{yield_ok} }})"
                 )
             }
             ExprKind::Catch { base, binder, fallback, rethrow } => {
@@ -5550,8 +5614,15 @@ impl<'a> Cgen<'a> {
                     }
                     let cur = self.cur_result.clone();
                     let paycp = self.pay_copy(&tmp);
+                    // Same `!E`-only rule as `?` and as the two recovering forms below:
+                    // no `ok` member exists, so nothing is yielded.
+                    let yield_ok = if matches!(bt, Ty::Result(ref ok, _) if **ok == Ty::Unit) {
+                        String::new()
+                    } else {
+                        format!(" {tmp}.ok;")
+                    };
                     return format!(
-                        "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) return ({cur}){{ .is_err = true, .err = {tmp}.err{paycp} }}; {tmp}.ok; }})"
+                        "({{ {res_ty} {tmp} = {base_c}; if ({tmp}.is_err) return ({cur}){{ .is_err = true, .err = {tmp}.err{paycp} }};{yield_ok} }})"
                     );
                 }
 
@@ -7195,10 +7266,13 @@ impl<'a> Cgen<'a> {
             }
         };
         self.cur_result = if f.errors.is_some() { ret.clone() } else { String::new() };
+        let unit_tail = f.errors.is_some() && f.ret_ty.is_none();
+        self.cur_result_unit = unit_tail;
         let cname = self.method_c_name(ctor, args, &f.name.name);
         let params = self.method_params_str(f);
         if body {
             self.raw(format!("{prefix}{ret} {cname}({params})\n"));
+            self.unit_tail = unit_tail;
             self.emit_body(&f.body, ret != "void");
             self.raw("\n");
         } else {
@@ -7327,10 +7401,13 @@ impl<'a> Cgen<'a> {
         } else {
             self.cur_result.clear();
         }
+        let unit_tail = f.errors.is_some() && f.ret_ty.is_none();
+        self.cur_result_unit = unit_tail;
         let cname = impl_method_c_name(&im.trait_name.name, &type_key, &f.name.name);
         let params = self.method_params_str(f);
         if body {
             self.raw(format!("{prefix}{ret} {cname}({params})\n"));
+            self.unit_tail = unit_tail;
             self.emit_body(&f.body, ret != "void");
             self.raw("\n");
         } else {
@@ -13038,47 +13115,77 @@ mod tests {
         );
     }
 
-    /// **A fallible function with no return type is refused by the backend.**
+    /// **A fallible function with NO return type lowers.** `fn f(x: i32) !{ Bad }` — the
+    /// natural signature for an operation that either fails or simply completes, which is
+    /// most of what a `sys` layer does (`close`, `bind`, `commit`, `cancel`).
     ///
-    /// `fn f(x: i32) !{ Bad }` used to reach `cc`. What arrived there was C that gcc
-    /// rejects in two of its three shapes (`?` projects `.ok` off a struct with no ok
-    /// field; `catch` becomes an invalid void expression) and — the dangerous one —
-    /// *accepts* in the third: a valueless `return` out of a `JestyrResult_unit`
-    /// function is only a gcc warning, so the success path compiled and returned an
-    /// uninitialized tag. `jestyrc check` said "ok" for all three.
+    /// It used to reach `cc`, and what arrived there was C that gcc rejects in two of its
+    /// three shapes (`?` projects `.ok` off a struct with no ok field; `catch` becomes an
+    /// invalid void expression) and — the dangerous one — *accepts* in the third: a
+    /// valueless `return` out of a `JestyrResult_unit` function is only a warning, so the
+    /// SUCCESS path compiled and returned an uninitialized tag.
     ///
-    /// The three assertions below are the three lowerings, so a future implementation
-    /// of `JestyrResult_unit` has to delete this test deliberately rather than watch it
-    /// pass vacuously.
+    /// Every arm below is one of those lowerings, and the last is the one with no `return`
+    /// at all: reaching the end of a unit-fallible body means success, which is
+    /// well-defined only because there is no value to invent.
     #[test]
-    fn a_fallible_function_with_no_return_type_is_refused() {
-        for (what, src) in [
-            ("bare return", "fn f(x: i32) !{ Bad } { if x < 0 { return err(Bad) } return }"),
-            (
-                "propagated with `?`",
-                "fn f(x: i32) !{ Bad } { return err(Bad) } \
-                 fn g(x: i32) -> i32 !{ Bad } { f(x)? return ok(1) }",
-            ),
-            (
-                "recovered with `catch`",
-                "fn f(x: i32) !{ Bad } { return err(Bad) } \
-                 fn g(x: i32) -> i32 { f(x) catch 0 return 1 }",
-            ),
-        ] {
-            let (_c, d) = gen(src);
-            assert!(
-                d.iter().any(|x| x.message.contains("a fallible function must declare a return type")),
-                "the {what} form must be refused by the backend, not by gcc; got {d:?}"
-            );
-        }
+    fn a_fallible_function_with_no_return_type_lowers() {
+        let unit_fn = "fn f(x: i32) !{ Bad } { if x < 0 { return err(Bad) } return } ";
 
-        // **The positive control.** Without it the assertions above would also pass for
-        // a backend that refused every fallible function, which is the failure mode a
-        // refusal test has: the same declared error set, one return type added, must
-        // still lower cleanly.
-        let (c, d) = gen("fn f(x: i32) -> i32 !{ Bad } { if x < 0 { return err(Bad) } return ok(x) }");
-        assert!(d.is_empty(), "a fallible function WITH a return type still lowers: {d:?}");
-        assert!(c.contains("JestyrResult_i32 jestyr_f("), "and returns the result struct: {c}");
+        // 1. The valueless `return` constructs the ok struct rather than emitting `return;`.
+        let (c, d) = gen(unit_fn);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(
+            c.contains("typedef struct { bool is_err; int err; } JestyrResult_unit;"),
+            "the unit result typedef carries no ok member: {c}"
+        );
+        // `body_of` matches the forward DECLARATION first, so these anchor on fragments
+        // that only the definition can contain.
+        assert!(
+            c.contains("return (JestyrResult_unit){ .is_err = false };"),
+            "the success path must construct the result: {c}"
+        );
+        assert!(!c.contains("
+    return;
+"), "and must not emit a bare `return;`: {c}");
+
+        // 2. `?` yields nothing — there is no `.ok` to read.
+        let (c, d) = gen(&format!("{unit_fn}fn g(x: i32) -> i32 !{{ Bad }} {{ f(x)? return ok(1) }}"));
+        assert!(d.is_empty(), "{d:?}");
+        // `_q0` is `?`'s own temp, so these are unambiguous without slicing the body out.
+        assert!(c.contains("_q0.is_err) return (JestyrResult_i32)"), "`?` still propagates: {c}");
+        assert!(!c.contains("_q0.ok"), "but reads no ok member: {c}");
+
+        // 3. `catch |e| return e` — the same, on the explicit-propagate form.
+        let (c, d) = gen(&format!("{unit_fn}fn g(x: i32) -> i32 !{{ Bad }} {{ f(x) catch |e| return e return ok(1) }}"));
+        assert!(d.is_empty(), "{d:?}");
+        assert!(c.contains("_ct0.is_err) return (JestyrResult_i32)"), "rethrow still propagates: {c}");
+        assert!(!c.contains("_ct0.ok"), "and reads no ok member: {c}");
+
+        // 4. **Falling off the end is success**, and it is spelled rather than left to run
+        //    off a non-void function.
+        let (c, d) = gen("fn f(x: i32) !{ Bad } { if x < 0 { return err(Bad) } }");
+        assert!(d.is_empty(), "{d:?}");
+        assert!(
+            c.contains("return (JestyrResult_unit){ .is_err = false };"),
+            "a body with no trailing `return` still returns success: {c}"
+        );
+
+        // **The positive control**: a fallible function WITH a return type is unchanged —
+        // it still carries an ok member and still reads it. Without this, every assertion
+        // above would also pass for a backend that had stopped emitting ok members at all.
+        let (c, d) = gen("fn f(x: i32) -> i32 !{ Bad } { if x < 0 { return err(Bad) } return ok(x) }                           fn g(x: i32) -> i32 !{ Bad } { let v = f(x)? return ok(v) }");
+        assert!(d.is_empty(), "{d:?}");
+        assert!(c.contains("int32_t ok;"), "a typed result still has an ok member: {c}");
+        assert!(c.contains("_q0.ok"), "and `?` still reads it: {c}");
+
+        // And a valueless `return` out of a NON-fallible void function is untouched: this
+        // change is scoped to unit RESULTS, not to valueless returns in general.
+        let (c, d) = gen("fn v(x: i32) { if x < 0 { return } }");
+        assert!(d.is_empty(), "{d:?}");
+        assert!(c.contains("
+        return;
+"), "a void fn still returns bare: {c}");
     }
 
     #[test]

@@ -130,14 +130,23 @@ fn main() -> i32 {
     //
     // First publish: nothing to replace. Second publish: the destination exists, and this
     // is where a portable `rename` would have FAILED on Windows rather than replacing.
-    let clobbered1: bool = sysfs.rename_replace(h, a, stage_path, final_path) catch true
+    //
+    // **`rename_replace` answers nothing** -- it is `fn … !{ E }` with no return type. It
+    // used to hand back "did the destination exist", which meant the LIBRARY performed a
+    // probe nobody asked for and reported an answer that could already be stale. A
+    // publisher that wants to know asks for itself, right here, and owns the race by doing
+    // so: between this probe and the rename another process may create the destination,
+    // and the rename replaces it either way.
+    let had1: bool = sysfs.exists(h, a, final_path)
+    sysfs.rename_replace(h, a, stage_path, final_path) catch { print_str("publish failed") }
     print_str("first publish replaced something")
-    print_bool(clobbered1)
+    print_bool(had1)
 
     fs.put(h, stage_path, "jestyr-manifest/v1\nmodule app 2222\n")
-    let clobbered2: bool = sysfs.rename_replace(h, a, stage_path, final_path) catch false
+    let had2: bool = sysfs.exists(h, a, final_path)
+    sysfs.rename_replace(h, a, stage_path, final_path) catch { print_str("publish failed") }
     print_str("second publish replaced something")
-    print_bool(clobbered2)
+    print_bool(had2)
 
     var got: String = fs.open_text(h, final_path)
     let gv: str = string_view(got)

@@ -256,7 +256,7 @@ fn cat_of_remove(mut f: fs.Fs, read a: Allocator, read p: str) -> i32 {
     return ok
 }
 
-@test fn rename_replaces_and_reports_whether_it_clobbered() -> bool {
+@test fn rename_replaces_an_existing_destination() -> bool {
     var raw: *mut u8 = alloc(u8, SYSFS_T_CAP)
     var rep: []u8 = slice(u8, raw, SYSFS_T_CAP)
     var c: test.Check = test.new()
@@ -272,19 +272,28 @@ fn cat_of_remove(mut f: fs.Fs, read a: Allocator, read p: str) -> i32 {
     let src: str = under("a.txt", b)
     let dst: str = under("b.txt", b2)
 
-    // Fresh destination: nothing clobbered.
+    // **`rename_replace` answers nothing** — it is `fn … !{ E }` with no return type, the
+    // shape that used to miscompile. Success is the absence of an error, and the test
+    // observes the WORLD rather than a return value: the source is gone, the destination
+    // holds the new bytes.
+    //
+    // `moved` starts true and only a `catch` can clear it, so a failure cannot be
+    // mistaken for a success that returned nothing.
     fs.put(h, src, "first")
-    let clobbered1: bool = sysfs.rename_replace(h, a, src, dst) catch true
-    test.is_false(c, rep, "a fresh destination reports no replacement", clobbered1)
+    var moved: bool = true
+    sysfs.rename_replace(h, a, src, dst) catch { moved = false }
+    test.is_true(c, rep, "a fresh destination is moved onto", moved)
     test.is_false(c, rep, "and the source is gone", sysfs.exists(h, a, src))
+    test.is_true(c, rep, "and the destination is there", sysfs.exists(h, a, dst))
 
     // Existing destination: replaced, and the CONTENTS are the new ones. **This is the
     // assertion that matters on Windows**, where plain `MoveFileA` would have failed
     // outright rather than replacing — the divergence that makes rename a `sys` operation
     // instead of an ISO C call.
     fs.put(h, src, "second")
-    let clobbered2: bool = sysfs.rename_replace(h, a, src, dst) catch false
-    test.is_true(c, rep, "an existing destination reports a replacement", clobbered2)
+    var moved2: bool = true
+    sysfs.rename_replace(h, a, src, dst) catch { moved2 = false }
+    test.is_true(c, rep, "an existing destination is replaced", moved2)
 
     var txt: String = fs.open_text(h, dst)
     let tv: str = string_view(txt)
@@ -311,6 +320,13 @@ fn cat_of_remove(mut f: fs.Fs, read a: Allocator, read p: str) -> i32 {
     // A refusal is a TYPED error here, not a counter bump — `std/fs` counts because its
     // operations answer `bool`; these answer with an error union, so the discrimination is
     // in the type. `cat_of_make` maps `SysFsRefused` to -1, which no real category is.
+    // A refused rename reports through the same typed member, and it has no return value
+    // to confuse the question with — `moved` can only be cleared by the `catch`.
+    var moved3: bool = true
+    var ro0: fs.Fs = fs.read_only()
+    sysfs.rename_replace(ro0, a, "a", "b") catch { moved3 = false }
+    test.is_false(c, rep, "a read-only handle refuses rename_replace", moved3)
+
     var ro: fs.Fs = fs.read_only()
     test.eq_i64(c, rep, "a read-only handle refuses make_dir", cat_of_make(ro, a, SYSFS_T_ROOT) as i64, 0 - 1)
     test.eq_i64(c, rep, "a read-only handle refuses remove_dir", cat_of_remove(ro, a, SYSFS_T_ROOT) as i64, 0 - 1)

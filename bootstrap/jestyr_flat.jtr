@@ -13558,6 +13558,12 @@ fn emit_ty_c(mut sb: String, read p: Parser, read src: str, read c: Checker, tyi
 fn push_ty_mangle(mut sb: String, read src: str, read c: Checker, tyid: i32) {
     if tyid < 0 { string_push(sb, "unit")  return }
     let d: TyData = get__list(TyData, c.tys, tyid as usize)
+    // The RESOLVED Unit type mangles to `unit` too. `tyid < 0` above is "no type at all"
+    // (an absent return type); this is a real TyData whose kind is Unit, which is what a
+    // `!{ E }`-only result's ok type resolves to. Without this arm it fell through to the
+    // `?` default and the port emitted `JestyrResult_?` where the reference emits
+    // `JestyrResult_unit` -- invisible until a corpus file first had a unit result.
+    if d.kind == 1 { string_push(sb, "unit")  return }
     if d.kind == 2 { string_push(sb, prim_jname(d.x))  return }
     if d.kind == 15 {
         let ns: i32 = get__list(i32, c.tdecl, (d.x * 10 + 0) as usize)
@@ -15034,8 +15040,15 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
     if e.kind == 8 {                                  // Try `e?`: early-return-on-error statement-expr
         let n: i32 = g.tmp
         g.tmp = g.tmp + 1
+        // `!E`-only base: a unit result carries NO `ok` member, so nothing is yielded and
+        // the statement-expression's type is `void` -- which is right, since `f(x)?` on a
+        // unit-fallible callee is a statement. Same test the two recovering forms below
+        // already use (`kind == 5` is Result, `.a == 1` is the unit ok type).
+        let qbt: i32 = get__list(i32, c.et, e.a as usize)
+        let qbtd: TyData = get__list(TyData, c.tys, qbt as usize)
+        let q_unit: bool = qbtd.kind == 5 and qbtd.a == 1
         string_push(sb, "({ ")
-        emit_ty_c(sb, p, src, c, get__list(i32, c.et, e.a as usize))   // the base's own Result type
+        emit_ty_c(sb, p, src, c, qbt)                 // the base's own Result type
         string_push(sb, " _q")
         push_uint__cgen(sb, n as i64)
         string_push(sb, " = ")
@@ -15052,9 +15065,13 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
             push_uint__cgen(sb, n as i64)
             string_push(sb, ".pay")
         }
-        string_push(sb, " }; _q")
-        push_uint__cgen(sb, n as i64)
-        string_push(sb, ".ok; })")
+        if q_unit {
+            string_push(sb, " }; })")
+        } else {
+            string_push(sb, " }; _q")
+            push_uint__cgen(sb, n as i64)
+            string_push(sb, ".ok; })")
+        }
         return
     }
     if e.kind == 45 {                                 // Catch `e catch v`: recover, don't propagate
@@ -15101,9 +15118,13 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                 push_uint__cgen(sb, n as i64)
                 string_push(sb, ".pay")
             }
-            string_push(sb, " }; _ct")
-            push_uint__cgen(sb, n as i64)
-            string_push(sb, ".ok; })")
+            if btd.kind == 5 and btd.a == 1 {     // `!E`-only: nothing to yield
+                string_push(sb, " }; })")
+            } else {
+                string_push(sb, " }; _ct")
+                push_uint__cgen(sb, n as i64)
+                string_push(sb, ".ok; })")
+            }
             string_free(sbb)
             return
         }
@@ -18544,8 +18565,54 @@ fn collect_moved_block(mut g: Cg, read p: Parser, read src: str, beid: i32) {
 
 // The statement group threads `read c: typeck.Checker` (inferred-`let` types, type-directed
 // lowering) and `mut g: Cg` (the temp counter). (`emit_expr` needs neither mutability nor `g` yet.)
+// The SUCCESS return of a unit-fallible fn: `return (JestyrResult_unit){ .is_err = false };`.
+// Mirrors `emit_value_return` on the reference side -- `ensures` postconditions and the
+// scope's drops run exactly as they do for a written value return, which is why this is a
+// helper and not two `string_push`es at each of its two call sites.
+//
+// `.is_err = false` alone: C zero-initializes every member a designated initializer omits,
+// so `err` and the payload union are cleared without being named.
+fn emit_unit_ok_return(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg, depth: i32) {
+    if len(i32, g.ens) > 0 or has_live_drops(g) {
+        indent(sb, depth)
+        emit_result_name(sb, p, src, c, g, g.res_ok)
+        string_push(sb, " j_result = (")
+        emit_result_name(sb, p, src, c, g, g.res_ok)
+        string_push(sb, "){ .is_err = false };\n")
+        var ei: usize = 0
+        for ei < len(i32, g.ens) {
+            let ene: ExprData = get__list(ExprData, p.ex, get__list(i32, g.ens, ei) as usize)
+            cg_mark_line(sb, g, ene.start)
+            indent(sb, depth)
+            string_push(sb, "assert(")
+            emit_expr(sb, p, src, c, g, get__list(i32, g.ens, ei))
+            string_push(sb, ");\n")
+            ei = ei + 1
+        }
+        emit_all_drops(sb, p, src, c, g, depth)
+        line_at(sb, depth, "return j_result;")
+        return
+    }
+    indent(sb, depth)
+    string_push(sb, "return (")
+    emit_result_name(sb, p, src, c, g, g.res_ok)
+    string_push(sb, "){ .is_err = false };\n")
+}
+
 fn emit_return(mut sb: String, read p: Parser, read src: str, read c: Checker, mut g: Cg, val: i32, depth: i32) {
     if val < 0 {
+        // A valueless `return` out of a UNIT-fallible fn is the success path and has to
+        // construct the result struct -- a bare `return;` from a function whose C return
+        // type is `JestyrResult_unit` is only a gcc WARNING, so it compiled and handed the
+        // caller an indeterminate tag. `res_ok == -1` is exactly "fallible, no declared
+        // return type"; `-2` is "not fallible" and keeps the bare `return;`.
+        //
+        // Scoped to unit deliberately: a valueless `return` out of a `-> T !E` has no `T`
+        // to supply, so synthesizing a success there would manufacture a zero-valued OK.
+        if g.res_ok == 0 - 1 {
+            emit_unit_ok_return(sb, p, src, c, g, depth)
+            return
+        }
         emit_all_drops(sb, p, src, c, g, depth)          // drop every live local before returning
         line_at(sb, depth, "return;")
         return
@@ -18779,13 +18846,34 @@ fn emit_body(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
         }
         i = i + 1
     }
+    // Does the body already end in an explicit `return`? Read once, used twice below.
+    var tail_ret: bool = false
+    if n > 0 {
+        let lsid0: i32 = get__list(i32, p.sar, (blk.x + n - 1) as usize)
+        let ls0: StmtData = get__list(StmtData, p.st, lsid0 as usize)
+        if ls0.kind == 1 { tail_ret = true }
+    }
+    // **Falling off the end of a unit-fallible fn means SUCCESS**, and it has to be
+    // spelled: `fn f(..) !{ E } { if bad { return err(E) } }` is the natural way to write
+    // a procedure that either fails early or completes, and it used to run off the end of
+    // a function whose C return type is `JestyrResult_unit`.
+    //
+    // `depth == 0` is what makes this the FUNCTION's body and not a nested one. Every one
+    // of the six `emit_body` call sites that opens a fn body passes a literal `0`, and
+    // every nested body (an `if` branch, a block, a match arm) is reached through
+    // `emit_stmt` at `depth + 1` -- so depth 0 is the outermost body by construction, the
+    // same role the reference gives its one-shot `unit_tail` flag.
+    //
+    // `res_ok == -1` is exactly "fallible with no declared return type"; `-2` is "not
+    // fallible". Well-defined only because the ok type is unit: there is no value to
+    // invent. A `-> T !E` (or a plain `-> T`) falling off the end is a different,
+    // pre-existing gap and is deliberately untouched.
+    if depth == 0 and g.res_ok == 0 - 1 and tail_ret == false {
+        emit_unit_ok_return(sb, p, src, c, g, depth + 1)
+    }
     // `block_diverges`: `ret` (the tail was emitted as a return) or a trailing explicit `return`.
     var dv: bool = ret
-    if n > 0 {
-        let lsid: i32 = get__list(i32, p.sar, (blk.x + n - 1) as usize)
-        let ls: StmtData = get__list(StmtData, p.st, lsid as usize)
-        if ls.kind == 1 { dv = true }
-    }
+    if tail_ret { dv = true }
     if dv { drop_scope_exit_discard(g) } else { drop_scope_exit_emit(sb, p, src, c, g, depth + 1) }
     line_at(sb, depth, "}")
 }

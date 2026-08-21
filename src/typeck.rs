@@ -1375,11 +1375,22 @@ impl<'a> TypeChecker<'a> {
         //
         // Deliberately narrow: only the pairings that have no conversion at all in
         // either direction. Everything else the default still declines to judge.
+        // **Unit converts to nothing and nothing converts to Unit.** It reads as a rule so
+        // obvious it needs no writing down, and it did need writing down: the moment
+        // `fn f(…) !{ E }` (a fallible function with no return type) became lowerable, its
+        // `catch` acquired the ok type Unit — and `let b: bool = f(x) catch true` passed
+        // `check` and failed in gcc with *void value not ignored as it ought to be*.
+        // Exactly the degrades-to-gcc failure the slice/pointer row above exists to stop,
+        // reached through a shape that did not exist before.
+        //
+        // `want == got` already accepted Unit-to-Unit at the top, so this is only the
+        // mismatch, and it is symmetric: a Unit value cannot be stored anywhere, and
+        // nothing can be stored where Unit is wanted.
         let no_conversion = |a: &Ty, b: &Ty| {
             matches!(
                 (a, b),
                 (Ty::Slice(_), Ty::Ptr { .. }) | (Ty::Slice(_), Ty::Array { .. })
-            )
+            ) || (matches!(a, Ty::Unit) && !matches!(b, Ty::Unknown | Ty::Error))
         };
         if no_conversion(want, got) || no_conversion(got, want) {
             return false;
@@ -6778,6 +6789,33 @@ mod tests {
         assert_eq!(d.len(), 1, "{d:?}");
         assert!(d[0].message.contains("`catch` needs a fallible expression"), "{:?}", d[0].message);
         assert!(d[0].message.contains("`i32`"), "the actual type must be named: {:?}", d[0].message);
+    }
+
+    /// **A unit value is assignable to nothing, and nothing is assignable to it.**
+    ///
+    /// The rule reads as too obvious to write down, and it needed writing down: the moment
+    /// `fn f(…) !{ E }` became lowerable its `catch` acquired the ok type `()`, and
+    /// `let b: bool = f(x) catch true` passed `check` and failed in gcc with *void value
+    /// not ignored as it ought to be* — the degrades-to-gcc class, reached through a shape
+    /// that did not exist until the backend learned `JestyrResult_unit`.
+    #[test]
+    fn a_unit_value_is_not_assignable_to_a_typed_binding() {
+        let unit_fn = "fn f(x: i32) !{ Bad } { if x < 0 { return err(Bad) } } ";
+
+        let (_i, d) = analyze(&format!("{unit_fn}fn g() -> bool {{ let b: bool = f(1) catch true return b }}"));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].message.contains("expected `bool`"), "{:?}", d[0].message);
+        assert!(d[0].message.contains("()"), "the unit type must be named: {:?}", d[0].message);
+
+        // **The positive control**: the same call, used as the STATEMENT it is, is clean.
+        // Without it the assertion above would also pass for a checker that had started
+        // refusing every `catch` on a unit-fallible callee.
+        let (_i, d) = analyze(&format!("{unit_fn}fn g() -> i32 {{ f(1) catch {{}} return 0 }}"));
+        assert!(d.is_empty(), "a unit catch in statement position is fine: {d:?}");
+
+        // And the rule is symmetric: a unit-typed parameter takes nothing either.
+        let (_i, d) = analyze(&format!("{unit_fn}fn g() -> i32 {{ let n: i32 = f(1) catch 0 return n }}"));
+        assert_eq!(d.len(), 1, "{d:?}");
     }
 
     /// **`catch |e|` binds `e` even when the base's type could not be recovered.**

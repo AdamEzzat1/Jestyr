@@ -54,15 +54,7 @@
 // looked equally cheap on both is exactly the "nice API that erases cost" this tier is
 // supposed to refuse.
 //
-// ─── Every operation returns a `bool`, and one of them means nothing ──────────
-//
-// **This is a language limitation, named rather than dressed up.** A fallible Jestyr
-// function must declare a return type: `fn f(…) !{ E }` with none lowers to a result
-// struct with no ok field, which the C backend now refuses outright (it used to reach gcc
-// and miscompile the *success* path). So an operation whose natural signature is "does a
-// thing or fails" has to answer something.
-//
-// Two of the three found an honest answer and are better for it:
+// ─── Two operations answer `bool`, and both answers mean something ────────────
 //
 //   `make_dir`   → true if THIS CALL created it, false if it was already a directory.
 //   `remove_dir` → true if THIS CALL removed it, false if it was already absent.
@@ -70,17 +62,17 @@
 // Both make the operation idempotent, which is what every caller wanted anyway: an
 // `EEXIST` on a directory you were trying to create is information, not a failure.
 //
-// The third did not:
+// **`rename_replace` answers nothing, and that is the point.** It used to return "did the
+// destination exist immediately before" — a REPORT that RACED, since another process could
+// create the destination between the probe and the rename, leaving the report stale while
+// the rename replaced anyway. It existed only because a fallible Jestyr function was
+// required to declare a return type.
 //
-//   `rename_replace` → true if the destination existed immediately before the rename.
-//
-// That one is a REPORT and it races: another process may create the destination between
-// the probe and the rename, in which case the report says `false` and the rename replaces
-// anyway. The rename itself is unaffected — only the reported bool can be stale. It is
-// documented here rather than quietly returning a constant `true`.
-//
-// **When `JestyrResult_unit` lowering lands, `rename_replace` should lose its bool and
-// its probe.** That is the note to invert; `make_dir` and `remove_dir` should keep theirs.
+// It is not any more. `fn f(…) !{ E }` now lowers (`JestyrResult_unit`), so the operation
+// says exactly what it does and no more, and the extra `stat` is gone. **A caller that
+// genuinely needs to know whether it clobbered something probes for itself** — and then it
+// owns the race, visibly, instead of being handed a stale answer by a library that had no
+// reason to guess. `sysfs_demo.jtr` does exactly that.
 //
 // ─── What `rename_replace` actually proves ────────────────────────────────────
 //
@@ -427,17 +419,17 @@ fn already_a_directory(mut f: fs.Fs, read a: Allocator, read path: str, code: i3
 
 // ---- rename ---------------------------------------------------------------------
 
-// Move `from` onto `to`, replacing whatever is at `to`. **True if `to` existed
-// immediately before** — a report, and a racy one; see the header.
+// Move `from` onto `to`, replacing whatever is at `to`. Answers nothing: it either
+// happened or it failed, and a caller that needs to know whether something was clobbered
+// probes for itself (see the header).
 //
 // Read the header on what this proves before relying on it: the name flips atomically,
 // the bytes are not promised to be on the disk.
-@cfg(posix) pub fn rename_replace(mut f: fs.Fs, read a: Allocator, read from: str, read to: str) -> bool !{ SysFsFailed(i32), SysFsRefused } {
+@cfg(posix) pub fn rename_replace(mut f: fs.Fs, read a: Allocator, read from: str, read to: str) !{ SysFsFailed(i32), SysFsRefused } {
     if fs.can_write(f) == false { return err(SysFsRefused) }
     if cstring.has_interior_nul(from) { return err(SysFsFailed(bad_path_code())) }
     if cstring.has_interior_nul(to) { return err(SysFsFailed(bad_path_code())) }
 
-    let had: bool = exists(f, a, to)
     var cf: CString = cstring.from_str(a, from)
     var ct: CString = cstring.from_str(a, to)
     // POSIX `rename` replaces silently and atomically within one filesystem. No flag, and
@@ -448,15 +440,14 @@ fn already_a_directory(mut f: fs.Fs, read a: Allocator, read path: str, code: i3
     cstring.free(cf)
     cstring.free(ct)
     if rc != 0 { return err(SysFsFailed(code)) }
-    return ok(had)
+    // No trailing `return`: reaching the end of a unit-fallible body IS the success path.
 }
 
-@cfg(windows) pub fn rename_replace(mut f: fs.Fs, read a: Allocator, read from: str, read to: str) -> bool !{ SysFsFailed(i32), SysFsRefused } {
+@cfg(windows) pub fn rename_replace(mut f: fs.Fs, read a: Allocator, read from: str, read to: str) !{ SysFsFailed(i32), SysFsRefused } {
     if fs.can_write(f) == false { return err(SysFsRefused) }
     if cstring.has_interior_nul(from) { return err(SysFsFailed(bad_path_code())) }
     if cstring.has_interior_nul(to) { return err(SysFsFailed(bad_path_code())) }
 
-    let had: bool = exists(f, a, to)
     var cf: CString = cstring.from_str(a, from)
     var ct: CString = cstring.from_str(a, to)
     // Plain `MoveFileA` REFUSES an existing destination, which is the divergence from
@@ -467,7 +458,6 @@ fn already_a_directory(mut f: fs.Fs, read a: Allocator, read path: str, code: i3
     cstring.free(cf)
     cstring.free(ct)
     if rc == 0 { return err(SysFsFailed(code)) }
-    return ok(had)
 }
 
 // ---- canonical paths --------------------------------------------------------------

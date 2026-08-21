@@ -46,6 +46,40 @@ versions are snapshots, not stability promises.
   24 on Linux x86-64, 16 on aarch64, 4 on macOS — and a wrong `st_mode` reads a `uid` and
   reports a plausible file type. Nothing in the module reads a foreign struct's interior.
 
+- **A fallible function may now have NO return type: `fn f(…) !{ E }` lowers.** That is the
+  natural signature for most of what a `sys` layer does — `close`, `bind`, `commit`,
+  `cancel`, `shutdown` — and it used to reach `cc`. What arrived there failed three ways:
+  `?` projected `.ok` off a struct with no ok member, the rethrow form did the same, and a
+  valueless `return` emitted `return;` from a function returning `JestyrResult_unit`. gcc
+  only *warns* about the last one, so **the success path compiled and handed the caller an
+  uninitialized tag** — the working path was the one that miscompiled.
+
+  Less than half of it was new: `emit_result_def` already emitted the ok-member-free typedef
+  for `Ty::Unit`, and both `catch` recovery forms already had a unit arm. What was missing
+  was the valueless `return` (now constructing `{ .is_err = false }` through
+  `emit_value_return`, so `ensures` and drops still run), `?`, the rethrow form, and — the
+  one that is a language decision rather than a lowering — **falling off the end**.
+
+  Reaching the end of a unit-fallible body is SUCCESS, and it is now spelled. It is
+  well-defined only because the ok type is unit: there is no value to invent. A `-> T !E`
+  (or a plain `-> T`) falling off the end is a different, pre-existing gap and is
+  deliberately untouched.
+
+  The port needed one thing the reference did not: `push_ty_mangle` had no `Unit` arm, so a
+  unit Result mangled to `JestyrResult_?`. Seed refreshed; zero golden churn, since no
+  corpus file emitted the shape.
+
+  **`std/sysfs.rename_replace` is the first beneficiary and drops a wart**: it had been
+  returning "did the destination exist immediately before" — a report that RACED — purely
+  because a fallible function was required to return something. It now answers nothing, and
+  the caller that wants to know probes for itself and owns the race visibly.
+
+- **A unit value is assignable to nothing, and nothing is assignable to it.** The rule reads
+  as too obvious to write down, and it needed writing down the moment a `catch` could have
+  the ok type `()`: `let b: bool = f(x) catch true` passed `check` and failed in gcc with
+  *void value not ignored as it ought to be*. Pinned with the positive control that the same
+  call in statement position stays clean.
+
 ### Fixed
 
 - **`jc build` no longer breaks a struct whose field name matches a colliding function
@@ -74,15 +108,6 @@ versions are snapshots, not stability promises.
   underneath it — and it was a reference/port divergence, caught by the whole-corpus typeck
   golden the moment a corpus file first caught a fallible call across a module edge. The
   port's behaviour was the better one and the reference adopted it.
-
-- **A fallible function with no return type is refused by the backend instead of
-  miscompiling.** `fn f(x: i32) !{ Bad }` parsed, type-checked, and `jestyrc check`
-  reported ok; the emitted C then failed three ways — `?` projects `.ok` off a struct with
-  no ok field, `catch` becomes an invalid void expression, and a bare `return` emits
-  `return;` from a `JestyrResult_unit` function, which gcc only *warns* about, so the
-  success path compiled and returned an uninitialized tag. Refused in cgen (following the
-  `Self`-in-a-trait-parameter precedent) with all three lowerings pinned plus a positive
-  control; zero corpus sites, zero emitted-byte change.
 
 ### Testing
 

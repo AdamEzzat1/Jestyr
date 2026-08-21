@@ -16,8 +16,10 @@ anything; if a later failure appears, assume it is yours.
 ## §0. START HERE
 
 The brief's **§1.1 (`sys/fs`) and §2.3 (platform error shape) are done**, with a real
-consumer. Three compiler bugs were found and closed on the way — one of them a silent
-miscompile — and the gate the 2026-08-20 census audit said it owed now exists.
+consumer. **`JestyrResult_unit` lowering is done too** — a fallible function may now have no
+return type at all, which is the natural signature for most of what a `sys` layer does.
+Five compiler bugs were found and closed on the way — one a silent miscompile — and the
+gate the 2026-08-20 census audit said it owed now exists.
 
 (Section numbers below are this note's own; the brief's are named as "the brief's §x".)
 
@@ -147,19 +149,21 @@ purity. Refusal is reported by TYPE here rather than by count, because these ope
 return an error union (`std/fs` counts because its operations answer `bool`, where a count
 is the only discriminator). `fs.refused(f)` therefore does not move when `sysfs` refuses.
 
-**Every operation returns a `bool`, and this is a language limitation named rather than
-dressed up.** A fallible Jestyr function must declare a return type (§2.1). Two of the
-three found an honest answer and are better for it:
+**Two operations answer `bool`, and both answers mean something:**
 
 * `make_dir` → true if THIS CALL created it, false if it was already a directory
 * `remove_dir` → true if THIS CALL removed it, false if it was already absent
 
 Both make the operation idempotent, which is what callers wanted: an `EEXIST` on a
-directory you were creating is information, not a failure. `rename_replace`'s bool
-(destination existed) is a REPORT and it races — another process may create the destination
-between the probe and the rename, in which case the report says `false` and the rename
-replaces anyway. **When `JestyrResult_unit` lowering lands, `rename_replace` should lose its
-bool and its probe; the other two should keep theirs.**
+directory you were creating is information, not a failure.
+
+**`rename_replace` answers nothing, and that is the payoff of §2.1.** It shipped returning
+"did the destination exist immediately before" — a report that RACED, and which existed only
+because a fallible function was required to declare a return type. With `JestyrResult_unit`
+lowered it says exactly what it does and the extra probe is gone. A caller that needs to know
+whether it clobbered something asks for itself and **owns the race visibly**, instead of being
+handed a possibly-stale answer by a library with no reason to guess; `sysfs_demo.jtr` does
+exactly that, and its output is unchanged.
 
 **`already_a_directory` checks rather than assumes**, and that is the subtlest thing here.
 `EEXIST` says the NAME is taken, not by what. A `make_dir` that turned every `EEXIST` into
@@ -212,38 +216,69 @@ anywhere in the test file.
 
 ## §2. WHAT THE BUILD TURNED UP IN THE COMPILER
 
-### §2.1 — A fallible function with NO return type reached gcc. Now refused
+### §2.1 — A fallible function with NO return type: was a miscompile, now LOWERED
 
-`fn f(x: i32) !{ Bad }` parses, type-checks, and `jestyrc check` reports **ok**. The C it
-produces fails three ways:
+`fn f(x: i32) !{ Bad }` parsed, type-checked, and `jestyrc check` reported **ok**. The C it
+produced failed three ways:
 
-| form | what gcc does |
+| form | what gcc did |
 |---|---|
-| bare `return` on the ok path | `return;` from a function returning `JestyrResult_unit` — a **warning**, so it compiles and hands back an uninitialized tag |
+| bare `return` on the ok path | `return;` from a function returning `JestyrResult_unit` — a **warning**, so it compiled and handed back an uninitialized tag |
 | `f(x)?` | `error: 'JestyrResult_unit' has no member named 'ok'` |
-| `f(x) catch v` | `error: invalid use of void expression` |
+| `f(x) catch` + rethrow | the same |
 
 The first is the dangerous one: it is the only shape gcc does not refuse, so the *working*
-path is the one that miscompiles.
+path was the one that miscompiled.
 
-**Refused in cgen, not typeck, following the `Self`-in-a-trait-parameter precedent.** The
-limitation genuinely is the backend's, the shape is a reasonable thing to want, and a typeck
-error would refuse `examples/vec.jtr` — whose `push` is a method on an uninstantiated
-`comptime T` factory. Measured: **that one corpus site, and it never reaches cgen**, so the
-rule fires nowhere and changes no emitted byte. No port mirror, no reseed.
+**It is now implemented rather than refused**, because the shape is the natural signature for
+most of a `sys` layer (`close`, `bind`, `commit`, `cancel`, `shutdown`) and every alternative
+distorts the library — `sysfs.rename_replace` had invented a racy bool purely to have
+something to return.
 
-`a_fallible_function_with_no_return_type_is_refused` pins all three lowerings plus the
-positive control (the same error set with a return type still lowers to
-`JestyrResult_i32`), so a future implementation has to delete the test deliberately rather
-than watch it pass vacuously.
+Four emission changes, and **less than half of it was new**: `emit_result_def` already
+emitted the ok-member-free typedef for `Ty::Unit`, and BOTH `catch` recovery forms already had
+a `Ty::Unit` arm. What was missing:
 
-**Consequence to know:** `check` still passes and `build` now fails — the same `check`/`run`
-gap `Self` has. The real fix is to lower `JestyrResult_unit`: construct it on the valueless
-`return`, skip the `.ok` projection in `?`, give `catch` a statement form. That is an
-emission change and owes the mirror in `examples/std/cgen.jtr` plus a reseed, with **zero
-golden churn** since no corpus file emits the shape. It is worth doing — Tier 4 is full of
-void fallible operations (`close`, `bind`, `commit`, `cancel`, `shutdown`) and every one of
-them currently has to invent a return value.
+1. **A valueless `return` in a unit-fallible fn** constructs `{ .is_err = false }` (routed
+   through `emit_value_return`, so `ensures` and drops run as for any value return).
+   **Scoped to unit deliberately** — a valueless `return` out of a `-> T !E` has no `T` to
+   supply, so synthesizing one there would manufacture a zero-valued *success*, strictly
+   worse than the pre-existing bare `return;`.
+2. **`?` yields nothing** when the base's ok type is unit; the statement-expression's type
+   becomes `void`, which is right, since `f(x)?` on a unit-fallible callee is a statement.
+3. **The rethrow form (`catch` + `return e`)** — the same, and it had been missed on both
+   sides.
+4. **Falling off the end is SUCCESS**, and it is now spelled. `fn f(…) !{ E } { if bad {
+   return err(E) } }` is the natural way to write "fails early or completes", and it used to
+   run off the end of a non-void function. Well-defined ONLY because the ok type is unit —
+   there is no value to invent. **A `-> T !E` (or a plain `-> T`) falling off the end is a
+   different, pre-existing gap and is untouched: `fn g(x: i32) -> i32 { if x > 0 { return 1 }
+   }` still compiles and returns garbage.** That is a real bug and a good next find.
+
+**The port mirror needed one thing the reference did not**: `push_ty_mangle` had no `Unit`
+arm, so a unit Result mangled to `JestyrResult_?`. `tyid < 0` ("no type at all") already gave
+`unit`; a RESOLVED Unit TyData fell through to the `?` default. Invisible until a corpus file
+first had a unit result.
+
+Two structural notes worth carrying: the reference uses a **one-shot `unit_tail` flag** taken
+with `mem::take` at each body emitter, because `emit_body` is shared with `if` branches and
+match arms; the port uses **`depth == 0`** instead, since all six of its fn-body call sites
+pass a literal `0` and every nested body is reached at `depth + 1`.
+
+Seed refreshed. Zero golden churn — no corpus file emitted the shape, and `examples/vec.jtr`'s
+`push` (the corpus's only instance) is a method on an uninstantiated `comptime T` factory that
+never reaches cgen at all.
+
+### §2.1a — And it immediately exposed one more degrades-to-gcc row
+
+`let b: bool = f(x) catch true` on a unit-fallible `f` passed `check` and failed in gcc with
+*void value not ignored as it ought to be*. `assignable` had no rule for `Ty::Unit`, because
+until now nothing could produce one. **Unit converts to nothing and nothing converts to
+Unit** — symmetric, and pinned with the positive control that the same call in STATEMENT
+position is still clean. Reference-only (a diagnostic, no emitted byte), so no mirror.
+
+The general shape is worth remembering: **a new type's first real inhabitant finds every place
+the checker had no rule for it.**
 
 ### §2.2 — The `jc build` collision bug is FIXED, and the recorded mechanism was backwards
 
@@ -452,9 +487,8 @@ are all written down with the thing that must change when the blocker moves.
 
 ## §5. Suggested order
 
-1. **`JestyrResult_unit` lowering** (§2.1). Small, bounded, zero golden churn, and every
-   remaining Tier 4 module wants it. Do it before writing another `sys` module that has to
-   invent a return value.
+1. ~~`JestyrResult_unit` lowering~~ — **done**, see §2.1. It found two more bugs on the way
+   in (the rethrow form, the port's `Unit` mangle) and one on the way out (§2.1a).
 2. **Event loop V1 `Pollable`** (§1.3) — `epoll`/`kqueue`/IOCP behind `@cfg`, reporting
    through `syserr`. The two things that were missing when `std/runtime` deferred it now
    exist.
