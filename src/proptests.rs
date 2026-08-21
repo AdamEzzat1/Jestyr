@@ -406,6 +406,66 @@ mod jc_build_matrix {
     }
 }
 
+/// **`jheartbeat` — the event loop and the `sys` tier in one long-running program.**
+///
+/// `examples/std/runtime_demo.jtr` is the smallest program that needs all of the event-loop
+/// tier at once: a schedule (`after` + a `CancelToken`), idling without burning a core
+/// (`poll_for`), a status file a concurrent reader can never catch half-written
+/// (`sysfs.rename_replace`), and a shutdown that in-flight work can observe (`cancel_all`
+/// + `is_cancelled`).
+///
+/// **Its output is exact because it runs on `time.manual()`**, where waiting ADVANCES the
+/// clock instead of sleeping. That is the property the whole design turns on: the same loop
+/// idles for real on `time.host()`, and this test asserts simulated milliseconds to the
+/// digit while taking no measurable time.
+#[cfg(all(test, feature = "c-oracle"))]
+mod runtime_heartbeat {
+    use super::*;
+
+    #[test]
+    fn jheartbeat_paces_publishes_and_shuts_down_on_its_token() {
+        let exe = super::c_oracle::build_exe("examples/std/runtime_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the heartbeat must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        // Three beats, then a cancellation that kills the timer the loop had just re-armed,
+        // then idle. Asserted as an exact sequence: a containment check would pass for a
+        // loop that published once, or that never stopped.
+        let want = "-- heartbeat --\n\
+                    published\n1\ntrue\n\
+                    published\n2\ntrue\n\
+                    published\n3\ntrue\n\
+                    -- cancelled --\n\
+                    timers killed\n1\n\
+                    the token reports itself cancelled\ntrue\n\
+                    a late registration is refused\ntrue\n\
+                    idle — nothing left to wait for\n";
+        assert!(out.starts_with(want), "the heartbeat sequence changed:\n{out}");
+
+        // **The simulated clock is the assertion that could not exist with a real one.**
+        // Three beats at 100ms means the loop waited exactly 300 simulated milliseconds,
+        // and the published file records the instant of the last one — to the digit. With a
+        // host clock the best this could say is "roughly 300ms, usually".
+        assert!(
+            out.contains("-- the published file --\nbeat=3 at_ms=300\n"),
+            "the published file must hold the last beat, whole, at its exact instant:\n{out}"
+        );
+        assert!(
+            out.contains("-- simulated elapsed ms --\n300\n"),
+            "and the loop must have advanced exactly 300 simulated ms:\n{out}"
+        );
+
+        // The `timers killed` line above is the anti-vacuity half of the cancellation: an
+        // earlier draft cancelled BEFORE re-arming, reported zero, and demonstrated nothing.
+        assert!(!out.contains("timers killed\n0\n"), "cancelling must kill a live timer:\n{out}");
+
+        // The staging file is gone and the tree is cleaned up, so a rerun is identical.
+        assert!(out.contains("and the staging file is gone\ntrue\n"), "{out}");
+        assert!(out.trim_end().ends_with("-- cleaned up --\ntrue"), "{out}");
+    }
+}
+
 /// **`jstage` — the atomic-publish demo, end to end through the real filesystem.**
 ///
 /// `examples/std/sysfs_demo.jtr` is `std/sysfs`'s consumer, not an illustration of it: it
@@ -16006,6 +16066,11 @@ fn main() -> i32 {
         "syserr.jtr",
         "syserr_test.jtr",
         "sysfs.jtr",
+        // `time.jtr` binds `usleep`/`Sleep` behind `@cfg`, so
+        // `every_cfg_bearing_corpus_file_is_byte_identity_verified` requires it here.
+        "time.jtr",
+        "time_test.jtr",
+        "runtime_demo.jtr",
     ];
     // **`sysfs_test.jtr` is deliberately absent, and the reason was MEASURED rather than
     // assumed** — which is what `walk.jtr`'s note below asks the next person to do.
@@ -16976,7 +17041,6 @@ fn main() -> i32 {
             ("walk_test", 7),
             ("memprof_test", 6),
             ("bitset_test", 6),
-            ("runtime_test", 5),
             ("json_test", 10),
             // `syserr` is almost entirely host-independent — `category` is a pure function
             // of (raw code, numbering system), so the POSIX table runs on Windows and the
@@ -16984,6 +17048,11 @@ fn main() -> i32 {
             // host-dependent, and it asserts agreement between two functions rather than a
             // literal, so it is a real assertion on both.
             ("syserr_test", 7),
+            // `runtime` grew cancellation tokens and a WAITING poll; the last of its ten
+            // cases is the only one in the suite that touches real time, and it asserts a
+            // lower bound only — an upper bound would be flaky on a loaded machine, and
+            // Windows' default timer granularity can round a 2ms sleep to ~15ms by itself.
+            ("runtime_test", 10),
             // `sysfs` touches the real filesystem on both platforms and creates its own
             // scratch tree, so it needs no fixture in the repository.
             ("sysfs_test", 10),

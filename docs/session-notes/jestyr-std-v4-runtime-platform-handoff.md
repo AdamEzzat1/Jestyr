@@ -23,14 +23,15 @@ gate the 2026-08-20 census audit said it owed now exists.
 
 (Section numbers below are this note's own; the brief's are named as "the brief's §x".)
 
-**The next thing to build is the brief's §1.2, the event loop.** `std/runtime` already has the
-half that does not need the OS — an explicit `Runtime` handle, timers, cancellation, a
-manual clock, `poll`/`run_until_idle`. What it lacks is `Pollable`, and the reason it was
-left out is now *less* true than it was: `sys` is a real tier with a real error shape, so
-an `epoll`/`kqueue`/IOCP binding has somewhere to live and something to report with. Read
-`std/runtime.jtr`'s header before designing anything; the ownership bug it records (a
-`Runtime` takes its clock by `take`, so the caller's copy is not the one that advances) is
-the shape of mistake this area produces.
+**The brief's §1.2 (event loop V1) is done too** — cancellation tokens, a waiting `poll`,
+and waiting that goes through the CLOCK so the same loop idles in production and runs
+instantly under a test. See §1.4.
+
+**The next thing to build is the brief's §1.3, TCP sockets**, and it is now the thing
+blocking everything else in the tier. `Pollable` was deliberately NOT built: `epoll`/
+`kqueue`/IOCP need something to poll and nothing in this tree exposes a file descriptor or
+a socket, so it belongs WITH sockets rather than before them (§1.4 has the measurement).
+Watching (§1.5), HTTP (§1.7) and the plugin host (§1.11) all wait behind the same thing.
 
 ### What is NOT what an older note says
 
@@ -211,6 +212,138 @@ The same split is the point of
 `a_non_empty_directory_refuses_with_a_portable_category` in the suite: one assertion against
 `SYSERR_NOT_EMPTY`, holding on three platforms, with none of 39 / 66 / 145 appearing
 anywhere in the test file.
+
+### §1.4 — Event loop V1 (the brief's §1.2): the first slice is DONE
+
+`std/time` gained waiting; `std/runtime` gained cancellation tokens and a waiting poll.
+`runtime_test.jtr` is 5 → 10 cases, and `runtime_demo.jtr` is the consumer.
+
+#### `Pollable` was NOT built, and the reason was measured rather than assumed
+
+The previous note's §5 said to build it next. That was wrong, and checking took two minutes:
+**`epoll`/`kqueue`/IOCP need something to poll, and nothing in this tree exposes a file
+descriptor or a socket.** `std/file` holds a `FILE*` as an opaque `cptr`. Even reaching for
+POSIX `fileno`, a regular file always polls ready (useless), and Windows `WSAPoll` refuses
+anything that is not a socket.
+
+So shipping a `Pollable` now would be precisely what `std/runtime`'s own header argues
+against — *"adding a `Pollable` that could not poll would be worse than having none"*.
+**It belongs with sockets (the brief's §1.3), not before them**, and the brief's §1.2 first
+slice never asked for it: handle, timers, cancellation token, task handles, manual runtime,
+one hosted runtime. Four of those already existed; the two that did not are below.
+
+#### Waiting belongs to the CLOCK, and that is the whole design
+
+A loop with nothing to do must idle, or a hosted server burns a core. A loop that SLEEPS
+makes every test take as long as its longest timer. Both are satisfied at once if waiting
+goes through the same handle reading already does:
+
+```
+time.wait(mut c: Clock, nanos: i64) -> i64      // returns what it ACTUALLY waited
+    host()    — really sleeps
+    manual()  — ADVANCES THE CLOCK and returns instantly
+```
+
+So the identical code path idles in production and runs at full speed under a test, **and
+the test calls no `advance` of its own — waiting IS advancing**. `runtime_test`'s
+`poll_for_waits_through_the_clock_and_names_what_happened` never advances the clock, and
+still asserts the exact instant every timer fired.
+
+It lives in `std/time` rather than `std/runtime` because sleeping needs a portability
+DECISION (`usleep` against `Sleep`), and the clock already WAS the OS boundary for reading.
+Nothing new is exposed by making it the boundary for waiting too.
+
+Two details worth keeping:
+
+* **`usleep`, not `nanosleep`.** `nanosleep` takes a `struct timespec*`, and reading a
+  foreign struct's interior is exactly what `std/sysfs`'s header refuses to do for `stat`.
+  `usleep` takes a scalar, so there is no layout to guess. It is obsolescent in POSIX 2008
+  and present everywhere that matters; when that stops being true, `nanosleep` arrives WITH
+  a checked layout rather than a hoped-for one.
+* **Windows rounds UP to whole milliseconds**, so a sub-millisecond request becomes
+  `Sleep(1)` — a yield rather than a spin. Rounding down would turn every short wait into a
+  busy loop. The default Windows granularity is coarser still (~15ms unless something has
+  called `timeBeginPeriod`), which is why `wait` REPORTS what it actually did instead of
+  letting the caller assume.
+
+`time.jtr` now carries `@cfg`, so it (and `time_test.jtr`, and `runtime_demo.jtr`) joined
+`CGEN_GOLDEN_ALLOWLIST` — byte-identical first try. **No reseed**: neither `time` nor
+`runtime` is in the 14-module self-host closure.
+
+#### `CancelToken` — a group handle, not an id and not a flag
+
+`cancel(rt, id)` already existed and is right when you hold the thing you scheduled. It is
+wrong for the case a long-running program actually has — *stop everything this
+request/connection/build started* — because the caller would have to keep every id it ever
+handed out.
+
+```
+token(rt) -> CancelToken     detached() -> CancelToken     // the explicit "no group"
+after(rt, nanos, tok, task) -> TaskId
+cancel_all(rt, tok) -> i64      is_cancelled(rt, tok) -> bool
+```
+
+Four decisions, each with a test that fails if it is reversed:
+
+1. **The token is REQUIRED, and `detached()` is the spelling for "no group".** An optional
+   token would make the common case default to ungrouped silently, which is the ambient
+   shape the brief says to avoid. The choice is visible at every call site either way.
+2. **`cancel_all(detached())` cancels NOTHING.** A wildcard here would let one careless call
+   stop every unrelated timer in the loop. Pinned in
+   `a_token_cancels_its_whole_group_and_leaves_everything_else_alone`, which would still
+   pass without it — that is why the assertion is written separately.
+3. **`is_cancelled` exists because a timer list cannot answer it.** Work already in flight
+   has no timer left to cancel; the only way it can learn to stop is to ask. That is the
+   half that makes this a token rather than a bulk-cancel helper.
+4. **Registering under an already-cancelled token is REFUSED** (`-1`). Accepting it would
+   let a straggler outlive the cancellation meant to stop it — everything looks cancelled
+   and one task still runs, which is the version of this bug that is hard to see.
+
+#### `poll_for` — the loop can finally idle, and says which of three things happened
+
+`poll(rt) -> i64` returned a count, and a count cannot distinguish *nothing was due* from
+*there is nothing left to do*. A loop needs that difference: the first means wait, the
+second means exit.
+
+```
+poll_for(rt, timeout_nanos) -> Event { kind, fired, waited }
+    RT_FIRED    at least one timer ran
+    RT_IDLE     nothing is scheduled at all; the loop may stop
+    RT_TIMEOUT  work is still pending, the budget ran out first
+run_for(rt, budget_nanos, rounds) -> Event
+```
+
+The wait is clamped to the next deadline, so a large timeout cannot overshoot a timer. A
+runtime with nothing scheduled returns `RT_IDLE` immediately and never waits — nothing could
+arrive to end the wait, so sleeping would be a hang with extra steps. **That is the line to
+invert when `Pollable` lands**: a runtime with no timers may still be waiting on a socket,
+and `RT_IDLE` will have to mean "no timers AND no pollables". The note is in the source.
+
+**No error set, and it was measured rather than assumed.** Nothing here can fail: `after`
+cannot, and an interrupted or short sleep is not an error — it is a shorter wait, which the
+`Event` already reports in `waited`. Inventing `!{ RuntimeError }` would have produced
+`std/diag`'s deleted `failed()` in a new costume: a query that can only answer "fine".
+
+#### The consumer: `jheartbeat`
+
+`examples/std/runtime_demo.jtr` — a supervisor that publishes a status file on a timer and
+shuts down on its token. It is the smallest program that needs the whole tier: the schedule
+(`after` + token), idling (`poll_for`), a status file a concurrent reader can never catch
+half-written (`sysfs.rename_replace`), and a shutdown in-flight work can observe.
+
+Two things it demonstrates that are easy to get wrong:
+
+* **The publish happens in the LOOP, not in the callback.** A callback runs inside the fire
+  pass, so blocking I/O there stalls every other timer and a "10ms" timer drifts to whatever
+  the disk felt like. The timer PACES the work; the loop DOES it.
+* **It re-arms before it cancels.** The first draft cancelled first, so `cancel_all` reported
+  zero and demonstrated nothing. `jheartbeat_paces_publishes_and_shuts_down_on_its_token`
+  asserts `timers killed 1` and separately asserts the output does NOT contain
+  `timers killed 0`.
+
+Its output is asserted to the digit — `beat=3 at_ms=300`, `simulated elapsed ms 300` —
+which is only possible because `manual()` makes waiting exact. With a host clock the best
+that test could say is "roughly 300ms, usually".
 
 ---
 
@@ -416,8 +549,8 @@ were byte-identical first try.
 |---|---|---|
 | 1.1 | `sys/fs` | ✅ this session |
 | 1.2 | deterministic `std/walk` | ✅ Tier 3 |
-| 1.3 | event loop V1 | ⬜ `std/runtime` has everything but `Pollable` — **start here** |
-| 1.4 | TCP sockets | ⬜ needs the event loop first |
+| 1.3 | event loop V1 | ✅ this session — tokens, waiting `poll`, waiting through the clock (§1.4) |
+| 1.4 | TCP sockets | ⬜ **start here** — and `Pollable` comes with them, not before |
 | 1.5 | file watching | ⬜ |
 | 1.6 | structured logging | ⬜ |
 | 1.7 | HTTP/1.1 | ⬜ |
@@ -489,10 +622,11 @@ are all written down with the thing that must change when the blocker moves.
 
 1. ~~`JestyrResult_unit` lowering~~ — **done**, see §2.1. It found two more bugs on the way
    in (the rethrow form, the port's `Unit` mangle) and one on the way out (§2.1a).
-2. **Event loop V1 `Pollable`** (§1.3) — `epoll`/`kqueue`/IOCP behind `@cfg`, reporting
-   through `syserr`. The two things that were missing when `std/runtime` deferred it now
-   exist.
-3. **TCP sockets** (§1.4), then a local status server as the consumer.
+2. ~~Event loop V1~~ — **done**, see §1.4. `Pollable` was measured and deferred to sit with
+   sockets: nothing in the tree is pollable yet.
+3. **TCP sockets** (the brief's §1.3), then a local status server as the consumer — and
+   `Pollable` alongside them, since a socket is the first thing worth polling. `RT_IDLE`
+   will need to mean "no timers AND no pollables"; the note is in `runtime.poll_for`.
 4. **`@must_use` enforcement** (§2.2) — cheap, and it is a degrades-to-gcc row.
 5. **The four `jc_build_matrix` failures** — one def-emission gap plus one inference gap,
    both now isolated.

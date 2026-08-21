@@ -72,22 +72,92 @@ import "sink"
 pub struct Runtime {
     clock: time.Clock,
     tasks: List(Task),
-    // Four parallel columns, one entry per timer: a struct-of-arrays rather than a
+    // Five parallel columns, one entry per timer: a struct-of-arrays rather than a
     // `List(Timer)`, for the same reason `std/hashmap` is one — a generic type cannot hold
     // a pointer to another generic type, and the columns index identically anyway.
     deadlines: List(i64),
     ids: List(i64),
     alive: List(bool),
+    groups: List(i64),          // the CancelToken each timer was registered under
+    dead_groups: List(i64),     // tokens that have been cancelled, so work can ask
     next_id: i64,
+    next_group: i64,
     fired: i64,
     cancelled: i64,
+}
+
+// ---- cancellation ------------------------------------------------------------
+//
+// **A token, not a flag, and not an id.** `cancel(rt, id)` already existed and cancels one
+// timer; it is the right tool when you hold exactly the thing you scheduled. It is the
+// wrong tool for the case that actually arises in a long-running program — "stop
+// everything this request/connection/build started" — because the caller would have to
+// keep every id it ever handed out.
+//
+// A `CancelToken` is a GROUP handle. Every registration names one, `cancel_all` kills the
+// group, and `is_cancelled` lets work already in flight ask whether it should stop. That
+// last part is why this is a token and not a counter: cancellation has to be observable by
+// the thing being cancelled, and an ambient flag would make it invisible in signatures.
+//
+// `@copy`: one integer, freely stored and passed. A token that had to be moved would be a
+// token you could only hand to one task.
+@copy pub struct CancelToken {
+    pub grp: i64,
+}
+
+// The token that groups nothing. **`cancel_all` on it cancels NOTHING**, deliberately — a
+// detached token is "this work is not part of any group", and if it were a wildcard then
+// one careless `cancel_all(rt, detached())` would stop every unrelated timer in the loop.
+@no_alloc @no_os pub fn detached() -> CancelToken {
+    return CancelToken{ grp: 0 }
+}
+
+// A fresh group token from this runtime. Ids are per-runtime, so a token from one loop
+// means nothing to another — which is correct: a group is a set of THIS loop's timers.
+pub fn token(mut rt: Runtime) -> CancelToken {
+    rt.next_group = rt.next_group + 1
+    return CancelToken{ grp: rt.next_group }
+}
+
+// Has this token been cancelled? The question long-running work asks between steps.
+pub fn is_cancelled(read rt: Runtime, read tok: CancelToken) -> bool {
+    if tok.grp == 0 { return false }
+    var i: usize = 0
+    for i < list.len(i64, rt.dead_groups) {
+        if list.get(i64, rt.dead_groups, i) == tok.grp { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Cancel every live timer registered under `tok`, and mark the token cancelled so work
+// already running can see it. Returns how many timers this call killed.
+//
+// Marking the token is separate from killing the timers on purpose: a task that is
+// mid-flight has no timer left to cancel, and the only way it can learn to stop is to ask.
+pub fn cancel_all(mut rt: Runtime, read tok: CancelToken) -> i64 {
+    if tok.grp == 0 { return 0 }
+    if is_cancelled(rt, tok) == false {
+        list.push(i64, rt.dead_groups, tok.grp)
+    }
+    var n: i64 = 0
+    var i: usize = 0
+    for i < list.len(i64, rt.groups) {
+        if list.get(i64, rt.groups, i) == tok.grp and list.get(bool, rt.alive, i) {
+            list.set(bool, rt.alive, i, false)
+            rt.cancelled = rt.cancelled + 1
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
 }
 
 // `take c` because the runtime STORES the clock: a `read` borrow is second-class and may
 // not outlive the call, and a runtime that borrowed its clock could not outlive the frame
 // that made it. Taking ownership is the honest signature -- the clock belongs to the loop.
 pub fn make(read a: Allocator, take c: time.Clock) -> Runtime {
-    return Runtime{ clock: c, tasks: list.make(Task, a), deadlines: list.make(i64, a), ids: list.make(i64, a), alive: list.make(bool, a), next_id: 1, fired: 0, cancelled: 0 }
+    return Runtime{ clock: c, tasks: list.make(Task, a), deadlines: list.make(i64, a), ids: list.make(i64, a), alive: list.make(bool, a), groups: list.make(i64, a), dead_groups: list.make(i64, a), next_id: 1, next_group: 0, fired: 0, cancelled: 0 }
 }
 
 pub fn free(mut rt: Runtime) {
@@ -95,6 +165,8 @@ pub fn free(mut rt: Runtime) {
     list.free(i64, rt.deadlines)
     list.free(i64, rt.ids)
     list.free(bool, rt.alive)
+    list.free(i64, rt.groups)
+    list.free(i64, rt.dead_groups)
 }
 
 // Schedule `t` to fire `after` nanoseconds from now. Returns the timer's id, which is what
@@ -103,7 +175,17 @@ pub fn free(mut rt: Runtime) {
 // The deadline is computed from the clock ONCE, at registration. A timer whose deadline
 // were recomputed on every poll would drift, and under a manual clock it would never fire
 // at all — the bug that makes hand-rolled loops untestable.
-pub fn after(mut rt: Runtime, after_nanos: i64, read t: Task) -> i64 {
+// The token is REQUIRED rather than optional, and `detached()` is the explicit spelling
+// for "no group". An optional token would make the common case default to ungrouped
+// silently, which is exactly the ambient-cancellation shape this design is avoiding — the
+// choice should be visible at the call site either way.
+//
+// Registering under an ALREADY-CANCELLED token refuses: the timer is not scheduled and -1
+// comes back. Accepting it would let a task outlive the cancellation that was supposed to
+// stop it, which is the subtle version of a cancellation bug — everything looks cancelled
+// and one straggler still runs.
+pub fn after(mut rt: Runtime, after_nanos: i64, read tok: CancelToken, read t: Task) -> i64 {
+    if is_cancelled(rt, tok) { return 0 - 1 }
     let now: i64 = time.read_nanos(rt.clock)
     let id: i64 = rt.next_id
     rt.next_id = rt.next_id + 1
@@ -111,13 +193,14 @@ pub fn after(mut rt: Runtime, after_nanos: i64, read t: Task) -> i64 {
     list.push(i64, rt.deadlines, now + after_nanos)
     list.push(i64, rt.ids, id)
     list.push(bool, rt.alive, true)
+    list.push(i64, rt.groups, tok.grp)
     return id
 }
 
 // Schedule `t` for the next poll, whenever that is. `after(rt, 0, t)` with the intent
 // spelled out.
-pub fn soon(mut rt: Runtime, read t: Task) -> i64 {
-    return after(rt, 0, t)
+pub fn soon(mut rt: Runtime, read tok: CancelToken, read t: Task) -> i64 {
+    return after(rt, 0, tok, t)
 }
 
 // Mark `id` dead. Returns whether it was alive.
@@ -247,6 +330,87 @@ pub fn run_until_idle(mut rt: Runtime, max_rounds: usize) -> i64 {
         r = r + 1
     }
     return total
+}
+
+// ---- the waiting poll --------------------------------------------------------
+//
+// What `poll` reported: a count, which cannot distinguish "nothing was due" from "there is
+// nothing left to do". A loop needs that difference — the first means wait, the second
+// means exit — so the waiting form answers with a kind.
+
+pub const RT_FIRED: i32 = 0      // at least one timer ran
+pub const RT_IDLE: i32 = 1       // nothing is scheduled at all; the loop may stop
+pub const RT_TIMEOUT: i32 = 2    // work is still pending, but the budget ran out first
+
+// `@copy`: three integers. `waited` is the time this call actually spent waiting, which is
+// not the time it asked for — see `time.wait`.
+@copy pub struct Event {
+    pub kind: i32,
+    pub fired: i64,
+    pub waited: i64,
+}
+
+@no_alloc @no_os pub fn ev_name(kind: i32) -> str {
+    if kind == RT_FIRED { return "fired" }
+    if kind == RT_IDLE { return "idle" }
+    return "timeout"
+}
+
+// Run what is due; if nothing is, WAIT for the earlier of `timeout_nanos` and the next
+// deadline, then run what is due again.
+//
+// **This is the one function in the module that can block, and it blocks through the
+// clock.** `time.wait` sleeps on a `host()` clock and ADVANCES a `manual()` one, so this
+// same code idles in production and runs instantly in a test — and the test does not call
+// `advance` itself, because waiting is advancing. That is what lets the suite assert a
+// sequence of events over simulated seconds and still take none.
+//
+// The wait is clamped to the next deadline so a large timeout cannot overshoot a timer.
+// A caller with nothing scheduled gets `RT_IDLE` immediately and never waits at all: there
+// is nothing that could arrive to end the wait, so sleeping would be a hang with extra
+// steps. **That changes the day IO exists** — then a runtime with no timers may still be
+// waiting on a socket, and `RT_IDLE` will have to mean "no timers AND no pollables". This
+// is the note to invert when `Pollable` lands.
+pub fn poll_for(mut rt: Runtime, timeout_nanos: i64) -> Event {
+    let n0: i64 = poll(rt)
+    if n0 > 0 { return Event{ kind: RT_FIRED, fired: n0, waited: 0 } }
+    if pending(rt) == 0 { return Event{ kind: RT_IDLE, fired: 0, waited: 0 } }
+
+    // Something is pending and nothing was due, so every live deadline is in the future.
+    let now: i64 = time.read_nanos(rt.clock)
+    let d: i64 = next_deadline(rt)
+    var want: i64 = timeout_nanos
+    if d >= 0 {
+        let until: i64 = d - now
+        if until < want { want = until }
+    }
+    if want < 0 { want = 0 }
+    let waited: i64 = time.wait(rt.clock, want)
+
+    let n1: i64 = poll(rt)
+    if n1 > 0 { return Event{ kind: RT_FIRED, fired: n1, waited: waited } }
+    return Event{ kind: RT_TIMEOUT, fired: 0, waited: waited }
+}
+
+// Drive the loop until it goes idle or `budget_nanos` of waiting is used up. Returns the
+// last event, so a caller can tell which of the two happened.
+//
+// `rounds` bounds the loop for the same reason `run_until_idle`'s does: a zero-delay task
+// that reschedules itself is due again immediately, and a bound is honest about that where
+// pretending it cannot happen is not.
+pub fn run_for(mut rt: Runtime, budget_nanos: i64, rounds: usize) -> Event {
+    var left: i64 = budget_nanos
+    var last: Event = Event{ kind: RT_IDLE, fired: 0, waited: 0 }
+    var r: usize = 0
+    for r < rounds {
+        let e: Event = poll_for(rt, left)
+        last = e
+        if e.kind == RT_IDLE { return e }
+        left = left - e.waited
+        if left <= 0 { return e }
+        r = r + 1
+    }
+    return last
 }
 
 // The counters as text, into a caller `Sink`. **Check `sink.overflowed`.**

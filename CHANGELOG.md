@@ -46,6 +46,49 @@ versions are snapshots, not stability promises.
   24 on Linux x86-64, 16 on aarch64, 4 on macOS — and a wrong `st_mode` reads a `uid` and
   reports a plausible file type. Nothing in the module reads a foreign struct's interior.
 
+- **Event loop V1: cancellation tokens, a waiting `poll`, and waiting that goes through the
+  CLOCK.** `std/time` gained `wait`; `std/runtime` gained `CancelToken`, `poll_for` and
+  `run_for`; `runtime_test` is 5 → 10 cases and `runtime_demo.jtr` (`jheartbeat`) is the
+  consumer.
+
+  **The one decision the rest follows from: waiting belongs to the clock.** A loop with
+  nothing to do must idle or a hosted server burns a core; a loop that sleeps makes every
+  test take as long as its longest timer. Both are satisfied at once because `time.wait`
+  really sleeps on `host()` and ADVANCES on `manual()` — so the identical code path idles in
+  production and runs at full speed in a test, and **the test calls no `advance` of its own,
+  because waiting is advancing**. `runtime_demo`'s output is asserted to the digit
+  (`beat=3 at_ms=300`) for exactly that reason; with a real clock the best a test could say
+  is "roughly 300ms, usually".
+
+  It lives in `std/time` because sleeping needs a portability decision (`usleep` against
+  `Sleep`) and the clock already WAS the OS boundary for reading. `usleep` rather than
+  `nanosleep` because `nanosleep` takes a `struct timespec*`, and reading a foreign struct's
+  interior is what `std/sysfs`'s header refuses to do for `stat`. Windows rounds sub-
+  millisecond requests UP to `Sleep(1)` — a yield rather than a spin — which is why `wait`
+  reports what it actually did instead of letting the caller assume.
+
+  **`CancelToken` is a group handle, not an id and not a flag.** `cancel(rt, id)` is right
+  when you hold the thing you scheduled; it is wrong for *stop everything this
+  request/connection/build started*. Four decisions, each pinned: the token is required and
+  `detached()` is the explicit "no group"; `cancel_all(detached())` cancels **nothing**
+  (a wildcard would let one careless call stop every unrelated timer); `is_cancelled` exists
+  because work already in flight has no timer left to cancel and can only ask; and
+  registering under an already-cancelled token is **refused**, so a straggler cannot outlive
+  the shutdown meant to stop it.
+
+  **`poll_for` answers with a kind, not a count.** A count cannot distinguish "nothing was
+  due" from "there is nothing left to do", and a loop needs that difference: the first means
+  wait, the second means exit. `RT_FIRED` / `RT_IDLE` / `RT_TIMEOUT`, with the wait clamped
+  to the next deadline so a large budget cannot overshoot a timer. No error set, measured
+  rather than assumed: nothing here can fail, and a short or interrupted sleep is not an
+  error but a shorter wait, which the `Event` already reports.
+
+  **`Pollable` was deliberately not built.** `epoll`/`kqueue`/IOCP need something to poll,
+  and nothing in the tree exposes a file descriptor or a socket — `std/file` holds a `FILE*`
+  as an opaque `cptr`, a regular file always polls ready, and `WSAPoll` refuses anything
+  that is not a socket. It belongs with sockets rather than before them, which is where the
+  next increment starts.
+
 - **A fallible function may now have NO return type: `fn f(…) !{ E }` lowers.** That is the
   natural signature for most of what a `sys` layer does — `close`, `bind`, `commit`,
   `cancel`, `shutdown` — and it used to reach `cc`. What arrived there failed three ways:

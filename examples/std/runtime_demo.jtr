@@ -1,0 +1,223 @@
+// std/runtime_demo.jtr — `jheartbeat`: a supervisor loop that publishes a status file on a
+// timer and stops when its token is cancelled.
+//
+// **This is what the event-loop tier is FOR**, and it is the smallest program that needs
+// all of it at once: a build daemon, a watcher or a local service that must (a) do
+// something on a schedule, (b) idle without burning a core between times, (c) leave a
+// status file that another process may read at any instant, and (d) shut down on command
+// rather than by being killed.
+//
+// Each of those is one piece:
+//
+//   (a) `runtime.after` + a `CancelToken`      — the schedule, and who owns it
+//   (b) `runtime.poll_for`                     — waiting, THROUGH THE CLOCK
+//   (c) `sysfs.rename_replace`                 — a reader never sees a half-written file
+//   (d) `runtime.cancel_all` + `is_cancelled`  — shutdown that in-flight work can observe
+//
+// ─── Why the demo is instant, and why that is the whole argument ──────────────
+//
+// It runs on `time.manual()`. Every wait therefore ADVANCES the simulated clock instead of
+// sleeping, so a run that spans a simulated second finishes in no measurable time — and
+// the timestamps it prints are EXACT, which is what makes the output assertable at all.
+//
+// The identical program on `time.host()` really idles between beats. Not a different code
+// path, not a test mode: `poll_for` waits through whichever clock it was handed, and that
+// is the one decision that makes a hosted loop testable.
+//
+// ─── Why the publish happens in the LOOP and not in the callback ──────────────
+//
+// A timer callback is a fn pointer with a raw context pointer; it could be made to write a
+// file. It should not. A callback runs inside the loop's fire pass, so blocking I/O there
+// stalls every other timer, and the classic symptom is a "10ms" timer that drifts to
+// whatever the disk felt like. The timer PACES the work; the loop DOES it. That separation
+// is why the callback here only counts.
+//
+// Run:  jestyrc run examples/std/runtime_demo.jtr
+
+import "runtime"
+import "time"
+import "sysfs"
+import "fs"
+import "env"
+import "mem"
+import "path"
+import "str"
+import "sink"
+
+const HB_CAP: usize = 1024
+const HB_INTERVAL: i64 = 100000000        // 100ms, in nanoseconds
+const HB_BEATS: i64 = 5                   // stop the demo after this many
+const HB_CANCEL_AFTER: i64 = 3            // …but cancel the token before that
+
+// The callback's context: one byte, counting beats. A raw block because a fn pointer's
+// context is a raw pointer and there is nothing else it could be — the `mem.Allocator`
+// shape, which is the only way a fn pointer carries state in this language.
+fn ctx_new() -> *mut u8 {
+    var p: *mut u8 = alloc(u8, 8)
+    for i in 0..8 {
+        unsafe { (p + i).* = 0 as u8 }
+    }
+    return p
+}
+
+fn beats_of(p: *mut u8) -> i64 {
+    var b: u8 = 0
+    unsafe { b = p.* }
+    return b as i64
+}
+
+// The whole callback. It counts, and that is all it does — see the header.
+fn tick(ctx: *mut u8, id: i64, now: i64) {
+    var b: u8 = 0
+    unsafe { b = ctx.* }
+    unsafe { ctx.* = (b + 1 as u8) }
+}
+
+// Write `text` to `final_path` so that a concurrent reader sees either the old contents or
+// the new ones and never a partial write: stage beside it, then rename over.
+//
+// Returns whether it landed. The error is reported by CATEGORY, never by raw number.
+fn publish(mut f: fs.Fs, read a: Allocator, read final_path: str, read stage_path: str, read text: str) -> bool {
+    fs.put(f, stage_path, text)
+    var ok: bool = true
+    sysfs.rename_replace(f, a, stage_path, final_path) catch { ok = false }
+    return ok
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    var e: env.Env = env.host()
+
+    // --- where the status file lives -------------------------------------------
+    var tmp: String = sysfs.temp_dir(e)
+    let tmpv: str = string_view(tmp)
+
+    var dbuf: *mut u8 = alloc(u8, HB_CAP)
+    var db: []u8 = slice(u8, dbuf, HB_CAP)
+    let dn: usize = path.join(tmpv, "jestyr_jheartbeat_demo", db)
+    let dir: str = from_utf8(db[0..dn])
+
+    var fbuf: *mut u8 = alloc(u8, HB_CAP)
+    var fb: []u8 = slice(u8, fbuf, HB_CAP)
+    let fn2: usize = path.join(dir, "status.txt", fb)
+    let final_path: str = from_utf8(fb[0..fn2])
+
+    var sbuf: *mut u8 = alloc(u8, HB_CAP)
+    var sb: []u8 = slice(u8, sbuf, HB_CAP)
+    let sn: usize = path.join(dir, "status.txt.staging", sb)
+    let stage_path: str = from_utf8(sb[0..sn])
+
+    fs.erase(h, final_path)
+    fs.erase(h, stage_path)
+    let scrubbed: bool = sysfs.remove_dir(h, a, dir) catch false
+    let made: bool = sysfs.make_dir(h, a, dir) catch false
+
+    // --- the loop ---------------------------------------------------------------
+    //
+    // `time.manual(0)` — so every `poll_for` advances instead of sleeping and the printed
+    // timestamps below are exact. Swap in `time.host()` and this same loop idles for real.
+    var rt: runtime.Runtime = runtime.make(a, time.manual(0))
+    var ctx: *mut u8 = ctx_new()
+    var beat_group: runtime.CancelToken = runtime.token(rt)
+
+    print_str("-- heartbeat --")
+    runtime.after(rt, HB_INTERVAL, beat_group, runtime.task(ctx, &tick))
+
+    var rendered: *mut u8 = alloc(u8, 256)
+    var rb: []u8 = slice(u8, rendered, 256)
+
+    var rounds: i64 = 0
+    for rounds < 16 {
+        // A generous budget: the wait is clamped to the next deadline, so this does not
+        // overshoot the timer — it just means "do not idle forever".
+        let ev: runtime.Event = runtime.poll_for(rt, 10 * HB_INTERVAL)
+
+        if ev.kind == RT_IDLE {
+            print_str("idle — nothing left to wait for")
+            break
+        }
+        if ev.kind == RT_TIMEOUT {
+            print_str("timeout — the budget ran out with work still pending")
+            break
+        }
+
+        // A beat fired: the loop does the work, at the simulated instant it was due.
+        let n: i64 = beats_of(ctx)
+        var s: sink.Sink = sink.new()
+        sink.put_str(s, rb, "beat=")
+        sink.put_i64(s, rb, n)
+        sink.put_str(s, rb, " at_ms=")
+        sink.put_i64(s, rb, runtime.now(rt) / 1000000)
+        sink.put_nl(s, rb)
+        // The `Sink` contract: a truncated status file would be worse than none, so the
+        // overflow flag is checked rather than assumed. See `std/diag`'s header.
+        if sink.overflowed(s) {
+            print_str("status did not fit — refusing to publish a truncated file")
+            break
+        }
+        let text: str = sink.view(s, rb)
+        let landed: bool = publish(h, a, final_path, stage_path, text)
+
+        print_str("published")
+        print_int(n)
+        print_bool(landed)
+
+        // Re-arm FIRST, the way a real loop does: the next beat is scheduled as soon as
+        // this one has run. It also makes the shutdown below a real demonstration — with
+        // the order reversed there would be no live timer and `cancel_all` would report
+        // zero, which proves nothing.
+        if n < HB_BEATS {
+            runtime.after(rt, HB_INTERVAL, beat_group, runtime.task(ctx, &tick))
+        }
+
+        // --- shutdown, on command ------------------------------------------------
+        //
+        // Cancelling the token both kills the scheduled timers AND marks the token, so the
+        // check below sees it. That second half is the part a list of timer ids cannot do:
+        // work already in flight has no timer left to cancel and can only ask.
+        if n == HB_CANCEL_AFTER {
+            let killed: i64 = runtime.cancel_all(rt, beat_group)
+            print_str("-- cancelled --")
+            print_str("timers killed")
+            print_int(killed)
+            print_str("the token reports itself cancelled")
+            print_bool(runtime.is_cancelled(rt, beat_group))
+            // And a straggler cannot re-arm it: registering under a cancelled token is
+            // refused, which is what keeps one last beat from outliving the shutdown.
+            let late: i64 = runtime.after(rt, HB_INTERVAL, beat_group, runtime.task(ctx, &tick))
+            print_str("a late registration is refused")
+            print_bool(late < 0)
+        }
+        rounds = rounds + 1
+    }
+
+    // --- what a reader would have seen ------------------------------------------
+    //
+    // The final status file holds the LAST beat, whole. At no point did it hold a partial
+    // line — that is `rename_replace`'s guarantee, and the reason the staging file exists.
+    var got: String = fs.open_text(h, final_path)
+    let gv: str = string_view(got)
+    print_str("-- the published file --")
+    print_str(str.trimmed(gv))
+    print_str("and the staging file is gone")
+    print_bool(sysfs.exists(h, a, stage_path) == false)
+    string_free(got)
+
+    print_str("-- simulated elapsed ms --")
+    print_int(runtime.now(rt) / 1000000)
+
+    fs.erase(h, final_path)
+    let cleaned: bool = sysfs.remove_dir(h, a, dir) catch false
+    print_str("-- cleaned up --")
+    print_bool(cleaned)
+
+    free_ptr(rendered)
+    runtime.free(rt)
+    free_ptr(ctx)
+    free_ptr(sbuf)
+    free_ptr(fbuf)
+    free_ptr(dbuf)
+    string_free(tmp)
+    return 0
+}

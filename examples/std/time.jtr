@@ -120,3 +120,90 @@ pub fn reads(read c: Clock) -> i64 {
 pub fn is_deterministic(read c: Clock) -> bool {
     return c.manual
 }
+
+// ------------------------------------------------------------------- waiting
+//
+// **Waiting belongs to the clock, and that one decision is what makes a hosted
+// event loop testable.** A loop that has nothing to do must be able to idle, or a
+// server burns a core doing nothing; but a loop that SLEEPS makes every test take
+// as long as its longest timer.
+//
+// Both are true at once if waiting goes through the same handle reading does:
+//
+//   `host()`   — really sleeps, and reports how long it actually slept.
+//   `manual()` — ADVANCES THE CLOCK by the requested amount and returns instantly.
+//
+// So the identical code path idles in production and runs at full speed under a
+// test, and the test needs no `advance` call of its own — waiting IS advancing.
+// That is the same trade `manual()` already made for reading, extended to the one
+// other thing a loop does with time.
+//
+// It is also why this is here rather than in `std/runtime`: sleeping needs a
+// portability DECISION (`usleep` against `Sleep`), and the rule is that a call
+// needing one lives at the platform boundary. The clock already WAS that boundary
+// for reading; nothing new is exposed by making it the boundary for waiting too.
+
+// POSIX. `usleep` rather than `nanosleep` on purpose: `nanosleep` takes a
+// `struct timespec*`, and reading or writing a foreign struct's interior is what
+// `std/sysfs`'s header refuses to do for `stat`. `usleep` takes a scalar, so there
+// is no layout to guess. It is marked obsolescent by POSIX 2008 and is present
+// everywhere that matters; the day it is not, `nanosleep` arrives WITH a checked
+// layout rather than a hoped-for one.
+@cfg(posix) extern "unistd.h" fn usleep(usec: u32) -> i32
+
+// Windows. `Sleep` is milliseconds and returns nothing.
+@cfg(windows) extern "windows.h" fn Sleep(ms: u32)
+
+// POSIX specifies `usleep` for values below one million; longer waits are looped
+// rather than assumed.
+const TIME_USLEEP_MAX: i64 = 999999
+
+@cfg(posix) fn sleep_micros(us: i64) {
+    var left: i64 = us
+    for left > 0 {
+        var chunk: i64 = left
+        if chunk > TIME_USLEEP_MAX { chunk = TIME_USLEEP_MAX }
+        usleep(chunk as u32)
+        left = left - chunk
+    }
+}
+
+// **Windows sleeps in whole milliseconds, and this rounds UP.** A request smaller
+// than a millisecond becomes `Sleep(1)`, which yields the thread rather than
+// spinning — the honest reading of "wait a little". Rounding DOWN would turn every
+// sub-millisecond wait into a busy loop, which is the failure this function exists
+// to prevent. The default Windows timer granularity is coarser still (~15ms unless
+// something has called `timeBeginPeriod`), so a caller that needs precise short
+// waits is not served by either platform and should not pretend otherwise.
+@cfg(windows) fn sleep_micros(us: i64) {
+    let ms: i64 = (us + 999) / 1000
+    if ms > 0 { Sleep(ms as u32) }
+}
+
+// Wait for `nanos`. Returns the nanoseconds actually waited.
+//
+// The return value is not decoration: on a host clock a sleep may be SHORT (a
+// signal on POSIX) or LONG (scheduler granularity, and on Windows that is the
+// common case by a wide margin), so a caller that needs to know how much time
+// really passed has to be told rather than assume. On a manual clock it is exactly
+// `nanos`, which is what makes a test assertable.
+//
+// Sub-microsecond requests do not sleep at all on POSIX — `usleep` takes
+// microseconds, so `nanos / 1000` truncates to zero — and become one millisecond on
+// Windows. Neither platform can honour a nanosecond wait and neither pretends to.
+pub fn wait(mut c: Clock, nanos: i64) -> i64 {
+    if nanos <= 0 { return 0 }
+    if c.manual {
+        c.now = c.now + nanos
+        return nanos
+    }
+    let start: i64 = mono_nanos()
+    sleep_micros(nanos / 1000)
+    return mono_nanos() - start
+}
+
+// Can this clock wait without real time passing? True only for `manual`, and the
+// question a loop asks before deciding whether idling is free.
+pub fn waits_are_free(read c: Clock) -> bool {
+    return c.manual
+}

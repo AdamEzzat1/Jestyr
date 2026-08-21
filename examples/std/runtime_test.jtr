@@ -55,7 +55,7 @@ fn note(ctx: *mut u8, id: i64, now: i64) {
     var clk: time.Clock = time.manual(0)
     var rt: runtime.Runtime = runtime.make(a, clk)
     var ctx: *mut u8 = ctx_new()
-    runtime.after(rt, 1000, runtime.task(ctx, &note))
+    runtime.after(rt, 1000, runtime.detached(), runtime.task(ctx, &note))
 
     test.eq_usize(c, rep, "one pending", runtime.pending(rt), 1)
     test.is_false(c, rep, "not idle", runtime.is_idle(rt))
@@ -100,13 +100,13 @@ fn note(ctx: *mut u8, id: i64, now: i64) {
 
     // Registered out of deadline order: 300, 100, 200. They must fire 100, 200, 300 —
     // ids 2, 3, 1.
-    runtime.after(rt, 300, runtime.task(ctx, &note))       // id 1
-    runtime.after(rt, 100, runtime.task(ctx, &note))       // id 2
-    runtime.after(rt, 200, runtime.task(ctx, &note))       // id 3
+    runtime.after(rt, 300, runtime.detached(), runtime.task(ctx, &note))       // id 1
+    runtime.after(rt, 100, runtime.detached(), runtime.task(ctx, &note))       // id 2
+    runtime.after(rt, 200, runtime.detached(), runtime.task(ctx, &note))       // id 3
     // Two more at the SAME deadline as id 2. Ties break by registration, so 4 then 5 —
     // not by callback address, which would vary between builds and make this untestable.
-    runtime.after(rt, 100, runtime.task(ctx, &note))       // id 4
-    runtime.after(rt, 100, runtime.task(ctx, &note))       // id 5
+    runtime.after(rt, 100, runtime.detached(), runtime.task(ctx, &note))       // id 4
+    runtime.after(rt, 100, runtime.detached(), runtime.task(ctx, &note))       // id 5
 
     test.eq_i64(c, rep, "earliest deadline", runtime.next_deadline(rt), 100)
     runtime.advance(rt, 1000)
@@ -136,8 +136,8 @@ fn note(ctx: *mut u8, id: i64, now: i64) {
     var rt: runtime.Runtime = runtime.make(a, clk)
     var ctx: *mut u8 = ctx_new()
 
-    let keep: i64 = runtime.after(rt, 100, runtime.task(ctx, &note))
-    let drop: i64 = runtime.after(rt, 100, runtime.task(ctx, &note))
+    let keep: i64 = runtime.after(rt, 100, runtime.detached(), runtime.task(ctx, &note))
+    let drop: i64 = runtime.after(rt, 100, runtime.detached(), runtime.task(ctx, &note))
     test.eq_usize(c, rep, "two pending", runtime.pending(rt), 2)
 
     test.is_true(c, rep, "cancel reports the change", runtime.cancel(rt, drop))
@@ -173,14 +173,14 @@ fn note(ctx: *mut u8, id: i64, now: i64) {
     // Two already-due tasks. A single `poll` fires exactly the ones present when it
     // started — the rule that stops a self-rescheduling task from spinning forever inside
     // one poll, which is the classic starvation bug.
-    runtime.soon(rt, runtime.task(ctx, &note))
-    runtime.soon(rt, runtime.task(ctx, &note))
+    runtime.soon(rt, runtime.detached(), runtime.task(ctx, &note))
+    runtime.soon(rt, runtime.detached(), runtime.task(ctx, &note))
     test.eq_i64(c, rep, "both fire", runtime.poll(rt), 2)
     test.is_true(c, rep, "idle", runtime.is_idle(rt))
 
     // `run_until_idle` is the settle operation and is bounded, so even a pathological
     // zero-delay chain terminates instead of hanging the suite.
-    runtime.soon(rt, runtime.task(ctx, &note))
+    runtime.soon(rt, runtime.detached(), runtime.task(ctx, &note))
     let n: i64 = runtime.run_until_idle(rt, 8)
     test.eq_i64(c, rep, "settled", n, 1)
     test.is_true(c, rep, "idle again", runtime.is_idle(rt))
@@ -210,7 +210,7 @@ fn note(ctx: *mut u8, id: i64, now: i64) {
     // A deadline computed from a start time of 5000, not from zero — the timer is relative
     // to the clock it was registered against, which is what makes a manual clock usable at
     // all.
-    runtime.after(rt, 250, runtime.task(ctx, &note))
+    runtime.after(rt, 250, runtime.detached(), runtime.task(ctx, &note))
     test.eq_i64(c, rep, "absolute deadline", runtime.next_deadline(rt), 5250)
 
     runtime.advance(rt, 250)
@@ -226,6 +226,219 @@ fn note(ctx: *mut u8, id: i64, now: i64) {
     free_ptr(braw)
     runtime.free(rt)
     free_ptr(ctx)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_token_cancels_its_whole_group_and_leaves_everything_else_alone() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var ctx: *mut u8 = ctx_new()
+    var rt: runtime.Runtime = runtime.make(a, time.manual(0))
+
+    // Two groups plus one ungrouped timer, all due at the same moment. Cancelling one
+    // group must take exactly its own members — the assertion that a group handle is a
+    // group and not a wildcard.
+    var g1: runtime.CancelToken = runtime.token(rt)
+    var g2: runtime.CancelToken = runtime.token(rt)
+    runtime.after(rt, 100, g1, runtime.task(ctx, &note))       // id 1
+    runtime.after(rt, 100, g2, runtime.task(ctx, &note))       // id 2
+    runtime.after(rt, 100, g1, runtime.task(ctx, &note))       // id 3
+    runtime.after(rt, 100, runtime.detached(), runtime.task(ctx, &note))   // id 4
+
+    test.eq_i64(c, rep, "cancelling g1 takes both of its timers", runtime.cancel_all(rt, g1), 2)
+    test.eq_i64(c, rep, "and nothing else", runtime.pending(rt) as i64, 2)
+
+    runtime.advance(rt, 100)
+    runtime.poll(rt)
+    test.eq_i64(c, rep, "two timers fired", ctx_n(ctx) as i64, 2)
+    // The survivors are id 2 (the other group) and id 4 (ungrouped), in registration order.
+    test.eq_i64(c, rep, "the other group survived", ctx_log(ctx, 0), 2)
+    test.eq_i64(c, rep, "and so did the ungrouped timer", ctx_log(ctx, 1), 4)
+
+    // **`detached()` is not a wildcard.** Without this, a token whose group id happened to
+    // be the ungrouped sentinel would cancel every unrelated timer in the loop, and the
+    // assertions above would still pass.
+    test.eq_i64(c, rep, "cancel_all on detached() cancels nothing", runtime.cancel_all(rt, runtime.detached()), 0)
+
+    runtime.free(rt)
+    free_ptr(ctx)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_cancelled_token_is_visible_to_work_and_refuses_new_registrations() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var ctx: *mut u8 = ctx_new()
+    var rt: runtime.Runtime = runtime.make(a, time.manual(0))
+
+    var g: runtime.CancelToken = runtime.token(rt)
+    test.is_false(c, rep, "a fresh token is live", runtime.is_cancelled(rt, g))
+    runtime.after(rt, 100, g, runtime.task(ctx, &note))
+    runtime.cancel_all(rt, g)
+
+    // The half a timer list cannot express: work already RUNNING has no timer left to
+    // cancel, and the only way it can learn to stop is to ask the token.
+    test.is_true(c, rep, "a cancelled token says so", runtime.is_cancelled(rt, g))
+
+    // **Registering under a cancelled token is refused.** Accepting it would let a
+    // straggler outlive the cancellation meant to stop it — everything looks cancelled and
+    // one task still runs, which is the version of this bug that is hard to see.
+    let late: i64 = runtime.after(rt, 100, g, runtime.task(ctx, &note))
+    test.eq_i64(c, rep, "a late registration is refused", late, 0 - 1)
+    test.eq_i64(c, rep, "and nothing is pending", runtime.pending(rt) as i64, 0)
+
+    runtime.advance(rt, 1000)
+    runtime.poll(rt)
+    test.eq_i64(c, rep, "so nothing fires", ctx_n(ctx) as i64, 0)
+
+    // The positive control: a DIFFERENT token is unaffected and still schedules and fires,
+    // so the refusal above is about cancellation and not about the runtime being spent.
+    var g2: runtime.CancelToken = runtime.token(rt)
+    test.is_false(c, rep, "a different token is live", runtime.is_cancelled(rt, g2))
+    runtime.after(rt, 100, g2, runtime.task(ctx, &note))
+    runtime.advance(rt, 100)
+    runtime.poll(rt)
+    test.eq_i64(c, rep, "positive control: it fires", ctx_n(ctx) as i64, 1)
+
+    runtime.free(rt)
+    free_ptr(ctx)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn poll_for_waits_through_the_clock_and_names_what_happened() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var ctx: *mut u8 = ctx_new()
+    var rt: runtime.Runtime = runtime.make(a, time.manual(0))
+
+    // Nothing scheduled: IDLE, immediately, with no wait. A loop that slept here would
+    // hang, because nothing can arrive to end the wait.
+    let e0: runtime.Event = runtime.poll_for(rt, 1000000)
+    test.eq_i64(c, rep, "an empty runtime is idle", e0.kind as i64, RT_IDLE as i64)
+    test.eq_i64(c, rep, "and did not wait", e0.waited, 0)
+
+    // **The behaviour this whole design is for**: one timer 500ns out, a generous timeout,
+    // and the wait goes through the clock — so on `manual()` it ADVANCES and the test is
+    // instant AND exact. The suite never calls `advance` for this one.
+    runtime.after(rt, 500, runtime.detached(), runtime.task(ctx, &note))
+    let e1: runtime.Event = runtime.poll_for(rt, 1000000)
+    test.eq_i64(c, rep, "the timer fired", e1.kind as i64, RT_FIRED as i64)
+    test.eq_i64(c, rep, "exactly one", e1.fired, 1)
+    // Clamped to the DEADLINE, not the timeout: a large budget must not overshoot a timer.
+    test.eq_i64(c, rep, "it waited to the deadline, not the timeout", e1.waited, 500)
+    test.eq_i64(c, rep, "and the clock moved by exactly that", runtime.now(rt), 500)
+
+    // A timeout SMALLER than the next deadline: the budget runs out first, the timer is
+    // still pending, and the caller is told which of the two happened.
+    runtime.after(rt, 1000, runtime.detached(), runtime.task(ctx, &note))
+    let e2: runtime.Event = runtime.poll_for(rt, 300)
+    test.eq_i64(c, rep, "the budget ran out", e2.kind as i64, RT_TIMEOUT as i64)
+    test.eq_i64(c, rep, "nothing fired", e2.fired, 0)
+    test.eq_i64(c, rep, "and it waited the whole budget", e2.waited, 300)
+    test.eq_i64(c, rep, "the timer is still pending", runtime.pending(rt) as i64, 1)
+
+    // …and the three kinds are distinguishable, which a count could not be. `IDLE` and
+    // `TIMEOUT` both report zero fired and mean opposite things: stop, and keep waiting.
+    test.ne_i64(c, rep, "idle and timeout are different answers", e0.kind as i64, e2.kind as i64)
+    test.eq_i64(c, rep, "and both fired nothing", e0.fired + e2.fired, 0)
+
+    runtime.free(rt)
+    free_ptr(ctx)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn run_for_stops_on_idle_and_on_a_spent_budget() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var ctx: *mut u8 = ctx_new()
+    var rt: runtime.Runtime = runtime.make(a, time.manual(0))
+
+    // Three timers inside the budget: all run, then the loop reports IDLE rather than
+    // spending the rest of the budget waiting for nothing.
+    runtime.after(rt, 100, runtime.detached(), runtime.task(ctx, &note))
+    runtime.after(rt, 200, runtime.detached(), runtime.task(ctx, &note))
+    runtime.after(rt, 300, runtime.detached(), runtime.task(ctx, &note))
+    let e: runtime.Event = runtime.run_for(rt, 10000, 64)
+    test.eq_i64(c, rep, "it ran until idle", e.kind as i64, RT_IDLE as i64)
+    test.eq_i64(c, rep, "all three fired", ctx_n(ctx) as i64, 3)
+    test.eq_i64(c, rep, "in deadline order", ctx_log(ctx, 0), 1)
+    test.eq_i64(c, rep, "…", ctx_log(ctx, 2), 3)
+    test.eq_i64(c, rep, "and only the needed time passed", runtime.now(rt), 300)
+
+    // A timer BEYOND the budget: the loop gives up and says so, and the timer survives —
+    // which is the difference between a budget and a cancellation.
+    var ctx2: *mut u8 = ctx_new()
+    var rt2: runtime.Runtime = runtime.make(a, time.manual(0))
+    runtime.after(rt2, 5000, runtime.detached(), runtime.task(ctx2, &note))
+    let e2: runtime.Event = runtime.run_for(rt2, 900, 64)
+    test.eq_i64(c, rep, "the budget ran out", e2.kind as i64, RT_TIMEOUT as i64)
+    test.eq_i64(c, rep, "nothing fired", ctx_n(ctx2) as i64, 0)
+    test.eq_i64(c, rep, "the timer is still there", runtime.pending(rt2) as i64, 1)
+    test.eq_i64(c, rep, "and no more than the budget was spent", runtime.now(rt2), 900)
+
+    runtime.free(rt2)
+    free_ptr(ctx2)
+    runtime.free(rt)
+    free_ptr(ctx)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_host_clock_really_waits_and_a_manual_one_does_not() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+
+    // The one case that must touch the real world, kept small on purpose: 2ms is long
+    // enough to exceed any platform's timer granularity and short enough that the suite
+    // stays instant.
+    var h: time.Clock = time.host()
+    test.is_false(c, rep, "a host clock's waits are not free", time.waits_are_free(h))
+    let t0: i64 = time.now_nanos()
+    let waited: i64 = time.wait(h, 2000000)
+    let elapsed: i64 = time.now_nanos() - t0
+    // Asserted as a LOWER bound only. An upper bound would be a flaky test on a loaded
+    // machine, and on Windows the default timer granularity can round a 2ms sleep up to
+    // ~15ms all by itself — which is exactly why `wait` reports what it actually did
+    // instead of letting the caller assume.
+    test.is_true(c, rep, "real time passed", elapsed >= 1000000)
+    test.is_true(c, rep, "and it reported a real wait", waited >= 1000000)
+
+    // The manual clock: the same call, no real time, and the advance is exact.
+    var m: time.Clock = time.manual(0)
+    test.is_true(c, rep, "a manual clock's waits are free", time.waits_are_free(m))
+    let t1: i64 = time.now_nanos()
+    let w2: i64 = time.wait(m, 60000000000)          // a simulated minute
+    let real: i64 = time.now_nanos() - t1
+    test.eq_i64(c, rep, "it waited the full simulated minute", w2, 60000000000)
+    test.eq_i64(c, rep, "the clock moved by exactly that", time.read_nanos(m), 60000000000)
+    // A minute of simulated waiting in under a millisecond of real time. The assertion is
+    // loose because it is measuring the absence of a sleep, not the speed of the machine.
+    test.is_true(c, rep, "and no real time passed", real < 1000000000)
+
+    // A non-positive wait is a no-op on both, so a loop with a deadline already in the past
+    // does not accidentally sleep.
+    test.eq_i64(c, rep, "a zero wait does nothing", time.wait(m, 0), 0)
+    test.eq_i64(c, rep, "and a negative one does not run backwards", time.wait(m, 0 - 5), 0)
+    test.eq_i64(c, rep, "the clock is where it was", time.read_nanos(m), 60000000000)
+
     let ok: bool = test_report.finish(c, rep)
     free_ptr(raw)
     return ok

@@ -78,6 +78,7 @@ BUILD_OK parser_cli
 BUILD_OK path_demo
 BUILD_OK process_demo
 BUILD_OK reductions
+BUILD_OK runtime_demo
 BUILD_OK select
 FAIL slice_algos
 BUILD_OK str_demo
