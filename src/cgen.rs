@@ -2711,6 +2711,41 @@ impl<'a> Cgen<'a> {
             .collect();
         self.ptr_params.extend(self.abi_ref_params(f));
         self.cur_result = self.fn_result_type(f);
+        // **A fallible function with no return type cannot be lowered yet**, and until
+        // now it was accepted all the way to `cc`. `fn f(x: i32) !{ Bad }` parses,
+        // type-checks, and `jestyrc check` reports ok — then produces C that fails three
+        // separate ways: a bare `return` emits `return;` out of a function whose C return
+        // type is `JestyrResult_unit` (a gcc *warning*, so the success path compiles and
+        // hands back an uninitialized tag), `?` emits `.ok` against a struct that has no
+        // such member, and `catch` emits an invalid void expression.
+        //
+        // The first of those is the dangerous one: it is the only failure mode here that
+        // gcc does not refuse, so the shape's *working* path is the one that miscompiles.
+        //
+        // Refused HERE rather than in typeck, following the `Self`-in-a-trait-parameter
+        // precedent: the limitation genuinely is the backend's, the shape is a reasonable
+        // thing to want, and a typeck error would refuse `examples/vec.jtr` — whose
+        // `push` is a method on an uninstantiated `comptime T` factory and is therefore
+        // never emitted at all. Measured over the corpus: **that one site, and it does
+        // not reach cgen**, so this rule fires nowhere and changes no emitted byte.
+        //
+        // Consequence to know: `check` still passes and `build` now fails, which is the
+        // same `check`/`run` gap `Self` has. The real fix is to lower `JestyrResult_unit`
+        // — construct it on the valueless `return`, skip the `.ok` projection in `?`, and
+        // give `catch` a statement form — which is an emission change and so owes the
+        // port mirror in `examples/std/cgen.jtr` plus a reseed. Zero golden churn, since
+        // no corpus file emits the shape.
+        if f.errors.is_some() && f.ret_ty.is_none() {
+            self.diag(
+                f.name.span,
+                format!(
+                    "the C backend cannot lower `{}` yet: a fallible function must declare \
+                     a return type, because `!{{ … }}` with none lowers to a result struct \
+                     with no ok field",
+                    f.name.name
+                ),
+            );
+        }
         self.cur_ensures = f.ensures.clone();
         self.cur_ret_cty = self.ret_type(f);
         self.cur_no_panic = f.no_panic;
@@ -13001,6 +13036,49 @@ mod tests {
             c3.contains("int32_t other(void* j_f);"),
             "only a `.h` suffix suppresses; anything else keeps the old behaviour: {c3}"
         );
+    }
+
+    /// **A fallible function with no return type is refused by the backend.**
+    ///
+    /// `fn f(x: i32) !{ Bad }` used to reach `cc`. What arrived there was C that gcc
+    /// rejects in two of its three shapes (`?` projects `.ok` off a struct with no ok
+    /// field; `catch` becomes an invalid void expression) and — the dangerous one —
+    /// *accepts* in the third: a valueless `return` out of a `JestyrResult_unit`
+    /// function is only a gcc warning, so the success path compiled and returned an
+    /// uninitialized tag. `jestyrc check` said "ok" for all three.
+    ///
+    /// The three assertions below are the three lowerings, so a future implementation
+    /// of `JestyrResult_unit` has to delete this test deliberately rather than watch it
+    /// pass vacuously.
+    #[test]
+    fn a_fallible_function_with_no_return_type_is_refused() {
+        for (what, src) in [
+            ("bare return", "fn f(x: i32) !{ Bad } { if x < 0 { return err(Bad) } return }"),
+            (
+                "propagated with `?`",
+                "fn f(x: i32) !{ Bad } { return err(Bad) } \
+                 fn g(x: i32) -> i32 !{ Bad } { f(x)? return ok(1) }",
+            ),
+            (
+                "recovered with `catch`",
+                "fn f(x: i32) !{ Bad } { return err(Bad) } \
+                 fn g(x: i32) -> i32 { f(x) catch 0 return 1 }",
+            ),
+        ] {
+            let (_c, d) = gen(src);
+            assert!(
+                d.iter().any(|x| x.message.contains("a fallible function must declare a return type")),
+                "the {what} form must be refused by the backend, not by gcc; got {d:?}"
+            );
+        }
+
+        // **The positive control.** Without it the assertions above would also pass for
+        // a backend that refused every fallible function, which is the failure mode a
+        // refusal test has: the same declared error set, one return type added, must
+        // still lower cleanly.
+        let (c, d) = gen("fn f(x: i32) -> i32 !{ Bad } { if x < 0 { return err(Bad) } return ok(x) }");
+        assert!(d.is_empty(), "a fallible function WITH a return type still lowers: {d:?}");
+        assert!(c.contains("JestyrResult_i32 jestyr_f("), "and returns the result struct: {c}");
     }
 
     #[test]

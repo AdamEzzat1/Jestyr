@@ -1,0 +1,186 @@
+// std/sysfs_demo.jtr — `jstage`: publish a file atomically, the way a build tool has to.
+//
+// **This is the consumer `std/sysfs` was built for, not an illustration of it.** Every
+// tool that writes an output someone else may be reading — a compiler emitting a `.c`, a
+// formatter rewriting a source file, a package manager updating an index — has the same
+// problem: a reader must never observe a half-written file under the final name. The
+// answer is always the same three steps, and all three are `sys` operations:
+//
+//   1. make sure the destination directory exists          (`make_dir`, idempotent)
+//   2. write the bytes to a STAGING name beside it          (`std/fs`)
+//   3. rename the staging file onto the final name          (`rename_replace`)
+//
+// Step 3 is the one that needs this module. ISO C `rename` cannot do it: on Windows it
+// REFUSES an existing destination, so the portable spelling is "remove the old file, then
+// rename" — and that leaves a window in which the final name does not exist at all. The
+// platform call that does what is wanted is `MoveFileExA` with `MOVEFILE_REPLACE_EXISTING`
+// on Windows and plain `rename` on POSIX, which is exactly the kind of divergence the
+// `sys` tier exists to expose rather than average out.
+//
+// ─── What it prints, and why none of it is a path ─────────────────────────────
+//
+// The output is deliberately free of absolute paths, because the temp directory differs on
+// every machine and a demo whose output cannot be asserted is a demo nobody checks. What
+// is printed is what is portable: what happened, and the CATEGORY of anything that failed.
+//
+// The last section is the point of `std/syserr`. It removes a directory that still has a
+// file in it, on purpose, and reports the failure. POSIX says `ENOTEMPTY` (39 on Linux, 66
+// on macOS) and Windows says `ERROR_DIR_NOT_EMPTY` (145); the rendered line reads the same
+// on all three except for the raw number, which is printed precisely so a bug report from
+// the other operating system is still actionable.
+//
+// Run:  jestyrc run examples/std/sysfs_demo.jtr
+
+import "sysfs"
+import "syserr"
+import "fs"
+import "env"
+import "mem"
+import "str"
+import "path"
+import "sink"
+
+const STAGE_CAP: usize = 1024
+const STAGE_PAYLOAD: str = "jestyr-manifest/v1\nmodule app 1111\n"
+
+// Report a failure by CATEGORY, never by raw number — the shape a portable caller writes.
+// The raw number rides along in the rendered text for the bug report; nothing branches on
+// it.
+fn say_error(read e: SysError) {
+    var buf: *mut u8 = alloc(u8, 256)
+    var b: []u8 = slice(u8, buf, 256)
+    var s: sink.Sink = sink.new()
+    syserr.render(e, s, b)
+    print_str(sink.view(s, b))
+    free_ptr(buf)
+}
+
+// Record `v` into `slot` and yield `false` — the shape a `catch |e| match e { … }` needs,
+// since a match arm body must be an expression. Same helper the suite uses.
+fn stamp(mut slot: i32, v: i32) -> bool {
+    slot = v
+    return false
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    var e: env.Env = env.host()
+
+    // --- where to work ---------------------------------------------------------
+    //
+    // The temp directory comes through the `Env` capability rather than from
+    // `GetTempPathA`, so this is one of the operations whose signature admits it reads
+    // process configuration. A sealed environment would get the documented fallback.
+    var tmp: String = sysfs.temp_dir(e)
+    let tmpv: str = string_view(tmp)
+
+    var dbuf: *mut u8 = alloc(u8, STAGE_CAP)
+    var db: []u8 = slice(u8, dbuf, STAGE_CAP)
+    let dn: usize = path.join(tmpv, "jestyr_jstage_demo", db)
+    let dir: str = from_utf8(db[0..dn])
+
+    // Best-effort scrub of anything a previous run left, so the demo's output does not
+    // depend on whether it has been run before. Failures here are ignored ON PURPOSE:
+    // "there was nothing to clean up" is the normal case.
+    var pbuf: *mut u8 = alloc(u8, STAGE_CAP)
+    var pb: []u8 = slice(u8, pbuf, STAGE_CAP)
+    let fn_: usize = path.join(dir, "manifest.txt", pb)
+    let final_path: str = from_utf8(pb[0..fn_])
+
+    var sbuf: *mut u8 = alloc(u8, STAGE_CAP)
+    var sb: []u8 = slice(u8, sbuf, STAGE_CAP)
+    let sn: usize = path.join(dir, "manifest.txt.staging", sb)
+    let stage_path: str = from_utf8(sb[0..sn])
+
+    fs.erase(h, final_path)
+    fs.erase(h, stage_path)
+    let scrubbed: bool = sysfs.remove_dir(h, a, dir) catch false
+
+    // --- step 1: the destination directory -------------------------------------
+    //
+    // `make_dir` is idempotent and SAYS WHICH CALL DID THE WORK, which is why it returns a
+    // bool at all. A publisher run twice must not fail the second time.
+    print_str("-- staging --")
+    var cat: i32 = SYSERR_OK
+    let created: bool = sysfs.make_dir(h, a, dir) catch |e2| match e2 {
+        SysFsFailed(code) => stamp(cat, syserr.category(code, syserr.host_plat())),
+        SysFsRefused => stamp(cat, 0 - 1),
+    }
+    if cat != SYSERR_OK {
+        print_str("could not create the staging directory")
+        return 1
+    }
+    print_str("created the directory")
+    print_bool(created)
+
+    let again: bool = sysfs.make_dir(h, a, dir) catch true
+    print_str("a second create reports it was already there")
+    print_bool(again == false)
+
+    // --- step 2: write to the staging name -------------------------------------
+    fs.put(h, stage_path, STAGE_PAYLOAD)
+    let m: sysfs.Meta = sysfs.metadata(h, a, stage_path) catch sysfs.missing()
+    print_str("staged bytes")
+    print_int(m.bytes as i64)
+    print_str("and the byte count is the one we wrote")
+    print_bool(m.bytes == STAGE_PAYLOAD.len as u64)
+
+    // --- step 3: the atomic move -----------------------------------------------
+    //
+    // First publish: nothing to replace. Second publish: the destination exists, and this
+    // is where a portable `rename` would have FAILED on Windows rather than replacing.
+    let clobbered1: bool = sysfs.rename_replace(h, a, stage_path, final_path) catch true
+    print_str("first publish replaced something")
+    print_bool(clobbered1)
+
+    fs.put(h, stage_path, "jestyr-manifest/v1\nmodule app 2222\n")
+    let clobbered2: bool = sysfs.rename_replace(h, a, stage_path, final_path) catch false
+    print_str("second publish replaced something")
+    print_bool(clobbered2)
+
+    var got: String = fs.open_text(h, final_path)
+    let gv: str = string_view(got)
+    print_str("and the published file holds the newest bytes")
+    print_bool(str.has(gv, "2222"))
+    print_bool(str.has(gv, "1111") == false)
+    string_free(got)
+
+    // --- the platform's own reason, in portable words ---------------------------
+    //
+    // Deliberately wrong: the directory still holds the published file. Two operating
+    // systems, two raw numbers, one category — which is the whole claim `std/syserr` makes.
+    print_str("-- what the platform says --")
+    var why: i32 = SYSERR_OK
+    var raw_code: i32 = 0
+    let removed: bool = sysfs.remove_dir(h, a, dir) catch |e3| match e3 {
+        SysFsFailed(code) => stamp2(why, syserr.category(code, syserr.host_plat()), raw_code, code),
+        SysFsRefused => stamp(why, 0 - 1),
+    }
+    print_str("removing a non-empty directory is refused")
+    print_bool(removed == false)
+    print_str("and the portable category is NOT_EMPTY")
+    print_bool(why == SYSERR_NOT_EMPTY)
+    say_error(syserr.here(raw_code))
+
+    // --- clean up ---------------------------------------------------------------
+    fs.erase(h, final_path)
+    let gone: bool = sysfs.remove_dir(h, a, dir) catch false
+    print_str("-- cleaned up --")
+    print_bool(gone)
+
+    free_ptr(sbuf)
+    free_ptr(pbuf)
+    free_ptr(dbuf)
+    string_free(tmp)
+    return 0
+}
+
+// Two slots, because this call site wants both the portable category (to branch on) and
+// the raw code (to print). Keeping them separate is the module's whole thesis in one
+// helper: nothing branches on the number, and the number is never thrown away.
+fn stamp2(mut cat: i32, c: i32, mut raw: i32, r: i32) -> bool {
+    cat = c
+    raw = r
+    return false
+}

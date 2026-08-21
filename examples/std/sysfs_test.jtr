@@ -1,0 +1,428 @@
+// std/sysfs_test.jtr — the unit suite for `std/sysfs`.
+//
+// These touch the real filesystem, for the same reason `std/sysdir`'s do: the module
+// exists because POSIX and Windows disagree, and a mock would encode one of their answers
+// and prove nothing about the other.
+//
+// Everything is created and removed under a scratch directory the suite makes itself, so
+// the tests need no fixture in the repository and leave nothing behind. Run from the
+// repository root.
+//
+// **The one test that justifies the whole `syserr` layer** is
+// `a_non_empty_directory_refuses_with_a_portable_category`: POSIX answers `ENOTEMPTY`
+// (39) and Windows answers `ERROR_DIR_NOT_EMPTY` (145), and the assertion is written once
+// against `SYSERR_NOT_EMPTY` and holds on both.
+//
+// Run:  jestyrc test examples/std/sysfs_test.jtr
+
+import "sysfs"
+import "syserr"
+import "fs"
+import "env"
+import "mem"
+import "str"
+import "path"
+import "file"
+import "test"
+import "test_report"
+
+const SYSFS_T_CAP: usize = 4096
+const SYSFS_T_ROOT: str = "zz_sysfs_scratch"
+
+// Build `<root>/<name>` into a caller buffer and view it. `path.join` does the separator
+// decision so the tests do not each hard-code one.
+fn under(read name: str, mut buf: []u8) -> str {
+    let n: usize = path.join(SYSFS_T_ROOT, name, buf)
+    return from_utf8(buf[0..n])
+}
+
+// Remove the scratch tree, best effort, ignoring every failure. Called at the START of
+// each test rather than the end: a test that fails midway must not leave the NEXT one
+// looking at its debris, and an end-of-test cleanup is exactly the code that does not run
+// when something goes wrong.
+fn scrub(mut f: fs.Fs, read a: Allocator) {
+    var buf: *mut u8 = alloc(u8, 512)
+    var b: []u8 = slice(u8, buf, 512)
+    fs.erase(f, under("a.txt", b))
+    fs.erase(f, under("b.txt", b))
+    fs.erase(f, under("inner/c.txt", b))
+    let inner: str = under("inner", b)
+    let dead1: bool = sysfs.remove_dir(f, a, inner) catch false
+    let dead2: bool = sysfs.remove_dir(f, a, SYSFS_T_ROOT) catch false
+    free_ptr(buf)
+}
+
+// Record `v` into `slot` and yield a `bool`, so a `catch |e| match e { … }` can both
+// produce the ok type the expression needs AND report which error arrived.
+//
+// A match ARM BODY must be an expression, so a bare assignment cannot be the fallback and
+// a `return` there would abandon the caller mid-test. This is the shape that works, and
+// it is worth naming once rather than open-coding at every call site. `REFUSED` is -1
+// because no real `SYSERR_*` category is negative.
+const SYSFS_T_REFUSED: i32 = 0 - 1
+
+fn stamp_bool(mut slot: i32, v: i32) -> bool {
+    slot = v
+    return false
+}
+
+fn stamp_str(mut slot: i32, v: i32) -> String {
+    slot = v
+    return string_new()
+}
+
+fn stamp_meta(mut slot: i32, v: i32) -> sysfs.Meta {
+    slot = v
+    return sysfs.missing()
+}
+
+// The category of whatever `make_dir` reported, or `SYSERR_OK` if it did not fail. The
+// shape every assertion below uses, so a test asserts on the PORTABLE category and never
+// on a platform's raw number — which is what lets one assertion hold on three platforms.
+fn cat_of_make(mut f: fs.Fs, read a: Allocator, read p: str) -> i32 {
+    var cat: i32 = SYSERR_OK
+    let made: bool = sysfs.make_dir(f, a, p) catch |e| match e {
+        SysFsFailed(code) => stamp_bool(cat, syserr.category(code, syserr.host_plat())),
+        SysFsRefused => stamp_bool(cat, SYSFS_T_REFUSED),
+    }
+    return cat
+}
+
+fn cat_of_remove(mut f: fs.Fs, read a: Allocator, read p: str) -> i32 {
+    var cat: i32 = SYSERR_OK
+    let gone: bool = sysfs.remove_dir(f, a, p) catch |e| match e {
+        SysFsFailed(code) => stamp_bool(cat, syserr.category(code, syserr.host_plat())),
+        SysFsRefused => stamp_bool(cat, SYSFS_T_REFUSED),
+    }
+    return cat
+}
+
+@test fn make_dir_is_idempotent_and_says_which_call_created_it() -> bool {
+    var raw: *mut u8 = alloc(u8, SYSFS_T_CAP)
+    var rep: []u8 = slice(u8, raw, SYSFS_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h, a)
+
+    // The distinction the return value exists for: an `EEXIST` on a directory you were
+    // creating is information, not a failure, and the caller still learns which call did
+    // the work.
+    let first: bool = sysfs.make_dir(h, a, SYSFS_T_ROOT) catch false
+    test.is_true(c, rep, "the first call creates it", first)
+    let second: bool = sysfs.make_dir(h, a, SYSFS_T_ROOT) catch true
+    test.is_false(c, rep, "the second call reports it was already there", second)
+
+    // And it really is a directory afterwards, rather than merely not-an-error.
+    let m: sysfs.Meta = sysfs.metadata(h, a, SYSFS_T_ROOT) catch sysfs.missing()
+    test.is_true(c, rep, "and it is a directory", sysfs.is_dir(m))
+    test.is_false(c, rep, "and not a file", sysfs.is_file(m))
+
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_file_sitting_at_the_path_is_not_reported_as_an_existing_directory() -> bool {
+    var raw: *mut u8 = alloc(u8, SYSFS_T_CAP)
+    var rep: []u8 = slice(u8, raw, SYSFS_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h, a)
+
+    var buf: *mut u8 = alloc(u8, 512)
+    var b: []u8 = slice(u8, buf, 512)
+    sysfs.make_dir(h, a, SYSFS_T_ROOT) catch false
+    let fp: str = under("a.txt", b)
+    fs.put(h, fp, "hello")
+
+    // **The regression this pins.** `EEXIST` says the NAME is taken; it does not say by
+    // what. A `make_dir` that turned every `EEXIST` into `false` would report success for
+    // a path where a regular file is sitting, and the caller's next write into "the
+    // directory it just made" would fail somewhere far away.
+    test.eq_i64(c, rep, "a file in the way is an error, not `already there`",
+        cat_of_make(h, a, fp) as i64, SYSERR_EXISTS as i64)
+
+    // The positive control: the identical second-call shape on a real directory IS
+    // `false`, so the assertion above is about the file and not about `make_dir` failing
+    // on everything.
+    let again: bool = sysfs.make_dir(h, a, SYSFS_T_ROOT) catch true
+    test.is_false(c, rep, "positive control: an existing directory is still `already there`", again)
+
+    free_ptr(buf)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn remove_dir_is_idempotent_and_refuses_a_non_empty_one() -> bool {
+    var raw: *mut u8 = alloc(u8, SYSFS_T_CAP)
+    var rep: []u8 = slice(u8, raw, SYSFS_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h, a)
+
+    var buf: *mut u8 = alloc(u8, 512)
+    var b: []u8 = slice(u8, buf, 512)
+    sysfs.make_dir(h, a, SYSFS_T_ROOT) catch false
+    let fp: str = under("a.txt", b)
+    fs.put(h, fp, "x")
+
+    // **The test that justifies the category layer.** POSIX reports `ENOTEMPTY` (39 on
+    // Linux, 66 on macOS) and Windows reports `ERROR_DIR_NOT_EMPTY` (145). This assertion
+    // is written once and holds on all three, which is the entire claim `std/syserr`
+    // makes — and none of those raw numbers appears anywhere in this file.
+    test.eq_i64(c, rep, "a non-empty directory reports NOT_EMPTY on every platform",
+        cat_of_remove(h, a, SYSFS_T_ROOT) as i64, SYSERR_NOT_EMPTY as i64)
+
+    fs.erase(h, fp)
+    let gone: bool = sysfs.remove_dir(h, a, SYSFS_T_ROOT) catch false
+    test.is_true(c, rep, "an empty one goes, and says this call did it", gone)
+    let again: bool = sysfs.remove_dir(h, a, SYSFS_T_ROOT) catch true
+    test.is_false(c, rep, "and removing it twice reports it was already absent", again)
+
+    free_ptr(buf)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn metadata_sizes_a_file_against_a_byte_count_it_did_not_ask_the_platform_for() -> bool {
+    var raw: *mut u8 = alloc(u8, SYSFS_T_CAP)
+    var rep: []u8 = slice(u8, raw, SYSFS_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h, a)
+
+    var buf: *mut u8 = alloc(u8, 512)
+    var b: []u8 = slice(u8, buf, 512)
+    sysfs.make_dir(h, a, SYSFS_T_ROOT) catch false
+    let fp: str = under("a.txt", b)
+    // 13 bytes, counted in Jestyr rather than read back from the platform — so a size
+    // computed the wrong way fails loudly instead of agreeing with itself.
+    let payload: str = "hello, world!"
+    fs.put(h, fp, payload)
+
+    let m: sysfs.Meta = sysfs.metadata(h, a, fp) catch sysfs.missing()
+    test.is_true(c, rep, "typed as a file", sysfs.is_file(m))
+    test.eq_i64(c, rep, "sized exactly", m.bytes as i64, payload.len as i64)
+
+    // A directory's size is 0 on both platforms BY DECISION, not by coincidence — see the
+    // module header. Pinning it keeps a future `stat`-based implementation from quietly
+    // starting to report POSIX's block count.
+    let d: sysfs.Meta = sysfs.metadata(h, a, SYSFS_T_ROOT) catch sysfs.missing()
+    test.is_true(c, rep, "a directory is a directory", sysfs.is_dir(d))
+    test.eq_i64(c, rep, "and reports no size", d.bytes as i64, 0)
+
+    free_ptr(buf)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_missing_path_is_not_found_in_the_same_words_on_both_platforms() -> bool {
+    var raw: *mut u8 = alloc(u8, SYSFS_T_CAP)
+    var rep: []u8 = slice(u8, raw, SYSFS_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+
+    // POSIX `ENOENT` is 2 and Win32 `ERROR_FILE_NOT_FOUND` is also 2 — which is a
+    // coincidence, and the point of asserting the CATEGORY is that the test does not
+    // depend on it. `metadata` on a missing path errors rather than reporting
+    // `SYSFS_FT_MISSING`, because the platform distinguishes "nothing there" from "you
+    // may not look" and collapsing them throws that away.
+    var got: i32 = SYSERR_OK
+    let m: sysfs.Meta = sysfs.metadata(h, a, "no/such/path/anywhere") catch |e| match e {
+        SysFsFailed(code) => stamp_meta(got, syserr.category(code, syserr.host_plat())),
+        SysFsRefused => stamp_meta(got, SYSFS_T_REFUSED),
+    }
+    test.eq_i64(c, rep, "a missing path is NOT_FOUND", got as i64, SYSERR_NOT_FOUND as i64)
+    test.eq_i64(c, rep, "and the fallback value really is the missing one", m.ftype as i64, SYSFS_FT_MISSING as i64)
+
+    // `exists` is the same question without the reason, and it must agree.
+    test.is_false(c, rep, "exists says no", sysfs.exists(h, a, "no/such/path/anywhere"))
+    test.is_true(c, rep, "positive control: exists says yes for a real path", sysfs.exists(h, a, "examples"))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn rename_replaces_and_reports_whether_it_clobbered() -> bool {
+    var raw: *mut u8 = alloc(u8, SYSFS_T_CAP)
+    var rep: []u8 = slice(u8, raw, SYSFS_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h, a)
+
+    var buf: *mut u8 = alloc(u8, 512)
+    var b: []u8 = slice(u8, buf, 512)
+    var buf2: *mut u8 = alloc(u8, 512)
+    var b2: []u8 = slice(u8, buf2, 512)
+    sysfs.make_dir(h, a, SYSFS_T_ROOT) catch false
+    let src: str = under("a.txt", b)
+    let dst: str = under("b.txt", b2)
+
+    // Fresh destination: nothing clobbered.
+    fs.put(h, src, "first")
+    let clobbered1: bool = sysfs.rename_replace(h, a, src, dst) catch true
+    test.is_false(c, rep, "a fresh destination reports no replacement", clobbered1)
+    test.is_false(c, rep, "and the source is gone", sysfs.exists(h, a, src))
+
+    // Existing destination: replaced, and the CONTENTS are the new ones. **This is the
+    // assertion that matters on Windows**, where plain `MoveFileA` would have failed
+    // outright rather than replacing — the divergence that makes rename a `sys` operation
+    // instead of an ISO C call.
+    fs.put(h, src, "second")
+    let clobbered2: bool = sysfs.rename_replace(h, a, src, dst) catch false
+    test.is_true(c, rep, "an existing destination reports a replacement", clobbered2)
+
+    var txt: String = fs.open_text(h, dst)
+    let tv: str = string_view(txt)
+    test.is_true(c, rep, "and the destination holds the new bytes", str.eq(tv, "second"))
+    string_free(txt)
+
+    fs.erase(h, dst)
+    free_ptr(buf2)
+    free_ptr(buf)
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_denied_capability_refuses_every_mutation_and_a_host_handle_does_not() -> bool {
+    var raw: *mut u8 = alloc(u8, SYSFS_T_CAP)
+    var rep: []u8 = slice(u8, raw, SYSFS_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h, a)
+
+    // A refusal is a TYPED error here, not a counter bump — `std/fs` counts because its
+    // operations answer `bool`; these answer with an error union, so the discrimination is
+    // in the type. `cat_of_make` maps `SysFsRefused` to -1, which no real category is.
+    var ro: fs.Fs = fs.read_only()
+    test.eq_i64(c, rep, "a read-only handle refuses make_dir", cat_of_make(ro, a, SYSFS_T_ROOT) as i64, 0 - 1)
+    test.eq_i64(c, rep, "a read-only handle refuses remove_dir", cat_of_remove(ro, a, SYSFS_T_ROOT) as i64, 0 - 1)
+    test.is_false(c, rep, "and nothing was created", sysfs.exists(h, a, SYSFS_T_ROOT))
+
+    // A read-only handle still READS, which is what makes it different from `denied` and
+    // is the reason three states exist rather than two.
+    test.is_true(c, rep, "but it still reads", sysfs.exists(ro, a, "examples"))
+
+    var no: fs.Fs = fs.denied()
+    test.is_false(c, rep, "a denied handle reads nothing", sysfs.exists(no, a, "examples"))
+
+    // **The positive control without which the three refusals prove nothing**: the
+    // identical call through `host()` succeeds, so the refusals are about the capability
+    // and not about the operation being broken.
+    test.eq_i64(c, rep, "positive control: host() creates it", cat_of_make(h, a, SYSFS_T_ROOT) as i64, SYSERR_OK as i64)
+    test.is_true(c, rep, "and it is there", sysfs.exists(h, a, SYSFS_T_ROOT))
+
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn an_interior_nul_is_refused_before_the_platform_sees_it() -> bool {
+    var raw: *mut u8 = alloc(u8, SYSFS_T_CAP)
+    var rep: []u8 = slice(u8, raw, SYSFS_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    scrub(h, a)
+
+    // C stops at the NUL, so `zz_sysfs_scratch\0/junk` would create the real prefix.
+    // Creating it silently would be a security answer dressed as a correctness one — the
+    // same refusal `std/sysdir` and `std/file.open_path` make.
+    test.eq_i64(c, rep, "an interior NUL is INVALID, not a silent prefix create",
+        cat_of_make(h, a, "zz_sysfs_scratch\0/junk") as i64, SYSERR_INVALID as i64)
+    test.is_false(c, rep, "and the prefix was NOT created", sysfs.exists(h, a, SYSFS_T_ROOT))
+
+    // The positive control: the prefix alone genuinely creates, so the refusal is about
+    // the NUL and not about the path being bad.
+    test.eq_i64(c, rep, "positive control: the prefix alone works",
+        cat_of_make(h, a, SYSFS_T_ROOT) as i64, SYSERR_OK as i64)
+
+    scrub(h, a)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn canonical_is_absolute_and_ends_at_the_name_it_was_given() -> bool {
+    var raw: *mut u8 = alloc(u8, SYSFS_T_CAP)
+    var rep: []u8 = slice(u8, raw, SYSFS_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+
+    // `examples/modules` is in the repository, so this is a real path on both platforms.
+    // The assertions are the two things the two platforms DO agree on — absolute, and
+    // ending at the same final component — because symlink resolution is exactly where
+    // they do not (POSIX `realpath` resolves, Windows `GetFullPathNameA` does not).
+    var s: String = sysfs.canonical(h, a, "examples/modules") catch string_new()
+    let v: str = string_view(s)
+    test.is_true(c, rep, "non-empty", v.len > 0)
+    test.is_true(c, rep, "absolute", path.is_abs(v))
+    test.is_true(c, rep, "ends at the name it was given", str.eq(path.base(v), "modules"))
+    string_free(s)
+
+    // Existence is made uniform on purpose: POSIX `realpath` requires it and Windows does
+    // not, and leaving that in place would make the same call succeed on one platform and
+    // fail on the other for a program that never mentions symlinks.
+    var missing: i32 = SYSERR_OK
+    var s2: String = sysfs.canonical(h, a, "no/such/path/anywhere") catch |e| match e {
+        SysFsFailed(code) => stamp_str(missing, syserr.category(code, syserr.host_plat())),
+        SysFsRefused => stamp_str(missing, SYSFS_T_REFUSED),
+    }
+    test.ne_i64(c, rep, "an absent path does not canonicalize on either platform", missing as i64, SYSERR_OK as i64)
+    string_free(s2)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn temp_dir_is_never_empty_and_a_sealed_environment_gets_the_fallback() -> bool {
+    var raw: *mut u8 = alloc(u8, SYSFS_T_CAP)
+    var rep: []u8 = slice(u8, raw, SYSFS_T_CAP)
+    var c: test.Check = test.new()
+
+    // Through the real environment: whatever it is, it must be a usable absolute path.
+    var e: env.Env = env.host()
+    var t: String = sysfs.temp_dir(e)
+    let tv: str = string_view(t)
+    test.is_true(c, rep, "non-empty", tv.len > 0)
+    test.is_true(c, rep, "absolute", path.is_abs(tv))
+    // No trailing separator, matching `std/path`'s convention that a directory is named
+    // without one — so a caller can `path.join` onto it without producing a doubled `/`.
+    test.is_false(c, rep, "no trailing separator", path.is_sep(tv[tv.len - 1] as i32))
+    string_free(t)
+
+    // **The reason this goes through `env.Env` rather than `GetTempPathA`.** A sealed
+    // environment sees no variables, so the documented fallback is what comes back — and
+    // it is deterministic, which a call into the platform's own lookup could not be.
+    var sealed: env.Env = env.sealed()
+    var t2: String = sysfs.temp_dir(sealed)
+    let tv2: str = string_view(t2)
+    test.is_true(c, rep, "a sealed environment still yields a path", tv2.len > 0)
+    test.is_true(c, rep, "and it is the documented fallback", path.is_abs(tv2))
+    test.is_true(c, rep, "the sealed handle counted the lookups", env.lookups(sealed) > 0)
+    string_free(t2)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

@@ -26643,14 +26643,18 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
         }
         if ml_ident_head(tx) {
             var prev_dot: bool = false
+            var prev_const: bool = false
             if i > 0 {
                 let pt: Token = get__list(Token, tk, i - 1)
                 prev_dot = str_eq(src[pt.start .. pt.end], ".")
+                prev_const = str_eq(src[pt.start .. pt.end], "const")
             }
             var next_dot: bool = false
+            var next_colon: bool = false
             if i + 1 < n {
                 let nt: Token = get__list(Token, tk, i + 1)
                 next_dot = str_eq(src[nt.start .. nt.end], ".")
+                next_colon = str_eq(src[nt.start .. nt.end], ":")
             }
             if !prev_dot and next_dot {
                 var probe: String = string_new()      // is this ident an import binding?
@@ -26686,7 +26690,41 @@ fn ml_rewrite(mut m: Ml, mi: usize, mut sb2: String, mut it: Interner, kwcount: 
                     continue
                 }
             }
-            if !prev_dot {
+            // `ident :` is never a USE of a top-level name -- it is a binder. Struct,
+            // record, union and enum-payload FIELD declarations, function parameters,
+            // `let`/`var` bindings and struct-LITERAL field names all have that shape, and
+            // none of them refers to the module-level declaration whose name they happen
+            // to share. Renaming them was the loader's remaining collision bug:
+            //
+            //   `std/sysdir` declares `pub fn open` AND a `Dir` field `open: bool`.
+            //   `std/file` also declares `pub fn open`, so `open` collides and is renamed.
+            //   `d.open` is `.`-preceded and was correctly left alone -- but the field
+            //   DECLARATION and every `Dir{ …, open: false }` literal were rewritten to
+            //   `open__m3`, so the struct became self-consistent under a name none of its
+            //   seven accessors used. `jestyrc` built the same program; `jc` reported
+            //   seven "type error at this expression" inside a module the user never
+            //   edited.
+            //
+            // The repository recorded this as "the rename rewrites the FIELD ACCESS too".
+            // Measured, it is the inverse: the accesses are the only sites that survive.
+            // That is why the fix is one more token-level exclusion and not a scheme for
+            // telling `mod.item` from a field access -- the `.`-preceded half already
+            // worked.
+            //
+            // **`const NAME: T = v` is the one exception, and leaving it out broke
+            // `test_demo` immediately.** A `const` IS a top-level name -- `std/test` and
+            // `std/cli` both declare `BACKSLASH`, so it collides and its bare uses are
+            // renamed -- and its declaration is the only top-level form spelled
+            // `ident :`. Excluding it unrenamed the DECLARATION while every use kept the
+            // new name, which is precisely the bug above with the two halves swapped:
+            // `j_BACKSLASH__m1 undeclared`, plus a redefinition of the un-renamed one.
+            // `distinct Name = Ty` needs no such carve-out because it spells `=`.
+            //
+            // The A/B over every multi-module corpus program is what caught it: 43 built
+            // before, 46 after -- and `test_demo` moved from BUILD_OK to FAIL in the same
+            // run, which is why `jc_build_matrix` is a two-directional expectations file
+            // rather than a count.
+            if !prev_dot and (!next_colon or prev_const) {
                 if ml_is_collision(ren, stem, tx) {   // an own colliding name at a bare use
                     string_push(sb2, src[cur .. t.start])
                     string_push(sb2, tx)

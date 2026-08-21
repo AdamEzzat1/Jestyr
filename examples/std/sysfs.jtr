@@ -1,0 +1,579 @@
+// std/sysfs.jtr — the filesystem operations that are not ISO C, and the platform's own
+// reason when one of them refuses.
+//
+// TIER: `sys`. The rule, restated because this is the module it was written for:
+//
+//   **`std` gives portable behavior. `sys` exposes platform-shaped facts.**
+//
+// `std/fs` answers `bool`. That is the correct answer at its tier — a portable wrapper
+// cannot say *why* without inventing a portable reason — and it is not enough to act on.
+// "Could not create the directory" is four different problems (it is already there, the
+// parent is missing, the volume is full, you may not) and each one is a different next
+// move. This module returns the platform's own number, and `std/syserr` turns it into a
+// portable category without throwing the number away.
+//
+// ─── What is here, and what deliberately is not ───────────────────────────────
+//
+// Here: create/remove a directory, replace-rename, metadata, canonical path, temp
+// directory. Every one of them is a thing ISO C cannot do or cannot do the same way
+// twice, which is exactly the admission criterion.
+//
+// NOT here: directory listing (that is `std/sysdir`, which came first), traversal (that
+// is `std/walk`, which is `std` because ORDER is a portability decision), and reading or
+// writing file contents (ISO C, so `std/file`).
+//
+// ─── Modification time is NOT in this slice, and the reason is a number ───────
+//
+// `mtime` is the field a build daemon actually wants, and it is the one field here that
+// cannot be had without reading `struct stat` at a hard-coded byte offset. That offset is
+// not portable in the way `std/sysdir`'s `D_NAME_OFFSET` is not portable — it is worse:
+//
+//   st_mtim.tv_sec    Linux x86-64   88     Linux aarch64   88     macOS   48
+//   st_mode           Linux x86-64   24     Linux aarch64   16     macOS    4
+//
+// `D_NAME_OFFSET` is wrong on exactly one platform and is asserted by a test the Linux CI
+// job runs. `st_mode` is wrong on an ARCHITECTURE that no CI runner here uses, and a wrong
+// `st_mode` reads a `uid` and reports a plausible file type. So the same discipline does
+// not transfer, and shipping it would be the untested-branch failure `std/sysdir`'s header
+// argues against.
+//
+// Everything in this module is therefore obtained WITHOUT reading a foreign struct's
+// interior. When `mtime` lands it should bring `stat` with it, behind a runtime check
+// that validates the offsets against a portable oracle rather than a comment.
+//
+// ─── The cost `metadata` makes visible instead of hiding ──────────────────────
+//
+// Windows answers "what kind of thing is this" in ONE call: `GetFileAttributesA` returns
+// a bitmask. POSIX has no equivalent that does not go through `struct stat`, so the POSIX
+// branch answers it by TRYING: `access` for existence, then an `opendir` that succeeds
+// only for a directory, then an `fopen` for the size.
+//
+// That asymmetry is not papered over, because it is a real cost difference a caller
+// walking ten thousand entries needs to know about — up to three syscalls per entry on
+// POSIX against one plus an open on Windows. Erasing it behind a uniform `metadata` that
+// looked equally cheap on both is exactly the "nice API that erases cost" this tier is
+// supposed to refuse.
+//
+// ─── Every operation returns a `bool`, and one of them means nothing ──────────
+//
+// **This is a language limitation, named rather than dressed up.** A fallible Jestyr
+// function must declare a return type: `fn f(…) !{ E }` with none lowers to a result
+// struct with no ok field, which the C backend now refuses outright (it used to reach gcc
+// and miscompile the *success* path). So an operation whose natural signature is "does a
+// thing or fails" has to answer something.
+//
+// Two of the three found an honest answer and are better for it:
+//
+//   `make_dir`   → true if THIS CALL created it, false if it was already a directory.
+//   `remove_dir` → true if THIS CALL removed it, false if it was already absent.
+//
+// Both make the operation idempotent, which is what every caller wanted anyway: an
+// `EEXIST` on a directory you were trying to create is information, not a failure.
+//
+// The third did not:
+//
+//   `rename_replace` → true if the destination existed immediately before the rename.
+//
+// That one is a REPORT and it races: another process may create the destination between
+// the probe and the rename, in which case the report says `false` and the rename replaces
+// anyway. The rename itself is unaffected — only the reported bool can be stale. It is
+// documented here rather than quietly returning a constant `true`.
+//
+// **When `JestyrResult_unit` lowering lands, `rename_replace` should lose its bool and
+// its probe.** That is the note to invert; `make_dir` and `remove_dir` should keep theirs.
+//
+// ─── What `rename_replace` actually proves ────────────────────────────────────
+//
+// Not durability. It proves that the destination NAME refers to the new contents, and
+// that no reader ever saw a partially written file under that name. It does NOT prove the
+// bytes reached stable storage: neither platform flushes the file's data as a consequence
+// of renaming it, and a power cut can leave the name pointing at a file whose blocks were
+// never written. Durability needs an `fsync` this module does not yet bind.
+//
+// It is also not atomic ACROSS FILESYSTEMS. POSIX `rename` fails with `EXDEV` and Windows
+// `MoveFileExA` without `MOVEFILE_COPY_ALLOWED` fails too; both surface as the
+// `SYSERR_CROSS_DEVICE` category, and the copy fallback is deliberately not taken here
+// because a copy is not atomic and pretending otherwise is the exact overclaim this tier
+// is meant to avoid.
+//
+// ─── The capability, and why refusal is a TYPE here and a COUNT in `std/fs` ───
+//
+// `fs.Fs` is reused rather than a second capability type invented. It is a POLICY value —
+// three states over read and mutate — and threading one handle through `std/fs`,
+// `std/walk` and this module is worth more than tier purity. `sysfs` importing `std/fs`
+// is a dependency on that policy, not on portable behavior.
+//
+// A refusal here is a typed error (`SysFsRefused`), not a counter bump. `std/fs` counts
+// because its operations answer `bool` and a count is the only way to tell "respected the
+// capability" from "never tried". These operations answer with an error UNION, so the
+// discrimination is in the type, which is strictly better — and `fs.Fs`'s counters are
+// private to `std/fs`, so a count here would mean widening that module's surface to
+// duplicate information the type already carries. `fs.refused(f)` therefore does NOT move
+// when `sysfs` refuses; the test asserts on the error member instead.
+//
+// Worked example:  examples/std/sysfs_demo.jtr
+// Run the tests:   jestyrc test examples/std/sysfs_test.jtr
+
+import "syserr"
+import "cstring"
+import "sysdir"
+import "file"
+import "fs"
+import "env"
+import "str"
+
+// ---- POSIX bindings -----------------------------------------------------------
+//
+// All five are header-declared, so no prototype is emitted and the platform's own
+// declaration — including glibc's versioning and attributes — is what applies.
+
+@cfg(posix) extern "sys/stat.h" fn mkdir(path: cstr, mode: u32) -> i32
+@cfg(posix) extern "unistd.h" fn rmdir(path: cstr) -> i32
+@cfg(posix) extern "unistd.h" fn access(path: cstr, mode: i32) -> i32
+@cfg(posix) extern "stdio.h" fn rename(from: cstr, to: cstr) -> i32
+@cfg(posix) extern "stdlib.h" fn realpath(path: cstr, resolved: cptr) -> cptr
+
+// ---- Windows bindings ---------------------------------------------------------
+
+@cfg(windows) extern "windows.h" fn CreateDirectoryA(path: cstr, sa: cptr) -> i32
+@cfg(windows) extern "windows.h" fn RemoveDirectoryA(path: cstr) -> i32
+@cfg(windows) extern "windows.h" fn MoveFileExA(from: cstr, to: cstr, flags: u32) -> i32
+@cfg(windows) extern "windows.h" fn GetFileAttributesA(path: cstr) -> i32
+@cfg(windows) extern "windows.h" fn GetFullPathNameA(path: cstr, len: u32, buf: cptr, part: cptr) -> u32
+
+// ---- file kinds ---------------------------------------------------------------
+//
+// Four, and `SYSFS_FT_OTHER` is load-bearing rather than a fallback for laziness: a FIFO,
+// a device node and a socket all exist, are not directories, and cannot be sized. Calling
+// them files would make `bytes` a lie for each of them.
+
+pub const SYSFS_FT_MISSING: i32 = 0
+pub const SYSFS_FT_FILE: i32 = 1
+pub const SYSFS_FT_DIR: i32 = 2
+pub const SYSFS_FT_OTHER: i32 = 3
+
+// The longest path either platform will hand back. Linux `PATH_MAX` is 4096 and macOS's
+// is 1024, so this is the larger of the two and safe for both; Windows paths without the
+// `\\?\` prefix are capped at 260 but `GetFullPathNameA` is given the real buffer size.
+const SYSFS_PATH_CAP: usize = 4096
+
+// POSIX `access` mode bit for "does it exist at all".
+const SYSFS_F_OK: i32 = 0
+
+// `mkdir`'s mode, 0o777. The process umask masks it down, which is the POSIX convention
+// and the reason this is not 0o755: choosing the stricter value here would silently
+// override a umask the operator set on purpose.
+const SYSFS_MKDIR_MODE: u32 = 511
+
+// Win32. `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` — the second asks the
+// rename itself to reach the disk before returning, which is as close to durable as a
+// rename gets on either platform and is still NOT a promise about the file's contents.
+// `MOVEFILE_COPY_ALLOWED` is deliberately absent; see the header on cross-filesystem.
+const SYSFS_MOVE_REPLACE_WRITETHROUGH: u32 = 9
+const SYSFS_FILE_ATTRIBUTE_DIRECTORY: i32 = 16
+// `INVALID_FILE_ATTRIBUTES` is `(DWORD)-1`; bound as `i32`, that is -1.
+const SYSFS_INVALID_ATTRS: i32 = 0 - 1
+
+// POSIX `EINVAL`, the code reported for a path this module refuses before it reaches the
+// platform. Spelled as the platform's own number rather than a private sentinel so
+// `syserr.category` classifies it like any other failure instead of needing a special case.
+const SYSFS_EINVAL: i32 = 22
+// Win32 `ERROR_INVALID_NAME`, the same refusal in the other numbering.
+const SYSFS_ERROR_INVALID_NAME: i32 = 123
+
+// What is known about a path, without reading any foreign struct's interior.
+//
+// `@copy`: an integer and a length. `bytes` is 0 for a directory on BOTH platforms — not
+// because they agree (Windows reports 0 and POSIX reports a block count) but because a
+// directory's byte size means nothing portable and reporting either platform's answer
+// would invite a caller to sum it.
+@copy pub struct Meta {
+    pub ftype: i32,
+    pub bytes: u64,
+}
+
+// The value for a path that is not there.
+//
+// It exists because a module-qualified struct LITERAL does not parse (`sysfs.Meta{ … }`
+// from another file is a parse error, though `sysfs.Meta` in type position is fine), so a
+// `pub struct` a caller is expected to build needs an exported constructor. Every `catch`
+// fallback in a caller wants exactly this value, which is why it is the one provided
+// rather than a general `meta(ftype, bytes)`: a caller has no business inventing a size.
+@no_alloc @no_os pub fn missing() -> Meta {
+    return Meta{ ftype: SYSFS_FT_MISSING, bytes: 0 }
+}
+
+@no_alloc @no_os pub fn is_dir(read m: Meta) -> bool {
+    return m.ftype == SYSFS_FT_DIR
+}
+
+@no_alloc @no_os pub fn is_file(read m: Meta) -> bool {
+    return m.ftype == SYSFS_FT_FILE
+}
+
+// ---- shared helpers -----------------------------------------------------------
+
+// The refusal this module reports before touching the platform. An interior NUL truncates
+// the path at the C boundary, so `mkdir("a\0/../etc")` would create `a` — a security
+// answer wearing a correctness costume, and the same refusal `std/sysdir` and
+// `std/file.open_path` make.
+@cfg(posix) @no_alloc @no_os fn bad_path_code() -> i32 {
+    return SYSFS_EINVAL
+}
+
+@cfg(windows) @no_alloc @no_os fn bad_path_code() -> i32 {
+    return SYSFS_ERROR_INVALID_NAME
+}
+
+// Copy a NUL-terminated C buffer into an owned `String`, bounded by `cap` so a buffer the
+// platform did not terminate cannot run off the end.
+//
+// It COPIES rather than returning a view, and that is not incidental: every caller frees
+// the buffer immediately afterwards, so a `str` borrowing it would dangle. The same shape
+// as `std/sysdir`'s `name_at`, with the ownership the other direction.
+fn owned_from_nul(p: *mut u8, cap: usize) -> String {
+    var n: usize = 0
+    for n < cap {
+        var b: u8 = 0
+        unsafe { b = (p + n).* }
+        if (b as i32) == 0 { break }
+        n = n + 1
+    }
+    let sl: []u8 = slice(u8, p, n)
+    let v: str = from_utf8(sl)
+    var s: String = string_new()
+    string_push(s, v)
+    return s
+}
+
+// ---- metadata -----------------------------------------------------------------
+
+// What `path` is, and how big it is if that is a meaningful question.
+//
+// A missing path is an ERROR rather than `SYSFS_FT_MISSING`, because the platform
+// distinguishes "there is nothing there" from "you are not allowed to look" and collapsing
+// them would throw away the difference this module exists to preserve. `SYSFS_FT_MISSING`
+// is the value a caller stores for an absent entry it already knows about, not an answer
+// this function returns.
+@cfg(posix) pub fn metadata(mut f: fs.Fs, read a: Allocator, read path: str) -> Meta !{ SysFsFailed(i32), SysFsRefused } {
+    if fs.can_read(f) == false { return err(SysFsRefused) }
+    if cstring.has_interior_nul(path) { return err(SysFsFailed(bad_path_code())) }
+
+    // Existence first, and the errno is read BEFORE the `CString` is freed. `free` is not
+    // required to preserve `errno` on every libc, so anything between the failing call and
+    // the read is a chance to lose the reason.
+    var c: CString = cstring.from_str(a, path)
+    let rc: i32 = access(cstring.as_cstr(c), SYSFS_F_OK)
+    var code: i32 = 0
+    if rc != 0 { code = syserr.last_raw() }
+    cstring.free(c)
+    if rc != 0 { return err(SysFsFailed(code)) }
+
+    // Directory? The only portable POSIX test that does not read `struct stat` is to open
+    // it as one. `opendir` on a regular file fails with `ENOTDIR`, which is precisely the
+    // answer wanted, and the failure is discarded rather than reported: existence is
+    // already established, so a failure here means "not a directory" and nothing else.
+    var d: sysdir.Dir = sysdir.open(a, path)
+    if sysdir.is_open(d) {
+        sysdir.close(d)
+        return ok(Meta{ ftype: SYSFS_FT_DIR, bytes: 0 })
+    }
+
+    return ok(sized_or_other(a, path))
+}
+
+@cfg(windows) pub fn metadata(mut f: fs.Fs, read a: Allocator, read path: str) -> Meta !{ SysFsFailed(i32), SysFsRefused } {
+    if fs.can_read(f) == false { return err(SysFsRefused) }
+    if cstring.has_interior_nul(path) { return err(SysFsFailed(bad_path_code())) }
+
+    // One call answers existence AND kind, which is the whole asymmetry the header names.
+    var c: CString = cstring.from_str(a, path)
+    let at: i32 = GetFileAttributesA(cstring.as_cstr(c))
+    var code: i32 = 0
+    if at == SYSFS_INVALID_ATTRS { code = syserr.last_raw() }
+    cstring.free(c)
+    if at == SYSFS_INVALID_ATTRS { return err(SysFsFailed(code)) }
+
+    if (at & SYSFS_FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        return ok(Meta{ ftype: SYSFS_FT_DIR, bytes: 0 })
+    }
+
+    return ok(sized_or_other(a, path))
+}
+
+// A path already known to exist and not to be a directory: size it if it can be sized.
+//
+// Unguarded, because it is ISO C on both platforms — `fopen`/`fseek`/`ftell` through
+// `std/file`. Something that exists, is not a directory, and cannot be opened for reading
+// is a device, a FIFO or a socket, and `SYSFS_FT_OTHER` is the honest answer for all three.
+fn sized_or_other(read a: Allocator, read path: str) -> Meta {
+    var r: file.Reader = file.open_path(a, path)
+    if file.is_open(r) == false {
+        return Meta{ ftype: SYSFS_FT_OTHER, bytes: 0 }
+    }
+    let n: i64 = file.size(r)
+    file.close(r)
+    // A negative size means `ftell` could not answer — an unseekable stream, which is
+    // exactly the `OTHER` case again rather than a file of unknown length.
+    if n < 0 {
+        return Meta{ ftype: SYSFS_FT_OTHER, bytes: 0 }
+    }
+    return Meta{ ftype: SYSFS_FT_FILE, bytes: n as u64 }
+}
+
+// Does `path` exist at all? The question `metadata` answers with an error, asked in the
+// form that does not need one — for the many callers whose next move does not depend on
+// why it is absent.
+pub fn exists(mut f: fs.Fs, read a: Allocator, read path: str) -> bool {
+    let m: Meta = metadata(f, a, path) catch Meta{ ftype: SYSFS_FT_MISSING, bytes: 0 }
+    return m.ftype != SYSFS_FT_MISSING
+}
+
+// ---- creating and removing directories -----------------------------------------
+
+// Create the directory `path`. **True if this call created it**, false if it was already
+// a directory — see the header on why that is the return value.
+//
+// Only the PARENT's existence is assumed; this is one level, not `mkdir -p`. A recursive
+// form belongs above this, in `std`, where the path-splitting decision lives.
+@cfg(posix) pub fn make_dir(mut f: fs.Fs, read a: Allocator, read path: str) -> bool !{ SysFsFailed(i32), SysFsRefused } {
+    if fs.can_write(f) == false { return err(SysFsRefused) }
+    if cstring.has_interior_nul(path) { return err(SysFsFailed(bad_path_code())) }
+
+    var c: CString = cstring.from_str(a, path)
+    let rc: i32 = mkdir(cstring.as_cstr(c), SYSFS_MKDIR_MODE)
+    var code: i32 = 0
+    if rc != 0 { code = syserr.last_raw() }
+    cstring.free(c)
+    if rc == 0 { return ok(true) }
+    return already_a_directory(f, a, path, code)
+}
+
+@cfg(windows) pub fn make_dir(mut f: fs.Fs, read a: Allocator, read path: str) -> bool !{ SysFsFailed(i32), SysFsRefused } {
+    if fs.can_write(f) == false { return err(SysFsRefused) }
+    if cstring.has_interior_nul(path) { return err(SysFsFailed(bad_path_code())) }
+
+    var c: CString = cstring.from_str(a, path)
+    // Win32 BOOL: zero is failure. The second argument is a `SECURITY_ATTRIBUTES*`, and
+    // null means "inherit the parent's" — the only choice with a portable meaning.
+    let rc: i32 = CreateDirectoryA(cstring.as_cstr(c), null)
+    var code: i32 = 0
+    if rc == 0 { code = syserr.last_raw() }
+    cstring.free(c)
+    if rc != 0 { return ok(true) }
+    return already_a_directory(f, a, path, code)
+}
+
+// The shared "it already exists" arm, and it checks rather than assumes.
+//
+// `EEXIST` / `ERROR_ALREADY_EXISTS` says the NAME is taken; it does not say by what. A
+// `make_dir` that reported success because a regular FILE was sitting at the path would
+// hand the caller a directory that is not there, and the next write into it would fail
+// somewhere far away with a much worse diagnostic. So the name is inspected, and only a
+// real directory turns the error into `false`.
+fn already_a_directory(mut f: fs.Fs, read a: Allocator, read path: str, code: i32) -> bool !{ SysFsFailed(i32), SysFsRefused } {
+    if syserr.category(code, syserr.host_plat()) != SYSERR_EXISTS {
+        return err(SysFsFailed(code))
+    }
+    let m: Meta = metadata(f, a, path)?
+    if is_dir(m) { return ok(false) }
+    return err(SysFsFailed(code))
+}
+
+// Remove the empty directory `path`. **True if this call removed it**, false if it was
+// already absent. A non-empty directory is an error, categorized `SYSERR_NOT_EMPTY` on
+// both platforms from two different raw numbers (POSIX `ENOTEMPTY`, Win32
+// `ERROR_DIR_NOT_EMPTY`) — which is the clearest demonstration in this module of what the
+// category layer buys.
+//
+// It does NOT recurse. Deleting a tree is a traversal, and traversal order is a
+// portability decision that belongs to `std/walk`.
+@cfg(posix) pub fn remove_dir(mut f: fs.Fs, read a: Allocator, read path: str) -> bool !{ SysFsFailed(i32), SysFsRefused } {
+    if fs.can_write(f) == false { return err(SysFsRefused) }
+    if cstring.has_interior_nul(path) { return err(SysFsFailed(bad_path_code())) }
+
+    var c: CString = cstring.from_str(a, path)
+    let rc: i32 = rmdir(cstring.as_cstr(c))
+    var code: i32 = 0
+    if rc != 0 { code = syserr.last_raw() }
+    cstring.free(c)
+    if rc == 0 { return ok(true) }
+    return absent_already(code)
+}
+
+@cfg(windows) pub fn remove_dir(mut f: fs.Fs, read a: Allocator, read path: str) -> bool !{ SysFsFailed(i32), SysFsRefused } {
+    if fs.can_write(f) == false { return err(SysFsRefused) }
+    if cstring.has_interior_nul(path) { return err(SysFsFailed(bad_path_code())) }
+
+    var c: CString = cstring.from_str(a, path)
+    let rc: i32 = RemoveDirectoryA(cstring.as_cstr(c))
+    var code: i32 = 0
+    if rc == 0 { code = syserr.last_raw() }
+    cstring.free(c)
+    if rc != 0 { return ok(true) }
+    return absent_already(code)
+}
+
+// "Already gone" is success-with-nothing-done; every other reason is a failure.
+//
+// Unlike `already_a_directory` this needs no second look: `ENOENT` means the name resolves
+// to nothing, and there is no kind of thing it could have been instead.
+@no_os fn absent_already(code: i32) -> bool !{ SysFsFailed(i32), SysFsRefused } {
+    if syserr.category(code, syserr.host_plat()) == SYSERR_NOT_FOUND {
+        return ok(false)
+    }
+    return err(SysFsFailed(code))
+}
+
+// ---- rename ---------------------------------------------------------------------
+
+// Move `from` onto `to`, replacing whatever is at `to`. **True if `to` existed
+// immediately before** — a report, and a racy one; see the header.
+//
+// Read the header on what this proves before relying on it: the name flips atomically,
+// the bytes are not promised to be on the disk.
+@cfg(posix) pub fn rename_replace(mut f: fs.Fs, read a: Allocator, read from: str, read to: str) -> bool !{ SysFsFailed(i32), SysFsRefused } {
+    if fs.can_write(f) == false { return err(SysFsRefused) }
+    if cstring.has_interior_nul(from) { return err(SysFsFailed(bad_path_code())) }
+    if cstring.has_interior_nul(to) { return err(SysFsFailed(bad_path_code())) }
+
+    let had: bool = exists(f, a, to)
+    var cf: CString = cstring.from_str(a, from)
+    var ct: CString = cstring.from_str(a, to)
+    // POSIX `rename` replaces silently and atomically within one filesystem. No flag, and
+    // no way to ask it NOT to — which is why the "did it exist" question needs a probe.
+    let rc: i32 = rename(cstring.as_cstr(cf), cstring.as_cstr(ct))
+    var code: i32 = 0
+    if rc != 0 { code = syserr.last_raw() }
+    cstring.free(cf)
+    cstring.free(ct)
+    if rc != 0 { return err(SysFsFailed(code)) }
+    return ok(had)
+}
+
+@cfg(windows) pub fn rename_replace(mut f: fs.Fs, read a: Allocator, read from: str, read to: str) -> bool !{ SysFsFailed(i32), SysFsRefused } {
+    if fs.can_write(f) == false { return err(SysFsRefused) }
+    if cstring.has_interior_nul(from) { return err(SysFsFailed(bad_path_code())) }
+    if cstring.has_interior_nul(to) { return err(SysFsFailed(bad_path_code())) }
+
+    let had: bool = exists(f, a, to)
+    var cf: CString = cstring.from_str(a, from)
+    var ct: CString = cstring.from_str(a, to)
+    // Plain `MoveFileA` REFUSES an existing destination, which is the divergence from
+    // POSIX that makes this a `sys` operation rather than an ISO C `rename` call.
+    let rc: i32 = MoveFileExA(cstring.as_cstr(cf), cstring.as_cstr(ct), SYSFS_MOVE_REPLACE_WRITETHROUGH)
+    var code: i32 = 0
+    if rc == 0 { code = syserr.last_raw() }
+    cstring.free(cf)
+    cstring.free(ct)
+    if rc == 0 { return err(SysFsFailed(code)) }
+    return ok(had)
+}
+
+// ---- canonical paths --------------------------------------------------------------
+
+// The absolute, lexically normalized form of `path`. The caller owns the result and
+// `string_free`s it.
+//
+// **The two platforms do not compute the same thing, and this is the divergence to know
+// about in this module.** POSIX `realpath` resolves every symbolic link along the way;
+// Windows `GetFullPathNameA` is purely lexical and resolves none. So on a tree containing
+// symlinks the two answers differ, and no amount of wrapping makes them agree — resolving
+// links on Windows needs a `GetFinalPathNameByHandleW` on an OPEN handle, which is a
+// different operation with different failure modes and different permissions.
+//
+// What IS made uniform is existence: POSIX `realpath` requires the path to exist and
+// Windows does not, so this probes first and both platforms report `SYSERR_NOT_FOUND` for
+// an absent path. Leaving that divergence in place would be the worse trap of the two,
+// because it makes the same call succeed on one platform and fail on the other for a
+// program that never mentions symlinks.
+@cfg(posix) pub fn canonical(mut f: fs.Fs, read a: Allocator, read path: str) -> String !{ SysFsFailed(i32), SysFsRefused } {
+    if fs.can_read(f) == false { return err(SysFsRefused) }
+    if cstring.has_interior_nul(path) { return err(SysFsFailed(bad_path_code())) }
+
+    var buf: *mut u8 = alloc(u8, SYSFS_PATH_CAP)
+    var c: CString = cstring.from_str(a, path)
+    // The caller-buffer form rather than `realpath(p, NULL)`: the NULL form returns a
+    // `malloc`ed pointer that must be handed back to C's `free`, and binding `free` in a
+    // tree whose modules already spell `cstring.free` and `free_ptr` is a name collision
+    // waiting to be found by someone else.
+    let got: cptr = realpath(cstring.as_cstr(c), buf as cptr)
+    var code: i32 = 0
+    if got == null { code = syserr.last_raw() }
+    cstring.free(c)
+    if got == null {
+        free_ptr(buf)
+        return err(SysFsFailed(code))
+    }
+    var s: String = owned_from_nul(buf, SYSFS_PATH_CAP)
+    free_ptr(buf)
+    return ok(s)
+}
+
+@cfg(windows) pub fn canonical(mut f: fs.Fs, read a: Allocator, read path: str) -> String !{ SysFsFailed(i32), SysFsRefused } {
+    if fs.can_read(f) == false { return err(SysFsRefused) }
+    if cstring.has_interior_nul(path) { return err(SysFsFailed(bad_path_code())) }
+
+    // `GetFullPathNameA` succeeds on a path that does not exist, so existence is checked
+    // first to match POSIX. `metadata`'s error is PROPAGATED unchanged — which is the whole
+    // mechanism: an absent path reports `SYSERR_NOT_FOUND` here because it reported it
+    // there, rather than because this function invented a second not-found answer.
+    //
+    // The result is deliberately discarded: `?` is the check. `metadata` never yields
+    // `SYSFS_FT_MISSING` (a missing path is an error, not a kind), so a `ftype` test after
+    // this would be dead code implying otherwise.
+    let m: Meta = metadata(f, a, path)?
+
+    var buf: *mut u8 = alloc(u8, SYSFS_PATH_CAP)
+    var c: CString = cstring.from_str(a, path)
+    let n: u32 = GetFullPathNameA(cstring.as_cstr(c), SYSFS_PATH_CAP as u32, buf as cptr, null)
+    var code: i32 = 0
+    if n == 0 { code = syserr.last_raw() }
+    cstring.free(c)
+    if n == 0 {
+        free_ptr(buf)
+        return err(SysFsFailed(code))
+    }
+    var s: String = owned_from_nul(buf, SYSFS_PATH_CAP)
+    free_ptr(buf)
+    return ok(s)
+}
+
+// ---- the temporary directory ------------------------------------------------------
+
+// Where this process may write scratch files. The caller owns the result and
+// `string_free`s it. Never empty: both platforms fall back to a fixed location.
+//
+// **Answered through `env.Env` on BOTH platforms, on purpose.** Windows has
+// `GetTempPathA`, and it is not used, because what it does is read `TMP`, then `TEMP`,
+// then `USERPROFILE`, then give up on the Windows directory — the same environment
+// lookup, performed somewhere a `sealed()` capability cannot see. Going through the
+// capability instead means a test can seal the environment and get the documented
+// fallback deterministically, and it means the one function in this module that consults
+// process configuration says so in its signature.
+//
+// The trailing separator is NOT included, matching `std/path`'s convention that a
+// directory is named without one.
+@cfg(posix) pub fn temp_dir(mut e: env.Env) -> String {
+    var s: String = string_new()
+    let v: str = env.lookup(e, "TMPDIR")
+    if v.len > 0 {
+        string_push(s, str.strip_suffix(v, "/"))
+    } else {
+        string_push(s, "/tmp")
+    }
+    return s
+}
+
+@cfg(windows) pub fn temp_dir(mut e: env.Env) -> String {
+    var s: String = string_new()
+    var v: str = env.lookup(e, "TEMP")
+    if v.len == 0 { v = env.lookup(e, "TMP") }
+    if v.len > 0 {
+        string_push(s, str.strip_suffix(v, "\\"))
+    } else {
+        // The documented last resort, and it is the one Windows itself falls back to.
+        string_push(s, "C:\\Windows\\Temp")
+    }
+    return s
+}

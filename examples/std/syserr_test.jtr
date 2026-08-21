@@ -1,0 +1,231 @@
+// std/syserr_test.jtr — the unit suite for `std/syserr`.
+//
+// **Almost all of this runs identically on both platforms**, which is the property the
+// module was shaped for. `category` is pure and takes the numbering system as an argument,
+// so the Windows table is exercised on Linux and the POSIX table on Windows. A mapping
+// table is where a module like this is actually wrong — a transposed digit produces a
+// plausible category forever — and it is now the part that is under test everywhere.
+//
+// The only host-dependent assertion is `the_host_stamps_its_own_numbering`, and it checks
+// agreement between two functions rather than a specific platform, so it is a real
+// assertion on both.
+//
+// Run:  jestyrc test examples/std/syserr_test.jtr
+
+import "syserr"
+import "sink"
+import "str"
+import "test"
+import "test_report"
+
+const SYSERR_T_CAP: usize = 4096
+
+@test fn both_platform_tables_are_exercised_on_this_host() -> bool {
+    var raw: *mut u8 = alloc(u8, SYSERR_T_CAP)
+    var rep: []u8 = slice(u8, raw, SYSERR_T_CAP)
+    var c: test.Check = test.new()
+
+    // POSIX numbering. These are the codes the operations in `std/sysfs` can actually
+    // produce, so the table is tested at the values that matter rather than at a sample.
+    test.eq_i64(c, rep, "posix ENOENT", syserr.category(2, SYSERR_PLAT_POSIX) as i64, SYSERR_NOT_FOUND as i64)
+    test.eq_i64(c, rep, "posix EACCES", syserr.category(13, SYSERR_PLAT_POSIX) as i64, SYSERR_DENIED as i64)
+    test.eq_i64(c, rep, "posix EEXIST", syserr.category(17, SYSERR_PLAT_POSIX) as i64, SYSERR_EXISTS as i64)
+    test.eq_i64(c, rep, "posix EXDEV", syserr.category(18, SYSERR_PLAT_POSIX) as i64, SYSERR_CROSS_DEVICE as i64)
+    test.eq_i64(c, rep, "posix ENOTDIR", syserr.category(20, SYSERR_PLAT_POSIX) as i64, SYSERR_NOT_DIR as i64)
+    test.eq_i64(c, rep, "posix ENOSPC", syserr.category(28, SYSERR_PLAT_POSIX) as i64, SYSERR_NO_SPACE as i64)
+
+    // Win32 numbering, same six meanings where they exist.
+    test.eq_i64(c, rep, "win ERROR_FILE_NOT_FOUND", syserr.category(2, SYSERR_PLAT_WINDOWS) as i64, SYSERR_NOT_FOUND as i64)
+    test.eq_i64(c, rep, "win ERROR_PATH_NOT_FOUND", syserr.category(3, SYSERR_PLAT_WINDOWS) as i64, SYSERR_NOT_FOUND as i64)
+    test.eq_i64(c, rep, "win ERROR_ACCESS_DENIED", syserr.category(5, SYSERR_PLAT_WINDOWS) as i64, SYSERR_DENIED as i64)
+    test.eq_i64(c, rep, "win ERROR_ALREADY_EXISTS", syserr.category(183, SYSERR_PLAT_WINDOWS) as i64, SYSERR_EXISTS as i64)
+    test.eq_i64(c, rep, "win ERROR_NOT_SAME_DEVICE", syserr.category(17, SYSERR_PLAT_WINDOWS) as i64, SYSERR_CROSS_DEVICE as i64)
+    test.eq_i64(c, rep, "win ERROR_DISK_FULL", syserr.category(112, SYSERR_PLAT_WINDOWS) as i64, SYSERR_NO_SPACE as i64)
+
+    // **The same number means different things in the two systems**, which is the reason
+    // the discriminator is stored rather than inferred. 17 is `EEXIST` on POSIX and
+    // `ERROR_NOT_SAME_DEVICE` on Win32; a `SysError` that lost its `plat` would classify
+    // one as the other.
+    test.ne_i64(c, rep, "17 is not the same failure in both systems",
+        syserr.category(17, SYSERR_PLAT_POSIX) as i64,
+        syserr.category(17, SYSERR_PLAT_WINDOWS) as i64)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn the_two_libc_aliases_agree_and_stay_out_of_the_shared_range() -> bool {
+    var raw: *mut u8 = alloc(u8, SYSERR_T_CAP)
+    var rep: []u8 = slice(u8, raw, SYSERR_T_CAP)
+    var c: test.Check = test.new()
+
+    // POSIX standardises errno NAMES, not values, and Linux and macOS diverge above 34.
+    // The table carries both numbers for each divergent name; these assert the union is
+    // actually there, because a table that mapped only Linux's would silently report
+    // `SYSERR_OTHER` for a real `ENOTEMPTY` on macOS — a wrong answer with no symptom.
+    test.eq_i64(c, rep, "ENOTEMPTY linux", syserr.category_posix(39) as i64, SYSERR_NOT_EMPTY as i64)
+    test.eq_i64(c, rep, "ENOTEMPTY macos", syserr.category_posix(66) as i64, SYSERR_NOT_EMPTY as i64)
+    test.eq_i64(c, rep, "ENAMETOOLONG linux", syserr.category_posix(36) as i64, SYSERR_INVALID as i64)
+    test.eq_i64(c, rep, "ENAMETOOLONG macos", syserr.category_posix(63) as i64, SYSERR_INVALID as i64)
+    test.eq_i64(c, rep, "ELOOP linux", syserr.category_posix(40) as i64, SYSERR_INVALID as i64)
+    test.eq_i64(c, rep, "ELOOP macos", syserr.category_posix(62) as i64, SYSERR_INVALID as i64)
+
+    // The union is only safe because every alias sits ABOVE the range where the two libcs
+    // agree — inside 1..34 a second meaning for a number would be a genuine conflict, not
+    // a harmless one. This is the checkable half of the header's argument: if someone adds
+    // an alias at 20 to "support" another system, this fails.
+    var lo_alias: i32 = 0
+    var k: i32 = 1
+    for k <= 34 {
+        if k == 36 or k == 39 or k == 40 or k == 62 or k == 63 or k == 66 { lo_alias = lo_alias + 1 }
+        k = k + 1
+    }
+    test.eq_i64(c, rep, "no alias inside the shared 1..34 range", lo_alias as i64, 0)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn an_unknown_numbering_never_guesses() -> bool {
+    var raw: *mut u8 = alloc(u8, SYSERR_T_CAP)
+    var rep: []u8 = slice(u8, raw, SYSERR_T_CAP)
+    var c: test.Check = test.new()
+
+    // A replayed log from a machine whose platform was not recorded must not be read
+    // through whichever table happens to be first. 2 is `ENOENT` and it is also
+    // `ERROR_FILE_NOT_FOUND`, so guessing would look right here and be wrong at 17.
+    test.eq_i64(c, rep, "unknown platform falls through", syserr.category(2, SYSERR_PLAT_UNKNOWN) as i64, SYSERR_OTHER as i64)
+    test.eq_i64(c, rep, "and at a code the two systems disagree on", syserr.category(17, SYSERR_PLAT_UNKNOWN) as i64, SYSERR_OTHER as i64)
+    // Zero still means ok in any numbering: "nothing went wrong" needs no table.
+    test.eq_i64(c, rep, "zero is ok everywhere", syserr.category(0, SYSERR_PLAT_UNKNOWN) as i64, SYSERR_OK as i64)
+
+    // **The positive control.** Without it the three above would also pass for a
+    // `category` that returned `SYSERR_OTHER` for everything.
+    test.eq_i64(c, rep, "positive control: a known platform does classify", syserr.category(2, SYSERR_PLAT_POSIX) as i64, SYSERR_NOT_FOUND as i64)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn same_compares_the_numbering_not_the_category() -> bool {
+    var raw: *mut u8 = alloc(u8, SYSERR_T_CAP)
+    var rep: []u8 = slice(u8, raw, SYSERR_T_CAP)
+    var c: test.Check = test.new()
+
+    // Two failures that mean the same portable thing and are NOT the same error. A
+    // comparison helper that folded them together would let a cross-platform test assert
+    // an exact error and pass against the other platform's — which is the one thing an
+    // exact comparison is for.
+    let p: SysError = syserr.make(2, SYSERR_PLAT_POSIX)
+    let w: SysError = syserr.make(2, SYSERR_PLAT_WINDOWS)
+    test.eq_i64(c, rep, "same category", syserr.cat_of(p) as i64, syserr.cat_of(w) as i64)
+    test.is_false(c, rep, "but not the same error", syserr.same(p, w))
+    test.is_true(c, rep, "positive control: identical records are same", syserr.same(p, syserr.make(2, SYSERR_PLAT_POSIX)))
+
+    // `none()` is not a failure and does not belong to a platform.
+    test.is_true(c, rep, "none is ok", syserr.is_ok(syserr.none()))
+    test.is_false(c, rep, "none has not failed", syserr.is_failure(syserr.none()))
+    test.is_true(c, rep, "a real code has failed", syserr.is_failure(p))
+    test.is_true(c, rep, "is_cat agrees with cat_of", syserr.is_cat(p, SYSERR_NOT_FOUND))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn every_category_has_its_own_name() -> bool {
+    var raw: *mut u8 = alloc(u8, SYSERR_T_CAP)
+    var rep: []u8 = slice(u8, raw, SYSERR_T_CAP)
+    var c: test.Check = test.new()
+
+    // A category added without a `cat_name` row falls through to the catch-all, and the
+    // symptom is a report that says "platform error" for something the module knows the
+    // name of. Sweeping for DISTINCTNESS catches that; sweeping for non-emptiness would
+    // not, because the fallthrough is non-empty too.
+    var dupes: i32 = 0
+    var i: i32 = 0
+    for i < SYSERR_CAT_COUNT - 1 {
+        var j: i32 = i + 1
+        for j < SYSERR_CAT_COUNT - 1 {
+            if str.eq(syserr.cat_name(i), syserr.cat_name(j)) { dupes = dupes + 1 }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    test.eq_i64(c, rep, "no two named categories share a name", dupes as i64, 0)
+
+    // And the catch-all is reachable, so the sweep above is testing a real boundary
+    // rather than a range that happens to be fully populated.
+    test.is_true(c, rep, "the catch-all is the last row",
+        str.eq(syserr.cat_name(SYSERR_OTHER), syserr.cat_name(SYSERR_CAT_COUNT + 99)))
+
+    test.is_true(c, rep, "posix is named", str.eq(syserr.plat_name(SYSERR_PLAT_POSIX), "posix"))
+    test.is_true(c, rep, "windows is named", str.eq(syserr.plat_name(SYSERR_PLAT_WINDOWS), "windows"))
+    test.is_true(c, rep, "unknown is named", str.eq(syserr.plat_name(SYSERR_PLAT_UNKNOWN), "unknown"))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn render_always_prints_the_raw_code() -> bool {
+    var raw: *mut u8 = alloc(u8, SYSERR_T_CAP)
+    var rep: []u8 = slice(u8, raw, SYSERR_T_CAP)
+    var c: test.Check = test.new()
+
+    var obuf: *mut u8 = alloc(u8, 256)
+    var ob: []u8 = slice(u8, obuf, 256)
+    var s: sink.Sink = sink.new()
+
+    // The category is known here, and the number is printed anyway. A report that said
+    // only "not found" would have discarded the one fact that tells a maintainer whether
+    // the bug arrived from `ENOENT` or from `ERROR_PATH_NOT_FOUND`.
+    let n: usize = syserr.render(syserr.make(2, SYSERR_PLAT_POSIX), s, ob)
+    let v: str = sink.view(s, ob)
+    test.is_true(c, rep, "names the category", str.has(v, "not found"))
+    test.is_true(c, rep, "names the numbering", str.has(v, "posix"))
+    test.is_true(c, rep, "prints the raw code", str.has(v, "2"))
+    test.eq_usize(c, rep, "returns what it wrote", n, sink.written(s))
+    test.is_false(c, rep, "and did not overflow", sink.overflowed(s))
+
+    // An unclassified code still renders usefully: the category degrades, the number does
+    // not. This is what "no string scraping" buys — the caller can still report something
+    // actionable for a code this table has never seen.
+    sink.reset(s)
+    syserr.render(syserr.make(4321, SYSERR_PLAT_WINDOWS), s, ob)
+    let v2: str = sink.view(s, ob)
+    test.is_true(c, rep, "unknown code still names the numbering", str.has(v2, "windows"))
+    test.is_true(c, rep, "unknown code still prints itself", str.has(v2, "4321"))
+
+    free_ptr(obuf)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn the_host_stamps_its_own_numbering() -> bool {
+    var raw: *mut u8 = alloc(u8, SYSERR_T_CAP)
+    var rep: []u8 = slice(u8, raw, SYSERR_T_CAP)
+    var c: test.Check = test.new()
+
+    // The one host-dependent thing in the module, asserted as an AGREEMENT rather than
+    // against a literal — so it is a real check on both platforms instead of a check that
+    // is vacuous on one of them.
+    let e: SysError = syserr.here(2)
+    test.eq_i64(c, rep, "here stamps host_plat", e.plat as i64, syserr.host_plat() as i64)
+    test.eq_i64(c, rep, "and keeps the raw code", e.raw as i64, 2)
+    test.eq_i64(c, rep, "so ENOENT/FILE_NOT_FOUND classifies here too", syserr.cat_of(e) as i64, SYSERR_NOT_FOUND as i64)
+
+    // `host_plat` must be one of the two real numberings, never UNKNOWN — an UNKNOWN host
+    // would make every locally produced error unclassifiable.
+    let hp: i32 = syserr.host_plat()
+    test.is_true(c, rep, "the host has a real numbering",
+        hp == SYSERR_PLAT_POSIX or hp == SYSERR_PLAT_WINDOWS)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

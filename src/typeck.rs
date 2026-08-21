@@ -3587,7 +3587,31 @@ impl<'a> TypeChecker<'a> {
                     }
                 };
                 let Some(ok) = ok else {
+                    // **The degraded path still binds `e`.** `catch |e| …` binds the
+                    // binder — that is what the syntax says — and whether the base's type
+                    // could be RECOVERED has nothing to do with whether the name exists.
+                    // Inferring the fallback without it left `e` an unknown name typed
+                    // `?`, which cascades: a `match e { … }` extractor under an
+                    // unresolvable base reports a second, invented problem on top of the
+                    // real one.
+                    //
+                    // It is also where the reference and the port disagreed. `jestyr_
+                    // typeck_dump_matches_reference` runs over the WHOLE corpus with no
+                    // allowlist, and `examples/std/sysfs_test.jtr` is the first file to
+                    // put a `catch |e| match e { … }` on a fallible call into another
+                    // module: with imports unresolved the base degrades, the reference
+                    // typed `e` as `?` and the port typed it `error`. The port's answer is
+                    // the better one and this adopts it, so the two agree by fixing the
+                    // behaviour rather than by excluding the file.
+                    //
+                    // Scoped and popped exactly as the recovered path does, so the binder
+                    // cannot leak past the fallback.
+                    scope.push(HashMap::new());
+                    if let Some(b) = binder {
+                        scope.last_mut().unwrap().insert(b.name.clone(), Ty::Prim("error"));
+                    }
                     self.infer(scope, typ, self_ty, *fallback);
+                    scope.pop();
                     return self.set(id, Ty::Error);
                 };
                 // `catch |e| …`: the binder carries the opaque `error` type, in scope
@@ -6754,6 +6778,65 @@ mod tests {
         assert_eq!(d.len(), 1, "{d:?}");
         assert!(d[0].message.contains("`catch` needs a fallible expression"), "{:?}", d[0].message);
         assert!(d[0].message.contains("`i32`"), "the actual type must be named: {:?}", d[0].message);
+    }
+
+    /// **`catch |e|` binds `e` even when the base's type could not be recovered.**
+    ///
+    /// The binder exists because the syntax says so; whether the base resolved has nothing
+    /// to do with it. Inferring the fallback without it left `e` an unknown name typed
+    /// `?`, so a program with one real problem (the unresolvable callee) reported a second
+    /// invented one underneath it.
+    ///
+    /// It was also a reference/port divergence. `jestyr_typeck_dump_matches_reference` runs
+    /// the WHOLE corpus with no allowlist, and `examples/std/sysfs_test.jtr` — the first
+    /// file to put a `catch |e| match e { … }` on a fallible call into another module — hit
+    /// it: with imports unresolved the reference typed `e` as `?` while the port typed it
+    /// `error`. The port had the better answer; this adopts it.
+    #[test]
+    fn catch_binds_its_error_name_even_when_the_base_does_not_resolve() {
+        // The recorded TYPE of the binder use is what diverged, so it is what is asserted
+        // — a diagnostic-shaped assertion would not distinguish `?` from `error` here,
+        // because the degraded path reports nothing at all.
+        let ty_of_e = |src: &str| -> String {
+            let (ast, info) = analyze_full(src);
+            let mut seen: Option<String> = None;
+            for (id, ed) in ast.exprs.iter().enumerate() {
+                if let ExprKind::Name(n) = &ed.kind {
+                    if n.name == "e" {
+                        seen = Some(info.expr_types[id].display(&info.table));
+                    }
+                }
+            }
+            seen.expect("the fallback's `e` must be a recorded expression")
+        };
+
+        // `nope(1)` is unresolvable, so the catch degrades — and `e` is still the opaque
+        // `error` type rather than an unknown name.
+        assert_eq!(
+            ty_of_e("fn g() -> i32 { return nope(1) catch |e| e }"),
+            "error",
+            "the binder must be in scope and opaque even on the degraded path"
+        );
+
+        // The positive control: the same shape with a RESOLVABLE fallible base. Without it
+        // the assertion above would also pass for a checker that typed every `e` as
+        // `error` for reasons having nothing to do with the binder.
+        assert_eq!(
+            ty_of_e(
+                "fn f(n: i32) -> i32 !{ Bad } { return err(Bad) } \
+                 fn g() -> i32 { return f(1) catch |e| e }"
+            ),
+            "error",
+            "and the recovered path is unchanged"
+        );
+
+        // The anti-vacuity half: an `e` that is NOT a catch binder is not `error`, so
+        // `ty_of_e` is reading the binder rather than reporting a constant.
+        assert_eq!(
+            ty_of_e("fn g() -> i32 { let e: i32 = 1 return e }"),
+            "i32",
+            "`ty_of_e` reads the binding it is given"
+        );
     }
 
     /// The fallback is inferred against the ok type, so the one mismatch class this

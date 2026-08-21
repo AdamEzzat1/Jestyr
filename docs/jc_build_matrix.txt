@@ -1,0 +1,91 @@
+# jc_build_matrix.txt -- can the SELF-HOSTED compiler build every multi-module program in
+# the corpus? One line per `examples/std/*.jtr` that declares `fn main()` and has at least
+# one `import "..."`, sorted; `BUILD_OK` or `FAIL`.
+#
+# WHY THIS FILE EXISTS
+#
+# `jc build` is the only path that exercises the port's own module loader, and no gate
+# covered it. `selfhost_fixpoint_subset` `continue`s on any file containing `import "` by
+# construction, and `jestyr_cgen_matches_reference` feeds every file to both backends with
+# imports UNRESOLVED -- so a program could be byte-identity verified AND unbuildable, which
+# is exactly what nine of them were. The 2026-08-20 census audit recorded the hole and the
+# gate it owed; this is that gate.
+#
+# IT IS AN EXPECTATIONS FILE, NOT A GREEN/RED GATE, AND IT FAILS IN BOTH DIRECTIONS.
+# Four entries are FAIL today, and pretending otherwise would mean either a permanently red
+# suite or a silently shrinking one. A fix has to move a line here deliberately.
+#
+# The two-directional half is not theoretical: the loader fix that took this matrix from 43
+# BUILD_OK to 49 ALSO moved `test_demo` from BUILD_OK to FAIL on its first attempt, because
+# the new exclusion caught `const NAME: T` along with struct fields. Nothing else in the
+# tree would have noticed.
+#
+# THE FOUR REMAINING FAILURES ARE ONE MECHANISM, now isolated (the census recorded it as
+# "mechanism not isolated"): the port emits a generic typedef's NAME into a prototype
+# without emitting the typedef itself.
+#
+#   combinators  JestyrFn_fn_di32_ret_?          fn-pointer typedef, return mangled empty
+#   mutex        JestyrFn_fn_dptr_i64_ret_unit   fn-pointer typedef never defined
+#   slice_algos  JestyrFn_fn_ri32_ri32_ret_bool  same, with a `read` parameter
+#   try_read     JestyrResult_                   an UN-ANNOTATED `let ok = fs.try_read_text(p)`
+#                                                infers nothing, so the ok type mangles empty
+#
+# The first three are one def-emission gap: a fn-pointer instance reached only through the
+# flattened program is named but never emitted. `try_read` is the other half -- the port's
+# INFERENCE, not its emission. Annotating that `let` would work around it, and that is
+# deliberately NOT done, because the workaround would hide the gap this file records.
+#
+# Regenerate:  JC_BUILD_MATRIX=1 cargo test --release --features c-oracle jc_build_matrix
+BUILD_OK alloc_demo
+BUILD_OK args
+BUILD_OK binned
+BUILD_OK buildgraph_demo
+BUILD_OK caps_demo
+BUILD_OK census_cli
+BUILD_OK cgen
+BUILD_OK channel
+BUILD_OK cli_demo
+FAIL combinators
+BUILD_OK ctfe_cli
+BUILD_OK demo
+BUILD_OK deque_demo
+BUILD_OK deterministic
+BUILD_OK diag_demo
+BUILD_OK doc_cli
+BUILD_OK drop_named_type_param
+BUILD_OK env_demo
+BUILD_OK escape_cli
+BUILD_OK file_demo
+BUILD_OK files
+BUILD_OK float_bits
+BUILD_OK format_float
+BUILD_OK hashmap_demo
+BUILD_OK impl_body_calls
+BUILD_OK intern_demo
+BUILD_OK lexer
+FAIL mutex
+BUILD_OK numbers
+BUILD_OK numerics_canary
+BUILD_OK par_cost
+BUILD_OK par_for
+BUILD_OK par_for_simd
+BUILD_OK par_for_width
+BUILD_OK par_reduce
+BUILD_OK par_reduce_int
+BUILD_OK par_soac
+BUILD_OK parse_float
+BUILD_OK parser_cli
+BUILD_OK path_demo
+BUILD_OK process_demo
+BUILD_OK reductions
+BUILD_OK select
+FAIL slice_algos
+BUILD_OK str_demo
+BUILD_OK strmap_demo
+BUILD_OK sysfs_demo
+BUILD_OK test_demo
+BUILD_OK test_fixture_demo
+BUILD_OK time_demo
+FAIL try_read
+BUILD_OK typeck_cli
+BUILD_OK writer_demo

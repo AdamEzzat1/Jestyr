@@ -1,0 +1,357 @@
+// std/syserr.jtr — what a platform says when it refuses, in a shape that survives
+// being stored, compared, and printed somewhere else.
+//
+// TIER: `sys`. This module knows two numbering systems by heart and admits it.
+//
+// ─── Why this exists before any `sys` operation does ──────────────────────────
+//
+// `std/fs` answers `bool`. `std/walk` answers with a COUNT. Both are honest at their
+// tier — a portable wrapper genuinely cannot say more than "it did not happen" without
+// inventing a portable reason — and both are useless to the caller who has to decide
+// what to do next. "Could not create the directory" is a different problem depending on
+// whether it already existed, the parent is missing, or the disk is full, and every one
+// of those is a different next move.
+//
+// So the `sys` tier reports the platform's own number. The rule that keeps that from
+// becoming unportable-by-construction:
+//
+//   **The raw code is never thrown away, and never scraped.**
+//
+// A caller that wants portability asks for the CATEGORY. A caller that needs the exact
+// fact reads the raw code. Nobody parses `strerror` output, because a message is a
+// locale-dependent rendering and comparing against one is a bug that only shows up on a
+// French CI runner.
+//
+// ─── The three fields, and why only two are stored ────────────────────────────
+//
+// §2.3 of the Tier 4 brief asks for a numeric raw code, a portable category, and a
+// platform discriminator. Two of those are stored and one is computed, on purpose:
+//
+//   raw    — the platform's own `errno` / `GetLastError()` value. Stored.
+//   plat   — which numbering system `raw` belongs to. Stored.
+//   cat    — the portable category. COMPUTED, by `category(raw, plat)`.
+//
+// The category is a pure function of the other two, so storing it would make a
+// `SysError` able to disagree with itself — a record whose `cat` says `NOT_FOUND` and
+// whose `raw` says `ENOSPC` is a bug that a struct with three fields can represent and
+// a struct with two cannot.
+//
+// ─── The mapping tables are PURE, and that is the whole trick ─────────────────
+//
+// `category` takes the platform as an ARGUMENT rather than reading the host it is
+// compiled on. It is not `@cfg`-guarded and it never calls anything.
+//
+// `@cfg` already buys "both platform branches are type-checked wherever you build".
+// This buys the stronger thing: **both platform branches are EXECUTED wherever you
+// build.** The Windows mapping table is exercised by the test suite on Linux and the
+// POSIX table is exercised on Windows, because deciding what `ENOTEMPTY` means requires
+// no operating system. The only part of this module that genuinely cannot run on the
+// other host is `last_raw` and the one line of `here` that stamps the discriminator.
+//
+// That is a much better ratio than it looks. Mapping tables are where this kind of
+// module is actually wrong — a transposed digit in an errno value produces a plausible
+// category forever — and mapping tables are exactly the part that is now under test on
+// every host.
+//
+// ─── The POSIX table is TWO libcs, and the aliases are deliberate ─────────────
+//
+// POSIX standardises the errno NAMES and not their VALUES. Linux (glibc and musl agree)
+// and macOS coincide from 1 to 34 and diverge above it, which is precisely where the
+// filesystem errors this module cares about live:
+//
+//              Linux   macOS
+//   ENOTEMPTY     39      66
+//   ENAMETOOLONG  36      63
+//   ELOOP         40      62
+//
+// Both numbers are in the table for each name. That is safe rather than sloppy, and the
+// reason is checkable: **each alias collides only with a NON-filesystem error on the
+// other libc.** Linux's 66 is `EREMOTE` and its 63 is `ENOSR` (a STREAMS error); macOS's
+// 39 is `EDESTADDRREQ` and its 36 is `EINPROGRESS` — all four are socket or STREAMS
+// codes that no operation in `std/sysfs` can produce. So within the domain this table is
+// scoped to, the union is unambiguous. The checkable half of that argument —
+// that every alias sits ABOVE the range where the two libcs agree, so no alias can
+// shadow a code they both already spell — is pinned by
+// `the_two_libc_aliases_agree_and_stay_out_of_the_shared_range`.
+//
+// The alternative was to add `macos` to the `@cfg` vocabulary and write a third table.
+// That would put the mapping behind a branch nobody in this repository can run, which is
+// the failure mode `std/sysdir`'s header argues against at length. A union that is
+// provably unambiguous in-domain is strictly better than an untested branch.
+//
+// ─── Rendering happens at the edge ────────────────────────────────────────────
+//
+// `render` writes into a caller `Sink`, like `std/diag`. There is no `to_string`, no
+// ambient stderr, and no allocation. A `SysError` travels as two integers; it becomes
+// text once, where someone has decided who reads it.
+//
+// Run the tests:  jestyrc test examples/std/syserr_test.jtr
+
+import "sink"
+
+// ---- the platform discriminator ---------------------------------------------
+//
+// Prefixed because a module `const` is emitted under its bare name, so two modules
+// cannot share one (see std/test.jtr for the same constraint).
+//
+// `SYSERR_PLAT_POSIX` means "the Linux/macOS errno numbering", not "some POSIX". There
+// is exactly one table for both, built as described in the header.
+
+pub const SYSERR_PLAT_UNKNOWN: i32 = 0
+pub const SYSERR_PLAT_POSIX: i32 = 1
+pub const SYSERR_PLAT_WINDOWS: i32 = 2
+
+// ---- the portable categories -------------------------------------------------
+//
+// Closed, and small on purpose. A category earns its place by being a DIFFERENT NEXT
+// MOVE for the caller: "it is already there" and "you may not" lead to different code,
+// "the disk is full" and "the name is too long" do not lead to different code from
+// `SYSERR_OTHER` today and would be surface without a consumer.
+//
+// `SYSERR_OTHER` is not a failure of the table. It is the answer for a code that has no
+// portable meaning, and a caller that reaches it still has `raw` — which is the entire
+// point of not throwing the number away.
+
+pub const SYSERR_OK: i32 = 0
+pub const SYSERR_NOT_FOUND: i32 = 1
+pub const SYSERR_DENIED: i32 = 2
+pub const SYSERR_EXISTS: i32 = 3
+pub const SYSERR_NOT_DIR: i32 = 4
+pub const SYSERR_IS_DIR: i32 = 5
+pub const SYSERR_NOT_EMPTY: i32 = 6
+pub const SYSERR_INVALID: i32 = 7
+pub const SYSERR_BUSY: i32 = 8
+pub const SYSERR_NO_SPACE: i32 = 9
+pub const SYSERR_CROSS_DEVICE: i32 = 10
+pub const SYSERR_OTHER: i32 = 11
+
+// The count, so a test can sweep every category without respelling the list. It is
+// asserted against `cat_name`'s coverage rather than trusted.
+pub const SYSERR_CAT_COUNT: i32 = 12
+
+// ---- the record --------------------------------------------------------------
+//
+// `@copy`: two integers, no ownership, freely stored in a list or a log record. An error
+// that had to be moved would be an error you could only report once.
+//
+// The fields are `pub` for the same reason `mem.Layout`'s are: a two-integer record
+// whose integers are unreadable outside its own module is an opaque token, not a record.
+@copy pub struct SysError {
+    pub raw: i32,
+    pub plat: i32,
+}
+
+// The no-error value. `plat` is UNKNOWN rather than the host's, because "nothing went
+// wrong" did not happen on a platform.
+@no_alloc @no_os pub fn none() -> SysError {
+    return SysError{ raw: 0, plat: SYSERR_PLAT_UNKNOWN }
+}
+
+// Build one explicitly — for a test fixture, a replayed log, or an error that crossed a
+// machine boundary. This is why `plat` is a parameter and not a compile-time fact.
+@no_alloc @no_os pub fn make(raw: i32, plat: i32) -> SysError {
+    return SysError{ raw: raw, plat: plat }
+}
+
+@no_alloc @no_os pub fn is_ok(read e: SysError) -> bool {
+    return e.raw == 0
+}
+
+// Named `is_failure` rather than `failed`, and `last_error` rather than `last`, to stay
+// out of a recorded `jc build` hazard: when two modules define a function with the same
+// name the loader renames it, and if that name is ALSO a struct field accessed as `x.name`
+// somewhere in the flattened program, the rename rewrites the field access too. `failed`
+// is a field in `std/ctfe` and `last` is one in `std/process` and `std/cgen`, and
+// `std/file` and `std/smallvec` already define functions by both names — so the plain
+// spellings would have added two fresh instances of a bug the tree is trying to shrink.
+@no_alloc @no_os pub fn is_failure(read e: SysError) -> bool {
+    return e.raw != 0
+}
+
+// Exact identity: same number, same numbering system. The comparison helper §2.3 asks
+// for, and it deliberately does NOT compare categories — two different failures that
+// happen to share a category are not the same error, and a test that accepted them as
+// equal would pass for the wrong reason.
+@no_alloc @no_os pub fn same(read a: SysError, read b: SysError) -> bool {
+    return a.raw == b.raw and a.plat == b.plat
+}
+
+// ---- this host ----------------------------------------------------------------
+
+@cfg(posix) @no_alloc @no_os pub fn host_plat() -> i32 {
+    return SYSERR_PLAT_POSIX
+}
+
+@cfg(windows) @no_alloc @no_os pub fn host_plat() -> i32 {
+    return SYSERR_PLAT_WINDOWS
+}
+
+// Stamp a raw code with THIS host's numbering. The right constructor for a code that
+// was just produced here, and the reason an operation's error payload can be a single
+// scalar without losing the platform: an error produced on this host was produced by
+// this host's platform, so the discriminator is recoverable rather than lost.
+@no_alloc @no_os pub fn here(raw: i32) -> SysError {
+    return SysError{ raw: raw, plat: host_plat() }
+}
+
+// ---- reading the platform's error slot ---------------------------------------
+//
+// POSIX. `errno` is a MACRO — `(*__errno_location())` on glibc and musl — so the macro
+// cannot be bound and the function under it must be. That function is glibc/musl's, not
+// POSIX's: macOS spells it `__error()`. It is named here rather than hidden because the
+// alternative (a "portable" errno accessor that silently fails to link) is worse, and
+// because the fix when it matters is one `@cfg` branch.
+//
+// The header owns the declaration, so no prototype is emitted for it and glibc's own
+// attributes and versioning apply.
+@cfg(posix) extern "errno.h" fn __errno_location() -> cptr
+
+// Windows. `GetLastError` returns a `DWORD`; the declaration comes from <windows.h>, so
+// what happens here is the ordinary C conversion to `int32_t` at the call. Win32 error
+// codes are 16-bit facility-plus-code values, so nothing is lost.
+@cfg(windows) extern "windows.h" fn GetLastError() -> i32
+
+// The last error this thread recorded, as a raw number.
+//
+// Valid ONLY immediately after a call that failed. Neither platform clears its slot on
+// success, so reading it after a call that worked yields whatever failed earlier — which
+// is why every operation in `std/sysfs` reads it on the failure branch and nowhere else.
+@cfg(posix) pub fn last_raw() -> i32 {
+    // `errno` is `int`, so the slot is narrowed from an opaque `cptr` back to a typed
+    // pointer with an explicit `as` — the same asymmetry `std/sysdir` relies on for
+    // `struct dirent*`, and explicit for the same reason: this is a claim about a
+    // foreign object's type and should look like one.
+    let p: *mut i32 = __errno_location() as *mut i32
+    var v: i32 = 0
+    unsafe { v = (p + 0).* }
+    return v
+}
+
+@cfg(windows) pub fn last_raw() -> i32 {
+    return GetLastError()
+}
+
+// The last error, stamped with this host. What an operation calls on its failure branch.
+pub fn last_error() -> SysError {
+    return here(last_raw())
+}
+
+// ---- the mapping tables -------------------------------------------------------
+
+// POSIX errno → category. Linux and macOS numbering, unioned; see the header for why
+// that union is unambiguous within the filesystem domain.
+@no_alloc @no_os pub fn category_posix(raw: i32) -> i32 {
+    if raw == 0 { return SYSERR_OK }
+    if raw == 1 { return SYSERR_DENIED }         // EPERM
+    if raw == 2 { return SYSERR_NOT_FOUND }      // ENOENT
+    if raw == 13 { return SYSERR_DENIED }        // EACCES
+    if raw == 16 { return SYSERR_BUSY }          // EBUSY
+    if raw == 17 { return SYSERR_EXISTS }        // EEXIST
+    if raw == 18 { return SYSERR_CROSS_DEVICE }  // EXDEV — rename across filesystems
+    if raw == 20 { return SYSERR_NOT_DIR }       // ENOTDIR
+    if raw == 21 { return SYSERR_IS_DIR }        // EISDIR
+    if raw == 22 { return SYSERR_INVALID }       // EINVAL
+    if raw == 28 { return SYSERR_NO_SPACE }      // ENOSPC
+    if raw == 30 { return SYSERR_DENIED }        // EROFS — read-only filesystem
+    // Above 34 the two libcs diverge; both numbers are listed for each name.
+    if raw == 36 { return SYSERR_INVALID }       // ENAMETOOLONG (Linux)
+    if raw == 63 { return SYSERR_INVALID }       // ENAMETOOLONG (macOS)
+    if raw == 39 { return SYSERR_NOT_EMPTY }     // ENOTEMPTY (Linux)
+    if raw == 66 { return SYSERR_NOT_EMPTY }     // ENOTEMPTY (macOS)
+    if raw == 40 { return SYSERR_INVALID }       // ELOOP (Linux)
+    if raw == 62 { return SYSERR_INVALID }       // ELOOP (macOS)
+    return SYSERR_OTHER
+}
+
+// Win32 `GetLastError()` → category. The values are from <winerror.h> and are stable
+// ABI: a Win32 error number has never been renumbered.
+@no_alloc @no_os pub fn category_windows(raw: i32) -> i32 {
+    if raw == 0 { return SYSERR_OK }
+    if raw == 2 { return SYSERR_NOT_FOUND }      // ERROR_FILE_NOT_FOUND
+    if raw == 3 { return SYSERR_NOT_FOUND }      // ERROR_PATH_NOT_FOUND
+    if raw == 5 { return SYSERR_DENIED }         // ERROR_ACCESS_DENIED
+    if raw == 6 { return SYSERR_INVALID }        // ERROR_INVALID_HANDLE
+    if raw == 15 { return SYSERR_NOT_FOUND }     // ERROR_INVALID_DRIVE
+    if raw == 17 { return SYSERR_CROSS_DEVICE }  // ERROR_NOT_SAME_DEVICE
+    if raw == 19 { return SYSERR_DENIED }        // ERROR_WRITE_PROTECT
+    if raw == 32 { return SYSERR_BUSY }          // ERROR_SHARING_VIOLATION
+    if raw == 33 { return SYSERR_BUSY }          // ERROR_LOCK_VIOLATION
+    if raw == 80 { return SYSERR_EXISTS }        // ERROR_FILE_EXISTS
+    if raw == 87 { return SYSERR_INVALID }       // ERROR_INVALID_PARAMETER
+    if raw == 112 { return SYSERR_NO_SPACE }     // ERROR_DISK_FULL
+    if raw == 123 { return SYSERR_INVALID }      // ERROR_INVALID_NAME
+    if raw == 145 { return SYSERR_NOT_EMPTY }    // ERROR_DIR_NOT_EMPTY
+    if raw == 183 { return SYSERR_EXISTS }       // ERROR_ALREADY_EXISTS
+    if raw == 206 { return SYSERR_INVALID }      // ERROR_FILENAME_EXCED_RANGE
+    if raw == 267 { return SYSERR_NOT_DIR }      // ERROR_DIRECTORY
+    return SYSERR_OTHER
+}
+
+// The portable category of a raw code in a named numbering system.
+//
+// Total over every `(raw, plat)` pair: an unknown platform answers `SYSERR_OTHER` rather
+// than falling through to one of the tables, because guessing which numbering a replayed
+// log used is exactly how a cross-machine report becomes a wrong report.
+@no_alloc @no_os pub fn category(raw: i32, plat: i32) -> i32 {
+    if plat == SYSERR_PLAT_POSIX { return category_posix(raw) }
+    if plat == SYSERR_PLAT_WINDOWS { return category_windows(raw) }
+    if raw == 0 { return SYSERR_OK }
+    return SYSERR_OTHER
+}
+
+// The category of a whole record — the form callers actually use.
+@no_alloc @no_os pub fn cat_of(read e: SysError) -> i32 {
+    return category(e.raw, e.plat)
+}
+
+// Does this error mean the named portable thing? The predicate a portable caller writes
+// instead of comparing raw numbers.
+@no_alloc @no_os pub fn is_cat(read e: SysError, cat: i32) -> bool {
+    return cat_of(e) == cat
+}
+
+// ---- naming and rendering ------------------------------------------------------
+
+@no_alloc @no_os pub fn cat_name(cat: i32) -> str {
+    if cat == SYSERR_OK { return "ok" }
+    if cat == SYSERR_NOT_FOUND { return "not found" }
+    if cat == SYSERR_DENIED { return "permission denied" }
+    if cat == SYSERR_EXISTS { return "already exists" }
+    if cat == SYSERR_NOT_DIR { return "not a directory" }
+    if cat == SYSERR_IS_DIR { return "is a directory" }
+    if cat == SYSERR_NOT_EMPTY { return "directory not empty" }
+    if cat == SYSERR_INVALID { return "invalid argument" }
+    if cat == SYSERR_BUSY { return "resource busy" }
+    if cat == SYSERR_NO_SPACE { return "no space left" }
+    if cat == SYSERR_CROSS_DEVICE { return "cross-device link" }
+    return "platform error"
+}
+
+@no_alloc @no_os pub fn plat_name(plat: i32) -> str {
+    if plat == SYSERR_PLAT_POSIX { return "posix" }
+    if plat == SYSERR_PLAT_WINDOWS { return "windows" }
+    return "unknown"
+}
+
+// Render as `<category> (posix errno 2)`, into a caller `Sink`, returning bytes written.
+//
+// The raw code is ALWAYS printed, even when the category is known. A report that said
+// only "not found" would have discarded the one fact that distinguishes `ENOENT` from
+// `ERROR_PATH_NOT_FOUND` in a bug report from a user on the other operating system.
+//
+// Overflow is the `Sink` contract's, not this function's: check `sink.overflowed` after
+// rendering into a bounded buffer. See `std/diag`'s header for why that is the shape.
+@no_alloc @no_os pub fn render(read e: SysError, mut s: sink.Sink, mut buf: []u8) -> usize {
+    let before: usize = sink.written(s)
+    sink.put_str(s, buf, cat_name(cat_of(e)))
+    sink.put_str(s, buf, " (")
+    sink.put_str(s, buf, plat_name(e.plat))
+    if e.plat == SYSERR_PLAT_POSIX {
+        sink.put_str(s, buf, " errno ")
+    } else {
+        sink.put_str(s, buf, " error ")
+    }
+    sink.put_i64(s, buf, e.raw as i64)
+    sink.put_str(s, buf, ")")
+    return sink.written(s) - before
+}

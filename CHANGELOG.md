@@ -7,6 +7,93 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/syserr` + `std/sysfs` — the `sys` tier becomes real, and it reports why.**
+  `syserr.jtr` (7 cases), `sysfs.jtr` (10 cases), `sysfs_demo.jtr`. Create and remove a
+  directory, replace-rename, metadata, canonical path, temp directory — everything ISO C
+  cannot do or cannot do the same way twice — each reporting the platform's own error code
+  behind a portable category.
+
+  ```
+  SysError { pub raw: i32, pub plat: i32 }      // the category is COMPUTED, never stored
+  category(raw, plat) -> i32                    // pure: no @cfg, no OS, no host
+  ```
+
+  **The mapping tables are pure functions of `(raw, plat)`, so both platforms' tables run
+  on every host.** `@cfg` buys "both branches type-check wherever you build"; a table that
+  takes the numbering system as an argument buys "both branches EXECUTE wherever you
+  build", because deciding what `ENOTEMPTY` means needs no operating system. Only
+  `last_raw` and one line of `here` are host-bound — and a mapping table is exactly where
+  a module like this is wrong, so the part now under test everywhere is the part that
+  matters.
+
+  The POSIX table carries Linux's and macOS's divergent numbers as aliases (`ENOTEMPTY`
+  39/66, `ENAMETOOLONG` 36/63, `ELOOP` 40/62). Safe rather than sloppy, for a checkable
+  reason: each alias collides only with a socket or STREAMS code on the other libc, none
+  of which any filesystem operation can produce. The alternative — a third `@cfg` branch
+  nobody here can run — is the failure `std/sysdir`'s header argues against.
+
+  **The consumer is `jstage`, an atomic publish**, not a directory demo: idempotent
+  `make_dir`, write to a staging name, `rename_replace` onto the final name. Step three is
+  the one that needs this tier — ISO C `rename` REFUSES an existing destination on Windows,
+  so the portable spelling is remove-then-rename and leaves a window where the final name
+  does not exist. Its last section removes a non-empty directory on purpose: POSIX answers
+  `ENOTEMPTY`, Windows answers `ERROR_DIR_NOT_EMPTY` (145), and one assertion against
+  `SYSERR_NOT_EMPTY` holds on both with none of those numbers in the test file.
+
+  Deliberately absent: modification time. It is the one field that needs `struct stat` at a
+  hard-coded offset, and unlike `sysdir`'s `D_NAME_OFFSET` (wrong on one platform, asserted
+  by a test Linux CI runs) `st_mode` is wrong on an *architecture* no runner here uses —
+  24 on Linux x86-64, 16 on aarch64, 4 on macOS — and a wrong `st_mode` reads a `uid` and
+  reports a plausible file type. Nothing in the module reads a foreign struct's interior.
+
+### Fixed
+
+- **`jc build` no longer breaks a struct whose field name matches a colliding function
+  name.** The self-hosted loader renames a top-level name declared by two modules; it
+  correctly skipped `.`-preceded tokens, so `d.open` was left alone — but the field
+  DECLARATION `open: bool` and every `Dir{ …, open: false }` literal were rewritten, so the
+  struct became self-consistent under a name none of its accessors used. `std/sysdir` and
+  `std/file` both declare `open`, and `jc` reported seven type errors inside a module the
+  user never edited while `jestyrc` built the same program.
+
+  The fix is one token-level exclusion: `ident :` is a binder, never a use of a top-level
+  name — **except `const NAME: T`**, which is the one top-level form spelled that way, and
+  omitting that carve-out regressed `test_demo` immediately (`std/test` and `std/cli` both
+  declare `BACKSLASH`). Measured over every multi-module corpus program: **43 → 49 build,
+  zero regressions**; `caps_demo`, `census_cli`, `process_demo`, `sysfs_demo`,
+  `test_fixture_demo` and `writer_demo` all recovered. Seed refreshed.
+
+  The repository had recorded this as "the rename rewrites the FIELD ACCESS too". It is the
+  inverse — the accesses are the only sites that survive — which is why the fix is an
+  exclusion rather than a scheme for telling `mod.item` from a field access.
+
+- **`catch |e|` now binds `e` even when the base expression does not resolve.** The binder
+  exists because the syntax says so; whether the base's type could be recovered has nothing
+  to do with whether the name is in scope. Inferring the fallback without it left `e` an
+  unknown name, so a program with one real problem reported a second invented one
+  underneath it — and it was a reference/port divergence, caught by the whole-corpus typeck
+  golden the moment a corpus file first caught a fallible call across a module edge. The
+  port's behaviour was the better one and the reference adopted it.
+
+- **A fallible function with no return type is refused by the backend instead of
+  miscompiling.** `fn f(x: i32) !{ Bad }` parsed, type-checked, and `jestyrc check`
+  reported ok; the emitted C then failed three ways — `?` projects `.ok` off a struct with
+  no ok field, `catch` becomes an invalid void expression, and a bare `return` emits
+  `return;` from a `JestyrResult_unit` function, which gcc only *warns* about, so the
+  success path compiled and returned an uninitialized tag. Refused in cgen (following the
+  `Self`-in-a-trait-parameter precedent) with all three lowerings pinned plus a positive
+  control; zero corpus sites, zero emitted-byte change.
+
+### Testing
+
+- **`docs/jc_build_matrix.txt` — the `jc build` path is gated for the first time.** Both
+  existing gates are blind to it by construction: `selfhost_fixpoint_subset` `continue`s on
+  any file containing `import "`, and `jestyr_cgen_matches_reference` feeds every file to
+  both backends with imports UNRESOLVED — so a program could be byte-identity verified
+  *and* unbuildable, which nine of them were. An expectations file rather than a pass/fail
+  gate, failing in **both** directions, because four programs still do not build. It caught
+  the `test_demo` regression above on the first run. Regenerate with `JC_BUILD_MATRIX=1`.
+
 - **`census` — a source-tree census, and the Tier 3 standard library's showcase.**
   `examples/std/census.jtr` (the tally), `census_cli.jtr` (the tool), `census_test.jtr`
   (9 cases). Files, bytes, lines and the text/binary split per extension, plus the largest

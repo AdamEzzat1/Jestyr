@@ -317,6 +317,177 @@ mod fallible_return {
 /// Every other test of that module feeds it a hand-written manifest, which proves the
 /// parser handles the format *as documented*. This one closes the loop the module exists
 /// for: `Modules::render_manifest` renders a real program's content-hash DAG, the
+/// **The gate the 2026-08-20 census audit owed: can `jc` BUILD every multi-module program?**
+///
+/// `jc build` is the only path that drives the port's own module loader, and until now
+/// nothing covered it. The two gates that look like they would are both blind to it by
+/// construction: `selfhost_fixpoint_subset` `continue`s on any file containing `import "`,
+/// and `jestyr_cgen_matches_reference` feeds every file to both backends with imports
+/// UNRESOLVED. So a program could be byte-identity verified *and* unbuildable — which nine
+/// of them were.
+///
+/// An EXPECTATIONS FILE rather than a pass/fail assertion, and it fails in BOTH directions.
+/// Four programs still do not build, so a green/red gate would be either permanently red or
+/// (worse) quietly relaxed; what is actually wanted is "this set does not grow, and shrinks
+/// only deliberately".
+///
+/// That two-directional half earned its keep on the first run: the loader fix that took the
+/// matrix from 43 `BUILD_OK` to 49 also moved `test_demo` from `BUILD_OK` to `FAIL`, because
+/// its first form excluded `const NAME: T` along with struct fields. Nothing else in the
+/// tree would have caught that.
+#[cfg(all(test, feature = "c-oracle"))]
+mod jc_build_matrix {
+    use super::*;
+
+    /// The programs this matrix covers: `examples/std/*.jtr` with a `fn main()` and at
+    /// least one `import`. Sorted, so the file is a stable diff.
+    fn multi_module_programs() -> Vec<String> {
+        let mut v: Vec<String> = Vec::new();
+        for e in std::fs::read_dir("examples/std").unwrap().flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("jtr") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&p).unwrap();
+            let has_main = src.lines().any(|l| l.starts_with("fn main()"));
+            let has_import = src.lines().any(|l| l.starts_with("import \""));
+            if has_main && has_import {
+                v.push(p.file_stem().unwrap().to_str().unwrap().to_string());
+            }
+        }
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn jc_build_matrix_matches_expectations() {
+        let jc = super::c_oracle::build_exe("examples/std/cgen.jtr");
+        let mut lines: Vec<String> = Vec::new();
+        for stem in multi_module_programs() {
+            let src = format!("examples/std/{stem}.jtr");
+            let out = std::process::Command::new(&jc).arg(&src).arg("build").output().unwrap();
+            let verdict = if out.status.success() { "BUILD_OK" } else { "FAIL" };
+            lines.push(format!("{verdict} {stem}"));
+            // `jc build` writes `<stem>.c` and `<stem>.exe` beside the source. Removing
+            // them keeps the working tree clean — and keeps a stale `.exe` from a previous
+            // run out of the next one.
+            let _ = std::fs::remove_file(format!("examples/std/{stem}.c"));
+            let _ = std::fs::remove_file(format!("examples/std/{stem}.exe"));
+        }
+        let got = lines.join("\n");
+
+        let path = "docs/jc_build_matrix.txt";
+        let committed = std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
+        // The header is prose; only the verdict lines are the data.
+        let want: String = committed
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if std::env::var("JC_BUILD_MATRIX").is_ok() {
+            let header: String = committed
+                .lines()
+                .take_while(|l| l.starts_with('#') || l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(path, format!("{header}\n{got}\n")).unwrap();
+            eprintln!("jc_build_matrix REFRESHED ({} programs)", lines.len());
+            return;
+        }
+
+        assert_eq!(
+            got, want,
+            "`jc build` verdicts changed. If a program was FIXED this is good news — rerun \
+             with JC_BUILD_MATRIX=1 and commit the moved line. If one REGRESSED, the port's \
+             module loader or its generic def-emission broke and nothing else would have \
+             told you."
+        );
+    }
+}
+
+/// **`jstage` — the atomic-publish demo, end to end through the real filesystem.**
+///
+/// `examples/std/sysfs_demo.jtr` is `std/sysfs`'s consumer, not an illustration of it: it
+/// performs the three-step publish (idempotent `make_dir`, write to a staging name,
+/// `rename_replace` onto the final name) that every tool writing an output someone else
+/// may be reading has to perform, and that ISO C `rename` cannot express — on Windows it
+/// REFUSES an existing destination, so the portable spelling leaves a window in which the
+/// final name does not exist at all.
+///
+/// The interesting half of this test is the LAST line. The demo removes a non-empty
+/// directory on purpose; POSIX answers `ENOTEMPTY` (39 on Linux, 66 on macOS) and Windows
+/// answers `ERROR_DIR_NOT_EMPTY` (145). The rendered category is asserted as a literal —
+/// identical on every platform — and the raw number is asserted to be PRESENT and
+/// platform-appropriate rather than equal to any particular value. That split is the
+/// claim `std/syserr` makes, tested as a claim rather than restated as a comment.
+#[cfg(all(test, feature = "c-oracle"))]
+mod sysfs_atomic_publish {
+    use super::*;
+
+    #[test]
+    fn jstage_publishes_atomically_and_reports_a_portable_category() {
+        let exe = super::c_oracle::build_exe("examples/std/sysfs_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the publish must succeed");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        // Everything except the one rendered error line is platform-independent, so it is
+        // asserted as an exact sequence. A containment check would pass for a demo that
+        // printed `false` for every step.
+        let want_prefix = "-- staging --\n\
+                           created the directory\n\
+                           true\n\
+                           a second create reports it was already there\n\
+                           true\n\
+                           staged bytes\n\
+                           35\n\
+                           and the byte count is the one we wrote\n\
+                           true\n\
+                           first publish replaced something\n\
+                           false\n\
+                           second publish replaced something\n\
+                           true\n\
+                           and the published file holds the newest bytes\n\
+                           true\n\
+                           true\n\
+                           -- what the platform says --\n\
+                           removing a non-empty directory is refused\n\
+                           true\n\
+                           and the portable category is NOT_EMPTY\n\
+                           true\n";
+        assert!(
+            out.starts_with(want_prefix),
+            "the publish sequence changed:\n{out}"
+        );
+
+        // `first publish replaced something` is `false` and the second is `true`: the
+        // first publish creates the destination and the second one clobbers it. Those two
+        // being DIFFERENT is what proves `rename_replace` actually replaced rather than
+        // failing and leaving the old file — a demo where both said `true` would also
+        // satisfy a containment check.
+        assert_eq!(out.matches("\nfalse\n").count(), 1, "exactly one step reports no replacement:\n{out}");
+
+        // The rendered failure: same words everywhere, different number.
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("directory not empty ("))
+            .unwrap_or_else(|| panic!("no rendered platform error in:\n{out}"));
+        if cfg!(windows) {
+            assert_eq!(line, "directory not empty (windows error 145)", "{out}");
+        } else {
+            // 39 on Linux, 66 on macOS — the alias pair the POSIX table carries both of.
+            assert!(
+                line == "directory not empty (posix errno 39)"
+                    || line == "directory not empty (posix errno 66)",
+                "unexpected POSIX rendering: {line}\n{out}"
+            );
+        }
+
+        assert!(out.trim_end().ends_with("-- cleaned up --\ntrue"), "the demo must clean up after itself:\n{out}");
+    }
+}
+
 /// Jestyr-built `jplan` reads it, and the order it produces has to put the dependency
 /// first. A format drift on either side fails here and nowhere else — the hand-written
 /// fixtures would keep passing against a manifest the compiler no longer writes.
@@ -15832,7 +16003,31 @@ fn main() -> i32 {
         "census.jtr",
         "census_test.jtr",
         "census_cli.jtr",
+        "syserr.jtr",
+        "syserr_test.jtr",
+        "sysfs.jtr",
     ];
+    // **`sysfs_test.jtr` is deliberately absent, and the reason was MEASURED rather than
+    // assumed** — which is what `walk.jtr`'s note below asks the next person to do.
+    //
+    // This golden feeds the RAW file to both backends with imports UNRESOLVED, and
+    // `sysfs_test.jtr` is the first corpus file to put a `catch |e| match e { … }` on a
+    // fallible call into ANOTHER MODULE. With `sysfs.make_dir` unresolvable the catch's ok
+    // type degrades, and the two sides degrade it differently — one C token, in the
+    // statement-expression's result temporary:
+    //
+    //     reference:  bool j_made = ({ … int  _cv4; … })
+    //     port:       bool j_made = ({ … void _cv4; … })
+    //
+    // Rebuilt self-contained with the fallible function declared LOCALLY, the two agree
+    // byte-for-byte and both emit `bool _cv1` — the ok type, correctly recovered. So this
+    // is a disagreement about how far to degrade an erroneous program, not an emission
+    // bug, and it is the same category as `walk.jtr`'s auto-drop divergence: both appear
+    // only in the import-unresolved mode this golden runs in, and neither can affect a
+    // program that actually compiles.
+    //
+    // `syserr_test.jtr` IS allowlisted and byte-identical, so the suite shape itself is
+    // covered; what is not covered is this one degradation path.
     // **`walk.jtr` is deliberately absent, and NOT because of `@cfg`.** The old note said it
     // was blocked "transitively — it imports sysdir"; measured, that is wrong. This golden
     // feeds the RAW file to both backends with imports UNRESOLVED, and `walk.jtr` is the first
@@ -16783,6 +16978,15 @@ fn main() -> i32 {
             ("bitset_test", 6),
             ("runtime_test", 5),
             ("json_test", 10),
+            // `syserr` is almost entirely host-independent — `category` is a pure function
+            // of (raw code, numbering system), so the POSIX table runs on Windows and the
+            // Win32 table runs on Linux. Only `the_host_stamps_its_own_numbering` is
+            // host-dependent, and it asserts agreement between two functions rather than a
+            // literal, so it is a real assertion on both.
+            ("syserr_test", 7),
+            // `sysfs` touches the real filesystem on both platforms and creates its own
+            // scratch tree, so it needs no fixture in the repository.
+            ("sysfs_test", 10),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

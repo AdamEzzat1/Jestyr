@@ -27,10 +27,10 @@ value would have been close to zero.
 | Release engineer | `ENFORCED` | Nothing new. Seed provenance, gcc-only bootstrap and fixpoint are already gated in `.github/workflows/ci.yml:74-88` | — |
 | Portability engineer | `N/A` | Not exercised — census adds no new C constructs | — |
 | Performance engineer | `N/A` | Deliberately empty. Nothing was timed and no perf claim was made or should be | — |
-| **Reliability engineer** | **`ABSENT`** | **The finding.** The only gate that builds programs end-to-end, `selfhost_fixpoint_subset`, explicitly `continue`s on any file containing `import "`. 52 runnable multi-module corpus programs are outside every gate; 9 of them do not build | `jc_build_matrix.txt` |
+| **Reliability engineer** | **`ENFORCED` (was `ABSENT`)** | **The finding, and it is now closed.** The only gate that built programs end-to-end, `selfhost_fixpoint_subset`, `continue`s on any file containing `import "`; 52 runnable multi-module corpus programs were outside every gate and 9 did not build. The gate this row asked for exists as `jc_build_matrix_matches_expectations` + `docs/jc_build_matrix.txt`, and the loader bug behind 5 of the 9 is fixed — **49 of 53 build now, and the remaining 4 are one isolated mechanism**. See `jestyr-std-v4-runtime-platform-handoff.md` §2.2/§2.3 | `docs/jc_build_matrix.txt` |
 | Supply-chain engineer | `N/A` | No new dependencies; census is pure Jestyr | — |
 | **DX / diagnostics engineer** | `CLAIMED` | Two API-shape findings, both low severity, both from census's own bugs: `walk`'s visitor must test `is_dir` with nothing prompting it, and `memprof` read before scope exit reports live arenas as a leak | this session |
-| API steward | `VERIFIED` | `len` / `refused` / `lost` are simultaneously public function names and struct field names across modules. That overlap is currently load-bearing for the port and nothing records it as a constraint | `mechanism.txt` |
+| API steward | `VERIFIED`, **constraint LIFTED** | `len` / `refused` / `lost` are simultaneously public function names and struct field names across modules. That overlap was load-bearing for the port; it no longer is — `ml_rewrite` stopped renaming binders, so the overlap is legal again. The mechanism recorded here was backwards (the field ACCESS survived; the DECLARATION was rewritten) | `mechanism.txt`, v4 handoff §2.2 |
 | Adversarial reviewer | — | Demoted 2 of 5 claimed benefits; see below | this file |
 
 ## The falsification gate, applied to each claimed benefit

@@ -37835,16 +37835,20 @@ void jestyr_ml_rewrite(Jestyr_Ml* restrict j_m, size_t j_mi, JestyrString* restr
         if (jestyr_ml_ident_head(j_tx))
         {
             bool j_prev_dot = false;
+            bool j_prev_const = false;
             if ((j_i > 0))
             {
                 Jestyr_Token j_pt = jestyr_get__list__Token(j_tk, (j_i - 1));
                 j_prev_dot = jestyr_rt_str_eq(jestyr_rt_substr(j_src, j_pt.j_start, j_pt.j_end), JSTR("."));
+                j_prev_const = jestyr_rt_str_eq(jestyr_rt_substr(j_src, j_pt.j_start, j_pt.j_end), JSTR("const"));
             }
             bool j_next_dot = false;
+            bool j_next_colon = false;
             if (((j_i + 1) < j_n))
             {
                 Jestyr_Token j_nt = jestyr_get__list__Token(j_tk, (j_i + 1));
                 j_next_dot = jestyr_rt_str_eq(jestyr_rt_substr(j_src, j_nt.j_start, j_nt.j_end), JSTR("."));
+                j_next_colon = jestyr_rt_str_eq(jestyr_rt_substr(j_src, j_nt.j_start, j_nt.j_end), JSTR(":"));
             }
             if (((!j_prev_dot) && j_next_dot))
             {
@@ -37887,7 +37891,7 @@ void jestyr_ml_rewrite(Jestyr_Ml* restrict j_m, size_t j_mi, JestyrString* restr
                     continue;
                 }
             }
-            if ((!j_prev_dot))
+            if (((!j_prev_dot) && ((!j_next_colon) || j_prev_const)))
             {
                 if (jestyr_ml_is_collision(j_ren, j_stem, j_tx))
                 {
