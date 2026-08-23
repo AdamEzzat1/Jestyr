@@ -1,0 +1,655 @@
+// std/syswatch.jtr — "has anything under this directory changed?"
+//
+// TIER: `sys`. A watcher is a POLLABLE over a platform notification handle, which is what
+// makes it the natural consumer of `runtime.Poller`: the loop already knows how to wait on
+// something and run a task when it fires, and this module supplies one more thing to wait
+// on.
+//
+// ─── What is here ─────────────────────────────────────────────────────────────
+//
+// One directory, NON-RECURSIVELY, per `Watcher`. A handle to hand `runtime.watch`, the
+// `Poller` that can wait on it, and a `drain` that reports what changed. No recursive
+// watching, no rename correlation, no debouncing — each of those is a policy, and a policy
+// built on top of a primitive that reports two different amounts of information on two
+// platforms would be a policy that means something different on each.
+//
+// ─── The one thing to understand before using this ────────────────────────────
+//
+// **A change notification is a HINT, not a log.** Every caller needs a path that rescans
+// and works out the truth for itself, and this module's job is to make that rescan RARE,
+// not to make it unnecessary. That is not a Windows concession — it is true on both
+// platforms, for two different reasons:
+//
+//   * Windows `FindFirstChangeNotification` reports THAT something under the directory
+//     changed and never says what. There is no name and no kind.
+//   * Linux `inotify` names the file and the kind — until its per-watch queue overflows,
+//     at which point the kernel drops events and sets `IN_Q_OVERFLOW`. A watcher that did
+//     not surface that would silently miss changes, which is the worst failure a build tool
+//     can have.
+//
+// Both arrive as `WATCH_RESCAN` / `WATCH_OVERFLOW`, so a caller writes ONE recovery path
+// and it is exercised on Linux too rather than being Windows-only code that nobody runs.
+// `names_changes()` says which world you are in, so a caller can skip work it knows is
+// impossible instead of discovering it at runtime.
+//
+// ─── The POSIX branch is LINUX, and the vocabulary cannot say so ──────────────
+//
+// `inotify` is a Linux interface. POSIX never standardised file watching, so there is no
+// portable spelling: macOS has `kqueue`/`FSEvents`, which is a different model, not a
+// different name. `<sys/inotify.h>` does not exist on macOS, so this module does not
+// compile there — a MISSING HEADER at the line that names it, which is the loudest and
+// earliest failure available, rather than a link error or a branch that quietly does
+// nothing.
+//
+// `std/sysdir`'s `D_NAME_OFFSET` comment already records that `linux`/`macos` become worth
+// adding to the `@cfg` vocabulary "when something needs to tell them apart". **This is the
+// second thing that needs it, and it is a sharper case than the first** — `sysdir` wanted
+// to tell them apart to pick a NUMBER, this one needs to pick an entirely different API.
+// They are still not added here, and the reason is now more specific than "nobody can run
+// it": `posix` is a SUPERSET of `linux` and `macos`, and `src/attrs.rs`'s vocabulary is a
+// closed list of guards that are disjoint by construction. Adding two nested names would
+// make `@cfg(posix) fn f` and `@cfg(linux) fn f` both emit on Linux — a duplicate
+// definition — so the increment is not a word in a list, it is a specificity rule about
+// which of two overlapping items wins. Recorded rather than half-done.
+//
+// ─── `read(2)` is unbindable, and `readv(2)` is the way through ───────────────
+//
+// Draining an inotify fd needs `read(2)`, and **`read` is a Jestyr KEYWORD** (the `read x:
+// T` parameter mode), so `extern "unistd.h" fn read` does not parse. That is §2.1b's rule
+// arriving from the other side: an extern's name belongs to the C symbol namespace, and
+// that namespace contains words Jestyr has spent on its own grammar.
+//
+// `readv` is the same call with a vector, and binding it costs one foreign structure:
+//
+//     struct iovec { void *iov_base; size_t iov_len; };
+//
+// **It is built out of `usize`, not out of bytes at offsets**, which is the whole reason it
+// is acceptable where `std/sysfs` refuses `struct stat`. `iovec` is two pointer-sized words
+// in a specified order with no room for padding, so an `alloc(usize, 2)` has its layout by
+// construction — there is no offset to get wrong and no endianness to assume. The single
+// assumption left is `sizeof(size_t) == sizeof(void *)`, and
+// `a_pointer_and_a_usize_are_the_same_width` asserts it on EVERY host, Windows included,
+// with `@size_of` — so the check runs on the platform that never compiles this branch.
+//
+// ─── The Windows limitation this module cannot fix, stated plainly ────────────
+//
+// A `Runtime` holds exactly ONE `Poller`. On Linux that is enough for everything, because a
+// socket and an inotify fd are both file descriptors and one `poll(2)` waits on both — so
+// `syspoll.host()` services a watcher with no new code at all, and `poller()` simply hands
+// it back.
+//
+// On Windows they are not the same kind of object. A change-notification HANDLE is waited
+// on with `WaitForSingleObject`; `WSAPoll` takes sockets and nothing else. **So a Windows
+// runtime can serve sockets or watches, not both**, and which one it serves is decided by
+// which `Poller` was installed. The fix is not a wrapper: it is `WSAEventSelect`, which
+// brings a socket into the object-wait world at the cost of making it non-blocking — a
+// change to `std/sysnet`'s semantics, not an addition to this module. Recorded in
+// `docs/session-notes/jestyr-std-v4-file-watching-handoff.md` §2.3.
+//
+// What the Windows poller does keep, and what `a_real_change_wakes_the_loop_and_drains`
+// exercises: it waits on its own handle for the WHOLE timeout even when that handle is not
+// among the ones it was asked about, so a runtime holding a foreign handle idles correctly
+// and merely never fires, rather than spinning. Never falsely ready, never spinning — the
+// two properties a poller that cannot see everything can still keep.
+//
+// ─── What this does NOT prove ─────────────────────────────────────────────────
+//
+// Not that you have seen every change: see the rescan discussion above. Not that a file is
+// finished being written — Linux `IN_CLOSE_WRITE` says a writer closed it, but another
+// writer may already have it open, and Windows says nothing of the kind. And not the ORDER
+// of changes across a rename: `IN_MOVED_FROM`/`IN_MOVED_TO` carry a cookie that correlates
+// the two halves, which this module deliberately does not expose, because Windows cannot
+// answer the question at all and an API that could only be used on one platform would be a
+// worse lie than not having it.
+//
+// Worked example:  examples/std/syswatch_demo.jtr
+// Run the tests:   jestyrc test examples/std/syswatch_test.jtr
+
+import "syserr"
+import "cstring"
+import "syspoll"
+import "runtime"
+import "fs"
+
+// ---- POSIX (Linux) bindings ---------------------------------------------------
+//
+// Header-declared, so no prototype is emitted and the platform's own declaration applies.
+// `inotify_init1`'s fd and `close`'s are `int`; they are bound as `i64` for the same reason
+// `std/sysnet` unifies its socket signatures — C converts implicitly at the call, and one
+// width across the module means no truncation to reason about.
+//
+// This `close` is libc's. `std/file` and `std/sysdir` each declare a Jestyr `close`, so the
+// canonicaliser has already renamed both and the bare name is free — see `runtime.fire_due`
+// for the case where it was not. **This module's own closing operation is therefore called
+// `close_watch`**, because a Jestyr `close` HERE would collide with the extern in its own
+// module, which is the one arrangement neither the canonicaliser nor the loader can fix.
+
+@cfg(posix) extern "sys/inotify.h" fn inotify_init1(flags: i32) -> i64
+@cfg(posix) extern "sys/inotify.h" fn inotify_add_watch(fd: i64, path: cstr, mask: u32) -> i32
+@cfg(posix) extern "sys/inotify.h" fn inotify_rm_watch(fd: i64, wd: i32) -> i32
+@cfg(posix) extern "sys/uio.h" fn readv(fd: i64, iov: cptr, n: i32) -> i64
+@cfg(posix) extern "unistd.h" fn close(fd: i64) -> i32
+
+// ---- Windows bindings ---------------------------------------------------------
+//
+// `FindFirstChangeNotificationA` returns a HANDLE that goes SIGNALED when something under
+// the directory changes and STAYS signaled until `FindNextChangeNotification` re-arms it.
+// That is level-triggered by construction, which is exactly what `runtime.watch` promises
+// its callers, so the two agree without either one adapting.
+
+@cfg(windows) extern "windows.h" fn FindFirstChangeNotificationA(path: cstr, subtree: i32, filter: u32) -> cptr
+@cfg(windows) extern "windows.h" fn FindNextChangeNotification(h: cptr) -> i32
+@cfg(windows) extern "windows.h" fn FindCloseChangeNotification(h: cptr) -> i32
+@cfg(windows) extern "windows.h" fn WaitForSingleObject(h: cptr, ms: u32) -> i32
+
+// ---- what a change can be -----------------------------------------------------
+//
+// Six kinds, and the last two are the ones that make the API honest. `WATCH_RESCAN` and
+// `WATCH_OVERFLOW` both mean "my report is incomplete, go and look" — they are kept
+// separate because they have different causes and a caller may want to count them
+// differently: a `RESCAN` every time is normal on Windows, and an `OVERFLOW` on Linux means
+// the loop is not draining fast enough.
+
+pub const WATCH_CREATED: i32 = 1
+pub const WATCH_DELETED: i32 = 2
+pub const WATCH_WRITTEN: i32 = 3     // a writer closed the file
+pub const WATCH_MOVED_OUT: i32 = 4
+pub const WATCH_MOVED_IN: i32 = 5
+pub const WATCH_RESCAN: i32 = 6      // something changed; this platform cannot say what
+pub const WATCH_OVERFLOW: i32 = 7    // events were LOST; the caller must rescan
+
+@no_alloc @no_os pub fn kind_name(kind: i32) -> str {
+    if kind == WATCH_CREATED { return "created" }
+    if kind == WATCH_DELETED { return "deleted" }
+    if kind == WATCH_WRITTEN { return "written" }
+    if kind == WATCH_MOVED_OUT { return "moved-out" }
+    if kind == WATCH_MOVED_IN { return "moved-in" }
+    if kind == WATCH_RESCAN { return "rescan" }
+    return "overflow"
+}
+
+// True when this platform reports WHICH entry changed. A caller uses it to decide whether
+// a name-keyed cache is worth keeping at all, rather than discovering at runtime that every
+// name is empty.
+@cfg(posix) @no_alloc @no_os pub fn names_changes() -> bool { return true }
+@cfg(windows) @no_alloc @no_os pub fn names_changes() -> bool { return false }
+
+// One change. **`@copy`: three scalars and no storage** — the NAME lives in the caller's
+// byte buffer, at `[name_off .. name_off + name_len]`, so a batch of changes costs one
+// allocation the caller already made and none here. `name_len` is 0 whenever the platform
+// did not supply a name, which is always on Windows and is also true on Linux for the
+// overflow marker.
+@copy pub struct Change {
+    pub kind: i32,
+    pub name_off: usize,
+    pub name_len: usize,
+}
+
+// The name of a change, as a view into the buffer `drain` filled. Empty when there is none.
+//
+// A free function rather than a method because the name and the change live apart on
+// purpose: a `Change` that owned its name would be an allocation per event, which is the
+// cost this shape exists to avoid.
+@no_alloc @no_os pub fn change_name(read c: Change, read names: []u8) -> str {
+    if c.name_len == 0 { return "" }
+    if c.name_off + c.name_len > names.len { return "" }
+    return from_utf8(names[c.name_off .. c.name_off + c.name_len])
+}
+
+// ---- constants ----------------------------------------------------------------
+//
+// The inotify mask this module asks for. **`IN_MODIFY` is deliberately ABSENT and
+// `IN_CLOSE_WRITE` is present instead**, and the difference is the single most common bug
+// in a first file watcher: `IN_MODIFY` fires on every `write(2)`, so a build triggered by it
+// runs against a file the compiler is still half way through writing. `IN_CLOSE_WRITE` fires
+// once, when a writer closes. It is not a guarantee that nobody else still has the file open
+// — see the header — but it is the difference between "usually right" and "reliably wrong".
+//
+//   IN_CLOSE_WRITE 0x0008    IN_MOVED_FROM 0x0040    IN_MOVED_TO 0x0080
+//   IN_CREATE      0x0100    IN_DELETE     0x0200
+const WATCH_IN_CLOSE_WRITE: u32 = 8
+const WATCH_IN_MOVED_FROM: u32 = 64
+const WATCH_IN_MOVED_TO: u32 = 128
+const WATCH_IN_CREATE: u32 = 256
+const WATCH_IN_DELETE: u32 = 512
+const WATCH_IN_MASK: u32 = 968              // the five above, OR-ed
+const WATCH_IN_Q_OVERFLOW: u32 = 16384
+
+// `IN_NONBLOCK`, which is `O_NONBLOCK`, which is 0o4000 on every architecture that runs
+// Linux and inotify together. It is hard-coded, and that is safe for a reason that does NOT
+// apply to `std/sysfs`'s refused `st_mode` offset: a wrong flag here makes `inotify_init1`
+// return `EINVAL` and the open FAIL, where a wrong struct offset reads a plausible number
+// and reports a plausible lie. Loud beats silent, so the constant is allowed to be a
+// constant.
+//
+// **Non-blocking, and the reason is platform AGREEMENT rather than convenience.** The
+// readiness-first design `std/sysnet` argues for would have this fd blocking, drained only
+// after the poller says ready. But Windows' `drain` cannot block — re-arming a notification
+// handle is a non-blocking operation with no other form — so a blocking POSIX branch would
+// give the two platforms `drain`s with different contracts. Non-blocking makes both mean
+// "report what is here now, and nothing if nothing is", which is one contract to document
+// and one to test. Inotify makes this free: a read returns whole events or none, so there is
+// no short-read case to handle.
+const WATCH_IN_NONBLOCK: i32 = 2048
+
+// The kernel's read buffer. inotify REFUSES a read smaller than one event
+// (`sizeof(struct inotify_event) + NAME_MAX + 1` = 16 + 255 + 1 = 272), so this is a floor
+// and not a tuning knob; 8 KiB holds a healthy batch and keeps `drain` to one syscall in the
+// common case.
+const WATCH_BUF_CAP: usize = 8192
+
+// `struct inotify_event`'s fixed header: `int wd; uint32_t mask; uint32_t cookie; uint32_t
+// len;` then `len` bytes of NUL-padded name.
+//
+// **This IS a foreign structure read by offset, and it is the `sockaddr_in` case rather than
+// the `struct stat` case.** It is a kernel WIRE format — the bytes a read of the fd hands
+// back — fixed by the inotify ABI and identical on every Linux architecture, which is what
+// `std/sysfs`'s header names as the distinction that makes one acceptable and the other not.
+// It is also read as `u32` SLOTS rather than as bytes at offsets, so no endianness is
+// assumed: the four header fields are slots 0..3 of a `*mut u32`, and the kernel pads every
+// event's length to keep the next one aligned.
+const WATCH_EV_HEADER: usize = 16
+
+// Win32 `FILE_NOTIFY_CHANGE_FILE_NAME | _DIR_NAME | _LAST_WRITE`. Attributes and size are
+// deliberately absent: a size change without a write is not a content change a build cares
+// about, and both would fire more often for no more information.
+const WATCH_WIN_FILTER: u32 = 19
+const WATCH_WAIT_SIGNALED: i32 = 0          // WAIT_OBJECT_0
+const WATCH_INVALID_HANDLE: i64 = 0 - 1     // INVALID_HANDLE_VALUE is (HANDLE)-1, not null
+
+// POSIX `EINVAL` / Win32 `ERROR_INVALID_NAME` — the refusal this module reports before
+// touching the platform, spelled as the platform's own number so `syserr.category`
+// classifies it like any other failure. The same pair `std/sysfs` uses.
+const WATCH_EINVAL: i32 = 22
+const WATCH_ERROR_INVALID_NAME: i32 = 123
+
+@cfg(posix) @no_alloc @no_os fn bad_path_code() -> i32 { return WATCH_EINVAL }
+@cfg(windows) @no_alloc @no_os fn bad_path_code() -> i32 { return WATCH_ERROR_INVALID_NAME }
+
+// ---- the handle ---------------------------------------------------------------
+//
+// One `Watcher` is one directory. Scalars and owned buffers only: a Jestyr borrow is
+// second-class, so a handle cannot own borrowed storage.
+//
+// Three of the four platform fields are dead on each platform, and that is deliberate rather
+// than wasteful. A `@cfg`-guarded STRUCT would mean two types that typeck keys on one name —
+// the hazard §2.1e records for functions, with worse consequences for a layout — so the
+// struct is unconditional and the OPERATIONS are guarded. Three unused words per watcher is
+// a price worth paying to keep exactly one `Watcher` type in the program.
+//
+// **There is no `allowed` field**, and its absence is the point: an earlier draft carried one
+// alongside `open`, written in three places and read in none. Two fields that must agree are
+// two fields that can disagree — the same argument `std/syserr` makes for storing two fields
+// and computing the third.
+pub struct Watcher {
+    fd: i64,            // POSIX: the inotify fd
+    wd: i32,            // POSIX: the watch descriptor within that fd
+    buf: *mut u32,      // POSIX: the kernel's read buffer, u32-slotted (see WATCH_EV_HEADER)
+    cell: *mut cptr,    // Windows: a heap cell holding the HANDLE, so a Poller can reach it
+    open: bool,
+}
+
+@no_alloc @no_os pub fn is_open(read w: Watcher) -> bool { return w.open }
+
+// The value a failed open hands back, and the one a caller uses for a slot it has not
+// filled. Exported because a module-qualified struct LITERAL does not parse, so a caller
+// writing `catch` has no other way to name it — the same reason `sysnet.closed()` and
+// `sysfs.missing()` exist.
+//
+// Every operation on it refuses, which is what makes ignoring the error survivable rather
+// than a dereference of a handle that was never opened.
+@no_alloc @no_os pub fn closed() -> Watcher {
+    return Watcher{ fd: 0 - 1, wd: 0, buf: null, cell: null, open: false }
+}
+
+// The value to hand `runtime.watch`. **It must be paired with `poller(w)`** — the two come
+// from the same module and mean nothing apart, which is the one invariant this module asks a
+// caller to hold.
+//
+// On POSIX it is the inotify fd, which is why `syspoll.host()` services it unchanged. On
+// Windows it is the HANDLE's own numeric value, which makes it unique per watcher without
+// inventing an id space.
+@cfg(posix) @no_alloc @no_os pub fn handle(read w: Watcher) -> i64 { return w.fd }
+
+@cfg(windows) @no_os pub fn handle(read w: Watcher) -> i64 {
+    if w.open == false { return 0 - 1 }
+    var h: cptr = null
+    unsafe { h = (w.cell + 0).* }
+    return h as i64
+}
+
+// ---- opening ------------------------------------------------------------------
+
+// Start watching `path`. The directory must exist; a watcher on a path that appears later
+// is a policy (retry, or watch the parent) and belongs to the caller.
+//
+// `fs.Fs` is reused rather than a fourth capability type invented, for the reason
+// `std/sysfs` gives: it is a POLICY value, and one handle threading through `std/fs`,
+// `std/walk`, `sysfs` and here is worth more than tier purity. Refusal is reported by TYPE,
+// so `fs.refused(f)` does not move.
+@cfg(posix) pub fn open_dir(mut f: fs.Fs, read a: Allocator, read path: str) -> Watcher !{ WatchFailed(i32), WatchRefused } {
+    if fs.can_read(f) == false { return err(WatchRefused) }
+    if cstring.has_interior_nul(path) { return err(WatchFailed(bad_path_code())) }
+
+    let fd: i64 = inotify_init1(WATCH_IN_NONBLOCK)
+    if fd < 0 { return err(WatchFailed(syserr.last_raw())) }
+
+    // The errno is read BEFORE the `CString` is freed: `free` is not required to preserve
+    // it on every libc, so anything between the failing call and the read is a chance to
+    // lose the reason. The same discipline every operation in `std/sysfs` follows.
+    var c: CString = cstring.from_str(a, path)
+    let wd: i32 = inotify_add_watch(fd, cstring.as_cstr(c), WATCH_IN_MASK)
+    var code: i32 = 0
+    if wd < 0 { code = syserr.last_raw() }
+    cstring.free(c)
+    if wd < 0 {
+        close(fd)
+        return err(WatchFailed(code))
+    }
+
+    var buf: *mut u32 = alloc(u32, WATCH_BUF_CAP / 4)
+    return ok(Watcher{ fd: fd, wd: wd, buf: buf, cell: null, open: true })
+}
+
+@cfg(windows) pub fn open_dir(mut f: fs.Fs, read a: Allocator, read path: str) -> Watcher !{ WatchFailed(i32), WatchRefused } {
+    if fs.can_read(f) == false { return err(WatchRefused) }
+    if cstring.has_interior_nul(path) { return err(WatchFailed(bad_path_code())) }
+
+    var c: CString = cstring.from_str(a, path)
+    let h: cptr = FindFirstChangeNotificationA(cstring.as_cstr(c), 0, WATCH_WIN_FILTER)
+    // **The failure test is the HANDLE, not the error code.** Inferring failure from a
+    // non-zero `GetLastError` would conflate two different questions, and it fails in the
+    // direction that matters: a failed call that left the code at zero would come back as a
+    // successfully opened watcher wrapping `INVALID_HANDLE_VALUE`. `INVALID_HANDLE_VALUE` is
+    // `(HANDLE)-1` and not null, which is why both are tested.
+    let bad: bool = h == null or (h as i64) == WATCH_INVALID_HANDLE
+    var code: i32 = 0
+    if bad { code = syserr.last_raw() }
+    cstring.free(c)
+    if bad { return err(WatchFailed(code)) }
+
+    // The handle goes on the heap rather than only in the struct, because a `Poller` reaches
+    // its state through a `*mut u8` and a Jestyr borrow cannot outlive the call that made
+    // it. The cell IS the poller's context, and `close_watch` frees it.
+    var cell: *mut cptr = alloc(cptr, 1)
+    unsafe { (cell + 0).* = h }
+    return ok(Watcher{ fd: 0 - 1, wd: 0, buf: null, cell: cell, open: true })
+}
+
+// Stop watching and release the platform's handle. Idempotent on the Jestyr value.
+//
+// Answers nothing — a failed close tells a caller nothing actionable, since the handle is
+// gone either way, which is why the failure is REPORTED rather than returned as a status.
+// That signature is only spellable because a fallible function may now have no return type.
+//
+// **Named `close_watch` rather than `close`**: this module binds libc's `close` as an
+// extern, and an extern's name is a C symbol reserved within its own module. See the
+// bindings above.
+@cfg(posix) pub fn close_watch(mut w: Watcher) !{ WatchFailed(i32), WatchRefused } {
+    if w.open == false { return }
+    inotify_rm_watch(w.fd, w.wd)
+    let rc: i32 = close(w.fd)
+    var code: i32 = 0
+    if rc != 0 { code = syserr.last_raw() }
+    free_ptr(w.buf)
+    w.buf = null
+    w.open = false
+    if rc != 0 { return err(WatchFailed(code)) }
+}
+
+@cfg(windows) pub fn close_watch(mut w: Watcher) !{ WatchFailed(i32), WatchRefused } {
+    if w.open == false { return }
+    var h: cptr = null
+    unsafe { h = (w.cell + 0).* }
+    let rc: i32 = FindCloseChangeNotification(h)
+    var code: i32 = 0
+    if rc == 0 { code = syserr.last_raw() }
+    free_ptr(w.cell)
+    w.cell = null
+    w.open = false
+    if rc == 0 { return err(WatchFailed(code)) }
+}
+
+// ---- the poller ---------------------------------------------------------------
+
+// On POSIX an inotify fd is a file descriptor and `poll(2)` waits on it exactly as it waits
+// on a socket, so this is `std/syspoll`'s poller unchanged — **the integration cost of file
+// watching on Linux is one line**, which is the property `runtime.Poller` being a fn pointer
+// was supposed to buy and here is the receipt.
+@cfg(posix) pub fn poller(read w: Watcher) -> runtime.Poller {
+    return syspoll.host()
+}
+
+// On Windows it is not a file descriptor and `WSAPoll` cannot see it, so the watcher brings
+// its own poller. See the header for the limitation this creates and for why the fix lives
+// in `std/sysnet` rather than here.
+//
+// It waits on ITS OWN handle for the whole timeout and marks ready only the entry whose
+// handle matches. Waiting even when its handle is not registered is deliberate: reporting
+// "nothing ready" instantly would turn a runtime holding a foreign handle into a busy loop,
+// where waiting makes it idle correctly and merely never fire. Never falsely ready, never
+// spinning — the two properties a poller that cannot see everything can still keep.
+@cfg(windows) fn win_wait(ctx: *mut u8, fds: *mut i64, ready: *mut u8, n: usize, timeout_nanos: i64) -> i64 {
+    var i: usize = 0
+    for i < n {
+        unsafe { (ready + i).* = 0 as u8 }
+        i = i + 1
+    }
+    if n == 0 { return 0 }
+
+    // **A closed watcher's poller reports nothing rather than dereferencing null.** This is
+    // reachable without doing anything unusual: `open_dir(...) catch closed()` is the
+    // documented fallback, and a caller who installs its poller before checking `is_open`
+    // would otherwise crash inside the loop instead of at the failed open. Nothing-ready is
+    // the honest answer — a watcher that was never opened will never become readable.
+    if ctx == null { return 0 }
+
+    var ms: i64 = 0
+    if timeout_nanos > 0 { ms = (timeout_nanos + 999999) / 1000000 }
+    if ms > 2147483647 { ms = 2147483647 }
+
+    var cell: *mut cptr = ctx as *mut cptr
+    var h: cptr = null
+    unsafe { h = (cell + 0).* }
+    if h == null { return 0 }
+    let rc: i32 = WaitForSingleObject(h, ms as u32)
+    if rc != WATCH_WAIT_SIGNALED { return 0 }
+
+    // Signaled. The handle stays signaled until `drain` re-arms it, so nothing is lost by
+    // reporting it against every matching registration.
+    let me: i64 = h as i64
+    var count: i64 = 0
+    var k: usize = 0
+    for k < n {
+        var fd: i64 = 0
+        unsafe { fd = (fds + k).* }
+        if fd == me {
+            unsafe { (ready + k).* = 1 as u8 }
+            count = count + 1
+        }
+        k = k + 1
+    }
+    return count
+}
+
+@cfg(windows) @no_os pub fn poller(read w: Watcher) -> runtime.Poller {
+    return runtime.poller(w.cell as *mut u8, &win_wait)
+}
+
+// ---- draining -----------------------------------------------------------------
+
+// Report what has changed since the last call, into caller storage. Returns how many
+// changes were written into `evs`; their names are packed into `names`.
+//
+// **Never blocks on either platform**, so calling it when nothing has happened is free and
+// answers 0. See `WATCH_IN_NONBLOCK` for why that contract was chosen over readiness-first.
+//
+// **DRAIN UNTIL IT ANSWERS 0.** One call is not one file operation and never was: writing a
+// new file is `IN_CREATE` and `IN_CLOSE_WRITE` on Linux, and on Windows the notification
+// handle re-arms straight back into a signaled state because the directory genuinely
+// changed more than once. The two platforms coalesce differently — Linux returns both
+// events from a single read, Windows needs a second call — so a caller that drains once and
+// stops has written code that works on one of them. What both promise is CONVERGENCE: with
+// nothing new happening this reaches 0 in a bounded number of calls, and only then does the
+// watch stop waking the loop. `a_real_change_wakes_the_loop_and_drains` asserts exactly
+// that pair, and it asserts them separately, so a `drain` that answered 0 without consuming
+// anything would still be caught.
+//
+// **A full buffer becomes a `WATCH_OVERFLOW`, not a silent truncation.** If `evs` or `names`
+// cannot hold everything the platform reported, the last slot written is an overflow marker
+// and the remainder is discarded — because the data has already left the kernel and cannot
+// be put back. That deliberately produces the same signal as the kernel's own queue
+// overflow, so a caller has exactly one recovery path and it is reachable by giving this
+// function a small buffer rather than by putting a kernel under load — which is what
+// `lost_events_are_reported_rather_than_silently_dropped` does, with the anti-vacuity
+// control (the same events into a buffer that FITS report all of them and no marker) beside
+// it.
+@cfg(posix) pub fn drain(mut w: Watcher, mut evs: []Change, mut names: []u8) -> usize !{ WatchFailed(i32), WatchRefused } {
+    if w.open == false { return err(WatchRefused) }
+    if evs.len == 0 { return ok(0) }
+
+    // `struct iovec` — two pointer-sized words, built as `usize` slots so there is no offset
+    // to get wrong and no byte order to assume. See the header.
+    var iov: *mut usize = alloc(usize, 2)
+    unsafe { (iov + 0).* = (w.buf as i64) as usize }
+    unsafe { (iov + 1).* = WATCH_BUF_CAP }
+    let got: i64 = readv(w.fd, iov as cptr, 1)
+    var code: i32 = 0
+    if got < 0 { code = syserr.last_raw() }
+    free_ptr(iov)
+
+    // Nothing pending. `EAGAIN`/`EWOULDBLOCK` on a non-blocking fd is the ANSWER "no events",
+    // not a failure, and reporting it as one would make an idle loop error every pass.
+    if got < 0 {
+        if code == 11 or code == 35 { return ok(0) }
+        return err(WatchFailed(code))
+    }
+    return ok(parse_inotify(w.buf, got as usize, evs, names))
+}
+
+// Walk a buffer of inotify events and turn it into `Change`s. Returns how many were written.
+//
+// **Public, and NOT `@cfg`-guarded, which is the most important decision in this module.**
+// This is where a file watcher is actually wrong — a transposed mask bit or an off-by-one in
+// the name padding yields plausible events forever — and guarding it would mean the parser
+// only ever runs on the platform whose CI job is the one nobody is looking at. It needs no
+// operating system: it is a pure function of a byte count and a buffer, exactly as
+// `syserr.category` is a pure function of a code and a numbering system, and for the same
+// payoff — **the part most likely to be wrong is the part under test on every host.**
+//
+// **`avail` is the byte count a read RETURNED, and the caller owes that it does not exceed
+// what `buf` actually holds** — this takes a raw pointer, so there is no length to check
+// against, which is the ordinary bargain in this tier. Everything downstream of it is
+// bounded: a name that would run past `avail` and a slot index past `evs.len` both stop with
+// an overflow marker rather than reading on.
+//
+// `buf` is `*mut u32`
+// rather than `*mut u8` so the four header fields are SLOTS instead of offsets, which is
+// what removes the byte-order assumption; the kernel's own padding keeps every event
+// 4-aligned, and an unaligned one is refused rather than guessed at.
+pub fn parse_inotify(buf: *mut u32, avail: usize, mut evs: []Change, mut names: []u8) -> usize {
+    var n: usize = 0
+    var off: usize = 0
+    var noff: usize = 0
+    for off + WATCH_EV_HEADER <= avail {
+        // Every event is 4-aligned by the kernel's own padding. A buffer that is not says
+        // the ABI assumption above is wrong, and stopping with an overflow marker is the
+        // honest answer — a misparse would invent names out of the middle of a struct.
+        if (off & 3) != 0 { return stamp_overflow(evs, n) }
+        let slot: usize = off / 4
+        var mask: u32 = 0
+        var nlen: u32 = 0
+        unsafe { mask = (buf + (slot + 1)).* }
+        unsafe { nlen = (buf + (slot + 3)).* }
+        let namelen: usize = nlen as usize
+        if off + WATCH_EV_HEADER + namelen > avail { return stamp_overflow(evs, n) }
+
+        // The kernel dropped events. Everything after this point in the stream is still
+        // valid, but the caller has already missed something, so the marker is emitted and
+        // the rest is abandoned — reporting the survivors would understate the damage.
+        if (mask & WATCH_IN_Q_OVERFLOW) != 0 { return stamp_overflow(evs, n) }
+
+        let kind: i32 = kind_of(mask)
+        if kind != 0 {
+            if n >= evs.len { return stamp_overflow(evs, n) }
+            // The name is NUL-PADDED to the alignment, not NUL-terminated at its length, so
+            // the real length is up to the first NUL rather than `nlen`.
+            let real: usize = name_len_at(buf, off + WATCH_EV_HEADER, namelen)
+            if noff + real > names.len { return stamp_overflow(evs, n) }
+            copy_name(buf, off + WATCH_EV_HEADER, real, names, noff)
+            evs[n] = Change{ kind: kind, name_off: noff, name_len: real }
+            noff = noff + real
+            n = n + 1
+        }
+        off = off + WATCH_EV_HEADER + namelen
+    }
+    return n
+}
+
+// Replace the last usable slot with an overflow marker. Returns the new count.
+//
+// When `evs` is completely full the LAST change is overwritten rather than the marker being
+// dropped: losing one reported change is strictly better than losing the fact that changes
+// were lost.
+fn stamp_overflow(mut evs: []Change, n: usize) -> usize {
+    if evs.len == 0 { return 0 }
+    var at: usize = n
+    if at >= evs.len { at = evs.len - 1 }
+    evs[at] = Change{ kind: WATCH_OVERFLOW, name_off: 0, name_len: 0 }
+    return at + 1
+}
+
+// Which of this module's kinds an inotify mask is, or 0 for one it did not ask for.
+//
+// The order matters where a mask carries more than one bit: a file that is created and
+// written before the queue is drained arrives with `IN_CREATE | IN_CLOSE_WRITE`, and
+// reporting it as CREATED is the more useful of the two — a caller that reacts to creation
+// will read the file anyway.
+@no_alloc @no_os fn kind_of(mask: u32) -> i32 {
+    if (mask & WATCH_IN_CREATE) != 0 { return WATCH_CREATED }
+    if (mask & WATCH_IN_DELETE) != 0 { return WATCH_DELETED }
+    if (mask & WATCH_IN_MOVED_TO) != 0 { return WATCH_MOVED_IN }
+    if (mask & WATCH_IN_MOVED_FROM) != 0 { return WATCH_MOVED_OUT }
+    if (mask & WATCH_IN_CLOSE_WRITE) != 0 { return WATCH_WRITTEN }
+    return 0
+}
+
+// The name's real length: up to `cap` bytes at byte offset `at`, stopping at the first NUL.
+fn name_len_at(buf: *mut u32, at: usize, cap: usize) -> usize {
+    var p: *mut u8 = buf as *mut u8
+    var i: usize = 0
+    for i < cap {
+        var b: u8 = 0
+        unsafe { b = (p + (at + i)).* }
+        if (b as i32) == 0 { break }
+        i = i + 1
+    }
+    return i
+}
+
+fn copy_name(buf: *mut u32, at: usize, len: usize, mut names: []u8, to: usize) {
+    var p: *mut u8 = buf as *mut u8
+    var i: usize = 0
+    for i < len {
+        var b: u8 = 0
+        unsafe { b = (p + (at + i)).* }
+        names[to + i] = b
+        i = i + 1
+    }
+}
+
+// Windows reports THAT the directory changed, so a drain is at most one change and it never
+// carries a name. Re-arming is what makes the handle go quiet again, and it happens HERE
+// rather than in the poller because the poller may run without the caller consuming
+// anything — a watch is level-triggered, and re-arming from the wait would drop a change the
+// caller never saw.
+@cfg(windows) pub fn drain(mut w: Watcher, mut evs: []Change, mut names: []u8) -> usize !{ WatchFailed(i32), WatchRefused } {
+    if w.open == false { return err(WatchRefused) }
+    if evs.len == 0 { return ok(0) }
+    var h: cptr = null
+    unsafe { h = (w.cell + 0).* }
+    if WaitForSingleObject(h, 0) != WATCH_WAIT_SIGNALED { return ok(0) }
+    evs[0] = Change{ kind: WATCH_RESCAN, name_off: 0, name_len: 0 }
+    if FindNextChangeNotification(h) == 0 { return err(WatchFailed(syserr.last_raw())) }
+    return ok(1)
+}

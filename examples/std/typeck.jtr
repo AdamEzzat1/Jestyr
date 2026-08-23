@@ -1738,6 +1738,26 @@ fn reflect_ret(n: str) -> i32 {
     return 0 - 1
 }
 
+// `@size_of(T)` / `@align_of(T)` / `@offset_of(T, f)` — a LAYOUT query's static result
+// type, or -1 if `n` is not one. Mirrors `comptime::is_layout_intrinsic` plus the
+// `Ty::Prim("i64")` the reference gives all three.
+//
+// Same shape as `reflect_ret` and handled at the same place, for the same reason: the first
+// argument is a TYPE, not a value, so inferring the arguments would report a binding that
+// does not exist.
+//
+// **This was missing while `cgen.jtr` already lowered `size_of` correctly** — the port typed
+// the call `?` and still emitted the right `sizeof`, so every emitted-C golden and `jc build`
+// itself agreed and only the no-allowlist typeck dump could see it. It went unnoticed because
+// no corpus file used a layout intrinsic until `std/syswatch` derived `struct iovec`'s layout
+// from one. A half-mirrored intrinsic is invisible to every gate that compares BYTES.
+fn layout_ret(n: str) -> i32 {
+    if str_eq(n, "size_of") { return t_i64() }
+    if str_eq(n, "align_of") { return t_i64() }
+    if str_eq(n, "offset_of") { return t_i64() }
+    return 0 - 1
+}
+
 fn infer_call(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> i32 {
     let d: parser.ExprData = list.get(parser.ExprData, p.ex, id as usize)
     let cal: parser.ExprData = list.get(parser.ExprData, p.ex, d.a as usize)
@@ -1747,6 +1767,8 @@ fn infer_call(mut c: Checker, read p: parser.Parser, read src: str, id: i32) -> 
     if cal.kind == 21 {
         let rr: i32 = reflect_ret(src[cal.x as usize .. cal.y as usize])
         if rr >= 0 { return rr }
+        let lr: i32 = layout_ret(src[cal.x as usize .. cal.y as usize])
+        if lr >= 0 { return lr }
     }
     if cal.kind == 5 {                             // method sugar (the callee Field is not inferred)
         let recv: i32 = infer(c, p, src, cal.a)

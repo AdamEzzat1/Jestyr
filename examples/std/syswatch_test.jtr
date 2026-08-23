@@ -1,0 +1,466 @@
+// std/syswatch_test.jtr — the watcher, and the loop it feeds.
+//
+// Three halves, deliberately separated, and the middle one is the point of the file:
+//
+//   * The CAPABILITY and the REFUSALS run with no operating system involved.
+//
+//   * **The inotify PARSER runs on every host, including the one that can never execute
+//     it.** `syswatch.parse_inotify` is a pure function of a byte count and a buffer, so a
+//     hand-built event stream tests the mask decoding, the NUL padding, the queue-overflow
+//     marker and the buffer-full marker on Windows — where none of that code will ever be
+//     compiled into a real program. That is `std/syserr`'s trick applied to the part of a
+//     file watcher most likely to be silently wrong.
+//
+//   * The END-TO-END check uses the real platform: a real directory, a real change, a real
+//     `Poller`, and the real event loop.
+//
+// Run:  jestyrc test examples/std/syswatch_test.jtr
+
+import "syswatch"
+import "runtime"
+import "syspoll"
+import "time"
+import "mem"
+import "fs"
+import "sysfs"
+import "test"
+import "test_report"
+
+const WATCH_T_CAP: usize = 8192
+const WATCH_T_ROOT: str = "zz_syswatch_scratch"
+const WATCH_T_FILE: str = "zz_syswatch_scratch/made.txt"
+
+// ---- helpers ------------------------------------------------------------------
+
+// Remove the scratch tree, best effort, ignoring every failure.
+fn scrub(mut f: fs.Fs, read a: Allocator) {
+    fs.erase(f, WATCH_T_FILE)
+    let dead: bool = sysfs.remove_dir(f, a, WATCH_T_ROOT) catch false
+}
+
+// A counter a watch task can bump through its `ctx` — the `mem.Allocator` shape, and the
+// only way a fn pointer carries state.
+fn bump(ctx: *mut u8, id: i64, now: i64) {
+    var p: *mut i64 = ctx as *mut i64
+    var v: i64 = 0
+    unsafe { v = (p + 0).* }
+    unsafe { (p + 0).* = v + 1 }
+}
+
+// Discard an error deliberately. A `catch` fallback must be an EXPRESSION and an empty block
+// is not one, so "ignore this" gets a name.
+fn nothing() { }
+
+fn no_watch() -> syswatch.Watcher {
+    return syswatch.closed()
+}
+
+// Write one inotify event into a `*mut u32` buffer at byte offset `at`, and return the byte
+// offset just past it.
+//
+// The kernel's layout, which is what this is imitating: `int wd; uint32_t mask; uint32_t
+// cookie; uint32_t len;` then `len` bytes of NUL-PADDED name. `len` is padded up so the next
+// event stays aligned, which is exactly the detail a parser gets wrong — so the padding is
+// written here rather than assumed away.
+fn put_event(buf: *mut u32, at: usize, mask: u32, read name: str, padded: usize) -> usize {
+    let slot: usize = at / 4
+    unsafe { (buf + (slot + 0)).* = 1 as u32 }          // wd
+    unsafe { (buf + (slot + 1)).* = mask }
+    unsafe { (buf + (slot + 2)).* = 0 as u32 }          // cookie
+    unsafe { (buf + (slot + 3)).* = padded as u32 }
+    var p: *mut u8 = buf as *mut u8
+    var i: usize = 0
+    for i < padded {
+        var b: u8 = 0
+        if i < name.len { b = name[i] }
+        unsafe { (p + (at + 16 + i)).* = b }
+        i = i + 1
+    }
+    return at + 16 + padded
+}
+
+// ---- the assumption the POSIX branch rests on ---------------------------------
+
+@test fn a_pointer_and_a_usize_are_the_same_width() -> bool {
+    var raw: *mut u8 = alloc(u8, WATCH_T_CAP)
+    var rep: []u8 = slice(u8, raw, WATCH_T_CAP)
+    var c: test.Check = test.new()
+
+    // **The one assumption `struct iovec` is built on**, checked on whichever host is
+    // running. `drain` writes an iovec as two `usize` slots rather than as bytes at offsets,
+    // which removes every layout and byte-order question and leaves exactly this: a
+    // `size_t` and a `void *` must be the same width, or slot 1 lands in the wrong place.
+    //
+    // It is asserted HERE, in a test that runs on Windows, precisely because Windows never
+    // compiles the branch that depends on it — the platform that cannot execute the code is
+    // still able to falsify its premise.
+    test.eq_i64(c, rep, "a size_t and a pointer are the same width", @size_of(usize), @size_of(cptr))
+    test.eq_i64(c, rep, "and an inotify header is four u32 slots", @size_of(u32) * 4, 16)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- the capability -----------------------------------------------------------
+
+@test fn a_denied_capability_refuses_before_touching_the_platform() -> bool {
+    var raw: *mut u8 = alloc(u8, WATCH_T_CAP)
+    var rep: []u8 = slice(u8, raw, WATCH_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    // A denied handle must refuse by TYPE, not by returning something that looks open. The
+    // fallback is a closed watcher, so a caller that ignores the error still cannot use it.
+    var d: fs.Fs = fs.denied()
+    var w: syswatch.Watcher = syswatch.open_dir(d, a, ".") catch no_watch()
+    test.is_false(c, rep, "a denied capability opens nothing", syswatch.is_open(w))
+
+    // And the refusal is a DIFFERENT member from a platform failure, so a caller can tell
+    // "you are not allowed" from "the directory is not there". Conflating them would make a
+    // denied handle indistinguishable from a real EACCES, which defeats the capability.
+    var saw_refusal: *mut i64 = alloc(i64, 1)
+    unsafe { (saw_refusal + 0).* = 0 }
+    var w2: syswatch.Watcher = syswatch.open_dir(d, a, ".") catch |e| match e {
+        WatchRefused => stamp(saw_refusal, 1),
+        WatchFailed(code) => stamp(saw_refusal, 2),
+    }
+    var got: i64 = 0
+    unsafe { got = (saw_refusal + 0).* }
+    test.eq_i64(c, rep, "and it is WatchRefused, not WatchFailed", got, 1)
+    test.is_false(c, rep, "the fallback watcher is closed", syswatch.is_open(w2))
+
+    // A closed watcher's operations refuse rather than dereferencing a handle that is not
+    // there — the property that makes ignoring the error survivable.
+    var evs: *mut syswatch.Change = alloc(syswatch.Change, 4)
+    var es: []syswatch.Change = slice(syswatch.Change, evs, 4)
+    var nb: *mut u8 = alloc(u8, 64)
+    var ns: []u8 = slice(u8, nb, 64)
+    let n: usize = syswatch.drain(w2, es, ns) catch 99
+    test.eq_usize(c, rep, "draining a closed watcher refuses", n, 99)
+
+    // **And so does its POLLER**, which is the one that would otherwise crash rather than
+    // refuse. `open_dir(...) catch closed()` is the documented fallback, so a caller who
+    // installs the poller before checking `is_open` is doing something ordinary — and on
+    // Windows that poller's context is the heap cell a failed open never allocated. It must
+    // report nothing ready, which is also the honest answer: a watcher that was never opened
+    // will never become readable.
+    var rt: runtime.Runtime = runtime.make(a, time.manual(0))
+    runtime.set_poller(rt, syswatch.poller(w2))
+    runtime.watch(rt, syswatch.handle(w2), runtime.detached(), runtime.task(saw_refusal as *mut u8, &bump))
+    let e: runtime.Event = runtime.poll_for(rt, 1000)
+    test.eq_i64(c, rep, "a closed watcher's poller reports nothing ready", e.kind as i64, RT_TIMEOUT as i64)
+    runtime.free(rt)
+
+    free_ptr(nb)
+    free_ptr(evs)
+    free_ptr(saw_refusal)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn an_interior_nul_is_refused_with_the_platforms_own_code() -> bool {
+    var raw: *mut u8 = alloc(u8, WATCH_T_CAP)
+    var rep: []u8 = slice(u8, raw, WATCH_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+
+    // An interior NUL truncates the path at the C boundary, so a watcher on `"a\0/../etc"`
+    // would watch `a`. Refused BEFORE the platform sees it, with the platform's own error
+    // number rather than a private sentinel — so `syserr.category` classifies it like any
+    // other failure instead of needing a special case.
+    var bad: *mut u8 = alloc(u8, 3)
+    unsafe { (bad + 0).* = 97 as u8 }
+    unsafe { (bad + 1).* = 0 as u8 }
+    unsafe { (bad + 2).* = 98 as u8 }
+    let p: str = from_utf8(slice(u8, bad, 3))
+
+    var code: *mut i64 = alloc(i64, 1)
+    unsafe { (code + 0).* = 0 }
+    var w: syswatch.Watcher = syswatch.open_dir(h, a, p) catch |e| match e {
+        WatchRefused => stamp(code, 0 - 1),
+        WatchFailed(raw_code) => stamp(code, raw_code as i64),
+    }
+    test.is_false(c, rep, "an interior NUL opens nothing", syswatch.is_open(w))
+    var got: i64 = 0
+    unsafe { got = (code + 0).* }
+    test.is_true(c, rep, "and it is a platform failure, not a refusal", got > 0)
+
+    free_ptr(code)
+    free_ptr(bad)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- the parser, on every host ------------------------------------------------
+
+@test fn the_inotify_parser_decodes_kinds_and_names_on_any_host() -> bool {
+    var raw: *mut u8 = alloc(u8, WATCH_T_CAP)
+    var rep: []u8 = slice(u8, raw, WATCH_T_CAP)
+    var c: test.Check = test.new()
+
+    var buf: *mut u32 = alloc(u32, 256)
+    var evs: *mut syswatch.Change = alloc(syswatch.Change, 8)
+    var es: []syswatch.Change = slice(syswatch.Change, evs, 8)
+    var nb: *mut u8 = alloc(u8, 128)
+    var ns: []u8 = slice(u8, nb, 128)
+
+    // Three events, with the name padding the kernel really applies: `"a.txt"` is five bytes
+    // reported with a `len` of 8. A parser that trusted `len` as the name length would report
+    // `"a.txt\0\0\0"`, which compares unequal to every filename a caller has.
+    var at: usize = 0
+    at = put_event(buf, at, 256, "a.txt", 8)         // IN_CREATE
+    at = put_event(buf, at, 8, "b.txt", 8)           // IN_CLOSE_WRITE
+    at = put_event(buf, at, 512, "gone", 8)          // IN_DELETE
+
+    let n: usize = syswatch.parse_inotify(buf, at, es, ns)
+    test.eq_usize(c, rep, "three events parse to three changes", n, 3)
+    test.eq_i64(c, rep, "IN_CREATE is a creation", es[0].kind as i64, syswatch.WATCH_CREATED as i64)
+    test.eq_i64(c, rep, "IN_CLOSE_WRITE is a write", es[1].kind as i64, syswatch.WATCH_WRITTEN as i64)
+    test.eq_i64(c, rep, "IN_DELETE is a deletion", es[2].kind as i64, syswatch.WATCH_DELETED as i64)
+
+    // The names, with the padding stripped. This is the assertion that fails if `name_len_at`
+    // stops at `len` rather than at the first NUL.
+    test.eq_str(c, rep, "the first name", syswatch.change_name(es[0], ns), "a.txt")
+    test.eq_str(c, rep, "the second name", syswatch.change_name(es[1], ns), "b.txt")
+    test.eq_str(c, rep, "the third name", syswatch.change_name(es[2], ns), "gone")
+
+    // Names are PACKED, not slotted: three names of 5, 5 and 4 bytes occupy 14 bytes, so a
+    // caller's buffer is sized by total name length rather than by event count.
+    test.eq_usize(c, rep, "names are packed end to end", es[2].name_off, 10)
+
+    // A mask this module did not ask for is DROPPED rather than reported as some default
+    // kind. `IN_ATTRIB` (0x4) is not in `WATCH_IN_MASK`, and inventing a kind for it would
+    // put an event in the stream that the watcher never subscribed to.
+    var at2: usize = 0
+    at2 = put_event(buf, at2, 4, "chmod", 8)
+    at2 = put_event(buf, at2, 256, "real", 8)
+    let n2: usize = syswatch.parse_inotify(buf, at2, es, ns)
+    test.eq_usize(c, rep, "an unsubscribed mask is dropped", n2, 1)
+    test.eq_str(c, rep, "and the real event survives it", syswatch.change_name(es[0], ns), "real")
+
+    free_ptr(nb)
+    free_ptr(evs)
+    free_ptr(buf)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn lost_events_are_reported_rather_than_silently_dropped() -> bool {
+    var raw: *mut u8 = alloc(u8, WATCH_T_CAP)
+    var rep: []u8 = slice(u8, raw, WATCH_T_CAP)
+    var c: test.Check = test.new()
+
+    var buf: *mut u32 = alloc(u32, 256)
+    var evs: *mut syswatch.Change = alloc(syswatch.Change, 8)
+    var nb: *mut u8 = alloc(u8, 128)
+    var ns: []u8 = slice(u8, nb, 128)
+
+    // **The kernel's own queue overflow.** `IN_Q_OVERFLOW` means events were DROPPED, so
+    // everything after it understates the damage — the marker is emitted and the rest is
+    // abandoned. A watcher that reported the survivors and swallowed the marker would look
+    // like it was working while a build went stale.
+    var es: []syswatch.Change = slice(syswatch.Change, evs, 8)
+    var at: usize = 0
+    at = put_event(buf, at, 256, "seen", 8)
+    at = put_event(buf, at, 16384, "", 0)            // IN_Q_OVERFLOW
+    at = put_event(buf, at, 256, "unseen", 8)
+    let n: usize = syswatch.parse_inotify(buf, at, es, ns)
+    test.eq_usize(c, rep, "the change before the overflow survives", n, 2)
+    test.eq_i64(c, rep, "and the overflow is reported as a kind", es[1].kind as i64, syswatch.WATCH_OVERFLOW as i64)
+    test.eq_str(c, rep, "an overflow carries no name", syswatch.change_name(es[1], ns), "")
+
+    // **A caller's buffer that is too small produces the SAME signal**, deliberately: the
+    // data has already left the kernel and cannot be put back, so a short buffer loses
+    // changes exactly as an overflowing queue does. One recovery path, reachable without a
+    // kernel under load.
+    var small: []syswatch.Change = slice(syswatch.Change, evs, 2)
+    var at2: usize = 0
+    at2 = put_event(buf, at2, 256, "one", 4)
+    at2 = put_event(buf, at2, 256, "two", 4)
+    at2 = put_event(buf, at2, 256, "three", 8)
+    let n2: usize = syswatch.parse_inotify(buf, at2, small, ns)
+    test.eq_usize(c, rep, "a full buffer fills and then marks", n2, 2)
+    test.eq_i64(c, rep, "the last slot is the overflow marker", small[1].kind as i64, syswatch.WATCH_OVERFLOW as i64)
+
+    // The anti-vacuity control: the same three events into a buffer that FITS report three
+    // changes and no marker, so the assertion above is about the size and not about the
+    // events.
+    let n3: usize = syswatch.parse_inotify(buf, at2, es, ns)
+    test.eq_usize(c, rep, "and a big enough buffer keeps all three", n3, 3)
+    test.eq_i64(c, rep, "with no marker among them", es[2].kind as i64, syswatch.WATCH_CREATED as i64)
+
+    free_ptr(nb)
+    free_ptr(evs)
+    free_ptr(buf)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- the loop, with a scripted poller and no platform -------------------------
+
+@test fn a_watch_keeps_the_loop_alive_and_a_token_stops_it() -> bool {
+    var raw: *mut u8 = alloc(u8, WATCH_T_CAP)
+    var rep: []u8 = slice(u8, raw, WATCH_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var hits: *mut i64 = alloc(i64, 1)
+    unsafe { (hits + 0).* = 0 }
+
+    // No watcher and no operating system: this is the loop's contract for a watch handle,
+    // whatever produced it. A file watcher registers exactly like a socket does, which is
+    // the property that made `Poller` a fn pointer.
+    var rt: runtime.Runtime = runtime.make(a, time.manual(0))
+    runtime.set_poller(rt, runtime.poller(null, &quiet))
+    let tok: runtime.CancelToken = runtime.token(rt)
+    runtime.watch(rt, 42, tok, runtime.task(hits as *mut u8, &bump))
+
+    test.is_false(c, rep, "a watch alone means the loop is not finished", runtime.is_idle(rt))
+    let e0: runtime.Event = runtime.poll_for(rt, 1000)
+    test.eq_i64(c, rep, "a quiet directory times out", e0.kind as i64, RT_TIMEOUT as i64)
+
+    // One token stops a watcher's registration exactly as it stops a timer's — which is why
+    // a build tool can hand every watch it opens the same token and forget the ids.
+    let killed: i64 = runtime.cancel_all(rt, tok)
+    test.eq_i64(c, rep, "the token cancelled the watch", killed, 1)
+    let e1: runtime.Event = runtime.poll_for(rt, 1000)
+    test.eq_i64(c, rep, "and now the loop is finished", e1.kind as i64, RT_IDLE as i64)
+    var n: i64 = 0
+    unsafe { n = (hits + 0).* }
+    test.eq_i64(c, rep, "nothing ever fired", n, 0)
+
+    runtime.free(rt)
+    free_ptr(hits)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// ---- the real platform --------------------------------------------------------
+
+@test fn a_real_change_wakes_the_loop_and_drains() -> bool {
+    var raw: *mut u8 = alloc(u8, WATCH_T_CAP)
+    var rep: []u8 = slice(u8, raw, WATCH_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+
+    // A scratch directory of this test's own, so the suite needs no fixture in the
+    // repository and cannot be woken by something else's file. Scrubbed at the START rather
+    // than the end: a test that fails midway must not leave the next run looking at its
+    // debris, and end-of-test cleanup is exactly the code that does not run when something
+    // goes wrong.
+    scrub(h, a)
+    sysfs.make_dir(h, a, WATCH_T_ROOT) catch false
+
+    var w: syswatch.Watcher = syswatch.open_dir(h, a, WATCH_T_ROOT) catch no_watch()
+    test.is_true(c, rep, "a watcher opens on a real directory", syswatch.is_open(w))
+
+    var hits: *mut i64 = alloc(i64, 1)
+    unsafe { (hits + 0).* = 0 }
+    var rt: runtime.Runtime = runtime.make(a, time.manual(0))
+
+    // **The pairing this module asks a caller to hold**: the handle and the poller come from
+    // the same watcher. On Linux `poller` is `syspoll.host()` and the handle is an fd, so
+    // this is the same registration a socket makes; on Windows both are the watcher's own,
+    // because a change-notification handle is not a socket and `WSAPoll` cannot see it.
+    runtime.set_poller(rt, syswatch.poller(w))
+    let tok: runtime.CancelToken = runtime.token(rt)
+    runtime.watch(rt, syswatch.handle(w), tok, runtime.task(hits as *mut u8, &bump))
+
+    // Nothing has happened yet. A 30ms budget distinguishes "quiet" from "the poller never
+    // works" without making the suite slow, and it is the only real wait in this file.
+    let quiet_ev: runtime.Event = runtime.poll_for(rt, 30000000)
+    test.eq_i64(c, rep, "an untouched directory is not ready", quiet_ev.kind as i64, RT_TIMEOUT as i64)
+
+    // Now change it for real.
+    fs.put(h, WATCH_T_FILE, "hello")
+
+    let e: runtime.Event = runtime.poll_for(rt, 2000000000)
+    test.eq_i64(c, rep, "a real change wakes the loop", e.kind as i64, RT_READY as i64)
+    var fired: i64 = 0
+    unsafe { fired = (hits + 0).* }
+    test.eq_i64(c, rep, "and the watch task ran", fired, 1)
+
+    // And the readiness was TRUE rather than merely reported: the drain that follows finds
+    // something. Without this the test would pass for a poller that said ready always.
+    var evs: *mut syswatch.Change = alloc(syswatch.Change, 8)
+    var es: []syswatch.Change = slice(syswatch.Change, evs, 8)
+    var nb: *mut u8 = alloc(u8, 256)
+    var ns: []u8 = slice(u8, nb, 256)
+    let n: usize = syswatch.drain(w, es, ns) catch 0
+    test.is_true(c, rep, "the promised drain really found a change", n > 0)
+
+    // **What the change SAYS is platform-dependent, and the test asserts the claim the
+    // module makes rather than one platform's answer.** `names_changes()` is the module's
+    // own statement about which world it is in, so this fails if the statement and the
+    // behaviour ever disagree — on Linux a named event, on Windows the rescan marker.
+    if syswatch.names_changes() {
+        test.eq_str(c, rep, "Linux names the entry that changed", syswatch.change_name(es[0], ns), "made.txt")
+    } else {
+        test.eq_i64(c, rep, "Windows reports a rescan and no name", es[0].kind as i64, syswatch.WATCH_RESCAN as i64)
+        test.eq_str(c, rep, "with no name at all", syswatch.change_name(es[0], ns), "")
+    }
+
+    // **A watch is drained until it is EMPTY, not drained once**, and this is the assertion
+    // that says so. One logical file operation is more than one notification on both
+    // platforms — Linux batches `IN_CREATE` and `IN_CLOSE_WRITE` into a single read, while
+    // Windows re-arms straight back into a signaled state because the directory really did
+    // change twice — so "the second drain answers none" is one platform's coalescing
+    // mistaken for a contract. What both platforms owe is CONVERGENCE: with nothing new
+    // happening, draining reaches zero in bounded steps and never blocks.
+    var rounds: usize = 0
+    var last: usize = 1
+    for last > 0 and rounds < 8 {
+        last = syswatch.drain(w, es, ns) catch 99
+        rounds = rounds + 1
+    }
+    test.eq_usize(c, rep, "draining converges to empty", last, 0)
+    test.is_true(c, rep, "and it took a bounded number of rounds", rounds < 8)
+
+    // And a drained watch stops waking the loop, which is the property that keeps a
+    // level-triggered watch from becoming a busy loop. This is the real consequence of the
+    // convergence above, and it is asserted separately so a `drain` that answered 0 without
+    // actually consuming anything would still be caught.
+    let after: runtime.Event = runtime.poll_for(rt, 30000000)
+    test.eq_i64(c, rep, "a drained watch goes quiet again", after.kind as i64, RT_TIMEOUT as i64)
+
+    syswatch.close_watch(w) catch nothing()
+    test.is_false(c, rep, "and the watcher closes", syswatch.is_open(w))
+
+    scrub(h, a)
+    free_ptr(nb)
+    free_ptr(evs)
+    runtime.free(rt)
+    free_ptr(hits)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// A poller that reports nothing ready, so the loop's behaviour over a quiet watch can be
+// asserted with no platform at all.
+fn quiet(ctx: *mut u8, fds: *mut i64, ready: *mut u8, n: usize, timeout_nanos: i64) -> i64 {
+    var i: usize = 0
+    for i < n {
+        unsafe { (ready + i).* = 0 as u8 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Record `v` and answer with a closed watcher.
+//
+// A `match` ARM BODY must be an EXPRESSION — a bare assignment cannot be a `catch` fallback
+// and a `return` there abandons the caller — so the shape that works is a helper that
+// records into a `mut` slot and returns the ok type.
+fn stamp(slot: *mut i64, v: i64) -> syswatch.Watcher {
+    unsafe { (slot + 0).* = v }
+    return syswatch.closed()
+}

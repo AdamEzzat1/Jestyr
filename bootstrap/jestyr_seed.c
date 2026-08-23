@@ -1114,6 +1114,7 @@ int32_t jestyr_intrinsic_ret(Jestyr_Checker* restrict j_c, JestyrStr j_t);
 int32_t jestyr_field_probe_fn(Jestyr_Checker* restrict j_c, Jestyr_Parser j_p, JestyrStr j_src, int32_t j_recv, size_t j_fs, size_t j_fe);
 int32_t jestyr_subst_tp_ty(Jestyr_Checker* restrict j_c, JestyrStr j_src, int32_t j_ty, int32_t j_tp_start, int32_t j_tp_count, int32_t j_args_start, int32_t j_args_count);
 int32_t jestyr_reflect_ret(JestyrStr j_n);
+int32_t jestyr_layout_ret(JestyrStr j_n);
 int32_t jestyr_infer_call(Jestyr_Checker* restrict j_c, Jestyr_Parser j_p, JestyrStr j_src, int32_t j_id);
 void jestyr_push_uint__typeck(JestyrString* restrict j_sb, int64_t j_v);
 void jestyr_ty_str(JestyrStr j_src, Jestyr_Checker j_c, int32_t j_id, JestyrString* restrict j_sb);
@@ -14082,6 +14083,23 @@ int32_t jestyr_reflect_ret(JestyrStr j_n)
     return (0 - 1);
 }
 
+int32_t jestyr_layout_ret(JestyrStr j_n)
+{
+    if (jestyr_rt_str_eq(j_n, JSTR("size_of")))
+    {
+        return jestyr_t_i64();
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("align_of")))
+    {
+        return jestyr_t_i64();
+    }
+    if (jestyr_rt_str_eq(j_n, JSTR("offset_of")))
+    {
+        return jestyr_t_i64();
+    }
+    return (0 - 1);
+}
+
 int32_t jestyr_infer_call(Jestyr_Checker* restrict j_c, Jestyr_Parser j_p, JestyrStr j_src, int32_t j_id)
 {
     Jestyr_ExprData j_d = jestyr_get__list__ExprData(j_p.j_ex, (size_t)(j_id));
@@ -14092,6 +14110,11 @@ int32_t jestyr_infer_call(Jestyr_Checker* restrict j_c, Jestyr_Parser j_p, Jesty
         if ((j_rr >= 0))
         {
             return j_rr;
+        }
+        int32_t j_lr = jestyr_layout_ret(jestyr_rt_substr(j_src, (size_t)(j_cal.j_x), (size_t)(j_cal.j_y)));
+        if ((j_lr >= 0))
+        {
+            return j_lr;
         }
     }
     if ((j_cal.j_kind == 5))

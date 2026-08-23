@@ -1,0 +1,289 @@
+// examples/std/syswatch_demo.jtr — `jwatch`, a debounced rebuild trigger.
+//
+// The smallest program that genuinely needs this whole tier: a watcher registered in an
+// event loop, a DEBOUNCE timer sharing that loop and that cancellation token, and a RESCAN
+// that decides what actually changed.
+//
+// Run:  jestyrc run examples/std/syswatch_demo.jtr
+//
+// ─── Why the rescan is the answer and the watcher is only the question ────────
+//
+// This program never prints an event's name, and on Linux it could — `std/syswatch` hands
+// back `made.txt` and the kind that touched it. It prints the result of a fresh directory
+// listing instead, and that is the demonstration rather than a simplification:
+//
+//   * **It is the only version that is correct on both platforms.** Windows reports THAT
+//     something changed and never what. A program written around event names works on Linux
+//     and reports nothing on Windows, which is the bug this module's header exists to stop
+//     someone writing.
+//
+//   * **It is the only version that survives an overflow.** Linux drops events when its
+//     queue fills, and a program that trusts the event stream silently goes stale exactly
+//     when the tree is busiest — the one moment a build tool must not.
+//
+// So the watcher's job here is to say WHEN to look, and the rescan's job is to say WHAT is
+// there. That the output is then identical on Linux and Windows is a consequence, not a
+// coincidence.
+//
+// ─── Why there is a debounce, and why it needs the event loop ─────────────────
+//
+// One editor save is several notifications — a create, a write, sometimes a rename of a
+// temporary file over the original — and `std/syswatch`'s `drain` header says so. Acting on
+// each one runs the build three times for one edit. So a burst is COALESCED: the first
+// notification arms a timer, every further notification re-arms it, and only the timer
+// firing triggers a rescan.
+//
+// That is exactly the thing a hand-rolled `while (true) { check(); sleep(50); }` cannot do,
+// and it is why the debounce lives in the same `Runtime` as the watch: one loop waits on
+// the directory and the clock at once, and one `CancelToken` stops both.
+//
+// The output is asserted to the line by `jwatch_coalesces_a_burst_and_reports_by_rescanning`.
+
+import "syswatch"
+import "runtime"
+import "time"
+import "mem"
+import "fs"
+import "sysfs"
+import "walk"
+import "sink"
+
+const WATCH_D_ROOT: str = "zz_syswatch_demo"
+const WATCH_D_A: str = "zz_syswatch_demo/alpha.txt"
+const WATCH_D_B: str = "zz_syswatch_demo/beta.txt"
+
+// 40ms. Long enough to swallow the several notifications one file operation produces,
+// short enough that a person does not notice it. It is a POLICY, which is why it lives
+// here in the consumer and not in `std/syswatch` — a library that picked one would be
+// picking it for every caller.
+const WATCH_D_DEBOUNCE: i64 = 40000000
+
+// How long the loop will wait for a burst to arrive and settle before giving up. Generous:
+// this is a bound that keeps a broken platform from hanging the demo, not a timeout anyone
+// should hit.
+const WATCH_D_BUDGET: i64 = 3000000000
+const WATCH_D_ROUNDS: usize = 64
+const WATCH_D_CAP: usize = 1024
+
+// The shared state the callbacks write and the loop reads.
+//
+//   slot 0 — notifications accumulated in the current burst
+//   slot 1 — the watch fired and has not been drained yet
+//   slot 2 — the debounce timer fired; a rescan is due
+//   slot 3 — entries counted by the last rescan
+const WATCH_D_PENDING: usize = 0
+const WATCH_D_READY: usize = 1
+const WATCH_D_SETTLED: usize = 2
+const WATCH_D_COUNT: usize = 3
+
+// **The callback MARKS and the loop ACTS**, which is the same discipline `jstatus` follows
+// for a socket. A callback runs inside the fire pass, so draining or rescanning here would
+// stall every other timer in the loop — and worse, it would put operations that can fail
+// somewhere with nowhere to report a failure.
+fn on_change(ctx: *mut u8, id: i64, now: i64) {
+    var s: *mut i64 = ctx as *mut i64
+    unsafe { (s + WATCH_D_READY).* = 1 }
+}
+
+fn on_settle(ctx: *mut u8, id: i64, now: i64) {
+    var s: *mut i64 = ctx as *mut i64
+    unsafe { (s + WATCH_D_SETTLED).* = 1 }
+}
+
+// One entry of a rescan. Prints the NAME rather than the path, because the path separator
+// differs between platforms and the whole point of this program is output that does not.
+fn show(ctx: *mut u8, p: str, depth: usize, is_dir: bool) -> bool {
+    var s: *mut i64 = ctx as *mut i64
+    var n: i64 = 0
+    unsafe { n = (s + WATCH_D_COUNT).* }
+    unsafe { (s + WATCH_D_COUNT).* = n + 1 }
+    if p.len > WATCH_D_ROOT.len + 1 {
+        print_str(p[WATCH_D_ROOT.len + 1 .. p.len])
+    }
+    return true
+}
+
+fn nothing() { }
+
+fn no_watch() -> syswatch.Watcher {
+    return syswatch.closed()
+}
+
+// A fresh, SORTED listing of the directory. `walk`'s ordering is deterministic by design,
+// which is what makes a rescan's output an assertion rather than a description.
+fn rescan(read a: Allocator, read cap: fs.Fs, state: *mut i64) {
+    unsafe { (state + WATCH_D_COUNT).* = 0 }
+    var opts: walk.WalkOptions = walk.options()
+    opts = walk.with_sorted(opts, true)
+    opts = walk.with_depth(opts, 1)
+    // `&show`, not `show`: a bare function name in fn-pointer argument position emits a
+    // local's spelling and gcc rejects it.
+    let vis: walk.Visitor = walk.visitor(state as *mut u8, &show)
+    let rep: walk.WalkReport = walk.walk(a, cap, WATCH_D_ROOT, opts, vis)
+}
+
+// Drive the loop until a burst has arrived AND settled, or the budget runs out. Returns
+// how many notifications were coalesced into it, or -1 if nothing ever arrived.
+//
+// This is the whole point of the module sharing a `Runtime` with the timers: the wait
+// belongs to the poller, so a change ends it early — and the debounce timer still fires on
+// time, because the poller's wait is clamped to the next deadline.
+fn settle(mut rt: runtime.Runtime, mut w: syswatch.Watcher, read tok: runtime.CancelToken,
+          state: *mut i64, mut evs: []syswatch.Change, mut names: []u8) -> i64 {
+    var timer: i64 = 0 - 1
+    var left: i64 = WATCH_D_BUDGET
+    var r: usize = 0
+    for r < WATCH_D_ROUNDS {
+        let e: runtime.Event = runtime.poll_for(rt, left)
+
+        var ready: i64 = 0
+        unsafe { ready = (state + WATCH_D_READY).* }
+        if ready != 0 {
+            unsafe { (state + WATCH_D_READY).* = 0 }
+            // **Drain until empty.** One file operation is more than one notification, and
+            // the two platforms coalesce differently — see `syswatch.drain`'s header. A
+            // caller that drains once works on exactly one of them.
+            var got: usize = 1
+            var guard: usize = 0
+            for got > 0 and guard < 16 {
+                got = syswatch.drain(w, evs, names) catch 0
+                var acc: i64 = 0
+                unsafe { acc = (state + WATCH_D_PENDING).* }
+                unsafe { (state + WATCH_D_PENDING).* = acc + (got as i64) }
+                guard = guard + 1
+            }
+            // Re-arm the debounce. Cancelling the previous timer is what makes this a
+            // debounce rather than a throttle: the burst is over when notifications STOP,
+            // not when a fixed window since the first one elapses.
+            if timer >= 0 { runtime.cancel(rt, timer) }
+            timer = runtime.after(rt, WATCH_D_DEBOUNCE, tok, runtime.task(state as *mut u8, &on_settle))
+        }
+
+        var done: i64 = 0
+        unsafe { done = (state + WATCH_D_SETTLED).* }
+        if done != 0 {
+            unsafe { (state + WATCH_D_SETTLED).* = 0 }
+            var n: i64 = 0
+            unsafe { n = (state + WATCH_D_PENDING).* }
+            unsafe { (state + WATCH_D_PENDING).* = 0 }
+            return n
+        }
+
+        left = left - e.waited
+        if left <= 0 { return 0 - 1 }
+        r = r + 1
+    }
+    return 0 - 1
+}
+
+// A burst's heading and the one claim that holds on BOTH platforms.
+//
+// The notification COUNT is deliberately not printed, and that is not squeamishness: one
+// `fs.put` is `IN_CREATE` + `IN_CLOSE_WRITE` on Linux and a differently-coalesced pair of
+// directory changes on Windows, so a count is a number this program cannot promise. What it
+// can promise is the debounce's actual contract — **a burst of notifications produced
+// exactly one rescan** — and that is what is asserted, so the transcript is identical on
+// both platforms and still says something falsifiable.
+fn burst(mut buf: []u8, read label: str, n: i64) {
+    var s: Sink = sink.new()
+    sink.put_str(s, buf, "-- ")
+    sink.put_str(s, buf, label)
+    sink.put_str(s, buf, " --")
+    print_str(sink.view(s, buf))
+    print_str("a burst arrived and settled into one rescan")
+    print_bool(n > 0)
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var cap: fs.Fs = fs.host()
+
+    // Scrub first, not last: a run that fails midway must not leave the next one looking at
+    // its debris, and end-of-run cleanup is exactly the code that does not run when
+    // something goes wrong.
+    fs.erase(cap, WATCH_D_A)
+    fs.erase(cap, WATCH_D_B)
+    let gone: bool = sysfs.remove_dir(cap, a, WATCH_D_ROOT) catch false
+    let made: bool = sysfs.make_dir(cap, a, WATCH_D_ROOT) catch false
+
+    var w: syswatch.Watcher = syswatch.open_dir(cap, a, WATCH_D_ROOT) catch no_watch()
+    if syswatch.is_open(w) == false {
+        print_str("could not watch the directory")
+        return 1
+    }
+
+    var state: *mut i64 = alloc(i64, 4)
+    var i: usize = 0
+    for i < 4 {
+        unsafe { (state + i).* = 0 }
+        i = i + 1
+    }
+
+    // A HOST clock, unlike `jheartbeat`'s: the changes this program reacts to are real, so
+    // the time it waits for them has to be real too. The debounce is the only thing the
+    // clock is asked for, and its length is never printed — which is what keeps the output
+    // deterministic without pretending the waiting was.
+    var rt: runtime.Runtime = runtime.make(a, time.host())
+
+    // **The pairing `std/syswatch` asks a caller to hold**: the handle and the poller come
+    // from the same watcher. On Linux that poller is `syspoll.host()` and the handle is a
+    // file descriptor, so this registration is the one a socket makes; on Windows both are
+    // the watcher's own, because a change-notification handle is not a socket.
+    runtime.set_poller(rt, syswatch.poller(w))
+    let tok: runtime.CancelToken = runtime.token(rt)
+    runtime.watch(rt, syswatch.handle(w), tok, runtime.task(state as *mut u8, &on_change))
+
+    var evraw: *mut syswatch.Change = alloc(syswatch.Change, 32)
+    var evs: []syswatch.Change = slice(syswatch.Change, evraw, 32)
+    var nraw: *mut u8 = alloc(u8, 1024)
+    var names: []u8 = slice(u8, nraw, 1024)
+    var braw: *mut u8 = alloc(u8, WATCH_D_CAP)
+    var buf: []u8 = slice(u8, braw, WATCH_D_CAP)
+
+    print_str("-- jwatch --")
+    print_str("watching a directory of its own")
+    print_bool(syswatch.is_open(w))
+
+    // Burst one: two files created back to back. Several notifications, one rescan.
+    fs.put(cap, WATCH_D_A, "one")
+    fs.put(cap, WATCH_D_B, "two")
+    let n1: i64 = settle(rt, w, tok, state, evs, names)
+    burst(buf, "burst 1: two files created", n1)
+    rescan(a, cap, state)
+
+    // Burst two: one file rewritten. The listing is UNCHANGED, and that is the honest
+    // answer rather than a gap — a rescan by name cannot see a rewrite, and seeing one would
+    // need the size or the modification time this tier deliberately does not read. A build
+    // tool that needs it hashes the contents, which is a decision with a cost, made by the
+    // caller, out in the open.
+    fs.put(cap, WATCH_D_A, "one, revised")
+    let n2: i64 = settle(rt, w, tok, state, evs, names)
+    burst(buf, "burst 2: one file rewritten", n2)
+    rescan(a, cap, state)
+
+    // Burst three: one file removed.
+    fs.erase(cap, WATCH_D_B)
+    let n3: i64 = settle(rt, w, tok, state, evs, names)
+    burst(buf, "burst 3: one file removed", n3)
+    rescan(a, cap, state)
+
+    // **One token stops the watch and the debounce together** — the reason cancellation is a
+    // group and not an id. A build tool that opened twenty watchers and a timer for each
+    // would otherwise be keeping a list of forty ids to shut down cleanly.
+    print_str("-- shutdown --")
+    print_str("one token stopped the watch")
+    print_int(runtime.cancel_all(rt, tok))
+    print_str("and the loop is idle")
+    print_bool(runtime.is_idle(rt))
+
+    syswatch.close_watch(w) catch nothing()
+    runtime.free(rt)
+    free_ptr(braw)
+    free_ptr(nraw)
+    free_ptr(evraw)
+    free_ptr(state)
+    fs.erase(cap, WATCH_D_A)
+    fs.erase(cap, WATCH_D_B)
+    let bye: bool = sysfs.remove_dir(cap, a, WATCH_D_ROOT) catch false
+    return 0
+}

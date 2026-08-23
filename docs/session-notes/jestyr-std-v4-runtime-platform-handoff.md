@@ -15,6 +15,13 @@ anything; if a later failure appears, assume it is yours.
 
 ## §0. START HERE
 
+> **SUPERSEDED for "what to do next" by
+> `docs/session-notes/jestyr-std-v4-file-watching-handoff.md`.** The brief's §1.4 (file
+> watching) named below as the next thing to build **is done** — `std/syswatch` plus
+> `jwatch`, its debounced-rebuild-trigger consumer. Read the successor's §0 first; this note
+> remains the authoritative record for §1.1–§1.3 and for the nine compiler bugs they found,
+> and everything in §2 and §4 below is still true.
+
 The brief's **§1.1 (`sys/fs`) and §2.3 (platform error shape) are done**, with a real
 consumer. **`JestyrResult_unit` lowering is done too** — a fallible function may now have no
 return type at all, which is the natural signature for most of what a `sys` layer does.
@@ -704,8 +711,8 @@ were byte-identical first try.
 | 1.2 | deterministic `std/walk` | ✅ Tier 3 |
 | 1.3 | event loop V1 | ✅ — cancellation, waiting `poll_for`, and now `Poller` + `watch` |
 | 1.4 | TCP sockets | ✅ this session — `std/sysnet`, real loopback both directions |
-| 1.5 | file watching | ⬜ — **start here**; a `Pollable` over `inotify` / `ReadDirectoryChangesW` |
-| 1.6 | structured logging | ⬜ |
+| 1.5 | file watching | ✅ — `std/syswatch`, inotify / change notifications. See the successor note |
+| 1.6 | structured logging | ⬜ — **start here** |
 | 1.7 | HTTP/1.1 | ⬜ |
 | 1.8 | tar / reproducible archive | ⬜ |
 | 1.9 | Unicode display width | ⬜ — `std/diag`'s `caret_alignment_is_byte_based_and_tabs_expand` is the pin to invert |

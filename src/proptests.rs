@@ -529,6 +529,83 @@ mod sysnet_status_server {
     }
 }
 
+/// **`jwatch` — a debounced rebuild trigger, end to end through the real filesystem.**
+///
+/// `examples/std/syswatch_demo.jtr` is `std/syswatch`'s consumer, and it is the smallest
+/// program that needs the whole tier at once: a watcher registered as a pollable, a DEBOUNCE
+/// timer sharing that loop and that `CancelToken`, and a rescan that decides what actually
+/// changed.
+///
+/// **The transcript is identical on Linux and Windows, and that is the assertion.** The demo
+/// never prints an event's name or a notification count, though on Linux it could print
+/// both: Windows reports only THAT the directory changed, and Linux drops events when its
+/// queue overflows, so a program built around the event stream is correct on at most one
+/// platform and stale on the other under load. Printing the RESCAN instead is the only
+/// version that is right on both — see the demo's header. If this test ever needs a
+/// `cfg!(windows)` branch, that design has been abandoned.
+///
+/// The other claim is the debounce's: three edit rounds produce exactly three rescans, not
+/// one per notification. `fs.put` alone is two notifications on both platforms.
+#[cfg(all(test, feature = "c-oracle"))]
+mod syswatch_debounced_trigger {
+    use super::*;
+
+    #[test]
+    fn jwatch_coalesces_a_burst_and_reports_by_rescanning() {
+        let exe = super::c_oracle::build_exe("examples/std/syswatch_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the watcher demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        let want = "-- jwatch --\n\
+                    watching a directory of its own\n\
+                    true\n\
+                    -- burst 1: two files created --\n\
+                    a burst arrived and settled into one rescan\n\
+                    true\n\
+                    alpha.txt\n\
+                    beta.txt\n\
+                    -- burst 2: one file rewritten --\n\
+                    a burst arrived and settled into one rescan\n\
+                    true\n\
+                    alpha.txt\n\
+                    beta.txt\n\
+                    -- burst 3: one file removed --\n\
+                    a burst arrived and settled into one rescan\n\
+                    true\n\
+                    alpha.txt\n\
+                    -- shutdown --\n\
+                    one token stopped the watch\n\
+                    1\n\
+                    and the loop is idle\n\
+                    true";
+        assert_eq!(out.trim_end(), want, "the watcher's transcript changed:\n{out}");
+
+        // Anti-vacuity, the same shape `jstatus` uses: `true` appears often enough that a
+        // containment check would pass for a demo that printed it unconditionally, so every
+        // `false` must be absent — each one would be a step that did not happen.
+        assert!(!out.contains("false"), "every step must have succeeded:\n{out}");
+
+        // **Exactly three rescans for three edit rounds.** This is the debounce's whole
+        // claim: a burst of notifications produces ONE rescan, not one per notification, and
+        // `fs.put` by itself is two notifications on both platforms. A demo that acted on
+        // each notification would print six headings and this count would move.
+        assert_eq!(
+            out.matches("a burst arrived and settled into one rescan").count(),
+            3,
+            "three edits must coalesce into three rescans, not one per notification:\n{out}"
+        );
+
+        // The listing shrinks when a file is removed, which is what makes the rescan a real
+        // rescan rather than a replay of the first one.
+        assert_eq!(out.matches("beta.txt").count(), 2, "beta.txt must vanish from the last rescan:\n{out}");
+
+        // The demo scrubs its own scratch tree at both ends, so a rerun is identical and the
+        // working tree is unchanged.
+        assert!(!std::path::Path::new("zz_syswatch_demo").exists(), "the demo must clean up after itself");
+    }
+}
+
 /// **`jstage` — the atomic-publish demo, end to end through the real filesystem.**
 ///
 /// `examples/std/sysfs_demo.jtr` is `std/sysfs`'s consumer, not an illustration of it: it
@@ -16169,7 +16246,34 @@ fn main() -> i32 {
         "sysnet.jtr",
         "syspoll.jtr",
         "syspoll_test.jtr",
+        // `syswatch.jtr` binds `inotify_*`/`readv` against `FindFirstChangeNotificationA`
+        // behind `@cfg`, so `every_cfg_bearing_corpus_file_is_byte_identity_verified`
+        // requires it here. Byte-identical first try.
+        "syswatch.jtr",
     ];
+    // **`syswatch_test.jtr` and `syswatch_demo.jtr` are deliberately absent, and the reason
+    // was MEASURED** — the same discipline `sysfs_test.jtr` below asks for, and the same
+    // category of divergence.
+    //
+    // Both are the first corpus files to build a `[]T` whose ELEMENT is a struct imported
+    // from another module (`slice(syswatch.Change, …)`). This golden feeds the raw file to
+    // both backends with imports UNRESOLVED, so `syswatch.Change` cannot resolve, and the
+    // two sides degrade the unknown element differently — one typedef:
+    //
+    //     reference:  typedef struct { int* ptr; size_t len; } JestyrSlice_?;
+    //     port:       (nothing)
+    //
+    // Note what the reference emits: a typedef whose NAME IS NOT A VALID C IDENTIFIER. It
+    // could never compile, which is the clue that this is degradation shape and not a real
+    // mangle gap — §2.1d's `JestyrResult_?` was a missing `Unit` arm reachable from a VALID
+    // program, and telling the two apart is the whole point of measuring.
+    //
+    // Rebuilt self-contained with the struct declared LOCALLY so the element RESOLVES, both
+    // backends emit `JestyrSlice_Change` and agree byte for byte over the whole file — the
+    // `#line` directives aside, which are the port's separately-recorded gap. So this cannot
+    // affect a program that compiles, and the demo is not left unchecked by its absence
+    // here: `jc_build_matrix_matches_expectations` builds it through the port's own module
+    // loader, where the import DOES resolve, and it runs and prints the same transcript.
     // **`sysfs_test.jtr` is deliberately absent, and the reason was MEASURED rather than
     // assumed** — which is what `walk.jtr`'s note below asks the next person to do.
     //
@@ -17197,6 +17301,13 @@ fn main() -> i32 {
             // Two halves: the loop driven by a scripted poller with no OS at all, and one
             // end-to-end check of the per-platform `pollfd` layout against the real kernel.
             ("syspoll_test", 3),
+            // **Three halves, and the middle one is why this suite is worth its size.** The
+            // capability and its refusals need no platform; the inotify PARSER is not
+            // `@cfg`-guarded, so its mask decoding, NUL padding, queue-overflow marker and
+            // buffer-full marker are exercised on Windows — the host that will never compile
+            // that branch into a real program — exactly as `syserr`'s pure tables are; and
+            // one end-to-end case uses a real directory, a real change and the real loop.
+            ("syswatch_test", 7),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");
