@@ -14,24 +14,26 @@
 //
 // So there is no `spawn()` free function, no ambient executor, and no `block_on` that
 // conjures one. You construct a `Runtime`, you hand it to whoever schedules work, and you
-// step it. `poll(rt)` runs what is due and returns; `run_until_idle(rt)` runs until
+// step it. `fire_due(rt)` runs what is due and returns; `run_until_idle(rt)` runs until
 // nothing is left. Neither ever blocks, and neither ever sleeps — see below.
 //
-// ─── What this deliberately IS NOT, yet ───────────────────────────────────────
+// ─── IO is here now, and this module still never touches the OS ───────────────
 //
-// **There is no IO here, and adding a `Pollable` that could not poll would be worse than
-// having none.** Non-blocking sockets and file handles need `epoll`/`kqueue`/IOCP, which
-// are three different models with three different readiness semantics — the same kind of
-// portability decision that made directory listing a `sys` module, only larger. That work
-// belongs behind `sys` and behind the `@cfg` port mirror that `std/sysdir` already owes.
+// This header used to say there was no IO and that adding a `Pollable` which could not poll
+// would be worse than having none. `Pollable` has landed, and the way it landed keeps the
+// promise that made the deferral worth making: **the runtime holds the registry and does
+// not perform the wait.** Readiness arrives through a `Poller` — a `ctx` + fn-pointer pair,
+// the `mem.Allocator` shape — so `std/syspoll` supplies the kernel's answer, a test
+// supplies a scripted one, and this module reaches the operating system through exactly the
+// two handles it is given: a `Clock` and a `Poller`.
 //
-// What CAN exist honestly today is the boundary itself: a runtime handle, timers on a
-// clock, cancellation, and a deterministic step function. Those are the parts every async
-// design needs to agree on FIRST, and settling them against a manual clock is much cheaper
-// than settling them against a socket.
+// That is why `epoll`/`kqueue`/IOCP being three different models does not infect the loop.
+// They are three different `Poller` implementations behind one signature, and the loop
+// cannot tell them apart — which is the property that makes the deterministic test runtime
+// possible at all.
 //
 // **Nothing here sleeps.** A loop with no IO cannot wait for anything but time, and a real
-// sleep would make every test take as long as its longest timer. `poll` asks the clock,
+// sleep would make every test take as long as its longest timer. `fire_due` asks the clock,
 // fires what is due, and returns; `next_deadline` tells a caller how long it could sleep
 // if it had something to sleep on. Under `time.host()` a caller drives that itself; under
 // `time.manual()` a test calls `time.advance` and gets the same behaviour instantly.
@@ -84,6 +86,47 @@ pub struct Runtime {
     next_group: i64,
     fired: i64,
     cancelled: i64,
+    // ---- pollables: the same struct-of-arrays shape, one entry per watch ----
+    fds: List(i64),             // the handle the poller asks about
+    pids: List(i64),
+    palive: List(bool),
+    pgroups: List(i64),
+    ptasks: List(Task),
+    poller: Poller,
+    ready: i64,                 // how many watches have fired, the pollable half of `fired`
+}
+
+// **How readiness reaches the loop, without the loop knowing what a socket is.**
+//
+// `wait_fn(ctx, fds, ready, n, timeout_nanos)` blocks up to `timeout_nanos`, writes 1 into
+// `ready[i]` for each of the `n` handles in `fds` that can be read without blocking, and
+// returns the count — or -1 if the platform refused.
+//
+// A `ctx` + fn-pointer pair rather than a trait, for the reason `mem.Allocator` is one:
+// Jestyr has no closures that cross a module boundary, and this shape makes the poller's
+// state EXPLICIT. `std/syspoll.host()` is the kernel's answer; a test writes its own in
+// four lines and drives the whole loop deterministically.
+//
+// `@copy`: a pointer and a function pointer, exactly like an `Allocator`.
+@copy pub struct Poller {
+    ctx: *mut u8,
+    wait_fn: fn(*mut u8, *mut i64, *mut u8, usize, i64) -> i64,
+}
+
+@no_alloc @no_os pub fn poller(ctx: *mut u8, f: fn(*mut u8, *mut i64, *mut u8, usize, i64) -> i64) -> Poller {
+    return Poller{ ctx: ctx, wait_fn: f }
+}
+
+// The poller a `Runtime` starts with: it is never CALLED, because a runtime with no watches
+// never asks. It exists so `Runtime` has a total value for the field rather than an
+// optional one — an `Option(Poller)` would put a branch on every step to express a state
+// that is already observable as `watching(rt) == 0`.
+fn never_ready(ctx: *mut u8, fds: *mut i64, ready: *mut u8, n: usize, timeout_nanos: i64) -> i64 {
+    return 0
+}
+
+@no_alloc @no_os pub fn no_poller() -> Poller {
+    return Poller{ ctx: null, wait_fn: &never_ready }
 }
 
 // ---- cancellation ------------------------------------------------------------
@@ -150,6 +193,19 @@ pub fn cancel_all(mut rt: Runtime, read tok: CancelToken) -> i64 {
         }
         i = i + 1
     }
+    // **Watches are cancelled by the same token as timers**, and that is the whole reason
+    // cancellation is a GROUP rather than an id: "stop everything this connection started"
+    // has to reach its socket watch and its timeout timer in one call, or a caller ends up
+    // keeping a list of both.
+    var j: usize = 0
+    for j < list.len(i64, rt.pgroups) {
+        if list.get(i64, rt.pgroups, j) == tok.grp and list.get(bool, rt.palive, j) {
+            list.set(bool, rt.palive, j, false)
+            rt.cancelled = rt.cancelled + 1
+            n = n + 1
+        }
+        j = j + 1
+    }
     return n
 }
 
@@ -157,7 +213,7 @@ pub fn cancel_all(mut rt: Runtime, read tok: CancelToken) -> i64 {
 // not outlive the call, and a runtime that borrowed its clock could not outlive the frame
 // that made it. Taking ownership is the honest signature -- the clock belongs to the loop.
 pub fn make(read a: Allocator, take c: time.Clock) -> Runtime {
-    return Runtime{ clock: c, tasks: list.make(Task, a), deadlines: list.make(i64, a), ids: list.make(i64, a), alive: list.make(bool, a), groups: list.make(i64, a), dead_groups: list.make(i64, a), next_id: 1, next_group: 0, fired: 0, cancelled: 0 }
+    return Runtime{ clock: c, tasks: list.make(Task, a), deadlines: list.make(i64, a), ids: list.make(i64, a), alive: list.make(bool, a), groups: list.make(i64, a), dead_groups: list.make(i64, a), next_id: 1, next_group: 0, fired: 0, cancelled: 0, fds: list.make(i64, a), pids: list.make(i64, a), palive: list.make(bool, a), pgroups: list.make(i64, a), ptasks: list.make(Task, a), poller: no_poller(), ready: 0 }
 }
 
 pub fn free(mut rt: Runtime) {
@@ -167,6 +223,11 @@ pub fn free(mut rt: Runtime) {
     list.free(bool, rt.alive)
     list.free(i64, rt.groups)
     list.free(i64, rt.dead_groups)
+    list.free(i64, rt.fds)
+    list.free(i64, rt.pids)
+    list.free(bool, rt.palive)
+    list.free(i64, rt.pgroups)
+    list.free(Task, rt.ptasks)
 }
 
 // Schedule `t` to fire `after` nanoseconds from now. Returns the timer's id, which is what
@@ -220,6 +281,70 @@ pub fn cancel(mut rt: Runtime, id: i64) -> bool {
     return false
 }
 
+// ---- pollables ----------------------------------------------------------------
+
+// Hand the runtime the thing that knows how to wait on handles. Until this is called a
+// runtime has `no_poller()`, which is never consulted because a runtime with no watches
+// never asks — so a timer-only program behaves exactly as it did before `Pollable` existed.
+pub fn set_poller(mut rt: Runtime, read p: Poller) {
+    rt.poller = p
+}
+
+// Watch `fd` for readability. When it becomes readable the task runs, exactly as a timer's
+// does, and the watch stays registered — a server accepts more than one connection.
+//
+// **A watch is level-triggered and does NOT rearm itself out of existence**: it fires every
+// time the loop finds the handle readable, which is the semantics `accept` and `recv` want
+// (there is more to read, so there is more to do). A caller that wants one-shot calls
+// `unwatch` from inside the task, which is safe for the same reason cancelling a timer from
+// a callback is: the loop marks, it does not remove.
+//
+// `tok` groups it with timers under the same `CancelToken`, so `cancel_all` stops a
+// connection's timers and its socket watch together — which is the whole reason
+// cancellation is a group and not an id.
+pub fn watch(mut rt: Runtime, fd: i64, read tok: CancelToken, read t: Task) -> i64 {
+    let id: i64 = rt.next_id
+    rt.next_id = rt.next_id + 1
+    list.push(i64, rt.fds, fd)
+    list.push(i64, rt.pids, id)
+    list.push(bool, rt.palive, true)
+    list.push(i64, rt.pgroups, tok.grp)
+    list.push(Task, rt.ptasks, t)
+    return id
+}
+
+// Stop watching. True if this call did it, false if it was already gone — the same
+// idempotent report `cancel` makes, and for the same reason: a cleanup path that runs twice
+// should not have to care.
+pub fn unwatch(mut rt: Runtime, id: i64) -> bool {
+    var i: usize = 0
+    for i < list.len(i64, rt.pids) {
+        if list.get(i64, rt.pids, i) == id {
+            if list.get(bool, rt.palive, i) {
+                list.set(bool, rt.palive, i, false)
+                return true
+            }
+            return false
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// How many watches are live.
+pub fn watching(read rt: Runtime) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    for i < list.len(bool, rt.palive) {
+        if list.get(bool, rt.palive, i) { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// How many watch callbacks have run — the pollable half of `fired`.
+pub fn ready_count(read rt: Runtime) -> i64 { return rt.ready }
+
 // How many timers are still live.
 pub fn pending(read rt: Runtime) -> usize {
     var n: usize = 0
@@ -247,7 +372,11 @@ pub fn now(mut rt: Runtime) -> i64 {
 
 pub fn fired(read rt: Runtime) -> i64 { return rt.fired }
 pub fn cancelled(read rt: Runtime) -> i64 { return rt.cancelled }
-pub fn is_idle(read rt: Runtime) -> bool { return pending(rt) == 0 }
+// **Idle means nothing can happen next**, which is no longer the same as "no timers".
+// A runtime with a watched socket and no timers is not finished — it is waiting for
+// something only the poller can deliver. This is the inversion `poll_for`'s header note
+// promised.
+pub fn is_idle(read rt: Runtime) -> bool { return pending(rt) == 0 and watching(rt) == 0 }
 
 // The earliest live deadline, or -1 when nothing is scheduled. What a caller would sleep
 // until if it had something to sleep on — this module never sleeps itself.
@@ -293,11 +422,22 @@ fn due_index(read rt: Runtime, now: i64) -> isize {
 
 // Fire every timer due at the current time. Returns how many fired.
 //
-// A timer registered BY a callback during this poll is not fired by the same poll even if
+// **Named `fire_due` rather than `poll`, and the reason is a hard constraint.** An
+// `extern` declaration's name is a C SYMBOL, so it is globally reserved against any Jestyr
+// function declared in exactly one module — and POSIX readiness polling is spelled
+// `poll(2)`. With this function called `poll`, `jestyrc` refused any program importing both
+// (*duplicate definition of `poll`*) and `jc` silently renamed the EXTERN instead, emitting
+// an undefined reference. `close` is not affected, because `std/file` and `std/sysdir` both
+// declare one and the canonicaliser has already renamed them.
+//
+// It is also the better name: this fires what is due and returns, where `poll_for` is the
+// one that waits.
+//
+// A timer registered BY a callback during this pass is not fired by the same pass even if
 // it is already due — the loop re-reads the clock once at entry and fires against that.
-// Without that rule a `soon` that re-schedules itself would spin forever inside one poll,
+// Without that rule a `soon` that re-schedules itself would spin forever inside one pass,
 // which is the classic starvation bug and is much easier to prevent than to debug.
-pub fn poll(mut rt: Runtime) -> i64 {
+pub fn fire_due(mut rt: Runtime) -> i64 {
     let now: i64 = time.read_nanos(rt.clock)
     let limit: usize = list.len(i64, rt.deadlines)
     var n: i64 = 0
@@ -316,7 +456,7 @@ pub fn poll(mut rt: Runtime) -> i64 {
 }
 
 // Poll until nothing is due at the current time. Timers scheduled by callbacks ARE fired
-// here, because each `poll` re-reads the clock — so this is the "settle" operation, and it
+// here, because each `fire_due` re-reads the clock — so this is the "settle" operation, and it
 // still cannot spin on a self-rescheduling zero-delay task under a manual clock: that task
 // is due again immediately, so `max_rounds` bounds it rather than pretending it cannot
 // happen.
@@ -324,7 +464,7 @@ pub fn run_until_idle(mut rt: Runtime, max_rounds: usize) -> i64 {
     var total: i64 = 0
     var r: usize = 0
     for r < max_rounds {
-        let n: i64 = poll(rt)
+        let n: i64 = fire_due(rt)
         if n == 0 { break }
         total = total + n
         r = r + 1
@@ -334,13 +474,14 @@ pub fn run_until_idle(mut rt: Runtime, max_rounds: usize) -> i64 {
 
 // ---- the waiting poll --------------------------------------------------------
 //
-// What `poll` reported: a count, which cannot distinguish "nothing was due" from "there is
+// What `fire_due` reports: a count, which cannot distinguish "nothing was due" from "there is
 // nothing left to do". A loop needs that difference — the first means wait, the second
 // means exit — so the waiting form answers with a kind.
 
 pub const RT_FIRED: i32 = 0      // at least one timer ran
 pub const RT_IDLE: i32 = 1       // nothing is scheduled at all; the loop may stop
 pub const RT_TIMEOUT: i32 = 2    // work is still pending, but the budget ran out first
+pub const RT_READY: i32 = 3      // at least one watched handle became readable
 
 // `@copy`: three integers. `waited` is the time this call actually spent waiting, which is
 // not the time it asked for — see `time.wait`.
@@ -353,7 +494,74 @@ pub const RT_TIMEOUT: i32 = 2    // work is still pending, but the budget ran ou
 @no_alloc @no_os pub fn ev_name(kind: i32) -> str {
     if kind == RT_FIRED { return "fired" }
     if kind == RT_IDLE { return "idle" }
+    if kind == RT_READY { return "ready" }
     return "timeout"
+}
+
+// Ask the poller which watched handles are readable, waiting up to `timeout_nanos`, and run
+// the task of each one that is. Returns how many ran.
+//
+// The live watches are COMPACTED into a scratch array first, with their original indices
+// alongside, because the poller takes a dense list and the registry is sparse (a cancelled
+// watch keeps its slot, exactly as a cancelled timer does — the loop marks, it never
+// removes, which is where use-after-free lives in every event loop that does).
+//
+// A callback may `watch` or `unwatch` while this is running. Both are safe: the snapshot's
+// indices point at entries that already existed, a push only appends, and `unwatch` sets a
+// flag the NEXT pass reads. The same rule timers live under.
+//
+// A poller that reports -1 (the platform refused) is treated as "nothing is ready". The
+// alternative — surfacing it — would make every loop body handle an error it cannot act on,
+// and a genuinely broken handle shows up as a failing read the moment its task runs.
+fn fire_ready(mut rt: Runtime, timeout_nanos: i64) -> i64 {
+    let n: usize = list.len(i64, rt.fds)
+    if n == 0 { return 0 }
+    var fdbuf: *mut i64 = alloc(i64, n)
+    var idxbuf: *mut i64 = alloc(i64, n)
+    var rdy: *mut u8 = alloc(u8, n)
+    var m: usize = 0
+    var i: usize = 0
+    for i < n {
+        if list.get(bool, rt.palive, i) {
+            unsafe { (fdbuf + m).* = list.get(i64, rt.fds, i) }
+            unsafe { (idxbuf + m).* = i as i64 }
+            unsafe { (rdy + m).* = 0 as u8 }
+            m = m + 1
+        }
+        i = i + 1
+    }
+    var count: i64 = 0
+    if m > 0 {
+        let pl: Poller = rt.poller
+        let got: i64 = pl.wait_fn(pl.ctx, fdbuf, rdy, m, timeout_nanos)
+        if got > 0 {
+            let now: i64 = time.read_nanos(rt.clock)
+            var k: usize = 0
+            for k < m {
+                var b: u8 = 0
+                unsafe { b = (rdy + k).* }
+                if (b as i32) != 0 {
+                    var ix: i64 = 0
+                    unsafe { ix = (idxbuf + k).* }
+                    let w: usize = ix as usize
+                    // Re-check liveness: an earlier callback in this same pass may have
+                    // cancelled this watch, and running it anyway would be the bug the
+                    // mark-do-not-remove rule exists to prevent.
+                    if list.get(bool, rt.palive, w) {
+                        let t: Task = list.get(Task, rt.ptasks, w)
+                        rt.ready = rt.ready + 1
+                        count = count + 1
+                        t.on_fire(t.ctx, list.get(i64, rt.pids, w), now)
+                    }
+                }
+                k = k + 1
+            }
+        }
+    }
+    free_ptr(rdy)
+    free_ptr(idxbuf)
+    free_ptr(fdbuf)
+    return count
 }
 
 // Run what is due; if nothing is, WAIT for the earlier of `timeout_nanos` and the next
@@ -368,13 +576,19 @@ pub const RT_TIMEOUT: i32 = 2    // work is still pending, but the budget ran ou
 // The wait is clamped to the next deadline so a large timeout cannot overshoot a timer.
 // A caller with nothing scheduled gets `RT_IDLE` immediately and never waits at all: there
 // is nothing that could arrive to end the wait, so sleeping would be a hang with extra
-// steps. **That changes the day IO exists** — then a runtime with no timers may still be
-// waiting on a socket, and `RT_IDLE` will have to mean "no timers AND no pollables". This
-// is the note to invert when `Pollable` lands.
+// steps. **This is the note that said it would have to change the day IO existed, and it
+// has:** `RT_IDLE` now means "no live timers AND no watched pollables", and a runtime with
+// a watch and no timers waits on the `Poller` rather than reporting itself finished.
+//
+// The two waits are exclusive and the choice is not a preference. With pollables registered
+// the wait goes through the poller, because that is the only wait a socket can END; with
+// none it goes through the clock, because that is the only wait a timer can end. A runtime
+// with both waits on the poller, bounded by the next deadline — the timer still fires on
+// time, and a socket that becomes ready cuts the wait short.
 pub fn poll_for(mut rt: Runtime, timeout_nanos: i64) -> Event {
-    let n0: i64 = poll(rt)
+    let n0: i64 = fire_due(rt)
     if n0 > 0 { return Event{ kind: RT_FIRED, fired: n0, waited: 0 } }
-    if pending(rt) == 0 { return Event{ kind: RT_IDLE, fired: 0, waited: 0 } }
+    if is_idle(rt) { return Event{ kind: RT_IDLE, fired: 0, waited: 0 } }
 
     // Something is pending and nothing was due, so every live deadline is in the future.
     let now: i64 = time.read_nanos(rt.clock)
@@ -385,9 +599,27 @@ pub fn poll_for(mut rt: Runtime, timeout_nanos: i64) -> Event {
         if until < want { want = until }
     }
     if want < 0 { want = 0 }
+
+    // **With watches registered the wait belongs to the POLLER**, because a socket is the
+    // only thing that can end it early — and the timeout is still clamped to the next
+    // deadline, so a timer cannot be overshot by a quiet socket.
+    //
+    // The clock is only READ on this path, never waited on. Under `time.host()` that is
+    // right: the poller did the real waiting and the wall clock moved on its own. Under
+    // `time.manual()` it means **a test with watches drives time with `advance`**, the way
+    // every other manual-clock caller does — the timer-only path below is the one where
+    // waiting IS advancing.
+    if watching(rt) > 0 {
+        let r: i64 = fire_ready(rt, want)
+        if r > 0 { return Event{ kind: RT_READY, fired: r, waited: 0 } }
+        let n2: i64 = fire_due(rt)
+        if n2 > 0 { return Event{ kind: RT_FIRED, fired: n2, waited: want } }
+        return Event{ kind: RT_TIMEOUT, fired: 0, waited: want }
+    }
+
     let waited: i64 = time.wait(rt.clock, want)
 
-    let n1: i64 = poll(rt)
+    let n1: i64 = fire_due(rt)
     if n1 > 0 { return Event{ kind: RT_FIRED, fired: n1, waited: waited } }
     return Event{ kind: RT_TIMEOUT, fired: 0, waited: waited }
 }

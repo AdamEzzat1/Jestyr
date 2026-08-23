@@ -20196,70 +20196,84 @@ void jestyr_emit_prelude(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrS
         jestyr_rt_str_push(&(*j_sb), JSTR("#include <time.h>\n"));
     }
     JestyrString j_seen_h = jestyr_rt_str_new();
-    int32_t j_hr = 0;
-    while ((j_hr < jestyr_len__i32(j_p.j_roots)))
+    int32_t j_hpass = 0;
+    while ((j_hpass < 2))
     {
-        int32_t j_hid = jestyr_get__list__i32(j_p.j_roots, (size_t)(j_hr));
-        Jestyr_ItemData j_hit = jestyr_get__list__ItemData(j_p.j_it, (size_t)(j_hid));
-        if (((j_hit.j_kind == 8) && (j_hit.j_w >= 0)))
+        int32_t j_hr = 0;
+        while ((j_hr < jestyr_len__i32(j_p.j_roots)))
         {
-            if (((j_hit.j_u - j_hit.j_w) >= 2))
+            int32_t j_hid = jestyr_get__list__i32(j_p.j_roots, (size_t)(j_hr));
+            Jestyr_ItemData j_hit = jestyr_get__list__ItemData(j_p.j_it, (size_t)(j_hid));
+            if (((j_hit.j_kind == 8) && (j_hit.j_w >= 0)))
             {
-                if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, (size_t)((j_hit.j_u - 2)), (size_t)(j_hit.j_u)), JSTR(".h")))
+                if (((j_hit.j_u - j_hit.j_w) >= 2))
                 {
-                    JestyrString j_probe_h = jestyr_rt_str_new();
-                    jestyr_rt_str_push(&j_probe_h, JSTR("|"));
-                    jestyr_rt_str_push(&j_probe_h, jestyr_rt_substr(j_src, (size_t)(j_hit.j_w), (size_t)(j_hit.j_u)));
-                    jestyr_rt_str_push(&j_probe_h, JSTR("|"));
-                    if ((!jestyr_rt_contains(jestyr_rt_str_view(&j_seen_h), jestyr_rt_str_view(&j_probe_h))))
+                    if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, (size_t)((j_hit.j_u - 2)), (size_t)(j_hit.j_u)), JSTR(".h")))
                     {
-                        jestyr_rt_str_push(&j_seen_h, jestyr_rt_str_view(&j_probe_h));
-                        JestyrStr j_hname = jestyr_rt_substr(j_src, (size_t)(j_hit.j_w), (size_t)(j_hit.j_u));
-                        JestyrStr j_hw = JSTR("");
-                        bool j_hfirst = true;
-                        bool j_hmixed = false;
-                        int32_t j_qr = 0;
-                        while ((j_qr < jestyr_len__i32(j_p.j_roots)))
+                        bool j_is_ws2 = jestyr_rt_str_eq(jestyr_rt_substr(j_src, (size_t)(j_hit.j_w), (size_t)(j_hit.j_u)), JSTR("winsock2.h"));
+                        bool j_want_now = j_is_ws2;
+                        if ((j_hpass == 1))
                         {
-                            int32_t j_qid = jestyr_get__list__i32(j_p.j_roots, (size_t)(j_qr));
-                            Jestyr_ItemData j_qit = jestyr_get__list__ItemData(j_p.j_it, (size_t)(j_qid));
-                            if (((j_qit.j_kind == 8) && (j_qit.j_w >= 0)))
+                            j_want_now = (!j_is_ws2);
+                        }
+                        if (j_want_now)
+                        {
+                            JestyrString j_probe_h = jestyr_rt_str_new();
+                            jestyr_rt_str_push(&j_probe_h, JSTR("|"));
+                            jestyr_rt_str_push(&j_probe_h, jestyr_rt_substr(j_src, (size_t)(j_hit.j_w), (size_t)(j_hit.j_u)));
+                            jestyr_rt_str_push(&j_probe_h, JSTR("|"));
+                            if ((!jestyr_rt_contains(jestyr_rt_str_view(&j_seen_h), jestyr_rt_str_view(&j_probe_h))))
                             {
-                                if (((j_qit.j_u - j_qit.j_w) >= 2))
+                                jestyr_rt_str_push(&j_seen_h, jestyr_rt_str_view(&j_probe_h));
+                                JestyrStr j_hname = jestyr_rt_substr(j_src, (size_t)(j_hit.j_w), (size_t)(j_hit.j_u));
+                                JestyrStr j_hw = JSTR("");
+                                bool j_hfirst = true;
+                                bool j_hmixed = false;
+                                int32_t j_qr = 0;
+                                while ((j_qr < jestyr_len__i32(j_p.j_roots)))
                                 {
-                                    if ((jestyr_rt_str_eq(jestyr_rt_substr(j_src, (size_t)((j_qit.j_u - 2)), (size_t)(j_qit.j_u)), JSTR(".h")) && jestyr_rt_str_eq(jestyr_rt_substr(j_src, (size_t)(j_qit.j_w), (size_t)(j_qit.j_u)), j_hname)))
+                                    int32_t j_qid = jestyr_get__list__i32(j_p.j_roots, (size_t)(j_qr));
+                                    Jestyr_ItemData j_qit = jestyr_get__list__ItemData(j_p.j_it, (size_t)(j_qid));
+                                    if (((j_qit.j_kind == 8) && (j_qit.j_w >= 0)))
                                     {
-                                        JestyrStr j_qw = jestyr_cfg_word(j_p, j_src, j_qit.j_xat, j_qit.j_xac);
-                                        if (j_hfirst)
+                                        if (((j_qit.j_u - j_qit.j_w) >= 2))
                                         {
-                                            j_hw = j_qw;
-                                            j_hfirst = false;
-                                        }
-                                        else
-                                        if ((!jestyr_rt_str_eq(j_hw, j_qw)))
-                                        {
-                                            j_hmixed = true;
+                                            if ((jestyr_rt_str_eq(jestyr_rt_substr(j_src, (size_t)((j_qit.j_u - 2)), (size_t)(j_qit.j_u)), JSTR(".h")) && jestyr_rt_str_eq(jestyr_rt_substr(j_src, (size_t)(j_qit.j_w), (size_t)(j_qit.j_u)), j_hname)))
+                                            {
+                                                JestyrStr j_qw = jestyr_cfg_word(j_p, j_src, j_qit.j_xat, j_qit.j_xac);
+                                                if (j_hfirst)
+                                                {
+                                                    j_hw = j_qw;
+                                                    j_hfirst = false;
+                                                }
+                                                else
+                                                if ((!jestyr_rt_str_eq(j_hw, j_qw)))
+                                                {
+                                                    j_hmixed = true;
+                                                }
+                                            }
                                         }
                                     }
+                                    j_qr = (j_qr + 1);
                                 }
+                                if (j_hmixed)
+                                {
+                                    j_hw = JSTR("");
+                                }
+                                bool j_hg = jestyr_cfg_open(&((*j_sb)), jestyr_cfg_cond(j_hw));
+                                jestyr_rt_str_push(&(*j_sb), JSTR("#include <"));
+                                jestyr_rt_str_push(&(*j_sb), j_hname);
+                                jestyr_rt_str_push(&(*j_sb), JSTR(">\n"));
+                                jestyr_cfg_close(&((*j_sb)), j_hg);
                             }
-                            j_qr = (j_qr + 1);
+                            jestyr_rt_str_free(&j_probe_h);
                         }
-                        if (j_hmixed)
-                        {
-                            j_hw = JSTR("");
-                        }
-                        bool j_hg = jestyr_cfg_open(&((*j_sb)), jestyr_cfg_cond(j_hw));
-                        jestyr_rt_str_push(&(*j_sb), JSTR("#include <"));
-                        jestyr_rt_str_push(&(*j_sb), j_hname);
-                        jestyr_rt_str_push(&(*j_sb), JSTR(">\n"));
-                        jestyr_cfg_close(&((*j_sb)), j_hg);
                     }
-                    jestyr_rt_str_free(&j_probe_h);
                 }
             }
+            j_hr = (j_hr + 1);
         }
-        j_hr = (j_hr + 1);
+        j_hpass = (j_hpass + 1);
     }
     jestyr_rt_str_free(&j_seen_h);
     jestyr_rt_str_push(&(*j_sb), JSTR("\n"));
@@ -22851,6 +22865,8 @@ void jestyr_emit_expr(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrStr 
     }
     if ((j_e.j_kind == 8))
     {
+        JestyrString j_qb = jestyr_rt_str_new();
+        jestyr_emit_expr(&(j_qb), j_p, j_src, j_c, &((*j_g)), j_e.j_a);
         int32_t j_n = (*j_g).j_tmp;
         (*j_g).j_tmp = ((*j_g).j_tmp + 1);
         int32_t j_qbt = jestyr_get__list__i32(j_c.j_et, (size_t)(j_e.j_a));
@@ -22861,7 +22877,8 @@ void jestyr_emit_expr(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrStr 
         jestyr_rt_str_push(&(*j_sb), JSTR(" _q"));
         jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_n));
         jestyr_rt_str_push(&(*j_sb), JSTR(" = "));
-        jestyr_emit_expr(&((*j_sb)), j_p, j_src, j_c, &((*j_g)), j_e.j_a);
+        jestyr_rt_str_push(&(*j_sb), jestyr_rt_str_view(&j_qb));
+        jestyr_rt_str_free(&j_qb);
         jestyr_rt_str_push(&(*j_sb), JSTR("; if (_q"));
         jestyr_push_uint__cgen(&((*j_sb)), (int64_t)(j_n));
         jestyr_rt_str_push(&(*j_sb), JSTR(".is_err) return ("));
@@ -37769,7 +37786,16 @@ void jestyr_ml_scan_decls(Jestyr_Ml* restrict j_m, size_t j_mi, Jestyr_Interner*
         {
             if ((((((((jestyr_rt_str_eq(j_tx, JSTR("fn")) || jestyr_rt_str_eq(j_tx, JSTR("struct"))) || jestyr_rt_str_eq(j_tx, JSTR("record"))) || jestyr_rt_str_eq(j_tx, JSTR("union"))) || jestyr_rt_str_eq(j_tx, JSTR("enum"))) || jestyr_rt_str_eq(j_tx, JSTR("const"))) || jestyr_rt_str_eq(j_tx, JSTR("distinct"))) || jestyr_rt_str_eq(j_tx, JSTR("trait"))))
             {
-                if (((j_i + 1) < jestyr_len__Token(j_tk)))
+                bool j_is_extern = false;
+                if ((jestyr_rt_str_eq(j_tx, JSTR("fn")) && (j_i >= 2)))
+                {
+                    Jestyr_Token j_xt = jestyr_get__list__Token(j_tk, (j_i - 2));
+                    if (jestyr_rt_str_eq(jestyr_rt_substr(j_src, j_xt.j_start, j_xt.j_end), JSTR("extern")))
+                    {
+                        j_is_extern = true;
+                    }
+                }
+                if ((((j_i + 1) < jestyr_len__Token(j_tk)) && (j_is_extern == false)))
                 {
                     Jestyr_Token j_nm = jestyr_get__list__Token(j_tk, (j_i + 1));
                     if (jestyr_ml_ident_head(jestyr_rt_substr(j_src, j_nm.j_start, j_nm.j_end)))
@@ -38305,11 +38331,22 @@ int32_t jestyr_driver_build(Jestyr_Ml* restrict j_m, Jestyr_Parser j_p, Jestyr_C
     {
         jestyr_rt_str_push(&j_cmd, JSTR(" -pthread"));
     }
+    if ((!j_posix))
+    {
+        jestyr_rt_str_push(&j_cmd, JSTR(" -D_WIN32_WINNT=0x0600"));
+    }
     jestyr_rt_str_push(&j_cmd, JSTR(" -o \""));
     jestyr_rt_str_push(&j_cmd, jestyr_rt_str_view(&j_xpath));
     jestyr_rt_str_push(&j_cmd, JSTR("\" \""));
     jestyr_rt_str_push(&j_cmd, jestyr_rt_str_view(&j_cpath));
     jestyr_rt_str_push(&j_cmd, JSTR("\""));
+    if ((!j_posix))
+    {
+        if (jestyr_rt_contains(jestyr_rt_str_view(&j_sb), JSTR("winsock2.h")))
+        {
+            jestyr_rt_str_push(&j_cmd, JSTR(" -lws2_32"));
+        }
+    }
     int32_t j_rc = jestyr_rt_run_command(jestyr_rt_str_view(&j_cmd));
     if ((j_rc != 0))
     {

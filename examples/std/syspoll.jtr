@@ -1,0 +1,174 @@
+// std/syspoll.jtr — "which of these sockets can be read without blocking?"
+//
+// TIER: `sys`. One question, asked of the kernel, with two entirely different structures
+// behind it.
+//
+// ─── Why this exists, and why it is this small ────────────────────────────────
+//
+// `std/sysnet`'s sockets are BLOCKING: `accept` waits for a connection, `recv` waits for
+// bytes. That is the honest primitive and it is unusable alone for anything that must also
+// service timers. The fix is readiness-first — ask whether a socket is ready, then make the
+// blocking call that is now guaranteed not to block — and this module is the asking.
+//
+// It answers READ readiness only. `accept` and `recv` are both read-readiness, which covers
+// a server; write readiness matters for a client that must not block on a full send buffer
+// and is deferred rather than guessed at. The interface has room for it (`ready` is a byte
+// per socket, not a bitset of one) and the day it is needed the shape does not change.
+//
+// ─── The two structures ───────────────────────────────────────────────────────
+//
+// POSIX `struct pollfd` and Windows `WSAPOLLFD` ask the same question and do not agree
+// about anything else:
+//
+//                        POSIX                   Windows
+//   fd                   int,    offset 0        SOCKET (64-bit), offset 0
+//   events               short,  offset 4        short,           offset 8
+//   revents              short,  offset 6        short,           offset 10
+//   sizeof               8                       16
+//   "readable"           POLLIN     = 0x0001     POLLRDNORM = 0x0100
+//
+// Both layouts are fixed by their platform's ABI and neither varies by architecture — the
+// reason `std/sysfs` refuses to read `struct stat` by offset does not apply here (see that
+// module's header for the distinction). Each branch is exercised on its own host by
+// `a_ready_socket_is_reported_ready`, which is a real end-to-end check rather than a
+// layout assertion: a wrong offset reports nothing ready and the test hangs the wait out
+// and fails.
+//
+// ─── `WSAPoll` needs a target baseline, and getting that wrong was silent ─────
+//
+// mingw declares `WSAPoll` only when `_WIN32_WINNT >= 0x0600`. Below that it is an IMPLICIT
+// DECLARATION — which C accepts, giving an `int` return and unchecked arguments. The driver
+// now passes `-D_WIN32_WINNT=0x0600` on Windows for exactly this reason; see
+// `cc_base_flags`.
+//
+// ─── What the poller does NOT do ──────────────────────────────────────────────
+//
+// It does not tell you a socket is *healthy* — a closed peer is READABLE (the read returns
+// zero), and so is a socket in error. Readiness means "a read will not block", nothing
+// more, and that is precisely the guarantee a caller needs to turn a blocking API into a
+// non-blocking one.
+//
+// Run the tests:  jestyrc test examples/std/syspoll_test.jtr
+
+import "runtime"
+
+@cfg(posix) extern "poll.h" fn poll(fds: cptr, n: u64, timeout_ms: i32) -> i32
+@cfg(windows) extern "winsock2.h" fn WSAPoll(fds: cptr, n: u32, timeout_ms: i32) -> i32
+
+// The per-platform layout of one entry. See the table in the header.
+@cfg(posix) @no_alloc @no_os fn entry_size() -> usize { return 8 }
+@cfg(windows) @no_alloc @no_os fn entry_size() -> usize { return 16 }
+
+@cfg(posix) @no_alloc @no_os fn events_off() -> usize { return 4 }
+@cfg(windows) @no_alloc @no_os fn events_off() -> usize { return 8 }
+
+// `POLLIN` on POSIX, `POLLRDNORM` on Windows — a two-byte little-endian field either way.
+@cfg(posix) @no_alloc @no_os fn read_events_lo() -> u8 { return 1 }
+@cfg(posix) @no_alloc @no_os fn read_events_hi() -> u8 { return 0 }
+@cfg(windows) @no_alloc @no_os fn read_events_lo() -> u8 { return 0 }
+@cfg(windows) @no_alloc @no_os fn read_events_hi() -> u8 { return 1 }
+
+// The fd field's width: 4 bytes on POSIX, 8 on Windows.
+@cfg(posix) @no_alloc @no_os fn fd_width() -> usize { return 4 }
+@cfg(windows) @no_alloc @no_os fn fd_width() -> usize { return 8 }
+
+// Write `v` little-endian into `w` bytes at `p + off`.
+fn put_le(p: *mut u8, off: usize, w: usize, v: i64) {
+    var i: usize = 0
+    for i < w {
+        let b: i64 = (v >> ((i * 8) as i64)) & 255
+        unsafe { (p + (off + i)).* = b as u8 }
+        i = i + 1
+    }
+}
+
+// Read `w` little-endian bytes at `p + off`.
+fn get_le(p: *mut u8, off: usize, w: usize) -> i64 {
+    var v: i64 = 0
+    var i: usize = 0
+    for i < w {
+        var b: u8 = 0
+        unsafe { b = (p + (off + i)).* }
+        v = v | ((b as i64) << ((i * 8) as i64))
+        i = i + 1
+    }
+    return v
+}
+
+@cfg(posix) fn raw_poll(p: *mut u8, n: usize, timeout_ms: i32) -> i32 {
+    return poll(p as cptr, n as u64, timeout_ms)
+}
+
+@cfg(windows) fn raw_poll(p: *mut u8, n: usize, timeout_ms: i32) -> i32 {
+    return WSAPoll(p as cptr, n as u32, timeout_ms)
+}
+
+// **The `runtime.Poller` implementation.** Blocks up to `timeout_nanos`, writes 1 into
+// `ready[i]` for every socket that can be read without blocking, and returns how many —
+// or -1 if the platform refused the call.
+//
+// `ctx` is unused: this poller has no state, because the kernel holds it all. It is still a
+// `ctx` + fn-pointer pair because that is the shape `runtime.Poller` takes and the shape
+// `mem.Allocator` established — a stateful poller (an epoll set, an IOCP port) slots in
+// without changing a signature.
+//
+// A millisecond timeout is what both platforms take, so nanoseconds are rounded UP: a
+// caller asking for 1ns must not get a busy spin, and must not get an unbounded wait
+// either. Zero stays zero — that is the "just ask, do not wait" case a runtime with due
+// timers needs.
+fn wait_ready(ctx: *mut u8, fds: *mut i64, ready: *mut u8, n: usize, timeout_nanos: i64) -> i64 {
+    if n == 0 { return 0 }
+    var ms: i64 = 0
+    if timeout_nanos > 0 { ms = (timeout_nanos + 999999) / 1000000 }
+    if ms > 2147483647 { ms = 2147483647 }
+
+    let esz: usize = entry_size()
+    var buf: *mut u8 = alloc(u8, esz * n)
+    var i: usize = 0
+    for i < esz * n {
+        unsafe { (buf + i).* = 0 as u8 }
+        i = i + 1
+    }
+    var k: usize = 0
+    for k < n {
+        var fd: i64 = 0
+        unsafe { fd = (fds + k).* }
+        put_le(buf, k * esz, fd_width(), fd)
+        unsafe { (buf + (k * esz + events_off())).* = read_events_lo() }
+        unsafe { (buf + (k * esz + events_off() + 1)).* = read_events_hi() }
+        k = k + 1
+    }
+
+    let rc: i32 = raw_poll(buf, n, ms as i32)
+    var count: i64 = 0
+    if rc > 0 {
+        var j: usize = 0
+        for j < n {
+            // `revents` sits two bytes past `events` on both platforms. ANY bit set means
+            // something happened — readable, hung up, or in error — and all three mean a
+            // read will not block, which is the only promise this module makes.
+            let rev: i64 = get_le(buf, j * esz + events_off() + 2, 2)
+            if rev != 0 {
+                unsafe { (ready + j).* = 1 as u8 }
+                count = count + 1
+            } else {
+                unsafe { (ready + j).* = 0 as u8 }
+            }
+            j = j + 1
+        }
+    } else {
+        var j2: usize = 0
+        for j2 < n {
+            unsafe { (ready + j2).* = 0 as u8 }
+            j2 = j2 + 1
+        }
+    }
+    free_ptr(buf)
+    if rc < 0 { return 0 - 1 }
+    return count
+}
+
+// The host poller, ready to hand to `runtime.set_poller`.
+pub fn host() -> runtime.Poller {
+    return runtime.poller(null, &wait_ready)
+}

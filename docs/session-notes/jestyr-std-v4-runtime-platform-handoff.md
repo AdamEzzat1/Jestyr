@@ -18,8 +18,9 @@ anything; if a later failure appears, assume it is yours.
 The brief's **§1.1 (`sys/fs`) and §2.3 (platform error shape) are done**, with a real
 consumer. **`JestyrResult_unit` lowering is done too** — a fallible function may now have no
 return type at all, which is the natural signature for most of what a `sys` layer does.
-Five compiler bugs were found and closed on the way — one a silent miscompile — and the
-gate the 2026-08-20 census audit said it owed now exists.
+**Nine compiler and toolchain bugs** were found and closed on the way, two of them silent
+miscompiles, and the gate the 2026-08-20 census audit said it owed now exists — **51 of 55
+multi-module programs build under `jc`**, up from 43 of 52.
 
 (Section numbers below are this note's own; the brief's are named as "the brief's §x".)
 
@@ -27,25 +28,38 @@ gate the 2026-08-20 census audit said it owed now exists.
 and waiting that goes through the CLOCK so the same loop idles in production and runs
 instantly under a test. See §1.4.
 
-**The next thing to build is the brief's §1.3, TCP sockets**, and it is now the thing
-blocking everything else in the tier. `Pollable` was deliberately NOT built: `epoll`/
-`kqueue`/IOCP need something to poll and nothing in this tree exposes a file descriptor or
-a socket, so it belongs WITH sockets rather than before them (§1.4 has the measurement).
-Watching (§1.5), HTTP (§1.7) and the plugin host (§1.11) all wait behind the same thing.
+**The brief's §1.3 (TCP sockets) is done, and `Pollable` landed with it** — which is where
+it always belonged, since `epoll`/`kqueue`/IOCP need something to poll. `std/sysnet` is real
+loopback TCP in both directions; `std/syspoll` + `runtime.Poller` is the readiness layer; and
+`examples/std/sysnet_demo.jtr` is a status server that answers a connection **and** keeps
+firing its own timers on one thread. See §1.5–§1.7.
+
+**The next thing to build is the brief's §1.4, file watching.** It is the natural next
+consumer of exactly this machinery — a watcher is a `Pollable` over a platform notification
+handle (`inotify` on Linux, `ReadDirectoryChangesW` on Windows) — and everything it needs
+from the loop now exists. §1.5 (structured logging) is the other cheap one and adds no new
+platform surface at all.
+
+Before either, read `std/runtime.jtr`'s header on `Poller`: **the loop reaches the operating
+system only through the two handles it is given** (a `Clock` and a `Poller`), and keeping that
+true is what makes the whole thing testable with no OS underneath.
 
 ### What is NOT what an older note says
 
 * **The `jc build` name-collision bug is FIXED**, and the mechanism recorded for it was
   backwards. See §2.2. The census note's "9 of the 52 runnable multi-module corpus
   programs fail" is now **4 of 53**, and those four are one isolated mechanism.
-* **`sys` at Tier 4 builds under `jc`.** `examples/std/sysfs_demo.jtr` — which imports
-  `sysfs`, `syserr`, `sysdir`, `file`, `fs`, `env`, `mem`, `str`, `path`, `sink` — compiles
-  through the self-hosted compiler's own loader and gcc driver, and prints exactly what the
-  reference toolchain's build prints.
+* **`sys` at Tier 4 builds under `jc`**, sockets included. `examples/std/sysnet_demo.jtr`
+  compiles through the self-hosted compiler's own loader and gcc driver — Winsock linked,
+  `WSAPoll` declared, headers in the right order — and prints exactly what the reference
+  toolchain's build prints.
+* **`runtime.poll` is now `runtime.fire_due`.** An `extern` name is a C symbol and is
+  globally reserved against any Jestyr function declared in exactly ONE module; POSIX
+  readiness polling is spelled `poll(2)`. See §2.1b.
 
 ---
 
-## §1. STD TIER 4 — `std/syserr` and `std/sysfs`
+## §1. STD TIER 4 — what was built
 
 ### §1.1 — `std/syserr`: the platform error shape (brief §2.3)
 
@@ -345,6 +359,73 @@ Its output is asserted to the digit — `beat=3 at_ms=300`, `simulated elapsed m
 which is only possible because `manual()` makes waiting exact. With a host clock the best
 that test could say is "roughly 300ms, usually".
 
+### §1.5 — `std/sysnet`: TCP over IPv4 (brief §1.3)
+
+`sysnet.jtr` + `sysnet_test.jtr` (5 cases). Listener, stream, connect / bind+listen / accept
+/ send / recv / close, and a `SocketAddr`. IPv4, blocking sockets, no TLS, no DNS.
+
+**Four divergences, all named in the header**: the handle is an `int` on POSIX and a 64-bit
+`SOCKET` on Windows; the failure sentinel is `-1` against `INVALID_SOCKET` (equal only as a
+signed 64-bit value, so it is *checked*, not assumed); Windows needs the library STARTED; and
+closing is `close()` against `closesocket()` — two different functions, not two spellings.
+
+**`WSAStartup` hangs off the CAPABILITY, and that is the design.** It is process-global
+initialization — exactly the hidden global this library refuses to have — so `net.host()`
+starts Winsock and `net.shutdown()` stops it. The thing you must not forget became the thing
+the type system already makes you hold.
+
+**`sockaddr_in` IS read by byte offset, and unlike `struct stat` that is defensible.** It is
+wire-adjacent, fixed at 16 bytes since 4.2BSD, and Linux and Windows agree byte for byte;
+`std/sysfs` refuses the `stat` equivalent because THAT layout varies by architecture with no
+CI runner covering it. macOS splits the first two bytes (`sin_len` + `sin_family`), and
+`an_address_round_trips_through_its_wire_bytes` asserts the exact bytes so a BSD gets a red
+test rather than a connection to nowhere.
+
+`send`/`recv` are byte-assembled rather than routed through `htons`/`htonl`, which are macros
+on several platforms and therefore unbindable — and writing the bytes puts the one fact a
+reader must know (port and address are BIG-ENDIAN on the wire) in the code.
+
+### §1.6 — `std/syspoll` + `runtime.Poller`: the loop grows IO (brief §1.2's other half)
+
+`syspoll.jtr` + `syspoll_test.jtr` (3 cases), plus `Poller`, `watch`/`unwatch`, `RT_READY`
+and a new idle rule in `std/runtime`.
+
+**`poll_for`'s header note is inverted, exactly as it promised.** `RT_IDLE` now means "no live
+timers AND no watched pollables"; a server with a watch and no timers is not finished, it is
+waiting.
+
+**The runtime still touches no OS.** Readiness arrives through a `Poller` — a `ctx` +
+fn-pointer pair, the `mem.Allocator` shape — so `std/syspoll` supplies the kernel's answer and
+a test supplies a scripted one. That is why `epoll`/`kqueue`/IOCP being three models does not
+infect the loop: they are three `Poller`s behind one signature and the loop cannot tell them
+apart. `a_scripted_poller_drives_the_loop_with_no_sockets_at_all` proves registration, firing,
+level-triggering, cancellation and the idle rule **with no operating system involved**;
+`a_ready_socket_is_reported_ready` is the one end-to-end check of the per-platform `pollfd`
+layout, and it is a real check rather than a layout assertion — a wrong offset reports nothing
+ready, the wait runs out, and it fails.
+
+**The wait is the poller's, clamped to the next deadline.** With watches registered a socket
+is the only thing that can end the wait early — but a timer still fires on time, which is what
+`jstatus`'s `the timer fired, not the socket` asserts. Consequence to know: on that path the
+clock is only READ, so **a manual-clock test with watches drives time with `advance`** rather
+than by waiting. The timer-only path is the one where waiting IS advancing.
+
+**One token cancels a watch and its timer together** — the reason cancellation is a group and
+not an id, now with a second kind of thing in the group.
+
+Watches are LEVEL-TRIGGERED and stay registered: "there is more to read" is the question
+`accept` and `recv` are actually asking. One-shot is `unwatch` from inside the task, which is
+safe for the same reason cancelling a timer from a callback is — the loop marks, it never
+removes.
+
+### §1.7 — The consumer: `jstatus`, a local status server
+
+`sysnet_demo.jtr`. The smallest program that needs all three layers: one thread answering a
+connection *and* firing its own timers. **The callback MARKS and the loop ACTS** — the watch's
+task records readability and the loop does the accept — which is the same mark-do-not-remove
+discipline the runtime uses on timers, and it keeps every operation that can fail out of a
+callback with nowhere to report a failure.
+
 ---
 
 ## §2. WHAT THE BUILD TURNED UP IN THE COMPILER
@@ -412,6 +493,78 @@ position is still clean. Reference-only (a diagnostic, no emitted byte), so no m
 
 The general shape is worth remembering: **a new type's first real inhabitant finds every place
 the checker had no rule for it.**
+
+### §2.1b — An `extern` name is a C symbol, and TWO things were renaming it
+
+Same root cause, two independent bugs: **an `extern` declaration's name belongs to the
+linker, not to Jestyr.**
+
+* **The port's loader renamed it.** `ml_scan_decls` registered every `fn` name as collidable,
+  an extern's included — so `std/file` and `std/sysdir` both declaring `close` made
+  `std/sysnet`'s `extern "unistd.h" fn close` become `close__m7`, an `undefined reference` at
+  link time. SILENTLY, because the loader has no idea the name belongs to someone else's
+  object file. Fixed by skipping registration when the token two before `fn` is `extern`.
+* **The reference canonicalized it.** `canon_in` produced the same `close__m7` while
+  `table.fns` stores externs under the BARE name, so every call inside the extern's own
+  module failed with *cannot find `close` in this module; it is defined in module `sysdir`*.
+  Fixed with `extern_owned: HashSet<(ModId, String)>`, keyed on `(module, name)` — keying on
+  the name alone would have given `file.close` and `sysdir.close` the same C symbol.
+
+**The rule that falls out, worth knowing before binding anything:** an extern name collides
+only with a Jestyr function declared in **exactly one** module. `close` is declared by two, so
+both are already canonicalized and the bare name is free. `poll` was declared only by
+`runtime`, so it genuinely collided — which is why `runtime.poll` is now `runtime.fire_due`.
+(A better name regardless: this one fires what is due and returns; `poll_for` is the one that
+waits.)
+
+### §2.1c — Three toolchain facts the socket layer needed, two of them silent
+
+* **`-lws2_32` must be linked, and linked LAST.** mingw does not link Winsock by default, and
+  a flag that is *present but early* fails identically to a missing one — GNU ld resolves
+  libraries against the objects seen so far. A debugging round went on `undefined reference to
+  __imp_socket` with the flag visibly in the command. There were FOUR link sites across the
+  tree and only three had it; they are one `link_and_finish` helper now.
+* **`-D_WIN32_WINNT=0x0600`, or `WSAPoll` is an implicit declaration.** mingw declares it only
+  at Vista or later; below that C accepts the call and gives it an `int` return. The
+  `int`-fallback silent miscompile, met for the fourth time in this tree.
+* **`<winsock2.h>` must precede `<windows.h>`.** `windows.h` pulls in Winsock 1.1, so the
+  other order makes `winsock2.h` collide with what it has already seen — mingw downgrades that
+  to a `#warning`, MSVC does not. One stable `sort_by_key` in the include emission, mirrored in
+  the port as a two-pass scan.
+
+### §2.1d — Two more reference/port divergences the corpus had never reached
+
+Both LATENT: the port had been wrong for a long time and nothing exercised the shape.
+
+* **The `?` temp was numbered before its base's.** `send_bytes(s, buf[off .. buf.len])?` is the
+  corpus's first `?` over a call carrying a slice-RANGE argument; the reference numbers the
+  range's `_s2` before the try's `_q3`, the port numbered `_q2` before `_s3`. The port's Catch
+  arm already carried a comment saying the base must be emitted before the temp is allocated —
+  Try had simply never been given the same treatment.
+* **`push_ty_mangle` had no `Unit` arm**, so a unit Result mangled to `JestyrResult_?`.
+  `tyid < 0` ("no type at all") already gave `unit`; a RESOLVED Unit `TyData` fell through to
+  the `?` default. Invisible until a corpus file first had a unit result.
+
+**The pattern across all of this session's port divergences is the same**: the port is
+byte-identical on everything the corpus exercises, and each new module finds one more shape it
+never did. That is an argument for writing new modules against the PORT as well as the
+reference, not just adding them to the allowlist afterwards.
+
+### §2.1e — `@cfg` items sharing a name must share a SIGNATURE. NOT fixed
+
+`@cfg` lets two items share a name when their platforms are disjoint — but typeck keys its
+function table on the BARE name, so the **second** declaration wins and BOTH branches are then
+checked against ONE signature. `std/sysdir` never met this because its POSIX and Windows
+externs have different names (`opendir` against `FindFirstFileA`); sockets have the same names
+with different C types, and the POSIX call sites were reported as `expected i32, found u32`
+against the Windows extern.
+
+Left open deliberately: it degrades to a type error at the call site rather than a miscompile,
+so it is noisy-but-safe. **Worked around by unifying the signatures, which is the better
+binding anyway** — these are header-declared externs, so no prototype is emitted and the
+Jestyr signature only has to describe something C can implicitly convert from (`i64` covers an
+`int` fd and a 64-bit `SOCKET`; `i32` covers `socklen_t`). A diagnostic naming the mismatch
+would be a good small increment.
 
 ### §2.2 — The `jc build` collision bug is FIXED, and the recorded mechanism was backwards
 
@@ -549,9 +702,9 @@ were byte-identical first try.
 |---|---|---|
 | 1.1 | `sys/fs` | ✅ this session |
 | 1.2 | deterministic `std/walk` | ✅ Tier 3 |
-| 1.3 | event loop V1 | ✅ this session — tokens, waiting `poll`, waiting through the clock (§1.4) |
-| 1.4 | TCP sockets | ⬜ **start here** — and `Pollable` comes with them, not before |
-| 1.5 | file watching | ⬜ |
+| 1.3 | event loop V1 | ✅ — cancellation, waiting `poll_for`, and now `Poller` + `watch` |
+| 1.4 | TCP sockets | ✅ this session — `std/sysnet`, real loopback both directions |
+| 1.5 | file watching | ⬜ — **start here**; a `Pollable` over `inotify` / `ReadDirectoryChangesW` |
 | 1.6 | structured logging | ⬜ |
 | 1.7 | HTTP/1.1 | ⬜ |
 | 1.8 | tar / reproducible archive | ⬜ |

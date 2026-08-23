@@ -7,6 +7,67 @@ versions are snapshots, not stability promises.
 
 ### Added
 
+- **`std/sysnet` + `std/syspoll` + `runtime.Pollable` — Jestyr answers a socket and keeps
+  its timers.** `sysnet.jtr` (5 cases), `syspoll.jtr` (3 cases), and `sysnet_demo.jtr`:
+  a local status server that services a connection *and* fires its own timers on one thread.
+
+  TCP over IPv4, blocking sockets, readiness-first. Four platform divergences named in the
+  header rather than averaged away: the handle is an `int` on POSIX and a 64-bit `SOCKET` on
+  Windows; the failure sentinel is `-1` against `INVALID_SOCKET` (equal only as a signed
+  64-bit value, so it is checked); Windows needs the library STARTED; and closing is
+  `close()` against `closesocket()` — two different functions, not two spellings.
+
+  **`WSAStartup` hangs off the capability.** It is process-global initialization — exactly
+  the hidden global this library refuses to have — so `net.host()` starts Winsock and
+  `net.shutdown()` stops it. The thing you must not forget became the thing the type system
+  already makes you hold.
+
+  **`runtime` still touches no operating system.** Readiness arrives through a `Poller` — a
+  `ctx` + fn-pointer pair, the `mem.Allocator` shape — so `std/syspoll` supplies the kernel's
+  answer and a test supplies a scripted one. `epoll`/`kqueue`/IOCP being three models does
+  not infect the loop: they are three `Poller`s behind one signature.
+  `a_scripted_poller_drives_the_loop_with_no_sockets_at_all` proves registration, firing,
+  level-triggering, cancellation and the idle rule **with no OS involved**.
+
+  `RT_IDLE` now means "no live timers AND no watched pollables" — the inversion `poll_for`'s
+  header note has been promising since Tier 3. A server with a watch and no timers is not
+  finished; it is waiting. And one `CancelToken` stops a watch and its timer together, which
+  is what cancellation being a group was always for.
+
+  `sockaddr_in` IS read by byte offset, and unlike `struct stat` that is defensible: it is
+  wire-adjacent, fixed at 16 bytes since 4.2BSD, and Linux and Windows agree byte for byte.
+  macOS splits the first two bytes, and the test asserts the exact bytes so a BSD gets a red
+  test rather than a connection to nowhere.
+
+### Changed
+
+- **`runtime.poll` is now `runtime.fire_due`.** An `extern` declaration's name is a C symbol
+  and is globally reserved against any Jestyr function declared in exactly one module — and
+  POSIX readiness polling is spelled `poll(2)`. It is also the better name: this one fires
+  what is due and returns, where `poll_for` is the one that waits.
+
+### Fixed
+
+- **An `extern` name is no longer renamed by either toolchain.** The port's loader
+  canonicalised it (`std/file` + `std/sysdir` both declare `close`, so binding POSIX's
+  `close(2)` produced `undefined reference to close__m7` — silently, since a loader cannot
+  know the name belongs to someone else's object file), and the reference canonicalised it
+  the same way while storing externs under the bare name, so calls inside the extern's own
+  module failed to resolve. Fixed on both sides, keyed on `(module, name)` so `file.close`
+  and `sysdir.close` keep their distinct symbols.
+
+- **Three Windows toolchain facts, two of them previously silent.** `-lws2_32` is linked when
+  the emitted C names `<winsock2.h>` — and linked *after* the source, because GNU ld resolves
+  libraries against the objects seen so far, so a flag placed early fails identically to a
+  missing one. `-D_WIN32_WINNT=0x0600` is passed on Windows, without which mingw leaves
+  `WSAPoll` an implicit declaration returning `int`. And `<winsock2.h>` is now emitted before
+  `<windows.h>`, since `windows.h` pulls in Winsock 1.1 and the other order collides.
+
+- **Two latent reference/port divergences the corpus had never reached.** The port numbered a
+  `?`'s temp before its base's, which only shows up for a `?` over a call carrying a
+  slice-range argument; and `push_ty_mangle` had no `Unit` arm, so a unit result mangled to
+  `JestyrResult_?`. Both were wrong for a long time with nothing exercising the shape.
+
 - **`std/syserr` + `std/sysfs` — the `sys` tier becomes real, and it reports why.**
   `syserr.jtr` (7 cases), `sysfs.jtr` (10 cases), `sysfs_demo.jtr`. Create and remove a
   directory, replace-rename, metadata, canonical path, temp directory — everything ISO C

@@ -466,6 +466,69 @@ mod runtime_heartbeat {
     }
 }
 
+/// **`jstatus` — a local status server that keeps its timers, end to end.**
+///
+/// `examples/std/sysnet_demo.jtr` is the consumer `std/sysnet`, `std/syspoll` and
+/// `runtime.Pollable` were built for, and it is the smallest program that needs all three:
+/// one thread has to answer a connection *and* keep firing its own timers, which is exactly
+/// what a blocking socket API cannot do alone.
+///
+/// The assertion that matters is `the timer fired, not the socket`. With a watch registered
+/// the loop's wait belongs to the POLLER — but it is still clamped to the next deadline, so
+/// a 1ms timer fires on time while the socket stays quiet. Without the clamp the timer would
+/// wait out the socket's whole budget, and nothing else in the tree would notice.
+#[cfg(all(test, feature = "c-oracle"))]
+mod sysnet_status_server {
+    use super::*;
+
+    #[test]
+    fn jstatus_serves_a_connection_without_starving_its_timers() {
+        let exe = super::c_oracle::build_exe("examples/std/sysnet_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the status server must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        // Nothing here is a port number or a path: the kernel chooses the port, so the
+        // whole sequence is asserted as an exact transcript instead.
+        let want = "-- jstatus --\n\
+                    listening on loopback\n\
+                    true\n\
+                    a watch alone keeps the loop alive\n\
+                    true\n\
+                    -- while the socket is quiet --\n\
+                    the timer fired, not the socket\n\
+                    true\n\
+                    1\n\
+                    -- a client connects --\n\
+                    true\n\
+                    the listener became readable\n\
+                    true\n\
+                    1\n\
+                    accepted without blocking\n\
+                    true\n\
+                    -- the client reads it --\n\
+                    true\n\
+                    -- shutdown --\n\
+                    one token stopped the watch\n\
+                    1\n\
+                    and the loop is idle\n\
+                    true";
+        assert_eq!(out.trim_end(), want, "the status server's transcript changed:\n{out}");
+
+        // Anti-vacuity: `true` appears often enough that a containment check would pass for
+        // a demo that printed it unconditionally. Every `false` would be a failed step, so
+        // there must be none — and the two counters must be the ones that were incremented,
+        // not zeros.
+        assert!(!out.contains("false"), "every step must have succeeded:\n{out}");
+        // Three counters, each printed as a bare `1`: the timer that fired while the socket
+        // was quiet, the listener that became readable, and the single watch `cancel_all`
+        // stopped. That last one is 1 rather than 2 because the timer had ALREADY fired and
+        // is no longer live -- a cancel reporting 2 would mean the loop still held a timer
+        // it had already run.
+        assert_eq!(out.matches("\n1\n").count(), 3, "one tick, one readable listener, one cancelled watch:\n{out}");
+    }
+}
+
 /// **`jstage` — the atomic-publish demo, end to end through the real filesystem.**
 ///
 /// `examples/std/sysfs_demo.jtr` is `std/sysfs`'s consumer, not an illustration of it: it
@@ -9995,10 +10058,17 @@ mod c_oracle {
         let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
         let mut cmd = Command::new(&cc);
         cmd.args(crate::CC_FLAGS);
+        // These helpers use `CC_FLAGS` directly rather than `cc_base_flags()`, so the
+        // Windows target baseline is repeated: mingw declares `WSAPoll` only at
+        // `_WIN32_WINNT >= 0x0600`, and below that it is an implicit declaration returning
+        // `int` -- the silent `int`-fallback shape this tree keeps meeting.
+        #[cfg(windows)]
+        cmd.arg("-D_WIN32_WINNT=0x0600");
         if c_src.contains("pthread") {
             cmd.arg("-pthread");
         }
-        let st = cmd.arg("-o").arg(&exe).arg(&cfile).status().unwrap();
+        link_and_finish(&mut cmd, &exe, &cfile, &c_src);
+        let st = cmd.status().unwrap();
         assert!(st.success(), "gcc failed for {rel}");
         let out = Command::new(&exe).output().unwrap();
         assert!(out.status.success(), "run of {rel} failed");
@@ -10012,6 +10082,24 @@ mod c_oracle {
 
     /// Compile `rel` to an executable and return its path (does NOT run it) — for
     /// programs that take command-line arguments, like the self-hosting lexer.
+    /// Append the output name, the source file, and any platform link libraries — **in that
+    /// order**, which is the whole reason this is a helper rather than four copies.
+    ///
+    /// GNU ld resolves `-l` libraries against the objects it has seen SO FAR, so a library
+    /// listed before the `.c` file resolves nothing and the link fails exactly as if the
+    /// flag were missing. Getting that wrong once cost a debugging round on
+    /// `undefined reference to __imp_socket` with the flag visibly present in the command.
+    ///
+    /// Winsock is content-triggered (the same shape as `-pthread`) and host-gated: both
+    /// `@cfg` branches are always emitted, so the source names `winsock2.h` on Linux too,
+    /// where `-lws2_32` does not exist.
+    fn link_and_finish(cmd: &mut Command, exe: &std::path::Path, cfile: &std::path::Path, c_src: &str) {
+        cmd.arg("-o").arg(exe).arg(cfile);
+        if cfg!(windows) && c_src.contains("winsock2.h") {
+            cmd.arg("-lws2_32");
+        }
+    }
+
     pub(super) fn build_exe(rel: &str) -> std::path::PathBuf {
         let prog = crate::module::load(rel);
         assert!(!prog.diags.iter().any(|d| d.is_error()), "load errors in {rel}: {:?}", prog.diags);
@@ -10030,6 +10118,12 @@ mod c_oracle {
         let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
         let mut cmd = Command::new(&cc);
         cmd.args(crate::CC_FLAGS);
+        // These helpers use `CC_FLAGS` directly rather than `cc_base_flags()`, so the
+        // Windows target baseline is repeated: mingw declares `WSAPoll` only at
+        // `_WIN32_WINNT >= 0x0600`, and below that it is an implicit declaration returning
+        // `int` -- the silent `int`-fallback shape this tree keeps meeting.
+        #[cfg(windows)]
+        cmd.arg("-D_WIN32_WINNT=0x0600");
         // The Jestyr-written compiler recurses per expression-nesting level; give the exe the
         // same headroom the Rust reference gets from its 8MB main-thread stack (Windows
         // defaults to 1MB, which the deepest corpus files overflow). Harness-only — the locked
@@ -10039,7 +10133,8 @@ mod c_oracle {
         if c_src.contains("pthread") {
             cmd.arg("-pthread");
         }
-        assert!(cmd.arg("-o").arg(&exe).arg(&cfile).status().unwrap().success(), "gcc failed for {rel}");
+        link_and_finish(&mut cmd, &exe, &cfile, &c_src);
+        assert!(cmd.status().unwrap().success(), "gcc failed for {rel}");
         exe
     }
 
@@ -16071,6 +16166,9 @@ fn main() -> i32 {
         "time.jtr",
         "time_test.jtr",
         "runtime_demo.jtr",
+        "sysnet.jtr",
+        "syspoll.jtr",
+        "syspoll_test.jtr",
     ];
     // **`sysfs_test.jtr` is deliberately absent, and the reason was MEASURED rather than
     // assumed** — which is what `walk.jtr`'s note below asks the next person to do.
@@ -16093,6 +16191,19 @@ fn main() -> i32 {
     //
     // `syserr_test.jtr` IS allowlisted and byte-identical, so the suite shape itself is
     // covered; what is not covered is this one degradation path.
+    //
+    // **`sysnet_test.jtr` is out for the same reason, found through the other golden.** Its
+    // instance of the shape lives inside an `@test` body, and `@test` functions are not
+    // emitted in non-test mode -- so `jestyr_cgen_matches_reference` passed it and
+    // `jestyr_cgen_test_mode_matches_reference` did not. Worth knowing when adding a suite
+    // to the allowlist: the two goldens see different halves of the same file, and a
+    // divergence inside a `@test` is invisible to the first one.
+    //
+    // Root cause measured on both: with the callee unresolvable the port types the call as
+    // `Result(unit)` and renders the statement-expression's temp `void`, while the reference
+    // types it `Unknown` and renders `int`. Neither can reach a program that compiles.
+    // `sysnet.jtr` and `syspoll.jtr` themselves ARE allowlisted and were byte-identical, which
+    // is what the `@cfg` gate actually requires.
     // **`walk.jtr` is deliberately absent, and NOT because of `@cfg`.** The old note said it
     // was blocked "transitively — it imports sysdir"; measured, that is wrong. This golden
     // feeds the RAW file to both backends with imports UNRESOLVED, and `walk.jtr` is the first
@@ -16291,6 +16402,12 @@ fn main() -> i32 {
         std::fs::write(&cfile, &c_src).unwrap();
         let mut cmd = Command::new(&cc);
         cmd.args(crate::CC_FLAGS);
+        // These helpers use `CC_FLAGS` directly rather than `cc_base_flags()`, so the
+        // Windows target baseline is repeated: mingw declares `WSAPoll` only at
+        // `_WIN32_WINNT >= 0x0600`, and below that it is an implicit declaration returning
+        // `int` -- the silent `int`-fallback shape this tree keeps meeting.
+        #[cfg(windows)]
+        cmd.arg("-D_WIN32_WINNT=0x0600");
         assert!(cmd.arg("-o").arg(&texe).arg(&cfile).status().unwrap().success(), "gcc failed on the test harness");
         let out = Command::new(&texe).output().unwrap();
         assert!(out.status.success(), "test harness exited non-zero");
@@ -16561,6 +16678,12 @@ fn main() -> i32 {
         std::fs::write(&cfile, &c1).unwrap();
         let mut cmd = Command::new(&cc);
         cmd.args(crate::CC_FLAGS);
+        // These helpers use `CC_FLAGS` directly rather than `cc_base_flags()`, so the
+        // Windows target baseline is repeated: mingw declares `WSAPoll` only at
+        // `_WIN32_WINNT >= 0x0600`, and below that it is an implicit declaration returning
+        // `int` -- the silent `int`-fallback shape this tree keeps meeting.
+        #[cfg(windows)]
+        cmd.arg("-D_WIN32_WINNT=0x0600");
         #[cfg(windows)]
         cmd.arg("-Wl,--stack,67108864");
         if c1.contains("pthread") {
@@ -16686,8 +16809,14 @@ fn main() -> i32 {
             std::fs::write(&cfile, &c_src).unwrap();
             let mut cmd = Command::new(&cc);
             cmd.args(crate::CC_FLAGS);
+        // These helpers use `CC_FLAGS` directly rather than `cc_base_flags()`, so the
+        // Windows target baseline is repeated: mingw declares `WSAPoll` only at
+        // `_WIN32_WINNT >= 0x0600`, and below that it is an implicit declaration returning
+        // `int` -- the silent `int`-fallback shape this tree keeps meeting.
+        #[cfg(windows)]
+        cmd.arg("-D_WIN32_WINNT=0x0600");
             assert!(
-                cmd.arg("-o").arg(&exe).arg(&cfile).status().unwrap().success(),
+                { link_and_finish(&mut cmd, &exe, &cfile, &c_src); cmd.status().unwrap().success() },
                 "gcc failed on jc1's C for {path}"
             );
             let got = Command::new(&exe).output().unwrap();
@@ -16751,10 +16880,17 @@ fn main() -> i32 {
         let cc = crate::find_c_compiler().expect("c-oracle needs a C compiler on PATH");
         let mut cmd = Command::new(&cc);
         cmd.args(crate::CC_FLAGS);
+        // These helpers use `CC_FLAGS` directly rather than `cc_base_flags()`, so the
+        // Windows target baseline is repeated: mingw declares `WSAPoll` only at
+        // `_WIN32_WINNT >= 0x0600`, and below that it is an implicit declaration returning
+        // `int` -- the silent `int`-fallback shape this tree keeps meeting.
+        #[cfg(windows)]
+        cmd.arg("-D_WIN32_WINNT=0x0600");
         if c_src.contains("pthread") {
             cmd.arg("-pthread");
         }
-        assert!(cmd.arg("-o").arg(&exe).arg(&cfile).status().unwrap().success(), "gcc failed for {rel}");
+        link_and_finish(&mut cmd, &exe, &cfile, &c_src);
+        assert!(cmd.status().unwrap().success(), "gcc failed for {rel}");
         let out = Command::new(&exe).output().unwrap();
         (String::from_utf8(out.stdout).unwrap(), out.status.code().unwrap_or(-1))
     }
@@ -17056,6 +17192,11 @@ fn main() -> i32 {
             // `sysfs` touches the real filesystem on both platforms and creates its own
             // scratch tree, so it needs no fixture in the repository.
             ("sysfs_test", 10),
+            // Real loopback TCP, both directions, on whichever platform is running.
+            ("sysnet_test", 5),
+            // Two halves: the loop driven by a scripted poller with no OS at all, and one
+            // end-to-end check of the per-platform `pollfd` layout against the real kernel.
+            ("syspoll_test", 3),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

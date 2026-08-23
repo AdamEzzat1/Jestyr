@@ -1,0 +1,550 @@
+// std/sysnet.jtr — TCP over IPv4, and the platform facts that come with it.
+//
+// TIER: `sys`. This is the module the tier rule was written for a second time: BSD sockets
+// are the closest thing computing has to a portable network API and the two platforms still
+// disagree about the handle's WIDTH, the failure sentinel, whether the library needs
+// starting, and which call closes a socket.
+//
+// ─── What is here ─────────────────────────────────────────────────────────────
+//
+// A listener, a stream, connect / bind+listen / accept / send / recv / close, and a
+// `SocketAddr`. IPv4 only. Blocking sockets only. No TLS, no DNS, no HTTP — each of those
+// is its own tier and each would hide something this one is trying to show.
+//
+// ─── The four divergences, named ──────────────────────────────────────────────
+//
+//   1. A socket is an `int` on POSIX and a 64-bit `SOCKET` on Windows. `Socket` therefore
+//      carries an `i64` on both, and the POSIX branch narrows at the call. A 32-bit handle
+//      type would silently truncate a Windows socket above 2^31.
+//
+//   2. Failure is `-1` on POSIX and `INVALID_SOCKET` (`(SOCKET)~0`, i.e. all bits set) on
+//      Windows. As a signed 64-bit value both read as -1, which is a coincidence worth
+//      relying on ONLY because it is checked: `is_open` compares against the platform's own
+//      sentinel constant, not against a shared -1.
+//
+//   3. **Windows needs the library STARTED**, POSIX does not. `WSAStartup` is
+//      process-global initialization — exactly the hidden global this library refuses to
+//      have — so it is attached to the CAPABILITY instead: `host()` starts Winsock and
+//      `shutdown()` stops it. The capability IS the initialization, which means the thing
+//      you must not forget is the thing the type system already makes you hold.
+//
+//   4. Closing a socket is `close()` on POSIX and `closesocket()` on Windows. POSIX has no
+//      `closesocket` and Windows' `close` is a CRT file call that does not know what a
+//      socket is, so this is not a spelling difference — it is two different functions.
+//
+// ─── `struct sockaddr_in` is read by OFFSET, and unlike `stat` that is DEFENSIBLE ──
+//
+// `std/sysfs` refuses to read `struct stat` by offset because its layout differs by
+// ARCHITECTURE (`st_mode` is at 24 on Linux x86-64 and 16 on aarch64) with no CI runner
+// covering the difference. `sockaddr_in` is not like that. It is a wire-adjacent structure
+// fixed at 16 bytes since 4.2BSD, and Linux and Windows agree byte for byte:
+//
+//     offset 0  (2 bytes)  sin_family    AF_INET = 2, HOST byte order
+//     offset 2  (2 bytes)  sin_port      NETWORK byte order (big-endian)
+//     offset 4  (4 bytes)  sin_addr      NETWORK byte order (big-endian)
+//     offset 8  (8 bytes)  sin_zero      must be zero
+//
+// **macOS and the BSDs split the first two bytes**: `uint8_t sin_len; uint8_t sin_family;`,
+// so byte 0 is 16 (the length) and byte 1 is 2 (the family) — where Linux little-endian
+// writes byte 0 = 2 and byte 1 = 0. This module writes the Linux/Windows form, and
+// `an_address_round_trips_through_its_wire_bytes` asserts those exact bytes, so a BSD host
+// gets a RED TEST rather than a connection to nowhere. Fixing it is one `@cfg` branch the
+// day someone can run it; guessing at it today would be the untested branch `std/sysdir`'s
+// header argues against.
+//
+// Byte order is the other half and it is not optional: the port and address travel
+// big-endian on the wire regardless of the host, so they are byte-assembled here rather
+// than passed through `htons`/`htonl` — which are macros on some platforms and therefore
+// unbindable, and which would hide the one thing about this structure a reader must know.
+//
+// ─── Blocking, and what that costs ────────────────────────────────────────────
+//
+// Every socket here is BLOCKING. `accept` waits for a connection, `recv` waits for bytes.
+// That is the honest primitive and it is unusable on its own for a server that must also
+// service timers — which is exactly what `std/syspoll` and `runtime.Pollable` exist for:
+// ask whether a socket is READY, then perform the blocking call that is now guaranteed not
+// to block. Non-blocking sockets plus `EWOULDBLOCK` are the other design; readiness-first
+// was chosen because it keeps every call in this module having exactly one meaning.
+//
+// ─── What this does NOT prove ─────────────────────────────────────────────────
+//
+// `send` returning n does not mean n bytes reached the peer — it means the kernel accepted
+// them. TCP can still fail afterwards, and the only way to know a peer received something
+// is for the peer to say so. `close` does not flush: it starts an orderly shutdown and
+// returns. Nothing here is a delivery guarantee, and a comment claiming otherwise would be
+// the overclaim this tier is built to avoid.
+//
+// Worked example:  examples/std/sysnet_demo.jtr
+// Run the tests:   jestyrc test examples/std/sysnet_test.jtr
+
+import "syserr"
+
+// ---- the bindings ---------------------------------------------------------------
+//
+// **The two platforms get the SAME Jestyr signature, and that is forced rather than
+// tidy.** `@cfg` lets two items share a name when their platforms are disjoint — but
+// typeck keys its function table on the BARE name, so the second declaration wins and BOTH
+// branches are then checked against ONE signature. `std/sysdir` never met this because its
+// POSIX and Windows externs have different names (`opendir` against `FindFirstFileA`);
+// sockets have the same names with different C types, which is exactly the case that
+// breaks. Measured: the POSIX call sites were type-checked against the Windows extern and
+// reported `expected i32, found u32`.
+//
+// Unifying is the right answer anyway, not just the working one. These are HEADER-declared
+// externs, so no prototype is emitted and the platform's own declaration is what applies —
+// the Jestyr signature only has to describe something C can implicitly convert from. `i64`
+// covers an `int` fd and a 64-bit `SOCKET`; `usize` covers `size_t` and Windows' `int`
+// length; `i32` covers `socklen_t`. The one place that does NOT unify is the two functions
+// that are genuinely different functions, and they keep their `@cfg` pair below.
+//
+// The return types are unified at `i64` on purpose: POSIX `socket` returns `int` and
+// Windows returns `SOCKET` (unsigned 64-bit). Widening `int` sign-extends -1 to -1, and
+// `INVALID_SOCKET` (all bits set) reinterprets as -1, so the two failure sentinels coincide
+// as a signed 64-bit value. That coincidence is relied on and therefore CHECKED —
+// `NET_INVALID` is compared against, and `the_invalid_socket_sentinel_is_the_same_on_both`
+// pins it.
+
+@cfg(posix) extern "sys/socket.h" fn socket(domain: i32, ty: i32, proto: i32) -> i64
+@cfg(windows) extern "winsock2.h" fn socket(domain: i32, ty: i32, proto: i32) -> i64
+
+@cfg(posix) extern "sys/socket.h" fn bind(s: i64, addr: cptr, len: i32) -> i32
+@cfg(windows) extern "winsock2.h" fn bind(s: i64, addr: cptr, len: i32) -> i32
+
+@cfg(posix) extern "sys/socket.h" fn listen(s: i64, backlog: i32) -> i32
+@cfg(windows) extern "winsock2.h" fn listen(s: i64, backlog: i32) -> i32
+
+@cfg(posix) extern "sys/socket.h" fn accept(s: i64, addr: cptr, len: cptr) -> i64
+@cfg(windows) extern "winsock2.h" fn accept(s: i64, addr: cptr, len: cptr) -> i64
+
+@cfg(posix) extern "sys/socket.h" fn connect(s: i64, addr: cptr, len: i32) -> i32
+@cfg(windows) extern "winsock2.h" fn connect(s: i64, addr: cptr, len: i32) -> i32
+
+@cfg(posix) extern "sys/socket.h" fn send(s: i64, buf: cptr, n: usize, flags: i32) -> i64
+@cfg(windows) extern "winsock2.h" fn send(s: i64, buf: cptr, n: usize, flags: i32) -> i64
+
+@cfg(posix) extern "sys/socket.h" fn recv(s: i64, buf: cptr, n: usize, flags: i32) -> i64
+@cfg(windows) extern "winsock2.h" fn recv(s: i64, buf: cptr, n: usize, flags: i32) -> i64
+
+@cfg(posix) extern "sys/socket.h" fn setsockopt(s: i64, lvl: i32, opt: i32, val: cptr, len: i32) -> i32
+@cfg(windows) extern "winsock2.h" fn setsockopt(s: i64, lvl: i32, opt: i32, val: cptr, len: i32) -> i32
+
+@cfg(posix) extern "sys/socket.h" fn getsockname(s: i64, addr: cptr, len: cptr) -> i32
+@cfg(windows) extern "winsock2.h" fn getsockname(s: i64, addr: cptr, len: cptr) -> i32
+
+// The two that are NOT the same function. POSIX has no `closesocket`, and Windows' `close`
+// is a CRT file call that does not know what a socket is — so this is the one pair that
+// genuinely needs a `@cfg` wrapper rather than a unified signature.
+//
+// This `close` is libc's, not `std/file`'s or `std/sysdir`'s. Both of those declare a
+// Jestyr `close`, so the canonicaliser has already renamed them and the bare name is free;
+// see `runtime.fire_due` for the case where it was not.
+@cfg(posix) extern "unistd.h" fn close(fd: i64) -> i32
+@cfg(windows) extern "winsock2.h" fn closesocket(s: i64) -> i32
+
+// Windows only: starting and stopping the library. See `Net` for why these hang off the
+// capability instead of being called once somewhere hopeful.
+@cfg(windows) extern "winsock2.h" fn WSAStartup(version: u16, data: cptr) -> i32
+@cfg(windows) extern "winsock2.h" fn WSACleanup() -> i32
+
+// ---- constants -----------------------------------------------------------------
+//
+// `AF_INET`, `SOCK_STREAM` and the socket options are macros, so their VALUES cross the
+// boundary rather than their names. Every one of these agrees between Linux and Windows;
+// where a value is NOT shared it gets a `@cfg` function rather than a constant, so that the
+// divergence is visible at the definition instead of hidden in a number.
+
+pub const NET_AF_INET: i32 = 2
+pub const NET_SOCK_STREAM: i32 = 1
+const NET_SOL_SOCKET_POSIX: i32 = 1
+const NET_SOL_SOCKET_WIN: i32 = 65535       // Windows spells SOL_SOCKET 0xFFFF
+const NET_SO_REUSEADDR_POSIX: i32 = 2
+const NET_SO_REUSEADDR_WIN: i32 = 4
+const NET_SOCKADDR_IN_LEN: usize = 16
+const NET_WSADATA_LEN: usize = 512          // WSADATA is 400 bytes; this is generous
+const NET_WINSOCK_2_2: u16 = 514            // MAKEWORD(2,2) = 0x0202
+
+// The invalid-socket sentinel. -1 on POSIX; on Windows `INVALID_SOCKET` is `(SOCKET)~0`,
+// which as a signed 64-bit value is also -1 — asserted rather than assumed, because the two
+// are equal by coincidence and not by specification.
+const NET_INVALID: i64 = 0 - 1
+
+// ---- the capability, which is also the platform's initialization ---------------
+//
+// `Net` is `std/fs`'s shape with one extra job: on Windows, constructing it starts Winsock.
+// That is the whole reason the capability is not optional here — `WSAStartup` is a
+// process-global that must happen before the first socket call, and attaching it to a value
+// the caller has to hold is the only way to have it without having a hidden global.
+//
+// Scalars only: a Jestyr borrow is second-class, so a handle cannot own borrowed storage.
+pub struct Net {
+    allowed: bool,
+    started: bool,
+    opened: i64,
+    refused: i64,
+}
+
+@cfg(posix) fn start_platform() -> bool {
+    return true                                   // nothing to start
+}
+
+@cfg(windows) fn start_platform() -> bool {
+    var d: *mut u8 = alloc(u8, NET_WSADATA_LEN)
+    let rc: i32 = WSAStartup(NET_WINSOCK_2_2, d as cptr)
+    free_ptr(d)
+    return rc == 0
+}
+
+@cfg(posix) fn stop_platform() {
+}
+
+@cfg(windows) fn stop_platform() {
+    WSACleanup()
+}
+
+// A handle that may open sockets. On Windows this STARTS WINSOCK; if that fails the handle
+// comes back not-allowed, so every subsequent operation refuses rather than crashing inside
+// a library that was never initialized.
+pub fn host() -> Net {
+    let ok: bool = start_platform()
+    return Net{ allowed: ok, started: ok, opened: 0, refused: 0 }
+}
+
+// A handle that refuses to open anything while still COUNTING what was asked of it — the
+// spy a refusal test needs. It does not start Winsock, because a denied handle should touch
+// nothing at all.
+pub fn denied() -> Net {
+    return Net{ allowed: false, started: false, opened: 0, refused: 0 }
+}
+
+// Stop the platform's networking library. A no-op on POSIX. Idempotent.
+pub fn shutdown(mut n: Net) {
+    if n.started {
+        stop_platform()
+        n.started = false
+    }
+    n.allowed = false
+}
+
+@no_alloc @no_os pub fn can_open(read n: Net) -> bool { return n.allowed }
+@no_alloc @no_os pub fn opened(read n: Net) -> i64 { return n.opened }
+@no_alloc @no_os pub fn refused(read n: Net) -> i64 { return n.refused }
+
+// ---- addresses ------------------------------------------------------------------
+//
+// `@copy`: two integers. An address is a value, not a resource.
+@copy pub struct SocketAddr {
+    pub ip: u32,          // HOST byte order; the wire conversion happens in `write_sockaddr`
+    pub port: u16,
+}
+
+@no_alloc @no_os pub fn addr(ip: u32, port: u16) -> SocketAddr {
+    return SocketAddr{ ip: ip, port: port }
+}
+
+// `127.0.0.1` — the only address this module can test against without a network.
+@no_alloc @no_os pub fn loopback(port: u16) -> SocketAddr {
+    return SocketAddr{ ip: 2130706433, port: port }        // 127<<24 | 1
+}
+
+// `0.0.0.0` — bind to every interface. Named rather than spelled 0, because "any" and
+// "the address zero" are different intents that happen to share a representation.
+@no_alloc @no_os pub fn any_addr(port: u16) -> SocketAddr {
+    return SocketAddr{ ip: 0, port: port }
+}
+
+// Fill a 16-byte `sockaddr_in` at `p`. See the header for the layout and for why macOS is
+// not covered.
+//
+// Byte-assembled rather than passed through `htons`/`htonl`: those are macros on several
+// platforms (so unbindable), and writing the bytes explicitly puts the one fact a reader
+// must know — port and address are BIG-ENDIAN on the wire — in the code instead of in a
+// function name.
+fn write_sockaddr(p: *mut u8, read a: SocketAddr) {
+    var i: usize = 0
+    for i < NET_SOCKADDR_IN_LEN {
+        unsafe { (p + i).* = 0 as u8 }
+        i = i + 1
+    }
+    // sin_family = AF_INET, host byte order (little-endian on every platform this targets).
+    unsafe { (p + 0).* = NET_AF_INET as u8 }
+    unsafe { (p + 1).* = 0 as u8 }
+    // sin_port, big-endian.
+    let pt: u32 = a.port as u32
+    unsafe { (p + 2).* = ((pt >> 8) & 255) as u8 }
+    unsafe { (p + 3).* = (pt & 255) as u8 }
+    // sin_addr, big-endian.
+    unsafe { (p + 4).* = ((a.ip >> 24) & 255) as u8 }
+    unsafe { (p + 5).* = ((a.ip >> 16) & 255) as u8 }
+    unsafe { (p + 6).* = ((a.ip >> 8) & 255) as u8 }
+    unsafe { (p + 7).* = (a.ip & 255) as u8 }
+}
+
+// Read a 16-byte `sockaddr_in` back out. The inverse of `write_sockaddr`, which is what
+// makes the round-trip testable without a network.
+fn read_sockaddr(p: *mut u8) -> SocketAddr {
+    var b2: u8 = 0
+    var b3: u8 = 0
+    var b4: u8 = 0
+    var b5: u8 = 0
+    var b6: u8 = 0
+    var b7: u8 = 0
+    unsafe { b2 = (p + 2).* }
+    unsafe { b3 = (p + 3).* }
+    unsafe { b4 = (p + 4).* }
+    unsafe { b5 = (p + 5).* }
+    unsafe { b6 = (p + 6).* }
+    unsafe { b7 = (p + 7).* }
+    let port: u32 = ((b2 as u32) << 8) | (b3 as u32)
+    let ip: u32 = ((b4 as u32) << 24) | ((b5 as u32) << 16) | ((b6 as u32) << 8) | (b7 as u32)
+    return SocketAddr{ ip: ip, port: port as u16 }
+}
+
+// The wire bytes of an address, for a test that wants to assert the layout rather than
+// trust it. Writes exactly `NET_SOCKADDR_IN_LEN` bytes into `buf`; returns how many.
+pub fn wire_bytes(read a: SocketAddr, mut buf: []u8) -> usize {
+    if buf.len < NET_SOCKADDR_IN_LEN { return 0 }
+    var i: usize = 0
+    var scratch: *mut u8 = alloc(u8, NET_SOCKADDR_IN_LEN)
+    write_sockaddr(scratch, a)
+    for i < NET_SOCKADDR_IN_LEN {
+        var b: u8 = 0
+        unsafe { b = (scratch + i).* }
+        buf[i] = b
+        i = i + 1
+    }
+    free_ptr(scratch)
+    return NET_SOCKADDR_IN_LEN
+}
+
+// ---- the handles -----------------------------------------------------------------
+//
+// A `Socket` is `@copy` and that is a KNOWN HAZARD, stated rather than hidden: copying one
+// gives two names for the same kernel handle, and closing through either leaves the other
+// pointing at a descriptor the kernel may already have reissued. Jestyr has move-only
+// DROPPABLES (a `take` parameter, a rebinding) but a struct with no `Drop` impl is still
+// freely copied, and giving `Socket` a `Drop` would close it at every scope exit — which is
+// wrong for a handle that is deliberately passed around.
+//
+// **The Tier 4 brief lists this as language work (§2.1) and it is not done.** The rule this
+// module lives under until it is: a `Socket` is owned by exactly one place, `close` is
+// called exactly once, and `is_open` is the only safe question to ask a copy.
+@copy pub struct Socket {
+    pub fd: i64,
+}
+
+@no_alloc @no_os pub fn is_open(read s: Socket) -> bool {
+    return s.fd != NET_INVALID
+}
+
+// The value a failed open hands back, and the one a caller uses to initialize a slot it has
+// not filled yet. Exported because a module-qualified struct LITERAL does not parse, so
+// there would otherwise be no way for a caller to name it.
+@no_alloc @no_os pub fn closed() -> Socket {
+    return Socket{ fd: NET_INVALID }
+}
+
+// ---- opening ---------------------------------------------------------------------
+
+// The one wrapper that survives unification: two different functions, one name.
+@cfg(posix) fn raw_close(fd: i64) -> i32 {
+    return close(fd)
+}
+
+@cfg(windows) fn raw_close(fd: i64) -> i32 {
+    return closesocket(fd)
+}
+
+// Let a listener re-bind a port still in TIME_WAIT. Without it a server cannot restart
+// promptly on the same port, which is the single most common "it works once" bug in a first
+// socket layer.
+//
+// **The option NUMBERS differ and the signatures do not**, so this stays a `@cfg` pair for
+// the values alone: `SO_REUSEADDR` is 2 on Linux and 4 on Windows, and `SOL_SOCKET` is 1
+// against 0xFFFF. Putting them in guarded functions rather than in a shared constant keeps
+// the divergence visible where it is defined instead of hidden inside a number.
+fn reuse_flag_buf() -> *mut u8 {
+    var one: *mut u8 = alloc(u8, 4)
+    unsafe { (one + 0).* = 1 as u8 }
+    unsafe { (one + 1).* = 0 as u8 }
+    unsafe { (one + 2).* = 0 as u8 }
+    unsafe { (one + 3).* = 0 as u8 }
+    return one
+}
+
+@cfg(posix) fn set_reuse(fd: i64) {
+    var one: *mut u8 = reuse_flag_buf()
+    setsockopt(fd, NET_SOL_SOCKET_POSIX, NET_SO_REUSEADDR_POSIX, one as cptr, 4)
+    free_ptr(one)
+}
+
+@cfg(windows) fn set_reuse(fd: i64) {
+    var one: *mut u8 = reuse_flag_buf()
+    setsockopt(fd, NET_SOL_SOCKET_WIN, NET_SO_REUSEADDR_WIN, one as cptr, 4)
+    free_ptr(one)
+}
+
+// ---- the operations ----------------------------------------------------------------
+
+// Bind and listen on `a`. `backlog` is the kernel's pending-connection queue.
+//
+// **Binding port 0 asks the kernel to choose one**, which is how a test gets a port nobody
+// else is using — `local_addr` then reports which. Hard-coding a port in a test is how a
+// socket suite becomes flaky on a shared machine.
+pub fn listen_on(mut n: Net, read a: SocketAddr, backlog: i32) -> Socket !{ NetFailed(i32), NetRefused } {
+    if n.allowed == false {
+        n.refused = n.refused + 1
+        return err(NetRefused)
+    }
+    let fd: i64 = socket(NET_AF_INET, NET_SOCK_STREAM, 0)
+    if fd == NET_INVALID { return err(NetFailed(syserr.last_raw())) }
+    n.opened = n.opened + 1
+    set_reuse(fd)
+
+    var p: *mut u8 = alloc(u8, NET_SOCKADDR_IN_LEN)
+    write_sockaddr(p, a)
+    let rc: i32 = bind(fd, p as cptr, NET_SOCKADDR_IN_LEN as i32)
+    var code: i32 = 0
+    if rc != 0 { code = syserr.last_raw() }
+    free_ptr(p)
+    if rc != 0 {
+        raw_close(fd)
+        return err(NetFailed(code))
+    }
+    if listen(fd, backlog) != 0 {
+        let lc: i32 = syserr.last_raw()
+        raw_close(fd)
+        return err(NetFailed(lc))
+    }
+    return ok(Socket{ fd: fd })
+}
+
+// The address a socket is actually bound to — the answer to "which port did the kernel
+// give me" after binding port 0.
+pub fn local_addr(read s: Socket) -> SocketAddr !{ NetFailed(i32), NetRefused } {
+    if is_open(s) == false { return err(NetRefused) }
+    var p: *mut u8 = alloc(u8, NET_SOCKADDR_IN_LEN)
+    var lenp: *mut u8 = alloc(u8, 4)
+    // The length is an in/out parameter: it says how big the buffer is and comes back
+    // saying how much was written. `socklen_t` is a 32-bit int on both platforms.
+    unsafe { (lenp + 0).* = NET_SOCKADDR_IN_LEN as u8 }
+    unsafe { (lenp + 1).* = 0 as u8 }
+    unsafe { (lenp + 2).* = 0 as u8 }
+    unsafe { (lenp + 3).* = 0 as u8 }
+    let rc: i32 = getsockname(s.fd, p as cptr, lenp as cptr)
+    var code: i32 = 0
+    if rc != 0 { code = syserr.last_raw() }
+    var got: SocketAddr = SocketAddr{ ip: 0, port: 0 }
+    if rc == 0 { got = read_sockaddr(p) }
+    free_ptr(lenp)
+    free_ptr(p)
+    if rc != 0 { return err(NetFailed(code)) }
+    return ok(got)
+}
+
+// Wait for a connection and return the accepted stream. **This BLOCKS** until one arrives;
+// see the header, and see `std/syspoll` for asking first.
+pub fn accept_one(mut n: Net, read l: Socket) -> Socket !{ NetFailed(i32), NetRefused } {
+    if n.allowed == false {
+        n.refused = n.refused + 1
+        return err(NetRefused)
+    }
+    if is_open(l) == false { return err(NetRefused) }
+    let fd: i64 = accept(l.fd, null, null)
+    if fd == NET_INVALID { return err(NetFailed(syserr.last_raw())) }
+    n.opened = n.opened + 1
+    return ok(Socket{ fd: fd })
+}
+
+// Open a connection to `a`. Blocks until the handshake completes or fails.
+pub fn connect_to(mut n: Net, read a: SocketAddr) -> Socket !{ NetFailed(i32), NetRefused } {
+    if n.allowed == false {
+        n.refused = n.refused + 1
+        return err(NetRefused)
+    }
+    let fd: i64 = socket(NET_AF_INET, NET_SOCK_STREAM, 0)
+    if fd == NET_INVALID { return err(NetFailed(syserr.last_raw())) }
+    n.opened = n.opened + 1
+
+    var p: *mut u8 = alloc(u8, NET_SOCKADDR_IN_LEN)
+    write_sockaddr(p, a)
+    let rc: i32 = connect(fd, p as cptr, NET_SOCKADDR_IN_LEN as i32)
+    var code: i32 = 0
+    if rc != 0 { code = syserr.last_raw() }
+    free_ptr(p)
+    if rc != 0 {
+        raw_close(fd)
+        return err(NetFailed(code))
+    }
+    return ok(Socket{ fd: fd })
+}
+
+// Send bytes. Returns how many the kernel ACCEPTED, which may be fewer than asked —
+// a short write is normal on a stream socket and is not an error. See the header on what
+// this does not prove.
+pub fn send_bytes(read s: Socket, read buf: []u8) -> usize !{ NetFailed(i32), NetRefused } {
+    if is_open(s) == false { return err(NetRefused) }
+    if buf.len == 0 { return ok(0) }
+    var scratch: *mut u8 = alloc(u8, buf.len)
+    var i: usize = 0
+    for i < buf.len {
+        unsafe { (scratch + i).* = buf[i] }
+        i = i + 1
+    }
+    let sent: i64 = send(s.fd, scratch as cptr, buf.len, 0)
+    var code: i32 = 0
+    if sent < 0 { code = syserr.last_raw() }
+    free_ptr(scratch)
+    if sent < 0 { return err(NetFailed(code)) }
+    return ok(sent as usize)
+}
+
+// The loop `send_bytes` does not do, spelled out: keep sending until everything is gone.
+// It is separate because a caller that must not block indefinitely wants the short write.
+pub fn send_all(read s: Socket, read buf: []u8) -> usize !{ NetFailed(i32), NetRefused } {
+    var off: usize = 0
+    for off < buf.len {
+        let n: usize = send_bytes(s, buf[off .. buf.len])?
+        if n == 0 { return ok(off) }
+        off = off + n
+    }
+    return ok(off)
+}
+
+// Receive into `buf`. **Zero means the peer closed cleanly** — it is not an error and not a
+// timeout; on a blocking socket there is no other way to get zero. That distinction is why
+// this returns a count rather than a bool.
+pub fn recv_bytes(read s: Socket, mut buf: []u8) -> usize !{ NetFailed(i32), NetRefused } {
+    if is_open(s) == false { return err(NetRefused) }
+    if buf.len == 0 { return ok(0) }
+    var scratch: *mut u8 = alloc(u8, buf.len)
+    let got: i64 = recv(s.fd, scratch as cptr, buf.len, 0)
+    var code: i32 = 0
+    if got < 0 { code = syserr.last_raw() }
+    if got > 0 {
+        var i: usize = 0
+        for i < got as usize {
+            var b: u8 = 0
+            unsafe { b = (scratch + i).* }
+            buf[i] = b
+            i = i + 1
+        }
+    }
+    free_ptr(scratch)
+    if got < 0 { return err(NetFailed(code)) }
+    return ok(got as usize)
+}
+
+// Close a socket. Idempotent on the Jestyr value: a closed `Socket` closes again for free.
+// **It is NOT idempotent on a COPY** — see the `@copy` hazard on `Socket`.
+//
+// Answers nothing. Closing either happened or failed, and a failed close on a socket tells
+// the caller almost nothing actionable (the descriptor is gone either way), which is why
+// the error is reported and not a status.
+pub fn close_socket(mut s: Socket) !{ NetFailed(i32), NetRefused } {
+    if is_open(s) == false { return }
+    let rc: i32 = raw_close(s.fd)
+    var code: i32 = 0
+    if rc != 0 { code = syserr.last_raw() }
+    s.fd = NET_INVALID
+    if rc != 0 { return err(NetFailed(code)) }
+}

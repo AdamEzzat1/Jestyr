@@ -1,0 +1,299 @@
+// std/sysnet_test.jtr — the unit suite for `std/sysnet`.
+//
+// These open real sockets, on real loopback, and that is the only honest way to test a
+// socket layer: the module exists because two platforms disagree about handles, sentinels,
+// initialization and closing, and a mock would encode one of their answers.
+//
+// **Every listener binds port 0** and asks the kernel which port it got. A test that
+// hard-codes a port is a test that fails on a shared machine for reasons that have nothing
+// to do with the code.
+//
+// The blocking half is kept to a single connect/accept pair per test and always in the
+// order accept-after-connect on the same thread — see `a_loopback_round_trip_carries_bytes`
+// for why that terminates.
+//
+// Run:  jestyrc test examples/std/sysnet_test.jtr
+
+import "sysnet"
+import "syserr"
+import "str"
+import "test"
+import "test_report"
+
+const NET_T_CAP: usize = 4096
+
+// Record `v` into `slot` and yield a `Socket`, so a `catch |e| match e { … }` can both
+// produce the ok type and report which error arrived. A match arm body must be an
+// expression, so this is the shape that works — the same helper `sysfs_test` uses.
+const NET_T_REFUSED: i32 = 0 - 1
+
+fn stamp_sock(mut slot: i32, v: i32) -> sysnet.Socket {
+    slot = v
+    return sysnet.closed()
+}
+
+fn stamp_usize(mut slot: i32, v: i32) -> usize {
+    slot = v
+    return 0
+}
+
+// Discard an error deliberately. A `catch` fallback must be an EXPRESSION and an empty
+// block is not one, so "ignore this" needs a name — which reads better than a silent `{ }`
+// would have: every discard in this file is visible as a discard.
+//
+// It works because the calls being discarded are UNIT-fallible (`fn … !{ E }` with no
+// return type), so the fallback only has to produce unit — which a void call does.
+fn ignore() { }
+
+@test fn an_address_round_trips_through_its_wire_bytes() -> bool {
+    var raw: *mut u8 = alloc(u8, NET_T_CAP)
+    var rep: []u8 = slice(u8, raw, NET_T_CAP)
+    var c: test.Check = test.new()
+
+    // **This is the layout assertion, and it is the one that must go RED on a BSD.**
+    // Linux and Windows agree byte for byte on `sockaddr_in`; macOS and the BSDs split the
+    // first two bytes into `sin_len` + `sin_family`, so byte 0 would be 16 there and 2
+    // here. Asserting the exact bytes turns that from a connection to nowhere into a
+    // failing test — see the module header.
+    var wbuf: *mut u8 = alloc(u8, 64)
+    var wb: []u8 = slice(u8, wbuf, 64)
+    let n: usize = sysnet.wire_bytes(sysnet.loopback(8080), wb)
+    test.eq_usize(c, rep, "a sockaddr_in is 16 bytes", n, 16)
+    test.eq_i64(c, rep, "sin_family low byte is AF_INET", wb[0] as i64, 2)
+    test.eq_i64(c, rep, "sin_family high byte is zero", wb[1] as i64, 0)
+    // 8080 = 0x1F90, big-endian on the wire.
+    test.eq_i64(c, rep, "sin_port is big-endian, high", wb[2] as i64, 31)
+    test.eq_i64(c, rep, "sin_port is big-endian, low", wb[3] as i64, 144)
+    // 127.0.0.1, big-endian.
+    test.eq_i64(c, rep, "sin_addr[0]", wb[4] as i64, 127)
+    test.eq_i64(c, rep, "sin_addr[1]", wb[5] as i64, 0)
+    test.eq_i64(c, rep, "sin_addr[2]", wb[6] as i64, 0)
+    test.eq_i64(c, rep, "sin_addr[3]", wb[7] as i64, 1)
+    // sin_zero must be zero, or some kernels reject the address.
+    var zeros: i32 = 0
+    var i: usize = 8
+    for i < 16 {
+        if wb[i] as i64 == 0 { zeros = zeros + 1 }
+        i = i + 1
+    }
+    test.eq_i64(c, rep, "sin_zero is eight zero bytes", zeros as i64, 8)
+
+    // The positive control for the byte-order assertions: a DIFFERENT address must produce
+    // different bytes in the places that encode it. Without this, an implementation that
+    // wrote a fixed 16 bytes would satisfy every assertion above.
+    let m: usize = sysnet.wire_bytes(sysnet.any_addr(1), wb)
+    test.eq_usize(c, rep, "still 16 bytes", m, 16)
+    test.eq_i64(c, rep, "0.0.0.0 has a zero address", wb[4] as i64, 0)
+    test.eq_i64(c, rep, "port 1 is big-endian too", wb[2] as i64, 0)
+    test.eq_i64(c, rep, "…low byte 1", wb[3] as i64, 1)
+
+    free_ptr(wbuf)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_loopback_round_trip_carries_bytes_in_both_directions() -> bool {
+    var raw: *mut u8 = alloc(u8, NET_T_CAP)
+    var rep: []u8 = slice(u8, raw, NET_T_CAP)
+    var c: test.Check = test.new()
+    var n: sysnet.Net = sysnet.host()
+    test.is_true(c, rep, "the platform's networking started", sysnet.can_open(n))
+
+    // Port 0: the kernel picks. `local_addr` then says which, so nothing here depends on a
+    // port being free.
+    var why: i32 = SYSERR_OK
+    var lis: sysnet.Socket = sysnet.listen_on(n, sysnet.loopback(0), 4) catch |e| match e {
+        NetFailed(code) => stamp_sock(why, syserr.category(code, syserr.host_plat())),
+        NetRefused => stamp_sock(why, NET_T_REFUSED),
+    }
+    test.eq_i64(c, rep, "the listener bound", why as i64, SYSERR_OK as i64)
+    test.is_true(c, rep, "and is open", sysnet.is_open(lis))
+
+    let bound: sysnet.SocketAddr = sysnet.local_addr(lis) catch sysnet.addr(0, 0)
+    test.is_true(c, rep, "the kernel chose a real port", bound.port > 0)
+    test.eq_i64(c, rep, "on loopback", bound.ip as i64, 2130706433)
+
+    // **Why this terminates on one thread**: `connect` to a listening socket completes as
+    // soon as the kernel puts it on the accept queue — the server does not have to be in
+    // `accept` yet. So connect-then-accept is safe here; accept-then-connect would deadlock.
+    var cli: sysnet.Socket = sysnet.connect_to(n, sysnet.loopback(bound.port)) catch |e| match e {
+        NetFailed(code) => stamp_sock(why, syserr.category(code, syserr.host_plat())),
+        NetRefused => stamp_sock(why, NET_T_REFUSED),
+    }
+    test.eq_i64(c, rep, "the client connected", why as i64, SYSERR_OK as i64)
+
+    var srv: sysnet.Socket = sysnet.accept_one(n, lis) catch |e| match e {
+        NetFailed(code) => stamp_sock(why, syserr.category(code, syserr.host_plat())),
+        NetRefused => stamp_sock(why, NET_T_REFUSED),
+    }
+    test.eq_i64(c, rep, "the server accepted", why as i64, SYSERR_OK as i64)
+    test.is_true(c, rep, "and the accepted socket is open", sysnet.is_open(srv))
+
+    // client -> server
+    var obuf: *mut u8 = alloc(u8, 64)
+    var ob: []u8 = slice(u8, obuf, 64)
+    let msg: str = "ping"
+    var k: usize = 0
+    for k < msg.len {
+        ob[k] = msg[k]
+        k = k + 1
+    }
+    let sent: usize = sysnet.send_all(cli, ob[0 .. msg.len]) catch 0
+    test.eq_usize(c, rep, "the client sent every byte", sent, msg.len)
+
+    var ibuf: *mut u8 = alloc(u8, 64)
+    var ib: []u8 = slice(u8, ibuf, 64)
+    let got: usize = sysnet.recv_bytes(srv, ib) catch 0
+    test.eq_usize(c, rep, "the server received them", got, msg.len)
+    test.is_true(c, rep, "byte for byte", str.eq(from_utf8(ib[0 .. got]), "ping"))
+
+    // server -> client, so the test covers both directions rather than assuming symmetry
+    let reply: str = "pong!"
+    var j: usize = 0
+    for j < reply.len {
+        ob[j] = reply[j]
+        j = j + 1
+    }
+    let sent2: usize = sysnet.send_all(srv, ob[0 .. reply.len]) catch 0
+    test.eq_usize(c, rep, "the server replied", sent2, reply.len)
+    let got2: usize = sysnet.recv_bytes(cli, ib) catch 0
+    test.is_true(c, rep, "and the client heard it", str.eq(from_utf8(ib[0 .. got2]), "pong!"))
+
+    // **Zero means the peer closed cleanly.** It is not an error and not a timeout, and it
+    // is the only way a blocking `recv` can return zero — which is why `recv_bytes` answers
+    // with a count rather than a bool.
+    sysnet.close_socket(srv) catch ignore()
+    let eof: usize = sysnet.recv_bytes(cli, ib) catch 999
+    test.eq_usize(c, rep, "a closed peer reads as zero, not as an error", eof, 0)
+
+    sysnet.close_socket(cli) catch ignore()
+    sysnet.close_socket(lis) catch ignore()
+    free_ptr(ibuf)
+    free_ptr(obuf)
+    sysnet.shutdown(n)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_denied_handle_opens_nothing_and_a_host_handle_does() -> bool {
+    var raw: *mut u8 = alloc(u8, NET_T_CAP)
+    var rep: []u8 = slice(u8, raw, NET_T_CAP)
+    var c: test.Check = test.new()
+
+    // A denied handle does not start Winsock either — it should touch nothing at all.
+    var no: sysnet.Net = sysnet.denied()
+    test.is_false(c, rep, "a denied handle cannot open", sysnet.can_open(no))
+
+    var why: i32 = SYSERR_OK
+    var lis: sysnet.Socket = sysnet.listen_on(no, sysnet.loopback(0), 4) catch |e| match e {
+        NetFailed(code) => stamp_sock(why, syserr.category(code, syserr.host_plat())),
+        NetRefused => stamp_sock(why, NET_T_REFUSED),
+    }
+    test.eq_i64(c, rep, "listen is refused by TYPE, not by failure", why as i64, NET_T_REFUSED as i64)
+    test.is_false(c, rep, "and no socket came back", sysnet.is_open(lis))
+
+    why = SYSERR_OK
+    var cli: sysnet.Socket = sysnet.connect_to(no, sysnet.loopback(9)) catch |e| match e {
+        NetFailed(code) => stamp_sock(why, syserr.category(code, syserr.host_plat())),
+        NetRefused => stamp_sock(why, NET_T_REFUSED),
+    }
+    test.eq_i64(c, rep, "connect is refused too", why as i64, NET_T_REFUSED as i64)
+
+    // Refusals are COUNTED as well as typed, so a test can assert the code TRIED — the
+    // difference between "respected the capability" and "never got that far".
+    test.eq_i64(c, rep, "both attempts were counted", sysnet.refused(no), 2)
+    test.eq_i64(c, rep, "and nothing was opened", sysnet.opened(no), 0)
+
+    // **The positive control without which the refusals prove nothing**: the identical
+    // calls through `host()` succeed.
+    var h: sysnet.Net = sysnet.host()
+    why = SYSERR_OK
+    var lis2: sysnet.Socket = sysnet.listen_on(h, sysnet.loopback(0), 4) catch |e| match e {
+        NetFailed(code) => stamp_sock(why, syserr.category(code, syserr.host_plat())),
+        NetRefused => stamp_sock(why, NET_T_REFUSED),
+    }
+    test.eq_i64(c, rep, "positive control: host() binds", why as i64, SYSERR_OK as i64)
+    test.is_true(c, rep, "and opened one socket", sysnet.opened(h) > 0)
+    test.eq_i64(c, rep, "refusing nothing", sysnet.refused(h), 0)
+    sysnet.close_socket(lis2) catch ignore()
+    sysnet.shutdown(h)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn connecting_to_a_port_nobody_listens_on_is_refused_by_the_platform() -> bool {
+    var raw: *mut u8 = alloc(u8, NET_T_CAP)
+    var rep: []u8 = slice(u8, raw, NET_T_CAP)
+    var c: test.Check = test.new()
+    var n: sysnet.Net = sysnet.host()
+
+    // Bind a port, learn it, then close — so we have a port that is *certainly* ours to
+    // name and *certainly* has nobody on it. Picking a number out of the air would be a
+    // test that fails when some unrelated service happens to be running.
+    var probe: sysnet.Socket = sysnet.listen_on(n, sysnet.loopback(0), 1) catch sysnet.closed()
+    let dead: sysnet.SocketAddr = sysnet.local_addr(probe) catch sysnet.addr(0, 0)
+    sysnet.close_socket(probe) catch ignore()
+    test.is_true(c, rep, "we know a port nobody is listening on", dead.port > 0)
+
+    var why: i32 = SYSERR_OK
+    var cli: sysnet.Socket = sysnet.connect_to(n, sysnet.loopback(dead.port)) catch |e| match e {
+        NetFailed(code) => stamp_sock(why, syserr.category(code, syserr.host_plat())),
+        NetRefused => stamp_sock(why, NET_T_REFUSED),
+    }
+    // The failure is the PLATFORM's, not the capability's — that distinction is the whole
+    // reason `NetFailed` and `NetRefused` are separate members. A denied handle and a
+    // refused connection must never look the same.
+    test.ne_i64(c, rep, "it failed", why as i64, SYSERR_OK as i64)
+    test.ne_i64(c, rep, "and it was the platform, not the capability", why as i64, NET_T_REFUSED as i64)
+    test.is_false(c, rep, "no socket came back", sysnet.is_open(cli))
+
+    sysnet.shutdown(n)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn operations_on_a_closed_socket_are_refused_rather_than_fatal() -> bool {
+    var raw: *mut u8 = alloc(u8, NET_T_CAP)
+    var rep: []u8 = slice(u8, raw, NET_T_CAP)
+    var c: test.Check = test.new()
+
+    // The value a failed open hands back. Every operation on it must refuse, not fault —
+    // a caller who forgot to check `is_open` gets a typed refusal instead of a crash, which
+    // is the same contract `std/sysdir`'s closed `Dir` makes.
+    var dead: sysnet.Socket = sysnet.closed()
+    test.is_false(c, rep, "a closed socket is not open", sysnet.is_open(dead))
+
+    var buf: *mut u8 = alloc(u8, 8)
+    var b: []u8 = slice(u8, buf, 8)
+    var why: i32 = SYSERR_OK
+    let sent: usize = sysnet.send_bytes(dead, b) catch |e| match e {
+        NetFailed(code) => stamp_usize(why, syserr.category(code, syserr.host_plat())),
+        NetRefused => stamp_usize(why, NET_T_REFUSED),
+    }
+    test.eq_i64(c, rep, "send refuses", why as i64, NET_T_REFUSED as i64)
+    test.eq_usize(c, rep, "and sends nothing", sent, 0)
+
+    why = SYSERR_OK
+    let got: usize = sysnet.recv_bytes(dead, b) catch |e| match e {
+        NetFailed(code) => stamp_usize(why, syserr.category(code, syserr.host_plat())),
+        NetRefused => stamp_usize(why, NET_T_REFUSED),
+    }
+    test.eq_i64(c, rep, "recv refuses", why as i64, NET_T_REFUSED as i64)
+    test.eq_usize(c, rep, "and receives nothing", got, 0)
+
+    // Closing a closed socket is a no-op, so a cleanup path that runs twice is harmless.
+    var twice: bool = true
+    sysnet.close_socket(dead) catch { twice = false }
+    sysnet.close_socket(dead) catch { twice = false }
+    test.is_true(c, rep, "closing twice is harmless", twice)
+
+    free_ptr(buf)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}

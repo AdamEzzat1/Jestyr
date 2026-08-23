@@ -189,7 +189,17 @@ fn emit_prelude(mut sb: String, read p: parser.Parser, read src: str, read g: Cg
     // header declares it; without this nothing made the header PRESENT, so the call was
     // an implicit declaration and its pointer return was truncated through `int`.
     // First-appearance order, deduplicated. The abi's INNER span is `(w,u)`, -1 absent.
+    //
+    // **Two passes, and `<winsock2.h>` goes in the first one.** `windows.h` pulls in the
+    // Winsock 1.1 header, so including it first makes `winsock2.h` collide with what it has
+    // already seen -- mingw downgrades that to `#warning Please include winsock2.h before
+    // windows.h`, MSVC does not. `std/syserr` names `windows.h` and `std/sysnet` names
+    // `winsock2.h`, so every program using both hit it. `seen_h` is shared across the two
+    // passes, so pass 1 skips whatever pass 0 emitted and every other header keeps its
+    // first-appearance position. Mirrors the reference's stable `sort_by_key`.
     var seen_h: String = string_new()
+    var hpass: i32 = 0
+    for hpass < 2 {
     var hr: i32 = 0
     for hr < list.len(i32, p.roots) {
         let hid: i32 = list.get(i32, p.roots, hr as usize)
@@ -197,6 +207,10 @@ fn emit_prelude(mut sb: String, read p: parser.Parser, read src: str, read g: Cg
         if hit.kind == 8 and hit.w >= 0 {
             if hit.u - hit.w >= 2 {
                 if str_eq(src[(hit.u - 2) as usize .. hit.u as usize], ".h") {
+                    let is_ws2: bool = str_eq(src[hit.w as usize .. hit.u as usize], "winsock2.h")
+                    var want_now: bool = is_ws2
+                    if hpass == 1 { want_now = !is_ws2 }
+                    if want_now {
                     var probe_h: String = string_new()
                     string_push(probe_h, "|")
                     string_push(probe_h, src[hit.w as usize .. hit.u as usize])
@@ -237,10 +251,13 @@ fn emit_prelude(mut sb: String, read p: parser.Parser, read src: str, read g: Cg
                         cfg_close(sb, hg)
                     }
                     string_free(probe_h)
+                    }
                 }
             }
         }
         hr = hr + 1
+    }
+    hpass = hpass + 1
     }
     string_free(seen_h)
     string_push(sb, "\n")
@@ -2160,6 +2177,18 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         return
     }
     if e.kind == 8 {                                  // Try `e?`: early-return-on-error statement-expr
+        // **THE BASE IS EMITTED BEFORE `_q{n}` IS ALLOCATED, matching the reference's temp
+        // order** -- the same rule the Catch arm below already states. The reference emits
+        // the base expression first and only then formats its own temp name, so any temps
+        // the base allocates get the lower numbers.
+        //
+        // Latent until `std/sysnet` wrote `send_bytes(s, buf[off .. buf.len])?`, which is
+        // the corpus's first `?` over a call carrying a slice-RANGE argument: the reference
+        // numbered the range's `_s2` before the try's `_q3`, the port numbered `_q2` before
+        // `_s3`. Every existing `?` had an argument that allocates nothing, so the two
+        // orders coincided and nothing noticed.
+        var qb: String = string_new()
+        emit_expr(qb, p, src, c, g, e.a)
         let n: i32 = g.tmp
         g.tmp = g.tmp + 1
         // `!E`-only base: a unit result carries NO `ok` member, so nothing is yielded and
@@ -2174,7 +2203,8 @@ fn emit_expr(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         string_push(sb, " _q")
         push_uint(sb, n as i64)
         string_push(sb, " = ")
-        emit_expr(sb, p, src, c, g, e.a)
+        string_push(sb, string_view(qb))
+        string_free(qb)
         string_push(sb, "; if (_q")
         push_uint(sb, n as i64)
         string_push(sb, ".is_err) return (")
@@ -13748,7 +13778,26 @@ fn ml_scan_decls(mut m: Ml, mi: usize, mut it: Interner, kwcount: i64, read a: A
         else if str_eq(tx, "}") { depth = depth - 1 }
         else if depth == 0 {
             if str_eq(tx, "fn") or str_eq(tx, "struct") or str_eq(tx, "record") or str_eq(tx, "union") or str_eq(tx, "enum") or str_eq(tx, "const") or str_eq(tx, "distinct") or str_eq(tx, "trait") {
-                if i + 1 < list.len(tokens.Token, tk) {
+                // **An `extern` declaration's name is a C SYMBOL and must never be
+                // renamed.** `extern "unistd.h" fn close(fd: i32)` names libc's `close`;
+                // rewriting it to `close__m7` because `std/file` and `std/sysdir` also
+                // declare a `close` produces `undefined reference to close__m7` at link
+                // time -- and it does so SILENTLY, because the loader has no idea the name
+                // it is renaming belongs to someone else's object file. Measured on a
+                // two-module probe binding `puts`: the reference REFUSES the program
+                // (*duplicate definition*), the port linked garbage.
+                //
+                // The shape is `[pub] [@attrs] extern "<abi>" fn <name>`, so the token two
+                // before `fn` is `extern` -- the abi string sits between them. Skipping the
+                // registration is enough: an unregistered name is never a collision, so it
+                // is never rewritten, and any Jestyr function sharing it is unaffected
+                // (cgen prefixes those with `jestyr_`, so there is no C-level clash either).
+                var is_extern: bool = false
+                if str_eq(tx, "fn") and i >= 2 {
+                    let xt: tokens.Token = list.get(tokens.Token, tk, i - 2)
+                    if str_eq(src[xt.start .. xt.end], "extern") { is_extern = true }
+                }
+                if i + 1 < list.len(tokens.Token, tk) and is_extern == false {
                     let nm: tokens.Token = list.get(tokens.Token, tk, i + 1)
                     if ml_ident_head(src[nm.start .. nm.end]) {
                         ml_register(m, src[nm.start .. nm.end], string_view(stemb))
@@ -14283,11 +14332,26 @@ fn driver_build(mut m: Ml, read p: parser.Parser, read c: typeck.Checker, read s
     }
     string_push(cmd, " -O2 -std=c11 -ffp-contract=off -fno-fast-math")
     if contains(string_view(sb), "pthread") { string_push(cmd, " -pthread") }
+    // **The Windows target baseline**, mirroring `cc_base_flags`: mingw declares `WSAPoll`
+    // only at `_WIN32_WINNT >= 0x0600`, and below that it is an implicit declaration
+    // returning `int` -- the silent `int`-fallback shape. Set unconditionally on Windows
+    // rather than gated on content, so the same source never compiles differently depending
+    // on which modules a program happened to import.
+    if !posix { string_push(cmd, " -D_WIN32_WINNT=0x0600") }
     string_push(cmd, " -o \"")
     string_push(cmd, string_view(xpath))
     string_push(cmd, "\" \"")
     string_push(cmd, string_view(cpath))
     string_push(cmd, "\"")
+    // **Winsock is linked LAST, and the position is load-bearing.** `<winsock2.h>` declares
+    // the socket API but the implementation is in `ws2_32.dll`, which mingw does not link by
+    // default; GNU ld resolves `-l` libraries against the objects seen SO FAR, so placing it
+    // before the source resolves nothing and the link fails exactly as if the flag were
+    // absent. Content-triggered like `-pthread`, and host-gated because both `@cfg` branches
+    // are always emitted -- the source names `winsock2.h` on Linux too.
+    if !posix {
+        if contains(string_view(sb), "winsock2.h") { string_push(cmd, " -lws2_32") }
+    }
     let rc: i32 = run_command(string_view(cmd))
     if rc != 0 {
         eprint_str("error: the C compiler failed on the generated C")

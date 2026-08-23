@@ -1082,6 +1082,19 @@ impl<'a> Cgen<'a> {
                 }
             }
         }
+        // **`<winsock2.h>` must precede `<windows.h>`, and that is a Windows rule rather
+        // than a preference.** `windows.h` pulls in the Winsock 1.1 header; including it
+        // first makes `winsock2.h` collide with declarations it has already seen. mingw
+        // downgrades that to `#warning Please include winsock2.h before windows.h` and
+        // limps on; MSVC does not. `std/syserr` names `windows.h` (for `GetLastError`) and
+        // `std/sysnet` names `winsock2.h`, so every program using both hit it.
+        //
+        // A single ordering exception rather than a general priority mechanism, because
+        // there is exactly one such pair in the C world this backend targets and a
+        // configurable ordering would be surface with one user. `sort_by_key` is STABLE, so
+        // every other header keeps its first-appearance position and no existing program's
+        // output moves.
+        hdrs.sort_by_key(|h| if *h == "winsock2.h" { 0 } else { 1 });
         for h in hdrs {
             let g = self.cfg_open(seen.get(h).cloned().flatten().flatten());
             self.raw(format!("#include <{h}>\n"));

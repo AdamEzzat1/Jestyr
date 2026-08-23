@@ -41,13 +41,15 @@ pub fn check(ast: &Ast) -> (TypeInfo, Vec<Diagnostic>) {
 /// item belongs to, what each module imports, and what is `pub` — so the checker
 /// can enforce visibility and resolve qualified access (`mem.allocate`).
 pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>) {
-    let Owners { owner, name_mods, dup, dup_types, dup_variants } = build_owner(ast, modules);
+    let Owners { owner, extern_owned, name_mods, dup, dup_types, dup_variants } =
+        build_owner(ast, modules);
     let item_mod: Vec<ModId> =
         (0..ast.items.len()).map(|i| *modules.item_mod.get(i).unwrap_or(&0)).collect();
     let mut tc = TypeChecker {
         ast,
         modules,
         owner,
+        extern_owned,
         name_mods,
         dup,
         dup_types,
@@ -100,6 +102,9 @@ struct Owners {
     /// visibility and qualified-access resolution; keyed on the module so two
     /// modules may own the same bare name independently (the namespace fix).
     owner: HashMap<(ModId, String), bool>,
+    /// `(module, name)` pairs declared by an `extern`. An extern's name is a C SYMBOL,
+    /// so it must never be canonicalized — see `TypeChecker::canon_in`.
+    extern_owned: HashSet<(ModId, String)>,
     /// fn/const name → the modules that define it. Drives `dup` and the
     /// "defined in another module — call it qualified" diagnostic.
     name_mods: HashMap<String, Vec<ModId>>,
@@ -119,6 +124,7 @@ struct Owners {
 /// so two modules each defining `make` are distinct entries, not a collision.
 fn build_owner(ast: &Ast, modules: &Modules) -> Owners {
     let mut owner: HashMap<(ModId, String), bool> = HashMap::new();
+    let mut extern_owned: HashSet<(ModId, String)> = HashSet::new();
     let mut name_mods: HashMap<String, Vec<ModId>> = HashMap::new();
     // Per-module-set trackers for the two type-side namespaces (non-generic type
     // names and enum variant names), so two modules can each define `Slot` or a
@@ -159,7 +165,10 @@ fn build_owner(ast: &Ast, modules: &Modules) -> Owners {
                 note(&mut type_mods, d.name.name.clone(), m);
                 (Some(d.name.name.clone()), false)
             }
-            Item::Extern(e) => (Some(e.name.name.clone()), false),
+            Item::Extern(e) => {
+                extern_owned.insert((m, e.name.name.clone()));
+                (Some(e.name.name.clone()), false)
+            }
             Item::Trait(t) => (Some(t.name.name.clone()), false),
             Item::Impl(_) | Item::Import(_) => (None, false),
         };
@@ -176,7 +185,7 @@ fn build_owner(ast: &Ast, modules: &Modules) -> Owners {
     let dup = dups(&name_mods);
     let dup_types = dups(&type_mods);
     let dup_variants = dups(&variant_mods);
-    Owners { owner, name_mods, dup, dup_types, dup_variants }
+    Owners { owner, extern_owned, name_mods, dup, dup_types, dup_variants }
 }
 
 struct TypeChecker<'a> {
@@ -184,6 +193,8 @@ struct TypeChecker<'a> {
     modules: &'a Modules,
     /// `(module, name)` → is_pub, for visibility + namespace-isolated resolution.
     owner: HashMap<(ModId, String), bool>,
+    /// `(module, name)` pairs declared by an `extern` — never canonicalized (`canon_in`).
+    extern_owned: HashSet<(ModId, String)>,
     /// fn/const name → the modules defining it (cross-module diagnostics).
     name_mods: HashMap<String, Vec<ModId>>,
     /// fn/const names defined in more than one module (drives `canon`).
@@ -307,6 +318,22 @@ impl<'a> TypeChecker<'a> {
     /// The canonical symbol name of `name` as owned by module `m` (the global
     /// table's key and the backend's C symbol — bare unless the name collides).
     fn canon_in(&self, m: ModId, name: &str) -> String {
+        // **An `extern` name is a C symbol and is never canonicalized.** It is registered
+        // in `table.fns` under its BARE name, because that is the symbol the linker will
+        // look for — so canonicalizing it here would look up `close__m7` and find nothing,
+        // and the call would then be reported as an unresolved cross-module name.
+        //
+        // That is not hypothetical: `std/file` and `std/sysdir` both declare a Jestyr
+        // `close`, which puts `close` in `dup`; `std/sysnet` then binds POSIX's `close(2)`
+        // to shut a socket, and every call to it inside its own module failed with
+        // *cannot find `close` in this module; it is defined in module `sysdir`*.
+        //
+        // Keyed on `(module, name)` rather than on the name alone, and that matters: making
+        // every `close` bare would give `file.close` and `sysdir.close` the same C symbol.
+        // Only the module that declared the extern gets the bare spelling.
+        if self.extern_owned.contains(&(m, name.to_string())) {
+            return name.to_string();
+        }
         crate::types::canon(m, name, &self.dup)
     }
 

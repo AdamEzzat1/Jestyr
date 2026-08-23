@@ -1,0 +1,223 @@
+// std/syspoll_test.jtr — the readiness layer, and the runtime loop it feeds.
+//
+// Two halves, deliberately separated:
+//
+//   * `a_scripted_poller_drives_the_loop_with_no_sockets_at_all` uses a four-line poller
+//     written in this file. It proves the LOOP — registration, firing, cancellation, the
+//     idle rule — with no operating system involved, which is the property that made
+//     `Poller` a fn pointer instead of a direct call into `std/syspoll`.
+//
+//   * `a_ready_socket_is_reported_ready` uses the real kernel and a real loopback
+//     connection. It is the end-to-end check of the per-platform `pollfd` layout: a wrong
+//     offset reports nothing ready, the wait runs out, and the test fails.
+//
+// Run:  jestyrc test examples/std/syspoll_test.jtr
+
+import "syspoll"
+import "sysnet"
+import "runtime"
+import "time"
+import "mem"
+import "test"
+import "test_report"
+
+const POLL_T_CAP: usize = 4096
+
+// A counter a task can bump through its `ctx`. The `mem.Allocator` shape: a fn pointer
+// carries state only through the context it is handed.
+fn bump(ctx: *mut u8, id: i64, now: i64) {
+    var p: *mut i64 = ctx as *mut i64
+    var v: i64 = 0
+    unsafe { v = (p + 0).* }
+    unsafe { (p + 0).* = v + 1 }
+}
+
+// A poller that reports everything ready and never waits. Four lines, no OS — this is the
+// deterministic test runtime the Tier 4 brief asks for, and it exists because `Poller` is a
+// fn pointer rather than a call into the platform.
+fn all_ready(ctx: *mut u8, fds: *mut i64, ready: *mut u8, n: usize, timeout_nanos: i64) -> i64 {
+    var i: usize = 0
+    for i < n {
+        unsafe { (ready + i).* = 1 as u8 }
+        i = i + 1
+    }
+    return n as i64
+}
+
+// A poller that reports nothing ready — the other half of the script, so a test can assert
+// what the loop does while a socket stays quiet.
+fn none_ready(ctx: *mut u8, fds: *mut i64, ready: *mut u8, n: usize, timeout_nanos: i64) -> i64 {
+    var i: usize = 0
+    for i < n {
+        unsafe { (ready + i).* = 0 as u8 }
+        i = i + 1
+    }
+    return 0
+}
+
+@test fn a_scripted_poller_drives_the_loop_with_no_sockets_at_all() -> bool {
+    var raw: *mut u8 = alloc(u8, POLL_T_CAP)
+    var rep: []u8 = slice(u8, raw, POLL_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var hits: *mut i64 = alloc(i64, 1)
+    unsafe { (hits + 0).* = 0 }
+
+    var rt: runtime.Runtime = runtime.make(a, time.manual(0))
+    runtime.set_poller(rt, runtime.poller(null, &none_ready))
+
+    // **The idle rule, inverted.** A runtime with no timers used to be idle by definition.
+    // With a watch registered it is not: something can still happen, and reporting itself
+    // finished would end a server's loop the moment it had nothing scheduled.
+    test.is_true(c, rep, "no timers and no watches is idle", runtime.is_idle(rt))
+    let w: i64 = runtime.watch(rt, 7, runtime.detached(), runtime.task(hits as *mut u8, &bump))
+    test.eq_usize(c, rep, "one watch is registered", runtime.watching(rt), 1)
+    test.is_false(c, rep, "and a watch alone means NOT idle", runtime.is_idle(rt))
+    test.eq_usize(c, rep, "with no timers at all", runtime.pending(rt), 0)
+
+    // A quiet socket: the loop waits its budget and reports a timeout, and the task does
+    // not run. `RT_IDLE` here would be the bug the rule above prevents.
+    let e0: runtime.Event = runtime.poll_for(rt, 1000)
+    test.eq_i64(c, rep, "a quiet watch times out, it does not go idle", e0.kind as i64, RT_TIMEOUT as i64)
+    var n0: i64 = 0
+    unsafe { n0 = (hits + 0).* }
+    test.eq_i64(c, rep, "and nothing ran", n0, 0)
+
+    // Now the scripted poller says ready.
+    runtime.set_poller(rt, runtime.poller(null, &all_ready))
+    let e1: runtime.Event = runtime.poll_for(rt, 1000)
+    test.eq_i64(c, rep, "a ready watch reports RT_READY", e1.kind as i64, RT_READY as i64)
+    test.eq_i64(c, rep, "one handle became readable", e1.fired, 1)
+    var n1: i64 = 0
+    unsafe { n1 = (hits + 0).* }
+    test.eq_i64(c, rep, "and its task ran", n1, 1)
+
+    // **Level-triggered**: the watch stays registered and fires again, because "there is
+    // more to read" is the question `accept` and `recv` are actually asking.
+    let e2: runtime.Event = runtime.poll_for(rt, 1000)
+    test.eq_i64(c, rep, "it is still watched and fires again", e2.kind as i64, RT_READY as i64)
+    var n2: i64 = 0
+    unsafe { n2 = (hits + 0).* }
+    test.eq_i64(c, rep, "twice now", n2, 2)
+    test.eq_i64(c, rep, "and the runtime counts them", runtime.ready_count(rt), 2)
+
+    // `unwatch` is idempotent and returns which call did the work — the same report
+    // `cancel` makes.
+    test.is_true(c, rep, "unwatch removes it", runtime.unwatch(rt, w))
+    test.is_false(c, rep, "and says so only once", runtime.unwatch(rt, w))
+    test.is_true(c, rep, "now it is idle", runtime.is_idle(rt))
+    let e3: runtime.Event = runtime.poll_for(rt, 1000)
+    test.eq_i64(c, rep, "and reports idle", e3.kind as i64, RT_IDLE as i64)
+
+    runtime.free(rt)
+    free_ptr(hits)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn one_token_cancels_a_watch_and_its_timer_together() -> bool {
+    var raw: *mut u8 = alloc(u8, POLL_T_CAP)
+    var rep: []u8 = slice(u8, raw, POLL_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var hits: *mut i64 = alloc(i64, 1)
+    unsafe { (hits + 0).* = 0 }
+    var rt: runtime.Runtime = runtime.make(a, time.manual(0))
+    runtime.set_poller(rt, runtime.poller(null, &all_ready))
+
+    // **This is why cancellation is a GROUP and not an id.** A connection owns a socket
+    // watch and a timeout timer; "stop this connection" has to reach both, or the caller
+    // ends up keeping a list of both.
+    let tok: runtime.CancelToken = runtime.token(rt)
+    runtime.watch(rt, 11, tok, runtime.task(hits as *mut u8, &bump))
+    runtime.after(rt, 1000, tok, runtime.task(hits as *mut u8, &bump))
+    test.eq_usize(c, rep, "one watch", runtime.watching(rt), 1)
+    test.eq_usize(c, rep, "one timer", runtime.pending(rt), 1)
+
+    let n: i64 = runtime.cancel_all(rt, tok)
+    test.eq_i64(c, rep, "both were cancelled by one token", n, 2)
+    test.eq_usize(c, rep, "no watches left", runtime.watching(rt), 0)
+    test.eq_usize(c, rep, "no timers left", runtime.pending(rt), 0)
+    test.is_true(c, rep, "so the runtime is idle", runtime.is_idle(rt))
+
+    // The positive control: the poller still says everything is ready, so the ONLY reason
+    // the task does not run is the cancellation.
+    runtime.advance(rt, 5000)
+    let e: runtime.Event = runtime.poll_for(rt, 1000)
+    test.eq_i64(c, rep, "and reports idle rather than firing", e.kind as i64, RT_IDLE as i64)
+    var got: i64 = 0
+    unsafe { got = (hits + 0).* }
+    test.eq_i64(c, rep, "neither task ran", got, 0)
+
+    runtime.free(rt)
+    free_ptr(hits)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_ready_socket_is_reported_ready() -> bool {
+    var raw: *mut u8 = alloc(u8, POLL_T_CAP)
+    var rep: []u8 = slice(u8, raw, POLL_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+
+    var hits: *mut i64 = alloc(i64, 1)
+    unsafe { (hits + 0).* = 0 }
+
+    var rt: runtime.Runtime = runtime.make(a, time.manual(0))
+    // **The real kernel this time.** Everything above ran without an operating system;
+    // this is the end-to-end check of the per-platform `pollfd` layout — a wrong offset or
+    // a wrong `POLLIN` value reports nothing ready, the wait runs out, and this fails.
+    runtime.set_poller(rt, syspoll.host())
+
+    var lis: sysnet.Socket = sysnet.listen_on(net, sysnet.loopback(0), 4) catch sysnet.closed()
+    test.is_true(c, rep, "a listener is open", sysnet.is_open(lis))
+    let bound: sysnet.SocketAddr = sysnet.local_addr(lis) catch sysnet.addr(0, 0)
+    runtime.watch(rt, lis.fd, runtime.detached(), runtime.task(hits as *mut u8, &bump))
+
+    // Nothing has connected yet, so the listener is NOT readable. A 20ms budget is enough
+    // to distinguish "not ready" from "the poller never works" without making the suite
+    // slow, and it is the only real wait in this file.
+    let quiet: runtime.Event = runtime.poll_for(rt, 20000000)
+    test.eq_i64(c, rep, "an unconnected listener is not ready", quiet.kind as i64, RT_TIMEOUT as i64)
+    var n0: i64 = 0
+    unsafe { n0 = (hits + 0).* }
+    test.eq_i64(c, rep, "so nothing ran", n0, 0)
+
+    // A pending connection makes the listener readable — that is what "readable" means for
+    // a listening socket, and it is why `accept` and `recv` share one interest bit.
+    var cli: sysnet.Socket = sysnet.connect_to(net, sysnet.loopback(bound.port)) catch sysnet.closed()
+    test.is_true(c, rep, "the client connected", sysnet.is_open(cli))
+
+    let e: runtime.Event = runtime.poll_for(rt, 1000000000)
+    test.eq_i64(c, rep, "now the listener is ready", e.kind as i64, RT_READY as i64)
+    var n1: i64 = 0
+    unsafe { n1 = (hits + 0).* }
+    test.eq_i64(c, rep, "and the watch task ran", n1, 1)
+
+    // And the readiness was TRUE, not merely reported: the accept that follows does not
+    // block, and hands back a live socket. Without this the test would pass for a poller
+    // that reported everything ready always.
+    var srv: sysnet.Socket = sysnet.accept_one(net, lis) catch sysnet.closed()
+    test.is_true(c, rep, "the promised accept really did not block", sysnet.is_open(srv))
+
+    sysnet.close_socket(srv) catch nothing()
+    sysnet.close_socket(cli) catch nothing()
+    sysnet.close_socket(lis) catch nothing()
+    sysnet.shutdown(net)
+    runtime.free(rt)
+    free_ptr(hits)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// Discard an error deliberately: a `catch` fallback must be an expression and an empty block
+// is not one, so "ignore this" gets a name. Works because the discarded calls are
+// unit-fallible, so the fallback only has to produce unit.
+fn nothing() { }

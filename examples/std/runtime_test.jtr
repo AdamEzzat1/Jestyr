@@ -62,23 +62,23 @@ fn note(ctx: *mut u8, id: i64, now: i64) {
     test.eq_i64(c, rep, "the deadline is visible", runtime.next_deadline(rt), 1000)
 
     // Nothing is due yet, and polling must not fire it early — the whole contract.
-    test.eq_i64(c, rep, "nothing fires early", runtime.poll(rt), 0)
+    test.eq_i64(c, rep, "nothing fires early", runtime.fire_due(rt), 0)
     test.eq_usize(c, rep, "nothing was logged", ctx_n(ctx), 0)
 
     // Just short of the deadline: still nothing.
     runtime.advance(rt, 999)
-    test.eq_i64(c, rep, "999 is not 1000", runtime.poll(rt), 0)
+    test.eq_i64(c, rep, "999 is not 1000", runtime.fire_due(rt), 0)
 
     // And exactly at it: fires. `<=` not `<`, which this pins.
     runtime.advance(rt, 1)
-    test.eq_i64(c, rep, "fires at the deadline", runtime.poll(rt), 1)
+    test.eq_i64(c, rep, "fires at the deadline", runtime.fire_due(rt), 1)
     test.eq_usize(c, rep, "logged once", ctx_n(ctx), 1)
     test.is_true(c, rep, "idle now", runtime.is_idle(rt))
     test.eq_i64(c, rep, "no deadline left", runtime.next_deadline(rt), 0 - 1)
 
     // And it does not fire twice.
     runtime.advance(rt, 10000)
-    test.eq_i64(c, rep, "fires once only", runtime.poll(rt), 0)
+    test.eq_i64(c, rep, "fires once only", runtime.fire_due(rt), 0)
     test.eq_usize(c, rep, "still one", ctx_n(ctx), 1)
 
     runtime.free(rt)
@@ -110,7 +110,7 @@ fn note(ctx: *mut u8, id: i64, now: i64) {
 
     test.eq_i64(c, rep, "earliest deadline", runtime.next_deadline(rt), 100)
     runtime.advance(rt, 1000)
-    test.eq_i64(c, rep, "all five fire", runtime.poll(rt), 5)
+    test.eq_i64(c, rep, "all five fire", runtime.fire_due(rt), 5)
 
     test.eq_usize(c, rep, "five logged", ctx_n(ctx), 5)
     test.eq_i64(c, rep, "1st: id 2 (t=100)", ctx_log(ctx, 0), 2)
@@ -147,7 +147,7 @@ fn note(ctx: *mut u8, id: i64, now: i64) {
     test.eq_i64(c, rep, "counted", runtime.cancelled(rt), 1)
 
     runtime.advance(rt, 100)
-    test.eq_i64(c, rep, "only the survivor fires", runtime.poll(rt), 1)
+    test.eq_i64(c, rep, "only the survivor fires", runtime.fire_due(rt), 1)
     test.eq_usize(c, rep, "one logged", ctx_n(ctx), 1)
     // THE control: the surviving id is the one that was NOT cancelled. Asserting only
     // "one fired" would pass if cancellation had killed the wrong timer.
@@ -175,7 +175,7 @@ fn note(ctx: *mut u8, id: i64, now: i64) {
     // one poll, which is the classic starvation bug.
     runtime.soon(rt, runtime.detached(), runtime.task(ctx, &note))
     runtime.soon(rt, runtime.detached(), runtime.task(ctx, &note))
-    test.eq_i64(c, rep, "both fire", runtime.poll(rt), 2)
+    test.eq_i64(c, rep, "both fire", runtime.fire_due(rt), 2)
     test.is_true(c, rep, "idle", runtime.is_idle(rt))
 
     // `run_until_idle` is the settle operation and is bounded, so even a pathological
@@ -214,7 +214,7 @@ fn note(ctx: *mut u8, id: i64, now: i64) {
     test.eq_i64(c, rep, "absolute deadline", runtime.next_deadline(rt), 5250)
 
     runtime.advance(rt, 250)
-    test.eq_i64(c, rep, "fires", runtime.poll(rt), 1)
+    test.eq_i64(c, rep, "fires", runtime.fire_due(rt), 1)
 
     var braw: *mut u8 = alloc(u8, 128)
     var buf: []u8 = slice(u8, braw, 128)
@@ -253,7 +253,7 @@ fn note(ctx: *mut u8, id: i64, now: i64) {
     test.eq_i64(c, rep, "and nothing else", runtime.pending(rt) as i64, 2)
 
     runtime.advance(rt, 100)
-    runtime.poll(rt)
+    runtime.fire_due(rt)
     test.eq_i64(c, rep, "two timers fired", ctx_n(ctx) as i64, 2)
     // The survivors are id 2 (the other group) and id 4 (ungrouped), in registration order.
     test.eq_i64(c, rep, "the other group survived", ctx_log(ctx, 0), 2)
@@ -296,7 +296,7 @@ fn note(ctx: *mut u8, id: i64, now: i64) {
     test.eq_i64(c, rep, "and nothing is pending", runtime.pending(rt) as i64, 0)
 
     runtime.advance(rt, 1000)
-    runtime.poll(rt)
+    runtime.fire_due(rt)
     test.eq_i64(c, rep, "so nothing fires", ctx_n(ctx) as i64, 0)
 
     // The positive control: a DIFFERENT token is unaffected and still schedules and fires,
@@ -305,7 +305,7 @@ fn note(ctx: *mut u8, id: i64, now: i64) {
     test.is_false(c, rep, "a different token is live", runtime.is_cancelled(rt, g2))
     runtime.after(rt, 100, g2, runtime.task(ctx, &note))
     runtime.advance(rt, 100)
-    runtime.poll(rt)
+    runtime.fire_due(rt)
     test.eq_i64(c, rep, "positive control: it fires", ctx_n(ctx) as i64, 1)
 
     runtime.free(rt)

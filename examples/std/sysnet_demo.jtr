@@ -1,0 +1,182 @@
+// std/sysnet_demo.jtr — `jstatus`: a local status server that also keeps its timers.
+//
+// **This is the consumer `std/sysnet`, `std/syspoll` and `runtime.Pollable` were built
+// for**, and it is the smallest program that needs all three. A status endpoint is the
+// thing every long-running tool grows — a build daemon, a language server, a watcher — and
+// it is exactly the case a blocking socket API cannot serve on its own: the process has to
+// answer a connection *and* keep firing its own timers, on one thread, without either
+// starving the other.
+//
+// The three steps, and which layer owns each:
+//
+//   1. bind + listen                          `std/sysnet`   (a `sys` platform call)
+//   2. wait until the listener is READABLE     `std/syspoll`  (poll / WSAPoll)
+//   3. run the loop, timers and all            `std/runtime`  (which touches no OS at all)
+//
+// Step 3 is the interesting one. `runtime` reaches the operating system only through the
+// two handles it is given — a `Clock` and a `Poller` — so the loop below is the same loop a
+// test drives with a four-line scripted poller and no sockets. That is what makes an event
+// loop testable rather than merely observable.
+//
+// ─── The callback MARKS, the loop ACTS ────────────────────────────────────────
+//
+// The watch's task does not accept the connection. It records that the listener became
+// readable, and the loop does the accept when `poll_for` hands back `RT_READY`.
+//
+// That is not a workaround for the fn-pointer shape — it is the same discipline the runtime
+// uses on its own timers ("the loop marks, it never removes"), and it keeps every operation
+// that can fail out of a callback that has nowhere to report a failure to.
+//
+// ─── What it prints, and why none of it is a port ─────────────────────────────
+//
+// The kernel chooses the port (`loopback(0)`), so nothing here can be asserted about *which*
+// one — and nothing is printed about it. What is printed is what is portable: what happened,
+// in order.
+//
+// Run:  jestyrc run examples/std/sysnet_demo.jtr
+
+import "sysnet"
+import "syspoll"
+import "runtime"
+import "time"
+import "mem"
+import "str"
+
+const STATUS_CAP: usize = 512
+
+// The watch's task: record that the listener became readable. See the header on why it does
+// not accept here.
+fn note_readable(ctx: *mut u8, id: i64, now: i64) {
+    var p: *mut i64 = ctx as *mut i64
+    var v: i64 = 0
+    unsafe { v = (p + 0).* }
+    unsafe { (p + 0).* = v + 1 }
+}
+
+// A timer's task, sharing the same counter block at a different slot — so the demo can show
+// that a timer fired while the socket was quiet, on the same loop, in the same thread.
+fn note_tick(ctx: *mut u8, id: i64, now: i64) {
+    var p: *mut i64 = ctx as *mut i64
+    var v: i64 = 0
+    unsafe { v = (p + 1).* }
+    unsafe { (p + 1).* = v + 1 }
+}
+
+// Copy `s` into `buf` and return the length — the shape every send needs, since a socket
+// takes bytes and a `str` is a view.
+fn fill(read s: str, mut buf: []u8) -> usize {
+    var i: usize = 0
+    for i < s.len {
+        buf[i] = s[i]
+        i = i + 1
+    }
+    return s.len
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var net: sysnet.Net = sysnet.host()
+
+    print_str("-- jstatus --")
+    if sysnet.can_open(net) == false {
+        print_str("the platform's networking would not start")
+        return 1
+    }
+
+    // --- step 1: listen -------------------------------------------------------
+    var lis: sysnet.Socket = sysnet.listen_on(net, sysnet.loopback(0), 4) catch sysnet.closed()
+    print_str("listening on loopback")
+    print_bool(sysnet.is_open(lis))
+    if sysnet.is_open(lis) == false {
+        sysnet.shutdown(net)
+        return 1
+    }
+    let bound: sysnet.SocketAddr = sysnet.local_addr(lis) catch sysnet.addr(0, 0)
+
+    // --- step 2: the loop -----------------------------------------------------
+    //
+    // A host clock and the host poller. Swap either for `time.manual()` and a scripted
+    // poller and the same loop runs with no operating system underneath it.
+    var counters: *mut i64 = alloc(i64, 2)
+    unsafe { (counters + 0).* = 0 }
+    unsafe { (counters + 1).* = 0 }
+
+    var rt: runtime.Runtime = runtime.make(a, time.host())
+    runtime.set_poller(rt, syspoll.host())
+    let conn: runtime.CancelToken = runtime.token(rt)
+    let w: i64 = runtime.watch(rt, lis.fd, conn, runtime.task(counters as *mut u8, &note_readable))
+
+    // **A watch alone means the loop is NOT idle**, which is the rule `poll_for`'s header
+    // spent a release promising to invert. A server with no timers scheduled is not
+    // finished; it is waiting.
+    print_str("a watch alone keeps the loop alive")
+    print_bool(runtime.is_idle(rt) == false)
+
+    // --- timers and sockets on one loop ---------------------------------------
+    //
+    // Nothing has connected yet, so the listener is quiet. A 1ms timer is due before the
+    // poll budget expires, and the loop clamps its wait to the nearer of the two — so the
+    // timer fires ON TIME even though the wait belongs to the socket poller.
+    runtime.after(rt, 1000000, conn, runtime.task(counters as *mut u8, &note_tick))
+    let e0: runtime.Event = runtime.poll_for(rt, 500000000)
+    print_str("-- while the socket is quiet --")
+    print_str("the timer fired, not the socket")
+    print_bool(e0.kind == RT_FIRED)
+    var ticks: i64 = 0
+    unsafe { ticks = (counters + 1).* }
+    print_int(ticks)
+
+    // --- a client arrives -----------------------------------------------------
+    var cli: sysnet.Socket = sysnet.connect_to(net, sysnet.loopback(bound.port)) catch sysnet.closed()
+    print_str("-- a client connects --")
+    print_bool(sysnet.is_open(cli))
+
+    let e1: runtime.Event = runtime.poll_for(rt, 1000000000)
+    print_str("the listener became readable")
+    print_bool(e1.kind == RT_READY)
+    var reads: i64 = 0
+    unsafe { reads = (counters + 0).* }
+    print_int(reads)
+
+    // The accept the readiness promised will not block.
+    var srv: sysnet.Socket = sysnet.accept_one(net, lis) catch sysnet.closed()
+    print_str("accepted without blocking")
+    print_bool(sysnet.is_open(srv))
+
+    // --- serve one status line ------------------------------------------------
+    var obuf: *mut u8 = alloc(u8, STATUS_CAP)
+    var ob: []u8 = slice(u8, obuf, STATUS_CAP)
+    let n: usize = fill("jestyr-status/v1 ok", ob)
+    sysnet.send_all(srv, ob[0 .. n]) catch 0
+
+    var ibuf: *mut u8 = alloc(u8, STATUS_CAP)
+    var ib: []u8 = slice(u8, ibuf, STATUS_CAP)
+    let got: usize = sysnet.recv_bytes(cli, ib) catch 0
+    print_str("-- the client reads it --")
+    print_bool(str.eq(from_utf8(ib[0 .. got]), "jestyr-status/v1 ok"))
+
+    // --- shutdown -------------------------------------------------------------
+    //
+    // One token cancels the socket watch and the connection's timers together — which is
+    // the reason cancellation is a GROUP and not an id.
+    let stopped: i64 = runtime.cancel_all(rt, conn)
+    print_str("-- shutdown --")
+    print_str("one token stopped the watch")
+    print_int(stopped)
+    print_str("and the loop is idle")
+    print_bool(runtime.is_idle(rt))
+
+    sysnet.close_socket(srv) catch ignore()
+    sysnet.close_socket(cli) catch ignore()
+    sysnet.close_socket(lis) catch ignore()
+    sysnet.shutdown(net)
+    runtime.free(rt)
+    free_ptr(ibuf)
+    free_ptr(obuf)
+    free_ptr(counters)
+    return 0
+}
+
+// Discard an error deliberately: a `catch` fallback must be an expression and an empty block
+// is not one, so "ignore this" gets a name.
+fn ignore() { }

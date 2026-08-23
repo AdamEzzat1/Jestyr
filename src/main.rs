@@ -940,7 +940,25 @@ fn build_one(source: &str, output: &str) -> ExitCode {
     if c_src.contains("pthread") {
         cmd.arg("-pthread");
     }
-    match cmd.arg("-o").arg(&exe).arg(&c_file).status() {
+    // **Winsock must be LINKED as well as included, and it must be linked LAST.**
+    // `<winsock2.h>` declares the socket API but the implementation lives in `ws2_32.dll`,
+    // which mingw does not link by default -- so `std/sysnet` compiled and then failed with
+    // `undefined reference to __imp_socket`. Same content-triggered shape as the `-pthread`
+    // rule above.
+    //
+    // **The position is load-bearing.** GNU ld resolves libraries left to right against the
+    // objects seen SO FAR, so `-lws2_32` placed before the `.c` file resolves nothing and
+    // the link fails exactly as if the flag were missing. It goes after the source, which is
+    // why this is appended here rather than beside the `-pthread` line.
+    //
+    // Host-gated as well as text-gated: both `@cfg` branches are always emitted -- that is
+    // the whole design -- so the source names `winsock2.h` on Linux too, where `-lws2_32`
+    // does not exist and would fail a link that was about to succeed.
+    cmd.arg("-o").arg(&exe).arg(&c_file);
+    if cfg!(windows) && c_src.contains("winsock2.h") {
+        cmd.arg("-lws2_32");
+    }
+    match cmd.status() {
         Ok(s) if s.success() => ExitCode::SUCCESS,
         Ok(s) => {
             eprintln!("error: {cc} failed to compile `{source}` (exit {:?})", s.code());
@@ -1069,6 +1087,21 @@ const DEBUG_FLAG: &str = "-g";
 fn cc_base_flags() -> Vec<&'static str> {
     let mut flags: Vec<&'static str> = CC_FLAGS.to_vec();
     flags.push(DEBUG_FLAG);
+    // **Windows target baseline: Vista.** mingw's `<winsock2.h>` declares `WSAPoll` only
+    // when `_WIN32_WINNT >= 0x0600`, and its default is lower — so `std/syspoll` compiled
+    // to an IMPLICIT DECLARATION, which C accepts and gives an `int` return. That is the
+    // `int`-fallback silent-miscompile shape this tree has been bitten by three times
+    // (`JestyrArr_T_8`, the array-index paths, the missing `#include`): a pointer-sized
+    // handle truncated through `int`, accepted by the linker, wrong at runtime.
+    //
+    // Set unconditionally on Windows rather than gated on the program's content, because a
+    // per-program `-D` would make the same source compile differently depending on which
+    // modules it happened to import — and Vista is a floor this project has no reason to
+    // sit below. It is a compiler FLAG, not a source change, so no emitted byte moves and
+    // no golden is affected.
+    if cfg!(windows) {
+        flags.push("-D_WIN32_WINNT=0x0600");
+    }
     flags
 }
 
@@ -1097,7 +1130,12 @@ fn build_and_maybe_run(path: &str, c_src: &str, run: bool) -> ExitCode {
     if c_src.contains("pthread") {
         cmd.arg("-pthread");
     }
-    let status = cmd.arg("-o").arg(&exe).arg(&c_file).status();
+    // See the note at the other link site: `-lws2_32` must follow the source file.
+    cmd.arg("-o").arg(&exe).arg(&c_file);
+    if cfg!(windows) && c_src.contains("winsock2.h") {
+        cmd.arg("-lws2_32");
+    }
+    let status = cmd.status();
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => {
@@ -1313,16 +1351,32 @@ mod fp_contract_tests {
     /// reach DWARF — and it rides *alongside*, not *inside*, the determinism seam.
     /// (Teeth: dropping `DEBUG_FLAG` from `cc_base_flags` fails the first assert;
     /// folding `-g` into `CC_FLAGS` — which would corrupt the `attest` provenance —
-    /// fails the second.)
+    /// fails the last.)
+    ///
+    /// **The exact-count assertion is enumerated rather than a bare `+ 1`.** It used to be
+    /// `CC_FLAGS.len() + 1`, and the Windows target baseline (`-D_WIN32_WINNT=0x0600`, which
+    /// `std/syspoll` needs before mingw will declare `WSAPoll`) broke it. Listing the
+    /// permitted additions keeps the property this test is actually for — *nothing sneaks
+    /// into the cc command unnoticed* — while letting a deliberate one be added deliberately.
     #[test]
     fn debug_flag_is_carried_and_separate_from_the_determinism_seam() {
         assert_eq!(DEBUG_FLAG, "-g");
         let flags = cc_base_flags();
         assert!(flags.contains(&"-g"), "cc command must carry -g for DWARF: {flags:?}");
-        // The base flags are the determinism seam plus exactly `-g`, in order.
+        // The FP seam survives intact.
         assert!(CC_FLAGS.iter().all(|f| flags.contains(f)), "FP flags must survive: {flags:?}");
-        assert_eq!(flags.len(), CC_FLAGS.len() + 1, "only -g is added: {flags:?}");
-        // `-g` is a usability flag, never part of the locked determinism/provenance set.
+        // Every flag is either the locked seam or one of the two sanctioned additions.
+        let extra: Vec<&str> =
+            flags.iter().copied().filter(|f| !CC_FLAGS.contains(f)).collect();
+        let want: &[&str] =
+            if cfg!(windows) { &["-g", "-D_WIN32_WINNT=0x0600"] } else { &["-g"] };
+        assert_eq!(extra, want, "only the sanctioned flags are added: {flags:?}");
+        // `-g` is a usability flag, never part of the locked determinism/provenance set —
+        // and neither is the platform baseline, for the same `attest` reason.
         assert!(!CC_FLAGS.contains(&"-g"), "-g must stay out of CC_FLAGS (attest provenance)");
+        assert!(
+            !CC_FLAGS.iter().any(|f| f.starts_with("-D_WIN32_WINNT")),
+            "the platform baseline must stay out of CC_FLAGS too: {CC_FLAGS:?}"
+        );
     }
 }

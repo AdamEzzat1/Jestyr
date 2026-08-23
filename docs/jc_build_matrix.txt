@@ -84,6 +84,7 @@ FAIL slice_algos
 BUILD_OK str_demo
 BUILD_OK strmap_demo
 BUILD_OK sysfs_demo
+BUILD_OK sysnet_demo
 BUILD_OK test_demo
 BUILD_OK test_fixture_demo
 BUILD_OK time_demo
