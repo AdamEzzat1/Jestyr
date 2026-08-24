@@ -252,12 +252,68 @@ const BUF_CAP: usize = 4096
     test.eq_golden(c, rep, "tab-expanded caret", sink.view(s, buf),
         "error: here\n  --> t.jtr:1:3\n   |\n 1 |     ab\n   |      ^\n")
 
-    // And the POSITION reported in the header is a byte column (3), not a display column
-    // (6). This is the pin to invert when a display-width function exists: `--json`
-    // reports byte columns too, and the two must not disagree about where a diagnostic
-    // points.
+    // And the POSITION reported in the header is a byte column (3), not a display column.
+    //
+    // **This is NOT the pin that inverted when `std/width` landed**, and the distinction is
+    // the module's header in one assertion: the caret is ALIGNMENT and is now measured in
+    // cells, while this number is NAVIGATION — a coordinate `--json` also emits and a tool
+    // uses to index into the text. A terminal-cell count is not an offset into a buffer, so
+    // making these agree in units would break the consumer that needs bytes.
+    // `a_wide_character_moves_the_caret_two_cells` pins the half that DID change.
     let p: diag.Pos = diag.pos_of(m, f, 2)
     test.eq_usize(c, rep, "byte column, not display column", p.col, 3)
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_wide_character_moves_the_caret_two_cells() -> bool {
+    var raw: *mut u8 = alloc(u8, REPORT_CAP)
+    var rep: []u8 = slice(u8, raw, REPORT_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var braw: *mut u8 = alloc(u8, BUF_CAP)
+    var buf: []u8 = slice(u8, braw, BUF_CAP)
+    var s: sink.Sink = sink.new()
+
+    // `日本x` — two CJK ideographs (3 bytes and 2 CELLS each) then `x` at byte 6.
+    var m: diag.SourceMap = diag.map_new(a)
+    let f: diag.FileId = diag.add_file(m, "w.jtr", "日本x\n")
+    var d: diag.Diagnostic = diag.new_error(a, "", "here")
+    diag.primary(d, diag.span(f, 6, 7), "")
+    diag.render(s, buf, m, d, diag.plain())
+
+    // **The caret must be indented 4, not 6.** Before `std/width` the renderer counted one
+    // cell per byte and put it two cells right of its token — the bug the module header
+    // used to describe as a known limitation.
+    //
+    // Note the header still says `1:7`: that is the BYTE column, and it is deliberately not
+    // the cell column. See `caret_alignment_is_byte_based_and_tabs_expand`.
+    test.eq_golden(c, rep, "caret under a wide-prefixed token", sink.view(s, buf),
+        "error: here\n  --> w.jtr:1:7\n   |\n 1 | 日本x\n   |     ^\n")
+
+    // And the UNDERLINE is measured in cells too: a span covering one ideograph is two
+    // carets wide, not three. Computed as the difference of two `expanded_width` calls, so
+    // it cannot disagree with the indent above it.
+    sink.reset(s)
+    var d2: diag.Diagnostic = diag.new_error(a, "", "wide")
+    diag.primary(d2, diag.span(f, 0, 3), "")
+    diag.render(s, buf, m, d2, diag.plain())
+    test.eq_golden(c, rep, "underline spans cells, not bytes", sink.view(s, buf),
+        "error: wide\n  --> w.jtr:1:1\n   |\n 1 | 日本x\n   | ^^\n")
+
+    // The anti-vacuity control: pure ASCII is unchanged, so the assertions above are about
+    // the wide characters and not about the renderer having moved for everyone.
+    sink.reset(s)
+    let g: diag.FileId = diag.add_file(m, "p.jtr", "abx\n")
+    var d3: diag.Diagnostic = diag.new_error(a, "", "plain")
+    diag.primary(d3, diag.span(g, 2, 3), "")
+    diag.render(s, buf, m, d3, diag.plain())
+    test.eq_golden(c, rep, "ascii is untouched", sink.view(s, buf),
+        "error: plain\n  --> p.jtr:1:3\n   |\n 1 | abx\n   |   ^\n")
 
     free_ptr(braw)
     let ok: bool = test_report.finish(c, rep)

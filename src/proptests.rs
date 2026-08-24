@@ -15830,7 +15830,12 @@ fn main() -> i32 {
         let dir = std::env::temp_dir().join("jestyr_diag_boundary");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        for m in ["diag", "sink", "list", "mem", "str"] {
+        // `width` is here because `diag` imports it for caret alignment — a transitive
+        // dependency, and the reason this list is a hazard: it is a hand-maintained copy of
+        // an import closure, so adding an import anywhere in `diag`'s subtree breaks this
+        // fixture with `cannot read module`. That is a LOUD failure rather than a silent one,
+        // which is why the list is still explicit.
+        for m in ["diag", "sink", "list", "mem", "str", "width"] {
             std::fs::copy(format!("examples/std/{m}.jtr"), dir.join(format!("{m}.jtr"))).unwrap();
         }
         // A consumer that exercises the whole chain: build a two-file map, attach labels
@@ -16370,6 +16375,8 @@ fn main() -> i32 {
         // behind `@cfg`, so `every_cfg_bearing_corpus_file_is_byte_identity_verified`
         // requires it here. Byte-identical first try.
         "syswatch.jtr",
+        "width.jtr",
+        "width_test.jtr",
         "log.jtr",
         "log_test.jtr",
         "log_demo.jtr",
@@ -16682,7 +16689,7 @@ fn main() -> i32 {
     /// imports first, `list` is already memoized, so `sink` lands immediately before `diag`.
     const SELFHOST_MODULES: &[&str] = &[
         "mem", "intern", "fs", "env", "list", "tokens", "parser", "ctfe", "typeck", "escape",
-        "sha256", "sink", "diag", "cgen",
+        "sha256", "sink", "width", "diag", "cgen",
     ];
 
     /// Flatten the multi-module Jestyr compiler into ONE single-file program — the
@@ -17393,7 +17400,7 @@ fn main() -> i32 {
             ("writer_test", 5),
             ("file_test", 19),
             ("cstring_test", 4),
-            ("diag_test", 15),
+            ("diag_test", 16),
             ("cli_test", 11),
             ("buildgraph_test", 10),
             // `sysdir` and `walk` are NOT in CGEN_GOLDEN_ALLOWLIST -- `sysdir` uses `@cfg`
@@ -17438,6 +17445,14 @@ fn main() -> i32 {
             // a quote or a newline is where a structured logger is silently wrong, and where
             // the log keeps looking fine while a reader sees invented fields.
             ("log_test", 7),
+            // **A width table is not wrong in a way that crashes.** An off-by-one in a range
+            // bound misaligns one script's output forever while every other test stays green,
+            // so `every_wide_range_is_pinned_at_both_edges` checks the codepoint on each side
+            // of every range the module claims — over the UNION, because several ranges are
+            // adjacent and "just above this range" is legitimately wide. Nothing here touches
+            // the OS: it is a pure function of a codepoint, which is `std/syserr`'s argument
+            // for keeping its errno tables pure.
+            ("width_test", 7),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

@@ -76,27 +76,41 @@
 // in the right interleaving to keep the caller's order. One record with a `LabelKind`
 // keeps the order for free and keeps `render` a single loop.
 //
-// ─── Columns are BYTE columns ─────────────────────────────────────────────────
+// ─── The COLUMN is bytes; the CARET is cells. They are different questions ────
 //
-// `pos_of` counts bytes, not characters and not display cells, and the caret row is
-// aligned in the same units. For ASCII — every `.jtr` keyword, identifier and operator —
-// they coincide. For a line with multi-byte UTF-8 before the span they do not, and the
-// caret sits left of its target. This is stated rather than hedged because it is the same
-// choice `jestyrc --json` already made (`docs/diagnostics-json.md` documents `col` as
-// 1-based with no character claim), and a renderer that disagreed with the JSON report
-// about where a diagnostic points would be worse than one that is uniformly byte-based.
-// `caret_alignment_is_byte_based_and_that_is_pinned` is the test to invert when a display
-// -width function exists.
+// This header used to say both were byte-based and that the pin below was "the test to
+// invert when a display-width function exists". `std/width` now exists, and **the pin did
+// not invert** — because measuring the two in the same units was never the goal, and doing
+// it would have made one of them wrong:
 //
-// TABS are the one exception, because they are not a width question but an alignment one:
-// a tab in the source expands to `th.tab_width` spaces in BOTH the source row and the
-// caret row, so the caret stays under its token. A renderer that copied the tab through
-// and counted it as one column would misplace every caret after an indent.
+//   * **The caret is ALIGNMENT.** It has to land under its token in a terminal, so it is
+//     measured in display cells: a CJK ideograph is three bytes and two cells, a combining
+//     mark is two bytes and none. `expanded_width` asks `std/width` for every non-tab
+//     character, and the underline is the difference of two such measurements so it cannot
+//     disagree with the indent above it.
+//
+//   * **The reported column is NAVIGATION.** `--> file:1:3` is a coordinate a person pastes
+//     into an editor and a coordinate `jestyrc --json` also emits
+//     (`docs/diagnostics-json.md` documents `col` as 1-based with no character claim). A
+//     tool consuming that JSON to place a marker in a buffer needs an offset into the TEXT,
+//     and a terminal-cell count is not one. So `pos_of` still counts bytes, and the renderer
+//     and the JSON still agree about where a diagnostic points — which is the property the
+//     old note was actually protecting.
+//
+// Stating it as one decision was the error; they are two, and they now have two answers.
+// `caret_alignment_is_byte_based_and_tabs_expand` keeps the byte-column half and
+// `a_wide_character_moves_the_caret_two_cells` pins the other, so a future change that
+// merges them has to break one on purpose.
+//
+// TABS stay this module's business rather than `std/width`'s, because a tab's width depends
+// on the COLUMN it starts at and not on the character: it expands to `th.tab_width` in BOTH
+// the source row and the caret row, and `std/width` answers 0 for one rather than guessing.
 //
 // Run the tests:  jestyrc test examples/std/diag_test.jtr
 // Worked example: jestyrc run examples/std/diag_demo.jtr examples/std/diag_demo.jtr
 
 import "list"
+import "width"
 import "sink"
 
 // ------------------------------------------------------------------ identifiers
@@ -542,15 +556,30 @@ const DASH: i32 = 45        // '-'
     }
 }
 
+// The display width of the first `upto` BYTES, with tabs expanded.
+//
+// **Two different questions, and only one of them is this.** A tab is an ALIGNMENT question —
+// its width depends on the theme, not on the character — so it is answered here. Everything
+// else is a WIDTH question and is answered by `std/width`, which knows that a CJK ideograph
+// is three bytes and two cells and that a combining mark is two bytes and none.
+//
+// Before this, every non-tab byte counted as one cell, and the header said so: a caret after
+// any multi-byte character sat left of its token. That is now fixed for the CARET while the
+// reported COLUMN stays byte-based — see the header on why those are not the same decision.
 @no_alloc @no_os fn expanded_width(read text: str, upto: usize, read th: Theme) -> usize {
     var w: usize = 0
     var lim: usize = upto
     if lim > text.len { lim = text.len }
-    for i in 0..lim {
+    var i: usize = 0
+    for i < lim {
         if (text[i] as i32) == TAB {
             w = w + th.tab_width
+            i = i + 1
         } else {
-            w = w + 1
+            var step: usize = width.seq_len(text, i)
+            if step == 0 { step = 1 }
+            w = w + width.width_upto(text[i .. i + step], step)
+            i = i + step
         }
     }
     return w
@@ -743,9 +772,16 @@ const DASH: i32 = 45        // '-'
             let lt: str = line_text(m, f, p.line)
             var endc: usize = l.span.end
             if endc < l.span.start { endc = l.span.start }
-            var width: usize = endc - l.span.start
+            var nbytes: usize = endc - l.span.start
             let room: usize = lt.len + 1 - p.col
-            if width > room { width = room }
+            if nbytes > room { nbytes = room }
+            // The span is BYTES; the underline is CELLS. Measured as the difference of two
+            // `expanded_width` calls rather than by measuring the slice, so the underline and
+            // the indent above it are computed by one function over one string and cannot
+            // disagree about a tab or a wide character — the same argument `put_source` makes
+            // for sharing its expansion with the caret row.
+            let lead: usize = expanded_width(lt, p.col - 1, th)
+            var width: usize = expanded_width(lt, p.col - 1 + nbytes, th) - lead
             if width == 0 { width = 1 }
             put_caret_row(s, buf, m, th, w, f, p.line, p.col, width, under_char(l.kind), label_text(d, l))
             li = li + 1

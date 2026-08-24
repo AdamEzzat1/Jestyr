@@ -1,0 +1,269 @@
+// std/width_test.jtr — the table, pinned at its edges.
+//
+// **The centre of this file is `every_wide_range_is_pinned_at_both_edges`.** A width table is
+// not wrong in a way that crashes: an off-by-one in a bound misaligns one script's output
+// forever while every other test stays green, and nobody notices until someone pastes CJK
+// into a diagnostic. So every range the module claims is checked on BOTH sides — the last
+// codepoint outside it and the first inside — which is the only assertion that can catch a
+// bound that moved.
+//
+// Nothing here touches the operating system: the module is a pure function of a codepoint, so
+// the whole table runs on every host, which is `std/syserr`'s argument for its errno tables.
+//
+// Run:  jestyrc test examples/std/width_test.jtr
+
+import "width"
+import "test"
+import "test_report"
+
+const W_T_CAP: usize = 8192
+
+@test fn ascii_is_one_cell_and_controls_are_none() -> bool {
+    var raw: *mut u8 = alloc(u8, W_T_CAP)
+    var rep: []u8 = slice(u8, raw, W_T_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_usize(c, rep, "a letter", width.char_width(97), 1)          // 'a'
+    test.eq_usize(c, rep, "a space", width.char_width(32), 1)
+    test.eq_usize(c, rep, "the last printable ASCII", width.char_width(126), 1)   // '~'
+
+    // **A control is 0, not 1.** A terminal does not advance for one, and counting it would
+    // put every caret after an escape sequence one cell right.
+    test.eq_usize(c, rep, "NUL", width.char_width(0), 0)
+    test.eq_usize(c, rep, "newline", width.char_width(10), 0)
+    test.eq_usize(c, rep, "ESC", width.char_width(27), 0)
+    test.eq_usize(c, rep, "the last C0", width.char_width(31), 0)
+    test.eq_usize(c, rep, "DEL", width.char_width(127), 0)
+    test.eq_usize(c, rep, "the last C1", width.char_width(159), 0)
+
+    // **A TAB is 0 here and that is deliberate**, not an oversight: a tab's width depends on
+    // the column it starts at, so it is not a property of the character. `std/diag` expands
+    // tabs against its theme before asking anything about width.
+    test.eq_usize(c, rep, "a tab is not a width question", width.char_width(9), 0)
+
+    // Latin-1 and Greek are ordinary single-cell text — the anti-vacuity control for the
+    // "below U+1100 nothing is wide" fast path.
+    test.eq_usize(c, rep, "e-acute", width.char_width(233), 1)
+    test.eq_usize(c, rep, "lambda", width.char_width(955), 1)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn every_wide_range_is_pinned_at_both_edges() -> bool {
+    var raw: *mut u8 = alloc(u8, W_T_CAP)
+    var rep: []u8 = slice(u8, raw, W_T_CAP)
+    var c: test.Check = test.new()
+
+    // These are the boundaries of the UNION of the module's ranges, not of each range
+    // separately, and the difference is the whole point: several of the ranges are ADJACENT
+    // (radicals end at U+2FFF and CJK symbols begin at U+3000), so "the codepoint just above
+    // this range" is legitimately wide and asserting otherwise tests the table's internal
+    // bookkeeping instead of its behaviour. The first draft of this test did exactly that and
+    // reported ten failures against a correct table.
+    //
+    // What a caller can observe is `is_wide` over the codepoint space, so that is what is
+    // pinned: each row is (last OUTSIDE, first INSIDE, last INSIDE, first OUTSIDE).
+    edge(c, rep, "Hangul Jamo initial", 4351, 4352, 4447, 4448)
+    edge(c, rep, "radicals..ideographs ext A", 11903, 11904, 19903, 19904)
+    edge(c, rep, "CJK unified..Yi", 19967, 19968, 42191, 42192)
+    edge(c, rep, "Hangul Jamo ext A", 43359, 43360, 43391, 43392)
+    edge(c, rep, "Hangul syllables", 44031, 44032, 55203, 55204)
+    edge(c, rep, "CJK compat ideographs", 63743, 63744, 64255, 64256)
+    edge(c, rep, "vertical forms", 65039, 65040, 65049, 65050)
+    edge(c, rep, "CJK compat forms", 65071, 65072, 65135, 65136)
+    edge(c, rep, "fullwidth forms", 65279, 65280, 65376, 65377)
+    edge(c, rep, "fullwidth signs", 65503, 65504, 65510, 65511)
+    edge(c, rep, "emoji/pictographs", 127743, 127744, 128591, 128592)
+    edge(c, rep, "transport", 128639, 128640, 128767, 128768)
+    edge(c, rep, "supplemental emoji", 129279, 129280, 129791, 129792)
+    edge(c, rep, "ideographs ext B..", 131071, 131072, 196605, 196606)
+    edge(c, rep, "ideographs ext G..", 196607, 196608, 262141, 262142)
+
+    // The gap between ideographs ext A (ends U+4DBF) and CJK unified (starts U+4E00) is real
+    // — U+4DC0..U+4DFF is the Yijing hexagram block, which is NOT wide. Asserted because a
+    // careless merge of the two ranges would swallow it and nothing else would notice.
+    test.is_false(c, rep, "the Yijing gap is not wide", width.is_wide(19904))
+    test.is_false(c, rep, "nor its far end", width.is_wide(19967))
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn combining_marks_and_joiners_take_no_cells() -> bool {
+    var raw: *mut u8 = alloc(u8, W_T_CAP)
+    var rep: []u8 = slice(u8, raw, W_T_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_usize(c, rep, "combining acute", width.char_width(769), 0)      // U+0301
+    test.eq_usize(c, rep, "combining ext", width.char_width(6832), 0)       // U+1AB0
+    test.eq_usize(c, rep, "combining supplement", width.char_width(7616), 0)// U+1DC0
+    test.eq_usize(c, rep, "combining for symbols", width.char_width(8400), 0)
+    test.eq_usize(c, rep, "combining half marks", width.char_width(65056), 0)
+    test.eq_usize(c, rep, "zero width joiner", width.char_width(8205), 0)   // U+200D
+    test.eq_usize(c, rep, "byte order mark", width.char_width(65279), 0)
+    test.eq_usize(c, rep, "variation selector 16", width.char_width(65039), 0)
+
+    // The edges again: U+02FF is a real spacing modifier and U+0370 is Greek. If the
+    // combining bound moved, one of these would silently become 0.
+    test.eq_usize(c, rep, "just below the combining block", width.char_width(767), 1)
+    test.eq_usize(c, rep, "just above it", width.char_width(880), 1)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_string_measures_by_decoding_utf8() -> bool {
+    var raw: *mut u8 = alloc(u8, W_T_CAP)
+    var rep: []u8 = slice(u8, raw, W_T_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_usize(c, rep, "ascii", width.str_width("hello"), 5)
+    test.eq_usize(c, rep, "empty", width.str_width(""), 0)
+
+    // **The case the whole module exists for**: three bytes, one codepoint, TWO cells. A
+    // byte-counting caret would indent 3 and sit one cell right of its token.
+    test.eq_usize(c, rep, "one CJK ideograph is 2 cells from 3 bytes", width.str_width("日"), 2)
+    test.eq_usize(c, rep, "and its byte length is 3", 3, 3)
+    test.eq_usize(c, rep, "two of them", width.str_width("日本"), 4)
+    test.eq_usize(c, rep, "mixed with ascii", width.str_width("a日b"), 4)
+
+    // `é` written as e + COMBINING ACUTE (U+0301 = CC 81): 3 bytes, 2 codepoints, ONE cell.
+    //
+    // Built from explicit bytes rather than typed as a literal, and that is not pedantry: the
+    // decomposed form renders identically to the precomposed U+00E9, so a literal would be
+    // indistinguishable in the source from the case it is NOT testing, and the next person to
+    // tidy the file could silently change what is asserted.
+    var draw: *mut u8 = alloc(u8, 3)
+    unsafe { (draw + 0).* = 101 as u8 }                 // 'e'
+    unsafe { (draw + 1).* = 204 as u8 }                 // U+0301, byte 1
+    unsafe { (draw + 2).* = 129 as u8 }                 // U+0301, byte 2
+    let decomposed: str = from_utf8(slice(u8, draw, 3))
+    test.eq_usize(c, rep, "a decomposed accent is one cell", width.str_width(decomposed), 1)
+    test.eq_usize(c, rep, "though it is three bytes", decomposed.len, 3)
+    free_ptr(draw)
+
+    // `width_upto` takes BYTES, which is the shape a span has.
+    test.eq_usize(c, rep, "upto the whole thing", width.width_upto("a日b", 5), 4)
+    test.eq_usize(c, rep, "upto before the wide char", width.width_upto("a日b", 1), 1)
+    test.eq_usize(c, rep, "upto past it", width.width_upto("a日b", 4), 3)
+    test.eq_usize(c, rep, "a limit past the end clamps", width.width_upto("ab", 99), 2)
+
+    // A limit that falls INSIDE a codepoint measures it — the caret ends up one cell wide
+    // rather than zero, pointing AT the malformed span instead of just left of it.
+    test.eq_usize(c, rep, "a limit inside a codepoint measures it", width.width_upto("a日b", 2), 3)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn measuring_is_total_over_every_byte_offset() -> bool {
+    var raw: *mut u8 = alloc(u8, W_T_CAP)
+    var rep: []u8 = slice(u8, raw, W_T_CAP)
+    var c: test.Check = test.new()
+
+    // **A malformed `str` cannot be constructed, so this test measures what CAN happen.**
+    // `from_utf8` validates and traps, `substr` asserts char boundaries, and there is no
+    // `from_utf8_unchecked` — so a `str` reaching `width_upto` is always well-formed, and
+    // the module's invalid-byte branches guard a state the type system already prevents.
+    // They are kept because they make the function TOTAL rather than because they are
+    // reachable, and the honest way to test totality is over the offsets a caller really
+    // supplies: a span boundary is an arbitrary byte index and nothing checks it lands on a
+    // character.
+    let s: str = "a日b語c"
+    var i: usize = 0
+    var prev: usize = 0
+    for i <= s.len {
+        let w: usize = width.width_upto(s, i)
+        // Monotone: measuring more bytes never measures fewer cells. That one property is
+        // what a caret depends on, and it is the one an off-by-one in the decoder breaks.
+        test.is_true(c, rep, "width is monotone in the byte limit", w >= prev)
+        test.is_true(c, rep, "and never exceeds the whole", w <= width.str_width(s))
+        prev = w
+        i = i + 1
+    }
+    test.eq_usize(c, rep, "the full string", width.str_width(s), 7)
+
+    // `seq_len` never walks off the end, which is the one place being wrong would be a
+    // memory error rather than a cosmetic one.
+    test.eq_usize(c, rep, "past the end is zero", width.seq_len(s, s.len), 0)
+    test.eq_usize(c, rep, "an ascii byte is one", width.seq_len(s, 0), 1)
+    test.eq_usize(c, rep, "a lead byte reports its sequence", width.seq_len(s, 1), 3)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn fitting_a_budget_never_splits_a_character() -> bool {
+    var raw: *mut u8 = alloc(u8, W_T_CAP)
+    var rep: []u8 = slice(u8, raw, W_T_CAP)
+    var c: test.Check = test.new()
+
+    test.eq_usize(c, rep, "ascii fits exactly", width.fit_bytes("hello", 5), 5)
+    test.eq_usize(c, rep, "ascii truncates by cells", width.fit_bytes("hello", 3), 3)
+    test.eq_usize(c, rep, "a budget past the end takes it all", width.fit_bytes("hi", 99), 2)
+    test.eq_usize(c, rep, "no budget takes nothing", width.fit_bytes("hi", 0), 0)
+
+    // **A wide character that would straddle the limit is EXCLUDED.** `a日` is 3 cells; with
+    // 2 columns the `日` does not fit, so the answer is 1 byte and not 4. Including it would
+    // overflow by one cell, which is how a table with a CJK entry in its last column wraps.
+    test.eq_usize(c, rep, "a straddling wide char is dropped", width.fit_bytes("a日", 2), 1)
+    test.eq_usize(c, rep, "with room it is kept", width.fit_bytes("a日", 3), 4)
+
+    // And the invariant that makes it usable: what fits, measured, never exceeds the budget.
+    let n: usize = width.fit_bytes("日本語ですよ", 5)
+    test.is_true(c, rep, "the fitted prefix is within budget", width.str_width("日本語ですよ"[0 .. n]) <= 5)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn the_scope_limits_are_stated_and_true() -> bool {
+    var raw: *mut u8 = alloc(u8, W_T_CAP)
+    var rep: []u8 = slice(u8, raw, W_T_CAP)
+    var c: test.Check = test.new()
+
+    // **These assert the module's OWN limitations**, so a future grapheme-aware version has
+    // to change them deliberately rather than discovering them. Each is a case where a
+    // terminal draws one glyph and this module answers per codepoint.
+    //
+    // A ZWJ family: three 2-cell people joined by two 0-cell joiners. One glyph, six cells
+    // by this module's reckoning.
+    test.eq_usize(c, rep, "a ZWJ sequence measures per codepoint, not per glyph",
+        width.str_width("👨‍👩‍👧"), 6)
+    // **A flag measures 2, which is what a terminal draws, and it is an ACCIDENT.** The
+    // regional indicators are not in the Wide table, so each is one cell and the pair happens
+    // to total two. Pinned as an accident rather than a success: adding the block to
+    // `is_wide` would make this 4 and break the case it currently gets right, so the next
+    // person to "complete the table" needs this test to stop them.
+    test.eq_usize(c, rep, "a flag totals 2 by accident, not by design", width.str_width("🇯🇵"), 2)
+    test.is_false(c, rep, "because a regional indicator is not in the wide table",
+        width.is_wide(127471))
+    test.eq_usize(c, rep, "so a LONE indicator is measured 1 and drawn wider",
+        width.char_width(127471), 1)
+
+    // The positive half: a single emoji IS 2, so the limitation above is about SEQUENCES and
+    // not about emoji generally.
+    test.eq_usize(c, rep, "one emoji is two cells", width.str_width("😀"), 2)
+
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// Assert a wide range's four boundary codepoints: outside-below, inside-first, inside-last,
+// outside-above. The shape that catches a bound that moved by one.
+fn edge(mut c: test.Check, mut rep: []u8, read name: str, below: u32, first: u32, last: u32, above: u32) {
+    test.eq_usize(c, rep, name, width.char_width(first), 2)
+    test.eq_usize(c, rep, name, width.char_width(last), 2)
+    // The neighbours must NOT be 2. They may be 1 or 0 (an adjacent range may be
+    // zero-width), so the assertion is "not wide" rather than a literal.
+    test.is_false(c, rep, name, width.is_wide(below))
+    test.is_false(c, rep, name, width.is_wide(above))
+}

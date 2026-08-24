@@ -12080,6 +12080,252 @@ pub struct Sink {
     return from_utf8(buf[0 .. s.used])
 }
 
+// std/width.jtr — how many terminal cells does this text occupy?
+//
+// TIER: `core`. No allocation, no operating system, no state. Every function here is a pure
+// function of its argument, which is what lets the whole module be exercised on any host —
+// and this module is a TABLE, so that matters more than usual: **a transposed range does not
+// crash, it misaligns one script's output forever.** `std/syserr`'s errno tables are here for
+// the same reason and were kept pure for the same payoff.
+//
+// ─── What this answers, and what it does not ──────────────────────────────────
+//
+// One question: **given a string, how far does the cursor move?** That is what a caret has to
+// know to sit under its token, what a table formatter needs to pad a column, and what a
+// progress bar needs to not wrap.
+//
+// It answers that PER CODEPOINT and sums. That is the honest scope and the limitation worth
+// stating first, because the alternative is an API that looks right and is wrong on the cases
+// people actually paste into a compiler:
+//
+//   * **An emoji ZWJ sequence is one cluster and several codepoints.** 👨‍👩‍👧 is three people
+//     joined by two zero-width joiners; a terminal draws one glyph of width 2, and this
+//     module answers 2 + 0 + 2 + 0 + 2 = 6.
+//   * **A regional-indicator flag is two codepoints**, and this module answers 2 — which is
+//     what a terminal draws, BY ACCIDENT. The regional indicators (U+1F1E6..U+1F1FF) are not
+//     in the Wide table, so each is measured as one cell and a pair happens to total two.
+//     A LONE indicator is measured 1 and drawn wider than that by most terminals. Adding the
+//     block to `is_wide` would make the common case (a flag) worse rather than better, which
+//     is why it is left out and written down instead.
+//   * **A variation selector** (U+FE0F) can turn a 1-cell glyph into a 2-cell one. This
+//     module gives VS16 width 0 and does not widen what precedes it.
+//
+// All three need GRAPHEME segmentation plus emoji-presentation data, which is a much larger
+// table and a different function signature (it has to look ahead). `str_width` is right for
+// source text, identifiers, paths and diagnostics — everything Jestyr's own tooling renders —
+// and wrong for a UI that lays out user-supplied emoji. That boundary is drawn here rather
+// than discovered later.
+//
+// ─── Tabs are NOT here, and that is deliberate ────────────────────────────────
+//
+// A tab's width depends on the COLUMN it starts at, so it is not a property of the character
+// and cannot be answered by a function taking one. `std/diag` already expands tabs against
+// its `Theme.tab_width` before asking anything about width, and its header calls a tab "not a
+// width question but an alignment one" — which is exactly right and is why `char_width(9)`
+// answers 0 rather than guessing 4 or 8.
+//
+// ─── Where the table came from ────────────────────────────────────────────────
+//
+// UAX #11 East Asian Width: the `W` (Wide) and `F` (Fullwidth) classes are 2 cells, everything
+// else printable is 1. Zero-width is the combining marks (general categories Mn/Me), the
+// explicit format controls, and the C0/C1 control range.
+//
+// The ranges are the compact set every `wcwidth` uses, not a generated copy of
+// `EastAsianWidth.txt` — a generated table would be thousands of lines, would need
+// regenerating per Unicode revision, and cannot be reviewed. **What makes this honest is not
+// that the table is complete but that its boundaries are asserted**:
+// `every_wide_range_is_pinned_at_both_edges` checks the codepoint on each side of every range
+// it claims, so an off-by-one in a bound is a red test rather than one misaligned script.
+//
+// ─── The consumer, and the one function that does not have one ───────────────
+//
+// `std/diag` is the consumer: `expanded_width` asks this module for every non-tab character,
+// so a caret lands under its token even when a CJK ideograph precedes it, and the underline
+// is measured in cells rather than bytes. That is the whole reason this exists rather than
+// being a library waiting for a user.
+//
+// **`fit_bytes` has no in-tree consumer yet**, and that is said out loud rather than left for
+// someone to notice. It is here because it is the inverse question a truncating formatter
+// asks and because the off-by-one lives in doing it by hand — but if nothing has needed it by
+// the time a table formatter exists, it should go rather than accumulate.
+//
+// Worked example:  the caret in `std/diag` — see `diag.expanded_width`
+// Run the tests:   jestyrc test examples/std/width_test.jtr
+
+// The C0 controls end at 0x1F; DEL and the C1 controls run 0x7F..0x9F.
+const W_C0_END: u32 = 31
+const W_DEL: u32 = 127
+const W_C1_END: u32 = 159
+
+// Width of one codepoint, in terminal cells.
+//
+// **A control character is 0, not 1.** A terminal does not advance the cursor for one, and
+// counting it would put every caret after an escape sequence one cell right. A caller that
+// wants control characters rendered visibly (`^C`, `\x1b`) is doing a TRANSFORMATION and
+// should measure the transformed text — which is what `std/diag` does with tabs.
+@no_alloc @no_os pub fn char_width(cp: u32) -> usize {
+    // Fast path: printable ASCII is every byte of every `.jtr` keyword, identifier and
+    // operator, so it is worth answering before touching the table.
+    if cp >= 32 and cp < W_DEL { return 1 }
+    if cp <= W_C0_END { return 0 }
+    if cp >= W_DEL and cp <= W_C1_END { return 0 }
+    if is_zero_width(cp) { return 0 }
+    if is_wide(cp) { return 2 }
+    return 1
+}
+
+// Zero-width: combining marks (Mn/Me), the format controls, and the variation selectors.
+//
+// **The combining ranges are the same set the C runtime's `jestyr_rt_is_combining` uses**,
+// deliberately: `count_graphemes` and this module would otherwise disagree about what a mark
+// is, and a grapheme count that did not match a width would be two answers to one question.
+@no_alloc @no_os pub fn is_zero_width(cp: u32) -> bool {
+    if cp >= 768 and cp <= 879 { return true }          // U+0300..U+036F  combining diacriticals
+    if cp >= 1155 and cp <= 1161 { return true }        // U+0483..U+0489  Cyrillic marks
+    if cp >= 1425 and cp <= 1469 { return true }        // U+0591..U+05BD  Hebrew points
+    if cp >= 1552 and cp <= 1562 { return true }        // U+0610..U+061A  Arabic marks
+    if cp >= 1611 and cp <= 1631 { return true }        // U+064B..U+065F  Arabic marks
+    if cp >= 2385 and cp <= 2391 { return true }        // U+0951..U+0957  Devanagari
+    if cp >= 6832 and cp <= 6911 { return true }        // U+1AB0..U+1AFF  combining ext
+    if cp >= 7616 and cp <= 7679 { return true }        // U+1DC0..U+1DFF  combining supplement
+    if cp >= 8400 and cp <= 8447 { return true }        // U+20D0..U+20FF  combining for symbols
+    if cp >= 65056 and cp <= 65071 { return true }      // U+FE20..U+FE2F  combining half marks
+    // Format controls: ZWSP, ZWNJ, ZWJ, the bidi marks, and the BOM. A ZWJ is what makes an
+    // emoji family one glyph, and giving it width 0 is why this module answers 6 for one —
+    // see the header.
+    if cp >= 8203 and cp <= 8207 { return true }        // U+200B..U+200F
+    if cp >= 8232 and cp <= 8239 { return true }        // U+2028..U+202F  line/para sep, bidi
+    if cp >= 8288 and cp <= 8303 { return true }        // U+2060..U+206F  word joiner, invisibles
+    if cp == 65279 { return true }                      // U+FEFF          BOM / ZWNBSP
+    if cp >= 65024 and cp <= 65039 { return true }      // U+FE00..U+FE0F  variation selectors
+    if cp >= 917760 and cp <= 917999 { return true }    // U+E0100..U+E01EF variation supplement
+    return false
+}
+
+// East Asian Wide (W) and Fullwidth (F): two cells.
+//
+// Ordered roughly by how often a range is hit, since this is a linear scan and CJK ideographs
+// and Hangul syllables are the bulk of any real text that reaches it.
+@no_alloc @no_os pub fn is_wide(cp: u32) -> bool {
+    if cp < 4352 { return false }                       // below U+1100 nothing is wide
+    if cp >= 19968 and cp <= 40959 { return true }      // U+4E00..U+9FFF  CJK unified ideographs
+    if cp >= 44032 and cp <= 55203 { return true }      // U+AC00..U+D7A3  Hangul syllables
+    if cp >= 12352 and cp <= 12543 { return true }      // U+3040..U+30FF  Hiragana + Katakana
+    if cp >= 4352 and cp <= 4447 { return true }        // U+1100..U+115F  Hangul Jamo initial
+    if cp >= 11904 and cp <= 12287 { return true }      // U+2E80..U+2FFF  radicals, Kangxi
+    if cp >= 12288 and cp <= 12351 { return true }      // U+3000..U+303F  CJK symbols + punct
+    if cp >= 12544 and cp <= 13311 { return true }      // U+3100..U+33FF  Bopomofo..CJK compat
+    if cp >= 13312 and cp <= 19903 { return true }      // U+3400..U+4DBF  ideographs ext A
+    if cp >= 40960 and cp <= 42191 { return true }      // U+A000..U+A4CF  Yi
+    if cp >= 43360 and cp <= 43391 { return true }      // U+A960..U+A97F  Hangul Jamo ext A
+    if cp >= 63744 and cp <= 64255 { return true }      // U+F900..U+FAFF  CJK compat ideographs
+    if cp >= 65040 and cp <= 65049 { return true }      // U+FE10..U+FE19  vertical forms
+    if cp >= 65072 and cp <= 65135 { return true }      // U+FE30..U+FE6F  CJK compat forms
+    if cp >= 65280 and cp <= 65376 { return true }      // U+FF00..U+FF60  fullwidth forms
+    if cp >= 65504 and cp <= 65510 { return true }      // U+FFE0..U+FFE6  fullwidth signs
+    if cp >= 127744 and cp <= 128591 { return true }    // U+1F300..U+1F64F emoji + pictographs
+    if cp >= 128640 and cp <= 128767 { return true }    // U+1F680..U+1F6FF transport
+    if cp >= 129280 and cp <= 129791 { return true }    // U+1F900..U+1F9FF supplemental emoji
+    if cp >= 131072 and cp <= 196605 { return true }    // U+20000..U+2FFFD ideographs ext B..
+    if cp >= 196608 and cp <= 262141 { return true }    // U+30000..U+3FFFD ideographs ext G..
+    return false
+}
+
+// The number of cells `text` occupies. Invalid UTF-8 is measured as one cell per byte —
+// see `width_upto` for why.
+@no_alloc @no_os pub fn str_width(read text: str) -> usize {
+    return width_upto(text, text.len)
+}
+
+// The cells occupied by the first `upto` BYTES of `text`.
+//
+// This is the shape a caret needs: a span is byte offsets, and the question is how far to
+// indent before drawing under it. Taking bytes rather than codepoints is what keeps the
+// caller from having to convert, which is where an off-by-one would live.
+//
+// **A byte limit that falls INSIDE a codepoint measures that codepoint.** The alternative is
+// to drop it, and dropping is worse: a span boundary that splits a character is already a bug
+// in the caller, and a caret one cell too wide points AT the problem where a caret one cell
+// too narrow points just left of it and looks correct.
+//
+// **Invalid UTF-8 is one cell per byte.** This module never rejects: a lexer handed a bad
+// file still has to draw a caret, and a width function that refused would take the diagnostic
+// away exactly when it is needed. `std/str`'s `is_utf8` is where validity gets decided.
+@no_alloc @no_os pub fn width_upto(read text: str, upto: usize) -> usize {
+    var lim: usize = upto
+    if lim > text.len { lim = text.len }
+    var w: usize = 0
+    var i: usize = 0
+    for i < lim {
+        let b: u32 = text[i] as u32
+        var n: usize = 1
+        var cp: u32 = b
+        if b >= 240 {
+            n = 4
+            cp = b & 7
+        } else if b >= 224 {
+            n = 3
+            cp = b & 15
+        } else if b >= 192 {
+            n = 2
+            cp = b & 31
+        } else if b >= 128 {
+            // A stray continuation byte: not the start of anything. One cell, one byte, and
+            // keep going — see the header on why this never fails.
+            w = w + 1
+            i = i + 1
+            continue
+        }
+        if i + n > text.len {
+            // A truncated sequence at the end of the text. Measure the bytes that are there.
+            w = w + (text.len - i)
+            i = text.len
+            continue
+        }
+        var k: usize = 1
+        for k < n {
+            cp = (cp << 6) | ((text[i + k] as u32) & 63)
+            k = k + 1
+        }
+        w = w + char_width(cp)
+        i = i + n
+    }
+    return w
+}
+
+// How many BYTES of `text` fit in `cells` columns, never splitting a codepoint.
+//
+// The inverse question, and the one a truncating formatter asks: "I have 40 columns, where do
+// I cut?" It exists because doing it by hand is where the off-by-one lives — a caller that
+// cuts at a byte count and then measures gets a different answer than one that measures and
+// then cuts.
+//
+// **A wide character that would straddle the limit is EXCLUDED.** Its first cell fits and its
+// second does not, so including it overflows the budget by one — which is how a table with a
+// CJK entry in the last column wraps and ruins the row.
+@no_alloc @no_os pub fn fit_bytes(read text: str, cells: usize) -> usize {
+    var used: usize = 0
+    var i: usize = 0
+    for i < text.len {
+        let step: usize = seq_len(text, i)
+        let cw: usize = width_upto(text[i .. i + step], step)
+        if used + cw > cells { return i }
+        used = used + cw
+        i = i + step
+    }
+    return text.len
+}
+
+// The byte length of the UTF-8 sequence starting at `at`, clamped to the end of the text.
+@no_alloc @no_os pub fn seq_len(read text: str, at: usize) -> usize {
+    if at >= text.len { return 0 }
+    let b: u32 = text[at] as u32
+    var n: usize = 1
+    if b >= 240 { n = 4 } else if b >= 224 { n = 3 } else if b >= 192 { n = 2 }
+    if at + n > text.len { return text.len - at }
+    return n
+}
+
 // std/diag.jtr — structured diagnostics: a source map, spans, labels, and a
 // renderer that does not own its destination.
 //
@@ -12158,22 +12404,35 @@ pub struct Sink {
 // in the right interleaving to keep the caller's order. One record with a `LabelKind`
 // keeps the order for free and keeps `render` a single loop.
 //
-// ─── Columns are BYTE columns ─────────────────────────────────────────────────
+// ─── The COLUMN is bytes; the CARET is cells. They are different questions ────
 //
-// `pos_of` counts bytes, not characters and not display cells, and the caret row is
-// aligned in the same units. For ASCII — every `.jtr` keyword, identifier and operator —
-// they coincide. For a line with multi-byte UTF-8 before the span they do not, and the
-// caret sits left of its target. This is stated rather than hedged because it is the same
-// choice `jestyrc --json` already made (`docs/diagnostics-json.md` documents `col` as
-// 1-based with no character claim), and a renderer that disagreed with the JSON report
-// about where a diagnostic points would be worse than one that is uniformly byte-based.
-// `caret_alignment_is_byte_based_and_that_is_pinned` is the test to invert when a display
-// -width function exists.
+// This header used to say both were byte-based and that the pin below was "the test to
+// invert when a display-width function exists". `std/width` now exists, and **the pin did
+// not invert** — because measuring the two in the same units was never the goal, and doing
+// it would have made one of them wrong:
 //
-// TABS are the one exception, because they are not a width question but an alignment one:
-// a tab in the source expands to `th.tab_width` spaces in BOTH the source row and the
-// caret row, so the caret stays under its token. A renderer that copied the tab through
-// and counted it as one column would misplace every caret after an indent.
+//   * **The caret is ALIGNMENT.** It has to land under its token in a terminal, so it is
+//     measured in display cells: a CJK ideograph is three bytes and two cells, a combining
+//     mark is two bytes and none. `expanded_width` asks `std/width` for every non-tab
+//     character, and the underline is the difference of two such measurements so it cannot
+//     disagree with the indent above it.
+//
+//   * **The reported column is NAVIGATION.** `--> file:1:3` is a coordinate a person pastes
+//     into an editor and a coordinate `jestyrc --json` also emits
+//     (`docs/diagnostics-json.md` documents `col` as 1-based with no character claim). A
+//     tool consuming that JSON to place a marker in a buffer needs an offset into the TEXT,
+//     and a terminal-cell count is not one. So `pos_of` still counts bytes, and the renderer
+//     and the JSON still agree about where a diagnostic points — which is the property the
+//     old note was actually protecting.
+//
+// Stating it as one decision was the error; they are two, and they now have two answers.
+// `caret_alignment_is_byte_based_and_tabs_expand` keeps the byte-column half and
+// `a_wide_character_moves_the_caret_two_cells` pins the other, so a future change that
+// merges them has to break one on purpose.
+//
+// TABS stay this module's business rather than `std/width`'s, because a tab's width depends
+// on the COLUMN it starts at and not on the character: it expands to `th.tab_width` in BOTH
+// the source row and the caret row, and `std/width` answers 0 for one rather than guessing.
 //
 // Run the tests:  jestyrc test examples/std/diag_test.jtr
 // Worked example: jestyrc run examples/std/diag_demo.jtr examples/std/diag_demo.jtr
@@ -12622,15 +12881,30 @@ const DASH: i32 = 45        // '-'
     }
 }
 
+// The display width of the first `upto` BYTES, with tabs expanded.
+//
+// **Two different questions, and only one of them is this.** A tab is an ALIGNMENT question —
+// its width depends on the theme, not on the character — so it is answered here. Everything
+// else is a WIDTH question and is answered by `std/width`, which knows that a CJK ideograph
+// is three bytes and two cells and that a combining mark is two bytes and none.
+//
+// Before this, every non-tab byte counted as one cell, and the header said so: a caret after
+// any multi-byte character sat left of its token. That is now fixed for the CARET while the
+// reported COLUMN stays byte-based — see the header on why those are not the same decision.
 @no_alloc @no_os fn expanded_width(read text: str, upto: usize, read th: Theme) -> usize {
     var w: usize = 0
     var lim: usize = upto
     if lim > text.len { lim = text.len }
-    for i in 0..lim {
+    var i: usize = 0
+    for i < lim {
         if (text[i] as i32) == TAB {
             w = w + th.tab_width
+            i = i + 1
         } else {
-            w = w + 1
+            var step: usize = seq_len(text, i)
+            if step == 0 { step = 1 }
+            w = w + width_upto(text[i .. i + step], step)
+            i = i + step
         }
     }
     return w
@@ -12823,9 +13097,16 @@ const DASH: i32 = 45        // '-'
             let lt: str = line_text(m, f, p.line)
             var endc: usize = l.span.end
             if endc < l.span.start { endc = l.span.start }
-            var width: usize = endc - l.span.start
+            var nbytes: usize = endc - l.span.start
             let room: usize = lt.len + 1 - p.col
-            if width > room { width = room }
+            if nbytes > room { nbytes = room }
+            // The span is BYTES; the underline is CELLS. Measured as the difference of two
+            // `expanded_width` calls rather than by measuring the slice, so the underline and
+            // the indent above it are computed by one function over one string and cannot
+            // disagree about a tab or a wide character — the same argument `put_source` makes
+            // for sharing its expansion with the caret row.
+            let lead: usize = expanded_width(lt, p.col - 1, th)
+            var width: usize = expanded_width(lt, p.col - 1 + nbytes, th) - lead
             if width == 0 { width = 1 }
             put_caret_row(s, buf, m, th, w, f, p.line, p.col, width, under_char(l.kind), label_text(d, l))
             li = li + 1
