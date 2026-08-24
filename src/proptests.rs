@@ -404,6 +404,51 @@ mod jc_build_matrix {
              told you."
         );
     }
+
+    /// **`BUILD_OK` is not `CORRECT`, and this test exists because that distinction cost a
+    /// debugging round.**
+    ///
+    /// The matrix above records whether `jc` produced a binary, not whether the binary is
+    /// right. Closing the port's monomorphization gaps moved `combinators` from FAIL to
+    /// BUILD_OK while it still printed zeros for every `Option`/`Result` combinator: the
+    /// port emitted `bool jestyr_opt_is_some__i32(…) { }` — an empty body — and gcc accepts a
+    /// function that falls off its end with a warning. **A verdict of BUILD_OK would have
+    /// recorded that as a success.**
+    ///
+    /// So the four programs whose monomorphized generics were the fix are checked the only
+    /// way that means anything: run the `jc`-built binary and the reference's, and compare
+    /// the bytes. `log_demo` and `str_demo` ride along as CONTROLS — they built and ran
+    /// correctly before any of this, so if they ever differ the harness is broken rather than
+    /// the compiler (line endings, header trimming), which is a mistake this comparison
+    /// already made once.
+    ///
+    /// Extending this corpus-wide is the obvious follow-up and is deliberately not done here:
+    /// it doubles the matrix's runtime, and these six are where the evidence is.
+    #[test]
+    fn jc_built_generics_run_the_same_as_the_reference() {
+        let jc = super::c_oracle::build_exe("examples/std/cgen.jtr");
+        for stem in ["combinators", "mutex", "slice_algos", "try_read", "log_demo", "str_demo"] {
+            let src = format!("examples/std/{stem}.jtr");
+            let built = std::process::Command::new(&jc).arg(&src).arg("build").output().unwrap();
+            assert!(built.status.success(), "jc must build {stem}:\n{}", String::from_utf8_lossy(&built.stderr));
+
+            let exe = format!("examples/std/{stem}{}", std::env::consts::EXE_SUFFIX);
+            let got = std::process::Command::new(&exe).output().unwrap();
+            let want = std::process::Command::new(super::c_oracle::build_exe(&src)).output().unwrap();
+            let norm = |b: &[u8]| String::from_utf8_lossy(b).replace("\r\n", "\n");
+
+            let (g, w) = (norm(&got.stdout), norm(&want.stdout));
+            let _ = std::fs::remove_file(format!("examples/std/{stem}.c"));
+            let _ = std::fs::remove_file(&exe);
+            assert_eq!(
+                g, w,
+                "the self-hosted compiler built {stem} but it does not BEHAVE like the \
+                 reference's build. A wrong typedef or a dropped body compiles fine — that \
+                 is the whole reason this test is not just `jc build`."
+            );
+            assert_eq!(got.status.code(), want.status.code(), "{stem}: exit codes differ");
+        }
+    }
 }
 
 /// **`jheartbeat` — the event loop and the `sys` tier in one long-running program.**

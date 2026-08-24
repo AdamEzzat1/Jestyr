@@ -13501,6 +13501,15 @@ fn prim_code_c(mut sb: String, code: i32) {
     if code == 13 { string_push(sb, "uint32_t")  return }   // char
     if code == 14 { string_push(sb, "JestyrStr")  return }  // str
     if code == 15 { string_push(sb, "const char*")  return } // cstr
+    // The same truncation as `prim_jname`, in the C-TYPE table rather than the mangle one —
+    // they are the pair that must agree, and both stopped at 15 while `typeck.prim_code`
+    // reaches 21. Spellings are the reference's (`os_str` is structurally a view, so
+    // `JestyrStr`; `cptr` is `void*`).
+    if code == 16 { string_push(sb, "JestyrStr")  return }      // os_str
+    if code == 17 { string_push(sb, "JestyrString")  return }
+    if code == 18 { string_push(sb, "JestyrBuilder")  return }
+    if code == 19 { string_push(sb, "JestyrCow")  return }
+    if code == 21 { string_push(sb, "void*")  return }          // cptr
     string_push(sb, "void")
 }
 
@@ -13666,6 +13675,25 @@ fn prim_jname(code: i32) -> str {
     if code == 12 { return "bool" }
     if code == 13 { return "char" }
     if code == 14 { return "str" }
+    // **Codes 15..21 were missing and every one of them mangled `?`.** The reference's
+    // `ty_mangle` renders a primitive as its NAME, so this table has to run as far as
+    // `typeck.prim_code` does — and that table reaches 21. The observable was
+    // `JestyrResult_?` for `let a = f()` where `f` is `-> String !{ E }`: an un-annotated
+    // `let` takes its C type from the CHECKER (there is no annotation to read), so this is
+    // the only path that renders it, and gcc saw `JestyrResult_? j_a = …` — parsing
+    // `JestyrResult_` as an identifier and `?` as a conditional, hence its baffling
+    // "expected ':' before ';'". `examples/std/try_read.jtr` is the corpus's instance.
+    //
+    // Recorded as an INFERENCE gap in an earlier note; measured, it is a mangle gap. Typeck
+    // agrees with the reference on the type — the whole-corpus typeck golden passes on that
+    // file — and only the emission was wrong. (20 is typeck's internal error binder, which
+    // has no C spelling and should never reach a mangle.)
+    if code == 15 { return "cstr" }
+    if code == 16 { return "os_str" }
+    if code == 17 { return "String" }
+    if code == 18 { return "Builder" }
+    if code == 19 { return "Cow" }
+    if code == 21 { return "cptr" }
     return "?"
 }
 
@@ -13910,6 +13938,41 @@ fn genum_item_of(read p: Parser, read src: str, read c: Checker, tid: i32) -> i3
     var i: i32 = 0
     for i < d.b {                                     // every arg must be CONCRETE (a pointer is!)
         if !tyid_concrete(c, get__list(i32, c.tya, (d.a + i) as usize)) { return 0 - 1 }
+        i = i + 1
+    }
+    return eit
+}
+
+// The same question asked from INSIDE a monomorphized body: an argument that is still an
+// opaque tparam is concrete if the active substitution binds it, because an instance's
+// bindings are concrete by construction.
+//
+// **Without this a tail `match` on a generic enum inside a generic function emitted NOTHING.**
+// `genum_item_of` answered -1 (the arg `T` is opaque in the template), `emit_match` took its
+// import-degenerate escape hatch, and the port produced
+// `bool jestyr_opt_is_some__i32(Jestyr_Option__i32 j_o) { }` — a function that falls off its
+// end. gcc accepts that with a warning, so it COMPILED and returned garbage: every
+// `Option`/`Result` combinator in `core` answered 0. A silent miscompile, and the reason the
+// `jc_build_matrix` gate now compares OUTPUT rather than just exit status.
+//
+// Falls through to `genum_item_of` when no substitution is armed, so it is a strict superset
+// and cannot change emission outside an instance body.
+fn genum_item_of_su(read p: Parser, read src: str, read c: Checker, read g: Cg, tid: i32) -> i32 {
+    if tid < 0 { return 0 - 1 }
+    if len(i32, g.su) == 0 { return genum_item_of(p, src, c, tid) }
+    let d: TyData = get__list(TyData, c.tys, tid as usize)
+    if d.kind != 6 { return 0 - 1 }
+    let eit: i32 = find_enum_item(p, src, d.x as usize, d.y as usize)
+    if eit < 0 { return 0 - 1 }
+    var i: i32 = 0
+    for i < d.b {
+        let arg: i32 = get__list(i32, c.tya, (d.a + i) as usize)
+        var okc: bool = tyid_concrete(c, arg)
+        if !okc {
+            let ad: TyData = get__list(TyData, c.tys, arg as usize)
+            if ad.kind == 4 and su_slot(src, g, ad.x as usize, ad.y as usize) >= 0 { okc = true }
+        }
+        if !okc { return 0 - 1 }
         i = i + 1
     }
     return eit
@@ -14350,8 +14413,8 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                     string_push(sb, ")0)")
                     return
                 }
-                if genum_item_of(p, src, c, own) >= 0 {          // a generic-enum instance value
-                    emit_gvariant_head(sb, p, src, c, own, src[e.start .. e.end])
+                if genum_item_of_su(p, src, c, g, own) >= 0 {          // a generic-enum instance value
+                    emit_gvariant_head(sb, p, src, c, g, own, src[e.start .. e.end])
                 } else {
                     emit_variant_head(sb, p, src, venum, src[e.start .. e.end])
                 }
@@ -14507,7 +14570,7 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                     string_push(hib, ".len")
                 }
                 string_push(sb, "({ ")
-                emit_ty_c(sb, p, src, c, sty)
+                emit_su_tyid(sb, p, src, c, g, sty)
                 string_push(sb, " _s")
                 push_uint__cgen(sb, n as i64)
                 string_push(sb, " = (")
@@ -14529,7 +14592,7 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                 string_push(sb, " <= _s")
                 push_uint__cgen(sb, n as i64)
                 string_push(sb, ".len); (")
-                emit_ty_c(sb, p, src, c, sty)
+                emit_su_tyid(sb, p, src, c, g, sty)
                 string_push(sb, "){ _s")
                 push_uint__cgen(sb, n as i64)
                 string_push(sb, ".ptr + _lo")
@@ -14553,7 +14616,7 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
             let n: i32 = g.tmp
             g.tmp = g.tmp + 1
             string_push(sb, "({ ")
-            emit_ty_c(sb, p, src, c, repr_tyid(c, e.a))
+            emit_su_tyid(sb, p, src, c, g, repr_tyid(c, e.a))
             string_push(sb, " _s")
             push_uint__cgen(sb, n as i64)
             string_push(sb, " = (")
@@ -14675,8 +14738,8 @@ fn emit_expr(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                 } else { string_push(sb, "0") }
                 return
             }
-            if genum_item_of(p, src, c, own) >= 0 {
-                emit_gvariant_head(sb, p, src, c, own, src[path.start .. path.end])
+            if genum_item_of_su(p, src, c, g, own) >= 0 {
+                emit_gvariant_head(sb, p, src, c, g, own, src[path.start .. path.end])
             } else {
                 emit_variant_head(sb, p, src, svenum, src[path.start .. path.end])
             }
@@ -16204,8 +16267,8 @@ fn emit_call(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
                 emit_expr(sb, p, src, c, g, arg_at(p, e, 0))
                 return
             }
-            if genum_item_of(p, src, c, own) >= 0 {   // a generic-enum instance value
-                emit_gvariant_head(sb, p, src, c, own, nm)
+            if genum_item_of_su(p, src, c, g, own) >= 0 {   // a generic-enum instance value
+                emit_gvariant_head(sb, p, src, c, g, own, nm)
             } else {
                 emit_variant_head(sb, p, src, venum, nm)
             }
@@ -17238,6 +17301,27 @@ fn push_su_mangle(mut sb: String, read p: Parser, read src: str, read c: Checker
         push_array_len(sb, p, src, t.b)
         return
     }
+    // An APPLICATION under substitution (`Option(U)` -> `Option__i32`). This mirrors
+    // `emit_su_ty`'s kind-7 arm exactly, minus its `Jestyr_` prefix — that arm renders the C
+    // TYPE NAME and this one the MANGLE, and the first is the second with the prefix.
+    //
+    // **Without it a generic-enum return inside a fn-pointer type mangled `?`**, because the
+    // fallthrough below is substitution-blind: `opt_and_then`'s `f: fn(T) -> Option(U)`
+    // became `JestyrFn_fn_di32_ret_?`, a name no typedef could ever define. It reached gcc
+    // rather than the checker, which is the degrades-to-gcc mode this tree keeps finding.
+    // `examples/std/combinators.jtr` is the corpus's instance; the reference spells the same
+    // type `JestyrFn_fn_di32_ret_Option__i32`.
+    if t.kind == 7 {
+        string_push(sb, src[t.x as usize .. t.y as usize])
+        string_push(sb, "__")
+        var ai7: i32 = 0
+        for ai7 < t.a {
+            if ai7 > 0 { string_push(sb, "_") }
+            push_su_mangle(sb, p, src, c, g, get__list(i32, p.tar, (t.op + ai7) as usize))
+            ai7 = ai7 + 1
+        }
+        return
+    }
     push_ast_mangle(sb, p, src, tyid)
 }
 
@@ -17353,6 +17437,22 @@ fn emit_su_tyid(mut sb: String, read p: Parser, read src: str, read c: Checker, 
         if d.kind == 3 {                              // Ptr of an Opaque tparam
             emit_su_tyid(sb, p, src, c, g, d.a)
             string_push(sb, "*")
+            return
+        }
+        if d.kind == 8 {                              // Slice `[]T` inside an instance body
+            // The Array arm below was added for `JestyrArr_T_8` and this one was NOT, which
+            // is the exact failure the note beside that fix warned about: **these renderers
+            // have to be checked AS A SET, because a type form handled by one and not the
+            // others is precisely this bug.** An `s[mid]` index inside
+            // `core.sl_binary_search`'s monomorphized body emitted
+            // `JestyrSlice_T _s124 = j_s;` and gcc refused the program `jestyrc` compiles.
+            //
+            // It fails LOUDLY where the array one failed silently, and the difference is
+            // worth knowing: there is no `int` fallback for an undefined struct typedef, so
+            // a wrong slice element is a compile error while a wrong array element was a
+            // 32-bit truncation of every `i64`.
+            string_push(sb, "JestyrSlice_")
+            push_su_tymangle(sb, src, c, g, d.a)
             return
         }
         if d.kind == 9 {                              // Array `[N]T` inside an instance body
@@ -19555,9 +19655,9 @@ fn emit_match(mut sb: String, read p: Parser, read src: str, read c: Checker, mu
         string_push(pfx, "Jestyr_")
         string_push(pfx, src[ens as usize .. ene as usize])
     } else {
-        enum_iid = genum_item_of(p, src, c, stid)
+        enum_iid = genum_item_of_su(p, src, c, g, stid)
         inst = stid
-        emit_ty_c(pfx, p, src, c, stid)
+        emit_su_tyid(pfx, p, src, c, g, stid)
         if enum_iid < 0 {                             // neither a local enum nor a local generic
             string_free(pfx)                          // instance (an import-degenerate scrutinee):
             return                                    // the reference diags and emits NOTHING
@@ -20680,7 +20780,7 @@ fn emit_slice_for(mut sb: String, read p: Parser, read src: str, read c: Checker
     let n: i32 = g.tmp
     g.tmp = g.tmp + 1
     indent(sb, depth)
-    emit_ty_c(sb, p, src, c, stid)
+    emit_su_tyid(sb, p, src, c, g, stid)
     string_push(sb, " _s")
     push_uint__cgen(sb, n as i64)
     string_push(sb, " = ")
@@ -20713,7 +20813,7 @@ fn emit_slice_for(mut sb: String, read p: Parser, read src: str, read c: Checker
     var added_ptr: bool = false
     if !str_eq(bname, "_") {
         indent(sb, depth + 1)
-        emit_ty_c(sb, p, src, c, sd.a)
+        emit_su_tyid(sb, p, src, c, g, sd.a)
         if conv == 2 {                                // mut: bind a pointer into the slice
             string_push(sb, "* j_")
             string_push(sb, bname)
@@ -20816,7 +20916,7 @@ fn emit_array_for(mut sb: String, read p: Parser, read src: str, read c: Checker
     let n: i32 = g.tmp
     g.tmp = g.tmp + 1
     indent(sb, depth)
-    emit_ty_c(sb, p, src, c, sty)
+    emit_su_tyid(sb, p, src, c, g, sty)
     string_push(sb, "* _a")
     push_uint__cgen(sb, n as i64)
     string_push(sb, " = &(")
@@ -21748,11 +21848,11 @@ fn emit_variant_head(mut sb: String, read p: Parser, read src: str, enum_iid: i3
 
 // Like `emit_variant_head`, but for a generic-enum INSTANCE (the construct expr's Checker type
 // `tid`, kind 6): `(<N>){ .tag = <N>_<v>` where N = `Jestyr_<ctor>__<args>`.
-fn emit_gvariant_head(mut sb: String, read p: Parser, read src: str, read c: Checker, tid: i32, read vname: str) {
+fn emit_gvariant_head(mut sb: String, read p: Parser, read src: str, read c: Checker, read g: Cg, tid: i32, read vname: str) {
     string_push(sb, "(")
-    emit_ty_c(sb, p, src, c, tid)
+    emit_su_tyid(sb, p, src, c, g, tid)
     string_push(sb, "){ .tag = ")
-    emit_ty_c(sb, p, src, c, tid)
+    emit_su_tyid(sb, p, src, c, g, tid)
     string_push(sb, "_")
     string_push(sb, vname)
 }
@@ -24333,6 +24433,89 @@ fn emit_fn_type_defs(mut sb: String, read p: Parser, read src: str, read c: Chec
         }
         gk = gk + 1
     }
+    // A monomorphized generic FUNCTION contributes the concrete fn-pointer type of each
+    // fn-pointer PARAMETER and of its RETURN under that instance's substitution —
+    // `opt_map(i32, i32)`'s `f: fn(T) -> U` yields `fn(i32) -> i32`. Mirrors the third pass
+    // of the reference's `collect_fn_types`, which the port did not have.
+    //
+    // **This is what made four corpus programs unbuildable under `jc`.** Pass 1 walks types
+    // written in the AST and skips `fn(T) -> U` because it is not concrete; pass 2 covers
+    // generic STRUCT fields only. So a higher-order generic combinator's signature NAMED a
+    // typedef nothing emitted, and gcc refused a program `jestyrc` compiles —
+    // `combinators`, `slice_algos` and `mutex` are the three instances, and each is an
+    // ordinary use of `core`'s or `sync`'s public API rather than anything exotic.
+    var rb3: i32 = 0
+    for (rb3 as usize) < len(i32, g.gfi) {
+        let fit3: i32 = get__list(i32, g.gfi, rb3 as usize)
+        let f3: ItemData = get__list(ItemData, p.it, fit3 as usize)
+        arm_record_su(g, p, rb3)
+        var pi3: i32 = 0
+        for pi3 <= f3.b {
+            // `f3.b` params, then one extra turn for the RETURN type — the reference chains
+            // `params.filter_map(ty)` with `ret_ty` into one sequence and this is that chain.
+            var ty3: i32 = f3.z
+            if pi3 < f3.b { ty3 = get__list(i32, p.iar, (f3.a + pi3 * 7 + 5) as usize) }
+            if ty3 >= 0 {
+                let t3: TypeData = get__list(TypeData, p.ty, ty3 as usize)
+                if t3.kind == 9 {
+                    var m3: String = string_new()
+                    push_su_mangle(m3, p, src, c, g, ty3)
+                    var probe3: String = string_new()
+                    string_push(probe3, "|")
+                    string_push(probe3, string_view(m3))
+                    string_push(probe3, "|")
+                    // A `?` in the mangle is exactly what the reference's `is_concrete`
+                    // screens out, in the form this side can observe: it means a tparam
+                    // reached the mangle unsubstituted, and emitting a typedef under that
+                    // name would define something no use can spell.
+                    if !contains(string_view(m3), "?") and !contains(string_view(seen), string_view(probe3)) {
+                        string_push(seen, string_view(probe3))
+                        let uns3: i32 = dc_len(d)
+                        string_push(d.nb, "JestyrFn_")
+                        string_push(d.nb, string_view(m3))
+                        let une3: i32 = dc_len(d)
+                        var line3: String = string_new()
+                        string_push(line3, "typedef ")
+                        var rc3: String = string_new()
+                        emit_su_ty(rc3, p, src, c, g, t3.x)
+                        dc_dep_anon(d, une3, string_view(rc3))
+                        string_push(line3, string_view(rc3))
+                        string_free(rc3)
+                        string_push(line3, " (*JestyrFn_")
+                        string_push(line3, string_view(m3))
+                        string_push(line3, ")(")
+                        if t3.a == 0 { string_push(line3, "void") }
+                        var i3: i32 = 0
+                        for i3 < t3.a {
+                            if i3 > 0 { string_push(line3, ", ") }
+                            let conv3: i32 = get__list(i32, p.tar, (t3.op + i3 * 2) as usize)
+                            var pc3: String = string_new()
+                            emit_su_ty(pc3, p, src, c, g, get__list(i32, p.tar, (t3.op + i3 * 2 + 1) as usize))
+                            if conv3 == 2 or conv3 == 4 { string_push(pc3, "*") }
+                            dc_dep_anon(d, une3, string_view(pc3))
+                            string_push(line3, string_view(pc3))
+                            string_free(pc3)
+                            i3 = i3 + 1
+                        }
+                        string_push(line3, ");\n")
+                        dc_begin(d, sb_len(sb), uns3, une3, une3, dc_len(d))
+                        string_push(sb, string_view(line3))
+                        dc_end(d, sb_len(sb))
+                        string_free(line3)
+                        any = true
+                    }
+                    string_free(m3)
+                    string_free(probe3)
+                }
+            }
+            pi3 = pi3 + 1
+        }
+        rb3 = rb3 + 2 + get__list(i32, g.gfi, (rb3 + 1) as usize) * 3
+    }
+    // `arm_record_su` leaves the substitution armed and its callers are required to clear it;
+    // every later emitter reads `g.su` and would otherwise render the last instance's
+    // bindings into unrelated code.
+    truncate(i32, g.su, 0)
     if any { string_push(sb, "\n") }
     string_free(seen)
 }
