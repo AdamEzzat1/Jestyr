@@ -63,6 +63,7 @@ BUILD_OK hashmap_demo
 BUILD_OK impl_body_calls
 BUILD_OK intern_demo
 BUILD_OK lexer
+BUILD_OK log_demo
 FAIL mutex
 BUILD_OK numbers
 BUILD_OK numerics_canary

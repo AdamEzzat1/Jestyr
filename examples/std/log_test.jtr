@@ -1,0 +1,328 @@
+// std/log_test.jtr — the record, the escaping, and every way a record can fail to appear.
+//
+// Everything here runs with `time.manual(0)` and `writer.to_buffer()`, so **no test in this
+// file touches the operating system** — which is the property `std/log` was shaped around: a
+// logger reaches the OS only through the clock and the writer it is given, so replacing both
+// makes the whole module testable and its output exact.
+//
+// The centre of the file is `a_value_that_could_break_the_record_is_quoted`. The escaping is
+// where a structured logger is actually wrong, and it is wrong in a way nothing notices: a
+// message with a space in it silently becomes two fields, and the log keeps looking fine.
+//
+// Run:  jestyrc test examples/std/log_test.jtr
+
+import "log"
+import "sink"
+import "json"
+import "writer"
+import "time"
+import "mem"
+import "str"
+import "test"
+import "test_report"
+
+const LOG_T_CAP: usize = 8192
+
+// A logger writing into a caller buffer, on a clock that does not move unless told. The two
+// substitutions that make every assertion below exact.
+fn buffered(min: i32, fmt: i32) -> log.Logger {
+    return log.make(time.manual(1000), writer.to_buffer(), min, fmt)
+}
+
+@test fn the_same_record_renders_in_both_formats() -> bool {
+    var raw: *mut u8 = alloc(u8, LOG_T_CAP)
+    var rep: []u8 = slice(u8, raw, LOG_T_CAP)
+    var c: test.Check = test.new()
+
+    var oraw: *mut u8 = alloc(u8, 1024)
+    var obuf: []u8 = slice(u8, oraw, 1024)
+
+    // **The same six calls, twice.** That is the claim: what to record is decided in the code
+    // that knows, how to ship it where the log is read, and neither can be changed by editing
+    // the other. If these two blocks ever have to differ, the design has failed.
+    var s1: Sink = sink.new()
+    var lf: log.Logger = buffered(log.LOG_TRACE, log.LOG_LOGFMT)
+    log.begin(lf, log.LOG_INFO, "watch fired")
+    log.kv_str(lf, "path", "notes.txt")
+    log.kv_i64(lf, "count", 3)
+    log.kv_bool(lf, "ok", true)
+    log.end(lf, s1, obuf)
+    test.eq_str(c, rep, "logfmt", sink.view(s1, obuf),
+        "ts=1000 level=info msg=\"watch fired\" path=notes.txt count=3 ok=true\n")
+    log.free(lf)
+
+    var s2: Sink = sink.new()
+    sink.reset(s2)
+    var js: log.Logger = buffered(log.LOG_TRACE, log.LOG_JSON)
+    log.begin(js, log.LOG_INFO, "watch fired")
+    log.kv_str(js, "path", "notes.txt")
+    log.kv_i64(js, "count", 3)
+    log.kv_bool(js, "ok", true)
+    log.end(js, s2, obuf)
+    test.eq_str(c, rep, "json", sink.view(s2, obuf),
+        "{\"ts\":1000,\"level\":\"info\",\"msg\":\"watch fired\",\"path\":\"notes.txt\",\"count\":3,\"ok\":true}\n")
+    log.free(js)
+
+    free_ptr(oraw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_value_that_could_break_the_record_is_quoted() -> bool {
+    var raw: *mut u8 = alloc(u8, LOG_T_CAP)
+    var rep: []u8 = slice(u8, raw, LOG_T_CAP)
+    var c: test.Check = test.new()
+
+    // The predicate first, on its own. Each of these is a value that would END THE FIELD
+    // EARLY, START A NEW ONE, or vanish, if it went out bare.
+    test.is_true(c, rep, "a space would split the field", log.needs_quoting("a b"))
+    test.is_true(c, rep, "an = would invent a key", log.needs_quoting("a=b"))
+    test.is_true(c, rep, "a quote would unbalance it", log.needs_quoting("a\"b"))
+    test.is_true(c, rep, "a backslash would escape the next byte", log.needs_quoting("a\\b"))
+    test.is_true(c, rep, "a newline would split the RECORD", log.needs_quoting("a\nb"))
+    test.is_true(c, rep, "a tab is a control character", log.needs_quoting("a\tb"))
+    // Empty is the one a reader cannot even see is there: `k=` then a space is
+    // indistinguishable from `k=` at end of line.
+    test.is_true(c, rep, "and empty is quoted so the field is visible", log.needs_quoting(""))
+
+    // The anti-vacuity control: an ordinary value is NOT quoted, so the assertions above are
+    // about these bytes and not about a predicate that answers true for everything.
+    test.is_false(c, rep, "an ordinary value goes bare", log.needs_quoting("notes.txt"))
+    test.is_false(c, rep, "punctuation that cannot confuse a reader stays bare", log.needs_quoting("a-b_c.d:1"))
+
+    // Now the rendering, end to end. A newline inside a value must come out as the two
+    // characters `\` and `n` — if it came out raw the record would be two lines and every
+    // downstream reader would see a truncated record followed by garbage.
+    var oraw: *mut u8 = alloc(u8, 1024)
+    var obuf: []u8 = slice(u8, oraw, 1024)
+    var s: Sink = sink.new()
+    var lg: log.Logger = buffered(log.LOG_TRACE, log.LOG_LOGFMT)
+    log.begin(lg, log.LOG_WARN, "two\nlines")
+    log.kv_str(lg, "empty", "")
+    log.kv_str(lg, "eq", "k=v")
+    log.end(lg, s, obuf)
+    let line: str = sink.view(s, obuf)
+    test.eq_str(c, rep, "every hostile value survives quoted", line,
+        "ts=1000 level=warn msg=\"two\\nlines\" empty=\"\" eq=\"k=v\"\n")
+
+    // And the property that matters more than the exact bytes: ONE record is ONE line.
+    test.eq_usize(c, rep, "a record with newlines in it is still one line", newlines(line), 1)
+
+    log.free(lg)
+    free_ptr(oraw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_record_below_the_level_costs_nothing_and_is_counted() -> bool {
+    var raw: *mut u8 = alloc(u8, LOG_T_CAP)
+    var rep: []u8 = slice(u8, raw, LOG_T_CAP)
+    var c: test.Check = test.new()
+
+    var oraw: *mut u8 = alloc(u8, 1024)
+    var obuf: []u8 = slice(u8, oraw, 1024)
+    var s: Sink = sink.new()
+    var lg: log.Logger = buffered(log.LOG_WARN, log.LOG_LOGFMT)
+
+    test.is_false(c, rep, "enabled says no before anything is built", log.enabled(lg, log.LOG_DEBUG))
+    test.is_false(c, rep, "and begin agrees", log.begin(lg, log.LOG_DEBUG, "cache probe"))
+    log.kv_str(lg, "key", "k")
+    test.is_false(c, rep, "end on a filtered record reports nothing shipped", log.end(lg, s, obuf))
+    test.eq_usize(c, rep, "nothing reached the destination", sink.written(s), 0)
+    test.eq_i64(c, rep, "and the drop was counted", log.dropped(lg), 1)
+    test.eq_i64(c, rep, "with nothing emitted", log.emitted(lg), 0)
+
+    // **The anti-vacuity control**, and the one that matters: the same calls at a level that
+    // PASSES do reach the buffer. Without it this test would pass for a logger that dropped
+    // everything.
+    test.is_true(c, rep, "a passing record opens", log.begin(lg, log.LOG_ERROR, "disk full"))
+    log.kv_i64(lg, "free", 0)
+    test.is_true(c, rep, "and ships", log.end(lg, s, obuf))
+    test.eq_str(c, rep, "exactly one record is in the buffer", sink.view(s, obuf),
+        "ts=1000 level=error msg=\"disk full\" free=0\n")
+    test.eq_i64(c, rep, "one emitted", log.emitted(lg), 1)
+    test.eq_i64(c, rep, "one dropped, still", log.dropped(lg), 1)
+
+    log.free(lg)
+    free_ptr(oraw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn omitting_the_filter_guard_cannot_corrupt_the_next_record() -> bool {
+    var raw: *mut u8 = alloc(u8, LOG_T_CAP)
+    var rep: []u8 = slice(u8, raw, LOG_T_CAP)
+    var c: test.Check = test.new()
+
+    var oraw: *mut u8 = alloc(u8, 1024)
+    var obuf: []u8 = slice(u8, oraw, 1024)
+    var s: Sink = sink.new()
+    var lg: log.Logger = buffered(log.LOG_INFO, log.LOG_JSON)
+
+    // The caller who never writes `if log.begin(…) { … }`. Every field below lands on a
+    // record that was filtered out, and the module's promise is that this is merely wasteful
+    // rather than wrong — the fields must not leak into the NEXT record, which is the failure
+    // mode that would make the guard mandatory instead of optional.
+    log.begin(lg, log.LOG_TRACE, "very chatty")
+    log.kv_str(lg, "leaked", "must-not-appear")
+    log.kv_i64(lg, "also_leaked", 7)
+    log.end(lg, s, obuf)
+
+    log.begin(lg, log.LOG_INFO, "the real one")
+    log.kv_str(lg, "kept", "yes")
+    log.end(lg, s, obuf)
+
+    let got: str = sink.view(s, obuf)
+    test.eq_str(c, rep, "only the real record is there", got,
+        "{\"ts\":1000,\"level\":\"info\",\"msg\":\"the real one\",\"kept\":\"yes\"}\n")
+    test.is_false(c, rep, "and nothing leaked from the filtered one", contains(got, "leaked"))
+    test.eq_i64(c, rep, "one emitted", log.emitted(lg), 1)
+    test.eq_i64(c, rep, "one dropped", log.dropped(lg), 1)
+
+    log.free(lg)
+    free_ptr(oraw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_truncated_record_is_withheld_and_announced() -> bool {
+    var raw: *mut u8 = alloc(u8, LOG_T_CAP)
+    var rep: []u8 = slice(u8, raw, LOG_T_CAP)
+    var c: test.Check = test.new()
+    let a: Allocator = mem.system_allocator()
+
+    var oraw: *mut u8 = alloc(u8, 1024)
+    var obuf: []u8 = slice(u8, oraw, 1024)
+    var s: Sink = sink.new()
+
+    // A record buffer far too small for what is about to be written. 64 bytes holds the
+    // truncation notice and not the record, which is exactly the interesting case.
+    var lg: log.Logger = log.make_sized(time.manual(1000), writer.to_buffer(),
+                                        log.LOG_TRACE, log.LOG_JSON, 64)
+    log.begin(lg, log.LOG_INFO, "a message long enough to overrun the record buffer entirely")
+    log.kv_str(lg, "and", "several more fields after it")
+    log.kv_str(lg, "so", "there is no doubt at all about overflowing")
+    let shipped: bool = log.end(lg, s, obuf)
+
+    test.eq_i64(c, rep, "the truncation was counted", log.truncated(lg), 1)
+    test.eq_i64(c, rep, "and the record was NOT emitted", log.emitted(lg), 0)
+
+    // **The gap is announced IN THE STREAM**, not only in a counter — the same choice
+    // `syswatch` makes with `WATCH_OVERFLOW`. A reader of the log can see that it lost
+    // something; a reader who only ever sees the log cannot query `truncated()`.
+    test.is_true(c, rep, "something was shipped in its place", shipped)
+    let got: str = sink.view(s, obuf)
+    test.is_true(c, rep, "and it says what happened", contains(got, "log record truncated"))
+
+    // And the replacement is VALID, which is the entire reason a truncated record is
+    // withheld: an unparseable line would be a loss a reader cannot detect.
+    var doc: json.Doc = json.parse(a, trim(got))
+    test.is_true(c, rep, "the notice is parseable JSON", json.parsed(doc))
+    test.is_false(c, rep, "the truncated record itself never reached the stream",
+        contains(got, "several more fields"))
+
+    log.free(lg)
+    free_ptr(oraw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_record_that_is_never_ended_is_counted() -> bool {
+    var raw: *mut u8 = alloc(u8, LOG_T_CAP)
+    var rep: []u8 = slice(u8, raw, LOG_T_CAP)
+    var c: test.Check = test.new()
+
+    var oraw: *mut u8 = alloc(u8, 1024)
+    var obuf: []u8 = slice(u8, oraw, 1024)
+    var s: Sink = sink.new()
+    var lg: log.Logger = buffered(log.LOG_TRACE, log.LOG_LOGFMT)
+
+    // The realistic shape of the bug: an early return between `begin` and `end`. The record
+    // is gone either way; what must not happen is it going unreported, because a missing
+    // record and a record that was never written look identical in the output.
+    log.begin(lg, log.LOG_INFO, "first")
+    log.kv_str(lg, "step", "one")
+    test.is_true(c, rep, "a record is open", log.building(lg))
+
+    log.begin(lg, log.LOG_INFO, "second")
+    test.eq_i64(c, rep, "the abandoned record was counted", log.abandoned(lg), 1)
+    log.end(lg, s, obuf)
+
+    test.eq_str(c, rep, "and only the second reached the buffer", sink.view(s, obuf),
+        "ts=1000 level=info msg=second\n")
+    test.eq_i64(c, rep, "one emitted", log.emitted(lg), 1)
+    test.eq_i64(c, rep, "nothing was dropped by level", log.dropped(lg), 0)
+    test.eq_i64(c, rep, "and nothing was truncated", log.truncated(lg), 0)
+
+    // The control: a properly closed record does NOT count as abandoned, so the assertion
+    // above is about the missing `end` and not about `begin` counting every call.
+    log.begin(lg, log.LOG_INFO, "third")
+    log.end(lg, s, obuf)
+    test.eq_i64(c, rep, "still one abandoned", log.abandoned(lg), 1)
+
+    // **A freed logger refuses instead of writing through a null buffer.** Logging after
+    // shutdown is an ordering bug, and the alternative is a crash somewhere far from the
+    // `free` that caused it. Asserted here because it is the one entry point `free` does not
+    // already close off — `kv_*` and `end` are covered by the cleared `open` flag.
+    let before: usize = sink.written(s)
+    log.free(lg)
+    test.is_false(c, rep, "a freed logger opens nothing", log.begin(lg, log.LOG_ERROR, "too late"))
+    log.kv_str(lg, "k", "v")
+    test.is_false(c, rep, "and ships nothing", log.end(lg, s, obuf))
+    test.eq_usize(c, rep, "the destination is untouched", sink.written(s), before)
+    free_ptr(oraw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn the_timestamp_is_the_clocks_and_the_level_threshold_moves() -> bool {
+    var raw: *mut u8 = alloc(u8, LOG_T_CAP)
+    var rep: []u8 = slice(u8, raw, LOG_T_CAP)
+    var c: test.Check = test.new()
+
+    var oraw: *mut u8 = alloc(u8, 1024)
+    var obuf: []u8 = slice(u8, oraw, 1024)
+    var s: Sink = sink.new()
+    var lg: log.Logger = buffered(log.LOG_INFO, log.LOG_LOGFMT)
+
+    // **The timestamp comes from the handle, never from an ambient clock.** That is what
+    // makes every other assertion in this file an exact string rather than a pattern, and it
+    // is the same reason `runtime` takes a `Clock` instead of reading the wall clock.
+    log.begin(lg, log.LOG_INFO, "first")
+    log.end(lg, s, obuf)
+    log.advance(lg, 500)
+    log.begin(lg, log.LOG_INFO, "second")
+    log.end(lg, s, obuf)
+    test.eq_str(c, rep, "each record carries the clock's reading", sink.view(s, obuf),
+        "ts=1000 level=info msg=first\nts=1500 level=info msg=second\n")
+
+    // The threshold is the one knob an operator turns, so it moves at runtime.
+    log.set_min_level(lg, log.LOG_ERROR)
+    test.is_false(c, rep, "raising it silences INFO", log.begin(lg, log.LOG_INFO, "quiet now"))
+    log.set_min_level(lg, log.LOG_TRACE)
+    test.is_true(c, rep, "lowering it lets TRACE through", log.enabled(lg, log.LOG_TRACE))
+    test.eq_i64(c, rep, "LOG_OFF admits nothing at all", log.LOG_OFF as i64, 99)
+    log.set_min_level(lg, log.LOG_OFF)
+    test.is_false(c, rep, "not even an error", log.enabled(lg, log.LOG_ERROR))
+
+    log.free(lg)
+    free_ptr(oraw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+// How many line terminators `t` contains — the check that a record is one line.
+fn newlines(read t: str) -> usize {
+    var n: usize = 0
+    for i in 0..t.len {
+        if (t[i] as i32) == 10 { n = n + 1 }
+    }
+    return n
+}

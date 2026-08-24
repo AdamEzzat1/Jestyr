@@ -606,6 +606,81 @@ mod syswatch_debounced_trigger {
     }
 }
 
+/// **`jlog` — one logging routine, two renderings, and the log reading itself back.**
+///
+/// `examples/std/log_demo.jtr` is `std/log`'s consumer. `run_job` is written once and shipped
+/// twice — logfmt for a person, JSON for a machine — which is the separation the module
+/// exists to make: what to record is decided where it is known, how to ship it where it is
+/// consumed, and neither can be changed by editing the other.
+///
+/// **The assertion that earns the word "structured" is the round trip.** One record carries a
+/// message containing a quote, an `=` AND a newline — every piece of punctuation both formats
+/// use — and the demo parses its own JSON back with `std/json` and compares. A logger that
+/// formats by concatenation produces an unparseable line here, or two lines, or silently
+/// loses the tail; all three show up as `false` rather than as a plausible-looking log.
+#[cfg(all(test, feature = "c-oracle"))]
+mod log_structured {
+    use super::*;
+
+    #[test]
+    fn jlog_ships_one_routine_two_ways_and_reads_itself_back() {
+        let exe = super::c_oracle::build_exe("examples/std/log_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the logging demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        // Exact, because the demo runs on `time.manual()` — the timestamps below are the
+        // clock's readings, not the wall clock's, which is the property that makes a log
+        // transcript assertable at all.
+        let want = "-- jlog --\n\
+                    -- as a person reads it --\n\
+                    ts=1000 level=info msg=\"job started\" job=import items=3\n\
+                    ts=1250 level=warn msg=\"peer said \\\"no\\\" and quit\\nreason=timeout\" peer=10.0.0.7:9000 retrying=true\n\
+                    ts=2000 level=info msg=\"job finished\" written=3 ok=true\n\
+                    -- as a machine reads it --\n\
+                    {\"ts\":1000,\"level\":\"info\",\"msg\":\"job started\",\"job\":\"import\",\"items\":3}\n\
+                    {\"ts\":1250,\"level\":\"warn\",\"msg\":\"peer said \\\"no\\\" and quit\\nreason=timeout\",\"peer\":\"10.0.0.7:9000\",\"retrying\":true}\n\
+                    {\"ts\":2000,\"level\":\"info\",\"msg\":\"job finished\",\"written\":3,\"ok\":true}\n\
+                    -- read back --\n\
+                    records emitted\n\
+                    3\n\
+                    records parsed back\n\
+                    3\n\
+                    every emitted record parsed\n\
+                    true\n\
+                    the hostile message survived the round trip\n\
+                    true\n\
+                    filtered by level\n\
+                    1\n\
+                    truncated\n\
+                    0\n\
+                    abandoned\n\
+                    0";
+        assert_eq!(out.trim_end(), want, "the logging demo's transcript changed:\n{out}");
+
+        // Anti-vacuity, the shape `jstatus` and `jwatch` use: `true` appears often enough
+        // that a containment check would pass for a demo printing it unconditionally.
+        assert!(!out.contains("false"), "every step must have succeeded:\n{out}");
+
+        // **The hostile value is present in ESCAPED form and never raw.** If the record had
+        // been emitted with a literal newline the transcript would still contain
+        // `reason=timeout`, so the check that matters is that the two-character escape is
+        // what appears — and that the record stayed on one line.
+        assert!(out.contains(r#"quit\nreason=timeout"#), "the newline must be escaped, not emitted:\n{out}");
+        assert_eq!(
+            out.matches("reason=timeout").count(),
+            2,
+            "the hostile message appears once per format and never as a line of its own:\n{out}"
+        );
+
+        // One DEBUG record was filtered in both runs; three were emitted. A demo that had
+        // silently dropped a record would move these and the exact transcript would too, but
+        // asserting the counters separately says which of the two broke.
+        assert!(out.contains("filtered by level\n1\n"), "the DEBUG record must be filtered:\n{out}");
+        assert!(out.contains("truncated\n0\n") && out.contains("abandoned\n0\n"), "{out}");
+    }
+}
+
 /// **`jstage` — the atomic-publish demo, end to end through the real filesystem.**
 ///
 /// `examples/std/sysfs_demo.jtr` is `std/sysfs`'s consumer, not an illustration of it: it
@@ -16250,6 +16325,9 @@ fn main() -> i32 {
         // behind `@cfg`, so `every_cfg_bearing_corpus_file_is_byte_identity_verified`
         // requires it here. Byte-identical first try.
         "syswatch.jtr",
+        "log.jtr",
+        "log_test.jtr",
+        "log_demo.jtr",
     ];
     // **`syswatch_test.jtr` and `syswatch_demo.jtr` are deliberately absent, and the reason
     // was MEASURED** — the same discipline `sysfs_test.jtr` below asks for, and the same
@@ -17308,6 +17386,13 @@ fn main() -> i32 {
             // that branch into a real program — exactly as `syserr`'s pure tables are; and
             // one end-to-end case uses a real directory, a real change and the real loop.
             ("syswatch_test", 7),
+            // **No test in this suite touches the operating system.** A `Logger` reaches it
+            // only through the `time.Clock` and the `writer.Writer` it is given, so
+            // `manual()` + `to_buffer()` makes every record's bytes exact — timestamps
+            // included. The centre of it is the escaping: a value carrying a space, an `=`,
+            // a quote or a newline is where a structured logger is silently wrong, and where
+            // the log keeps looking fine while a reader sees invented fields.
+            ("log_test", 7),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

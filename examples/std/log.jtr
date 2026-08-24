@@ -1,0 +1,423 @@
+// std/log.jtr — structured logging: one record, written once, rendered two ways.
+//
+// TIER: `std`. It reaches the operating system through exactly two things it is GIVEN — a
+// `time.Clock` for the timestamp and a `writer.Writer` for the destination — so a `Logger`
+// over `time.manual()` and `writer.to_buffer()` touches nothing at all and runs in a test.
+// That is the same discipline `std/runtime` follows, and for the same payoff.
+//
+// ─── The rule this module exists to obey ──────────────────────────────────────
+//
+// **No hidden logger.** There is no `log.info(…)` free function, no ambient default, and no
+// initialization that happens on first use. You construct a `Logger`, you hand it to whoever
+// logs, and its destination and clock are visible in the signature that made it. A global
+// logger is a hidden global with an open file handle and a clock attached, and this tree has
+// spent a lot of effort not having hidden globals.
+//
+// ─── What "structured" buys, and the one property it rests on ─────────────────
+//
+// A record is `(timestamp, level, message, fields…)`, and **it is always exactly one line**.
+// Every value is escaped, so a message containing a quote, a newline or an `=` cannot end
+// the record early, split it in two, or invent a field. That is the whole difference between
+// a log a program can read and a log a program can only nearly read — and it is also the
+// property hand-rolled loggers break first, which is why `log_demo.jtr` PARSES ITS OWN
+// OUTPUT back and asserts what it finds.
+//
+// **The escaping is `std/json`'s, deliberately, in both formats.** A quoted logfmt value is
+// a JSON string, produced by the same `json.put_str` that the JSON renderer uses and that
+// `json_test` already covers. Two escape tables would be two places to be wrong about the
+// same question, and the second one would be the one nobody tested.
+//
+// ─── Two formats, one record-building API ─────────────────────────────────────
+//
+//   LOG_LOGFMT   ts=1000 level=info msg="watch fired" path="a b.txt" count=3
+//   LOG_JSON     {"ts":1000,"level":"info","msg":"watch fired","path":"a b.txt","count":3}
+//
+// The format is a property of the `Logger`, chosen once at `make`, and the calls that build
+// a record are identical either way. That is not a convenience: it means the decision of
+// what to record is made in the code that knows, and the decision of how to ship it is made
+// where the log is consumed — and neither one can be changed by editing the other.
+// `the_same_record_renders_in_both_formats` builds one record twice and asserts both.
+//
+// ─── Filtering happens BEFORE formatting, and forgetting to check is SAFE ─────
+//
+// `begin` returns false when the record's level is below the logger's minimum, so the hot
+// path is
+//
+//     if log.begin(lg, LOG_DEBUG, "cache probe") {
+//         log.kv_str(lg, "key", k)
+//         log.end(lg, s, buf)
+//     }
+//
+// and the cost of a filtered DEBUG record is one integer comparison. **But a caller who
+// omits the `if` is CORRECT, not merely lucky**: `begin` marks the record closed, every
+// `kv_*` on a closed record is a no-op, and `end` reports false. Filtering is an
+// optimisation the caller may take, never a rule the caller must obey — a logger where
+// forgetting the guard corrupts the next record is a logger that will corrupt the next
+// record.
+//
+// ─── Every way a record can fail to appear is COUNTED, and they are distinct ──
+//
+//   dropped     below the minimum level        → lower the level
+//   truncated   too big for the record buffer  → make the buffer bigger
+//   abandoned   `begin` without a matching `end` → fix the missing `end`
+//
+// Three causes, three counters, because the three FIXES are different and a single "lost"
+// number would tell a caller nothing about which to apply. This is `std/sink`'s lesson —
+// `sink.overflowed` exists because a truncated write that reports success is how
+// `writer_demo` once produced `user=alice balan` while every oracle answered truthfully.
+//
+// **A truncated record is NOT emitted.** A half-written JSON object is unparseable and a
+// half-written logfmt line silently loses its last fields, so shipping one would put
+// corruption into the stream that a reader cannot detect. Instead the record is dropped and
+// — when the buffer can hold it — a minimal, VALID record announcing the loss takes its
+// place, so the log reports its own gap in band. That is the same choice `std/syswatch`
+// makes with `WATCH_OVERFLOW`: loss that a consumer can see beats loss it cannot.
+//
+// ─── What this does NOT do ────────────────────────────────────────────────────
+//
+// No log rotation, no sampling, no rate limiting, no async/buffered shipping, no context
+// inheritance (a "child logger with these fields pre-set"). Each is a policy, and each wants
+// a decision this module has no basis to make for every caller. Rotation in particular
+// belongs with the append-only log (the brief's §1.10), not here.
+//
+// Worked example:  examples/std/log_demo.jtr
+// Run the tests:   jestyrc test examples/std/log_test.jtr
+
+import "sink"
+import "json"
+import "writer"
+import "time"
+
+// ---- levels -------------------------------------------------------------------
+//
+// Five, ordered, with a sixth that admits nothing. Ordering is the whole point — a level is
+// compared against the logger's minimum, so the numbers are the API and not an enum's
+// private business. (An `enum` would be the more Jestyr-ish spelling and is deliberately not
+// used: enums have no `Eq` and no ordering, so every comparison would be a `match`.)
+
+pub const LOG_TRACE: i32 = 0
+pub const LOG_DEBUG: i32 = 1
+pub const LOG_INFO: i32 = 2
+pub const LOG_WARN: i32 = 3
+pub const LOG_ERROR: i32 = 4
+// A minimum that admits nothing. Not a level a record can BE — `begin(lg, LOG_OFF, …)` is a
+// caller error the same way `begin(lg, 99, …)` is — which is why it is spelled far above the
+// real ones instead of as `LOG_ERROR + 1`.
+pub const LOG_OFF: i32 = 99
+
+@no_alloc @no_os pub fn level_name(lv: i32) -> str {
+    if lv <= LOG_TRACE { return "trace" }
+    if lv == LOG_DEBUG { return "debug" }
+    if lv == LOG_INFO { return "info" }
+    if lv == LOG_WARN { return "warn" }
+    if lv == LOG_ERROR { return "error" }
+    return "off"
+}
+
+// ---- formats ------------------------------------------------------------------
+
+pub const LOG_LOGFMT: i32 = 0
+pub const LOG_JSON: i32 = 1
+
+// ---- the handle ---------------------------------------------------------------
+
+// **The logger owns the buffer a record is built in**, which is the one place this module
+// departs from the tree's usual "storage stays with the caller" rule, and the reason is that
+// the caller has no business sizing it per call: a record's size is a property of the logger
+// (its format and its fields), not of the call site. Owning it also makes truncation the
+// LOGGER's business, which is what lets it be counted and announced instead of silently
+// landing in someone else's sink.
+//
+// The DESTINATION's sink still travels as a parameter, and only on `end` — one call rather
+// than all of them. That is `std/writer`'s own convention: the sink and its buffer travel on
+// every write and are simply unused for a stream target, so a routine that logs is
+// polymorphic over where the log goes.
+pub struct Logger {
+    clock: time.Clock,
+    w: writer.Writer,
+    jw: json.Writer,
+    rec: Sink,
+    raw: *mut u8,
+    cap: usize,
+    min: i32,
+    fmt: i32,
+    open: bool,
+    emitted: i64,
+    dropped: i64,
+    truncated: i64,
+    abandoned: i64,
+}
+
+// The record buffer's default size. Generous for a line of key/value pairs and small enough
+// that a program holding many loggers does not notice; `make_sized` is there for the caller
+// who knows better.
+pub const LOG_RECORD_CAP: usize = 4096
+
+// `take` for both handles, because the logger STORES them: a Jestyr borrow is second-class
+// and may not outlive the call, so a logger that borrowed its clock could not outlive the
+// frame that made it. The same signature `runtime.make` carries, for the same reason.
+pub fn make(take c: time.Clock, take w: writer.Writer, min: i32, fmt: i32) -> Logger {
+    return make_sized(c, w, min, fmt, LOG_RECORD_CAP)
+}
+
+pub fn make_sized(take c: time.Clock, take w: writer.Writer, min: i32, fmt: i32, cap: usize) -> Logger {
+    var raw: *mut u8 = alloc(u8, cap)
+    return Logger{ clock: c, w: w, jw: json.writer(), rec: sink.new(), raw: raw, cap: cap,
+                   min: min, fmt: fmt, open: false, emitted: 0, dropped: 0, truncated: 0,
+                   abandoned: 0 }
+}
+
+// Release the record buffer. The clock and the writer own nothing, so there is nothing else
+// to give back.
+pub fn free(mut lg: Logger) {
+    if lg.raw != null {
+        free_ptr(lg.raw)
+        lg.raw = null
+    }
+    lg.open = false
+}
+
+@no_alloc @no_os pub fn min_level(read lg: Logger) -> i32 { return lg.min }
+@no_alloc @no_os pub fn format(read lg: Logger) -> i32 { return lg.fmt }
+
+// Change the threshold at runtime — the one knob an operator actually turns.
+@no_alloc @no_os pub fn set_min_level(mut lg: Logger, min: i32) { lg.min = min }
+
+// Would a record at `lv` be emitted? For the caller who wants to skip building the ARGUMENTS
+// as well as the record — `enabled` answers before anything is evaluated, where `begin`
+// answers after the message string exists.
+@no_alloc @no_os pub fn enabled(read lg: Logger, lv: i32) -> bool { return lv >= lg.min }
+
+// Records the CALLER built that reached the destination.
+//
+// A truncation notice is deliberately NOT counted here: it is this module's record, not the
+// caller's, and folding it in would make `emitted` answer a question nobody asked ("lines in
+// the stream") instead of the one they did ("records of mine that got through"). `truncated`
+// is where the notice's cause is counted.
+@no_alloc @no_os pub fn emitted(read lg: Logger) -> i64 { return lg.emitted }
+@no_alloc @no_os pub fn dropped(read lg: Logger) -> i64 { return lg.dropped }
+@no_alloc @no_os pub fn truncated(read lg: Logger) -> i64 { return lg.truncated }
+@no_alloc @no_os pub fn abandoned(read lg: Logger) -> i64 { return lg.abandoned }
+
+// Is a record currently being built? A caller should not need this; a test does, and so does
+// anyone debugging a missing `end`.
+@no_alloc @no_os pub fn building(read lg: Logger) -> bool { return lg.open }
+
+// The logger OWNS its clock (`take` at construction), so time is driven through the logger
+// and not through the caller's copy — the same signature and the same reason as
+// `runtime.advance`. A test that kept advancing its own `Clock` would be advancing one
+// nothing reads, and every timestamp would come out identical.
+pub fn advance(mut lg: Logger, by: i64) -> bool {
+    return time.advance(lg.clock, by)
+}
+
+// What the next record's `ts` will be.
+pub fn now(mut lg: Logger) -> i64 {
+    return time.read_nanos(lg.clock)
+}
+
+// ---- building a record --------------------------------------------------------
+
+// The logger's own buffer, as a slice. Rebuilt per call rather than stored, because a struct
+// field cannot hold a borrow.
+@no_alloc @no_os fn rbuf(read lg: Logger) -> []u8 {
+    return slice(u8, lg.raw, lg.cap)
+}
+
+// Start a record. Returns whether it will be emitted.
+//
+// A `begin` while another record is open ABANDONS that record and counts it. That is the
+// shape of the realistic bug — an early `return` between `begin` and `end` — and leaving it
+// uncounted would make the missing record indistinguishable from one that was never written.
+pub fn begin(mut lg: Logger, lv: i32, read msg: str) -> bool {
+    // **A freed logger refuses rather than writing through a null buffer.** `free` is the
+    // only way a `Logger` becomes unusable, and logging after it is an ordinary
+    // shutdown-ordering bug — the kind that would otherwise crash somewhere far from the
+    // `free`. It is not counted as `dropped`: nothing was filtered, the logger is simply
+    // gone. Every other entry point is already covered, because `free` clears `open` and a
+    // closed record makes `kv_*` and `end` no-ops.
+    if lg.raw == null { return false }
+    if lg.open { lg.abandoned = lg.abandoned + 1 }
+    lg.open = false
+    if lv < lg.min {
+        lg.dropped = lg.dropped + 1
+        return false
+    }
+    let now: i64 = time.read_nanos(lg.clock)
+    var buf: []u8 = rbuf(lg)
+    sink.reset(lg.rec)
+    lg.jw = json.writer()
+    lg.open = true
+
+    if lg.fmt == LOG_JSON {
+        json.begin_object(lg.jw, lg.rec, buf)
+        json.key(lg.jw, lg.rec, buf, "ts")
+        json.put_i64(lg.jw, lg.rec, buf, now)
+        json.key(lg.jw, lg.rec, buf, "level")
+        json.put_str(lg.jw, lg.rec, buf, level_name(lv))
+        json.key(lg.jw, lg.rec, buf, "msg")
+        json.put_str(lg.jw, lg.rec, buf, msg)
+        return true
+    }
+    sink.put_str(lg.rec, buf, "ts=")
+    sink.put_i64(lg.rec, buf, now)
+    sink.put_str(lg.rec, buf, " level=")
+    sink.put_str(lg.rec, buf, level_name(lv))
+    sink.put_str(lg.rec, buf, " msg=")
+    put_logfmt_value(lg.rec, buf, msg)
+    return true
+}
+
+// **There are no per-level openers (`log.info(lg, m)`), and the reason is a keyword.**
+//
+// `error` is reserved by the grammar, so the set cannot be spelled: `trace`/`debug`/`info`/
+// `warn` parse and `error` does not. Every way out is worse than having none. An asymmetric
+// four-plus-`log_error` puts the odd spelling on the level a reader most needs to get right;
+// a uniformly prefixed `begin_info`/`begin_error` set is `begin(lg, LOG_INFO, …)` with five
+// more names and no more capability; and `std/diag`'s dodge (`sev_error`, `new_error`) works
+// for an enum variant precisely because nobody types it forty times a file.
+//
+// So `begin` is the only opener, and it is better than it looks: the level constant sits at
+// the call site where it greps, and it is the SAME vocabulary as `enabled(lg, LOG_DEBUG)`
+// and `set_min_level(lg, LOG_WARN)` rather than a second one that has to be kept in step.
+//
+// (`read` is unspellable for the same reason, one module over — see `std/syswatch`'s header
+// on `read(2)`. The pattern is worth naming: the obvious API name is sometimes already the
+// grammar's, and the fix is a better API rather than a worse spelling.)
+
+// A string field. A no-op on a closed record — see the header on why forgetting the guard is
+// safe rather than merely tolerated.
+@no_alloc @no_os pub fn kv_str(mut lg: Logger, read k: str, read v: str) {
+    if lg.open == false { return }
+    var buf: []u8 = rbuf(lg)
+    if lg.fmt == LOG_JSON {
+        json.key(lg.jw, lg.rec, buf, k)
+        json.put_str(lg.jw, lg.rec, buf, v)
+        return
+    }
+    sink.put(lg.rec, buf, 32 as u8)
+    sink.put_str(lg.rec, buf, k)
+    sink.put(lg.rec, buf, 61 as u8)          // '='
+    put_logfmt_value(lg.rec, buf, v)
+}
+
+@no_alloc @no_os pub fn kv_i64(mut lg: Logger, read k: str, v: i64) {
+    if lg.open == false { return }
+    var buf: []u8 = rbuf(lg)
+    if lg.fmt == LOG_JSON {
+        json.key(lg.jw, lg.rec, buf, k)
+        json.put_i64(lg.jw, lg.rec, buf, v)
+        return
+    }
+    sink.put(lg.rec, buf, 32 as u8)
+    sink.put_str(lg.rec, buf, k)
+    sink.put(lg.rec, buf, 61 as u8)
+    sink.put_i64(lg.rec, buf, v)
+}
+
+@no_alloc @no_os pub fn kv_bool(mut lg: Logger, read k: str, v: bool) {
+    if lg.open == false { return }
+    var buf: []u8 = rbuf(lg)
+    if lg.fmt == LOG_JSON {
+        json.key(lg.jw, lg.rec, buf, k)
+        json.put_bool(lg.jw, lg.rec, buf, v)
+        return
+    }
+    sink.put(lg.rec, buf, 32 as u8)
+    sink.put_str(lg.rec, buf, k)
+    sink.put(lg.rec, buf, 61 as u8)
+    sink.put_bool(lg.rec, buf, v)
+}
+
+// Finish the record and ship it. Returns whether it reached the destination.
+//
+// `s`/`buf` are the DESTINATION's sink, used only by a buffer target and simply ignored by
+// stdout and stderr — `std/writer`'s convention, which is what keeps a logging routine
+// polymorphic over where its output goes.
+//
+// One `writer.line` per record, never one per field: the stream targets terminate every
+// write with a newline of their own, so a record assembled piecewise would arrive as one
+// line per piece. That is exactly the case `std/writer`'s header says to build in a `Sink`
+// and write once, and a log record is the archetype of it.
+pub fn end(mut lg: Logger, mut s: Sink, mut buf: []u8) -> bool {
+    if lg.open == false { return false }
+    lg.open = false
+    var rb: []u8 = rbuf(lg)
+    if lg.fmt == LOG_JSON { json.end_object(lg.jw, lg.rec, rb) }
+
+    // **A truncated record is not emitted.** See the header: an unparseable line in the
+    // stream is worse than a missing one, because a reader cannot tell it happened.
+    if sink.overflowed(lg.rec) {
+        lg.truncated = lg.truncated + 1
+        return announce_truncation(lg, s, buf)
+    }
+    let text: str = sink.view(lg.rec, rb)
+    let ok: bool = writer.line(lg.w, s, buf, text)
+    if ok { lg.emitted = lg.emitted + 1 }
+    return ok
+}
+
+// Put a VALID record in the stream saying one was lost, so the gap is visible to whoever
+// reads the log rather than only to whoever queries `truncated()`.
+//
+// It rebuilds from scratch in the same buffer, which is why it can succeed where the real
+// record did not — and if even this does not fit, it gives up rather than emitting a
+// half-written apology for a half-written record. `truncated()` has already counted it
+// either way, so nothing is lost that was not already reported.
+fn announce_truncation(mut lg: Logger, mut s: Sink, mut buf: []u8) -> bool {
+    var rb: []u8 = rbuf(lg)
+    sink.reset(lg.rec)
+    lg.jw = json.writer()
+    if lg.fmt == LOG_JSON {
+        json.begin_object(lg.jw, lg.rec, rb)
+        json.key(lg.jw, lg.rec, rb, "level")
+        json.put_str(lg.jw, lg.rec, rb, "error")
+        json.key(lg.jw, lg.rec, rb, "msg")
+        json.put_str(lg.jw, lg.rec, rb, "log record truncated")
+        json.end_object(lg.jw, lg.rec, rb)
+    } else {
+        sink.put_str(lg.rec, rb, "level=error msg=\"log record truncated\"")
+    }
+    if sink.overflowed(lg.rec) { return false }
+    return writer.line(lg.w, s, buf, sink.view(lg.rec, rb))
+}
+
+// ---- logfmt values ------------------------------------------------------------
+
+// Does `v` need quoting to survive as one logfmt field?
+//
+// **Pure, and public, so the platform that ships the log can test the rule that makes it
+// parseable** — the same argument `std/syserr`'s tables and `std/syswatch`'s event parser
+// make. This predicate is where a logfmt writer is actually wrong: get it too narrow and a
+// value with a space silently becomes two fields, or one with an `=` invents a key.
+//
+// The empty string is quoted too, and that is not an edge case for tidiness: `k=` followed
+// by a space is indistinguishable from `k=` at the end of a line, so an unquoted empty value
+// is the one case where a reader cannot tell a field is there at all.
+@no_alloc @no_os pub fn needs_quoting(read v: str) -> bool {
+    if v.len == 0 { return true }
+    for i in 0..v.len {
+        let ch: i32 = v[i] as i32
+        if ch <= 32 { return true }          // space and every C0 control, newline included
+        if ch == 34 { return true }          // '"'
+        if ch == 61 { return true }          // '='
+        if ch == 92 { return true }          // '\'
+        if ch == 127 { return true }         // DEL
+    }
+    return false
+}
+
+// A logfmt value: bare when it is unambiguous, otherwise a JSON string.
+//
+// The quoted form is produced by `json.put_str` rather than by a second escaper here, so
+// there is exactly ONE escape table in the tree and it is the one `json_test` already
+// covers. A fresh `json.Writer` is used so its separator state cannot leak in: with
+// `need_comma` false it emits the quoted string and nothing else.
+@no_alloc @no_os fn put_logfmt_value(mut s: Sink, mut buf: []u8, read v: str) {
+    if needs_quoting(v) == false {
+        sink.put_str(s, buf, v)
+        return
+    }
+    var q: json.Writer = json.writer()
+    json.put_str(q, s, buf, v)
+}

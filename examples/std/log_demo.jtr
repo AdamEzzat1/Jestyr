@@ -1,0 +1,171 @@
+// examples/std/log_demo.jtr — `jlog`, and the claim "structured" has to earn.
+//
+// Run:  jestyrc run examples/std/log_demo.jtr
+//
+// ─── What this demonstrates ───────────────────────────────────────────────────
+//
+// One routine — `run_job` — logs a small job's progress. It is written ONCE and shipped
+// twice: as logfmt for a person reading a terminal, and as JSON for something that ingests
+// it. The routine does not know which; the format is a property of the `Logger` it was
+// handed. That is the whole point of separating what to record from how to ship it.
+//
+// Then the program **parses its own JSON output back** and reads a field out of it. That is
+// not decoration: "structured" is a claim that a machine can read the log, and a logger that
+// merely looks structured fails exactly when a value contains the format's own punctuation.
+// So one of the records carries a message with a quote, an `=` AND a newline in it, and the
+// demo asserts that what comes back out is byte-identical to what went in. If the escaping
+// were wrong, that record would be an unparseable line, or two lines, or would silently lose
+// its tail — and this program would say so rather than printing a plausible log.
+//
+// Everything runs on `time.manual()`, so the timestamps are exact and the transcript is
+// asserted to the line by `jlog_ships_one_routine_two_ways_and_reads_itself_back`.
+
+import "log"
+import "sink"
+import "json"
+import "writer"
+import "time"
+import "mem"
+
+const JLOG_CAP: usize = 4096
+
+// **The value that decides whether any of this is real.** A quote would close the JSON
+// string early, an `=` would invent a field in logfmt, and a newline would end the record
+// where no reader expects it. It is written once here and compared against what survives the
+// round trip.
+const JLOG_HOSTILE: str = "peer said \"no\" and quit\nreason=timeout"
+
+// The job, logged once and rendered by whichever `Logger` it is given.
+//
+// Note what is NOT here: no format, no destination, no timestamps, no decision about which
+// levels matter. All four belong to whoever built the logger, which is what lets this
+// function be the same in a test, on a terminal and in a log pipeline.
+fn run_job(mut lg: log.Logger, mut s: Sink, mut buf: []u8) {
+    if log.begin(lg, log.LOG_INFO, "job started") {
+        log.kv_str(lg, "job", "import")
+        log.kv_i64(lg, "items", 3)
+        log.end(lg, s, buf)
+    }
+
+    // A DEBUG record, which the loggers below filter out. The `if` is the reason a filtered
+    // record costs one integer comparison instead of a formatted string — and omitting it
+    // would still be correct, just wasteful.
+    if log.begin(lg, log.LOG_DEBUG, "opening source") {
+        log.kv_str(lg, "path", "/tmp/in.csv")
+        log.end(lg, s, buf)
+    }
+
+    log.advance(lg, 250)
+    if log.begin(lg, log.LOG_WARN, JLOG_HOSTILE) {
+        log.kv_str(lg, "peer", "10.0.0.7:9000")
+        log.kv_bool(lg, "retrying", true)
+        log.end(lg, s, buf)
+    }
+
+    log.advance(lg, 750)
+    if log.begin(lg, log.LOG_INFO, "job finished") {
+        log.kv_i64(lg, "written", 3)
+        log.kv_bool(lg, "ok", true)
+        log.end(lg, s, buf)
+    }
+}
+
+// Print a buffer of newline-separated records, one `print_str` per record.
+//
+// Needed because the print intrinsics terminate every write themselves, so handing them a
+// multi-line buffer would add a line that is not in the log — the same asymmetry
+// `std/writer`'s header describes, seen from the reading side.
+fn print_lines(read t: str) {
+    var start: usize = 0
+    for i in 0..t.len {
+        if (t[i] as i32) == 10 {
+            print_str(t[start .. i])
+            start = i + 1
+        }
+    }
+}
+
+// Parse each JSON record and count the ones that came back whole. Returns how many parsed;
+// writes the `msg` of the record at `want_ix` into `seen`, so the caller can compare it to
+// what it logged.
+fn read_back(read a: Allocator, read t: str, want_ix: i64, mut seen: String) -> i64 {
+    var n: i64 = 0
+    var start: usize = 0
+    for i in 0..t.len {
+        if (t[i] as i32) == 10 {
+            let line: str = t[start .. i]
+            start = i + 1
+            var doc: json.Doc = json.parse(a, line)
+            if json.parsed(doc) {
+                let r: isize = json.root(doc)
+                if r >= 0 {
+                    if n == want_ix {
+                        let m: isize = json.get(doc, r as usize, "msg")
+                        if m >= 0 { string_push(seen, json.as_str(doc, m as usize)) }
+                    }
+                    n = n + 1
+                }
+            }
+        }
+    }
+    return n
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+
+    var oraw: *mut u8 = alloc(u8, JLOG_CAP)
+    var obuf: []u8 = slice(u8, oraw, JLOG_CAP)
+
+    print_str("-- jlog --")
+
+    // ---- the same run, for a person ----
+    var s1: Sink = sink.new()
+    var human: log.Logger = log.make(time.manual(1000), writer.to_buffer(), log.LOG_INFO, log.LOG_LOGFMT)
+    run_job(human, s1, obuf)
+    print_str("-- as a person reads it --")
+    print_lines(sink.view(s1, obuf))
+
+    // ---- and for a machine ----
+    var s2: Sink = sink.new()
+    var machine: log.Logger = log.make(time.manual(1000), writer.to_buffer(), log.LOG_INFO, log.LOG_JSON)
+    var jraw: *mut u8 = alloc(u8, JLOG_CAP)
+    var jbuf: []u8 = slice(u8, jraw, JLOG_CAP)
+    run_job(machine, s2, jbuf)
+    print_str("-- as a machine reads it --")
+    print_lines(sink.view(s2, jbuf))
+
+    // ---- the claim, checked ----
+    //
+    // Three records were emitted and one was filtered, so a reader must find exactly three.
+    // A parse failure here would mean the escaping let a value break its own record.
+    print_str("-- read back --")
+    var seen: String = string_new()
+    let parsed: i64 = read_back(a, sink.view(s2, jbuf), 1, seen)
+    print_str("records emitted")
+    print_int(log.emitted(machine))
+    print_str("records parsed back")
+    print_int(parsed)
+    print_str("every emitted record parsed")
+    print_bool(parsed == log.emitted(machine))
+
+    // **The one that matters.** A quote, an `=` and a newline went in; the same bytes must
+    // come out. This is false for every logger that formats by concatenation.
+    print_str("the hostile message survived the round trip")
+    print_bool(str_eq(string_view(seen), JLOG_HOSTILE))
+
+    // And the accounting: one DEBUG record was filtered, nothing was lost any other way.
+    print_str("filtered by level")
+    print_int(log.dropped(machine))
+    print_str("truncated")
+    print_int(log.truncated(machine))
+    print_str("abandoned")
+    print_int(log.abandoned(machine))
+
+    string_free(seen)
+    log.free(machine)
+    log.free(human)
+    free_ptr(jraw)
+    free_ptr(oraw)
+    return 0
+}

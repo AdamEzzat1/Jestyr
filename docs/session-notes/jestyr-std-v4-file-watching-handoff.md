@@ -19,6 +19,12 @@ assume it is yours.
 
 ## §0. START HERE
 
+> **SUPERSEDED for "what to do next" by
+> `docs/session-notes/jestyr-std-v4-logging-handoff.md`.** Structured logging, named below as
+> the next thing to build, **is done** — `std/log` plus `jlog`. Read the successor's §0 first;
+> this note remains the record for file watching, and **§2.6 (a half-mirrored intrinsic no
+> byte-comparing gate could see) is the one every future session should read.**
+
 **File watching is done**, with a real consumer. `std/syswatch` is a
 directory watcher that registers in the event loop as a `Pollable`, and
 `examples/std/syswatch_demo.jtr` is `jwatch` — a debounced rebuild trigger whose transcript
@@ -405,7 +411,7 @@ commands.
 | 1.3 | event loop V1 | ✅ — cancellation, `poll_for`, `Poller` + `watch` |
 | 1.4 | TCP sockets | ✅ |
 | 1.5 | file watching | ✅ **this session** — `std/syswatch`, inotify / change notifications |
-| 1.6 | structured logging | ⬜ — **start here**; no new platform surface |
+| 1.6 | structured logging | ✅ — `std/log`, logfmt + JSON. See the successor note |
 | 1.7 | HTTP/1.1 | ⬜ |
 | 1.8 | tar / reproducible archive | ⬜ |
 | 1.9 | Unicode display width | ⬜ — `std/diag`'s `caret_alignment_is_byte_based_and_tabs_expand` is the pin to invert |
