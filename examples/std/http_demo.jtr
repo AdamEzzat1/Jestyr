@@ -1,0 +1,194 @@
+// examples/std/http_demo.jtr — `jserve`, on a real socket, refusing a real attack.
+//
+// Run:  jestyrc run examples/std/http_demo.jtr
+//
+// ─── What this demonstrates ───────────────────────────────────────────────────
+//
+// `std/http` is a parser over a byte buffer and is tested that way, with no network. This puts
+// it on a REAL loopback socket, through `std/sysnet`, so the whole path is exercised: bytes
+// arrive in pieces from a kernel, the parser says whether it has a message yet, and a response
+// goes back out.
+//
+// Three requests, and the second and third are the point:
+//
+//   1. an ordinary GET                  -> 200, with a body
+//   2. a REQUEST-SMUGGLING attempt      -> 400, refused as ambiguous
+//   3. a chunked POST                   -> 200, with the decoded body echoed back
+//
+// **Request 2 is a real attack, not a malformed message.** It carries both `Content-Length`
+// and `Transfer-Encoding: chunked`, so a front-end proxy and a back-end server disagree about
+// where it ends — and the bytes after it become a second request the attacker wrote,
+// attributed to whoever uses the connection next. Every byte of it is well-formed. A lenient
+// parser answers 200.
+//
+// The server is single-threaded and handles one connection at a time, which is what makes the
+// transcript exact: client and server take turns in one process, so there is no scheduling to
+// depend on.
+
+import "http"
+import "sysnet"
+import "sink"
+import "mem"
+
+const SERVE_CAP: usize = 8192
+
+fn nothing() { }
+
+// Answer one request on `conn`: read until the parser says it has a whole message, then reply.
+//
+// **The read loop is the reason `HTTP_INCOMPLETE` exists.** Bytes arrive in whatever pieces the
+// kernel felt like, so "is this a message yet" is a question asked after every read — and a
+// parser with only ok/bad would have to guess, dropping every request that arrived in two
+// packets.
+fn serve_one(mut net: sysnet.Net, read conn: sysnet.Socket, mut buf: []u8, mut hs: []http.Header) {
+    var have: usize = 0
+    var req: http.Request = http.empty_request()
+    var status: i32 = http.HTTP_INCOMPLETE
+    for have < buf.len {
+        // The window is hoisted into a local rather than written inline: a slice RANGE as an
+        // argument to a call carrying a `catch` is refused by the backend (`does not support
+        // ranges yet`), though the same range is fine in a call without one.
+        var win: []u8 = buf[have .. buf.len]
+        let n: usize = sysnet.recv_bytes(conn, win) catch 0
+        if n == 0 { break }
+        have = have + n
+        status = http.parse_request(buf[0 .. have], hs, req)
+        if status != http.HTTP_INCOMPLETE { break }
+    }
+
+    var oraw: *mut u8 = alloc(u8, SERVE_CAP)
+    var obuf: []u8 = slice(u8, oraw, SERVE_CAP)
+    var s: Sink = sink.new()
+
+    if status == http.HTTP_OK {
+        // Echo the decoded body, so a chunked request proves it was really decoded rather than
+        // merely accepted.
+        var braw: *mut u8 = alloc(u8, SERVE_CAP)
+        var body: []u8 = slice(u8, braw, SERVE_CAP)
+        var blen: usize = 0
+        if req.chunked {
+            let d: isize = http.decode_chunked(buf[0 .. have], req.body, body)
+            if d > 0 { blen = d as usize }
+        } else {
+            var i: usize = 0
+            for i < req.body.len {
+                body[i] = buf[req.body.off + i]
+                i = i + 1
+            }
+            blen = req.body.len
+        }
+        http.begin_response(s, obuf, 200, "OK")
+        http.put_header(s, obuf, "Content-Type", "text/plain")
+        http.put_content_length(s, obuf, blen + 5)
+        http.end_headers(s, obuf)
+        sink.put_str(s, obuf, "got:")
+        sink.put_str(s, obuf, from_utf8(body[0 .. blen]))
+        sink.put_str(s, obuf, ".")
+        free_ptr(braw)
+    } else {
+        // **The refusal is reported with WHICH refusal it was.** Both are a 400 to the client,
+        // but the reason phrase tells an operator whether they are looking at a broken client
+        // or an attack — which is why `HTTP_AMBIGUOUS` is its own answer.
+        http.begin_response(s, obuf, 400, http.outcome_name(status))
+        http.put_content_length(s, obuf, 0)
+        http.end_headers(s, obuf)
+    }
+    var wire: []u8 = obuf[0 .. sink.written(s)]
+    sysnet.send_all(conn, wire) catch 0
+    free_ptr(oraw)
+}
+
+// Send `text` to a fresh connection, read the reply, and print its first line.
+fn ask(mut net: sysnet.Net, read addr: sysnet.SocketAddr, read lis: sysnet.Socket,
+       read text: str, mut buf: []u8, mut hs: []http.Header, read label: str) {
+    print_str(label)
+    var cli: sysnet.Socket = sysnet.connect_to(net, addr) catch sysnet.closed()
+    if sysnet.is_open(cli) == false {
+        print_str("could not connect")
+        return
+    }
+    var sraw: *mut u8 = alloc(u8, SERVE_CAP)
+    var sbuf: []u8 = slice(u8, sraw, SERVE_CAP)
+    var i: usize = 0
+    for i < text.len {
+        sbuf[i] = text[i]
+        i = i + 1
+    }
+    var outgoing: []u8 = sbuf[0 .. text.len]
+    sysnet.send_all(cli, outgoing) catch 0
+
+    // Accept and answer in the same thread. The client's bytes are already in the kernel's
+    // buffer, so the server never waits on a peer that is not there.
+    var conn: sysnet.Socket = sysnet.accept_one(net, lis) catch sysnet.closed()
+    serve_one(net, conn, buf, hs)
+    sysnet.close_socket(conn) catch nothing()
+
+    var rraw: *mut u8 = alloc(u8, SERVE_CAP)
+    var rbuf: []u8 = slice(u8, rraw, SERVE_CAP)
+    let got: usize = sysnet.recv_bytes(cli, rbuf) catch 0
+    print_str(first_line(from_utf8(rbuf[0 .. got])))
+    print_str(body_of(from_utf8(rbuf[0 .. got])))
+    free_ptr(rraw)
+    free_ptr(sraw)
+    sysnet.close_socket(cli) catch nothing()
+}
+
+fn first_line(read t: str) -> read str {
+    for i in 0..t.len {
+        if (t[i] as i32) == 13 { return t[0 .. i] }
+    }
+    return t
+}
+
+// Everything after the blank line, or "" if there is none.
+fn body_of(read t: str) -> read str {
+    var i: usize = 0
+    for i + 3 < t.len {
+        if (t[i] as i32) == 13 and (t[i + 1] as i32) == 10 and (t[i + 2] as i32) == 13 and (t[i + 3] as i32) == 10 {
+            return t[i + 4 .. t.len]
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn main() -> i32 {
+    var net: sysnet.Net = sysnet.host()
+    var lis: sysnet.Socket = sysnet.listen_on(net, sysnet.loopback(0), 8) catch sysnet.closed()
+    if sysnet.is_open(lis) == false {
+        print_str("could not listen")
+        return 1
+    }
+    // Port 0 asks the kernel to choose, so the demo cannot collide with anything on the
+    // machine — and `local_addr` reports which it picked.
+    let bound: sysnet.SocketAddr = sysnet.local_addr(lis) catch sysnet.addr(0, 0)
+
+    var braw: *mut u8 = alloc(u8, SERVE_CAP)
+    var buf: []u8 = slice(u8, braw, SERVE_CAP)
+    var hraw: *mut http.Header = alloc(http.Header, 32)
+    var hs: []http.Header = slice(http.Header, hraw, 32)
+
+    print_str("-- jserve --")
+
+    ask(net, sysnet.loopback(bound.port), lis,
+        "GET /hello HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nworld",
+        buf, hs, "-- an ordinary request --")
+
+    // **A real request-smuggling attempt.** Both framing headers, so a proxy and an origin
+    // disagree about where this message ends. Every byte is well-formed.
+    ask(net, sysnet.loopback(bound.port), lis,
+        "POST /pay HTTP/1.1\r\nHost: localhost\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET /admin HTTP/1.1\r\n\r\n",
+        buf, hs, "-- a request-smuggling attempt --")
+
+    ask(net, sysnet.loopback(bound.port), lis,
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n there\r\n0\r\n\r\n",
+        buf, hs, "-- a chunked request --")
+
+    print_str("-- the server refused the attack and kept serving --")
+
+    free_ptr(hraw)
+    free_ptr(braw)
+    sysnet.close_socket(lis) catch nothing()
+    sysnet.shutdown(net)
+    return 0
+}

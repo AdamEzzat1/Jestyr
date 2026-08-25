@@ -1,0 +1,332 @@
+// std/tar.jtr — a tar archive that is byte-identical every time you build it.
+//
+// TIER: `core`. An archive is bytes in a buffer you own. Nothing here opens a file, so the
+// whole format — including the header checksum, which is where tar writers are actually wrong
+// — is a pure function and runs on any host.
+//
+// ─── "Reproducible" is the requirement, and it is a claim you can check ───────
+//
+// The brief asks for a *reproducible* archive, so the question is what makes an archive differ
+// from one built a second later from identical inputs. Four things, and this module removes
+// all four **by default rather than by option**:
+//
+//   * **mtime.** The single largest source of irreproducibility. Written as 0.
+//   * **uid / gid**, and their names. Written as 0 and empty — they describe the machine that
+//     built the archive, not the thing being archived.
+//   * **mode.** Whatever the source file happens to carry, including a umask nobody chose.
+//     Written as 0644 for a file and 0755 for a directory.
+//   * **ENTRY ORDER.** A directory walk's order is the filesystem's, not the program's, and
+//     it changes when files are rewritten. That one this module cannot fix, because it never
+//     sees a directory — **the caller must add entries in a deterministic order**, and
+//     `std/walk` already sorts for exactly this reason. Said out loud because it is the one
+//     leak left, and a module that silently depended on its caller for its headline property
+//     would be making a promise it does not keep.
+//
+// Those are DEFAULTS with no override, which is a real restriction: an archive that must
+// preserve real timestamps cannot use this module. That is the correct trade for a format
+// whose stated purpose here is reproducibility — an option to write real mtimes is an option
+// to produce a different archive every time, which is the thing being prevented.
+//
+// `an_archive_of_the_same_entries_is_byte_identical` builds one twice and compares, which is
+// the only way this claim can be believed.
+//
+// ─── The header, and the checksum quirk that everybody gets wrong ─────────────
+//
+// USTAR, 512-byte blocks:
+//
+//     0   100  name          157 100  linkname
+//     100   8  mode          257   6  magic "ustar\0"
+//     108   8  uid           263   2  version "00"
+//     116   8  gid           265  32  uname
+//     124  12  size          297  32  gname
+//     136  12  mtime         329   8  devmajor
+//     148   8  chksum        337   8  devminor
+//     156   1  typeflag      345 155  prefix
+//
+// **The checksum is computed with its own field filled with SPACES**, not with zeros and not
+// with the checksum. That is the detail: a writer that sums the zeroed field produces an
+// archive every real `tar` rejects, and a writer that sums it after writing produces one that
+// cannot be verified at all. `the_checksum_is_computed_over_spaces` pins it, and
+// `a_real_ustar_header_has_the_bytes_the_format_specifies` asserts the magic and the field
+// offsets so a mistake is a red test rather than an archive `tar` cannot read.
+//
+// Numeric fields are OCTAL, NUL-terminated, right-aligned with leading zeros — an ASCII format
+// from 1979, and every field is a fixed width that a value can overrun.
+//
+// ─── The limits, which are REFUSALS ───────────────────────────────────────────
+//
+// A name longer than 100 bytes, or a file larger than 8 GiB, does not fit a USTAR header. This
+// module **refuses** rather than truncating: a silently shortened path produces an archive
+// that extracts to the wrong place, which is a security bug as much as a correctness one.
+//
+// The `prefix` field can carry a longer path split at a `/`, and GNU and PAX have their own
+// extensions for longer still. Neither is implemented, and the refusal is what makes that
+// safe to say — a caller learns at pack time rather than at extract time.
+//
+// ─── What this does NOT do ────────────────────────────────────────────────────
+//
+// No compression — that is `gzip`'s job and a separate format. No symlinks, hard links, device
+// nodes, sparse files, extended attributes, or PAX records. No extraction to disk: `read_entry`
+// hands back a header and a body span, and what a caller does with it — including deciding
+// whether the path is safe to write — is deliberately the caller's. **A tar extractor that
+// writes wherever the archive says is the `../../etc/passwd` vulnerability**, and this module
+// not extracting is what keeps it out of the blast radius.
+//
+// Worked example:  examples/std/tar_demo.jtr
+// Run the tests:   jestyrc test examples/std/tar_test.jtr
+
+// ---- the format ------------------------------------------------------------------
+
+pub const TAR_BLOCK: usize = 512
+pub const TAR_NAME_MAX: usize = 100
+
+pub const TAR_TYPE_FILE: i32 = 48          // '0'
+pub const TAR_TYPE_DIR: i32 = 53           // '5'
+
+// The reproducible defaults. See the header for why these are not options.
+pub const TAR_MODE_FILE: i64 = 420         // 0644
+pub const TAR_MODE_DIR: i64 = 493          // 0755
+
+// What a write can answer.
+pub const TAR_OK: i32 = 0
+pub const TAR_NAME_TOO_LONG: i32 = 1
+pub const TAR_TOO_BIG: i32 = 2
+pub const TAR_NO_ROOM: i32 = 3             // the caller's buffer is full
+pub const TAR_BAD: i32 = 4                 // reading: not a valid archive
+pub const TAR_END: i32 = 5                 // reading: the end-of-archive marker
+
+@no_alloc @no_os pub fn outcome_name(o: i32) -> str {
+    if o == TAR_OK { return "ok" }
+    if o == TAR_NAME_TOO_LONG { return "name-too-long" }
+    if o == TAR_TOO_BIG { return "too-big" }
+    if o == TAR_NO_ROOM { return "no-room" }
+    if o == TAR_END { return "end" }
+    return "bad"
+}
+
+// The largest size a 12-byte octal field can hold: 8^11 - 1, one byte being the NUL.
+pub const TAR_MAX_SIZE: i64 = 8589934591
+
+// ---- writing ----------------------------------------------------------------------
+
+@no_alloc @no_os fn zero(mut b: []u8, at: usize, n: usize) {
+    var i: usize = 0
+    for i < n {
+        b[at + i] = 0 as u8
+        i = i + 1
+    }
+}
+
+@no_alloc @no_os fn put_bytes(mut b: []u8, at: usize, read s: str) {
+    for i in 0..s.len {
+        b[at + i] = s[i]
+    }
+}
+
+// An octal field: `width - 1` digits, zero-padded, then a NUL. The 1979 convention, and the
+// reason every size in a tar file is a string.
+@no_alloc @no_os fn put_octal(mut b: []u8, at: usize, width: usize, v: i64) {
+    let digits: usize = width - 1
+    var x: i64 = v
+    var i: usize = digits
+    for i > 0 {
+        b[at + i - 1] = (48 + (x % 8)) as u8
+        x = x / 8
+        i = i - 1
+    }
+    b[at + digits] = 0 as u8
+}
+
+// **The checksum, computed with its own field taken as eight SPACES.** See the header: this is
+// the detail a tar writer gets wrong, and getting it wrong produces an archive that every real
+// `tar` refuses.
+//
+// Public and pure so the rule is testable directly rather than only through a round trip.
+@no_alloc @no_os pub fn header_checksum(read blk: []u8) -> i64 {
+    var sum: i64 = 0
+    var i: usize = 0
+    for i < TAR_BLOCK {
+        if i >= 148 and i < 156 {
+            sum = sum + 32                     // the chksum field reads as spaces
+        } else {
+            sum = sum + (blk[i] as i64)
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+// Write one entry's 512-byte header at `at`.
+@no_alloc @no_os fn put_header(mut b: []u8, at: usize, read name: str, size: i64, kind: i32) {
+    zero(b, at, TAR_BLOCK)
+    put_bytes(b, at, name)
+    put_octal(b, at + 100, 8, mode_for(kind))
+    put_octal(b, at + 108, 8, 0)               // uid  — the build machine's, so it is 0
+    put_octal(b, at + 116, 8, 0)               // gid
+    put_octal(b, at + 124, 12, size)
+    put_octal(b, at + 136, 12, 0)              // mtime — the largest source of drift
+    b[at + 156] = kind as u8
+    put_bytes(b, at + 257, "ustar")
+    b[at + 262] = 0 as u8
+    b[at + 263] = 48 as u8                     // version "00"
+    b[at + 264] = 48 as u8
+    // uname/gname stay empty: they name accounts on the machine that packed the archive.
+
+    // The checksum LAST, over a block whose checksum field is still zero — `header_checksum`
+    // substitutes spaces itself, so the two can never disagree about what was summed.
+    let sum: i64 = header_checksum(b[at .. at + TAR_BLOCK])
+    put_octal(b, at + 148, 7, sum)             // six digits, NUL...
+    b[at + 155] = 32 as u8                     // ...then a space, which is the format's shape
+}
+
+@no_alloc @no_os fn mode_for(kind: i32) -> i64 {
+    if kind == TAR_TYPE_DIR { return TAR_MODE_DIR }
+    return TAR_MODE_FILE
+}
+
+// An archive being built into a caller's buffer.
+pub struct Archive {
+    at: usize,
+    entries: i64,
+}
+
+@no_alloc @no_os pub fn begin() -> Archive {
+    return Archive{ at: 0, entries: 0 }
+}
+
+@no_alloc @no_os pub fn written(read ar: Archive) -> usize { return ar.at }
+@no_alloc @no_os pub fn entries(read ar: Archive) -> i64 { return ar.entries }
+
+// Add a file. Returns `TAR_OK`, or a refusal.
+//
+// **A name that does not fit is refused, never truncated.** A silently shortened path extracts
+// to the wrong place, which is a security bug and not merely a wrong archive.
+@no_alloc @no_os pub fn add_file(mut ar: Archive, mut b: []u8, read name: str, read data: []u8) -> i32 {
+    if name.len == 0 or name.len > TAR_NAME_MAX { return TAR_NAME_TOO_LONG }
+    if (data.len as i64) > TAR_MAX_SIZE { return TAR_TOO_BIG }
+    let padded: usize = ((data.len + TAR_BLOCK - 1) / TAR_BLOCK) * TAR_BLOCK
+    if ar.at + TAR_BLOCK + padded > b.len { return TAR_NO_ROOM }
+
+    put_header(b, ar.at, name, data.len as i64, TAR_TYPE_FILE)
+    ar.at = ar.at + TAR_BLOCK
+    var i: usize = 0
+    for i < data.len {
+        b[ar.at + i] = data[i]
+        i = i + 1
+    }
+    // **The tail of the last block is zeroed**, not left as whatever the buffer held. An
+    // archive whose padding carries stale bytes is a different archive every run — and, worse,
+    // leaks whatever was in that memory.
+    zero(b, ar.at + data.len, padded - data.len)
+    ar.at = ar.at + padded
+    ar.entries = ar.entries + 1
+    return TAR_OK
+}
+
+// Add a directory entry. It has no body, and its name conventionally ends in `/`.
+@no_alloc @no_os pub fn add_dir(mut ar: Archive, mut b: []u8, read name: str) -> i32 {
+    if name.len == 0 or name.len > TAR_NAME_MAX { return TAR_NAME_TOO_LONG }
+    if ar.at + TAR_BLOCK > b.len { return TAR_NO_ROOM }
+    put_header(b, ar.at, name, 0, TAR_TYPE_DIR)
+    ar.at = ar.at + TAR_BLOCK
+    ar.entries = ar.entries + 1
+    return TAR_OK
+}
+
+// Close the archive: two zero blocks, which is what tells a reader it ended deliberately
+// rather than being truncated.
+@no_alloc @no_os pub fn finish(mut ar: Archive, mut b: []u8) -> i32 {
+    if ar.at + 2 * TAR_BLOCK > b.len { return TAR_NO_ROOM }
+    zero(b, ar.at, 2 * TAR_BLOCK)
+    ar.at = ar.at + 2 * TAR_BLOCK
+    return TAR_OK
+}
+
+// ---- reading ------------------------------------------------------------------------
+
+// One entry, as views into the caller's buffer. Nothing is copied.
+@copy pub struct Entry {
+    pub name_off: usize,
+    pub name_len: usize,
+    pub body_off: usize,
+    pub body_len: usize,
+    pub kind: i32,
+    pub next: usize,               // where the following entry's header begins
+}
+
+@no_alloc @no_os pub fn entry_name(read e: Entry, read b: []u8) -> str {
+    if e.name_len == 0 { return "" }
+    return from_utf8(b[e.name_off .. e.name_off + e.name_len])
+}
+
+@no_alloc @no_os pub fn empty_entry() -> Entry {
+    return Entry{ name_off: 0, name_len: 0, body_off: 0, body_len: 0, kind: 0, next: 0 }
+}
+
+// Read the entry whose header starts at `at`.
+//
+// **The checksum is verified**, which is what makes "bad" a real answer rather than a guess: a
+// block of arbitrary bytes will not sum correctly, so a truncated or corrupted archive is
+// detected at the entry rather than by producing a garbage filename.
+@no_alloc @no_os pub fn read_entry(read b: []u8, at: usize, mut e: Entry) -> i32 {
+    e = empty_entry()
+    if at + TAR_BLOCK > b.len { return TAR_BAD }
+    if all_zero(b, at) {
+        // One zero block is the end marker. Two is the proper one, but a single trailing block
+        // is common enough in the wild that refusing it would reject working archives.
+        return TAR_END
+    }
+    if match_at(b, at + 257, "ustar") == false { return TAR_BAD }
+    let want: i64 = read_octal(b, at + 148, 8)
+    if want < 0 { return TAR_BAD }
+    if header_checksum(b[at .. at + TAR_BLOCK]) != want { return TAR_BAD }
+
+    var n: usize = 0
+    for n < TAR_NAME_MAX {
+        if (b[at + n] as i32) == 0 { break }
+        n = n + 1
+    }
+    let size: i64 = read_octal(b, at + 124, 12)
+    if size < 0 { return TAR_BAD }
+    let body: usize = at + TAR_BLOCK
+    if body + (size as usize) > b.len { return TAR_BAD }
+    let padded: usize = (((size as usize) + TAR_BLOCK - 1) / TAR_BLOCK) * TAR_BLOCK
+
+    e = Entry{ name_off: at, name_len: n, body_off: body, body_len: size as usize,
+               kind: b[at + 156] as i32, next: body + padded }
+    return TAR_OK
+}
+
+@no_alloc @no_os fn all_zero(read b: []u8, at: usize) -> bool {
+    var i: usize = 0
+    for i < TAR_BLOCK {
+        if (b[at + i] as i32) != 0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+@no_alloc @no_os fn match_at(read b: []u8, at: usize, read want: str) -> bool {
+    if at + want.len > b.len { return false }
+    for i in 0..want.len {
+        if (b[at + i] as i32) != (want[i] as i32) { return false }
+    }
+    return true
+}
+
+// Read an octal field, stopping at the first NUL or space. -1 if it is not octal.
+@no_alloc @no_os fn read_octal(read b: []u8, at: usize, width: usize) -> i64 {
+    var v: i64 = 0
+    var seen: bool = false
+    var i: usize = 0
+    for i < width {
+        let c: i32 = b[at + i] as i32
+        if c == 0 or c == 32 { break }
+        if c < 48 or c > 55 { return 0 - 1 }
+        v = v * 8 + (c - 48) as i64
+        seen = true
+        i = i + 1
+    }
+    if seen == false { return 0 - 1 }
+    return v
+}

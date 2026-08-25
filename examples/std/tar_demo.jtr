@@ -1,0 +1,125 @@
+// examples/std/tar_demo.jtr — `jpack`, and the claim it checks on itself.
+//
+// Run:  jestyrc run examples/std/tar_demo.jtr
+//
+// ─── What this demonstrates ───────────────────────────────────────────────────
+//
+// A reproducible archive is one that is byte-identical when built again from identical inputs,
+// so the demonstration is not "here is an archive" — it is **building the same archive twice
+// and comparing every byte**, then writing it out and reading it back.
+//
+// The archive this produces is a real USTAR file. It was verified against the system `tar`
+// while this was written; that check is recorded in the handoff note rather than run here,
+// because a demo whose transcript depends on which `tar` is installed is a demo that fails on
+// someone else's machine for a reason that is not a bug.
+
+import "tar"
+import "file"
+import "fs"
+import "mem"
+
+const PACK_CAP: usize = 8192
+const PACK_PATH: str = "zz_jpack.tar"
+
+fn load(mut buf: []u8, read text: str) -> usize {
+    for i in 0..text.len {
+        buf[i] = text[i]
+    }
+    return text.len
+}
+
+// The archive's contents, in ONE place so both builds are provably the same inputs.
+//
+// **Entry order is the caller's responsibility** and this is where it is discharged: a fixed
+// sequence here, where a directory walk would need `std/walk`'s sort. That is the one leak in
+// the reproducibility claim the module cannot close for itself.
+fn pack(mut ar: tar.Archive, mut b: []u8, mut scratch: []u8) -> usize {
+    let n1: usize = load(scratch, "# jpack\nA reproducible archive.\n")
+    tar.add_file(ar, b, "README.md", scratch[0 .. n1])
+    tar.add_dir(ar, b, "src/")
+    let n2: usize = load(scratch, "fn main() -> i32 { return 0 }\n")
+    tar.add_file(ar, b, "src/main.jtr", scratch[0 .. n2])
+    tar.finish(ar, b)
+    return tar.written(ar)
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    fs.erase(h, PACK_PATH)
+
+    var sraw: *mut u8 = alloc(u8, 512)
+    var scratch: []u8 = slice(u8, sraw, 512)
+    var r1: *mut u8 = alloc(u8, PACK_CAP)
+    var b1: []u8 = slice(u8, r1, PACK_CAP)
+    var r2: *mut u8 = alloc(u8, PACK_CAP)
+    var b2: []u8 = slice(u8, r2, PACK_CAP)
+
+    // Dirty both buffers differently, so any byte the packer does not write shows up as a
+    // difference rather than as a coincidence.
+    var i: usize = 0
+    for i < PACK_CAP {
+        b1[i] = 219 as u8
+        b2[i] = 7 as u8
+        i = i + 1
+    }
+
+    print_str("-- jpack --")
+
+    var ar1: tar.Archive = tar.begin()
+    let n1: usize = pack(ar1, b1, scratch)
+    var ar2: tar.Archive = tar.begin()
+    let n2: usize = pack(ar2, b2, scratch)
+
+    print_str("entries")
+    print_int(tar.entries(ar1))
+    print_str("archive bytes")
+    print_int(n1 as i64)
+
+    var same: bool = n1 == n2
+    var k: usize = 0
+    for k < n1 {
+        if b1[k] != b2[k] { same = false  break }
+        k = k + 1
+    }
+    print_str("built twice, byte-identical")
+    print_bool(same)
+
+    // Write it out, then read it back through the module's own reader.
+    var w: file.Writer = file.create_path(a, PACK_PATH)
+    file.write_from(w, b1[0 .. n1])
+    let put: usize = file.finish(w) catch 0
+    print_str("written to disk")
+    print_bool(put == n1)
+
+    var rd: file.Reader = file.open_path(a, PACK_PATH)
+    var raw3: *mut u8 = alloc(u8, PACK_CAP)
+    var b3: []u8 = slice(u8, raw3, PACK_CAP)
+    let got: usize = file.read_into(rd, b3)
+    file.close(rd)
+    print_str("read back the same bytes")
+    var back: bool = got == n1
+    var j: usize = 0
+    for j < got {
+        if b3[j] != b1[j] { back = false  break }
+        j = j + 1
+    }
+    print_bool(back)
+
+    print_str("-- listing --")
+    var e: tar.Entry = tar.empty_entry()
+    var at: usize = 0
+    for true {
+        let st: i32 = tar.read_entry(b3[0 .. got], at, e)
+        if st != tar.TAR_OK { break }
+        print_str(tar.entry_name(e, b3))
+        at = e.next
+    }
+
+    fs.erase(h, PACK_PATH)
+    free_ptr(raw3)
+    free_ptr(r2)
+    free_ptr(r1)
+    free_ptr(sraw)
+    return 0
+}

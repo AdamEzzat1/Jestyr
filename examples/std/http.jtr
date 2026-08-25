@@ -1,0 +1,566 @@
+// std/http.jtr — HTTP/1.1, and the ambiguities it refuses to resolve.
+//
+// TIER: `core` for the parser and the serializer — no allocation, no operating system, no
+// sockets. A message is bytes in a buffer you own, and every function here is a pure function
+// of those bytes. `examples/std/http_demo.jtr` is what puts it on a socket.
+//
+// That split is deliberate and it is the whole reason this module is testable: **the part of
+// an HTTP implementation that is dangerous is the parser, and the parser needs no network.**
+//
+// ─── What this module is actually for ─────────────────────────────────────────
+//
+// Not "parsing HTTP" — that is easy and every implementation does it. The job is REFUSING
+// ambiguity, because an HTTP message that two implementations read differently is the entire
+// request-smuggling vulnerability class:
+//
+//   * A message with BOTH `Content-Length` and `Transfer-Encoding: chunked`. A front-end proxy
+//     honours one, the back-end honours the other, and one request becomes two — the second
+//     one attacker-controlled and attributed to the next client on the connection.
+//   * Two `Content-Length` headers that disagree, for the same reason.
+//   * A `Content-Length` that is not a plain decimal number: `+10`, `0x10`, ` 10`, `10 `.
+//     Implementations that are generous here disagree about the value.
+//
+// RFC 9112 says a recipient that cannot resolve these **must** reject the message. So
+// `HTTP_AMBIGUOUS` is its own answer, distinct from `HTTP_BAD` — not because a caller acts on
+// it differently (both are a 400) but because they are different BUGS, and a log that
+// distinguishes them tells an operator whether they are looking at a broken client or an
+// attack.
+//
+// ─── The three answers a parser must give, not two ────────────────────────────
+//
+//   HTTP_OK          a complete message is here
+//   HTTP_INCOMPLETE  what is here is valid so far; read more
+//   HTTP_BAD         it is malformed and no amount of reading will fix it
+//   HTTP_AMBIGUOUS   it is well-formed and its framing is contradictory
+//   HTTP_TOO_LARGE   it exceeded a bound before finishing
+//
+// **`HTTP_INCOMPLETE` is the one a naive parser omits**, and omitting it makes a streaming
+// server unable to tell a slow client from a hostile one: with only ok/bad, a half-arrived
+// request is "bad" and the connection is dropped on every slow network.
+//
+// ─── Everything is BOUNDED, and that is a security property ───────────────────
+//
+// An unbounded parser is a denial of service: a client that opens a connection and sends
+// header bytes forever costs the server memory forever. So there is a maximum line length, a
+// maximum header count, and a maximum start-line length, and exceeding any of them is
+// `HTTP_TOO_LARGE` rather than a crash or an allocation. Slowloris is not solved here — that
+// needs timeouts, which need the runtime — but the memory half is.
+//
+// ─── CRLF is required, and leniency is a VULNERABILITY ────────────────────────
+//
+// Lines end with CRLF. A bare LF is refused. That is stricter than some servers, and the
+// strictness is the point: RFC 9112 permits a recipient to accept a bare LF, and the moment
+// two implementations differ about whether `\n` alone ends a line, a message can be split
+// differently by each — which is the same smuggling mechanism as the header conflict above.
+// **Being generous about framing is how this goes wrong.** Being generous about SEMANTICS
+// (an unknown method, an unknown header) is fine and this module is.
+//
+// ─── Zero copies ──────────────────────────────────────────────────────────────
+//
+// Nothing here copies a byte of the message. A `Request` holds `Span`s — offsets into the
+// caller's buffer — so parsing a request costs no allocation at all and a header's value is a
+// view. That is the same shape `std/syswatch`'s `Change` and `std/diag`'s labels take, and it
+// is what lets the parser be `@no_alloc`.
+//
+// ─── What this does NOT do ────────────────────────────────────────────────────
+//
+// No TLS. No compression. No HTTP/2 or /3 — those are different protocols that share a name.
+// No connection management, no keep-alive state machine, no timeouts, no redirect following,
+// no cookie jar, no URL parsing beyond taking the target as bytes. Chunked bodies are
+// DECODED but this module does not encode them: a server that knows its body length should
+// send `Content-Length`, and one that does not needs the streaming API this does not have.
+//
+// Worked example:  examples/std/http_demo.jtr
+// Run the tests:   jestyrc test examples/std/http_test.jtr
+
+import "sink"
+import "str"
+
+// ---- outcomes ---------------------------------------------------------------------
+
+pub const HTTP_OK: i32 = 0
+pub const HTTP_INCOMPLETE: i32 = 1
+pub const HTTP_BAD: i32 = 2
+pub const HTTP_AMBIGUOUS: i32 = 3
+pub const HTTP_TOO_LARGE: i32 = 4
+
+@no_alloc @no_os pub fn outcome_name(o: i32) -> str {
+    if o == HTTP_OK { return "ok" }
+    if o == HTTP_INCOMPLETE { return "incomplete" }
+    if o == HTTP_BAD { return "bad" }
+    if o == HTTP_AMBIGUOUS { return "ambiguous" }
+    return "too-large"
+}
+
+// ---- bounds ------------------------------------------------------------------------
+//
+// See the header: an unbounded parser is a denial of service, so every one of these is a
+// refusal rather than a crash.
+
+pub const HTTP_MAX_LINE: usize = 8192          // any single header or start line
+pub const HTTP_MAX_HEADERS: usize = 100
+
+// ---- spans ---------------------------------------------------------------------------
+
+// A view into the caller's buffer. Nothing in this module copies a byte of the message.
+@copy pub struct Span {
+    pub off: usize,
+    pub len: usize,
+}
+
+@no_alloc @no_os pub fn span_str(read s: Span, read buf: []u8) -> str {
+    if s.len == 0 { return "" }
+    if s.off + s.len > buf.len { return "" }
+    return from_utf8(buf[s.off .. s.off + s.len])
+}
+
+@copy pub struct Header {
+    pub name: Span,
+    pub value: Span,
+}
+
+// A parsed request. Every field is a view; `body` is what followed the headers, already
+// framed by `Content-Length` or by chunked decoding.
+pub struct Request {
+    pub method: Span,
+    pub target: Span,
+    pub minor: i32,               // the `1` in HTTP/1.1
+    pub headers: usize,           // how many entries of the caller's array are filled
+    pub body: Span,
+    pub chunked: bool,
+    pub total: usize,             // bytes of the buffer this message consumed
+}
+
+@no_alloc @no_os pub fn empty_request() -> Request {
+    return Request{ method: Span{ off: 0, len: 0 }, target: Span{ off: 0, len: 0 }, minor: 1,
+                    headers: 0, body: Span{ off: 0, len: 0 }, chunked: false, total: 0 }
+}
+
+// ---- character classes ---------------------------------------------------------------
+
+@no_alloc @no_os fn is_digit(c: i32) -> bool { return c >= 48 and c <= 57 }
+
+// An RFC 9110 `tchar`: what a method name and a header NAME may contain. Anything else in a
+// header name is a malformed message, not an unknown header.
+@no_alloc @no_os fn is_tchar(c: i32) -> bool {
+    if c >= 97 and c <= 122 { return true }        // a-z
+    if c >= 65 and c <= 90 { return true }         // A-Z
+    if is_digit(c) { return true }
+    if c == 33 { return true }                     // !
+    if c >= 35 and c <= 39 { return true }         // # $ % & '
+    if c == 42 or c == 43 { return true }          // * +
+    if c == 45 or c == 46 { return true }          // - .
+    if c == 94 or c == 95 or c == 96 { return true }   // ^ _ `
+    if c == 124 or c == 126 { return true }        // | ~
+    return false
+}
+
+// A byte that may appear in a header VALUE. Deliberately permissive — an unknown value is
+// semantics, not framing — but CR, LF and NUL are refused, because those are the bytes that
+// would end the field somewhere the sender did not intend.
+@no_alloc @no_os fn is_value_byte(c: i32) -> bool {
+    if c == 13 or c == 10 or c == 0 { return false }
+    return true
+}
+
+// ASCII lower-case, for case-insensitive header names. HTTP field names are case-insensitive
+// and a parser that compares them exactly will miss `content-length` from a client that spells
+// it that way — which every second client does.
+@no_alloc @no_os fn lower(c: i32) -> i32 {
+    if c >= 65 and c <= 90 { return c + 32 }
+    return c
+}
+
+// Is the header at `h` named `name` (which must be given lower-case)?
+@no_alloc @no_os pub fn header_is(read h: Header, read buf: []u8, read name: str) -> bool {
+    if h.name.len != name.len { return false }
+    for i in 0..name.len {
+        if lower(buf[h.name.off + i] as i32) != (name[i] as i32) { return false }
+    }
+    return true
+}
+
+// The value of the first header named `name`, or "" if there is none.
+@no_alloc @no_os pub fn header_value(read hs: []Header, n: usize, read buf: []u8, read name: str) -> str {
+    var i: usize = 0
+    for i < n {
+        if header_is(hs[i], buf, name) { return span_str(hs[i].value, buf) }
+        i = i + 1
+    }
+    return ""
+}
+
+// ---- the parser ------------------------------------------------------------------------
+
+// Find the CRLF ending the line starting at `at`. Returns the offset of the CR, or -1 if the
+// line is not complete yet, or -2 if it is malformed.
+//
+// **A bare LF is malformed, not a line ending.** See the header: leniency about framing is a
+// smuggling vector, and this is the single place framing is decided.
+@no_alloc @no_os fn line_end(read buf: []u8, at: usize) -> isize {
+    var i: usize = at
+    for i < buf.len {
+        let c: i32 = buf[i] as i32
+        if c == 10 { return 0 - 2 }                 // a bare LF
+        if c == 13 {
+            if i + 1 >= buf.len { return 0 - 1 }    // CR at the edge: might be CRLF
+            if (buf[i + 1] as i32) != 10 { return 0 - 2 }
+            return i as isize
+        }
+        if i - at >= HTTP_MAX_LINE { return 0 - 3 } // too long
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Parse a request out of `buf`, filling `hs` with its headers. Returns one of the outcomes.
+//
+// `req.total` is how many bytes of the buffer the message occupied, so a caller driving a
+// connection knows where the next one begins.
+@no_alloc @no_os pub fn parse_request(read buf: []u8, mut hs: []Header, mut req: Request) -> i32 {
+    req = empty_request()
+    if buf.len == 0 { return HTTP_INCOMPLETE }
+
+    // ---- the start line: METHOD SP TARGET SP HTTP/1.N CRLF ----
+    let e0: isize = line_end(buf, 0)
+    if e0 == 0 - 1 { return HTTP_INCOMPLETE }
+    if e0 == 0 - 3 { return HTTP_TOO_LARGE }
+    if e0 < 0 { return HTTP_BAD }
+    let eol: usize = e0 as usize
+
+    var i: usize = 0
+    for i < eol {
+        if (buf[i] as i32) == 32 { break }
+        if is_tchar(buf[i] as i32) == false { return HTTP_BAD }
+        i = i + 1
+    }
+    if i == 0 or i >= eol { return HTTP_BAD }
+    req.method = Span{ off: 0, len: i }
+
+    let tstart: usize = i + 1
+    var j: usize = tstart
+    for j < eol {
+        if (buf[j] as i32) == 32 { break }
+        // A space is the delimiter, so a target containing one is a malformed request line —
+        // and is exactly how a request line is smuggled into looking like two.
+        if (buf[j] as i32) <= 32 { return HTTP_BAD }
+        j = j + 1
+    }
+    if j <= tstart or j >= eol { return HTTP_BAD }
+    req.target = Span{ off: tstart, len: j - tstart }
+
+    // The version. `HTTP/1.` then one digit — this module speaks 1.x and nothing else, and
+    // says so rather than guessing at a message it cannot frame.
+    let vstart: usize = j + 1
+    if vstart + 8 != eol { return HTTP_BAD }
+    if match_at(buf, vstart, "HTTP/1.") == false { return HTTP_BAD }
+    let vd: i32 = buf[vstart + 7] as i32
+    if is_digit(vd) == false { return HTTP_BAD }
+    req.minor = vd - 48
+
+    // ---- headers ----
+    var at: usize = eol + 2
+    var n: usize = 0
+    for true {
+        let e: isize = line_end(buf, at)
+        if e == 0 - 1 { return HTTP_INCOMPLETE }
+        if e == 0 - 3 { return HTTP_TOO_LARGE }
+        if e < 0 { return HTTP_BAD }
+        let he: usize = e as usize
+        if he == at {
+            at = at + 2
+            break                                    // the empty line: headers are done
+        }
+        if n >= hs.len or n >= HTTP_MAX_HEADERS { return HTTP_TOO_LARGE }
+
+        // **A leading space is an obs-fold** (a header continued onto the next line). RFC 9112
+        // says a recipient must reject it in a request: it is the other historical framing
+        // ambiguity, and no client that matters has emitted one this century.
+        if (buf[at] as i32) == 32 or (buf[at] as i32) == 9 { return HTTP_BAD }
+
+        var k: usize = at
+        for k < he {
+            if (buf[k] as i32) == 58 { break }        // ':'
+            if is_tchar(buf[k] as i32) == false { return HTTP_BAD }
+            k = k + 1
+        }
+        if k == at or k >= he { return HTTP_BAD }
+        // **No space before the colon.** `Foo : bar` is refused, because a recipient that
+        // trims it and one that does not disagree about the field's name.
+        let name: Span = Span{ off: at, len: k - at }
+
+        var v: usize = k + 1
+        for v < he {
+            if (buf[v] as i32) != 32 and (buf[v] as i32) != 9 { break }
+            v = v + 1
+        }
+        var ve: usize = he
+        for ve > v {
+            let c: i32 = buf[ve - 1] as i32
+            if c != 32 and c != 9 { break }
+            ve = ve - 1
+        }
+        var vi: usize = v
+        for vi < ve {
+            if is_value_byte(buf[vi] as i32) == false { return HTTP_BAD }
+            vi = vi + 1
+        }
+        hs[n] = Header{ name: name, value: Span{ off: v, len: ve - v } }
+        n = n + 1
+        at = he + 2
+    }
+    req.headers = n
+
+    // ---- framing, which is where the danger is ----
+    return frame_body(buf, hs, n, at, req)
+}
+
+// Decide how long the body is, refusing every arrangement that two implementations could read
+// differently. See the header.
+@no_alloc @no_os fn frame_body(read buf: []u8, read hs: []Header, n: usize, at: usize, mut req: Request) -> i32 {
+    var seen_cl: i32 = 0
+    var cl: i64 = 0 - 1
+    var chunked: bool = false
+    var seen_te: i32 = 0
+    var i: usize = 0
+    for i < n {
+        if header_is(hs[i], buf, "content-length") {
+            seen_cl = seen_cl + 1
+            let v: i64 = strict_decimal(buf, hs[i].value)
+            if v < 0 { return HTTP_BAD }
+            // **Two `Content-Length`s that DISAGREE is ambiguous; two that agree is merely
+            // redundant.** RFC 9112 allows collapsing identical values, and refusing them
+            // would reject messages no attacker sent.
+            if seen_cl > 1 {
+                if v != cl { return HTTP_AMBIGUOUS }
+            }
+            cl = v
+        }
+        if header_is(hs[i], buf, "transfer-encoding") {
+            seen_te = seen_te + 1
+            // Only `chunked` is understood, and it must be the whole value: `gzip, chunked`
+            // means a body this module cannot frame, and guessing is the failure mode.
+            if eq_ci(buf, hs[i].value, "chunked") == false { return HTTP_BAD }
+            chunked = true
+        }
+        i = i + 1
+    }
+
+    // **The smuggling case.** A message with both is read one way by a proxy and another way
+    // by an origin server, which turns one request into two.
+    if chunked and cl >= 0 { return HTTP_AMBIGUOUS }
+    if seen_te > 1 { return HTTP_AMBIGUOUS }
+
+    if chunked {
+        req.chunked = true
+        return frame_chunked(buf, at, req)
+    }
+    if cl < 0 {
+        // No framing headers: the body is empty. For a REQUEST that is the only safe reading —
+        // "until the connection closes" is a response-only rule, and applying it to a request
+        // would let a client's body run into the next one.
+        req.body = Span{ off: at, len: 0 }
+        req.total = at
+        return HTTP_OK
+    }
+    let want: usize = cl as usize
+    if at + want > buf.len { return HTTP_INCOMPLETE }
+    req.body = Span{ off: at, len: want }
+    req.total = at + want
+    return HTTP_OK
+}
+
+// Walk a chunked body to its terminating zero chunk. The body span covers the ENCODED bytes;
+// `decode_chunked` produces the decoded ones.
+@no_alloc @no_os fn frame_chunked(read buf: []u8, at: usize, mut req: Request) -> i32 {
+    let start: usize = at
+    var p: usize = at
+    for true {
+        let e: isize = line_end(buf, p)
+        if e == 0 - 1 { return HTTP_INCOMPLETE }
+        if e == 0 - 3 { return HTTP_TOO_LARGE }
+        if e < 0 { return HTTP_BAD }
+        let he: usize = e as usize
+        // A chunk-size line may carry `;ext` extensions, which are ignored — that is
+        // semantics, not framing.
+        var sz_end: usize = p
+        for sz_end < he {
+            if (buf[sz_end] as i32) == 59 { break }
+            sz_end = sz_end + 1
+        }
+        let size: i64 = strict_hex(buf, p, sz_end)
+        if size < 0 { return HTTP_BAD }
+        p = he + 2
+        if size == 0 {
+            // The trailer section, terminated by an empty line. Trailers are parsed only far
+            // enough to find the end of the message.
+            for true {
+                let te: isize = line_end(buf, p)
+                if te == 0 - 1 { return HTTP_INCOMPLETE }
+                if te == 0 - 3 { return HTTP_TOO_LARGE }
+                if te < 0 { return HTTP_BAD }
+                let tee: usize = te as usize
+                // An EMPTY line ends the message. A non-empty one is a trailer field, which
+                // this module walks past without interpreting — a trailer carries semantics,
+                // and only the framing matters here.
+                if tee == p {
+                    p = p + 2
+                    break
+                }
+                p = tee + 2
+            }
+            req.body = Span{ off: start, len: (p - start) }
+            req.total = p
+            return HTTP_OK
+        }
+        if p + (size as usize) + 2 > buf.len { return HTTP_INCOMPLETE }
+        p = p + (size as usize)
+        if (buf[p] as i32) != 13 or (buf[p + 1] as i32) != 10 { return HTTP_BAD }
+        p = p + 2
+    }
+    return HTTP_BAD
+}
+
+// A `Content-Length` value: DIGITS ONLY, no sign, no space, no hex, no leading `+`.
+//
+// **Strictness here is the point.** `+10`, ` 10`, `0x10` and `10 ` are read differently by
+// different implementations, which is the same disagreement that smuggles a request. Returns
+// -1 for anything that is not a plain decimal number.
+@no_alloc @no_os fn strict_decimal(read buf: []u8, read s: Span) -> i64 {
+    if s.len == 0 or s.len > 18 { return 0 - 1 }
+    var v: i64 = 0
+    for i in 0..s.len {
+        let c: i32 = buf[s.off + i] as i32
+        if is_digit(c) == false { return 0 - 1 }
+        v = v * 10 + (c - 48) as i64
+    }
+    return v
+}
+
+// A chunk size: hex digits only, at least one, at most 8 (4 GiB is already absurd for a chunk).
+@no_alloc @no_os fn strict_hex(read buf: []u8, from: usize, to: usize) -> i64 {
+    if to <= from or to - from > 8 { return 0 - 1 }
+    var v: i64 = 0
+    var i: usize = from
+    for i < to {
+        let c: i32 = buf[i] as i32
+        var d: i32 = 0 - 1
+        if is_digit(c) { d = c - 48 }
+        else if c >= 97 and c <= 102 { d = c - 87 }
+        else if c >= 65 and c <= 70 { d = c - 55 }
+        if d < 0 { return 0 - 1 }
+        v = v * 16 + d as i64
+        i = i + 1
+    }
+    return v
+}
+
+@no_alloc @no_os fn eq_ci(read buf: []u8, read s: Span, read want: str) -> bool {
+    if s.len != want.len { return false }
+    for i in 0..want.len {
+        if lower(buf[s.off + i] as i32) != lower(want[i] as i32) { return false }
+    }
+    return true
+}
+
+@no_alloc @no_os fn match_at(read buf: []u8, at: usize, read want: str) -> bool {
+    if at + want.len > buf.len { return false }
+    for i in 0..want.len {
+        if (buf[at + i] as i32) != (want[i] as i32) { return false }
+    }
+    return true
+}
+
+// Decode a chunked body span into `dst`. Returns the decoded length, or -1 if the encoding is
+// malformed. The span must be one `frame_chunked` accepted.
+@no_alloc @no_os pub fn decode_chunked(read buf: []u8, read body: Span, mut dst: []u8) -> isize {
+    var p: usize = body.off
+    let end: usize = body.off + body.len
+    var n: usize = 0
+    for p < end {
+        let e: isize = line_end(buf, p)
+        if e < 0 { return 0 - 1 }
+        let he: usize = e as usize
+        var sz_end: usize = p
+        for sz_end < he {
+            if (buf[sz_end] as i32) == 59 { break }
+            sz_end = sz_end + 1
+        }
+        let size: i64 = strict_hex(buf, p, sz_end)
+        if size < 0 { return 0 - 1 }
+        p = he + 2
+        if size == 0 { return n as isize }
+        let sz: usize = size as usize
+        if n + sz > dst.len { return 0 - 1 }
+        var i: usize = 0
+        for i < sz {
+            dst[n + i] = buf[p + i]
+            i = i + 1
+        }
+        n = n + sz
+        p = p + sz + 2
+    }
+    return n as isize
+}
+
+// ---- the serializer ---------------------------------------------------------------------
+
+// Is `v` safe to send as a header value?
+//
+// **A value containing CR or LF splits the message into two**, and the second one is whatever
+// the attacker put after the newline — response splitting, the mirror image of request
+// smuggling. Anything built from user input goes through here.
+//
+// Public and pure, so the rule that keeps a response one message is testable directly.
+@no_alloc @no_os pub fn safe_header_value(read v: str) -> bool {
+    for i in 0..v.len {
+        let c: i32 = v[i] as i32
+        if c == 13 or c == 10 or c == 0 { return false }
+    }
+    return true
+}
+
+@no_alloc @no_os pub fn safe_header_name(read n: str) -> bool {
+    if n.len == 0 { return false }
+    for i in 0..n.len {
+        if is_tchar(n[i] as i32) == false { return false }
+    }
+    return true
+}
+
+// Begin a response: `HTTP/1.1 <status> <reason>` and the blank line is NOT written yet.
+@no_alloc @no_os pub fn begin_response(mut s: Sink, mut buf: []u8, status: i32, read reason: str) -> bool {
+    if status < 100 or status > 599 { return false }
+    if safe_header_value(reason) == false { return false }
+    sink.put_str(s, buf, "HTTP/1.1 ")
+    sink.put_i64(s, buf, status as i64)
+    sink.put(s, buf, 32 as u8)
+    sink.put_str(s, buf, reason)
+    sink.put_str(s, buf, "\r\n")
+    return true
+}
+
+// One header. **Refuses rather than escaping** — there is no escaping in HTTP field values, so
+// a value with a newline in it cannot be sent at all, and pretending otherwise would emit two
+// messages.
+@no_alloc @no_os pub fn put_header(mut s: Sink, mut buf: []u8, read name: str, read value: str) -> bool {
+    if safe_header_name(name) == false { return false }
+    if safe_header_value(value) == false { return false }
+    sink.put_str(s, buf, name)
+    sink.put_str(s, buf, ": ")
+    sink.put_str(s, buf, value)
+    sink.put_str(s, buf, "\r\n")
+    return true
+}
+
+@no_alloc @no_os pub fn put_content_length(mut s: Sink, mut buf: []u8, n: usize) -> bool {
+    sink.put_str(s, buf, "Content-Length: ")
+    sink.put_usize(s, buf, n)
+    sink.put_str(s, buf, "\r\n")
+    return true
+}
+
+// End the header section. Everything after this is body.
+@no_alloc @no_os pub fn end_headers(mut s: Sink, mut buf: []u8) {
+    sink.put_str(s, buf, "\r\n")
+}

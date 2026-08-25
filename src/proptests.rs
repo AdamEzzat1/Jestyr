@@ -651,6 +651,88 @@ mod syswatch_debounced_trigger {
     }
 }
 
+/// **`jserve` — an HTTP server on a real socket, refusing a real attack.**
+///
+/// `std/http` is a parser over a byte buffer and is tested that way; this puts it on loopback
+/// through `std/sysnet`, so bytes arrive in whatever pieces the kernel chose and the parser's
+/// `HTTP_INCOMPLETE` answer is what drives the read loop.
+///
+/// **The middle request is a genuine request-smuggling attempt**, not a malformed message: it
+/// carries both `Content-Length` and `Transfer-Encoding: chunked`, so a front-end proxy and a
+/// back-end server disagree about where it ends, and the bytes after it (`GET /admin`) become a
+/// second request attributed to the next client on the connection. Every byte of it is
+/// well-formed, and a lenient parser answers 200.
+#[cfg(all(test, feature = "c-oracle"))]
+mod http_server {
+    use super::*;
+
+    #[test]
+    fn jserve_answers_refuses_and_keeps_serving() {
+        let exe = super::c_oracle::build_exe("examples/std/http_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the server demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        let want = "-- jserve --\n\
+                    -- an ordinary request --\n\
+                    HTTP/1.1 200 OK\ngot:world.\n\
+                    -- a request-smuggling attempt --\n\
+                    HTTP/1.1 400 ambiguous\n\n\
+                    -- a chunked request --\n\
+                    HTTP/1.1 200 OK\ngot:hello there.\n\
+                    -- the server refused the attack and kept serving --";
+        assert_eq!(out.trim_end(), want, "the server demo's transcript changed:\n{out}");
+
+        // **The attack must be refused as AMBIGUOUS specifically**, not merely as "bad": both
+        // are a 400 to the client, but only one of them tells an operator they are looking at
+        // an attack rather than a broken client.
+        assert!(out.contains("400 ambiguous"), "the smuggling attempt must be refused as ambiguous:\n{out}");
+        assert!(!out.contains("200 OK\ngot:0"), "the smuggled body must never be served:\n{out}");
+        // And the server kept working afterwards — the chunked request is served AFTER the
+        // attack, so a server that died or desynchronised would not answer it.
+        assert_eq!(out.matches("200 OK").count(), 2, "two requests must have been served:\n{out}");
+    }
+}
+
+/// **`jpack` — a reproducible archive, checked by rebuilding it.**
+///
+/// The demonstration is not "here is an archive" but **building the same archive twice from
+/// deliberately different dirty buffers and comparing every byte**, then writing it out and
+/// reading it back through the module's own reader.
+///
+/// **Verified against the system `tar` while this was written** — `tar -tvf` lists
+/// `-rw-r--r-- 0/0` and `drwxr-xr-x 0/0` at the epoch, and `tar -xf` extracts byte-correct
+/// contents. That check is recorded rather than run here: a test whose result depends on which
+/// `tar` is installed fails on someone else's machine for a reason that is not a bug.
+#[cfg(all(test, feature = "c-oracle"))]
+mod tar_reproducible {
+    use super::*;
+
+    #[test]
+    fn jpack_builds_the_same_bytes_twice() {
+        let exe = super::c_oracle::build_exe("examples/std/tar_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the archive demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        let want = "-- jpack --\n\
+                    entries\n3\n\
+                    archive bytes\n3584\n\
+                    built twice, byte-identical\ntrue\n\
+                    written to disk\ntrue\n\
+                    read back the same bytes\ntrue\n\
+                    -- listing --\n\
+                    README.md\nsrc/\nsrc/main.jtr";
+        assert_eq!(out.trim_end(), want, "the archive demo's transcript changed:\n{out}");
+
+        // The claim, asserted separately from the transcript so a failure says WHICH property
+        // broke rather than only that the output moved.
+        assert!(out.contains("built twice, byte-identical\ntrue"), "reproducibility failed:\n{out}");
+        assert!(!out.contains("false"), "every step must have succeeded:\n{out}");
+        assert!(!std::path::Path::new("zz_jpack.tar").exists(), "the demo must clean up after itself");
+    }
+}
+
 /// **`jhost` — a host that survives every way a plugin can let it down.**
 ///
 /// The only test in the tree that runs **two Jestyr programs against each other**: it compiles
@@ -16499,6 +16581,10 @@ fn main() -> i32 {
         "plugin_test.jtr",
         "plugin_echo.jtr",
         "plugin_demo.jtr",
+        "http.jtr",
+        "tar.jtr",
+        "tar_test.jtr",
+        "tar_demo.jtr",
         "log.jtr",
         "log_test.jtr",
         "log_demo.jtr",
@@ -16526,6 +16612,26 @@ fn main() -> i32 {
     // affect a program that compiles, and the demo is not left unchecked by its absence
     // here: `jc_build_matrix_matches_expectations` builds it through the port's own module
     // loader, where the import DOES resolve, and it runs and prints the same transcript.
+    // **`http_test.jtr` and `http_demo.jtr` are deliberately absent, and the mechanism is a
+    // THIRD instance of the same category — a slice of ANOTHER MODULE's struct.**
+    //
+    // Both take a `[]http.Header`. With imports unresolved the element type degrades to `?`,
+    // and the two sides disagree about whether that still deserves a typedef:
+    //
+    //     reference:  typedef struct { int* ptr; size_t len; } JestyrSlice_?;
+    //     port:       (nothing)
+    //
+    // **Measured, not assumed**: `http.jtr` itself IS allowlisted and byte-identical, and it
+    // declares `Header` locally and passes `[]Header` through `parse_request`. So the same
+    // shape agrees exactly when the element type resolves, and this is a disagreement about
+    // how far to degrade an erroneous program rather than an emission bug — the same category
+    // as `sysfs_test.jtr` below and `walk.jtr`'s auto-drop divergence.
+    //
+    // **The rule that falls out, worth knowing before adding a file here:** a corpus file that
+    // takes a slice of another module's struct cannot be in this allowlist, because this
+    // golden runs with imports unresolved by construction. `syswatch_test.jtr` (`[]syswatch.
+    // Change`) is out for the same reason. The MODULE that declares the struct is fine.
+    //
     // **`sysfs_test.jtr` is deliberately absent, and the reason was MEASURED rather than
     // assumed** — which is what `walk.jtr`'s note below asks the next person to do.
     //
@@ -17586,6 +17692,18 @@ fn main() -> i32 {
             // `jhost_survives_every_way_a_plugin_can_fail`, because it needs a COMPILED
             // plugin and a `.jtr` suite cannot build one.
             ("plugin_test", 4),
+            // **Most of this suite is adversarial**, which is the right shape for an HTTP
+            // parser: the ordinary cases are easy and every implementation gets them right,
+            // and the vulnerabilities are all in messages that are well-formed and mean two
+            // different things. Every case in the smuggling test is a message a lenient
+            // parser accepts. No socket is involved -- the dangerous half of an HTTP
+            // implementation is a pure function of a byte buffer.
+            ("http_test", 5),
+            // Reproducibility is a CLAIM, so the suite builds the same archive twice from
+            // deliberately different dirty buffers and compares every byte -- the assertion a
+            // `time(0)` in the header fails. The checksum test pins the one detail every tar
+            // writer gets wrong: the field is summed as eight SPACES, not as zeros.
+            ("tar_test", 4),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

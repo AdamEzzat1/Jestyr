@@ -1,0 +1,331 @@
+// std/http_test.jtr — the ambiguities, refused.
+//
+// **Most of this file is adversarial**, which is the right shape for an HTTP parser: the
+// ordinary cases are easy and every implementation gets them right, and the vulnerabilities
+// are all in messages that are well-formed and mean two different things.
+//
+// `a_message_that_two_implementations_would_frame_differently_is_refused` is the centre. Every
+// case in it is a real request-smuggling shape, and every one of them is a message a lenient
+// parser accepts.
+//
+// Nothing here touches a socket: the parser is a pure function of a byte buffer, so the
+// dangerous half of an HTTP implementation is tested with no network at all.
+//
+// Run:  jestyrc test examples/std/http_test.jtr
+
+import "http"
+import "sink"
+import "test"
+import "test_report"
+
+const H_T_CAP: usize = 16384
+
+// Parse `text` and report the outcome. The whole suite goes through this, so a case is one
+// line and the message it feeds in is visible in the assertion.
+fn outcome(read text: str, mut hs: []http.Header, mut req: http.Request) -> i32 {
+    var raw: *mut u8 = alloc(u8, text.len + 1)
+    var buf: []u8 = slice(u8, raw, text.len)
+    for i in 0..text.len {
+        buf[i] = text[i]
+    }
+    let o: i32 = http.parse_request(buf, hs, req)
+    free_ptr(raw)
+    return o
+}
+
+// Copy `text` into `buf` and report its LENGTH, so a caller can slice `buf[0 .. n]` itself.
+//
+// It cannot hand back the slice: a second-class borrow may not outlive the call that made it,
+// so `return buf[0 .. n]` is refused. The caller slicing at its own site is the shape that
+// works, and it keeps the buffer visibly alive for as long as the spans into it are read.
+fn fill(mut buf: []u8, read text: str) -> usize {
+    for i in 0..text.len {
+        buf[i] = text[i]
+    }
+    return text.len
+}
+
+@test fn an_ordinary_request_parses_into_views() -> bool {
+    var raw: *mut u8 = alloc(u8, H_T_CAP)
+    var rep: []u8 = slice(u8, raw, H_T_CAP)
+    var c: test.Check = test.new()
+
+    var hraw: *mut http.Header = alloc(http.Header, 32)
+    var hs: []http.Header = slice(http.Header, hraw, 32)
+    var braw: *mut u8 = alloc(u8, 1024)
+    var bbuf: []u8 = slice(u8, braw, 1024)
+    var req: http.Request = http.empty_request()
+
+    let msg: str = "POST /submit?x=1 HTTP/1.1\r\nHost: example.org\r\nContent-Length: 5\r\nX-Odd: a b c\r\n\r\nhello"
+    let n_buf: usize = fill(bbuf, msg)
+    var buf: []u8 = bbuf[0 .. n_buf]
+    test.eq_i64(c, rep, "it parses", http.parse_request(buf, hs, req) as i64, http.HTTP_OK as i64)
+
+    test.eq_str(c, rep, "the method", http.span_str(req.method, buf), "POST")
+    test.eq_str(c, rep, "the target, query and all", http.span_str(req.target, buf), "/submit?x=1")
+    test.eq_i64(c, rep, "HTTP/1.1", req.minor as i64, 1)
+    test.eq_usize(c, rep, "three headers", req.headers, 3)
+    test.eq_str(c, rep, "the body", http.span_str(req.body, buf), "hello")
+    test.eq_usize(c, rep, "and the message's length, so the next one can be found", req.total, msg.len)
+
+    // **Header names are case-insensitive**, which is not a nicety: a client spelling it
+    // `content-length` is conformant, and a parser comparing exactly would frame its body as
+    // empty and then read its body as the next request.
+    test.eq_str(c, rep, "found case-insensitively", http.header_value(hs, req.headers, buf, "content-length"), "5")
+    test.eq_str(c, rep, "and so is Host", http.header_value(hs, req.headers, buf, "host"), "example.org")
+    test.eq_str(c, rep, "a value keeps its interior spaces", http.header_value(hs, req.headers, buf, "x-odd"), "a b c")
+    test.eq_str(c, rep, "an absent header is empty", http.header_value(hs, req.headers, buf, "nope"), "")
+
+    // Optional whitespace around a value is stripped; the value itself is not touched.
+    let n_buf2: usize = fill(bbuf, "GET / HTTP/1.1\r\nA:   padded   \r\n\r\n")
+    var buf2: []u8 = bbuf[0 .. n_buf2]
+    test.eq_i64(c, rep, "it parses", http.parse_request(buf2, hs, req) as i64, http.HTTP_OK as i64)
+    test.eq_str(c, rep, "surrounding whitespace is stripped", http.header_value(hs, req.headers, buf2, "a"), "padded")
+
+    // No framing header at all means an EMPTY body, not "until close" — see the module header.
+    let n_buf3: usize = fill(bbuf, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    var buf3: []u8 = bbuf[0 .. n_buf3]
+    test.eq_i64(c, rep, "a bodyless request parses", http.parse_request(buf3, hs, req) as i64, http.HTTP_OK as i64)
+    test.eq_usize(c, rep, "with an empty body", req.body.len, 0)
+
+    free_ptr(braw)
+    free_ptr(hraw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_message_that_two_implementations_would_frame_differently_is_refused() -> bool {
+    var raw: *mut u8 = alloc(u8, H_T_CAP)
+    var rep: []u8 = slice(u8, raw, H_T_CAP)
+    var c: test.Check = test.new()
+
+    var hraw: *mut http.Header = alloc(http.Header, 32)
+    var hs: []http.Header = slice(http.Header, hraw, 32)
+    var req: http.Request = http.empty_request()
+
+    // **The canonical request smuggle.** A front-end honours `Content-Length` and forwards 6
+    // bytes; a back-end honours `Transfer-Encoding` and reads a zero-length chunked body, then
+    // treats what follows as a SECOND request that the attacker wrote. One message, two
+    // readings, and the second is attributed to whoever uses the connection next.
+    test.eq_i64(c, rep, "Content-Length AND Transfer-Encoding is ambiguous",
+        outcome("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", hs, req) as i64,
+        http.HTTP_AMBIGUOUS as i64)
+
+    // Two lengths that disagree: the same trick with one header.
+    test.eq_i64(c, rep, "two disagreeing Content-Lengths are ambiguous",
+        outcome("POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello", hs, req) as i64,
+        http.HTTP_AMBIGUOUS as i64)
+
+    // **But two that AGREE are merely redundant**, and refusing them would reject messages no
+    // attacker sent. The line is "can two implementations disagree", not "is it tidy".
+    test.eq_i64(c, rep, "two agreeing Content-Lengths are fine",
+        outcome("POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello", hs, req) as i64,
+        http.HTTP_OK as i64)
+
+    // A `Content-Length` that is not a plain decimal. Each of these is read differently by
+    // different implementations, which is the same disagreement by another route.
+    test.eq_i64(c, rep, "a signed length is bad",
+        outcome("POST / HTTP/1.1\r\nContent-Length: +5\r\n\r\nhello", hs, req) as i64, http.HTTP_BAD as i64)
+    test.eq_i64(c, rep, "a hex length is bad",
+        outcome("POST / HTTP/1.1\r\nContent-Length: 0x5\r\n\r\nhello", hs, req) as i64, http.HTTP_BAD as i64)
+    test.eq_i64(c, rep, "an empty length is bad",
+        outcome("POST / HTTP/1.1\r\nContent-Length:\r\n\r\n", hs, req) as i64, http.HTTP_BAD as i64)
+
+    // A Transfer-Encoding this module cannot frame. Guessing is the failure mode, so it says
+    // no rather than assuming the body is chunked anyway.
+    test.eq_i64(c, rep, "an unframeable Transfer-Encoding is bad",
+        outcome("POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n", hs, req) as i64,
+        http.HTTP_BAD as i64)
+
+    // **A bare LF is not a line ending.** Leniency here is the third smuggling route: two
+    // implementations that differ about whether `\n` alone terminates a line split a message
+    // in two different places.
+    test.eq_i64(c, rep, "a bare LF in the start line is bad",
+        outcome("GET / HTTP/1.1\nHost: x\r\n\r\n", hs, req) as i64, http.HTTP_BAD as i64)
+    test.eq_i64(c, rep, "a bare LF between headers is bad",
+        outcome("GET / HTTP/1.1\r\nHost: x\nA: b\r\n\r\n", hs, req) as i64, http.HTTP_BAD as i64)
+
+    // An obs-fold: a header continued onto the next line by leading whitespace. RFC 9112 says
+    // a recipient must reject one in a request, and it is the last of the historical framing
+    // ambiguities.
+    test.eq_i64(c, rep, "an obs-fold is bad",
+        outcome("GET / HTTP/1.1\r\nA: one\r\n  two\r\n\r\n", hs, req) as i64, http.HTTP_BAD as i64)
+
+    // A space before the colon: a recipient that trims it and one that does not disagree about
+    // the field's NAME, which is how a `Content-Length ` slips past a filter.
+    test.eq_i64(c, rep, "a space before the colon is bad",
+        outcome("GET / HTTP/1.1\r\nA : b\r\n\r\n", hs, req) as i64, http.HTTP_BAD as i64)
+
+    free_ptr(hraw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn incomplete_is_a_different_answer_from_malformed() -> bool {
+    var raw: *mut u8 = alloc(u8, H_T_CAP)
+    var rep: []u8 = slice(u8, raw, H_T_CAP)
+    var c: test.Check = test.new()
+
+    var hraw: *mut http.Header = alloc(http.Header, 32)
+    var hs: []http.Header = slice(http.Header, hraw, 32)
+    var req: http.Request = http.empty_request()
+
+    // **Without this distinction a streaming server cannot tell a slow client from a hostile
+    // one**, and drops the connection on every slow network.
+    test.eq_i64(c, rep, "nothing yet", outcome("", hs, req) as i64, http.HTTP_INCOMPLETE as i64)
+    test.eq_i64(c, rep, "half a start line", outcome("GET / HT", hs, req) as i64, http.HTTP_INCOMPLETE as i64)
+    test.eq_i64(c, rep, "a CR at the edge might be a CRLF",
+        outcome("GET / HTTP/1.1\r", hs, req) as i64, http.HTTP_INCOMPLETE as i64)
+    test.eq_i64(c, rep, "headers not yet finished",
+        outcome("GET / HTTP/1.1\r\nHost: x\r\n", hs, req) as i64, http.HTTP_INCOMPLETE as i64)
+    test.eq_i64(c, rep, "the body has not all arrived",
+        outcome("POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nhi", hs, req) as i64, http.HTTP_INCOMPLETE as i64)
+
+    // The control: the same messages COMPLETED parse. Without it every assertion above would
+    // pass for a parser that answered INCOMPLETE always.
+    test.eq_i64(c, rep, "and completed, it parses",
+        outcome("POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi", hs, req) as i64, http.HTTP_OK as i64)
+
+    // Malformed is malformed no matter how much more arrives, and must not be reported as
+    // incomplete — a server that waited for more would hang on a broken client.
+    test.eq_i64(c, rep, "a bad version is bad, not incomplete",
+        outcome("GET / HTTP/2.0\r\n\r\n", hs, req) as i64, http.HTTP_BAD as i64)
+    test.eq_i64(c, rep, "a missing target is bad",
+        outcome("GET  HTTP/1.1\r\n\r\n", hs, req) as i64, http.HTTP_BAD as i64)
+    test.eq_i64(c, rep, "a control byte in the method is bad",
+        outcome("G\tET / HTTP/1.1\r\n\r\n", hs, req) as i64, http.HTTP_BAD as i64)
+
+    // Bounds are refusals, not crashes: a client sending header bytes forever costs the
+    // server nothing but a rejection.
+    var big: *mut u8 = alloc(u8, 20000)
+    var bb: []u8 = slice(u8, big, 20000)
+    var i: usize = 0
+    for i < 20000 {
+        bb[i] = 65 as u8
+        i = i + 1
+    }
+    test.eq_i64(c, rep, "an absurd start line is refused, not parsed",
+        http.parse_request(bb, hs, req) as i64, http.HTTP_TOO_LARGE as i64)
+    free_ptr(big)
+
+    // More headers than the caller's array can hold is TOO_LARGE, not a buffer overrun.
+    var tiny: *mut http.Header = alloc(http.Header, 2)
+    var ths: []http.Header = slice(http.Header, tiny, 2)
+    test.eq_i64(c, rep, "too many headers for the array is refused",
+        outcome("GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n", ths, req) as i64, http.HTTP_TOO_LARGE as i64)
+    free_ptr(tiny)
+
+    free_ptr(hraw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_chunked_body_is_framed_and_decoded() -> bool {
+    var raw: *mut u8 = alloc(u8, H_T_CAP)
+    var rep: []u8 = slice(u8, raw, H_T_CAP)
+    var c: test.Check = test.new()
+
+    var hraw: *mut http.Header = alloc(http.Header, 32)
+    var hs: []http.Header = slice(http.Header, hraw, 32)
+    var braw: *mut u8 = alloc(u8, 1024)
+    var bbuf: []u8 = slice(u8, braw, 1024)
+    var draw: *mut u8 = alloc(u8, 1024)
+    var dst: []u8 = slice(u8, draw, 1024)
+    var req: http.Request = http.empty_request()
+
+    let n_buf: usize = fill(bbuf, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n")
+    var buf: []u8 = bbuf[0 .. n_buf]
+    test.eq_i64(c, rep, "a chunked request parses", http.parse_request(buf, hs, req) as i64, http.HTTP_OK as i64)
+    test.is_true(c, rep, "and is marked chunked", req.chunked)
+    let n: isize = http.decode_chunked(buf, req.body, dst)
+    test.eq_i64(c, rep, "the decoded length", n as i64, 11)
+    test.eq_str(c, rep, "and the decoded bytes", from_utf8(dst[0 .. n as usize]), "hello world")
+
+    // A chunk extension is semantics, not framing, and is skipped.
+    let n_buf2: usize = fill(bbuf, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5;a=b\r\nhello\r\n0\r\n\r\n")
+    var buf2: []u8 = bbuf[0 .. n_buf2]
+    test.eq_i64(c, rep, "a chunk extension is ignored", http.parse_request(buf2, hs, req) as i64, http.HTTP_OK as i64)
+
+    // A trailer after the zero chunk is walked past to find the end of the message.
+    let n_buf3: usize = fill(bbuf, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Trailer: v\r\n\r\n")
+    var buf3: []u8 = bbuf[0 .. n_buf3]
+    test.eq_i64(c, rep, "a trailer ends the message correctly", http.parse_request(buf3, hs, req) as i64, http.HTTP_OK as i64)
+    test.eq_usize(c, rep, "and the total covers it", req.total, buf3.len)
+
+    // Incomplete and malformed are still distinguished inside a chunked body.
+    let n_buf4: usize = fill(bbuf, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel")
+    var buf4: []u8 = bbuf[0 .. n_buf4]
+    test.eq_i64(c, rep, "a half-arrived chunk is incomplete", http.parse_request(buf4, hs, req) as i64,
+        http.HTTP_INCOMPLETE as i64)
+    let n_buf5: usize = fill(bbuf, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n")
+    var buf5: []u8 = bbuf[0 .. n_buf5]
+    test.eq_i64(c, rep, "a non-hex chunk size is bad", http.parse_request(buf5, hs, req) as i64, http.HTTP_BAD as i64)
+    let n_buf6: usize = fill(bbuf, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n")
+    var buf6: []u8 = bbuf[0 .. n_buf6]
+    test.eq_i64(c, rep, "a chunk not followed by CRLF is bad", http.parse_request(buf6, hs, req) as i64,
+        http.HTTP_BAD as i64)
+
+    free_ptr(draw)
+    free_ptr(braw)
+    free_ptr(hraw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
+
+@test fn a_header_value_that_would_split_the_response_is_refused() -> bool {
+    var raw: *mut u8 = alloc(u8, H_T_CAP)
+    var rep: []u8 = slice(u8, raw, H_T_CAP)
+    var c: test.Check = test.new()
+
+    // **Response splitting is request smuggling's mirror image.** A value carrying a CRLF ends
+    // the header section early and everything after it becomes a second message the attacker
+    // wrote. There is no escaping in an HTTP field value, so the only correct answer is to
+    // refuse to send it.
+    test.is_false(c, rep, "a CRLF in a value is refused", http.safe_header_value("a\r\nX-Evil: 1"))
+    test.is_false(c, rep, "a bare LF too", http.safe_header_value("a\nb"))
+    test.is_false(c, rep, "a bare CR too", http.safe_header_value("a\rb"))
+    // A NUL, built from bytes because a `str` literal has no escape for one. It is refused for
+    // a different reason from CR/LF: it does not split the message, it TRUNCATES it at every C
+    // consumer downstream, which is the same disagreement wearing different clothes.
+    var nb: *mut u8 = alloc(u8, 3)
+    unsafe { (nb + 0).* = 97 as u8 }
+    unsafe { (nb + 1).* = 0 as u8 }
+    unsafe { (nb + 2).* = 98 as u8 }
+    test.is_false(c, rep, "and a NUL", http.safe_header_value(from_utf8(slice(u8, nb, 3))))
+    free_ptr(nb)
+    test.is_true(c, rep, "an ordinary value is fine", http.safe_header_value("text/plain; charset=utf-8"))
+
+    // A name is stricter still: only `tchar`, so a space or a colon cannot invent a field.
+    test.is_false(c, rep, "a space in a name is refused", http.safe_header_name("X Bad"))
+    test.is_false(c, rep, "a colon in a name is refused", http.safe_header_name("X:Bad"))
+    test.is_false(c, rep, "an empty name is refused", http.safe_header_name(""))
+    test.is_true(c, rep, "an ordinary name is fine", http.safe_header_name("X-Request-Id"))
+
+    // And the writer enforces it rather than trusting the caller.
+    var braw: *mut u8 = alloc(u8, 1024)
+    var buf: []u8 = slice(u8, braw, 1024)
+    var s: Sink = sink.new()
+    test.is_true(c, rep, "a response starts", http.begin_response(s, buf, 200, "OK"))
+    test.is_false(c, rep, "a poisoned header is refused by the writer",
+        http.put_header(s, buf, "X-Echo", "a\r\nX-Evil: 1"))
+    test.is_true(c, rep, "a clean one is written", http.put_header(s, buf, "Content-Type", "text/plain"))
+    http.put_content_length(s, buf, 2)
+    http.end_headers(s, buf)
+    sink.put_str(s, buf, "hi")
+    test.eq_str(c, rep, "and the message is exactly one message", sink.view(s, buf),
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nhi")
+
+    // A status outside 100..599 is not a status.
+    var s2: Sink = sink.new()
+    test.is_false(c, rep, "a nonsense status is refused", http.begin_response(s2, buf, 99, "Nope"))
+    test.is_false(c, rep, "and so is a reason with a newline", http.begin_response(s2, buf, 200, "OK\r\nX: 1"))
+
+    free_ptr(braw)
+    let ok: bool = test_report.finish(c, rep)
+    free_ptr(raw)
+    return ok
+}
