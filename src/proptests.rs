@@ -651,6 +651,57 @@ mod syswatch_debounced_trigger {
     }
 }
 
+/// **`jledger` — a log that crashes itself and says what it lost.**
+///
+/// `examples/std/alog_demo.jtr` is `std/alog`'s consumer, and it is a consumer rather than an
+/// illustration because it exercises the one path a log either handles or quietly gets wrong:
+/// it appends three entries, syncs, then writes nine bytes of a record whose header promised
+/// sixteen — exactly what a process killed mid-write leaves on disk.
+///
+/// The assertions that matter are the two numbers after recovery (three entries kept, nine
+/// bytes discarded) and the replay: four entries, in order, with **no gap and no phantom**. A
+/// log that lost a completed entry or invented one from the torn bytes changes one of them.
+#[cfg(all(test, feature = "c-oracle"))]
+mod alog_durable {
+    use super::*;
+
+    #[test]
+    fn jledger_survives_a_torn_write_and_says_what_it_lost() {
+        let exe = super::c_oracle::build_exe("examples/std/alog_demo.jtr");
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the ledger demo must exit cleanly");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        let want = "-- jledger --\n\
+                    opened a fresh ledger, entries recovered\n0\n\
+                    0\n1\n2\n\
+                    entries appended, then synced once\n3\n1\n\
+                    -- simulating a process killed mid-write --\n\
+                    reopened; entries recovered\n3\n\
+                    bytes discarded as a torn tail\n9\n\
+                    the next entry will be number\n3\n\
+                    3\n\
+                    -- replaying the whole ledger --\n\
+                    open  balance 100\n\
+                    debit  15 -> 85\n\
+                    credit 40 -> 125\n\
+                    debit  25 -> 100\n\
+                    entries replayed\n4\n\
+                    no entry was lost and none was invented\ntrue";
+        assert_eq!(out.trim_end(), want, "the ledger demo's transcript changed:\n{out}");
+
+        // Anti-vacuity: `true` is printed once and nothing must print `false`.
+        assert!(!out.contains("false"), "every step must have succeeded:\n{out}");
+        // The replay must not report damage — the torn bytes were truncated away, so a clean
+        // end is the whole point. This is the line that would appear if it had not been.
+        assert!(!out.contains("damaged"), "recovery must leave a clean log:\n{out}");
+
+        // The demo scrubs its own scratch file at both ends, so a rerun is identical and the
+        // working tree is unchanged.
+        assert!(!std::path::Path::new("zz_jledger.log").exists(), "the demo must clean up after itself");
+    }
+}
+
 /// **`jlog` — one logging routine, two renderings, and the log reading itself back.**
 ///
 /// `examples/std/log_demo.jtr` is `std/log`'s consumer. `run_job` is written once and shipped
@@ -16377,6 +16428,9 @@ fn main() -> i32 {
         "syswatch.jtr",
         "width.jtr",
         "width_test.jtr",
+        "alog.jtr",
+        "alog_test.jtr",
+        "alog_demo.jtr",
         "log.jtr",
         "log_test.jtr",
         "log_demo.jtr",
@@ -17453,6 +17507,12 @@ fn main() -> i32 {
             // the OS: it is a pure function of a codepoint, which is `std/syserr`'s argument
             // for keeping its errno tables pure.
             ("width_test", 7),
+            // **Three of these DAMAGE a real log on disk** — a torn tail, a bad checksum, a
+            // stale record numbered for another position — and the damaged files are built
+            // byte by byte by the suite rather than by poking at one the module wrote. That
+            // costs a second implementation of the frame and buys an independent encoder: a
+            // test that corrupts a file the module wrote can only ever agree with the module.
+            ("alog_test", 6),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

@@ -66,9 +66,11 @@
 // `finish`.
 //
 // `flush` becomes worth adding when a caller must learn about durability MID-stream
-// without ending the file — a log tailed by another process. Nothing in the tree has
-// one, and a `flush` added before that caller exists would be a second, weaker place
-// to ask the question `finish` answers.
+// without ending the file — a log tailed by another process. **That caller now exists**
+// (`std/alog`), and what it needed turned out not to be `flush` at all: see `sync` below.
+// `fflush` alone never answers the durability question, so adding it would have been the
+// second, weaker place to ask that this paragraph was warning against. `sync` is `fflush`
+// AND `fsync`, which is a different operation with a different promise.
 //
 // ─── What `Drop` on a `Writer` does and does not promise ──────────────────────
 //
@@ -110,8 +112,15 @@
 // leaves two names for one handle — the same missing linear-type obligation. And ISO
 // C cannot close the false-ok case: if a platform's `fclose` returns 0 without ever
 // setting the error indicator while bytes were dropped downstream, `finish` returns
-// ok and is wrong. `fsync` is POSIX, and by this module's own scope rule that makes
-// it `sys`'s.
+// ok and is wrong.
+//
+// **That paragraph used to end "`fsync` is POSIX, and by this module's own scope rule
+// that makes it `sys`'s", and the rule lost.** `sync` and `truncate_path` are here now,
+// behind `@cfg`. What changed is not the scope rule but a measurement: `std/alog` needed
+// both, could not reach this module's private `FILE *`, and binding `fopen` itself was a
+// **duplicate definition** that made the two modules impossible to import together. Given
+// a choice between a tier boundary and a usable library, the boundary moved — and the
+// operations landed where they belong anyway, since durability is a property of a writer.
 //
 // ─── Opening a computed path ──────────────────────────────────────────────────
 //
@@ -179,6 +188,42 @@ extern "stdio.h" fn ferror(f: cptr) -> i32
 extern "stdio.h" fn fseek(f: cptr, off: i64, whence: i32) -> i32
 extern "stdio.h" fn ftell(f: cptr) -> i64
 extern "stdio.h" fn rewind(f: cptr)
+extern "stdio.h" fn fflush(f: cptr) -> i32
+
+// ---- durability and truncation: the two operations ISO C does not have ----------
+//
+// Everything above is ISO C and behaves identically everywhere, which is the rule that
+// decides what belongs in this module. These three do NOT, and they are here anyway because
+// the alternative was worse: `std/alog` needs them, it cannot reach this module's private
+// `FILE *`, and a second module binding `fopen` is a **duplicate definition of `fopen`** that
+// makes the two impossible to import together. Measured, not predicted — `alog` was built
+// that way first and could not coexist with `std/file`.
+//
+// So the platform pair lives with the handle it acts on, which is also where it belongs:
+// durability is a property of a WRITER, and this module owns writers.
+//
+//                       POSIX                  Windows
+//   descriptor          fileno                 _fileno
+//   durability          fsync                  _commit
+//   truncation          ftruncate              _chsize
+//
+// All three take an `int` descriptor on both platforms, so they unify cleanly — unlike
+// `std/sysnet`'s socket calls, whose handle widths differ. `_commit`/`_chsize` are in
+// `<io.h>`, a Windows header; the POSIX pair is in `<unistd.h>`.
+
+@cfg(posix) extern "stdio.h" fn fileno(f: cptr) -> i32
+@cfg(windows) extern "stdio.h" fn _fileno(f: cptr) -> i32
+@cfg(posix) extern "unistd.h" fn fsync(fd: i32) -> i32
+@cfg(windows) extern "io.h" fn _commit(fd: i32) -> i32
+@cfg(posix) extern "unistd.h" fn ftruncate(fd: i32, len: i64) -> i32
+@cfg(windows) extern "io.h" fn _chsize(fd: i32, len: i64) -> i32
+
+@cfg(posix) fn raw_fd(f: cptr) -> i32 { return fileno(f) }
+@cfg(windows) fn raw_fd(f: cptr) -> i32 { return _fileno(f) }
+@cfg(posix) fn raw_sync(fd: i32) -> i32 { return fsync(fd) }
+@cfg(windows) fn raw_sync(fd: i32) -> i32 { return _commit(fd) }
+@cfg(posix) fn raw_truncate(fd: i32, len: i64) -> i32 { return ftruncate(fd, len) }
+@cfg(windows) fn raw_truncate(fd: i32, len: i64) -> i32 { return _chsize(fd, len) }
 
 // `SEEK_END`/`SEEK_SET` are macros, so their VALUES are what crosses the boundary.
 // 0/1/2 are fixed by ISO C and by every ABI Jestyr targets; `size` below is pinned
@@ -422,6 +467,65 @@ pub fn write_str(mut w: Writer, read text: str) -> usize {
 // Per-handle, not per-file — an `append` writer that adds two bytes to a five-byte
 // file reports 2. The module reports progress freely and reports failure at exactly
 // one place, which is the line that keeps a caller from checking the wrong thing.
+// A handle that is not open, for a caller that must initialise a slot before it has one.
+//
+// These exist because a module-qualified struct LITERAL does not parse, so a caller in another
+// module has no way to name `Reader{ … }` — the same reason `sysnet.closed()` and
+// `syswatch.closed()` exist. Every operation on one refuses, which is what makes
+// `open_path(...)` followed by an unchecked `is_open` survivable rather than a crash.
+@no_alloc @no_os pub fn no_reader() -> Reader {
+    return Reader{ h: null }
+}
+
+@no_alloc @no_os pub fn no_writer() -> Writer {
+    return Writer{ h: null, put: 0 }
+}
+
+// Make everything written through `w` durable. True if it reached the device.
+//
+// **`fflush` is not `fsync`, and calling only the first is the classic mistake in this area.**
+// `fflush` moves bytes out of the C library's buffer into the kernel; `fsync` asks the kernel
+// to put them on the device. A program that flushed and called it durable returns success, its
+// bytes are visible to every other process, and a POWER CUT loses them anyway. This does both,
+// in that order — the first without the second is a no-op for durability, and the second
+// without the first syncs a buffer that has not been handed over yet.
+//
+// It is a separate call rather than something `write_from` does, because a device flush costs
+// one to two orders of magnitude more than the write. A caller batching a thousand records
+// wants one sync, and the cost is visible in the API precisely so the choice is theirs.
+//
+// **What it does not promise**: that the DIRECTORY ENTRY is durable. On POSIX a newly created
+// file needs its parent directory synced too, or a crash can leave the data with no name
+// pointing at it. That needs an `open(2)` on the directory, which this module does not do; a
+// caller creating a file it must find again after a power cut should write to an existing name
+// or use `sysfs.rename_replace`, which is the primitive built for exactly that.
+pub fn sync(mut w: Writer) -> bool {
+    if is_writable(w) == false { return false }
+    if fflush(w.h) != 0 { return false }
+    return raw_sync(raw_fd(w.h)) == 0
+}
+
+// Cut `path` down to `len` bytes. True if it now is that long.
+//
+// Path-based rather than acting on an open `Writer`, because the caller that needs it —
+// `std/alog` discarding a torn tail — must truncate BEFORE it opens the log for appending,
+// and an append handle positioned past the new end would write into the gap it just made.
+//
+// Opens `r+b`, which fails rather than creating: truncating a file that is not there is a
+// caller's mistake, and `w+b` would silently create an empty one and report success.
+pub fn truncate_path(read a: Allocator, read p: str, len: i64) -> bool {
+    if len < 0 { return false }
+    var c: CString = cstring.from_str(a, p)
+    var m: CString = cstring.from_str(a, "r+b")
+    let h: cptr = fopen(cstring.as_cstr(c), cstring.as_cstr(m))
+    cstring.free(m)
+    cstring.free(c)
+    if h == null { return false }
+    let rc: i32 = raw_truncate(raw_fd(h), len)
+    fclose(h)
+    return rc == 0
+}
+
 pub fn written(read w: Writer) -> usize {
     return w.put
 }

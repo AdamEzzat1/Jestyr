@@ -1,0 +1,490 @@
+// std/alog.jtr — an append-only log that can tell you where it stopped being true.
+//
+// TIER: `sys`, by dependency rather than by binding: the two operations a crash-safe log needs
+// that ISO C does not have — durability and truncation — live in `std/file` (see below), and
+// this module is the record format, the recovery rule and the reader over them.
+//
+// ─── The claim, stated so it can be checked ───────────────────────────────────
+//
+// **After a crash, reopening the log yields exactly the records that were completely written,
+// in order, and says how many bytes it threw away.** Not "usually", and not "the file is
+// probably fine": a partially written record is DETECTED and discarded, and the discarding is
+// reported rather than silent.
+//
+// What it does NOT claim: that a record which `append` returned is on the platter. That is
+// what `sync` is for, and it is a separate call because forcing a device flush per record costs
+// one to two orders of magnitude and most callers want to batch. An `append` without a `sync`
+// survives a PROCESS crash (the bytes are in the kernel's page cache) and not a POWER cut.
+// Those are different failures and this module keeps them different.
+//
+// ─── The record frame, and why each field is there ────────────────────────────
+//
+//     offset 0  (4 bytes)  len   payload length, LITTLE-ENDIAN
+//     offset 4  (4 bytes)  crc   CRC-32 of len ++ seq ++ payload
+//     offset 8  (8 bytes)  seq   this record's sequence number, LITTLE-ENDIAN
+//     offset 16 (len)      payload
+//
+// **Little-endian is written explicitly, byte by byte, and is not the host's order.** A log
+// is a FILE FORMAT: it can be written on one machine and read on another, so the one thing it
+// must not do is inherit whatever the compiler felt like. `std/sysnet` writes `sockaddr_in`
+// the same way and for the same reason.
+//
+// **The CRC says a record is INTACT. The sequence says it is the record this POSITION owes.**
+// Those are different questions and a checksum answers only the first.
+//
+// The case that needs the second: a log is reset or repaired and written again, and the bytes
+// beyond the new tail are whatever the previous generation left there. Those bytes can be a
+// perfectly valid record with a perfectly good CRC — it WAS one, before the log was rewound —
+// so a reader trusting the checksum alone hands back a phantom from a log that no longer
+// contains it. Requiring the record at position k to carry `seq == k` rejects it whenever the
+// stale record's number does not match where it now sits.
+//
+// **What that does NOT close, stated because the alternative is a false sense of safety:** a
+// stale record lying at exactly its old offset with exactly its old number is indistinguishable
+// from a legitimate one, and no per-record check can tell them apart — the bytes are identical
+// to what a correct log would hold. Closing that needs a per-generation nonce in every record
+// (an epoch stamped at open and checked alongside the sequence), which costs 8 more bytes on
+// every append and is worth adding the day a caller can actually be hurt by it. The sequence
+// closes the common cases — a shorter or longer replacement, a reset to fewer records — and
+// `a_stale_record_that_lands_at_the_wrong_position_is_rejected` is one of them, built by hand.
+//
+// **The CRC covers `len` too.** A corrupted length otherwise gets to decide how much to read
+// before anything checks it; covering it means a wrong length fails the checksum rather than
+// being caught by a heuristic about plausible sizes.
+//
+// ─── This module does NOT own a `FILE *`, and that was MEASURED ───────────────
+//
+// It was written the other way first: its own `fopen`/`fread`/`fwrite`/`fseek`, so that `sync`
+// could reach the descriptor of the handle that wrote. That version type-checked, and it could
+// not be imported alongside `std/file`:
+//
+//     error: duplicate definition of `fopen`
+//
+// **Two modules cannot both bind the same C symbol.** An extern's name belongs to the linker,
+// which §2.1b of the v4 notes already recorded from the other side (a Jestyr function may not
+// shadow one) — this is the same rule saying two *externs* may not collide either. A log that
+// could not coexist with the file module is not a log anyone can use, so the platform pair
+// moved to `std/file`, where it belongs anyway: **durability is a property of a writer, and
+// that module owns writers.** See `file.sync` and `file.truncate_path` for the POSIX/Windows
+// table and for why `fflush` alone is not durability.
+//
+// What is left here is the part that is actually about logs: the frame, the checksum, the
+// recovery rule and the cursor.
+//
+// ─── What is deliberately absent ──────────────────────────────────────────────
+//
+// **No rotation, and `std/log`'s header pointed here for it.** Rotation is a policy — by size,
+// by age, by record count — and every variant needs a decision about what happens to the
+// sequence numbering across a boundary. Doing it properly means segments, a manifest and a
+// reader that spans them, which is a larger module than this one and should not be smuggled
+// in as a parameter. What is here is the primitive rotation would be built from:
+// `sysfs.rename_replace` moves a sealed segment aside atomically, and `size_bytes()` is the
+// number a size policy would test.
+//
+// **No concurrent writers.** One process, one `Log`, one appender. Two processes appending to
+// one file is atomic only for writes the platform chooses to make atomic, and Windows has no
+// equivalent guarantee at all — so the honest position is a single writer and a statement
+// saying so, not a lock that works on one platform.
+//
+// **No compaction, no index, no random access by sequence.** A reader scans. For a log that
+// is replayed at startup that is the right shape; for one queried by key it is not, and that
+// is a different data structure wearing this one's name.
+//
+// Worked example:  examples/std/alog_demo.jtr
+// Run the tests:   jestyrc test examples/std/alog_test.jtr
+
+import "file"
+import "fs"
+
+// ---- the frame ------------------------------------------------------------------
+
+// `len` + `crc` + `seq`. See the header for the layout.
+pub const ALOG_HEADER: usize = 16
+
+// The largest payload this module will believe. A corrupted `len` otherwise decides how much
+// to allocate before anything has checked it, so the ceiling is a REFUSAL TO TRUST rather
+// than a limit on what a caller may store — an oversized length is treated as corruption and
+// ends the scan exactly as a bad checksum does.
+pub const ALOG_MAX_RECORD: usize = 16777216
+
+// ---- CRC-32 ---------------------------------------------------------------------
+
+// CRC-32 (IEEE 802.3, reflected, the one `zlib` and every archive format use).
+//
+// **Pure and public, so the part most likely to be silently wrong is testable on any host** —
+// the same argument `std/syserr`'s errno tables and `std/syswatch`'s event parser make. A
+// checksum that is subtly wrong does not fail: it accepts everything it wrote itself and
+// rejects nothing, which looks exactly like a working log until another implementation reads
+// it. `the_published_crc32_vector_matches` pins it against the standard test vector
+// (`"123456789"` → `0xCBF43926`), which is the only assertion that catches a home-grown
+// polynomial or a reflection mistake.
+//
+// Computed bitwise rather than from a 256-entry table. The table is four times faster and
+// would be 256 lines of generated constants nobody can review; a log's cost is dominated by
+// the write, and this is the version whose correctness is visible.
+//
+// **Arithmetic is `i64` masked to 32 bits**, which is `std/sha256`'s convention in this tree:
+// it makes the wrapping explicit at every step instead of resting on `u32` overflow semantics.
+@no_alloc @no_os pub fn crc32(read bytes: []u8) -> u32 {
+    var crc: i64 = 4294967295
+    for i in 0..bytes.len {
+        crc = crc ^ (bytes[i] as i64)
+        var k: i32 = 0
+        for k < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 3988292384          // 0xEDB88320
+            } else {
+                crc = crc >> 1
+            }
+            crc = crc & 4294967295
+            k = k + 1
+        }
+    }
+    return (crc ^ 4294967295) as u32
+}
+
+// ---- little-endian, written explicitly ------------------------------------------
+//
+// A log is a file format, so byte order is part of it and is never the host's. See the header.
+
+@no_alloc @no_os fn put_u32(mut b: []u8, at: usize, v: i64) {
+    b[at + 0] = (v & 255) as u8
+    b[at + 1] = ((v >> 8) & 255) as u8
+    b[at + 2] = ((v >> 16) & 255) as u8
+    b[at + 3] = ((v >> 24) & 255) as u8
+}
+
+@no_alloc @no_os fn put_u64(mut b: []u8, at: usize, v: i64) {
+    var i: usize = 0
+    for i < 8 {
+        b[at + i] = ((v >> ((i * 8) as i64)) & 255) as u8
+        i = i + 1
+    }
+}
+
+@no_alloc @no_os fn get_u32(read b: []u8, at: usize) -> i64 {
+    return (b[at + 0] as i64) | ((b[at + 1] as i64) << 8) | ((b[at + 2] as i64) << 16) | ((b[at + 3] as i64) << 24)
+}
+
+@no_alloc @no_os fn get_u64(read b: []u8, at: usize) -> i64 {
+    var v: i64 = 0
+    var i: usize = 0
+    for i < 8 {
+        v = v | ((b[at + i] as i64) << ((i * 8) as i64))
+        i = i + 1
+    }
+    return v
+}
+
+// ---- the handle -----------------------------------------------------------------
+
+// One log, one writer. See the header on why there is no second appender.
+pub struct Log {
+    w: file.Writer,
+    seq: i64,               // the sequence the NEXT append will use
+    end: i64,               // byte offset just past the last good record
+    appended: i64,
+    synced: i64,
+    recovered: i64,         // records found when this log was opened
+    discarded: i64,         // bytes recovery threw away
+    open: bool,
+}
+
+@no_alloc @no_os pub fn is_open(read l: Log) -> bool { return l.open }
+@no_alloc @no_os pub fn next_seq(read l: Log) -> i64 { return l.seq }
+@no_alloc @no_os pub fn size_bytes(read l: Log) -> i64 { return l.end }
+@no_alloc @no_os pub fn appended(read l: Log) -> i64 { return l.appended }
+@no_alloc @no_os pub fn syncs(read l: Log) -> i64 { return l.synced }
+
+// How many complete records were found when this log was opened, and how many bytes were
+// discarded as a torn tail.
+//
+// **`discarded` is the number that matters after a crash**, and it is a query rather than a
+// log line because only the caller knows whether losing them is routine (a process killed
+// between appends) or an incident (a filesystem that lost a completed write).
+@no_alloc @no_os pub fn recovered(read l: Log) -> i64 { return l.recovered }
+@no_alloc @no_os pub fn discarded(read l: Log) -> i64 { return l.discarded }
+
+// The value a failed open hands back, so a caller's `catch` has something to name. Exported
+// because a module-qualified struct LITERAL does not parse.
+pub fn closed() -> Log {
+    return Log{ w: file.no_writer(), seq: 0, end: 0, appended: 0, synced: 0, recovered: 0, discarded: 0, open: false }
+}
+
+// ---- opening, which is also recovery ---------------------------------------------
+
+// Open `path`, creating it if absent, and RECOVER it: scan the records already there, find the
+// end of the last complete one, and truncate anything after it.
+//
+// **Recovery is not optional and there is no flag to skip it**, because a log that is appended
+// to without being scanned first has no idea what sequence number to use, and writing record 4
+// after a torn record 4 produces a file with two of them. The scan is the only thing that
+// makes the next append correct.
+pub fn open(mut fh: fs.Fs, read a: Allocator, read path: str) -> Log !{ AlogFailed(i32), AlogRefused } {
+    if fs.can_write(fh) == false { return err(AlogRefused) }
+
+    // The scan reads; a missing file simply scans to nothing, which is the right answer for a
+    // log that does not exist yet.
+    var seq: i64 = 0
+    var end: i64 = 0
+    var total: i64 = 0
+    var r: file.Reader = file.open_path(a, path)
+    if file.is_open(r) {
+        total = file.size(r)
+        scan(r, a, total, seq, end)
+        file.close(r)
+    }
+
+    // Discard the torn tail. Truncating rather than leaving it is the difference between a log
+    // that is correct and one that merely reads correctly today: leftover bytes are a trap for
+    // every future reader, and for the sequence check that has to reject them.
+    var thrown: i64 = 0
+    if end < total {
+        thrown = total - end
+        if file.truncate_path(a, path, end) == false { return err(AlogFailed(0 - 1)) }
+    }
+
+    // Append mode, so every write lands at the end — which after the truncation above is
+    // exactly `end`. Opening for append BEFORE truncating would position the handle past the
+    // gap it is about to make.
+    var w: file.Writer = file.append_path(a, path)
+    if file.is_writable(w) == false { return err(AlogFailed(0 - 1)) }
+    return ok(Log{ w: w, seq: seq, end: end, appended: 0, synced: 0, recovered: seq, discarded: thrown, open: true })
+}
+
+// Walk the file from the start, accepting records while they are complete, correctly
+// checksummed and correctly numbered. Reports the count and the end offset through `out`
+// parameters, because a scan answers two things and a struct for them would be a type nobody
+// else names.
+//
+// It stops at the FIRST bad record and does not look further, which is deliberate: a log is
+// ordered, so anything after a gap is unreachable even if it is individually valid. Scanning
+// on would find records a reader can never legitimately reach.
+fn scan(mut r: file.Reader, read a: Allocator, total: i64, mut seq: i64, mut end: i64) {
+    var hdr: *mut u8 = alloc(u8, ALOG_HEADER)
+    var hb: []u8 = slice(u8, hdr, ALOG_HEADER)
+    var at: i64 = 0
+    var n: i64 = 0
+    for at + (ALOG_HEADER as i64) <= total {
+        if file.read_into(r, hb) != ALOG_HEADER { break }
+        let plen: i64 = get_u32(hb, 0)
+        let want: i64 = get_u32(hb, 4)
+        let sq: i64 = get_u64(hb, 8)
+        if plen < 0 or plen > (ALOG_MAX_RECORD as i64) { break }
+        if at + (ALOG_HEADER as i64) + plen > total { break }
+        // **The sequence must be the one this position owes.** See the header: this is what
+        // rejects a valid-but-stale record left by an earlier generation of the log.
+        if sq != n { break }
+        if verify(r, plen, sq, want) == false { break }
+        at = at + (ALOG_HEADER as i64) + plen
+        n = n + 1
+    }
+    free_ptr(hdr)
+    end = at
+    seq = n
+}
+
+// Read `plen` payload bytes from `r` and check them against `want`.
+//
+// The checksummed region is rebuilt here exactly as `append` laid it out — `len ++ seq ++
+// payload` — because the writer and the reader must agree byte for byte about what is covered,
+// and the cheapest way to guarantee that is for one shape to appear in both.
+fn verify(mut r: file.Reader, plen: i64, sq: i64, want: i64) -> bool {
+    let n: usize = 12 + (plen as usize)
+    var sc: *mut u8 = alloc(u8, n)
+    var sb: []u8 = slice(u8, sc, n)
+    put_u32(sb, 0, plen)
+    put_u64(sb, 4, sq)
+    var got: bool = true
+    if plen > 0 {
+        var pay: []u8 = sb[12 .. n]
+        if file.read_into(r, pay) != (plen as usize) { got = false }
+    }
+    var good: bool = false
+    if got {
+        if (crc32(sb[0 .. n]) as i64) == want { good = true }
+    }
+    free_ptr(sc)
+    return good
+}
+
+// ---- appending -------------------------------------------------------------------
+
+// Append `payload` and return the sequence number it was given.
+//
+// **The write is one `write_from`**, header and payload together, and that is not an
+// optimisation: two writes can be interrupted between them, and a header on disk with no
+// payload behind it is the exact shape recovery has to handle. One call does not make it
+// atomic — nothing at this layer can — but it removes the window this module would otherwise
+// create for itself.
+pub fn append(mut l: Log, read payload: []u8) -> i64 !{ AlogFailed(i32), AlogRefused } {
+    if l.open == false { return err(AlogRefused) }
+    if payload.len > ALOG_MAX_RECORD { return err(AlogRefused) }
+
+    let total: usize = ALOG_HEADER + payload.len
+    var rec: *mut u8 = alloc(u8, total)
+    var rb: []u8 = slice(u8, rec, total)
+
+    // The checksummed region is `len ++ seq ++ payload`. It is built in the record buffer
+    // itself: bytes 4..8 hold the CRC in the frame and are not covered, so the region is
+    // assembled in a scratch that mirrors the frame minus that hole.
+    var sc: *mut u8 = alloc(u8, 12 + payload.len)
+    var sb: []u8 = slice(u8, sc, 12 + payload.len)
+    put_u32(sb, 0, payload.len as i64)
+    put_u64(sb, 4, l.seq)
+    var i: usize = 0
+    for i < payload.len {
+        sb[12 + i] = payload[i]
+        i = i + 1
+    }
+    let c: u32 = crc32(sb[0 .. 12 + payload.len])
+    free_ptr(sc)
+
+    put_u32(rb, 0, payload.len as i64)
+    put_u32(rb, 4, c as i64)
+    put_u64(rb, 8, l.seq)
+    var k: usize = 0
+    for k < payload.len {
+        rb[ALOG_HEADER + k] = payload[k]
+        k = k + 1
+    }
+
+    let wrote: usize = file.write_from(l.w, rb)
+    free_ptr(rec)
+    if wrote != total { return err(AlogFailed(0 - 1)) }
+
+    let assigned: i64 = l.seq
+    l.seq = l.seq + 1
+    l.end = l.end + (total as i64)
+    l.appended = l.appended + 1
+    return ok(assigned)
+}
+
+// Make everything appended so far durable. See `file.sync` for why this is `fflush` AND
+// `fsync`, and for what it does not promise about the directory entry.
+//
+// Separate from `append` because a device flush costs one to two orders of magnitude more than
+// the write, and a caller batching a thousand records wants one sync. The cost is visible in
+// the API precisely so the choice is the caller's.
+pub fn sync(mut l: Log) !{ AlogFailed(i32), AlogRefused } {
+    if l.open == false { return err(AlogRefused) }
+    if file.sync(l.w) == false { return err(AlogFailed(0 - 1)) }
+    l.synced = l.synced + 1
+}
+
+// Sync and close. Idempotent on the Jestyr value.
+//
+// It syncs rather than merely closing, because a caller who closes a log has finished with it,
+// and "finished" that does not survive a power cut is not a useful meaning of the word.
+pub fn close(mut l: Log) !{ AlogFailed(i32), AlogRefused } {
+    if l.open == false { return }
+    file.sync(l.w)
+    l.open = false
+    let n: usize = file.finish(l.w) catch 0
+    if n == 0 {
+        if l.appended > 0 { return err(AlogFailed(0 - 1)) }
+    }
+}
+
+// ---- reading -----------------------------------------------------------------------
+
+// A forward cursor over a log's records.
+//
+// Separate from `Log` on purpose: reading and appending are different jobs with different
+// lifetimes, and a combined handle would make "read the log" require write permission. A
+// cursor opens the file read-only.
+pub struct Cursor {
+    r: file.Reader,
+    at: i64,
+    total: i64,
+    seq: i64,
+    bad: bool,
+    open: bool,
+}
+
+@no_alloc @no_os pub fn cursor_is_open(read cu: Cursor) -> bool { return cu.open }
+
+// Did the cursor stop because of a MALFORMED record rather than because it reached the end?
+//
+// The distinction a replaying caller needs: a clean end means the log was fully consumed, and
+// a bad record means the tail is damaged and everything after it is unreachable. Collapsing
+// them into "no more records" is how a truncated replay looks like a complete one.
+@no_alloc @no_os pub fn cursor_damaged(read cu: Cursor) -> bool { return cu.bad }
+
+// How many records the cursor has handed back.
+@no_alloc @no_os pub fn cursor_count(read cu: Cursor) -> i64 { return cu.seq }
+
+pub fn no_cursor() -> Cursor {
+    return Cursor{ r: file.no_reader(), at: 0, total: 0, seq: 0, bad: false, open: false }
+}
+
+pub fn reader(mut fh: fs.Fs, read a: Allocator, read path: str) -> Cursor !{ AlogFailed(i32), AlogRefused } {
+    if fs.can_read(fh) == false { return err(AlogRefused) }
+    var r: file.Reader = file.open_path(a, path)
+    if file.is_open(r) == false { return err(AlogFailed(0 - 1)) }
+    let total: i64 = file.size(r)
+    return ok(Cursor{ r: r, at: 0, total: total, seq: 0, bad: false, open: true })
+}
+
+pub fn cursor_close(mut cu: Cursor) {
+    if cu.open == false { return }
+    file.close(cu.r)
+    cu.open = false
+}
+
+// Read the next record into `payload`. Returns its byte length, or -1 when there is no next
+// record — check `cursor_damaged` to learn which of the two happened.
+//
+// A record too large for `payload` is reported as damage rather than truncated into it: a
+// caller handed 40 bytes of a 200-byte record has no way to know it is incomplete, and
+// silently shortening a log entry is the failure this module's whole frame exists to prevent.
+pub fn next(mut cu: Cursor, mut payload: []u8) -> isize {
+    if cu.open == false { return 0 - 1 }
+    if cu.at + (ALOG_HEADER as i64) > cu.total { return 0 - 1 }
+    var hdr: *mut u8 = alloc(u8, ALOG_HEADER)
+    var hb: []u8 = slice(u8, hdr, ALOG_HEADER)
+    if file.read_into(cu.r, hb) != ALOG_HEADER {
+        free_ptr(hdr)
+        cu.bad = true
+        return 0 - 1
+    }
+    let plen: i64 = get_u32(hb, 0)
+    let want: i64 = get_u32(hb, 4)
+    let sq: i64 = get_u64(hb, 8)
+    free_ptr(hdr)
+
+    if plen < 0 or plen > (ALOG_MAX_RECORD as i64) { cu.bad = true  return 0 - 1 }
+    if cu.at + (ALOG_HEADER as i64) + plen > cu.total { cu.bad = true  return 0 - 1 }
+    if sq != cu.seq { cu.bad = true  return 0 - 1 }
+    if (plen as usize) > payload.len { cu.bad = true  return 0 - 1 }
+
+    let n: usize = 12 + (plen as usize)
+    var sc: *mut u8 = alloc(u8, n)
+    var sb: []u8 = slice(u8, sc, n)
+    put_u32(sb, 0, plen)
+    put_u64(sb, 4, sq)
+    var got: bool = true
+    if plen > 0 {
+        var pay: []u8 = sb[12 .. n]
+        if file.read_into(cu.r, pay) != (plen as usize) { got = false }
+    }
+    var good: bool = false
+    if got {
+        if (crc32(sb[0 .. n]) as i64) == want { good = true }
+    }
+    if good {
+        var i: usize = 0
+        for i < (plen as usize) {
+            payload[i] = sb[12 + i]
+            i = i + 1
+        }
+    }
+    free_ptr(sc)
+    if good == false {
+        cu.bad = true
+        return 0 - 1
+    }
+    cu.at = cu.at + (ALOG_HEADER as i64) + plen
+    cu.seq = cu.seq + 1
+    return plen as isize
+}

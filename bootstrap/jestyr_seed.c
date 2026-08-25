@@ -28177,12 +28177,13 @@ void jestyr_emit_body(JestyrString* restrict j_sb, Jestyr_Parser j_p, JestyrStr 
         {
             jestyr_cg_mark_line(&((*j_sb)), &((*j_g)), jestyr_stmt_mark_start(j_p, j_sid));
             Jestyr_StmtData j_s = jestyr_get__list__StmtData(j_p.j_st, (size_t)(j_sid));
+            bool j_unit_tail = ((j_depth == 0) && ((*j_g).j_res_ok == (0 - 1)));
             if ((j_s.j_kind == 1))
             {
                 jestyr_emit_return(&((*j_sb)), j_p, j_src, j_c, &((*j_g)), j_s.j_a, (j_depth + 1));
             }
             else
-            if ((j_s.j_kind == 2))
+            if (((j_s.j_kind == 2) && (j_unit_tail == false)))
             {
                 jestyr_emit_return(&((*j_sb)), j_p, j_src, j_c, &((*j_g)), j_s.j_a, (j_depth + 1));
             }

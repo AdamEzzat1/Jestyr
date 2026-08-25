@@ -45,6 +45,7 @@
 #
 # Regenerate:  JC_BUILD_MATRIX=1 cargo test --release --features c-oracle jc_build_matrix
 BUILD_OK alloc_demo
+BUILD_OK alog_demo
 BUILD_OK args
 BUILD_OK binned
 BUILD_OK buildgraph_demo

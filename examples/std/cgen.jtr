@@ -6090,8 +6090,17 @@ fn emit_body(mut sb: String, read p: parser.Parser, read src: str, read c: typec
             // so map its line here, like the reference's tail arms do.
             cg_mark_line(sb, g, stmt_mark_start(p, sid))
             let s: parser.StmtData = list.get(parser.StmtData, p.st, sid as usize)
+            // **A tail EXPRESSION is not a return value when the ok type is unit.** `ret` is
+            // true for a unit-fallible fn (its C return type is `JestyrResult_unit`), so
+            // without this guard a body whose last statement is an ordinary one --
+            // `l.synced = l.synced + 1` -- emitted `return l.synced + 1`, which gcc refuses.
+            // The success return is synthesized below instead, after the statement runs.
+            //
+            // The condition is the same `depth == 0 and res_ok == -1` the unit-ok return
+            // below uses, and it is spelled once here so the two cannot drift apart.
+            let unit_tail: bool = depth == 0 and g.res_ok == 0 - 1
             if s.kind == 1 { emit_return(sb, p, src, c, g, s.a, depth + 1) }
-            else if s.kind == 2 { emit_return(sb, p, src, c, g, s.a, depth + 1) }
+            else if s.kind == 2 and unit_tail == false { emit_return(sb, p, src, c, g, s.a, depth + 1) }
             else { emit_stmt(sb, p, src, c, g, sid, depth + 1) }
         } else {
             emit_stmt(sb, p, src, c, g, sid, depth + 1)

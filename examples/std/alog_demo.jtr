@@ -1,0 +1,132 @@
+// examples/std/alog_demo.jtr — `jledger`, and the crash it survives.
+//
+// Run:  jestyrc run examples/std/alog_demo.jtr
+//
+// ─── What this demonstrates ───────────────────────────────────────────────────
+//
+// A ledger appends entries and must never lose a completed one. The interesting part is not
+// the appending — it is what happens when the process dies halfway through a write, which is
+// the case a log either handles or quietly gets wrong.
+//
+// So this program **crashes itself on purpose**: it appends three entries, syncs, and then
+// writes a partial fourth record directly to the file, which is exactly what a process killed
+// mid-`fwrite` leaves behind. Reopening reports what survived and what it threw away, and the
+// ledger keeps going from the right sequence number.
+//
+// It also shows the property that makes the numbers trustworthy: after recovery, the entries
+// read back are the ones that were completely written, in order, with no gap and no phantom.
+//
+// Everything here is deterministic — the same file, the same bytes, the same transcript — so
+// `jledger_survives_a_torn_write_and_says_what_it_lost` asserts it to the line.
+
+import "alog"
+import "file"
+import "fs"
+import "mem"
+import "sink"
+
+const LEDGER_PATH: str = "zz_jledger.log"
+const LEDGER_CAP: usize = 512
+
+// Append one entry, reporting the sequence it was given. A real ledger would carry a
+// structured record; the point here is the framing, so an entry is its text.
+fn post(mut l: alog.Log, mut buf: []u8, read text: str) -> i64 {
+    var i: usize = 0
+    for i < text.len {
+        buf[i] = text[i]
+        i = i + 1
+    }
+    return alog.append(l, buf[0 .. text.len]) catch 0 - 1
+}
+
+// Read the whole ledger back, printing each entry. Returns how many were read.
+fn replay(read a: Allocator, mut h: fs.Fs, mut buf: []u8) -> i64 {
+    var cu: alog.Cursor = alog.reader(h, a, LEDGER_PATH) catch alog.no_cursor()
+    if alog.cursor_is_open(cu) == false {
+        print_str("(the ledger could not be opened)")
+        return 0
+    }
+    for true {
+        let n: isize = alog.next(cu, buf)
+        if n < 0 { break }
+        print_str(from_utf8(buf[0 .. n as usize]))
+    }
+    // **A clean end and a damaged one are different**, and a replay that could not tell them
+    // apart would report a truncated ledger as a complete one.
+    if alog.cursor_damaged(cu) { print_str("!! the ledger is damaged past this point") }
+    let got: i64 = alog.cursor_count(cu)
+    alog.cursor_close(cu)
+    return got
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    var h: fs.Fs = fs.host()
+    fs.erase(h, LEDGER_PATH)
+
+    var raw: *mut u8 = alloc(u8, LEDGER_CAP)
+    var buf: []u8 = slice(u8, raw, LEDGER_CAP)
+
+    print_str("-- jledger --")
+
+    // ---- an ordinary session ----
+    var l: alog.Log = alog.open(h, a, LEDGER_PATH) catch alog.closed()
+    print_str("opened a fresh ledger, entries recovered")
+    print_int(alog.recovered(l))
+    print_int(post(l, buf, "open  balance 100"))
+    print_int(post(l, buf, "debit  15 -> 85"))
+    print_int(post(l, buf, "credit 40 -> 125"))
+
+    // **`sync` is what makes those three survive a power cut**, and it is separate from
+    // `append` because a device flush costs orders of magnitude more than the write.
+    alog.sync(l) catch nothing()
+    print_str("entries appended, then synced once")
+    print_int(alog.appended(l))
+    print_int(alog.syncs(l))
+    alog.close(l) catch nothing()
+
+    // ---- the crash ----
+    //
+    // Nine bytes of a record whose header promised sixteen. This is what a process killed
+    // between the header and the payload leaves on disk; nothing about it is a valid record.
+    print_str("-- simulating a process killed mid-write --")
+    var torn: *mut u8 = alloc(u8, 9)
+    var tb: []u8 = slice(u8, torn, 9)
+    var k: usize = 0
+    for k < 9 {
+        tb[k] = 255 as u8
+        k = k + 1
+    }
+    var w: file.Writer = file.append_path(a, LEDGER_PATH)
+    file.write_from(w, tb)
+    let dead: usize = file.finish(w) catch 0
+    free_ptr(torn)
+
+    // ---- recovery ----
+    var l2: alog.Log = alog.open(h, a, LEDGER_PATH) catch alog.closed()
+    print_str("reopened; entries recovered")
+    print_int(alog.recovered(l2))
+    print_str("bytes discarded as a torn tail")
+    print_int(alog.discarded(l2))
+    print_str("the next entry will be number")
+    print_int(alog.next_seq(l2))
+
+    // The ledger is usable again immediately, and the entry written after recovery lands
+    // where the torn bytes were — which is what the truncation buys.
+    print_int(post(l2, buf, "debit  25 -> 100"))
+    alog.close(l2) catch nothing()
+
+    // ---- the check ----
+    print_str("-- replaying the whole ledger --")
+    let n: i64 = replay(a, h, buf)
+    print_str("entries replayed")
+    print_int(n)
+    print_str("no entry was lost and none was invented")
+    print_bool(n == 4)
+
+    fs.erase(h, LEDGER_PATH)
+    free_ptr(raw)
+    return 0
+}
+
+fn nothing() { }

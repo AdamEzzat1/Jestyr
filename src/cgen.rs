@@ -2800,7 +2800,18 @@ impl<'a> Cgen<'a> {
                 let sp = self.stmt_span(stmt);
                 self.mark_line(sp);
                 match stmt {
-                    Stmt::Expr(e) => self.emit_return(Some(*e)),
+                    // **A tail EXPRESSION is not a return value when the ok type is unit.**
+                    // `ret` is true for a unit-fallible function (its C return type is
+                    // `JestyrResult_unit`), so without this guard a body whose last statement
+                    // is an ordinary one -- `l.synced = l.synced + 1` -- was emitted as
+                    // `return l.synced + 1`, which gcc refuses: an `int64_t` returned from a
+                    // struct-returning function. `jestyrc check` reported ok, so it was a
+                    // degrades-to-gcc row, found by `std/alog`'s `sync`.
+                    //
+                    // There is no value to return here. The statement runs as a statement and
+                    // the success return is synthesized below, which is the same path a body
+                    // that simply ends already takes.
+                    Stmt::Expr(e) if !unit_tail => self.emit_return(Some(*e)),
                     Stmt::Return { value, .. } => self.emit_return(*value),
                     _ => self.emit_stmt(stmt),
                 }
@@ -3800,7 +3811,18 @@ impl<'a> Cgen<'a> {
                 let sp = self.stmt_span(stmt);
                 self.mark_line(sp);
                 match stmt {
-                    Stmt::Expr(e) => self.emit_return(Some(*e)),
+                    // **A tail EXPRESSION is not a return value when the ok type is unit.**
+                    // `ret` is true for a unit-fallible function (its C return type is
+                    // `JestyrResult_unit`), so without this guard a body whose last statement
+                    // is an ordinary one -- `l.synced = l.synced + 1` -- was emitted as
+                    // `return l.synced + 1`, which gcc refuses: an `int64_t` returned from a
+                    // struct-returning function. `jestyrc check` reported ok, so it was a
+                    // degrades-to-gcc row, found by `std/alog`'s `sync`.
+                    //
+                    // There is no value to return here. The statement runs as a statement and
+                    // the success return is synthesized below, which is the same path a body
+                    // that simply ends already takes.
+                    Stmt::Expr(e) if !unit_tail => self.emit_return(Some(*e)),
                     Stmt::Return { value, .. } => self.emit_return(*value),
                     _ => self.emit_stmt(stmt),
                 }
