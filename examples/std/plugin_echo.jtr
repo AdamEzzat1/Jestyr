@@ -1,0 +1,94 @@
+// examples/std/plugin_echo.jtr — the other side of the protocol: a real plugin.
+//
+// A plugin's whole contract is three lines long:
+//
+//   1. read the request the host wrote,
+//   2. write a response,
+//   3. exit 0 IF AND ONLY IF a valid response is waiting.
+//
+// Rule 3 is the one that matters and the one this file exists to demonstrate. The host reads
+// an exit code of 0 as a promise, so every path that does not leave a good response behind
+// must exit non-zero — a bad frame, an unknown protocol version, a failed write. A plugin that
+// exits 0 having written nothing is the `PLUGIN_BAD_RESPONSE` case, and it is the plugin's
+// bug, not the host's.
+//
+// This one upper-cases its payload, and understands one directive: a payload beginning with
+// `!fail` makes it report an error the way a real plugin reports one it can describe.
+//
+// Invoked as:  plugin_echo <request-path> <response-path>
+
+import "plugin"
+import "env"
+import "mem"
+
+const ECHO_CAP: usize = 4096
+
+// The plugin's own error exits. Distinct numbers so a host — or a person reading a build log —
+// can tell which refusal happened without a response to read.
+const ECHO_EXIT_BAD_ARGS: i32 = 2
+const ECHO_EXIT_BAD_FRAME: i32 = 3
+const ECHO_EXIT_BAD_VERSION: i32 = 4
+const ECHO_EXIT_WORK_FAILED: i32 = 5
+const ECHO_EXIT_WRITE_FAILED: i32 = 6
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    if env.argc() < 3 { return ECHO_EXIT_BAD_ARGS }
+    let req_path: str = env.argv(1)
+    let resp_path: str = env.argv(2)
+
+    var raw: *mut u8 = alloc(u8, ECHO_CAP)
+    var buf: []u8 = slice(u8, raw, ECHO_CAP)
+    var status: i32 = 0
+    let n: isize = plugin.read_request(a, req_path, buf, status)
+    if n < 0 {
+        free_ptr(raw)
+        // **An unknown version is reported differently from a corrupt frame**, because they
+        // are different bugs: one is a deployment mismatch, the other is a broken host or a
+        // broken disk.
+        if status == plugin.PLUGIN_BAD_VERSION { return ECHO_EXIT_BAD_VERSION }
+        return ECHO_EXIT_BAD_FRAME
+    }
+    let len: usize = n as usize
+
+    // `!fail` — the plugin is asked to fail in a way it can describe. It exits non-zero
+    // WITHOUT writing a response, which is the `PLUGIN_FAILED` path: the host learns the
+    // plugin ran and reported trouble, and gets its exit code to act on.
+    if starts(buf, len, "!fail") {
+        free_ptr(raw)
+        return ECHO_EXIT_WORK_FAILED
+    }
+
+    // `!silent` — **the plugin MISBEHAVES on purpose**: it exits 0 having written nothing.
+    // This is the case the whole `PLUGIN_BAD_RESPONSE` outcome exists for, and it cannot be
+    // demonstrated with a well-behaved plugin. A host that trusted the exit code would report
+    // success and then read whatever file happened to be lying around.
+    if starts(buf, len, "!silent") {
+        free_ptr(raw)
+        return 0
+    }
+
+    // The work: upper-case ASCII in place.
+    var i: usize = 0
+    for i < len {
+        let ch: i32 = buf[i] as i32
+        if ch >= 97 and ch <= 122 { buf[i] = (ch - 32) as u8 }
+        i = i + 1
+    }
+
+    let wrote: bool = plugin.write_response(a, resp_path, buf[0 .. len])
+    free_ptr(raw)
+    // **A failed write must NOT exit 0.** A half-written response with a success code is
+    // exactly what the host cannot detect any other way.
+    if wrote == false { return ECHO_EXIT_WRITE_FAILED }
+    return 0
+}
+
+// Does the first `len` bytes of `buf` begin with `pre`?
+fn starts(read buf: []u8, len: usize, read pre: str) -> bool {
+    if len < pre.len { return false }
+    for i in 0..pre.len {
+        if buf[i] != pre[i] { return false }
+    }
+    return true
+}

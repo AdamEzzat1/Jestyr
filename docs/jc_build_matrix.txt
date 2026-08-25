@@ -86,6 +86,8 @@ BUILD_OK par_soac
 BUILD_OK parse_float
 BUILD_OK parser_cli
 BUILD_OK path_demo
+BUILD_OK plugin_demo
+BUILD_OK plugin_echo
 BUILD_OK process_demo
 BUILD_OK reductions
 BUILD_OK runtime_demo

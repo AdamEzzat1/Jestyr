@@ -1,0 +1,420 @@
+// std/plugin.jtr — calling code you did not compile, and surviving it.
+//
+// TIER: `std`. It composes `std/process` (spawning), `std/file` (the messages) and
+// `std/alog`'s checksum; it binds nothing itself.
+//
+// ─── What a plugin protocol is FOR ────────────────────────────────────────────
+//
+// A plugin runs in another process, and the entire reason for that is ISOLATION: a plugin that
+// crashes, hangs on a null pointer, or corrupts its heap must not take the host with it. An
+// in-process plugin is a dynamic library and shares the host's fate.
+//
+// So the value of this module is not the calling — it is the FAILURE TAXONOMY. Four things can
+// go wrong and they have four different fixes, which is why they are four different answers
+// rather than one `bool`:
+//
+//   PLUGIN_OK            the plugin answered
+//   PLUGIN_FAILED        it ran and reported an error itself (its own exit code)
+//   PLUGIN_CRASHED       it did not exit normally, or could not be started at all
+//   PLUGIN_BAD_RESPONSE  it exited 0 and what it wrote is not a valid response
+//
+// Collapsing those is what makes plugin systems miserable to debug. `PLUGIN_BAD_RESPONSE` in
+// particular is the one everybody forgets: a plugin that exits 0 having written nothing, or
+// half a message, or a message for a protocol version it invented, has FAILED — and an exit
+// code of 0 says it succeeded.
+//
+// ─── The transport, and the limitation that chose it ──────────────────────────
+//
+// **One request, one response, one process per call.** The host writes a request file, runs
+// the plugin with both paths as arguments, and reads the response file.
+//
+// That is not the design anyone would pick first. A long-lived plugin server — one process,
+// many requests, streaming — is better in every way except that **it cannot be built on what
+// this tree has.** `std/process` runs commands through `system()`, which BLOCKS until the child
+// exits, so a host can never both run a plugin and talk to it. The loopback-socket design
+// `std/sysnet` would otherwise support needs a child running CONCURRENTLY with its parent, and
+// that needs `posix_spawn`/`CreateProcess` — a real `sys` module, not a wrapper. Named here as
+// the unblocker rather than worked around.
+//
+// So the cost is a process start per call, which is real: a plugin invoked per source file in
+// a build is paying milliseconds each time. That is the trade this shape makes, and it is the
+// same one `git` hooks and most linter plugins make.
+//
+// **Paths as ARGUMENTS, not shell redirection.** `plugin < req > resp` works in both `cmd.exe`
+// and `sh`, and it was still not chosen: the plugin would then have to read stdin, and nothing
+// in this tree can — `std/file` opens paths. Arguments keep the plugin side writable in Jestyr
+// with the modules that exist.
+//
+// ─── The message frame ────────────────────────────────────────────────────────
+//
+//     offset 0      (4 bytes)  magic   "JPL1", so a file that is not a message is refused
+//                                      before its length is believed
+//     offset 4      (2 bytes)  version protocol version, LITTLE-ENDIAN
+//     offset 6      (2 bytes)  kind    request or response
+//     offset 8      (4 bytes)  len     payload length, LITTLE-ENDIAN
+//     offset 12     (len)      payload
+//     offset 12+len (4 bytes)  crc     CRC-32 of everything before it
+//
+// **The checksum is a TRAILER rather than a header field, and that is not cosmetic.** With it
+// in the middle, the checksummed region is everything except itself — two disjoint ranges — so
+// computing it needs a scratch copy, and `encode` could not be `@no_alloc`. Putting it last
+// makes the region `0 .. 12+len`, one contiguous slice, and both sides check it without
+// allocating anything. The `@no_alloc` contract is what surfaced this: the first version
+// carried the attribute and the compiler refused it, which is the attribute doing its job.
+//
+// **The magic is first and is checked first**, because everything after it is only meaningful
+// if this is a message at all. Without it, a truncated file of zeroes parses as a
+// version-0 message of length 0 and passes its checksum.
+//
+// **The checksum is `alog.crc32`**, deliberately reused rather than reimplemented: two CRC
+// implementations in one tree is two places to be wrong about one question, and that one is
+// already pinned against the published vector.
+//
+// **Byte order is written explicitly.** A plugin may be compiled by a different toolchain on a
+// different machine — that is the entire point of a plugin — so the frame cannot inherit the
+// host's order. The same rule `std/alog` and `std/sysnet` follow.
+//
+// ─── Version negotiation, and why it is a REFUSAL and not a fallback ──────────
+//
+// The request carries `PLUGIN_VERSION`. A plugin that does not know that version must refuse —
+// `read_request` returns `PLUGIN_BAD_VERSION` and the plugin is expected to exit non-zero
+// rather than answer.
+//
+// It is not a negotiation, and that is a decision: a plugin that "does its best" with a
+// version it does not understand produces answers the host cannot interpret and cannot
+// distinguish from correct ones. A clean refusal is a bug report; a best effort is a mystery.
+//
+// ─── What this does NOT do ────────────────────────────────────────────────────
+//
+// No timeouts. `system()` blocks, and there is no way to interrupt it from here — a plugin that
+// hangs hangs the host, which is a genuine hole and the second reason to want a real spawn.
+// No streaming, no concurrent calls, no plugin-initiated messages, and no sandbox: a plugin is
+// a program running with the host's privileges. `process.denied()` refuses to run anything at
+// all, which is the only enforcement this tier has.
+//
+// Worked example:  examples/std/plugin_demo.jtr (host) + examples/std/plugin_echo.jtr (plugin)
+// Run the tests:   jestyrc test examples/std/plugin_test.jtr
+
+import "alog"
+import "file"
+import "fs"
+import "process"
+import "str"
+
+// ---- the frame ------------------------------------------------------------------
+
+pub const PLUGIN_HEADER: usize = 12
+pub const PLUGIN_TRAILER: usize = 4
+pub const PLUGIN_VERSION: i64 = 1
+pub const PLUGIN_MAX_PAYLOAD: usize = 4194304
+
+pub const PLUGIN_KIND_REQUEST: i64 = 1
+pub const PLUGIN_KIND_RESPONSE: i64 = 2
+
+// ---- what a call can answer ------------------------------------------------------
+//
+// Four, because there are four different fixes. See the header.
+
+pub const PLUGIN_OK: i32 = 0
+pub const PLUGIN_FAILED: i32 = 1           // it ran and reported an error itself
+pub const PLUGIN_CRASHED: i32 = 2          // did not exit normally, or never started
+pub const PLUGIN_BAD_RESPONSE: i32 = 3     // exited 0 and wrote something unusable
+pub const PLUGIN_REFUSED: i32 = 4          // the capability said no
+
+@no_alloc @no_os pub fn outcome_name(o: i32) -> str {
+    if o == PLUGIN_OK { return "ok" }
+    if o == PLUGIN_FAILED { return "failed" }
+    if o == PLUGIN_CRASHED { return "crashed" }
+    if o == PLUGIN_BAD_RESPONSE { return "bad-response" }
+    return "refused"
+}
+
+// What a plugin's `read_request` reports.
+pub const PLUGIN_REQ_OK: i32 = 0
+pub const PLUGIN_BAD_FRAME: i32 = 1        // not a message, or corrupt
+pub const PLUGIN_BAD_VERSION: i32 = 2      // a version this plugin does not know
+
+// ---- little-endian, written explicitly -------------------------------------------
+
+@no_alloc @no_os fn put_u16(mut b: []u8, at: usize, v: i64) {
+    b[at + 0] = (v & 255) as u8
+    b[at + 1] = ((v >> 8) & 255) as u8
+}
+
+@no_alloc @no_os fn put_u32(mut b: []u8, at: usize, v: i64) {
+    b[at + 0] = (v & 255) as u8
+    b[at + 1] = ((v >> 8) & 255) as u8
+    b[at + 2] = ((v >> 16) & 255) as u8
+    b[at + 3] = ((v >> 24) & 255) as u8
+}
+
+@no_alloc @no_os fn get_u16(read b: []u8, at: usize) -> i64 {
+    return (b[at + 0] as i64) | ((b[at + 1] as i64) << 8)
+}
+
+@no_alloc @no_os fn get_u32(read b: []u8, at: usize) -> i64 {
+    return (b[at + 0] as i64) | ((b[at + 1] as i64) << 8) | ((b[at + 2] as i64) << 16) | ((b[at + 3] as i64) << 24)
+}
+
+// `JPL1`. Checked before anything else in the frame is believed.
+@no_alloc @no_os fn magic_ok(read b: []u8) -> bool {
+    if b.len < 4 { return false }
+    if (b[0] as i32) != 74 { return false }        // J
+    if (b[1] as i32) != 80 { return false }        // P
+    if (b[2] as i32) != 76 { return false }        // L
+    if (b[3] as i32) != 49 { return false }        // 1
+    return true
+}
+
+// Encode a message into `out`. Returns its total length, or 0 if `out` is too small.
+//
+// **Public, and pure**, so both sides of the protocol use the same encoder and a test can
+// build a message without a plugin. A host and a plugin that encoded separately would be two
+// implementations of one format, which is the shape `std/alog`'s test deliberately takes ON
+// PURPOSE for cross-checking — and which a shipped protocol must never have.
+@no_alloc @no_os pub fn encode(mut dst: []u8, kind: i64, version: i64, read payload: []u8) -> usize {
+    let total: usize = PLUGIN_HEADER + PLUGIN_TRAILER + payload.len
+    if dst.len < total { return 0 }
+    if payload.len > PLUGIN_MAX_PAYLOAD { return 0 }
+    dst[0] = 74 as u8
+    dst[1] = 80 as u8
+    dst[2] = 76 as u8
+    dst[3] = 49 as u8
+    put_u16(dst, 4, version)
+    put_u16(dst, 6, kind)
+    put_u32(dst, 8, payload.len as i64)
+    var i: usize = 0
+    for i < payload.len {
+        dst[PLUGIN_HEADER + i] = payload[i]
+        i = i + 1
+    }
+    // The checksum is the TRAILER, over everything before it — one contiguous slice, which is
+    // what lets this function be `@no_alloc`. See the header.
+    put_u32(dst, PLUGIN_HEADER + payload.len, alog.crc32(dst[0 .. PLUGIN_HEADER + payload.len]) as i64)
+    return total
+}
+
+// Validate a frame and report its payload length, or -1 if it is not a usable message of
+// `want_kind`. `bad_version` is set when the frame is well-formed but speaks another version —
+// the one failure a caller reports differently from corruption.
+@no_alloc @no_os fn decode(read frame: []u8, want_kind: i64, mut bad_version: bool) -> isize {
+    bad_version = false
+    if frame.len < PLUGIN_HEADER + PLUGIN_TRAILER { return 0 - 1 }
+    if magic_ok(frame) == false { return 0 - 1 }
+    let plen: i64 = get_u32(frame, 8)
+    if plen < 0 or plen > (PLUGIN_MAX_PAYLOAD as i64) { return 0 - 1 }
+    if ((PLUGIN_HEADER + PLUGIN_TRAILER) as i64) + plen != (frame.len as i64) { return 0 - 1 }
+    if get_u16(frame, 6) != want_kind { return 0 - 1 }
+    // **The checksum is verified BEFORE the version is trusted.** A corrupt frame can carry any
+    // version at all, and reporting "unsupported version" for what is really bit rot sends a
+    // caller after entirely the wrong bug.
+    let body: usize = PLUGIN_HEADER + (plen as usize)
+    if (alog.crc32(frame[0 .. body]) as i64) != get_u32(frame, body) { return 0 - 1 }
+    if get_u16(frame, 4) != PLUGIN_VERSION {
+        bad_version = true
+        return 0 - 1
+    }
+    return plen as isize
+}
+
+// ---- the host side ----------------------------------------------------------------
+
+// A host that may call plugins. It is `process.Process` plus `fs.Fs` because a call needs
+// both — and both are the caller's to grant, so a function that calls plugins says so in its
+// signature exactly as one that runs commands does.
+pub struct Host {
+    p: process.Process,
+    f: fs.Fs,
+    calls: i64,
+    failures: i64,
+}
+
+pub fn host(take p: process.Process, take f: fs.Fs) -> Host {
+    return Host{ p: p, f: f, calls: 0, failures: 0 }
+}
+
+@no_alloc @no_os pub fn calls(read h: Host) -> i64 { return h.calls }
+@no_alloc @no_os pub fn failures(read h: Host) -> i64 { return h.failures }
+
+// What a call answers: an outcome, the plugin's exit code, and the response length.
+//
+// `@copy`: three scalars. The response BYTES land in the caller's buffer, which is the shape
+// every reader in this tree takes — a `Reply` that owned its payload would be an allocation
+// per call for data the caller already has somewhere to put.
+@copy pub struct Reply {
+    pub outcome: i32,
+    pub exit_code: i32,
+    pub len: usize,
+}
+
+@no_alloc @no_os pub fn succeeded(read r: Reply) -> bool { return r.outcome == PLUGIN_OK }
+
+// Call `cmd`, handing it `request` and reading its answer into `response`.
+//
+// `req_path` and `resp_path` are the two files the plugin is told about; they are the caller's
+// to name so a host running several plugins can keep them apart, and so a test can look at
+// them afterwards.
+//
+// **The command is built as `<cmd> <req_path> <resp_path>`**, which means `cmd` may carry its
+// own arguments and the two paths always arrive last. A path containing a space would break
+// that, and this module does NOT quote it: quoting differs between `cmd.exe` and `sh`, and a
+// half-right quoting rule is worse than a documented restriction. `plugin_paths_must_not_
+// contain_spaces` pins the refusal.
+pub fn call(mut h: Host, read a: Allocator, read cmd: str, read req_path: str, read resp_path: str,
+            read request: []u8, mut response: []u8) -> Reply {
+    h.calls = h.calls + 1
+    // **Both capabilities are checked BEFORE anything happens**, and the process one is
+    // checked rather than inferred from `run`'s answer. `std/process`'s own header says why:
+    // a denied handle reports -1 and so does a real `system()` failure, so -1 is deliberately
+    // not a discriminator. Asking `can_run` first is what keeps `PLUGIN_REFUSED` distinct
+    // from `PLUGIN_CRASHED` — and those are the two outcomes a caller most needs to tell
+    // apart, since one is its own configuration and the other is the plugin's fault.
+    if process.can_run(h.p) == false { return fail(h, PLUGIN_REFUSED, 0) }
+    if fs.can_write(h.f) == false { return fail(h, PLUGIN_REFUSED, 0) }
+    // `cmd` MAY contain spaces — it carries the plugin's own arguments. The two PATHS may not,
+    // because they are appended to a shell command line unquoted. See the header on why this
+    // refuses rather than quoting.
+    if has_space(req_path) or has_space(resp_path) { return fail(h, PLUGIN_REFUSED, 0) }
+
+    // Write the request.
+    let total: usize = PLUGIN_HEADER + PLUGIN_TRAILER + request.len
+    var raw: *mut u8 = alloc(u8, total)
+    var frame: []u8 = slice(u8, raw, total)
+    let n: usize = encode(frame, PLUGIN_KIND_REQUEST, PLUGIN_VERSION, request)
+    if n == 0 {
+        free_ptr(raw)
+        return fail(h, PLUGIN_REFUSED, 0)
+    }
+    var w: file.Writer = file.create_path(a, req_path)
+    file.write_from(w, frame[0 .. n])
+    let put: usize = file.finish(w) catch 0
+    free_ptr(raw)
+    if put != n { return fail(h, PLUGIN_REFUSED, 0) }
+
+    // Remove any stale response BEFORE running, so a plugin that writes nothing cannot be
+    // mistaken for one that answered — the previous call's file would otherwise be read as
+    // this call's reply. That is the subtlest bug in a file-based protocol and it is silent.
+    fs.erase(h.f, resp_path)
+
+    var line: String = string_new()
+    string_push(line, cmd)
+    string_push(line, " ")
+    string_push(line, req_path)
+    string_push(line, " ")
+    string_push(line, resp_path)
+    let code: i32 = process.run(h.p, string_view(line))
+    string_free(line)
+
+    // `run` reports -1 for "did not exit normally" — signalled, or the shell could not start
+    // it. That is the isolation this whole module exists for, so it is its own outcome.
+    if code < 0 { return fail(h, PLUGIN_CRASHED, code) }
+    if code != 0 { return fail(h, PLUGIN_FAILED, code) }
+
+    // **Exit 0 is not success.** A plugin that wrote nothing, or half a message, or a message
+    // for a version it invented, has failed — and its exit code says otherwise.
+    var r: file.Reader = file.open_path(a, resp_path)
+    if file.is_open(r) == false { return fail(h, PLUGIN_BAD_RESPONSE, code) }
+    let size: i64 = file.size(r)
+    if size < ((PLUGIN_HEADER + PLUGIN_TRAILER) as i64) or size > ((PLUGIN_HEADER + PLUGIN_TRAILER + PLUGIN_MAX_PAYLOAD) as i64) {
+        file.close(r)
+        return fail(h, PLUGIN_BAD_RESPONSE, code)
+    }
+    var rraw: *mut u8 = alloc(u8, size as usize)
+    var rframe: []u8 = slice(u8, rraw, size as usize)
+    let got: usize = file.read_into(r, rframe)
+    file.close(r)
+    var badver: bool = false
+    var plen: isize = 0 - 1
+    if got == (size as usize) { plen = decode(rframe, PLUGIN_KIND_RESPONSE, badver) }
+    if plen < 0 {
+        free_ptr(rraw)
+        return fail(h, PLUGIN_BAD_RESPONSE, code)
+    }
+    if (plen as usize) > response.len {
+        free_ptr(rraw)
+        return fail(h, PLUGIN_BAD_RESPONSE, code)
+    }
+    var i: usize = 0
+    for i < (plen as usize) {
+        response[i] = rframe[PLUGIN_HEADER + i]
+        i = i + 1
+    }
+    free_ptr(rraw)
+    return Reply{ outcome: PLUGIN_OK, exit_code: code, len: plen as usize }
+}
+
+fn fail(mut h: Host, outcome: i32, code: i32) -> Reply {
+    h.failures = h.failures + 1
+    return Reply{ outcome: outcome, exit_code: code, len: 0 }
+}
+
+@no_alloc @no_os fn has_space(read s: str) -> bool {
+    for i in 0..s.len {
+        if (s[i] as i32) == 32 { return true }
+    }
+    return false
+}
+
+// ---- the plugin side ----------------------------------------------------------------
+
+// Read the request a host wrote at `path` into `payload`. Returns its length, or -1 with
+// `status` saying why.
+//
+// A plugin's whole contract is: read this, answer, exit 0. Anything else — a bad frame, a
+// version it does not know — must exit NON-ZERO, because the host reads an exit code of 0 as
+// a promise that a valid response is waiting.
+pub fn read_request(read a: Allocator, read path: str, mut payload: []u8, mut status: i32) -> isize {
+    status = PLUGIN_BAD_FRAME
+    var r: file.Reader = file.open_path(a, path)
+    if file.is_open(r) == false { return 0 - 1 }
+    let size: i64 = file.size(r)
+    if size < ((PLUGIN_HEADER + PLUGIN_TRAILER) as i64) or size > ((PLUGIN_HEADER + PLUGIN_TRAILER + PLUGIN_MAX_PAYLOAD) as i64) {
+        file.close(r)
+        return 0 - 1
+    }
+    var raw: *mut u8 = alloc(u8, size as usize)
+    var frame: []u8 = slice(u8, raw, size as usize)
+    let got: usize = file.read_into(r, frame)
+    file.close(r)
+    var badver: bool = false
+    var plen: isize = 0 - 1
+    if got == (size as usize) { plen = decode(frame, PLUGIN_KIND_REQUEST, badver) }
+    if plen < 0 {
+        if badver { status = PLUGIN_BAD_VERSION }
+        free_ptr(raw)
+        return 0 - 1
+    }
+    if (plen as usize) > payload.len {
+        free_ptr(raw)
+        return 0 - 1
+    }
+    var i: usize = 0
+    for i < (plen as usize) {
+        payload[i] = frame[PLUGIN_HEADER + i]
+        i = i + 1
+    }
+    free_ptr(raw)
+    status = PLUGIN_REQ_OK
+    return plen as isize
+}
+
+// Write a response to `path`. True if it went out whole.
+//
+// A plugin that returns false here must exit non-zero: a half-written response with an exit
+// code of 0 is precisely the `PLUGIN_BAD_RESPONSE` case, and the plugin is the only side that
+// knows it happened.
+pub fn write_response(read a: Allocator, read path: str, read payload: []u8) -> bool {
+    let total: usize = PLUGIN_HEADER + PLUGIN_TRAILER + payload.len
+    var raw: *mut u8 = alloc(u8, total)
+    var frame: []u8 = slice(u8, raw, total)
+    let n: usize = encode(frame, PLUGIN_KIND_RESPONSE, PLUGIN_VERSION, payload)
+    var okay: bool = false
+    if n > 0 {
+        var w: file.Writer = file.create_path(a, path)
+        file.write_from(w, frame[0 .. n])
+        let put: usize = file.finish(w) catch 0
+        if put == n { okay = true }
+    }
+    free_ptr(raw)
+    return okay
+}

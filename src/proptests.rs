@@ -651,6 +651,70 @@ mod syswatch_debounced_trigger {
     }
 }
 
+/// **`jhost` — a host that survives every way a plugin can let it down.**
+///
+/// The only test in the tree that runs **two Jestyr programs against each other**: it compiles
+/// `plugin_echo.jtr` to an executable and hands its path to `plugin_demo.jtr`, which invokes it
+/// four times for real through `system()`.
+///
+/// Three of those calls go wrong on purpose, and the assertion is that they are told APART:
+///
+/// * a plugin reporting its own error → `failed`, carrying the plugin's exit code (5)
+/// * a plugin that exits 0 and writes nothing → `bad-response`, **exit code 0**
+/// * a host with no permission → `refused`, without the plugin running at all
+///
+/// The middle one is the reason the module exists. Exit 0 is a promise that a valid response
+/// is waiting; a host that believed it would report success and then read whatever file was
+/// lying around — which, without the response file being deleted on every call, is the
+/// PREVIOUS call's answer.
+#[cfg(all(test, feature = "c-oracle"))]
+mod plugin_protocol {
+    use super::*;
+
+    #[test]
+    fn jhost_survives_every_way_a_plugin_can_fail() {
+        // Two programs, compiled separately, talking over the wire format.
+        let echo = super::c_oracle::build_exe("examples/std/plugin_echo.jtr");
+        let host = super::c_oracle::build_exe("examples/std/plugin_demo.jtr");
+        let run = std::process::Command::new(&host).arg(&echo).output().unwrap();
+        assert_eq!(run.status.code(), Some(0), "the host must exit cleanly whatever the plugin does");
+        let out = String::from_utf8_lossy(&run.stdout).replace("\r\n", "\n");
+
+        let want = "-- jhost --\n\
+                    -- an ordinary call --\n\
+                    ok\nHELLO FROM THE HOST\n\
+                    -- a plugin that reports its own error --\n\
+                    failed\nexit code\n5\n\
+                    -- a plugin that exits 0 and answers nothing --\n\
+                    bad-response\nexit code\n0\n\
+                    -- a host with no permission --\n\
+                    refused\nexit code\n0\n\
+                    -- the host is still standing --\n\
+                    calls\n3\nfailures\n2\n\
+                    the denied host ran nothing\ntrue";
+        assert_eq!(out.trim_end(), want, "the plugin host's transcript changed:\n{out}");
+
+        // **The four outcomes must be four DIFFERENT words.** A regression that collapsed any
+        // two of them would still produce a plausible transcript, so they are counted.
+        for verdict in ["ok", "failed", "bad-response", "refused"] {
+            assert!(out.contains(verdict), "outcome `{verdict}` is missing:\n{out}");
+        }
+        // `bad-response` with exit code 0 is the pairing that matters: it is the case an
+        // exit-code-only host cannot see.
+        assert!(
+            out.contains("bad-response\nexit code\n0"),
+            "a plugin that exits 0 and answers nothing must be bad-response, not ok:\n{out}"
+        );
+        // And the refusal must NOT be reported as a crash — `process.run` answers -1 for both,
+        // so telling them apart takes the deliberate `can_run` check.
+        assert!(!out.contains("crashed"), "a denied capability is a refusal, not a crash:\n{out}");
+
+        // The demo scrubs its scratch files at both ends.
+        assert!(!std::path::Path::new("zz_jhost_req.bin").exists(), "the demo must clean up after itself");
+        assert!(!std::path::Path::new("zz_jhost_resp.bin").exists(), "the demo must clean up after itself");
+    }
+}
+
 /// **`jledger` — a log that crashes itself and says what it lost.**
 ///
 /// `examples/std/alog_demo.jtr` is `std/alog`'s consumer, and it is a consumer rather than an
@@ -16431,6 +16495,10 @@ fn main() -> i32 {
         "alog.jtr",
         "alog_test.jtr",
         "alog_demo.jtr",
+        "plugin.jtr",
+        "plugin_test.jtr",
+        "plugin_echo.jtr",
+        "plugin_demo.jtr",
         "log.jtr",
         "log_test.jtr",
         "log_demo.jtr",
@@ -17513,6 +17581,11 @@ fn main() -> i32 {
             // costs a second implementation of the frame and buys an independent encoder: a
             // test that corrupts a file the module wrote can only ever agree with the module.
             ("alog_test", 6),
+            // The frame and the refusals that happen before a process starts. The END-TO-END
+            // half — a real plugin, really invoked, failing three different ways — is
+            // `jhost_survives_every_way_a_plugin_can_fail`, because it needs a COMPILED
+            // plugin and a `.jtr` suite cannot build one.
+            ("plugin_test", 4),
         ] {
             let (out, code) = build_tests_and_run(&format!("examples/std/{f}.jtr"), None);
             assert_eq!(code, 0, "std/{f} must pass:\n{out}");

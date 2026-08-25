@@ -1,0 +1,106 @@
+// examples/std/plugin_demo.jtr — `jhost`, and the four ways a plugin can let you down.
+//
+// Run:  jestyrc run examples/std/plugin_demo.jtr <path-to-plugin_echo-exe>
+//
+// ─── What this demonstrates ───────────────────────────────────────────────────
+//
+// The point of running a plugin in another process is that it can fail without taking the host
+// with it. So this host calls a REAL plugin — `examples/std/plugin_echo.jtr`, compiled — four
+// times, and three of those calls go wrong on purpose:
+//
+//   1. an ordinary call, which answers
+//   2. a plugin that reports an error itself      -> PLUGIN_FAILED, with its exit code
+//   3. a plugin that exits 0 and writes NOTHING   -> PLUGIN_BAD_RESPONSE
+//   4. a host with no permission to run anything  -> PLUGIN_REFUSED
+//
+// **Case 3 is the one worth the whole module.** The plugin exits 0, which is a promise that a
+// valid response is waiting, and there is none. A host that trusted the exit code would report
+// success and then read whatever file happened to be lying around — which, before the response
+// file is deleted on every call, would be the PREVIOUS call's answer. That is the subtlest bug
+// available in a file-based protocol and it is completely silent.
+//
+// The host survives all four and keeps its own counters straight, which is the property being
+// demonstrated: nothing here is a crash, an abort, or a corrupted host.
+
+import "plugin"
+import "process"
+import "fs"
+import "env"
+import "mem"
+
+const HOST_CAP: usize = 4096
+const REQ_PATH: str = "zz_jhost_req.bin"
+const RESP_PATH: str = "zz_jhost_resp.bin"
+
+// One call, reported the same way every time: the outcome by name, then the payload if there
+// is one. Printing the OUTCOME rather than a bool is the whole point — see the module header.
+fn attempt(mut h: plugin.Host, read a: Allocator, read cmd: str, read label: str,
+           read request: []u8, mut response: []u8) {
+    print_str(label)
+    let r: plugin.Reply = plugin.call(h, a, cmd, REQ_PATH, RESP_PATH, request, response)
+    print_str(plugin.outcome_name(r.outcome))
+    if plugin.succeeded(r) {
+        print_str(from_utf8(response[0 .. r.len]))
+    } else {
+        print_str("exit code")
+        print_int(r.exit_code as i64)
+    }
+}
+
+// Copy `text` into `buf` and report its length, so a caller can pass `buf[0 .. n]`.
+fn load(mut buf: []u8, read text: str) -> usize {
+    for i in 0..text.len {
+        buf[i] = text[i]
+    }
+    return text.len
+}
+
+fn main() -> i32 {
+    let a: Allocator = mem.system_allocator()
+    if env.argc() < 2 {
+        print_str("usage: plugin_demo <plugin-executable>")
+        return 0
+    }
+    let cmd: str = env.argv(1)
+
+    var raw: *mut u8 = alloc(u8, HOST_CAP)
+    var req: []u8 = slice(u8, raw, HOST_CAP)
+    var rraw: *mut u8 = alloc(u8, HOST_CAP)
+    var resp: []u8 = slice(u8, rraw, HOST_CAP)
+
+    print_str("-- jhost --")
+
+    var h: plugin.Host = plugin.host(process.host(), fs.host())
+
+    let n1: usize = load(req, "hello from the host")
+    attempt(h, a, cmd, "-- an ordinary call --", req[0 .. n1], resp)
+
+    let n2: usize = load(req, "!fail the plugin cannot do this")
+    attempt(h, a, cmd, "-- a plugin that reports its own error --", req[0 .. n2], resp)
+
+    // **The interesting one.** The plugin exits 0 and writes nothing.
+    let n3: usize = load(req, "!silent")
+    attempt(h, a, cmd, "-- a plugin that exits 0 and answers nothing --", req[0 .. n3], resp)
+
+    // A host that may not run anything refuses before touching the plugin at all, and it is a
+    // DIFFERENT outcome from any of the plugin's own failures.
+    var denied: plugin.Host = plugin.host(process.denied(), fs.host())
+    let n4: usize = load(req, "hello")
+    attempt(denied, a, cmd, "-- a host with no permission --", req[0 .. n4], resp)
+
+    // The host's own books, which are the evidence it survived: four calls, three failures.
+    print_str("-- the host is still standing --")
+    print_str("calls")
+    print_int(plugin.calls(h))
+    print_str("failures")
+    print_int(plugin.failures(h))
+    print_str("the denied host ran nothing")
+    print_bool(plugin.calls(denied) == 1 and plugin.failures(denied) == 1)
+
+    var f: fs.Fs = fs.host()
+    fs.erase(f, REQ_PATH)
+    fs.erase(f, RESP_PATH)
+    free_ptr(rraw)
+    free_ptr(raw)
+    return 0
+}
