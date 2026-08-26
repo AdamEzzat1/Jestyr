@@ -254,6 +254,23 @@ pub struct FnSig {
     /// (sorted, deduped), `None` for an infallible one. The names feed the
     /// soundness diagnostics and ride into `Ty::Result` at every call.
     pub errs: Option<Vec<String>>,
+    /// Does the declaration carry `@must_use`?
+    ///
+    /// The attribute used to be a *pure* emission concern — `attrs.rs` accepted it,
+    /// `cgen.rs` turned it into `__attribute__((warn_unused_result))`, and nothing
+    /// in the front end ever looked at it again. That made a discarded `@must_use`
+    /// result a **degrades-to-gcc** row: it was diagnosed by whichever C compiler
+    /// happened to build the output, at whichever warning level, and not at all by
+    /// `jestyrc check`. The fallible half of the same idea (a discarded `T !E`) has
+    /// been a front-end error since v3; this is the other half, and it is the same
+    /// rule applied to a value the language has no other way to insist on.
+    ///
+    /// Carried on the *signature* rather than re-read from the `FnDecl` at each
+    /// call because three of the four call-resolution paths (unqualified,
+    /// `mod.f(…)`, and the UFCS method form) already hold a `FnSig` and nothing
+    /// else in common. The fourth — a struct-body method — never gets a `FnSig`
+    /// at all and reads its own decl; see `resolve_struct_method`.
+    pub must_use: bool,
 }
 
 /// A declared `trait`: the set of its method names, each flagged required (no

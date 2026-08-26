@@ -202,6 +202,281 @@ mod must_use_fallible {
     }
 }
 
+/// **Must-use VALUES — the infallible half, and a degrades-to-gcc row closed.**
+///
+/// `@must_use` on a non-union return was accepted by `attrs.rs`, lowered by `cgen.rs` to
+/// `__attribute__((warn_unused_result))`, and then *never looked at again*. So whether
+/// discarding the value was diagnosed depended on which C compiler built the emitted C
+/// and at what warning level; `jestyrc check` said nothing. The fallible sibling above
+/// has been a front-end error since v3 — this is the same rule for the values the
+/// language has no other way to insist on.
+///
+/// **Four call-resolution paths, four tests.** Unqualified, module-qualified, the UFCS
+/// method form and a struct-body method share no code, so a rule wired into one of them
+/// is silently vacuous in the rest. That is the failure mode these tests exist to catch,
+/// and it is why the qualified case pays for a real two-file load rather than being
+/// approximated in a single source string.
+///
+/// The count was **measured**. The rule was first written against the three paths that
+/// hold a `FnSig`, and a probe of the two method forms the attribute's own target list
+/// advertises found `@must_use` on a struct-body method doing nothing at all — the same
+/// degrades-to-gcc hole, one level down. The trait-method form is still uncovered and
+/// deliberately so: the attribute belongs on the trait (a call through a trait is typed
+/// by the trait's signature, whichever impl answers) and `TraitMethod` has no `attrs`
+/// field, which makes it an AST + parser increment rather than a line in the checker.
+/// `a_trait_impl_method_is_not_covered_yet` pins that as a known gap, so the day it is
+/// closed the test fails and says so.
+#[cfg(test)]
+mod must_use_value {
+    use super::*;
+
+    const NEEDLE: &str = "the `@must_use` result of this call is discarded";
+    const FALLIBLE_NEEDLE: &str = "the fallible result of this call is discarded";
+
+    fn checked() -> &'static str {
+        "@must_use fn checked_add(a: i64, b: i64) -> i64 { return a + b }\n"
+    }
+
+    #[test]
+    fn a_discarded_must_use_result_is_refused() {
+        let src = format!(
+            "{}fn use_it() -> i64 {{\n\
+             \x20   checked_add(1, 2)\n\
+             \x20   return 1\n\
+             }}\n",
+            checked()
+        );
+        let ds = typeck_diags(&src);
+        assert!(
+            ds.iter().any(|d| d.contains(NEEDLE)),
+            "a discarded @must_use value must be refused; got {ds:?}"
+        );
+    }
+
+    /// Positive control 1: using the value is the whole point of the attribute.
+    #[test]
+    fn consuming_the_value_is_not_a_discard() {
+        let src = format!(
+            "{}fn use_it() -> i64 {{\n\
+             \x20   let n = checked_add(1, 2) + 1\n\
+             \x20   return n\n\
+             }}\n",
+            checked()
+        );
+        let ds = typeck_diags(&src);
+        assert!(!ds.iter().any(|d| d.contains(NEEDLE)), "a consumed value is fine; got {ds:?}");
+    }
+
+    /// Positive control 2: `let _v = …` — the deliberate-discard spelling the help text
+    /// names. Without a way to say "I know, and I am ignoring it", an ERROR here would be
+    /// unusable rather than strict, so this control is what justifies the severity.
+    #[test]
+    fn binding_the_value_is_the_deliberate_discard_spelling() {
+        let src = format!(
+            "{}fn use_it() -> i64 {{\n\
+             \x20   let _v = checked_add(1, 2)\n\
+             \x20   return 1\n\
+             }}\n",
+            checked()
+        );
+        let ds = typeck_diags(&src);
+        assert!(
+            !ds.iter().any(|d| d.contains(NEEDLE)),
+            "the escape hatch the help text advertises must work; got {ds:?}"
+        );
+    }
+
+    /// Positive control 3: a block's TRAILING expression is its value, so in a `-> i64`
+    /// body it is the implicit return and discards nothing. The boundary the rule must
+    /// not cross — flagging it would refuse the ordinary forwarding function.
+    #[test]
+    fn a_trailing_must_use_expression_is_the_implicit_return() {
+        let src = format!(
+            "{}fn forward(a: i64) -> i64 {{\n\
+             \x20   checked_add(a, a)\n\
+             }}\n",
+            checked()
+        );
+        let ds = typeck_diags(&src);
+        assert!(
+            !ds.iter().any(|d| d.contains(NEEDLE)),
+            "a trailing expression is a return, not a discard; got {ds:?}"
+        );
+    }
+
+    /// Anti-vacuity: a call WITHOUT the attribute, discarded, stays legal. This rule is
+    /// about the attribute, not about unused values in general — every `print_int(…)`
+    /// and `sink.put_str(…)` statement in the tree depends on that distinction.
+    #[test]
+    fn discarding_an_unattributed_result_is_still_allowed() {
+        let src = "fn plain(n: i64) -> i64 { return n * 2 }\n\
+                   fn use_it() -> i64 {\n\
+                   \x20   plain(3)\n\
+                   \x20   return 1\n\
+                   }\n";
+        let ds = typeck_diags(src);
+        assert!(
+            !ds.iter().any(|d| d.contains(NEEDLE)),
+            "an unattributed discard must stay legal; got {ds:?}"
+        );
+    }
+
+    /// A function that is BOTH `@must_use` and fallible is discarded in two senses at
+    /// once, and gets ONE diagnostic — the error-set one, which names what was actually
+    /// thrown away. Two complaints for one mistake is how a rule teaches people to stop
+    /// reading diagnostics.
+    #[test]
+    fn a_fallible_must_use_discard_reports_the_error_set_once() {
+        let src = "@must_use fn risky(n: i64) -> i64 !{ Bad } {\n\
+                   \x20   if n < 0 { return err(Bad) }\n\
+                   \x20   return ok(n)\n\
+                   }\n\
+                   fn use_it() -> i64 {\n\
+                   \x20   risky(1)\n\
+                   \x20   return 1\n\
+                   }\n";
+        let ds = typeck_diags(src);
+        assert!(
+            ds.iter().any(|d| d.contains(FALLIBLE_NEEDLE)),
+            "the error set is the more specific complaint; got {ds:?}"
+        );
+        assert!(
+            !ds.iter().any(|d| d.contains(NEEDLE)),
+            "one discard must not produce two diagnostics; got {ds:?}"
+        );
+    }
+
+    /// Resolution path 3 of 4: the UFCS method form `r.area()`, which reaches the sig
+    /// through `resolve_free_method` and not through the unqualified path at all.
+    #[test]
+    fn the_ufcs_method_path_is_checked_too() {
+        let src = "struct Rect { w: i64, h: i64 }\n\
+                   fn rect(w: i64, h: i64) -> Rect { return Rect{ w: w, h: h } }\n\
+                   @must_use fn area(read r: Rect) -> i64 { return r.w * r.h }\n\
+                   fn use_it() -> i64 {\n\
+                   \x20   let r = rect(2, 3)\n\
+                   \x20   r.area()\n\
+                   \x20   return 1\n\
+                   }\n";
+        let ds = typeck_diags(src);
+        assert!(
+            ds.iter().any(|d| d.contains(NEEDLE)),
+            "a discarded @must_use METHOD result must be refused; got {ds:?}"
+        );
+    }
+
+    /// Resolution path 2 of 4: `lib.f(…)`, which resolves through the qualified path.
+    /// A real two-file load, because `typeck_diags` parses one source string and the
+    /// qualified path does not exist inside it — approximating this would test nothing.
+    #[test]
+    fn the_module_qualified_path_is_checked_too() {
+        let dir = std::env::temp_dir().join("jestyr_must_use_qualified");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("lib.jtr"),
+            "@must_use pub fn twice(a: i64) -> i64 { return a + a }\n\
+             pub fn plain(a: i64) -> i64 { return a }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("main.jtr"),
+            "import \"lib\"\n\
+             fn main() {\n\
+             \x20   lib.plain(1)\n\
+             \x20   lib.twice(4)\n\
+             \x20   print_int(0)\n\
+             }\n",
+        )
+        .unwrap();
+
+        let prog = crate::module::load(dir.join("main.jtr").to_str().unwrap());
+        let (_info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        let ds: Vec<String> = td.iter().map(|d| d.message.clone()).collect();
+        assert_eq!(
+            ds.iter().filter(|d| d.contains(NEEDLE)).count(),
+            1,
+            "exactly the `lib.twice` line, not `lib.plain`; got {ds:?}"
+        );
+    }
+
+    /// Resolution path 4 of 4: a method declared inside the struct body. It never gets a
+    /// `FnSig` — `resolve_struct_method` reads the `FnDecl` — so it was the path the rule
+    /// missed on the first pass, and the one a probe rather than an argument found.
+    #[test]
+    fn the_struct_body_method_path_is_checked_too() {
+        let src = "struct Counter {\n\
+                   \x20   n: i64,\n\
+                   \n\
+                   \x20   @must_use fn peek(read self) -> i64 { return self.n }\n\
+                   }\n\
+                   fn use_it() -> i64 {\n\
+                   \x20   let c = Counter{ n: 3 }\n\
+                   \x20   c.peek()\n\
+                   \x20   return 1\n\
+                   }\n";
+        let ds = typeck_diags(src);
+        assert!(
+            ds.iter().any(|d| d.contains(NEEDLE)),
+            "a discarded @must_use struct-body method result must be refused; got {ds:?}"
+        );
+    }
+
+    /// **A pin on a known gap, not an endorsement of it.** `@must_use` on a TRAIT-impl
+    /// method is accepted and does nothing, because the attribute belongs on the trait
+    /// (whose `TraitMethod` node has no `attrs` field yet) rather than on one impl of it.
+    ///
+    /// Asserting the current behaviour makes the gap fail loudly the day someone closes
+    /// it, which is the only way a "we chose not to do this" survives contact with a
+    /// later session. It is a *deliberately* inverted assertion — read the comment above
+    /// `resolve_struct_method`'s `record_must_use` before deleting it.
+    #[test]
+    fn a_trait_impl_method_is_not_covered_yet() {
+        let src = "trait Sized2 {\n\
+                   \x20   fn size(read self) -> i64\n\
+                   }\n\
+                   struct Box2 { k: i64 }\n\
+                   impl Sized2 for Box2 {\n\
+                   \x20   @must_use fn size(read self) -> i64 { return self.k }\n\
+                   }\n\
+                   fn use_it() -> i64 {\n\
+                   \x20   let b = Box2{ k: 4 }\n\
+                   \x20   b.size()\n\
+                   \x20   return 1\n\
+                   }\n";
+        let ds = typeck_diags(src);
+        assert!(
+            !ds.iter().any(|d| d.contains(NEEDLE)),
+            "if this now fires, the trait-method gap was closed — delete this test and \
+             cover the trait path properly in the module doc above; got {ds:?}"
+        );
+    }
+
+    /// The corpus stays clean. `@must_use` appears once in the tree today
+    /// (`examples/attributes.jtr`, where the result IS consumed), so this starts as a
+    /// guard rather than a fix — the point is that the next file to add the attribute
+    /// and then ignore it fails here instead of depending on gcc's warning level.
+    #[test]
+    fn no_corpus_file_discards_a_must_use_result() {
+        let mut offenders: Vec<String> = Vec::new();
+        for dir in ["examples", "examples/std"] {
+            let Ok(rd) = std::fs::read_dir(dir) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) != Some("jtr") {
+                    continue;
+                }
+                let prog = crate::module::load(p.to_str().unwrap());
+                let (_info, td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+                if td.iter().any(|d| d.message.contains(NEEDLE)) {
+                    offenders.push(p.display().to_string());
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "these files discard a @must_use result: {offenders:?}");
+    }
+}
+
 /// **A `return` in a fallible function must be Result-typed.**
 ///
 /// `cgen` emits `return <value>` verbatim, so a bare ok value out of a `-> T !E` produced

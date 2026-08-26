@@ -59,6 +59,7 @@ pub fn check_program(ast: &Ast, modules: &Modules) -> (TypeInfo, Vec<Diagnostic>
         expr_types: vec![Ty::Unknown; ast.exprs.len()],
         variant_field_names: HashMap::new(),
         resolved: vec![None; ast.exprs.len()],
+        must_use_call: vec![false; ast.exprs.len()],
         cur_type_param_bounds: HashMap::new(),
         cur_expected: None,
         cur_ret: None,
@@ -225,6 +226,26 @@ struct TypeChecker<'a> {
     /// with `expr_types` and indexed the same way. Written only through the
     /// `record_*` helpers below; never read back during checking.
     resolved: Vec<Option<Box<Resolved>>>,
+    /// Expr id → "this call resolved to a `@must_use` function".
+    ///
+    /// A **dense** side table sized with `expr_types`, deliberately, and not a
+    /// `HashMap<ExprId, _>`: an expr id is a position in one `Ast`'s arena, so a map
+    /// keyed by one is a map keyed by an index that only means anything next to the
+    /// arena it came from. `expr_types` and `resolved` are both dense for the same
+    /// reason and this rides beside them.
+    ///
+    /// Written by the four call-resolution paths — unqualified, `mod.f(…)`, the UFCS
+    /// method form, and a struct-body method — and read once, at the discarded-
+    /// statement seam. Recording it at resolution rather than re-resolving at the
+    /// seam is what keeps the rule from growing a *fifth* answer to "which function
+    /// does this call name?".
+    ///
+    /// That there were four and not three was **measured, not reasoned**: the rule
+    /// was written against the three `FnSig` paths, and a probe of the two method
+    /// forms the attribute advertises (`Target::Method`) found `@must_use fn peek`
+    /// inside a struct body silently doing nothing. Trait methods remain uncovered
+    /// on purpose — see `resolve_struct_method` for why that is an AST change.
+    must_use_call: Vec<bool>,
     /// The bracket type parameters in scope for the function being checked, each
     /// mapped to its declared bound (`None` if unbounded). Drives the body-side
     /// "only the bound's methods are callable on a `T` value" check.
@@ -307,6 +328,16 @@ impl<'a> TypeChecker<'a> {
 
     fn record_dyn_coercion(&mut self, id: ExprId, trait_name: String) {
         self.row(id).dyn_coercion = Some(trait_name);
+    }
+
+    /// Note that call `id` resolved to a `@must_use` function. Deliberately NOT a
+    /// `Resolved` field: that struct is the HIR handed to `escape` and `cgen`, and
+    /// this fact is consumed entirely inside the checker — putting it there would
+    /// widen the backend's input for a rule the backend has no part in.
+    fn record_must_use(&mut self, id: ExprId, must_use: bool) {
+        if must_use {
+            self.must_use_call[id.0 as usize] = true;
+        }
     }
 
     fn record_dyn_call(&mut self, id: ExprId, method: String) {
@@ -619,7 +650,13 @@ impl<'a> TypeChecker<'a> {
                     fn_cfg.insert(key.clone(), cfg);
                     self.table.fns.insert(
                         key,
-                        FnSig { params, ret, ret_conv: f.ret_conv, errs: errs_of(&f.errors) },
+                        FnSig {
+                            params,
+                            ret,
+                            ret_conv: f.ret_conv,
+                            errs: errs_of(&f.errors),
+                            must_use: f.attr("must_use").is_some(),
+                        },
                     );
                 }
                 Item::Const(c) => {
@@ -648,7 +685,11 @@ impl<'a> TypeChecker<'a> {
                     fn_cfg.insert(e.name.name.clone(), cfg);
                     self.table.fns.insert(
                         e.name.name.clone(),
-                        FnSig { params, ret, ret_conv: e.ret_conv, errs: None },
+                        // Never `@must_use`: the attribute's target list in `attrs.rs`
+                        // is `Fn`/`Method`, so `validate` already refuses it on an
+                        // `extern`. Hard-coded rather than read from `e.attrs` so the
+                        // two facts cannot drift apart silently.
+                        FnSig { params, ret, ret_conv: e.ret_conv, errs: None, must_use: false },
                     );
                 }
                 Item::Import(_) => {}
@@ -2258,18 +2299,29 @@ impl<'a> TypeChecker<'a> {
         let tps = self.fn_type_params(f, &HashSet::new());
 
         // Take the owned parameter data we need, then release the table borrow.
-        let (recv_conv, ret, errs, param_tys, runtime_idx) = {
+        let (recv_conv, ret, errs, param_tys, runtime_idx, must_use) = {
             let sig = self.table.fns.get(mname)?;
             let param_tys: Vec<Ty> = sig.params.iter().map(|p| p.ty.clone()).collect();
             let runtime_idx: Vec<usize> =
                 f.params.iter().enumerate().filter(|(_, p)| !p.comptime).map(|(i, _)| i).collect();
-            (sig.params[recv_idx].conv, sig.ret.clone(), sig.errs.clone(), param_tys, runtime_idx)
+            (
+                sig.params[recv_idx].conv,
+                sig.ret.clone(),
+                sig.errs.clone(),
+                param_tys,
+                runtime_idx,
+                sig.must_use,
+            )
         };
 
         // The receiver type must match for this to be a method call at all.
+        // Recorded only AFTER this gate: a receiver mismatch means this was never a
+        // call to `mname` at all, and marking the expr before knowing that would
+        // attribute the attribute to whichever function the name happened to hit.
         if !head_matches(&param_tys[recv_idx], recv_ty) {
             return None;
         }
+        self.record_must_use(call_id, must_use);
 
         // Recover the comptime type arguments by unifying params with actuals.
         let mut subst: HashMap<String, Ty> = HashMap::new();
@@ -2370,6 +2422,20 @@ impl<'a> TypeChecker<'a> {
             _ => return None,
         };
         let (method, tp_names) = self.find_struct_method(&ctor, mname)?;
+        // Resolution path 3 of 3 for `@must_use`. A struct-body method's own
+        // declaration IS its contract — there is no trait above it that a caller
+        // might have been typed by — so the attribute is read straight off the
+        // decl rather than out of a `FnSig` (these methods never get one).
+        //
+        // TRAIT methods are deliberately NOT handled here or in
+        // `resolve_impl_method`/`resolve_bound_method`/`resolve_dyn_method`.
+        // `wrap_trait_ret` records the principle: a call through a trait is typed
+        // by the TRAIT's signature, whichever impl answers. An `@must_use` written
+        // on one impl would make the same trait call must-use for some receivers
+        // and not others, so the attribute belongs on the trait method — and
+        // `TraitMethod` has no `attrs` field to put it on. That is an AST + parser
+        // increment (and a port mirror), not a line here.
+        self.record_must_use(call_id, method.attr("must_use").is_some());
 
         let recv_conv =
             method.params.iter().find(|p| p.is_self).map(|p| p.conv).unwrap_or(Conv::Default);
@@ -2437,9 +2503,10 @@ impl<'a> TypeChecker<'a> {
                 let resolved = self.table.fns.get(&key).map(|sig| {
                     let ptys: Vec<(String, Ty)> =
                         sig.params.iter().map(|p| (p.name.clone(), p.ty.clone())).collect();
-                    (sig.ret.clone(), sig.errs.clone(), ptys)
+                    (sig.ret.clone(), sig.errs.clone(), ptys, sig.must_use)
                 });
-                if let Some((ret, errs, ptys)) = resolved {
+                if let Some((ret, errs, ptys, must_use)) = resolved {
+                    self.record_must_use(id, must_use);
                     let want = ptys.len();
                     if want != args.len() {
                         self.error(
@@ -2960,6 +3027,43 @@ impl<'a> TypeChecker<'a> {
                              and `let _v = expr catch <fallback>` records the verdict"
                                 .to_string(),
                         );
+                    } else if self.must_use_call[e.0 as usize] {
+                        // **A discarded `@must_use` result.** The infallible sibling of
+                        // the rule above, and until now the attribute's ONLY enforcement
+                        // was `__attribute__((warn_unused_result))` in the emitted C —
+                        // so whether ignoring `checked_add(a, b)` was diagnosed depended
+                        // on which C compiler built the output and at what warning level,
+                        // and `jestyrc check` said nothing at all. That is the shape the
+                        // notes call degrades-to-gcc: a rule the language advertises and
+                        // then subcontracts.
+                        //
+                        // Ordered AFTER the fallible arm, not beside it. A `@must_use
+                        // fn f() -> T !E` is discarded in both senses at once, and the
+                        // error set is the more specific complaint — one diagnostic per
+                        // discard, and the one that names what was actually thrown away.
+                        //
+                        // Non-trailing only, for the same reason as above: a block's last
+                        // expression is its value, not a discard. That leaves one real
+                        // gap — the last statement of a `-> ()` body, where the value has
+                        // nowhere to go and still is not judged — which the fallible rule
+                        // has had since v3. Closing it needs the block checker to be told
+                        // whether its own value is wanted, which neither rule needs badly
+                        // enough to justify threading it through every caller.
+                        //
+                        // REFERENCE-ONLY, like the fallible rule and for the same reason:
+                        // no Error *type* is produced and no C changes, so `jc` stays
+                        // permissive and the two backends still emit the same bytes. The
+                        // `warn_unused_result` lowering is untouched and still there —
+                        // this is a second, earlier line of defence, not a replacement.
+                        self.error(
+                            self.ast.expr_at(*e).span,
+                            "the `@must_use` result of this call is discarded".to_string(),
+                        );
+                        self.diags.last_mut().unwrap().help = Some(
+                            "consume it: use the value, or bind it (`let _v = <expr>`) to \
+                             record that ignoring it is deliberate"
+                                .to_string(),
+                        );
                     }
                 }
             }
@@ -3280,12 +3384,13 @@ impl<'a> TypeChecker<'a> {
                         self.table.fns.get(&key).map(|sig| {
                             let ptys: Vec<(String, Ty)> =
                                 sig.params.iter().map(|p| (p.name.clone(), p.ty.clone())).collect();
-                            (sig.ret.clone(), sig.errs.clone(), ptys)
+                            (sig.ret.clone(), sig.errs.clone(), ptys, sig.must_use)
                         })
                     } else {
                         None
                     };
-                    if let Some((ret, errs, ptys)) = resolved {
+                    if let Some((ret, errs, ptys, must_use)) = resolved {
+                        self.record_must_use(id, must_use);
                         let want = ptys.len();
                         if key != name {
                             self.record_call_sym(id, key.clone());
