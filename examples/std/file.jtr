@@ -239,7 +239,7 @@ const SEEK_END: i32 = 2
 // done to it, because it is not a pointer type in Jestyr's grammar at all. So this
 // struct cannot be made to read the FILE's innards even inside `unsafe` — there is
 // no operation to write. A `*mut u8` would have offered several.
-pub struct Reader {
+@move pub struct Reader {
     h: cptr,
 }
 
@@ -376,7 +376,7 @@ impl Drop for Reader {
 // has no arithmetic, not even inside `unsafe`, so this struct cannot be made to read
 // the FILE's innards. `usize` for the counter to match `fwrite`, `read_into` and
 // `finish`'s ok type, so no width conversion appears anywhere in the path.
-pub struct Writer {
+@move pub struct Writer {
     h: cptr,
     put: usize,
 }

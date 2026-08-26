@@ -227,6 +227,20 @@ pub struct TypeDecl {
     pub kind: TypeKindG,
     /// User aggregates are non-`Copy` by default (an explicit opt-in lands later).
     pub is_copy: bool,
+    /// Declared `@move`: this aggregate is a RESOURCE and may not be duplicated.
+    ///
+    /// The ownership rules in `escape.rs` used to be gated on `droppable_ty` alone, so a
+    /// type could only be consumed by `take`/rebinding if it had a `Drop` impl. Every OS
+    /// handle in the `sys` tier is a plain struct around an integer with no `Drop`, so all
+    /// of them were freely copyable and closing through one copy left the other naming a
+    /// descriptor the platform may have reissued.
+    ///
+    /// Deliberately independent of `Drop`, and of `is_copy` (which is its exact opposite —
+    /// `attrs::validate_struct` refuses both on one struct). "May not be duplicated" and
+    /// "runs teardown automatically" are separate properties; these handles want the first
+    /// and specifically do not want the second, because their close is fallible and the
+    /// caller is meant to see the verdict.
+    pub is_move: bool,
     /// Declared with `record` rather than `struct` — its fields are immutable
     /// (assigning one is a compile error). Layout/representation is identical.
     pub is_record: bool,

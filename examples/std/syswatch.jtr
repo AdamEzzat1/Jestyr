@@ -281,7 +281,7 @@ const WATCH_ERROR_INVALID_NAME: i32 = 123
 // alongside `open`, written in three places and read in none. Two fields that must agree are
 // two fields that can disagree — the same argument `std/syserr` makes for storing two fields
 // and computing the third.
-pub struct Watcher {
+@move pub struct Watcher {
     fd: i64,            // POSIX: the inotify fd
     wd: i32,            // POSIX: the watch descriptor within that fd
     buf: *mut u32,      // POSIX: the kernel's read buffer, u32-slotted (see WATCH_EV_HEADER)

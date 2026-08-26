@@ -318,17 +318,23 @@ pub fn wire_bytes(read a: SocketAddr, mut buf: []u8) -> usize {
 
 // ---- the handles -----------------------------------------------------------------
 //
-// A `Socket` is `@copy` and that is a KNOWN HAZARD, stated rather than hidden: copying one
-// gives two names for the same kernel handle, and closing through either leaves the other
-// pointing at a descriptor the kernel may already have reissued. Jestyr has move-only
-// DROPPABLES (a `take` parameter, a rebinding) but a struct with no `Drop` impl is still
-// freely copied, and giving `Socket` a `Drop` would close it at every scope exit — which is
-// wrong for a handle that is deliberately passed around.
+// A `Socket` is `@move`, and it used to be `@copy` with the hazard written out here in
+// full: copying one gives two names for the same kernel handle, and closing through either
+// leaves the other pointing at a descriptor the kernel may already have reissued. Jestyr
+// had move-only DROPPABLES (a `take` parameter, a rebinding) but a struct with no `Drop`
+// impl was still freely copied.
 //
-// **The Tier 4 brief lists this as language work (§2.1) and it is not done.** The rule this
-// module lives under until it is: a `Socket` is owned by exactly one place, `close` is
-// called exactly once, and `is_open` is the only safe question to ask a copy.
-@copy pub struct Socket {
+// **Brief §2.1 is DONE, and `@move` is what it turned out to be.** The obstacle recorded
+// here was that giving `Socket` a `Drop` would close it at every scope exit, which is wrong
+// for a handle deliberately passed around — and the resolution is that "may not be
+// duplicated" and "runs teardown automatically" are two separate properties. Only the first
+// one is unsound. `@move` grants it alone; `close_socket` stays explicit and FALLIBLE, so a
+// caller still sees whether the close worked, which an implicit drop would have thrown away.
+//
+// The rule is now the compiler's rather than this comment's: rebinding a `Socket` or giving
+// one to a `take` parameter consumes it, and reading the old name is an error. `is_open`
+// remains the right question to ask a handle you were handed rather than given.
+@move pub struct Socket {
     pub fd: i64,
 }
 

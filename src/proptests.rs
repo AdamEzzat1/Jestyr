@@ -1090,6 +1090,78 @@ int main(void) {
     }
 }
 
+/// **Every OS handle in the `sys` tier is move-only.**
+///
+/// Eight types wrap a raw descriptor: `Socket`, `Dir`, `Reader`, `Writer`, `Watcher`,
+/// `alog.Log`, `plugin.Host`, `sysproc.Child`. A copy of any of them is a second name for
+/// one kernel handle, and closing through either leaves the other naming a descriptor the
+/// platform may already have reissued. `std/sysnet`'s header stated exactly that and then
+/// said the language could not express it; `@move` is that expression.
+///
+/// Checked through `check_program` rather than by grepping for the attribute text, because
+/// what matters is that it reached the TYPE TABLE. A misspelling, a lost registration, or
+/// a `@copy` added later for a performance reason all leave the source looking right.
+#[cfg(test)]
+mod sys_handles_are_move_only {
+    /// (module, type) for every handle that owns a platform descriptor.
+    const HANDLES: &[(&str, &str)] = &[
+        ("sysnet", "Socket"),
+        ("sysdir", "Dir"),
+        ("file", "Reader"),
+        ("file", "Writer"),
+        ("syswatch", "Watcher"),
+        ("alog", "Log"),
+        ("plugin", "Host"),
+        ("sysproc", "Child"),
+    ];
+
+    #[test]
+    fn every_sys_handle_type_is_registered_move_only() {
+        let mut missing: Vec<String> = Vec::new();
+        for (module, ty) in HANDLES {
+            let path = format!("examples/std/{module}.jtr");
+            let prog = crate::module::load(&path);
+            let (info, _td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+            let found = info.table.types.iter().find(|d| d.name == *ty);
+            match found {
+                None => missing.push(format!("{module}.{ty} — no such type any more")),
+                Some(d) if !d.is_move => {
+                    missing.push(format!("{module}.{ty} — declared, but not `@move`"))
+                }
+                Some(d) if d.is_copy => {
+                    missing.push(format!("{module}.{ty} — `@copy`, which is the opposite"))
+                }
+                Some(_) => {}
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these handle types can be silently duplicated:\n{}",
+            missing.join("\n")
+        );
+    }
+
+    /// Anti-vacuity: `is_move` must not be true of everything. If a refactor ever defaulted
+    /// it on, the sweep above would pass while meaning nothing — so a type that is
+    /// deliberately NOT a resource is checked to still be freely copyable.
+    #[test]
+    fn an_ordinary_value_type_is_not_move_only() {
+        let prog = crate::module::load("examples/std/sysnet.jtr");
+        let (info, _td) = crate::typeck::check_program(&prog.ast, &prog.modules);
+        let addr = info
+            .table
+            .types
+            .iter()
+            .find(|d| d.name == "SocketAddr")
+            .expect("sysnet declares SocketAddr");
+        assert!(
+            !addr.is_move,
+            "`SocketAddr` is a pair of numbers, not a handle — it must stay freely copyable"
+        );
+        assert!(addr.is_copy, "and it is explicitly `@copy`, which `@move` would contradict");
+    }
+}
+
 /// **Two modules must not bind one C symbol with two different signatures.**
 ///
 /// `std/syswatch` and `std/sysproc` both need `WaitForSingleObject`, and typeck keys its
@@ -13559,6 +13631,82 @@ fn g(p: *mut i32) -> i32 {
             let got = jestyr_escape_dump(&exe, f.to_str().unwrap());
             assert_eq!(got, want, "the toolchains disagree on a legal two-slice call: {src}");
         }
+    }
+
+    /// **`@move`, differentially — and the corpus cannot carry this one either.**
+    ///
+    /// Adopting `@move` on the eight `sys`-tier handle types broke NOTHING: the corpus
+    /// already passed every one of them by borrow. That is the good outcome and also the
+    /// dangerous one, because it means the whole-corpus escape golden would pass with the
+    /// port missing the rule entirely — the same trap `jestyr_slice_alias_matches_
+    /// reference` above exists for. So the probes carry the rule.
+    ///
+    /// Two FIRE (rebinding a `@move` value then reading the old name; giving one to a
+    /// `take` parameter then reading it), and — the assertion that matters most — the
+    /// byte-identical program WITHOUT the attribute must stay legal on both toolchains.
+    /// Without that control, a checker that simply rejected all struct rebinding would
+    /// pass the firing half.
+    #[test]
+    fn jestyr_move_only_matches_reference() {
+        let exe = build_exe("examples/std/escape_cli.jtr");
+        // `mk()` is a CALL initializer, so `a` is a fresh value nothing else owns — the
+        // move under test is the `let b = a` on the next line, not the binding of `a`.
+        let body = "fn mk() -> H { return H { fd: 3 } } \
+                    fn sink(take h: H) -> i64 { return h.fd } \
+                    fn peek(read h: H) -> i64 { return h.fd } \
+                    fn rebound() -> i64 { var a: H = mk()  let b: H = a  return b.fd + a.fd } \
+                    fn consumed() -> i64 { var c: H = mk()  let n: i64 = sink(c)  return n + c.fd }";
+        let moved = format!("@move struct H {{ fd: i64 }} {body}");
+        let plain = format!("struct H {{ fd: i64 }} {body}");
+
+        let want = rust_escape_dump(&moved);
+        // Anti-vacuity: both shapes must actually be refused by the reference, or the
+        // agreement below is agreement about an empty set.
+        assert!(
+            want.iter().any(|l| l.contains("moved to another binding")),
+            "the rebinding probe no longer fires — replace it with a shape that does: {want:?}"
+        );
+        assert!(
+            want.iter().any(|l| l.contains("given to a `take` parameter")),
+            "the take probe no longer fires — replace it with a shape that does: {want:?}"
+        );
+        let f = std::env::temp_dir().join("jestyr_move_only.jtr");
+        std::fs::write(&f, &moved).unwrap();
+        assert_eq!(
+            jestyr_escape_dump(&exe, f.to_str().unwrap()),
+            want,
+            "the toolchains disagree about `@move`; the port's `droppable_expr` is the mirror"
+        );
+
+        // **The control.** Identical source minus the attribute. If this is not clean, the
+        // rule is rejecting struct rebinding in general and `@move` is doing no work.
+        let ok = rust_escape_dump(&plain);
+        assert!(
+            !ok.iter().any(|l| l.contains("moved to another binding")
+                || l.contains("given to a `take` parameter")),
+            "without `@move` the same program must stay legal — the rule is over-reaching: {ok:?}"
+        );
+        let g = std::env::temp_dir().join("jestyr_move_only_plain.jtr");
+        std::fs::write(&g, &plain).unwrap();
+        assert_eq!(
+            jestyr_escape_dump(&exe, g.to_str().unwrap()),
+            ok,
+            "the toolchains disagree about a plain (non-`@move`) struct"
+        );
+
+        // A borrow is not a move: `peek` takes `read`, so the value may be read again.
+        // This is the boundary the `sys` tier lives on — every handle in it is passed
+        // around by borrow, which is why adoption broke nothing.
+        let borrowed = format!(
+            "@move struct H {{ fd: i64 }} {body} \
+             fn twice() -> i64 {{ var d: H = mk()  let x: i64 = peek(d)  return x + peek(d) }}"
+        );
+        let b = rust_escape_dump(&borrowed);
+        assert_eq!(
+            b.iter().filter(|l| l.contains("cannot use")).count(),
+            want.iter().filter(|l| l.contains("cannot use")).count(),
+            "borrowing a `@move` value twice must add no diagnostic: {b:?}"
+        );
     }
 
     /// **The alias taint, differentially (item 5 residue (a))** — the corpus has no

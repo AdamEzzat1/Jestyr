@@ -67,18 +67,22 @@
 // `wait` (unbounded) does NOT poll: it hands off to the platform's own blocking wait,
 // because there a poll would be a busy loop with nothing to gain.
 //
-// ─── A `Child` is a RESOURCE, and the language cannot say so yet ──────────────
+// ─── A `Child` is a RESOURCE, and `@move` is how the language says so ─────────
 //
-// `Child` is a freely copyable struct holding an OS handle, so `release`-ing through one
-// copy leaves the other naming a handle the platform may already have reissued. That is
-// brief §2.1 — move-only resources — and this module is the SEVENTH type to owe it,
-// after `Socket`, `Dir`, `Reader`/`Writer`, `Watcher`, `alog.Log` and `plugin.Host`.
-// Giving it a `Drop` is not the fix on its own: a `Child` is meant to be passed around,
-// and closing at every scope exit is wrong for exactly that reason.
+// `Child` holds an OS handle, so `release`-ing through a COPY would leave the other name
+// pointing at a handle the platform may already have reissued. It is `@move`, which makes
+// that a compile error: rebinding a `Child` or giving one to a `take` parameter consumes
+// it, and reading the old name is refused.
 //
-// Until then the invariant is `release` exactly once, and `is_live` reports whether that
-// has happened. On Windows a released `Child` also leaks nothing: `release` closes both
-// the process and thread handles, and forgetting the thread handle is the classic
+// It is NOT droppable, and that is the other half of the design. Brief §2.1's recorded
+// obstacle was that a `Drop` closes at every scope exit, which is wrong for a handle
+// deliberately passed around — so `@move` grants "may not be duplicated" WITHOUT "runs
+// teardown automatically". Only the first property is unsound; the second would also have
+// discarded the verdict of a fallible close.
+//
+// The remaining invariant is a caller's: `release` exactly once, and `is_live` reports
+// whether that has happened. On Windows a released `Child` leaks nothing — `release` closes
+// both the process and thread handles, and forgetting the thread handle is the classic
 // `CreateProcess` leak.
 //
 // ─── `spawn` is a KEYWORD, so the central verb here is `start` ────────────────
@@ -243,7 +247,7 @@ pub fn denied() -> Spawner {
 // `h`/`th` are Windows HANDLEs carried as integers — the one pointer currency this
 // module uses, since `i64 as cptr` converts and `i64 as *mut u8` does not. On POSIX both
 // are zero and `pid` is the identity.
-pub struct Child {
+@move pub struct Child {
     h: i64,
     th: i64,
     pid: i64,

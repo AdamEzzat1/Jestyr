@@ -368,10 +368,17 @@ enum MoveCause {
 }
 
 impl MoveCause {
+    /// The reason, phrased so it is true for BOTH kinds of resource.
+    ///
+    /// These used to say "…and will drop it", which was accurate while the rules were
+    /// gated on `droppable_ty` alone. A `@move` type need not have a `Drop` — the seven
+    /// `sys`-tier handles deliberately do not, because their close is fallible and the
+    /// caller is meant to see the verdict — so "the new name owns it" is the part that is
+    /// always true and the destructor is the part that is not.
     fn phrase(self) -> &'static str {
         match self {
             MoveCause::TakeArg => "it was given to a `take` parameter: ownership moved at the call",
-            MoveCause::Rebind => "it was moved to another binding: the new name owns it and will drop it",
+            MoveCause::Rebind => "it was moved to another binding: the new name owns it now",
         }
     }
 }
@@ -519,8 +526,17 @@ impl<'a> Checker<'a> {
          allocate it in a `region` if it must outlive this frame, or store a `genref` handle \
          instead of a borrow";
 
+    /// **"has already dropped it" was removed deliberately.**
+    ///
+    /// It was true while the rules were gated on `droppable_ty` alone. A `@move` type need
+    /// not have a `Drop` — the `sys` tier's handles specifically do not, because their
+    /// close is fallible and the caller is meant to see the verdict — so for the commonest
+    /// new instance of this diagnostic (a second name for one OS handle) the old help text
+    /// described a destructor that does not exist, and pointed the reader at the wrong
+    /// question. What is always true is that the value has ONE owner and this name is no
+    /// longer it.
     const CONSUMED_HELP: &'static str =
-        "the callee owns the value now and has already dropped it — a consumed binding cannot \
+        "the value has one owner and this name is no longer it — a consumed binding cannot \
          be read, reused, or reinitialized; bind the callee's result if you need a value back, \
          or pass a borrow (`read`/`mut`) instead of giving ownership";
 
@@ -640,7 +656,7 @@ impl<'a> Checker<'a> {
                     if let Some(e) = init {
                         if let ExprKind::Name(n) = &self.ast.expr_at(*e).kind {
                             if ctx.lookup(&n.name) == Some(false)
-                                && self.droppable_ty(&self.info.type_of(*e).clone())
+                                && self.owns_resource(&self.info.type_of(*e).clone())
                             {
                                 ctx.mark_consumed(&n.name, MoveCause::Rebind);
                             }
@@ -1837,6 +1853,46 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Is `ty` declared `@move` — a RESOURCE that may not be duplicated?
+    ///
+    /// Read straight off the type declaration, so it is a property of the type and not of
+    /// any impl. That is the whole point: the seven OS-handle types in the `sys` tier are
+    /// plain structs around an integer with no `Drop`, and `droppable_ty` therefore says
+    /// no about every one of them.
+    fn move_only_ty(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Named(i) => self.info.table.types.get(*i).is_some_and(|d| d.is_move),
+            // A generic instance inherits its constructor's declaration: `@move struct
+            // Handle(T)` makes `Handle(i32)` a resource, exactly as a blanket `Drop` impl
+            // makes every instance droppable in `droppable_ty` above.
+            Ty::GenStruct { ctor, .. } => self
+                .info
+                .table
+                .type_index
+                .get(ctor)
+                .and_then(|i| self.info.table.types.get(*i))
+                .is_some_and(|d| d.is_move),
+            _ => false,
+        }
+    }
+
+    /// Does a value of `ty` own something that must not be duplicated?
+    ///
+    /// The gate every ownership rule below consults. It is the UNION of two independent
+    /// properties, and keeping them separate is deliberate:
+    ///
+    ///   * `droppable_ty` — teardown runs, so a copy would run it twice.
+    ///   * `move_only_ty` — the value names a resource, so a copy is a second name for one
+    ///     OS handle whether or not anything automatic happens at scope exit.
+    ///
+    /// The `sys` tier is entirely the second kind. Its handles close FALLIBLY — the caller
+    /// is meant to see whether the bytes landed — so giving them a `Drop` to reach the
+    /// first property would have discarded exactly the verdict `@must_use` exists to
+    /// preserve, and would have closed them at every scope exit besides.
+    fn owns_resource(&self, ty: &Ty) -> bool {
+        self.droppable_ty(ty) || self.move_only_ty(ty)
+    }
+
     /// The consuming rule's marking half: `arg` is being given to a `take`
     /// parameter. A droppable bare-Name OWNED local is marked consumed at its
     /// binding (a borrow already got route 4's give-away error, and a non-local
@@ -1853,7 +1909,7 @@ impl<'a> Checker<'a> {
                 if ctx.lookup(&name) != Some(false) {
                     return;
                 }
-                if !self.droppable_ty(&self.info.type_of(arg).clone()) {
+                if !self.owns_resource(&self.info.type_of(arg).clone()) {
                     return;
                 }
                 if let Some(&floor) = ctx.loop_floor.last() {
@@ -1878,7 +1934,7 @@ impl<'a> Checker<'a> {
                 if ctx.lookup(&root) != Some(false) {
                     return;
                 }
-                if !self.droppable_ty(&self.info.type_of(arg).clone()) {
+                if !self.owns_resource(&self.info.type_of(arg).clone()) {
                     return;
                 }
                 self.error_help(
@@ -3195,6 +3251,67 @@ mod tests {
         ));
         assert_eq!(d.len(), 1, "{:?}", d);
         assert!(d[0].message.contains("cannot use `d`"), "{:?}", d);
+    }
+
+    // --- `@move`: a resource with no `Drop` (the `sys` tier's eight OS handles) ---
+    //
+    // The ownership rules used to be gated on `droppable_ty` alone, so only a type with a
+    // `Drop` impl could be consumed. Every handle in the `sys` tier is a plain struct
+    // around an integer, so all of them were freely copyable — and closing through a copy
+    // leaves the other name pointing at a descriptor the platform may have reissued.
+    //
+    // Each test below is paired with the SAME source minus the attribute. That control is
+    // the whole point: without it, a rule that rejected all struct rebinding would pass.
+    const HANDLE: &str = "@move struct H { fd: i64 } \
+                          fn mk() -> H { return H { fd: 3 } } \
+                          fn sink(take h: H) -> i64 { return h.fd } \
+                          fn peek(read h: H) -> i64 { return h.fd } ";
+    const PLAIN: &str = "struct H { fd: i64 } \
+                         fn mk() -> H { return H { fd: 3 } } \
+                         fn sink(take h: H) -> i64 { return h.fd } \
+                         fn peek(read h: H) -> i64 { return h.fd } ";
+
+    #[test]
+    fn rebinding_a_move_only_value_consumes_the_old_name() {
+        let d = escapes(&format!(
+            "{HANDLE} fn f() -> i64 {{ var a: H = mk() let b: H = a return b.fd + a.fd }}"
+        ));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].message.contains("moved to another binding"), "{d:?}");
+    }
+
+    #[test]
+    fn giving_a_move_only_value_to_take_consumes_it() {
+        let d = escapes(&format!(
+            "{HANDLE} fn f() -> i64 {{ var c: H = mk() let n: i64 = sink(c) return n + c.fd }}"
+        ));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].message.contains("given to a `take` parameter"), "{d:?}");
+    }
+
+    /// **The control for both tests above.** Byte-identical source, no attribute. If this
+    /// is ever non-empty, `@move` is not what is doing the work.
+    #[test]
+    fn without_the_attribute_the_same_program_is_legal() {
+        let a = escapes(&format!(
+            "{PLAIN} fn f() -> i64 {{ var a: H = mk() let b: H = a return b.fd + a.fd }}"
+        ));
+        assert!(a.is_empty(), "a plain struct still copies freely: {a:?}");
+        let b = escapes(&format!(
+            "{PLAIN} fn f() -> i64 {{ var c: H = mk() let n: i64 = sink(c) return n + c.fd }}"
+        ));
+        assert!(b.is_empty(), "giving a plain struct to `take` is an implicit copy: {b:?}");
+    }
+
+    /// A BORROW is not a move — and this is the boundary the `sys` tier actually lives on.
+    /// Adopting `@move` on all eight handle types broke no corpus file precisely because
+    /// every one of them is passed around by `read`/`mut`, never by value.
+    #[test]
+    fn borrowing_a_move_only_value_does_not_consume_it() {
+        let d = escapes(&format!(
+            "{HANDLE} fn f() -> i64 {{ var h: H = mk() let x: i64 = peek(h) return x + peek(h) }}"
+        ));
+        assert!(d.is_empty(), "a `read` borrow must not consume: {d:?}");
     }
 
     #[test]

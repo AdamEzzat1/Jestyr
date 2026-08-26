@@ -144,9 +144,21 @@ fn e_scope_depth_of(read e: Esc, read src: str, ns: usize, ne: usize) -> i32 {
 // matching both the text and the binding's depth — a shadowing inner binding's marks sit at
 // a deeper depth and never mask the outer one, and every `e_bind` pushed a tombstone, so
 // marks from dead same-depth bindings are always masked. Mirrors `FnCtx::is_consumed`.
+// WHY a binding was consumed, carried in the entry's flag slot so the use-half can name
+// the right cause. Mirrors `MoveCause`; 0 is the tombstone `e_bind` pushes.
+const ECONS_TAKE: i32 = 1     // given to a `take` parameter
+const ECONS_REBIND: i32 = 2   // moved to another binding
+
 fn e_is_consumed(read e: Esc, read src: str, ns: usize, ne: usize) -> bool {
+    return e_consumed_cause(e, src, ns, ne) != 0
+}
+
+// The CAUSE of `src[ns..ne]`'s current binding being consumed, or 0 for "it is not".
+// Mirrors `FnCtx::consumed_cause`; `e_is_consumed` above is the boolean face of it, kept
+// because that is the shape most callers want.
+fn e_consumed_cause(read e: Esc, read src: str, ns: usize, ne: usize) -> i32 {
     let dep: i32 = e_scope_depth_of(e, src, ns, ne)
-    if dep < 0 { return false }
+    if dep < 0 { return 0 }
     var i: i32 = list.len(i32, e.cons) as i32
     for i >= 4 {
         i = i - 4
@@ -154,21 +166,21 @@ fn e_is_consumed(read e: Esc, read src: str, ns: usize, ne: usize) -> bool {
             let cns: i32 = list.get(i32, e.cons, i as usize)
             let cne: i32 = list.get(i32, e.cons, (i + 1) as usize)
             if str_eq(src[ns .. ne], src[cns as usize .. cne as usize]) {
-                return list.get(i32, e.cons, (i + 3) as usize) == 1
+                return list.get(i32, e.cons, (i + 3) as usize)
             }
         }
     }
-    return false
+    return 0
 }
 // Record `src[ns..ne]`'s binding as consumed, at its BINDING depth — the mark outlives inner
 // blocks and dies (via the depth match above) with the binding. Mirrors `FnCtx::mark_consumed`.
-fn e_mark_consumed(mut e: Esc, read src: str, ns: i32, ne: i32) {
+fn e_mark_consumed(mut e: Esc, read src: str, ns: i32, ne: i32, why: i32) {
     let dep: i32 = e_scope_depth_of(e, src, ns as usize, ne as usize)
     if dep < 0 { return }
     list.push(i32, e.cons, ns)
     list.push(i32, e.cons, ne)
     list.push(i32, e.cons, dep)
-    list.push(i32, e.cons, 1)
+    list.push(i32, e.cons, why)
 }
 // Mark `src[ns..ne]` region-tainted in the innermost region scope.
 fn e_bind_region(mut e: Esc, ns: i32, ne: i32) {
@@ -571,16 +583,49 @@ fn mcall_row(read c: typeck.Checker, id: i32) -> i32 {
     return 0 - 1
 }
 
-// ---- the consuming rule (use-after-`take` of a droppable; mirrors take_shape /
-//      droppable_ty / consume_take_arg + the FnCtx consumed set) ----
+// ---- the consuming rule (use-after-`take` of a RESOURCE; mirrors take_shape /
+//      owns_resource = droppable_ty | move_only_ty / consume_take_arg + the FnCtx
+//      consumed set) ----
 
-// Does the expression's type run drop glue the callee now owns? v1 answers "a Named type
-// with a direct concrete `impl Drop`" — the same items scan as cgen's `has_drop_impl`
-// (duplicated here because the import goes the other way). Transitively-droppable
-// aggregates, blanket generic `impl[T] Drop` instances, and concrete-generic-instance
-// impls are the reference gate's `impl_index` reach beyond this — recorded residue, no
-// corpus file distinguishes them. Drop-free values stay unmarked ON PURPOSE: giving one
-// to `take` is an implicit copy (MVS; the Option-combinator shape).
+// Does the attribute slice `aar[attr_start…]` contain `@move`? Mirrors the reference's
+// `attrs.iter().any(|a| a.name == "move")` at the struct-registration site. The 4-tuple
+// layout is `parser.jtr`'s, and `attrs_has_volatile` there is the same walk.
+fn attrs_has_move(read p: parser.Parser, read src: str, attr_start: i32, attr_count: i32) -> bool {
+    var i: i32 = 0
+    for i < attr_count {
+        let base: i32 = attr_start + i * 4
+        let ns: usize = list.get(i32, p.aar, base as usize) as usize
+        let ne: usize = list.get(i32, p.aar, (base + 1) as usize) as usize
+        if str_eq(src[ns .. ne], "move") { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Does the expression's type own something that must not be DUPLICATED? Two independent
+// reasons, mirroring the reference's `owns_resource`:
+//
+//   1. It runs drop glue the callee now owns — "a Named type with a direct concrete
+//      `impl Drop`", the same items scan as cgen's `has_drop_impl` (duplicated here
+//      because the import goes the other way).
+//   2. It is declared `@move` — a RESOURCE with no `Drop` at all. Every OS handle in the
+//      `sys` tier is this shape: a plain struct around an integer, where a copy is a
+//      second name for one kernel handle and closing through either leaves the other
+//      naming a descriptor the platform may already have reissued.
+//
+// Reason 2 is why this is no longer only about drop glue. `std/sysnet`'s header used to
+// state the hazard and then say the language could not express it; `@move` is that
+// expression, and giving those handles a `Drop` instead would have been wrong twice over
+// — it closes at every scope exit, and their close is FALLIBLE, so the verdict a caller
+// is meant to read would be discarded.
+//
+// Transitively-droppable aggregates, blanket generic `impl[T] Drop` instances, and
+// concrete-generic-instance impls are the reference gate's `impl_index` reach beyond
+// this — recorded residue, no corpus file distinguishes them. `@move` on a GENERIC struct
+// is residue of the same kind: the reference resolves it through `GenStruct`'s ctor and
+// the scan below is Named-only, and no corpus file declares one. Drop-free, move-free
+// values stay unmarked ON PURPOSE: giving one to `take` is an implicit copy (MVS; the
+// Option-combinator shape).
 fn droppable_expr(read p: parser.Parser, read c: typeck.Checker, read src: str, eid: i32) -> bool {
     let tid: i32 = list.get(i32, c.et, eid as usize)
     if tid < 0 { return false }
@@ -598,6 +643,12 @@ fn droppable_expr(read p: parser.Parser, read c: typeck.Checker, read src: str, 
                 if tt.kind == 0 {
                     if str_eq(src[tt.start .. tt.end], src[tns as usize .. tne as usize]) { return true }
                 }
+            }
+        }
+        // The `@move` half: a struct declaration of this name carrying the attribute.
+        if it.kind == 4 {
+            if str_eq(src[it.x .. it.y], src[tns as usize .. tne as usize]) {
+                if attrs_has_move(p, src, it.u, it.v) { return true }
             }
         }
         r = r + 1
@@ -724,7 +775,7 @@ fn consume_take_arg(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, r
                 return
             }
         }
-        e_mark_consumed(e, src, ad.start as i32, ad.end as i32)
+        e_mark_consumed(e, src, ad.start as i32, ad.end as i32, ECONS_TAKE)
         return
     }
     if ad.kind == 5 or ad.kind == 6 {
@@ -1183,6 +1234,33 @@ fn check_block(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read s
                 }
                 string_free(kb)
                 if is_borrow_place(e, p, c, src, s.a) { isb = 1 }
+
+                // **The consuming rule's REBINDING half** (mirrors the reference's
+                // `Stmt::Let` arm): `let b = a` where `a` is an owned local naming a
+                // RESOURCE moves it — the new name owns it and the old one may not be
+                // read again.
+                //
+                // This half was MISSING here until `@move` landed, and no corpus file
+                // showed it: the whole-corpus escape golden compares diagnostic SETS, and
+                // nothing in the tree rebinds a droppable, so the port agreed with the
+                // reference by producing the same empty answer for the wrong reason. It
+                // took a differential probe (`jestyr_move_only_matches_reference`) to see
+                // it — the same shape as the `@size_of` half-mirror, and the same lesson:
+                // a golden that passes is evidence about the corpus, not about agreement.
+                //
+                // Only a BARE NAME initializer moves. A field or index initializer is
+                // already refused by the `take` path's place-chain arm, and a call
+                // initializer produces a fresh value nothing else owns. Marked BEFORE
+                // `e_bind` so `var h = h` self-shadowing consumes the outer binding rather
+                // than the one being created.
+                let ia: parser.ExprData = list.get(parser.ExprData, p.ex, s.a as usize)
+                if ia.kind == 2 {
+                    if e_lookup(e, src, ia.start, ia.end) == 0 {
+                        if droppable_expr(p, c, src, s.a) {
+                            e_mark_consumed(e, src, ia.start as i32, ia.end as i32, ECONS_REBIND)
+                        }
+                    }
+                }
             }
             e_bind(e, s.x, s.y, isb)
             if tdep >= 0 { e_taint_alias(e, s.x, s.y, tdep) }
@@ -1508,11 +1586,20 @@ fn walk_expr(mut e: Esc, read p: parser.Parser, read c: typeck.Checker, read src
     // or reassigning it reads a dropped value. (Falls through: a tail Name still
     // gets the region-return checks below, like the reference's Name arm.)
     if k == 2 {
-        if e_is_consumed(e, src, d.start, d.end) {
+        let why: i32 = e_consumed_cause(e, src, d.start, d.end)
+        if why != 0 {
             var sb: String = string_new()
             string_push(sb, "cannot use `")
             string_push(sb, src[d.start .. d.end])
-            string_push(sb, "` after it was given to a `take` parameter: ownership moved at the call")
+            // The two causes, phrased exactly as `MoveCause::phrase` does. Neither says
+            // "and will drop it" any more: a `@move` type need not have a `Drop`, and the
+            // `sys` tier's handles deliberately do not — their close is fallible and the
+            // caller is meant to see the verdict.
+            if why == ECONS_REBIND {
+                string_push(sb, "` after it was moved to another binding: the new name owns it now")
+            } else {
+                string_push(sb, "` after it was given to a `take` parameter: ownership moved at the call")
+            }
             ediag(e, d.start, d.end, string_view(sb))
             string_free(sb)
         }

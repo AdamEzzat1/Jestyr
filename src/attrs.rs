@@ -97,6 +97,23 @@ const SPECS: &[Spec] = &[
     Spec { name: "layout", targets: &[Target::Struct], args: Args::Word, status: Status::Active },
     // opt-in `Copy` for a small aggregate (design §2.8): freely copied, never moves.
     Spec { name: "copy", targets: &[Target::Struct, Target::Enum], args: Args::None, status: Status::Active },
+    // `@move` — this aggregate is a RESOURCE, so it moves rather than copies.
+    //
+    // The exact opposite of `@copy`, and it exists because the ownership rules were gated
+    // on `droppable_ty`: only a type with a `Drop` impl could be consumed by `take` or by
+    // rebinding. Every OS handle in the `sys` tier is a plain struct wrapping an integer
+    // with no `Drop` — `Socket`, `Dir`, `Reader`/`Writer`, `Watcher`, `alog.Log`,
+    // `plugin.Host`, `sysproc.Child` — so all seven were freely copyable, and closing one
+    // through a copy left the other naming a descriptor the platform may already have
+    // reissued to something else.
+    //
+    // **Giving them a `Drop` is NOT the same fix**, which is why this is a separate
+    // attribute rather than a missing impl. A `Drop` closes at every scope exit, which is
+    // wrong for a handle deliberately passed around; and these handles close FALLIBLY
+    // (`file.finish` returns the verdict on whether the bytes landed), so an implicit drop
+    // would discard exactly the answer `@must_use` exists to preserve. Duplication and
+    // automatic teardown are separate properties, and only the first one is unsound.
+    Spec { name: "move", targets: &[Target::Struct], args: Args::None, status: Status::Active },
     // `@abi(<word>)` (workstream L, increment 3) — how this function's **large
     // read-only aggregate parameters** are passed. `value` is the default (a copy,
     // which is what `read` has always meant physically); `ref` passes them as
@@ -380,6 +397,28 @@ pub fn validate_struct(ast: &Ast, item: &Item, diags: &mut Vec<Diagnostic>) {
     let Item::Struct { body, attrs, is_union, .. } = item else {
         return;
     };
+
+    // `@copy` and `@move` are the two answers to one question, so carrying both is not an
+    // over-specification that could be resolved by picking a winner — it is a declaration
+    // that the type both may and may not be duplicated. Refused at the point of
+    // contradiction rather than by silently letting one attribute shadow the other, which
+    // is how a resource type ends up freely copied because someone added `@copy` for a
+    // performance reason and never saw the `@move` twenty lines up.
+    if let Some(m) = attrs.iter().find(|a| a.name == "move") {
+        if attrs.iter().any(|a| a.name == "copy") {
+            diags.push(
+                Diagnostic::new(
+                    "`@move` and `@copy` on the same struct contradict each other".to_string(),
+                    m.span,
+                )
+                .with_help(
+                    "`@copy` says the value may be freely duplicated and `@move` says it may \
+                     not; keep whichever is true — a type that owns an OS handle wants `@move`",
+                ),
+            );
+        }
+    }
+
     for a in attrs.iter().filter(|a| a.name == "layout") {
         // The vocabulary is closed (`c` | `auto`). Checking only that the argument *is*
         // an identifier — which is all `Args::Word` does — let `@layout(packd)` validate
@@ -1223,6 +1262,24 @@ mod tests {
     fn reserved_attribute_errors_rather_than_silently_passing() {
         let d = diags_of("@verified fn f() {}");
         assert!(has_msg(&d, "`@verified` is reserved"), "{d:?}");
+    }
+
+    #[test]
+    /// `@move` and `@copy` are the two answers to one question, so a struct carrying both
+    /// has declared that it both may and may not be duplicated. Refused at the point of
+    /// contradiction rather than by letting one silently win — which is how a resource
+    /// type ends up freely copied because `@copy` was added for a performance reason and
+    /// nobody saw the `@move` above it.
+    #[test]
+    fn move_and_copy_on_one_struct_contradict() {
+        let d = diags_of("@move @copy struct H { fd: i64 }");
+        assert!(has_msg(&d, "contradict each other"), "{d:?}");
+
+        // Either alone is fine, and `@move` is struct-only (a handle is never an enum).
+        assert!(diags_of("@move struct H { fd: i64 }").is_empty());
+        assert!(diags_of("@copy struct H { fd: i64 }").is_empty());
+        let e = diags_of("@move enum E { a, b }");
+        assert!(has_msg(&e, "@move"), "`@move` must be refused on an enum: {e:?}");
     }
 
     #[test]

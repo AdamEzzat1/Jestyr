@@ -82,7 +82,7 @@ import "str"
 // It is owned by the handle and freed by `close`, which is what lets `next_name` have the
 // same signature on both platforms instead of making every caller carry a buffer whose
 // size is a Windows implementation detail.
-pub struct Dir {
+@move pub struct Dir {
     h: cptr,
     buf: *mut u8,
     pending: bool,          // Windows: the open already produced the first entry

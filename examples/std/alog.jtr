@@ -179,7 +179,7 @@ pub const ALOG_MAX_RECORD: usize = 16777216
 // ---- the handle -----------------------------------------------------------------
 
 // One log, one writer. See the header on why there is no second appender.
-pub struct Log {
+@move pub struct Log {
     w: file.Writer,
     seq: i64,               // the sequence the NEXT append will use
     end: i64,               // byte offset just past the last good record

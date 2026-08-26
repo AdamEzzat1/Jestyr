@@ -432,6 +432,12 @@ impl<'a> TypeChecker<'a> {
                     // (design §2.8) — the escape checker then never treats it as a
                     // move/borrow that could escape.
                     self.table.types[i].is_copy = attrs.iter().any(|a| a.name == "copy");
+                    // `@move` is `@copy`'s opposite: the aggregate is a RESOURCE, so the
+                    // ownership rules treat it the way they treat a droppable even though
+                    // it has no `Drop`. Set here beside `is_copy` because the two are one
+                    // decision about the same type, and `attrs::validate_struct` has
+                    // already refused a struct that claims both.
+                    self.table.types[i].is_move = attrs.iter().any(|a| a.name == "move");
                 }
                 Item::Enum(e) => {
                     let idx = self.register_type(&e.name, true);
@@ -476,6 +482,7 @@ impl<'a> TypeChecker<'a> {
                             name: key.clone(),
                             kind: TypeKindG::Distinct { base: Ty::Unknown },
                             is_copy: false,
+                            is_move: false,
                             is_record: false,
                             type_params: Vec::new(),
                         });
@@ -1236,6 +1243,7 @@ impl<'a> TypeChecker<'a> {
             name: key.clone(),
             kind,
             is_copy: false,
+            is_move: false,
             is_record: false,
             type_params: Vec::new(),
         });

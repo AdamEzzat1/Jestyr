@@ -222,7 +222,7 @@ pub const PLUGIN_BAD_VERSION: i32 = 2      // a version this plugin does not kno
 // A host that may call plugins. It is `process.Process` plus `fs.Fs` because a call needs
 // both — and both are the caller's to grant, so a function that calls plugins says so in its
 // signature exactly as one that runs commands does.
-pub struct Host {
+@move pub struct Host {
     p: process.Process,
     f: fs.Fs,
     calls: i64,
