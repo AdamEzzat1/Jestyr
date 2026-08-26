@@ -647,7 +647,7 @@ impl<'a> TypeChecker<'a> {
                     let key = self.canon_in(item_m, &f.name.name);
                     let cfg = crate::attrs::cfg_of(ast, &f.attrs);
                     if self.table.fns.contains_key(&key)
-                        && !crate::attrs::cfgs_are_disjoint(
+                        && !crate::attrs::cfgs_may_share_a_name(
                             fn_cfg.get(&key).unwrap_or(&None),
                             &cfg,
                         )
@@ -682,7 +682,7 @@ impl<'a> TypeChecker<'a> {
                     let ret = e.ret_ty.map(|t| self.lower_type(&empty, t)).unwrap_or(Ty::Unit);
                     let cfg = crate::attrs::cfg_of(ast, &e.attrs);
                     if self.table.fns.contains_key(&e.name.name)
-                        && !crate::attrs::cfgs_are_disjoint(
+                        && !crate::attrs::cfgs_may_share_a_name(
                             fn_cfg.get(&e.name.name).unwrap_or(&None),
                             &cfg,
                         )

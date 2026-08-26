@@ -45,12 +45,23 @@
 // adding to the `@cfg` vocabulary "when something needs to tell them apart". **This is the
 // second thing that needs it, and it is a sharper case than the first** — `sysdir` wanted
 // to tell them apart to pick a NUMBER, this one needs to pick an entirely different API.
-// They are still not added here, and the reason is now more specific than "nobody can run
-// it": `posix` is a SUPERSET of `linux` and `macos`, and `src/attrs.rs`'s vocabulary is a
-// closed list of guards that are disjoint by construction. Adding two nested names would
-// make `@cfg(posix) fn f` and `@cfg(linux) fn f` both emit on Linux — a duplicate
-// definition — so the increment is not a word in a list, it is a specificity rule about
-// which of two overlapping items wins. Recorded rather than half-done.
+// **That increment is DONE.** The obstacle recorded here was exact and was the whole
+// problem: `posix` is a SUPERSET of `linux` and `macos`, so adding two nested names to a
+// vocabulary of guards that were disjoint by construction would make `@cfg(posix) fn f`
+// and `@cfg(linux) fn f` BOTH emit on Linux — a duplicate definition. It was never a word
+// in a list, it was a specificity rule about which of two overlapping items wins.
+//
+// The rule now exists: the narrower item keeps its own guard, and the wider one is emitted
+// with every narrower sibling of the same name subtracted, so exactly one survives on
+// every host. `examples/cfg_platform.jtr` demonstrates it and
+// `exactly_one_definition_survives_on_every_platform` proves it against the real C
+// preprocessor.
+//
+// **This module still does not use it**, and that is now a scope decision rather than a
+// language one. Splitting the watcher would mean a genuine third implementation — kqueue
+// or FSEvents, a different model rather than a different spelling — and writing one that
+// nothing in reach can run is the untested-claim failure this file's own header argues
+// against. What changed is that the language is no longer the thing in the way.
 //
 // ─── `read(2)` is unbindable, and `readv(2)` is the way through ───────────────
 //

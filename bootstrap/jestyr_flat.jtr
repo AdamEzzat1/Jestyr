@@ -17194,7 +17194,7 @@ fn emit_extern_protos(mut sb: String, read p: Parser, read src: str) {
             }
             if !hdr {
                 any = true
-                let eg: bool = cfg_open(sb, cfg_cond(cfg_word(p, src, it.xat, it.xac)))
+                let eg: bool = cfg_open_for(sb, p, src, it.x, it.y, cfg_word(p, src, it.xat, it.xac))
                 emit_c_ty(sb, p, src, it.z)               // ret type (-1 = void)
                 string_push(sb, " ")
                 string_push(sb, src[it.x .. it.y])
@@ -21466,6 +21466,8 @@ fn cfg_word(read p: Parser, read src: str, ats: i32, atc: i32) -> str {
                     let w: str = src[ax.start .. ax.end]
                     if str_eq(w, "posix") { return "posix" }
                     if str_eq(w, "windows") { return "windows" }
+                    if str_eq(w, "linux") { return "linux" }
+                    if str_eq(w, "macos") { return "macos" }
                 }
             }
         }
@@ -21479,7 +21481,76 @@ fn cfg_word(read p: Parser, read src: str, ats: i32, atc: i32) -> str {
 fn cfg_cond(read w: str) -> str {
     if str_eq(w, "windows") { return "defined(_WIN32)" }
     if str_eq(w, "posix") { return "!defined(_WIN32)" }
+    // `__linux__` and `__APPLE__` are compiler-predefined and need no header — the same
+    // property that made `_WIN32` the right choice for `windows`.
+    if str_eq(w, "linux") { return "defined(__linux__)" }
+    if str_eq(w, "macos") { return "defined(__APPLE__)" }
     return ""
+}
+
+// Is `sub` a strict SUBSET of `sup`? Mirrors `attrs::cfg_is_narrower`. `posix` is a
+// SUPERSET of both new words; everything else is disjoint by construction, which is why
+// the old two-word vocabulary needed no ordering at all.
+fn cfg_is_narrower(read sub: str, read sup: str) -> bool {
+    if !str_eq(sup, "posix") { return false }
+    if str_eq(sub, "linux") { return true }
+    if str_eq(sub, "macos") { return true }
+    return false
+}
+
+// Does any OTHER item named `src[ns..ne]` carry `@cfg(w)`? The sibling scan behind the
+// specificity rule. Fn (kind 3) and Extern (kind 8) are the two item kinds `cfg_open`
+// guards, matching the reference's `cfg_siblings` map.
+fn cfg_has_sibling(read p: Parser, read src: str, ns: i32, ne: i32, read w: str) -> bool {
+    var r: i32 = 0
+    for r < len(i32, p.roots) {
+        let iid: i32 = get__list(i32, p.roots, r as usize)
+        let it: ItemData = get__list(ItemData, p.it, iid as usize)
+        if it.kind == 3 or it.kind == 8 {
+            if str_eq(src[it.x .. it.y], src[ns as usize .. ne as usize]) {
+                var ats: i32 = it.u
+                var atc: i32 = it.v
+                if it.kind == 8 { ats = it.xat  atc = it.xac }
+                if str_eq(cfg_word(p, src, ats, atc), w) { return true }
+            }
+        }
+        r = r + 1
+    }
+    return false
+}
+
+// **The specificity rule.** An item's own guard, with every NARROWER sibling of the same
+// name subtracted — so `@cfg(posix) fn f` beside `@cfg(linux) fn f` emits ONE definition
+// on Linux instead of two. Mirrors `Cgen::cfg_open`'s condition-building half.
+//
+// Without it, adding `linux`/`macos` to the vocabulary would be actively wrong rather than
+// merely incomplete: `posix` is a superset, so both guards are true on Linux and the C
+// compiler reports a duplicate definition. That is why this was never "two more words in
+// a list".
+//
+// The narrower words are walked in the reference's SORTED order (`linux` then `macos`)
+// rather than in item order, so both backends build the same condition string character
+// for character — the emitted C has to be byte-identical for attest to mean anything.
+fn cfg_cond_for(read p: Parser, read src: str, ns: i32, ne: i32, read w: str) -> String {
+    // NOT named `out` — that is a Jestyr KEYWORD (the `out x: T` parameter mode), and it
+    // parses as one here too. Fourth time this list has cost something.
+    var acc: String = string_new()
+    let base: str = cfg_cond(w)
+    if base.len == 0 { return acc }
+    string_push(acc, base)
+    if cfg_is_narrower("linux", w) {
+        if cfg_has_sibling(p, src, ns, ne, "linux") {
+            string_push(acc, " && !")
+            string_push(acc, cfg_cond("linux"))
+        }
+    }
+    if cfg_is_narrower("macos", w) {
+        if cfg_has_sibling(p, src, ns, ne, "macos") {
+            string_push(acc, " && !")
+            string_push(acc, cfg_cond("macos"))
+        }
+    }
+    return acc
 }
 
 // Open the C preprocessor guard for a `@cfg`ed item; the bool says whether `cfg_close` must
@@ -21495,6 +21566,16 @@ fn cfg_open(mut sb: String, read cond: str) -> bool {
     string_push(sb, cond)
     string_push(sb, "\n")
     return true
+}
+
+// `cfg_open` with the specificity rule applied — the shape every call site wants, so the
+// subtraction cannot be forgotten at one of them.
+fn cfg_open_for(mut sb: String, read p: Parser, read src: str, ns: i32, ne: i32, read w: str) -> bool {
+    var cond: String = cfg_cond_for(p, src, ns, ne, w)
+    let cv: str = string_view(cond)
+    let g: bool = cfg_open(sb, cv)
+    string_free(cond)
+    return g
 }
 
 fn cfg_close(mut sb: String, open: bool) {
@@ -26636,7 +26717,7 @@ fn emit_fn_protos(mut sb: String, read p: Parser, read src: str, read c: Checker
         let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 and !fn_is_template(p, it) and !test_only_item(p, src, it, g.tmode) {  // Fn (templates never emitted directly; @test only in test mode)
-            let fg: bool = cfg_open(sb, cfg_cond(cfg_word(p, src, it.u, it.v)))
+            let fg: bool = cfg_open_for(sb, p, src, it.x, it.y, cfg_word(p, src, it.u, it.v))
             emit_fn_sig(sb, p, src, it)
             string_push(sb, ";\n")
             cfg_close(sb, fg)
@@ -26649,7 +26730,7 @@ fn emit_fn_protos(mut sb: String, read p: Parser, read src: str, read c: Checker
         // signature it is substituted from.
         let tid: i32 = get__list(i32, g.gfi, gi as usize)
         let tit: ItemData = get__list(ItemData, p.it, tid as usize)
-        let ig: bool = cfg_open(sb, cfg_cond(cfg_word(p, src, tit.u, tit.v)))
+        let ig: bool = cfg_open_for(sb, p, src, tit.x, tit.y, cfg_word(p, src, tit.u, tit.v))
         emit_gfn_sig(sb, p, src, c, g, gi)
         string_push(sb, ";\n")
         cfg_close(sb, ig)
@@ -26666,7 +26747,7 @@ fn emit_fn_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, 
         let iid: i32 = get__list(i32, p.roots, r as usize)
         let it: ItemData = get__list(ItemData, p.it, iid as usize)
         if it.kind == 3 and !fn_is_template(p, it) and !test_only_item(p, src, it, g.tmode) {  // Fn (templates never emitted directly; @test only in test mode)
-            let fg: bool = cfg_open(sb, cfg_cond(cfg_word(p, src, it.u, it.v)))
+            let fg: bool = cfg_open_for(sb, p, src, it.x, it.y, cfg_word(p, src, it.u, it.v))
             emit_fn_sig(sb, p, src, it)
             string_push(sb, "\n")
             // Register the fn's by-pointer (`mut`/`out`) params so body uses render `(*j_x)`.
@@ -26744,7 +26825,7 @@ fn emit_fn_defs(mut sb: String, read p: Parser, read src: str, read c: Checker, 
     for (gi as usize) < len(i32, g.gfi) {
         let fit: i32 = get__list(i32, g.gfi, gi as usize)
         let fd: ItemData = get__list(ItemData, p.it, fit as usize)
-        let dg: bool = cfg_open(sb, cfg_cond(cfg_word(p, src, fd.u, fd.v)))
+        let dg: bool = cfg_open_for(sb, p, src, fd.x, fd.y, cfg_word(p, src, fd.u, fd.v))
         emit_gfn_sig(sb, p, src, c, g, gi)            // arms g.su for the body too
         string_push(sb, "\n")
         truncate(i32, g.pp, 0)

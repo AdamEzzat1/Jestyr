@@ -402,6 +402,38 @@ fn emit_program(
             }
             m
         },
+        cfg_siblings: {
+            // name → every `@cfg` word declared for that name, for the specificity rule.
+            //
+            // Keyed the way the C symbol is: a fn by its CANONICAL name (two modules'
+            // same-named fns become different symbols, so their guards must not subtract
+            // from each other), an extern by its bare name (an extern's name IS a C
+            // symbol and is never canonicalized).
+            let mut m: HashMap<String, Vec<String>> = HashMap::new();
+            for (i, it) in ast.items.iter().enumerate() {
+                let md = *info.item_mod.get(i).unwrap_or(&0);
+                let (key, attrs) = match it {
+                    Item::Fn(f) => (
+                        crate::types::canon(md, &f.name.name, &info.dup_fns),
+                        &f.attrs,
+                    ),
+                    Item::Extern(e) => (e.name.name.clone(), &e.attrs),
+                    _ => continue,
+                };
+                if let Some(w) = crate::attrs::cfg_of(ast, attrs) {
+                    let v = m.entry(key).or_default();
+                    if !v.contains(&w) {
+                        v.push(w);
+                    }
+                }
+            }
+            // Sorted so a subtracted guard list is a deterministic string — the emitted C
+            // has to be byte-identical run to run for `attest` to mean anything.
+            for v in m.values_mut() {
+                v.sort();
+            }
+            m
+        },
         par_fusions: HashMap::new(),
         gen_enum_by_canon: {
             let mut m: HashMap<String, usize> = HashMap::new();
@@ -849,6 +881,11 @@ struct Cgen<'a> {
     /// is borrowed immutably for the whole of codegen, so no `FnDecl` moves and
     /// the addresses stay valid.
     fn_item_index: HashMap<usize, usize>,
+    /// Emitted-symbol name → every `@cfg` word declared for it. Drives the specificity
+    /// rule in [`Self::cfg_open`]: a wider item's guard has each NARROWER sibling of the
+    /// same name subtracted, so `@cfg(posix) fn f` beside `@cfg(linux) fn f` emits one
+    /// definition on Linux instead of two.
+    cfg_siblings: HashMap<String, Vec<String>>,
     /// Canonical function name → its index in `ast.items`, first definition wins —
     /// the lookup behind [`find_fn`](Self::find_fn).
     fn_by_canon: HashMap<String, usize>,
@@ -1096,7 +1133,13 @@ impl<'a> Cgen<'a> {
         // output moves.
         hdrs.sort_by_key(|h| if *h == "winsock2.h" { 0 } else { 1 });
         for h in hdrs {
-            let g = self.cfg_open(seen.get(h).cloned().flatten().flatten());
+            // **No specificity key here, deliberately.** A `#include` is not a definition,
+            // so two headers guarded by overlapping `@cfg`s do not collide the way two
+            // function bodies do: `<sys/inotify.h>` under `@cfg(linux)` and `<unistd.h>`
+            // under `@cfg(posix)` must BOTH be included on Linux. Subtracting here would
+            // remove an include the linux branch still needs. `""` matches no entry in
+            // `cfg_siblings`, which only ever holds fn and extern names.
+            let g = self.cfg_open(seen.get(h).cloned().flatten().flatten(), "");
             self.raw(format!("#include <{h}>\n"));
             self.cfg_close(g);
         }
@@ -2484,10 +2527,29 @@ impl<'a> Cgen<'a> {
     /// **The item is always emitted.** `@cfg` selects at the C preprocessor, not in
     /// codegen, so the emitted C is the same on every host and `attest`'s "same source →
     /// byte-identical C" survives a platform-conditional program. See `attrs::cfg_guard`.
-    fn cfg_open(&mut self, word: Option<String>) -> bool {
+    /// `key` is the emitted symbol name, used to find same-name siblings for the
+    /// SPECIFICITY rule: every sibling guard strictly narrower than this item's is
+    /// subtracted, so the wider item stands down exactly where a narrower one applies.
+    ///
+    /// Without this, `@cfg(posix) fn f` beside `@cfg(linux) fn f` emits BOTH definitions
+    /// on Linux — `posix` is a superset, so the two guards are both true — and the C
+    /// compiler reports a duplicate. The old vocabulary could not express the problem
+    /// because `posix` and `windows` are disjoint by construction and no pair overlapped.
+    fn cfg_open(&mut self, word: Option<String>, key: &str) -> bool {
         let Some(w) = word else { return false };
         let Some(g) = crate::attrs::cfg_guard(&w) else { return false };
-        self.raw(format!("#if {g}\n"));
+        let mut cond = g.to_string();
+        if let Some(sibs) = self.cfg_siblings.get(key) {
+            // `sibs` is sorted at construction, so the emitted condition is stable.
+            for s in sibs {
+                if crate::attrs::cfg_is_narrower(s, &w) {
+                    if let Some(sg) = crate::attrs::cfg_guard(s) {
+                        cond.push_str(&format!(" && !{sg}"));
+                    }
+                }
+            }
+        }
+        self.raw(format!("#if {cond}\n"));
         true
     }
 
@@ -2513,7 +2575,8 @@ impl<'a> Cgen<'a> {
                 let cfg = crate::attrs::cfg_of(ast, &f.attrs);
                 let cname = self.c_fn_name(&self.fn_canon(f));
                 let sig = self.fn_signature(f, &cname);
-                let g = self.cfg_open(cfg);
+                let key = self.fn_canon(f);
+                let g = self.cfg_open(cfg, &key);
                 self.raw(format!("{sig};\n"));
                 self.cfg_close(g);
             }
@@ -2525,7 +2588,7 @@ impl<'a> Cgen<'a> {
                 self.subst = self.make_subst(f, &args);
                 let cfg = crate::attrs::cfg_of(ast, &f.attrs);
                 let sig = self.fn_signature(f, &format!("jestyr_{}", self.mangle(&name, &args)));
-                let g = self.cfg_open(cfg);
+                let g = self.cfg_open(cfg, &name);
                 self.raw(format!("{sig};\n"));
                 self.cfg_close(g);
                 self.subst.clear();
@@ -2574,7 +2637,8 @@ impl<'a> Cgen<'a> {
                     None => "void".to_string(),
                 };
                 let params = self.extern_params_str(e);
-                let g = self.cfg_open(cfg);
+                let key = e.name.name.clone();
+                let g = self.cfg_open(cfg, &key);
                 self.raw(format!("{ret} {}({});\n", e.name.name, params));
                 self.cfg_close(g);
             }
@@ -2702,7 +2766,8 @@ impl<'a> Cgen<'a> {
                 self.subst.clear();
                 let cfg = crate::attrs::cfg_of(ast, &f.attrs);
                 let cname = self.c_fn_name(&self.fn_canon(f));
-                let g = self.cfg_open(cfg);
+                let key = self.fn_canon(f);
+                let g = self.cfg_open(cfg, &key);
                 self.emit_fn(f, &cname);
                 self.cfg_close(g);
             }
@@ -2713,7 +2778,7 @@ impl<'a> Cgen<'a> {
             if let Some(f) = self.find_fn(&name) {
                 self.subst = self.make_subst(f, &args);
                 let cfg = crate::attrs::cfg_of(ast, &f.attrs);
-                let g = self.cfg_open(cfg);
+                let g = self.cfg_open(cfg, &name);
                 self.emit_fn(f, &format!("jestyr_{}", self.mangle(&name, &args)));
                 self.cfg_close(g);
                 self.subst.clear();

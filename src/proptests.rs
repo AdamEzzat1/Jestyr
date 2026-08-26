@@ -2045,10 +2045,119 @@ mod cfg_platform {
         for w in crate::attrs::CFG_WORDS {
             assert!(crate::attrs::cfg_guard(w).is_some(), "`{w}` is accepted but has no guard");
         }
-        for w in ["freebsd", "linux", "macos", "", "POSIX", "windows "] {
+        // `linux`/`macos` moved OUT of this list when they joined the vocabulary. They are
+        // the reason the specificity rule exists — see the tests below.
+        for w in ["freebsd", "openbsd", "", "POSIX", "windows "] {
             assert!(
-                crate::attrs::cfg_guard(w).is_none() || crate::attrs::CFG_WORDS.contains(&w),
+                crate::attrs::cfg_guard(w).is_none(),
                 "`{w}` has a guard but is not in the vocabulary"
+            );
+        }
+    }
+
+    /// **The containment relation, which is the whole reason this is not just two more
+    /// words in a list.** `posix` is a SUPERSET of `linux` and `macos`; everything else is
+    /// disjoint by construction, which is why the old vocabulary needed no ordering.
+    #[test]
+    fn only_posix_contains_the_two_new_words() {
+        use crate::attrs::cfg_is_narrower;
+        assert!(cfg_is_narrower("linux", "posix"));
+        assert!(cfg_is_narrower("macos", "posix"));
+        // Not symmetric, not reflexive, and nothing else overlaps.
+        assert!(!cfg_is_narrower("posix", "linux"));
+        assert!(!cfg_is_narrower("linux", "linux"));
+        assert!(!cfg_is_narrower("linux", "macos"));
+        assert!(!cfg_is_narrower("macos", "linux"));
+        assert!(!cfg_is_narrower("linux", "windows"));
+        assert!(!cfg_is_narrower("windows", "posix"));
+    }
+
+    /// A narrower platform's item subtracts itself from its wider sibling's guard, so the
+    /// two do not both survive where they overlap.
+    #[test]
+    fn a_narrower_platform_is_subtracted_from_the_wider_one() {
+        let c = emit("@cfg(posix) fn n() -> i64 { return 1 }\n\
+                      @cfg(linux) fn n() -> i64 { return 2 }\n\
+                      fn main() { print_int(n()) }\n");
+        assert!(
+            c.contains("#if !defined(_WIN32) && !defined(__linux__)"),
+            "the posix item must stand down on Linux:\n{c}"
+        );
+        assert!(c.contains("#if defined(__linux__)"), "the linux item keeps its own guard:\n{c}");
+    }
+
+    /// **Nothing about the old vocabulary moved.** `posix`/`windows` are disjoint, so
+    /// neither subtracts from the other and every existing program's emitted C is
+    /// byte-identical to what it was. That property is what lets this land without
+    /// re-baselining every golden in the tree.
+    #[test]
+    fn a_disjoint_pair_emits_exactly_what_it_always_did() {
+        let c = emit("@cfg(posix) fn n() -> i64 { return 1 }\n\
+                      @cfg(windows) fn n() -> i64 { return 2 }\n\
+                      fn main() { print_int(n()) }\n");
+        assert!(c.contains("#if !defined(_WIN32)\n"), "the posix guard is unchanged:\n{c}");
+        assert!(c.contains("#if defined(_WIN32)\n"), "the windows guard is unchanged:\n{c}");
+        assert!(!c.contains("&& !defined"), "nothing should be subtracted here:\n{c}");
+    }
+
+    /// **THE assertion: exactly one definition survives on every platform.**
+    ///
+    /// Not a re-derivation of the rule in the test — it takes the guards cgen ACTUALLY
+    /// emitted and hands them to the real C preprocessor under each platform's macro set.
+    /// A rule that produced two definitions on Linux (the bug this whole increment exists
+    /// to prevent) or zero on FreeBSD would show up here as a count that is not 1.
+    #[test]
+    fn exactly_one_definition_survives_on_every_platform() {
+        let c = emit("@cfg(posix) fn n() -> i64 { return 1 }\n\
+                      @cfg(linux) fn n() -> i64 { return 2 }\n\
+                      @cfg(macos) fn n() -> i64 { return 3 }\n\
+                      @cfg(windows) fn n() -> i64 { return 4 }\n\
+                      fn main() { print_int(n()) }\n");
+
+        // The four PROTOTYPE guards, lifted straight out of the emitted C: an `#if` whose
+        // next line is the prototype. Reading real output rather than rebuilding it is the
+        // point — otherwise this tests the test.
+        let lines: Vec<&str> = c.lines().collect();
+        let conds: Vec<String> = lines
+            .windows(2)
+            .filter(|w| w[1].trim() == "int64_t jestyr_n(void);")
+            .map(|w| w[0].trim_start_matches("#if ").to_string())
+            .collect();
+        assert_eq!(conds.len(), 4, "expected four guarded prototypes, got {conds:?}");
+
+        let cc = crate::find_c_compiler().expect("this test needs a C compiler on PATH");
+        // (label, extra cpp flags). `_WIN32` is predefined by a mingw gcc, so every
+        // non-Windows platform has to UNdefine it explicitly.
+        let platforms: [(&str, Vec<&str>); 4] = [
+            ("windows", vec!["-D_WIN32=1", "-U__linux__", "-U__APPLE__"]),
+            ("linux", vec!["-U_WIN32", "-D__linux__=1", "-U__APPLE__"]),
+            ("macos", vec!["-U_WIN32", "-U__linux__", "-D__APPLE__=1"]),
+            // A POSIX that is neither — FreeBSD, say. This is the case the subtraction
+            // could break by over-reaching, and the one a hand-written rule forgets.
+            ("other-posix", vec!["-U_WIN32", "-U__linux__", "-U__APPLE__"]),
+        ];
+
+        let dir = std::env::temp_dir();
+        let mut probe = String::new();
+        for cond in &conds {
+            probe.push_str(&format!("#if {cond}\nJESTYR_SELECTED\n#endif\n"));
+        }
+        let cfile = dir.join("jestyr_cfg_specificity_probe.c");
+        std::fs::write(&cfile, &probe).unwrap();
+
+        for (label, flags) in &platforms {
+            let out = std::process::Command::new(&cc)
+                .arg("-E")
+                .arg("-P")
+                .args(flags)
+                .arg(&cfile)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "preprocessing failed for {label}");
+            let n = String::from_utf8_lossy(&out.stdout).matches("JESTYR_SELECTED").count();
+            assert_eq!(
+                n, 1,
+                "on {label} exactly one definition must survive, {n} did.\nguards: {conds:?}"
             );
         }
     }

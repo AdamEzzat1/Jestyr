@@ -87,6 +87,51 @@
     return "windows"
 }
 
+// ---- specificity: when two platforms OVERLAP ------------------------------
+//
+// Everything above works because `posix` and `windows` are disjoint — no host is both, so
+// "two items may share a name when their platforms differ" needed no further rule.
+//
+// `linux` and `macos` are not like that. **`posix` is a SUPERSET of both**, so the four
+// items below are not four disjoint cases: on Linux, `@cfg(posix)` and `@cfg(linux)` are
+// BOTH true. Under the disjointness rule alone that is a duplicate definition, and the C
+// compiler says so.
+//
+// So the vocabulary could never have been "two more words in a list". What makes it work
+// is a SPECIFICITY rule: the narrower item wins where it applies, and the wider one is
+// emitted with every narrower sibling of its own name subtracted from its guard —
+//
+//     @cfg(linux)   →  #if defined(__linux__)
+//     @cfg(macos)   →  #if defined(__APPLE__)
+//     @cfg(posix)   →  #if !defined(_WIN32) && !defined(__linux__) && !defined(__APPLE__)
+//     @cfg(windows) →  #if defined(_WIN32)
+//
+// Exactly one survives on every host — including a POSIX that is neither Linux nor macOS,
+// which is the case an over-eager subtraction would silently delete. That is checked by
+// handing the ACTUAL emitted guards to the real C preprocessor under each platform's
+// macro set (`exactly_one_definition_survives_on_every_platform`), rather than by
+// re-deriving the rule inside its own test.
+//
+// The subtraction is per-NAME. `platform_name` above is untouched: nothing narrower than
+// `posix` shares that name, so its guard is still the bare `#if !defined(_WIN32)` it
+// always was, and every existing program's emitted C is byte-identical.
+
+@cfg(posix) fn family() -> str {
+    return "posix, unspecialised"
+}
+
+@cfg(linux) fn family() -> str {
+    return "posix, and specifically linux"
+}
+
+@cfg(macos) fn family() -> str {
+    return "posix, and specifically macos"
+}
+
+@cfg(windows) fn family() -> str {
+    return "windows"
+}
+
 // The search pattern differs too: POSIX opens the directory itself, Windows needs a
 // glob. Same name, disjoint platforms, one call site below.
 @cfg(posix) fn here_pattern() -> cstr {
@@ -99,6 +144,9 @@
 
 fn main() -> i32 {
     print_str(platform_name())
+    // The specificity rule, observed: on Linux this is the `@cfg(linux)` body and NOT the
+    // `@cfg(posix)` one, even though both guards would otherwise be true there.
+    print_str(family())
 
     // 320 bytes covers WIN32_FIND_DATAA; POSIX ignores it entirely.
     var scratch: *mut u8 = alloc(u8, 512)

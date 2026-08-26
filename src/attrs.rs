@@ -655,7 +655,26 @@ pub const ABI_WORDS: &[&str] = &["value", "ref"];
 /// control) falls the same way. `linux`/`macos` are deliberately absent until something
 /// needs to tell them apart — a vocabulary that outruns its callers is a set of names
 /// nobody has had to define precisely.
-pub const CFG_WORDS: &[&str] = &["posix", "windows"];
+pub const CFG_WORDS: &[&str] = &["posix", "windows", "linux", "macos"];
+
+/// Is `sub` a strict SUBSET of `sup` — every host `sub` selects, `sup` selects too?
+///
+/// This is the fact that made `linux`/`macos` more than two names in a list. The other
+/// guards are disjoint by construction, so "two `@cfg`s cannot both be active" was simply
+/// `x != y`. `posix` is a SUPERSET of both new words, so `@cfg(posix) fn f` and
+/// `@cfg(linux) fn f` are both active on Linux — a duplicate definition — unless something
+/// says which of two OVERLAPPING items wins.
+///
+/// The rule is SPECIFICITY: the narrower item wins on the hosts it names, and the wider one
+/// is emitted with every narrower sibling of the same name subtracted from its guard. That
+/// subtraction happens in `cgen`; this predicate is the ordering it consults.
+///
+/// Deliberately a hard-coded pair list rather than a general lattice. The vocabulary is a
+/// closed list of four, and a two-entry table that is obviously right beats a hierarchy
+/// nobody can check by eye.
+pub fn cfg_is_narrower(sub: &str, sup: &str) -> bool {
+    matches!((sub, sup), ("linux", "posix") | ("macos", "posix"))
+}
 
 /// The C preprocessor condition guarding `word`'s items, or `None` for an unknown word.
 ///
@@ -669,6 +688,13 @@ pub fn cfg_guard(word: &str) -> Option<&'static str> {
     match word {
         "windows" => Some("defined(_WIN32)"),
         "posix" => Some("!defined(_WIN32)"),
+        // `__linux__` and `__APPLE__` are the compiler-predefined macros gcc and clang
+        // both set, needing no header — the same property that made `_WIN32` the right
+        // choice for `windows`. Probing `__GLIBC__` or a feature macro would require an
+        // include, and on the platform where it is absent the include is the thing that
+        // fails.
+        "linux" => Some("defined(__linux__)"),
+        "macos" => Some("defined(__APPLE__)"),
         _ => None,
     }
 }
@@ -689,9 +715,20 @@ pub fn cfg_of(ast: &Ast, attrs: &[Attribute]) -> Option<String> {
     None
 }
 
-/// Two `@cfg`s cannot both be active, so items carrying them may share a name.
-/// `None` (unconditional) is disjoint from nothing — it is live on every platform.
-pub fn cfgs_are_disjoint(a: &Option<String>, b: &Option<String>) -> bool {
+/// May two items carrying these `@cfg`s share a name?
+///
+/// **Renamed from `cfgs_are_disjoint`, because that is no longer why the answer is yes.**
+/// With a vocabulary of two mutually-exclusive words, "different" and "disjoint" were the
+/// same test. `posix` is a SUPERSET of `linux` and `macos`, so `@cfg(posix) fn f` and
+/// `@cfg(linux) fn f` are both active on Linux and are NOT disjoint — they may still share
+/// a name, because [`cfg_is_narrower`]'s specificity rule says which one wins there and
+/// `cgen` subtracts the narrower guard from the wider item.
+///
+/// So the test stays `x != y` and the NAME stops claiming something untrue. Two items with
+/// the same word really are a duplicate, and `None` (unconditional) shares with nothing —
+/// it is live on every host, so nothing can be more specific than it in a way this rule
+/// could resolve.
+pub fn cfgs_may_share_a_name(a: &Option<String>, b: &Option<String>) -> bool {
     match (a, b) {
         (Some(x), Some(y)) => x != y,
         _ => false,

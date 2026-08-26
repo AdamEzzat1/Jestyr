@@ -112,14 +112,25 @@ const INVALID_HANDLE: i64 = 0 - 1
 // than garbage names. That test only runs on POSIX, which means the CI Linux canary is
 // what actually exercises it; on Windows this constant is not compiled at all.
 //
-// This is exactly the trigger the `@cfg` vocabulary was left closed for: `linux` and
-// `macos` become worth adding when something needs to tell them apart, and this is that
-// something. They are NOT added here because a branch nobody can run on either machine
-// available to this session would be an untested claim, which is the failure mode this
-// module's whole header argues against.
+// This was the trigger the `@cfg` vocabulary was left closed for, and **`linux` and
+// `macos` now EXIST** — with a specificity rule, because `posix` is a superset of both and
+// two overlapping guards would otherwise emit two definitions on Linux. See
+// `examples/cfg_platform.jtr`.
+//
+// **They are still not used here, and the reason has changed.** It is no longer that the
+// language cannot say it; it is that 21 is a claim about macOS's `struct dirent` that
+// nobody can run on either machine this project builds on, and an untested claim is the
+// failure mode this module's whole header argues against. `d_name_offset_is_right_for_
+// this_libc` is what makes 19 a measurement rather than a memory, and the macOS branch
+// would have no equivalent until something runs there. The vocabulary is ready when a CI
+// runner is.
+//
+// Two smaller obstacles, both real: `@cfg` is scoped to functions and externs, so the
+// branch would have to become `@cfg(linux) fn d_name_offset()` rather than a `const`; and
+// the offset is read on the POSIX path, which would then have to call it.
+//
 // Unguarded, because a constant needs no guard: it is unused on Windows and costs one
-// line of C. `@cfg` is scoped to functions and externs deliberately -- widening it to
-// consts would be surface added for a case that does not need it.
+// line of C.
 const D_NAME_OFFSET: usize = 19
 const D_NAME_MAX: usize = 256
 
