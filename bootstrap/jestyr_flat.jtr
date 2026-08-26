@@ -1378,7 +1378,7 @@ pub struct PatData { pub kind: i32, pub start: usize, pub end: usize, pub op: i3
 // an Extern's attribute slice — externs are the one kind whose `(u,v)` is taken (by the abi
 // span), and `(g,h)` is NOT a safe place to borrow: `typeck.fn_call_ret` reads it as the
 // generic slice off whatever item a call resolves to, an extern included.
-pub struct ItemData { pub kind: i32, pub start: usize, pub end: usize, pub is_pub: i32, pub op: i32, pub a: i32, pub b: i32, pub x: i32, pub y: i32, pub z: i32, pub w: i32, pub u: i32, pub v: i32, pub g: i32, pub h: i32, pub e: i32, pub xat: i32, pub xac: i32 }
+pub struct ItemData { pub kind: i32, pub start: usize, pub end: usize, pub is_pub: i32, pub op: i32, pub a: i32, pub b: i32, pub x: i32, pub y: i32, pub z: i32, pub w: i32, pub u: i32, pub v: i32, pub g: i32, pub h: i32, pub e: i32, pub xat: i32, pub xac: i32, pub cns: i32, pub cne: i32 }
 
 // `st` is the statement arena; `sar` the statement-id child arena a Block slices. `pt` is
 // the pattern arena; `par` a shared i32 child arena for pattern children (variant subpats,
@@ -1865,26 +1865,26 @@ fn parse_conv(mut p: Parser) -> i32 {
 // An `import` item: `(x,y)`=path span, `(z,w)`=alias span (z=-1 none), `(a,b)`=hash span.
 fn mk_item_import(mut p: Parser, start: usize, end: usize, ps: usize, pe: usize, als: i32, ale: i32, hs: i32, he: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 0, start: start, end: end, is_pub: 0, op: 0 - 1, a: hs, b: he, x: ps as i32, y: pe as i32, z: als, w: ale, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 0, start: start, end: end, is_pub: 0, op: 0 - 1, a: hs, b: he, x: ps as i32, y: pe as i32, z: als, w: ale, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1, cns: 0 - 1, cne: 0 - 1 })
     return id
 }
 // A `distinct Name = Base` item: `(x,y)`=name span, `a`=base TypeId.
 fn mk_item_distinct(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, base: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 1, start: start, end: end, is_pub: is_pub, op: 0 - 1, a: base, b: 0 - 1, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 1, start: start, end: end, is_pub: is_pub, op: 0 - 1, a: base, b: 0 - 1, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1, cns: 0 - 1, cne: 0 - 1 })
     return id
 }
 // A `const Name [: T] = value` item: `(x,y)`=name span, `a`=type TypeId (-1 none), `b`=value.
 fn mk_item_const(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, tyid: i32, value: i32, attr_start: i32, attr_count: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 2, start: start, end: end, is_pub: is_pub, op: 0 - 1, a: tyid, b: value, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1, u: attr_start, v: attr_count, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 2, start: start, end: end, is_pub: is_pub, op: 0 - 1, a: tyid, b: value, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1, u: attr_start, v: attr_count, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1, cns: 0 - 1, cne: 0 - 1 })
     return id
 }
 // A `fn Name(params) [-> conv R] { … }` item: `(x,y)`=name span, `(a,b)`=(param_start,
 // param_count) of 7-tuples in `iar`, `op`=ret_conv, `z`=ret TypeId (-1 none), `w`=body.
 fn mk_item_fn(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, param_start: i32, param_count: i32, ret_conv: i32, ret_ty: i32, body: i32, attr_start: i32, attr_count: i32, gen_start: i32, gen_count: i32, e_start: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 3, start: start, end: end, is_pub: is_pub, op: ret_conv, a: param_start, b: param_count, x: ns as i32, y: ne as i32, z: ret_ty, w: body, u: attr_start, v: attr_count, g: gen_start, h: gen_count, e: e_start, xat: 0 - 1, xac: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 3, start: start, end: end, is_pub: is_pub, op: ret_conv, a: param_start, b: param_count, x: ns as i32, y: ne as i32, z: ret_ty, w: body, u: attr_start, v: attr_count, g: gen_start, h: gen_count, e: e_start, xat: 0 - 1, xac: 0 - 1, cns: 0 - 1, cne: 0 - 1 })
     return id
 }
 // A `struct`/`record`/`union Name { members }` item (kind 4): `op`=kind code (0=struct,
@@ -1892,7 +1892,7 @@ fn mk_item_fn(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, n
 // in `mar`.
 fn mk_item_struct(mut p: Parser, start: usize, end: usize, is_pub: i32, kindcode: i32, ns: usize, ne: usize, mem_start: i32, mem_count: i32, attr_start: i32, attr_count: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 4, start: start, end: end, is_pub: is_pub, op: kindcode, a: mem_start, b: mem_count, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1, u: attr_start, v: attr_count, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 4, start: start, end: end, is_pub: is_pub, op: kindcode, a: mem_start, b: mem_count, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1, u: attr_start, v: attr_count, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1, cns: 0 - 1, cne: 0 - 1 })
     return id
 }
 // An `enum Name(tparams) { variants }` item (kind 5): `(x,y)`=name span, `(op,a)`=(tparam_start,
@@ -1902,21 +1902,21 @@ fn mk_item_struct(mut p: Parser, start: usize, end: usize, is_pub: i32, kindcode
 // reference item dump).
 fn mk_item_enum(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, tparam_start: i32, tparam_count: i32, variant_start: i32, variant_count: i32, attr_start: i32, attr_count: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 5, start: start, end: end, is_pub: is_pub, op: tparam_start, a: tparam_count, b: variant_start, x: ns as i32, y: ne as i32, z: variant_count, w: 0 - 1, u: attr_start, v: attr_count, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 5, start: start, end: end, is_pub: is_pub, op: tparam_start, a: tparam_count, b: variant_start, x: ns as i32, y: ne as i32, z: variant_count, w: 0 - 1, u: attr_start, v: attr_count, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1, cns: 0 - 1, cne: 0 - 1 })
     return id
 }
 // A `trait Name { methods }` item (kind 6): `(x,y)`=name span, `(a,b)`=(method_start,
 // method_count) of trait-method 7-tuples in `mar`.
 fn mk_item_trait(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, method_start: i32, method_count: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 6, start: start, end: end, is_pub: is_pub, op: 0 - 1, a: method_start, b: method_count, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 6, start: start, end: end, is_pub: is_pub, op: 0 - 1, a: method_start, b: method_count, x: ns as i32, y: ne as i32, z: 0 - 1, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1, cns: 0 - 1, cne: 0 - 1 })
     return id
 }
 // An `impl Trait for Type { methods }` item (kind 7): `(x,y)`=trait-name span, `a`=target
 // `TypeId`, `(b,z)`=(method_start, method_count) of method fn-`ItemId`s in `mar`.
 fn mk_item_impl(mut p: Parser, start: usize, end: usize, tns: usize, tne: usize, target: i32, method_start: i32, method_count: i32, gen_start: i32, gen_count: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 7, start: start, end: end, is_pub: 0, op: 0 - 1, a: target, b: method_start, x: tns as i32, y: tne as i32, z: method_count, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: gen_start, h: gen_count, e: 0 - 1, xat: 0 - 1, xac: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 7, start: start, end: end, is_pub: 0, op: 0 - 1, a: target, b: method_start, x: tns as i32, y: tne as i32, z: method_count, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: gen_start, h: gen_count, e: 0 - 1, xat: 0 - 1, xac: 0 - 1, cns: 0 - 1, cne: 0 - 1 })
     return id
 }
 // An `extern ["abi"] fn Name(params) [-> conv R]` item (kind 8): `(x,y)`=name span,
@@ -1929,15 +1929,21 @@ fn mk_item_impl(mut p: Parser, start: usize, end: usize, tns: usize, tne: usize,
 // obvious free pair and is NOT usable: it is the bracket-generic slice into `gar`, and
 // `fn_call_ret` reads it off whatever item a call resolves to — an extern included. Hence a
 // dedicated pair rather than another overload of the same two slots.
-fn mk_item_extern(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, param_start: i32, param_count: i32, ret_conv: i32, ret_ty: i32, abis: i32, abie: i32, attr_start: i32, attr_count: i32) -> i32 {
+// `(cns,cne)` is the DECLARED ALIAS span (`extern "unistd.h" fn sys_read = "read"(…)`), -1 when
+// absent. DEDICATED fields, not a reused pair: `g`/`h` are the generic-parameter slice
+// and `fn_is_gen` answers `it.h > 0` for ANY item, so parking a string offset there made
+// every aliased extern look generic and segfault in `p.gar`. `v` and `e` are read as a
+// count and an arena index by code that does not check the kind either. Measured, not
+// guessed — the crash is what said so.
+fn mk_item_extern(mut p: Parser, start: usize, end: usize, is_pub: i32, ns: usize, ne: usize, param_start: i32, param_count: i32, ret_conv: i32, ret_ty: i32, abis: i32, abie: i32, attr_start: i32, attr_count: i32, syms: i32, syme: i32) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 8, start: start, end: end, is_pub: is_pub, op: ret_conv, a: param_start, b: param_count, x: ns as i32, y: ne as i32, z: ret_ty, w: abis, u: abie, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: attr_start, xac: attr_count })
+    push(ItemData, p.it, ItemData{ kind: 8, start: start, end: end, is_pub: is_pub, op: ret_conv, a: param_start, b: param_count, x: ns as i32, y: ne as i32, z: ret_ty, w: abis, u: abie, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: attr_start, xac: attr_count, cns: syms, cne: syme })
     return id
 }
 // An unrecognized item -> Error (kind 99), spanning the offending token.
 fn mk_item_err(mut p: Parser, start: usize, end: usize) -> i32 {
     let id: i32 = len(ItemData, p.it) as i32
-    push(ItemData, p.it, ItemData{ kind: 99, start: start, end: end, is_pub: 0, op: 0 - 1, a: 0 - 1, b: 0 - 1, x: 0 - 1, y: 0 - 1, z: 0 - 1, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1 })
+    push(ItemData, p.it, ItemData{ kind: 99, start: start, end: end, is_pub: 0, op: 0 - 1, a: 0 - 1, b: 0 - 1, x: 0 - 1, y: 0 - 1, z: 0 - 1, w: 0 - 1, u: 0 - 1, v: 0 - 1, g: 0 - 1, h: 0 - 1, e: 0 - 1, xat: 0 - 1, xac: 0 - 1, cns: 0 - 1, cne: 0 - 1 })
     return id
 }
 
@@ -3499,6 +3505,14 @@ fn parse_extern(mut p: Parser, is_pub: i32, attr_start: i32, attr_count: i32) ->
     var ns: usize = idn14.start
     var ne: usize = idn14.end
     if cur_kind(p) == 0 { bump(p) }
+    // `= "<c symbol>"` — the declared alias. Stored as the string's INNER span. It exists
+    // because `read`, `take`, `error`, `out` and `spawn` are Jestyr keywords, so an extern
+    // cannot otherwise name a C symbol spelled like one.
+    var syms: i32 = 0 - 1  var syme: i32 = 0 - 1
+    if cur_kind(p) == 84 {                         // `=`
+        bump(p)
+        if cur_kind(p) == 3 { let st14: Token = cur_tok(p)  syms = (st14.start + 1) as i32  syme = (st14.end - 1) as i32  bump(p) }
+    }
     if cur_kind(p) == 63 { bump(p) }               // `(`
     let param_start: i32 = parse_params_into_iar(p)
     let param_count: i32 = ((len(i32, p.iar) as i32) - param_start) / 7
@@ -3506,7 +3520,7 @@ fn parse_extern(mut p: Parser, is_pub: i32, attr_start: i32, attr_count: i32) ->
     var ret_conv: i32 = 0
     var ret_ty: i32 = 0 - 1
     if cur_kind(p) == 77 { bump(p)  ret_conv = parse_conv(p)  ret_ty = parse_type(p) }   // `-> conv R`
-    return mk_item_extern(p, start, prev_end(p), is_pub, ns, ne, param_start, param_count, ret_conv, ret_ty, abis, abie, attr_start, attr_count)
+    return mk_item_extern(p, start, prev_end(p), is_pub, ns, ne, param_start, param_count, ret_conv, ret_ty, abis, abie, attr_start, attr_count, syms, syme)
 }
 
 // Parse one top-level item: leading `@…` attributes, then an optional `pub`, then dispatch on
@@ -4647,7 +4661,11 @@ fn dump_item(read src: str, read p: Parser, iid: i32) {
         // ret_conv, ret-opt.
         print_str("extern")
         if d.w < 0 { print_str("c") } else { print_str(src[d.w as usize .. d.u as usize]) }
-        print_int(d.is_pub as i64) print_int(d.x as i64) print_int(d.y as i64) print_int(d.b as i64)
+        print_int(d.is_pub as i64) print_int(d.x as i64) print_int(d.y as i64)
+        // The declared alias, as TEXT — the reference stores a String and this stores a
+        // span, so the text is the thing that has to agree. `-` for absent.
+        if d.cns < 0 { print_str("-") } else { print_str(src[d.cns as usize .. d.cne as usize]) }
+        print_int(d.b as i64)
         dump_params(src, p, d.a, d.b)
         print_int(d.op as i64)
         if d.z < 0 { print_str("(") print_str("none") print_str(")") } else { dump_type(src, p, d.z) }
@@ -17130,7 +17148,11 @@ fn emit_call(mut sb: String, read p: Parser, read src: str, read c: Checker, mut
         // `mut`/`out` params still take the argument by address.
         let xit: i32 = find_extern_item(p, src, nm)
         if xit >= 0 {
-            string_push(sb, nm)
+            // The C SYMBOL, which under a declared alias is not the Jestyr name: `(g,h)`
+            // holds `= "read"` and `nm` is `sys_read`. The Jestyr name exists only so the
+            // source can NAME a symbol whose spelling Jestyr spent on its own grammar.
+            let xd: ItemData = get__list(ItemData, p.it, xit as usize)
+            if xd.cns < 0 { string_push(sb, nm) } else { string_push(sb, src[xd.cns as usize .. xd.cne as usize]) }
             emit_args_for_item(sb, p, src, c, g, e, xit)
             return
         }
@@ -17194,10 +17216,15 @@ fn emit_extern_protos(mut sb: String, read p: Parser, read src: str) {
             }
             if !hdr {
                 any = true
-                let eg: bool = cfg_open_for(sb, p, src, it.x, it.y, cfg_word(p, src, it.xat, it.xac))
+                // The prototype declares the C SYMBOL. Under a declared alias the Jestyr
+                // name never reaches the emitted C at all — and the specificity rule keys
+                // on the symbol too, since that is the identity the linker sees.
+                var xns: i32 = it.x  var xne: i32 = it.y
+                if it.cns >= 0 { xns = it.cns  xne = it.cne }
+                let eg: bool = cfg_open_for(sb, p, src, xns, xne, cfg_word(p, src, it.xat, it.xac))
                 emit_c_ty(sb, p, src, it.z)               // ret type (-1 = void)
                 string_push(sb, " ")
-                string_push(sb, src[it.x .. it.y])
+                string_push(sb, src[xns as usize .. xne as usize])
                 string_push(sb, "(")
                 var emitted: i32 = 0
                 var i: i32 = 0
@@ -28028,6 +28055,13 @@ fn at_extern_sig(mut sb: String, read p: Parser, read src: str, read it: ItemDat
     if it.w >= 0 { string_push(sb, src[it.w as usize .. it.u as usize]) } else { string_push(sb, "c") }
     string_push(sb, "\" fn ")
     string_push(sb, src[it.x as usize .. it.y as usize])
+    // The declared alias is part of the ABI contract attest hashes: `fn sys_read = "read"`
+    // and `fn sys_read = "_read"` bind different C symbols and must not render alike.
+    if it.cns >= 0 {
+        string_push(sb, " = \"")
+        string_push(sb, src[it.cns as usize .. it.cne as usize])
+        string_push(sb, "\"")
+    }
     string_push(sb, "(")
     at_params(sb, p, src, it.a, it.b)
     string_push(sb, ")")

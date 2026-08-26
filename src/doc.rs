@@ -517,7 +517,15 @@ pub(crate) fn extern_sig(ast: &Ast, e: &ExternFn) -> String {
     if e.is_pub {
         s.push_str("pub ");
     }
-    s.push_str(&format!("extern \"{}\" fn {}(", e.abi, e.name.name));
+    // **The declared alias is part of the signature, not decoration.** `attest` hashes
+    // this string as the item's ABI contract, so `fn sys_read = "read"` and
+    // `fn sys_read = "_read"` — the POSIX and Windows halves of one binding — must not
+    // render identically. They bind different C symbols, which is exactly the kind of
+    // drift the manifest exists to catch.
+    match &e.c_name {
+        Some(sym) => s.push_str(&format!("extern \"{}\" fn {} = \"{sym}\"(", e.abi, e.name.name)),
+        None => s.push_str(&format!("extern \"{}\" fn {}(", e.abi, e.name.name)),
+    }
     s.push_str(&params_str(ast, "", &e.params));
     s.push(')');
     if let Some(t) = e.ret_ty {

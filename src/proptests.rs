@@ -1090,6 +1090,102 @@ int main(void) {
     }
 }
 
+/// **The extern declared alias — naming a C symbol Jestyr cannot spell.**
+///
+/// An extern's name lives in two namespaces at once: it is a C symbol AND a Jestyr
+/// identifier. Jestyr has spent some of those spellings on its own grammar, so
+/// `extern "unistd.h" fn read(…)` does not parse at all — `std/syswatch` binds `readv(2)`
+/// and drives it with a one-element iovec purely to reach `read(2)`.
+///
+/// `fn <jestyr-name> = "<c-symbol>"(…)` separates them. The symbol is a STRING, so no
+/// keyword can collide with it, and the `= "<string>"` shape is not new grammar —
+/// `import "path" = "<sha256>"` already uses it.
+#[cfg(test)]
+mod extern_alias {
+    use super::*;
+
+    fn emit(src: &str) -> String {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (ast, _) = Parser::new(src, tokens).parse();
+        let (info, _td) = typeck::check(&ast);
+        let (c, _cd) = crate::cgen::emit(&ast, &info);
+        c
+    }
+
+    /// **The motivation, stated as a test.** `read` is a keyword, so the plain form does
+    /// not parse — and the aliased form does. If the first half ever stops failing, the
+    /// alias has lost its reason to exist and this test should be revisited rather than
+    /// deleted.
+    #[test]
+    fn a_keyword_cannot_be_an_externs_name_but_can_be_its_symbol() {
+        let (tokens, _) = Lexer::new("extern \"unistd.h\" fn read(fd: i64) -> i64\n").tokenize();
+        let (_ast, pd) = Parser::new("extern \"unistd.h\" fn read(fd: i64) -> i64\n", tokens).parse();
+        assert!(!pd.is_empty(), "`extern fn read` must not parse — `read` is a keyword");
+
+        let ok = "extern \"unistd.h\" fn sys_read = \"read\"(fd: i64) -> i64\n";
+        let (tokens, _) = Lexer::new(ok).tokenize();
+        let (_ast, pd) = Parser::new(ok, tokens).parse();
+        assert!(pd.is_empty(), "the aliased form must parse: {pd:?}");
+    }
+
+    /// The C symbol is what reaches the emitted C; the Jestyr name never does.
+    #[test]
+    fn the_call_lowers_to_the_symbol_not_the_name() {
+        let c = emit("extern \"string.h\" fn c_strlen = \"strlen\"(s: cstr) -> usize\n\
+                      fn main() -> i32 { print_int(c_strlen(\"hi\".cstr) as i64) return 0 }\n");
+        assert!(c.contains("strlen(JSTR(\"hi\").ptr)"), "the call must use the symbol:\n{c}");
+        assert!(!c.contains("c_strlen"), "the Jestyr name must not reach the C:\n{c}");
+    }
+
+    /// A non-header abi emits a PROTOTYPE, and it declares the symbol too — otherwise the
+    /// program would declare one function and call another.
+    #[test]
+    fn the_prototype_declares_the_symbol() {
+        let c = emit("extern \"c\" fn c_abs = \"abs\"(v: i32) -> i32\n\
+                      fn main() -> i32 { return c_abs(0 - 3) }\n");
+        assert!(c.contains("int32_t abs(int32_t"), "the prototype declares the symbol:\n{c}");
+        assert!(!c.contains("c_abs"), "the Jestyr name must not reach the C:\n{c}");
+    }
+
+    /// **Anti-vacuity.** An extern with NO alias is unchanged — which is every extern in
+    /// the tree, and why this landed without moving a single existing golden.
+    #[test]
+    fn an_unaliased_extern_still_binds_its_own_name() {
+        let c = emit("extern \"string.h\" fn strcmp(a: cstr, b: cstr) -> i32\n\
+                      fn main() -> i32 { return strcmp(\"a\".cstr, \"a\".cstr) }\n");
+        assert!(c.contains("strcmp(JSTR(\"a\").ptr"), "unchanged:\n{c}");
+    }
+
+    /// **The alias is part of the attested ABI contract.** `fn sys_read = "read"` and
+    /// `fn sys_read = "_read"` are the POSIX and Windows halves of one binding: same
+    /// Jestyr name, different C symbols. If they rendered alike, `attest` could not tell
+    /// two different foreign bindings apart — which is the drift it exists to catch.
+    #[test]
+    fn two_symbols_under_one_name_do_not_render_alike() {
+        let sig = |src: &str| -> String {
+            let (tokens, _) = Lexer::new(src).tokenize();
+            let (ast, _) = Parser::new(src, tokens).parse();
+            let e = ast
+                .items
+                .iter()
+                .find_map(|i| match i {
+                    crate::ast::Item::Extern(e) => Some(e),
+                    _ => None,
+                })
+                .expect("an extern");
+            crate::doc::extern_sig(&ast, e)
+        };
+        let posix = sig("extern \"unistd.h\" fn sys_read = \"read\"(fd: i64) -> i64\n");
+        let win = sig("extern \"io.h\" fn sys_read = \"_read\"(fd: i64) -> i64\n");
+        assert_ne!(posix, win, "two C symbols must not share one ABI signature");
+        assert!(posix.contains("= \"read\""), "the alias is rendered: {posix}");
+
+        // And an un-aliased extern renders exactly as it always did.
+        let plain = sig("extern \"string.h\" fn strcmp(a: cstr, b: cstr) -> i32\n");
+        assert!(!plain.contains(" = \""), "no alias, no change: {plain}");
+    }
+}
+
 /// **Every OS handle in the `sys` tier is move-only.**
 ///
 /// Eight types wrap a raw descriptor: `Socket`, `Dir`, `Reader`, `Writer`, `Watcher`,
@@ -11977,6 +12073,11 @@ mod c_oracle {
                 out.push(if e.is_pub { "1" } else { "0" }.to_string());
                 out.push(e.name.span.start.to_string());
                 out.push(e.name.span.end.to_string());
+                // The declared alias (`fn sys_read = "read"`), as TEXT rather than a span:
+                // the two backends store it differently (a `String` here, a source span in
+                // the port) and the text is the thing that has to agree. `-` for absent,
+                // which no C symbol can be.
+                out.push(e.c_name.clone().unwrap_or_else(|| "-".to_string()));
                 out.push(e.params.len().to_string());
                 ref_dump_params(ast, &e.params, out);
                 out.push(ref_conv_code(e.ret_conv).to_string());
@@ -17387,6 +17488,11 @@ fn main() -> i32 {
         "sysproc.jtr",
         "sysproc_test.jtr",
         "sysproc_demo.jtr",
+        // `extern_alias.jtr` `@cfg`-splits the `read`/`_read` binding, so
+        // `every_cfg_bearing_corpus_file_is_byte_identity_verified` requires it. It is
+        // also the ONLY corpus file that uses a declared alias, which makes it the thing
+        // that stops the alias from being a reference-only feature the goldens cannot see.
+        "extern_alias.jtr",
     ];
     // **`syswatch_test.jtr` and `syswatch_demo.jtr` are deliberately absent, and the reason
     // was MEASURED** — the same discipline `sysfs_test.jtr` below asks for, and the same

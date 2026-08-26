@@ -644,6 +644,15 @@ impl<'src> Parser<'src> {
         };
         self.expect(Fn, "`fn`");
         let name = self.eat_ident("function name");
+        // `= "<c symbol>"` — the declared alias. The same `= "<string>"` shape
+        // `import "path" = "<sha256>"` already uses, so the grammar gains no new form.
+        let c_name = if self.eat(Eq) {
+            let sp = self.cur().span;
+            self.expect(Str, "the C symbol as a string");
+            Some(self.text(sp).trim_matches('"').to_string())
+        } else {
+            None
+        };
         let open_paren = self.cur().span;
         self.expect(LParen, "`(`");
         let params = self.parse_params();
@@ -656,7 +665,7 @@ impl<'src> Parser<'src> {
             ret_ty = Some(self.parse_type());
         }
         let span = start.to(self.prev_span());
-        ExternFn { is_pub: false, abi, attrs: Vec::new(), name, params, ret_conv, ret_ty, span }
+        ExternFn { is_pub: false, abi, attrs: Vec::new(), name, c_name, params, ret_conv, ret_ty, span }
     }
 
     fn parse_conv(&mut self) -> Conv {

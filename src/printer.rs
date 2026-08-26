@@ -77,7 +77,16 @@ impl<'a> Printer<'a> {
                 self.struct_body(d + 1, body);
             }
             Item::Extern(e) => {
-                self.line(d, &format!("extern \"{}\" fn {}", e.abi, e.name.name));
+                // The declared alias is part of what was parsed, so it belongs in the
+                // dump — this is the P2 golden's view of the AST, and a form the port
+                // parsed but did not print would be a divergence nothing could see.
+                match &e.c_name {
+                    Some(sym) => self.line(
+                        d,
+                        &format!("extern \"{}\" fn {} = \"{sym}\"", e.abi, e.name.name),
+                    ),
+                    None => self.line(d, &format!("extern \"{}\" fn {}", e.abi, e.name.name)),
+                }
                 for p in &e.params {
                     let ts = p.ty.map(|t| self.type_str(t)).unwrap_or_else(|| "_".to_string());
                     self.line(d + 1, &format!("param {}: {}", p.name.name, ts));

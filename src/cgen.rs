@@ -288,7 +288,14 @@ fn emit_program(
             .items
             .iter()
             .filter_map(|it| match it {
-                Item::Extern(e) => Some(e.name.name.clone()),
+                // Jestyr name → the C symbol to emit. A declared alias
+                // (`fn sys_read = "read"(…)`) separates the two; without one they are
+                // the same string, which is every extern written before the alias existed
+                // and is why nothing else in this file had to care.
+                Item::Extern(e) => Some((
+                    e.name.name.clone(),
+                    e.c_name.clone().unwrap_or_else(|| e.name.name.clone()),
+                )),
                 _ => None,
             })
             .collect(),
@@ -417,7 +424,13 @@ fn emit_program(
                         crate::types::canon(md, &f.name.name, &info.dup_fns),
                         &f.attrs,
                     ),
-                    Item::Extern(e) => (e.name.name.clone(), &e.attrs),
+                    // Keyed by the SYMBOL: two aliased externs naming one C symbol under
+                    // different Jestyr names are still one definition to the linker, so
+                    // that is the identity the specificity rule has to reason about.
+                    Item::Extern(e) => (
+                        e.c_name.clone().unwrap_or_else(|| e.name.name.clone()),
+                        &e.attrs,
+                    ),
                     _ => continue,
                 };
                 if let Some(w) = crate::attrs::cfg_of(ast, attrs) {
@@ -751,7 +764,10 @@ struct Cgen<'a> {
     /// is the current method's `self` passed by pointer (`mut`/`out self`)?
     self_is_ptr: bool,
     /// names declared via `extern "c"` — called by their bare C name, not mangled.
-    extern_fns: HashSet<String>,
+    /// Jestyr name → the C symbol it is emitted as. Equal for an extern with no
+    /// declared alias; different for `extern "unistd.h" fn sys_read = "read"(…)`, which
+    /// exists because `read` is a Jestyr KEYWORD and cannot be an extern's name at all.
+    extern_fns: HashMap<String, String>,
     /// trait names used as `dyn Trait` anywhere — each gets a synthesized vtable
     /// struct + fat-pointer typedef, and a static vtable per `impl` (Stage F).
     dyn_traits: HashSet<String>,
@@ -2637,9 +2653,12 @@ impl<'a> Cgen<'a> {
                     None => "void".to_string(),
                 };
                 let params = self.extern_params_str(e);
-                let key = e.name.name.clone();
+                // The prototype declares the C SYMBOL. Under a declared alias the Jestyr
+                // name never reaches the emitted C at all — it exists so the source can
+                // NAME a symbol whose spelling Jestyr has spent on its own grammar.
+                let key = e.c_name.clone().unwrap_or_else(|| e.name.name.clone());
                 let g = self.cfg_open(cfg, &key);
-                self.raw(format!("{ret} {}({});\n", e.name.name, params));
+                self.raw(format!("{ret} {}({});\n", key, params));
                 self.cfg_close(g);
             }
         }
@@ -5254,8 +5273,8 @@ impl<'a> Cgen<'a> {
                 // `j_`-prefixed local, so the generic `&j_name` path is wrong here.
                 if matches!(op, UnOp::Ref) {
                     if let ExprKind::Name(n) = &self.ast.expr_at(*rhs).kind {
-                        if self.extern_fns.contains(&n.name) {
-                            return format!("(&{})", n.name);
+                        if let Some(sym) = self.extern_fns.get(&n.name) {
+                            return format!("(&{sym})");
                         }
                         // Canonical name for a colliding function referenced by
                         // address (the checker recorded it on the name expr);
@@ -6541,7 +6560,7 @@ impl<'a> Cgen<'a> {
 
             // An `extern "c"` function: call it by its bare C name (the linker
             // resolves it), passing `mut`/`out` arguments by address.
-            if self.extern_fns.contains(&n.name) {
+            if self.extern_fns.contains_key(&n.name) {
                 let convs: Vec<Conv> = self
                     .info
                     .table
@@ -6558,7 +6577,10 @@ impl<'a> Cgen<'a> {
                     };
                     parts.push(e);
                 }
-                return format!("{}({})", n.name, parts.join(", "));
+                // The SYMBOL, not the Jestyr name — they differ under a declared alias.
+                let sym =
+                    self.extern_fns.get(&n.name).cloned().unwrap_or_else(|| n.name.clone());
+                return format!("{}({})", sym, parts.join(", "));
             }
 
             // The callee's canonical name: the type checker recorded it when an
@@ -6631,8 +6653,8 @@ impl<'a> Cgen<'a> {
             };
             parts.push(e);
         }
-        if self.extern_fns.contains(name) {
-            format!("{}({})", name, parts.join(", "))
+        if let Some(sym) = self.extern_fns.get(name) {
+            format!("{}({})", sym, parts.join(", "))
         } else {
             // `@no_mangle` callees are reached by their bare C name too.
             format!("{}({})", self.c_fn_name(name), parts.join(", "))

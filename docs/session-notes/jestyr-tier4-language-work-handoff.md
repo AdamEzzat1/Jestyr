@@ -1,18 +1,19 @@
-# Tier 4's language queue — three of four items, and what the fourth costs
+# Tier 4's language queue — all four items
 
-Cold-start note. **§0 is what to do next.** Then the four increments (§1–§4), what is left
-(§5), and the traps this arc bought (§6).
+Cold-start note. **§0 is what to do next.** Then the five increments (§1–§4b), what is
+left (§5), and the traps this arc bought (§6).
 
 ```bash
 cargo build --release && cargo test --release --features "c-oracle,selfhost-fixpoint"
 ```
 
-**1307 passed / 0 failed / 3 ignored**, and `jc_build_matrix` is **63 of 63**
+**1312 passed / 0 failed / 3 ignored**, and `jc_build_matrix` is **63 of 63**
 (`sysproc_demo` joined it). The 3 ignored are the deliberate slow numeric sweeps. Record
 the count before changing anything; if a failure appears later, assume it is yours.
 
-It was 1279 at the start of this arc — the arc's four commits are `3cd0126` (`@must_use`),
-the `std/sysproc` commit, `6233869` (`@move`), and the `@cfg` specificity commit.
+It was 1279 at the start of this arc — the arc's five commits are `3cd0126` (`@must_use`),
+the `std/sysproc` commit, `6233869` (`@move`), `a2a250c` (the `@cfg` specificity rule)
+and the extern-alias commit.
 
 The predecessor note is `docs/session-notes/jestyr-std-v4-tier4-complete-handoff.md`; its
 §4 is the queue this session worked, in its own leverage order.
@@ -21,7 +22,8 @@ The predecessor note is `docs/session-notes/jestyr-std-v4-tier4-complete-handoff
 
 ## §0. START HERE
 
-The Tier 4 note's queue was four items. **Three are done and the fourth is half done:**
+The Tier 4 note's queue was four items. **All four are done**, and the fourth was two
+separate compiler follow-ups:
 
 | § | item | status |
 |---|---|---|
@@ -29,10 +31,10 @@ The Tier 4 note's queue was four items. **Three are done and the fourth is half 
 | §4.1 | a `sys` process module | **DONE** — `std/sysproc`, spawn + bounded wait + kill |
 | §4.3 | move-only resources (brief §2.1) | **DONE** — `@move`, all eight handle types |
 | §4.5 | the `@cfg` specificity rule | **DONE** — `linux`/`macos` exist |
-| §4.5 | the extern declared-alias | **NOT STARTED** — see §5.1, it is the expensive one |
+| §4.5 | the extern declared-alias | **DONE** — `fn sys_read = "read"(…)` |
 
-**What to do next is §5.1 or §5.2**, and they are very different sizes. Read §5 before
-picking.
+**All four are done.** What is left is in §5, and the largest item there is pipes for
+`std/sysproc` (§5.2) — now unblocked, because binding `read(2)` was its prerequisite.
 
 ---
 
@@ -97,7 +99,7 @@ wait.
 
 * **`spawn` is a KEYWORD.** The concurrency task form, so the process module cannot spell
   its central verb — it is `start`. Fifth on the list after `read`/`take`/`error`/`out`,
-  and the first that the declared-alias design (§5.1) would NOT fix: this is a Jestyr name,
+  and the first that the declared alias (§4b) does NOT fix: this is a Jestyr name,
   not a C symbol.
 * **`GetExitCodeProcess` cannot answer "is it running".** `STILL_ACTIVE` is **259** and a
   child may legitimately exit with 259. Liveness is `WaitForSingleObject(h, 0)`, which has
@@ -208,32 +210,67 @@ is what puts the PORT's copy under byte-identity.
 
 ---
 
-## §5. WHAT IS LEFT
-
-### §5.1 — The extern declared-alias. The expensive one, and still worth it
+## §4b. The extern declared alias
 
 ```jtr
 extern "unistd.h" fn sys_read = "read"(fd: i64, buf: cptr, n: usize) -> i64
 ```
 
-`read`, `take`, `error`, `out` and now `spawn` are Jestyr keywords, so an extern cannot
-bind a C symbol that shares one of those spellings — `std/syswatch` binds `readv` instead.
-The alias would also **unwind the four separate `close`es** now across `std/file`,
-`std/sysdir`, `std/sysnet` and `std/sysproc`'s `CloseHandle`.
+**An extern's name lives in two namespaces at once** — a C symbol resolved by the linker,
+and a Jestyr identifier resolved by the parser. Jestyr has spent some of those spellings on
+its own grammar, so `extern "unistd.h" fn read(…)` does not parse AT ALL: the parser sees
+`read` where a function name should be. The alias makes the symbol a STRING, which no
+keyword can collide with, and reuses the `= "<string>"` shape `import "path" = "<sha256>"`
+already had.
 
-**Cost, honestly:** parser + typeck + cgen, so it owes the P2 (parse dump), P3 (typeck) and
-P5 (cgen) goldens plus a reseed. That is the full three-golden tax, and it is why this
-session did not start it — the other three items were each one or two goldens.
+Under an alias the Jestyr name **never reaches the emitted C** — neither the call nor the
+prototype. `examples/extern_alias.jtr` is the corpus file, and it is what stops this being
+a reference-only feature the goldens cannot see: parse-dump, typeck, cgen, doc and attest
+all compare both backends on it.
 
-Note it does NOT fix `spawn`: that is a Jestyr function name, not a C symbol. Scoped
-keywords are a separate question.
+**The alias is part of the attested ABI signature.** `fn sys_read = "read"` and
+`fn sys_read = "_read"` are the POSIX and Windows halves of one binding — same Jestyr name,
+different C symbols — and if they rendered alike `attest` could not tell two foreign
+bindings apart.
+
+### `g`/`h` were NOT free, and the crash is what said so
+
+The port stores the alias as a source span, and the obvious home was `ItemData`'s `g`/`h`,
+documented as the generic-parameter slice and `-1` for an extern. But `fn_is_gen` answers
+`it.h > 0` **for any item kind**, so an alias offset there made every aliased extern look
+generic and segfaulted indexing `p.gar`. `v` and `e` are no better — one is read as a loop
+count, the other as an index into `p.far`, both without checking the kind.
+
+`ItemData` gained two DEDICATED fields (`cns`/`cne`). "Those slots are `-1` for this kind"
+is not the same claim as "nothing reads them".
+
+### It does NOT fix `spawn`
+
+That is a Jestyr FUNCTION name, not a C symbol — `std/sysproc` still cannot call its
+starter `spawn`. Scoped keywords are a separate question and nothing needs them yet.
+
+---
+
+## §5. WHAT IS LEFT
+
+### §5.1 — ADOPTING the alias. The feature landed; nothing uses it yet
+
+`std/syswatch` still binds `readv(2)` and drives it with a one-element `iovec` purely to
+reach `read(2)`, and there are still four separate `close`es across `std/file`,
+`std/sysdir`, `std/sysnet` and `std/sysproc`. Both are now one-line changes.
+
+**Both were left alone deliberately**, for the reason `sysdir`'s header gives about
+`@cfg`: the POSIX branch only ever RUNS on the Linux CI runner, so switching a working
+binding here would ship a change nothing in reach can observe. Do it when you can watch the
+Linux ladder, not before — the mechanical part is trivial and the verification is the
+whole cost.
 
 ### §5.2 — Pipes for `std/sysproc`, and the plugin server they unblock
 
-The module deliberately stops before capturing a child's stdout. That is the increment that
-turns `std/plugin` from one-process-per-call into a server, and it needs `CreatePipe` /
-`pipe(2)`, inherited handles, and on POSIX a `read(2)` this language cannot bind by name —
-so **§5.1 is its prerequisite**, or `readv` is again the way through.
+**The biggest remaining item, and it is now unblocked.** The module deliberately stops
+before capturing a child's stdout; that is what turns `std/plugin` from one-process-per-call
+into a server. It needs `CreatePipe` / `pipe(2)`, inherited handles, and `read(2)` — which
+§4's alias can finally name.
 
 ### §5.3 — A `mut` sub-slice as a call argument
 
@@ -284,6 +321,12 @@ against it. Now swept corpus-wide.
 measured with a C probe, and the test re-measures them against `<windows.h>` while parsing
 the constants out of the shipped source — so a wrong number is a red test rather than a
 `CreateProcess` that mysteriously starts nothing.
+
+**"That field is -1 for this kind" is not "nothing reads it".** The port's `ItemData` slots
+are documented per item kind, but `fn_is_gen` reads `h` for every kind, and `v` and `e` are
+read as a loop count and an arena index without checking either. Parking an alias span in
+`g`/`h` segfaulted. Add a field rather than reusing one whose readers you have not
+enumerated.
 
 **Do not edit `examples/**` while a ladder is running.** The corpus tests read those files
 at run time, so an edit underneath a running suite corrupts it. `src/**` is safe once the

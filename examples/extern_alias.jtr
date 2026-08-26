@@ -1,0 +1,80 @@
+// examples/extern_alias.jtr — binding a C symbol Jestyr cannot spell.
+//
+// ─── The problem ──────────────────────────────────────────────────────────────
+//
+// **An extern's name lives in two namespaces at once.** It is a C symbol, resolved by the
+// linker, and it is a Jestyr identifier, resolved by the parser. Jestyr has spent some of
+// those spellings on its own grammar: `read`, `take`, `error` and `out` are parameter
+// modes and `spawn` is the concurrency task form, so
+//
+//     extern "unistd.h" fn read(fd: i64, buf: cptr, n: usize) -> i64
+//
+// does not parse at all. Not "is refused" — the parser sees `read` where a function name
+// should be and never gets to the signature.
+//
+// That is not a hypothetical. `std/syswatch` needs `read(2)` to drain an inotify fd and
+// binds **`readv(2)`** instead, driving it with a one-element `iovec` purely to reach a
+// syscall whose name Jestyr had already taken.
+//
+// ─── The fix: a DECLARED ALIAS ────────────────────────────────────────────────
+//
+//     extern "<header>" fn <jestyr-name> = "<c-symbol>"(<params>) -> <ret>
+//
+// The Jestyr name is what the source calls; the C symbol is what the linker sees, and it
+// is a STRING, so it is not parsed as an identifier and no keyword can collide with it.
+// The `= "<string>"` shape is not new grammar — `import "path" = "<sha256>"` already uses
+// it to pin a module hash.
+//
+// Under an alias the Jestyr name **never reaches the emitted C**. `sys_read(…)` lowers to
+// `read(…)` on POSIX and `_read(…)` on Windows, and the prototype (when one is emitted at
+// all) declares the symbol, not the name.
+//
+// ─── The second thing it buys ─────────────────────────────────────────────────
+//
+// Two modules may now bind ONE C symbol under different Jestyr names. That is the answer
+// to the four separate `close`es across `std/file`, `std/sysdir`, `std/sysnet` and
+// `std/sysproc` — each of which had to re-declare the symbol because the name was the
+// binding, so a shared spelling meant a shared declaration and a signature both had to
+// agree on.
+//
+// ─── What it does NOT fix ─────────────────────────────────────────────────────
+//
+// `spawn`. That is a Jestyr FUNCTION name, not a C symbol — `std/sysproc` cannot call its
+// own starter `spawn` no matter how externs are declared, and it is `start` instead. The
+// alias moves the C namespace out of Jestyr's way; it does nothing about Jestyr's own.
+//
+// Run:  jestyrc run examples/extern_alias.jtr
+//   →   5, then the platform's own name for `read(2)`.
+
+// The motivating case, both halves. **Two different C symbols under one Jestyr name** —
+// which is also why the alias is part of the attested signature: `= "read"` and
+// `= "_read"` are different ABI contracts and must not hash alike.
+@cfg(posix) extern "unistd.h" fn sys_read = "read"(fd: i64, buf: cptr, n: usize) -> i64
+@cfg(windows) extern "io.h" fn sys_read = "_read"(fd: i64, buf: cptr, n: usize) -> i64
+
+// An alias where the name was never blocked — `strlen` is a perfectly good Jestyr
+// identifier. Renaming it anyway is the ordinary use: the C name is terse and global, and
+// the Jestyr name can say which library it came from.
+extern "string.h" fn c_strlen = "strlen"(s: cstr) -> usize
+
+// And the control: an extern with NO alias still binds its own name, which is every
+// extern written before this existed.
+extern "string.h" fn strcmp(a: cstr, b: cstr) -> i32
+
+@cfg(posix) fn read_symbol() -> str { return "read" }
+@cfg(windows) fn read_symbol() -> str { return "_read" }
+
+fn main() -> i32 {
+    // The aliased call lowers to `strlen(...)`; the Jestyr name is gone by then.
+    print_int(c_strlen("hello".cstr) as i64)
+
+    // The un-aliased control, still bound by its own name.
+    print_int(strcmp("a".cstr, "a".cstr) as i64)
+
+    // Which symbol `sys_read` actually is on this host. The binding itself is declared
+    // and type-checked on both platforms — `@cfg` emits both branches and lets the
+    // preprocessor choose — but it is not CALLED here: `read(2)` on a file descriptor a
+    // test harness may have redirected is not a deterministic thing to print.
+    print_str(read_symbol())
+    return 0
+}

@@ -3862,7 +3862,11 @@ fn emit_call(mut sb: String, read p: parser.Parser, read src: str, read c: typec
         // `mut`/`out` params still take the argument by address.
         let xit: i32 = find_extern_item(p, src, nm)
         if xit >= 0 {
-            string_push(sb, nm)
+            // The C SYMBOL, which under a declared alias is not the Jestyr name: `(g,h)`
+            // holds `= "read"` and `nm` is `sys_read`. The Jestyr name exists only so the
+            // source can NAME a symbol whose spelling Jestyr spent on its own grammar.
+            let xd: parser.ItemData = list.get(parser.ItemData, p.it, xit as usize)
+            if xd.cns < 0 { string_push(sb, nm) } else { string_push(sb, src[xd.cns as usize .. xd.cne as usize]) }
             emit_args_for_item(sb, p, src, c, g, e, xit)
             return
         }
@@ -3926,10 +3930,15 @@ fn emit_extern_protos(mut sb: String, read p: parser.Parser, read src: str) {
             }
             if !hdr {
                 any = true
-                let eg: bool = cfg_open_for(sb, p, src, it.x, it.y, cfg_word(p, src, it.xat, it.xac))
+                // The prototype declares the C SYMBOL. Under a declared alias the Jestyr
+                // name never reaches the emitted C at all — and the specificity rule keys
+                // on the symbol too, since that is the identity the linker sees.
+                var xns: i32 = it.x  var xne: i32 = it.y
+                if it.cns >= 0 { xns = it.cns  xne = it.cne }
+                let eg: bool = cfg_open_for(sb, p, src, xns, xne, cfg_word(p, src, it.xat, it.xac))
                 emit_c_ty(sb, p, src, it.z)               // ret type (-1 = void)
                 string_push(sb, " ")
-                string_push(sb, src[it.x .. it.y])
+                string_push(sb, src[xns as usize .. xne as usize])
                 string_push(sb, "(")
                 var emitted: i32 = 0
                 var i: i32 = 0
@@ -14760,6 +14769,13 @@ fn at_extern_sig(mut sb: String, read p: parser.Parser, read src: str, read it: 
     if it.w >= 0 { string_push(sb, src[it.w as usize .. it.u as usize]) } else { string_push(sb, "c") }
     string_push(sb, "\" fn ")
     string_push(sb, src[it.x as usize .. it.y as usize])
+    // The declared alias is part of the ABI contract attest hashes: `fn sys_read = "read"`
+    // and `fn sys_read = "_read"` bind different C symbols and must not render alike.
+    if it.cns >= 0 {
+        string_push(sb, " = \"")
+        string_push(sb, src[it.cns as usize .. it.cne as usize])
+        string_push(sb, "\"")
+    }
     string_push(sb, "(")
     at_params(sb, p, src, it.a, it.b)
     string_push(sb, ")")

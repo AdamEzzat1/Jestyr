@@ -573,6 +573,20 @@ pub struct ExternFn {
     /// `opendir` versus `FindFirstFileA`, not the function that calls them.
     pub attrs: Vec<Attribute>,
     pub name: Ident,
+    /// `extern "unistd.h" fn sys_read = "read"(…)` — the C symbol, when it differs from
+    /// the Jestyr name. `None` means they are the same, which is every extern written
+    /// before this existed.
+    ///
+    /// It exists because **an extern's name lives in two namespaces at once**: it is a C
+    /// symbol AND a Jestyr identifier, and Jestyr has spent some of those spellings on its
+    /// own grammar. `read`, `take`, `error` and `out` are keywords, so
+    /// `extern "unistd.h" fn read` does not parse at all — `std/syswatch` binds `readv`
+    /// and drives it with a one-element iovec purely to get at `read(2)`.
+    ///
+    /// The alias also lets two modules bind one C symbol under different Jestyr names,
+    /// which is the answer to the four separate `close`es across `std/file`,
+    /// `std/sysdir`, `std/sysnet` and `std/sysproc`.
+    pub c_name: Option<String>,
     pub params: Vec<Param>,
     pub ret_conv: Conv,
     pub ret_ty: Option<TypeId>,
